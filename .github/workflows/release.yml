@@ -15,12 +15,22 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # npm provenance
+      # Mints the OIDC id-token pnpm exchanges for a short-lived publish token
+      # (npm trusted publishing) — and the same token backs provenance. There is
+      # deliberately NO npm token here: 2FA-bypass tokens lose publish rights in
+      # early 2027, and every package is registered as a trusted publisher of
+      # THIS workflow file (release.yml). Renaming this file breaks publishing
+      # until the trusted-publisher config on npmjs.com is renamed to match.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
         with:
-          version: 10
+          # >=11.10 speaks OIDC. Pinned exactly: 11.13.0 is also the release that
+          # stopped an unresolved ${NODE_AUTH_TOKEN} placeholder in the .npmrc
+          # setup-node writes from being sent as a literal bearer token, which
+          # 404s the OIDC publish.
+          version: 11.13.0
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -42,5 +52,4 @@ jobs:
             pnpm -r --filter './packages/*' publish --access public --no-git-checks
           fi
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: true
