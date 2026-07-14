@@ -1,6 +1,6 @@
 {
   "name": "crumbtrail-react",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -38,7 +38,7 @@
     "vitest": "^3.1.0"
   },
   "license": "MIT",
-  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/react#readme",
+  "homepage": "https://crumbtrail.dev",
   "bugs": {
     "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
   },
@@ -49,5 +49,21 @@
   },
   "publishConfig": {
     "access": "public"
-  }
+  },
+  "description": "React bindings for Crumbtrail: an error boundary that captures the session, and a hook that records component state with a bug report. See https://crumbtrail.dev",
+  "keywords": [
+    "crumbtrail",
+    "debugging",
+    "bug-reporting",
+    "ai-agents",
+    "coding-agent",
+    "session-replay",
+    "observability",
+    "developer-tools",
+    "react",
+    "error-boundary",
+    "hooks",
+    "react-error-handling",
+    "state"
+  ]
 }

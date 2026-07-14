@@ -1,6 +1,6 @@
 {
   "name": "crumbtrail-install-shared",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -31,7 +31,7 @@
     "react": "^19.0.0"
   },
   "license": "MIT",
-  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/install-shared#readme",
+  "homepage": "https://crumbtrail.dev",
   "bugs": {
     "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
   },
@@ -42,5 +42,19 @@
   },
   "publishConfig": {
     "access": "public"
-  }
+  },
+  "description": "Shared Crumbtrail install recipes, OTLP facts and agent prompts used by the crumbtrail CLI and dashboard. See https://crumbtrail.dev",
+  "keywords": [
+    "crumbtrail",
+    "debugging",
+    "bug-reporting",
+    "ai-agents",
+    "coding-agent",
+    "session-replay",
+    "observability",
+    "developer-tools",
+    "install",
+    "recipes",
+    "internal"
+  ]
 }

@@ -1,7 +1,7 @@
 {
   "name": "crumbtrail-core",
-  "version": "0.2.2",
-  "description": "Browser SDK for capturing Crumbtrail sessions and sending evidence to a local Crumbtrail server.",
+  "version": "0.2.3",
+  "description": "Capture the console, network, DOM and state around a bug and hand it to a coding agent as evidence. Zero-dependency browser SDK. See https://crumbtrail.dev",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -11,9 +11,18 @@
   "keywords": [
     "crumbtrail",
     "debugging",
+    "bug-reporting",
+    "ai-agents",
+    "coding-agent",
     "session-replay",
     "observability",
-    "browser-sdk"
+    "developer-tools",
+    "browser-sdk",
+    "error-tracking",
+    "javascript",
+    "typescript",
+    "redaction",
+    "telemetry"
   ],
   "type": "module",
   "main": "./dist/index.cjs",
@@ -41,7 +50,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "clean": "rm -rf dist"
   },
-  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/core#readme",
+  "homepage": "https://crumbtrail.dev",
   "bugs": {
     "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
   }

@@ -1,6 +1,6 @@
 {
   "name": "crumbtrail-react-native",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -53,7 +53,7 @@
     "vitest": "^3.1.0"
   },
   "license": "MIT",
-  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/react-native#readme",
+  "homepage": "https://crumbtrail.dev",
   "bugs": {
     "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
   },
@@ -64,5 +64,22 @@
   },
   "publishConfig": {
     "access": "public"
-  }
+  },
+  "description": "React Native and Expo SDK for Crumbtrail: capture errors, network, navigation and a view-tree snapshot around a bug. See https://crumbtrail.dev",
+  "keywords": [
+    "crumbtrail",
+    "debugging",
+    "bug-reporting",
+    "ai-agents",
+    "coding-agent",
+    "session-replay",
+    "observability",
+    "developer-tools",
+    "react-native",
+    "expo",
+    "mobile",
+    "ios",
+    "android",
+    "crash-reporting"
+  ]
 }

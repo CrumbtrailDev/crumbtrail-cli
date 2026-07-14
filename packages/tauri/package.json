@@ -1,6 +1,6 @@
 {
   "name": "crumbtrail-tauri",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -37,7 +37,7 @@
     "vitest": "^3.2.0"
   },
   "license": "MIT",
-  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/tauri#readme",
+  "homepage": "https://crumbtrail.dev",
   "bugs": {
     "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
   },
@@ -48,5 +48,21 @@
   },
   "publishConfig": {
     "access": "public"
-  }
+  },
+  "description": "Tauri v2 plugin for Crumbtrail: capture desktop app sessions over native IPC, no server process required. See https://crumbtrail.dev",
+  "keywords": [
+    "crumbtrail",
+    "debugging",
+    "bug-reporting",
+    "ai-agents",
+    "coding-agent",
+    "session-replay",
+    "observability",
+    "developer-tools",
+    "tauri",
+    "tauri-plugin",
+    "desktop",
+    "rust",
+    "ipc"
+  ]
 }
