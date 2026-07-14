@@ -107,3 +107,6 @@ scripts/.out/
 # Local agent tooling / session config
 .claude/
 .codex/
+
+# Local agent memory (memsearch) — never committed, matches the main repo.
+.memsearch/
