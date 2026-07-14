@@ -27,8 +27,9 @@ jobs:
           cache: pnpm
           registry-url: https://registry.npmjs.org
       - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
+      # build first: workspace typecheck resolves sibling packages' dist types.
       - run: pnpm build
+      - run: pnpm typecheck
       - run: pnpm test
 
       - name: Publish
