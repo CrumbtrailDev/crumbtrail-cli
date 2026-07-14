@@ -79,8 +79,8 @@ value is safe.
 - **Website** — https://crumbtrail.dev
 - **Docs** — https://crumbtrail.dev/docs
 - **How it works** — https://crumbtrail.dev/how-it-works
-- **Source** — https://github.com/crumbtrail-dev/crumbtrail-js
-- **Issues** — https://github.com/crumbtrail-dev/crumbtrail-js/issues
+- **Source** — https://github.com/CrumbtrailDev/crumbtrail-js
+- **Issues** — https://github.com/CrumbtrailDev/crumbtrail-js/issues
 
 ## License
 
