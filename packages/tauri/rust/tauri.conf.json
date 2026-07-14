@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegram/nicegram-tauri/main/.schema/config.schema.json",
+  "productName": "crumbtrail-plugin-dev",
+  "identifier": "dev.crumbtrail.plugin",
+  "build": {},
+  "app": {
+    "windows": []
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all",
+    "icon": []
+  }
+}

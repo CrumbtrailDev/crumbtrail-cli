@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "//": "The integration tests import the cloud package's test-stack (cross-package); they run under vitest/esbuild and are excluded from this package's rootDir-scoped tsc program.",
+  "exclude": [
+    "src/__tests__/integration.test.ts",
+    "src/__tests__/batch-integration.test.ts"
+  ]
+}

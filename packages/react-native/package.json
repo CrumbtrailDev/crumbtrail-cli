@@ -1,0 +1,68 @@
+{
+  "name": "crumbtrail-react-native",
+  "version": "0.2.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "crumbtrail-core": "workspace:^"
+  },
+  "peerDependencies": {
+    "@react-native-async-storage/async-storage": ">=1.17",
+    "@react-navigation/native": ">=6",
+    "react": ">=18",
+    "react-native": ">=0.72",
+    "react-native-view-shot": ">=3"
+  },
+  "peerDependenciesMeta": {
+    "@react-native-async-storage/async-storage": {
+      "optional": true
+    },
+    "@react-navigation/native": {
+      "optional": true
+    },
+    "react-native-view-shot": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "react": "^19.0.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.1.0"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/react-native#readme",
+  "bugs": {
+    "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crumbtrail-dev/crumbtrail-js.git",
+    "directory": "packages/react-native"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

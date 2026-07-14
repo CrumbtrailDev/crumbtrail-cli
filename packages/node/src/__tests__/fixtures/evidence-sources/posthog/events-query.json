@@ -1,0 +1,30 @@
+{
+  "results": [
+    {
+      "id": "01890abc-EXAMPLE-event-0001",
+      "distinct_id": "user-42",
+      "event": "$pageview",
+      "timestamp": "2026-07-08T12:34:56.789Z",
+      "properties": {
+        "$current_url": "https://app.example.com/checkout",
+        "$pathname": "/checkout",
+        "$browser": "Chrome",
+        "$os": "Mac OS X",
+        "$session_id": "sess-abc-123"
+      }
+    },
+    {
+      "id": "01890abc-EXAMPLE-event-0002",
+      "distinct_id": "user-42",
+      "event": "$exception",
+      "timestamp": "2026-07-08T12:35:10.000Z",
+      "properties": {
+        "$current_url": "https://app.example.com/checkout",
+        "$exception_type": "TypeError",
+        "$exception_message": "Cannot read properties of undefined (reading 'id') while authorizing Bearer abcdef0123456789abcdef0123",
+        "$session_id": "sess-abc-123"
+      }
+    }
+  ],
+  "next": "https://us.posthog.com/api/projects/1/events/?before=2026-07-08T12:35:10.000Z"
+}

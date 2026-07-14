@@ -1,0 +1,26 @@
+{
+  "preview": false,
+  "init_offset": 0,
+  "results": [
+    {
+      "_bkt": "main~0~ABCDEF01-2345-6789-ABCD-EF0123456789",
+      "_cd": "0:12345",
+      "_indextime": "1720440096",
+      "_raw": "2026-07-08 12:34:56.789 ERROR checkout failed: TypeError: Cannot read properties of undefined (reading 'id') requestId=req_abc123 while authorizing Bearer abcdef0123456789abcdef0123",
+      "_time": "2026-07-08T12:34:56.789+00:00",
+      "index": "main",
+      "sourcetype": "httpevent",
+      "service": "checkout"
+    },
+    {
+      "_bkt": "main~0~ABCDEF01-2345-6789-ABCD-EF0123456789",
+      "_cd": "0:12346",
+      "_indextime": "1720440400",
+      "_raw": "2026-07-08 12:40:00.000 ERROR PaymentError: gateway declined requestId=req_abc123",
+      "_time": "2026-07-08T12:40:00.000+00:00",
+      "index": "main",
+      "sourcetype": "httpevent",
+      "service": "checkout"
+    }
+  ]
+}

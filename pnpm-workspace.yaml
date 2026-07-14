@@ -1,0 +1,8 @@
+packages:
+  - "packages/*"
+
+# pnpm 11 build-script approval (map of package -> allow/deny lifecycle scripts).
+allowBuilds:
+  # esbuild's postinstall links its platform binary, which vitest/vite rely on
+  # for TS transforms.
+  esbuild: true

@@ -1,0 +1,109 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Rust
+target/
+packages/tauri/rust/gen/
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+coverage/
+
+# Misc
+.context/
+*.tgz
+Business Climate/market-first-verdict.md
+
+# Tool / agent artifacts
+.agents/
+.claude/skills/
+.deepsec/
+.paperclip/
+.playwright-mcp/
+.superset/
+.mcp.json
+docs/research/
+docs/superpowers/
+plan/
+plugins/*
+!plugins/crumbtrail-mcp/
+!plugins/crumbtrail-mcp/**
+
+# ── GSD baseline (auto-generated) ──
+.gsd
+.gsd-id
+.bg-shell/
+*~
+*.code-workspace
+.next/
+build/
+__pycache__/
+*.pyc
+.venv/
+venv/
+vendor/
+.cache/
+tmp/
+
+# Local crumbtrail session output (created by `crumbtrail serve/doctor` in-repo)
+.crumbtrail/
+
+# Installer regression fixtures: keep sources + lockfiles tracked, ignore the
+# installed deps / build output the harness generates.
+test-fixtures/**/node_modules/
+test-fixtures/**/.env
+test-fixtures/**/dist/
+test-fixtures/**/.crumbtrail/
+
+# Phase-0 gate run output: built sample apps + recordings stay local
+# (textual results like answers/ and gate-report.json are still tracked).
+docs/gates/phase0/artifacts/
+
+# Rolling gate run-history logs (regenerated on each run)
+docs/gates/*.jsonl
+docs/gates/fp-gate-latest.json
+
+
+# Outbound sweep scheduler output
+growth/outbound/sweep.log
+
+# Demo video pipeline render outputs
+tools/demo-pipeline/out/
+tools/demo-pipeline/work/
+
+# Show HN launch-day watcher output
+docs/launch/show-hn/replies/
+docs/launch/show-hn/.watch-state.json
+docs/issue-memory-status.html
+# Walkthrough recording raw output (encoded mp4/poster live under landing/web/public/demo)
+scripts/.out/
+
+# Local tarballs for installing into other apps
+.local-packs/
+
+# Local agent tooling / session config
+.claude/
+.codex/

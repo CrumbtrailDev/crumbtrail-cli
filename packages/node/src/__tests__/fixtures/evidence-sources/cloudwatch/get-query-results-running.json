@@ -1,0 +1,22 @@
+{
+  "status": "Running",
+  "statistics": {
+    "recordsMatched": 1,
+    "recordsScanned": 500,
+    "bytesScanned": 102400
+  },
+  "results": [
+    [
+      { "field": "@timestamp", "value": "2026-07-08 12:34:56.789" },
+      {
+        "field": "@message",
+        "value": "ERROR checkout failed: TypeError: Cannot read properties of undefined (reading 'id') requestId=req_abc123"
+      },
+      {
+        "field": "@ptr",
+        "value": "CoUBClgKVDQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAx"
+      },
+      { "field": "@logStream", "value": "2026/07/08/[$LATEST]abcdef0123456789" }
+    ]
+  ]
+}

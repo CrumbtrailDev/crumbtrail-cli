@@ -1,0 +1,46 @@
+{
+  "name": "crumbtrail-install-shared",
+  "version": "0.2.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "crumbtrail-core": "workspace:^"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "react": "^19.0.0"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/install-shared#readme",
+  "bugs": {
+    "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crumbtrail-dev/crumbtrail-js.git",
+    "directory": "packages/install-shared"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

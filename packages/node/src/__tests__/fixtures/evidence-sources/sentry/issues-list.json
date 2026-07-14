@@ -1,0 +1,32 @@
+[
+  {
+    "id": "1234567890",
+    "shortId": "ACME-7",
+    "title": "TypeError: Cannot read properties of undefined (reading 'id')",
+    "culprit": "checkout(app/checkout/pay.ts)",
+    "permalink": "https://acme.sentry.io/organizations/acme/issues/1234567890/",
+    "lastSeen": "2026-07-08T12:34:56.000Z",
+    "firstSeen": "2026-07-08T11:00:00.000Z",
+    "count": "42",
+    "level": "error",
+    "metadata": {
+      "type": "TypeError",
+      "value": "Cannot read properties of undefined (reading 'id')"
+    }
+  },
+  {
+    "id": "9876543210",
+    "shortId": "ACME-8",
+    "title": "PaymentError: gateway declined",
+    "culprit": "charge(app/checkout/gateway.ts)",
+    "permalink": "https://acme.sentry.io/organizations/acme/issues/9876543210/?referrer=alert&token=sk_fake_abcdef0123456789abcdef0123",
+    "lastSeen": "2026-07-08T12:40:00.000Z",
+    "firstSeen": "2026-07-08T12:00:00.000Z",
+    "count": "5",
+    "level": "error",
+    "metadata": {
+      "type": "PaymentError",
+      "value": "gateway declined"
+    }
+  }
+]

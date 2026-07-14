@@ -1,0 +1,8 @@
+[default]
+description = "Default permissions for the crumbtrail plugin"
+permissions = [
+    "allow-start-session",
+    "allow-end-session",
+    "allow-append-events",
+    "allow-write-blob",
+]

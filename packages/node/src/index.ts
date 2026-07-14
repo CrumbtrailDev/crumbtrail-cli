@@ -1,0 +1,364 @@
+/** @stability stable — public SDK export surface (contract review, wargames/wargames/03-contract-decisions.md). */
+export { createServer } from "./server";
+export type { ServerConfig } from "./server";
+export {
+  DISTINCT_BUGS_SCHEMA_VERSION,
+  groupDistinctBugs,
+  buildDistinctBugSignature,
+  groupDistinctBugRecurrences,
+} from "./distinct-bugs";
+export type {
+  DistinctBug,
+  DistinctBugSeverity,
+  DistinctBugEvidenceRef,
+  DistinctBugRecurrence,
+  DistinctBugRecurrenceInput,
+  DistinctBugRecurrenceOccurrence,
+} from "./distinct-bugs";
+export { FilesystemSessionStore, defaultSessionStore } from "./session-store";
+export type { SessionStore } from "./session-store";
+export { SessionManager } from "./session";
+export type { SessionFinalizationResult, SessionListItem } from "./session";
+export {
+  sweepIdleSessions,
+  startSessionSweeper,
+  DEFAULT_SWEEP_IDLE_MS,
+  DEFAULT_SWEEP_INTERVAL_MS,
+  DEFAULT_SWEEP_CHECKPOINT_MS,
+} from "./session-sweeper";
+export type {
+  SessionSweepOptions,
+  SessionSweepResult,
+  SessionSweeperHandle,
+} from "./session-sweeper";
+export { buildSessionSummary } from "./session-summary";
+export type {
+  SessionSummary,
+  SessionFileFlags,
+  Severity,
+} from "./session-summary";
+export { BugQueueManager } from "./bug-queue";
+export type { BugReport as ServerBugReport, BugQueueConfig } from "./bug-queue";
+export { McpServer } from "./mcp-server";
+export type { McpServerConfig } from "./mcp-server";
+export {
+  buildFixContext,
+  FixContextError,
+  FIX_CONTEXT_SCHEMA_VERSION,
+} from "./fix-context";
+export type {
+  FixContext,
+  FixContextSession,
+  FixContextReproHint,
+  FixContextPrimaryWindow,
+  FixContextDbDiff,
+  FixContextDbRead,
+  BuildFixContextOptions,
+} from "./fix-context";
+export {
+  buildDbDiffEvent,
+  buildDbReadBulkEvent,
+  buildDbReadEvent,
+  instrumentMssqlPool,
+  instrumentMysqlClient,
+  instrumentPgClient,
+  instrumentSqliteDatabase,
+  resolveDbRequestContext,
+  parseMutation,
+  parseRead,
+  DEFAULT_SENSITIVE_DB_COLUMNS,
+} from "./db";
+export type {
+  BuildDbDiffEventInput,
+  BuildDbReadBulkEventInput,
+  BuildDbReadEventInput,
+  DbRequestContext,
+  DuckTypedMssqlPool,
+  DuckTypedMssqlRequest,
+  DuckTypedMssqlResult,
+  DuckTypedMysqlClient,
+  DuckTypedMysqlResultHeader,
+  DuckTypedPgClient,
+  DuckTypedPgQueryResult,
+  DuckTypedSqliteDatabase,
+  DuckTypedSqliteRunResult,
+  DuckTypedSqliteStatement,
+  InstrumentDbClientOptions,
+  InstrumentPgClientOptions,
+} from "./db";
+export { inspectSession, formatInspection, InspectError } from "./inspect";
+export type {
+  SessionInspection,
+  SessionInspectionArtifact,
+  InspectSessionOptions,
+} from "./inspect";
+export { readPackageVersion } from "./version";
+export {
+  PROVIDER_IDS,
+  PROVIDER_RECIPES,
+  getProviderRecipe,
+  isProviderId,
+  renderProviderCliOutput,
+  renderProviderConfig,
+  renderProviderDoc,
+  renderProviderReadme,
+} from "./provider-recipes";
+export type { ProviderId, ProviderRecipe } from "./provider-recipes";
+export {
+  createCrumbtrailExpressErrorMiddleware,
+  createCrumbtrailExpressMiddleware,
+} from "./express";
+export { startHeadlessSession } from "./headless-session";
+export type {
+  HeadlessSession,
+  HeadlessSessionOptions,
+} from "./headless-session";
+export type {
+  CrumbtrailExpressErrorMiddleware,
+  CrumbtrailExpressErrorNext,
+  CrumbtrailExpressMiddleware,
+  CrumbtrailExpressNext,
+  CrumbtrailExpressOptions,
+  CrumbtrailExpressRequest,
+  CrumbtrailExpressResponse,
+  CrumbtrailExpressWarning,
+  CrumbtrailExpressWarningKind,
+} from "./express";
+export {
+  compareSessions,
+  CompareError,
+  SESSION_COMPARE_SCHEMA_VERSION,
+} from "./compare";
+export {
+  comparisonTitle,
+  formatComparisonSummary,
+  renderCompareReport,
+  sessionRefLabel,
+} from "./compare/report";
+export {
+  buildRegressionContext,
+  REGRESSION_CONTEXT_SCHEMA_VERSION,
+} from "./compare/regression-context";
+export type {
+  CompareOptions,
+  ComparisonConfidence,
+  ComparisonVerdict,
+  Divergence,
+  EnvChannelDelta,
+  EnvDiff,
+  EnvValueChange,
+  SessionComparison,
+} from "./compare";
+export type { RegressionContext } from "./compare/regression-context";
+export {
+  CRUMBTRAIL_USER_AGENT,
+  JiraTicketClient,
+  TicketError,
+  withBoundedRetry,
+} from "./ticket/clients";
+export type {
+  BoundedRetryOptions,
+  CommentingTicketConnector,
+  JiraAuth,
+  JiraBasicAuth,
+  JiraBearerAuth,
+  JiraTicketClientConfig,
+  JiraTicketClientConfigLegacy,
+  JiraTicketClientConfigWithAuth,
+  TicketConnector,
+} from "./ticket/clients";
+export { jiraToSymptom } from "./ticket/normalize";
+export type { TicketProvider } from "./ticket/normalize";
+export { buildAdvisoryComment } from "./ticket/comment";
+export type {
+  AdfDoc,
+  AdfNode,
+  AdvisoryCommentGap,
+  AdvisoryCommentMatch,
+  BuildAdvisoryCommentInput,
+} from "./ticket/comment";
+// Import from the barrel so the built-in adapters register into
+// EVIDENCE_SOURCE_PROVIDERS when the library entry is loaded.
+export {
+  CRUMBTRAIL_USER_AGENT as EVIDENCE_SOURCE_USER_AGENT,
+  EVIDENCE_SOURCE_PROVIDERS,
+  evidenceSourcesFromEnv,
+  evidenceRequestHeaders,
+  registerEvidenceProvider,
+} from "./evidence-sources";
+export type {
+  EvidenceSource,
+  EvidenceSourceProvider,
+  SourceHealth,
+} from "./evidence-sources";
+export {
+  DEFAULT_MAX_TOTAL_BYTES,
+  DEFAULT_SOURCE_TIMEOUT_MS,
+  fetchAdapterEvidence,
+} from "./evidence-sources";
+export type {
+  AdapterEvidence,
+  AdapterSourceStats,
+  FetchAdapterEvidenceOptions,
+} from "./evidence-sources";
+export {
+  redactEvidenceGap,
+  redactEvidenceItem,
+  redactSourceResult,
+} from "./evidence-sources";
+export {
+  SENTRY_AUTH_FIELDS,
+  SENTRY_AUTH_TOKEN_ENV,
+  SENTRY_DEFAULT_HOST,
+  SENTRY_DESCRIPTOR,
+  SENTRY_HOST_ENV,
+  SENTRY_ORG_ENV,
+  SentryEvidenceSource,
+  buildSentryQuery,
+  normalizeSentryIssue,
+  sentryEvidenceProvider,
+} from "./evidence-sources";
+export type { SentryQueryPlan, SentrySourceConfig } from "./evidence-sources";
+export {
+  CLOUDWATCH_ACCESS_KEY_ID_ENV,
+  CLOUDWATCH_AUTH_FIELDS,
+  CLOUDWATCH_DESCRIPTOR,
+  CLOUDWATCH_ENDPOINT_ENV,
+  CLOUDWATCH_LOG_GROUPS_ENV,
+  CLOUDWATCH_REGION_ENV,
+  CLOUDWATCH_SECRET_ACCESS_KEY_ENV,
+  CLOUDWATCH_SESSION_TOKEN_ENV,
+  CloudWatchEvidenceSource,
+  buildCloudWatchQuery,
+  cloudWatchDeepLink,
+  cloudWatchEvidenceProvider,
+  normalizeCloudWatchRow,
+} from "./evidence-sources";
+export type {
+  CloudWatchQueryPlan,
+  CloudWatchResultRow,
+  CloudWatchSourceConfig,
+} from "./evidence-sources";
+export { signSigV4 } from "./evidence-sources";
+export type { SigV4Input, SignedHeaders } from "./evidence-sources";
+export {
+  SPLUNK_AUTH_FIELDS,
+  SPLUNK_DESCRIPTOR,
+  SPLUNK_HOST_ENV,
+  SPLUNK_INDEX_ENV,
+  SPLUNK_TOKEN_ENV,
+  SPLUNK_WEB_URL_ENV,
+  SplunkEvidenceSource,
+  buildSplunkQuery,
+  normalizeSplunkRow,
+  splunkEvidenceProvider,
+  splunkSearchDeepLink,
+  splunkWebBase,
+} from "./evidence-sources";
+export type {
+  SplunkQueryPlan,
+  SplunkResultRow,
+  SplunkSourceConfig,
+} from "./evidence-sources";
+export {
+  DATADOG_API_KEY_ENV,
+  DATADOG_APP_KEY_ENV,
+  DATADOG_AUTH_FIELDS,
+  DATADOG_DEFAULT_SITE,
+  DATADOG_DESCRIPTOR,
+  DATADOG_SITE_ENV,
+  DatadogEvidenceSource,
+  buildDatadogQuery,
+  datadogAppBase,
+  datadogEvidenceProvider,
+  normalizeDatadogLog,
+  normalizeDatadogSpan,
+} from "./evidence-sources";
+export type {
+  DatadogLog,
+  DatadogQueryPlan,
+  DatadogSourceConfig,
+  DatadogSpan,
+} from "./evidence-sources";
+export {
+  POSTHOG_API_KEY_ENV,
+  POSTHOG_AUTH_FIELDS,
+  POSTHOG_DEFAULT_HOST,
+  POSTHOG_DESCRIPTOR,
+  POSTHOG_HOST_ENV,
+  POSTHOG_PROJECT_ID_ENV,
+  PostHogEvidenceSource,
+  buildPostHogQuery,
+  formatDuration,
+  normalizePostHogEvent,
+  normalizePostHogRecording,
+  posthogEventDeepLink,
+  posthogEvidenceProvider,
+  posthogRecordingDeepLink,
+} from "./evidence-sources";
+export type {
+  PostHogEvent,
+  PostHogPropertyFilter,
+  PostHogQueryPlan,
+  PostHogRecording,
+  PostHogSourceConfig,
+} from "./evidence-sources";
+export {
+  CLOUDFLARE_AUTH_FIELDS,
+  CLOUDFLARE_DESCRIPTOR,
+  CLOUDFLARE_R2_ACCESS_KEY_ID_ENV,
+  CLOUDFLARE_R2_ACCOUNT_ID_ENV,
+  CLOUDFLARE_R2_BUCKET_ENV,
+  CLOUDFLARE_R2_DATASET_ENV,
+  CLOUDFLARE_R2_ENDPOINT_ENV,
+  CLOUDFLARE_R2_PREFIX_ENV,
+  CLOUDFLARE_R2_SECRET_ACCESS_KEY_ENV,
+  CloudflareEvidenceSource,
+  buildCloudflarePlan,
+  cloudflareEvidenceProvider,
+} from "./evidence-sources";
+export type {
+  CloudflareDataset,
+  CloudflarePlan,
+  CloudflareSourceConfig,
+} from "./evidence-sources";
+export type {
+  EvidenceSourceDescriptor,
+  EvidenceJoinKey,
+} from "crumbtrail-core";
+export {
+  REPLAY_RESULT_SCHEMA_VERSION,
+  buildReplayResult,
+  parseReplayResult,
+  writeReplayResult,
+} from "./replay/result";
+export type {
+  ReplayDivergence,
+  ReplayResult,
+  ReplayStepResult,
+  StepResolution,
+} from "./replay/result";
+
+// ── CP1: auto-capture (crash + console.error) ────────────────────────────────
+// Append-only block. Do not reorder the exports above.
+export { autoCapture, AUTO_CAPTURE_ERROR_EVENT } from "./auto-capture";
+export type {
+  AutoCaptureHandle,
+  AutoCaptureOptions,
+  AutoCaptureSource,
+} from "./auto-capture";
+
+// ── CP4: OTLP/HTTP protobuf decoders ─────────────────────────────────────────
+// Append-only block. Exported so the cloud edge (packages/cloud) can decode
+// `application/x-protobuf` OTLP bodies at ingest and forward the JSON wire shape
+// to the inner server, at parity with the local receiver's readOtlpBody.
+export {
+  decodeOtlpTraceProtobuf,
+  decodeOtlpLogsProtobuf,
+} from "./otel-protobuf";
+export type {
+  OtlpTraceRequest,
+  OtlpLogsRequest,
+  OtlpResourceSpans,
+  OtlpResourceLogs,
+} from "./otel-adapter";

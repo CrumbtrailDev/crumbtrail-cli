@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>cf-logs-bucket</Name>
+  <Prefix>cf-logs/20260708/</Prefix>
+  <KeyCount>1</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>cf-logs/20260708/20260708T123000Z_20260708T124500Z_w1.ndjson</Key>
+    <LastModified>2026-07-08T12:45:10.000Z</LastModified>
+    <ETag>&quot;w1etag&quot;</ETag>
+    <Size>420</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>

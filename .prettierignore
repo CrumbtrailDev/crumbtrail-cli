@@ -1,0 +1,20 @@
+dist/
+build/
+node_modules/
+*.d.ts
+
+# Generated fixtures / demo pipeline output and working directories
+tools/demo-pipeline/work/
+docs/gates/phase0/artifacts/
+# Generated from provider-recipes.json by scripts/verify-integration-docs.mjs;
+# the docs gate byte-compares against generator output, so prettier must not reformat.
+docs/integrations/
+tmp/
+plans/
+reports/
+
+# Landing marketing site is formatted by its own Biome tooling, not root Prettier.
+landing/
+landing/**
+
+pnpm-lock.yaml

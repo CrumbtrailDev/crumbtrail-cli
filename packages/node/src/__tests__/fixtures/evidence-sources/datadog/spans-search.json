@@ -1,0 +1,18 @@
+{
+  "data": [
+    {
+      "id": "AAAAAaEXAMPLEspanid1",
+      "type": "spans",
+      "attributes": {
+        "start_timestamp": 1783168496789000000,
+        "resource_name": "POST /api/checkout",
+        "operation_name": "web.request",
+        "service": "checkout",
+        "duration": 1284000000,
+        "trace_id": "trace-abc-123",
+        "span_id": "span-xyz-789"
+      }
+    }
+  ],
+  "meta": {}
+}

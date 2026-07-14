@@ -1,0 +1,59 @@
+{
+  "name": "crumbtrail",
+  "version": "0.2.0",
+  "description": "Crumbtrail setup CLI — detect your framework and wire the SDK into your app in one step.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crumbtrail-dev/crumbtrail-js.git",
+    "directory": "packages/cli"
+  },
+  "keywords": [
+    "crumbtrail",
+    "cli",
+    "setup",
+    "wizard",
+    "install"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "crumbtrail": "./dist/cli.cjs"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "crumbtrail-core": "workspace:^",
+    "crumbtrail-install-shared": "workspace:^"
+  },
+  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/cli#readme",
+  "bugs": {
+    "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
+  }
+}

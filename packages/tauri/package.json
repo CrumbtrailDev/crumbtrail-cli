@@ -1,0 +1,52 @@
+{
+  "name": "crumbtrail-tauri",
+  "version": "0.2.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "peerDependencies": {
+    "crumbtrail-core": "workspace:^"
+  },
+  "devDependencies": {
+    "crumbtrail-core": "workspace:^",
+    "typescript": "^5.8.3",
+    "tsup": "^8.5.0",
+    "vitest": "^3.2.0"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/tauri#readme",
+  "bugs": {
+    "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crumbtrail-dev/crumbtrail-js.git",
+    "directory": "packages/tauri"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

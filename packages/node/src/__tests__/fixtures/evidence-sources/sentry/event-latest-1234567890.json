@@ -1,0 +1,44 @@
+{
+  "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "eventID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "dateCreated": "2026-07-08T12:34:56.000Z",
+  "message": "TypeError: Cannot read properties of undefined (reading 'id')",
+  "entries": [
+    {
+      "type": "breadcrumbs",
+      "data": {
+        "values": [{ "category": "navigation", "message": "to /checkout" }]
+      }
+    },
+    {
+      "type": "exception",
+      "data": {
+        "values": [
+          {
+            "type": "TypeError",
+            "value": "Cannot read properties of undefined (reading 'id') while authorizing Bearer abcdef0123456789abcdef0123",
+            "stacktrace": {
+              "frames": [
+                {
+                  "function": "handleRequest",
+                  "filename": "app/server.ts",
+                  "lineNo": 88
+                },
+                {
+                  "function": "pay",
+                  "filename": "app/checkout/pay.ts",
+                  "lineNo": 42
+                },
+                {
+                  "function": "readId",
+                  "filename": "app/checkout/pay.ts",
+                  "lineNo": 17
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

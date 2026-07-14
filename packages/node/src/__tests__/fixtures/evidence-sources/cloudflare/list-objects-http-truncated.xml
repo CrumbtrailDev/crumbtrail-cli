@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>cf-logs-bucket</Name>
+  <Prefix>cf-logs/20260708/</Prefix>
+  <KeyCount>1000</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>true</IsTruncated>
+  <Contents>
+    <Key>cf-logs/20260708/20260708T123000Z_20260708T124500Z_a1b2c3.log.gz</Key>
+    <LastModified>2026-07-08T12:45:10.000Z</LastModified>
+    <ETag>&quot;abc123etag&quot;</ETag>
+    <Size>512</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <Contents>
+    <Key>cf-logs/20260708/20260708T200000Z_20260708T201000Z_d4e5f6.log.gz</Key>
+    <LastModified>2026-07-08T20:10:05.000Z</LastModified>
+    <ETag>&quot;def456etag&quot;</ETag>
+    <Size>640</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>

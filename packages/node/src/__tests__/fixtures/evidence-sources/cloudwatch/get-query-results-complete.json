@@ -1,0 +1,34 @@
+{
+  "status": "Complete",
+  "statistics": {
+    "recordsMatched": 2,
+    "recordsScanned": 1000,
+    "bytesScanned": 204800
+  },
+  "results": [
+    [
+      { "field": "@timestamp", "value": "2026-07-08 12:34:56.789" },
+      {
+        "field": "@message",
+        "value": "ERROR checkout failed: TypeError: Cannot read properties of undefined (reading 'id') requestId=req_abc123 while authorizing Bearer abcdef0123456789abcdef0123"
+      },
+      {
+        "field": "@ptr",
+        "value": "CoUBClgKVDQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAx"
+      },
+      { "field": "@logStream", "value": "2026/07/08/[$LATEST]abcdef0123456789" }
+    ],
+    [
+      { "field": "@timestamp", "value": "2026-07-08 12:40:00.000" },
+      {
+        "field": "@message",
+        "value": "ERROR PaymentError: gateway declined requestId=req_abc123"
+      },
+      {
+        "field": "@ptr",
+        "value": "CoUBClgKVDk4NzY1NDMyMTA5ODc2NTQzMjEwOTg3NjU0MzIxMDk4NzY1NDMyMQ"
+      },
+      { "field": "@logStream", "value": "2026/07/08/[$LATEST]abcdef0123456789" }
+    ]
+  ]
+}

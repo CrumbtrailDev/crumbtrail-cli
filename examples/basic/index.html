@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Crumbtrail Demo</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; min-height: 100vh; padding: 2rem; }
+    h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.25rem; }
+    .subtitle { color: #888; font-size: 0.875rem; margin-bottom: 2rem; }
+    .status-bar {
+      display: flex; gap: 2rem; padding: 1rem 1.25rem;
+      background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;
+      margin-bottom: 2rem; align-items: center; flex-wrap: wrap;
+    }
+    .status-item { display: flex; flex-direction: column; gap: 2px; }
+    .status-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #666; }
+    .status-value { font-size: 0.95rem; font-weight: 500; font-family: monospace; }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #444; }
+    .dot.connected { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+    .dot.stopped { background: #ef4444; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; }
+    .card {
+      background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 1.25rem;
+    }
+    .card h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: #666; margin-bottom: 1rem; }
+    .row { display: flex; flex-direction: column; gap: 0.5rem; }
+    label { font-size: 0.8rem; color: #aaa; }
+    input[type="text"], input[type="email"], input[type="password"], textarea, select {
+      width: 100%; padding: 0.5rem 0.75rem; background: #111; border: 1px solid #333;
+      border-radius: 6px; color: #e0e0e0; font-size: 0.875rem; outline: none;
+    }
+    input:focus, textarea:focus, select:focus { border-color: #555; }
+    textarea { resize: vertical; min-height: 80px; }
+    .btn-row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.25rem; }
+    button {
+      padding: 0.45rem 1rem; border-radius: 6px; border: 1px solid #333;
+      background: #252525; color: #ddd; font-size: 0.875rem; cursor: pointer;
+    }
+    button:hover { background: #333; }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    button.primary:hover { background: #1d4ed8; }
+    button.danger { background: #7f1d1d; border-color: #991b1b; color: #fca5a5; }
+    button.danger:hover { background: #991b1b; }
+    .event-log {
+      font-family: monospace; font-size: 0.75rem; line-height: 1.6;
+      max-height: 220px; overflow-y: auto; padding: 0.75rem;
+      background: #111; border: 1px solid #2a2a2a; border-radius: 6px; margin-top: 0.5rem;
+    }
+    .event-log .entry { padding: 1px 0; border-bottom: 1px solid #1a1a1a; }
+    .event-log .entry:last-child { border-bottom: none; }
+    .k-con { color: #94a3b8; }
+    .k-err { color: #f87171; }
+    .k-clk, .k-inp { color: #86efac; }
+    .k-key { color: #fde68a; }
+    .k-net { color: #93c5fd; }
+    .k-perf { color: #c4b5fd; }
+    .k-vis, .k-scr { color: #6ee7b7; }
+    .k-clip { color: #fdba74; }
+    .k-snap { color: #a5b4fc; }
+    .k-mark { color: #f0abfc; }
+    .stop-section { margin-top: 1.5rem; display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+    .session-result { font-family: monospace; font-size: 0.8rem; color: #888; }
+    a { color: #60a5fa; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <h1>Crumbtrail Demo</h1>
+  <p class="subtitle">Interact with the page — all events are recorded and sent to the local server.</p>
+
+  <div class="status-bar">
+    <div class="status-item">
+      <span class="status-label">Status</span>
+      <span class="status-value" id="status"><span class="dot" id="dot"></span>Starting…</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">Session ID</span>
+      <span class="status-value" id="session-id">—</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">Events Captured</span>
+      <span class="status-value" id="event-count">0</span>
+    </div>
+    <div class="status-item">
+      <span class="status-label">Server</span>
+      <span class="status-value"><a href="http://localhost:9898/health" target="_blank">localhost:9898</a></span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Interactions</h2>
+      <div class="row">
+        <label>Text input</label>
+        <input type="text" placeholder="Type something…" />
+      </div>
+      <div class="row" style="margin-top:0.75rem">
+        <label>Password (masked)</label>
+        <input type="password" placeholder="Not captured" />
+      </div>
+      <div class="row" style="margin-top:0.75rem">
+        <label>Email</label>
+        <input type="email" placeholder="user@example.com" />
+      </div>
+      <div class="row" style="margin-top:0.75rem">
+        <label>Select</label>
+        <select>
+          <option>Option A</option>
+          <option>Option B</option>
+          <option>Option C</option>
+        </select>
+      </div>
+      <div class="row" style="margin-top:0.75rem">
+        <label>Textarea (try copy/paste)</label>
+        <textarea placeholder="Paste something here to test clipboard…"></textarea>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Clicks &amp; Navigation</h2>
+      <div class="btn-row">
+        <button onclick="handleClick('Alpha')">Alpha</button>
+        <button onclick="handleClick('Beta')">Beta</button>
+        <button onclick="handleClick('Gamma')">Gamma</button>
+      </div>
+      <div style="margin-top:1rem">
+        <p style="font-size:0.8rem;color:#666;margin-bottom:0.5rem">Links (open in new tab)</p>
+        <div class="btn-row">
+          <a href="https://example.com" target="_blank" rel="noopener">example.com</a>
+          <a href="#section-1">Anchor link</a>
+        </div>
+      </div>
+      <div style="margin-top:1rem">
+        <p style="font-size:0.8rem;color:#666;margin-bottom:0.5rem">Throw a JS error</p>
+        <button onclick="throwError()">Throw error</button>
+      </div>
+      <div style="margin-top:1rem">
+        <p style="font-size:0.8rem;color:#666;margin-bottom:0.5rem">Console output</p>
+        <div class="btn-row">
+          <button onclick="console.log('hello from demo')">console.log</button>
+          <button onclick="console.warn('demo warning')">console.warn</button>
+          <button onclick="console.error('demo error')">console.error</button>
+        </div>
+      </div>
+      <div style="margin-top:1rem">
+        <p style="font-size:0.8rem;color:#666;margin-bottom:0.5rem">Network fetch</p>
+        <button onclick="doFetch()">Fetch /health</button>
+      </div>
+      <div style="margin-top:1rem">
+        <p style="font-size:0.8rem;color:#666;margin-bottom:0.5rem">Manual mark</p>
+        <button onclick="addMark()">Add mark</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Live Event Log</h2>
+      <div class="event-log" id="log"><div class="entry" style="color:#555">Waiting for events…</div></div>
+    </div>
+  </div>
+
+  <div class="stop-section">
+    <button class="danger" id="stop-btn" onclick="stopSession()">Stop Session</button>
+    <span class="session-result" id="stop-result"></span>
+  </div>
+
+  <div id="section-1" style="margin-top:3rem;color:#444;font-size:0.75rem">— anchor target —</div>
+
+  <script type="module">
+    import { Crumbtrail } from '../../packages/core/dist/index.js';
+
+    let eventCount = 0;
+    let logger = null;
+
+    // Patch EventBus to intercept events for the live log
+    // We wrap the transport to count and display events
+    class LoggingTransport {
+      constructor(inner) { this.inner = inner; }
+      async startSession(id, meta) { return this.inner.startSession(id, meta); }
+      async endSession(id) { return this.inner.endSession(id); }
+      async sendBlob(name, blob, meta) { return this.inner.sendBlob(name, blob, meta); }
+      async sendEvents(events) {
+        for (const ev of events) appendToLog(ev);
+        return this.inner.sendEvents(events);
+      }
+      async sendBugReport(report, events, voiceBlob) {
+        return this.inner.sendBugReport(report, events, voiceBlob);
+      }
+    }
+
+    function appendToLog(ev) {
+      eventCount++;
+      document.getElementById('event-count').textContent = eventCount;
+
+      const log = document.getElementById('log');
+      if (log.firstChild?.textContent === 'Waiting for events…') log.innerHTML = '';
+
+      const entry = document.createElement('div');
+      entry.className = 'entry';
+      const k = ev.k || '?';
+      const prefix = k.split('.')[0];
+      entry.innerHTML = `<span class="k-${prefix}">[${k}]</span> ${JSON.stringify(ev.d).slice(0, 120)}`;
+      log.appendChild(entry);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    async function init() {
+      // Use a plain HttpTransport wrapped for logging
+      const { HttpTransport } = await import('../../packages/core/dist/index.js');
+      const inner = new HttpTransport('http://localhost:9898');
+      const transport = new LoggingTransport(inner);
+
+      logger = Crumbtrail.init({
+        transportInstance: transport,
+        httpEndpoint: 'http://localhost:9898',
+        flushIntervalMs: 2000,
+        video: false,
+        audio: false,
+        widget: true,
+      });
+
+      // Expose sessionId (private, but grab it via stop to get the id)
+      document.getElementById('dot').className = 'dot connected';
+      document.getElementById('status').innerHTML = '<span class="dot connected"></span>Recording';
+
+      const sessionIdEl = document.getElementById('session-id');
+      // We'll show it after stop — or read it from the init return
+      // Crumbtrail.init doesn't expose sessionId directly; show placeholder
+      sessionIdEl.textContent = '(active)';
+    }
+
+    window.handleClick = function(label) {
+      logger?.mark(`click:${label}`);
+    };
+
+    window.throwError = function() {
+      setTimeout(() => { throw new Error('Demo error from Crumbtrail example'); }, 0);
+    };
+
+    window.doFetch = function() {
+      fetch('http://localhost:9898/health').catch(() => {});
+    };
+
+    window.addMark = function() {
+      logger?.mark('manual-mark');
+    };
+
+    window.stopSession = async function() {
+      if (!logger) return;
+      const btn = document.getElementById('stop-btn');
+      btn.disabled = true;
+      btn.textContent = 'Stopping…';
+      try {
+        const { sessionId } = await logger.stop();
+        document.getElementById('dot').className = 'dot stopped';
+        document.getElementById('status').innerHTML = '<span class="dot stopped"></span>Stopped';
+        document.getElementById('session-id').textContent = sessionId;
+        document.getElementById('stop-result').textContent =
+          `Session saved → ~/.crumbtrail/sessions/${sessionId}/`;
+        logger = null;
+      } catch (e) {
+        btn.disabled = false;
+        btn.textContent = 'Stop Session';
+      }
+    };
+
+    init().catch(console.error);
+  </script>
+</body>
+</html>

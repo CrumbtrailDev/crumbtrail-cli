@@ -1,0 +1,30 @@
+{
+  "name": "crumbtrail-js",
+  "private": true,
+  "description": "Crumbtrail SDKs and CLI — the published npm packages.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crumbtrail-dev/crumbtrail-js.git"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r --if-present run typecheck",
+    "lint": "eslint .",
+    "clean": "pnpm -r clean"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@vitest/coverage-v8": "^3.2.4",
+    "eslint": "^10.6.0",
+    "express": "^5.2.1",
+    "globals": "^17.7.0",
+    "happy-dom": "^17.4.0",
+    "prettier": "^3.5.0",
+    "tsup": "^8.4.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.62.1",
+    "vitest": "^3.1.0"
+  }
+}

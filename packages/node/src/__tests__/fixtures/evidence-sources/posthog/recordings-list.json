@@ -1,0 +1,12 @@
+{
+  "results": [
+    {
+      "id": "rec-EXAMPLE-0001",
+      "distinct_id": "user-42",
+      "start_time": "2026-07-08T12:30:00.000Z",
+      "end_time": "2026-07-08T12:33:20.000Z",
+      "recording_duration": 200
+    }
+  ],
+  "has_next": false
+}

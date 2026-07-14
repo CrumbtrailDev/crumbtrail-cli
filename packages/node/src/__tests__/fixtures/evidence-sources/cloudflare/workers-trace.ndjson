@@ -1,0 +1,2 @@
+{"Outcome":"exception","ScriptName":"checkout-worker","EventType":"fetch","EventTimestampMs":1783514096789,"RayID":"aa11bb22cc33dd44","Logs":[{"Level":"log","Message":["processing order 8891"],"TimestampMs":1783514096700}],"Exceptions":[{"Name":"TypeError","Message":"Cannot read properties of undefined (reading 'id') authorizing Bearer abcdef0123456789abcdef0123","TimestampMs":1783514096780}]}
+{"Outcome":"ok","ScriptName":"checkout-worker","EventType":"fetch","EventTimestampMs":1783514400000,"RayID":"bb22cc33dd44ee55","Logs":[],"Exceptions":[]}

@@ -1,0 +1,63 @@
+[
+  {
+    "id": "otel",
+    "title": "OpenTelemetry SDK",
+    "docFile": "opentelemetry.md",
+    "description": "Point any OTLP-capable SDK at Crumbtrail's OTLP/HTTP receiver.",
+    "config": "export OTEL_EXPORTER_OTLP_ENDPOINT={{endpoint}}\nexport OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf",
+    "notes": [
+      "Use the Crumbtrail server base URL as the OTLP endpoint; SDK exporters append /v1/traces and /v1/logs.",
+      "Sessionless spans and logs are accepted and grouped into auto sessions. Add crumbtrail.session.id later when you want explicit frontend session joins."
+    ]
+  },
+  {
+    "id": "datadog",
+    "title": "Datadog",
+    "docFile": "datadog.md",
+    "description": "Keep the Datadog exporter and add Crumbtrail as a second OTLP/HTTP exporter.",
+    "config": "exporters:\n  datadog:\n    api:\n      key: ${env:DD_API_KEY}\n  otlphttp/crumbtrail:\n    endpoint: {{endpoint}}\n    compression: none\n\nservice:\n  pipelines:\n    traces:\n      exporters: [datadog, otlphttp/crumbtrail]\n    logs:\n      exporters: [datadog, otlphttp/crumbtrail]",
+    "notes": [
+      "Use otlphttp/crumbtrail, not otlp/crumbtrail, for Crumbtrail's HTTP listener.",
+      "For dd-trace deployments that already emit OTLP, add Crumbtrail as an additional OTLP/HTTP destination.",
+      "Crumbtrail's exporter sets compression: none (the collector's OTLP/HTTP default is gzip). Crumbtrail accepts gzip too, but none keeps this recipe honest with the receiver's recommended posture.",
+      "Reference the Datadog API key via the ${env:DD_API_KEY} expansion so the collector reads it from the environment."
+    ]
+  },
+  {
+    "id": "sentry",
+    "title": "Sentry via OpenTelemetry",
+    "docFile": "sentry.md",
+    "description": "Fan out OpenTelemetry-backed Sentry traces to Crumbtrail.",
+    "config": "exporters:\n  otlphttp/sentry:\n    endpoint: ${SENTRY_OTLP_ENDPOINT}\n  otlphttp/crumbtrail:\n    endpoint: {{endpoint}}\n    compression: none\n\nservice:\n  pipelines:\n    traces:\n      exporters: [otlphttp/sentry, otlphttp/crumbtrail]",
+    "notes": [
+      "Keep Sentry as the system of record for issues; Crumbtrail consumes the same traces as agent-readable evidence.",
+      "Sentry-side exporter auth is deployment-specific — configure the otlphttp/sentry exporter's authentication per your Sentry setup (self-hosted vs. SaaS differ). This recipe does not prescribe a header.",
+      "Crumbtrail's exporter sets compression: none to match the receiver's recommended posture (gzip is also accepted).",
+      "Backfill import is Wave 2; this recipe is for live OTLP fanout."
+    ]
+  },
+  {
+    "id": "grafana",
+    "title": "Grafana Alloy",
+    "docFile": "grafana-alloy.md",
+    "description": "Forward Alloy OTel pipelines to Crumbtrail.",
+    "config": "otelcol.exporter.otlphttp \"crumbtrail\" {\n  client {\n    endpoint    = \"{{endpoint}}\"\n    compression = \"none\"\n  }\n}\n\notelcol.processor.batch \"default\" {\n  output {\n    traces = [otelcol.exporter.otlphttp.crumbtrail.input]\n    logs   = [otelcol.exporter.otlphttp.crumbtrail.input]\n  }\n}",
+    "notes": [
+      "This is an OTLP/HTTP exporter; do not point Alloy's OTLP gRPC exporter at Crumbtrail's HTTP port.",
+      "Keep your existing Grafana export path and add Crumbtrail as a second output.",
+      "The client sets compression = \"none\" to match the receiver's recommended posture (gzip is also accepted)."
+    ]
+  },
+  {
+    "id": "splunk",
+    "title": "Splunk Observability Cloud",
+    "docFile": "splunk.md",
+    "description": "Fan out Splunk OTel Collector telemetry to Crumbtrail.",
+    "config": "exporters:\n  otlphttp/splunk:\n    traces_endpoint: https://ingest.${SPLUNK_REALM}.signalfx.com/v2/trace/otlp\n    headers:\n      X-SF-Token: ${SPLUNK_ACCESS_TOKEN}\n  otlphttp/crumbtrail:\n    endpoint: {{endpoint}}\n    compression: none\n\nservice:\n  pipelines:\n    traces:\n      exporters: [otlphttp/splunk, otlphttp/crumbtrail]\n    logs:\n      exporters: [otlphttp/crumbtrail]",
+    "notes": [
+      "Splunk Observability Cloud ingests OTLP traces at the realm's /v2/trace/otlp endpoint (traces_endpoint); the Splunk exporter here mirrors traces only.",
+      "Splunk Platform logs go through HEC, not this OTLP trace endpoint — sending Splunk logs is out of scope for this recipe, so the logs pipeline exports to Crumbtrail only.",
+      "Crumbtrail still receives both traces (/v1/traces) and logs (/v1/logs), with compression: none to match the receiver's recommended posture (gzip is also accepted)."
+    ]
+  }
+]

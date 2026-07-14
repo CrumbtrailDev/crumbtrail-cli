@@ -1,0 +1,28 @@
+{
+  "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "eventID": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "dateCreated": "2026-07-08T12:40:00.000Z",
+  "message": "PaymentError: gateway declined",
+  "entries": [
+    {
+      "type": "exception",
+      "data": {
+        "values": [
+          {
+            "type": "PaymentError",
+            "value": "gateway declined",
+            "stacktrace": {
+              "frames": [
+                {
+                  "function": "charge",
+                  "filename": "app/checkout/gateway.ts",
+                  "lineNo": 25
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

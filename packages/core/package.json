@@ -1,0 +1,48 @@
+{
+  "name": "crumbtrail-core",
+  "version": "0.2.1",
+  "description": "Browser SDK for capturing Crumbtrail sessions and sending evidence to a local Crumbtrail server.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crumbtrail-dev/crumbtrail-js.git",
+    "directory": "packages/core"
+  },
+  "keywords": [
+    "crumbtrail",
+    "debugging",
+    "session-replay",
+    "observability",
+    "browser-sdk"
+  ],
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/core#readme",
+  "bugs": {
+    "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
+  }
+}

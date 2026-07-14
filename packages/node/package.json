@@ -1,0 +1,66 @@
+{
+  "name": "crumbtrail-node",
+  "version": "0.2.1",
+  "description": "Local Crumbtrail server, MCP evidence tools, Express middleware, and CLI for self-hosted debugging sessions.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crumbtrail-dev/crumbtrail-js.git",
+    "directory": "packages/node"
+  },
+  "keywords": [
+    "crumbtrail",
+    "debugging",
+    "mcp",
+    "observability",
+    "cli"
+  ],
+  "mcpName": "io.github.crumbtrail-dev/crumbtrail",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "crumbtrail-server": "./dist/cli.cjs"
+  },
+  "engines": {
+    "node": ">=22.15.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "verify:package-runtime": "pnpm build && node scripts/verify-package-runtime.mjs",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "crumbtrail-core": "workspace:^",
+    "protobufjs": "^8.6.5"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.5.0",
+    "express": "^5.2.1",
+    "typescript": "^5.7.0"
+  },
+  "homepage": "https://github.com/crumbtrail-dev/crumbtrail-js/tree/main/packages/node#readme",
+  "bugs": {
+    "url": "https://github.com/crumbtrail-dev/crumbtrail-js/issues"
+  }
+}

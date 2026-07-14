@@ -1,0 +1,27 @@
+{
+  "data": [
+    {
+      "id": "AAAAAaEXAMPLElogid1",
+      "type": "log",
+      "attributes": {
+        "timestamp": "2026-07-08T12:34:56.789Z",
+        "status": "error",
+        "service": "checkout",
+        "message": "checkout failed: TypeError: Cannot read properties of undefined (reading 'id') while authorizing Bearer abcdef0123456789abcdef0123",
+        "tags": ["env:prod", "service:checkout"]
+      }
+    },
+    {
+      "id": "AAAAAaEXAMPLElogid2",
+      "type": "log",
+      "attributes": {
+        "timestamp": "2026-07-08T12:40:00.000Z",
+        "status": "error",
+        "service": "checkout",
+        "message": "PaymentError: gateway declined for order 8891",
+        "tags": ["env:prod", "service:checkout"]
+      }
+    }
+  ],
+  "meta": { "page": { "after": "eyJhZnRlciI6ImV4YW1wbGUifQ==" } }
+}
