@@ -171,9 +171,9 @@ export interface CallbackServer {
 }
 
 const CALLBACK_PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>Crumbtrail CLI</title>
-<style>body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;display:grid;place-items:center;height:100vh;margin:0}
-.card{background:#1e293b;padding:2rem 2.5rem;border-radius:12px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.4)}
-h1{color:#319B7C;margin:0 0 .5rem;font-size:1.25rem}p{margin:0;color:#94a3b8}</style></head>
+<style>body{font-family:system-ui,sans-serif;background:radial-gradient(circle at top,#16341f33,transparent 34rem),#0f172a;color:#e2e8f0;display:grid;place-items:center;min-height:100vh;margin:0}
+.card{background:#1e293b;border:1px solid #334155;padding:2rem 2.5rem;border-radius:12px;text-align:center;box-shadow:0 24px 80px rgba(2,6,23,.5)}
+h1{color:#22c55e;margin:0 0 .5rem;font-size:1.25rem}p{margin:0;color:#94a3b8}</style></head>
 <body><div class="card"><h1>Crumbtrail connected ✓</h1><p>You can close this tab and return to your terminal.</p></div></body></html>`;
 
 /** Start an ephemeral localhost listener that captures the browser callback. */

@@ -50,16 +50,16 @@
     "react": "^19.0.0",
     "tsup": "^8.4.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.1.0"
+    "vitest": "^4.1.10"
   },
   "license": "MIT",
   "homepage": "https://crumbtrail.dev",
   "bugs": {
-    "url": "https://github.com/CrumbtrailDev/crumbtrail-js/issues"
+    "url": "https://github.com/CrumbtrailDev/crumbtrail-cli/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CrumbtrailDev/crumbtrail-js.git",
+    "url": "git+https://github.com/CrumbtrailDev/crumbtrail-cli.git",
     "directory": "packages/react-native"
   },
   "publishConfig": {

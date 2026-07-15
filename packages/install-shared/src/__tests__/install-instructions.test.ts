@@ -10,6 +10,7 @@ import {
   buildBackendJsNote,
   buildOtlpSnippets,
   getInstallVariant,
+  keyEnvRef,
 } from "../index";
 
 const keys = { endpoint: "https://app.crumbtrail.com", apiKey: "bl_live_xyz" };
@@ -101,13 +102,23 @@ describe("install-instructions snippets", () => {
     }
   });
 
-  it("agent prompt bakes in the real endpoint + key for JS stacks", () => {
+  it("agent prompt is hands-off for JS stacks — env var, never the literal key", () => {
     const p = buildAgentPrompt("react", keys);
     expect(p).toContain("https://app.crumbtrail.com");
-    expect(p).toContain("bl_live_xyz");
     expect(p).toContain("PRESET_PASSIVE");
+    // Hands-off: the live key is NEVER baked into the JS prompt; it references
+    // the framework-correct env var instead (react → Vite).
+    expect(p).not.toContain("bl_live_xyz");
+    expect(p).toContain("VITE_CRUMBTRAIL_KEY");
+    expect(p).toContain("import.meta.env.VITE_CRUMBTRAIL_KEY");
     // Frontend-only JS stack gets no middleware line.
     expect(p).not.toContain("crumbtrail-node");
+  });
+
+  it("agent prompt uses Next's public env var for the nextjs stack", () => {
+    const p = buildAgentPrompt("nextjs", keys);
+    expect(p).not.toContain("bl_live_xyz");
+    expect(p).toContain("process.env.NEXT_PUBLIC_CRUMBTRAIL_KEY");
   });
 
   it("agent prompt wires the real Express middleware for the express stack", () => {
@@ -116,6 +127,9 @@ describe("install-instructions snippets", () => {
     expect(p).toContain("crumbtrail-node");
     expect(p).toContain("createCrumbtrailExpressMiddleware");
     expect(p).toContain("createCrumbtrailExpressErrorMiddleware");
+    // Hands-off: backend reads the key from the environment, not a literal.
+    expect(p).not.toContain("bl_live_xyz");
+    expect(p).toContain("process.env.CRUMBTRAIL_KEY");
     // No invented names.
     expect(p).not.toContain("attachCrumbtrail");
   });
@@ -126,6 +140,8 @@ describe("install-instructions snippets", () => {
       expect(p).toContain("PRESET_PASSIVE");
       expect(p).toContain("crumbtrail-node");
       expect(p).toContain("startHeadlessSession");
+      expect(p).not.toContain("bl_live_xyz");
+      expect(p).toContain("process.env.CRUMBTRAIL_KEY");
       // Express-only middleware must not leak into non-express stacks.
       expect(p).not.toContain("createCrumbtrailExpressMiddleware");
       expect(p).not.toContain("attachCrumbtrail");
@@ -137,8 +153,23 @@ describe("install-instructions snippets", () => {
     expect(p).toContain(
       "OTEL_EXPORTER_OTLP_ENDPOINT=https://app.crumbtrail.com",
     );
+    // OTLP auth is an env-var header (OTEL_EXPORTER_OTLP_HEADERS), not source, so
+    // it legitimately carries the key value.
     expect(p).toContain("X-Crumbtrail-Auth: bl_live_xyz");
     expect(p).toContain("crumbtrail.session.id");
     expect(p).not.toContain("PRESET_PASSIVE");
+  });
+
+  it("keyEnvRef maps stacks to the framework-correct public env var", () => {
+    expect(keyEnvRef("nextjs")).toEqual({
+      envVar: "NEXT_PUBLIC_CRUMBTRAIL_KEY",
+      expr: "process.env.NEXT_PUBLIC_CRUMBTRAIL_KEY",
+    });
+    for (const s of ["react", "vue", "svelte", "vite"] as const) {
+      expect(keyEnvRef(s).expr).toBe("import.meta.env.VITE_CRUMBTRAIL_KEY");
+    }
+    for (const s of ["express", "hono", "node"] as const) {
+      expect(keyEnvRef(s).expr).toBe("process.env.CRUMBTRAIL_KEY");
+    }
   });
 });

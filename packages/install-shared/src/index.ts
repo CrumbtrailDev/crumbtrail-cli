@@ -83,8 +83,53 @@ export function allStackInstalls(): StackInstall[] {
 export interface EndpointKey {
   /** Live ingest endpoint (the cloud origin / dashboard origin). */
   endpoint: string;
-  /** Live ingest key used as the auth token. */
+  /**
+   * Live ingest key. Used only by the OTLP path (an env-var header, not source)
+   * and left available for callers. The JS agent prompt is hands-off — it reads
+   * the key from an env var and never bakes this literal into source.
+   */
   apiKey: string;
+}
+
+export interface KeyEnvRef {
+  /** The env var the user sets to their ingest key. */
+  envVar: string;
+  /** The code expression the SDK init reads it from. */
+  expr: string;
+}
+
+const VITE_KEY_ENV: KeyEnvRef = {
+  envVar: "VITE_CRUMBTRAIL_KEY",
+  expr: "import.meta.env.VITE_CRUMBTRAIL_KEY",
+};
+const NEXT_KEY_ENV: KeyEnvRef = {
+  envVar: "NEXT_PUBLIC_CRUMBTRAIL_KEY",
+  expr: "process.env.NEXT_PUBLIC_CRUMBTRAIL_KEY",
+};
+const SERVER_KEY_ENV: KeyEnvRef = {
+  envVar: "CRUMBTRAIL_KEY",
+  expr: "process.env.CRUMBTRAIL_KEY",
+};
+
+/**
+ * The env-var reference the SDK reads its ingest key from, per stack. Client
+ * bundlers only expose a var under a framework-specific PUBLIC prefix (Next →
+ * NEXT_PUBLIC_, Vite-based React/Vue/Svelte/Vite → VITE_); backends read a plain
+ * server var. This is the single source of truth for the hands-off key posture —
+ * the key lives in the user's env, never inlined into committed source.
+ */
+export function keyEnvRef(stack: Stack): KeyEnvRef {
+  switch (stack) {
+    case "nextjs":
+      return NEXT_KEY_ENV;
+    case "react":
+    case "vue":
+    case "svelte":
+    case "vite":
+      return VITE_KEY_ENV;
+    default:
+      return SERVER_KEY_ENV;
+  }
 }
 
 /**
@@ -226,32 +271,43 @@ export function buildOtlpSnippets({
 }
 
 /**
- * Build the "Install via AI" agent prompt — a copyable block with the real
- * endpoint + key baked in. It instructs a coding agent to run the correct setup
- * for the stack, initialize with PRESET_PASSIVE (JS), wire backend middleware
- * when applicable, change nothing else, and verify the build.
+ * Build the "Install via AI" agent prompt — a copyable block that instructs a
+ * coding agent to run the correct setup for the stack, initialize with
+ * PRESET_PASSIVE (JS), wire backend middleware when applicable, change nothing
+ * else, and verify the build. Hands-off with the key: the JS prompt tells the
+ * agent to read the key from a framework-correct env var (which the user sets)
+ * and NEVER to hard-code it, so a live credential can't land in committed source.
+ * Only the OTLP path references the key value directly — there it's an env-var
+ * header (OTEL_EXPORTER_OTLP_HEADERS), not source.
+ *
+ * `keyEnv` overrides how the JS prompt names the key var. `keyEnvRef(stack)` only
+ * knows the coarse stack (nextjs/react/vue/svelte/vite/server), so callers with a
+ * finer notion of the framework — e.g. the CLI, which distinguishes Astro's
+ * `PUBLIC_` prefix and Expo/React Native's `EXPO_PUBLIC_` (`process.env`, not
+ * `import.meta.env`) — pass the exact ref so the prompt matches the injected code.
  */
-export function buildAgentPrompt(stack: Stack, keys: EndpointKey): string {
+export function buildAgentPrompt(
+  stack: Stack,
+  keys: EndpointKey,
+  keyEnv?: KeyEnvRef,
+): string {
   const { kind, backendJs } = getInstallVariant(stack);
   const { endpoint, apiKey } = keys;
-  const header = [
-    "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
-    "do not refactor or touch anything else, then verify the build still passes.",
-    "",
-    `Ingest endpoint: ${endpoint}`,
-    `Ingest key:      ${apiKey}`,
-    "",
-  ];
 
   if (kind === "otlp") {
     return [
-      ...header,
+      "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
+      "do not refactor or touch anything else, then verify the build still passes.",
+      "",
+      `Ingest endpoint: ${endpoint}`,
+      "",
       "This is a non-JS backend that already uses OpenTelemetry. Do NOT install a",
       "second SDK. Instead, add Crumbtrail as an additional OTLP/HTTP exporter:",
       `  1. Set OTEL_EXPORTER_OTLP_ENDPOINT=${endpoint} (the exporter appends`,
       "     /v1/traces and /v1/logs — do not add those paths).",
       `  2. Send the auth header X-Crumbtrail-Auth: ${apiKey} on every export`,
-      "     (or Authorization: Bearer <key> if your exporter prefers that).",
+      "     (or Authorization: Bearer <key> if your exporter prefers that). Keep",
+      "     this key in your environment, not in committed source.",
       "  3. Stamp the resource attribute crumbtrail.session.id so spans/logs join",
       "     the right session.",
       "  4. Keep your existing exporter — add Crumbtrail alongside it.",
@@ -259,8 +315,15 @@ export function buildAgentPrompt(stack: Stack, keys: EndpointKey): string {
     ].join("\n");
   }
 
+  const { envVar, expr } = keyEnv ?? keyEnvRef(stack);
   const jsLines = [
-    ...header,
+    "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
+    "do not refactor or touch anything else, then verify the build still passes.",
+    "",
+    `Ingest endpoint: ${endpoint}`,
+    `Ingest key:      read it from the ${envVar} environment variable — the user`,
+    "                 sets it in their .env. Do NOT hard-code the key in source.",
+    "",
     "This is a JavaScript/TypeScript project. Do the following:",
     "  1. Install the SDK:  npm install crumbtrail-core",
     '  2. Import the SDK:  import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
@@ -268,7 +331,7 @@ export function buildAgentPrompt(stack: Stack, keys: EndpointKey): string {
     "       Crumbtrail.init({",
     "         ...PRESET_PASSIVE,",
     `         httpEndpoint: "${endpoint}",`,
-    `         httpAuthToken: "${apiKey}",`,
+    `         httpAuthToken: ${expr},`,
     "       });",
   ];
   if (backendJs && stack === "express") {
@@ -279,7 +342,7 @@ export function buildAgentPrompt(stack: Stack, keys: EndpointKey): string {
       "         createCrumbtrailExpressMiddleware,",
       "         createCrumbtrailExpressErrorMiddleware,",
       '       } from "crumbtrail-node";',
-      `       const opts = { endpoint: "${endpoint}", authToken: "${apiKey}" };`,
+      `       const opts = { endpoint: "${endpoint}", authToken: process.env.CRUMBTRAIL_KEY };`,
       "       app.use(createCrumbtrailExpressMiddleware(opts));      // before your routes",
       "       app.use(createCrumbtrailExpressErrorMiddleware(opts)); // after your routes",
       "  5. Change nothing else, then verify the build still passes.",
@@ -292,7 +355,7 @@ export function buildAgentPrompt(stack: Stack, keys: EndpointKey): string {
       '       import { startHeadlessSession } from "crumbtrail-node";',
       "       const session = await startHeadlessSession({",
       `         endpoint: "${endpoint}",`,
-      `         authToken: "${apiKey}",`,
+      "         authToken: process.env.CRUMBTRAIL_KEY,",
       '         sessionId: "<your-session-id>",',
       "       });",
       "       // session.record(event) for server events; session.end() when the request ends.",

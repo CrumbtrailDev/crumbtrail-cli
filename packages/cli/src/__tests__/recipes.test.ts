@@ -91,8 +91,9 @@ describe("buildPlan — Next.js", () => {
     expect(plan.kind).toBe("fallback-ai");
     expect(plan.warnings.join(" ")).toMatch(/use client|Server Component/i);
     expect(plan.snippet).toContain(`httpEndpoint: "${ENDPOINT}"`);
-    // Hands-off: the agent prompt shows the placeholder, never a live key.
-    expect(plan.agentPrompt).toContain(KEY_PLACEHOLDER);
+    // Hands-off: the agent prompt names the env var to set (matching the
+    // injected snippet), never a live key.
+    expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
     expectNoKeyLiteral(plan.agentPrompt);
   });
 
@@ -196,7 +197,7 @@ describe("buildPlan — Next.js", () => {
     );
     expect(plan.kind).toBe("fallback-ai");
     expect(plan.agentPrompt).toContain(ENDPOINT);
-    expect(plan.agentPrompt).toContain(KEY_PLACEHOLDER);
+    expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
     expectNoKeyLiteral(plan.agentPrompt);
   });
 });
@@ -339,7 +340,7 @@ describe("buildPlan — React Native", () => {
     );
     expect(plan.kind).toBe("fallback-ai");
     expect(plan.snippet).toContain("createReactNativeCrumbtrail");
-    expect(plan.agentPrompt).toContain(KEY_PLACEHOLDER);
+    expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
     expectNoKeyLiteral(plan.agentPrompt);
   });
 });
@@ -467,7 +468,7 @@ describe("buildPlan — dirty file + ambiguity", () => {
     );
     expect(plan.kind).toBe("fallback-ai");
     expect(plan.snippet).toContain(ENDPOINT);
-    expect(plan.agentPrompt).toContain(KEY_PLACEHOLDER);
+    expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
     expectNoKeyLiteral(plan.agentPrompt);
   });
 });
@@ -527,7 +528,7 @@ describe("buildPlan — backend-JS recipes (express/hono/fastify)", () => {
       );
       expect(plan.kind).toBe("fallback-ai");
       expect(plan.snippet).toContain(ENDPOINT);
-      expect(plan.agentPrompt).toContain(KEY_PLACEHOLDER);
+      expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
       expect(plan.agentPrompt).toContain("crumbtrail-node");
       expectNoKeyLiteral(plan.agentPrompt);
     });
@@ -614,7 +615,7 @@ describe("buildPlan — Node recipe", () => {
     );
     expect(plan.kind).toBe("fallback-ai");
     expect(plan.agentPrompt).toContain("crumbtrail-node");
-    expect(plan.agentPrompt).toContain(KEY_PLACEHOLDER);
+    expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
   });
 });
 
@@ -657,7 +658,7 @@ describe("buildPlan — Remix", () => {
     );
     expect(plan.kind).toBe("fallback-ai");
     expect(plan.snippet).toContain(ENDPOINT);
-    expect(plan.agentPrompt).toContain(KEY_PLACEHOLDER);
+    expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
     expectNoKeyLiteral(plan.agentPrompt);
   });
 
@@ -699,7 +700,7 @@ describe("buildPlan — Astro", () => {
     );
     expectNoKeyLiteral(plan.snippet);
     expect(plan.snippet).toContain('from "crumbtrail-core"');
-    expect(plan.agentPrompt).toContain(KEY_PLACEHOLDER);
+    expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
     expect(plan.warnings.join(" ")).toMatch(/layout/i);
     expect(plan.keyEnvVar).toBe("PUBLIC_CRUMBTRAIL_KEY");
   });

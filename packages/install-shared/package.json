@@ -1,6 +1,6 @@
 {
   "name": "crumbtrail-install-shared",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -27,17 +27,18 @@
     "crumbtrail-core": "workspace:^"
   },
   "devDependencies": {
+    "@types/node": "^25.5.0",
     "@types/react": "^19.0.0",
     "react": "^19.0.0"
   },
   "license": "MIT",
   "homepage": "https://crumbtrail.dev",
   "bugs": {
-    "url": "https://github.com/CrumbtrailDev/crumbtrail-js/issues"
+    "url": "https://github.com/CrumbtrailDev/crumbtrail-cli/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CrumbtrailDev/crumbtrail-js.git",
+    "url": "git+https://github.com/CrumbtrailDev/crumbtrail-cli.git",
     "directory": "packages/install-shared"
   },
   "publishConfig": {

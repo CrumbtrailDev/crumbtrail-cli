@@ -29,8 +29,8 @@ it — not because it's a useful standalone API. It has no stability guarantees.
 
 - **Website** — https://crumbtrail.dev
 - **Docs** — https://crumbtrail.dev/docs
-- **Source** — https://github.com/CrumbtrailDev/crumbtrail-js
-- **Issues** — https://github.com/CrumbtrailDev/crumbtrail-js/issues
+- **Source** — https://github.com/CrumbtrailDev/crumbtrail-cli
+- **Issues** — https://github.com/CrumbtrailDev/crumbtrail-cli/issues
 
 ## License
 

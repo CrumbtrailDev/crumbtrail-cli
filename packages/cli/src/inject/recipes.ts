@@ -87,11 +87,18 @@ function fallbackPlan(
     content: null,
     snippet,
     // Hands-off: the prompt reads the key from env / the dashboard, never a
-    // baked-in literal (KEY_PLACEHOLDER stands in for the user's own key).
-    agentPrompt: buildAgentPrompt(RECIPE_REGISTRY[input.recipe].stack, {
-      endpoint: input.endpoint,
-      apiKey: KEY_PLACEHOLDER,
-    }),
+    // baked-in literal (KEY_PLACEHOLDER stands in for the user's own key). Pass
+    // the recipe's exact keyRef so the prompt names the same env var the injected
+    // snippet reads (e.g. Astro's PUBLIC_, Expo's EXPO_PUBLIC_) — the coarse Stack
+    // alone can't distinguish those.
+    agentPrompt: buildAgentPrompt(
+      RECIPE_REGISTRY[input.recipe].stack,
+      {
+        endpoint: input.endpoint,
+        apiKey: KEY_PLACEHOLDER,
+      },
+      RECIPE_REGISTRY[input.recipe].keyRef,
+    ),
     warnings,
   };
 }

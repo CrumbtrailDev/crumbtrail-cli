@@ -83,8 +83,8 @@ for the three-line manual setup.
 - **Docs** — https://crumbtrail.dev/docs
 - **How it works** — https://crumbtrail.dev/how-it-works
 - **Pricing** — https://crumbtrail.dev/pricing
-- **Source** — https://github.com/CrumbtrailDev/crumbtrail-js
-- **Issues** — https://github.com/CrumbtrailDev/crumbtrail-js/issues
+- **Source** — https://github.com/CrumbtrailDev/crumbtrail-cli
+- **Issues** — https://github.com/CrumbtrailDev/crumbtrail-cli/issues
 
 ## License
 
