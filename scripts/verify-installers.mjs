@@ -4,10 +4,12 @@
 //
 // For each recipe: pack the SDK+CLI locally, stand up a fresh temp app from a
 // real fixture, drive the REAL setup wizard against a stub cloud, then assert the
-// wiring actually landed (entry file wired + .env + ingest key) and an AUTHED
-// session reached the ingest stub. The install-order and wizardStart-poll fixes
-// are exercised for real because the pipeline runs the wizard's own exported
-// functions (defaultDeps() from packages/cli/dist), not a re-implementation.
+// wiring actually landed (entry file wired, no key written — the installer is
+// hands-off) and an AUTHED session reached the ingest stub once the harness
+// supplies the key via the env var the injected code reads (as a user would).
+// The install-order and wizardStart-poll fixes are exercised for real because
+// the pipeline runs the wizard's own exported functions (defaultDeps() from
+// packages/cli/dist), not a re-implementation.
 //
 // House style mirrors scripts/verify-quickstart-timed.mjs: mkdtemp + kill-before-
 // run + finally cleanup, phase logs, non-zero exit on FAIL.
@@ -268,14 +270,17 @@ async function runRecipeInproc({ name, packed, tmpRoot }) {
       `entry file ${detected.entryFile} was NOT wired (no crumbtrail-node reference) — injection self-cancelled after SDK install`,
     );
   }
-  // 2. .env carries the ingest key.
+  // 2. Hands-off: the installer writes NO ingest key to .env — the user sets it.
+  // Assert no CRUMBTRAIL_KEY line was written; the injected snippet reads it from
+  // process.env, which the boom-drive below supplies to prove the authed
+  // round-trip (the way a user who set their env would get).
   const envText = (await readFileSafe(path.join(appDir, ".env"))) ?? "";
-  if (!new RegExp(`^CRUMBTRAIL_KEY=${stub.apiKey}$`, "m").test(envText)) {
+  if (/^CRUMBTRAIL_KEY=/m.test(envText)) {
     throw new Error(
-      `.env missing 'CRUMBTRAIL_KEY=${stub.apiKey}' — env action did not run`,
+      `hands-off installer must not write CRUMBTRAIL_KEY to .env, but it did`,
     );
   }
-  phase("PASS", `${name}:injected`, `env+entry wired`);
+  phase("PASS", `${name}:injected`, `entry wired; no key written to .env`);
 
   // 2b. Live app drive (CP1): when a recipe carries an active boom-error-event
   // assertion, boot the wired app for real (real SDK installed, plain node start
@@ -285,7 +290,17 @@ async function runRecipeInproc({ name, packed, tmpRoot }) {
     (w) => w.id === "boom-error-event" && w.status === "active",
   );
   if (boomActive) {
-    await driveBoomCapture({ name, recipe, appDir, packed, stub, ingest });
+    await driveBoomCapture({
+      name,
+      recipe,
+      appDir,
+      packed,
+      stub,
+      ingest,
+      // Hands-off: the wizard wrote no key, so the harness supplies it via the
+      // env var the injected snippet reads (CRUMBTRAIL_KEY for backend recipes).
+      keyEnvVar: preflightPlan.keyEnvVar ?? "CRUMBTRAIL_KEY",
+    });
   }
 
   // 3. Wire assertions (manifest-driven; todo-cp1 ones are skipped).
@@ -396,14 +411,16 @@ async function runRecipeBinary({ name, packed, tmpRoot }) {
       `packed binary did not wire the entry file\n${out.slice(-1500)}`,
     );
   }
+  // Hands-off: the binary writes NO ingest key to .env (the user sets it), so
+  // assert the absence of a key line rather than its contents.
   const envText = (await readFileSafe(path.join(appDir, ".env"))) ?? "";
-  if (!new RegExp(`^CRUMBTRAIL_KEY=${stub.apiKey}$`, "m").test(envText)) {
+  if (/^CRUMBTRAIL_KEY=/m.test(envText)) {
     throw new Error(
-      `packed binary did not write CRUMBTRAIL_KEY to .env\n${out.slice(-1500)}`,
+      `packed binary must not write CRUMBTRAIL_KEY to .env (hands-off)\n${out.slice(-1500)}`,
     );
   }
-  ingest.assertSessionStartSeen();
-  ingest.assertAuthPresent();
+  // No synthetic ingest check remains (no key is minted) and binary mode never
+  // boots the wired app, so there is no ingest traffic to assert here.
   phase("PASS", `${name}:wizard`, `mode=binary wired`);
   return { name, ok: true };
 }
@@ -580,11 +597,17 @@ async function runRecipeBrowser({ name, packed, tmpRoot }) {
   }
   phase("PASS", `${name}:sdk-install`, `core=${path.basename(packed.core)}`);
 
+  // Hands-off: the installer bakes no key into the bundle — the injected code
+  // reads it from a framework-appropriate env var (plan.keyEnvVar). Supply that
+  // var the way a user would, at BUILD time, so the bundler inlines the key
+  // (Vite/Next statically replace `import.meta.env.*` / `NEXT_PUBLIC_*`).
+  const keyEnv = plan.keyEnvVar ? { [plan.keyEnvVar]: stub.apiKey } : {};
+
   // (4) Build, then prove the injected init shipped into the client bundle.
   phase("START", `${name}:build`);
   const build = await run(recipe.buildCmd[0], recipe.buildCmd.slice(1), {
     cwd: appDir,
-    env: { NEXT_TELEMETRY_DISABLED: "1" },
+    env: { NEXT_TELEMETRY_DISABLED: "1", ...keyEnv },
     timeoutMs: 420_000,
   });
   if (build.code !== 0) {
@@ -623,7 +646,7 @@ async function runRecipeBrowser({ name, packed, tmpRoot }) {
     {
       cwd: appDir,
       port,
-      env: { NEXT_TELEMETRY_DISABLED: "1", PORT: String(port) },
+      env: { NEXT_TELEMETRY_DISABLED: "1", PORT: String(port), ...keyEnv },
     },
   );
   const appUrl = `http://127.0.0.1:${port}/`;
@@ -715,11 +738,12 @@ function hasBoomErrorEvent(ingest) {
 
 /**
  * Boot the wizard-wired backend app for real and hit /boom so autoCapture
- * records a server-side error event. The app is run with plain `node`/`npm start`
- * (NO --env-file and NO CRUMBTRAIL_KEY in the environment) — proving autoCapture
- * loads the ingest key from the injected `.env` itself. The packed SDK tarballs
- * (core + node) are installed over the wizard's seeded stub so the injected
- * `import("crumbtrail-node")` resolves to the real `autoCapture`.
+ * records a server-side error event. Hands-off: the installer wrote no key, so
+ * the harness supplies it through the environment (`keyEnvVar` = CRUMBTRAIL_KEY)
+ * exactly as a user who set their env would — autoCapture reads it from there.
+ * The packed SDK tarballs (core + node) are installed over the wizard's seeded
+ * stub so the injected `import("crumbtrail-node")` resolves to the real
+ * `autoCapture`.
  */
 async function driveBoomCapture({
   name,
@@ -728,6 +752,7 @@ async function driveBoomCapture({
   packed,
   stub,
   ingest,
+  keyEnvVar,
 }) {
   phase("START", `${name}:sdk-install`);
   const sdkInstall = await run(
@@ -759,8 +784,9 @@ async function driveBoomCapture({
   const port = recipe.portSlot;
   const server = startServer(recipe.runCmd[0], recipe.runCmd.slice(1), {
     cwd: appDir,
-    // Deliberately NO CRUMBTRAIL_KEY here: autoCapture must load it from .env.
-    env: { PORT: String(port) },
+    // Hands-off: the installer wrote no .env, so the harness supplies the key the
+    // way a user would — via the environment. autoCapture reads it from there.
+    env: { PORT: String(port), [keyEnvVar]: stub.apiKey },
   });
   const baseUrl = `http://127.0.0.1:${port}`;
   try {

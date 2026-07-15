@@ -34,16 +34,16 @@
     "crumbtrail-core": "workspace:^",
     "typescript": "^5.8.3",
     "tsup": "^8.5.0",
-    "vitest": "^3.2.0"
+    "vitest": "^4.1.10"
   },
   "license": "MIT",
   "homepage": "https://crumbtrail.dev",
   "bugs": {
-    "url": "https://github.com/CrumbtrailDev/crumbtrail-js/issues"
+    "url": "https://github.com/CrumbtrailDev/crumbtrail-cli/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CrumbtrailDev/crumbtrail-js.git",
+    "url": "git+https://github.com/CrumbtrailDev/crumbtrail-cli.git",
     "directory": "packages/tauri"
   },
   "publishConfig": {

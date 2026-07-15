@@ -5,7 +5,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CrumbtrailDev/crumbtrail-js.git",
+    "url": "git+https://github.com/CrumbtrailDev/crumbtrail-cli.git",
     "directory": "packages/core"
   },
   "keywords": [
@@ -52,6 +52,6 @@
   },
   "homepage": "https://crumbtrail.dev",
   "bugs": {
-    "url": "https://github.com/CrumbtrailDev/crumbtrail-js/issues"
+    "url": "https://github.com/CrumbtrailDev/crumbtrail-cli/issues"
   }
 }

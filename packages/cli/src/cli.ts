@@ -40,18 +40,16 @@ import {
 import {
   pollForRealEvent,
   pollForServices,
-  syntheticCheck,
   type PollRealEventResult,
   type PollServicesResult,
 } from "./verify";
 import { discoverServices, type ServiceCandidate } from "./discover";
 import { otlpGuidePlan, renderOtlpGuide } from "./otlp-guide";
 import { RECIPE_REGISTRY } from "./recipe-registry";
-import { resolveEndpoint } from "./net";
+import { dashboardBase, resolveEndpoint } from "./net";
 import {
   color,
   consoleUi,
-  maskKey,
   stdinPrompter,
   type MultiSelectItem,
   type Prompter,
@@ -349,7 +347,6 @@ export interface WizardDeps {
   installSdk: (input: InstallSdkInput) => Promise<InstallSdkResult>;
   buildPlan: typeof buildPlan;
   executePlan: typeof executePlan;
-  syntheticCheck: typeof syntheticCheck;
   pollForRealEvent: typeof pollForRealEvent;
   /** Batch path (monorepo root). */
   discoverServices: typeof discoverServices;
@@ -374,7 +371,6 @@ export function defaultDeps(): WizardDeps {
     installSdk,
     buildPlan,
     executePlan,
-    syntheticCheck,
     pollForRealEvent,
     discoverServices,
     resolveProject,
@@ -572,7 +568,6 @@ export async function runWizard(
     cwd,
     recipe: result.recipe,
     endpoint: base,
-    apiKey: provisioned.apiKey,
     entryFile: result.entryFile,
     nextVersion: result.nextVersion,
     stack: result.otlpStack ?? undefined,
@@ -602,26 +597,29 @@ export async function runWizard(
     packages: install.packages,
   });
 
-  // 6. Verify — synthetic check, then poll for the real first event.
+  // 6. Next steps — the installer is hands-off: it mints no key, so there is no
+  // synthetic check to run. We still (optionally) wait for the first real event,
+  // which arrives if the user sets their key + starts the app during the wait.
   const notes: string[] = [];
   if (!install.installed && install.note) notes.push(install.note);
   notes.push(...inject.notes);
+
+  const setKeyHint = plan.keyEnvVar
+    ? `Set ${plan.keyEnvVar} in your .env to your ingest key`
+    : "Set your ingest key";
+
+  // User-facing links point at the app host (the SPA), not the API host.
+  const appBase = dashboardBase(base);
 
   let sessionUrl: string | undefined;
   if (parsed.skipVerify) {
     notes.push("Verification skipped (--skip-verify).");
   } else {
-    try {
-      await deps.syntheticCheck(base, provisioned.apiKey, deps.fetchImpl);
-      ui.out(
-        `${color.green("✓")} Synthetic ingest check passed (key + endpoint OK).`,
-      );
-    } catch (err) {
-      ui.err(color.red(`Synthetic ingest check failed: ${errMessage(err)}`));
-      notes.push(
-        "Synthetic ingest check failed — verify your network/endpoint.",
-      );
-    }
+    ui.out(
+      color.dim(
+        `${setKeyHint} — mint one at ${appBase}/settings, then start your app.`,
+      ),
+    );
     const poll = await pollWithSigint(
       base,
       token,
@@ -633,8 +631,8 @@ export async function runWizard(
       // The emotional payoff: deep-link straight to the captured session
       // (spec §4), and open it in the browser when one is available.
       sessionUrl = poll.sessionId
-        ? `${base}/sessions/${encodeURIComponent(poll.sessionId)}`
-        : `${base}/bugs`;
+        ? `${appBase}/sessions/${encodeURIComponent(poll.sessionId)}`
+        : `${appBase}/bugs`;
       ui.out(`${color.green("✓")} First real event received!`);
       ui.out(`  Watch it live: ${color.cyan(sessionUrl)}`);
       if (canUseBrowser(parsed.noBrowser, deps.env)) {
@@ -648,15 +646,23 @@ export async function runWizard(
         "Stopped waiting for the first event — load your app any time.",
       );
     } else {
-      notes.push("No event yet — start your app and check the dashboard.");
+      notes.push(`No event yet — ${setKeyHint.toLowerCase()} and start your app.`);
     }
-    // Verify ran (SDK is wired and reporting): point the user at the next lever —
-    // pulling in the evidence sources they already run. Pointer only, no prompt.
+    // Point the user at the next lever — pulling in the evidence sources they
+    // already run. Pointer only, no prompt.
     printEvidenceSourcesPointer(ui, base);
   }
 
   // 7. Summary.
-  printSummary(ui, base, provisioned, inject.filesTouched, notes, sessionUrl);
+  printSummary(
+    ui,
+    base,
+    provisioned,
+    inject.filesTouched,
+    notes,
+    plan.keyEnvVar,
+    sessionUrl,
+  );
   return 0;
 }
 
@@ -682,7 +688,7 @@ function printEvidenceSourcesPointer(ui: Ui, base: string): void {
     ),
   );
   ui.out(color.dim("queried at incident time and added to each bug's bundle."));
-  ui.out(`  Evidence sources: ${color.cyan(`${base}/settings`)}`);
+  ui.out(`  Evidence sources: ${color.cyan(`${dashboardBase(base)}/settings`)}`);
 }
 
 // ── Batch wizard (monorepo root) ─────────────────────────────────────────────
@@ -699,7 +705,8 @@ export interface ServiceOutcome {
   recipe: Recipe;
   status: ServiceStatus;
   serviceId?: string;
-  apiKey?: string;
+  /** Env var the injected code reads its key from (hands-off — user sets it). */
+  keyEnvVar?: string;
   filesTouched: string[];
   notes: string[];
   error?: string;
@@ -949,7 +956,6 @@ export async function runBatchWizard(
         cwd: c.dir,
         recipe,
         endpoint: base,
-        apiKey: svc.apiKey,
         entryFile: c.detected.entryFile,
         nextVersion: c.detected.nextVersion,
         stack: c.detected.otlpStack ?? undefined,
@@ -985,7 +991,7 @@ export async function runBatchWizard(
         recipe,
         status: applied.status,
         serviceId: svc.serviceId,
-        apiKey: svc.apiKey,
+        keyEnvVar: plan.keyEnvVar,
         filesTouched: applied.filesTouched,
         notes: [
           ...(!install.installed && install.note ? [install.note] : []),
@@ -1009,7 +1015,9 @@ export async function runBatchWizard(
     }
   }
 
-  // 6. Verify — synthetic per key, then ONE shared wait for real events.
+  // 6. Next steps — hands-off: no keys were minted, so there's no synthetic
+  // check. We still open ONE shared wait for real events (arriving if the user
+  // sets each key + starts the service during the wait).
   const reporting = outcomes.filter(
     (o) => o.status === "wired" || o.status === "guidance",
   );
@@ -1019,16 +1027,13 @@ export async function runBatchWizard(
     // times is noise, not information.
     batchNotes.push("Verification skipped (--skip-verify).");
   } else if (reporting.length > 0) {
+    // User-facing links point at the app host (the SPA), not the API host.
+    const appBase = dashboardBase(base);
     for (const o of reporting) {
-      if (!o.apiKey) continue;
-      try {
-        await deps.syntheticCheck(base, o.apiKey, deps.fetchImpl);
-        ui.out(`${color.green("✓")} ${o.name}: key + endpoint OK.`);
-      } catch (err) {
-        ui.err(
-          color.red(`✗ ${o.name}: ingest check failed: ${errMessage(err)}`),
+      if (o.keyEnvVar) {
+        o.notes.push(
+          `Set ${o.keyEnvVar} in this service's .env (mint at ${appBase}/settings).`,
         );
-        o.notes.push("Synthetic ingest check failed — check network/endpoint.");
       }
     }
 
@@ -1048,7 +1053,7 @@ export async function runBatchWizard(
         onFound: (serviceId, sessionId) => {
           const o = byServiceId.get(serviceId);
           if (!o) return;
-          o.sessionUrl = `${base}/sessions/${encodeURIComponent(sessionId)}`;
+          o.sessionUrl = `${appBase}/sessions/${encodeURIComponent(sessionId)}`;
           ui.out(`${color.green("✓")} ${o.name}: first event received.`);
         },
         fetchImpl: deps.fetchImpl,
@@ -1183,7 +1188,7 @@ function printBatchSummary(
   ];
   ui.out("");
   ui.out(`  ${parts.join(" · ")}`);
-  ui.out(`  Dashboard: ${color.cyan(`${base}/bugs`)}`);
+  ui.out(`  Dashboard: ${color.cyan(`${dashboardBase(base)}/bugs`)}`);
 
   const notes = [
     ...outcomes.flatMap((o) => o.notes.map((n) => `${o.name}: ${n}`)),
@@ -1298,14 +1303,6 @@ async function applyInjection(
       `${plan.kind === "create" ? "Creating" : "Editing"} ${color.cyan(plan.targetPath)}…`,
     );
   }
-  if (plan.envAction) {
-    ui.out(
-      `Appending CRUMBTRAIL_KEY to ${color.cyan(plan.envAction.targetPath)}…`,
-    );
-    if (plan.envAction.gitignoreWarning) {
-      notes.push(plan.envAction.gitignoreWarning);
-    }
-  }
   const res = deps.executePlan(plan);
   filesTouched.push(...res.written);
   ui.out(`${color.green("✓")} ${describeWrites(res)}`);
@@ -1365,22 +1362,29 @@ function printSummary(
   p: ProvisionResult,
   filesTouched: string[],
   notes: string[],
+  keyEnvVar?: string,
   sessionUrl?: string,
 ): void {
+  // User-facing links point at the app host (the SPA), not the API host.
+  const appBase = dashboardBase(base);
   ui.out("");
   ui.out(color.bold("Setup complete"));
   ui.out(`  Project:   ${p.projectName}`);
   ui.out(`  Service:   ${p.serviceName}`);
-  ui.out(
-    `  Key:       ${maskKey(p.apiKey)} ${color.dim("(already wired into your code)")}`,
-  );
+  if (keyEnvVar) {
+    // Hands-off: the installer wrote no key. Tell the user the var to set and
+    // where to mint the value.
+    ui.out(
+      `  Ingest key: set ${color.bold(keyEnvVar)} in .env ${color.dim(`(mint at ${appBase}/settings)`)}`,
+    );
+  }
   if (filesTouched.length > 0) {
     ui.out(`  Files:     ${filesTouched.join("\n             ")}`);
   }
   if (sessionUrl) {
     ui.out(`  Session:   ${color.cyan(sessionUrl)}`);
   }
-  ui.out(`  Dashboard: ${color.cyan(`${base}/bugs`)}`);
+  ui.out(`  Dashboard: ${color.cyan(`${appBase}/bugs`)}`);
   if (notes.length > 0) {
     ui.out("");
     for (const n of notes) ui.out(color.dim(`  note: ${n}`));

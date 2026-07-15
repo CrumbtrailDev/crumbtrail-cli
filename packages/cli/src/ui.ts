@@ -19,12 +19,6 @@ export const color = {
   red: (s: string) => paint("31", s),
 };
 
-/** Mask the middle of a secret: first 8 + last 4, dots between. */
-export function maskKey(key: string): string {
-  if (key.length <= 12) return "•".repeat(key.length);
-  return `${key.slice(0, 8)}…${key.slice(-4)}`;
-}
-
 /** Output sink — swappable in tests to capture lines instead of writing stdout. */
 export interface Ui {
   out(line?: string): void;

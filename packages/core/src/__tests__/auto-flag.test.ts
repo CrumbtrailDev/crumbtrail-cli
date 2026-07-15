@@ -1,14 +1,22 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  afterEach,
+  type Mock,
+} from "vitest";
 import { createAutoFlagController } from "../auto-flag";
 import { rageClickDetector, retryStormDetector } from "../signals";
-import type { BugEvent } from "../types";
+import type { BugEvent, FlagBugOptions } from "../types";
 
 function errEvent(msg: string, stk?: string): BugEvent {
   return { t: Date.now(), k: "err", d: { msg, stk } };
 }
 
 describe("createAutoFlagController", () => {
-  let flag: ReturnType<typeof vi.fn>;
+  let flag: Mock<(options: FlagBugOptions) => Promise<unknown>>;
 
   beforeEach(() => {
     vi.useFakeTimers();

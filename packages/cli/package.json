@@ -1,11 +1,11 @@
 {
   "name": "crumbtrail",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Set up Crumbtrail in one command: npx crumbtrail detects your framework, wires in the SDK, and verifies the first event. See https://crumbtrail.dev",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/CrumbtrailDev/crumbtrail-js.git",
+    "url": "git+https://github.com/CrumbtrailDev/crumbtrail-cli.git",
     "directory": "packages/cli"
   },
   "keywords": [
@@ -62,6 +62,6 @@
   },
   "homepage": "https://crumbtrail.dev",
   "bugs": {
-    "url": "https://github.com/CrumbtrailDev/crumbtrail-js/issues"
+    "url": "https://github.com/CrumbtrailDev/crumbtrail-cli/issues"
   }
 }
