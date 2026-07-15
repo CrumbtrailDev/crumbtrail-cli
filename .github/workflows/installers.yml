@@ -2,7 +2,7 @@ name: installers
 
 # Installer regression harness (scripts/verify-installers.mjs). Path-filtered so
 # it only runs when the wizard, cloud, SDK, install-shared, the harness itself,
-# or an installer fixture changes. Setup mirrors ci.yml (pnpm 10 + Node 22).
+# or an installer fixture changes. Setup mirrors ci.yml (pnpm 10 + Node 24).
 
 on:
   pull_request:
@@ -42,7 +42,7 @@ jobs:
           version: 10
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # browser-load.mjs proves frontend recipes in a real chromium page.
@@ -63,7 +63,7 @@ jobs:
           version: 10
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install --with-deps chromium
