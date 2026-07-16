@@ -339,7 +339,7 @@ export class DatadogEvidenceSource implements EvidenceSource {
   constructor(config: DatadogSourceConfig) {
     this.apiKey = config.apiKey;
     this.appKey = config.appKey;
-    this.site = config.site || DATADOG_DEFAULT_SITE;
+    this.site = normalizeDatadogSite(config.site || DATADOG_DEFAULT_SITE);
     this.apiBase = `https://api.${this.site}`;
     this.appBase = datadogAppBase(this.site);
     this.fetchImpl = config.fetchImpl ?? fetch;
@@ -586,6 +586,18 @@ export class DatadogEvidenceSource implements EvidenceSource {
         latencyMs: Math.max(0, Date.now() - started),
       },
     };
+  }
+}
+
+/** Hosted credential settings use an https URL so destination validation can be
+ * uniform. Preserve the existing self hosted bare-site env value for backwards
+ * compatibility, then pass only the hostname to Datadog URL construction. */
+function normalizeDatadogSite(site: string): string {
+  if (!site.includes("://")) return site.replace(/\/+$/, "");
+  try {
+    return new URL(site).hostname;
+  } catch {
+    return site;
   }
 }
 

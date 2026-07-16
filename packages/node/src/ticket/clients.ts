@@ -10,6 +10,12 @@ export interface TicketConnector {
   fetchSymptom(id: string): Promise<Symptom>;
 }
 
+/** Provider neutral ticket comment. Callers provide plain paragraphs only; each
+ * provider owns its own rich text conversion at its outbound API boundary. */
+export interface TicketComment {
+  paragraphs: readonly string[];
+}
+
 /**
  * Extension of TicketConnector for providers that can write an advisory
  * comment back to the ticket. Declared as a separate interface (not an
@@ -20,7 +26,7 @@ export interface TicketConnector {
 export interface CommentingTicketConnector extends TicketConnector {
   postComment(
     ticketKey: string,
-    adfBody: unknown,
+    comment: TicketComment,
     retry?: BoundedRetryOptions,
   ): Promise<void>;
 }
@@ -213,15 +219,15 @@ export class JiraTicketClient implements CommentingTicketConnector {
   }
 
   /**
-   * POST an advisory comment to a Jira issue. `adfBody` is an Atlassian Document
-   * Format doc (see buildAdvisoryComment); it is sent as `{ body: <adf> }`.
+   * POST an advisory comment to a Jira issue. Jira's ADF is constructed here at
+   * the Jira boundary so cloud code stays provider neutral.
    * Wrapped in a small bounded retry so a transient 5xx/429/network blip does not
    * drop the comment. Throws TicketError on a non-2xx that survives the retries —
    * the API token never appears in the message (only the sanitized URL does).
    */
   async postComment(
     issueIdOrKey: string,
-    adfBody: unknown,
+    comment: TicketComment,
     retry?: BoundedRetryOptions,
   ): Promise<void> {
     const url = `${this.baseUrl}/rest/api/3/issue/${encodeURIComponent(issueIdOrKey)}/comment`;
@@ -233,7 +239,7 @@ export class JiraTicketClient implements CommentingTicketConnector {
           Authorization: this.authHeader(),
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ body: adfBody }),
+        body: JSON.stringify({ body: jiraCommentBody(comment) }),
       });
       if (!res.ok) {
         throw new TicketError(
@@ -252,7 +258,7 @@ export interface ZendeskTicketClientConfig {
   fetchImpl?: typeof fetch;
 }
 
-export class ZendeskTicketClient implements TicketConnector {
+export class ZendeskTicketClient implements CommentingTicketConnector {
   private subdomain: string;
   private email: string;
   private apiToken: string;
@@ -276,6 +282,71 @@ export class ZendeskTicketClient implements TicketConnector {
     );
     return zendeskToSymptom(payload);
   }
+
+  async postComment(
+    ticketId: string,
+    comment: TicketComment,
+    retry?: BoundedRetryOptions,
+  ): Promise<void> {
+    const auth = Buffer.from(`${this.email}/token:${this.apiToken}`).toString(
+      "base64",
+    );
+    const url = `https://${this.subdomain}.zendesk.com/api/v2/tickets/${encodeURIComponent(ticketId)}.json`;
+    await withBoundedRetry(async () => {
+      const res = await this.fetchImpl(url, {
+        method: "PUT",
+        headers: {
+          "User-Agent": CRUMBTRAIL_USER_AGENT,
+          Authorization: `Basic ${auth}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          ticket: { comment: { body: commentText(comment), public: true } },
+        }),
+      });
+      if (!res.ok) {
+        throw new TicketError(
+          res.status,
+          `Zendesk comment post failed with HTTP ${res.status}: ${sanitizeUrl(url)}`,
+        );
+      }
+    }, retry);
+  }
+}
+
+function commentText(comment: TicketComment): string {
+  return comment.paragraphs
+    .filter((paragraph): paragraph is string => typeof paragraph === "string")
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function jiraCommentBody(comment: TicketComment): Record<string, unknown> {
+  return {
+    version: 1,
+    type: "doc",
+    content: commentText(comment)
+      .split("\n\n")
+      .filter(Boolean)
+      .map(jiraParagraph),
+  };
+}
+
+function jiraParagraph(paragraph: string): Record<string, unknown> {
+  const content = paragraph
+    .split(/(https?:\/\/[^\s]+)/g)
+    .filter(Boolean)
+    .map((part) =>
+      part.startsWith("http://") || part.startsWith("https://")
+        ? {
+            type: "text",
+            text: part,
+            marks: [{ type: "link", attrs: { href: part } }],
+          }
+        : { type: "text", text: part },
+    );
+  return { type: "paragraph", content };
 }
 
 export interface TrelloTicketClientConfig {
