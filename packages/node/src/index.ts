@@ -172,14 +172,13 @@ export type {
   JiraTicketClientConfig,
   JiraTicketClientConfigLegacy,
   JiraTicketClientConfigWithAuth,
+  TicketComment,
   TicketConnector,
 } from "./ticket/clients";
 export { jiraToSymptom } from "./ticket/normalize";
 export type { TicketProvider } from "./ticket/normalize";
 export { buildAdvisoryComment } from "./ticket/comment";
 export type {
-  AdfDoc,
-  AdfNode,
   AdvisoryCommentGap,
   AdvisoryCommentMatch,
   BuildAdvisoryCommentInput,
