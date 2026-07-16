@@ -1,6 +1,5 @@
-// Advisory Jira comment builder. Turns a located/assembled bundle result into an
-// Atlassian Document Format (ADF) document that Crumbtrail posts back on the
-// ticket. Per VISION this is a CONSULTANT's note, never a verdict: it says what
+// Advisory ticket comment builder. Turns a located/assembled bundle result into
+// provider neutral plain text paragraphs. Per VISION this is a CONSULTANT's note, never a verdict: it says what
 // evidence was found and links to the full bundle, but it NEVER claims the bug is
 // fixed/verified/reproduced and NEVER emits a boolean pass/fail. The branch is
 // driven purely by the locate outcome ("matched" vs "inconclusive"); the raw
@@ -65,50 +64,7 @@ function humanizeReason(reason: string): string {
   return REASON_PHRASES[reason] ?? reason;
 }
 
-/** A minimally-typed ADF node. ADF is an open tree; we only build the handful of
- *  node kinds we need (doc/paragraph/text/link/bulletList/listItem). */
-export interface AdfNode {
-  type: string;
-  [key: string]: unknown;
-}
-
-export interface AdfDoc {
-  version: 1;
-  type: "doc";
-  content: AdfNode[];
-}
-
-function text(value: string): AdfNode {
-  return { type: "text", text: value };
-}
-
-/** A text node rendered with the inline `code` mark — used for correlation-key
- *  values so they read as literal ids and are easy to copy off the ticket. */
-function code(value: string): AdfNode {
-  return { type: "text", text: value, marks: [{ type: "code" }] };
-}
-
-function link(label: string, href: string): AdfNode {
-  return {
-    type: "text",
-    text: label,
-    marks: [{ type: "link", attrs: { href } }],
-  };
-}
-
-function paragraph(...content: AdfNode[]): AdfNode {
-  return { type: "paragraph", content };
-}
-
-function bulletList(items: AdfNode[][]): AdfNode {
-  return {
-    type: "bulletList",
-    content: items.map((content) => ({
-      type: "listItem",
-      content: [paragraph(...content)],
-    })),
-  };
-}
+import type { TicketComment } from "./clients";
 
 /**
  * Render the confidence float as a whole-number percentage for DISPLAY ONLY.
@@ -122,10 +78,6 @@ function confidencePercent(confidence: number): number {
   return Math.min(100, Math.max(0, pct));
 }
 
-function linkParagraph(label: string, bundleUrl: string): AdfNode {
-  return paragraph(text(`${label} `), link(bundleUrl, bundleUrl));
-}
-
 /**
  * Build the correlation-key bullet lines (`Session: <id>`, `Request: <id>` …).
  * Filters empties, dedupes request ids, and caps them at 3 (defense-in-depth —
@@ -135,28 +87,28 @@ function linkParagraph(label: string, bundleUrl: string): AdfNode {
  */
 function correlationLines(
   correlation: AdvisoryCommentCorrelation | undefined,
-): AdfNode[][] {
+): string[] {
   if (!correlation) return [];
-  const items: AdfNode[][] = [];
+  const items: string[] = [];
   const sessionId =
     typeof correlation.sessionId === "string"
       ? correlation.sessionId.trim()
       : "";
-  if (sessionId) items.push([text("Session: "), code(sessionId)]);
+  if (sessionId) items.push(`Session: ${sessionId}`);
   const seen = new Set<string>();
   for (const raw of correlation.requestIds ?? []) {
     if (typeof raw !== "string") continue;
     const id = raw.trim();
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    items.push([text("Request: "), code(id)]);
+    items.push(`Request: ${id}`);
     if (seen.size >= 3) break;
   }
   return items;
 }
 
 /**
- * Build the advisory ADF comment. Two shapes, chosen by `match.outcome`:
+ * Build the advisory plain text comment. Two shapes, chosen by `match.outcome`:
  *
  * - matched: names that a candidate incident was located, shows the rounded
  *   confidence as an advisory percentage, lists the match reasons in plain
@@ -169,76 +121,54 @@ function correlationLines(
  *
  * Pure and side-effect free — unit-testable in isolation.
  */
-export function buildAdvisoryComment(input: BuildAdvisoryCommentInput): AdfDoc {
+export function buildAdvisoryComment(
+  input: BuildAdvisoryCommentInput,
+): TicketComment {
   const { match, bundleUrl } = input;
   const gaps = input.gaps ?? [];
-  const content: AdfNode[] = [];
+  const paragraphs: string[] = [];
 
   if (match.outcome === "matched") {
-    content.push(
-      paragraph(
-        text(
-          "Crumbtrail located a candidate incident that likely matches this ticket.",
-        ),
-      ),
-    );
-    content.push(
-      paragraph(
-        text(
-          `Match confidence: ${confidencePercent(match.confidence)}% (advisory — review the evidence before acting).`,
-        ),
-      ),
+    paragraphs.push(
+      "Crumbtrail located a candidate incident that likely matches this ticket.",
+      `Match confidence: ${confidencePercent(match.confidence)}% (advisory, review the evidence before acting).`,
     );
     const reasons = (match.reasons ?? []).filter(
       (reason) => typeof reason === "string" && reason.trim().length > 0,
     );
     if (reasons.length > 0) {
-      content.push(paragraph(text("Why this was matched:")));
-      content.push(
-        bulletList(reasons.map((reason) => [text(humanizeReason(reason))])),
-      );
+      paragraphs.push("Why this was matched:", ...reasons.map(humanizeReason));
     }
     // Correlation keys: carry the located session + request/trace ids onto the
     // ticket so the reader can line the incident up against their logs/traces.
     // Only rendered from keys the evidence actually carries — never fabricated.
     const correlationItems = correlationLines(input.correlation);
     if (correlationItems.length > 0) {
-      content.push(
-        paragraph(
-          text("Correlation keys (match these against your logs and traces):"),
-        ),
+      paragraphs.push(
+        "Correlation keys (match these against your logs and traces):",
+        ...correlationItems,
       );
-      content.push(bulletList(correlationItems));
     }
-    content.push(linkParagraph("View the full evidence bundle:", bundleUrl));
-    return { version: 1, type: "doc", content };
+    paragraphs.push(`View the full evidence bundle: ${bundleUrl}`);
+    return { paragraphs };
   }
 
-  // inconclusive — honest, gaps-only, no fabricated match.
-  content.push(
-    paragraph(
-      text(
-        "Crumbtrail could not locate a recorded incident matching this ticket yet.",
-      ),
-    ),
+  // inconclusive: honest, gaps only, no fabricated match.
+  paragraphs.push(
+    "Crumbtrail could not locate a recorded incident matching this ticket yet.",
   );
   const namedGaps = gaps.filter(
     (gap) =>
       gap && typeof gap.reason === "string" && gap.reason.trim().length > 0,
   );
   if (namedGaps.length > 0) {
-    content.push(paragraph(text("What is missing:")));
-    content.push(
-      bulletList(
-        namedGaps.map((gap) => {
-          const label = gap.suggestion
-            ? `${gap.reason} — ${gap.suggestion}`
-            : gap.reason;
-          return [text(label)];
-        }),
+    paragraphs.push(
+      "What is missing:",
+      ...namedGaps.map((gap) =>
+        gap.suggestion ? `${gap.reason}: ${gap.suggestion}` : gap.reason,
       ),
     );
   }
-  content.push(linkParagraph("Open the evidence bundle:", bundleUrl));
-  return { version: 1, type: "doc", content };
+  paragraphs.push(`Open the evidence bundle: ${bundleUrl}`);
+  return { paragraphs };
 }

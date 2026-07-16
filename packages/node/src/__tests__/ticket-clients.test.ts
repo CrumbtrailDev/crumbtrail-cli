@@ -3,6 +3,8 @@ import {
   JiraTicketClient,
   ZendeskTicketClient,
   TrelloTicketClient,
+  type CommentingTicketConnector,
+  type TicketConnector,
   TicketError,
   ticketClientFromEnv,
 } from "../ticket/clients";
@@ -13,6 +15,104 @@ function jsonResponse(body: unknown, status = 200): Response {
     headers: { "content-type": "application/json" },
   });
 }
+
+describe("TicketConnector adapter contract", () => {
+  it("runs the read and comment contract against Jira and Zendesk", async () => {
+    const comments: Array<{ url: string; method: string; body: unknown }> = [];
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      if (init?.method) {
+        comments.push({
+          url,
+          method: init.method,
+          body: JSON.parse(String(init.body)),
+        });
+        return new Response("{}", { status: 201 });
+      }
+      if (url.includes("atlassian.net")) {
+        return jsonResponse({ fields: { summary: "Jira symptom" } });
+      }
+      return jsonResponse({ ticket: { subject: "Zendesk symptom" } });
+    }) as typeof fetch;
+    const connectors: CommentingTicketConnector[] = [
+      new JiraTicketClient({
+        baseUrl: "https://acme.atlassian.net",
+        email: "dev@acme.test",
+        apiToken: "jira-token",
+        fetchImpl,
+      }),
+      new ZendeskTicketClient({
+        subdomain: "acme",
+        email: "dev@acme.test",
+        apiToken: "zendesk-token",
+        fetchImpl,
+      }),
+    ];
+
+    expect(connectors.every((connector) => typeof connector.fetchSymptom === "function")).toBe(true);
+    await expect(connectors[0].fetchSymptom("CT-1")).resolves.toMatchObject({
+      title: "Jira symptom",
+    });
+    await expect(connectors[1].fetchSymptom("42")).resolves.toMatchObject({
+      title: "Zendesk symptom",
+    });
+    await Promise.all(
+      connectors.map((connector, index) =>
+        connector.postComment(String(index + 1), {
+          paragraphs: ["A first paragraph", "A second paragraph"],
+        }),
+      ),
+    );
+    expect(comments).toHaveLength(2);
+    expect(comments[0]).toMatchObject({
+      url: "https://acme.atlassian.net/rest/api/3/issue/1/comment",
+      method: "POST",
+      body: {
+        body: {
+          version: 1,
+          type: "doc",
+          content: [
+            { type: "paragraph", content: [{ type: "text", text: "A first paragraph" }] },
+            { type: "paragraph", content: [{ type: "text", text: "A second paragraph" }] },
+          ],
+        },
+      },
+    });
+    expect(comments[1]).toMatchObject({
+      url: "https://acme.zendesk.com/api/v2/tickets/2.json",
+      method: "PUT",
+      body: {
+        ticket: {
+          comment: { body: "A first paragraph\n\nA second paragraph", public: true },
+        },
+      },
+    });
+  });
+
+  it("maps provider read failures to TicketError for Jira and Zendesk", async () => {
+    const fetchImpl = (async () => jsonResponse({}, 404)) as typeof fetch;
+    const connectors: CommentingTicketConnector[] = [
+      new JiraTicketClient({
+        baseUrl: "https://acme.atlassian.net",
+        email: "dev@acme.test",
+        apiToken: "jira-token",
+        fetchImpl,
+      }),
+      new ZendeskTicketClient({
+        subdomain: "acme",
+        email: "dev@acme.test",
+        apiToken: "zendesk-token",
+        fetchImpl,
+      }),
+    ];
+
+    for (const connector of connectors) {
+      await expect(connector.fetchSymptom("42")).rejects.toMatchObject({
+        name: "TicketError",
+        status: 404,
+      });
+    }
+  });
+});
 
 describe("JiraTicketClient", () => {
   it("fetches the issue and maps it to a Symptom", async () => {
@@ -60,7 +160,7 @@ describe("JiraTicketClient", () => {
 });
 
 describe("JiraTicketClient.postComment", () => {
-  const adf = { version: 1, type: "doc", content: [] };
+  const comment = { paragraphs: ["A plain text comment"] };
 
   it("posts an ADF comment with Basic auth and returns on 2xx", async () => {
     let capturedUrl = "";
@@ -78,7 +178,7 @@ describe("JiraTicketClient.postComment", () => {
       fetchImpl,
     });
 
-    await client.postComment("ABC-1", adf, { baseDelayMs: 0 });
+    await client.postComment("ABC-1", comment, { baseDelayMs: 0 });
 
     expect(capturedUrl).toBe(
       "https://acme.atlassian.net/rest/api/3/issue/ABC-1/comment",
@@ -88,7 +188,13 @@ describe("JiraTicketClient.postComment", () => {
     expect(headers.Authorization).toBe(
       `Basic ${Buffer.from("dev@acme.com:tok").toString("base64")}`,
     );
-    expect(JSON.parse(String(capturedInit?.body))).toEqual({ body: adf });
+    expect(JSON.parse(String(capturedInit?.body))).toEqual({
+      body: {
+        version: 1,
+        type: "doc",
+        content: [{ type: "paragraph", content: [{ type: "text", text: "A plain text comment" }] }],
+      },
+    });
   });
 
   it("does not retry a non-retryable 4xx and throws TicketError once", async () => {
@@ -105,7 +211,7 @@ describe("JiraTicketClient.postComment", () => {
     });
 
     await expect(
-      client.postComment("ABC-1", adf, { baseDelayMs: 0 }),
+      client.postComment("ABC-1", comment, { baseDelayMs: 0 }),
     ).rejects.toMatchObject({ status: 400 });
     expect(calls).toBe(1);
   });
@@ -124,7 +230,7 @@ describe("JiraTicketClient.postComment", () => {
     });
 
     try {
-      await client.postComment("ABC-1", adf, { baseDelayMs: 0 });
+      await client.postComment("ABC-1", comment, { baseDelayMs: 0 });
       throw new Error("expected throw");
     } catch (err) {
       expect(err).toBeInstanceOf(TicketError);
@@ -150,13 +256,13 @@ describe("JiraTicketClient.postComment", () => {
       fetchImpl,
     });
 
-    await client.postComment("ABC-1", adf, { baseDelayMs: 0 });
+    await client.postComment("ABC-1", comment, { baseDelayMs: 0 });
     expect(calls).toBe(2);
   });
 });
 
 describe("JiraTicketClient — OAuth bearer mode", () => {
-  const adf = { version: 1, type: "doc", content: [] };
+  const comment = { paragraphs: ["A plain text comment"] };
   // The cloud connector boundary hands in a gateway base URL
   // (api.atlassian.com/ex/jira/{cloudId}) plus an already-valid access token.
   const gatewayBase = "https://api.atlassian.com/ex/jira/cloud-abc123";
@@ -199,13 +305,15 @@ describe("JiraTicketClient — OAuth bearer mode", () => {
       fetchImpl,
     });
 
-    await client.postComment("ABC-1", adf, { baseDelayMs: 0 });
+    await client.postComment("ABC-1", comment, { baseDelayMs: 0 });
 
     expect(capturedUrl).toBe(`${gatewayBase}/rest/api/3/issue/ABC-1/comment`);
     expect(capturedInit?.method).toBe("POST");
     const headers = capturedInit?.headers as Record<string, string>;
     expect(headers.Authorization).toBe("Bearer access-xyz");
-    expect(JSON.parse(String(capturedInit?.body))).toEqual({ body: adf });
+    expect(JSON.parse(String(capturedInit?.body))).toMatchObject({
+      body: { type: "doc", version: 1 },
+    });
   });
 
   it("never leaks the access token into a TicketError message", async () => {
@@ -218,7 +326,7 @@ describe("JiraTicketClient — OAuth bearer mode", () => {
     });
 
     try {
-      await client.postComment("ABC-1", adf, { baseDelayMs: 0 });
+      await client.postComment("ABC-1", comment, { baseDelayMs: 0 });
       throw new Error("expected throw");
     } catch (err) {
       expect(err).toBeInstanceOf(TicketError);

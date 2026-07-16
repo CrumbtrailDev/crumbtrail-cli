@@ -97,12 +97,16 @@ export interface ServerConfig {
     info: { refinalized: boolean },
   ) => void;
   /**
-   * Test-only seam: overrides how the client's evidence sources are constructed
-   * for the inner /api/solve-context adapter phase (sessionless Mode A +
-   * blended). Production leaves this unset; gatherAdapterEvidence then builds
-   * them from env via evidenceSourcesFromEnv().
+   * Per-tenant seam for the inner /api/solve-context adapter phase. Hosted
+   * cloud uses it to inject exactly one tenant's sealed credential sources.
+   * Returning an array, including [], bypasses evidenceSourcesFromEnv(). Returning
+   * undefined explicitly requests the legacy environment fallback. This makes
+   * fallback an affirmative operator decision instead of an accidental omission.
    */
-  evidenceSourcesFactory?: () => EvidenceSource[];
+  evidenceSourcesFactory?: (ctx: {
+    tenantId?: string;
+    projectId?: string;
+  }) => EvidenceSource[] | undefined | Promise<EvidenceSource[] | undefined>;
 }
 
 export const DEFAULT_MAX_JSON_BODY_BYTES = 1_048_576;
@@ -1714,6 +1718,8 @@ export function createServer(config: ServerConfig): http.Server {
           threshold?: number;
           now?: number;
           ticketCreatedAt?: number;
+          tenantId?: string;
+          projectId?: string;
         } = {};
         if (typeof rawOptions.threshold === "number") {
           opts.threshold = rawOptions.threshold;
@@ -1726,17 +1732,26 @@ export function createServer(config: ServerConfig): http.Server {
         if (typeof rawOptions.ticketCreatedAt === "number") {
           opts.ticketCreatedAt = rawOptions.ticketCreatedAt;
         }
+        if (typeof rawOptions.tenantId === "string") {
+          opts.tenantId = rawOptions.tenantId;
+        }
+        if (typeof rawOptions.projectId === "string") {
+          opts.projectId = rawOptions.projectId;
+        }
+        const factorySources = config.evidenceSourcesFactory
+          ? await config.evidenceSourcesFactory({
+              tenantId: opts.tenantId,
+              projectId: opts.projectId,
+            })
+          : undefined;
         const { bundle, match, sources } = await locateAndAssemble(
           symptom,
           buildRecallStore(config.outputDir),
           {
             ...opts,
-            // Adapter phase (sessionless Mode A + blended): production defaults
-            // to evidenceSourcesFromEnv() inside gatherAdapterEvidence; tests
-            // inject sources via this seam.
-            ...(config.evidenceSourcesFactory
-              ? { sources: config.evidenceSourcesFactory() }
-              : {}),
+            // An array, including [], owns source construction and blocks the
+            // environment fallback. Undefined is the explicit legacy opt in.
+            ...(factorySources === undefined ? {} : { sources: factorySources }),
           },
         );
         // `sources` is the per-source health summary (provider + ok + sanitized
