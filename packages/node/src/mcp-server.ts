@@ -8,6 +8,7 @@ import {
   FixContextError,
   type FixContext,
 } from "./fix-context";
+import { normalizeAiOpinion } from "./ai-diagnosis";
 import { resolveLatestIssue } from "./latest-issue";
 import {
   attachTokenEstimate,
@@ -230,7 +231,7 @@ const TOOLS = [
   {
     name: "getFixContext",
     description:
-      "Give a coding agent complete bug context for one recorded session. Returns the fix-context.v1 bundle: ranked candidate causes, the primary evidence window with correlated frontend requests, backend spans, and the exact database rows that changed, plus a redaction-aware environment snapshot and a repro hint. Start here when the user asks you to fix a bug captured with Crumbtrail.",
+      "Give a coding agent complete bug context for one recorded session. Returns the fix-context.v2 bundle: deterministic signals with heuristic bases, the primary evidence window with correlated frontend requests, backend spans, and the exact database rows that changed, plus a redaction aware environment snapshot, causal chain, and repro hint. Start here when the user asks you to fix a bug captured with Crumbtrail.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -242,9 +243,20 @@ const TOOLS = [
   },
   /** @stability stable */
   {
+    name: "getOpinion",
+    description:
+      "Get the optional LLM produced opinion for one session. Returns ranked hypotheses with confidence, evidence references, and explicit unknowns. It does not alter the neutral evidence bundle.",
+    inputSchema: {
+      type: "object" as const,
+      properties: { sessionId: { type: "string" } },
+      required: ["sessionId"],
+    },
+  },
+  /** @stability stable */
+  {
     name: "getLatestIssue",
     description:
-      "The one-call, zero-friction entry point: finds the most recent finalized session with error-class evidence (errors, failed requests, or critical/high-severity candidates) and returns its complete fix-context.v1 bundle — ranked candidate causes, correlated primary window, environment snapshot, and repro hint — in a single call. No sessionId, no listSessions round-trip, no setup: call it with no arguments when the user says 'fix the latest bug' or you just want the newest issue. Optional maxTokens bounds the response (ceil(chars/4) estimate — under-counts token-dense content, so budget conservatively).",
+      "The one call entry point: finds the most recent finalized session with error class evidence and returns its complete fix-context.v2 bundle with deterministic signals, the correlated primary window, environment snapshot, causal chain, and repro hint. Call it with no arguments when the user asks to fix the latest bug. Optional maxTokens bounds the response using a conservative character estimate.",
     inputSchema: {
       type: "object" as const,
       properties: { maxTokens: { ...MAX_TOKENS_SCHEMA } },
@@ -254,7 +266,7 @@ const TOOLS = [
   {
     name: "getRegressionContext",
     description:
-      "Compare two recorded sessions of the same flow across releases and return the regression-context.v1 witness verdict. Catches escaped regressions — behavior changes that fired no error — and hands back the diverging interaction, the causal window of correlated requests, the exact database rows whose values changed, and a repro hint. Input: { sessionA, sessionB } (ids or paths). Use listSessions to find candidates.",
+      "Compare two recorded sessions of the same flow across releases and return the regression-context.v1 witness verdict. Catches escaped regressions — behavior changes that fired no error — and hands back the diverging interaction, the causal window of correlated requests, the exact database rows whose values changed, and a repro hint. Input: { sessionA, sessionB } (ids or paths). Use listSessions to find sessions.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -336,7 +348,7 @@ const TOOLS = [
   {
     name: "listDistinctBugs",
     description:
-      'List the DISTINCT bugs a session hit, grouped deterministically from the ranked candidates (within-session dedup). With mode:"cross-session", scans finalized sessions and returns recurrence rollups by stable bug signature. Use getBug for one session bug, or getRecurrence(signature) for one recurrence.',
+      'List the DISTINCT bugs a session hit, grouped deterministically from detector signals within a session. With mode:"cross-session", scans finalized sessions and returns recurrence rollups by stable bug signature. Use getBug for one session bug, or getRecurrence(signature) for one recurrence.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -464,7 +476,7 @@ const TOOLS = [
   {
     name: "getSessionManifest",
     description:
-      "Get the session manifest (manifest.json): metadata, error and failed-request markers, timeline, ranked candidates, and an accessPattern hint. The token-bounded entry point for exploring a recorded session — start drilldown here, then getWindow for raw events in a time window and getEvidence to resolve one candidate, signature, or request id. Hot-plane only. Every response carries tokenEstimate (ceil(chars/4) heuristic).",
+      "Get the session manifest (manifest.json): metadata, error and failed request markers, timeline, detector signals, and an accessPattern hint. The token bounded entry point for exploring a recorded session. Start drilldown here, then getWindow for raw events in a time window and getEvidence to resolve one signal, signature, or request id. Hot plane only. Every response carries a character based token estimate.",
     inputSchema: {
       type: "object" as const,
       properties: { sessionId: { type: "string" } },
@@ -873,6 +885,8 @@ export class McpServer {
         return this.toolGetLinkedRequestContext(args);
       case "getFixContext":
         return this.toolGetFixContext(args);
+      case "getOpinion":
+        return this.toolGetOpinion(args);
       case "getLatestIssue":
         return this.toolGetLatestIssue(args);
       case "getRegressionContext":
@@ -1414,15 +1428,15 @@ export class McpServer {
 
   /**
    * Shared response path for getFixContext and getLatestIssue. Unbudgeted
-   * stays byte-identical to the raw contract; budgeted fills ranked_candidates
-   * in candidate-rank order (refs are candidate ids resolvable via getEvidence).
+   * stays byte-identical to the raw contract; budgeted fills `signals` in
+   * detector rank order (refs are signal ids resolvable via getEvidence).
    */
   private fixContextResult(context: FixContext, maxTokens: number | undefined) {
     if (maxTokens === undefined) return textResult(context);
     return this.budgetedTextResult(
       context as unknown as Record<string, unknown>,
-      "ranked_candidates",
-      context.ranked_candidates,
+      "signals",
+      context.signals,
       maxTokens,
       (candidate) => candidate.id,
     );
@@ -1441,6 +1455,20 @@ export class McpServer {
       if (err instanceof FixContextError) return errorResult(err.message);
       throw err;
     }
+  }
+
+  private toolGetOpinion(args: Record<string, unknown>) {
+    const sessionId = stringField(args.sessionId);
+    if (!sessionId) return errorResult("getOpinion requires sessionId");
+    const dir = this.sessionDir(sessionId);
+    if (!this.sessionExists(dir)) return errorResult("Session not found");
+
+    const opinion = this.readJsonRecord(dir, "opinion.json");
+    if (opinion) return textResult(opinion);
+
+    const legacy = this.readJsonRecord(dir, "diagnosis.json");
+    if (legacy) return textResult(normalizeAiOpinion(legacy));
+    return errorResult("No opinion generated yet for this session.");
   }
 
   /**
@@ -2047,6 +2075,8 @@ export class McpServer {
           id: stringField(candidate.id),
           detector: stringField(candidate.detector),
           severity: stringField(candidate.severity),
+          basis: "heuristic",
+          baseScore: numberField(candidate.score),
           score: numberField(candidate.score),
           anchor: isRecord(candidate.anchor) ? candidate.anchor : undefined,
           evidenceWindow: isRecord(candidate.evidenceWindow)

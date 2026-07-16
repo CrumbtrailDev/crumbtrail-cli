@@ -120,10 +120,11 @@ describe("MCP Server", () => {
     });
     expect(res).not.toBeNull();
     const result = res!.result as any;
-    expect(result.tools).toHaveLength(33);
+    expect(result.tools).toHaveLength(34);
     const names = result.tools.map((t: any) => t.name);
     expect(names).toContain("listSessions");
     expect(names).toContain("getFixContext");
+    expect(names).toContain("getOpinion");
     expect(names).toContain("getLatestIssue");
     expect(names).toContain("getRegressionContext");
     expect(names).toContain("listDistinctBugs");
@@ -165,6 +166,67 @@ describe("MCP Server", () => {
     expect(linkedTool.inputSchema.properties.requestId).toMatchObject({
       type: "string",
     });
+  });
+
+  it("returns opinion hypotheses, evidence references, and unknowns over MCP", async () => {
+    createSession("sess-opinion", []);
+    fs.writeFileSync(
+      path.join(tmpDir, "sess-opinion", "opinion.json"),
+      JSON.stringify({
+        schemaVersion: "opinion.v1",
+        hypotheses: [
+          {
+            rank: 1,
+            title: "The save request failed",
+            confidence: "high",
+            evidence_refs: ["cand_0001", "req_1"],
+          },
+        ],
+        unknowns: ["Whether a retry succeeded"],
+      }),
+    );
+
+    const response = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: "opinion",
+      method: "tools/call",
+      params: { name: "getOpinion", arguments: { sessionId: "sess-opinion" } },
+    });
+    const result = response!.result as any;
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      hypotheses: [
+        {
+          confidence: "high",
+          evidence_refs: ["cand_0001", "req_1"],
+        },
+      ],
+      unknowns: ["Whether a retry succeeded"],
+    });
+
+    const aliasResponse = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: "opinion-alias",
+      method: "tools/call",
+      params: { name: "get_opinion", arguments: { sessionId: "sess-opinion" } },
+    });
+    expect((aliasResponse!.result as any).isError).toBeUndefined();
+
+    createSession("sess-no-opinion", []);
+    const missingResponse = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: "opinion-missing",
+      method: "tools/call",
+      params: {
+        name: "getOpinion",
+        arguments: { sessionId: "sess-no-opinion" },
+      },
+    });
+    const missing = missingResponse!.result as any;
+    expect(missing.isError).toBe(true);
+    expect(missing.content[0].text).toBe(
+      "No opinion generated yet for this session.",
+    );
   });
 
   async function createFinalizedBugSession(sessionId: string) {
@@ -1483,7 +1545,7 @@ describe("MCP Server", () => {
       };
     }
 
-    /** Fat ranked candidates so budget fills drop predictably. */
+    /** Fat detector signals so budget fills drop predictably. */
     function fatCandidates(count: number) {
       return Array.from({ length: count }, (_, i) => ({
         schemaVersion: 1,
@@ -1541,7 +1603,7 @@ describe("MCP Server", () => {
       const full = await callTool("getFixContext", {
         sessionId: "sess-cp4-fc",
       });
-      const fullIds = full.parsed.ranked_candidates.map((c: any) => c.id);
+      const fullIds = full.parsed.signals.map((c: any) => c.id);
       expect(fullIds).toHaveLength(6);
 
       const maxTokens = estimateTokens(full.text!) - 200;
@@ -1551,10 +1613,10 @@ describe("MCP Server", () => {
       });
 
       // Rank-prefix fill: kept ids + dropped refs reassemble the full ranking.
-      expect(parsed.ranked_candidates.length).toBeGreaterThanOrEqual(1);
+      expect(parsed.signals.length).toBeGreaterThanOrEqual(1);
       expect(parsed.dropReport.droppedCount).toBeGreaterThanOrEqual(1);
       expect([
-        ...parsed.ranked_candidates.map((c: any) => c.id),
+        ...parsed.signals.map((c: any) => c.id),
         ...parsed.dropReport.droppedRefs,
       ]).toEqual(fullIds);
       expect(parsed.dropReport.message).toMatch(/^omitted \d+ items?, ~/);
@@ -1736,7 +1798,7 @@ describe("MCP Server", () => {
 
       const { parsed, result } = await callTool("getLatestIssue", {});
       expect(result.isError).toBeFalsy();
-      expect(parsed.schemaVersion).toBe("fix-context.v1");
+      expect(parsed.schemaVersion).toBe("fix-context.v2");
       expect(parsed.session.id).toBe("sess-latest-new");
       // No maxTokens -> byte-identical to the raw contract (no budgeting fields).
       expect(JSON.stringify(parsed)).not.toContain("tokenEstimate");

@@ -49,8 +49,8 @@ CRUMBTRAIL_PACKAGE_RUNTIME_PASS cli=dist/cli.cjs ...
 | `--allow-origin`        |             localhost origins only | Must be an `http` or `https` origin containing only scheme, host, and optional port. Repeatable. | Additional browser origins allowed by CORS.                                                                                               |
 | `--auth-token`          | unset (or `CRUMBTRAIL_AUTH_TOKEN`) | Presence is reported, but token content is never logged.                                         | Optional token required for `/api/*` routes. The `--auth-token` flag wins; otherwise a non-blank `CRUMBTRAIL_AUTH_TOKEN` env var is used. |
 | `--mcp`                 |                            `false` | Boolean flag.                                                                                    | Run MCP server mode against the output directory instead of HTTP mode.                                                                    |
-| `--ai`                  |                            `false` | Boolean flag.                                                                                    | Opt into AI diagnosis after finalization.                                                                                                 |
-| `--ai-model`            |                              unset | Parsed as an opaque model string.                                                                | Model override for AI diagnosis.                                                                                                          |
+| `--ai`                  |                            `false` | Boolean flag.                                                                                    | Opt into an LLM produced opinion after finalization.                                                                                      |
+| `--ai-model`            |                              unset | Parsed as an opaque model string.                                                                | Model override for the LLM produced opinion.                                                                                              |
 | `--ai-allow-auto-model` |                            `false` | Boolean flag.                                                                                    | Allow provider auto-model selection.                                                                                                      |
 
 Invalid config fails before the server binds and prints a bounded message like:
@@ -142,7 +142,7 @@ The same `crumbtrail-server` binary exposes subcommands beyond `serve`. Every su
 ```bash
 crumbtrail-server --version                     # print crumbtrail-node version
 crumbtrail-server serve --help           # focused help for any subcommand
-crumbtrail-server fix-context <sessionId> --json   # ranked, correlated, LLM-ready fix-context.v1 bundle
+crumbtrail-server fix-context <sessionId> --json   # correlated, LLM ready fix-context.v2 bundle
 crumbtrail-server fix-context <sessionId>          # human-readable summary
 crumbtrail-server inspect <sessionId>           # hot-plane-only session summary
 crumbtrail-server inspect <sessionId> --json    # machine-readable summary
@@ -153,22 +153,26 @@ crumbtrail-server doctor --port 9898            # verify capture + correlation +
 `fix-context` and `inspect` accept either a bare session id (resolved under the sessions dir,
 override with `--output`) or a path to a session directory. Both read hot-plane artifacts
 only and never open the raw event log. `inspect` reports duration, event/error/failed-request
-counts, candidate count, truncation state, and on-disk artifact sizes.
+counts, signal count, truncation state, and on-disk artifact sizes.
 
 ## MCP evidence tools
 
 `crumbtrail-server serve --mcp` runs the stdio MCP server against the sessions directory. The
 evidence-first tools are:
 
-- `getFixContext(sessionId)` — the `fix-context.v1` bundle (`ranked_candidates`,
-  `primary_window` with `frontend` / `backend` / `db_diffs`, `environment`, `repro_hint`).
+- `getFixContext(sessionId)` — the `fix-context.v2` bundle (`signals` with `basis: "heuristic"`
+  and `baseScore`, `primary_window` with `frontend` / `backend` / `db_diffs`, `environment`,
+  `causal_chain`, `repro_hint`).
+- `getOpinion(sessionId)` (alias `get_opinion`) — the optional LLM produced `opinion.json` with
+  ranked hypotheses, evidence references, confidence, and explicit unknowns. It returns a clear
+  error when no opinion has been generated yet.
 - `getSessionManifest(sessionId)` (alias `get_session_manifest`) — manifest metadata,
-  markers, timeline, candidates, `accessPattern`. Synthesizes a manifest from `index.json`
+  markers, timeline, detector signals, `accessPattern`. Synthesizes a manifest from `index.json`
   for older sessions.
 - `getWindow(sessionId, t0, t1)` (alias `get_window`) — cold events inside an absolute-ms
   window; bounded and capped (default/max 500) with truncation reporting. The only tool that
   reads the cold stream.
-- `getEvidence(sessionId, ref)` (alias `get_evidence`) — resolve a candidate id,
+- `getEvidence(sessionId, ref)` (alias `get_evidence`) — resolve a signal id,
   interactive-element signature, or request/event id from hot-plane artifacts.
 
 ## Database diffing
