@@ -48,3 +48,72 @@ jobs:
             exit 1
           fi
           echo "verify correctly exited non-zero on a broken config"
+
+  # Mirror of crumbtrail's relaunch-gate job, pointed at THIS commit. The gate
+  # reads this repo's evidence (topology matrix, correlation and topology
+  # sources, package manifests) out of git objects at a pinned revision, so a
+  # change here that breaks the cross repository contract fails this repo's CI
+  # rather than surfacing later in crumbtrail.
+  relaunch-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: crumbtrail-cli
+          # The gate pins a revision and reads objects at it, so this checkout
+          # needs real history rather than a single shallow commit.
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: CrumbtrailDev/crumbtrail
+          path: crumbtrail
+          token: ${{ secrets.COMPANION_REPO_TOKEN || github.token }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: crumbtrail/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: crumbtrail
+      - name: Resolve this checkout's commit
+        id: companion
+        run: echo "sha=$(git -C crumbtrail-cli rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      # Contract matches crumbtrail's gate job: HOLD is the honest verdict while
+      # operational evidence stays pending, so READY is not required. What is
+      # required is that every row resolves against this commit and no row is
+      # FAIL or UNRESOLVED_CROSS_REPO.
+      - name: Run the crumbtrail relaunch gate against this commit
+        working-directory: crumbtrail
+        env:
+          CRUMBTRAIL_CLI_DIR: ${{ github.workspace }}/crumbtrail-cli
+          CRUMBTRAIL_CLI_REV: ${{ steps.companion.outputs.sha }}
+        run: |
+          # --silent keeps pnpm's lifecycle banner out of stdout so the JSON
+          # parses. Strict exits 1 on HOLD, hence the `|| true`; the assertion
+          # below decides whether this job passes.
+          pnpm --silent verify:relaunch-gate:strict --json > gate.json || true
+          cat gate.json
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const result = JSON.parse(fs.readFileSync("gate.json", "utf8"));
+            const broken = result.rows.filter((row) =>
+              row.status === "FAIL" || row.status === "UNRESOLVED_CROSS_REPO",
+            );
+            for (const row of broken)
+              console.log(`::error::row ${row.row} is ${row.status}`);
+            if (!result.companionSha)
+              console.log("::error::the companion revision did not resolve");
+            if (!["READY", "HOLD"].includes(result.verdict))
+              console.log(`::error::unexpected verdict ${result.verdict}`);
+            const failed =
+              broken.length > 0 ||
+              !result.companionSha ||
+              !["READY", "HOLD"].includes(result.verdict);
+            console.log(
+              `relaunch gate verdict=${result.verdict} companion=${result.companionSha}`,
+            );
+            process.exit(failed ? 1 : 0);
+          '
