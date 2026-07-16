@@ -674,7 +674,7 @@ function sessionArtifactNames(sessionDir: string): string[] {
     path.join(sessionDir, "events.ndjson.zst"),
   );
   return [
-    "diagnosis.md",
+    "opinion.md",
     "CANDIDATES.md",
     "timeline.md",
     "manifest.json",
@@ -700,6 +700,10 @@ function serveSessionArtifact(
   artifactName: string,
 ): void {
   const allowed = new Set([
+    "opinion.md",
+    "opinion.json",
+    "opinion.audit.json",
+    // Legacy artifacts remain directly readable for existing sessions.
     "diagnosis.md",
     "diagnosis.json",
     "CANDIDATES.md",
@@ -1369,7 +1373,7 @@ export function createServer(config: ServerConfig): http.Server {
   );
 
   // Post-finalize side effect shared by the idle sweeper and the fast
-  // finalizer: schedule AI diagnosis when opted in. The session dir is
+  // finalizer: schedule the AI opinion pass when opted in. The session dir is
   // resolved at call time because finalize moves the directory.
   const scheduleSessionAiDiagnosis = (sessionId: string): void => {
     if (!config.ai?.enabled) return;
@@ -1395,7 +1399,7 @@ export function createServer(config: ServerConfig): http.Server {
   };
 
   // Shared post-finalize callback for the background finalizers (sweeper +
-  // fast finalizer). AI diagnosis is scheduled first so a throwing embedder
+  // fast finalizer). The AI opinion pass is scheduled first so a throwing embedder
   // hook can never suppress it; the emit itself is try/caught above.
   const onBackgroundFinalized = (
     sessionId: string,
@@ -2034,7 +2038,7 @@ export function createServer(config: ServerConfig): http.Server {
         config.ai as AiDiagnosisConfig,
       ).then((result) =>
         config.ai?.log?.(
-          `Crumbtrail AI diagnosis backfill complete: ${JSON.stringify(result)}`,
+          `Crumbtrail AI opinion backfill complete: ${JSON.stringify(result)}`,
         ),
       );
     }, 0);
@@ -2056,7 +2060,7 @@ export function createServer(config: ServerConfig): http.Server {
         config.ai as AiDiagnosisConfig,
       ).then((result) =>
         config.ai?.log?.(
-          `Crumbtrail AI diagnosis backfill complete: ${JSON.stringify(result)}`,
+          `Crumbtrail AI opinion backfill complete: ${JSON.stringify(result)}`,
         ),
       );
     }, 0);

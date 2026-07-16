@@ -228,8 +228,8 @@ describe("MCP hierarchical retrieval", () => {
     expect(names).toContain("getSessionManifest");
     expect(names).toContain("getWindow");
     expect(names).toContain("getEvidence");
-    // 33 = the 32 pre-CP4 tools + getLatestIssue (CP4 one-call entry point).
-    expect(result.tools).toHaveLength(33);
+    // 34 includes the optional getOpinion opinion retrieval tool.
+    expect(result.tools).toHaveLength(34);
   });
 
   it("getSessionManifest returns the manifest.json payload (small, hot-plane)", async () => {
@@ -256,6 +256,11 @@ describe("MCP hierarchical retrieval", () => {
     expect(parsed.session.endMs).toBe(9000);
     expect(parsed.timeline.errorMarkers).toHaveLength(1);
     expect(parsed.candidates.map((c: any) => c.id)).toContain("cand_0001");
+    expect(parsed.candidates[0]).toMatchObject({
+      basis: "heuristic",
+      baseScore: 90,
+      score: 90,
+    });
   });
 
   it("getSessionManifest returns isError for an unknown session", async () => {

@@ -530,6 +530,9 @@ const GENERATED_SESSION_ARTIFACTS = [
   "candidates.jsonl",
   "search.jsonl",
   "signatures.json",
+  "opinion.json",
+  "opinion.md",
+  "opinion.audit.json",
   "diagnosis.json",
   "diagnosis.md",
   "capture-truncated.json",
@@ -658,7 +661,9 @@ function readSessionSummary(
 
   const flags: SessionFileFlags = {
     hasVideo: existsNonEmptyFile(path.join(sessionDir, "recording.webm")),
-    hasDiagnosis: fs.existsSync(path.join(sessionDir, "diagnosis.json")),
+    hasDiagnosis:
+      fs.existsSync(path.join(sessionDir, "opinion.json")) ||
+      fs.existsSync(path.join(sessionDir, "diagnosis.json")),
     topSeverity: readTopSeverity(sessionDir),
   };
   return buildSessionSummary(metaRecord, index, flags);

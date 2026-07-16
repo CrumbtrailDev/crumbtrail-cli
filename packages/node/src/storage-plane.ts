@@ -374,6 +374,8 @@ function buildManifest(
       id: candidate.id,
       detector: candidate.detector,
       severity: candidate.severity,
+      basis: "heuristic" as const,
+      baseScore: candidate.score,
       score: candidate.score,
       anchor: candidate.anchor,
       evidenceWindow: candidate.evidenceWindow,

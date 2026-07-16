@@ -1350,31 +1350,32 @@ function renderCandidatesMarkdown(
   input: EvidenceIndexInput,
 ): string {
   const lines = [
-    `# Candidate Evidence Index`,
+    `# Signal Evidence Index`,
     "",
-    "Deterministic, redacted issue candidates generated from local Crumbtrail events. This uppercase entry point is intentional: start here before raw replay artifacts.",
+    "Deterministic, redacted issue signals generated from local Crumbtrail events. This uppercase entry point is intentional: start here before raw replay artifacts.",
     "",
-    `- Schema version: ${CANDIDATE_SCHEMA_VERSION}`,
-    `- Session: ${input.index.id ?? path.basename(input.sessionDir)}`,
-    `- Candidates: ${candidates.length}`,
-    `- Ordering: score desc, anchor time asc, deterministic dedupe key asc; stable candidate IDs are assigned after ranking`,
+    `* Schema version: ${CANDIDATE_SCHEMA_VERSION}`,
+    `* Session: ${input.index.id ?? path.basename(input.sessionDir)}`,
+    `* Signals: ${candidates.length}`,
+    `* Ordering: score desc, anchor time asc, deterministic dedupe key asc; stable signal IDs are assigned after ranking`,
     "",
-    "## Ranked candidates",
+    "## Signals",
     "",
   ];
 
   if (candidates.length === 0) {
-    lines.push("_No deterministic issue candidates were detected._", "");
+    lines.push("_No deterministic issue signals were detected._", "");
   } else {
     for (const candidate of candidates) {
       lines.push(`### ${candidate.id} · ${candidate.title}`);
       lines.push("");
-      lines.push(`- Detector: ${candidate.detector}`);
-      lines.push(`- Severity: ${candidate.severity}`);
-      lines.push(`- Score: ${candidate.score}`);
-      lines.push(`- Confidence: ${candidate.confidence}`);
+      lines.push(`* Detector: ${candidate.detector}`);
+      lines.push(`* Severity: ${candidate.severity}`);
+      lines.push(`* basis: "heuristic"`);
+      lines.push(`* baseScore: ${candidate.score}`);
+      lines.push(`* Confidence: ${candidate.confidence}`);
       lines.push(
-        `- Anchor: ${formatOffset(candidate.anchor.offsetMs, candidate.anchor.t)}${candidate.anchor.route ? ` on ${candidate.anchor.route}` : ""}`,
+        `* Anchor: ${formatOffset(candidate.anchor.offsetMs, candidate.anchor.t)}${candidate.anchor.route ? ` on ${candidate.anchor.route}` : ""}`,
       );
       if (
         candidate.anchor.method ||
@@ -1382,26 +1383,26 @@ function renderCandidatesMarkdown(
         candidate.anchor.url
       )
         lines.push(
-          `- Request: ${[candidate.anchor.method, candidate.anchor.status, candidate.anchor.url].filter((part) => part !== undefined && part !== "").join(" ")}`,
+          `* Request: ${[candidate.anchor.method, candidate.anchor.status, candidate.anchor.url].filter((part) => part !== undefined && part !== "").join(" ")}`,
         );
       if (candidate.anchor.errorCode)
-        lines.push(`- Error code: ${candidate.anchor.errorCode}`);
+        lines.push(`* Error code: ${candidate.anchor.errorCode}`);
       if (candidate.anchor.message)
-        lines.push(`- Message: ${candidate.anchor.message}`);
+        lines.push(`* Message: ${candidate.anchor.message}`);
       if (candidate.anchor.elementLabel)
-        lines.push(`- Element: ${candidate.anchor.elementLabel}`);
+        lines.push(`* Element: ${candidate.anchor.elementLabel}`);
       // Causal structure (CP4): additive per-candidate lines from the CP3 re-rank fields.
       if (candidate.causalRole)
-        lines.push(`- Causal role: ${candidate.causalRole}`);
+        lines.push(`* Causal role: ${candidate.causalRole}`);
       if (candidate.causalRole === "symptom" && candidate.rootCauseId) {
-        lines.push(`- Root cause: ${candidate.rootCauseId}`);
+        lines.push(`* Root cause: ${candidate.rootCauseId}`);
         if (candidate.attributionConfidence)
           lines.push(
-            `- Attribution confidence: ${candidate.attributionConfidence}`,
+            `* Attribution confidence: ${candidate.attributionConfidence}`,
           );
       }
       lines.push(
-        `- Evidence window: [windows/${candidate.id}.md](windows/${candidate.id}.md)`,
+        `* Evidence window: [windows/${candidate.id}.md](windows/${candidate.id}.md)`,
       );
       lines.push("");
     }
@@ -1410,7 +1411,7 @@ function renderCandidatesMarkdown(
   lines.push("## Search corpus");
   lines.push("");
   lines.push(
-    "Use `search.jsonl` for normalized, redacted grep-friendly rows linked back to candidates. It is not a replacement for `events.ndjson`; it avoids raw payloads, storage values, auth material, and raw input values.",
+    "Use `search.jsonl` for normalized, redacted grep friendly rows linked back to signals. It is not a replacement for `events.ndjson`; it avoids raw payloads, storage values, auth material, and raw input values.",
   );
   lines.push("");
   return lines.join("\n");

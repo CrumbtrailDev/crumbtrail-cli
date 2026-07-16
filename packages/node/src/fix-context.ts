@@ -19,7 +19,7 @@ export type FixContextDbRead = LlmBundleDbRead;
 export type FixContextDbActivity = LlmBundleDbActivity;
 
 /**
- * Versioned, ranked, correlated, LLM-ready "hand it to the model" bundle for a finalized
+ * Versioned, correlated, LLM-ready "hand it to the model" bundle for a finalized
  * session. This is the keystone fix-context contract (V2.5).
  *
  * The shape is intentionally stable: `primary_window.db_diffs` defaults to an empty array
@@ -31,7 +31,7 @@ export type FixContextDbActivity = LlmBundleDbActivity;
  * Version-bump policy follows the same Fork A decision as fusion.v1 — see
  * wargames/wargames/01-solve-context-wargame-fields.md.
  */
-export const FIX_CONTEXT_SCHEMA_VERSION = "fix-context.v1" as const;
+export const FIX_CONTEXT_SCHEMA_VERSION = "fix-context.v2" as const;
 
 export interface FixContextSession {
   id: string;
@@ -82,7 +82,7 @@ export interface FixContextPrimaryWindow {
   db_activity: FixContextDbActivity[];
 }
 
-/** One downstream symptom of the primary root cause, resolved from `ranked_candidates`. */
+/** One downstream symptom of the primary root cause, resolved from `signals`. */
 export interface FixContextCausalSymptom {
   id: string;
   detector: string;
@@ -92,7 +92,7 @@ export interface FixContextCausalSymptom {
 
 /**
  * The primary root-cause → symptom chain, derived ONLY from causal fields already present on the
- * ranked candidates (CP3). `null` when the primary candidate is isolated or has no attributed
+ * signals (CP3). `null` when the primary candidate is isolated or has no attributed
  * symptoms. Purely a projection — no attribution is recomputed here.
  */
 export interface FixContextCausalChain {
@@ -100,10 +100,22 @@ export interface FixContextCausalChain {
   symptoms: FixContextCausalSymptom[];
 }
 
+/**
+ * A deterministic detector output. `basis` makes it explicit that `baseScore`
+ * is a reproducible heuristic score, not a contextual model judgment.
+ *
+ * Candidates on disk intentionally remain unchanged for artifact compatibility;
+ * this contract projects the audit fields at its boundary.
+ */
+export type FixContextSignal = EvidenceCandidate & {
+  basis: "heuristic";
+  baseScore: number;
+};
+
 export interface FixContext {
   schemaVersion: typeof FIX_CONTEXT_SCHEMA_VERSION;
   session: FixContextSession;
-  ranked_candidates: EvidenceCandidate[];
+  signals: FixContextSignal[];
   primary_window: FixContextPrimaryWindow;
   /**
    * Account/environment state snapshot. Defaults to `null`; CP3 (environment capture)
@@ -111,7 +123,7 @@ export interface FixContext {
    */
   environment: Record<string, unknown> | null;
   /**
-   * Primary root-cause → symptom chain projected from the ranked candidates' causal fields (CP4).
+   * Primary root-cause → symptom chain projected from the signals' causal fields (CP4).
    * `null` when the top candidate is isolated or attributes no symptoms. Consumers MUST treat null
    * as "no causal structure surfaced".
    */
@@ -163,11 +175,19 @@ export function buildFixContext(
   return {
     schemaVersion: FIX_CONTEXT_SCHEMA_VERSION,
     session,
-    ranked_candidates: ranked,
+    signals: ranked.map(toSignal),
     primary_window: primaryWindow,
     environment,
     causal_chain: causalChain,
     repro_hint: reproHint,
+  };
+}
+
+function toSignal(candidate: EvidenceCandidate): FixContextSignal {
+  return {
+    ...candidate,
+    basis: "heuristic",
+    baseScore: candidate.score,
   };
 }
 
@@ -178,9 +198,9 @@ export function buildFixContext(
  *
  * Primary root resolution:
  *   - if `ranked[0].causalRole === 'root'` → ranked[0] is the root;
- *   - else if ranked[0] is a symptom → resolve its `rootCauseId` against ranked_candidates;
+ *   - else if ranked[0] is a symptom → resolve its `rootCauseId` against `signals`;
  *   - else (isolated / no candidates) → null.
- * Symptoms are the root's own `causes` (candidate ids), resolved against ranked_candidates in the
+ * Symptoms are the root's own `causes` (candidate ids), resolved against `signals` in the
  * root's already-sorted `causes` order, so output is deterministic with no map-iteration leaks.
  */
 function buildCausalChain(

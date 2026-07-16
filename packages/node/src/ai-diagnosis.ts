@@ -1,13 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { EvidenceCandidate } from "./evidence-index";
+import { buildFixContext, type FixContext } from "./fix-context";
 
 export interface AiDiagnosisConfig {
   enabled: boolean;
   apiKey?: string;
   model?: string;
   allowAutoModel?: boolean;
-  maxWindows?: number;
   maxPromptBytes?: number;
   fetchImpl?: typeof fetch;
   log?: (message: string) => void;
@@ -36,8 +35,8 @@ export interface AiDiagnosisBackfillResult {
 }
 
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
-const DEFAULT_MAX_WINDOWS = 40;
 const DEFAULT_MAX_PROMPT_BYTES = 180_000;
+const OPINION_PROMPT_REVISION = "opinion.v1";
 const inFlightDiagnosisDirs = new Set<string>();
 const queuedDiagnosisDirs = new Set<string>();
 
@@ -53,6 +52,38 @@ interface DiagnosisQueue {
   pumpScheduled: boolean;
 }
 
+export interface AiOpinionHypothesis extends Record<string, unknown> {
+  rank: number;
+  confidence: string;
+  evidence_refs: string[];
+}
+
+export interface AiOpinionArtifact {
+  schemaVersion: "opinion.v1";
+  hypotheses: AiOpinionHypothesis[];
+  unknowns: string[];
+}
+
+interface OpinionPrompt {
+  prompt: string;
+  /** Exact user-message bytes sent to the provider, including its evidence bundle. */
+  evidenceSlice: string;
+  reduction: PromptReduction;
+}
+
+interface PromptDrop {
+  path: string;
+  reason: "prompt_byte_cap";
+  omitted?: number;
+  id?: string;
+  characters?: number;
+}
+
+interface PromptReduction {
+  mode: "none" | "deterministic_structural" | "byte_prefix";
+  dropped: PromptDrop[];
+}
+
 const diagnosisQueues = new WeakMap<AiDiagnosisConfig, DiagnosisQueue>();
 
 export async function runAiDiagnosis(
@@ -60,26 +91,25 @@ export async function runAiDiagnosis(
   config: AiDiagnosisConfig,
 ): Promise<AiDiagnosisResult> {
   if (!config.enabled) return { ok: true, skipped: "opt_in_disabled" };
-  if (hasDiagnosisArtifacts(sessionDir))
+  if (hasOpinionArtifacts(sessionDir))
     return { ok: true, skipped: "already_exists" };
   const apiKey = config.apiKey ?? process.env.OPENROUTER_API_KEY;
   if (!apiKey) return { ok: true, skipped: "missing_key" };
 
   try {
-    const candidates = readCandidates(sessionDir);
-    if (candidates.length === 0) return { ok: true, skipped: "no_candidates" };
+    const context = buildFixContext(sessionDir);
+    if (context.signals.length === 0)
+      return { ok: true, skipped: "no_candidates" };
 
     const model = selectModel(config.model, config.allowAutoModel === true);
     const fetchImpl = config.fetchImpl ?? fetch;
-    const prompt = buildPrompt(
-      sessionDir,
-      candidates,
-      config.maxWindows ?? DEFAULT_MAX_WINDOWS,
+    const opinionPrompt = buildPrompt(
+      context,
       config.maxPromptBytes ?? DEFAULT_MAX_PROMPT_BYTES,
     );
 
     config.log?.(
-      `Crumbtrail AI diagnosis enabled; sending AI-safe candidate metadata to OpenRouter model ${model}.`,
+      `Crumbtrail AI opinion enabled; sending the redacted evidence bundle to OpenRouter model ${model}.`,
     );
     const res = await fetchImpl(
       "https://openrouter.ai/api/v1/chat/completions",
@@ -96,9 +126,9 @@ export async function runAiDiagnosis(
             {
               role: "system",
               content:
-                "You are ranking Crumbtrail deterministic issue candidates. Return strict JSON only.",
+                "You produce an advisory Crumbtrail opinion from neutral evidence. Return strict JSON only.",
             },
-            { role: "user", content: prompt },
+            { role: "user", content: opinionPrompt.prompt },
           ],
         }),
       },
@@ -116,22 +146,31 @@ export async function runAiDiagnosis(
         ok: false,
         error: "OpenRouter response did not include content",
       };
-    const diagnosis = JSON.parse(content) as Record<string, unknown>;
-    writeSessionFileNoSymlink(
-      sessionDir,
-      "diagnosis.json",
-      `${JSON.stringify(diagnosis, null, 2)}\n`,
-    );
-    writeSessionFileNoSymlink(
-      sessionDir,
-      "diagnosis.md",
-      renderDiagnosisMarkdown(diagnosis),
-    );
+    const opinion = normalizeAiOpinion(JSON.parse(content));
+    writeOpinionArtifacts(sessionDir, {
+      opinionJson: `${JSON.stringify(opinion, null, 2)}\n`,
+      opinionMarkdown: renderOpinionMarkdown(opinion),
+      auditJson: `${JSON.stringify(
+        {
+          model,
+          prompt: opinionPrompt.prompt,
+          promptBytes: Buffer.byteLength(opinionPrompt.prompt, "utf-8"),
+          // This is deliberately the exact user message captured by the
+          // fetch mock and sent to the provider, rather than a reconstructed
+          // object that could disagree in the byte-prefix fallback.
+          evidenceSlice: opinionPrompt.evidenceSlice,
+          reduction: opinionPrompt.reduction,
+          promptRevision: OPINION_PROMPT_REVISION,
+        },
+        null,
+        2,
+      )}\n`,
+    });
     return { ok: true };
   } catch (err) {
     return {
       ok: false,
-      error: err instanceof Error ? err.message : "AI diagnosis failed",
+      error: err instanceof Error ? err.message : "AI opinion failed",
     };
   }
 }
@@ -144,7 +183,7 @@ export function scheduleAiDiagnosis(
   void enqueueAiDiagnosis(sessionDir, config).then((result) => {
     if (!result.ok)
       config.log?.(
-        `Crumbtrail AI diagnosis failed: ${result.error ?? "unknown error"}`,
+        `Crumbtrail AI opinion failed: ${result.error ?? "unknown error"}`,
       );
   });
 }
@@ -188,7 +227,7 @@ function enqueueAiDiagnosis(
   config: AiDiagnosisConfig,
 ): Promise<AiDiagnosisResult> {
   const key = path.resolve(sessionDir);
-  if (hasDiagnosisArtifacts(sessionDir))
+  if (hasOpinionArtifacts(sessionDir))
     return Promise.resolve({ ok: true, skipped: "already_exists" });
   if (inFlightDiagnosisDirs.has(key) || queuedDiagnosisDirs.has(key)) {
     return Promise.resolve({ ok: true, skipped: "in_progress" });
@@ -239,11 +278,122 @@ function pumpDiagnosisQueue(
   }
 }
 
-function hasDiagnosisArtifacts(sessionDir: string): boolean {
+function hasOpinionArtifacts(sessionDir: string): boolean {
   return (
-    fs.existsSync(path.join(sessionDir, "diagnosis.json")) ||
-    fs.existsSync(path.join(sessionDir, "diagnosis.md"))
+    isRegularOpinionArtifact(sessionDir, "opinion.json") &&
+    isRegularOpinionArtifact(sessionDir, "opinion.audit.json")
   );
+}
+
+function isRegularOpinionArtifact(sessionDir: string, name: string): boolean {
+  try {
+    return fs.lstatSync(path.join(sessionDir, name)).isFile();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+interface OpinionArtifacts {
+  opinionJson: string;
+  opinionMarkdown: string;
+  auditJson: string;
+}
+
+/**
+ * Publish the opinion as one complete set. The audit is made visible before
+ * opinion.json, so a failure can leave only an incomplete set that a later
+ * run will regenerate, never an opinion that is treated as complete without
+ * its audit.
+ */
+function writeOpinionArtifacts(
+  sessionDir: string,
+  artifacts: OpinionArtifacts,
+): void {
+  const names = ["opinion.audit.json", "opinion.md", "opinion.json"] as const;
+  const nonce = `${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
+  const temporary = new Map(
+    names.map((name) => [name, `.${name}.${nonce}.tmp`] as const),
+  );
+
+  assertSafeOpinionArtifactPaths(sessionDir, names);
+  if (!hasOpinionArtifacts(sessionDir)) removeIncompleteOpinionArtifacts(sessionDir, names);
+
+  try {
+    writeSessionFileNoSymlink(
+      sessionDir,
+      temporary.get("opinion.audit.json")!,
+      artifacts.auditJson,
+    );
+    writeSessionFileNoSymlink(
+      sessionDir,
+      temporary.get("opinion.md")!,
+      artifacts.opinionMarkdown,
+    );
+    writeSessionFileNoSymlink(
+      sessionDir,
+      temporary.get("opinion.json")!,
+      artifacts.opinionJson,
+    );
+
+    for (const name of names) {
+      const temporaryName = temporary.get(name)!;
+      const temporaryPath = path.join(sessionDir, temporaryName);
+      const finalPath = path.join(sessionDir, name);
+      assertSafeOpinionArtifactPaths(sessionDir, [name, temporaryName]);
+      fs.renameSync(temporaryPath, finalPath);
+    }
+    if (!hasPublishedOpinionArtifacts(sessionDir))
+      throw new Error("Opinion artifacts were not published completely");
+  } catch (err) {
+    // Do not retain an incomplete publication. The successful set is only
+    // opinion.json plus opinion.audit.json, and json is published last.
+    if (!hasPublishedOpinionArtifacts(sessionDir))
+      removeIncompleteOpinionArtifacts(sessionDir, names);
+    if (err instanceof Error && err.message.includes("Invalid opinion artifact path"))
+      throw err;
+    throw new Error(`Unable to write opinion artifacts: ${errorMessage(err)}`);
+  } finally {
+    for (const name of temporary.values()) {
+      const temporaryPath = path.join(sessionDir, name);
+      if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { force: true });
+    }
+  }
+}
+
+function hasPublishedOpinionArtifacts(sessionDir: string): boolean {
+  return (
+    hasOpinionArtifacts(sessionDir) &&
+    isRegularOpinionArtifact(sessionDir, "opinion.md")
+  );
+}
+
+function assertSafeOpinionArtifactPaths(
+  sessionDir: string,
+  names: readonly string[],
+): void {
+  const root = fs.realpathSync(sessionDir);
+  for (const name of names) {
+    const filePath = path.join(sessionDir, name);
+    const parent = fs.realpathSync(path.dirname(filePath));
+    if (parent !== root && !parent.startsWith(root + path.sep))
+      throw new Error("Invalid opinion artifact path");
+    if (fs.existsSync(filePath) && fs.lstatSync(filePath).isSymbolicLink())
+      throw new Error("Invalid opinion artifact path");
+  }
+}
+
+function removeIncompleteOpinionArtifacts(
+  sessionDir: string,
+  names: readonly string[],
+): void {
+  for (const name of names) {
+    const filePath = path.join(sessionDir, name);
+    if (!fs.existsSync(filePath)) continue;
+    if (fs.lstatSync(filePath).isSymbolicLink())
+      throw new Error("Invalid opinion artifact path");
+    fs.rmSync(filePath, { recursive: true, force: true });
+  }
 }
 
 function writeSessionFileNoSymlink(
@@ -251,38 +401,12 @@ function writeSessionFileNoSymlink(
   name: string,
   data: string,
 ): void {
-  const filePath = path.join(sessionDir, name);
-  try {
-    const root = fs.realpathSync(sessionDir);
-    const parent = fs.realpathSync(path.dirname(filePath));
-    if (parent !== root && !parent.startsWith(root + path.sep))
-      throw new Error("Invalid diagnosis artifact path");
-    if (fs.existsSync(filePath) && fs.lstatSync(filePath).isSymbolicLink()) {
-      throw new Error("Invalid diagnosis artifact path");
-    }
-    fs.writeFileSync(filePath, data);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      fs.writeFileSync(filePath, data);
-      return;
-    }
-    if (
-      err instanceof Error &&
-      err.message.includes("Invalid diagnosis artifact path")
-    )
-      throw err;
-    throw new Error("Invalid diagnosis artifact path");
-  }
+  assertSafeOpinionArtifactPaths(sessionDir, [name]);
+  fs.writeFileSync(path.join(sessionDir, name), data);
 }
 
-function readCandidates(sessionDir: string): EvidenceCandidate[] {
-  const filePath = path.join(sessionDir, "candidates.jsonl");
-  if (!fs.existsSync(filePath)) return [];
-  return fs
-    .readFileSync(filePath, "utf-8")
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as EvidenceCandidate);
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : "unknown write failure";
 }
 
 function selectModel(
@@ -295,84 +419,238 @@ function selectModel(
 }
 
 function buildPrompt(
-  sessionDir: string,
-  candidates: EvidenceCandidate[],
-  maxWindows: number,
+  context: FixContext,
   maxBytes: number,
-): string {
-  const selected = candidates.slice(0, Math.max(0, maxWindows));
-  const chunks = [
-    "Rank these Crumbtrail issue candidates. Use the deterministic evidence as source of truth. Return JSON with an array named findings. Each finding should include real_issue, confidence, severity, user_visible_symptom, suspected_root_cause, evidence_refs, recommended_debug_steps, unknowns, and false_positive_reason when rejected.",
-    "",
-    "Candidate summaries:",
-    JSON.stringify(
-      selected.map((candidate) => ({
-        id: candidate.id,
-        detector: candidate.detector,
-        severity: candidate.severity,
-        score: candidate.score,
-        confidence: candidate.confidence,
-        anchor: safeAnchor(candidate.anchor),
-        evidenceWindow: candidate.evidenceWindow,
-      })),
-      null,
-      2,
-    ),
-    "",
-    "AI-safe evidence references:",
-  ];
-
-  for (const candidate of selected) {
-    chunks.push(
-      JSON.stringify(
-        buildAiSafeEvidenceReference(sessionDir, candidate),
-        null,
-        2,
-      ),
-    );
-  }
-
-  const prompt = chunks.join("\n");
-  const promptBytes = Buffer.from(prompt, "utf-8");
-  if (promptBytes.byteLength <= maxBytes) return prompt;
-  return `${promptBytes.subarray(0, Math.max(0, maxBytes)).toString("utf-8")}\n[TRUNCATED_TO_PROMPT_BYTE_CAP]`;
+): OpinionPrompt {
+  const instruction =
+    "Create an advisory opinion from this redacted Crumbtrail evidence bundle. The deterministic signals are heuristics, not contextual judgments. Return strict JSON with an array named hypotheses. Every hypothesis must include confidence and evidence_refs. Include a top level unknowns array that states what this evidence cannot establish. Keep the opinion structurally separate from the evidence.";
+  return boundOpinionPrompt(instruction, context, maxBytes);
 }
 
-function buildAiSafeEvidenceReference(
-  sessionDir: string,
-  candidate: EvidenceCandidate,
-): Record<string, unknown> {
-  const windowPath = path.join(sessionDir, "windows", `${candidate.id}.md`);
+function boundOpinionPrompt(
+  instruction: string,
+  evidenceSlice: FixContext,
+  maxBytes: number,
+): OpinionPrompt {
+  const prefix = `${instruction}\n\nEvidence bundle:\n`;
+  const fullPrompt = `${prefix}${JSON.stringify(evidenceSlice, null, 2)}`;
+  if (Buffer.byteLength(fullPrompt, "utf-8") <= maxBytes) {
+    return {
+      prompt: fullPrompt,
+      evidenceSlice: fullPrompt,
+      reduction: { mode: "none", dropped: [] },
+    };
+  }
+
+  // The normal path above always sends the complete agent-visible bundle.
+  // Under an explicit hard byte cap, remove lower ranked signals first and
+  // retain an auditable record of every omission.
+  const reduced = cloneFixContext(evidenceSlice);
+  const signalDrops: PromptDrop[] = [];
+  while (
+    reduced.signals.length > 0 &&
+    Buffer.byteLength(`${prefix}${JSON.stringify(reduced, null, 2)}`, "utf-8") >
+      maxBytes
+  ) {
+    const index = reduced.signals.length - 1;
+    const signal = reduced.signals.pop()!;
+    signalDrops.push({
+      path: `signals[${index}]`,
+      reason: "prompt_byte_cap",
+      id: signal.id,
+    });
+  }
+  if (
+    Buffer.byteLength(
+      `${prefix}${JSON.stringify(reduced, null, 2)}`,
+      "utf-8",
+  ) <= maxBytes
+  ) {
+    const prompt = `${prefix}${JSON.stringify(reduced, null, 2)}`;
+    return {
+      prompt,
+      evidenceSlice: prompt,
+      reduction: {
+        mode: "deterministic_structural",
+        dropped: signalDrops,
+      },
+    };
+  }
+
+  // A single correlated window can exceed the provider cap. Retain the full
+  // top-level shape and shorten deterministic lower-detail values, recording
+  // precisely which paths changed in the audit.
+  for (const stringLimit of [2048, 1024, 512, 256, 128, 64, 32, 16, 0]) {
+    for (const arrayLimit of [20, 10, 5, 1, 0]) {
+      const drops = [...signalDrops];
+      const bounded = limitPromptValue(
+        reduced,
+        stringLimit,
+        arrayLimit,
+        "",
+        drops,
+      ) as FixContext;
+      const prompt = `${prefix}${JSON.stringify(bounded, null, 2)}`;
+      if (Buffer.byteLength(prompt, "utf-8") <= maxBytes) {
+        return {
+          prompt,
+          evidenceSlice: prompt,
+          reduction: { mode: "deterministic_structural", dropped: drops },
+        };
+      }
+    }
+  }
+
+  const minimal = minimalEvidenceSlice(reduced);
+  const prompt = `${prefix}${JSON.stringify(minimal, null, 2)}`;
+  if (Buffer.byteLength(prompt, "utf-8") <= maxBytes) {
+    return {
+      prompt,
+      evidenceSlice: prompt,
+      reduction: {
+        mode: "deterministic_structural",
+        dropped: [
+          ...signalDrops,
+          ...minimalEvidenceDrops(reduced),
+        ],
+      },
+    };
+  }
+
+  const capped = utf8Prefix(prompt, Math.max(0, maxBytes));
   return {
-    id: candidate.id,
-    windowAvailable: fs.existsSync(windowPath),
-    detector: candidate.detector,
-    severity: candidate.severity,
-    score: candidate.score,
-    confidence: candidate.confidence,
-    anchor: safeAnchor(candidate.anchor),
-    evidenceWindow: candidate.evidenceWindow,
-    omittedRawEvidence: [
-      "clipboard",
-      "keystrokes",
-      "transcripts",
-      "storage_values",
-      "cookies",
-      "input_values",
-      "console_text",
-      "unknown_payloads",
-    ],
+    prompt: capped,
+    evidenceSlice: capped,
+    reduction: {
+      mode: "byte_prefix",
+      dropped: [
+        ...signalDrops,
+        ...minimalEvidenceDrops(reduced),
+        {
+          path: "$",
+          reason: "prompt_byte_cap",
+          characters: prompt.length - capped.length,
+        },
+      ],
+    },
   };
 }
 
-function safeAnchor(
-  anchor: EvidenceCandidate["anchor"],
-): Record<string, unknown> | undefined {
-  if (!anchor || typeof anchor !== "object") return undefined;
-  const record = anchor as Record<string, unknown>;
+function cloneFixContext(context: FixContext): FixContext {
+  return JSON.parse(JSON.stringify(context)) as FixContext;
+}
+
+function limitPromptValue(
+  value: unknown,
+  stringLimit: number,
+  arrayLimit: number,
+  path: string,
+  drops: PromptDrop[],
+): unknown {
+  if (typeof value === "string") {
+    if (value.length <= stringLimit) return value;
+    drops.push({
+      path,
+      reason: "prompt_byte_cap",
+      characters: value.length - stringLimit,
+    });
+    if (stringLimit === 0) return "";
+    return `${value.slice(0, stringLimit)}[TRUNCATED_TO_PROMPT_BYTE_CAP]`;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > arrayLimit)
+      drops.push({
+        path,
+        reason: "prompt_byte_cap",
+        omitted: value.length - arrayLimit,
+      });
+    return value
+      .slice(0, arrayLimit)
+      .map((entry, index) =>
+        limitPromptValue(
+          entry,
+          stringLimit,
+          arrayLimit,
+          `${path}[${index}]`,
+          drops,
+        ),
+      );
+  }
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [
+      key,
+      limitPromptValue(
+        entry,
+        stringLimit,
+        arrayLimit,
+        path ? `${path}.${key}` : key,
+        drops,
+      ),
+    ]),
+  );
+}
+
+function minimalEvidenceDrops(context: FixContext): PromptDrop[] {
+  const drops: PromptDrop[] = [];
+  if (context.signals.length > 0)
+    drops.push({
+      path: "signals",
+      reason: "prompt_byte_cap",
+      omitted: context.signals.length,
+    });
+  for (const [path, entries] of [
+    ["primary_window.frontend.requests", context.primary_window.frontend.requests],
+    ["primary_window.backend.requests", context.primary_window.backend.requests],
+    ["primary_window.db_diffs", context.primary_window.db_diffs],
+    ["primary_window.db_reads", context.primary_window.db_reads],
+    ["primary_window.db_activity", context.primary_window.db_activity],
+  ] as const) {
+    if (entries.length > 0)
+      drops.push({
+        path,
+        reason: "prompt_byte_cap",
+        omitted: entries.length,
+      });
+  }
+  if (context.environment !== null)
+    drops.push({ path: "environment", reason: "prompt_byte_cap" });
+  if (context.causal_chain !== null)
+    drops.push({ path: "causal_chain", reason: "prompt_byte_cap" });
+  if (context.repro_hint !== null)
+    drops.push({ path: "repro_hint", reason: "prompt_byte_cap" });
+  return drops;
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value, "utf-8");
+  for (let end = Math.min(bytes.length, maxBytes); end >= 0; end -= 1) {
+    const prefix = bytes.subarray(0, end).toString("utf-8");
+    if (Buffer.byteLength(prefix, "utf-8") <= maxBytes) return prefix;
+  }
+  return "";
+}
+
+function minimalEvidenceSlice(context: FixContext): FixContext {
   return {
-    ...(typeof record.t === "number" ? { t: record.t } : {}),
-    ...(typeof record.k === "string" ? { k: record.k.slice(0, 80) } : {}),
+    schemaVersion: context.schemaVersion,
+    session: {
+      id: context.session.id,
+      startMs: context.session.startMs,
+      endMs: context.session.endMs,
+      durationMs: context.session.durationMs,
+    },
+    signals: [],
+    primary_window: {
+      frontend: { window: null, anchor: null, requests: [] },
+      backend: { requests: [] },
+      db_diffs: [],
+      db_reads: [],
+      db_activity: [],
+    },
+    environment: null,
+    causal_chain: null,
+    repro_hint: null,
   };
 }
 
@@ -385,42 +663,71 @@ function extractContent(payload: unknown): string | undefined {
     : undefined;
 }
 
-function renderDiagnosisMarkdown(diagnosis: Record<string, unknown>): string {
+export function normalizeAiOpinion(value: unknown): AiOpinionArtifact {
+  const source = isRecord(value) ? value : {};
+  const rawHypotheses = Array.isArray(source.hypotheses)
+    ? source.hypotheses
+    : Array.isArray(source.findings)
+      ? source.findings
+      : [];
+  const hypotheses = rawHypotheses.map((entry, index) => {
+    const record = isRecord(entry) ? entry : {};
+    return {
+      ...record,
+      rank: typeof record.rank === "number" ? record.rank : index + 1,
+      confidence:
+        typeof record.confidence === "string" ? record.confidence : "unknown",
+      evidence_refs: stringValues(record.evidence_refs),
+    } as AiOpinionHypothesis;
+  });
+  const unknowns = stringValues(source.unknowns);
+  if (unknowns.length === 0) {
+    for (const hypothesis of hypotheses) {
+      unknowns.push(...stringValues(hypothesis.unknowns));
+    }
+  }
+  return { schemaVersion: "opinion.v1", hypotheses, unknowns };
+}
+
+function renderOpinionMarkdown(opinion: AiOpinionArtifact): string {
   const lines = [
-    "# AI Diagnosis",
+    "# AI Opinion",
     "",
-    "Optional OpenRouter ranking over deterministic Crumbtrail candidates.",
+    "Optional LLM produced opinion over redacted Crumbtrail evidence.",
     "",
   ];
-  const findings = Array.isArray(diagnosis.findings) ? diagnosis.findings : [];
-  if (findings.length === 0) {
-    lines.push("No findings returned.", "");
+  if (opinion.hypotheses.length === 0) {
+    lines.push("No hypotheses returned.", "");
     return lines.join("\n");
   }
 
-  for (const [index, finding] of findings.entries()) {
-    const record = isRecord(finding) ? finding : {};
-    lines.push(`## Finding ${index + 1}`);
+  for (const hypothesis of opinion.hypotheses) {
+    lines.push(`## Hypothesis ${hypothesis.rank}`);
     lines.push("");
     for (const key of [
-      "real_issue",
+      "title",
       "confidence",
-      "severity",
-      "user_visible_symptom",
-      "suspected_root_cause",
       "evidence_refs",
+      "summary",
       "recommended_debug_steps",
-      "unknowns",
-      "false_positive_reason",
     ]) {
-      if (record[key] === undefined) continue;
+      if (hypothesis[key] === undefined) continue;
       lines.push(
-        `- ${key}: ${Array.isArray(record[key]) ? (record[key] as unknown[]).join(", ") : String(record[key])}`,
+        `* ${key}: ${Array.isArray(hypothesis[key]) ? (hypothesis[key] as unknown[]).join(", ") : String(hypothesis[key])}`,
       );
     }
     lines.push("");
   }
+
+  lines.push("## Unknowns", "");
+  if (opinion.unknowns.length === 0) lines.push("* None reported.", "");
+  else for (const unknown of opinion.unknowns) lines.push(`* ${unknown}`);
   return lines.join("\n");
+}
+
+function stringValues(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === "string");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

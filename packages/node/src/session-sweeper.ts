@@ -60,7 +60,7 @@ export interface SessionSweepOptions {
   checkpointMs?: number;
   /** Upper bound on finalizations (incl. re-finalizations) per sweep. */
   maxPerSweep?: number;
-  /** Called after each successful finalize (e.g. to schedule AI diagnosis). */
+  /** Called after each successful finalize (for example, to schedule an AI opinion). */
   onFinalized?: (sessionId: string, refinalized: boolean) => void;
   /** Clock seam for tests. */
   now?: () => number;

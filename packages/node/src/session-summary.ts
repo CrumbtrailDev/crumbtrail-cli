@@ -1,4 +1,4 @@
-export type Severity = 'critical' | 'high' | 'medium' | 'low';
+export type Severity = "critical" | "high" | "medium" | "low";
 
 export interface SessionSummary {
   id: string;
@@ -25,7 +25,7 @@ export interface SessionFileFlags {
 const TITLE_MAX_LENGTH = 120;
 
 // Maps already-parsed meta.json / index.json into a SessionSummary. Pure: it performs
-// no filesystem I/O. The caller discovers file flags (recording.webm / diagnosis.json
+// no filesystem I/O. The caller discovers file flags (recording.webm / opinion.json
 // presence, candidate-derived severity) and passes them via fileFlags.
 export function buildSessionSummary(
   metaJson: unknown,
@@ -42,9 +42,10 @@ export function buildSessionSummary(
   const errors = errs.length;
   const failedReqCount = failedReqs.length;
 
-  const id = str(index.id) ?? str(meta.id) ?? '';
+  const id = str(index.id) ?? str(meta.id) ?? "";
   const release = str(meta.release) ?? str(meta.releaseId) ?? str(meta.version);
-  const build = str(meta.build) ?? str(meta.buildId) ?? str(meta.commit) ?? str(meta.sha);
+  const build =
+    str(meta.build) ?? str(meta.buildId) ?? str(meta.commit) ?? str(meta.sha);
   const start = num(index.start) ?? num(meta.start) ?? 0;
   const end = num(index.end) ?? num(meta.end);
   const dur = num(index.dur) ?? num(meta.dur);
@@ -66,7 +67,8 @@ export function buildSessionSummary(
 
   // Severity precedence: a candidate-derived severity (passed in by the caller) wins.
   // Otherwise derive a coarse fallback from the failure counts.
-  const topSeverity = fileFlags.topSeverity ?? deriveSeverity(errors, failedReqCount);
+  const topSeverity =
+    fileFlags.topSeverity ?? deriveSeverity(errors, failedReqCount);
   if (topSeverity) summary.topSeverity = topSeverity;
 
   const title = deriveTitle(errs, navs, meta, id);
@@ -75,17 +77,27 @@ export function buildSessionSummary(
   return summary;
 }
 
-function deriveSeverity(errors: number, failedReqs: number): Severity | undefined {
-  if (errors > 0) return 'high';
-  if (failedReqs > 0) return 'medium';
+function deriveSeverity(
+  errors: number,
+  failedReqs: number,
+): Severity | undefined {
+  if (errors > 0) return "high";
+  if (failedReqs > 0) return "medium";
   return undefined;
 }
 
-function deriveTitle(errs: unknown[], navs: unknown[], meta: Record<string, unknown>, id: string): string | undefined {
-  const firstErr = errs.length > 0 && isRecord(errs[0]) ? str(errs[0].msg) : undefined;
+function deriveTitle(
+  errs: unknown[],
+  navs: unknown[],
+  meta: Record<string, unknown>,
+  id: string,
+): string | undefined {
+  const firstErr =
+    errs.length > 0 && isRecord(errs[0]) ? str(errs[0].msg) : undefined;
   if (firstErr) return truncate(firstErr);
 
-  const firstNav = navs.length > 0 && isRecord(navs[0]) ? str(navs[0].to) : undefined;
+  const firstNav =
+    navs.length > 0 && isRecord(navs[0]) ? str(navs[0].to) : undefined;
   if (firstNav) return truncate(firstNav);
 
   const metaTitle = str(meta.rootUrl) ?? str(meta.url) ?? str(meta.title);
@@ -95,19 +107,23 @@ function deriveTitle(errs: unknown[], navs: unknown[], meta: Record<string, unkn
 }
 
 function truncate(value: string): string {
-  return value.length > TITLE_MAX_LENGTH ? value.slice(0, TITLE_MAX_LENGTH) : value;
+  return value.length > TITLE_MAX_LENGTH
+    ? value.slice(0, TITLE_MAX_LENGTH)
+    : value;
 }
 
 function str(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
+  if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function num(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return value != null && typeof value === 'object' && !Array.isArray(value);
+  return value != null && typeof value === "object" && !Array.isArray(value);
 }

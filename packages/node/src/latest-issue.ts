@@ -74,7 +74,7 @@ function recencyOf(dir: string, index: Record<string, unknown>): number {
   return finiteNumber(meta?.start) ?? 0;
 }
 
-/** Severities of the ranked candidates.jsonl rows (hot plane), rank order. */
+/** Severities of the detector signal rows in candidates.jsonl, rank order. */
 function candidateSeverities(dir: string): string[] {
   const buf = defaultSessionStore.readArtifact(dir, "candidates.jsonl");
   if (!buf) return [];
