@@ -2626,6 +2626,9 @@ describe("searchable evidence index artifacts", () => {
       "utf-8",
     );
     const candidates = readNdjson(path.join(tmpDir, "candidates.jsonl"));
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, "manifest.json"), "utf-8"),
+    );
     const search = fs.readFileSync(path.join(tmpDir, "search.jsonl"), "utf-8");
     const windowMd = fs.readFileSync(
       path.join(tmpDir, "windows", "cand_0001.md"),
@@ -2641,6 +2644,13 @@ describe("searchable evidence index artifacts", () => {
     });
     expect(candidatesMd).toContain("BILLING_USAGE_SUBSCRIPTION_NOT_FOUND");
     expect(candidatesMd).toContain("windows/cand_0001.md");
+    expect(candidatesMd).toContain('basis: "heuristic"');
+    expect(candidatesMd).toContain("baseScore: 95");
+    expect(manifest.candidates[0]).toMatchObject({
+      basis: "heuristic",
+      baseScore: 95,
+      score: 95,
+    });
     expect(windowMd).toContain("Compact event timeline");
     expect(timeline).toContain("Five-minute deterministic buckets");
     expect(search).toContain("candidateId");

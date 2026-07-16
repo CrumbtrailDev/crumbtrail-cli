@@ -123,7 +123,7 @@ interface Cluster {
 }
 
 /**
- * Groups the ranked candidates into DISTINCT bugs deterministically.
+ * Groups detector signals into DISTINCT bugs deterministically.
  *
  * Grouping key heuristics (deterministic, order-independent):
  *  - Candidates sharing a correlated `anchor.requestId` (Crumbtrail request id or W3C trace id)

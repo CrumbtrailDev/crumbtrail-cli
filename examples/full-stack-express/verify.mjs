@@ -640,7 +640,7 @@ async function assertFixContextCausalChain({ outputDir, sessionId, token }) {
   }
   const text = result.content?.[0]?.text;
   const contract = JSON.parse(text);
-  if (contract.schemaVersion !== "fix-context.v1") {
+  if (contract.schemaVersion !== "fix-context.v2") {
     throw new VerificationError(
       "fix-context",
       "fix-context schema version drifted",
@@ -681,12 +681,12 @@ async function assertFixContextCausalChain({ outputDir, sessionId, token }) {
       },
     );
   }
-  if (contract.ranked_candidates?.[0]?.causalRole !== "root") {
+  if (contract.signals?.[0]?.causalRole !== "root") {
     throw new VerificationError(
       "fix-context",
-      "ranked_candidates[0] was not the causal root",
+      "signals[0] was not the causal root",
       {
-        topCausalRole: contract.ranked_candidates?.[0]?.causalRole,
+        topCausalRole: contract.signals?.[0]?.causalRole,
       },
     );
   }

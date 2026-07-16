@@ -159,11 +159,11 @@ export function formatFixContext(context: FixContext): string {
     `  App:         ${s.app ?? "unknown"}${s.source ? ` (${s.source})` : ""}`,
   );
   lines.push(`  Duration:    ${s.durationMs} ms`);
-  lines.push(`  Candidates:  ${context.ranked_candidates.length}`);
+  lines.push(`  Signals:     ${context.signals.length}`);
 
-  for (const candidate of context.ranked_candidates.slice(0, 5)) {
+  for (const signal of context.signals.slice(0, 5)) {
     lines.push(
-      `    ${candidate.id} [${candidate.detector}] score ${candidate.score} — ${candidate.title}`,
+      `    ${signal.id} [${signal.detector}] score ${signal.baseScore} — ${signal.title}`,
     );
   }
 

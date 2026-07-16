@@ -844,7 +844,7 @@ describe("server", () => {
     expect(eventRes.status, JSON.stringify(eventRes.body)).toBe(200);
     expect(endRes.status, JSON.stringify(endRes.body)).toBe(200);
     const fc = buildFixContext(findSessionDir(tmpDir, sessionId));
-    expect(fc.ranked_candidates[0]).toMatchObject({
+    expect(fc.signals[0]).toMatchObject({
       detector: "repeated_clicks",
       anchor: {
         route: "/checkout",
@@ -1029,7 +1029,7 @@ describe("server", () => {
 
     const fc = buildFixContext(sessionDir);
     expect(fc.session.app).toBe("shop-expo");
-    expect(fc.ranked_candidates[0]).toMatchObject({
+    expect(fc.signals[0]).toMatchObject({
       detector: "repeated_clicks",
       anchor: {
         route: "/checkout",
@@ -2415,18 +2415,18 @@ describe("server evidence artifact routes", () => {
     expect(html.indexOf("timeline.md")).toBeLessThan(html.indexOf("llm.md"));
 
     const sessionDir = findSessionDir(tmpDir, "ses_candidates");
-    fs.writeFileSync(path.join(sessionDir, "diagnosis.md"), "# Diagnosis\n");
+    fs.writeFileSync(path.join(sessionDir, "opinion.md"), "# AI Opinion\n");
     fs.writeFileSync(
       path.join(sessionDir, "recording.webm"),
       Buffer.from("video"),
     );
 
-    const pageWithDiagnosisRes = await fetch(sessionUrl, {
+    const pageWithOpinionRes = await fetch(sessionUrl, {
       headers: authHeaders,
     });
-    const htmlWithDiagnosis = await pageWithDiagnosisRes.text();
-    expect(htmlWithDiagnosis.indexOf("diagnosis.md")).toBeLessThan(
-      htmlWithDiagnosis.indexOf("CANDIDATES.md"),
+    const htmlWithOpinion = await pageWithOpinionRes.text();
+    expect(htmlWithOpinion.indexOf("opinion.md")).toBeLessThan(
+      htmlWithOpinion.indexOf("CANDIDATES.md"),
     );
 
     const windowRes = await fetch(`${sessionUrl}/windows/cand_0001.md`, {
@@ -2581,7 +2581,7 @@ describe("server GET /api/sessions", () => {
       },
       files: {
         "recording.webm": Buffer.from("video-bytes"),
-        "diagnosis.json": JSON.stringify({ ok: true }),
+        "opinion.json": JSON.stringify({ ok: true }),
       },
     });
     writeSession(tmpDir, "ses_partial", {

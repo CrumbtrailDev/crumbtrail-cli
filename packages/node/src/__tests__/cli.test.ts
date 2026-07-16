@@ -268,7 +268,7 @@ describe("startupMessages", () => {
       "Auth token protection enabled for /api/* routes",
     );
     expect(messages).toContain(
-      "AI diagnosis opt-in enabled with model openai/gpt-4.1-mini",
+      "AI opinion opt in enabled with model openai/gpt-4.1-mini",
     );
     expect(messages.join("\n")).not.toContain("super-secret-token");
   });

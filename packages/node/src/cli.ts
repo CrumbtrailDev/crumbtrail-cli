@@ -82,7 +82,7 @@ Options:
   --allow-origin <o>  Add an allowed browser origin (repeatable)
   --whisper-model <m> Whisper model for audio transcription (default base)
   --mcp               Start the stdio MCP server instead of the HTTP server
-  --ai                Enable opt-in AI diagnosis (see --ai-model)
+  --ai                Enable opt in AI opinion (see --ai-model)
 
 Example:
   crumbtrail-server serve --port 9898 --output ./.crumbtrail/sessions`,
@@ -343,7 +343,7 @@ export function startupMessages(config: CliConfig): string[] {
   }
   if (config.ai) {
     messages.push(
-      `AI diagnosis opt-in enabled${config.aiModel ? ` with model ${config.aiModel}` : ""}`,
+      `AI opinion opt in enabled${config.aiModel ? ` with model ${config.aiModel}` : ""}`,
     );
   }
 

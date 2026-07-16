@@ -22,7 +22,7 @@ import { McpServer } from "../mcp-server";
 const SESSION_ID = "ses_fc";
 
 // A full-stack bug: a click triggers a POST that fails 500 on both the browser response and
-// the correlated backend request, so post-processing yields a ranked candidate plus a linked
+// the correlated backend request, so post-processing yields a detector signal plus a linked
 // frontend/backend full-stack request.
 const EVENTS = [
   {
@@ -121,19 +121,19 @@ describe("buildFixContext", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("locks the fix-context.v1 schema shape", () => {
+  it("locks the fix-context.v2 schema shape with honest signal bases", () => {
     const fc = buildFixContext(sessionDir);
 
-    expect(fc.schemaVersion).toBe("fix-context.v1");
-    expect(FIX_CONTEXT_SCHEMA_VERSION).toBe("fix-context.v1");
+    expect(fc.schemaVersion).toBe("fix-context.v2");
+    expect(FIX_CONTEXT_SCHEMA_VERSION).toBe("fix-context.v2");
     expect(Object.keys(fc).sort()).toEqual([
       "causal_chain",
       "environment",
       "primary_window",
-      "ranked_candidates",
       "repro_hint",
       "schemaVersion",
       "session",
+      "signals",
     ]);
     expect(Object.keys(fc.primary_window).sort()).toEqual([
       "backend",
@@ -144,6 +144,12 @@ describe("buildFixContext", () => {
     ]);
     expect(fc.session.id).toBe(SESSION_ID);
     expect(fc.session.app).toBe("shop");
+    expect(fc.signals[0]).toMatchObject({
+      basis: "heuristic",
+      detector: "backend_http_error",
+      baseScore: 89,
+      score: 89,
+    });
   });
 
   it("defaults db_diffs/db_reads to [] and environment to null", () => {
@@ -364,8 +370,8 @@ describe("buildFixContext", () => {
       await postProcess(dir);
 
       const fc = buildFixContext(dir);
-      // The standalone db_mutation is the only candidate, hence ranked[0], and its window covers the diff.
-      expect(fc.ranked_candidates[0].detector).toBe("db_mutation");
+      // The standalone db_mutation is the only signal, and its window covers the diff.
+      expect(fc.signals[0].detector).toBe("db_mutation");
       expect(fc.primary_window.db_diffs.length).toBeGreaterThan(0);
       const diff = fc.primary_window.db_diffs[0];
       expect(diff.op).toBe("insert");
@@ -445,7 +451,7 @@ describe("buildFixContext", () => {
 
       const fc = buildFixContext(dir);
       expect(
-        fc.ranked_candidates.some(
+        fc.signals.some(
           (candidate) => candidate.detector === "otel_db_activity",
         ),
       ).toBe(true);
@@ -566,7 +572,7 @@ describe("buildFixContext", () => {
       await postProcess(dir);
 
       const fc = buildFixContext(dir);
-      expect(fc.ranked_candidates[0].detector).toBe("db_mutation");
+      expect(fc.signals[0].detector).toBe("db_mutation");
       expect(fc.primary_window.db_diffs).toHaveLength(1);
       expect(fc.primary_window.db_reads).toHaveLength(2);
       expect(fc.primary_window.db_reads.map((read) => read.row.rank)).toEqual([
@@ -586,17 +592,15 @@ describe("buildFixContext", () => {
 
   it("ranks the backend root above its net.res symptom (causal re-rank)", () => {
     const fc = buildFixContext(sessionDir);
-    expect(fc.ranked_candidates.length).toBeGreaterThan(0);
+    expect(fc.signals.length).toBeGreaterThan(0);
     // The backend error is the root cause of the correlated 500 response; the causal re-rank makes
     // it ranked[0] and demotes the frontend-observed http_error to a symptom below it. (Before CP3
     // the higher-scored http_error sat at ranked[0], burying the actual backend root.)
-    const top = fc.ranked_candidates[0];
+    const top = fc.signals[0];
     expect(top.detector).toBe("backend_http_error");
     expect(top.anchor.status).toBe(500);
     expect(top.causalRole).toBe("root");
-    const httpError = fc.ranked_candidates.find(
-      (c: any) => c.detector === "http_error",
-    );
+    const httpError = fc.signals.find((c: any) => c.detector === "http_error");
     expect(httpError).toBeDefined();
     expect(httpError!.causalRole).toBe("symptom");
     expect(httpError!.rootCauseId).toBe(top.id);
@@ -605,28 +609,24 @@ describe("buildFixContext", () => {
     expect(top.score).toBe(89);
   });
 
-  it("surfaces a causal_chain projecting root → symptom from ranked candidate fields", () => {
+  it("surfaces a causal_chain projecting root → symptom from signal fields", () => {
     const fc = buildFixContext(sessionDir);
 
-    // ranked_candidates[0] is the backend root; the chain projects that same order without re-sort.
-    expect(fc.ranked_candidates[0].causalRole).toBe("root");
+    // signals[0] is the backend root; the chain projects that same order without re-sort.
+    expect(fc.signals[0].causalRole).toBe("root");
     expect(fc.causal_chain).not.toBeNull();
     const chain = fc.causal_chain!;
     expect(chain.root.detector).toBe("backend_http_error");
-    expect(chain.root.id).toBe(fc.ranked_candidates[0].id);
+    expect(chain.root.id).toBe(fc.signals[0].id);
 
     const httpSymptom = chain.symptoms.find((s) => s.detector === "http_error");
     expect(httpSymptom).toBeDefined();
     expect(httpSymptom!.attributionConfidence).toBeDefined();
 
     // The chain's root/symptom ids are consistent with the candidate causal fields (no recompute).
-    const httpError = fc.ranked_candidates.find(
-      (c: any) => c.detector === "http_error",
-    );
+    const httpError = fc.signals.find((c: any) => c.detector === "http_error");
     expect(httpError!.rootCauseId).toBe(chain.root.id);
-    expect(chain.symptoms.map((s) => s.id)).toEqual(
-      fc.ranked_candidates[0].causes,
-    );
+    expect(chain.symptoms.map((s) => s.id)).toEqual(fc.signals[0].causes);
   });
 
   it("leaves causal_chain null when the primary candidate is isolated / has no causes", async () => {
@@ -668,29 +668,26 @@ describe("buildFixContext", () => {
       await postProcess(dir);
 
       const fc = buildFixContext(dir);
-      expect(fc.ranked_candidates.length).toBeGreaterThan(0);
+      expect(fc.signals.length).toBeGreaterThan(0);
       // The single console error attributes no downstream symptoms (no `causes`), so even if it is
       // labeled a root it yields NO chain — causal_chain must be null.
-      expect(fc.ranked_candidates[0].causes ?? []).toEqual([]);
+      expect(fc.signals[0].causes ?? []).toEqual([]);
       expect(fc.causal_chain).toBeNull();
     } finally {
       fs.rmSync(isoTmp, { recursive: true, force: true });
     }
   });
 
-  it("keeps ranked_candidates root-first (regression) and back-compat defaults intact", () => {
+  it("keeps signals root-first and context defaults intact", () => {
     const fc = buildFixContext(sessionDir);
     // Root-first order: the backend root precedes its http_error symptom in file order.
-    const rootIdx = fc.ranked_candidates.findIndex(
+    const rootIdx = fc.signals.findIndex(
       (c) => c.detector === "backend_http_error",
     );
-    const symptomIdx = fc.ranked_candidates.findIndex(
-      (c) => c.detector === "http_error",
-    );
+    const symptomIdx = fc.signals.findIndex((c) => c.detector === "http_error");
     expect(rootIdx).toBeGreaterThanOrEqual(0);
     expect(symptomIdx).toBeGreaterThan(rootIdx);
-    // Back-compat: existing fields/defaults are untouched by the additive causal_chain.
-    expect(fc.schemaVersion).toBe("fix-context.v1");
+    expect(fc.schemaVersion).toBe("fix-context.v2");
     expect(fc.primary_window.db_diffs).toEqual([]);
     expect(fc.primary_window.db_reads).toEqual([]);
     expect(fc.environment).toBeNull();
@@ -715,7 +712,7 @@ describe("buildFixContext", () => {
     expect(fc.repro_hint!.title).toContain("500");
   });
 
-  it("carries target descriptors from ranked candidates into fix-context hints", () => {
+  it("carries target descriptors from signals into fix-context hints", () => {
     const dir = path.join(tmpDir, "ses_fc_target");
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(
@@ -837,7 +834,7 @@ describe("buildFixContext", () => {
 
     const fc = buildFixContext(dir);
 
-    expect(fc.ranked_candidates[0].anchor.target).toMatchObject({
+    expect(fc.signals[0].anchor.target).toMatchObject({
       testID: "submit-order",
       routePath: "/checkout",
     });
@@ -916,8 +913,8 @@ describe("runFixContext (CLI)", () => {
     const code = await runFixContext([sessionDir, "--json"]);
     expect(code).toBe(0);
     const parsed = JSON.parse(writes.join(""));
-    expect(parsed.schemaVersion).toBe("fix-context.v1");
-    expect(parsed.ranked_candidates.length).toBeGreaterThan(0);
+    expect(parsed.schemaVersion).toBe("fix-context.v2");
+    expect(parsed.signals.length).toBeGreaterThan(0);
   });
 
   it("emits a human-readable summary by default", async () => {
@@ -926,7 +923,7 @@ describe("runFixContext (CLI)", () => {
     const out = writes.join("");
     expect(out).toContain("crumbtrail-server fix-context");
     expect(out).toContain(SESSION_ID);
-    expect(out).toContain("fix-context.v1");
+    expect(out).toContain("fix-context.v2");
   });
 
   it("resolves a bare session id against --output", async () => {
@@ -1013,7 +1010,7 @@ describe("runFixContext --latest / --follow (CLI)", () => {
     ]);
     expect(code).toBe(0);
     const parsed = JSON.parse(outWrites.join(""));
-    expect(parsed.schemaVersion).toBe("fix-context.v1");
+    expect(parsed.schemaVersion).toBe("fix-context.v2");
     expect(parsed.session.id).toBe(SESSION_ID);
   });
 
@@ -1055,7 +1052,7 @@ describe("runFixContext --latest / --follow (CLI)", () => {
 
     expect(code).toBe(0);
     const parsed = JSON.parse(outWrites.join(""));
-    expect(parsed.schemaVersion).toBe("fix-context.v1");
+    expect(parsed.schemaVersion).toBe("fix-context.v2");
     expect(parsed.session.id).toBe("ses_follow");
     const stderr = errWrites.join("");
     expect(stderr).toContain("waiting for ses_follow");
@@ -1131,12 +1128,12 @@ describe("getFixContext (MCP tool)", () => {
     const result = res!.result as any;
     expect(result.isError).toBeUndefined();
     const contract = JSON.parse(result.content[0].text);
-    expect(contract.schemaVersion).toBe("fix-context.v1");
+    expect(contract.schemaVersion).toBe("fix-context.v2");
     expect(contract.session.id).toBe(SESSION_ID);
     expect(contract.primary_window.db_diffs).toEqual([]);
     expect(contract.primary_window.db_reads).toEqual([]);
     expect(contract.environment).toBeNull();
-    expect(contract.ranked_candidates[0].detector).toBe("backend_http_error");
+    expect(contract.signals[0].detector).toBe("backend_http_error");
   });
 
   it("returns an MCP error for an unknown session", async () => {

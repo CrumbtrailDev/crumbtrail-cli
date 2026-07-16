@@ -432,14 +432,14 @@ export interface LlmBundle {
   browserEvidence: LlmBundleBrowserEvidence;
   fullStackEvidence: LlmBundleFullStackEvidence;
   /**
-   * Deterministic within-session grouping of the ranked candidates into DISTINCT labeled bugs.
-   * `[]` when no candidates were detected. See {@link DistinctBug}.
+   * Deterministic within-session grouping of detector signals into DISTINCT labeled bugs.
+   * `[]` when no signals were detected. See {@link DistinctBug}.
    */
   distinctBugs: DistinctBug[];
   /** Redaction-aware environment snapshot for the session, or `null` when none was captured. */
   environment: LlmBundleEnvironment | null;
   /**
-   * Root → symptom causal tree projected from the ranked candidates' CP3 causal fields. Additive
+   * Root → symptom causal tree projected from detector signals' CP3 causal fields. Additive
    * and optional: absent when no candidate carries `causalRole: 'root'` with attributed symptoms.
    * Consumers MUST NOT treat its absence as "no bug"; it only means no root→symptom structure was
    * surfaced. Never recomputes attribution — a pure projection of `candidates`.
@@ -486,7 +486,7 @@ export interface LlmBundleCausalSymptom {
   attributionConfidence?: CausalConfidence;
 }
 
-/** A root cause with its nested symptoms, built from ranked candidate causal fields (CP4). */
+/** A root cause with its nested symptoms, built from detector signal causal fields (CP4). */
 export interface LlmBundleCausalRoot {
   id: string;
   detector: string;
@@ -549,7 +549,7 @@ const KNOWN_ARTIFACTS: Array<{
     path: "search.jsonl",
     role: "generated",
     description:
-      "Redacted normalized grep-friendly search corpus linked to candidates.",
+      "Redacted normalized grep friendly search corpus linked to detector signals.",
     generated: true,
   },
   {
@@ -572,17 +572,24 @@ const KNOWN_ARTIFACTS: Array<{
     generated: true,
   },
   {
-    path: "diagnosis.md",
+    path: "opinion.md",
     role: "generated",
     description:
-      "Optional AI diagnosis generated only when explicitly opted in.",
+      "Optional LLM produced opinion generated only when explicitly opted in.",
     generated: true,
   },
   {
-    path: "diagnosis.json",
+    path: "opinion.json",
     role: "generated",
     description:
-      "Machine-readable optional AI diagnosis generated only when explicitly opted in.",
+      "Machine readable optional LLM produced opinion generated only when explicitly opted in.",
+    generated: true,
+  },
+  {
+    path: "opinion.audit.json",
+    role: "generated",
+    description:
+      "Audit record of the redacted evidence bundle and prompt sent for the optional opinion.",
     generated: true,
   },
   {
@@ -1368,7 +1375,7 @@ function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
 }
 
 /**
- * Projects a root → symptom causal tree from the ranked candidates' CP3 causal fields (`causalRole`,
+ * Projects a root → symptom causal tree from detector signal CP3 causal fields (`causalRole`,
  * `causes`, `attributionConfidence`). Pure and deterministic: never recomputes attribution.
  *
  * Ordering is stable and independent of map-iteration order: roots preserve the candidates' ranked
@@ -3463,7 +3470,7 @@ function renderCausalStructureSection(
   if (!causalTree || causalTree.length === 0) return [];
   const lines = ["## Causal Structure", ""];
   lines.push(
-    "Root causes with the downstream symptoms attributed to them (deterministic; from ranked candidate causal fields).",
+    "Root causes with the downstream symptoms attributed to them (deterministic; from detector signal causal fields).",
   );
   lines.push("");
   for (const root of causalTree) {
