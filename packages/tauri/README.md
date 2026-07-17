@@ -18,7 +18,7 @@ Add the plugin to your `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-tauri-plugin-crumbtrail = { path = "../packages/tauri/rust" }
+tauri-plugin-crumbtrail = "0.1"
 ```
 
 Register it in `src-tauri/src/lib.rs` (the Tauri v2 CLI scaffold's `run()`

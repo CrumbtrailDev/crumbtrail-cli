@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-write-blob"
+description = "Enables the write_blob command without any pre-configured scope."
+commands.allow = ["write_blob"]
+
+[[permission]]
+identifier = "deny-write-blob"
+description = "Denies the write_blob command without any pre-configured scope."
+commands.deny = ["write_blob"]

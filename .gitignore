@@ -7,7 +7,6 @@ dist/
 
 # Rust
 target/
-packages/tauri/rust/gen/
 Cargo.lock
 
 # IDE

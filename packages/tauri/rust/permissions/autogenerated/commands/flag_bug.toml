@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-flag-bug"
+description = "Enables the flag_bug command without any pre-configured scope."
+commands.allow = ["flag_bug"]
+
+[[permission]]
+identifier = "deny-flag-bug"
+description = "Denies the flag_bug command without any pre-configured scope."
+commands.deny = ["flag_bug"]

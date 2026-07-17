@@ -5,4 +5,6 @@ permissions = [
     "allow-end-session",
     "allow-append-events",
     "allow-write-blob",
+    "allow-flag-bug",
+    "allow-write-bug-voice",
 ]
