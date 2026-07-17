@@ -1622,7 +1622,7 @@ function renderWindowMarkdown(
 
   if (windowEvents.length === 0) lines.push("_No events in this window._");
   else
-    for (const event of windowEvents.slice(0, 120))
+    for (const event of selectCompactTimelineEvents(candidate, windowEvents))
       lines.push(
         `- ${formatOffset(offsetForEvent(event) ?? offsetFromStart(event.t, index.start), event.t)} ${event.k}: ${eventSummary(event)}`,
       );
@@ -1671,6 +1671,149 @@ function renderWindowMarkdown(
     `- Review video/audio around ${formatOffset(candidate.anchor.offsetMs, candidate.anchor.t)} if media artifacts exist.`,
   );
   return lines.join("\n") + "\n";
+}
+
+const COMPACT_TIMELINE_MAX_EVENTS = 120;
+const COMPACT_TIMELINE_BUDGETS = {
+  errors: 36,
+  interactions: 24,
+  network: 24,
+  lowSignal: 18,
+  context: 15,
+} as const;
+
+function selectCompactTimelineEvents(
+  candidate: EvidenceCandidate,
+  windowEvents: BugEvent[],
+): BugEvent[] {
+  // Preserve the complete chronology when it already fits. Per-kind quotas only
+  // shape an overflowed timeline; they must not discard useful context otherwise.
+  if (windowEvents.length <= COMPACT_TIMELINE_MAX_EVENTS) return windowEvents;
+
+  const indexedEvents = windowEvents.map((event, index) => ({ event, index }));
+  const selected = new Set<number>();
+  const add = (entry: { event: BugEvent; index: number } | undefined) => {
+    if (entry && selected.size < COMPACT_TIMELINE_MAX_EVENTS)
+      selected.add(entry.index);
+  };
+  const byProximity = (entries: typeof indexedEvents) =>
+    entries.slice().sort(
+      (a, b) =>
+        Math.abs(a.event.t - candidate.anchor.t) -
+          Math.abs(b.event.t - candidate.anchor.t) ||
+        a.event.t - b.event.t ||
+        a.index - b.index,
+    );
+  const firstMatching = (
+    predicate: (event: BugEvent) => boolean,
+  ): { event: BugEvent; index: number } | undefined =>
+    byProximity(indexedEvents.filter(({ event }) => predicate(event)))[0];
+  const requestId = candidate.anchor.requestId;
+  const response = findResponseEvent(
+    collectResponsesByTimeStatus(windowEvents),
+    candidate.anchor.t,
+    candidate.anchor.status,
+  );
+  const responseEntry = response
+    ? indexedEvents.find(({ event }) => event === response)
+    : undefined;
+  const detectorAnchorKind = compactAnchorEventKind(candidate.detector);
+  const anchor =
+    requestId
+      ? responseEntry ??
+        firstMatching(
+          (event) =>
+            event.t === candidate.anchor.t &&
+            requestIdForEvent(event) === requestId,
+        ) ??
+        firstMatching((event) => event.t === candidate.anchor.t)
+      : (detectorAnchorKind
+          ? firstMatching((event) => event.k === detectorAnchorKind)
+          : undefined) ??
+        responseEntry ??
+        firstMatching((event) => event.t === candidate.anchor.t) ??
+        firstMatching(() => true);
+  add(anchor);
+
+  const correlatedRequestId = requestId ?? requestIdForEvent(anchor?.event);
+  if (correlatedRequestId) {
+    add(
+      firstMatching(
+        (event) =>
+          event.k === "net.req" && requestIdForEvent(event) === correlatedRequestId,
+      ),
+    );
+    add(
+      firstMatching(
+        (event) =>
+          event.k === "net.res" && requestIdForEvent(event) === correlatedRequestId,
+      ),
+    );
+  }
+
+  const addBudgeted = (
+    budget: number,
+    predicate: (event: BugEvent) => boolean,
+  ) => {
+    const remaining = COMPACT_TIMELINE_MAX_EVENTS - selected.size;
+    for (const entry of byProximity(
+      indexedEvents.filter(
+        ({ event, index }) => !selected.has(index) && predicate(event),
+      ),
+    ).slice(0, Math.min(budget, remaining)))
+      add(entry);
+  };
+
+  addBudgeted(COMPACT_TIMELINE_BUDGETS.errors, isCompactErrorEvent);
+  addBudgeted(COMPACT_TIMELINE_BUDGETS.interactions, (event) =>
+    ["clk", "inp", "key"].includes(event.k),
+  );
+  addBudgeted(COMPACT_TIMELINE_BUDGETS.network, (event) =>
+    event.k === "net.req" || event.k === "net.res" || event.k === "net.err",
+  );
+  addBudgeted(COMPACT_TIMELINE_BUDGETS.lowSignal, isCompactLowSignalEvent);
+  addBudgeted(
+    COMPACT_TIMELINE_BUDGETS.context,
+    (event) =>
+      !isCompactErrorEvent(event) &&
+      !["clk", "inp", "key", "net.req", "net.res", "net.err"].includes(
+        event.k,
+      ) &&
+      !isCompactLowSignalEvent(event),
+  );
+
+  // Quotas preserve a useful mix, then unused capacity goes to the events most
+  // relevant to the candidate rather than leaving the compact timeline sparse.
+  for (const entry of byProximity(
+    indexedEvents.filter(({ index }) => !selected.has(index)),
+  ).slice(0, COMPACT_TIMELINE_MAX_EVENTS - selected.size))
+    add(entry);
+
+  return indexedEvents
+    .filter(({ index }) => selected.has(index))
+    .sort((a, b) => a.event.t - b.event.t || a.index - b.index)
+    .map(({ event }) => event);
+}
+
+function compactAnchorEventKind(detector: string): BugEvent["k"] | undefined {
+  if (detector === "unhandled_rejection") return "rej";
+  if (detector === "console_error") return "con";
+  if (detector === "uncaught_error") return "err";
+  return undefined;
+}
+
+function requestIdForEvent(event: BugEvent | undefined): string | undefined {
+  return event ? safeText(event.d.id, 120) : undefined;
+}
+
+function isCompactErrorEvent(event: BugEvent): boolean {
+  return ["con", "err", "rej", "probe.error", "native-crash"].includes(
+    event.k,
+  );
+}
+
+function isCompactLowSignalEvent(event: BugEvent): boolean {
+  return ["stor", "cookie", "perf", "hb", "snap"].includes(event.k);
 }
 
 function findResponseEvent(

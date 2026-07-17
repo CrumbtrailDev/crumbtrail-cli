@@ -359,6 +359,183 @@ describe("evidence-index mixed page evidence artifacts", () => {
     expect(serialized).not.toContain("card=");
   });
 
+  it("keeps an HTTP error anchor and its request-response pair above boot noise", () => {
+    const bootNoise: BugEvent[] = Array.from({ length: 125 }, (_, index) => ({
+      t: index * 56,
+      k: ["stor", "cookie", "perf", "hb"][index % 4],
+      offsetMs: index * 56,
+      d: { name: `boot-${index}` },
+    }));
+    const events: BugEvent[] = [
+      ...bootNoise,
+      {
+        t: 7177,
+        k: "net.req",
+        offsetMs: 7177,
+        d: {
+          id: "send-file",
+          m: "POST",
+          url: "https://api.example.test/jobs/sendFile",
+        },
+      },
+      {
+        t: 7598,
+        k: "net.res",
+        offsetMs: 7598,
+        d: { id: "send-file", st: 500, dur: 421 },
+      },
+      {
+        t: 7700,
+        k: "con",
+        offsetMs: 7700,
+        d: { lv: "error", msg: "Upload failed" },
+      },
+    ];
+
+    const candidates = writeEvidenceIndex({
+      sessionDir: tmpDir,
+      events,
+      index: {
+        id: "ses_anchor_centered_window",
+        start: 0,
+        end: 7700,
+        dur: 7700,
+        failedReqs: [
+          {
+            t: 7598,
+            m: "POST",
+            url: "https://api.example.test/jobs/sendFile",
+            st: 500,
+          },
+        ],
+      },
+    });
+    const candidate = candidates.find(
+      (entry) => entry.detector === "http_error",
+    );
+    const window = fs.readFileSync(
+      path.join(tmpDir, "windows", `${candidate!.id}.md`),
+      "utf-8",
+    );
+    const compactTimeline = window.split("## Network summaries", 1)[0];
+    const compactEventLines = compactTimeline.match(/^- \d+ ms /gm) ?? [];
+    const lowSignalLines =
+      compactTimeline.match(/^- .* (?:stor|cookie|perf|hb):/gm) ?? [];
+
+    expect(candidate).toBeDefined();
+    expect(window).toContain(
+      "- Candidate: HTTP 500 from POST https://api.example.test/jobs/sendFile",
+    );
+    expect(compactTimeline).toContain(
+      "7177 ms net.req: request POST https://api.example.test/jobs/sendFile",
+    );
+    expect(compactTimeline).toContain(
+      "7598 ms net.res: response send-file status 500 dur 421 ms",
+    );
+    expect(compactEventLines.length).toBeLessThanOrEqual(120);
+    expect(lowSignalLines.length).toBeGreaterThan(18);
+  });
+
+  it("keeps a rejection anchor when another event shares its timestamp", () => {
+    const anchorTime = 10_000;
+    const events: BugEvent[] = [
+      ...Array.from({ length: 36 }, (_, index) => ({
+        t: anchorTime,
+        k: "con",
+        offsetMs: anchorTime,
+        d: { lv: "error", msg: `competing console error ${index}` },
+      })),
+      {
+        t: anchorTime,
+        k: "rej",
+        offsetMs: anchorTime,
+        d: { msg: "the rejection anchor" },
+      },
+      ...Array.from({ length: 90 }, (_, index) => ({
+        t: anchorTime + index + 1,
+        k: "stor",
+        offsetMs: anchorTime + index + 1,
+        d: { key: `noise-${index}` },
+      })),
+    ];
+
+    const candidates = writeEvidenceIndex({
+      sessionDir: tmpDir,
+      events,
+      index: {
+        id: "ses_rejection_anchor",
+        start: anchorTime,
+        end: anchorTime + 90,
+        dur: 90,
+        errs: [{ t: anchorTime, msg: "the rejection anchor" }],
+      },
+    });
+    const candidate = candidates.find(
+      (entry) => entry.detector === "unhandled_rejection",
+    );
+    const window = fs.readFileSync(
+      path.join(tmpDir, "windows", `${candidate!.id}.md`),
+      "utf-8",
+    );
+    const compactTimeline = window.split("## Network summaries", 1)[0];
+
+    expect(candidate).toBeDefined();
+    expect(compactTimeline).toContain(
+      "10000 ms rej: rej: the rejection anchor",
+    );
+  });
+
+  it("renders every event in a non-overflowing window despite per-kind quotas", () => {
+    const anchorTime = 10_000;
+    const events: BugEvent[] = [
+      ...Array.from({ length: 40 }, (_, index) => ({
+        t: anchorTime - 60 + index,
+        k: "stor",
+        offsetMs: anchorTime - 60 + index,
+        d: { key: `low-signal-${index}` },
+      })),
+      ...Array.from({ length: 20 }, (_, index) => ({
+        t: anchorTime - 20 + index,
+        k: "nav",
+        offsetMs: anchorTime - 20 + index,
+        d: { to: `/context-${index}` },
+      })),
+      {
+        t: anchorTime,
+        k: "con",
+        offsetMs: anchorTime,
+        d: { lv: "error", msg: "anchor console error" },
+      },
+    ];
+
+    const candidates = writeEvidenceIndex({
+      sessionDir: tmpDir,
+      events,
+      index: {
+        id: "ses_non_overflowing_window",
+        start: anchorTime - 60,
+        end: anchorTime,
+        dur: 60,
+        consoleErrors: [{ t: anchorTime, msg: "anchor console error" }],
+      },
+    });
+    const candidate = candidates.find(
+      (entry) => entry.detector === "console_error",
+    );
+    const window = fs.readFileSync(
+      path.join(tmpDir, "windows", `${candidate!.id}.md`),
+      "utf-8",
+    );
+    const compactTimeline = window.split("## Network summaries", 1)[0];
+    const compactEventLines = compactTimeline.match(/^- \d+ ms /gm) ?? [];
+
+    expect(candidate).toBeDefined();
+    expect(events.length).toBeLessThan(120);
+    expect(compactEventLines).toHaveLength(events.length);
+    expect(compactTimeline).toContain('"key":"low-signal-39"');
+    expect(compactTimeline).toContain("navigation to /context-19");
+  });
+
   it("caps repeated-click evidence candidates to prevent quadratic finalization growth", () => {
     const events = Array.from({ length: 900 }, (_, index) => ({
       t: 10_000 + index * 10,
