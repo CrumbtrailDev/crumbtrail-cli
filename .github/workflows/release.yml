@@ -70,6 +70,12 @@ jobs:
         working-directory: packages/tauri/rust
     steps:
       - uses: actions/checkout@v4
+      # Tauri's Linux backend compiles against GTK/WebKitGTK system libraries.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
       - run: cargo test
       - name: Skip if version already published
         id: check
