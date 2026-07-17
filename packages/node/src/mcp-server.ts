@@ -36,6 +36,7 @@ import { parseTicketUrl } from "./ticket/url";
 import type { Reproducer } from "./reproduce/types";
 import {
   buildDistinctBugSignature,
+  computeDistinctBugSignatures,
   groupDistinctBugRecurrences,
   type DistinctBug,
   type DistinctBugRecurrence,
@@ -1944,9 +1945,22 @@ export class McpServer {
   private toolGetRecurrence(args: Record<string, unknown>) {
     const signature = stringField(args.signature);
     if (!signature) return errorResult("signature is required");
-    const recurrence = this.recurrenceRollups(args).find(
+    const inputs = this.recurrenceInputs(args);
+    const recurrences = groupDistinctBugRecurrences(inputs);
+    let recurrence = recurrences.find(
       (entry) => entry.signature === signature,
     );
+    if (!recurrence && signature.startsWith("bugsig:")) {
+      const input = inputs.find(
+        ({ bug }) => computeDistinctBugSignatures(bug).legacy === signature,
+      );
+      if (input) {
+        recurrence = recurrences.find(
+          (entry) =>
+            entry.signature === computeDistinctBugSignatures(input.bug).current,
+        );
+      }
+    }
     if (!recurrence) return errorResult(`Recurrence ${signature} not found`);
     return textResult(recurrence);
   }
@@ -1970,6 +1984,12 @@ export class McpServer {
   private recurrenceRollups(
     args: Record<string, unknown>,
   ): DistinctBugRecurrence[] {
+    return groupDistinctBugRecurrences(this.recurrenceInputs(args));
+  }
+
+  private recurrenceInputs(
+    args: Record<string, unknown>,
+  ): DistinctBugRecurrenceInput[] {
     const inputs: DistinctBugRecurrenceInput[] = [];
     for (const { dir } of defaultSessionStore.listSessions(this.outputDir)) {
       const meta = this.readJsonRecord(dir, "meta.json") ?? {};
@@ -1993,7 +2013,7 @@ export class McpServer {
         if (this.isDistinctBugRecord(bug)) inputs.push({ bug, session });
       }
     }
-    return groupDistinctBugRecurrences(inputs);
+    return inputs;
   }
 
   private compactRecurrence(

@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { buildDistinctBugSignature, groupDistinctBugs } from "../distinct-bugs";
+import {
+  buildDistinctBugSignature,
+  groupDistinctBugs,
+} from "../distinct-bugs";
+import { computeDistinctBugSignatures } from "../index";
 import type { EvidenceCandidate } from "../evidence-index";
 
 function candidate(
@@ -202,7 +206,7 @@ describe("groupDistinctBugs", () => {
 });
 
 describe("buildDistinctBugSignature", () => {
-  it("normalizes long row IDs across sessions but keeps small semantic numbers distinct", () => {
+  it("normalizes numeric message values across sessions", () => {
     const invoiceA = groupDistinctBugs([
       candidate({
         id: "cand_invoice_a",
@@ -255,8 +259,102 @@ describe("buildDistinctBugSignature", () => {
     expect(buildDistinctBugSignature(invoiceA)).toBe(
       buildDistinctBugSignature(invoiceB),
     );
-    expect(buildDistinctBugSignature(thresholdA)).not.toBe(
+    expect(buildDistinctBugSignature(thresholdA)).toBe(
       buildDistinctBugSignature(thresholdB),
     );
+  });
+
+  it("collapses the production route variants into one version-2 signature", () => {
+    const bug = (route: string) => ({
+      title: "Unhandled rejection: Failed to fetch",
+      representative: {
+        title: "Unhandled rejection: Failed to fetch",
+        detector: "unhandled_rejection",
+        severity: "high" as const,
+        message: "Unhandled rejection: Failed to fetch",
+        route,
+      },
+    });
+
+    const signatures = [
+      "https://alertbase.ai/dashboard/jobs",
+      "https://alertbase.ai/dashboard/jobs?tab=2",
+      "/dashboard/jobs#x",
+    ].map((route) => buildDistinctBugSignature(bug(route)));
+
+    expect(signatures).toEqual([signatures[0], signatures[0], signatures[0]]);
+    expect(signatures[0]).toMatch(/^bugsig2:/);
+  });
+
+  it("collapses UUID and hexadecimal route segments", () => {
+    const bug = (route: string) => ({
+      title: "Job request failed",
+      representative: {
+        title: "Job request failed",
+        detector: "http_error",
+        severity: "high" as const,
+        message: "Job request failed",
+        route,
+      },
+    });
+
+    const idSignature = buildDistinctBugSignature(bug("/jobs/:id"));
+
+    expect(
+      buildDistinctBugSignature(
+        bug("/jobs/550e8400-e29b-41d4-a716-446655440000"),
+      ),
+    ).toBe(idSignature);
+    expect(buildDistinctBugSignature(bug("/jobs/deadbeef"))).toBe(
+      idSignature,
+    );
+    expect(buildDistinctBugSignature(bug("/jobs/feedback"))).not.toBe(
+      idSignature,
+    );
+    expect(buildDistinctBugSignature(bug("/jobs/dashboard"))).not.toBe(
+      idSignature,
+    );
+  });
+
+  it("keeps genuinely different routes distinct", () => {
+    const bug = (route: string) => ({
+      title: "Request failed",
+      representative: {
+        title: "Request failed",
+        detector: "http_error",
+        severity: "high" as const,
+        message: "Request failed",
+        route,
+      },
+    });
+
+    expect(buildDistinctBugSignature(bug("/jobs"))).not.toBe(
+      buildDistinctBugSignature(bug("/billing")),
+    );
+  });
+
+  it("returns the exact legacy signature for cutover matching", () => {
+    const signatures = computeDistinctBugSignatures({
+      title: "Unhandled rejection: Failed to fetch",
+      representative: {
+        title: "Unhandled rejection: Failed to fetch",
+        detector: "unhandled_rejection",
+        severity: "high",
+        message: "Unhandled rejection: Failed to fetch",
+        route: "https://alertbase.ai/dashboard/jobs?tab=2#x",
+      },
+    });
+
+    expect(signatures.legacy).toBe("bugsig:1du09jm");
+    expect(buildDistinctBugSignature({
+      title: "Unhandled rejection: Failed to fetch",
+      representative: {
+        title: "Unhandled rejection: Failed to fetch",
+        detector: "unhandled_rejection",
+        severity: "high",
+        message: "Unhandled rejection: Failed to fetch",
+        route: "https://alertbase.ai/dashboard/jobs?tab=2#x",
+      },
+    })).toBe(signatures.current);
   });
 });

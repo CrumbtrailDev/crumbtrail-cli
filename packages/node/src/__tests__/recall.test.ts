@@ -174,12 +174,13 @@ describe("recallLocal (direct, in-memory store)", () => {
     expect(matches[0].reasons).toContain("env-overlap");
   });
 
-  it("honours the limit", () => {
+  it("merges digit-bearing route variants as one recurrence", () => {
     const store = fakeStore(
       Array.from({ length: 5 }, (_, i) => ({
         id: `sess-${i}`,
         bundle: {},
-        // distinct routes → distinct signatures so none dedupe away
+        // Digit-bearing route variants identify the same phenomenon and must
+        // share a recurrence signature.
         bugs: [
           bug({
             bugId: `bug-${i}`,
@@ -191,6 +192,33 @@ describe("recallLocal (direct, in-memory store)", () => {
           }),
         ],
       })),
+    );
+    const query: LocalIssueProfile = {
+      tokens: tokenizeIssueText("Payment failed gateway timeout"),
+      facetTokens: [],
+    };
+    const matches = recallLocal(query, store, undefined, 2);
+    expect(matches).toHaveLength(1);
+  });
+
+  it("honours the limit across distinct recurrences", () => {
+    const store = fakeStore(
+      ["cart", "catalog", "dashboard", "profile", "settings"].map(
+        (route, i) => ({
+          id: `sess-${i}`,
+          bundle: {},
+          bugs: [
+            bug({
+              bugId: `bug-${i}`,
+              representative: {
+                detector: "console_error",
+                message: "Payment failed: gateway timeout",
+                route: `/${route}`,
+              },
+            }),
+          ],
+        }),
+      ),
     );
     const query: LocalIssueProfile = {
       tokens: tokenizeIssueText("Payment failed gateway timeout"),

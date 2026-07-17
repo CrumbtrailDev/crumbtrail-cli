@@ -5,6 +5,7 @@ export {
   DISTINCT_BUGS_SCHEMA_VERSION,
   groupDistinctBugs,
   buildDistinctBugSignature,
+  computeDistinctBugSignatures,
   groupDistinctBugRecurrences,
 } from "./distinct-bugs";
 export type {
