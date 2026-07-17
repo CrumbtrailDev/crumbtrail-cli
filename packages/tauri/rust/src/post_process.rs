@@ -17,6 +17,10 @@ struct FailedReqEntry {
     m: String,
     url: String,
     st: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -97,7 +101,45 @@ pub fn process(session_dir: &Path) -> io::Result<()> {
             if st >= 400 {
                 let id = d.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let (m, url) = net_reqs.get(id).cloned().unwrap_or_default();
-                failed_reqs.push(FailedReqEntry { t, m, url, st });
+                failed_reqs.push(FailedReqEntry {
+                    t,
+                    m,
+                    url,
+                    st,
+                    reason: None,
+                    message: None,
+                });
+            }
+        }
+
+        if k == "net.err" {
+            // Network-level failures (no HTTP response) count as failed requests with
+            // st 0, matching the TS post-processor. Aborts are routine cancellations
+            // and page-probe events are page-world-untrusted, so neither counts.
+            let name = d.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let source = d.get("source").and_then(|v| v.as_str()).unwrap_or("");
+            let trust = d.get("evidenceTrust").and_then(|v| v.as_str()).unwrap_or("");
+            if name != "AbortError" && source != "page-probe" && trust != "page-world-untrusted" {
+                let id = d.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let req = net_reqs.get(id).cloned();
+                let m = d.get("method").and_then(|v| v.as_str())
+                    .or_else(|| d.get("m").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+                    .or_else(|| req.as_ref().map(|(m, _)| m.clone()))
+                    .unwrap_or_default();
+                let url = d.get("url").and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| req.map(|(_, url)| url))
+                    .unwrap_or_default();
+                let message = d.get("msg").and_then(|v| v.as_str()).map(str::to_string);
+                failed_reqs.push(FailedReqEntry {
+                    t,
+                    m,
+                    url,
+                    st: 0,
+                    reason: Some("network_error".to_string()),
+                    message,
+                });
             }
         }
 
@@ -234,6 +276,110 @@ mod tests {
         assert_eq!(failed[0]["m"], "POST");
         assert_eq!(failed[0]["url"], "/api/save");
         assert_eq!(failed[0]["st"], 500);
+    }
+
+    #[test]
+    fn counts_network_level_failures_as_failed_requests() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("ses_test");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let events = vec![
+            json!({"t": 1000, "k": "net.err", "d": {"id": "r1", "method": "GET", "url": "/api/data", "dur": 12, "msg": "Failed to fetch", "transport": "fetch"}}),
+        ];
+        write_events(&session_dir, &events);
+
+        process(&session_dir).unwrap();
+
+        let index: Value = serde_json::from_str(
+            &fs::read_to_string(session_dir.join("index.json")).unwrap()
+        ).unwrap();
+
+        let failed = index["failedReqs"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["t"], 1000);
+        assert_eq!(failed[0]["m"], "GET");
+        assert_eq!(failed[0]["url"], "/api/data");
+        assert_eq!(failed[0]["st"], 0);
+        assert_eq!(failed[0]["reason"], "network_error");
+        assert_eq!(failed[0]["message"], "Failed to fetch");
+    }
+
+    #[test]
+    fn falls_back_to_correlated_request_for_network_failures() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("ses_test");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let events = vec![
+            json!({"t": 1000, "k": "net.req", "d": {"id": "r1", "m": "POST", "url": "/api/save"}}),
+            json!({"t": 1050, "k": "net.err", "d": {"id": "r1", "dur": 50}}),
+        ];
+        write_events(&session_dir, &events);
+
+        process(&session_dir).unwrap();
+
+        let index: Value = serde_json::from_str(
+            &fs::read_to_string(session_dir.join("index.json")).unwrap()
+        ).unwrap();
+
+        let failed = index["failedReqs"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["m"], "POST");
+        assert_eq!(failed[0]["url"], "/api/save");
+        assert_eq!(failed[0]["st"], 0);
+        assert_eq!(failed[0]["reason"], "network_error");
+        // No msg on the event -> message must be absent, not null/empty.
+        assert!(failed[0].get("message").is_none());
+    }
+
+    #[test]
+    fn skips_aborts_and_page_probe_network_errors() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("ses_test");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let events = vec![
+            json!({"t": 1000, "k": "net.err", "d": {"id": "r1", "method": "GET", "url": "/a", "msg": "aborted", "name": "AbortError"}}),
+            json!({"t": 1050, "k": "net.err", "d": {"id": "r2", "method": "GET", "url": "/b", "msg": "Failed to fetch", "source": "page-probe"}}),
+            json!({"t": 1100, "k": "net.err", "d": {"id": "r3", "method": "GET", "url": "/c", "msg": "Failed to fetch", "evidenceTrust": "page-world-untrusted"}}),
+        ];
+        write_events(&session_dir, &events);
+
+        process(&session_dir).unwrap();
+
+        let index: Value = serde_json::from_str(
+            &fs::read_to_string(session_dir.join("index.json")).unwrap()
+        ).unwrap();
+
+        assert_eq!(index["failedReqs"].as_array().unwrap().len(), 0);
+        assert_eq!(index["stats"]["net.err"], 3);
+    }
+
+    #[test]
+    fn http_status_failures_omit_network_error_fields() {
+        let dir = TempDir::new().unwrap();
+        let session_dir = dir.path().join("ses_test");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let events = vec![
+            json!({"t": 1000, "k": "net.req", "d": {"id": "r1", "m": "GET", "url": "/api"}}),
+            json!({"t": 1050, "k": "net.res", "d": {"id": "r1", "st": 404}}),
+        ];
+        write_events(&session_dir, &events);
+
+        process(&session_dir).unwrap();
+
+        let raw = fs::read_to_string(session_dir.join("index.json")).unwrap();
+        let index: Value = serde_json::from_str(&raw).unwrap();
+
+        let failed = index["failedReqs"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["st"], 404);
+        // Keep the serialized shape of status-based failures byte-stable.
+        assert!(failed[0].get("reason").is_none());
+        assert!(failed[0].get("message").is_none());
+        assert!(!raw.contains("\"reason\""));
     }
 
     #[test]
