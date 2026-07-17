@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { McpServer } from "../mcp-server";
+import { computeDistinctBugSignatures } from "../index";
 import { postProcess } from "../post-process";
 import { buildFixContext } from "../fix-context";
 import { runFixContext } from "../run-fix-context";
@@ -329,7 +330,7 @@ describe("MCP Server", () => {
     const httpBug = bugs.find((b: any) => b.severity === "high");
     expect(httpBug).toBeDefined();
     expect(httpBug.bugId).toMatch(/^bug_/);
-    expect(httpBug.signature).toMatch(/^bugsig:/);
+    expect(httpBug.signature).toMatch(/^bugsig2:/);
     expect(httpBug.counts.candidates).toBeGreaterThanOrEqual(1);
     expect(httpBug).toHaveProperty("window");
     // Sorted severity desc: the high-severity bug comes before any medium ones.
@@ -422,6 +423,31 @@ describe("MCP Server", () => {
     expect(recurrence.signature).toBe(rollup.signature);
     expect(recurrence.session_count).toBe(2);
     expect(recurrence.release_span.label).toBe("R181->R183");
+  });
+
+  it("getRecurrence resolves a legacy signature saved before the upgrade", async () => {
+    const sessionDir = createSessionWithDistinctBug("sess-legacy-signature", {
+      release: "R181",
+      message: "Invoice 123 ranked 3 instead of 1",
+    });
+    const { distinctBugs } = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "llm.json"), "utf8"),
+    );
+    const signatures = computeDistinctBugSignatures(distinctBugs[0]);
+
+    const res = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 57,
+      method: "tools/call",
+      params: {
+        name: "getRecurrence",
+        arguments: { signature: signatures.legacy },
+      },
+    });
+
+    const recurrence = JSON.parse((res!.result as any).content[0].text);
+    expect(recurrence.signature).toBe(signatures.current);
+    expect(recurrence.session_count).toBe(1);
   });
 
   it("getBug returns the full correlated evidence for one distinct bug", async () => {

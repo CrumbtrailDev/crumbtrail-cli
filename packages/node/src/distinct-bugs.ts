@@ -192,11 +192,25 @@ export function groupDistinctBugs(
 export function buildDistinctBugSignature(
   bug: Pick<DistinctBug, "title" | "representative">,
 ): string {
+  return computeDistinctBugSignatures(bug).current;
+}
+
+/**
+ * Computes the versioned recurrence signature and the pre-versioning value for
+ * a bug. Consumers can use `legacy` to match rows created before route and
+ * message normalization was tightened.
+ */
+export function computeDistinctBugSignatures(
+  bug: Pick<DistinctBug, "title" | "representative">,
+): { current: string; legacy: string } {
   const detector = bug.representative?.detector ?? "unknown";
   const route = bug.representative?.route ?? "";
   const message =
     bug.representative?.message ?? bug.representative?.title ?? bug.title;
-  return `bugsig:${hashString(`${detector}|${normalizeRecurrenceText(message)}|${normalizeRecurrenceText(route)}`)}`;
+  return {
+    current: `bugsig2:${hashString(`${detector}|${normalizeRecurrenceText(message)}|${normalizeRecurrenceRoute(route)}`)}`,
+    legacy: `bugsig:${hashString(`${detector}|${normalizeLegacyRecurrenceText(message)}|${normalizeLegacyRecurrenceText(route)}`)}`,
+  };
 }
 
 export function groupDistinctBugRecurrences(
@@ -402,9 +416,46 @@ function normalizeRecurrenceText(source: string): string {
   return source
     .toLowerCase()
     .replace(/\[redacted\]/g, "")
+    .replace(/\d+/g, "#")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeLegacyRecurrenceText(source: string): string {
+  return source
+    .toLowerCase()
+    .replace(/\[redacted\]/g, "")
     .replace(/\d{3,}/g, "#")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/** Normalizes only the route component of a version-2 recurrence signature. */
+function normalizeRecurrenceRoute(source: string): string {
+  const path = source
+    .trim()
+    .replace(/^(?:[a-z][a-z\d+.-]*:)?\/\/[^/?#]*/i, "")
+    .split(/[?#]/, 1)[0];
+
+  return path
+    .split("/")
+    .map((segment) =>
+      isValueLikeRouteSegment(segment) ? ":id" : segment.toLowerCase(),
+    )
+    .join("/");
+}
+
+function isValueLikeRouteSegment(segment: string): boolean {
+  return (
+    /^[a-f\d]{8}-(?:[a-f\d]{4}-){3}[a-f\d]{12}$/i.test(segment) ||
+    /^[a-f\d]{6,}$/i.test(segment) ||
+    /\d/.test(segment) ||
+    (segment.length >= 16 &&
+      /^[a-z\d+/_-]+={0,2}$/i.test(segment) &&
+      /[a-z]/.test(segment) &&
+      /[A-Z]/.test(segment)) ||
+    segment.length > 24
+  );
 }
 
 function componentSignature(candidate: EvidenceCandidate): string {
