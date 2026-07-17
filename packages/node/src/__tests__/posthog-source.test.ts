@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { EvidenceQuery } from "crumbtrail-core";
 import {
   PostHogEvidenceSource,
@@ -476,6 +476,35 @@ describe("registry wiring", () => {
     };
     const sources = evidenceSourcesFromEnv(env);
     expect(sources.map((s) => s.descriptor.provider)).toContain("posthog");
+  });
+
+  it("constructs PostHog with the supplied fetch implementation", async () => {
+    const { fetchImpl } = fakePostHog();
+    const sentinel = vi.fn(fetchImpl);
+    const globalFetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation((() => {
+        throw new Error("global fetch must not be called");
+      }) as typeof fetch);
+
+    try {
+      const source = posthogEvidenceProvider.fromEnv(
+        {
+          [POSTHOG_API_KEY_ENV]: "key",
+          [POSTHOG_PROJECT_ID_ENV]: PROJECT_ID,
+        },
+        { fetchImpl: sentinel },
+      );
+
+      await expect(source.health()).resolves.toMatchObject({
+        ok: true,
+        provider: "posthog",
+      });
+      expect(sentinel).toHaveBeenCalledTimes(1);
+      expect(globalFetch).not.toHaveBeenCalled();
+    } finally {
+      globalFetch.mockRestore();
+    }
   });
 
   it("omits PostHog when a required var (project id) is missing", () => {

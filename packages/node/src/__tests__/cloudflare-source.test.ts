@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { EvidenceQuery } from "crumbtrail-core";
 import {
   CloudflareEvidenceSource,
@@ -548,6 +548,38 @@ describe("registry wiring", () => {
     };
     const sources = evidenceSourcesFromEnv(env);
     expect(sources.map((s) => s.descriptor.provider)).toContain("cloudflare");
+  });
+
+  it("constructs Cloudflare with the supplied fetch implementation", async () => {
+    const { fetchImpl } = fakeR2({ dataset: "http_requests" });
+    const sentinel = vi.fn(fetchImpl);
+    const globalFetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation((() => {
+        throw new Error("global fetch must not be called");
+      }) as typeof fetch);
+
+    try {
+      const source = cloudflareEvidenceProvider.fromEnv(
+        {
+          [CLOUDFLARE_R2_ACCOUNT_ID_ENV]: "acct123",
+          [CLOUDFLARE_R2_ACCESS_KEY_ID_ENV]: "ak",
+          [CLOUDFLARE_R2_SECRET_ACCESS_KEY_ENV]: "sk",
+          [CLOUDFLARE_R2_BUCKET_ENV]: "cf-logs-bucket",
+          [CLOUDFLARE_R2_DATASET_ENV]: "http_requests",
+        },
+        { fetchImpl: sentinel },
+      );
+
+      await expect(source.health()).resolves.toMatchObject({
+        ok: true,
+        provider: "cloudflare",
+      });
+      expect(sentinel).toHaveBeenCalledTimes(1);
+      expect(globalFetch).not.toHaveBeenCalled();
+    } finally {
+      globalFetch.mockRestore();
+    }
   });
 
   it("omits Cloudflare when a required var (bucket) is missing", () => {

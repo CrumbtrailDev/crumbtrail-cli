@@ -613,11 +613,12 @@ function parseIndexes(raw: string | undefined): string[] {
 export const splunkEvidenceProvider: EvidenceSourceProvider = {
   provider: "splunk",
   authFields: SPLUNK_AUTH_FIELDS,
-  fromEnv: (env) =>
+  fromEnv: (env, options) =>
     new SplunkEvidenceSource({
       host: env[SPLUNK_HOST_ENV] as string,
       token: env[SPLUNK_TOKEN_ENV] as string,
       indexes: parseIndexes(env[SPLUNK_INDEX_ENV]),
       webUrl: env[SPLUNK_WEB_URL_ENV] || undefined,
+      fetchImpl: options?.fetchImpl,
     }),
 };
