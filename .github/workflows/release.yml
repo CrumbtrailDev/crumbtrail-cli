@@ -53,3 +53,44 @@ jobs:
           fi
         env:
           NPM_CONFIG_PROVENANCE: true
+
+  publish-crate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Same trusted-publishing model as npm above: crates.io exchanges the OIDC
+      # id-token for a short-lived publish token, so there is deliberately NO
+      # CARGO_REGISTRY_TOKEN secret. The crate must be configured on crates.io
+      # (tauri-plugin-crumbtrail → Settings → Trusted Publishing) with this repo
+      # and workflow file (release.yml); renaming this file breaks crate
+      # publishing until that config is renamed to match.
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/tauri/rust
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test
+      - name: Skip if version already published
+        id: check
+        run: |
+          VERSION=$(cargo pkgid | sed 's/.*[#@]//')
+          if curl -s https://index.crates.io/ta/ur/tauri-plugin-crumbtrail | grep -q "\"vers\":\"$VERSION\""; then
+            echo "tauri-plugin-crumbtrail $VERSION is already on crates.io; skipping publish."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: rust-lang/crates-io-auth-action@v1
+        if: ${{ !inputs.dry_run && steps.check.outputs.published == 'false' }}
+        id: auth
+      - name: Publish
+        if: ${{ steps.check.outputs.published == 'false' }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish --dry-run
+          else
+            cargo publish
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
