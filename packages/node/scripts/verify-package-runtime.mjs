@@ -17,14 +17,16 @@ const timeoutMs = 8_000;
 /**
  * The hosted cloud namespace-imports crumbtrail-node and reads
  * NODE_CONTRACT_CAPABILITIES to decide whether the installed contract supports
- * the tenant context factory and the provider neutral ticket comment. It gates
- * on `=== true` and fails closed on anything else, so a bundler that tree
- * shakes or reshapes the marker would silently disable those features with a
- * green build. Assert the built dist in BOTH formats a consumer can load.
+ * the tenant context factory, the provider neutral ticket comment, and the
+ * evidence source fetch injection seam. It gates on `=== true` and fails closed
+ * on anything else, so a bundler that tree shakes or reshapes the marker would
+ * silently disable those features with a green build. Assert the built dist in
+ * BOTH formats a consumer can load.
  */
 const EXPECTED_NODE_CONTRACT_CAPABILITIES = {
   tenantContextFactory: true,
   ticketComment: true,
+  evidenceSourceFetchInjection: true,
 };
 
 function assertCapabilityMarker(format, modulePath, namespace) {

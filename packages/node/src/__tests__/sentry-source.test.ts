@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { EvidenceQuery } from "crumbtrail-core";
 import {
   SentryEvidenceSource,
@@ -412,6 +412,36 @@ describe("registry wiring", () => {
     };
     const sources = evidenceSourcesFromEnv(env);
     expect(sources.map((s) => s.descriptor.provider)).toContain("sentry");
+  });
+
+  it("constructs Sentry with the supplied fetch implementation", async () => {
+    const { fetchImpl } = fakeSentry();
+    const sentinel = vi.fn(fetchImpl);
+    const globalFetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation((() => {
+        throw new Error("global fetch must not be called");
+      }) as typeof fetch);
+
+    try {
+      const source = sentryEvidenceProvider.fromEnv(
+        {
+          [SENTRY_AUTH_TOKEN_ENV]: "tok",
+          [SENTRY_ORG_ENV]: "acme",
+          [SENTRY_HOST_ENV]: "https://acme.sentry.io",
+        },
+        { fetchImpl: sentinel },
+      );
+
+      await expect(source.health()).resolves.toMatchObject({
+        ok: true,
+        provider: "sentry",
+      });
+      expect(sentinel).toHaveBeenCalledTimes(1);
+      expect(globalFetch).not.toHaveBeenCalled();
+    } finally {
+      globalFetch.mockRestore();
+    }
   });
 
   it("omits Sentry when the token is missing", () => {

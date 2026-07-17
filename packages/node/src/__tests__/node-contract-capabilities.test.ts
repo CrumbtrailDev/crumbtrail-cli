@@ -3,8 +3,14 @@ import { describe, expect, it } from "vitest";
 import { NODE_CONTRACT_CAPABILITIES } from "../node-contract-capabilities";
 import * as packageIndex from "../index";
 import { createServer } from "../server";
-import type { EvidenceSource } from "../evidence-sources/registry";
-import type { CommentingTicketConnector, TicketComment } from "../ticket/clients";
+import type {
+  EvidenceSource,
+  EvidenceSourceProvider,
+} from "../evidence-sources/registry";
+import type {
+  CommentingTicketConnector,
+  TicketComment,
+} from "../ticket/clients";
 
 /**
  * The marker tells the hosted cloud that this package implements a contract.
@@ -31,6 +37,11 @@ interface CloudTicketComment {
   paragraphs: readonly string[];
 }
 
+type CloudEvidenceSourceProviderFromEnv = (
+  env: Record<string, string | undefined>,
+  options?: { fetchImpl?: typeof fetch },
+) => EvidenceSource;
+
 // --- What this package actually exports ---
 
 type NodeEvidenceSourcesFactory = NonNullable<
@@ -40,6 +51,8 @@ type NodeEvidenceSourcesFactory = NonNullable<
 type NodePostCommentComment = Parameters<
   CommentingTicketConnector["postComment"]
 >[1];
+
+type NodeEvidenceSourceProviderFromEnv = EvidenceSourceProvider["fromEnv"];
 
 // --- Static enforcement of each declared capability ---
 
@@ -72,6 +85,13 @@ const postCommentAcceptsTicketComment: Exact<
   TicketComment
 > = true;
 
+// evidenceSourceFetchInjection: built in providers receive this optional
+// transport through fromEnv. Third party registrants remain independent.
+const evidenceSourceFetchInjectionIsImplemented: Exact<
+  NodeEvidenceSourceProviderFromEnv,
+  CloudEvidenceSourceProviderFromEnv
+> = true;
+
 describe("NODE_CONTRACT_CAPABILITIES", () => {
   it("backs tenantContextFactory with a createServer that takes the cloud's ctx", () => {
     // Enforced by tsc above; asserted here so the intent is visible in the run.
@@ -86,6 +106,11 @@ describe("NODE_CONTRACT_CAPABILITIES", () => {
     expect(NODE_CONTRACT_CAPABILITIES.ticketComment).toBe(true);
   });
 
+  it("backs evidenceSourceFetchInjection with an optional fromEnv transport", () => {
+    expect(evidenceSourceFetchInjectionIsImplemented).toBe(true);
+    expect(NODE_CONTRACT_CAPABILITIES.evidenceSourceFetchInjection).toBe(true);
+  });
+
   it("is re-exported from the package index", () => {
     // The cloud probes this package through a namespace import and reads the
     // marker off the index, so the re-export is the contract, not a detail.
@@ -95,12 +120,17 @@ describe("NODE_CONTRACT_CAPABILITIES", () => {
     expect(packageIndex.NODE_CONTRACT_CAPABILITIES).toEqual({
       tenantContextFactory: true,
       ticketComment: true,
+      evidenceSourceFetchInjection: true,
     });
   });
 
   it("reads exactly true for each capability the cloud gates on", () => {
     // The cloud accepts `=== true` only; a truthy value would fail closed.
-    for (const capability of ["tenantContextFactory", "ticketComment"] as const) {
+    for (const capability of [
+      "tenantContextFactory",
+      "ticketComment",
+      "evidenceSourceFetchInjection",
+    ] as const) {
       expect(packageIndex.NODE_CONTRACT_CAPABILITIES[capability]).toBe(true);
     }
   });

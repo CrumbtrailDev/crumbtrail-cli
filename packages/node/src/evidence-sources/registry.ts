@@ -42,6 +42,10 @@ export interface EvidenceSource {
   ): Promise<EvidenceSourceResult>;
 }
 
+export interface EvidenceSourceOptions {
+  fetchImpl?: typeof fetch;
+}
+
 /**
  * A registered provider: how to detect its env credentials and construct a
  * source from them. Adapters append an entry to {@link EVIDENCE_SOURCE_PROVIDERS}.
@@ -54,7 +58,10 @@ export interface EvidenceSourceProvider {
    * present ⇔ required-vars-set rule.
    */
   authFields: string[];
-  fromEnv(env: Record<string, string | undefined>): EvidenceSource;
+  fromEnv(
+    env: Record<string, string | undefined>,
+    options?: EvidenceSourceOptions,
+  ): EvidenceSource;
 }
 
 /**
@@ -98,11 +105,12 @@ function isPresent(
 export function evidenceSourcesFromEnv(
   env: Record<string, string | undefined> = process.env,
   providers: EvidenceSourceProvider[] = EVIDENCE_SOURCE_PROVIDERS,
+  options?: EvidenceSourceOptions,
 ): EvidenceSource[] {
   const sources: EvidenceSource[] = [];
   for (const provider of providers) {
     if (isPresent(env, provider.authFields))
-      sources.push(provider.fromEnv(env));
+      sources.push(provider.fromEnv(env, options));
   }
   return sources;
 }

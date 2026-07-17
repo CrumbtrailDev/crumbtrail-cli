@@ -954,7 +954,7 @@ function parseDataset(raw: string | undefined): CloudflareDataset {
 export const cloudflareEvidenceProvider: EvidenceSourceProvider = {
   provider: "cloudflare",
   authFields: CLOUDFLARE_AUTH_FIELDS,
-  fromEnv: (env) =>
+  fromEnv: (env, options) =>
     new CloudflareEvidenceSource({
       accountId: env[CLOUDFLARE_R2_ACCOUNT_ID_ENV] as string,
       accessKeyId: env[CLOUDFLARE_R2_ACCESS_KEY_ID_ENV] as string,
@@ -963,5 +963,6 @@ export const cloudflareEvidenceProvider: EvidenceSourceProvider = {
       prefix: env[CLOUDFLARE_R2_PREFIX_ENV] || undefined,
       dataset: parseDataset(env[CLOUDFLARE_R2_DATASET_ENV]),
       endpoint: env[CLOUDFLARE_R2_ENDPOINT_ENV] || undefined,
+      fetchImpl: options?.fetchImpl,
     }),
 };

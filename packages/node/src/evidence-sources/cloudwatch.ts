@@ -713,7 +713,7 @@ function parseLogGroups(raw: string | undefined): string[] {
 export const cloudWatchEvidenceProvider: EvidenceSourceProvider = {
   provider: "cloudwatch",
   authFields: CLOUDWATCH_AUTH_FIELDS,
-  fromEnv: (env) =>
+  fromEnv: (env, options) =>
     new CloudWatchEvidenceSource({
       accessKeyId: env[CLOUDWATCH_ACCESS_KEY_ID_ENV] as string,
       secretAccessKey: env[CLOUDWATCH_SECRET_ACCESS_KEY_ENV] as string,
@@ -721,5 +721,6 @@ export const cloudWatchEvidenceProvider: EvidenceSourceProvider = {
       logGroups: parseLogGroups(env[CLOUDWATCH_LOG_GROUPS_ENV]),
       sessionToken: env[CLOUDWATCH_SESSION_TOKEN_ENV] || undefined,
       endpoint: env[CLOUDWATCH_ENDPOINT_ENV] || undefined,
+      fetchImpl: options?.fetchImpl,
     }),
 };

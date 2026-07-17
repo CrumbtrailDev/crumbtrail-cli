@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import type { EvidenceQuery } from "crumbtrail-core";
 import {
   SplunkEvidenceSource,
@@ -400,6 +400,36 @@ describe("registry wiring", () => {
     };
     const sources = evidenceSourcesFromEnv(env);
     expect(sources.map((s) => s.descriptor.provider)).toContain("splunk");
+  });
+
+  it("constructs Splunk with the supplied fetch implementation", async () => {
+    const { fetchImpl } = fakeSplunk();
+    const sentinel = vi.fn(fetchImpl);
+    const globalFetch = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation((() => {
+        throw new Error("global fetch must not be called");
+      }) as typeof fetch);
+
+    try {
+      const source = splunkEvidenceProvider.fromEnv(
+        {
+          [SPLUNK_HOST_ENV]: HOST,
+          [SPLUNK_TOKEN_ENV]: "token",
+          [SPLUNK_INDEX_ENV]: "main",
+        },
+        { fetchImpl: sentinel },
+      );
+
+      await expect(source.health()).resolves.toMatchObject({
+        ok: true,
+        provider: "splunk",
+      });
+      expect(sentinel).toHaveBeenCalledTimes(1);
+      expect(globalFetch).not.toHaveBeenCalled();
+    } finally {
+      globalFetch.mockRestore();
+    }
   });
 
   it("omits Splunk when a required var (index) is missing", () => {

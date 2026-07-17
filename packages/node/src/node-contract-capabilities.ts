@@ -16,4 +16,9 @@
 export const NODE_CONTRACT_CAPABILITIES = {
   tenantContextFactory: true,
   ticketComment: true,
+  /**
+   * The evidence providers registered by this package construct their sources
+   * with the fetch passed to fromEnv.
+   */
+  evidenceSourceFetchInjection: true,
 } as const;

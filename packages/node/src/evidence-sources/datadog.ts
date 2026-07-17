@@ -605,10 +605,11 @@ function normalizeDatadogSite(site: string): string {
 export const datadogEvidenceProvider: EvidenceSourceProvider = {
   provider: "datadog",
   authFields: DATADOG_AUTH_FIELDS,
-  fromEnv: (env) =>
+  fromEnv: (env, options) =>
     new DatadogEvidenceSource({
       apiKey: env[DATADOG_API_KEY_ENV] as string,
       appKey: env[DATADOG_APP_KEY_ENV] as string,
       site: env[DATADOG_SITE_ENV] || DATADOG_DEFAULT_SITE,
+      fetchImpl: options?.fetchImpl,
     }),
 };

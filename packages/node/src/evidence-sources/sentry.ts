@@ -577,10 +577,11 @@ export class SentryEvidenceSource implements EvidenceSource {
 export const sentryEvidenceProvider: EvidenceSourceProvider = {
   provider: "sentry",
   authFields: SENTRY_AUTH_FIELDS,
-  fromEnv: (env) =>
+  fromEnv: (env, options) =>
     new SentryEvidenceSource({
       authToken: env[SENTRY_AUTH_TOKEN_ENV] as string,
       org: env[SENTRY_ORG_ENV] as string,
       host: env[SENTRY_HOST_ENV] || SENTRY_DEFAULT_HOST,
+      fetchImpl: options?.fetchImpl,
     }),
 };

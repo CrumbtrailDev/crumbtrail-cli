@@ -653,10 +653,11 @@ export class PostHogEvidenceSource implements EvidenceSource {
 export const posthogEvidenceProvider: EvidenceSourceProvider = {
   provider: "posthog",
   authFields: POSTHOG_AUTH_FIELDS,
-  fromEnv: (env) =>
+  fromEnv: (env, options) =>
     new PostHogEvidenceSource({
       apiKey: env[POSTHOG_API_KEY_ENV] as string,
       projectId: env[POSTHOG_PROJECT_ID_ENV] as string,
       host: env[POSTHOG_HOST_ENV] || POSTHOG_DEFAULT_HOST,
+      fetchImpl: options?.fetchImpl,
     }),
 };
