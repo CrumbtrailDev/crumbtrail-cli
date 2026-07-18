@@ -185,3 +185,63 @@ function makeTmpRepoDirty(root: string, rel: string, content: string): void {
   // sanity: the file exists and differs from HEAD
   expect(existsSync(path.join(root, rel))).toBe(true);
 }
+
+describe("executePlan — Express rewrite", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    while (roots.length) cleanup(roots.pop()!);
+  });
+  const ENTRY = [
+    'import express from "express";',
+    "const app = express();",
+    'app.get("/", (req, res) => res.send("ok"));',
+    "app.listen(3000);",
+    "",
+  ].join("\n");
+
+  it("applies a rewrite plan: middleware wired around routes on disk", () => {
+    const root = makeTmpRepo({ "package.json": "{}", "server.js": ENTRY });
+    gitInit(root);
+    roots.push(root);
+    const entry = path.join(root, "server.js");
+    const plan = buildPlan(
+      { cwd: root, recipe: "express", endpoint: ENDPOINT, entryFile: entry },
+      defaultInjectIO,
+    );
+    expect(plan.kind).toBe("rewrite");
+    const res = executePlan(plan);
+    expect(res.written).toEqual([entry]);
+    const out = readFileSync(entry, "utf8");
+    expect(out.indexOf("app.use(createCrumbtrailExpressMiddleware(")).toBeGreaterThan(
+      out.indexOf("const app = express()"),
+    );
+    expect(out.indexOf("app.listen(")).toBeGreaterThan(
+      out.indexOf("app.use(createCrumbtrailExpressErrorMiddleware("),
+    );
+    // Idempotent: a re-run sees the crumbtrail reference and skips.
+    const again = buildPlan(
+      { cwd: root, recipe: "express", endpoint: ENDPOINT, entryFile: entry },
+      defaultInjectIO,
+    );
+    expect(again.kind).toBe("skip-already-wired");
+  });
+
+  it("applies a confirmed dirty rewrite as a full file replace", () => {
+    const { io, files } = memExecutorIO({ "/app/server.js": "old\n" });
+    const plan: Plan = {
+      recipe: "express",
+      kind: "needs-confirm-dirty",
+      targetPath: "/app/server.js",
+      content: "rewritten file body\n",
+      applyMode: "rewrite",
+      warnings: [],
+    };
+    // Unconfirmed: nothing written.
+    expect(executePlan(plan, io).skipped).toBe(true);
+    expect(files["/app/server.js"]).toBe("old\n");
+    // Confirmed: content replaces the file (not prepended).
+    const res = executePlan(plan, io, { confirmDirty: true });
+    expect(res.written).toEqual(["/app/server.js"]);
+    expect(files["/app/server.js"]).toBe("rewritten file body\n");
+  });
+});

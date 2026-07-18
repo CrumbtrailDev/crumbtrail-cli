@@ -58,7 +58,8 @@ export interface ExecuteResult {
 
 type FileOp =
   | { op: "create"; path: string; content: string }
-  | { op: "prepend"; path: string; block: string };
+  | { op: "prepend"; path: string; block: string }
+  | { op: "replace"; path: string; content: string };
 
 interface PreImage {
   path: string;
@@ -85,6 +86,9 @@ function applyAllOrNothing(ops: FileOp[], io: ExecutorIO): string[] {
           break;
         case "prepend":
           next = prependIntoSource(prior ?? "", op.block);
+          break;
+        case "replace":
+          next = op.content;
           break;
       }
       io.mkdirp(path.dirname(op.path));
@@ -158,8 +162,19 @@ export function executePlan(
         path: plan.targetPath,
         content: withTrailingNewline(plan.content),
       });
+    } else if (
+      plan.kind === "rewrite" ||
+      (plan.kind === "needs-confirm-dirty" && plan.applyMode === "rewrite")
+    ) {
+      // Full-file rewrite (Express middleware wiring): content is the whole
+      // transformed file, not a block to prepend.
+      ops.push({
+        op: "replace",
+        path: plan.targetPath,
+        content: withTrailingNewline(plan.content),
+      });
     } else {
-      // prepend, or a confirmed needs-confirm-dirty plan
+      // prepend, or a confirmed needs-confirm-dirty plan in prepend mode
       ops.push({ op: "prepend", path: plan.targetPath, block: plan.content });
     }
   }

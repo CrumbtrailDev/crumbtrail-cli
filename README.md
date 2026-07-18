@@ -27,7 +27,9 @@ npx crumbtrail
 ```
 
 The wizard detects your stack, installs the right packages, and injects the
-setup code for you.
+setup code for you. For Express backends it wires both crash capture and the
+request and error middleware, so backend request spans link up with frontend
+sessions out of the box.
 
 To wire it up by hand:
 
