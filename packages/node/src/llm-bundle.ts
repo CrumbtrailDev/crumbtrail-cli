@@ -796,7 +796,7 @@ export function buildLlmBundle({
     browserEvidence,
     fullStackEvidence,
     distinctBugs: applyFlagNoteTitles(
-      groupDistinctBugs(candidates ?? []),
+      groupDistinctBugs(candidates ?? [], events),
       events,
     ),
     environment: buildEnvironment(events),
