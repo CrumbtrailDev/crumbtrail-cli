@@ -16,6 +16,7 @@ import {
   type DetectResult,
   type Plan,
 } from "../index";
+import { sdkInstallSpec } from "../recipe-registry";
 import type { ServiceCandidate } from "../discover";
 import type { Prompter, Ui } from "../ui";
 
@@ -1119,5 +1120,36 @@ describe("isCliEntrypoint", () => {
     expect(isCliEntrypoint("/x/node_modules/vitest/vitest.mjs")).toBe(false);
     expect(isCliEntrypoint("/x/some-other-cli.cjs")).toBe(false);
     expect(isCliEntrypoint("/x/crumbtrail-server")).toBe(false);
+  });
+});
+
+describe("installSdk — registry install is version pinned", () => {
+  it("passes ^floor specs to the package manager, never bare names", async () => {
+    const uiSink: Ui = { out: () => {}, err: () => {} };
+    const calls: string[][] = [];
+    const spawnFn = (_cmd: string, args: string[]) => {
+      calls.push(args);
+      return 0;
+    };
+    const result = await realInstallSdk({
+      cwd: "/app",
+      packageManager: "npm",
+      recipe: "express",
+      base: "https://deploy.example",
+      ui: uiSink,
+      spawnFn,
+    });
+    expect(result.installed).toBe(true);
+    // Bare names would let a stale dist tag resolve to an old 0.2.x SDK; the
+    // floors from SDK_VERSION_FLOORS must be applied to every package.
+    expect(calls[0]).toEqual([
+      "install",
+      ...["crumbtrail-core", "crumbtrail-node"].map(sdkInstallSpec),
+    ]);
+    for (const spec of calls[0].slice(1)) {
+      expect(spec).toMatch(/^crumbtrail-(core|node)@\^\d+\.\d+\.\d+$/);
+    }
+    // The result reports bare package names (used for notes + tarball fallback).
+    expect(result.packages).toEqual(["crumbtrail-core", "crumbtrail-node"]);
   });
 });

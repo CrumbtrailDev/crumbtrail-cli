@@ -844,3 +844,122 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
     expect(plan.agentPrompt).not.toContain("PRESET_PASSIVE");
   });
 });
+
+describe("buildPlan — Express middleware wiring", () => {
+  const ESM_ENTRY = [
+    'import express from "express";',
+    "",
+    "const app = express();",
+    "",
+    'app.get("/", (req, res) => res.send("ok"));',
+    "",
+    "app.listen(3000);",
+    "",
+  ].join("\n");
+
+  const CJS_ENTRY = [
+    'const express = require("express");',
+    "const app = express();",
+    'app.get("/", (req, res) => res.send("ok"));',
+    "app.listen(3000);",
+    "",
+  ].join("\n");
+
+  it("rewrites an ESM entry: request middleware before routes, error middleware after", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.js")]: ESM_ENTRY,
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      io,
+    );
+    expect(plan.kind).toBe("rewrite");
+    const content = plan.content ?? "";
+    // autoCapture block plus ESM import of the middleware pair.
+    expect(content).toContain("autoCapture");
+    expect(content).toContain(
+      'import { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } from "crumbtrail-node";',
+    );
+    // Ordering: app creation -> request middleware -> routes -> error middleware -> listen.
+    const appIdx = content.indexOf("const app = express()");
+    const reqIdx = content.indexOf("app.use(createCrumbtrailExpressMiddleware(");
+    const routeIdx = content.indexOf('app.get("/"');
+    const errIdx = content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware(");
+    const listenIdx = content.indexOf("app.listen(");
+    expect(appIdx).toBeGreaterThan(-1);
+    expect(reqIdx).toBeGreaterThan(appIdx);
+    expect(routeIdx).toBeGreaterThan(reqIdx);
+    expect(errIdx).toBeGreaterThan(routeIdx);
+    expect(listenIdx).toBeGreaterThan(errIdx);
+    // Same endpoint/env-key expressions as autoCapture: no key literal.
+    expect(content).toContain(`endpoint: "${ENDPOINT}"`);
+    expect(content).toContain("authToken: process.env.CRUMBTRAIL_KEY");
+    expectNoKeyLiteral(content);
+  });
+
+  it("rewrites a CJS entry with a require of the middleware pair", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.js")]: CJS_ENTRY,
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      io,
+    );
+    expect(plan.kind).toBe("rewrite");
+    expect(plan.content).toContain(
+      'const { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } = require("crumbtrail-node");',
+    );
+    expect(plan.content).toContain("app.use(createCrumbtrailExpressMiddleware(");
+    expect(plan.content).toContain("app.use(createCrumbtrailExpressErrorMiddleware(");
+  });
+
+  it("needs-confirm-dirty with applyMode rewrite when the entry is dirty", () => {
+    const io = fakeInjectIO(
+      { [p("package.json")]: "{}", [p("server.js")]: ESM_ENTRY },
+      { dirty: [p("server.js")] },
+    );
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      io,
+    );
+    expect(plan.kind).toBe("needs-confirm-dirty");
+    expect(plan.applyMode).toBe("rewrite");
+    expect(plan.content).toContain("app.use(createCrumbtrailExpressMiddleware(");
+  });
+
+  it("falls back to prepend + TODO instructions when anchors are missing", () => {
+    // Has an express import but no `const app = express()` / listen anchors.
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.js")]: 'import express from "express";\nconst app = buildApp();\n',
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.content).toContain("autoCapture");
+    expect(plan.content).toContain("TODO(crumbtrail)");
+    expect(plan.content).toContain("createCrumbtrailExpressMiddleware");
+    expect(plan.content).toContain("createCrumbtrailExpressErrorMiddleware");
+    // The wizard surfaces the same guidance.
+    expect(plan.warnings.join(" ")).toContain("createCrumbtrailExpressMiddleware");
+  });
+
+  it("does not wire middleware for non express backend recipes", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.js")]: ESM_ENTRY,
+    });
+    for (const recipe of ["fastify", "hono", "node"] as const) {
+      const plan = buildPlan(
+        { cwd: CWD, recipe, endpoint: ENDPOINT, entryFile: p("server.js") },
+        io,
+      );
+      expect(plan.kind).toBe("prepend");
+      expect(plan.content).not.toContain("app.use(createCrumbtrailExpress");
+    }
+  });
+});

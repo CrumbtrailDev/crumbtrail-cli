@@ -83,6 +83,67 @@ export function prependIntoSource(existing: string, block: string): string {
   return bom + out.join(eol);
 }
 
+// --- Express middleware wiring ----------------------------------------------
+
+/** `const app = express()` (also let/var), capturing the app variable name. */
+const EXPRESS_APP_RE = /^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*express\s*\(\s*\)/;
+
+/**
+ * Detect the entry's module style from how `express` itself is imported.
+ * Returns null when neither an ESM import nor a require of express is present —
+ * the caller then falls back to guidance instead of guessing.
+ */
+export function detectExpressModuleStyle(text: string): "esm" | "cjs" | null {
+  if (/(^|\n)\s*import\s[^\n]*from\s*(['"])express\2/.test(text)) return "esm";
+  if (/require\(\s*(['"])express\1\s*\)/.test(text)) return "cjs";
+  return null;
+}
+
+/**
+ * Wire the Express request + error middleware into `existing` when the entry
+ * matches the common shape: a `const app = express()` line followed later by an
+ * `app.listen(...)` line. The request middleware line is inserted immediately
+ * after the app creation (before any routes); the error middleware line is
+ * inserted just above the listen call (after the routes). Preserves BOM and EOL
+ * style. Returns null when either anchor is missing so the caller can fall back
+ * to guidance instead of mis-wiring.
+ */
+export function wireExpressMiddleware(
+  existing: string,
+  makeRequestLine: (appVar: string) => string,
+  makeErrorLine: (appVar: string) => string,
+): string | null {
+  const { bom, eol, lines } = analyzeSource(existing);
+
+  let appIdx = -1;
+  let appVar = "";
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(EXPRESS_APP_RE);
+    if (m) {
+      appIdx = i;
+      appVar = m[1];
+      break;
+    }
+  }
+  if (appIdx < 0) return null;
+
+  let listenIdx = -1;
+  for (let i = appIdx + 1; i < lines.length; i++) {
+    if (lines[i].includes(`${appVar}.listen(`)) {
+      listenIdx = i;
+      break;
+    }
+  }
+  if (listenIdx < 0) return null;
+
+  const indentOf = (line: string) => line.match(/^\s*/)?.[0] ?? "";
+  const out = [...lines];
+  // Insert bottom-up so earlier indices stay valid.
+  out.splice(listenIdx, 0, indentOf(lines[listenIdx]) + makeErrorLine(appVar));
+  out.splice(appIdx + 1, 0, indentOf(lines[appIdx]) + makeRequestLine(appVar));
+  return bom + out.join(eol);
+}
+
 /** Ensure a create-file body ends in exactly one trailing newline. */
 export function withTrailingNewline(text: string): string {
   return text.endsWith("\n") ? text : text + "\n";

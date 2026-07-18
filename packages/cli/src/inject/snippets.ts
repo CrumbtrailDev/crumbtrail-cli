@@ -67,6 +67,62 @@ export function nodeInitSnippet(endpoint: string): string {
 }
 
 /**
+ * Import line for the Express middleware pair, matched to the entry file's
+ * module style (detected from how `express` itself is imported). ESM entries get
+ * a static `import`; CommonJS entries get a `require` destructure.
+ */
+export function expressMiddlewareImportSnippet(style: "esm" | "cjs"): string {
+  return style === "esm"
+    ? 'import { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } from "crumbtrail-node";'
+    : 'const { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } = require("crumbtrail-node");';
+}
+
+/**
+ * Request middleware registration, inserted immediately after
+ * `const <appVar> = express()`. Emits backend.req.* start/finish spans so
+ * frontend sessions link to backend requests. Reads the same
+ * process.env.CRUMBTRAIL_KEY the autoCapture block uses.
+ */
+export function expressRequestMiddlewareSnippet(
+  appVar: string,
+  endpoint: string,
+): string {
+  return `${appVar}.use(createCrumbtrailExpressMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: process.env.CRUMBTRAIL_KEY }));`;
+}
+
+/**
+ * Error middleware registration, inserted just above `<appVar>.listen(...)` so
+ * it lands after the routes (Express error middleware must be registered last).
+ */
+export function expressErrorMiddlewareSnippet(
+  appVar: string,
+  endpoint: string,
+): string {
+  return `${appVar}.use(createCrumbtrailExpressErrorMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: process.env.CRUMBTRAIL_KEY }));`;
+}
+
+/**
+ * Manual wiring TODO block, prepended when the entry file does not match the
+ * common `const app = express()` / `app.listen(...)` shape. Carries exact copy
+ * and paste lines so the user (or their coding agent) can finish the wiring.
+ * Comment-only: safe to prepend anywhere.
+ */
+export function expressManualWiringSnippet(endpoint: string): string {
+  return [
+    "// TODO(crumbtrail): finish Express request capture. Crumbtrail could not find",
+    "// your express() app and app.listen anchors, so add these lines yourself:",
+    "//",
+    '//   import { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } from "crumbtrail-node";',
+    "//",
+    "//   // right after `const app = express()`, before your routes:",
+    `//   app.use(createCrumbtrailExpressMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: process.env.CRUMBTRAIL_KEY }));`,
+    "//",
+    "//   // after your routes, right before `app.listen(...)`:",
+    `//   app.use(createCrumbtrailExpressErrorMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: process.env.CRUMBTRAIL_KEY }));`,
+  ].join("\n");
+}
+
+/**
  * Single-quoted string literal in Prettier's `singleQuote: true` style: wraps the
  * value in single quotes, escaping backslashes and single quotes. Kept local to
  * the Nest snippet, whose scaffold ships that Prettier default — everything else

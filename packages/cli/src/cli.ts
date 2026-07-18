@@ -54,7 +54,7 @@ import {
 } from "./verify";
 import { discoverServices, type ServiceCandidate } from "./discover";
 import { otlpGuidePlan, renderOtlpGuide } from "./otlp-guide";
-import { RECIPE_REGISTRY } from "./recipe-registry";
+import { RECIPE_REGISTRY, sdkInstallSpec } from "./recipe-registry";
 import { dashboardBase, resolveEndpoint } from "./net";
 import {
   color,
@@ -335,10 +335,14 @@ export async function installSdk(
   }
   const { cmd, add } = pmInvocation(input.packageManager);
   const run = input.spawnFn ?? realSpawn;
+  // Pin the registry install to the CLI's version floors so a stale dist-tag
+  // can never leave a freshly wired service on an old SDK. The tarball fallback
+  // below keeps bare names (tarball URLs are resolved by name prefix).
+  const specs = packages.map(sdkInstallSpec);
   input.ui.out(
-    `Installing SDK: ${color.cyan(`${cmd} ${add} ${packages.join(" ")}`)}`,
+    `Installing SDK: ${color.cyan(`${cmd} ${add} ${specs.join(" ")}`)}`,
   );
-  const code = run(cmd, [add, ...packages], input.cwd);
+  const code = run(cmd, [add, ...specs], input.cwd);
   if (code === 0) {
     return { installed: true, packages };
   }

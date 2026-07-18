@@ -79,6 +79,28 @@ const NODE_KEY: KeyRef = {
 };
 
 /**
+ * Version floors for the SDK packages the installer adds. A bare `npm install
+ * crumbtrail-node` resolves whatever the registry says is latest at run time —
+ * which once left freshly wired services on stale 0.2.x installs when a
+ * dist-tag/publish hiccup lagged. Pinning `^<floor>` guarantees the wizard never
+ * wires a service to an SDK older than the one this CLI was built against.
+ * Bump these alongside SDK releases (they mirror the workspace package versions
+ * at publish time).
+ */
+export const SDK_VERSION_FLOORS: Record<string, string> = {
+  "crumbtrail-core": "0.5.0",
+  "crumbtrail-node": "0.6.0",
+  "crumbtrail-react-native": "0.2.3",
+  "crumbtrail-tauri": "0.2.3",
+};
+
+/** The install spec for a package: `pkg@^<floor>`, or the bare name when unknown. */
+export function sdkInstallSpec(pkg: string): string {
+  const floor = SDK_VERSION_FLOORS[pkg];
+  return floor ? `${pkg}@^${floor}` : pkg;
+}
+
+/**
  * Exhaustive registry keyed by `Recipe`. Typed `Record<Recipe, RecipeMeta>` so a
  * future recipe missing an entry fails typecheck — preserve that safety net.
  */

@@ -16,9 +16,19 @@ import type { Recipe } from "../detect";
 import { RECIPE_REGISTRY } from "../recipe-registry";
 import { defaultInjectIO, type InjectIO } from "./io";
 import type { Plan } from "./types";
-import { referencesCrumbtrail, withTrailingNewline } from "./text";
+import {
+  detectExpressModuleStyle,
+  prependIntoSource,
+  referencesCrumbtrail,
+  wireExpressMiddleware,
+  withTrailingNewline,
+} from "./text";
 import {
   clientInitSnippet,
+  expressErrorMiddlewareSnippet,
+  expressManualWiringSnippet,
+  expressMiddlewareImportSnippet,
+  expressRequestMiddlewareSnippet,
   nestInitSnippet,
   nodeInitSnippet,
   nuxtPluginSnippet,
@@ -336,8 +346,9 @@ function planVite(input: BuildPlanInput, io: InjectIO): Plan {
 }
 
 /**
- * Shared backend-JS plan builder. Express, Hono, Fastify, and the generic Node
- * recipe all inject the same self-contained `autoCapture` block (the only
+ * Shared backend-JS plan builder. Hono, Fastify, Nest, and the generic Node
+ * recipe inject (Express has its own builder, planExpress, which also wires the
+ * request/error middleware pair) the same self-contained `autoCapture` block (the only
  * prepend-safe server snippet — no `app` handle is available at the top of a
  * file). The block reads the key from process.env.CRUMBTRAIL_KEY, which the user
  * sets themselves (hands-off — the installer writes no key). Framework-specific
@@ -360,6 +371,89 @@ function planNode(input: BuildPlanInput, io: InjectIO): Plan {
     ]);
   }
   return prependWithPreflight(input, io, input.entryFile, block);
+}
+
+/**
+ * Express. Injects the same autoCapture block as the other backend-JS recipes,
+ * AND wires the request + error middleware so backends emit backend.req.* spans
+ * (autoCapture alone captures crashes and console.error only — with no request
+ * middleware, frontend to backend linkage stays empty forever).
+ *
+ * When the entry matches the common shape (an `express` import, a
+ * `const app = express()` line, an `app.listen(...)` line), the file is
+ * rewritten with the middleware registered in the right positions: request
+ * middleware right after app creation (before routes), error middleware just
+ * above listen (after routes). When any anchor is missing we fall back to the
+ * prepend path with a TODO block carrying exact copy and paste lines, and the
+ * wizard prints the same instructions.
+ */
+function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
+  const { endpoint } = input;
+  const block = nodeInitSnippet(endpoint);
+  if (!input.entryFile) {
+    return fallbackPlan(input, block, [
+      "Could not resolve the Node server entry — wire it manually.",
+    ]);
+  }
+  const target = input.entryFile;
+  const existing = io.readFile(target);
+  if (existing == null) {
+    return fallbackPlan(input, block, [
+      `Could not read ${target}; use the snippet or AI prompt to wire it manually.`,
+    ]);
+  }
+  if (referencesCrumbtrail(existing)) {
+    return skipPlan(input);
+  }
+
+  const style = detectExpressModuleStyle(existing);
+  const wired = style
+    ? wireExpressMiddleware(
+        existing,
+        (appVar) => expressRequestMiddlewareSnippet(appVar, endpoint),
+        (appVar) => expressErrorMiddlewareSnippet(appVar, endpoint),
+      )
+    : null;
+
+  if (wired == null) {
+    // Anchors not found: prepend autoCapture plus a TODO block with exact copy
+    // and paste instructions, and surface the same guidance in wizard output.
+    const combined = `${block}\n\n${expressManualWiringSnippet(endpoint)}`;
+    return prependWithPreflight(input, io, target, combined, [
+      "Express request middleware was NOT wired automatically (no `const app = express()` / `app.listen(...)` anchors found). Follow the TODO block added at the top of the entry: register createCrumbtrailExpressMiddleware before your routes and createCrumbtrailExpressErrorMiddleware after them, or backend request spans stay empty.",
+    ]);
+  }
+
+  // Full rewrite: middleware wired around the routes, plus the autoCapture block
+  // and the middleware import prepended after any shebang/directive prologue.
+  const content = prependIntoSource(
+    wired,
+    `${block}\n\n${expressMiddlewareImportSnippet(style!)}`,
+  );
+  const warnings = [
+    "Wired Express request middleware (before routes) and error middleware (after routes) for backend request capture.",
+  ];
+  const status = io.gitStatus(input.cwd, target);
+  if (status.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: target,
+      content,
+      applyMode: "rewrite",
+      warnings: [
+        ...warnings,
+        `${target} has uncommitted changes — confirm (or re-run with force) before editing.`,
+      ],
+    };
+  }
+  return {
+    recipe: input.recipe,
+    kind: "rewrite",
+    targetPath: target,
+    content,
+    warnings,
+  };
 }
 
 /**
@@ -526,8 +620,11 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
       return planAngular(input, io);
     case "vite-spa":
       return planVite(input, io);
-    case "nestjs":
     case "express":
+      // Express additionally wires the request/error middleware pair so the
+      // backend emits backend.req.* spans, not just crash capture.
+      return planExpress(input, io);
+    case "nestjs":
     case "hono":
     case "fastify":
     case "node":
