@@ -6,7 +6,7 @@
 // unambiguous, and reports package-manager + monorepo shape so the caller can
 // decide whether to prompt for a workspace.
 
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import type { Stack } from "crumbtrail-core";
 
@@ -32,6 +32,122 @@ export type Recipe =
   | "otlp";
 
 export type PackageManager = "pnpm" | "yarn" | "bun" | "npm";
+
+/** Synchronous filesystem boundary used by detection and monorepo discovery. */
+export interface FileReader {
+  /** File contents, or null when missing or unreadable. */
+  readFile(path: string): string | null;
+  isFile(path: string): boolean;
+  isDir(path: string): boolean;
+  /** Immediate entry basenames, or an empty list when unreadable. */
+  readDir(path: string): string[];
+  /** Highest directory the package-manager upward walk may inspect. */
+  root: string;
+}
+
+/** Local synchronous implementation, bounded by the filesystem root. */
+export function localFsReader(root: string): FileReader {
+  return {
+    root: path.parse(path.resolve(root)).root,
+    readFile(file) {
+      try {
+        return readFileSync(file, "utf8");
+      } catch {
+        return null;
+      }
+    },
+    isFile(file) {
+      try {
+        return statSync(file).isFile();
+      } catch {
+        return false;
+      }
+    },
+    isDir(dir) {
+      try {
+        return statSync(dir).isDirectory();
+      } catch {
+        return false;
+      }
+    },
+    readDir(dir) {
+      try {
+        return readdirSync(dir);
+      } catch {
+        return [];
+      }
+    },
+  };
+}
+
+/**
+ * In-memory reader for tests and prefetched remote repository trees. Keys may
+ * be absolute; relative keys are resolved from the current working directory.
+ */
+export function memoryReader(
+  files: Record<string, string>,
+  rootOverride?: string,
+): FileReader {
+  const entries = new Map(
+    Object.entries(files).map(([file, content]) => [
+      path.resolve(file),
+      content,
+    ]),
+  );
+  const paths = [...entries.keys()];
+  // Root is inferred from the common parent, which means adding one unrelated
+  // file to a set silently widens the detection boundary. Pass rootOverride
+  // when the boundary matters, as a prefetched repository tree does.
+  //
+  // An empty set resolves to the filesystem root, never process.cwd(): binding
+  // a virtual filesystem to ambient process state would let an empty remote
+  // tree root detection at whatever directory the server happens to be in.
+  const root =
+    rootOverride !== undefined
+      ? path.resolve(rootOverride)
+      : paths.length === 0
+        ? path.parse(path.resolve(".")).root
+        : commonDirectory(paths.map((file) => path.dirname(file)));
+
+  return {
+    root,
+    readFile: (file) => entries.get(path.resolve(file)) ?? null,
+    isFile: (file) => entries.has(path.resolve(file)),
+    isDir: (dir) => {
+      const normalized = path.resolve(dir);
+      const prefix = normalized.endsWith(path.sep)
+        ? normalized
+        : `${normalized}${path.sep}`;
+      return paths.some((file) => file.startsWith(prefix));
+    },
+    readDir: (dir) => {
+      const normalized = path.resolve(dir);
+      const prefix = normalized.endsWith(path.sep)
+        ? normalized
+        : `${normalized}${path.sep}`;
+      const names = new Set<string>();
+      for (const file of paths) {
+        if (!file.startsWith(prefix)) continue;
+        const relative = file.slice(prefix.length);
+        const [entry] = relative.split(path.sep);
+        if (entry) names.add(entry);
+      }
+      return [...names].sort();
+    },
+  };
+}
+
+function commonDirectory(files: string[]): string {
+  const [first, ...rest] = files.map((file) => file.split(path.sep));
+  let shared = first;
+  for (const parts of rest) {
+    let length = 0;
+    while (length < shared.length && shared[length] === parts[length])
+      length += 1;
+    shared = shared.slice(0, length);
+  }
+  return shared.join(path.sep) || path.parse(files[0]).root;
+}
 
 export interface WorkspacePackage {
   /** package.json `name`, falling back to the directory basename. */
@@ -91,16 +207,12 @@ interface PackageJson {
   workspaces?: string[] | { packages?: string[] };
 }
 
-function safeRead(file: string): string | null {
-  try {
-    return readFileSync(file, "utf8");
-  } catch {
-    return null;
-  }
+function safeRead(file: string, reader: FileReader): string | null {
+  return reader.readFile(file);
 }
 
-function readPackageJson(dir: string): PackageJson | null {
-  const text = safeRead(path.join(dir, "package.json"));
+function readPackageJson(dir: string, reader: FileReader): PackageJson | null {
+  const text = safeRead(path.join(dir, "package.json"), reader);
   if (text == null) return null;
   try {
     const parsed = JSON.parse(text) as unknown;
@@ -112,37 +224,24 @@ function readPackageJson(dir: string): PackageJson | null {
   }
 }
 
-function isDir(p: string): boolean {
-  try {
-    return statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-function isFile(p: string): boolean {
-  try {
-    return statSync(p).isFile();
-  } catch {
-    return false;
-  }
-}
-
 /** Walk up from `startDir` to the filesystem root looking for a known lockfile. */
-export function detectPackageManager(startDir: string): PackageManager | null {
+export function detectPackageManager(
+  startDir: string,
+  reader: FileReader = localFsReader(startDir),
+): PackageManager | null {
   let dir = path.resolve(startDir);
 
   while (true) {
-    if (existsSync(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
+    if (reader.isFile(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
     if (
-      existsSync(path.join(dir, "bun.lockb")) ||
-      existsSync(path.join(dir, "bun.lock"))
+      reader.isFile(path.join(dir, "bun.lockb")) ||
+      reader.isFile(path.join(dir, "bun.lock"))
     )
       return "bun";
-    if (existsSync(path.join(dir, "yarn.lock"))) return "yarn";
-    if (existsSync(path.join(dir, "package-lock.json"))) return "npm";
+    if (reader.isFile(path.join(dir, "yarn.lock"))) return "yarn";
+    if (reader.isFile(path.join(dir, "package-lock.json"))) return "npm";
     const parent = path.dirname(dir);
-    if (parent === dir) return null;
+    if (dir === reader.root || parent === dir) return null;
     dir = parent;
   }
 }
@@ -169,23 +268,30 @@ export function parsePnpmWorkspace(text: string): string[] {
   return out;
 }
 
-function expandWorkspaceGlobs(cwd: string, patterns: string[]): string[] {
+function expandWorkspaceGlobs(
+  cwd: string,
+  patterns: string[],
+  reader: FileReader,
+): string[] {
   const dirs = new Set<string>();
   for (const pattern of patterns) {
     if (pattern.startsWith("!")) continue; // ignore exclusions
     const wildcard = pattern.endsWith("/*") || pattern.endsWith("/**");
     if (wildcard) {
       const base = path.join(cwd, pattern.replace(/\/\*\*?$/, ""));
-      if (!isDir(base)) continue;
-      for (const entry of readdirSync(base)) {
+      if (!reader.isDir(base)) continue;
+      for (const entry of reader.readDir(base)) {
         const full = path.join(base, entry);
-        if (isDir(full) && existsSync(path.join(full, "package.json"))) {
+        if (
+          reader.isDir(full) &&
+          reader.isFile(path.join(full, "package.json"))
+        ) {
           dirs.add(full);
         }
       }
     } else if (!pattern.includes("*")) {
       const full = path.join(cwd, pattern);
-      if (existsSync(path.join(full, "package.json"))) dirs.add(full);
+      if (reader.isFile(path.join(full, "package.json"))) dirs.add(full);
     }
   }
   return [...dirs].sort();
@@ -194,10 +300,11 @@ function expandWorkspaceGlobs(cwd: string, patterns: string[]): string[] {
 function detectWorkspaces(
   cwd: string,
   pkg: PackageJson | null,
+  reader: FileReader,
 ): WorkspacePackage[] | null {
   let patterns: string[] | null = null;
   const wsYaml = path.join(cwd, "pnpm-workspace.yaml");
-  const wsYamlText = safeRead(wsYaml);
+  const wsYamlText = safeRead(wsYaml, reader);
   if (wsYamlText != null) {
     patterns = parsePnpmWorkspace(wsYamlText);
   } else if (pkg?.workspaces) {
@@ -208,9 +315,9 @@ function detectWorkspaces(
   // Nx is a strict FALLBACK source: it runs only when neither pnpm-workspace.yaml
   // nor a package.json `workspaces` field resolved. Order preserved so an Nx repo
   // that also happens to carry pnpm/pkg workspaces never double-sources.
-  if (!patterns) return detectNxWorkspaces(cwd);
-  return expandWorkspaceGlobs(cwd, patterns).map((dir) => {
-    const p = readPackageJson(dir);
+  if (!patterns) return detectNxWorkspaces(cwd, reader);
+  return expandWorkspaceGlobs(cwd, patterns, reader).map((dir) => {
+    const p = readPackageJson(dir, reader);
     return { name: p?.name ?? path.basename(dir), dir };
   });
 }
@@ -220,8 +327,11 @@ interface NxJson {
 }
 
 /** Parse a JSON object file (nx.json / project.json), null on missing/malformed. */
-function readJsonObject(file: string): Record<string, unknown> | null {
-  const text = safeRead(file);
+function readJsonObject(
+  file: string,
+  reader: FileReader,
+): Record<string, unknown> | null {
+  const text = safeRead(file, reader);
   if (text == null) return null;
   try {
     const parsed = JSON.parse(text) as unknown;
@@ -234,10 +344,10 @@ function readJsonObject(file: string): Record<string, unknown> | null {
 }
 
 /** Derive an Nx project's name: project.json → package.json → dir basename. */
-function nxProjectName(dir: string): string {
-  const proj = readJsonObject(path.join(dir, "project.json"));
+function nxProjectName(dir: string, reader: FileReader): string {
+  const proj = readJsonObject(path.join(dir, "project.json"), reader);
   if (proj && typeof proj.name === "string" && proj.name) return proj.name;
-  const p = readPackageJson(dir);
+  const p = readPackageJson(dir, reader);
   if (p?.name) return p.name;
   return path.basename(dir);
 }
@@ -250,9 +360,12 @@ function nxProjectName(dir: string): string {
  * A root-level standalone `project.json` is treated as a single project. Returns
  * null when no projects are found so `detect()` treats the repo as non-monorepo.
  */
-function detectNxWorkspaces(cwd: string): WorkspacePackage[] | null {
-  if (!isFile(path.join(cwd, "nx.json"))) return null;
-  const nx = readJsonObject(path.join(cwd, "nx.json")) as NxJson | null;
+function detectNxWorkspaces(
+  cwd: string,
+  reader: FileReader,
+): WorkspacePackage[] | null {
+  if (!reader.isFile(path.join(cwd, "nx.json"))) return null;
+  const nx = readJsonObject(path.join(cwd, "nx.json"), reader) as NxJson | null;
   const layout = nx?.workspaceLayout ?? {};
   const appsDir = typeof layout.appsDir === "string" ? layout.appsDir : "apps";
   const libsDir = typeof layout.libsDir === "string" ? layout.libsDir : "libs";
@@ -260,21 +373,21 @@ function detectNxWorkspaces(cwd: string): WorkspacePackage[] | null {
   const found = new Map<string, WorkspacePackage>();
 
   // Standalone single-project repo: a root project.json with no apps/libs.
-  if (isFile(path.join(cwd, "project.json"))) {
-    found.set(cwd, { name: nxProjectName(cwd), dir: cwd });
+  if (reader.isFile(path.join(cwd, "project.json"))) {
+    found.set(cwd, { name: nxProjectName(cwd, reader), dir: cwd });
   }
 
   for (const base of new Set([appsDir, libsDir])) {
     const baseDir = path.join(cwd, base);
-    if (!isDir(baseDir)) continue;
-    for (const entry of readdirSync(baseDir)) {
+    if (!reader.isDir(baseDir)) continue;
+    for (const entry of reader.readDir(baseDir)) {
       const full = path.join(baseDir, entry);
-      if (!isDir(full)) continue;
+      if (!reader.isDir(full)) continue;
       if (
-        isFile(path.join(full, "project.json")) ||
-        existsSync(path.join(full, "package.json"))
+        reader.isFile(path.join(full, "project.json")) ||
+        reader.isFile(path.join(full, "package.json"))
       ) {
-        found.set(full, { name: nxProjectName(full), dir: full });
+        found.set(full, { name: nxProjectName(full, reader), dir: full });
       }
     }
   }
@@ -284,8 +397,11 @@ function detectNxWorkspaces(cwd: string): WorkspacePackage[] | null {
 }
 
 /** Resolve the Vite entry from index.html's `<script type="module" src>` tag. */
-export function resolveViteEntry(cwd: string): string | null {
-  const html = safeRead(path.join(cwd, "index.html"));
+export function resolveViteEntry(
+  cwd: string,
+  reader: FileReader = localFsReader(cwd),
+): string | null {
+  const html = safeRead(path.join(cwd, "index.html"), reader);
   if (html == null) return null;
   // Match every <script ...> open tag, then require type=module + a local src.
   const tagRe = /<script\b[^>]*>/gi;
@@ -299,7 +415,7 @@ export function resolveViteEntry(cwd: string): string | null {
     if (/^https?:/i.test(rel)) continue; // external entry, can't edit
     rel = rel.replace(/^\.?\//, "");
     const full = path.join(cwd, rel);
-    if (isFile(full)) return full;
+    if (reader.isFile(full)) return full;
   }
   return null;
 }
@@ -317,7 +433,10 @@ export function resolveViteEntry(cwd: string): string | null {
  * (→ ambiguous), so the resolver never points at an `expo/AppEntry` path inside
  * node_modules.
  */
-export function resolveReactNativeEntry(cwd: string): string | null {
+export function resolveReactNativeEntry(
+  cwd: string,
+  reader: FileReader = localFsReader(cwd),
+): string | null {
   const candidates = [
     path.join("app", "_layout.tsx"),
     path.join("app", "_layout.jsx"),
@@ -334,7 +453,7 @@ export function resolveReactNativeEntry(cwd: string): string | null {
   ];
   for (const c of candidates) {
     const full = path.join(cwd, c);
-    if (isFile(full)) return full;
+    if (reader.isFile(full)) return full;
   }
   return null;
 }
@@ -347,7 +466,11 @@ export function parseNodeInvocation(script: string): string | null {
   return m ? m[1] : null;
 }
 
-function resolveNodeEntry(cwd: string, pkg: PackageJson): string | null {
+function resolveNodeEntry(
+  cwd: string,
+  pkg: PackageJson,
+  reader: FileReader,
+): string | null {
   const candidates: string[] = [];
   if (typeof pkg.main === "string") candidates.push(pkg.main);
   if (typeof pkg.bin === "string") candidates.push(pkg.bin);
@@ -361,7 +484,7 @@ function resolveNodeEntry(cwd: string, pkg: PackageJson): string | null {
   }
   for (const c of candidates) {
     const full = path.join(cwd, c);
-    if (isFile(full)) return full;
+    if (reader.isFile(full)) return full;
   }
   return null;
 }
@@ -372,11 +495,14 @@ function resolveNodeEntry(cwd: string, pkg: PackageJson): string | null {
  * script is `nest start` (not a bare node invocation) and `main` points at
  * `dist/`. First existing file wins; null when neither exists (→ ambiguous).
  */
-export function resolveNestEntry(cwd: string): string | null {
+export function resolveNestEntry(
+  cwd: string,
+  reader: FileReader = localFsReader(cwd),
+): string | null {
   const candidates = [path.join("src", "main.ts"), path.join("src", "main.js")];
   for (const c of candidates) {
     const full = path.join(cwd, c);
-    if (isFile(full)) return full;
+    if (reader.isFile(full)) return full;
   }
   return null;
 }
@@ -387,7 +513,10 @@ export function resolveNestEntry(cwd: string): string | null {
  * the recipe then FALLS BACK rather than creating one, because a bare init-only
  * entry.client would omit hydrateRoot/<RemixBrowser> and break the app.
  */
-export function resolveRemixEntry(cwd: string): string | null {
+export function resolveRemixEntry(
+  cwd: string,
+  reader: FileReader = localFsReader(cwd),
+): string | null {
   const candidates = [
     path.join("app", "entry.client.tsx"),
     path.join("app", "entry.client.jsx"),
@@ -395,7 +524,7 @@ export function resolveRemixEntry(cwd: string): string | null {
   ];
   for (const c of candidates) {
     const full = path.join(cwd, c);
-    if (isFile(full)) return full;
+    if (reader.isFile(full)) return full;
   }
   return null;
 }
@@ -405,9 +534,12 @@ export function resolveRemixEntry(cwd: string): string | null {
  * when absent (→ ambiguous). Prepending an import + `Crumbtrail.init` above
  * Angular's `bootstrapApplication`/`platformBrowserDynamic` call is safe.
  */
-export function resolveAngularEntry(cwd: string): string | null {
+export function resolveAngularEntry(
+  cwd: string,
+  reader: FileReader = localFsReader(cwd),
+): string | null {
   const full = path.join(cwd, "src", "main.ts");
-  return isFile(full) ? full : null;
+  return reader.isFile(full) ? full : null;
 }
 
 function mergedDeps(pkg: PackageJson | null): Record<string, string> {
@@ -434,16 +566,17 @@ function textMentions(text: string, token: string): boolean {
  */
 export function resolveOtlpStack(
   root: string,
+  reader: FileReader = localFsReader(root),
 ): { stack: Stack; reason: string } | null {
-  if (isFile(path.join(root, "manage.py"))) {
+  if (reader.isFile(path.join(root, "manage.py"))) {
     return {
       stack: "django",
       reason: "found manage.py (Django) — OTLP guidance",
     };
   }
   const pyText = [
-    safeRead(path.join(root, "pyproject.toml")),
-    safeRead(path.join(root, "requirements.txt")),
+    safeRead(path.join(root, "pyproject.toml"), reader),
+    safeRead(path.join(root, "requirements.txt"), reader),
   ]
     .filter((t): t is string => t != null)
     .join("\n");
@@ -464,25 +597,21 @@ export function resolveOtlpStack(
       };
     }
   }
-  if (isFile(path.join(root, "go.mod"))) {
+  if (reader.isFile(path.join(root, "go.mod"))) {
     return { stack: "go", reason: "found go.mod (Go) — OTLP guidance" };
   }
-  const gemfile = safeRead(path.join(root, "Gemfile"));
+  const gemfile = safeRead(path.join(root, "Gemfile"), reader);
   if (gemfile != null && textMentions(gemfile, "rails")) {
     return {
       stack: "rails",
       reason: "found a Gemfile referencing rails — OTLP guidance",
     };
   }
-  try {
-    if (readdirSync(root).some((entry) => entry.endsWith(".csproj"))) {
-      return {
-        stack: "dotnet",
-        reason: "found a *.csproj file (.NET) — OTLP guidance",
-      };
-    }
-  } catch {
-    // root unreadable — no dotnet marker.
+  if (reader.readDir(root).some((entry) => entry.endsWith(".csproj"))) {
+    return {
+      stack: "dotnet",
+      reason: "found a *.csproj file (.NET) — OTLP guidance",
+    };
   }
   return null;
 }
@@ -512,21 +641,22 @@ export const DOCKER_COMING_SOON_NOTE =
   "Docker/Compose files found — infra evidence sources (e.g. docker) are coming soon.";
 
 /** True when a Deno project marker is present at root (presence only, not parsed). */
-function hasDenoMarker(root: string): boolean {
+function hasDenoMarker(root: string, reader: FileReader): boolean {
   return (
-    isFile(path.join(root, "deno.json")) ||
-    isFile(path.join(root, "deno.jsonc"))
+    reader.isFile(path.join(root, "deno.json")) ||
+    reader.isFile(path.join(root, "deno.jsonc"))
   );
 }
 
 /** True when any Docker/Compose marker file is present at root. */
-function hasDockerMarker(root: string): boolean {
-  return DOCKER_MARKER_FILES.some((f) => isFile(path.join(root, f)));
+function hasDockerMarker(root: string, reader: FileReader): boolean {
+  return DOCKER_MARKER_FILES.some((f) => reader.isFile(path.join(root, f)));
 }
 
 /** Inputs shared by every recipe matcher — filesystem-derived facts only. */
 interface MatchContext {
   root: string;
+  reader: FileReader;
   deps: Record<string, string>;
   pkg: PackageJson | null;
   /** Matchers push their user-facing detection reasons here (side effect). */
@@ -560,13 +690,13 @@ const RECIPE_MATCHERS: ReadonlyArray<
     // The `@tauri-apps/*` dep + `src-tauri/` directory pair is the most specific
     // signal, so it must win. The frontend entry is resolved like vite-spa.
     "tauri",
-    ({ root, deps, reasons }) => {
+    ({ root, deps, reasons, reader }) => {
       const hasTauriDep =
         "@tauri-apps/api" in deps || "@tauri-apps/cli" in deps;
-      if (!hasTauriDep || !existsSync(path.join(root, "src-tauri")))
+      if (!hasTauriDep || !reader.isDir(path.join(root, "src-tauri")))
         return null;
       reasons.push("found `@tauri-apps/*` dependency + src-tauri/ directory");
-      const entryFile = resolveViteEntry(root);
+      const entryFile = resolveViteEntry(root, reader);
       if (!entryFile)
         reasons.push(
           "could not resolve a local frontend entry from index.html",
@@ -605,7 +735,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
     // `react-router` + `@react-router/dev` pair. A plain `react-router-dom` SPA
     // (no `@react-router/dev`) deliberately falls through to vite-spa.
     "remix",
-    ({ root, deps, reasons }) => {
+    ({ root, deps, reasons, reader }) => {
       const classicRemix =
         "@remix-run/react" in deps ||
         "@remix-run/node" in deps ||
@@ -617,7 +747,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
           ? "found `@remix-run/*` dependency"
           : "found `react-router` + `@react-router/dev` (React Router v7 framework mode)",
       );
-      const entryFile = resolveRemixEntry(root);
+      const entryFile = resolveRemixEntry(root, reader);
       if (!entryFile) reasons.push("could not resolve app/entry.client.*");
       return { entryFile, nextVersion: null };
     },
@@ -639,23 +769,23 @@ const RECIPE_MATCHERS: ReadonlyArray<
     // `@angular/core` dep alone is a sufficiently specific signal; angular.json
     // is recorded only as a confirming reason.
     "angular",
-    ({ root, deps, reasons }) => {
+    ({ root, deps, reasons, reader }) => {
       if (!("@angular/core" in deps)) return null;
       reasons.push("found `@angular/core` dependency");
-      if (existsSync(path.join(root, "angular.json")))
+      if (reader.isFile(path.join(root, "angular.json")))
         reasons.push("found angular.json");
-      const entryFile = resolveAngularEntry(root);
+      const entryFile = resolveAngularEntry(root, reader);
       if (!entryFile) reasons.push("could not resolve src/main.ts");
       return { entryFile, nextVersion: null };
     },
   ],
   [
     "vite-spa",
-    ({ root, deps, reasons }) => {
-      if (!("vite" in deps && existsSync(path.join(root, "index.html"))))
+    ({ root, deps, reasons, reader }) => {
+      if (!("vite" in deps && reader.isFile(path.join(root, "index.html"))))
         return null;
       reasons.push("found `vite` dependency + index.html");
-      const entryFile = resolveViteEntry(root);
+      const entryFile = resolveViteEntry(root, reader);
       if (!entryFile)
         reasons.push("could not resolve a local module entry from index.html");
       return { entryFile, nextVersion: null };
@@ -667,36 +797,45 @@ const RECIPE_MATCHERS: ReadonlyArray<
     // express/fastify — so this must win over those matchers. The bootstrap
     // entry lives at src/main.ts (resolveNodeEntry can't find it).
     "nestjs",
-    ({ root, deps, reasons }) => {
+    ({ root, deps, reasons, reader }) => {
       if (!("@nestjs/core" in deps)) return null;
       reasons.push("found `@nestjs/core` dependency");
-      const entryFile = resolveNestEntry(root);
+      const entryFile = resolveNestEntry(root, reader);
       if (!entryFile) reasons.push("could not resolve src/main.ts");
       return { entryFile, nextVersion: null };
     },
   ],
   [
     "express",
-    ({ root, deps, pkg, reasons }) => {
+    ({ root, deps, pkg, reasons, reader }) => {
       if (!("express" in deps) || !pkg) return null;
       reasons.push("found `express` dependency");
-      return { entryFile: resolveNodeEntry(root, pkg), nextVersion: null };
+      return {
+        entryFile: resolveNodeEntry(root, pkg, reader),
+        nextVersion: null,
+      };
     },
   ],
   [
     "hono",
-    ({ root, deps, pkg, reasons }) => {
+    ({ root, deps, pkg, reasons, reader }) => {
       if (!("hono" in deps) || !pkg) return null;
       reasons.push("found `hono` dependency");
-      return { entryFile: resolveNodeEntry(root, pkg), nextVersion: null };
+      return {
+        entryFile: resolveNodeEntry(root, pkg, reader),
+        nextVersion: null,
+      };
     },
   ],
   [
     "fastify",
-    ({ root, deps, pkg, reasons }) => {
+    ({ root, deps, pkg, reasons, reader }) => {
       if (!("fastify" in deps) || !pkg) return null;
       reasons.push("found `fastify` dependency");
-      return { entryFile: resolveNodeEntry(root, pkg), nextVersion: null };
+      return {
+        entryFile: resolveNodeEntry(root, pkg, reader),
+        nextVersion: null,
+      };
     },
   ],
   [
@@ -705,10 +844,10 @@ const RECIPE_MATCHERS: ReadonlyArray<
     // node matcher (an RN `package.json` `main` can resolve a node entry). The
     // `expo` / `react-native` dep is the specific signal that must win.
     "react-native",
-    ({ root, deps, reasons }) => {
+    ({ root, deps, reasons, reader }) => {
       if (!("expo" in deps || "react-native" in deps)) return null;
       reasons.push("found `expo` or `react-native` dependency");
-      const entryFile = resolveReactNativeEntry(root);
+      const entryFile = resolveReactNativeEntry(root, reader);
       if (!entryFile)
         reasons.push("could not resolve an App/_layout/index entry");
       return { entryFile, nextVersion: null };
@@ -716,9 +855,9 @@ const RECIPE_MATCHERS: ReadonlyArray<
   ],
   [
     "node",
-    ({ root, pkg, reasons }) => {
+    ({ root, pkg, reasons, reader }) => {
       if (!pkg) return null;
-      const nodeEntry = resolveNodeEntry(root, pkg);
+      const nodeEntry = resolveNodeEntry(root, pkg, reader);
       if (!nodeEntry) return null;
       reasons.push("resolved a Node server entry from package.json");
       return { entryFile: nodeEntry, nextVersion: null };
@@ -735,12 +874,12 @@ const RECIPE_MATCHERS: ReadonlyArray<
     // null entry → the guided fallback-ai plan, which is strictly better DX than
     // no match at all.
     "vite-spa",
-    ({ root, deps, reasons }) => {
+    ({ root, deps, reasons, reader }) => {
       if (!("vite" in deps)) return null;
       reasons.push(
         "found `vite` dependency (no root index.html — guided fallback)",
       );
-      const entryFile = resolveViteEntry(root);
+      const entryFile = resolveViteEntry(root, reader);
       if (!entryFile)
         reasons.push("could not resolve a local module entry from index.html");
       return { entryFile, nextVersion: null };
@@ -752,8 +891,8 @@ const RECIPE_MATCHERS: ReadonlyArray<
     // project, so they sit strictly after the generic `node` matcher. A single
     // `otlp` recipe carries the detected Stack out via `otlpStack`.
     "otlp",
-    ({ root, reasons }) => {
-      const hit = resolveOtlpStack(root);
+    ({ root, reasons, reader }) => {
+      const hit = resolveOtlpStack(root, reader);
       if (!hit) return null;
       reasons.push(hit.reason);
       return { entryFile: null, nextVersion: null, otlpStack: hit.stack };
@@ -790,16 +929,19 @@ export function matchRecipe(ctx: MatchContext): {
  * workspace list and marks the result ambiguous — the caller picks a workspace
  * and re-runs `detect` inside it.
  */
-export function detect(cwd: string): DetectResult {
+export function detect(
+  cwd: string,
+  reader: FileReader = localFsReader(cwd),
+): DetectResult {
   const reasons: string[] = [];
   const root = path.resolve(cwd);
-  const packageJsonPath = existsSync(path.join(root, "package.json"))
+  const packageJsonPath = reader.isFile(path.join(root, "package.json"))
     ? path.join(root, "package.json")
     : null;
-  const pkg = packageJsonPath ? readPackageJson(root) : null;
-  const packageManager = detectPackageManager(root);
+  const pkg = packageJsonPath ? readPackageJson(root, reader) : null;
+  const packageManager = detectPackageManager(root, reader);
 
-  const workspaces = detectWorkspaces(root, pkg);
+  const workspaces = detectWorkspaces(root, pkg, reader);
   const isMonorepo = !!workspaces && workspaces.length > 0;
 
   const deps = mergedDeps(pkg);
@@ -807,14 +949,14 @@ export function detect(cwd: string): DetectResult {
   // Non-blocking informational notes — kept strictly separate from `reasons`
   // and never allowed to affect recipe/ambiguity/monorepo/entry.
   const notes: string[] = [];
-  if (hasDockerMarker(root)) notes.push(DOCKER_COMING_SOON_NOTE);
+  if (hasDockerMarker(root, reader)) notes.push(DOCKER_COMING_SOON_NOTE);
 
   // Ordered, most-specific-first matcher ladder. Each matcher inspects the
   // filesystem/manifest and, when it wins, records the recipe plus its exact
   // `reasons`/entry/version side effects. Order is load-bearing: sveltekit/nuxt
   // must win over a bare vite+index.html project, and vite-spa over the generic
   // node fallback. Preserve this list verbatim when adding recipes.
-  const match = matchRecipe({ root, deps, pkg, reasons });
+  const match = matchRecipe({ root, reader, deps, pkg, reasons });
   const recipe: Recipe | null = match.recipe;
   let entryFile: string | null = match.entryFile;
   const nextVersion: string | null = match.nextVersion;
@@ -834,7 +976,8 @@ export function detect(cwd: string): DetectResult {
     // A Deno project (deno.json/deno.jsonc, no package.json) gets a distinct,
     // recognizable reason so the wizard can explain it isn't supported yet
     // rather than falling back to the generic "no recipe matched" hint.
-    if (!pkg && hasDenoMarker(root)) reasons.push(DENO_UNSUPPORTED_REASON);
+    if (!pkg && hasDenoMarker(root, reader))
+      reasons.push(DENO_UNSUPPORTED_REASON);
     else reasons.push("no recipe matched");
   } else if (
     (recipe === "tauri" ||
