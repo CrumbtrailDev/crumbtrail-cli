@@ -1,7 +1,53 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { detect } from "../detect";
+import {
+  detect,
+  detectPackageManager,
+  localFsReader,
+  memoryReader,
+} from "../detect";
 import { cleanup, makeTmpRepo } from "./helpers";
+
+describe("FileReader root bounds the upward lockfile walk", () => {
+  // The parity tests elsewhere pass only incidentally: the fixtures they use
+  // happen to carry their own lockfile, so neither reader ever walks far
+  // enough for the boundary to matter. This asserts the bound directly, since
+  // it is the whole reason `root` exists — a GitHub reader has nothing above
+  // the repository root, and an unbounded walk would escape the repo.
+  const files = {
+    "/virtual/repo/apps/web/package.json": "{}",
+    "/virtual/repo/package.json": "{}",
+  };
+
+  it("ignores a lockfile above the root", () => {
+    const reader = memoryReader(
+      { ...files, "/virtual/yarn.lock": "" },
+      "/virtual/repo",
+    );
+    expect(detectPackageManager("/virtual/repo/apps/web", reader)).toBeNull();
+  });
+
+  it("finds a lockfile at the root itself, which is inclusive", () => {
+    const reader = memoryReader(
+      { ...files, "/virtual/repo/yarn.lock": "" },
+      "/virtual/repo",
+    );
+    expect(detectPackageManager("/virtual/repo/apps/web", reader)).toBe("yarn");
+  });
+
+  it("walks upward from a subdirectory until it reaches the root", () => {
+    const reader = memoryReader(
+      { ...files, "/virtual/repo/pnpm-lock.yaml": "" },
+      "/virtual/repo",
+    );
+    expect(detectPackageManager("/virtual/repo/apps/web", reader)).toBe("pnpm");
+  });
+
+  it("roots an empty file set at the filesystem root, never process.cwd()", () => {
+    expect(memoryReader({}).root).toBe(path.parse(path.resolve(".")).root);
+  });
+});
 
 describe("detect", () => {
   const roots: string[] = [];
@@ -26,6 +72,24 @@ describe("detect", () => {
     expect(r.nextVersion).toBe("15.4.0");
     expect(r.packageManager).toBe("pnpm");
     expect(r.ambiguous).toBe(false);
+  });
+
+  it("matches fixture detection with localFsReader and memoryReader", () => {
+    const fixture = path.resolve("../../test-fixtures/installers/vite-react");
+    const files: Record<string, string> = {};
+    const collect = (dir: string) => {
+      for (const entry of readdirSync(dir)) {
+        const full = path.join(dir, entry);
+        if (statSync(full).isDirectory()) collect(full);
+        else files[full] = readFileSync(full, "utf8");
+      }
+    };
+    collect(fixture);
+
+    const inMemory = memoryReader(files);
+    expect(detect(fixture, localFsReader(fixture))).toEqual(
+      detect(inMemory.root, inMemory),
+    );
   });
 
   it("detects SvelteKit over a bare vite entry", () => {

@@ -15,10 +15,15 @@
 //      calling resolveOtlpStack() directly keeps `otlpStack` correct and cannot
 //      drift from the matcher order.
 
-import fs from "node:fs";
 import path from "node:path";
-import { detect, type DetectResult, type Recipe } from "./detect";
-import { defaultInjectIO, projectAlreadyWired } from "./inject";
+import {
+  detect,
+  localFsReader,
+  type DetectResult,
+  type FileReader,
+  type Recipe,
+} from "./detect";
+import { projectAlreadyWired, type InjectIO } from "./inject";
 import { OTLP_GUIDE_FILENAME } from "./otlp-guide";
 import { RECIPE_REGISTRY } from "./recipe-registry";
 
@@ -45,11 +50,7 @@ const MAX_SCAN_DIRS = 200;
 export type CandidateSource = "workspace" | "scan";
 
 export type CandidateFlag =
-  | "ambiguous"
-  | "otlp"
-  | "likely-library"
-  | "already-wired"
-  | "no-recipe";
+  "ambiguous" | "otlp" | "likely-library" | "already-wired" | "no-recipe";
 
 export interface ServiceCandidate {
   /** Absolute path to the service directory. */
@@ -70,36 +71,25 @@ export interface ServiceCandidate {
 }
 
 export interface DiscoverDeps {
-  detect?: (cwd: string) => DetectResult;
+  detect?: (cwd: string, reader?: FileReader) => DetectResult;
   /** True when this dir already depends on a Crumbtrail SDK. */
   alreadyWired?: (dir: string) => boolean;
-  readDir?: (dir: string) => string[];
-  isDir?: (p: string) => boolean;
-  isFile?: (p: string) => boolean;
 }
 
-function defaultReadDir(dir: string): string[] {
-  try {
-    return fs.readdirSync(dir);
-  } catch {
-    return [];
-  }
-}
-
-function defaultIsDir(p: string): boolean {
-  try {
-    return fs.statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-function defaultIsFile(p: string): boolean {
-  try {
-    return fs.statSync(p).isFile();
-  } catch {
-    return false;
-  }
+function injectIOFromReader(reader: FileReader): InjectIO {
+  return {
+    exists: (p) => reader.isFile(p) || reader.isDir(p),
+    // Bound, not passed by reference: a future class based reader would lose
+    // `this` if this were `readFile: reader.readFile`.
+    readFile: (p) => reader.readFile(p),
+    // A FileReader has no working tree, so there is no honest answer here.
+    // Throwing rather than returning a plausible "clean" keeps a future caller
+    // from silently getting a wrong answer. Unreachable today: the only
+    // consumer, projectAlreadyWired, reads files and never asks for git status.
+    gitStatus: () => {
+      throw new Error("gitStatus is unavailable through a FileReader");
+    },
+  };
 }
 
 /**
@@ -127,12 +117,12 @@ export function looksLikeLibrary(
 
 function readPkg(
   dir: string,
-  isFile: (p: string) => boolean,
+  reader: FileReader,
 ): { name?: string; scripts?: Record<string, string>; bin?: unknown } | null {
   const file = path.join(dir, "package.json");
-  if (!isFile(file)) return null;
+  if (!reader.isFile(file)) return null;
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) as {
+    return JSON.parse(reader.readFile(file) ?? "") as {
       name?: string;
       scripts?: Record<string, string>;
     };
@@ -146,18 +136,19 @@ function classify(
   dir: string,
   source: CandidateSource,
   fallbackName: string,
-  deps: Required<Pick<DiscoverDeps, "detect" | "alreadyWired" | "isFile">>,
+  reader: FileReader,
+  deps: Required<Pick<DiscoverDeps, "detect" | "alreadyWired">>,
 ): ServiceCandidate {
-  const detected = deps.detect(dir);
+  const detected = deps.detect(dir, reader);
   const recipe = detected.recipe;
-  const pkg = readPkg(dir, deps.isFile);
+  const pkg = readPkg(dir, reader);
   const flags: CandidateFlag[] = [];
 
   const isOtlp = recipe === "otlp";
   // An OTLP service has no package.json to inspect, so "already wired" for it
   // means the guide file is already sitting there from a previous run.
   const wired = isOtlp
-    ? deps.isFile(path.join(dir, OTLP_GUIDE_FILENAME))
+    ? reader.isFile(path.join(dir, OTLP_GUIDE_FILENAME))
     : recipe != null && deps.alreadyWired(dir);
 
   if (recipe == null) flags.push("no-recipe");
@@ -197,17 +188,14 @@ function classify(
 export function discoverServices(
   root: string,
   rootResult: DetectResult,
+  reader: FileReader = localFsReader(root),
   overrides: DiscoverDeps = {},
 ): ServiceCandidate[] {
-  const isFile = overrides.isFile ?? defaultIsFile;
-  const isDir = overrides.isDir ?? defaultIsDir;
-  const readDir = overrides.readDir ?? defaultReadDir;
   const deps = {
     detect: overrides.detect ?? detect,
     alreadyWired:
       overrides.alreadyWired ??
-      ((dir: string) => projectAlreadyWired(dir, defaultInjectIO)),
-    isFile,
+      ((dir: string) => projectAlreadyWired(dir, injectIOFromReader(reader))),
   };
 
   const byDir = new Map<string, ServiceCandidate>();
@@ -215,24 +203,26 @@ export function discoverServices(
   for (const ws of rootResult.workspaces) {
     const dir = path.resolve(ws.dir);
     if (byDir.has(dir)) continue;
-    byDir.set(dir, classify(root, dir, "workspace", ws.name, deps));
+    byDir.set(dir, classify(root, dir, "workspace", ws.name, reader, deps));
   }
 
   // Scan pass. Workspaces already claimed win — a dir under packages/* that is
   // also a workspace must appear once, as a workspace.
   let scanned = 0;
   const parents = [
-    ...SCAN_PARENTS.map((p) => path.join(root, p)).filter(isDir),
+    ...SCAN_PARENTS.map((p) => path.join(root, p)).filter((dir) =>
+      reader.isDir(dir),
+    ),
     root,
   ];
   for (const parent of parents) {
-    for (const entry of readDir(parent)) {
+    for (const entry of reader.readDir(parent)) {
       if (scanned >= MAX_SCAN_DIRS) break;
       if (entry.startsWith(".") || SKIP_DIRS.has(entry)) continue;
       const dir = path.join(parent, entry);
-      if (!isDir(dir) || byDir.has(dir)) continue;
+      if (!reader.isDir(dir) || byDir.has(dir)) continue;
       scanned += 1;
-      const candidate = classify(root, dir, "scan", entry, deps);
+      const candidate = classify(root, dir, "scan", entry, reader, deps);
       // The scan exists solely to surface non-JS services. A JS package that
       // isn't a declared workspace is not ours to wire — leaving it out keeps
       // the list honest and avoids picking up examples/ and fixtures/.

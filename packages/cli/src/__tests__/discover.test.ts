@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import path from "node:path";
-import { detect } from "../detect";
+import { detect, memoryReader } from "../detect";
 import { discoverServices, looksLikeLibrary } from "../discover";
 import { cleanup, makeTmpRepo } from "./helpers";
 
@@ -168,6 +168,34 @@ describe("discoverServices", () => {
     repo = makeMonorepo();
     const found = discoverServices(repo, detect(repo));
     expect(found.map((c) => c.dir)).not.toContain(path.resolve(repo));
+  });
+
+  it("finds the same services through memoryReader", () => {
+    const files = {
+      "package.json": pkg({ name: "shop", private: true }),
+      "pnpm-workspace.yaml": "packages:\n  - 'apps/*'\n",
+      "apps/web/package.json": pkg({
+        name: "web",
+        dependencies: { vite: "^5.0.0" },
+      }),
+      "apps/web/index.html":
+        '<script type="module" src="/src/main.ts"></script>',
+      "apps/web/src/main.ts": "",
+      "services/payments/Gemfile": "gem 'rails'",
+    };
+    repo = makeTmpRepo(files);
+    const reader = memoryReader(
+      Object.fromEntries(
+        Object.entries(files).map(([file, content]) => [
+          path.join(repo!, file),
+          content,
+        ]),
+      ),
+    );
+
+    expect(discoverServices(repo, detect(repo))).toEqual(
+      discoverServices(reader.root, detect(reader.root, reader), reader),
+    );
   });
 });
 
