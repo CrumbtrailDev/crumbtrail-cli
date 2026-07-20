@@ -43,7 +43,8 @@ export type KnowledgeGapKind =
   | "timeout"
   | "request-failed"
   | "empty-query"
-  | "no-results";
+  | "no-results"
+  | "input-truncated";
 
 /**
  * Kinds that are HARD failures: the oracle could not consult the provider at
@@ -54,7 +55,9 @@ export type KnowledgeGapKind =
  * — "no documented intent exists for this behavior" is a real and useful
  * answer, and marking it unavailable would tell the caller the oracle is broken
  * when it is working correctly. `"empty-query"` is likewise a caller-side input
- * problem, not a provider outage.
+ * problem, not a provider outage, and `"input-truncated"` is the oracle
+ * reporting that it clipped the caller's own input before searching — the
+ * lookup still ran and its answer is still real, just narrower than asked for.
  */
 const HARD_FAILURES: ReadonlySet<KnowledgeGapKind> = new Set([
   "not-configured",
