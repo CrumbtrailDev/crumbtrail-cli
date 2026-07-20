@@ -151,9 +151,70 @@ describe("confluenceClientFromEnv", () => {
     expect(parseSpaceKeysEnv(undefined)).toEqual([]);
     expect(parseSpaceKeysEnv("")).toEqual([]);
   });
+
+  it("fails closed when a configured space allowlist is malformed or empty", async () => {
+    for (const rawSpaceKeys of ["ENG,BAD!", " , , "]) {
+      const { fetchImpl, calls } = stubFetch(searchMultiPage);
+      const client = confluenceClientFromEnv(
+        { ...fullEnv, CONFLUENCE_SPACE_KEYS: rawSpaceKeys },
+        { fetchImpl },
+      );
+      expect(client).toBeInstanceOf(ConfluenceKnowledgeClient);
+
+      const result = await client!.searchSpecs(
+        { query: "checkout retry" },
+        clock,
+      );
+      expect(calls).toHaveLength(0);
+      expect(result.excerpts).toEqual([]);
+      expect(result.gaps).toHaveLength(1);
+      expect(result.gaps[0].reason).toContain(
+        "CONFLUENCE_SPACE_KEYS is invalid",
+      );
+      expect(result.gaps[0].reason).not.toContain(rawSpaceKeys);
+    }
+  });
+
+  it("does not let runtime options override the env-derived allowlist", async () => {
+    const { fetchImpl, calls } = stubFetch(searchMultiPage);
+    // Extra properties are legal on a variable passed to the narrow options
+    // type at runtime. They must not be spread into the security config.
+    const options = {
+      fetchImpl,
+      spaceKeys: ["ENG"],
+      spaceKeysConfigured: false,
+    };
+    const client = confluenceClientFromEnv(
+      { ...fullEnv, CONFLUENCE_SPACE_KEYS: "ENG,BAD!" },
+      options,
+    );
+
+    const result = await client!.searchSpecs(
+      { query: "checkout retry" },
+      clock,
+    );
+    expect(calls).toHaveLength(0);
+    expect(result.excerpts).toEqual([]);
+    expect(result.gaps[0].reason).toContain("CONFLUENCE_SPACE_KEYS is invalid");
+  });
 });
 
 describe("searchSpecs — request construction", () => {
+  it("fails closed for malformed non-empty direct allowlist config", async () => {
+    for (const spaceKeys of [["ENG", "BAD!"], ["BAD!"]]) {
+      const { fetchImpl, calls } = stubFetch(searchMultiPage);
+      const result = await makeClient(fetchImpl, { spaceKeys }).searchSpecs(
+        { query: "checkout retry" },
+        clock,
+      );
+
+      expect(calls).toHaveLength(0);
+      expect(result.excerpts).toEqual([]);
+      expect(result.gaps).toHaveLength(1);
+      expect(result.gaps[0].reason).toContain("no search was sent");
+    }
+  });
+
   it("issues exactly one bounded GET with Basic auth and the shared User-Agent", async () => {
     const { fetchImpl, calls } = stubFetch(searchMultiPage);
     await makeClient(fetchImpl).searchSpecs({ query: "checkout retry" }, clock);
@@ -269,6 +330,37 @@ describe("searchSpecs — normalization", () => {
     // Provider order (ORDER BY lastModified DESC) is preserved, never re-ranked.
     expect(second.spaceKey).toBe("ARCH");
     expect(second.ageDays).toBeGreaterThan(first.ageDays);
+  });
+
+  it("selects context around a matched term even when it starts after 2 KB", async () => {
+    const boilerplate =
+      "Opening boilerplate with no matching behavior. ".repeat(70);
+    expect(Buffer.byteLength(boilerplate, "utf8")).toBeGreaterThan(
+      MAX_EXCERPT_BYTES,
+    );
+    const matchedPassage =
+      "The retry budget is three attempts before the checkout is abandoned.";
+    const result = await makeClient(
+      stubFetch({
+        results: [
+          {
+            id: "1",
+            title: "Checkout retry policy",
+            space: { key: "ENG" },
+            body: { view: { value: `<p>${boilerplate}${matchedPassage}</p>` } },
+            version: { when: "2026-07-19T00:00:00.000Z" },
+            _links: { webui: "/spaces/ENG/pages/1" },
+          },
+        ],
+        _links: { base: BASE_URL },
+      }).fetchImpl,
+    ).searchSpecs({ query: "retry budget" }, clock);
+
+    expect(result.excerpts[0].excerpt).toContain(matchedPassage);
+    expect(result.stats.truncated).toBe(true);
+    expect(
+      Buffer.byteLength(result.excerpts[0].excerpt, "utf8"),
+    ).toBeLessThanOrEqual(MAX_EXCERPT_BYTES);
   });
 
   it("skips rows carrying no usable body rather than emitting empty excerpts", async () => {
@@ -387,6 +479,53 @@ describe("searchSpecs — degradation (never rejects)", () => {
     );
     expect(result.excerpts).toEqual([]);
     expect(result.gaps[0].kind).toBe("source-unavailable");
+  });
+
+  it("rejects an oversized declared response before attempting JSON parsing", async () => {
+    const json = vi.fn(async () => searchMultiPage);
+    const cancel = vi.fn(async () => undefined);
+    const fetchImpl = (async () =>
+      ({
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-length": String(1_024 * 1_024 + 1) }),
+        body: { cancel },
+        json,
+      }) as unknown as Response) as typeof fetch;
+
+    const result = await makeClient(fetchImpl).searchSpecs(
+      { query: "retry" },
+      clock,
+    );
+
+    expect(json).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(result.excerpts).toEqual([]);
+    expect(result.gaps[0].reason).toContain("response exceeded");
+    expect(serialize(result)).not.toContain(API_TOKEN);
+  });
+
+  it("cancels a chunked response that grows past the byte limit before parsing", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(700 * 1_024));
+        controller.enqueue(new Uint8Array(400 * 1_024));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const fetchImpl = (async () => new Response(stream)) as typeof fetch;
+
+    const result = await makeClient(fetchImpl).searchSpecs(
+      { query: "retry" },
+      clock,
+    );
+
+    expect(cancelled).toBe(true);
+    expect(result.excerpts).toEqual([]);
+    expect(result.gaps[0].reason).toContain("response exceeded");
   });
 
   it("zero results is an informational gap, not an unavailable source", async () => {
@@ -680,6 +819,34 @@ describe("excerpt byte cap", () => {
     expect(
       Buffer.byteLength(big.excerpts[0].excerpt, "utf8"),
     ).toBeLessThanOrEqual(MAX_EXCERPT_BYTES);
+  });
+
+  it("bounds remote HTML before conversion and reports the discarded markup", async () => {
+    // The 20-byte prefix plus 1,596 five-byte tags exactly fills the 8 KB raw
+    // HTML budget. The remaining tags must not reach `htmlToText`, while the
+    // converted prose stays far below the 2 KB excerpt cap.
+    const hostileHtml = "<p>spec survives</p>" + "<br/>".repeat(2_000);
+    const result = await makeClient(
+      stubFetch({
+        results: [
+          {
+            id: "1",
+            title: "Markup-heavy spec",
+            space: { key: "ENG" },
+            body: { view: { value: hostileHtml } },
+            version: { when: "2026-07-19T00:00:00.000Z" },
+            _links: { webui: "/spaces/ENG/pages/1" },
+          },
+        ],
+        _links: { base: BASE_URL },
+      }).fetchImpl,
+    ).searchSpecs({ query: "retry" }, clock);
+
+    expect(result.excerpts[0].excerpt).toBe("spec survives");
+    expect(Buffer.byteLength(result.excerpts[0].excerpt, "utf8")).toBeLessThan(
+      MAX_EXCERPT_BYTES,
+    );
+    expect(result.stats.truncated).toBe(true);
   });
 });
 

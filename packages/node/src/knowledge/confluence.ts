@@ -48,6 +48,7 @@ import {
   buildSpecSearchCql,
   describeCqlInputLoss,
   MAX_QUERY_LENGTH,
+  sanitizeSpaceKeys,
   type CqlInputLoss,
   type SpecCqlInput,
   type SpecCqlResult,
@@ -94,6 +95,33 @@ export const MAX_SPEC_LIMIT = 15;
  * three to four bytes per character.
  */
 export const MAX_EXCERPT_BYTES = 2_000;
+
+/**
+ * Reserve enough leading context for an excerpt to be readable while keeping a
+ * matched term comfortably inside the final {@link MAX_EXCERPT_BYTES} cap.
+ */
+const MATCH_CONTEXT_BEFORE_BYTES = Math.floor(MAX_EXCERPT_BYTES / 4);
+
+/**
+ * Work with a finite region before applying the public excerpt cap. The final
+ * cap still governs what callers receive; this wider window merely preserves
+ * a little trailing context around the match.
+ */
+const MAX_MATCH_CONTEXT_BYTES = MAX_EXCERPT_BYTES * 2;
+
+/**
+ * A Confluence response can contain rich page HTML for several results. Keep
+ * the wire payload finite before parsing it, rather than trusting a provider
+ * header or allocating an unbounded JSON string.
+ */
+const MAX_CONFLUENCE_RESPONSE_BYTES = 1_024 * 1_024;
+
+/**
+ * Bound remote markup before `htmlToText`'s regex passes. Four times the 2 KB
+ * excerpt budget leaves room for ordinary tags/entities without letting one
+ * hostile field turn the regex work into an unbounded CPU allocation.
+ */
+const MAX_HTML_BYTES = MAX_EXCERPT_BYTES * 4;
 
 /** Page fields the search must expand for a usable excerpt + staleness signal. */
 const SEARCH_EXPAND = "body.view,version,space";
@@ -152,6 +180,13 @@ export interface ConfluenceClientConfig {
    * caller-supplied list can only narrow it, never widen it.
    */
   spaceKeys?: readonly string[];
+  /**
+   * Internal env boundary marker: `CONFLUENCE_SPACE_KEYS` was present, even if
+   * it parsed to no keys. Direct clients may use `spaceKeys: []` as the
+   * established spelling for no configured ceiling; a non-empty direct list
+   * is always validated as a security ceiling too.
+   */
+  spaceKeysConfigured?: boolean;
   /** Injectable transport. Defaults to global `fetch`. Tests pass a stub. */
   fetchImpl?: typeof fetch;
   /** Per-request budget. Defaults to `DEFAULT_SOURCE_TIMEOUT_MS`. */
@@ -210,12 +245,26 @@ export function confluenceClientFromEnv(
   });
   if (!present) return undefined;
 
+  const configuredSpaceKeys = env[CONFLUENCE_SPACE_KEYS_ENV];
+  // This is deliberately a destructure rather than `...options` in the
+  // config literal. The env-derived space ceiling is security-sensitive and a
+  // runtime caller can otherwise smuggle `spaceKeys` or
+  // `spaceKeysConfigured` through an object typed as these test seams.
+  const { fetchImpl, timeoutMs } = options;
   return new ConfluenceKnowledgeClient({
     baseUrl: env[CONFLUENCE_BASE_URL_ENV] as string,
     email: env[CONFLUENCE_EMAIL_ENV] as string,
     apiToken: env[CONFLUENCE_API_TOKEN_ENV] as string,
-    spaceKeys: parseSpaceKeysEnv(env[CONFLUENCE_SPACE_KEYS_ENV]),
-    ...options,
+    // Preserve whether the env var was set. `""`, `",,"`, and a malformed
+    // value are materially different from the variable being absent: the
+    // former are a broken security ceiling and must fail closed.
+    spaceKeys:
+      configuredSpaceKeys === undefined
+        ? undefined
+        : parseSpaceKeysEnv(configuredSpaceKeys),
+    spaceKeysConfigured: configuredSpaceKeys !== undefined,
+    fetchImpl,
+    timeoutMs,
   });
 }
 
@@ -359,6 +408,76 @@ export function capExcerptBytes(
 }
 
 /**
+ * Find the deterministic anchor for a page excerpt. Prefer the complete
+ * sanitized phrase; Confluence can also return stemming/token matches, so
+ * fall back to the first matching individual term in query order.
+ */
+function matchedTermIndex(text: string, sanitizedQuery: string): number {
+  const haystack = text.toLowerCase();
+  const phrase = sanitizedQuery.toLowerCase();
+  const phraseIndex = haystack.indexOf(phrase);
+  if (phraseIndex >= 0) return phraseIndex;
+
+  for (const term of phrase.split(/\s+/)) {
+    if (!term) continue;
+    const index = haystack.indexOf(term);
+    if (index >= 0) return index;
+  }
+  return -1;
+}
+
+/** Move backward by at most `maxBytes`, without splitting a code point. */
+function contextStartBeforeMatch(
+  text: string,
+  matchIndex: number,
+  maxBytes: number,
+): number {
+  let start = matchIndex;
+  let bytes = 0;
+  while (start > 0) {
+    const previous = text.charCodeAt(start - 1);
+    // A low surrogate at `start - 1` belongs to the code point starting one
+    // code unit earlier. Include the pair only when it is well-formed.
+    const codePointStart =
+      previous >= 0xdc00 &&
+      previous <= 0xdfff &&
+      start >= 2 &&
+      text.charCodeAt(start - 2) >= 0xd800 &&
+      text.charCodeAt(start - 2) <= 0xdbff
+        ? start - 2
+        : start - 1;
+    if (codePointStart < 0) break;
+    const char = text.slice(codePointStart, start);
+    const charBytes = Buffer.byteLength(char, "utf8");
+    if (bytes + charBytes > maxBytes) break;
+    bytes += charBytes;
+    start = codePointStart;
+  }
+  return start;
+}
+
+/**
+ * Select a bounded region around the first deterministic query match. This
+ * runs after HTML-to-text but before redaction and the public excerpt cap, so
+ * a relevant passage deep in a page is not replaced by its opening boilerplate.
+ */
+function matchedExcerptContext(
+  text: string,
+  sanitizedQuery: string,
+): { text: string; truncated: boolean } {
+  const matchIndex = matchedTermIndex(text, sanitizedQuery);
+  if (matchIndex < 0) return { text, truncated: false };
+
+  const start = contextStartBeforeMatch(
+    text,
+    matchIndex,
+    MATCH_CONTEXT_BEFORE_BYTES,
+  );
+  const region = capExcerptBytes(text.slice(start), MAX_MATCH_CONTEXT_BYTES);
+  return { text: region.text, truncated: start > 0 || region.truncated };
+}
+
+/**
  * Coerce the caller's `query` to a string at the trust boundary.
  *
  * `SpecSearchRequest.query` is typed `string`, but the type is a compile-time
@@ -395,10 +514,19 @@ function pageUrl(row: ConfluenceSearchRow, base: string): string {
   return redactUrl(raw, "excerpts[].url").value;
 }
 
+/** A response crossed the body limit before it could be parsed as JSON. */
+class ConfluenceResponseTooLargeError extends Error {
+  constructor() {
+    super("Confluence response body exceeded the configured limit");
+    this.name = "ConfluenceResponseTooLargeError";
+  }
+}
+
 export class ConfluenceKnowledgeClient {
   private readonly baseUrl: string;
   private readonly authorization: string;
   private readonly operatorSpaceKeys: readonly string[];
+  private readonly operatorAllowlistInvalid: boolean;
   private readonly fetchImpl: typeof fetch;
   private readonly timeoutMs: number;
 
@@ -410,7 +538,24 @@ export class ConfluenceKnowledgeClient {
       `${config.email}:${config.apiToken}`,
       "utf8",
     ).toString("base64")}`;
-    this.operatorSpaceKeys = config.spaceKeys ?? [];
+    const configuredSpaceKeys = config.spaceKeys;
+    this.operatorSpaceKeys = sanitizeSpaceKeys(configuredSpaceKeys ?? []);
+    // A configured ceiling which loses any key during sanitization cannot be
+    // relaxed to an unrestricted search. This is intentionally stricter than
+    // caller-supplied narrowing: an operator typo must fail closed before any
+    // network egress, including when the whole list becomes empty.
+    this.operatorAllowlistInvalid =
+      // An explicit empty direct array is the established no-ceiling spelling.
+      // Every non-empty direct list is a ceiling and must fail closed if CQL
+      // sanitization changes it. The marker extends the same treatment to an
+      // env value which parsed to `[]`.
+      (config.spaceKeysConfigured === true ||
+        (configuredSpaceKeys?.length ?? 0) > 0) &&
+      (this.operatorSpaceKeys.length === 0 ||
+        describeCqlInputLoss({
+          query: "allowlist validation",
+          spaceKeys: configuredSpaceKeys,
+        }).droppedSpaceKeys > 0);
     this.fetchImpl = config.fetchImpl ?? fetch;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_SOURCE_TIMEOUT_MS;
   }
@@ -462,6 +607,15 @@ export class ConfluenceKnowledgeClient {
     const startedAt = clock();
     const elapsed = () => Math.max(0, clock() - startedAt);
     const gaps: EvidenceGap[] = [];
+
+    if (this.operatorAllowlistInvalid) {
+      return knowledgeResult([], [this.invalidAllowlistGap()], {
+        fetched: 0,
+        returned: 0,
+        truncated: false,
+        latencyMs: elapsed(),
+      });
+    }
 
     // The pre-flight block is inside a try/catch and reads through the coercers
     // above for the same reason the rest of this method is defensive: the
@@ -630,7 +784,7 @@ export class ConfluenceKnowledgeClient {
           `Confluence search failed with HTTP ${res.status}: ${sanitizeUrl(url)}`,
         );
       }
-      payload = (await res.json()) as ConfluenceSearchResponse;
+      payload = await this.readBoundedJson(res);
     } catch (error) {
       return knowledgeResult(
         [],
@@ -667,7 +821,7 @@ export class ConfluenceKnowledgeClient {
       // so field-level type guards alone are not sufficient.
       let normalized: { excerpt: SpecExcerpt; truncated: boolean } | null;
       try {
-        normalized = this.normalizeRow(row, base, now);
+        normalized = this.normalizeRow(row, base, now, built.sanitizedQuery);
       } catch {
         continue;
       }
@@ -705,6 +859,7 @@ export class ConfluenceKnowledgeClient {
     row: ConfluenceSearchRow,
     base: string,
     now: number,
+    sanitizedQuery: string,
   ): { excerpt: SpecExcerpt; truncated: boolean } | null {
     // `ConfluenceSearchRow` is a claim about JSON off the wire, not a checked
     // fact. `{"results":[null]}` is malformed JSON that the file header already
@@ -715,10 +870,12 @@ export class ConfluenceKnowledgeClient {
     const bodyHtml = row.body?.view?.value;
     if (typeof bodyHtml !== "string" || bodyHtml.length === 0) return null;
 
-    const text = htmlToText(bodyHtml);
+    const boundedHtml = capExcerptBytes(bodyHtml, MAX_HTML_BYTES);
+    const text = htmlToText(boundedHtml.text);
     if (text.length === 0) return null;
 
-    const capped = capExcerptBytes(text, MAX_EXCERPT_BYTES);
+    const matchedContext = matchedExcerptContext(text, sanitizedQuery);
+    const capped = capExcerptBytes(matchedContext.text, MAX_EXCERPT_BYTES);
     // Redaction runs AFTER the byte cap so the cap governs page bytes, not
     // redaction-marker bytes, and BEFORE anything is returned.
     const excerptText = redactText(capped.text, "excerpts[].excerpt");
@@ -747,7 +904,65 @@ export class ConfluenceKnowledgeClient {
     if (typeof author === "string" && author.length > 0) {
       excerpt.lastModifiedBy = author;
     }
-    return { excerpt, truncated: capped.truncated };
+    return {
+      excerpt,
+      truncated:
+        boundedHtml.truncated || matchedContext.truncated || capped.truncated,
+    };
+  }
+
+  /** Parse a successful response only after enforcing its byte ceiling. */
+  private async readBoundedJson(
+    response: Response,
+  ): Promise<ConfluenceSearchResponse> {
+    const declaredLength = this.contentLength(response);
+    if (
+      declaredLength !== undefined &&
+      declaredLength > MAX_CONFLUENCE_RESPONSE_BYTES
+    ) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new ConfluenceResponseTooLargeError();
+    }
+
+    // The injected legacy fixture seam supplies only `json()`. Production
+    // fetch always returns a readable body; retaining this fallback keeps that
+    // narrow test seam usable without weakening real network handling.
+    if (!response.body) {
+      return (await response.json()) as ConfluenceSearchResponse;
+    }
+
+    const reader = response.body.getReader();
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += value.byteLength;
+        if (bytes > MAX_CONFLUENCE_RESPONSE_BYTES) {
+          try {
+            await reader.cancel();
+          } catch {
+            // The size violation still wins if a broken stream rejects its
+            // cancellation; never surface that provider-controlled error.
+          }
+          throw new ConfluenceResponseTooLargeError();
+        }
+        chunks.push(Buffer.from(value));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return JSON.parse(
+      Buffer.concat(chunks, bytes).toString("utf8"),
+    ) as ConfluenceSearchResponse;
+  }
+
+  private contentLength(response: Response): number | undefined {
+    const value = response.headers?.get("content-length");
+    if (value === null || value === undefined) return undefined;
+    const bytes = Number(value);
+    return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : undefined;
   }
 
   /**
@@ -773,6 +988,16 @@ export class ConfluenceKnowledgeClient {
     });
   }
 
+  /** A configured operator allowlist was malformed or sanitized away. */
+  private invalidAllowlistGap(): EvidenceGap {
+    return knowledgeGap({
+      kind: "request-failed",
+      reason: `confluence: ${CONFLUENCE_SPACE_KEYS_ENV} is invalid; no search was sent`,
+      suggestion:
+        "set a non-empty comma-separated list of alphanumeric or underscore space keys",
+    });
+  }
+
   /**
    * Map a caught failure to its gap. The thrown message is already sanitized to
    * status + origin + path by {@link ConfluenceError}; a network error's message
@@ -784,6 +1009,14 @@ export class ConfluenceKnowledgeClient {
     timedOut: boolean,
     callerAborted: boolean,
   ): EvidenceGap {
+    if (error instanceof ConfluenceResponseTooLargeError) {
+      return knowledgeGap({
+        kind: "request-failed",
+        reason: "confluence: search response exceeded the 1 MiB safety limit",
+        suggestion:
+          "narrow the query or space allowlist, then retry the lookup",
+      });
+    }
     if (error instanceof ConfluenceError) {
       if (error.status === 401 || error.status === 403) {
         return knowledgeGap({

@@ -18,7 +18,9 @@ import {
   CONFLUENCE_AUTH_FIELDS,
   CONFLUENCE_BASE_URL_ENV,
   CONFLUENCE_SPACE_KEYS_ENV,
+  describeCqlInputLoss,
   parseSpaceKeysEnv,
+  sanitizeSpaceKeys,
 } from "./knowledge";
 
 export type CheckStatus = "pass" | "warn" | "fail";
@@ -216,7 +218,7 @@ export async function checkEvidenceSources(
  *
  * Presence-only: no request is made, so this cannot report auth validity the way
  * an adapter's `health()` does. `CONFLUENCE_API_TOKEN` is never echoed — only
- * the base URL's origin+path and the space-allowlist keys reach the detail
+ * the base URL's origin+path and valid space-allowlist keys reach the detail
  * string, and the token is reported as set/unset by inference from the check
  * passing at all.
  *
@@ -242,7 +244,29 @@ export function checkSpecOracle(
     };
   }
 
-  const spaceKeys = parseSpaceKeysEnv(env[CONFLUENCE_SPACE_KEYS_ENV]);
+  const configuredSpaceKeys = env[CONFLUENCE_SPACE_KEYS_ENV];
+  const parsedSpaceKeys = parseSpaceKeysEnv(configuredSpaceKeys);
+  const spaceKeys = sanitizeSpaceKeys(parsedSpaceKeys);
+  const droppedSpaceKeys = describeCqlInputLoss({
+    query: "allowlist validation",
+    spaceKeys: parsedSpaceKeys,
+  }).droppedSpaceKeys;
+
+  // Mirror `ConfluenceKnowledgeClient`'s env boundary: an allowlist that is
+  // present but empty, malformed, or exceeds the key cap fails closed there,
+  // so doctor must not describe it as an unrestricted configuration.
+  if (
+    configuredSpaceKeys !== undefined &&
+    (spaceKeys.length === 0 || droppedSpaceKeys > 0)
+  ) {
+    return {
+      name: "spec-oracle",
+      status: "warn",
+      detail: `${CONFLUENCE_SPACE_KEYS_ENV} is invalid; Confluence searches are disabled until its allowlist is fixed`,
+      remediation: `set ${CONFLUENCE_SPACE_KEYS_ENV} to a non-empty comma-separated list of alphanumeric or underscore space keys`,
+    };
+  }
+
   const scope =
     spaceKeys.length > 0
       ? `space allowlist: ${spaceKeys.join(", ")}`

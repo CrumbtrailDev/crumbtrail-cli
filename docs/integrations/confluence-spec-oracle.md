@@ -55,10 +55,15 @@ read access to the spaces you want searched. Never commit it, and never pass it
 as a tool argument — it is read exclusively from the environment, at the
 boundary.
 
-The oracle is configured **iff all three required variables are set to non-empty
+The oracle is configured **iff all three required variables are set to nonempty
 strings**. A partial configuration is treated as not configured — it produces a
 gap, never an error. Authentication is HTTP Basic (`email:token`, base64), and
 every outbound request carries the shared `CRUMBTRAIL_USER_AGENT`.
+
+When `CONFLUENCE_SPACE_KEYS` is set, every key must be alphanumeric or use an
+underscore. A malformed, empty, or overlong configured allowlist disables
+lookups until it is corrected. This fails closed, so a typo cannot broaden a
+search to every readable space.
 
 Confluence being unconfigured is a fully supported state. It disables the
 `searchSpecs` lookup and nothing else.
@@ -103,7 +108,7 @@ will not be found. That is a known limit of this slice, not a bug.
 | Limit | Value |
 |---|---|
 | Query length | 512 **code points** (sliced by code point, not UTF-16 code unit) |
-| Space keys accepted | 50 maximum; malformed keys dropped |
+| Space keys accepted | 50 maximum; malformed caller keys are dropped |
 | Results per call | `limit` clamped to 1..15; defaults to 5 |
 | Per-request timeout | `DEFAULT_SOURCE_TIMEOUT_MS` (10s) |
 | Excerpt size | 2000 UTF-8 **bytes** per excerpt |

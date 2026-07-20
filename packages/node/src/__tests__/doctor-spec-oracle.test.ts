@@ -83,6 +83,36 @@ describe("checkSpecOracle — warn branch", () => {
   it("does not warn merely because the optional space allowlist is unset", () => {
     expect(checkSpecOracle(configured()).status).toBe("pass");
   });
+
+  it.each(["", " , , ", "BAD!"])(
+    "warns when a configured allowlist has no valid keys (%j)",
+    (spaceKeys) => {
+      const check = checkSpecOracle({
+        ...configured(),
+        [CONFLUENCE_SPACE_KEYS_ENV]: spaceKeys,
+      });
+
+      expect(check.status).toBe("warn");
+      expect(check.detail).toContain(CONFLUENCE_SPACE_KEYS_ENV);
+      expect(check.detail).not.toContain("all readable spaces");
+      expect(check.remediation).toContain("alphanumeric or underscore");
+      expect(emitted(check)).not.toContain("confluence-token");
+    },
+  );
+
+  it("warns when a configured allowlist mixes valid and malformed keys", () => {
+    const check = checkSpecOracle({
+      ...configured(),
+      [CONFLUENCE_SPACE_KEYS_ENV]: "ENG,BAD!",
+    });
+
+    expect(check.status).toBe("warn");
+    expect(check.detail).toContain(CONFLUENCE_SPACE_KEYS_ENV);
+    expect(check.detail).not.toContain("space allowlist: ENG");
+    expect(check.detail).not.toContain("all readable spaces");
+    expect(check.remediation).toContain("alphanumeric or underscore");
+    expect(emitted(check)).not.toContain("BAD!");
+  });
 });
 
 describe("checkSpecOracle — pass branch", () => {
