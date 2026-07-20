@@ -75,7 +75,10 @@ describe("detect", () => {
   });
 
   it("matches fixture detection with localFsReader and memoryReader", () => {
-    const fixture = path.resolve("../../test-fixtures/installers/vite-react");
+    const fixture = path.resolve(
+      __dirname,
+      "../../../../test-fixtures/installers/vite-react",
+    );
     const files: Record<string, string> = {};
     const collect = (dir: string) => {
       for (const entry of readdirSync(dir)) {
