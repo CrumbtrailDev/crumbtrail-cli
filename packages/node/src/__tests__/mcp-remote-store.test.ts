@@ -78,6 +78,7 @@ interface MockCloudOptions {
   artifactResponse?: ArtifactResponseMode;
   artifactFraming?: ArtifactFraming;
   headSupport?: HeadSupport;
+  artifactHandoff?: boolean;
 }
 
 const SESSION_ID = "sess_fixture";
@@ -146,6 +147,7 @@ function startMockCloud({
   artifactResponse = "normal",
   artifactFraming = "chunked",
   headSupport = "head",
+  artifactHandoff = false,
 }: MockCloudOptions = {}): Promise<MockCloud> {
   const requests: MockRequest[] = [];
   const sockets = new Set<Socket>();
@@ -223,9 +225,7 @@ function startMockCloud({
       return;
     }
 
-    const prefix = `/api/agent/sessions/${SESSION_ID}/artifacts/`;
-    if (url.pathname.startsWith(prefix)) {
-      const name = decodeURIComponent(url.pathname.slice(prefix.length));
+    const artifactResponseFor = (name: string): void => {
       if (artifactResponse === "unauthorized") {
         res.writeHead(401);
         res.end();
@@ -266,6 +266,37 @@ function startMockCloud({
           : {}),
       });
       res.end(artifact);
+    };
+
+    const edgePrefix = "/edge/artifacts/";
+    if (url.pathname.startsWith(edgePrefix)) {
+      if (req.headers.authorization !== "Bearer edge-short-lived-grant") {
+        res.writeHead(401);
+        res.end();
+        return;
+      }
+      artifactResponseFor(decodeURIComponent(url.pathname.slice(edgePrefix.length)));
+      return;
+    }
+
+    const prefix = `/api/agent/sessions/${SESSION_ID}/artifacts/`;
+    if (url.pathname.startsWith(prefix)) {
+      const name = decodeURIComponent(url.pathname.slice(prefix.length));
+      if (artifactHandoff && artifacts[name] !== undefined) {
+        const body = JSON.stringify({
+          handoff: "artifact.v2",
+          url: `http://${req.headers.host}/edge/artifacts/${encodeURIComponent(name)}`,
+          authorization: "Bearer edge-short-lived-grant",
+        });
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          "x-crumbtrail-artifact-read": "direct",
+        });
+        res.end(req.method === "HEAD" ? undefined : body);
+        return;
+      }
+      artifactResponseFor(name);
       return;
     }
 
@@ -512,6 +543,34 @@ describe("MCP remote read store", () => {
       String(Buffer.byteLength(artifacts["index.json"])),
     );
     await declared.text();
+  });
+
+  it("follows an agent artifact handoff to the edge with a header credential", async () => {
+    mock = await startMockCloud({
+      artifactFraming: "content-length",
+      artifactHandoff: true,
+    });
+    const store = new RemoteMcpReadStore({ baseUrl: mock.baseUrl, token: TOKEN });
+
+    await expect(store.readArtifact(SESSION_ID, "index.json")).resolves.toEqual(
+      Buffer.from(artifacts["index.json"]),
+    );
+    await expect(store.statArtifact(SESSION_ID, "index.json")).resolves.toEqual({
+      bytes: Buffer.byteLength(artifacts["index.json"]),
+      isDir: false,
+    });
+
+    const cloudCalls = mock.requests.filter((request) =>
+      request.path === `/api/agent/sessions/${SESSION_ID}/artifacts/index.json`,
+    );
+    expect(cloudCalls.map((request) => request.method)).toEqual(["GET", "HEAD", "GET"]);
+    expect(cloudCalls.every((request) => request.authorization === `Bearer ${TOKEN}`)).toBe(true);
+    const edgeCalls = mock.requests.filter((request) => request.path === "/edge/artifacts/index.json");
+    expect(edgeCalls).toEqual([
+      expect.objectContaining({ method: "GET", authorization: "Bearer edge-short-lived-grant" }),
+      expect.objectContaining({ method: "HEAD", authorization: "Bearer edge-short-lived-grant" }),
+    ]);
+    expect(edgeCalls.every((request) => !request.path.includes("grant="))).toBe(true);
   });
 
   it("stats an artifact with a single HEAD when the endpoint declares Content-Length", async () => {
