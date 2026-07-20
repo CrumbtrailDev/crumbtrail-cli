@@ -32,7 +32,7 @@
  * Hard cap on the sanitized free-text term. Long queries do not improve keyword
  * matching and an unbounded term lets a caller inflate the request URL.
  */
-const MAX_QUERY_LENGTH = 512;
+export const MAX_QUERY_LENGTH = 512;
 
 /** Hard cap on distinct space keys in the allowlist clause. */
 const MAX_SPACE_KEYS = 50;
@@ -103,14 +103,27 @@ const SPACE_KEY_PATTERN = /^[A-Za-z0-9_]+$/;
  * rather than as a match-everything query.
  */
 export function sanitizeCqlText(raw: string): string {
-  const collapsed = raw
+  return Array.from(collapseCqlText(raw))
+    .slice(0, MAX_QUERY_LENGTH)
+    .join("")
+    .trim();
+}
+
+/**
+ * The removal + collapse half of {@link sanitizeCqlText}, WITHOUT the length
+ * cap. Split out so {@link describeCqlInputLoss} can measure exactly how much
+ * the cap dropped instead of inferring it from the capped output — a capped
+ * result is not distinguishable from a naturally-512-code-point one by length
+ * alone, because the trailing `.trim()` can pull it back under the cap.
+ */
+function collapseCqlText(raw: string): string {
+  return raw
     .normalize("NFKC")
     .replace(QUOTE_LOOKALIKES, "")
     .replace(CQL_STRUCTURAL, "")
     .replace(CONTROL_CHARS, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return Array.from(collapsed).slice(0, MAX_QUERY_LENGTH).join("").trim();
 }
 
 /**
@@ -182,5 +195,49 @@ export function buildSpecSearchCql(input: SpecCqlInput): SpecCqlResult {
     cql: `${clauses.join(" AND ")} ORDER BY lastModified DESC`,
     sanitizedQuery,
     spaceKeys,
+  };
+}
+
+/**
+ * How much of the caller's input the caps in this module silently discarded.
+ *
+ * Reported as a separate pure query rather than as extra fields on
+ * {@link SpecCqlResult} so the builder's result shape stays exactly what CP1
+ * published. The Confluence client calls this and turns a non-zero loss into an
+ * informational gap, mirroring `buildSentryQuery`, which emits an
+ * `EvidenceGap` whenever a requested join key is dropped. Silent truncation in
+ * a surface whose contract is "always report what you could not do" is a lie by
+ * omission — a caller whose 900-character query was clipped to 512 otherwise
+ * has no way to know why the match looks wrong.
+ */
+export interface CqlInputLoss {
+  /** True when {@link MAX_QUERY_LENGTH} actually discarded code points. */
+  queryTruncated: boolean;
+  /**
+   * Count of distinct requested space keys that did not survive — either
+   * malformed under {@link SPACE_KEY_PATTERN} or past {@link MAX_SPACE_KEYS}.
+   */
+  droppedSpaceKeys: number;
+}
+
+/**
+ * Measure what {@link buildSpecSearchCql} would drop from this input. Pure, and
+ * exact rather than inferred: the query side compares the uncapped collapsed
+ * form against the cap, and the space-key side compares distinct non-empty
+ * requested keys against the survivors.
+ */
+export function describeCqlInputLoss(input: SpecCqlInput): CqlInputLoss {
+  const collapsed = Array.from(collapseCqlText(input.query ?? ""));
+  const requested = new Set(
+    (input.spaceKeys ?? [])
+      .map((k) => (typeof k === "string" ? k.trim() : ""))
+      .filter((k) => k.length > 0),
+  );
+  return {
+    queryTruncated: collapsed.length > MAX_QUERY_LENGTH,
+    droppedSpaceKeys: Math.max(
+      0,
+      requested.size - sanitizeSpaceKeys(input.spaceKeys ?? []).length,
+    ),
   };
 }
