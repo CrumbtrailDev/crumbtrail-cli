@@ -466,6 +466,8 @@ export function buildEvidenceCandidates(
   const mutatingRequests = collectMutatingRequests(events);
   addDbDeltaMismatchCandidates(events, index, drafts, mutatingRequests);
   addIneffectiveInputCandidates(events, index, drafts, mutatingRequests);
+  addUiArithmeticMismatchCandidates(events, index, drafts);
+  addUiApiDivergenceCandidates(events, index, drafts);
   addOtelDbActivityCandidates(events, index, drafts);
 
   // Downrank known third-party analytics/ads beacon failures before dedupe/ranking so a blocked
@@ -1598,6 +1600,30 @@ function collectFieldEntries(
   return out;
 }
 
+/**
+ * Collects numeric [fieldName, value] entries from a parsed JSON body,
+ * placeholder-opaque like collectFieldEntries but PRESERVING the original
+ * casing so camelCase names ("totalItems") still stem correctly ("total").
+ */
+function collectNumericFieldEntries(
+  value: unknown,
+  out: Array<[string, number]> = [],
+  depth = 0,
+): Array<[string, number]> {
+  if (depth > MAX_BODY_SCOPE_DEPTH) return out;
+  if (Array.isArray(value)) {
+    for (const item of value) collectNumericFieldEntries(item, out, depth + 1);
+    return out;
+  }
+  if (!isRecord(value) || isRedactedPlaceholder(value)) return out;
+  for (const [name, inner] of Object.entries(value)) {
+    const num = toFiniteNumber(inner);
+    if (num !== undefined) out.push([name, num]);
+    else collectNumericFieldEntries(inner, out, depth + 1);
+  }
+  return out;
+}
+
 function isZeroOrEmpty(value: unknown): boolean {
   if (value === null || value === false) return true;
   if (typeof value === "number") return value === 0;
@@ -1700,6 +1726,286 @@ function addIneffectiveInputCandidates(
   const emitted = [...byField.values()]
     .sort((a, b) => a.anchor.t - b.anchor.t)
     .slice(0, MAX_INEFFECTIVE_INPUT_CANDIDATES);
+  drafts.push(...emitted);
+}
+
+// ─── Pillar C display detectors (ui_arithmetic_mismatch / ui_api_divergence) ───
+//
+// Both operate on `ui.num` snapshots ({region, items:[{label, value, unit?}]})
+// emitted by the browser ui-numbers collector. Same deny-biased posture as
+// Pillar A: redacted labels, ambiguous roles, and conflicting response fields
+// silence the detector rather than guess.
+
+const MAX_UI_API_DIVERGENCE_CANDIDATES = 3;
+/** One cent: the display tolerance unit for on-screen currency comparisons. */
+const UI_CENT_EPSILON = 0.01;
+/** Absorbs binary-float artifacts on exact-boundary comparisons. */
+const UI_FLOAT_SLACK = 1e-9;
+const SUBTOTAL_LABEL_RE = /sub[\s_-]?total/i;
+const TOTAL_LABEL_RE = /\btotal\b/i;
+/** Count-style labels ("Total items", "Item count", "Qty") are counts, never currency totals. */
+const COUNT_LABEL_RE = /\b(items?|counts?|qty|quantity|units?)\b/i;
+type UiComponentRole = "subtotal" | "tax" | "fee" | "shipping" | "discount";
+const UI_COMPONENT_ROLES: ReadonlyArray<[UiComponentRole, RegExp]> = [
+  ["subtotal", SUBTOTAL_LABEL_RE],
+  ["tax", /\btax(es)?\b/i],
+  ["fee", /\bfees?\b/i],
+  ["shipping", /\bshipping\b/i],
+  ["discount", /\bdiscount\b/i],
+];
+
+interface UiNumItem {
+  label: string;
+  value: number;
+  unit?: string;
+}
+
+/** Extracts well-formed {label, value, unit?} items from a ui.num snapshot; malformed entries are dropped. */
+function uiNumItems(event: BugEvent): UiNumItem[] {
+  const items = event.d.items;
+  if (!Array.isArray(items)) return [];
+  const out: UiNumItem[] = [];
+  for (const item of items) {
+    if (!isRecord(item)) continue;
+    const label = safeText(item.label, 120);
+    const value = finiteNumber(item.value);
+    if (label === undefined || value === undefined) continue;
+    const unit = safeText(item.unit, 20);
+    out.push(unit === undefined ? { label, value } : { label, value, unit });
+  }
+  return out;
+}
+
+/**
+ * Maps a display label to its arithmetic role. Component patterns are checked
+ * before the bare total pattern so "Subtotal"/"Sub Total" never reads as a
+ * total and qualified totals like "Total tax"/"Total fees"/"Total discount"
+ * classify as the component they name, not as THE total. Count-style total
+ * labels ("Total items") are counts, not totals → no role.
+ */
+function uiLabelRole(label: string): UiComponentRole | "total" | undefined {
+  for (const [role, pattern] of UI_COMPONENT_ROLES) {
+    if (pattern.test(label)) return role;
+  }
+  if (TOTAL_LABEL_RE.test(label)) {
+    if (COUNT_LABEL_RE.test(label)) return undefined;
+    return "total";
+  }
+  return undefined;
+}
+
+function formatCents(value: number): string {
+  return (Math.round(value * 100) / 100).toFixed(2);
+}
+
+/**
+ * C1 (P3): within one ui.num snapshot the labeled component amounts
+ * (subtotal/tax/fee/shipping, minus discount) disagree with the labeled total
+ * beyond ε = 1 cent per component. Arithmetic either holds or it doesn't →
+ * confidence high, uncapped. Silent on redacted labels, ambiguous roles
+ * (no total, multiple totals, or no components), and unit disagreement.
+ * qty×price vs line total deferred — ui.num items carry no per-line pairing;
+ * regression #26 needs component-vs-total only.
+ */
+function addUiArithmeticMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (event.k !== "ui.num") continue;
+    const items = uiNumItems(event);
+    if (items.length === 0) continue;
+    if (items.some((item) => item.label.includes("[REDACTED]"))) continue;
+    const region = safeText(event.d.region, 200) ?? "unknown region";
+
+    const totals: UiNumItem[] = [];
+    const components: Array<UiNumItem & { role: UiComponentRole }> = [];
+    for (const item of items) {
+      const role = uiLabelRole(item.label);
+      if (role === "total") totals.push(item);
+      else if (role !== undefined) components.push({ ...item, role });
+    }
+    // Ambiguous roles → silent: exactly one total and at least one component required.
+    if (totals.length !== 1 || components.length === 0) continue;
+    const total = totals[0];
+    // When units are present they must agree: a count total vs $ components
+    // (or any mixed units among total+components) is not an arithmetic claim.
+    const units = new Set(
+      [total, ...components]
+        .map((item) => item.unit?.trim().toLowerCase())
+        .filter((unit): unit is string => unit !== undefined && unit !== ""),
+    );
+    if (units.size > 1) continue;
+    // Discounts are displayed either as positive amounts ("Discount 20") or
+    // already-negated ("Discount −20"); subtract the magnitude either way.
+    const sum = components.reduce(
+      (acc, item) =>
+        acc + (item.role === "discount" ? -Math.abs(item.value) : item.value),
+      0,
+    );
+    const epsilon = UI_CENT_EPSILON * components.length;
+    if (Math.abs(sum - total.value) <= epsilon + UI_FLOAT_SLACK) continue;
+
+    // Evidence: the snapshot items verbatim (labels already passed the capture-side classifier).
+    const itemsText = items
+      .map((item) => `${item.label}:${item.value}`)
+      .join(", ");
+    drafts.push({
+      detector: "ui_arithmetic_mismatch",
+      title: `UI arithmetic mismatch in ${region}: components sum to ${formatCents(sum)} but ${total.label} shows ${formatCents(total.value)}`,
+      severity: "medium",
+      score: 60,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        message: scrubText(itemsText, 220),
+      }),
+      // Region + the two mismatch amounts: re-emits of the same broken region collapse.
+      dedupeKey: `uiarith:${region}:${formatCents(sum)}:${formatCents(total.value)}`,
+    });
+  }
+}
+
+/** Normalizes a label/field name for exact matching: lowercase, separators stripped. */
+function normalizeFieldName(name: string): string {
+  return name.toLowerCase().replace(/[\s_-]+/g, "");
+}
+
+const COUNT_SUFFIX_RE = /^(items?|counts?|qty|nums?|numbers?)\b/i;
+
+/**
+ * Resolves which response-field entries a UI label compares against. Exact
+ * case-normalized full-name matches win; the stem fallback applies only when
+ * exactly one distinct same-stem field name exists AND that name does not
+ * continue with a count-like suffix ("totalItems"/"totalCount" are counts,
+ * not the on-screen amount).
+ */
+function resolveDivergenceMatches(
+  label: string,
+  stem: string,
+  entries: Array<{ name: string; value: number; requestId?: string }>,
+): Array<{ name: string; value: number; requestId?: string }> | undefined {
+  const target = normalizeFieldName(label);
+  const exact = entries.filter(
+    (entry) => normalizeFieldName(entry.name) === target,
+  );
+  if (exact.length > 0) return exact;
+  const stemMatches = entries.filter(
+    (entry) => stemFieldName(entry.name) === stem,
+  );
+  if (stemMatches.length === 0) return undefined;
+  const distinctNames = new Set(
+    stemMatches.map((entry) => normalizeFieldName(entry.name)),
+  );
+  if (distinctNames.size !== 1) return undefined;
+  const suffix = stemMatches[0].name
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(" ")
+    .filter(Boolean)
+    .slice(1)
+    .join(" ");
+  if (suffix && COUNT_SUFFIX_RE.test(suffix)) return undefined;
+  return stemMatches;
+}
+
+/**
+ * C2: a labeled on-screen number differs by more than one cent from a
+ * matching numeric field in a net.res body received since the last
+ * navigation. Exact (case-normalized) field-name matches are preferred; a
+ * stem match is a fallback only when it is unambiguous and not count-like.
+ * Silent when no response body parses, the label is redacted, or multiple
+ * candidate response fields conflict. Confidence medium, capped at 3 per
+ * session, deduped by label stem.
+ */
+function addUiApiDivergenceCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const uiEvents = events.filter((event) => event.k === "ui.num");
+  if (uiEvents.length === 0) return;
+  const responses = events.filter((event) => event.k === "net.res");
+  const navs = index.navs ?? [];
+
+  const byStem = new Map<string, CandidateDraft>();
+  for (const event of uiEvents) {
+    // Only responses received since the last navigation before this snapshot
+    // count. `navs` is assumed sorted ascending by t. A response at the nav
+    // instant belongs to the old page, so the boundary is exclusive (<=).
+    let navBoundary = Number.NEGATIVE_INFINITY;
+    for (const nav of navs) {
+      if (nav.t > event.t) break;
+      navBoundary = nav.t;
+    }
+
+    const fieldEntries: Array<{
+      name: string;
+      value: number;
+      requestId?: string;
+    }> = [];
+    for (const response of responses) {
+      if (response.t <= navBoundary || response.t > event.t) continue;
+      const body = parseStructuredBody(response.d.body);
+      if (body === undefined) continue; // unreadable response → no evidence
+      const requestId = requestIdForEvent(response);
+      for (const [name, value] of collectNumericFieldEntries(body)) {
+        fieldEntries.push(
+          requestId === undefined ? { name, value } : { name, value, requestId },
+        );
+      }
+    }
+    if (fieldEntries.length === 0) continue;
+
+    for (const item of uiNumItems(event)) {
+      if (item.label.includes("[REDACTED]")) continue;
+      const stem = stemFieldName(item.label);
+      if (byStem.has(stem)) continue; // dedupe by label stem, keep the earliest
+      const matches = resolveDivergenceMatches(item.label, stem, fieldEntries);
+      if (!matches || matches.length === 0) continue;
+      // Conflicting candidate response values → ambiguous, stay silent.
+      const apiValue = matches[0].value;
+      if (
+        matches.some(
+          (candidate) =>
+            Math.abs(candidate.value - apiValue) >
+            UI_CENT_EPSILON + UI_FLOAT_SLACK,
+        )
+      )
+        continue;
+      if (Math.abs(item.value - apiValue) <= UI_CENT_EPSILON + UI_FLOAT_SLACK)
+        continue;
+
+      byStem.set(stem, {
+        detector: "ui_api_divergence",
+        title: `UI shows ${item.label} ${formatCents(item.value)} but the API reported ${formatCents(apiValue)}`,
+        severity: "medium",
+        score: 55,
+        confidence: "medium",
+        anchor: removeUndefined({
+          t: event.t,
+          offsetMs:
+            offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+          route: routeAt(index.navs ?? [], event.t),
+          requestId: matches[0].requestId,
+          message: scrubText(
+            `on-screen \`${item.label}\`=${item.value} vs response field stem \`${stem}\`=${apiValue}`,
+            220,
+          ),
+        }),
+        dedupeKey: `uidiverge:${stem}`,
+      });
+    }
+  }
+
+  const emitted = [...byStem.values()]
+    .sort((a, b) => a.anchor.t - b.anchor.t)
+    .slice(0, MAX_UI_API_DIVERGENCE_CANDIDATES);
   drafts.push(...emitted);
 }
 
