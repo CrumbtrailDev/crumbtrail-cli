@@ -2284,6 +2284,11 @@ describe("server evidence artifact routes", () => {
       authHeaders,
     );
 
+    // The provider fetch never resolves, so a finalization that awaited it
+    // would never respond at all. The deadline only needs to be finite to
+    // catch that regression; it is generous so genuine finalization work
+    // under full-suite load never trips it.
+    let deadline: NodeJS.Timeout | undefined;
     const res = await Promise.race([
       request(
         server,
@@ -2292,19 +2297,22 @@ describe("server evidence artifact routes", () => {
         { sessionId: "ses_ai_async" },
         authHeaders,
       ),
-      new Promise<never>((_, reject) =>
-        setTimeout(
+      new Promise<never>((_, reject) => {
+        deadline = setTimeout(
           () =>
             reject(
               new Error("session finalization waited for AI provider work"),
             ),
-          100,
-        ),
-      ),
-    ]);
+          5_000,
+        );
+      }),
+    ]).finally(() => clearTimeout(deadline));
     expect(res.status).toBe(200);
     expect((res.body as any).processed).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    const providerDeadline = Date.now() + 2_000;
+    while (!providerCalled && Date.now() < providerDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
     expect(providerCalled).toBe(true);
   });
 
