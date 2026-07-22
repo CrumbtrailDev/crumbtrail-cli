@@ -1266,7 +1266,7 @@ function addDbDiffCandidates(
   }
 }
 
-// ─── Pillar A invariant detectors (db_delta_mismatch / ineffective_input) ───
+// ─── Cross-plane invariant detectors (payload ↔ db.diff ↔ response) ───
 //
 // Both detectors operate per requestId on the correlated triple
 // net.req ↔ net.res ↔ db.diff[] and are deliberately silent on ANY ambiguity:
@@ -1490,7 +1490,7 @@ function interpretDiffForPk(
 }
 
 /**
- * A1 (P1): payload says "change by qty", the correlated db.diff changed a
+ * db_delta_mismatch: payload says "change by qty", the correlated db.diff changed a
  * single numeric column by a different amount. Exact-pairing only; silent on
  * any ambiguity. Uncapped — exact by construction.
  */
@@ -1542,6 +1542,9 @@ function addDbDeltaMismatchCandidates(
       );
       if (Math.abs(deltaSum - pair.qtySum) <= 1e-9) continue;
       const anchorEvent = matched[0].event;
+      // pkValue comes from a request payload — scrub and length-cap it before
+      // echoing into human-readable draft text (same policy as other drafts).
+      const safePk = scrubText(pkValue, 120) ?? "[REDACTED]";
       drafts.push({
         detector: "db_delta_mismatch",
         title: `DB delta mismatch: payload ${pair.qtyField}=${pair.qtySum} but ${table}.${column} changed by ${deltaSum}`,
@@ -1557,7 +1560,7 @@ function addDbDeltaMismatchCandidates(
           requestId: request.requestId,
           method: request.method,
           url: redactUrl(request.url),
-          message: `payload ${pair.idField}=${pkValue} ${pair.qtyField}=${pair.qtySum} (${pair.lines} line${pair.lines === 1 ? "" : "s"}) vs ${table}.${column} |after−before|=${deltaSum}`,
+          message: `payload ${pair.idField}=${safePk} ${pair.qtyField}=${pair.qtySum} (${pair.lines} line${pair.lines === 1 ? "" : "s"}) vs ${table}.${column} |after−before|=${deltaSum}`,
           source: normalizeDbEngine(anchorEvent.d.engine),
         }),
         dedupeKey: `dbdelta:${request.requestId}:${pkValue}:${table}:${column}`,
@@ -1637,7 +1640,7 @@ function isZeroOrEmpty(value: unknown): boolean {
 }
 
 /**
- * A2 (P2): a user-input-shaped string field was accepted (2xx) but neither the
+ * ineffective_input: a user-input-shaped string field was accepted (2xx) but neither the
  * response body nor any touched db table shows a trace of it. Hint-grade:
  * confidence low, capped at 3 per session, deduped by field name.
  */
@@ -1729,11 +1732,11 @@ function addIneffectiveInputCandidates(
   drafts.push(...emitted);
 }
 
-// ─── Pillar C display detectors (ui_arithmetic_mismatch / ui_api_divergence) ───
+// ─── Display detectors (ui.num snapshots): ui_arithmetic_mismatch / ui_api_divergence ───
 //
 // Both operate on `ui.num` snapshots ({region, items:[{label, value, unit?}]})
-// emitted by the browser ui-numbers collector. Same deny-biased posture as
-// Pillar A: redacted labels, ambiguous roles, and conflicting response fields
+// emitted by the browser ui-numbers collector. Same deny-biased posture as the
+// cross-plane detectors: redacted labels, ambiguous roles, and conflicting response fields
 // silence the detector rather than guess.
 
 const MAX_UI_API_DIVERGENCE_CANDIDATES = 3;
@@ -1799,13 +1802,13 @@ function formatCents(value: number): string {
 }
 
 /**
- * C1 (P3): within one ui.num snapshot the labeled component amounts
+ * ui_arithmetic_mismatch: within one ui.num snapshot the labeled component amounts
  * (subtotal/tax/fee/shipping, minus discount) disagree with the labeled total
  * beyond ε = 1 cent per component. Arithmetic either holds or it doesn't →
  * confidence high, uncapped. Silent on redacted labels, ambiguous roles
  * (no total, multiple totals, or no components), and unit disagreement.
  * qty×price vs line total deferred — ui.num items carry no per-line pairing;
- * regression #26 needs component-vs-total only.
+ * the playground display-total regression only needs component-vs-total.
  */
 function addUiArithmeticMismatchCandidates(
   events: BugEvent[],

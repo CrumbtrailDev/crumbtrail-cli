@@ -1,13 +1,13 @@
 import type { EventBus } from "../event-bus";
 import type { CrumbtrailConfig, CollectorCleanup } from "../types";
 import { UI_NUM_EVENT_KIND } from "../types";
-import { classifyStructuredValue, REDACTED_VALUE } from "../redaction";
+import { classifyStructuredValue } from "../redaction";
 import { buildCaptureGapEvent } from "../capture-gap";
 import { now } from "../utils";
 import { subscribeNavCommit } from "../nav-signal";
 
 /**
- * Pillar C capture: labeled numeric tokens visible on screen, emitted as
+ * Display capture: labeled numeric tokens visible on screen, emitted as
  * compact `ui.num` snapshots so backend detectors can check display arithmetic
  * (subtotal + tax vs total) and UI↔API divergence. No raw DOM/HTML is ever
  * captured — only short labels and parsed numbers.
@@ -51,23 +51,57 @@ export function parseNumericToken(
 }
 
 /**
- * Labels run through the Checkpoint 1 structured-value classifier, but only
+ * Labels run through the structured-value classifier in redaction.ts, but only
  * name/PII-grade findings redact: the classifier's `free_text_value` catch-all
  * was tuned for network body *values*, where any multi-word string is suspect.
  * UI labels are visible-by-design short strings ("Tax (8.25%)"), so free text
  * is normal — only deny-listed names (password/card/email/…) and PII-shaped
  * content (emails, card numbers, JWTs, token-like or high-entropy strings)
- * indicate a label that must not leave the page.
+ * indicate a label that must not leave the page. A deny/PII label drops the
+ * whole item (label AND value): under a sensitive label the number itself is
+ * the sensitive datum, so a `[REDACTED]`+value pair would still leak it.
+ *
+ * Accepted residual risk of the free_text_value carve-out: labels that are
+ * themselves PII but read as ordinary free text — most notably human names in
+ * payroll/CRM-style tables ("Jane Doe  $84,000") — survive capture by design,
+ * because a name is indistinguishable from a benign label here. Mitigations:
+ * add the label to `redaction.denyFields`, use PRESET_LIGHT, or disable this
+ * collector with `collect.uiNumbers: false`.
  */
-function sanitizeLabel(label: string): string {
-  const classification = classifyStructuredValue(label, label);
-  if (
+function isDeniedLabel(label: string, denyFields?: string[]): boolean {
+  const classification = classifyStructuredValue(label, label, denyFields);
+  return (
     classification.action === "redact" &&
     classification.reason !== "free_text_value"
-  ) {
-    return REDACTED_VALUE;
+  );
+}
+
+/**
+ * Value gate for the numeric token's integer-part digit run: a 13–19 digit
+ * Luhn-passing run is a card number rendered on screen, and any run longer
+ * than 16 digits is an absurd-length identifier, not a displayed figure.
+ * Bare 9–11 digit runs (order numbers, tax refs) intentionally pass.
+ */
+function isDeniedNumericValue(value: number): boolean {
+  const digits = String(Math.trunc(Math.abs(value)));
+  if (digits.length > 16) return true;
+  if (digits.length >= 13 && luhnPasses(digits)) return true;
+  return false;
+}
+
+function luhnPasses(digits: string): boolean {
+  let sum = 0;
+  let double = false;
+  for (let i = digits.length - 1; i >= 0; i -= 1) {
+    let digit = digits.charCodeAt(i) - 48;
+    if (double) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+    double = !double;
   }
-  return label;
+  return sum % 10 === 0;
 }
 
 function isHiddenElement(el: Element): boolean {
@@ -228,7 +262,10 @@ function isLeaf(el: Element): boolean {
  * Scan visible text under `root` for labeled numeric tokens, grouped by
  * region. Pure DOM read — no mutation, no HTML capture.
  */
-export function scanUiNumbers(root: Element): Map<string, UiNumItem[]> {
+export function scanUiNumbers(
+  root: Element,
+  denyFields?: string[],
+): Map<string, UiNumItem[]> {
   const regions = new Map<string, UiNumItem[]>();
   const elements = root.querySelectorAll("*");
   for (const el of elements) {
@@ -241,6 +278,10 @@ export function scanUiNumbers(root: Element): Map<string, UiNumItem[]> {
     if (isHiddenElement(el)) continue;
     const label = resolveLabel(el);
     if (!label) continue;
+    // Deny/PII label or PAN-shaped value: drop the item entirely — never a
+    // `[REDACTED]`-labeled value.
+    if (isDeniedLabel(label, denyFields)) continue;
+    if (isDeniedNumericValue(parsed.value)) continue;
 
     const region = regionIdentifier(regionContainer(el, root));
     let items = regions.get(region);
@@ -250,7 +291,7 @@ export function scanUiNumbers(root: Element): Map<string, UiNumItem[]> {
     }
     if (items.length >= UI_NUM_MAX_ITEMS) continue;
     const item: UiNumItem = {
-      label: sanitizeLabel(label),
+      label,
       value: parsed.value,
     };
     if (parsed.unit) item.unit = parsed.unit;
@@ -261,8 +302,9 @@ export function scanUiNumbers(root: Element): Map<string, UiNumItem[]> {
 
 export function uiNumbersCollector(
   bus: EventBus,
-  _config: CrumbtrailConfig,
+  config: CrumbtrailConfig,
 ): CollectorCleanup {
+  const denyFields = config.redaction?.denyFields;
   if (
     typeof document === "undefined" ||
     typeof MutationObserver === "undefined"
@@ -277,7 +319,7 @@ export function uiNumbersCollector(
     let cancelled = false;
     const onReady = (): void => {
       if (cancelled || !document.body) return;
-      started = startUiNumbersCollector(bus);
+      started = startUiNumbersCollector(bus, denyFields);
     };
     document.addEventListener("DOMContentLoaded", onReady, { once: true });
     return () => {
@@ -287,22 +329,25 @@ export function uiNumbersCollector(
     };
   }
 
-  return startUiNumbersCollector(bus);
+  return startUiNumbersCollector(bus, denyFields);
 }
 
-function startUiNumbersCollector(bus: EventBus): CollectorCleanup {
+function startUiNumbersCollector(
+  bus: EventBus,
+  denyFields?: string[],
+): CollectorCleanup {
   let disabled = false;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
   // Previous serialized snapshot per region: emit only on change.
   const lastSnapshot = new Map<string, string>();
   let observer: MutationObserver | undefined;
 
-  // Failure policy (deliberate deviation from the plan's "bug-logger
-  // wrapping" phrasing): the collector self-disables inside its own scan
-  // path and degrades to a single `capture_gap` event, rather than relying
-  // on bug-logger to wrap collector callbacks. Same intent — one broken
-  // collector never breaks the page or the session — but placed here so the
-  // MutationObserver/debounce internals are covered too.
+  // Failure policy: the collector self-disables inside its own scan path and
+  // degrades to a single `capture_gap` event, rather than relying on
+  // bug-logger to wrap collector callbacks — core has no manifest writer for
+  // `degradedCollection` (that field is assembled server-side). One broken
+  // collector never breaks the page or the session, and placing the guard
+  // here covers the MutationObserver/debounce internals too.
   const disable = (error: unknown): void => {
     if (disabled) return;
     disabled = true;
@@ -326,7 +371,7 @@ function startUiNumbersCollector(bus: EventBus): CollectorCleanup {
   const runScan = (): void => {
     if (disabled) return;
     try {
-      const regions = scanUiNumbers(document.body);
+      const regions = scanUiNumbers(document.body, denyFields);
       for (const [region, items] of regions) {
         if (items.length === 0) continue;
         const serialized = JSON.stringify(items);

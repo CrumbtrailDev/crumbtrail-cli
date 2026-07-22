@@ -88,6 +88,7 @@ describe("uiNumbersCollector", () => {
       <dl class="totals">
         <dt>Subtotal</dt><dd>$199.00</dd>
         <dt>Tax (8.25%)</dt><dd>$16.42</dd>
+        <dt>Shipping</dt><dd>$5.00</dd>
         <dt>Total</dt><dd>$199.00</dd>
       </dl>`;
 
@@ -102,6 +103,8 @@ describe("uiNumbersCollector", () => {
       items: [
         { label: "Subtotal", value: 199, unit: "$" },
         { label: "Tax (8.25%)", value: 16.42, unit: "$" },
+        // "Shipping" must survive: `pin` is word-matched, not a substring.
+        { label: "Shipping", value: 5, unit: "$" },
         { label: "Total", value: 199, unit: "$" },
       ],
     });
@@ -151,9 +154,9 @@ describe("uiNumbersCollector", () => {
     expect(items).toHaveLength(UI_NUM_MAX_ITEMS);
   });
 
-  it("redacts PII-named labels while keeping the value", async () => {
+  it("drops items with deny-listed labels entirely (no redacted-label+value pair)", async () => {
     document.body.innerHTML = `
-      <dl class="account">
+      <dl class="totals">
         <dt>Card number</dt><dd>4242</dd>
         <dt>Balance</dt><dd>$50.00</dd>
       </dl>`;
@@ -164,12 +167,64 @@ describe("uiNumbersCollector", () => {
 
     const snapshots = uiNumEvents(events);
     expect(snapshots).toHaveLength(1);
+    // The deny-labeled item is absent — its value (4242) must not survive
+    // under a "[REDACTED]" label.
     expect(snapshots[0].d).toEqual({
-      region: "dl.account",
+      region: "dl.totals",
+      items: [{ label: "Balance", value: 50, unit: "$" }],
+    });
+    expect(JSON.stringify(events)).not.toContain(REDACTED_VALUE);
+    expect(JSON.stringify(events)).not.toContain("4242");
+  });
+
+  it("skips Luhn-passing 13-19 digit values and absurd-length digit runs", async () => {
+    document.body.innerHTML = `
+      <dl class="totals">
+        <dt>Reference</dt><dd>4242424242424242</dd>
+        <dt>Trace</dt><dd>12345678901234567890</dd>
+        <dt>Order number</dt><dd>123456789</dd>
+        <dt>Total</dt><dd>$50.00</dd>
+      </dl>`;
+
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+
+    const snapshots = uiNumEvents(events);
+    expect(snapshots).toHaveLength(1);
+    // The unspaced PAN and the > 16 digit run are dropped; the 9-digit
+    // order number (accepted residual) and the total are kept.
+    expect(snapshots[0].d).toEqual({
+      region: "dl.totals",
       items: [
-        { label: REDACTED_VALUE, value: 4242 },
-        { label: "Balance", value: 50, unit: "$" },
+        { label: "Order number", value: 123456789 },
+        { label: "Total", value: 50, unit: "$" },
       ],
+    });
+  });
+
+  it("drops items whose label matches config redaction.denyFields", async () => {
+    document.body.innerHTML = `
+      <dl class="totals">
+        <dt>Balance</dt><dd>$50.00</dd>
+        <dt>Total</dt><dd>$9.99</dd>
+      </dl>`;
+
+    const events: BugEvent[] = [];
+    const bus = new EventBus();
+    bus.subscribe((batch) => events.push(...batch));
+    const cleanup = uiNumbersCollector(
+      bus,
+      makeConfig({ redaction: { denyFields: ["balance"] } }),
+    );
+    cleanups.push(cleanup);
+    await settle(bus);
+
+    const snapshots = uiNumEvents(events);
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0].d).toEqual({
+      region: "dl.totals",
+      items: [{ label: "Total", value: 9.99, unit: "$" }],
     });
   });
 

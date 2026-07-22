@@ -1429,9 +1429,22 @@ const STRUCTURED_DENY_NAME_TOKENS = [
   "email",
   "phone",
   "address",
+  "iban",
+  "account",
 ];
 
+/**
+ * Short/ambiguous deny tokens matched as whole words (with optional trailing
+ * digits) rather than substrings: `pin` ⊂ "shipping", `pan` ⊂ "company",
+ * `pass` ⊂ "compass", `otp` ⊂ "spanish"-class collisions would otherwise
+ * over-reach into legitimate field names. `pwd2`/`pin2`/`otpCode`/`userPass`
+ * still redact; `shipping`/`company`/`ping` survive.
+ */
+const STRUCTURED_DENY_WORD_RE = /^(?:pwd|pin|pan|otp|pass)\d*$/;
+
 const STRUCTURED_EMAIL_RE = /[^\s@"'<>]+@[^\s@"'<>]+\.[a-z]{2,}/i;
+/** IBAN shape: 2-letter country, 2 check digits, 10–30 alphanumerics. */
+const STRUCTURED_IBAN_RE = /^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/;
 const STRUCTURED_JWT_RE =
   /eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{2,}/;
 const ENUM_LIKE_RE = /^[A-Za-z0-9_-]{1,24}$/;
@@ -1443,6 +1456,15 @@ function compactFieldName(name: string): string {
     .replace(/[^a-z0-9]/g, "");
 }
 
+/** Field name split into words at camelCase/snake/kebab boundaries. */
+function fieldNameWords(name: string): string[] {
+  return name
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
 function isStructuredDenyName(
   name: string | undefined,
   denyFields?: string[],
@@ -1451,6 +1473,8 @@ function isStructuredDenyName(
   if (isSensitiveName(name)) return true;
   const compact = compactFieldName(name);
   if (STRUCTURED_DENY_NAME_TOKENS.some((token) => compact.includes(token)))
+    return true;
+  if (fieldNameWords(name).some((word) => STRUCTURED_DENY_WORD_RE.test(word)))
     return true;
   if (denyFields && denyFields.length > 0) {
     // Same substring-of-compacted-name semantics as the built-in deny tokens:
@@ -1562,9 +1586,15 @@ export function computeRedactedShape(value: unknown): RedactedValueShape {
  * only numbers, booleans, nulls, and short enum-like strings that match no
  * redact rule survive verbatim.
  *
- * @param keyName Owning field name, used by external callers (e.g. CP3
- * detectors) for deny-list checks; the internal walker checks names itself and
- * passes `undefined` here.
+ * Accepted residual: bare 9–11 digit strings under genuinely neutral field
+ * names (order numbers, tax refs) are kept — there is deliberately no blanket
+ * digit-run rule, because that class is dominated by non-sensitive business
+ * identifiers. Sensitive digit runs are caught by name (deny tokens like
+ * ssn/pin/account) or by shape (Luhn card runs, IBANs) instead.
+ *
+ * @param keyName Owning field name, used by external callers (e.g. UI-capture
+ * label classification) for deny-list checks; the internal walker checks names
+ * itself and passes `undefined` here.
  */
 export function classifyStructuredValue(
   value: unknown,
@@ -1606,6 +1636,11 @@ export function classifyStructuredValue(
   // enum-like (≤ 24) and entropy-eligible (≥ 24) — entropy wins.
   if (isHighEntropyString(value))
     return { action: "redact", reason: "high_entropy_value" };
+  // IBANs are enum-shaped (≤ 24 alphanumerics for most countries), so this
+  // check must run before the enum-keep. Whitespace-stripped: display forms
+  // group IBANs in blocks of four ("GB29 NWBK 6016 ...").
+  if (STRUCTURED_IBAN_RE.test(value.replace(/\s+/g, "")))
+    return { action: "redact", reason: "iban_value" };
   if (ENUM_LIKE_RE.test(value)) return { action: "keep" };
   return { action: "redact", reason: "free_text_value" };
 }

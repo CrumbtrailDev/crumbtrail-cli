@@ -79,6 +79,24 @@ describe("buildEvidenceCandidates — db_delta_mismatch", () => {
     expect(cand!.score).toBeGreaterThan(mutation!.score);
   });
 
+  it("scrubs token-like pk values out of the anchor message", () => {
+    const token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEFghiJKLmno";
+    const events: BugEvent[] = [
+      netReq(1000, "r1", { productId: token, qty: 1 }),
+      netRes(1100, "r1", 200),
+      invDiff(1050, "r1", 25, 23, {
+        pk: { id: token },
+        before: { id: token, stock: 25 },
+        after: { id: token, stock: 23 },
+      }),
+    ];
+    const candidates = buildEvidenceCandidates(events, { start: 1000 });
+    const cand = candidates.find((c) => c.detector === "db_delta_mismatch");
+    expect(cand).toBeDefined();
+    expect(cand!.anchor.message).not.toContain(token);
+    expect(cand!.anchor.message).toContain("[REDACTED]");
+  });
+
   it("stays silent when the delta matches the payload qty", () => {
     const events: BugEvent[] = [
       netReq(1000, "r1", { productId: 7, qty: 2 }),

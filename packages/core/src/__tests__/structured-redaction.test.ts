@@ -31,6 +31,13 @@ describe("classifyStructuredValue", () => {
     ["phoneNumber", "555"],
     ["cvv", "123"],
     ["clientSecret", "s"],
+    ["pwd2", "hunter2"],
+    ["pin2", "1234"],
+    ["userPass", "x"],
+    ["otpCode", "123456"],
+    ["iban", "GB29NWBK60161331926819"],
+    ["account", "12345678"],
+    ["panDigits", "x"],
   ])("redacts deny-listed field name %s", (name, value) => {
     expect(classifyStructuredValue(value, name)).toMatchObject({
       action: "redact",
@@ -38,12 +45,39 @@ describe("classifyStructuredValue", () => {
     });
   });
 
+  it.each(["shipping", "company", "ping", "spanish", "compass", "pingCount"])(
+    "keeps field name %s (short deny tokens are word-matched, not substrings)",
+    (name) => {
+      expect(classifyStructuredValue("ok", name)).toEqual({ action: "keep" });
+    },
+  );
+
   it("redacts custom denyFields names", () => {
     expect(classifyStructuredValue("blue", "favColor", ["fav_color"])).toEqual({
       action: "redact",
       reason: "deny_field",
     });
     expect(classifyStructuredValue("blue", "favColor")).toEqual({
+      action: "keep",
+    });
+  });
+
+  it("redacts IBAN-shaped values under neutral names", () => {
+    expect(classifyStructuredValue("GB29NWBK60161331926819", "ref")).toEqual({
+      action: "redact",
+      reason: "iban_value",
+    });
+    // Display form: grouped in blocks of four (whitespace-stripped first).
+    expect(
+      classifyStructuredValue("GB29 NWBK 6016 1331 9268 19", "ref"),
+    ).toEqual({ action: "redact", reason: "iban_value" });
+  });
+
+  it("keeps bare 9-11 digit strings under neutral names (accepted residual)", () => {
+    expect(classifyStructuredValue("123456789", "orderNumber")).toEqual({
+      action: "keep",
+    });
+    expect(classifyStructuredValue("12345678901", "taxRef")).toEqual({
       action: "keep",
     });
   });
@@ -103,6 +137,7 @@ describe("classifyStructuredValue", () => {
     // A 19-digit PAN exceeds Number.MAX_SAFE_INTEGER; JSON.parse rounds it,
     // so the rendered digits usually fail Luhn — but the leading ~16 digits
     // are still real card digits and must be redacted.
+    // eslint-disable-next-line no-loss-of-precision -- imprecision is the point: JSON.parse rounds 19-digit PANs past Luhn validity
     expect(classifyStructuredValue(6212345678901265399)).toMatchObject({
       action: "redact",
       reason: "luhn_value",
