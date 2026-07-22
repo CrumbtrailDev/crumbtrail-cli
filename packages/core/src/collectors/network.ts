@@ -261,6 +261,19 @@ function applyFetchCorrelationHeaders(
   }
 }
 
+/** Structured (v2) body redaction is the default; `redaction.mode: "full"` restores v1. */
+function bodyRedactionOptions(config: CrumbtrailConfig): {
+  mode: "structured" | "full";
+  denyFields?: string[];
+} {
+  return {
+    mode: config.redaction?.mode ?? "structured",
+    ...(config.redaction?.denyFields
+      ? { denyFields: config.redaction.denyFields }
+      : {}),
+  };
+}
+
 function applyBodyResult(
   target: Record<string, unknown>,
   result: BodyRedactionResult,
@@ -329,6 +342,7 @@ function wrapFetch(
         contentType: getHeaderValue(requestHeaders, "content-type"),
         maxLength: config.networkMaxBodySize,
         path: "body",
+        ...bodyRedactionOptions(config),
       });
       applyBodyResult(reqData, bodyResult);
       reqMetadata.push(bodyResult.metadata);
@@ -413,6 +427,7 @@ function wrapFetch(
             contentType,
             maxLength: config.networkMaxBodySize,
             path: "body",
+            ...bodyRedactionOptions(config),
           });
           if (bodyResult.body !== undefined) {
             const ts = String(now());
@@ -633,6 +648,7 @@ function wrapXHR(
         contentType: getHeaderValue(meta.requestHeaders, "content-type"),
         maxLength: config.networkMaxBodySize,
         path: "body",
+        ...bodyRedactionOptions(config),
       });
       applyBodyResult(reqData, bodyResult);
       reqMetadata.push(bodyResult.metadata);
@@ -704,6 +720,7 @@ function wrapXHR(
             contentType,
             maxLength: config.networkMaxBodySize,
             path: "body",
+            ...bodyRedactionOptions(config),
           });
           if (bodyResult.body !== undefined) {
             const ts = String(now());

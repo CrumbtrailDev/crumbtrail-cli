@@ -334,6 +334,20 @@ export interface CrumbtrailConfig {
   networkCaptureHeaders: boolean;
   networkCorrelationHeaders: boolean;
   networkCorrelationAllowedOrigins: string[];
+  /**
+   * Network JSON-body redaction policy.
+   * - `mode: "structured"` (default): JSON bodies ≤ 16 KB keep their structure;
+   *   each value goes through the deny-biased v2 classifier and redacted values
+   *   carry non-recoverable shape metadata. Tagged `crumbtrail.browser-redaction.v2`.
+   * - `mode: "full"`: restores the v1 whole-body behavior exactly.
+   * - `denyFields`: extra field names added to the redaction deny list,
+   *   matched as substrings of the compacted (lowercased, alphanumeric-only)
+   *   field name — same semantics as the built-in deny tokens.
+   */
+  redaction?: {
+    mode?: "structured" | "full";
+    denyFields?: string[];
+  };
 
   // Interaction
   maskInputTypes: string[];
