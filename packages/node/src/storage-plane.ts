@@ -3,7 +3,9 @@ import path from "node:path";
 import * as zlib from "node:zlib";
 import type { BugEvent } from "crumbtrail-core";
 import {
+  BROWSER_REDACTION_POLICY_V2,
   REDACTED_VALUE,
+  redactNetworkTextBody,
   redactTokenLikeString,
   redactUrl,
 } from "crumbtrail-core";
@@ -453,6 +455,15 @@ function sanitizeRecord(
       continue;
     }
     if (
+      key === "body" &&
+      fieldPath === "event.d" &&
+      typeof raw === "string" &&
+      declaresStructuredBodyRedaction(value)
+    ) {
+      out[safeKey] = sanitizeStructuredBody(raw);
+      continue;
+    }
+    if (
       (isSensitiveName(key) && !isSafeMetadataField(key)) ||
       isSensitiveField(childPath) ||
       safeKey === REDACTED_VALUE
@@ -463,6 +474,43 @@ function sanitizeRecord(
     out[safeKey] = sanitizeValue(raw, childPath);
   }
   return out;
+}
+
+/**
+ * A network event body is kept at rest only when the emitting SDK declared
+ * structured (v2) redaction for the event AND the server's own structured
+ * classifier successfully re-processes it. The client declaration is a hint,
+ * never a grant: every value in the body is re-classified here, so a client
+ * that lies about its policy still cannot store secrets. Anything that fails
+ * the re-run (non-JSON, oversized, parse error) collapses to the blanket
+ * REDACTED_VALUE this sanitizer always used.
+ */
+function declaresStructuredBodyRedaction(
+  record: Record<string, unknown>,
+): boolean {
+  const redaction = record.redaction;
+  return (
+    isRecord(redaction) && redaction.policy === BROWSER_REDACTION_POLICY_V2
+  );
+}
+
+function sanitizeStructuredBody(body: string): string {
+  try {
+    const result = redactNetworkTextBody(body, {
+      contentType: "application/json",
+      path: "event.d.body",
+      mode: "structured",
+    });
+    if (
+      typeof result.body === "string" &&
+      result.bodySummary?.reason === "structured_redaction"
+    ) {
+      return result.body;
+    }
+  } catch {
+    /* fall through to blanket redaction */
+  }
+  return REDACTED_VALUE;
 }
 
 function sanitizeKey(key: string, fieldPath: string): string {
