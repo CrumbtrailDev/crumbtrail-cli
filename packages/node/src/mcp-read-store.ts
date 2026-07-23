@@ -150,10 +150,7 @@ export class RemoteMcpReadStore implements McpReadStore {
    */
   private static readonly HEAD_UNSUPPORTED_STATUSES = new Set([404, 405, 501]);
 
-  private artifactPath(
-    sessionId: string,
-    name: string,
-  ): string {
+  private artifactPath(sessionId: string, name: string): string {
     return `/api/agent/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(name)}`;
   }
 
@@ -217,7 +214,10 @@ export class RemoteMcpReadStore implements McpReadStore {
   }
 
   private fetchBody(path: string): Promise<Buffer | undefined>;
-  private fetchBody(path: string, mode: "byteLength"): Promise<number | undefined>;
+  private fetchBody(
+    path: string,
+    mode: "byteLength",
+  ): Promise<number | undefined>;
   private async fetchBody(
     path: string,
     mode: "buffer" | "byteLength" = "buffer",
@@ -306,6 +306,11 @@ export class RemoteMcpReadStore implements McpReadStore {
 export function selectMcpReadStore(outputDir: string): McpReadStore {
   const baseUrl = process.env.CRUMBTRAIL_CLOUD_URL;
   const token = process.env.CRUMBTRAIL_CLOUD_TOKEN;
+  if (Boolean(baseUrl) !== Boolean(token)) {
+    throw new Error(
+      "CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN must be configured together for MCP cloud reads.",
+    );
+  }
   if (baseUrl && token) return new RemoteMcpReadStore({ baseUrl, token });
   return new FilesystemMcpReadStore(outputDir);
 }

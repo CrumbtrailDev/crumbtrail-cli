@@ -74,9 +74,10 @@ describe("McpServer session containment (post SessionStore delegation)", () => {
     expect(JSON.stringify(index)).not.toContain(secret);
 
     const events = await callTool("getEvents", { sessionId: "leaky" });
-    // getEvents returns an empty list (no artifact) rather than the smuggled events.
+    // Missing sessions are explicit rather than indistinguishable from no events.
     expect(JSON.stringify(events)).not.toContain(secret);
-    expect(JSON.parse(events.content[0].text as string)).toEqual([]);
+    expect(events.isError).toBe(true);
+    expect(events.content[0].text).toBe("Session not found");
 
     // The escaping session must not surface through enumeration either.
     const sessions = await callTool("listSessions", {});
