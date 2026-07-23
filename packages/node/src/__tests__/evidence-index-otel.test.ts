@@ -3,7 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { BugEvent } from "crumbtrail-core";
-import { buildEvidenceCandidates, writeEvidenceIndex } from "../evidence-index";
+import {
+  buildEvidenceCandidates,
+  writeEvidenceIndex,
+  DB_WRITE_RANK,
+} from "../evidence-index";
 
 const tmpDirs: string[] = [];
 afterEach(() => {
@@ -135,7 +139,11 @@ describe("buildEvidenceCandidates — OTel sources", () => {
       (candidate) => candidate.detector === "otel_db_activity",
     );
     expect(db).toBeDefined();
-    expect(db?.severity).toBe("high");
+    // The span precedes the error, so request linkage does not apply and it is linked by
+    // proximity — which is the only branch allowed to say "near an error".
+    expect(db?.severity).toBe("medium");
+    expect(db?.score).toBe(DB_WRITE_RANK.LINKED_SCORE);
+    expect(db?.title).toContain("near an error");
     expect(db?.anchor.requestId).toBe("trace-db");
     expect(db?.anchor.source).toContain("statements, not row diffs");
   });

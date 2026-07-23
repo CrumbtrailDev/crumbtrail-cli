@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { BugEvent } from "crumbtrail-core";
-import { buildEvidenceCandidates } from "../evidence-index";
+import { buildEvidenceCandidates, DB_WRITE_RANK } from "../evidence-index";
 
 function dbDiff(
   t: number,
@@ -22,7 +22,7 @@ function dbDiff(
 }
 
 describe("buildEvidenceCandidates — db.diff", () => {
-  it("ranks a db.diff temporally adjacent to an error as high-value evidence", () => {
+  it("ranks a db.diff temporally proximate to an error above a standalone one", () => {
     const events: BugEvent[] = [
       dbDiff(5000, "trace-1"),
       { t: 5200, k: "err", d: { msg: "TypeError: cannot read x" } },
@@ -33,14 +33,15 @@ describe("buildEvidenceCandidates — db.diff", () => {
     });
     const dbCand = candidates.find((c) => c.detector === "db_mutation");
     expect(dbCand).toBeDefined();
-    expect(dbCand!.severity).toBe("high");
-    expect(dbCand!.score).toBe(88);
+    expect(dbCand!.severity).toBe("medium");
+    expect(dbCand!.score).toBe(DB_WRITE_RANK.LINKED_SCORE);
+    expect(dbCand!.title).toContain("near an error");
     expect(dbCand!.anchor.requestId).toBe("trace-1");
     expect(dbCand!.anchor.message).toContain("update");
     expect(dbCand!.anchor.message).toContain("orders");
   });
 
-  it("ranks a db.diff sharing a requestId with a failing backend response as high-value", () => {
+  it("links a db.diff sharing a requestId with a failing backend response, however late", () => {
     const events: BugEvent[] = [
       {
         t: 1000,
@@ -52,7 +53,11 @@ describe("buildEvidenceCandidates — db.diff", () => {
     const candidates = buildEvidenceCandidates(events, { start: 1000 });
     const dbCand = candidates.find((c) => c.detector === "db_mutation");
     expect(dbCand).toBeDefined();
-    expect(dbCand!.severity).toBe("high");
+    expect(dbCand!.severity).toBe("medium");
+    expect(dbCand!.score).toBe(DB_WRITE_RANK.LINKED_SCORE);
+    // 59s away: linked by request membership, so the title must not claim proximity.
+    expect(dbCand!.title).toContain("in the failing request");
+    expect(dbCand!.title).not.toContain("near an error");
     expect(dbCand!.anchor.requestId).toBe("trace-9");
   });
 
@@ -62,7 +67,7 @@ describe("buildEvidenceCandidates — db.diff", () => {
     const dbCand = candidates.find((c) => c.detector === "db_mutation");
     expect(dbCand).toBeDefined();
     expect(dbCand!.severity).toBe("low");
-    expect(dbCand!.score).toBe(40);
+    expect(dbCand!.score).toBe(DB_WRITE_RANK.STANDALONE_SCORE);
     expect(dbCand!.anchor.requestId).toBe("trace-ok");
     // With no error present, the standalone db.diff is the top-ranked candidate.
     expect(candidates[0].detector).toBe("db_mutation");

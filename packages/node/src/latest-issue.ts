@@ -10,8 +10,9 @@ import { defaultSessionStore } from "./session-store";
  *   (`defaultSessionStore.listSessions`).
  * - A session QUALIFIES iff its `index.json` exists (index.json presence IS the
  *   finalize signal) AND it carries error-class evidence: `index.errs`
- *   non-empty, OR `index.failedReqs` non-empty, OR any `candidates.jsonl` row
- *   with severity `"critical"` or `"high"`.
+ *   non-empty, OR `index.failedReqs` non-empty, OR `index.consoleErrors`
+ *   non-empty, OR any `candidates.jsonl` row with severity `"critical"` or
+ *   `"high"`. See `hasErrorClassEvidence` for why those four and not others.
  * - RECENCY is `index.end`, falling back to `index.start`, then `meta.start`,
  *   then 0. Remaining ties break by session id descending, then session dir
  *   descending (plain code-unit comparison — never locale-dependent).
@@ -53,12 +54,43 @@ function beats(
   return candidate.dir > incumbent.dir;
 }
 
+/**
+ * Does this session contain error-class evidence?
+ *
+ * Every clause names evidence that is error-class *on its own terms*. None of them infers "an error
+ * happened" from how some other candidate was ranked:
+ *
+ *  - `index.errs` — uncaught errors and unhandled rejections (`err` / `rej` events).
+ *  - `index.failedReqs` — failed HTTP responses, plus the network failures post-process judged to
+ *    be real failures rather than routine cancellations.
+ *  - `index.consoleErrors` — `con` events the capture already narrowed to level `error`
+ *    (`summarizeConsoleErrorEvent` drops every other level). An application that logged
+ *    `console.error` and nothing else has still reported an error, and nothing above covers it.
+ *  - a `critical`/`high` `candidates.jsonl` row — the detectors that find error-class evidence no
+ *    index array carries at all: backend request errors, OTel span errors, `db_delta_mismatch`.
+ *
+ * `index.networkErrors` is deliberately NOT a clause, and the omission is not an oversight.
+ * post-process pushes *every* `net.err` event into it, then applies `isCountableNetworkFailure` —
+ * which drops `AbortError`, page-probe events and page-world-untrusted events — before pushing the
+ * survivors into `failedReqs`. So every trustworthy network error is already covered by the
+ * `failedReqs` clause, and adding `networkErrors` would widen this gate by exactly the set
+ * post-process decided was not a failure: a fetch the user cancelled by navigating away would make
+ * its session "the latest issue".
+ *
+ * Note what this must not do: rank a candidate up so that the fourth clause fires. Before the db
+ * write ranking was corrected, a console-error-only session qualified only when a database write
+ * happened to sit within two seconds of the console error and was boosted to `high` for it —
+ * qualification turned on an unrelated write's presence rather than on the error. The
+ * `consoleErrors` clause states the evidence directly instead.
+ */
 function hasErrorClassEvidence(
   dir: string,
   index: Record<string, unknown>,
 ): boolean {
   if (Array.isArray(index.errs) && index.errs.length > 0) return true;
   if (Array.isArray(index.failedReqs) && index.failedReqs.length > 0)
+    return true;
+  if (Array.isArray(index.consoleErrors) && index.consoleErrors.length > 0)
     return true;
   return candidateSeverities(dir).some(
     (severity) => severity === "critical" || severity === "high",

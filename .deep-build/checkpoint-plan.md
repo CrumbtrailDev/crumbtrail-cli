@@ -44,10 +44,25 @@ severities, and `distinct-bugs.ts` groups on the result.
 - Delete the superseded binary branching and its dead constants. One canonical implementation.
 - Re-check `DB_DIFF_ADJACENCY_MS` and `collectErrorMoments` for the same over broad match.
 
-**Done when:** the eight same request mutations in `ses_20260723_160942` no longer share one
-severity and score; `ses_20260723_160706` still emits `db_delta_mismatch` high/72 as `cand_0001`
-with `causalRole: root`; no existing detector loses a candidate, proven by a before and after
-candidate set diff across all five sessions; the full gate stays 17/17 and 39/39.
+**Done when:** the unrelated background drain writes in `ses_20260723_160942` are no longer
+promoted to the failing checkout's tier; `ses_20260723_160706` still emits `db_delta_mismatch`
+high/72 as `cand_0001` with `causalRole: root`; no existing detector loses a candidate, proven by
+a before and after candidate set diff across all five sessions; the full gate stays 17/17 and
+39/39.
+
+**Amended after the round 1 review (2026-07-23).** The original criterion read "the eight same
+request mutations in `ses_20260723_160942` no longer share one severity and score". It is
+withdrawn, not met by other means, for two reasons.
+
+1. The count was wrong. The real capture holds six writes in the failing checkout request and
+   three in a later background drain request, not eight in one request.
+2. The criterion asked for discrimination the available evidence cannot support. Inside a single
+   request the error precedes every write, so any temporal or ordinal measure collapses to write
+   order, which application code fixes and which carries no information about culpability. The
+   first implementation did exactly that and ranked the two duplicate `coupon_redemptions` rows,
+   the actual defect, below the innocent `products` update purely because checkout writes coupons
+   last. Writes linked to one failure therefore share one rank on purpose. Discriminating between
+   them needs an observable property of the rows, which is CP3's duplicate write detector.
 
 **Prerequisites:** CP1.
 

@@ -10,16 +10,16 @@ A live probe exercise (2026-07-22, playground `crumbtrail-detection-probe`) plan
 silent bugs — no error, no 4xx/5xx, all flows return 200 OK — and measured what Crumbtrail
 surfaced:
 
-| Probe | Bug | Captured? | Auto-flagged? |
-| --- | --- | --- | --- |
-| P1 | Inventory decremented by `qty + 1` per order | Yes — `db.diff` before/after showed 25→23 for qty 1 | Only as generic low-score `db_mutation` |
-| P2 | Expired coupon silently accepted (200, $0 discount, no redemption row) | Partially — request body was `[REDACTED]`, hiding the coupon input | No — 200 looks normal |
-| P3 | Cart Total renders subtotal, dropping tax (`Total ≠ Subtotal + Tax` in the DOM) | No — pure client render, no fetch/console trace | No |
+| Probe | Bug                                                                             | Captured?                                                          | Auto-flagged?                           |
+| ----- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------ | --------------------------------------- |
+| P1    | Inventory decremented by `qty + 1` per order                                    | Yes — `db.diff` before/after showed 25→23 for qty 1                | Only as generic low-score `db_mutation` |
+| P2    | Expired coupon silently accepted (200, $0 discount, no redemption row)          | Partially — request body was `[REDACTED]`, hiding the coupon input | No — 200 looks normal                   |
+| P3    | Cart Total renders subtotal, dropping tax (`Total ≠ Subtotal + Tax` in the DOM) | No — pure client render, no fetch/console trace                    | No                                      |
 
 Crumbtrail today is an evidence-capture tool with error-shaped heuristics. Its 23 detectors
 (`evidence-index.ts`) fire on errors, failed HTTP, and console noise — not on
 semantically-wrong-but-200 flows. The `db.diff` before/after data is already the strongest
-evidence in the product; it is captured but never *interpreted*.
+evidence in the product; it is captured but never _interpreted_.
 
 ## Goal
 
@@ -60,9 +60,12 @@ For each mutating request (POST/PUT/PATCH/DELETE with ≥1 correlated `db.diff`)
    `op` is `update` with exactly one changed numeric column.
 3. If `|after − before| ≠ qty` → emit signal.
 
-Severity `high`, base score 72 (above generic `db_mutation` 40, at/above `http_error` 70 so
-it leads the ranking). Confidence `high` only when the id match is exact and a single
-numeric column changed; otherwise the detector stays silent — no fuzzy guesses.
+Severity `high`, base score 72. That is above every generic `db_mutation` rank (66 when the
+write is linked to a failure, 40 standalone) and above a 4xx `http_error`'s 70, so it is the
+highest-scored db-plane signal. Score is not list position: see "Ranking database writes
+against errors" below for what actually decides emitted order. Confidence `high` only when
+the id match is exact and a single numeric column changed; otherwise the detector stays
+silent — no fuzzy guesses.
 Evidence attached verbatim: the payload fields, the diff `before`/`after`, the requestId.
 
 Cart-line aggregation rule: when multiple payload lines target the same id, compare the
@@ -79,7 +82,7 @@ of a user-input shape (≤ 64 chars, not id-like, not on the redaction deny-list
    `coupon → discount|redemption|promo`; `search|query → results`; extensible constant).
 3. If the response contains a matching field that is zero/empty/absent AND no touched
    table name matches → emit signal:
-   *"input `couponCode` accepted (200) but produced no observable effect."*
+   _"input `couponCode` accepted (200) but produced no observable effect."_
 
 Severity `medium`, base score 55, confidence `low` — deliberately surfaced-not-buried,
 capped at 3 per session, deduped by field name. This is a hint detector; the evidence
@@ -93,14 +96,14 @@ with structure-preserving redaction for JSON request and response bodies (bounde
 
 Per-value classification, deny-biased:
 
-| Class | Rule | Output |
-| --- | --- | --- |
+| Class         | Rule                                                                                                                                                                                                                                                                   | Output                 |
+| ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
 | Always redact | Field-name deny list (the v1 sensitive-key patterns in `core/src/redaction.ts`, plus `password`, `token`, `secret`, `auth`, `card`, `cvv`, `ssn`, `email`, `phone`, `address`) or value pattern (email regex, Luhn-passing digits, JWT shape, high-entropy ≥ 24 chars) | `"[REDACTED]"` + shape |
-| Keep | Numbers, booleans, nulls; short enum-like strings (≤ 24 chars, single token, alphanumeric/`-_`) not matching any redact rule | verbatim |
-| Unknown | Everything else (long strings, free text) | `"[REDACTED]"` + shape |
+| Keep          | Numbers, booleans, nulls; short enum-like strings (≤ 24 chars, single token, alphanumeric/`-_`) not matching any redact rule                                                                                                                                           | verbatim               |
+| Unknown       | Everything else (long strings, free text)                                                                                                                                                                                                                              | `"[REDACTED]"` + shape |
 
 Shape metadata (for redacted values): `{ len, charset: "alpha"|"num"|"alnum"|"mixed", hash8 }` —
-enough for presence/equality tests without recoverability. Field *names* and JSON structure
+enough for presence/equality tests without recoverability. Field _names_ and JSON structure
 are always preserved.
 
 Config: `redaction: { mode: "structured" | "full", denyFields: string[] }` — `"full"`
@@ -122,10 +125,17 @@ from `dt/dd` pairs, `label`+sibling, `aria-label`, or preceding text node in the
 row/list item. Emit a compact snapshot:
 
 ```json
-{ "k": "ui.num", "d": { "region": "dl.totals", "items": [
-  { "label": "Subtotal", "value": 199.00, "unit": "$" },
-  { "label": "Tax (8.25%)", "value": 16.42, "unit": "$" },
-  { "label": "Total", "value": 199.00, "unit": "$" } ] } }
+{
+  "k": "ui.num",
+  "d": {
+    "region": "dl.totals",
+    "items": [
+      { "label": "Subtotal", "value": 199.0, "unit": "$" },
+      { "label": "Tax (8.25%)", "value": 16.42, "unit": "$" },
+      { "label": "Total", "value": 199.0, "unit": "$" }
+    ]
+  }
+}
 ```
 
 Caps: ≤ 50 tokens per snapshot, ≤ 1 snapshot per region per settle, emit only on change
@@ -151,6 +161,99 @@ redacted, its value kept).
 - Emit-only-on-exact-pairing is the core FP control: every detector stays silent rather
   than guess. Every emitted signal carries the raw evidence pair it was computed from.
 - Per-session caps: A1 uncapped (exact by construction), A2 ≤ 3, C2 ≤ 3, C1 uncapped.
+
+#### Ranking database writes against errors
+
+`db_mutation` (from `db.diff`) and `otel_db_activity` (from OTel db spans) are always emitted —
+they are the subtle data-correctness evidence the logger most wants to catch — so their rank,
+not their presence, is what carries meaning. That rank is decided by each write's own
+relationship to the session's failures (`rankDbWritesAgainstErrors` / `DB_WRITE_RANK` in
+`evidence-index.ts`):
+
+1. **Same request, error at or before the write.** The unit of work failed and this write still
+   landed, so it may be a partial or retried commit. This is the strongest link, and it is
+   unbounded in time: request membership, not elapsed time, is the claim. The two planes key it
+   differently — `db.diff` on `requestId` (one HTTP request), the OTel plane on `traceId`, which
+   can span a long-running job, so the same rule reaches further there.
+2. **Otherwise, within `PROXIMITY_MS` of a failure.** The only route available to a write with no
+   request linkage, such as a background job. `PROXIMITY_MS` is bound by reference to
+   `CAUSAL_RANK_CONSTANTS.MAP_WINDOW_MS` (2s): without a shared request id, a write is only
+   claimed to be near an error inside the same window the causal graph itself will draw an edge
+   across.
+3. **Otherwise standalone**, at score 40 / `low`. Still surfaced, and — absent any error — still
+   ranked first so its evidence window covers the write for fix-context.
+
+Rule 1 depends on the two keys agreeing. `collectErrorMoments` keys an OTel error moment on its
+`traceId`, while `db.diff` writes key on `requestId`; the SDK stamps them identically in the
+captures behind this document, which is why the checkout's writes reach rule 1 at all. Wherever a
+trace id is not the application's request id, that linkage is simply unreachable and those writes
+fall through to the 2 second proximity rule instead.
+
+Every linked write gets the **same** rank: score 66, severity `medium`, confidence `medium`. The
+score sits below `db_delta_mismatch`'s 72 and below a 4xx `http_error`'s 70 on purpose. "A write
+landed in a request that failed" is weaker evidence than the failure itself or than an observed
+data inconsistency: the link says the write is worth reading, not that the write is wrong. It ties
+`backend_http_client_error`'s 66 deliberately: a request the backend answered 4xx makes the same
+kind of claim, and separating the two would assert a difference that is not there. Scores in this
+file are a rank, not an identifier, and are not distinct anyway (`repeated_clicks` alone spans
+58..65, across `console_error`'s 58 and the OTel 60s). Only the linkage _rule_ differs between
+linked writes, and only in the title — rule 2 says "near an error", rule 1 says "in the failing
+request", because rule 1 is unbounded in time and a write a minute away from the failure must not
+claim to be near it.
+
+There is deliberately **no ordering of writes within one failure**. Ordering by temporal distance
+to the error was implemented and then removed: inside a single request the error precedes every
+write, so distance collapses to write order, and write order is an artifact of the application's
+code path rather than evidence about culpability. On the captured retry storm it ranked the two
+duplicate `coupon_redemptions` rows — the actual defect — below the innocent `products` update and
+`orders` insert purely because checkout writes coupons last. Discriminating inside a failure needs
+an observable property of the rows themselves (identical after-images, a delta contradicting the
+payload), which is what the `db.diff` invariant detectors above do.
+
+Table participation in the error path was evaluated as a discriminator and rejected. The error
+evidence available at this point (HTTP spans, console errors, network failures) carries no table
+name, so it could only be matched by guessing a table from a route or a message, which contradicts
+the emit-only-on-exact-pairing posture above.
+
+**One failure is one moment.** A single failure emits several error events milliseconds apart (the
+5xx response, the matching `backend.req.error`, the console error it raises on the client), and
+each is emitted again from the pre-built index arrays. `collectErrorMoments` collapses them:
+events are chained into one moment while consecutive events sit within `PROXIMITY_MS` of each
+other, so a retry burst is one failure rather than several. Chaining on a shared request id was
+considered and rejected — two failures of one request a minute apart would merge into a moment
+spanning that minute, and every unrelated write in between would silently become "near an error".
+Chaining only on `PROXIMITY_MS` adjacency keeps every internal gap at or below the window, which
+makes distance-to-span and distance-to-nearest-event agree, so the collapse changes the moment
+model without widening what links. Under a uniform linked rank the collapse changes no emitted
+score today; it exists so that "error moment" means "failure", which is what any per-failure count
+or budget will need.
+
+**Rank is not a stand-in for "an error happened".** `resolveLatestIssue` (behind the
+`getLatestIssue` MCP tool and `fix-context --latest`) qualifies a session on error-class evidence,
+one clause of which is a `critical`/`high` candidate row. Under the old binary boost, a session
+whose only error signal was a console error qualified through that clause: a database write within
+five seconds was lifted to `high`, and the gate read the write's rank as proof of the error. Ranking
+that write honestly removed the proxy, so `hasErrorClassEvidence` now tests for the evidence
+directly and counts `index.consoleErrors` — errors the capture already narrowed to level `error` —
+as its own clause. `index.networkErrors` is deliberately not a clause: post-process records every
+`net.err` there, then keeps only the ones `isCountableNetworkFailure` accepts in `failedReqs`, so
+the trustworthy network errors already qualify and adding the array back would qualify a session on
+a fetch the user cancelled by navigating away. Detector ranks are evidence weight; they are not a
+place for another surface to read a boolean out of.
+
+**Score is not list position.** `buildCausalGraph` runs unconditionally in the shipped finalize
+path, so `applyCausalRerank` almost always applies, and its first sort key is a causal tier, not
+score: roots and isolated candidates are ordered ahead of every high/medium-confidence symptom
+before score is consulted. A standalone `low`/40 write that the graph called a root therefore
+lists above a `medium`/66 write it called a symptom. That is a known limitation of the emitted
+ordering, not of this rule; the ranks above decide relative weight, and MCP consumers should
+compare rank, not list index.
+
+This rule replaces an earlier binary boost that lifted a write to `high`/88 whenever any error
+shared its request id or fell inside a wide ±5s window. On a real captured retry storm
+(`ses_20260723_160942_5cb9d594a635`) that lifted an unrelated background job drain ~2.9s later to
+the same `high`/88 tier as the failing checkout's own writes, on the time window alone. Under the
+rule above the checkout's six writes are all `medium`/66 and the drain's three return to `low`/40.
 
 ## Data flow (end to end)
 

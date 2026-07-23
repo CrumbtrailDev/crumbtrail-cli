@@ -8,7 +8,11 @@ import { resolveLatestIssue } from "../latest-issue";
  * Pins the shared latest-issue definition (backing BOTH the getLatestIssue MCP
  * tool and the `fix-context --latest` CLI flag):
  * - qualifies iff index.json exists (finalize signal) AND errs non-empty OR
- *   failedReqs non-empty OR any candidates.jsonl row with severity critical/high
+ *   failedReqs non-empty OR consoleErrors non-empty OR any candidates.jsonl row
+ *   with severity critical/high
+ * - index.networkErrors is deliberately not a clause: post-process pushes every
+ *   net.err into it, and the ones it judged to be real failures are already in
+ *   failedReqs
  * - recency = index.end, fallback index.start, then meta.start; ties -> session
  *   id descending
  * - hot-plane reads only (never events.ndjson)
@@ -109,6 +113,70 @@ describe("resolveLatestIssue", () => {
       sessionId: "ses_failed",
       dir,
     });
+  });
+
+  it("qualifies via index.consoleErrors non-empty, with no err and no failed request", () => {
+    // Real reproduction, artifacts shaped exactly as postProcess writes them for a session that
+    // navigates, logs one console.error, and makes one database write:
+    //   nav -> con(level "error") at +1000ms -> db.diff at +1500ms
+    // No `err`/`rej` event and no failed request, so the first two clauses are silent, and the
+    // db write ranks medium/66 (linked to the console error but not proof the write is wrong), so
+    // the critical/high candidate clause is silent too. The console error is the error-class
+    // evidence, and it must qualify the session on its own.
+    const dir = seed("ses_console_only", {
+      index: {
+        start: 1784837000000,
+        end: 1784837002000,
+        consoleErrors: [
+          {
+            t: 1784837001000,
+            offsetMs: 1000,
+            lv: "err",
+            msg: "checkout failed: coupon already redeemed",
+          },
+        ],
+      },
+      candidates: [
+        {
+          id: "cand_0001",
+          detector: "db_mutation",
+          severity: "medium",
+          score: 66,
+        },
+        {
+          id: "cand_0002",
+          detector: "console_error",
+          severity: "medium",
+          score: 58,
+        },
+      ],
+    });
+    expect(resolveLatestIssue({ outputDir: tmpDir })).toEqual({
+      sessionId: "ses_console_only",
+      dir,
+    });
+  });
+
+  it("does not qualify on index.networkErrors alone", () => {
+    // post-process pushes every net.err into networkErrors, then keeps only the ones
+    // isCountableNetworkFailure accepts — an AbortError from a fetch the user cancelled by
+    // navigating away is recorded but is not a failure, so failedReqs stays empty. Recording the
+    // exclusion: the trustworthy network errors already qualify through failedReqs.
+    seed("ses_aborted_fetch", {
+      index: {
+        end: 5000,
+        networkErrors: [
+          {
+            t: 4000,
+            m: "GET",
+            url: "/api/cart",
+            msg: "The user aborted a request.",
+          },
+        ],
+      },
+      candidates: [{ id: "cand_0001", severity: "low" }],
+    });
+    expect(resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
   });
 
   it.each(["critical", "high"] as const)(

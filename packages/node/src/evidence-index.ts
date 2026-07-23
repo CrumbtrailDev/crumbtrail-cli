@@ -1150,18 +1150,214 @@ function addOtelErrorCandidates(
   }
 }
 
-const DB_DIFF_ADJACENCY_MS = 5_000;
+/**
+ * Ranking constants for database writes (db.diff rows and OTel db spans) relative to the errors
+ * around them.
+ *
+ * The rule these serve replaces an earlier binary boost that promoted a write to high/88 whenever
+ * *any* error shared its requestId or fell inside a wide ±5s window. Membership, not relationship,
+ * decided the rank, so an unrelated background job drain 3s after a checkout failure was lifted to
+ * the same tier as the checkout's own writes.
+ *
+ *  - PROXIMITY_MS: how far a write may sit from an error and still claim a *cross request* link.
+ *    Bound to `CAUSAL_RANK_CONSTANTS.MAP_WINDOW_MS` by reference, not by a restated literal:
+ *    without a shared request id, a write is only claimed to be near an error inside the same
+ *    window the causal graph itself is willing to draw an edge across. Anything further apart is
+ *    ranked as a standalone write.
+ *  - LINKED_SCORE: every write linked to a failure gets this one score. It is deliberately below
+ *    `http_error`'s 4xx 70 and below `db_delta_mismatch`'s 72, because "a write landed in a request
+ *    that failed" is weaker evidence than either the failure itself or an observed data
+ *    inconsistency: the link says the write is worth reading, not that the write is wrong. It sits
+ *    well above STANDALONE_SCORE so the linked set is still clearly separated.
+ *  - STANDALONE_SCORE: a write with no error link is still surfaced (db.diffs are the subtle
+ *    data-correctness evidence a logger most wants to catch) at a score low enough that it never
+ *    buries a real error, and — absent any error — still becomes ranked[0] so its evidence window
+ *    covers the write for fix-context.
+ *
+ * There is deliberately no per-write discrimination *within* one failure. Inside a single request
+ * the error precedes every write, so any distance-based ordering collapses to write order, which is
+ * fixed by application code and says nothing about which write is culpable. Ranking on it buries the
+ * real defect whenever the application happens to write it late. Discriminating between the writes
+ * of one failing request needs an observable property of the rows themselves (identical after-images,
+ * a delta that contradicts the payload), which is what the `db.diff` invariant detectors do.
+ */
+export const DB_WRITE_RANK = {
+  PROXIMITY_MS: CAUSAL_RANK_CONSTANTS.MAP_WINDOW_MS,
+  LINKED_SCORE: 66,
+  STANDALONE_SCORE: 40,
+} as const;
 
+/**
+ * One logical failure: the burst of error events a single failure emitted, collapsed into one
+ * moment.
+ *
+ * A single failure routinely emits several error events — a 5xx `net.res`, the matching
+ * `backend.req.error`, the client-side `con` error it triggers — and `collectErrorMoments` then
+ * emits each of them again from the pre-built index arrays. Left uncollapsed, "error moment" means
+ * "error event", and any rule that counts or budgets per moment counts one failure several times.
+ */
 interface ErrorMoment {
-  t: number;
-  requestId?: string;
+  /** First error event in the burst. */
+  readonly start: number;
+  /** Last error event in the burst. */
+  readonly end: number;
+  /** Earliest time at which each request id failed inside this burst. */
+  readonly requestFirstT: ReadonlyMap<string, number>;
+}
+
+/** How a database write is linked to a failure, or `"none"` when it is not. */
+type DbWriteLink = "request" | "proximity" | "none";
+
+/** How a single database write relates to the failures in the session. */
+interface DbWriteRank {
+  readonly link: DbWriteLink;
+  readonly severity: EvidenceCandidate["severity"];
+  readonly score: number;
+  readonly confidence: EvidenceCandidate["confidence"];
+}
+
+/**
+ * The three possible ranks. They are shared sentinels rather than per-write objects: frozen, so
+ * aliasing one across many slots cannot be undone by a later mutation. (`readonly` alone is a
+ * compile-time claim and would not survive an untyped caller.)
+ */
+const UNLINKED_DB_WRITE_RANK: DbWriteRank = Object.freeze({
+  link: "none",
+  severity: "low",
+  score: DB_WRITE_RANK.STANDALONE_SCORE,
+  confidence: "low",
+});
+const REQUEST_LINKED_DB_WRITE_RANK: DbWriteRank = Object.freeze({
+  link: "request",
+  severity: "medium",
+  score: DB_WRITE_RANK.LINKED_SCORE,
+  confidence: "medium",
+});
+const PROXIMITY_LINKED_DB_WRITE_RANK: DbWriteRank = Object.freeze({
+  link: "proximity",
+  severity: "medium",
+  score: DB_WRITE_RANK.LINKED_SCORE,
+  confidence: "medium",
+});
+
+/**
+ * Rank a set of database writes by each write's own relationship to the session's failures.
+ *
+ * A write is linked to a failure when either:
+ *   1. it carries the request id of a failure that began at or before it — the unit of work failed
+ *      and this write still landed, so it may be a partial or retried commit; or
+ *   2. failing that, a failure sits within `PROXIMITY_MS` of it. Writes with no request linkage
+ *      (background jobs, legacy events) can only qualify this way.
+ *
+ * Rule 1 is unbounded in time on purpose: request membership, not elapsed time, is the claim. Note
+ * the two planes key it differently. `db.diff` keys on `requestId`, so the unbounded window is one
+ * HTTP request. The OTel path keys on `traceId`, which can span a long-running job or a fan-out of
+ * child spans, so the same rule reaches further there.
+ *
+ * Every linked write receives the *same* rank. Ordering the writes of one failing request against
+ * each other was tried and removed: inside a request the error precedes all of them, so temporal
+ * distance collapses to write order, and write order is an artifact of the application's code path.
+ * On the captured retry storm it scored the two duplicate `coupon_redemptions` rows — the actual
+ * defect — below the innocent `products` update and `orders` insert purely because checkout writes
+ * coupons last. Discrimination inside a failure belongs to detectors that read an observable
+ * property of the rows.
+ *
+ * Table participation in the error path was evaluated as a discriminator and rejected: the error
+ * evidence available here (HTTP spans, console errors, network failures) carries no table name, so
+ * it could only be matched by guessing a table from a route or a message. The cross-plane detectors
+ * in this file are deliberately silent on that kind of ambiguity, and a ranking rule that guesses is
+ * worse than one that ranks on relationships it can actually observe.
+ *
+ * @returns a rank per input write, keyed by index.
+ */
+function rankDbWritesAgainstErrors(
+  writes: Array<{ t: number; requestId?: string }>,
+  failures: ErrorMoment[],
+): DbWriteRank[] {
+  if (failures.length === 0 || writes.length === 0) {
+    return writes.map(() => UNLINKED_DB_WRITE_RANK);
+  }
+
+  return writes.map((write) => {
+    if (write.requestId !== undefined) {
+      for (const failure of failures) {
+        const failedAt = failure.requestFirstT.get(write.requestId);
+        // Only failures at or before the write: a write that preceded the failure is not implicated
+        // by it merely through request membership, and falls through to the proximity rule.
+        if (failedAt !== undefined && failedAt <= write.t) {
+          return REQUEST_LINKED_DB_WRITE_RANK;
+        }
+      }
+    }
+
+    for (const failure of failures) {
+      const distance =
+        write.t < failure.start
+          ? failure.start - write.t
+          : write.t > failure.end
+            ? write.t - failure.end
+            : 0;
+      if (distance <= DB_WRITE_RANK.PROXIMITY_MS) {
+        return PROXIMITY_LINKED_DB_WRITE_RANK;
+      }
+    }
+
+    return UNLINKED_DB_WRITE_RANK;
+  });
+}
+
+/**
+ * Collapse raw error events into one moment per logical failure.
+ *
+ * Events are chained while consecutive events sit within `PROXIMITY_MS` of each other, so a retry
+ * burst, or one failure's 5xx / `backend.req.error` / console-error trio, is a single moment.
+ *
+ * Chaining on a shared request id was considered and rejected. Two failures of the same request a
+ * minute apart would merge into one moment spanning that minute, and because the proximity rule
+ * measures distance to the moment's span, every unrelated write in between would silently become
+ * "near an error". Chaining only on `PROXIMITY_MS` adjacency keeps every internal gap at or below
+ * the window, which makes distance-to-span and distance-to-nearest-event agree on linkage: the
+ * collapse changes the moment model without widening what links.
+ */
+function clusterErrorMoments(
+  raw: Array<{ t: number; requestId?: string }>,
+): ErrorMoment[] {
+  if (raw.length === 0) return [];
+  const sorted = [...raw].sort((a, b) => a.t - b.t);
+  const clusters: Array<{
+    start: number;
+    end: number;
+    requestFirstT: Map<string, number>;
+  }> = [];
+
+  for (const moment of sorted) {
+    let current = clusters[clusters.length - 1];
+    if (
+      current === undefined ||
+      moment.t - current.end > DB_WRITE_RANK.PROXIMITY_MS
+    ) {
+      current = { start: moment.t, end: moment.t, requestFirstT: new Map() };
+      clusters.push(current);
+    } else {
+      current.end = moment.t;
+    }
+    // Ascending order means the first error event seen for a request id is also its earliest.
+    if (
+      moment.requestId !== undefined &&
+      !current.requestFirstT.has(moment.requestId)
+    ) {
+      current.requestFirstT.set(moment.requestId, moment.t);
+    }
+  }
+
+  return clusters;
 }
 
 function collectErrorMoments(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
 ): ErrorMoment[] {
-  const moments: ErrorMoment[] = [];
+  const moments: Array<{ t: number; requestId?: string }> = [];
 
   for (const event of events) {
     if (
@@ -1212,7 +1408,7 @@ function collectErrorMoments(
   for (const entry of index.consoleErrors ?? []) moments.push({ t: entry.t });
   for (const entry of index.errs ?? []) moments.push({ t: entry.t });
 
-  return moments;
+  return clusterErrorMoments(moments);
 }
 
 function addDbDiffCandidates(
@@ -1223,35 +1419,38 @@ function addDbDiffCandidates(
   const dbDiffs = events.filter((event) => event.k === "db.diff");
   if (dbDiffs.length === 0) return;
 
-  // Maximum visibility: always surface db.diffs (the subtle data-correctness bugs a logger
-  // most wants to catch). A diff adjacent to an error ranks high (88); a standalone diff ranks
-  // low (40) so it never buries real errors but still appears — and, absent any error, becomes
-  // ranked[0] so its evidence window covers the diff for fix-context.
-  const errorMoments = collectErrorMoments(events, index);
+  // Maximum visibility: always surface db.diffs (the subtle data-correctness bugs a logger most
+  // wants to catch). How high a diff ranks is decided by its own relationship to the session's
+  // errors — see rankDbWritesAgainstErrors and DB_WRITE_RANK.
+  const failures = collectErrorMoments(events, index);
+  const ranks = rankDbWritesAgainstErrors(
+    dbDiffs.map((event) => ({
+      t: event.t,
+      requestId: safeText(event.d.requestId, 120),
+    })),
+    failures,
+  );
 
-  for (const event of dbDiffs) {
+  for (const [i, event] of dbDiffs.entries()) {
     const requestId = safeText(event.d.requestId, 120);
     const op = safeText(event.d.op, 20) ?? "mutation";
     const table = safeText(event.d.table, 200) ?? "unknown table";
-
-    const adjacent = errorMoments.some(
-      (moment) =>
-        Math.abs(moment.t - event.t) <= DB_DIFF_ADJACENCY_MS ||
-        (requestId !== undefined &&
-          moment.requestId !== undefined &&
-          moment.requestId === requestId),
-    );
+    const rank = ranks[i];
+    const subject = `Database ${op} on ${scrubText(table, 100) ?? "table"}`;
 
     drafts.push({
       detector: "db_mutation",
-      // A db.diff adjacent to an error is high-value evidence (ranked like an otel_span_error);
-      // a standalone db.diff is surfaced at a low score so it is visible without out-ranking errors.
-      title: adjacent
-        ? `Database ${op} on ${scrubText(table, 100) ?? "table"} near an error`
-        : `Database ${op} on ${scrubText(table, 100) ?? "table"}`,
-      severity: adjacent ? "high" : "low",
-      score: adjacent ? 88 : 40,
-      confidence: adjacent ? "high" : "low",
+      // "near an error" is only true on the proximity branch. Request linkage is unbounded in time,
+      // so a write minutes away from the failure still links — and must not claim to be near it.
+      title:
+        rank.link === "request"
+          ? `${subject} in the failing request`
+          : rank.link === "proximity"
+            ? `${subject} near an error`
+            : subject,
+      severity: rank.severity,
+      score: rank.score,
+      confidence: rank.confidence,
       anchor: removeUndefined({
         t: event.t,
         offsetMs:
@@ -1997,7 +2196,9 @@ function addUiApiDivergenceCandidates(
       const requestId = requestIdForEvent(response);
       for (const [name, value] of collectNumericFieldEntries(body)) {
         fieldEntries.push(
-          requestId === undefined ? { name, value } : { name, value, requestId },
+          requestId === undefined
+            ? { name, value }
+            : { name, value, requestId },
         );
       }
     }
@@ -2066,11 +2267,21 @@ function addOtelDbActivityCandidates(
   );
   if (dbSpans.length === 0) return;
 
-  const errorMoments = collectErrorMoments(events, index);
-  for (const event of dbSpans) {
+  const failures = collectErrorMoments(events, index);
+  const ranks = rankDbWritesAgainstErrors(
+    dbSpans.map((event) => ({
+      t: event.t,
+      requestId:
+        safeText(event.d.traceId, 120) ?? safeText(event.d.requestId, 120),
+    })),
+    failures,
+  );
+
+  for (const [i, event] of dbSpans.entries()) {
     const attrs = event.d.attributes as Record<string, unknown>;
     const requestId =
       safeText(event.d.traceId, 120) ?? safeText(event.d.requestId, 120);
+    const rank = ranks[i];
     const system =
       safeText(attrs["db.system"], 80) ??
       safeText(attrs["db.name"], 80) ??
@@ -2081,22 +2292,19 @@ function addOtelDbActivityCandidates(
     const statement =
       scrubText(attrs["db.statement"], 220) ??
       scrubText(attrs["db.query.text"], 220);
-    const adjacent = errorMoments.some(
-      (moment) =>
-        Math.abs(moment.t - event.t) <= DB_DIFF_ADJACENCY_MS ||
-        (requestId !== undefined &&
-          moment.requestId !== undefined &&
-          moment.requestId === requestId),
-    );
-
+    const subject = operation ?? statement ?? system;
     drafts.push({
       detector: "otel_db_activity",
-      title: adjacent
-        ? `OTel DB activity near an error: ${operation ?? statement ?? system}`
-        : `OTel DB activity: ${operation ?? statement ?? system}`,
-      severity: adjacent ? "high" : "low",
-      score: adjacent ? 88 : 40,
-      confidence: adjacent ? "high" : "low",
+      // See addDbDiffCandidates: only the proximity branch may claim "near an error".
+      title:
+        rank.link === "request"
+          ? `OTel DB activity in the failing request: ${subject}`
+          : rank.link === "proximity"
+            ? `OTel DB activity near an error: ${subject}`
+            : `OTel DB activity: ${subject}`,
+      severity: rank.severity,
+      score: rank.score,
+      confidence: rank.confidence,
       anchor: removeUndefined({
         t: event.t,
         offsetMs:
@@ -2111,6 +2319,16 @@ function addOtelDbActivityCandidates(
   }
 }
 
+/**
+ * True for any span carrying OTel database attributes.
+ *
+ * Caveat, deliberate: OTel db spans do not reliably distinguish reads from writes, so this admits
+ * `SELECT` spans too. `otel_db_activity` and the write-ranking rule therefore cover db *activity*,
+ * not only mutations. Rule 1 ("the unit of work failed and this still ran") holds for a read as
+ * well, but a read is never a partial or retried commit, so the OTel plane's linked candidates are
+ * weaker evidence than the `db.diff` plane's. The plane's `anchor.source` already says
+ * "statements, not row diffs"; only `db.diff` proves a row changed.
+ */
 function hasOtelDbAttributes(attrs: Record<string, unknown>): boolean {
   return (
     safeText(attrs["db.system"], 80) !== undefined ||
@@ -2179,7 +2397,8 @@ function isNavigationEvent(event: BugEvent): boolean {
  * trailing digits so a bare `https://host/a.js` with no position never matches
  * and no half-location is reported as a code frame.
  */
-const STACK_FRAME_LOCATION = /((?:https?:\/\/|\/|[A-Za-z]:\\|\w)[^\s()]*?:\d+:\d+)/;
+const STACK_FRAME_LOCATION =
+  /((?:https?:\/\/|\/|[A-Za-z]:\\|\w)[^\s()]*?:\d+:\d+)/;
 
 /**
  * The `file:line:col` of the failing code, or undefined when the session never
@@ -2244,7 +2463,8 @@ function downrankTrackerBeacons(
       .filter((id): id is string => id !== undefined),
   );
   for (const draft of drafts) {
-    if (!isTrackerBeaconDraft(draft, beaconFailures, beaconRequestIds)) continue;
+    if (!isTrackerBeaconDraft(draft, beaconFailures, beaconRequestIds))
+      continue;
     draft.score = Math.min(draft.score, TRACKER_BEACON_SCORE);
     draft.severity = "low";
   }
