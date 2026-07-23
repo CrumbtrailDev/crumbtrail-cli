@@ -6,18 +6,25 @@
  */
 
 /**
- * Slack allowance, in estimated tokens, that covers the budgeting envelope a
- * budgeted response adds on top of its kept content: the `dropReport` object
- * (per-plane counts, capped refs, message), `budgetSatisfied`, and the
- * `tokenEstimate` field itself, plus per-item rounding in
- * {@link fillPlanesToBudget}'s cost model. Contract: whenever the fixed
- * (non-plane) part of a payload fits the budget, the final response's
- * {@link estimateTokens} over its exact serialized form is
- * `<= maxTokens + BUDGET_SLACK_TOKENS`. When the fixed part alone does NOT fit,
- * no fill can rescue the response, so the caller says so through
- * `budgetSatisfied: false` rather than silently overrunning.
+ * Estimated cost of the two budgeting fields every budgeted response appends
+ * after the fill has run: `budgetSatisfied` (~27 serialized chars) and
+ * `tokenEstimate` (~27 serialized chars), so ~14 tokens plus a small margin.
+ *
+ * This is a RESERVE held back from the fill, not a tolerance applied to the
+ * result. `dropReport` is reserved separately and exactly by
+ * {@link fillPlanesWithDropReport}; these two fields are the only part of the
+ * envelope whose cost is not measured, because they are written after it.
+ *
+ * Contract: whenever the budget can pay for the fixed (non-plane) part of the
+ * payload, this reserve, and the `dropReport` the fill implies, the final
+ * response's {@link estimateTokens} over its exact serialized form is
+ * `<= maxTokens`. Below that there is no fill that fits, because the report is
+ * unavoidable overhead once anything is dropped. Nothing is ever allowed to
+ * overrun the budget and still claim `budgetSatisfied: true`: the caller
+ * compares the final estimate against `maxTokens` itself and says
+ * `budgetSatisfied: false` when it is over, whatever the reason.
  */
-export const BUDGET_SLACK_TOKENS = 256;
+export const BUDGET_ENVELOPE_TOKENS = 16;
 
 /** Max refs surfaced in a drop report (both the arrays and the message). */
 const DROP_REPORT_REF_CAP = 10;
@@ -92,9 +99,25 @@ export interface DropReport {
 }
 
 /**
- * One budgetable array inside a payload. `path` is BOTH the dotted location the
- * kept prefix is written back to and the plane's name in the drop report, so a
- * plane can never be reported under a name that does not resolve.
+ * Projection of one budgeted item onto one dotted payload location: the array
+ * at `[0]` receives `[1](item)` for every kept item, in kept order.
+ */
+export type PlaneWriteBack = readonly [
+  path: string,
+  project: (item: unknown) => unknown,
+];
+
+/**
+ * One budgetable unit list inside a payload. `path` is the plane's name in the
+ * drop report and, by default, the dotted location its kept prefix is written
+ * back to, so a plane is never reported under a name that does not resolve.
+ *
+ * `writeBack` covers the one case where a budgeted unit spans MORE than one
+ * array: getFixContext's linked frontend/backend request pair, where index `i`
+ * of each array is the same full-stack request. Budgeting them as one plane is
+ * what keeps that positional alignment true after a trim; budgeting them
+ * separately would keep half a pair. A fan-out plane's `path` names the logical
+ * list (`primary_window.requests`) and `writeBack` names the arrays it owns.
  *
  * Build these with {@link budgetPlane}, which keeps `items`/`refOf` type-safe at
  * the call site while the fill treats every plane uniformly.
@@ -103,6 +126,7 @@ export interface BudgetPlane {
   path: string;
   items: readonly unknown[];
   refOf: (item: unknown) => string;
+  writeBack?: readonly PlaneWriteBack[];
 }
 
 /** Type-safe constructor for a {@link BudgetPlane}. */
@@ -110,8 +134,26 @@ export function budgetPlane<T>(
   path: string,
   items: readonly T[],
   refOf: (item: T) => string,
+  writeBack?: ReadonlyArray<readonly [string, (item: T) => unknown]>,
 ): BudgetPlane {
-  return { path, items, refOf: (item) => refOf(item as T) };
+  return {
+    path,
+    items,
+    refOf: (item) => refOf(item as T),
+    writeBack: writeBack?.map(
+      ([path, project]) =>
+        [path, (item: unknown) => project(item as T)] as PlaneWriteBack,
+    ),
+  };
+}
+
+/**
+ * The dotted locations a plane owns and how each is projected from a kept item.
+ * Defaults to writing the kept items verbatim at `plane.path`, so a plain plane
+ * and a fan-out plane are handled by one code path everywhere.
+ */
+export function planeWriteBacks(plane: BudgetPlane): readonly PlaneWriteBack[] {
+  return plane.writeBack ?? [[plane.path, (item: unknown) => item]];
 }
 
 export interface FillPlanesOptions {
@@ -225,10 +267,24 @@ export function fillPlanesToBudget(
   const dropped: PlaneDropReport[] = [];
 
   for (const plane of planes) {
-    const indent = planeIndent(plane.path);
+    // A fan-out plane costs what its item really occupies in EVERY array it
+    // owns, each at that array's own indentation — not what the synthetic
+    // tuple would serialize to.
+    const writeBacks = planeWriteBacks(plane);
+    const costOf = (item: unknown): number => {
+      let cost = 0;
+      for (const [path, project] of writeBacks) {
+        cost += itemCost(
+          JSON.stringify(project(item) ?? null, null, 2),
+          planeIndent(path),
+        );
+      }
+      return cost;
+    };
+
     let keptCount = 0;
     for (const item of plane.items) {
-      const cost = itemCost(JSON.stringify(item, null, 2), indent);
+      const cost = costOf(item);
       if (cost > available) break;
       available -= cost;
       usedTokens += cost;
@@ -239,8 +295,7 @@ export function fillPlanesToBudget(
     const lost = plane.items.slice(keptCount);
     if (lost.length === 0) continue;
     let droppedTokenEstimate = 0;
-    for (const item of lost)
-      droppedTokenEstimate += itemCost(JSON.stringify(item, null, 2), indent);
+    for (const item of lost) droppedTokenEstimate += costOf(item);
     dropped.push({
       plane: plane.path,
       droppedCount: lost.length,
@@ -308,15 +363,17 @@ function dropReportCost(report: DropReport | undefined): number {
 
 /**
  * {@link fillPlanesToBudget} plus the `dropReport` the fill implies, with the
- * report's own cost RESERVED OUT OF THE BUDGET rather than out of
- * {@link BUDGET_SLACK_TOKENS}. A report that names several planes and their
- * refs is far too large to hide in a fixed fudge factor, and a response that
- * pays for its own bookkeeping is the whole point of an honest budget.
+ * report's own cost RESERVED OUT OF THE BUDGET rather than absorbed by a fudge
+ * factor. A report that names several planes and their refs is far too large to
+ * hide in a constant, and a response that pays for its own bookkeeping is the
+ * whole point of an honest budget. {@link BUDGET_ENVELOPE_TOKENS} covers only
+ * `budgetSatisfied` and `tokenEstimate`, which are written after this runs.
  *
  * Each pass reserves what the previous pass's report cost and refills. The
- * reserve only ever grows and the refs are capped, so it converges within a
- * pass or two; the loop is bounded regardless, and callers verify the final
- * serialization against the budget rather than trusting this accounting.
+ * reserve only ever grows, the refs are capped and the plane list is finite, so
+ * it converges within a pass or two; the loop is bounded regardless, and
+ * callers verify the final serialization against the budget rather than
+ * trusting this accounting.
  *
  * `extraDrops` reports a non-array projection the caller had to remove because
  * the fill invalidated it (getFixContext's `causal_chain`). It is evaluated
@@ -333,7 +390,7 @@ export function fillPlanesWithDropReport(
   let kept = new Map<string, unknown[]>();
   let report: DropReport | undefined;
 
-  for (let pass = 0; pass < 3; pass += 1) {
+  for (let pass = 0; pass < 8; pass += 1) {
     const fill = fillPlanesToBudget(planes, {
       maxTokens: opts.maxTokens,
       baseTokens: opts.baseTokens + reserve,

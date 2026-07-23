@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  BUDGET_SLACK_TOKENS,
+  BUDGET_ENVELOPE_TOKENS,
   attachTokenEstimate,
   budgetPlane,
   estimateTokens,
@@ -287,10 +287,18 @@ describe("fillPlanesWithDropReport", () => {
     ),
   );
 
-  it("keeps the final serialized response within maxTokens + BUDGET_SLACK_TOKENS", () => {
-    // Simulate the exact MCP assembly: base measured with every plane emptied,
-    // fill, then attach dropReport + budgetSatisfied + tokenEstimate and
-    // measure the truth over the real serialization.
+  it("keeps the final serialized response within maxTokens, with no tolerance", () => {
+    // Simulate the exact MCP assembly: base measured with every plane emptied
+    // PLUS the envelope reserve, fill, then attach dropReport +
+    // budgetSatisfied + tokenEstimate and measure the truth over the real
+    // serialization. The bound is the budget itself, not budget + a constant.
+    //
+    // The bound holds whenever the budget can actually pay for the fixed
+    // fields, the envelope and the drop report the fill implies. Below that
+    // there is no fill that fits: the report is unavoidable overhead once
+    // anything is dropped, and the MCP path reports `budgetSatisfied: false`
+    // rather than pretending a constant covers the gap.
+    let affordableSeen = 0;
     for (const maxTokens of [
       baseTokens + 50,
       baseTokens + 400,
@@ -298,20 +306,22 @@ describe("fillPlanesWithDropReport", () => {
       baseTokens + 4000,
       estimateTokens(JSON.stringify(payload, null, 2)) + 100,
     ]) {
-      const { kept, report } = fillPlanesWithDropReport(planes(), {
-        maxTokens,
-        baseTokens,
-      });
+      const { kept, report, reservedTokens } = fillPlanesWithDropReport(
+        planes(),
+        { maxTokens, baseTokens: baseTokens + BUDGET_ENVELOPE_TOKENS },
+      );
       const out = withPlaneValues(payload, kept);
       if (report) out.dropReport = report;
       out.budgetSatisfied = true;
       const final = attachTokenEstimate(out);
       const finalText = JSON.stringify(final, null, 2);
-      expect(estimateTokens(finalText)).toBeLessThanOrEqual(
-        maxTokens + BUDGET_SLACK_TOKENS,
-      );
       expect(final.tokenEstimate).toBe(estimateTokens(finalText));
+      if (baseTokens + BUDGET_ENVELOPE_TOKENS + reservedTokens <= maxTokens) {
+        affordableSeen += 1;
+        expect(estimateTokens(finalText)).toBeLessThanOrEqual(maxTokens);
+      }
     }
+    expect(affordableSeen).toBeGreaterThan(0);
   });
 
   it("reserves the drop report's own cost out of the budget, not out of the slack", () => {
@@ -362,7 +372,20 @@ describe("attachTokenEstimate", () => {
     );
   });
 
-  it("exports the pinned slack constant", () => {
-    expect(BUDGET_SLACK_TOKENS).toBe(256);
+  it("pins the envelope reserve to the real cost of the two appended fields", () => {
+    // budgetSatisfied + tokenEstimate are the only budgeting fields written
+    // after every measurement the fill can take, so the reserve has to cover
+    // exactly them and nothing more. A constant big enough to also swallow a
+    // small budget is what let a 51% overrun report budgetSatisfied: true.
+    const withoutEnvelope = JSON.stringify({ a: 1 }, null, 2);
+    const withEnvelope = JSON.stringify(
+      { a: 1, budgetSatisfied: false, tokenEstimate: 123456 },
+      null,
+      2,
+    );
+    const realCost =
+      estimateTokens(withEnvelope) - estimateTokens(withoutEnvelope);
+    expect(BUDGET_ENVELOPE_TOKENS).toBeGreaterThanOrEqual(realCost);
+    expect(BUDGET_ENVELOPE_TOKENS).toBeLessThan(realCost + 8);
   });
 });
