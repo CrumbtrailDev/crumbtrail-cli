@@ -13,9 +13,10 @@ import { normalizeAiOpinion } from "./ai-diagnosis";
 import {
   attachTokenEstimate,
   budgetPlane,
-  BUDGET_SLACK_TOKENS,
+  BUDGET_ENVELOPE_TOKENS,
   estimateTokens,
   fillPlanesWithDropReport,
+  planeWriteBacks,
   withPlaneValues,
   type BudgetPlane,
   type DropReport,
@@ -153,15 +154,31 @@ export interface McpServerConfig {
 }
 
 /**
- * Shared input-schema fragment for the optional `maxTokens` response budget
- * (getFixContext / getLatestIssue / solveContext / getWindow). One constant so
- * the documented chars/4 bias cannot drift between tools.
+ * Shared input-schema fragment for the optional `maxTokens` response budget.
+ * One constant so the documented chars/4 bias and the meaning of
+ * `budgetSatisfied` cannot drift between tools.
+ *
+ * Deliberately tool-neutral: it is spread into every budgeted tool's schema, so
+ * a per-tool priority order or a per-tool remediation belongs in that tool's
+ * own override (see {@link FIX_CONTEXT_MAX_TOKENS_SCHEMA} and getWindow), never
+ * here.
  */
+const MAX_TOKENS_DESCRIPTION =
+  "Optional response token budget. Estimated as ceil(chars/4) of the serialized JSON. This low cost heuristic can undercount dense content such as non ASCII text, base64, or punctuation, so budget conservatively. When set, the response's budgeted lists compete for the same budget in a fixed priority order, and items are dropped whole from the bottom of a list rather than rewritten. A list nested inside a kept item is part of that item's cost and is not trimmed on its own. The response gains tokenEstimate and budgetSatisfied, plus a dropReport naming each trimmed list when anything was omitted. budgetSatisfied is false whenever tokenEstimate exceeds maxTokens, which is what happens when the fixed fields and the dropReport cannot fit however much is trimmed; budgetNotice then reports a budget large enough for that exact response. Omit maxTokens for the full payload.";
+
 const MAX_TOKENS_SCHEMA = {
   type: "integer" as const,
   minimum: 1,
-  description:
-    "Optional response token budget. Estimated as ceil(chars/4) of the serialized JSON. This low cost heuristic can undercount dense content such as non ASCII text, base64, or punctuation, so budget conservatively. When set, every list in the response competes for the same budget in a fixed priority order, highest value first: for getFixContext that is ranked signals, then database evidence, then backend and then frontend request lists. Items are dropped whole from the bottom of each list and are never rewritten. The response gains tokenEstimate, budgetSatisfied, and, when anything was omitted, a dropReport naming each list it trimmed. budgetSatisfied is false when even the fixed fields exceed the budget, and budgetNotice then names a budget that does fit. Omit maxTokens for the full payload.",
+  description: MAX_TOKENS_DESCRIPTION,
+};
+
+/**
+ * getFixContext and getLatestIssue return the same fix-context.v2 bundle, so
+ * they document the same plane priority and the same linked request invariant.
+ */
+const FIX_CONTEXT_MAX_TOKENS_SCHEMA = {
+  ...MAX_TOKENS_SCHEMA,
+  description: `${MAX_TOKENS_DESCRIPTION} In this bundle the order is ranked signals, then database row diffs, then database pre state reads, then database span activity, then the correlated requests. The backend and frontend request lists are budgeted together as one list named primary_window.requests, so the same index in primary_window.backend.requests and primary_window.frontend.requests always describes the same linked request. causal_chain is a projection over signals rather than a list of its own: it is kept only when every signal it names survived, and is otherwise dropped whole and named in dropReport.`,
 };
 
 /**
@@ -174,11 +191,18 @@ const MAX_TOKENS_SCHEMA = {
  * Order rationale: the ranked signal list is the point of the bundle and the
  * only plane that names a root cause, so it is spent first. Database evidence
  * carries the row level state those detectors reason over, with row diffs
- * before pre state reads before statement only OTel activity. The request
- * arrays come last: they are the bulkiest plane and the most redundant, since
- * every kept signal already carries its own anchor and requestId, and backend
- * request summaries carry the error and route detail that frontend summaries
- * lack.
+ * before pre state reads before statement only OTel activity. The requests come
+ * last: they are the bulkiest plane and the most redundant, since every kept
+ * signal already carries its own anchor and requestId.
+ *
+ * `primary_window.backend.requests` and `primary_window.frontend.requests` are
+ * ONE plane, not two. `buildPrimaryWindow` projects both from a single list of
+ * linked full-stack requests (`matched.map(entry => entry.backend)` and
+ * `matched.map(entry => entry.frontend)`), so index `i` of one array is the
+ * same request as index `i` of the other. Two independent planes would trim
+ * them to different lengths and keep half a pair, silently breaking a
+ * positional join that has always held. They are budgeted together under the
+ * logical name `primary_window.requests`.
  *
  * `causal_chain` is deliberately absent. It is a projection over `signals`
  * rather than an independent list, so `fixContextResult` keeps or drops it
@@ -207,21 +231,36 @@ const FIX_CONTEXT_BUDGET_PLANES: ReadonlyArray<
       (activity) =>
         `db.activity:${activity.operation ?? activity.spanName ?? "span"}@t=${activity.t}`,
     ),
-  (context) =>
-    budgetPlane(
-      "primary_window.backend.requests",
-      context.primary_window.backend.requests,
-      (request) =>
-        requestPlaneRef(request.requestId, request.method, request.url),
-    ),
-  (context) =>
-    budgetPlane(
-      "primary_window.frontend.requests",
-      context.primary_window.frontend.requests,
-      (request) =>
-        requestPlaneRef(request.requestId, request.method, request.url),
-    ),
+  (context) => linkedRequestPlane(context),
 ];
+
+/**
+ * The linked frontend/backend request pair as ONE plane, so a trim can never
+ * leave the two arrays at different lengths. Items are `[i]`-wise pairs of the
+ * two arrays; `writeBack` projects the kept prefix back onto both.
+ */
+function linkedRequestPlane(context: FixContext): BudgetPlane {
+  const backend = context.primary_window.backend.requests;
+  const frontend = context.primary_window.frontend.requests;
+  const pairs = Array.from(
+    { length: Math.max(backend.length, frontend.length) },
+    (_, i) => ({ backend: backend[i], frontend: frontend[i] }),
+  );
+  return budgetPlane(
+    "primary_window.requests",
+    pairs,
+    (pair) =>
+      requestPlaneRef(
+        pair.backend?.requestId ?? pair.frontend?.requestId,
+        pair.backend?.method ?? pair.frontend?.method,
+        pair.backend?.url ?? pair.frontend?.url,
+      ),
+    [
+      ["primary_window.backend.requests", (pair) => pair.backend],
+      ["primary_window.frontend.requests", (pair) => pair.frontend],
+    ],
+  );
+}
 
 /**
  * The causal-chain invariant: a chain that names a signal the budget dropped
@@ -399,7 +438,7 @@ const TOOLS = [
       type: "object" as const,
       properties: {
         sessionId: { type: "string" },
-        maxTokens: { ...MAX_TOKENS_SCHEMA },
+        maxTokens: { ...FIX_CONTEXT_MAX_TOKENS_SCHEMA },
       },
       required: ["sessionId"],
     },
@@ -422,7 +461,7 @@ const TOOLS = [
       "The one call entry point: finds the most recent finalized session with error class evidence and returns its complete fix-context.v2 bundle with deterministic signals, the correlated primary window, environment snapshot, causal chain, repro hint, and, when cloud analysis resolved them, GitHub code_pointers. Call it with no arguments when the user asks to fix the latest bug. Optional maxTokens bounds the response using a conservative character estimate.",
     inputSchema: {
       type: "object" as const,
-      properties: { maxTokens: { ...MAX_TOKENS_SCHEMA } },
+      properties: { maxTokens: { ...FIX_CONTEXT_MAX_TOKENS_SCHEMA } },
     },
   },
   /** @stability stable */
@@ -685,8 +724,7 @@ const TOOLS = [
         },
         maxTokens: {
           ...MAX_TOKENS_SCHEMA,
-          description:
-            "Optional response token budget, estimated as ceil(chars/4) of the serialized JSON. This low cost heuristic can undercount dense content, so budget conservatively. When set, chronological events are dropped from the end of the window after the limit cap to fit. The response gains tokenEstimate and a dropReport whose first ref carries the first omitted event timestamp (t=<ms>) so you can start a new window there. Omit it for the full payload.",
+          description: `${MAX_TOKENS_DESCRIPTION} getWindow budgets one list: chronological events are dropped from the end of the window after the limit cap, and dropReport's first ref carries the first omitted event timestamp (t=<ms>) so you can start a new window there.`,
         },
       },
       required: ["sessionId", "t0", "t1"],
@@ -1876,13 +1914,17 @@ export class McpServer {
    * `hooks.extraDrops` reports a non-array projection the fill invalidated (see
    * {@link fillPlanesWithDropReport}); `hooks.onKept` patches dependent fields
    * once the fill is final (getWindow's returned/truncated, getFixContext's
-   * causal chain).
+   * causal chain); `hooks.remediation` adds tool-specific advice to the
+   * over-budget notice, which is otherwise tool-neutral because this path is
+   * shared by every budgeted tool.
    *
-   * `budgetSatisfied` is verified against the FINAL serialization, not against
-   * the fill's own accounting: when a payload's fixed fields alone exceed the
-   * budget no fill can rescue it, and the response says so instead of silently
-   * overrunning. Deterministic; logs drops to stderr only (stdout carries only
-   * JSON-RPC frames).
+   * `budgetSatisfied` is the plain truth about the FINAL serialization:
+   * `tokenEstimate <= maxTokens`. It is never softened by a tolerance constant,
+   * because a tolerance large enough to cover the envelope is also large enough
+   * to swallow a small budget whole and call a 51% overrun satisfied. The only
+   * constant involved is {@link BUDGET_ENVELOPE_TOKENS}, and it is RESERVED
+   * from the fill rather than forgiven afterwards. Deterministic; logs drops to
+   * stderr only (stdout carries only JSON-RPC frames).
    */
   private budgetedTextResult(
     payload: Record<string, unknown>,
@@ -1897,20 +1939,34 @@ export class McpServer {
         kept: ReadonlyMap<string, unknown[]>,
         report: DropReport | undefined,
       ) => void;
+      remediation?: string;
     } = {},
   ) {
     const emptied = withPlaneValues(
       payload,
-      planes.map((plane) => [plane.path, []] as const),
+      planes.flatMap((plane) =>
+        planeWriteBacks(plane).map((write) => [write[0], []] as const),
+      ),
     );
-    const baseTokens = estimateTokens(JSON.stringify(emptied, null, 2));
+    // Fixed cost is what the payload weighs with every budgeted list empty;
+    // the fill also has to leave room for the two envelope fields appended
+    // below, which are written after every measurement it can take.
+    const fixedTokens = estimateTokens(JSON.stringify(emptied, null, 2));
     const { kept, report } = fillPlanesWithDropReport(
       planes,
-      { maxTokens, baseTokens },
+      { maxTokens, baseTokens: fixedTokens + BUDGET_ENVELOPE_TOKENS },
       hooks.extraDrops,
     );
 
-    const out = withPlaneValues(payload, kept);
+    const out = withPlaneValues(
+      payload,
+      planes.flatMap((plane) => {
+        const items = kept.get(plane.path) ?? [];
+        return planeWriteBacks(plane).map(
+          ([path, project]) => [path, items.map(project)] as const,
+        );
+      }),
+    );
     hooks.onKept?.(out, kept, report);
     if (report) {
       out.dropReport = report;
@@ -1920,22 +1976,62 @@ export class McpServer {
     }
 
     // Provisionally claim the budget was met, then check the claim against the
-    // real serialization and downgrade it if the fixed fields alone blew past.
+    // real serialization and downgrade it if the response is over regardless.
     out.budgetSatisfied = true;
     let final = attachTokenEstimate(out);
-    if (final.tokenEstimate > maxTokens + BUDGET_SLACK_TOKENS) {
+    if (final.tokenEstimate > maxTokens) {
       out.budgetSatisfied = false;
-      // `final.tokenEstimate` is measured with every budgeted list already
-      // empty, so a budget of that size leaves the response inside its own
-      // slack allowance. Recommending it is a fact about this response, not an
-      // estimate of one.
-      out.budgetNotice = `This response could not be brought within maxTokens=${maxTokens}: its fixed fields alone estimate about ${baseTokens} tokens before any list content, and every budgeted list is already empty. Retry with maxTokens of at least ${final.tokenEstimate}, or read the omitted lists separately with getEvidence and getWindow.`;
-      final = attachTokenEstimate(out);
+      // The recommended budget must cover THIS response, notice included. The
+      // notice is not free, so the estimate is re-taken with it in place and
+      // the recommendation raised until it no longer undersells the very
+      // response carrying it. The reserve only grows, so this settles at once.
+      let recommended = final.tokenEstimate;
+      const keptAnything = planes.some(
+        (plane) => (kept.get(plane.path) ?? []).length > 0,
+      );
+      for (let pass = 0; pass < 5; pass += 1) {
+        out.budgetNotice = this.budgetNoticeText(
+          maxTokens,
+          fixedTokens,
+          recommended,
+          keptAnything,
+          hooks.remediation,
+        );
+        final = attachTokenEstimate(out);
+        if (final.tokenEstimate <= recommended) break;
+        recommended = final.tokenEstimate;
+      }
       process.stderr.write(
-        `mcp: budget not satisfiable at maxTokens=${maxTokens}: fixed fields alone estimate ~${baseTokens} tokens\n`,
+        `mcp: budget not satisfiable at maxTokens=${maxTokens}: fixed fields alone estimate ~${fixedTokens} tokens\n`,
       );
     }
     return textResult(final);
+  }
+
+  /**
+   * Copy for `budgetNotice`. Tool-neutral by construction: this path serves
+   * getWindow, getErrorContext, getFailedRequests, solveContext, the bounded
+   * event dumps and the fix-context bundle, so naming a follow up tool here
+   * would send most callers to a tool that cannot resolve their refs. Call
+   * sites pass their own `remediation` when they have one.
+   *
+   * The emptied-lists claim is derived from the fill, never assumed: an
+   * over-budget response is normally one whose fixed fields alone do not fit,
+   * but the drop report is unavoidable overhead too, and the notice must not
+   * assert a state the response is not in.
+   */
+  private budgetNoticeText(
+    maxTokens: number,
+    fixedTokens: number,
+    recommended: number,
+    keptAnything: boolean,
+    remediation?: string,
+  ): string {
+    const emptied = keptAnything
+      ? ""
+      : ", and every budgeted list is already empty";
+    const base = `This response could not be brought within maxTokens=${maxTokens}: its fixed fields alone estimate about ${fixedTokens} tokens before any list content${emptied}. Retry with maxTokens of at least ${recommended}.`;
+    return remediation ? `${base} ${remediation}` : base;
   }
 
   /**
@@ -1963,6 +2059,11 @@ export class McpServer {
             out.causal_chain = null;
           }
         },
+        // Bundle-specific and correct only here: signal ids are candidate ids,
+        // which getEvidence resolves, and primary_window timestamps are what
+        // getWindow takes.
+        remediation:
+          "You can also read the omitted evidence separately with getEvidence for a signal id and getWindow for the primary window.",
       },
     );
   }
