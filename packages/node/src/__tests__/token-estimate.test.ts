@@ -324,6 +324,93 @@ describe("fillPlanesWithDropReport", () => {
     expect(affordableSeen).toBeGreaterThan(0);
   });
 
+  it("charges every non-empty array's closing bracket, so the bound survives zero per-item slack", () => {
+    // The band the per-item ceiling normally hides. `itemCost` rounds up per
+    // item, and that rounding slack usually absorbs the one cost it does not
+    // model: the base measurement serialized each plane as a bare `[]`, but a
+    // non-empty array closes with "\n" + its own indent + "]". Size the items
+    // so every itemCost is exact and the slack disappears, spread six arrays
+    // over four depths, and the unmodelled columns add up to a real overrun.
+    // Unless the fill pays for each array's closing bracket, the final
+    // serialization exceeds maxTokens here even though the fixed fields, the
+    // envelope and the drop report all fit.
+    const paths = [
+      "signals",
+      "recommendations",
+      "primary_window.events",
+      "primary_window.frontend.requests",
+      "primary_window.backend.requests",
+      "primary_window.backend.logs",
+    ];
+    const indentOf = (path: string) => 2 * (path.split(".").length + 1);
+    // A JSON string is one line, so it costs `length + indent + 2` columns.
+    // Round its length up until that total is a multiple of 4: no slack.
+    const alignedLength = (indent: number, approx: number) => {
+      let length = approx;
+      while ((length + indent + 2) % 4 !== 0) length += 1;
+      return length;
+    };
+
+    let affordableSeen = 0;
+    let tightSeen = 0;
+    for (const perPlane of [2, 4, 6]) {
+      for (const approx of [43, 63, 83]) {
+        const lists = paths.map((path, planeIndex) =>
+          Array.from({ length: perPlane }, (_, i) => {
+            const ref = `r${planeIndex}${String(i).padStart(2, "0")}`;
+            const length = alignedLength(indentOf(path), approx);
+            return ref + "x".repeat(length - 2 - ref.length);
+          }),
+        );
+        const full = withPlaneValues(
+          {
+            schemaVersion: "test.v1",
+            summary: "s".repeat(40),
+            primary_window: { frontend: {}, backend: {} },
+          },
+          paths.map((path, i) => [path, lists[i]] as const),
+        );
+        const planes = paths.map((path, i) =>
+          budgetPlane(path, lists[i], (entry: string) => entry.slice(0, 4)),
+        );
+        const baseTokens = estimateTokens(
+          serialize(
+            withPlaneValues(
+              full,
+              paths.map((path) => [path, []] as const),
+            ),
+          ),
+        );
+
+        const ceiling = estimateTokens(serialize(full));
+        for (let maxTokens = baseTokens; maxTokens <= ceiling + 4; maxTokens++) {
+          const { kept, report, reservedTokens } = fillPlanesWithDropReport(
+            planes,
+            { maxTokens, baseTokens: baseTokens + BUDGET_ENVELOPE_TOKENS },
+          );
+          if (baseTokens + BUDGET_ENVELOPE_TOKENS + reservedTokens > maxTokens)
+            continue;
+          const out = withPlaneValues(full, kept);
+          if (report) out.dropReport = report;
+          out.budgetSatisfied = true;
+          const estimate = estimateTokens(serialize(attachTokenEstimate(out)));
+
+          affordableSeen += 1;
+          if (estimate >= maxTokens - 8) tightSeen += 1;
+          expect(estimate).toBeLessThanOrEqual(maxTokens);
+        }
+      }
+    }
+    // Guard the guard. A fixture that never comes near its budget would pass
+    // the bound above without exercising the accounting this test exists to
+    // pin, which is exactly how the previous version of this check stayed
+    // green over a cost model that could overrun. Without the closing-bracket
+    // charge these same points reach 3 tokens PAST the budget; with it the
+    // tightest lands 4 tokens under.
+    expect(affordableSeen).toBeGreaterThan(0);
+    expect(tightSeen).toBeGreaterThan(0);
+  });
+
   it("reserves the drop report's own cost out of the budget, not out of the slack", () => {
     const maxTokens = baseTokens + 1200;
     const unreserved = fillPlanesToBudget(planes(), { maxTokens, baseTokens });
