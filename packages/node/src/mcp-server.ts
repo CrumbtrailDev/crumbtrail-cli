@@ -63,6 +63,7 @@ import {
   locateEvidence,
   NO_LOCATED_SESSION_GAP,
 } from "./locate-incident";
+import { resolveIssueToCapsule } from "./capsule-resolve";
 import {
   evidenceSourcesFromEnv,
   type EvidenceSource,
@@ -387,6 +388,35 @@ const TOOLS = [
         },
         maxTokens: { ...MAX_TOKENS_SCHEMA },
       },
+    },
+  },
+  /** @stability experimental */
+  {
+    name: "resolveCapsule",
+    description:
+      "Resolve a described symptom to the capsule.v2 issue-resolution envelope: identity, symptom, occurrences, evidence, join graph, quality report, advisory opinion, memory, resolution, and agent directions. Part 4 REUSES the fusion.v1 RankedBundle solveContext returns, referenced verbatim and never re-ranked, so this is additive framing over the same evidence rather than a second ranking. Still advisory, never a boolean verdict: a thin match returns a deliverable capsule that states its own limits with an explicit inconclusive advisory. Completeness is scored only against a configured evidence profile, so it is reported as not scored when none exists.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        symptom: {
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            description: { type: "string" },
+            release: { type: "string" },
+            url: { type: "string" },
+            user: { type: "string" },
+            errorSig: {
+              type: "string",
+              description:
+                "Known error signature. Used as the capsule signature when present; otherwise a deterministic signature is derived from the symptom text.",
+            },
+            source: { type: "string" },
+          },
+          required: ["title"],
+        },
+      },
+      required: ["symptom"],
     },
   },
   /** @stability stable */
@@ -1094,6 +1124,8 @@ export class McpServer {
         return this.toolGetRegressionContext(args);
       case "solveContext":
         return this.toolSolveContext(args);
+      case "resolveCapsule":
+        return this.toolResolveCapsule(args);
       case "listDistinctBugs":
         return this.toolListDistinctBugs(args);
       case "getRecurrence":
@@ -2204,6 +2236,33 @@ export class McpServer {
       budget.maxTokens,
       (item) => item.id,
     );
+  }
+
+  /**
+   * `resolveCapsule` — resolve a symptom to the additive capsule.v2 envelope.
+   *
+   * Delegates to the shared {@link resolveIssueToCapsule} helper, which runs the
+   * existing locate + assemble path (the same one the inner /api/solve-context
+   * endpoint uses) and then the package's single capsule compile site. The CLI
+   * `capsule` command calls that same helper, so the two surfaces are at parity
+   * and neither re-implements the compile. `solveContext` is untouched: this is
+   * a separate tool, so every existing fusion.v1 output stays byte-identical.
+   */
+  private async toolResolveCapsule(args: Record<string, unknown>) {
+    const passedSymptom: Partial<Symptom> | undefined = isRecord(args.symptom)
+      ? (args.symptom as unknown as Partial<Symptom>)
+      : undefined;
+    const title = stringField(passedSymptom?.title);
+    if (!title) {
+      return errorResult("resolveCapsule requires symptom.title");
+    }
+
+    const { capsule } = await resolveIssueToCapsule(
+      { ...passedSymptom, title } as Symptom,
+      this.recallStore(),
+      { sources: this.evidenceSources() },
+    );
+    return textResult(capsule);
   }
 
   // --- Distinct within-session bug grouping ---

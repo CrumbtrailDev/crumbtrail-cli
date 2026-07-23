@@ -20,6 +20,7 @@ import {
 } from "./provider-recipes";
 import { runScan } from "./run-scan";
 import { runFixContext } from "./run-fix-context";
+import { runCapsule } from "./run-capsule";
 import { runInspect } from "./run-inspect";
 import { runCompare } from "./run-compare";
 import { readPackageVersion } from "./version";
@@ -54,6 +55,7 @@ Commands:
   doctor    Verify capture + correlation + MCP-readability end to end
   scan      Flag components/functions missing IDs or logging (coverage gaps)
   fix-context  Emit the ranked, correlated, LLM-ready fix-context bundle for a session
+  capsule   Resolve a symptom to the capsule.v2 issue-resolution envelope
   inspect   Summarize a finalized session's manifest + artifacts (hot-plane only)
   compare   Compare two recorded sessions or releases
   help      Show this help
@@ -127,6 +129,25 @@ Options:
 Examples:
   crumbtrail-server fix-context ses_123 --json
   crumbtrail-server fix-context --latest --follow --json`,
+  capsule: `crumbtrail-server capsule — resolve a symptom to the capsule.v2 issue-resolution envelope
+
+Wraps the existing fusion.v1 ranked bundle (referenced verbatim, never re-ranked) in the
+ten part capsule.v2 envelope. Runs the same shared resolution helper as the MCP
+resolveCapsule tool, so both surfaces return the same capsule for the same issue.
+
+Options:
+  <title>              Symptom title (or pass --title)
+  --title <text>       Symptom title; wins over the positional argument
+  --description <text> Longer symptom description
+  --url <path>         Affected route or URL
+  --release <id>       Release the symptom was reported on
+  --error-sig <sig>    Known error signature; used as the capsule signature
+  --source <name>      Where the symptom came from (ticket, alert, report)
+  --json               Emit the raw capsule.v2 envelope instead of a summary
+  --output <dir>       Sessions directory to resolve the issue against
+
+Example:
+  crumbtrail-server capsule "checkout fails" --url /api/checkout --json`,
   inspect: `crumbtrail-server inspect — summarize a finalized session's manifest + artifacts
 
 Reads hot-plane artifacts only (manifest.json, else index.json); never the raw event log.
@@ -251,6 +272,10 @@ export async function runCli(argv: string[]): Promise<number> {
 
   if (command === "fix-context") {
     return await runFixContext(rest);
+  }
+
+  if (command === "capsule") {
+    return await runCapsule(rest);
   }
 
   if (command === "inspect") {
