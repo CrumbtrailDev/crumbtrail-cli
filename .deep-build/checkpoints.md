@@ -24,11 +24,13 @@ Depends on: Checkpoint 2.
 
 ## External gate
 
-The four prepared versions must be published and verified on npm before the
+The seven prepared versions must be published and verified on npm before the
 hosted repository can take its frozen-lockfile dependency update:
 
-- `crumbtrail-core@0.6.0`
-- `crumbtrail-node@0.9.0`
-- `crumbtrail-detect-core@0.2.0`
 - `crumbtrail@0.7.2`
-
+- `crumbtrail-core@0.6.0`
+- `crumbtrail-detect-core@0.2.0`
+- `crumbtrail-install-shared@0.4.0`
+- `crumbtrail-node@0.9.0`
+- `crumbtrail-react-native@0.3.0`
+- `crumbtrail-tauri@0.3.0`

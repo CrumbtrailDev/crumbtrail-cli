@@ -20,10 +20,23 @@ function isWorkspaceSpec(version) {
   return typeof version === "string" && version.startsWith("workspace:");
 }
 
-function packageDependencies(pkg) {
+function runtimeContractDependencies(pkg) {
   return {
     ...(pkg.dependencies ?? {}),
     ...(pkg.optionalDependencies ?? {}),
+    ...(pkg.peerDependencies ?? {}),
+  };
+}
+
+function runtimeWorkspaceDependencies(pkg) {
+  return Object.entries(runtimeContractDependencies(pkg.manifest))
+    .filter(([, version]) => isWorkspaceSpec(version))
+    .map(([name]) => name);
+}
+
+function declaredDependencies(pkg) {
+  return {
+    ...runtimeContractDependencies(pkg),
     ...(pkg.devDependencies ?? {}),
   };
 }
@@ -37,7 +50,11 @@ function bundledWorkspaceDependencies(pkg) {
       .flatMap((match) => [...match[1].matchAll(/["']([^"']+)["']/g)].map((entry) => entry[1])),
   );
 
-  return Object.entries(packageDependencies(pkg.manifest))
+  // noExternal affects the packed build even when the imported workspace
+  // package is listed as a dev dependency. This is intentionally broader than
+  // runtimeContractDependencies: CLI bundles install-shared and detect-core
+  // from devDependencies, so their source changes must reach the CLI release.
+  return Object.entries(declaredDependencies(pkg.manifest))
     .filter(([name, version]) => isWorkspaceSpec(version) && noExternal.has(name))
     .map(([name]) => name);
 }
@@ -94,23 +111,19 @@ export function selectReleasePackages({ packages, changedFiles, versionChangedPa
       .map((pkg) => pkg.name),
   );
   const versionsChanged = new Set(versionChangedPackageNames);
-
   // Build output can contain workspace packages via tsup's noExternal option.
-  // A workspace dependency version bump also changes the packed package.json
-  // because pnpm rewrites workspace:^ during pack/publish. Add those consumers
-  // too, but do not release an external consumer for a source-only dependency
-  // change that leaves its packed output identical.
+  // A bundled dependency changes the consumer's artifact. A public runtime,
+  // optional, or peer workspace dependency whose version changed also changes
+  // the consumer's packed contract because pnpm resolves workspace:^ during
+  // pack/publish. Dev dependencies intentionally do not propagate releases.
   let added = true;
   while (added) {
     added = false;
     for (const pkg of packages) {
       if (selected.has(pkg.name)) continue;
-      const workspaceDependencies = Object.entries(packageDependencies(pkg.manifest))
-        .filter(([, version]) => isWorkspaceSpec(version))
-        .map(([name]) => name);
       if (
         bundledWorkspaceDependencies(pkg).some((dependency) => selected.has(dependency)) ||
-        workspaceDependencies.some((dependency) => versionsChanged.has(dependency))
+        runtimeWorkspaceDependencies(pkg).some((dependency) => versionsChanged.has(dependency))
       ) {
         selected.add(pkg.name);
         added = true;
@@ -141,7 +154,7 @@ export async function changedFilesSince(rootDir, baseRef) {
   return stdout.split("\n").filter(Boolean);
 }
 
-async function versionChangedPackageNames(rootDir, baseRef, packages) {
+async function versionsChangedSince(rootDir, baseRef, packages) {
   if (!baseRef) return [];
   const changed = [];
   for (const pkg of packages) {
@@ -159,16 +172,29 @@ async function versionChangedPackageNames(rootDir, baseRef, packages) {
   return changed;
 }
 
+export function assertVersionedRuntimeConsumers(selected, versionChangedPackageNames) {
+  const versionChangedSet = new Set(versionChangedPackageNames);
+  const propagatedWithoutVersionBump = selected
+    .filter((pkg) => !versionChangedSet.has(pkg.name))
+    .filter((pkg) => runtimeWorkspaceDependencies(pkg).some((dependency) => versionChangedSet.has(dependency)));
+  if (propagatedWithoutVersionBump.length > 0) {
+    throw new Error(
+      "A workspace runtime/peer dependency changed version, but its public consumer was not bumped: " +
+      `${propagatedWithoutVersionBump.map((pkg) => pkg.name).join(", ")}. ` +
+      "Bump each consumer before releasing so its packed contract receives a unique npm version.",
+    );
+  }
+}
+
 export async function createReleasePlan({ rootDir, baseRef, changedFiles } = {}) {
   const safeBaseRef = validateBaseRef(baseRef);
   const packages = await discoverPackages(rootDir);
   const files = changedFiles ?? await changedFilesSince(rootDir, safeBaseRef);
-  const versionChanged = await versionChangedPackageNames(rootDir, safeBaseRef, packages);
+  const versionChanged = await versionsChangedSince(rootDir, safeBaseRef, packages);
   const selected = selectReleasePackages({ packages, changedFiles: files, versionChangedPackageNames: versionChanged });
+  assertVersionedRuntimeConsumers(selected, versionChanged);
   return {
     baseRef: safeBaseRef,
-    changedFiles: files.map(normalisePath),
-    versionChangedPackageNames: versionChanged,
     packages: selected.map((pkg) => ({ name: pkg.name, version: pkg.version, relativeDir: pkg.relativeDir })),
   };
 }

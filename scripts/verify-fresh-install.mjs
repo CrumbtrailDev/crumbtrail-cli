@@ -12,6 +12,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 const coreRoot = path.join(repoRoot, "packages", "core");
 const nodeRoot = path.join(repoRoot, "packages", "node");
+const cliRoot = path.join(repoRoot, "packages", "cli");
 const timeoutMs = 10_000;
 const maxDiagnosticChars = 1_500;
 const authToken = "fresh-install-verifier-auth-token";
@@ -222,6 +223,34 @@ async function assertPackedNodeDependency(
   if (!packedPkg.files?.includes("dist"))
     throw new Error("packed crumbtrail-node package files must include dist");
   recordPhase("packed-manifest", "pass", `crumbtrail-core=${expectedCoreRange}`);
+}
+
+async function assertPackedCliInstallSpecs(cliTarball, tempProjectDir, expectedSpecs) {
+  recordPhase("packed-cli-install-specs", "start");
+  await fs.writeFile(
+    path.join(tempProjectDir, "package.json"),
+    JSON.stringify({ private: true, type: "commonjs" }, null, 2),
+  );
+  await runCommand(
+    "packed-cli-install",
+    "npm",
+    ["i", `crumbtrail@file:${cliTarball}`, "--ignore-scripts"],
+    { cwd: tempProjectDir },
+  );
+  const probe = await runCommand(
+    "packed-cli-probe",
+    process.execPath,
+    [
+      "-e",
+      'const { sdkInstallSpec } = require("crumbtrail"); console.log(JSON.stringify([sdkInstallSpec("crumbtrail-core"), sdkInstallSpec("crumbtrail-node")]));',
+    ],
+    { cwd: tempProjectDir },
+  );
+  const emittedSpecs = JSON.parse(probe.stdout.trim());
+  if (JSON.stringify(emittedSpecs) !== JSON.stringify(expectedSpecs)) {
+    throw new Error(`packed crumbtrail emitted install specs ${JSON.stringify(emittedSpecs)}, expected ${JSON.stringify(expectedSpecs)}`);
+  }
+  recordPhase("packed-cli-install-specs", "pass", `specs=${emittedSpecs.join(",")}`);
 }
 
 async function installTempProject(tempProjectDir, coreTarball, nodeTarball) {
@@ -610,10 +639,12 @@ async function main() {
     );
     const packDir = path.join(tmpRoot, "packed");
     const tempProjectDir = path.join(tmpRoot, "project");
+    const cliProjectDir = path.join(tmpRoot, "packed-cli-project");
     const staticDir = path.join(tmpRoot, "static");
     const outputDir = path.join(tmpRoot, "sessions");
     await fs.mkdir(packDir, { recursive: true });
     await fs.mkdir(tempProjectDir, { recursive: true });
+    await fs.mkdir(cliProjectDir, { recursive: true });
     await fs.mkdir(staticDir, { recursive: true });
     await fs.writeFile(
       path.join(staticDir, "index.html"),
@@ -634,14 +665,25 @@ async function main() {
       "crumbtrail-node",
       "build",
     ]);
+    await runCommand("package-build", "pnpm", [
+      "--filter",
+      "crumbtrail",
+      "build",
+    ]);
 
     const coreTarball = await packPackage(coreRoot, packDir);
     const nodeTarball = await packPackage(nodeRoot, packDir);
+    const cliTarball = await packPackage(cliRoot, packDir);
     await assertPackedNodeDependency(
       nodeTarball,
       path.join(tmpRoot, "packed-node-manifest"),
       `^${expectedCoreVersion}`,
     );
+    const nodePackage = await readJsonFile(path.join(nodeRoot, "package.json"));
+    await assertPackedCliInstallSpecs(cliTarball, cliProjectDir, [
+      `crumbtrail-core@^${expectedCoreVersion}`,
+      `crumbtrail-node@^${nodePackage.version}`,
+    ]);
     await installTempProject(tempProjectDir, coreTarball, nodeTarball);
     await assertInstalledPackageMetadata(tempProjectDir, expectedCoreVersion);
 
@@ -661,7 +703,7 @@ async function main() {
 
     recordPhase("complete", "pass", `project=${tempProjectDir}`);
     console.log(
-      "CRUMBTRAIL_FRESH_INSTALL_PASS phases=package-metadata,package-build,package-pack,temp-install,installed-package-metadata,binary-resolution,binary-startup,health-readiness,self-host-artifact-proof,shutdown",
+      "CRUMBTRAIL_FRESH_INSTALL_PASS phases=package-metadata,package-build,package-pack,packed-cli-install-specs,temp-install,installed-package-metadata,binary-resolution,binary-startup,health-readiness,self-host-artifact-proof,shutdown",
     );
   } catch (err) {
     if (child) await shutdownServer(child).catch(() => undefined);
