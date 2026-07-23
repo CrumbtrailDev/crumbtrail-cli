@@ -2272,7 +2272,7 @@ describe("MCP Server", () => {
       const { text } = await callTool("getFixContext", {
         sessionId: "sess-planes-identical",
       });
-      const expected = buildFixContext(
+      const expected = await buildFixContext(
         path.join(tmpDir, "sess-planes-identical"),
         { outputDir: tmpDir },
       );
