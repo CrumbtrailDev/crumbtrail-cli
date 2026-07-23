@@ -65,6 +65,11 @@ class SealingSessionStore implements SessionStore {
     events: BugEvent[],
     opts?: Parameters<SessionStore["appendEvents"]>[2],
   ) => this.inner.appendEvents(dir, events, opts);
+  appendRecordLines = (
+    dir: string,
+    records: string[],
+    opts?: Parameters<SessionStore["appendRecordLines"]>[2],
+  ) => this.inner.appendRecordLines(dir, records, opts);
   writeBlob = (dir: string, name: string, data: Buffer) =>
     this.inner.writeBlob(dir, name, data);
   writeSessionArtifact = (dir: string, name: string, data: string | Buffer) =>
