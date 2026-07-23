@@ -1179,6 +1179,94 @@ interface ErrorMoment {
   requestId?: string;
 }
 
+/**
+ * How strongly a database write is tied to an error in the same session.
+ *
+ *  - `request`  the write and an error carry the SAME request id. Explicit
+ *               correlation, the strongest link the capture can express.
+ *  - `temporal` the write is inside {@link DB_DIFF_ADJACENCY_MS} of an error
+ *               whose linkage cannot be decided, because one side or the other
+ *               carries no request id. Suggestive, not established.
+ *  - `none`     neither holds.
+ */
+type DbErrorLinkage = "request" | "temporal" | "none";
+
+/**
+ * One ranking table for both database planes. `db.diff` (row images) and
+ * `otel_db_activity` (statements) describe the same writes from two capture
+ * sources, so a reader comparing them must not see two different gradings of
+ * the same linkage.
+ */
+const DB_LINKAGE_SEVERITY: Record<
+  DbErrorLinkage,
+  EvidenceCandidate["severity"]
+> = {
+  request: "high",
+  temporal: "medium",
+  none: "low",
+};
+const DB_LINKAGE_SCORE: Record<DbErrorLinkage, number> = {
+  request: 88,
+  temporal: 64,
+  none: 40,
+};
+const DB_LINKAGE_CONFIDENCE: Record<
+  DbErrorLinkage,
+  EvidenceCandidate["confidence"]
+> = {
+  request: "high",
+  temporal: "medium",
+  none: "low",
+};
+
+/**
+ * Grade a write against the session's error moments.
+ *
+ * The rule this replaced was `sameRequestId OR within 5s of any error`, which
+ * made the time window an independent promoter: any write landing near an
+ * error reached the top tier even when both sides carried request ids that
+ * disagreed. In a real session a background job drain 2942ms after an unrelated
+ * checkout error was lifted to `high`/88 on the time window alone.
+ *
+ * Two request ids that are both present and different are positive evidence of
+ * NON linkage, not missing evidence, so the window must not override them. The
+ * window survives only where correlation genuinely cannot be decided: one of
+ * the two sides has no request id to compare. That is the whole change — a
+ * write correlated to the error keeps the top tier, a write correlated AWAY
+ * from it drops to the standalone tier, and only the undecidable middle sits
+ * between them.
+ *
+ * Note what this deliberately does NOT do: it does not discriminate between
+ * writes that share the error's request id. Inside one request the error
+ * usually precedes every write, so temporal distance collapses to write order,
+ * which application code chooses freely and which says nothing about which
+ * write is at fault. Ranking on it produces confident nonsense — in the
+ * duplicate redemption session it scored the two culprit `coupon_redemptions`
+ * inserts BELOW the innocent `products` update, purely because checkout writes
+ * coupons later. Discriminating inside a request is the job of a detector that
+ * reads an observable property of the rows themselves.
+ */
+function gradeDbErrorLinkage(
+  eventT: number,
+  requestId: string | undefined,
+  errorMoments: ErrorMoment[],
+): DbErrorLinkage {
+  let temporal = false;
+  for (const moment of errorMoments) {
+    if (
+      requestId !== undefined &&
+      moment.requestId !== undefined &&
+      moment.requestId === requestId
+    )
+      return "request";
+    const undecidable =
+      requestId === undefined || moment.requestId === undefined;
+    if (undecidable && Math.abs(moment.t - eventT) <= DB_DIFF_ADJACENCY_MS)
+      temporal = true;
+  }
+  return temporal ? "temporal" : "none";
+}
+
 function collectErrorMoments(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
@@ -1246,9 +1334,10 @@ function addDbDiffCandidates(
   if (dbDiffs.length === 0) return;
 
   // Maximum visibility: always surface db.diffs (the subtle data-correctness bugs a logger
-  // most wants to catch). A diff adjacent to an error ranks high (88); a standalone diff ranks
-  // low (40) so it never buries real errors but still appears — and, absent any error, becomes
-  // ranked[0] so its evidence window covers the diff for fix-context.
+  // most wants to catch). A diff correlated to an error by request id ranks high (88); one
+  // merely near an error whose linkage cannot be decided ranks medium (64); a standalone diff
+  // ranks low (40) so it never buries real errors but still appears — and, absent any error,
+  // becomes ranked[0] so its evidence window covers the diff for fix-context.
   const errorMoments = collectErrorMoments(events, index);
 
   for (const event of dbDiffs) {
@@ -1256,24 +1345,20 @@ function addDbDiffCandidates(
     const op = safeText(event.d.op, 20) ?? "mutation";
     const table = safeText(event.d.table, 200) ?? "unknown table";
 
-    const adjacent = errorMoments.some(
-      (moment) =>
-        Math.abs(moment.t - event.t) <= DB_DIFF_ADJACENCY_MS ||
-        (requestId !== undefined &&
-          moment.requestId !== undefined &&
-          moment.requestId === requestId),
-    );
+    const linkage = gradeDbErrorLinkage(event.t, requestId, errorMoments);
+    const label = scrubText(table, 100) ?? "table";
 
     drafts.push({
       detector: "db_mutation",
-      // A db.diff adjacent to an error is high-value evidence (ranked like an otel_span_error);
-      // a standalone db.diff is surfaced at a low score so it is visible without out-ranking errors.
-      title: adjacent
-        ? `Database ${op} on ${scrubText(table, 100) ?? "table"} near an error`
-        : `Database ${op} on ${scrubText(table, 100) ?? "table"}`,
-      severity: adjacent ? "high" : "low",
-      score: adjacent ? 88 : 40,
-      confidence: adjacent ? "high" : "low",
+      title:
+        linkage === "request"
+          ? `Database ${op} on ${label} in a failed request`
+          : linkage === "temporal"
+            ? `Database ${op} on ${label} near an error`
+            : `Database ${op} on ${label}`,
+      severity: DB_LINKAGE_SEVERITY[linkage],
+      score: DB_LINKAGE_SCORE[linkage],
+      confidence: DB_LINKAGE_CONFIDENCE[linkage],
       anchor: removeUndefined({
         t: event.t,
         offsetMs:
@@ -2103,22 +2188,20 @@ function addOtelDbActivityCandidates(
     const statement =
       scrubText(attrs["db.statement"], 220) ??
       scrubText(attrs["db.query.text"], 220);
-    const adjacent = errorMoments.some(
-      (moment) =>
-        Math.abs(moment.t - event.t) <= DB_DIFF_ADJACENCY_MS ||
-        (requestId !== undefined &&
-          moment.requestId !== undefined &&
-          moment.requestId === requestId),
-    );
+    const linkage = gradeDbErrorLinkage(event.t, requestId, errorMoments);
+    const label = operation ?? statement ?? system;
 
     drafts.push({
       detector: "otel_db_activity",
-      title: adjacent
-        ? `OTel DB activity near an error: ${operation ?? statement ?? system}`
-        : `OTel DB activity: ${operation ?? statement ?? system}`,
-      severity: adjacent ? "high" : "low",
-      score: adjacent ? 88 : 40,
-      confidence: adjacent ? "high" : "low",
+      title:
+        linkage === "request"
+          ? `OTel DB activity in a failed request: ${label}`
+          : linkage === "temporal"
+            ? `OTel DB activity near an error: ${label}`
+            : `OTel DB activity: ${label}`,
+      severity: DB_LINKAGE_SEVERITY[linkage],
+      score: DB_LINKAGE_SCORE[linkage],
+      confidence: DB_LINKAGE_CONFIDENCE[linkage],
       anchor: removeUndefined({
         t: event.t,
         offsetMs:
