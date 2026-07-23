@@ -129,11 +129,12 @@ Options:
 Examples:
   crumbtrail-server fix-context ses_123 --json
   crumbtrail-server fix-context --latest --follow --json`,
-  capsule: `crumbtrail-server capsule — resolve a symptom to the capsule.v2 issue-resolution envelope
+  capsule: `crumbtrail-server capsule — resolve a ticket or symptom to the capsule.v2 issue-resolution envelope
 
 Wraps the existing fusion.v1 ranked bundle (referenced verbatim, never re-ranked) in the
-ten part capsule.v2 envelope. Runs the same shared resolution helper as the MCP
-resolveCapsule tool, so both surfaces return the same capsule for the same issue.
+ten part capsule.v2 envelope. Runs the same shared resolution pipeline as the MCP
+resolveCapsule and solveContext tools, so both surfaces return the same capsule for the
+same issue. Ticket credentials come from the documented env vars only.
 
 Options:
   <title>              Symptom title (or pass --title)
@@ -143,11 +144,19 @@ Options:
   --release <id>       Release the symptom was reported on
   --error-sig <sig>    Known error signature; used as the capsule signature
   --source <name>      Where the symptom came from (ticket, alert, report)
+  --ticket <ref>       Ticket URL, or the ticket key when --provider is given
+  --provider <jira|zendesk|trello>  Provider for a --ticket key
+  --baseline <session> Baseline session id for an explicit comparison
+  --current <session>  Current session id for an explicit comparison
+  --repo <owner/name>  Git host repo for intent inference (needs CRUMBTRAIL_GITHUB_TOKEN)
+  --base-ref <ref>     Git host base ref (with --repo and --head-ref)
+  --head-ref <ref>     Git host head ref (with --repo and --base-ref)
   --json               Emit the raw capsule.v2 envelope instead of a summary
   --output <dir>       Sessions directory to resolve the issue against
 
-Example:
-  crumbtrail-server capsule "checkout fails" --url /api/checkout --json`,
+Examples:
+  crumbtrail-server capsule "checkout fails" --url /api/checkout --json
+  crumbtrail-server capsule --ticket https://acme.atlassian.net/browse/OPS-42 --json`,
   inspect: `crumbtrail-server inspect — summarize a finalized session's manifest + artifacts
 
 Reads hot-plane artifacts only (manifest.json, else index.json); never the raw event log.

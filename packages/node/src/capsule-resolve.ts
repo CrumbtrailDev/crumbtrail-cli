@@ -5,16 +5,13 @@ import {
   type CompileCapsuleV2Input,
   type ExternalRef,
   type RankedBundle,
-  type Symptom,
 } from "crumbtrail-core";
 import {
-  locateAndAssemble,
-  type AdapterPhaseOptions,
-  type EvidenceSourceHealth,
-  type LocateIncidentOptions,
-  type LocateMatch,
-} from "./locate-incident";
-import type { RecallStore } from "./recall";
+  isFusionBundleRecord,
+  resolveTicketToBundle,
+  type ResolvedTicketRef,
+  type TicketResolutionDeps,
+} from "./ticket-resolve";
 
 // --- capsule.v2 resolution (CRUMB-60) --------------------------------------
 //
@@ -133,40 +130,103 @@ export function compileCapsuleFromBundle(
   return compileCapsuleV2(input);
 }
 
-/** Options for {@link resolveIssueToCapsule}: the same locate + adapter options
- *  {@link locateAndAssemble} takes, plus an optional additive capsule slice. */
-export type ResolveIssueToCapsuleOptions = LocateIncidentOptions &
-  AdapterPhaseOptions & { capsule?: CompileCapsuleFromBundleOptions };
+// --- issue resolution (CRUMB-60) --------------------------------------------
+//
+// ONE resolution entry point for both capsule surfaces, taking the SAME input
+// `solveContext` takes: a ticket reference, a described symptom, or both. It
+// calls the SAME shared producer `solveContext` calls
+// ({@link resolveTicketToBundle}: cloud pull short-circuit, ticket fetch and
+// normalization, explicit baseline/current comparison, auto-locate and the
+// adapter phase, git-host intent inference), then the single compile site above.
+// No second pipeline, no re-ranking: the capsule is additive framing over
+// exactly the bundle `solveContext` would have returned for the same input.
 
-/** The result of resolving an issue to a capsule: the capsule plus the exact
- *  bundle it wraps, the locate decision, and per-source health — mirrors
- *  {@link locateAndAssemble} so callers keep the advisory locate/health signals. */
-export interface ResolveIssueToCapsuleResult {
-  capsule: CapsuleV2;
-  bundle: RankedBundle;
-  match: LocateMatch;
-  sources: EvidenceSourceHealth[];
+/** The result of resolving a ticket to a capsule. `error` carries a refusal the
+ *  surface should report (for example an unusable stored bundle), never a
+ *  half-built capsule. */
+export type ResolveTicketToCapsuleResult =
+  | { kind: "error"; message: string }
+  | {
+      kind: "capsule";
+      capsule: CapsuleV2;
+      bundle: RankedBundle;
+      /** Where the bundle came from: a configured cloud deployment's stored
+       *  bundle for this ticket, or local resolution. */
+      source: "cloud" | "local";
+      ticket?: ResolvedTicketRef;
+    };
+
+/** Link the resolved issue back to its ticket, unless the caller already
+ *  supplied its own external refs. */
+function withTicketRef(
+  options: CompileCapsuleFromBundleOptions,
+  ticket: ResolvedTicketRef | undefined,
+): CompileCapsuleFromBundleOptions {
+  if (!ticket || options.identity?.externalRefs) return options;
+  return {
+    ...options,
+    identity: {
+      ...options.identity,
+      externalRefs: [
+        {
+          system: ticket.provider,
+          id: ticket.id,
+          ...(ticket.url ? { url: ticket.url } : {}),
+        },
+      ],
+    },
+  };
 }
 
 /**
- * Resolve a symptom to a capsule.v2 envelope through the ONE existing bundle
- * resolution path ({@link locateAndAssemble}, already shared with the inner
- * `/api/solve-context` endpoint) and then the single {@link compileCapsuleFromBundle}
- * compile site. Both the MCP `resolveCapsule` tool and the CLI `capsule` command
- * call this, so the two surfaces are at parity by construction. No parallel
- * resolution path, no re-ranking.
+ * Resolve a TICKET reference (the same `ticket`/`symptom`/`baselineSession`/
+ * `currentSession`/`gitHost` input `solveContext` accepts) to a capsule.v2
+ * envelope. Both the MCP `resolveCapsule` tool and the CLI `capsule` command
+ * call this, so the surfaces are at parity by construction: identical input
+ * yields an identical capsule, including its identity and signature.
  */
-export async function resolveIssueToCapsule(
-  symptom: Symptom,
-  store: RecallStore,
-  opts: ResolveIssueToCapsuleOptions = {},
-): Promise<ResolveIssueToCapsuleResult> {
-  const { capsule: capsuleOptions, ...locateOptions } = opts;
-  const { bundle, match, sources } = await locateAndAssemble(
-    symptom,
-    store,
-    locateOptions,
-  );
-  const capsule = compileCapsuleFromBundle(bundle, capsuleOptions);
-  return { capsule, bundle, match, sources };
+export async function resolveTicketToCapsule(
+  args: Record<string, unknown>,
+  deps: TicketResolutionDeps,
+  capsuleOptions: CompileCapsuleFromBundleOptions = {},
+): Promise<ResolveTicketToCapsuleResult> {
+  const resolved = await resolveTicketToBundle(args, deps);
+  if (resolved.kind === "error") {
+    return { kind: "error", message: resolved.message };
+  }
+
+  if (resolved.kind === "pulled") {
+    // A stored bundle is reused verbatim, exactly as solveContext returns it.
+    // It is only usable as capsule part 4 when it really is a fusion.v1 bundle;
+    // anything else is reported honestly rather than coerced into a capsule.
+    if (!isFusionBundleRecord(resolved.bundle)) {
+      return {
+        kind: "error",
+        message:
+          "the bundle stored for this ticket is not a fusion.v1 RankedBundle, so it cannot be wrapped in a capsule; use solveContext to inspect the stored payload.",
+      };
+    }
+    const bundle = resolved.bundle as RankedBundle;
+    return {
+      kind: "capsule",
+      capsule: compileCapsuleFromBundle(
+        bundle,
+        withTicketRef(capsuleOptions, resolved.ticket),
+      ),
+      bundle,
+      source: "cloud",
+      ...(resolved.ticket ? { ticket: resolved.ticket } : {}),
+    };
+  }
+
+  return {
+    kind: "capsule",
+    capsule: compileCapsuleFromBundle(
+      resolved.bundle,
+      withTicketRef(capsuleOptions, resolved.ticket),
+    ),
+    bundle: resolved.bundle,
+    source: "local",
+    ...(resolved.ticket ? { ticket: resolved.ticket } : {}),
+  };
 }
