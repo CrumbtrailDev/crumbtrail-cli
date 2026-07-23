@@ -19,10 +19,19 @@
  * payload, this reserve, and the `dropReport` the fill implies, the final
  * response's {@link estimateTokens} over its exact serialized form is
  * `<= maxTokens`. Below that there is no fill that fits, because the report is
- * unavoidable overhead once anything is dropped. Nothing is ever allowed to
- * overrun the budget and still claim `budgetSatisfied: true`: the caller
- * compares the final estimate against `maxTokens` itself and says
- * `budgetSatisfied: false` when it is over, whatever the reason.
+ * unavoidable overhead once anything is dropped.
+ *
+ * That bound is complete rather than a rounding artifact: the fill charges
+ * every byte a kept item adds, including the closing bracket each non empty
+ * array pays over the `[]` the base measurement counted. Leaving that
+ * per array cost unmodelled left a narrow band, reachable when per item
+ * rounding happened to leave no slack, where the fixed fields fit but the final
+ * serialization still ran a token or three over.
+ *
+ * Nothing is ever allowed to overrun the budget and still claim
+ * `budgetSatisfied: true` regardless: the caller compares the final estimate
+ * against `maxTokens` itself and says `budgetSatisfied: false` when it is over,
+ * whatever the reason.
  */
 export const BUDGET_ENVELOPE_TOKENS = 16;
 
@@ -199,6 +208,21 @@ function planeIndent(path: string): number {
   return 2 * (path.split(".").length + 1);
 }
 
+/**
+ * Estimated cost a plane pays the first time it keeps an item: the base
+ * measurement serialized every plane as an empty `[]`, but a non-empty array
+ * closes with `"\n"` plus its own indentation plus `"]"`, which is
+ * `indentColumns - 2` more columns than `[]` spent. {@link itemCost} charges per
+ * item and never sees this once-per-array cost, so without it the fill can
+ * outspend the budget by a couple of tokens. A fan-out plane pays it for every
+ * array it owns. Ceiling over the summed columns, the safe direction.
+ */
+function planeClosingCost(writeBacks: readonly PlaneWriteBack[]): number {
+  let columns = 0;
+  for (const [path] of writeBacks) columns += planeIndent(path) - 2;
+  return Math.ceil(columns / 4);
+}
+
 function formatTokenCount(tokens: number): string {
   if (tokens < 1000) return String(tokens);
   const thousands = tokens / 1000;
@@ -282,9 +306,12 @@ export function fillPlanesToBudget(
       return cost;
     };
 
+    const closingCost = planeClosingCost(writeBacks);
     let keptCount = 0;
     for (const item of plane.items) {
-      const cost = costOf(item);
+      // The first kept item also turns `[]` into a real array, so it pays the
+      // array's closing bracket once.
+      const cost = costOf(item) + (keptCount === 0 ? closingCost : 0);
       if (cost > available) break;
       available -= cost;
       usedTokens += cost;
