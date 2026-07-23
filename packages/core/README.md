@@ -103,6 +103,31 @@ action, or `flag()` triggers capture. The recorder adds the configured tail
 before finalizing the report. A cloud config response can disable capture with
 `killSwitch: true`; the SDK clears its buffer as soon as that response arrives.
 
+### On-screen numbers (`ui.num`)
+
+The `uiNumbers` collector is **on by default**. It scans the visible DOM for
+labeled numeric tokens — a number paired with its nearby text label, e.g.
+`Subtotal: $84.00` — and emits compact `ui.num` snapshots of `{label, value,
+unit}`. These power the display-arithmetic detector (subtotal + tax vs total)
+and the UI-vs-API divergence detector. It never captures raw DOM or HTML, only
+the short label and the parsed number.
+
+This means numeric amounts shown on screen are captured together with their
+labels. Labels run through the redaction classifier, so PII-shaped labels
+(emails, tokens) and card-number-shaped values are dropped entirely. The honest
+residual: a label that is itself a human name reads as ordinary free text and
+can survive capture, so the case to think about is numbers rendered next to
+names — payroll, CRM rows, admin tables (`Jane Doe  $84,000`).
+
+Opting out, narrowest first:
+
+- Add the sensitive label to `redaction.denyFields` to drop just those items.
+- Use `PRESET_LIGHT`, which disables the collector.
+- Disable it entirely with `uiNumbers: false` in `Crumbtrail.init({...})`.
+
+Hidden elements (`hidden`, `aria-hidden="true"`, `display:none`,
+`visibility:hidden`) are already skipped.
+
 ## Related packages
 
 | Package                                                                            | Use it for                                                 |
