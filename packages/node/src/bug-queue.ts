@@ -28,6 +28,8 @@ export interface BugReport {
 export interface BugQueueConfig {
   bugsDir: string;
   whisperModel?: string;
+  /** Read-only consumers must not create the queue directory on construction. */
+  readOnly?: boolean;
 }
 
 interface LlmBugContext {
@@ -65,7 +67,7 @@ export class BugQueueManager {
   constructor(config: BugQueueConfig) {
     this.bugsDir = config.bugsDir;
     this.whisperModel = config.whisperModel;
-    fs.mkdirSync(this.bugsDir, { recursive: true });
+    if (!config.readOnly) fs.mkdirSync(this.bugsDir, { recursive: true });
   }
 
   async create(report: BugReport, events: BugEvent[]): Promise<void> {
