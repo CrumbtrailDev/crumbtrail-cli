@@ -14,6 +14,7 @@ import {
   maskText,
 } from "../masking";
 import { describeElement, now } from "../utils";
+import { subscribeNavCommit } from "../nav-signal";
 
 function describeInteractionTarget(
   target: Element,
@@ -199,47 +200,18 @@ export function interactionCollector(
   // Initial nav event
   emitNav(currentUrl, "", "init");
 
-  const origPushState = history.pushState.bind(history);
-  const origReplaceState = history.replaceState.bind(history);
-
-  history.pushState = function (
-    ...args: Parameters<typeof History.prototype.pushState>
-  ) {
-    const from = currentUrl;
-    origPushState(...args);
-    currentUrl = window.location.href;
-    emitNav(currentUrl, from, "push");
-  };
-
-  history.replaceState = function (
-    ...args: Parameters<typeof History.prototype.replaceState>
-  ) {
-    const from = currentUrl;
-    origReplaceState(...args);
-    currentUrl = window.location.href;
-    emitNav(currentUrl, from, "replace");
-  };
-
-  const onPopState = () => {
-    const from = currentUrl;
-    currentUrl = window.location.href;
-    emitNav(currentUrl, from, "pop");
-  };
-  window.addEventListener("popstate", onPopState);
-
-  const onHashChange = () => {
-    const from = currentUrl;
-    currentUrl = window.location.href;
-    emitNav(currentUrl, from, "hash");
-  };
-  window.addEventListener("hashchange", onHashChange);
-
-  cleanups.push(() => {
-    history.pushState = origPushState;
-    history.replaceState = origReplaceState;
-    window.removeEventListener("popstate", onPopState);
-    window.removeEventListener("hashchange", onHashChange);
-  });
+  // Route commits arrive via the shared nav-commit signal (single wrap of
+  // the history API shared by all collectors); the callback runs after the
+  // navigation is applied, so location.href is already the destination. The
+  // NavCommitKind values ("push"/"replace"/"pop"/"hash") are exactly the
+  // `tr` values this collector has always emitted.
+  cleanups.push(
+    subscribeNavCommit((kind) => {
+      const from = currentUrl;
+      currentUrl = window.location.href;
+      emitNav(currentUrl, from, kind);
+    }),
+  );
 
   return () => {
     for (const fn of cleanups) fn();

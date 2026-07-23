@@ -1,4 +1,13 @@
 export const BROWSER_REDACTION_POLICY = "crumbtrail.browser-redaction.v1";
+/**
+ * Structure-preserving network-body redaction. Emitted only on JSON bodies that
+ * went through the v2 per-value classifier; every other capture plane (storage,
+ * console, cookies, inputs, headers, URLs) stays on the v1 policy tag.
+ */
+export const BROWSER_REDACTION_POLICY_V2 = "crumbtrail.browser-redaction.v2";
+export type BrowserRedactionPolicy =
+  | typeof BROWSER_REDACTION_POLICY
+  | typeof BROWSER_REDACTION_POLICY_V2;
 export const REDACTED_VALUE = "[REDACTED]";
 export const REDACTED_STORAGE_KEY = "[REDACTED_KEY]";
 
@@ -30,7 +39,7 @@ export interface PayloadSummary {
 }
 
 export interface RedactionMetadata {
-  policy: typeof BROWSER_REDACTION_POLICY;
+  policy: BrowserRedactionPolicy;
   fields: RedactionField[];
   summaries?: PayloadSummary[];
 }
@@ -47,10 +56,28 @@ export interface BodyRedactionResult {
   metadata?: RedactionMetadata;
 }
 
+/**
+ * Options for {@link redactNetworkTextBody}. Only the network collector
+ * (collectors/network.ts) call sites opt into structured (v2) mode; all other
+ * body-redaction callers stay on the v1 path.
+ */
 export interface BodyRedactionOptions {
   contentType?: string | null;
   maxLength?: number;
   path?: string;
+  /**
+   * "structured": JSON bodies ≤ {@link STRUCTURED_BODY_MAX_BYTES} go through the
+   * v2 per-value classifier (structure preserved, sensitive values replaced with
+   * `[REDACTED]` + shape metadata, policy tag bumped to v2). "full" (default at
+   * this layer) keeps the v1 whole-body behavior exactly.
+   */
+  mode?: StructuredRedactionMode;
+  /**
+   * Extra field names added to the deny list. Matched the same way as the
+   * built-in deny tokens: as substrings of the compacted (lowercased,
+   * alphanumeric-only) field name, so `"coupon"` also redacts `couponCode`.
+   */
+  denyFields?: string[];
 }
 
 export interface StoredValueRedactionOptions {
@@ -250,8 +277,11 @@ export function mergeRedactionMetadata(
   const fields: RedactionField[] = [];
   const summaries: PayloadSummary[] = [];
 
+  let policy: BrowserRedactionPolicy = BROWSER_REDACTION_POLICY;
   for (const item of items) {
     if (!item) continue;
+    if (item.policy === BROWSER_REDACTION_POLICY_V2)
+      policy = BROWSER_REDACTION_POLICY_V2;
     fields.push(...item.fields);
     if (item.summaries) summaries.push(...item.summaries);
   }
@@ -259,7 +289,7 @@ export function mergeRedactionMetadata(
   if (fields.length === 0 && summaries.length === 0) return undefined;
 
   return {
-    policy: BROWSER_REDACTION_POLICY,
+    policy,
     fields,
     ...(summaries.length > 0 ? { summaries } : {}),
   };
@@ -1355,6 +1385,355 @@ function replaceSensitiveMarkupPayloadAttributes(attrs: string): string {
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* Structured redaction v2 (network JSON bodies)                       */
+/* ------------------------------------------------------------------ */
+
+export type StructuredRedactionMode = "structured" | "full";
+
+/** JSON bodies above this size skip the structured walk and keep v1 behavior. */
+export const STRUCTURED_BODY_MAX_BYTES = 16_384;
+
+export type RedactedShapeCharset = "alpha" | "num" | "alnum" | "mixed";
+
+/**
+ * Non-recoverable shape metadata attached to every v2-redacted value.
+ * `hash8` is salted with a per-session random salt (equality tests work within
+ * a session; cross-session recovery does not) and is omitted entirely when the
+ * candidate space is small enough to brute-force (short numerics like CVVs,
+ * PINs, SSNs, phone numbers, or any very short value).
+ */
+export interface RedactedValueShape {
+  len: number;
+  charset: RedactedShapeCharset;
+  hash8?: string;
+}
+
+export type StructuredClassification =
+  | { action: "keep" }
+  | { action: "redact"; reason: string };
+
+/**
+ * V2 additions to the field-name deny list, matched as substrings of the
+ * compacted (lowercased, alphanumeric-only) field name. Deny-biased on purpose:
+ * `cardigan` matching `card` is an acceptable false positive.
+ */
+const STRUCTURED_DENY_NAME_TOKENS = [
+  "password",
+  "token",
+  "secret",
+  "auth",
+  "card",
+  "cvv",
+  "ssn",
+  "email",
+  "phone",
+  "address",
+  "iban",
+  "account",
+];
+
+/**
+ * Short/ambiguous deny tokens matched as whole words (with optional trailing
+ * digits) rather than substrings: `pin` ⊂ "shipping", `pan` ⊂ "company",
+ * `pass` ⊂ "compass", `otp` ⊂ "spanish"-class collisions would otherwise
+ * over-reach into legitimate field names. `pwd2`/`pin2`/`otpCode`/`userPass`
+ * still redact; `shipping`/`company`/`ping` survive.
+ */
+const STRUCTURED_DENY_WORD_RE = /^(?:pwd|pin|pan|otp|pass)\d*$/;
+
+const STRUCTURED_EMAIL_RE = /[^\s@"'<>]+@[^\s@"'<>]+\.[a-z]{2,}/i;
+/** IBAN shape: 2-letter country, 2 check digits, 10–30 alphanumerics. */
+const STRUCTURED_IBAN_RE = /^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/;
+const STRUCTURED_JWT_RE =
+  /eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{2,}/;
+const ENUM_LIKE_RE = /^[A-Za-z0-9_-]{1,24}$/;
+
+function compactFieldName(name: string): string {
+  return name
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+/** Field name split into words at camelCase/snake/kebab boundaries. */
+function fieldNameWords(name: string): string[] {
+  return name
+    .replace(/([a-z])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+function isStructuredDenyName(
+  name: string | undefined,
+  denyFields?: string[],
+): boolean {
+  if (!name) return false;
+  if (isSensitiveName(name)) return true;
+  const compact = compactFieldName(name);
+  if (STRUCTURED_DENY_NAME_TOKENS.some((token) => compact.includes(token)))
+    return true;
+  if (fieldNameWords(name).some((word) => STRUCTURED_DENY_WORD_RE.test(word)))
+    return true;
+  if (denyFields && denyFields.length > 0) {
+    // Same substring-of-compacted-name semantics as the built-in deny tokens:
+    // denyFields: ["coupon"] also redacts couponCode. Deny-biased on purpose.
+    return denyFields.some((deny) => {
+      const denyCompact = compactFieldName(deny);
+      return denyCompact.length > 0 && compact.includes(denyCompact);
+    });
+  }
+  return false;
+}
+
+function luhnPasses(digits: string): boolean {
+  let sum = 0;
+  let double = false;
+  for (let i = digits.length - 1; i >= 0; i -= 1) {
+    let digit = digits.charCodeAt(i) - 48;
+    if (double) {
+      digit *= 2;
+      if (digit > 9) digit -= 9;
+    }
+    sum += digit;
+    double = !double;
+  }
+  return sum % 10 === 0;
+}
+
+function containsLuhnDigitRun(value: string): boolean {
+  const stripped = value.replace(/[\s-]/g, "");
+  const runs = stripped.match(/\d{13,19}/g);
+  if (!runs) return false;
+  return runs.some((run) => luhnPasses(run));
+}
+
+function shannonEntropyBitsPerChar(value: string): number {
+  const counts = new Map<string, number>();
+  for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const p = count / value.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function isHighEntropyString(value: string): boolean {
+  if (value.length < 24 || /\s/.test(value)) return false;
+  return shannonEntropyBitsPerChar(value) >= 3.5;
+}
+
+/** Lazily-initialized per-session random salt for shape hashes. */
+let structuredShapeSalt: string | undefined;
+
+function getStructuredShapeSalt(): string {
+  if (structuredShapeSalt === undefined) {
+    const cryptoObj = (globalThis as { crypto?: Crypto }).crypto;
+    if (cryptoObj?.getRandomValues) {
+      const bytes = new Uint8Array(16);
+      cryptoObj.getRandomValues(bytes);
+      structuredShapeSalt = Array.from(bytes, (b) =>
+        b.toString(16).padStart(2, "0"),
+      ).join("");
+    } else {
+      structuredShapeSalt = `${Math.random()}${Math.random()}${Date.now()}`;
+    }
+  }
+  return structuredShapeSalt;
+}
+
+/** Test-only: clears the session salt so a fresh one is generated. */
+export function resetStructuredShapeSaltForTests(): void {
+  structuredShapeSalt = undefined;
+}
+
+function fnv1a32Hex(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Shape metadata for a redacted value — length, charset class, and a salted
+ * one-way hash. The hash is omitted for low-entropy values whose candidate
+ * space is trivially enumerable (numeric with len < 12, or any len < 6).
+ */
+export function computeRedactedShape(value: unknown): RedactedValueShape {
+  const text = typeof value === "string" ? value : JSON.stringify(value) ?? "";
+  const charset: RedactedShapeCharset = /^[A-Za-z]+$/.test(text)
+    ? "alpha"
+    : /^[0-9]+$/.test(text)
+      ? "num"
+      : /^[A-Za-z0-9]+$/.test(text)
+        ? "alnum"
+        : "mixed";
+  const shape: RedactedValueShape = { len: text.length, charset };
+  const smallCandidateSpace =
+    text.length < 6 || (charset === "num" && text.length < 12);
+  if (!smallCandidateSpace) {
+    shape.hash8 = fnv1a32Hex(`${getStructuredShapeSalt()}:${text}`);
+  }
+  return shape;
+}
+
+/**
+ * Per-value classifier for structured (v2) network-body redaction. Deny-biased:
+ * only numbers, booleans, nulls, and short enum-like strings that match no
+ * redact rule survive verbatim.
+ *
+ * Accepted residual: bare 9–11 digit strings under genuinely neutral field
+ * names (order numbers, tax refs) are kept — there is deliberately no blanket
+ * digit-run rule, because that class is dominated by non-sensitive business
+ * identifiers. Sensitive digit runs are caught by name (deny tokens like
+ * ssn/pin/account) or by shape (Luhn card runs, IBANs) instead.
+ *
+ * @param keyName Owning field name, used by external callers (e.g. UI-capture
+ * label classification) for deny-list checks; the internal walker checks names
+ * itself and passes `undefined` here.
+ */
+export function classifyStructuredValue(
+  value: unknown,
+  keyName?: string,
+  denyFields?: string[],
+): StructuredClassification {
+  if (isStructuredDenyName(keyName, denyFields))
+    return { action: "redact", reason: "deny_field" };
+  if (typeof value === "number") {
+    // JSON numbers are ordinarily kept verbatim (prices, qtys, ids,
+    // timestamps), but a 13–19 digit Luhn-passing integer is a card number.
+    if (Number.isInteger(value) && value > 0) {
+      const digits = String(value);
+      if (/^\d{13,19}$/.test(digits) && luhnPasses(digits))
+        return { action: "redact", reason: "luhn_value" };
+      // A 17–19 digit PAN exceeds Number.MAX_SAFE_INTEGER, so JSON.parse
+      // rounds it and the rounded rendering usually fails Luhn — but its
+      // leading ~16 digits are still the real card digits. Deny-biased:
+      // redact any unsafe integer that renders as a 13–20 digit run (a
+      // nanosecond timestamp over-redacting is acceptable).
+      if (!Number.isSafeInteger(value) && /^\d{13,20}$/.test(digits))
+        return { action: "redact", reason: "luhn_value" };
+    }
+    return { action: "keep" };
+  }
+  if (value === null || typeof value === "boolean")
+    return { action: "keep" };
+  if (typeof value !== "string")
+    return { action: "redact", reason: "unknown_value" };
+  if (STRUCTURED_EMAIL_RE.test(value))
+    return { action: "redact", reason: "email_value" };
+  if (STRUCTURED_JWT_RE.test(value))
+    return { action: "redact", reason: "jwt_value" };
+  if (containsLuhnDigitRun(value))
+    return { action: "redact", reason: "luhn_value" };
+  if (redactTokenLikeString(value).value !== value)
+    return { action: "redact", reason: "token_like_value" };
+  // Deny-biased ordering: at the 24-char boundary a string can be both
+  // enum-like (≤ 24) and entropy-eligible (≥ 24) — entropy wins.
+  if (isHighEntropyString(value))
+    return { action: "redact", reason: "high_entropy_value" };
+  // IBANs are enum-shaped (≤ 24 alphanumerics for most countries), so this
+  // check must run before the enum-keep. Whitespace-stripped: display forms
+  // group IBANs in blocks of four ("GB29 NWBK 6016 ...").
+  if (STRUCTURED_IBAN_RE.test(value.replace(/\s+/g, "")))
+    return { action: "redact", reason: "iban_value" };
+  if (ENUM_LIKE_RE.test(value)) return { action: "keep" };
+  return { action: "redact", reason: "free_text_value" };
+}
+
+function redactedShapePlaceholder(value: unknown): Record<string, unknown> {
+  const shape = computeRedactedShape(value);
+  const placeholder: Record<string, unknown> = {
+    $redacted: REDACTED_VALUE,
+    len: shape.len,
+    charset: shape.charset,
+  };
+  if (shape.hash8 !== undefined) placeholder.hash8 = shape.hash8;
+  return placeholder;
+}
+
+function redactStructuredJsonValue(
+  value: unknown,
+  path: string,
+  denyFields: string[] | undefined,
+  fields: RedactionField[],
+  keyName?: string,
+): unknown {
+  // A deny-listed field name redacts its entire subtree, whatever the type.
+  if (isStructuredDenyName(keyName, denyFields)) {
+    fields.push({ path, reason: "deny_field", action: "redacted" });
+    return redactedShapePlaceholder(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry, index) =>
+      redactStructuredJsonValue(entry, `${path}[${index}]`, denyFields, fields),
+    );
+  }
+
+  if (value !== null && typeof value === "object") {
+    const output: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(
+      value as Record<string, unknown>,
+    )) {
+      const safeKey = sanitizeKeyName(key);
+      if (safeKey !== key) {
+        fields.push({
+          path: `${path}.${safeKey}`,
+          reason: "json_key_token_like",
+          action: "redacted",
+        });
+        output[safeKey] = redactedShapePlaceholder(entry);
+        continue;
+      }
+      output[safeKey] = redactStructuredJsonValue(
+        entry,
+        `${path}.${safeKey}`,
+        denyFields,
+        fields,
+        key,
+      );
+    }
+    return output;
+  }
+
+  const classification = classifyStructuredValue(value, undefined, denyFields);
+  if (classification.action === "keep") return value;
+  fields.push({ path, reason: classification.reason, action: "redacted" });
+  return redactedShapePlaceholder(value);
+}
+
+function redactStructuredJsonBody(
+  body: string,
+  path: string,
+  denyFields: string[] | undefined,
+): BodyRedactionResult {
+  const parsed = JSON.parse(body) as unknown;
+  const fields: RedactionField[] = [];
+  const value = redactStructuredJsonValue(parsed, path, denyFields, fields);
+  const summary = buildSummary(
+    "json",
+    fields.length > 0 ? "redacted" : "summarized",
+    "structured_redaction",
+    body.length,
+    undefined,
+    fields.length,
+  );
+  return {
+    body: JSON.stringify(value),
+    bodySummary: summary,
+    metadata: {
+      policy: BROWSER_REDACTION_POLICY_V2,
+      fields,
+      summaries: [summary],
+    },
+  };
+}
+
 export function redactNetworkTextBody(
   body: string,
   options: BodyRedactionOptions = {},
@@ -1384,6 +1763,20 @@ export function redactNetworkTextBody(
   }
 
   if (kind === "form") return redactFormBody(body, path);
+
+  if (
+    kind === "json" &&
+    options.mode === "structured" &&
+    body.length <= STRUCTURED_BODY_MAX_BYTES
+  ) {
+    // Structured (v2) treatment. Any failure — malformed JSON or an unexpected
+    // walker error — falls through to the v1 path below; never throw upward.
+    try {
+      return redactStructuredJsonBody(body, path, options.denyFields);
+    } catch {
+      /* fall back to v1 behavior */
+    }
+  }
 
   if (kind === "json") {
     try {

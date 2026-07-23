@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   redactTokenLikeString,
   redactUrl as redactCoreUrl,
+  type BrowserRedactionPolicy,
   type BugEvent,
   type TargetDescriptor,
 } from "crumbtrail-core";
@@ -462,6 +463,11 @@ export function buildEvidenceCandidates(
   addOtelErrorCandidates(events, index, drafts);
   addBackendErrorCandidates(events, index, drafts);
   addDbDiffCandidates(events, index, drafts);
+  const mutatingRequests = collectMutatingRequests(events);
+  addDbDeltaMismatchCandidates(events, index, drafts, mutatingRequests);
+  addIneffectiveInputCandidates(events, index, drafts, mutatingRequests);
+  addUiArithmeticMismatchCandidates(events, index, drafts);
+  addUiApiDivergenceCandidates(events, index, drafts);
   addOtelDbActivityCandidates(events, index, drafts);
 
   // Downrank known third-party analytics/ads beacon failures before dedupe/ranking so a blocked
@@ -1258,6 +1264,756 @@ function addDbDiffCandidates(
       dedupeKey: `dbdiff:${event.t}:${requestId ?? ""}:${op}:${table}`,
     });
   }
+}
+
+// ─── Cross-plane invariant detectors (payload ↔ db.diff ↔ response) ───
+//
+// Both detectors operate per requestId on the correlated triple
+// net.req ↔ net.res ↔ db.diff[] and are deliberately silent on ANY ambiguity:
+// unparseable or legacy "[REDACTED]" bodies, fuzzy id matches, multi-column
+// diffs, and composite pks all produce no signal rather than a guess.
+
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+/**
+ * Id-like field names: exactly "id"/"ID", snake_case "*_id", or camelCase
+ * "*Id" (case-SENSITIVE suffix so "paid"/"valid"/"grid" never match).
+ */
+const ID_EXACT = /^id$/i;
+const ID_CAMEL_SUFFIX = /[a-z0-9]Id$/;
+const ID_SNAKE_SUFFIX = /_id$/i;
+function isIdLikeField(name: string): boolean {
+  return (
+    ID_EXACT.test(name) ||
+    ID_CAMEL_SUFFIX.test(name) ||
+    ID_SNAKE_SUFFIX.test(name)
+  );
+}
+const QTY_LIKE_FIELD = /^(qty|quantity|count|units)$/i;
+/** Field names whose values must never be echoed or reasoned about (deny-biased superset of the redaction v2 deny list). */
+const SENSITIVE_INPUT_FIELD =
+  /pass|pwd|token|secret|auth|key|card|cvv|cvc|ssn|social|email|phone|tel|address|account|iban|pin|otp|credential|session|cookie|bearer/i;
+/**
+ * Extensible stem→synonym map for ineffective_input. A payload field stem on the
+ * left matches response fields / db.diff table names containing the stem itself
+ * or any listed synonym.
+ */
+const INEFFECTIVE_INPUT_STEM_SYNONYMS: Readonly<
+  Record<string, readonly string[]>
+> = {
+  coupon: ["discount", "redemption", "promo"],
+  search: ["results"],
+  query: ["results"],
+};
+const MAX_INEFFECTIVE_INPUT_CANDIDATES = 3;
+const MAX_BODY_SCOPE_DEPTH = 6;
+
+/** Parses a structured (JSON) network body. Legacy "[REDACTED]", non-JSON, or missing bodies → undefined (no evidence). */
+function parseStructuredBody(value: unknown): unknown | undefined {
+  if (isRecord(value) || Array.isArray(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  if (!text || text === "[REDACTED]") return undefined;
+  if (!text.startsWith("{") && !text.startsWith("[")) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isRecord(parsed) || Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * True for structured-redaction v2 placeholders
+ * ({ $redacted: "[REDACTED]", len, charset, hash8? }). These are opaque
+ * redacted leaves — their shape metadata must never be enumerated as if it
+ * were payload data.
+ */
+function isRedactedPlaceholder(value: unknown): boolean {
+  return isRecord(value) && "$redacted" in value;
+}
+
+/** Collects every object scope (top level plus array elements / nested objects) up to a bounded depth. Redacted-placeholder objects are opaque leaves. */
+function collectObjectScopes(
+  value: unknown,
+  out: Record<string, unknown>[] = [],
+  depth = 0,
+): Record<string, unknown>[] {
+  if (depth > MAX_BODY_SCOPE_DEPTH) return out;
+  if (Array.isArray(value)) {
+    for (const item of value) collectObjectScopes(item, out, depth + 1);
+    return out;
+  }
+  if (!isRecord(value) || isRedactedPlaceholder(value)) return out;
+  out.push(value);
+  for (const inner of Object.values(value)) {
+    if (isRecord(inner) || Array.isArray(inner)) {
+      collectObjectScopes(inner, out, depth + 1);
+    }
+  }
+  return out;
+}
+
+interface CorrelatedRequest {
+  requestId: string;
+  reqEvent: BugEvent;
+  method: string;
+  url?: string;
+  body: unknown;
+  resBody?: unknown;
+  status?: number;
+}
+
+/** Maps requestId → mutating net.req (+ correlated net.res body/status). */
+function collectMutatingRequests(
+  events: BugEvent[],
+): Map<string, CorrelatedRequest> {
+  const requests = new Map<string, CorrelatedRequest>();
+  // db.diff correlation runs on the propagated correlation id (d.requestId),
+  // not the transport-local counter (d.id) — browser events carry both and the
+  // counter never matches a diff. Legacy fixtures without d.requestId fall back
+  // to the transport id so old sessions keep whatever correlation they had.
+  for (const event of events) {
+    if (event.k !== "net.req") continue;
+    const id = safeText(event.d.requestId, 120) ?? requestIdForEvent(event);
+    if (!id) continue;
+    const method = (
+      safeText(event.d.m, 20) ??
+      safeText(event.d.method, 20) ??
+      ""
+    ).toUpperCase();
+    if (!MUTATING_METHODS.has(method)) continue;
+    requests.set(id, {
+      requestId: id,
+      reqEvent: event,
+      method,
+      url: safeText(event.d.url, 400),
+      body: event.d.body,
+    });
+  }
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const id = safeText(event.d.requestId, 120) ?? requestIdForEvent(event);
+    if (!id) continue;
+    const entry = requests.get(id);
+    if (!entry) continue;
+    entry.resBody = event.d.body;
+    entry.status = finiteNumber(event.d.st);
+  }
+  return requests;
+}
+
+interface PayloadIdQty {
+  idField: string;
+  qtyField: string;
+  qtySum: number;
+  lines: number;
+}
+
+/**
+ * Extracts unambiguous (id, qty) pairs from a structured payload. A scope
+ * contributes only when it has EXACTLY one id-like and EXACTLY one qty-like
+ * field; multiple payload lines targeting the same id are aggregated (summed).
+ */
+function extractIdQtyPairs(payload: unknown): Map<string, PayloadIdQty> {
+  const pairs = new Map<string, PayloadIdQty>();
+  for (const scope of collectObjectScopes(payload)) {
+    const idEntries = Object.entries(scope).filter(
+      ([name, value]) =>
+        isIdLikeField(name) &&
+        (typeof value === "string" || toFiniteNumber(value) !== undefined),
+    );
+    const qtyEntries = Object.entries(scope).filter(
+      ([name, value]) =>
+        QTY_LIKE_FIELD.test(name) && toFiniteNumber(value) !== undefined,
+    );
+    if (idEntries.length !== 1 || qtyEntries.length !== 1) continue;
+    const [idField, idValue] = idEntries[0];
+    const [qtyField, qtyValue] = qtyEntries[0];
+    const qty = toFiniteNumber(qtyValue);
+    if (qty === undefined || qty < 0) continue;
+    const key = String(idValue);
+    const existing = pairs.get(key);
+    if (existing) {
+      if (existing.idField !== idField || existing.qtyField !== qtyField) {
+        // Conflicting field names for the same id — ambiguous, drop the id entirely.
+        pairs.set(key, { idField, qtyField, qtySum: Number.NaN, lines: 0 });
+        continue;
+      }
+      existing.qtySum += qty;
+      existing.lines += 1;
+    } else {
+      pairs.set(key, { idField, qtyField, qtySum: qty, lines: 1 });
+    }
+  }
+  for (const [key, value] of pairs) {
+    if (!Number.isFinite(value.qtySum)) pairs.delete(key);
+  }
+  return pairs;
+}
+
+interface InterpretedDiff {
+  event: BugEvent;
+  table: string;
+  column: string;
+  delta: number;
+}
+
+/**
+ * Interprets one db.diff as a single-numeric-column update for the given pk
+ * value. Returns undefined when the diff does not target the pk; returns null
+ * when it targets the pk but is ambiguous (composite pk, missing images, more
+ * than one changed column, or a non-numeric change) — ambiguity silences the pk.
+ */
+function interpretDiffForPk(
+  event: BugEvent,
+  pkValue: string,
+): InterpretedDiff | null | undefined {
+  if (safeText(event.d.op, 20) !== "update") return undefined;
+  const pk = event.d.pk;
+  if (!isRecord(pk)) return undefined;
+  const pkEntries = Object.entries(pk);
+  const matches = pkEntries.some(([, value]) => String(value) === pkValue);
+  if (!matches) return undefined;
+  if (pkEntries.length !== 1) return null; // composite pk → ambiguous
+  const before = event.d.before;
+  const after = event.d.after;
+  if (!isRecord(before) || !isRecord(after)) return null;
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  const changed: string[] = [];
+  for (const key of keys) {
+    if (String(before[key]) !== String(after[key])) changed.push(key);
+  }
+  if (changed.length !== 1) return null;
+  const column = changed[0];
+  const beforeNum = toFiniteNumber(before[column]);
+  const afterNum = toFiniteNumber(after[column]);
+  if (beforeNum === undefined || afterNum === undefined) return null;
+  const table = safeText(event.d.table, 200) ?? "unknown table";
+  // Signed per-diff delta; the aggregation takes |sum| so compensated writes net out.
+  return { event, table, column, delta: afterNum - beforeNum };
+}
+
+/**
+ * db_delta_mismatch: payload says "change by qty", the correlated db.diff changed a
+ * single numeric column by a different amount. Exact-pairing only; silent on
+ * any ambiguity. Uncapped — exact by construction.
+ */
+function addDbDeltaMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  mutatingRequests: Map<string, CorrelatedRequest>,
+): void {
+  const dbDiffs = events.filter((event) => event.k === "db.diff");
+  if (dbDiffs.length === 0) return;
+  const diffsByRequest = new Map<string, BugEvent[]>();
+  for (const event of dbDiffs) {
+    const requestId = safeText(event.d.requestId, 120);
+    if (!requestId) continue;
+    const list = diffsByRequest.get(requestId) ?? [];
+    list.push(event);
+    diffsByRequest.set(requestId, list);
+  }
+
+  for (const request of mutatingRequests.values()) {
+    const diffs = diffsByRequest.get(request.requestId);
+    if (!diffs || diffs.length === 0) continue;
+    const payload = parseStructuredBody(request.body);
+    if (payload === undefined) continue; // redacted/unparseable → no evidence
+    for (const [pkValue, pair] of extractIdQtyPairs(payload)) {
+      let ambiguous = false;
+      const matched: InterpretedDiff[] = [];
+      for (const diff of diffs) {
+        const interpreted = interpretDiffForPk(diff, pkValue);
+        if (interpreted === null) {
+          ambiguous = true;
+          break;
+        }
+        if (interpreted) matched.push(interpreted);
+      }
+      if (ambiguous || matched.length === 0) continue;
+      // All matched diffs must describe the same table.column, otherwise the
+      // summed delta mixes unrelated writes — ambiguous, stay silent.
+      const table = matched[0].table;
+      const column = matched[0].column;
+      if (
+        matched.some((diff) => diff.table !== table || diff.column !== column)
+      )
+        continue;
+      // |sum of signed deltas|: compensated writes cancel; epsilon absorbs FP artifacts.
+      const deltaSum = Math.abs(
+        matched.reduce((sum, diff) => sum + diff.delta, 0),
+      );
+      if (Math.abs(deltaSum - pair.qtySum) <= 1e-9) continue;
+      const anchorEvent = matched[0].event;
+      // pkValue comes from a request payload — scrub and length-cap it before
+      // echoing into human-readable draft text (same policy as other drafts).
+      const safePk = scrubText(pkValue, 120) ?? "[REDACTED]";
+      drafts.push({
+        detector: "db_delta_mismatch",
+        title: `DB delta mismatch: payload ${pair.qtyField}=${pair.qtySum} but ${table}.${column} changed by ${deltaSum}`,
+        severity: "high",
+        score: 72,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: anchorEvent.t,
+          offsetMs:
+            offsetForEvent(anchorEvent) ??
+            offsetFromStart(anchorEvent.t, index.start),
+          route: routeAt(index.navs ?? [], anchorEvent.t),
+          requestId: request.requestId,
+          method: request.method,
+          url: redactUrl(request.url),
+          message: `payload ${pair.idField}=${safePk} ${pair.qtyField}=${pair.qtySum} (${pair.lines} line${pair.lines === 1 ? "" : "s"}) vs ${table}.${column} |after−before|=${deltaSum}`,
+          source: normalizeDbEngine(anchorEvent.d.engine),
+        }),
+        dedupeKey: `dbdelta:${request.requestId}:${pkValue}:${table}:${column}`,
+      });
+    }
+  }
+}
+
+/** Stems a payload field name: lowercased leading token of camel/snake case (couponCode → coupon). */
+function stemFieldName(name: string): string {
+  const tokens = name
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(" ")
+    .filter(Boolean);
+  return tokens[0] ?? name.toLowerCase();
+}
+
+function matchTermsForStem(stem: string): string[] {
+  return [stem, ...(INEFFECTIVE_INPUT_STEM_SYNONYMS[stem] ?? [])];
+}
+
+/** Collects lowercase field-name → value entries from a parsed JSON body. */
+function collectFieldEntries(
+  value: unknown,
+  out: Array<[string, unknown]> = [],
+  depth = 0,
+): Array<[string, unknown]> {
+  if (depth > MAX_BODY_SCOPE_DEPTH) return out;
+  if (Array.isArray(value)) {
+    for (const item of value) collectFieldEntries(item, out, depth + 1);
+    return out;
+  }
+  if (!isRecord(value) || isRedactedPlaceholder(value)) return out;
+  for (const [name, inner] of Object.entries(value)) {
+    out.push([name.toLowerCase(), inner]);
+    collectFieldEntries(inner, out, depth + 1);
+  }
+  return out;
+}
+
+/**
+ * Collects numeric [fieldName, value] entries from a parsed JSON body,
+ * placeholder-opaque like collectFieldEntries but PRESERVING the original
+ * casing so camelCase names ("totalItems") still stem correctly ("total").
+ */
+function collectNumericFieldEntries(
+  value: unknown,
+  out: Array<[string, number]> = [],
+  depth = 0,
+): Array<[string, number]> {
+  if (depth > MAX_BODY_SCOPE_DEPTH) return out;
+  if (Array.isArray(value)) {
+    for (const item of value) collectNumericFieldEntries(item, out, depth + 1);
+    return out;
+  }
+  if (!isRecord(value) || isRedactedPlaceholder(value)) return out;
+  for (const [name, inner] of Object.entries(value)) {
+    const num = toFiniteNumber(inner);
+    if (num !== undefined) out.push([name, num]);
+    else collectNumericFieldEntries(inner, out, depth + 1);
+  }
+  return out;
+}
+
+function isZeroOrEmpty(value: unknown): boolean {
+  if (value === null || value === false) return true;
+  if (typeof value === "number") return value === 0;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed === "" || toFiniteNumber(trimmed) === 0;
+  }
+  if (Array.isArray(value)) return value.length === 0;
+  if (isRecord(value)) return Object.keys(value).length === 0;
+  return false;
+}
+
+/**
+ * ineffective_input: a user-input-shaped string field was accepted (2xx) but neither the
+ * response body nor any touched db table shows a trace of it. Hint-grade:
+ * confidence low, capped at 3 per session, deduped by field name.
+ */
+function addIneffectiveInputCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  mutatingRequests: Map<string, CorrelatedRequest>,
+): void {
+  const tablesByRequest = new Map<string, string[]>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    const requestId = safeText(event.d.requestId, 120);
+    const table = safeText(event.d.table, 200);
+    if (!requestId || !table) continue;
+    const list = tablesByRequest.get(requestId) ?? [];
+    list.push(table.toLowerCase());
+    tablesByRequest.set(requestId, list);
+  }
+
+  const byField = new Map<string, CandidateDraft>();
+  for (const request of mutatingRequests.values()) {
+    if (
+      request.status === undefined ||
+      request.status < 200 ||
+      request.status >= 300
+    )
+      continue;
+    const payload = parseStructuredBody(request.body);
+    if (payload === undefined) continue; // legacy "[REDACTED]"/unparseable → silent
+    const responseBody = parseStructuredBody(request.resBody);
+    if (responseBody === undefined) continue; // no readable response → no evidence
+    const responseEntries = collectFieldEntries(responseBody);
+    const touchedTables = tablesByRequest.get(request.requestId) ?? [];
+
+    for (const scope of collectObjectScopes(payload)) {
+      for (const [name, value] of Object.entries(scope)) {
+        if (typeof value !== "string") continue;
+        const trimmed = value.trim();
+        if (!trimmed || trimmed.length > 64 || trimmed === "[REDACTED]")
+          continue;
+        if (isIdLikeField(name) || QTY_LIKE_FIELD.test(name)) continue;
+        if (SENSITIVE_INPUT_FIELD.test(name)) continue;
+        const stem = stemFieldName(name);
+        if (SENSITIVE_INPUT_FIELD.test(stem)) continue;
+        const terms = matchTermsForStem(stem);
+        const matchesTerm = (candidate: string): boolean =>
+          terms.some((term) => candidate.includes(term));
+
+        if (touchedTables.some(matchesTerm)) continue; // effect visible in db
+        const matchingResponse = responseEntries.filter(([fieldName]) =>
+          matchesTerm(fieldName),
+        );
+        const hasEffect = matchingResponse.some(
+          ([, fieldValue]) => !isZeroOrEmpty(fieldValue),
+        );
+        if (hasEffect) continue;
+
+        const anchorEvent = request.reqEvent;
+        const existing = byField.get(name);
+        if (existing && existing.anchor.t <= anchorEvent.t) continue;
+        byField.set(name, {
+          detector: "ineffective_input",
+          title: `Input \`${name}\` accepted (${request.status}) but produced no observable effect`,
+          severity: "medium",
+          score: 55,
+          confidence: "low",
+          anchor: removeUndefined({
+            t: anchorEvent.t,
+            offsetMs:
+              offsetForEvent(anchorEvent) ??
+              offsetFromStart(anchorEvent.t, index.start),
+            route: routeAt(index.navs ?? [], anchorEvent.t),
+            requestId: request.requestId,
+            method: request.method,
+            url: redactUrl(request.url),
+            status: request.status,
+            message: `field \`${name}\` (stem \`${stem}\`) has no matching non-empty response field and no touched table match`,
+          }),
+          dedupeKey: `ineffinput:${name}`,
+        });
+      }
+    }
+  }
+
+  const emitted = [...byField.values()]
+    .sort((a, b) => a.anchor.t - b.anchor.t)
+    .slice(0, MAX_INEFFECTIVE_INPUT_CANDIDATES);
+  drafts.push(...emitted);
+}
+
+// ─── Display detectors (ui.num snapshots): ui_arithmetic_mismatch / ui_api_divergence ───
+//
+// Both operate on `ui.num` snapshots ({region, items:[{label, value, unit?}]})
+// emitted by the browser ui-numbers collector. Same deny-biased posture as the
+// cross-plane detectors: redacted labels, ambiguous roles, and conflicting response fields
+// silence the detector rather than guess.
+
+const MAX_UI_API_DIVERGENCE_CANDIDATES = 3;
+/** One cent: the display tolerance unit for on-screen currency comparisons. */
+const UI_CENT_EPSILON = 0.01;
+/** Absorbs binary-float artifacts on exact-boundary comparisons. */
+const UI_FLOAT_SLACK = 1e-9;
+const SUBTOTAL_LABEL_RE = /sub[\s_-]?total/i;
+const TOTAL_LABEL_RE = /\btotal\b/i;
+/** Count-style labels ("Total items", "Item count", "Qty") are counts, never currency totals. */
+const COUNT_LABEL_RE = /\b(items?|counts?|qty|quantity|units?)\b/i;
+type UiComponentRole = "subtotal" | "tax" | "fee" | "shipping" | "discount";
+const UI_COMPONENT_ROLES: ReadonlyArray<[UiComponentRole, RegExp]> = [
+  ["subtotal", SUBTOTAL_LABEL_RE],
+  ["tax", /\btax(es)?\b/i],
+  ["fee", /\bfees?\b/i],
+  ["shipping", /\bshipping\b/i],
+  ["discount", /\bdiscount\b/i],
+];
+
+interface UiNumItem {
+  label: string;
+  value: number;
+  unit?: string;
+}
+
+/** Extracts well-formed {label, value, unit?} items from a ui.num snapshot; malformed entries are dropped. */
+function uiNumItems(event: BugEvent): UiNumItem[] {
+  const items = event.d.items;
+  if (!Array.isArray(items)) return [];
+  const out: UiNumItem[] = [];
+  for (const item of items) {
+    if (!isRecord(item)) continue;
+    const label = safeText(item.label, 120);
+    const value = finiteNumber(item.value);
+    if (label === undefined || value === undefined) continue;
+    const unit = safeText(item.unit, 20);
+    out.push(unit === undefined ? { label, value } : { label, value, unit });
+  }
+  return out;
+}
+
+/**
+ * Maps a display label to its arithmetic role. Component patterns are checked
+ * before the bare total pattern so "Subtotal"/"Sub Total" never reads as a
+ * total and qualified totals like "Total tax"/"Total fees"/"Total discount"
+ * classify as the component they name, not as THE total. Count-style total
+ * labels ("Total items") are counts, not totals → no role.
+ */
+function uiLabelRole(label: string): UiComponentRole | "total" | undefined {
+  for (const [role, pattern] of UI_COMPONENT_ROLES) {
+    if (pattern.test(label)) return role;
+  }
+  if (TOTAL_LABEL_RE.test(label)) {
+    if (COUNT_LABEL_RE.test(label)) return undefined;
+    return "total";
+  }
+  return undefined;
+}
+
+function formatCents(value: number): string {
+  return (Math.round(value * 100) / 100).toFixed(2);
+}
+
+/**
+ * ui_arithmetic_mismatch: within one ui.num snapshot the labeled component amounts
+ * (subtotal/tax/fee/shipping, minus discount) disagree with the labeled total
+ * beyond ε = 1 cent per component. Arithmetic either holds or it doesn't →
+ * confidence high, uncapped. Silent on redacted labels, ambiguous roles
+ * (no total, multiple totals, or no components), and unit disagreement.
+ * qty×price vs line total deferred — ui.num items carry no per-line pairing;
+ * the playground display-total regression only needs component-vs-total.
+ */
+function addUiArithmeticMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (event.k !== "ui.num") continue;
+    const items = uiNumItems(event);
+    if (items.length === 0) continue;
+    if (items.some((item) => item.label.includes("[REDACTED]"))) continue;
+    const region = safeText(event.d.region, 200) ?? "unknown region";
+
+    const totals: UiNumItem[] = [];
+    const components: Array<UiNumItem & { role: UiComponentRole }> = [];
+    for (const item of items) {
+      const role = uiLabelRole(item.label);
+      if (role === "total") totals.push(item);
+      else if (role !== undefined) components.push({ ...item, role });
+    }
+    // Ambiguous roles → silent: exactly one total and at least one component required.
+    if (totals.length !== 1 || components.length === 0) continue;
+    const total = totals[0];
+    // When units are present they must agree: a count total vs $ components
+    // (or any mixed units among total+components) is not an arithmetic claim.
+    const units = new Set(
+      [total, ...components]
+        .map((item) => item.unit?.trim().toLowerCase())
+        .filter((unit): unit is string => unit !== undefined && unit !== ""),
+    );
+    if (units.size > 1) continue;
+    // Discounts are displayed either as positive amounts ("Discount 20") or
+    // already-negated ("Discount −20"); subtract the magnitude either way.
+    const sum = components.reduce(
+      (acc, item) =>
+        acc + (item.role === "discount" ? -Math.abs(item.value) : item.value),
+      0,
+    );
+    const epsilon = UI_CENT_EPSILON * components.length;
+    if (Math.abs(sum - total.value) <= epsilon + UI_FLOAT_SLACK) continue;
+
+    // Evidence: the snapshot items verbatim (labels already passed the capture-side classifier).
+    const itemsText = items
+      .map((item) => `${item.label}:${item.value}`)
+      .join(", ");
+    drafts.push({
+      detector: "ui_arithmetic_mismatch",
+      title: `UI arithmetic mismatch in ${region}: components sum to ${formatCents(sum)} but ${total.label} shows ${formatCents(total.value)}`,
+      severity: "medium",
+      score: 60,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        message: scrubText(itemsText, 220),
+      }),
+      // Region + the two mismatch amounts: re-emits of the same broken region collapse.
+      dedupeKey: `uiarith:${region}:${formatCents(sum)}:${formatCents(total.value)}`,
+    });
+  }
+}
+
+/** Normalizes a label/field name for exact matching: lowercase, separators stripped. */
+function normalizeFieldName(name: string): string {
+  return name.toLowerCase().replace(/[\s_-]+/g, "");
+}
+
+const COUNT_SUFFIX_RE = /^(items?|counts?|qty|nums?|numbers?)\b/i;
+
+/**
+ * Resolves which response-field entries a UI label compares against. Exact
+ * case-normalized full-name matches win; the stem fallback applies only when
+ * exactly one distinct same-stem field name exists AND that name does not
+ * continue with a count-like suffix ("totalItems"/"totalCount" are counts,
+ * not the on-screen amount).
+ */
+function resolveDivergenceMatches(
+  label: string,
+  stem: string,
+  entries: Array<{ name: string; value: number; requestId?: string }>,
+): Array<{ name: string; value: number; requestId?: string }> | undefined {
+  const target = normalizeFieldName(label);
+  const exact = entries.filter(
+    (entry) => normalizeFieldName(entry.name) === target,
+  );
+  if (exact.length > 0) return exact;
+  const stemMatches = entries.filter(
+    (entry) => stemFieldName(entry.name) === stem,
+  );
+  if (stemMatches.length === 0) return undefined;
+  const distinctNames = new Set(
+    stemMatches.map((entry) => normalizeFieldName(entry.name)),
+  );
+  if (distinctNames.size !== 1) return undefined;
+  const suffix = stemMatches[0].name
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(" ")
+    .filter(Boolean)
+    .slice(1)
+    .join(" ");
+  if (suffix && COUNT_SUFFIX_RE.test(suffix)) return undefined;
+  return stemMatches;
+}
+
+/**
+ * C2: a labeled on-screen number differs by more than one cent from a
+ * matching numeric field in a net.res body received since the last
+ * navigation. Exact (case-normalized) field-name matches are preferred; a
+ * stem match is a fallback only when it is unambiguous and not count-like.
+ * Silent when no response body parses, the label is redacted, or multiple
+ * candidate response fields conflict. Confidence medium, capped at 3 per
+ * session, deduped by label stem.
+ */
+function addUiApiDivergenceCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const uiEvents = events.filter((event) => event.k === "ui.num");
+  if (uiEvents.length === 0) return;
+  const responses = events.filter((event) => event.k === "net.res");
+  const navs = index.navs ?? [];
+
+  const byStem = new Map<string, CandidateDraft>();
+  for (const event of uiEvents) {
+    // Only responses received since the last navigation before this snapshot
+    // count. `navs` is assumed sorted ascending by t. A response at the nav
+    // instant belongs to the old page, so the boundary is exclusive (<=).
+    let navBoundary = Number.NEGATIVE_INFINITY;
+    for (const nav of navs) {
+      if (nav.t > event.t) break;
+      navBoundary = nav.t;
+    }
+
+    const fieldEntries: Array<{
+      name: string;
+      value: number;
+      requestId?: string;
+    }> = [];
+    for (const response of responses) {
+      if (response.t <= navBoundary || response.t > event.t) continue;
+      const body = parseStructuredBody(response.d.body);
+      if (body === undefined) continue; // unreadable response → no evidence
+      const requestId = requestIdForEvent(response);
+      for (const [name, value] of collectNumericFieldEntries(body)) {
+        fieldEntries.push(
+          requestId === undefined ? { name, value } : { name, value, requestId },
+        );
+      }
+    }
+    if (fieldEntries.length === 0) continue;
+
+    for (const item of uiNumItems(event)) {
+      if (item.label.includes("[REDACTED]")) continue;
+      const stem = stemFieldName(item.label);
+      if (byStem.has(stem)) continue; // dedupe by label stem, keep the earliest
+      const matches = resolveDivergenceMatches(item.label, stem, fieldEntries);
+      if (!matches || matches.length === 0) continue;
+      // Conflicting candidate response values → ambiguous, stay silent.
+      const apiValue = matches[0].value;
+      if (
+        matches.some(
+          (candidate) =>
+            Math.abs(candidate.value - apiValue) >
+            UI_CENT_EPSILON + UI_FLOAT_SLACK,
+        )
+      )
+        continue;
+      if (Math.abs(item.value - apiValue) <= UI_CENT_EPSILON + UI_FLOAT_SLACK)
+        continue;
+
+      byStem.set(stem, {
+        detector: "ui_api_divergence",
+        title: `UI shows ${item.label} ${formatCents(item.value)} but the API reported ${formatCents(apiValue)}`,
+        severity: "medium",
+        score: 55,
+        confidence: "medium",
+        anchor: removeUndefined({
+          t: event.t,
+          offsetMs:
+            offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+          route: routeAt(index.navs ?? [], event.t),
+          requestId: matches[0].requestId,
+          message: scrubText(
+            `on-screen \`${item.label}\`=${item.value} vs response field stem \`${stem}\`=${apiValue}`,
+            220,
+          ),
+        }),
+        dedupeKey: `uidiverge:${stem}`,
+      });
+    }
+  }
+
+  const emitted = [...byStem.values()]
+    .sort((a, b) => a.anchor.t - b.anchor.t)
+    .slice(0, MAX_UI_API_DIVERGENCE_CANDIDATES);
+  drafts.push(...emitted);
 }
 
 function addOtelDbActivityCandidates(
@@ -2387,6 +3143,16 @@ function finiteNumber(value: unknown): number | undefined {
     : undefined;
 }
 
+/** Coercing variant of `finiteNumber`: also parses numeric strings ("3" → 3); strict `finiteNumber` accepts numbers only. */
+function toFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
 function offsetForEvent(event: BugEvent | undefined): number | undefined {
   if (!event) return undefined;
   return (
@@ -2440,6 +3206,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
-export function evidenceRedactionPolicy(): typeof BROWSER_REDACTION_POLICY {
+/**
+ * Baseline policy tag for evidence produced by this indexer. Typed as the
+ * v1|v2 union: individual events may carry either tag (structured v2 network
+ * bodies included), even though the indexer's own baseline remains v1.
+ */
+export function evidenceRedactionPolicy(): BrowserRedactionPolicy {
   return BROWSER_REDACTION_POLICY;
 }
