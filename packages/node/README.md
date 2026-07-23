@@ -144,6 +144,8 @@ crumbtrail-server --version                     # print crumbtrail-node version
 crumbtrail-server serve --help           # focused help for any subcommand
 crumbtrail-server fix-context <sessionId> --json   # correlated, LLM ready fix-context.v2 bundle
 crumbtrail-server fix-context <sessionId>          # human-readable summary
+crumbtrail-server capsule "<symptom title>" --json  # capsule.v2 issue resolution envelope
+crumbtrail-server capsule "<symptom title>"        # human-readable summary
 crumbtrail-server inspect <sessionId>           # hot-plane-only session summary
 crumbtrail-server inspect <sessionId> --json    # machine-readable summary
 crumbtrail-server scan ./src --strict           # coverage scanner (CI gate); findings carry a suggested fix
@@ -154,6 +156,13 @@ crumbtrail-server doctor --port 9898            # verify capture + correlation +
 override with `--output`) or a path to a session directory. Both read hot-plane artifacts
 only and never open the raw event log. `inspect` reports duration, event/error/failed-request
 counts, signal count, truncation state, and on-disk artifact sizes.
+
+`capsule` takes a symptom rather than a session id: it locates the matching recording, assembles
+the existing `fusion.v1` ranked bundle, and wraps that bundle verbatim in the ten part
+`capsule.v2` envelope. It runs the same shared resolution helper as the `resolveCapsule` MCP
+tool, so both surfaces return the same capsule for the same issue. Completeness is scored only
+against a configured evidence profile, so it reports as not scored when none exists, and a thin
+match still returns a deliverable capsule that states its own gaps.
 
 ## MCP evidence retrieval
 
@@ -180,7 +189,11 @@ current code and tests, and report uncertainty or evidence gaps.
    or time range, `getEvidence` to inspect one reference, and `getWindow` only
    for the required time window. `getWindow` is capped and reports truncation.
 4. Use `solveContext`, `recallSimilarIssues`, and `searchSpecs` as context for
-   a diagnosis, not as a verdict. `searchSpecs` returns advisory documentation,
+   a diagnosis, not as a verdict. Use `resolveCapsule` when you want the same
+   ranked bundle framed as the `capsule.v2` envelope: identity, symptom,
+   occurrences, evidence, join graph, quality report, advisory opinion, memory,
+   resolution, and agent directions. It reuses the bundle rather than re-ranking
+   it, and stays advisory. `searchSpecs` returns advisory documentation,
    which can be stale and is not observed behavior. On cloud deployments a
    recall match can also carry an `outcomeSummary` and reasons such as
    `resolution_verified` or `resolution_recurred`; prefer a verified resolution.
