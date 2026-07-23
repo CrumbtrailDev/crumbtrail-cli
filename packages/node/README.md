@@ -146,6 +146,8 @@ crumbtrail-server fix-context <sessionId> --json   # correlated, LLM ready fix-c
 crumbtrail-server fix-context <sessionId>          # human-readable summary
 crumbtrail-server capsule "<symptom title>" --json  # capsule.v2 issue resolution envelope
 crumbtrail-server capsule "<symptom title>"        # human-readable summary
+crumbtrail-server capsule --ticket <ticket url> --json     # resolve a ticket to the same envelope
+crumbtrail-server capsule --ticket <key> --provider jira   # resolve by provider and ticket key
 crumbtrail-server inspect <sessionId>           # hot-plane-only session summary
 crumbtrail-server inspect <sessionId> --json    # machine-readable summary
 crumbtrail-server scan ./src --strict           # coverage scanner (CI gate); findings carry a suggested fix
@@ -157,12 +159,15 @@ override with `--output`) or a path to a session directory. Both read hot-plane 
 only and never open the raw event log. `inspect` reports duration, event/error/failed-request
 counts, signal count, truncation state, and on-disk artifact sizes.
 
-`capsule` takes a symptom rather than a session id: it locates the matching recording, assembles
-the existing `fusion.v1` ranked bundle, and wraps that bundle verbatim in the ten part
-`capsule.v2` envelope. It runs the same shared resolution helper as the `resolveCapsule` MCP
-tool, so both surfaces return the same capsule for the same issue. Completeness is scored only
-against a configured evidence profile, so it reports as not scored when none exists, and a thin
-match still returns a deliverable capsule that states its own gaps.
+`capsule` takes a ticket reference or a symptom rather than a session id. With `--ticket` it
+fetches and normalizes the ticket through the documented provider env vars (`JIRA_*`,
+`ZENDESK_*`, `TRELLO_*`), then locates the matching recording, assembles the existing
+`fusion.v1` ranked bundle, and wraps that bundle verbatim in the ten part `capsule.v2`
+envelope. Pass a pasted ticket URL, or a ticket key together with `--provider`. It runs the
+same shared resolution pipeline as the `resolveCapsule` and `solveContext` MCP tools, so both
+surfaces return the same capsule for the same input. Completeness is scored only against a
+configured evidence profile, so it reports as not scored when none exists, and a thin match
+still returns a deliverable capsule that states its own gaps.
 
 ## MCP evidence retrieval
 
@@ -192,7 +197,9 @@ current code and tests, and report uncertainty or evidence gaps.
    a diagnosis, not as a verdict. Use `resolveCapsule` when you want the same
    ranked bundle framed as the `capsule.v2` envelope: identity, symptom,
    occurrences, evidence, join graph, quality report, advisory opinion, memory,
-   resolution, and agent directions. It reuses the bundle rather than re-ranking
+   resolution, and agent directions. It accepts the same `ticket` input as
+   `solveContext` and runs the same resolution pipeline, so a ticket resolves
+   identically through either tool. It reuses the bundle rather than re-ranking
    it, and stays advisory. `searchSpecs` returns advisory documentation,
    which can be stale and is not observed behavior. On cloud deployments a
    recall match can also carry an `outcomeSummary` and reasons such as

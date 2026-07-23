@@ -8,9 +8,10 @@ import {
   compileCapsuleFromBundle,
   deriveCapsuleCanonicalId,
   deriveCapsuleSignature,
-  resolveIssueToCapsule,
+  resolveTicketToCapsule,
 } from "../capsule-resolve";
 import { buildRecallStore } from "../recall";
+import { localSessionAccess } from "../ticket-resolve";
 import { McpServer } from "../mcp-server";
 import { runCli } from "../cli";
 
@@ -293,32 +294,45 @@ describe("compileCapsuleFromBundle (the one compile site)", () => {
 
 // --- the shared resolution path --------------------------------------------
 
-describe("resolveIssueToCapsule (shared by MCP + CLI)", () => {
-  it("resolves a symptom through the existing locate+assemble path", async () => {
+/** The deps both capsule surfaces build for the one shared producer. */
+function depsFor(root: string) {
+  return {
+    recallStore: buildRecallStore(root),
+    evidenceSources: [],
+    localSessions: localSessionAccess(root),
+    surface: "capsule",
+  };
+}
+
+describe("resolveTicketToCapsule (shared by MCP + CLI)", () => {
+  it("resolves a symptom through the shared ticket → bundle producer", async () => {
     const root = makeRoot();
     seedLocatedSession(root, "sess-checkout");
 
-    const { capsule, bundle, match } = await resolveIssueToCapsule(
-      { title: "checkout failed span error", url: "/api/checkout" },
-      buildRecallStore(root),
-      { sources: [] },
+    const resolved = await resolveTicketToCapsule(
+      { symptom: { title: "checkout failed span error", url: "/api/checkout" } },
+      depsFor(root),
     );
 
-    expect(capsule.schemaVersion).toBe("capsule.v2");
-    // The capsule wraps exactly the bundle the existing path produced.
-    expect(capsule.evidence.bundle).toBe(bundle);
-    expect(bundle.schemaVersion).toBe("fusion.v1");
-    expect(match).toBeDefined();
+    expect(resolved.kind).toBe("capsule");
+    if (resolved.kind !== "capsule") return;
+    expect(resolved.capsule.schemaVersion).toBe("capsule.v2");
+    // The capsule wraps exactly the bundle the shared producer returned.
+    expect(resolved.capsule.evidence.bundle).toBe(resolved.bundle);
+    expect(resolved.bundle.schemaVersion).toBe("fusion.v1");
+    expect(resolved.source).toBe("local");
   });
 
   it("returns a deliverable capsule that states its limits when nothing matches", async () => {
     const root = makeRoot();
 
-    const { capsule } = await resolveIssueToCapsule(
-      { title: "nothing recorded like this" },
-      buildRecallStore(root),
-      { sources: [] },
+    const resolved = await resolveTicketToCapsule(
+      { symptom: { title: "nothing recorded like this" } },
+      depsFor(root),
     );
+    expect(resolved.kind).toBe("capsule");
+    if (resolved.kind !== "capsule") return;
+    const capsule = resolved.capsule;
 
     // Deliverable, not a refusal: a full envelope carrying its own gaps.
     expect(capsule.schemaVersion).toBe("capsule.v2");
