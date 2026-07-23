@@ -102,6 +102,7 @@ describe("MCP pull-path (solveContext ticket → cloud bundle)", () => {
     mock = undefined;
     fs.rmSync(tmpDir, { recursive: true, force: true });
     delete process.env.CRUMBTRAIL_CLOUD_URL;
+    delete process.env.CRUMBTRAIL_CLOUD_TOKEN;
     delete process.env.CRUMBTRAIL_API_KEY;
   });
 
@@ -119,6 +120,7 @@ describe("MCP pull-path (solveContext ticket → cloud bundle)", () => {
   it("a Jira browse URL resolves + short-circuits to the stored cloud bundle", async () => {
     mock = await startMockCloud("ABC-123");
     process.env.CRUMBTRAIL_CLOUD_URL = mock.url;
+    process.env.CRUMBTRAIL_CLOUD_TOKEN = "mcp-read-token";
     process.env.CRUMBTRAIL_API_KEY = "proj-key-xyz";
     const server = new McpServer({
       outputDir: tmpDir,
@@ -144,6 +146,7 @@ describe("MCP pull-path (solveContext ticket → cloud bundle)", () => {
   it("a Jira REST-issue URL resolves to the SAME stored bundle as browse", async () => {
     mock = await startMockCloud("ABC-123");
     process.env.CRUMBTRAIL_CLOUD_URL = mock.url;
+    process.env.CRUMBTRAIL_CLOUD_TOKEN = "mcp-read-token";
     process.env.CRUMBTRAIL_API_KEY = "proj-key-xyz";
     const server = new McpServer({
       outputDir: tmpDir,
@@ -161,6 +164,7 @@ describe("MCP pull-path (solveContext ticket → cloud bundle)", () => {
   it("an explicit {provider,id} resolves to the SAME stored bundle", async () => {
     mock = await startMockCloud("ABC-123");
     process.env.CRUMBTRAIL_CLOUD_URL = mock.url;
+    process.env.CRUMBTRAIL_CLOUD_TOKEN = "mcp-read-token";
     process.env.CRUMBTRAIL_API_KEY = "proj-key-xyz";
     const server = new McpServer({
       outputDir: tmpDir,
@@ -177,6 +181,7 @@ describe("MCP pull-path (solveContext ticket → cloud bundle)", () => {
   it("a cloud MISS falls back to the local path unchanged (no short-circuit)", async () => {
     mock = await startMockCloud("SOME-OTHER-KEY"); // ABC-123 will 404
     process.env.CRUMBTRAIL_CLOUD_URL = mock.url;
+    process.env.CRUMBTRAIL_CLOUD_TOKEN = "mcp-read-token";
     process.env.CRUMBTRAIL_API_KEY = "proj-key-xyz";
     const server = new McpServer({
       outputDir: tmpDir,

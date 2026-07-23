@@ -121,7 +121,7 @@ describe("MCP Server", () => {
     });
     expect(res).not.toBeNull();
     const result = res!.result as any;
-    expect(result.tools).toHaveLength(35);
+    expect(result.tools).toHaveLength(37);
     const names = result.tools.map((t: any) => t.name);
     expect(names).toContain("listSessions");
     expect(names).toContain("getFixContext");
@@ -154,7 +154,10 @@ describe("MCP Server", () => {
     expect(names).toContain("getBugFailedRequests");
     expect(names).toContain("getBugVoiceTranscript");
     expect(names).toContain("getBugLLMContext");
-    expect(names).toContain("resolveBug");
+    expect(names).toContain("resolveIssue");
+    expect(names).toContain("recordFeedback");
+    expect(names).toContain("getPlaybook");
+    expect(names).not.toContain("resolveBug");
 
     const linkedTool = result.tools.find(
       (t: any) => t.name === "getLinkedRequestContext",
@@ -512,6 +515,12 @@ describe("MCP Server", () => {
       path.join(partitionedDir, "meta.json"),
       JSON.stringify({ id: "sess-3", start: 3000, app: "test-app" }),
     );
+    const metadataWithoutId = path.join(tmpDir, "sess-store-id-fallback");
+    fs.mkdirSync(metadataWithoutId, { recursive: true });
+    fs.writeFileSync(
+      path.join(metadataWithoutId, "meta.json"),
+      JSON.stringify({ start: 3500, app: "test-app" }),
+    );
 
     const res = await server.handleMessage({
       jsonrpc: "2.0",
@@ -525,6 +534,7 @@ describe("MCP Server", () => {
       "sess-1",
       "sess-2",
       "sess-3",
+      "sess-store-id-fallback",
     ]);
   });
 
@@ -604,12 +614,12 @@ describe("MCP Server", () => {
     const result = res!.result as any;
     const sessions = JSON.parse(result.content[0].text);
     const row = sessions.find((session: any) => session.id === "sess-aliased");
-    // release/build are first-class on the row even though the app used the
-    // `version`/`commit` aliases; the raw aliases are preserved too.
+    // release/build are first-class on the compact row even though the app used
+    // the `version`/`commit` aliases; raw aliases stay out of list views.
     expect(row.release).toBe("R192");
     expect(row.build).toBe("deadbeef");
-    expect(row.version).toBe("R192");
-    expect(row.commit).toBe("deadbeef");
+    expect(row.version).toBeUndefined();
+    expect(row.commit).toBeUndefined();
   });
 
   it("getIndex returns index.json contents for a session", async () => {
@@ -751,6 +761,31 @@ describe("MCP Server", () => {
     expect(parsed).toHaveLength(3);
   });
 
+  it("getEvents clamps malformed limits to a safe integer range", async () => {
+    createSession(
+      "sess-safe-limit",
+      Array.from({ length: 600 }, (_, i) => ({ t: i, k: "nav", d: {} })),
+    );
+    for (const [limit, expected] of [
+      [9999, 500],
+      [-4, 1],
+      [3.9, 3],
+    ]) {
+      const res = await server.handleMessage({
+        jsonrpc: "2.0",
+        id: `safe-limit-${limit}`,
+        method: "tools/call",
+        params: {
+          name: "getEvents",
+          arguments: { sessionId: "sess-safe-limit", limit },
+        },
+      });
+      expect(JSON.parse((res!.result as any).content[0].text)).toHaveLength(
+        expected,
+      );
+    }
+  });
+
   it("getErrorContext returns error events with surrounding context", async () => {
     const events = [
       { t: 1000, k: "nav", d: { to: "/home" } },
@@ -780,6 +815,33 @@ describe("MCP Server", () => {
     expect(parsed[0].context.find((e: any) => e.t === 5000)).toBeUndefined();
   });
 
+  it("bounds error contexts and reports token-budget drops", async () => {
+    createSession(
+      "sess-bounded-context",
+      Array.from({ length: 150 }, (_, i) => ({
+        t: i,
+        k: i % 2 === 0 ? "err" : "nav",
+        d: { msg: `event-${i}` },
+      })),
+    );
+    const res = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: "bounded-context",
+      method: "tools/call",
+      params: {
+        name: "getErrorContext",
+        arguments: {
+          sessionId: "sess-bounded-context",
+          limit: 2,
+          maxTokens: 1,
+        },
+      },
+    });
+    const parsed = JSON.parse((res!.result as any).content[0].text);
+    expect(parsed.contexts).toEqual([]);
+    expect(parsed.dropReport).toBeDefined();
+  });
+
   it("getFailedRequests returns failed requests", async () => {
     const events = [
       { t: 1000, k: "net.res", d: { st: 200, id: "r1" } },
@@ -800,6 +862,29 @@ describe("MCP Server", () => {
     const result = res!.result as any;
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed).toHaveLength(2);
+  });
+
+  it("bounds failed requests and reports token-budget drops", async () => {
+    createSession(
+      "sess-bounded-failed",
+      Array.from({ length: 10 }, (_, i) => ({
+        t: i,
+        k: "net.res",
+        d: { st: 500, id: `r${i}` },
+      })),
+    );
+    const res = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: "bounded-failed",
+      method: "tools/call",
+      params: {
+        name: "getFailedRequests",
+        arguments: { sessionId: "sess-bounded-failed", limit: 2, maxTokens: 1 },
+      },
+    });
+    const parsed = JSON.parse((res!.result as any).content[0].text);
+    expect(parsed.requests).toEqual([]);
+    expect(parsed.dropReport).toBeDefined();
   });
 
   it("getLinkedRequestContext returns linked full-stack request evidence from the index", async () => {
@@ -1485,12 +1570,12 @@ describe("MCP Server", () => {
       createSession("sess-div", events);
       exposeSessionAsBug("sess-div", "bug_div");
 
-      // Session getEvents does NOT clamp — honors the raw limit.
+      // Session getEvents caps large requests to keep MCP responses bounded.
       const s = await callTool("getEvents", {
         sessionId: "sess-div",
         limit: 1500,
       });
-      expect(s.parsed).toHaveLength(1500);
+      expect(s.parsed).toHaveLength(500);
 
       // Bug getEvents clamps the limit to 1000.
       const b = await callTool("getBugEvents", {
@@ -1532,10 +1617,11 @@ describe("MCP Server", () => {
       expect(missBugFR.result.isError).toBe(true);
       expect(missBugFR.result.content[0].text).toContain("Bug not found");
 
-      // Session getEvents on a missing dir returns [] (not an error).
+      // Missing sessions are explicit so empty evidence cannot be misread as a
+      // valid session with no events.
       const missSession = await callTool("getEvents", { sessionId: "ghost" });
-      expect(missSession.result.isError).toBeFalsy();
-      expect(missSession.parsed).toEqual([]);
+      expect(missSession.result.isError).toBe(true);
+      expect(missSession.result.content[0].text).toContain("Session not found");
 
       // Session failedRequests discovers the missing session via index.json.
       const missFR = await callTool("getFailedRequests", {
