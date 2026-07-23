@@ -102,6 +102,9 @@ importers:
       node-sql-parser:
         specifier: ^5.4.0
         version: 5.4.0
+      playwright:
+        specifier: '>=1.40.0'
+        version: 1.61.1
       protobufjs:
         specifier: ^8.6.5
         version: 8.7.0
