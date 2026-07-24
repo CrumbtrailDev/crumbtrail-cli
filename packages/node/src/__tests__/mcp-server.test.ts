@@ -7,7 +7,7 @@ import { computeDistinctBugSignatures } from "../index";
 import { postProcess } from "../post-process";
 import { buildFixContext } from "../fix-context";
 import { runFixContext } from "../run-fix-context";
-import { BUDGET_SLACK_TOKENS, estimateTokens } from "../token-estimate";
+import { estimateTokens } from "../token-estimate";
 import { FakeEvidenceSource } from "../evidence-sources/fake-source";
 import type { EvidenceItem } from "crumbtrail-core";
 
@@ -1734,11 +1734,9 @@ describe("MCP Server", () => {
       expect(parsed.dropReport.message).toMatch(/^omitted \d+ items?, ~/);
       expect(parsed.dropReport.droppedTokenEstimate).toBeGreaterThan(0);
 
-      // Estimate is over the exact serialized response and within budget+slack.
+      // Estimate is over the exact serialized response and inside the budget.
       expect(parsed.tokenEstimate).toBe(estimateTokens(text!));
-      expect(parsed.tokenEstimate).toBeLessThanOrEqual(
-        maxTokens + BUDGET_SLACK_TOKENS,
-      );
+      expect(parsed.tokenEstimate).toBeLessThanOrEqual(maxTokens);
 
       // A dropped candidate ref resolves back through getEvidence.
       const ref = parsed.dropReport.droppedRefs[0];
@@ -1763,6 +1761,526 @@ describe("MCP Server", () => {
           "maxTokens must be an integer >= 1",
         );
       }
+    });
+
+    // --- Cross-plane budgeting ------------------------------------------------
+    //
+    // A fix-context bundle is not one ranked list: `primary_window` carries
+    // request and database planes that used to be fixed cost, so a small budget
+    // dropped 100% of `signals` — the ranked detector output, the only plane
+    // that names a root cause — and still overran by multiples. These pin the
+    // priority order, the causal-chain invariant, and the honest over-budget
+    // result.
+
+    /** A bulky primary_window: linked full-stack requests plus db row diffs. */
+    function writeBundle(
+      sessionId: string,
+      opts: { requests: number; dbDiffs: number },
+    ) {
+      const linked = Array.from({ length: opts.requests }, (_, i) => ({
+        requestId: `req_full_${String(i).padStart(2, "0")}`,
+        sessionId,
+        frontend: {
+          ref: { t: 2000 + i },
+          requestId: `req_full_${String(i).padStart(2, "0")}`,
+          method: "POST",
+          url: `/api/checkout/${i}`,
+          status: 500,
+          durationMs: 120 + i,
+          error: { message: `frontend detail ${"x".repeat(140)}` },
+        },
+        backend: {
+          requestId: `req_full_${String(i).padStart(2, "0")}`,
+          sessionId,
+          method: "POST",
+          url: `/api/checkout/${i}`,
+          route: "/api/checkout/:id",
+          statusCode: 500,
+          durationMs: 130 + i,
+          error: {
+            name: "Error",
+            code: "E_CHECKOUT",
+            message: `backend detail ${"y".repeat(220)}`,
+          },
+        },
+      }));
+      const databaseDiffs = Array.from({ length: opts.dbDiffs }, (_, i) => ({
+        t: 2000 + i,
+        engine: "postgres",
+        op: "update",
+        table: `table_${i}`,
+        pk: { id: i },
+        before: { price: 100 + i, note: "z".repeat(90) },
+        after: { price: 200 + i, note: "z".repeat(90) },
+        requestId: `req_full_${String(i).padStart(2, "0")}`,
+      }));
+      fs.writeFileSync(
+        path.join(tmpDir, sessionId, "llm.json"),
+        JSON.stringify({
+          session: {
+            id: sessionId,
+            app: "test-app",
+            startMs: 1000,
+            endMs: 3000,
+            durationMs: 2000,
+          },
+          fullStackEvidence: {
+            schemaVersion: 1,
+            summary: {
+              frontendRequests: linked.length,
+              backendRequests: linked.length,
+              linked: linked.length,
+              gaps: 0,
+              gapTypes: {},
+            },
+            linked,
+            gaps: [],
+            limitations: [],
+          },
+          databaseDiffs,
+        }),
+      );
+    }
+
+    /** Candidates carrying a root → symptom chain over the given ranks. */
+    function causalCandidates(count: number) {
+      const candidates = fatCandidates(count) as any[];
+      candidates[0].causalRole = "root";
+      candidates[0].causes = ["cand_0005"];
+      candidates[4].causalRole = "symptom";
+      candidates[4].rootCauseId = "cand_0001";
+      candidates[4].attributionConfidence = "likely";
+      return candidates;
+    }
+
+    /** Kept-count vector in the canonical plane priority order. */
+    function planeVector(parsed: any) {
+      return [
+        parsed.signals.length,
+        parsed.primary_window.db_diffs.length,
+        parsed.primary_window.db_reads.length,
+        parsed.primary_window.db_activity.length,
+        parsed.primary_window.backend.requests.length,
+        parsed.primary_window.frontend.requests.length,
+      ];
+    }
+
+    function bulkySession(sessionId: string, candidates: unknown[]) {
+      createSession(sessionId, [
+        { t: 1000, k: "nav", d: { to: "/checkout" } },
+        { t: 2000, k: "err", d: { msg: "boom" } },
+      ]);
+      writeCandidates(sessionId, candidates);
+      writeBundle(sessionId, { requests: 10, dbDiffs: 7 });
+    }
+
+    it("a small maxTokens keeps top-ranked signals and trims primary_window instead", async () => {
+      bulkySession("sess-planes-small", fatCandidates(9));
+
+      const full = await callTool("getFixContext", {
+        sessionId: "sess-planes-small",
+      });
+      // The unbudgeted bundle is genuinely bulky on the request/db planes.
+      expect(full.parsed.primary_window.frontend.requests).toHaveLength(10);
+      expect(full.parsed.primary_window.backend.requests).toHaveLength(10);
+      expect(full.parsed.primary_window.db_diffs).toHaveLength(7);
+      const fullEstimate = estimateTokens(full.text!);
+
+      const maxTokens = Math.floor(fullEstimate / 3);
+      const { parsed, text } = await callTool("getFixContext", {
+        sessionId: "sess-planes-small",
+        maxTokens,
+      });
+
+      // The regression: signals used to be emptied while the request arrays
+      // survived whole and the response still blew the budget.
+      expect(parsed.signals.length).toBeGreaterThan(0);
+      expect(parsed.signals[0].id).toBe("cand_0001");
+      expect(parsed.primary_window.frontend.requests.length).toBeLessThan(10);
+      expect(parsed.primary_window.backend.requests.length).toBeLessThan(10);
+
+      expect(parsed.budgetSatisfied).toBe(true);
+      expect(parsed.tokenEstimate).toBe(estimateTokens(text!));
+      expect(parsed.tokenEstimate).toBeLessThanOrEqual(maxTokens);
+
+      // Every trimmed plane is named, not just `signals`. The two request
+      // arrays are ONE plane, so they are named once, together.
+      const named = parsed.dropReport.planes.map((p: any) => p.plane);
+      expect(named).toContain("primary_window.requests");
+      for (const plane of parsed.dropReport.planes) {
+        expect(parsed.dropReport.message).toContain(plane.plane);
+        expect(plane.droppedCount).toBeGreaterThan(0);
+      }
+    });
+
+    it("pins the plane priority order: a plane only loses items once every higher-priority plane is whole", async () => {
+      bulkySession("sess-planes-order", fatCandidates(9));
+
+      const order = [
+        "signals",
+        "primary_window.db_diffs",
+        "primary_window.db_reads",
+        "primary_window.db_activity",
+        "primary_window.backend.requests",
+        "primary_window.frontend.requests",
+      ];
+      const full = await callTool("getFixContext", {
+        sessionId: "sess-planes-order",
+      });
+      const fullVector = planeVector(full.parsed);
+      const fullEstimate = estimateTokens(full.text!);
+
+      for (const divisor of [1.2, 1.5, 2, 3, 6]) {
+        const { parsed } = await callTool("getFixContext", {
+          sessionId: "sess-planes-order",
+          maxTokens: Math.floor(fullEstimate / divisor),
+        });
+        const vector = planeVector(parsed);
+        // Once a plane is partial, no lower-priority plane may be whole while a
+        // higher-priority one is still short of its full length.
+        const firstPartial = vector.findIndex((n, i) => n < fullVector[i]);
+        if (firstPartial === -1) continue;
+        for (let i = firstPartial + 1; i < vector.length; i += 1) {
+          if (fullVector[i] === 0) continue;
+          expect(vector[i]).toBeLessThan(fullVector[i]);
+        }
+        expect(order[firstPartial]).toBeDefined();
+      }
+    });
+
+    it("degrades monotonically across a budget sweep", async () => {
+      bulkySession("sess-planes-sweep", fatCandidates(9));
+
+      let previous: number[] | undefined;
+      for (const maxTokens of [500, 1800, 4000, 20000]) {
+        const { parsed, text } = await callTool("getFixContext", {
+          sessionId: "sess-planes-sweep",
+          maxTokens,
+        });
+        expect(parsed.tokenEstimate).toBe(estimateTokens(text!));
+        const vector = planeVector(parsed);
+        if (previous) {
+          const firstDiff = vector.findIndex((n, i) => n !== previous![i]);
+          // A larger budget never returns lexicographically less content.
+          if (firstDiff !== -1) {
+            expect(vector[firstDiff]).toBeGreaterThan(previous[firstDiff]);
+          }
+        }
+        previous = vector;
+      }
+      // The largest budget in the sweep returns the whole bundle.
+      expect(previous).toEqual([9, 7, 0, 0, 10, 10]);
+    });
+
+    it("never leaves causal_chain referencing a dropped signal", async () => {
+      bulkySession("sess-planes-chain", causalCandidates(9));
+
+      const full = await callTool("getFixContext", {
+        sessionId: "sess-planes-chain",
+      });
+      expect(full.parsed.causal_chain).toEqual({
+        root: {
+          id: "cand_0001",
+          detector: "http_error",
+          title: full.parsed.signals[0].title,
+        },
+        symptoms: [
+          {
+            id: "cand_0005",
+            detector: "http_error",
+            title: full.parsed.signals[4].title,
+            attributionConfidence: "likely",
+          },
+        ],
+      });
+      const fullEstimate = estimateTokens(full.text!);
+
+      let sawDroppedChain = false;
+      let sawKeptChain = false;
+      for (const divisor of [1.1, 1.3, 1.6, 2, 3, 5, 10]) {
+        const { parsed } = await callTool("getFixContext", {
+          sessionId: "sess-planes-chain",
+          maxTokens: Math.floor(fullEstimate / divisor),
+        });
+        const keptIds = new Set(parsed.signals.map((s: any) => s.id));
+        if (parsed.causal_chain) {
+          sawKeptChain = true;
+          // The invariant: every id the chain names is present in `signals`.
+          expect(keptIds.has(parsed.causal_chain.root.id)).toBe(true);
+          for (const symptom of parsed.causal_chain.symptoms) {
+            expect(keptIds.has(symptom.id)).toBe(true);
+          }
+        } else {
+          sawDroppedChain = true;
+          // A dropped chain is reported, never silently nulled.
+          expect(parsed.dropReport.planes.map((p: any) => p.plane)).toContain(
+            "causal_chain",
+          );
+          expect(parsed.dropReport.message).toContain("causal_chain");
+        }
+      }
+      expect(sawKeptChain).toBe(true);
+      expect(sawDroppedChain).toBe(true);
+    });
+
+    it("reports budgetSatisfied: false instead of overrunning a budget it cannot meet", async () => {
+      bulkySession("sess-planes-tiny", fatCandidates(9));
+
+      const { parsed, text } = await callTool("getFixContext", {
+        sessionId: "sess-planes-tiny",
+        maxTokens: 1,
+      });
+      expect(parsed.budgetSatisfied).toBe(false);
+      expect(parsed.budgetNotice).toContain("could not be brought within");
+      expect(parsed.budgetNotice).toContain("maxTokens=1");
+      // Everything budgetable really is emptied — the overrun is the fixed
+      // fields, not retained content.
+      expect(planeVector(parsed)).toEqual([0, 0, 0, 0, 0, 0]);
+      expect(parsed.causal_chain).toBeNull();
+      expect(parsed.tokenEstimate).toBe(estimateTokens(text!));
+    });
+
+    // --- budgetSatisfied honesty ----------------------------------------------
+    //
+    // `budgetSatisfied` used to be `tokenEstimate > maxTokens + 256`, so any
+    // budget within 256 tokens of the payload's fixed cost was reported as met
+    // while the response overran it — 51% over on a real session, 135x over on
+    // a small getWindow. The flag now means exactly what it says.
+
+    /** Budget the response's own notice tells the caller to retry with. */
+    function recommendedBudget(notice: string): number {
+      const match = /at least (\d+)/.exec(notice);
+      expect(match).not.toBeNull();
+      return Number(match![1]);
+    }
+
+    /**
+     * The one rule every budgeted tool obeys, checked against the real bytes:
+     * a satisfied budget is never overrun, an unsatisfied one always says so
+     * and never recommends a budget smaller than the response carrying it.
+     */
+    function expectHonestBudget(
+      parsed: any,
+      text: string,
+      maxTokens: number,
+    ): void {
+      expect(parsed.tokenEstimate).toBe(estimateTokens(text));
+      if (parsed.budgetSatisfied) {
+        expect(parsed.tokenEstimate).toBeLessThanOrEqual(maxTokens);
+        expect(parsed.budgetNotice).toBeUndefined();
+        return;
+      }
+      expect(parsed.tokenEstimate).toBeGreaterThan(maxTokens);
+      expect(parsed.budgetNotice).toContain(`maxTokens=${maxTokens}`);
+      expect(recommendedBudget(parsed.budgetNotice)).toBeGreaterThanOrEqual(
+        parsed.tokenEstimate,
+      );
+    }
+
+    it("getFixContext: budgetSatisfied implies tokenEstimate <= maxTokens across a sweep crossing the bundle's fixed cost", async () => {
+      bulkySession("sess-honest-fc", fatCandidates(9));
+
+      // With maxTokens=1 every plane is empty, so this response is the
+      // payload's floor: the band just under it is where the old 256-token
+      // tolerance silently forgave the overrun.
+      const floor = await callTool("getFixContext", {
+        sessionId: "sess-honest-fc",
+        maxTokens: 1,
+      });
+      const fixed: number = floor.parsed.tokenEstimate;
+      expect(fixed).toBeGreaterThan(300);
+
+      let sawUnsatisfied = false;
+      let sawSatisfied = false;
+      for (const maxTokens of [
+        1,
+        300,
+        498,
+        500,
+        700,
+        fixed - 200,
+        fixed - 1,
+        fixed,
+        fixed + 1,
+        fixed + 200,
+        1800,
+        4000,
+        20000,
+      ]) {
+        const { parsed, text } = await callTool("getFixContext", {
+          sessionId: "sess-honest-fc",
+          maxTokens,
+        });
+        expectHonestBudget(parsed, text!, maxTokens);
+        if (parsed.budgetSatisfied) sawSatisfied = true;
+        else {
+          sawUnsatisfied = true;
+          // Remediation is supplied by this call site, not by the shared path.
+          expect(parsed.budgetNotice).toContain("getEvidence");
+        }
+      }
+      expect(sawUnsatisfied).toBe(true);
+      expect(sawSatisfied).toBe(true);
+    });
+
+    it("budgets the linked frontend and backend request lists as one plane, so index i stays the same request in both", async () => {
+      bulkySession("sess-pair-align", fatCandidates(9));
+
+      const full = await callTool("getFixContext", {
+        sessionId: "sess-pair-align",
+      });
+      // fix-context builds both arrays as positional projections of one linked
+      // list, so callers can zip them by index. A trim must not break that.
+      expect(full.parsed.primary_window.backend.requests).toHaveLength(10);
+      expect(full.parsed.primary_window.frontend.requests).toHaveLength(10);
+      const fullEstimate = estimateTokens(full.text!);
+
+      let sawTrim = false;
+      for (const divisor of [1.05, 1.1, 1.2, 1.35, 1.5, 1.8, 2, 2.5, 3, 4, 6]) {
+        const { parsed } = await callTool("getFixContext", {
+          sessionId: "sess-pair-align",
+          maxTokens: Math.floor(fullEstimate / divisor),
+        });
+        const backend = parsed.primary_window.backend.requests;
+        const frontend = parsed.primary_window.frontend.requests;
+        expect(frontend).toHaveLength(backend.length);
+        for (let i = 0; i < backend.length; i += 1) {
+          expect(frontend[i].requestId).toBe(backend[i].requestId);
+        }
+        if (backend.length < 10) {
+          sawTrim = true;
+          expect(parsed.dropReport.planes.map((p: any) => p.plane)).toContain(
+            "primary_window.requests",
+          );
+          // Named once, as one plane, never as two half-trimmed arrays.
+          expect(
+            parsed.dropReport.planes.map((p: any) => p.plane),
+          ).not.toContain("primary_window.frontend.requests");
+        }
+      }
+      expect(sawTrim).toBe(true);
+    });
+
+    it("getWindow: budgetSatisfied is honest at every budget, including ones far under its fixed cost", async () => {
+      const events = Array.from({ length: 40 }, (_, i) => ({
+        t: 1000 + i * 10,
+        k: "nav",
+        d: { i, pad: "x".repeat(150) },
+      }));
+      createSession("sess-honest-win", events);
+      const window = { sessionId: "sess-honest-win", t0: 0, t1: 100000 };
+
+      // The clearest case of the old dishonest flag: a 135x overrun that
+      // reported budgetSatisfied: true because the payload was under 257
+      // tokens with every event dropped.
+      const floor = await callTool("getWindow", { ...window, maxTokens: 1 });
+      expect(floor.parsed.budgetSatisfied).toBe(false);
+      expect(floor.parsed.events).toEqual([]);
+      expect(floor.parsed.tokenEstimate).toBeGreaterThan(1);
+      expect(floor.parsed.returned).toBe(0);
+      expect(floor.parsed.truncated).toBe(true);
+
+      const fixed: number = floor.parsed.tokenEstimate;
+      let sawSatisfied = false;
+      for (const maxTokens of [
+        1,
+        2,
+        10,
+        50,
+        100,
+        fixed - 1,
+        fixed,
+        fixed + 1,
+        fixed + 400,
+        20000,
+      ]) {
+        const { parsed, text } = await callTool("getWindow", {
+          ...window,
+          maxTokens,
+        });
+        expectHonestBudget(parsed, text!, maxTokens);
+        if (parsed.budgetSatisfied) sawSatisfied = true;
+        else {
+          // The shared path names no tool: getWindow must not be told to call
+          // getWindow, and getEvidence cannot resolve a t=<ms> ref.
+          expect(parsed.budgetNotice).not.toContain("getWindow");
+          expect(parsed.budgetNotice).not.toContain("getEvidence");
+        }
+      }
+      expect(sawSatisfied).toBe(true);
+    });
+
+    it("getTranscript: the bounded event dumps carry budgetSatisfied and the reshaped dropReport", async () => {
+      const events = Array.from({ length: 30 }, (_, i) => ({
+        t: 1000 + i,
+        k: "tx",
+        d: { text: `utterance ${i} ${"word ".repeat(40)}` },
+      }));
+      createSession("sess-honest-tx", events);
+
+      // Unbudgeted: still the bare event array, no budgeting fields at all.
+      const full = await callTool("getTranscript", {
+        sessionId: "sess-honest-tx",
+      });
+      expect(full.parsed).toHaveLength(30);
+      expect(full.text).not.toContain("budgetSatisfied");
+      expect(full.text).not.toContain("tokenEstimate");
+      expect(full.text).not.toContain("dropReport");
+
+      const maxTokens = Math.floor(estimateTokens(full.text!) / 3);
+      const { parsed, text } = await callTool("getTranscript", {
+        sessionId: "sess-honest-tx",
+        maxTokens,
+      });
+      expectHonestBudget(parsed, text!, maxTokens);
+      expect(parsed.budgetSatisfied).toBe(true);
+      expect(parsed.events.length).toBeGreaterThan(0);
+      expect(parsed.events.length).toBeLessThan(30);
+      expect(parsed.returned).toBe(parsed.events.length);
+      expect(parsed.truncated).toBe(true);
+      // Reshaped report: per-plane entries carry counts only, refs are carried
+      // once at the top level.
+      const dropped = 30 - parsed.events.length;
+      expect(parsed.dropReport.planes).toEqual([
+        {
+          plane: "events",
+          droppedCount: dropped,
+          droppedTokenEstimate: expect.any(Number),
+        },
+      ]);
+      expect(parsed.dropReport.planes[0]).not.toHaveProperty("droppedRefs");
+      expect(parsed.dropReport.droppedCount).toBe(dropped);
+      expect(parsed.dropReport.droppedRefs[0]).toBe(
+        `t=${events[parsed.events.length].t}`,
+      );
+      expect(parsed.dropReport.message).toContain("events");
+
+      // And at a budget its fixed fields cannot meet, it says so rather than
+      // reporting a satisfied budget it missed by multiples.
+      const tiny = await callTool("getTranscript", {
+        sessionId: "sess-honest-tx",
+        maxTokens: 1,
+      });
+      expectHonestBudget(tiny.parsed, tiny.text!, 1);
+      expect(tiny.parsed.budgetSatisfied).toBe(false);
+      expect(tiny.parsed.events).toEqual([]);
+    });
+
+    it("getFixContext without maxTokens is byte-identical even when every plane is bulky", async () => {
+      bulkySession("sess-planes-identical", causalCandidates(9));
+
+      const { text } = await callTool("getFixContext", {
+        sessionId: "sess-planes-identical",
+      });
+      const expected = await buildFixContext(
+        path.join(tmpDir, "sess-planes-identical"),
+        { outputDir: tmpDir },
+      );
+      expect(text).toBe(JSON.stringify(expected, null, 2));
+      expect(text).not.toContain("tokenEstimate");
+      expect(text).not.toContain("dropReport");
+      expect(text).not.toContain("budgetSatisfied");
+      expect(text).not.toContain("budgetNotice");
     });
 
     it("solveContext without maxTokens carries no budgeting fields; with maxTokens it drops ranked evidence by EvidenceItem.id", async () => {
@@ -1812,9 +2330,7 @@ describe("MCP Server", () => {
       expect(budgeted.parsed.tokenEstimate).toBe(
         estimateTokens(budgeted.text!),
       );
-      expect(budgeted.parsed.tokenEstimate).toBeLessThanOrEqual(
-        maxTokens + BUDGET_SLACK_TOKENS,
-      );
+      expect(budgeted.parsed.tokenEstimate).toBeLessThanOrEqual(maxTokens);
     });
 
     it("getWindow without maxTokens is byte-identical; with maxTokens it drops from the tail and reports the first omitted timestamp", async () => {
@@ -1861,9 +2377,7 @@ describe("MCP Server", () => {
       expect(parsed.dropReport.droppedRefs[0]).toBe(`t=${firstOmitted.t}`);
       expect(parsed.dropReport.droppedCount).toBe(40 - parsed.events.length);
       expect(parsed.tokenEstimate).toBe(estimateTokens(text!));
-      expect(parsed.tokenEstimate).toBeLessThanOrEqual(
-        maxTokens + BUDGET_SLACK_TOKENS,
-      );
+      expect(parsed.tokenEstimate).toBeLessThanOrEqual(maxTokens);
     });
 
     it("getSessionManifest and getEvidence always carry an additive tokenEstimate", async () => {
