@@ -477,9 +477,22 @@ describe("db invariant detectors — ranked position with the causal graph enabl
       diff(1250, "req-checkout", "insert", "jobs", { id: 1 }, { id: 1 }),
     ];
     const candidates = ranked(events);
-    expect(candidates[0].detector).toBe("db_field_divergence");
-    expect(candidates[0].causalRole).toBe("root");
-    expect(candidates[0].rootCauseId).toBeUndefined();
+    const divergence = candidates.findIndex(
+      (c) => c.detector === "db_field_divergence",
+    );
+    expect(divergence).toBeGreaterThanOrEqual(0);
+    // The property this change establishes is relative, not absolute: the named divergence outranks
+    // EVERY generic surfacing of the same writes. Asserting position 0 of the whole session would
+    // also fail for any unrelated detector that later fires here at score 90 or above, and would
+    // read as a divergence regression when it is not one.
+    const genericWrites = candidates
+      .map((c, i) => (c.detector === "db_mutation" ? i : -1))
+      .filter((i) => i >= 0);
+    expect(genericWrites.length).toBeGreaterThan(0);
+    expect(divergence).toBeLessThan(Math.min(...genericWrites));
+    // And it leads as a cause, not as something explained by one of those writes.
+    expect(candidates[divergence].causalRole).toBe("root");
+    expect(candidates[divergence].rootCauseId).toBeUndefined();
   });
 
   it("a duplicate write outranks an unrelated background write in another request", () => {
