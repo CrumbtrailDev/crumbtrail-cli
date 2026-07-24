@@ -167,6 +167,8 @@ crumbtrail-server fix-context <sessionId> --json   # correlated, LLM ready fix-c
 crumbtrail-server fix-context <sessionId>          # human-readable summary
 crumbtrail-server inspect <sessionId>           # hot-plane-only session summary
 crumbtrail-server inspect <sessionId> --json    # machine-readable summary
+crumbtrail-server reanalyze <sessionId>         # rebuild artifacts with the current analyzer
+crumbtrail-server reanalyze --all --dry-run     # list what a rebuild would cover
 crumbtrail-server scan ./src --strict           # coverage scanner (CI gate); findings carry a suggested fix
 crumbtrail-server doctor --port 9898            # verify capture + correlation + MCP-readability locally
 ```
@@ -175,6 +177,15 @@ crumbtrail-server doctor --port 9898            # verify capture + correlation +
 override with `--output`) or a path to a session directory. Both read hot-plane artifacts
 only and never open the raw event log. `inspect` reports duration, event/error/failed-request
 counts, signal count, truncation state, and on-disk artifact sizes.
+
+`reanalyze` rebuilds a finalized session's derived artifacts by replaying its stored cold event
+stream through the current analyzer. Artifacts are written once at finalize time, so a session
+analyzed by an older build keeps that build's output even after the analyzer improves; this
+recomputes them from evidence already on disk. It rewrites only the derived files (index,
+candidates, bundle, manifest) and reads `events.ndjson.zst` and `signatures.json` without ever
+rewriting them, because once a session is cold those are the only surviving copy of the raw
+evidence. A rebuild can only recover what was captured: fields the capturing SDK never recorded
+stay missing.
 
 ## MCP evidence retrieval
 
