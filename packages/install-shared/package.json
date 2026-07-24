@@ -16,6 +16,8 @@
     "dist"
   ],
   "scripts": {
+    "prepack": "node ../../scripts/assert-publish-safe.mjs",
+    "prepublishOnly": "node ../../scripts/assert-publish-safe.mjs",
     "build": "tsup",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
