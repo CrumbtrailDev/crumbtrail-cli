@@ -574,6 +574,35 @@ function nodeKindsForDetector(detector: string): Set<CausalNodeKind> {
   }
 }
 
+/**
+ * Detectors that surface a plane rather than name a failure: they report that
+ * an event was captured, not what is wrong with it.
+ */
+const GENERIC_PLANE_DETECTORS = new Set(["db_mutation", "otel_db_activity"]);
+
+/**
+ * Ordering key for node ownership. Two candidates can describe the SAME event —
+ * `db_mutation` says "a write happened on order_items", `db_field_divergence`
+ * says "that write disagrees with the products row it references". They anchor
+ * on the same timestamp and the same request, so they contend for one node, and
+ * the winner becomes the causal root while the loser is pushed down as a
+ * symptom of it.
+ *
+ * Resolving that by candidate id would decide it on a dedupe key prefix, which
+ * is an accident of naming. Resolve it by what the candidate says instead: the
+ * candidate that names the failure owns the node, and the generic surfacing of
+ * the same event falls back to another write or to isolated. A reader asking
+ * "what is wrong here" is answered by the named invariant violation, never by
+ * "a write happened".
+ *
+ * Lower sorts first, so 0 is the specific detector and 1 the generic one.
+ */
+function ownershipPriority(detector: string | undefined): number {
+  return detector !== undefined && GENERIC_PLANE_DETECTORS.has(detector)
+    ? 1
+    : 0;
+}
+
 const CONFIDENCE_RANK: Record<CausalConfidence, number> = {
   high: 3,
   medium: 2,
@@ -632,11 +661,16 @@ function attributeCandidatesInternal(
   detectorById: (id: string) => string | undefined,
 ): Map<string, CandidateAttribution> {
   // --- 1. Map each candidate to at most one node (with per-node contention arbitration) --------
-  // Process candidates in a deterministic order (anchor.t asc, then id asc) so contention winners
-  // are stable regardless of input order.
+  // Process candidates in a deterministic order (anchor.t asc, then ownership priority, then id
+  // asc) so contention winners are stable regardless of input order. Since the incumbent always
+  // wins contention, processing order IS the arbitration rule: see ownershipPriority for why a
+  // named failure must reach a shared node before the generic plane surfacing of the same event.
   const sortedCandidates = [...candidates].sort(
     (a, b) =>
-      a.anchor.t - b.anchor.t || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+      a.anchor.t - b.anchor.t ||
+      ownershipPriority(detectorById(a.id)) -
+        ownershipPriority(detectorById(b.id)) ||
+      (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
   );
 
   // node id -> candidate id currently owning it.
@@ -701,8 +735,9 @@ function attributeCandidatesInternal(
         nodeToCandidate.set(reqNode.id, candidate.id);
         return reqNode.id;
       }
-      // Contention: smaller anchor.t, then smaller id wins. Since sortedCandidates is processed in
-      // (t, id) order, the incumbent always wins requestId contention; loser falls through.
+      // Contention: smaller anchor.t, then the named failure over the generic plane surfacing of
+      // the same event, then smaller id. Since sortedCandidates is processed in that order, the
+      // incumbent always wins requestId contention; the loser falls through.
     }
 
     // Precedence 2: temporal + compatible-kind fallback over still-unowned nodes.
@@ -742,6 +777,36 @@ function attributeCandidatesInternal(
     }
   }
 
+  const kindById = new Map<string, CausalNodeKind>(
+    nodes.map((node) => [node.id, node.kind]),
+  );
+
+  /**
+   * How strongly one hop of the request spine supports a CAUSAL claim.
+   *
+   * The spine chains a request's nodes in time order, so consecutive writes in
+   * one request are joined by a high confidence `request` edge. That edge is a
+   * true statement about ordering and a weak one about causation: which write
+   * an application performs after which is a free choice of the code, and says
+   * nothing about which write is at fault. Reading it as high confidence
+   * causation makes every write the established cause of the next one, so the
+   * write a detector actually named is ranked behind every write that happened
+   * to precede it.
+   *
+   * The edge stays as captured — the two writes really are consecutive stages
+   * of one request. Only the causal claim drawn through it is weakened, to the
+   * same `low` tier the ranker treats as annotate only.
+   */
+  function hopConfidence(effectId: string, causeId: string): CausalConfidence {
+    if (
+      kindById.get(effectId) === "db.write" &&
+      kindById.get(causeId) === "db.write"
+    ) {
+      return "low";
+    }
+    return confByPair.get(JSON.stringify([effectId, causeId])) ?? "low";
+  }
+
   // --- 3. For each mapped candidate, walk ancestors to the nearest candidate-bearing ancestor ---
   // Returns { rootNodeId, weakestConfidence } or undefined when no candidate-bearing ancestor.
   function nearestCandidateAncestor(
@@ -766,8 +831,7 @@ function attributeCandidatesInternal(
         for (const causeId of causes) {
           if (visited.has(causeId)) continue;
           visited.add(causeId);
-          const hopConf =
-            confByPair.get(JSON.stringify([nodeId, causeId])) ?? "low";
+          const hopConf = hopConfidence(nodeId, causeId);
           const newPathConf =
             pathConf === undefined
               ? hopConf
