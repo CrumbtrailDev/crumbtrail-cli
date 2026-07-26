@@ -70,6 +70,14 @@ jobs:
         with:
           name: npm-release-dry-run
           path: .release-artifacts/
+          # `.release-artifacts` is a DOT directory, and upload-artifact excludes
+          # hidden paths by default, so every dry run packed its tarballs
+          # correctly and then failed here with "No files were found". That made
+          # the dry run unusable for the one thing it exists for: inspecting what
+          # a release would publish, before publishing it. A real publish never
+          # hit this, being gated on `if: inputs.dry_run`, which is how it went
+          # unnoticed.
+          include-hidden-files: true
           if-no-files-found: error
 
   publish-crate:
