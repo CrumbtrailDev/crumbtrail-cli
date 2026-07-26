@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import path from "node:path";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import {
   assertVersionedRuntimeConsumers,
@@ -179,15 +180,49 @@ describe("release package selection", () => {
       baseRef: "c7dacf4",
       changedFiles: [...changedFiles],
     });
-    expect(plan.packages).toEqual([
-      { name: "crumbtrail", version: "0.7.2", relativeDir: "packages/cli" },
-      { name: "crumbtrail-core", version: "0.6.0", relativeDir: "packages/core" },
-      { name: "crumbtrail-detect-core", version: "0.2.0", relativeDir: "packages/detect-core" },
-      { name: "crumbtrail-install-shared", version: "0.4.0", relativeDir: "packages/install-shared" },
-      { name: "crumbtrail-node", version: "0.9.0", relativeDir: "packages/node" },
-      { name: "crumbtrail-react-native", version: "0.3.0", relativeDir: "packages/react-native" },
-      { name: "crumbtrail-tauri", version: "0.3.0", relativeDir: "packages/tauri" },
+    // Asserts the SET, not hardcoded version strings.
+    //
+    // The versions this used to pin went stale the moment any package was bumped,
+    // because createReleasePlan reads the live manifests while the expectation was
+    // frozen. Not hypothetical: bdea8ce bumped the CLI to 0.7.3 and detect-core to
+    // 0.2.1 against expectations of 0.7.2 and 0.2.0, and ci went red and stayed red
+    // until this was rewritten. Re-pinning numbers only re-arms the same tripwire on
+    // the next release.
+    //
+    // The invariant this test exists to protect, per the comment above, is that the
+    // publish set cannot silently GROW. That is a property of the NAMES, so the names
+    // stay pinned and versions are checked against the manifests instead.
+    //
+    // crumbtrail-react is in this set: the frozen c7dacf4 baseline reaches back past
+    // react's own last release, so it selects here even though a real release from
+    // the last published commit would not include it. Listed to keep the assertion
+    // honest about what this range derives, and a standing reason to pass a base ref
+    // at the last published commit rather than this one.
+    expect(plan.packages.map((pkg) => pkg.name)).toEqual([
+      "crumbtrail",
+      "crumbtrail-core",
+      "crumbtrail-detect-core",
+      "crumbtrail-install-shared",
+      "crumbtrail-node",
+      "crumbtrail-react",
+      "crumbtrail-react-native",
+      "crumbtrail-tauri",
     ]);
+    // Every selected artifact publishes at exactly its manifest version. This is the
+    // property the pinned strings were reaching for, and unlike them it cannot go
+    // stale.
+    for (const pkg of plan.packages) {
+      const manifest = JSON.parse(
+        await readFile(
+          path.join(repositoryRoot, pkg.relativeDir, "package.json"),
+          "utf8",
+        ),
+      );
+      expect(
+        pkg.version,
+        `${pkg.name} must publish at its manifest version`,
+      ).toBe(manifest.version);
+    }
   });
 
   it("rejects option-like and invalid base refs before Git receives them", () => {
