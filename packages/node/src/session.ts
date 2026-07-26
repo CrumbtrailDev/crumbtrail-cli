@@ -67,6 +67,13 @@ function ensureOutputRootSync(dir: string): void {
   }
 }
 
+/**
+ * Cap on the finalized-session ids kept for late-evidence recognition. Sized
+ * well past any plausible burst of concurrently ending sessions; eviction only
+ * costs a late refinalize the idle sweeper would still pick up.
+ */
+const MAX_TRACKED_FINALIZED_SESSIONS = 512;
+
 export class SessionManager {
   private outputDir: string;
   private whisperModel?: string;
@@ -74,6 +81,16 @@ export class SessionManager {
     sessionDir: string,
     whisperModel?: string,
   ) => Promise<void>;
+  /**
+   * Session ids this process has already finalized with a successful
+   * postProcess, insertion-ordered. Its only job is to let the ingest path
+   * recognise LATE evidence synchronously: an event appended after finalize is
+   * NOT in index.json/candidates.jsonl, so the session's derived artifacts are
+   * stale until something re-analyses it (see fast-finalize.ts). Bounded and
+   * in-memory on purpose — a miss (restart, eviction, another process) is
+   * harmless because the idle sweeper stays the completeness backstop.
+   */
+  private readonly finalizedIds = new Set<string>();
 
   constructor(config: string | SessionManagerConfig) {
     if (typeof config === "string") {
@@ -264,9 +281,18 @@ export class SessionManager {
     return targetDir;
   }
 
+  /**
+   * @param options.background Set by the idle sweeper and the fast finalizer.
+   * A background finalize is a CHECKPOINT of a session whose producer never
+   * said it was done, so it does not put the session into the late-evidence
+   * regime (see hasFinalized) — an always-on backend would otherwise
+   * re-analyse a growing session on every cooldown window instead of on the
+   * checkpoint cadence. It still keeps a session there that got in through an
+   * explicit end, so a tail arriving in several batches is folded in.
+   */
   async finalize(
     sessionId: string,
-    options?: { refinalize?: boolean },
+    options?: { refinalize?: boolean; background?: boolean },
   ): Promise<SessionFinalizationResult> {
     let sessionDir = await this.getExistingSessionDir(sessionId);
     if (!sessionDir) throw new Error(`Session ${sessionId}: not found`);
@@ -294,7 +320,10 @@ export class SessionManager {
       isRecord(meta.finalization)
     ) {
       const prior = reconstructFinalizationResult(sessionId, meta.finalization);
-      if (prior) return prior;
+      if (prior) {
+        if (prior.processed) this.rememberFinalized(sessionId, options);
+        return prior;
+      }
     }
 
     const finalizedAt = Date.now();
@@ -361,7 +390,38 @@ export class SessionManager {
       "meta.json",
       JSON.stringify(meta, null, 2),
     );
+    // Recorded AFTER meta.json lands, so anything ingested from here on is
+    // genuinely later than the artifacts this finalize wrote.
+    if (result.processed) this.rememberFinalized(sessionId, options);
     return result;
+  }
+
+  /**
+   * True when this process finalized the session already, which makes any
+   * freshly ingested event late evidence the session's derived artifacts do
+   * not include.
+   */
+  hasFinalized(sessionId: string): boolean {
+    return this.finalizedIds.has(sessionId);
+  }
+
+  private rememberFinalized(
+    sessionId: string,
+    options?: { background?: boolean },
+  ): void {
+    // A background checkpoint never ADMITS a session to the set; it only keeps
+    // one that an explicit end already put there.
+    if (options?.background === true && !this.finalizedIds.has(sessionId)) {
+      return;
+    }
+    // Re-insert so a re-finalized session moves to the young end of the set.
+    this.finalizedIds.delete(sessionId);
+    this.finalizedIds.add(sessionId);
+    while (this.finalizedIds.size > MAX_TRACKED_FINALIZED_SESSIONS) {
+      const oldest = this.finalizedIds.values().next();
+      if (oldest.done) break;
+      this.finalizedIds.delete(oldest.value);
+    }
   }
 
   // Enumerate the session directories under outputDir, applying the symlink / path
@@ -680,7 +740,10 @@ async function readSessionSummary(
 
   let index: unknown;
   try {
-    const raw = await defaultSessionStore.readArtifact(sessionDir, "index.json");
+    const raw = await defaultSessionStore.readArtifact(
+      sessionDir,
+      "index.json",
+    );
     index = raw ? JSON.parse(raw.toString("utf-8")) : undefined;
   } catch {
     index = undefined;
@@ -790,7 +853,10 @@ async function readAudioSummary(
   sessionDir: string,
 ): Promise<PostProcessAudioSummary | undefined> {
   try {
-    const raw = await defaultSessionStore.readArtifact(sessionDir, "index.json");
+    const raw = await defaultSessionStore.readArtifact(
+      sessionDir,
+      "index.json",
+    );
     if (!raw) return undefined;
     const index: unknown = JSON.parse(raw.toString("utf-8"));
     if (
