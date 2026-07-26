@@ -1,6 +1,6 @@
 {
   "name": "crumbtrail-node",
-  "version": "0.10.0",
+  "version": "0.15.0",
   "description": "Self-hosted Crumbtrail server, MCP evidence tools and Express middleware for capturing and diagnosing bugs. See https://crumbtrail.ai",
   "license": "MIT",
   "repository": {
@@ -51,6 +51,8 @@
     "access": "public"
   },
   "scripts": {
+    "prepack": "node ../../scripts/assert-publish-safe.mjs",
+    "prepublishOnly": "node ../../scripts/assert-publish-safe.mjs",
     "build": "tsup",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",

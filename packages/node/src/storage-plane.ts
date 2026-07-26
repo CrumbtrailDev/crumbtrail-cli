@@ -91,13 +91,13 @@ export interface ColdEvidenceArtifacts {
   compressedBytes: number;
 }
 
-export function writeColdEvidenceArtifacts(
+export async function writeColdEvidenceArtifacts(
   input: WriteColdEvidenceArtifactsInput,
-): ColdEvidenceArtifacts {
+): Promise<ColdEvidenceArtifacts> {
   const { dictionary: signatures, signatureIds } = buildSignatureDictionary(
     input.events,
   );
-  writeGeneratedArtifact(
+  await writeGeneratedArtifact(
     input.sessionDir,
     SIGNATURES_ARTIFACT,
     `${JSON.stringify(signatures, null, 2)}\n`,
@@ -111,7 +111,11 @@ export function writeColdEvidenceArtifacts(
       ? `${coldEvents.map((event) => JSON.stringify(event)).join("\n")}\n`
       : "";
   const compressed = compressColdEvents(Buffer.from(coldNdjson, "utf-8"));
-  writeGeneratedArtifact(input.sessionDir, COLD_EVENTS_ARTIFACT, compressed);
+  await writeGeneratedArtifact(
+    input.sessionDir,
+    COLD_EVENTS_ARTIFACT,
+    compressed,
+  );
 
   return {
     signatures,
@@ -123,29 +127,144 @@ export function writeColdEvidenceArtifacts(
   };
 }
 
-export function writeTwoPlaneSessionArtifacts(
+/**
+ * Rehydrates the cold event stream back into analyzable {@link BugEvent}s.
+ *
+ * This is the read inverse of {@link writeColdEvidenceArtifacts}: it
+ * decompresses `events.ndjson.zst` and expands each `d.el = { sigRef }` back
+ * into the `{ sig, path, tag }` shape the analyzer expects, using
+ * `signatures.json` as the dictionary. Without that expansion every element
+ * anchored detector sees a bare numeric ref and silently stops matching.
+ *
+ * Returns undefined when the session has no cold artifact (a live session that
+ * has not finalized yet, where `events.ndjson` is still the source of truth).
+ * Cold events are already sanitized, so callers must not re-sanitize them.
+ */
+export function readColdEvents(sessionDir: string): BugEvent[] | undefined {
+  const coldPath = path.join(sessionDir, COLD_EVENTS_ARTIFACT);
+  if (!fs.existsSync(coldPath)) return undefined;
+  if (typeof zlib.zstdDecompressSync !== "function") {
+    throw new Error(
+      "Crumbtrail cold storage requires Node.js >=22.15.0 for zstd decompression.",
+    );
+  }
+  const raw = zlib.zstdDecompressSync(fs.readFileSync(coldPath)).toString(
+    "utf-8",
+  );
+  const bySigRef = readSignatureDictionaryById(sessionDir);
+  const events: BugEvent[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue; // Match readEvents: skip malformed lines rather than fail the replay.
+    }
+    if (!isRecord(parsed)) continue;
+    events.push(rehydrateColdEvent(parsed as unknown as BugEvent, bySigRef));
+  }
+  return events;
+}
+
+/**
+ * Reports the cold plane exactly as it already exists on disk, so a re-analysis
+ * can rebuild the manifest without rewriting `events.ndjson.zst`.
+ *
+ * Byte counts come from the previous manifest when it is readable, because
+ * `sourceRawBytes` records the size of the original `events.ndjson`, which is
+ * gone by the time a session is cold and cannot be recovered from the
+ * compressed copy. Falling back to the on-disk sizes keeps the ratio honest
+ * (it reports cold-to-compressed) rather than inventing a figure.
+ */
+export function readColdEvidenceArtifacts(
+  sessionDir: string,
+): ColdEvidenceArtifacts | undefined {
+  const compressedBytes = existingFileBytes(
+    path.join(sessionDir, COLD_EVENTS_ARTIFACT),
+  );
+  if (compressedBytes === undefined) return undefined;
+  const signatures = readSignatureDictionary(sessionDir);
+  const manifest = readJsonRecord(path.join(sessionDir, MANIFEST_ARTIFACT));
+  const cold = isRecord(manifest?.cold) ? manifest.cold : undefined;
+  const compression = isRecord(cold?.compression) ? cold.compression : undefined;
+  const coldRawBytes = finiteNumber(compression?.coldRawBytes);
+  const sourceRawBytes = finiteNumber(compression?.sourceRawBytes);
+  return {
+    signatures,
+    coldRawBytes: coldRawBytes ?? compressedBytes,
+    sourceRawBytes: sourceRawBytes ?? coldRawBytes ?? compressedBytes,
+    compressedBytes,
+  };
+}
+
+function readSignatureDictionary(sessionDir: string): SignatureDictionary {
+  const parsed = readJsonRecord(path.join(sessionDir, SIGNATURES_ARTIFACT));
+  const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+  return {
+    schemaVersion: 1,
+    entries: entries.filter(
+      (entry): entry is SignatureDictionaryEntry =>
+        isRecord(entry) && finiteNumber(entry.id) !== undefined,
+    ),
+  };
+}
+
+function readSignatureDictionaryById(
+  sessionDir: string,
+): Map<number, SignatureDictionaryEntry> {
+  const byId = new Map<number, SignatureDictionaryEntry>();
+  for (const entry of readSignatureDictionary(sessionDir).entries)
+    byId.set(entry.id, entry);
+  return byId;
+}
+
+/** Expands `d.el = { sigRef }` back to the dictionary entry it points at. */
+function rehydrateColdEvent(
+  event: BugEvent,
+  bySigRef: Map<number, SignatureDictionaryEntry>,
+): BugEvent {
+  const data = isRecord(event.d) ? event.d : undefined;
+  if (!data) return event;
+  const el = isRecord(data.el) ? data.el : undefined;
+  const sigRef = finiteNumber(el?.sigRef);
+  if (sigRef === undefined) return event;
+  const entry = bySigRef.get(sigRef);
+  // A dangling ref means signatures.json is missing or truncated. Drop the
+  // placeholder rather than leave `{ sigRef }` behind, so detectors treat the
+  // element as absent instead of matching against a meaningless shape.
+  const rehydrated = entry
+    ? removeUndefined({ sig: entry.sig, path: entry.path, tag: entry.tag })
+    : undefined;
+  const nextData = { ...data };
+  if (rehydrated) nextData.el = rehydrated;
+  else delete nextData.el;
+  return { ...event, d: nextData } as BugEvent;
+}
+
+export async function writeTwoPlaneSessionArtifacts(
   input: WriteTwoPlaneSessionArtifactsInput,
-): void {
-  writeGeneratedArtifact(
+): Promise<void> {
+  await writeGeneratedArtifact(
     input.sessionDir,
     BUNDLE_ALIAS_ARTIFACT,
     `${JSON.stringify(input.bundle, null, 2)}\n`,
   );
 
-  const manifest = buildManifest(input, input.coldEvidence);
-  writeGeneratedArtifact(
+  const manifest = await buildManifest(input, input.coldEvidence);
+  await writeGeneratedArtifact(
     input.sessionDir,
     MANIFEST_ARTIFACT,
     `${JSON.stringify(manifest, null, 2)}\n`,
   );
 }
 
-function writeGeneratedArtifact(
+async function writeGeneratedArtifact(
   sessionDir: string,
   name: string,
   data: string | Buffer,
-): void {
-  defaultSessionStore.writeArtifact(sessionDir, name, data);
+): Promise<void> {
+  await defaultSessionStore.writeArtifact(sessionDir, name, data);
 }
 
 export function readCaptureTruncationMarker(
@@ -238,7 +357,7 @@ function prepareColdEvent(
   return sanitized;
 }
 
-function buildManifest(
+async function buildManifest(
   input: WriteTwoPlaneSessionArtifactsInput,
   storage: {
     signatures: SignatureDictionary;
@@ -246,7 +365,7 @@ function buildManifest(
     coldRawBytes: number;
     compressedBytes: number;
   },
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   const meta = readJsonRecord(path.join(input.sessionDir, "meta.json")) ?? {};
   const start =
     finiteNumber(input.index.start) ??
@@ -273,6 +392,27 @@ function buildManifest(
       : storage.sourceRawBytes === 0
         ? 1
         : storage.sourceRawBytes;
+
+  // Hoisted out of the manifest literal because describeArtifacts now stats
+  // through the async store seam. Order is preserved (hot, then cold).
+  const hotArtifacts = await describeArtifacts(input.sessionDir, [
+    MANIFEST_ARTIFACT,
+    BUNDLE_ALIAS_ARTIFACT,
+    "llm.json",
+    "llm.md",
+    "index.json",
+    "candidates.jsonl",
+    "CANDIDATES.md",
+    "timeline.md",
+    "search.jsonl",
+  ]);
+  const coldArtifacts = await describeArtifacts(input.sessionDir, [
+    COLD_EVENTS_ARTIFACT,
+    SIGNATURES_ARTIFACT,
+    "recording.webm",
+    "audio.webm",
+    "frames",
+  ]);
 
   return {
     schemaVersion: SESSION_MANIFEST_SCHEMA_VERSION,
@@ -306,17 +446,7 @@ function buildManifest(
     },
     hot: {
       layoutVersion: TWO_PLANE_LAYOUT_VERSION,
-      artifacts: describeArtifacts(input.sessionDir, [
-        MANIFEST_ARTIFACT,
-        BUNDLE_ALIAS_ARTIFACT,
-        "llm.json",
-        "llm.md",
-        "index.json",
-        "candidates.jsonl",
-        "CANDIDATES.md",
-        "timeline.md",
-        "search.jsonl",
-      ]).map((artifact) =>
+      artifacts: hotArtifacts.map((artifact) =>
         artifact.path === MANIFEST_ARTIFACT
           ? { ...artifact, exists: true }
           : artifact,
@@ -331,13 +461,7 @@ function buildManifest(
           "Deferred until a dependency-light Parquet writer is chosen; the plane split ships now with zstd-compressed NDJSON fallback.",
         redaction: "sanitized-before-cold-write",
       },
-      artifacts: describeArtifacts(input.sessionDir, [
-        COLD_EVENTS_ARTIFACT,
-        SIGNATURES_ARTIFACT,
-        "recording.webm",
-        "audio.webm",
-        "frames",
-      ]),
+      artifacts: coldArtifacts,
       compression: {
         sourceRawBytes: storage.sourceRawBytes,
         coldRawBytes: storage.coldRawBytes,
@@ -392,22 +516,33 @@ function buildManifest(
   };
 }
 
-function describeArtifacts(
+async function describeArtifacts(
   sessionDir: string,
   names: string[],
-): Array<Record<string, unknown>> {
-  return names.map((name) => {
-    const stat = defaultSessionStore.statArtifact(sessionDir, name);
-    if (!stat) return { path: name, exists: false };
-    return removeUndefined({
-      path: name,
-      exists: true,
-      bytes: !stat.isDir ? stat.bytes : undefined,
-      entries: stat.isDir
-        ? defaultSessionStore.listArtifacts(path.join(sessionDir, name)).length
-        : undefined,
-    });
-  });
+): Promise<Array<Record<string, unknown>>> {
+  const described: Array<Record<string, unknown>> = [];
+  // Serial (not Promise.all) so the emitted order matches `names` exactly and
+  // the store sees the same one-at-a-time access pattern it did when sync.
+  for (const name of names) {
+    const stat = await defaultSessionStore.statArtifact(sessionDir, name);
+    if (!stat) {
+      described.push({ path: name, exists: false });
+      continue;
+    }
+    const entries = stat.isDir
+      ? (await defaultSessionStore.listArtifacts(path.join(sessionDir, name)))
+          .length
+      : undefined;
+    described.push(
+      removeUndefined({
+        path: name,
+        exists: true,
+        bytes: !stat.isDir ? stat.bytes : undefined,
+        entries,
+      }),
+    );
+  }
+  return described;
 }
 
 function compressColdEvents(input: Buffer): Buffer {

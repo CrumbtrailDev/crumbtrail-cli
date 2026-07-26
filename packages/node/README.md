@@ -53,6 +53,27 @@ CRUMBTRAIL_PACKAGE_RUNTIME_PASS cli=dist/cli.cjs ...
 | `--ai-model`            |                              unset | Parsed as an opaque model string.                                                                | Model override for the LLM produced opinion.                                                                                              |
 | `--ai-allow-auto-model` |                            `false` | Boolean flag.                                                                                    | Allow provider auto-model selection.                                                                                                      |
 
+### Source map resolution
+
+| Variable                    | Default | Purpose                                                                                                          |
+| --------------------------- | ------: | ---------------------------------------------------------------------------------------------------------------- |
+| `CRUMBTRAIL_SOURCEMAP_DIR`  |   unset | Directory of build output holding `.map` files. When set, a candidate's `anchor.frame` is resolved to the original source. |
+
+A frame captured on a minified build names a bundler chunk, such as
+`/_next/static/chunks/4526-abc.js:1:24891`. Point this at the directory your
+build wrote its `.map` files to and the frame is rewritten to the original
+`file:line:col`, with the generated location kept as `anchor.minifiedFrame` so
+the mapping can be checked rather than trusted.
+
+Maps are matched by the frame's basename, so `board.min.js` resolves against
+`board.min.js.map` in that directory. Only the basename is used and the read is
+confined to the directory, so a frame cannot reach files outside it.
+
+Resolution never guesses. A missing, corrupt, or non-covering map leaves the
+frame exactly as the runtime reported it, because a location pointing at the
+wrong file is worse than one a reader knows is minified. Index maps (a map with
+a `sections` array) are not resolved.
+
 Invalid config fails before the server binds and prints a bounded message like:
 
 ```text
@@ -150,6 +171,8 @@ crumbtrail-server capsule --ticket <ticket url> --json     # resolve a ticket to
 crumbtrail-server capsule --ticket <key> --provider jira   # resolve by provider and ticket key
 crumbtrail-server inspect <sessionId>           # hot-plane-only session summary
 crumbtrail-server inspect <sessionId> --json    # machine-readable summary
+crumbtrail-server reanalyze <sessionId>         # rebuild artifacts with the current analyzer
+crumbtrail-server reanalyze --all --dry-run     # list what a rebuild would cover
 crumbtrail-server scan ./src --strict           # coverage scanner (CI gate); findings carry a suggested fix
 crumbtrail-server doctor --port 9898            # verify capture + correlation + MCP-readability locally
 ```
@@ -158,6 +181,15 @@ crumbtrail-server doctor --port 9898            # verify capture + correlation +
 override with `--output`) or a path to a session directory. Both read hot-plane artifacts
 only and never open the raw event log. `inspect` reports duration, event/error/failed-request
 counts, signal count, truncation state, and on-disk artifact sizes.
+
+`reanalyze` rebuilds a finalized session's derived artifacts by replaying its stored cold event
+stream through the current analyzer. Artifacts are written once at finalize time, so a session
+analyzed by an older build keeps that build's output even after the analyzer improves; this
+recomputes them from evidence already on disk. It rewrites only the derived files (index,
+candidates, bundle, manifest) and reads `events.ndjson.zst` and `signatures.json` without ever
+rewriting them, because once a session is cold those are the only surviving copy of the raw
+evidence. A rebuild can only recover what was captured: fields the capturing SDK never recorded
+stay missing.
 
 `capsule` takes a ticket reference or a symptom rather than a session id. With `--ticket` it
 fetches and normalizes the ticket through the documented provider env vars (`JIRA_*`,

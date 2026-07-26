@@ -16,8 +16,24 @@ export type {
   DistinctBugRecurrenceInput,
   DistinctBugRecurrenceOccurrence,
 } from "./distinct-bugs";
-export { FilesystemSessionStore, defaultSessionStore } from "./session-store";
-export type { SessionStore } from "./session-store";
+export {
+  FilesystemSessionStore,
+  defaultSessionStore,
+  setSessionStore,
+  resetSessionStore,
+  getSessionStore,
+} from "./session-store";
+// The full SessionStore surface must be exported, not just the interface: an
+// embedder implementing or decorating it (for example the hosted cloud's
+// EncryptedSessionStore) needs these parameter/return types to type its methods.
+export type {
+  SessionStore,
+  AppendEventsOptions,
+  AppendEventsResult,
+  ArtifactStat,
+  ResolveSessionScope,
+  SessionPartition,
+} from "./session-store";
 export {
   FilesystemMcpReadStore,
   RemoteMcpReadStore,
@@ -131,7 +147,11 @@ export type {
   SessionIndexLike,
   WriteLlmBundleInput,
 } from "./llm-bundle";
-export { postProcess } from "./post-process";
+export {
+  postProcess,
+  reanalyzeSession,
+  type ReanalyzeSessionResult,
+} from "./post-process";
 export { inspectSession, formatInspection, InspectError } from "./inspect";
 export type {
   SessionInspection,

@@ -8,7 +8,8 @@ import { resolveLatestIssue } from "../latest-issue";
  * Pins the shared latest-issue definition (backing BOTH the getLatestIssue MCP
  * tool and the `fix-context --latest` CLI flag):
  * - qualifies iff index.json exists (finalize signal) AND errs non-empty OR
- *   failedReqs non-empty OR any candidates.jsonl row with severity critical/high
+ *   failedReqs non-empty OR consoleErrors non-empty OR any candidates.jsonl row
+ *   with severity critical/high. networkErrors is deliberately not a clause.
  * - recency = index.end, fallback index.start, then meta.start; ties -> session
  *   id descending
  * - hot-plane reads only (never events.ndjson)
@@ -62,22 +63,24 @@ describe("resolveLatestIssue", () => {
     return dir;
   }
 
-  it("returns undefined for an empty store", () => {
-    expect(resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
+  it("returns undefined for an empty store", async () => {
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
     expect(
-      resolveLatestIssue({ outputDir: path.join(tmpDir, "does-not-exist") }),
+      await resolveLatestIssue({
+        outputDir: path.join(tmpDir, "does-not-exist"),
+      }),
     ).toBeUndefined();
   });
 
-  it("ignores non-finalized sessions (no index.json), whatever else they contain", () => {
+  it("ignores non-finalized sessions (no index.json), whatever else they contain", async () => {
     seed("ses_live", {
       index: null,
       candidates: [{ id: "cand_0001", severity: "critical" }],
     });
-    expect(resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
   });
 
-  it("does not qualify a clean finalized session (no errs, no failedReqs, no high candidates)", () => {
+  it("does not qualify a clean finalized session (no errs, no failedReqs, no high candidates)", async () => {
     seed("ses_clean", {
       index: { end: 9000 },
       candidates: [
@@ -85,35 +88,66 @@ describe("resolveLatestIssue", () => {
         { id: "cand_0002", severity: "low" },
       ],
     });
-    expect(resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
   });
 
-  it("qualifies via index.errs non-empty", () => {
+  it("qualifies via index.errs non-empty", async () => {
     const dir = seed("ses_errs", {
       index: { end: 5000, errs: [{ t: 4000, msg: "boom" }] },
     });
-    expect(resolveLatestIssue({ outputDir: tmpDir })).toEqual({
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toEqual({
       sessionId: "ses_errs",
       dir,
     });
   });
 
-  it("qualifies via index.failedReqs non-empty", () => {
+  it("qualifies via index.failedReqs non-empty", async () => {
     const dir = seed("ses_failed", {
       index: {
         end: 5000,
         failedReqs: [{ t: 4000, m: "GET", url: "/x", st: 500 }],
       },
     });
-    expect(resolveLatestIssue({ outputDir: tmpDir })).toEqual({
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toEqual({
       sessionId: "ses_failed",
       dir,
     });
   });
 
+  it("qualifies via index.consoleErrors non-empty, with no errs and no failedReqs", async () => {
+    // A console error moment carries no request id, so a db write near it grades `temporal`
+    // (medium/64) rather than `request` (high/88). Without this clause the session qualifies only
+    // when some unrelated write happens to sit nearby and reach `high`, which makes qualification
+    // depend on the write rather than on the error.
+    const dir = seed("ses_console_only", {
+      index: {
+        end: 5000,
+        consoleErrors: [{ t: 4000, lv: "err", msg: "checkout failed" }],
+      },
+      candidates: [{ id: "cand_0001", severity: "medium" }],
+    });
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toEqual({
+      sessionId: "ses_console_only",
+      dir,
+    });
+  });
+
+  it("does not qualify on index.networkErrors alone", async () => {
+    // networkErrors holds every net.err, including the routine cancellations post-process
+    // deliberately kept out of failedReqs. Qualifying on it would surface a fetch the user
+    // cancelled by navigating away as the latest issue.
+    seed("ses_net_only", {
+      index: {
+        end: 5000,
+        networkErrors: [{ t: 4000, url: "/x", reason: "AbortError" }],
+      },
+    });
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
+  });
+
   it.each(["critical", "high"] as const)(
     "qualifies via a %s-severity candidates.jsonl row",
-    (severity) => {
+    async (severity) => {
       const dir = seed("ses_cand", {
         index: { end: 5000 },
         candidates: [
@@ -121,26 +155,26 @@ describe("resolveLatestIssue", () => {
           { id: "cand_0002", severity },
         ],
       });
-      expect(resolveLatestIssue({ outputDir: tmpDir })).toEqual({
+      expect(await resolveLatestIssue({ outputDir: tmpDir })).toEqual({
         sessionId: "ses_cand",
         dir,
       });
     },
   );
 
-  it("orders by index.end recency across qualifying sessions", () => {
+  it("orders by index.end recency across qualifying sessions", async () => {
     seed("ses_old", { index: { end: 1000, errs: [{ t: 900, msg: "old" }] } });
     const newest = seed("ses_new", {
       index: { end: 9000, errs: [{ t: 8000, msg: "new" }] },
     });
     seed("ses_mid", { index: { end: 5000, errs: [{ t: 4000, msg: "mid" }] } });
-    expect(resolveLatestIssue({ outputDir: tmpDir })).toEqual({
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toEqual({
       sessionId: "ses_new",
       dir: newest,
     });
   });
 
-  it("falls back to index.start, then meta.start, for recency", () => {
+  it("falls back to index.start, then meta.start, for recency", async () => {
     // No index.end anywhere: a beats b via index.start; c has neither index.end
     // nor index.start and falls back to meta.start (largest of all -> wins).
     seed("ses_a", { index: { start: 5000, errs: [{ t: 1, msg: "a" }] } });
@@ -149,36 +183,36 @@ describe("resolveLatestIssue", () => {
       meta: { start: 6000 },
       index: { errs: [{ t: 1, msg: "c" }] },
     });
-    expect(resolveLatestIssue({ outputDir: tmpDir })).toEqual({
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toEqual({
       sessionId: "ses_c",
       dir: c,
     });
   });
 
-  it("breaks recency ties by session id descending", () => {
+  it("breaks recency ties by session id descending", async () => {
     seed("ses_aaa", { index: { end: 5000, errs: [{ t: 1, msg: "x" }] } });
     const winner = seed("ses_zzz", {
       index: { end: 5000, errs: [{ t: 1, msg: "x" }] },
     });
     seed("ses_mmm", { index: { end: 5000, errs: [{ t: 1, msg: "x" }] } });
-    expect(resolveLatestIssue({ outputDir: tmpDir })).toEqual({
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toEqual({
       sessionId: "ses_zzz",
       dir: winner,
     });
   });
 
-  it("reads the hot plane only — a malformed cold event stream is never touched", () => {
+  it("reads the hot plane only — a malformed cold event stream is never touched", async () => {
     const dir = seed("ses_hot", {
       index: { end: 5000, errs: [{ t: 1, msg: "x" }] },
       eventsNdjson: "{this is not json\nnor this",
     });
-    expect(resolveLatestIssue({ outputDir: tmpDir })).toEqual({
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toEqual({
       sessionId: "ses_hot",
       dir,
     });
   });
 
-  it("skips a session whose index.json is malformed (not finalized cleanly)", () => {
+  it("skips a session whose index.json is malformed (not finalized cleanly)", async () => {
     const dir = path.join(tmpDir, "ses_bad");
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(
@@ -186,6 +220,6 @@ describe("resolveLatestIssue", () => {
       JSON.stringify({ id: "ses_bad" }),
     );
     fs.writeFileSync(path.join(dir, "index.json"), "{not json");
-    expect(resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
   });
 });

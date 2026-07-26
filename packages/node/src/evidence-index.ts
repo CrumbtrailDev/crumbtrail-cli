@@ -10,7 +10,13 @@ import {
 import { BROWSER_REDACTION_POLICY, normalizeDbEngine } from "./llm-bundle";
 import { redactedNetworkBodySnippet } from "./network-body";
 import { attributeCandidates } from "./causal-graph";
+import { defaultSessionStore } from "./session-store";
 import type { CausalConfidence, CausalGraph } from "./causal-graph";
+import {
+  directorySourceMapLookup,
+  resolveFrame,
+  type SourceMap,
+} from "./source-map";
 
 export const CANDIDATE_SCHEMA_VERSION = 1 as const;
 const MAX_EVIDENCE_CANDIDATES = 200;
@@ -134,10 +140,15 @@ export interface EvidenceIndexInput {
       lv?: string;
       msg?: string;
       source?: string;
+      /** Stack synthesized by the console collector. See post-process.ts. */
+      stk?: string;
     }>;
     errs?: Array<{
       t: number;
       msg?: string;
+      requestId?: string | number;
+      method?: string;
+      url?: string;
       file?: string;
       line?: number;
       col?: number;
@@ -199,11 +210,19 @@ export interface EvidenceCandidate {
      */
     source?: string;
     /**
-     * Source location of the failing code as `file:line:col`, when the browser
-     * captured one. Minified unless the app ships readable builds; Crumbtrail
-     * does not resolve source maps today.
+     * Source location of the failing code as `file:line:col`, when one was
+     * captured. Resolved through the build's source map when a map is
+     * available, so this names a file in the repository rather than a bundler
+     * chunk; see `minifiedFrame` for what the runtime originally reported.
      */
     frame?: string;
+    /**
+     * The generated location `frame` was resolved FROM, set only when source
+     * map resolution actually replaced it. Kept so a reader can verify the
+     * mapping rather than trust it, and so a wrong map is detectable instead of
+     * silently sending someone to the wrong file.
+     */
+    minifiedFrame?: string;
     target?: TargetDescriptor;
   };
   /** Causal role assigned by the confidence-gated re-rank (CP3). Additive/optional. */
@@ -238,37 +257,87 @@ interface RequestInfo {
   route?: string;
 }
 
-export function writeEvidenceIndex(
-  input: EvidenceIndexInput,
+// Every artifact here goes through the SessionStore seam rather than fs directly:
+// these are finalize-time cold-plane files, and an embedder that decorates the
+// store (the hosted cloud's at-rest envelope encryption) must see them, or they
+// stay plaintext on the volume while the rest of the session is sealed.
+/**
+ * Rewrites every candidate's `frame` to the original source location, keeping
+ * the generated one as `minifiedFrame`.
+ *
+ * Config gated on `CRUMBTRAIL_SOURCEMAP_DIR`, a directory of build output
+ * holding the `.map` files. Off by default: without it this is a no-op and the
+ * generated frame stands, which is the honest result rather than a silent
+ * half-resolution.
+ *
+ * Failure is always "leave the frame alone". A frame pointed at the wrong file
+ * is worse than a frame a reader knows is minified, so an unreadable, corrupt
+ * or non-covering map changes nothing.
+ */
+function resolveCandidateFrames(
+  candidates: EvidenceCandidate[],
 ): EvidenceCandidate[] {
+  const dir = process.env.CRUMBTRAIL_SOURCEMAP_DIR?.trim();
+  if (!dir) return candidates;
+  if (!candidates.some((candidate) => candidate.anchor.frame)) {
+    return candidates;
+  }
+
+  const lookup = directorySourceMapLookup(dir);
+  // Shared across candidates: a session's failures usually sit in a handful of
+  // chunks, and parsing a production map is the expensive part.
+  const cache = new Map<string, SourceMap | undefined>();
+
+  return candidates.map((candidate) => {
+    const frame = candidate.anchor.frame;
+    if (!frame) return candidate;
+    const resolved = resolveFrame(frame, lookup, cache);
+    if (!resolved || resolved === frame) return candidate;
+    return {
+      ...candidate,
+      anchor: { ...candidate.anchor, frame: resolved, minifiedFrame: frame },
+    };
+  });
+}
+
+export async function writeEvidenceIndex(
+  input: EvidenceIndexInput,
+): Promise<EvidenceCandidate[]> {
   const events = normalizeEvidenceEvents(input.events);
   const index = withNavigationContext(events, input.index);
-  const candidates = buildEvidenceCandidates(events, index, input.causalGraph);
+  const candidates = resolveCandidateFrames(
+    buildEvidenceCandidates(events, index, input.causalGraph),
+  );
   const normalizedInput = { ...input, index };
   const windowsDir = path.join(input.sessionDir, "windows");
   fs.rmSync(windowsDir, { recursive: true, force: true });
   fs.mkdirSync(windowsDir, { recursive: true });
 
-  fs.writeFileSync(
-    path.join(input.sessionDir, "CANDIDATES.md"),
+  await defaultSessionStore.writeArtifact(
+    input.sessionDir,
+    "CANDIDATES.md",
     renderCandidatesMarkdown(candidates, normalizedInput),
   );
-  fs.writeFileSync(
-    path.join(input.sessionDir, "candidates.jsonl"),
+  await defaultSessionStore.writeArtifact(
+    input.sessionDir,
+    "candidates.jsonl",
     renderCandidatesJsonl(candidates),
   );
-  fs.writeFileSync(
-    path.join(input.sessionDir, "timeline.md"),
+  await defaultSessionStore.writeArtifact(
+    input.sessionDir,
+    "timeline.md",
     renderTimelineMarkdown(events, index),
   );
-  fs.writeFileSync(
-    path.join(input.sessionDir, "search.jsonl"),
+  await defaultSessionStore.writeArtifact(
+    input.sessionDir,
+    "search.jsonl",
     renderSearchJsonl(events, candidates, index),
   );
 
   for (const candidate of candidates) {
-    fs.writeFileSync(
-      path.join(windowsDir, `${candidate.id}.md`),
+    await defaultSessionStore.writeArtifact(
+      input.sessionDir,
+      `windows/${candidate.id}.md`,
       renderWindowMarkdown(candidate, events, index),
     );
   }
@@ -381,6 +450,11 @@ export function buildEvidenceCandidates(
         route: routeAt(index.navs ?? [], entry.t),
         message: scrubText(entry.msg, 220),
         source: entry.source,
+        // The console collector synthesizes a stack at `console.error` time, so
+        // a framework that reports through the console instead of throwing
+        // still yields a code location. Without this the slot reads as a
+        // capture gap while the stack sits in the index unread.
+        frame: codeFrameOf({ stk: entry.stk }),
       }),
       // Key on content signature (message+route), not the volatile timestamp, so a component that
       // re-renders and re-logs the same console error collapses into one candidate (dedupeDrafts
@@ -395,6 +469,12 @@ export function buildEvidenceCandidates(
         candidate.t === entry.t &&
         (candidate.k === "err" || candidate.k === "rej"),
     );
+    // A "Failed to fetch" rejection carries no location of its own. When the
+    // page probe could key the thrown error to its failed request, the errs
+    // entry inherits that request's id/method/url, so surface it on the anchor
+    // (mirrors the http_error anchor above) to restore request identity.
+    const requestId =
+      entry.requestId != null ? String(entry.requestId) : undefined;
     drafts.push({
       detector: event?.k === "rej" ? "unhandled_rejection" : "uncaught_error",
       title: `${event?.k === "rej" ? "Unhandled rejection" : "Uncaught error"}: ${scrubText(entry.msg, 100) ?? "message unavailable"}`,
@@ -406,6 +486,9 @@ export function buildEvidenceCandidates(
         offsetMs:
           offsetForEvent(event) ?? offsetFromStart(entry.t, index.start),
         route: routeAt(index.navs ?? [], entry.t),
+        requestId,
+        method: entry.method,
+        url: redactUrl(entry.url),
         message: scrubText(entry.msg, 220),
         frame: codeFrameOf(entry),
       }),
@@ -463,6 +546,8 @@ export function buildEvidenceCandidates(
   addOtelErrorCandidates(events, index, drafts);
   addBackendErrorCandidates(events, index, drafts);
   addDbDiffCandidates(events, index, drafts);
+  addDbFieldDivergenceCandidates(events, index, drafts);
+  addDuplicateWriteCandidates(events, index, drafts);
   const mutatingRequests = collectMutatingRequests(events);
   addDbDeltaMismatchCandidates(events, index, drafts, mutatingRequests);
   addIneffectiveInputCandidates(events, index, drafts, mutatingRequests);
@@ -556,12 +641,25 @@ export function buildEvidenceCandidates(
  * additive causal tag fields) but NEVER the emitted `score`. Uses `dedupeKey` as each draft's stable
  * identity. With no/empty graph, attribution is all-isolated and the baseline order is preserved.
  *
- * Gates (per attributionConfidence of the symptom→root link):
- *  - high symptom   → collapse: never eligible for ranked[0]; ordered strictly after ALL roots (kept
- *                     in output, appended to its root's causes).
- *  - medium symptom → demote+keep: ordered strictly after its own root, but may interleave with other
- *                     roots by score (still after all roots via tier, actually — see rankTier).
- *  - low symptom    → annotate only: order preserved; tags only.
+ * Gates (per attributionConfidence of the symptom→root link), applied by the tier sort:
+ *  - high symptom   → collapse: demoted tier, sorted after every root and every annotate-only draft
+ *                     (kept in output, appended to its root's causes).
+ *  - medium symptom → demote+keep: same demoted tier; within it, ordered by effective score.
+ *  - low symptom    → annotate only: not demoted, order preserved, tags only.
+ *
+ * TWO ordering rules, and they can disagree. The tier sort is the weaker one. `enforceRootBeforeSymptom`
+ * runs AFTER it and sweeps left to right: any draft found later than the symptom it causes is lifted to
+ * sit immediately before that symptom, INCLUDING across the tier boundary. So a demoted symptom that is
+ * itself the root of an undemoted draft is pulled back above unrelated roots, and is no longer barred
+ * from ranked[0].
+ *
+ * That is intended. "A root appears before its own symptom" is the more fundamental invariant: a list
+ * where a symptom precedes its cause is incoherent, while the tier partition only encodes how strongly
+ * a link was graded. The resulting order is also the one we want — the named failure sits directly under
+ * its actual root instead of at the bottom of the list on a technicality.
+ *
+ * So the only absolute guarantee here is root-before-symptom. A `high` symptom is NOT guaranteed to be
+ * ranked after all roots, nor to be excluded from ranked[0].
  *
  * The comparator produces a total, deterministic order derived solely from per-draft fields.
  */
@@ -628,7 +726,8 @@ function applyCausalRerank(
   }
 
   // Rank tier: roots + isolated (0) precede high/medium demoted symptoms (1). Low symptoms are NOT
-  // demoted (annotate-only) → tier 0, order preserved.
+  // demoted (annotate-only) → tier 0, order preserved. The tier holds only until
+  // enforceRootBeforeSymptom below, which may lift a tier-1 draft back across the boundary.
   const rankTier = (draft: CandidateDraft): number => {
     if (
       draft.causalRole === "symptom" &&
@@ -655,11 +754,10 @@ function applyCausalRerank(
     return a.dedupeKey.localeCompare(b.dedupeKey);
   });
 
-  // Guarantee: every demoted (high/medium) symptom orders strictly AFTER its root. The tier already
-  // pushes all demoted symptoms below all roots, so any symptom whose root is a tier-0 draft is
-  // satisfied. A symptom attributed to another (rare) demoted symptom is still after its root because
-  // the root precedes it in the same tier by effective score / tie-break; enforce explicitly for
-  // safety without disturbing determinism.
+  // Absolute guarantee: every symptom orders strictly AFTER its root. NOT a safety net over the tier
+  // sort — it overrides it. A tier-0 draft whose root is a tier-1 demoted symptom is only reachable by
+  // this pass, which lifts that root back across the tier boundary. See the header for why root-before-
+  // symptom outranks the tier partition when the two disagree.
   enforceRootBeforeSymptom(ordered, baselineRank);
 }
 
@@ -972,12 +1070,72 @@ function addTranscriptComplaintCandidates(
 const OTEL_SPAN_KIND = "backend.otel.span";
 const OTEL_LOG_KIND = "backend.otel.log";
 
+/** Upper bound on a stack scanned for a code frame. Deep async stacks are long. */
+const MAX_STACK_CHARS = 8000;
+
 function otelHttpStatus(attributes: unknown): number | undefined {
   if (!isRecord(attributes)) return undefined;
   return (
     finiteNumber(attributes["http.response.status_code"]) ??
     finiteNumber(attributes["http.status_code"])
   );
+}
+
+/**
+ * `file:line:col` for a backend signal, read from OTel attributes. Both the
+ * current (`code.file.path`) and the older (`code.filepath`) semantic
+ * convention names are accepted, since exporters in the field emit either.
+ *
+ * Falls back to `exception.stacktrace`, which is where a recorded exception
+ * puts its frames when the SDK sets it as an attribute rather than a span
+ * event. Returns undefined rather than a partial location, matching
+ * {@link codeFrameOf}: a path with no line is not a starting point.
+ */
+function otelCodeFrame(attributes: unknown): string | undefined {
+  if (!isRecord(attributes)) return undefined;
+  const file =
+    safeText(attributes["code.file.path"], 300) ??
+    safeText(attributes["code.filepath"], 300);
+  const line =
+    finiteNumber(attributes["code.line.number"]) ??
+    finiteNumber(attributes["code.lineno"]);
+  if (file && line !== undefined) {
+    const column =
+      finiteNumber(attributes["code.column.number"]) ??
+      finiteNumber(attributes["code.column"]);
+    return safeText(
+      `${file}:${line}${column !== undefined ? `:${column}` : ""}`,
+      300,
+    );
+  }
+  // Deliberately NOT safeText: it collapses runs of whitespace, which flattens
+  // a stack onto one line and leaves codeFrameOf nothing to split on (it skips
+  // the header line, so a flattened stack yields no frames at all). Pass the
+  // raw string, bounded, and let codeFrameOf truncate the location it returns.
+  const stack = attributes["exception.stacktrace"];
+  if (typeof stack !== "string") return undefined;
+  return codeFrameOf({ stk: stack.slice(0, MAX_STACK_CHARS) });
+}
+
+/**
+ * A code frame for a span, preferring its own attributes and falling back to a
+ * recorded exception span event.
+ *
+ * `recordException()` is how a backend normally reports a failure, and it puts
+ * exception.stacktrace on a span EVENT rather than on the span. Reading only
+ * span attributes therefore left the common case with no code location.
+ */
+function spanCodeFrame(d: Record<string, unknown>): string | undefined {
+  const fromAttributes = otelCodeFrame(d.attributes);
+  if (fromAttributes) return fromAttributes;
+
+  if (!Array.isArray(d.spanEvents)) return undefined;
+  for (const spanEvent of d.spanEvents) {
+    if (!isRecord(spanEvent)) continue;
+    const frame = otelCodeFrame(spanEvent.attributes);
+    if (frame) return frame;
+  }
+  return undefined;
 }
 
 function addConsoleWarningCandidates(
@@ -1115,6 +1273,7 @@ function addOtelErrorCandidates(
           message:
             scrubText(event.d.statusMessage, 220) ?? scrubText(name, 220),
           source: service,
+          frame: spanCodeFrame(event.d),
         }),
         dedupeKey: `otelspan:${safeText(event.d.spanId, 120) ?? event.t}:${event.d.statusCode ?? ""}:${status ?? ""}`,
       });
@@ -1143,6 +1302,7 @@ function addOtelErrorCandidates(
           requestId: traceId,
           message: scrubText(event.d.body, 220),
           source: service,
+          frame: otelCodeFrame(event.d.attributes),
         }),
         dedupeKey: `otellog:${event.t}:${traceId ?? ""}:${body ?? ""}`,
       });
@@ -1155,6 +1315,94 @@ const DB_DIFF_ADJACENCY_MS = 5_000;
 interface ErrorMoment {
   t: number;
   requestId?: string;
+}
+
+/**
+ * How strongly a database write is tied to an error in the same session.
+ *
+ *  - `request`  the write and an error carry the SAME request id. Explicit
+ *               correlation, the strongest link the capture can express.
+ *  - `temporal` the write is inside {@link DB_DIFF_ADJACENCY_MS} of an error
+ *               whose linkage cannot be decided, because one side or the other
+ *               carries no request id. Suggestive, not established.
+ *  - `none`     neither holds.
+ */
+type DbErrorLinkage = "request" | "temporal" | "none";
+
+/**
+ * One ranking table for both database planes. `db.diff` (row images) and
+ * `otel_db_activity` (statements) describe the same writes from two capture
+ * sources, so a reader comparing them must not see two different gradings of
+ * the same linkage.
+ */
+const DB_LINKAGE_SEVERITY: Record<
+  DbErrorLinkage,
+  EvidenceCandidate["severity"]
+> = {
+  request: "high",
+  temporal: "medium",
+  none: "low",
+};
+const DB_LINKAGE_SCORE: Record<DbErrorLinkage, number> = {
+  request: 88,
+  temporal: 64,
+  none: 40,
+};
+const DB_LINKAGE_CONFIDENCE: Record<
+  DbErrorLinkage,
+  EvidenceCandidate["confidence"]
+> = {
+  request: "high",
+  temporal: "medium",
+  none: "low",
+};
+
+/**
+ * Grade a write against the session's error moments.
+ *
+ * The rule this replaced was `sameRequestId OR within 5s of any error`, which
+ * made the time window an independent promoter: any write landing near an
+ * error reached the top tier even when both sides carried request ids that
+ * disagreed. In a real session a background job drain 2942ms after an unrelated
+ * checkout error was lifted to `high`/88 on the time window alone.
+ *
+ * Two request ids that are both present and different are positive evidence of
+ * NON linkage, not missing evidence, so the window must not override them. The
+ * window survives only where correlation genuinely cannot be decided: one of
+ * the two sides has no request id to compare. That is the whole change — a
+ * write correlated to the error keeps the top tier, a write correlated AWAY
+ * from it drops to the standalone tier, and only the undecidable middle sits
+ * between them.
+ *
+ * Note what this deliberately does NOT do: it does not discriminate between
+ * writes that share the error's request id. Inside one request the error
+ * usually precedes every write, so temporal distance collapses to write order,
+ * which application code chooses freely and which says nothing about which
+ * write is at fault. Ranking on it produces confident nonsense — in the
+ * duplicate redemption session it scored the two culprit `coupon_redemptions`
+ * inserts BELOW the innocent `products` update, purely because checkout writes
+ * coupons later. Discriminating inside a request is the job of a detector that
+ * reads an observable property of the rows themselves.
+ */
+function gradeDbErrorLinkage(
+  eventT: number,
+  requestId: string | undefined,
+  errorMoments: ErrorMoment[],
+): DbErrorLinkage {
+  let temporal = false;
+  for (const moment of errorMoments) {
+    if (
+      requestId !== undefined &&
+      moment.requestId !== undefined &&
+      moment.requestId === requestId
+    )
+      return "request";
+    const undecidable =
+      requestId === undefined || moment.requestId === undefined;
+    if (undecidable && Math.abs(moment.t - eventT) <= DB_DIFF_ADJACENCY_MS)
+      temporal = true;
+  }
+  return temporal ? "temporal" : "none";
 }
 
 function collectErrorMoments(
@@ -1224,9 +1472,10 @@ function addDbDiffCandidates(
   if (dbDiffs.length === 0) return;
 
   // Maximum visibility: always surface db.diffs (the subtle data-correctness bugs a logger
-  // most wants to catch). A diff adjacent to an error ranks high (88); a standalone diff ranks
-  // low (40) so it never buries real errors but still appears — and, absent any error, becomes
-  // ranked[0] so its evidence window covers the diff for fix-context.
+  // most wants to catch). A diff correlated to an error by request id ranks high (88); one
+  // merely near an error whose linkage cannot be decided ranks medium (64); a standalone diff
+  // ranks low (40) so it never buries real errors but still appears — and, absent any error,
+  // becomes ranked[0] so its evidence window covers the diff for fix-context.
   const errorMoments = collectErrorMoments(events, index);
 
   for (const event of dbDiffs) {
@@ -1234,24 +1483,20 @@ function addDbDiffCandidates(
     const op = safeText(event.d.op, 20) ?? "mutation";
     const table = safeText(event.d.table, 200) ?? "unknown table";
 
-    const adjacent = errorMoments.some(
-      (moment) =>
-        Math.abs(moment.t - event.t) <= DB_DIFF_ADJACENCY_MS ||
-        (requestId !== undefined &&
-          moment.requestId !== undefined &&
-          moment.requestId === requestId),
-    );
+    const linkage = gradeDbErrorLinkage(event.t, requestId, errorMoments);
+    const label = scrubText(table, 100) ?? "table";
 
     drafts.push({
       detector: "db_mutation",
-      // A db.diff adjacent to an error is high-value evidence (ranked like an otel_span_error);
-      // a standalone db.diff is surfaced at a low score so it is visible without out-ranking errors.
-      title: adjacent
-        ? `Database ${op} on ${scrubText(table, 100) ?? "table"} near an error`
-        : `Database ${op} on ${scrubText(table, 100) ?? "table"}`,
-      severity: adjacent ? "high" : "low",
-      score: adjacent ? 88 : 40,
-      confidence: adjacent ? "high" : "low",
+      title:
+        linkage === "request"
+          ? `Database ${op} on ${label} in a failed request`
+          : linkage === "temporal"
+            ? `Database ${op} on ${label} near an error`
+            : `Database ${op} on ${label}`,
+      severity: DB_LINKAGE_SEVERITY[linkage],
+      score: DB_LINKAGE_SCORE[linkage],
+      confidence: DB_LINKAGE_CONFIDENCE[linkage],
       anchor: removeUndefined({
         t: event.t,
         offsetMs:
@@ -1569,6 +1814,238 @@ function addDbDeltaMismatchCandidates(
         }),
         dedupeKey: `dbdelta:${request.requestId}:${pkValue}:${table}:${column}`,
       });
+    }
+  }
+}
+
+// ─── Per-request db.diff invariant detectors ──────────────────────────────
+//
+// Both read one request's whole `db.diff` set rather than a single diff, and
+// both are deliberately silent on ambiguity. They exist because the generic
+// `db_mutation` surfacing says only "a write happened", which cannot tell a
+// reader WHICH of eight writes in a failed request is the bug. These name the
+// bug from a property of the rows themselves, so they are scored above the
+// `db_mutation` ceiling of 88: a reader working the ranked list downward must
+// reach the named invariant violation before the generic plane dump.
+
+const DB_INVARIANT_SCORE = 90;
+
+/** Group a session's `db.diff` events by request id. Diffs with no request id are dropped: every rule here is per request, and an uncorrelated diff cannot join one. */
+function dbDiffsByRequest(events: BugEvent[]): Map<string, BugEvent[]> {
+  const byRequest = new Map<string, BugEvent[]>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    const requestId = safeText(event.d.requestId, 120);
+    if (!requestId) continue;
+    const list = byRequest.get(requestId) ?? [];
+    list.push(event);
+    byRequest.set(requestId, list);
+  }
+  return byRequest;
+}
+
+/** Field names that identify or timestamp a row rather than carry a value. Comparing them across two rows is meaningless: they are SUPPOSED to differ. */
+function isIdentityOrClockField(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower === "id" ||
+    lower.endsWith("_id") ||
+    lower.endsWith("id") ||
+    lower.endsWith("_at") ||
+    lower.endsWith("_on") ||
+    lower.includes("timestamp") ||
+    lower.includes("created") ||
+    lower.includes("updated") ||
+    lower === "uuid" ||
+    lower === "guid"
+  );
+}
+
+/** The pk values of a diff, as strings. */
+function pkValuesOf(event: BugEvent): string[] {
+  const pk = event.d.pk;
+  if (!isRecord(pk)) return [];
+  return Object.values(pk).map((value) => String(value));
+}
+
+/**
+ * Do these two rows reference each other?
+ *
+ * Linkage is a foreign key match: one row's after image or pk carries a value
+ * equal to the other row's primary key. This is the whole guard against
+ * comparing unrelated rows that happen to share a column name — two different
+ * customers' `orders` rows both have a `total_cents` and are supposed to
+ * differ.
+ */
+function rowsAreLinked(left: BugEvent, right: BugEvent): boolean {
+  const referencesPkOf = (from: BugEvent, target: BugEvent): boolean => {
+    const targetPks = new Set(pkValuesOf(target));
+    if (targetPks.size === 0) return false;
+    const after = from.d.after;
+    const candidates = [
+      ...pkValuesOf(from),
+      ...(isRecord(after) ? Object.values(after).map((v) => String(v)) : []),
+    ];
+    return candidates.some((value) => targetPks.has(value));
+  };
+  return referencesPkOf(left, right) || referencesPkOf(right, left);
+}
+
+/**
+ * db_field_divergence: two linked rows written by ONE request disagree about
+ * the same named value.
+ *
+ * The real case: a checkout wrote `products.price_cents=8900` and
+ * `order_items.price_cents=7900` in one request, the order_items row
+ * referencing the products row. Two prices for one product, written together,
+ * neither one wrong on its own. No existing detector reads the `db.diff` set
+ * as a set, so the candidate list was identical to the clean control's.
+ *
+ * Silent on ambiguity, by these guards:
+ *  - both rows must carry a record `after` image;
+ *  - the rows must be in DIFFERENT tables. Two rows of one table are siblings,
+ *    not a contradiction, and are supposed to hold different values;
+ *  - they must be linked by a foreign key match (see {@link rowsAreLinked});
+ *  - the shared field must name a value, not an identity or a clock;
+ *  - both values must be finite numbers. A string field disagreeing is not
+ *    reliably a contradiction — two rows can legitimately hold different
+ *    labels for one entity.
+ */
+function addDbFieldDivergenceCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    if (diffs.length < 2) continue;
+    for (let i = 0; i < diffs.length; i += 1) {
+      for (let j = i + 1; j < diffs.length; j += 1) {
+        const left = diffs[i];
+        const right = diffs[j];
+        const leftTable = safeText(left.d.table, 200);
+        const rightTable = safeText(right.d.table, 200);
+        if (!leftTable || !rightTable || leftTable === rightTable) continue;
+        const leftAfter = left.d.after;
+        const rightAfter = right.d.after;
+        if (!isRecord(leftAfter) || !isRecord(rightAfter)) continue;
+        if (!rowsAreLinked(left, right)) continue;
+
+        for (const field of Object.keys(leftAfter)) {
+          if (!(field in rightAfter)) continue;
+          if (isIdentityOrClockField(field)) continue;
+          const leftValue = toFiniteNumber(leftAfter[field]);
+          const rightValue = toFiniteNumber(rightAfter[field]);
+          if (leftValue === undefined || rightValue === undefined) continue;
+          if (leftValue === rightValue) continue;
+
+          const anchorEvent = left.t <= right.t ? left : right;
+          drafts.push({
+            detector: "db_field_divergence",
+            title: `Linked rows disagree on ${field}: ${leftTable}.${field}=${leftValue} but ${rightTable}.${field}=${rightValue} in one request`,
+            severity: "high",
+            score: DB_INVARIANT_SCORE,
+            confidence: "high",
+            anchor: removeUndefined({
+              t: anchorEvent.t,
+              offsetMs:
+                offsetForEvent(anchorEvent) ??
+                offsetFromStart(anchorEvent.t, index.start),
+              route: routeAt(index.navs ?? [], anchorEvent.t),
+              requestId,
+              message: `${leftTable}.${field}=${leftValue} vs ${rightTable}.${field}=${rightValue} (rows linked by id, written by request ${requestId})`,
+              source: normalizeDbEngine(anchorEvent.d.engine),
+            }),
+            // Table pair is ordered so the key does not depend on diff order.
+            dedupeKey: `dbfielddiv:${requestId}:${field}:${[leftTable, rightTable].sort().join("|")}`,
+          });
+        }
+      }
+    }
+  }
+}
+
+/**
+ * The comparable content of an insert: its after image minus the primary key,
+ * canonicalized so two rows written in either key order compare equal.
+ *
+ * Returns undefined when nothing SUBSTANTIVE survives the pk drop. That guard
+ * is load bearing rather than defensive: the clean control run inserts two
+ * `shipments` rows whose after images are `{id: …}` alone, so they reduce to
+ * `{}` and a naive "identical inserts" rule fires on the control. A signature
+ * with no surviving value carries no evidence that the two rows are the same
+ * write twice, only that the capture recorded nothing about either.
+ */
+function insertSignature(event: BugEvent): string | undefined {
+  const after = event.d.after;
+  if (!isRecord(after)) return undefined;
+  const pkKeys = isRecord(event.d.pk) ? new Set(Object.keys(event.d.pk)) : null;
+  const entries = Object.entries(after)
+    .filter(([key]) => !pkKeys?.has(key))
+    .sort(([a], [b]) => a.localeCompare(b));
+  if (entries.length === 0) return undefined;
+  if (entries.every(([, value]) => isZeroOrEmpty(value))) return undefined;
+  return JSON.stringify(entries);
+}
+
+/**
+ * duplicate_write: one request inserted the same row into one table more than
+ * once.
+ *
+ * The real case: a retry storm with no idempotency key wrote two identical
+ * `coupon_redemptions` rows for one order under a single request id. Both rows
+ * are individually valid, so nothing else in the pipeline names them.
+ *
+ * Identity is the after image minus the primary key — a duplicate differs only
+ * by whatever the database generated. See {@link insertSignature} for the
+ * non trivial guard that keeps this silent on the clean control.
+ */
+function addDuplicateWriteCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    // table → signature → the inserts sharing it
+    const byTable = new Map<string, Map<string, BugEvent[]>>();
+    for (const event of diffs) {
+      if (safeText(event.d.op, 20) !== "insert") continue;
+      const table = safeText(event.d.table, 200);
+      if (!table) continue;
+      const signature = insertSignature(event);
+      if (signature === undefined) continue;
+      const signatures = byTable.get(table) ?? new Map<string, BugEvent[]>();
+      const group = signatures.get(signature) ?? [];
+      group.push(event);
+      signatures.set(signature, group);
+      byTable.set(table, signatures);
+    }
+
+    for (const [table, signatures] of byTable) {
+      for (const [signature, group] of signatures) {
+        if (group.length < 2) continue;
+        const anchorEvent = group.reduce((earliest, event) =>
+          event.t < earliest.t ? event : earliest,
+        );
+        const label = scrubText(table, 100) ?? "table";
+        drafts.push({
+          detector: "duplicate_write",
+          title: `Duplicate write: ${group.length} identical rows inserted into ${label} in one request`,
+          severity: "high",
+          score: DB_INVARIANT_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: anchorEvent.t,
+            offsetMs:
+              offsetForEvent(anchorEvent) ??
+              offsetFromStart(anchorEvent.t, index.start),
+            route: routeAt(index.navs ?? [], anchorEvent.t),
+            requestId,
+            message: `${group.length} inserts into ${table} in request ${requestId} share one after image once the primary key is dropped`,
+            source: normalizeDbEngine(anchorEvent.d.engine),
+          }),
+          dedupeKey: `dupwrite:${requestId}:${table}:${signature}`,
+        });
+      }
     }
   }
 }
@@ -1997,7 +2474,9 @@ function addUiApiDivergenceCandidates(
       const requestId = requestIdForEvent(response);
       for (const [name, value] of collectNumericFieldEntries(body)) {
         fieldEntries.push(
-          requestId === undefined ? { name, value } : { name, value, requestId },
+          requestId === undefined
+            ? { name, value }
+            : { name, value, requestId },
         );
       }
     }
@@ -2081,22 +2560,20 @@ function addOtelDbActivityCandidates(
     const statement =
       scrubText(attrs["db.statement"], 220) ??
       scrubText(attrs["db.query.text"], 220);
-    const adjacent = errorMoments.some(
-      (moment) =>
-        Math.abs(moment.t - event.t) <= DB_DIFF_ADJACENCY_MS ||
-        (requestId !== undefined &&
-          moment.requestId !== undefined &&
-          moment.requestId === requestId),
-    );
+    const linkage = gradeDbErrorLinkage(event.t, requestId, errorMoments);
+    const label = operation ?? statement ?? system;
 
     drafts.push({
       detector: "otel_db_activity",
-      title: adjacent
-        ? `OTel DB activity near an error: ${operation ?? statement ?? system}`
-        : `OTel DB activity: ${operation ?? statement ?? system}`,
-      severity: adjacent ? "high" : "low",
-      score: adjacent ? 88 : 40,
-      confidence: adjacent ? "high" : "low",
+      title:
+        linkage === "request"
+          ? `OTel DB activity in a failed request: ${label}`
+          : linkage === "temporal"
+            ? `OTel DB activity near an error: ${label}`
+            : `OTel DB activity: ${label}`,
+      severity: DB_LINKAGE_SEVERITY[linkage],
+      score: DB_LINKAGE_SCORE[linkage],
+      confidence: DB_LINKAGE_CONFIDENCE[linkage],
       anchor: removeUndefined({
         t: event.t,
         offsetMs:
@@ -2179,7 +2656,8 @@ function isNavigationEvent(event: BugEvent): boolean {
  * trailing digits so a bare `https://host/a.js` with no position never matches
  * and no half-location is reported as a code frame.
  */
-const STACK_FRAME_LOCATION = /((?:https?:\/\/|\/|[A-Za-z]:\\|\w)[^\s()]*?:\d+:\d+)/;
+const STACK_FRAME_LOCATION =
+  /((?:https?:\/\/|\/|[A-Za-z]:\\|\w)[^\s()]*?:\d+:\d+)/;
 
 /**
  * The `file:line:col` of the failing code, or undefined when the session never
@@ -2244,7 +2722,8 @@ function downrankTrackerBeacons(
       .filter((id): id is string => id !== undefined),
   );
   for (const draft of drafts) {
-    if (!isTrackerBeaconDraft(draft, beaconFailures, beaconRequestIds)) continue;
+    if (!isTrackerBeaconDraft(draft, beaconFailures, beaconRequestIds))
+      continue;
     draft.score = Math.min(draft.score, TRACKER_BEACON_SCORE);
     draft.severity = "low";
   }

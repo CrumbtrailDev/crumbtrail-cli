@@ -4,6 +4,15 @@ import {
 } from "../backend-events";
 
 export {
+  AUTO_INSTRUMENT_DRIVERS,
+  autoInstrumentDbClients,
+  formatAutoInstrumentReport,
+  type AutoInstrumentDbOptions,
+  type AutoInstrumentDriver,
+  type AutoInstrumentDriverResult,
+  type AutoInstrumentReport,
+} from "./auto-instrument";
+export {
   DEFAULT_SENSITIVE_DB_COLUMNS,
   buildSensitiveColumnSet,
   redactColumns,
