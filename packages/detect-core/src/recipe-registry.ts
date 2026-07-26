@@ -88,10 +88,10 @@ const NODE_KEY: KeyRef = {
  * exact for every recipe-managed SDK and equals each workspace manifest version.
  */
 export const SDK_VERSION_FLOORS: Record<string, string> = {
-  "crumbtrail-core": "0.6.0",
-  "crumbtrail-node": "0.14.0",
-  "crumbtrail-react-native": "0.3.0",
-  "crumbtrail-tauri": "0.3.0",
+  "crumbtrail-core": "0.7.0",
+  "crumbtrail-node": "0.15.0",
+  "crumbtrail-react-native": "0.3.1",
+  "crumbtrail-tauri": "0.3.1",
 };
 
 /** The install spec for a package: `pkg@^<floor>`, or the bare name when unknown. */
