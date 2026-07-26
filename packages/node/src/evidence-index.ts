@@ -93,6 +93,24 @@ const TRACKER_BEACON_CORRELATION_MS = 2_000;
 // first-party 4xx (70) while staying above pure-noise signals, so it is reordered, not hidden.
 const TRACKER_BEACON_SCORE = 15;
 
+// Ceiling score applied to a 4xx the application deliberately returned. Sits below a first-party
+// console warning (50) so a real defect that only warns still outranks a whole session of expected
+// rejections, and above tracker-beacon noise (15) because an expected rejection is at least
+// first-party behavior worth reading. Demoted, never dropped: "login 401s for every user" has to
+// stay findable.
+const HANDLED_CLIENT_ERROR_SCORE = 30;
+
+// 4xx statuses that are an authentication or authorization challenge. Answering one is how the
+// protocol works — an unauthenticated visitor polling /api/me gets a 401 on every page load — so
+// these need no body evidence to count as deliberate. Deliberately excludes 408/429: a timeout or a
+// throttle is a real operational signal, and only a structured body demotes those.
+const AUTH_CHALLENGE_STATUSES = new Set([401, 403]);
+
+// Keys whose presence in a JSON response body proves a handler chose this outcome and named it,
+// rather than something failing its way into a 4xx. `type` + `title` covers RFC 9457 problem
+// details. A bare `message` is not enough: unhandled framework errors serialize that way too.
+const STRUCTURED_ERROR_KEYS = ["error", "errors", "code"] as const;
+
 // Fetch-level rejection detectors that carry no url of their own, so they must be correlated to a
 // nearby blocked beacon request to be recognised as beacon noise.
 const FETCH_REJECTION_DETECTORS = new Set([
@@ -192,6 +210,13 @@ export interface EvidenceCandidate {
   severity: "critical" | "high" | "medium" | "low";
   score: number;
   confidence: "high" | "medium" | "low";
+  /**
+   * How many drafts collapsed into this candidate, set only when more than one
+   * did. Four rejected sign-in attempts and one are the same defect but not the
+   * same event, and a grouped signal that dropped the count would read as a
+   * single incident.
+   */
+  occurrences?: number;
   anchor: {
     t: number;
     offsetMs?: number;
@@ -209,6 +234,18 @@ export interface EvidenceCandidate {
      * NOT read this as a code location; use `frame`.
      */
     source?: string;
+    /**
+     * Column names a row-identity comparison rested on, sorted. Set by the
+     * database detectors that claim two rows are the same, so a reader can see
+     * what was compared instead of taking the claim on faith.
+     */
+    comparedColumns?: string[];
+    /**
+     * The after image the compared rows shared, restricted to
+     * {@link EvidenceCandidate.anchor.comparedColumns}. Already redacted and
+     * size-bounded at capture time; re-scrubbed here before it is re-shipped.
+     */
+    sharedAfterImage?: Record<string, unknown>;
     /**
      * Source location of the failing code as `file:line:col`, when one was
      * captured. Resolved through the build's source map when a map is
@@ -555,6 +592,10 @@ export function buildEvidenceCandidates(
   addUiApiDivergenceCandidates(events, index, drafts);
   addOtelDbActivityCandidates(events, index, drafts);
 
+  // Demote the 4xx responses the application returned deliberately (auth challenges, structured
+  // error bodies) before dedupe so their grouped keys collapse. Ranking-only, like the beacon pass.
+  demoteHandledClientErrors(drafts, events);
+
   // Downrank known third-party analytics/ads beacon failures before dedupe/ranking so a blocked
   // tracker beacon cannot outrank (or drown) a genuine first-party failure. Ranking-only in spirit:
   // it lowers score/severity for beacon noise but never removes a candidate.
@@ -620,6 +661,9 @@ export function buildEvidenceCandidates(
       severity: draft.severity,
       score: draft.score,
       confidence: draft.confidence,
+      ...(draft.occurrences !== undefined
+        ? { occurrences: draft.occurrences }
+        : {}),
       anchor: draft.anchor,
       ...(draft.causalRole ? { causalRole: draft.causalRole } : {}),
       ...(rootCauseId ? { rootCauseId } : {}),
@@ -1405,11 +1449,46 @@ function gradeDbErrorLinkage(
   return temporal ? "temporal" : "none";
 }
 
+/**
+ * Response bodies by browser network id, so a failed request can be judged
+ * against what the server actually said.
+ */
+function responseBodyByRequestId(events: BugEvent[]): Map<string, unknown> {
+  const out = new Map<string, unknown>();
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const id = requestIdForEvent(event);
+    if (id !== undefined) out.set(id, event.d.body);
+  }
+  return out;
+}
+
+/**
+ * Failed requests that are a deliberate application outcome, keyed by browser
+ * network id. Shared by the demotion pass and by error-moment collection: a 4xx
+ * the app chose to return is not an error a nearby database write should be
+ * graded against.
+ */
+function handledClientErrorRequestIds(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+): Set<string> {
+  const bodies = responseBodyByRequestId(events);
+  const handled = new Set<string>();
+  for (const failed of index.failedReqs ?? []) {
+    const id = requestIdForValue(failed);
+    if (id === undefined) continue;
+    if (isHandledClientError(failed.st, bodies.get(id))) handled.add(id);
+  }
+  return handled;
+}
+
 function collectErrorMoments(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
 ): ErrorMoment[] {
   const moments: ErrorMoment[] = [];
+  const handled = handledClientErrorRequestIds(events, index);
 
   for (const event of events) {
     if (
@@ -1417,6 +1496,9 @@ function collectErrorMoments(
       finiteNumber(event.d.st) !== undefined &&
       (finiteNumber(event.d.st) ?? 0) >= 400
     ) {
+      // A 4xx the application chose to return is an outcome, not a fault, so a
+      // write that happens to sit beside it is not thereby suspicious.
+      if (isHandledClientError(finiteNumber(event.d.st), event.d.body)) continue;
       moments.push({ t: event.t, requestId: safeText(event.d.requestId, 120) });
     } else if (event.k === "err" || event.k === "rej") {
       moments.push({ t: event.t });
@@ -1455,7 +1537,11 @@ function collectErrorMoments(
     }
   }
 
-  for (const failed of index.failedReqs ?? []) moments.push({ t: failed.t });
+  for (const failed of index.failedReqs ?? []) {
+    const id = requestIdForValue(failed);
+    if (id !== undefined && handled.has(id)) continue;
+    moments.push({ t: failed.t });
+  }
   for (const entry of index.networkErrors ?? []) moments.push({ t: entry.t });
   for (const entry of index.consoleErrors ?? []) moments.push({ t: entry.t });
   for (const entry of index.errs ?? []) moments.push({ t: entry.t });
@@ -1964,18 +2050,50 @@ function addDbFieldDivergenceCandidates(
   }
 }
 
+/** Cap on columns re-shipped as duplicate-write evidence. */
+const MAX_COMPARED_COLUMNS = 24;
+
+/**
+ * Whether a column name points at a parent row rather than identifying this
+ * one. Every child row written by one request shares its parent's key: the
+ * three `order_items` of a single order all carry the same `order_id`, so a
+ * match on that column alone says they belong to one order, which we already
+ * knew from the request id.
+ */
+function looksLikeForeignKey(column: string): boolean {
+  return /(^|_)id$|Id$/.test(column);
+}
+
 /**
  * The comparable content of an insert: its after image minus the primary key,
  * canonicalized so two rows written in either key order compare equal.
  *
- * Returns undefined when nothing SUBSTANTIVE survives the pk drop. That guard
- * is load bearing rather than defensive: the clean control run inserts two
- * `shipments` rows whose after images are `{id: …}` alone, so they reduce to
- * `{}` and a naive "identical inserts" rule fires on the control. A signature
- * with no surviving value carries no evidence that the two rows are the same
- * write twice, only that the capture recorded nothing about either.
+ * Returns undefined when nothing DISCRIMINATING survives the pk drop, because a
+ * signature that cannot tell two different rows apart cannot be evidence that
+ * they are one row written twice. Three cases are rejected:
+ *
+ *  - Nothing survives. The clean control run inserts two `shipments` rows whose
+ *    after images are `{id: …}` alone, so they reduce to `{}` and a naive
+ *    "identical inserts" rule fires on the control.
+ *  - Every surviving value is zero or empty, which is the same absence wearing
+ *    a column name.
+ *  - The only surviving column is a foreign key. A live run reported three
+ *    demonstrably different `order_items` rows (different product, quantity and
+ *    price) as "3 identical rows" because the captured after image had reduced
+ *    to `{id, order_id}` and every row of one order shares `order_id`. A
+ *    partial capture must read as unknown, never as a duplicate.
  */
 function insertSignature(event: BugEvent): string | undefined {
+  return comparedInsertColumns(event)?.signature;
+}
+
+/**
+ * The signature plus the entries it rests on, so a detector can ship the
+ * evidence for its own claim rather than asserting it.
+ */
+function comparedInsertColumns(
+  event: BugEvent,
+): { signature: string; entries: Array<[string, unknown]> } | undefined {
   const after = event.d.after;
   if (!isRecord(after)) return undefined;
   const pkKeys = isRecord(event.d.pk) ? new Set(Object.keys(event.d.pk)) : null;
@@ -1984,7 +2102,20 @@ function insertSignature(event: BugEvent): string | undefined {
     .sort(([a], [b]) => a.localeCompare(b));
   if (entries.length === 0) return undefined;
   if (entries.every(([, value]) => isZeroOrEmpty(value))) return undefined;
-  return JSON.stringify(entries);
+  if (entries.length === 1 && looksLikeForeignKey(entries[0][0]))
+    return undefined;
+  return { signature: JSON.stringify(entries), entries };
+}
+
+/** Re-scrubs an after image for re-shipping inside a candidate anchor. */
+function sharedAfterImageOf(
+  entries: Array<[string, unknown]>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of entries.slice(0, MAX_COMPARED_COLUMNS)) {
+    out[key] = typeof value === "string" ? scrubText(value, 200) : value;
+  }
+  return out;
 }
 
 /**
@@ -2007,16 +2138,20 @@ function addDuplicateWriteCandidates(
   for (const [requestId, diffs] of dbDiffsByRequest(events)) {
     // table → signature → the inserts sharing it
     const byTable = new Map<string, Map<string, BugEvent[]>>();
+    // signature → the entries that produced it, so the emitted candidate can
+    // carry the compared columns without recomputing them.
+    const entriesBySignature = new Map<string, Array<[string, unknown]>>();
     for (const event of diffs) {
       if (safeText(event.d.op, 20) !== "insert") continue;
       const table = safeText(event.d.table, 200);
       if (!table) continue;
-      const signature = insertSignature(event);
-      if (signature === undefined) continue;
+      const compared = comparedInsertColumns(event);
+      if (compared === undefined) continue;
+      entriesBySignature.set(compared.signature, compared.entries);
       const signatures = byTable.get(table) ?? new Map<string, BugEvent[]>();
-      const group = signatures.get(signature) ?? [];
+      const group = signatures.get(compared.signature) ?? [];
       group.push(event);
-      signatures.set(signature, group);
+      signatures.set(compared.signature, group);
       byTable.set(table, signatures);
     }
 
@@ -2027,6 +2162,8 @@ function addDuplicateWriteCandidates(
           event.t < earliest.t ? event : earliest,
         );
         const label = scrubText(table, 100) ?? "table";
+        const entries = entriesBySignature.get(signature) ?? [];
+        const columns = entries.map(([key]) => key);
         drafts.push({
           detector: "duplicate_write",
           title: `Duplicate write: ${group.length} identical rows inserted into ${label} in one request`,
@@ -2040,8 +2177,12 @@ function addDuplicateWriteCandidates(
               offsetFromStart(anchorEvent.t, index.start),
             route: routeAt(index.navs ?? [], anchorEvent.t),
             requestId,
-            message: `${group.length} inserts into ${table} in request ${requestId} share one after image once the primary key is dropped`,
+            // Name the columns the claim rests on. "share one after image" alone
+            // sent a reader looking for row data the bundle never carried.
+            message: `${group.length} inserts into ${table} in request ${requestId} match on every non-key column captured (${columns.join(", ")})`,
             source: normalizeDbEngine(anchorEvent.d.engine),
+            comparedColumns: columns.slice(0, MAX_COMPARED_COLUMNS),
+            sharedAfterImage: sharedAfterImageOf(entries),
           }),
           dedupeKey: `dupwrite:${requestId}:${table}:${signature}`,
         });
@@ -2709,6 +2850,113 @@ function normalizeErrorSignature(value: unknown): string {
  *    {@link TRACKER_BEACON_CORRELATION_MS} of a blocked beacon request.
  * Candidates with unknown or first-party targets are left untouched.
  */
+/**
+ * True when `body` is a JSON object naming its own failure — the signature of a
+ * handler that returned this status on purpose.
+ *
+ * Parses rather than pattern-matches: a redacted or truncated body, an HTML
+ * error page and a framework stack trace all fail to parse, and every one of
+ * those is a case where we must NOT claim the outcome was deliberate.
+ */
+function bodyNamesItsOwnError(body: unknown): boolean {
+  if (typeof body !== "string") return false;
+  const trimmed = body.trim();
+  if (!trimmed.startsWith("{")) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return false;
+  }
+  if (!isRecord(parsed)) return false;
+  if (STRUCTURED_ERROR_KEYS.some((key) => parsed[key] !== undefined))
+    return true;
+  // RFC 9457 problem details: the pair is the proof, since `title` alone is a
+  // common field on perfectly ordinary payloads.
+  return parsed.type !== undefined && parsed.title !== undefined;
+}
+
+/**
+ * Whether a status/body pair is a 4xx the application chose to return.
+ *
+ * Conservative on purpose. The cost of a false positive here is a real defect
+ * demoted out of sight, so an unexplained 4xx — a 404 with no body, a 409 whose
+ * body never reached the capture — is left at full weight.
+ */
+function isHandledClientError(status: number | undefined, body: unknown): boolean {
+  if (status === undefined || status < 400 || status > 499) return false;
+  if (AUTH_CHALLENGE_STATUSES.has(status)) return true;
+  return bodyNamesItsOwnError(body);
+}
+
+/**
+ * Demotes and groups the 4xx responses an application returned deliberately.
+ *
+ * Ranking-only, in the same spirit as {@link downrankTrackerBeacons}: severity,
+ * confidence, score and the dedupe key change so these sort beneath real
+ * defects and collapse by route, but no candidate is removed.
+ *
+ * Runs over both planes. The frontend view carries the response body, which is
+ * the evidence; the backend `backend.req.end` event carries only a status code,
+ * so a backend 4xx is demoted either on its own auth-challenge status or by
+ * sharing a correlation id with a frontend response already judged handled.
+ * Without that join one expected rejection keeps producing two rows.
+ */
+function demoteHandledClientErrors(
+  drafts: CandidateDraft[],
+  events: BugEvent[],
+): void {
+  // Shared correlation ids (net.res `d.requestId`, not the browser-local `d.id`)
+  // whose frontend response was judged handled.
+  const handledSharedIds = new Set<string>();
+  const bodyByBrowserId = responseBodyByRequestId(events);
+  const sharedIdByBrowserId = new Map<string, string>();
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const browserId = requestIdForEvent(event);
+    if (browserId === undefined) continue;
+    const sharedId = safeText(event.d.requestId, 120);
+    if (sharedId) sharedIdByBrowserId.set(browserId, sharedId);
+  }
+
+  const demote = (draft: CandidateDraft, groupKey: string): void => {
+    draft.severity = "low";
+    draft.confidence = "low";
+    draft.score = Math.min(draft.score, HANDLED_CLIENT_ERROR_SCORE);
+    draft.dedupeKey = groupKey;
+  };
+
+  for (const draft of drafts) {
+    if (draft.detector !== "http_error") continue;
+    const browserId = draft.anchor.requestId;
+    const body = browserId ? bodyByBrowserId.get(browserId) : undefined;
+    if (!isHandledClientError(draft.anchor.status, body)) continue;
+    if (browserId) {
+      const sharedId = sharedIdByBrowserId.get(browserId);
+      if (sharedId) handledSharedIds.add(sharedId);
+    }
+    // Group by what the outcome IS — method, target, status — dropping the
+    // per-attempt request id that kept four identical rejections apart.
+    demote(
+      draft,
+      `handled4xx:${draft.anchor.method ?? ""}:${draft.anchor.url ?? ""}:${draft.anchor.status ?? ""}`,
+    );
+  }
+
+  for (const draft of drafts) {
+    if (draft.detector !== "backend_http_client_error") continue;
+    const sharedId = draft.anchor.requestId;
+    const handled =
+      AUTH_CHALLENGE_STATUSES.has(draft.anchor.status ?? 0) ||
+      (sharedId !== undefined && handledSharedIds.has(sharedId));
+    if (!handled) continue;
+    demote(
+      draft,
+      `handled4xx:backend:${draft.anchor.method ?? ""}:${draft.anchor.route ?? ""}:${draft.anchor.status ?? ""}`,
+    );
+  }
+}
+
 function downrankTrackerBeacons(
   drafts: CandidateDraft[],
   events: BugEvent[],
@@ -2825,7 +3073,11 @@ function responseLookupKey(t: number, status: unknown): string {
 
 function dedupeDrafts(drafts: CandidateDraft[]): CandidateDraft[] {
   const byKey = new Map<string, CandidateDraft>();
+  // Counted separately from the surviving draft: the winner can be replaced as
+  // better-scoring drafts arrive, and the count belongs to the key either way.
+  const countByKey = new Map<string, number>();
   for (const draft of drafts) {
+    countByKey.set(draft.dedupeKey, (countByKey.get(draft.dedupeKey) ?? 0) + 1);
     const existing = byKey.get(draft.dedupeKey);
     if (
       !existing ||
@@ -2835,7 +3087,12 @@ function dedupeDrafts(drafts: CandidateDraft[]): CandidateDraft[] {
       byKey.set(draft.dedupeKey, draft);
     }
   }
-  return [...byKey.values()];
+  return [...byKey.values()].map((draft) => {
+    const count = countByKey.get(draft.dedupeKey) ?? 1;
+    // Emitted only when it says something: `occurrences: 1` on every candidate
+    // is noise in a payload an agent has to read.
+    return count > 1 ? { ...draft, occurrences: count } : draft;
+  });
 }
 
 function mergeWindowRanges(

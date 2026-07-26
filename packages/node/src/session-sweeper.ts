@@ -205,7 +205,10 @@ export async function sweepIdleSessions(
     }
 
     try {
-      await options.sessions.finalize(id, { refinalize: needsRefinalize });
+      await options.sessions.finalize(id, {
+        refinalize: needsRefinalize,
+        background: true,
+      });
       if (needsRefinalize) result.refinalized += 1;
       else result.finalized += 1;
       try {

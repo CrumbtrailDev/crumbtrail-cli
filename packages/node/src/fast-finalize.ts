@@ -9,6 +9,17 @@
 // debounced checkpoint-finalize for the affected session, cutting worst-case
 // detection latency to roughly the debounce window (~45s by default).
 //
+// It also watches for LATE evidence: an append to a session this process
+// already finalized. Derived artifacts are written once per finalize, so a
+// backend that flushes the db writes of the user's last click a few hundred
+// milliseconds after the browser called POST /api/session/end leaves the
+// session's candidates permanently missing every detector that needed those
+// events — until the 30-minute idle sweep. That is not a rare tail: it is the
+// normal shape of a full-stack session, and it silences precisely the
+// invariant detectors (db_delta_mismatch, db_field_divergence, duplicate_write)
+// that read a request's own db.diff set. Such an append schedules a short-
+// debounce re-finalize instead.
+//
 // Design constraints:
 // - In-memory only, deliberately: debounce/cooldown state is NOT persisted.
 //   A fast finalize lost to a process restart is fine — the mtime-based idle
@@ -16,7 +27,10 @@
 //   its normal cadence. This module is purely a latency optimization.
 // - Reuses the sweeper's exact (re-)finalization semantics via the shared
 //   computeFinalizeNeed helper (processed flag + events-vs-meta mtime with
-//   the 1s late-events epsilon). No parallel mtime logic.
+//   the 1s late-events epsilon). No parallel mtime logic. The one documented
+//   exception is the late-evidence path: the ingest hook witnessed the append
+//   itself, which is strictly better evidence than an mtime comparison that
+//   cannot resolve a sub-second gap.
 // - Per-session debounce coalesces bursts. The delay is fixed from the FIRST
 //   severe event (not sliding), so a continuously erroring session still
 //   fires instead of being pushed out forever.
@@ -39,6 +53,13 @@ import { computeFinalizeNeed } from "./session-sweeper";
 export const DEFAULT_FAST_FINALIZE_DEBOUNCE_MS = 45_000;
 export const DEFAULT_FAST_FINALIZE_MAX_CONCURRENT = 2;
 export const DEFAULT_FAST_FINALIZE_COOLDOWN_MS = 300_000;
+/**
+ * Debounce for the late-evidence path. Much shorter than the severity debounce
+ * because the session is already finalized: its candidates are demonstrably
+ * stale right now, and the only thing worth waiting for is the tail of the
+ * trailing batch (a backend flushing the writes of one last request).
+ */
+export const DEFAULT_LATE_EVIDENCE_DEBOUNCE_MS = 3_000;
 
 // Only the leading slice of a string response body is scanned for
 // application-failure markers; anything past this is ignored (under-match).
@@ -135,6 +156,14 @@ export function isHighSeverityEvent(event: BugEvent): boolean {
 
 export type FastFinalizeOutcome = "finalized" | "refinalized" | "skipped";
 
+/** Why an attempt was scheduled. Both can be true for one attempt. */
+export interface FastFinalizeReasons {
+  /** A high-severity event landed on the session. */
+  severity?: boolean;
+  /** Events were ingested after this process finalized the session. */
+  lateEvidence?: boolean;
+}
+
 /**
  * One fast-finalize attempt: re-resolve the session dir at fire time (the
  * finalize partition move makes any cached dir stale), compute the need with
@@ -144,22 +173,39 @@ export type FastFinalizeOutcome = "finalized" | "refinalized" | "skipped";
 export async function runFastFinalize(
   sessions: SessionManager,
   sessionId: string,
+  reasons: FastFinalizeReasons = {},
 ): Promise<FastFinalizeOutcome> {
   const sessionDir = await sessions.getExistingSessionDir(sessionId);
   if (!sessionDir) return "skipped";
   const need = await computeFinalizeNeed(sessionDir);
-  if (!need || (!need.needsFinalize && !need.needsRefinalize)) return "skipped";
-  await sessions.finalize(sessionId, { refinalize: need.needsRefinalize });
-  return need.needsRefinalize ? "refinalized" : "finalized";
+  if (!need) return "skipped";
+  // The mtime epsilon cannot see an append that lands in the same second as
+  // finalize's own meta.json write — exactly the shape of a backend flushing
+  // the db writes of the request the user's last click made. A late-evidence
+  // notify is first-hand proof from the ingest path that such an append
+  // happened, so it stands in for the mtime comparison rather than repeating
+  // it. `processed` still gates it: an unprocessed session needs a first
+  // finalize, not a re-finalize.
+  const refinalize =
+    need.needsRefinalize ||
+    (reasons.lateEvidence === true && need.meta.processed === true);
+  if (!need.needsFinalize && !refinalize) return "skipped";
+  await sessions.finalize(sessionId, { refinalize, background: true });
+  return refinalize ? "refinalized" : "finalized";
 }
 
 type TimerHandle = unknown;
 
 export interface FastFinalizeSchedulerOptions {
   /** Executes one finalize attempt for a session. May throw; may be slow. */
-  runFinalize: (sessionId: string) => Promise<FastFinalizeOutcome>;
+  runFinalize: (
+    sessionId: string,
+    reasons: FastFinalizeReasons,
+  ) => Promise<FastFinalizeOutcome>;
   /** Delay from the first severe event to the finalize attempt. Default 45_000. */
   debounceMs?: number;
+  /** Delay from the first late-evidence append to the attempt. Default 3_000. */
+  lateEvidenceDebounceMs?: number;
   /** Global cap on concurrently running finalizes. Default 2. */
   maxConcurrent?: number;
   /** Minimum spacing between finalize attempts for one session. Default 300_000. */
@@ -173,9 +219,14 @@ export interface FastFinalizeSchedulerOptions {
   clearTimer?: (handle: TimerHandle) => void;
 }
 
+export type FastFinalizeTrigger = "severity" | "late-evidence";
+
 export interface FastFinalizeScheduler {
-  /** Report that a high-severity event landed for this session. Never throws. */
-  notify(sessionId: string): void;
+  /**
+   * Report a trigger for this session: a high-severity event, or an append
+   * that landed after the session was finalized. Never throws.
+   */
+  notify(sessionId: string, trigger: FastFinalizeTrigger): void;
   /** Cancel all pending timers and queued work. Running finalizes drain. */
   stop(): void;
 }
@@ -187,6 +238,8 @@ interface SessionScheduleState {
   cooldownUntil: number;
   /** A severe event landed mid-finalize; re-attempt after cooldown. */
   renotified: boolean;
+  /** Triggers accumulated for the pending attempt; cleared when it starts. */
+  reasons: FastFinalizeReasons;
 }
 
 function defaultSetTimer(fn: () => void, delayMs: number): TimerHandle {
@@ -203,6 +256,8 @@ export function createFastFinalizeScheduler(
   options: FastFinalizeSchedulerOptions,
 ): FastFinalizeScheduler {
   const debounceMs = options.debounceMs ?? DEFAULT_FAST_FINALIZE_DEBOUNCE_MS;
+  const lateEvidenceDebounceMs =
+    options.lateEvidenceDebounceMs ?? DEFAULT_LATE_EVIDENCE_DEBOUNCE_MS;
   const maxConcurrent =
     options.maxConcurrent ?? DEFAULT_FAST_FINALIZE_MAX_CONCURRENT;
   const cooldownMs = options.cooldownMs ?? DEFAULT_FAST_FINALIZE_COOLDOWN_MS;
@@ -229,13 +284,21 @@ export function createFastFinalizeScheduler(
     }
   };
 
+  // A severe event keeps the full coalescing window even when late evidence
+  // also triggered the attempt; only a purely late-evidence attempt is fast.
+  const baseDelayFor = (reasons: FastFinalizeReasons): number =>
+    reasons.severity === true ? debounceMs : lateEvidenceDebounceMs;
+
   const scheduleAttempt = (
     sessionId: string,
     state: SessionScheduleState,
   ): void => {
     // Fixed (non-sliding) delay: at least one debounce window from now, and
     // never inside the session's cooldown window.
-    const delay = Math.max(debounceMs, state.cooldownUntil - now());
+    const delay = Math.max(
+      baseDelayFor(state.reasons),
+      state.cooldownUntil - now(),
+    );
     state.timer = setTimer(() => onTimerFire(sessionId), delay);
   };
 
@@ -256,9 +319,13 @@ export function createFastFinalizeScheduler(
   const startRun = (sessionId: string, state: SessionScheduleState): void => {
     runningCount += 1;
     state.running = true;
+    // Consume the pending triggers: anything that arrives while this attempt
+    // runs repopulates them for the renotify follow-up below.
+    const reasons = state.reasons;
+    state.reasons = {};
     void (async () => {
       try {
-        const outcome = await options.runFinalize(sessionId);
+        const outcome = await options.runFinalize(sessionId, reasons);
         if (outcome !== "skipped") {
           try {
             options.onFinalized?.(sessionId, outcome === "refinalized");
@@ -298,7 +365,7 @@ export function createFastFinalizeScheduler(
   };
 
   return {
-    notify(sessionId: string): void {
+    notify(sessionId: string, trigger: FastFinalizeTrigger): void {
       if (stopped) return;
       pruneSettled();
       let state = states.get(sessionId);
@@ -308,9 +375,12 @@ export function createFastFinalizeScheduler(
           queued: false,
           cooldownUntil: 0,
           renotified: false,
+          reasons: {},
         };
         states.set(sessionId, state);
       }
+      if (trigger === "severity") state.reasons.severity = true;
+      else state.reasons.lateEvidence = true;
       // Coalesce: an already-pending attempt (timer or queue slot) will pick
       // up this event's evidence when it fires.
       if (state.timer !== undefined || state.queued) return;
@@ -340,6 +410,7 @@ export function createFastFinalizeScheduler(
 export interface FastFinalizerOptions {
   sessions: SessionManager;
   debounceMs?: number;
+  lateEvidenceDebounceMs?: number;
   maxConcurrent?: number;
   cooldownMs?: number;
   /** Post-success hook shared with the sweeper (AI-diagnosis scheduling). */
@@ -349,7 +420,8 @@ export interface FastFinalizerOptions {
 export interface FastFinalizeHandle {
   /**
    * Classify a successfully-ingested batch and schedule a fast finalize when
-   * it contains a high-severity event. NEVER throws into the request path —
+   * the session was already finalized (late evidence) or the batch contains a
+   * high-severity event. NEVER throws into the request path —
    * classification/scheduling failures are logged to stderr and swallowed.
    */
   notifyIngest(sessionId: string, events: BugEvent[]): void;
@@ -361,8 +433,10 @@ export function startFastFinalizer(
   options: FastFinalizerOptions,
 ): FastFinalizeHandle {
   const scheduler = createFastFinalizeScheduler({
-    runFinalize: (sessionId) => runFastFinalize(options.sessions, sessionId),
+    runFinalize: (sessionId, reasons) =>
+      runFastFinalize(options.sessions, sessionId, reasons),
     debounceMs: options.debounceMs,
+    lateEvidenceDebounceMs: options.lateEvidenceDebounceMs,
     maxConcurrent: options.maxConcurrent,
     cooldownMs: options.cooldownMs,
     onFinalized: options.onFinalized,
@@ -370,7 +444,14 @@ export function startFastFinalizer(
   return {
     notifyIngest(sessionId: string, events: BugEvent[]): void {
       try {
-        if (events.some(isHighSeverityEvent)) scheduler.notify(sessionId);
+        // Late evidence outranks severity: the session is already finalized, so
+        // its artifacts are stale regardless of how severe this batch is, and
+        // the refinalize this schedules folds the whole batch in.
+        if (options.sessions.hasFinalized(sessionId)) {
+          scheduler.notify(sessionId, "late-evidence");
+        } else if (events.some(isHighSeverityEvent)) {
+          scheduler.notify(sessionId, "severity");
+        }
       } catch (err) {
         console.error(
           `[crumbtrail-node] fast-finalize scheduling failed for session ${sessionId}: ${
