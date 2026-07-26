@@ -8,6 +8,7 @@ import {
   isHighSeverityEvent,
   createFastFinalizeScheduler,
   runFastFinalize,
+  startFastFinalizer,
   type FastFinalizeOutcome,
 } from "../fast-finalize";
 
@@ -253,17 +254,71 @@ describe("createFastFinalizeScheduler", () => {
       clearTimer: clock.clearTimer,
     });
 
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
     await clock.advance(10);
-    scheduler.notify("s1");
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
+    scheduler.notify("s1", "severity");
 
     await clock.advance(44_000);
     expect(runFinalize).not.toHaveBeenCalled();
 
     await clock.advance(1_000);
     expect(runFinalize).toHaveBeenCalledTimes(1);
-    expect(runFinalize).toHaveBeenCalledWith("s1");
+    expect(runFinalize).toHaveBeenCalledWith("s1", { severity: true });
+    scheduler.stop();
+  });
+
+  it("fires a late-evidence notify on the short debounce, tagged as late evidence", async () => {
+    const clock = createClock();
+    const runFinalize = vi.fn(
+      async (): Promise<FastFinalizeOutcome> => "refinalized",
+    );
+    const scheduler = createFastFinalizeScheduler({
+      runFinalize,
+      debounceMs: 45_000,
+      lateEvidenceDebounceMs: 3_000,
+      cooldownMs: 300_000,
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    scheduler.notify("s1", "late-evidence");
+    await clock.advance(2_900);
+    expect(runFinalize).not.toHaveBeenCalled();
+
+    await clock.advance(100);
+    expect(runFinalize).toHaveBeenCalledTimes(1);
+    expect(runFinalize).toHaveBeenCalledWith("s1", { lateEvidence: true });
+    scheduler.stop();
+  });
+
+  it("keeps the full severity window when a severe event also triggered the attempt", async () => {
+    const clock = createClock();
+    const runFinalize = vi.fn(
+      async (): Promise<FastFinalizeOutcome> => "finalized",
+    );
+    const scheduler = createFastFinalizeScheduler({
+      runFinalize,
+      debounceMs: 45_000,
+      lateEvidenceDebounceMs: 3_000,
+      cooldownMs: 300_000,
+      now: clock.now,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+    });
+
+    scheduler.notify("s1", "severity");
+    scheduler.notify("s1", "late-evidence");
+
+    await clock.advance(3_100);
+    expect(runFinalize).not.toHaveBeenCalled();
+
+    await clock.advance(42_000);
+    expect(runFinalize).toHaveBeenCalledWith("s1", {
+      severity: true,
+      lateEvidence: true,
+    });
     scheduler.stop();
   });
 
@@ -296,9 +351,9 @@ describe("createFastFinalizeScheduler", () => {
       clearTimer: clock.clearTimer,
     });
 
-    scheduler.notify("s1");
-    scheduler.notify("s2");
-    scheduler.notify("s3");
+    scheduler.notify("s1", "severity");
+    scheduler.notify("s2", "severity");
+    scheduler.notify("s3", "severity");
     await clock.advance(100);
 
     // Only two run; the third waits for a slot.
@@ -333,13 +388,13 @@ describe("createFastFinalizeScheduler", () => {
       clearTimer: clock.clearTimer,
     });
 
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
     await clock.advance(45_000);
     expect(runFinalize).toHaveBeenCalledTimes(1);
 
     // Severe events keep landing right after the attempt.
-    scheduler.notify("s1");
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
+    scheduler.notify("s1", "severity");
 
     // A debounce window passes — still inside the cooldown, no second attempt.
     await clock.advance(45_000);
@@ -368,7 +423,7 @@ describe("createFastFinalizeScheduler", () => {
       clearTimer: clock.clearTimer,
     });
 
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
     await clock.advance(45_000);
     expect(runFinalize).toHaveBeenCalledTimes(1);
     expect(consoleError).toHaveBeenCalledWith(
@@ -376,7 +431,7 @@ describe("createFastFinalizeScheduler", () => {
     );
 
     // Immediate re-notify does not hot-loop: the cooldown gates the retry.
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
     await clock.advance(45_000);
     expect(runFinalize).toHaveBeenCalledTimes(1);
     await clock.advance(300_000);
@@ -402,12 +457,12 @@ describe("createFastFinalizeScheduler", () => {
       clearTimer: clock.clearTimer,
     });
 
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
     await clock.advance(1_000);
     expect(runFinalize).toHaveBeenCalledTimes(1);
 
     // Evidence lands while the finalize is still reading/postprocessing.
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
     gate.resolve();
     await clock.flush();
 
@@ -439,11 +494,11 @@ describe("createFastFinalizeScheduler", () => {
       clearTimer: clock.clearTimer,
     });
 
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
     await clock.advance(1_000);
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
     await clock.advance(2_000);
-    scheduler.notify("s1");
+    scheduler.notify("s1", "severity");
     await clock.advance(2_000);
 
     expect(runFinalize).toHaveBeenCalledTimes(3);
@@ -467,8 +522,8 @@ describe("createFastFinalizeScheduler", () => {
       clearTimer: clock.clearTimer,
     });
 
-    scheduler.notify("s1");
-    scheduler.notify("s2");
+    scheduler.notify("s1", "severity");
+    scheduler.notify("s2", "severity");
     scheduler.stop();
 
     await clock.advance(10_000);
@@ -476,7 +531,7 @@ describe("createFastFinalizeScheduler", () => {
     expect(clock.timers.every((t) => t.cleared || t.fired)).toBe(true);
 
     // Notifies after stop are ignored.
-    scheduler.notify("s3");
+    scheduler.notify("s3", "severity");
     await clock.advance(10_000);
     expect(runFinalize).not.toHaveBeenCalled();
   });
@@ -513,7 +568,9 @@ describe("runFastFinalize", () => {
       const outcome = await runFastFinalize(sessions, "fast_1");
 
       expect(outcome).toBe("finalized");
-      const finalDir = await sessions.getExistingSessionDir("fast_1") as string;
+      const finalDir = (await sessions.getExistingSessionDir(
+        "fast_1",
+      )) as string;
       expect(fs.existsSync(path.join(finalDir, "index.json"))).toBe(true);
       const meta = JSON.parse(
         fs.readFileSync(path.join(finalDir, "meta.json"), "utf-8"),
@@ -535,7 +592,7 @@ describe("runFastFinalize", () => {
       expect(await runFastFinalize(sessions, "fast_2")).toBe("skipped");
 
       // Late events land clearly after the finalize (beyond the 1s epsilon).
-      const dir = await sessions.getExistingSessionDir("fast_2") as string;
+      const dir = (await sessions.getExistingSessionDir("fast_2")) as string;
       backdate(path.join(dir, "meta.json"), 5_000);
       fs.writeFileSync(
         path.join(dir, "events.ndjson"),
@@ -556,6 +613,205 @@ describe("runFastFinalize", () => {
   it("skips unknown sessions", async () => {
     await withSessions(async () => {
       expect(await runFastFinalize(sessions, "does_not_exist")).toBe("skipped");
+    });
+  });
+
+  it("refinalizes on a late-evidence notify even inside the mtime epsilon", async () => {
+    await withSessions(async () => {
+      await sessions.create("fast_3", { app: "svc" });
+      fs.writeFileSync(
+        path.join(await sessions.getSessionDir("fast_3"), "events.ndjson"),
+        JSON.stringify({ t: Date.now(), k: "backend.uncaught", d: {} }) + "\n",
+      );
+      await sessions.finalize("fast_3");
+
+      // Append immediately: events.ndjson and meta.json share a second, so the
+      // mtime comparison cannot tell this apart from a settled session.
+      const dir = (await sessions.getExistingSessionDir("fast_3")) as string;
+      fs.appendFileSync(
+        path.join(dir, "events.ndjson"),
+        JSON.stringify({ t: Date.now(), k: "db.diff", d: { table: "x" } }) +
+          "\n",
+      );
+
+      expect(await runFastFinalize(sessions, "fast_3")).toBe("skipped");
+      expect(
+        await runFastFinalize(sessions, "fast_3", { lateEvidence: true }),
+      ).toBe("refinalized");
+    });
+  });
+
+  it("does not turn a late-evidence notify into a first finalize", async () => {
+    await withSessions(async () => {
+      await sessions.create("fast_4", { app: "svc" });
+      fs.writeFileSync(
+        path.join(await sessions.getSessionDir("fast_4"), "events.ndjson"),
+        JSON.stringify({ t: Date.now(), k: "db.diff", d: { table: "x" } }) +
+          "\n",
+      );
+
+      // Never finalized: needsFinalize wins, and the outcome is a plain
+      // finalize rather than a refinalize of artifacts that do not exist.
+      expect(
+        await runFastFinalize(sessions, "fast_4", { lateEvidence: true }),
+      ).toBe("finalized");
+    });
+  });
+
+  it("reports hasFinalized only for sessions this process finalized", async () => {
+    await withSessions(async () => {
+      await sessions.create("fast_5", { app: "svc" });
+      fs.writeFileSync(
+        path.join(await sessions.getSessionDir("fast_5"), "events.ndjson"),
+        JSON.stringify({ t: Date.now(), k: "backend.uncaught", d: {} }) + "\n",
+      );
+
+      expect(sessions.hasFinalized("fast_5")).toBe(false);
+      expect(sessions.hasFinalized("never_seen")).toBe(false);
+      await sessions.finalize("fast_5");
+      expect(sessions.hasFinalized("fast_5")).toBe(true);
+    });
+  });
+
+  it("a background checkpoint does not put a live session in the late-evidence regime", async () => {
+    await withSessions(async () => {
+      await sessions.create("fast_6", { app: "svc" });
+      fs.writeFileSync(
+        path.join(await sessions.getSessionDir("fast_6"), "events.ndjson"),
+        JSON.stringify({ t: Date.now(), k: "backend.uncaught", d: {} }) + "\n",
+      );
+
+      // What the sweeper/fast finalizer do to a session whose producer never
+      // said it was done: a checkpoint, not an end.
+      await sessions.finalize("fast_6", { background: true });
+      expect(sessions.hasFinalized("fast_6")).toBe(false);
+
+      // An explicit end admits it, and a later background refinalize keeps it
+      // there so a tail arriving in several batches is still folded in.
+      await sessions.finalize("fast_6");
+      expect(sessions.hasFinalized("fast_6")).toBe(true);
+      await sessions.finalize("fast_6", {
+        refinalize: true,
+        background: true,
+      });
+      expect(sessions.hasFinalized("fast_6")).toBe(true);
+    });
+  });
+
+  it("notifyIngest schedules on a benign batch once the session is finalized", async () => {
+    await withSessions(async () => {
+      const finalized: Array<[string, boolean]> = [];
+      const finalizer = startFastFinalizer({
+        sessions,
+        lateEvidenceDebounceMs: 5,
+        onFinalized: (sessionId, refinalized) =>
+          finalized.push([sessionId, refinalized]),
+      });
+      try {
+        await sessions.create("fast_notify", { app: "svc" });
+        const staging = await sessions.getSessionDir("fast_notify");
+        const benign: BugEvent[] = [
+          { t: Date.now(), k: "db.diff", d: { table: "products" } },
+        ];
+        fs.writeFileSync(
+          path.join(staging, "events.ndjson"),
+          JSON.stringify(benign[0]) + "\n",
+        );
+
+        // Not finalized and nothing severe in the batch: no attempt at all.
+        finalizer.notifyIngest("fast_notify", benign);
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        expect(finalized).toEqual([]);
+
+        await sessions.finalize("fast_notify");
+        const dir = (await sessions.getExistingSessionDir(
+          "fast_notify",
+        )) as string;
+        fs.appendFileSync(
+          path.join(dir, "events.ndjson"),
+          JSON.stringify({ t: Date.now(), k: "db.diff", d: { table: "p" } }) +
+            "\n",
+        );
+
+        finalizer.notifyIngest("fast_notify", benign);
+        // Poll rather than sleep a fixed budget: the attempt runs postProcess.
+        for (let i = 0; i < 100 && finalized.length === 0; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        expect(finalized).toEqual([["fast_notify", true]]);
+      } finally {
+        finalizer.stop();
+      }
+    });
+  });
+
+  // CRUMB-146. A checkout's db writes reach the collector just after the
+  // browser ends the session, so the first finalize computes candidates from
+  // an event log with no db.diff in it and every per-request db invariant
+  // detector stays silent on evidence that is already on disk.
+  it("recovers a db invariant candidate from db.diff that landed after finalize", async () => {
+    await withSessions(async () => {
+      const t = Date.now();
+      const requestId = "req_checkout_1";
+      await sessions.create("fast_late_db", { app: "shop" });
+      const stagingDir = await sessions.getSessionDir("fast_late_db");
+      const browserEvents: BugEvent[] = [
+        {
+          t,
+          k: "net.req",
+          d: {
+            requestId,
+            method: "POST",
+            url: "https://shop.example/api/checkout",
+            body: JSON.stringify({
+              userId: 4,
+              items: [{ productId: 1, qty: 1 }],
+            }),
+          },
+        },
+        { t: t + 60, k: "net.res", d: { requestId, st: 200 } },
+      ];
+      fs.writeFileSync(
+        path.join(stagingDir, "events.ndjson"),
+        browserEvents.map((event) => JSON.stringify(event)).join("\n") + "\n",
+      );
+      await sessions.finalize("fast_late_db");
+
+      const dir = (await sessions.getExistingSessionDir(
+        "fast_late_db",
+      )) as string;
+      const readDetectors = (): string[] =>
+        fs
+          .readFileSync(path.join(dir, "candidates.jsonl"), "utf-8")
+          .split("\n")
+          .filter((line) => line.trim())
+          .map((line) => JSON.parse(line).detector as string);
+
+      expect(readDetectors()).not.toContain("db_delta_mismatch");
+
+      // The backend flushes the checkout's writes a moment later: inventory
+      // moved by 2 for an order of 1.
+      fs.appendFileSync(
+        path.join(dir, "events.ndjson"),
+        JSON.stringify({
+          t: t + 40,
+          k: "db.diff",
+          d: {
+            engine: "postgres",
+            op: "update",
+            table: "products",
+            pk: { id: 1 },
+            requestId,
+            before: { id: 1, inventory: 25 },
+            after: { id: 1, inventory: 23 },
+          },
+        }) + "\n",
+      );
+
+      expect(
+        await runFastFinalize(sessions, "fast_late_db", { lateEvidence: true }),
+      ).toBe("refinalized");
+      expect(readDetectors()).toContain("db_delta_mismatch");
     });
   });
 });
