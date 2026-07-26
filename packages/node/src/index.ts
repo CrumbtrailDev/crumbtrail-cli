@@ -407,6 +407,65 @@ export type {
   StepResolution,
 } from "./replay/result";
 
+// Replay adapters: the `Reproducer` seam, its policy, and the two adapters.
+// `defaultReproducerFactory` is the production default, so `allowReproduction`
+// is a live switch rather than an inert argument.
+export { buildReplayFlow, flowCarriesSecret } from "./replay/flow";
+export {
+  DEFAULT_REPLAY_MAX_STEPS,
+  DEFAULT_REPLAY_STEP_TIMEOUT_MS,
+  defaultReplayPolicy,
+  describeRefusal,
+  evaluateReplayPolicy,
+  replayPolicyFromEnv,
+  resolveReplayPolicy,
+} from "./replay/policy";
+export { NoopReproducer } from "./replay/noop";
+export {
+  PlaywrightReproducer,
+  loadPlaywrightDriver,
+} from "./replay/playwright";
+export {
+  defaultReproducerFactory,
+  runReproduction,
+} from "./replay/factory";
+export type {
+  BuildReplayFlowInput,
+  ReplayFlowEvent,
+} from "./replay/flow";
+export type {
+  ReplayPolicy,
+  ReplayRequestOptions,
+  ReplayTargetAllowlistEntry,
+} from "./replay/policy";
+export type {
+  PlaywrightDriver,
+  PlaywrightLoader,
+  PlaywrightReproducerOptions,
+  ReplayBrowser,
+  ReplayBrowserContext,
+  ReplayBrowserType,
+  ReplayLocator,
+  ReplayPage,
+} from "./replay/playwright";
+export type {
+  ReproducerContext,
+  ReproducerFactory,
+  ReproductionRequest,
+} from "./replay/factory";
+export type {
+  ReplayAction,
+  ReplayDecision,
+  ReplayFlow,
+  ReplayMode,
+  ReplayRefusal,
+  ReplayRefusalCode,
+  ReplayStep,
+  ReplayValueSource,
+  Reproducer,
+  ReproductionOutcome,
+} from "./replay/types";
+
 // ── CP1: auto-capture (crash + console.error) ────────────────────────────────
 // Append-only block. Do not reorder the exports above.
 export { autoCapture, AUTO_CAPTURE_ERROR_EVENT } from "./auto-capture";

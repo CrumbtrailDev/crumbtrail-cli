@@ -20,6 +20,7 @@ import {
 } from "./provider-recipes";
 import { runScan } from "./run-scan";
 import { runFixContext } from "./run-fix-context";
+import { runCapsule } from "./run-capsule";
 import { runInspect } from "./run-inspect";
 import { runReanalyze } from "./run-reanalyze";
 import { runCompare } from "./run-compare";
@@ -55,6 +56,7 @@ Commands:
   doctor    Verify capture + correlation + MCP-readability end to end
   scan      Flag components/functions missing IDs or logging (coverage gaps)
   fix-context  Emit the ranked, correlated, LLM-ready fix-context bundle for a session
+  capsule   Resolve a symptom to the capsule.v2 issue-resolution envelope
   inspect   Summarize a finalized session's manifest + artifacts (hot-plane only)
   compare   Compare two recorded sessions or releases
   reanalyze Rebuild finalized sessions' artifacts with the current analyzer
@@ -147,6 +149,34 @@ Options:
 Examples:
   crumbtrail-server reanalyze ses_123
   crumbtrail-server reanalyze --all --dry-run`,
+  capsule: `crumbtrail-server capsule — resolve a ticket or symptom to the capsule.v2 issue-resolution envelope
+
+Wraps the existing fusion.v1 ranked bundle (referenced verbatim, never re-ranked) in the
+ten part capsule.v2 envelope. Runs the same shared resolution pipeline as the MCP
+resolveCapsule and solveContext tools, so both surfaces return the same capsule for the
+same issue. Ticket credentials come from the documented env vars only.
+
+Options:
+  <title>              Symptom title (or pass --title)
+  --title <text>       Symptom title; wins over the positional argument
+  --description <text> Longer symptom description
+  --url <path>         Affected route or URL
+  --release <id>       Release the symptom was reported on
+  --error-sig <sig>    Known error signature; used as the capsule signature
+  --source <name>      Where the symptom came from (ticket, alert, report)
+  --ticket <ref>       Ticket URL, or the ticket key when --provider is given
+  --provider <jira|zendesk|trello>  Provider for a --ticket key
+  --baseline <session> Baseline session id for an explicit comparison
+  --current <session>  Current session id for an explicit comparison
+  --repo <owner/name>  Git host repo for intent inference (needs CRUMBTRAIL_GITHUB_TOKEN)
+  --base-ref <ref>     Git host base ref (with --repo and --head-ref)
+  --head-ref <ref>     Git host head ref (with --repo and --base-ref)
+  --json               Emit the raw capsule.v2 envelope instead of a summary
+  --output <dir>       Sessions directory to resolve the issue against
+
+Examples:
+  crumbtrail-server capsule "checkout fails" --url /api/checkout --json
+  crumbtrail-server capsule --ticket https://acme.atlassian.net/browse/OPS-42 --json`,
   inspect: `crumbtrail-server inspect — summarize a finalized session's manifest + artifacts
 
 Reads hot-plane artifacts only (manifest.json, else index.json); never the raw event log.
@@ -271,6 +301,10 @@ export async function runCli(argv: string[]): Promise<number> {
 
   if (command === "fix-context") {
     return await runFixContext(rest);
+  }
+
+  if (command === "capsule") {
+    return await runCapsule(rest);
   }
 
   if (command === "inspect") {

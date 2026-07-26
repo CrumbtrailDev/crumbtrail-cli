@@ -1,8 +1,14 @@
 # Ticket connector setup (Jira / Zendesk / Trello)
 
-`solveContext` can accept `ticket: { provider, id }` instead of a hand-typed
-`symptom`, fetching the ticket and normalizing it into a `Symptom` (title,
-description, url, release, source) that feeds the same fusion pipeline.
+`solveContext` can accept `ticket: { provider, ticketKey }` instead of a
+hand-typed `symptom`, fetching the ticket and normalizing it into a `Symptom`
+(title, description, url, release, source) that feeds the same fusion pipeline.
+
+The same ticket input, resolved through the same pipeline, is also accepted by
+the `resolveCapsule` MCP tool and the `crumbtrail-server capsule --ticket` CLI
+command, which frame the resulting bundle as the `capsule.v2` envelope and
+record the ticket as the capsule's external ref. All three surfaces share one
+producer, so a ticket resolves identically whichever one you ask.
 
 ## What to provision
 
