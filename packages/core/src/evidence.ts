@@ -5,6 +5,20 @@
  */
 export const EVIDENCE_SCHEMA_VERSION = "evidence.v1" as const;
 
+/**
+ * A lane is WHERE a piece of evidence came from, and it is the vendor neutral
+ * vocabulary the whole product speaks: business logic asks for a lane over a
+ * window with correlation keys, never for a provider. Adding a provider therefore
+ * adds no lane, and adding a lane is a deliberate widening of what context means.
+ *
+ * The first eight are CAPTURED or read from an observability source: a session, a
+ * request, a query, a log line. The last three are read from systems of record
+ * that humans write into, and exist because two questions cannot be answered from
+ * telemetry at all:
+ *   • what did people already say about this (`tickets`, `conversations`), which
+ *     is the only place an issue no end user reported to us ever surfaces
+ *   • what changed immediately before it broke (`deploys`)
+ */
 export type EvidenceLane =
   | "flow"
   | "network"
@@ -13,7 +27,16 @@ export type EvidenceLane =
   | "browser"
   | "logs"
   | "memory"
-  | "code";
+  | "code"
+  /** Support and issue trackers: Jira, Zendesk, Intercom, Linear. Corroborating
+   *  context for a failure someone has already described. */
+  | "tickets"
+  /** Human threads: Slack, email, support conversations. The discovery lane, for
+   *  complaints that never became a ticket, which no telemetry source holds. */
+  | "conversations"
+  /** Releases and deployments: Railway, Vercel, Netlify. What changed inside the
+   *  incident window, often the most discriminating single fact available. */
+  | "deploys";
 
 export interface EvidenceRef {
   sessionId?: string;
