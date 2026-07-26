@@ -11,7 +11,10 @@ import {
 import { writeEvidenceIndex } from "./evidence-index";
 import {
   readCaptureTruncationMarker,
+  readColdEvents,
+  readColdEvidenceArtifacts,
   type CaptureTruncationSummary,
+  type ColdEvidenceArtifacts,
   writeColdEvidenceArtifacts,
   writeTwoPlaneSessionArtifacts,
 } from "./storage-plane";
@@ -76,6 +79,15 @@ interface ConsoleErrorIndexEntry {
   lv: string;
   msg: string;
   source?: string;
+  /**
+   * Stack synthesized by the console collector at `console.error` time (a
+   * `new Error().stack` taken inside the patched method). Kept because a
+   * framework that reports failures through `console.error` rather than
+   * throwing — React error boundaries being the common case — otherwise leaves
+   * the candidate with no code location at all, even though the collector
+   * captured one and shipped it.
+   */
+  stk?: string;
 }
 
 interface NetworkErrorIndexEntry {
@@ -227,6 +239,11 @@ interface SessionIndex {
   errs: Array<{
     t: number;
     msg: string;
+    // The per-session browser network id shared with the coincident net.err /
+    // failedReqs entry. Present when the page probe could key the thrown error
+    // to its failed request; lets consumers join the rejection to its request
+    // without relying on timestamp proximity.
+    requestId?: string | number;
     method?: string;
     url?: string;
     // Source location of the throw. `file`/`line`/`col` come straight from the
@@ -269,6 +286,74 @@ interface AudioProcessResult {
   audio?: PostProcessAudioSummary;
 }
 
+/** Outcome of {@link reanalyzeSession}, for callers that report or audit a repair run. */
+export interface ReanalyzeSessionResult {
+  /** False when the session has no cold artifact to replay; nothing was written. */
+  reanalyzed: boolean;
+  /** Events replayed out of `events.ndjson.zst`. */
+  events: number;
+}
+
+/**
+ * Rebuilds a finalized session's derived artifacts by replaying its cold event
+ * stream through the current analyzer.
+ *
+ * Session artifacts are written once at finalize time and never revisited, so a
+ * session analyzed by an older build keeps that build's output forever even
+ * after the analyzer improves. Sessions finalized before crumbtrail-node 0.13.0,
+ * for instance, dropped `stk`/`url` from `index.errs`, which cost those reports
+ * both their code frames and the tracker-beacon downranking that depends on the
+ * request url. The raw evidence to recompute all of it is still in cold storage.
+ *
+ * This regenerates only the derived hot plane (index, candidates, bundle,
+ * manifest). It deliberately never rewrites `events.ndjson.zst` or
+ * `signatures.json`: once a session is cold those files are the only surviving
+ * copy of the raw evidence, and a repair path must not put them at risk. The
+ * existing cold artifacts are read and carried into the new manifest instead.
+ *
+ * Audio is not re-transcoded. Any prior transcript already merged into the cold
+ * stream replays with it, so re-running Whisper would duplicate those events.
+ */
+export async function reanalyzeSession(
+  sessionDir: string,
+): Promise<ReanalyzeSessionResult> {
+  const events = readColdEvents(sessionDir);
+  if (events === undefined) return { reanalyzed: false, events: 0 };
+  const coldEvidence = readColdEvidenceArtifacts(sessionDir);
+  if (coldEvidence === undefined) return { reanalyzed: false, events: 0 };
+  await analyzeSession({
+    sessionDir,
+    events,
+    truncation: readCaptureTruncationMarker(sessionDir),
+    audio: readIndexAudioSummary(sessionDir),
+    coldEvidence,
+  });
+  return { reanalyzed: true, events: events.length };
+}
+
+/**
+ * Carries a prior run's audio summary forward on re-analysis.
+ *
+ * Re-analysis skips transcription, so without this the rebuilt index would drop
+ * `audio` entirely and a repaired session would look like it never had any.
+ */
+function readIndexAudioSummary(
+  sessionDir: string,
+): PostProcessAudioSummary | undefined {
+  try {
+    const parsed: unknown = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "index.json"), "utf-8"),
+    );
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const audio = (parsed as { audio?: unknown }).audio;
+    return typeof audio === "object" && audio !== null
+      ? (audio as PostProcessAudioSummary)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function postProcess(
   sessionDir: string,
   whisperModel?: string,
@@ -280,27 +365,63 @@ export async function postProcess(
   // Process audio transcription if audio.webm exists. Audio failures are non-fatal and
   // are exposed through index.audio instead of throwing away usable artifacts.
   const audioResult = await processAudio(sessionDir, events, whisperModel);
+  await analyzeSession({
+    sessionDir,
+    events: audioResult.events,
+    truncation,
+    audio: audioResult.audio,
+  });
+}
+
+interface AnalyzeSessionInput {
+  sessionDir: string;
+  events: BugEvent[];
+  truncation: CaptureTruncationSummary | undefined;
+  audio: PostProcessAudioSummary | undefined;
+  /**
+   * Pre-existing cold artifacts to reuse. Present only on re-analysis; when
+   * omitted the cold plane is written fresh from `events`, which is what a
+   * first finalize must do.
+   */
+  coldEvidence?: ColdEvidenceArtifacts;
+}
+
+/**
+ * The shared analysis core behind both the first finalize and a re-analysis.
+ * Everything that reads raw events and produces derived artifacts lives here,
+ * so a replayed session goes through exactly the same code a live one does.
+ */
+async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
+  const { sessionDir, truncation } = input;
+  const audioResult: AudioProcessResult = {
+    events: input.events,
+    ...(input.audio !== undefined ? { audio: input.audio } : {}),
+  };
   const mergedEvents = audioResult.events;
+  const writeCold = async (events: BugEvent[]) =>
+    input.coldEvidence ??
+    (await writeColdEvidenceArtifacts({ sessionDir, events }));
 
   if (mergedEvents.length === 0) {
-    const index = writeEmptyIndex(sessionDir, audioResult.audio, truncation);
-    const candidates = writeEvidenceIndex({
+    const index = await writeEmptyIndex(
+      sessionDir,
+      audioResult.audio,
+      truncation,
+    );
+    const candidates = await writeEvidenceIndex({
       sessionDir,
       events: mergedEvents,
       index,
       causalGraph: undefined,
     });
-    const coldEvidence = writeColdEvidenceArtifacts({
-      sessionDir,
-      events: mergedEvents,
-    });
-    const bundle = writeLlmBundle({
+    const coldEvidence = await writeCold(mergedEvents);
+    const bundle = await writeLlmBundle({
       sessionDir,
       events: mergedEvents,
       index,
       candidates,
     });
-    writeTwoPlaneSessionArtifacts({
+    await writeTwoPlaneSessionArtifacts({
       sessionDir,
       events: mergedEvents,
       index,
@@ -339,13 +460,22 @@ export async function postProcess(
       const msg = safeDiagnosticString(event.d.msg) ?? "";
       const entry: SessionIndex["errs"][number] = { t: event.t, msg };
       // A fetch network failure surfaces twice: as a net.err and, when uncaught,
-      // as a rejection moments later. Attach the request identity to the error
-      // entry so the failing URL is visible from the error itself.
-      const linked = isNetworkFailureMessage(msg)
-        ? findRecentNetworkFailure(recentNetErrs, event.t)
-        : undefined;
-      if (linked?.m) entry.method = linked.m;
-      if (linked?.url) entry.url = linked.url;
+      // as a rejection moments later. The page probe stamps the shared network
+      // id (plus method/url) onto the rejection when it can key the thrown
+      // error, so prefer that direct identity; fall back to timestamp proximity
+      // for older sessions that lack the id.
+      const requestId = safeId(event.d.requestId) ?? safeId(event.d.id);
+      const directMethod = safeMethod(event.d.method) ?? safeMethod(event.d.m);
+      const directUrl = safeUrl(event.d.url);
+      const linked =
+        directUrl === undefined && isNetworkFailureMessage(msg)
+          ? findRecentNetworkFailure(recentNetErrs, event.t)
+          : undefined;
+      if (requestId !== undefined) entry.requestId = requestId;
+      const method = directMethod ?? linked?.m;
+      if (method) entry.method = method;
+      const url = directUrl ?? linked?.url;
+      if (url) entry.url = url;
       const file = safeUrl(event.d.file) ?? safePath(event.d.file);
       if (file) entry.file = file;
       const line = safeInteger(event.d.line);
@@ -468,24 +598,25 @@ export async function postProcess(
     ...(truncation !== undefined ? { truncated: truncation } : {}),
   };
 
-  fs.writeFileSync(path.join(sessionDir, "index.json"), JSON.stringify(index));
-  const candidates = writeEvidenceIndex({
+  await defaultSessionStore.writeArtifact(
+    sessionDir,
+    "index.json",
+    JSON.stringify(index),
+  );
+  const candidates = await writeEvidenceIndex({
     sessionDir,
     events: mergedEvents,
     index,
     causalGraph,
   });
-  const coldEvidence = writeColdEvidenceArtifacts({
-    sessionDir,
-    events: mergedEvents,
-  });
-  const bundle = writeLlmBundle({
+  const coldEvidence = await writeCold(mergedEvents);
+  const bundle = await writeLlmBundle({
     sessionDir,
     events: mergedEvents,
     index,
     candidates,
   });
-  writeTwoPlaneSessionArtifacts({
+  await writeTwoPlaneSessionArtifacts({
     sessionDir,
     events: mergedEvents,
     index,
@@ -640,6 +771,7 @@ function summarizeConsoleErrorEvent(
     lv: level,
     msg: message,
     source: safeString(event.d.source),
+    stk: safeStackString(event.d.stk),
   });
 }
 
@@ -1473,7 +1605,11 @@ async function processAudio(
       );
     }
 
-    const txEvents = readTranscriptEvents(transcriptPath, events, sessionDir);
+    const txEvents = await readTranscriptEvents(
+      transcriptPath,
+      events,
+      sessionDir,
+    );
 
     // Merge and re-sort. Drop existing tx events so repeated successful post-process runs don't duplicate.
     const baseEvents = events.filter((e) => e.k !== "tx");
@@ -1504,11 +1640,11 @@ async function processAudio(
   }
 }
 
-function readTranscriptEvents(
+async function readTranscriptEvents(
   transcriptPath: string,
   events: BugEvent[],
   sessionDir: string,
-): BugEvent[] {
+): Promise<BugEvent[]> {
   let transcript: unknown;
   try {
     transcript = JSON.parse(fs.readFileSync(transcriptPath, "utf-8"));
@@ -1516,7 +1652,7 @@ function readTranscriptEvents(
     throw new AudioProcessingError("transcript", err);
   }
 
-  const startTime = events[0]?.t ?? readMetaStart(sessionDir) ?? 0;
+  const startTime = events[0]?.t ?? (await readMetaStart(sessionDir)) ?? 0;
   const txEvents: BugEvent[] = [];
   const segments =
     isRecord(transcript) && Array.isArray(transcript.transcription)
@@ -1714,9 +1850,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
 
-function readMetaStart(sessionDir: string): number | undefined {
+async function readMetaStart(
+  sessionDir: string,
+): Promise<number | undefined> {
   try {
-    const buf = defaultSessionStore.readArtifact(sessionDir, "meta.json");
+    const buf = await defaultSessionStore.readArtifact(sessionDir, "meta.json");
     if (!buf) return undefined;
     const meta = JSON.parse(buf.toString("utf-8"));
     return finiteNumber(meta.start);
@@ -1725,11 +1863,11 @@ function readMetaStart(sessionDir: string): number | undefined {
   }
 }
 
-function writeEmptyIndex(
+async function writeEmptyIndex(
   sessionDir: string,
   audio?: PostProcessAudioSummary,
   truncation?: CaptureTruncationSummary,
-): SessionIndex {
+): Promise<SessionIndex> {
   const index: SessionIndex = {
     id: path.basename(sessionDir),
     start: 0,
@@ -1744,6 +1882,10 @@ function writeEmptyIndex(
     ...(audio !== undefined ? { audio } : {}),
     ...(truncation !== undefined ? { truncated: truncation } : {}),
   };
-  fs.writeFileSync(path.join(sessionDir, "index.json"), JSON.stringify(index));
+  await defaultSessionStore.writeArtifact(
+    sessionDir,
+    "index.json",
+    JSON.stringify(index),
+  );
   return index;
 }

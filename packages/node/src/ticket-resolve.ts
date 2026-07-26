@@ -332,7 +332,7 @@ export async function resolveTicketToBundle(
       // Shared locate → evidence slice (also used by the inner
       // /api/solve-context endpoint). On an inconclusive locate this returns
       // evidence: [] and the existing gaps-only path fires unchanged.
-      const located = locateEvidence(symptom, deps.recallStore);
+      const located = await locateEvidence(symptom, deps.recallStore);
       evidence = located.evidence;
       // Expose the locate decision on the bundle (previously dropped here).
       // method "fuzzy": this is the scored locate engine; War-game 02's

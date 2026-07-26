@@ -10,8 +10,10 @@ import { defaultSessionStore } from "./session-store";
  *   (`defaultSessionStore.listSessions`).
  * - A session QUALIFIES iff its `index.json` exists (index.json presence IS the
  *   finalize signal) AND it carries error-class evidence: `index.errs`
- *   non-empty, OR `index.failedReqs` non-empty, OR any `candidates.jsonl` row
- *   with severity `"critical"` or `"high"`.
+ *   non-empty, OR `index.failedReqs` non-empty, OR `index.consoleErrors`
+ *   non-empty, OR any `candidates.jsonl` row with severity `"critical"` or
+ *   `"high"`. See `hasErrorClassEvidence` for why each clause is error-class on
+ *   its own terms and why `index.networkErrors` is excluded.
  * - RECENCY is `index.end`, falling back to `index.start`, then `meta.start`,
  *   then 0. Remaining ties break by session id descending, then session dir
  *   descending (plain code-unit comparison — never locale-dependent).
@@ -23,17 +25,19 @@ export interface LatestIssue {
   dir: string;
 }
 
-export function resolveLatestIssue(opts: {
+export async function resolveLatestIssue(opts: {
   outputDir: string;
-}): LatestIssue | undefined {
+}): Promise<LatestIssue | undefined> {
   let best: { sessionId: string; dir: string; recency: number } | undefined;
 
-  for (const { id, dir } of defaultSessionStore.listSessions(opts.outputDir)) {
-    const index = readJsonRecord(dir, "index.json");
+  for (const { id, dir } of await defaultSessionStore.listSessions(
+    opts.outputDir,
+  )) {
+    const index = await readJsonRecord(dir, "index.json");
     if (!index) continue; // not finalized
-    if (!hasErrorClassEvidence(dir, index)) continue;
+    if (!(await hasErrorClassEvidence(dir, index))) continue;
 
-    const recency = recencyOf(dir, index);
+    const recency = await recencyOf(dir, index);
     if (!best || beats({ sessionId: id, dir, recency }, best)) {
       best = { sessionId: id, dir, recency };
     }
@@ -53,30 +57,62 @@ function beats(
   return candidate.dir > incumbent.dir;
 }
 
-function hasErrorClassEvidence(
+/**
+ * Does this session contain error-class evidence?
+ *
+ * Every clause names evidence that is error-class on its own terms. None of them infers "an error
+ * happened" from how some other candidate was ranked:
+ *
+ *  - `index.errs` uncaught errors and unhandled rejections (`err` / `rej` events).
+ *  - `index.failedReqs` failed HTTP responses, plus the network failures post-process judged to be
+ *    real failures rather than routine cancellations.
+ *  - `index.consoleErrors` `con` events the capture already narrowed to level `error`
+ *    (`summarizeConsoleErrorEvent` drops every other level). An application that logged
+ *    `console.error` and nothing else has still reported an error, and no clause above covers it.
+ *  - a `critical` or `high` `candidates.jsonl` row, for error-class evidence no index array carries
+ *    at all: backend request errors, OTel span errors, `db_delta_mismatch`.
+ *
+ * `index.consoleErrors` is load bearing rather than redundant. A console error moment carries no
+ * request id, so a database write near it grades `temporal` (`medium`/64) rather than `request`
+ * (`high`/88). Before database writes were graded by linkage, such a session qualified only because
+ * the write was boosted to `high`, which made qualification depend on whether an unrelated write
+ * happened to exist. That is not a property of the error. This clause states the evidence directly.
+ *
+ * `index.networkErrors` is deliberately NOT a clause. post-process pushes every `net.err` into it
+ * unconditionally, then applies `isCountableNetworkFailure` before promoting survivors into
+ * `failedReqs`. Adding it would widen this gate by exactly the set post-process already judged not
+ * to be a failure, so a fetch the user cancelled by navigating away would make its session the
+ * latest issue.
+ */
+async function hasErrorClassEvidence(
   dir: string,
   index: Record<string, unknown>,
-): boolean {
+): Promise<boolean> {
   if (Array.isArray(index.errs) && index.errs.length > 0) return true;
   if (Array.isArray(index.failedReqs) && index.failedReqs.length > 0)
     return true;
-  return candidateSeverities(dir).some(
+  if (Array.isArray(index.consoleErrors) && index.consoleErrors.length > 0)
+    return true;
+  return (await candidateSeverities(dir)).some(
     (severity) => severity === "critical" || severity === "high",
   );
 }
 
-function recencyOf(dir: string, index: Record<string, unknown>): number {
+async function recencyOf(
+  dir: string,
+  index: Record<string, unknown>,
+): Promise<number> {
   const end = finiteNumber(index.end);
   if (end !== undefined) return end;
   const start = finiteNumber(index.start);
   if (start !== undefined) return start;
-  const meta = readJsonRecord(dir, "meta.json");
+  const meta = await readJsonRecord(dir, "meta.json");
   return finiteNumber(meta?.start) ?? 0;
 }
 
 /** Severities of the detector signal rows in candidates.jsonl, rank order. */
-function candidateSeverities(dir: string): string[] {
-  const buf = defaultSessionStore.readArtifact(dir, "candidates.jsonl");
+async function candidateSeverities(dir: string): Promise<string[]> {
+  const buf = await defaultSessionStore.readArtifact(dir, "candidates.jsonl");
   if (!buf) return [];
   const severities: string[] = [];
   for (const line of buf.toString("utf-8").split("\n")) {
@@ -98,12 +134,12 @@ function candidateSeverities(dir: string): string[] {
   return severities;
 }
 
-function readJsonRecord(
+async function readJsonRecord(
   dir: string,
   name: string,
-): Record<string, unknown> | undefined {
+): Promise<Record<string, unknown> | undefined> {
   try {
-    const buf = defaultSessionStore.readArtifact(dir, name);
+    const buf = await defaultSessionStore.readArtifact(dir, name);
     if (!buf) return undefined;
     const parsed: unknown = JSON.parse(buf.toString("utf-8"));
     return typeof parsed === "object" &&

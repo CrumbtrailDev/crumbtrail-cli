@@ -4,6 +4,12 @@ import {
   startHeadlessSession,
   type HeadlessSession,
 } from "./headless-session";
+import {
+  autoInstrumentDbClients,
+  formatAutoInstrumentReport,
+  type AutoInstrumentDriver,
+  type AutoInstrumentReport,
+} from "./db/auto-instrument";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -94,6 +100,21 @@ export interface AutoCaptureOptions {
    * without real timers.
    */
   nowImpl?: () => number;
+  /**
+   * When true (default) wrap whichever SQL driver the app already depends on so
+   * `db.diff` evidence is captured with no `instrument*` call in host code. This
+   * is what makes the DB detectors — `db_delta_mismatch`, `db_field_divergence`,
+   * `duplicate_write` — reachable in a stock install rather than only for apps
+   * that wired them by hand.
+   *
+   * Set false to keep drivers untouched, e.g. when the app already calls
+   * `instrumentPgClient` itself and would otherwise double-instrument.
+   */
+  instrumentDatabases?: boolean;
+  /** Restrict auto-instrumentation to specific drivers. Absent ⇒ all known ones. */
+  databaseDrivers?: readonly AutoInstrumentDriver[];
+  /** Module resolver seam for auto-instrumentation (tests). */
+  databaseResolve?: (specifier: string) => unknown;
 }
 
 export interface AutoCaptureHandle {
@@ -381,6 +402,34 @@ export async function autoCapture(
   };
   proc.on("unhandledRejection", onUnhandled);
 
+  // Zero-config DB capture. Installed AFTER the hooks so a driver patch can
+  // never delay crash instrumentation, and best-effort in the same sense as the
+  // rest of this module: a driver with an unexpected shape is reported, never
+  // fatal. Events ride the same headless session as everything else; when the
+  // session is dark the emit is dropped rather than queued, matching how a
+  // captured error behaves.
+  let dbInstrumentation: AutoInstrumentReport | undefined;
+  if (options.instrumentDatabases !== false) {
+    try {
+      dbInstrumentation = autoInstrumentDbClients({
+        emit: (event) => {
+          if (stopped || !session) return;
+          void session
+            .record(event)
+            .catch((sendErr) =>
+              emitError(sendErr, { phase: "record", source: "console.error" }),
+            );
+        },
+        drivers: options.databaseDrivers,
+        resolve: options.databaseResolve,
+      });
+      const line = formatAutoInstrumentReport(dbInstrumentation);
+      if (line && debug) originalConsoleError.call(consoleRef, line);
+    } catch (error) {
+      emitError(error, { phase: "record", source: "console.error" });
+    }
+  }
+
   const stop = (): void => {
     if (stopped) return;
     // Setting `stopped` also cancels any pending re-establishment: the backoff
@@ -393,6 +442,7 @@ export async function autoCapture(
     }
     proc.removeListener("uncaughtException", onUncaught);
     proc.removeListener("unhandledRejection", onUnhandled);
+    dbInstrumentation?.restore();
     installed = false;
   };
 
