@@ -4,6 +4,7 @@ export type Command =
   | "doctor"
   | "scan"
   | "fix-context"
+  | "capsule"
   | "inspect"
   | "compare"
   | "reanalyze"
@@ -20,6 +21,7 @@ const COMMAND_WORDS = new Set<Command>([
   "doctor",
   "scan",
   "fix-context",
+  "capsule",
   "inspect",
   "compare",
   "reanalyze",

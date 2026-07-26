@@ -24,21 +24,9 @@ import {
 } from "./token-estimate";
 import { compareSessions } from "./compare";
 import { buildRegressionContext } from "./compare/regression-context";
-import {
-  assembleBundle,
-  inferIntent,
-  type Symptom,
-  type EvidenceGap,
-  type EvidenceItem,
-  type IntentSignal,
-  type GitHostClient,
-  type Located,
-} from "crumbtrail-core";
-import { GitHubRestClient, GitHostError } from "./git-host/github-rest";
-import { ticketClientFromEnv, TicketError } from "./ticket/clients";
+import { type Symptom, type GitHostClient } from "crumbtrail-core";
 import type { TicketConnector } from "./ticket/clients";
 import type { TicketProvider } from "./ticket/normalize";
-import { parseTicketUrl } from "./ticket/url";
 import {
   buildDistinctBugSignature,
   computeDistinctBugSignatures,
@@ -57,7 +45,6 @@ import type { LlmBundle } from "./llm-bundle";
 import {
   buildRecallStore,
   isDistinctBugRecord as isDistinctBugRecordShared,
-  pullBundleByTicketViaCloud,
   recallLocal,
   recallViaCloud,
   sessionIssueProfile,
@@ -65,12 +52,8 @@ import {
   type LocalIssueProfile,
   type RecallStore,
 } from "./recall";
-import {
-  AMBIGUOUS_LOCATED_SESSION_GAP,
-  gatherAdapterEvidence,
-  locateEvidence,
-  NO_LOCATED_SESSION_GAP,
-} from "./locate-incident";
+import { resolveTicketToCapsule } from "./capsule-resolve";
+import { resolveTicketToBundle } from "./ticket-resolve";
 import {
   evidenceSourcesFromEnv,
   type EvidenceSource,
@@ -538,6 +521,73 @@ const TOOLS = [
           required: ["owner", "repo", "baseRef", "headRef"],
         },
         maxTokens: { ...MAX_TOKENS_SCHEMA },
+      },
+    },
+  },
+  /** @stability experimental */
+  {
+    name: "resolveCapsule",
+    description:
+      "Resolve a ticket or a described symptom to the capsule.v2 issue-resolution envelope: identity, symptom, occurrences, evidence, join graph, quality report, advisory opinion, memory, resolution, and agent directions. Runs the SAME ticket resolution pipeline as solveContext (cloud pull when configured, else ticket fetch and normalization, session comparison or auto location, evidence source adapters, and git host intent inference), then frames its fusion.v1 RankedBundle as part 4, referenced verbatim and never re-ranked. Pass ticket, symptom, or both; passed symptom values win over fetched ticket fields. Still advisory, never a boolean verdict: a thin match returns a deliverable capsule that states its own limits with an explicit inconclusive advisory. Completeness is scored only against a configured evidence profile, so it is reported as not scored when none exists.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        symptom: {
+          type: "object",
+          properties: {
+            title: { type: "string" },
+            description: { type: "string" },
+            release: { type: "string" },
+            url: { type: "string" },
+            user: { type: "string" },
+            errorSig: {
+              type: "string",
+              description:
+                "Known error signature. Used as the capsule signature when present; otherwise a deterministic signature is derived from the symptom text.",
+            },
+            source: { type: "string" },
+          },
+          required: ["title"],
+        },
+        ticket: {
+          description:
+            "Optional ticket reference, in the SAME shape solveContext accepts: either a pasted ticket URL (Jira *.atlassian.net /browse/KEY or /rest/api/N/issue/idOrKey; Zendesk *.zendesk.com; Trello card) OR an explicit { provider, ticketKey } (`id` is a deprecated alias for ticketKey). Resolved through the identical pipeline, and recorded on the capsule as an external ref. Credentials come from env only (JIRA_*/ZENDESK_*/TRELLO_*), never a tool arg; an unrecognized URL is an honest miss, never an error.",
+          anyOf: [
+            { type: "string" },
+            {
+              type: "object",
+              properties: {
+                provider: {
+                  type: "string",
+                  enum: ["jira", "zendesk", "trello"],
+                },
+                ticketKey: {
+                  type: "string",
+                  description: "Ticket key/id in the provider's format",
+                },
+                id: {
+                  type: "string",
+                  description: "Deprecated alias for ticketKey",
+                },
+              },
+              required: ["provider"],
+            },
+          ],
+        },
+        baselineSession: { type: "string" },
+        currentSession: { type: "string" },
+        gitHost: {
+          type: "object",
+          description:
+            "Optional git-host range for intent-inference. Requires CRUMBTRAIL_GITHUB_TOKEN env var (never accepted as a tool arg); when absent, intent-inference is skipped.",
+          properties: {
+            owner: { type: "string" },
+            repo: { type: "string" },
+            baseRef: { type: "string" },
+            headRef: { type: "string" },
+          },
+          required: ["owner", "repo", "baseRef", "headRef"],
+        },
       },
     },
   },
@@ -1245,6 +1295,8 @@ export class McpServer {
         return this.toolGetRegressionContext(args);
       case "solveContext":
         return this.toolSolveContext(args);
+      case "resolveCapsule":
+        return this.toolResolveCapsule(args);
       case "listDistinctBugs":
         return this.toolListDistinctBugs(args);
       case "getRecurrence":
@@ -2165,309 +2217,79 @@ export class McpServer {
     return textResult(await buildRegressionContext(comparison, bDir));
   }
 
+  /**
+   * Deps for the shared ticket → bundle producer ({@link resolveTicketToBundle}).
+   * `localSessions` is present ONLY for a filesystem read store, which is what
+   * gates the explicit-comparison and auto-locate paths on local disk.
+   */
+  private ticketResolutionDeps(
+    surface: string,
+  ): Parameters<typeof resolveTicketToBundle>[1] {
+    return {
+      recallStore: this.recallStore(),
+      evidenceSources: this.evidenceSources(),
+      ...(this.store instanceof FilesystemMcpReadStore
+        ? {
+            localSessions: {
+              resolveSessionDir: (sessionId: string) =>
+                this.sessionDirAsync(sessionId),
+              sessionExists: (dir: string) => this.sessionExistsAsync(dir),
+            },
+          }
+        : {}),
+      ...(this.ticketConnectorFactory
+        ? { ticketConnectorFactory: this.ticketConnectorFactory }
+        : {}),
+      ...(this.gitHostClientFactory
+        ? { gitHostClientFactory: this.gitHostClientFactory }
+        : {}),
+      surface,
+    };
+  }
+
+  /**
+   * `solveContext` — fuse a ticket/symptom with recorded evidence into a
+   * fusion.v1 RankedBundle.
+   *
+   * The ticket-driven pipeline itself lives in the shared
+   * {@link resolveTicketToBundle} producer (moved out of this method verbatim,
+   * so the emitted payload is unchanged); this method owns only the response
+   * shaping: the optional token budget and the MCP result envelope. The capsule
+   * surfaces reuse the same producer, so a ticket resolves identically no matter
+   * which surface asks.
+   */
   private async toolSolveContext(args: Record<string, unknown>) {
     const budget = this.maxTokensOf(args);
     if ("error" in budget) return errorResult(budget.error);
-    const passedSymptom: Partial<Symptom> | undefined = isRecord(args.symptom)
-      ? (args.symptom as unknown as Partial<Symptom>)
-      : undefined;
 
-    // The ticket arg is either a pasted URL string (recognized locally, zero
-    // network) or the explicit { provider, ticketKey } object (`id` accepted as
-    // a deprecated alias — contract decision #2). An unrecognized URL is an
-    // honest miss (surfaced as a gap below), never a throw.
-    let ticketArg: { provider?: string; id?: string } | undefined;
-    let ticketUrlUnrecognized = false;
-    if (typeof args.ticket === "string") {
-      const resolved = parseTicketUrl(args.ticket);
-      if (resolved) ticketArg = resolved;
-      else ticketUrlUnrecognized = true;
-    } else if (isRecord(args.ticket)) {
-      ticketArg = {
-        provider: stringField(args.ticket.provider),
-        id: stringField(args.ticket.ticketKey) ?? stringField(args.ticket.id),
-      };
-    }
+    const resolved = await resolveTicketToBundle(
+      args,
+      this.ticketResolutionDeps("solveContext"),
+    );
+    if (resolved.kind === "error") return errorResult(resolved.message);
 
-    let symptom: Symptom | undefined = passedSymptom?.title
-      ? (passedSymptom as Symptom)
-      : undefined;
-    const ticketGaps: {
-      lane: "network";
-      reason: string;
-      suggestion?: string;
-    }[] = [];
-
-    // Cloud pull-path — BEFORE any local ticket-fetch/evidence/reproduction/
-    // git-host logic. When the ticket resolves to a provider+id AND the cloud env
-    // pair is configured, ask the cloud by-ticket endpoint for a pre-assembled
-    // bundle. On a hit, return that stored bundle verbatim and short-circuit the
-    // entire local pipeline. On any miss/failure/unconfigured env the helper
-    // returns undefined and we fall through UNCHANGED to the local fetch +
-    // auto-locate path — a deliberate always-fall-back design (mirrors
-    // recallViaCloud): the pull is a fast path, never a hard dependency.
-    if (ticketArg?.provider && ticketArg.id) {
-      const pulled = await pullBundleByTicketViaCloud(
-        ticketArg.provider,
-        ticketArg.id,
-      );
-      if (pulled && isRecord(pulled.bundle)) {
-        // Unbudgeted: return the stored bundle verbatim, byte-identical to
-        // before. With maxTokens set, the pulled bundle honors the same
-        // budgeting contract as a locally assembled one (evidence is the
-        // relevance-ranked array in a stored fusion.v1 RankedBundle).
-        if (budget.maxTokens === undefined) return textResult(pulled.bundle);
-        if (!Array.isArray(pulled.bundle.evidence)) {
-          return textResult(attachTokenEstimate(pulled.bundle));
-        }
-        return this.budgetedTextResult(
-          pulled.bundle,
-          [
-            budgetPlane("evidence", pulled.bundle.evidence, (item) =>
-              isRecord(item) && typeof item.id === "string"
-                ? item.id
-                : "unknown",
-            ),
-          ],
-          budget.maxTokens,
-        );
+    if (resolved.kind === "pulled") {
+      // Unbudgeted: return the stored bundle verbatim, byte-identical to
+      // before. With maxTokens set, the pulled bundle honors the same
+      // budgeting contract as a locally assembled one (evidence is the
+      // relevance-ranked array in a stored fusion.v1 RankedBundle).
+      const pulled = resolved.bundle;
+      if (budget.maxTokens === undefined) return textResult(pulled);
+      if (!Array.isArray(pulled.evidence)) {
+        return textResult(attachTokenEstimate(pulled));
       }
-    }
-
-    if (ticketArg?.provider && ticketArg.id) {
-      try {
-        const provider = ticketArg.provider as "jira" | "zendesk" | "trello";
-        const connector: TicketConnector = this.ticketConnectorFactory
-          ? this.ticketConnectorFactory(provider)
-          : ticketClientFromEnv(provider);
-        const fetched = await connector.fetchSymptom(ticketArg.id);
-        // Passed symptom values win; fetched ticket fields fill gaps.
-        symptom = { ...fetched, ...(passedSymptom ?? {}) } as Symptom;
-      } catch (err) {
-        const message =
-          err instanceof TicketError
-            ? `TicketError (status ${err.status}): ${err.message}`
-            : err instanceof Error
-              ? err.message
-              : String(err);
-        process.stderr.write(
-          `solveContext: ticket fetch failed, falling back: ${message}\n`,
-        );
-        if (passedSymptom?.title) {
-          symptom = passedSymptom as Symptom;
-        } else {
-          symptom = { title: ticketArg.id };
-          ticketGaps.push({
-            lane: "network",
-            reason: `ticket fetch failed: ${message}`,
-            suggestion: "check connector credentials",
-          });
-        }
-      }
-    } else if (ticketUrlUnrecognized && !symptom) {
-      // A pasted ticket URL we could not recognize, with no symptom to fall back
-      // on. Same honest-miss shape as a fetch failure: a minimal symptom (so the
-      // pipeline proceeds) plus one gap explaining the miss — never a throw.
-      symptom = { title: args.ticket as string };
-      ticketGaps.push({
-        lane: "network",
-        reason: "ticket url not recognized",
-        suggestion:
-          "pass symptom.title or a supported jira/zendesk/trello ticket url",
-      });
-    }
-
-    let noInputGiven = false;
-    if (!symptom) {
-      symptom = { title: "" };
-      noInputGiven = true;
-      ticketGaps.push({
-        lane: "network",
-        reason: "a symptom or ticket is required",
-        suggestion: "pass symptom.title or ticket:{provider,id}",
-      });
-    }
-
-    const baselineSession = stringField(args.baselineSession);
-    const currentSession = stringField(args.currentSession);
-    if (
-      baselineSession &&
-      currentSession &&
-      !(this.store instanceof FilesystemMcpReadStore)
-    ) {
-      return errorResult(
-        "solveContext cannot compare baselineSession/currentSession with a remote artifact store; use getSessionManifest, getWindow, and getEvidence for each session without local-disk fallback.",
+      return this.budgetedTextResult(
+        pulled,
+        [
+          budgetPlane("evidence", pulled.evidence, (item) =>
+            isRecord(item) && typeof item.id === "string" ? item.id : "unknown",
+          ),
+        ],
+        budget.maxTokens,
       );
     }
 
-    let evidence: EvidenceItem[] = [];
-    let intent: IntentSignal[] = [];
-    // The locate decision, when the auto-locate path runs — threaded onto the
-    // bundle (RankedBundle.located) and folded into contextCompleteness. Stays
-    // undefined for explicit baseline/current comparison bundles.
-    let locatedDecision: Located | undefined;
-    // Gaps declared by the adapter phase (unsupported keys, timeouts, byte caps).
-    const adapterGaps: EvidenceGap[] = [];
-    // True when a no-session locate produced a bundle populated PURELY from
-    // adapter evidence (sessionless Mode A) — that bundle must still state that
-    // no Crumbtrail session matched.
-    let sessionlessAdapterBundle = false;
-
-    if (
-      baselineSession &&
-      currentSession &&
-      this.store instanceof FilesystemMcpReadStore
-    ) {
-      const aDir = await this.sessionDirAsync(baselineSession);
-      const bDir = await this.sessionDirAsync(currentSession);
-      if (
-        (await this.sessionExistsAsync(aDir)) &&
-        (await this.sessionExistsAsync(bDir))
-      ) {
-        const comparison = await compareSessions(aDir, bDir);
-        evidence = comparison.evidence;
-        intent = comparison.intent;
-      }
-    }
-
-    // Auto-locate: when the caller gave a ticket/symptom but NO explicit
-    // baseline/current sessions, rank the recorded sessions against the symptom
-    // and, on a confident match, populate evidence from the located session.
-    // Placed BEFORE reproduction so "skip reproduction once evidence.length > 0"
-    // naturally covers located evidence too. Never throws out of the tool; on an
-    // inconclusive locate (or any failure) evidence stays [] and the existing
-    // gaps-only path fires unchanged.
-    if (
-      !baselineSession &&
-      !currentSession &&
-      !noInputGiven &&
-      this.store instanceof FilesystemMcpReadStore
-    ) {
-      try {
-        // Shared locate → evidence slice (also used by the inner
-        // /api/solve-context endpoint). On an inconclusive locate this returns
-        // evidence: [] and the existing gaps-only path fires unchanged.
-        const located = await locateEvidence(symptom, this.recallStore());
-        evidence = located.evidence;
-        // Expose the locate decision on the bundle (previously dropped here).
-        // method "fuzzy": this is the scored locate engine; War-game 02's
-        // deterministic token join sets "token" through the same field.
-        locatedDecision = {
-          outcome: located.match.outcome,
-          confidence: located.match.confidence,
-          method: "fuzzy",
-          ...(located.match.sessionId
-            ? { sessionId: located.match.sessionId }
-            : {}),
-          reasons: located.match.reasons,
-          ...(located.match.outcome === "ambiguous" && located.match.candidates
-            ? { candidates: located.match.candidates }
-            : {}),
-        };
-        // Adapter phase: query the client's configured evidence sources for the
-        // located window (matched) or a sessionless fallback window (Mode A) and
-        // merge the neutral items ALONGSIDE session evidence — the single fusion
-        // path ranks the mixed set. Never throws; ZERO sources → no-op, so this
-        // block is byte-identical to before for a session-matched (or no-source)
-        // request.
-        const adapter = await gatherAdapterEvidence(symptom, located, {
-          sources: this.evidenceSources(),
-        });
-        evidence = [...evidence, ...adapter.items];
-        adapterGaps.push(...adapter.gaps);
-        // A no-session locate whose bundle is populated purely from adapters must
-        // still state that no Crumbtrail session matched (Mode A invariant).
-        if (located.match.outcome !== "matched" && adapter.items.length > 0) {
-          sessionlessAdapterBundle = true;
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        process.stderr.write(
-          `solveContext: incident location failed, falling back: ${message}\n`,
-        );
-      }
-    }
-
-    const gitHost = isRecord(args.gitHost)
-      ? {
-          owner: stringField(args.gitHost.owner),
-          repo: stringField(args.gitHost.repo),
-          baseRef: stringField(args.gitHost.baseRef),
-          headRef: stringField(args.gitHost.headRef),
-        }
-      : undefined;
-    const token = process.env.CRUMBTRAIL_GITHUB_TOKEN;
-
-    if (
-      gitHost &&
-      gitHost.owner &&
-      gitHost.repo &&
-      gitHost.baseRef &&
-      gitHost.headRef &&
-      token &&
-      evidence.length > 0
-    ) {
-      try {
-        const client: GitHostClient = this.gitHostClientFactory
-          ? this.gitHostClientFactory({
-              owner: gitHost.owner,
-              repo: gitHost.repo,
-            })
-          : new GitHubRestClient({
-              owner: gitHost.owner,
-              repo: gitHost.repo,
-              token,
-            });
-        const commits = await client.listCommits({
-          baseRef: gitHost.baseRef,
-          headRef: gitHost.headRef,
-        });
-        intent = inferIntent(evidence, commits);
-      } catch (err) {
-        const message =
-          err instanceof GitHostError
-            ? `GitHostError (status ${err.status}): ${err.message}`
-            : err instanceof Error
-              ? err.message
-              : String(err);
-        process.stderr.write(
-          `solveContext: git-host intent-inference failed, falling back to existing intent: ${message}\n`,
-        );
-      }
-    }
-
-    const gaps = [
-      ...ticketGaps,
-      ...(locatedDecision?.outcome === "ambiguous"
-        ? [AMBIGUOUS_LOCATED_SESSION_GAP]
-        : []),
-      // Adapter-only (sessionless Mode A) bundle: state that no Crumbtrail session
-      // matched even though the bundle is populated from evidence sources.
-      ...(sessionlessAdapterBundle ? [NO_LOCATED_SESSION_GAP] : []),
-      ...adapterGaps,
-      ...(evidence.length === 0 && !noInputGiven
-        ? [
-            {
-              // Unified with NO_LOCATED_SESSION_GAP so every no-match outcome
-              // (auto-locate miss, comparison miss, sessionless) reads the same
-              // "no recorded session matched this symptom" wording — the old
-              // "compared" vs "matched" split confused readers about whether a
-              // comparison had even run.
-              lane: NO_LOCATED_SESSION_GAP.lane,
-              reason: NO_LOCATED_SESSION_GAP.reason,
-              suggestion: NO_LOCATED_SESSION_GAP.suggestion,
-            },
-          ]
-        : []),
-    ];
-
-    const bundle = assembleBundle({
-      symptom,
-      evidence,
-      intent,
-      gaps,
-      located: locatedDecision,
-    });
+    const bundle = resolved.bundle;
     if (budget.maxTokens === undefined) return textResult(bundle);
     // Budgeted: fill the relevance-ranked evidence in rank order; refs are
     // EvidenceItem.id values (the same ids opinion.hypotheses reference).
@@ -2476,6 +2298,34 @@ export class McpServer {
       [budgetPlane("evidence", bundle.evidence, (item) => item.id)],
       budget.maxTokens,
     );
+  }
+
+  /**
+   * `resolveCapsule` — resolve a TICKET or a described symptom to the additive
+   * capsule.v2 envelope.
+   *
+   * Delegates to the shared {@link resolveTicketToCapsule} helper, which runs the
+   * SAME ticket → bundle producer `solveContext` runs and then the package's
+   * single capsule compile site. The CLI `capsule` command calls that same
+   * helper, so the two surfaces are at parity for both input shapes and neither
+   * re-implements the pipeline or the compile. `solveContext` is untouched: this
+   * is a separate tool, so every existing fusion.v1 output stays byte-identical.
+   */
+  private async toolResolveCapsule(args: Record<string, unknown>) {
+    const passedSymptom: Partial<Symptom> | undefined = isRecord(args.symptom)
+      ? (args.symptom as unknown as Partial<Symptom>)
+      : undefined;
+    const title = stringField(passedSymptom?.title);
+    if (!title && args.ticket === undefined) {
+      return errorResult("resolveCapsule requires symptom.title or ticket");
+    }
+
+    const resolved = await resolveTicketToCapsule(
+      args,
+      this.ticketResolutionDeps("resolveCapsule"),
+    );
+    if (resolved.kind === "error") return errorResult(resolved.message);
+    return textResult(resolved.capsule);
   }
 
   // --- Distinct within-session bug grouping ---

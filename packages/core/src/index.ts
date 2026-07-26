@@ -144,3 +144,35 @@ export type {
 } from "./evidence-source";
 export { STACK_IDS } from "./stacks";
 export type { Stack } from "./stacks";
+export {
+  CAPSULE_SCHEMA_VERSION,
+  GAP_REASONS,
+  isGapReason,
+  compileCapsuleV2,
+} from "./capsule";
+export type {
+  KeyProvenance,
+  GapReason,
+  ExternalRef,
+  CapsuleIdentity,
+  CapsuleSymptom,
+  OccurrenceImpact,
+  CapsuleEvidence,
+  JoinBasis,
+  JoinEdge,
+  JoinIsland,
+  JoinGraph,
+  JoinObservation,
+  EvidenceProfile,
+  GapDetail,
+  Completeness,
+  QualityReport,
+  FixClass,
+  AdvisoryOpinion,
+  VerifiedFix,
+  CapsuleMemory,
+  CapsuleResolution,
+  AgentDirections,
+  CapsuleV2,
+  CompileCapsuleV2Input,
+} from "./capsule";

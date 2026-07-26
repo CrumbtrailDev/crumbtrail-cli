@@ -66,6 +66,14 @@
     "node-sql-parser": "^5.4.0",
     "protobufjs": "^8.6.5"
   },
+  "peerDependencies": {
+    "playwright": ">=1.40.0"
+  },
+  "peerDependenciesMeta": {
+    "playwright": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",

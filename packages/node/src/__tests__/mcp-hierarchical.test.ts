@@ -228,10 +228,10 @@ describe("MCP hierarchical retrieval", () => {
     expect(names).toContain("getSessionManifest");
     expect(names).toContain("getWindow");
     expect(names).toContain("getEvidence");
-    // 37 = read tools + the three learning-loop tools (resolveIssue,
-    // recordFeedback, getPlaybook); still excludes the removed mutating
-    // resolveBug tool.
-    expect(result.tools).toHaveLength(37);
+    // 38 = read tools + the three learning-loop tools (resolveIssue,
+    // recordFeedback, getPlaybook) + the additive capsule.v2 resolveCapsule
+    // tool; still excludes the removed mutating resolveBug tool.
+    expect(result.tools).toHaveLength(38);
   });
 
   it("getSessionManifest returns the manifest.json payload (small, hot-plane)", async () => {

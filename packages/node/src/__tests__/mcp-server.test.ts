@@ -121,9 +121,11 @@ describe("MCP Server", () => {
     });
     expect(res).not.toBeNull();
     const result = res!.result as any;
-    expect(result.tools).toHaveLength(37);
+    // 38 includes the additive capsule.v2 resolveCapsule tool.
+    expect(result.tools).toHaveLength(38);
     const names = result.tools.map((t: any) => t.name);
     expect(names).toContain("listSessions");
+    expect(names).toContain("resolveCapsule");
     expect(names).toContain("getFixContext");
     expect(names).toContain("getOpinion");
     expect(names).toContain("getLatestIssue");
