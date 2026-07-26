@@ -125,10 +125,7 @@ interface FlowConfig {
   browserUrl?: string;
   assertCorsHeaders?: boolean;
   sessionId?: string;
-  correlation:
-    | "headers"
-    | "gateway_traceparent"
-    | "sessionless_traceparent";
+  correlation: "headers" | "gateway_traceparent" | "sessionless_traceparent";
   requiredGaps?: GroundTruth["requiredGaps"];
   extraEvents?: BugEvent[];
   productionTrigger?: boolean;
@@ -190,7 +187,11 @@ function browserActionEvents(
   ];
 }
 
-function browserResponseEvent(id: string, sessionId: string, requestId: string): BugEvent {
+function browserResponseEvent(
+  id: string,
+  sessionId: string,
+  requestId: string,
+): BugEvent {
   return {
     t: SESSION_START + 90,
     k: "net.res",
@@ -228,8 +229,12 @@ function headersFor(
 }
 
 /** Shared deterministic bundle primitive used by topology and benchmark reproductions. */
-export async function buildTopologyBundle(events: BugEvent[]): Promise<LlmBundle> {
-  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-topology-"));
+export async function buildTopologyBundle(
+  events: BugEvent[],
+): Promise<LlmBundle> {
+  const sessionDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "crumbtrail-topology-"),
+  );
   try {
     fs.writeFileSync(
       path.join(sessionDir, "events.ndjson"),
@@ -257,7 +262,11 @@ async function runCapturedFlow(config: FlowConfig): Promise<ScenarioExecution> {
       ? (config.serverRequestId ?? SDK_REQUEST_ID)
       : TRACE_ID;
   const browserRequestId = config.browserRequestId ?? inputRequestId;
-  const preEdgeHeaders = headersFor(config.correlation, sessionId, inputRequestId);
+  const preEdgeHeaders = headersFor(
+    config.correlation,
+    sessionId,
+    inputRequestId,
+  );
   const headers =
     config.correlation === "gateway_traceparent"
       ? Object.fromEntries(
@@ -274,7 +283,9 @@ async function runCapturedFlow(config: FlowConfig): Promise<ScenarioExecution> {
       headers["X-Crumbtrail-Session-Id"] ||
       headers["X-Crumbtrail-Request-Id"]
     ) {
-      throw new Error("Gateway edge did not remove the custom correlation headers.");
+      throw new Error(
+        "Gateway edge did not remove the custom correlation headers.",
+      );
     }
   }
 
@@ -289,9 +300,12 @@ async function runCapturedFlow(config: FlowConfig): Promise<ScenarioExecution> {
     );
   }
   if (config.assertCorsHeaders) {
-    const corsUrl = config.browserUrl ?? "https://api.example.test/api/orders/101";
+    const corsUrl =
+      config.browserUrl ?? "https://api.example.test/api/orders/101";
     if (!canInjectCorrelationHeaders(corsUrl, ["https://api.example.test"])) {
-      throw new Error("Configured CORS origin did not allow correlation headers.");
+      throw new Error(
+        "Configured CORS origin did not allow correlation headers.",
+      );
     }
   }
   if (config.extraEvents) events.push(...config.extraEvents);
@@ -312,8 +326,13 @@ async function runCapturedFlow(config: FlowConfig): Promise<ScenarioExecution> {
   events.push(requestStart);
   if (config.correlation === "gateway_traceparent") {
     const correlation = resolveBackendRequestCorrelation(requestInput);
-    if (correlation.requestId !== TRACE_ID || correlation.requestIdSource !== "traceparent") {
-      throw new Error("Gateway request did not resolve correlation from traceparent.");
+    if (
+      correlation.requestId !== TRACE_ID ||
+      correlation.requestIdSource !== "traceparent"
+    ) {
+      throw new Error(
+        "Gateway request did not resolve correlation from traceparent.",
+      );
     }
   }
   if (config.productionTrigger) {
@@ -324,7 +343,9 @@ async function runCapturedFlow(config: FlowConfig): Promise<ScenarioExecution> {
       ...(sessionId ? { sessionId } : {}),
     };
     if (!isHighSeverityEvent(triggerEvent)) {
-      throw new Error("The production fast finalize trigger rejected a severe request event.");
+      throw new Error(
+        "The production fast finalize trigger rejected a severe request event.",
+      );
     }
     const finalizer = startFastFinalizer({
       // The harness deliberately has no live server or persisted session. This
@@ -332,6 +353,9 @@ async function runCapturedFlow(config: FlowConfig): Promise<ScenarioExecution> {
       // skipped finalization path after it classifies the severe ingest event.
       sessions: {
         getExistingSessionDir: () => undefined,
+        // No persisted session, so nothing here was ever finalized: the trigger
+        // must take the severity path, not the late-evidence one.
+        hasFinalized: () => false,
       } as never,
       debounceMs: 0,
       cooldownMs: 0,
@@ -379,7 +403,9 @@ async function runCapturedFlow(config: FlowConfig): Promise<ScenarioExecution> {
   };
 }
 
-function pgDriver(queries: string[] = ["UPDATE orders SET status = $1 WHERE id = $2"]): DriverRun {
+function pgDriver(
+  queries: string[] = ["UPDATE orders SET status = $1 WHERE id = $2"],
+): DriverRun {
   return async ({ requestId, sessionId, emit, now }) => {
     const rawClient = {
       async query(_text: unknown, _params?: unknown) {
@@ -493,7 +519,9 @@ function mssqlDriver(): DriverRun {
  * receives the payload string, recreates request context with the public SDK
  * resolver, and then emits its database diff through the regular driver path.
  */
-async function runBullmqWorkerFlow(missingContext = false): Promise<ScenarioExecution> {
+async function runBullmqWorkerFlow(
+  missingContext = false,
+): Promise<ScenarioExecution> {
   const id = missingContext
     ? "bullmq_worker_missing_context"
     : "bullmq_worker_enterprise_core";
@@ -522,7 +550,8 @@ async function runBullmqWorkerFlow(missingContext = false): Promise<ScenarioExec
     sessionId,
     offsetMs: 3,
   });
-  const serializedWorkerEventStream = await executeSerializedBullmqWorker(payload);
+  const serializedWorkerEventStream =
+    await executeSerializedBullmqWorker(payload);
   const workerEvents = JSON.parse(serializedWorkerEventStream) as BugEvent[];
   requestEvents.push(
     buildBackendRequestEndEvent({
@@ -535,7 +564,9 @@ async function runBullmqWorkerFlow(missingContext = false): Promise<ScenarioExec
   );
   // The event streams are independently created and serialized on the worker
   // side. Merging happens only after the worker has completed its handoff.
-  const events = [...requestEvents, ...workerEvents].sort((left, right) => left.t - right.t);
+  const events = [...requestEvents, ...workerEvents].sort(
+    (left, right) => left.t - right.t,
+  );
   const bundle = await buildTopologyBundle(events);
   return {
     events,
@@ -553,8 +584,12 @@ async function runBullmqWorkerFlow(missingContext = false): Promise<ScenarioExec
         ? { requiredGaps: [{ surface: "queue", reason: "missing_session_id" }] }
         : {}),
       notes: missingContext
-        ? ["A dropped worker context emits a queue capture gap and cannot complete the original join."]
-        : ["A serialized worker payload is deserialized in a fresh worker scope before it writes."],
+        ? [
+            "A dropped worker context emits a queue capture gap and cannot complete the original join.",
+          ]
+        : [
+            "A serialized worker payload is deserialized in a fresh worker scope before it writes.",
+          ],
     },
   };
 }
@@ -647,7 +682,9 @@ export const topologyCells: TopologyCell[] = [
       driverOrm: "pg_direct",
       transactionPattern: "batched_statements",
     },
-    ["A statement batch that cannot be classified records a database capture gap."],
+    [
+      "A statement batch that cannot be classified records a database capture gap.",
+    ],
     {
       correlation: "headers",
       driverRun: pgDriver([
@@ -659,7 +696,9 @@ export const topologyCells: TopologyCell[] = [
   fullCell(
     "prisma_driver_layer_enterprise_core",
     { ...common, driverOrm: "prisma_driver_layer" },
-    ["Prisma coverage uses emitted SQL through the PostgreSQL driver layer, not a live ORM integration."],
+    [
+      "Prisma coverage uses emitted SQL through the PostgreSQL driver layer, not a live ORM integration.",
+    ],
     {
       correlation: "headers",
       driverRun: prismaDriverLayer(),
@@ -668,16 +707,22 @@ export const topologyCells: TopologyCell[] = [
   fullCell(
     "drizzle_driver_layer",
     { ...common, driverOrm: "drizzle_driver_layer" },
-    ["Drizzle coverage uses emitted SQL through the PostgreSQL driver layer, not a live ORM integration."],
+    [
+      "Drizzle coverage uses emitted SQL through the PostgreSQL driver layer, not a live ORM integration.",
+    ],
     {
       correlation: "headers",
-      driverRun: pgDriver(["UPDATE orders SET status = $1 WHERE orders.id = $2"]),
+      driverRun: pgDriver([
+        "UPDATE orders SET status = $1 WHERE orders.id = $2",
+      ]),
     },
   ),
   fullCell(
     "knex_driver_layer",
     { ...common, driverOrm: "knex_driver_layer" },
-    ["Knex coverage uses emitted SQL through the PostgreSQL driver layer, not a live ORM integration."],
+    [
+      "Knex coverage uses emitted SQL through the PostgreSQL driver layer, not a live ORM integration.",
+    ],
     {
       correlation: "headers",
       driverRun: pgDriver(["UPDATE orders SET status = $1 WHERE id = $2"]),
@@ -685,16 +730,28 @@ export const topologyCells: TopologyCell[] = [
   ),
   {
     id: "bullmq_worker_enterprise_core",
-    dimensions: { ...common, driverOrm: "pg_pool", processShape: "bullmq_worker" },
+    dimensions: {
+      ...common,
+      driverOrm: "pg_pool",
+      processShape: "bullmq_worker",
+    },
     expected: "full",
-    notes: ["A worker module accepts only the serialized queue payload, creates an independent event stream, and returns it for the harness to merge after execution."],
+    notes: [
+      "A worker module accepts only the serialized queue payload, creates an independent event stream, and returns it for the harness to merge after execution.",
+    ],
     run: () => runBullmqWorkerFlow(false),
   },
   {
     id: "bullmq_worker_missing_context",
-    dimensions: { ...common, driverOrm: "pg_direct", processShape: "bullmq_worker" },
+    dimensions: {
+      ...common,
+      driverOrm: "pg_direct",
+      processShape: "bullmq_worker",
+    },
     expected: "gapped",
-    notes: ["A missing worker context emits the required queue capture gap instead of joining the original request."],
+    notes: [
+      "A missing worker context emits the required queue capture gap instead of joining the original request.",
+    ],
     run: () => runBullmqWorkerFlow(true),
   },
   fullCell(
@@ -720,7 +777,9 @@ export const topologyCells: TopologyCell[] = [
       driverOrm: "pg_direct",
       edge: "gateway_traceparent_only",
     },
-    ["The gateway strips custom correlation headers after receipt while traceparent resolves the backend request join."],
+    [
+      "The gateway strips custom correlation headers after receipt while traceparent resolves the backend request join.",
+    ],
     { correlation: "gateway_traceparent", driverRun: pgDriver() },
   ),
   fullCell(
@@ -776,7 +835,9 @@ export const topologyCells: TopologyCell[] = [
       driverOrm: "pg_direct",
       captureMode: "v3_production_trigger",
     },
-    ["The real production fast finalize trigger processes a severe event; finalization is modeled as skipped because this deterministic harness has no session store."],
+    [
+      "The real production fast finalize trigger processes a severe event; finalization is modeled as skipped because this deterministic harness has no session store.",
+    ],
     {
       correlation: "headers",
       driverRun: pgDriver(),
@@ -790,7 +851,9 @@ export const topologyCells: TopologyCell[] = [
       driverOrm: "pg_direct",
       captureMode: "otlp_sessionless",
     },
-    ["Sessionless telemetry retains its trace join and records the missing session coverage."],
+    [
+      "Sessionless telemetry retains its trace join and records the missing session coverage.",
+    ],
     {
       correlation: "sessionless_traceparent",
       includeBrowser: false,
@@ -800,11 +863,14 @@ export const topologyCells: TopologyCell[] = [
   ),
 ];
 
-function captureGaps(events: BugEvent[]): Array<{ surface?: string; reason?: string }> {
+function captureGaps(
+  events: BugEvent[],
+): Array<{ surface?: string; reason?: string }> {
   return events
     .filter((event) => event.k === "capture_gap")
     .map((event) => ({
-      surface: typeof event.d.surface === "string" ? event.d.surface : undefined,
+      surface:
+        typeof event.d.surface === "string" ? event.d.surface : undefined,
       reason: typeof event.d.reason === "string" ? event.d.reason : undefined,
     }));
 }
@@ -829,7 +895,8 @@ function sameJsonValue(left: unknown, right: unknown): boolean {
     leftKeys.length === rightKeys.length &&
     leftKeys.every(
       (key, index) =>
-        key === rightKeys[index] && sameJsonValue(leftRecord[key], rightRecord[key]),
+        key === rightKeys[index] &&
+        sameJsonValue(leftRecord[key], rightRecord[key]),
     )
   );
 }
@@ -864,7 +931,9 @@ function exactExpectedRows(
   if (diffs.length !== expectedRows.length) return false;
   const remaining = [...diffs];
   for (const expected of expectedRows) {
-    const index = remaining.findIndex((diff) => matchesExpectedRow(diff, expected));
+    const index = remaining.findIndex((diff) =>
+      matchesExpectedRow(diff, expected),
+    );
     if (index < 0) return false;
     remaining.splice(index, 1);
   }
@@ -875,7 +944,9 @@ export function deriveAchievedFidelity(execution: ScenarioExecution): Fidelity {
   const { bundle, events, groundTruth } = execution;
   const gaps = captureGaps(events);
   const action = groundTruth.actionId
-    ? events.find((event) => event.k === "clk" && event.d.id === groundTruth.actionId)
+    ? events.find(
+        (event) => event.k === "clk" && event.d.id === groundTruth.actionId,
+      )
     : undefined;
   const requestStart = groundTruth.requestId
     ? events.find(
@@ -887,7 +958,9 @@ export function deriveAchievedFidelity(execution: ScenarioExecution): Fidelity {
   const hasAction = action !== undefined;
   const hasLinkedRequest = requestStart !== undefined;
   const matchingRows = groundTruth.requestId
-    ? bundle.databaseDiffs.filter((diff) => diff.requestId === groundTruth.requestId)
+    ? bundle.databaseDiffs.filter(
+        (diff) => diff.requestId === groundTruth.requestId,
+      )
     : bundle.databaseDiffs;
   const hasExactRows = exactExpectedRows(
     matchingRows,
@@ -903,7 +976,12 @@ export function deriveAchievedFidelity(execution: ScenarioExecution): Fidelity {
 
   if (groundTruth.requiredGaps && groundTruth.requiredGaps.length > 0) {
     for (const expected of groundTruth.requiredGaps) {
-      if (!gaps.some((gap) => gap.surface === expected.surface && gap.reason === expected.reason)) {
+      if (
+        !gaps.some(
+          (gap) =>
+            gap.surface === expected.surface && gap.reason === expected.reason,
+        )
+      ) {
         throw new Error(
           `Cell required capture gap ${expected.surface}:${expected.reason}, but it was not emitted.`,
         );
@@ -917,10 +995,7 @@ export function deriveAchievedFidelity(execution: ScenarioExecution): Fidelity {
     return "gapped";
   }
 
-  if (
-    completeJoin &&
-    bundle.completeness.grade === "complete"
-  ) {
+  if (completeJoin && bundle.completeness.grade === "complete") {
     return "full";
   }
 
