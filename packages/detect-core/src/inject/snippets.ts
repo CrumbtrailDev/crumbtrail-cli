@@ -57,8 +57,11 @@ export function nuxtPluginSnippet(endpoint: string, keyExpr: string): string {
 export function nodeInitSnippet(endpoint: string): string {
   return [
     "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections, and",
-    "// console.error. Key is read from process.env.CRUMBTRAIL_KEY — set it in your",
-    "// .env (get your key from the Crumbtrail dashboard). Express apps can also add",
+    "// console.error, and instruments whichever SQL driver this app already uses",
+    "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
+    "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
+    "// from process.env.CRUMBTRAIL_KEY — set it in your .env (get your key from the",
+    "// Crumbtrail dashboard). Express apps can also add",
     "// createCrumbtrailExpressMiddleware for per-request capture.",
     'import("crumbtrail-node")',
     `  .then(({ autoCapture }) => autoCapture({ endpoint: ${JSON.stringify(endpoint)} }))`,
@@ -145,8 +148,11 @@ function singleQuoted(value: string): string {
 export function nestInitSnippet(endpoint: string): string {
   return [
     "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections, and",
-    "// console.error. Key is read from process.env.CRUMBTRAIL_KEY — set it in your",
-    "// .env (get your key from the Crumbtrail dashboard). Express apps can also add",
+    "// console.error, and instruments whichever SQL driver this app already uses",
+    "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
+    "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
+    "// from process.env.CRUMBTRAIL_KEY — set it in your .env (get your key from the",
+    "// Crumbtrail dashboard). Express apps can also add",
     "// createCrumbtrailExpressMiddleware for per-request capture.",
     "import('crumbtrail-node')",
     `  .then(({ autoCapture }) => autoCapture({ endpoint: ${singleQuoted(endpoint)} }))`,

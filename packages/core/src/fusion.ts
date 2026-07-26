@@ -227,7 +227,15 @@ function clamp01(value: number): number {
 
 /** Informative lanes for completeness breadth — the lanes that actually
  *  discriminate a cause. Mirrors {@link INFORMATIVE_LANES} intent but includes
- *  `env` since a present env difference is real context. */
+ *  `env` since a present env difference is real context.
+ *
+ *  `tickets`, `conversations`, and `deploys` are deliberately ABSENT, and this is
+ *  not an oversight to correct. Breadth here saturates at three lanes and feeds
+ *  the LOW_CONTEXT signal, so admitting a lane makes bundles read as more complete
+ *  than they were. A tenant who connects Slack would see LOW_CONTEXT fall without
+ *  any new evidence about the failure itself. Whether `deploys` earns a place is a
+ *  deliberate re-tuning of a shipped signal, to be made against real bundles
+ *  rather than folded into the change that introduced the lane. */
 const COMPLETENESS_LANES: EvidenceLane[] = [
   "network",
   "db",
@@ -408,15 +416,29 @@ function deriveEscalation(
 
 // --- evidence ranking (formerly fusion-rank.ts) ---------------------------
 
+/**
+ * Per-lane ranking bonus, added to an item's score (see below, capped at 1).
+ * Deliberately NOT normalized across lanes: the value is an additive bonus with a
+ * `?? 0.05` fallback, so introducing a lane cannot re-rank evidence in lanes that
+ * already existed. That is what makes widening {@link EvidenceLane} additive
+ * rather than a silent change to every tenant's existing ranking.
+ *
+ * `deploys` is weighted with the causal lanes rather than the corroborating ones.
+ * A release inside the incident window is a direct candidate cause, unlike a
+ * ticket or a Slack thread, which describe a failure without evidencing it.
+ */
 const LANE_PRIOR: Record<EvidenceLane, number> = {
   db: 0.2,
   network: 0.2,
   flow: 0.15,
+  deploys: 0.15,
   env: 0.1,
   browser: 0.1,
   logs: 0.05,
   memory: 0.05,
   code: 0.05,
+  tickets: 0.05,
+  conversations: 0.05,
 };
 
 /** Jaccard overlap of two token sets; 0 when both are empty. */
@@ -587,7 +609,12 @@ function classifyHypotheses(
 
 // --- capture directives (formerly capture-directive.ts) -------------------
 
-/** Lanes worth escalating capture on when evidence is thin. */
+/** Lanes worth escalating capture on when evidence is thin.
+ *
+ *  `tickets`, `conversations`, and `deploys` can never belong here, for a stronger
+ *  reason than the completeness list: these lanes are not CAPTURED. They are read
+ *  from external systems of record, so there is no capture knob to turn and a
+ *  directive naming one would be uninstructable. */
 const INFORMATIVE_LANES: EvidenceLane[] = ["network", "db", "browser", "flow"];
 
 function slugify(title: string): string {

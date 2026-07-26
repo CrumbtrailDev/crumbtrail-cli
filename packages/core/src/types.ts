@@ -447,7 +447,17 @@ export interface CrumbtrailConfig {
   autoFlagOnUncaughtError: boolean;
   /** Enable automatic capture for unhandled promise rejections. */
   autoFlagOnUnhandledRejection: boolean;
-  /** Enable automatic capture for instrumented HTTP 5xx responses. */
+  /**
+   * Enable automatic capture for instrumented HTTP 5xx responses. On by
+   * default.
+   *
+   * A 5xx an app handles gracefully — caught, rendered as an empty state, no
+   * console error, no retry — is otherwise invisible to every other trigger,
+   * which is exactly the silent-failure class capture exists for. The cost of
+   * being wrong here is one extra session; the cost of missing it is a bug
+   * nobody can reproduce. `autoFlagDebounceMs` coalesces a burst and
+   * `autoFlagMaxPerSession` caps the total, so an outage cannot flood.
+   */
   autoFlagOnRequest5xx: boolean;
   /** Allow app code and the widget to call `flag()` as an explicit beacon. */
   explicitBeacon: boolean;
@@ -588,7 +598,7 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   autoFlagOnError: false,
   autoFlagOnUncaughtError: true,
   autoFlagOnUnhandledRejection: true,
-  autoFlagOnRequest5xx: false,
+  autoFlagOnRequest5xx: true,
   explicitBeacon: true,
   serverSidePull: false,
   autoFlagDebounceMs: 2000,

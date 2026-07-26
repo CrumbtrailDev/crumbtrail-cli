@@ -106,6 +106,16 @@ describe("Crumbtrail", () => {
     expect(DEFAULT_CONFIG.networkCorrelationAllowedOrigins).toEqual([]);
   });
 
+  it("captures a 5xx by default, bounded by the debounce and the session cap", () => {
+    // A gracefully handled 500 throws nothing and logs nothing, so no other
+    // trigger sees it. Turning this off means that whole class of silent
+    // failure is never captured. If this default is ever flipped back, it must
+    // be a deliberate decision, not a drift.
+    expect(DEFAULT_CONFIG.autoFlagOnRequest5xx).toBe(true);
+    expect(DEFAULT_CONFIG.autoFlagDebounceMs).toBeGreaterThan(0);
+    expect(DEFAULT_CONFIG.autoFlagMaxPerSession).toBeGreaterThan(0);
+  });
+
   it("mark() emits mark event without throwing", async () => {
     const logger = Crumbtrail.init({
       flushIntervalMs: 100_000,

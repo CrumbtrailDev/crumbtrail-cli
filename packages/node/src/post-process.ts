@@ -11,7 +11,10 @@ import {
 import { writeEvidenceIndex } from "./evidence-index";
 import {
   readCaptureTruncationMarker,
+  readColdEvents,
+  readColdEvidenceArtifacts,
   type CaptureTruncationSummary,
+  type ColdEvidenceArtifacts,
   writeColdEvidenceArtifacts,
   writeTwoPlaneSessionArtifacts,
 } from "./storage-plane";
@@ -76,6 +79,15 @@ interface ConsoleErrorIndexEntry {
   lv: string;
   msg: string;
   source?: string;
+  /**
+   * Stack synthesized by the console collector at `console.error` time (a
+   * `new Error().stack` taken inside the patched method). Kept because a
+   * framework that reports failures through `console.error` rather than
+   * throwing — React error boundaries being the common case — otherwise leaves
+   * the candidate with no code location at all, even though the collector
+   * captured one and shipped it.
+   */
+  stk?: string;
 }
 
 interface NetworkErrorIndexEntry {
@@ -274,6 +286,74 @@ interface AudioProcessResult {
   audio?: PostProcessAudioSummary;
 }
 
+/** Outcome of {@link reanalyzeSession}, for callers that report or audit a repair run. */
+export interface ReanalyzeSessionResult {
+  /** False when the session has no cold artifact to replay; nothing was written. */
+  reanalyzed: boolean;
+  /** Events replayed out of `events.ndjson.zst`. */
+  events: number;
+}
+
+/**
+ * Rebuilds a finalized session's derived artifacts by replaying its cold event
+ * stream through the current analyzer.
+ *
+ * Session artifacts are written once at finalize time and never revisited, so a
+ * session analyzed by an older build keeps that build's output forever even
+ * after the analyzer improves. Sessions finalized before crumbtrail-node 0.13.0,
+ * for instance, dropped `stk`/`url` from `index.errs`, which cost those reports
+ * both their code frames and the tracker-beacon downranking that depends on the
+ * request url. The raw evidence to recompute all of it is still in cold storage.
+ *
+ * This regenerates only the derived hot plane (index, candidates, bundle,
+ * manifest). It deliberately never rewrites `events.ndjson.zst` or
+ * `signatures.json`: once a session is cold those files are the only surviving
+ * copy of the raw evidence, and a repair path must not put them at risk. The
+ * existing cold artifacts are read and carried into the new manifest instead.
+ *
+ * Audio is not re-transcoded. Any prior transcript already merged into the cold
+ * stream replays with it, so re-running Whisper would duplicate those events.
+ */
+export async function reanalyzeSession(
+  sessionDir: string,
+): Promise<ReanalyzeSessionResult> {
+  const events = readColdEvents(sessionDir);
+  if (events === undefined) return { reanalyzed: false, events: 0 };
+  const coldEvidence = readColdEvidenceArtifacts(sessionDir);
+  if (coldEvidence === undefined) return { reanalyzed: false, events: 0 };
+  await analyzeSession({
+    sessionDir,
+    events,
+    truncation: readCaptureTruncationMarker(sessionDir),
+    audio: readIndexAudioSummary(sessionDir),
+    coldEvidence,
+  });
+  return { reanalyzed: true, events: events.length };
+}
+
+/**
+ * Carries a prior run's audio summary forward on re-analysis.
+ *
+ * Re-analysis skips transcription, so without this the rebuilt index would drop
+ * `audio` entirely and a repaired session would look like it never had any.
+ */
+function readIndexAudioSummary(
+  sessionDir: string,
+): PostProcessAudioSummary | undefined {
+  try {
+    const parsed: unknown = JSON.parse(
+      fs.readFileSync(path.join(sessionDir, "index.json"), "utf-8"),
+    );
+    if (typeof parsed !== "object" || parsed === null) return undefined;
+    const audio = (parsed as { audio?: unknown }).audio;
+    return typeof audio === "object" && audio !== null
+      ? (audio as PostProcessAudioSummary)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function postProcess(
   sessionDir: string,
   whisperModel?: string,
@@ -285,7 +365,42 @@ export async function postProcess(
   // Process audio transcription if audio.webm exists. Audio failures are non-fatal and
   // are exposed through index.audio instead of throwing away usable artifacts.
   const audioResult = await processAudio(sessionDir, events, whisperModel);
+  await analyzeSession({
+    sessionDir,
+    events: audioResult.events,
+    truncation,
+    audio: audioResult.audio,
+  });
+}
+
+interface AnalyzeSessionInput {
+  sessionDir: string;
+  events: BugEvent[];
+  truncation: CaptureTruncationSummary | undefined;
+  audio: PostProcessAudioSummary | undefined;
+  /**
+   * Pre-existing cold artifacts to reuse. Present only on re-analysis; when
+   * omitted the cold plane is written fresh from `events`, which is what a
+   * first finalize must do.
+   */
+  coldEvidence?: ColdEvidenceArtifacts;
+}
+
+/**
+ * The shared analysis core behind both the first finalize and a re-analysis.
+ * Everything that reads raw events and produces derived artifacts lives here,
+ * so a replayed session goes through exactly the same code a live one does.
+ */
+async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
+  const { sessionDir, truncation } = input;
+  const audioResult: AudioProcessResult = {
+    events: input.events,
+    ...(input.audio !== undefined ? { audio: input.audio } : {}),
+  };
   const mergedEvents = audioResult.events;
+  const writeCold = async (events: BugEvent[]) =>
+    input.coldEvidence ??
+    (await writeColdEvidenceArtifacts({ sessionDir, events }));
 
   if (mergedEvents.length === 0) {
     const index = await writeEmptyIndex(
@@ -299,10 +414,7 @@ export async function postProcess(
       index,
       causalGraph: undefined,
     });
-    const coldEvidence = await writeColdEvidenceArtifacts({
-      sessionDir,
-      events: mergedEvents,
-    });
+    const coldEvidence = await writeCold(mergedEvents);
     const bundle = await writeLlmBundle({
       sessionDir,
       events: mergedEvents,
@@ -497,10 +609,7 @@ export async function postProcess(
     index,
     causalGraph,
   });
-  const coldEvidence = await writeColdEvidenceArtifacts({
-    sessionDir,
-    events: mergedEvents,
-  });
+  const coldEvidence = await writeCold(mergedEvents);
   const bundle = await writeLlmBundle({
     sessionDir,
     events: mergedEvents,
@@ -662,6 +771,7 @@ function summarizeConsoleErrorEvent(
     lv: level,
     msg: message,
     source: safeString(event.d.source),
+    stk: safeStackString(event.d.stk),
   });
 }
 
