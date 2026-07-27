@@ -83,6 +83,21 @@ function freePort(port) {
   spawnSync('kill', ['-9', ...pids]);
 }
 
+/**
+ * `tsup --watch` CLEANS dist/ before its first rebuild, so a dist that existed a
+ * moment ago is gone the instant the watchers start. Anything that loads a built
+ * file must wait for that file specifically — checking "did dist exist at
+ * startup" is a race that passes locally and fails on a cold or slow machine.
+ */
+async function waitForFile(file, timeoutMs = 60000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(file)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return false;
+}
+
 async function waitForHealth(port, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -149,24 +164,50 @@ async function main() {
   const packages = localPackages();
   const needsBuild = [...packages.values()].some((p) => !p.private && !isBuilt(p));
   if (needsBuild) {
-    log('building SDK packages (first run only)…');
+    // `pnpm -r build` is topological, which matters: crumbtrail-node inlines
+    // crumbtrail-core (noExternal) and its DTS step reads core's .d.ts, so core
+    // must be fully built first.
+    log('building SDK packages…');
     run('pnpm', ['build']);
   }
 
   log('linking targets to this checkout…');
   run('node', [LINK_SCRIPT, 'link', ...options.targets.flatMap((t) => ['--target', t])]);
 
+  // --no-clean is load-bearing, not an optimisation. Each package's tsup config
+  // sets clean:true, so concurrent watchers wipe dist/ at startup — and because
+  // crumbtrail-node's DTS build reads crumbtrail-core's .d.ts, core's wipe makes
+  // node's build fail with "Could not find a declaration file for module
+  // 'crumbtrail-core'". Watch mode never retries that without a source change,
+  // so the watcher stays dead and dist/cli.cjs never appears. Building first and
+  // then watching without clean removes the race entirely.
   for (const name of WATCHED) {
     if (!packages.has(name)) continue;
-    spawnLogged(`watch-${name}`, 'pnpm', ['--filter', name, 'exec', 'tsup', '--watch']);
+    spawnLogged(`watch-${name}`, 'pnpm', [
+      '--filter',
+      name,
+      'exec',
+      'tsup',
+      '--watch',
+      '--no-clean',
+    ]);
     log(`watching ${name}`);
   }
 
   if (options.server) {
     freePort(options.port);
     fs.mkdirSync(options.sessions, { recursive: true });
+
+    const serverEntry = path.join(REPO_ROOT, 'packages', 'node', 'dist', 'cli.cjs');
+    log('waiting for the watcher to rebuild the server entry…');
+    if (!(await waitForFile(serverEntry))) {
+      log(`✗ ${path.relative(REPO_ROOT, serverEntry)} never appeared`);
+      log(`  see ${path.relative(REPO_ROOT, path.join(LOG_DIR, 'watch-crumbtrail-node.log'))}`);
+      return shutdown(1);
+    }
+
     spawnLogged('capture-server', 'node', [
-      path.join(REPO_ROOT, 'packages', 'node', 'dist', 'cli.cjs'),
+      serverEntry,
       'serve',
       '--port',
       String(options.port),

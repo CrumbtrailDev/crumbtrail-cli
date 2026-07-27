@@ -45,7 +45,16 @@ export function localPackages() {
  * A package is only linkable if its build output exists — a symlink to a package
  * with no dist/ resolves to a module with no main, which fails at require() time
  * with an error that looks nothing like "you forgot to build".
+ *
+ * Checks for CONTENT, not just the directory: `tsup --watch` cleans dist/ and
+ * leaves the empty directory behind, so an existence check reports "built" for a
+ * package whose output was just wiped.
  */
 export function isBuilt(pkg) {
-  return fs.existsSync(path.join(pkg.dir, 'dist'));
+  const dist = path.join(pkg.dir, 'dist');
+  try {
+    return fs.readdirSync(dist).length > 0;
+  } catch {
+    return false;
+  }
 }
