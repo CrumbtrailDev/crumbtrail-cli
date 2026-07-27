@@ -8,17 +8,19 @@
  * analyzable const: no computed keys, no conditional construction, nothing
  * a bundler could tree shake or reshape.
  *
- * The hosted cloud probed this map while it bridged the unpublished
- * contract. Since crumbtrail-node 0.5.0 it depends on the published package
- * directly and that probe is gone. Keys remain part of the public contract
- * byte for byte.
+ * The map is currently EMPTY, and that is the contract, not an oversight.
+ * Every key it used to carry described a third-party integration surface this
+ * package no longer implements:
+ *
+ *   - `tenantContextFactory`         — createServer's per-tenant evidence-source seam
+ *   - `ticketComment`                — the provider-neutral ticket comment writer
+ *   - `evidenceSourceFetchInjection` — fetch injection into evidence providers
+ *
+ * Those left along with `evidence-sources/`, `ticket/`, and `knowledge/`: that
+ * data now reaches agents through each vendor's own MCP server rather than
+ * through a package installed in the customer's node_modules. Because the cloud
+ * accepts `=== true` only, dropping the keys disables those paths by
+ * construction, which is safer than keeping a marker that lies about what the
+ * package can still do.
  */
-export const NODE_CONTRACT_CAPABILITIES = {
-  tenantContextFactory: true,
-  ticketComment: true,
-  /**
-   * The evidence providers registered by this package construct their sources
-   * with the fetch passed to fromEnv.
-   */
-  evidenceSourceFetchInjection: true,
-} as const;
+export const NODE_CONTRACT_CAPABILITIES = {} as const;

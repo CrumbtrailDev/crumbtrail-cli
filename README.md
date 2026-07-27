@@ -14,7 +14,7 @@ them require it.
 | --- | --- |
 | [`crumbtrail`](packages/cli) | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. |
 | [`crumbtrail-core`](packages/core) | Framework-agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. |
-| [`crumbtrail-node`](packages/node) | Node.js server: session store, evidence sources, the local dashboard. |
+| [`crumbtrail-node`](packages/node) | Node.js server: session store, backend capture, the local dashboard. |
 | [`crumbtrail-react`](packages/react) | React bindings. |
 | [`crumbtrail-react-native`](packages/react-native) | React Native bindings. |
 | [`crumbtrail-tauri`](packages/tauri) | Tauri (Rust desktop) bindings. |

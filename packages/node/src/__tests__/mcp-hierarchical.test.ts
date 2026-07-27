@@ -228,10 +228,11 @@ describe("MCP hierarchical retrieval", () => {
     expect(names).toContain("getSessionManifest");
     expect(names).toContain("getWindow");
     expect(names).toContain("getEvidence");
-    // 38 = read tools + the three learning-loop tools (resolveIssue,
-    // recordFeedback, getPlaybook) + the additive capsule.v2 resolveCapsule
-    // tool; still excludes the removed mutating resolveBug tool.
-    expect(result.tools).toHaveLength(38);
+    // 35 = read tools + the three learning-loop tools (resolveIssue,
+    // recordFeedback, getPlaybook); excludes the removed mutating resolveBug
+    // tool, and the three integration tools (solveContext, resolveCapsule,
+    // searchSpecs) that left with evidence-sources/, ticket/, and knowledge/.
+    expect(result.tools).toHaveLength(35);
   });
 
   it("getSessionManifest returns the manifest.json payload (small, hot-plane)", async () => {
