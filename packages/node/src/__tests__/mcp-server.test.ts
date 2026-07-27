@@ -8,7 +8,6 @@ import { postProcess } from "../post-process";
 import { buildFixContext } from "../fix-context";
 import { runFixContext } from "../run-fix-context";
 import { estimateTokens } from "../token-estimate";
-import { FakeEvidenceSource } from "../evidence-sources/fake-source";
 import type { EvidenceItem } from "crumbtrail-core";
 
 describe("MCP Server", () => {
@@ -121,12 +120,17 @@ describe("MCP Server", () => {
     });
     expect(res).not.toBeNull();
     const result = res!.result as any;
-    // 38 includes the additive capsule.v2 resolveCapsule tool.
-    expect(result.tools).toHaveLength(38);
+    // 35 = 38 minus solveContext, resolveCapsule, and searchSpecs, which left
+    // with the third-party integration surfaces they queried.
+    expect(result.tools).toHaveLength(35);
     const names = result.tools.map((t: any) => t.name);
     expect(names).toContain("listSessions");
-    expect(names).toContain("resolveCapsule");
     expect(names).toContain("getFixContext");
+    // The integration tools left with evidence-sources/, ticket/, and
+    // knowledge/; re-adding a name here without an implementation should fail.
+    for (const gone of ["solveContext", "resolveCapsule", "searchSpecs"]) {
+      expect(names).not.toContain(gone);
+    }
     expect(names).toContain("getOpinion");
     expect(names).toContain("getLatestIssue");
     expect(names).toContain("getRegressionContext");
@@ -2285,55 +2289,6 @@ describe("MCP Server", () => {
       expect(text).not.toContain("budgetNotice");
     });
 
-    it("solveContext without maxTokens carries no budgeting fields; with maxTokens it drops ranked evidence by EvidenceItem.id", async () => {
-      const items: EvidenceItem[] = Array.from({ length: 6 }, (_, i) => ({
-        id: `ev_${String(i).padStart(2, "0")}`,
-        lane: "logs",
-        kind: "sentry.error",
-        brief: `checkout crash detail ${i} — ${"trace ".repeat(60)}`,
-        ref: { sig: `https://sentry.io/issues/${i}/` },
-        before: undefined,
-        after: `frame-${i}`,
-        whenObserved: 1200 + i,
-      }));
-      const budgetServer = new McpServer({
-        outputDir: tmpDir,
-        evidenceSourcesFactory: () => [
-          new FakeEvidenceSource({ provider: "sentry", items }),
-        ],
-      });
-
-      const full = await callTool(
-        "solveContext",
-        { symptom: { title: "checkout crash" } },
-        budgetServer,
-      );
-      expect(full.parsed.schemaVersion).toBe("fusion.v1");
-      expect(full.parsed.evidence).toHaveLength(6);
-      expect(full.text).not.toContain("tokenEstimate");
-      expect(full.text).not.toContain("dropReport");
-
-      const rankedIds = full.parsed.evidence.map((e: any) => e.id);
-      const maxTokens = estimateTokens(full.text!) - 150;
-      const budgeted = await callTool(
-        "solveContext",
-        { symptom: { title: "checkout crash" }, maxTokens },
-        budgetServer,
-      );
-      expect(budgeted.parsed.dropReport.droppedCount).toBeGreaterThanOrEqual(1);
-      expect([
-        ...budgeted.parsed.evidence.map((e: any) => e.id),
-        ...budgeted.parsed.dropReport.droppedRefs,
-      ]).toEqual(rankedIds);
-      // Kept items are whole, unrewritten copies of their unbudgeted selves.
-      expect(budgeted.parsed.evidence).toEqual(
-        full.parsed.evidence.slice(0, budgeted.parsed.evidence.length),
-      );
-      expect(budgeted.parsed.tokenEstimate).toBe(
-        estimateTokens(budgeted.text!),
-      );
-      expect(budgeted.parsed.tokenEstimate).toBeLessThanOrEqual(maxTokens);
-    });
 
     it("getWindow without maxTokens is byte-identical; with maxTokens it drops from the tail and reports the first omitted timestamp", async () => {
       const events = Array.from({ length: 40 }, (_, i) => ({

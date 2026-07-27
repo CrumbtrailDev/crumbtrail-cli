@@ -9,13 +9,6 @@ import type {
   RankedBundle,
   Symptom,
 } from "crumbtrail-core";
-import {
-  evidenceSourcesFromEnv,
-  fetchAdapterEvidence,
-  type AdapterSourceStats,
-  type EvidenceSource,
-  type FetchAdapterEvidenceOptions,
-} from "./evidence-sources";
 import type { DistinctBug, DistinctBugEvidenceRef } from "./distinct-bugs";
 import {
   bugProfile,
@@ -509,202 +502,32 @@ export async function locateEvidence(
   };
 }
 
-// --- Adapter (evidence-source) phase ---------------------------------------
-//
-// After the incident window is located, query the client's EXISTING
-// observability tools (the CP1 evidence-source framework) for neutral
-// evidence.v1 items inside that window and merge them ALONGSIDE session-derived
-// evidence — the one fusion path (assembleBundle) ranks the mixed set; adapter
-// items are never special-cased or re-ranked. Two windows feed the query:
-//   - matched locate → the located session's observed-time span + its
-//     correlation keys (sessionId, requestId/traceId) plus symptom keys.
-//   - NO session matched (sessionless "Mode A") → a bounded fallback window
-//     ending at the ticket's reference time, reaching SESSIONLESS_LOOKBACK_MS
-//     back, keyed only by symptom-extractable keys (url/release/user).
-// The phase is advisory: with zero sources configured it is a no-op, so the
-// session-matched path stays byte-identical to today; a dead/slow source
-// degrades to a gap inside fetchAdapterEvidence, never a thrown error.
-
-/**
- * Sessionless (Mode A) lookback: how far BEFORE a ticket's reference time to
- * scan a client's evidence sources when NO Crumbtrail session matched. 24h is a
- * deliberate guess — long enough to catch a ticket filed the morning after an
- * incident, short enough to bound adapter egress. TUNE ME (raise for
- * slow-to-report teams, lower to cut noise/cost). Intentionally a named
- * constant and NOT yet a config surface (see brief Assumptions). The window is
- * capped by this lookback; per-source `maxItems`/`maxBytes` bound volume.
- */
-export const SESSIONLESS_LOOKBACK_MS = 24 * 60 * 60 * 1000;
-
-/**
- * Default egress bounds for an adapter {@link EvidenceQuery}. maxItems/maxBytes
- * cap volume (important for the wide sessionless window); timeoutMs bounds a
- * slow source. Mirrors the framework's own byte-cap discipline.
- */
-export const DEFAULT_EVIDENCE_QUERY_LIMITS: EvidenceQuery["limits"] = {
-  maxItems: 50,
-  maxBytes: 512 * 1024,
-  timeoutMs: 10_000,
-};
-
-/** Injection + tuning seam for the adapter phase (production defaults to env). */
-export interface AdapterPhaseOptions {
-  /** Injected evidence sources (DI seam). Defaults to evidenceSourcesFromEnv(). */
-  sources?: EvidenceSource[];
-  /** Reference "now" for the sessionless fallback window. Defaults to Date.now(). */
-  now?: number;
-  /** Ticket created-time (ms) for the sessionless window when known; else `now`. */
-  ticketCreatedAt?: number;
-  /** EvidenceQuery limits. Defaults to {@link DEFAULT_EVIDENCE_QUERY_LIMITS}. */
-  limits?: EvidenceQuery["limits"];
-  /** fetchAdapterEvidence options (clock / byte-cap overrides for tests). */
-  fetchOptions?: FetchAdapterEvidenceOptions;
-}
-
-/**
- * Build the {@link EvidenceQuery} for the adapter phase from the located
- * incident (matched → observed-time span + correlation keys; sessionless →
- * bounded fallback window). Pure and deterministic; exported for direct testing.
- */
-export function buildEvidenceQuery(
-  symptom: Symptom,
-  located: { evidence: EvidenceItem[]; match: LocateMatch },
-  opts: AdapterPhaseOptions = {},
-): EvidenceQuery {
-  const now = opts.now ?? Date.now();
-  const limits = opts.limits ?? DEFAULT_EVIDENCE_QUERY_LIMITS;
-
-  // Symptom-extractable keys apply to BOTH paths (matched + sessionless).
-  const keys: EvidenceQuery["keys"] = {};
-  if (symptom.url) keys.url = symptom.url;
-  if (symptom.release) keys.release = symptom.release;
-  if (symptom.user) keys.user = symptom.user;
-
-  // A matched locate ALWAYS contributes its session's correlation keys, even in
-  // the (rare) matched-but-empty-evidence case: the sessionId is a real key an
-  // adapter can filter by, and dropping it would silently degrade a matched
-  // ticket to a symptom-only fetch. requestId/traceId + the observed-time window
-  // are derived from the located evidence and only apply when evidence exists.
-  const matched = located.match.outcome === "matched";
-  if (matched && located.match.sessionId) {
-    keys.sessionId = located.match.sessionId;
-  }
-
-  if (matched && located.evidence.length > 0) {
-    // requestId doubles as traceId in the repo's correlation model — feed both
-    // so an adapter can filter by whichever it declares.
-    const requestId = located.evidence.find((item) => item.ref?.requestId)?.ref
-      ?.requestId;
-    if (requestId) {
-      keys.requestId = requestId;
-      keys.traceId = requestId;
-    }
-    const times = located.evidence
-      .map((item) => item.whenObserved)
-      .filter((t): t is number => typeof t === "number");
-    const start =
-      times.length > 0 ? Math.min(...times) : now - SESSIONLESS_LOOKBACK_MS;
-    const end = times.length > 0 ? Math.max(...times) : now;
-    return { window: { start, end }, keys, symptom, limits };
-  }
-
-  // Sessionless Mode A (and the matched-but-empty guard above): a bounded
-  // fallback window ending at the ticket's reference time (created-time when
-  // known so a stale ticket anchors to incident time, not "now"), reaching
-  // SESSIONLESS_LOOKBACK_MS back. Any matched sessionId is already in `keys`.
-  const reference = opts.ticketCreatedAt ?? now;
-  return {
-    window: { start: reference - SESSIONLESS_LOOKBACK_MS, end: reference },
-    keys,
-    symptom,
-    limits,
-  };
-}
-
-/**
- * Per-source health summary threaded up to the cloud layer so the webhook can
- * record connector success/failure for each evidence source. Deliberately
- * minimal (provider + the framework's `ok` verdict + the already-sanitized
- * error) — it carries NO items/gaps and no raw provider payload, so it is safe
- * to serialize across the inner /api/solve-context boundary. `ok` follows the
- * framework invariant: false iff the source could not deliver primary evidence
- * (see {@link AdapterSourceStats}).
- */
-export interface EvidenceSourceHealth {
-  provider: string;
-  ok: boolean;
-  /** Sanitized failure reason when `ok` is false (never a raw secret/token). */
-  error?: string;
-}
-
-/** Project the framework's per-source stats onto the minimal cloud-facing
- *  health summary. Drops volume/latency detail the connector-status surface
- *  does not need. */
-function toSourceHealth(stats: AdapterSourceStats[]): EvidenceSourceHealth[] {
-  return stats.map((s) => ({
-    provider: s.provider,
-    ok: s.ok,
-    ...(s.error ? { error: s.error } : {}),
-  }));
-}
-
-/**
- * Adapter phase: query the client's configured evidence sources for the located
- * incident window and return neutral evidence.v1 items + gaps to merge into the
- * bundle ALONGSIDE session-derived evidence, plus a minimal per-source health
- * summary for the cloud connector-status surface. Never throws — a dead/slow
- * source degrades to a gap inside fetchAdapterEvidence. With ZERO sources
- * configured this returns `{ items: [], gaps: [], sources: [] }`, so the
- * caller's behavior is identical to the pre-adapter path.
- */
-export async function gatherAdapterEvidence(
-  symptom: Symptom,
-  located: { evidence: EvidenceItem[]; match: LocateMatch },
-  opts: AdapterPhaseOptions = {},
-): Promise<{
-  items: EvidenceItem[];
-  gaps: EvidenceGap[];
-  sources: EvidenceSourceHealth[];
-}> {
-  const sources = opts.sources ?? evidenceSourcesFromEnv();
-  if (sources.length === 0) return { items: [], gaps: [], sources: [] };
-  const query = buildEvidenceQuery(symptom, located, opts);
-  const { items, gaps, stats } = await fetchAdapterEvidence(
-    sources,
-    query,
-    opts.fetchOptions,
-  );
-  return { items, gaps, sources: toSourceHealth(stats) };
-}
-
 /**
  * Locate + assemble in one call: produce the persisted RankedBundle for a
  * symptom (always assembleBundle output, never hand-assembled) alongside the
  * pinned {@link LocateMatch}. A matched locate assembles the located session's
- * evidence; a no-session locate assembles a bundle built purely from adapter
- * evidence (sessionless Mode A) when sources are configured, or empty evidence
- * with the standard "no session matched" gap when they are not. Either way a
- * no-session bundle carries {@link NO_LOCATED_SESSION_GAP} stating that no
- * Crumbtrail session matched. Adapter items are ranked through the one fusion
- * path (never special-cased). Used by the inner /api/solve-context endpoint, so
- * the cloud webhook picks up the adapter phase for free.
+ * evidence; a no-session locate assembles an empty bundle carrying
+ * {@link NO_LOCATED_SESSION_GAP} stating that no Crumbtrail session matched.
+ * Used by the inner /api/solve-context endpoint.
+ *
+ * Evidence is first-party only: Crumbtrail's own captured sessions. The former
+ * adapter phase, which fanned out to a client's Sentry/Datadog/Splunk/etc.
+ * connectors and merged their items alongside session evidence, was removed —
+ * that data now reaches agents through those vendors' own MCP servers rather
+ * than through a package installed in the customer's node_modules.
  */
 export async function locateAndAssemble(
   symptom: Symptom,
   store: RecallStore,
-  opts: LocateIncidentOptions & AdapterPhaseOptions = {},
+  opts: LocateIncidentOptions = {},
 ): Promise<{
   bundle: RankedBundle;
   match: LocateMatch;
-  sources: EvidenceSourceHealth[];
 }> {
   const located = await locateEvidence(symptom, store, opts);
-  const adapter = await gatherAdapterEvidence(symptom, located, opts);
-  const evidence = [...located.evidence, ...adapter.items];
-  // A no-session locate ALWAYS states that no Crumbtrail session matched —
-  // whether the bundle ends up empty (today's inconclusive) or populated purely
-  // from adapter evidence (Mode A). A matched locate carries only adapter gaps.
-  // An ambiguous decision names its ambiguity separately so consumers can route
+  const evidence = located.evidence;
+  // A no-session locate ALWAYS states that no Crumbtrail session matched. An
+  // ambiguous decision names its ambiguity separately so consumers can route
   // the candidates to review rather than treat it as a normal no-match.
   const gaps =
     located.evidence.length === 0
@@ -713,9 +536,8 @@ export async function locateAndAssemble(
           ...(located.match.outcome === "ambiguous"
             ? [AMBIGUOUS_LOCATED_SESSION_GAP]
             : []),
-          ...adapter.gaps,
         ]
-      : [...adapter.gaps];
+      : [];
   // Thread the locate decision onto the bundle (RankedBundle.located) so the
   // persisted bundle carries it uniformly with the MCP tool's output; the
   // separate `match` return stays for back-compat. method "fuzzy": scored
@@ -737,7 +559,5 @@ export async function locateAndAssemble(
     gaps,
     located: located_,
   });
-  // `sources` is the per-source health summary the inner endpoint surfaces so
-  // the cloud webhook can record connector success/failure. Advisory only.
-  return { bundle, match: located.match, sources: adapter.sources };
+  return { bundle, match: located.match };
 }
