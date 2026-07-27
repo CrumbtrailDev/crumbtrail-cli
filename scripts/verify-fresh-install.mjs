@@ -8,6 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { compareVersions } from "./verify-sdk-version-floors.mjs";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 const coreRoot = path.join(repoRoot, "packages", "core");
@@ -247,8 +249,21 @@ async function assertPackedCliInstallSpecs(cliTarball, tempProjectDir, expectedS
     { cwd: tempProjectDir },
   );
   const emittedSpecs = JSON.parse(probe.stdout.trim());
-  if (JSON.stringify(emittedSpecs) !== JSON.stringify(expectedSpecs)) {
-    throw new Error(`packed crumbtrail emitted install specs ${JSON.stringify(emittedSpecs)}, expected ${JSON.stringify(expectedSpecs)}`);
+  // Assert the SHAPE and the floor relationship, not an exact string. Pinning
+  // the expected floor to the current workspace version is what made this check
+  // go stale on every release; a floor is allowed to lag behind latest.
+  if (emittedSpecs.length !== expectedSpecs.length) {
+    throw new Error(`packed crumbtrail emitted ${emittedSpecs.length} install specs, expected ${expectedSpecs.length}`);
+  }
+  for (const [index, { pkg, maxVersion }] of expectedSpecs.entries()) {
+    const emitted = emittedSpecs[index];
+    const match = new RegExp(`^${pkg}@>=(\\d+\\.\\d+\\.\\d+)$`).exec(emitted ?? "");
+    if (!match) {
+      throw new Error(`packed crumbtrail emitted install spec ${JSON.stringify(emitted)}, expected ${pkg}@>=<floor>`);
+    }
+    if (compareVersions(match[1], maxVersion) > 0) {
+      throw new Error(`packed crumbtrail floor ${emitted} is ahead of the workspace version ${maxVersion}`);
+    }
   }
   recordPhase("packed-cli-install-specs", "pass", `specs=${emittedSpecs.join(",")}`);
 }
@@ -681,8 +696,8 @@ async function main() {
     );
     const nodePackage = await readJsonFile(path.join(nodeRoot, "package.json"));
     await assertPackedCliInstallSpecs(cliTarball, cliProjectDir, [
-      `crumbtrail-core@^${expectedCoreVersion}`,
-      `crumbtrail-node@^${nodePackage.version}`,
+      { pkg: "crumbtrail-core", maxVersion: expectedCoreVersion },
+      { pkg: "crumbtrail-node", maxVersion: nodePackage.version },
     ]);
     await installTempProject(tempProjectDir, coreTarball, nodeTarball);
     await assertInstalledPackageMetadata(tempProjectDir, expectedCoreVersion);

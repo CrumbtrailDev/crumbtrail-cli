@@ -9,6 +9,36 @@ const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(scriptDir, "..");
 const registryPath = path.join(rootDir, "packages/detect-core/src/recipe-registry.ts");
 
+const RELEASE_VERSION = /^(\d+)\.(\d+)\.(\d+)$/;
+
+function parseVersion(value, label) {
+  const match = RELEASE_VERSION.exec(String(value ?? ""));
+  if (!match) {
+    throw new Error(`${label} "${value}" must be a plain x.y.z release version.`);
+  }
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/** Compare two plain x.y.z releases. Negative when `a` precedes `b`. */
+export function compareVersions(a, b) {
+  const left = parseVersion(a, "version");
+  const right = parseVersion(b, "version");
+  for (let i = 0; i < 3; i += 1) {
+    if (left[i] !== right[i]) return left[i] - right[i];
+  }
+  return 0;
+}
+
+/**
+ * A floor is valid when it is at or below the version this workspace can
+ * publish. It is deliberately allowed to LAG: the floor names the oldest SDK
+ * that satisfies the installer recipes, not the newest one that exists. A floor
+ * ahead of the workspace would point users at a version nobody can publish.
+ */
+export function floorSatisfiedBy(floor, workspaceVersion) {
+  return compareVersions(floor, workspaceVersion) <= 0;
+}
+
 function propertyName(property) {
   if (!property.name) return undefined;
   if (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)) return property.name.text;
@@ -90,14 +120,18 @@ async function main() {
   for (const packageName of expected) {
     const workspaceVersion = versions.get(packageName);
     if (!workspaceVersion) throw new Error(`${packageName} is installer-managed but has no workspace package manifest.`);
-    if (floors.get(packageName) !== workspaceVersion) {
-      throw new Error(`${packageName} floor ${floors.get(packageName)} drifted from workspace version ${workspaceVersion}.`);
+    if (!floorSatisfiedBy(floors.get(packageName), workspaceVersion)) {
+      throw new Error(`${packageName} floor ${floors.get(packageName)} is ahead of workspace version ${workspaceVersion}; a floor must name a version that can actually be published.`);
     }
   }
   console.log(`CRUMBTRAIL_SDK_VERSION_FLOORS_PASS packages=${expected.map((name) => `${name}@${floors.get(name)}`).join(",")}`);
 }
 
-main().catch((error) => {
-  console.error(`CRUMBTRAIL_SDK_VERSION_FLOORS_FAIL ${error.message}`);
-  process.exitCode = 1;
-});
+// Only sweep the workspace when invoked as a script. Importing this module (the
+// unit tests do) must not run the check or mutate the process exit code.
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(`CRUMBTRAIL_SDK_VERSION_FLOORS_FAIL ${error.message}`);
+    process.exitCode = 1;
+  });
+}
