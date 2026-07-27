@@ -79,13 +79,19 @@ const NODE_KEY: KeyRef = {
 };
 
 /**
- * Version floors for the SDK packages the installer adds. A bare `npm install
- * crumbtrail-node` resolves whatever the registry says is latest at run time —
- * which once left freshly wired services on stale 0.2.x installs when a
- * dist-tag/publish hiccup lagged. Pinning `^<floor>` guarantees the wizard never
- * wires a service to an SDK older than the one this CLI was built against.
- * `pnpm verify:sdk-version-floors` mechanically enforces that this record is
- * exact for every recipe-managed SDK and equals each workspace manifest version.
+ * Capability floors for the SDK packages the installer adds. A bare `npm
+ * install crumbtrail-node` resolves whatever the registry says is latest at run
+ * time — which once left freshly wired services on stale 0.2.x installs when a
+ * dist-tag/publish hiccup lagged. A floor is the guard against that.
+ *
+ * A floor names the OLDEST SDK that satisfies the recipes below — not the
+ * newest that exists. Raise an entry only when a recipe starts depending on a
+ * capability the older SDK lacks. Do NOT raise it just because a package was
+ * released: these are pre-1.0 packages that cut minors constantly, and mirroring
+ * latest here turned every SDK patch into a detect-core release plus a CLI
+ * release that delivered nothing (the CLI is `npx`-invoked, so users already run
+ * the newest one). `pnpm verify:sdk-version-floors` enforces only that each
+ * floor exists, is recipe-managed, and is not ahead of its workspace manifest.
  */
 export const SDK_VERSION_FLOORS: Record<string, string> = {
   "crumbtrail-core": "0.8.0",
@@ -94,10 +100,24 @@ export const SDK_VERSION_FLOORS: Record<string, string> = {
   "crumbtrail-tauri": "0.3.2",
 };
 
-/** The install spec for a package: `pkg@^<floor>`, or the bare name when unknown. */
+/**
+ * The install spec for a package: `pkg@>=<floor>`, or the bare name when
+ * unknown.
+ *
+ * `>=` rather than `^` is deliberate. Under semver, a caret on a 0.x version is
+ * both a floor AND a ceiling — `^0.16.1` means `>=0.16.1 <0.17.0` — so while
+ * these packages are pre-1.0 a caret pins new installs to a single minor line
+ * and every minor release strands them until the floor moves. `>=` keeps the
+ * stale-dist-tag guard while letting a freshly wired service resolve the newest
+ * SDK, which is the whole point of a floor.
+ *
+ * Note for callers: this spec contains `>`, so it is safe as an argv element
+ * (see `installSdk`, which spawns without a shell) but MUST be quoted in any
+ * command string shown to a user for copy-paste.
+ */
 export function sdkInstallSpec(pkg: string): string {
   const floor = SDK_VERSION_FLOORS[pkg];
-  return floor ? `${pkg}@^${floor}` : pkg;
+  return floor ? `${pkg}@>=${floor}` : pkg;
 }
 
 /**
