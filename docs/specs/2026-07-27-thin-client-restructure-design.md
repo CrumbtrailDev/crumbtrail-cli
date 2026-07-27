@@ -1,7 +1,7 @@
 # Thin Capture Client: Stop Shipping the Analysis Engine to Customers
 
 Date: 2026-07-27
-Status: Approved; step 3 implemented (`80de3c5`), blocked on a cloud-side decision
+Status: Approved; steps 3 and 3a implemented (this PR + crumbtrail#123)
 Packages: `crumbtrail-node`, `crumbtrail-core`, `crumbtrail` (CLI), `crumbtrail-detect-core`,
 and `crumbtrail/packages/{cloud,artifact-edge,artifact-protocol,capture-policy}`
 
@@ -151,8 +151,8 @@ Each step is independently shippable and independently revertible.
    `solveContext` / `resolveCapsule` / `searchSpecs` MCP tools. 20,351 lines removed;
    `crumbtrail-node` 46,698 → 37,573 LOC. Blocked on step 3a below before it can ship.
 
-3a. **Unbreak the cloud** — see the blocking question below. Must land before the
-   `crumbtrail-node` bump.
+3a. **Absorb the adapters into the cloud** — ✅ **done** (crumbtrail#123). Must land
+   *with or after* the `crumbtrail-node` bump, not before.
 
 4. **Move interpretation to cloud** — relocate the ~17k LOC. Cloud already imports
    `postProcess`; invert so cloud owns the code and node no longer exports it.
@@ -171,50 +171,25 @@ only. This makes the ~5,900 LOC of client-side MCP plumbing a removal candidate.
 
 **Package renames** — acceptable; there are no installs to migrate.
 
-## Open question — blocking, needs a decision
+## Resolved: the cloud absorbs the adapters
 
-**The cloud does not compile against the new `crumbtrail-node`.** `packages/cloud` has 21
-import sites pulling exports that no longer exist:
+Decided: **move**, not delete. `evidence-sources/` and `ticket/` now live in
+`packages/cloud/src` (crumbtrail#123), recovered verbatim from `80de3c5`, along with the
+adapter phase itself as `adapter-phase.ts`. 21 import sites across 19 cloud files rewired.
 
-| Export | Cloud import sites |
-| --- | --- |
-| `CRUMBTRAIL_USER_AGENT` | 5 |
-| `EvidenceSource` | 5 |
-| `TicketError` | 4 |
-| `jiraToSymptom` | 2 |
-| `TicketComment` | 2 |
-| `JiraTicketClient` | 1 |
-| `buildAdvisoryComment` | 1 |
-| `evidenceSourcesFromEnv` | 1 |
+The seam changed shape rather than disappearing. `createServer`'s `evidenceSourcesFactory` is
+gone, so the cloud consumes its own factory: `forwardSolveContext` runs the fan-out after the
+inner server answers and folds adapter items in through the same single `assembleBundle` call.
+The envelope stays `{ bundle, match, sources }`, so the webhook and connector-status surfaces
+are untouched.
 
-Plus `packages/cloud/src/node-contract.ts`, which mirrors the now-empty
-`NODE_CONTRACT_CAPABILITIES`.
+**Ordering constraint (verified, not assumed):** crumbtrail#123 must land with or after the
+`crumbtrail-node` bump, never before. Against the published 0.16.0 the inner server still owns
+the adapter phase, and omitting the factory makes it fall back to `evidenceSourcesFromEnv()`
+(`locate-incident.ts:669`) — reviving the shared process environment the explicit empty array
+existed to prevent, and double-fanning alongside the cloud's own pass.
 
-Two ways out — and the cheap-looking one does not work:
-
-- **(a) Delete the cloud's connector machinery too.** Consistent with "MCPs get that data."
-  But this is a real, server-side hosted feature, not a stub: `evidence-source-factory.ts`
-  builds per-tenant sources from sealed credentials, `cloudwatch-role.ts` does STS role
-  assumption, and `main.ts:710` wires them into the inner `/api/solve-context` through the
-  `evidenceSourcesFactory` seam this change removed. `connector-routes.ts` is 68.8K and
-  `connector-catalog-routes.ts` 29.7K. Deleting all of that is a much larger change than the
-  client-side removal, on a production-deployed service.
-- **(b) Move `evidence-sources/` and `ticket/` into `packages/cloud` instead of deleting
-  them.** ~7,400 LOC changes repository rather than disappearing.
-
-**Vendoring "just the small utilities" is not an option.** It looked like one — most of the
-21 sites want `CRUMBTRAIL_USER_AGENT`, `TicketError`, or `jiraToSymptom`, all small — but
-`evidenceSourcesFromEnv` and `EvidenceSource` pull in the provider registry and every adapter
-implementation behind it. The cloud needs the whole directory or none of it.
-
-**Recommend (b).** It fully satisfies the actual goal: the code leaves the customer's
-`node_modules`, which is what was driving client releases, while the hosted connector feature
-keeps working and can be redeployed continuously like everything else server-side. Choosing
-(a) is then a separate product decision about whether to offer connectors at all — worth
-making on its own merits, not as a side effect of shrinking the SDK.
-
-Note this makes the client-side deletion in `80de3c5` a *move* for those two directories:
-recover them from that commit rather than rewriting them.
+Cloud: 2,891 tests pass against a locally linked build of the new `crumbtrail-node`.
 
 ## The honest tension
 
