@@ -489,14 +489,6 @@ describe("MCP remote read store", () => {
     for (const [name, arguments_] of [
       ["getFrame", { sessionId: SESSION_ID, timestamp: 1_000 }],
       ["getFrameById", { sessionId: SESSION_ID, filename: "frame-1000.jpg" }],
-      [
-        "solveContext",
-        {
-          symptom: { title: "remote comparison" },
-          baselineSession: SESSION_ID,
-          currentSession: SESSION_ID,
-        },
-      ],
     ] as const) {
       const response = await server.handleMessage({
         jsonrpc: "2.0",

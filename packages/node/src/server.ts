@@ -6,7 +6,6 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { BugEvent, Symptom } from "crumbtrail-core";
 import { buildRecallStore } from "./recall";
 import { locateAndAssemble } from "./locate-incident";
-import type { EvidenceSource } from "./evidence-sources/registry";
 import { SessionManager } from "./session";
 import type { SessionManagerConfig } from "./session";
 import { BugQueueManager } from "./bug-queue";
@@ -97,17 +96,6 @@ export interface ServerConfig {
     sessionId: string,
     info: { refinalized: boolean },
   ) => void;
-  /**
-   * Per-tenant seam for the inner /api/solve-context adapter phase. Hosted
-   * cloud uses it to inject exactly one tenant's sealed credential sources.
-   * Returning an array, including [], bypasses evidenceSourcesFromEnv(). Returning
-   * undefined explicitly requests the legacy environment fallback. This makes
-   * fallback an affirmative operator decision instead of an accidental omission.
-   */
-  evidenceSourcesFactory?: (ctx: {
-    tenantId?: string;
-    projectId?: string;
-  }) => EvidenceSource[] | undefined | Promise<EvidenceSource[] | undefined>;
 }
 
 export const DEFAULT_MAX_JSON_BODY_BYTES = 1_048_576;
@@ -1780,27 +1768,12 @@ export function createServer(config: ServerConfig): http.Server {
         if (typeof rawOptions.projectId === "string") {
           opts.projectId = rawOptions.projectId;
         }
-        const factorySources = config.evidenceSourcesFactory
-          ? await config.evidenceSourcesFactory({
-              tenantId: opts.tenantId,
-              projectId: opts.projectId,
-            })
-          : undefined;
-        const { bundle, match, sources } = await locateAndAssemble(
+        const { bundle, match } = await locateAndAssemble(
           symptom,
           buildRecallStore(config.outputDir),
-          {
-            ...opts,
-            // An array, including [], owns source construction and blocks the
-            // environment fallback. Undefined is the explicit legacy opt in.
-            ...(factorySources === undefined
-              ? {}
-              : { sources: factorySources }),
-          },
+          opts,
         );
-        // `sources` is the per-source health summary (provider + ok + sanitized
-        // error) the cloud webhook records as connector success/failure. Advisory.
-        json(res, 200, { bundle, match, sources });
+        json(res, 200, { bundle, match });
         return;
       }
 
