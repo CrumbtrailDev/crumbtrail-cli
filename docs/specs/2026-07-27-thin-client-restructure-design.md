@@ -1,7 +1,7 @@
 # Thin Capture Client: Stop Shipping the Analysis Engine to Customers
 
 Date: 2026-07-27
-Status: Design for review — **not approved, not implemented**
+Status: Approved; step 3 implemented (`80de3c5`), blocked on a cloud-side decision
 Packages: `crumbtrail-node`, `crumbtrail-core`, `crumbtrail` (CLI), `crumbtrail-detect-core`,
 and `crumbtrail/packages/{cloud,artifact-edge,artifact-protocol,capture-policy}`
 
@@ -105,7 +105,7 @@ that import must be updated in the same change.
 Three things force a client release today; all three are removed:
 
 1. **Analysis heuristics** → server-side, deploy continuously. This is what PR #33 was.
-2. **Vendor API drift** → deleted from the client entirely (pending the decision below).
+2. **Vendor API drift** → ✅ deleted from the client entirely (`80de3c5`).
 3. **Redaction/capture rules** → already server-side at the edge. `core/src/redaction.ts`
    is 1,998 LOC substantially duplicating `crumbtrail-capture-policy`.
 
@@ -114,54 +114,94 @@ What remains as a release trigger is the **wire contract**, and
 envelope version N and N−1 at minimum; clients ship only when the envelope shape changes.
 That is a couple of releases a year rather than a couple a month.
 
-## The genuinely new work
+## Correction: the hosted transport already exists
 
-The clients do not speak the hosted protocol. `core/src/transports/http.ts` POSTs
-`/api/events`, `/api/blob/:name`, `/api/session/start`, `/api/bug/flag` to a **local**
-server. `artifact-edge` exposes `/v2/ingest/*` with grant auth. And
-`crumbtrail-artifact-protocol` is **not a dependency of any package in this repo** (verified:
-no match in `packages/*/package.json`).
+**This section previously claimed clients could not talk to the hosted service and that a new
+`HostedTransport` was the critical path. That was wrong.** Re-verified against the cloud repo:
 
-So the critical path is a hosted transport in `crumbtrail-core` that acquires a grant and
-speaks v2. The edge side is already built and tested; this is the client half only.
+- `packages/cloud/src/routes/ingest-routes.ts` accepts exactly the SDK's existing paths —
+  `/api/session/start`, `/api/events`, `/api/session/end`, `/api/bug/flag`, `/api/blob/*`,
+  `/v1/traces`, `/v1/logs` (`INGEST_PATHS`, line 70).
+- It authenticates them with a project API key read from the `X-Crumbtrail-Auth` header
+  (`requireApiKey`), which `HttpTransport` already sends.
+- The CLI already points clients at the hosted service by default:
+  `DEFAULT_ENDPOINT = "https://api.crumbtrail.ai"` (`packages/cli/src/net.ts:14`).
+
+`/v2/ingest/*` with grant auth is an **internal** protocol between the cloud and
+`artifact-edge`, not a client-facing one. `crumbtrail-artifact-protocol` is correctly absent
+from this repo's dependencies, and should stay absent.
+
+So there is no client transport work. Point the SDK at the hosted endpoint with an API key and
+it works today — which means the release-frequency problem was never about the wire, only
+about what code rides along in the customer's `node_modules`.
+
+The envelope-compatibility rule still matters, but it applies to the `/api/*` JSON shapes the
+cloud already accepts, not to a v2 envelope the client never sends.
 
 ## Sequencing
 
 Each step is independently shippable and independently revertible.
 
-1. **Hosted transport in `core`** — new `HostedTransport` alongside `HttpTransport`, grant
-   acquisition, v2 envelopes. Additive; nothing is removed. Unblocks everything else.
-2. **Envelope compatibility rule** — server accepts N and N−1; add a contract test asserting
-   it. This is what makes later client versions optional rather than mandatory.
-3. **Move interpretation to cloud** — relocate the ~17k LOC. Cloud already imports
+1. ~~Hosted transport in `core`~~ — **not needed**; see the correction above.
+2. **Compatibility rule for the `/api/*` ingest shapes** — pin that the cloud accepts the
+   current event/session payloads and the previous shape, with a contract test. This is what
+   makes a later client version optional rather than mandatory.
+3. **Delete vendor integrations** — ✅ **done** (commit `80de3c5`). `evidence-sources/`,
+   `knowledge/`, `ticket/`, the ticket→capsule chain, the `capsule` CLI command, and the
+   `solveContext` / `resolveCapsule` / `searchSpecs` MCP tools. 20,351 lines removed;
+   `crumbtrail-node` 46,698 → 37,573 LOC. Blocked on step 3a below before it can ship.
+
+3a. **Unbreak the cloud** — see the blocking question below. Must land before the
+   `crumbtrail-node` bump.
+
+4. **Move interpretation to cloud** — relocate the ~17k LOC. Cloud already imports
    `postProcess`; invert so cloud owns the code and node no longer exports it.
-4. **Delete vendor integrations** — 7,392 LOC (see open question below).
+
 5. **Consolidate adapters** — `react`/`tauri` into `core` subpaths; `detect-core`/
    `install-shared` into the CLI. Cosmetic by comparison; do it last, when it is only
    packaging.
 
-Steps 1 and 2 deliver most of the benefit. Steps 3–5 are cleanup that the first two make safe.
+## Resolved questions
 
-## Open questions — blocking, need a decision
+**Deleting `knowledge/`** — confirmed: no users yet, so losing the shipped `searchSpecs`
+capability is acceptable. Done in `80de3c5`.
 
-**1. Deleting `knowledge/` conflicts with recent deliberate work.**
-The call was "don't worry about integrations, MCPs will get that data." Taken literally that
-deletes `evidence-sources/` (7 vendors), `ticket/`, and `knowledge/`. But `knowledge/confluence.ts`
-(39.3K) is the Confluence spec oracle, which has its own approved design
-(`docs/specs/2026-07-19-confluence-spec-oracle-design.md`), a `deep-build/confluence-spec-oracle`
-branch, and a **live `searchSpecs` tool exposed on the Crumbtrail MCP server**. Deleting it
-would remove a shipped, externally-visible capability. Recommend: delete `evidence-sources/`
-and `ticket/`, **keep `knowledge/`** until explicitly confirmed — or move it to cloud rather
-than dropping it.
+**MCP server: local or hosted** — hosted. Anything running locally is for our own testing
+only. This makes the ~5,900 LOC of client-side MCP plumbing a removal candidate.
 
-**2. Does the MCP server stay local or become hosted?**
-The transcript recorded "remote-first, nothing second," which implies hosted. That removes
-~5,900 LOC of plumbing from the client but changes how agents connect. Not yet decided.
+**Package renames** — acceptable; there are no installs to migrate.
 
-**3. Package renames are breaking for existing installs.**
-Folding `detect-core` and `install-shared` into `crumbtrail` deprecates two published names.
-Existing installs need a migration path or a final deprecating release — which is itself a
-forced client update, cutting against the goal. Sequencing step 5 last limits the damage.
+## Open question — blocking, needs a decision
+
+**The cloud does not compile against the new `crumbtrail-node`.** `packages/cloud` has 21
+import sites pulling exports that no longer exist:
+
+| Export | Cloud import sites |
+| --- | --- |
+| `CRUMBTRAIL_USER_AGENT` | 5 |
+| `EvidenceSource` | 5 |
+| `TicketError` | 4 |
+| `jiraToSymptom` | 2 |
+| `TicketComment` | 2 |
+| `JiraTicketClient` | 1 |
+| `buildAdvisoryComment` | 1 |
+| `evidenceSourcesFromEnv` | 1 |
+
+Plus `packages/cloud/src/node-contract.ts`, which mirrors the now-empty
+`NODE_CONTRACT_CAPABILITIES`.
+
+Two ways out:
+
+- **(a) Delete the cloud's connector machinery too.** Consistent with "MCPs get that data."
+  But `connector-routes.ts` is 68.8K and `connector-catalog-routes.ts` 29.7K, this is a
+  production-deployed service, and it is a much larger change than the client-side removal.
+- **(b) Cloud vendors what it still needs.** `CRUMBTRAIL_USER_AGENT` is a one-line constant
+  and `jiraToSymptom` / `TicketError` / `TicketComment` are small. Cheapest unblock; leaves
+  the cloud's connector story intact and defers (a).
+
+Recommend **(b)** to unblock the `crumbtrail-node` bump, then decide (a) on its own merits —
+the client-side goal is already met either way, because that code is out of the customer's
+`node_modules` regardless of whether the cloud keeps its own copy.
 
 ## The honest tension
 
