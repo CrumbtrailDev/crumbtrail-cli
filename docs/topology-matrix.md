@@ -4,7 +4,7 @@
 
 This matrix is produced by deterministic CI scenarios that use the public Crumbtrail instrumentation helpers.
 
-Node package version: 0.16.0.
+Node package version: 0.16.1.
 Run: local.
 Revision: local.
 Generation timestamp: 2026-07-26T19:18:32.062Z.
