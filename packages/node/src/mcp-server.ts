@@ -25,8 +25,6 @@ import {
 import { compareSessions } from "./compare";
 import { buildRegressionContext } from "./compare/regression-context";
 import { type Symptom, type GitHostClient } from "crumbtrail-core";
-import type { TicketConnector } from "./ticket/clients";
-import type { TicketProvider } from "./ticket/normalize";
 import {
   buildDistinctBugSignature,
   computeDistinctBugSignatures,
@@ -52,22 +50,6 @@ import {
   type LocalIssueProfile,
   type RecallStore,
 } from "./recall";
-import { resolveTicketToCapsule } from "./capsule-resolve";
-import { resolveTicketToBundle } from "./ticket-resolve";
-import {
-  evidenceSourcesFromEnv,
-  type EvidenceSource,
-} from "./evidence-sources";
-import {
-  confluenceClientFromEnv,
-  DEFAULT_SPEC_LIMIT,
-  MAX_SPEC_LIMIT,
-  notConfiguredKnowledgeResult,
-  systemClock,
-  unexpectedFailureKnowledgeResult,
-  unusableInputKnowledgeResult,
-  type ConfluenceKnowledgeClient,
-} from "./knowledge";
 import {
   FEEDBACK_SIGNALS,
   FEEDBACK_SUBJECT_KINDS,
@@ -115,25 +97,6 @@ export interface McpServerConfig {
     owner: string;
     repo: string;
   }) => GitHostClient;
-  /**
-   * Test-only seam: overrides how the ticket connector is constructed for
-   * `solveContext`'s `ticket` input. Production code leaves this unset and
-   * builds a connector from the documented provider env vars.
-   */
-  ticketConnectorFactory?: (provider: TicketProvider) => TicketConnector;
-  /**
-   * Test-only seam: overrides how the client's evidence sources are constructed
-   * for `solveContext`'s adapter phase (sessionless Mode A + blended). Production
-   * code leaves this unset and builds them from env via evidenceSourcesFromEnv().
-   */
-  evidenceSourcesFactory?: () => EvidenceSource[];
-  /**
-   * Test-only seam: overrides how the Confluence spec-oracle client is
-   * constructed for `searchSpecs`. Production code leaves this unset and builds
-   * from env via `confluenceClientFromEnv()`, which returns `undefined` when the
-   * host is not configured — that is a gap-bearing result, not an MCP error.
-   */
-  knowledgeClientFactory?: () => ConfluenceKnowledgeClient | undefined;
 }
 
 /**
@@ -462,135 +425,7 @@ const TOOLS = [
     },
   },
   /** @stability stable */
-  {
-    name: "solveContext",
-    description:
-      "Fuse a described symptom with locally recorded evidence into a fusion.v1 RankedBundle — the complete, neutral evidence (ranked by relevance) plus a structurally-separate advisory opinion of ranked hypotheses and any evidence gaps. Never a boolean verdict. Pass baselineSession + currentSession to gather evidence via compareSessions; omit both to get an evidence-free bundle describing gaps.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        symptom: {
-          type: "object",
-          properties: {
-            title: { type: "string" },
-            description: { type: "string" },
-            release: { type: "string" },
-            url: { type: "string" },
-            user: { type: "string" },
-            errorSig: { type: "string" },
-          },
-          required: ["title"],
-        },
-        ticket: {
-          description:
-            "Optional ticket reference. Either a pasted ticket URL (Jira *.atlassian.net /browse/KEY or /rest/api/N/issue/idOrKey; Zendesk *.zendesk.com; Trello card) OR an explicit { provider, ticketKey } (`id` is a deprecated alias for ticketKey). When a cloud deployment is configured (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_API_KEY) a pre-assembled bundle stored for that ticket is returned directly; otherwise the ticket is fetched + normalized into a symptom via env credentials only (JIRA_*/ZENDESK_*/TRELLO_*, never a tool arg). The pasted URL's origin is never fetched. Passed symptom values win when both are present; an unrecognized URL is an honest miss, never an error.",
-          anyOf: [
-            { type: "string" },
-            {
-              type: "object",
-              properties: {
-                provider: {
-                  type: "string",
-                  enum: ["jira", "zendesk", "trello"],
-                },
-                ticketKey: {
-                  type: "string",
-                  description: "Ticket key/id in the provider's format",
-                },
-                id: {
-                  type: "string",
-                  description: "Deprecated alias for ticketKey",
-                },
-              },
-              required: ["provider"],
-            },
-          ],
-        },
-        baselineSession: { type: "string" },
-        currentSession: { type: "string" },
-        gitHost: {
-          type: "object",
-          description:
-            "Optional git-host range for intent-inference. Requires CRUMBTRAIL_GITHUB_TOKEN env var (never accepted as a tool arg); when absent, intent-inference is skipped.",
-          properties: {
-            owner: { type: "string" },
-            repo: { type: "string" },
-            baseRef: { type: "string" },
-            headRef: { type: "string" },
-          },
-          required: ["owner", "repo", "baseRef", "headRef"],
-        },
-        maxTokens: { ...MAX_TOKENS_SCHEMA },
-      },
-    },
-  },
   /** @stability experimental */
-  {
-    name: "resolveCapsule",
-    description:
-      "Resolve a ticket or a described symptom to the capsule.v2 issue-resolution envelope: identity, symptom, occurrences, evidence, join graph, quality report, advisory opinion, memory, resolution, and agent directions. Runs the SAME ticket resolution pipeline as solveContext (cloud pull when configured, else ticket fetch and normalization, session comparison or auto location, evidence source adapters, and git host intent inference), then frames its fusion.v1 RankedBundle as part 4, referenced verbatim and never re-ranked. Pass ticket, symptom, or both; passed symptom values win over fetched ticket fields. Still advisory, never a boolean verdict: a thin match returns a deliverable capsule that states its own limits with an explicit inconclusive advisory. Completeness is scored only against a configured evidence profile, so it is reported as not scored when none exists.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        symptom: {
-          type: "object",
-          properties: {
-            title: { type: "string" },
-            description: { type: "string" },
-            release: { type: "string" },
-            url: { type: "string" },
-            user: { type: "string" },
-            errorSig: {
-              type: "string",
-              description:
-                "Known error signature. Used as the capsule signature when present; otherwise a deterministic signature is derived from the symptom text.",
-            },
-            source: { type: "string" },
-          },
-          required: ["title"],
-        },
-        ticket: {
-          description:
-            "Optional ticket reference, in the SAME shape solveContext accepts: either a pasted ticket URL (Jira *.atlassian.net /browse/KEY or /rest/api/N/issue/idOrKey; Zendesk *.zendesk.com; Trello card) OR an explicit { provider, ticketKey } (`id` is a deprecated alias for ticketKey). Resolved through the identical pipeline, and recorded on the capsule as an external ref. Credentials come from env only (JIRA_*/ZENDESK_*/TRELLO_*), never a tool arg; an unrecognized URL is an honest miss, never an error.",
-          anyOf: [
-            { type: "string" },
-            {
-              type: "object",
-              properties: {
-                provider: {
-                  type: "string",
-                  enum: ["jira", "zendesk", "trello"],
-                },
-                ticketKey: {
-                  type: "string",
-                  description: "Ticket key/id in the provider's format",
-                },
-                id: {
-                  type: "string",
-                  description: "Deprecated alias for ticketKey",
-                },
-              },
-              required: ["provider"],
-            },
-          ],
-        },
-        baselineSession: { type: "string" },
-        currentSession: { type: "string" },
-        gitHost: {
-          type: "object",
-          description:
-            "Optional git-host range for intent-inference. Requires CRUMBTRAIL_GITHUB_TOKEN env var (never accepted as a tool arg); when absent, intent-inference is skipped.",
-          properties: {
-            owner: { type: "string" },
-            repo: { type: "string" },
-            baseRef: { type: "string" },
-            headRef: { type: "string" },
-          },
-          required: ["owner", "repo", "baseRef", "headRef"],
-        },
-      },
-    },
-  },
   /** @stability stable */
   {
     name: "listDistinctBugs",
@@ -672,32 +507,6 @@ const TOOLS = [
     },
   },
   /** @stability experimental */
-  {
-    name: "searchSpecs",
-    description:
-      "ADVISORY ONLY — returns documentation pages written by people, not observed behavior and not evidence. A page can be stale: written before the code changed, or describing an intent later abandoned. Searches the operator's allowlisted Confluence spaces for what the system was supposed to do. Each excerpt carries a deep link, lastModified, lastModifiedBy, and ageDays (days since the last edit) — weigh ageDays before relying on it. Use a result to annotate a finding, never to close or dismiss one: a page calling a behavior intended is not proof the current behavior is correct, and finding no page is not proof of a bug. Never errors: unconfigured, unreachable, and no-match all return gaps.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        query: {
-          type: "string",
-          description:
-            "Free-text description of the behavior in question. Keyword-matched against page text, so use the distinctive domain terms rather than a full sentence.",
-        },
-        spaceKeys: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Optional Confluence space keys to restrict the search to. This can only NARROW the operator's CONFLUENCE_SPACE_KEYS allowlist, never widen it; keys outside the allowlist are not searched and are reported as a gap.",
-        },
-        limit: {
-          type: "number",
-          description: `Max page excerpts to return (default ${DEFAULT_SPEC_LIMIT}, max ${MAX_SPEC_LIMIT}). Clamped server-side.`,
-        },
-      },
-      required: ["query"],
-    },
-  },
   // Signature resolve / locate surface (act-by-identity, phase 1: resolve-only).
   /** @stability stable */
   {
@@ -1162,10 +971,7 @@ export class McpServer {
   private outputDir: string;
   private store: McpReadStore;
   private bugQueue: BugQueueManager;
-  private knowledgeClientFactory?: McpServerConfig["knowledgeClientFactory"];
   private gitHostClientFactory?: McpServerConfig["gitHostClientFactory"];
-  private ticketConnectorFactory?: McpServerConfig["ticketConnectorFactory"];
-  private evidenceSourcesFactory?: McpServerConfig["evidenceSourcesFactory"];
 
   constructor(config: McpServerConfig) {
     this.outputDir = config.outputDir;
@@ -1173,18 +979,8 @@ export class McpServer {
     const bugsDir = path.join(path.dirname(this.outputDir), "bugs");
     this.bugQueue = new BugQueueManager({ bugsDir, readOnly: true });
     this.gitHostClientFactory = config.gitHostClientFactory;
-    this.ticketConnectorFactory = config.ticketConnectorFactory;
-    this.evidenceSourcesFactory = config.evidenceSourcesFactory;
-    this.knowledgeClientFactory = config.knowledgeClientFactory;
   }
 
-  /** Evidence sources for solveContext's adapter phase — injected in tests,
-   *  built from env in production. */
-  private evidenceSources(): EvidenceSource[] {
-    return this.evidenceSourcesFactory
-      ? this.evidenceSourcesFactory()
-      : evidenceSourcesFromEnv();
-  }
 
   start(): void {
     const rl = readline.createInterface({ input: process.stdin });
@@ -1293,10 +1089,6 @@ export class McpServer {
         return this.toolGetLatestIssue(args);
       case "getRegressionContext":
         return this.toolGetRegressionContext(args);
-      case "solveContext":
-        return this.toolSolveContext(args);
-      case "resolveCapsule":
-        return this.toolResolveCapsule(args);
       case "listDistinctBugs":
         return this.toolListDistinctBugs(args);
       case "getRecurrence":
@@ -1311,8 +1103,6 @@ export class McpServer {
         return this.toolRecordFeedback(args);
       case "getPlaybook":
         return this.toolGetPlaybook(args);
-      case "searchSpecs":
-        return this.toolSearchSpecs(args);
       case "resolveSignature":
         return this.toolResolveSignature(args);
       case "locateInteractiveElements":
@@ -2217,116 +2007,8 @@ export class McpServer {
     return textResult(await buildRegressionContext(comparison, bDir));
   }
 
-  /**
-   * Deps for the shared ticket → bundle producer ({@link resolveTicketToBundle}).
-   * `localSessions` is present ONLY for a filesystem read store, which is what
-   * gates the explicit-comparison and auto-locate paths on local disk.
-   */
-  private ticketResolutionDeps(
-    surface: string,
-  ): Parameters<typeof resolveTicketToBundle>[1] {
-    return {
-      recallStore: this.recallStore(),
-      evidenceSources: this.evidenceSources(),
-      ...(this.store instanceof FilesystemMcpReadStore
-        ? {
-            localSessions: {
-              resolveSessionDir: (sessionId: string) =>
-                this.sessionDirAsync(sessionId),
-              sessionExists: (dir: string) => this.sessionExistsAsync(dir),
-            },
-          }
-        : {}),
-      ...(this.ticketConnectorFactory
-        ? { ticketConnectorFactory: this.ticketConnectorFactory }
-        : {}),
-      ...(this.gitHostClientFactory
-        ? { gitHostClientFactory: this.gitHostClientFactory }
-        : {}),
-      surface,
-    };
-  }
 
-  /**
-   * `solveContext` — fuse a ticket/symptom with recorded evidence into a
-   * fusion.v1 RankedBundle.
-   *
-   * The ticket-driven pipeline itself lives in the shared
-   * {@link resolveTicketToBundle} producer (moved out of this method verbatim,
-   * so the emitted payload is unchanged); this method owns only the response
-   * shaping: the optional token budget and the MCP result envelope. The capsule
-   * surfaces reuse the same producer, so a ticket resolves identically no matter
-   * which surface asks.
-   */
-  private async toolSolveContext(args: Record<string, unknown>) {
-    const budget = this.maxTokensOf(args);
-    if ("error" in budget) return errorResult(budget.error);
 
-    const resolved = await resolveTicketToBundle(
-      args,
-      this.ticketResolutionDeps("solveContext"),
-    );
-    if (resolved.kind === "error") return errorResult(resolved.message);
-
-    if (resolved.kind === "pulled") {
-      // Unbudgeted: return the stored bundle verbatim, byte-identical to
-      // before. With maxTokens set, the pulled bundle honors the same
-      // budgeting contract as a locally assembled one (evidence is the
-      // relevance-ranked array in a stored fusion.v1 RankedBundle).
-      const pulled = resolved.bundle;
-      if (budget.maxTokens === undefined) return textResult(pulled);
-      if (!Array.isArray(pulled.evidence)) {
-        return textResult(attachTokenEstimate(pulled));
-      }
-      return this.budgetedTextResult(
-        pulled,
-        [
-          budgetPlane("evidence", pulled.evidence, (item) =>
-            isRecord(item) && typeof item.id === "string" ? item.id : "unknown",
-          ),
-        ],
-        budget.maxTokens,
-      );
-    }
-
-    const bundle = resolved.bundle;
-    if (budget.maxTokens === undefined) return textResult(bundle);
-    // Budgeted: fill the relevance-ranked evidence in rank order; refs are
-    // EvidenceItem.id values (the same ids opinion.hypotheses reference).
-    return this.budgetedTextResult(
-      bundle as unknown as Record<string, unknown>,
-      [budgetPlane("evidence", bundle.evidence, (item) => item.id)],
-      budget.maxTokens,
-    );
-  }
-
-  /**
-   * `resolveCapsule` — resolve a TICKET or a described symptom to the additive
-   * capsule.v2 envelope.
-   *
-   * Delegates to the shared {@link resolveTicketToCapsule} helper, which runs the
-   * SAME ticket → bundle producer `solveContext` runs and then the package's
-   * single capsule compile site. The CLI `capsule` command calls that same
-   * helper, so the two surfaces are at parity for both input shapes and neither
-   * re-implements the pipeline or the compile. `solveContext` is untouched: this
-   * is a separate tool, so every existing fusion.v1 output stays byte-identical.
-   */
-  private async toolResolveCapsule(args: Record<string, unknown>) {
-    const passedSymptom: Partial<Symptom> | undefined = isRecord(args.symptom)
-      ? (args.symptom as unknown as Partial<Symptom>)
-      : undefined;
-    const title = stringField(passedSymptom?.title);
-    if (!title && args.ticket === undefined) {
-      return errorResult("resolveCapsule requires symptom.title or ticket");
-    }
-
-    const resolved = await resolveTicketToCapsule(
-      args,
-      this.ticketResolutionDeps("resolveCapsule"),
-    );
-    if (resolved.kind === "error") return errorResult(resolved.message);
-    return textResult(resolved.capsule);
-  }
 
   // --- Distinct within-session bug grouping ---
 
@@ -2685,89 +2367,7 @@ export class McpServer {
     return textResult({ ...result.data, source: "cloud" });
   }
 
-  /**
-   * The Confluence spec oracle (`knowledge.v1`) — injected in tests, built from
-   * env in production. `undefined` means "this host has no Confluence
-   * credentials", which is a reportable gap, not a failure.
-   */
-  private knowledgeClient(): ConfluenceKnowledgeClient | undefined {
-    try {
-      return this.knowledgeClientFactory
-        ? this.knowledgeClientFactory()
-        : confluenceClientFromEnv();
-    } catch {
-      // A throwing factory is indistinguishable, from the caller's side, from a
-      // host that cannot produce a client — and "cannot produce a client" is
-      // already a gap, not an error. Without this, an injected factory (or any
-      // future construction-time validation in confluenceClientFromEnv) turns
-      // into `isError: true` carrying a raw JS message.
-      return undefined;
-    }
-  }
 
-  /**
-   * `searchSpecs` dispatch. Two rules govern this method:
-   *
-   * 1. **It never returns `isError`.** An unconfigured host, an unreachable
-   *    provider, and zero matches are all answers, and "no documented intent was
-   *    found" is a useful one. `notConfiguredKnowledgeResult()` is the single
-   *    implementation of the first case (see `knowledge/confluence.ts`); this
-   *    method must not grow a second one. A missing `query` likewise falls
-   *    through to the client, which gaps with `empty-query`.
-   *
-   *    That rule is ENFORCED here, not merely inherited. `searchSpecs` is
-   *    documented as never rejecting, but this method used to rely on that
-   *    documentation with no `catch` — and the contract had holes (`{results:
-   *    [null]}`, a non-string `title`, a non-string `_links.base`, a row that
-   *    throws on property access), each of which surfaced as `isError: true`
-   *    carrying an unsanitized JS message. Those holes are fixed at the root in
-   *    `confluence.ts`; the guard below exists so the NEXT one degrades instead.
-   *    It deliberately does not interpolate the caught message: `errorGap`
-   *    refuses to reuse transport messages because they can echo the request
-   *    URL, and this layer has even less control over the shape.
-   * 2. **It does not police `spaceKeys`.** The operator allowlist is a ceiling
-   *    enforced in `ConfluenceKnowledgeClient.resolveSpaceKeys`, at the same
-   *    boundary that holds the credential, and denial is reported there as a
-   *    gap. Re-checking it here would either duplicate that invariant or, worse,
-   *    quietly diverge from it. All this does is drop non-string entries from
-   *    agent-supplied JSON so the narrowing logic sees a clean list.
-   */
-  private async toolSearchSpecs(args: Record<string, unknown>) {
-    const client = this.knowledgeClient();
-    if (!client) return textResult(notConfiguredKnowledgeResult());
-
-    // `query` absent is a different answer from `query` present with a type
-    // that cannot mean anything. Collapsing `42` / `null` / `{}` / `true` to ""
-    // reported "empty after sanitization", which tells an agent to rephrase —
-    // so it retries the identical malformed shape. The client's purpose-built
-    // unusable-input gap ("query must be text …") was unreachable from MCP.
-    if (args.query !== undefined && typeof args.query !== "string") {
-      return textResult(unusableInputKnowledgeResult());
-    }
-
-    const spaceKeys = Array.isArray(args.spaceKeys)
-      ? args.spaceKeys.filter((key): key is string => typeof key === "string")
-      : undefined;
-    // Clamped here as well as in the client: this is the untrusted boundary, and
-    // the schema advertises the bounds, so an agent that ignores them is
-    // corrected rather than obeyed. A non-numeric limit reads as "unspecified".
-    const requested = numberField(args.limit);
-    const limit =
-      requested === undefined
-        ? DEFAULT_SPEC_LIMIT
-        : Math.min(MAX_SPEC_LIMIT, Math.max(1, Math.trunc(requested)));
-
-    try {
-      return textResult(
-        await client.searchSpecs(
-          { query: stringField(args.query) ?? "", spaceKeys, limit },
-          systemClock,
-        ),
-      );
-    } catch {
-      return textResult(unexpectedFailureKnowledgeResult());
-    }
-  }
 
   /** Adapt this server's storage readers to the recall engine's injected seam.
    *  Delegates to the shared buildRecallStore so the MCP tool and the inner

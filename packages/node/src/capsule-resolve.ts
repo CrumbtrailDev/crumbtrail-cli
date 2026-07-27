@@ -6,12 +6,6 @@ import {
   type ExternalRef,
   type RankedBundle,
 } from "crumbtrail-core";
-import {
-  isFusionBundleRecord,
-  resolveTicketToBundle,
-  type ResolvedTicketRef,
-  type TicketResolutionDeps,
-} from "./ticket-resolve";
 
 // --- capsule.v2 resolution (CRUMB-60) --------------------------------------
 //
@@ -128,105 +122,4 @@ export function compileCapsuleFromBundle(
   };
 
   return compileCapsuleV2(input);
-}
-
-// --- issue resolution (CRUMB-60) --------------------------------------------
-//
-// ONE resolution entry point for both capsule surfaces, taking the SAME input
-// `solveContext` takes: a ticket reference, a described symptom, or both. It
-// calls the SAME shared producer `solveContext` calls
-// ({@link resolveTicketToBundle}: cloud pull short-circuit, ticket fetch and
-// normalization, explicit baseline/current comparison, auto-locate and the
-// adapter phase, git-host intent inference), then the single compile site above.
-// No second pipeline, no re-ranking: the capsule is additive framing over
-// exactly the bundle `solveContext` would have returned for the same input.
-
-/** The result of resolving a ticket to a capsule. `error` carries a refusal the
- *  surface should report (for example an unusable stored bundle), never a
- *  half-built capsule. */
-export type ResolveTicketToCapsuleResult =
-  | { kind: "error"; message: string }
-  | {
-      kind: "capsule";
-      capsule: CapsuleV2;
-      bundle: RankedBundle;
-      /** Where the bundle came from: a configured cloud deployment's stored
-       *  bundle for this ticket, or local resolution. */
-      source: "cloud" | "local";
-      ticket?: ResolvedTicketRef;
-    };
-
-/** Link the resolved issue back to its ticket, unless the caller already
- *  supplied its own external refs. */
-function withTicketRef(
-  options: CompileCapsuleFromBundleOptions,
-  ticket: ResolvedTicketRef | undefined,
-): CompileCapsuleFromBundleOptions {
-  if (!ticket || options.identity?.externalRefs) return options;
-  return {
-    ...options,
-    identity: {
-      ...options.identity,
-      externalRefs: [
-        {
-          system: ticket.provider,
-          id: ticket.id,
-          ...(ticket.url ? { url: ticket.url } : {}),
-        },
-      ],
-    },
-  };
-}
-
-/**
- * Resolve a TICKET reference (the same `ticket`/`symptom`/`baselineSession`/
- * `currentSession`/`gitHost` input `solveContext` accepts) to a capsule.v2
- * envelope. Both the MCP `resolveCapsule` tool and the CLI `capsule` command
- * call this, so the surfaces are at parity by construction: identical input
- * yields an identical capsule, including its identity and signature.
- */
-export async function resolveTicketToCapsule(
-  args: Record<string, unknown>,
-  deps: TicketResolutionDeps,
-  capsuleOptions: CompileCapsuleFromBundleOptions = {},
-): Promise<ResolveTicketToCapsuleResult> {
-  const resolved = await resolveTicketToBundle(args, deps);
-  if (resolved.kind === "error") {
-    return { kind: "error", message: resolved.message };
-  }
-
-  if (resolved.kind === "pulled") {
-    // A stored bundle is reused verbatim, exactly as solveContext returns it.
-    // It is only usable as capsule part 4 when it really is a fusion.v1 bundle;
-    // anything else is reported honestly rather than coerced into a capsule.
-    if (!isFusionBundleRecord(resolved.bundle)) {
-      return {
-        kind: "error",
-        message:
-          "the bundle stored for this ticket is not a fusion.v1 RankedBundle, so it cannot be wrapped in a capsule; use solveContext to inspect the stored payload.",
-      };
-    }
-    const bundle = resolved.bundle as RankedBundle;
-    return {
-      kind: "capsule",
-      capsule: compileCapsuleFromBundle(
-        bundle,
-        withTicketRef(capsuleOptions, resolved.ticket),
-      ),
-      bundle,
-      source: "cloud",
-      ...(resolved.ticket ? { ticket: resolved.ticket } : {}),
-    };
-  }
-
-  return {
-    kind: "capsule",
-    capsule: compileCapsuleFromBundle(
-      resolved.bundle,
-      withTicketRef(capsuleOptions, resolved.ticket),
-    ),
-    bundle: resolved.bundle,
-    source: "local",
-    ...(resolved.ticket ? { ticket: resolved.ticket } : {}),
-  };
 }

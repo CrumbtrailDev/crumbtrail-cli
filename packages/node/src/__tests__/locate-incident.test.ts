@@ -224,7 +224,6 @@ describe("locateIncident — outcome", async () => {
 
     const assembled = await locateAndAssemble(strongSymptom, store, {
       now: 1_000,
-      sources: [],
     });
     expect(assembled.bundle.evidence).toEqual([]);
     expect(assembled.bundle.located).toMatchObject({
@@ -292,7 +291,7 @@ describe("locateIncident — outcome", async () => {
     const matchedAssembled = await locateAndAssemble(
       strongSymptom,
       matchedStore,
-      { now: 1_000, sources: [] },
+      { now: 1_000 },
     );
     expect(matchedAssembled.match).toStrictEqual(expectedMatchedMatch);
     expect(matchedAssembled.bundle.located).toStrictEqual({
@@ -337,7 +336,7 @@ describe("locateIncident — outcome", async () => {
     const inconclusiveAssembled = await locateAndAssemble(
       inconclusiveSymptom,
       inconclusiveStore,
-      { now: 1_000, sources: [] },
+      { now: 1_000 },
     );
     expect(inconclusiveAssembled.match).toStrictEqual(
       expectedInconclusiveMatch,

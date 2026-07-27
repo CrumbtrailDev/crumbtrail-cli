@@ -191,20 +191,10 @@ rewriting them, because once a session is cold those are the only surviving copy
 evidence. A rebuild can only recover what was captured: fields the capturing SDK never recorded
 stay missing.
 
-`capsule` takes a ticket reference or a symptom rather than a session id. With `--ticket` it
-fetches and normalizes the ticket through the documented provider env vars (`JIRA_*`,
-`ZENDESK_*`, `TRELLO_*`), then locates the matching recording, assembles the existing
-`fusion.v1` ranked bundle, and wraps that bundle verbatim in the ten part `capsule.v2`
-envelope. Pass a pasted ticket URL, or a ticket key together with `--provider`. It runs the
-same shared resolution pipeline as the `resolveCapsule` and `solveContext` MCP tools, so both
-surfaces return the same capsule for the same input. Completeness is scored only against a
-configured evidence profile, so it reports as not scored when none exists, and a thin match
-still returns a deliverable capsule that states its own gaps.
-
 ## MCP evidence retrieval
 
 `crumbtrail-server serve --mcp` runs the stdio MCP server against the sessions
-directory. Its more than thirty canonical tools are read only context retrieval
+directory. Its thirty-five canonical tools are read only context retrieval
 tools. They can retrieve captured artifacts and configured reference context,
 but cannot edit code, change bug state, run commands, drive a browser, or
 authorize an action.
@@ -225,17 +215,10 @@ current code and tests, and report uncertainty or evidence gaps.
 3. For a focused investigation, use `getSessionManifest` to identify a signal
    or time range, `getEvidence` to inspect one reference, and `getWindow` only
    for the required time window. `getWindow` is capped and reports truncation.
-4. Use `solveContext`, `recallSimilarIssues`, and `searchSpecs` as context for
-   a diagnosis, not as a verdict. Use `resolveCapsule` when you want the same
-   ranked bundle framed as the `capsule.v2` envelope: identity, symptom,
-   occurrences, evidence, join graph, quality report, advisory opinion, memory,
-   resolution, and agent directions. It accepts the same `ticket` input as
-   `solveContext` and runs the same resolution pipeline, so a ticket resolves
-   identically through either tool. It reuses the bundle rather than re-ranking
-   it, and stays advisory. `searchSpecs` returns advisory documentation,
-   which can be stale and is not observed behavior. On cloud deployments a
-   recall match can also carry an `outcomeSummary` and reasons such as
-   `resolution_verified` or `resolution_recurred`; prefer a verified resolution.
+4. Use `recallSimilarIssues` as context for a diagnosis, not as a verdict. On
+   cloud deployments a recall match can also carry an `outcomeSummary` and
+   reasons such as `resolution_verified` or `resolution_recurred`; prefer a
+   verified resolution.
 5. Close the learning loop (cloud only): after reusing recall matches to resolve
    an issue, call `resolveIssue` with its disposition and the `usedMemoryIds` you
    adopted so recall learns which past answers helped. Use `recordFeedback` to
