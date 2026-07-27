@@ -422,8 +422,8 @@ export function buildEvidenceCandidates(
       detector,
       title:
         failed.reason === "application_failure"
-          ? `Application failure in ${failed.m || req?.method || "request"} ${redactUrl(failed.url || req?.url || "")}`
-          : `HTTP ${failed.st ?? "error"} from ${failed.m || req?.method || "request"} ${redactUrl(failed.url || req?.url || "")}`,
+          ? `Application failure in ${failed.m || req?.method || "request"} ${titleUrl(failed.url || req?.url || "") ?? "unknown URL"}`
+          : `HTTP ${failed.st ?? "error"} from ${failed.m || req?.method || "request"} ${titleUrl(failed.url || req?.url || "") ?? "unknown URL"}`,
       severity:
         failed.reason === "application_failure" || (failed.st ?? 0) >= 500
           ? "high"
@@ -456,7 +456,7 @@ export function buildEvidenceCandidates(
     const requestId = requestIdForValue(entry);
     drafts.push({
       detector: "network_error",
-      title: `Network error from ${entry.method || entry.m || "request"} ${redactUrl(entry.url || "")}`,
+      title: `Network error from ${entry.method || entry.m || "request"} ${titleUrl(entry.url || "") ?? "unknown URL"}`,
       severity: "high",
       score: 86,
       confidence: "high",
@@ -871,7 +871,7 @@ function addRepeatedClickCandidates(
       }
       drafts.push({
         detector: "repeated_clicks",
-        title: `Repeated clicks on ${scrubText(label, 100)}`,
+        title: `Repeated clicks on ${titleElementLabel(first)}`,
         severity: "medium",
         score: 55 + Math.min(10, groupLength),
         confidence: "medium",
@@ -905,8 +905,13 @@ function addSlowRequestCandidates(
     const req = requestId ? requests.get(requestId) : undefined;
     drafts.push({
       detector: "slow_request",
-      title:
-        `Slow request ${req?.method ?? ""} ${redactUrl(req?.url ?? "")}`.trim(),
+      title: [
+        "Slow request",
+        req?.method,
+        titleUrl(req?.url ?? "") ?? "unknown URL",
+      ]
+        .filter(Boolean)
+        .join(" "),
       severity: dur >= 15_000 ? "high" : "medium",
       score: dur >= 15_000 ? 78 : 64,
       confidence: "high",
@@ -986,7 +991,7 @@ function addIneffectiveSubmitCandidates(
     if (hasActivity) continue;
     drafts.push({
       detector: "ineffective_submit",
-      title: `Submit-like click had no navigation or network activity: ${scrubText(label, 100)}`,
+      title: `Submit-like click had no navigation or network activity: ${titleElementLabel(event)}`,
       severity: "medium",
       score: 52,
       confidence: "medium",
@@ -3692,6 +3697,29 @@ function routeAt(
   return route;
 }
 
+/**
+ * A label safe to put in a headline. `scrubText` correctly masks token-like and
+ * regulated text, but a title of `**********` tells a reader nothing, so fall
+ * back to the element's structural identity (role, then component, then tag)
+ * and finally to a plain phrase. The unmasked-but-scrubbed label still lives on
+ * the anchor for anyone who needs it.
+ */
+function titleElementLabel(event: BugEvent): string {
+  const scrubbed = scrubText(elementLabel(event), 100);
+  // Usable only if something survives once every mask token is removed — the
+  // maskers emit both `[REDACTED]` and runs of `*`, and either can consume the
+  // whole label.
+  const unmasked = scrubbed?.replace(/\[REDACTED\]|[*•]/g, "").trim();
+  if (scrubbed && unmasked) return scrubbed;
+
+  const target = targetForEvent(event);
+  const structural =
+    safeText(target?.role, 60) ??
+    safeText(target?.componentName, 60) ??
+    safeText(target?.testID ?? target?.testId, 60);
+  return structural ? `a ${structural}` : "an unlabeled element";
+}
+
 function elementLabel(event: BugEvent): string | undefined {
   const d = event.d;
   const el = isRecord(d.el) ? d.el : undefined;
@@ -3882,6 +3910,23 @@ function redactUrl(value: unknown): string | undefined {
   const text = safeText(value, 2_000);
   if (!text) return undefined;
   return truncate(redactTokenLikeText(redactCoreUrl(text).value), 240);
+}
+
+/**
+ * URL shortened for use inside a human-readable title: origin plus path only.
+ * The query string is where redaction expands hardest (every value becomes an
+ * escaped `[REDACTED]`), which turns a title into a several-hundred-character
+ * line that reads as noise and breaks any layout showing it. The full redacted
+ * URL is still carried on the anchor, so nothing is lost from the evidence.
+ */
+function titleUrl(value: unknown): string | undefined {
+  const redacted = redactUrl(value);
+  if (!redacted) return undefined;
+  const withoutHash = redacted.split("#")[0] ?? redacted;
+  const withoutQuery = withoutHash.split("?")[0] ?? withoutHash;
+  const trimmed = withoutQuery.trim();
+  if (!trimmed) return undefined;
+  return truncate(trimmed, 120);
 }
 
 function redactUrlLikeText(value: string): string {
