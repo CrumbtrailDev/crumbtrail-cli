@@ -1146,8 +1146,10 @@ describe("installSdk — registry install is version pinned", () => {
       "install",
       ...["crumbtrail-core", "crumbtrail-node"].map(sdkInstallSpec),
     ]);
+    // `>=`, not `^`: a caret on a 0.x version also caps at the next minor, which
+    // would strand new installs on one minor line until the floor is bumped.
     for (const spec of calls[0].slice(1)) {
-      expect(spec).toMatch(/^crumbtrail-(core|node)@\^\d+\.\d+\.\d+$/);
+      expect(spec).toMatch(/^crumbtrail-(core|node)@>=\d+\.\d+\.\d+$/);
     }
     // The result reports bare package names (used for notes + tarball fallback).
     expect(result.packages).toEqual(["crumbtrail-core", "crumbtrail-node"]);

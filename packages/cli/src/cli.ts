@@ -340,9 +340,11 @@ export async function installSdk(
   // can never leave a freshly wired service on an old SDK. The tarball fallback
   // below keeps bare names (tarball URLs are resolved by name prefix).
   const specs = packages.map(sdkInstallSpec);
-  input.ui.out(
-    `Installing SDK: ${color.cyan(`${cmd} ${add} ${specs.join(" ")}`)}`,
-  );
+  // Specs carry a `>=` range. Spawning below is shell-free so the raw argv is
+  // correct, but the echoed line is something people copy into a shell, where
+  // an unquoted `>` would redirect stdout into a file. Quote it for display.
+  const shown = specs.map((spec) => `'${spec}'`).join(" ");
+  input.ui.out(`Installing SDK: ${color.cyan(`${cmd} ${add} ${shown}`)}`);
   const code = run(cmd, [add, ...specs], input.cwd);
   if (code === 0) {
     return { installed: true, packages };
