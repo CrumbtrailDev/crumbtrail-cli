@@ -190,18 +190,31 @@ import sites pulling exports that no longer exist:
 Plus `packages/cloud/src/node-contract.ts`, which mirrors the now-empty
 `NODE_CONTRACT_CAPABILITIES`.
 
-Two ways out:
+Two ways out — and the cheap-looking one does not work:
 
 - **(a) Delete the cloud's connector machinery too.** Consistent with "MCPs get that data."
-  But `connector-routes.ts` is 68.8K and `connector-catalog-routes.ts` 29.7K, this is a
-  production-deployed service, and it is a much larger change than the client-side removal.
-- **(b) Cloud vendors what it still needs.** `CRUMBTRAIL_USER_AGENT` is a one-line constant
-  and `jiraToSymptom` / `TicketError` / `TicketComment` are small. Cheapest unblock; leaves
-  the cloud's connector story intact and defers (a).
+  But this is a real, server-side hosted feature, not a stub: `evidence-source-factory.ts`
+  builds per-tenant sources from sealed credentials, `cloudwatch-role.ts` does STS role
+  assumption, and `main.ts:710` wires them into the inner `/api/solve-context` through the
+  `evidenceSourcesFactory` seam this change removed. `connector-routes.ts` is 68.8K and
+  `connector-catalog-routes.ts` 29.7K. Deleting all of that is a much larger change than the
+  client-side removal, on a production-deployed service.
+- **(b) Move `evidence-sources/` and `ticket/` into `packages/cloud` instead of deleting
+  them.** ~7,400 LOC changes repository rather than disappearing.
 
-Recommend **(b)** to unblock the `crumbtrail-node` bump, then decide (a) on its own merits —
-the client-side goal is already met either way, because that code is out of the customer's
-`node_modules` regardless of whether the cloud keeps its own copy.
+**Vendoring "just the small utilities" is not an option.** It looked like one — most of the
+21 sites want `CRUMBTRAIL_USER_AGENT`, `TicketError`, or `jiraToSymptom`, all small — but
+`evidenceSourcesFromEnv` and `EvidenceSource` pull in the provider registry and every adapter
+implementation behind it. The cloud needs the whole directory or none of it.
+
+**Recommend (b).** It fully satisfies the actual goal: the code leaves the customer's
+`node_modules`, which is what was driving client releases, while the hosted connector feature
+keeps working and can be redeployed continuously like everything else server-side. Choosing
+(a) is then a separate product decision about whether to offer connectors at all — worth
+making on its own merits, not as a side effect of shrinking the SDK.
+
+Note this makes the client-side deletion in `80de3c5` a *move* for those two directories:
+recover them from that commit rather than rewriting them.
 
 ## The honest tension
 
