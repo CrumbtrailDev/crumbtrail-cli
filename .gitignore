@@ -111,3 +111,6 @@ scripts/.out/
 # Local agent memory (memsearch) — never committed, matches the main repo.
 .memsearch/
 .cursor/
+
+# Local dev harness process logs
+.harness-logs/
