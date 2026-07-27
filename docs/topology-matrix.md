@@ -7,7 +7,7 @@ This matrix is produced by deterministic CI scenarios that use the public Crumbt
 Node package version: 0.16.1.
 Run: local.
 Revision: local.
-Generation timestamp: 2026-07-26T19:18:32.062Z.
+Generation timestamp: 2026-07-27T16:18:04.556Z.
 
 | Cell | Driver or ORM | Process shape | Edge | Transaction pattern | Capture mode | Expected | Achieved |
 | --- | --- | --- | --- | --- | --- | --- | --- |
