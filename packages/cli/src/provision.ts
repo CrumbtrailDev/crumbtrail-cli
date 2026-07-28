@@ -102,7 +102,7 @@ export async function createProject(
       const copy =
         typeof body.error === "string"
           ? body.error
-          : "The free tier includes one project. Upgrade to add more.";
+          : "Your plan's project limit was reached. Upgrade to add more.";
       const url =
         typeof body.upgradeUrl === "string"
           ? body.upgradeUrl
