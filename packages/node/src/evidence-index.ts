@@ -620,6 +620,7 @@ export function buildEvidenceCandidates(
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
   addBatchImportCandidates(events, index, drafts, exchanges);
   addRelationalWriteIntegrityCandidates(events, index, drafts, exchanges);
+  addOpsStateLifecycleCandidates(events, index, drafts, exchanges);
   addRefundInvariantCandidates(events, index, drafts);
   addSessionCartInvariantCandidates(events, index, drafts, exchanges);
   addLocaleInputCandidates(index, drafts, exchanges);
@@ -6289,6 +6290,289 @@ function addRelationalWriteIntegrityCandidates(
   addRequestTargetRowMismatchCandidates(events, index, drafts, exchanges);
   addStaleValueWritebackCandidates(events, index, drafts);
   addBatchAppliedCountMismatchCandidates(events, index, drafts);
+}
+
+// ─── async state lifecycle integrity ─────────────────────────────────────────
+
+const STATE_LIFECYCLE_SCORE = DB_INVARIANT_SCORE + 2;
+
+function addDeferredDrainCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (
+      exchange.method !== "POST" ||
+      !/\/jobs\/drain$/i.test(capturedUrlPath(exchange.url) ?? "") ||
+      !isSuccessStatus(exchange.status) ||
+      !exchange.res
+    )
+      continue;
+    const response = parseStructuredBody(exchange.resBody);
+    if (!isRecord(response)) continue;
+    const remaining = finiteNumber(response.remaining);
+    const deferred = finiteNumber(response.deferred);
+    if (
+      remaining === undefined ||
+      deferred === undefined ||
+      remaining < 1 ||
+      deferred < 1
+    )
+      continue;
+    drafts.push({
+      detector: "job_drain_left_work_deferred",
+      title: `Successful job drain deferred ${deferred} job${deferred === 1 ? "" : "s"} and left ${remaining} pending`,
+      severity: "high",
+      score: STATE_LIFECYCLE_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs:
+          offsetForEvent(exchange.res) ??
+          offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        message:
+          `The drain returned success but reported deferred=${deferred} and remaining=${remaining}. ` +
+          `Work was neither completed nor failed.`,
+      }),
+      dedupeKey: `deferreddrain:${capturedUrlPath(exchange.url) ?? ""}`,
+    });
+  }
+}
+
+function parsedTimestamp(value: unknown): number | undefined {
+  const text = safeText(value, 100);
+  if (!text) return undefined;
+  const timestamp = Date.parse(text);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
+function addRetryClockShiftCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const HOUR_MS = 60 * 60 * 1000;
+  const CLOCK_SHIFT_TOLERANCE_MS = 2 * 60 * 1000;
+  for (const event of events) {
+    if (
+      event.k !== "db.diff" ||
+      bareTableName(safeText(event.d.table, 200) ?? "").toLowerCase() !==
+        "jobs" ||
+      safeText(event.d.op, 20)?.toLowerCase() !== "update" ||
+      !isRecord(event.d.before) ||
+      !isRecord(event.d.after)
+    )
+      continue;
+    const attemptsBefore = finiteNumber(event.d.before.attempts);
+    const attemptsAfter = finiteNumber(event.d.after.attempts);
+    const runAt = parsedTimestamp(event.d.after.run_at);
+    if (
+      attemptsBefore === undefined ||
+      attemptsAfter !== attemptsBefore + 1 ||
+      safeText(event.d.after.status, 40)?.toLowerCase() !== "pending" ||
+      !safeText(event.d.after.last_error, 300) ||
+      runAt === undefined
+    )
+      continue;
+    const delay = runAt - event.t;
+    const roundedHours = Math.round(delay / HOUR_MS);
+    if (
+      roundedHours < 2 ||
+      roundedHours > 14 ||
+      Math.abs(delay - roundedHours * HOUR_MS) >
+        CLOCK_SHIFT_TOLERANCE_MS
+    )
+      continue;
+    drafts.push({
+      detector: "retry_schedule_clock_shift",
+      title: `Retry was shifted about ${roundedHours} hours into the future`,
+      severity: "high",
+      score: STATE_LIFECYCLE_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: correlationIdOf(event),
+        table: safeText(event.d.table, 200),
+        source: normalizeDbEngine(event.d.engine),
+        frame: dbCallsiteFrame(event.d.callsite),
+        message:
+          `After attempt ${attemptsAfter} failed, run_at landed ${roundedHours} whole hours ahead of the retry write. ` +
+          `That hour-aligned displacement is characteristic of a local-time/UTC reconstruction, not a short retry backoff.`,
+      }),
+      dedupeKey: `retryclockshift:${rowIdentity(event) ?? event.t}`,
+    });
+  }
+}
+
+interface BackendRequestInterval {
+  start: BugEvent;
+  end?: BugEvent;
+}
+
+function backendRequestIntervals(
+  events: BugEvent[],
+): Map<string, BackendRequestInterval> {
+  const intervals = new Map<string, BackendRequestInterval>();
+  for (const event of events) {
+    if (event.k !== "backend.req.start") continue;
+    const requestId = correlationIdOf(event);
+    if (requestId) intervals.set(requestId, { start: event });
+  }
+  for (const event of events) {
+    if (event.k !== "backend.req.end") continue;
+    const requestId = correlationIdOf(event);
+    const interval = requestId ? intervals.get(requestId) : undefined;
+    if (interval) interval.end = event;
+  }
+  return intervals;
+}
+
+function addInflightSessionInvalidationCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const intervals = [...backendRequestIntervals(events).entries()];
+  for (const deletion of events) {
+    if (
+      deletion.k !== "db.diff" ||
+      bareTableName(safeText(deletion.d.table, 200) ?? "").toLowerCase() !==
+        "sessions" ||
+      safeText(deletion.d.op, 20)?.toLowerCase() !== "delete"
+    )
+      continue;
+    const deletedBy = correlationIdOf(deletion);
+    const invalidated = intervals.find(([requestId, interval]) => {
+      const status = finiteNumber(interval.end?.d.statusCode);
+      return (
+        requestId !== deletedBy &&
+        interval.end !== undefined &&
+        interval.start.t < deletion.t &&
+        interval.end.t > deletion.t &&
+        status === 401
+      );
+    });
+    if (!invalidated?.[1].end) continue;
+    const [requestId, interval] = invalidated;
+    const end = interval.end;
+    if (!end) continue;
+    const url =
+      safeText(interval.start.d.url, 400) ??
+      safeText(interval.start.d.pathname, 400);
+    drafts.push({
+      detector: "inflight_request_invalidated_by_session_rotation",
+      title: `An in-flight request became unauthorized after its session was deleted`,
+      severity: "high",
+      score: STATE_LIFECYCLE_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: end.t,
+        offsetMs:
+          offsetForEvent(end) ?? offsetFromStart(end.t, index.start),
+        route: routeAt(index.navs ?? [], end.t),
+        requestId,
+        method: safeText(interval.start.d.method, 20)?.toUpperCase(),
+        url: redactUrl(url),
+        status: 401,
+        source: "backend",
+        message:
+          `The request started ${deletion.t - interval.start.t} ms before a sessions row was deleted, ` +
+          `remained in flight across that rotation, and then completed with HTTP 401.`,
+      }),
+      dedupeKey: `inflightsessioninvalidated:${requestId}`,
+    });
+  }
+}
+
+function addCachedEmptyAfterDataCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const reports = events
+    .filter(
+      (event) =>
+        event.k === "db.diff" &&
+        safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+        isRecord(event.d.after) &&
+        finiteNumber(event.d.after.rows_returned) === 0,
+    )
+    .sort((left, right) => left.t - right.t);
+  for (let laterIndex = 1; laterIndex < reports.length; laterIndex += 1) {
+    const later = reports[laterIndex];
+    if (!isRecord(later.d.after)) continue;
+    const note = safeText(later.d.after.note, 160)?.toLowerCase();
+    const kind = keyValueOf(later.d.after.kind);
+    if (!note?.includes("cache=hit") || !kind) continue;
+    const earlier = reports
+      .slice(0, laterIndex)
+      .reverse()
+      .find(
+        (event) =>
+          isRecord(event.d.after) &&
+          keyValueOf(event.d.after.kind) === kind,
+      );
+    if (!earlier) continue;
+    const reportTable = safeText(later.d.table, 200);
+    const inserted = events.filter(
+      (event) =>
+        event.k === "db.diff" &&
+        safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+        event.t > earlier.t &&
+        event.t < later.t &&
+        safeText(event.d.table, 200) !== reportTable,
+    );
+    if (inserted.length === 0) continue;
+    const sourceTables = [
+      ...new Set(
+        inserted
+          .map((event) => safeText(event.d.table, 120))
+          .filter((table): table is string => Boolean(table)),
+      ),
+    ];
+    drafts.push({
+      detector: "cached_empty_result_after_data_arrived",
+      title: `Cached ${kind} result stayed empty after ${inserted.length} row inserts`,
+      severity: "high",
+      score: STATE_LIFECYCLE_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: later.t,
+        offsetMs:
+          offsetForEvent(later) ?? offsetFromStart(later.t, index.start),
+        route: routeAt(index.navs ?? [], later.t),
+        requestId: correlationIdOf(later),
+        table: reportTable,
+        source: normalizeDbEngine(later.d.engine),
+        frame: dbCallsiteFrame(later.d.callsite),
+        message:
+          `A ${kind} read recorded zero rows, ${inserted.length} rows were then inserted into ` +
+          `${sourceTables.join(", ") || "source tables"}, and the next report still recorded rows_returned=0 with cache=hit.`,
+      }),
+      dedupeKey: `cachedempty:${kind}:${reportTable ?? ""}`,
+    });
+  }
+}
+
+function addOpsStateLifecycleCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  addDeferredDrainCandidates(index, drafts, exchanges);
+  addRetryClockShiftCandidates(events, index, drafts);
+  addInflightSessionInvalidationCandidates(events, index, drafts);
+  addCachedEmptyAfterDataCandidates(events, index, drafts);
 }
 
 // ─── refund and return invariants ─────────────────────────────────────────────
