@@ -292,6 +292,14 @@ without it the two produce byte-identical evidence, and telling them apart is th
 N+1 finding. The `n_plus_one_query` detector reads it; read caps bound the count, so a finding
 understates a large fan-out rather than overstating it.
 
+Read events also carry `d.q`, the resolved LIMIT/OFFSET window the statement ran with (literals and
+Postgres `$n` placeholders; an unresolvable placeholder yields nothing rather than a guess). The
+`pagination_first_page_offset` detector compares that window against the request's own paging
+parameters: a request that asks for the first page whose SELECT ran with `0 < OFFSET < LIMIT` is
+skipping rows that will be returned to no page at all, which is the off-by-one behind every "the
+first item just isn't there" report. Offset equal to the limit (a real page 2, a ranked pick) and
+cursor-paged requests stay silent.
+
 `captureBefore: true` records UPDATE pre-images, which the `lost_update` detector needs: it fires
 when a second writer's before-image still shows the value an earlier writer had already replaced
 and both computed the same new value. That is the only rule here that crosses request boundaries,
@@ -309,6 +317,28 @@ It reports a race, not a defect. An application that discards responses no longe
 current input emits the same events and is correct, so the finding states the ordering and leaves the
 conclusion to the reader. The two calls are identified by send offset rather than by URL, since the
 query string is both the part that differs and the part redaction removes.
+
+`concurrent_duplicate_mutation` is the write-side sibling: two byte-identical mutations (same
+method, URL, and body) whose lifetimes overlapped and which BOTH returned 2xx. That is the transport
+shape of a read-modify-write race — a double-fired submit or two writers on a shared resource — and
+its downstream symptom is a duplicated line or a lost increment, invisible to every error detector
+because nothing failed. A sequential retry after a failure is the client behaving correctly and is
+excluded, as is any body carrying a redaction marker, since redaction can collapse distinct payloads
+into one signature.
+
+### Runtime warnings
+
+The Express middleware (like `autoCapture` before it) subscribes to `process.on("warning")` and
+records each runtime warning as a `backend.warning` event in the session the middleware most
+recently saw. A `MaxListenersExceededWarning` fires synchronously inside the request that crossed
+the threshold, so attribution is exact in the case that matters. The `runtime_warning` detector
+ranks a listener-leak warning above console output the app chose to print, because the platform
+put a threshold behind it. Disable with `captureRuntimeWarnings: false`.
+
+On the browser side, the `ui.listeners` gauge emits at every navigation commit, and two detectors
+read the curve: session-total growth that never shrinks (gross leaks), and a per-type staircase
+scoped to one path — one event type whose count rises on every arrival at the same route, which is
+the exact signature of a subscribe-on-mount with no cleanup even at one leaked handler per visit.
 
 ## Headless job-run sessions
 
