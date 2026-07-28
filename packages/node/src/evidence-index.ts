@@ -589,6 +589,7 @@ export function buildEvidenceCandidates(
   addDbDiffCandidates(events, index, drafts);
   addDbFieldDivergenceCandidates(events, index, drafts);
   addDuplicateWriteCandidates(events, index, drafts);
+  addInterpolationArtifactCandidates(events, index, drafts);
   addLostUpdateCandidates(events, index, drafts);
   addCounterContradictionCandidates(events, index, drafts);
   addNPlusOneCandidates(events, index, drafts);
@@ -2899,6 +2900,82 @@ function addDuplicateWriteCandidates(
           dedupeKey: `dupwrite:${requestId}:${table}:${signature}`,
         });
       }
+    }
+  }
+}
+
+/**
+ * The literal fingerprints an interpolation bug leaves in rendered text: a
+ * JavaScript value that was never looked up ("undefined"), never a number
+ * ("NaN"), never stringified ("[object Object]"), or a template that was never
+ * rendered at all ({{name}}, ${name}). Word-bounded so "undefined_behavior" in
+ * prose does not match. "null" is deliberately absent: a whole-column null is
+ * an ordinary database value, and the word appears in legitimate text far too
+ * often to anchor a high-confidence claim.
+ */
+const INTERPOLATION_ARTIFACT_PATTERN =
+  /\bundefined\b|\bNaN\b|\[object Object\]|\{\{\s*[\w.]+\s*\}\}|\$\{[\w.]+\}/;
+
+/** First artifact match in a string value, for the candidate's own evidence. */
+function interpolationArtifactIn(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  return INTERPOLATION_ARTIFACT_PATTERN.exec(value)?.[0] ?? undefined;
+}
+
+/**
+ * interpolation_artifact: persisted text carries a template-rendering fault.
+ *
+ * The real case: a notification row stored
+ * `subject: "Hi undefined, your order #1 was cancelled"` — the template
+ * rendered, the row inserted, the mail queued, every status code 200. The
+ * defect is visible ONLY in the value itself, which makes it invisible to
+ * every structural detector and glaring to this one. These fingerprints are
+ * near-zero-entropy: real user text containing a word-bounded "undefined" or
+ * an unrendered "{{name}}" exists, but a ROW WRITTEN BY THE APP containing one
+ * is an interpolation bug until proven otherwise.
+ *
+ * Scans both planes that carry persisted values — db.diff after images
+ * (writes) and db.read rows (reads) — because the write that stored the broken
+ * text often happened in an earlier request or a job, and the session at hand
+ * only ever reads it back. One candidate per table+column, anchored at the
+ * first sighting.
+ */
+function addInterpolationArtifactCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const seen = new Set<string>();
+  for (const event of events) {
+    if (event.k !== "db.diff" && event.k !== "db.read") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const image = event.k === "db.diff" ? event.d.after : event.d.row;
+    if (!isRecord(image)) continue;
+    for (const [column, value] of Object.entries(image)) {
+      const artifact = interpolationArtifactIn(value);
+      if (artifact === undefined) continue;
+      const key = `${table}:${column}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const requestId = safeText(event.d.requestId, 200);
+      const snippet = scrubText(String(value), 160);
+      drafts.push({
+        detector: "interpolation_artifact",
+        title: `Interpolation artifact persisted: ${table}.${column} contains "${artifact}"`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: event.t,
+          offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+          route: routeAt(index.navs ?? [], event.t),
+          requestId,
+          message: `${table}.${column} ${event.k === "db.diff" ? "was written with" : "read back"} "${snippet}" — "${artifact}" is a template value that never resolved`,
+          source: normalizeDbEngine(event.d.engine),
+        }),
+        dedupeKey: `interpolation:${key}`,
+      });
     }
   }
 }
