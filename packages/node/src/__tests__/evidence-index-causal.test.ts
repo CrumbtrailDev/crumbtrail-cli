@@ -215,13 +215,15 @@ describe("buildEvidenceCandidates — gate behavior", () => {
   });
 
   /**
-   * `enforceRootBeforeSymptom` runs after the tier sort and outranks it. A demoted (tier 1) symptom
-   * that is itself the root of an undemoted (tier 0) draft is lifted back across the tier boundary,
-   * which puts it above roots the tier partition alone would have kept ahead of it. Pinned here
-   * because it is the rule the header documents, and because a well-meaning "keep the tiers intact"
-   * change would silently bury the named failure again.
+   * A high-confidence symptom is bound into its root's chain, and the chain is placed by its
+   * strongest member — so the named failure sits directly under its own cause, ABOVE unrelated
+   * roots that score lower. The `low` link hanging off it binds nothing and ranks on its own score.
+   *
+   * Pinned because the failure mode is silent: an earlier design partitioned high/medium symptoms
+   * into a demoted tier and then undid it with a corrective sweep, and any change that lets a
+   * symptom's grade set position again buries the named failure under whatever happened first.
    */
-  it("lifts a demoted symptom across the tier boundary to sit before the draft it causes", () => {
+  it("keeps a symptom under its own cause and above lower-scoring unrelated roots", () => {
     const write = (t: number, requestId: string, table: string): BugEvent => ({
       t,
       k: "db.diff",
@@ -263,23 +265,30 @@ describe("buildEvidenceCandidates — gate behavior", () => {
     const at = (table: string) =>
       candidates.findIndex((c) => c.title.includes(` on ${table}`));
     const get = (table: string) => candidates[at(table)];
+    const backendAt = candidates.findIndex((c) =>
+      c.detector.startsWith("backend_"),
+    );
 
-    const lifted = get("orders");
-    const caused = get("order_items");
+    const bound = get("orders");
+    const sequenced = get("order_items");
     const unrelatedRoot = get("shipments");
 
-    // Preconditions: `lifted` is a demoted (tier 1) high symptom; `caused` is annotate-only (tier 0)
-    // and names `lifted` as its root; `unrelatedRoot` is an undemoted root.
-    expect(lifted.causalRole).toBe("symptom");
-    expect(lifted.attributionConfidence).toBe("high");
-    expect(caused.causalRole).toBe("symptom");
-    expect(caused.attributionConfidence).toBe("low");
-    expect(caused.rootCauseId).toBe(lifted.id);
+    // Preconditions: `bound` is a high (credited) symptom of the backend error, so the two share a
+    // chain; `sequenced` names `bound` as its root through a low (uncredited) link; `unrelatedRoot`
+    // is a root of its own, scoring the same as the two writes.
+    expect(bound.causalRole).toBe("symptom");
+    expect(bound.attributionConfidence).toBe("high");
+    expect(sequenced.causalRole).toBe("symptom");
+    expect(sequenced.attributionConfidence).toBe("low");
+    expect(sequenced.rootCauseId).toBe(bound.id);
     expect(unrelatedRoot.causalRole).toBe("root");
 
-    // The invariant that wins: a root is never listed after its own symptom.
+    // The chain is contiguous and led by its root: `bound` sits immediately under the cause it was
+    // attributed to, not wherever its own grade would have put it.
+    expect(backendAt).toBeGreaterThanOrEqual(0);
+    expect(at("orders")).toBe(backendAt + 1);
+    // The write merely sequenced behind it, and the unrelated root, both rank below.
     expect(at("orders")).toBeLessThan(at("order_items"));
-    // And it wins ACROSS the tier boundary: the demoted symptom outranks an undemoted root.
     expect(at("orders")).toBeLessThan(at("shipments"));
   });
 
@@ -297,11 +306,11 @@ describe("buildEvidenceCandidates — write-to-write causal claims are weakened"
    * high-confidence `request` edge. Ordering, not causation — so the causal claim drawn through it is
    * clamped to `low`.
    *
-   * The clamp reads what the CANDIDATES are, not only what node kinds they landed on, and this
-   * fixture is why. `backend.req.end` shares the last write's millisecond, and the requestId match
-   * takes the nearest node regardless of kind, so that write is attributed to the `backend.req` node
-   * instead of its own `db.write`. Keyed on node kind alone, the first two writes are clamped and the
-   * third silently keeps `high` on the same bogus claim.
+   * `backend.req.end` shares the last write's millisecond here, which used to hand that write the
+   * node for the request's END instead of the node for itself — the requestId match took the nearest
+   * node and broke the tie on node id, where `backend.req` sorts under `db.write`. The tie now
+   * prefers a kind the detector describes, so each write reaches its own node; the assertions below
+   * are unchanged and pin that the third write is clamped like its siblings either way.
    */
   const write = (t: number, table: string): BugEvent => ({
     t,
@@ -333,7 +342,7 @@ describe("buildEvidenceCandidates — write-to-write causal claims are weakened"
     { t: 220, k: "backend.req.end", d: { requestId: "req1", route: "/c" } },
   ];
 
-  it("clamps a write attributed to a non-db.write node just like its siblings", () => {
+  it("clamps the write sharing a millisecond with the request's end like its siblings", () => {
     const candidates = buildEvidenceCandidates(
       events,
       { start: 0 },
@@ -345,10 +354,79 @@ describe("buildEvidenceCandidates — write-to-write causal claims are weakened"
 
     // Sibling writes, clamped through two db.write nodes.
     expect(byTable("order_items").attributionConfidence).toBe("low");
-    // The one whose node kind hides that it is a write. Same claim, same clamp.
+    // The one contending with `backend.req.end` for its millisecond. Same claim, same clamp.
     expect(byTable("jobs").causalRole).toBe("symptom");
     expect(byTable("jobs").rootCauseId).toBe(byTable("order_items").id);
     expect(byTable("jobs").attributionConfidence).toBe("low");
+  });
+
+  /**
+   * The tie-break decides ownership only when the nodes are equidistant — time still dominates, so a
+   * write cannot be pulled onto a distant node of the right kind. Pinned as the guard on that: the
+   * request's end is nearer than either write, so it wins on time and the candidate lands there
+   * anyway. `isDbWriteEnd` reading the OWNING CANDIDATE, not just the node kind, is what keeps the
+   * claim clamped when that happens.
+   */
+  it("still clamps when a write's nearest node is not a write at all", () => {
+    const spread: BugEvent[] = [
+      { t: 100, k: "backend.req.start", d: { requestId: "req1", route: "/c" } },
+      write(200, "orders"),
+      { t: 215, k: "backend.req.end", d: { requestId: "req1", route: "/c" } },
+      write(230, "jobs"),
+    ];
+    const graph = buildCausalGraph({ events: spread });
+    const attribution = attributeCandidates(
+      graph,
+      [
+        { id: "c_orders", anchor: { t: 200, requestId: "req1" } },
+        // Anchored on the request's end, nearer to `backend.req` than to either write.
+        { id: "c_stray", anchor: { t: 215, requestId: "req1" } },
+      ],
+      () => "db_mutation",
+    );
+
+    const stray = attribution.get("c_stray")!;
+    expect(stray.causalRole).toBe("symptom");
+    expect(stray.rootCauseId).toBe("c_orders");
+    expect(stray.attributionConfidence).toBe("low");
+  });
+
+  /**
+   * The per-hop clamp only sees ADJACENT nodes, so anything the request emits between two writes
+   * splits the write-to-write hop in two and both halves grade `high`. A single OTLP span is enough,
+   * and a real checkout emits several. That is how the client-supplied-total finding was published
+   * as an established effect of an unrelated inventory decrement.
+   */
+  it("clamps a write-to-write claim that a span was emitted in the middle of", () => {
+    const spanned: BugEvent[] = [
+      { t: 100, k: "backend.req.start", d: { requestId: "req1", route: "/c" } },
+      write(200, "products"),
+      {
+        t: 205,
+        k: "backend.otel.span",
+        d: {
+          traceId: "req1",
+          spanId: "s1",
+          name: "POST",
+          kind: 2,
+          serviceName: "pricing",
+          statusCode: "UNSET",
+        },
+      },
+      write(210, "orders"),
+      { t: 220, k: "backend.req.end", d: { requestId: "req1", route: "/c" } },
+    ];
+    const candidates = buildEvidenceCandidates(
+      spanned,
+      { start: 0 },
+      buildCausalGraph({ events: spanned }),
+    );
+    const orders = candidates.find((c) => c.title.includes(" on orders"))!;
+    const products = candidates.find((c) => c.title.includes(" on products"))!;
+    // Neither hop of products -> span -> orders is write-to-write, so only a clamp applied to the
+    // claim's two ends can catch this.
+    expect(orders.rootCauseId).toBe(products.id);
+    expect(orders.attributionConfidence).toBe("low");
   });
 
   it("leaves the request's entry hop alone — that one is not write-to-write", () => {
@@ -419,6 +497,148 @@ describe("buildEvidenceCandidates — write-to-write causal claims are weakened"
     // Graded low — annotate only — so it must not reorder the list.
     expect(candidates[duplicate].attributionConfidence).toBe("low");
     expect(duplicate).toBeLessThan(Math.min(...genericWrites));
+  });
+
+  /**
+   * The grade is not the whole rule, and this is the case that proves it. An
+   * `otel_db_activity` root is NOT a database write — its node is an `otel.span`
+   * — so the write-to-write clamp never reaches the link and it survives at
+   * `high`. Graded that strongly, it would bind the named failure into the
+   * generic draft's chain and put "a database span exists" ahead of the
+   * invariant violation underneath it.
+   *
+   * `namesFailureOnGenericPlane` is what covers this, and it is consulted where
+   * chains are formed rather than where lifts were once allowed.
+   */
+  it("does not let a generic OTel span lead the named failure under it", () => {
+    const spanned: BugEvent[] = [
+      {
+        t: 100,
+        k: "backend.otel.span",
+        d: {
+          // On the request spine, so the span really is the writes' nominal root.
+          requestId: "req1",
+          traceId: "req1",
+          spanId: "s1",
+          name: "SELECT",
+          kind: 3,
+          serviceName: "store",
+          statusCode: "UNSET",
+          attributes: { "db.system": "postgres", "db.operation": "SELECT" },
+        },
+      },
+      {
+        t: 150,
+        k: "db.diff",
+        d: {
+          engine: "postgres",
+          op: "update",
+          table: "products",
+          pk: { id: 1 },
+          after: { id: 1, price_cents: 19900 },
+          requestId: "req1",
+        },
+      },
+      {
+        t: 160,
+        k: "db.diff",
+        d: {
+          engine: "postgres",
+          op: "insert",
+          table: "order_items",
+          pk: { id: 1 },
+          after: { id: 1, product_id: 1, price_cents: 6900 },
+          requestId: "req1",
+        },
+      },
+    ];
+    const candidates = buildEvidenceCandidates(
+      spanned,
+      { start: 0 },
+      buildCausalGraph({ events: spanned }),
+    );
+    const namedAt = candidates.findIndex(
+      (c) => c.detector === "db_field_divergence",
+    );
+    const genericAt = candidates.findIndex(
+      (c) => c.detector === "otel_db_activity",
+    );
+
+    expect(namedAt).toBeGreaterThanOrEqual(0);
+    expect(genericAt).toBeGreaterThanOrEqual(0);
+    // Precondition: the link really is graded strongly enough to bind, so nothing
+    // but the generic/named rule can be keeping the order right.
+    expect(candidates[namedAt].rootCauseId).toBe(candidates[genericAt].id);
+    expect(candidates[namedAt].attributionConfidence).toBe("high");
+    // "Linked rows disagree" is what the reader needs; "a database span exists" is not.
+    expect(namedAt).toBeLessThan(genericAt);
+  });
+});
+
+describe("attributeCandidates — a write detector reaches only its own write", () => {
+  /**
+   * Two candidates describe the SAME write, so one loses the node. The loser used to take the
+   * nearest unowned `db.write`, which is a DIFFERENT write of the same request — and that displaced
+   * write's own candidate then took the next one, and so on down the request. The emitted chain
+   * became write order shifted by a slot, which is how a candidate came to name as its cause a write
+   * that happened after it.
+   */
+  const events: BugEvent[] = [
+    { t: 100, k: "backend.req.start", d: { requestId: "req1", route: "/c" } },
+    ...["orders", "order_items", "jobs"].map((table, i): BugEvent => ({
+      t: 200 + i * 10,
+      k: "db.diff",
+      d: {
+        engine: "postgres",
+        op: "insert",
+        table,
+        pk: { id: 1 },
+        after: { id: 1 },
+        requestId: "req1",
+      },
+    })),
+  ];
+
+  it("leaves a displaced write isolated rather than on a neighbour's node", () => {
+    const graph = buildCausalGraph({ events });
+    // Two candidates on the FIRST write (t=200): a named failure and the generic plane surfacing.
+    const attribution = attributeCandidates(
+      graph,
+      [
+        { id: "named", anchor: { t: 200, requestId: "req1" } },
+        { id: "generic", anchor: { t: 200, requestId: "req1" } },
+        { id: "second_write", anchor: { t: 210, requestId: "req1" } },
+      ],
+      (id) => (id === "named" ? "db_field_divergence" : "db_mutation"),
+    );
+
+    // The named failure owns the write they share.
+    expect(attribution.get("named")!.causalRole).not.toBe("isolated");
+    // The loser does NOT wander onto the next write.
+    expect(attribution.get("generic")!.causalRole).toBe("isolated");
+    // ...which leaves that next write's own candidate free to claim it.
+    expect(attribution.get("second_write")!.rootCauseId).toBe("named");
+  });
+
+  it("gives db_client_supplied_value the node on priority, not on dedupe-key alphabet", () => {
+    const graph = buildCausalGraph({ events });
+    // `db_client_supplied_value` and `db_mutation` ALWAYS tie: both anchor on the same db.diff. The
+    // named failure must own the node whichever way the ids happen to sort, so this gives the
+    // generic twin the alphabetically smaller id — the one that would win a bare id tie-break.
+    const attribution = attributeCandidates(
+      graph,
+      [
+        { id: "aaa_generic", anchor: { t: 200, requestId: "req1" } },
+        { id: "zzz_client_value", anchor: { t: 200, requestId: "req1" } },
+      ],
+      (id) =>
+        id === "zzz_client_value" ? "db_client_supplied_value" : "db_mutation",
+    );
+
+    expect(attribution.get("zzz_client_value")!.causalRole).not.toBe(
+      "isolated",
+    );
+    expect(attribution.get("aaa_generic")!.causalRole).toBe("isolated");
   });
 });
 
