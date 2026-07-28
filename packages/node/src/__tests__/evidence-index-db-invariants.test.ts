@@ -225,6 +225,375 @@ describe("db_field_divergence", () => {
   });
 });
 
+/**
+ * The rows of session ses_20260727_201639_01d3cd76d2a8, verbatim: a two-line
+ * checkout on a freshly seeded store, where every table's primary key sequence
+ * still starts at 1. Small sequential ids are what make this fixture worth
+ * keeping — the single-product fixtures above use deliberately non-colliding
+ * ids (42, 7), which is exactly why the collision below survived.
+ *
+ * The checkout underpays: the order totals 70894 but the payment settles 60500.
+ */
+const twoLineCheckout = (): BugEvent[] => [
+  diff(
+    1100,
+    "req-checkout",
+    "update",
+    "products",
+    { id: 1 },
+    {
+      id: 1,
+      price_cents: 19900,
+      inventory: 23,
+    },
+  ),
+  diff(
+    1120,
+    "req-checkout",
+    "update",
+    "products",
+    { id: 3 },
+    {
+      id: 3,
+      price_cents: 6900,
+      inventory: 0,
+    },
+  ),
+  diff(
+    1140,
+    "req-checkout",
+    "insert",
+    "orders",
+    { id: 1 },
+    {
+      id: 1,
+      total_cents: 70894,
+    },
+  ),
+  diff(
+    1160,
+    "req-checkout",
+    "insert",
+    "order_items",
+    { id: 1 },
+    {
+      id: 1,
+      order_id: 1,
+      product_id: 1,
+      qty: 2,
+      price_cents: 19900,
+    },
+  ),
+  diff(
+    1180,
+    "req-checkout",
+    "insert",
+    "order_items",
+    { id: 2 },
+    {
+      id: 2,
+      order_id: 1,
+      product_id: 3,
+      qty: 3,
+      price_cents: 6900,
+    },
+  ),
+  diff(
+    1200,
+    "req-checkout",
+    "insert",
+    "payments",
+    { id: 1 },
+    {
+      id: 1,
+      order_id: 1,
+      amount_cents: 60500,
+      status: "succeeded",
+    },
+  ),
+];
+
+describe("db_field_divergence — foreign key linkage", () => {
+  it("does not link two rows on a column that names a different table", () => {
+    // The false positive: `order_items.order_id` is 1 and `products.id` is 1,
+    // so a scan of every value in the after image linked order_items#2 to
+    // products#1 and reported their prices (6900 vs 19900) as a contradiction.
+    // Those rows describe different products — order_items#2 is product 3. The
+    // only join that links order_items to products is `product_id`.
+    const found = find(twoLineCheckout(), "db_field_divergence");
+    expect(found.filter((c) => c.title.includes("price_cents"))).toHaveLength(
+      0,
+    );
+  });
+
+  it("still links rows through the column that does name the target table", () => {
+    // Same fixture, one price edited: order_items#2 IS product 3, so a price
+    // disagreement between those two rows is a real contradiction.
+    const events = twoLineCheckout().map((event) =>
+      event.d.table === "order_items" && (event.d.pk as { id: number }).id === 2
+        ? diff(
+            event.t,
+            "req-checkout",
+            "insert",
+            "order_items",
+            { id: 2 },
+            {
+              id: 2,
+              order_id: 1,
+              product_id: 3,
+              qty: 3,
+              price_cents: 5900,
+            },
+          )
+        : event,
+    );
+    const found = find(events, "db_field_divergence").filter((c) =>
+      c.title.includes("price_cents"),
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0].title).toContain("6900");
+    expect(found[0].title).toContain("5900");
+    // The message cites the join it actually used, so a reader can check it.
+    expect(found[0].anchor.message).toContain("order_items.product_id");
+  });
+
+  it("is silent when the shared value is not a scalar identifier", () => {
+    // `{}` is what a db.diff after image leaves behind for a Date. Two of them
+    // stringify alike and must never constitute a foreign key match.
+    const events = [
+      diff(
+        1100,
+        "req-checkout",
+        "insert",
+        "orders",
+        { id: {} },
+        {
+          id: {},
+          total_cents: 8900,
+        },
+      ),
+      diff(
+        1200,
+        "req-checkout",
+        "insert",
+        "payments",
+        { id: 1 },
+        {
+          id: 1,
+          order_id: {},
+          amount_cents: 7900,
+        },
+      ),
+    ];
+    expect(find(events, "db_field_divergence")).toHaveLength(0);
+  });
+});
+
+describe("db_field_divergence — settlement rows that do not settle their parent", () => {
+  it("names a payment that does not cover the order it references", () => {
+    const found = find(twoLineCheckout(), "db_field_divergence").filter((c) =>
+      c.title.includes("amount_cents"),
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0].severity).toBe("high");
+    expect(found[0].score).toBe(90);
+    expect(found[0].title).toContain("70894");
+    expect(found[0].title).toContain("60500");
+    expect(found[0].anchor.requestId).toBe("req-checkout");
+    expect(found[0].anchor.message).toContain("payments.order_id");
+  });
+
+  it("outranks the app's own log line, which used to be the only way it surfaced", () => {
+    // The whole point. In the live session this underpayment reached the reader
+    // only at rank 5, score 50, severity low, as a `console_warning` — because
+    // the application happened to log it. Delete that one line from the app and
+    // the checkout fraud left the ranking entirely.
+    const events: BugEvent[] = [
+      ...twoLineCheckout(),
+      {
+        t: 1210,
+        k: "con",
+        d: { lv: "warn", args: ["payment 60500 does not cover order 70894"] },
+      },
+    ];
+    const candidates = buildEvidenceCandidates(
+      events,
+      { start: 1000 },
+      buildCausalGraph({ events }),
+    );
+    const settlement = candidates.findIndex((c) =>
+      c.title.includes("amount_cents"),
+    );
+    const warning = candidates.findIndex(
+      (c) => c.detector === "console_warning",
+    );
+    expect(settlement).toBeGreaterThanOrEqual(0);
+    expect(warning).toBeGreaterThanOrEqual(0);
+    expect(settlement).toBeLessThan(warning);
+  });
+
+  it("outranks every generic surfacing of the request's writes, including earlier ones", () => {
+    // This divergence anchors on the third write of six, so the two `products`
+    // updates precede it on the request spine. Those writes are joined to it by
+    // ordering, not causation, and the graph grades that link `low` for exactly
+    // that reason — a `low` link must not reorder anything.
+    const events = twoLineCheckout();
+    const candidates = buildEvidenceCandidates(
+      events,
+      { start: 1000 },
+      buildCausalGraph({ events }),
+    );
+    const settlement = candidates.findIndex((c) =>
+      c.title.includes("amount_cents"),
+    );
+    const genericWrites = candidates
+      .map((c, i) => (c.detector === "db_mutation" ? i : -1))
+      .filter((i) => i >= 0);
+    expect(settlement).toBeGreaterThanOrEqual(0);
+    expect(genericWrites).toHaveLength(6);
+    expect(settlement).toBeLessThan(Math.min(...genericWrites));
+  });
+
+  it("is silent when the payment settles the order exactly", () => {
+    const events = twoLineCheckout().map((event) =>
+      event.d.table === "payments"
+        ? diff(
+            event.t,
+            "req-checkout",
+            "insert",
+            "payments",
+            { id: 1 },
+            {
+              id: 1,
+              order_id: 1,
+              amount_cents: 70894,
+              status: "succeeded",
+            },
+          )
+        : event,
+    );
+    expect(find(events, "db_field_divergence")).toHaveLength(0);
+  });
+
+  it("is silent when one order is settled by more than one payment", () => {
+    // A split payment or an installment: no single row is supposed to equal the
+    // total, so comparing either one against it says nothing.
+    const events = [
+      ...twoLineCheckout(),
+      diff(
+        1220,
+        "req-checkout",
+        "insert",
+        "payments",
+        { id: 2 },
+        {
+          id: 2,
+          order_id: 1,
+          amount_cents: 10394,
+          status: "succeeded",
+        },
+      ),
+    ];
+    expect(
+      find(events, "db_field_divergence").filter((c) =>
+        c.title.includes("amount_cents"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("is silent for a child row that is a component of the total, not a settlement of it", () => {
+    // A coupon carries the same `amount_cents` column as a payment and the same
+    // `order_id` foreign key, and is SUPPOSED to differ from the order total.
+    const events = [
+      diff(
+        1140,
+        "req-checkout",
+        "insert",
+        "orders",
+        { id: 1 },
+        {
+          id: 1,
+          total_cents: 70894,
+        },
+      ),
+      diff(
+        1200,
+        "req-checkout",
+        "insert",
+        "coupon_redemptions",
+        { id: 1 },
+        {
+          id: 1,
+          order_id: 1,
+          coupon_code: "SAVE10",
+          amount_cents: 1000,
+        },
+      ),
+    ];
+    expect(find(events, "db_field_divergence")).toHaveLength(0);
+  });
+
+  it("is silent when the two money columns are in different units", () => {
+    const events = [
+      diff(
+        1140,
+        "req-checkout",
+        "insert",
+        "orders",
+        { id: 1 },
+        {
+          id: 1,
+          total_cents: 70894,
+        },
+      ),
+      diff(
+        1200,
+        "req-checkout",
+        "insert",
+        "payments",
+        { id: 1 },
+        {
+          id: 1,
+          order_id: 1,
+          amount_usd: 708.94,
+          status: "succeeded",
+        },
+      ),
+    ];
+    expect(find(events, "db_field_divergence")).toHaveLength(0);
+  });
+
+  it("is silent across two requests", () => {
+    const events = [
+      diff(
+        1140,
+        "req-one",
+        "insert",
+        "orders",
+        { id: 1 },
+        {
+          id: 1,
+          total_cents: 70894,
+        },
+      ),
+      diff(
+        1200,
+        "req-two",
+        "insert",
+        "payments",
+        { id: 1 },
+        {
+          id: 1,
+          order_id: 1,
+          amount_cents: 60500,
+          status: "succeeded",
+        },
+      ),
+    ];
+    expect(find(events, "db_field_divergence")).toHaveLength(0);
+  });
+});
+
 describe("duplicate_write", () => {
   it("names two identical inserts into one table in one request", () => {
     // The gap 3 session: a retry storm with no idempotency key redeemed one
