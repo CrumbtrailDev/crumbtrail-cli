@@ -3870,7 +3870,10 @@ interface RequestExchange {
   url?: string;
   body: unknown;
   res?: BugEvent;
+  /** `net.res d.body`: the redacted response body, as text. */
   resBody?: unknown;
+  /** `net.res d.bodyMeta`: the bounded parsed view, when the browser built one. */
+  resBodyMeta?: unknown;
   status?: number;
 }
 
@@ -3906,6 +3909,7 @@ function collectRequestExchanges(
     if (!entry) continue;
     entry.res = event;
     entry.resBody = event.d.body;
+    entry.resBodyMeta = event.d.bodyMeta;
     entry.status = finiteNumber(event.d.st);
   }
   return exchanges;
@@ -3953,8 +3957,6 @@ function looksLikeApiRequest(url: string | undefined): boolean {
   return path !== undefined && API_PATH_RE.test(path);
 }
 
-/** The JSON body envelope's content-type marker. */
-const JSON_BODY_CONTENT_TYPE = "json";
 /** Conventional names for the collection inside a JSON response object. */
 const COLLECTION_BODY_KEYS = new Set([
   "items",
@@ -3967,43 +3969,105 @@ const COLLECTION_BODY_KEYS = new Set([
   "nodes",
 ]);
 
-/** The structured payload inside a captured response body, envelope or not. */
-function responsePayload(body: unknown): unknown | undefined {
-  if (isRecord(body) && safeText(body.ct, 20) === JSON_BODY_CONTENT_TYPE) {
-    return parseStructuredBody(body.data);
+/** JSONPath of the root value in `bodyMeta.arrayTotal`. */
+const BODY_ROOT_PATH = "$";
+
+/**
+ * The structured view of a response body.
+ *
+ * `net.res` carries two things and they are not interchangeable. `d.body` is the
+ * redacted body as TEXT — the long-standing contract every older consumer reads.
+ * `d.bodyMeta` is the browser's bounded parsed view: `{ ct, bytes?, truncated?,
+ * data?, arrayTotal? }`, present only for a same-origin JSON response under
+ * 32KB that survived redaction and parsing.
+ *
+ * Prefer `d.bodyMeta.data`, because it is already parsed, depth-bounded and
+ * array-capped, and because it is the only place the true lengths of capped
+ * arrays are recorded. Fall back to parsing the `d.body` text, which is what a
+ * backend-captured, replayed or pre-`bodyMeta` session has — and where nothing
+ * was capped, so the captured lengths are exact.
+ */
+interface ResponseBodyView {
+  /** The parsed payload. Undefined when neither source yielded one. */
+  data: unknown;
+  /**
+   * True length of every array the capture capped, keyed by JSONPath —
+   * `{"$": 25}` for a top-level array, `{"$.items": 57}` for a nested one. Empty
+   * when nothing was capped, in which case the captured lengths are the true
+   * ones.
+   */
+  arrayTotal: Record<string, number>;
+}
+
+function responseBodyView(
+  body: unknown,
+  bodyMeta: unknown,
+): ResponseBodyView | undefined {
+  if (isRecord(bodyMeta) && bodyMeta.data !== undefined) {
+    const arrayTotal: Record<string, number> = {};
+    if (isRecord(bodyMeta.arrayTotal)) {
+      for (const [path, value] of Object.entries(bodyMeta.arrayTotal)) {
+        const total = finiteNumber(value);
+        if (total !== undefined) arrayTotal[path] = total;
+      }
+    }
+    return { data: bodyMeta.data, arrayTotal };
   }
-  return parseStructuredBody(body);
+  const parsed = parseStructuredBody(body);
+  if (parsed === undefined) return undefined;
+  return { data: parsed, arrayTotal: {} };
+}
+
+/** The structured payload of a captured response, from either source. */
+function responsePayload(body: unknown, bodyMeta?: unknown): unknown | undefined {
+  return responseBodyView(body, bodyMeta)?.data;
 }
 
 /**
- * The one collection a response body carries.
+ * The one collection a response body carries, with its TRUE length.
  *
- * `total` is the true length: the envelope's `arrayTotal` when the capture
- * capped the array, the captured length otherwise. Undefined — never a guess —
- * when the body does not parse, carries no array, carries more than one
- * candidate array, or was truncated with no total to stand in for the part that
- * was dropped. Every count claim below rests on this, so an unreadable body has
- * to end the claim rather than under-report.
+ * `total` reads the array's own entry in `bodyMeta.arrayTotal` when the capture
+ * capped it, and the captured length otherwise — core writes an entry only for
+ * an array it actually shortened, so the absence of one means the length in hand
+ * is the real length. Note that `bodyMeta.truncated` is NOT a usable guard here:
+ * it is also set by the string-length and depth caps, which say nothing about
+ * how many items an array had.
+ *
+ * Undefined — never a guess — when the body does not parse, carries no array, or
+ * carries more than one candidate array, because then nothing maps a count back
+ * to the rows it should describe.
  */
 interface BodyCollection {
+  /** True length of the collection, capped items accounted for. */
   total: number;
+  /** The items actually captured — the first 20 when the array was capped. */
   items: unknown[];
+  /**
+   * True when `items` IS the collection rather than a prefix of it. Any rule
+   * that reasons about which items are present (rather than how many there are)
+   * has to check this: two capped arrays share their first twenty entries no
+   * matter how differently they end.
+   */
+  complete: boolean;
 }
 
-function responseCollection(body: unknown): BodyCollection | undefined {
-  const envelope =
-    isRecord(body) && safeText(body.ct, 20) === JSON_BODY_CONTENT_TYPE
-      ? body
-      : undefined;
-  const payload = responsePayload(body);
-  if (payload === undefined) return undefined;
-  const arrayTotal = finiteNumber(envelope?.arrayTotal);
-  const truncated = envelope?.truncated === true;
+function collectionOf(items: unknown[], total: number): BodyCollection {
+  return { total, items, complete: items.length === total };
+}
+
+function responseCollection(
+  body: unknown,
+  bodyMeta?: unknown,
+): BodyCollection | undefined {
+  const view = responseBodyView(body, bodyMeta);
+  if (!view || view.data === undefined) return undefined;
+  const payload = view.data;
 
   if (Array.isArray(payload)) {
-    if (arrayTotal !== undefined) return { total: arrayTotal, items: payload };
-    if (truncated) return undefined;
-    return { total: payload.length, items: payload };
+    return collectionOf(
+      payload,
+      view.arrayTotal[BODY_ROOT_PATH] ?? payload.length,
+    );
   }
   if (!isRecord(payload) || isRedactedPlaceholder(payload)) return undefined;
 
@@ -4017,12 +4081,11 @@ function responseCollection(body: unknown): BodyCollection | undefined {
   const chosen =
     named.length === 1 ? named[0] : arrays.length === 1 ? arrays[0] : undefined;
   if (!chosen) return undefined;
-  // `arrayTotal` names one array's true length, so it is only safe to read when
-  // the body has exactly one array for it to be about.
-  if (arrays.length === 1 && arrayTotal !== undefined)
-    return { total: arrayTotal, items: chosen[1] };
-  if (truncated) return undefined;
-  return { total: chosen[1].length, items: chosen[1] };
+  const [name, items] = chosen;
+  return collectionOf(
+    items,
+    view.arrayTotal[`${BODY_ROOT_PATH}.${name}`] ?? items.length,
+  );
 }
 
 /**
@@ -4500,7 +4563,7 @@ function addResultRowLossCandidates(
     );
     if (rowsRead < 1) continue;
 
-    const collection = responseCollection(exchange.resBody);
+    const collection = responseCollection(exchange.resBody, exchange.resBodyMeta);
     let shown: number | undefined;
     let basis: "body" | "ui" | undefined;
     if (collection) {
@@ -4619,7 +4682,7 @@ function addSharedStateBleedCandidates(
     if (!isSuccessStatus(exchange.status) || !exchange.res) continue;
     const url = exchange.url;
     if (!url) continue;
-    const collection = responseCollection(exchange.resBody);
+    const collection = responseCollection(exchange.resBody, exchange.resBodyMeta);
     if (!collection) continue;
     const list = byUrl.get(url) ?? [];
     list.push({ exchange, res: exchange.res, collection });
@@ -4651,8 +4714,18 @@ function addSharedStateBleedCandidates(
       if (wroteInBetween) continue;
 
       const grew = after.collection.total > before.collection.total;
-      const beforeIds = collectionIdentities(before.collection.items);
-      const afterIds = collectionIdentities(after.collection.items);
+      // The item-set comparison needs both collections whole. The capture keeps
+      // the first twenty entries of a longer array, and two different
+      // twenty-first-onward tails share an identical prefix, so comparing
+      // prefixes as sets would report agreement that was never established.
+      const comparable =
+        before.collection.complete && after.collection.complete;
+      const beforeIds = comparable
+        ? collectionIdentities(before.collection.items)
+        : undefined;
+      const afterIds = comparable
+        ? collectionIdentities(after.collection.items)
+        : undefined;
       const setChanged =
         beforeIds !== undefined &&
         afterIds !== undefined &&
@@ -4695,7 +4768,12 @@ function addSharedStateBleedCandidates(
  */
 const ACKNOWLEDGED_WRITE_LOST_SCORE = 88;
 
-/** The stable target a mutating request addressed, from its own body. */
+/**
+ * The stable target a mutating request addressed, from its own body.
+ *
+ * A REQUEST body has no `bodyMeta` — that summary is built for responses only —
+ * so this parses the captured text, which is exact because nothing capped it.
+ */
 function bodyTargetKey(body: unknown): string | undefined {
   const payload = responsePayload(body);
   if (payload === undefined) return undefined;
@@ -4755,6 +4833,7 @@ function addAcknowledgedWriteLostCandidates(
     const target = bodyTargetKey(exchange.body) ?? "";
     const key = `${exchange.url} ${target}`;
     const list = groups.get(key) ?? [];
+    // Request body again: parsed from the captured text, with no `bodyMeta`.
     const payload = responsePayload(exchange.body);
     const quantity = collectObjectScopes(payload)
       .map((scope) => soleQuantityOf(scope))
@@ -4779,7 +4858,7 @@ function addAcknowledgedWriteLostCandidates(
     if (!isSuccessStatus(exchange.status) || !exchange.res) continue;
     const path = capturedUrlPath(exchange.url);
     if (!path) continue;
-    const collection = responseCollection(exchange.resBody);
+    const collection = responseCollection(exchange.resBody, exchange.resBodyMeta);
     if (!collection) continue;
     const list = readsByPath.get(path) ?? [];
     list.push({ exchange, res: exchange.res, collection });
@@ -5562,7 +5641,7 @@ function collectResourceObservations(
     if (!path) continue;
     pathByRequest.set(exchange.requestId, path);
     if (!exchange.res || !isSuccessStatus(exchange.status)) continue;
-    const payload = responsePayload(exchange.resBody);
+    const payload = responsePayload(exchange.resBody, exchange.resBodyMeta);
     if (payload === undefined) continue;
     observations.push({
       path,

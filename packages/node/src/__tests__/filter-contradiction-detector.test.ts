@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import type { BugEvent } from "crumbtrail-core";
 import { buildEvidenceCandidates } from "../evidence-index";
+import {
+  jsonResponse,
+  request as netRequest,
+} from "./fixtures/net-res";
 
 function request(
   t: number,
@@ -8,9 +12,14 @@ function request(
   requestId = "req-a",
   method = "GET",
 ): BugEvent {
-  return { t, k: "net.req", d: { requestId, m: method, url } } as BugEvent;
+  return netRequest(t, requestId, method, url);
 }
 
+/**
+ * This detector reads the request's query string and the rows the request read;
+ * the response only has to be a 2xx. A body-free `net.res` is the minimal case,
+ * and `respondsWith` below pins that a real emitted body changes nothing.
+ */
 function response(t: number, requestId = "req-a", st = 200): BugEvent {
   return { t, k: "net.res", d: { requestId, st, dur: 12 } } as BugEvent;
 }
@@ -59,6 +68,15 @@ describe("filter_contradiction", () => {
     );
     expect(candidate?.severity).toBe("high");
     expect(candidate?.anchor.comparedColumns).toEqual(["category"]);
+  });
+
+  it("is unaffected by a real emitted response body and summary", () => {
+    const found = detectors([
+      request(10, "/api/products?category=audio"),
+      read(21, { id: 2, category: "desk" }),
+      jsonResponse(30, "req-a", [{ id: 2, category: "desk" }]),
+    ]);
+    expect(found).toContain("filter_contradiction");
   });
 
   it("reads a boolean availability filter against the stock column", () => {
