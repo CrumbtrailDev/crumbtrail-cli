@@ -619,6 +619,7 @@ export function buildEvidenceCandidates(
   addSharedStateBleedCandidates(events, index, drafts, exchanges);
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
   addBatchImportCandidates(events, index, drafts, exchanges);
+  addRelationalWriteIntegrityCandidates(events, index, drafts, exchanges);
   addRefundInvariantCandidates(events, index, drafts);
   addSessionCartInvariantCandidates(events, index, drafts, exchanges);
   addLocaleInputCandidates(index, drafts, exchanges);
@@ -5982,6 +5983,312 @@ function addBatchImportCandidates(
       });
     }
   }
+}
+
+// ─── relational write integrity ──────────────────────────────────────────────
+
+const RELATIONAL_WRITE_INTEGRITY_SCORE = DB_INVARIANT_SCORE + 3;
+const STALE_WRITEBACK_WINDOW_MS = 60_000;
+
+function scalarChanged(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+  field: string,
+): { before: string; after: string } | undefined {
+  const previous = keyValueOf(before[field]);
+  const next = keyValueOf(after[field]);
+  return previous !== undefined && next !== undefined && previous !== next
+    ? { before: previous, after: next }
+    : undefined;
+}
+
+function rowIdentity(event: BugEvent): string | undefined {
+  const table = safeText(event.d.table, 200);
+  const pk = pkEntriesOf(event);
+  if (!table || pk.length === 0) return undefined;
+  return `${bareTableName(table).toLowerCase()}:${pk
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([field, value]) => `${field}=${value}`)
+    .join("&")}`;
+}
+
+function addExistingChildrenReparentedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    const parentInserts = diffs.filter(
+      (event) =>
+        safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+        isRecord(event.d.after),
+    );
+    for (const parent of parentInserts) {
+      const parentTable = safeText(parent.d.table, 200);
+      if (!parentTable) continue;
+      const parentPk = pkEntriesOf(parent);
+      if (parentPk.length !== 1) continue;
+      const moved = diffs.filter((child) => {
+        if (
+          safeText(child.d.op, 20)?.toLowerCase() !== "update" ||
+          !isRecord(child.d.before) ||
+          !isRecord(child.d.after)
+        )
+          return false;
+        const before = child.d.before;
+        const after = child.d.after;
+        return Object.keys(after).some((field) => {
+          if (!columnReferencesTable(field, parentTable)) return false;
+          const change = scalarChanged(before, after, field);
+          return change?.after === parentPk[0][1];
+        });
+      });
+      if (moved.length === 0) continue;
+      const childTable = safeText(moved[0].d.table, 200);
+      if (
+        !childTable ||
+        moved.some(
+          (event) => safeText(event.d.table, 200) !== childTable,
+        ) ||
+        diffs.some(
+          (event) =>
+            safeText(event.d.table, 200) === childTable &&
+            safeText(event.d.op, 20)?.toLowerCase() === "insert",
+        )
+      )
+        continue;
+      const anchor = moved[0];
+      drafts.push({
+        detector: "existing_children_reparented_to_new_row",
+        title: `${moved.length} existing ${bareTableName(childTable)} row${moved.length === 1 ? "" : "s"} moved to a newly inserted ${bareTableName(parentTable)}`,
+        severity: "critical",
+        score: RELATIONAL_WRITE_INTEGRITY_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: anchor.t,
+          offsetMs:
+            offsetForEvent(anchor) ?? offsetFromStart(anchor.t, index.start),
+          route: routeAt(index.navs ?? [], anchor.t),
+          requestId,
+          table: childTable,
+          source: normalizeDbEngine(anchor.d.engine),
+          frame: dbCallsiteFrame(anchor.d.callsite),
+          message:
+            `The request inserted ${bareTableName(parentTable)} ${parentPk[0][1]}, then updated ` +
+            `${moved.length} existing ${bareTableName(childTable)} row${moved.length === 1 ? "" : "s"} to reference it without inserting replacement child rows.`,
+        }),
+        dedupeKey: `reparented:${requestId}:${childTable}:${parentTable}`,
+      });
+    }
+  }
+}
+
+function identifierTargetsTable(field: string, table: string): boolean {
+  const entity = foreignKeyEntity(field);
+  if (!entity) return false;
+  const tableEntity = singularize(
+    normalizeEntityName(bareTableName(table)),
+  );
+  return tableEntity === entity || tableEntity.endsWith(entity);
+}
+
+function addRequestTargetRowMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (!isSuccessStatus(exchange.status)) continue;
+    const request = parseStructuredBody(exchange.body);
+    if (!isRecord(request)) continue;
+    const diffs = events.filter(
+      (event) =>
+        event.k === "db.diff" &&
+        correlationIdOf(event) === exchange.requestId &&
+        ["update", "delete"].includes(
+          safeText(event.d.op, 20)?.toLowerCase() ?? "",
+        ),
+    );
+    for (const diff of diffs) {
+      const table = safeText(diff.d.table, 200);
+      const pk = pkEntriesOf(diff);
+      if (!table || pk.length !== 1) continue;
+      const targets = Object.entries(request)
+        .filter(([field]) => identifierTargetsTable(field, table))
+        .map(([field, value]) => [field, keyValueOf(value)] as const)
+        .filter(
+          (entry): entry is readonly [string, string] =>
+            entry[1] !== undefined,
+        );
+      if (targets.length !== 1 || targets[0][1] === pk[0][1]) continue;
+      drafts.push({
+        detector: "request_target_row_mismatch",
+        title: `Request targeted ${targets[0][0]}=${targets[0][1]}, but updated ${bareTableName(table)} ${pk[0][0]}=${pk[0][1]}`,
+        severity: "critical",
+        score: RELATIONAL_WRITE_INTEGRITY_SCORE + 1,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: diff.t,
+          offsetMs:
+            offsetForEvent(diff) ?? offsetFromStart(diff.t, index.start),
+          route: routeAt(index.navs ?? [], diff.t),
+          requestId: exchange.requestId,
+          method: exchange.method,
+          url: redactUrl(exchange.url),
+          status: exchange.status,
+          table,
+          source: normalizeDbEngine(diff.d.engine),
+          frame: dbCallsiteFrame(diff.d.callsite),
+          message:
+            `The accepted request named ${targets[0][0]}=${targets[0][1]}, but its correlated database mutation targeted ${bareTableName(table)} ${pk[0][0]}=${pk[0][1]}.`,
+        }),
+        dedupeKey: `targetmismatch:${exchange.requestId}:${table}`,
+      });
+    }
+  }
+}
+
+function addStaleValueWritebackCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const updates = events
+    .filter(
+      (event) =>
+        event.k === "db.diff" &&
+        safeText(event.d.op, 20)?.toLowerCase() === "update" &&
+        isRecord(event.d.before) &&
+        isRecord(event.d.after),
+    )
+    .sort((left, right) => left.t - right.t);
+  const priorByRow = new Map<string, BugEvent[]>();
+  const emitted = new Set<string>();
+  for (const current of updates) {
+    const identity = rowIdentity(current);
+    if (!identity) continue;
+    const prior = priorByRow.get(identity) ?? [];
+    for (const previous of prior) {
+      if (
+        current.t - previous.t > STALE_WRITEBACK_WINDOW_MS ||
+        correlationIdOf(current) === correlationIdOf(previous) ||
+        !isRecord(previous.d.before) ||
+        !isRecord(previous.d.after) ||
+        !isRecord(current.d.before) ||
+        !isRecord(current.d.after)
+      )
+        continue;
+      for (const field of Object.keys(current.d.after)) {
+        if (isIdentityOrClockField(field)) continue;
+        const first = scalarChanged(previous.d.before, previous.d.after, field);
+        const second = scalarChanged(current.d.before, current.d.after, field);
+        if (
+          !first ||
+          !second ||
+          first.before !== second.after ||
+          first.after !== second.before
+        )
+          continue;
+        const dedupeKey = `stalewriteback:${identity}:${field}`;
+        if (emitted.has(dedupeKey)) continue;
+        emitted.add(dedupeKey);
+        const table = safeText(current.d.table, 200);
+        drafts.push({
+          detector: "stale_value_writeback",
+          title: `${bareTableName(table ?? "row")}.${field} reverted to its prior value`,
+          severity: "high",
+          score: RELATIONAL_WRITE_INTEGRITY_SCORE - 1,
+          confidence: "medium",
+          anchor: removeUndefined({
+            t: current.t,
+            offsetMs:
+              offsetForEvent(current) ??
+              offsetFromStart(current.t, index.start),
+            route: routeAt(index.navs ?? [], current.t),
+            requestId: correlationIdOf(current),
+            table,
+            source: normalizeDbEngine(current.d.engine),
+            frame: dbCallsiteFrame(current.d.callsite),
+            message:
+              `${bareTableName(table ?? "row")}.${field} changed from ${first.before} to ${first.after}, ` +
+              `then a different request wrote the exact prior value ${second.after} back ${current.t - previous.t} ms later.`,
+          }),
+          dedupeKey,
+        });
+      }
+    }
+    prior.push(current);
+    priorByRow.set(identity, prior.slice(-8));
+  }
+}
+
+function addBatchAppliedCountMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    for (const batch of diffs) {
+      const table = safeText(batch.d.table, 200);
+      const after = isRecord(batch.d.after) ? batch.d.after : undefined;
+      const applied = finiteNumber(after?.rows_applied);
+      const batchId =
+        keyValueOf(after?.id) ??
+        (isRecord(batch.d.pk) ? keyValueOf(batch.d.pk.id) : undefined);
+      if (
+        !table ||
+        !/batches?$/i.test(bareTableName(table)) ||
+        applied === undefined ||
+        applied < 1 ||
+        !batchId
+      )
+        continue;
+      const staged = diffs.filter((event) => {
+        const stagedTable = safeText(event.d.table, 200);
+        const row = isRecord(event.d.after) ? event.d.after : undefined;
+        return (
+          safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+          stagedTable !== undefined &&
+          /stag/i.test(bareTableName(stagedTable)) &&
+          (keyValueOf(row?.batch_id) ?? keyValueOf(row?.batchId)) === batchId
+        );
+      });
+      if (staged.length === 0 || applied <= staged.length) continue;
+      drafts.push({
+        detector: "batch_applied_count_exceeds_staged_rows",
+        title: `Batch claimed ${applied} applied rows after staging only ${staged.length}`,
+        severity: "high",
+        score: RELATIONAL_WRITE_INTEGRITY_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: batch.t,
+          offsetMs:
+            offsetForEvent(batch) ?? offsetFromStart(batch.t, index.start),
+          route: routeAt(index.navs ?? [], batch.t),
+          requestId,
+          table,
+          source: normalizeDbEngine(batch.d.engine),
+          frame: dbCallsiteFrame(batch.d.callsite),
+          message:
+            `${bareTableName(table)} ${batchId} recorded rows_applied=${applied}, but the same request inserted only ${staged.length} correlated staging row${staged.length === 1 ? "" : "s"}.`,
+        }),
+        dedupeKey: `batchapplied:${requestId}:${table}:${batchId}`,
+      });
+    }
+  }
+}
+
+function addRelationalWriteIntegrityCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  addExistingChildrenReparentedCandidates(events, index, drafts);
+  addRequestTargetRowMismatchCandidates(events, index, drafts, exchanges);
+  addStaleValueWritebackCandidates(events, index, drafts);
+  addBatchAppliedCountMismatchCandidates(events, index, drafts);
 }
 
 // ─── refund and return invariants ─────────────────────────────────────────────
