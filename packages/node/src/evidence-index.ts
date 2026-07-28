@@ -593,6 +593,7 @@ export function buildEvidenceCandidates(
   addStateFlipFlopCandidates(events, index, drafts);
   addDuplicateChargeCandidates(events, index, drafts);
   addMoneyScaleShiftCandidates(events, index, drafts);
+  addCrossUserReadCandidates(events, index, drafts);
   addLostUpdateCandidates(events, index, drafts);
   addCounterContradictionCandidates(events, index, drafts);
   addNPlusOneCandidates(events, index, drafts);
@@ -3311,6 +3312,76 @@ function addMoneyScaleShiftCandidates(
         dedupeKey: `moneyscale:${key}`,
       });
     }
+  }
+}
+
+/**
+ * cross_user_read: a request served one user another user's row.
+ *
+ * The live case: GET /api/orders/1 loaded the order by id alone — no user_id
+ * predicate — so the "Stranger" account read the "Owner" account's order with
+ * a clean 200. The session stream carries both halves: the login wrote
+ * sessions.user_id = 4, and the later read returned orders.user_id = 1.
+ *
+ * The active user comes ONLY from writes/reads on a sessions-shaped table, so
+ * flows with no session trail (anonymous browsing, ops consoles on token
+ * auth) never establish one and stay silent — which also keeps legitimate
+ * admin flows out. This is a targeted authorization signal, not a general
+ * ownership policy: it claims exactly "this session's user got a row owned by
+ * someone else", and shows both ids so the reader can judge.
+ */
+function addCrossUserReadCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const isSessionTable = (table: string): boolean =>
+    /(^|_)(sessions?|auth_sessions?|user_sessions?)$/i.test(table);
+  const ownerOf = (row: Record<string, unknown>): unknown =>
+    row.user_id ?? row.owner_id ?? row.customer_id ?? row.account_id;
+
+  const seen = new Set<string>();
+  let activeUser: unknown;
+  let establishedAt: number | undefined;
+  for (const event of events) {
+    if (event.k !== "db.diff" && event.k !== "db.read") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const image = event.k === "db.diff" ? event.d.after : event.d.row;
+    if (!isRecord(image)) continue;
+    if (isSessionTable(table)) {
+      const sessionUser = image.user_id;
+      if (sessionUser !== null && sessionUser !== undefined) {
+        activeUser = sessionUser;
+        establishedAt = event.t;
+      }
+      continue;
+    }
+    if (activeUser === undefined) continue;
+    if (event.k !== "db.read") continue;
+    if (/(^|_)users?$/i.test(table)) continue;
+    const owner = ownerOf(image);
+    if (owner === null || owner === undefined) continue;
+    if (String(owner) === String(activeUser)) continue;
+    const key = `${table}:${String(owner)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    drafts.push({
+      detector: "cross_user_read",
+      title: `Cross-user read: ${table} row owned by user ${scrubText(String(owner), 60)} served to user ${scrubText(String(activeUser), 60)}`,
+      severity: "high",
+      score: 85,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: safeText(event.d.requestId, 200),
+        message: `The active session belongs to user ${scrubText(String(activeUser), 60)} (established at +${Math.round(offsetFromStart(establishedAt ?? event.t, index.start) ?? 0)} ms), yet this request read a ${table} row owned by user ${scrubText(String(owner), 60)}. If this endpoint is not meant to serve other users' data, the query is missing an ownership predicate.`,
+        source: normalizeDbEngine(event.d.engine),
+      }),
+      dedupeKey: `crossuser:${key}`,
+    });
   }
 }
 
