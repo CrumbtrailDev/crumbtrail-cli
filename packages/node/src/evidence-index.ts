@@ -626,6 +626,7 @@ export function buildEvidenceCandidates(
   addLocaleInputCandidates(index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
   addDeclinedPaymentOrderedCandidates(events, index, drafts);
+  addCheckoutCorrectnessCandidates(events, index, drafts);
   addDownstreamSucceededAfterTimeoutCandidates(events, index, drafts);
   addInvalidWebhookSignatureAcceptedCandidates(
     events,
@@ -7570,6 +7571,172 @@ function addRuntimeWarningCandidates(
       dedupeKey: `runtimewarning:${name}:${normalizeErrorSignature(event.d.message)}`,
     });
   }
+}
+
+// ─── checkout correctness ────────────────────────────────────────────────────
+
+const CHECKOUT_CORRECTNESS_SCORE = DB_INVARIANT_SCORE + 5;
+
+function insertedOrderForRequest(
+  events: BugEvent[],
+  requestId: string,
+): BugEvent | undefined {
+  return events.find(
+    (event) =>
+      event.k === "db.diff" &&
+      correlationIdOf(event) === requestId &&
+      safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+      bareTableName(safeText(event.d.table, 200) ?? "").toLowerCase() ===
+        "orders" &&
+      isRecord(event.d.after),
+  );
+}
+
+function addPricingOutcomeContradictionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const pricing of events) {
+    if (
+      pricing.k !== "backend.http" ||
+      safeText(pricing.d.service, 80)?.toLowerCase() !== "pricing"
+    )
+      continue;
+    const requestId = correlationIdOf(pricing);
+    if (!requestId) continue;
+    const order = insertedOrderForRequest(events, requestId);
+    if (!order || !isRecord(order.d.after)) continue;
+    const orderTotal =
+      finiteNumber(order.d.after.total_cents) ??
+      finiteNumber(order.d.after.totalCents);
+    if (orderTotal === undefined) continue;
+
+    const pricingTotal =
+      finiteNumber(pricing.d.totalCents) ??
+      finiteNumber(pricing.d.total_cents);
+    if (
+      finiteNumber(pricing.d.status) === 200 &&
+      pricingTotal !== undefined &&
+      pricingTotal !== orderTotal
+    ) {
+      drafts.push({
+        detector: "pricing_total_ignored_by_checkout",
+        title: `Checkout stored ${orderTotal} after pricing returned ${pricingTotal}`,
+        severity: "critical",
+        score: CHECKOUT_CORRECTNESS_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: order.t,
+          offsetMs:
+            offsetForEvent(order) ?? offsetFromStart(order.t, index.start),
+          route: routeAt(index.navs ?? [], order.t),
+          requestId,
+          table: safeText(order.d.table, 200),
+          source: normalizeDbEngine(order.d.engine),
+          frame: dbCallsiteFrame(order.d.callsite),
+          message:
+            `The pricing service returned totalCents=${pricingTotal}, but the correlated orders insert persisted total_cents=${orderTotal}.`,
+        }),
+        dedupeKey: `pricingtotalignored:${requestId}`,
+      });
+    }
+
+    const timedOut =
+      finiteNumber(pricing.d.status) === 0 &&
+      (safeText(pricing.d.errorKind, 80)?.toLowerCase() === "timeout" ||
+        /timed?\s*out/i.test(safeText(pricing.d.error, 200) ?? ""));
+    if (!timedOut) continue;
+    drafts.push({
+      detector: "checkout_committed_after_pricing_timeout",
+      title: `Checkout committed an order after authoritative pricing timed out`,
+      severity: "critical",
+      score: CHECKOUT_CORRECTNESS_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: order.t,
+        offsetMs:
+          offsetForEvent(order) ?? offsetFromStart(order.t, index.start),
+        route: routeAt(index.navs ?? [], order.t),
+        requestId,
+        table: safeText(order.d.table, 200),
+        source: normalizeDbEngine(order.d.engine),
+        frame: dbCallsiteFrame(order.d.callsite),
+        message:
+          `The pricing request timed out without returning an authoritative total, but the same request inserted an order with total_cents=${orderTotal}.`,
+      }),
+      dedupeKey: `pricingtimeoutcommit:${requestId}`,
+    });
+  }
+}
+
+function addNegativeInventoryOrderCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const order of events) {
+    if (
+      order.k !== "db.diff" ||
+      safeText(order.d.op, 20)?.toLowerCase() !== "insert" ||
+      bareTableName(safeText(order.d.table, 200) ?? "").toLowerCase() !==
+        "orders"
+    )
+      continue;
+    const requestId = correlationIdOf(order);
+    if (!requestId) continue;
+    const negative = events.find((event) => {
+      if (
+        event.k !== "db.diff" ||
+        correlationIdOf(event) !== requestId ||
+        !isRecord(event.d.after)
+      )
+        return false;
+      return Object.entries(event.d.after).some(
+        ([field, value]) =>
+          /(?:inventory|stock|quantity|qty)/i.test(field) &&
+          finiteNumber(value) !== undefined &&
+          finiteNumber(value)! < 0,
+      );
+    });
+    if (!negative || !isRecord(negative.d.after)) continue;
+    const negativeField = Object.entries(negative.d.after).find(
+      ([field, value]) =>
+        /(?:inventory|stock|quantity|qty)/i.test(field) &&
+        finiteNumber(value) !== undefined &&
+        finiteNumber(value)! < 0,
+    );
+    if (!negativeField) continue;
+    drafts.push({
+      detector: "order_committed_with_negative_inventory",
+      title: `Order committed while ${bareTableName(safeText(negative.d.table, 200) ?? "inventory")}.${negativeField[0]} was ${negativeField[1]}`,
+      severity: "critical",
+      score: CHECKOUT_CORRECTNESS_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: order.t,
+        offsetMs:
+          offsetForEvent(order) ?? offsetFromStart(order.t, index.start),
+        route: routeAt(index.navs ?? [], order.t),
+        requestId,
+        table: safeText(order.d.table, 200),
+        source: normalizeDbEngine(order.d.engine),
+        frame: dbCallsiteFrame(order.d.callsite),
+        message:
+          `The request wrote ${negativeField[0]}=${negativeField[1]} and still inserted an orders row. The oversold checkout was not rolled back.`,
+      }),
+      dedupeKey: `negativeinventoryorder:${requestId}`,
+    });
+  }
+}
+
+function addCheckoutCorrectnessCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  addPricingOutcomeContradictionCandidates(events, index, drafts);
+  addNegativeInventoryOrderCandidates(events, index, drafts);
 }
 
 // ─── declined_payment_ordered ───────────────────────────────────────────────
