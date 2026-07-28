@@ -272,6 +272,57 @@ describe("backend event contract helpers", () => {
     expect(JSON.stringify(event.d)).not.toContain("SHOULD_NOT_LEAK");
   });
 
+  // A 500 tells a reader that something failed and the message tells them what.
+  // Neither names the line to change, so the agent handed the bundle still goes
+  // looking — the same problem `db.diff` callsites already solve for writes.
+  // The frames are parsed out of the thrown error and reported structurally;
+  // the raw stack text still never rests, which the sibling test above pins.
+  it("reports the app frames of a thrown error without serializing its stack", () => {
+    const error = new Error("checkout failed");
+    error.stack = [
+      "Error: checkout failed",
+      `    at placeOrder (${process.cwd()}/server/src/services/order-service.js:118:11)`,
+      `    at async postCheckout (${process.cwd()}/server/src/routes/checkout.js:41:20)`,
+      "    at node:internal/process/task_queues:95:5",
+      `    at Layer.handle (${process.cwd()}/node_modules/express/lib/router/layer.js:95:5)`,
+    ].join("\n");
+
+    const event = buildBackendRequestErrorEvent({
+      now: 1000,
+      sessionId: "ses_frames",
+      requestId: "req_frames",
+      method: "POST",
+      url: "/api/checkout",
+      statusCode: 500,
+      error,
+    });
+
+    // Innermost app frame first, repo-relative, with the caller chain above it.
+    expect(event.d.error).toMatchObject({
+      frames: [
+        { file: "server/src/services/order-service.js", line: 118, column: 11, fn: "placeOrder" },
+        { file: "server/src/routes/checkout.js", line: 41, column: 20, fn: "postCheckout" },
+      ],
+    });
+    // Node internals and dependency frames are never the answer.
+    expect(JSON.stringify(event.d)).not.toContain("node:internal");
+    expect(JSON.stringify(event.d)).not.toContain("node_modules");
+    // The raw stack string itself still does not rest.
+    expect(JSON.stringify(event.d)).not.toContain("Error: checkout failed\n");
+  });
+
+  it("omits frames when the error carries no recognizable app frame", () => {
+    const event = buildBackendRequestErrorEvent({
+      now: 1000,
+      sessionId: "ses_no_frames",
+      requestId: "req_no_frames",
+      url: "/api/error",
+      error: Object.assign(new Error("opaque"), { stack: "Error: opaque" }),
+    });
+
+    expect(event.d.error).not.toHaveProperty("frames");
+  });
+
   it("redacts token-like error details and records redaction policy metadata", () => {
     const secret = "Bearer abcdefghijklmnopqrstuvwxyz1234567890";
     const event = buildBackendRequestErrorEvent({
