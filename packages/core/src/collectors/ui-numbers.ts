@@ -58,19 +58,121 @@ export interface UiNumItem {
  * The element's entire trimmed text must be the token — free prose containing
  * numbers is not a labeled figure.
  */
+// The numeric core is deliberately loose here — digits (Latin or Arabic-Indic)
+// plus every separator any supported locale renders — and then normalized and
+// validated strictly below. A single US-format regex silently blinded this
+// collector for every decimal-comma shopper: de-DE's `$129,00` parsed as
+// nothing, so a German session carried zero numeric evidence.
 const NUM_TOKEN_RE =
-  /^([$€£¥])?\s*(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?)\s*([$€£¥%])?$/;
+  /^([$€£¥])?\s*(-?[\d٠-٩۰-۹][\d٠-٩۰-۹.,٫٬    ]*)\s*([$€£¥%])?$/;
 
 /** Containers that delimit a snapshot region. */
 const REGION_SELECTOR =
   "dl, table, ul, ol, form, fieldset, section, article, aside, nav, main";
 
+/**
+ * Whether `lang` renders decimals with a comma (de-DE, fr-FR, ar-EG, …).
+ * Derived from Intl rather than a hardcoded language list; cached because the
+ * scan asks once per numeric leaf.
+ */
+const COMMA_DECIMAL_CACHE = new Map<string, boolean>();
+function usesCommaDecimal(lang: string | null): boolean {
+  if (!lang) return false;
+  const cached = COMMA_DECIMAL_CACHE.get(lang);
+  if (cached !== undefined) return cached;
+  let comma = false;
+  try {
+    for (const part of new Intl.NumberFormat(lang).formatToParts(1.1)) {
+      if (part.type === "decimal") {
+        comma = part.value === "," || part.value === "٫";
+        break;
+      }
+    }
+  } catch {
+    // Unknown language tag: keep the dot-decimal default.
+  }
+  COMMA_DECIMAL_CACHE.set(lang, comma);
+  return comma;
+}
+
+const ARABIC_INDIC_DIGIT_RE = /[٠-٩۰-۹]/g;
+const SPACE_GROUP_RE = /[    ]/g;
+
+/**
+ * Reduces a locale-rendered numeric string to canonical `-?\d+(\.\d+)?` form,
+ * or null when the separators don't form a coherent number. When dot and comma
+ * both appear, the later one is the decimal separator (shape alone decides:
+ * `1.234,56` vs `1,234.56`). A single separator followed by exactly three
+ * digits is ambiguous (`1,234`), and the page language breaks the tie; any
+ * other single-separator shape is a decimal.
+ */
+function normalizeNumericCore(core: string, lang: string | null): string | null {
+  let text = core
+    .replace(ARABIC_INDIC_DIGIT_RE, (d) => {
+      const code = d.charCodeAt(0);
+      return String(code >= 0x06f0 ? code - 0x06f0 : code - 0x0660);
+    })
+    .replace(/٫/g, ",")
+    .replace(/٬/g, ".")
+    .replace(SPACE_GROUP_RE, "");
+
+  const sign = text.startsWith("-") ? "-" : "";
+  if (sign) text = text.slice(1);
+  if (!/^[\d.,]+$/.test(text)) return null;
+
+  const lastDot = text.lastIndexOf(".");
+  const lastComma = text.lastIndexOf(",");
+  let decimalSep: string | null = null;
+  if (lastDot !== -1 && lastComma !== -1) {
+    decimalSep = lastDot > lastComma ? "." : ",";
+  } else if (lastDot !== -1 || lastComma !== -1) {
+    const sep = lastDot !== -1 ? "." : ",";
+    const occurrences = text.split(sep).length - 1;
+    const tail = text.slice(text.lastIndexOf(sep) + 1);
+    if (occurrences > 1) {
+      decimalSep = null; // repeated separator can only be grouping
+    } else if (tail.length === 3) {
+      // Ambiguous (`1,234` / `1.234`): the page language decides which side
+      // of the Atlantic the grouping convention comes from.
+      const commaDecimal = usesCommaDecimal(lang);
+      decimalSep = sep === "," ? (commaDecimal ? "," : null) : commaDecimal ? null : ".";
+    } else if (sep === "," && tail.length > 2 && !usesCommaDecimal(lang)) {
+      // `12,3456` on a dot-decimal page is neither grouping nor money.
+      return null;
+    } else {
+      decimalSep = sep;
+    }
+  }
+
+  let integer = text;
+  let fraction = "";
+  if (decimalSep !== null) {
+    const at = text.lastIndexOf(decimalSep);
+    integer = text.slice(0, at);
+    fraction = text.slice(at + 1);
+    if (!/^\d+$/.test(fraction)) return null;
+  }
+  const groupSep = decimalSep === "," ? "." : decimalSep === "." ? "," : null;
+  if (groupSep ? integer.includes(groupSep) : /[.,]/.test(integer)) {
+    const sep = groupSep ?? (integer.includes(".") ? "." : ",");
+    if (integer.includes(sep === "." ? "," : ".")) return null;
+    const grouped = new RegExp(`^\\d{1,3}(?:\\${sep}\\d{3})+$`);
+    if (!grouped.test(integer)) return null;
+    integer = integer.split(sep).join("");
+  }
+  if (!/^\d+$/.test(integer)) return null;
+  return `${sign}${integer}${fraction ? `.${fraction}` : ""}`;
+}
+
 export function parseNumericToken(
   text: string,
+  lang: string | null = null,
 ): { value: number; unit?: string } | null {
   const match = NUM_TOKEN_RE.exec(text.trim());
   if (!match) return null;
-  const value = Number.parseFloat(match[2].replace(/,/g, ""));
+  const normalized = normalizeNumericCore(match[2], lang);
+  if (normalized === null) return null;
+  const value = Number.parseFloat(normalized);
   if (!Number.isFinite(value)) return null;
   const unit = match[1] ?? match[3];
   return unit ? { value, unit } : { value };
@@ -301,6 +403,7 @@ export function scanUiNumbers(
   root: Element,
   denyFields?: string[],
   maxElements: number = UI_NUM_MAX_SCAN_ELEMENTS,
+  lang: string | null = null,
 ): Map<string, UiNumItem[]> | null {
   const elements = root.querySelectorAll("*");
   if (elements.length > maxElements) return null;
@@ -310,7 +413,7 @@ export function scanUiNumbers(
     const tag = el.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") continue;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") continue;
-    const parsed = parseNumericToken(el.textContent ?? "");
+    const parsed = parseNumericToken(el.textContent ?? "", lang);
     if (!parsed) continue;
     if (isHiddenElement(el)) continue;
     const label = resolveLabel(el);
@@ -475,7 +578,15 @@ function startUiNumbersCollector(
       emitLayout(bus);
     }
     try {
-      const regions = scanUiNumbers(document.body, denyFields);
+      // Locale first: the page language decides how ambiguous separators in
+      // rendered numbers are read (`1,234` is a thousand in en, 1.234 in de).
+      const locale = readLocale();
+      const regions = scanUiNumbers(
+        document.body,
+        denyFields,
+        UI_NUM_MAX_SCAN_ELEMENTS,
+        locale.lang,
+      );
       if (regions === null) {
         // Over budget: the page has too many elements to scan safely on the
         // 500ms cadence. Permanently disable rather than emit a partial (and
@@ -487,7 +598,6 @@ function startUiNumbersCollector(
         );
         return;
       }
-      const locale = readLocale();
       for (const [region, items] of regions) {
         if (items.length === 0) continue;
         const serialized = JSON.stringify(items);

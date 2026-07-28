@@ -72,6 +72,50 @@ describe("parseNumericToken", () => {
     expect(parseNumericToken("")).toBeNull();
     expect(parseNumericToken("free")).toBeNull();
   });
+
+  it("parses decimal-comma locales", () => {
+    expect(parseNumericToken("$129,00", "de-DE")).toEqual({
+      value: 129,
+      unit: "$",
+    });
+    expect(parseNumericToken("$1.234,56", "de-DE")).toEqual({
+      value: 1234.56,
+      unit: "$",
+    });
+    // fr-FR groups thousands with narrow no-break space.
+    expect(parseNumericToken("1 234,56 €", "fr-FR")).toEqual({
+      value: 1234.56,
+      unit: "€",
+    });
+    // Comma-decimal needs no lang hint when the shape is unambiguous.
+    expect(parseNumericToken("129,00")).toEqual({ value: 129 });
+  });
+
+  it("breaks the ambiguous three-digit-tail tie with the page language", () => {
+    expect(parseNumericToken("1,234", "en-US")).toEqual({ value: 1234 });
+    expect(parseNumericToken("1,234", "de-DE")).toEqual({ value: 1.234 });
+    expect(parseNumericToken("1.234", "en-US")).toEqual({ value: 1.234 });
+    expect(parseNumericToken("1.234", "de-DE")).toEqual({ value: 1234 });
+    // ja-JP groups with commas and uses dot decimals, like en.
+    expect(parseNumericToken("$1,235", "ja-JP")).toEqual({
+      value: 1235,
+      unit: "$",
+    });
+  });
+
+  it("parses Arabic-Indic digits and separators", () => {
+    expect(parseNumericToken("١٢٩٫٠٠", "ar-EG")).toEqual({ value: 129 });
+    expect(parseNumericToken("$١٬٢٣٤٫٥٦", "ar-EG")).toEqual({
+      value: 1234.56,
+      unit: "$",
+    });
+  });
+
+  it("rejects incoherent separator shapes", () => {
+    expect(parseNumericToken("1,23,4", "en-US")).toBeNull();
+    expect(parseNumericToken("1.2.3,4.5")).toBeNull();
+    expect(parseNumericToken("12,3456")).toBeNull();
+  });
 });
 
 describe("scanUiNumbers element budget", () => {
