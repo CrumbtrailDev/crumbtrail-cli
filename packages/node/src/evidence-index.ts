@@ -621,6 +621,7 @@ export function buildEvidenceCandidates(
   addBatchImportCandidates(events, index, drafts, exchanges);
   addRelationalWriteIntegrityCandidates(events, index, drafts, exchanges);
   addOpsStateLifecycleCandidates(events, index, drafts, exchanges);
+  addDataLifecycleIntegrityCandidates(events, index, drafts, exchanges);
   addRefundInvariantCandidates(events, index, drafts);
   addSessionCartInvariantCandidates(events, index, drafts, exchanges);
   addLocaleInputCandidates(index, drafts, exchanges);
@@ -6727,6 +6728,299 @@ function addOpsStateLifecycleCandidates(
   addRetryClockShiftCandidates(events, index, drafts);
   addInflightSessionInvalidationCandidates(events, index, drafts);
   addCachedEmptyAfterDataCandidates(events, index, drafts);
+}
+
+// ─── data lifecycle integrity ────────────────────────────────────────────────
+
+const DATA_LIFECYCLE_SCORE = DB_INVARIANT_SCORE + 2;
+const FREE_TEXT_FIELDS = /^(body|comment|content|description|message|note|text)$/i;
+
+function redactedLengthsByField(
+  value: unknown,
+  out = new Map<string, number[]>(),
+  depth = 0,
+): Map<string, number[]> {
+  if (depth > MAX_BODY_SCOPE_DEPTH) return out;
+  if (Array.isArray(value)) {
+    for (const item of value) redactedLengthsByField(item, out, depth + 1);
+    return out;
+  }
+  if (!isRecord(value)) return out;
+  for (const [field, child] of Object.entries(value)) {
+    if (isRedactedPlaceholder(child)) {
+      const length = finiteNumber((child as Record<string, unknown>).len);
+      if (length !== undefined) {
+        const values = out.get(field) ?? [];
+        values.push(length);
+        out.set(field, values);
+      }
+      continue;
+    }
+    redactedLengthsByField(child, out, depth + 1);
+  }
+  return out;
+}
+
+function addAcceptedTextTruncationCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (
+      !MUTATING_METHODS.has(exchange.method) ||
+      !isSuccessStatus(exchange.status) ||
+      !exchange.res
+    ) continue;
+    const request = parseStructuredBody(exchange.body);
+    // The raw redacted JSON preserves placeholder length metadata. The bounded
+    // bodyMeta view may intentionally collapse a sensitive nested string to the
+    // scalar "[REDACTED]", so prefer the privacy-safe raw shape here.
+    const response =
+      parseStructuredBody(exchange.resBody) ??
+      responsePayload(exchange.resBody, exchange.resBodyMeta);
+    if (request === undefined || response === undefined) continue;
+    const requested = redactedLengthsByField(request);
+    const returned = redactedLengthsByField(response);
+    for (const [field, requestLengths] of requested) {
+      if (!FREE_TEXT_FIELDS.test(field)) continue;
+      const responseLengths = returned.get(field);
+      if (!responseLengths) continue;
+      const requestLength = Math.max(...requestLengths);
+      const responseLength = Math.max(...responseLengths);
+      if (
+        requestLength < 32 ||
+        responseLength >= requestLength ||
+        requestLength - responseLength < 4
+      ) continue;
+      drafts.push({
+        detector: "accepted_text_was_truncated",
+        title: `Successful write shortened ${field} from ${requestLength} to ${responseLength} characters`,
+        severity: "high",
+        score: DATA_LIFECYCLE_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: exchange.res.t,
+          offsetMs: offsetForEvent(exchange.res) ?? offsetFromStart(exchange.res.t, index.start),
+          route: routeAt(index.navs ?? [], exchange.res.t),
+          requestId: exchange.requestId,
+          method: exchange.method,
+          url: redactUrl(exchange.url),
+          status: exchange.status,
+          message:
+            `The accepted request carried a redacted ${field} with length ${requestLength}, ` +
+            `but the successful response returned that field with length ${responseLength}.`,
+        }),
+        dedupeKey: `acceptedtexttruncated:${exchange.requestId}:${field}`,
+      });
+      break;
+    }
+  }
+}
+
+function addDerivedCountBelowObservedInsertsCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const inserts = events.filter(
+    (event) =>
+      event.k === "db.diff" &&
+      safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+      isRecord(event.d.after),
+  );
+  for (const cacheWrite of events) {
+    if (
+      cacheWrite.k !== "db.diff" ||
+      !["insert", "update"].includes(
+        safeText(cacheWrite.d.op, 20)?.toLowerCase() ?? "",
+      ) ||
+      !isRecord(cacheWrite.d.after)
+    ) continue;
+    const cacheTable = safeText(cacheWrite.d.table, 200);
+    if (!cacheTable || !/(cache|rollup|summary|aggregate)/i.test(cacheTable))
+      continue;
+    const countEntry = Object.entries(cacheWrite.d.after).find(
+      ([field, value]) =>
+        /(?:^|_)count$/i.test(field) && finiteNumber(value) !== undefined,
+    );
+    const parentEntry =
+      Object.entries(cacheWrite.d.after).find(
+        ([field, value]) =>
+          !ID_EXACT.test(field) &&
+          isIdLikeField(field) &&
+          keyValueOf(value) !== undefined,
+      ) ??
+      Object.entries(cacheWrite.d.after).find(
+        ([field, value]) =>
+          isIdLikeField(field) && keyValueOf(value) !== undefined,
+      );
+    if (!countEntry || !parentEntry) continue;
+    const [countField, rawCount] = countEntry;
+    const [parentField, rawParent] = parentEntry;
+    const derivedCount = finiteNumber(rawCount);
+    const parentId = keyValueOf(rawParent);
+    if (derivedCount === undefined || !parentId) continue;
+    const matching = inserts.filter((event) => {
+      if (
+        event.t > cacheWrite.t ||
+        safeText(event.d.table, 200) === cacheTable ||
+        !isRecord(event.d.after)
+      ) return false;
+      return Object.entries(event.d.after).some(
+        ([field, value]) =>
+          normalizeFieldName(field) === normalizeFieldName(parentField) &&
+          keyValueOf(value) === parentId,
+      );
+    });
+    if (matching.length <= derivedCount) continue;
+    drafts.push({
+      detector: "derived_count_below_observed_inserts",
+      title: `${cacheTable}.${countField}=${derivedCount} after ${matching.length} matching rows were inserted`,
+      severity: "high",
+      score: DATA_LIFECYCLE_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: cacheWrite.t,
+        offsetMs: offsetForEvent(cacheWrite) ?? offsetFromStart(cacheWrite.t, index.start),
+        route: routeAt(index.navs ?? [], cacheWrite.t),
+        requestId: correlationIdOf(cacheWrite),
+        table: cacheTable,
+        source: normalizeDbEngine(cacheWrite.d.engine),
+        frame: dbCallsiteFrame(cacheWrite.d.callsite),
+        message:
+          `The session captured ${matching.length} inserted rows with ${parentField}=${parentId}, ` +
+          `but the derived row subsequently stored ${countField}=${derivedCount}.`,
+      }),
+      dedupeKey: `derivedcountbelowinserts:${cacheTable}:${parentField}:${parentId}`,
+    });
+  }
+}
+
+function addResponseLimitExceededCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (
+      exchange.method !== "GET" ||
+      !isSuccessStatus(exchange.status) ||
+      !exchange.res
+    ) continue;
+    const parsed = parseCapturedUrl(exchange.url);
+    const rawLimit = parsed?.searchParams.get("limit");
+    if (!rawLimit) continue;
+    const limit = Number(rawLimit);
+    if (!Number.isInteger(limit) || limit < 0) continue;
+    const collection = responseCollection(exchange.resBody, exchange.resBodyMeta);
+    if (!collection || collection.total <= limit) continue;
+    drafts.push({
+      detector: "response_exceeded_requested_limit",
+      title: `Response returned ${collection.total} rows despite limit=${limit}`,
+      severity: "high",
+      score: DATA_LIFECYCLE_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs: offsetForEvent(exchange.res) ?? offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        message: `The request explicitly set limit=${limit}, but the captured response contained ${collection.total} collection rows.`,
+      }),
+      dedupeKey: `responselimitexceeded:${capturedUrlPath(exchange.url) ?? ""}:${limit}`,
+    });
+  }
+}
+
+function lifecycleType(value: unknown): string | undefined {
+  const text = safeText(value, 120)?.toLowerCase();
+  if (!text) return undefined;
+  if (/(^|[_-])cancel(?:led|ed)?($|[_-])/.test(text)) return "cancelled";
+  if (/(^|[_-])confirm(?:ed)?($|[_-])/.test(text)) return "confirmed";
+  return undefined;
+}
+
+function addInvertedLifecycleNotificationCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const notifications = events
+    .filter(
+      (event) =>
+        (event.k === "db.read" || event.k === "db.diff") &&
+        bareTableName(safeText(event.d.table, 200) ?? "").toLowerCase() ===
+          "notifications",
+    )
+    .flatMap((event) => {
+      const row =
+        event.k === "db.read"
+          ? isRecord(event.d.row)
+            ? event.d.row
+            : undefined
+          : isRecord(event.d.after)
+            ? event.d.after
+            : undefined;
+      const orderId = row ? orderIdFromRow(row) : undefined;
+      const kind = row
+        ? lifecycleType(row.type) ?? lifecycleType(row.kind)
+        : undefined;
+      const status = row ? safeText(row.status, 40)?.toLowerCase() : undefined;
+      return orderId && kind && (!status || status === "sent")
+        ? [{ event, orderId, kind }]
+        : [];
+    })
+    .sort((left, right) => left.event.t - right.event.t);
+  const byOrder = new Map<string, typeof notifications>();
+  for (const notification of notifications) {
+    const list = byOrder.get(notification.orderId) ?? [];
+    list.push(notification);
+    byOrder.set(notification.orderId, list);
+  }
+  for (const [orderId, list] of byOrder) {
+    const cancelled = list.find((entry) => entry.kind === "cancelled");
+    const confirmed = list.find(
+      (entry) =>
+        entry.kind === "confirmed" &&
+        cancelled !== undefined &&
+        entry.event.t >= cancelled.event.t,
+    );
+    if (!cancelled || !confirmed) continue;
+    drafts.push({
+      detector: "notification_lifecycle_order_inverted",
+      title: `Order ${orderId} was confirmed after its cancellation notification`,
+      severity: "high",
+      score: DATA_LIFECYCLE_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: confirmed.event.t,
+        offsetMs: offsetForEvent(confirmed.event) ?? offsetFromStart(confirmed.event.t, index.start),
+        route: routeAt(index.navs ?? [], confirmed.event.t),
+        requestId: correlationIdOf(confirmed.event),
+        table: safeText(confirmed.event.d.table, 200),
+        source: normalizeDbEngine(confirmed.event.d.engine),
+        message:
+          `The captured notification history for order ${orderId} recorded a sent cancellation before a sent confirmation.`,
+      }),
+      dedupeKey: `notificationlifecycleinverted:${orderId}`,
+    });
+  }
+}
+
+function addDataLifecycleIntegrityCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  addAcceptedTextTruncationCandidates(index, drafts, exchanges);
+  addDerivedCountBelowObservedInsertsCandidates(events, index, drafts);
+  addResponseLimitExceededCandidates(index, drafts, exchanges);
+  addInvertedLifecycleNotificationCandidates(events, index, drafts);
 }
 
 // ─── refund and return invariants ─────────────────────────────────────────────
