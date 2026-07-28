@@ -156,4 +156,18 @@ describe("response_race", () => {
     ];
     expect(detectors(events)).toContain("response_race");
   });
+
+  it("reports nothing when two responses share one request id", () => {
+    // The browser restarts its request counter on navigation, so a reload
+    // replays id 1 and the second response joins the first request's record.
+    // Send order does not exist for such a pair — a phantom race reported
+    // from it anchored a live session's ranking with "+99 ms vs +99 ms".
+    const events = [
+      req(1, 100, "http://x/build-id.json"),
+      req(1, 220, "http://x/build-id.json"),
+      res(1, 230),
+      res(1, 360),
+    ];
+    expect(detectors(events)).not.toContain("response_race");
+  });
 });

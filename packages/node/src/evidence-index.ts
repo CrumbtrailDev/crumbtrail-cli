@@ -1075,6 +1075,12 @@ function addResponseRaceCandidates(
       for (let j = i + 1; j < bucket.length; j += 1) {
         const first = bucket[i];
         const second = bucket[j];
+        // Equal send sequence means both responses joined the SAME request
+        // record — the browser restarts its request ids on navigation, so a
+        // page reload replays id 1 and the second response has no request of
+        // its own. The race claim rests entirely on send order, and for such
+        // a pair send order does not exist; report nothing.
+        if (first.sentSeq === second.sentSeq) continue;
         // `earlier` and `later` are by send order; the race is that `later`
         // also came back first.
         const later = second.sentSeq > first.sentSeq ? second : first;
