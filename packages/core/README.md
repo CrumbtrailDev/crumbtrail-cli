@@ -175,6 +175,15 @@ cut, keyed by its path, so a truncated list is never mistaken for a short one.
 Anything else, including cross origin and oversized responses, carries the
 content type and byte size only.
 
+### Server-sent events (`net.sse`)
+
+The `eventSource` collector wraps the `EventSource` constructor and emits
+`{ url, op }` for open, error, and close, with `count` (messages received so
+far) on error and close, and `reopen: true` when a stream to the same URL is
+recreated within 30 seconds of the last failure. That makes a stream which
+quietly drops and reconnects visible while the page shows stale data. Message
+payloads are never read.
+
 ### Listener accounting (`ui.listeners`)
 
 The `listeners` collector is **on by default** and disabled by `PRESET_LIGHT`.

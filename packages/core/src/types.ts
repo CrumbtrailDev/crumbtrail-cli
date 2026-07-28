@@ -456,6 +456,9 @@ export interface CrumbtrailConfig {
   // Live event-listener gauge (`k:'ui.listeners'`)
   listeners: boolean;
 
+  // Server-sent events lifecycle (`k:'net.sse'`)
+  eventSource: boolean;
+
   // Environment snapshot
   environment: boolean;
 
@@ -614,6 +617,8 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   uiNumbers: true,
 
   listeners: true,
+
+  eventSource: true,
 
   environment: true,
 

@@ -57,6 +57,7 @@ import { performanceCollector } from "./collectors/performance";
 import { heartbeatCollector } from "./collectors/heartbeat";
 import { uiNumbersCollector } from "./collectors/ui-numbers";
 import { listenerCollector } from "./collectors/listeners";
+import { eventSourceCollector } from "./collectors/eventsource";
 import { environmentCollector, buildEnvDelta } from "./collectors/environment";
 import type { EnvDeclaration } from "./types";
 import {
@@ -94,6 +95,7 @@ const COLLECTOR_MAP: Record<string, Collector> = {
   heartbeat: heartbeatCollector,
   uiNumbers: uiNumbersCollector,
   listeners: listenerCollector,
+  eventSource: eventSourceCollector,
 };
 
 const DEFAULT_CONFIG_POLL_INTERVAL_MS = 60_000;
