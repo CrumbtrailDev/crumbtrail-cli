@@ -65,6 +65,7 @@ export interface UiNumItem {
 // nothing, so a German session carried zero numeric evidence.
 const NUM_TOKEN_RE =
   /^([$€£¥])?\s*(-?[\d٠-٩۰-۹][\d٠-٩۰-۹.,٫٬\u00a0\u202f\u2009 ]*)\s*([$€£¥%])?$/;
+const ISO_DAY_TOKEN_RE = /\b(\d{4})-(\d{2})-(\d{2})\b/;
 
 /** Containers that delimit a snapshot region. */
 const REGION_SELECTOR =
@@ -176,6 +177,34 @@ export function parseNumericToken(
   if (!Number.isFinite(value)) return null;
   const unit = match[1] ?? match[3];
   return unit ? { value, unit } : { value };
+}
+
+/**
+ * Convert one rendered ISO calendar day into an epoch-day number. Only direct
+ * text nodes are read, so a container is not credited with dates rendered by
+ * arbitrary descendants. The exact day remains numeric correlation evidence;
+ * sensitive labels such as DOB are rejected by the existing label gate.
+ */
+function parseRenderedIsoDay(el: Element): UiNumItem["value"] | null {
+  const directText = Array.from(el.childNodes)
+    .filter((node) => node.nodeType === 3)
+    .map((node) => node.textContent ?? "")
+    .join(" ");
+  const match = ISO_DAY_TOKEN_RE.exec(directText);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const at = Date.UTC(year, month - 1, day);
+  const parsed = new Date(at);
+  if (
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return Math.floor(at / 86_400_000);
 }
 
 /**
@@ -409,11 +438,15 @@ export function scanUiNumbers(
   if (elements.length > maxElements) return null;
   const regions = new Map<string, UiNumItem[]>();
   for (const el of elements) {
-    if (!isLeaf(el)) continue;
     const tag = el.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") continue;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") continue;
-    const parsed = parseNumericToken(el.textContent ?? "", lang);
+    const renderedDay = parseRenderedIsoDay(el);
+    if (!isLeaf(el) && renderedDay === null) continue;
+    const parsed =
+      renderedDay === null
+        ? parseNumericToken(el.textContent ?? "", lang)
+        : { value: renderedDay, unit: "iso-day" };
     if (!parsed) continue;
     if (isHiddenElement(el)) continue;
     const label = resolveLabel(el);

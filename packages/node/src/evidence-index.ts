@@ -621,6 +621,7 @@ export function buildEvidenceCandidates(
   addRuntimeWarningCandidates(events, index, drafts);
   addInputRevertedCandidates(events, index, drafts);
   addCurrencyLocaleMismatchCandidates(events, index, drafts);
+  addDisplayDateTimezoneMismatchCandidates(events, index, drafts);
   addLayoutOverflowCandidates(events, index, drafts);
   addStaleViewAfterPopCandidates(events, index, drafts);
   addListenerGrowthCandidates(events, index, drafts);
@@ -6132,6 +6133,109 @@ function addInputRevertedCandidates(
       }),
       dedupeKey: `inputreverted:${field}`,
     });
+  }
+}
+
+// ─── display_date_timezone_mismatch ─────────────────────────────────────────
+
+const DISPLAY_DATE_TIMEZONE_MISMATCH_SCORE = 76;
+const ISO_INSTANT_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
+
+function epochDayInTimezone(instant: string, timezone: string): number | undefined {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date(instant));
+    const year = Number(parts.find((part) => part.type === "year")?.value);
+    const month = Number(parts.find((part) => part.type === "month")?.value);
+    const day = Number(parts.find((part) => part.type === "day")?.value);
+    if (![year, month, day].every(Number.isFinite)) return undefined;
+    return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * display_date_timezone_mismatch: the page rendered an API timestamp's UTC
+ * calendar day even though that instant belongs to another day locally.
+ *
+ * The browser collector represents a visible YYYY-MM-DD as an epoch-day
+ * number under `unit:"iso-day"`. API timestamps remain canonical ISO strings.
+ * Matching the visible day to the instant's UTC day while it differs from the
+ * session timezone's day is direct evidence of `toISOString().slice(0, 10)`
+ * style formatting.
+ */
+function addDisplayDateTimezoneMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const timezone = events
+    .filter((event) => event.k === "env")
+    .map((event) => safeText(event.d.timezone, 80))
+    .find((value): value is string => value !== undefined);
+  if (!timezone) return;
+
+  const sources: Array<{
+    utcDay: number;
+    localDay: number;
+    requestId?: string;
+  }> = [];
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const payload = responsePayload(event.d.body, event.d.bodyMeta);
+    if (payload === undefined) continue;
+    for (const [name, value] of collectFieldEntries(payload)) {
+      if (!/(?:^|_)(?:created|updated|placed|occurred)_?at$/.test(name)) continue;
+      if (typeof value !== "string" || !ISO_INSTANT_RE.test(value)) continue;
+      const at = Date.parse(value);
+      const localDay = epochDayInTimezone(value, timezone);
+      if (!Number.isFinite(at) || localDay === undefined) continue;
+      sources.push({
+        utcDay: Math.floor(at / 86_400_000),
+        localDay,
+        requestId: correlationIdOf(event),
+      });
+    }
+  }
+  if (sources.length === 0) return;
+
+  for (const event of events) {
+    if (event.k !== "ui.num") continue;
+    for (const item of uiNumItems(event)) {
+      if (item.unit !== "iso-day") continue;
+      const source = sources.find(
+        (entry) =>
+          entry.utcDay === item.value && entry.localDay !== entry.utcDay,
+      );
+      if (!source) continue;
+      drafts.push({
+        detector: "display_date_timezone_mismatch",
+        title: `A date was rendered in UTC instead of ${timezone}`,
+        severity: "high",
+        score: DISPLAY_DATE_TIMEZONE_MISMATCH_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: event.t,
+          offsetMs:
+            offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+          route: routeAt(index.navs ?? [], event.t),
+          requestId: source.requestId,
+          elementLabel: scrubText(item.label, 120),
+          message:
+            `The displayed day for ${scrubText(item.label, 100) ?? "this item"} ` +
+            `matches the API timestamp's UTC calendar day, but that instant falls ` +
+            `on a different day in the captured browser timezone (${timezone}).`,
+        }),
+        dedupeKey: `displaydatetz:${timezone}:${item.label}`,
+      });
+      return;
+    }
   }
 }
 
