@@ -6432,11 +6432,24 @@ function addStaleViewAfterPopCandidates(
    * side a request withdraws the claim, and refusing to count one because its
    * parameters look unrelated would manufacture findings.
    */
-  const anyRequestAroundPop = (popAt: number): boolean =>
+  const anyRequestAroundPop = (popAt: number, popUrl: URL): boolean =>
     apiRequests.some(
-      (request) =>
-        request.t >= popAt - STALE_VIEW_POP_LEAD_MS &&
-        request.t <= popAt + STALE_VIEW_REACTION_MS,
+      (request) => {
+        if (
+          request.t < popAt - STALE_VIEW_POP_LEAD_MS ||
+          request.t > popAt + STALE_VIEW_REACTION_MS
+        ) {
+          return false;
+        }
+        if (request.t >= popAt) return true;
+
+        // A request that beats its own pop event only excuses the pop when its
+        // query is the state being restored. A request for the state the user
+        // is leaving commonly lands a few milliseconds before the pop too; it
+        // must not hide the stale view.
+        const requestUrl = parseCapturedUrl(request.url);
+        return requestUrl?.search === popUrl.search;
+      },
     );
 
   for (let i = 1; i < navs.length; i += 1) {
@@ -6462,7 +6475,7 @@ function addStaleViewAfterPopCandidates(
       return provedReactionTo(earlier.event.t, url);
     });
     if (!provedReactive) continue;
-    if (anyRequestAroundPop(pop.event.t)) continue;
+    if (anyRequestAroundPop(pop.event.t, popUrl)) continue;
 
     drafts.push({
       detector: "stale_view_after_pop",
