@@ -168,6 +168,17 @@ describe("classifyStructuredValue", () => {
     });
   });
 
+  it("keeps canonical operational timestamps but still denies sensitive date fields", () => {
+    const timestamp = "2026-07-28T20:38:55.123Z";
+    expect(classifyStructuredValue(timestamp, "created_at")).toEqual({
+      action: "keep",
+    });
+    expect(classifyStructuredValue(timestamp, "birthdate")).toMatchObject({
+      action: "redact",
+      reason: "deny_field",
+    });
+  });
+
   it("redacts long free text (unknown class)", () => {
     expect(
       classifyStructuredValue("please ship this to my house after 5pm"),

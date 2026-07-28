@@ -137,6 +137,27 @@ describe("scanUiNumbers element budget", () => {
     document.body.innerHTML = `<dl class="totals"><dt>Total</dt><dd>$9.99</dd></dl>`;
     expect(scanUiNumbers(document.body, undefined, 1)).toBeNull();
   });
+
+  it("captures a labeled rendered ISO day without serializing surrounding text", () => {
+    document.body.innerHTML = `
+      <ul class="order-list">
+        <li>
+          <strong>Order #1</strong>
+          <span>2026-07-28 <span class="badge"> · Today</span> · placed</span>
+        </li>
+      </ul>`;
+    const regions = scanUiNumbers(document.body);
+    expect(regions?.get("ul.order-list")).toContainEqual({
+      label: "Order #1",
+      value: Math.floor(Date.UTC(2026, 6, 28) / 86_400_000),
+      unit: "iso-day",
+    });
+  });
+
+  it("drops rendered ISO days under sensitive labels", () => {
+    document.body.innerHTML = `<dl><dt>Birthdate</dt><dd>1990-01-02</dd></dl>`;
+    expect(scanUiNumbers(document.body)?.get("dl")).toBeUndefined();
+  });
 });
 
 describe("uiNumbersCollector", () => {

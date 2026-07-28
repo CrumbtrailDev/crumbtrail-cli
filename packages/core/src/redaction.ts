@@ -1699,6 +1699,16 @@ export function classifyStructuredValue(
     return { action: "redact", reason: "luhn_value" };
   if (redactTokenLikeString(value).value !== value)
     return { action: "redact", reason: "token_like_value" };
+  // Operational timestamps are correlation evidence, not free-form user
+  // content. Keep canonical ISO instants unless the field name itself is
+  // sensitive (the deny-name check above still redacts dob/birthdate/etc.).
+  // This mirrors Date-object handling, which already serializes to ISO.
+  if (
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value) &&
+    Number.isFinite(Date.parse(value))
+  ) {
+    return { action: "keep" };
+  }
   // Deny-biased ordering: at the 24-char boundary a string can be both
   // enum-like (≤ 24) and entropy-eligible (≥ 24) — entropy wins.
   if (isHighEntropyString(value))
