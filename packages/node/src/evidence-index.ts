@@ -587,6 +587,7 @@ export function buildEvidenceCandidates(
   addDuplicateWriteCandidates(events, index, drafts);
   const mutatingRequests = collectMutatingRequests(events);
   addDbDeltaMismatchCandidates(events, index, drafts, mutatingRequests);
+  addClientSuppliedValueCandidates(events, index, drafts, mutatingRequests);
   addIneffectiveInputCandidates(events, index, drafts, mutatingRequests);
   addUiArithmeticMismatchCandidates(events, index, drafts);
   addUiApiDivergenceCandidates(events, index, drafts);
@@ -2050,6 +2051,136 @@ function addDbFieldDivergenceCandidates(
             dedupeKey: `dbfielddiv:${requestId}:${field}:${[leftTable, rightTable].sort().join("|")}`,
           });
         }
+      }
+    }
+  }
+}
+
+/**
+ * A money column, by name. Deliberately narrow: this detector reports a trust
+ * boundary violation, and the cost of a false positive on a non-money column is
+ * an engineer chasing a value the client was always allowed to choose.
+ */
+function looksLikeMoneyField(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower.endsWith("_cents") ||
+    lower.includes("amount") ||
+    lower.includes("total") ||
+    lower.includes("price") ||
+    lower.includes("subtotal") ||
+    lower.includes("balance")
+  );
+}
+
+/**
+ * Smallest client value worth matching. Carts are full of 1s and 2s — a qty of
+ * 1 colliding with a money column that happens to hold 1 is noise, and cents
+ * amounts that low are not real money.
+ */
+const MIN_CLIENT_SUPPLIED_VALUE = 100;
+
+/** Every finite number anywhere in a parsed request body, with its key path. */
+function collectNumbersByPath(
+  value: unknown,
+  path: string,
+  out: Map<number, string>,
+  depth = 0,
+): void {
+  if (depth > 6) return;
+  if (typeof value === "number") {
+    if (Number.isFinite(value) && !out.has(value)) out.set(value, path);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, i) =>
+      collectNumbersByPath(entry, `${path}[${i}]`, out, depth + 1),
+    );
+    return;
+  }
+  if (isRecord(value)) {
+    for (const [key, entry] of Object.entries(value)) {
+      collectNumbersByPath(entry, path ? `${path}.${key}` : key, out, depth + 1);
+    }
+  }
+}
+
+/**
+ * db_client_supplied_value: a money value from the request body is persisted
+ * verbatim by the same request.
+ *
+ * The real case: a checkout posted `{"total":23319,...}` and `orders.total_cents`
+ * came back as exactly 23319 — the price the CLIENT named, stored as though the
+ * server had computed it. Nothing in the session looks broken from any single
+ * plane: the write succeeds, the response is 200, and the row is internally
+ * consistent. Only the pairing of body and diff shows the server never did the
+ * arithmetic. db_field_divergence cannot see it (that needs two linked rows
+ * disagreeing on a SHARED field name), and ui_arithmetic_mismatch cannot either
+ * (each rendered region is self-consistent).
+ *
+ * Silent on ambiguity, by these guards:
+ *  - body and diff must share a request id — a value echoed by some other
+ *    request is not evidence it crossed this trust boundary;
+ *  - the body must parse as JSON; redacted or opaque bodies say nothing;
+ *  - the persisted column must name money. product_id and qty coming from the
+ *    client is the entire point of a cart;
+ *  - the column must not be an identity or a clock;
+ *  - the value must be >= MIN_CLIENT_SUPPLIED_VALUE, so cart-sized integers do
+ *    not collide their way into a high-severity finding.
+ */
+function addClientSuppliedValueCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  mutatingRequests: Map<string, CorrelatedRequest>,
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    const request = mutatingRequests.get(requestId);
+    if (!request) continue;
+
+    const raw = typeof request.body === "string" ? request.body : undefined;
+    if (!raw) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      continue; // redacted, truncated, or not JSON — say nothing
+    }
+    const clientNumbers = new Map<number, string>();
+    collectNumbersByPath(parsed, "", clientNumbers);
+    if (clientNumbers.size === 0) continue;
+
+    for (const diff of diffs) {
+      const table = safeText(diff.d.table, 200);
+      const after = diff.d.after;
+      if (!table || !isRecord(after)) continue;
+
+      for (const [field, rawValue] of Object.entries(after)) {
+        if (isIdentityOrClockField(field)) continue;
+        if (!looksLikeMoneyField(field)) continue;
+        const value = toFiniteNumber(rawValue);
+        if (value === undefined) continue;
+        if (Math.abs(value) < MIN_CLIENT_SUPPLIED_VALUE) continue;
+        const bodyPath = clientNumbers.get(value);
+        if (bodyPath === undefined) continue;
+
+        drafts.push({
+          detector: "db_client_supplied_value",
+          title: `Client-supplied value persisted: request body ${bodyPath}=${value} written to ${table}.${field} unchanged`,
+          severity: "high",
+          score: DB_INVARIANT_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: diff.t,
+            offsetMs:
+              offsetForEvent(diff) ?? offsetFromStart(diff.t, index.start),
+            route: routeAt(index.navs ?? [], diff.t),
+            requestId,
+            message: `${request.method} ${request.url ?? ""} sent ${bodyPath}=${value}; ${table}.${field} stored ${value} (request ${requestId})`.trim(),
+            source: normalizeDbEngine(diff.d.engine),
+          }),
+          dedupeKey: `dbclientvalue:${requestId}:${table}:${field}`,
+        });
       }
     }
   }
