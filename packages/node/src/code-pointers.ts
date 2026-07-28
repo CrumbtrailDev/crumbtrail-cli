@@ -68,3 +68,63 @@ export function extractOpinionCodePointers(
   }
   return pointers.length > 0 ? pointers : undefined;
 }
+
+/** A source location captured from the runtime (see `captureDbCallsite`). */
+export interface CallsiteLike {
+  file: string;
+  line?: number;
+}
+
+/** Repo identity for turning a runtime callsite into a clickable pointer. */
+export interface RepoBinding {
+  /** `owner/name`, or any GitHub remote URL this can be parsed out of. */
+  repo: string;
+  commitSha: string;
+  /** "deploy" when the sha came from a deploy binding, "head" for a branch head. */
+  resolution?: CodePointerResolution;
+}
+
+/** Accepts `owner/name`, an https remote, or an scp-style git remote. */
+export function parseGitHubRepo(remote: string): string | undefined {
+  const trimmed = remote.trim().replace(/\.git$/, "");
+  if (/^[\w.-]+\/[\w.-]+$/.test(trimmed)) return trimmed;
+  const match =
+    /github\.com[/:]([\w.-]+\/[\w.-]+)$/.exec(trimmed) ?? undefined;
+  return match?.[1];
+}
+
+/**
+ * Turns a runtime-captured callsite into the same `CodePointer` the cloud's
+ * GitHub integration produces, so a bundle carries code evidence on the
+ * self-host and file-store paths too — where there is no connector to resolve
+ * it from the other end.
+ *
+ * Returns undefined rather than guessing: an absolute path, a path that climbs
+ * out of the repo, or an unparseable remote all mean the pointer would not
+ * resolve, and a broken permalink in a bundle is worse than none.
+ */
+export function buildCallsitePointer(
+  callsite: CallsiteLike | undefined,
+  binding: RepoBinding | undefined,
+): CodePointer | undefined {
+  if (!callsite?.file || !binding?.commitSha) return undefined;
+  const repo = parseGitHubRepo(binding.repo ?? "");
+  if (!repo) return undefined;
+  const path = callsite.file.replace(/^\.\//, "");
+  if (path.startsWith("/") || path.startsWith("..")) return undefined;
+  const line =
+    typeof callsite.line === "number" && Number.isFinite(callsite.line)
+      ? callsite.line
+      : undefined;
+  const permalink = `https://github.com/${repo}/blob/${binding.commitSha}/${path}${
+    line ? `#L${line}` : ""
+  }`;
+  return {
+    repo,
+    path,
+    ...(line ? { line } : {}),
+    commitSha: binding.commitSha,
+    permalink,
+    resolution: binding.resolution ?? "head",
+  };
+}

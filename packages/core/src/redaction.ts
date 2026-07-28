@@ -78,6 +78,29 @@ export interface BodyRedactionOptions {
    * alphanumeric-only) field name, so `"coupon"` also redacts `couponCode`.
    */
   denyFields?: string[];
+  /**
+   * Field names exempted from the *name-based* deny rules and from the
+   * free-text catch-all, matched on the whole compacted name rather than as a
+   * substring — an allowance is a narrower thing than a denial, so `"body"`
+   * keeps `body` but not `passwordBody`.
+   *
+   * The classifier is name-based and application-blind: one rule decides
+   * `body` for every JSON it ever sees. That is right for a gateway payload and
+   * wrong for a product review, where the submitted text IS the defect. Only
+   * the application knows which of its fields carry personal data, so the
+   * exception list is the application's to declare.
+   *
+   * Value-based detection still runs inside a kept field, so an email, a JWT,
+   * a card number, a token, or a high-entropy secret pasted into one is still
+   * redacted. A `denyFields` entry wins over a keep for the same name.
+   */
+  keepFields?: string[];
+}
+
+/** The name-based half of the structured policy, threaded through the walker. */
+export interface StructuredFieldPolicy {
+  denyFields?: string[];
+  keepFields?: string[];
 }
 
 export interface StoredValueRedactionOptions {
@@ -388,14 +411,26 @@ function redactQueryString(
   const search = query.startsWith("?") ? query.slice(1) : query;
   const params = new URLSearchParams(search);
   const fields: RedactionField[] = [];
+  const keepFields = getRedactionKeepFields();
 
   for (const key of Array.from(params.keys())) {
     const values = params.getAll(key);
     const safeKey = sanitizeKeyName(key);
     params.delete(key);
+    // A query parameter is a field with a name, so it answers to the same
+    // application-declared keep list as a JSON key. `?q=[REDACTED]` on a search
+    // defect erases the one input that explains it. Values still go through the
+    // classifier, so only a value that survives every check is kept.
+    const kept = isStructuredKeepName(key, keepFields);
     for (const value of values) {
       if (value === "") {
         params.append(safeKey, "");
+      } else if (
+        kept &&
+        classifyStructuredValue(value, key, undefined, keepFields).action ===
+          "keep"
+      ) {
+        params.append(safeKey, value);
       } else {
         params.append(safeKey, REDACTED_VALUE);
         fields.push({
@@ -1070,6 +1105,19 @@ function redactJsonValue(
     return { value: output, fields };
   }
 
+  // A Date is an object with no own enumerable properties, so the generic walk
+  // below would render every timestamp as `{}`. Timestamps answer the ordering
+  // and timing questions a captured session exists for, and rows differing only
+  // by one would collapse to a single value — which downstream reads as
+  // duplicate work that never happened. An unrepresentable date becomes null
+  // rather than the string "Invalid Date", so a reader sees absence, not a
+  // value. Applied before the object branch and after the string branch, so
+  // key-name redaction above still wins on a sensitive column.
+  if (value instanceof Date) {
+    const time = value.getTime();
+    return { value: Number.isFinite(time) ? value.toISOString() : null, fields: [] };
+  }
+
   if (value !== null && typeof value === "object") {
     const fields: RedactionField[] = [];
     const output: Record<string, unknown> = {};
@@ -1468,22 +1516,36 @@ function fieldNameWords(name: string): string[] {
 function isStructuredDenyName(
   name: string | undefined,
   denyFields?: string[],
+  keepFields?: string[],
 ): boolean {
   if (!name) return false;
-  if (isSensitiveName(name)) return true;
   const compact = compactFieldName(name);
+  if (denyFields && denyFields.length > 0) {
+    // Substring-of-compacted-name semantics: denyFields: ["coupon"] also
+    // redacts couponCode. Checked first, and unconditionally: the application's
+    // own denial is the strongest statement it can make about a field, so it
+    // outranks its own keep for the same name.
+    const denied = denyFields.some((deny) => {
+      const denyCompact = compactFieldName(deny);
+      return denyCompact.length > 0 && compact.includes(denyCompact);
+    });
+    if (denied) return true;
+  }
+  // A whole-name keep overrides the BUILT-IN name rules below, and only those.
+  // Those rules are substring heuristics with real false positives — `auth`
+  // matches `author`, `pan` matches `panel` — and without an override an
+  // application whose schema trips one has no way to capture the field at all.
+  // This is the deliberate escape hatch, so it is narrow on purpose: it takes
+  // a whole-name match, it cannot be reached by substring, and every
+  // value-based check in classifyStructuredValue still runs behind it, so an
+  // email, a JWT, a card number, a token, or a high-entropy secret sitting in
+  // a kept field is still redacted.
+  if (isStructuredKeepName(name, keepFields)) return false;
+  if (isSensitiveName(name)) return true;
   if (STRUCTURED_DENY_NAME_TOKENS.some((token) => compact.includes(token)))
     return true;
   if (fieldNameWords(name).some((word) => STRUCTURED_DENY_WORD_RE.test(word)))
     return true;
-  if (denyFields && denyFields.length > 0) {
-    // Same substring-of-compacted-name semantics as the built-in deny tokens:
-    // denyFields: ["coupon"] also redacts couponCode. Deny-biased on purpose.
-    return denyFields.some((deny) => {
-      const denyCompact = compactFieldName(deny);
-      return denyCompact.length > 0 && compact.includes(denyCompact);
-    });
-  }
   return false;
 }
 
@@ -1600,9 +1662,14 @@ export function classifyStructuredValue(
   value: unknown,
   keyName?: string,
   denyFields?: string[],
+  keepFields?: string[],
 ): StructuredClassification {
-  if (isStructuredDenyName(keyName, denyFields))
+  if (isStructuredDenyName(keyName, denyFields, keepFields))
     return { action: "redact", reason: "deny_field" };
+  // An application-declared keep exempts the name from the free-text
+  // catch-all at the bottom of this function. Every value-based check below
+  // still runs, so a secret pasted into a kept field is still caught.
+  const kept = isStructuredKeepName(keyName, keepFields);
   if (typeof value === "number") {
     // JSON numbers are ordinarily kept verbatim (prices, qtys, ids,
     // timestamps), but a 13–19 digit Luhn-passing integer is a card number.
@@ -1642,7 +1709,45 @@ export function classifyStructuredValue(
   if (STRUCTURED_IBAN_RE.test(value.replace(/\s+/g, "")))
     return { action: "redact", reason: "iban_value" };
   if (ENUM_LIKE_RE.test(value)) return { action: "keep" };
+  if (kept) return { action: "keep" };
   return { action: "redact", reason: "free_text_value" };
+}
+
+/**
+ * The application's keep list, for the redaction paths that have no config in
+ * hand.
+ *
+ * `redactUrl` is reached from masking, error, performance and navigation
+ * capture, none of which are handed the SDK config, so a per-call policy
+ * argument would have to be threaded through a dozen unrelated signatures. The
+ * list is set once at init and read where it is needed. Empty by default, which
+ * is the deny-biased behavior every one of those paths had before.
+ */
+let redactionKeepFields: string[] = [];
+
+/** Set from `config.redaction.keepFields` at init. Pass `[]` to restore defaults. */
+export function setRedactionKeepFields(names: readonly string[] = []): void {
+  redactionKeepFields = names.filter(
+    (name) => typeof name === "string" && name.trim().length > 0,
+  );
+}
+
+export function getRedactionKeepFields(): string[] {
+  return redactionKeepFields;
+}
+
+/**
+ * Whole-name match, unlike the substring semantics of `denyFields`. Widening a
+ * keep by substring would let `"id"` silently exempt `nationalIdNumber`.
+ */
+function isStructuredKeepName(
+  name: string | undefined,
+  keepFields?: string[],
+): boolean {
+  if (!name || !keepFields || keepFields.length === 0) return false;
+  const compact = compactFieldName(name);
+  if (compact.length === 0) return false;
+  return keepFields.some((keep) => compactFieldName(keep) === compact);
 }
 
 function redactedShapePlaceholder(value: unknown): Record<string, unknown> {
@@ -1659,19 +1764,27 @@ function redactedShapePlaceholder(value: unknown): Record<string, unknown> {
 function redactStructuredJsonValue(
   value: unknown,
   path: string,
-  denyFields: string[] | undefined,
+  policy: StructuredFieldPolicy,
   fields: RedactionField[],
   keyName?: string,
 ): unknown {
   // A deny-listed field name redacts its entire subtree, whatever the type.
-  if (isStructuredDenyName(keyName, denyFields)) {
+  if (isStructuredDenyName(keyName, policy.denyFields, policy.keepFields)) {
     fields.push({ path, reason: "deny_field", action: "redacted" });
     return redactedShapePlaceholder(value);
   }
 
   if (Array.isArray(value)) {
+    // The array's own name carries through to its entries: a kept `tags` is a
+    // kept list of tags, not a kept container of anonymous free text.
     return value.map((entry, index) =>
-      redactStructuredJsonValue(entry, `${path}[${index}]`, denyFields, fields),
+      redactStructuredJsonValue(
+        entry,
+        `${path}[${index}]`,
+        policy,
+        fields,
+        keyName,
+      ),
     );
   }
 
@@ -1693,7 +1806,7 @@ function redactStructuredJsonValue(
       output[safeKey] = redactStructuredJsonValue(
         entry,
         `${path}.${safeKey}`,
-        denyFields,
+        policy,
         fields,
         key,
       );
@@ -1701,7 +1814,12 @@ function redactStructuredJsonValue(
     return output;
   }
 
-  const classification = classifyStructuredValue(value, undefined, denyFields);
+  const classification = classifyStructuredValue(
+    value,
+    keyName,
+    policy.denyFields,
+    policy.keepFields,
+  );
   if (classification.action === "keep") return value;
   fields.push({ path, reason: classification.reason, action: "redacted" });
   return redactedShapePlaceholder(value);
@@ -1710,11 +1828,11 @@ function redactStructuredJsonValue(
 function redactStructuredJsonBody(
   body: string,
   path: string,
-  denyFields: string[] | undefined,
+  policy: StructuredFieldPolicy,
 ): BodyRedactionResult {
   const parsed = JSON.parse(body) as unknown;
   const fields: RedactionField[] = [];
-  const value = redactStructuredJsonValue(parsed, path, denyFields, fields);
+  const value = redactStructuredJsonValue(parsed, path, policy, fields);
   const summary = buildSummary(
     "json",
     fields.length > 0 ? "redacted" : "summarized",
@@ -1772,7 +1890,10 @@ export function redactNetworkTextBody(
     // Structured (v2) treatment. Any failure — malformed JSON or an unexpected
     // walker error — falls through to the v1 path below; never throw upward.
     try {
-      return redactStructuredJsonBody(body, path, options.denyFields);
+      return redactStructuredJsonBody(body, path, {
+        ...(options.denyFields ? { denyFields: options.denyFields } : {}),
+        ...(options.keepFields ? { keepFields: options.keepFields } : {}),
+      });
     } catch {
       /* fall back to v1 behavior */
     }

@@ -116,6 +116,60 @@ export function parseRead(sql: string): ParsedRead | undefined {
   return classification.kind === "read" ? classification.read : undefined;
 }
 
+/** The window shape (LIMIT/OFFSET) one read statement ran with, values resolved. */
+export interface ReadQueryShape {
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * Extracts the resolved LIMIT/OFFSET window from one read statement.
+ *
+ * Pagination arithmetic lives exactly here — a first-page request whose SELECT
+ * runs `OFFSET 1` silently drops the first row of the table's order from every
+ * page, and nothing errors. Capturing the window on the read event is what lets
+ * a detector compare it against the request's own paging parameters.
+ *
+ * Literal numbers and Postgres `$n` placeholders (resolved against `params`)
+ * are supported, plus MySQL's `LIMIT offset, count` form with literals. A
+ * placeholder that cannot be resolved yields no value rather than a guess.
+ */
+export function parseLimitOffset(
+  sql: string,
+  params?: unknown,
+): ReadQueryShape {
+  const text = stripSqlComments(sql);
+  const paramArray = Array.isArray(params) ? params : undefined;
+  const resolve = (token: string): number | undefined => {
+    if (/^\d+$/.test(token)) return Number(token);
+    const placeholder = token.match(/^\$(\d+)$/);
+    if (placeholder && paramArray) {
+      const value = Number(paramArray[Number(placeholder[1]) - 1]);
+      return Number.isInteger(value) && value >= 0 ? value : undefined;
+    }
+    return undefined;
+  };
+
+  const shape: ReadQueryShape = {};
+  const mysqlForm = text.match(/\blimit\s+(\d+)\s*,\s*(\d+)/i);
+  if (mysqlForm) {
+    shape.offset = Number(mysqlForm[1]);
+    shape.limit = Number(mysqlForm[2]);
+    return shape;
+  }
+  const limit = text.match(/\blimit\s+(\d+|\$\d+)/i);
+  if (limit) {
+    const value = resolve(limit[1]);
+    if (value !== undefined) shape.limit = value;
+  }
+  const offset = text.match(/\boffset\s+(\d+|\$\d+)/i);
+  if (offset) {
+    const value = resolve(offset[1]);
+    if (value !== undefined) shape.offset = value;
+  }
+  return shape;
+}
+
 /**
  * The bounded, literal-free descriptor adapters attach to an `unparsed_sql` capture gap. It is
  * intentionally only the leading SQL keyword, never any query text or bind value.

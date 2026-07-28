@@ -39,6 +39,9 @@ jobs:
             packages/topology-harness/benchmark/report.generated.md
       - run: pnpm typecheck
       - run: pnpm test
+      # `pnpm test` is `pnpm -r test`, which only reaches workspace packages.
+      # scripts/ is not one, so the dev harness gates need their own run.
+      - run: pnpm test:dev-harness
 
       # Dogfood the pre-deploy gate mechanism: the locally-built CLI must exit
       # NON-zero when the config is broken, which is what makes `.github/actions/verify`

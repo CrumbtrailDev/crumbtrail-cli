@@ -212,3 +212,38 @@ describe("CLI config normalization", () => {
     ).toThrow(expect.objectContaining({ code: "invalid_origin" }));
   });
 });
+
+describe("keep fields (--keep-field vs CRUMBTRAIL_KEEP_FIELDS)", () => {
+  const ENV = "CRUMBTRAIL_KEEP_FIELDS";
+  const original = process.env[ENV];
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV];
+    else process.env[ENV] = original;
+  });
+
+  it("defaults to an empty keep list, so the deny-biased policy stands", () => {
+    delete process.env[ENV];
+    expect(parseCliConfig([]).keepFields).toEqual([]);
+  });
+
+  it("accepts a comma list and a repeated flag, deduplicated", () => {
+    delete process.env[ENV];
+    const config = parseCliConfig([
+      "--keep-field",
+      "body, postal_code",
+      "--keep-field",
+      "body",
+    ]);
+    expect(config.keepFields).toEqual(["body", "postal_code"]);
+  });
+
+  it("adds the env var to the flags rather than replacing them", () => {
+    process.env[ENV] = "email,phone";
+    expect(parseCliConfig(["--keep-field", "body"]).keepFields).toEqual([
+      "body",
+      "email",
+      "phone",
+    ]);
+  });
+});

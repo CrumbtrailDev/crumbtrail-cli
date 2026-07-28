@@ -21,6 +21,7 @@
     "refresh:installer-fixtures": "node scripts/refresh-installer-fixtures.mjs",
     "release:plan": "node scripts/release/run-release-plan.mjs",
     "test:release": "vitest run --config scripts/release/vitest.config.ts",
+    "test:dev-harness": "vitest run --config scripts/dev-harness/vitest.config.ts",
     "dev:harness": "node scripts/dev-harness/harness.mjs",
     "dev:link": "node scripts/dev-harness/link.mjs link",
     "dev:unlink": "node scripts/dev-harness/link.mjs unlink",

@@ -130,6 +130,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
   options: InstrumentDbClientOptions,
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
+  const readStatementsByRequest = new Map<string, number>();
   const rawQuery = client.query.bind(client) as MysqlMethod;
   const rawExecute =
     typeof (client as { execute?: unknown }).execute === "function"
@@ -370,6 +371,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
               rowCount: rows.length,
               options,
               emittedReadRowsByRequest,
+              readStatementsByRequest,
             });
           } catch (error) {
             emitGap(options, { reason: "capture_exception", error });
