@@ -23,6 +23,7 @@ import { runFixContext } from "./run-fix-context";
 import { runInspect } from "./run-inspect";
 import { runReanalyze } from "./run-reanalyze";
 import { runCompare } from "./run-compare";
+import { setStorageKeepFields } from "./storage-plane";
 import { readPackageVersion } from "./version";
 
 export function parseArgs(args: string[]): CliConfig {
@@ -82,6 +83,9 @@ Options:
   --static <dir>      Serve a static app directory alongside the API
   --auth-token <tok>  Require this token on /api/* (or set CRUMBTRAIL_AUTH_TOKEN)
   --allow-origin <o>  Add an allowed browser origin (repeatable)
+  --keep-field <a,b>  Field names to keep verbatim instead of redacting by name
+                      (repeatable, or set CRUMBTRAIL_KEEP_FIELDS). Value based
+                      detection still removes tokens and card numbers inside them.
   --whisper-model <m> Whisper model for audio transcription (default base)
   --mcp               Start the stdio MCP server instead of the HTTP server
   --ai                Enable opt in AI opinion (see --ai-model)
@@ -295,10 +299,15 @@ export async function runCli(argv: string[]): Promise<number> {
     staticDir,
     authToken,
     allowedOrigins,
+    keepFields,
     ai,
     aiModel,
     aiAllowAutoModel,
   } = resolveCliConfig(rest);
+
+  // Applied before anything can be stored, and before the MCP branch: the MCP
+  // server reads sessions the same sanitizer wrote.
+  setStorageKeepFields(keepFields);
 
   if (mcp) {
     const mcpServer = new McpServer({ outputDir: output });
@@ -334,6 +343,7 @@ export async function runCli(argv: string[]): Promise<number> {
       staticDir,
       authToken,
       allowedOrigins,
+      keepFields,
       ai,
       aiModel,
       aiAllowAutoModel,
@@ -364,6 +374,13 @@ export function startupMessages(config: CliConfig): string[] {
   }
   if (config.authToken) {
     messages.push("Auth token protection enabled for /api/* routes");
+  }
+  // Relaxing a redaction rule is worth saying out loud at boot: it is the one
+  // setting here that makes the server store more than it used to.
+  if (config.keepFields.length > 0) {
+    messages.push(
+      `Keeping these field names verbatim instead of redacting by name: ${config.keepFields.join(", ")}`,
+    );
   }
   if (config.ai) {
     messages.push(

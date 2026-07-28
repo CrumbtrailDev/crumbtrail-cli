@@ -692,4 +692,116 @@ describe("evidence-index mixed page evidence artifacts", () => {
     expect(window).not.toContain("unrelated-response-one");
     expect(window).not.toContain("unrelated-response-two");
   });
+
+  it("anchors a backend error at the source location its frames name", async () => {
+    const anchorTime = 20_000;
+    const events: BugEvent[] = [
+      {
+        t: anchorTime,
+        k: "backend.req.error",
+        offsetMs: 0,
+        d: {
+          requestId: "req-frames",
+          method: "GET",
+          route: "/api/search",
+          error: {
+            name: "Error",
+            message: "query failed to parse",
+            frames: [
+              { file: "src/routes/search.js", line: 61, column: 33 },
+              { file: "src/server.js", line: 12, column: 5 },
+            ],
+          },
+        },
+      },
+    ];
+
+    const candidates = await writeEvidenceIndex({
+      sessionDir: tmpDir,
+      events,
+      index: {
+        id: "ses_backend_frames",
+        start: anchorTime,
+        end: anchorTime + 1,
+        dur: 1,
+      },
+    });
+
+    const candidate = candidates.find(
+      (entry) => entry.detector === "backend_request_error",
+    );
+    expect(candidate?.anchor.frame).toBe("src/routes/search.js:61:33");
+  });
+
+  it("names the source location in the markdown a reader starts from", async () => {
+    const anchorTime = 20_000;
+    const events: BugEvent[] = [
+      {
+        t: anchorTime,
+        k: "backend.req.error",
+        offsetMs: 0,
+        d: {
+          requestId: "req-frames-md",
+          method: "GET",
+          route: "/api/search",
+          error: {
+            name: "Error",
+            message: "query failed to parse",
+            frames: [{ file: "src/routes/search.js", line: 61, column: 33 }],
+          },
+        },
+      },
+    ];
+
+    await writeEvidenceIndex({
+      sessionDir: tmpDir,
+      events,
+      index: {
+        id: "ses_backend_frames_md",
+        start: anchorTime,
+        end: anchorTime + 1,
+        dur: 1,
+      },
+    });
+
+    const markdown = fs.readFileSync(
+      path.join(tmpDir, "CANDIDATES.md"),
+      "utf-8",
+    );
+    expect(markdown).toContain("* Source: src/routes/search.js:61:33");
+  });
+
+  it("omits the backend anchor frame when no frame was captured", async () => {
+    const anchorTime = 20_000;
+    const events: BugEvent[] = [
+      {
+        t: anchorTime,
+        k: "backend.req.error",
+        offsetMs: 0,
+        d: {
+          requestId: "req-frameless",
+          method: "GET",
+          route: "/api/search",
+          error: { name: "Error", message: "query failed to parse" },
+        },
+      },
+    ];
+
+    const candidates = await writeEvidenceIndex({
+      sessionDir: tmpDir,
+      events,
+      index: {
+        id: "ses_backend_frameless",
+        start: anchorTime,
+        end: anchorTime + 1,
+        dur: 1,
+      },
+    });
+
+    const candidate = candidates.find(
+      (entry) => entry.detector === "backend_request_error",
+    );
+    expect(candidate).toBeDefined();
+    expect(candidate?.anchor.frame).toBeUndefined();
+  });
 });

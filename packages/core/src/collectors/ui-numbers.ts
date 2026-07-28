@@ -367,6 +367,7 @@ function startUiNumbersCollector(
   let observer: MutationObserver | undefined;
   // Assigned after observer setup; `let` so `disable` (defined first, callable
   // from the observer-setup catch) can release it without a TDZ reference.
+  // eslint-disable-next-line prefer-const
   let unsubscribeNav: (() => void) | undefined;
 
   // Failure policy: the collector self-disables inside its own scan path and

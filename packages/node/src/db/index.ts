@@ -12,6 +12,7 @@ export {
   type AutoInstrumentDriverResult,
   type AutoInstrumentReport,
 } from "./auto-instrument";
+export { captureDbCallsite, type DbCallsite } from "./callsite";
 export {
   DEFAULT_SENSITIVE_DB_COLUMNS,
   buildSensitiveColumnSet,

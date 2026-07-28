@@ -23,7 +23,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { localPackages, builtBundleVersion, REPO_ROOT } from './packages.mjs';
+import { localPackages, waitForFreshEntry, REPO_ROOT } from './packages.mjs';
 
 const WORKSPACE_ROOT = path.resolve(REPO_ROOT, '..');
 const DEFAULT_TARGETS = [
@@ -81,50 +81,6 @@ function freePort(port) {
   if (pids.length === 0) return;
   log(`freeing port ${port} (killing ${pids.join(', ')})`);
   spawnSync('kill', ['-9', ...pids]);
-}
-
-/**
- * Wait until `file` is BOTH built from the current source and finished being
- * written, then report why if it never gets there.
- *
- * `fs.existsSync` is not enough, and the failure it allows is the nastiest kind:
- * dist/cli.cjs almost always exists already from a previous build, so an
- * existence check returns instantly and the server is spawned against whatever
- * bytes happen to be on disk — including bytes a watcher is midway through
- * replacing. The server then comes up, answers /health, and reports the OLD
- * version, so a local SDK edit looks like it simply had no effect.
- *
- * Two conditions, both required:
- *   1. the version inlined in the bundle matches the manifest (not stale)
- *   2. size and mtime are unchanged across consecutive polls (not mid-write)
- *
- * Condition 2 matters even right after a successful build, because the watchers
- * start their own initial pass and rewrite this exact file underneath us.
- */
-async function waitForFreshEntry(file, packageName, expectedVersion, timeoutMs = 60000) {
-  const deadline = Date.now() + timeoutMs;
-  let previous = null;
-  let lastSeenVersion = null;
-  while (Date.now() < deadline) {
-    let stat = null;
-    try {
-      stat = fs.statSync(file);
-    } catch {
-      // not written yet
-    }
-    if (stat) {
-      const stamp = `${stat.size}:${stat.mtimeMs}`;
-      lastSeenVersion = builtBundleVersion(file, packageName);
-      if (lastSeenVersion === expectedVersion && stamp === previous) {
-        return { ok: true };
-      }
-      previous = stamp;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  if (!fs.existsSync(file)) return { ok: false, reason: 'missing' };
-  if (lastSeenVersion === null) return { ok: false, reason: 'unreadable' };
-  return { ok: false, reason: 'stale', found: lastSeenVersion };
 }
 
 /** Resolves to the parsed /health payload, so callers can check what it claims. */

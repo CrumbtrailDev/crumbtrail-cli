@@ -17,6 +17,8 @@ export interface BuildDbReadEventInput {
   pk: Record<string, unknown> | null;
   row: Record<string, unknown>;
   requestId: string;
+  /** 1-based ordinal of the SELECT within this request. */
+  stmt?: number;
   sessionId?: string;
   redactColumns?: readonly string[];
   now?: number;
@@ -58,6 +60,8 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
     row: boundedRow,
     requestId: input.requestId,
   };
+  if (Number.isInteger(input.stmt) && (input.stmt as number) > 0)
+    d.stmt = input.stmt;
   const redaction = mergeRedactionMetadata(row.metadata, pk.metadata);
   if (redaction) d.redaction = redaction;
 
