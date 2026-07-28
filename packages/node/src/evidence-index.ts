@@ -624,6 +624,13 @@ export function buildEvidenceCandidates(
   addLocaleInputCandidates(index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
   addDeclinedPaymentOrderedCandidates(events, index, drafts);
+  addDownstreamSucceededAfterTimeoutCandidates(events, index, drafts);
+  addInvalidWebhookSignatureAcceptedCandidates(
+    events,
+    index,
+    drafts,
+    exchanges,
+  );
   addStoredActiveMarkupCandidates(events, index, drafts);
   addInputRevertedCandidates(events, index, drafts);
   addFormResetAfterErrorCandidates(events, index, drafts);
@@ -6871,6 +6878,200 @@ function addDeclinedPaymentOrderedCandidates(
           `then an orders row was inserted ${order.t - failure.t} ms later.`,
       }),
       dedupeKey: `declinedordered:${correlationIdOf(order) ?? order.t}`,
+    });
+  }
+}
+
+// ─── downstream_succeeded_after_timeout ─────────────────────────────────────
+
+const DOWNSTREAM_SUCCEEDED_AFTER_TIMEOUT_SCORE = 95;
+const DOWNSTREAM_TIMEOUT_MATCH_WINDOW_MS = 2_000;
+
+function backendHttpPath(event: BugEvent): string | undefined {
+  return (
+    capturedUrlPath(safeText(event.d.url, 400)) ??
+    capturedUrlPath(safeText(event.d.operation, 200))
+  );
+}
+
+function otelHttpPath(event: BugEvent): string | undefined {
+  const attributes = isRecord(event.d.attributes)
+    ? event.d.attributes
+    : undefined;
+  return (
+    capturedUrlPath(safeText(attributes?.["http.target"], 400)) ??
+    capturedUrlPath(safeText(attributes?.["http.route"], 400)) ??
+    capturedUrlPath(safeText(attributes?.["http.url"], 400))
+  );
+}
+
+/**
+ * downstream_succeeded_after_timeout: the caller gave up, but the downstream
+ * service's server span says the same operation completed successfully.
+ *
+ * This is stronger than a generic timeout: it proves the operation has an
+ * ambiguous outcome and may already have committed its side effect.
+ */
+function addDownstreamSucceededAfterTimeoutCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const successfulServerSpans = events.filter((event) => {
+    if (event.k !== OTEL_SPAN_KIND) return false;
+    const status = otelHttpStatus(event.d.attributes);
+    return status !== undefined && status >= 200 && status < 300;
+  });
+
+  for (const timeout of events) {
+    if (
+      timeout.k !== "backend.http" ||
+      safeText(timeout.d.errorKind, 80)?.toLowerCase() !== "timeout" ||
+      finiteNumber(timeout.d.status) !== 0
+    )
+      continue;
+    const requestId = correlationIdOf(timeout);
+    if (!requestId) continue;
+    const path = backendHttpPath(timeout);
+    if (!path) continue;
+    const service = safeText(timeout.d.service, 120)?.toLowerCase();
+    const completed = successfulServerSpans.find((span) => {
+      if (correlationIdOf(span) !== requestId) return false;
+      if (otelHttpPath(span) !== path) return false;
+      if (
+        Math.abs(span.t - timeout.t) > DOWNSTREAM_TIMEOUT_MATCH_WINDOW_MS
+      )
+        return false;
+      const spanService = safeText(span.d.serviceName, 160)?.toLowerCase();
+      return (
+        !service ||
+        !spanService ||
+        spanService === service ||
+        spanService.endsWith(`-${service}`) ||
+        spanService.endsWith(`.${service}`)
+      );
+    });
+    if (!completed) continue;
+    const status = otelHttpStatus(completed.d.attributes);
+    drafts.push({
+      detector: "downstream_succeeded_after_timeout",
+      title: `Downstream ${path} completed after its caller timed out`,
+      severity: "critical",
+      score: DOWNSTREAM_SUCCEEDED_AFTER_TIMEOUT_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: completed.t,
+        offsetMs:
+          offsetForEvent(completed) ??
+          offsetFromStart(completed.t, index.start),
+        route: routeAt(index.navs ?? [], completed.t),
+        requestId,
+        method:
+          safeText(timeout.d.method, 20)?.toUpperCase() ??
+          safeText(completed.d.name, 20)?.toUpperCase(),
+        url: redactUrl(path),
+        status,
+        source: "backend",
+        frame: otelCodeFrame(completed.d.attributes),
+        message:
+          `The caller recorded a timeout for ${service ? `${service} ` : ""}${path}, ` +
+          `while the downstream server span completed with HTTP ${status}. ` +
+          `The operation may have committed even though the caller treated it as failed.`,
+      }),
+      dedupeKey: `downstreamtimeout:${service ?? ""}:${path}`,
+    });
+  }
+}
+
+// ─── invalid_webhook_signature_accepted ──────────────────────────────────────
+
+const INVALID_WEBHOOK_SIGNATURE_ACCEPTED_SCORE = 97;
+
+function malformedSha256Signature(
+  headers: unknown,
+): { header: string; digestLength: number } | undefined {
+  if (!isRecord(headers)) return undefined;
+  for (const [name, value] of Object.entries(headers)) {
+    if (!/(?:^|-)signature$/i.test(name)) continue;
+    const signature = safeText(value, 200);
+    const match = signature ? /^sha256=(.*)$/i.exec(signature) : null;
+    if (!match) continue;
+    const digest = match[1] ?? "";
+    if (/^[a-f\d]{64}$/i.test(digest)) continue;
+    return { header: name.toLowerCase(), digestLength: digest.length };
+  }
+  return undefined;
+}
+
+function dbCallsiteFrame(callsite: unknown): string | undefined {
+  if (!isRecord(callsite)) return undefined;
+  return codeFrameOf({
+    file: safeText(callsite.file, 300),
+    line: finiteNumber(callsite.line),
+    col: finiteNumber(callsite.column),
+  });
+}
+
+/**
+ * invalid_webhook_signature_accepted: a webhook accepted a malformed SHA-256
+ * signature and performed a database mutation in that same request.
+ *
+ * This does not try to recover or verify a secret. A SHA-256 digest has an
+ * objective wire shape, so a non-64-hex digest is invalid before HMAC
+ * comparison, and a 2xx plus a correlated write proves it was not rejected.
+ */
+function addInvalidWebhookSignatureAcceptedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (
+      exchange.method !== "POST" ||
+      !/webhooks?(?:\/|$)/i.test(capturedUrlPath(exchange.url) ?? "") ||
+      !isSuccessStatus(exchange.status)
+    )
+      continue;
+    const malformed = malformedSha256Signature(exchange.req.d.hdrs);
+    if (!malformed) continue;
+    const mutation = events.find(
+      (event) =>
+        event.k === "db.diff" &&
+        correlationIdOf(event) === exchange.requestId &&
+        ["insert", "update", "delete"].includes(
+          safeText(event.d.op, 20)?.toLowerCase() ?? "",
+        ),
+    );
+    if (!mutation) continue;
+    const table = safeText(mutation.d.table, 120);
+    drafts.push({
+      detector: "invalid_webhook_signature_accepted",
+      title: `Webhook with a malformed SHA-256 signature changed the database`,
+      severity: "critical",
+      score: INVALID_WEBHOOK_SIGNATURE_ACCEPTED_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: mutation.t,
+        offsetMs:
+          offsetForEvent(mutation) ??
+          offsetFromStart(mutation.t, index.start),
+        route: routeAt(index.navs ?? [], mutation.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        table,
+        source: normalizeDbEngine(mutation.d.engine),
+        frame: dbCallsiteFrame(mutation.d.callsite),
+        message:
+          `${malformed.header} carried a ${malformed.digestLength}-character SHA-256 digest ` +
+          `(64 hexadecimal characters are required), but the webhook returned ${exchange.status}` +
+          `${table ? ` and mutated ${table}` : " and mutated the database"}.`,
+      }),
+      dedupeKey:
+        `invalidwebhooksig:${capturedUrlPath(exchange.url) ?? ""}:` +
+        `${table ?? ""}`,
     });
   }
 }
