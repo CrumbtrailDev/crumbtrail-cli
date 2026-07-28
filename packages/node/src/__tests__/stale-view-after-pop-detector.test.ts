@@ -166,6 +166,15 @@ describe("stale_view_after_pop", () => {
       expect(found).toContain("stale_view_after_pop");
     });
 
+    it("does not let a just-issued call for the previous state excuse the pop", () => {
+      const found = detectors([
+        ...search,
+        apiCall(2_993, "/api/search?q=sonar&category=audio"),
+        nav(3_000, "/search?q=sonar", "pop"),
+      ]);
+      expect(found).toContain("stale_view_after_pop");
+    });
+
     it("does not accept an unrelated background call as proof of reactivity", () => {
       const unrelated = [
         nav(1_000, "/search?q=sonar", "init"),
