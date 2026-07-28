@@ -49,6 +49,10 @@ export function localPackages() {
  * Checks for CONTENT, not just the directory: `tsup --watch` cleans dist/ and
  * leaves the empty directory behind, so an existence check reports "built" for a
  * package whose output was just wiped.
+ *
+ * This answers "has this EVER been built", NOT "is this build current". A dist
+ * full of last week's bytes passes. Anything that needs currency must compare
+ * the artifact's contents against source — see builtBundleVersion.
  */
 export function isBuilt(pkg) {
   const dist = path.join(pkg.dir, 'dist');
@@ -57,4 +61,33 @@ export function isBuilt(pkg) {
   } catch {
     return false;
   }
+}
+
+/**
+ * The package version BAKED INTO a built bundle, or null if it cannot be found.
+ *
+ * crumbtrail-node reports its version two different ways, and only one of them
+ * detects a stale build:
+ *   - src/version.ts walks up to the nearest package.json AT RUNTIME, so the CLI's
+ *     `--version` reads the manifest on disk and matches it no matter how old
+ *     dist/ is. Useless as a staleness check.
+ *   - src/health.ts does `import packageJson from "../package.json"`, which esbuild
+ *     INLINES at build time. GET /health therefore reports the version the bundle
+ *     was built from, which is exactly the signal we want.
+ *
+ * So we read the inlined manifest back out of the bundle. Deliberately tolerant of
+ * whitespace and minification; a null return means "the format moved", which
+ * callers must surface loudly rather than treat as "fine".
+ */
+export function builtBundleVersion(bundleFile, packageName) {
+  let source;
+  try {
+    source = fs.readFileSync(bundleFile, 'utf8');
+  } catch {
+    return null;
+  }
+  const anchor = new RegExp(`name:\\s*["']${packageName}["']`).exec(source);
+  if (!anchor) return null;
+  const window = source.slice(anchor.index, anchor.index + 400);
+  return /version:\s*["']([^"']+)["']/.exec(window)?.[1] ?? null;
 }

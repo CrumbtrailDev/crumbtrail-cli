@@ -23,7 +23,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { localPackages, isBuilt, REPO_ROOT } from './packages.mjs';
+import { localPackages, builtBundleVersion, REPO_ROOT } from './packages.mjs';
 
 const WORKSPACE_ROOT = path.resolve(REPO_ROOT, '..');
 const DEFAULT_TARGETS = [
@@ -84,32 +84,62 @@ function freePort(port) {
 }
 
 /**
- * `tsup --watch` CLEANS dist/ before its first rebuild, so a dist that existed a
- * moment ago is gone the instant the watchers start. Anything that loads a built
- * file must wait for that file specifically — checking "did dist exist at
- * startup" is a race that passes locally and fails on a cold or slow machine.
+ * Wait until `file` is BOTH built from the current source and finished being
+ * written, then report why if it never gets there.
+ *
+ * `fs.existsSync` is not enough, and the failure it allows is the nastiest kind:
+ * dist/cli.cjs almost always exists already from a previous build, so an
+ * existence check returns instantly and the server is spawned against whatever
+ * bytes happen to be on disk — including bytes a watcher is midway through
+ * replacing. The server then comes up, answers /health, and reports the OLD
+ * version, so a local SDK edit looks like it simply had no effect.
+ *
+ * Two conditions, both required:
+ *   1. the version inlined in the bundle matches the manifest (not stale)
+ *   2. size and mtime are unchanged across consecutive polls (not mid-write)
+ *
+ * Condition 2 matters even right after a successful build, because the watchers
+ * start their own initial pass and rewrite this exact file underneath us.
  */
-async function waitForFile(file, timeoutMs = 60000) {
+async function waitForFreshEntry(file, packageName, expectedVersion, timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs;
+  let previous = null;
+  let lastSeenVersion = null;
   while (Date.now() < deadline) {
-    if (fs.existsSync(file)) return true;
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    let stat = null;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      // not written yet
+    }
+    if (stat) {
+      const stamp = `${stat.size}:${stat.mtimeMs}`;
+      lastSeenVersion = builtBundleVersion(file, packageName);
+      if (lastSeenVersion === expectedVersion && stamp === previous) {
+        return { ok: true };
+      }
+      previous = stamp;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  return false;
+  if (!fs.existsSync(file)) return { ok: false, reason: 'missing' };
+  if (lastSeenVersion === null) return { ok: false, reason: 'unreadable' };
+  return { ok: false, reason: 'stale', found: lastSeenVersion };
 }
 
+/** Resolves to the parsed /health payload, so callers can check what it claims. */
 async function waitForHealth(port, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/health`);
-      if (response.ok) return true;
+      if (response.ok) return await response.json();
     } catch {
       // not up yet
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  return false;
+  return null;
 }
 
 function track(name, child, logFile) {
@@ -162,14 +192,17 @@ async function main() {
   for (const target of options.targets) log(`target:   ${target}`);
 
   const packages = localPackages();
-  const needsBuild = [...packages.values()].some((p) => !p.private && !isBuilt(p));
-  if (needsBuild) {
-    // `pnpm -r build` is topological, which matters: crumbtrail-node inlines
-    // crumbtrail-core (noExternal) and its DTS step reads core's .d.ts, so core
-    // must be fully built first.
-    log('building SDK packages…');
-    run('pnpm', ['build']);
-  }
+  // ALWAYS build — never "only if dist/ looks empty". A dist/ from a previous
+  // build is the normal case, so a has-it-ever-been-built check skips the build
+  // precisely when the tree is stale, which is the one case that needs it. The
+  // full topological build is ~7s and incremental, far cheaper than debugging an
+  // SDK edit that silently never took effect.
+  //
+  // `pnpm -r build` is topological, which matters: crumbtrail-node inlines
+  // crumbtrail-core (noExternal) and its DTS step reads core's .d.ts, so core
+  // must be fully built first.
+  log('building SDK packages…');
+  run('pnpm', ['build']);
 
   log('linking targets to this checkout…');
   run('node', [LINK_SCRIPT, 'link', ...options.targets.flatMap((t) => ['--target', t])]);
@@ -180,7 +213,11 @@ async function main() {
   // node's build fail with "Could not find a declaration file for module
   // 'crumbtrail-core'". Watch mode never retries that without a source change,
   // so the watcher stays dead and dist/cli.cjs never appears. Building first and
-  // then watching without clean removes the race entirely.
+  // then watching without clean removes THAT race.
+  //
+  // It does not remove all of them: each watcher still runs an initial pass that
+  // rewrites dist/ underneath whatever is about to read it. Anything loading a
+  // built file must still wait for it to settle — see waitForFreshEntry.
   for (const name of WATCHED) {
     if (!packages.has(name)) continue;
     spawnLogged(`watch-${name}`, 'pnpm', [
@@ -199,10 +236,27 @@ async function main() {
     fs.mkdirSync(options.sessions, { recursive: true });
 
     const serverEntry = path.join(REPO_ROOT, 'packages', 'node', 'dist', 'cli.cjs');
-    log('waiting for the watcher to rebuild the server entry…');
-    if (!(await waitForFile(serverEntry))) {
-      log(`✗ ${path.relative(REPO_ROOT, serverEntry)} never appeared`);
-      log(`  see ${path.relative(REPO_ROOT, path.join(LOG_DIR, 'watch-crumbtrail-node.log'))}`);
+    const entryRel = path.relative(REPO_ROOT, serverEntry);
+    const watchLog = path.relative(REPO_ROOT, path.join(LOG_DIR, 'watch-crumbtrail-node.log'));
+    const expectedVersion = packages.get('crumbtrail-node')?.version;
+    if (!expectedVersion) {
+      log('✗ crumbtrail-node is missing from packages/ — cannot verify the server build');
+      return shutdown(1);
+    }
+
+    log('waiting for the watcher to settle on a current server entry…');
+    const entry = await waitForFreshEntry(serverEntry, 'crumbtrail-node', expectedVersion);
+    if (!entry.ok) {
+      if (entry.reason === 'missing') log(`✗ ${entryRel} never appeared`);
+      else if (entry.reason === 'stale') {
+        log(`✗ ${entryRel} is stale: built from ${entry.found}, expected ${expectedVersion}`);
+        log('  the watcher never produced a current build — refusing to start a stale server');
+      } else {
+        log(`✗ could not read the built version out of ${entryRel}`);
+        log("  the bundle no longer inlines package.json where this expects it;");
+        log('  fix builtBundleVersion in scripts/dev-harness/packages.mjs');
+      }
+      log(`  see ${watchLog}`);
       return shutdown(1);
     }
 
@@ -214,13 +268,25 @@ async function main() {
       '--output',
       options.sessions, // absolute: a relative path resolves against the package cwd
     ]);
-    const healthy = await waitForHealth(options.port);
-    if (!healthy) {
+    const health = await waitForHealth(options.port);
+    if (!health) {
       log(`✗ capture server never answered /health on :${options.port}`);
       log(`  see ${path.relative(REPO_ROOT, path.join(LOG_DIR, 'capture-server.log'))}`);
       return shutdown(1);
     }
-    log(`✓ capture server healthy on :${options.port} → ${options.sessions}`);
+    // The last word on staleness, and the only one that describes the process
+    // actually listening: /health reports the version inlined when the bundle it
+    // loaded was built. A file that passed the check above can still lose to a
+    // watcher rewrite in the moment between the check and the spawn. Failing here
+    // is the whole point — a stale server that announces itself as healthy costs
+    // an afternoon; one that refuses to start costs a rebuild.
+    if (health.version !== expectedVersion) {
+      log(`✗ capture server is running STALE code on :${options.port}`);
+      log(`  /health reports ${health.version}, but packages/node is ${expectedVersion}`);
+      log('  your SDK changes are NOT in the running server. Re-run the harness.');
+      return shutdown(1);
+    }
+    log(`✓ capture server healthy on :${options.port} (v${health.version}) → ${options.sessions}`);
   }
 
   console.log('');
