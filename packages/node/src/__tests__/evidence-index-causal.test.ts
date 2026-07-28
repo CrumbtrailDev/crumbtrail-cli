@@ -442,6 +442,137 @@ describe("buildEvidenceCandidates — write-to-write causal claims are weakened"
         .attributionConfidence,
     ).toBe("high");
   });
+
+  /**
+   * The clamp exists so the ranker treats a write-to-write link as annotate
+   * ONLY. That has to hold for both ordering rules, not just the tier sort:
+   * clamping the grade and then reordering on it anyway defeats the clamp, and
+   * the symptom is precisely what the clamp was written to prevent — "the write
+   * a detector actually named is ranked behind every write that happened to
+   * precede it".
+   */
+  it("a low-graded link does not pull its root ahead of a higher scoring symptom", () => {
+    const named: BugEvent[] = [
+      ...events,
+      // A named invariant on the LAST write of the request, so every generic
+      // write candidate precedes it on the spine.
+      {
+        t: 210,
+        k: "db.diff",
+        d: {
+          engine: "postgres",
+          op: "insert",
+          table: "coupon_redemptions",
+          pk: { id: 1 },
+          after: { id: 1, order_id: 1, code: "SAVE10", amount_cents: 1000 },
+          requestId: "req1",
+        },
+      },
+      {
+        t: 215,
+        k: "db.diff",
+        d: {
+          engine: "postgres",
+          op: "insert",
+          table: "coupon_redemptions",
+          pk: { id: 2 },
+          after: { id: 2, order_id: 1, code: "SAVE10", amount_cents: 1000 },
+          requestId: "req1",
+        },
+      },
+    ];
+    const candidates = buildEvidenceCandidates(
+      named,
+      { start: 0 },
+      buildCausalGraph({ events: named }),
+    );
+    const duplicate = candidates.findIndex(
+      (c) => c.detector === "duplicate_write",
+    );
+    const genericWrites = candidates
+      .map((c, i) => (c.detector === "db_mutation" ? i : -1))
+      .filter((i) => i >= 0);
+    expect(duplicate).toBeGreaterThanOrEqual(0);
+    expect(genericWrites.length).toBeGreaterThan(0);
+    // Graded low — annotate only — so it must not reorder the list.
+    expect(candidates[duplicate].attributionConfidence).toBe("low");
+    expect(duplicate).toBeLessThan(Math.min(...genericWrites));
+  });
+
+  /**
+   * The grade is not the whole rule, and this is the case that proves it. An
+   * `otel_db_activity` root is NOT a database write — its node is an `otel.span`
+   * — so the write-to-write clamp never reaches the link and it survives at
+   * `high`. Graded that strongly, it would bind the named failure into the
+   * generic draft's chain and put "a database span exists" ahead of the
+   * invariant violation underneath it.
+   *
+   * `namesFailureOnGenericPlane` is what covers this, and it is consulted where
+   * chains are formed rather than where lifts were once allowed.
+   */
+  it("does not let a generic OTel span lead the named failure under it", () => {
+    const spanned: BugEvent[] = [
+      {
+        t: 100,
+        k: "backend.otel.span",
+        d: {
+          // On the request spine, so the span really is the writes' nominal root.
+          requestId: "req1",
+          traceId: "req1",
+          spanId: "s1",
+          name: "SELECT",
+          kind: 3,
+          serviceName: "store",
+          statusCode: "UNSET",
+          attributes: { "db.system": "postgres", "db.operation": "SELECT" },
+        },
+      },
+      {
+        t: 150,
+        k: "db.diff",
+        d: {
+          engine: "postgres",
+          op: "update",
+          table: "products",
+          pk: { id: 1 },
+          after: { id: 1, price_cents: 19900 },
+          requestId: "req1",
+        },
+      },
+      {
+        t: 160,
+        k: "db.diff",
+        d: {
+          engine: "postgres",
+          op: "insert",
+          table: "order_items",
+          pk: { id: 1 },
+          after: { id: 1, product_id: 1, price_cents: 6900 },
+          requestId: "req1",
+        },
+      },
+    ];
+    const candidates = buildEvidenceCandidates(
+      spanned,
+      { start: 0 },
+      buildCausalGraph({ events: spanned }),
+    );
+    const namedAt = candidates.findIndex(
+      (c) => c.detector === "db_field_divergence",
+    );
+    const genericAt = candidates.findIndex(
+      (c) => c.detector === "otel_db_activity",
+    );
+
+    expect(namedAt).toBeGreaterThanOrEqual(0);
+    expect(genericAt).toBeGreaterThanOrEqual(0);
+    // Precondition: the link really is graded strongly enough to bind, so nothing
+    // but the generic/named rule can be keeping the order right.
+    expect(candidates[namedAt].rootCauseId).toBe(candidates[genericAt].id);
+    expect(candidates[namedAt].attributionConfidence).toBe("high");
+    // "Linked rows disagree" is what the reader needs; "a database span exists" is not.
+    expect(namedAt).toBeLessThan(genericAt);
+  });
 });
 
 describe("attributeCandidates — a write detector reaches only its own write", () => {

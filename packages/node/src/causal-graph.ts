@@ -631,6 +631,40 @@ const NAMED_FAILURE_DETECTORS = new Set([
 ]);
 
 /**
+ * The generic twins from that list: detectors that surface a plane without
+ * naming anything wrong on it. `db_mutation` says "a write happened";
+ * `otel_db_activity` says "a database span exists".
+ *
+ * Same ALLOWLIST discipline as {@link NAMED_FAILURE_DETECTORS}, and the same
+ * default: a detector left out is not treated as generic, so an unlisted
+ * detector never loses a position it would otherwise hold.
+ */
+const GENERIC_PLANE_DETECTORS = new Set(["db_mutation", "otel_db_activity"]);
+
+/**
+ * Does `symptomDetector` name a failure on a plane `rootDetector` merely
+ * surfaces?
+ *
+ * The ranker uses this to answer one question: may this root be lifted ahead of
+ * this symptom? "A write happened on products" must never be ranked above the
+ * invariant violation that says what is wrong, so for that pair the answer is
+ * no. It is the same principle {@link ownershipPriority} applies to node
+ * contention — a reader asking "what is wrong here" is answered by the named
+ * invariant violation, never by "a write happened" — carried over to the one
+ * ordering rule that could otherwise reimpose the opposite.
+ */
+export function namesFailureOnGenericPlane(
+  rootDetector: string | undefined,
+  symptomDetector: string | undefined,
+): boolean {
+  if (rootDetector === undefined || symptomDetector === undefined) return false;
+  return (
+    GENERIC_PLANE_DETECTORS.has(rootDetector) &&
+    NAMED_FAILURE_DETECTORS.has(symptomDetector)
+  );
+}
+
+/**
  * Ordering key for node ownership, applied ONLY to candidates that tie on
  * `anchor.t`. Two candidates can describe the SAME event — `db_mutation` says "a
  * write happened on order_items", `db_field_divergence` says "that write
