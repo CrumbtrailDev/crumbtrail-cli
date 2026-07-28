@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { EventBus } from "../../event-bus";
 import { DEFAULT_CONFIG, UI_LISTENERS_EVENT_KIND } from "../../types";
 import type { BugEvent } from "../../types";
-import { LISTENER_GROWTH_THRESHOLD, listenerCollector } from "../listeners";
+import {
+  LISTENER_GROWTH_THRESHOLD,
+  LISTENER_SETTLE_MS,
+  listenerCollector,
+} from "../listeners";
 
 /**
  * The gauge counts every registration in the realm, including ones the test
@@ -79,6 +83,17 @@ describe("listenerCollector", () => {
     window.dispatchEvent(new Event("popstate"));
 
     expect(gauges().length).toBe(before + 3);
+  });
+
+  it("emits a settled gauge after route effects register listeners", async () => {
+    const before = gauges().length;
+    history.pushState({}, "", "/with-effect");
+    window.addEventListener("route-effect", () => {});
+
+    await new Promise((resolve) => setTimeout(resolve, LISTENER_SETTLE_MS + 20));
+
+    expect(gauges().length).toBe(before + 2);
+    expect(countFor(latest(), "route-effect")).toBe(1);
   });
 
   it("emits once the total grows past the threshold between navigations", () => {
