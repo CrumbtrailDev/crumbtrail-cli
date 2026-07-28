@@ -9,7 +9,10 @@ import {
 } from "crumbtrail-core";
 import { BROWSER_REDACTION_POLICY, normalizeDbEngine } from "./llm-bundle";
 import { redactedNetworkBodySnippet } from "./network-body";
-import { attributeCandidates } from "./causal-graph";
+import {
+  attributeCandidates,
+  namesFailureOnGenericPlane,
+} from "./causal-graph";
 import { defaultSessionStore } from "./session-store";
 import type { CausalConfidence, CausalGraph } from "./causal-graph";
 import {
@@ -701,10 +704,19 @@ export function buildEvidenceCandidates(
  * Ordering within one chain is root-before-symptom by construction (pre-order walk from the chain's
  * top), so no corrective sweep is needed and a symptom can never precede its own cause.
  *
+ * A second rule sits alongside the grade, and it is about WHAT the two drafts say rather than how
+ * strongly they are linked: a generic plane surfacing never leads a chain containing a named failure
+ * (see {@link namesFailureOnGenericPlane}). The grade alone does not cover this — a `db.write` symptom
+ * of an `otel_db_activity` root is not a write-to-write claim, so nothing clamps it, and "a database
+ * span exists" would be read first. Such a link is left uncredited, so the named failure ranks on its
+ * own score.
+ *
  * Replaces an earlier rank-tier partition (roots ahead of demoted high/medium symptoms) plus an
  * `enforceRootBeforeSymptom` sweep that undid it. The two disagreed by design, the sweep won, and
  * because it honored EVERY `rootCauseId` regardless of grade, the `low` tier's documented
- * "annotate only, order preserved" contract was not true of position.
+ * "annotate only, order preserved" contract was not true of position. The sweep's own exemption for
+ * the generic/named pair is preserved above, as a rule about which links bind rather than about which
+ * lifts are allowed.
  *
  * The comparator produces a total, deterministic order derived solely from per-draft fields.
  */
@@ -746,8 +758,17 @@ function applyCausalRerank(
   );
 
   /**
-   * A symptom→root link strong enough to bind the two into one ranked chain. `low` links are the
-   * request spine's time ordering restated, so they annotate without binding — see the header.
+   * A symptom→root link strong enough to bind the two into one ranked chain. Two ways to fail:
+   *
+   *  - GRADE. A `low` link is the request spine's time ordering restated, so it annotates without
+   *    binding — see the header.
+   *  - WHAT THE DRAFTS SAY. A generic plane surfacing never leads a chain containing the named
+   *    failure it is the nominal root of. The grade does not cover this on its own: an
+   *    `otel_db_activity` root is not a database write, so a write-to-write clamp never reaches the
+   *    link, and "a database span exists" would be read ahead of the invariant violation under it.
+   *
+   * Either way the draft becomes its own chain top and ranks on its own score, keeping its
+   * `causalRole` and `rootCauseId` so the relation is still readable.
    */
   const creditedParent = (draft: CandidateDraft): string | undefined => {
     if (draft.causalRole !== "symptom" || !draft.rootCauseId) return undefined;
@@ -756,7 +777,11 @@ function applyCausalRerank(
       draft.attributionConfidence !== "medium"
     )
       return undefined;
-    return byKey.has(draft.rootCauseId) ? draft.rootCauseId : undefined;
+    const root = byKey.get(draft.rootCauseId);
+    if (root === undefined) return undefined;
+    if (namesFailureOnGenericPlane(root.detector, draft.detector))
+      return undefined;
+    return draft.rootCauseId;
   };
 
   // Blast-radius boost (ranking-only): each root's effective score rises by a bounded amount driven
@@ -1534,7 +1559,8 @@ function collectErrorMoments(
     ) {
       // A 4xx the application chose to return is an outcome, not a fault, so a
       // write that happens to sit beside it is not thereby suspicious.
-      if (isHandledClientError(finiteNumber(event.d.st), event.d.body)) continue;
+      if (isHandledClientError(finiteNumber(event.d.st), event.d.body))
+        continue;
       moments.push({ t: event.t, requestId: safeText(event.d.requestId, 120) });
     } else if (event.k === "err" || event.k === "rej") {
       moments.push({ t: event.t });
@@ -1983,55 +2009,204 @@ function isIdentityOrClockField(name: string): boolean {
   );
 }
 
-/** The pk values of a diff, as strings. */
-function pkValuesOf(event: BugEvent): string[] {
+/**
+ * A value that can stand as a key, canonicalized for comparison. Only scalars
+ * qualify: a db.diff after image renders a Date as `{}`, and two of those
+ * stringify alike, so `String(value)` on arbitrary content invents key matches
+ * out of structural noise. Booleans are excluded for the same reason — nothing
+ * joins on `true`.
+ */
+function keyValueOf(value: unknown): string | undefined {
+  if (typeof value === "number")
+    return Number.isFinite(value) ? String(value) : undefined;
+  if (typeof value === "bigint") return String(value);
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 && trimmed.length <= 200 ? trimmed : undefined;
+  }
+  return undefined;
+}
+
+/** The pk of a diff as `[column, value]` pairs, scalar values only. */
+function pkEntriesOf(event: BugEvent): Array<[string, string]> {
   const pk = event.d.pk;
   if (!isRecord(pk)) return [];
-  return Object.values(pk).map((value) => String(value));
+  const entries: Array<[string, string]> = [];
+  for (const [column, raw] of Object.entries(pk)) {
+    const value = keyValueOf(raw);
+    if (value !== undefined) entries.push([column, value]);
+  }
+  return entries;
+}
+
+/** The bare table name: `"public"."order_items"` → `order_items`. */
+function bareTableName(table: string): string {
+  const segments = table.split(".");
+  return segments[segments.length - 1] ?? table;
+}
+
+/** Lowercased and stripped of separators, so `order_items` and `OrderItems` compare equal. */
+function normalizeEntityName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 /**
- * Do these two rows reference each other?
- *
- * Linkage is a foreign key match: one row's after image or pk carries a value
- * equal to the other row's primary key. This is the whole guard against
- * comparing unrelated rows that happen to share a column name — two different
- * customers' `orders` rows both have a `total_cents` and are supposed to
- * differ.
+ * A rough singular form, used ONLY to compare a foreign key column's prefix
+ * with a table name. Both sides pass through it, so a word it mangles
+ * (`status` → `statu`) still matches itself; the function has to be consistent,
+ * not linguistically correct.
  */
-function rowsAreLinked(left: BugEvent, right: BugEvent): boolean {
-  const referencesPkOf = (from: BugEvent, target: BugEvent): boolean => {
-    const targetPks = new Set(pkValuesOf(target));
-    if (targetPks.size === 0) return false;
-    const after = from.d.after;
-    const candidates = [
-      ...pkValuesOf(from),
-      ...(isRecord(after) ? Object.values(after).map((v) => String(v)) : []),
-    ];
-    return candidates.some((value) => targetPks.has(value));
-  };
-  return referencesPkOf(left, right) || referencesPkOf(right, left);
+function singularize(word: string): string {
+  if (word.length > 3 && word.endsWith("ies")) return `${word.slice(0, -3)}y`;
+  if (/(?:s|x|z|ch|sh)es$/.test(word)) return word.slice(0, -2);
+  if (word.endsWith("s") && !word.endsWith("ss")) return word.slice(0, -1);
+  return word;
 }
 
 /**
- * db_field_divergence: two linked rows written by ONE request disagree about
- * the same named value.
+ * The entity a foreign key column names: `product_id` → `product`,
+ * `productId` → `product`. Returns undefined for a column that identifies THIS
+ * row rather than referencing another (`id`, `uuid`), and for every column that
+ * is not a key at all.
+ */
+function foreignKeyEntity(column: string): string | undefined {
+  const match = /^(.+?)(?:_id|_uuid|Id|ID|Uuid|UUID)$/.exec(column.trim());
+  if (!match) return undefined;
+  const entity = normalizeEntityName(match[1]);
+  return entity.length > 0 ? singularize(entity) : undefined;
+}
+
+/** Does this column name a reference to that table? `product_id` → `products`. */
+function columnReferencesTable(column: string, table: string): boolean {
+  const entity = foreignKeyEntity(column);
+  if (entity === undefined) return false;
+  return entity === singularize(normalizeEntityName(bareTableName(table)));
+}
+
+/** One row's foreign key reference to another row. */
+interface RowLinkage {
+  /** The row carrying the foreign key. */
+  child: BugEvent;
+  /** The row whose primary key it references. */
+  parent: BugEvent;
+  /** The foreign key column on the child, e.g. `product_id`. */
+  column: string;
+  /** The primary key column it resolves to on the parent, e.g. `id`. */
+  parentColumn: string;
+}
+
+/**
+ * Does `from` carry a foreign key to `target`?
  *
- * The real case: a checkout wrote `products.price_cents=8900` and
- * `order_items.price_cents=7900` in one request, the order_items row
- * referencing the products row. Two prices for one product, written together,
- * neither one wrong on its own. No existing detector reads the `db.diff` set
- * as a set, so the candidate list was identical to the clean control's.
+ * The column name has to NAME the target table. Matching on value alone —
+ * "some value in this row equals some primary key of that row" — is what made
+ * this detector report a live two-line checkout as a bug: on a freshly seeded
+ * store every table's key sequence starts at 1, so `order_items.order_id=1`
+ * collided with `products.id=1` and linked a line item to a product it has
+ * nothing to do with. Requiring `product_id` to be the column that reaches
+ * `products` is the difference between a join and a coincidence.
  *
- * Silent on ambiguity, by these guards:
+ * The pk is searched alongside the after image because a composite key can BE
+ * the foreign key (`order_items` keyed by `{order_id, product_id}`).
+ */
+function foreignKeyLinkTo(
+  from: BugEvent,
+  target: BugEvent,
+): { column: string; parentColumn: string } | undefined {
+  const targetTable = safeText(target.d.table, 200);
+  if (!targetTable) return undefined;
+  const targetPk = pkEntriesOf(target);
+  if (targetPk.length === 0) return undefined;
+  const after = from.d.after;
+  const columns: Array<[string, unknown]> = [
+    ...(isRecord(from.d.pk) ? Object.entries(from.d.pk) : []),
+    ...(isRecord(after) ? Object.entries(after) : []),
+  ];
+
+  for (const [column, raw] of columns) {
+    if (!columnReferencesTable(column, targetTable)) continue;
+    const value = keyValueOf(raw);
+    if (value === undefined) continue;
+    // A single-column key is unambiguous. A composite one is not: the foreign
+    // key has to say WHICH column it means, or the match is a guess.
+    const candidates =
+      targetPk.length === 1
+        ? targetPk
+        : targetPk.filter(
+            ([key]) => key.toLowerCase() === column.toLowerCase(),
+          );
+    const hit = candidates.find(([, targetValue]) => targetValue === value);
+    if (hit) return { column, parentColumn: hit[0] };
+  }
+  return undefined;
+}
+
+/**
+ * Are these two rows joined by a foreign key, and in which direction?
+ *
+ * This is the whole guard against comparing unrelated rows that happen to share
+ * a column name — two different customers' `orders` rows both have a
+ * `total_cents` and are supposed to differ.
+ */
+function linkRows(left: BugEvent, right: BugEvent): RowLinkage | undefined {
+  const leftToRight = foreignKeyLinkTo(left, right);
+  if (leftToRight) return { child: left, parent: right, ...leftToRight };
+  const rightToLeft = foreignKeyLinkTo(right, left);
+  if (rightToLeft) return { child: right, parent: left, ...rightToLeft };
+  return undefined;
+}
+
+/** Cites the join a candidate rests on, so a reader can check it rather than take it. */
+function describeLinkage(linkage: RowLinkage): string {
+  const childTable = safeText(linkage.child.d.table, 200) ?? "?";
+  const parentTable = safeText(linkage.parent.d.table, 200) ?? "?";
+  return `${childTable}.${linkage.column} = ${parentTable}.${linkage.parentColumn}`;
+}
+
+/** Two rows of one request joined by a foreign key, kept in write order. */
+interface LinkedRowPair {
+  /** The two rows in the order they were written, so messages read chronologically. */
+  first: BugEvent;
+  second: BugEvent;
+  linkage: RowLinkage;
+}
+
+/**
+ * Every foreign key join among one request's rows.
+ *
+ * Guards shared by both rules below:
  *  - both rows must carry a record `after` image;
  *  - the rows must be in DIFFERENT tables. Two rows of one table are siblings,
  *    not a contradiction, and are supposed to hold different values;
- *  - they must be linked by a foreign key match (see {@link rowsAreLinked});
- *  - the shared field must name a value, not an identity or a clock;
- *  - both values must be finite numbers. A string field disagreeing is not
- *    reliably a contradiction — two rows can legitimately hold different
- *    labels for one entity.
+ *  - they must be joined by a real foreign key (see {@link linkRows}).
+ */
+function linkedRowPairs(diffs: BugEvent[]): LinkedRowPair[] {
+  const pairs: LinkedRowPair[] = [];
+  for (let i = 0; i < diffs.length; i += 1) {
+    for (let j = i + 1; j < diffs.length; j += 1) {
+      const first = diffs[i];
+      const second = diffs[j];
+      const firstTable = safeText(first.d.table, 200);
+      const secondTable = safeText(second.d.table, 200);
+      if (!firstTable || !secondTable || firstTable === secondTable) continue;
+      if (!isRecord(first.d.after) || !isRecord(second.d.after)) continue;
+      const linkage = linkRows(first, second);
+      if (!linkage) continue;
+      pairs.push({ first, second, linkage });
+    }
+  }
+  return pairs;
+}
+
+/**
+ * db_field_divergence: two rows joined by a foreign key and written by ONE
+ * request hold contradictory values.
+ *
+ * Two rules, each with its own guards:
+ *  - {@link addSharedFieldDivergence} — the rows disagree on the SAME named
+ *    field;
+ *  - {@link addSettlementDivergence} — a settlement row does not match the
+ *    total of the row it settles, under different column names.
  */
 function addDbFieldDivergenceCandidates(
   events: BugEvent[],
@@ -2040,49 +2215,250 @@ function addDbFieldDivergenceCandidates(
 ): void {
   for (const [requestId, diffs] of dbDiffsByRequest(events)) {
     if (diffs.length < 2) continue;
-    for (let i = 0; i < diffs.length; i += 1) {
-      for (let j = i + 1; j < diffs.length; j += 1) {
-        const left = diffs[i];
-        const right = diffs[j];
-        const leftTable = safeText(left.d.table, 200);
-        const rightTable = safeText(right.d.table, 200);
-        if (!leftTable || !rightTable || leftTable === rightTable) continue;
-        const leftAfter = left.d.after;
-        const rightAfter = right.d.after;
-        if (!isRecord(leftAfter) || !isRecord(rightAfter)) continue;
-        if (!rowsAreLinked(left, right)) continue;
+    const pairs = linkedRowPairs(diffs);
+    for (const pair of pairs)
+      addSharedFieldDivergence(pair, requestId, index, drafts);
+    addSettlementDivergence(pairs, requestId, index, drafts);
+  }
+}
 
-        for (const field of Object.keys(leftAfter)) {
-          if (!(field in rightAfter)) continue;
-          if (isIdentityOrClockField(field)) continue;
-          const leftValue = toFiniteNumber(leftAfter[field]);
-          const rightValue = toFiniteNumber(rightAfter[field]);
-          if (leftValue === undefined || rightValue === undefined) continue;
-          if (leftValue === rightValue) continue;
+/**
+ * Two linked rows disagree about the same named value.
+ *
+ * The real case: a checkout wrote `products.price_cents=8900` and
+ * `order_items.price_cents=7900` in one request, the order_items row
+ * referencing the products row. Two prices for one product, written together,
+ * neither one wrong on its own. No existing detector reads the `db.diff` set
+ * as a set, so the candidate list was identical to the clean control's.
+ *
+ * Silent on ambiguity, beyond the shared guards in {@link linkedRowPairs}:
+ *  - the shared field must name a value, not an identity or a clock;
+ *  - both values must be finite numbers. A string field disagreeing is not
+ *    reliably a contradiction — two rows can legitimately hold different
+ *    labels for one entity.
+ */
+function addSharedFieldDivergence(
+  pair: LinkedRowPair,
+  requestId: string,
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const { first, second, linkage } = pair;
+  const firstTable = safeText(first.d.table, 200);
+  const secondTable = safeText(second.d.table, 200);
+  const firstAfter = first.d.after;
+  const secondAfter = second.d.after;
+  if (!firstTable || !secondTable) return;
+  if (!isRecord(firstAfter) || !isRecord(secondAfter)) return;
 
-          const anchorEvent = left.t <= right.t ? left : right;
-          drafts.push({
-            detector: "db_field_divergence",
-            title: `Linked rows disagree on ${field}: ${leftTable}.${field}=${leftValue} but ${rightTable}.${field}=${rightValue} in one request`,
-            severity: "high",
-            score: DB_INVARIANT_SCORE,
-            confidence: "high",
-            anchor: removeUndefined({
-              t: anchorEvent.t,
-              offsetMs:
-                offsetForEvent(anchorEvent) ??
-                offsetFromStart(anchorEvent.t, index.start),
-              route: routeAt(index.navs ?? [], anchorEvent.t),
-              requestId,
-              message: `${leftTable}.${field}=${leftValue} vs ${rightTable}.${field}=${rightValue} (rows linked by id, written by request ${requestId})`,
-              source: normalizeDbEngine(anchorEvent.d.engine),
-            }),
-            // Table pair is ordered so the key does not depend on diff order.
-            dedupeKey: `dbfielddiv:${requestId}:${field}:${[leftTable, rightTable].sort().join("|")}`,
-          });
-        }
-      }
+  for (const field of Object.keys(firstAfter)) {
+    if (!(field in secondAfter)) continue;
+    if (isIdentityOrClockField(field)) continue;
+    const firstValue = toFiniteNumber(firstAfter[field]);
+    const secondValue = toFiniteNumber(secondAfter[field]);
+    if (firstValue === undefined || secondValue === undefined) continue;
+    if (firstValue === secondValue) continue;
+
+    const anchorEvent = first.t <= second.t ? first : second;
+    drafts.push({
+      detector: "db_field_divergence",
+      title: `Linked rows disagree on ${field}: ${firstTable}.${field}=${firstValue} but ${secondTable}.${field}=${secondValue} in one request`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: anchorEvent.t,
+        offsetMs:
+          offsetForEvent(anchorEvent) ??
+          offsetFromStart(anchorEvent.t, index.start),
+        route: routeAt(index.navs ?? [], anchorEvent.t),
+        requestId,
+        message: `${firstTable}.${field}=${firstValue} vs ${secondTable}.${field}=${secondValue} (rows linked by ${describeLinkage(linkage)}, written by request ${requestId})`,
+        source: normalizeDbEngine(anchorEvent.d.engine),
+      }),
+      // Table pair is ordered so the key does not depend on diff order.
+      dedupeKey: `dbfielddiv:${requestId}:${field}:${[firstTable, secondTable].sort().join("|")}`,
+    });
+  }
+}
+
+/**
+ * Tables whose rows SETTLE the row they reference rather than compose it. A
+ * payment is supposed to equal the order total; a coupon redemption, a tax line
+ * or an order item carries the same `amount_cents` column and the same
+ * `order_id` foreign key and is supposed to DIFFER from it. Nothing in a column
+ * name separates those two cases, so the table name has to, and the list is
+ * deliberately short: a table not on it is read as a component, which is the
+ * silent answer.
+ */
+const SETTLEMENT_TABLES = new Set([
+  "payment",
+  "paymentintent",
+  "charge",
+  "capture",
+  "settlement",
+  "receipt",
+]);
+
+function isSettlementTable(table: string): boolean {
+  return SETTLEMENT_TABLES.has(
+    singularize(normalizeEntityName(bareTableName(table))),
+  );
+}
+
+/** Currency and scale suffixes. `total_cents` and `total_usd` are not the same quantity. */
+const MONEY_UNIT_SUFFIXES = [
+  "cents",
+  "cent",
+  "minor",
+  "micros",
+  "usd",
+  "eur",
+  "gbp",
+];
+
+/**
+ * Splits a money column into the quantity it names and the unit it is in:
+ * `total_cents` → base `total`, unit `cents`. An unsuffixed column has unit "".
+ */
+function splitMoneyColumn(column: string): { base: string; unit: string } {
+  const normalized = normalizeEntityName(column);
+  for (const unit of MONEY_UNIT_SUFFIXES) {
+    if (normalized.length > unit.length && normalized.endsWith(unit)) {
+      return { base: normalized.slice(0, -unit.length), unit };
     }
+  }
+  return { base: normalized, unit: "" };
+}
+
+/**
+ * Column bases that name what a row is worth IN FULL, on either side of a
+ * settlement.
+ *
+ * Deliberately excluded, because each is SUPPOSED to differ from a total:
+ * `subtotal` (pre-tax by definition), `balance` (what is left after paying),
+ * `price` (a unit price), and every component — tax, discount, shipping, fee.
+ */
+const SETTLEMENT_MONEY_BASES = new Set([
+  "total",
+  "grandtotal",
+  "ordertotal",
+  "totalamount",
+  "totaldue",
+  "amountdue",
+  "amount",
+  "amountpaid",
+  "amountcaptured",
+  "amountcharged",
+  "paidamount",
+  "chargedamount",
+]);
+
+/** The money value a row states it is worth in full, if it states one. */
+function settlementMoneyOf(
+  after: Record<string, unknown>,
+): { column: string; unit: string; value: number } | undefined {
+  for (const [column, raw] of Object.entries(after)) {
+    if (isIdentityOrClockField(column)) continue;
+    const { base, unit } = splitMoneyColumn(column);
+    if (!SETTLEMENT_MONEY_BASES.has(base)) continue;
+    const value = toFiniteNumber(raw);
+    if (value === undefined) continue;
+    return { column, unit, value };
+  }
+  return undefined;
+}
+
+/**
+ * A settlement row does not match the total of the row it settles.
+ *
+ * The real case: one checkout request wrote `orders.total_cents=70894` and
+ * `payments.amount_cents=60500` against it. A genuine divergence over a real
+ * join key, and invisible to every DB-plane rule the pipeline had: the columns
+ * are named differently, so {@link addSharedFieldDivergence} cannot compare
+ * them, and each row is internally consistent, so nothing else names it either.
+ * It reached the reader only because the application happened to call
+ * `console.warn` — delete that one log line and the underpayment disappeared
+ * from the ranking entirely.
+ *
+ * Silent on ambiguity, beyond the shared guards in {@link linkedRowPairs}:
+ *  - the child must be a settlement row (see {@link SETTLEMENT_TABLES}), not a
+ *    component of the parent's total;
+ *  - exactly ONE settlement row of that table may reference the parent in this
+ *    request. A split payment or an installment settles a total across several
+ *    rows, and no single one of them is supposed to equal it;
+ *  - both columns must name a full amount (see {@link SETTLEMENT_MONEY_BASES})
+ *    in the SAME unit;
+ *  - the two columns must be named differently — an identical name is
+ *    {@link addSharedFieldDivergence}'s to report, and reporting it here too
+ *    would say one thing twice.
+ *
+ * Confidence is `medium`, not `high`: within a single request a deliberate
+ * deposit or partial capture is indistinguishable from an underpayment. The
+ * score stays at {@link DB_INVARIANT_SCORE} regardless, because a finding a
+ * reader never reaches is worth nothing — below the `db_mutation` ceiling of 88
+ * this would rank under the generic dump of the very writes it is about.
+ */
+function addSettlementDivergence(
+  pairs: LinkedRowPair[],
+  requestId: string,
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const rowIdentity = (event: BugEvent): string =>
+    `${safeText(event.d.table, 200) ?? "?"}#${pkEntriesOf(event)
+      .map(([column, value]) => `${column}=${value}`)
+      .join(",")}`;
+
+  // How many rows of one table settle a given parent row. Counted across the
+  // whole request before any of them is judged: a second payment is what makes
+  // the first one uncomparable.
+  const settlementCounts = new Map<string, number>();
+  for (const { linkage } of pairs) {
+    const childTable = safeText(linkage.child.d.table, 200);
+    if (!childTable || !isSettlementTable(childTable)) continue;
+    const key = `${rowIdentity(linkage.parent)}|${childTable}`;
+    settlementCounts.set(key, (settlementCounts.get(key) ?? 0) + 1);
+  }
+
+  for (const { linkage } of pairs) {
+    const { child, parent } = linkage;
+    const childTable = safeText(child.d.table, 200);
+    const parentTable = safeText(parent.d.table, 200);
+    if (!childTable || !parentTable) continue;
+    if (!isSettlementTable(childTable)) continue;
+    if (settlementCounts.get(`${rowIdentity(parent)}|${childTable}`) !== 1)
+      continue;
+
+    const childAfter = child.d.after;
+    const parentAfter = parent.d.after;
+    if (!isRecord(childAfter) || !isRecord(parentAfter)) continue;
+    const settled = settlementMoneyOf(childAfter);
+    const owed = settlementMoneyOf(parentAfter);
+    if (!settled || !owed) continue;
+    if (settled.unit !== owed.unit) continue;
+    if (settled.column === owed.column) continue;
+    if (settled.value === owed.value) continue;
+
+    const anchorEvent = child.t <= parent.t ? child : parent;
+    drafts.push({
+      detector: "db_field_divergence",
+      title: `Linked rows disagree on the amount owed: ${parentTable}.${owed.column}=${owed.value} but ${childTable}.${settled.column}=${settled.value} in one request`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: anchorEvent.t,
+        offsetMs:
+          offsetForEvent(anchorEvent) ??
+          offsetFromStart(anchorEvent.t, index.start),
+        route: routeAt(index.navs ?? [], anchorEvent.t),
+        requestId,
+        message: `${parentTable}.${owed.column}=${owed.value} vs ${childTable}.${settled.column}=${settled.value} (rows linked by ${describeLinkage(linkage)}, written by request ${requestId})`,
+        source: normalizeDbEngine(anchorEvent.d.engine),
+      }),
+      dedupeKey: `dbsettlement:${requestId}:${[`${parentTable}.${owed.column}`, `${childTable}.${settled.column}`].sort().join("|")}`,
+    });
   }
 }
 
@@ -2130,7 +2506,12 @@ function collectNumbersByPath(
   }
   if (isRecord(value)) {
     for (const [key, entry] of Object.entries(value)) {
-      collectNumbersByPath(entry, path ? `${path}.${key}` : key, out, depth + 1);
+      collectNumbersByPath(
+        entry,
+        path ? `${path}.${key}` : key,
+        out,
+        depth + 1,
+      );
     }
   }
 }
@@ -2206,7 +2587,8 @@ function addClientSuppliedValueCandidates(
               offsetForEvent(diff) ?? offsetFromStart(diff.t, index.start),
             route: routeAt(index.navs ?? [], diff.t),
             requestId,
-            message: `${request.method} ${request.url ?? ""} sent ${bodyPath}=${value}; ${table}.${field} stored ${value} (request ${requestId})`.trim(),
+            message:
+              `${request.method} ${request.url ?? ""} sent ${bodyPath}=${value}; ${table}.${field} stored ${value} (request ${requestId})`.trim(),
             source: normalizeDbEngine(diff.d.engine),
           }),
           dedupeKey: `dbclientvalue:${requestId}:${table}:${field}`,
@@ -3049,7 +3431,10 @@ function bodyNamesItsOwnError(body: unknown): boolean {
  * demoted out of sight, so an unexplained 4xx — a 404 with no body, a 409 whose
  * body never reached the capture — is left at full weight.
  */
-function isHandledClientError(status: number | undefined, body: unknown): boolean {
+function isHandledClientError(
+  status: number | undefined,
+  body: unknown,
+): boolean {
   if (status === undefined || status < 400 || status > 499) return false;
   if (AUTH_CHALLENGE_STATUSES.has(status)) return true;
   return bodyNamesItsOwnError(body);

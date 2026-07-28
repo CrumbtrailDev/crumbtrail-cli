@@ -262,8 +262,19 @@ describe("buildEvidenceCandidates — checkout chain ranking", () => {
     expect(byTable("order_items").rootCauseId).not.toBe(byTable("jobs").id);
   });
 
-  it("keeps every signal it had before — nothing dropped by the re-rank", () => {
-    expect(candidates.length).toBe(11);
+  it("re-ranks without dropping or inventing a signal", () => {
+    // The re-rank reorders; it must never change the SET. Compared against the
+    // same input with no graph — which skips attribution and the chain layout
+    // entirely — by the fields that identify a signal, since `id` is assigned
+    // from rank and is expected to differ. A hard count would break every time a
+    // detector is added, which says nothing about the ranker.
+    const identify = (list: typeof candidates) =>
+      list
+        .map((c) => `${c.detector}|${c.anchor.t}|${c.title}`)
+        .sort((a, b) => a.localeCompare(b));
+    expect(identify(candidates)).toEqual(
+      identify(buildEvidenceCandidates(events, index)),
+    );
   });
 
   it("is deterministic across runs", () => {
