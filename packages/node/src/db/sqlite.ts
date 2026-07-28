@@ -155,6 +155,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
   options: InstrumentDbClientOptions,
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
+  const readStatementsByRequest = new Map<string, number>();
 
   const resolveRequestId = (): string | undefined =>
     options.requestId ?? options.getRequestId?.();
@@ -406,6 +407,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
         rowCount: rows.length,
         options,
         emittedReadRowsByRequest,
+        readStatementsByRequest,
       });
     } catch (error) {
       emitGap(options, { reason: "capture_exception", error });

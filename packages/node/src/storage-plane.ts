@@ -8,6 +8,7 @@ import {
   redactNetworkTextBody,
   redactTokenLikeString,
   redactUrl,
+  setRedactionKeepFields,
 } from "crumbtrail-core";
 import type { EvidenceCandidate } from "./evidence-index";
 import type { LlmBundle, LlmBundleRedactionSummary } from "./llm-bundle";
@@ -554,6 +555,50 @@ function compressColdEvents(input: Buffer): Buffer {
   return zlib.zstdCompressSync(input);
 }
 
+/**
+ * Field names the operator has declared product content rather than personal data.
+ *
+ * The rules below are name-based and table-blind: `SENSITIVE_NAME_RE` contains the
+ * literal token `body`, so `payments.body` (a raw gateway payload) and
+ * `reviews.body` (the shopper text that IS the defect on a stored-XSS ticket) are
+ * treated identically, and both rest as `[REDACTED]`. Same for `email` on a
+ * duplicate-account bug and `postal` on an address-validation bug. The evidence
+ * that explains those defects is destroyed by the policy meant to protect it, and
+ * until now there was no way to say otherwise.
+ *
+ * This is the keep half of the client-controlled capture policy. Deliberately
+ * opt-in, process-wide, and narrow: it exempts a name from the *name-based* rules
+ * only. Value-based detection still runs, so a token or a card number pasted into
+ * a kept field is still caught, and a non-primitive is still swept whole.
+ */
+let keepFieldNames: Set<string> = new Set();
+
+function normalizeFieldName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Replaces the keep list. Pass an empty list to restore deny-biased defaults. */
+export function setStorageKeepFields(names: readonly string[] = []): void {
+  keepFieldNames = new Set(
+    names
+      .filter((name) => typeof name === "string" && name.trim())
+      .map(normalizeFieldName),
+  );
+  // The URL paths in crumbtrail-core read their policy from module scope, so
+  // one call configures both halves. Without this a name would be kept in a
+  // db.diff row and still `[REDACTED]` in the query string that produced it.
+  setRedactionKeepFields([...keepFieldNames]);
+}
+
+/** The active keep list, for reporting it back in a capture-policy summary. */
+export function getStorageKeepFields(): string[] {
+  return [...keepFieldNames].sort();
+}
+
+function isKeptFieldName(key: string): boolean {
+  return keepFieldNames.size > 0 && keepFieldNames.has(normalizeFieldName(key));
+}
+
 function sanitizeValue(value: unknown, fieldPath: string): unknown {
   if (typeof value === "string") {
     if (isSafeSdkDescriptorValue(fieldPath, value)) return value;
@@ -598,6 +643,14 @@ function sanitizeRecord(
       out[safeKey] = sanitizeStructuredBody(raw);
       continue;
     }
+    // An operator-declared keep exempts this name from the name-based rules, but
+    // only for a primitive: a nested object could carry anything, so it still
+    // goes through sanitizeValue below and is swept in full.
+    if (isKeptFieldName(key) && (typeof raw !== "object" || raw === null)) {
+      out[safeKey] =
+        typeof raw === "string" ? sanitizeString(raw, childPath) : raw;
+      continue;
+    }
     if (
       (isSensitiveName(key) && !isSafeMetadataField(key)) ||
       isSensitiveField(childPath) ||
@@ -635,6 +688,13 @@ function sanitizeStructuredBody(body: string): string {
       contentType: "application/json",
       path: "event.d.body",
       mode: "structured",
+      // The server's keep list, not the client's declaration. The re-run is a
+      // re-classification, so it has to be told the same exception the rest of
+      // this sanitizer honors, or a field the operator declared keepable is
+      // kept in db.diff and placeholdered in the request body that caused it.
+      ...(keepFieldNames.size > 0
+        ? { keepFields: getStorageKeepFields() }
+        : {}),
     });
     if (
       typeof result.body === "string" &&

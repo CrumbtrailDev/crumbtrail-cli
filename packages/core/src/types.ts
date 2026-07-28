@@ -232,6 +232,14 @@ export interface DbReadEventData {
   pk: Record<string, unknown> | null;
   row: Record<string, unknown>;
   requestId: string;
+  /**
+   * 1-based ordinal of the SELECT statement within this request.
+   *
+   * Rows are emitted one event each, so without it N single-row SELECTs and one
+   * SELECT returning N rows produce byte-identical evidence — and the whole
+   * point of an N+1 finding is telling those two apart.
+   */
+  stmt?: number;
   redaction?: unknown;
 }
 
@@ -351,10 +359,17 @@ export interface CrumbtrailConfig {
    * - `denyFields`: extra field names added to the redaction deny list,
    *   matched as substrings of the compacted (lowercased, alphanumeric-only)
    *   field name — same semantics as the built-in deny tokens.
+   * - `keepFields`: field names exempted from the name-based deny rules and
+   *   from the free-text catch-all, matched on the whole compacted name rather
+   *   than as a substring. Use it when the submitted text IS the defect (a
+   *   review body, a search term, a mangled address line) and a shape
+   *   placeholder would tell an agent nothing. Value-based detection still
+   *   runs inside a kept field, and a `denyFields` entry wins over a keep.
    */
   redaction?: {
     mode?: "structured" | "full";
     denyFields?: string[];
+    keepFields?: string[];
   };
 
   // Interaction

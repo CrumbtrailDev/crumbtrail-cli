@@ -479,6 +479,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
   options: InstrumentDbClientOptions,
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
+  const readStatementsByRequest = new Map<string, number>();
 
   // `request` is the RAW mssql request that already has the host's inputs bound; `recordedInputs` are
   // the same inputs captured for replay onto fresh requests. Fresh requests always come from the RAW
@@ -529,6 +530,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
             rowCount: rowCountFromResult(result, rows.length),
             options,
             emittedReadRowsByRequest,
+            readStatementsByRequest,
           });
         } catch (error) {
           emitGap(options, { reason: "capture_exception", error });
