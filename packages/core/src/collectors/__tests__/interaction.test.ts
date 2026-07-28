@@ -292,6 +292,39 @@ describe("interactionCollector", () => {
     document.body.removeChild(form);
   });
 
+  it("captures controls cleared by a form remount after submit", () => {
+    vi.useFakeTimers();
+    const form = document.createElement("form");
+    const line1 = document.createElement("input");
+    line1.name = "line1";
+    line1.value = "10 Downing Street";
+    form.appendChild(line1);
+    document.body.appendChild(form);
+
+    form.dispatchEvent(new Event("submit", { bubbles: true }));
+    form.remove();
+    const replacementForm = document.createElement("form");
+    const replacementLine1 = document.createElement("input");
+    replacementLine1.name = "line1";
+    replacementLine1.value = "";
+    replacementForm.appendChild(replacementLine1);
+    document.body.appendChild(replacementForm);
+    vi.advanceTimersByTime(700);
+    bus.flush();
+
+    expect(
+      events.some(
+        (event) =>
+          event.k === "inp" &&
+          event.d.ev === "state" &&
+          event.d.trusted === false &&
+          (event.d.el as Record<string, unknown>).name === "line1",
+      ),
+    ).toBe(true);
+
+    document.body.removeChild(replacementForm);
+  });
+
   it("does not report the user's next input as a silent overwrite", () => {
     vi.useFakeTimers();
     const input = document.createElement("input");
