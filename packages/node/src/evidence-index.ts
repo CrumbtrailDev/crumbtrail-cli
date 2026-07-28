@@ -578,6 +578,7 @@ export function buildEvidenceCandidates(
   addRepeatedClickCandidates(events, index, drafts);
   addSlowRequestCandidates(events, index, requestById, drafts);
   addPendingRequestCandidates(index, requestById, responseIds, drafts);
+  addResponseRaceCandidates(events, index, requestById, drafts);
   addIneffectiveSubmitCandidates(events, index, drafts);
   addMediaDegradationCandidates(events, index, drafts);
   addVoiceMarkerCandidates(events, index, drafts);
@@ -588,6 +589,9 @@ export function buildEvidenceCandidates(
   addDbDiffCandidates(events, index, drafts);
   addDbFieldDivergenceCandidates(events, index, drafts);
   addDuplicateWriteCandidates(events, index, drafts);
+  addLostUpdateCandidates(events, index, drafts);
+  addCounterContradictionCandidates(events, index, drafts);
+  addNPlusOneCandidates(events, index, drafts);
   const mutatingRequests = collectMutatingRequests(events);
   addDbDeltaMismatchCandidates(events, index, drafts, mutatingRequests);
   addClientSuppliedValueCandidates(events, index, drafts, mutatingRequests);
@@ -928,7 +932,7 @@ function addSlowRequestCandidates(
     if (event.k !== "net.res") continue;
     const dur = finiteNumber(event.d.dur);
     if (dur === undefined || dur < 5_000) continue;
-    const requestId = safeText(event.d.id, 120);
+    const requestId = networkRequestId(event.d.id);
     const req = requestId ? requests.get(requestId) : undefined;
     drafts.push({
       detector: "slow_request",
@@ -989,6 +993,126 @@ function addPendingRequestCandidates(
       dedupeKey: `pending:${req.id}`,
     });
   }
+}
+
+/**
+ * Two requests to the same endpoint were in flight together and came back in the
+ * opposite order to the one they were sent in.
+ *
+ * This is the shape behind every "the search box shows results for what I typed
+ * three keystrokes ago" report: the app fires one request per keystroke, the
+ * earlier and narrower query happens to take longer, and whichever response
+ * lands last wins the render. Nothing errors, nothing is slow, and the gate
+ * stays green — the only trace is the ordering, which is fully visible here and
+ * invisible from inside the app unless it was already sequencing responses.
+ *
+ * Reported as a race rather than as a bug: an app that tags each response and
+ * drops the stale one has the same event shape and is correct. The evidence is
+ * the ordering; whether the UI stomped is the reader's call, and the message
+ * says so rather than asserting it.
+ */
+function addResponseRaceCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  requests: Map<string, RequestInfo>,
+  drafts: CandidateDraft[],
+): void {
+  // Order is the whole signal here, and timestamps alone cannot carry it: two
+  // calls fired from the same tick share a millisecond, so a comparison on `t`
+  // reads the real race below as no race at all. Capture order is what actually
+  // records which went first, so both orders are taken from the event stream and
+  // timestamps are used only to prove the two overlapped.
+  const sentAt = new Map<string, number>();
+  for (const event of events) {
+    if (event.k !== "net.req") continue;
+    const id = networkRequestId(event.d.id);
+    if (id && !sentAt.has(id)) sentAt.set(id, sentAt.size);
+  }
+
+  // Responses in arrival order, joined back to the request that opened them.
+  const arrivals: {
+    req: RequestInfo;
+    res: BugEvent;
+    ok: boolean;
+    sentSeq: number;
+    backSeq: number;
+  }[] = [];
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const id = networkRequestId(event.d.id);
+    const req = id ? requests.get(id) : undefined;
+    const sentSeq = id ? sentAt.get(id) : undefined;
+    if (!req?.url || sentSeq === undefined) continue;
+    const status = finiteNumber(event.d.st);
+    arrivals.push({
+      req,
+      res: event,
+      ok: status !== undefined && status >= 200 && status < 300,
+      sentSeq,
+      backSeq: arrivals.length,
+    });
+  }
+
+  // Same endpoint means same method and path. The query string is the part that
+  // differs between the racing calls, so keying on the full URL would put every
+  // keystroke in its own bucket and find nothing.
+  const byEndpoint = new Map<string, typeof arrivals>();
+  for (const arrival of arrivals) {
+    const key = `${arrival.req.method ?? "GET"} ${requestPathOf(arrival.req.url ?? "")}`;
+    const bucket = byEndpoint.get(key) ?? [];
+    bucket.push(arrival);
+    byEndpoint.set(key, bucket);
+  }
+
+  for (const [endpoint, bucket] of byEndpoint) {
+    if (bucket.length < 2) continue;
+    for (let i = 0; i < bucket.length; i += 1) {
+      for (let j = i + 1; j < bucket.length; j += 1) {
+        const first = bucket[i];
+        const second = bucket[j];
+        // `earlier` and `later` are by send order; the race is that `later`
+        // also came back first.
+        const later = second.sentSeq > first.sentSeq ? second : first;
+        const earlier = later === second ? first : second;
+        if (later.backSeq >= earlier.backSeq) continue;
+        // A genuine overlap, not two sequential calls: the second was sent
+        // before the first had answered. A pair where either half failed is a
+        // different signal that the error detectors own.
+        if (later.req.t > earlier.res.t) continue;
+        if (!first.ok || !second.ok) continue;
+        const gapMs = Math.round(earlier.res.t - later.res.t);
+        drafts.push({
+          detector: "response_race",
+          title: `Out of order responses from ${titleUrl(earlier.req.url ?? "") ?? endpoint}`,
+          severity: "medium",
+          score: 72,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: earlier.res.t,
+            offsetMs:
+              offsetForEvent(earlier.res) ??
+              offsetFromStart(earlier.res.t, index.start),
+            route: routeAt(index.navs ?? [], earlier.res.t),
+            requestId: earlier.req.id,
+            method: earlier.req.method,
+            url: redactUrl(earlier.req.url),
+            // Identified by send time rather than by URL: the part that differs
+            // between racing calls is the query string, which redaction blanks
+            // unless the app declared those fields keepable. Offsets always
+            // survive, so the pair stays distinguishable at any policy.
+            message: `Two requests to this endpoint overlapped and returned in the opposite order. The one sent at +${Math.round(offsetFromStart(earlier.req.t, index.start) ?? 0)} ms came back ${gapMs} ms after the one sent at +${Math.round(offsetFromStart(later.req.t, index.start) ?? 0)} ms (${redactUrl(later.req.url) ?? "later request"}). Whatever the app rendered last is the older result, unless it discards responses that no longer match the current input.`,
+          }),
+          dedupeKey: `race:${earlier.req.id}:${later.req.id}`,
+        });
+      }
+    }
+  }
+}
+
+/** Path portion of a request URL, for grouping calls that differ only by query. */
+function requestPathOf(url: string): string {
+  const withoutHash = url.split("#")[0] ?? url;
+  return withoutHash.split("?")[0] ?? withoutHash;
 }
 
 function addIneffectiveSubmitCandidates(
@@ -1311,6 +1435,7 @@ function addBackendErrorCandidates(
         errorCode,
         message,
         source: "backend",
+        frame: backendErrorFrame(error),
       }),
       // Key on requestId alone (not status): a thrown error event often carries no statusCode
       // while the response's end event carries e.g. 500 — including status would split one
@@ -2584,18 +2709,67 @@ function looksLikeForeignKey(column: string): boolean {
 }
 
 /**
- * The comparable content of an insert: its after image minus the primary key,
- * canonicalized so two rows written in either key order compare equal.
+ * A column that carries row STATE rather than row identity: lifecycle enums,
+ * money and quantity magnitudes, flags. Two different rows sharing state is
+ * ordinary — eight bulk-created orders legitimately share
+ * {status: "placed", total_cents: N} — so state columns cannot anchor a
+ * duplicate-write claim. Anything else (a foreign key, a coupon code, a
+ * tracking number, a name) is treated as identifying. Deny-listing state is
+ * deliberate over allow-listing identity: business keys are unenumerable,
+ * and an unknown column wrongly treated as identifying costs one candidate,
+ * while one wrongly treated as state silences a real duplicate.
+ */
+function looksLikeStateColumn(column: string): boolean {
+  return (
+    /(^|_)(status|state|type|kind|phase|stage|flag|enabled|active|visible|archived)$/i.test(
+      column,
+    ) ||
+    /(^|_)(amount|total|price|cost|balance|qty|quantity|count|cents)(_cents|_amount)?s?$/i.test(
+      column,
+    )
+  );
+}
+
+/**
+ * True for a column the database fills in on write — a row timestamp. These are
+ * generated, exactly like the primary key, so two writes of the same row differ
+ * there for the same uninteresting reason and identity must not rest on them.
+ *
+ * Load bearing for determinism: a retry storm that lands both inserts inside one
+ * millisecond would otherwise be reported while the identical storm a
+ * millisecond slower is not, making the detector a coin flip on machine speed.
+ * The value is still captured and still shipped in the after image — it is
+ * evidence a reader wants, just not evidence of sameness.
+ */
+function looksLikeGeneratedTimestamp(column: string): boolean {
+  return /^(created|updated|modified|inserted|deleted)_?(at|on|time|timestamp)$|^(timestamp|created|updated)$/i.test(
+    column,
+  );
+}
+
+/**
+ * The comparable content of an insert: its after image minus the columns the
+ * database generated (the primary key and row timestamps), canonicalized so two
+ * rows written in either key order compare equal. Dropping timestamps is what
+ * makes the verdict deterministic; see {@link looksLikeGeneratedTimestamp}.
  *
  * Returns undefined when nothing DISCRIMINATING survives the pk drop, because a
  * signature that cannot tell two different rows apart cannot be evidence that
- * they are one row written twice. Three cases are rejected:
+ * they are one row written twice. Four cases are rejected:
+ *
+ *  - A column arrived structurally empty (`{}` / `[]`). That is a value the
+ *    capture could not represent, not a value the row does not have: a Date, a
+ *    Buffer, or a driver wrapper renders that way. The rows may well differ
+ *    exactly there, so identity is UNKNOWN and the detector must stay silent
+ *    rather than claim a match from the columns that happen to have survived.
+ *    A live run reported eight genuinely distinct orders as "6 identical rows"
+ *    because an unserializable `created_at` had reduced to `{}` on every one.
+ *    A scalar `null` or `""` is NOT this case — that is a real captured value,
+ *    and nullable columns are far too common to treat as evidence loss.
  *
  *  - Nothing survives. The clean control run inserts two `shipments` rows whose
  *    after images are `{id: …}` alone, so they reduce to `{}` and a naive
  *    "identical inserts" rule fires on the control.
- *  - Every surviving value is zero or empty, which is the same absence wearing
- *    a column name.
  *  - The only surviving column is a foreign key. A live run reported three
  *    demonstrably different `order_items` rows (different product, quantity and
  *    price) as "3 identical rows" because the captured after image had reduced
@@ -2617,9 +2791,11 @@ function comparedInsertColumns(
   if (!isRecord(after)) return undefined;
   const pkKeys = isRecord(event.d.pk) ? new Set(Object.keys(event.d.pk)) : null;
   const entries = Object.entries(after)
-    .filter(([key]) => !pkKeys?.has(key))
+    .filter(([key]) => !pkKeys?.has(key) && !looksLikeGeneratedTimestamp(key))
     .sort(([a], [b]) => a.localeCompare(b));
   if (entries.length === 0) return undefined;
+  if (entries.some(([, value]) => isUnrepresentedValue(value)))
+    return undefined;
   if (entries.every(([, value]) => isZeroOrEmpty(value))) return undefined;
   if (entries.length === 1 && looksLikeForeignKey(entries[0][0]))
     return undefined;
@@ -2677,11 +2853,28 @@ function addDuplicateWriteCandidates(
     for (const [table, signatures] of byTable) {
       for (const [signature, group] of signatures) {
         if (group.length < 2) continue;
+        const entries = entriesBySignature.get(signature) ?? [];
+        // "The same row written twice" is a claim about identity, and identity
+        // needs an anchor: some non-null, non-boolean column that is not mere
+        // row STATE. A bulk insert of eight orders sharing only
+        // {status: "placed", total_cents: 35700, user_id: null} matches on
+        // everything captured and is still eight different orders — while two
+        // coupon_redemptions sharing a non-null order_id and code are one
+        // redemption written twice. Without the anchor, stay silent: a partial
+        // capture reads as unknown, never as a duplicate.
+        const hasEntityAnchor = entries.some(
+          ([key, value]) =>
+            value !== null &&
+            value !== undefined &&
+            value !== "" &&
+            typeof value !== "boolean" &&
+            !looksLikeStateColumn(key),
+        );
+        if (!hasEntityAnchor) continue;
         const anchorEvent = group.reduce((earliest, event) =>
           event.t < earliest.t ? event : earliest,
         );
         const label = scrubText(table, 100) ?? "table";
-        const entries = entriesBySignature.get(signature) ?? [];
         const columns = entries.map(([key]) => key);
         drafts.push({
           detector: "duplicate_write",
@@ -2707,6 +2900,401 @@ function addDuplicateWriteCandidates(
         });
       }
     }
+  }
+}
+
+/**
+ * lost_update: a read-modify-write raced itself and one writer's change vanished.
+ *
+ * The signature is exact and does not need to know anything about the app: two
+ * UPDATEs land on the same table and primary key, and the later one's BEFORE
+ * image still shows the value the earlier one had already replaced. Both writes
+ * succeeded, both rows are individually valid, and the final row silently holds
+ * one increment instead of two. Nothing else in the pipeline names it — the
+ * generic `db_mutation` surfacing says only "a row changed", which is exactly
+ * as true of the correct outcome.
+ *
+ * This is the one detector here that deliberately crosses request boundaries:
+ * a lost update is *made of* two concurrent requests, so a per-request rule can
+ * never see it. Requiring a stale before-image is what keeps that safe — two
+ * unrelated sequential updates chain correctly and stay silent.
+ *
+ * Needs `captureBefore: true`; without before images there is nothing to
+ * compare and the rule cannot fire at all.
+ */
+function addLostUpdateCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  // table + pk → the update diffs against that row, in capture order.
+  const byRow = new Map<string, BugEvent[]>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    if (safeText(event.d.op, 20) !== "update") continue;
+    if (!isRecord(event.d.before) || !isRecord(event.d.after)) continue;
+    const table = safeText(event.d.table, 200);
+    const pk = pkEntriesOf(event);
+    if (!table || pk.length === 0) continue;
+    const key = `${table}\u0000${pk.map(([c, v]) => `${c}=${v}`).join(",")}`;
+    const list = byRow.get(key) ?? [];
+    list.push(event);
+    byRow.set(key, list);
+  }
+
+  for (const [key, updates] of byRow) {
+    if (updates.length < 2) continue;
+    const ordered = [...updates].sort((a, b) => a.t - b.t);
+    for (let i = 1; i < ordered.length; i += 1) {
+      const earlier = ordered[i - 1];
+      const later = ordered[i];
+      // Two writes from the same request are a sequence the app wrote on
+      // purpose, not a race.
+      const earlierRequest = safeText(earlier.d.requestId, 120);
+      const laterRequest = safeText(later.d.requestId, 120);
+      if (earlierRequest && laterRequest && earlierRequest === laterRequest)
+        continue;
+
+      const earlierAfter = earlier.d.after as Record<string, unknown>;
+      const laterBefore = later.d.before as Record<string, unknown>;
+      const laterAfter = later.d.after as Record<string, unknown>;
+      for (const [column, wrote] of Object.entries(earlierAfter)) {
+        if (isIdentityOrClockField(column)) continue;
+        if (!Object.hasOwn(laterBefore, column)) continue;
+        const sawBefore = laterBefore[column];
+        // The later writer read a value the earlier writer had already
+        // replaced, so its own write was computed from stale state.
+        if (sameScalar(sawBefore, wrote)) continue;
+        const earlierBefore = earlier.d.before as Record<string, unknown>;
+        if (!sameScalar(sawBefore, earlierBefore[column])) continue;
+        // ...and both writers, from that one read, computed the SAME new value.
+        // That coincidence is the read-modify-write fingerprint: two increments
+        // of 1 both produced 2, so the row holds 2 where it should hold 3. When
+        // the two writes disagree the rule stays silent, because an absolute
+        // `SET qty = n` from a stale read is indistinguishable from a correct
+        // one and guessing would put a false claim above the plane dump.
+        if (!sameScalar(laterAfter[column], wrote)) continue;
+
+        const label = scrubText(bareTableName(key.split("\u0000")[0]), 100) ?? "table";
+        drafts.push({
+          detector: "lost_update",
+          title: `Lost update: a second writer overwrote ${label}.${column} from a stale read`,
+          severity: "high",
+          score: DB_INVARIANT_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: later.t,
+            offsetMs:
+              offsetForEvent(later) ?? offsetFromStart(later.t, index.start),
+            route: routeAt(index.navs ?? [], later.t),
+            requestId: laterRequest,
+            message: `${label}.${column}: one writer set ${formatScalar(wrote)}, a concurrent writer had already read ${formatScalar(sawBefore)} and wrote ${formatScalar(laterAfter[column])}`,
+            source: normalizeDbEngine(later.d.engine),
+          }),
+          dedupeKey: `lostupdate:${key}:${column}`,
+        });
+        break; // One claim per row pair; the first stale column carries it.
+      }
+    }
+  }
+}
+
+/**
+ * Vocabulary for the two halves of a recorded counter pair: what the
+ * application set out to do, and what it reports having done. Matched on
+ * word segments rather than substrings, so `completed_at` does not read as
+ * an achievement count.
+ */
+const INTENDED_COUNTER_WORDS = new Set([
+  "expected",
+  "claimed",
+  "requested",
+  "planned",
+  "target",
+  "advertised",
+  "intended",
+  "total",
+]);
+const ACHIEVED_COUNTER_WORDS = new Set([
+  "written",
+  "returned",
+  "delivered",
+  "processed",
+  "actual",
+  "completed",
+  "succeeded",
+  "applied",
+  "sent",
+  "inserted",
+  "exported",
+  "seen",
+]);
+
+/**
+ * Columns whose units are not a row count. `total_cents` is an amount, and
+ * pairing it against a row count would fire on every ordinary order that costs
+ * more cents than it has line items. Duration and size columns are excluded for
+ * the same reason.
+ */
+const NON_COUNT_UNIT_WORDS =
+  /(cents|amount|price|cost|fee|tax|bytes|ms|millis|seconds|duration|balance)/i;
+
+/** `rows_expected` → ["rows","expected"]; `rowsExpected` → ["rows","expected"]. */
+function columnWords(column: string): string[] {
+  return column
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((word) => word.toLowerCase());
+}
+
+/** A non-negative integer that is plausibly a row count, or undefined. */
+function counterValueOf(column: string, value: unknown): number | undefined {
+  if (NON_COUNT_UNIT_WORDS.test(column)) return undefined;
+  const numeric = finiteNumber(value);
+  if (numeric === undefined) return undefined;
+  if (!Number.isInteger(numeric) || numeric < 0) return undefined;
+  return numeric;
+}
+
+/** How many contradiction claims one session may carry. */
+const MAX_COUNTER_CONTRADICTION_CANDIDATES = 5;
+
+/**
+ * Status values that mean the work is over, so its counters have to agree.
+ * Deny-biased: a status outside this set, including one this does not
+ * recognise, reads as still in flight and the row is left alone.
+ */
+const TERMINAL_STATUS_VALUES = new Set([
+  "done",
+  "complete",
+  "completed",
+  "finished",
+  "success",
+  "succeeded",
+  "failed",
+  "failure",
+  "errored",
+  "cancelled",
+  "canceled",
+  "aborted",
+]);
+
+/** Column names that carry a row's lifecycle state. */
+function isStatusColumn(column: string): boolean {
+  return columnWords(column).some(
+    (word) => word === "status" || word === "state" || word === "phase",
+  );
+}
+
+/**
+ * Whether a row is making a finished claim about itself.
+ *
+ * A row that carries a lifecycle column answers this itself, and only a
+ * terminal value counts: a batch inserted `pending` with nothing applied is a
+ * plan, and one `running` half way through is progress. Neither is a
+ * contradiction, and both are the ordinary shape of every job table.
+ *
+ * A row with no lifecycle column at all is a write-once record — an export
+ * receipt, a report line — so it is finished by the time it exists. Requiring
+ * it to have achieved something keeps a placeholder row, written ahead of the
+ * work it describes, from reading as a failure to do the work.
+ */
+function recordsFinishedWork(
+  after: Record<string, unknown>,
+  achievedValue: number,
+): boolean {
+  const statusEntry = Object.entries(after).find(([column]) =>
+    isStatusColumn(column),
+  );
+  if (statusEntry) {
+    const value = safeText(statusEntry[1], 40);
+    return value !== undefined && TERMINAL_STATUS_VALUES.has(value.toLowerCase());
+  }
+  return achievedValue > 0;
+}
+
+/**
+ * counter_contradiction: one written row records both what the application
+ * meant to do and what it did, and the two disagree.
+ *
+ * `rows_expected: 8, rows_written: 3` in a single inserted row is the whole
+ * signal. Nothing has to be correlated, no clock is involved, and no knowledge
+ * of the application is needed — the app chose to persist both numbers, which
+ * is itself the statement that it cares whether they match. Without this the
+ * ranker says only "Database update on order_exports", which is exactly as true
+ * of a correct export.
+ *
+ * Deliberately calibrated below the invariant detectors. What is certain is
+ * that two recorded counters disagree; whether that is a defect is the reader's
+ * call, so the claim is phrased as the two numbers rather than as a verdict.
+ *
+ * The one thing that must be right is WHEN to ask, because a job table spends
+ * its whole life with its counters disagreeing on purpose. {@link
+ * recordsFinishedWork} is that gate: the row has to be claiming the work is
+ * over. An earlier revision keyed on the operation instead, firing on every
+ * insert, and measuring it across 37 captured sessions showed the mistake in
+ * both directions — it fired on seven unrelated sessions that had merely
+ * inserted a `pending` batch with nothing applied yet, and it stayed silent on
+ * the batch that finished `done` having applied one row of two, which was the
+ * actual defect in that session.
+ */
+function addCounterContradictionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  let emitted = 0;
+  for (const event of events) {
+    if (emitted >= MAX_COUNTER_CONTRADICTION_CANDIDATES) return;
+    if (event.k !== "db.diff") continue;
+    const op = safeText(event.d.op, 20);
+    if (op !== "insert" && op !== "update") continue;
+    if (!isRecord(event.d.after)) continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+
+    const intended: Array<[string, number]> = [];
+    const achieved: Array<[string, number]> = [];
+    for (const [column, raw] of Object.entries(event.d.after)) {
+      const words = columnWords(column);
+      const isIntended = words.some((word) =>
+        INTENDED_COUNTER_WORDS.has(word),
+      );
+      const isAchieved = words.some((word) =>
+        ACHIEVED_COUNTER_WORDS.has(word),
+      );
+      // A column reading as both halves names nothing in particular.
+      if (isIntended === isAchieved) continue;
+      const value = counterValueOf(column, raw);
+      if (value === undefined) continue;
+      (isIntended ? intended : achieved).push([column, value]);
+    }
+    if (intended.length === 0 || achieved.length === 0) continue;
+
+    intended.sort(([a], [b]) => a.localeCompare(b));
+    achieved.sort(([a], [b]) => a.localeCompare(b));
+    const [intendedColumn, intendedValue] = intended[0];
+    const [achievedColumn, achievedValue] = achieved[0];
+    if (intendedValue === achievedValue) continue;
+    if (!recordsFinishedWork(event.d.after, achievedValue)) continue;
+
+    const label = scrubText(bareTableName(table), 100) ?? "table";
+    const comparedColumns = [...intended, ...achieved]
+      .map(([column]) => column)
+      .sort();
+    drafts.push({
+      detector: "counter_contradiction",
+      title: `${label} recorded ${intendedColumn} ${intendedValue} but ${achievedColumn} ${achievedValue}`,
+      severity: "medium",
+      score: 68,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: safeText(event.d.requestId, 120),
+        message: scrubText(
+          `${label}: \`${intendedColumn}\`=${intendedValue} against \`${achievedColumn}\`=${achievedValue}, recorded in one inserted row`,
+          220,
+        ),
+        comparedColumns,
+        source: normalizeDbEngine(event.d.engine),
+      }),
+      dedupeKey: `countercontradiction:${table}:${intendedColumn}:${achievedColumn}`,
+    });
+    emitted += 1;
+  }
+}
+
+/** Scalar equality that treats 1 and "1" as the same stored value. */
+function sameScalar(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || a === undefined || b === undefined)
+    return false;
+  if (typeof a === "object" || typeof b === "object") return false;
+  return String(a) === String(b);
+}
+
+function formatScalar(value: unknown): string {
+  if (value === null) return "null";
+  if (value === undefined) return "absent";
+  if (typeof value === "string") return scrubText(value, 80) ?? "[REDACTED]";
+  if (typeof value === "object") return "[object]";
+  return String(value);
+}
+
+/** SELECT statements against one table in one request before it reads as a fan-out. */
+const N_PLUS_ONE_STATEMENT_THRESHOLD = 8;
+
+/**
+ * n_plus_one_query: one request issued a separate SELECT per item.
+ *
+ * The classic listing defect. A catalog handler loops the rows it just fetched
+ * and asks the database one more question per row, so a page that should cost
+ * two round trips costs fifty-one. It is invisible to every other signal here:
+ * each query is fast, correct and individually unremarkable, the response is a
+ * 200, and the page renders exactly the right data. Only the shape of the
+ * request as a whole is wrong.
+ *
+ * Counted in SELECT *statements*, not rows. Rows are emitted one `db.read`
+ * event each, so a single SELECT returning fifty rows and fifty SELECTs
+ * returning one row produce the same number of events — `d.stmt` is what tells
+ * them apart, and without it this rule cannot run.
+ *
+ * Needs `captureReads: true`. Read caps bound the count, so the finding
+ * understates a large fan-out rather than overstating it.
+ */
+function addNPlusOneCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  // requestId + table → the distinct statement ordinals seen, and the first event.
+  const byTable = new Map<
+    string,
+    { statements: Set<number>; first: BugEvent; requestId: string; table: string }
+  >();
+  for (const event of events) {
+    if (event.k !== "db.read") continue;
+    const requestId = safeText(event.d.requestId, 120);
+    const table = safeText(event.d.table, 200);
+    const stmt = event.d.stmt;
+    if (!requestId || !table || !Number.isInteger(stmt)) continue;
+    const key = `${requestId}\u0000${table}`;
+    const entry = byTable.get(key) ?? {
+      statements: new Set<number>(),
+      first: event,
+      requestId,
+      table,
+    };
+    entry.statements.add(stmt as number);
+    if (event.t < entry.first.t) entry.first = event;
+    byTable.set(key, entry);
+  }
+
+  for (const entry of byTable.values()) {
+    const count = entry.statements.size;
+    if (count < N_PLUS_ONE_STATEMENT_THRESHOLD) continue;
+    const label = scrubText(bareTableName(entry.table), 100) ?? "table";
+    drafts.push({
+      detector: "n_plus_one_query",
+      title: `N+1 query: one request ran ${count} separate SELECTs against ${label}`,
+      severity: "medium",
+      score: 78,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: entry.first.t,
+        offsetMs:
+          offsetForEvent(entry.first) ??
+          offsetFromStart(entry.first.t, index.start),
+        route: routeAt(index.navs ?? [], entry.first.t),
+        requestId: entry.requestId,
+        message: `${count} SELECT statements against ${label} in one request, one per row rather than one for all of them. Read caps bound this count, so the real fan-out may be larger.`,
+        source: normalizeDbEngine(entry.first.d.engine),
+      }),
+      dedupeKey: `nplus1:${entry.requestId}:${entry.table}`,
+    });
   }
 }
 
@@ -2766,6 +3354,18 @@ function collectNumericFieldEntries(
     else collectNumericFieldEntries(inner, out, depth + 1);
   }
   return out;
+}
+
+/**
+ * True when a captured column value is a structurally empty object or array —
+ * the shape a value takes when the capture could not represent it (a Date, a
+ * Buffer, a driver's numeric wrapper). Distinct from {@link isZeroOrEmpty},
+ * which asks whether a value is blank: `null` and `""` are real answers about
+ * the row, while `{}` is the absence of an answer.
+ */
+function isUnrepresentedValue(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length === 0;
+  return isRecord(value) && Object.keys(value).length === 0;
 }
 
 function isZeroOrEmpty(value: unknown): boolean {
@@ -3263,7 +3863,7 @@ function collectRequests(events: BugEvent[]): Map<string, RequestInfo> {
   const navs = collectNavigationContext(events);
   for (const event of events) {
     if (event.k !== "net.req") continue;
-    const id = safeText(event.d.id, 120);
+    const id = networkRequestId(event.d.id);
     if (!id) continue;
     requests.set(
       id,
@@ -3344,6 +3944,30 @@ function codeFrameOf(entry: {
     if (match) return safeText(match[1], 300);
   }
   return undefined;
+}
+
+/**
+ * The `file:line:col` a backend error's own frames name, or undefined when the
+ * error rested without any.
+ *
+ * The innermost app frame is used because that is where the throw happened. The
+ * frames are already filtered to the host application at capture time (library,
+ * node_modules and runtime frames are dropped), so the first entry is the line
+ * a reader opens, not the driver that called it. Same output shape as
+ * {@link codeFrameOf}, and undefined for a partial location for the same
+ * reason: a file with no line is not a starting point.
+ */
+function backendErrorFrame(error: Record<string, unknown> | undefined) {
+  if (!error) return undefined;
+  const frames = error.frames;
+  if (!Array.isArray(frames)) return undefined;
+  const innermost = frames[0];
+  if (!isRecord(innermost)) return undefined;
+  return codeFrameOf({
+    file: safeText(innermost.file, 300),
+    line: finiteNumber(innermost.line),
+    col: finiteNumber(innermost.column),
+  });
 }
 
 // Normalizes an error message into a stable content signature for dedupe: lowercased, redaction
@@ -3674,6 +4298,11 @@ function renderCandidatesMarkdown(
         lines.push(`* Error code: ${candidate.anchor.errorCode}`);
       if (candidate.anchor.message)
         lines.push(`* Message: ${candidate.anchor.message}`);
+      // The file and line is the shortest path from "something broke" to an open
+      // editor, and it was reaching candidates.jsonl but not the markdown this
+      // file tells every reader to start from.
+      if (candidate.anchor.frame)
+        lines.push(`* Source: ${candidate.anchor.frame}`);
       if (candidate.anchor.elementLabel)
         lines.push(`* Element: ${candidate.anchor.elementLabel}`);
       // Causal structure (CP4): additive per-candidate lines from the CP3 re-rank fields.
@@ -4463,6 +5092,21 @@ function redactUrlLikeText(value: string): string {
 
 function redactTokenLikeText(value: string): string {
   return redactTokenLikeString(value).value;
+}
+
+/**
+ * A network event's correlation id, as a string.
+ *
+ * The browser SDK numbers its in-flight requests, so `d.id` arrives as a number
+ * on every browser captured session while a backend or a replayed session sends
+ * a string. Reading it as a string only looked correct against the backend
+ * fixtures and silently dropped every browser request on the floor, which took
+ * `slow_request`, `pending_request` and `response_race` with it: their request
+ * table was simply empty. Both shapes are valid capture, so both are accepted.
+ */
+function networkRequestId(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return safeText(value, 120);
 }
 
 function safeText(value: unknown, maxLength: number): string | undefined {
