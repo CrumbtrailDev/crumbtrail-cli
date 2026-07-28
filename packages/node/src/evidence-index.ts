@@ -618,6 +618,7 @@ export function buildEvidenceCandidates(
   addResultRowLossCandidates(events, index, drafts, exchanges);
   addSharedStateBleedCandidates(events, index, drafts, exchanges);
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
+  addBatchImportCandidates(events, index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
   addDeclinedPaymentOrderedCandidates(events, index, drafts);
   addStoredActiveMarkupCandidates(events, index, drafts);
@@ -5752,6 +5753,222 @@ function addSharedStateBleedCandidates(
             : `Two GETs of this URL returned the same number of items but a different set, with no POST, PUT, PATCH or DELETE from this session anywhere between them. The session had written to ${prefix} earlier, so this URL is session-scoped state that moved on its own.`,
         }),
         dedupeKey: `statebleed:${path}`,
+      });
+    }
+  }
+}
+
+// ─── correlated batch imports ────────────────────────────────────────────────
+
+interface ParsedCsv {
+  headers: string[];
+  rows: string[][];
+}
+
+/** Small RFC-4180 parser for captured import bodies; malformed CSV is ignored. */
+function parseCapturedCsv(value: unknown): ParsedCsv | undefined {
+  if (typeof value !== "string" || !value.includes("\n")) return undefined;
+  const records: string[][] = [];
+  let record: string[] = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i];
+    if (char === '"') {
+      if (quoted && value[i + 1] === '"') {
+        field += '"';
+        i += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (char === "," && !quoted) {
+      record.push(field);
+      field = "";
+    } else if ((char === "\n" || char === "\r") && !quoted) {
+      if (char === "\r" && value[i + 1] === "\n") i += 1;
+      record.push(field);
+      if (record.some((item) => item.length > 0)) records.push(record);
+      record = [];
+      field = "";
+    } else {
+      field += char;
+    }
+  }
+  if (quoted) return undefined;
+  record.push(field);
+  if (record.some((item) => item.length > 0)) records.push(record);
+  if (records.length < 2) return undefined;
+  const width = records[0].length;
+  if (width < 2 || records.some((row) => row.length !== width)) return undefined;
+  return {
+    headers: records[0].map((header) => header.replace(/^\uFEFF/, "").trim()),
+    rows: records.slice(1),
+  };
+}
+
+function csvColumn(
+  csv: ParsedCsv,
+  pattern: RegExp,
+): number | undefined {
+  const index = csv.headers.findIndex((header) => pattern.test(header));
+  return index >= 0 ? index : undefined;
+}
+
+function scalarPkText(event: BugEvent): string | undefined {
+  const entries = pkEntriesOf(event);
+  if (entries.length !== 1) return undefined;
+  return `${entries[0][0]}=${entries[0][1]}`;
+}
+
+/**
+ * Names three high-signal batch contradictions using only one correlated
+ * request: a response that claims more rows than it describes, one row updated
+ * twice, and values shifted forward by one CSV row.
+ */
+function addBatchImportCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const diffs = dbDiffsByRequest(events);
+  for (const exchange of exchanges.values()) {
+    if (!isSuccessStatus(exchange.status) || !exchange.res) continue;
+    const csv = parseCapturedCsv(exchange.body);
+    if (!csv) continue;
+    const response = parseStructuredBody(exchange.resBody);
+    const requestDiffs = diffs.get(exchange.requestId) ?? [];
+
+    if (isRecord(response)) {
+      const applied =
+        finiteNumber(response.applied) ?? finiteNumber(response.rows_applied);
+      const total =
+        finiteNumber(response.total) ?? finiteNumber(response.rows_total);
+      const rows = response.rows;
+      const errors = response.errors;
+      if (
+        applied !== undefined &&
+        applied > 0 &&
+        (total === undefined || total === csv.rows.length) &&
+        applied === csv.rows.length &&
+        Array.isArray(rows) &&
+        rows.length < applied &&
+        Array.isArray(errors) &&
+        errors.length === 0
+      ) {
+        drafts.push({
+          detector: "acknowledged_batch_rows_missing",
+          title: `Batch reported ${applied} applied rows but described only ${rows.length}`,
+          severity: "high",
+          score: DB_INVARIANT_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: exchange.res.t,
+            offsetMs:
+              offsetForEvent(exchange.res) ??
+              offsetFromStart(exchange.res.t, index.start),
+            route: routeAt(index.navs ?? [], exchange.res.t),
+            requestId: exchange.requestId,
+            method: exchange.method,
+            url: redactUrl(exchange.url),
+            status: exchange.status,
+            message: `The CSV contained ${csv.rows.length} data rows. The successful response claimed ${applied} applied with no errors, but its result list contained ${rows.length}.`,
+          }),
+          dedupeKey: `batchmissing:${exchange.requestId}`,
+        });
+      }
+    }
+
+    const repeated = new Map<string, BugEvent[]>();
+    for (const diff of requestDiffs) {
+      if (safeText(diff.d.op, 20)?.toLowerCase() !== "update") continue;
+      const table = safeText(diff.d.table, 160);
+      const pk = scalarPkText(diff);
+      if (!table || !pk) continue;
+      const key = `${table}\u0000${pk}`;
+      const group = repeated.get(key) ?? [];
+      group.push(diff);
+      repeated.set(key, group);
+    }
+    for (const [key, group] of repeated) {
+      if (group.length < 2) continue;
+      group.sort((a, b) => a.t - b.t);
+      const last = group[group.length - 1];
+      const [table, pk] = key.split("\u0000");
+      drafts.push({
+        detector: "same_request_row_rewritten",
+        title: `${bareTableName(table)} row ${pk} was updated ${group.length} times by one batch request`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: last.t,
+          offsetMs:
+            offsetForEvent(last) ?? offsetFromStart(last.t, index.start),
+          route: routeAt(index.navs ?? [], last.t),
+          requestId: exchange.requestId,
+          method: exchange.method,
+          url: redactUrl(exchange.url),
+          message: `One successful CSV request rewrote the same ${bareTableName(table)} primary key ${group.length} times. Distinct input rows collided on one database row, so an earlier imported value was overwritten before the response returned.`,
+          source: normalizeDbEngine(last.d.engine),
+        }),
+        dedupeKey: `batchrewrite:${exchange.requestId}:${table}:${pk}`,
+      });
+    }
+
+    const identityColumn = csvColumn(csv, /^(sku|slug|key|code)$/i);
+    const valueColumn = csvColumn(
+      csv,
+      /(?:price|amount|total|cost|value)(?:_?cents?)?$/i,
+    );
+    if (identityColumn === undefined || valueColumn === undefined) continue;
+    let shifted = 0;
+    let anchor: BugEvent | undefined;
+    for (let rowIndex = 0; rowIndex + 1 < csv.rows.length; rowIndex += 1) {
+      const identity = csv.rows[rowIndex][identityColumn]?.trim();
+      const expected = Number(csv.rows[rowIndex][valueColumn]);
+      const next = Number(csv.rows[rowIndex + 1][valueColumn]);
+      if (!identity || !Number.isFinite(expected) || !Number.isFinite(next))
+        continue;
+      const match = requestDiffs.find((diff) => {
+        const after = isRecord(diff.d.after) ? diff.d.after : undefined;
+        if (!after) return false;
+        const dbIdentity =
+          safeText(after.slug, 240) ??
+          safeText(after.sku, 240) ??
+          safeText(after.key, 240) ??
+          safeText(after.code, 240);
+        if (dbIdentity !== identity) return false;
+        const actual =
+          finiteNumber(after[csv.headers[valueColumn]]) ??
+          finiteNumber(after.price_cents) ??
+          finiteNumber(after.amount_cents);
+        return actual === next && actual !== expected;
+      });
+      if (match) {
+        shifted += 1;
+        anchor = match;
+      }
+    }
+    if (shifted >= 2 && anchor) {
+      drafts.push({
+        detector: "batch_value_shift",
+        title: `${shifted} batch rows were written with the next CSV row's value`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE + 2,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: anchor.t,
+          offsetMs:
+            offsetForEvent(anchor) ?? offsetFromStart(anchor.t, index.start),
+          route: routeAt(index.navs ?? [], anchor.t),
+          requestId: exchange.requestId,
+          method: exchange.method,
+          url: redactUrl(exchange.url),
+          message: `${shifted} database updates matched a CSV row's identity but used the following row's ${csv.headers[valueColumn]} value. This is a consistent one-row shift, not an isolated mismatch.`,
+          source: normalizeDbEngine(anchor.d.engine),
+        }),
+        dedupeKey: `batchshift:${exchange.requestId}:${csv.headers[valueColumn]}`,
       });
     }
   }
