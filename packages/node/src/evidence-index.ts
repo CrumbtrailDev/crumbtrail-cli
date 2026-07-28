@@ -590,6 +590,7 @@ export function buildEvidenceCandidates(
   addDbFieldDivergenceCandidates(events, index, drafts);
   addDuplicateWriteCandidates(events, index, drafts);
   addInterpolationArtifactCandidates(events, index, drafts);
+  addStateFlipFlopCandidates(events, index, drafts);
   addLostUpdateCandidates(events, index, drafts);
   addCounterContradictionCandidates(events, index, drafts);
   addNPlusOneCandidates(events, index, drafts);
@@ -3008,6 +3009,112 @@ function addInterpolationArtifactCandidates(
         dedupeKey: `interpolation:${key}`,
       });
     }
+  }
+}
+
+/** Columns that carry a lifecycle: status/state/phase/stage, bare or suffixed.
+ *  Deliberately narrower than {@link looksLikeStateColumn}: flag/enabled/
+ *  active/visible are legitimate user toggles, and a toggle flipped twice is
+ *  A→B→A by design. Lifecycles are not supposed to go backward. */
+function looksLikeLifecycleColumn(column: string): boolean {
+  return /(^|_)(status|state|phase|stage)$/i.test(column);
+}
+
+/**
+ * state_flip_flop: one row's lifecycle column returned to a value it had
+ * already left.
+ *
+ * The live case: order #1's status went placed → delivered → placed →
+ * refunded → shipped inside 31 ms. No error fired, every write succeeded, and
+ * the only structural signal was four generic "Database update on orders"
+ * candidates at the bottom of the ranking. The domain-free invariant is the
+ * revisit: whatever the app's state machine is, a value that was held, left,
+ * and held again means either an invalid transition or two writers fighting.
+ * Restricted to string-valued lifecycle columns so boolean and enum toggles
+ * the user can legitimately flip twice stay out.
+ */
+function addStateFlipFlopCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  // (table, pk, column) → observed value chain, in event order.
+  const chains = new Map<
+    string,
+    { table: string; column: string; values: string[]; first: BugEvent; last: BugEvent }
+  >();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    if (safeText(event.d.op, 20) !== "update") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const pk = event.d.pk;
+    if (!isRecord(pk)) continue;
+    const before = isRecord(event.d.before) ? event.d.before : undefined;
+    const after = isRecord(event.d.after) ? event.d.after : undefined;
+    if (!after) continue;
+    for (const [column, afterValue] of Object.entries(after)) {
+      if (!looksLikeLifecycleColumn(column)) continue;
+      if (typeof afterValue !== "string" || afterValue.length === 0) continue;
+      const key = `${table} ${JSON.stringify(pk)} ${column}`;
+      const chain = chains.get(key) ?? {
+        table,
+        column,
+        values: [],
+        first: event,
+        last: event,
+      };
+      const beforeValue = before?.[column];
+      if (
+        chain.values.length === 0 &&
+        typeof beforeValue === "string" &&
+        beforeValue.length > 0
+      ) {
+        chain.values.push(beforeValue);
+      }
+      if (chain.values[chain.values.length - 1] !== afterValue) {
+        chain.values.push(afterValue);
+      }
+      chain.last = event;
+      chains.set(key, chain);
+    }
+  }
+
+  for (const chain of chains.values()) {
+    // A revisit: some value appears again after a different value intervened.
+    const seen = new Set<string>();
+    let left: string | undefined;
+    let revisited: string | undefined;
+    for (const value of chain.values) {
+      if (seen.has(value)) {
+        revisited = value;
+        break;
+      }
+      if (left !== undefined) seen.add(left);
+      left = value;
+    }
+    if (revisited === undefined) continue;
+    const label = scrubText(chain.table, 100) ?? "table";
+    const spanMs = Math.max(0, chain.last.t - chain.first.t);
+    const path = chain.values.map((v) => scrubText(v, 60)).join(" → ");
+    drafts.push({
+      detector: "state_flip_flop",
+      title: `State went backward: ${label}.${chain.column} returned to "${revisited}"`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: chain.first.t,
+        offsetMs:
+          offsetForEvent(chain.first) ??
+          offsetFromStart(chain.first.t, index.start),
+        route: routeAt(index.navs ?? [], chain.first.t),
+        requestId: safeText(chain.first.d.requestId, 200),
+        message: `${chain.table} row ${scrubText(JSON.stringify(chain.first.d.pk), 120)} moved ${path} over ${spanMs} ms. "${revisited}" was held, left, and reached again — an invalid transition or two writers fighting, whatever the intended state machine is.`,
+        source: normalizeDbEngine(chain.first.d.engine),
+      }),
+      dedupeKey: `flipflop:${chain.table}:${chain.column}:${scrubText(JSON.stringify(chain.first.d.pk), 120)}`,
+    });
   }
 }
 
