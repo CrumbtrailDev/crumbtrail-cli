@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "crumbtrail-mcp",
+  "description": "Give Claude complete bug context from recorded browser sessions — ranked fix bundles, correlated backend spans, exact database row changes, and a cross-release regression witness — via the Crumbtrail MCP server.",
+  "version": "0.1.0",
+  "author": { "name": "Crumbtrail", "url": "https://github.com/CrumbtrailDev" },
+  "homepage": "https://crumbtrail.ai",
+  "repository": "https://github.com/CrumbtrailDev/crumbtrail-cli",
+  "license": "MIT",
+  "keywords": [
+    "debugging",
+    "mcp",
+    "session-capture",
+    "regression",
+    "bug-context"
+  ]
+}

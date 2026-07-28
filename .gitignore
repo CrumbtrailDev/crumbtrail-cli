@@ -45,6 +45,9 @@ Business Climate/market-first-verdict.md
 .playwright-mcp/
 .superset/
 .mcp.json
+# The root .mcp.json is published collateral, not a local artifact: cursor.directory
+# auto-detects the MCP server from it. Local .mcp.json files elsewhere stay ignored.
+!/.mcp.json
 docs/research/
 docs/superpowers/
 plan/
