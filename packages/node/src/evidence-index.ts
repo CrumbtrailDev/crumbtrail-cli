@@ -620,6 +620,7 @@ export function buildEvidenceCandidates(
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
   addDeclinedPaymentOrderedCandidates(events, index, drafts);
+  addStoredActiveMarkupCandidates(events, index, drafts);
   addInputRevertedCandidates(events, index, drafts);
   addFormResetAfterErrorCandidates(events, index, drafts);
   addCurrencyLocaleMismatchCandidates(events, index, drafts);
@@ -6064,6 +6065,53 @@ function addDeclinedPaymentOrderedCandidates(
           `then an orders row was inserted ${order.t - failure.t} ms later.`,
       }),
       dedupeKey: `declinedordered:${correlationIdOf(order) ?? order.t}`,
+    });
+  }
+}
+
+// ─── stored_active_markup ───────────────────────────────────────────────────
+
+const STORED_ACTIVE_MARKUP_SCORE = 96;
+const ACTIVE_MARKUP_RE =
+  /<(?:script|iframe|object|embed)\b|<[^>]+\bon[a-z]+\s*=|javascript\s*:/i;
+
+/**
+ * stored_active_markup: a database write persisted markup that can execute in
+ * a browser. The value itself is never repeated in the candidate.
+ */
+function addStoredActiveMarkupCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (event.k !== "db.diff" || event.d.op === "delete") continue;
+    const after = event.d.after;
+    if (!isRecord(after)) continue;
+    const field = collectFieldEntries(after).find(
+      ([, value]) => typeof value === "string" && ACTIVE_MARKUP_RE.test(value),
+    );
+    if (!field) continue;
+    const table = safeText(event.d.table, 120) ?? "a database table";
+    drafts.push({
+      detector: "stored_active_markup",
+      title: `Executable markup was persisted to ${table}.${field[0]}`,
+      severity: "critical",
+      score: STORED_ACTIVE_MARKUP_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: correlationIdOf(event),
+        table,
+        source: normalizeDbEngine(event.d.engine),
+        message:
+          `A ${event.d.op} wrote a string containing an executable HTML construct ` +
+          `to ${table}.${field[0]}. The stored value is omitted from this finding.`,
+      }),
+      dedupeKey: `storedmarkup:${table}:${field[0]}`,
     });
   }
 }
