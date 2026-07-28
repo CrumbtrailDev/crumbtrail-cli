@@ -538,9 +538,18 @@ export interface AttributableCandidate {
 
 /**
  * Detectors whose subject is a single database write: `db_mutation` surfaces
- * the write plane, `db_field_divergence` and `duplicate_write` name a specific
- * failure in one of those writes. All three anchor on the write itself, so they
- * share a node family and can contend for the same node.
+ * the write plane, `db_field_divergence`, `duplicate_write` and
+ * `db_client_supplied_value` name a specific failure in one of those writes.
+ * All of them anchor on the write itself, so they share a node family and can
+ * contend for the same node.
+ *
+ * `db_client_supplied_value` anchors on the `db.diff` of the write that stored
+ * the client's number, which is the same event `db_mutation` anchors on. Left
+ * out of this table it reached a node only through the requestId match, took
+ * the empty kind family in {@link nodeKindsForDetector} whenever that missed,
+ * and — because {@link isDbWriteEnd} reads this set — presented as something
+ * other than a write, which re-inflated the confidence of every write-to-write
+ * claim running through it.
  *
  * `db_delta_mismatch` is deliberately absent: it is a named DB invariant, but it
  * has never been in this table, and adding it here would change which node the
@@ -551,6 +560,7 @@ const DB_WRITE_DETECTORS = new Set([
   "db_mutation",
   "db_field_divergence",
   "duplicate_write",
+  "db_client_supplied_value",
 ]);
 
 /**
@@ -592,9 +602,16 @@ function nodeKindsForDetector(detector: string): Set<CausalNodeKind> {
  * Detectors that NAME a specific failure on a plane another detector merely
  * surfaces, and that must therefore own a contended node ahead of that generic
  * twin. Each entry has a twin it can tie with on the same event:
- * `db_delta_mismatch`, `db_field_divergence` and `duplicate_write` against
- * `db_mutation`; `otel_span_error` against `otel_db_activity`, which fires on
- * the same span when a database span carries ERROR status.
+ * `db_delta_mismatch`, `db_field_divergence`, `duplicate_write` and
+ * `db_client_supplied_value` against `db_mutation`; `otel_span_error` against
+ * `otel_db_activity`, which fires on the same span when a database span carries
+ * ERROR status.
+ *
+ * `db_client_supplied_value` ALWAYS ties with `db_mutation` — both anchor on the
+ * same `db.diff` — so before it was listed here, the node that decides which of
+ * the two becomes the causal root was awarded by dedupe-key alphabet
+ * (`dbclientvalue:` sorting under `dbdiff:`). The right answer was reached by
+ * the wrong rule, and renaming either key would have silently reversed it.
  *
  * This is an ALLOWLIST, and omission is the safe answer, not an oversight. A
  * detector left out takes the default in {@link ownershipPriority}, which is no
@@ -609,6 +626,7 @@ const NAMED_FAILURE_DETECTORS = new Set([
   "db_delta_mismatch",
   "db_field_divergence",
   "duplicate_write",
+  "db_client_supplied_value",
   "otel_span_error",
 ]);
 
@@ -666,8 +684,10 @@ function weakerConfidence(
  * Pure, deterministic candidate->node attribution over a prebuilt CausalGraph.
  *
  * Mapping precedence (anchor -> at most one node):
- *   1. requestId match: nearest |delta-t|, tie-break node id asc.
+ *   1. requestId match: nearest |delta-t|, then a node kind the detector describes, then node id asc.
  *   2. temporal + compatible-kind fallback within CAUSAL_MAP_WINDOW_MS: nearest t, tie-break id asc.
+ *      A DB write detector is additionally barred from any `db.write` node but its own, so a
+ *      displaced write reports isolated rather than a neighbour's write.
  *   3. no match -> isolated.
  * One candidate per node: on contention the smaller anchor.t wins, then the candidate that NAMES a
  * failure over the generic surfacing of the same event (see {@link ownershipPriority}), then the
@@ -675,8 +695,10 @@ function weakerConfidence(
  *
  * Classification (over reverse adjacency effect->cause): nearest candidate-bearing ancestor = root;
  * this candidate becomes a symptom whose rootCauseId is that ancestor and whose attributionConfidence
- * is the WEAKEST edge confidence along the path. A candidate node with no candidate-bearing ancestor
- * is a root, and its `causes` are the sorted candidate ids of the symptoms attributed to it.
+ * is the WEAKEST edge confidence along the path, then clamped to `low` when both ends of the claim
+ * are database writes (spine order is not causation — see {@link clampWriteToWriteClaim}). A
+ * candidate node with no candidate-bearing ancestor is a root, and its `causes` are the sorted
+ * candidate ids of the symptoms attributed to it.
  */
 export function attributeCandidates(
   graph: CausalGraph,
@@ -727,15 +749,32 @@ function attributeCandidatesInternal(
   const nodes = graph.nodes;
 
   function findRequestIdNode(
+    candidateId: string,
     anchor: AttributableCandidate["anchor"],
   ): CausalNode | undefined {
     if (!anchor.requestId) return undefined;
     const matches = nodes.filter((n) => n.requestId === anchor.requestId);
     if (matches.length === 0) return undefined;
+    // Kind compatibility, used ONLY to break a tie at equal |delta-t|. A request routinely closes on
+    // the same millisecond as its last write, and `backend.req` sorts under `db.write` by id, so the
+    // write was handed the node for the request's end instead of the node for itself. That is an
+    // accident of two node ids and a shared millisecond, not a statement about the candidate.
+    //
+    // Time still dominates: a nearer node of the wrong kind still wins, so this cannot pull a
+    // candidate onto a distant node just because the kind matches. An unknown detector takes the
+    // empty family and every node ties at 1, leaving its order exactly as it was.
+    const detector = detectorById(candidateId);
+    const kinds =
+      detector !== undefined ? nodeKindsForDetector(detector) : undefined;
+    const kindRank = (node: CausalNode): number =>
+      kinds !== undefined && kinds.has(node.kind) ? 0 : 1;
     return [...matches].sort((a, b) => {
       const da = Math.abs(a.t - anchor.t);
       const db = Math.abs(b.t - anchor.t);
       if (da !== db) return da - db;
+      const ka = kindRank(a);
+      const kb = kindRank(b);
+      if (ka !== kb) return ka - kb;
       return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     })[0];
   }
@@ -754,10 +793,21 @@ function attributeCandidatesInternal(
     const kinds =
       detector !== undefined ? nodeKindsForDetector(detector) : undefined;
     if (kinds !== undefined && kinds.size === 0) return undefined;
+    // A DB write detector names ONE write. The nearest unowned `db.write` node is some OTHER write
+    // of the same request, and handing it that node makes the candidate report a write it does not
+    // describe. Worse, it cascades: when a named failure takes the node for the write they share,
+    // the displaced `db_mutation` lands on the next write, displacing THAT one in turn, until the
+    // emitted chain is write order shifted by a slot — which is how a candidate came to name a
+    // write that happened after it as its own cause. Its own node is `db.write` at the same
+    // instant in the same request; anything else is not it, so it stays isolated instead.
+    const ownWriteOnly =
+      detector !== undefined && DB_WRITE_DETECTORS.has(detector);
     const matches = nodes.filter((n) => {
       if (excluded.has(n.id)) return false;
       if (Math.abs(n.t - anchor.t) > CAUSAL_MAP_WINDOW_MS) return false;
       if (kinds && !kinds.has(n.kind)) return false;
+      if (ownWriteOnly && n.kind === "db.write" && n.t !== anchor.t)
+        return false;
       return true;
     });
     if (matches.length === 0) return undefined;
@@ -774,7 +824,7 @@ function attributeCandidatesInternal(
     const excluded = new Set<string>(nodeToCandidate.keys());
 
     // Precedence 1: requestId match (may already be owned -> arbitrate).
-    const reqNode = findRequestIdNode(candidate.anchor);
+    const reqNode = findRequestIdNode(candidate.id, candidate.anchor);
     if (reqNode) {
       const owner = nodeToCandidate.get(reqNode.id);
       if (owner === undefined) {
@@ -832,13 +882,18 @@ function attributeCandidatesInternal(
    *
    * Two ways to be one, and both are needed. The node kind is the direct
    * answer: a `db.write` node was built from a `db.diff` event. The owning
-   * candidate is the answer when the node kind lies about it: precedence 1 of
-   * the mapping matches on requestId alone and takes the node NEAREST in time
-   * regardless of kind, so a write whose `backend.req` node happens to be a
-   * millisecond closer than its own `db.write` node is attributed there. The
-   * candidate still describes a write; only the node it landed on does not say
-   * so. Reading the kind alone would clamp three writes of one request and
-   * leave the fourth at high confidence purely on that accident.
+   * candidate is the answer when the node kind does not say so — precedence 1
+   * of the mapping takes the node NEAREST in time, so a write whose
+   * `backend.req` node is closer than its own `db.write` node is attributed
+   * there. The candidate still describes a write; only the node it landed on
+   * does not. Reading the kind alone would clamp the writes of one request and
+   * leave that one at high confidence purely on the accident of which node was
+   * nearest.
+   *
+   * The common case — a request closing on its last write's millisecond — is no
+   * longer one of these: an equal-distance tie now prefers a node kind the
+   * detector describes. What remains is the genuinely nearer non-write node,
+   * which no tie-break can address, so this stays as the backstop for it.
    */
   function isDbWriteEnd(nodeId: string): boolean {
     if (kindById.get(nodeId) === "db.write") return true;
@@ -870,10 +925,43 @@ function attributeCandidatesInternal(
    * today, so the two are the same set. Should a later rule draw a genuinely
    * causal write-to-write edge, it would be clamped here as well and the
    * predicate would have to read `edge.kind` to tell them apart.
+   *
+   * A hop is not the whole claim, though: two writes of one request are
+   * ADJACENT on the spine only when nothing else of that request happened
+   * between them. Let one OTLP span land in between and the path becomes
+   * write -> span -> write, neither hop is write-to-write, and the same
+   * ordering-not-causation claim comes back out graded `high`. See
+   * {@link clampWriteToWriteClaim}, which re-applies the rule to the claim's
+   * two ends after the walk, where the intervening nodes cannot launder it.
    */
   function hopConfidence(effectId: string, causeId: string): CausalConfidence {
     if (isDbWriteEnd(effectId) && isDbWriteEnd(causeId)) return "low";
     return confByPair.get(JSON.stringify([effectId, causeId])) ?? "low";
+  }
+
+  /**
+   * The write-to-write rule applied to the CLAIM rather than to a hop: whatever
+   * the walk passed through, "one write of a request caused another write of
+   * the same request" is a statement about the order the handler chose, so it
+   * cannot be graded above `low`.
+   *
+   * This is what the per-hop clamp cannot see. In the checkout that motivated
+   * it, an OTLP span was emitted between the inventory decrement and the order
+   * insert, so the path ran write -> span -> write, both hops graded `high`,
+   * and the client-supplied-total finding was published as an established
+   * effect of an unrelated stock update.
+   *
+   * Only the grade moves; the link itself is still emitted, so a reader can
+   * still follow the sequence.
+   */
+  function clampWriteToWriteClaim(
+    startNodeId: string,
+    rootNodeId: string,
+    conf: CausalConfidence,
+  ): CausalConfidence {
+    if (isDbWriteEnd(startNodeId) && isDbWriteEnd(rootNodeId))
+      return weakerConfidence(conf, "low");
+    return conf;
   }
 
   // --- 3. For each mapped candidate, walk ancestors to the nearest candidate-bearing ancestor ---
@@ -943,7 +1031,11 @@ function attributeCandidatesInternal(
       attribution.set(candidate.id, {
         causalRole: "symptom",
         rootCauseId: rootCandidateId,
-        attributionConfidence: ancestor.conf,
+        attributionConfidence: clampWriteToWriteClaim(
+          nodeId,
+          ancestor.rootNodeId,
+          ancestor.conf,
+        ),
       });
       const list = symptomsByRoot.get(rootCandidateId) ?? [];
       list.push(candidate.id);

@@ -682,29 +682,29 @@ export function buildEvidenceCandidates(
 }
 
 /**
- * Confidence-gated, causal-graph-driven re-rank. RANKING-ONLY: mutates draft ordering (and the
- * additive causal tag fields) but NEVER the emitted `score`. Uses `dedupeKey` as each draft's stable
- * identity. With no/empty graph, attribution is all-isolated and the baseline order is preserved.
+ * Causal-graph-driven re-rank. RANKING-ONLY: mutates draft ordering (and the additive causal tag
+ * fields) but NEVER the emitted `score`. Uses `dedupeKey` as each draft's stable identity. With
+ * no/empty graph, attribution is all-isolated and the baseline order is preserved byte for byte.
  *
- * Gates (per attributionConfidence of the symptom→root link), applied by the tier sort:
- *  - high symptom   → collapse: demoted tier, sorted after every root and every annotate-only draft
- *                     (kept in output, appended to its root's causes).
- *  - medium symptom → demote+keep: same demoted tier; within it, ordered by effective score.
- *  - low symptom    → annotate only: not demoted, order preserved, tags only.
+ * Drafts are ranked as CAUSAL CHAINS, not individually. A chain is a set of drafts connected by
+ * CREDITED symptom→root links; it is placed by the score of its strongest member and laid out
+ * internally root first. So a high-scoring symptom lifts its whole chain to the height it deserves
+ * and still appears under its own cause — the two rules that used to fight.
  *
- * TWO ordering rules, and they can disagree. The tier sort is the weaker one. `enforceRootBeforeSymptom`
- * runs AFTER it and sweeps left to right: any draft found later than the symptom it causes is lifted to
- * sit immediately before that symptom, INCLUDING across the tier boundary. So a demoted symptom that is
- * itself the root of an undemoted draft is pulled back above unrelated roots, and is no longer barred
- * from ranked[0].
+ * A link is CREDITED when its `attributionConfidence` is `high` or `medium`. A `low` link is an
+ * annotation ("these ran in sequence"), it binds nothing, and its symptom ranks on its own score.
+ * That is the whole point: the graph's spine chains a request's nodes in time order, so an ordinary
+ * checkout emits one long low-confidence chain of writes. Letting those links decide position is
+ * what buried a score-90 named failure under a score-40 "Database update on products" — the write
+ * that merely happened first. Causality is still expressed, as a link, in the emitted fields.
  *
- * That is intended. "A root appears before its own symptom" is the more fundamental invariant: a list
- * where a symptom precedes its cause is incoherent, while the tier partition only encodes how strongly
- * a link was graded. The resulting order is also the one we want — the named failure sits directly under
- * its actual root instead of at the bottom of the list on a technicality.
+ * Ordering within one chain is root-before-symptom by construction (pre-order walk from the chain's
+ * top), so no corrective sweep is needed and a symptom can never precede its own cause.
  *
- * So the only absolute guarantee here is root-before-symptom. A `high` symptom is NOT guaranteed to be
- * ranked after all roots, nor to be excluded from ranked[0].
+ * Replaces an earlier rank-tier partition (roots ahead of demoted high/medium symptoms) plus an
+ * `enforceRootBeforeSymptom` sweep that undid it. The two disagreed by design, the sweep won, and
+ * because it honored EVERY `rootCauseId` regardless of grade, the `low` tier's documented
+ * "annotate only, order preserved" contract was not true of position.
  *
  * The comparator produces a total, deterministic order derived solely from per-draft fields.
  */
@@ -712,11 +712,6 @@ function applyCausalRerank(
   ordered: CandidateDraft[],
   causalGraph?: CausalGraph,
 ): void {
-  // Baseline rank position (from the score-sorted `ordered`) is the stable fallback key so that,
-  // absent causal relations, order is byte-identical to today.
-  const baselineRank = new Map<string, number>();
-  ordered.forEach((draft, i) => baselineRank.set(draft.dedupeKey, i));
-
   if (causalGraph && causalGraph.nodes.length > 0) {
     const detectorByKey = new Map<string, string>();
     for (const draft of ordered)
@@ -746,8 +741,27 @@ function applyCausalRerank(
     }
   }
 
+  const byKey = new Map<string, CandidateDraft>(
+    ordered.map((draft) => [draft.dedupeKey, draft]),
+  );
+
+  /**
+   * A symptom→root link strong enough to bind the two into one ranked chain. `low` links are the
+   * request spine's time ordering restated, so they annotate without binding — see the header.
+   */
+  const creditedParent = (draft: CandidateDraft): string | undefined => {
+    if (draft.causalRole !== "symptom" || !draft.rootCauseId) return undefined;
+    if (
+      draft.attributionConfidence !== "high" &&
+      draft.attributionConfidence !== "medium"
+    )
+      return undefined;
+    return byKey.has(draft.rootCauseId) ? draft.rootCauseId : undefined;
+  };
+
   // Blast-radius boost (ranking-only): each root's effective score rises by a bounded amount driven
-  // by the severity of the symptoms it explains. Symptoms/isolated get no boost.
+  // by the severity of the symptoms it explains. Only CREDITED symptoms count — a link too weak to
+  // set position is too weak to argue the root has a blast radius. Symptoms/isolated get no boost.
   const boostByKey = new Map<string, number>();
   for (const draft of ordered) {
     if (
@@ -758,89 +772,105 @@ function applyCausalRerank(
       continue;
     let raw = 0;
     for (const symptomKey of draft.causes) {
-      const symptom = ordered.find((d) => d.dedupeKey === symptomKey);
-      const weight = symptom
-        ? CAUSAL_RANK_CONSTANTS.SEVERITY_WEIGHT[symptom.severity]
-        : 1;
-      raw += weight * CAUSAL_RANK_CONSTANTS.BLAST_PER_SYMPTOM;
+      const symptom = byKey.get(symptomKey);
+      if (!symptom || creditedParent(symptom) !== draft.dedupeKey) continue;
+      raw +=
+        CAUSAL_RANK_CONSTANTS.SEVERITY_WEIGHT[symptom.severity] *
+        CAUSAL_RANK_CONSTANTS.BLAST_PER_SYMPTOM;
     }
-    boostByKey.set(
-      draft.dedupeKey,
-      Math.min(CAUSAL_RANK_CONSTANTS.MAX_BLAST_BOOST, raw),
-    );
+    if (raw > 0)
+      boostByKey.set(
+        draft.dedupeKey,
+        Math.min(CAUSAL_RANK_CONSTANTS.MAX_BLAST_BOOST, raw),
+      );
   }
 
-  // Rank tier: roots + isolated (0) precede high/medium demoted symptoms (1). Low symptoms are NOT
-  // demoted (annotate-only) → tier 0, order preserved. The tier holds only until
-  // enforceRootBeforeSymptom below, which may lift a tier-1 draft back across the boundary.
-  const rankTier = (draft: CandidateDraft): number => {
-    if (
-      draft.causalRole === "symptom" &&
-      (draft.attributionConfidence === "high" ||
-        draft.attributionConfidence === "medium")
-    ) {
-      return 1;
-    }
-    return 0;
-  };
   const effectiveScore = (draft: CandidateDraft): number =>
     draft.score + (boostByKey.get(draft.dedupeKey) ?? 0);
 
-  ordered.sort((a, b) => {
-    const ta = rankTier(a);
-    const tb = rankTier(b);
-    if (ta !== tb) return ta - tb;
-    // Within a tier, higher effective (ranking) score first.
+  // Sibling / singleton order, and the tie-break everywhere else: higher effective score, then the
+  // historical anchor-time and dedupeKey keys.
+  const byRank = (a: CandidateDraft, b: CandidateDraft): number => {
     const sa = effectiveScore(a);
     const sb = effectiveScore(b);
     if (sa !== sb) return sb - sa;
-    // Deterministic tie-breaks: anchor time asc, then dedupeKey asc (matches the historical order).
     if (a.anchor.t !== b.anchor.t) return a.anchor.t - b.anchor.t;
     return a.dedupeKey.localeCompare(b.dedupeKey);
-  });
-
-  // Absolute guarantee: every symptom orders strictly AFTER its root. NOT a safety net over the tier
-  // sort — it overrides it. A tier-0 draft whose root is a tier-1 demoted symptom is only reachable by
-  // this pass, which lifts that root back across the tier boundary. See the header for why root-before-
-  // symptom outranks the tier partition when the two disagree.
-  enforceRootBeforeSymptom(ordered, baselineRank);
-}
-
-/**
- * Deterministic stable pass ensuring each symptom appears after its rootCauseId. Uses a single
- * left-to-right sweep: if a symptom is encountered before its root, the root is spliced in just
- * before the symptom. Order among already-correct items is untouched. Idempotent.
- */
-function enforceRootBeforeSymptom(
-  ordered: CandidateDraft[],
-  _baselineRank: Map<string, number>,
-): void {
-  const indexByKey = () => {
-    const m = new Map<string, number>();
-    ordered.forEach((d, i) => m.set(d.dedupeKey, i));
-    return m;
   };
-  let moved = true;
-  let guard = 0;
-  while (moved && guard < ordered.length + 1) {
-    moved = false;
-    guard++;
-    const pos = indexByKey();
-    for (let i = 0; i < ordered.length; i++) {
-      const draft = ordered[i];
-      const rootKey = draft.rootCauseId;
-      if (!rootKey) continue;
-      const rootPos = pos.get(rootKey);
-      if (rootPos === undefined) continue;
-      if (rootPos > i) {
-        // Root is after its symptom: move the root to just before the symptom.
-        const [root] = ordered.splice(rootPos, 1);
-        ordered.splice(i, 0, root);
-        moved = true;
-        break;
-      }
+
+  // --- Chain assembly ---------------------------------------------------------------------------
+  // Walk each draft up its credited parents to the chain's top. The guard bounds a cycle the
+  // attribution should never produce (it classifies over a DAG's ancestry) but which must not hang
+  // the ranker if a future edge rule introduces one; a draft in a cycle becomes its own chain top.
+  const topOf = new Map<string, string>();
+  for (const draft of ordered) {
+    let current = draft;
+    const seen = new Set<string>([current.dedupeKey]);
+    for (;;) {
+      const parentKey = creditedParent(current);
+      if (parentKey === undefined || seen.has(parentKey)) break;
+      seen.add(parentKey);
+      current = byKey.get(parentKey)!;
     }
+    topOf.set(draft.dedupeKey, current.dedupeKey);
   }
+
+  const childrenOf = new Map<string, CandidateDraft[]>();
+  for (const draft of ordered) {
+    const parentKey = creditedParent(draft);
+    if (
+      parentKey === undefined ||
+      topOf.get(draft.dedupeKey) === draft.dedupeKey
+    )
+      continue;
+    const siblings = childrenOf.get(parentKey) ?? [];
+    siblings.push(draft);
+    childrenOf.set(parentKey, siblings);
+  }
+
+  const members = new Map<string, CandidateDraft[]>();
+  for (const draft of ordered) {
+    const top = topOf.get(draft.dedupeKey)!;
+    const list = members.get(top) ?? [];
+    list.push(draft);
+    members.set(top, list);
+  }
+
+  // Root first, then each subtree in sibling-rank order. Pre-order, so no member can precede the
+  // cause it was attributed to.
+  const layout = (top: CandidateDraft): CandidateDraft[] => {
+    const out: CandidateDraft[] = [];
+    const walk = (draft: CandidateDraft): void => {
+      out.push(draft);
+      for (const child of [...(childrenOf.get(draft.dedupeKey) ?? [])].sort(
+        byRank,
+      ))
+        walk(child);
+    };
+    walk(top);
+    return out;
+  };
+
+  // A chain is placed by its STRONGEST member: a named failure pulls the chain that explains it up
+  // to its own height rather than sinking to wherever its cause happened to rank.
+  const chains = [...members.entries()].map(([topKey, chainMembers]) => ({
+    top: byKey.get(topKey)!,
+    score: Math.max(...chainMembers.map(effectiveScore)),
+    t: Math.min(...chainMembers.map((draft) => draft.anchor.t)),
+  }));
+  chains.sort(
+    (a, b) =>
+      b.score - a.score ||
+      a.t - b.t ||
+      a.top.dedupeKey.localeCompare(b.top.dedupeKey),
+  );
+
+  const ranked = chains.flatMap((chain) => layout(chain.top));
+  // Defensive: a draft dropped by a chain-assembly bug would silently vanish from the output. Keep
+  // the emitted set identical to the input set no matter what.
+  if (ranked.length === ordered.length)
+    ordered.splice(0, ordered.length, ...ranked);
+  else ordered.sort(byRank);
 }
 
 function addRepeatedClickCandidates(
@@ -3256,7 +3286,7 @@ function renderCandidatesMarkdown(
     `* Schema version: ${CANDIDATE_SCHEMA_VERSION}`,
     `* Session: ${input.index.id ?? path.basename(input.sessionDir)}`,
     `* Signals: ${candidates.length}`,
-    `* Ordering: score desc, anchor time asc, deterministic dedupe key asc; stable signal IDs are assigned after ranking`,
+    `* Ordering: causal chains ranked by their highest-scoring member (score desc, anchor time asc, deterministic dedupe key asc); within a chain a cause is listed before what it explains. Only high/medium attributions form a chain — a low one is a sequence note and does not move anything. Stable signal IDs are assigned after ranking.`,
     "",
     "## Signals",
     "",
@@ -3294,11 +3324,20 @@ function renderCandidatesMarkdown(
       if (candidate.causalRole)
         lines.push(`* Causal role: ${candidate.causalRole}`);
       if (candidate.causalRole === "symptom" && candidate.rootCauseId) {
-        lines.push(`* Root cause: ${candidate.rootCauseId}`);
-        if (candidate.attributionConfidence)
+        // A `low` attribution is the request spine's time ordering, not an established cause. The
+        // ranker does not let it set position (see applyCausalRerank), so this document must not
+        // announce it as a root cause either — a reader cannot see the grade in the heading.
+        if (candidate.attributionConfidence === "low") {
           lines.push(
-            `* Attribution confidence: ${candidate.attributionConfidence}`,
+            `* Follows: ${candidate.rootCauseId} (same request — sequence only, not an established cause)`,
           );
+        } else {
+          lines.push(`* Root cause: ${candidate.rootCauseId}`);
+          if (candidate.attributionConfidence)
+            lines.push(
+              `* Attribution confidence: ${candidate.attributionConfidence}`,
+            );
+        }
       }
       lines.push(
         `* Evidence window: [windows/${candidate.id}.md](windows/${candidate.id}.md)`,
