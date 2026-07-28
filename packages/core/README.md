@@ -175,6 +175,16 @@ cut, keyed by its path, so a truncated list is never mistaken for a short one.
 Anything else, including cross origin and oversized responses, carries the
 content type and byte size only.
 
+### Listener accounting (`ui.listeners`)
+
+The `listeners` collector is **on by default** and disabled by `PRESET_LIGHT`.
+It patches `addEventListener` and `removeEventListener` to keep a running count
+per event type, and emits `{ total, byType, url }` on every navigation and
+whenever the total grows by 25 since the last reading. That makes a view which
+re-subscribes on every render and never unsubscribes visible before it starts
+firing handlers twice. It stores counts only, never a target or a listener, and
+only sees registrations made after `init()`.
+
 ### On-screen numbers (`ui.num`)
 
 The `uiNumbers` collector is **on by default**. It scans the visible DOM for

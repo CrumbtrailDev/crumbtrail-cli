@@ -145,6 +145,13 @@ export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
 export const UI_NUM_EVENT_KIND = "ui.num" as const;
 
 /**
+ * Canonical event kind for the live event-listener gauge (`k:'ui.listeners'`).
+ * Payload: `{ total, byType: [[type, count], …], url }` — counts only, never a
+ * reference to a target or a listener.
+ */
+export const UI_LISTENERS_EVENT_KIND = "ui.listeners" as const;
+
+/**
  * Type specific payload (`d`) of a `k:'capture_gap'` event. `detail` is deliberately a bounded,
  * redacted diagnostic descriptor such as an error name, table and operation, or leading SQL
  * keyword. It must never contain raw SQL values or other user data.
@@ -446,6 +453,9 @@ export interface CrumbtrailConfig {
   // Labeled on-screen numeric snapshots (`k:'ui.num'`)
   uiNumbers: boolean;
 
+  // Live event-listener gauge (`k:'ui.listeners'`)
+  listeners: boolean;
+
   // Environment snapshot
   environment: boolean;
 
@@ -603,6 +613,8 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
 
   uiNumbers: true,
 
+  listeners: true,
+
   environment: true,
 
   widget: false,
@@ -669,6 +681,8 @@ export const PRESET_LIGHT: Partial<CrumbtrailConfig> = {
   performance: false,
   // Full-DOM numeric scans are against LIGHT's minimal-overhead posture.
   uiNumbers: false,
+  // So is a patch on the hottest DOM method there is.
+  listeners: false,
 };
 
 // Embedded end-user monitoring: no widget, but silently auto-capture the reproduction window
