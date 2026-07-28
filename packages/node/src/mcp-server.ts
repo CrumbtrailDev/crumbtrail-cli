@@ -260,7 +260,7 @@ const TOOLS = [
   {
     name: "listSessions",
     description:
-      "List recorded Crumbtrail sessions. These are complete app evidence sessions with clicks when present, console, network, backend spans, database row changes, environment, and feature flags. Use this first to find the sessionId for getFixContext, which covers one session, or getRegressionContext, which provides a cross release regression witness. Supports app, time, release, and build filters.",
+      "List recorded Crumbtrail sessions. A session is evidence of what the app actually did: clicks when present, console, network, backend spans, database row changes, environment, and feature flags. A ticket describing the same bug is a claim about that run, so start from the recording. Use this first to find the sessionId for getFixContext, which covers one session, or getRegressionContext, which compares two sessions across releases. Supports app, time, release, and build filters.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -379,7 +379,7 @@ const TOOLS = [
   {
     name: "getFixContext",
     description:
-      "Give a coding agent complete bug context for one recorded session. Returns the fix-context.v2 bundle: deterministic signals with heuristic bases, the primary evidence window with correlated frontend requests, backend spans, and the exact database rows that changed, plus a redaction aware environment snapshot, causal chain, and repro hint. When cloud analysis resolved GitHub code pointers for the session, the bundle also carries code_pointers (repo, path, line, permalink pinned to a deploy or head commit). Start here when the user asks you to fix a bug captured with Crumbtrail.",
+      "Ground a fix in what one recorded session shows rather than in what the report claims. Returns the fix-context.v2 bundle: deterministic signals with heuristic bases, the primary evidence window with correlated frontend requests, backend spans, and the exact database rows that changed, plus a redaction aware environment snapshot, causal chain, and repro hint. When cloud analysis resolved GitHub code pointers for the session, the bundle also carries code_pointers (repo, path, line, permalink pinned to a deploy or head commit). Start here when the user asks you to fix a bug captured with Crumbtrail.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -414,7 +414,7 @@ const TOOLS = [
   {
     name: "getRegressionContext",
     description:
-      "Compare two recorded sessions of the same flow across releases and return the regression-context.v1 witness verdict. Catches escaped regressions — behavior changes that fired no error — and hands back the diverging interaction, the causal window of correlated requests, the exact database rows whose values changed, and a repro hint. Input: { sessionA, sessionB } (ids or paths). Use listSessions to find sessions.",
+      "A report that a release broke a flow is a claim; two recordings of that flow settle it. Compares them and returns the regression-context.v1 bundle: a verdict of regression or clean with a confidence level, the first diverging interaction, the causal window of correlated request ids, the exact database rows whose values changed, the environment delta when feature flags, config, release, or build labels moved, and a repro hint. The verdict comes from divergence across the interaction, network, database, and environment planes, so a behavior change that raised no error is still reported. A regression verdict means the two recordings diverged once noise rules were applied, not that the change is a defect. Input: { sessionA, sessionB } (ids or paths). Use listSessions to find sessions.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -486,7 +486,7 @@ const TOOLS = [
   {
     name: "recallSimilarIssues",
     description:
-      "Before diagnosing a bug, ask: have we seen this before? Recalls past issues that RHYME with a session or a free-text description — not just exact duplicates, but same route/different error, same error/different route, or similar environment/feature-flag state — ranked by a hybrid of text similarity and structured overlap. Each match carries how it was resolved when known (disposition, root cause, fix reference), so an agent or support engineer can reuse a prior answer instead of re-solving from scratch. On cloud deployments a match may also carry an outcomeSummary (what happened after the prior resolution) and reasons such as resolution_verified (a past fix confirmed to hold) or resolution_recurred (the issue came back) — weigh a verified resolution more heavily than one that recurred. After reusing a match to close an issue, report its id back via resolveIssue's usedMemoryIds (or recordFeedback) so recall learns which suggestions actually helped. Pass sessionId to recall relative to a captured session, or query for a free-text description.",
+      "Before diagnosing a bug, ask: have we seen this before? Recalls past issues that RHYME with a session or a free text description, not just exact duplicates but the same route with a different error, the same error on a different route, or a similar environment and feature flag state, ranked by a hybrid of text similarity and structured overlap. Each match carries how it was resolved when known (disposition, root cause, fix reference), so an agent or support engineer can reuse a prior answer instead of solving it again from scratch. On cloud deployments a match may also carry an outcomeSummary (what happened after the prior resolution) and reasons such as resolution_verified (a past fix confirmed to hold) or resolution_recurred (the issue came back); weigh a verified resolution more heavily than one that recurred. After reusing a match to close an issue, report its id back via resolveIssue's usedMemoryIds (or recordFeedback) so recall learns which suggestions actually helped. Pass sessionId to recall relative to a captured session, or query for a free text description.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -497,7 +497,7 @@ const TOOLS = [
         query: {
           type: "string",
           description:
-            "Free-text description of the problem to recall similar issues for (used when no sessionId).",
+            "Free text description of the problem to recall similar issues for (used when no sessionId).",
         },
         limit: {
           type: "number",
@@ -814,7 +814,7 @@ const TOOLS = [
   {
     name: "resolveIssue",
     description:
-      "Close the loop after diagnosing a recalled issue: record its resolution disposition in the cloud issue memory and, crucially, report which recall matches you actually reused via usedMemoryIds so the org recall index learns which past answers close real bugs. This does NOT touch the user's app, tickets, or external systems — it writes only to Crumbtrail's own memory. memoryId is a recall match id (the `id` field from recallSimilarIssues). Requires a cloud deployment (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_API_KEY); returns a gap when unconfigured.",
+      "Close the loop after diagnosing a recalled issue: record its resolution disposition in the cloud issue memory and, crucially, report which recall matches you actually reused via usedMemoryIds so the org recall index learns which past answers close real bugs. This does NOT touch the user's app, tickets, or external systems; it writes only to Crumbtrail's own memory. memoryId is a recall match id (the `id` field from recallSimilarIssues). Requires a cloud deployment (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_API_KEY); returns a gap when unconfigured.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -846,7 +846,7 @@ const TOOLS = [
           type: "string",
           description: "Reference to the fix (PR, commit, ticket) (optional).",
         },
-        note: { type: "string", description: "Free-text note (optional)." },
+        note: { type: "string", description: "Free text note (optional)." },
       },
       required: ["memoryId", "disposition"],
     },
@@ -878,7 +878,7 @@ const TOOLS = [
           enum: [...FEEDBACK_SIGNALS],
           description: `The feedback signal. One of: ${FEEDBACK_SIGNALS.join(", ")}.`,
         },
-        note: { type: "string", description: "Free-text note (optional)." },
+        note: { type: "string", description: "Free text note (optional)." },
       },
       required: ["projectId", "subjectKind", "subjectRef", "signal"],
     },
