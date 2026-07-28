@@ -218,6 +218,40 @@ describe("groupDistinctBugs", () => {
     expect(bug.representative).not.toHaveProperty("bodySnippet");
   });
 
+  it("carries the anchor's source location onto the representative", () => {
+    const [bug] = groupDistinctBugs([
+      candidate({
+        id: "cand_framed",
+        detector: "backend_request_error",
+        title: "Backend error from GET /api/search",
+        severity: "high",
+        score: 90,
+        anchor: {
+          t: 1_200,
+          route: "/api/search",
+          frame: "src/routes/search.js:61:33",
+        },
+      }),
+    ]);
+
+    expect(bug.representative.frame).toBe("src/routes/search.js:61:33");
+  });
+
+  it("omits the representative frame when the anchor named no source location", () => {
+    const [bug] = groupDistinctBugs([
+      candidate({
+        id: "cand_frameless",
+        detector: "backend_request_error",
+        title: "Backend error from GET /api/search",
+        severity: "high",
+        score: 90,
+        anchor: { t: 1_200, route: "/api/search" },
+      }),
+    ]);
+
+    expect(bug.representative).not.toHaveProperty("frame");
+  });
+
   it("carries target descriptors into distinct bug evidence and signatures", () => {
     const bugs = groupDistinctBugs([
       candidate({

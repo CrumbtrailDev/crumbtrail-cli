@@ -2,6 +2,7 @@ import {
   classifyStatement,
   ensureReturning,
   leadingSqlKeyword,
+  parseLimitOffset,
   parseMutation,
   parseRead,
   type ParsedMutation,
@@ -56,6 +57,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
   options: InstrumentPgClientOptions,
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
+  const readStatementsByRequest = new Map<string, number>();
 
   const wrappedQuery = async (
     text: unknown,
@@ -107,6 +109,8 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
             rowCount,
             options,
             emittedReadRowsByRequest,
+            readStatementsByRequest,
+            queryShape: parseLimitOffset(text, params),
           });
         } catch (error) {
           emitGap(options, { reason: "capture_exception", error });

@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventBus } from "../event-bus";
 import type { BugEvent, CrumbtrailConfig } from "../types";
-import { DEFAULT_CONFIG, UI_NUM_EVENT_KIND } from "../types";
+import {
+  DEFAULT_CONFIG,
+  UI_LAYOUT_EVENT_KIND,
+  UI_NUM_EVENT_KIND,
+} from "../types";
 import { REDACTED_VALUE } from "../redaction";
 import {
   parseNumericToken,
@@ -68,6 +72,50 @@ describe("parseNumericToken", () => {
     expect(parseNumericToken("")).toBeNull();
     expect(parseNumericToken("free")).toBeNull();
   });
+
+  it("parses decimal-comma locales", () => {
+    expect(parseNumericToken("$129,00", "de-DE")).toEqual({
+      value: 129,
+      unit: "$",
+    });
+    expect(parseNumericToken("$1.234,56", "de-DE")).toEqual({
+      value: 1234.56,
+      unit: "$",
+    });
+    // fr-FR groups thousands with narrow no-break space.
+    expect(parseNumericToken("1 234,56 €", "fr-FR")).toEqual({
+      value: 1234.56,
+      unit: "€",
+    });
+    // Comma-decimal needs no lang hint when the shape is unambiguous.
+    expect(parseNumericToken("129,00")).toEqual({ value: 129 });
+  });
+
+  it("breaks the ambiguous three-digit-tail tie with the page language", () => {
+    expect(parseNumericToken("1,234", "en-US")).toEqual({ value: 1234 });
+    expect(parseNumericToken("1,234", "de-DE")).toEqual({ value: 1.234 });
+    expect(parseNumericToken("1.234", "en-US")).toEqual({ value: 1.234 });
+    expect(parseNumericToken("1.234", "de-DE")).toEqual({ value: 1234 });
+    // ja-JP groups with commas and uses dot decimals, like en.
+    expect(parseNumericToken("$1,235", "ja-JP")).toEqual({
+      value: 1235,
+      unit: "$",
+    });
+  });
+
+  it("parses Arabic-Indic digits and separators", () => {
+    expect(parseNumericToken("١٢٩٫٠٠", "ar-EG")).toEqual({ value: 129 });
+    expect(parseNumericToken("$١٬٢٣٤٫٥٦", "ar-EG")).toEqual({
+      value: 1234.56,
+      unit: "$",
+    });
+  });
+
+  it("rejects incoherent separator shapes", () => {
+    expect(parseNumericToken("1,23,4", "en-US")).toBeNull();
+    expect(parseNumericToken("1.2.3,4.5")).toBeNull();
+    expect(parseNumericToken("12,3456")).toBeNull();
+  });
 });
 
 describe("scanUiNumbers element budget", () => {
@@ -130,6 +178,8 @@ describe("uiNumbersCollector", () => {
         { label: "Shipping", value: 5, unit: "$" },
         { label: "Total", value: 199, unit: "$" },
       ],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -157,7 +207,37 @@ describe("uiNumbersCollector", () => {
     expect(snapshots[1].d).toEqual({
       region: "dl.totals",
       items: [{ label: "Subtotal", value: 205, unit: "$" }],
+      lang: null,
+      dir: "ltr",
     });
+  });
+
+  it("scans a page that never settles once deferral hits the ceiling", async () => {
+    // A live page (stock ticker, SSE feed) can mutate faster than
+    // UI_NUM_SETTLE_MS forever. Every mutation re-arms the debounce, so
+    // without the deferral ceiling the scan starves and the collector emits
+    // nothing on exactly the pages where live numbers are the evidence.
+    document.body.innerHTML = `
+      <dl class="totals">
+        <dt>Total</dt><dd id="tick">$199.00</dd>
+      </dl>`;
+    // Date joins the fake clock so the collector's deferral arithmetic moves
+    // with advanceTimersByTime instead of real wall time.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+
+    // 8 mutations at 400ms spacing: the settle window (500ms) never elapses
+    // quietly, but total deferral (3200ms) crosses UI_NUM_MAX_WAIT_MS.
+    for (let i = 0; i < 8; i += 1) {
+      document.getElementById("tick")!.textContent = `$${199 + i}.00`;
+      await flushObserverDelivery();
+      vi.advanceTimersByTime(400);
+    }
+    bus.flush();
+
+    expect(uiNumEvents(events).length).toBeGreaterThanOrEqual(1);
   });
 
   it("caps a region snapshot at 50 items", async () => {
@@ -195,6 +275,8 @@ describe("uiNumbersCollector", () => {
     expect(snapshots[0].d).toEqual({
       region: "dl.totals",
       items: [{ label: "Balance", value: 50, unit: "$" }],
+      lang: null,
+      dir: "ltr",
     });
     expect(JSON.stringify(events)).not.toContain(REDACTED_VALUE);
     expect(JSON.stringify(events)).not.toContain("4242");
@@ -223,6 +305,8 @@ describe("uiNumbersCollector", () => {
         { label: "Order number", value: 123456789 },
         { label: "Total", value: 50, unit: "$" },
       ],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -248,6 +332,8 @@ describe("uiNumbersCollector", () => {
     expect(snapshots[0].d).toEqual({
       region: "dl.totals",
       items: [{ label: "Total", value: 9.99, unit: "$" }],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -309,6 +395,8 @@ describe("uiNumbersCollector", () => {
         { label: "Item total", value: 25, unit: "$" },
         { label: "Quantity", value: 2 },
       ],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -331,6 +419,8 @@ describe("uiNumbersCollector", () => {
         { label: "Quantity", value: 2 },
         { label: "Unit price", value: 25, unit: "$" },
       ],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -440,6 +530,155 @@ describe("uiNumbersCollector", () => {
     await settle(bus);
     expect(uiNumEvents(events)).toHaveLength(0);
     expect(events.filter((event) => event.k === "capture_gap")).toHaveLength(1);
+  });
+
+  // --- Layout probe ---
+  function layoutEvents(events: BugEvent[]): BugEvent[] {
+    return events.filter((event) => event.k === UI_LAYOUT_EVENT_KIND);
+  }
+
+  function stubDocumentWidths(scrollW: number, clientW: number): () => void {
+    const root = document.documentElement;
+    const original = {
+      scrollWidth: Object.getOwnPropertyDescriptor(root, "scrollWidth"),
+      clientWidth: Object.getOwnPropertyDescriptor(root, "clientWidth"),
+    };
+    Object.defineProperty(root, "scrollWidth", {
+      value: scrollW,
+      configurable: true,
+    });
+    Object.defineProperty(root, "clientWidth", {
+      value: clientW,
+      configurable: true,
+    });
+    return () => {
+      delete (root as unknown as Record<string, unknown>).scrollWidth;
+      delete (root as unknown as Record<string, unknown>).clientWidth;
+      if (original.scrollWidth)
+        Object.defineProperty(root, "scrollWidth", original.scrollWidth);
+      if (original.clientWidth)
+        Object.defineProperty(root, "clientWidth", original.clientWidth);
+    };
+  }
+
+  it("emits one ui.layout event for the initial navigation", async () => {
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+
+    const layout = layoutEvents(events);
+    expect(layout).toHaveLength(1);
+    expect(layout[0].d).toMatchObject({
+      dir: "ltr",
+      lang: null,
+      overflowX: 0,
+      url: window.location.href,
+    });
+    expect(layout[0].d.scrollW).toBeTypeOf("number");
+    expect(layout[0].d.clientW).toBeTypeOf("number");
+  });
+
+  it("reports horizontal overflow", async () => {
+    const restore = stubDocumentWidths(1400, 1024);
+    try {
+      const { events, bus, cleanup } = collect();
+      cleanups.push(cleanup);
+      await settle(bus);
+
+      expect(layoutEvents(events)[0].d).toMatchObject({
+        scrollW: 1400,
+        clientW: 1024,
+        overflowX: 376,
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  it("carries the document locale attributes", async () => {
+    document.documentElement.lang = "de";
+    document.documentElement.dir = "rtl";
+    try {
+      document.body.innerHTML = `<dl class="totals"><dt>Total</dt><dd>$9.99</dd></dl>`;
+      const { events, bus, cleanup } = collect();
+      cleanups.push(cleanup);
+      await settle(bus);
+
+      expect(layoutEvents(events)[0].d).toMatchObject({
+        dir: "rtl",
+        lang: "de",
+      });
+      expect(uiNumEvents(events)[0].d).toMatchObject({
+        lang: "de",
+        dir: "rtl",
+      });
+    } finally {
+      document.documentElement.lang = "";
+      document.documentElement.dir = "";
+    }
+  });
+
+  it("re-emits ui.num on every SPA navigation, even when the figures repeat", async () => {
+    // Two routes rendering the same total under the same structural region —
+    // /cart then /checkout. Cross-view suppression used to swallow the second
+    // page entirely.
+    const page = `<main><dl><dt>Total</dt><dd>$42.00</dd></dl></main>`;
+    document.body.innerHTML = page;
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(1);
+    expect(layoutEvents(events)).toHaveLength(1);
+
+    history.pushState({}, "", "/checkout");
+    document.body.innerHTML = page;
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(2);
+    expect(layoutEvents(events)).toHaveLength(2);
+
+    history.pushState({}, "", "/confirm");
+    document.body.innerHTML = page;
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(3);
+    expect(layoutEvents(events)).toHaveLength(3);
+
+    for (const snapshot of uiNumEvents(events)) {
+      expect(snapshot.d).toMatchObject({ lang: null, dir: "ltr" });
+      expect(snapshot.d.items).toEqual([{ label: "Total", value: 42, unit: "$" }]);
+    }
+
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("still suppresses an unchanged re-scan inside one view", async () => {
+    document.body.innerHTML = `<main><dl><dt>Total</dt><dd>$42.00</dd></dl></main>`;
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(1);
+
+    // A mutation that leaves every figure identical.
+    document.body.appendChild(document.createElement("span"));
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(1);
+  });
+
+  it("emits again on a navigation commit but not on a plain DOM settle", async () => {
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    expect(layoutEvents(events)).toHaveLength(1);
+
+    document.body.innerHTML = `<dl class="totals"><dt>Total</dt><dd>$1.00</dd></dl>`;
+    await settle(bus);
+    expect(layoutEvents(events)).toHaveLength(1);
+
+    history.pushState({}, "", "/checkout");
+    await settle(bus);
+    expect(layoutEvents(events)).toHaveLength(2);
+    expect(layoutEvents(events)[1].d.url).toContain("/checkout");
+
+    window.history.replaceState(null, "", "/");
   });
 
   it("no-ops cleanly when MutationObserver is unavailable", () => {

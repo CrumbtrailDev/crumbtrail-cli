@@ -11,6 +11,11 @@ import {
   type BackendIntakeWarning,
   type BackendIntakeWarningKind,
 } from "./backend-intake";
+import {
+  buildBackendWarningEvent,
+  installBackendWarningCapture,
+  type BackendWarningCaptureHandle,
+} from "./backend-warnings";
 
 export type {
   BackendIntakeWarning as CrumbtrailExpressWarning,
@@ -68,6 +73,14 @@ export interface CrumbtrailExpressOptions {
   sessionStartedAt?: SessionStartedAtResolver;
   now?: NowResolver;
   onWarning?: (warning: BackendIntakeWarning) => void;
+  /**
+   * Capture `process.on("warning")` runtime warnings (MaxListenersExceeded,
+   * deprecations) into the session the middleware most recently saw. Default
+   * on: these warnings are the platform naming a defect the application never
+   * logs, and the express path was previously blind to them while the
+   * autoCapture path recorded them.
+   */
+  captureRuntimeWarnings?: boolean;
 }
 
 interface RequestState {
@@ -78,24 +91,81 @@ interface RequestState {
 
 const requestStates = new WeakMap<CrumbtrailExpressRequest, RequestState>();
 
+/**
+ * How long after the last request that carried a session a process warning is
+ * still attributed to that session. A MaxListenersExceededWarning fires
+ * synchronously inside the request that crossed the threshold, so the common
+ * case is microseconds, not minutes; the window only bounds the tail so a
+ * warning during a long idle gap is dropped rather than pinned to a session
+ * that plausibly ended (matching autoCapture, which drops while dark).
+ */
+const WARNING_SESSION_FRESH_MS = 120_000;
+
+export interface CrumbtrailExpressMiddlewareWithHandle
+  extends CrumbtrailExpressMiddleware {
+  /** Present when runtime warning capture installed; `stop()` releases it. */
+  crumbtrailWarningCapture?: BackendWarningCaptureHandle;
+}
+
 export function createCrumbtrailExpressMiddleware(
   options: CrumbtrailExpressOptions = {},
-): CrumbtrailExpressMiddleware {
-  return function crumbtrailExpressMiddleware(req, res, next) {
-    const startedAtMs = readNow(options);
-    const startEvent = buildBackendRequestStartEvent({
-      ...readRequestInput(req, options),
-      now: startedAtMs,
-    });
-    const state = stateFromEvent(startEvent, startedAtMs);
-    requestStates.set(req, state);
-    exposeRequestIdHeader(req, state);
+): CrumbtrailExpressMiddlewareWithHandle {
+  let lastSession: { sessionId: string; atMs: number } | undefined;
 
-    attemptSend(startEvent, options, state.sessionId);
-    attachFinishListener(req, res, options, state);
+  const middleware: CrumbtrailExpressMiddlewareWithHandle =
+    function crumbtrailExpressMiddleware(req, res, next) {
+      const startedAtMs = readNow(options);
+      const startEvent = buildBackendRequestStartEvent({
+        ...readRequestInput(req, options),
+        now: startedAtMs,
+      });
+      const state = stateFromEvent(startEvent, startedAtMs);
+      requestStates.set(req, state);
+      exposeRequestIdHeader(req, state);
+      if (state.sessionId) {
+        lastSession = { sessionId: state.sessionId, atMs: startedAtMs };
+      }
 
-    next();
-  };
+      attemptSend(startEvent, options, state.sessionId);
+      attachFinishListener(req, res, options, state);
+
+      next();
+    };
+
+  if (options.captureRuntimeWarnings !== false) {
+    try {
+      middleware.crumbtrailWarningCapture = installBackendWarningCapture({
+        emit: (event) => {
+          const now = readNow(options);
+          const session =
+            lastSession && now - lastSession.atMs <= WARNING_SESSION_FRESH_MS
+              ? lastSession.sessionId
+              : undefined;
+          // No live session means nowhere for the event to land: the intake
+          // path addresses an existing session, so an unattributed warning is
+          // dropped rather than misfiled.
+          if (!session) return;
+          const stamped = buildBackendWarningEvent(
+            {
+              name: typeof event.d.name === "string" ? event.d.name : undefined,
+              message:
+                typeof event.d.message === "string"
+                  ? event.d.message
+                  : undefined,
+              stack:
+                typeof event.d.stack === "string" ? event.d.stack : undefined,
+            },
+            { sessionId: session, now },
+          );
+          attemptSend(stamped, options, session);
+        },
+      });
+    } catch {
+      // Warning capture is additive; its failure must not break the request path.
+    }
+  }
+
+  return middleware;
 }
 
 export function createCrumbtrailExpressErrorMiddleware(

@@ -11,6 +11,19 @@ export interface CliConfig {
   staticDir?: string;
   authToken?: string;
   allowedOrigins: string[];
+  /**
+   * Field names the storage sanitizer must keep verbatim, declared by the
+   * operator rather than guessed by the SDK.
+   *
+   * The sanitizer is name based and table blind: one rule decides `body` for
+   * every row it ever sees. That is right for a payments webhook payload and
+   * wrong for a product review, where the submitted text IS the defect. Only
+   * the operator knows which of their columns carry personal data, so the
+   * exception list is theirs to declare. Value based detection still runs
+   * inside a kept field, so a token or a card number pasted into a review body
+   * is still removed.
+   */
+  keepFields: string[];
   ai: boolean;
   aiModel?: string;
   aiAllowAutoModel: boolean;
@@ -34,6 +47,7 @@ export function defaultCliConfig(): CliConfig {
     whisperModel: "base",
     mcp: false,
     allowedOrigins: [],
+    keepFields: [],
     ai: false,
     aiAllowAutoModel: false,
   };
@@ -64,6 +78,9 @@ export function parseCliConfig(args: string[]): CliConfig {
     } else if (args[i] === "--allow-origin" && args[i + 1]) {
       config.allowedOrigins.push(args[i + 1]);
       i++;
+    } else if (args[i] === "--keep-field" && args[i + 1]) {
+      config.keepFields.push(...splitFieldList(args[i + 1]));
+      i++;
     } else if (args[i] === "--ai") {
       config.ai = true;
     } else if (args[i] === "--ai-model" && args[i + 1]) {
@@ -85,7 +102,22 @@ export function parseCliConfig(args: string[]): CliConfig {
     }
   }
 
+  // Flags add to the env var rather than replacing it, so a deployment that
+  // sets the policy centrally can still be extended for one run.
+  config.keepFields.push(
+    ...splitFieldList(process.env.CRUMBTRAIL_KEEP_FIELDS ?? ""),
+  );
+  config.keepFields = [...new Set(config.keepFields)];
+
   return config;
+}
+
+/** Accepts `--keep-field a,b` and a repeated `--keep-field a --keep-field b`. */
+function splitFieldList(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
 }
 
 export function resolveCliConfig(args: string[]): CliConfig {

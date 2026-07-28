@@ -35,6 +35,26 @@ Crumbtrail.init({
 
 That's the whole integration — capture runs in the background from there.
 
+### Catching the requests that beat init
+
+`init()` usually runs from an async import, so the fetches that render the
+first screen can finish before the network patch exists. Those requests leave
+no `net.req` and, more importantly, no correlation header, so their backend and
+database events cannot be joined to the session later.
+
+Add one side-effect import above everything else in your entry file:
+
+```ts
+import "crumbtrail-core/early";
+```
+
+It patches `fetch` and `XMLHttpRequest` synchronously, stamps the same
+correlation headers the SDK stamps on same origin requests, and parks bounded
+metadata (at most 50 requests, 2 MB of body text) until `init()` drains it
+through the normal redaction pipeline. `init()` adopts the session id it minted,
+so the early requests, the live session, and the backend events all match. If
+`init()` never runs within 60 seconds, the queue is dropped and recording stops.
+
 ### Presets
 
 | Preset           | Behaviour                                                              |
@@ -68,6 +88,46 @@ Tokens, cookies, storage values, page text, input values, and database row value
 are redacted before an event enters the browser buffer. See
 `BROWSER_REDACTION_POLICY` and the `redact*` helpers if you want to inspect or
 tighten the policy.
+
+### Keeping a field the classifier would otherwise drop
+
+JSON request bodies go through a deny biased per value classifier: numbers and
+short enum like strings are kept, everything else is replaced by a shape
+placeholder. That is the right default and it is wrong for one specific case,
+which is when the text a user submitted **is** the defect. A stored XSS payload,
+a search term with a quote in it, an address line a validator wrongly rejects,
+a decimal comma amount: a hash of any of those tells an agent nothing.
+
+`redaction.keepFields` names those fields. It is matched on the whole field
+name, never as a substring, and it applies to JSON keys and query string
+parameters alike:
+
+```ts
+Crumbtrail.init({
+  redaction: { keepFields: ["body", "q", "postalCode"] },
+});
+```
+
+What a keep does and does not do:
+
+- It overrides the **built in name heuristics** only. Those match by substring
+  and have real false positives, so without an override an app whose schema
+  trips one (`auth` matches `author`, `pan` matches `panel`) cannot capture the
+  field at all.
+- It never disables **value based detection**. An email, a JWT, a card number,
+  a token, or a high entropy secret sitting in a kept field is still redacted.
+- Your own `denyFields` entry still wins over your keep for the same name.
+
+The capture server takes the same list, so a name kept in a `db.diff` row is
+also kept in the request body and query string that produced it:
+
+```bash
+crumbtrail-server serve --keep-field body,q,postalCode
+```
+
+`CRUMBTRAIL_KEEP_FIELDS` sets it from the environment; flags add to it rather
+than replacing it. The active list is printed at boot, because it is the one
+setting that makes the server store more than it did before.
 
 ## Production capture
 
@@ -103,6 +163,37 @@ action, or `flag()` triggers capture. The recorder adds the configured tail
 before finalizing the report. A cloud config response can disable capture with
 `killSwitch: true`; the SDK clears its buffer as soon as that response arrives.
 
+### Response body summaries (`net.res`)
+
+`net.res` keeps carrying the redacted response body as text in `d.body`. It also
+carries `d.bodyMeta`, the size facts plus a bounded parsed view:
+`{ ct, bytes, truncated?, data?, arrayTotal? }`. `data` is present for JSON
+responses of 32 KB or less, is derived from the already redacted body, and is
+capped at four levels of nesting, 20 array items, and 120 character strings.
+`arrayTotal` records the real length of each array that was cut, keyed by its
+path, so a truncated list is never mistaken for a short one. Anything else,
+including non JSON and oversized responses, carries the content type and byte
+size only.
+
+### Server-sent events (`net.sse`)
+
+The `eventSource` collector wraps the `EventSource` constructor and emits
+`{ url, op }` for open, error, and close, with `count` (messages received so
+far) on error and close, and `reopen: true` when a stream to the same URL is
+recreated within 30 seconds of the last failure. That makes a stream which
+quietly drops and reconnects visible while the page shows stale data. Message
+payloads are never read.
+
+### Listener accounting (`ui.listeners`)
+
+The `listeners` collector is **on by default** and disabled by `PRESET_LIGHT`.
+It patches `addEventListener` and `removeEventListener` to keep a running count
+per event type, and emits `{ total, byType, url }` on every navigation and
+whenever the total grows by 25 since the last reading. That makes a view which
+re-subscribes on every render and never unsubscribes visible before it starts
+firing handlers twice. It stores counts only, never a target or a listener, and
+only sees registrations made after `init()`.
+
 ### On-screen numbers (`ui.num`)
 
 The `uiNumbers` collector is **on by default**. It scans the visible DOM for
@@ -127,6 +218,12 @@ Opting out, narrowest first:
 
 Hidden elements (`hidden`, `aria-hidden="true"`, `display:none`,
 `visibility:hidden`) are already skipped.
+
+Each `ui.num` snapshot carries the document `lang` and `dir`, and the same
+collector emits one `ui.layout` event per navigation with
+`{ dir, lang, scrollW, clientW, overflowX, url }`. Together they make a
+locale-vs-rendered-number contradiction, and horizontal overflow from a long
+translated label, joinable without capturing any DOM.
 
 ## Related packages
 
