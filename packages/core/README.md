@@ -35,6 +35,26 @@ Crumbtrail.init({
 
 That's the whole integration — capture runs in the background from there.
 
+### Catching the requests that beat init
+
+`init()` usually runs from an async import, so the fetches that render the
+first screen can finish before the network patch exists. Those requests leave
+no `net.req` and, more importantly, no correlation header, so their backend and
+database events cannot be joined to the session later.
+
+Add one side-effect import above everything else in your entry file:
+
+```ts
+import "crumbtrail-core/early";
+```
+
+It patches `fetch` and `XMLHttpRequest` synchronously, stamps the same
+correlation headers the SDK stamps on same origin requests, and parks bounded
+metadata (at most 50 requests, 2 MB of body text) until `init()` drains it
+through the normal redaction pipeline. `init()` adopts the session id it minted,
+so the early requests, the live session, and the backend events all match. If
+`init()` never runs within 60 seconds, the queue is dropped and recording stops.
+
 ### Presets
 
 | Preset           | Behaviour                                                              |

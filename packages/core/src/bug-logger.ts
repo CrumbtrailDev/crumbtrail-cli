@@ -20,6 +20,7 @@ import {
   PRESET_PASSIVE,
 } from "./types";
 import { createCrumbtrailRequestHeaders } from "./correlation";
+import { readEarlySessionId } from "./early-capture";
 import { createAutoFlagController } from "./auto-flag";
 import {
   errorDetector,
@@ -276,11 +277,20 @@ export class Crumbtrail {
     // Reuse a persisted session id across a hard page reload (same tab, within the idle window)
     // so a reload appends to the same session instead of spawning a new one. Explicit sessionId
     // always wins; SSR / non-browser falls through to a fresh id.
+    //
+    // `crumbtrail-core/early` sits between those two: it already stamped a session id on the
+    // requests that beat init to the wire, so adopting it keeps those requests, everything
+    // captured after init, and the backend events carrying that header in ONE session. Early
+    // capture reads the same persisted session first, so the two agree whenever a persisted
+    // session exists. An explicit `sessionId` still wins, and the early queue is still drained
+    // into it: the request ids continue to join, and only the session header sent during the
+    // blind window names a different session.
     const sessionId =
       config.sessionId ??
       (sessionStore
         ? readPersistedSessionId(sessionStore, config.sessionIdleMs)
         : undefined) ??
+      readEarlySessionId() ??
       generateSessionId();
     if (sessionStore) writePersistedSession(sessionStore, sessionId);
     const bus = new EventBus();

@@ -21,6 +21,10 @@ import {
   canInjectCorrelationHeaders,
   resolveOutboundCorrelation,
 } from "../correlation";
+import {
+  drainEarlyCapture,
+  type EarlyRequestRecord,
+} from "../early-capture";
 import { now } from "../utils";
 
 /* ------------------------------------------------------------------ */
@@ -795,6 +799,129 @@ function wrapXHR(
 }
 
 /* ------------------------------------------------------------------ */
+/* Early-capture drain                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Replays one request `crumbtrail-core/early` captured before the SDK existed.
+ * The record carries raw text; every field leaves through the same redaction
+ * the live wrappers use, and the original timestamps are preserved so the
+ * first-paint requests sit in the timeline where they happened. `d.early`
+ * marks the pair as retro-emitted — the request went out before this patch,
+ * so response headers were never observed.
+ */
+function emitEarlyRecord(
+  bus: EventBus,
+  config: CrumbtrailConfig,
+  record: EarlyRequestRecord,
+): void {
+  const id = nextId++;
+  const urlResult = redactUrl(record.url, "url");
+  const reqMetadata: Array<RedactionMetadata | undefined> = [
+    urlResult.metadata,
+  ];
+  const reqData: Record<string, unknown> = {
+    id,
+    method: record.method,
+    url: urlResult.value,
+    early: true,
+  };
+  if (record.sessionId) reqData.sessionId = record.sessionId;
+  if (record.requestId) reqData.requestId = record.requestId;
+  if (record.traceId) reqData.traceId = record.traceId;
+  if (record.spanId) reqData.spanId = record.spanId;
+
+  if (record.reqBody !== undefined) {
+    const bodyResult = redactNetworkTextBody(record.reqBody, {
+      contentType: record.reqCt,
+      maxLength: config.networkMaxBodySize,
+      path: "body",
+      ...bodyRedactionOptions(config),
+    });
+    applyBodyResult(reqData, bodyResult);
+    reqMetadata.push(bodyResult.metadata);
+  }
+
+  attachRedactionMetadata(reqData, ...reqMetadata);
+  bus.emit({ t: record.t, k: "net.req", d: reqData });
+
+  const settledAt = record.t + record.dur;
+
+  if (record.err !== undefined) {
+    const errData: Record<string, unknown> = {
+      id,
+      method: record.method,
+      url: urlResult.value,
+      dur: record.dur,
+      msg: record.err,
+      transport: record.transport,
+      early: true,
+    };
+    if (record.sessionId) errData.sessionId = record.sessionId;
+    if (record.requestId) errData.requestId = record.requestId;
+    if (record.traceId) errData.traceId = record.traceId;
+    if (record.spanId) errData.spanId = record.spanId;
+    attachRedactionMetadata(errData, urlResult.metadata);
+    bus.emit({ t: settledAt, k: "net.err", d: errData });
+    return;
+  }
+
+  const resMetadata: Array<RedactionMetadata | undefined> = [];
+  const resData: Record<string, unknown> = {
+    id,
+    st: record.status ?? 0,
+    dur: record.dur,
+    early: true,
+  };
+  if (record.sessionId) resData.sessionId = record.sessionId;
+  if (record.requestId) resData.requestId = record.requestId;
+  if (record.traceId) resData.traceId = record.traceId;
+  if (record.spanId) resData.spanId = record.spanId;
+
+  if (record.resBody !== undefined) {
+    const bodyResult = redactNetworkTextBody(record.resBody, {
+      contentType: record.ct,
+      maxLength: config.networkMaxBodySize,
+      path: "body",
+      ...bodyRedactionOptions(config),
+    });
+    if (bodyResult.body !== undefined) {
+      const dedupResult = checkDedup(
+        urlResult.value,
+        bodyResult.body,
+        String(settledAt),
+      );
+      if (dedupResult) {
+        resData.body = dedupResult;
+        resData.dedup = true;
+      } else {
+        resData.body = bodyResult.body;
+      }
+    }
+    if (bodyResult.bodySummary) resData.bodySummary = bodyResult.bodySummary;
+    resMetadata.push(bodyResult.metadata);
+  }
+
+  attachRedactionMetadata(resData, ...resMetadata);
+  bus.emit({ t: settledAt, k: "net.res", d: resData });
+}
+
+/**
+ * Drains the `crumbtrail-core/early` queue into the bus and defers the early
+ * patch permanently. A no-op when the early module was never imported.
+ */
+function drainEarlyRequests(bus: EventBus, config: CrumbtrailConfig): void {
+  for (const record of drainEarlyCapture()) {
+    if (shouldExclude(record.url, config)) continue;
+    try {
+      emitEarlyRecord(bus, config, record);
+    } catch {
+      // One malformed record never costs the rest of the queue.
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Collector export                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -803,6 +930,10 @@ export function networkCollector(
   config: CrumbtrailConfig,
   context?: CollectorContext,
 ): CollectorCleanup {
+  // Drain before patching: the queued requests happened before this collector
+  // existed, so they belong at the head of the network timeline.
+  drainEarlyRequests(bus, config);
+
   const originalFetch = globalThis.fetch;
   const shouldPatchFetch = typeof originalFetch === "function";
 
