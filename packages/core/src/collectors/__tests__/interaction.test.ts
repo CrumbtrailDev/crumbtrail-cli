@@ -188,6 +188,57 @@ describe("interactionCollector", () => {
     document.body.removeChild(input);
   });
 
+  // --- Input trust ---
+  it("marks a programmatic write to an input as untrusted", () => {
+    const input = document.createElement("input");
+    input.name = "quantity";
+    document.body.appendChild(input);
+
+    input.value = "99";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inpEvents = events.filter((e) => e.k === "inp");
+    expect(inpEvents).toHaveLength(1);
+    expect(inpEvents[0].d.trusted).toBe(false);
+
+    document.body.removeChild(input);
+  });
+
+  it("marks a user-generated input event as trusted", () => {
+    const input = document.createElement("input");
+    input.name = "quantity";
+    document.body.appendChild(input);
+
+    const event = new Event("input", { bubbles: true });
+    Object.defineProperty(event, "isTrusted", { value: true });
+    input.value = "2";
+    input.dispatchEvent(event);
+    bus.flush();
+
+    const inpEvents = events.filter((e) => e.k === "inp");
+    expect(inpEvents).toHaveLength(1);
+    expect(inpEvents[0].d.trusted).toBe(true);
+
+    document.body.removeChild(input);
+  });
+
+  it("marks form submits with their trust flag", () => {
+    const form = document.createElement("form");
+    document.body.appendChild(form);
+
+    form.dispatchEvent(new Event("submit", { bubbles: true }));
+    bus.flush();
+
+    const submitEvents = events.filter(
+      (e) => e.k === "inp" && e.d.ev === "submit",
+    );
+    expect(submitEvents).toHaveLength(1);
+    expect(submitEvents[0].d.trusted).toBe(false);
+
+    document.body.removeChild(form);
+  });
+
   // --- Navigation via pushState ---
   it("captures pushState navigation", () => {
     history.pushState({}, "", "/test-page");

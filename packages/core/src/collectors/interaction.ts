@@ -159,6 +159,10 @@ export function interactionCollector(
       el,
       val: val.value,
       ev: e.type as "input" | "change",
+      // A user typing produces a trusted event; a script assigning `.value`
+      // and dispatching its own does not. That is the difference between the
+      // user entering the wrong thing and the app overwriting what they typed.
+      trusted: e.isTrusted === true,
     };
     if (val.summary) d.valSummary = val.summary;
     attachRedactionMetadata(d, readDescriptorMetadata(el), val.metadata);
@@ -187,6 +191,7 @@ export function interactionCollector(
       el,
       val: "",
       ev: "submit",
+      trusted: e.isTrusted === true,
     };
     attachRedactionMetadata(d, readDescriptorMetadata(el));
 
