@@ -591,6 +591,8 @@ export function buildEvidenceCandidates(
   addDuplicateWriteCandidates(events, index, drafts);
   addInterpolationArtifactCandidates(events, index, drafts);
   addStateFlipFlopCandidates(events, index, drafts);
+  addDuplicateChargeCandidates(events, index, drafts);
+  addMoneyScaleShiftCandidates(events, index, drafts);
   addLostUpdateCandidates(events, index, drafts);
   addCounterContradictionCandidates(events, index, drafts);
   addNPlusOneCandidates(events, index, drafts);
@@ -3115,6 +3117,200 @@ function addStateFlipFlopCandidates(
       }),
       dedupeKey: `flipflop:${chain.table}:${chain.column}:${scrubText(JSON.stringify(chain.first.d.pk), 120)}`,
     });
+  }
+}
+
+/** Columns that carry money. Narrower than looksLikeStateColumn's value arm:
+ *  qty/count are excluded because doubling a quantity is commerce, not a unit
+ *  bug. */
+function looksLikeMoneyColumn(column: string): boolean {
+  return /(^|_)(amount|total|price|cost|balance)(_cents|_amount)?s?$|_cents$/i.test(
+    column,
+  );
+}
+
+/** Success-shaped status values, for claims about settled writes. */
+function looksSettled(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    /^(succeeded|success|captured|settled|paid|completed?|confirmed|ok)$/i.test(value)
+  );
+}
+
+/**
+ * duplicate_charge: two settled rows for the same reference and the same
+ * amount.
+ *
+ * The live case: an idempotency key generated inside the retry loop, so the
+ * gateway saw attempt 2 as a brand-new charge — two payments rows with the
+ * same order_id, order_ref and amount_cents, both succeeded, differing only
+ * in gateway_charge_id. duplicate_write is structurally blind to this: the
+ * gateway id differs by design, so the after images never match. The claim
+ * here rests on the business identity instead: same non-null reference
+ * column, same money amount, both settled, different primary keys.
+ */
+function addDuplicateChargeCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  // The grouping key is ONE reference column at a time, never the composite:
+  // the duplicating row legitimately differs in its gateway-assigned id
+  // (which also ends in _id), so a composite key would never collide. Actor
+  // columns (user_id, customer_id...) are excluded: the same customer settling
+  // the same amount twice for two different orders is commerce, not a
+  // duplicate.
+  const isTransactionRef = (key: string): boolean =>
+    /(^|_)(ref|reference)$|_id$/i.test(key) &&
+    !/^id$/i.test(key) &&
+    !/(^|_)(user|customer|account|actor|owner|creator|created_by|updated_by)_?id$/i.test(
+      key,
+    ) &&
+    !/(^|_)(gateway|external|provider|processor|charge|txn|transaction)_/i.test(key);
+
+  interface SettledRow {
+    event: BugEvent;
+    pk: string;
+    refs: Array<[string, string]>;
+    amountText: string;
+  }
+  const rowsByTable = new Map<string, SettledRow[]>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    if (safeText(event.d.op, 20) !== "insert") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const after = isRecord(event.d.after) ? event.d.after : undefined;
+    if (!after) continue;
+    const settled = Object.entries(after).some(
+      ([key, value]) => looksLikeStateColumn(key) && looksSettled(value),
+    );
+    if (!settled) continue;
+    const refs = Object.entries(after)
+      .filter(
+        ([key, value]) =>
+          value !== null && value !== undefined && value !== "" && isTransactionRef(key),
+      )
+      .map(([key, value]): [string, string] => [key, String(value)]);
+    const amounts = Object.entries(after)
+      .filter(
+        ([key, value]) => looksLikeMoneyColumn(key) && finiteNumber(value) !== undefined,
+      )
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .sort();
+    if (refs.length === 0 || amounts.length === 0) continue;
+    const rows = rowsByTable.get(table) ?? [];
+    rows.push({
+      event,
+      pk: JSON.stringify(event.d.pk ?? rows.length),
+      refs,
+      amountText: amounts.join(", "),
+    });
+    rowsByTable.set(table, rows);
+  }
+
+  for (const [table, rows] of rowsByTable) {
+    if (rows.length < 2) continue;
+    // column=value + identical amounts: the rows claiming the same event.
+    const byRef = new Map<string, SettledRow[]>();
+    for (const row of rows) {
+      for (const [column, value] of row.refs) {
+        const key = `${column}=${value} ${row.amountText}`;
+        const group = byRef.get(key) ?? [];
+        group.push(row);
+        byRef.set(key, group);
+      }
+    }
+    // The same pair of rows usually collides on several reference columns
+    // (order_id AND order_ref); one finding per distinct row set.
+    const reported = new Set<string>();
+    for (const [key, group] of byRef) {
+      if (group.length < 2) continue;
+      const pkSet = group
+        .map((row) => row.pk)
+        .sort()
+        .join(",");
+      if (reported.has(pkSet)) continue;
+      reported.add(pkSet);
+      const first = group.reduce((earliest, row) =>
+        row.event.t < earliest.event.t ? row : earliest,
+      );
+      const label = scrubText(table, 100) ?? "table";
+      drafts.push({
+        detector: "duplicate_charge",
+        title: `Duplicate settlement: ${group.length} settled ${label} rows for one reference`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: first.event.t,
+          offsetMs:
+            offsetForEvent(first.event) ??
+            offsetFromStart(first.event.t, index.start),
+          route: routeAt(index.navs ?? [], first.event.t),
+          requestId: safeText(first.event.d.requestId, 200),
+          message: `${group.length} rows inserted into ${table} share ${scrubText(key.split(" ")[0] ?? key, 200)} with identical ${scrubText(first.amountText, 120)}, every one in a settled state. One business event settled ${group.length} times — on a payments table that is a double charge.`,
+          source: normalizeDbEngine(first.event.d.engine),
+        }),
+        dedupeKey: `dupcharge:${table}:${scrubText(key, 200)}`,
+      });
+    }
+  }
+}
+
+/**
+ * money_scale_shift: one row's money column changed by exactly a power of a
+ * hundred.
+ *
+ * The live case: capturePayment divided by 100 before sending and the gateway
+ * read the field as cents, so the captured amount landed as 199 where the
+ * charge said 19900. A legitimate 100.00x price change exists; a payment,
+ * total or balance moving by exactly 100x in one UPDATE is a unit bug — the
+ * cents/dollars boundary was crossed once too often or too rarely.
+ */
+function addMoneyScaleShiftCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const seen = new Set<string>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    if (safeText(event.d.op, 20) !== "update") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const before = isRecord(event.d.before) ? event.d.before : undefined;
+    const after = isRecord(event.d.after) ? event.d.after : undefined;
+    if (!before || !after) continue;
+    for (const [column, afterRaw] of Object.entries(after)) {
+      if (!looksLikeMoneyColumn(column)) continue;
+      const to = finiteNumber(afterRaw);
+      const from = finiteNumber(before[column]);
+      if (from === undefined || to === undefined) continue;
+      if (from <= 0 || to <= 0) continue;
+      const ratio = from > to ? from / to : to / from;
+      if (ratio !== 100 && ratio !== 10_000) continue;
+      const key = `${table}:${column}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const direction = from > to ? "shrank" : "grew";
+      drafts.push({
+        detector: "money_scale_shift",
+        title: `Money moved by exactly ${ratio}x: ${table}.${column} ${direction} ${from} → ${to}`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: event.t,
+          offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+          route: routeAt(index.navs ?? [], event.t),
+          requestId: safeText(event.d.requestId, 200),
+          message: `${table}.${column} went from ${from} to ${to} in one update — an exact ${ratio}x shift, the fingerprint of a cents/dollars conversion applied once too often or too rarely.`,
+          source: normalizeDbEngine(event.d.engine),
+        }),
+        dedupeKey: `moneyscale:${key}`,
+      });
+    }
   }
 }
 
