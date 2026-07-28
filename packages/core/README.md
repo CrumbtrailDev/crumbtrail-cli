@@ -219,6 +219,12 @@ Opting out, narrowest first:
 Hidden elements (`hidden`, `aria-hidden="true"`, `display:none`,
 `visibility:hidden`) are already skipped.
 
+Each `ui.num` snapshot carries the document `lang` and `dir`, and the same
+collector emits one `ui.layout` event per navigation with
+`{ dir, lang, scrollW, clientW, overflowX, url }`. Together they make a
+locale-vs-rendered-number contradiction, and horizontal overflow from a long
+translated label, joinable without capturing any DOM.
+
 ## Related packages
 
 | Package                                                                            | Use it for                                                 |

@@ -1,7 +1,11 @@
 import type { EventBus } from "../event-bus";
 import type { CrumbtrailConfig, CollectorCleanup } from "../types";
-import { UI_NUM_EVENT_KIND } from "../types";
-import { classifyStructuredValue } from "../redaction";
+import { UI_LAYOUT_EVENT_KIND, UI_NUM_EVENT_KIND } from "../types";
+import {
+  attachRedactionMetadata,
+  classifyStructuredValue,
+  redactUrl,
+} from "../redaction";
 import {
   buildCaptureGapEvent,
   type BuildCaptureGapEventInput,
@@ -324,6 +328,55 @@ export function scanUiNumbers(
   return regions;
 }
 
+/**
+ * Locale attributes that decide how the numbers above are rendered and read.
+ * A page serving `lang="de"` while formatting `1,234.56` is a real defect that
+ * neither lane can show alone, so both `ui.num` and `ui.layout` carry them.
+ */
+function readLocale(): { dir: string; lang: string | null } {
+  try {
+    const root = document.documentElement;
+    return {
+      dir: document.dir || root?.dir || "ltr",
+      lang: root?.lang || null,
+    };
+  } catch {
+    return { dir: "ltr", lang: null };
+  }
+}
+
+/**
+ * One small measurement per navigation: document geometry plus locale. It is
+ * what turns "the layout is broken on this screen" into evidence — horizontal
+ * overflow is invisible to every other lane, and it is the usual outcome of a
+ * long translated label or an RTL locale meeting a fixed-width column.
+ * Emitted unconditionally; deciding what counts as significant is the
+ * detector's job, not the SDK's.
+ */
+function emitLayout(bus: EventBus): void {
+  try {
+    const root = document?.documentElement;
+    if (!root) return;
+    const scrollW = root.scrollWidth ?? 0;
+    const clientW = root.clientWidth ?? 0;
+    const locale = readLocale();
+    const href = typeof window !== "undefined" ? window.location.href : "";
+    const urlResult = href ? redactUrl(href, "url") : undefined;
+    const d: Record<string, unknown> = {
+      dir: locale.dir,
+      lang: locale.lang,
+      scrollW,
+      clientW,
+      overflowX: Math.max(0, scrollW - clientW),
+    };
+    if (urlResult) d.url = urlResult.value;
+    attachRedactionMetadata(d, urlResult?.metadata);
+    bus.emit({ t: now(), k: UI_LAYOUT_EVENT_KIND, d });
+  } catch {
+    // A failed measurement must not take the numeric scan down with it.
+  }
+}
+
 export function uiNumbersCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
@@ -361,6 +414,7 @@ function startUiNumbersCollector(
   denyFields?: string[],
 ): CollectorCleanup {
   let disabled = false;
+  let layoutPending = true;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
   // Previous serialized snapshot per region: emit only on change.
   const lastSnapshot = new Map<string, string>();
@@ -402,6 +456,12 @@ function startUiNumbersCollector(
 
   const runScan = (): void => {
     if (disabled) return;
+    // Layout is measured once per navigation, not once per DOM settle: it
+    // describes the view, and a mutation-driven rescan would repeat it.
+    if (layoutPending) {
+      layoutPending = false;
+      emitLayout(bus);
+    }
     try {
       const regions = scanUiNumbers(document.body, denyFields);
       if (regions === null) {
@@ -415,6 +475,7 @@ function startUiNumbersCollector(
         );
         return;
       }
+      const locale = readLocale();
       for (const [region, items] of regions) {
         if (items.length === 0) continue;
         const serialized = JSON.stringify(items);
@@ -423,7 +484,7 @@ function startUiNumbersCollector(
         bus.emit({
           t: now(),
           k: UI_NUM_EVENT_KIND,
-          d: { region, items },
+          d: { region, items, lang: locale.lang, dir: locale.dir },
         });
       }
     } catch (error) {
@@ -454,7 +515,10 @@ function startUiNumbersCollector(
   // view's DOM is read after it renders. Uses the shared nav-commit signal —
   // never a private history.pushState wrap — so multiple collectors can
   // observe navigation without corrupting each other's teardown.
-  unsubscribeNav = subscribeNavCommit(() => scheduleScan());
+  unsubscribeNav = subscribeNavCommit(() => {
+    layoutPending = true;
+    scheduleScan();
+  });
 
   // Initial navigation commit (page load): scan after the settle window.
   scheduleScan();

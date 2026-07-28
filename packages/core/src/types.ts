@@ -152,6 +152,13 @@ export const UI_NUM_EVENT_KIND = "ui.num" as const;
 export const UI_LISTENERS_EVENT_KIND = "ui.listeners" as const;
 
 /**
+ * Canonical event kind for the per-navigation layout probe (`k:'ui.layout'`).
+ * Payload: `{ dir, lang, scrollW, clientW, overflowX, url }` — document
+ * geometry and locale attributes, never content.
+ */
+export const UI_LAYOUT_EVENT_KIND = "ui.layout" as const;
+
+/**
  * Type specific payload (`d`) of a `k:'capture_gap'` event. `detail` is deliberately a bounded,
  * redacted diagnostic descriptor such as an error name, table and operation, or leading SQL
  * keyword. It must never contain raw SQL values or other user data.

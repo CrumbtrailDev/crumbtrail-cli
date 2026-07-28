@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventBus } from "../event-bus";
 import type { BugEvent, CrumbtrailConfig } from "../types";
-import { DEFAULT_CONFIG, UI_NUM_EVENT_KIND } from "../types";
+import {
+  DEFAULT_CONFIG,
+  UI_LAYOUT_EVENT_KIND,
+  UI_NUM_EVENT_KIND,
+} from "../types";
 import { REDACTED_VALUE } from "../redaction";
 import {
   parseNumericToken,
@@ -130,6 +134,8 @@ describe("uiNumbersCollector", () => {
         { label: "Shipping", value: 5, unit: "$" },
         { label: "Total", value: 199, unit: "$" },
       ],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -157,6 +163,8 @@ describe("uiNumbersCollector", () => {
     expect(snapshots[1].d).toEqual({
       region: "dl.totals",
       items: [{ label: "Subtotal", value: 205, unit: "$" }],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -195,6 +203,8 @@ describe("uiNumbersCollector", () => {
     expect(snapshots[0].d).toEqual({
       region: "dl.totals",
       items: [{ label: "Balance", value: 50, unit: "$" }],
+      lang: null,
+      dir: "ltr",
     });
     expect(JSON.stringify(events)).not.toContain(REDACTED_VALUE);
     expect(JSON.stringify(events)).not.toContain("4242");
@@ -223,6 +233,8 @@ describe("uiNumbersCollector", () => {
         { label: "Order number", value: 123456789 },
         { label: "Total", value: 50, unit: "$" },
       ],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -248,6 +260,8 @@ describe("uiNumbersCollector", () => {
     expect(snapshots[0].d).toEqual({
       region: "dl.totals",
       items: [{ label: "Total", value: 9.99, unit: "$" }],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -309,6 +323,8 @@ describe("uiNumbersCollector", () => {
         { label: "Item total", value: 25, unit: "$" },
         { label: "Quantity", value: 2 },
       ],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -331,6 +347,8 @@ describe("uiNumbersCollector", () => {
         { label: "Quantity", value: 2 },
         { label: "Unit price", value: 25, unit: "$" },
       ],
+      lang: null,
+      dir: "ltr",
     });
   });
 
@@ -440,6 +458,110 @@ describe("uiNumbersCollector", () => {
     await settle(bus);
     expect(uiNumEvents(events)).toHaveLength(0);
     expect(events.filter((event) => event.k === "capture_gap")).toHaveLength(1);
+  });
+
+  // --- Layout probe ---
+  function layoutEvents(events: BugEvent[]): BugEvent[] {
+    return events.filter((event) => event.k === UI_LAYOUT_EVENT_KIND);
+  }
+
+  function stubDocumentWidths(scrollW: number, clientW: number): () => void {
+    const root = document.documentElement;
+    const original = {
+      scrollWidth: Object.getOwnPropertyDescriptor(root, "scrollWidth"),
+      clientWidth: Object.getOwnPropertyDescriptor(root, "clientWidth"),
+    };
+    Object.defineProperty(root, "scrollWidth", {
+      value: scrollW,
+      configurable: true,
+    });
+    Object.defineProperty(root, "clientWidth", {
+      value: clientW,
+      configurable: true,
+    });
+    return () => {
+      delete (root as unknown as Record<string, unknown>).scrollWidth;
+      delete (root as unknown as Record<string, unknown>).clientWidth;
+      if (original.scrollWidth)
+        Object.defineProperty(root, "scrollWidth", original.scrollWidth);
+      if (original.clientWidth)
+        Object.defineProperty(root, "clientWidth", original.clientWidth);
+    };
+  }
+
+  it("emits one ui.layout event for the initial navigation", async () => {
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+
+    const layout = layoutEvents(events);
+    expect(layout).toHaveLength(1);
+    expect(layout[0].d).toMatchObject({
+      dir: "ltr",
+      lang: null,
+      overflowX: 0,
+      url: window.location.href,
+    });
+    expect(layout[0].d.scrollW).toBeTypeOf("number");
+    expect(layout[0].d.clientW).toBeTypeOf("number");
+  });
+
+  it("reports horizontal overflow", async () => {
+    const restore = stubDocumentWidths(1400, 1024);
+    try {
+      const { events, bus, cleanup } = collect();
+      cleanups.push(cleanup);
+      await settle(bus);
+
+      expect(layoutEvents(events)[0].d).toMatchObject({
+        scrollW: 1400,
+        clientW: 1024,
+        overflowX: 376,
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  it("carries the document locale attributes", async () => {
+    document.documentElement.lang = "de";
+    document.documentElement.dir = "rtl";
+    try {
+      document.body.innerHTML = `<dl class="totals"><dt>Total</dt><dd>$9.99</dd></dl>`;
+      const { events, bus, cleanup } = collect();
+      cleanups.push(cleanup);
+      await settle(bus);
+
+      expect(layoutEvents(events)[0].d).toMatchObject({
+        dir: "rtl",
+        lang: "de",
+      });
+      expect(uiNumEvents(events)[0].d).toMatchObject({
+        lang: "de",
+        dir: "rtl",
+      });
+    } finally {
+      document.documentElement.lang = "";
+      document.documentElement.dir = "";
+    }
+  });
+
+  it("emits again on a navigation commit but not on a plain DOM settle", async () => {
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    expect(layoutEvents(events)).toHaveLength(1);
+
+    document.body.innerHTML = `<dl class="totals"><dt>Total</dt><dd>$1.00</dd></dl>`;
+    await settle(bus);
+    expect(layoutEvents(events)).toHaveLength(1);
+
+    history.pushState({}, "", "/checkout");
+    await settle(bus);
+    expect(layoutEvents(events)).toHaveLength(2);
+    expect(layoutEvents(events)[1].d.url).toContain("/checkout");
+
+    window.history.replaceState(null, "", "/");
   });
 
   it("no-ops cleanly when MutationObserver is unavailable", () => {
