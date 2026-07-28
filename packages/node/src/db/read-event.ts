@@ -19,6 +19,8 @@ export interface BuildDbReadEventInput {
   requestId: string;
   /** 1-based ordinal of the SELECT within this request. */
   stmt?: number;
+  /** Resolved LIMIT/OFFSET the statement ran with, when the adapter parsed one. */
+  queryShape?: { limit?: number; offset?: number };
   sessionId?: string;
   redactColumns?: readonly string[];
   now?: number;
@@ -62,6 +64,13 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
   };
   if (Number.isInteger(input.stmt) && (input.stmt as number) > 0)
     d.stmt = input.stmt;
+  const shape = input.queryShape;
+  if (shape && (shape.limit !== undefined || shape.offset !== undefined)) {
+    d.q = {
+      ...(Number.isInteger(shape.limit) ? { limit: shape.limit } : {}),
+      ...(Number.isInteger(shape.offset) ? { offset: shape.offset } : {}),
+    };
+  }
   const redaction = mergeRedactionMetadata(row.metadata, pk.metadata);
   if (redaction) d.redaction = redaction;
 

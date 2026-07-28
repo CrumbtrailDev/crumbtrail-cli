@@ -592,7 +592,10 @@ export function buildEvidenceCandidates(
   addLostUpdateCandidates(events, index, drafts);
   addCounterContradictionCandidates(events, index, drafts);
   addNPlusOneCandidates(events, index, drafts);
+  addPaginationOffsetCandidates(events, index, drafts);
+  addListenerTypeStaircaseCandidates(events, index, drafts);
   const mutatingRequests = collectMutatingRequests(events);
+  addConcurrentDuplicateMutationCandidates(events, index, drafts, mutatingRequests);
   addDbDeltaMismatchCandidates(events, index, drafts, mutatingRequests);
   addClientSuppliedValueCandidates(events, index, drafts, mutatingRequests);
   addIneffectiveInputCandidates(events, index, drafts, mutatingRequests);
@@ -1122,6 +1125,204 @@ function addResponseRaceCandidates(
         });
       }
     }
+  }
+}
+
+/**
+ * A first-page request ran its SELECT with a fractional-page OFFSET.
+ *
+ * Off-by-one pagination is the canonical "the first item just isn't there"
+ * report: the request carries no paging parameter (or asks for page 1), the
+ * query runs `OFFSET 1`, and every row of output is real and correct except
+ * the one that never appears on any page. Nothing errors and no count
+ * contradicts, so the window on the read event is the only evidence.
+ *
+ * The guard `0 < offset < limit` is what keeps this quiet on legitimate
+ * queries: a real page 2 runs with offset === limit, a ranked pick
+ * ("second-highest") runs LIMIT 1 OFFSET 1 where offset === limit, and cursor
+ * pagination carries no OFFSET at all. Requests that page by cursor-style
+ * parameters are skipped outright, because their window arithmetic is not
+ * derivable from the URL.
+ */
+const PAGINATION_OFFSET_SCORE = 68;
+const PAGE_PARAM_NAMES = new Set(["page", "p", "pageindex", "pagenumber"]);
+const OFFSET_PARAM_NAMES = new Set(["offset", "skip", "start"]);
+const CURSOR_PARAM_NAMES = new Set(["cursor", "after", "before", "pagetoken"]);
+
+function addPaginationOffsetCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const requestsById = new Map<string, BugEvent>();
+  for (const event of events) {
+    if (event.k !== "net.req") continue;
+    const id = safeText(event.d.requestId, 120) ?? requestIdForEvent(event);
+    if (id && !requestsById.has(id)) requestsById.set(id, event);
+  }
+
+  for (const event of events) {
+    if (event.k !== "db.read" && event.k !== "db.read.bulk") continue;
+    const shape = isRecord(event.d.q) ? event.d.q : undefined;
+    const limit = finiteNumber(shape?.limit);
+    const offset = finiteNumber(shape?.offset);
+    if (
+      limit === undefined ||
+      offset === undefined ||
+      offset <= 0 ||
+      offset >= limit
+    )
+      continue;
+    const requestId = safeText(event.d.requestId, 120);
+    const request = requestId ? requestsById.get(requestId) : undefined;
+    if (!request) continue;
+    const url = safeText(request.d.url, 400);
+    if (!url) continue;
+
+    let params: URLSearchParams;
+    try {
+      params = new URL(url, "http://local").searchParams;
+    } catch {
+      continue;
+    }
+    let firstPage = true;
+    let cursorStyle = false;
+    for (const [name, value] of params) {
+      const key = name.toLowerCase();
+      if (CURSOR_PARAM_NAMES.has(key)) cursorStyle = true;
+      if (PAGE_PARAM_NAMES.has(key) && value !== "1" && value !== "0")
+        firstPage = false;
+      if (OFFSET_PARAM_NAMES.has(key) && value !== "0") firstPage = false;
+    }
+    if (!firstPage || cursorStyle) continue;
+
+    const table = safeText(event.d.table, 120) ?? "table";
+    drafts.push({
+      detector: "pagination_first_page_offset",
+      title: `First page of ${table} skips ${offset} row${offset === 1 ? "" : "s"}`,
+      severity: "medium",
+      score: PAGINATION_OFFSET_SCORE,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId,
+        method: safeText(request.d.method, 20),
+        url: redactUrl(url),
+        message:
+          `This request asks for the first page, but its ${table} SELECT ran with ` +
+          `OFFSET ${offset} (LIMIT ${limit}). The first ${offset} row${offset === 1 ? "" : "s"} of the ` +
+          `table's order are skipped before the page starts, so they are returned to no page at all.`,
+      }),
+      dedupeKey: `pageoffset:${requestId}:${table}:${offset}`,
+    });
+  }
+}
+
+/**
+ * The same mutation was in flight twice at once and both copies succeeded.
+ *
+ * This is the transport shape of both halves of a read-modify-write race: a
+ * client that double-fires a submit, or two tabs/users hitting a shared
+ * resource, sends byte-identical mutations whose handling overlaps, and the
+ * store applies both. The symptom downstream is a duplicated line or a lost
+ * increment — invisible to every error detector because both requests returned
+ * 2xx. Sequential retries are excluded on purpose (a retry after a failure is
+ * the client behaving correctly); only pairs whose lifetimes overlap qualify.
+ *
+ * Bodies must be readable to group: a redacted body collapses distinct payloads
+ * into one signature, which would manufacture duplicates, so any body carrying
+ * a redaction marker is skipped rather than trusted.
+ */
+const CONCURRENT_DUPLICATE_MUTATION_SCORE = 72;
+const REDACTION_MARKER = "[REDACTED]";
+
+function addConcurrentDuplicateMutationCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  mutatingRequests: Map<string, CorrelatedRequest>,
+): void {
+  // Response arrival times, keyed the same way collectMutatingRequests keys its
+  // entries, so a request's lifetime is [reqEvent.t, resT].
+  const resAt = new Map<string, number>();
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const id = safeText(event.d.requestId, 120) ?? requestIdForEvent(event);
+    if (id && !resAt.has(id)) resAt.set(id, event.t);
+  }
+
+  const groups = new Map<string, CorrelatedRequest[]>();
+  for (const entry of mutatingRequests.values()) {
+    if (!entry.url) continue;
+    if (entry.status === undefined || entry.status < 200 || entry.status >= 300)
+      continue;
+    const body =
+      typeof entry.body === "string"
+        ? entry.body
+        : entry.body === undefined || entry.body === null
+          ? undefined
+          : JSON.stringify(entry.body);
+    if (!body || body.includes(REDACTION_MARKER)) continue;
+    const key = `${entry.method} ${entry.url} ${body.slice(0, 2_000)}`;
+    const bucket = groups.get(key) ?? [];
+    bucket.push(entry);
+    groups.set(key, bucket);
+  }
+
+  for (const bucket of groups.values()) {
+    if (bucket.length < 2) continue;
+    bucket.sort((a, b) => a.reqEvent.t - b.reqEvent.t);
+    // The earliest overlapping pair anchors the finding; more copies only
+    // raise the count, not the number of candidates.
+    let anchor: [CorrelatedRequest, CorrelatedRequest] | undefined;
+    let overlapping = 0;
+    for (let i = 0; i + 1 < bucket.length; i += 1) {
+      const first = bucket[i];
+      const second = bucket[i + 1];
+      const firstBack = resAt.get(first.requestId);
+      if (firstBack === undefined || second.reqEvent.t > firstBack) continue;
+      overlapping += 1;
+      anchor ??= [first, second];
+    }
+    if (!anchor) continue;
+    const [first, second] = anchor;
+    const firstRes =
+      typeof first.resBody === "string"
+        ? first.resBody
+        : JSON.stringify(first.resBody);
+    const secondRes =
+      typeof second.resBody === "string"
+        ? second.resBody
+        : JSON.stringify(second.resBody);
+    const divergence =
+      firstRes !== undefined && secondRes !== undefined && firstRes !== secondRes
+        ? " Their responses describe different resulting states, so each write observed a store the other had not finished changing."
+        : "";
+    drafts.push({
+      detector: "concurrent_duplicate_mutation",
+      title: `Identical ${first.method} ${titleUrl(first.url ?? "") ?? "mutation"} in flight twice at once`,
+      severity: "medium",
+      score: CONCURRENT_DUPLICATE_MUTATION_SCORE,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: second.reqEvent.t,
+        offsetMs:
+          offsetForEvent(second.reqEvent) ??
+          offsetFromStart(second.reqEvent.t, index.start),
+        route: routeAt(index.navs ?? [], second.reqEvent.t),
+        requestId: second.requestId,
+        method: first.method,
+        url: redactUrl(first.url),
+        message:
+          `${bucket.length} identical ${first.method} calls to this endpoint succeeded, ` +
+          `${overlapping + 1} of them overlapping in flight. A read-modify-write behind this ` +
+          `endpoint applies each copy against the state it read, so the result is a duplicated ` +
+          `entry or a lost increment rather than an error.${divergence}`,
+      }),
+      dedupeKey: `dupmutation:${first.method}:${first.requestId}`,
+    });
   }
 }
 
@@ -5602,6 +5803,89 @@ function listenerCountsByType(
     counts.set(type, count);
   }
   return counts.size > 0 ? counts : undefined;
+}
+
+/** Arrivals at one path that must show the staircase before it is a trend. */
+const LISTENER_STAIRCASE_MIN_VISITS = 3;
+/** Minimum growth for one event type across those arrivals. */
+const LISTENER_STAIRCASE_MIN_DELTA = 2;
+const LISTENER_STAIRCASE_SCORE = 70;
+
+/**
+ * The session-total check above is deliberately deaf to slow leaks: its
+ * absolute floor and ratio guard exist so a busy page's organic listener churn
+ * never reads as a defect. But the classic per-mount leak adds ONE handler per
+ * visit — an EventSource subscription, a store callback — and at one per visit
+ * the totals never clear those guards inside a normal session. Scoped to a
+ * single event type on a single path, the same staircase is high signal at a
+ * delta of two: legitimate long-lived subscriptions register once and hold
+ * flat, and cleanup that runs at all produces a dip somewhere in the series.
+ */
+function addListenerTypeStaircaseCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const byPath = new Map<
+    string,
+    Array<{ event: BugEvent; byType: Map<string, number> }>
+  >();
+  for (const event of events) {
+    if (event.k !== "ui.listeners") continue;
+    const url = safeText(event.d.url, 400);
+    if (!url) continue;
+    let path: string;
+    try {
+      path = new URL(url, "http://local").pathname;
+    } catch {
+      continue;
+    }
+    const byType = listenerCountsByType(event);
+    if (!byType) continue;
+    const bucket = byPath.get(path) ?? [];
+    bucket.push({ event, byType });
+    byPath.set(path, bucket);
+  }
+
+  for (const [path, readings] of byPath) {
+    if (readings.length < LISTENER_STAIRCASE_MIN_VISITS) continue;
+    const types = new Set<string>();
+    for (const reading of readings)
+      for (const type of reading.byType.keys()) types.add(type);
+    for (const type of types) {
+      const series = readings.map((r) => r.byType.get(type) ?? 0);
+      let monotone = true;
+      for (let i = 1; i < series.length; i += 1) {
+        if (series[i] < series[i - 1]) {
+          monotone = false;
+          break;
+        }
+      }
+      const delta = series[series.length - 1] - series[0];
+      if (!monotone || delta < LISTENER_STAIRCASE_MIN_DELTA) continue;
+      const last = readings[readings.length - 1].event;
+      drafts.push({
+        detector: "listener_growth",
+        title: `"${type}" listeners grow on every visit to ${path}`,
+        severity: "medium",
+        score: LISTENER_STAIRCASE_SCORE,
+        confidence: "medium",
+        anchor: removeUndefined({
+          t: last.t,
+          offsetMs:
+            offsetForEvent(last) ?? offsetFromStart(last.t, index.start),
+          route: routeAt(index.navs ?? [], last.t),
+          message:
+            `Across ${readings.length} arrivals at ${path}, live "${type}" listeners ` +
+            `went ${series[0]} → ${series[series.length - 1]} and never decreased. ` +
+            `A subscription made on every mount with no cleanup on unmount produces exactly ` +
+            `this staircase; each leaked handler still fires, so work is repeated once per ` +
+            `earlier visit.`,
+        }),
+        dedupeKey: `listenerstaircase:${path}:${type}`,
+      });
+    }
+  }
 }
 
 // ─── stream_desync ───────────────────────────────────────────────────────────

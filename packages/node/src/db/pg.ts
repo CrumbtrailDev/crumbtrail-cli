@@ -2,6 +2,7 @@ import {
   classifyStatement,
   ensureReturning,
   leadingSqlKeyword,
+  parseLimitOffset,
   parseMutation,
   parseRead,
   type ParsedMutation,
@@ -109,6 +110,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
             options,
             emittedReadRowsByRequest,
             readStatementsByRequest,
+            queryShape: parseLimitOffset(text, params),
           });
         } catch (error) {
           emitGap(options, { reason: "capture_exception", error });

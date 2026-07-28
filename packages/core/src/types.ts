@@ -254,6 +254,14 @@ export interface DbReadEventData {
    * point of an N+1 finding is telling those two apart.
    */
   stmt?: number;
+  /**
+   * Resolved LIMIT/OFFSET window the statement ran with, when the adapter
+   * could parse one. Pagination arithmetic bugs live entirely in this shape: a
+   * first-page request whose SELECT ran `OFFSET 1` drops the first row of the
+   * table's order from every page without a single error, and only comparing
+   * this window against the request's own paging parameters can say so.
+   */
+  q?: { limit?: number; offset?: number };
   redaction?: unknown;
 }
 

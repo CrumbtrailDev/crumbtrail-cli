@@ -199,6 +199,7 @@ export type {
   CrumbtrailExpressErrorMiddleware,
   CrumbtrailExpressErrorNext,
   CrumbtrailExpressMiddleware,
+  CrumbtrailExpressMiddlewareWithHandle,
   CrumbtrailExpressNext,
   CrumbtrailExpressOptions,
   CrumbtrailExpressRequest,

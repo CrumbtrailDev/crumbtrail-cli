@@ -426,6 +426,8 @@ export function emitDbReadEvents(input: {
    * is the only thing separating N single-row SELECTs from one N-row SELECT.
    */
   readStatementsByRequest?: Map<string, number>;
+  /** Resolved LIMIT/OFFSET the statement ran with, when the adapter parsed one. */
+  queryShape?: { limit?: number; offset?: number };
 }): void {
   const { engine, table, requestId, rows, rowCount, options } = input;
   const emittedReadRowsByRequest = input.emittedReadRowsByRequest;
@@ -468,6 +470,7 @@ export function emitDbReadEvents(input: {
           row,
           requestId,
           ...(stmt !== undefined ? { stmt } : {}),
+          queryShape: input.queryShape,
           sessionId: options.sessionId,
           redactColumns: options.redactColumns,
           now: options.now?.(),

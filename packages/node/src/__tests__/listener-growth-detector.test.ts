@@ -85,3 +85,57 @@ describe("listener_growth", () => {
     expect(candidatesFor(events)).toHaveLength(0);
   });
 });
+
+/** Alternate two routes; each `/` arrival carries the given "message" count. */
+function toggleWalk(messageCounts: number[]): BugEvent[] {
+  return messageCounts.flatMap((count, i) => [
+    nav(1_000 * (i + 1), "/"),
+    gauge(1_000 * (i + 1) + 100, count + 10, "http://x/", [
+      ["message", count],
+      ["click", 10],
+    ]),
+    nav(1_000 * (i + 1) + 500, "/search"),
+    gauge(1_000 * (i + 1) + 600, count + 10, "http://x/search", [
+      ["message", count],
+      ["click", 10],
+    ]),
+  ]);
+}
+
+describe("listener_growth per-type staircase", () => {
+  it("names one event type that climbs on every revisit of the same path", () => {
+    // One leaked stream handler per visit: far below the session-total floor,
+    // but a clean staircase for "message" on "/".
+    const found = candidatesFor(toggleWalk([1, 2, 3, 4, 5]));
+    const staircase = found.find((candidate) =>
+      candidate.title.includes('"message"'),
+    );
+    expect(staircase).toBeDefined();
+    expect(String(staircase?.anchor?.message)).toContain("1 → 5");
+    expect(String(staircase?.anchor?.message)).toContain("never decreased");
+  });
+
+  it("stays silent when the count ever dips — cleanup ran", () => {
+    expect(
+      candidatesFor(toggleWalk([1, 2, 1, 2, 1])).filter((candidate) =>
+        candidate.title.includes('"message"'),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("stays silent on a flat long-lived subscription", () => {
+    expect(
+      candidatesFor(toggleWalk([3, 3, 3, 3])).filter((candidate) =>
+        candidate.title.includes('"message"'),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("needs three arrivals at the path before growth is a trend", () => {
+    expect(
+      candidatesFor(toggleWalk([1, 3])).filter((candidate) =>
+        candidate.title.includes('"message"'),
+      ),
+    ).toHaveLength(0);
+  });
+});
