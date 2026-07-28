@@ -621,6 +621,7 @@ export function buildEvidenceCandidates(
   addBatchImportCandidates(events, index, drafts, exchanges);
   addRefundInvariantCandidates(events, index, drafts);
   addSessionCartInvariantCandidates(events, index, drafts, exchanges);
+  addLocaleInputCandidates(index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
   addDeclinedPaymentOrderedCandidates(events, index, drafts);
   addStoredActiveMarkupCandidates(events, index, drafts);
@@ -6405,6 +6406,121 @@ function addSessionCartInvariantCandidates(
         message: `Two successful logins for the same user each reported merged guest lines. The cart grew from ${firstItems.length} to ${secondItems.length} lines and now contains a duplicate product, with no add-to-cart request between the reads.`,
       }),
       dedupeKey: `cartremerge:${second.userId}`,
+    });
+  }
+}
+
+// ─── locale-sensitive input invariants ────────────────────────────────────────
+
+function expectedLocalizedCents(
+  raw: string,
+  locale: string,
+): number | undefined {
+  let decimal = ".";
+  let groups = new Set<string>();
+  try {
+    const parts = new Intl.NumberFormat(locale).formatToParts(12345.6);
+    decimal = parts.find((part) => part.type === "decimal")?.value ?? ".";
+    groups = new Set(
+      parts
+        .filter((part) => part.type === "group")
+        .map((part) => part.value),
+    );
+  } catch {
+    return undefined;
+  }
+  let normalized = raw.trim();
+  for (const group of groups)
+    normalized = normalized.split(group).join("");
+  normalized = normalized.split(decimal).join(".");
+  normalized = normalized.replace(/[^\d.+-]/g, "");
+  const amount = Number(normalized);
+  return Number.isFinite(amount) ? Math.round(amount * 100) : undefined;
+}
+
+function addLocaleInputCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (!exchange.res) continue;
+    const request = parseStructuredBody(exchange.body);
+    const response = parseStructuredBody(exchange.resBody);
+    if (!isRecord(request) || !isRecord(response)) continue;
+
+    const country = safeText(request.country, 20)?.toUpperCase();
+    if (
+      country &&
+      country !== "US" &&
+      exchange.status === 400 &&
+      safeText(response.error, 80) === "validation_failed" &&
+      isRecord(response.errors) &&
+      /invalid postal/i.test(safeText(response.errors.postalCode, 160) ?? "")
+    ) {
+      drafts.push({
+        detector: "country_postal_validation_mismatch",
+        title: `${country} postal code was rejected by country-agnostic validation`,
+        severity: "medium",
+        score: 78,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: exchange.res.t,
+          offsetMs:
+            offsetForEvent(exchange.res) ??
+            offsetFromStart(exchange.res.t, index.start),
+          route: routeAt(index.navs ?? [], exchange.res.t),
+          requestId: exchange.requestId,
+          method: exchange.method,
+          url: redactUrl(exchange.url),
+          status: exchange.status,
+          message: `The request explicitly selected country ${country} and supplied a postal code, but validation returned only a generic invalid-postal error. Country-specific formats cannot all satisfy one validation rule.`,
+        }),
+        dedupeKey: `postalcountry:${country}:${capturedUrlPath(exchange.url) ?? ""}`,
+      });
+    }
+
+    const raw = safeText(request.raw, 120);
+    const locale = safeText(request.locale, 40);
+    const actual =
+      finiteNumber(request.amountCents) ??
+      finiteNumber(request.amount_cents);
+    if (
+      !isSuccessStatus(exchange.status) ||
+      !raw ||
+      !locale ||
+      actual === undefined
+    )
+      continue;
+    const expected = expectedLocalizedCents(raw, locale);
+    if (
+      expected === undefined ||
+      expected <= 0 ||
+      actual === expected ||
+      actual < expected * 10
+    )
+      continue;
+    const ratio = actual / expected;
+    if (!Number.isInteger(ratio)) continue;
+    drafts.push({
+      detector: "locale_decimal_scale_shift",
+      title: `Localized amount was submitted ${ratio}× too large`,
+      severity: "critical",
+      score: DB_INVARIANT_SCORE + 3,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs:
+          offsetForEvent(exchange.res) ??
+          offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        message: `Locale ${locale} parses the submitted amount to ${expected} cents, but the client sent ${actual} cents and the server accepted it.`,
+      }),
+      dedupeKey: `localemoney:${locale}:${capturedUrlPath(exchange.url) ?? ""}`,
     });
   }
 }
