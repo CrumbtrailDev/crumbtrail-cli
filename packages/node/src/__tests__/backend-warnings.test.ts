@@ -77,15 +77,18 @@ describe("buildBackendWarningEvent", () => {
   });
 
   it("redacts a token-like value the runtime happened to print", () => {
+    const token = [
+      "sk",
+      "live",
+      "51H8xQ2eZvKYlo2CabcdefghijklmnopqrstuvwxYZ0123",
+    ].join("_");
     const event = buildBackendWarningEvent(
       warning(
         "DeprecationWarning",
-        "connection string sk_live_51H8xQ2eZvKYlo2CabcdefghijklmnopqrstuvwxYZ0123 is deprecated",
+        `connection string ${token} is deprecated`,
       ),
     );
-    expect(String(event.d.message)).not.toContain(
-      "sk_live_51H8xQ2eZvKYlo2CabcdefghijklmnopqrstuvwxYZ0123",
-    );
+    expect(String(event.d.message)).not.toContain(token);
   });
 });
 
