@@ -47,7 +47,7 @@ describe("createProject 402", () => {
   it("throws UpgradeRequiredError with copy + upgrade URL, no crash", async () => {
     const fetchImpl = vi.fn(async () =>
       jsonResponse(402, {
-        error: "The free tier includes one project. Upgrade to add more.",
+        error: "Your plan's project limit was reached. Upgrade to add more.",
         code: "upgrade_required",
         upgradeUrl: "https://cloud.example/dashboard?upgrade=team",
       }),

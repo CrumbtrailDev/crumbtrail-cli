@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "crumbtrail": {
+      "command": "npx",
+      "args": ["-p", "crumbtrail-node", "crumbtrail-server", "serve", "--mcp"]
+    }
+  }
+}
