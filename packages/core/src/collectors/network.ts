@@ -265,11 +265,15 @@ function applyFetchCorrelationHeaders(
 function bodyRedactionOptions(config: CrumbtrailConfig): {
   mode: "structured" | "full";
   denyFields?: string[];
+  keepFields?: string[];
 } {
   return {
     mode: config.redaction?.mode ?? "structured",
     ...(config.redaction?.denyFields
       ? { denyFields: config.redaction.denyFields }
+      : {}),
+    ...(config.redaction?.keepFields
+      ? { keepFields: config.redaction.keepFields }
       : {}),
   };
 }

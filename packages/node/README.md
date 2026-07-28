@@ -48,6 +48,7 @@ CRUMBTRAIL_PACKAGE_RUNTIME_PASS cli=dist/cli.cjs ...
 | `--static`              |                              unset | If set, path must exist and be a directory.                                                      | Optional static directory to serve alongside API/session routes.                                                                          |
 | `--allow-origin`        |             localhost origins only | Must be an `http` or `https` origin containing only scheme, host, and optional port. Repeatable. | Additional browser origins allowed by CORS.                                                                                               |
 | `--auth-token`          | unset (or `CRUMBTRAIL_AUTH_TOKEN`) | Presence is reported, but token content is never logged.                                         | Optional token required for `/api/*` routes. The `--auth-token` flag wins; otherwise a non-blank `CRUMBTRAIL_AUTH_TOKEN` env var is used. |
+| `--keep-field`          |     none (or `CRUMBTRAIL_KEEP_FIELDS`) | Comma separated or repeatable. Matched on the whole field name.                                  | Field names kept verbatim instead of redacted by name, in JSON bodies, `db.diff` rows, and query strings alike. Overrides only the built in name heuristics; value based detection still removes tokens, emails, and card numbers inside a kept field. Flags add to the env var. Printed at boot. |
 | `--mcp`                 |                            `false` | Boolean flag.                                                                                    | Run MCP server mode against the output directory instead of HTTP mode.                                                                    |
 | `--ai`                  |                            `false` | Boolean flag.                                                                                    | Opt into an LLM produced opinion after finalization.                                                                                      |
 | `--ai-model`            |                              unset | Parsed as an opaque model string.                                                                | Model override for the LLM produced opinion.                                                                                              |
@@ -257,6 +258,57 @@ sourced); `captureReads: true` opts into capped `db.read` row capture. The event
 `requestId` (= the request's trace id), so they land in the same evidence window, fill
 `primary_window.db_diffs` in the fix-context bundle, and feed session db differencing across
 all engines. Per-engine wiring examples: `docs/integrations/databases.md`.
+
+### Callsites: which line issued the write
+
+`captureCallsite: true` adds `callsite` to every `db.diff`: the innermost host frame plus the
+app frames above it (`{ file, line, column, fn, stack }`, repo-relative against
+`callsiteRoot`). The innermost frame alone is usually not the answer — in any app with a
+repository layer it names the same `insertOrder` helper for every defect that touches that
+table, while the line a fix has to change sits one or two frames up in the route handler. Both
+ends are reported rather than guessed at.
+
+Off by default: capturing a stack per query is not free. Library, runtime and instrumentation
+frames are excluded by path, so a linked checkout does not report the SDK's own internals as
+the host's code. With a repo binding (`CRUMBTRAIL_REPO` + `CRUMBTRAIL_COMMIT_SHA`, else the
+git remote and `HEAD`) the callsite also resolves to a GitHub permalink; without one it still
+works, which is why this is the only code pointer that holds on the self-host and file-store
+paths.
+
+```ts
+instrumentPgClient(pool, {
+  captureCallsite: true,
+  callsiteRoot: repoRoot,
+  emit: (event) => sendBackendEvent(event),
+});
+```
+
+### Read capture and query fan-out
+
+`captureReads: true` records SELECT results as capped, redacted `db.read` events. Each row is one
+event, and each event carries `d.stmt`, the 1-based ordinal of the SELECT within its request. That
+ordinal is what separates one SELECT returning fifty rows from fifty SELECTs returning one row —
+without it the two produce byte-identical evidence, and telling them apart is the whole point of an
+N+1 finding. The `n_plus_one_query` detector reads it; read caps bound the count, so a finding
+understates a large fan-out rather than overstating it.
+
+`captureBefore: true` records UPDATE pre-images, which the `lost_update` detector needs: it fires
+when a second writer's before-image still shows the value an earlier writer had already replaced
+and both computed the same new value. That is the only rule here that crosses request boundaries,
+because a lost update is made of two concurrent requests and a per-request rule can never see one.
+
+### Overlapping requests
+
+`response_race` names two requests to the same endpoint that overlapped and came back in the
+opposite order to the one they were sent in. Nothing has to fail for it to fire, which is the point:
+a search box that renders results for a query the user has already replaced produces two clean 200s
+and no other trace. Send order is read from capture order rather than from timestamps, because two
+fetches issued in one tick share a millisecond.
+
+It reports a race, not a defect. An application that discards responses no longer matching its
+current input emits the same events and is correct, so the finding states the ordering and leaves the
+conclusion to the reader. The two calls are identified by send offset rather than by URL, since the
+query string is both the part that differs and the part redaction removes.
 
 ## Headless job-run sessions
 

@@ -69,6 +69,46 @@ are redacted before an event enters the browser buffer. See
 `BROWSER_REDACTION_POLICY` and the `redact*` helpers if you want to inspect or
 tighten the policy.
 
+### Keeping a field the classifier would otherwise drop
+
+JSON request bodies go through a deny biased per value classifier: numbers and
+short enum like strings are kept, everything else is replaced by a shape
+placeholder. That is the right default and it is wrong for one specific case,
+which is when the text a user submitted **is** the defect. A stored XSS payload,
+a search term with a quote in it, an address line a validator wrongly rejects,
+a decimal comma amount: a hash of any of those tells an agent nothing.
+
+`redaction.keepFields` names those fields. It is matched on the whole field
+name, never as a substring, and it applies to JSON keys and query string
+parameters alike:
+
+```ts
+Crumbtrail.init({
+  redaction: { keepFields: ["body", "q", "postalCode"] },
+});
+```
+
+What a keep does and does not do:
+
+- It overrides the **built in name heuristics** only. Those match by substring
+  and have real false positives, so without an override an app whose schema
+  trips one (`auth` matches `author`, `pan` matches `panel`) cannot capture the
+  field at all.
+- It never disables **value based detection**. An email, a JWT, a card number,
+  a token, or a high entropy secret sitting in a kept field is still redacted.
+- Your own `denyFields` entry still wins over your keep for the same name.
+
+The capture server takes the same list, so a name kept in a `db.diff` row is
+also kept in the request body and query string that produced it:
+
+```bash
+crumbtrail-server serve --keep-field body,q,postalCode
+```
+
+`CRUMBTRAIL_KEEP_FIELDS` sets it from the environment; flags add to it rather
+than replacing it. The active list is printed at boot, because it is the one
+setting that makes the server store more than it did before.
+
 ## Production capture
 
 Page text, input values, keystrokes, clipboard content, DOM snapshots, and

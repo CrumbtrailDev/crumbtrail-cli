@@ -64,6 +64,7 @@ import {
   redactUrl,
   redactValue,
   type PayloadSummary,
+  setRedactionKeepFields,
 } from "./redaction";
 import { buildCaptureGapEvent } from "./capture-gap";
 import { buildMaskedDomSnapshot, maskText } from "./masking";
@@ -237,6 +238,11 @@ export class Crumbtrail {
       maskAllText: true,
       maskAllInputs: true,
     };
+
+    // Before any collector can emit: the URL and masking paths read this list
+    // from module scope rather than from config, because they are reached from
+    // places that never see a config object.
+    setRedactionKeepFields(config.redaction?.keepFields ?? []);
 
     // Non-browser guard (SSR, `next build`). init() is documented as a
     // module-scope call, so it runs during server render/build where `window`

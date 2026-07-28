@@ -103,6 +103,77 @@ describe("buildEvidenceCandidates — duplicate_write evidence", () => {
     });
   });
 
+  // A column the capture could not represent arrives as `{}` — a Buffer, a JSON
+  // column, a driver wrapper. That is the absence of an answer, not an answer,
+  // and the rows may well differ exactly there, so identity is unknown and the
+  // claim cannot be made. Distinct from a scalar null, which is a real value a
+  // nullable column legitimately holds.
+  it("stays silent when a substantive column was captured unrepresented", () => {
+    const events = [
+      insert(1000, "req-1", "webhook_deliveries", { id: 1 }, { id: 1, endpoint: "/hooks/pay", payload: {} }),
+      insert(1001, "req-1", "webhook_deliveries", { id: 2 }, { id: 2, endpoint: "/hooks/pay", payload: {} }),
+    ];
+
+    const candidates = buildEvidenceCandidates(events, { start: 900 });
+    expect(
+      candidates.filter((c) => c.detector === "duplicate_write"),
+    ).toHaveLength(0);
+  });
+
+  it("treats a scalar null as a real value rather than a capture gap", () => {
+    // Nullable columns are ordinary; refusing to judge whenever one is null
+    // would silence the detector across most real schemas.
+    const row = { order_id: 7, code: "SAVE10", redeemed_by: null };
+    const events = [
+      insert(1000, "req-1", "coupon_redemptions", { id: 1 }, { id: 1, ...row }),
+      insert(1001, "req-1", "coupon_redemptions", { id: 2 }, { id: 2, ...row }),
+    ];
+
+    const candidates = buildEvidenceCandidates(events, { start: 900 });
+    expect(
+      candidates.filter((c) => c.detector === "duplicate_write"),
+    ).toHaveLength(1);
+  });
+
+  // Timestamps are database-generated, exactly like the primary key, so they
+  // cannot be part of what makes two rows the same row. The live retry storm
+  // wrote its two redemptions inside one millisecond and fired; the identical
+  // storm one millisecond slower would not have, which makes the detector a
+  // coin flip on machine speed rather than on the defect.
+  it("fires on a genuine duplicate whose generated timestamps differ", () => {
+    const row = { order_id: 7, code: "SAVE10", amount_cents: 1000 };
+    const events = [
+      insert(1000, "req-1", "coupon_redemptions", { id: 1 }, { id: 1, ...row, created_at: "2026-07-28T06:33:43.835Z" }),
+      insert(1001, "req-1", "coupon_redemptions", { id: 2 }, { id: 2, ...row, created_at: "2026-07-28T06:33:43.836Z" }),
+    ];
+
+    const candidates = buildEvidenceCandidates(events, { start: 900 });
+    const dup = candidates.find((c) => c.detector === "duplicate_write");
+    expect(dup).toBeDefined();
+    // The timestamp is evidence a reader wants, but it is not what the claim
+    // rests on, so it must not appear among the compared columns.
+    expect(dup?.anchor.comparedColumns).not.toContain("created_at");
+    expect(dup?.anchor.comparedColumns).toEqual([
+      "amount_cents",
+      "code",
+      "order_id",
+    ]);
+  });
+
+  it("does not let a timestamp alone license a duplicate claim", () => {
+    // Once generated columns are out, a row whose only remaining column is a
+    // timestamp has nothing discriminating left, so the detector stays silent.
+    const events = [
+      insert(1000, "req-1", "pings", { id: 1 }, { id: 1, created_at: "2026-07-28T06:00:00.000Z" }),
+      insert(1001, "req-1", "pings", { id: 2 }, { id: 2, created_at: "2026-07-28T06:00:00.000Z" }),
+    ];
+
+    const candidates = buildEvidenceCandidates(events, { start: 900 });
+    expect(
+      candidates.filter((c) => c.detector === "duplicate_write"),
+    ).toHaveLength(0);
+  });
+
   it("does not group inserts made by different requests", () => {
     const row = { order_id: 7, code: "SAVE10", discount_cents: 1000 };
     const events = [

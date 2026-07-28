@@ -88,6 +88,45 @@ describe("performanceCollector", () => {
     expect(events[0].d.initiatorType).toBe("fetch");
   });
 
+  it("caps perf events per session and records the shedding as a capture gap", async () => {
+    // A page that polls or loops emits without bound. Observed for real at
+    // 10,299 entries in one session, which buried the network requests that
+    // were the actual evidence.
+    const performanceCollector = await loadCollector();
+    performanceCollector(bus, DEFAULT_CONFIG);
+
+    const resourceObserver = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "resource",
+    );
+    const entry = (i: number) => ({
+      entryType: "resource",
+      name: `https://example.com/api/poll/${i}`,
+      duration: 1,
+      transferSize: 1,
+      initiatorType: "fetch",
+    });
+
+    resourceObserver!.simulateEntries(
+      Array.from({ length: 1_200 }, (_, i) => entry(i)),
+    );
+    bus.flush();
+
+    const perf = events.filter((e) => e.k === "perf");
+    expect(perf).toHaveLength(1_000);
+
+    const gaps = events.filter((e) => e.k === "capture_gap");
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0].d.reason).toBe("scan_budget_exceeded");
+    expect(gaps[0].d.surface).toBe("browser");
+
+    // The gap is reported once, not once per shed entry, and observation stops.
+    resourceObserver!.simulateEntries([entry(9_999)]);
+    bus.flush();
+    expect(events.filter((e) => e.k === "capture_gap")).toHaveLength(1);
+    expect(events.filter((e) => e.k === "perf")).toHaveLength(1_000);
+    expect(resourceObserver!.disconnected).toBe(true);
+  });
+
   it("redacts query values from resource timing URLs", async () => {
     const performanceCollector = await loadCollector();
     performanceCollector(bus, DEFAULT_CONFIG);
