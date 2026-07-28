@@ -594,6 +594,8 @@ export function buildEvidenceCandidates(
   addDuplicateChargeCandidates(events, index, drafts);
   addMoneyScaleShiftCandidates(events, index, drafts);
   addCrossUserReadCandidates(events, index, drafts);
+  addDuplicateReadbackCandidates(events, index, drafts);
+  addOrphanedReferenceCandidates(events, index, drafts);
   addLostUpdateCandidates(events, index, drafts);
   addCounterContradictionCandidates(events, index, drafts);
   addNPlusOneCandidates(events, index, drafts);
@@ -3616,6 +3618,172 @@ function addCrossUserReadCandidates(
         source: normalizeDbEngine(event.d.engine),
       }),
       dedupeKey: `crossuser:${key}`,
+    });
+  }
+}
+
+/**
+ * duplicate_readback: two rows read back identical on every meaningful column.
+ *
+ * The live case: a fulfillment worker retried after a transient failure and
+ * inserted a second shipments row for order 1 — but the INSERT after images
+ * were captured thin ({id} only), so duplicate_write had nothing to compare.
+ * The read-back rows carry the full picture: two shipments rows, different
+ * primary keys, identical on order_id and status, differing only in pk and
+ * created_at. The claim mirrors duplicate_write's: identity needs an entity
+ * anchor, and generated columns (pk, timestamps) are excluded from the
+ * signature. Rows that differ in ANY captured business column — two
+ * order_items lines with different product_ids — never group.
+ */
+function addDuplicateReadbackCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const isGeneratedColumn = (key: string): boolean =>
+    /^id$|(^|_)(created_at|updated_at|inserted_at|timestamp|created|updated)$/i.test(key);
+  // table → signature → {pks, first event}
+  const byTable = new Map<
+    string,
+    Map<string, { pks: Set<string>; first: BugEvent; entries: Array<[string, unknown]> }>
+  >();
+  for (const event of events) {
+    if (event.k !== "db.read") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const row = isRecord(event.d.row) ? event.d.row : undefined;
+    if (!row) continue;
+    const pkCols = isRecord(event.d.pk) ? new Set(Object.keys(event.d.pk)) : new Set<string>();
+    const pkText = isRecord(event.d.pk) ? JSON.stringify(event.d.pk) : safeText(row.id, 60);
+    if (!pkText) continue;
+    const entries = Object.entries(row)
+      .filter(([key]) => !pkCols.has(key) && !isGeneratedColumn(key))
+      .sort(([a], [b]) => (a < b ? -1 : 1));
+    if (entries.length < 2) continue;
+    const signature = JSON.stringify(entries);
+    const signatures = byTable.get(table) ?? new Map();
+    const group = signatures.get(signature) ?? { pks: new Set<string>(), first: event, entries };
+    group.pks.add(pkText);
+    if (event.t < group.first.t) group.first = event;
+    signatures.set(signature, group);
+    byTable.set(table, signatures);
+  }
+
+  for (const [table, signatures] of byTable) {
+    for (const [signature, group] of signatures) {
+      if (group.pks.size < 2) continue;
+      // Same anchor rule as duplicate_write: some non-null, non-boolean column
+      // that is not mere row state must tie the rows to one business entity.
+      const hasEntityAnchor = group.entries.some(
+        ([key, value]) =>
+          value !== null &&
+          value !== undefined &&
+          value !== "" &&
+          typeof value !== "boolean" &&
+          !looksLikeStateColumn(key),
+      );
+      if (!hasEntityAnchor) continue;
+      const label = scrubText(table, 100) ?? "table";
+      const columns = group.entries.map(([key]) => key);
+      drafts.push({
+        detector: "duplicate_readback",
+        title: `Duplicate rows: ${group.pks.size} ${label} rows identical on every business column`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: group.first.t,
+          offsetMs:
+            offsetForEvent(group.first) ??
+            offsetFromStart(group.first.t, index.start),
+          route: routeAt(index.navs ?? [], group.first.t),
+          requestId: safeText(group.first.d.requestId, 200),
+          message: `${group.pks.size} distinct ${table} rows read back identical on ${columns.join(", ")} — different primary keys, same business content. One event produced ${group.pks.size} rows; on a fulfillment or settlement table that is a non-idempotent retry.`,
+          source: normalizeDbEngine(group.first.d.engine),
+        }),
+        dedupeKey: `dupreadback:${table}:${scrubText(signature, 200)}`,
+      });
+    }
+  }
+}
+
+/**
+ * orphaned_reference: a child row was written with a null reference to a
+ * parent that was created afterwards.
+ *
+ * The live case: the fulfillment worker's dependent writes were reordered, so
+ * inventory_ledger got its row with shipment_id = null and the shipments row
+ * appeared milliseconds LATER — the ledger row references nothing, forever.
+ * The domain-free signal is the write order: a null *_id column whose parent
+ * table (by name: shipment_id → shipments) receives an INSERT later in the
+ * same session. A nullable reference that stays null with no parent ever
+ * created is a data-model choice; a null reference whose parent shows up
+ * after the child was committed is an ordering bug.
+ */
+function addOrphanedReferenceCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const parentTablesOf = (column: string): string[] => {
+    const stem = column.replace(/_id$/i, "");
+    if (!stem || stem === column) return [];
+    return [stem, `${stem}s`, `${stem.replace(/y$/i, "ies")}`, `${stem}es`];
+  };
+  interface NullRef {
+    event: BugEvent;
+    table: string;
+    column: string;
+    parents: string[];
+  }
+  const nullRefs: NullRef[] = [];
+  const insertTimes = new Map<string, number[]>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    if (safeText(event.d.op, 20) !== "insert") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const times = insertTimes.get(table.toLowerCase()) ?? [];
+    times.push(event.t);
+    insertTimes.set(table.toLowerCase(), times);
+    const after = isRecord(event.d.after) ? event.d.after : undefined;
+    if (!after) continue;
+    for (const [column, value] of Object.entries(after)) {
+      if (value !== null) continue;
+      if (!/_id$/i.test(column)) continue;
+      const parents = parentTablesOf(column.toLowerCase());
+      if (parents.length === 0) continue;
+      nullRefs.push({ event, table, column, parents });
+    }
+  }
+
+  const seen = new Set<string>();
+  for (const ref of nullRefs) {
+    const parentTable = ref.parents.find((p) => insertTimes.has(p));
+    if (!parentTable) continue;
+    const laterInsert = (insertTimes.get(parentTable) ?? []).find(
+      (t) => t > ref.event.t,
+    );
+    if (laterInsert === undefined) continue;
+    const key = `${ref.table}:${ref.column}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    drafts.push({
+      detector: "orphaned_reference",
+      title: `Orphaned reference: ${ref.table}.${ref.column} written null before ${parentTable} existed`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: ref.event.t,
+        offsetMs:
+          offsetForEvent(ref.event) ?? offsetFromStart(ref.event.t, index.start),
+        route: routeAt(index.navs ?? [], ref.event.t),
+        requestId: safeText(ref.event.d.requestId, 200),
+        message: `${ref.table} was inserted with ${ref.column} = null, and a ${parentTable} row was created ${Math.round(laterInsert - ref.event.t)} ms AFTER it. The dependent writes ran in the wrong order, so this row references nothing — and unless something backfills it, it never will.`,
+        source: normalizeDbEngine(ref.event.d.engine),
+      }),
+      dedupeKey: `orphanref:${key}`,
     });
   }
 }
