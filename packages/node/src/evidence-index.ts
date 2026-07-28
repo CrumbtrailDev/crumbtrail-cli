@@ -1081,6 +1081,17 @@ function addResponseRaceCandidates(
         // different signal that the error detectors own.
         if (later.req.t > earlier.res.t) continue;
         if (!first.ok || !second.ok) continue;
+        // An out-of-order pair is only evidence when the user could tell the
+        // difference. Two byte-identical requests whose responses carry the
+        // same status and byte count render the same thing in either order —
+        // and interval pollers (build checks, heartbeats) overlap routinely,
+        // so without this check every polling endpoint tops the ranking.
+        if (
+          earlier.req.url !== undefined &&
+          earlier.req.url === later.req.url &&
+          responsesLookIdentical(earlier.res, later.res)
+        )
+          continue;
         const gapMs = Math.round(earlier.res.t - later.res.t);
         drafts.push({
           detector: "response_race",
@@ -1108,6 +1119,26 @@ function addResponseRaceCandidates(
       }
     }
   }
+}
+
+/**
+ * Whether two responses are indistinguishable to the page: same status and the
+ * same byte count. Bytes come from bodyMeta (post-capture) or the summary's
+ * originalLength; when neither response carries a size, the answer is false so
+ * the race stays reported — suppression needs positive evidence.
+ */
+function responsesLookIdentical(a: BugEvent, b: BugEvent): boolean {
+  const statusA = finiteNumber(a.d.st);
+  if (statusA === undefined || statusA !== finiteNumber(b.d.st)) return false;
+  const bytesOf = (event: BugEvent): number | undefined => {
+    const meta = event.d.bodyMeta;
+    const fromMeta = isRecord(meta) ? finiteNumber(meta.bytes) : undefined;
+    if (fromMeta !== undefined) return fromMeta;
+    const summary = event.d.bodySummary;
+    return isRecord(summary) ? finiteNumber(summary.originalLength) : undefined;
+  };
+  const bytesA = bytesOf(a);
+  return bytesA !== undefined && bytesA === bytesOf(b);
 }
 
 /** Path portion of a request URL, for grouping calls that differ only by query. */
@@ -3350,10 +3381,34 @@ function addNPlusOneCandidates(
     byTable.set(key, entry);
   }
 
+  // One candidate per table, not one per request. The same missing JOIN fires
+  // on every request that walks the same code path, and a session that paged
+  // through four screens would otherwise fill the entire top of the ranking
+  // with four copies of one finding — crowding out whatever else the session
+  // caught. The worst request anchors the claim; the rest become a count.
+  const worstPerTable = new Map<
+    string,
+    {
+      worst: { statements: Set<number>; first: BugEvent; requestId: string; table: string };
+      requests: number;
+    }
+  >();
   for (const entry of byTable.values()) {
-    const count = entry.statements.size;
-    if (count < N_PLUS_ONE_STATEMENT_THRESHOLD) continue;
-    const label = scrubText(bareTableName(entry.table), 100) ?? "table";
+    if (entry.statements.size < N_PLUS_ONE_STATEMENT_THRESHOLD) continue;
+    const agg = worstPerTable.get(entry.table);
+    if (!agg) {
+      worstPerTable.set(entry.table, { worst: entry, requests: 1 });
+    } else {
+      agg.requests += 1;
+      if (entry.statements.size > agg.worst.statements.size) agg.worst = entry;
+    }
+  }
+
+  for (const { worst, requests } of worstPerTable.values()) {
+    const count = worst.statements.size;
+    const label = scrubText(bareTableName(worst.table), 100) ?? "table";
+    const recurrence =
+      requests > 1 ? ` The same pattern ran in ${requests} requests this session.` : "";
     drafts.push({
       detector: "n_plus_one_query",
       title: `N+1 query: one request ran ${count} separate SELECTs against ${label}`,
@@ -3361,16 +3416,16 @@ function addNPlusOneCandidates(
       score: 78,
       confidence: "high",
       anchor: removeUndefined({
-        t: entry.first.t,
+        t: worst.first.t,
         offsetMs:
-          offsetForEvent(entry.first) ??
-          offsetFromStart(entry.first.t, index.start),
-        route: routeAt(index.navs ?? [], entry.first.t),
-        requestId: entry.requestId,
-        message: `${count} SELECT statements against ${label} in one request, one per row rather than one for all of them. Read caps bound this count, so the real fan-out may be larger.`,
-        source: normalizeDbEngine(entry.first.d.engine),
+          offsetForEvent(worst.first) ??
+          offsetFromStart(worst.first.t, index.start),
+        route: routeAt(index.navs ?? [], worst.first.t),
+        requestId: worst.requestId,
+        message: `${count} SELECT statements against ${label} in one request, one per row rather than one for all of them. Read caps bound this count, so the real fan-out may be larger.${recurrence}`,
+        source: normalizeDbEngine(worst.first.d.engine),
       }),
-      dedupeKey: `nplus1:${entry.requestId}:${entry.table}`,
+      dedupeKey: `nplus1:${worst.table}`,
     });
   }
 }
