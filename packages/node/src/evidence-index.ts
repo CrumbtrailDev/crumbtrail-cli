@@ -1190,9 +1190,21 @@ function addPaginationOffsetCandidates(
     for (const [name, value] of params) {
       const key = name.toLowerCase();
       if (CURSOR_PARAM_NAMES.has(key)) cursorStyle = true;
-      if (PAGE_PARAM_NAMES.has(key) && value !== "1" && value !== "0")
+      // Query values are routinely redacted at capture ("[REDACTED]"), so only
+      // a READABLE later-page value disproves first-page; an unreadable value
+      // proves nothing either way. The window guard above already excludes
+      // every aligned window a genuine later page would run (page N's offset
+      // is a multiple of limit, never 0 < offset < limit), so treating an
+      // unreadable value as unknown cannot admit legitimate paging.
+      if (
+        PAGE_PARAM_NAMES.has(key) &&
+        /^\d+$/.test(value) &&
+        value !== "1" &&
+        value !== "0"
+      )
         firstPage = false;
-      if (OFFSET_PARAM_NAMES.has(key) && value !== "0") firstPage = false;
+      if (OFFSET_PARAM_NAMES.has(key) && /^\d+$/.test(value) && value !== "0")
+        firstPage = false;
     }
     if (!firstPage || cursorStyle) continue;
 

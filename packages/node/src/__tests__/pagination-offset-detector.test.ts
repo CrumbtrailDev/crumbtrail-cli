@@ -105,6 +105,26 @@ describe("pagination_first_page_offset", () => {
     expect(detections(events)).toHaveLength(0);
   });
 
+  it("fires when the page value was redacted at capture", () => {
+    // URL query values are routinely scrubbed to "[REDACTED]" before the
+    // detector ever sees them. An unreadable value proves nothing about which
+    // page was requested, and a genuine later page cannot produce
+    // 0 < offset < limit anyway — so redaction must not silence the finding.
+    const events = [
+      req("r1", 100, "http://x/api/products?page=%5BREDACTED%5D&limit=50"),
+      read("r1", 120, { limit: 50, offset: 1 }),
+    ];
+    expect(detections(events)).toHaveLength(1);
+  });
+
+  it("still trusts a readable later-page value", () => {
+    const events = [
+      req("r1", 100, "http://x/api/products?page=3"),
+      read("r1", 120, { limit: 12, offset: 1 }),
+    ];
+    expect(detections(events)).toHaveLength(0);
+  });
+
   it("skips cursor-paged requests whose window is not derivable", () => {
     const events = [
       req("r1", 100, "http://x/api/products?cursor=abc"),
