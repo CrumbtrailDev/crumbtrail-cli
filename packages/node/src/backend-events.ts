@@ -1,4 +1,5 @@
 import type { BugEvent, RedactionMetadata } from "crumbtrail-core";
+import { appFramesFromStack, type DbCallsite } from "./db/callsite";
 import {
   CRUMBTRAIL_REQUEST_HEADER_LOWER as CORE_CRUMBTRAIL_REQUEST_HEADER,
   CRUMBTRAIL_SESSION_HEADER_LOWER as CORE_CRUMBTRAIL_SESSION_HEADER,
@@ -103,8 +104,17 @@ interface SanitizedError {
   message: string;
   code?: string;
   statusCode?: number;
+  /**
+   * Where the host application threw, innermost first. Structured frames only
+   * (file, line, column, function) — the raw stack string never rests, so a
+   * value that arrives on a `stack` property cannot leak through this field.
+   */
+  frames?: DbCallsite[];
   metadata?: RedactionMetadata;
 }
+
+/** How many app frames of a thrown error to keep. */
+const MAX_ERROR_FRAMES = 4;
 
 export function buildBackendRequestStartEvent(
   input: BackendRequestEventInput,
@@ -416,11 +426,21 @@ function sanitizeError(error: unknown): SanitizedError {
     code?.metadata,
   );
 
+  // Parsed from the thrown error's own stack, which names where the fault is,
+  // not the middleware that caught it. Library and runtime frames are dropped
+  // by the shared walk, so an error thrown entirely inside a dependency
+  // contributes nothing and the field is omitted rather than empty.
+  const frames =
+    typeof errorRecord?.stack === "string"
+      ? appFramesFromStack(errorRecord.stack, process.cwd(), MAX_ERROR_FRAMES)
+      : [];
+
   return {
     name: name.value || "Error",
     message: message.value || "Error",
     ...(code?.value ? { code: code.value } : {}),
     ...(Number.isFinite(statusCode) ? { statusCode } : {}),
+    ...(frames.length > 0 ? { frames } : {}),
     ...(metadata ? { metadata } : {}),
   };
 }

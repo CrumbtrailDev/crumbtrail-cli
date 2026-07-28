@@ -992,6 +992,8 @@ describe("stop() delivery ordering", () => {
     releaseSend();
     await stopping;
     expect(order.indexOf("send:done")).toBeGreaterThanOrEqual(0);
-    expect(order.indexOf("endSession")).toBeGreaterThan(order.indexOf("send:done"));
+    expect(order.indexOf("endSession")).toBeGreaterThan(
+      order.indexOf("send:done"),
+    );
   });
 });

@@ -7,6 +7,7 @@ import {
   type DbDiffOp,
   type DbEngine,
 } from "crumbtrail-core";
+import { captureDbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import { buildDbDiffEvent } from "./diff-event";
 import { buildDbReadBulkEvent, buildDbReadEvent } from "./read-event";
@@ -47,6 +48,13 @@ export interface InstrumentDbClientOptions {
   captureReads?: boolean;
   /** Extra sensitive column names dropped on top of the defaults. */
   redactColumns?: readonly string[];
+  /**
+   * Capture the host application callsite (file, line) that issued each write and
+   * ride it along on the `db.diff`. Off by default: this costs one stack capture
+   * per mutating query. Set `callsiteRoot` to make the path repo-relative.
+   */
+  captureCallsite?: boolean;
+  callsiteRoot?: string;
   /** Primary-key columns per table; defaults to `['id']` for unlisted tables. */
   pkColumns?: Record<string, readonly string[]>;
   /** Maximum per-row `db.diff` events to emit for one statement before adding a bulk summary. */
@@ -300,6 +308,9 @@ export function emitDbDiffEvents(input: {
       requestId,
       sessionId: options.sessionId,
       redactColumns: options.redactColumns,
+      callsite: options.captureCallsite
+        ? captureDbCallsite(options.callsiteRoot)
+        : undefined,
       now: options.now?.(),
       sessionStartedAt: options.sessionStartedAt,
       ...(op === "delete"
@@ -365,6 +376,9 @@ export function emitImagelessDbDiff(input: {
         requestId,
         sessionId: options.sessionId,
         redactColumns: options.redactColumns,
+        callsite: options.captureCallsite
+          ? captureDbCallsite(options.callsiteRoot)
+          : undefined,
         now: options.now?.(),
         sessionStartedAt: options.sessionStartedAt,
       }),
@@ -406,9 +420,23 @@ export function emitDbReadEvents(input: {
   rowCount: number;
   options: InstrumentDbClientOptions;
   emittedReadRowsByRequest: Map<string, number>;
+  /**
+   * Per-request SELECT counter, shared with the caller so every statement in a
+   * request gets a distinct ordinal. Rows are emitted one event each, so this
+   * is the only thing separating N single-row SELECTs from one N-row SELECT.
+   */
+  readStatementsByRequest?: Map<string, number>;
+  /** Resolved LIMIT/OFFSET the statement ran with, when the adapter parsed one. */
+  queryShape?: { limit?: number; offset?: number };
 }): void {
   const { engine, table, requestId, rows, rowCount, options } = input;
   const emittedReadRowsByRequest = input.emittedReadRowsByRequest;
+  const readStatementsByRequest = input.readStatementsByRequest;
+  let stmt: number | undefined;
+  if (readStatementsByRequest) {
+    stmt = (readStatementsByRequest.get(requestId) ?? 0) + 1;
+    readStatementsByRequest.set(requestId, stmt);
+  }
   const perStatementCap = normalizeReadCap(
     options.maxReadRowsPerStatement,
     DEFAULT_MAX_READ_ROWS_PER_STATEMENT,
@@ -441,6 +469,8 @@ export function emitDbReadEvents(input: {
           pk,
           row,
           requestId,
+          ...(stmt !== undefined ? { stmt } : {}),
+          queryShape: input.queryShape,
           sessionId: options.sessionId,
           redactColumns: options.redactColumns,
           now: options.now?.(),
