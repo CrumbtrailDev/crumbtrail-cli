@@ -90,6 +90,49 @@ describe("db_client_supplied_value", () => {
     expect(find(events, "db_client_supplied_value")).toHaveLength(0);
   });
 
+  it("flags a fractional cent value rounded into an integer cents column", () => {
+    const events = [
+      req(1100, "req-checkout", {
+        userId: 1,
+        total: 21541.75,
+        items: [{ productId: 1, qty: 1 }],
+      }),
+      diff(1200, "req-checkout", "insert", "orders", { id: 1 }, {
+        id: 1,
+        total_cents: 21542,
+      }),
+    ];
+
+    const found = find(events, "fractional_cent_rounding");
+    expect(found).toHaveLength(1);
+    expect(found[0].severity).toBe("high");
+    expect(found[0].confidence).toBe("high");
+    expect(found[0].title).toContain("total=21541.75");
+    expect(found[0].title).toContain("orders.total_cents=21542");
+  });
+
+  it("does not call an ordinary integer client value fractional", () => {
+    const events = [
+      req(1100, "req-checkout", { total: 21542 }),
+      diff(1200, "req-checkout", "insert", "orders", { id: 1 }, {
+        id: 1,
+        total_cents: 21542,
+      }),
+    ];
+    expect(find(events, "fractional_cent_rounding")).toHaveLength(0);
+  });
+
+  it("does not infer a cent bug for a non-money request field", () => {
+    const events = [
+      req(1100, "req-checkout", { quantity: 21541.75 }),
+      diff(1200, "req-checkout", "insert", "orders", { id: 1 }, {
+        id: 1,
+        total_cents: 21542,
+      }),
+    ];
+    expect(find(events, "fractional_cent_rounding")).toHaveLength(0);
+  });
+
   it("ignores non-money fields the client is supposed to choose", () => {
     // productId and qty coming from the client is the entire point of a cart.
     // Only money is a trust-boundary violation worth a high-severity signal.

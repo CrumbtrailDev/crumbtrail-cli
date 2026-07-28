@@ -2975,7 +2975,37 @@ function addClientSuppliedValueCandidates(
         if (value === undefined) continue;
         if (Math.abs(value) < MIN_CLIENT_SUPPLIED_VALUE) continue;
         const bodyPath = clientNumbers.get(value);
-        if (bodyPath === undefined) continue;
+        if (bodyPath === undefined) {
+          const roundedClientValue = [...clientNumbers.entries()].find(
+            ([clientValue, clientPath]) =>
+              !Number.isInteger(clientValue) &&
+              Math.round(clientValue) === value &&
+              field.toLowerCase().endsWith("_cents") &&
+              looksLikeMoneyField(clientPath),
+          );
+          if (!roundedClientValue) continue;
+          const [clientValue, clientPath] = roundedClientValue;
+          drafts.push({
+            detector: "fractional_cent_rounding",
+            title: `Fractional cents rounded at persistence: request body ${clientPath}=${clientValue} became ${table}.${field}=${value}`,
+            severity: "high",
+            score: DB_INVARIANT_SCORE,
+            confidence: "high",
+            anchor: removeUndefined({
+              t: diff.t,
+              offsetMs:
+                offsetForEvent(diff) ??
+                offsetFromStart(diff.t, index.start),
+              route: routeAt(index.navs ?? [], diff.t),
+              requestId,
+              message:
+                `${request.method} ${request.url ?? ""} sent the non-integer cent value ${clientPath}=${clientValue}; ${table}.${field} stored Math.round(${clientValue})=${value} (request ${requestId})`.trim(),
+              source: normalizeDbEngine(diff.d.engine),
+            }),
+            dedupeKey: `fractionalcents:${requestId}:${table}:${field}`,
+          });
+          continue;
+        }
 
         drafts.push({
           detector: "db_client_supplied_value",
