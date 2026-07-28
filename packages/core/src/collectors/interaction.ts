@@ -194,14 +194,36 @@ export function interactionCollector(
   ) => {
     const timer = setTimeout(() => {
       observationTimers.delete(timer);
-      if (!target.isConnected) return;
-      if ((inputVersions.get(target) ?? 0) !== version) return;
-      if (target.value === expectedValue) return;
+      let observed = target;
+      if (!observed.isConnected) {
+        // Frameworks often express a failed-submit reset by remounting the
+        // entire form. Find the replacement control by stable, non-value
+        // attributes so that a remount does not erase the observation too.
+        const name = target.getAttribute("name");
+        const id = target.getAttribute("id");
+        if (name || id) {
+          observed = Array.from(
+            document.querySelectorAll<
+              HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
+            >("input, textarea, select"),
+          ).find(
+            (candidate) =>
+              candidate.tagName === target.tagName &&
+              candidate.getAttribute("type") === target.getAttribute("type") &&
+              (name
+                ? candidate.getAttribute("name") === name
+                : candidate.getAttribute("id") === id),
+          ) ?? target;
+        }
+      } else if ((inputVersions.get(observed) ?? 0) !== version) {
+        return;
+      }
+      if (!observed.isConnected || observed.value === expectedValue) return;
       // React and browser autofill commonly assign the value property without
       // dispatching an input event. Emit a privacy scrubbed state observation
       // so a detector can distinguish the app taking a value back from the
       // user's own next keystroke.
-      emitInputState(target, "state", false);
+      emitInputState(observed, "state", false);
     }, delayMs);
     observationTimers.add(timer);
   };
