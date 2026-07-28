@@ -326,6 +326,39 @@ because nothing failed. A sequential retry after a failure is the client behavin
 excluded, as is any body carrying a redaction marker, since redaction can collapse distinct payloads
 into one signature.
 
+### Database invariants
+
+A set of detectors reads `db.diff` and `db.read` events for claims that need no knowledge of the
+application, only of what data never legitimately does:
+
+- `interpolation_artifact` — persisted text carrying a template value that never resolved: a
+  word-bounded `undefined` or `NaN`, `[object Object]`, or an unrendered `{{name}}`/`${name}`.
+  A notification row storing "Hi undefined, your order #1 was cancelled" inserts cleanly, mails
+  cleanly, and returns 200 everywhere; the defect is visible only in the value itself.
+- `state_flip_flop` — a string lifecycle column (`status`, `state`, `phase`, `stage`) that was
+  held, left, and reached again on one row. Whatever the intended state machine, a status that
+  goes `placed → delivered → placed` is an invalid transition or two writers fighting. Boolean
+  and toggle columns are excluded, since a user flipping a switch twice is `A → B → A` by design.
+- `duplicate_charge` — two settled rows for one business reference and one amount. The grouping
+  key is one transaction-reference column at a time (never the composite), because the row that
+  duplicates a charge legitimately differs in its gateway-assigned id. Actor columns (`user_id`)
+  are excluded: the same customer paying the same amount twice for two orders is commerce.
+- `money_scale_shift` — a money column that moved by exactly 100x or 10000x in a single UPDATE,
+  the fingerprint of a cents/dollars conversion applied once too often or too rarely.
+- `cross_user_read` — a request served one user a row owned by another. The active user comes only
+  from writes on a sessions-shaped table, so anonymous flows and token-auth admin consoles never
+  establish one and stay silent.
+- `duplicate_readback` — two rows read back identical on every business column (generated columns
+  excluded, entity anchor required): the read-plane proof of a non-idempotent retry when the
+  INSERT after-images were captured too thin for `duplicate_write` to compare.
+- `orphaned_reference` — a child row committed with a null `*_id` whose parent table receives its
+  INSERT afterwards. A nullable reference that stays null is a data-model choice; a null reference
+  whose parent shows up after the child was committed is dependent writes run in the wrong order.
+
+Each of these fires on the stored data alone, so it works even when the application logs nothing —
+and each states the evidence it rests on (the columns compared, both user ids, the value chain) so
+a reader verifies rather than trusts.
+
 ### Runtime warnings
 
 The Express middleware (like `autoCapture` before it) subscribes to `process.on("warning")` and
