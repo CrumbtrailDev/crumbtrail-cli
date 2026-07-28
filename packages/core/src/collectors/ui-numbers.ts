@@ -22,6 +22,15 @@ import { subscribeNavCommit } from "../nav-signal";
 
 /** DOM settle debounce for mutation-triggered scans. */
 export const UI_NUM_SETTLE_MS = 500;
+/**
+ * Ceiling on settle deferral. A page that mutates faster than the settle
+ * window forever — a stock ticker, an SSE feed, an animation loop — would
+ * otherwise re-arm the debounce on every mutation and the scan would starve,
+ * which blinds this collector on exactly the pages where live numbers are the
+ * evidence. Once deferral has lasted this long, the next schedule runs the
+ * scan immediately instead of waiting for quiet that never comes.
+ */
+export const UI_NUM_MAX_WAIT_MS = 1500;
 /** Hard cap on labeled tokens per region snapshot. */
 export const UI_NUM_MAX_ITEMS = 50;
 /** Labels longer than this are ignored (they are prose, not labels). */
@@ -416,6 +425,8 @@ function startUiNumbersCollector(
   let disabled = false;
   let layoutPending = true;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  // When the current run of deferrals began; undefined between bursts.
+  let deferredSince: number | undefined;
   // Previous serialized snapshot per region: emit only on change.
   const lastSnapshot = new Map<string, string>();
   let observer: MutationObserver | undefined;
@@ -456,6 +467,7 @@ function startUiNumbersCollector(
 
   const runScan = (): void => {
     if (disabled) return;
+    deferredSince = undefined;
     // Layout is measured once per navigation, not once per DOM settle: it
     // describes the view, and a mutation-driven rescan would repeat it.
     if (layoutPending) {
@@ -494,8 +506,14 @@ function startUiNumbersCollector(
 
   const scheduleScan = (): void => {
     if (disabled) return;
+    const at = now();
+    if (deferredSince === undefined) deferredSince = at;
     if (settleTimer !== undefined) clearTimeout(settleTimer);
-    settleTimer = setTimeout(runScan, UI_NUM_SETTLE_MS);
+    // Deferral ceiling: under continuous mutation (a ticker, a stream) the
+    // settle window re-arms forever, so once deferral has lasted
+    // UI_NUM_MAX_WAIT_MS the scan runs now instead of waiting for quiet.
+    const wait = at - deferredSince >= UI_NUM_MAX_WAIT_MS ? 0 : UI_NUM_SETTLE_MS;
+    settleTimer = setTimeout(runScan, wait);
   };
 
   try {

@@ -168,6 +168,34 @@ describe("uiNumbersCollector", () => {
     });
   });
 
+  it("scans a page that never settles once deferral hits the ceiling", async () => {
+    // A live page (stock ticker, SSE feed) can mutate faster than
+    // UI_NUM_SETTLE_MS forever. Every mutation re-arms the debounce, so
+    // without the deferral ceiling the scan starves and the collector emits
+    // nothing on exactly the pages where live numbers are the evidence.
+    document.body.innerHTML = `
+      <dl class="totals">
+        <dt>Total</dt><dd id="tick">$199.00</dd>
+      </dl>`;
+    // Date joins the fake clock so the collector's deferral arithmetic moves
+    // with advanceTimersByTime instead of real wall time.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+
+    // 8 mutations at 400ms spacing: the settle window (500ms) never elapses
+    // quietly, but total deferral (3200ms) crosses UI_NUM_MAX_WAIT_MS.
+    for (let i = 0; i < 8; i += 1) {
+      document.getElementById("tick")!.textContent = `$${199 + i}.00`;
+      await flushObserverDelivery();
+      vi.advanceTimersByTime(400);
+    }
+    bus.flush();
+
+    expect(uiNumEvents(events).length).toBeGreaterThanOrEqual(1);
+  });
+
   it("caps a region snapshot at 50 items", async () => {
     const rows = Array.from(
       { length: 60 },
