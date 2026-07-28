@@ -204,6 +204,15 @@ export class Crumbtrail {
   private samplingGapEmitted = false;
   private baselineSampled: boolean;
   private sessionStarted = false;
+  /**
+   * Event batches handed to the transport whose POST has not yet settled.
+   * stop() awaits these before ending the session: /api/session/end finalizes
+   * the server's append log, and a batch that loses that race arrives after
+   * finalization and vanishes. On a fast flow (an automated driver, a user
+   * closing the tab right after the failing click) the losing batch is exactly
+   * the one carrying the defect's interaction and request.
+   */
+  private pendingSends = new Set<Promise<void>>();
   private sessionMetadataWrite: Promise<void> = Promise.resolve();
   private stopped = false;
   private identity: CrumbtrailIdentity = {};
@@ -323,8 +332,11 @@ export class Crumbtrail {
       const persistable = events.filter((event) =>
         instance.shouldPersistEvent(event),
       );
-      if (persistable.length > 0)
-        transport.sendEvents(persistable).catch(() => {});
+      if (persistable.length > 0) {
+        const send = transport.sendEvents(persistable).catch(() => {});
+        instance.pendingSends.add(send);
+        void send.then(() => instance.pendingSends.delete(send));
+      }
     });
 
     // Feed events into ring buffer
@@ -1065,6 +1077,14 @@ export class Crumbtrail {
   }
 
   async stop(): Promise<{ sessionId: string }> {
+    // Ship everything captured up to this instant BEFORE tearing down.
+    // shouldPersistEvent consults canTransport(), which is false once
+    // `stopped` is set — so a flush that runs after the flag would hand the
+    // final batch to a subscriber that drops every event in it. That batch is
+    // the last flush-interval of the session: on a fast flow it holds the
+    // failing click and its request, the exact evidence the session exists
+    // to keep.
+    this.bus.flush();
     this.stopped = true;
     if (this.widgetCleanup) this.widgetCleanup();
     this.autoFlagCleanup?.();
@@ -1076,7 +1096,12 @@ export class Crumbtrail {
     this.stateProviders.clear();
     this.bus.stop();
     this.ringBuffer.clear();
-    if (this.sessionStarted) await this.transport.endSession(this.sessionId);
+    if (this.sessionStarted) {
+      // bus.stop() just flushed the final batch into the transport; every
+      // in-flight POST must land before end-of-session finalizes the log.
+      await Promise.allSettled([...this.pendingSends]);
+      await this.transport.endSession(this.sessionId);
+    }
     return { sessionId: this.sessionId };
   }
 }
