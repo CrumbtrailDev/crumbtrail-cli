@@ -63,6 +63,22 @@ describe("locale-sensitive input invariants", () => {
     expect(found).toContain("locale_decimal_scale_shift");
   });
 
+  it("uses redacted input shape without recovering the raw amount", () => {
+    const found = detectors([
+      request(10, "r1", "POST", "/api/addresses/store-credit", {
+        amountCents: 19_900,
+        raw: {
+          $redacted: "[REDACTED]",
+          len: 4,
+          charset: "mixed",
+        },
+        locale: "de-DE",
+      }),
+      jsonResponse(20, "r1", { ok: true, appliedCents: 19_900 }),
+    ]);
+    expect(found).toContain("locale_decimal_scale_shift");
+  });
+
   it("accepts a correctly parsed decimal-comma amount", () => {
     const found = detectors([
       request(10, "r1", "POST", "/api/addresses/store-credit", {
