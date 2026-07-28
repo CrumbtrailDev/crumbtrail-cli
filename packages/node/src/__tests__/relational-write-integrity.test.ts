@@ -246,4 +246,110 @@ describe("relational write integrity", () => {
       ]),
     ).not.toContain("batch_applied_count_exceeds_staged_rows");
   });
+
+  it("flags repeated entity mutations with only an unrelated batch audit", () => {
+    expect(
+      detectors([
+        diff(
+          100,
+          "bulk-1",
+          "update",
+          "products",
+          7,
+          { id: 7, price_cents: 7900 },
+          { id: 7, price_cents: 8100 },
+        ),
+        diff(
+          110,
+          "bulk-1",
+          "update",
+          "products",
+          6,
+          { id: 6, price_cents: 5900 },
+          { id: 6, price_cents: 6100 },
+        ),
+        diff(120, "bulk-1", "insert", "audit_log", 1, undefined, {
+          id: 1,
+          entity: "reprice_batches",
+          entity_id: 1,
+          action: "completed",
+        }),
+      ]),
+    ).toContain("mutations_missing_entity_audit");
+  });
+
+  it("accepts repeated mutations with a matching entity audit", () => {
+    expect(
+      detectors([
+        diff(
+          100,
+          "bulk-1",
+          "update",
+          "products",
+          7,
+          { id: 7, price_cents: 7900 },
+          { id: 7, price_cents: 8100 },
+        ),
+        diff(
+          110,
+          "bulk-1",
+          "update",
+          "products",
+          6,
+          { id: 6, price_cents: 5900 },
+          { id: 6, price_cents: 6100 },
+        ),
+        diff(120, "bulk-1", "insert", "audit_log", 1, undefined, {
+          id: 1,
+          entity: "products",
+          entity_id: 7,
+          action: "price-change",
+        }),
+      ]),
+    ).not.toContain("mutations_missing_entity_audit");
+  });
+
+  it("flags a report total that contradicts its referenced source row", () => {
+    expect(
+      detectors([
+        diff(
+          100,
+          "refund-1",
+          "update",
+          "orders",
+          1,
+          { id: 1, total_cents: 35_700 },
+          { id: 1, total_cents: 35_200 },
+        ),
+        diff(200, "report-1", "insert", "ops_reports", 1, undefined, {
+          id: 1,
+          kind: "order-totals",
+          total_cents: 35_700,
+          note: "order=1",
+        }),
+      ]),
+    ).toContain("report_total_contradicts_source_row");
+  });
+
+  it("accepts a report total that matches its referenced source row", () => {
+    expect(
+      detectors([
+        diff(
+          100,
+          "refund-1",
+          "update",
+          "orders",
+          1,
+          { id: 1, total_cents: 35_700 },
+          { id: 1, total_cents: 35_200 },
+        ),
+        diff(200, "report-1", "insert", "ops_reports", 1, undefined, {
+          id: 1,
+          kind: "order-totals",
+          total_cents: 35_200,
+          note: "order=1",
+        }),
+      ]),
+    ).not.toContain("report_total_contradicts_source_row");
+  });
 });
