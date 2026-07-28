@@ -5314,17 +5314,78 @@ function addLayoutOverflowCandidates(
 
 /** How long after a navigation the view's data call is expected to start. */
 const STALE_VIEW_REACTION_MS = 2_000;
+/**
+ * How far BEFORE a navigation event its own data call may sit and still belong
+ * to it.
+ *
+ * Routers do not commit first and fetch second. A handler typically starts the
+ * fetch and then calls `pushState`, so a live session reads
+ * `net.req /api/search?q=sonar&category=audio` at T and
+ * `nav push /search?q=sonar&category=audio` at T+100. An earlier revision
+ * required the request to land strictly AFTER the nav event and therefore
+ * concluded the view had never been shown to react at all, which silenced the
+ * detector on the exact signature it exists to catch.
+ */
+const STALE_VIEW_REACTION_LEAD_MS = 750;
+/**
+ * The same allowance on the pop side, deliberately much smaller.
+ *
+ * On this side a nearby request is a reason to STAY SILENT, so a generous
+ * lookback suppresses real findings: a call issued a second before the user
+ * pressed back was serving the previous state and says nothing about whether
+ * the pop was handled. 250 ms covers only a pop whose own fetch raced its nav
+ * event, which is the one case a lookback is here to forgive.
+ */
+const STALE_VIEW_POP_LEAD_MS = 250;
 const STALE_VIEW_SCORE = 78;
+
+/**
+ * Whether an API request plausibly serves a navigation, judged on their query
+ * strings.
+ *
+ * One shared parameter is enough — a route's `?q=sonar&category=audio` and its
+ * call's `/api/search?q=sonar&category=audio` agree on both, and a route that
+ * carries a `page` its API spells differently still agrees on the rest.
+ * Deliberately permissive in the other direction: when either side carries no
+ * query at all, or a value was redacted away, there is nothing to disagree
+ * about, so this must not veto.
+ */
+function navigationQueryRelated(
+  navUrl: URL,
+  requestUrl: string | undefined,
+): boolean {
+  const request = parseCapturedUrl(requestUrl);
+  if (!request) return true;
+  const navPairs = [...navUrl.searchParams];
+  const requestPairs = [...request.searchParams];
+  if (navPairs.length === 0 || requestPairs.length === 0) return true;
+  return navPairs.some(([name, value]) =>
+    requestPairs.some(([otherName, otherValue]) => {
+      if (normalizeFieldName(name) !== normalizeFieldName(otherName))
+        return false;
+      // A redacted value on either side is an unknown, not a disagreement.
+      if (isRedactedValue(value) || isRedactedValue(otherValue)) return true;
+      return value === otherValue;
+    }),
+  );
+}
 
 /**
  * stale_view_after_pop: the back button changed the URL and nothing else.
  *
- * The same page had already proved it reacts to a parameter change — an earlier
- * navigation to this path with different parameters was followed straight away
- * by a data call. Then the user pressed back, the URL changed again, and no call
- * followed. The address bar and the screen now disagree, and the app reports
- * nothing at all: this is the one navigation class where the router is doing its
- * job and the view is not.
+ * The same page had already proved it reacts to a parameter change — a
+ * navigation to this path with different parameters had a data call around it.
+ * Then the user pressed back, the URL changed again, and no call followed. The
+ * address bar and the screen now disagree, and the app reports nothing at all:
+ * this is the one navigation class where the router is doing its job and the
+ * view is not.
+ *
+ * The two windows are asymmetric on purpose, because finding a request means
+ * opposite things on the two sides. On the reactive side a request is what
+ * establishes the precondition, so the window reaches back far enough to catch
+ * a fetch that beat its own `pushState`. On the pop side a request is what
+ * withdraws the claim, so the window reaches back only far enough to forgive
+ * the same race, and no further.
  */
 function addStaleViewAfterPopCandidates(
   events: BugEvent[],
@@ -5350,14 +5411,37 @@ function addStaleViewAfterPopCandidates(
     );
   if (navs.length < 2) return;
 
-  const apiRequestTimes = events
-    .filter((event) => event.k === "net.req" && looksLikeApiRequest(safeText(event.d.url, 400)))
-    .map((event) => event.t)
-    .sort((a, b) => a - b);
+  const apiRequests = events
+    .filter(
+      (event) =>
+        event.k === "net.req" &&
+        looksLikeApiRequest(safeText(event.d.url, 400)),
+    )
+    .map((event) => ({ t: event.t, url: safeText(event.d.url, 400) }))
+    .sort((a, b) => a.t - b.t);
 
-  const reactedWithin = (start: number): boolean =>
-    apiRequestTimes.some(
-      (t) => t > start && t <= start + STALE_VIEW_REACTION_MS,
+  /**
+   * A data call this navigation plausibly caused: inside the window around the
+   * nav commit, and sharing something with the nav's own query string.
+   */
+  const provedReactionTo = (navAt: number, navUrl: URL): boolean =>
+    apiRequests.some(
+      (request) =>
+        request.t >= navAt - STALE_VIEW_REACTION_LEAD_MS &&
+        request.t <= navAt + STALE_VIEW_REACTION_MS &&
+        navigationQueryRelated(navUrl, request.url),
+    );
+
+  /**
+   * Any data call near the pop. Deliberately blind to the query string: on this
+   * side a request withdraws the claim, and refusing to count one because its
+   * parameters look unrelated would manufacture findings.
+   */
+  const anyRequestAroundPop = (popAt: number): boolean =>
+    apiRequests.some(
+      (request) =>
+        request.t >= popAt - STALE_VIEW_POP_LEAD_MS &&
+        request.t <= popAt + STALE_VIEW_REACTION_MS,
     );
 
   for (let i = 1; i < navs.length; i += 1) {
@@ -5380,10 +5464,10 @@ function addStaleViewAfterPopCandidates(
       if (!url) return false;
       if (url.pathname !== popUrl.pathname) return false;
       if (url.search === popUrl.search) return false;
-      return reactedWithin(earlier.event.t);
+      return provedReactionTo(earlier.event.t, url);
     });
     if (!provedReactive) continue;
-    if (reactedWithin(pop.event.t)) continue;
+    if (anyRequestAroundPop(pop.event.t)) continue;
 
     drafts.push({
       detector: "stale_view_after_pop",

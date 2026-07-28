@@ -113,4 +113,67 @@ describe("stale_view_after_pop", () => {
     ]);
     expect(found).toContain("stale_view_after_pop");
   });
+
+  describe("a fetch that beats its own pushState", () => {
+    /**
+     * The live-session ordering, verbatim. The handler starts the fetch and
+     * THEN commits the history entry, so the reactive request is recorded 100 ms
+     * BEFORE the nav event it belongs to. A strictly-after precondition read
+     * that as "this view was never shown to react" and stayed silent on the
+     * textbook signature.
+     */
+    const search = [
+      nav(1_000, "/search?q=sonar", "init"),
+      apiCall(1_900, "/api/search?q=sonar&category=audio"),
+      nav(2_000, "/search?q=sonar&category=audio", "push"),
+    ];
+
+    it("counts a request that lands just before the nav it caused", () => {
+      const found = detectors([
+        ...search,
+        nav(3_000, "/search?q=sonar", "pop"),
+      ]);
+      expect(found).toContain("stale_view_after_pop");
+    });
+
+    it("stays silent when the pop is followed by a refetch", () => {
+      const found = detectors([
+        ...search,
+        nav(3_000, "/search?q=sonar", "pop"),
+        apiCall(3_150, "/api/search?q=sonar"),
+      ]);
+      expect(found).not.toContain("stale_view_after_pop");
+    });
+
+    it("stays silent when the pop's own fetch also beat its nav event", () => {
+      // Same race on the pop side, inside the tighter 250 ms allowance.
+      const found = detectors([
+        ...search,
+        apiCall(2_900, "/api/search?q=sonar"),
+        nav(3_000, "/search?q=sonar", "pop"),
+      ]);
+      expect(found).not.toContain("stale_view_after_pop");
+    });
+
+    it("does not let a call serving the previous state excuse the pop", () => {
+      // 900 ms before the pop: that request was answering the pushed state, and
+      // forgiving it would silence a real finding.
+      const found = detectors([
+        ...search,
+        apiCall(2_100, "/api/search?q=sonar&category=audio"),
+        nav(3_000, "/search?q=sonar", "pop"),
+      ]);
+      expect(found).toContain("stale_view_after_pop");
+    });
+
+    it("does not accept an unrelated background call as proof of reactivity", () => {
+      const unrelated = [
+        nav(1_000, "/search?q=sonar", "init"),
+        apiCall(1_900, "/api/telemetry?session=abc"),
+        nav(2_000, "/search?q=sonar&category=audio", "push"),
+        nav(3_000, "/search?q=sonar", "pop"),
+      ];
+      expect(detectors(unrelated)).not.toContain("stale_view_after_pop");
+    });
+  });
 });
