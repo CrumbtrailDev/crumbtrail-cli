@@ -173,7 +173,7 @@ describe("net.res response body summary", () => {
     expect(meta).toEqual({ ct: "text/html", bytes: 13 });
   });
 
-  it("attaches size facts only for a cross-origin JSON response", async () => {
+  it("summarizes a cross-origin JSON response too", async () => {
     globalThis.fetch = respondWith('{"total":42}');
     const run = collect();
     cleanup = run.cleanup;
@@ -181,8 +181,64 @@ describe("net.res response body summary", () => {
     await globalThis.fetch(CROSS_ORIGIN);
     const meta = bodyMetaOf(run.events, run.bus);
 
-    expect(meta?.ct).toBe("application/json");
-    expect(meta?.data).toBeUndefined();
+    expect(meta?.ct).toBe("json");
+    expect(meta?.data).toEqual({ total: 42 });
+  });
+
+  it("summarizes a default-config same-origin response with a charset suffix", async () => {
+    const items = Array.from({ length: 25 }, (_, index) => ({
+      id: index,
+      price: 9.99,
+    }));
+    globalThis.fetch = respondWith(
+      JSON.stringify(items),
+      "application/json; charset=utf-8",
+    );
+    // DEFAULT_CONFIG verbatim: no body flags, no redaction overrides.
+    const run = collect();
+    cleanup = run.cleanup;
+
+    await globalThis.fetch("/api/items");
+    const meta = bodyMetaOf(run.events, run.bus);
+
+    expect(meta?.ct).toBe("json");
+    expect(meta?.data).toHaveLength(20);
+    expect((meta?.data as Array<{ id: number }>)[0]).toEqual({
+      id: 0,
+      price: 9.99,
+    });
+    expect(meta?.arrayTotal).toEqual({ $: 25 });
+    expect(meta?.truncated).toBe(true);
+  });
+
+  it("records the size facts when the body is empty", async () => {
+    globalThis.fetch = respondWith("", "application/json; charset=utf-8");
+    const run = collect();
+    cleanup = run.cleanup;
+
+    await globalThis.fetch(SAME_ORIGIN);
+    const meta = bodyMetaOf(run.events, run.bus);
+
+    expect(meta).toEqual({ ct: "application/json", bytes: 0 });
+  });
+
+  it("does not report zero bytes when there is no content-length header", async () => {
+    globalThis.fetch = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response("stream", {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      ),
+    );
+    const run = collect();
+    cleanup = run.cleanup;
+
+    await globalThis.fetch(SAME_ORIGIN);
+    const meta = bodyMetaOf(run.events, run.bus);
+
+    expect(meta?.ct).toBe("text/event-stream");
+    expect(meta?.bytes).toBeUndefined();
   });
 
   it("attaches size facts only when the JSON body is over 32KB", async () => {

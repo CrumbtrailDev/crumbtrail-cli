@@ -158,17 +158,6 @@ function isJsonContentType(contentType: string): boolean {
   return /\bjson\b/i.test(contentType);
 }
 
-function isSameOriginUrl(url: string): boolean {
-  try {
-    const origin = (globalThis as { location?: { origin?: string } }).location
-      ?.origin;
-    if (!origin || origin === "null") return false;
-    return new URL(url, origin).origin === origin;
-  } catch {
-    return false;
-  }
-}
-
 function capSummaryValue(
   value: unknown,
   depth: number,
@@ -219,18 +208,24 @@ function capSummaryValue(
  * Returns undefined when nothing is known about the body at all.
  */
 function buildResponseBodyMeta(input: {
-  url: string;
   contentType: string;
   contentLength?: string | null;
   text?: string;
   redactedBody?: string;
 }): ResponseBodyMeta | undefined {
-  const declaredLength = Number(input.contentLength);
+  // `Number(null)` is 0, not NaN: a response with no content-length header
+  // would otherwise be reported as zero bytes.
+  const declared =
+    input.contentLength !== undefined &&
+    input.contentLength !== null &&
+    input.contentLength.trim() !== ""
+      ? Number(input.contentLength)
+      : Number.NaN;
   const bytes =
     input.text !== undefined
       ? utf8ByteLength(input.text)
-      : Number.isFinite(declaredLength) && declaredLength >= 0
-        ? declaredLength
+      : Number.isFinite(declared) && declared >= 0
+        ? declared
         : undefined;
 
   if (!input.contentType && bytes === undefined) return undefined;
@@ -238,10 +233,14 @@ function buildResponseBodyMeta(input: {
   const meta: ResponseBodyMeta = { ct: mediaType(input.contentType) };
   if (bytes !== undefined) meta.bytes = bytes;
 
+  // Deliberately not gated on same-origin. The redacted body text in `d.body`
+  // is already captured for every origin this collector sees, so withholding
+  // the parsed view of that same text would hide structure the event already
+  // carries — and a third-party API's payload is exactly where a contradiction
+  // between what the page shows and what the service returned needs reading.
   const summarizable =
     input.redactedBody !== undefined &&
     isJsonContentType(input.contentType) &&
-    isSameOriginUrl(input.url) &&
     bytes !== undefined &&
     bytes <= RESPONSE_SUMMARY_MAX_BYTES;
   if (!summarizable) return meta;
@@ -587,7 +586,6 @@ function wrapFetch(
       applyBodyResult(resData, bodyResult);
       resMetadata.push(bodyResult.metadata);
       applyResponseBodyMeta(resData, {
-        url: url,
         contentType,
         contentLength,
       });
@@ -600,7 +598,6 @@ function wrapFetch(
       applyBodyResult(resData, bodyResult);
       resMetadata.push(bodyResult.metadata);
       applyResponseBodyMeta(resData, {
-        url: url,
         contentType,
         contentLength,
       });
@@ -635,17 +632,20 @@ function wrapFetch(
             resData.bodySummary = bodyResult.bodySummary;
           resMetadata.push(bodyResult.metadata);
           applyResponseBodyMeta(resData, {
-            url: url,
             contentType,
             contentLength,
             text,
             redactedBody: bodyResult.body,
           });
+        } else {
+          // Empty body: an event that says "200, JSON, 0 bytes" is evidence.
+          applyResponseBodyMeta(resData, { contentType, contentLength, text });
         }
       } catch {
         const bodyResult = summarizeOmittedPayload("body_read_failed", "body");
         applyBodyResult(resData, bodyResult);
         resMetadata.push(bodyResult.metadata);
+        applyResponseBodyMeta(resData, { contentType, contentLength });
       }
     }
 
@@ -902,7 +902,6 @@ function wrapXHR(
         applyBodyResult(resData, bodyResult);
         resMetadata.push(bodyResult.metadata);
         applyResponseBodyMeta(resData, {
-          url: meta.url,
           contentType,
           contentLength,
         });
@@ -915,12 +914,18 @@ function wrapXHR(
         applyBodyResult(resData, bodyResult);
         resMetadata.push(bodyResult.metadata);
         applyResponseBodyMeta(resData, {
-          url: meta.url,
           contentType,
           contentLength,
         });
       } else {
-        const text = this.responseText;
+        // responseText throws for a non-text responseType (json, blob,
+        // arraybuffer); the response still deserves its size facts.
+        let text: string | undefined;
+        try {
+          text = this.responseText;
+        } catch {
+          text = undefined;
+        }
         if (text) {
           const bodyResult = redactNetworkTextBody(text, {
             contentType,
@@ -946,12 +951,13 @@ function wrapXHR(
             resData.bodySummary = bodyResult.bodySummary;
           resMetadata.push(bodyResult.metadata);
           applyResponseBodyMeta(resData, {
-            url: meta.url,
             contentType,
             contentLength,
             text,
             redactedBody: bodyResult.body,
           });
+        } else {
+          applyResponseBodyMeta(resData, { contentType, contentLength });
         }
       }
 
@@ -1106,7 +1112,6 @@ function emitEarlyRecord(
     if (bodyResult.bodySummary) resData.bodySummary = bodyResult.bodySummary;
     resMetadata.push(bodyResult.metadata);
     applyResponseBodyMeta(resData, {
-      url: record.url,
       contentType: record.ct ?? "",
       text: record.resBody,
       redactedBody: bodyResult.body,

@@ -167,13 +167,13 @@ before finalizing the report. A cloud config response can disable capture with
 
 `net.res` keeps carrying the redacted response body as text in `d.body`. It also
 carries `d.bodyMeta`, the size facts plus a bounded parsed view:
-`{ ct, bytes, truncated?, data?, arrayTotal? }`. `data` is present for
-same origin JSON responses of 32 KB or less, is derived from the already
-redacted body, and is capped at four levels of nesting, 20 array items, and 120
-character strings. `arrayTotal` records the real length of each array that was
-cut, keyed by its path, so a truncated list is never mistaken for a short one.
-Anything else, including cross origin and oversized responses, carries the
-content type and byte size only.
+`{ ct, bytes, truncated?, data?, arrayTotal? }`. `data` is present for JSON
+responses of 32 KB or less, is derived from the already redacted body, and is
+capped at four levels of nesting, 20 array items, and 120 character strings.
+`arrayTotal` records the real length of each array that was cut, keyed by its
+path, so a truncated list is never mistaken for a short one. Anything else,
+including non JSON and oversized responses, carries the content type and byte
+size only.
 
 ### Server-sent events (`net.sse`)
 

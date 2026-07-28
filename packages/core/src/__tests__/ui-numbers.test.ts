@@ -546,6 +546,51 @@ describe("uiNumbersCollector", () => {
     }
   });
 
+  it("re-emits ui.num on every SPA navigation, even when the figures repeat", async () => {
+    // Two routes rendering the same total under the same structural region —
+    // /cart then /checkout. Cross-view suppression used to swallow the second
+    // page entirely.
+    const page = `<main><dl><dt>Total</dt><dd>$42.00</dd></dl></main>`;
+    document.body.innerHTML = page;
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(1);
+    expect(layoutEvents(events)).toHaveLength(1);
+
+    history.pushState({}, "", "/checkout");
+    document.body.innerHTML = page;
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(2);
+    expect(layoutEvents(events)).toHaveLength(2);
+
+    history.pushState({}, "", "/confirm");
+    document.body.innerHTML = page;
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(3);
+    expect(layoutEvents(events)).toHaveLength(3);
+
+    for (const snapshot of uiNumEvents(events)) {
+      expect(snapshot.d).toMatchObject({ lang: null, dir: "ltr" });
+      expect(snapshot.d.items).toEqual([{ label: "Total", value: 42, unit: "$" }]);
+    }
+
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("still suppresses an unchanged re-scan inside one view", async () => {
+    document.body.innerHTML = `<main><dl><dt>Total</dt><dd>$42.00</dd></dl></main>`;
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(1);
+
+    // A mutation that leaves every figure identical.
+    document.body.appendChild(document.createElement("span"));
+    await settle(bus);
+    expect(uiNumEvents(events)).toHaveLength(1);
+  });
+
   it("emits again on a navigation commit but not on a plain DOM settle", async () => {
     const { events, bus, cleanup } = collect();
     cleanups.push(cleanup);

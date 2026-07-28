@@ -516,6 +516,14 @@ function startUiNumbersCollector(
   // never a private history.pushState wrap — so multiple collectors can
   // observe navigation without corrupting each other's teardown.
   unsubscribeNav = subscribeNavCommit(() => {
+    // A route change is a new view, so the change-suppression state from the
+    // old one has to go. Region identifiers are structural ("main", "dl.totals",
+    // "table#cart") and repeat across routes, so without this the first
+    // snapshot of a new page is silently dropped whenever it happens to match
+    // the page before it — /cart and /checkout showing the same total emitted
+    // nothing at all for /checkout. Suppression is meant to squash repeats
+    // during DOM churn inside one view, never to hide a view.
+    lastSnapshot.clear();
     layoutPending = true;
     scheduleScan();
   });
