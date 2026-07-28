@@ -196,6 +196,15 @@ describe("computeRedactedShape", () => {
     expect(computeRedactedShape("hunter23").hash8).not.toBe(shape.hash8);
   });
 
+  it("reports a salted case-fold fingerprint without exposing the value", () => {
+    const uppercase = computeRedactedShape("Omar@Example.com");
+    const lowercase = computeRedactedShape("omar@example.com");
+
+    expect(uppercase.hash8).not.toBe(lowercase.hash8);
+    expect(uppercase.casefoldHash8).toBe(lowercase.hash8);
+    expect(lowercase.casefoldHash8).toBeUndefined();
+  });
+
   it("omits hash8 for brute-forceable candidate spaces", () => {
     // Numeric with len < 12: CVV, PIN, SSN, phone.
     expect(computeRedactedShape("123").hash8).toBeUndefined();

@@ -622,6 +622,7 @@ export function buildEvidenceCandidates(
   addRelationalWriteIntegrityCandidates(events, index, drafts, exchanges);
   addOpsStateLifecycleCandidates(events, index, drafts, exchanges);
   addDataLifecycleIntegrityCandidates(events, index, drafts, exchanges);
+  addBrowserNetworkIntegrityCandidates(events, index, drafts, exchanges);
   addRefundInvariantCandidates(events, index, drafts);
   addSessionCartInvariantCandidates(events, index, drafts, exchanges);
   addLocaleInputCandidates(index, drafts, exchanges);
@@ -7021,6 +7022,341 @@ function addDataLifecycleIntegrityCandidates(
   addDerivedCountBelowObservedInsertsCandidates(events, index, drafts);
   addResponseLimitExceededCandidates(index, drafts, exchanges);
   addInvertedLifecycleNotificationCandidates(events, index, drafts);
+}
+
+// ─── browser and network integrity ───────────────────────────────────────────
+
+const BROWSER_NETWORK_SCORE = 85;
+
+interface CasefoldIdentity {
+  field: string;
+  hash: string;
+  casefoldHash: string;
+  length: number;
+}
+
+function casefoldIdentityOf(value: unknown): CasefoldIdentity | undefined {
+  for (const scope of collectObjectScopes(value)) {
+    for (const [field, child] of Object.entries(scope)) {
+      if (!/^(email|username|login|handle)$/i.test(field)) continue;
+      if (!isRedactedPlaceholder(child)) continue;
+      const shape = child as Record<string, unknown>;
+      const hash = safeText(shape.hash8, 20);
+      const casefoldHash = safeText(shape.casefoldHash8, 20) ?? hash;
+      const length = finiteNumber(shape.len);
+      if (!hash || !casefoldHash || length === undefined) continue;
+      return { field, hash, casefoldHash, length };
+    }
+  }
+  return undefined;
+}
+
+function addCasefoldIdentityCollisionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const insertsByRequest = dbDiffsByRequest(events);
+  const grouped = new Map<
+    string,
+    Array<{
+      identity: CasefoldIdentity;
+      exchange: RequestExchange;
+      insert: BugEvent;
+    }>
+  >();
+  for (const exchange of exchanges.values()) {
+    if (
+      exchange.method !== "POST" ||
+      !isSuccessStatus(exchange.status) ||
+      !exchange.res
+    ) continue;
+    const identity = casefoldIdentityOf(parseStructuredBody(exchange.body));
+    if (!identity) continue;
+    const inserts = (insertsByRequest.get(exchange.requestId) ?? []).filter(
+      (event) =>
+        safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+        isRecord(event.d.after) &&
+        Object.keys(event.d.after).some(
+          (field) =>
+            normalizeFieldName(field) === normalizeFieldName(identity.field),
+        ),
+    );
+    if (inserts.length !== 1) continue;
+    const insert = inserts[0];
+    const table = safeText(insert.d.table, 200);
+    if (!table) continue;
+    const key = `${table}:${identity.field}:${identity.casefoldHash}:${identity.length}`;
+    const list = grouped.get(key) ?? [];
+    list.push({ identity, exchange, insert });
+    grouped.set(key, list);
+  }
+  for (const [key, entries] of grouped) {
+    const rawHashes = new Set(entries.map((entry) => entry.identity.hash));
+    if (entries.length < 2 || rawHashes.size < 2) continue;
+    entries.sort((left, right) => left.insert.t - right.insert.t);
+    const first = entries[0];
+    const last = entries[entries.length - 1];
+    const table = safeText(last.insert.d.table, 200);
+    drafts.push({
+      detector: "casefold_duplicate_identity_accepted",
+      title: `${entries.length} case-only variants of one ${first.identity.field} were inserted`,
+      severity: "high",
+      score: DATA_LIFECYCLE_SCORE + 2,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: last.insert.t,
+        offsetMs: offsetForEvent(last.insert) ?? offsetFromStart(last.insert.t, index.start),
+        route: routeAt(index.navs ?? [], last.insert.t),
+        requestId: last.exchange.requestId,
+        method: last.exchange.method,
+        url: redactUrl(last.exchange.url),
+        status: last.exchange.status,
+        table,
+        source: normalizeDbEngine(last.insert.d.engine),
+        frame: dbCallsiteFrame(last.insert.d.callsite),
+        message:
+          `${entries.length} successful requests carried different salted fingerprints but the same ` +
+          `case-fold fingerprint and length for ${first.identity.field}; each request inserted a ${bareTableName(table ?? "row")} row.`,
+      }),
+      dedupeKey: `casefoldcollision:${key}`,
+    });
+  }
+}
+
+function addBlockedDependencyActionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const blockedScripts = events.filter(
+    (event) =>
+      event.k === "perf" &&
+      safeText(event.d.metric, 20) === "res" &&
+      safeText(event.d.initiatorType, 40) === "script" &&
+      finiteNumber(event.d.transferSize) === 0 &&
+      /(?:vendor|analytics|tracker|tracking|pixel|tag|ads?)[/_.-]/i.test(
+        safeText(event.d.name, 400) ?? "",
+      ),
+  );
+  if (blockedScripts.length === 0) return;
+  const populatedCart = events.some(
+    (event) =>
+      event.k === "net.res" &&
+      isSuccessStatus(finiteNumber(event.d.st)) &&
+      /\/(?:api\/)?cart\/items(?:$|\?)/i.test(
+        safeText(
+          events.find(
+            (request) =>
+              request.k === "net.req" &&
+              requestIdForEvent(request) === requestIdForEvent(event),
+          )?.d.url,
+          400,
+        ) ?? "",
+      ),
+  );
+  if (!populatedCart) return;
+  for (const click of events) {
+    if (click.k !== "clk" || !isRecord(click.d.el)) continue;
+    const action = [
+      safeText(click.d.el.path, 300),
+      safeText(click.d.el.txt, 160),
+    ]
+      .filter(Boolean)
+      .join(" ");
+    if (!/(checkout|place[-_ ]?order|purchase|pay|submit)/i.test(action))
+      continue;
+    const deadline = click.t + 3_000;
+    const progressed = events.some((event) => {
+      if (event.t <= click.t || event.t > deadline) return false;
+      if (isNavigationEvent(event)) return true;
+      if (event.k !== "net.req") return false;
+      const path = capturedUrlPath(safeText(event.d.url, 400)) ?? "";
+      return /(?:checkout|orders?|payments?)/i.test(path);
+    });
+    if (progressed) continue;
+    const blocked = [...blockedScripts]
+      .reverse()
+      .find((event) => event.t <= click.t);
+    if (!blocked) continue;
+    drafts.push({
+      detector: "blocked_script_prevented_action",
+      title: `Checkout action produced no request after a script failed to load`,
+      severity: "high",
+      score: BROWSER_NETWORK_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: click.t,
+        offsetMs: offsetForEvent(click) ?? offsetFromStart(click.t, index.start),
+        route: routeAt(index.navs ?? [], click.t),
+        message:
+          `The populated cart's checkout control was clicked, but no checkout/order/payment request or navigation followed within 3 seconds. ` +
+          `A vendor-style script resource on this page transferred zero bytes.`,
+        source: redactUrl(safeText(blocked.d.name, 400)),
+      }),
+      dedupeKey: `blockedaction:${safeText(click.d.el.path, 200) ?? click.t}`,
+    });
+  }
+}
+
+const MUTATED_STATE_FIELD =
+  /^(active|available|count|enabled|inventory|quantity|qty|seq|sequence|state|status|stock|value)$/i;
+
+function addAcknowledgedStateContradictionCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const ordered = [...exchanges.values()].sort(
+    (left, right) => left.req.t - right.req.t,
+  );
+  for (const mutation of ordered) {
+    if (
+      !MUTATING_METHODS.has(mutation.method) ||
+      !isSuccessStatus(mutation.status) ||
+      !mutation.res
+    ) continue;
+    const payload = parseStructuredBody(mutation.body);
+    if (!isRecord(payload)) continue;
+    const ids = Object.entries(payload).filter(
+      ([field, value]) =>
+        isIdLikeField(field) &&
+        (typeof value === "string" || finiteNumber(value) !== undefined),
+    );
+    const states = Object.entries(payload).filter(
+      ([field, value]) =>
+        MUTATED_STATE_FIELD.test(field) &&
+        (typeof value === "string" ||
+          typeof value === "boolean" ||
+          finiteNumber(value) !== undefined),
+    );
+    if (ids.length !== 1 || states.length !== 1) continue;
+    const [idField, idValue] = ids[0];
+    const [stateField, stateValue] = states[0];
+    const mutationPath = capturedUrlPath(mutation.url);
+    if (!mutationPath) continue;
+    const root = apiPrefixOf(mutationPath);
+    const read = ordered.find((exchange) => {
+      if (
+        exchange.method !== "GET" ||
+        exchange.req.t <= mutation.res!.t ||
+        !isSuccessStatus(exchange.status) ||
+        !exchange.res ||
+        !capturedUrlPath(exchange.url)?.startsWith(root)
+      ) return false;
+      const collection = responseCollection(exchange.resBody, exchange.resBodyMeta);
+      if (!collection) return false;
+      const row = findCollectionItem(collection.items, [String(idValue)]);
+      if (!row) return false;
+      const observed = Object.entries(row).find(
+        ([field]) =>
+          normalizeFieldName(field) === normalizeFieldName(stateField),
+      );
+      return observed !== undefined && !sameScalar(observed[1], stateValue);
+    });
+    if (!read?.res) continue;
+    const collection = responseCollection(read.resBody, read.resBodyMeta);
+    const row = collection
+      ? findCollectionItem(collection.items, [String(idValue)])
+      : undefined;
+    const observed = row
+      ? Object.entries(row).find(
+          ([field]) =>
+            normalizeFieldName(field) === normalizeFieldName(stateField),
+        )
+      : undefined;
+    if (!observed) continue;
+    drafts.push({
+      detector: "acknowledged_state_contradicted_by_read",
+      title: `Successful ${stateField}=${String(stateValue)} mutation was contradicted by the next read`,
+      severity: "high",
+      score: BROWSER_NETWORK_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: read.res.t,
+        offsetMs: offsetForEvent(read.res) ?? offsetFromStart(read.res.t, index.start),
+        route: routeAt(index.navs ?? [], read.res.t),
+        requestId: read.requestId,
+        method: mutation.method,
+        url: redactUrl(mutation.url),
+        status: mutation.status,
+        message:
+          `The server acknowledged ${idField}=${String(idValue)}, ${stateField}=${String(stateValue)}. ` +
+          `The next related collection read returned ${stateField}=${String(observed[1])} for that same identity.`,
+      }),
+      dedupeKey: `statecontradiction:${root}:${idField}:${String(idValue)}:${stateField}`,
+    });
+  }
+}
+
+function addRequestBurstCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const byPath = new Map<string, BugEvent[]>();
+  for (const event of events) {
+    if (event.k !== "net.req") continue;
+    const path = capturedUrlPath(safeText(event.d.url, 400));
+    if (!path) continue;
+    const list = byPath.get(path) ?? [];
+    list.push(event);
+    byPath.set(path, list);
+  }
+  const failedIds = new Set(
+    events
+      .filter((event) => event.k === "net.err")
+      .map((event) => requestIdForEvent(event))
+      .filter((id): id is string => id !== undefined),
+  );
+  for (const [path, requests] of byPath) {
+    requests.sort((left, right) => left.t - right.t);
+    for (let start = 0; start < requests.length; start += 1) {
+      const burst = requests.filter(
+        (event) =>
+          event.t >= requests[start].t && event.t <= requests[start].t + 250,
+      );
+      if (burst.length < 5) continue;
+      const failed = burst.filter((event) =>
+        failedIds.has(requestIdForEvent(event) ?? ""),
+      ).length;
+      if (failed < Math.ceil(burst.length / 2)) continue;
+      const anchor = burst[burst.length - 1];
+      drafts.push({
+        detector: "request_reconnect_storm",
+        title: `${burst.length} requests hit ${path} within ${anchor.t - burst[0].t} ms`,
+        severity: "high",
+        score: BROWSER_NETWORK_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: anchor.t,
+          offsetMs: offsetForEvent(anchor) ?? offsetFromStart(anchor.t, index.start),
+          route: routeAt(index.navs ?? [], anchor.t),
+          requestId: requestIdForEvent(anchor),
+          method: safeText(anchor.d.method, 20) ?? safeText(anchor.d.m, 20),
+          url: redactUrl(safeText(anchor.d.url, 400)),
+          message:
+            `${burst.length} same-endpoint requests started inside 250 ms and ${failed} failed. ` +
+            `The synchronized burst has no backoff or jitter.`,
+        }),
+        dedupeKey: `requestburst:${path}:${burst[0].t}`,
+      });
+      break;
+    }
+  }
+}
+
+function addBrowserNetworkIntegrityCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  addCasefoldIdentityCollisionCandidates(events, index, drafts, exchanges);
+  addBlockedDependencyActionCandidates(events, index, drafts);
+  addAcknowledgedStateContradictionCandidates(index, drafts, exchanges);
+  addRequestBurstCandidates(events, index, drafts);
 }
 
 // ─── refund and return invariants ─────────────────────────────────────────────
