@@ -364,6 +364,62 @@ describe("buildEvidenceCandidates — write-to-write causal claims are weakened"
         .attributionConfidence,
     ).toBe("high");
   });
+
+  /**
+   * The clamp exists so the ranker treats a write-to-write link as annotate
+   * ONLY. That has to hold for both ordering rules, not just the tier sort:
+   * clamping the grade and then reordering on it anyway defeats the clamp, and
+   * the symptom is precisely what the clamp was written to prevent — "the write
+   * a detector actually named is ranked behind every write that happened to
+   * precede it".
+   */
+  it("a low-graded link does not pull its root ahead of a higher scoring symptom", () => {
+    const named: BugEvent[] = [
+      ...events,
+      // A named invariant on the LAST write of the request, so every generic
+      // write candidate precedes it on the spine.
+      {
+        t: 210,
+        k: "db.diff",
+        d: {
+          engine: "postgres",
+          op: "insert",
+          table: "coupon_redemptions",
+          pk: { id: 1 },
+          after: { id: 1, order_id: 1, code: "SAVE10", amount_cents: 1000 },
+          requestId: "req1",
+        },
+      },
+      {
+        t: 215,
+        k: "db.diff",
+        d: {
+          engine: "postgres",
+          op: "insert",
+          table: "coupon_redemptions",
+          pk: { id: 2 },
+          after: { id: 2, order_id: 1, code: "SAVE10", amount_cents: 1000 },
+          requestId: "req1",
+        },
+      },
+    ];
+    const candidates = buildEvidenceCandidates(
+      named,
+      { start: 0 },
+      buildCausalGraph({ events: named }),
+    );
+    const duplicate = candidates.findIndex(
+      (c) => c.detector === "duplicate_write",
+    );
+    const genericWrites = candidates
+      .map((c, i) => (c.detector === "db_mutation" ? i : -1))
+      .filter((i) => i >= 0);
+    expect(duplicate).toBeGreaterThanOrEqual(0);
+    expect(genericWrites.length).toBeGreaterThan(0);
+    // Graded low — annotate only — so it must not reorder the list.
+    expect(candidates[duplicate].attributionConfidence).toBe("low");
+    expect(duplicate).toBeLessThan(Math.min(...genericWrites));
+  });
 });
 
 describe("buildEvidenceCandidates — console_warning must not steal a console.error node", () => {
