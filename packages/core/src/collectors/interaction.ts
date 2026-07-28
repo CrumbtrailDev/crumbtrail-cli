@@ -80,6 +80,26 @@ function describeFrameContext(url: string): Record<string, unknown> {
   });
 }
 
+/**
+ * How this document was reached, per the Navigation Timing API:
+ * "navigate" | "reload" | "back_forward" | "prerender".
+ *
+ * `tr: "init"` covers every first load, so a back/forward that reloads the
+ * document (a multi-page app, or an SPA entered through a hard navigation)
+ * looks exactly like a fresh visit. This field is what separates them, without
+ * changing what `tr` means.
+ */
+function readDocumentNavType(): string | undefined {
+  try {
+    const entries = performance?.getEntriesByType?.("navigation");
+    const type = (entries?.[0] as PerformanceNavigationTiming | undefined)
+      ?.type;
+    return typeof type === "string" && type ? type : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function interactionCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
@@ -189,6 +209,7 @@ export function interactionCollector(
       from: fromResult?.value ?? "",
       to: toResult.value,
       tr,
+      navType: tr === "init" ? readDocumentNavType() : undefined,
       fromOrigin: from ? readSafeOrigin(from) : undefined,
       toOrigin: readSafeOrigin(to),
       frame: describeFrameContext(to),

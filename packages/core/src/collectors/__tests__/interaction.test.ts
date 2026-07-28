@@ -209,6 +209,83 @@ describe("interactionCollector", () => {
     expect(navEvents[0].d.to).toContain("/replaced");
   });
 
+  it("captures a history pop as tr:'pop'", () => {
+    history.pushState({}, "", "/step-two");
+    bus.flush();
+    events.length = 0;
+
+    // The browser applies the traversal and then fires popstate; the collector
+    // reads the destination off location, exactly as it does here.
+    window.dispatchEvent(new Event("popstate"));
+    bus.flush();
+
+    const navEvents = events.filter((e) => e.k === "nav");
+    expect(navEvents).toHaveLength(1);
+    expect(navEvents[0].d.tr).toBe("pop");
+    expect(navEvents[0].d.to).toContain("/step-two");
+  });
+
+  it("captures a hash change as tr:'hash'", () => {
+    window.dispatchEvent(new Event("hashchange"));
+    bus.flush();
+
+    const navEvents = events.filter((e) => e.k === "nav");
+    expect(navEvents).toHaveLength(1);
+    expect(navEvents[0].d.tr).toBe("hash");
+  });
+
+  it("does not label a route change as an initial load", () => {
+    history.pushState({}, "", "/somewhere");
+    bus.flush();
+
+    const navEvents = events.filter((e) => e.k === "nav");
+    expect(navEvents.map((event) => event.d.tr)).not.toContain("init");
+    expect(navEvents[0].d.navType).toBeUndefined();
+  });
+
+  // --- Document navigation type ---
+  it("labels a back/forward document load on the initial nav event", () => {
+    cleanup();
+    vi.spyOn(performance, "getEntriesByType").mockReturnValue([
+      { type: "back_forward" } as unknown as PerformanceEntry,
+    ]);
+
+    const initEvents: BugEvent[] = [];
+    const initBus = new EventBus();
+    initBus.subscribe((batch) => initEvents.push(...batch));
+    const initCleanup = interactionCollector(initBus, DEFAULT_CONFIG);
+    initBus.flush();
+
+    expect(initEvents[0].d.tr).toBe("init");
+    expect(initEvents[0].d.navType).toBe("back_forward");
+
+    initCleanup();
+    vi.restoreAllMocks();
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+  });
+
+  it("omits navType when the Navigation Timing entry is unavailable", () => {
+    cleanup();
+    vi.spyOn(performance, "getEntriesByType").mockReturnValue([]);
+
+    const initEvents: BugEvent[] = [];
+    const initBus = new EventBus();
+    initBus.subscribe((batch) => initEvents.push(...batch));
+    const initCleanup = interactionCollector(initBus, DEFAULT_CONFIG);
+    initBus.flush();
+
+    expect(initEvents[0].d.tr).toBe("init");
+    expect(initEvents[0].d.navType).toBeUndefined();
+
+    initCleanup();
+    vi.restoreAllMocks();
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+  });
+
   // --- Cleanup ---
   it("restores history.pushState on cleanup", () => {
     cleanup();
