@@ -7347,6 +7347,118 @@ function addRequestBurstCandidates(
   }
 }
 
+function addStaleClientBuildCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const snapshots = events
+    .filter(
+      (event) =>
+        event.k === "env" &&
+        safeText(event.d.appBuild, 120) !== undefined,
+    )
+    .sort((left, right) => left.t - right.t);
+  if (snapshots.length === 0) return;
+  for (const exchange of exchanges.values()) {
+    if (
+      exchange.method !== "GET" ||
+      capturedUrlPath(exchange.url) !== "/build-id.json" ||
+      !isSuccessStatus(exchange.status) ||
+      !exchange.res
+    ) continue;
+    const payload = responsePayload(exchange.resBody, exchange.resBodyMeta);
+    if (!isRecord(payload)) continue;
+    const serverBuild =
+      safeText(payload.build, 120) ??
+      safeText(payload.buildId, 120) ??
+      safeText(payload.version, 120);
+    if (!serverBuild) continue;
+    const snapshot = [...snapshots]
+      .reverse()
+      .find((event) => event.t <= exchange.res!.t);
+    const clientBuild = snapshot
+      ? safeText(snapshot.d.appBuild, 120)
+      : undefined;
+    if (!clientBuild || clientBuild === serverBuild) continue;
+    drafts.push({
+      detector: "stale_client_build",
+      title: `Client build ${clientBuild} disagreed with server build ${serverBuild}`,
+      severity: "high",
+      score: BROWSER_NETWORK_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs: offsetForEvent(exchange.res) ?? offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        message:
+          `The running HTML shell declared app-build=${clientBuild}, while the no-cache build identity endpoint returned ${serverBuild}. The client is serving a stale release.`,
+      }),
+      dedupeKey: `stalebuild:${clientBuild}:${serverBuild}`,
+    });
+  }
+}
+
+function addRtlPhysicalLayoutCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (
+      event.k !== "ui.layout" ||
+      safeText(event.d.dir, 20)?.toLowerCase() !== "rtl" ||
+      !Array.isArray(event.d.rtlPhysical)
+    ) continue;
+    const rules = event.d.rtlPhysical.filter(isRecord);
+    if (rules.length < 2) continue;
+    const properties = new Set(
+      rules.flatMap((rule) =>
+        Array.isArray(rule.properties)
+          ? rule.properties
+              .map((property) => safeText(property, 40))
+              .filter((property): property is string => Boolean(property))
+          : [],
+      ),
+    );
+    const hasAnchor = properties.has("left") || properties.has("right");
+    const hasSpacing = [...properties].some((property) =>
+      /^(?:margin|padding|border)/.test(property),
+    );
+    if (!hasAnchor || !hasSpacing) continue;
+    const sources = [
+      ...new Set(
+        rules
+          .map((rule) => safeText(rule.source, 300))
+          .filter((source): source is string => Boolean(source)),
+      ),
+    ];
+    drafts.push({
+      detector: "rtl_physical_layout_rules",
+      title: `${rules.length} active RTL rules used physical left/right layout properties`,
+      severity: "medium",
+      score: 64,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        url: redactUrl(safeText(event.d.url, 400)),
+        source: sources[0],
+        message:
+          `The RTL page matched ${rules.length} author CSS rules using physical anchoring and asymmetric physical spacing ` +
+          `(${[...properties].sort().join(", ")}). These rules do not mirror with document direction.`,
+      }),
+      dedupeKey: `rtlphysical:${safeText(event.d.url, 300) ?? event.t}`,
+    });
+  }
+}
+
 function addBrowserNetworkIntegrityCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
@@ -7357,6 +7469,8 @@ function addBrowserNetworkIntegrityCandidates(
   addBlockedDependencyActionCandidates(events, index, drafts);
   addAcknowledgedStateContradictionCandidates(index, drafts, exchanges);
   addRequestBurstCandidates(events, index, drafts);
+  addStaleClientBuildCandidates(events, index, drafts, exchanges);
+  addRtlPhysicalLayoutCandidates(events, index, drafts);
 }
 
 // ─── refund and return invariants ─────────────────────────────────────────────

@@ -639,6 +639,45 @@ describe("uiNumbersCollector", () => {
     }
   });
 
+  it("reports active physical CSS rules under RTL without capturing selectors", async () => {
+    document.documentElement.dir = "rtl";
+    document.head.innerHTML = `<style>
+      .rtl-row { padding: 4px 8px 4px 32px; }
+      .rtl-chip { position: absolute; left: 4px; }
+      .logical { margin-inline-start: auto; }
+    </style>`;
+    document.body.innerHTML = `
+      <div class="rtl-row"><span class="rtl-chip">private text</span></div>
+      <div class="logical"></div>
+    `;
+    try {
+      const { events, bus, cleanup } = collect();
+      cleanups.push(cleanup);
+      await settle(bus);
+
+      const physical = layoutEvents(events)[0].d.rtlPhysical as Array<{
+        properties: string[];
+        matched: number;
+      }>;
+      expect(physical).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            properties: expect.arrayContaining(["padding"]),
+          }),
+          expect.objectContaining({
+            properties: expect.arrayContaining(["left"]),
+          }),
+        ]),
+      );
+      expect(JSON.stringify(physical)).not.toContain("private text");
+      expect(JSON.stringify(physical)).not.toContain(".rtl-row");
+      expect(JSON.stringify(physical)).not.toContain("margin-inline-start");
+    } finally {
+      document.documentElement.dir = "";
+      document.head.innerHTML = "";
+    }
+  });
+
   it("re-emits ui.num on every SPA navigation, even when the figures repeat", async () => {
     // Two routes rendering the same total under the same structural region —
     // /cart then /checkout. Cross-view suppression used to swallow the second

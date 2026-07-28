@@ -322,4 +322,79 @@ describe("browser and network integrity", () => {
     }
     expect(detectors(events)).not.toContain("request_reconnect_storm");
   });
+
+  it("flags a running client build that disagrees with the server build", () => {
+    expect(
+      detectors([
+        {
+          t: 100,
+          k: "env",
+          d: { kind: "snapshot", appBuild: "release-old" },
+        },
+        ...exchange(
+          200,
+          "build-1",
+          "GET",
+          "/build-id.json",
+          undefined,
+          { build: "release-new" },
+        ),
+      ] as unknown as BugEvent[]),
+    ).toContain("stale_client_build");
+  });
+
+  it("accepts a client and server on the same build", () => {
+    expect(
+      detectors([
+        {
+          t: 100,
+          k: "env",
+          d: { kind: "snapshot", appBuild: "release-current" },
+        },
+        ...exchange(
+          200,
+          "build-1",
+          "GET",
+          "/build-id.json",
+          undefined,
+          { build: "release-current" },
+        ),
+      ] as unknown as BugEvent[]),
+    ).not.toContain("stale_client_build");
+  });
+
+  it("flags physical anchoring plus physical spacing on an RTL page", () => {
+    expect(
+      detectors([
+        {
+          t: 100,
+          k: "ui.layout",
+          d: {
+            dir: "rtl",
+            url: "https://shop.test/account",
+            rtlPhysical: [
+              { properties: ["left"], matched: 1 },
+              { properties: ["margin-left"], matched: 1 },
+            ],
+          },
+        },
+      ] as unknown as BugEvent[]),
+    ).toContain("rtl_physical_layout_rules");
+  });
+
+  it("accepts logical layout rules on an RTL page", () => {
+    expect(
+      detectors([
+        {
+          t: 100,
+          k: "ui.layout",
+          d: {
+            dir: "rtl",
+            url: "https://shop.test/account",
+            rtlPhysical: [],
+          },
+        },
+      ] as unknown as BugEvent[]),
+    ).not.toContain("rtl_physical_layout_rules");
+  });
 });

@@ -310,6 +310,8 @@ export interface EnvSnapshot {
   viewport?: { w: number; h: number };
   locale?: string;
   timezone?: string;
+  /** Public client release identity declared by `<meta name="app-build">`. */
+  appBuild?: string;
   /** Redacted feature flags declared via `setEnv`. */
   flags?: Record<string, unknown>;
   /** Redacted runtime config declared via `setEnv`. */
