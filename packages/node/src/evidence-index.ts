@@ -6280,6 +6280,157 @@ function addBatchAppliedCountMismatchCandidates(
   }
 }
 
+function addMissingEntityAuditCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    const audits = diffs.filter(
+      (event) =>
+        safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+        /audit/i.test(bareTableName(safeText(event.d.table, 200) ?? "")) &&
+        isRecord(event.d.after),
+    );
+    if (audits.length === 0) continue;
+    const mutationsByTable = new Map<string, BugEvent[]>();
+    for (const event of diffs) {
+      const table = safeText(event.d.table, 200);
+      if (
+        !table ||
+        /audit/i.test(bareTableName(table)) ||
+        !["insert", "update", "delete"].includes(
+          safeText(event.d.op, 20)?.toLowerCase() ?? "",
+        )
+      )
+        continue;
+      const list = mutationsByTable.get(table) ?? [];
+      list.push(event);
+      mutationsByTable.set(table, list);
+    }
+    for (const [table, mutations] of mutationsByTable) {
+      if (mutations.length < 2) continue;
+      const entity = singularize(normalizeEntityName(bareTableName(table)));
+      const matchingAudits = audits.filter((audit) => {
+        if (!isRecord(audit.d.after)) return false;
+        const auditedEntity = safeText(audit.d.after.entity, 160);
+        return (
+          auditedEntity !== undefined &&
+          singularize(normalizeEntityName(auditedEntity)) === entity
+        );
+      });
+      if (matchingAudits.length > 0) continue;
+      const anchor = mutations[0];
+      drafts.push({
+        detector: "mutations_missing_entity_audit",
+        title: `${mutations.length} ${bareTableName(table)} mutations had no matching entity audit`,
+        severity: "high",
+        score: RELATIONAL_WRITE_INTEGRITY_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: anchor.t,
+          offsetMs:
+            offsetForEvent(anchor) ?? offsetFromStart(anchor.t, index.start),
+          route: routeAt(index.navs ?? [], anchor.t),
+          requestId,
+          table,
+          source: normalizeDbEngine(anchor.d.engine),
+          frame: dbCallsiteFrame(anchor.d.callsite),
+          message:
+            `The request mutated ${mutations.length} ${bareTableName(table)} rows and wrote ${audits.length} audit row${audits.length === 1 ? "" : "s"}, ` +
+            `but none of those audits named the ${entity} entity.`,
+        }),
+        dedupeKey: `missingaudit:${requestId}:${table}`,
+      });
+    }
+  }
+}
+
+function referencedEntityFromNote(
+  note: unknown,
+): { entity: string; id: string } | undefined {
+  const text = safeText(note, 200);
+  const match = text ? /\b([a-z][a-z0-9_-]*)\s*=\s*([a-z0-9_-]+)\b/i.exec(text) : null;
+  return match ? { entity: match[1], id: match[2] } : undefined;
+}
+
+function addReportSourceContradictionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const sourceRows = new Map<string, BugEvent>();
+  const ordered = [...events].sort((left, right) => left.t - right.t);
+  for (const event of ordered) {
+    if (
+      (event.k === "db.read" && isRecord(event.d.row)) ||
+      (event.k === "db.diff" && isRecord(event.d.after))
+    ) {
+      const row =
+        event.k === "db.read" && isRecord(event.d.row)
+          ? event.d.row
+          : isRecord(event.d.after)
+            ? event.d.after
+            : undefined;
+      const table = safeText(event.d.table, 200);
+      const id =
+        keyValueOf(row?.id) ??
+        (isRecord(event.d.pk) ? keyValueOf(event.d.pk.id) : undefined);
+      if (row && table && id)
+        sourceRows.set(
+          `${singularize(normalizeEntityName(bareTableName(table)))}:${id}`,
+          event,
+        );
+    }
+    if (
+      event.k !== "db.diff" ||
+      safeText(event.d.op, 20)?.toLowerCase() !== "insert" ||
+      !isRecord(event.d.after)
+    )
+      continue;
+    const reference = referencedEntityFromNote(event.d.after.note);
+    const reportedTotal =
+      finiteNumber(event.d.after.total_cents) ??
+      finiteNumber(event.d.after.totalCents);
+    if (!reference || reportedTotal === undefined) continue;
+    const source = sourceRows.get(
+      `${singularize(normalizeEntityName(reference.entity))}:${reference.id}`,
+    );
+    const sourceRow =
+      source?.k === "db.read" && isRecord(source.d.row)
+        ? source.d.row
+        : source?.k === "db.diff" && isRecord(source.d.after)
+          ? source.d.after
+          : undefined;
+    const sourceTotal =
+      finiteNumber(sourceRow?.total_cents) ??
+      finiteNumber(sourceRow?.totalCents);
+    if (sourceTotal === undefined || sourceTotal === reportedTotal) continue;
+    const table = safeText(event.d.table, 200);
+    drafts.push({
+      detector: "report_total_contradicts_source_row",
+      title: `Report total ${reportedTotal} disagreed with ${reference.entity} ${reference.id}'s stored total ${sourceTotal}`,
+      severity: "high",
+      score: RELATIONAL_WRITE_INTEGRITY_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: correlationIdOf(event),
+        table,
+        source: normalizeDbEngine(event.d.engine),
+        frame: dbCallsiteFrame(event.d.callsite),
+        message:
+          `The latest captured ${reference.entity} ${reference.id} row had total_cents=${sourceTotal}, ` +
+          `but the subsequent report persisted total_cents=${reportedTotal}.`,
+      }),
+      dedupeKey: `reportsourcecontradiction:${reference.entity}:${reference.id}:${table ?? ""}`,
+    });
+  }
+}
+
 function addRelationalWriteIntegrityCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
@@ -6290,6 +6441,8 @@ function addRelationalWriteIntegrityCandidates(
   addRequestTargetRowMismatchCandidates(events, index, drafts, exchanges);
   addStaleValueWritebackCandidates(events, index, drafts);
   addBatchAppliedCountMismatchCandidates(events, index, drafts);
+  addMissingEntityAuditCandidates(events, index, drafts);
+  addReportSourceContradictionCandidates(events, index, drafts);
 }
 
 // ─── async state lifecycle integrity ─────────────────────────────────────────
