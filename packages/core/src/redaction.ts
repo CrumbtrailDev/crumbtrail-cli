@@ -1455,6 +1455,12 @@ export interface RedactedValueShape {
   len: number;
   charset: RedactedShapeCharset;
   hash8?: string;
+  /**
+   * Session-salted fingerprint of the lowercase value. Present only when case
+   * folding changes a sufficiently high-entropy string, so consumers can spot
+   * case-only identity collisions without learning or recovering the value.
+   */
+  casefoldHash8?: string;
 }
 
 export type StructuredClassification =
@@ -1639,6 +1645,12 @@ export function computeRedactedShape(value: unknown): RedactedValueShape {
     text.length < 6 || (charset === "num" && text.length < 12);
   if (!smallCandidateSpace) {
     shape.hash8 = fnv1a32Hex(`${getStructuredShapeSalt()}:${text}`);
+    const casefolded = text.toLowerCase();
+    if (casefolded !== text) {
+      shape.casefoldHash8 = fnv1a32Hex(
+        `${getStructuredShapeSalt()}:${casefolded}`,
+      );
+    }
   }
   return shape;
 }
@@ -1768,6 +1780,8 @@ function redactedShapePlaceholder(value: unknown): Record<string, unknown> {
     charset: shape.charset,
   };
   if (shape.hash8 !== undefined) placeholder.hash8 = shape.hash8;
+  if (shape.casefoldHash8 !== undefined)
+    placeholder.casefoldHash8 = shape.casefoldHash8;
   return placeholder;
 }
 
