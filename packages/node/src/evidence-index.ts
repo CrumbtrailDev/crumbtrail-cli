@@ -620,6 +620,7 @@ export function buildEvidenceCandidates(
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
   addBatchImportCandidates(events, index, drafts, exchanges);
   addRefundInvariantCandidates(events, index, drafts);
+  addSessionCartInvariantCandidates(events, index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
   addDeclinedPaymentOrderedCandidates(events, index, drafts);
   addStoredActiveMarkupCandidates(events, index, drafts);
@@ -6214,6 +6215,196 @@ function addRefundInvariantCandidates(
         source: normalizeDbEngine(last.event.d.engine),
       }),
       dedupeKey: `duplicaterestock:${orderId}:${productId}`,
+    });
+  }
+}
+
+// ─── session-bound cart invariants ────────────────────────────────────────────
+
+function cartItemsFromExchange(
+  exchange: RequestExchange | undefined,
+): Record<string, unknown>[] | undefined {
+  if (!exchange?.res || !isSuccessStatus(exchange.status)) return undefined;
+  const body = parseStructuredBody(exchange.resBody);
+  if (!isRecord(body) || !Array.isArray(body.items)) return undefined;
+  const items = body.items.filter(isRecord);
+  return items.length === body.items.length ? items : undefined;
+}
+
+function itemIdentity(item: Record<string, unknown>): string | undefined {
+  return (
+    keyValueOf(item.productId) ??
+    keyValueOf(item.product_id) ??
+    keyValueOf(item.id) ??
+    safeText(item.slug, 200)
+  );
+}
+
+function hasDuplicateCartIdentity(items: Record<string, unknown>[]): boolean {
+  const seen = new Set<string>();
+  for (const item of items) {
+    const identity = itemIdentity(item);
+    if (!identity) continue;
+    if (seen.has(identity)) return true;
+    seen.add(identity);
+  }
+  return false;
+}
+
+function addSessionCartInvariantCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const ordered = [...exchanges.values()].sort(
+    (a, b) => a.req.t - b.req.t,
+  );
+  const cartReads = ordered.filter(
+    (exchange) =>
+      exchange.method === "GET" &&
+      capturedUrlPath(exchange.url) === "/api/cart",
+  );
+
+  for (const checkout of ordered) {
+    if (
+      checkout.method !== "POST" ||
+      capturedUrlPath(checkout.url) !== "/api/checkout" ||
+      !checkout.res
+    )
+      continue;
+    const response = parseStructuredBody(checkout.resBody);
+    if (
+      !isRecord(response) ||
+      safeText(response.error, 80) !== "empty_cart"
+    )
+      continue;
+    const deletedSession = events.some(
+      (event) =>
+        event.k === "db.diff" &&
+        safeText(event.d.requestId, 120) === checkout.requestId &&
+        safeText(event.d.op, 20)?.toLowerCase() === "delete" &&
+        bareTableName(safeText(event.d.table, 160) ?? "").toLowerCase() ===
+          "sessions",
+    );
+    if (!deletedSession) continue;
+    const before = [...cartReads]
+      .reverse()
+      .find((read) => read.res && read.res.t < checkout.req.t);
+    const after = cartReads.find(
+      (read) => read.req.t > (checkout.res?.t ?? checkout.req.t),
+    );
+    const beforeItems = cartItemsFromExchange(before);
+    const afterItems = cartItemsFromExchange(after);
+    if (
+      !beforeItems ||
+      beforeItems.length === 0 ||
+      !afterItems ||
+      afterItems.length !== 0
+    )
+      continue;
+    drafts.push({
+      detector: "cart_lost_after_session_expiry",
+      title: `Session expiry erased a non-empty cart during checkout`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE + 2,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: checkout.res.t,
+        offsetMs:
+          offsetForEvent(checkout.res) ??
+          offsetFromStart(checkout.res.t, index.start),
+        route: routeAt(index.navs ?? [], checkout.res.t),
+        requestId: checkout.requestId,
+        method: checkout.method,
+        url: redactUrl(checkout.url),
+        status: checkout.status,
+        message: `The cart contained ${beforeItems.length} item line${beforeItems.length === 1 ? "" : "s"} immediately before checkout. That checkout deleted the active session and returned empty_cart; the next cart read was empty.`,
+      }),
+      dedupeKey: `sessioncartloss:${checkout.requestId}`,
+    });
+  }
+
+  interface Login {
+    exchange: RequestExchange;
+    userId: string;
+    mergedLines: number;
+  }
+  const logins: Login[] = [];
+  for (const exchange of ordered) {
+    if (
+      exchange.method !== "POST" ||
+      capturedUrlPath(exchange.url) !== "/api/login" ||
+      !isSuccessStatus(exchange.status)
+    )
+      continue;
+    const body = parseStructuredBody(exchange.resBody);
+    if (!isRecord(body) || !isRecord(body.user)) continue;
+    const userId = keyValueOf(body.user.id);
+    const mergedLines = finiteNumber(body.mergedLines);
+    if (userId && mergedLines !== undefined && mergedLines > 0)
+      logins.push({ exchange, userId, mergedLines });
+  }
+  for (let i = 1; i < logins.length; i += 1) {
+    const first = logins[i - 1];
+    const second = logins[i];
+    if (first.userId !== second.userId) continue;
+    const firstCart = cartReads.find(
+      (read) =>
+        read.req.t > (first.exchange.res?.t ?? first.exchange.req.t) &&
+        read.req.t < second.exchange.req.t,
+    );
+    const secondCart = cartReads.find(
+      (read) =>
+        read.req.t > (second.exchange.res?.t ?? second.exchange.req.t),
+    );
+    const firstItems = cartItemsFromExchange(firstCart);
+    const secondItems = cartItemsFromExchange(secondCart);
+    if (
+      !firstItems ||
+      firstItems.length === 0 ||
+      !secondItems ||
+      secondItems.length <= firstItems.length ||
+      !hasDuplicateCartIdentity(secondItems)
+    )
+      continue;
+    const cartWriteBetween = ordered.some(
+      (exchange) =>
+        exchange.req.t > (firstCart?.res?.t ?? first.exchange.req.t) &&
+        exchange.req.t < (secondCart?.res?.t ?? Number.POSITIVE_INFINITY) &&
+        exchange.method !== "GET" &&
+        (capturedUrlPath(exchange.url)?.startsWith("/api/cart") ?? false),
+    );
+    if (cartWriteBetween) continue;
+    drafts.push({
+      detector: "cart_remerged_on_login",
+      title: `Repeated login merged the same guest cart twice`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE + 2,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: secondCart?.res?.t ?? second.exchange.res?.t ?? second.exchange.req.t,
+        offsetMs:
+          offsetForEvent(secondCart?.res ?? second.exchange.res) ??
+          offsetFromStart(
+            secondCart?.res?.t ??
+              second.exchange.res?.t ??
+              second.exchange.req.t,
+            index.start,
+          ),
+        route: routeAt(
+          index.navs ?? [],
+          secondCart?.res?.t ??
+            second.exchange.res?.t ??
+            second.exchange.req.t,
+        ),
+        requestId: second.exchange.requestId,
+        method: second.exchange.method,
+        url: redactUrl(second.exchange.url),
+        status: second.exchange.status,
+        message: `Two successful logins for the same user each reported merged guest lines. The cart grew from ${firstItems.length} to ${secondItems.length} lines and now contains a duplicate product, with no add-to-cart request between the reads.`,
+      }),
+      dedupeKey: `cartremerge:${second.userId}`,
     });
   }
 }
