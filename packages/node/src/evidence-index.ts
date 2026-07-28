@@ -619,6 +619,7 @@ export function buildEvidenceCandidates(
   addSharedStateBleedCandidates(events, index, drafts, exchanges);
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
+  addDeclinedPaymentOrderedCandidates(events, index, drafts);
   addInputRevertedCandidates(events, index, drafts);
   addFormResetAfterErrorCandidates(events, index, drafts);
   addCurrencyLocaleMismatchCandidates(events, index, drafts);
@@ -6009,6 +6010,60 @@ function addRuntimeWarningCandidates(
       // Content signature, not the timestamp: a leak re-warns on every request
       // and has to read as one finding with a count, not as fifty findings.
       dedupeKey: `runtimewarning:${name}:${normalizeErrorSignature(event.d.message)}`,
+    });
+  }
+}
+
+// ─── declined_payment_ordered ───────────────────────────────────────────────
+
+const DECLINED_PAYMENT_ORDERED_SCORE = 94;
+const DECLINED_PAYMENT_ORDERED_WINDOW_MS = 10_000;
+
+/**
+ * declined_payment_ordered: a payment gateway explicitly declined a charge,
+ * but the same request lifecycle still inserted an order.
+ */
+function addDeclinedPaymentOrderedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const declined = events.filter(
+    (event) =>
+      event.k === "backend.http" &&
+      safeText(event.d.service, 80)?.toLowerCase() === "payments" &&
+      safeText(event.d.chargeStatus, 80)?.toLowerCase() === "declined",
+  );
+  for (const failure of declined) {
+    const order = events.find(
+      (event) =>
+        event.k === "db.diff" &&
+        event.d.table === "orders" &&
+        event.d.op === "insert" &&
+        event.t >= failure.t &&
+        event.t <= failure.t + DECLINED_PAYMENT_ORDERED_WINDOW_MS,
+    );
+    if (!order) continue;
+    drafts.push({
+      detector: "declined_payment_ordered",
+      title: `An order was placed after its payment was declined`,
+      severity: "critical",
+      score: DECLINED_PAYMENT_ORDERED_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: order.t,
+        offsetMs:
+          offsetForEvent(order) ?? offsetFromStart(order.t, index.start),
+        route: routeAt(index.navs ?? [], order.t),
+        requestId: correlationIdOf(order),
+        table: "orders",
+        source: normalizeDbEngine(order.d.engine),
+        message:
+          `The payments service returned chargeStatus=declined` +
+          `${safeText(failure.d.failureCode, 80) ? ` (${safeText(failure.d.failureCode, 80)})` : ""}, ` +
+          `then an orders row was inserted ${order.t - failure.t} ms later.`,
+      }),
+      dedupeKey: `declinedordered:${correlationIdOf(order) ?? order.t}`,
     });
   }
 }
