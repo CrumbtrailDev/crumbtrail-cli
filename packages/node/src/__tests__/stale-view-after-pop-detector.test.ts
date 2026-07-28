@@ -185,4 +185,20 @@ describe("stale_view_after_pop", () => {
       expect(detectors(unrelated)).not.toContain("stale_view_after_pop");
     });
   });
+
+  it("detects the live browser ordering when the previous request shares the pop window", () => {
+    const found = detectors([
+      nav(2_557, "http://127.0.0.1:5637/search", "init"),
+      nav(2_567, "http://127.0.0.1:5637/search?category=desk", "push"),
+      apiCall(2_568, "/api/search?category=desk"),
+      nav(
+        2_585,
+        "http://127.0.0.1:5637/search?category=desk&inStock=1",
+        "push",
+      ),
+      apiCall(2_585, "/api/search?category=desk&inStock=1"),
+      nav(2_613, "http://127.0.0.1:5637/search?category=desk", "pop"),
+    ]);
+    expect(found).toContain("stale_view_after_pop");
+  });
 });

@@ -620,6 +620,7 @@ export function buildEvidenceCandidates(
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
   addInputRevertedCandidates(events, index, drafts);
+  addFormResetAfterErrorCandidates(events, index, drafts);
   addCurrencyLocaleMismatchCandidates(events, index, drafts);
   addDisplayDateTimezoneMismatchCandidates(events, index, drafts);
   addLayoutOverflowCandidates(events, index, drafts);
@@ -6136,6 +6137,78 @@ function addInputRevertedCandidates(
   }
 }
 
+// ─── form_reset_after_error ─────────────────────────────────────────────────
+
+const FORM_RESET_AFTER_ERROR_WINDOW_MS = 2_000;
+const FORM_RESET_AFTER_ERROR_SCORE = 79;
+
+/**
+ * form_reset_after_error: a failed submit was followed by multiple controls
+ * being silently cleared. The interaction collector emits `ev:"state"` only
+ * when a snapshotted control changed without a user input event, including
+ * framework remounts, so two empty controls after a 4xx response is the
+ * high-signal "one validation error wiped my form" shape.
+ */
+function addFormResetAfterErrorCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const ordered = [...events].sort((a, b) => a.t - b.t);
+  for (const submit of ordered) {
+    if (submit.k !== "inp" || submit.d.ev !== "submit") continue;
+    const failure = ordered.find(
+      (event) =>
+        event.k === "net.res" &&
+        event.t >= submit.t &&
+        event.t <= submit.t + FORM_RESET_AFTER_ERROR_WINDOW_MS &&
+        (finiteNumber(event.d.st) ?? 0) >= 400 &&
+        (finiteNumber(event.d.st) ?? 0) < 500,
+    );
+    if (!failure) continue;
+
+    const cleared = ordered.filter(
+      (event) =>
+        event.k === "inp" &&
+        event.d.ev === "state" &&
+        event.d.trusted === false &&
+        event.t >= failure.t &&
+        event.t <= submit.t + FORM_RESET_AFTER_ERROR_WINDOW_MS &&
+        inputValueLength(event) === 0,
+    );
+    const fields = [
+      ...new Set(
+        cleared
+          .map(inputFieldKey)
+          .filter((field): field is string => field !== undefined),
+      ),
+    ];
+    if (fields.length < 2) continue;
+
+    drafts.push({
+      detector: "form_reset_after_error",
+      title: `A failed submit silently cleared ${fields.length} form fields`,
+      severity: "high",
+      score: FORM_RESET_AFTER_ERROR_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: cleared[0].t,
+        offsetMs:
+          offsetForEvent(cleared[0]) ??
+          offsetFromStart(cleared[0].t, index.start),
+        route: routeAt(index.navs ?? [], cleared[0].t),
+        requestId: correlationIdOf(failure),
+        target: targetForEvent(submit),
+        message:
+          `The submit received HTTP ${finiteNumber(failure.d.st)}, then the app ` +
+          `changed ${fields.length} snapshotted controls to empty without user input. ` +
+          `Fields are identified structurally; their values remain redacted.`,
+      }),
+      dedupeKey: `formreset:${routeAt(index.navs ?? [], submit.t) ?? "unknown"}`,
+    });
+  }
+}
+
 // ─── display_date_timezone_mismatch ─────────────────────────────────────────
 
 const DISPLAY_DATE_TIMEZONE_MISMATCH_SCORE = 76;
@@ -6536,7 +6609,11 @@ function addStaleViewAfterPopCandidates(
    * side a request withdraws the claim, and refusing to count one because its
    * parameters look unrelated would manufacture findings.
    */
-  const anyRequestAroundPop = (popAt: number, popUrl: URL): boolean =>
+  const anyRequestAroundPop = (
+    popAt: number,
+    popUrl: URL,
+    previousNavAt: number,
+  ): boolean =>
     apiRequests.some(
       (request) => {
         if (
@@ -6552,7 +6629,10 @@ function addStaleViewAfterPopCandidates(
         // is leaving commonly lands a few milliseconds before the pop too; it
         // must not hide the stale view.
         const requestUrl = parseCapturedUrl(request.url);
-        return requestUrl?.search === popUrl.search;
+        return (
+          request.t >= previousNavAt &&
+          requestUrl?.search === popUrl.search
+        );
       },
     );
 
@@ -6579,7 +6659,7 @@ function addStaleViewAfterPopCandidates(
       return provedReactionTo(earlier.event.t, url);
     });
     if (!provedReactive) continue;
-    if (anyRequestAroundPop(pop.event.t, popUrl)) continue;
+    if (anyRequestAroundPop(pop.event.t, popUrl, previous.event.t)) continue;
 
     drafts.push({
       detector: "stale_view_after_pop",
