@@ -64,7 +64,7 @@ export interface UiNumItem {
 // collector for every decimal-comma shopper: de-DE's `$129,00` parsed as
 // nothing, so a German session carried zero numeric evidence.
 const NUM_TOKEN_RE =
-  /^([$€£¥])?\s*(-?[\d٠-٩۰-۹][\d٠-٩۰-۹.,٫٬    ]*)\s*([$€£¥%])?$/;
+  /^([$€£¥])?\s*(-?[\d٠-٩۰-۹][\d٠-٩۰-۹.,٫٬\u00a0\u202f\u2009 ]*)\s*([$€£¥%])?$/;
 
 /** Containers that delimit a snapshot region. */
 const REGION_SELECTOR =
@@ -96,7 +96,7 @@ function usesCommaDecimal(lang: string | null): boolean {
 }
 
 const ARABIC_INDIC_DIGIT_RE = /[٠-٩۰-۹]/g;
-const SPACE_GROUP_RE = /[    ]/g;
+const SPACE_GROUP_RE = /[\u00a0\u202f\u2009 ]/g;
 
 /**
  * Reduces a locale-rendered numeric string to canonical `-?\d+(\.\d+)?` form,

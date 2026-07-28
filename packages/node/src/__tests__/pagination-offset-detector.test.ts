@@ -11,6 +11,14 @@ function req(requestId: string, t: number, url: string): BugEvent {
   } as unknown as BugEvent;
 }
 
+function backendReq(requestId: string, t: number, url: string): BugEvent {
+  return {
+    t,
+    k: "backend.req.start",
+    d: { requestId, url, method: "GET" },
+  } as unknown as BugEvent;
+}
+
 function read(
   requestId: string,
   t: number,
@@ -69,6 +77,16 @@ describe("pagination_first_page_offset", () => {
     const found = detections(events);
     expect(found).toHaveLength(1);
     expect(String(found[0]?.anchor?.message)).toContain("OFFSET 1");
+  });
+
+  it("uses a correlated backend request when the browser request is absent", () => {
+    const events = [
+      backendReq("r1", 100, "/api/products?page=%5BREDACTED%5D&limit=%5BREDACTED%5D"),
+      read("r1", 120, { limit: 50, offset: 1 }),
+    ];
+    const found = detections(events);
+    expect(found).toHaveLength(1);
+    expect(found[0]?.anchor?.requestId).toBe("r1");
   });
 
   it("collapses the per-row read events into one finding", () => {

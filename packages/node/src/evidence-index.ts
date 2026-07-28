@@ -1229,7 +1229,11 @@ function addPaginationOffsetCandidates(
 ): void {
   const requestsById = new Map<string, BugEvent>();
   for (const event of events) {
-    if (event.k !== "net.req") continue;
+    // A backend only application has no net.req plane, and first paint can
+    // reach the server before the browser collector has drained its early
+    // queue. backend.req.start carries the same correlation id and URL, so it
+    // is an equally valid request anchor for a database pagination invariant.
+    if (event.k !== "net.req" && event.k !== "backend.req.start") continue;
     const id = safeText(event.d.requestId, 120) ?? requestIdForEvent(event);
     if (id && !requestsById.has(id)) requestsById.set(id, event);
   }

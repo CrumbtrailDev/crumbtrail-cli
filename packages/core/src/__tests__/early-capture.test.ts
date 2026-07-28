@@ -484,9 +484,9 @@ describe("Crumbtrail.init session adoption", () => {
     await logger.stop();
   });
 
-  it("lets an explicit sessionId win and still drains the queue", async () => {
+  it("keeps the session id already sent on early requests over an explicit id", async () => {
     globalThis.fetch = fetchMock();
-    installEarlyCapture();
+    const capture = installEarlyCapture();
     await globalThis.fetch("/api/cart");
 
     const logger = Crumbtrail.init({
@@ -497,7 +497,7 @@ describe("Crumbtrail.init session adoption", () => {
       flushBufferSize: 1000,
     });
 
-    expect(logger.getSessionId()).toBe("ses_explicit_1");
+    expect(logger.getSessionId()).toBe(capture?.sessionId);
     expect(readEarlyCapture()?.entries).toHaveLength(0);
     expect(readEarlyCapture()?.deferred).toBe(true);
     await logger.stop();
