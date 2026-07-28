@@ -342,3 +342,16 @@ export type {
 // closed when the marker is absent, so this re-export is load bearing and must
 // survive bundling in both the ESM and CJS dist outputs.
 export { NODE_CONTRACT_CAPABILITIES } from "./node-contract-capabilities";
+
+// ── Node runtime warning capture ─────────────────────────────────────────────
+// Append-only block. Do not reorder the exports above.
+export {
+  BACKEND_WARNING_EVENT,
+  buildBackendWarningEvent,
+  installBackendWarningCapture,
+} from "./backend-warnings";
+export type {
+  BackendWarningCaptureHandle,
+  BackendWarningCaptureOptions,
+  RuntimeWarningLike,
+} from "./backend-warnings";

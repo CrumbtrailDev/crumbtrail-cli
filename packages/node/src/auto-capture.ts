@@ -10,6 +10,10 @@ import {
   type AutoInstrumentDriver,
   type AutoInstrumentReport,
 } from "./db/auto-instrument";
+import {
+  installBackendWarningCapture,
+  type BackendWarningCaptureHandle,
+} from "./backend-warnings";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -115,6 +119,15 @@ export interface AutoCaptureOptions {
   databaseDrivers?: readonly AutoInstrumentDriver[];
   /** Module resolver seam for auto-instrumentation (tests). */
   databaseResolve?: (specifier: string) => unknown;
+  /**
+   * When true (default) record Node runtime warnings (`process.on("warning")`)
+   * as `backend.warning` events. This is the only path by which a
+   * MaxListenersExceededWarning or a DeprecationWarning — the platform naming a
+   * defect the application never logs — reaches a session.
+   *
+   * Set false to leave the process untouched.
+   */
+  captureRuntimeWarnings?: boolean;
 }
 
 export interface AutoCaptureHandle {
@@ -402,6 +415,31 @@ export async function autoCapture(
   };
   proc.on("unhandledRejection", onUnhandled);
 
+  // Runtime warnings. Ref-counted inside `installBackendWarningCapture`, so two
+  // captures in one process (or two test files) share a single process listener
+  // rather than each adding one — the thing MaxListenersExceededWarning exists
+  // to complain about. Emitted through the same session as everything else, and
+  // dropped rather than queued while the session is dark, matching db events.
+  let warningCapture: BackendWarningCaptureHandle | undefined;
+  if (options.captureRuntimeWarnings !== false) {
+    try {
+      warningCapture = installBackendWarningCapture({
+        processImpl: proc,
+        sessionId: stableSessionId,
+        emit: (event) => {
+          if (stopped || !session) return;
+          void session
+            .record(event)
+            .catch((sendErr) =>
+              emitError(sendErr, { phase: "record", source: "console.error" }),
+            );
+        },
+      });
+    } catch (error) {
+      emitError(error, { phase: "record", source: "console.error" });
+    }
+  }
+
   // Zero-config DB capture. Installed AFTER the hooks so a driver patch can
   // never delay crash instrumentation, and best-effort in the same sense as the
   // rest of this module: a driver with an unexpected shape is reported, never
@@ -442,6 +480,7 @@ export async function autoCapture(
     }
     proc.removeListener("uncaughtException", onUncaught);
     proc.removeListener("unhandledRejection", onUnhandled);
+    warningCapture?.stop();
     dbInstrumentation?.restore();
     installed = false;
   };
