@@ -373,6 +373,11 @@ describe("early capture drain", () => {
     expect(req?.d.url).toBe("/api/cart");
     expect(res?.d.st).toBe(200);
     expect(res?.d.body).toBe('{"total":42}');
+    expect(res?.d.bodyMeta).toEqual({
+      ct: "json",
+      bytes: 12,
+      data: { total: 42 },
+    });
     expect(req?.d.sessionId).toBe(capture?.sessionId);
     expect(req?.d.requestId).toBe(queued?.requestId);
     expect(req?.d.traceId).toBe(queued?.traceId);

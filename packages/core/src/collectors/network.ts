@@ -102,6 +102,165 @@ function shouldExclude(url: string, config: CrumbtrailConfig): boolean {
   return config.networkExcludeUrls.some((pattern) => url.includes(pattern));
 }
 
+/* ------------------------------------------------------------------ */
+/* Response body summary (`d.bodyMeta`)                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `d.body` carries the redacted response body as text, which answers "what did
+ * the server say" but not "what shape was it, and how much of it is here".
+ * `d.bodyMeta` adds the size facts plus a bounded, parsed view so a detector
+ * can compare a rendered number against the field that produced it without
+ * re-parsing an unbounded string, and can tell a real empty list from a
+ * truncated one.
+ *
+ * The parsed view is derived from the ALREADY REDACTED body text, never from
+ * the raw response, so it cannot widen what capture stores.
+ */
+const RESPONSE_SUMMARY_MAX_BYTES = 32_768;
+const RESPONSE_SUMMARY_MAX_DEPTH = 4;
+const RESPONSE_SUMMARY_MAX_ARRAY = 20;
+const RESPONSE_SUMMARY_MAX_STRING = 120;
+
+export interface ResponseBodyMeta {
+  /** `"json"` when `data` is present, otherwise the response's media type. */
+  ct: string;
+  /** Body size in bytes. Absent when neither the text nor content-length was available. */
+  bytes?: number;
+  /** True when depth, array length, or string length caps dropped anything. */
+  truncated?: boolean;
+  data?: unknown;
+  /** True length of each truncated array, keyed by its path (`"$"` is the root). */
+  arrayTotal?: Record<string, number>;
+}
+
+interface SummaryState {
+  truncated: boolean;
+  arrayTotal: Record<string, number>;
+}
+
+function utf8ByteLength(text: string): number {
+  try {
+    if (typeof TextEncoder !== "undefined")
+      return new TextEncoder().encode(text).length;
+  } catch {
+    // Fall through to the character-count approximation.
+  }
+  return text.length;
+}
+
+function mediaType(contentType: string): string {
+  const essence = contentType.split(";")[0]?.trim().toLowerCase();
+  return essence || "unknown";
+}
+
+function isJsonContentType(contentType: string): boolean {
+  return /\bjson\b/i.test(contentType);
+}
+
+function isSameOriginUrl(url: string): boolean {
+  try {
+    const origin = (globalThis as { location?: { origin?: string } }).location
+      ?.origin;
+    if (!origin || origin === "null") return false;
+    return new URL(url, origin).origin === origin;
+  } catch {
+    return false;
+  }
+}
+
+function capSummaryValue(
+  value: unknown,
+  depth: number,
+  path: string,
+  state: SummaryState,
+): unknown {
+  if (typeof value === "string") {
+    if (value.length <= RESPONSE_SUMMARY_MAX_STRING) return value;
+    state.truncated = true;
+    return value.slice(0, RESPONSE_SUMMARY_MAX_STRING);
+  }
+
+  if (Array.isArray(value)) {
+    if (depth >= RESPONSE_SUMMARY_MAX_DEPTH) {
+      state.truncated = true;
+      return `[array:${value.length}]`;
+    }
+    const kept = value.slice(0, RESPONSE_SUMMARY_MAX_ARRAY);
+    if (value.length > kept.length) {
+      state.truncated = true;
+      state.arrayTotal[path] = value.length;
+    }
+    return kept.map((entry, index) =>
+      capSummaryValue(entry, depth + 1, `${path}[${index}]`, state),
+    );
+  }
+
+  if (value !== null && typeof value === "object") {
+    if (depth >= RESPONSE_SUMMARY_MAX_DEPTH) {
+      state.truncated = true;
+      return "[object]";
+    }
+    const output: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(
+      value as Record<string, unknown>,
+    )) {
+      output[key] = capSummaryValue(entry, depth + 1, `${path}.${key}`, state);
+    }
+    return output;
+  }
+
+  return value;
+}
+
+/**
+ * Builds `d.bodyMeta` for one response. `redactedBody` is the output of the
+ * shared body-redaction pipeline; it is parsed (never the raw text) and capped.
+ * Returns undefined when nothing is known about the body at all.
+ */
+function buildResponseBodyMeta(input: {
+  url: string;
+  contentType: string;
+  contentLength?: string | null;
+  text?: string;
+  redactedBody?: string;
+}): ResponseBodyMeta | undefined {
+  const declaredLength = Number(input.contentLength);
+  const bytes =
+    input.text !== undefined
+      ? utf8ByteLength(input.text)
+      : Number.isFinite(declaredLength) && declaredLength >= 0
+        ? declaredLength
+        : undefined;
+
+  if (!input.contentType && bytes === undefined) return undefined;
+
+  const meta: ResponseBodyMeta = { ct: mediaType(input.contentType) };
+  if (bytes !== undefined) meta.bytes = bytes;
+
+  const summarizable =
+    input.redactedBody !== undefined &&
+    isJsonContentType(input.contentType) &&
+    isSameOriginUrl(input.url) &&
+    bytes !== undefined &&
+    bytes <= RESPONSE_SUMMARY_MAX_BYTES;
+  if (!summarizable) return meta;
+
+  try {
+    const parsed = JSON.parse(input.redactedBody as string) as unknown;
+    const state: SummaryState = { truncated: false, arrayTotal: {} };
+    meta.data = capSummaryValue(parsed, 0, "$", state);
+    meta.ct = "json";
+    if (state.truncated) meta.truncated = true;
+    if (Object.keys(state.arrayTotal).length > 0)
+      meta.arrayTotal = state.arrayTotal;
+  } catch {
+    // Not parseable after redaction: size facts only, never a partial guess.
+    delete meta.data;
+  }
+  return meta;
+}
+
 function headersToRecord(
   headers: HeadersInit | undefined,
 ): Record<string, string> | undefined {
@@ -290,6 +449,14 @@ function applyBodyResult(
   if (result.bodySummary) target.bodySummary = result.bodySummary;
 }
 
+function applyResponseBodyMeta(
+  target: Record<string, unknown>,
+  input: Parameters<typeof buildResponseBodyMeta>[0],
+): void {
+  const meta = buildResponseBodyMeta(input);
+  if (meta) target.bodyMeta = meta;
+}
+
 /* ------------------------------------------------------------------ */
 /* Fetch wrapper                                                       */
 /* ------------------------------------------------------------------ */
@@ -413,21 +580,34 @@ function wrapFetch(
     }
 
     const contentType = response.headers.get("content-type") ?? "";
+    const contentLength = response.headers.get("content-length");
 
     if (isSSE(contentType)) {
       const bodyResult = summarizeOmittedPayload("stream_payload", "body");
       applyBodyResult(resData, bodyResult);
       resMetadata.push(bodyResult.metadata);
+      applyResponseBodyMeta(resData, {
+        url: url,
+        contentType,
+        contentLength,
+      });
     } else if (isBinaryContentType(contentType)) {
       const bodyResult = summarizeBinaryPayload(
         contentType,
-        response.headers.get("content-length"),
+        contentLength,
         "body",
       );
       applyBodyResult(resData, bodyResult);
       resMetadata.push(bodyResult.metadata);
+      applyResponseBodyMeta(resData, {
+        url: url,
+        contentType,
+        contentLength,
+      });
     } else {
       try {
+        // clone() leaves the app's stream untouched — the page still reads the
+        // response itself.
         const cloned = response.clone();
         const text = await cloned.text();
         if (text) {
@@ -454,6 +634,13 @@ function wrapFetch(
           if (bodyResult.bodySummary)
             resData.bodySummary = bodyResult.bodySummary;
           resMetadata.push(bodyResult.metadata);
+          applyResponseBodyMeta(resData, {
+            url: url,
+            contentType,
+            contentLength,
+            text,
+            redactedBody: bodyResult.body,
+          });
         }
       } catch {
         const bodyResult = summarizeOmittedPayload("body_read_failed", "body");
@@ -708,19 +895,30 @@ function wrapXHR(
       }
 
       const contentType = this.getResponseHeader("content-type") ?? "";
+      const contentLength = this.getResponseHeader("content-length");
 
       if (isSSE(contentType)) {
         const bodyResult = summarizeOmittedPayload("stream_payload", "body");
         applyBodyResult(resData, bodyResult);
         resMetadata.push(bodyResult.metadata);
+        applyResponseBodyMeta(resData, {
+          url: meta.url,
+          contentType,
+          contentLength,
+        });
       } else if (isBinaryContentType(contentType)) {
         const bodyResult = summarizeBinaryPayload(
           contentType,
-          this.getResponseHeader("content-length"),
+          contentLength,
           "body",
         );
         applyBodyResult(resData, bodyResult);
         resMetadata.push(bodyResult.metadata);
+        applyResponseBodyMeta(resData, {
+          url: meta.url,
+          contentType,
+          contentLength,
+        });
       } else {
         const text = this.responseText;
         if (text) {
@@ -747,6 +945,13 @@ function wrapXHR(
           if (bodyResult.bodySummary)
             resData.bodySummary = bodyResult.bodySummary;
           resMetadata.push(bodyResult.metadata);
+          applyResponseBodyMeta(resData, {
+            url: meta.url,
+            contentType,
+            contentLength,
+            text,
+            redactedBody: bodyResult.body,
+          });
         }
       }
 
@@ -900,6 +1105,12 @@ function emitEarlyRecord(
     }
     if (bodyResult.bodySummary) resData.bodySummary = bodyResult.bodySummary;
     resMetadata.push(bodyResult.metadata);
+    applyResponseBodyMeta(resData, {
+      url: record.url,
+      contentType: record.ct ?? "",
+      text: record.resBody,
+      redactedBody: bodyResult.body,
+    });
   }
 
   attachRedactionMetadata(resData, ...resMetadata);
