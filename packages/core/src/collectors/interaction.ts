@@ -105,6 +105,8 @@ export function interactionCollector(
   config: CrumbtrailConfig,
 ): CollectorCleanup {
   const cleanups: Array<() => void> = [];
+  const inputVersions = new WeakMap<Element, number>();
+  const observationTimers = new Set<ReturnType<typeof setTimeout>>();
 
   // --- Clicks ---
   const onClick = (e: MouseEvent) => {
@@ -133,8 +135,18 @@ export function interactionCollector(
   cleanups.push(() => document.removeEventListener("click", onClick, true));
 
   // --- Input / Change ---
-  const onInput = (e: Event) => {
-    const target = e.target;
+  const isInputControl = (
+    target: EventTarget | null,
+  ): target is HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement =>
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement;
+
+  const emitInputState = (
+    target: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
+    eventType: string,
+    trusted: boolean,
+  ) => {
     if (!(
       target instanceof HTMLInputElement ||
       target instanceof HTMLTextAreaElement ||
@@ -158,11 +170,11 @@ export function interactionCollector(
     const d: Record<string, unknown> = {
       el,
       val: val.value,
-      ev: e.type as "input" | "change",
+      ev: eventType,
       // A user typing produces a trusted event; a script assigning `.value`
       // and dispatching its own does not. That is the difference between the
       // user entering the wrong thing and the app overwriting what they typed.
-      trusted: e.isTrusted === true,
+      trusted,
     };
     if (val.summary) d.valSummary = val.summary;
     attachRedactionMetadata(d, readDescriptorMetadata(el), val.metadata);
@@ -172,6 +184,37 @@ export function interactionCollector(
       k: "inp",
       d,
     });
+  };
+
+  const observeSilentValueChange = (
+    target: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
+    expectedValue: string,
+    version: number,
+    delayMs: number,
+  ) => {
+    const timer = setTimeout(() => {
+      observationTimers.delete(timer);
+      if (!target.isConnected) return;
+      if ((inputVersions.get(target) ?? 0) !== version) return;
+      if (target.value === expectedValue) return;
+      // React and browser autofill commonly assign the value property without
+      // dispatching an input event. Emit a privacy scrubbed state observation
+      // so a detector can distinguish the app taking a value back from the
+      // user's own next keystroke.
+      emitInputState(target, "state", false);
+    }, delayMs);
+    observationTimers.add(timer);
+  };
+
+  const onInput = (e: Event) => {
+    const target = e.target;
+    if (!isInputControl(target)) return;
+    const version = (inputVersions.get(target) ?? 0) + 1;
+    inputVersions.set(target, version);
+    emitInputState(target, e.type, e.isTrusted === true);
+    if (e.isTrusted === true) {
+      observeSilentValueChange(target, target.value, version, 450);
+    }
   };
   document.addEventListener("input", onInput, true);
   document.addEventListener("change", onInput, true);
@@ -200,6 +243,15 @@ export function interactionCollector(
       k: "inp",
       d,
     });
+
+    // A failed submit can remount or reset the whole form without dispatching
+    // an input event. Snapshot each value now, then emit only controls whose
+    // value the application changed while handling the response.
+    for (const control of target.querySelectorAll("input, textarea, select")) {
+      if (!isInputControl(control)) continue;
+      const version = inputVersions.get(control) ?? 0;
+      observeSilentValueChange(control, control.value, version, 700);
+    }
   };
   document.addEventListener("submit", onSubmit, true);
   cleanups.push(() => document.removeEventListener("submit", onSubmit, true));
@@ -240,6 +292,8 @@ export function interactionCollector(
   );
 
   return () => {
+    for (const timer of observationTimers) clearTimeout(timer);
+    observationTimers.clear();
     for (const fn of cleanups) fn();
   };
 }

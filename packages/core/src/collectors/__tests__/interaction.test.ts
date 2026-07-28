@@ -26,6 +26,7 @@ describe("interactionCollector", () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
   });
 
   // --- Initial nav ---
@@ -237,6 +238,82 @@ describe("interactionCollector", () => {
     expect(submitEvents[0].d.trusted).toBe(false);
 
     document.body.removeChild(form);
+  });
+
+  it("captures a silent programmatic value change after trusted input", () => {
+    vi.useFakeTimers();
+    const input = document.createElement("input");
+    input.name = "postalCode";
+    document.body.appendChild(input);
+
+    input.value = "SW1A2AA";
+    const userInput = new Event("input", { bubbles: true });
+    Object.defineProperty(userInput, "isTrusted", { value: true });
+    input.dispatchEvent(userInput);
+    input.value = "SWA";
+    vi.advanceTimersByTime(450);
+    bus.flush();
+
+    const inputEvents = events.filter((event) => event.k === "inp");
+    expect(inputEvents).toHaveLength(2);
+    expect(inputEvents[1].d).toMatchObject({
+      ev: "state",
+      trusted: false,
+      valSummary: { originalLength: 3 },
+    });
+
+    document.body.removeChild(input);
+  });
+
+  it("captures controls silently cleared after a form submit", () => {
+    vi.useFakeTimers();
+    const form = document.createElement("form");
+    const line1 = document.createElement("input");
+    line1.name = "line1";
+    line1.value = "10 Downing Street";
+    form.appendChild(line1);
+    document.body.appendChild(form);
+
+    form.dispatchEvent(new Event("submit", { bubbles: true }));
+    line1.value = "";
+    vi.advanceTimersByTime(700);
+    bus.flush();
+
+    expect(
+      events.some(
+        (event) =>
+          event.k === "inp" &&
+          event.d.ev === "state" &&
+          event.d.trusted === false &&
+          (event.d.el as Record<string, unknown>).name === "line1",
+      ),
+    ).toBe(true);
+
+    document.body.removeChild(form);
+  });
+
+  it("does not report the user's next input as a silent overwrite", () => {
+    vi.useFakeTimers();
+    const input = document.createElement("input");
+    input.name = "postalCode";
+    document.body.appendChild(input);
+
+    for (const value of ["S", "SW"]) {
+      input.value = value;
+      const event = new Event("input", { bubbles: true });
+      Object.defineProperty(event, "isTrusted", { value: true });
+      input.dispatchEvent(event);
+    }
+    vi.advanceTimersByTime(450);
+    bus.flush();
+
+    expect(
+      events.some(
+        (event) => event.k === "inp" && event.d.ev === "state",
+      ),
+    ).toBe(false);
+
+    document.body.removeChild(input);
   });
 
   // --- Navigation via pushState ---
