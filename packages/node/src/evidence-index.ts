@@ -619,6 +619,7 @@ export function buildEvidenceCandidates(
   addSharedStateBleedCandidates(events, index, drafts, exchanges);
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
   addBatchImportCandidates(events, index, drafts, exchanges);
+  addRefundInvariantCandidates(events, index, drafts);
   addRuntimeWarningCandidates(events, index, drafts);
   addDeclinedPaymentOrderedCandidates(events, index, drafts);
   addStoredActiveMarkupCandidates(events, index, drafts);
@@ -5971,6 +5972,249 @@ function addBatchImportCandidates(
         dedupeKey: `batchshift:${exchange.requestId}:${csv.headers[valueColumn]}`,
       });
     }
+  }
+}
+
+// ─── refund and return invariants ─────────────────────────────────────────────
+
+interface RefundInsert {
+  event: BugEvent;
+  orderId: string;
+  amount: number;
+}
+
+function orderIdFromRow(row: Record<string, unknown>): string | undefined {
+  return keyValueOf(row.order_id) ?? keyValueOf(row.orderId);
+}
+
+/**
+ * Cross-request lifecycle invariants: cumulative issued refunds may not exceed
+ * the order total, and returning then refunding one order may not restock the
+ * same item twice.
+ */
+function addRefundInvariantCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const orderTotals = new Map<string, number>();
+  const refunds: RefundInsert[] = [];
+
+  for (const event of events) {
+    const table = safeText(event.d.table, 160);
+    if (!table) continue;
+    const bare = bareTableName(table).toLowerCase();
+    const row =
+      event.k === "db.read"
+        ? isRecord(event.d.row)
+          ? event.d.row
+          : undefined
+        : event.k === "db.diff" && isRecord(event.d.after)
+          ? event.d.after
+          : undefined;
+    if (!row) continue;
+
+    if (bare === "orders") {
+      const orderId =
+        keyValueOf(row.id) ??
+        (isRecord(event.d.pk) ? keyValueOf(event.d.pk.id) : undefined);
+      const total =
+        finiteNumber(row.total_cents) ?? finiteNumber(row.totalCents);
+      if (orderId && total !== undefined && total >= 0)
+        orderTotals.set(orderId, total);
+    }
+    if (
+      bare === "refunds" &&
+      event.k === "db.diff" &&
+      safeText(event.d.op, 20)?.toLowerCase() === "insert"
+    ) {
+      const orderId = orderIdFromRow(row);
+      const amount =
+        finiteNumber(row.amount_cents) ?? finiteNumber(row.amountCents);
+      if (orderId && amount !== undefined && amount > 0)
+        refunds.push({ event, orderId, amount });
+    }
+  }
+
+  const refundsByOrder = new Map<string, RefundInsert[]>();
+  for (const refund of refunds) {
+    const list = refundsByOrder.get(refund.orderId) ?? [];
+    list.push(refund);
+    refundsByOrder.set(refund.orderId, list);
+  }
+  for (const [orderId, entries] of refundsByOrder) {
+    const total = orderTotals.get(orderId);
+    if (total === undefined) continue;
+    entries.sort((a, b) => a.event.t - b.event.t);
+    let refunded = 0;
+    let exceeded: RefundInsert | undefined;
+    for (const entry of entries) {
+      refunded += entry.amount;
+      if (refunded > total) {
+        exceeded = entry;
+        break;
+      }
+    }
+    if (!exceeded) continue;
+    drafts.push({
+      detector: "refund_total_exceeded",
+      title: `Issued refunds exceeded order ${orderId}'s total`,
+      severity: "critical",
+      score: DB_INVARIANT_SCORE + 4,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exceeded.event.t,
+        offsetMs:
+          offsetForEvent(exceeded.event) ??
+          offsetFromStart(exceeded.event.t, index.start),
+        route: routeAt(index.navs ?? [], exceeded.event.t),
+        requestId: safeText(exceeded.event.d.requestId, 120),
+        message: `${entries.length} issued refund rows total ${refunded} cents against an order total of ${total} cents. The cumulative ledger exceeded the maximum refundable balance.`,
+        source: normalizeDbEngine(exceeded.event.d.engine),
+      }),
+      dedupeKey: `overrefund:${orderId}`,
+    });
+  }
+
+  interface Restock {
+    event: BugEvent;
+    requestId: string;
+    orderId: string;
+    productId: string;
+    quantity: number;
+    source: "return" | "refund";
+  }
+  const byRequest = dbDiffsByRequest(events);
+  const readsByRequest = new Map<string, BugEvent[]>();
+  for (const event of events) {
+    if (event.k !== "db.read") continue;
+    const requestId = safeText(event.d.requestId, 120);
+    if (!requestId) continue;
+    const list = readsByRequest.get(requestId) ?? [];
+    list.push(event);
+    readsByRequest.set(requestId, list);
+  }
+
+  const restocks: Restock[] = [];
+  for (const [requestId, requestDiffs] of byRequest) {
+    let orderId: string | undefined;
+    let source: Restock["source"] | undefined;
+    for (const diff of requestDiffs) {
+      const table = bareTableName(safeText(diff.d.table, 160) ?? "").toLowerCase();
+      const after = isRecord(diff.d.after) ? diff.d.after : undefined;
+      if (!after) continue;
+      if (
+        table === "orders" &&
+        safeText(after.status, 40)?.toLowerCase() === "returned"
+      ) {
+        orderId =
+          keyValueOf(after.id) ??
+          (isRecord(diff.d.pk) ? keyValueOf(diff.d.pk.id) : undefined);
+        source = "return";
+      } else if (
+        table === "refunds" &&
+        safeText(diff.d.op, 20)?.toLowerCase() === "insert"
+      ) {
+        orderId = orderIdFromRow(after);
+        source = "refund";
+      }
+    }
+    if (!orderId || !source) continue;
+
+    const itemReads = (readsByRequest.get(requestId) ?? []).flatMap((read) => {
+      if (
+        bareTableName(safeText(read.d.table, 160) ?? "").toLowerCase() !==
+          "order_items" ||
+        !isRecord(read.d.row)
+      )
+        return [];
+      const productId =
+        keyValueOf(read.d.row.product_id) ?? keyValueOf(read.d.row.productId);
+      const quantity =
+        finiteNumber(read.d.row.qty) ?? finiteNumber(read.d.row.quantity);
+      return productId && quantity !== undefined && quantity > 0
+        ? [{ productId, quantity }]
+        : [];
+    });
+    for (const diff of requestDiffs) {
+      if (
+        bareTableName(safeText(diff.d.table, 160) ?? "").toLowerCase() !==
+        "products"
+      )
+        continue;
+      const before = isRecord(diff.d.before) ? diff.d.before : undefined;
+      const after = isRecord(diff.d.after) ? diff.d.after : undefined;
+      if (!before || !after) continue;
+      const previous = finiteNumber(before.inventory);
+      const current = finiteNumber(after.inventory);
+      const productId =
+        keyValueOf(after.id) ??
+        (isRecord(diff.d.pk) ? keyValueOf(diff.d.pk.id) : undefined);
+      if (
+        previous === undefined ||
+        current === undefined ||
+        !productId ||
+        current <= previous
+      )
+        continue;
+      const quantity = current - previous;
+      if (
+        !itemReads.some(
+          (item) =>
+            item.productId === productId && item.quantity === quantity,
+        )
+      )
+        continue;
+      restocks.push({
+        event: diff,
+        requestId,
+        orderId,
+        productId,
+        quantity,
+        source,
+      });
+    }
+  }
+
+  const groupedRestocks = new Map<string, Restock[]>();
+  for (const restock of restocks) {
+    const key = `${restock.orderId}\u0000${restock.productId}`;
+    const list = groupedRestocks.get(key) ?? [];
+    list.push(restock);
+    groupedRestocks.set(key, list);
+  }
+  for (const [key, entries] of groupedRestocks) {
+    if (
+      entries.length < 2 ||
+      !entries.some((entry) => entry.source === "return") ||
+      !entries.some((entry) => entry.source === "refund")
+    )
+      continue;
+    entries.sort((a, b) => a.event.t - b.event.t);
+    const last = entries[entries.length - 1];
+    const [orderId, productId] = key.split("\u0000");
+    const totalQuantity = entries.reduce(
+      (sum, entry) => sum + entry.quantity,
+      0,
+    );
+    drafts.push({
+      detector: "duplicate_restock",
+      title: `Order ${orderId} restocked product ${productId} twice`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE + 2,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: last.event.t,
+        offsetMs:
+          offsetForEvent(last.event) ??
+          offsetFromStart(last.event.t, index.start),
+        route: routeAt(index.navs ?? [], last.event.t),
+        requestId: last.requestId,
+        message: `The return transition restored this order item's quantity, then a separate refund request restored it again. ${entries.length} inventory increases added ${totalQuantity} units for the same order and product.`,
+        source: normalizeDbEngine(last.event.d.engine),
+      }),
+      dedupeKey: `duplicaterestock:${orderId}:${productId}`,
+    });
   }
 }
 
