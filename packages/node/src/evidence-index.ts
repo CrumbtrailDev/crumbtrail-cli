@@ -6438,6 +6438,43 @@ function expectedLocalizedCents(
   return Number.isFinite(amount) ? Math.round(amount * 100) : undefined;
 }
 
+/**
+ * Privacy-safe fallback for a redacted `d,dd` / `dd,dd` money input. The
+ * collector retains only length and character class. If the client-submitted
+ * cents decode to N whole units after stripping one locale decimal separator,
+ * that shape proves the intended two-fraction-digit value was N cents.
+ */
+function expectedLocalizedCentsFromShape(
+  raw: unknown,
+  locale: string,
+  actualCents: number,
+): number | undefined {
+  if (
+    !isRecord(raw) ||
+    !isRedactedPlaceholder(raw) ||
+    finiteNumber(raw.len) === undefined ||
+    safeText(raw.charset, 40) !== "mixed" ||
+    actualCents <= 0 ||
+    actualCents % 100 !== 0
+  )
+    return undefined;
+  let decimal = ".";
+  try {
+    const formatter = new Intl.NumberFormat(locale);
+    decimal =
+      formatter
+        .formatToParts(1.1)
+        .find((part) => part.type === "decimal")?.value ?? ".";
+  } catch {
+    return undefined;
+  }
+  if (decimal === ".") return undefined;
+  const digits = String(actualCents / 100);
+  if (finiteNumber(raw.len) !== digits.length + decimal.length) return undefined;
+  const expected = Number(digits);
+  return Number.isFinite(expected) ? expected : undefined;
+}
+
 function addLocaleInputCandidates(
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
@@ -6480,19 +6517,20 @@ function addLocaleInputCandidates(
       });
     }
 
-    const raw = safeText(request.raw, 120);
     const locale = safeText(request.locale, 40);
     const actual =
       finiteNumber(request.amountCents) ??
       finiteNumber(request.amount_cents);
     if (
       !isSuccessStatus(exchange.status) ||
-      !raw ||
       !locale ||
       actual === undefined
     )
       continue;
-    const expected = expectedLocalizedCents(raw, locale);
+    const raw = safeText(request.raw, 120);
+    const expected = raw
+      ? expectedLocalizedCents(raw, locale)
+      : expectedLocalizedCentsFromShape(request.raw, locale, actual);
     if (
       expected === undefined ||
       expected <= 0 ||
