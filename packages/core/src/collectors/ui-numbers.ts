@@ -490,6 +490,101 @@ function readLocale(): { dir: string; lang: string | null } {
   }
 }
 
+interface RtlPhysicalRule {
+  source?: string;
+  properties: string[];
+  matched: number;
+}
+
+const RTL_PHYSICAL_RULE_LIMIT = 8;
+const RTL_PHYSICAL_PROPERTIES = [
+  "left",
+  "right",
+  "margin-left",
+  "margin-right",
+  "padding-left",
+  "padding-right",
+  "border-left",
+  "border-right",
+];
+
+function asymmetricFourValueShorthand(
+  style: CSSStyleDeclaration,
+  property: "margin" | "padding",
+): boolean {
+  const tokens = style
+    .getPropertyValue(property)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  return tokens.length === 4 && tokens[1] !== tokens[3];
+}
+
+/**
+ * Under RTL, active author rules that use physical left/right properties are
+ * the evidence document-level overflow cannot provide. The scan is bounded,
+ * same-origin only, and records no selector or page text.
+ */
+function readRtlPhysicalRules(): RtlPhysicalRule[] {
+  const output: RtlPhysicalRule[] = [];
+  const visit = (rules: CSSRuleList, source?: string): void => {
+    for (const rule of Array.from(rules)) {
+      if (output.length >= RTL_PHYSICAL_RULE_LIMIT) return;
+      // Modern Chromium exposes `cssRules` on CSSStyleRule for native CSS
+      // nesting. A style rule must be inspected before the grouping-rule path,
+      // or every ordinary rule is mistaken for an empty container.
+      if (!(rule instanceof CSSStyleRule) && "cssRules" in rule) {
+        try {
+          visit((rule as CSSGroupingRule).cssRules, source);
+        } catch {
+          // Inaccessible nested rule: skip it.
+        }
+        continue;
+      }
+      if (!(rule instanceof CSSStyleRule)) continue;
+      let matched = 0;
+      try {
+        matched = document.querySelectorAll(rule.selectorText).length;
+      } catch {
+        continue;
+      }
+      if (matched === 0) continue;
+      const cssText = rule.style.cssText.toLowerCase();
+      if (/(?:^|;)\s*(?:inset|margin|padding|border)-inline/.test(cssText))
+        continue;
+      // CSSStyleDeclaration expands `margin: 0` into both margin-left and
+      // margin-right. Read the authored declaration text so symmetric
+      // shorthands do not fill the bounded result with false physical rules.
+      const properties = RTL_PHYSICAL_PROPERTIES.filter((property) =>
+        new RegExp(`(?:^|;)\\s*${property}\\s*:`).test(cssText),
+      );
+      if (asymmetricFourValueShorthand(rule.style, "margin"))
+        properties.push("margin");
+      if (asymmetricFourValueShorthand(rule.style, "padding"))
+        properties.push("padding");
+      if (properties.length === 0) continue;
+      output.push({
+        ...(source ? { source } : {}),
+        properties: [...new Set(properties)].sort(),
+        matched: Math.min(matched, 100),
+      });
+    }
+  };
+
+  for (const sheet of Array.from(document.styleSheets).slice(0, 20)) {
+    if (output.length >= RTL_PHYSICAL_RULE_LIMIT) break;
+    try {
+      const href = sheet.href
+        ? redactUrl(sheet.href, "stylesheet").value
+        : undefined;
+      visit(sheet.cssRules, href);
+    } catch {
+      // Cross-origin stylesheets intentionally expose no cssRules.
+    }
+  }
+  return output;
+}
+
 /**
  * One small measurement per navigation: document geometry plus locale. It is
  * what turns "the layout is broken on this screen" into evidence — horizontal
@@ -515,6 +610,10 @@ function emitLayout(bus: EventBus): void {
       overflowX: Math.max(0, scrollW - clientW),
     };
     if (urlResult) d.url = urlResult.value;
+    if (locale.dir.toLowerCase() === "rtl") {
+      const rtlPhysical = readRtlPhysicalRules();
+      if (rtlPhysical.length > 0) d.rtlPhysical = rtlPhysical;
+    }
     attachRedactionMetadata(d, urlResult?.metadata);
     bus.emit({ t: now(), k: UI_LAYOUT_EVENT_KIND, d });
   } catch {
