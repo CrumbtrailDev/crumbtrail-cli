@@ -635,7 +635,12 @@ function sanitizeRecord(
       continue;
     }
     if (
-      key === "body" &&
+      // `responseBody` alongside `body`: the backend plane records what a
+      // handler sent under its own key, and that name carries the literal token
+      // `body`, so the name-based rule would sweep the one sentence that
+      // explains a 500 to `[REDACTED]`. Same gate as the browser's body — it is
+      // kept only when the event declares it already went through the v2 policy.
+      (key === "body" || key === "responseBody") &&
       fieldPath === "event.d" &&
       typeof raw === "string" &&
       declaresStructuredBodyRedaction(value)
