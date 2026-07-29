@@ -42,6 +42,17 @@ export interface RedactionMetadata {
   policy: BrowserRedactionPolicy;
   fields: RedactionField[];
   summaries?: PayloadSummary[];
+  /**
+   * Field names the application declared keepable, carried so the capture
+   * server's re-classification can apply the same name exemption.
+   *
+   * Without it the server re-runs with an empty keep list and placeholders
+   * every name the application deliberately kept, which is how a declared
+   * `error` or `message` still reached disk as `[REDACTED]`. This is a
+   * declaration, not a grant: the server re-runs every value-based check, so a
+   * token or card number inside a kept field is still caught.
+   */
+  keep?: string[];
 }
 
 export interface RedactionResult<T> {
@@ -301,20 +312,24 @@ export function mergeRedactionMetadata(
   const summaries: PayloadSummary[] = [];
 
   let policy: BrowserRedactionPolicy = BROWSER_REDACTION_POLICY;
+  const keep = new Set<string>();
   for (const item of items) {
     if (!item) continue;
     if (item.policy === BROWSER_REDACTION_POLICY_V2)
       policy = BROWSER_REDACTION_POLICY_V2;
     fields.push(...item.fields);
     if (item.summaries) summaries.push(...item.summaries);
+    for (const name of item.keep ?? []) keep.add(name);
   }
 
-  if (fields.length === 0 && summaries.length === 0) return undefined;
+  if (fields.length === 0 && summaries.length === 0 && keep.size === 0)
+    return undefined;
 
   return {
     policy,
     fields,
     ...(summaries.length > 0 ? { summaries } : {}),
+    ...(keep.size > 0 ? { keep: [...keep] } : {}),
   };
 }
 
@@ -1785,6 +1800,54 @@ function redactedShapePlaceholder(value: unknown): Record<string, unknown> {
   return placeholder;
 }
 
+const PLACEHOLDER_KEYS = new Set([
+  "$redacted",
+  "len",
+  "charset",
+  "hash8",
+  "casefoldHash8",
+]);
+const CHARSET_RE = /^[a-z]+$/;
+const HASH8_RE = /^[0-9a-f]{8}$/;
+
+/**
+ * True only for a value this module itself produced.
+ *
+ * Redaction runs more than once over the same payload: the SDK classifies a
+ * body before sending it, and the capture server re-classifies it at rest,
+ * deliberately, so a client that lies about its policy cannot store secrets.
+ * Without this check the second pass sees a placeholder OBJECT under a
+ * free-text name and wraps it in another placeholder, so the stored value is
+ * `$redacted` inside `$redacted` and the `len`/`hash8` shape facts detectors
+ * join against describe the first placeholder rather than the original value.
+ *
+ * The check is exact rather than structural on purpose. Every key must be one
+ * of the five this module emits, `$redacted` must be the literal marker, `len`
+ * a finite number, and the hashes 8 hex digits. Nothing that shape can carry a
+ * secret, so treating it as already-redacted grants a caller nothing.
+ */
+function isRedactedPlaceholder(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    return false;
+  const record = value as Record<string, unknown>;
+  if (record.$redacted !== REDACTED_VALUE) return false;
+  for (const [key, entry] of Object.entries(record)) {
+    if (!PLACEHOLDER_KEYS.has(key)) return false;
+    if (key === "$redacted") continue;
+    if (key === "len") {
+      if (typeof entry !== "number" || !Number.isFinite(entry)) return false;
+      continue;
+    }
+    if (typeof entry !== "string") return false;
+    if (key === "charset") {
+      if (!CHARSET_RE.test(entry) || entry.length > 16) return false;
+      continue;
+    }
+    if (!HASH8_RE.test(entry)) return false;
+  }
+  return true;
+}
+
 function redactStructuredJsonValue(
   value: unknown,
   path: string,
@@ -1792,6 +1855,9 @@ function redactStructuredJsonValue(
   fields: RedactionField[],
   keyName?: string,
 ): unknown {
+  // Already redacted by an earlier pass. Re-wrapping it would replace the
+  // original value's shape facts with the placeholder's own.
+  if (isRedactedPlaceholder(value)) return value;
   // A deny-listed field name redacts its entire subtree, whatever the type.
   if (isStructuredDenyName(keyName, policy.denyFields, policy.keepFields)) {
     fields.push({ path, reason: "deny_field", action: "redacted" });
@@ -1872,6 +1938,9 @@ function redactStructuredJsonBody(
       policy: BROWSER_REDACTION_POLICY_V2,
       fields,
       summaries: [summary],
+      ...(policy.keepFields && policy.keepFields.length > 0
+        ? { keep: [...policy.keepFields] }
+        : {}),
     },
   };
 }
