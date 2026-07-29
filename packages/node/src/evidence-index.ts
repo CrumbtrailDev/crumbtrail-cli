@@ -578,6 +578,7 @@ export function buildEvidenceCandidates(
   addRepeatedClickCandidates(events, index, drafts);
   addSlowRequestCandidates(events, index, requestById, drafts);
   addPendingRequestCandidates(index, requestById, responseIds, drafts);
+  addResponseRaceCandidates(events, index, requestById, drafts);
   addIneffectiveSubmitCandidates(events, index, drafts);
   addMediaDegradationCandidates(events, index, drafts);
   addVoiceMarkerCandidates(events, index, drafts);
@@ -588,7 +589,20 @@ export function buildEvidenceCandidates(
   addDbDiffCandidates(events, index, drafts);
   addDbFieldDivergenceCandidates(events, index, drafts);
   addDuplicateWriteCandidates(events, index, drafts);
+  addInterpolationArtifactCandidates(events, index, drafts);
+  addStateFlipFlopCandidates(events, index, drafts);
+  addDuplicateChargeCandidates(events, index, drafts);
+  addMoneyScaleShiftCandidates(events, index, drafts);
+  addCrossUserReadCandidates(events, index, drafts);
+  addDuplicateReadbackCandidates(events, index, drafts);
+  addOrphanedReferenceCandidates(events, index, drafts);
+  addLostUpdateCandidates(events, index, drafts);
+  addCounterContradictionCandidates(events, index, drafts);
+  addNPlusOneCandidates(events, index, drafts);
+  addPaginationOffsetCandidates(events, index, drafts);
+  addListenerTypeStaircaseCandidates(events, index, drafts);
   const mutatingRequests = collectMutatingRequests(events);
+  addConcurrentDuplicateMutationCandidates(events, index, drafts, mutatingRequests);
   addDbDeltaMismatchCandidates(events, index, drafts, mutatingRequests);
   addClientSuppliedValueCandidates(events, index, drafts, mutatingRequests);
   addUnrequestedClearCandidates(events, index, drafts, mutatingRequests);
@@ -602,6 +616,42 @@ export function buildEvidenceCandidates(
   addUiArithmeticMismatchCandidates(events, index, drafts);
   addUiApiDivergenceCandidates(events, index, drafts);
   addOtelDbActivityCandidates(events, index, drafts);
+
+  // Full-recall detectors. Append-only: every rule above keeps its position and
+  // its ranking, and these read evidence the pipeline already captured but no
+  // rule had ever looked at.
+  const exchanges = collectRequestExchanges(events);
+  addFilterContradictionCandidates(events, index, drafts, exchanges);
+  addResultRowLossCandidates(events, index, drafts, exchanges);
+  addSharedStateBleedCandidates(events, index, drafts, exchanges);
+  addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
+  addBatchImportCandidates(events, index, drafts, exchanges);
+  addRelationalWriteIntegrityCandidates(events, index, drafts, exchanges);
+  addOpsStateLifecycleCandidates(events, index, drafts, exchanges);
+  addDataLifecycleIntegrityCandidates(events, index, drafts, exchanges);
+  addBrowserNetworkIntegrityCandidates(events, index, drafts, exchanges);
+  addRefundInvariantCandidates(events, index, drafts);
+  addSessionCartInvariantCandidates(events, index, drafts, exchanges);
+  addLocaleInputCandidates(index, drafts, exchanges);
+  addRuntimeWarningCandidates(events, index, drafts);
+  addDeclinedPaymentOrderedCandidates(events, index, drafts);
+  addCheckoutCorrectnessCandidates(events, index, drafts);
+  addDownstreamSucceededAfterTimeoutCandidates(events, index, drafts);
+  addInvalidWebhookSignatureAcceptedCandidates(
+    events,
+    index,
+    drafts,
+    exchanges,
+  );
+  addStoredActiveMarkupCandidates(events, index, drafts);
+  addInputRevertedCandidates(events, index, drafts);
+  addFormResetAfterErrorCandidates(events, index, drafts);
+  addCurrencyLocaleMismatchCandidates(events, index, drafts);
+  addDisplayDateTimezoneMismatchCandidates(events, index, drafts);
+  addLayoutOverflowCandidates(events, index, drafts);
+  addStaleViewAfterPopCandidates(events, index, drafts);
+  addListenerGrowthCandidates(events, index, drafts);
+  addStreamDesyncCandidates(events, index, drafts, exchanges);
 
   // Demote the 4xx responses the application returned deliberately (auth challenges, structured
   // error bodies) before dedupe so their grouped keys collapse. Ranking-only, like the beacon pass.
@@ -964,7 +1014,7 @@ function addSlowRequestCandidates(
     if (event.k !== "net.res") continue;
     const dur = finiteNumber(event.d.dur);
     if (dur === undefined || dur < 5_000) continue;
-    const requestId = requestIdForEvent(event);
+    const requestId = networkRequestId(event.d.id);
     const req = requestId ? requests.get(requestId) : undefined;
     drafts.push({
       detector: "slow_request",
@@ -1025,6 +1075,377 @@ function addPendingRequestCandidates(
       dedupeKey: `pending:${req.id}`,
     });
   }
+}
+
+/**
+ * Two requests to the same endpoint were in flight together and came back in the
+ * opposite order to the one they were sent in.
+ *
+ * This is the shape behind every "the search box shows results for what I typed
+ * three keystrokes ago" report: the app fires one request per keystroke, the
+ * earlier and narrower query happens to take longer, and whichever response
+ * lands last wins the render. Nothing errors, nothing is slow, and the gate
+ * stays green — the only trace is the ordering, which is fully visible here and
+ * invisible from inside the app unless it was already sequencing responses.
+ *
+ * Reported as a race rather than as a bug: an app that tags each response and
+ * drops the stale one has the same event shape and is correct. The evidence is
+ * the ordering; whether the UI stomped is the reader's call, and the message
+ * says so rather than asserting it.
+ */
+function addResponseRaceCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  requests: Map<string, RequestInfo>,
+  drafts: CandidateDraft[],
+): void {
+  // Order is the whole signal here, and timestamps alone cannot carry it: two
+  // calls fired from the same tick share a millisecond, so a comparison on `t`
+  // reads the real race below as no race at all. Capture order is what actually
+  // records which went first, so both orders are taken from the event stream and
+  // timestamps are used only to prove the two overlapped.
+  const sentAt = new Map<string, number>();
+  for (const event of events) {
+    if (event.k !== "net.req") continue;
+    const id = networkRequestId(event.d.id);
+    if (id && !sentAt.has(id)) sentAt.set(id, sentAt.size);
+  }
+
+  // Responses in arrival order, joined back to the request that opened them.
+  const arrivals: {
+    req: RequestInfo;
+    res: BugEvent;
+    ok: boolean;
+    sentSeq: number;
+    backSeq: number;
+  }[] = [];
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const id = networkRequestId(event.d.id);
+    const req = id ? requests.get(id) : undefined;
+    const sentSeq = id ? sentAt.get(id) : undefined;
+    if (!req?.url || sentSeq === undefined) continue;
+    const status = finiteNumber(event.d.st);
+    arrivals.push({
+      req,
+      res: event,
+      ok: status !== undefined && status >= 200 && status < 300,
+      sentSeq,
+      backSeq: arrivals.length,
+    });
+  }
+
+  // Same endpoint means same method and path. The query string is the part that
+  // differs between the racing calls, so keying on the full URL would put every
+  // keystroke in its own bucket and find nothing.
+  const byEndpoint = new Map<string, typeof arrivals>();
+  for (const arrival of arrivals) {
+    const key = `${arrival.req.method ?? "GET"} ${requestPathOf(arrival.req.url ?? "")}`;
+    const bucket = byEndpoint.get(key) ?? [];
+    bucket.push(arrival);
+    byEndpoint.set(key, bucket);
+  }
+
+  for (const [endpoint, bucket] of byEndpoint) {
+    if (bucket.length < 2) continue;
+    for (let i = 0; i < bucket.length; i += 1) {
+      for (let j = i + 1; j < bucket.length; j += 1) {
+        const first = bucket[i];
+        const second = bucket[j];
+        // Equal send sequence means both responses joined the SAME request
+        // record — the browser restarts its request ids on navigation, so a
+        // page reload replays id 1 and the second response has no request of
+        // its own. The race claim rests entirely on send order, and for such
+        // a pair send order does not exist; report nothing.
+        if (first.sentSeq === second.sentSeq) continue;
+        // `earlier` and `later` are by send order; the race is that `later`
+        // also came back first.
+        const later = second.sentSeq > first.sentSeq ? second : first;
+        const earlier = later === second ? first : second;
+        if (later.backSeq >= earlier.backSeq) continue;
+        // A genuine overlap, not two sequential calls: the second was sent
+        // before the first had answered. A pair where either half failed is a
+        // different signal that the error detectors own.
+        if (later.req.t > earlier.res.t) continue;
+        if (!first.ok || !second.ok) continue;
+        // An out-of-order pair is only evidence when the user could tell the
+        // difference. Two byte-identical requests whose responses carry the
+        // same status and byte count render the same thing in either order —
+        // and interval pollers (build checks, heartbeats) overlap routinely,
+        // so without this check every polling endpoint tops the ranking.
+        if (
+          earlier.req.url !== undefined &&
+          earlier.req.url === later.req.url &&
+          responsesLookIdentical(earlier.res, later.res)
+        )
+          continue;
+        const gapMs = Math.round(earlier.res.t - later.res.t);
+        drafts.push({
+          detector: "response_race",
+          title: `Out of order responses from ${titleUrl(earlier.req.url ?? "") ?? endpoint}`,
+          severity: "medium",
+          score: 72,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: earlier.res.t,
+            offsetMs:
+              offsetForEvent(earlier.res) ??
+              offsetFromStart(earlier.res.t, index.start),
+            route: routeAt(index.navs ?? [], earlier.res.t),
+            requestId: earlier.req.id,
+            method: earlier.req.method,
+            url: redactUrl(earlier.req.url),
+            // Identified by send time rather than by URL: the part that differs
+            // between racing calls is the query string, which redaction blanks
+            // unless the app declared those fields keepable. Offsets always
+            // survive, so the pair stays distinguishable at any policy.
+            message: `Two requests to this endpoint overlapped and returned in the opposite order. The one sent at +${Math.round(offsetFromStart(earlier.req.t, index.start) ?? 0)} ms came back ${gapMs} ms after the one sent at +${Math.round(offsetFromStart(later.req.t, index.start) ?? 0)} ms (${redactUrl(later.req.url) ?? "later request"}). Whatever the app rendered last is the older result, unless it discards responses that no longer match the current input.`,
+          }),
+          dedupeKey: `race:${earlier.req.id}:${later.req.id}`,
+        });
+      }
+    }
+  }
+}
+
+/**
+ * Whether two responses are indistinguishable to the page: same status and the
+ * same byte count. Bytes come from bodyMeta (post-capture) or the summary's
+ * originalLength; when neither response carries a size, the answer is false so
+ * the race stays reported — suppression needs positive evidence.
+ */
+function responsesLookIdentical(a: BugEvent, b: BugEvent): boolean {
+  const statusA = finiteNumber(a.d.st);
+  if (statusA === undefined || statusA !== finiteNumber(b.d.st)) return false;
+  const bytesOf = (event: BugEvent): number | undefined => {
+    const meta = event.d.bodyMeta;
+    const fromMeta = isRecord(meta) ? finiteNumber(meta.bytes) : undefined;
+    if (fromMeta !== undefined) return fromMeta;
+    const summary = event.d.bodySummary;
+    return isRecord(summary) ? finiteNumber(summary.originalLength) : undefined;
+  };
+  const bytesA = bytesOf(a);
+  return bytesA !== undefined && bytesA === bytesOf(b);
+}
+
+/**
+ * A first-page request ran its SELECT with a fractional-page OFFSET.
+ *
+ * Off-by-one pagination is the canonical "the first item just isn't there"
+ * report: the request carries no paging parameter (or asks for page 1), the
+ * query runs `OFFSET 1`, and every row of output is real and correct except
+ * the one that never appears on any page. Nothing errors and no count
+ * contradicts, so the window on the read event is the only evidence.
+ *
+ * The guard `0 < offset < limit` is what keeps this quiet on legitimate
+ * queries: a real page 2 runs with offset === limit, a ranked pick
+ * ("second-highest") runs LIMIT 1 OFFSET 1 where offset === limit, and cursor
+ * pagination carries no OFFSET at all. Requests that page by cursor-style
+ * parameters are skipped outright, because their window arithmetic is not
+ * derivable from the URL.
+ */
+const PAGINATION_OFFSET_SCORE = 68;
+const PAGE_PARAM_NAMES = new Set(["page", "p", "pageindex", "pagenumber"]);
+const OFFSET_PARAM_NAMES = new Set(["offset", "skip", "start"]);
+const CURSOR_PARAM_NAMES = new Set(["cursor", "after", "before", "pagetoken"]);
+
+function addPaginationOffsetCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const requestsById = new Map<string, BugEvent>();
+  for (const event of events) {
+    // A backend only application has no net.req plane, and first paint can
+    // reach the server before the browser collector has drained its early
+    // queue. backend.req.start carries the same correlation id and URL, so it
+    // is an equally valid request anchor for a database pagination invariant.
+    if (event.k !== "net.req" && event.k !== "backend.req.start") continue;
+    const id = safeText(event.d.requestId, 120) ?? requestIdForEvent(event);
+    if (id && !requestsById.has(id)) requestsById.set(id, event);
+  }
+
+  for (const event of events) {
+    if (event.k !== "db.read" && event.k !== "db.read.bulk") continue;
+    const shape = isRecord(event.d.q) ? event.d.q : undefined;
+    const limit = finiteNumber(shape?.limit);
+    const offset = finiteNumber(shape?.offset);
+    if (
+      limit === undefined ||
+      offset === undefined ||
+      offset <= 0 ||
+      offset >= limit
+    )
+      continue;
+    const requestId = safeText(event.d.requestId, 120);
+    const request = requestId ? requestsById.get(requestId) : undefined;
+    if (!request) continue;
+    const url = safeText(request.d.url, 400);
+    if (!url) continue;
+
+    let params: URLSearchParams;
+    try {
+      params = new URL(url, "http://local").searchParams;
+    } catch {
+      continue;
+    }
+    let firstPage = true;
+    let cursorStyle = false;
+    for (const [name, value] of params) {
+      const key = name.toLowerCase();
+      if (CURSOR_PARAM_NAMES.has(key)) cursorStyle = true;
+      // Query values are routinely redacted at capture ("[REDACTED]"), so only
+      // a READABLE later-page value disproves first-page; an unreadable value
+      // proves nothing either way. The window guard above already excludes
+      // every aligned window a genuine later page would run (page N's offset
+      // is a multiple of limit, never 0 < offset < limit), so treating an
+      // unreadable value as unknown cannot admit legitimate paging.
+      if (
+        PAGE_PARAM_NAMES.has(key) &&
+        /^\d+$/.test(value) &&
+        value !== "1" &&
+        value !== "0"
+      )
+        firstPage = false;
+      if (OFFSET_PARAM_NAMES.has(key) && /^\d+$/.test(value) && value !== "0")
+        firstPage = false;
+    }
+    if (!firstPage || cursorStyle) continue;
+
+    const table = safeText(event.d.table, 120) ?? "table";
+    drafts.push({
+      detector: "pagination_first_page_offset",
+      title: `First page of ${table} skips ${offset} row${offset === 1 ? "" : "s"}`,
+      severity: "medium",
+      score: PAGINATION_OFFSET_SCORE,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId,
+        method: safeText(request.d.method, 20),
+        url: redactUrl(url),
+        message:
+          `This request asks for the first page, but its ${table} SELECT ran with ` +
+          `OFFSET ${offset} (LIMIT ${limit}). The first ${offset} row${offset === 1 ? "" : "s"} of the ` +
+          `table's order are skipped before the page starts, so they are returned to no page at all.`,
+      }),
+      dedupeKey: `pageoffset:${requestId}:${table}:${offset}`,
+    });
+  }
+}
+
+/**
+ * The same mutation was in flight twice at once and both copies succeeded.
+ *
+ * This is the transport shape of both halves of a read-modify-write race: a
+ * client that double-fires a submit, or two tabs/users hitting a shared
+ * resource, sends byte-identical mutations whose handling overlaps, and the
+ * store applies both. The symptom downstream is a duplicated line or a lost
+ * increment — invisible to every error detector because both requests returned
+ * 2xx. Sequential retries are excluded on purpose (a retry after a failure is
+ * the client behaving correctly); only pairs whose lifetimes overlap qualify.
+ *
+ * Bodies must be readable to group: a redacted body collapses distinct payloads
+ * into one signature, which would manufacture duplicates, so any body carrying
+ * a redaction marker is skipped rather than trusted.
+ */
+const CONCURRENT_DUPLICATE_MUTATION_SCORE = 72;
+const REDACTION_MARKER = "[REDACTED]";
+
+function addConcurrentDuplicateMutationCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  mutatingRequests: Map<string, CorrelatedRequest>,
+): void {
+  // Response arrival times, keyed the same way collectMutatingRequests keys its
+  // entries, so a request's lifetime is [reqEvent.t, resT].
+  const resAt = new Map<string, number>();
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const id = safeText(event.d.requestId, 120) ?? requestIdForEvent(event);
+    if (id && !resAt.has(id)) resAt.set(id, event.t);
+  }
+
+  const groups = new Map<string, CorrelatedRequest[]>();
+  for (const entry of mutatingRequests.values()) {
+    if (!entry.url) continue;
+    if (entry.status === undefined || entry.status < 200 || entry.status >= 300)
+      continue;
+    const body =
+      typeof entry.body === "string"
+        ? entry.body
+        : entry.body === undefined || entry.body === null
+          ? undefined
+          : JSON.stringify(entry.body);
+    if (!body || body.includes(REDACTION_MARKER)) continue;
+    const key = `${entry.method} ${entry.url} ${body.slice(0, 2_000)}`;
+    const bucket = groups.get(key) ?? [];
+    bucket.push(entry);
+    groups.set(key, bucket);
+  }
+
+  for (const bucket of groups.values()) {
+    if (bucket.length < 2) continue;
+    bucket.sort((a, b) => a.reqEvent.t - b.reqEvent.t);
+    // The earliest overlapping pair anchors the finding; more copies only
+    // raise the count, not the number of candidates.
+    let anchor: [CorrelatedRequest, CorrelatedRequest] | undefined;
+    let overlapping = 0;
+    for (let i = 0; i + 1 < bucket.length; i += 1) {
+      const first = bucket[i];
+      const second = bucket[i + 1];
+      const firstBack = resAt.get(first.requestId);
+      if (firstBack === undefined || second.reqEvent.t > firstBack) continue;
+      overlapping += 1;
+      anchor ??= [first, second];
+    }
+    if (!anchor) continue;
+    const [first, second] = anchor;
+    const firstRes =
+      typeof first.resBody === "string"
+        ? first.resBody
+        : JSON.stringify(first.resBody);
+    const secondRes =
+      typeof second.resBody === "string"
+        ? second.resBody
+        : JSON.stringify(second.resBody);
+    const divergence =
+      firstRes !== undefined && secondRes !== undefined && firstRes !== secondRes
+        ? " Their responses describe different resulting states, so each write observed a store the other had not finished changing."
+        : "";
+    drafts.push({
+      detector: "concurrent_duplicate_mutation",
+      title: `Identical ${first.method} ${titleUrl(first.url ?? "") ?? "mutation"} in flight twice at once`,
+      severity: "medium",
+      score: CONCURRENT_DUPLICATE_MUTATION_SCORE,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: second.reqEvent.t,
+        offsetMs:
+          offsetForEvent(second.reqEvent) ??
+          offsetFromStart(second.reqEvent.t, index.start),
+        route: routeAt(index.navs ?? [], second.reqEvent.t),
+        requestId: second.requestId,
+        method: first.method,
+        url: redactUrl(first.url),
+        message:
+          `${bucket.length} identical ${first.method} calls to this endpoint succeeded, ` +
+          `${overlapping + 1} of them overlapping in flight. A read-modify-write behind this ` +
+          `endpoint applies each copy against the state it read, so the result is a duplicated ` +
+          `entry or a lost increment rather than an error.${divergence}`,
+      }),
+      dedupeKey: `dupmutation:${first.method}:${first.requestId}`,
+    });
+  }
+}
+
+/** Path portion of a request URL, for grouping calls that differ only by query. */
+function requestPathOf(url: string): string {
+  const withoutHash = url.split("#")[0] ?? url;
+  return withoutHash.split("?")[0] ?? withoutHash;
 }
 
 function addIneffectiveSubmitCandidates(
@@ -1347,6 +1768,7 @@ function addBackendErrorCandidates(
         errorCode,
         message,
         source: "backend",
+        frame: backendErrorFrame(error),
       }),
       // Key on requestId alone (not status): a thrown error event often carries no statusCode
       // while the response's end event carries e.g. 500 — including status would split one
@@ -2580,7 +3002,37 @@ function addClientSuppliedValueCandidates(
         if (value === undefined) continue;
         if (Math.abs(value) < MIN_CLIENT_SUPPLIED_VALUE) continue;
         const bodyPath = clientNumbers.get(value);
-        if (bodyPath === undefined) continue;
+        if (bodyPath === undefined) {
+          const roundedClientValue = [...clientNumbers.entries()].find(
+            ([clientValue, clientPath]) =>
+              !Number.isInteger(clientValue) &&
+              Math.round(clientValue) === value &&
+              field.toLowerCase().endsWith("_cents") &&
+              looksLikeMoneyField(clientPath),
+          );
+          if (!roundedClientValue) continue;
+          const [clientValue, clientPath] = roundedClientValue;
+          drafts.push({
+            detector: "fractional_cent_rounding",
+            title: `Fractional cents rounded at persistence: request body ${clientPath}=${clientValue} became ${table}.${field}=${value}`,
+            severity: "high",
+            score: DB_INVARIANT_SCORE,
+            confidence: "high",
+            anchor: removeUndefined({
+              t: diff.t,
+              offsetMs:
+                offsetForEvent(diff) ??
+                offsetFromStart(diff.t, index.start),
+              route: routeAt(index.navs ?? [], diff.t),
+              requestId,
+              message:
+                `${request.method} ${request.url ?? ""} sent the non-integer cent value ${clientPath}=${clientValue}; ${table}.${field} stored Math.round(${clientValue})=${value} (request ${requestId})`.trim(),
+              source: normalizeDbEngine(diff.d.engine),
+            }),
+            dedupeKey: `fractionalcents:${requestId}:${table}:${field}`,
+          });
+          continue;
+        }
 
         drafts.push({
           detector: "db_client_supplied_value",
@@ -2785,7 +3237,7 @@ function addEmptyDownloadCandidates(
     const length = toFiniteNumber(headerValue(event, "content-length"));
     if (length === undefined || length > 0) continue;
 
-    const transportId = requestIdForEvent(event);
+    const transportId = networkRequestId(event.d.id);
     const req = transportId ? requestById.get(transportId) : undefined;
     if (req?.method && req.method.toUpperCase() === "HEAD") continue;
     const requestId = safeText(event.d.requestId, 120);
@@ -2843,7 +3295,7 @@ function addContentTypeBodyMismatchCandidates(
     if (!type || !BINARY_MEDIA_TYPE.test(type)) continue;
     if (parseStructuredBody(event.d.body) === undefined) continue;
 
-    const transportId = requestIdForEvent(event);
+    const transportId = networkRequestId(event.d.id);
     const req = transportId ? requestById.get(transportId) : undefined;
     const requestId = safeText(event.d.requestId, 120);
 
@@ -3113,7 +3565,7 @@ function addLatencyOutlierCandidates(
     if (dur < threshold) continue;
     // Already covered, and at a higher score, by the absolute-threshold rule.
     if (dur >= 5_000) continue;
-    const transportId = requestIdForEvent(event);
+    const transportId = networkRequestId(event.d.id);
     const req = transportId ? requestById.get(transportId) : undefined;
     const requestId = safeText(event.d.requestId, 120);
     const ratio = median > 0 ? Math.round(dur / median) : undefined;
@@ -3258,18 +3710,67 @@ function looksLikeForeignKey(column: string): boolean {
 }
 
 /**
- * The comparable content of an insert: its after image minus the primary key,
- * canonicalized so two rows written in either key order compare equal.
+ * A column that carries row STATE rather than row identity: lifecycle enums,
+ * money and quantity magnitudes, flags. Two different rows sharing state is
+ * ordinary — eight bulk-created orders legitimately share
+ * {status: "placed", total_cents: N} — so state columns cannot anchor a
+ * duplicate-write claim. Anything else (a foreign key, a coupon code, a
+ * tracking number, a name) is treated as identifying. Deny-listing state is
+ * deliberate over allow-listing identity: business keys are unenumerable,
+ * and an unknown column wrongly treated as identifying costs one candidate,
+ * while one wrongly treated as state silences a real duplicate.
+ */
+function looksLikeStateColumn(column: string): boolean {
+  return (
+    /(^|_)(status|state|type|kind|phase|stage|flag|enabled|active|visible|archived)$/i.test(
+      column,
+    ) ||
+    /(^|_)(amount|total|price|cost|balance|qty|quantity|count|cents)(_cents|_amount)?s?$/i.test(
+      column,
+    )
+  );
+}
+
+/**
+ * True for a column the database fills in on write — a row timestamp. These are
+ * generated, exactly like the primary key, so two writes of the same row differ
+ * there for the same uninteresting reason and identity must not rest on them.
+ *
+ * Load bearing for determinism: a retry storm that lands both inserts inside one
+ * millisecond would otherwise be reported while the identical storm a
+ * millisecond slower is not, making the detector a coin flip on machine speed.
+ * The value is still captured and still shipped in the after image — it is
+ * evidence a reader wants, just not evidence of sameness.
+ */
+function looksLikeGeneratedTimestamp(column: string): boolean {
+  return /^(created|updated|modified|inserted|deleted)_?(at|on|time|timestamp)$|^(timestamp|created|updated)$/i.test(
+    column,
+  );
+}
+
+/**
+ * The comparable content of an insert: its after image minus the columns the
+ * database generated (the primary key and row timestamps), canonicalized so two
+ * rows written in either key order compare equal. Dropping timestamps is what
+ * makes the verdict deterministic; see {@link looksLikeGeneratedTimestamp}.
  *
  * Returns undefined when nothing DISCRIMINATING survives the pk drop, because a
  * signature that cannot tell two different rows apart cannot be evidence that
- * they are one row written twice. Three cases are rejected:
+ * they are one row written twice. Four cases are rejected:
+ *
+ *  - A column arrived structurally empty (`{}` / `[]`). That is a value the
+ *    capture could not represent, not a value the row does not have: a Date, a
+ *    Buffer, or a driver wrapper renders that way. The rows may well differ
+ *    exactly there, so identity is UNKNOWN and the detector must stay silent
+ *    rather than claim a match from the columns that happen to have survived.
+ *    A live run reported eight genuinely distinct orders as "6 identical rows"
+ *    because an unserializable `created_at` had reduced to `{}` on every one.
+ *    A scalar `null` or `""` is NOT this case — that is a real captured value,
+ *    and nullable columns are far too common to treat as evidence loss.
  *
  *  - Nothing survives. The clean control run inserts two `shipments` rows whose
  *    after images are `{id: …}` alone, so they reduce to `{}` and a naive
  *    "identical inserts" rule fires on the control.
- *  - Every surviving value is zero or empty, which is the same absence wearing
- *    a column name.
  *  - The only surviving column is a foreign key. A live run reported three
  *    demonstrably different `order_items` rows (different product, quantity and
  *    price) as "3 identical rows" because the captured after image had reduced
@@ -3291,9 +3792,11 @@ function comparedInsertColumns(
   if (!isRecord(after)) return undefined;
   const pkKeys = isRecord(event.d.pk) ? new Set(Object.keys(event.d.pk)) : null;
   const entries = Object.entries(after)
-    .filter(([key]) => !pkKeys?.has(key))
+    .filter(([key]) => !pkKeys?.has(key) && !looksLikeGeneratedTimestamp(key))
     .sort(([a], [b]) => a.localeCompare(b));
   if (entries.length === 0) return undefined;
+  if (entries.some(([, value]) => isUnrepresentedValue(value)))
+    return undefined;
   if (entries.every(([, value]) => isZeroOrEmpty(value))) return undefined;
   if (entries.length === 1 && looksLikeForeignKey(entries[0][0]))
     return undefined;
@@ -3351,11 +3854,28 @@ function addDuplicateWriteCandidates(
     for (const [table, signatures] of byTable) {
       for (const [signature, group] of signatures) {
         if (group.length < 2) continue;
+        const entries = entriesBySignature.get(signature) ?? [];
+        // "The same row written twice" is a claim about identity, and identity
+        // needs an anchor: some non-null, non-boolean column that is not mere
+        // row STATE. A bulk insert of eight orders sharing only
+        // {status: "placed", total_cents: 35700, user_id: null} matches on
+        // everything captured and is still eight different orders — while two
+        // coupon_redemptions sharing a non-null order_id and code are one
+        // redemption written twice. Without the anchor, stay silent: a partial
+        // capture reads as unknown, never as a duplicate.
+        const hasEntityAnchor = entries.some(
+          ([key, value]) =>
+            value !== null &&
+            value !== undefined &&
+            value !== "" &&
+            typeof value !== "boolean" &&
+            !looksLikeStateColumn(key),
+        );
+        if (!hasEntityAnchor) continue;
         const anchorEvent = group.reduce((earliest, event) =>
           event.t < earliest.t ? event : earliest,
         );
         const label = scrubText(table, 100) ?? "table";
-        const entries = entriesBySignature.get(signature) ?? [];
         const columns = entries.map(([key]) => key);
         drafts.push({
           detector: "duplicate_write",
@@ -3381,6 +3901,1037 @@ function addDuplicateWriteCandidates(
         });
       }
     }
+  }
+}
+
+/**
+ * The literal fingerprints an interpolation bug leaves in rendered text: a
+ * JavaScript value that was never looked up ("undefined"), never a number
+ * ("NaN"), never stringified ("[object Object]"), or a template that was never
+ * rendered at all ({{name}}, ${name}). Word-bounded so "undefined_behavior" in
+ * prose does not match. "null" is deliberately absent: a whole-column null is
+ * an ordinary database value, and the word appears in legitimate text far too
+ * often to anchor a high-confidence claim.
+ */
+const INTERPOLATION_ARTIFACT_PATTERN =
+  /\bundefined\b|\bNaN\b|\[object Object\]|\{\{\s*[\w.]+\s*\}\}|\$\{[\w.]+\}/;
+
+/** First artifact match in a string value, for the candidate's own evidence. */
+function interpolationArtifactIn(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  return INTERPOLATION_ARTIFACT_PATTERN.exec(value)?.[0] ?? undefined;
+}
+
+/**
+ * interpolation_artifact: persisted text carries a template-rendering fault.
+ *
+ * The real case: a notification row stored
+ * `subject: "Hi undefined, your order #1 was cancelled"` — the template
+ * rendered, the row inserted, the mail queued, every status code 200. The
+ * defect is visible ONLY in the value itself, which makes it invisible to
+ * every structural detector and glaring to this one. These fingerprints are
+ * near-zero-entropy: real user text containing a word-bounded "undefined" or
+ * an unrendered "{{name}}" exists, but a ROW WRITTEN BY THE APP containing one
+ * is an interpolation bug until proven otherwise.
+ *
+ * Scans both planes that carry persisted values — db.diff after images
+ * (writes) and db.read rows (reads) — because the write that stored the broken
+ * text often happened in an earlier request or a job, and the session at hand
+ * only ever reads it back. One candidate per table+column, anchored at the
+ * first sighting.
+ */
+function addInterpolationArtifactCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const seen = new Set<string>();
+  for (const event of events) {
+    if (event.k !== "db.diff" && event.k !== "db.read") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const image = event.k === "db.diff" ? event.d.after : event.d.row;
+    if (!isRecord(image)) continue;
+    for (const [column, value] of Object.entries(image)) {
+      const artifact = interpolationArtifactIn(value);
+      if (artifact === undefined) continue;
+      const key = `${table}:${column}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const requestId = safeText(event.d.requestId, 200);
+      const snippet = scrubText(String(value), 160);
+      drafts.push({
+        detector: "interpolation_artifact",
+        title: `Interpolation artifact persisted: ${table}.${column} contains "${artifact}"`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: event.t,
+          offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+          route: routeAt(index.navs ?? [], event.t),
+          requestId,
+          message: `${table}.${column} ${event.k === "db.diff" ? "was written with" : "read back"} "${snippet}" — "${artifact}" is a template value that never resolved`,
+          source: normalizeDbEngine(event.d.engine),
+        }),
+        dedupeKey: `interpolation:${key}`,
+      });
+    }
+  }
+}
+
+/** Columns that carry a lifecycle: status/state/phase/stage, bare or suffixed.
+ *  Deliberately narrower than {@link looksLikeStateColumn}: flag/enabled/
+ *  active/visible are legitimate user toggles, and a toggle flipped twice is
+ *  A→B→A by design. Lifecycles are not supposed to go backward. */
+function looksLikeLifecycleColumn(column: string): boolean {
+  return /(^|_)(status|state|phase|stage)$/i.test(column);
+}
+
+/**
+ * state_flip_flop: one row's lifecycle column returned to a value it had
+ * already left.
+ *
+ * The live case: order #1's status went placed → delivered → placed →
+ * refunded → shipped inside 31 ms. No error fired, every write succeeded, and
+ * the only structural signal was four generic "Database update on orders"
+ * candidates at the bottom of the ranking. The domain-free invariant is the
+ * revisit: whatever the app's state machine is, a value that was held, left,
+ * and held again means either an invalid transition or two writers fighting.
+ * Restricted to string-valued lifecycle columns so boolean and enum toggles
+ * the user can legitimately flip twice stay out.
+ */
+function addStateFlipFlopCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  // (table, pk, column) → observed value chain, in event order.
+  const chains = new Map<
+    string,
+    { table: string; column: string; values: string[]; first: BugEvent; last: BugEvent }
+  >();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    if (safeText(event.d.op, 20) !== "update") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const pk = event.d.pk;
+    if (!isRecord(pk)) continue;
+    const before = isRecord(event.d.before) ? event.d.before : undefined;
+    const after = isRecord(event.d.after) ? event.d.after : undefined;
+    if (!after) continue;
+    for (const [column, afterValue] of Object.entries(after)) {
+      if (!looksLikeLifecycleColumn(column)) continue;
+      if (typeof afterValue !== "string" || afterValue.length === 0) continue;
+      const key = `${table} ${JSON.stringify(pk)} ${column}`;
+      const chain = chains.get(key) ?? {
+        table,
+        column,
+        values: [],
+        first: event,
+        last: event,
+      };
+      const beforeValue = before?.[column];
+      if (
+        chain.values.length === 0 &&
+        typeof beforeValue === "string" &&
+        beforeValue.length > 0
+      ) {
+        chain.values.push(beforeValue);
+      }
+      if (chain.values[chain.values.length - 1] !== afterValue) {
+        chain.values.push(afterValue);
+      }
+      chain.last = event;
+      chains.set(key, chain);
+    }
+  }
+
+  for (const chain of chains.values()) {
+    // A revisit: some value appears again after a different value intervened.
+    const seen = new Set<string>();
+    let left: string | undefined;
+    let revisited: string | undefined;
+    for (const value of chain.values) {
+      if (seen.has(value)) {
+        revisited = value;
+        break;
+      }
+      if (left !== undefined) seen.add(left);
+      left = value;
+    }
+    if (revisited === undefined) continue;
+    const label = scrubText(chain.table, 100) ?? "table";
+    const spanMs = Math.max(0, chain.last.t - chain.first.t);
+    const path = chain.values.map((v) => scrubText(v, 60)).join(" → ");
+    drafts.push({
+      detector: "state_flip_flop",
+      title: `State went backward: ${label}.${chain.column} returned to "${revisited}"`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: chain.first.t,
+        offsetMs:
+          offsetForEvent(chain.first) ??
+          offsetFromStart(chain.first.t, index.start),
+        route: routeAt(index.navs ?? [], chain.first.t),
+        requestId: safeText(chain.first.d.requestId, 200),
+        message: `${chain.table} row ${scrubText(JSON.stringify(chain.first.d.pk), 120)} moved ${path} over ${spanMs} ms. "${revisited}" was held, left, and reached again — an invalid transition or two writers fighting, whatever the intended state machine is.`,
+        source: normalizeDbEngine(chain.first.d.engine),
+      }),
+      dedupeKey: `flipflop:${chain.table}:${chain.column}:${scrubText(JSON.stringify(chain.first.d.pk), 120)}`,
+    });
+  }
+}
+
+/** Columns that carry money. Narrower than looksLikeStateColumn's value arm:
+ *  qty/count are excluded because doubling a quantity is commerce, not a unit
+ *  bug. */
+function looksLikeMoneyColumn(column: string): boolean {
+  return /(^|_)(amount|total|price|cost|balance)(_cents|_amount)?s?$|_cents$/i.test(
+    column,
+  );
+}
+
+/** Success-shaped status values, for claims about settled writes. */
+function looksSettled(value: unknown): boolean {
+  return (
+    typeof value === "string" &&
+    /^(succeeded|success|captured|settled|paid|completed?|confirmed|ok)$/i.test(value)
+  );
+}
+
+/**
+ * duplicate_charge: two settled rows for the same reference and the same
+ * amount.
+ *
+ * The live case: an idempotency key generated inside the retry loop, so the
+ * gateway saw attempt 2 as a brand-new charge — two payments rows with the
+ * same order_id, order_ref and amount_cents, both succeeded, differing only
+ * in gateway_charge_id. duplicate_write is structurally blind to this: the
+ * gateway id differs by design, so the after images never match. The claim
+ * here rests on the business identity instead: same non-null reference
+ * column, same money amount, both settled, different primary keys.
+ */
+function addDuplicateChargeCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  // The grouping key is ONE reference column at a time, never the composite:
+  // the duplicating row legitimately differs in its gateway-assigned id
+  // (which also ends in _id), so a composite key would never collide. Actor
+  // columns (user_id, customer_id...) are excluded: the same customer settling
+  // the same amount twice for two different orders is commerce, not a
+  // duplicate.
+  const isTransactionRef = (key: string): boolean =>
+    /(^|_)(ref|reference)$|_id$/i.test(key) &&
+    !/^id$/i.test(key) &&
+    !/(^|_)(user|customer|account|actor|owner|creator|created_by|updated_by)_?id$/i.test(
+      key,
+    ) &&
+    !/(^|_)(gateway|external|provider|processor|charge|txn|transaction)_/i.test(key);
+
+  interface SettledRow {
+    event: BugEvent;
+    pk: string;
+    refs: Array<[string, string]>;
+    amountText: string;
+  }
+  const rowsByTable = new Map<string, SettledRow[]>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    if (safeText(event.d.op, 20) !== "insert") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const after = isRecord(event.d.after) ? event.d.after : undefined;
+    if (!after) continue;
+    const settled = Object.entries(after).some(
+      ([key, value]) => looksLikeStateColumn(key) && looksSettled(value),
+    );
+    if (!settled) continue;
+    const refs = Object.entries(after)
+      .filter(
+        ([key, value]) =>
+          value !== null && value !== undefined && value !== "" && isTransactionRef(key),
+      )
+      .map(([key, value]): [string, string] => [key, String(value)]);
+    const amounts = Object.entries(after)
+      .filter(
+        ([key, value]) => looksLikeMoneyColumn(key) && finiteNumber(value) !== undefined,
+      )
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .sort();
+    if (refs.length === 0 || amounts.length === 0) continue;
+    const rows = rowsByTable.get(table) ?? [];
+    rows.push({
+      event,
+      pk: JSON.stringify(event.d.pk ?? rows.length),
+      refs,
+      amountText: amounts.join(", "),
+    });
+    rowsByTable.set(table, rows);
+  }
+
+  for (const [table, rows] of rowsByTable) {
+    if (rows.length < 2) continue;
+    // column=value + identical amounts: the rows claiming the same event.
+    const byRef = new Map<string, SettledRow[]>();
+    for (const row of rows) {
+      for (const [column, value] of row.refs) {
+        const key = `${column}=${value} ${row.amountText}`;
+        const group = byRef.get(key) ?? [];
+        group.push(row);
+        byRef.set(key, group);
+      }
+    }
+    // The same pair of rows usually collides on several reference columns
+    // (order_id AND order_ref); one finding per distinct row set.
+    const reported = new Set<string>();
+    for (const [key, group] of byRef) {
+      if (group.length < 2) continue;
+      const pkSet = group
+        .map((row) => row.pk)
+        .sort()
+        .join(",");
+      if (reported.has(pkSet)) continue;
+      reported.add(pkSet);
+      const first = group.reduce((earliest, row) =>
+        row.event.t < earliest.event.t ? row : earliest,
+      );
+      const label = scrubText(table, 100) ?? "table";
+      drafts.push({
+        detector: "duplicate_charge",
+        title: `Duplicate settlement: ${group.length} settled ${label} rows for one reference`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: first.event.t,
+          offsetMs:
+            offsetForEvent(first.event) ??
+            offsetFromStart(first.event.t, index.start),
+          route: routeAt(index.navs ?? [], first.event.t),
+          requestId: safeText(first.event.d.requestId, 200),
+          message: `${group.length} rows inserted into ${table} share ${scrubText(key.split(" ")[0] ?? key, 200)} with identical ${scrubText(first.amountText, 120)}, every one in a settled state. One business event settled ${group.length} times — on a payments table that is a double charge.`,
+          source: normalizeDbEngine(first.event.d.engine),
+        }),
+        dedupeKey: `dupcharge:${table}:${scrubText(key, 200)}`,
+      });
+    }
+  }
+}
+
+/**
+ * money_scale_shift: one row's money column changed by exactly a power of a
+ * hundred.
+ *
+ * The live case: capturePayment divided by 100 before sending and the gateway
+ * read the field as cents, so the captured amount landed as 199 where the
+ * charge said 19900. A legitimate 100.00x price change exists; a payment,
+ * total or balance moving by exactly 100x in one UPDATE is a unit bug — the
+ * cents/dollars boundary was crossed once too often or too rarely.
+ */
+function addMoneyScaleShiftCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const seen = new Set<string>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    if (safeText(event.d.op, 20) !== "update") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const before = isRecord(event.d.before) ? event.d.before : undefined;
+    const after = isRecord(event.d.after) ? event.d.after : undefined;
+    if (!before || !after) continue;
+    for (const [column, afterRaw] of Object.entries(after)) {
+      if (!looksLikeMoneyColumn(column)) continue;
+      const to = finiteNumber(afterRaw);
+      const from = finiteNumber(before[column]);
+      if (from === undefined || to === undefined) continue;
+      if (from <= 0 || to <= 0) continue;
+      const ratio = from > to ? from / to : to / from;
+      if (ratio !== 100 && ratio !== 10_000) continue;
+      const key = `${table}:${column}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const direction = from > to ? "shrank" : "grew";
+      drafts.push({
+        detector: "money_scale_shift",
+        title: `Money moved by exactly ${ratio}x: ${table}.${column} ${direction} ${from} → ${to}`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: event.t,
+          offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+          route: routeAt(index.navs ?? [], event.t),
+          requestId: safeText(event.d.requestId, 200),
+          message: `${table}.${column} went from ${from} to ${to} in one update — an exact ${ratio}x shift, the fingerprint of a cents/dollars conversion applied once too often or too rarely.`,
+          source: normalizeDbEngine(event.d.engine),
+        }),
+        dedupeKey: `moneyscale:${key}`,
+      });
+    }
+  }
+}
+
+/**
+ * cross_user_read: a request served one user another user's row.
+ *
+ * The live case: GET /api/orders/1 loaded the order by id alone — no user_id
+ * predicate — so the "Stranger" account read the "Owner" account's order with
+ * a clean 200. The session stream carries both halves: the login wrote
+ * sessions.user_id = 4, and the later read returned orders.user_id = 1.
+ *
+ * The active user comes ONLY from writes/reads on a sessions-shaped table, so
+ * flows with no session trail (anonymous browsing, ops consoles on token
+ * auth) never establish one and stay silent — which also keeps legitimate
+ * admin flows out. This is a targeted authorization signal, not a general
+ * ownership policy: it claims exactly "this session's user got a row owned by
+ * someone else", and shows both ids so the reader can judge.
+ */
+function addCrossUserReadCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const isSessionTable = (table: string): boolean =>
+    /(^|_)(sessions?|auth_sessions?|user_sessions?)$/i.test(table);
+  const ownerOf = (row: Record<string, unknown>): unknown =>
+    row.user_id ?? row.owner_id ?? row.customer_id ?? row.account_id;
+
+  const seen = new Set<string>();
+  let activeUser: unknown;
+  let establishedAt: number | undefined;
+  for (const event of events) {
+    if (event.k !== "db.diff" && event.k !== "db.read") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const image = event.k === "db.diff" ? event.d.after : event.d.row;
+    if (!isRecord(image)) continue;
+    if (isSessionTable(table)) {
+      const sessionUser = image.user_id;
+      if (sessionUser !== null && sessionUser !== undefined) {
+        activeUser = sessionUser;
+        establishedAt = event.t;
+      }
+      continue;
+    }
+    if (activeUser === undefined) continue;
+    if (event.k !== "db.read") continue;
+    if (/(^|_)users?$/i.test(table)) continue;
+    const owner = ownerOf(image);
+    if (owner === null || owner === undefined) continue;
+    if (String(owner) === String(activeUser)) continue;
+    const key = `${table}:${String(owner)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    drafts.push({
+      detector: "cross_user_read",
+      title: `Cross-user read: ${table} row owned by user ${scrubText(String(owner), 60)} served to user ${scrubText(String(activeUser), 60)}`,
+      severity: "high",
+      score: 85,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: safeText(event.d.requestId, 200),
+        message: `The active session belongs to user ${scrubText(String(activeUser), 60)} (established at +${Math.round(offsetFromStart(establishedAt ?? event.t, index.start) ?? 0)} ms), yet this request read a ${table} row owned by user ${scrubText(String(owner), 60)}. If this endpoint is not meant to serve other users' data, the query is missing an ownership predicate.`,
+        source: normalizeDbEngine(event.d.engine),
+      }),
+      dedupeKey: `crossuser:${key}`,
+    });
+  }
+}
+
+/**
+ * duplicate_readback: two rows read back identical on every meaningful column.
+ *
+ * The live case: a fulfillment worker retried after a transient failure and
+ * inserted a second shipments row for order 1 — but the INSERT after images
+ * were captured thin ({id} only), so duplicate_write had nothing to compare.
+ * The read-back rows carry the full picture: two shipments rows, different
+ * primary keys, identical on order_id and status, differing only in pk and
+ * created_at. The claim mirrors duplicate_write's: identity needs an entity
+ * anchor, and generated columns (pk, timestamps) are excluded from the
+ * signature. Rows that differ in ANY captured business column — two
+ * order_items lines with different product_ids — never group.
+ */
+function addDuplicateReadbackCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const isGeneratedColumn = (key: string): boolean =>
+    /^id$|(^|_)(created_at|updated_at|inserted_at|timestamp|created|updated)$/i.test(key);
+  // table → signature → {pks, first event}
+  const byTable = new Map<
+    string,
+    Map<string, { pks: Set<string>; first: BugEvent; entries: Array<[string, unknown]> }>
+  >();
+  for (const event of events) {
+    if (event.k !== "db.read") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const row = isRecord(event.d.row) ? event.d.row : undefined;
+    if (!row) continue;
+    const pkCols = isRecord(event.d.pk) ? new Set(Object.keys(event.d.pk)) : new Set<string>();
+    const pkText = isRecord(event.d.pk) ? JSON.stringify(event.d.pk) : safeText(row.id, 60);
+    if (!pkText) continue;
+    const entries = Object.entries(row)
+      .filter(([key]) => !pkCols.has(key) && !isGeneratedColumn(key))
+      .sort(([a], [b]) => (a < b ? -1 : 1));
+    if (entries.length < 2) continue;
+    const signature = JSON.stringify(entries);
+    const signatures = byTable.get(table) ?? new Map();
+    const group = signatures.get(signature) ?? { pks: new Set<string>(), first: event, entries };
+    group.pks.add(pkText);
+    if (event.t < group.first.t) group.first = event;
+    signatures.set(signature, group);
+    byTable.set(table, signatures);
+  }
+
+  for (const [table, signatures] of byTable) {
+    for (const [signature, group] of signatures) {
+      if (group.pks.size < 2) continue;
+      // Same anchor rule as duplicate_write: some non-null, non-boolean column
+      // that is not mere row state must tie the rows to one business entity.
+      const hasEntityAnchor = group.entries.some(
+        ([key, value]) =>
+          value !== null &&
+          value !== undefined &&
+          value !== "" &&
+          typeof value !== "boolean" &&
+          !looksLikeStateColumn(key),
+      );
+      if (!hasEntityAnchor) continue;
+      const label = scrubText(table, 100) ?? "table";
+      const columns = group.entries.map(([key]) => key);
+      drafts.push({
+        detector: "duplicate_readback",
+        title: `Duplicate rows: ${group.pks.size} ${label} rows identical on every business column`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: group.first.t,
+          offsetMs:
+            offsetForEvent(group.first) ??
+            offsetFromStart(group.first.t, index.start),
+          route: routeAt(index.navs ?? [], group.first.t),
+          requestId: safeText(group.first.d.requestId, 200),
+          message: `${group.pks.size} distinct ${table} rows read back identical on ${columns.join(", ")} — different primary keys, same business content. One event produced ${group.pks.size} rows; on a fulfillment or settlement table that is a non-idempotent retry.`,
+          source: normalizeDbEngine(group.first.d.engine),
+        }),
+        dedupeKey: `dupreadback:${table}:${scrubText(signature, 200)}`,
+      });
+    }
+  }
+}
+
+/**
+ * orphaned_reference: a child row was written with a null reference to a
+ * parent that was created afterwards.
+ *
+ * The live case: the fulfillment worker's dependent writes were reordered, so
+ * inventory_ledger got its row with shipment_id = null and the shipments row
+ * appeared milliseconds LATER — the ledger row references nothing, forever.
+ * The domain-free signal is the write order: a null *_id column whose parent
+ * table (by name: shipment_id → shipments) receives an INSERT later in the
+ * same session. A nullable reference that stays null with no parent ever
+ * created is a data-model choice; a null reference whose parent shows up
+ * after the child was committed is an ordering bug.
+ */
+function addOrphanedReferenceCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const parentTablesOf = (column: string): string[] => {
+    const stem = column.replace(/_id$/i, "");
+    if (!stem || stem === column) return [];
+    return [stem, `${stem}s`, `${stem.replace(/y$/i, "ies")}`, `${stem}es`];
+  };
+  interface NullRef {
+    event: BugEvent;
+    table: string;
+    column: string;
+    parents: string[];
+  }
+  const nullRefs: NullRef[] = [];
+  const insertTimes = new Map<string, number[]>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    if (safeText(event.d.op, 20) !== "insert") continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+    const times = insertTimes.get(table.toLowerCase()) ?? [];
+    times.push(event.t);
+    insertTimes.set(table.toLowerCase(), times);
+    const after = isRecord(event.d.after) ? event.d.after : undefined;
+    if (!after) continue;
+    for (const [column, value] of Object.entries(after)) {
+      if (value !== null) continue;
+      if (!/_id$/i.test(column)) continue;
+      const parents = parentTablesOf(column.toLowerCase());
+      if (parents.length === 0) continue;
+      nullRefs.push({ event, table, column, parents });
+    }
+  }
+
+  const seen = new Set<string>();
+  for (const ref of nullRefs) {
+    const parentTable = ref.parents.find((p) => insertTimes.has(p));
+    if (!parentTable) continue;
+    const laterInsert = (insertTimes.get(parentTable) ?? []).find(
+      (t) => t > ref.event.t,
+    );
+    if (laterInsert === undefined) continue;
+    const key = `${ref.table}:${ref.column}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    drafts.push({
+      detector: "orphaned_reference",
+      title: `Orphaned reference: ${ref.table}.${ref.column} written null before ${parentTable} existed`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: ref.event.t,
+        offsetMs:
+          offsetForEvent(ref.event) ?? offsetFromStart(ref.event.t, index.start),
+        route: routeAt(index.navs ?? [], ref.event.t),
+        requestId: safeText(ref.event.d.requestId, 200),
+        message: `${ref.table} was inserted with ${ref.column} = null, and a ${parentTable} row was created ${Math.round(laterInsert - ref.event.t)} ms AFTER it. The dependent writes ran in the wrong order, so this row references nothing — and unless something backfills it, it never will.`,
+        source: normalizeDbEngine(ref.event.d.engine),
+      }),
+      dedupeKey: `orphanref:${key}`,
+    });
+  }
+}
+
+/**
+ * lost_update: a read-modify-write raced itself and one writer's change vanished.
+ *
+ * The signature is exact and does not need to know anything about the app: two
+ * UPDATEs land on the same table and primary key, and the later one's BEFORE
+ * image still shows the value the earlier one had already replaced. Both writes
+ * succeeded, both rows are individually valid, and the final row silently holds
+ * one increment instead of two. Nothing else in the pipeline names it — the
+ * generic `db_mutation` surfacing says only "a row changed", which is exactly
+ * as true of the correct outcome.
+ *
+ * This is the one detector here that deliberately crosses request boundaries:
+ * a lost update is *made of* two concurrent requests, so a per-request rule can
+ * never see it. Requiring a stale before-image is what keeps that safe — two
+ * unrelated sequential updates chain correctly and stay silent.
+ *
+ * Needs `captureBefore: true`; without before images there is nothing to
+ * compare and the rule cannot fire at all.
+ */
+function addLostUpdateCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  // table + pk → the update diffs against that row, in capture order.
+  const byRow = new Map<string, BugEvent[]>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    if (safeText(event.d.op, 20) !== "update") continue;
+    if (!isRecord(event.d.before) || !isRecord(event.d.after)) continue;
+    const table = safeText(event.d.table, 200);
+    const pk = pkEntriesOf(event);
+    if (!table || pk.length === 0) continue;
+    const key = `${table}\u0000${pk.map(([c, v]) => `${c}=${v}`).join(",")}`;
+    const list = byRow.get(key) ?? [];
+    list.push(event);
+    byRow.set(key, list);
+  }
+
+  for (const [key, updates] of byRow) {
+    if (updates.length < 2) continue;
+    const ordered = [...updates].sort((a, b) => a.t - b.t);
+    for (let i = 1; i < ordered.length; i += 1) {
+      const earlier = ordered[i - 1];
+      const later = ordered[i];
+      // Two writes from the same request are a sequence the app wrote on
+      // purpose, not a race.
+      const earlierRequest = safeText(earlier.d.requestId, 120);
+      const laterRequest = safeText(later.d.requestId, 120);
+      if (earlierRequest && laterRequest && earlierRequest === laterRequest)
+        continue;
+
+      const earlierAfter = earlier.d.after as Record<string, unknown>;
+      const laterBefore = later.d.before as Record<string, unknown>;
+      const laterAfter = later.d.after as Record<string, unknown>;
+      for (const [column, wrote] of Object.entries(earlierAfter)) {
+        if (isIdentityOrClockField(column)) continue;
+        if (!Object.hasOwn(laterBefore, column)) continue;
+        const sawBefore = laterBefore[column];
+        // The later writer read a value the earlier writer had already
+        // replaced, so its own write was computed from stale state.
+        if (sameScalar(sawBefore, wrote)) continue;
+        const earlierBefore = earlier.d.before as Record<string, unknown>;
+        if (!sameScalar(sawBefore, earlierBefore[column])) continue;
+        // ...and both writers, from that one read, computed the SAME new value.
+        // That coincidence is the read-modify-write fingerprint: two increments
+        // of 1 both produced 2, so the row holds 2 where it should hold 3. When
+        // the two writes disagree the rule stays silent, because an absolute
+        // `SET qty = n` from a stale read is indistinguishable from a correct
+        // one and guessing would put a false claim above the plane dump.
+        if (!sameScalar(laterAfter[column], wrote)) continue;
+
+        const label = scrubText(bareTableName(key.split("\u0000")[0]), 100) ?? "table";
+        drafts.push({
+          detector: "lost_update",
+          title: `Lost update: a second writer overwrote ${label}.${column} from a stale read`,
+          severity: "high",
+          score: DB_INVARIANT_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: later.t,
+            offsetMs:
+              offsetForEvent(later) ?? offsetFromStart(later.t, index.start),
+            route: routeAt(index.navs ?? [], later.t),
+            requestId: laterRequest,
+            message: `${label}.${column}: one writer set ${formatScalar(wrote)}, a concurrent writer had already read ${formatScalar(sawBefore)} and wrote ${formatScalar(laterAfter[column])}`,
+            source: normalizeDbEngine(later.d.engine),
+          }),
+          dedupeKey: `lostupdate:${key}:${column}`,
+        });
+        break; // One claim per row pair; the first stale column carries it.
+      }
+    }
+  }
+}
+
+/**
+ * Vocabulary for the two halves of a recorded counter pair: what the
+ * application set out to do, and what it reports having done. Matched on
+ * word segments rather than substrings, so `completed_at` does not read as
+ * an achievement count.
+ */
+const INTENDED_COUNTER_WORDS = new Set([
+  "expected",
+  "claimed",
+  "requested",
+  "planned",
+  "target",
+  "advertised",
+  "intended",
+  "total",
+]);
+const ACHIEVED_COUNTER_WORDS = new Set([
+  "written",
+  "returned",
+  "delivered",
+  "processed",
+  "actual",
+  "completed",
+  "succeeded",
+  "applied",
+  "sent",
+  "inserted",
+  "exported",
+  "seen",
+]);
+
+/**
+ * Columns whose units are not a row count. `total_cents` is an amount, and
+ * pairing it against a row count would fire on every ordinary order that costs
+ * more cents than it has line items. Duration and size columns are excluded for
+ * the same reason.
+ */
+const NON_COUNT_UNIT_WORDS =
+  /(cents|amount|price|cost|fee|tax|bytes|ms|millis|seconds|duration|balance)/i;
+
+/** `rows_expected` → ["rows","expected"]; `rowsExpected` → ["rows","expected"]. */
+function columnWords(column: string): string[] {
+  return column
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[^A-Za-z0-9]+/)
+    .filter(Boolean)
+    .map((word) => word.toLowerCase());
+}
+
+/** A non-negative integer that is plausibly a row count, or undefined. */
+function counterValueOf(column: string, value: unknown): number | undefined {
+  if (NON_COUNT_UNIT_WORDS.test(column)) return undefined;
+  const numeric = finiteNumber(value);
+  if (numeric === undefined) return undefined;
+  if (!Number.isInteger(numeric) || numeric < 0) return undefined;
+  return numeric;
+}
+
+/** How many contradiction claims one session may carry. */
+const MAX_COUNTER_CONTRADICTION_CANDIDATES = 5;
+
+/**
+ * Status values that mean the work is over, so its counters have to agree.
+ * Deny-biased: a status outside this set, including one this does not
+ * recognise, reads as still in flight and the row is left alone.
+ */
+const TERMINAL_STATUS_VALUES = new Set([
+  "done",
+  "complete",
+  "completed",
+  "finished",
+  "success",
+  "succeeded",
+  "failed",
+  "failure",
+  "errored",
+  "cancelled",
+  "canceled",
+  "aborted",
+]);
+
+/** Column names that carry a row's lifecycle state. */
+function isStatusColumn(column: string): boolean {
+  return columnWords(column).some(
+    (word) => word === "status" || word === "state" || word === "phase",
+  );
+}
+
+/**
+ * Whether a row is making a finished claim about itself.
+ *
+ * A row that carries a lifecycle column answers this itself, and only a
+ * terminal value counts: a batch inserted `pending` with nothing applied is a
+ * plan, and one `running` half way through is progress. Neither is a
+ * contradiction, and both are the ordinary shape of every job table.
+ *
+ * A row with no lifecycle column at all is a write-once record — an export
+ * receipt, a report line — so it is finished by the time it exists. Requiring
+ * it to have achieved something keeps a placeholder row, written ahead of the
+ * work it describes, from reading as a failure to do the work.
+ */
+function recordsFinishedWork(
+  after: Record<string, unknown>,
+  achievedValue: number,
+): boolean {
+  const statusEntry = Object.entries(after).find(([column]) =>
+    isStatusColumn(column),
+  );
+  if (statusEntry) {
+    const value = safeText(statusEntry[1], 40);
+    return value !== undefined && TERMINAL_STATUS_VALUES.has(value.toLowerCase());
+  }
+  return achievedValue > 0;
+}
+
+/**
+ * counter_contradiction: one written row records both what the application
+ * meant to do and what it did, and the two disagree.
+ *
+ * `rows_expected: 8, rows_written: 3` in a single inserted row is the whole
+ * signal. Nothing has to be correlated, no clock is involved, and no knowledge
+ * of the application is needed — the app chose to persist both numbers, which
+ * is itself the statement that it cares whether they match. Without this the
+ * ranker says only "Database update on order_exports", which is exactly as true
+ * of a correct export.
+ *
+ * Deliberately calibrated below the invariant detectors. What is certain is
+ * that two recorded counters disagree; whether that is a defect is the reader's
+ * call, so the claim is phrased as the two numbers rather than as a verdict.
+ *
+ * The one thing that must be right is WHEN to ask, because a job table spends
+ * its whole life with its counters disagreeing on purpose. {@link
+ * recordsFinishedWork} is that gate: the row has to be claiming the work is
+ * over. An earlier revision keyed on the operation instead, firing on every
+ * insert, and measuring it across 37 captured sessions showed the mistake in
+ * both directions — it fired on seven unrelated sessions that had merely
+ * inserted a `pending` batch with nothing applied yet, and it stayed silent on
+ * the batch that finished `done` having applied one row of two, which was the
+ * actual defect in that session.
+ */
+function addCounterContradictionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  let emitted = 0;
+  for (const event of events) {
+    if (emitted >= MAX_COUNTER_CONTRADICTION_CANDIDATES) return;
+    if (event.k !== "db.diff") continue;
+    const op = safeText(event.d.op, 20);
+    if (op !== "insert" && op !== "update") continue;
+    if (!isRecord(event.d.after)) continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+
+    const intended: Array<[string, number]> = [];
+    const achieved: Array<[string, number]> = [];
+    for (const [column, raw] of Object.entries(event.d.after)) {
+      const words = columnWords(column);
+      const isIntended = words.some((word) =>
+        INTENDED_COUNTER_WORDS.has(word),
+      );
+      const isAchieved = words.some((word) =>
+        ACHIEVED_COUNTER_WORDS.has(word),
+      );
+      // A column reading as both halves names nothing in particular.
+      if (isIntended === isAchieved) continue;
+      const value = counterValueOf(column, raw);
+      if (value === undefined) continue;
+      (isIntended ? intended : achieved).push([column, value]);
+    }
+    if (intended.length === 0 || achieved.length === 0) continue;
+
+    intended.sort(([a], [b]) => a.localeCompare(b));
+    achieved.sort(([a], [b]) => a.localeCompare(b));
+    const [intendedColumn, intendedValue] = intended[0];
+    const [achievedColumn, achievedValue] = achieved[0];
+    if (intendedValue === achievedValue) continue;
+    if (!recordsFinishedWork(event.d.after, achievedValue)) continue;
+
+    const label = scrubText(bareTableName(table), 100) ?? "table";
+    const comparedColumns = [...intended, ...achieved]
+      .map(([column]) => column)
+      .sort();
+    drafts.push({
+      detector: "counter_contradiction",
+      title: `${label} recorded ${intendedColumn} ${intendedValue} but ${achievedColumn} ${achievedValue}`,
+      severity: "medium",
+      score: 68,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: safeText(event.d.requestId, 120),
+        message: scrubText(
+          `${label}: \`${intendedColumn}\`=${intendedValue} against \`${achievedColumn}\`=${achievedValue}, recorded in one inserted row`,
+          220,
+        ),
+        comparedColumns,
+        source: normalizeDbEngine(event.d.engine),
+      }),
+      dedupeKey: `countercontradiction:${table}:${intendedColumn}:${achievedColumn}`,
+    });
+    emitted += 1;
+  }
+}
+
+/** Scalar equality that treats 1 and "1" as the same stored value. */
+function sameScalar(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || a === undefined || b === undefined)
+    return false;
+  if (typeof a === "object" || typeof b === "object") return false;
+  return String(a) === String(b);
+}
+
+function formatScalar(value: unknown): string {
+  if (value === null) return "null";
+  if (value === undefined) return "absent";
+  if (typeof value === "string") return scrubText(value, 80) ?? "[REDACTED]";
+  if (typeof value === "object") return "[object]";
+  return String(value);
+}
+
+/** SELECT statements against one table in one request before it reads as a fan-out. */
+const N_PLUS_ONE_STATEMENT_THRESHOLD = 8;
+
+/**
+ * n_plus_one_query: one request issued a separate SELECT per item.
+ *
+ * The classic listing defect. A catalog handler loops the rows it just fetched
+ * and asks the database one more question per row, so a page that should cost
+ * two round trips costs fifty-one. It is invisible to every other signal here:
+ * each query is fast, correct and individually unremarkable, the response is a
+ * 200, and the page renders exactly the right data. Only the shape of the
+ * request as a whole is wrong.
+ *
+ * Counted in SELECT *statements*, not rows. Rows are emitted one `db.read`
+ * event each, so a single SELECT returning fifty rows and fifty SELECTs
+ * returning one row produce the same number of events — `d.stmt` is what tells
+ * them apart, and without it this rule cannot run.
+ *
+ * Needs `captureReads: true`. Read caps bound the count, so the finding
+ * understates a large fan-out rather than overstating it.
+ */
+function addNPlusOneCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  // requestId + table → the distinct statement ordinals seen, and the first event.
+  const byTable = new Map<
+    string,
+    { statements: Set<number>; first: BugEvent; requestId: string; table: string }
+  >();
+  for (const event of events) {
+    if (event.k !== "db.read") continue;
+    const requestId = safeText(event.d.requestId, 120);
+    const table = safeText(event.d.table, 200);
+    const stmt = event.d.stmt;
+    if (!requestId || !table || !Number.isInteger(stmt)) continue;
+    const key = `${requestId}\u0000${table}`;
+    const entry = byTable.get(key) ?? {
+      statements: new Set<number>(),
+      first: event,
+      requestId,
+      table,
+    };
+    entry.statements.add(stmt as number);
+    if (event.t < entry.first.t) entry.first = event;
+    byTable.set(key, entry);
+  }
+
+  // One candidate per table, not one per request. The same missing JOIN fires
+  // on every request that walks the same code path, and a session that paged
+  // through four screens would otherwise fill the entire top of the ranking
+  // with four copies of one finding — crowding out whatever else the session
+  // caught. The worst request anchors the claim; the rest become a count.
+  const worstPerTable = new Map<
+    string,
+    {
+      worst: { statements: Set<number>; first: BugEvent; requestId: string; table: string };
+      requests: number;
+    }
+  >();
+  for (const entry of byTable.values()) {
+    if (entry.statements.size < N_PLUS_ONE_STATEMENT_THRESHOLD) continue;
+    const agg = worstPerTable.get(entry.table);
+    if (!agg) {
+      worstPerTable.set(entry.table, { worst: entry, requests: 1 });
+    } else {
+      agg.requests += 1;
+      if (entry.statements.size > agg.worst.statements.size) agg.worst = entry;
+    }
+  }
+
+  for (const { worst, requests } of worstPerTable.values()) {
+    const count = worst.statements.size;
+    const label = scrubText(bareTableName(worst.table), 100) ?? "table";
+    const recurrence =
+      requests > 1 ? ` The same pattern ran in ${requests} requests this session.` : "";
+    drafts.push({
+      detector: "n_plus_one_query",
+      title: `N+1 query: one request ran ${count} separate SELECTs against ${label}`,
+      severity: "medium",
+      score: 78,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: worst.first.t,
+        offsetMs:
+          offsetForEvent(worst.first) ??
+          offsetFromStart(worst.first.t, index.start),
+        route: routeAt(index.navs ?? [], worst.first.t),
+        requestId: worst.requestId,
+        message: `${count} SELECT statements against ${label} in one request, one per row rather than one for all of them. Read caps bound this count, so the real fan-out may be larger.${recurrence}`,
+        source: normalizeDbEngine(worst.first.d.engine),
+      }),
+      dedupeKey: `nplus1:${worst.table}`,
+    });
   }
 }
 
@@ -3440,6 +4991,18 @@ function collectNumericFieldEntries(
     else collectNumericFieldEntries(inner, out, depth + 1);
   }
   return out;
+}
+
+/**
+ * True when a captured column value is a structurally empty object or array —
+ * the shape a value takes when the capture could not represent it (a Date, a
+ * Buffer, a driver's numeric wrapper). Distinct from {@link isZeroOrEmpty},
+ * which asks whether a value is blank: `null` and `""` are real answers about
+ * the row, while `{}` is the absence of an answer.
+ */
+function isUnrepresentedValue(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length === 0;
+  return isRecord(value) && Object.keys(value).length === 0;
 }
 
 function isZeroOrEmpty(value: unknown): boolean {
@@ -3932,16 +5495,5000 @@ function hasOtelDbAttributes(attrs: Record<string, unknown>): boolean {
   );
 }
 
+// ═══ Full-recall detectors ══════════════════════════════════════════════════
+//
+// A recall sweep across a planted-bug corpus produced a set of defects whose
+// evidence the capture already carried while no rule read it: a response that
+// contradicts its own query string, rows read and never rendered, a stream that
+// reconnected past a change, a value the app quietly took back off the user.
+// Every rule below is written against events that already exist, and every one
+// of them stays silent rather than guessing — an unreadable body, an ambiguous
+// array, a redacted value, or a second plausible explanation ends the claim.
+//
+// Ranking discipline: the hard contradictions (a filter the response defies, an
+// acknowledged write the collection never received) sit with the database
+// invariants near the top; the heuristics (a currency symbol read against a
+// language tag, a listener count read across navigations) sit below the console
+// plane and say in their own detail text that they are heuristics.
+
+/**
+ * The propagated correlation id, falling back to the transport-local counter.
+ *
+ * Mirrors {@link collectMutatingRequests}: `d.requestId` is the id a `db.read`
+ * or a backend event carries, while `d.id` is the browser's per-transport
+ * counter. Joining on the wrong one silently matches nothing.
+ */
+function correlationIdOf(event: BugEvent): string | undefined {
+  return safeText(event.d.requestId, 120) ?? requestIdForEvent(event);
+}
+
+/** A request and its response, correlated on {@link correlationIdOf}. */
+interface RequestExchange {
+  requestId: string;
+  req: BugEvent;
+  method: string;
+  url?: string;
+  body: unknown;
+  res?: BugEvent;
+  /** `net.res d.body`: the redacted response body, as text. */
+  resBody?: unknown;
+  /** `net.res d.bodyMeta`: the bounded parsed view, when the browser built one. */
+  resBodyMeta?: unknown;
+  status?: number;
+}
+
+/**
+ * Every request in the session (not only the mutating ones
+ * {@link collectMutatingRequests} keeps), joined to its response.
+ */
+function collectRequestExchanges(
+  events: BugEvent[],
+): Map<string, RequestExchange> {
+  const exchanges = new Map<string, RequestExchange>();
+  for (const event of events) {
+    if (event.k !== "net.req") continue;
+    const id = correlationIdOf(event);
+    if (!id) continue;
+    exchanges.set(id, {
+      requestId: id,
+      req: event,
+      method: (
+        safeText(event.d.m, 20) ??
+        safeText(event.d.method, 20) ??
+        "GET"
+      ).toUpperCase(),
+      url: safeText(event.d.url, 400),
+      body: event.d.body,
+    });
+  }
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const id = correlationIdOf(event);
+    if (!id) continue;
+    const entry = exchanges.get(id);
+    if (!entry) continue;
+    entry.res = event;
+    entry.resBody = event.d.body;
+    entry.resBodyMeta = event.d.bodyMeta;
+    entry.status = finiteNumber(event.d.st);
+  }
+  return exchanges;
+}
+
+function isSuccessStatus(status: number | undefined): boolean {
+  return status !== undefined && status >= 200 && status < 300;
+}
+
+/** Parsed URL of a captured request/navigation url, relative or absolute. */
+function parseCapturedUrl(url: string | undefined): URL | undefined {
+  const text = url?.trim();
+  if (!text) return undefined;
+  try {
+    return /^[a-z][a-z\d+.-]*:/i.test(text)
+      ? new URL(text)
+      : new URL(text.startsWith("/") ? text : `/${text}`, "http://crumbtrail.local");
+  } catch {
+    return undefined;
+  }
+}
+
+/** Path portion of a captured url, origin and query removed. */
+function capturedUrlPath(url: string | undefined): string | undefined {
+  const parsed = parseCapturedUrl(url);
+  return parsed ? parsed.pathname : undefined;
+}
+
+/**
+ * The API root a url belongs to: its path with the last segment dropped.
+ * `/api/cart/items` → `/api/cart`, so a mutation of the collection and a read of
+ * it are recognisably the same area of the server.
+ */
+function apiPrefixOf(path: string): string {
+  const segments = path.split("/").filter(Boolean);
+  if (segments.length <= 1) return `/${segments.join("/")}`;
+  return `/${segments.slice(0, -1).join("/")}`;
+}
+
+/** Paths that look like a data call rather than a document or a static asset. */
+const API_PATH_RE = /(^|\/)(api|apis|graphql|gql|rest|v[0-9]+)(\/|$)/i;
+
+function looksLikeApiRequest(url: string | undefined): boolean {
+  const path = capturedUrlPath(url);
+  return path !== undefined && API_PATH_RE.test(path);
+}
+
+/** Conventional names for the collection inside a JSON response object. */
+const COLLECTION_BODY_KEYS = new Set([
+  "items",
+  "data",
+  "results",
+  "rows",
+  "records",
+  "list",
+  "entries",
+  "nodes",
+]);
+
+/** JSONPath of the root value in `bodyMeta.arrayTotal`. */
+const BODY_ROOT_PATH = "$";
+
+/**
+ * The structured view of a response body.
+ *
+ * `net.res` carries two things and they are not interchangeable. `d.body` is the
+ * redacted body as TEXT — the long-standing contract every older consumer reads.
+ * `d.bodyMeta` is the browser's bounded parsed view: `{ ct, bytes?, truncated?,
+ * data?, arrayTotal? }`, present only for a same-origin JSON response under
+ * 32KB that survived redaction and parsing.
+ *
+ * Prefer `d.bodyMeta.data`, because it is already parsed, depth-bounded and
+ * array-capped, and because it is the only place the true lengths of capped
+ * arrays are recorded. Fall back to parsing the `d.body` text, which is what a
+ * backend-captured, replayed or pre-`bodyMeta` session has — and where nothing
+ * was capped, so the captured lengths are exact.
+ */
+interface ResponseBodyView {
+  /** The parsed payload. Undefined when neither source yielded one. */
+  data: unknown;
+  /**
+   * True length of every array the capture capped, keyed by JSONPath —
+   * `{"$": 25}` for a top-level array, `{"$.items": 57}` for a nested one. Empty
+   * when nothing was capped, in which case the captured lengths are the true
+   * ones.
+   */
+  arrayTotal: Record<string, number>;
+}
+
+function responseBodyView(
+  body: unknown,
+  bodyMeta: unknown,
+): ResponseBodyView | undefined {
+  if (isRecord(bodyMeta) && bodyMeta.data !== undefined) {
+    const arrayTotal: Record<string, number> = {};
+    if (isRecord(bodyMeta.arrayTotal)) {
+      for (const [path, value] of Object.entries(bodyMeta.arrayTotal)) {
+        const total = finiteNumber(value);
+        if (total !== undefined) arrayTotal[path] = total;
+      }
+    }
+    return { data: bodyMeta.data, arrayTotal };
+  }
+  const parsed = parseStructuredBody(body);
+  if (parsed === undefined) return undefined;
+  return { data: parsed, arrayTotal: {} };
+}
+
+/** The structured payload of a captured response, from either source. */
+function responsePayload(body: unknown, bodyMeta?: unknown): unknown | undefined {
+  return responseBodyView(body, bodyMeta)?.data;
+}
+
+/**
+ * The one collection a response body carries, with its TRUE length.
+ *
+ * `total` reads the array's own entry in `bodyMeta.arrayTotal` when the capture
+ * capped it, and the captured length otherwise — core writes an entry only for
+ * an array it actually shortened, so the absence of one means the length in hand
+ * is the real length. Note that `bodyMeta.truncated` is NOT a usable guard here:
+ * it is also set by the string-length and depth caps, which say nothing about
+ * how many items an array had.
+ *
+ * Undefined — never a guess — when the body does not parse, carries no array, or
+ * carries more than one candidate array, because then nothing maps a count back
+ * to the rows it should describe.
+ */
+interface BodyCollection {
+  /** True length of the collection, capped items accounted for. */
+  total: number;
+  /** The items actually captured — the first 20 when the array was capped. */
+  items: unknown[];
+  /**
+   * True when `items` IS the collection rather than a prefix of it. Any rule
+   * that reasons about which items are present (rather than how many there are)
+   * has to check this: two capped arrays share their first twenty entries no
+   * matter how differently they end.
+   */
+  complete: boolean;
+}
+
+function collectionOf(items: unknown[], total: number): BodyCollection {
+  return { total, items, complete: items.length === total };
+}
+
+function responseCollection(
+  body: unknown,
+  bodyMeta?: unknown,
+): BodyCollection | undefined {
+  const view = responseBodyView(body, bodyMeta);
+  if (!view || view.data === undefined) return undefined;
+  const payload = view.data;
+
+  if (Array.isArray(payload)) {
+    return collectionOf(
+      payload,
+      view.arrayTotal[BODY_ROOT_PATH] ?? payload.length,
+    );
+  }
+  if (!isRecord(payload) || isRedactedPlaceholder(payload)) return undefined;
+
+  const arrays = Object.entries(payload).filter(([, value]) =>
+    Array.isArray(value),
+  ) as Array<[string, unknown[]]>;
+  if (arrays.length === 0) return undefined;
+  const named = arrays.filter(([name]) =>
+    COLLECTION_BODY_KEYS.has(name.toLowerCase()),
+  );
+  const chosen =
+    named.length === 1 ? named[0] : arrays.length === 1 ? arrays[0] : undefined;
+  if (!chosen) return undefined;
+  const [name, items] = chosen;
+  return collectionOf(
+    items,
+    view.arrayTotal[`${BODY_ROOT_PATH}.${name}`] ?? items.length,
+  );
+}
+
+/**
+ * The id-like value of every item in a collection, in order. Undefined when any
+ * item has no unambiguous identity, so a set comparison is never made up.
+ */
+function collectionIdentities(items: unknown[]): string[] | undefined {
+  const ids: string[] = [];
+  for (const item of items) {
+    if (!isRecord(item) || isRedactedPlaceholder(item)) return undefined;
+    const entry = Object.entries(item).find(
+      ([name, value]) =>
+        isIdLikeField(name) &&
+        (typeof value === "string" || toFiniteNumber(value) !== undefined),
+    );
+    if (!entry) return undefined;
+    ids.push(String(entry[1]));
+  }
+  return ids;
+}
+
+function sameIdentitySet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const a = [...left].sort();
+  const b = [...right].sort();
+  return a.every((value, i) => value === b[i]);
+}
+
+/** The single quantity-like number a record carries, or undefined if ambiguous. */
+function soleQuantityOf(value: unknown): number | undefined {
+  if (!isRecord(value) || isRedactedPlaceholder(value)) return undefined;
+  const quantities = Object.entries(value)
+    .filter(([name]) => QTY_LIKE_FIELD.test(name))
+    .map(([, raw]) => toFiniteNumber(raw))
+    .filter((qty): qty is number => qty !== undefined);
+  return quantities.length === 1 ? quantities[0] : undefined;
+}
+
+/** True for a captured value that is a redaction placeholder rather than data. */
+function isRedactedValue(value: unknown): boolean {
+  if (typeof value === "string") return value.trim() === "[REDACTED]";
+  return isRedactedPlaceholder(value);
+}
+
+// ─── filter_contradiction ────────────────────────────────────────────────────
+
+/** How many contradicted filters one session may carry. */
+const MAX_FILTER_CONTRADICTION_CANDIDATES = 5;
+
+/**
+ * A response that contradicts its request's own filter, or a request whose rows
+ * never reached the response, is a hard contradiction between two things the
+ * capture recorded — one tier under the database invariants (90), because the
+ * join rests on a name match rather than on two images of one row, and above the
+ * runtime errors (82) because nothing here errored at all.
+ */
+const FILTER_CONTRADICTION_SCORE = 84;
+
+/**
+ * Query parameters that carry free text. `?q=desk` is a search term the server
+ * is free to interpret, not a declaration that every row will have `q = "desk"`.
+ */
+const FREE_TEXT_QUERY_PARAMS = new Set([
+  "q",
+  "query",
+  "search",
+  "searchterm",
+  "term",
+  "keyword",
+  "keywords",
+  "text",
+  "s",
+  "filter",
+  "filters",
+]);
+
+/**
+ * Parameters that page, sort or shape a response rather than filter it. Matched
+ * on the whole normalized name, so a column genuinely called `order` in a table
+ * is unaffected — this is about the parameter, not the column.
+ */
+const NON_FILTER_QUERY_PARAMS = new Set([
+  "limit",
+  "offset",
+  "page",
+  "pagesize",
+  "perpage",
+  "cursor",
+  "sort",
+  "sortby",
+  "order",
+  "orderby",
+  "direction",
+  "fields",
+  "select",
+  "include",
+  "expand",
+  "format",
+  "callback",
+  "locale",
+  "lang",
+  "token",
+  "key",
+  "apikey",
+  "signature",
+  "nonce",
+]);
+
+/**
+ * Word segments that make a parameter a range bound. `maxPrice=200` says rows
+ * are ≤ 200, not that every row costs exactly 200, so an equality reading of it
+ * would fire on every correct response.
+ */
+const RANGE_PARAM_WORDS = new Set([
+  "min",
+  "max",
+  "from",
+  "to",
+  "before",
+  "after",
+  "since",
+  "until",
+  "start",
+  "end",
+  "lt",
+  "lte",
+  "gt",
+  "gte",
+  "range",
+  "between",
+]);
+
+const TRUE_TOKENS = new Set(["true", "1", "yes", "y", "on"]);
+const FALSE_TOKENS = new Set(["false", "0", "no", "n", "off"]);
+
+/**
+ * The one name family this detector reads across a rename: a boolean
+ * availability filter against the stock column the row actually carries.
+ * `?inStock=true` returning a row whose `inventory` is 0 is the canonical shape
+ * of the defect, and the two names never match textually. Deliberately narrow —
+ * a boolean parameter and a count column, nothing else — because every entry
+ * here is an assumption about someone else's schema.
+ */
+const AVAILABILITY_PARAM_NAMES = new Set([
+  "instock",
+  "instockonly",
+  "available",
+  "isavailable",
+  "hasstock",
+  "instocked",
+]);
+const AVAILABILITY_ROW_FIELDS = new Set([
+  "instock",
+  "available",
+  "isavailable",
+  "inventory",
+  "stock",
+  "stockcount",
+  "stocklevel",
+  "quantityavailable",
+  "availablequantity",
+]);
+
+interface DeclaredFilter {
+  /** Parameter name as written in the query string. */
+  name: string;
+  /** Normalized name used for matching a row field. */
+  key: string;
+  /** Accepted values; more than one when the query repeats or comma-lists it. */
+  values: string[];
+  /** True when every accepted value reads as a boolean. */
+  boolean: boolean;
+}
+
+/**
+ * The equality-ish filters a request declared in its own query string.
+ *
+ * Deny-biased at every step: a free-text parameter, a paging parameter, a range
+ * bound, an empty value and a redacted value all contribute nothing, because the
+ * whole claim rests on the request having stated something the response can
+ * contradict.
+ */
+function declaredFilters(url: string | undefined): DeclaredFilter[] {
+  const parsed = parseCapturedUrl(url);
+  if (!parsed) return [];
+  const byKey = new Map<string, DeclaredFilter>();
+  for (const [rawName, rawValue] of parsed.searchParams) {
+    const name = safeText(rawName, 80);
+    if (!name) continue;
+    const key = normalizeFieldName(name);
+    if (FREE_TEXT_QUERY_PARAMS.has(key)) continue;
+    if (NON_FILTER_QUERY_PARAMS.has(key)) continue;
+    if (columnWords(name).some((word) => RANGE_PARAM_WORDS.has(word))) continue;
+    const value = safeText(rawValue, 200);
+    if (!value || isRedactedValue(value)) continue;
+    // A repeated or comma-listed parameter is a set: a row matching any member
+    // satisfies it, so only a row matching none is a contradiction.
+    const values = value.includes(",")
+      ? value
+          .split(",")
+          .map((part) => part.trim())
+          .filter(Boolean)
+      : [value];
+    if (values.length === 0) continue;
+    const existing = byKey.get(key);
+    if (existing) existing.values.push(...values);
+    else
+      byKey.set(key, {
+        name,
+        key,
+        values,
+        boolean: false,
+      });
+  }
+  for (const filter of byKey.values()) {
+    filter.boolean = filter.values.every((value) => {
+      const token = value.trim().toLowerCase();
+      return TRUE_TOKENS.has(token) || FALSE_TOKENS.has(token);
+    });
+  }
+  return [...byKey.values()];
+}
+
+/** The row field a declared filter is about, when the row carries one. */
+function rowFieldForFilter(
+  filter: DeclaredFilter,
+  row: Record<string, unknown>,
+): { field: string; value: unknown } | undefined {
+  const direct = Object.entries(row).find(
+    ([name]) => normalizeFieldName(name) === filter.key,
+  );
+  if (direct) return { field: direct[0], value: direct[1] };
+  if (!filter.boolean || !AVAILABILITY_PARAM_NAMES.has(filter.key))
+    return undefined;
+  const availability = Object.entries(row).find(([name]) =>
+    AVAILABILITY_ROW_FIELDS.has(normalizeFieldName(name)),
+  );
+  return availability
+    ? { field: availability[0], value: availability[1] }
+    : undefined;
+}
+
+/** Truthiness of a stored value read as an availability flag. */
+function availabilityTruth(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  const numeric = finiteNumber(value);
+  if (numeric !== undefined) return numeric > 0;
+  if (typeof value === "string") {
+    const token = value.trim().toLowerCase();
+    if (TRUE_TOKENS.has(token)) return true;
+    if (FALSE_TOKENS.has(token)) return false;
+    const parsed = toFiniteNumber(token);
+    if (parsed !== undefined) return parsed > 0;
+  }
+  if (value === null) return false;
+  return undefined;
+}
+
+/**
+ * Whether a read row contradicts a filter the request declared, and how.
+ * Returns the sentence for the candidate's detail, or undefined when the row
+ * satisfies the filter or cannot be compared against it.
+ */
+function filterContradictionOf(
+  filter: DeclaredFilter,
+  field: string,
+  value: unknown,
+): string | undefined {
+  if (value === undefined || isRedactedValue(value)) return undefined;
+  if (typeof value === "object" && value !== null) return undefined;
+
+  if (filter.boolean) {
+    const wanted = TRUE_TOKENS.has(filter.values[0].trim().toLowerCase());
+    const actual = availabilityTruth(value);
+    if (actual === undefined || actual === wanted) return undefined;
+    return `the request declared \`${filter.name}=${filter.values[0]}\` and the row read back carries \`${field}\`=${formatScalar(value)}`;
+  }
+
+  const actual = String(value).trim().toLowerCase();
+  const accepted = filter.values.map((entry) => entry.trim().toLowerCase());
+  if (accepted.includes(actual)) return undefined;
+  // A comma-listed value may also have been stored verbatim.
+  if (accepted.length > 1 && actual === filter.values.join(",").toLowerCase())
+    return undefined;
+  return `the request declared \`${filter.name}=${filter.values.join(",")}\` and the row read back carries \`${field}\`=${formatScalar(value)}`;
+}
+
+/**
+ * filter_contradiction: a 2xx response was built from rows that defy the
+ * request's own query string.
+ *
+ * `GET /products?category=audio` answering with a row whose `category` is
+ * `desk` is a contradiction with no second reading: the request declared the
+ * constraint, the server acknowledged with a 200, and the row it read says
+ * otherwise. Nothing else in the pipeline sees it — the request is fine, the
+ * response is fine, the query is fast, and the page renders exactly the wrong
+ * products without a single error.
+ *
+ * The join is the request's own correlation id, so the rows compared are the
+ * rows THAT request read, not rows that happened to be read nearby.
+ */
+function addFilterContradictionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const readsByRequest = new Map<string, BugEvent[]>();
+  for (const event of events) {
+    if (event.k !== "db.read") continue;
+    if (!isRecord(event.d.row)) continue;
+    const id = correlationIdOf(event);
+    if (!id) continue;
+    const list = readsByRequest.get(id) ?? [];
+    list.push(event);
+    readsByRequest.set(id, list);
+  }
+  if (readsByRequest.size === 0) return;
+
+  const byFilter = new Map<string, CandidateDraft>();
+  for (const exchange of exchanges.values()) {
+    if (!isSuccessStatus(exchange.status)) continue;
+    const reads = readsByRequest.get(exchange.requestId);
+    if (!reads || reads.length === 0) continue;
+    const filters = declaredFilters(exchange.url);
+    if (filters.length === 0) continue;
+
+    for (const filter of filters) {
+      for (const read of reads) {
+        const row = read.d.row as Record<string, unknown>;
+        const match = rowFieldForFilter(filter, row);
+        if (!match) continue;
+        const contradiction = filterContradictionOf(
+          filter,
+          match.field,
+          match.value,
+        );
+        if (!contradiction) continue;
+
+        const path = capturedUrlPath(exchange.url) ?? exchange.requestId;
+        const dedupeKey = `filtercontradiction:${path}:${filter.key}`;
+        if (byFilter.has(dedupeKey)) break;
+        const table =
+          scrubText(bareTableName(safeText(read.d.table, 200) ?? ""), 100) ??
+          "the table";
+        byFilter.set(dedupeKey, {
+          detector: "filter_contradiction",
+          title: `Response rows contradict the request's own filter \`${filter.name}\``,
+          severity: "high",
+          score: FILTER_CONTRADICTION_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: read.t,
+            offsetMs:
+              offsetForEvent(read) ?? offsetFromStart(read.t, index.start),
+            route: routeAt(index.navs ?? [], read.t),
+            requestId: exchange.requestId,
+            method: exchange.method,
+            url: redactUrl(exchange.url),
+            status: exchange.status,
+            message: scrubText(
+              `${contradiction} (read from ${table} inside this request). The response was a ${exchange.status}, so nothing downstream had reason to doubt it.`,
+              220,
+            ),
+            comparedColumns: [match.field],
+            source: normalizeDbEngine(read.d.engine),
+          }),
+          dedupeKey,
+        });
+        break; // One claim per declared filter.
+      }
+    }
+  }
+
+  const emitted = [...byFilter.values()]
+    .sort((a, b) => a.anchor.t - b.anchor.t)
+    .slice(0, MAX_FILTER_CONTRADICTION_CANDIDATES);
+  drafts.push(...emitted);
+}
+
+// ─── result_row_loss ─────────────────────────────────────────────────────────
+
+/** How many row-loss claims one session may carry. */
+const MAX_RESULT_ROW_LOSS_CANDIDATES = 5;
+/**
+ * The count of on-screen numbers is not a row count. When the response body is
+ * unreadable and a `ui.num` snapshot is all there is, the claim drops to the
+ * display plane's own tier and says so.
+ */
+const RESULT_ROW_LOSS_UI_SCORE = 64;
+
+/** Parameter names whose value is the page size the server was asked for. */
+const PAGE_SIZE_PARAMS = new Set(["limit", "pagesize", "perpage", "take", "count"]);
+
+/** The page size a request asked for, when it asked for one. */
+function requestedPageSize(url: string | undefined): number | undefined {
+  const parsed = parseCapturedUrl(url);
+  if (!parsed) return undefined;
+  for (const [name, value] of parsed.searchParams) {
+    if (!PAGE_SIZE_PARAMS.has(normalizeFieldName(name))) continue;
+    const size = toFiniteNumber(value);
+    if (size !== undefined) return size;
+  }
+  return undefined;
+}
+
+/**
+ * result_row_loss: the backend read rows the response never carried.
+ *
+ * A handler that reads twelve rows and answers with eight has dropped four, and
+ * the four the user never saw are the defect. Everything else in the session
+ * says the request succeeded, because it did — the loss happens between the
+ * database and the serializer, where no error is raised and no status changes.
+ *
+ * Restricted to non-mutating requests on purpose. A POST reads rows to validate
+ * its input and answers with a single object; comparing those two numbers would
+ * fire on every correct write in every session.
+ *
+ * Aggregates are excluded by requiring `d.pk`: a `count(*)` row has no primary
+ * key, and counting it as a returned row would invent a loss.
+ */
+function addResultRowLossCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  // requestId → table → the row reads against it.
+  const readsByRequest = new Map<string, Map<string, BugEvent[]>>();
+  for (const event of events) {
+    if (event.k !== "db.read") continue;
+    // A row read carries the primary key of the row it read. A count/aggregate
+    // row does not, and must never be counted as a row the user should have
+    // seen.
+    if (event.d.pk == null || !isRecord(event.d.pk)) continue;
+    const id = correlationIdOf(event);
+    const table = safeText(event.d.table, 200);
+    if (!id || !table) continue;
+    const byTable = readsByRequest.get(id) ?? new Map<string, BugEvent[]>();
+    const list = byTable.get(table) ?? [];
+    list.push(event);
+    byTable.set(table, list);
+    readsByRequest.set(id, byTable);
+  }
+  if (readsByRequest.size === 0) return;
+
+  // The true row count when the capture capped per-row emission.
+  const bulkRowCount = new Map<string, number>();
+  for (const event of events) {
+    if (event.k !== "db.read.bulk") continue;
+    const id = correlationIdOf(event);
+    const table = safeText(event.d.table, 200);
+    const rows = finiteNumber(event.d.rowCount);
+    if (!id || !table || rows === undefined) continue;
+    bulkRowCount.set(`${id} ${table}`, rows);
+  }
+
+  const uiSnapshots = events
+    .filter((event) => event.k === "ui.num")
+    .sort((a, b) => a.t - b.t);
+  const navTimes = (index.navs ?? []).map((nav) => nav.t).sort((a, b) => a - b);
+
+  const emitted: CandidateDraft[] = [];
+  for (const exchange of exchanges.values()) {
+    if (MUTATING_METHODS.has(exchange.method)) continue;
+    if (!isSuccessStatus(exchange.status) || !exchange.res) continue;
+    const byTable = readsByRequest.get(exchange.requestId);
+    // More than one table read in the request means no honest mapping from a
+    // response array back to the rows it should have carried.
+    if (!byTable || byTable.size !== 1) continue;
+    const [table, reads] = [...byTable.entries()][0];
+    const rowsRead = Math.max(
+      reads.length,
+      bulkRowCount.get(`${exchange.requestId} ${table}`) ?? 0,
+    );
+    if (rowsRead < 1) continue;
+
+    const collection = responseCollection(exchange.resBody, exchange.resBodyMeta);
+    let shown: number | undefined;
+    let basis: "body" | "ui" | undefined;
+    if (collection) {
+      shown = collection.total;
+      basis = "body";
+    } else {
+      // No readable body: the next display snapshot on this page is the only
+      // record of what the user was actually shown.
+      const nextNav = navTimes.find((t) => t > exchange.res!.t);
+      const snapshot = uiSnapshots.find(
+        (event) =>
+          event.t >= exchange.res!.t &&
+          (nextNav === undefined || event.t < nextNav),
+      );
+      const items = snapshot ? uiNumItems(snapshot) : [];
+      if (items.length > 0) {
+        shown = items.length;
+        basis = "ui";
+      }
+    }
+    if (shown === undefined || basis === undefined) continue;
+    if (shown >= rowsRead) continue;
+    // The server was asked for a page and returned exactly that page: the rows
+    // beyond it were read for the count, not lost.
+    if (requestedPageSize(exchange.url) === shown) continue;
+
+    const label = scrubText(bareTableName(table), 100) ?? "the table";
+    emitted.push({
+      detector: "result_row_loss",
+      title: `${rowsRead - shown} of ${rowsRead} rows read from ${label} never reached the user`,
+      severity: basis === "body" ? "high" : "medium",
+      score:
+        basis === "body" ? FILTER_CONTRADICTION_SCORE : RESULT_ROW_LOSS_UI_SCORE,
+      confidence: basis === "body" ? "high" : "low",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs:
+          offsetForEvent(exchange.res) ??
+          offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        message:
+          basis === "body"
+            ? `The request read ${rowsRead} rows from ${table} and its response body carried ${shown}. Read caps bound the count, so the loss may be larger, never smaller.`
+            : `The request read ${rowsRead} rows from ${table}; the response body was unreadable, and the next on-screen number snapshot showed ${shown} values. A count of rendered numbers is not a row count — treat this as a pointer to check the response, not as a proven count.`,
+        source: normalizeDbEngine(reads[0].d.engine),
+      }),
+      dedupeKey: `rowloss:${capturedUrlPath(exchange.url) ?? exchange.requestId}:${table}`,
+    });
+  }
+
+  drafts.push(
+    ...emitted
+      .sort((a, b) => a.anchor.t - b.anchor.t)
+      .slice(0, MAX_RESULT_ROW_LOSS_CANDIDATES),
+  );
+}
+
+// ─── shared_state_bleed ──────────────────────────────────────────────────────
+
+/**
+ * Two reads of one URL that disagree, with nothing this session did in between,
+ * is a strong observation with a weaker conclusion: another writer moved the
+ * data. That could be a second user, a leaked session, or a legitimate
+ * background job, so the score sits under the hard contradictions and the
+ * confidence says medium.
+ */
+const SHARED_STATE_BLEED_SCORE = 80;
+
+/**
+ * shared_state_bleed: the same read answered differently while this session did
+ * nothing.
+ *
+ * Two GETs of one URL, both 200, the second holding more (or different) items,
+ * and no POST/PUT/PATCH/DELETE from this session anywhere between them. Server
+ * state moved under a session that only looked at it — the shape of a cart, a
+ * draft or a filter that is keyed on something shared rather than on the caller.
+ *
+ * Gated on the URL being stateful at all: some earlier mutating request in this
+ * session must have addressed the same API root. Without that gate every
+ * read-only dashboard polling a live feed reads as a defect, which is the
+ * opposite of the finding.
+ */
+function addSharedStateBleedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const mutations: Array<{ t: number; path: string }> = [];
+  for (const event of events) {
+    if (event.k !== "net.req") continue;
+    const method = (
+      safeText(event.d.m, 20) ??
+      safeText(event.d.method, 20) ??
+      ""
+    ).toUpperCase();
+    if (!MUTATING_METHODS.has(method)) continue;
+    const path = capturedUrlPath(safeText(event.d.url, 400));
+    if (!path) continue;
+    mutations.push({ t: event.t, path });
+  }
+  if (mutations.length === 0) return;
+
+  interface Read {
+    exchange: RequestExchange;
+    res: BugEvent;
+    collection: BodyCollection;
+  }
+  const byUrl = new Map<string, Read[]>();
+  for (const exchange of exchanges.values()) {
+    if (exchange.method !== "GET") continue;
+    if (!isSuccessStatus(exchange.status) || !exchange.res) continue;
+    const url = exchange.url;
+    if (!url) continue;
+    const collection = responseCollection(exchange.resBody, exchange.resBodyMeta);
+    if (!collection) continue;
+    const list = byUrl.get(url) ?? [];
+    list.push({ exchange, res: exchange.res, collection });
+    byUrl.set(url, list);
+  }
+
+  for (const [url, reads] of byUrl) {
+    if (reads.length < 2) continue;
+    reads.sort((a, b) => a.res.t - b.res.t);
+    const path = capturedUrlPath(url);
+    if (!path) continue;
+    const prefix = apiPrefixOf(path);
+    // Stateful gate: this session has written to this area before.
+    const firstMutationToArea = mutations
+      .filter((mutation) => mutation.path.startsWith(prefix))
+      .sort((a, b) => a.t - b.t)[0];
+    if (!firstMutationToArea) continue;
+
+    for (let i = 1; i < reads.length; i += 1) {
+      const before = reads[i - 1];
+      const after = reads[i];
+      if (firstMutationToArea.t >= before.exchange.req.t) continue;
+      // Anything this session wrote anywhere in the span could explain the
+      // change, so the span has to be clean end to end.
+      const wroteInBetween = mutations.some(
+        (mutation) =>
+          mutation.t >= before.exchange.req.t && mutation.t <= after.res.t,
+      );
+      if (wroteInBetween) continue;
+
+      const grew = after.collection.total > before.collection.total;
+      // The item-set comparison needs both collections whole. The capture keeps
+      // the first twenty entries of a longer array, and two different
+      // twenty-first-onward tails share an identical prefix, so comparing
+      // prefixes as sets would report agreement that was never established.
+      const comparable =
+        before.collection.complete && after.collection.complete;
+      const beforeIds = comparable
+        ? collectionIdentities(before.collection.items)
+        : undefined;
+      const afterIds = comparable
+        ? collectionIdentities(after.collection.items)
+        : undefined;
+      const setChanged =
+        beforeIds !== undefined &&
+        afterIds !== undefined &&
+        !sameIdentitySet(beforeIds, afterIds);
+      if (!grew && !setChanged) continue;
+
+      drafts.push({
+        detector: "shared_state_bleed",
+        title: `Server state changed between two identical reads this session never wrote to`,
+        severity: "high",
+        score: SHARED_STATE_BLEED_SCORE,
+        confidence: "medium",
+        anchor: removeUndefined({
+          t: after.res.t,
+          offsetMs:
+            offsetForEvent(after.res) ??
+            offsetFromStart(after.res.t, index.start),
+          route: routeAt(index.navs ?? [], after.res.t),
+          requestId: after.exchange.requestId,
+          method: "GET",
+          url: redactUrl(url),
+          status: after.exchange.status,
+          message: grew
+            ? `Two GETs of this URL returned ${before.collection.total} then ${after.collection.total} items with no POST, PUT, PATCH or DELETE from this session anywhere between them. The session had written to ${prefix} earlier, so this URL is session-scoped state that moved on its own.`
+            : `Two GETs of this URL returned the same number of items but a different set, with no POST, PUT, PATCH or DELETE from this session anywhere between them. The session had written to ${prefix} earlier, so this URL is session-scoped state that moved on its own.`,
+        }),
+        dedupeKey: `statebleed:${path}`,
+      });
+    }
+  }
+}
+
+// ─── correlated batch imports ────────────────────────────────────────────────
+
+interface ParsedCsv {
+  headers: string[];
+  rows: string[][];
+}
+
+/** Small RFC-4180 parser for captured import bodies; malformed CSV is ignored. */
+function parseCapturedCsv(value: unknown): ParsedCsv | undefined {
+  if (typeof value !== "string" || !value.includes("\n")) return undefined;
+  const records: string[][] = [];
+  let record: string[] = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i];
+    if (char === '"') {
+      if (quoted && value[i + 1] === '"') {
+        field += '"';
+        i += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (char === "," && !quoted) {
+      record.push(field);
+      field = "";
+    } else if ((char === "\n" || char === "\r") && !quoted) {
+      if (char === "\r" && value[i + 1] === "\n") i += 1;
+      record.push(field);
+      if (record.some((item) => item.length > 0)) records.push(record);
+      record = [];
+      field = "";
+    } else {
+      field += char;
+    }
+  }
+  if (quoted) return undefined;
+  record.push(field);
+  if (record.some((item) => item.length > 0)) records.push(record);
+  if (records.length < 2) return undefined;
+  const width = records[0].length;
+  if (width < 2 || records.some((row) => row.length !== width)) return undefined;
+  return {
+    headers: records[0].map((header) => header.replace(/^\uFEFF/, "").trim()),
+    rows: records.slice(1),
+  };
+}
+
+function csvColumn(
+  csv: ParsedCsv,
+  pattern: RegExp,
+): number | undefined {
+  const index = csv.headers.findIndex((header) => pattern.test(header));
+  return index >= 0 ? index : undefined;
+}
+
+function scalarPkText(event: BugEvent): string | undefined {
+  const entries = pkEntriesOf(event);
+  if (entries.length !== 1) return undefined;
+  return `${entries[0][0]}=${entries[0][1]}`;
+}
+
+/**
+ * Names three high-signal batch contradictions using only one correlated
+ * request: a response that claims more rows than it describes, one row updated
+ * twice, and values shifted forward by one CSV row.
+ */
+function addBatchImportCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const diffs = dbDiffsByRequest(events);
+  for (const exchange of exchanges.values()) {
+    if (!isSuccessStatus(exchange.status) || !exchange.res) continue;
+    const csv = parseCapturedCsv(exchange.body);
+    if (!csv) continue;
+    const response = parseStructuredBody(exchange.resBody);
+    const requestDiffs = diffs.get(exchange.requestId) ?? [];
+
+    if (isRecord(response)) {
+      const applied =
+        finiteNumber(response.applied) ?? finiteNumber(response.rows_applied);
+      const total =
+        finiteNumber(response.total) ?? finiteNumber(response.rows_total);
+      const rows = response.rows;
+      const errors = response.errors;
+      if (
+        applied !== undefined &&
+        applied > 0 &&
+        (total === undefined || total === csv.rows.length) &&
+        applied === csv.rows.length &&
+        Array.isArray(rows) &&
+        rows.length < applied &&
+        Array.isArray(errors) &&
+        errors.length === 0
+      ) {
+        drafts.push({
+          detector: "acknowledged_batch_rows_missing",
+          title: `Batch reported ${applied} applied rows but described only ${rows.length}`,
+          severity: "high",
+          score: DB_INVARIANT_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: exchange.res.t,
+            offsetMs:
+              offsetForEvent(exchange.res) ??
+              offsetFromStart(exchange.res.t, index.start),
+            route: routeAt(index.navs ?? [], exchange.res.t),
+            requestId: exchange.requestId,
+            method: exchange.method,
+            url: redactUrl(exchange.url),
+            status: exchange.status,
+            message: `The CSV contained ${csv.rows.length} data rows. The successful response claimed ${applied} applied with no errors, but its result list contained ${rows.length}.`,
+          }),
+          dedupeKey: `batchmissing:${exchange.requestId}`,
+        });
+      }
+    }
+
+    const repeated = new Map<string, BugEvent[]>();
+    for (const diff of requestDiffs) {
+      if (safeText(diff.d.op, 20)?.toLowerCase() !== "update") continue;
+      const table = safeText(diff.d.table, 160);
+      const pk = scalarPkText(diff);
+      if (!table || !pk) continue;
+      const key = `${table}\u0000${pk}`;
+      const group = repeated.get(key) ?? [];
+      group.push(diff);
+      repeated.set(key, group);
+    }
+    for (const [key, group] of repeated) {
+      if (group.length < 2) continue;
+      group.sort((a, b) => a.t - b.t);
+      const last = group[group.length - 1];
+      const [table, pk] = key.split("\u0000");
+      drafts.push({
+        detector: "same_request_row_rewritten",
+        title: `${bareTableName(table)} row ${pk} was updated ${group.length} times by one batch request`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: last.t,
+          offsetMs:
+            offsetForEvent(last) ?? offsetFromStart(last.t, index.start),
+          route: routeAt(index.navs ?? [], last.t),
+          requestId: exchange.requestId,
+          method: exchange.method,
+          url: redactUrl(exchange.url),
+          message: `One successful CSV request rewrote the same ${bareTableName(table)} primary key ${group.length} times. Distinct input rows collided on one database row, so an earlier imported value was overwritten before the response returned.`,
+          source: normalizeDbEngine(last.d.engine),
+        }),
+        dedupeKey: `batchrewrite:${exchange.requestId}:${table}:${pk}`,
+      });
+    }
+
+    const identityColumn = csvColumn(csv, /^(sku|slug|key|code)$/i);
+    const valueColumn = csvColumn(
+      csv,
+      /(?:price|amount|total|cost|value)(?:_?cents?)?$/i,
+    );
+    if (identityColumn === undefined || valueColumn === undefined) continue;
+    let shifted = 0;
+    let anchor: BugEvent | undefined;
+    for (let rowIndex = 0; rowIndex + 1 < csv.rows.length; rowIndex += 1) {
+      const identity = csv.rows[rowIndex][identityColumn]?.trim();
+      const expected = Number(csv.rows[rowIndex][valueColumn]);
+      const next = Number(csv.rows[rowIndex + 1][valueColumn]);
+      if (!identity || !Number.isFinite(expected) || !Number.isFinite(next))
+        continue;
+      const match = requestDiffs.find((diff) => {
+        const after = isRecord(diff.d.after) ? diff.d.after : undefined;
+        if (!after) return false;
+        const dbIdentity =
+          safeText(after.slug, 240) ??
+          safeText(after.sku, 240) ??
+          safeText(after.key, 240) ??
+          safeText(after.code, 240);
+        if (dbIdentity !== identity) return false;
+        const actual =
+          finiteNumber(after[csv.headers[valueColumn]]) ??
+          finiteNumber(after.price_cents) ??
+          finiteNumber(after.amount_cents);
+        return actual === next && actual !== expected;
+      });
+      if (match) {
+        shifted += 1;
+        anchor = match;
+      }
+    }
+    if (shifted >= 2 && anchor) {
+      drafts.push({
+        detector: "batch_value_shift",
+        title: `${shifted} batch rows were written with the next CSV row's value`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE + 2,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: anchor.t,
+          offsetMs:
+            offsetForEvent(anchor) ?? offsetFromStart(anchor.t, index.start),
+          route: routeAt(index.navs ?? [], anchor.t),
+          requestId: exchange.requestId,
+          method: exchange.method,
+          url: redactUrl(exchange.url),
+          message: `${shifted} database updates matched a CSV row's identity but used the following row's ${csv.headers[valueColumn]} value. This is a consistent one-row shift, not an isolated mismatch.`,
+          source: normalizeDbEngine(anchor.d.engine),
+        }),
+        dedupeKey: `batchshift:${exchange.requestId}:${csv.headers[valueColumn]}`,
+      });
+    }
+  }
+}
+
+// ─── relational write integrity ──────────────────────────────────────────────
+
+const RELATIONAL_WRITE_INTEGRITY_SCORE = DB_INVARIANT_SCORE + 3;
+const STALE_WRITEBACK_WINDOW_MS = 60_000;
+
+function scalarChanged(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+  field: string,
+): { before: string; after: string } | undefined {
+  const previous = keyValueOf(before[field]);
+  const next = keyValueOf(after[field]);
+  return previous !== undefined && next !== undefined && previous !== next
+    ? { before: previous, after: next }
+    : undefined;
+}
+
+function rowIdentity(event: BugEvent): string | undefined {
+  const table = safeText(event.d.table, 200);
+  const pk = pkEntriesOf(event);
+  if (!table || pk.length === 0) return undefined;
+  return `${bareTableName(table).toLowerCase()}:${pk
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([field, value]) => `${field}=${value}`)
+    .join("&")}`;
+}
+
+function addExistingChildrenReparentedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    const parentInserts = diffs.filter(
+      (event) =>
+        safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+        isRecord(event.d.after),
+    );
+    for (const parent of parentInserts) {
+      const parentTable = safeText(parent.d.table, 200);
+      if (!parentTable) continue;
+      const parentPk = pkEntriesOf(parent);
+      if (parentPk.length !== 1) continue;
+      const moved = diffs.filter((child) => {
+        if (
+          safeText(child.d.op, 20)?.toLowerCase() !== "update" ||
+          !isRecord(child.d.before) ||
+          !isRecord(child.d.after)
+        )
+          return false;
+        const before = child.d.before;
+        const after = child.d.after;
+        return Object.keys(after).some((field) => {
+          if (!columnReferencesTable(field, parentTable)) return false;
+          const change = scalarChanged(before, after, field);
+          return change?.after === parentPk[0][1];
+        });
+      });
+      if (moved.length === 0) continue;
+      const childTable = safeText(moved[0].d.table, 200);
+      if (
+        !childTable ||
+        moved.some(
+          (event) => safeText(event.d.table, 200) !== childTable,
+        ) ||
+        diffs.some(
+          (event) =>
+            safeText(event.d.table, 200) === childTable &&
+            safeText(event.d.op, 20)?.toLowerCase() === "insert",
+        )
+      )
+        continue;
+      const anchor = moved[0];
+      drafts.push({
+        detector: "existing_children_reparented_to_new_row",
+        title: `${moved.length} existing ${bareTableName(childTable)} row${moved.length === 1 ? "" : "s"} moved to a newly inserted ${bareTableName(parentTable)}`,
+        severity: "critical",
+        score: RELATIONAL_WRITE_INTEGRITY_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: anchor.t,
+          offsetMs:
+            offsetForEvent(anchor) ?? offsetFromStart(anchor.t, index.start),
+          route: routeAt(index.navs ?? [], anchor.t),
+          requestId,
+          table: childTable,
+          source: normalizeDbEngine(anchor.d.engine),
+          frame: dbCallsiteFrame(anchor.d.callsite),
+          message:
+            `The request inserted ${bareTableName(parentTable)} ${parentPk[0][1]}, then updated ` +
+            `${moved.length} existing ${bareTableName(childTable)} row${moved.length === 1 ? "" : "s"} to reference it without inserting replacement child rows.`,
+        }),
+        dedupeKey: `reparented:${requestId}:${childTable}:${parentTable}`,
+      });
+    }
+  }
+}
+
+function identifierTargetsTable(field: string, table: string): boolean {
+  const entity = foreignKeyEntity(field);
+  if (!entity) return false;
+  const tableEntity = singularize(
+    normalizeEntityName(bareTableName(table)),
+  );
+  return tableEntity === entity || tableEntity.endsWith(entity);
+}
+
+function addRequestTargetRowMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (!isSuccessStatus(exchange.status)) continue;
+    const request = parseStructuredBody(exchange.body);
+    if (!isRecord(request)) continue;
+    const diffs = events.filter(
+      (event) =>
+        event.k === "db.diff" &&
+        correlationIdOf(event) === exchange.requestId &&
+        ["update", "delete"].includes(
+          safeText(event.d.op, 20)?.toLowerCase() ?? "",
+        ),
+    );
+    for (const diff of diffs) {
+      const table = safeText(diff.d.table, 200);
+      const pk = pkEntriesOf(diff);
+      if (!table || pk.length !== 1) continue;
+      const targets = Object.entries(request)
+        .filter(([field]) => identifierTargetsTable(field, table))
+        .map(([field, value]) => [field, keyValueOf(value)] as const)
+        .filter(
+          (entry): entry is readonly [string, string] =>
+            entry[1] !== undefined,
+        );
+      if (targets.length !== 1 || targets[0][1] === pk[0][1]) continue;
+      drafts.push({
+        detector: "request_target_row_mismatch",
+        title: `Request targeted ${targets[0][0]}=${targets[0][1]}, but updated ${bareTableName(table)} ${pk[0][0]}=${pk[0][1]}`,
+        severity: "critical",
+        score: RELATIONAL_WRITE_INTEGRITY_SCORE + 1,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: diff.t,
+          offsetMs:
+            offsetForEvent(diff) ?? offsetFromStart(diff.t, index.start),
+          route: routeAt(index.navs ?? [], diff.t),
+          requestId: exchange.requestId,
+          method: exchange.method,
+          url: redactUrl(exchange.url),
+          status: exchange.status,
+          table,
+          source: normalizeDbEngine(diff.d.engine),
+          frame: dbCallsiteFrame(diff.d.callsite),
+          message:
+            `The accepted request named ${targets[0][0]}=${targets[0][1]}, but its correlated database mutation targeted ${bareTableName(table)} ${pk[0][0]}=${pk[0][1]}.`,
+        }),
+        dedupeKey: `targetmismatch:${exchange.requestId}:${table}`,
+      });
+    }
+  }
+}
+
+function addStaleValueWritebackCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const updates = events
+    .filter(
+      (event) =>
+        event.k === "db.diff" &&
+        safeText(event.d.op, 20)?.toLowerCase() === "update" &&
+        isRecord(event.d.before) &&
+        isRecord(event.d.after),
+    )
+    .sort((left, right) => left.t - right.t);
+  const priorByRow = new Map<string, BugEvent[]>();
+  const emitted = new Set<string>();
+  for (const current of updates) {
+    const identity = rowIdentity(current);
+    if (!identity) continue;
+    const prior = priorByRow.get(identity) ?? [];
+    for (const previous of prior) {
+      if (
+        current.t - previous.t > STALE_WRITEBACK_WINDOW_MS ||
+        correlationIdOf(current) === correlationIdOf(previous) ||
+        !isRecord(previous.d.before) ||
+        !isRecord(previous.d.after) ||
+        !isRecord(current.d.before) ||
+        !isRecord(current.d.after)
+      )
+        continue;
+      for (const field of Object.keys(current.d.after)) {
+        if (isIdentityOrClockField(field)) continue;
+        const first = scalarChanged(previous.d.before, previous.d.after, field);
+        const second = scalarChanged(current.d.before, current.d.after, field);
+        if (
+          !first ||
+          !second ||
+          first.before !== second.after ||
+          first.after !== second.before
+        )
+          continue;
+        const dedupeKey = `stalewriteback:${identity}:${field}`;
+        if (emitted.has(dedupeKey)) continue;
+        emitted.add(dedupeKey);
+        const table = safeText(current.d.table, 200);
+        drafts.push({
+          detector: "stale_value_writeback",
+          title: `${bareTableName(table ?? "row")}.${field} reverted to its prior value`,
+          severity: "high",
+          score: RELATIONAL_WRITE_INTEGRITY_SCORE - 1,
+          confidence: "medium",
+          anchor: removeUndefined({
+            t: current.t,
+            offsetMs:
+              offsetForEvent(current) ??
+              offsetFromStart(current.t, index.start),
+            route: routeAt(index.navs ?? [], current.t),
+            requestId: correlationIdOf(current),
+            table,
+            source: normalizeDbEngine(current.d.engine),
+            frame: dbCallsiteFrame(current.d.callsite),
+            message:
+              `${bareTableName(table ?? "row")}.${field} changed from ${first.before} to ${first.after}, ` +
+              `then a different request wrote the exact prior value ${second.after} back ${current.t - previous.t} ms later.`,
+          }),
+          dedupeKey,
+        });
+      }
+    }
+    prior.push(current);
+    priorByRow.set(identity, prior.slice(-8));
+  }
+}
+
+function addBatchAppliedCountMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    for (const batch of diffs) {
+      const table = safeText(batch.d.table, 200);
+      const after = isRecord(batch.d.after) ? batch.d.after : undefined;
+      const applied = finiteNumber(after?.rows_applied);
+      const batchId =
+        keyValueOf(after?.id) ??
+        (isRecord(batch.d.pk) ? keyValueOf(batch.d.pk.id) : undefined);
+      if (
+        !table ||
+        !/batches?$/i.test(bareTableName(table)) ||
+        applied === undefined ||
+        applied < 1 ||
+        !batchId
+      )
+        continue;
+      const staged = diffs.filter((event) => {
+        const stagedTable = safeText(event.d.table, 200);
+        const row = isRecord(event.d.after) ? event.d.after : undefined;
+        return (
+          safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+          stagedTable !== undefined &&
+          /stag/i.test(bareTableName(stagedTable)) &&
+          (keyValueOf(row?.batch_id) ?? keyValueOf(row?.batchId)) === batchId
+        );
+      });
+      if (staged.length === 0 || applied <= staged.length) continue;
+      drafts.push({
+        detector: "batch_applied_count_exceeds_staged_rows",
+        title: `Batch claimed ${applied} applied rows after staging only ${staged.length}`,
+        severity: "high",
+        score: RELATIONAL_WRITE_INTEGRITY_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: batch.t,
+          offsetMs:
+            offsetForEvent(batch) ?? offsetFromStart(batch.t, index.start),
+          route: routeAt(index.navs ?? [], batch.t),
+          requestId,
+          table,
+          source: normalizeDbEngine(batch.d.engine),
+          frame: dbCallsiteFrame(batch.d.callsite),
+          message:
+            `${bareTableName(table)} ${batchId} recorded rows_applied=${applied}, but the same request inserted only ${staged.length} correlated staging row${staged.length === 1 ? "" : "s"}.`,
+        }),
+        dedupeKey: `batchapplied:${requestId}:${table}:${batchId}`,
+      });
+    }
+  }
+}
+
+function addMissingEntityAuditCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    const audits = diffs.filter(
+      (event) =>
+        safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+        /audit/i.test(bareTableName(safeText(event.d.table, 200) ?? "")) &&
+        isRecord(event.d.after),
+    );
+    if (audits.length === 0) continue;
+    const mutationsByTable = new Map<string, BugEvent[]>();
+    for (const event of diffs) {
+      const table = safeText(event.d.table, 200);
+      if (
+        !table ||
+        /audit/i.test(bareTableName(table)) ||
+        !["insert", "update", "delete"].includes(
+          safeText(event.d.op, 20)?.toLowerCase() ?? "",
+        )
+      )
+        continue;
+      const list = mutationsByTable.get(table) ?? [];
+      list.push(event);
+      mutationsByTable.set(table, list);
+    }
+    for (const [table, mutations] of mutationsByTable) {
+      if (mutations.length < 2) continue;
+      const entity = singularize(normalizeEntityName(bareTableName(table)));
+      const matchingAudits = audits.filter((audit) => {
+        if (!isRecord(audit.d.after)) return false;
+        const auditedEntity = safeText(audit.d.after.entity, 160);
+        return (
+          auditedEntity !== undefined &&
+          singularize(normalizeEntityName(auditedEntity)) === entity
+        );
+      });
+      if (matchingAudits.length > 0) continue;
+      const anchor = mutations[0];
+      drafts.push({
+        detector: "mutations_missing_entity_audit",
+        title: `${mutations.length} ${bareTableName(table)} mutations had no matching entity audit`,
+        severity: "high",
+        score: RELATIONAL_WRITE_INTEGRITY_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: anchor.t,
+          offsetMs:
+            offsetForEvent(anchor) ?? offsetFromStart(anchor.t, index.start),
+          route: routeAt(index.navs ?? [], anchor.t),
+          requestId,
+          table,
+          source: normalizeDbEngine(anchor.d.engine),
+          frame: dbCallsiteFrame(anchor.d.callsite),
+          message:
+            `The request mutated ${mutations.length} ${bareTableName(table)} rows and wrote ${audits.length} audit row${audits.length === 1 ? "" : "s"}, ` +
+            `but none of those audits named the ${entity} entity.`,
+        }),
+        dedupeKey: `missingaudit:${requestId}:${table}`,
+      });
+    }
+  }
+}
+
+function referencedEntityFromNote(
+  note: unknown,
+): { entity: string; id: string } | undefined {
+  const text = safeText(note, 200);
+  const match = text ? /\b([a-z][a-z0-9_-]*)\s*=\s*([a-z0-9_-]+)\b/i.exec(text) : null;
+  return match ? { entity: match[1], id: match[2] } : undefined;
+}
+
+function addReportSourceContradictionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const sourceRows = new Map<string, BugEvent>();
+  const ordered = [...events].sort((left, right) => left.t - right.t);
+  for (const event of ordered) {
+    if (
+      (event.k === "db.read" && isRecord(event.d.row)) ||
+      (event.k === "db.diff" && isRecord(event.d.after))
+    ) {
+      const row =
+        event.k === "db.read" && isRecord(event.d.row)
+          ? event.d.row
+          : isRecord(event.d.after)
+            ? event.d.after
+            : undefined;
+      const table = safeText(event.d.table, 200);
+      const id =
+        keyValueOf(row?.id) ??
+        (isRecord(event.d.pk) ? keyValueOf(event.d.pk.id) : undefined);
+      if (row && table && id)
+        sourceRows.set(
+          `${singularize(normalizeEntityName(bareTableName(table)))}:${id}`,
+          event,
+        );
+    }
+    if (
+      event.k !== "db.diff" ||
+      safeText(event.d.op, 20)?.toLowerCase() !== "insert" ||
+      !isRecord(event.d.after)
+    )
+      continue;
+    const reference = referencedEntityFromNote(event.d.after.note);
+    const reportedTotal =
+      finiteNumber(event.d.after.total_cents) ??
+      finiteNumber(event.d.after.totalCents);
+    if (!reference || reportedTotal === undefined) continue;
+    const source = sourceRows.get(
+      `${singularize(normalizeEntityName(reference.entity))}:${reference.id}`,
+    );
+    const sourceRow =
+      source?.k === "db.read" && isRecord(source.d.row)
+        ? source.d.row
+        : source?.k === "db.diff" && isRecord(source.d.after)
+          ? source.d.after
+          : undefined;
+    const sourceTotal =
+      finiteNumber(sourceRow?.total_cents) ??
+      finiteNumber(sourceRow?.totalCents);
+    if (sourceTotal === undefined || sourceTotal === reportedTotal) continue;
+    const table = safeText(event.d.table, 200);
+    drafts.push({
+      detector: "report_total_contradicts_source_row",
+      title: `Report total ${reportedTotal} disagreed with ${reference.entity} ${reference.id}'s stored total ${sourceTotal}`,
+      severity: "high",
+      score: RELATIONAL_WRITE_INTEGRITY_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: correlationIdOf(event),
+        table,
+        source: normalizeDbEngine(event.d.engine),
+        frame: dbCallsiteFrame(event.d.callsite),
+        message:
+          `The latest captured ${reference.entity} ${reference.id} row had total_cents=${sourceTotal}, ` +
+          `but the subsequent report persisted total_cents=${reportedTotal}.`,
+      }),
+      dedupeKey: `reportsourcecontradiction:${reference.entity}:${reference.id}:${table ?? ""}`,
+    });
+  }
+}
+
+function addRelationalWriteIntegrityCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  addExistingChildrenReparentedCandidates(events, index, drafts);
+  addRequestTargetRowMismatchCandidates(events, index, drafts, exchanges);
+  addStaleValueWritebackCandidates(events, index, drafts);
+  addBatchAppliedCountMismatchCandidates(events, index, drafts);
+  addMissingEntityAuditCandidates(events, index, drafts);
+  addReportSourceContradictionCandidates(events, index, drafts);
+}
+
+// ─── async state lifecycle integrity ─────────────────────────────────────────
+
+const STATE_LIFECYCLE_SCORE = DB_INVARIANT_SCORE + 2;
+
+function addDeferredDrainCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (
+      exchange.method !== "POST" ||
+      !/\/jobs\/drain$/i.test(capturedUrlPath(exchange.url) ?? "") ||
+      !isSuccessStatus(exchange.status) ||
+      !exchange.res
+    )
+      continue;
+    const response = parseStructuredBody(exchange.resBody);
+    if (!isRecord(response)) continue;
+    const remaining = finiteNumber(response.remaining);
+    const deferred = finiteNumber(response.deferred);
+    if (
+      remaining === undefined ||
+      deferred === undefined ||
+      remaining < 1 ||
+      deferred < 1
+    )
+      continue;
+    drafts.push({
+      detector: "job_drain_left_work_deferred",
+      title: `Successful job drain deferred ${deferred} job${deferred === 1 ? "" : "s"} and left ${remaining} pending`,
+      severity: "high",
+      score: STATE_LIFECYCLE_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs:
+          offsetForEvent(exchange.res) ??
+          offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        message:
+          `The drain returned success but reported deferred=${deferred} and remaining=${remaining}. ` +
+          `Work was neither completed nor failed.`,
+      }),
+      dedupeKey: `deferreddrain:${capturedUrlPath(exchange.url) ?? ""}`,
+    });
+  }
+}
+
+function parsedTimestamp(value: unknown): number | undefined {
+  const text = safeText(value, 100);
+  if (!text) return undefined;
+  const timestamp = Date.parse(text);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
+function addRetryClockShiftCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const HOUR_MS = 60 * 60 * 1000;
+  const CLOCK_SHIFT_TOLERANCE_MS = 2 * 60 * 1000;
+  for (const event of events) {
+    if (
+      event.k !== "db.diff" ||
+      bareTableName(safeText(event.d.table, 200) ?? "").toLowerCase() !==
+        "jobs" ||
+      safeText(event.d.op, 20)?.toLowerCase() !== "update" ||
+      !isRecord(event.d.before) ||
+      !isRecord(event.d.after)
+    )
+      continue;
+    const attemptsBefore = finiteNumber(event.d.before.attempts);
+    const attemptsAfter = finiteNumber(event.d.after.attempts);
+    const runAt = parsedTimestamp(event.d.after.run_at);
+    if (
+      attemptsBefore === undefined ||
+      attemptsAfter !== attemptsBefore + 1 ||
+      safeText(event.d.after.status, 40)?.toLowerCase() !== "pending" ||
+      !safeText(event.d.after.last_error, 300) ||
+      runAt === undefined
+    )
+      continue;
+    const delay = runAt - event.t;
+    const roundedHours = Math.round(delay / HOUR_MS);
+    if (
+      roundedHours < 2 ||
+      roundedHours > 14 ||
+      Math.abs(delay - roundedHours * HOUR_MS) >
+        CLOCK_SHIFT_TOLERANCE_MS
+    )
+      continue;
+    drafts.push({
+      detector: "retry_schedule_clock_shift",
+      title: `Retry was shifted about ${roundedHours} hours into the future`,
+      severity: "high",
+      score: STATE_LIFECYCLE_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: correlationIdOf(event),
+        table: safeText(event.d.table, 200),
+        source: normalizeDbEngine(event.d.engine),
+        frame: dbCallsiteFrame(event.d.callsite),
+        message:
+          `After attempt ${attemptsAfter} failed, run_at landed ${roundedHours} whole hours ahead of the retry write. ` +
+          `That hour-aligned displacement is characteristic of a local-time/UTC reconstruction, not a short retry backoff.`,
+      }),
+      dedupeKey: `retryclockshift:${rowIdentity(event) ?? event.t}`,
+    });
+  }
+}
+
+interface BackendRequestInterval {
+  start: BugEvent;
+  end?: BugEvent;
+}
+
+function backendRequestIntervals(
+  events: BugEvent[],
+): Map<string, BackendRequestInterval> {
+  const intervals = new Map<string, BackendRequestInterval>();
+  for (const event of events) {
+    if (event.k !== "backend.req.start") continue;
+    const requestId = correlationIdOf(event);
+    if (requestId) intervals.set(requestId, { start: event });
+  }
+  for (const event of events) {
+    if (event.k !== "backend.req.end") continue;
+    const requestId = correlationIdOf(event);
+    const interval = requestId ? intervals.get(requestId) : undefined;
+    if (interval) interval.end = event;
+  }
+  return intervals;
+}
+
+function addInflightSessionInvalidationCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const intervals = [...backendRequestIntervals(events).entries()];
+  for (const deletion of events) {
+    if (
+      deletion.k !== "db.diff" ||
+      bareTableName(safeText(deletion.d.table, 200) ?? "").toLowerCase() !==
+        "sessions" ||
+      safeText(deletion.d.op, 20)?.toLowerCase() !== "delete"
+    )
+      continue;
+    const deletedBy = correlationIdOf(deletion);
+    const invalidated = intervals.find(([requestId, interval]) => {
+      const status = finiteNumber(interval.end?.d.statusCode);
+      return (
+        requestId !== deletedBy &&
+        interval.end !== undefined &&
+        interval.start.t < deletion.t &&
+        interval.end.t > deletion.t &&
+        status === 401
+      );
+    });
+    if (!invalidated?.[1].end) continue;
+    const [requestId, interval] = invalidated;
+    const end = interval.end;
+    if (!end) continue;
+    const url =
+      safeText(interval.start.d.url, 400) ??
+      safeText(interval.start.d.pathname, 400);
+    drafts.push({
+      detector: "inflight_request_invalidated_by_session_rotation",
+      title: `An in-flight request became unauthorized after its session was deleted`,
+      severity: "high",
+      score: STATE_LIFECYCLE_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: end.t,
+        offsetMs:
+          offsetForEvent(end) ?? offsetFromStart(end.t, index.start),
+        route: routeAt(index.navs ?? [], end.t),
+        requestId,
+        method: safeText(interval.start.d.method, 20)?.toUpperCase(),
+        url: redactUrl(url),
+        status: 401,
+        source: "backend",
+        message:
+          `The request started ${deletion.t - interval.start.t} ms before a sessions row was deleted, ` +
+          `remained in flight across that rotation, and then completed with HTTP 401.`,
+      }),
+      dedupeKey: `inflightsessioninvalidated:${requestId}`,
+    });
+  }
+}
+
+function addCachedEmptyAfterDataCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const reports = events
+    .filter(
+      (event) =>
+        event.k === "db.diff" &&
+        safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+        isRecord(event.d.after) &&
+        finiteNumber(event.d.after.rows_returned) === 0,
+    )
+    .sort((left, right) => left.t - right.t);
+  for (let laterIndex = 1; laterIndex < reports.length; laterIndex += 1) {
+    const later = reports[laterIndex];
+    if (!isRecord(later.d.after)) continue;
+    const note = safeText(later.d.after.note, 160)?.toLowerCase();
+    const kind = keyValueOf(later.d.after.kind);
+    if (!note?.includes("cache=hit") || !kind) continue;
+    const earlier = reports
+      .slice(0, laterIndex)
+      .reverse()
+      .find(
+        (event) =>
+          isRecord(event.d.after) &&
+          keyValueOf(event.d.after.kind) === kind,
+      );
+    if (!earlier) continue;
+    const reportTable = safeText(later.d.table, 200);
+    const inserted = events.filter(
+      (event) =>
+        event.k === "db.diff" &&
+        safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+        event.t > earlier.t &&
+        event.t < later.t &&
+        safeText(event.d.table, 200) !== reportTable,
+    );
+    if (inserted.length === 0) continue;
+    const sourceTables = [
+      ...new Set(
+        inserted
+          .map((event) => safeText(event.d.table, 120))
+          .filter((table): table is string => Boolean(table)),
+      ),
+    ];
+    drafts.push({
+      detector: "cached_empty_result_after_data_arrived",
+      title: `Cached ${kind} result stayed empty after ${inserted.length} row inserts`,
+      severity: "high",
+      score: STATE_LIFECYCLE_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: later.t,
+        offsetMs:
+          offsetForEvent(later) ?? offsetFromStart(later.t, index.start),
+        route: routeAt(index.navs ?? [], later.t),
+        requestId: correlationIdOf(later),
+        table: reportTable,
+        source: normalizeDbEngine(later.d.engine),
+        frame: dbCallsiteFrame(later.d.callsite),
+        message:
+          `A ${kind} read recorded zero rows, ${inserted.length} rows were then inserted into ` +
+          `${sourceTables.join(", ") || "source tables"}, and the next report still recorded rows_returned=0 with cache=hit.`,
+      }),
+      dedupeKey: `cachedempty:${kind}:${reportTable ?? ""}`,
+    });
+  }
+}
+
+function addOpsStateLifecycleCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  addDeferredDrainCandidates(index, drafts, exchanges);
+  addRetryClockShiftCandidates(events, index, drafts);
+  addInflightSessionInvalidationCandidates(events, index, drafts);
+  addCachedEmptyAfterDataCandidates(events, index, drafts);
+}
+
+// ─── data lifecycle integrity ────────────────────────────────────────────────
+
+const DATA_LIFECYCLE_SCORE = DB_INVARIANT_SCORE + 2;
+const FREE_TEXT_FIELDS = /^(body|comment|content|description|message|note|text)$/i;
+
+function redactedLengthsByField(
+  value: unknown,
+  out = new Map<string, number[]>(),
+  depth = 0,
+): Map<string, number[]> {
+  if (depth > MAX_BODY_SCOPE_DEPTH) return out;
+  if (Array.isArray(value)) {
+    for (const item of value) redactedLengthsByField(item, out, depth + 1);
+    return out;
+  }
+  if (!isRecord(value)) return out;
+  for (const [field, child] of Object.entries(value)) {
+    if (isRedactedPlaceholder(child)) {
+      const length = finiteNumber((child as Record<string, unknown>).len);
+      if (length !== undefined) {
+        const values = out.get(field) ?? [];
+        values.push(length);
+        out.set(field, values);
+      }
+      continue;
+    }
+    redactedLengthsByField(child, out, depth + 1);
+  }
+  return out;
+}
+
+function addAcceptedTextTruncationCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (
+      !MUTATING_METHODS.has(exchange.method) ||
+      !isSuccessStatus(exchange.status) ||
+      !exchange.res
+    ) continue;
+    const request = parseStructuredBody(exchange.body);
+    // The raw redacted JSON preserves placeholder length metadata. The bounded
+    // bodyMeta view may intentionally collapse a sensitive nested string to the
+    // scalar "[REDACTED]", so prefer the privacy-safe raw shape here.
+    const response =
+      parseStructuredBody(exchange.resBody) ??
+      responsePayload(exchange.resBody, exchange.resBodyMeta);
+    if (request === undefined || response === undefined) continue;
+    const requested = redactedLengthsByField(request);
+    const returned = redactedLengthsByField(response);
+    for (const [field, requestLengths] of requested) {
+      if (!FREE_TEXT_FIELDS.test(field)) continue;
+      const responseLengths = returned.get(field);
+      if (!responseLengths) continue;
+      const requestLength = Math.max(...requestLengths);
+      const responseLength = Math.max(...responseLengths);
+      if (
+        requestLength < 32 ||
+        responseLength >= requestLength ||
+        requestLength - responseLength < 4
+      ) continue;
+      drafts.push({
+        detector: "accepted_text_was_truncated",
+        title: `Successful write shortened ${field} from ${requestLength} to ${responseLength} characters`,
+        severity: "high",
+        score: DATA_LIFECYCLE_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: exchange.res.t,
+          offsetMs: offsetForEvent(exchange.res) ?? offsetFromStart(exchange.res.t, index.start),
+          route: routeAt(index.navs ?? [], exchange.res.t),
+          requestId: exchange.requestId,
+          method: exchange.method,
+          url: redactUrl(exchange.url),
+          status: exchange.status,
+          message:
+            `The accepted request carried a redacted ${field} with length ${requestLength}, ` +
+            `but the successful response returned that field with length ${responseLength}.`,
+        }),
+        dedupeKey: `acceptedtexttruncated:${exchange.requestId}:${field}`,
+      });
+      break;
+    }
+  }
+}
+
+function addDerivedCountBelowObservedInsertsCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const inserts = events.filter(
+    (event) =>
+      event.k === "db.diff" &&
+      safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+      isRecord(event.d.after),
+  );
+  for (const cacheWrite of events) {
+    if (
+      cacheWrite.k !== "db.diff" ||
+      !["insert", "update"].includes(
+        safeText(cacheWrite.d.op, 20)?.toLowerCase() ?? "",
+      ) ||
+      !isRecord(cacheWrite.d.after)
+    ) continue;
+    const cacheTable = safeText(cacheWrite.d.table, 200);
+    if (!cacheTable || !/(cache|rollup|summary|aggregate)/i.test(cacheTable))
+      continue;
+    const countEntry = Object.entries(cacheWrite.d.after).find(
+      ([field, value]) =>
+        /(?:^|_)count$/i.test(field) && finiteNumber(value) !== undefined,
+    );
+    const parentEntry =
+      Object.entries(cacheWrite.d.after).find(
+        ([field, value]) =>
+          !ID_EXACT.test(field) &&
+          isIdLikeField(field) &&
+          keyValueOf(value) !== undefined,
+      ) ??
+      Object.entries(cacheWrite.d.after).find(
+        ([field, value]) =>
+          isIdLikeField(field) && keyValueOf(value) !== undefined,
+      );
+    if (!countEntry || !parentEntry) continue;
+    const [countField, rawCount] = countEntry;
+    const [parentField, rawParent] = parentEntry;
+    const derivedCount = finiteNumber(rawCount);
+    const parentId = keyValueOf(rawParent);
+    if (derivedCount === undefined || !parentId) continue;
+    const matching = inserts.filter((event) => {
+      if (
+        event.t > cacheWrite.t ||
+        safeText(event.d.table, 200) === cacheTable ||
+        !isRecord(event.d.after)
+      ) return false;
+      return Object.entries(event.d.after).some(
+        ([field, value]) =>
+          normalizeFieldName(field) === normalizeFieldName(parentField) &&
+          keyValueOf(value) === parentId,
+      );
+    });
+    if (matching.length <= derivedCount) continue;
+    drafts.push({
+      detector: "derived_count_below_observed_inserts",
+      title: `${cacheTable}.${countField}=${derivedCount} after ${matching.length} matching rows were inserted`,
+      severity: "high",
+      score: DATA_LIFECYCLE_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: cacheWrite.t,
+        offsetMs: offsetForEvent(cacheWrite) ?? offsetFromStart(cacheWrite.t, index.start),
+        route: routeAt(index.navs ?? [], cacheWrite.t),
+        requestId: correlationIdOf(cacheWrite),
+        table: cacheTable,
+        source: normalizeDbEngine(cacheWrite.d.engine),
+        frame: dbCallsiteFrame(cacheWrite.d.callsite),
+        message:
+          `The session captured ${matching.length} inserted rows with ${parentField}=${parentId}, ` +
+          `but the derived row subsequently stored ${countField}=${derivedCount}.`,
+      }),
+      dedupeKey: `derivedcountbelowinserts:${cacheTable}:${parentField}:${parentId}`,
+    });
+  }
+}
+
+function addResponseLimitExceededCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (
+      exchange.method !== "GET" ||
+      !isSuccessStatus(exchange.status) ||
+      !exchange.res
+    ) continue;
+    const parsed = parseCapturedUrl(exchange.url);
+    const rawLimit = parsed?.searchParams.get("limit");
+    if (!rawLimit) continue;
+    const limit = Number(rawLimit);
+    if (!Number.isInteger(limit) || limit < 0) continue;
+    const collection = responseCollection(exchange.resBody, exchange.resBodyMeta);
+    if (!collection || collection.total <= limit) continue;
+    drafts.push({
+      detector: "response_exceeded_requested_limit",
+      title: `Response returned ${collection.total} rows despite limit=${limit}`,
+      severity: "high",
+      score: DATA_LIFECYCLE_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs: offsetForEvent(exchange.res) ?? offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        message: `The request explicitly set limit=${limit}, but the captured response contained ${collection.total} collection rows.`,
+      }),
+      dedupeKey: `responselimitexceeded:${capturedUrlPath(exchange.url) ?? ""}:${limit}`,
+    });
+  }
+}
+
+function lifecycleType(value: unknown): string | undefined {
+  const text = safeText(value, 120)?.toLowerCase();
+  if (!text) return undefined;
+  if (/(^|[_-])cancel(?:led|ed)?($|[_-])/.test(text)) return "cancelled";
+  if (/(^|[_-])confirm(?:ed)?($|[_-])/.test(text)) return "confirmed";
+  return undefined;
+}
+
+function addInvertedLifecycleNotificationCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const notifications = events
+    .filter(
+      (event) =>
+        (event.k === "db.read" || event.k === "db.diff") &&
+        bareTableName(safeText(event.d.table, 200) ?? "").toLowerCase() ===
+          "notifications",
+    )
+    .flatMap((event) => {
+      const row =
+        event.k === "db.read"
+          ? isRecord(event.d.row)
+            ? event.d.row
+            : undefined
+          : isRecord(event.d.after)
+            ? event.d.after
+            : undefined;
+      const orderId = row ? orderIdFromRow(row) : undefined;
+      const kind = row
+        ? lifecycleType(row.type) ?? lifecycleType(row.kind)
+        : undefined;
+      const status = row ? safeText(row.status, 40)?.toLowerCase() : undefined;
+      return orderId && kind && (!status || status === "sent")
+        ? [{ event, orderId, kind }]
+        : [];
+    })
+    .sort((left, right) => left.event.t - right.event.t);
+  const byOrder = new Map<string, typeof notifications>();
+  for (const notification of notifications) {
+    const list = byOrder.get(notification.orderId) ?? [];
+    list.push(notification);
+    byOrder.set(notification.orderId, list);
+  }
+  for (const [orderId, list] of byOrder) {
+    const cancelled = list.find((entry) => entry.kind === "cancelled");
+    const confirmed = list.find(
+      (entry) =>
+        entry.kind === "confirmed" &&
+        cancelled !== undefined &&
+        entry.event.t >= cancelled.event.t,
+    );
+    if (!cancelled || !confirmed) continue;
+    drafts.push({
+      detector: "notification_lifecycle_order_inverted",
+      title: `Order ${orderId} was confirmed after its cancellation notification`,
+      severity: "high",
+      score: DATA_LIFECYCLE_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: confirmed.event.t,
+        offsetMs: offsetForEvent(confirmed.event) ?? offsetFromStart(confirmed.event.t, index.start),
+        route: routeAt(index.navs ?? [], confirmed.event.t),
+        requestId: correlationIdOf(confirmed.event),
+        table: safeText(confirmed.event.d.table, 200),
+        source: normalizeDbEngine(confirmed.event.d.engine),
+        message:
+          `The captured notification history for order ${orderId} recorded a sent cancellation before a sent confirmation.`,
+      }),
+      dedupeKey: `notificationlifecycleinverted:${orderId}`,
+    });
+  }
+}
+
+function addDataLifecycleIntegrityCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  addAcceptedTextTruncationCandidates(index, drafts, exchanges);
+  addDerivedCountBelowObservedInsertsCandidates(events, index, drafts);
+  addResponseLimitExceededCandidates(index, drafts, exchanges);
+  addInvertedLifecycleNotificationCandidates(events, index, drafts);
+}
+
+// ─── browser and network integrity ───────────────────────────────────────────
+
+const BROWSER_NETWORK_SCORE = 85;
+
+interface CasefoldIdentity {
+  field: string;
+  hash: string;
+  casefoldHash: string;
+  length: number;
+}
+
+function casefoldIdentityOf(value: unknown): CasefoldIdentity | undefined {
+  for (const scope of collectObjectScopes(value)) {
+    for (const [field, child] of Object.entries(scope)) {
+      if (!/^(email|username|login|handle)$/i.test(field)) continue;
+      if (!isRedactedPlaceholder(child)) continue;
+      const shape = child as Record<string, unknown>;
+      const hash = safeText(shape.hash8, 20);
+      const casefoldHash = safeText(shape.casefoldHash8, 20) ?? hash;
+      const length = finiteNumber(shape.len);
+      if (!hash || !casefoldHash || length === undefined) continue;
+      return { field, hash, casefoldHash, length };
+    }
+  }
+  return undefined;
+}
+
+function addCasefoldIdentityCollisionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const insertsByRequest = dbDiffsByRequest(events);
+  const grouped = new Map<
+    string,
+    Array<{
+      identity: CasefoldIdentity;
+      exchange: RequestExchange;
+      insert: BugEvent;
+    }>
+  >();
+  for (const exchange of exchanges.values()) {
+    if (
+      exchange.method !== "POST" ||
+      !isSuccessStatus(exchange.status) ||
+      !exchange.res
+    ) continue;
+    const identity = casefoldIdentityOf(parseStructuredBody(exchange.body));
+    if (!identity) continue;
+    const inserts = (insertsByRequest.get(exchange.requestId) ?? []).filter(
+      (event) =>
+        safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+        isRecord(event.d.after) &&
+        Object.keys(event.d.after).some(
+          (field) =>
+            normalizeFieldName(field) === normalizeFieldName(identity.field),
+        ),
+    );
+    if (inserts.length !== 1) continue;
+    const insert = inserts[0];
+    const table = safeText(insert.d.table, 200);
+    if (!table) continue;
+    const key = `${table}:${identity.field}:${identity.casefoldHash}:${identity.length}`;
+    const list = grouped.get(key) ?? [];
+    list.push({ identity, exchange, insert });
+    grouped.set(key, list);
+  }
+  for (const [key, entries] of grouped) {
+    const rawHashes = new Set(entries.map((entry) => entry.identity.hash));
+    if (entries.length < 2 || rawHashes.size < 2) continue;
+    entries.sort((left, right) => left.insert.t - right.insert.t);
+    const first = entries[0];
+    const last = entries[entries.length - 1];
+    const table = safeText(last.insert.d.table, 200);
+    drafts.push({
+      detector: "casefold_duplicate_identity_accepted",
+      title: `${entries.length} case-only variants of one ${first.identity.field} were inserted`,
+      severity: "high",
+      score: DATA_LIFECYCLE_SCORE + 2,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: last.insert.t,
+        offsetMs: offsetForEvent(last.insert) ?? offsetFromStart(last.insert.t, index.start),
+        route: routeAt(index.navs ?? [], last.insert.t),
+        requestId: last.exchange.requestId,
+        method: last.exchange.method,
+        url: redactUrl(last.exchange.url),
+        status: last.exchange.status,
+        table,
+        source: normalizeDbEngine(last.insert.d.engine),
+        frame: dbCallsiteFrame(last.insert.d.callsite),
+        message:
+          `${entries.length} successful requests carried different salted fingerprints but the same ` +
+          `case-fold fingerprint and length for ${first.identity.field}; each request inserted a ${bareTableName(table ?? "row")} row.`,
+      }),
+      dedupeKey: `casefoldcollision:${key}`,
+    });
+  }
+}
+
+function addBlockedDependencyActionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const blockedScripts = events.filter(
+    (event) =>
+      event.k === "perf" &&
+      safeText(event.d.metric, 20) === "res" &&
+      safeText(event.d.initiatorType, 40) === "script" &&
+      finiteNumber(event.d.transferSize) === 0 &&
+      /(?:vendor|analytics|tracker|tracking|pixel|tag|ads?)[/_.-]/i.test(
+        safeText(event.d.name, 400) ?? "",
+      ),
+  );
+  if (blockedScripts.length === 0) return;
+  const populatedCart = events.some(
+    (event) =>
+      event.k === "net.res" &&
+      isSuccessStatus(finiteNumber(event.d.st)) &&
+      /\/(?:api\/)?cart\/items(?:$|\?)/i.test(
+        safeText(
+          events.find(
+            (request) =>
+              request.k === "net.req" &&
+              requestIdForEvent(request) === requestIdForEvent(event),
+          )?.d.url,
+          400,
+        ) ?? "",
+      ),
+  );
+  if (!populatedCart) return;
+  for (const click of events) {
+    if (click.k !== "clk" || !isRecord(click.d.el)) continue;
+    const action = [
+      safeText(click.d.el.path, 300),
+      safeText(click.d.el.txt, 160),
+    ]
+      .filter(Boolean)
+      .join(" ");
+    if (!/(checkout|place[-_ ]?order|purchase|pay|submit)/i.test(action))
+      continue;
+    const deadline = click.t + 3_000;
+    const progressed = events.some((event) => {
+      if (event.t <= click.t || event.t > deadline) return false;
+      if (isNavigationEvent(event)) return true;
+      if (event.k !== "net.req") return false;
+      const path = capturedUrlPath(safeText(event.d.url, 400)) ?? "";
+      return /(?:checkout|orders?|payments?)/i.test(path);
+    });
+    if (progressed) continue;
+    const blocked = [...blockedScripts]
+      .reverse()
+      .find((event) => event.t <= click.t);
+    if (!blocked) continue;
+    drafts.push({
+      detector: "blocked_script_prevented_action",
+      title: `Checkout action produced no request after a script failed to load`,
+      severity: "high",
+      score: BROWSER_NETWORK_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: click.t,
+        offsetMs: offsetForEvent(click) ?? offsetFromStart(click.t, index.start),
+        route: routeAt(index.navs ?? [], click.t),
+        message:
+          `The populated cart's checkout control was clicked, but no checkout/order/payment request or navigation followed within 3 seconds. ` +
+          `A vendor-style script resource on this page transferred zero bytes.`,
+        source: redactUrl(safeText(blocked.d.name, 400)),
+      }),
+      dedupeKey: `blockedaction:${safeText(click.d.el.path, 200) ?? click.t}`,
+    });
+  }
+}
+
+const MUTATED_STATE_FIELD =
+  /^(active|available|count|enabled|inventory|quantity|qty|seq|sequence|state|status|stock|value)$/i;
+
+function addAcknowledgedStateContradictionCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const ordered = [...exchanges.values()].sort(
+    (left, right) => left.req.t - right.req.t,
+  );
+  for (const mutation of ordered) {
+    if (
+      !MUTATING_METHODS.has(mutation.method) ||
+      !isSuccessStatus(mutation.status) ||
+      !mutation.res
+    ) continue;
+    const payload = parseStructuredBody(mutation.body);
+    if (!isRecord(payload)) continue;
+    const ids = Object.entries(payload).filter(
+      ([field, value]) =>
+        isIdLikeField(field) &&
+        (typeof value === "string" || finiteNumber(value) !== undefined),
+    );
+    const states = Object.entries(payload).filter(
+      ([field, value]) =>
+        MUTATED_STATE_FIELD.test(field) &&
+        (typeof value === "string" ||
+          typeof value === "boolean" ||
+          finiteNumber(value) !== undefined),
+    );
+    if (ids.length !== 1 || states.length !== 1) continue;
+    const [idField, idValue] = ids[0];
+    const [stateField, stateValue] = states[0];
+    const mutationPath = capturedUrlPath(mutation.url);
+    if (!mutationPath) continue;
+    const root = apiPrefixOf(mutationPath);
+    const read = ordered.find((exchange) => {
+      if (
+        exchange.method !== "GET" ||
+        exchange.req.t <= mutation.res!.t ||
+        !isSuccessStatus(exchange.status) ||
+        !exchange.res ||
+        !capturedUrlPath(exchange.url)?.startsWith(root)
+      ) return false;
+      const collection = responseCollection(exchange.resBody, exchange.resBodyMeta);
+      if (!collection) return false;
+      const row = findCollectionItem(collection.items, [String(idValue)]);
+      if (!row) return false;
+      const observed = Object.entries(row).find(
+        ([field]) =>
+          normalizeFieldName(field) === normalizeFieldName(stateField),
+      );
+      return observed !== undefined && !sameScalar(observed[1], stateValue);
+    });
+    if (!read?.res) continue;
+    const collection = responseCollection(read.resBody, read.resBodyMeta);
+    const row = collection
+      ? findCollectionItem(collection.items, [String(idValue)])
+      : undefined;
+    const observed = row
+      ? Object.entries(row).find(
+          ([field]) =>
+            normalizeFieldName(field) === normalizeFieldName(stateField),
+        )
+      : undefined;
+    if (!observed) continue;
+    drafts.push({
+      detector: "acknowledged_state_contradicted_by_read",
+      title: `Successful ${stateField}=${String(stateValue)} mutation was contradicted by the next read`,
+      severity: "high",
+      score: BROWSER_NETWORK_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: read.res.t,
+        offsetMs: offsetForEvent(read.res) ?? offsetFromStart(read.res.t, index.start),
+        route: routeAt(index.navs ?? [], read.res.t),
+        requestId: read.requestId,
+        method: mutation.method,
+        url: redactUrl(mutation.url),
+        status: mutation.status,
+        message:
+          `The server acknowledged ${idField}=${String(idValue)}, ${stateField}=${String(stateValue)}. ` +
+          `The next related collection read returned ${stateField}=${String(observed[1])} for that same identity.`,
+      }),
+      dedupeKey: `statecontradiction:${root}:${idField}:${String(idValue)}:${stateField}`,
+    });
+  }
+}
+
+function addRequestBurstCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const byPath = new Map<string, BugEvent[]>();
+  for (const event of events) {
+    if (event.k !== "net.req") continue;
+    const path = capturedUrlPath(safeText(event.d.url, 400));
+    if (!path) continue;
+    const list = byPath.get(path) ?? [];
+    list.push(event);
+    byPath.set(path, list);
+  }
+  const failedIds = new Set(
+    events
+      .filter((event) => event.k === "net.err")
+      .map((event) => requestIdForEvent(event))
+      .filter((id): id is string => id !== undefined),
+  );
+  for (const [path, requests] of byPath) {
+    requests.sort((left, right) => left.t - right.t);
+    for (let start = 0; start < requests.length; start += 1) {
+      const burst = requests.filter(
+        (event) =>
+          event.t >= requests[start].t && event.t <= requests[start].t + 250,
+      );
+      if (burst.length < 5) continue;
+      const failed = burst.filter((event) =>
+        failedIds.has(requestIdForEvent(event) ?? ""),
+      ).length;
+      if (failed < Math.ceil(burst.length / 2)) continue;
+      const anchor = burst[burst.length - 1];
+      drafts.push({
+        detector: "request_reconnect_storm",
+        title: `${burst.length} requests hit ${path} within ${anchor.t - burst[0].t} ms`,
+        severity: "high",
+        score: BROWSER_NETWORK_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: anchor.t,
+          offsetMs: offsetForEvent(anchor) ?? offsetFromStart(anchor.t, index.start),
+          route: routeAt(index.navs ?? [], anchor.t),
+          requestId: requestIdForEvent(anchor),
+          method: safeText(anchor.d.method, 20) ?? safeText(anchor.d.m, 20),
+          url: redactUrl(safeText(anchor.d.url, 400)),
+          message:
+            `${burst.length} same-endpoint requests started inside 250 ms and ${failed} failed. ` +
+            `The synchronized burst has no backoff or jitter.`,
+        }),
+        dedupeKey: `requestburst:${path}:${burst[0].t}`,
+      });
+      break;
+    }
+  }
+}
+
+function addStaleClientBuildCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const snapshots = events
+    .filter(
+      (event) =>
+        event.k === "env" &&
+        safeText(event.d.appBuild, 120) !== undefined,
+    )
+    .sort((left, right) => left.t - right.t);
+  if (snapshots.length === 0) return;
+  for (const exchange of exchanges.values()) {
+    if (
+      exchange.method !== "GET" ||
+      capturedUrlPath(exchange.url) !== "/build-id.json" ||
+      !isSuccessStatus(exchange.status) ||
+      !exchange.res
+    ) continue;
+    const payload = responsePayload(exchange.resBody, exchange.resBodyMeta);
+    if (!isRecord(payload)) continue;
+    const serverBuild =
+      safeText(payload.build, 120) ??
+      safeText(payload.buildId, 120) ??
+      safeText(payload.version, 120);
+    if (!serverBuild) continue;
+    const snapshot = [...snapshots]
+      .reverse()
+      .find((event) => event.t <= exchange.res!.t);
+    const clientBuild = snapshot
+      ? safeText(snapshot.d.appBuild, 120)
+      : undefined;
+    if (!clientBuild || clientBuild === serverBuild) continue;
+    drafts.push({
+      detector: "stale_client_build",
+      title: `Client build ${clientBuild} disagreed with server build ${serverBuild}`,
+      severity: "high",
+      score: BROWSER_NETWORK_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs: offsetForEvent(exchange.res) ?? offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        message:
+          `The running HTML shell declared app-build=${clientBuild}, while the no-cache build identity endpoint returned ${serverBuild}. The client is serving a stale release.`,
+      }),
+      dedupeKey: `stalebuild:${clientBuild}:${serverBuild}`,
+    });
+  }
+}
+
+function addRtlPhysicalLayoutCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (
+      event.k !== "ui.layout" ||
+      safeText(event.d.dir, 20)?.toLowerCase() !== "rtl" ||
+      !Array.isArray(event.d.rtlPhysical)
+    ) continue;
+    const rules = event.d.rtlPhysical.filter(isRecord);
+    if (rules.length < 2) continue;
+    const properties = new Set(
+      rules.flatMap((rule) =>
+        Array.isArray(rule.properties)
+          ? rule.properties
+              .map((property) => safeText(property, 40))
+              .filter((property): property is string => Boolean(property))
+          : [],
+      ),
+    );
+    const hasAnchor = properties.has("left") || properties.has("right");
+    const hasSpacing = [...properties].some((property) =>
+      /^(?:margin|padding|border)/.test(property),
+    );
+    if (!hasAnchor || !hasSpacing) continue;
+    const sources = [
+      ...new Set(
+        rules
+          .map((rule) => safeText(rule.source, 300))
+          .filter((source): source is string => Boolean(source)),
+      ),
+    ];
+    drafts.push({
+      detector: "rtl_physical_layout_rules",
+      title: `${rules.length} active RTL rules used physical left/right layout properties`,
+      severity: "medium",
+      score: 64,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        url: redactUrl(safeText(event.d.url, 400)),
+        source: sources[0],
+        message:
+          `The RTL page matched ${rules.length} author CSS rules using physical anchoring and asymmetric physical spacing ` +
+          `(${[...properties].sort().join(", ")}). These rules do not mirror with document direction.`,
+      }),
+      dedupeKey: `rtlphysical:${safeText(event.d.url, 300) ?? event.t}`,
+    });
+  }
+}
+
+function addBrowserNetworkIntegrityCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  addCasefoldIdentityCollisionCandidates(events, index, drafts, exchanges);
+  addBlockedDependencyActionCandidates(events, index, drafts);
+  addAcknowledgedStateContradictionCandidates(index, drafts, exchanges);
+  addRequestBurstCandidates(events, index, drafts);
+  addStaleClientBuildCandidates(events, index, drafts, exchanges);
+  addRtlPhysicalLayoutCandidates(events, index, drafts);
+}
+
+// ─── refund and return invariants ─────────────────────────────────────────────
+
+interface RefundInsert {
+  event: BugEvent;
+  orderId: string;
+  amount: number;
+}
+
+function orderIdFromRow(row: Record<string, unknown>): string | undefined {
+  return keyValueOf(row.order_id) ?? keyValueOf(row.orderId);
+}
+
+/**
+ * Cross-request lifecycle invariants: cumulative issued refunds may not exceed
+ * the order total, and returning then refunding one order may not restock the
+ * same item twice.
+ */
+function addRefundInvariantCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const orderTotals = new Map<string, number>();
+  const refunds: RefundInsert[] = [];
+
+  for (const event of events) {
+    const table = safeText(event.d.table, 160);
+    if (!table) continue;
+    const bare = bareTableName(table).toLowerCase();
+    const row =
+      event.k === "db.read"
+        ? isRecord(event.d.row)
+          ? event.d.row
+          : undefined
+        : event.k === "db.diff" && isRecord(event.d.after)
+          ? event.d.after
+          : undefined;
+    if (!row) continue;
+
+    if (bare === "orders") {
+      const orderId =
+        keyValueOf(row.id) ??
+        (isRecord(event.d.pk) ? keyValueOf(event.d.pk.id) : undefined);
+      const total =
+        finiteNumber(row.total_cents) ?? finiteNumber(row.totalCents);
+      if (orderId && total !== undefined && total >= 0)
+        orderTotals.set(orderId, total);
+    }
+    if (
+      bare === "refunds" &&
+      event.k === "db.diff" &&
+      safeText(event.d.op, 20)?.toLowerCase() === "insert"
+    ) {
+      const orderId = orderIdFromRow(row);
+      const amount =
+        finiteNumber(row.amount_cents) ?? finiteNumber(row.amountCents);
+      if (orderId && amount !== undefined && amount > 0)
+        refunds.push({ event, orderId, amount });
+    }
+  }
+
+  const refundsByOrder = new Map<string, RefundInsert[]>();
+  for (const refund of refunds) {
+    const list = refundsByOrder.get(refund.orderId) ?? [];
+    list.push(refund);
+    refundsByOrder.set(refund.orderId, list);
+  }
+  for (const [orderId, entries] of refundsByOrder) {
+    const total = orderTotals.get(orderId);
+    if (total === undefined) continue;
+    entries.sort((a, b) => a.event.t - b.event.t);
+    let refunded = 0;
+    let exceeded: RefundInsert | undefined;
+    for (const entry of entries) {
+      refunded += entry.amount;
+      if (refunded > total) {
+        exceeded = entry;
+        break;
+      }
+    }
+    if (!exceeded) continue;
+    drafts.push({
+      detector: "refund_total_exceeded",
+      title: `Issued refunds exceeded order ${orderId}'s total`,
+      severity: "critical",
+      score: DB_INVARIANT_SCORE + 4,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exceeded.event.t,
+        offsetMs:
+          offsetForEvent(exceeded.event) ??
+          offsetFromStart(exceeded.event.t, index.start),
+        route: routeAt(index.navs ?? [], exceeded.event.t),
+        requestId: safeText(exceeded.event.d.requestId, 120),
+        message: `${entries.length} issued refund rows total ${refunded} cents against an order total of ${total} cents. The cumulative ledger exceeded the maximum refundable balance.`,
+        source: normalizeDbEngine(exceeded.event.d.engine),
+      }),
+      dedupeKey: `overrefund:${orderId}`,
+    });
+  }
+
+  interface Restock {
+    event: BugEvent;
+    requestId: string;
+    orderId: string;
+    productId: string;
+    quantity: number;
+    source: "return" | "refund";
+  }
+  const byRequest = dbDiffsByRequest(events);
+  const readsByRequest = new Map<string, BugEvent[]>();
+  for (const event of events) {
+    if (event.k !== "db.read") continue;
+    const requestId = safeText(event.d.requestId, 120);
+    if (!requestId) continue;
+    const list = readsByRequest.get(requestId) ?? [];
+    list.push(event);
+    readsByRequest.set(requestId, list);
+  }
+
+  const restocks: Restock[] = [];
+  for (const [requestId, requestDiffs] of byRequest) {
+    let orderId: string | undefined;
+    let source: Restock["source"] | undefined;
+    for (const diff of requestDiffs) {
+      const table = bareTableName(safeText(diff.d.table, 160) ?? "").toLowerCase();
+      const after = isRecord(diff.d.after) ? diff.d.after : undefined;
+      if (!after) continue;
+      if (
+        table === "orders" &&
+        safeText(after.status, 40)?.toLowerCase() === "returned"
+      ) {
+        orderId =
+          keyValueOf(after.id) ??
+          (isRecord(diff.d.pk) ? keyValueOf(diff.d.pk.id) : undefined);
+        source = "return";
+      } else if (
+        table === "refunds" &&
+        safeText(diff.d.op, 20)?.toLowerCase() === "insert"
+      ) {
+        orderId = orderIdFromRow(after);
+        source = "refund";
+      }
+    }
+    if (!orderId || !source) continue;
+
+    const itemReads = (readsByRequest.get(requestId) ?? []).flatMap((read) => {
+      if (
+        bareTableName(safeText(read.d.table, 160) ?? "").toLowerCase() !==
+          "order_items" ||
+        !isRecord(read.d.row)
+      )
+        return [];
+      const productId =
+        keyValueOf(read.d.row.product_id) ?? keyValueOf(read.d.row.productId);
+      const quantity =
+        finiteNumber(read.d.row.qty) ?? finiteNumber(read.d.row.quantity);
+      return productId && quantity !== undefined && quantity > 0
+        ? [{ productId, quantity }]
+        : [];
+    });
+    for (const diff of requestDiffs) {
+      if (
+        bareTableName(safeText(diff.d.table, 160) ?? "").toLowerCase() !==
+        "products"
+      )
+        continue;
+      const before = isRecord(diff.d.before) ? diff.d.before : undefined;
+      const after = isRecord(diff.d.after) ? diff.d.after : undefined;
+      if (!before || !after) continue;
+      const previous = finiteNumber(before.inventory);
+      const current = finiteNumber(after.inventory);
+      const productId =
+        keyValueOf(after.id) ??
+        (isRecord(diff.d.pk) ? keyValueOf(diff.d.pk.id) : undefined);
+      if (
+        previous === undefined ||
+        current === undefined ||
+        !productId ||
+        current <= previous
+      )
+        continue;
+      const quantity = current - previous;
+      if (
+        !itemReads.some(
+          (item) =>
+            item.productId === productId && item.quantity === quantity,
+        )
+      )
+        continue;
+      restocks.push({
+        event: diff,
+        requestId,
+        orderId,
+        productId,
+        quantity,
+        source,
+      });
+    }
+  }
+
+  const groupedRestocks = new Map<string, Restock[]>();
+  for (const restock of restocks) {
+    const key = `${restock.orderId}\u0000${restock.productId}`;
+    const list = groupedRestocks.get(key) ?? [];
+    list.push(restock);
+    groupedRestocks.set(key, list);
+  }
+  for (const [key, entries] of groupedRestocks) {
+    if (
+      entries.length < 2 ||
+      !entries.some((entry) => entry.source === "return") ||
+      !entries.some((entry) => entry.source === "refund")
+    )
+      continue;
+    entries.sort((a, b) => a.event.t - b.event.t);
+    const last = entries[entries.length - 1];
+    const [orderId, productId] = key.split("\u0000");
+    const totalQuantity = entries.reduce(
+      (sum, entry) => sum + entry.quantity,
+      0,
+    );
+    drafts.push({
+      detector: "duplicate_restock",
+      title: `Order ${orderId} restocked product ${productId} twice`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE + 2,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: last.event.t,
+        offsetMs:
+          offsetForEvent(last.event) ??
+          offsetFromStart(last.event.t, index.start),
+        route: routeAt(index.navs ?? [], last.event.t),
+        requestId: last.requestId,
+        message: `The return transition restored this order item's quantity, then a separate refund request restored it again. ${entries.length} inventory increases added ${totalQuantity} units for the same order and product.`,
+        source: normalizeDbEngine(last.event.d.engine),
+      }),
+      dedupeKey: `duplicaterestock:${orderId}:${productId}`,
+    });
+  }
+}
+
+// ─── session-bound cart invariants ────────────────────────────────────────────
+
+function cartItemsFromExchange(
+  exchange: RequestExchange | undefined,
+): Record<string, unknown>[] | undefined {
+  if (!exchange?.res || !isSuccessStatus(exchange.status)) return undefined;
+  const body = parseStructuredBody(exchange.resBody);
+  if (!isRecord(body) || !Array.isArray(body.items)) return undefined;
+  const items = body.items.filter(isRecord);
+  return items.length === body.items.length ? items : undefined;
+}
+
+function itemIdentity(item: Record<string, unknown>): string | undefined {
+  return (
+    keyValueOf(item.productId) ??
+    keyValueOf(item.product_id) ??
+    keyValueOf(item.id) ??
+    safeText(item.slug, 200)
+  );
+}
+
+function hasDuplicateCartIdentity(items: Record<string, unknown>[]): boolean {
+  const seen = new Set<string>();
+  for (const item of items) {
+    const identity = itemIdentity(item);
+    if (!identity) continue;
+    if (seen.has(identity)) return true;
+    seen.add(identity);
+  }
+  return false;
+}
+
+function addSessionCartInvariantCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const ordered = [...exchanges.values()].sort(
+    (a, b) => a.req.t - b.req.t,
+  );
+  const cartReads = ordered.filter(
+    (exchange) =>
+      exchange.method === "GET" &&
+      capturedUrlPath(exchange.url) === "/api/cart",
+  );
+
+  for (const checkout of ordered) {
+    if (
+      checkout.method !== "POST" ||
+      capturedUrlPath(checkout.url) !== "/api/checkout" ||
+      !checkout.res
+    )
+      continue;
+    const response = parseStructuredBody(checkout.resBody);
+    if (
+      !isRecord(response) ||
+      safeText(response.error, 80) !== "empty_cart"
+    )
+      continue;
+    const deletedSession = events.some(
+      (event) =>
+        event.k === "db.diff" &&
+        safeText(event.d.requestId, 120) === checkout.requestId &&
+        safeText(event.d.op, 20)?.toLowerCase() === "delete" &&
+        bareTableName(safeText(event.d.table, 160) ?? "").toLowerCase() ===
+          "sessions",
+    );
+    if (!deletedSession) continue;
+    const before = [...cartReads]
+      .reverse()
+      .find((read) => read.res && read.res.t < checkout.req.t);
+    const after = cartReads.find(
+      (read) => read.req.t > (checkout.res?.t ?? checkout.req.t),
+    );
+    const beforeItems = cartItemsFromExchange(before);
+    const afterItems = cartItemsFromExchange(after);
+    if (
+      !beforeItems ||
+      beforeItems.length === 0 ||
+      !afterItems ||
+      afterItems.length !== 0
+    )
+      continue;
+    drafts.push({
+      detector: "cart_lost_after_session_expiry",
+      title: `Session expiry erased a non-empty cart during checkout`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE + 2,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: checkout.res.t,
+        offsetMs:
+          offsetForEvent(checkout.res) ??
+          offsetFromStart(checkout.res.t, index.start),
+        route: routeAt(index.navs ?? [], checkout.res.t),
+        requestId: checkout.requestId,
+        method: checkout.method,
+        url: redactUrl(checkout.url),
+        status: checkout.status,
+        message: `The cart contained ${beforeItems.length} item line${beforeItems.length === 1 ? "" : "s"} immediately before checkout. That checkout deleted the active session and returned empty_cart; the next cart read was empty.`,
+      }),
+      dedupeKey: `sessioncartloss:${checkout.requestId}`,
+    });
+  }
+
+  interface Login {
+    exchange: RequestExchange;
+    userId: string;
+    mergedLines: number;
+  }
+  const logins: Login[] = [];
+  for (const exchange of ordered) {
+    if (
+      exchange.method !== "POST" ||
+      capturedUrlPath(exchange.url) !== "/api/login" ||
+      !isSuccessStatus(exchange.status)
+    )
+      continue;
+    const body = parseStructuredBody(exchange.resBody);
+    if (!isRecord(body) || !isRecord(body.user)) continue;
+    const userId = keyValueOf(body.user.id);
+    const mergedLines = finiteNumber(body.mergedLines);
+    if (userId && mergedLines !== undefined && mergedLines > 0)
+      logins.push({ exchange, userId, mergedLines });
+  }
+  for (let i = 1; i < logins.length; i += 1) {
+    const first = logins[i - 1];
+    const second = logins[i];
+    if (first.userId !== second.userId) continue;
+    const firstCart = cartReads.find(
+      (read) =>
+        read.req.t > (first.exchange.res?.t ?? first.exchange.req.t) &&
+        read.req.t < second.exchange.req.t,
+    );
+    const secondCart = cartReads.find(
+      (read) =>
+        read.req.t > (second.exchange.res?.t ?? second.exchange.req.t),
+    );
+    const firstItems = cartItemsFromExchange(firstCart);
+    const secondItems = cartItemsFromExchange(secondCart);
+    if (
+      !firstItems ||
+      firstItems.length === 0 ||
+      !secondItems ||
+      secondItems.length <= firstItems.length ||
+      !hasDuplicateCartIdentity(secondItems)
+    )
+      continue;
+    const cartWriteBetween = ordered.some(
+      (exchange) =>
+        exchange.req.t > (firstCart?.res?.t ?? first.exchange.req.t) &&
+        exchange.req.t < (secondCart?.res?.t ?? Number.POSITIVE_INFINITY) &&
+        exchange.method !== "GET" &&
+        (capturedUrlPath(exchange.url)?.startsWith("/api/cart") ?? false),
+    );
+    if (cartWriteBetween) continue;
+    drafts.push({
+      detector: "cart_remerged_on_login",
+      title: `Repeated login merged the same guest cart twice`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE + 2,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: secondCart?.res?.t ?? second.exchange.res?.t ?? second.exchange.req.t,
+        offsetMs:
+          offsetForEvent(secondCart?.res ?? second.exchange.res) ??
+          offsetFromStart(
+            secondCart?.res?.t ??
+              second.exchange.res?.t ??
+              second.exchange.req.t,
+            index.start,
+          ),
+        route: routeAt(
+          index.navs ?? [],
+          secondCart?.res?.t ??
+            second.exchange.res?.t ??
+            second.exchange.req.t,
+        ),
+        requestId: second.exchange.requestId,
+        method: second.exchange.method,
+        url: redactUrl(second.exchange.url),
+        status: second.exchange.status,
+        message: `Two successful logins for the same user each reported merged guest lines. The cart grew from ${firstItems.length} to ${secondItems.length} lines and now contains a duplicate product, with no add-to-cart request between the reads.`,
+      }),
+      dedupeKey: `cartremerge:${second.userId}`,
+    });
+  }
+}
+
+// ─── locale-sensitive input invariants ────────────────────────────────────────
+
+function expectedLocalizedCents(
+  raw: string,
+  locale: string,
+): number | undefined {
+  let decimal = ".";
+  let groups = new Set<string>();
+  try {
+    const parts = new Intl.NumberFormat(locale).formatToParts(12345.6);
+    decimal = parts.find((part) => part.type === "decimal")?.value ?? ".";
+    groups = new Set(
+      parts
+        .filter((part) => part.type === "group")
+        .map((part) => part.value),
+    );
+  } catch {
+    return undefined;
+  }
+  let normalized = raw.trim();
+  for (const group of groups)
+    normalized = normalized.split(group).join("");
+  normalized = normalized.split(decimal).join(".");
+  normalized = normalized.replace(/[^\d.+-]/g, "");
+  const amount = Number(normalized);
+  return Number.isFinite(amount) ? Math.round(amount * 100) : undefined;
+}
+
+/**
+ * Privacy-safe fallback for a redacted `d,dd` / `dd,dd` money input. The
+ * collector retains only length and character class. If the client-submitted
+ * cents decode to N whole units after stripping one locale decimal separator,
+ * that shape proves the intended two-fraction-digit value was N cents.
+ */
+function expectedLocalizedCentsFromShape(
+  raw: unknown,
+  locale: string,
+  actualCents: number,
+): number | undefined {
+  if (
+    !isRecord(raw) ||
+    !isRedactedPlaceholder(raw) ||
+    finiteNumber(raw.len) === undefined ||
+    safeText(raw.charset, 40) !== "mixed" ||
+    actualCents <= 0 ||
+    actualCents % 100 !== 0
+  )
+    return undefined;
+  let decimal = ".";
+  try {
+    const formatter = new Intl.NumberFormat(locale);
+    decimal =
+      formatter
+        .formatToParts(1.1)
+        .find((part) => part.type === "decimal")?.value ?? ".";
+  } catch {
+    return undefined;
+  }
+  if (decimal === ".") return undefined;
+  const digits = String(actualCents / 100);
+  if (finiteNumber(raw.len) !== digits.length + decimal.length) return undefined;
+  const expected = Number(digits);
+  return Number.isFinite(expected) ? expected : undefined;
+}
+
+function addLocaleInputCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (!exchange.res) continue;
+    const request = parseStructuredBody(exchange.body);
+    const response = parseStructuredBody(exchange.resBody);
+    if (!isRecord(request) || !isRecord(response)) continue;
+
+    const country = safeText(request.country, 20)?.toUpperCase();
+    if (
+      country &&
+      country !== "US" &&
+      exchange.status === 400 &&
+      safeText(response.error, 80) === "validation_failed" &&
+      isRecord(response.errors) &&
+      /invalid postal/i.test(safeText(response.errors.postalCode, 160) ?? "")
+    ) {
+      drafts.push({
+        detector: "country_postal_validation_mismatch",
+        title: `${country} postal code was rejected by country-agnostic validation`,
+        severity: "medium",
+        score: 78,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: exchange.res.t,
+          offsetMs:
+            offsetForEvent(exchange.res) ??
+            offsetFromStart(exchange.res.t, index.start),
+          route: routeAt(index.navs ?? [], exchange.res.t),
+          requestId: exchange.requestId,
+          method: exchange.method,
+          url: redactUrl(exchange.url),
+          status: exchange.status,
+          message: `The request explicitly selected country ${country} and supplied a postal code, but validation returned only a generic invalid-postal error. Country-specific formats cannot all satisfy one validation rule.`,
+        }),
+        dedupeKey: `postalcountry:${country}:${capturedUrlPath(exchange.url) ?? ""}`,
+      });
+    }
+
+    const locale = safeText(request.locale, 40);
+    const actual =
+      finiteNumber(request.amountCents) ??
+      finiteNumber(request.amount_cents);
+    if (
+      !isSuccessStatus(exchange.status) ||
+      !locale ||
+      actual === undefined
+    )
+      continue;
+    const raw = safeText(request.raw, 120);
+    const expected = raw
+      ? expectedLocalizedCents(raw, locale)
+      : expectedLocalizedCentsFromShape(request.raw, locale, actual);
+    if (
+      expected === undefined ||
+      expected <= 0 ||
+      actual === expected ||
+      actual < expected * 10
+    )
+      continue;
+    const ratio = actual / expected;
+    if (!Number.isInteger(ratio)) continue;
+    drafts.push({
+      detector: "locale_decimal_scale_shift",
+      title: `Localized amount was submitted ${ratio}× too large`,
+      severity: "critical",
+      score: DB_INVARIANT_SCORE + 3,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs:
+          offsetForEvent(exchange.res) ??
+          offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        message: `Locale ${locale} parses the submitted amount to ${expected} cents, but the client sent ${actual} cents and the server accepted it.`,
+      }),
+      dedupeKey: `localemoney:${locale}:${capturedUrlPath(exchange.url) ?? ""}`,
+    });
+  }
+}
+
+// ─── acknowledged_write_lost ─────────────────────────────────────────────────
+
+/**
+ * Two 200s and one row is data loss the client was explicitly promised would
+ * not happen, so this sits with `lost_update` and `duplicate_write` rather than
+ * below them. One point under {@link DB_INVARIANT_SCORE} because the comparison
+ * is made across HTTP rather than across two images of the same row.
+ */
+const ACKNOWLEDGED_WRITE_LOST_SCORE = 88;
+
+/**
+ * The stable target a mutating request addressed, from its own body.
+ *
+ * A REQUEST body has no `bodyMeta` — that summary is built for responses only —
+ * so this parses the captured text, which is exact because nothing capped it.
+ */
+function bodyTargetKey(body: unknown): string | undefined {
+  const payload = responsePayload(body);
+  if (payload === undefined) return undefined;
+  const ids: string[] = [];
+  for (const scope of collectObjectScopes(payload)) {
+    for (const [name, value] of Object.entries(scope)) {
+      if (!isIdLikeField(name)) continue;
+      if (typeof value !== "string" && toFiniteNumber(value) === undefined)
+        continue;
+      ids.push(`${normalizeFieldName(name)}=${String(value)}`);
+    }
+  }
+  if (ids.length === 0) return undefined;
+  return [...new Set(ids)].sort().join("&");
+}
+
+/** The id value a target key names, for matching an item inside a collection. */
+function targetIdValues(targetKey: string): string[] {
+  return targetKey
+    .split("&")
+    .map((entry) => entry.split("=")[1])
+    .filter((value): value is string => value !== undefined && value !== "");
+}
+
+/**
+ * acknowledged_write_lost: the server said yes twice and kept one.
+ *
+ * Two POSTs to the same collection endpoint with the same target, both answered
+ * 2xx, and a later read of that collection holding fewer items — or a smaller
+ * quantity on the target row — than those acknowledgements imply. The client was
+ * told both writes landed. One did.
+ *
+ * The comparison is anchored on a read taken BEFORE the writes wherever one
+ * exists, so the claim is about the delta this session caused rather than about
+ * an absolute count the detector would have to assume started at zero. Without a
+ * pre-read only the quantity comparison runs, and it treats the starting
+ * quantity as zero, which under-claims rather than over-claims.
+ */
+function addAcknowledgedWriteLostCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  interface Ack {
+    exchange: RequestExchange;
+    res: BugEvent;
+    quantity?: number;
+  }
+  const groups = new Map<string, Ack[]>();
+  for (const exchange of exchanges.values()) {
+    // Additive semantics only. A PUT replaces and a DELETE removes, so "two
+    // acknowledgements imply two items" is simply untrue for them.
+    if (exchange.method !== "POST") continue;
+    if (!isSuccessStatus(exchange.status) || !exchange.res) continue;
+    if (!exchange.url) continue;
+    const target = bodyTargetKey(exchange.body) ?? "";
+    const key = `${exchange.url} ${target}`;
+    const list = groups.get(key) ?? [];
+    // Request body again: parsed from the captured text, with no `bodyMeta`.
+    const payload = responsePayload(exchange.body);
+    const quantity = collectObjectScopes(payload)
+      .map((scope) => soleQuantityOf(scope))
+      .find((value) => value !== undefined);
+    list.push(
+      quantity === undefined
+        ? { exchange, res: exchange.res }
+        : { exchange, res: exchange.res, quantity },
+    );
+    groups.set(key, list);
+  }
+
+  // Every readable collection read in the session, keyed by collection path.
+  interface CollectionRead {
+    exchange: RequestExchange;
+    res: BugEvent;
+    collection: BodyCollection;
+  }
+  const readsByPath = new Map<string, CollectionRead[]>();
+  for (const exchange of exchanges.values()) {
+    if (exchange.method !== "GET") continue;
+    if (!isSuccessStatus(exchange.status) || !exchange.res) continue;
+    const path = capturedUrlPath(exchange.url);
+    if (!path) continue;
+    const collection = responseCollection(exchange.resBody, exchange.resBodyMeta);
+    if (!collection) continue;
+    const list = readsByPath.get(path) ?? [];
+    list.push({ exchange, res: exchange.res, collection });
+    readsByPath.set(path, list);
+  }
+
+  for (const [key, acks] of groups) {
+    if (acks.length < 2) continue;
+    acks.sort((a, b) => a.exchange.req.t - b.exchange.req.t);
+    const first = acks[0];
+    const last = acks[acks.length - 1];
+    const path = capturedUrlPath(first.exchange.url);
+    if (!path) continue;
+    const reads = (readsByPath.get(path) ?? []).sort((a, b) => a.res.t - b.res.t);
+    if (reads.length === 0) continue;
+
+    const baseline = [...reads]
+      .reverse()
+      .find((read) => read.res.t < first.exchange.req.t);
+    const observed = reads.find(
+      (read) => read.exchange.req.t > last.res.t,
+    );
+    if (!observed) continue;
+
+    const targetKey = key.split(" ")[1] ?? "";
+    const targetIds = targetIdValues(targetKey);
+    const quantities = acks.map((ack) => ack.quantity);
+    const impliedQuantity = quantities.every(
+      (quantity): quantity is number => quantity !== undefined,
+    )
+      ? quantities.reduce((sum, quantity) => sum + quantity, 0)
+      : undefined;
+
+    const observedRow = findCollectionItem(observed.collection.items, targetIds);
+    const baselineRow = baseline
+      ? findCollectionItem(baseline.collection.items, targetIds)
+      : undefined;
+    const observedQuantity = soleQuantityOf(observedRow);
+    const baselineQuantity = soleQuantityOf(baselineRow) ?? 0;
+
+    let message: string | undefined;
+    if (impliedQuantity !== undefined && observedQuantity !== undefined) {
+      if (observedQuantity < baselineQuantity + impliedQuantity) {
+        message = `${acks.length} POSTs to this endpoint were each answered ${first.exchange.status}, adding ${impliedQuantity} in total to a starting quantity of ${baselineQuantity}. The next read of the collection shows ${observedQuantity}.`;
+      }
+    } else if (baseline) {
+      if (observed.collection.total < baseline.collection.total + acks.length) {
+        message = `${acks.length} POSTs to this endpoint were each answered ${first.exchange.status}. The collection held ${baseline.collection.total} items before them and ${observed.collection.total} after, which is ${baseline.collection.total + acks.length - observed.collection.total} fewer than the acknowledgements imply.`;
+      }
+    }
+    if (!message) continue;
+
+    drafts.push({
+      detector: "acknowledged_write_lost",
+      title: `${acks.length} writes were acknowledged but the collection kept fewer`,
+      severity: "high",
+      score: ACKNOWLEDGED_WRITE_LOST_SCORE,
+      confidence: baseline ? "high" : "medium",
+      anchor: removeUndefined({
+        t: observed.res.t,
+        offsetMs:
+          offsetForEvent(observed.res) ??
+          offsetFromStart(observed.res.t, index.start),
+        route: routeAt(index.navs ?? [], observed.res.t),
+        requestId: last.exchange.requestId,
+        method: "POST",
+        url: redactUrl(first.exchange.url),
+        status: last.exchange.status,
+        message: scrubText(message, 300),
+      }),
+      dedupeKey: `ackwritelost:${path}:${targetKey}`,
+    });
+  }
+}
+
+/** The item in a collection whose id-like value matches one of `ids`. */
+function findCollectionItem(
+  items: unknown[],
+  ids: string[],
+): Record<string, unknown> | undefined {
+  const records = items.filter(
+    (item): item is Record<string, unknown> =>
+      isRecord(item) && !isRedactedPlaceholder(item),
+  );
+  if (records.length === 0) return undefined;
+  if (ids.length === 0) return records.length === 1 ? records[0] : undefined;
+  return records.find((item) =>
+    Object.entries(item).some(
+      ([name, value]) =>
+        isIdLikeField(name) &&
+        (typeof value === "string" || toFiniteNumber(value) !== undefined) &&
+        ids.includes(String(value)),
+    ),
+  );
+}
+
+// ─── runtime_warning ─────────────────────────────────────────────────────────
+
+/**
+ * A `MaxListenersExceededWarning` is the platform stating, with a threshold
+ * behind it, that something subscribes and never unsubscribes. That outranks a
+ * console warning the app chose to print and sits under an actual fault. Every
+ * other warning class keeps the medium tier: real, but a statement about the
+ * code rather than about this session.
+ */
+const MAX_LISTENERS_WARNING_SCORE = 74;
+const RUNTIME_WARNING_SCORE = 54;
+const MAX_LISTENERS_WARNING_NAME = "MaxListenersExceededWarning";
+
+/**
+ * runtime_warning: the Node runtime announced a defect the application never
+ * logged.
+ *
+ * `process.on("warning")` is a channel almost no application reads. A leaked
+ * listener, an API already scheduled for removal, a deprecated buffer
+ * constructor — the runtime says all of it out loud, into a stream that goes
+ * nowhere. Identical warnings collapse into one candidate carrying the count,
+ * because a leak's whole signature is the same warning firing over and over.
+ */
+function addRuntimeWarningCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (event.k !== "backend.warning") continue;
+    const name = safeText(event.d.name, 120) ?? "Warning";
+    const message = scrubText(event.d.message, 220);
+    const isListenerLeak = name === MAX_LISTENERS_WARNING_NAME;
+    drafts.push({
+      detector: "runtime_warning",
+      title: `Node runtime warning: ${name}${message ? ` — ${truncate(message, 90)}` : ""}`,
+      severity: isListenerLeak ? "high" : "medium",
+      score: isListenerLeak
+        ? MAX_LISTENERS_WARNING_SCORE
+        : RUNTIME_WARNING_SCORE,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: safeText(event.d.requestId, 120),
+        errorCode: name,
+        message,
+        source: "backend",
+        frame: codeFrameOf({
+          stk: typeof event.d.stack === "string" ? event.d.stack : undefined,
+        }),
+      }),
+      // Content signature, not the timestamp: a leak re-warns on every request
+      // and has to read as one finding with a count, not as fifty findings.
+      dedupeKey: `runtimewarning:${name}:${normalizeErrorSignature(event.d.message)}`,
+    });
+  }
+}
+
+// ─── checkout correctness ────────────────────────────────────────────────────
+
+const CHECKOUT_CORRECTNESS_SCORE = DB_INVARIANT_SCORE + 5;
+
+function insertedOrderForRequest(
+  events: BugEvent[],
+  requestId: string,
+): BugEvent | undefined {
+  return events.find(
+    (event) =>
+      event.k === "db.diff" &&
+      correlationIdOf(event) === requestId &&
+      safeText(event.d.op, 20)?.toLowerCase() === "insert" &&
+      bareTableName(safeText(event.d.table, 200) ?? "").toLowerCase() ===
+        "orders" &&
+      isRecord(event.d.after),
+  );
+}
+
+function addPricingOutcomeContradictionCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const pricing of events) {
+    if (
+      pricing.k !== "backend.http" ||
+      safeText(pricing.d.service, 80)?.toLowerCase() !== "pricing"
+    )
+      continue;
+    const requestId = correlationIdOf(pricing);
+    if (!requestId) continue;
+    const order = insertedOrderForRequest(events, requestId);
+    if (!order || !isRecord(order.d.after)) continue;
+    const orderTotal =
+      finiteNumber(order.d.after.total_cents) ??
+      finiteNumber(order.d.after.totalCents);
+    if (orderTotal === undefined) continue;
+
+    const pricingTotal =
+      finiteNumber(pricing.d.totalCents) ??
+      finiteNumber(pricing.d.total_cents);
+    if (
+      finiteNumber(pricing.d.status) === 200 &&
+      pricingTotal !== undefined &&
+      pricingTotal !== orderTotal
+    ) {
+      drafts.push({
+        detector: "pricing_total_ignored_by_checkout",
+        title: `Checkout stored ${orderTotal} after pricing returned ${pricingTotal}`,
+        severity: "critical",
+        score: CHECKOUT_CORRECTNESS_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: order.t,
+          offsetMs:
+            offsetForEvent(order) ?? offsetFromStart(order.t, index.start),
+          route: routeAt(index.navs ?? [], order.t),
+          requestId,
+          table: safeText(order.d.table, 200),
+          source: normalizeDbEngine(order.d.engine),
+          frame: dbCallsiteFrame(order.d.callsite),
+          message:
+            `The pricing service returned totalCents=${pricingTotal}, but the correlated orders insert persisted total_cents=${orderTotal}.`,
+        }),
+        dedupeKey: `pricingtotalignored:${requestId}`,
+      });
+    }
+
+    const timedOut =
+      finiteNumber(pricing.d.status) === 0 &&
+      (safeText(pricing.d.errorKind, 80)?.toLowerCase() === "timeout" ||
+        /timed?\s*out/i.test(safeText(pricing.d.error, 200) ?? ""));
+    if (!timedOut) continue;
+    drafts.push({
+      detector: "checkout_committed_after_pricing_timeout",
+      title: `Checkout committed an order after authoritative pricing timed out`,
+      severity: "critical",
+      score: CHECKOUT_CORRECTNESS_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: order.t,
+        offsetMs:
+          offsetForEvent(order) ?? offsetFromStart(order.t, index.start),
+        route: routeAt(index.navs ?? [], order.t),
+        requestId,
+        table: safeText(order.d.table, 200),
+        source: normalizeDbEngine(order.d.engine),
+        frame: dbCallsiteFrame(order.d.callsite),
+        message:
+          `The pricing request timed out without returning an authoritative total, but the same request inserted an order with total_cents=${orderTotal}.`,
+      }),
+      dedupeKey: `pricingtimeoutcommit:${requestId}`,
+    });
+  }
+}
+
+function addNegativeInventoryOrderCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const order of events) {
+    if (
+      order.k !== "db.diff" ||
+      safeText(order.d.op, 20)?.toLowerCase() !== "insert" ||
+      bareTableName(safeText(order.d.table, 200) ?? "").toLowerCase() !==
+        "orders"
+    )
+      continue;
+    const requestId = correlationIdOf(order);
+    if (!requestId) continue;
+    const negative = events.find((event) => {
+      if (
+        event.k !== "db.diff" ||
+        correlationIdOf(event) !== requestId ||
+        !isRecord(event.d.after)
+      )
+        return false;
+      return Object.entries(event.d.after).some(
+        ([field, value]) =>
+          /(?:inventory|stock|quantity|qty)/i.test(field) &&
+          finiteNumber(value) !== undefined &&
+          finiteNumber(value)! < 0,
+      );
+    });
+    if (!negative || !isRecord(negative.d.after)) continue;
+    const negativeField = Object.entries(negative.d.after).find(
+      ([field, value]) =>
+        /(?:inventory|stock|quantity|qty)/i.test(field) &&
+        finiteNumber(value) !== undefined &&
+        finiteNumber(value)! < 0,
+    );
+    if (!negativeField) continue;
+    drafts.push({
+      detector: "order_committed_with_negative_inventory",
+      title: `Order committed while ${bareTableName(safeText(negative.d.table, 200) ?? "inventory")}.${negativeField[0]} was ${negativeField[1]}`,
+      severity: "critical",
+      score: CHECKOUT_CORRECTNESS_SCORE + 1,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: order.t,
+        offsetMs:
+          offsetForEvent(order) ?? offsetFromStart(order.t, index.start),
+        route: routeAt(index.navs ?? [], order.t),
+        requestId,
+        table: safeText(order.d.table, 200),
+        source: normalizeDbEngine(order.d.engine),
+        frame: dbCallsiteFrame(order.d.callsite),
+        message:
+          `The request wrote ${negativeField[0]}=${negativeField[1]} and still inserted an orders row. The oversold checkout was not rolled back.`,
+      }),
+      dedupeKey: `negativeinventoryorder:${requestId}`,
+    });
+  }
+}
+
+function addCheckoutCorrectnessCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  addPricingOutcomeContradictionCandidates(events, index, drafts);
+  addNegativeInventoryOrderCandidates(events, index, drafts);
+}
+
+// ─── declined_payment_ordered ───────────────────────────────────────────────
+
+const DECLINED_PAYMENT_ORDERED_SCORE = 94;
+const DECLINED_PAYMENT_ORDERED_WINDOW_MS = 10_000;
+
+/**
+ * declined_payment_ordered: a payment gateway explicitly declined a charge,
+ * but the same request lifecycle still inserted an order.
+ */
+function addDeclinedPaymentOrderedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const declined = events.filter(
+    (event) =>
+      event.k === "backend.http" &&
+      safeText(event.d.service, 80)?.toLowerCase() === "payments" &&
+      safeText(event.d.chargeStatus, 80)?.toLowerCase() === "declined",
+  );
+  for (const failure of declined) {
+    const order = events.find(
+      (event) =>
+        event.k === "db.diff" &&
+        event.d.table === "orders" &&
+        event.d.op === "insert" &&
+        event.t >= failure.t &&
+        event.t <= failure.t + DECLINED_PAYMENT_ORDERED_WINDOW_MS,
+    );
+    if (!order) continue;
+    drafts.push({
+      detector: "declined_payment_ordered",
+      title: `An order was placed after its payment was declined`,
+      severity: "critical",
+      score: DECLINED_PAYMENT_ORDERED_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: order.t,
+        offsetMs:
+          offsetForEvent(order) ?? offsetFromStart(order.t, index.start),
+        route: routeAt(index.navs ?? [], order.t),
+        requestId: correlationIdOf(order),
+        table: "orders",
+        source: normalizeDbEngine(order.d.engine),
+        message:
+          `The payments service returned chargeStatus=declined` +
+          `${safeText(failure.d.failureCode, 80) ? ` (${safeText(failure.d.failureCode, 80)})` : ""}, ` +
+          `then an orders row was inserted ${order.t - failure.t} ms later.`,
+      }),
+      dedupeKey: `declinedordered:${correlationIdOf(order) ?? order.t}`,
+    });
+  }
+}
+
+// ─── downstream_succeeded_after_timeout ─────────────────────────────────────
+
+const DOWNSTREAM_SUCCEEDED_AFTER_TIMEOUT_SCORE = 95;
+const DOWNSTREAM_TIMEOUT_MATCH_WINDOW_MS = 2_000;
+
+function backendHttpPath(event: BugEvent): string | undefined {
+  return (
+    capturedUrlPath(safeText(event.d.url, 400)) ??
+    capturedUrlPath(safeText(event.d.operation, 200))
+  );
+}
+
+function otelHttpPath(event: BugEvent): string | undefined {
+  const attributes = isRecord(event.d.attributes)
+    ? event.d.attributes
+    : undefined;
+  return (
+    capturedUrlPath(safeText(attributes?.["http.target"], 400)) ??
+    capturedUrlPath(safeText(attributes?.["http.route"], 400)) ??
+    capturedUrlPath(safeText(attributes?.["http.url"], 400))
+  );
+}
+
+/**
+ * downstream_succeeded_after_timeout: the caller gave up, but the downstream
+ * service's server span says the same operation completed successfully.
+ *
+ * This is stronger than a generic timeout: it proves the operation has an
+ * ambiguous outcome and may already have committed its side effect.
+ */
+function addDownstreamSucceededAfterTimeoutCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const successfulServerSpans = events.filter((event) => {
+    if (event.k !== OTEL_SPAN_KIND) return false;
+    const status = otelHttpStatus(event.d.attributes);
+    return status !== undefined && status >= 200 && status < 300;
+  });
+
+  for (const timeout of events) {
+    if (
+      timeout.k !== "backend.http" ||
+      safeText(timeout.d.errorKind, 80)?.toLowerCase() !== "timeout" ||
+      finiteNumber(timeout.d.status) !== 0
+    )
+      continue;
+    const requestId = correlationIdOf(timeout);
+    if (!requestId) continue;
+    const path = backendHttpPath(timeout);
+    if (!path) continue;
+    const service = safeText(timeout.d.service, 120)?.toLowerCase();
+    const completed = successfulServerSpans.find((span) => {
+      if (correlationIdOf(span) !== requestId) return false;
+      if (otelHttpPath(span) !== path) return false;
+      if (
+        Math.abs(span.t - timeout.t) > DOWNSTREAM_TIMEOUT_MATCH_WINDOW_MS
+      )
+        return false;
+      const spanService = safeText(span.d.serviceName, 160)?.toLowerCase();
+      return (
+        !service ||
+        !spanService ||
+        spanService === service ||
+        spanService.endsWith(`-${service}`) ||
+        spanService.endsWith(`.${service}`)
+      );
+    });
+    if (!completed) continue;
+    const status = otelHttpStatus(completed.d.attributes);
+    drafts.push({
+      detector: "downstream_succeeded_after_timeout",
+      title: `Downstream ${path} completed after its caller timed out`,
+      severity: "critical",
+      score: DOWNSTREAM_SUCCEEDED_AFTER_TIMEOUT_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: completed.t,
+        offsetMs:
+          offsetForEvent(completed) ??
+          offsetFromStart(completed.t, index.start),
+        route: routeAt(index.navs ?? [], completed.t),
+        requestId,
+        method:
+          safeText(timeout.d.method, 20)?.toUpperCase() ??
+          safeText(completed.d.name, 20)?.toUpperCase(),
+        url: redactUrl(path),
+        status,
+        source: "backend",
+        frame: otelCodeFrame(completed.d.attributes),
+        message:
+          `The caller recorded a timeout for ${service ? `${service} ` : ""}${path}, ` +
+          `while the downstream server span completed with HTTP ${status}. ` +
+          `The operation may have committed even though the caller treated it as failed.`,
+      }),
+      dedupeKey: `downstreamtimeout:${service ?? ""}:${path}`,
+    });
+  }
+}
+
+// ─── invalid_webhook_signature_accepted ──────────────────────────────────────
+
+const INVALID_WEBHOOK_SIGNATURE_ACCEPTED_SCORE = 97;
+
+function malformedSha256Signature(
+  headers: unknown,
+): { header: string; digestLength: number } | undefined {
+  if (!isRecord(headers)) return undefined;
+  for (const [name, value] of Object.entries(headers)) {
+    if (!/(?:^|-)signature$/i.test(name)) continue;
+    const signature = safeText(value, 200);
+    const match = signature ? /^sha256=(.*)$/i.exec(signature) : null;
+    if (!match) continue;
+    const digest = match[1] ?? "";
+    if (/^[a-f\d]{64}$/i.test(digest)) continue;
+    return { header: name.toLowerCase(), digestLength: digest.length };
+  }
+  return undefined;
+}
+
+function dbCallsiteFrame(callsite: unknown): string | undefined {
+  if (!isRecord(callsite)) return undefined;
+  return codeFrameOf({
+    file: safeText(callsite.file, 300),
+    line: finiteNumber(callsite.line),
+    col: finiteNumber(callsite.column),
+  });
+}
+
+/**
+ * invalid_webhook_signature_accepted: a webhook accepted a malformed SHA-256
+ * signature and performed a database mutation in that same request.
+ *
+ * This does not try to recover or verify a secret. A SHA-256 digest has an
+ * objective wire shape, so a non-64-hex digest is invalid before HMAC
+ * comparison, and a 2xx plus a correlated write proves it was not rejected.
+ */
+function addInvalidWebhookSignatureAcceptedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const exchange of exchanges.values()) {
+    if (
+      exchange.method !== "POST" ||
+      !/webhooks?(?:\/|$)/i.test(capturedUrlPath(exchange.url) ?? "") ||
+      !isSuccessStatus(exchange.status)
+    )
+      continue;
+    const malformed = malformedSha256Signature(exchange.req.d.hdrs);
+    if (!malformed) continue;
+    const mutation = events.find(
+      (event) =>
+        event.k === "db.diff" &&
+        correlationIdOf(event) === exchange.requestId &&
+        ["insert", "update", "delete"].includes(
+          safeText(event.d.op, 20)?.toLowerCase() ?? "",
+        ),
+    );
+    if (!mutation) continue;
+    const table = safeText(mutation.d.table, 120);
+    drafts.push({
+      detector: "invalid_webhook_signature_accepted",
+      title: `Webhook with a malformed SHA-256 signature changed the database`,
+      severity: "critical",
+      score: INVALID_WEBHOOK_SIGNATURE_ACCEPTED_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: mutation.t,
+        offsetMs:
+          offsetForEvent(mutation) ??
+          offsetFromStart(mutation.t, index.start),
+        route: routeAt(index.navs ?? [], mutation.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(exchange.url),
+        status: exchange.status,
+        table,
+        source: normalizeDbEngine(mutation.d.engine),
+        frame: dbCallsiteFrame(mutation.d.callsite),
+        message:
+          `${malformed.header} carried a ${malformed.digestLength}-character SHA-256 digest ` +
+          `(64 hexadecimal characters are required), but the webhook returned ${exchange.status}` +
+          `${table ? ` and mutated ${table}` : " and mutated the database"}.`,
+      }),
+      dedupeKey:
+        `invalidwebhooksig:${capturedUrlPath(exchange.url) ?? ""}:` +
+        `${table ?? ""}`,
+    });
+  }
+}
+
+// ─── stored_active_markup ───────────────────────────────────────────────────
+
+const STORED_ACTIVE_MARKUP_SCORE = 96;
+const ACTIVE_MARKUP_RE =
+  /<(?:script|iframe|object|embed)\b|<[^>]+\bon[a-z]+\s*=|javascript\s*:/i;
+
+/**
+ * stored_active_markup: a database write persisted markup that can execute in
+ * a browser. The value itself is never repeated in the candidate.
+ */
+function addStoredActiveMarkupCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (event.k !== "db.diff" || event.d.op === "delete") continue;
+    const after = event.d.after;
+    if (!isRecord(after)) continue;
+    const field = collectFieldEntries(after).find(
+      ([, value]) => typeof value === "string" && ACTIVE_MARKUP_RE.test(value),
+    );
+    if (!field) continue;
+    const table = safeText(event.d.table, 120) ?? "a database table";
+    drafts.push({
+      detector: "stored_active_markup",
+      title: `Executable markup was persisted to ${table}.${field[0]}`,
+      severity: "critical",
+      score: STORED_ACTIVE_MARKUP_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: correlationIdOf(event),
+        table,
+        source: normalizeDbEngine(event.d.engine),
+        message:
+          `A ${event.d.op} wrote a string containing an executable HTML construct ` +
+          `to ${table}.${field[0]}. The stored value is omitted from this finding.`,
+      }),
+      dedupeKey: `storedmarkup:${table}:${field[0]}`,
+    });
+  }
+}
+
+// ─── input_reverted ──────────────────────────────────────────────────────────
+
+/** How long after a user keystroke a programmatic write still reads as a revert. */
+const INPUT_REVERT_WINDOW_MS = 10_000;
+/**
+ * The app taking back what the user typed is a defect they can see and cannot
+ * work around, so it ranks with the response-level failures. Confidence stays
+ * medium because the comparison is usually made on redacted lengths: a
+ * controlled component legitimately rewriting a formatted value has the same
+ * shape as a field being cleared.
+ */
+const INPUT_REVERTED_SCORE = 80;
+
+/** The field an `inp` event is about, stable across events. */
+function inputFieldKey(event: BugEvent): string | undefined {
+  const el = isRecord(event.d.el) ? event.d.el : undefined;
+  return (
+    safeText(el?.name, 120) ??
+    safeText(el?.id, 120) ??
+    safeText(el?.sig, 120) ??
+    safeText(el?.path, 200) ??
+    elementLabel(event)
+  );
+}
+
+/** The length of the value an `inp` event carried, redacted or not. */
+function inputValueLength(event: BugEvent): number | undefined {
+  const summary = isRecord(event.d.valSummary) ? event.d.valSummary : undefined;
+  const declared = finiteNumber(summary?.originalLength);
+  if (declared !== undefined) return declared;
+  const value = event.d.val;
+  if (typeof value !== "string") return undefined;
+  if (isRedactedValue(value)) return undefined;
+  return value.length;
+}
+
+/** The comparable value of an `inp` event, when it was not redacted away. */
+function inputComparableValue(event: BugEvent): string | undefined {
+  const value = event.d.val;
+  if (typeof value !== "string" || isRedactedValue(value)) return undefined;
+  if (/^[*•]+$/.test(value)) return undefined; // masked, not a value
+  return value;
+}
+
+/**
+ * input_reverted: the application overwrote what the user typed.
+ *
+ * Two `inp` events on one field: a trusted one (the user's keystrokes) and,
+ * within ten seconds, an untrusted one (the app writing to the field) that
+ * shortens or replaces the value. It is the mechanism behind every "it keeps
+ * clearing my form" report, and no other signal names it — nothing fails, no
+ * request is made, and the field simply is not what the user left it as.
+ *
+ * Values are usually redacted, so the comparison is made on
+ * `valSummary.originalLength`. A programmatic write that lengthens the value is
+ * ignored: autocompletion and formatting do that, and neither is a revert.
+ */
+function addInputRevertedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const inputs = events
+    .filter((event) => event.k === "inp")
+    .sort((a, b) => a.t - b.t);
+  if (inputs.length < 2) return;
+
+  const lastTrusted = new Map<string, BugEvent>();
+  for (const event of inputs) {
+    const field = inputFieldKey(event);
+    if (!field) continue;
+    const trusted = event.d.trusted;
+    if (trusted === true) {
+      lastTrusted.set(field, event);
+      continue;
+    }
+    if (trusted !== false) continue; // no provenance captured → no claim
+    const typed = lastTrusted.get(field);
+    if (!typed || event.t - typed.t > INPUT_REVERT_WINDOW_MS) continue;
+
+    const before = inputValueLength(typed);
+    const after = inputValueLength(event);
+    if (before === undefined || after === undefined) continue;
+
+    let how: string | undefined;
+    if (after < before) {
+      how =
+        after === 0
+          ? `cleared the field (${before} characters typed, 0 left)`
+          : `shortened the value from ${before} to ${after} characters`;
+    } else if (after === before) {
+      const typedValue = inputComparableValue(typed);
+      const writtenValue = inputComparableValue(event);
+      if (
+        typedValue !== undefined &&
+        writtenValue !== undefined &&
+        typedValue !== writtenValue
+      ) {
+        how = `replaced the value with a different one of the same length (${after} characters)`;
+      }
+    }
+    if (!how) continue;
+
+    const label = scrubText(elementLabel(event) ?? field, 100) ?? "a field";
+    drafts.push({
+      detector: "input_reverted",
+      title: `The app overwrote what the user typed into ${label}`,
+      severity: "high",
+      score: INPUT_REVERTED_SCORE,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        target: targetForEvent(event),
+        elementLabel: scrubText(elementLabel(event), 160),
+        message: `A user keystroke on this field was followed ${event.t - typed.t} ms later by a programmatic write (untrusted event) that ${how}. Values are redacted, so the comparison is on captured lengths.`,
+      }),
+      dedupeKey: `inputreverted:${field}`,
+    });
+  }
+}
+
+// ─── form_reset_after_error ─────────────────────────────────────────────────
+
+const FORM_RESET_AFTER_ERROR_WINDOW_MS = 2_000;
+const FORM_RESET_AFTER_ERROR_SCORE = 79;
+
+/**
+ * form_reset_after_error: a failed submit was followed by multiple controls
+ * being silently cleared. The interaction collector emits `ev:"state"` only
+ * when a snapshotted control changed without a user input event, including
+ * framework remounts, so two empty controls after a 4xx response is the
+ * high-signal "one validation error wiped my form" shape.
+ */
+function addFormResetAfterErrorCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const ordered = [...events].sort((a, b) => a.t - b.t);
+  for (const submit of ordered) {
+    if (submit.k !== "inp" || submit.d.ev !== "submit") continue;
+    const failure = ordered.find(
+      (event) =>
+        event.k === "net.res" &&
+        event.t >= submit.t &&
+        event.t <= submit.t + FORM_RESET_AFTER_ERROR_WINDOW_MS &&
+        (finiteNumber(event.d.st) ?? 0) >= 400 &&
+        (finiteNumber(event.d.st) ?? 0) < 500,
+    );
+    if (!failure) continue;
+
+    const cleared = ordered.filter(
+      (event) =>
+        event.k === "inp" &&
+        event.d.ev === "state" &&
+        event.d.trusted === false &&
+        event.t >= failure.t &&
+        event.t <= submit.t + FORM_RESET_AFTER_ERROR_WINDOW_MS &&
+        inputValueLength(event) === 0,
+    );
+    const fields = [
+      ...new Set(
+        cleared
+          .map(inputFieldKey)
+          .filter((field): field is string => field !== undefined),
+      ),
+    ];
+    if (fields.length < 2) continue;
+
+    drafts.push({
+      detector: "form_reset_after_error",
+      title: `A failed submit silently cleared ${fields.length} form fields`,
+      severity: "high",
+      score: FORM_RESET_AFTER_ERROR_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: cleared[0].t,
+        offsetMs:
+          offsetForEvent(cleared[0]) ??
+          offsetFromStart(cleared[0].t, index.start),
+        route: routeAt(index.navs ?? [], cleared[0].t),
+        requestId: correlationIdOf(failure),
+        target: targetForEvent(submit),
+        message:
+          `The submit received HTTP ${finiteNumber(failure.d.st)}, then the app ` +
+          `changed ${fields.length} snapshotted controls to empty without user input. ` +
+          `Fields are identified structurally; their values remain redacted.`,
+      }),
+      dedupeKey: `formreset:${routeAt(index.navs ?? [], submit.t) ?? "unknown"}`,
+    });
+  }
+}
+
+// ─── display_date_timezone_mismatch ─────────────────────────────────────────
+
+const DISPLAY_DATE_TIMEZONE_MISMATCH_SCORE = 76;
+const ISO_INSTANT_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
+
+function epochDayInTimezone(instant: string, timezone: string): number | undefined {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(new Date(instant));
+    const year = Number(parts.find((part) => part.type === "year")?.value);
+    const month = Number(parts.find((part) => part.type === "month")?.value);
+    const day = Number(parts.find((part) => part.type === "day")?.value);
+    if (![year, month, day].every(Number.isFinite)) return undefined;
+    return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * display_date_timezone_mismatch: the page rendered an API timestamp's UTC
+ * calendar day even though that instant belongs to another day locally.
+ *
+ * The browser collector represents a visible YYYY-MM-DD as an epoch-day
+ * number under `unit:"iso-day"`. API timestamps remain canonical ISO strings.
+ * Matching the visible day to the instant's UTC day while it differs from the
+ * session timezone's day is direct evidence of `toISOString().slice(0, 10)`
+ * style formatting.
+ */
+function addDisplayDateTimezoneMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const timezone = events
+    .filter((event) => event.k === "env")
+    .map((event) => safeText(event.d.timezone, 80))
+    .find((value): value is string => value !== undefined);
+  if (!timezone) return;
+
+  const sources: Array<{
+    utcDay: number;
+    localDay: number;
+    requestId?: string;
+  }> = [];
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const payload = responsePayload(event.d.body, event.d.bodyMeta);
+    if (payload === undefined) continue;
+    for (const [name, value] of collectFieldEntries(payload)) {
+      if (!/(?:^|_)(?:created|updated|placed|occurred)_?at$/.test(name)) continue;
+      if (typeof value !== "string" || !ISO_INSTANT_RE.test(value)) continue;
+      const at = Date.parse(value);
+      const localDay = epochDayInTimezone(value, timezone);
+      if (!Number.isFinite(at) || localDay === undefined) continue;
+      sources.push({
+        utcDay: Math.floor(at / 86_400_000),
+        localDay,
+        requestId: correlationIdOf(event),
+      });
+    }
+  }
+  if (sources.length === 0) return;
+
+  for (const event of events) {
+    if (event.k !== "ui.num") continue;
+    for (const item of uiNumItems(event)) {
+      if (item.unit !== "iso-day") continue;
+      const source = sources.find(
+        (entry) =>
+          entry.utcDay === item.value && entry.localDay !== entry.utcDay,
+      );
+      if (!source) continue;
+      drafts.push({
+        detector: "display_date_timezone_mismatch",
+        title: `A date was rendered in UTC instead of ${timezone}`,
+        severity: "high",
+        score: DISPLAY_DATE_TIMEZONE_MISMATCH_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: event.t,
+          offsetMs:
+            offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+          route: routeAt(index.navs ?? [], event.t),
+          requestId: source.requestId,
+          elementLabel: scrubText(item.label, 120),
+          message:
+            `The displayed day for ${scrubText(item.label, 100) ?? "this item"} ` +
+            `matches the API timestamp's UTC calendar day, but that instant falls ` +
+            `on a different day in the captured browser timezone (${timezone}).`,
+        }),
+        dedupeKey: `displaydatetz:${timezone}:${item.label}`,
+      });
+      return;
+    }
+  }
+}
+
+// ─── currency_locale_mismatch ────────────────────────────────────────────────
+
+/**
+ * A currency symbol read against a language tag is a guess about intent, not a
+ * measurement, so it ranks below the console plane and its detail text says so
+ * outright.
+ */
+const CURRENCY_LOCALE_MISMATCH_SCORE = 52;
+/** Symbols this rule is willing to reason about. */
+const CURRENCY_SYMBOLS = new Set(["$", "€", "£", "¥"]);
+/** Language prefixes whose default presentation currency is the euro. */
+const EURO_LANGUAGE_PREFIXES = new Set(["de", "fr", "es", "it", "nl"]);
+
+/**
+ * The currency symbol a page's language tag implies.
+ *
+ * Frankly approximate: `de-CH` bills in francs and an English page can price in
+ * anything it likes. The mapping is only ever used to notice that a page
+ * declaring one locale is rendering another locale's symbol, which is the
+ * mis-localised-price defect; it is never used to assert what the price should
+ * be.
+ */
+function expectedCurrencyForLang(lang: string): string | undefined {
+  const parts = lang.trim().toLowerCase().split(/[-_]/).filter(Boolean);
+  const base = parts[0];
+  if (!base) return undefined;
+  const region = parts[1]?.toUpperCase();
+  if (EURO_LANGUAGE_PREFIXES.has(base)) return "€";
+  if (region === "EU") return "€";
+  if (base === "en" && region === "GB") return "£";
+  if (base === "ja") return "¥";
+  if (base === "en") return "$";
+  return undefined;
+}
+
+/**
+ * currency_locale_mismatch: the page declares one locale and prices in another
+ * locale's currency.
+ *
+ * Heuristic by construction, and gated to match: it needs a declared `lang`, a
+ * symbol it recognises, and either two mismatching amounts in one snapshot or
+ * the same mismatch surviving into a second snapshot. One stray symbol on one
+ * render is not enough.
+ */
+function addCurrencyLocaleMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const snapshots = events
+    .filter((event) => event.k === "ui.num")
+    .sort((a, b) => a.t - b.t);
+  if (snapshots.length === 0) return;
+
+  // (lang, rendered symbol) → the emission that first showed it.
+  const pending = new Map<string, { event: BugEvent; expected: string }>();
+  for (const event of snapshots) {
+    const lang = safeText(event.d.lang, 40);
+    if (!lang) continue;
+    const expected = expectedCurrencyForLang(lang);
+    if (!expected) continue;
+
+    const mismatched = new Map<string, number>();
+    for (const item of uiNumItems(event)) {
+      const unit = item.unit?.trim();
+      if (!unit || !CURRENCY_SYMBOLS.has(unit)) continue;
+      if (unit === expected) continue;
+      mismatched.set(unit, (mismatched.get(unit) ?? 0) + 1);
+    }
+
+    for (const [unit, count] of mismatched) {
+      const key = `${lang} ${unit}`;
+      const earlier = pending.get(key);
+      // Two amounts in one snapshot, or the same mismatch on two consecutive
+      // emissions. Either way the page is consistently rendering the wrong
+      // symbol rather than carrying one odd number.
+      if (count < 2 && !earlier) {
+        pending.set(key, { event, expected });
+        continue;
+      }
+      const anchor = earlier?.event ?? event;
+      drafts.push({
+        detector: "currency_locale_mismatch",
+        title: `Page declares lang "${lang}" but prices in ${unit}`,
+        severity: "medium",
+        score: CURRENCY_LOCALE_MISMATCH_SCORE,
+        confidence: "low",
+        anchor: removeUndefined({
+          t: anchor.t,
+          offsetMs:
+            offsetForEvent(anchor) ?? offsetFromStart(anchor.t, index.start),
+          route: routeAt(index.navs ?? [], anchor.t),
+          message: `The document declares \`lang="${lang}"\`, whose usual presentation currency is ${expected}, while ${count > 1 ? `${count} on-screen amounts render` : "the on-screen amounts render"} in ${unit}. This is a heuristic: the language a page is written in does not decide what currency it may bill in, so read this as a prompt to check the formatter, not as a proven defect.`,
+        }),
+        dedupeKey: `currencylocale:${lang}:${unit}`,
+      });
+      pending.delete(key);
+    }
+  }
+}
+
+// ─── layout_overflow ─────────────────────────────────────────────────────────
+
+/** Horizontal overflow below this many pixels is measurement noise. */
+const LAYOUT_OVERFLOW_MIN_PX = 24;
+const LAYOUT_OVERFLOW_SCORE = 56;
+/**
+ * Right-to-left layout is where horizontal overflow stops being cosmetic: a
+ * mirrored axis usually means content is running off the side the reader starts
+ * from, so it is not merely ugly, it is unreachable.
+ */
+const LAYOUT_OVERFLOW_RTL_SCORE = 70;
+
+/**
+ * layout_overflow: the document is wider than its viewport.
+ *
+ * `scrollWidth - clientWidth` is a measured number, not an opinion, which is why
+ * this carries high confidence at a modest score: the overflow certainly exists,
+ * and whether it matters depends on the design. One candidate per URL, carrying
+ * the worst measurement seen there.
+ */
+function addLayoutOverflowCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const worstByUrl = new Map<string, { event: BugEvent; overflow: number }>();
+  for (const event of events) {
+    if (event.k !== "ui.layout") continue;
+    const overflow = finiteNumber(event.d.overflowX);
+    if (overflow === undefined || overflow <= LAYOUT_OVERFLOW_MIN_PX) continue;
+    const url = safeText(event.d.url, 400) ?? "unknown URL";
+    const existing = worstByUrl.get(url);
+    if (existing && existing.overflow >= overflow) continue;
+    worstByUrl.set(url, { event, overflow });
+  }
+
+  for (const [url, worst] of worstByUrl) {
+    const dir = safeText(worst.event.d.dir, 20)?.toLowerCase() ?? "ltr";
+    const isRtl = dir === "rtl";
+    const scrollW = finiteNumber(worst.event.d.scrollW);
+    const clientW = finiteNumber(worst.event.d.clientW);
+    drafts.push({
+      detector: "layout_overflow",
+      title: `Page overflows its viewport by ${Math.round(worst.overflow)} px (dir ${dir})`,
+      severity: isRtl ? "high" : "medium",
+      score: isRtl ? LAYOUT_OVERFLOW_RTL_SCORE : LAYOUT_OVERFLOW_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: worst.event.t,
+        offsetMs:
+          offsetForEvent(worst.event) ??
+          offsetFromStart(worst.event.t, index.start),
+        route: routeAt(index.navs ?? [], worst.event.t),
+        url: redactUrl(url),
+        message: `dir=${dir}, horizontal overflow ${Math.round(worst.overflow)} px${
+          scrollW !== undefined && clientW !== undefined
+            ? ` (scrollWidth ${Math.round(scrollW)} vs clientWidth ${Math.round(clientW)})`
+            : ""
+        } at ${redactUrl(url) ?? "unknown URL"}.${
+          isRtl
+            ? " The axis is mirrored, so the overflowing edge is the one the reader starts from."
+            : ""
+        }`,
+      }),
+      dedupeKey: `layoutoverflow:${url}`,
+    });
+  }
+}
+
+// ─── stale_view_after_pop ────────────────────────────────────────────────────
+
+/** How long after a navigation the view's data call is expected to start. */
+const STALE_VIEW_REACTION_MS = 2_000;
+/**
+ * How far BEFORE a navigation event its own data call may sit and still belong
+ * to it.
+ *
+ * Routers do not commit first and fetch second. A handler typically starts the
+ * fetch and then calls `pushState`, so a live session reads
+ * `net.req /api/search?q=sonar&category=audio` at T and
+ * `nav push /search?q=sonar&category=audio` at T+100. An earlier revision
+ * required the request to land strictly AFTER the nav event and therefore
+ * concluded the view had never been shown to react at all, which silenced the
+ * detector on the exact signature it exists to catch.
+ */
+const STALE_VIEW_REACTION_LEAD_MS = 750;
+/**
+ * The same allowance on the pop side, deliberately much smaller.
+ *
+ * On this side a nearby request is a reason to STAY SILENT, so a generous
+ * lookback suppresses real findings: a call issued a second before the user
+ * pressed back was serving the previous state and says nothing about whether
+ * the pop was handled. 250 ms covers only a pop whose own fetch raced its nav
+ * event, which is the one case a lookback is here to forgive.
+ */
+const STALE_VIEW_POP_LEAD_MS = 250;
+const STALE_VIEW_SCORE = 78;
+
+/**
+ * Whether an API request plausibly serves a navigation, judged on their query
+ * strings.
+ *
+ * One shared parameter is enough — a route's `?q=sonar&category=audio` and its
+ * call's `/api/search?q=sonar&category=audio` agree on both, and a route that
+ * carries a `page` its API spells differently still agrees on the rest.
+ * Deliberately permissive in the other direction: when either side carries no
+ * query at all, or a value was redacted away, there is nothing to disagree
+ * about, so this must not veto.
+ */
+function navigationQueryRelated(
+  navUrl: URL,
+  requestUrl: string | undefined,
+): boolean {
+  const request = parseCapturedUrl(requestUrl);
+  if (!request) return true;
+  const navPairs = [...navUrl.searchParams];
+  const requestPairs = [...request.searchParams];
+  if (navPairs.length === 0 || requestPairs.length === 0) return true;
+  return navPairs.some(([name, value]) =>
+    requestPairs.some(([otherName, otherValue]) => {
+      if (normalizeFieldName(name) !== normalizeFieldName(otherName))
+        return false;
+      // A redacted value on either side is an unknown, not a disagreement.
+      if (isRedactedValue(value) || isRedactedValue(otherValue)) return true;
+      return value === otherValue;
+    }),
+  );
+}
+
+/**
+ * stale_view_after_pop: the back button changed the URL and nothing else.
+ *
+ * The same page had already proved it reacts to a parameter change — a
+ * navigation to this path with different parameters had a data call around it.
+ * Then the user pressed back, the URL changed again, and no call followed. The
+ * address bar and the screen now disagree, and the app reports nothing at all:
+ * this is the one navigation class where the router is doing its job and the
+ * view is not.
+ *
+ * The two windows are asymmetric on purpose, because finding a request means
+ * opposite things on the two sides. On the reactive side a request is what
+ * establishes the precondition, so the window reaches back far enough to catch
+ * a fetch that beat its own `pushState`. On the pop side a request is what
+ * withdraws the claim, so the window reaches back only far enough to forgive
+ * the same race, and no further.
+ */
+function addStaleViewAfterPopCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const navs = events
+    .filter(isNavigationEvent)
+    .sort((a, b) => a.t - b.t)
+    .map((event) => ({
+      event,
+      url: safeText(event.d.to, 400) ?? safeText(event.d.path, 400),
+      transition: safeText(event.d.tr, 20),
+    }))
+    .filter(
+      (
+        entry,
+      ): entry is {
+        event: BugEvent;
+        url: string;
+        transition: string | undefined;
+      } => entry.url !== undefined,
+    );
+  if (navs.length < 2) return;
+
+  const apiRequests = events
+    .filter(
+      (event) =>
+        event.k === "net.req" &&
+        looksLikeApiRequest(safeText(event.d.url, 400)),
+    )
+    .map((event) => ({ t: event.t, url: safeText(event.d.url, 400) }))
+    .sort((a, b) => a.t - b.t);
+
+  /**
+   * A data call this navigation plausibly caused: inside the window around the
+   * nav commit, and sharing something with the nav's own query string.
+   */
+  const provedReactionTo = (navAt: number, navUrl: URL): boolean =>
+    apiRequests.some(
+      (request) =>
+        request.t >= navAt - STALE_VIEW_REACTION_LEAD_MS &&
+        request.t <= navAt + STALE_VIEW_REACTION_MS &&
+        navigationQueryRelated(navUrl, request.url),
+    );
+
+  /**
+   * Any data call near the pop. Deliberately blind to the query string: on this
+   * side a request withdraws the claim, and refusing to count one because its
+   * parameters look unrelated would manufacture findings.
+   */
+  const anyRequestAroundPop = (
+    popAt: number,
+    popUrl: URL,
+    previousNavAt: number,
+  ): boolean =>
+    apiRequests.some(
+      (request) => {
+        if (
+          request.t < popAt - STALE_VIEW_POP_LEAD_MS ||
+          request.t > popAt + STALE_VIEW_REACTION_MS
+        ) {
+          return false;
+        }
+        if (request.t >= popAt) return true;
+
+        // A request that beats its own pop event only excuses the pop when its
+        // query is the state being restored. A request for the state the user
+        // is leaving commonly lands a few milliseconds before the pop too; it
+        // must not hide the stale view.
+        const requestUrl = parseCapturedUrl(request.url);
+        return (
+          request.t >= previousNavAt &&
+          requestUrl?.search === popUrl.search
+        );
+      },
+    );
+
+  for (let i = 1; i < navs.length; i += 1) {
+    const pop = navs[i];
+    if (pop.transition !== "pop") continue;
+    const previous = navs[i - 1];
+    const popUrl = parseCapturedUrl(pop.url);
+    const previousUrl = parseCapturedUrl(previous.url);
+    if (!popUrl || !previousUrl) continue;
+    // Only a parameter change: a pop to a different page is an ordinary
+    // navigation and the router owns re-mounting the view.
+    if (popUrl.pathname !== previousUrl.pathname) continue;
+    if (popUrl.search === previousUrl.search) continue;
+
+    // The same view, earlier in the session, demonstrably reacting to a
+    // different set of parameters. Without that proof the absence of a call
+    // after the pop says nothing.
+    const provedReactive = navs.slice(0, i).some((earlier) => {
+      const url = parseCapturedUrl(earlier.url);
+      if (!url) return false;
+      if (url.pathname !== popUrl.pathname) return false;
+      if (url.search === popUrl.search) return false;
+      return provedReactionTo(earlier.event.t, url);
+    });
+    if (!provedReactive) continue;
+    if (anyRequestAroundPop(pop.event.t, popUrl, previous.event.t)) continue;
+
+    drafts.push({
+      detector: "stale_view_after_pop",
+      title: `Back navigation changed the URL but the view never refetched`,
+      severity: "high",
+      score: STALE_VIEW_SCORE,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: pop.event.t,
+        offsetMs:
+          offsetForEvent(pop.event) ??
+          offsetFromStart(pop.event.t, index.start),
+        route: routeAt(index.navs ?? [], pop.event.t),
+        url: redactUrl(pop.url),
+        message: `A history pop changed the query string on ${popUrl.pathname} and no API request followed within ${STALE_VIEW_REACTION_MS} ms. An earlier navigation to this same path with different parameters did trigger one, so the view reacts to parameter changes in general — just not to this one. The URL and what is on screen now disagree.`,
+      }),
+      dedupeKey: `staleview:${popUrl.pathname}`,
+    });
+  }
+}
+
+// ─── listener_growth ─────────────────────────────────────────────────────────
+
+/** Navigations that must carry a gauge before growth is a trend rather than noise. */
+const LISTENER_GROWTH_MIN_EPOCHS = 3;
+/** Cumulative growth ratio from the first gauge to the last. */
+const LISTENER_GROWTH_MIN_RATIO = 1.5;
+/** Absolute growth floor, so a page that goes 4 → 6 listeners is not a leak. */
+const LISTENER_GROWTH_MIN_ABSOLUTE = 30;
+const LISTENER_GROWTH_SCORE = 58;
+
+/**
+ * listener_growth: event listeners accumulate across navigations and never come
+ * back down.
+ *
+ * The signature of subscribe-without-cleanup. Each page adds its handlers, none
+ * of them are removed on unmount, and the count climbs until the tab is slow and
+ * every handler runs N times. Nothing errors and nothing is slow enough to
+ * measure early — the only evidence is the shape of the curve, which is exactly
+ * what a gauge per navigation records.
+ *
+ * Requires the count to never shrink: a single drop proves cleanup runs
+ * somewhere, and a count that oscillates is a page doing its job.
+ */
+function addListenerGrowthCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const navTimes = events
+    .filter(isNavigationEvent)
+    .map((event) => event.t)
+    .sort((a, b) => a - b);
+  const gauges = events
+    .filter(
+      (event) =>
+        event.k === "ui.listeners" && finiteNumber(event.d.total) !== undefined,
+    )
+    .sort((a, b) => a.t - b.t);
+  if (gauges.length < LISTENER_GROWTH_MIN_EPOCHS) return;
+
+  // One gauge per navigation epoch — the last, which is the settled count for
+  // that page. Two gauges on one page are one observation, not two.
+  const byEpoch = new Map<number, BugEvent>();
+  for (const gauge of gauges) {
+    const epoch = navTimes.filter((t) => t <= gauge.t).length;
+    byEpoch.set(epoch, gauge);
+  }
+  const series = [...byEpoch.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, event]) => event);
+  if (series.length < LISTENER_GROWTH_MIN_EPOCHS) return;
+
+  const totals = series.map((event) => finiteNumber(event.d.total) as number);
+  for (let i = 1; i < totals.length; i += 1) {
+    if (totals[i] < totals[i - 1]) return; // cleanup ran somewhere → not a leak
+  }
+  const first = totals[0];
+  const last = totals[totals.length - 1];
+  if (last - first < LISTENER_GROWTH_MIN_ABSOLUTE) return;
+  if (first > 0 && last < first * LISTENER_GROWTH_MIN_RATIO) return;
+
+  const firstEvent = series[0];
+  const lastEvent = series[series.length - 1];
+  const growthByType = describeListenerGrowth(firstEvent, lastEvent);
+  drafts.push({
+    detector: "listener_growth",
+    title: `Event listeners grew from ${first} to ${last} across ${series.length} navigations without ever shrinking`,
+    severity: "medium",
+    score: LISTENER_GROWTH_SCORE,
+    confidence: "medium",
+    anchor: removeUndefined({
+      t: lastEvent.t,
+      offsetMs:
+        offsetForEvent(lastEvent) ?? offsetFromStart(lastEvent.t, index.start),
+      route: routeAt(index.navs ?? [], lastEvent.t),
+      url: redactUrl(safeText(lastEvent.d.url, 400)),
+      message: `First gauge: ${first} listeners at +${Math.round(offsetForEvent(firstEvent) ?? offsetFromStart(firstEvent.t, index.start) ?? 0)} ms on ${redactUrl(safeText(firstEvent.d.url, 400)) ?? "an earlier page"}. Last gauge: ${last} listeners at +${Math.round(offsetForEvent(lastEvent) ?? offsetFromStart(lastEvent.t, index.start) ?? 0)} ms on ${redactUrl(safeText(lastEvent.d.url, 400)) ?? "this page"}. The count never dropped between them${growthByType ? `; ${growthByType}` : ""}.`,
+    }),
+    dedupeKey: `listenergrowth:${safeText(lastEvent.d.url, 400) ?? "session"}`,
+  });
+}
+
+/** The listener types that account for the growth between two gauges. */
+function describeListenerGrowth(
+  first: BugEvent,
+  last: BugEvent,
+): string | undefined {
+  const before = listenerCountsByType(first);
+  const after = listenerCountsByType(last);
+  if (!before || !after) return undefined;
+  const deltas = [...after.entries()]
+    .map(([type, count]) => [type, count - (before.get(type) ?? 0)] as const)
+    .filter(([, delta]) => delta > 0)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3);
+  if (deltas.length === 0) return undefined;
+  return `largest growth by type: ${deltas.map(([type, delta]) => `${type} +${delta}`).join(", ")}`;
+}
+
+function listenerCountsByType(
+  event: BugEvent,
+): Map<string, number> | undefined {
+  const byType = event.d.byType;
+  if (!Array.isArray(byType)) return undefined;
+  const counts = new Map<string, number>();
+  for (const entry of byType) {
+    if (!Array.isArray(entry) || entry.length < 2) continue;
+    const type = safeText(entry[0], 60);
+    const count = finiteNumber(entry[1]);
+    if (!type || count === undefined) continue;
+    counts.set(type, count);
+  }
+  return counts.size > 0 ? counts : undefined;
+}
+
+/** Arrivals at one path that must show the staircase before it is a trend. */
+const LISTENER_STAIRCASE_MIN_VISITS = 3;
+/** Minimum growth for one event type across those arrivals. */
+const LISTENER_STAIRCASE_MIN_DELTA = 2;
+const LISTENER_STAIRCASE_SCORE = 70;
+
+/**
+ * The session-total check above is deliberately deaf to slow leaks: its
+ * absolute floor and ratio guard exist so a busy page's organic listener churn
+ * never reads as a defect. But the classic per-mount leak adds ONE handler per
+ * visit — an EventSource subscription, a store callback — and at one per visit
+ * the totals never clear those guards inside a normal session. Scoped to a
+ * single event type on a single path, the same staircase is high signal at a
+ * delta of two: legitimate long-lived subscriptions register once and hold
+ * flat, and cleanup that runs at all produces a dip somewhere in the series.
+ */
+function addListenerTypeStaircaseCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const byPath = new Map<
+    string,
+    Array<{ event: BugEvent; byType: Map<string, number> }>
+  >();
+  for (const event of events) {
+    if (event.k !== "ui.listeners") continue;
+    const url = safeText(event.d.url, 400);
+    if (!url) continue;
+    let path: string;
+    try {
+      path = new URL(url, "http://local").pathname;
+    } catch {
+      continue;
+    }
+    const byType = listenerCountsByType(event);
+    if (!byType) continue;
+    const bucket = byPath.get(path) ?? [];
+    bucket.push({ event, byType });
+    byPath.set(path, bucket);
+  }
+
+  for (const [path, readings] of byPath) {
+    if (readings.length < LISTENER_STAIRCASE_MIN_VISITS) continue;
+    const types = new Set<string>();
+    for (const reading of readings)
+      for (const type of reading.byType.keys()) types.add(type);
+    for (const type of types) {
+      const series = readings.map((r) => r.byType.get(type) ?? 0);
+      let monotone = true;
+      for (let i = 1; i < series.length; i += 1) {
+        if (series[i] < series[i - 1]) {
+          monotone = false;
+          break;
+        }
+      }
+      const delta = series[series.length - 1] - series[0];
+      if (!monotone || delta < LISTENER_STAIRCASE_MIN_DELTA) continue;
+      const last = readings[readings.length - 1].event;
+      drafts.push({
+        detector: "listener_growth",
+        title: `"${type}" listeners grow on every visit to ${path}`,
+        severity: "medium",
+        score: LISTENER_STAIRCASE_SCORE,
+        confidence: "medium",
+        anchor: removeUndefined({
+          t: last.t,
+          offsetMs:
+            offsetForEvent(last) ?? offsetFromStart(last.t, index.start),
+          route: routeAt(index.navs ?? [], last.t),
+          message:
+            `Across ${readings.length} arrivals at ${path}, live "${type}" listeners ` +
+            `went ${series[0]} → ${series[series.length - 1]} and never decreased. ` +
+            `A subscription made on every mount with no cleanup on unmount produces exactly ` +
+            `this staircase; each leaked handler still fires, so work is repeated once per ` +
+            `earlier visit.`,
+        }),
+        dedupeKey: `listenerstaircase:${path}:${type}`,
+      });
+    }
+  }
+}
+
+// ─── stream_desync ───────────────────────────────────────────────────────────
+
+/** How many reconnect findings one session may carry. */
+const MAX_STREAM_DESYNC_CANDIDATES = 3;
+/** A reconnect that provably skipped a change. */
+const STREAM_DESYNC_SCORE = 56;
+/** A reconnect whose replay could not be checked from the captured events. */
+const STREAM_RECONNECT_SCORE = 38;
+
+/**
+ * stream_desync: a stream dropped, came back, and never said what it missed.
+ *
+ * Server-sent events are a promise that the client will be told about changes.
+ * A reconnect breaks that promise for the length of the gap unless the server
+ * replays it, and almost none do by default. When the session also shows the
+ * underlying resource holding a different value after the gap than before, the
+ * missed change is no longer hypothetical: the client was out of date for as
+ * long as it took someone to reload.
+ *
+ * When the resource cannot be compared from the captured events the reconnect
+ * is still reported, at low severity, saying exactly that — a reconnect is worth
+ * knowing about even when the consequence cannot be proved.
+ */
+function addStreamDesyncCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const streams = new Map<string, BugEvent[]>();
+  for (const event of events) {
+    if (event.k !== "net.sse") continue;
+    const url = safeText(event.d.url, 400);
+    if (!url) continue;
+    const list = streams.get(url) ?? [];
+    list.push(event);
+    streams.set(url, list);
+  }
+  if (streams.size === 0) return;
+
+  const observations = collectResourceObservations(events, exchanges);
+  const emitted: CandidateDraft[] = [];
+
+  for (const [url, stream] of streams) {
+    stream.sort((a, b) => a.t - b.t);
+    const path = capturedUrlPath(url);
+    if (!path) continue;
+    const root = apiPrefixOf(path);
+
+    for (let i = 0; i < stream.length; i += 1) {
+      const gap = stream[i];
+      const op = safeText(gap.d.op, 20);
+      if (op !== "error" && op !== "close") continue;
+      const reopen = stream
+        .slice(i + 1)
+        .find((event) => event.d.reopen === true || event.d.reopen === 1);
+      if (!reopen) continue;
+
+      const drift = firstResourceDrift(observations, root, gap.t, reopen.t);
+      const confirmed = drift !== undefined;
+      emitted.push({
+        detector: "stream_desync",
+        title: confirmed
+          ? `Stream reconnected without replay and the resource had changed`
+          : `Stream reconnected without any replay of what it missed`,
+        severity: confirmed ? "medium" : "low",
+        score: confirmed ? STREAM_DESYNC_SCORE : STREAM_RECONNECT_SCORE,
+        confidence: confirmed ? "medium" : "low",
+        anchor: removeUndefined({
+          t: reopen.t,
+          offsetMs:
+            offsetForEvent(reopen) ?? offsetFromStart(reopen.t, index.start),
+          route: routeAt(index.navs ?? [], reopen.t),
+          url: redactUrl(url),
+          message: scrubText(
+            confirmed
+              ? `The stream ${op}d and reopened ${Math.round(reopen.t - gap.t)} ms later with no replay. Across that gap ${drift} — a change the stream never delivered, so anything rendered from it was stale until the next full read.`
+              : `The stream ${op}d and reopened ${Math.round(reopen.t - gap.t)} ms later with no replay. Whether anything changed during the gap could not be verified: the session carries no read of ${root} on both sides of it. The reconnect itself is the finding.`,
+            300,
+          ),
+        }),
+        dedupeKey: `streamdesync:${path}:${gap.t}`,
+      });
+    }
+  }
+
+  drafts.push(
+    ...emitted
+      .sort((a, b) => b.score - a.score || a.anchor.t - b.anchor.t)
+      .slice(0, MAX_STREAM_DESYNC_CANDIDATES),
+  );
+}
+
+/** One recorded value of one logical resource at one moment. */
+interface ResourceObservation {
+  /** Path used to decide whether the observation belongs to a stream's root. */
+  path: string;
+  /** Stable identity of the thing observed, so two moments are comparable. */
+  key: string;
+  t: number;
+  value: string;
+  label: string;
+}
+
+/**
+ * Every readable value of a resource in the session: response bodies, and the
+ * rows the requests behind them read. Bounded and summarized, never the raw
+ * payload.
+ */
+function collectResourceObservations(
+  events: BugEvent[],
+  exchanges: Map<string, RequestExchange>,
+): ResourceObservation[] {
+  const observations: ResourceObservation[] = [];
+  const pathByRequest = new Map<string, string>();
+
+  for (const exchange of exchanges.values()) {
+    const path = capturedUrlPath(exchange.url);
+    if (!path) continue;
+    pathByRequest.set(exchange.requestId, path);
+    if (!exchange.res || !isSuccessStatus(exchange.status)) continue;
+    const payload = responsePayload(exchange.resBody, exchange.resBodyMeta);
+    if (payload === undefined) continue;
+    observations.push({
+      path,
+      key: `res:${path}`,
+      t: exchange.res.t,
+      value: summarizeObservedValue(payload),
+      label: `the response body for ${path}`,
+    });
+  }
+
+  for (const event of events) {
+    if (event.k !== "db.read") continue;
+    if (!isRecord(event.d.row)) continue;
+    const id = correlationIdOf(event);
+    const path = id ? pathByRequest.get(id) : undefined;
+    const table = safeText(event.d.table, 200);
+    if (!path || !table) continue;
+    const pk = pkEntriesOf(event)
+      .map(([column, value]) => `${column}=${value}`)
+      .join(",");
+    observations.push({
+      path,
+      key: `row:${table}:${pk}`,
+      t: event.t,
+      value: summarizeObservedValue(event.d.row),
+      label: `${bareTableName(table)}${pk ? ` (${pk})` : ""}`,
+    });
+  }
+
+  return observations;
+}
+
+function summarizeObservedValue(value: unknown): string {
+  try {
+    return truncate(JSON.stringify(summarizePayload(value)) ?? "", 400);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The first resource under `root` whose value differs on the two sides of a
+ * stream gap, described for the candidate's detail. Undefined when nothing was
+ * observed on both sides — an absence of evidence, reported as such.
+ */
+function firstResourceDrift(
+  observations: ResourceObservation[],
+  root: string,
+  gapAt: number,
+  reopenedAt: number,
+): string | undefined {
+  const byKey = new Map<string, ResourceObservation[]>();
+  for (const observation of observations) {
+    if (!observation.path.startsWith(root)) continue;
+    const list = byKey.get(observation.key) ?? [];
+    list.push(observation);
+    byKey.set(observation.key, list);
+  }
+
+  for (const [, list] of [...byKey.entries()].sort((a, b) =>
+    a[0].localeCompare(b[0]),
+  )) {
+    list.sort((a, b) => a.t - b.t);
+    const before = [...list].reverse().find((entry) => entry.t <= gapAt);
+    const after = list.find((entry) => entry.t >= reopenedAt);
+    if (!before || !after) continue;
+    if (before.value === after.value) continue;
+    return `${before.label} changed`;
+  }
+  return undefined;
+}
+
 function collectRequests(events: BugEvent[]): Map<string, RequestInfo> {
   const requests = new Map<string, RequestInfo>();
   const navs = collectNavigationContext(events);
   for (const event of events) {
     if (event.k !== "net.req") continue;
-    // Must be the coercing read: the browser SDK emits `d.id` as a NUMBER, and
-    // `safeText` accepts strings only, so keying this map with `safeText`
-    // silently produced an empty map and every finding routed through it lost
-    // its method and URL.
-    const id = requestIdForEvent(event);
+    const id = networkRequestId(event.d.id);
     if (!id) continue;
     requests.set(
       id,
@@ -4022,6 +10569,30 @@ function codeFrameOf(entry: {
     if (match) return safeText(match[1], 300);
   }
   return undefined;
+}
+
+/**
+ * The `file:line:col` a backend error's own frames name, or undefined when the
+ * error rested without any.
+ *
+ * The innermost app frame is used because that is where the throw happened. The
+ * frames are already filtered to the host application at capture time (library,
+ * node_modules and runtime frames are dropped), so the first entry is the line
+ * a reader opens, not the driver that called it. Same output shape as
+ * {@link codeFrameOf}, and undefined for a partial location for the same
+ * reason: a file with no line is not a starting point.
+ */
+function backendErrorFrame(error: Record<string, unknown> | undefined) {
+  if (!error) return undefined;
+  const frames = error.frames;
+  if (!Array.isArray(frames)) return undefined;
+  const innermost = frames[0];
+  if (!isRecord(innermost)) return undefined;
+  return codeFrameOf({
+    file: safeText(innermost.file, 300),
+    line: finiteNumber(innermost.line),
+    col: finiteNumber(innermost.column),
+  });
 }
 
 // Normalizes an error message into a stable content signature for dedupe: lowercased, redaction
@@ -4352,6 +10923,11 @@ function renderCandidatesMarkdown(
         lines.push(`* Error code: ${candidate.anchor.errorCode}`);
       if (candidate.anchor.message)
         lines.push(`* Message: ${candidate.anchor.message}`);
+      // The file and line is the shortest path from "something broke" to an open
+      // editor, and it was reaching candidates.jsonl but not the markdown this
+      // file tells every reader to start from.
+      if (candidate.anchor.frame)
+        lines.push(`* Source: ${candidate.anchor.frame}`);
       if (candidate.anchor.elementLabel)
         lines.push(`* Element: ${candidate.anchor.elementLabel}`);
       // Causal structure (CP4): additive per-candidate lines from the CP3 re-rank fields.
@@ -5150,6 +11726,21 @@ function redactUrlLikeText(value: string): string {
 
 function redactTokenLikeText(value: string): string {
   return redactTokenLikeString(value).value;
+}
+
+/**
+ * A network event's correlation id, as a string.
+ *
+ * The browser SDK numbers its in-flight requests, so `d.id` arrives as a number
+ * on every browser captured session while a backend or a replayed session sends
+ * a string. Reading it as a string only looked correct against the backend
+ * fixtures and silently dropped every browser request on the floor, which took
+ * `slow_request`, `pending_request` and `response_race` with it: their request
+ * table was simply empty. Both shapes are valid capture, so both are accepted.
+ */
+function networkRequestId(value: unknown): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return safeText(value, 120);
 }
 
 function safeText(value: unknown, maxLength: number): string | undefined {

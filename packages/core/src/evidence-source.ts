@@ -22,7 +22,7 @@ import type { EvidenceGap, Symptom } from "./fusion";
 export const EVIDENCE_SOURCE_SCHEMA_VERSION = "evidence-source.v1" as const;
 
 /**
- * Correlation keys an adapter can filter by. The Varicent lesson: most clients
+ * Correlation keys an adapter can filter by. The field lesson: most clients
  * do not propagate a trace end-to-end, so an adapter must declare (in its
  * descriptor) which keys it can actually use and honestly report — via an
  * {@link EvidenceGap} — when a requested key is unavailable and it fell back to

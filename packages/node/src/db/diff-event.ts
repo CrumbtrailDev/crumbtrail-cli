@@ -6,6 +6,7 @@ import {
   type DbDiffOp,
   type DbEngine,
 } from "crumbtrail-core";
+import type { DbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 
 export interface BuildDbDiffEventInput {
@@ -26,6 +27,8 @@ export interface BuildDbDiffEventInput {
   sessionId?: string;
   /** Extra sensitive column names to drop, on top of {@link DEFAULT_SENSITIVE_DB_COLUMNS}. */
   redactColumns?: readonly string[];
+  /** Host application callsite that issued the write, when callsite capture is on. */
+  callsite?: DbCallsite;
   now?: number;
   sessionStartedAt?: number | Date;
 }
@@ -98,6 +101,9 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     ...(boundedAfter !== undefined ? { after: boundedAfter } : {}),
     ...(boundedBefore !== undefined ? { before: boundedBefore } : {}),
     ...(input.rowCount !== undefined ? { rowCount: input.rowCount } : {}),
+    // Not redacted: a callsite is the host's own source path and line, which is
+    // the one thing in the event that is definitionally not user data.
+    ...(input.callsite !== undefined ? { callsite: input.callsite } : {}),
   };
 
   const redaction = mergeRedactionMetadata(

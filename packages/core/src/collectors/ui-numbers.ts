@@ -1,7 +1,11 @@
 import type { EventBus } from "../event-bus";
 import type { CrumbtrailConfig, CollectorCleanup } from "../types";
-import { UI_NUM_EVENT_KIND } from "../types";
-import { classifyStructuredValue } from "../redaction";
+import { UI_LAYOUT_EVENT_KIND, UI_NUM_EVENT_KIND } from "../types";
+import {
+  attachRedactionMetadata,
+  classifyStructuredValue,
+  redactUrl,
+} from "../redaction";
 import {
   buildCaptureGapEvent,
   type BuildCaptureGapEventInput,
@@ -18,6 +22,15 @@ import { subscribeNavCommit } from "../nav-signal";
 
 /** DOM settle debounce for mutation-triggered scans. */
 export const UI_NUM_SETTLE_MS = 500;
+/**
+ * Ceiling on settle deferral. A page that mutates faster than the settle
+ * window forever — a stock ticker, an SSE feed, an animation loop — would
+ * otherwise re-arm the debounce on every mutation and the scan would starve,
+ * which blinds this collector on exactly the pages where live numbers are the
+ * evidence. Once deferral has lasted this long, the next schedule runs the
+ * scan immediately instead of waiting for quiet that never comes.
+ */
+export const UI_NUM_MAX_WAIT_MS = 1500;
 /** Hard cap on labeled tokens per region snapshot. */
 export const UI_NUM_MAX_ITEMS = 50;
 /** Labels longer than this are ignored (they are prose, not labels). */
@@ -45,22 +58,153 @@ export interface UiNumItem {
  * The element's entire trimmed text must be the token — free prose containing
  * numbers is not a labeled figure.
  */
+// The numeric core is deliberately loose here — digits (Latin or Arabic-Indic)
+// plus every separator any supported locale renders — and then normalized and
+// validated strictly below. A single US-format regex silently blinded this
+// collector for every decimal-comma shopper: de-DE's `$129,00` parsed as
+// nothing, so a German session carried zero numeric evidence.
 const NUM_TOKEN_RE =
-  /^([$€£¥])?\s*(-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?)\s*([$€£¥%])?$/;
+  /^([$€£¥])?\s*(-?[\d٠-٩۰-۹][\d٠-٩۰-۹.,٫٬\u00a0\u202f\u2009 ]*)\s*([$€£¥%])?$/;
+const ISO_DAY_TOKEN_RE = /\b(\d{4})-(\d{2})-(\d{2})\b/;
 
 /** Containers that delimit a snapshot region. */
 const REGION_SELECTOR =
   "dl, table, ul, ol, form, fieldset, section, article, aside, nav, main";
 
+/**
+ * Whether `lang` renders decimals with a comma (de-DE, fr-FR, ar-EG, …).
+ * Derived from Intl rather than a hardcoded language list; cached because the
+ * scan asks once per numeric leaf.
+ */
+const COMMA_DECIMAL_CACHE = new Map<string, boolean>();
+function usesCommaDecimal(lang: string | null): boolean {
+  if (!lang) return false;
+  const cached = COMMA_DECIMAL_CACHE.get(lang);
+  if (cached !== undefined) return cached;
+  let comma = false;
+  try {
+    for (const part of new Intl.NumberFormat(lang).formatToParts(1.1)) {
+      if (part.type === "decimal") {
+        comma = part.value === "," || part.value === "٫";
+        break;
+      }
+    }
+  } catch {
+    // Unknown language tag: keep the dot-decimal default.
+  }
+  COMMA_DECIMAL_CACHE.set(lang, comma);
+  return comma;
+}
+
+const ARABIC_INDIC_DIGIT_RE = /[٠-٩۰-۹]/g;
+const SPACE_GROUP_RE = /[\u00a0\u202f\u2009 ]/g;
+
+/**
+ * Reduces a locale-rendered numeric string to canonical `-?\d+(\.\d+)?` form,
+ * or null when the separators don't form a coherent number. When dot and comma
+ * both appear, the later one is the decimal separator (shape alone decides:
+ * `1.234,56` vs `1,234.56`). A single separator followed by exactly three
+ * digits is ambiguous (`1,234`), and the page language breaks the tie; any
+ * other single-separator shape is a decimal.
+ */
+function normalizeNumericCore(core: string, lang: string | null): string | null {
+  let text = core
+    .replace(ARABIC_INDIC_DIGIT_RE, (d) => {
+      const code = d.charCodeAt(0);
+      return String(code >= 0x06f0 ? code - 0x06f0 : code - 0x0660);
+    })
+    .replace(/٫/g, ",")
+    .replace(/٬/g, ".")
+    .replace(SPACE_GROUP_RE, "");
+
+  const sign = text.startsWith("-") ? "-" : "";
+  if (sign) text = text.slice(1);
+  if (!/^[\d.,]+$/.test(text)) return null;
+
+  const lastDot = text.lastIndexOf(".");
+  const lastComma = text.lastIndexOf(",");
+  let decimalSep: string | null = null;
+  if (lastDot !== -1 && lastComma !== -1) {
+    decimalSep = lastDot > lastComma ? "." : ",";
+  } else if (lastDot !== -1 || lastComma !== -1) {
+    const sep = lastDot !== -1 ? "." : ",";
+    const occurrences = text.split(sep).length - 1;
+    const tail = text.slice(text.lastIndexOf(sep) + 1);
+    if (occurrences > 1) {
+      decimalSep = null; // repeated separator can only be grouping
+    } else if (tail.length === 3) {
+      // Ambiguous (`1,234` / `1.234`): the page language decides which side
+      // of the Atlantic the grouping convention comes from.
+      const commaDecimal = usesCommaDecimal(lang);
+      decimalSep = sep === "," ? (commaDecimal ? "," : null) : commaDecimal ? null : ".";
+    } else if (sep === "," && tail.length > 2 && !usesCommaDecimal(lang)) {
+      // `12,3456` on a dot-decimal page is neither grouping nor money.
+      return null;
+    } else {
+      decimalSep = sep;
+    }
+  }
+
+  let integer = text;
+  let fraction = "";
+  if (decimalSep !== null) {
+    const at = text.lastIndexOf(decimalSep);
+    integer = text.slice(0, at);
+    fraction = text.slice(at + 1);
+    if (!/^\d+$/.test(fraction)) return null;
+  }
+  const groupSep = decimalSep === "," ? "." : decimalSep === "." ? "," : null;
+  if (groupSep ? integer.includes(groupSep) : /[.,]/.test(integer)) {
+    const sep = groupSep ?? (integer.includes(".") ? "." : ",");
+    if (integer.includes(sep === "." ? "," : ".")) return null;
+    const grouped = new RegExp(`^\\d{1,3}(?:\\${sep}\\d{3})+$`);
+    if (!grouped.test(integer)) return null;
+    integer = integer.split(sep).join("");
+  }
+  if (!/^\d+$/.test(integer)) return null;
+  return `${sign}${integer}${fraction ? `.${fraction}` : ""}`;
+}
+
 export function parseNumericToken(
   text: string,
+  lang: string | null = null,
 ): { value: number; unit?: string } | null {
   const match = NUM_TOKEN_RE.exec(text.trim());
   if (!match) return null;
-  const value = Number.parseFloat(match[2].replace(/,/g, ""));
+  const normalized = normalizeNumericCore(match[2], lang);
+  if (normalized === null) return null;
+  const value = Number.parseFloat(normalized);
   if (!Number.isFinite(value)) return null;
   const unit = match[1] ?? match[3];
   return unit ? { value, unit } : { value };
+}
+
+/**
+ * Convert one rendered ISO calendar day into an epoch-day number. Only direct
+ * text nodes are read, so a container is not credited with dates rendered by
+ * arbitrary descendants. The exact day remains numeric correlation evidence;
+ * sensitive labels such as DOB are rejected by the existing label gate.
+ */
+function parseRenderedIsoDay(el: Element): UiNumItem["value"] | null {
+  const directText = Array.from(el.childNodes)
+    .filter((node) => node.nodeType === 3)
+    .map((node) => node.textContent ?? "")
+    .join(" ");
+  const match = ISO_DAY_TOKEN_RE.exec(directText);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const at = Date.UTC(year, month - 1, day);
+  const parsed = new Date(at);
+  if (
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return Math.floor(at / 86_400_000);
 }
 
 /**
@@ -288,16 +432,21 @@ export function scanUiNumbers(
   root: Element,
   denyFields?: string[],
   maxElements: number = UI_NUM_MAX_SCAN_ELEMENTS,
+  lang: string | null = null,
 ): Map<string, UiNumItem[]> | null {
   const elements = root.querySelectorAll("*");
   if (elements.length > maxElements) return null;
   const regions = new Map<string, UiNumItem[]>();
   for (const el of elements) {
-    if (!isLeaf(el)) continue;
     const tag = el.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") continue;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") continue;
-    const parsed = parseNumericToken(el.textContent ?? "");
+    const renderedDay = parseRenderedIsoDay(el);
+    if (!isLeaf(el) && renderedDay === null) continue;
+    const parsed =
+      renderedDay === null
+        ? parseNumericToken(el.textContent ?? "", lang)
+        : { value: renderedDay, unit: "iso-day" };
     if (!parsed) continue;
     if (isHiddenElement(el)) continue;
     const label = resolveLabel(el);
@@ -322,6 +471,154 @@ export function scanUiNumbers(
     items.push(item);
   }
   return regions;
+}
+
+/**
+ * Locale attributes that decide how the numbers above are rendered and read.
+ * A page serving `lang="de"` while formatting `1,234.56` is a real defect that
+ * neither lane can show alone, so both `ui.num` and `ui.layout` carry them.
+ */
+function readLocale(): { dir: string; lang: string | null } {
+  try {
+    const root = document.documentElement;
+    return {
+      dir: document.dir || root?.dir || "ltr",
+      lang: root?.lang || null,
+    };
+  } catch {
+    return { dir: "ltr", lang: null };
+  }
+}
+
+interface RtlPhysicalRule {
+  source?: string;
+  properties: string[];
+  matched: number;
+}
+
+const RTL_PHYSICAL_RULE_LIMIT = 8;
+const RTL_PHYSICAL_PROPERTIES = [
+  "left",
+  "right",
+  "margin-left",
+  "margin-right",
+  "padding-left",
+  "padding-right",
+  "border-left",
+  "border-right",
+];
+
+function asymmetricFourValueShorthand(
+  style: CSSStyleDeclaration,
+  property: "margin" | "padding",
+): boolean {
+  const tokens = style
+    .getPropertyValue(property)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  return tokens.length === 4 && tokens[1] !== tokens[3];
+}
+
+/**
+ * Under RTL, active author rules that use physical left/right properties are
+ * the evidence document-level overflow cannot provide. The scan is bounded,
+ * same-origin only, and records no selector or page text.
+ */
+function readRtlPhysicalRules(): RtlPhysicalRule[] {
+  const output: RtlPhysicalRule[] = [];
+  const visit = (rules: CSSRuleList, source?: string): void => {
+    for (const rule of Array.from(rules)) {
+      if (output.length >= RTL_PHYSICAL_RULE_LIMIT) return;
+      // Modern Chromium exposes `cssRules` on CSSStyleRule for native CSS
+      // nesting. A style rule must be inspected before the grouping-rule path,
+      // or every ordinary rule is mistaken for an empty container.
+      if (!(rule instanceof CSSStyleRule) && "cssRules" in rule) {
+        try {
+          visit((rule as CSSGroupingRule).cssRules, source);
+        } catch {
+          // Inaccessible nested rule: skip it.
+        }
+        continue;
+      }
+      if (!(rule instanceof CSSStyleRule)) continue;
+      let matched = 0;
+      try {
+        matched = document.querySelectorAll(rule.selectorText).length;
+      } catch {
+        continue;
+      }
+      if (matched === 0) continue;
+      const cssText = rule.style.cssText.toLowerCase();
+      if (/(?:^|;)\s*(?:inset|margin|padding|border)-inline/.test(cssText))
+        continue;
+      // CSSStyleDeclaration expands `margin: 0` into both margin-left and
+      // margin-right. Read the authored declaration text so symmetric
+      // shorthands do not fill the bounded result with false physical rules.
+      const properties = RTL_PHYSICAL_PROPERTIES.filter((property) =>
+        new RegExp(`(?:^|;)\\s*${property}\\s*:`).test(cssText),
+      );
+      if (asymmetricFourValueShorthand(rule.style, "margin"))
+        properties.push("margin");
+      if (asymmetricFourValueShorthand(rule.style, "padding"))
+        properties.push("padding");
+      if (properties.length === 0) continue;
+      output.push({
+        ...(source ? { source } : {}),
+        properties: [...new Set(properties)].sort(),
+        matched: Math.min(matched, 100),
+      });
+    }
+  };
+
+  for (const sheet of Array.from(document.styleSheets).slice(0, 20)) {
+    if (output.length >= RTL_PHYSICAL_RULE_LIMIT) break;
+    try {
+      const href = sheet.href
+        ? redactUrl(sheet.href, "stylesheet").value
+        : undefined;
+      visit(sheet.cssRules, href);
+    } catch {
+      // Cross-origin stylesheets intentionally expose no cssRules.
+    }
+  }
+  return output;
+}
+
+/**
+ * One small measurement per navigation: document geometry plus locale. It is
+ * what turns "the layout is broken on this screen" into evidence — horizontal
+ * overflow is invisible to every other lane, and it is the usual outcome of a
+ * long translated label or an RTL locale meeting a fixed-width column.
+ * Emitted unconditionally; deciding what counts as significant is the
+ * detector's job, not the SDK's.
+ */
+function emitLayout(bus: EventBus): void {
+  try {
+    const root = document?.documentElement;
+    if (!root) return;
+    const scrollW = root.scrollWidth ?? 0;
+    const clientW = root.clientWidth ?? 0;
+    const locale = readLocale();
+    const href = typeof window !== "undefined" ? window.location.href : "";
+    const urlResult = href ? redactUrl(href, "url") : undefined;
+    const d: Record<string, unknown> = {
+      dir: locale.dir,
+      lang: locale.lang,
+      scrollW,
+      clientW,
+      overflowX: Math.max(0, scrollW - clientW),
+    };
+    if (urlResult) d.url = urlResult.value;
+    if (locale.dir.toLowerCase() === "rtl") {
+      const rtlPhysical = readRtlPhysicalRules();
+      if (rtlPhysical.length > 0) d.rtlPhysical = rtlPhysical;
+    }
+    attachRedactionMetadata(d, urlResult?.metadata);
+    bus.emit({ t: now(), k: UI_LAYOUT_EVENT_KIND, d });
+  } catch {
+    // A failed measurement must not take the numeric scan down with it.
+  }
 }
 
 export function uiNumbersCollector(
@@ -361,12 +658,16 @@ function startUiNumbersCollector(
   denyFields?: string[],
 ): CollectorCleanup {
   let disabled = false;
+  let layoutPending = true;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  // When the current run of deferrals began; undefined between bursts.
+  let deferredSince: number | undefined;
   // Previous serialized snapshot per region: emit only on change.
   const lastSnapshot = new Map<string, string>();
   let observer: MutationObserver | undefined;
   // Assigned after observer setup; `let` so `disable` (defined first, callable
   // from the observer-setup catch) can release it without a TDZ reference.
+  // eslint-disable-next-line prefer-const
   let unsubscribeNav: (() => void) | undefined;
 
   // Failure policy: the collector self-disables inside its own scan path and
@@ -402,8 +703,23 @@ function startUiNumbersCollector(
 
   const runScan = (): void => {
     if (disabled) return;
+    deferredSince = undefined;
+    // Layout is measured once per navigation, not once per DOM settle: it
+    // describes the view, and a mutation-driven rescan would repeat it.
+    if (layoutPending) {
+      layoutPending = false;
+      emitLayout(bus);
+    }
     try {
-      const regions = scanUiNumbers(document.body, denyFields);
+      // Locale first: the page language decides how ambiguous separators in
+      // rendered numbers are read (`1,234` is a thousand in en, 1.234 in de).
+      const locale = readLocale();
+      const regions = scanUiNumbers(
+        document.body,
+        denyFields,
+        UI_NUM_MAX_SCAN_ELEMENTS,
+        locale.lang,
+      );
       if (regions === null) {
         // Over budget: the page has too many elements to scan safely on the
         // 500ms cadence. Permanently disable rather than emit a partial (and
@@ -423,7 +739,7 @@ function startUiNumbersCollector(
         bus.emit({
           t: now(),
           k: UI_NUM_EVENT_KIND,
-          d: { region, items },
+          d: { region, items, lang: locale.lang, dir: locale.dir },
         });
       }
     } catch (error) {
@@ -433,8 +749,14 @@ function startUiNumbersCollector(
 
   const scheduleScan = (): void => {
     if (disabled) return;
+    const at = now();
+    if (deferredSince === undefined) deferredSince = at;
     if (settleTimer !== undefined) clearTimeout(settleTimer);
-    settleTimer = setTimeout(runScan, UI_NUM_SETTLE_MS);
+    // Deferral ceiling: under continuous mutation (a ticker, a stream) the
+    // settle window re-arms forever, so once deferral has lasted
+    // UI_NUM_MAX_WAIT_MS the scan runs now instead of waiting for quiet.
+    const wait = at - deferredSince >= UI_NUM_MAX_WAIT_MS ? 0 : UI_NUM_SETTLE_MS;
+    settleTimer = setTimeout(runScan, wait);
   };
 
   try {
@@ -454,7 +776,18 @@ function startUiNumbersCollector(
   // view's DOM is read after it renders. Uses the shared nav-commit signal —
   // never a private history.pushState wrap — so multiple collectors can
   // observe navigation without corrupting each other's teardown.
-  unsubscribeNav = subscribeNavCommit(() => scheduleScan());
+  unsubscribeNav = subscribeNavCommit(() => {
+    // A route change is a new view, so the change-suppression state from the
+    // old one has to go. Region identifiers are structural ("main", "dl.totals",
+    // "table#cart") and repeat across routes, so without this the first
+    // snapshot of a new page is silently dropped whenever it happens to match
+    // the page before it — /cart and /checkout showing the same total emitted
+    // nothing at all for /checkout. Suppression is meant to squash repeats
+    // during DOM churn inside one view, never to hide a view.
+    lastSnapshot.clear();
+    layoutPending = true;
+    scheduleScan();
+  });
 
   // Initial navigation commit (page load): scan after the settle window.
   scheduleScan();

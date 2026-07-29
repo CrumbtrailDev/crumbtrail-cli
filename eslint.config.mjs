@@ -10,6 +10,7 @@ export default tseslint.config(
       "**/node_modules/**",
       "**/*.d.ts",
       "packages/tauri/rust/**",
+      ".claude/worktrees/**",
       ".husky/**",
       "tmp/**",
     ],

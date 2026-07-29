@@ -145,6 +145,20 @@ export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
 export const UI_NUM_EVENT_KIND = "ui.num" as const;
 
 /**
+ * Canonical event kind for the live event-listener gauge (`k:'ui.listeners'`).
+ * Payload: `{ total, byType: [[type, count], …], url }` — counts only, never a
+ * reference to a target or a listener.
+ */
+export const UI_LISTENERS_EVENT_KIND = "ui.listeners" as const;
+
+/**
+ * Canonical event kind for the per-navigation layout probe (`k:'ui.layout'`).
+ * Payload: `{ dir, lang, scrollW, clientW, overflowX, url }` — document
+ * geometry and locale attributes, never content.
+ */
+export const UI_LAYOUT_EVENT_KIND = "ui.layout" as const;
+
+/**
  * Type specific payload (`d`) of a `k:'capture_gap'` event. `detail` is deliberately a bounded,
  * redacted diagnostic descriptor such as an error name, table and operation, or leading SQL
  * keyword. It must never contain raw SQL values or other user data.
@@ -232,6 +246,22 @@ export interface DbReadEventData {
   pk: Record<string, unknown> | null;
   row: Record<string, unknown>;
   requestId: string;
+  /**
+   * 1-based ordinal of the SELECT statement within this request.
+   *
+   * Rows are emitted one event each, so without it N single-row SELECTs and one
+   * SELECT returning N rows produce byte-identical evidence — and the whole
+   * point of an N+1 finding is telling those two apart.
+   */
+  stmt?: number;
+  /**
+   * Resolved LIMIT/OFFSET window the statement ran with, when the adapter
+   * could parse one. Pagination arithmetic bugs live entirely in this shape: a
+   * first-page request whose SELECT ran `OFFSET 1` drops the first row of the
+   * table's order from every page without a single error, and only comparing
+   * this window against the request's own paging parameters can say so.
+   */
+  q?: { limit?: number; offset?: number };
   redaction?: unknown;
 }
 
@@ -280,6 +310,8 @@ export interface EnvSnapshot {
   viewport?: { w: number; h: number };
   locale?: string;
   timezone?: string;
+  /** Public client release identity declared by `<meta name="app-build">`. */
+  appBuild?: string;
   /** Redacted feature flags declared via `setEnv`. */
   flags?: Record<string, unknown>;
   /** Redacted runtime config declared via `setEnv`. */
@@ -351,10 +383,17 @@ export interface CrumbtrailConfig {
    * - `denyFields`: extra field names added to the redaction deny list,
    *   matched as substrings of the compacted (lowercased, alphanumeric-only)
    *   field name — same semantics as the built-in deny tokens.
+   * - `keepFields`: field names exempted from the name-based deny rules and
+   *   from the free-text catch-all, matched on the whole compacted name rather
+   *   than as a substring. Use it when the submitted text IS the defect (a
+   *   review body, a search term, a mangled address line) and a shape
+   *   placeholder would tell an agent nothing. Value-based detection still
+   *   runs inside a kept field, and a `denyFields` entry wins over a keep.
    */
   redaction?: {
     mode?: "structured" | "full";
     denyFields?: string[];
+    keepFields?: string[];
   };
 
   // Interaction
@@ -430,6 +469,12 @@ export interface CrumbtrailConfig {
 
   // Labeled on-screen numeric snapshots (`k:'ui.num'`)
   uiNumbers: boolean;
+
+  // Live event-listener gauge (`k:'ui.listeners'`)
+  listeners: boolean;
+
+  // Server-sent events lifecycle (`k:'net.sse'`)
+  eventSource: boolean;
 
   // Environment snapshot
   environment: boolean;
@@ -588,6 +633,10 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
 
   uiNumbers: true,
 
+  listeners: true,
+
+  eventSource: true,
+
   environment: true,
 
   widget: false,
@@ -654,6 +703,8 @@ export const PRESET_LIGHT: Partial<CrumbtrailConfig> = {
   performance: false,
   // Full-DOM numeric scans are against LIGHT's minimal-overhead posture.
   uiNumbers: false,
+  // So is a patch on the hottest DOM method there is.
+  listeners: false,
 };
 
 // Embedded end-user monitoring: no widget, but silently auto-capture the reproduction window

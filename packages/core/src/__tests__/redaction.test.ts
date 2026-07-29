@@ -748,6 +748,40 @@ describe("redactValue", () => {
     const result = redactValue({ password: "hunter2" }, "custom.root");
     expect(result.metadata?.fields[0].path).toBe("custom.root.password");
   });
+
+  // A Date has no own enumerable properties, so the generic object walk turns
+  // every timestamp column into `{}`. Timestamps are the columns an ordering or
+  // timing question is answered with, and rows that differ only by one collapse
+  // to a single value, which reads downstream as duplicate work that never
+  // happened.
+  it("keeps Date values as ISO timestamps rather than empty objects", () => {
+    const result = redactValue({
+      created_at: new Date("2026-07-28T06:16:57.484Z"),
+    });
+
+    expect(result.value).toEqual({ created_at: "2026-07-28T06:16:57.484Z" });
+  });
+
+  it("keeps Date values distinct inside nested rows", () => {
+    const result = redactValue({
+      rows: [
+        { id: 1, created_at: new Date("2026-07-28T06:00:00.000Z") },
+        { id: 2, created_at: new Date("2026-07-28T06:00:01.000Z") },
+      ],
+    });
+
+    expect(result.value).toEqual({
+      rows: [
+        { id: 1, created_at: "2026-07-28T06:00:00.000Z" },
+        { id: 2, created_at: "2026-07-28T06:00:01.000Z" },
+      ],
+    });
+  });
+
+  it("represents an invalid Date without throwing", () => {
+    const result = redactValue({ created_at: new Date(Number.NaN) });
+    expect(result.value).toEqual({ created_at: null });
+  });
 });
 
 describe("mergeRedactionMetadata", () => {

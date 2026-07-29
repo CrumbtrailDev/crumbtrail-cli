@@ -8,6 +8,7 @@ import {
   redactNetworkTextBody,
   redactTokenLikeString,
   redactUrl,
+  setRedactionKeepFields,
 } from "crumbtrail-core";
 import type { EvidenceCandidate } from "./evidence-index";
 import type { LlmBundle, LlmBundleRedactionSummary } from "./llm-bundle";
@@ -554,6 +555,50 @@ function compressColdEvents(input: Buffer): Buffer {
   return zlib.zstdCompressSync(input);
 }
 
+/**
+ * Field names the operator has declared product content rather than personal data.
+ *
+ * The rules below are name-based and table-blind: `SENSITIVE_NAME_RE` contains the
+ * literal token `body`, so `payments.body` (a raw gateway payload) and
+ * `reviews.body` (the shopper text that IS the defect on a stored-XSS ticket) are
+ * treated identically, and both rest as `[REDACTED]`. Same for `email` on a
+ * duplicate-account bug and `postal` on an address-validation bug. The evidence
+ * that explains those defects is destroyed by the policy meant to protect it, and
+ * until now there was no way to say otherwise.
+ *
+ * This is the keep half of the client-controlled capture policy. Deliberately
+ * opt-in, process-wide, and narrow: it exempts a name from the *name-based* rules
+ * only. Value-based detection still runs, so a token or a card number pasted into
+ * a kept field is still caught, and a non-primitive is still swept whole.
+ */
+let keepFieldNames: Set<string> = new Set();
+
+function normalizeFieldName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Replaces the keep list. Pass an empty list to restore deny-biased defaults. */
+export function setStorageKeepFields(names: readonly string[] = []): void {
+  keepFieldNames = new Set(
+    names
+      .filter((name) => typeof name === "string" && name.trim())
+      .map(normalizeFieldName),
+  );
+  // The URL paths in crumbtrail-core read their policy from module scope, so
+  // one call configures both halves. Without this a name would be kept in a
+  // db.diff row and still `[REDACTED]` in the query string that produced it.
+  setRedactionKeepFields([...keepFieldNames]);
+}
+
+/** The active keep list, for reporting it back in a capture-policy summary. */
+export function getStorageKeepFields(): string[] {
+  return [...keepFieldNames].sort();
+}
+
+function isKeptFieldName(key: string): boolean {
+  return keepFieldNames.size > 0 && keepFieldNames.has(normalizeFieldName(key));
+}
+
 function sanitizeValue(value: unknown, fieldPath: string): unknown {
   if (typeof value === "string") {
     if (isSafeSdkDescriptorValue(fieldPath, value)) return value;
@@ -598,6 +643,18 @@ function sanitizeRecord(
       out[safeKey] = sanitizeStructuredBody(raw);
       continue;
     }
+    if (key === "bodyMeta" && fieldPath === "event.d") {
+      out[safeKey] = sanitizeBodyMeta(raw, value);
+      continue;
+    }
+    // An operator-declared keep exempts this name from the name-based rules, but
+    // only for a primitive: a nested object could carry anything, so it still
+    // goes through sanitizeValue below and is swept in full.
+    if (isKeptFieldName(key) && (typeof raw !== "object" || raw === null)) {
+      out[safeKey] =
+        typeof raw === "string" ? sanitizeString(raw, childPath) : raw;
+      continue;
+    }
     if (
       (isSensitiveName(key) && !isSafeMetadataField(key)) ||
       isSensitiveField(childPath) ||
@@ -629,12 +686,67 @@ function declaresStructuredBodyRedaction(
   );
 }
 
+/**
+ * `net.res` `d.bodyMeta` is the response-body summary the browser SDK derives
+ * from the ALREADY REDACTED body text: `{ct, bytes?, truncated?, data?,
+ * arrayTotal?}`. Its key contains the literal token `body`, so the name-based
+ * rule would sweep the whole envelope to `[REDACTED]` and destroy the size and
+ * shape facts detectors join against.
+ *
+ * The envelope (media type, byte count, truncation flags, true array lengths)
+ * carries no captured values, so it is validated structurally and kept
+ * regardless of declaration. `data` DOES carry values — the parsed view of the
+ * redacted body — so it is held to the same standard as `d.body`: kept only
+ * when the emitting SDK declared structured (v2) redaction, and then re-swept
+ * by the generic sanitizer, so a client that lies about its policy still
+ * cannot store secrets through the summary.
+ */
+function sanitizeBodyMeta(
+  raw: unknown,
+  eventData: Record<string, unknown>,
+): unknown {
+  if (!isRecord(raw)) return REDACTED_VALUE;
+  const ct =
+    typeof raw.ct === "string" && /^[a-z0-9!#$&^_+./-]{1,80}$/.test(raw.ct)
+      ? raw.ct
+      : undefined;
+  if (ct === undefined) return REDACTED_VALUE;
+  const out: Record<string, unknown> = { ct };
+  const bytes = finiteNumber(raw.bytes);
+  if (bytes !== undefined && bytes >= 0) out.bytes = bytes;
+  if (raw.truncated === true) out.truncated = true;
+  if (isRecord(raw.arrayTotal)) {
+    const totals: Record<string, number> = {};
+    for (const [totalPath, totalValue] of Object.entries(raw.arrayTotal)) {
+      if (Object.keys(totals).length >= MAX_BODY_META_ARRAY_TOTALS) break;
+      const total = finiteNumber(totalValue);
+      if (total === undefined || total < 0) continue;
+      if (!/^\$[A-Za-z0-9_.$[\]]{0,120}$/.test(totalPath)) continue;
+      totals[totalPath] = total;
+    }
+    if (Object.keys(totals).length > 0) out.arrayTotal = totals;
+  }
+  if (raw.data !== undefined && declaresStructuredBodyRedaction(eventData)) {
+    out.data = sanitizeValue(raw.data, "event.d.bodyMeta.data");
+  }
+  return out;
+}
+
+const MAX_BODY_META_ARRAY_TOTALS = 32;
+
 function sanitizeStructuredBody(body: string): string {
   try {
     const result = redactNetworkTextBody(body, {
       contentType: "application/json",
       path: "event.d.body",
       mode: "structured",
+      // The server's keep list, not the client's declaration. The re-run is a
+      // re-classification, so it has to be told the same exception the rest of
+      // this sanitizer honors, or a field the operator declared keepable is
+      // kept in db.diff and placeholdered in the request body that caused it.
+      ...(keepFieldNames.size > 0
+        ? { keepFields: getStorageKeepFields() }
+        : {}),
     });
     if (
       typeof result.body === "string" &&
@@ -942,6 +1054,10 @@ const SAFE_CORRELATION_VALUE_FIELD_NAMES = new Set([
   "parentSpanId",
 ]);
 const SAFE_METADATA_FIELD_NAMES = new Set([
+  // Derived summary envelope of the redacted response body; admitted through
+  // its own declaration-gated branch in sanitizeRecord, and listed here so the
+  // path-segment sensitivity check does not sweep its descendants wholesale.
+  "bodyMeta",
   "bodySummary",
   "hrefSummary",
   "newValSummary",

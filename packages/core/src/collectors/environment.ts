@@ -61,9 +61,31 @@ export function buildEnvSnapshot(
   const timezone = safeTimezone();
   if (timezone) snapshot.timezone = timezone;
 
+  const appBuild = safeAppBuild();
+  if (appBuild) snapshot.appBuild = appBuild;
+
   applyDeclaredEnv(snapshot, flags, config);
 
   return snapshot;
+}
+
+/**
+ * Build identifiers stamped into public HTML are release metadata rather than
+ * user data. Keep only the conventional token-safe form and bound it tightly.
+ */
+function safeAppBuild(): string | undefined {
+  try {
+    if (typeof document === "undefined") return undefined;
+    const value = document
+      .querySelector('meta[name="app-build"]')
+      ?.getAttribute("content")
+      ?.trim();
+    return value && /^[A-Za-z0-9._-]{1,120}$/.test(value)
+      ? value
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

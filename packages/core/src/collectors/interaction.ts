@@ -80,11 +80,33 @@ function describeFrameContext(url: string): Record<string, unknown> {
   });
 }
 
+/**
+ * How this document was reached, per the Navigation Timing API:
+ * "navigate" | "reload" | "back_forward" | "prerender".
+ *
+ * `tr: "init"` covers every first load, so a back/forward that reloads the
+ * document (a multi-page app, or an SPA entered through a hard navigation)
+ * looks exactly like a fresh visit. This field is what separates them, without
+ * changing what `tr` means.
+ */
+function readDocumentNavType(): string | undefined {
+  try {
+    const entries = performance?.getEntriesByType?.("navigation");
+    const type = (entries?.[0] as PerformanceNavigationTiming | undefined)
+      ?.type;
+    return typeof type === "string" && type ? type : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function interactionCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
 ): CollectorCleanup {
   const cleanups: Array<() => void> = [];
+  const inputVersions = new WeakMap<Element, number>();
+  const observationTimers = new Set<ReturnType<typeof setTimeout>>();
 
   // --- Clicks ---
   const onClick = (e: MouseEvent) => {
@@ -113,8 +135,18 @@ export function interactionCollector(
   cleanups.push(() => document.removeEventListener("click", onClick, true));
 
   // --- Input / Change ---
-  const onInput = (e: Event) => {
-    const target = e.target;
+  const isInputControl = (
+    target: EventTarget | null,
+  ): target is HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement =>
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement;
+
+  const emitInputState = (
+    target: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
+    eventType: string,
+    trusted: boolean,
+  ) => {
     if (!(
       target instanceof HTMLInputElement ||
       target instanceof HTMLTextAreaElement ||
@@ -138,7 +170,11 @@ export function interactionCollector(
     const d: Record<string, unknown> = {
       el,
       val: val.value,
-      ev: e.type as "input" | "change",
+      ev: eventType,
+      // A user typing produces a trusted event; a script assigning `.value`
+      // and dispatching its own does not. That is the difference between the
+      // user entering the wrong thing and the app overwriting what they typed.
+      trusted,
     };
     if (val.summary) d.valSummary = val.summary;
     attachRedactionMetadata(d, readDescriptorMetadata(el), val.metadata);
@@ -148,6 +184,59 @@ export function interactionCollector(
       k: "inp",
       d,
     });
+  };
+
+  const observeSilentValueChange = (
+    target: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement,
+    expectedValue: string,
+    version: number,
+    delayMs: number,
+  ) => {
+    const timer = setTimeout(() => {
+      observationTimers.delete(timer);
+      let observed = target;
+      if (!observed.isConnected) {
+        // Frameworks often express a failed-submit reset by remounting the
+        // entire form. Find the replacement control by stable, non-value
+        // attributes so that a remount does not erase the observation too.
+        const name = target.getAttribute("name");
+        const id = target.getAttribute("id");
+        if (name || id) {
+          observed = Array.from(
+            document.querySelectorAll<
+              HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
+            >("input, textarea, select"),
+          ).find(
+            (candidate) =>
+              candidate.tagName === target.tagName &&
+              candidate.getAttribute("type") === target.getAttribute("type") &&
+              (name
+                ? candidate.getAttribute("name") === name
+                : candidate.getAttribute("id") === id),
+          ) ?? target;
+        }
+      } else if ((inputVersions.get(observed) ?? 0) !== version) {
+        return;
+      }
+      if (!observed.isConnected || observed.value === expectedValue) return;
+      // React and browser autofill commonly assign the value property without
+      // dispatching an input event. Emit a privacy scrubbed state observation
+      // so a detector can distinguish the app taking a value back from the
+      // user's own next keystroke.
+      emitInputState(observed, "state", false);
+    }, delayMs);
+    observationTimers.add(timer);
+  };
+
+  const onInput = (e: Event) => {
+    const target = e.target;
+    if (!isInputControl(target)) return;
+    const version = (inputVersions.get(target) ?? 0) + 1;
+    inputVersions.set(target, version);
+    emitInputState(target, e.type, e.isTrusted === true);
+    if (e.isTrusted === true) {
+      observeSilentValueChange(target, target.value, version, 450);
+    }
   };
   document.addEventListener("input", onInput, true);
   document.addEventListener("change", onInput, true);
@@ -167,6 +256,7 @@ export function interactionCollector(
       el,
       val: "",
       ev: "submit",
+      trusted: e.isTrusted === true,
     };
     attachRedactionMetadata(d, readDescriptorMetadata(el));
 
@@ -175,6 +265,15 @@ export function interactionCollector(
       k: "inp",
       d,
     });
+
+    // A failed submit can remount or reset the whole form without dispatching
+    // an input event. Snapshot each value now, then emit only controls whose
+    // value the application changed while handling the response.
+    for (const control of target.querySelectorAll("input, textarea, select")) {
+      if (!isInputControl(control)) continue;
+      const version = inputVersions.get(control) ?? 0;
+      observeSilentValueChange(control, control.value, version, 700);
+    }
   };
   document.addEventListener("submit", onSubmit, true);
   cleanups.push(() => document.removeEventListener("submit", onSubmit, true));
@@ -189,6 +288,7 @@ export function interactionCollector(
       from: fromResult?.value ?? "",
       to: toResult.value,
       tr,
+      navType: tr === "init" ? readDocumentNavType() : undefined,
       fromOrigin: from ? readSafeOrigin(from) : undefined,
       toOrigin: readSafeOrigin(to),
       frame: describeFrameContext(to),
@@ -214,6 +314,8 @@ export function interactionCollector(
   );
 
   return () => {
+    for (const timer of observationTimers) clearTimeout(timer);
+    observationTimers.clear();
     for (const fn of cleanups) fn();
   };
 }
