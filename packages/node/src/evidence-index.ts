@@ -605,6 +605,13 @@ export function buildEvidenceCandidates(
   addConcurrentDuplicateMutationCandidates(events, index, drafts, mutatingRequests);
   addDbDeltaMismatchCandidates(events, index, drafts, mutatingRequests);
   addClientSuppliedValueCandidates(events, index, drafts, mutatingRequests);
+  addUnrequestedClearCandidates(events, index, drafts, mutatingRequests);
+  addResponseCountMismatchCandidates(events, index, drafts, mutatingRequests);
+  addRetryLoopAgainstSuccessCandidates(events, index, drafts);
+  addWriteReadColumnSplitCandidates(events, index, drafts);
+  addEmptyDownloadCandidates(events, index, drafts, requestById);
+  addContentTypeBodyMismatchCandidates(events, index, drafts, requestById);
+  addLatencyOutlierCandidates(events, index, drafts, requestById);
   addIneffectiveInputCandidates(events, index, drafts, mutatingRequests);
   addUiArithmeticMismatchCandidates(events, index, drafts);
   addUiApiDivergenceCandidates(events, index, drafts);
@@ -3044,6 +3051,644 @@ function addClientSuppliedValueCandidates(
             source: normalizeDbEngine(diff.d.engine),
           }),
           dedupeKey: `dbclientvalue:${requestId}:${table}:${field}`,
+        });
+      }
+    }
+  }
+}
+
+/** Case- and separator-insensitive field key, so `dueDate` and `due_date` are one name. */
+function fieldNameKey(name: string): string {
+  return name.replace(/[_\-\s]/g, "").toLowerCase();
+}
+
+/** Every field name a request body mentions, at any nesting depth, normalized. */
+function bodyFieldNames(body: unknown): Set<string> {
+  const names = new Set<string>();
+  for (const scope of collectObjectScopes(body)) {
+    for (const key of Object.keys(scope)) names.add(fieldNameKey(key));
+  }
+  return names;
+}
+
+/** True for the empty end of a clear: null, undefined, or the empty string. */
+function isClearedValue(value: unknown): boolean {
+  return value === null || value === undefined || value === "";
+}
+
+/**
+ * db_unrequested_clear: a partial update destroyed a column the request never
+ * named.
+ *
+ * The real case: a task form loaded before another user saved a description,
+ * then PATCHed `{"status":"in_progress"}`. The route wrote the whole row back
+ * from its stale model, so `tasks.description` went from
+ * 'Acceptance criteria written by Alice' to null in the same statement. The
+ * write succeeds, the response is 200, and the row is internally consistent —
+ * the data loss is visible only by reading the request body next to the diff.
+ * This is the shape of every lost-update bug, and no existing detector sees it:
+ * `db_field_divergence` and `db_delta_mismatch` compare database rows to each
+ * other, and `db_client_supplied_value` looks at what a body PUT IN, not at
+ * what a body never asked to take out.
+ *
+ * Silent on ambiguity, by these guards:
+ *  - body and diff must share a request id, and the body must parse as JSON —
+ *    a redacted or opaque body cannot establish what was not named;
+ *  - the diff must be an update carrying a `before` snapshot. An insert clears
+ *    nothing, and without `before` there is no clear to observe;
+ *  - the column must go from a non-empty value to empty. A column that merely
+ *    changed (a counter, a server-computed status) is the ordinary business of
+ *    a write;
+ *  - identity and clock columns are excluded — a route rewriting `updated_at`
+ *    without being asked is correct behavior;
+ *  - the body must name at least one column the written row actually HAS.
+ *    That is what makes this a partial update of the row the request
+ *    addressed, rather than a server-side lifecycle write (a lock released, an
+ *    error message reset) that merely shares a request id. Deliberately NOT
+ *    "a named column must have CHANGED": in the captured case `status` was
+ *    already `in_progress`, so the write's only effect was the data loss —
+ *    the purest form of the bug, and the form that guard would have missed.
+ */
+function addUnrequestedClearCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  mutatingRequests: Map<string, CorrelatedRequest>,
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    const request = mutatingRequests.get(requestId);
+    if (!request) continue;
+    const parsed = parseStructuredBody(request.body);
+    if (parsed === undefined) continue;
+    const named = bodyFieldNames(parsed);
+    if (named.size === 0) continue;
+
+    for (const diff of diffs) {
+      if (safeText(diff.d.op, 20)?.toLowerCase() !== "update") continue;
+      const table = safeText(diff.d.table, 200);
+      const after = diff.d.after;
+      const before = diff.d.before;
+      if (!table || !isRecord(after) || !isRecord(before)) continue;
+
+      const cleared: string[] = [];
+      const addressed: string[] = [];
+      for (const [field, value] of Object.entries(after)) {
+        if (named.has(fieldNameKey(field))) {
+          addressed.push(field);
+          continue;
+        }
+        if (isIdentityOrClockField(field)) continue;
+        const priorValue = before[field];
+        if (isClearedValue(value) && !isClearedValue(priorValue)) {
+          cleared.push(field);
+        }
+      }
+      // The request names nothing this row has, so it did not address this row.
+      if (addressed.length === 0 || cleared.length === 0) continue;
+
+      for (const field of cleared) {
+        drafts.push({
+          detector: "db_unrequested_clear",
+          title: `Unrequested data loss: ${table}.${field} cleared by a request that only named ${addressed.join(", ")}`,
+          severity: "high",
+          score: DB_INVARIANT_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: diff.t,
+            offsetMs:
+              offsetForEvent(diff) ?? offsetFromStart(diff.t, index.start),
+            route: routeAt(index.navs ?? [], diff.t),
+            requestId,
+            message:
+              `${request.method} ${request.url ?? ""} named ${addressed.join(", ")}; the same update also emptied ${table}.${field}, which the request never mentioned (was ${JSON.stringify(before[field])}) (request ${requestId})`.trim(),
+            source: normalizeDbEngine(diff.d.engine),
+          }),
+          dedupeKey: `dbunreqclear:${requestId}:${table}:${field}`,
+        });
+      }
+    }
+  }
+}
+
+// ─── Response-plane invariant detectors (status ↔ headers ↔ body) ───
+//
+// These read a single net.res, or a net.res against the db.diff rows of the
+// same request. Every one of them fires on a 2xx: the family they exist for is
+// the response that reports success while contradicting itself.
+
+/** Lowercased header lookup over a net.* event's `hdrs` record. */
+function headerValue(event: BugEvent, name: string): string | undefined {
+  const hdrs = event.d.hdrs;
+  if (!isRecord(hdrs)) return undefined;
+  for (const [key, value] of Object.entries(hdrs)) {
+    if (key.toLowerCase() === name) return safeText(value, 400);
+  }
+  return undefined;
+}
+
+/** The media type without parameters: "text/csv; charset=utf-8" → "text/csv". */
+function mediaType(contentType: string | undefined): string | undefined {
+  if (!contentType) return undefined;
+  const base = contentType.split(";")[0]?.trim().toLowerCase();
+  return base || undefined;
+}
+
+/**
+ * Content types that promise a downloadable document. Deliberately excludes
+ * application/json and text/html: an empty JSON body or an empty HTML fragment
+ * is ordinary, and a 200 serving one is not evidence of anything.
+ */
+const DOCUMENT_MEDIA_TYPE =
+  /^(text\/csv|text\/tab-separated-values|application\/pdf|application\/zip|application\/gzip|application\/x-tar|application\/octet-stream|application\/vnd\.(ms-excel|ms-word|ms-powerpoint|openxmlformats-officedocument\..+|oasis\.opendocument\..+))$/;
+
+/** Media types whose payload is binary and can never legitimately be a JSON document. */
+const BINARY_MEDIA_TYPE =
+  /^(application\/pdf|application\/zip|application\/gzip|application\/x-tar|image\/|audio\/|video\/|application\/vnd\.(ms-excel|ms-word|ms-powerpoint|openxmlformats-officedocument\..+|oasis\.opendocument\..+))/;
+
+/**
+ * download_empty_body: a 2xx served a document content type with nothing in it.
+ *
+ * The real case: an export route caught its own warnings, logged them, and
+ * returned `res.status(200).send("")`. The browser downloads a 0-byte CSV, the
+ * network panel shows green, and the user reports "the export is broken" with
+ * nothing to attach. The contradiction is entirely inside one response —
+ * `200`, `content-type: text/csv`, `content-length: 0`.
+ *
+ * Silent on: non-2xx (already flagged elsewhere), 204/205/304 (empty BY
+ * DEFINITION), HEAD requests (a body is not expected), JSON and HTML (an empty
+ * one is ordinary), and any response whose length cannot be read.
+ */
+function addEmptyDownloadCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  requestById: Map<string, RequestInfo>,
+): void {
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const status = finiteNumber(event.d.st);
+    if (status === undefined || status < 200 || status >= 300) continue;
+    // A body is not expected for these, so its absence says nothing.
+    if (status === 204 || status === 205) continue;
+    const type = mediaType(headerValue(event, "content-type"));
+    if (!type || !DOCUMENT_MEDIA_TYPE.test(type)) continue;
+    // Header values are always strings on the wire, so this must be the
+    // coercing parse — `finiteNumber` rejects "0" and silences the detector.
+    const length = toFiniteNumber(headerValue(event, "content-length"));
+    if (length === undefined || length > 0) continue;
+
+    const transportId = networkRequestId(event.d.id);
+    const req = transportId ? requestById.get(transportId) : undefined;
+    if (req?.method && req.method.toUpperCase() === "HEAD") continue;
+    const requestId = safeText(event.d.requestId, 120);
+
+    drafts.push({
+      detector: "download_empty_body",
+      title:
+        `Empty download: HTTP ${status} served ${type} with content-length 0${req?.url ? ` from ${titleUrl(req.url) ?? ""}` : ""}`.trim(),
+      severity: "high",
+      score: 78,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId,
+        method: req?.method,
+        url: redactUrl(req?.url),
+        status,
+        message:
+          `${req?.method ?? "GET"} ${redactUrl(req?.url) ?? ""} returned ${status} with content-type ${type} and an empty body — the request succeeded and delivered nothing`.trim(),
+      }),
+      // Keyed on the endpoint, not the request: a route that serves empty
+      // downloads does it every time, and N copies of one finding is noise.
+      dedupeKey: `emptydownload:${redactUrl(req?.url) ?? requestId ?? event.t}:${type}`,
+    });
+  }
+}
+
+/**
+ * content_type_body_mismatch: the response declares a binary document and
+ * ships JSON.
+ *
+ * The real case: an `.xlsx` export route never built a workbook — it fell
+ * through to `res.json(...)` while the content type had already been set to the
+ * spreadsheet MIME. Every client either downloads a corrupt file or renders
+ * nothing, and the response is a 200 the whole way.
+ *
+ * Silent unless the declared type is unambiguously binary AND the captured body
+ * parses as JSON. A redacted or opaque body proves nothing, and a JSON body
+ * under a JSON or text content type is correct.
+ */
+function addContentTypeBodyMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  requestById: Map<string, RequestInfo>,
+): void {
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const status = finiteNumber(event.d.st);
+    if (status === undefined || status < 200 || status >= 300) continue;
+    const type = mediaType(headerValue(event, "content-type"));
+    if (!type || !BINARY_MEDIA_TYPE.test(type)) continue;
+    if (parseStructuredBody(event.d.body) === undefined) continue;
+
+    const transportId = networkRequestId(event.d.id);
+    const req = transportId ? requestById.get(transportId) : undefined;
+    const requestId = safeText(event.d.requestId, 120);
+
+    drafts.push({
+      detector: "content_type_body_mismatch",
+      title:
+        `Content type lies: response declared ${type} but the body is JSON${req?.url ? ` from ${titleUrl(req.url) ?? ""}` : ""}`.trim(),
+      severity: "high",
+      score: 80,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId,
+        method: req?.method,
+        url: redactUrl(req?.url),
+        status,
+        message:
+          `${req?.method ?? "GET"} ${redactUrl(req?.url) ?? ""} returned ${status} with content-type ${type}, but the captured body parses as JSON — the route never produced the format it promised`.trim(),
+      }),
+      // Endpoint-keyed for the same reason as download_empty_body.
+      dedupeKey: `ctypemismatch:${redactUrl(req?.url) ?? requestId ?? event.t}:${type}`,
+    });
+  }
+}
+
+/** Response fields that report how many rows a mutation affected. */
+const AFFECTED_COUNT_FIELD =
+  /^(updated|modified|affected|changed|deleted|removed|inserted|created)(_?(count|rows|records|items))?$/i;
+
+/**
+ * response_count_mismatch: the response reports how many rows it changed, and
+ * the database changed a different number.
+ *
+ * The real case: a bulk status update counted the ids it was GIVEN rather than
+ * the rows it actually wrote, so a request naming a deleted id reported
+ * `updated: 4` while three rows changed. The caller's UI then shows four items
+ * moving and one silently snaps back on the next refresh.
+ *
+ * Distinct from `db_delta_mismatch`, which compares a quantity in the REQUEST
+ * against a numeric column's delta. This compares a count the RESPONSE
+ * asserted against the number of rows that actually changed.
+ *
+ * Silent on ambiguity: the response must parse and name exactly one affected-
+ * count field at the top level, the request must have produced at least one
+ * db.diff, and every diff counted must be a write of the same operation family
+ * the field names (a field called `deleted` is not evidence about updates).
+ */
+function addResponseCountMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  mutatingRequests: Map<string, CorrelatedRequest>,
+): void {
+  const diffsByRequest = dbDiffsByRequest(events);
+  for (const [requestId, diffs] of diffsByRequest) {
+    const request = mutatingRequests.get(requestId);
+    if (!request) continue;
+    const body = parseStructuredBody(request.resBody);
+    if (!isRecord(body)) continue;
+
+    // Exactly one affected-count field, read at the top level only. Two of them
+    // (or one nested in an unrelated object) is ambiguous — stay silent.
+    const countFields = Object.entries(body).filter(
+      ([key, value]) =>
+        AFFECTED_COUNT_FIELD.test(key) && toFiniteNumber(value) !== undefined,
+    );
+    if (countFields.length !== 1) continue;
+    const [field, rawClaimed] = countFields[0];
+    const claimed = toFiniteNumber(rawClaimed);
+    if (claimed === undefined) continue;
+
+    // Count only the diffs whose operation matches what the field name claims.
+    const wantsDelete = /^(deleted|removed)/i.test(field);
+    const wantsInsert = /^(inserted|created)/i.test(field);
+    const wantedOp = wantsDelete ? "delete" : wantsInsert ? "insert" : "update";
+    const actual = diffs.filter(
+      (diff) => safeText(diff.d.op, 20)?.toLowerCase() === wantedOp,
+    );
+    if (actual.length === 0) continue;
+    if (actual.length === claimed) continue;
+
+    const anchorEvent = actual[0];
+    const table = safeText(anchorEvent.d.table, 200) ?? "unknown table";
+    drafts.push({
+      detector: "response_count_mismatch",
+      title: `Response count lies: body reported ${field}=${claimed} but ${actual.length} row${actual.length === 1 ? "" : "s"} changed in ${table}`,
+      severity: "high",
+      score: DB_INVARIANT_SCORE,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: anchorEvent.t,
+        offsetMs:
+          offsetForEvent(anchorEvent) ??
+          offsetFromStart(anchorEvent.t, index.start),
+        route: routeAt(index.navs ?? [], anchorEvent.t),
+        requestId,
+        method: request.method,
+        url: redactUrl(request.url),
+        message:
+          `${request.method} ${redactUrl(request.url) ?? ""} responded ${field}=${claimed}, but only ${actual.length} ${wantedOp} row${actual.length === 1 ? "" : "s"} reached ${table} (request ${requestId})`.trim(),
+        source: normalizeDbEngine(anchorEvent.d.engine),
+      }),
+      dedupeKey: `respcount:${requestId}:${field}`,
+    });
+  }
+}
+
+/** Columns that carry a retry counter. */
+const ATTEMPT_COLUMN = /^(attempt|attempts|try|tries|retry_count|retries)$/i;
+/** Columns that carry an upstream HTTP status code. */
+const HTTP_STATUS_COLUMN =
+  /^(http_status|status_code|response_status|http_code|resp_status)$/i;
+/** Minimum escalating attempts before a retry sequence is a loop rather than a retry. */
+const MIN_RETRY_LOOP_ATTEMPTS = 3;
+
+/**
+ * retry_loop_against_success: a delivery was retried, and the status it
+ * recorded each time was a success code.
+ *
+ * The real case: a webhook sender treated anything that was not exactly `200`
+ * as a failure. The receiver answered `204`, so every delivery was retried to
+ * the cap — 25 attempts and 25 duplicate deliveries downstream, all from one
+ * user action, with no error anywhere. The rows say it plainly: `attempt: 1..25`,
+ * `status: 'retrying'`, `http_status: 204`.
+ *
+ * The 2xx is what makes this decisive rather than merely noisy: retrying a 500
+ * is correct behavior, and retrying a 204 is a bug in the success check. The
+ * attempt count is reported alongside so the blast radius is visible without a
+ * second detector.
+ *
+ * Silent unless one request wrote at least MIN_RETRY_LOOP_ATTEMPTS rows to one
+ * table carrying both an attempt counter and a recorded 2xx status.
+ */
+function addRetryLoopAgainstSuccessCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    // Group by table: two unrelated retry logs in one request stay separate.
+    const byTable = new Map<string, BugEvent[]>();
+    for (const diff of diffs) {
+      const table = safeText(diff.d.table, 200);
+      if (!table || !isRecord(diff.d.after)) continue;
+      const list = byTable.get(table) ?? [];
+      list.push(diff);
+      byTable.set(table, list);
+    }
+
+    for (const [table, rows] of byTable) {
+      const attempts = new Set<number>();
+      const successStatuses = new Set<number>();
+      let attemptField: string | undefined;
+      let statusField: string | undefined;
+      let sawNonSuccess = false;
+
+      for (const row of rows) {
+        const after = row.d.after;
+        if (!isRecord(after)) continue;
+        for (const [field, value] of Object.entries(after)) {
+          if (ATTEMPT_COLUMN.test(field)) {
+            const n = toFiniteNumber(value);
+            if (n !== undefined) {
+              attempts.add(n);
+              attemptField ??= field;
+            }
+          } else if (HTTP_STATUS_COLUMN.test(field)) {
+            const n = toFiniteNumber(value);
+            if (n === undefined) continue;
+            statusField ??= field;
+            if (n >= 200 && n < 300) successStatuses.add(n);
+            else sawNonSuccess = true;
+          }
+        }
+      }
+
+      // A mixed sequence (some 5xx, some 2xx) is an ordinary retry that
+      // eventually succeeded. Only an all-success sequence is the bug.
+      if (sawNonSuccess) continue;
+      if (attempts.size < MIN_RETRY_LOOP_ATTEMPTS) continue;
+      if (successStatuses.size === 0) continue;
+      if (!attemptField || !statusField) continue;
+
+      const anchorEvent = rows[rows.length - 1];
+      const highest = Math.max(...attempts);
+      const statusList = [...successStatuses].sort((a, b) => a - b).join(", ");
+      drafts.push({
+        detector: "retry_loop_against_success",
+        title: `Retry loop against a success code: ${table} recorded ${attempts.size} attempts (up to ${attemptField}=${highest}) while ${statusField} stayed ${statusList}`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "high",
+        anchor: removeUndefined({
+          t: anchorEvent.t,
+          offsetMs:
+            offsetForEvent(anchorEvent) ??
+            offsetFromStart(anchorEvent.t, index.start),
+          route: routeAt(index.navs ?? [], anchorEvent.t),
+          requestId,
+          message: `One request wrote ${rows.length} rows to ${table} with ${attemptField} escalating to ${highest}, every one recording ${statusField}=${statusList} — a 2xx is being treated as a failure, so each retry is a duplicate delivery (request ${requestId})`,
+          source: normalizeDbEngine(anchorEvent.d.engine),
+        }),
+        dedupeKey: `retryloop2xx:${requestId}:${table}`,
+      });
+    }
+  }
+}
+
+/** Minimum requests before the session's own duration distribution means anything. */
+const MIN_LATENCY_SAMPLES = 8;
+/** How far above the session median a request must sit to be an outlier. */
+const LATENCY_OUTLIER_FACTOR = 10;
+/** Absolute floor, so a 4 ms request against a 0.2 ms median is never "slow". */
+const MIN_LATENCY_OUTLIER_MS = 250;
+
+function medianOf(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+}
+
+/**
+ * latency_outlier: one route took an order of magnitude longer than every
+ * other request in the same session.
+ *
+ * `slow_request` exists but has a fixed 5,000 ms floor, which is the wrong
+ * instrument for the failure this catches: a quadratic query that is instant on
+ * a seeded dev board and takes 788 ms on a real one. Nothing crosses 5 s until
+ * the largest customer complains, and by then the shape has been in production
+ * for months. Measured against the session's OWN median (1 ms here), the same
+ * request is a 700× outlier and obvious.
+ *
+ * Scale-dependent by design, so the guards are about having a distribution
+ * worth comparing to: at least MIN_LATENCY_SAMPLES requests, at least
+ * LATENCY_OUTLIER_FACTOR× the median, and at least MIN_LATENCY_OUTLIER_MS in
+ * absolute terms so a fast session cannot manufacture outliers out of noise.
+ * Scored below the DB invariants — this is a strong lead, not a proof.
+ */
+function addLatencyOutlierCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  requestById: Map<string, RequestInfo>,
+): void {
+  const samples: { event: BugEvent; dur: number }[] = [];
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const dur = finiteNumber(event.d.dur);
+    if (dur === undefined || dur < 0) continue;
+    samples.push({ event, dur });
+  }
+  if (samples.length < MIN_LATENCY_SAMPLES) return;
+
+  const median = medianOf(samples.map((s) => s.dur));
+  // A median of 0 makes the ratio meaningless; the absolute floor carries it.
+  const threshold = Math.max(
+    median * LATENCY_OUTLIER_FACTOR,
+    MIN_LATENCY_OUTLIER_MS,
+  );
+
+  for (const { event, dur } of samples) {
+    if (dur < threshold) continue;
+    // Already covered, and at a higher score, by the absolute-threshold rule.
+    if (dur >= 5_000) continue;
+    const transportId = networkRequestId(event.d.id);
+    const req = transportId ? requestById.get(transportId) : undefined;
+    const requestId = safeText(event.d.requestId, 120);
+    const ratio = median > 0 ? Math.round(dur / median) : undefined;
+
+    drafts.push({
+      detector: "latency_outlier",
+      title: `Latency outlier: ${Math.round(dur)} ms${ratio ? ` (${ratio}× the session median of ${Math.round(median)} ms)` : ""}${req?.url ? ` on ${titleUrl(req.url) ?? ""}` : ""}`,
+      severity: "medium",
+      score: 68,
+      confidence: "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId,
+        method: req?.method,
+        url: redactUrl(req?.url),
+        status: finiteNumber(event.d.st),
+        message:
+          `${req?.method ?? "GET"} ${redactUrl(req?.url) ?? ""} took ${Math.round(dur)} ms against a session median of ${Math.round(median)} ms across ${samples.length} requests — far below any absolute slow-request threshold, but an outlier against this session's own distribution`.trim(),
+      }),
+      dedupeKey: `latencyoutlier:${requestId ?? transportId ?? event.t}`,
+    });
+  }
+}
+
+/** Minimum reads of a table before "no read ever selects this column" is a pattern. */
+const MIN_READS_FOR_COLUMN_SPLIT = 3;
+
+/**
+ * db_write_read_column_split: writes populate one column, reads select a
+ * different one, and the column the reads DO select was left empty by the write.
+ *
+ * The real case: a saved-view route inserted the filter preset into
+ * `filters_json` while every read selected `filters`, which the insert left
+ * null. The POST returns 201 with the filters echoed straight back out of the
+ * request, so the UI confirms a save that will never load. Nothing throws, and
+ * a single plane shows nothing wrong — the write is fine, the reads are fine.
+ *
+ * This is the case `db_unrequested_clear` was wrongly claimed to cover. Nothing
+ * is cleared here and the request named exactly what it wrote; the failure is
+ * only visible by reading the write against LATER reads of the same table.
+ *
+ * Silent unless: a write left column A non-empty and sibling column B empty in
+ * the same row; at least MIN_READS_FOR_COLUMN_SPLIT reads of that table
+ * followed; every one of those reads selected B; and NOT ONE of them ever
+ * selected A. A single read that touches A means the column is wired up
+ * somewhere and this is not a split.
+ */
+function addWriteReadColumnSplitCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  // Reads first: which columns does any read of this table ever project?
+  const readColumns = new Map<string, Set<string>>();
+  const readCounts = new Map<string, number>();
+  for (const event of events) {
+    if (event.k !== "db.read") continue;
+    const table = safeText(event.d.table, 200);
+    const row = event.d.row;
+    if (!table || !isRecord(row)) continue;
+    const set = readColumns.get(table) ?? new Set<string>();
+    for (const key of Object.keys(row)) set.add(key);
+    readColumns.set(table, set);
+    readCounts.set(table, (readCounts.get(table) ?? 0) + 1);
+  }
+  if (readColumns.size === 0) return;
+
+  const seen = new Set<string>();
+  for (const event of events) {
+    if (event.k !== "db.diff") continue;
+    const op = safeText(event.d.op, 20)?.toLowerCase();
+    if (op !== "insert" && op !== "update") continue;
+    const table = safeText(event.d.table, 200);
+    const after = event.d.after;
+    if (!table || !isRecord(after)) continue;
+
+    const projected = readColumns.get(table);
+    const reads = readCounts.get(table) ?? 0;
+    if (!projected || reads < MIN_READS_FOR_COLUMN_SPLIT) continue;
+
+    // A column this write populated that no read of the table ever selects.
+    const written = Object.entries(after).filter(
+      ([field, value]) =>
+        !isIdentityOrClockField(field) &&
+        !isClearedValue(value) &&
+        !projected.has(field),
+    );
+    if (written.length === 0) continue;
+
+    // A column the reads DO select that this same write left empty. Without
+    // this the rule fires on every wide table with a narrow SELECT.
+    const starved = Object.keys(after).filter(
+      (field) =>
+        !isIdentityOrClockField(field) &&
+        projected.has(field) &&
+        isClearedValue(after[field]),
+    );
+    if (starved.length === 0) continue;
+
+    for (const [writtenField] of written) {
+      for (const readField of starved) {
+        const key = `${table}:${writtenField}:${readField}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        drafts.push({
+          detector: "db_write_read_column_split",
+          title: `Write and read disagree on a column: ${table}.${writtenField} was written, but every read selects ${table}.${readField}, which this write left empty`,
+          severity: "high",
+          score: DB_INVARIANT_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: event.t,
+            offsetMs:
+              offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+            route: routeAt(index.navs ?? [], event.t),
+            requestId: safeText(event.d.requestId, 120),
+            message: `The ${op} populated ${table}.${writtenField} and left ${table}.${readField} empty; ${reads} later read${reads === 1 ? "" : "s"} of ${table} selected ${readField} and never once selected ${writtenField} — the value is stored where nothing looks for it`,
+            source: normalizeDbEngine(event.d.engine),
+          }),
+          dedupeKey: `writereadsplit:${table}:${writtenField}:${readField}`,
         });
       }
     }
