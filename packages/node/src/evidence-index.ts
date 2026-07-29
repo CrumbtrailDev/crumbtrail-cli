@@ -591,6 +591,7 @@ export function buildEvidenceCandidates(
   const mutatingRequests = collectMutatingRequests(events);
   addDbDeltaMismatchCandidates(events, index, drafts, mutatingRequests);
   addClientSuppliedValueCandidates(events, index, drafts, mutatingRequests);
+  addUnrequestedClearCandidates(events, index, drafts, mutatingRequests);
   addIneffectiveInputCandidates(events, index, drafts, mutatingRequests);
   addUiArithmeticMismatchCandidates(events, index, drafts);
   addUiApiDivergenceCandidates(events, index, drafts);
@@ -2592,6 +2593,119 @@ function addClientSuppliedValueCandidates(
             source: normalizeDbEngine(diff.d.engine),
           }),
           dedupeKey: `dbclientvalue:${requestId}:${table}:${field}`,
+        });
+      }
+    }
+  }
+}
+
+/** Case- and separator-insensitive field key, so `dueDate` and `due_date` are one name. */
+function fieldNameKey(name: string): string {
+  return name.replace(/[_\-\s]/g, "").toLowerCase();
+}
+
+/** Every field name a request body mentions, at any nesting depth, normalized. */
+function bodyFieldNames(body: unknown): Set<string> {
+  const names = new Set<string>();
+  for (const scope of collectObjectScopes(body)) {
+    for (const key of Object.keys(scope)) names.add(fieldNameKey(key));
+  }
+  return names;
+}
+
+/** True for the empty end of a clear: null, undefined, or the empty string. */
+function isClearedValue(value: unknown): boolean {
+  return value === null || value === undefined || value === "";
+}
+
+/**
+ * db_unrequested_clear: a partial update destroyed a column the request never
+ * named.
+ *
+ * The real case: a task form loaded before another user saved a description,
+ * then PATCHed `{"status":"in_progress"}`. The route wrote the whole row back
+ * from its stale model, so `tasks.description` went from
+ * 'Acceptance criteria written by Alice' to null in the same statement. The
+ * write succeeds, the response is 200, and the row is internally consistent —
+ * the data loss is visible only by reading the request body next to the diff.
+ * This is the shape of every lost-update bug, and no existing detector sees it:
+ * `db_field_divergence` and `db_delta_mismatch` compare database rows to each
+ * other, and `db_client_supplied_value` looks at what a body PUT IN, not at
+ * what a body never asked to take out.
+ *
+ * Silent on ambiguity, by these guards:
+ *  - body and diff must share a request id, and the body must parse as JSON —
+ *    a redacted or opaque body cannot establish what was not named;
+ *  - the diff must be an update carrying a `before` snapshot. An insert clears
+ *    nothing, and without `before` there is no clear to observe;
+ *  - the column must go from a non-empty value to empty. A column that merely
+ *    changed (a counter, a server-computed status) is the ordinary business of
+ *    a write;
+ *  - identity and clock columns are excluded — a route rewriting `updated_at`
+ *    without being asked is correct behavior;
+ *  - the body must name at least one column the written row actually HAS.
+ *    That is what makes this a partial update of the row the request
+ *    addressed, rather than a server-side lifecycle write (a lock released, an
+ *    error message reset) that merely shares a request id. Deliberately NOT
+ *    "a named column must have CHANGED": in the captured case `status` was
+ *    already `in_progress`, so the write's only effect was the data loss —
+ *    the purest form of the bug, and the form that guard would have missed.
+ */
+function addUnrequestedClearCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  mutatingRequests: Map<string, CorrelatedRequest>,
+): void {
+  for (const [requestId, diffs] of dbDiffsByRequest(events)) {
+    const request = mutatingRequests.get(requestId);
+    if (!request) continue;
+    const parsed = parseStructuredBody(request.body);
+    if (parsed === undefined) continue;
+    const named = bodyFieldNames(parsed);
+    if (named.size === 0) continue;
+
+    for (const diff of diffs) {
+      if (safeText(diff.d.op, 20)?.toLowerCase() !== "update") continue;
+      const table = safeText(diff.d.table, 200);
+      const after = diff.d.after;
+      const before = diff.d.before;
+      if (!table || !isRecord(after) || !isRecord(before)) continue;
+
+      const cleared: string[] = [];
+      const addressed: string[] = [];
+      for (const [field, value] of Object.entries(after)) {
+        if (named.has(fieldNameKey(field))) {
+          addressed.push(field);
+          continue;
+        }
+        if (isIdentityOrClockField(field)) continue;
+        const priorValue = before[field];
+        if (isClearedValue(value) && !isClearedValue(priorValue)) {
+          cleared.push(field);
+        }
+      }
+      // The request names nothing this row has, so it did not address this row.
+      if (addressed.length === 0 || cleared.length === 0) continue;
+
+      for (const field of cleared) {
+        drafts.push({
+          detector: "db_unrequested_clear",
+          title: `Unrequested data loss: ${table}.${field} cleared by a request that only named ${addressed.join(", ")}`,
+          severity: "high",
+          score: DB_INVARIANT_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: diff.t,
+            offsetMs:
+              offsetForEvent(diff) ?? offsetFromStart(diff.t, index.start),
+            route: routeAt(index.navs ?? [], diff.t),
+            requestId,
+            message:
+              `${request.method} ${request.url ?? ""} named ${addressed.join(", ")}; the same update also emptied ${table}.${field}, which the request never mentioned (was ${JSON.stringify(before[field])}) (request ${requestId})`.trim(),
+            source: normalizeDbEngine(diff.d.engine),
+          }),
+          dedupeKey: `dbunreqclear:${requestId}:${table}:${field}`,
         });
       }
     }

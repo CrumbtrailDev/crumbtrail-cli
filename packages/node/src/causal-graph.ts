@@ -561,6 +561,7 @@ const DB_WRITE_DETECTORS = new Set([
   "db_field_divergence",
   "duplicate_write",
   "db_client_supplied_value",
+  "db_unrequested_clear",
 ]);
 
 /**
@@ -627,6 +628,7 @@ const NAMED_FAILURE_DETECTORS = new Set([
   "db_field_divergence",
   "duplicate_write",
   "db_client_supplied_value",
+  "db_unrequested_clear",
   "otel_span_error",
 ]);
 
