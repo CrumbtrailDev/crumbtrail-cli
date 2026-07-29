@@ -11,6 +11,8 @@ import {
   computeRedactedShape,
   redactNetworkTextBody,
   resetStructuredShapeSaltForTests,
+  redactUrl,
+  setRedactionKeepFields,
 } from "../redaction";
 
 const JWT =
@@ -166,6 +168,17 @@ describe("classifyStructuredValue", () => {
     });
   });
 
+  it("keeps canonical operational timestamps but still denies sensitive date fields", () => {
+    const timestamp = "2026-07-28T20:38:55.123Z";
+    expect(classifyStructuredValue(timestamp, "created_at")).toEqual({
+      action: "keep",
+    });
+    expect(classifyStructuredValue(timestamp, "birthdate")).toMatchObject({
+      action: "redact",
+      reason: "deny_field",
+    });
+  });
+
   it("redacts long free text (unknown class)", () => {
     expect(
       classifyStructuredValue("please ship this to my house after 5pm"),
@@ -181,6 +194,15 @@ describe("computeRedactedShape", () => {
     // Equality tests work within a session.
     expect(computeRedactedShape("hunter22").hash8).toBe(shape.hash8);
     expect(computeRedactedShape("hunter23").hash8).not.toBe(shape.hash8);
+  });
+
+  it("reports a salted case-fold fingerprint without exposing the value", () => {
+    const uppercase = computeRedactedShape("Omar@Example.com");
+    const lowercase = computeRedactedShape("omar@example.com");
+
+    expect(uppercase.hash8).not.toBe(lowercase.hash8);
+    expect(uppercase.casefoldHash8).toBe(lowercase.hash8);
+    expect(lowercase.casefoldHash8).toBeUndefined();
   });
 
   it("omits hash8 for brute-forceable candidate spaces", () => {
@@ -544,5 +566,197 @@ describe("networkCollector structured redaction", () => {
     );
 
     cleanup();
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Application-declared keep list                                      */
+/* ------------------------------------------------------------------ */
+
+describe("redaction.keepFields", () => {
+  const KEEP = ["body", "q", "postalCode"];
+
+  function structured(body: string, keepFields = KEEP) {
+    const result = redactNetworkTextBody(body, {
+      mode: "structured",
+      contentType: "application/json",
+      keepFields,
+    });
+    return JSON.parse(result.body as string) as Record<string, unknown>;
+  }
+
+  it("redacts free text under an undeclared name", () => {
+    const parsed = structured(JSON.stringify({ body: "hello there world" }), []);
+    expect(parsed.body).toMatchObject({ $redacted: "[REDACTED]" });
+  });
+
+  it("keeps free text under a declared name", () => {
+    const parsed = structured(
+      JSON.stringify({ body: "<img src=x onerror=alert(1)>" }),
+    );
+    expect(parsed.body).toBe("<img src=x onerror=alert(1)>");
+  });
+
+  it("keeps a declared search term so the query that broke is readable", () => {
+    const parsed = structured(JSON.stringify({ q: "O'Brien \"widget\"" }));
+    expect(parsed.q).toBe("O'Brien \"widget\"");
+  });
+
+  it("matches the whole compacted name, never a substring", () => {
+    const parsed = structured(JSON.stringify({ shadowBody: "free text here" }));
+    expect(parsed.shadowBody).toMatchObject({ $redacted: "[REDACTED]" });
+  });
+
+  it("still redacts an email pasted into a kept field", () => {
+    const parsed = structured(
+      JSON.stringify({ body: "reach me at someone@example.com please" }),
+    );
+    expect(parsed.body).toMatchObject({ $redacted: "[REDACTED]" });
+  });
+
+  it("still redacts a JWT pasted into a kept field", () => {
+    const parsed = structured(JSON.stringify({ body: JWT }));
+    expect(parsed.body).toMatchObject({ $redacted: "[REDACTED]" });
+  });
+
+  it("still redacts a card number pasted into a kept field", () => {
+    const parsed = structured(JSON.stringify({ body: "pay 4111111111111111" }));
+    expect(parsed.body).toMatchObject({ $redacted: "[REDACTED]" });
+  });
+
+  it("lets a denyFields entry win over a keep for the same name", () => {
+    const result = redactNetworkTextBody(JSON.stringify({ body: "free text" }), {
+      mode: "structured",
+      contentType: "application/json",
+      keepFields: ["body"],
+      denyFields: ["body"],
+    });
+    const parsed = JSON.parse(result.body as string) as Record<string, unknown>;
+    expect(parsed.body).toMatchObject({ $redacted: "[REDACTED]" });
+  });
+
+  it("carries the keep into array entries under the same name", () => {
+    const parsed = structured(JSON.stringify({ body: ["free text one"] }));
+    expect(parsed.body).toEqual(["free text one"]);
+  });
+
+  it("does not extend the keep to nested keys under a kept object", () => {
+    const parsed = structured(
+      JSON.stringify({ body: { note: "nested free text" } }),
+    );
+    expect((parsed.body as Record<string, unknown>).note).toMatchObject({
+      $redacted: "[REDACTED]",
+    });
+  });
+
+  it("leaves the default deny-biased behavior intact when unset", () => {
+    const result = redactNetworkTextBody(
+      JSON.stringify({ body: "free text here", qty: 2 }),
+      { mode: "structured", contentType: "application/json" },
+    );
+    const parsed = JSON.parse(result.body as string) as Record<string, unknown>;
+    expect(parsed.body).toMatchObject({ $redacted: "[REDACTED]" });
+    expect(parsed.qty).toBe(2);
+  });
+});
+
+describe("keepFields vs the built-in deny rules", () => {
+  function structured(body: string, keepFields: string[], denyFields?: string[]) {
+    const result = redactNetworkTextBody(body, {
+      mode: "structured",
+      contentType: "application/json",
+      keepFields,
+      ...(denyFields ? { denyFields } : {}),
+    });
+    return JSON.parse(result.body as string) as Record<string, unknown>;
+  }
+
+  it("overrides a built-in substring false positive (auth in author)", () => {
+    expect(structured(JSON.stringify({ author: "A. Shopper" }), []).author).toMatchObject(
+      { $redacted: "[REDACTED]" },
+    );
+    expect(
+      structured(JSON.stringify({ author: "A. Shopper" }), ["author"]).author,
+    ).toBe("A. Shopper");
+  });
+
+  it("does not override a built-in rule for a merely similar name", () => {
+    const parsed = structured(JSON.stringify({ authorEmail: "x y z here" }), [
+      "author",
+    ]);
+    expect(parsed.authorEmail).toMatchObject({ $redacted: "[REDACTED]" });
+  });
+
+  it("keeps the application's own denyFields winning over its own keep", () => {
+    const parsed = structured(
+      JSON.stringify({ author: "A. Shopper" }),
+      ["author"],
+      ["author"],
+    );
+    expect(parsed.author).toMatchObject({ $redacted: "[REDACTED]" });
+  });
+
+  it("still redacts by value inside a name the keep un-denied", () => {
+    for (const value of [
+      "someone@example.com",
+      JWT,
+      "4111111111111111",
+      "aB3xQ9zL7pR2mN8kT4vY6wS1",
+    ]) {
+      const parsed = structured(JSON.stringify({ author: value }), ["author"]);
+      expect(parsed.author).toMatchObject({ $redacted: "[REDACTED]" });
+    }
+  });
+
+  it("redacts a password even when its own name is kept, if the value looks secret", () => {
+    // The escape hatch un-denies the NAME. Anything the value-based checks
+    // catch is still removed, which is what keeps the hatch safe to offer.
+    const parsed = structured(
+      JSON.stringify({ password: "aB3xQ9zL7pR2mN8kT4vY6wS1" }),
+      ["password"],
+    );
+    expect(parsed.password).toMatchObject({ $redacted: "[REDACTED]" });
+  });
+});
+
+describe("query parameters answer to the same keep list", () => {
+  afterEach(() => setRedactionKeepFields([]));
+
+  it("redacts every query value by default", () => {
+    setRedactionKeepFields([]);
+    expect(redactUrl("/api/search?q=widget&productId=1").value).toBe(
+      "/api/search?q=%5BREDACTED%5D&productId=%5BREDACTED%5D",
+    );
+  });
+
+  it("keeps a declared parameter so the query that broke is readable", () => {
+    setRedactionKeepFields(["q", "productId"]);
+    expect(redactUrl("/api/search?q=widget&productId=1").value).toBe(
+      "/api/search?q=widget&productId=1",
+    );
+  });
+
+  it("leaves an undeclared parameter redacted alongside a kept one", () => {
+    setRedactionKeepFields(["q"]);
+    const value = redactUrl("/api/search?q=widget&sessionKey=abc").value;
+    expect(value).toContain("q=widget");
+    expect(value).toContain("sessionKey=%5BREDACTED%5D");
+  });
+
+  it("still redacts a sensitive value inside a kept parameter", () => {
+    setRedactionKeepFields(["q"]);
+    expect(redactUrl("/api/search?q=someone%40example.com").value).toBe(
+      "/api/search?q=%5BREDACTED%5D",
+    );
+  });
+
+  it("keeps punctuation in a search term, which is the whole point", () => {
+    setRedactionKeepFields(["q"]);
+    const value = redactUrl(`/api/search?q=${encodeURIComponent(`O'Brien "x"`)}`)
+      .value;
+    // Read it back the way a query string is actually parsed: toString()
+    // form-encodes the space as `+`, which decodeURIComponent does not undo.
+    const parsed = new URLSearchParams(value.split("?")[1]);
+    expect(parsed.get("q")).toBe(`O'Brien "x"`);
   });
 });

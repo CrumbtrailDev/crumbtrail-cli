@@ -48,6 +48,12 @@ export interface DistinctBug {
     status?: number;
     target?: TargetDescriptor;
     requestId?: string;
+    /**
+     * `file:line:col` of the failing code, carried from the winning candidate's
+     * anchor. This is the one field that answers "where do I open the editor",
+     * so it travels with the bug rather than staying behind on the candidate.
+     */
+    frame?: string;
     /** Bounded, redacted payload evidence for this representative's failed request. */
     bodySnippet?: { request?: string; response?: string };
   };
@@ -413,6 +419,7 @@ function buildBug(cluster: Cluster, events: BugEvent[]): DistinctBug {
       status: representative.anchor.status,
       target: representative.anchor.target,
       requestId: representative.anchor.requestId,
+      frame: representative.anchor.frame,
       bodySnippet: failedRequestBodySnippet(representative, events),
     }) as DistinctBug["representative"],
     frontendEvidence,

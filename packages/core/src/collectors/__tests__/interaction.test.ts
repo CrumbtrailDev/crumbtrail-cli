@@ -26,6 +26,7 @@ describe("interactionCollector", () => {
 
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
   });
 
   // --- Initial nav ---
@@ -188,6 +189,166 @@ describe("interactionCollector", () => {
     document.body.removeChild(input);
   });
 
+  // --- Input trust ---
+  it("marks a programmatic write to an input as untrusted", () => {
+    const input = document.createElement("input");
+    input.name = "quantity";
+    document.body.appendChild(input);
+
+    input.value = "99";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inpEvents = events.filter((e) => e.k === "inp");
+    expect(inpEvents).toHaveLength(1);
+    expect(inpEvents[0].d.trusted).toBe(false);
+
+    document.body.removeChild(input);
+  });
+
+  it("marks a user-generated input event as trusted", () => {
+    const input = document.createElement("input");
+    input.name = "quantity";
+    document.body.appendChild(input);
+
+    const event = new Event("input", { bubbles: true });
+    Object.defineProperty(event, "isTrusted", { value: true });
+    input.value = "2";
+    input.dispatchEvent(event);
+    bus.flush();
+
+    const inpEvents = events.filter((e) => e.k === "inp");
+    expect(inpEvents).toHaveLength(1);
+    expect(inpEvents[0].d.trusted).toBe(true);
+
+    document.body.removeChild(input);
+  });
+
+  it("marks form submits with their trust flag", () => {
+    const form = document.createElement("form");
+    document.body.appendChild(form);
+
+    form.dispatchEvent(new Event("submit", { bubbles: true }));
+    bus.flush();
+
+    const submitEvents = events.filter(
+      (e) => e.k === "inp" && e.d.ev === "submit",
+    );
+    expect(submitEvents).toHaveLength(1);
+    expect(submitEvents[0].d.trusted).toBe(false);
+
+    document.body.removeChild(form);
+  });
+
+  it("captures a silent programmatic value change after trusted input", () => {
+    vi.useFakeTimers();
+    const input = document.createElement("input");
+    input.name = "postalCode";
+    document.body.appendChild(input);
+
+    input.value = "SW1A2AA";
+    const userInput = new Event("input", { bubbles: true });
+    Object.defineProperty(userInput, "isTrusted", { value: true });
+    input.dispatchEvent(userInput);
+    input.value = "SWA";
+    vi.advanceTimersByTime(450);
+    bus.flush();
+
+    const inputEvents = events.filter((event) => event.k === "inp");
+    expect(inputEvents).toHaveLength(2);
+    expect(inputEvents[1].d).toMatchObject({
+      ev: "state",
+      trusted: false,
+      valSummary: { originalLength: 3 },
+    });
+
+    document.body.removeChild(input);
+  });
+
+  it("captures controls silently cleared after a form submit", () => {
+    vi.useFakeTimers();
+    const form = document.createElement("form");
+    const line1 = document.createElement("input");
+    line1.name = "line1";
+    line1.value = "10 Downing Street";
+    form.appendChild(line1);
+    document.body.appendChild(form);
+
+    form.dispatchEvent(new Event("submit", { bubbles: true }));
+    line1.value = "";
+    vi.advanceTimersByTime(700);
+    bus.flush();
+
+    expect(
+      events.some(
+        (event) =>
+          event.k === "inp" &&
+          event.d.ev === "state" &&
+          event.d.trusted === false &&
+          (event.d.el as Record<string, unknown>).name === "line1",
+      ),
+    ).toBe(true);
+
+    document.body.removeChild(form);
+  });
+
+  it("captures controls cleared by a form remount after submit", () => {
+    vi.useFakeTimers();
+    const form = document.createElement("form");
+    const line1 = document.createElement("input");
+    line1.name = "line1";
+    line1.value = "10 Downing Street";
+    form.appendChild(line1);
+    document.body.appendChild(form);
+
+    form.dispatchEvent(new Event("submit", { bubbles: true }));
+    form.remove();
+    const replacementForm = document.createElement("form");
+    const replacementLine1 = document.createElement("input");
+    replacementLine1.name = "line1";
+    replacementLine1.value = "";
+    replacementForm.appendChild(replacementLine1);
+    document.body.appendChild(replacementForm);
+    vi.advanceTimersByTime(700);
+    bus.flush();
+
+    expect(
+      events.some(
+        (event) =>
+          event.k === "inp" &&
+          event.d.ev === "state" &&
+          event.d.trusted === false &&
+          (event.d.el as Record<string, unknown>).name === "line1",
+      ),
+    ).toBe(true);
+
+    document.body.removeChild(replacementForm);
+  });
+
+  it("does not report the user's next input as a silent overwrite", () => {
+    vi.useFakeTimers();
+    const input = document.createElement("input");
+    input.name = "postalCode";
+    document.body.appendChild(input);
+
+    for (const value of ["S", "SW"]) {
+      input.value = value;
+      const event = new Event("input", { bubbles: true });
+      Object.defineProperty(event, "isTrusted", { value: true });
+      input.dispatchEvent(event);
+    }
+    vi.advanceTimersByTime(450);
+    bus.flush();
+
+    expect(
+      events.some(
+        (event) => event.k === "inp" && event.d.ev === "state",
+      ),
+    ).toBe(false);
+
+    document.body.removeChild(input);
+  });
+
   // --- Navigation via pushState ---
   it("captures pushState navigation", () => {
     history.pushState({}, "", "/test-page");
@@ -207,6 +368,83 @@ describe("interactionCollector", () => {
     expect(navEvents).toHaveLength(1);
     expect(navEvents[0].d.tr).toBe("replace");
     expect(navEvents[0].d.to).toContain("/replaced");
+  });
+
+  it("captures a history pop as tr:'pop'", () => {
+    history.pushState({}, "", "/step-two");
+    bus.flush();
+    events.length = 0;
+
+    // The browser applies the traversal and then fires popstate; the collector
+    // reads the destination off location, exactly as it does here.
+    window.dispatchEvent(new Event("popstate"));
+    bus.flush();
+
+    const navEvents = events.filter((e) => e.k === "nav");
+    expect(navEvents).toHaveLength(1);
+    expect(navEvents[0].d.tr).toBe("pop");
+    expect(navEvents[0].d.to).toContain("/step-two");
+  });
+
+  it("captures a hash change as tr:'hash'", () => {
+    window.dispatchEvent(new Event("hashchange"));
+    bus.flush();
+
+    const navEvents = events.filter((e) => e.k === "nav");
+    expect(navEvents).toHaveLength(1);
+    expect(navEvents[0].d.tr).toBe("hash");
+  });
+
+  it("does not label a route change as an initial load", () => {
+    history.pushState({}, "", "/somewhere");
+    bus.flush();
+
+    const navEvents = events.filter((e) => e.k === "nav");
+    expect(navEvents.map((event) => event.d.tr)).not.toContain("init");
+    expect(navEvents[0].d.navType).toBeUndefined();
+  });
+
+  // --- Document navigation type ---
+  it("labels a back/forward document load on the initial nav event", () => {
+    cleanup();
+    vi.spyOn(performance, "getEntriesByType").mockReturnValue([
+      { type: "back_forward" } as unknown as PerformanceEntry,
+    ]);
+
+    const initEvents: BugEvent[] = [];
+    const initBus = new EventBus();
+    initBus.subscribe((batch) => initEvents.push(...batch));
+    const initCleanup = interactionCollector(initBus, DEFAULT_CONFIG);
+    initBus.flush();
+
+    expect(initEvents[0].d.tr).toBe("init");
+    expect(initEvents[0].d.navType).toBe("back_forward");
+
+    initCleanup();
+    vi.restoreAllMocks();
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
+  });
+
+  it("omits navType when the Navigation Timing entry is unavailable", () => {
+    cleanup();
+    vi.spyOn(performance, "getEntriesByType").mockReturnValue([]);
+
+    const initEvents: BugEvent[] = [];
+    const initBus = new EventBus();
+    initBus.subscribe((batch) => initEvents.push(...batch));
+    const initCleanup = interactionCollector(initBus, DEFAULT_CONFIG);
+    initBus.flush();
+
+    expect(initEvents[0].d.tr).toBe("init");
+    expect(initEvents[0].d.navType).toBeUndefined();
+
+    initCleanup();
+    vi.restoreAllMocks();
+    cleanup = interactionCollector(bus, DEFAULT_CONFIG);
+    bus.flush();
+    events.length = 0;
   });
 
   // --- Cleanup ---
