@@ -69,6 +69,14 @@ export interface BackendRequestEndEventInput extends BackendRequestEventInput {
   responseHeaders?: Record<string, string>;
   /** Whether the caller truncated `responseBody` at its cap. */
   responseBodyTruncated?: boolean;
+  /**
+   * Field names the application declares keepable, exactly as the browser SDK's
+   * `redaction.keepFields`. Exempts a NAME from the name-based deny rules; every
+   * value-based check still runs, and the list is carried in the event's policy
+   * declaration so the capture server's re-classification applies the same
+   * exemption instead of undoing it at rest.
+   */
+  keepFields?: readonly string[];
 }
 
 export interface BackendRequestErrorEventInput extends BackendRequestEndEventInput {
@@ -194,6 +202,9 @@ function attachResponseEvidence(
     // and stamps the policy declaration that lets the at-rest sanitizer
     // recognise this as an already-redacted body instead of sweeping it whole.
     mode: "structured",
+    ...(input.keepFields && input.keepFields.length > 0
+      ? { keepFields: [...input.keepFields] }
+      : {}),
   });
   if (result.body !== undefined) payload.responseBody = result.body;
   if (result.bodySummary) payload.responseBodySummary = result.bodySummary;
