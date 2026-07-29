@@ -23,6 +23,12 @@ export {
   resetSessionStore,
   getSessionStore,
 } from "./session-store";
+// The keep half of the capture policy. A host that embeds this package rather
+// than running the CLI sets it the same way `serve --keep-field` does.
+export {
+  setStorageKeepFields,
+  getStorageKeepFields,
+} from "./storage-plane";
 // The full SessionStore surface must be exported, not just the interface: an
 // embedder implementing or decorating it (for example the hosted cloud's
 // EncryptedSessionStore) needs these parameter/return types to type its methods.
@@ -90,7 +96,14 @@ export type {
   FixContextDbRead,
   BuildFixContextOptions,
 } from "./fix-context";
-export { extractOpinionCodePointers } from "./code-pointers";
+export {
+  extractOpinionCodePointers,
+  buildCallsitePointer,
+  parseGitHubRepo,
+  type CallsiteLike,
+  type RepoBinding,
+} from "./code-pointers";
+export { captureDbCallsite, type DbCallsite } from "./db/callsite";
 export type { CodePointer, CodePointerResolution } from "./code-pointers";
 export {
   buildDbDiffEvent,
@@ -186,6 +199,7 @@ export type {
   CrumbtrailExpressErrorMiddleware,
   CrumbtrailExpressErrorNext,
   CrumbtrailExpressMiddleware,
+  CrumbtrailExpressMiddlewareWithHandle,
   CrumbtrailExpressNext,
   CrumbtrailExpressOptions,
   CrumbtrailExpressRequest,
@@ -329,3 +343,16 @@ export type {
 // closed when the marker is absent, so this re-export is load bearing and must
 // survive bundling in both the ESM and CJS dist outputs.
 export { NODE_CONTRACT_CAPABILITIES } from "./node-contract-capabilities";
+
+// ── Node runtime warning capture ─────────────────────────────────────────────
+// Append-only block. Do not reorder the exports above.
+export {
+  BACKEND_WARNING_EVENT,
+  buildBackendWarningEvent,
+  installBackendWarningCapture,
+} from "./backend-warnings";
+export type {
+  BackendWarningCaptureHandle,
+  BackendWarningCaptureOptions,
+  RuntimeWarningLike,
+} from "./backend-warnings";

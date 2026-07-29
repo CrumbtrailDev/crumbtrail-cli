@@ -52,6 +52,14 @@ describe("environmentCollector", () => {
     expect(typeof snap.timezone).toBe("string");
   });
 
+  it("captures a public app-build meta identity", () => {
+    document.head.innerHTML =
+      '<meta name="app-build" content="release-2026.07.28">';
+    const snap = buildEnvSnapshot();
+    expect(snap.appBuild).toBe("release-2026.07.28");
+    document.head.innerHTML = "";
+  });
+
   it("stays a no-op-safe minimal snapshot when navigator/window are absent (SSR guard)", () => {
     // Simulate a non-browser/SSR runtime; vi.unstubAllGlobals restores happy-dom afterward.
     vi.stubGlobal("navigator", undefined);

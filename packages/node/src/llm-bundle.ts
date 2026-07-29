@@ -404,6 +404,26 @@ export interface LlmBundleDbDiff {
    */
   rowCount?: number;
   requestId?: string;
+  /**
+   * Where the application issued this write: the innermost host frame plus the
+   * app frames above it. Present only when the SDK was run with
+   * `captureCallsite`.
+   *
+   * A diff says a row changed. Without this the agent still has to go looking
+   * for the line that changed it, which on a defect like "the total is written
+   * from the client's value" is the entire answer.
+   */
+  callsite?: LlmBundleDbCallsite;
+}
+
+/** One frame of a `db.diff` callsite chain, repo-relative where derivable. */
+export interface LlmBundleDbCallsite {
+  file: string;
+  line?: number;
+  column?: number;
+  fn?: string;
+  /** App frames above this one, innermost first. Never nested further. */
+  stack?: LlmBundleDbCallsite[];
 }
 
 export interface LlmBundleDbRead {
@@ -1686,10 +1706,42 @@ function buildDatabaseDiffs(
           : undefined,
         rowCount: finiteNumber(event.d.rowCount),
         requestId: safeCorrelationId(event.d.requestId, 200),
+        callsite: normalizeDbCallsite(event.d.callsite),
       }) as LlmBundleDbDiff,
     );
   }
   return diffs.sort((a, b) => a.t - b.t).slice(0, 200);
+}
+
+/**
+ * A callsite chain, bounded and stripped to the fields the contract declares.
+ *
+ * Paths are file locations the runtime already resolved against the repo root,
+ * not user data, but they are length-capped like every other string that rests
+ * here. Depth is capped at the innermost frame plus four callers so a deep
+ * async stack cannot inflate a bundle.
+ */
+function normalizeDbCallsite(
+  raw: unknown,
+  depth = 0,
+): LlmBundleDbCallsite | undefined {
+  if (!isRecord(raw)) return undefined;
+  const file = safeText(raw.file, 400);
+  if (!file) return undefined;
+  const stack =
+    depth === 0 && Array.isArray(raw.stack)
+      ? raw.stack
+          .slice(0, 4)
+          .map((frame) => normalizeDbCallsite(frame, depth + 1))
+          .filter((frame): frame is LlmBundleDbCallsite => frame !== undefined)
+      : undefined;
+  return removeUndefined({
+    file,
+    line: finiteNumber(raw.line),
+    column: finiteNumber(raw.column),
+    fn: safeText(raw.fn, 200),
+    stack: stack && stack.length > 0 ? stack : undefined,
+  }) as LlmBundleDbCallsite;
 }
 
 function buildDatabaseReads(
@@ -3676,6 +3728,7 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
           "",
         ]
       : []),
+    ...renderDatabaseDiffSection(bundle.databaseDiffs),
     ...renderDatabaseActivitySection(bundle.databaseActivity),
     ...renderCausalStructureSection(bundle.causalTree),
     "## Key Timeline Moments",
@@ -3766,6 +3819,74 @@ function renderEnvironmentSection(
       `- Config keys: ${Object.keys(environment.config).sort().join(", ") || "none"} (values redacted in browser before capture)`,
     );
   lines.push("");
+  return lines;
+}
+
+/** `insertReview server/src/repos/reviews-repo.js:5 < handler server/src/routes/reviews.js:41` */
+function formatCallsiteChain(
+  callsite: LlmBundleDbCallsite | undefined,
+): string {
+  if (!callsite) return "";
+  const frames = [callsite, ...(callsite.stack ?? [])];
+  return frames
+    .map((frame) => {
+      const at = frame.line === undefined ? frame.file : `${frame.file}:${frame.line}`;
+      return frame.fn ? `${frame.fn} ${at}` : at;
+    })
+    .join(" < ");
+}
+
+/**
+ * The rows that actually changed, which the markdown had no section for at all
+ * — only OTel statement spans, which say a query ran but never what it wrote.
+ *
+ * The callsite column is the point of the table. A diff says a row changed; the
+ * chain says which line changed it, innermost frame first, so a reader working
+ * a ticket goes straight to the handler instead of grepping for the table name.
+ */
+function renderDatabaseDiffSection(diffs: LlmBundleDbDiff[]): string[] {
+  if (diffs.length === 0) return [];
+  const shown = diffs.slice(0, 25);
+  const hasCallsites = shown.some((diff) => diff.callsite);
+  const lines = [
+    "## Database Row Changes",
+    "",
+    "Before and after images for the rows this session wrote, correlated to the request that caused them.",
+    "",
+    table(
+      [
+        "Offset",
+        "Op",
+        "Table",
+        "Key",
+        "After",
+        ...(hasCallsites ? ["Issued from"] : []),
+        "Request ID",
+      ],
+      shown.map((diff) => [
+        diff.offsetMs !== undefined ? `${diff.offsetMs} ms` : "unknown",
+        diff.op,
+        diff.table,
+        diff.pk ? JSON.stringify(diff.pk) : "unresolved",
+        diff.after ? truncate(JSON.stringify(diff.after), 300) : "",
+        ...(hasCallsites ? [formatCallsiteChain(diff.callsite)] : []),
+        diff.requestId ?? "",
+      ]),
+    ),
+    "",
+  ];
+  if (diffs.length > shown.length) {
+    lines.push(
+      `${diffs.length - shown.length} further row change(s) are in \`bundle.json\` under \`databaseDiffs\`.`,
+      "",
+    );
+  }
+  if (!hasCallsites) {
+    lines.push(
+      "No callsites captured. Run the server SDK with `captureCallsite` to record which line issued each write.",
+      "",
+    );
+  }
   return lines;
 }
 

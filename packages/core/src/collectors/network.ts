@@ -21,6 +21,10 @@ import {
   canInjectCorrelationHeaders,
   resolveOutboundCorrelation,
 } from "../correlation";
+import {
+  drainEarlyCapture,
+  type EarlyRequestRecord,
+} from "../early-capture";
 import { now } from "../utils";
 
 /* ------------------------------------------------------------------ */
@@ -96,6 +100,164 @@ function isSSE(ct: string): boolean {
 function shouldExclude(url: string, config: CrumbtrailConfig): boolean {
   if (config.httpEndpoint && url.includes(config.httpEndpoint)) return true;
   return config.networkExcludeUrls.some((pattern) => url.includes(pattern));
+}
+
+/* ------------------------------------------------------------------ */
+/* Response body summary (`d.bodyMeta`)                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `d.body` carries the redacted response body as text, which answers "what did
+ * the server say" but not "what shape was it, and how much of it is here".
+ * `d.bodyMeta` adds the size facts plus a bounded, parsed view so a detector
+ * can compare a rendered number against the field that produced it without
+ * re-parsing an unbounded string, and can tell a real empty list from a
+ * truncated one.
+ *
+ * The parsed view is derived from the ALREADY REDACTED body text, never from
+ * the raw response, so it cannot widen what capture stores.
+ */
+const RESPONSE_SUMMARY_MAX_BYTES = 32_768;
+const RESPONSE_SUMMARY_MAX_DEPTH = 4;
+const RESPONSE_SUMMARY_MAX_ARRAY = 20;
+const RESPONSE_SUMMARY_MAX_STRING = 120;
+
+export interface ResponseBodyMeta {
+  /** `"json"` when `data` is present, otherwise the response's media type. */
+  ct: string;
+  /** Body size in bytes. Absent when neither the text nor content-length was available. */
+  bytes?: number;
+  /** True when depth, array length, or string length caps dropped anything. */
+  truncated?: boolean;
+  data?: unknown;
+  /** True length of each truncated array, keyed by its path (`"$"` is the root). */
+  arrayTotal?: Record<string, number>;
+}
+
+interface SummaryState {
+  truncated: boolean;
+  arrayTotal: Record<string, number>;
+}
+
+function utf8ByteLength(text: string): number {
+  try {
+    if (typeof TextEncoder !== "undefined")
+      return new TextEncoder().encode(text).length;
+  } catch {
+    // Fall through to the character-count approximation.
+  }
+  return text.length;
+}
+
+function mediaType(contentType: string): string {
+  const essence = contentType.split(";")[0]?.trim().toLowerCase();
+  return essence || "unknown";
+}
+
+function isJsonContentType(contentType: string): boolean {
+  return /\bjson\b/i.test(contentType);
+}
+
+function capSummaryValue(
+  value: unknown,
+  depth: number,
+  path: string,
+  state: SummaryState,
+): unknown {
+  if (typeof value === "string") {
+    if (value.length <= RESPONSE_SUMMARY_MAX_STRING) return value;
+    state.truncated = true;
+    return value.slice(0, RESPONSE_SUMMARY_MAX_STRING);
+  }
+
+  if (Array.isArray(value)) {
+    if (depth >= RESPONSE_SUMMARY_MAX_DEPTH) {
+      state.truncated = true;
+      return `[array:${value.length}]`;
+    }
+    const kept = value.slice(0, RESPONSE_SUMMARY_MAX_ARRAY);
+    if (value.length > kept.length) {
+      state.truncated = true;
+      state.arrayTotal[path] = value.length;
+    }
+    return kept.map((entry, index) =>
+      capSummaryValue(entry, depth + 1, `${path}[${index}]`, state),
+    );
+  }
+
+  if (value !== null && typeof value === "object") {
+    if (depth >= RESPONSE_SUMMARY_MAX_DEPTH) {
+      state.truncated = true;
+      return "[object]";
+    }
+    const output: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(
+      value as Record<string, unknown>,
+    )) {
+      output[key] = capSummaryValue(entry, depth + 1, `${path}.${key}`, state);
+    }
+    return output;
+  }
+
+  return value;
+}
+
+/**
+ * Builds `d.bodyMeta` for one response. `redactedBody` is the output of the
+ * shared body-redaction pipeline; it is parsed (never the raw text) and capped.
+ * Returns undefined when nothing is known about the body at all.
+ */
+function buildResponseBodyMeta(input: {
+  contentType: string;
+  contentLength?: string | null;
+  text?: string;
+  redactedBody?: string;
+}): ResponseBodyMeta | undefined {
+  // `Number(null)` is 0, not NaN: a response with no content-length header
+  // would otherwise be reported as zero bytes.
+  const declared =
+    input.contentLength !== undefined &&
+    input.contentLength !== null &&
+    input.contentLength.trim() !== ""
+      ? Number(input.contentLength)
+      : Number.NaN;
+  const bytes =
+    input.text !== undefined
+      ? utf8ByteLength(input.text)
+      : Number.isFinite(declared) && declared >= 0
+        ? declared
+        : undefined;
+
+  if (!input.contentType && bytes === undefined) return undefined;
+
+  const meta: ResponseBodyMeta = { ct: mediaType(input.contentType) };
+  if (bytes !== undefined) meta.bytes = bytes;
+
+  // Deliberately not gated on same-origin. The redacted body text in `d.body`
+  // is already captured for every origin this collector sees, so withholding
+  // the parsed view of that same text would hide structure the event already
+  // carries — and a third-party API's payload is exactly where a contradiction
+  // between what the page shows and what the service returned needs reading.
+  const summarizable =
+    input.redactedBody !== undefined &&
+    isJsonContentType(input.contentType) &&
+    bytes !== undefined &&
+    bytes <= RESPONSE_SUMMARY_MAX_BYTES;
+  if (!summarizable) return meta;
+
+  try {
+    const parsed = JSON.parse(input.redactedBody as string) as unknown;
+    const state: SummaryState = { truncated: false, arrayTotal: {} };
+    meta.data = capSummaryValue(parsed, 0, "$", state);
+    meta.ct = "json";
+    if (state.truncated) meta.truncated = true;
+    if (Object.keys(state.arrayTotal).length > 0)
+      meta.arrayTotal = state.arrayTotal;
+  } catch {
+    // Not parseable after redaction: size facts only, never a partial guess.
+    delete meta.data;
+  }
+  return meta;
 }
 
 function headersToRecord(
@@ -265,11 +427,15 @@ function applyFetchCorrelationHeaders(
 function bodyRedactionOptions(config: CrumbtrailConfig): {
   mode: "structured" | "full";
   denyFields?: string[];
+  keepFields?: string[];
 } {
   return {
     mode: config.redaction?.mode ?? "structured",
     ...(config.redaction?.denyFields
       ? { denyFields: config.redaction.denyFields }
+      : {}),
+    ...(config.redaction?.keepFields
+      ? { keepFields: config.redaction.keepFields }
       : {}),
   };
 }
@@ -280,6 +446,14 @@ function applyBodyResult(
 ): void {
   if (result.body !== undefined) target.body = result.body;
   if (result.bodySummary) target.bodySummary = result.bodySummary;
+}
+
+function applyResponseBodyMeta(
+  target: Record<string, unknown>,
+  input: Parameters<typeof buildResponseBodyMeta>[0],
+): void {
+  const meta = buildResponseBodyMeta(input);
+  if (meta) target.bodyMeta = meta;
 }
 
 /* ------------------------------------------------------------------ */
@@ -405,21 +579,32 @@ function wrapFetch(
     }
 
     const contentType = response.headers.get("content-type") ?? "";
+    const contentLength = response.headers.get("content-length");
 
     if (isSSE(contentType)) {
       const bodyResult = summarizeOmittedPayload("stream_payload", "body");
       applyBodyResult(resData, bodyResult);
       resMetadata.push(bodyResult.metadata);
+      applyResponseBodyMeta(resData, {
+        contentType,
+        contentLength,
+      });
     } else if (isBinaryContentType(contentType)) {
       const bodyResult = summarizeBinaryPayload(
         contentType,
-        response.headers.get("content-length"),
+        contentLength,
         "body",
       );
       applyBodyResult(resData, bodyResult);
       resMetadata.push(bodyResult.metadata);
+      applyResponseBodyMeta(resData, {
+        contentType,
+        contentLength,
+      });
     } else {
       try {
+        // clone() leaves the app's stream untouched — the page still reads the
+        // response itself.
         const cloned = response.clone();
         const text = await cloned.text();
         if (text) {
@@ -446,11 +631,21 @@ function wrapFetch(
           if (bodyResult.bodySummary)
             resData.bodySummary = bodyResult.bodySummary;
           resMetadata.push(bodyResult.metadata);
+          applyResponseBodyMeta(resData, {
+            contentType,
+            contentLength,
+            text,
+            redactedBody: bodyResult.body,
+          });
+        } else {
+          // Empty body: an event that says "200, JSON, 0 bytes" is evidence.
+          applyResponseBodyMeta(resData, { contentType, contentLength, text });
         }
       } catch {
         const bodyResult = summarizeOmittedPayload("body_read_failed", "body");
         applyBodyResult(resData, bodyResult);
         resMetadata.push(bodyResult.metadata);
+        applyResponseBodyMeta(resData, { contentType, contentLength });
       }
     }
 
@@ -700,21 +895,37 @@ function wrapXHR(
       }
 
       const contentType = this.getResponseHeader("content-type") ?? "";
+      const contentLength = this.getResponseHeader("content-length");
 
       if (isSSE(contentType)) {
         const bodyResult = summarizeOmittedPayload("stream_payload", "body");
         applyBodyResult(resData, bodyResult);
         resMetadata.push(bodyResult.metadata);
+        applyResponseBodyMeta(resData, {
+          contentType,
+          contentLength,
+        });
       } else if (isBinaryContentType(contentType)) {
         const bodyResult = summarizeBinaryPayload(
           contentType,
-          this.getResponseHeader("content-length"),
+          contentLength,
           "body",
         );
         applyBodyResult(resData, bodyResult);
         resMetadata.push(bodyResult.metadata);
+        applyResponseBodyMeta(resData, {
+          contentType,
+          contentLength,
+        });
       } else {
-        const text = this.responseText;
+        // responseText throws for a non-text responseType (json, blob,
+        // arraybuffer); the response still deserves its size facts.
+        let text: string | undefined;
+        try {
+          text = this.responseText;
+        } catch {
+          text = undefined;
+        }
         if (text) {
           const bodyResult = redactNetworkTextBody(text, {
             contentType,
@@ -739,6 +950,14 @@ function wrapXHR(
           if (bodyResult.bodySummary)
             resData.bodySummary = bodyResult.bodySummary;
           resMetadata.push(bodyResult.metadata);
+          applyResponseBodyMeta(resData, {
+            contentType,
+            contentLength,
+            text,
+            redactedBody: bodyResult.body,
+          });
+        } else {
+          applyResponseBodyMeta(resData, { contentType, contentLength });
         }
       }
 
@@ -791,6 +1010,134 @@ function wrapXHR(
 }
 
 /* ------------------------------------------------------------------ */
+/* Early-capture drain                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Replays one request `crumbtrail-core/early` captured before the SDK existed.
+ * The record carries raw text; every field leaves through the same redaction
+ * the live wrappers use, and the original timestamps are preserved so the
+ * first-paint requests sit in the timeline where they happened. `d.early`
+ * marks the pair as retro-emitted — the request went out before this patch,
+ * so response headers were never observed.
+ */
+function emitEarlyRecord(
+  bus: EventBus,
+  config: CrumbtrailConfig,
+  record: EarlyRequestRecord,
+): void {
+  const id = nextId++;
+  const urlResult = redactUrl(record.url, "url");
+  const reqMetadata: Array<RedactionMetadata | undefined> = [
+    urlResult.metadata,
+  ];
+  const reqData: Record<string, unknown> = {
+    id,
+    method: record.method,
+    url: urlResult.value,
+    early: true,
+  };
+  if (record.sessionId) reqData.sessionId = record.sessionId;
+  if (record.requestId) reqData.requestId = record.requestId;
+  if (record.traceId) reqData.traceId = record.traceId;
+  if (record.spanId) reqData.spanId = record.spanId;
+
+  if (record.reqBody !== undefined) {
+    const bodyResult = redactNetworkTextBody(record.reqBody, {
+      contentType: record.reqCt,
+      maxLength: config.networkMaxBodySize,
+      path: "body",
+      ...bodyRedactionOptions(config),
+    });
+    applyBodyResult(reqData, bodyResult);
+    reqMetadata.push(bodyResult.metadata);
+  }
+
+  attachRedactionMetadata(reqData, ...reqMetadata);
+  bus.emit({ t: record.t, k: "net.req", d: reqData });
+
+  const settledAt = record.t + record.dur;
+
+  if (record.err !== undefined) {
+    const errData: Record<string, unknown> = {
+      id,
+      method: record.method,
+      url: urlResult.value,
+      dur: record.dur,
+      msg: record.err,
+      transport: record.transport,
+      early: true,
+    };
+    if (record.sessionId) errData.sessionId = record.sessionId;
+    if (record.requestId) errData.requestId = record.requestId;
+    if (record.traceId) errData.traceId = record.traceId;
+    if (record.spanId) errData.spanId = record.spanId;
+    attachRedactionMetadata(errData, urlResult.metadata);
+    bus.emit({ t: settledAt, k: "net.err", d: errData });
+    return;
+  }
+
+  const resMetadata: Array<RedactionMetadata | undefined> = [];
+  const resData: Record<string, unknown> = {
+    id,
+    st: record.status ?? 0,
+    dur: record.dur,
+    early: true,
+  };
+  if (record.sessionId) resData.sessionId = record.sessionId;
+  if (record.requestId) resData.requestId = record.requestId;
+  if (record.traceId) resData.traceId = record.traceId;
+  if (record.spanId) resData.spanId = record.spanId;
+
+  if (record.resBody !== undefined) {
+    const bodyResult = redactNetworkTextBody(record.resBody, {
+      contentType: record.ct,
+      maxLength: config.networkMaxBodySize,
+      path: "body",
+      ...bodyRedactionOptions(config),
+    });
+    if (bodyResult.body !== undefined) {
+      const dedupResult = checkDedup(
+        urlResult.value,
+        bodyResult.body,
+        String(settledAt),
+      );
+      if (dedupResult) {
+        resData.body = dedupResult;
+        resData.dedup = true;
+      } else {
+        resData.body = bodyResult.body;
+      }
+    }
+    if (bodyResult.bodySummary) resData.bodySummary = bodyResult.bodySummary;
+    resMetadata.push(bodyResult.metadata);
+    applyResponseBodyMeta(resData, {
+      contentType: record.ct ?? "",
+      text: record.resBody,
+      redactedBody: bodyResult.body,
+    });
+  }
+
+  attachRedactionMetadata(resData, ...resMetadata);
+  bus.emit({ t: settledAt, k: "net.res", d: resData });
+}
+
+/**
+ * Drains the `crumbtrail-core/early` queue into the bus and defers the early
+ * patch permanently. A no-op when the early module was never imported.
+ */
+function drainEarlyRequests(bus: EventBus, config: CrumbtrailConfig): void {
+  for (const record of drainEarlyCapture()) {
+    if (shouldExclude(record.url, config)) continue;
+    try {
+      emitEarlyRecord(bus, config, record);
+    } catch {
+      // One malformed record never costs the rest of the queue.
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Collector export                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -799,6 +1146,10 @@ export function networkCollector(
   config: CrumbtrailConfig,
   context?: CollectorContext,
 ): CollectorCleanup {
+  // Drain before patching: the queued requests happened before this collector
+  // existed, so they belong at the head of the network timeline.
+  drainEarlyRequests(bus, config);
+
   const originalFetch = globalThis.fetch;
   const shouldPatchFetch = typeof originalFetch === "function";
 

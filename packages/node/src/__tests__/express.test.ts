@@ -231,6 +231,66 @@ describe("Crumbtrail Express-compatible middleware", () => {
     });
   });
 
+  it("captures a runtime warning into the session the middleware last saw", async () => {
+    const fetch = vi.fn().mockResolvedValue(okResponse());
+    const req = fakeRequest({
+      method: "GET",
+      path: "/api/health",
+      headers: {
+        "x-crumbtrail-session-id": "ses_warned",
+        "x-crumbtrail-request-id": "req_warned",
+      },
+    });
+    const res = new FakeResponse(200);
+
+    const middleware = createCrumbtrailExpressMiddleware({
+      fetch,
+      // Date.now-scale timestamps so the freshness window uses real arithmetic.
+      now: sequenceClock(1_700_000_000_000, 1_700_000_000_004),
+    });
+    try {
+      middleware(req, res, vi.fn());
+
+      const warning = Object.assign(
+        new Error(
+          "Possible EventEmitter memory leak detected. 11 flush listeners added.",
+        ),
+        { name: "MaxListenersExceededWarning" },
+      );
+      process.emitWarning(warning);
+      // `process.emitWarning` delivers on a later tick, not synchronously.
+      await new Promise((resolve) => setImmediate(resolve));
+      await flushPromises();
+
+      const warningCalls = fetch.mock.calls
+        .map((call) => JSON.parse(String(call[1]?.body)).events[0] as BugEvent)
+        .filter((event) => event.k === "backend.warning");
+      expect(warningCalls).toHaveLength(1);
+      expect(warningCalls[0]).toMatchObject({
+        sessionId: "ses_warned",
+        d: {
+          name: "MaxListenersExceededWarning",
+          message: expect.stringContaining("11 flush listeners"),
+        },
+      });
+    } finally {
+      middleware.crumbtrailWarningCapture?.stop();
+    }
+  });
+
+  it("drops a runtime warning observed before any session-bearing request", async () => {
+    const fetch = vi.fn().mockResolvedValue(okResponse());
+    const middleware = createCrumbtrailExpressMiddleware({ fetch });
+    try {
+      process.emitWarning(new Error("orphan warning"));
+      await new Promise((resolve) => setImmediate(resolve));
+      await flushPromises();
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      middleware.crumbtrailWarningCapture?.stop();
+    }
+  });
+
   it("does not leak raw query values, headers, body fields, or auth tokens into captured payloads", () => {
     const fetch = vi.fn().mockResolvedValue(okResponse());
     const req = fakeRequest({

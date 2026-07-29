@@ -34,6 +34,11 @@
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
     },
+    "./early": {
+      "types": "./dist/early.d.ts",
+      "import": "./dist/early.js",
+      "require": "./dist/early.cjs"
+    },
     "./package.json": "./package.json"
   },
   "files": [

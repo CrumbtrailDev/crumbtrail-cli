@@ -943,3 +943,57 @@ describe("Crumbtrail", () => {
     });
   });
 });
+
+describe("stop() delivery ordering", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response('{"ok":true}')),
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("awaits in-flight event batches before ending the session", async () => {
+    const order: string[] = [];
+    let releaseSend: () => void = () => {};
+    const sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    const transport = {
+      async sendEvents() {
+        order.push("send:start");
+        await sendGate;
+        order.push("send:done");
+      },
+      async sendBlob() {},
+      async startSession() {},
+      async endSession() {
+        order.push("endSession");
+      },
+      async sendBugReport() {},
+    };
+    const logger = Crumbtrail.init({
+      transportInstance: transport,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1000,
+    });
+    // Give startSession's microtasks a beat so sessionStarted is set.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    logger.mark("tail-event");
+    const stopping = logger.stop();
+    // The final flush hands the batch to the transport, which is now blocked
+    // mid-POST. endSession must not run until that send settles.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(order).toContain("send:start");
+    expect(order).not.toContain("endSession");
+    releaseSend();
+    await stopping;
+    expect(order.indexOf("send:done")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("endSession")).toBeGreaterThan(
+      order.indexOf("send:done"),
+    );
+  });
+});
