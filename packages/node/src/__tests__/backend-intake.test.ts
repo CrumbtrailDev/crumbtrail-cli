@@ -73,7 +73,7 @@ describe("backend intake client", () => {
         fetch,
         onWarning: (warning) => warnings.push(warning),
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
 
     expect(fetch).not.toHaveBeenCalled();
     expect(warnings).toEqual([
@@ -98,9 +98,10 @@ describe("backend intake client", () => {
         event: baseEvent,
         authToken: "local-secret-token",
         fetch,
+        retries: 0,
         onWarning: warnings.push.bind(warnings),
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
 
     expect(warnings).toEqual([
       {
@@ -145,13 +146,11 @@ describe("backend intake client", () => {
   });
 
   it("converts malformed JSON response text into a safe warning", async () => {
-    const fetch = vi
-      .fn()
-      .mockResolvedValue({
-        ok: true,
-        status: 200,
-        text: vi.fn().mockResolvedValue("{not-json local-secret-token"),
-      });
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: vi.fn().mockResolvedValue("{not-json local-secret-token"),
+    });
     const warnings: BackendIntakeWarning[] = [];
 
     await sendBackendEvent({
@@ -174,15 +173,13 @@ describe("backend intake client", () => {
   });
 
   it("converts malformed JSON response objects into a safe warning", async () => {
-    const fetch = vi
-      .fn()
-      .mockResolvedValue({
-        ok: true,
-        status: 200,
-        json: vi
-          .fn()
-          .mockResolvedValue({ ok: false, token: "local-secret-token" }),
-      });
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi
+        .fn()
+        .mockResolvedValue({ ok: false, token: "local-secret-token" }),
+    });
     const warnings: BackendIntakeWarning[] = [];
 
     await sendBackendEvent({
@@ -205,15 +202,13 @@ describe("backend intake client", () => {
   });
 
   it("converts response read failures into safe malformed-response warnings", async () => {
-    const fetch = vi
-      .fn()
-      .mockResolvedValue({
-        ok: true,
-        status: 200,
-        text: vi
-          .fn()
-          .mockRejectedValue(new SyntaxError("bad local-secret-token")),
-      });
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: vi
+        .fn()
+        .mockRejectedValue(new SyntaxError("bad local-secret-token")),
+    });
     const warnings: BackendIntakeWarning[] = [];
 
     await sendBackendEvent({
@@ -235,6 +230,57 @@ describe("backend intake client", () => {
     expect(JSON.stringify(warnings)).not.toContain("local-secret-token");
   });
 
+  it("retries a transport rejection and reports the event delivered once it lands", async () => {
+    const fetch = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("fetch failed"))
+      .mockResolvedValue(okJsonResponse());
+    const warnings: BackendIntakeWarning[] = [];
+
+    await expect(
+      sendBackendEvent({
+        event: baseEvent,
+        fetch,
+        retryDelayMs: 0,
+        sleep: async () => {},
+        onWarning: (warning) => warnings.push(warning),
+      }),
+    ).resolves.toBe(true);
+
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(warnings).toEqual([]);
+  });
+
+  it("gives up after the retry budget and reports the event undelivered", async () => {
+    const fetch = vi.fn().mockRejectedValue(new Error("fetch failed"));
+    const warnings: BackendIntakeWarning[] = [];
+
+    await expect(
+      sendBackendEvent({
+        event: baseEvent,
+        fetch,
+        retries: 2,
+        sleep: async () => {},
+        onWarning: (warning) => warnings.push(warning),
+      }),
+    ).resolves.toBe(false);
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(warnings).toHaveLength(1);
+  });
+
+  it("does not retry a response the endpoint actually answered", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValue({ ok: false, status: 503, text: vi.fn() });
+
+    await expect(
+      sendBackendEvent({ event: baseEvent, fetch, sleep: async () => {} }),
+    ).resolves.toBe(false);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("swallows warning callback failures to keep host responses safe", async () => {
     const fetch = vi.fn().mockRejectedValue(new Error("network failed"));
 
@@ -242,11 +288,12 @@ describe("backend intake client", () => {
       sendBackendEvent({
         event: baseEvent,
         fetch,
+        retries: 0,
         onWarning: () => {
           throw new Error("warning callback failed");
         },
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
   });
 });
 
