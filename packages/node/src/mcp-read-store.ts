@@ -206,9 +206,16 @@ export class RemoteMcpReadStore implements McpReadStore {
         headers: { Authorization: `Bearer ${this.token}` },
         signal: controller.signal,
       });
+      const artifact = await this.followDirectArtifactHandoff(
+        path,
+        method,
+        response,
+        controller.signal,
+      );
+      if (!artifact) return undefined;
       // Headers are all this stat consumes; drop the body without reading it.
-      void response.body?.cancel().catch(() => undefined);
-      return response;
+      void artifact.body?.cancel().catch(() => undefined);
+      return artifact;
     } catch {
       return undefined;
     } finally {
@@ -232,19 +239,66 @@ export class RemoteMcpReadStore implements McpReadStore {
         headers: { Authorization: `Bearer ${this.token}` },
         signal: controller.signal,
       });
-      if (!response.ok || this.exceedsBodyLimit(response)) {
-        void response.body?.cancel().catch(() => undefined);
+      const artifact = await this.followDirectArtifactHandoff(
+        path,
+        "GET",
+        response,
+        controller.signal,
+      );
+      if (!artifact || !artifact.ok || this.exceedsBodyLimit(artifact)) {
+        void artifact?.body?.cancel().catch(() => undefined);
         return undefined;
       }
       return mode === "buffer"
-        ? await this.readBoundedBody(response)
-        : await this.readBoundedBodyByteLength(response);
+        ? await this.readBoundedBody(artifact)
+        : await this.readBoundedBodyByteLength(artifact);
     } catch {
       return undefined;
     } finally {
       // The deadline deliberately remains armed while the response stream is
       // consumed. fetch() only resolves at headers, while a body can stall.
       clearTimeout(timeout);
+    }
+  }
+
+  /**
+   * Hosted artifact routes authenticate the agent then return a short lived
+   * edge URL and header grant. The actual bytes are fetched directly from the
+   * edge so Railway never becomes the artifact data path.
+   */
+  private async followDirectArtifactHandoff(
+    path: string,
+    method: "GET" | "HEAD",
+    response: Response,
+    signal: AbortSignal,
+  ): Promise<Response | undefined> {
+    if (response.headers.get("x-crumbtrail-artifact-read") !== "direct") {
+      return response;
+    }
+    // A HEAD response has no body, so make one authenticated metadata request
+    // to obtain the handoff before sending HEAD to the edge.
+    const handoffResponse = method === "HEAD"
+      ? await globalThis.fetch(`${this.baseUrl}${path}`, {
+          headers: { Authorization: `Bearer ${this.token}` },
+          signal,
+        })
+      : response;
+    if (!handoffResponse.ok) return undefined;
+    let handoff: unknown;
+    try {
+      handoff = await handoffResponse.json();
+    } catch {
+      return undefined;
+    }
+    if (!isDirectArtifactHandoff(handoff)) return undefined;
+    try {
+      return await globalThis.fetch(handoff.url, {
+        method,
+        headers: { Authorization: handoff.authorization },
+        signal,
+      });
+    } catch {
+      return undefined;
     }
   }
 
@@ -304,6 +358,23 @@ export class RemoteMcpReadStore implements McpReadStore {
       reader.releaseLock();
     }
   }
+}
+
+interface DirectArtifactHandoff {
+  handoff: "artifact.v2";
+  url: string;
+  authorization: string;
+}
+
+function isDirectArtifactHandoff(value: unknown): value is DirectArtifactHandoff {
+  if (value == null || typeof value !== "object") return false;
+  const handoff = value as Record<string, unknown>;
+  return (
+    handoff.handoff === "artifact.v2" &&
+    typeof handoff.url === "string" &&
+    typeof handoff.authorization === "string" &&
+    handoff.authorization.startsWith("Bearer ")
+  );
 }
 
 export function selectMcpReadStore(outputDir: string): McpReadStore {
