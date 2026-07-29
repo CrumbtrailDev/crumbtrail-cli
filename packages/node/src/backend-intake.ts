@@ -50,11 +50,35 @@ export interface SendBackendEventOptions {
   fetch?: FetchLike;
   signal?: AbortSignal;
   onWarning?: (warning: BackendIntakeWarning) => void;
+  /**
+   * Extra attempts after a transport level rejection. A capture server under a
+   * burst of event posts fills its accept backlog and the kernel resets the next
+   * connection, which surfaces as `TypeError: fetch failed`. Without a retry the
+   * event is gone and the session shows a hole. Defaults to
+   * {@link DEFAULT_BACKEND_INTAKE_RETRIES}; set to 0 to disable.
+   */
+  retries?: number;
+  /** Delay between attempts, in milliseconds. Defaults to {@link DEFAULT_BACKEND_INTAKE_RETRY_DELAY_MS}. */
+  retryDelayMs?: number;
+  /** Injection seam for tests. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
+/**
+ * Two extra attempts clear the backlog resets observed in practice without
+ * turning a genuinely unreachable endpoint into a long stall on every event.
+ */
+export const DEFAULT_BACKEND_INTAKE_RETRIES = 2;
+export const DEFAULT_BACKEND_INTAKE_RETRY_DELAY_MS = 25;
+
+/**
+ * Resolves once the event has been accepted, or once every attempt has failed.
+ * Returns whether the event actually reached the capture endpoint so a caller
+ * that owns a request lifecycle can record a gap when it did not.
+ */
 export async function sendBackendEvent(
   options: SendBackendEventOptions,
-): Promise<void> {
+): Promise<boolean> {
   const event = options.event;
   const sessionId =
     safeString(options.sessionId) ?? safeString(event.sessionId);
@@ -71,7 +95,7 @@ export async function sendBackendEvent(
       requestId,
       eventKind,
     });
-    return;
+    return false;
   }
 
   const fetchImpl = options.fetch ?? globalThis.fetch;
@@ -82,40 +106,85 @@ export async function sendBackendEvent(
         "Backend event was not sent because no fetch implementation is available.",
       ...warningContext,
     });
-    return;
+    return false;
   }
 
   const endpoint = normalizeEndpoint(options.endpoint);
   const headers: HeadersInitLike = { "Content-Type": "application/json" };
   const authToken = options.authToken?.trim();
   if (authToken) headers["X-Crumbtrail-Auth"] = authToken;
+  const body = JSON.stringify({ sessionId, events: [event] });
 
-  try {
-    const response = await fetchImpl(`${endpoint}/api/events`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ sessionId, events: [event] }),
-      signal: options.signal,
-    });
+  const attempts = Math.max(0, normalizeRetries(options.retries)) + 1;
+  const delayMs = normalizeRetryDelay(options.retryDelayMs);
+  const sleep = options.sleep ?? defaultSleep;
 
-    if (!response.ok) {
-      reportWarning(options.onWarning, {
-        kind: "http-error",
-        message: `Backend intake returned HTTP ${safeStatus(response.status) ?? "error"}.`,
-        status: safeStatus(response.status),
-        ...warningContext,
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetchImpl(`${endpoint}/api/events`, {
+        method: "POST",
+        headers,
+        body,
+        signal: options.signal,
       });
-      return;
-    }
 
-    await readAndValidateResponse(response);
-  } catch (error) {
-    reportWarning(options.onWarning, {
-      kind: classifyCaughtError(error),
-      message: safeErrorMessage(error),
-      ...warningContext,
-    });
+      if (!response.ok) {
+        reportWarning(options.onWarning, {
+          kind: "http-error",
+          message: `Backend intake returned HTTP ${safeStatus(response.status) ?? "error"}.`,
+          status: safeStatus(response.status),
+          ...warningContext,
+        });
+        return false;
+      }
+
+      await readAndValidateResponse(response);
+      return true;
+    } catch (error) {
+      const kind = classifyCaughtError(error);
+      // Only a transport rejection is worth repeating. A malformed response
+      // means the endpoint answered, and an aborted send means the caller
+      // withdrew, so neither improves by being sent again.
+      const retryable =
+        kind === "fetch-rejected" && !isAbort(error) && attempt < attempts;
+      if (!retryable) {
+        reportWarning(options.onWarning, {
+          kind,
+          message: safeErrorMessage(error),
+          ...warningContext,
+        });
+        return false;
+      }
+      await sleep(delayMs * attempt);
+    }
   }
+
+  return false;
+}
+
+function normalizeRetries(value: number | undefined): number {
+  return Number.isFinite(value)
+    ? Math.min(5, Math.round(value as number))
+    : DEFAULT_BACKEND_INTAKE_RETRIES;
+}
+
+function normalizeRetryDelay(value: number | undefined): number {
+  return Number.isFinite(value) && (value as number) >= 0
+    ? Math.round(value as number)
+    : DEFAULT_BACKEND_INTAKE_RETRY_DELAY_MS;
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    // The host application must never be held open by a capture retry.
+    if (typeof timer === "object" && typeof timer.unref === "function")
+      timer.unref();
+  });
+}
+
+function isAbort(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 export const postBackendEvent = sendBackendEvent;

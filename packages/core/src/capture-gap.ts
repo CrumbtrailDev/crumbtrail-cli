@@ -10,27 +10,27 @@ export interface BuildCaptureGapEventInput {
   reason: CaptureGapEventData["reason"];
   /** A safe diagnostic descriptor, never raw SQL or user data. */
   detail?: string;
+  /** Request the gap belongs to. Carried so an unterminated request names itself. */
+  requestId?: string;
   t?: number;
   sessionId?: string;
   sessionStartedAt?: number | Date;
 }
 
 const MAX_CAPTURE_GAP_DETAIL_LENGTH = 500;
+const MAX_CAPTURE_GAP_REQUEST_ID_LENGTH = 128;
 const REDACTED_VALUE = "[REDACTED]";
 
 // Capture gap details must never carry arbitrary values. These patterns cover the user data
 // shapes that are not handled by redactTokenLikeString's credential focused token patterns.
-const EMAIL_ADDRESS_RE =
-  /\b[A-Z0-9._%+-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)+\b/gi;
-const PHONE_LIKE_RE =
-  /(?<![A-Za-z0-9])\+?\d[\d().\s-]{6,}\d(?![A-Za-z0-9])/g;
+const EMAIL_ADDRESS_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9-]+(?:\.[A-Z0-9-]+)+\b/gi;
+const PHONE_LIKE_RE = /(?<![A-Za-z0-9])\+?\d[\d().\s-]{6,}\d(?![A-Za-z0-9])/g;
 const LONG_DIGIT_SEQUENCE_RE = /(?<!\d)\d{7,}(?!\d)/g;
 const SQL_KEYWORD_RE =
   /\b(INSERT|UPDATE|DELETE|MERGE|REPLACE|UPSERT|WITH|PREPARE|SELECT)\b/i;
 const SQL_TABLE_RE =
   /\b(?:INTO|UPDATE|FROM|TABLE)\s+((?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*)(?:\s*\.\s*(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*)){0,2})/i;
-const ERROR_CLASS_RE =
-  /\b(Error|[A-Z][A-Za-z0-9_$]*(?:Error|Exception))\b/g;
+const ERROR_CLASS_RE = /\b(Error|[A-Z][A-Za-z0-9_$]*(?:Error|Exception))\b/g;
 
 /**
  * Builds the canonical bounded completeness event. The input detail is redacted defensively and
@@ -41,11 +41,13 @@ export function buildCaptureGapEvent(
 ): BugEvent {
   const t = normalizeTimestamp(input.t);
   const detail = sanitizeDetail(input.detail);
+  const requestId = sanitizeRequestId(input.requestId);
   const d: CaptureGapEventData = {
     kind: "capture_gap",
     surface: input.surface,
     reason: input.reason,
     ...(detail ? { detail } : {}),
+    ...(requestId ? { requestId } : {}),
     t,
   };
   const event: BugEvent = {
@@ -83,6 +85,16 @@ function sanitizeDetail(value: string | undefined): string | undefined {
   return normalized
     ? normalized.slice(0, MAX_CAPTURE_GAP_DETAIL_LENGTH)
     : undefined;
+}
+
+/**
+ * Request ids are generated identifiers, not user data, so the value is kept
+ * verbatim apart from a length bound and a whitespace trim.
+ */
+function sanitizeRequestId(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, MAX_CAPTURE_GAP_REQUEST_ID_LENGTH);
 }
 
 function redactDetailValue(value: string): string {
