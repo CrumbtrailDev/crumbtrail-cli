@@ -562,6 +562,9 @@ const DB_WRITE_DETECTORS = new Set([
   "duplicate_write",
   "db_client_supplied_value",
   "db_unrequested_clear",
+  "response_count_mismatch",
+  "retry_loop_against_success",
+  "db_write_read_column_split",
 ]);
 
 /**
@@ -629,6 +632,9 @@ const NAMED_FAILURE_DETECTORS = new Set([
   "duplicate_write",
   "db_client_supplied_value",
   "db_unrequested_clear",
+  "response_count_mismatch",
+  "retry_loop_against_success",
+  "db_write_read_column_split",
   "otel_span_error",
 ]);
 

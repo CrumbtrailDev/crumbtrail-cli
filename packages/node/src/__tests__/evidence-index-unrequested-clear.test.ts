@@ -243,11 +243,18 @@ describe("db_unrequested_clear", () => {
   it("stays silent without a before snapshot", () => {
     const events = [
       req(1100, "req-patch", { status: "in_progress" }),
-      diff(1140, "req-patch", "update", "tasks", { id: 2 }, {
-        id: 2,
-        status: "in_progress",
-        description: null,
-      }),
+      diff(
+        1140,
+        "req-patch",
+        "update",
+        "tasks",
+        { id: 2 },
+        {
+          id: 2,
+          status: "in_progress",
+          description: null,
+        },
+      ),
     ];
     expect(find(events, "db_unrequested_clear")).toHaveLength(0);
   });
