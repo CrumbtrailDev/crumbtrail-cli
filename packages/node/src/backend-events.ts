@@ -8,6 +8,7 @@ import {
   buildCaptureGapEvent,
   mergeRedactionMetadata,
   parseTraceparent,
+  redactNetworkTextBody,
   redactTokenLikeString,
   redactUrl,
 } from "crumbtrail-core";
@@ -58,6 +59,16 @@ export interface BackendRequestEventInput {
 export interface BackendRequestEndEventInput extends BackendRequestEventInput {
   statusCode?: number;
   durationMs?: number;
+  /**
+   * The response the handler actually sent, already bounded by the caller.
+   * Redacted here through the same policy the browser plane uses, so a backend
+   * body is never held to a weaker standard than a captured one.
+   */
+  responseBody?: string;
+  /** Allowlisted response headers, already filtered by the caller. */
+  responseHeaders?: Record<string, string>;
+  /** Whether the caller truncated `responseBody` at its cap. */
+  responseBodyTruncated?: boolean;
 }
 
 export interface BackendRequestErrorEventInput extends BackendRequestEndEventInput {
@@ -140,6 +151,7 @@ export function buildBackendRequestEndEvent(
   if (Number.isFinite(input.statusCode)) payload.statusCode = input.statusCode;
   if (Number.isFinite(input.durationMs))
     payload.durationMs = Math.max(0, Math.round(input.durationMs as number));
+  attachResponseEvidence(payload, input);
   return buildEvent(
     BACKEND_REQUEST_END_EVENT,
     payload,
@@ -147,6 +159,57 @@ export function buildBackendRequestEndEvent(
     input.sessionStartedAt,
     correlation.sessionId,
   );
+}
+
+/**
+ * Attaches the response the handler sent, redacted.
+ *
+ * Until this existed, a request that never passed through an instrumented
+ * browser reached the bundle as a method, a path and a status code. On a corpus
+ * where the defect IS the sentence the server returned — a constraint violation
+ * naming neither column nor row, a migration failing "with an unspecified
+ * error", a success message reporting a count nothing wrote — that is a pointer
+ * to the problem rather than the problem.
+ *
+ * The body goes through `redactNetworkTextBody` under the same policy as the
+ * browser plane, so the application's declared keep and deny fields govern both
+ * planes identically and a backend body is never the weaker link. Headers are
+ * allowlisted by the caller; nothing here widens that.
+ */
+function attachResponseEvidence(
+  payload: Record<string, unknown>,
+  input: BackendRequestEndEventInput,
+): void {
+  if (input.responseHeaders && Object.keys(input.responseHeaders).length > 0)
+    payload.responseHeaders = { ...input.responseHeaders };
+
+  if (typeof input.responseBody !== "string" || input.responseBody === "")
+    return;
+
+  const contentType = headerValueOf(input.responseHeaders, "content-type");
+  const result = redactNetworkTextBody(input.responseBody, {
+    ...(contentType ? { contentType } : {}),
+    path: "responseBody",
+    // Structured explicitly, not by default: v2 keeps the shape a reader needs
+    // and stamps the policy declaration that lets the at-rest sanitizer
+    // recognise this as an already-redacted body instead of sweeping it whole.
+    mode: "structured",
+  });
+  if (result.body !== undefined) payload.responseBody = result.body;
+  if (result.bodySummary) payload.responseBodySummary = result.bodySummary;
+  if (input.responseBodyTruncated) payload.responseBodyTruncated = true;
+  attachRedactionMetadata(payload, result.metadata);
+}
+
+function headerValueOf(
+  headers: Record<string, string> | undefined,
+  name: string,
+): string | undefined {
+  if (!headers) return undefined;
+  const key = Object.keys(headers).find(
+    (candidate) => candidate.toLowerCase() === name,
+  );
+  return key ? headers[key] : undefined;
 }
 
 export function buildBackendRequestErrorEvent(

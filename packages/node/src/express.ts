@@ -39,6 +39,20 @@ export interface CrumbtrailExpressResponse {
   once?: (event: "finish", listener: () => void) => unknown;
 }
 
+/**
+ * The response members the recorder uses, kept off the public interface.
+ *
+ * Widening {@link CrumbtrailExpressResponse} with `write`/`end`/`getHeader`
+ * would make it structurally incompatible with Express's own `Response`, so a
+ * caller could no longer hand the middleware to `app.use`. These are read
+ * through a narrow local view instead, each one checked at runtime before use.
+ */
+interface ResponseInternals {
+  write?: (...args: never[]) => unknown;
+  end?: (...args: never[]) => unknown;
+  getHeader?: (name: string) => unknown;
+}
+
 export type CrumbtrailExpressMiddleware = (
   req: CrumbtrailExpressRequest,
   res: CrumbtrailExpressResponse,
@@ -81,7 +95,51 @@ export interface CrumbtrailExpressOptions {
    * autoCapture path recorded them.
    */
   captureRuntimeWarnings?: boolean;
+  /**
+   * Whether to record the response body on `backend.req.end`.
+   *
+   * `"error"` (default) captures it for 4xx and 5xx only, which is where the
+   * text that explains a failure lives and where a bundle is otherwise left
+   * holding a status code. `"all"` also captures successful responses, for the
+   * failures that answer 200 and lie about what they did. `"off"` restores the
+   * previous behavior.
+   *
+   * Whatever is captured goes through the same redaction policy as the browser
+   * plane before it is sent.
+   */
+  captureResponseBody?: "off" | "error" | "all";
+  /** Cap on captured response bytes. Beyond it the body is truncated and marked. */
+  responseBodyMaxBytes?: number;
+  /**
+   * Response headers to record, lowercase. Replaces the default allowlist
+   * rather than extending it, so a caller can never widen it by accident.
+   */
+  responseHeaderAllowlist?: readonly string[];
 }
+
+/**
+ * Headers that describe the response rather than authorize it.
+ *
+ * Allowlisted, never denylisted: a denylist is one forgotten vendor header away
+ * from writing a credential to disk. `set-cookie` and `authorization` are absent
+ * by construction, not by exclusion. Application headers that carry diagnostic
+ * counters are the reason a caller can supply its own list.
+ */
+const DEFAULT_RESPONSE_HEADER_ALLOWLIST = [
+  "content-type",
+  "content-length",
+  "content-encoding",
+  "cache-control",
+  "retry-after",
+  "location",
+  "x-request-id",
+] as const;
+
+const DEFAULT_RESPONSE_BODY_MAX_BYTES = 4096;
+
+/** Content types worth reading as text. Anything else is bytes to a reader. */
+const TEXTUAL_CONTENT_TYPE =
+  /^(application\/(json|.*\+json|xml|.*\+xml|x-www-form-urlencoded)|text\/)/i;
 
 interface RequestState {
   startedAtMs: number;
@@ -199,6 +257,8 @@ function attachFinishListener(
 ): void {
   if (typeof res.once !== "function") return;
 
+  const recorder = attachResponseRecorder(res, options);
+
   res.once("finish", () => {
     const now = readNow(options);
     const endEvent = buildBackendRequestEndEvent({
@@ -206,10 +266,146 @@ function attachFinishListener(
       now,
       statusCode: safeStatusCode(res.statusCode),
       durationMs: now - state.startedAtMs,
+      ...readResponseEvidence(res, recorder, options),
     });
 
     attemptSend(endEvent, options, state.sessionId);
   });
+}
+
+interface ResponseRecorder {
+  chunks: string[];
+  bytes: number;
+  truncated: boolean;
+}
+
+/**
+ * Buffers what the handler writes, up to the cap.
+ *
+ * `res.write`/`res.end` are wrapped rather than the stream piped, because a pipe
+ * changes the response's own backpressure and a capture layer must not alter
+ * what the user receives. Both wrappers return the original's return value
+ * unchanged, and every failure inside them is swallowed: recording evidence can
+ * never be the reason a response fails to send.
+ */
+function attachResponseRecorder(
+  res: CrumbtrailExpressResponse,
+  options: CrumbtrailExpressOptions,
+): ResponseRecorder | undefined {
+  const mode = options.captureResponseBody ?? "error";
+  if (mode === "off") return undefined;
+  const sink = res as ResponseInternals;
+  if (typeof sink.write !== "function" || typeof sink.end !== "function")
+    return undefined;
+
+  const cap = responseBodyCap(options);
+  if (cap <= 0) return undefined;
+
+  const recorder: ResponseRecorder = { chunks: [], bytes: 0, truncated: false };
+  const record = (chunk: unknown): void => {
+    if (recorder.bytes >= cap) return;
+    let text: string | undefined;
+    if (typeof chunk === "string") text = chunk;
+    else if (chunk instanceof Uint8Array) text = Buffer.from(chunk).toString("utf8");
+    if (text === undefined || text === "") return;
+    const remaining = cap - recorder.bytes;
+    if (text.length > remaining) {
+      recorder.chunks.push(text.slice(0, remaining));
+      recorder.bytes = cap;
+      recorder.truncated = true;
+      return;
+    }
+    recorder.chunks.push(text);
+    recorder.bytes += text.length;
+  };
+
+  const originalWrite = sink.write.bind(res) as (...args: never[]) => unknown;
+  const originalEnd = sink.end.bind(res) as (...args: never[]) => unknown;
+  sink.write = (...args: never[]) => {
+    try {
+      record(args[0]);
+    } catch {
+      /* never break the response */
+    }
+    return originalWrite(...args);
+  };
+  sink.end = (...args: never[]) => {
+    try {
+      // A function first argument is the callback overload, not a body.
+      if (typeof args[0] !== "function") record(args[0]);
+    } catch {
+      /* never break the response */
+    }
+    return originalEnd(...args);
+  };
+
+  return recorder;
+}
+
+function readResponseEvidence(
+  res: CrumbtrailExpressResponse,
+  recorder: ResponseRecorder | undefined,
+  options: CrumbtrailExpressOptions,
+): {
+  responseBody?: string;
+  responseHeaders?: Record<string, string>;
+  responseBodyTruncated?: boolean;
+} {
+  const mode = options.captureResponseBody ?? "error";
+  if (mode === "off") return {};
+
+  const headers = readAllowlistedHeaders(res, options);
+  const status = safeStatusCode(res.statusCode);
+  // "error" mode still records headers on a success: a content type that
+  // disagrees with what the caller parsed is itself the defect, and it costs
+  // nothing to keep.
+  if (mode === "error" && (status === undefined || status < 400))
+    return Object.keys(headers).length > 0 ? { responseHeaders: headers } : {};
+  if (!recorder || recorder.chunks.length === 0)
+    return Object.keys(headers).length > 0 ? { responseHeaders: headers } : {};
+
+  const contentType = headers["content-type"];
+  // A binary payload contributes nothing a reader can use and everything a
+  // capture budget cannot afford.
+  if (contentType && !TEXTUAL_CONTENT_TYPE.test(contentType))
+    return { responseHeaders: headers };
+
+  return {
+    responseBody: recorder.chunks.join(""),
+    ...(recorder.truncated ? { responseBodyTruncated: true } : {}),
+    ...(Object.keys(headers).length > 0 ? { responseHeaders: headers } : {}),
+  };
+}
+
+function readAllowlistedHeaders(
+  res: CrumbtrailExpressResponse,
+  options: CrumbtrailExpressOptions,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const source = res as ResponseInternals;
+  const getHeader = source.getHeader;
+  if (typeof getHeader !== "function") return out;
+  const allowlist =
+    options.responseHeaderAllowlist ?? DEFAULT_RESPONSE_HEADER_ALLOWLIST;
+  for (const name of allowlist) {
+    let raw: unknown;
+    try {
+      raw = getHeader.call(res, name);
+    } catch {
+      continue;
+    }
+    if (raw === undefined || raw === null) continue;
+    const value = Array.isArray(raw) ? raw.join(", ") : String(raw);
+    if (value) out[name.toLowerCase()] = value.slice(0, 300);
+  }
+  return out;
+}
+
+function responseBodyCap(options: CrumbtrailExpressOptions): number {
+  const configured = options.responseBodyMaxBytes;
+  if (typeof configured !== "number" || !Number.isFinite(configured))
+    return DEFAULT_RESPONSE_BODY_MAX_BYTES;
+  return Math.max(0, Math.floor(configured));
 }
 
 function exposeRequestIdHeader(
