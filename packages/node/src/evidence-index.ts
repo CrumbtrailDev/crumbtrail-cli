@@ -1704,6 +1704,37 @@ function addConsoleWarningCandidates(
   }
 }
 
+/** Field names that hold a server's own statement of what went wrong. */
+const SENTENCE_FIELDS = ["error", "message", "detail", "reason"] as const;
+const SENTENCE_MAX = 180;
+
+/**
+ * The one sentence a failing response stated, if it stated one.
+ *
+ * Reads only the conventional top-level fields, and only when the value is a
+ * plain string: a redacted value arrives as a `{$redacted, len, …}` placeholder,
+ * which is not a sentence and must never be pasted into a title as though it
+ * were. Anything unparseable yields nothing rather than a guess — a title is
+ * read as a claim about the failure, so a wrong one is worse than none.
+ */
+function responseSentence(raw: unknown): string | undefined {
+  if (typeof raw !== "string" || raw.length === 0) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+  for (const field of SENTENCE_FIELDS) {
+    const value = parsed[field];
+    if (typeof value !== "string") continue;
+    const text = scrubText(value, SENTENCE_MAX);
+    if (text) return text;
+  }
+  return undefined;
+}
+
 function addBackendErrorCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
@@ -1746,14 +1777,23 @@ function addBackendErrorCandidates(
     }
 
     const method = safeText(event.d.method, 20);
-    const route = redactUrl(event.d.route) ?? redactUrl(event.d.pathname);
+    // Pathname first, pattern second — same order as the request anchors. A
+    // title reading `/:id/run` tells a reader which handler; `/api/calcs/2/run`
+    // tells them which calculation, and that is the one they can go look at.
+    const route = redactUrl(event.d.pathname) ?? redactUrl(event.d.route);
     const errorCode = safeText(error?.code, 160) ?? safeText(error?.name, 160);
-    const message = scrubText(error?.message, 220);
+    // A thrown error carries `error.message`. A handler that answers
+    // `res.status(500).json({error: "…"})` throws nothing, so the only statement
+    // of what went wrong is the body it sent — which is most of them. Without
+    // this the ranked list says "Backend HTTP 500 from POST /api/calcs/2/run"
+    // and the sentence naming the missing relation sits unread in the event log.
+    const sentence = responseSentence(event.d.responseBody);
+    const message = scrubText(error?.message, 220) ?? sentence;
 
     drafts.push({
       detector,
       title:
-        `Backend ${status ? `HTTP ${status}` : "error"} from ${method ?? "request"} ${route ?? ""}`.trim(),
+        `Backend ${status ? `HTTP ${status}` : "error"} from ${method ?? "request"} ${route ?? ""}${sentence ? `: ${sentence}` : ""}`.trim(),
       severity,
       score,
       confidence: "high",
@@ -1999,6 +2039,16 @@ function collectErrorMoments(
     ) {
       // backend.uncaught carries no requestId; safeText returns undefined then.
       moments.push({ t: event.t, requestId: safeText(event.d.requestId, 120) });
+    } else if (event.k === "backend.req.end") {
+      // A request that answered 500 is an error moment even when no browser saw
+      // it. Only `net.res` counted before, so a failure reached through a driver,
+      // a job, a webhook or a service call left its writes graded as unlinked —
+      // and unlinked writes are the ones that roll up, which would have buried
+      // the very diffs that explain the failure.
+      const status = finiteNumber(event.d.statusCode);
+      if (status === undefined || status < 400) continue;
+      if (isHandledClientError(status, event.d.responseBody)) continue;
+      moments.push({ t: event.t, requestId: safeText(event.d.requestId, 120) });
     } else if (event.k === "net.err") {
       moments.push({ t: event.t });
     } else if (
@@ -2083,7 +2133,20 @@ function addDbDiffCandidates(
         message: `${op} on ${table}`,
         source: normalizeDbEngine(event.d.engine),
       }),
-      dedupeKey: `dbdiff:${event.t}:${requestId ?? ""}:${op}:${table}`,
+      // A diff tied to an error keeps its own identity, because which write it
+      // was is the whole question. A diff tied to nothing is a census entry:
+      // seeding a fixture writes hundreds, they are identical in everything a
+      // reader would use to tell them apart, and one candidate each is what
+      // spent 130 of the 200 ranked slots on ordinary inserts while the
+      // sentence explaining a failure never reached the list. Those roll up per
+      // table and operation, and `dedupeDrafts` counts them into `occurrences`,
+      // so "47 inserts on results" survives as a fact while costing one slot.
+      // The individual diffs are untouched in the event log and stay inside the
+      // evidence window either way.
+      dedupeKey:
+        linkage === "none"
+          ? `dbdiff:routine:${op}:${table}`
+          : `dbdiff:${event.t}:${requestId ?? ""}:${op}:${table}`,
     });
   }
 }
@@ -5480,7 +5543,13 @@ function addOtelDbActivityCandidates(
         message: statement ?? operation ?? system,
         source: `otel db activity (${system}); statements, not row diffs`,
       }),
-      dedupeKey: `oteldb:${safeText(event.d.spanId, 120) ?? event.t}:${requestId ?? ""}:${operation ?? ""}:${statement ?? ""}`,
+      // Same rollup as `db_mutation` above, for the same reason: spans tied to
+      // no error are a census of ordinary query traffic, and a statement
+      // repeated four hundred times is one fact, not four hundred candidates.
+      dedupeKey:
+        linkage === "none"
+          ? `oteldb:routine:${operation ?? ""}:${statement ?? ""}`
+          : `oteldb:${safeText(event.d.spanId, 120) ?? event.t}:${requestId ?? ""}:${operation ?? ""}:${statement ?? ""}`,
     });
   }
 }

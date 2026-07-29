@@ -450,7 +450,15 @@ describe("db_field_divergence — settlement rows that do not settle their paren
       .map((c, i) => (c.detector === "db_mutation" ? i : -1))
       .filter((i) => i >= 0);
     expect(settlement).toBeGreaterThanOrEqual(0);
-    expect(genericWrites).toHaveLength(6);
+    // Six writes, four distinct table-and-operation pairs: `products` is
+    // updated twice and `order_items` inserted twice. Writes tied to no error
+    // roll up per pair rather than taking a ranked slot each, so the six
+    // surface as four candidates carrying `occurrences`.
+    expect(genericWrites).toHaveLength(4);
+    const rolledUp = genericWrites
+      .map((i) => candidates[i])
+      .filter((c) => (c.occurrences ?? 1) > 1);
+    expect(rolledUp.map((c) => c.occurrences).sort()).toEqual([2, 2]);
     expect(settlement).toBeLessThan(Math.min(...genericWrites));
   });
 
