@@ -40,25 +40,25 @@ CRUMBTRAIL_PACKAGE_RUNTIME_PASS cli=dist/cli.cjs ...
 
 ## Local configuration contract
 
-| Flag                    |                            Default | Validation                                                                                       | Purpose                                                                                                                                   |
-| ----------------------- | ---------------------------------: | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `--host`                |                        `127.0.0.1` | Must be non-empty.                                                                               | Interface for the local server to bind.                                                                                                   |
-| `--port`                |                             `9898` | Must be an integer from 1 to 65535.                                                              | HTTP port.                                                                                                                                |
-| `--output`              |           `~/.crumbtrail/sessions` | Must be a non-empty local path.                                                                  | Directory where session artifacts are written.                                                                                            |
-| `--static`              |                              unset | If set, path must exist and be a directory.                                                      | Optional static directory to serve alongside API/session routes.                                                                          |
-| `--allow-origin`        |             localhost origins only | Must be an `http` or `https` origin containing only scheme, host, and optional port. Repeatable. | Additional browser origins allowed by CORS.                                                                                               |
-| `--auth-token`          | unset (or `CRUMBTRAIL_AUTH_TOKEN`) | Presence is reported, but token content is never logged.                                         | Optional token required for `/api/*` routes. The `--auth-token` flag wins; otherwise a non-blank `CRUMBTRAIL_AUTH_TOKEN` env var is used. |
-| `--keep-field`          |     none (or `CRUMBTRAIL_KEEP_FIELDS`) | Comma separated or repeatable. Matched on the whole field name.                                  | Field names kept verbatim instead of redacted by name, in JSON bodies, `db.diff` rows, and query strings alike. Overrides only the built in name heuristics; value based detection still removes tokens, emails, and card numbers inside a kept field. Flags add to the env var. Printed at boot. |
-| `--mcp`                 |                            `false` | Boolean flag.                                                                                    | Run MCP server mode against the output directory instead of HTTP mode.                                                                    |
-| `--ai`                  |                            `false` | Boolean flag.                                                                                    | Opt into an LLM produced opinion after finalization.                                                                                      |
-| `--ai-model`            |                              unset | Parsed as an opaque model string.                                                                | Model override for the LLM produced opinion.                                                                                              |
-| `--ai-allow-auto-model` |                            `false` | Boolean flag.                                                                                    | Allow provider auto-model selection.                                                                                                      |
+| Flag                    |                            Default | Validation                                                                                       | Purpose                                                                                                                                                                                                                                                                                           |
+| ----------------------- | ---------------------------------: | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--host`                |                        `127.0.0.1` | Must be non-empty.                                                                               | Interface for the local server to bind.                                                                                                                                                                                                                                                           |
+| `--port`                |                             `9898` | Must be an integer from 1 to 65535.                                                              | HTTP port.                                                                                                                                                                                                                                                                                        |
+| `--output`              |           `~/.crumbtrail/sessions` | Must be a non-empty local path.                                                                  | Directory where session artifacts are written.                                                                                                                                                                                                                                                    |
+| `--static`              |                              unset | If set, path must exist and be a directory.                                                      | Optional static directory to serve alongside API/session routes.                                                                                                                                                                                                                                  |
+| `--allow-origin`        |             localhost origins only | Must be an `http` or `https` origin containing only scheme, host, and optional port. Repeatable. | Additional browser origins allowed by CORS.                                                                                                                                                                                                                                                       |
+| `--auth-token`          | unset (or `CRUMBTRAIL_AUTH_TOKEN`) | Presence is reported, but token content is never logged.                                         | Optional token required for `/api/*` routes. The `--auth-token` flag wins; otherwise a non-blank `CRUMBTRAIL_AUTH_TOKEN` env var is used.                                                                                                                                                         |
+| `--keep-field`          | none (or `CRUMBTRAIL_KEEP_FIELDS`) | Comma separated or repeatable. Matched on the whole field name.                                  | Field names kept verbatim instead of redacted by name, in JSON bodies, `db.diff` rows, and query strings alike. Overrides only the built in name heuristics; value based detection still removes tokens, emails, and card numbers inside a kept field. Flags add to the env var. Printed at boot. |
+| `--mcp`                 |                            `false` | Boolean flag.                                                                                    | Run MCP server mode against the output directory instead of HTTP mode.                                                                                                                                                                                                                            |
+| `--ai`                  |                            `false` | Boolean flag.                                                                                    | Opt into an LLM produced opinion after finalization.                                                                                                                                                                                                                                              |
+| `--ai-model`            |                              unset | Parsed as an opaque model string.                                                                | Model override for the LLM produced opinion.                                                                                                                                                                                                                                                      |
+| `--ai-allow-auto-model` |                            `false` | Boolean flag.                                                                                    | Allow provider auto-model selection.                                                                                                                                                                                                                                                              |
 
 ### Source map resolution
 
-| Variable                    | Default | Purpose                                                                                                          |
-| --------------------------- | ------: | ---------------------------------------------------------------------------------------------------------------- |
-| `CRUMBTRAIL_SOURCEMAP_DIR`  |   unset | Directory of build output holding `.map` files. When set, a candidate's `anchor.frame` is resolved to the original source. |
+| Variable                   | Default | Purpose                                                                                                                    |
+| -------------------------- | ------: | -------------------------------------------------------------------------------------------------------------------------- |
+| `CRUMBTRAIL_SOURCEMAP_DIR` |   unset | Directory of build output holding `.map` files. When set, a candidate's `anchor.frame` is resolved to the original source. |
 
 A frame captured on a minified build names a bundler chunk, such as
 `/_next/static/chunks/4526-abc.js:1:24891`. Point this at the directory your
@@ -414,6 +414,21 @@ the full chronological event stream, zstd-compressed as `events.ndjson.zst`, alo
 (`cold.transcode.redaction: "sanitized-before-cold-write"`), and the cold event stream is
 opened only when raw chronological evidence is required (zstd needs Node ≥ 22.15.0). The
 manifest's `accessPattern` field documents this read order for tools and operators.
+
+## Backend request lifecycle
+
+Every request the express middleware starts reaches a terminal record. `backend.req.end` is
+emitted when the response finishes, and also when the response closes after its body was
+already written; a response that closes before finishing has no status to report, so the
+request emits a `capture_gap` with `surface: "backend_request"` and `reason:
+"request_unterminated"` instead. Exactly one of the two is emitted per request.
+
+Event delivery is retried on a transport level rejection, because a capture server under a
+burst of event posts fills its accept backlog and the kernel resets the next connection, which
+arrives as `TypeError: fetch failed` and used to drop the event silently. Set `retries: 0` to
+send each event exactly once. If a `backend.req.end` still never lands, the request emits a
+`capture_gap` with `reason: "delivery_failed"` carrying the same `requestId`, so a reader sees
+a named hole rather than a request that appears never to have happened.
 
 ## Public API boundary
 
