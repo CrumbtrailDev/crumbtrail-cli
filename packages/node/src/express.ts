@@ -1,4 +1,4 @@
-import type { BugEvent } from "crumbtrail-core";
+import { buildCaptureGapEvent, type BugEvent } from "crumbtrail-core";
 import {
   CRUMBTRAIL_REQUEST_HEADER,
   buildBackendRequestEndEvent,
@@ -36,7 +36,12 @@ export interface CrumbtrailExpressRequest {
 
 export interface CrumbtrailExpressResponse {
   statusCode?: number;
-  once?: (event: "finish", listener: () => void) => unknown;
+  /**
+   * True once the response body has been fully handed to the socket. Read on
+   * `close` to tell a completed response from one the peer cut short.
+   */
+  writableEnded?: boolean;
+  once?: (event: "finish" | "close", listener: () => void) => unknown;
 }
 
 export type CrumbtrailExpressMiddleware = (
@@ -74,6 +79,14 @@ export interface CrumbtrailExpressOptions {
   now?: NowResolver;
   onWarning?: (warning: BackendIntakeWarning) => void;
   /**
+   * Extra delivery attempts after a transport level rejection, forwarded to the
+   * intake client. Defaults to the intake client's own default; set to 0 to
+   * send each event exactly once.
+   */
+  retries?: number;
+  /** Delay between delivery attempts, in milliseconds. */
+  retryDelayMs?: number;
+  /**
    * Capture `process.on("warning")` runtime warnings (MaxListenersExceeded,
    * deprecations) into the session the middleware most recently saw. Default
    * on: these warnings are the platform naming a defect the application never
@@ -87,6 +100,12 @@ interface RequestState {
   startedAtMs: number;
   sessionId?: string;
   requestId: string;
+  /**
+   * Set the moment the request's terminal event is built. `finish` and `close`
+   * both fire for an ordinary response, so without this a request would report
+   * two ends; with it, whichever fires first owns the terminal event.
+   */
+  settled?: boolean;
 }
 
 const requestStates = new WeakMap<CrumbtrailExpressRequest, RequestState>();
@@ -101,8 +120,7 @@ const requestStates = new WeakMap<CrumbtrailExpressRequest, RequestState>();
  */
 const WARNING_SESSION_FRESH_MS = 120_000;
 
-export interface CrumbtrailExpressMiddlewareWithHandle
-  extends CrumbtrailExpressMiddleware {
+export interface CrumbtrailExpressMiddlewareWithHandle extends CrumbtrailExpressMiddleware {
   /** Present when runtime warning capture installed; `stop()` releases it. */
   crumbtrailWarningCapture?: BackendWarningCaptureHandle;
 }
@@ -191,6 +209,14 @@ export function createCrumbtrailExpressErrorMiddleware(
   };
 }
 
+/**
+ * Every started request has to reach a terminal event. `finish` covers the
+ * ordinary response, `close` covers the response the peer aborted or the server
+ * destroyed, and the `settled` flag makes sure exactly one of them emits. When
+ * `close` arrives on a response that never finished writing there is no status
+ * to report, so the request leaves a `capture_gap` naming itself rather than
+ * simply disappearing from the session.
+ */
 function attachFinishListener(
   req: CrumbtrailExpressRequest,
   res: CrumbtrailExpressResponse,
@@ -200,16 +226,65 @@ function attachFinishListener(
   if (typeof res.once !== "function") return;
 
   res.once("finish", () => {
-    const now = readNow(options);
-    const endEvent = buildBackendRequestEndEvent({
-      ...readRequestInput(req, options, state),
-      now,
-      statusCode: safeStatusCode(res.statusCode),
-      durationMs: now - state.startedAtMs,
-    });
-
-    attemptSend(endEvent, options, state.sessionId);
+    if (state.settled) return;
+    state.settled = true;
+    emitRequestEnd(req, res, options, state);
   });
+
+  res.once("close", () => {
+    if (state.settled) return;
+    state.settled = true;
+    if (res.writableEnded) {
+      emitRequestEnd(req, res, options, state);
+      return;
+    }
+    emitRequestGap(options, state, "request_unterminated");
+  });
+}
+
+function emitRequestEnd(
+  req: CrumbtrailExpressRequest,
+  res: CrumbtrailExpressResponse,
+  options: CrumbtrailExpressOptions,
+  state: RequestState,
+): void {
+  const now = readNow(options);
+  const endEvent = buildBackendRequestEndEvent({
+    ...readRequestInput(req, options, state),
+    now,
+    statusCode: safeStatusCode(res.statusCode),
+    durationMs: now - state.startedAtMs,
+  });
+
+  attemptSend(endEvent, options, state.sessionId, (delivered) => {
+    // The terminal event is the one whose loss reads as "nothing happened
+    // here", so a delivery that never landed leaves a marker in its place.
+    if (delivered) return;
+    emitRequestGap(options, state, "delivery_failed");
+  });
+}
+
+function emitRequestGap(
+  options: CrumbtrailExpressOptions,
+  state: RequestState,
+  reason: "request_unterminated" | "delivery_failed",
+): void {
+  if (!state.sessionId) return;
+  try {
+    attemptSend(
+      buildCaptureGapEvent({
+        surface: "backend_request",
+        reason,
+        requestId: state.requestId,
+        sessionId: state.sessionId,
+        t: readNow(options),
+      }),
+      options,
+      state.sessionId,
+    );
+  } catch {
+    // Completeness reporting is best effort and never affects the response path.
+  }
 }
 
 function exposeRequestIdHeader(
@@ -317,6 +392,7 @@ function attemptSend(
   event: BugEvent,
   options: CrumbtrailExpressOptions,
   sessionId?: string,
+  onSettled?: (delivered: boolean) => void,
 ): void {
   void sendBackendEvent({
     event,
@@ -326,8 +402,13 @@ function attemptSend(
     fetch: options.fetch,
     signal: options.signal,
     onWarning: options.onWarning,
-  }).catch(() => {
-    // sendBackendEvent is expected to resolve all degraded intake states. This
-    // final catch keeps host application responses safe if that contract changes.
-  });
+    retries: options.retries,
+    retryDelayMs: options.retryDelayMs,
+  })
+    .then((delivered) => onSettled?.(delivered))
+    .catch(() => {
+      // sendBackendEvent is expected to resolve all degraded intake states. This
+      // final catch keeps host application responses safe if that contract changes.
+      onSettled?.(false);
+    });
 }
