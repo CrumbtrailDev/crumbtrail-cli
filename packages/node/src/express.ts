@@ -115,6 +115,18 @@ export interface CrumbtrailExpressOptions {
    * rather than extending it, so a caller can never widen it by accident.
    */
   responseHeaderAllowlist?: readonly string[];
+  /**
+   * Field names to exempt from the name-based redaction rules, the backend
+   * counterpart of the browser SDK's `redaction.keepFields`.
+   *
+   * Give it the same list both planes, or the same field is readable in a
+   * captured request and placeholdered in the response that answered it. The
+   * exemption is name-scoped only: every value-based check still runs, so an
+   * email, a card number or a high-entropy token under a kept name is still
+   * redacted. The list is carried in the event's policy declaration, so the
+   * capture server's re-classification honors it instead of undoing it at rest.
+   */
+  keepFields?: readonly string[];
 }
 
 /**
@@ -350,6 +362,7 @@ function readResponseEvidence(
   responseBody?: string;
   responseHeaders?: Record<string, string>;
   responseBodyTruncated?: boolean;
+  keepFields?: readonly string[];
 } {
   const mode = options.captureResponseBody ?? "error";
   if (mode === "off") return {};
@@ -372,6 +385,9 @@ function readResponseEvidence(
 
   return {
     responseBody: recorder.chunks.join(""),
+    ...(options.keepFields && options.keepFields.length > 0
+      ? { keepFields: options.keepFields }
+      : {}),
     ...(recorder.truncated ? { responseBodyTruncated: true } : {}),
     ...(Object.keys(headers).length > 0 ? { responseHeaders: headers } : {}),
   };
