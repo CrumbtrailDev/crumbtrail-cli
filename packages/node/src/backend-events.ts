@@ -8,6 +8,7 @@ import {
   buildCaptureGapEvent,
   mergeRedactionMetadata,
   parseTraceparent,
+  redactNetworkTextBody,
   redactTokenLikeString,
   redactUrl,
 } from "crumbtrail-core";
@@ -59,21 +60,23 @@ export interface BackendRequestEndEventInput extends BackendRequestEventInput {
   statusCode?: number;
   durationMs?: number;
   /**
-   * Already-redacted request and response payloads. The express middleware
-   * redacts with the same `crumbtrail.browser-redaction.v2` policy the browser
-   * transport uses before handing them here, so this builder never sees a raw
-   * body and cannot become a second redaction path.
-   *
-   * Named `body` / `reqBody` to match the browser's `net.res` / `net.req`
-   * shape: the detectors that read a response body join on those field names,
-   * and a backend-only exchange should reach them by the same route rather
-   * than needing a parallel one.
+   * The response the handler actually sent, already bounded by the caller.
+   * Redacted here through the same policy the browser plane uses, so a backend
+   * body is never held to a weaker standard than a captured one.
    */
-  body?: unknown;
-  bodySummary?: unknown;
-  reqBody?: unknown;
-  reqBodySummary?: unknown;
-  bodyRedaction?: RedactionMetadata;
+  responseBody?: string;
+  /** Allowlisted response headers, already filtered by the caller. */
+  responseHeaders?: Record<string, string>;
+  /** Whether the caller truncated `responseBody` at its cap. */
+  responseBodyTruncated?: boolean;
+  /**
+   * Field names the application declares keepable, exactly as the browser SDK's
+   * `redaction.keepFields`. Exempts a NAME from the name-based deny rules; every
+   * value-based check still runs, and the list is carried in the event's policy
+   * declaration so the capture server's re-classification applies the same
+   * exemption instead of undoing it at rest.
+   */
+  keepFields?: readonly string[];
 }
 
 export interface BackendRequestErrorEventInput extends BackendRequestEndEventInput {
@@ -156,7 +159,7 @@ export function buildBackendRequestEndEvent(
   if (Number.isFinite(input.statusCode)) payload.statusCode = input.statusCode;
   if (Number.isFinite(input.durationMs))
     payload.durationMs = Math.max(0, Math.round(input.durationMs as number));
-  attachBodies(payload, input);
+  attachResponseEvidence(payload, input);
   return buildEvent(
     BACKEND_REQUEST_END_EVENT,
     payload,
@@ -167,25 +170,57 @@ export function buildBackendRequestEndEvent(
 }
 
 /**
- * Copies the already-redacted payload fields onto the event, and merges their
- * redaction metadata with whatever the URL and route sanitizers recorded so one
- * event reports one policy decision set.
+ * Attaches the response the handler sent, redacted.
+ *
+ * Until this existed, a request that never passed through an instrumented
+ * browser reached the bundle as a method, a path and a status code. On a corpus
+ * where the defect IS the sentence the server returned — a constraint violation
+ * naming neither column nor row, a migration failing "with an unspecified
+ * error", a success message reporting a count nothing wrote — that is a pointer
+ * to the problem rather than the problem.
+ *
+ * The body goes through `redactNetworkTextBody` under the same policy as the
+ * browser plane, so the application's declared keep and deny fields govern both
+ * planes identically and a backend body is never the weaker link. Headers are
+ * allowlisted by the caller; nothing here widens that.
  */
-function attachBodies(
+function attachResponseEvidence(
   payload: Record<string, unknown>,
   input: BackendRequestEndEventInput,
 ): void {
-  if (input.body !== undefined) payload.body = input.body;
-  if (input.bodySummary !== undefined) payload.bodySummary = input.bodySummary;
-  if (input.reqBody !== undefined) payload.reqBody = input.reqBody;
-  if (input.reqBodySummary !== undefined)
-    payload.reqBodySummary = input.reqBodySummary;
-  if (!input.bodyRedaction) return;
-  // buildBasePayload already wrote `redaction` for the URL and route. Passing
-  // only the body metadata to attachRedactionMetadata would replace it, so the
-  // existing record is merged back in.
-  const existing = payload.redaction as RedactionMetadata | undefined;
-  attachRedactionMetadata(payload, existing, input.bodyRedaction);
+  if (input.responseHeaders && Object.keys(input.responseHeaders).length > 0)
+    payload.responseHeaders = { ...input.responseHeaders };
+
+  if (typeof input.responseBody !== "string" || input.responseBody === "")
+    return;
+
+  const contentType = headerValueOf(input.responseHeaders, "content-type");
+  const result = redactNetworkTextBody(input.responseBody, {
+    ...(contentType ? { contentType } : {}),
+    path: "responseBody",
+    // Structured explicitly, not by default: v2 keeps the shape a reader needs
+    // and stamps the policy declaration that lets the at-rest sanitizer
+    // recognise this as an already-redacted body instead of sweeping it whole.
+    mode: "structured",
+    ...(input.keepFields && input.keepFields.length > 0
+      ? { keepFields: [...input.keepFields] }
+      : {}),
+  });
+  if (result.body !== undefined) payload.responseBody = result.body;
+  if (result.bodySummary) payload.responseBodySummary = result.bodySummary;
+  if (input.responseBodyTruncated) payload.responseBodyTruncated = true;
+  attachRedactionMetadata(payload, result.metadata);
+}
+
+function headerValueOf(
+  headers: Record<string, string> | undefined,
+  name: string,
+): string | undefined {
+  if (!headers) return undefined;
+  const key = Object.keys(headers).find(
+    (candidate) => candidate.toLowerCase() === name,
+  );
+  return key ? headers[key] : undefined;
 }
 
 export function buildBackendRequestErrorEvent(
@@ -198,15 +233,9 @@ export function buildBackendRequestErrorEvent(
   if (Number.isFinite(input.durationMs))
     payload.durationMs = Math.max(0, Math.round(input.durationMs as number));
 
-  attachBodies(payload, input);
-
   const error = sanitizeError(input.error);
   payload.error = omitMetadata(error);
-  attachRedactionMetadata(
-    payload,
-    payload.redaction as RedactionMetadata | undefined,
-    error.metadata,
-  );
+  attachRedactionMetadata(payload, error.metadata);
 
   return buildEvent(
     BACKEND_REQUEST_ERROR_EVENT,

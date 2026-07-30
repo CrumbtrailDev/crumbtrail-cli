@@ -103,11 +103,15 @@ const TRACKER_BEACON_SCORE = 15;
 // stay findable.
 const HANDLED_CLIENT_ERROR_SCORE = 30;
 
-// 4xx statuses that are an authentication or authorization challenge. Answering one is how the
-// protocol works — an unauthenticated visitor polling /api/me gets a 401 on every page load — so
-// these need no body evidence to count as deliberate. Deliberately excludes 408/429: a timeout or a
-// throttle is a real operational signal, and only a structured body demotes those.
-const AUTH_CHALLENGE_STATUSES = new Set([401, 403]);
+// An authentication challenge. Answering one is how the protocol works — an unauthenticated
+// visitor polling /api/me gets a 401 on every page load — so it needs no body evidence to count
+// as deliberate. Deliberately excludes 408/429: a timeout or a throttle is a real operational
+// signal, and only a structured body demotes those.
+const UNAUTHENTICATED_STATUS = 401;
+
+// A refusal, which is only routine when the session shows an authentication flow around it.
+// See {@link isHandledClientError}.
+const FORBIDDEN_STATUS = 403;
 
 // Keys whose presence in a JSON response body proves a handler chose this outcome and named it,
 // rather than something failing its way into a 4xx. `type` + `title` covers RFC 9457 problem
@@ -611,6 +615,8 @@ export function buildEvidenceCandidates(
   addWriteReadColumnSplitCandidates(events, index, drafts);
   addEmptyDownloadCandidates(events, index, drafts, requestById);
   addContentTypeBodyMismatchCandidates(events, index, drafts, requestById);
+  addApiRouteReturnedDocumentCandidates(events, index, drafts, requestById);
+  addAcknowledgedWriteNeverLandedCandidates(events, index, drafts);
   addLatencyOutlierCandidates(events, index, drafts, requestById);
   addIneffectiveInputCandidates(events, index, drafts, mutatingRequests);
   addUiArithmeticMismatchCandidates(events, index, drafts);
@@ -1746,7 +1752,13 @@ function addBackendErrorCandidates(
     }
 
     const method = safeText(event.d.method, 20);
-    const route = redactUrl(event.d.route) ?? redactUrl(event.d.pathname);
+    // The concrete path first, the framework's route pattern only as a fallback.
+    // A title reading "POST /:id/run" names five different endpoints at once, and
+    // the same value keys the dedupe below, so distinct failing endpoints used to
+    // collapse into one finding. `pathname` is on the same event.
+    const pathname = redactUrl(event.d.pathname);
+    const routePattern = redactUrl(event.d.route);
+    const route = pathname ?? routePattern;
     const errorCode = safeText(error?.code, 160) ?? safeText(error?.name, 160);
     const message = scrubText(error?.message, 220);
 
@@ -1762,6 +1774,7 @@ function addBackendErrorCandidates(
         offsetMs:
           offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
         route,
+        url: route,
         requestId,
         method,
         status,
@@ -10711,10 +10724,37 @@ function bodyNamesItsOwnError(body: unknown): boolean {
 function isHandledClientError(
   status: number | undefined,
   body: unknown,
+  sessionSawAuthChallenge = true,
 ): boolean {
   if (status === undefined || status < 400 || status > 499) return false;
-  if (AUTH_CHALLENGE_STATUSES.has(status)) return true;
+  if (status === UNAUTHENTICATED_STATUS) return true;
+  // A 403 is only "handled" when the session actually contains an authentication
+  // flow. Without one, the caller was authenticated the whole way and the server
+  // still refused: that is an authorization defect — a permission computed
+  // against the wrong object, a role check reading a stale claim — and demoting
+  // it as a routine challenge is how those disappear from a bundle entirely.
+  if (status === FORBIDDEN_STATUS) return sessionSawAuthChallenge;
   return bodyNamesItsOwnError(body);
+}
+
+/**
+ * Whether the session contains a real authentication challenge.
+ *
+ * A 401 on either plane is the signal. Its presence makes a sibling 403 an
+ * expected part of a sign-in or token-refresh flow; its absence makes a 403 a
+ * refusal handed to a caller who never had anything to prove.
+ */
+function sessionHasAuthChallenge(events: BugEvent[]): boolean {
+  for (const event of events) {
+    if (event.k === "net.res" && finiteNumber(event.d.st) === UNAUTHENTICATED_STATUS)
+      return true;
+    if (
+      event.k === "backend.req.end" &&
+      finiteNumber(event.d.statusCode) === UNAUTHENTICATED_STATUS
+    )
+      return true;
+  }
+  return false;
 }
 
 /**
@@ -10737,6 +10777,7 @@ function demoteHandledClientErrors(
   // Shared correlation ids (net.res `d.requestId`, not the browser-local `d.id`)
   // whose frontend response was judged handled.
   const handledSharedIds = new Set<string>();
+  const sawAuthChallenge = sessionHasAuthChallenge(events);
   const bodyByBrowserId = responseBodyByRequestId(events);
   const sharedIdByBrowserId = new Map<string, string>();
   for (const event of events) {
@@ -10758,7 +10799,8 @@ function demoteHandledClientErrors(
     if (draft.detector !== "http_error") continue;
     const browserId = draft.anchor.requestId;
     const body = browserId ? bodyByBrowserId.get(browserId) : undefined;
-    if (!isHandledClientError(draft.anchor.status, body)) continue;
+    if (!isHandledClientError(draft.anchor.status, body, sawAuthChallenge))
+      continue;
     if (browserId) {
       const sharedId = sharedIdByBrowserId.get(browserId);
       if (sharedId) handledSharedIds.add(sharedId);
@@ -10774,14 +10816,180 @@ function demoteHandledClientErrors(
   for (const draft of drafts) {
     if (draft.detector !== "backend_http_client_error") continue;
     const sharedId = draft.anchor.requestId;
+    const status = draft.anchor.status ?? 0;
     const handled =
-      AUTH_CHALLENGE_STATUSES.has(draft.anchor.status ?? 0) ||
+      status === UNAUTHENTICATED_STATUS ||
+      (status === FORBIDDEN_STATUS && sawAuthChallenge) ||
       (sharedId !== undefined && handledSharedIds.has(sharedId));
     if (!handled) continue;
     demote(
       draft,
       `handled4xx:backend:${draft.anchor.method ?? ""}:${draft.anchor.route ?? ""}:${draft.anchor.status ?? ""}`,
     );
+  }
+}
+
+// ─── acknowledged_write_never_landed ─────────────────────────────────────────
+
+/**
+ * One under {@link DB_INVARIANT_SCORE}: the contradiction is between an HTTP
+ * acknowledgement and the database plane rather than between two images of the
+ * same row, exactly as {@link ACKNOWLEDGED_WRITE_LOST_SCORE} is.
+ */
+const ACKNOWLEDGED_WRITE_NEVER_LANDED_SCORE = 88;
+
+/** Mutating methods whose 2xx is a promise that something was stored. */
+const CREATING_METHODS = new Set(["POST", "PUT", "PATCH"]);
+
+/**
+ * acknowledged_write_never_landed: the server said "created" and stored nothing.
+ *
+ * A mutating request answered 201 — or 2xx with a created-entity id in its body —
+ * that read the instrumented database during the request and wrote nothing to it.
+ * The client is handed an id it can neither fetch nor use again. Nothing errors,
+ * no counter disagrees, and the row is simply absent, so the report arrives days
+ * later as "the record I saved is gone".
+ *
+ * Both halves are already captured and were never joined: the acknowledgement is
+ * on `backend.req.end`, and the absence of any `db.diff` under the same request
+ * id is the other half.
+ *
+ * Silent unless the session wrote SOMETHING somewhere — without that, an absence
+ * only means write instrumentation was never live. Reads under the request id
+ * raise confidence rather than gate the finding: a handler that aborts before its
+ * first statement, which is exactly the swallowed-transaction shape this targets,
+ * leaves no read behind either.
+ */
+function addAcknowledgedWriteNeverLandedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const wrote = new Set<string>();
+  const read = new Set<string>();
+  for (const event of events) {
+    const requestId = safeText(event.d.requestId, 120);
+    if (!requestId) continue;
+    if (event.k === "db.diff") wrote.add(requestId);
+    else if (event.k === "db.read" || event.k === "db.read.bulk")
+      read.add(requestId);
+  }
+  // No writes anywhere means no write instrumentation. An absence proves nothing.
+  if (wrote.size === 0) return;
+
+  for (const event of events) {
+    if (event.k !== "backend.req.end") continue;
+    const method = safeText(event.d.method, 20);
+    if (!method || !CREATING_METHODS.has(method.toUpperCase())) continue;
+    const status = finiteNumber(event.d.statusCode);
+    if (!isSuccessStatus(status)) continue;
+    // 201 is the unambiguous case: the status itself claims a resource exists
+    // now. A plain 200 needs the body to make the same claim, and a backend-only
+    // request has no captured body, so it is left alone.
+    if (status !== 201) continue;
+
+    const requestId = safeText(event.d.requestId, 120);
+    if (!requestId) continue;
+    if (wrote.has(requestId)) continue;
+    const readDuringRequest = read.has(requestId);
+
+    const target =
+      redactUrl(event.d.pathname) ?? redactUrl(event.d.route) ?? "the endpoint";
+    drafts.push({
+      detector: "acknowledged_write_never_landed",
+      title: `Created nothing: ${method} ${target} answered 201 with no database write`,
+      severity: "high",
+      score: ACKNOWLEDGED_WRITE_NEVER_LANDED_SCORE,
+      confidence: readDuringRequest ? "high" : "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId,
+        method,
+        url: target,
+        status,
+        message:
+          `${method} ${target} answered 201, so the client was told a record now exists. ` +
+          `The request produced no write to any table${readDuringRequest ? ", though it did read one" : ""}, ` +
+          `while other requests in this session did write — the acknowledgement is the only trace of it.`,
+        source: "backend",
+      }),
+      // Endpoint-keyed: a form submitted four times produces one finding.
+      dedupeKey: `ackwritenever:${target}:${method}`,
+    });
+  }
+}
+
+// ─── api_route_returned_document ─────────────────────────────────────────────
+
+/** Paths a client parses as data rather than rendering. */
+const API_PATH = /(^|\/)(api|graphql|rest|v\d+)(\/|$)/i;
+
+/** A response body that is an HTML document rather than data. */
+const HTML_DOCUMENT = /^\s*(<!doctype html|<html[\s>])/i;
+
+/**
+ * api_route_returned_document: a data endpoint answered with a web page.
+ *
+ * The mirror of {@link addContentTypeBodyMismatchCandidates}, and the more
+ * expensive direction. A route under `/api` is served by a static or catch-all
+ * handler that renders the application shell, so the call succeeds — 200 or 201,
+ * the work committed — and the client's `JSON.parse` throws. Whatever the client
+ * does with a parse failure is what the user reports: a generic error page, a
+ * failed-upload toast, a retry loop. The operation worked every time.
+ *
+ * Fires on the content type alone when the path is an API path, because a
+ * redacted body is the normal case and the declared type is already proof. When
+ * the body did survive capture, it has to look like a document.
+ */
+function addApiRouteReturnedDocumentCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  requestById: Map<string, RequestInfo>,
+): void {
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const status = finiteNumber(event.d.st);
+    if (!isSuccessStatus(status)) continue;
+    const type = mediaType(headerValue(event, "content-type"));
+    if (type !== "text/html") continue;
+
+    const transportId = networkRequestId(event.d.id);
+    const req = transportId ? requestById.get(transportId) : undefined;
+    const url = redactUrl(req?.url);
+    if (!url || !API_PATH.test(url)) continue;
+
+    // A body that survived redaction has to corroborate. A redacted one is
+    // neither corroboration nor a disproof, so the content type stands alone.
+    const body = typeof event.d.body === "string" ? event.d.body : undefined;
+    if (body && !HTML_DOCUMENT.test(body) && !/\[REDACTED\]/.test(body))
+      continue;
+
+    drafts.push({
+      detector: "api_route_returned_document",
+      title: `Data endpoint returned a web page: ${req?.method ?? "GET"} ${titleUrl(req?.url) ?? url}`,
+      severity: "high",
+      score: 82,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId: safeText(event.d.requestId, 120),
+        method: req?.method,
+        url,
+        status,
+        message:
+          `${req?.method ?? "GET"} ${url} returned ${status} with content-type text/html. ` +
+          `The call succeeded and any write it performed is committed, but a caller parsing ` +
+          `this as JSON throws — the failure the user sees belongs to the parse, not to the request.`,
+      }),
+      dedupeKey: `apidocument:${url}`,
+    });
   }
 }
 

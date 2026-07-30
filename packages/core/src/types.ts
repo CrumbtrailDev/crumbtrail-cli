@@ -174,8 +174,14 @@ export interface CaptureGapEventData {
     | "scan_budget_exceeded"
     | "window_miss"
     | "sampled_out"
-    | "header_stripped";
+    | "header_stripped"
+    /** A request emitted `backend.req.start` and was closed out without a terminal status. */
+    | "request_unterminated"
+    /** The event was built but its delivery to the capture endpoint never succeeded. */
+    | "delivery_failed";
   detail?: string;
+  /** Request the gap belongs to, so a reader can join the hole to the request that made it. */
+  requestId?: string;
   t: number;
 }
 

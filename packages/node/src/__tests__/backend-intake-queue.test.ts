@@ -144,7 +144,10 @@ describe("retry policy", () => {
     expect(warnings).toEqual([]);
   });
 
-  it("retries a 503 and a 429 but not a 400 or a 404", async () => {
+  // A status means the intake received the payload and judged it. Repeating the
+  // identical body cannot change that verdict, so no status is retried; only a
+  // transport rejection, where nothing was judged because nothing arrived, is.
+  it("does not repeat a request the intake actually answered", async () => {
     const attempts = async (status: number) => {
       resetBackendIntakeQueueForTest();
       const fetch = vi.fn().mockResolvedValue({ ok: false, status });
@@ -152,11 +155,12 @@ describe("retry policy", () => {
       return fetch.mock.calls.length;
     };
 
-    expect(await attempts(503)).toBe(3);
-    expect(await attempts(429)).toBe(3);
-    expect(await attempts(400)).toBe(1);
-    expect(await attempts(404)).toBe(1);
-    expect(await attempts(401)).toBe(1);
+    for (const status of [400, 401, 404, 429, 500, 503]) {
+      expect({ status, calls: await attempts(status) }).toEqual({
+        status,
+        calls: 1,
+      });
+    }
   });
 
   it("reports the transport cause instead of a bare TypeError", async () => {
