@@ -1,4 +1,5 @@
-import type { BugEvent } from "crumbtrail-core";
+import type { BugEvent, RedactionMetadata } from "crumbtrail-core";
+import { mergeRedactionMetadata, redactNetworkTextBody } from "crumbtrail-core";
 import {
   CRUMBTRAIL_REQUEST_HEADER,
   buildBackendRequestEndEvent,
@@ -32,11 +33,22 @@ export interface CrumbtrailExpressRequest {
   path?: string;
   route?: string | { path?: unknown };
   headers?: BackendRequestHeaders;
+  /** Populated by a body parser mounted before this middleware. */
+  body?: unknown;
 }
 
 export interface CrumbtrailExpressResponse {
   statusCode?: number;
   once?: (event: "finish", listener: () => void) => unknown;
+  /**
+   * Present on a real ServerResponse. Typed as `unknown` rather than with
+   * signatures: express's own `Response` declares overloaded `write` / `end`,
+   * and any narrower declaration here makes the middleware unassignable to
+   * `RequestHandler` at the host application's call site.
+   */
+  getHeader?: unknown;
+  write?: unknown;
+  end?: unknown;
 }
 
 export type CrumbtrailExpressMiddleware = (
@@ -81,15 +93,64 @@ export interface CrumbtrailExpressOptions {
    * autoCapture path recorded them.
    */
   captureRuntimeWarnings?: boolean;
+  /**
+   * Capture the request and response payloads onto `backend.req.end`, redacted
+   * with the same policy the browser transport applies.
+   *
+   * Default on. Without it a backend-only exchange reaches the session as a
+   * method, a URL, a status code and a duration — which settles a failure that
+   * threw and nothing else. Every defect whose evidence is the VALUE the server
+   * returned (a total that is an hour out, a sum that will not reconcile, an
+   * expiry judged against the wrong clock) is undiagnosable from a status code,
+   * and those requests are exactly the ones no browser made: jobs, webhooks,
+   * service-to-service calls, CLIs.
+   */
+  captureBodies?: boolean;
+  /** Cap on captured characters per payload. Default 4096, hard max 16384. */
+  maxBodyChars?: number;
+  /**
+   * Field names exempted from the built-in name-based deny rules, and field
+   * names always denied. Same semantics as the browser's
+   * `config.redaction.keepFields` / `denyFields`, and passed to the same
+   * classifier — a keep never disables the value-based checks, so a token or a
+   * card number inside a kept field is still redacted.
+   */
+  keepFields?: string[];
+  denyFields?: string[];
 }
 
 interface RequestState {
   startedAtMs: number;
   sessionId?: string;
   requestId: string;
+  /** Response chunks accumulated by the write/end wrappers, already capped. */
+  responseChunks?: string[];
+  responseChars?: number;
+  responseTruncated?: boolean;
 }
 
+const DEFAULT_MAX_BODY_CHARS = 4096;
+const HARD_MAX_BODY_CHARS = 16_384;
+
+/**
+ * Content types worth reading. A response the app produced as text in any
+ * structured dialect is evidence; an image, a font or a zip is bytes that would
+ * cost the session its size budget and tell an agent nothing.
+ *
+ * Written as the set of text-bearing families rather than a list of exact types,
+ * so a JSON:API, an ndjson stream, a SOAP envelope or a GraphQL response is
+ * captured on the same terms as plain `application/json` — none of these needs
+ * its own entry.
+ */
+const CAPTURABLE_CONTENT_TYPE =
+  /^(text\/|application\/(json|xml|graphql|csv|yaml|x-ndjson|ld\+json|x-www-form-urlencoded)|application\/[\w.+-]*\+(json|xml))/i;
+
 const requestStates = new WeakMap<CrumbtrailExpressRequest, RequestState>();
+
+/** Exposed for tests: the gate that decides whether a payload is evidence. */
+export function isCapturableContentTypeForTest(contentType: string): boolean {
+  return CAPTURABLE_CONTENT_TYPE.test(contentType.trim());
+}
 
 /**
  * How long after the last request that carried a session a process warning is
@@ -126,6 +187,7 @@ export function createCrumbtrailExpressMiddleware(
         lastSession = { sessionId: state.sessionId, atMs: startedAtMs };
       }
 
+      if (options.captureBodies !== false) captureResponseBody(res, state, options);
       attemptSend(startEvent, options, state.sessionId);
       attachFinishListener(req, res, options, state);
 
@@ -206,10 +268,198 @@ function attachFinishListener(
       now,
       statusCode: safeStatusCode(res.statusCode),
       durationMs: now - state.startedAtMs,
+      ...readBodies(req, res, state, options),
     });
 
     attemptSend(endEvent, options, state.sessionId);
   });
+}
+
+/**
+ * Wraps `res.write` / `res.end` so the payload the application sent is
+ * available at finish time. Chunks are accumulated as text up to the cap and
+ * the wrappers always delegate, so a capture failure cannot change what the
+ * client receives.
+ */
+function captureResponseBody(
+  res: CrumbtrailExpressResponse,
+  state: RequestState,
+  options: CrumbtrailExpressOptions,
+): void {
+  const originalWrite = res.write;
+  const originalEnd = res.end;
+  if (typeof originalWrite !== "function" || typeof originalEnd !== "function")
+    return;
+
+  const cap = bodyCharCap(options);
+  state.responseChunks = [];
+  state.responseChars = 0;
+
+  const absorb = (chunk: unknown): void => {
+    if (chunk === undefined || chunk === null) return;
+    if ((state.responseChars ?? 0) >= cap) {
+      state.responseTruncated = true;
+      return;
+    }
+    let text: string | undefined;
+    if (typeof chunk === "string") text = chunk;
+    else if (isBufferLike(chunk)) text = decodeBufferLike(chunk);
+    if (text === undefined) return;
+    const room = cap - (state.responseChars ?? 0);
+    if (text.length > room) {
+      state.responseTruncated = true;
+      text = text.slice(0, room);
+    }
+    state.responseChunks?.push(text);
+    state.responseChars = (state.responseChars ?? 0) + text.length;
+  };
+
+  res.write = function wrappedWrite(this: unknown, ...args: unknown[]) {
+    try {
+      absorb(args[0]);
+    } catch {
+      // Capture is additive; never let it break a response.
+    }
+    return (originalWrite as (...a: unknown[]) => unknown).apply(this, args);
+  };
+
+  res.end = function wrappedEnd(this: unknown, ...args: unknown[]) {
+    try {
+      if (typeof args[0] !== "function") absorb(args[0]);
+    } catch {
+      // As above.
+    }
+    return (originalEnd as (...a: unknown[]) => unknown).apply(this, args);
+  };
+}
+
+function readBodies(
+  req: CrumbtrailExpressRequest,
+  res: CrumbtrailExpressResponse,
+  state: RequestState,
+  options: CrumbtrailExpressOptions,
+): {
+  body?: unknown;
+  bodySummary?: unknown;
+  reqBody?: unknown;
+  reqBodySummary?: unknown;
+  bodyRedaction?: RedactionMetadata;
+} {
+  if (options.captureBodies === false) return {};
+  const out: {
+    body?: unknown;
+    bodySummary?: unknown;
+    reqBody?: unknown;
+    reqBodySummary?: unknown;
+    bodyRedaction?: RedactionMetadata;
+  } = {};
+  const metadata: Array<RedactionMetadata | undefined> = [];
+
+  try {
+    const request = redactBodyValue(req.body, "reqBody", options);
+    if (request) {
+      out.reqBody = request.body;
+      if (request.bodySummary) out.reqBodySummary = request.bodySummary;
+      metadata.push(request.metadata);
+    }
+  } catch {
+    // A body that cannot be serialized is simply not captured.
+  }
+
+  try {
+    if (isCapturableResponse(res, state)) {
+      const text = (state.responseChunks ?? []).join("");
+      const response = redactBodyValue(text, "body", options);
+      if (response) {
+        out.body = response.body;
+        if (response.bodySummary) out.bodySummary = response.bodySummary;
+        metadata.push(response.metadata);
+      }
+    }
+  } catch {
+    // As above.
+  }
+
+  const merged = mergeRedactionMetadata(...metadata);
+  if (merged) out.bodyRedaction = merged;
+  return out;
+}
+
+function isCapturableResponse(
+  res: CrumbtrailExpressResponse,
+  state: RequestState,
+): boolean {
+  if (!state.responseChunks || state.responseChunks.length === 0) return false;
+  const raw =
+    typeof res.getHeader === "function"
+      ? res.getHeader("content-type")
+      : undefined;
+  const contentType = Array.isArray(raw) ? raw[0] : raw;
+  // No content type at all: a hand-rolled response is more likely text than a
+  // binary blob, and the redactor handles whatever it turns out to be.
+  if (typeof contentType !== "string") return true;
+  return CAPTURABLE_CONTENT_TYPE.test(contentType.trim());
+}
+
+function redactBodyValue(
+  value: unknown,
+  path: string,
+  options: CrumbtrailExpressOptions,
+):
+  | { body: unknown; bodySummary?: unknown; metadata?: RedactionMetadata }
+  | undefined {
+  const text = serializeBody(value, bodyCharCap(options));
+  if (text === undefined) return undefined;
+  const result = redactNetworkTextBody(text, {
+    path,
+    mode: "structured",
+    ...(options.keepFields ? { keepFields: options.keepFields } : {}),
+    ...(options.denyFields ? { denyFields: options.denyFields } : {}),
+  } as Parameters<typeof redactNetworkTextBody>[1]);
+  if (result.body === undefined && result.bodySummary === undefined)
+    return undefined;
+  return {
+    body: result.body,
+    ...(result.bodySummary ? { bodySummary: result.bodySummary } : {}),
+    ...(result.metadata ? { metadata: result.metadata } : {}),
+  };
+}
+
+function serializeBody(value: unknown, cap: number): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "string")
+    return value.length > 0 ? value.slice(0, cap) : undefined;
+  if (isBufferLike(value)) return decodeBufferLike(value)?.slice(0, cap);
+  if (typeof value !== "object") return String(value).slice(0, cap);
+  try {
+    const text = JSON.stringify(value);
+    return typeof text === "string" && text !== "{}"
+      ? text.slice(0, cap)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isBufferLike(value: unknown): value is ArrayBufferView {
+  return ArrayBuffer.isView(value);
+}
+
+function decodeBufferLike(value: ArrayBufferView): string | undefined {
+  try {
+    const decoded = (value as { toString?: unknown }).toString;
+    if (typeof decoded === "function")
+      return (decoded as (enc: string) => string).call(value, "utf8");
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+function bodyCharCap(options: CrumbtrailExpressOptions): number {
+  const requested = options.maxBodyChars;
+  if (!Number.isFinite(requested)) return DEFAULT_MAX_BODY_CHARS;
+  return Math.max(0, Math.min(HARD_MAX_BODY_CHARS, Math.round(requested as number)));
 }
 
 function exposeRequestIdHeader(

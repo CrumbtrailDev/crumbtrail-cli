@@ -634,8 +634,13 @@ function sanitizeRecord(
       out[safeKey] = raw;
       continue;
     }
+    // `reqBody` gets the same treatment as `body`: it is the same payload
+    // captured on the other side of the exchange, redacted by the same policy
+    // before it was sent. Without this it fell through to the free-text sweep
+    // and every request payload landed as a bare placeholder while the response
+    // beside it was readable.
     if (
-      key === "body" &&
+      (key === "body" || key === "reqBody") &&
       fieldPath === "event.d" &&
       typeof raw === "string" &&
       declaresStructuredBodyRedaction(value)
@@ -1059,6 +1064,7 @@ const SAFE_METADATA_FIELD_NAMES = new Set([
   // path-segment sensitivity check does not sweep its descendants wholesale.
   "bodyMeta",
   "bodySummary",
+  "reqBodySummary",
   "hrefSummary",
   "newValSummary",
   "oldValSummary",

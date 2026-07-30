@@ -103,7 +103,7 @@ describe("groupDistinctBugs", () => {
     const [bugA, bugB] = bugs;
 
     // Stable, deterministic ids locked to detect any drift in the dedup-key derivation.
-    expect(bugA.bugId).toBe("bug_1xcohsf");
+    expect(bugA.bugId).toBe("bug_otjiny");
     expect(bugB.bugId).toBe("bug_1pg6ltd");
 
     // Bug A: correlated front-end + back-end share one requestId, so front/back land together.
@@ -532,5 +532,67 @@ describe("buildDistinctBugSignature", () => {
         route: "https://alertbase.ai/dashboard/jobs?tab=2#x",
       },
     })).toBe(signatures.current);
+  });
+});
+
+// A write path that trips two detectors per attempt produced one bug per
+// attempt: eight retries of the same defect answered as eight distinct bugs
+// carrying one signature. Only singleton request clusters used to fold.
+describe("repeated multi-candidate request clusters", () => {
+  function attempt(n: number): EvidenceCandidate[] {
+    const t = 5000 + n * 1000;
+    return [
+      candidate({
+        id: `cand_${n}a`,
+        detector: "mutations_missing_entity_audit",
+        title: "2 dispatch_jobs mutations had no matching entity audit",
+        severity: "high",
+        score: 93,
+        anchor: {
+          t,
+          offsetMs: t,
+          route: "/board",
+          requestId: `req-${n}`,
+          message: "The request mutated 2 dispatch_jobs rows",
+        },
+        evidenceWindow: { start: t - 10, end: t + 50, windowId: "win_0001" },
+      }),
+      candidate({
+        id: `cand_${n}b`,
+        detector: "db_mutation",
+        title: "Database update on dispatch_jobs",
+        severity: "medium",
+        score: 40,
+        anchor: {
+          t: t + 5,
+          offsetMs: t + 5,
+          route: "/board",
+          requestId: `req-${n}`,
+          message: "Database update on dispatch_jobs",
+        },
+        evidenceWindow: { start: t - 10, end: t + 50, windowId: "win_0001" },
+      }),
+    ];
+  }
+
+  const events: BugEvent[] = [];
+
+  it("folds identical attempts into one bug", () => {
+    const bugs = groupDistinctBugs(
+      [0, 1, 2, 3].flatMap((n) => attempt(n)),
+      events,
+    );
+    expect(bugs).toHaveLength(1);
+    expect(bugs[0].requestIds).toHaveLength(4);
+    expect(new Set(bugs.map((b) => b.title)).size).toBe(1);
+  });
+
+  it("keeps a request whose signal combination is unique", () => {
+    const odd = attempt(9)[0];
+    const bugs = groupDistinctBugs(
+      [...[0, 1, 2].flatMap((n) => attempt(n)), odd],
+      events,
+    );
+    expect(bugs).toHaveLength(2);
   });
 });

@@ -1,12 +1,17 @@
 import { EventEmitter } from "node:events";
 import type { BugEvent } from "crumbtrail-core";
 import { BROWSER_REDACTION_POLICY, REDACTED_VALUE } from "crumbtrail-core";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BACKEND_REQUEST_END_EVENT,
   BACKEND_REQUEST_ERROR_EVENT,
   BACKEND_REQUEST_START_EVENT,
 } from "../backend-events";
+import {
+  backendIntakeQueueStats,
+  flushBackendEvents,
+  resetBackendIntakeQueueForTest,
+} from "../backend-intake";
 import {
   createCrumbtrailExpressErrorMiddleware,
   createCrumbtrailExpressMiddleware,
@@ -25,6 +30,12 @@ class FakeResponse extends EventEmitter implements CrumbtrailExpressResponse {
 }
 
 describe("Crumbtrail Express-compatible middleware", () => {
+  // The intake queue bounds concurrency for the whole process, which is the
+  // right scope for socket pressure and the wrong scope for test isolation: a
+  // test that leaves a retry in flight would otherwise hold a slot during the
+  // next one.
+  beforeEach(() => resetBackendIntakeQueueForTest());
+
   it("emits start immediately, calls next synchronously, and emits one end event on finish", async () => {
     const fetch = vi.fn().mockResolvedValue(okResponse());
     const req = fakeRequest({
@@ -103,19 +114,29 @@ describe("Crumbtrail Express-compatible middleware", () => {
     await flushPromises();
 
     expect(next).toHaveBeenCalledTimes(1);
-    expect(fetch).toHaveBeenCalledTimes(2);
+    // The response path never waits on the intake: both events are already
+    // handed off while their delivery is still being retried.
+    expect(fetch).toHaveBeenCalled();
+
+    await flushBackendEvents();
+
+    // A transport rejection is retried before it is reported, so each event
+    // costs MAX_INTAKE_ATTEMPTS requests and yields exactly one warning.
+    expect(fetch).toHaveBeenCalledTimes(6);
     expect(warnings).toEqual([
       expect.objectContaining({
         kind: "fetch-rejected",
         message: "Error",
         sessionId: "ses_warn",
         requestId: "req_warn",
+        attempts: 3,
       }),
       expect.objectContaining({
         kind: "fetch-rejected",
         message: "Error",
         sessionId: "ses_warn",
         requestId: "req_warn",
+        attempts: 3,
       }),
     ]);
     expect(JSON.stringify(warnings)).not.toContain("local-secret-token");
