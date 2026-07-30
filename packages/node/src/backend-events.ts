@@ -58,6 +58,22 @@ export interface BackendRequestEventInput {
 export interface BackendRequestEndEventInput extends BackendRequestEventInput {
   statusCode?: number;
   durationMs?: number;
+  /**
+   * Already-redacted request and response payloads. The express middleware
+   * redacts with the same `crumbtrail.browser-redaction.v2` policy the browser
+   * transport uses before handing them here, so this builder never sees a raw
+   * body and cannot become a second redaction path.
+   *
+   * Named `body` / `reqBody` to match the browser's `net.res` / `net.req`
+   * shape: the detectors that read a response body join on those field names,
+   * and a backend-only exchange should reach them by the same route rather
+   * than needing a parallel one.
+   */
+  body?: unknown;
+  bodySummary?: unknown;
+  reqBody?: unknown;
+  reqBodySummary?: unknown;
+  bodyRedaction?: RedactionMetadata;
 }
 
 export interface BackendRequestErrorEventInput extends BackendRequestEndEventInput {
@@ -140,6 +156,7 @@ export function buildBackendRequestEndEvent(
   if (Number.isFinite(input.statusCode)) payload.statusCode = input.statusCode;
   if (Number.isFinite(input.durationMs))
     payload.durationMs = Math.max(0, Math.round(input.durationMs as number));
+  attachBodies(payload, input);
   return buildEvent(
     BACKEND_REQUEST_END_EVENT,
     payload,
@@ -147,6 +164,28 @@ export function buildBackendRequestEndEvent(
     input.sessionStartedAt,
     correlation.sessionId,
   );
+}
+
+/**
+ * Copies the already-redacted payload fields onto the event, and merges their
+ * redaction metadata with whatever the URL and route sanitizers recorded so one
+ * event reports one policy decision set.
+ */
+function attachBodies(
+  payload: Record<string, unknown>,
+  input: BackendRequestEndEventInput,
+): void {
+  if (input.body !== undefined) payload.body = input.body;
+  if (input.bodySummary !== undefined) payload.bodySummary = input.bodySummary;
+  if (input.reqBody !== undefined) payload.reqBody = input.reqBody;
+  if (input.reqBodySummary !== undefined)
+    payload.reqBodySummary = input.reqBodySummary;
+  if (!input.bodyRedaction) return;
+  // buildBasePayload already wrote `redaction` for the URL and route. Passing
+  // only the body metadata to attachRedactionMetadata would replace it, so the
+  // existing record is merged back in.
+  const existing = payload.redaction as RedactionMetadata | undefined;
+  attachRedactionMetadata(payload, existing, input.bodyRedaction);
 }
 
 export function buildBackendRequestErrorEvent(
@@ -159,9 +198,15 @@ export function buildBackendRequestErrorEvent(
   if (Number.isFinite(input.durationMs))
     payload.durationMs = Math.max(0, Math.round(input.durationMs as number));
 
+  attachBodies(payload, input);
+
   const error = sanitizeError(input.error);
   payload.error = omitMetadata(error);
-  attachRedactionMetadata(payload, error.metadata);
+  attachRedactionMetadata(
+    payload,
+    payload.redaction as RedactionMetadata | undefined,
+    error.metadata,
+  );
 
   return buildEvent(
     BACKEND_REQUEST_ERROR_EVENT,

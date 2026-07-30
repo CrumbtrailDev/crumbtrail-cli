@@ -954,6 +954,10 @@ function stringField(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
 function numberField(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value)
     ? value
@@ -2524,6 +2528,36 @@ export class McpServer {
     const ref = args.ref as string;
     const dir = await this.sessionDirAsync(sessionId);
     const candidates = await this.readCandidatesJsonlAsync(dir);
+
+    // `ref` is required by the schema but was never checked here, and the
+    // request-id branch below compares `stringField(anchor.requestId) === ref`.
+    // With `ref` undefined that comparison is true for the first candidate whose
+    // anchor carries no request id, so a call that omitted the argument was
+    // answered with an arbitrary candidate presented as a match. Observed live:
+    // a session whose top-ranked signal was a 92-scored root cause answered with
+    // an 82-scored symptom of `attributionConfidence: low`.
+    if (!isNonEmptyString(ref)) {
+      if (!(await this.sessionExistsAsync(dir)))
+        return errorResult("Session not found");
+      const top = candidates[0];
+      return textResult(
+        attachTokenEstimate(
+          removeUndefined({
+            sessionId,
+            kind: "top-candidate",
+            status: top ? "ref-omitted" : "no-candidates",
+            candidate: top,
+            anchor:
+              top && isRecord(top.anchor) ? top.anchor : undefined,
+            evidenceWindow:
+              top && isRecord(top.evidenceWindow)
+                ? top.evidenceWindow
+                : undefined,
+            hint: "ref is required; the highest-ranked candidate is returned instead. Pass its id to resolve one signal, or call getFixContext for the ranked set.",
+          }),
+        ),
+      );
+    }
 
     // Every getEvidence payload carries an always-present additive
     // tokenEstimate (CP4) so agents can account for drilldown costs.

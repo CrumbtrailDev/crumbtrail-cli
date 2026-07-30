@@ -102,6 +102,8 @@ describe("backend intake client", () => {
       }),
     ).resolves.toBeUndefined();
 
+    // A transport rejection is retried before it is reported, and the report
+    // says how many attempts it took.
     expect(warnings).toEqual([
       {
         kind: "fetch-rejected",
@@ -109,6 +111,7 @@ describe("backend intake client", () => {
         sessionId: "ses_event",
         requestId: "req_123",
         eventKind: "backend.req.start",
+        attempts: 3,
       },
     ]);
     expect(JSON.stringify(warnings)).not.toContain("local-secret-token");

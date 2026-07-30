@@ -489,6 +489,53 @@ function redactUrlPath(
   return { value: output.join("/"), ...(metadata ? { metadata } : {}) };
 }
 
+/**
+ * A path segment that is plainly a route name rather than a value.
+ *
+ * The preceder rule above redacts whatever follows `auth`, `token`, `session`
+ * and friends, which is right for `/reset/9f3c…` and wrong for `/api/auth/whoami`
+ * — `whoami` became `[REDACTED]`, so a captured session could not say which
+ * endpoint returned a 401. Measured on a live run: every `/api/auth/*` request
+ * in the capture reported its own pathname as a secret.
+ *
+ * Deliberately narrow, because it weakens a security control: only short,
+ * all-lowercase alphabetic words with no digits, no separators and no
+ * mixed case survive. Anything with entropy — a token, a hash, an id, a JWT, a
+ * base64 fragment, a uuid — fails at least one of those and is still redacted.
+ */
+const PLAIN_ROUTE_WORD_RE = /^[a-z]{2,16}$/;
+
+/**
+ * The sensitive preceders that hold a credential in the very next segment.
+ *
+ * Stated as the exclusion rather than as a list of safe namespaces, so it stays
+ * correct as the sensitive-name rules grow: anything newly treated as sensitive
+ * (`authentication`, `authorization`, a future name) gets the route-word
+ * carve-out without being enumerated here, and only the names that are
+ * definitionally followed by the secret itself are opted out. `/reset/…`,
+ * `/token/…` and `/otp/…` are followed by the value; `/auth/…` and `/session/…`
+ * are followed by endpoint names (`whoami`, `logout`, `refresh`) as often as by
+ * values.
+ */
+const CREDENTIAL_PATH_PRECEDERS = new Set([
+  "code",
+  "invite",
+  "magic",
+  "mfa",
+  "otp",
+  "passcode",
+  "reset",
+  "token",
+  "verify",
+]);
+
+function isPlainRouteWord(previous: string, component: string): boolean {
+  return (
+    !CREDENTIAL_PATH_PRECEDERS.has(previous) &&
+    PLAIN_ROUTE_WORD_RE.test(component)
+  );
+}
+
 function redactUrlPathComponent(
   component: string,
   previous: string,
@@ -498,7 +545,8 @@ function redactUrlPathComponent(
   let lastToken = previous;
   if (
     (SENSITIVE_PATH_PRECEDERS.has(previous) || isSensitiveName(previous)) &&
-    component.length > 0
+    component.length > 0 &&
+    !isPlainRouteWord(previous, component)
   ) {
     fields.push({
       path,
@@ -643,7 +691,10 @@ function isSecretLikePathSegment(segment: string, previous: string): boolean {
   if (
     (SENSITIVE_PATH_PRECEDERS.has(previous) || isSensitiveName(previous)) &&
     segment.length > 0 &&
-    segment.length <= 256
+    segment.length <= 256 &&
+    // Same carve-out as the branch in redactUrlPathComponent: a plain lowercase
+    // route word after `auth` or `session` is an endpoint name, not a value.
+    !isPlainRouteWord(previous, segment)
   )
     return true;
   return /^[A-Za-z0-9_-]{16,39}$/.test(segment) && /[A-Z0-9_-]/.test(segment);

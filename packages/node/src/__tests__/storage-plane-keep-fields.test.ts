@@ -78,3 +78,56 @@ describe("storage keep fields", () => {
     );
   });
 });
+
+// The request payload captured beside the response was swept as free text: a
+// live session stored `body` readable and `reqBody` as a bare placeholder, so
+// the value the caller SENT — the one that decides an idempotency or a retry
+// defect — never reached disk.
+describe("backend request payloads", () => {
+  function backendEnd(d: Record<string, unknown>): BugEvent {
+    return {
+      t: 1,
+      k: "backend.req.end",
+      d: {
+        requestId: "req-1",
+        method: "POST",
+        url: "/api/payroll/approve",
+        statusCode: 200,
+        redaction: {
+          policy: "crumbtrail.browser-redaction.v2",
+          fields: [],
+          summaries: [
+            { kind: "json", action: "summarized", reason: "structured_redaction" },
+          ],
+        },
+        ...d,
+      },
+    } as unknown as BugEvent;
+  }
+
+  it("stores reqBody the same way it stores body", () => {
+    setStorageKeepFields(["worker", "period", "hours"]);
+    const payload = JSON.stringify({ worker: "dana", period: "2026-03", hours: 3.6 });
+    const d = sanitizeEventForStorage(
+      backendEnd({ body: payload, reqBody: payload }),
+    ).d as Record<string, unknown>;
+    expect(d.body).toContain("dana");
+    expect(d.reqBody).toBe(d.body);
+    expect(d.reqBody).not.toBe("[REDACTED]");
+  });
+
+  it("keeps the request payload summary envelope", () => {
+    const summary = {
+      kind: "json",
+      action: "summarized",
+      reason: "structured_redaction",
+      originalLength: 58,
+      redactedFields: 0,
+    };
+    const d = sanitizeEventForStorage(
+      backendEnd({ bodySummary: summary, reqBodySummary: summary }),
+    ).d as Record<string, unknown>;
+    expect(d.reqBodySummary).toEqual(d.bodySummary);
+    expect(d.reqBodySummary).not.toBe("[REDACTED]");
+  });
+});
