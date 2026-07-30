@@ -634,18 +634,19 @@ function sanitizeRecord(
       out[safeKey] = raw;
       continue;
     }
-    // `reqBody` gets the same treatment as `body`: it is the same payload
-    // captured on the other side of the exchange, redacted by the same policy
-    // before it was sent. Without this it fell through to the free-text sweep
-    // and every request payload landed as a bare placeholder while the response
-    // beside it was readable.
+    // `reqBody` and `responseBody` alongside `body`: each plane records the
+    // payload it saw under its own key, and those names carry the literal token
+    // `body`, so the name-based rule would sweep the one sentence that explains
+    // a 500 to `[REDACTED]` while the payload beside it stayed readable. Same
+    // gate as the browser's body — kept only when the event declares it already
+    // went through the v2 policy.
     if (
-      (key === "body" || key === "reqBody") &&
+      (key === "body" || key === "reqBody" || key === "responseBody") &&
       fieldPath === "event.d" &&
       typeof raw === "string" &&
       declaresStructuredBodyRedaction(value)
     ) {
-      out[safeKey] = sanitizeStructuredBody(raw);
+      out[safeKey] = sanitizeStructuredBody(raw, declaredKeepFields(value));
       continue;
     }
     if (key === "bodyMeta" && fieldPath === "event.d") {
@@ -739,19 +740,45 @@ function sanitizeBodyMeta(
 
 const MAX_BODY_META_ARRAY_TOTALS = 32;
 
-function sanitizeStructuredBody(body: string): string {
+/** Field names of a declared keep list, ignoring anything that is not one. */
+const DECLARED_KEEP_NAME_RE = /^[A-Za-z0-9_.\- ]{1,64}$/;
+const MAX_DECLARED_KEEP_FIELDS = 64;
+
+/**
+ * The keep list the emitting SDK declared alongside its v2 policy.
+ *
+ * The re-run below is a re-classification, not a rubber stamp, so it has to be
+ * told the same name exemptions that produced the body it is re-reading. Told
+ * nothing, it placeholders every name the application deliberately kept, which
+ * is why a declared `error` or `message` still reached disk as `[REDACTED]`.
+ *
+ * The declaration exempts a NAME from the name-based rules only. Every
+ * value-based check still runs against the value under that name, so an
+ * application cannot use its keep list to store a token, a card number or an
+ * email. Entries are shape-checked and bounded here, because the field names
+ * themselves are attacker-controlled text on the way to a classifier.
+ */
+function declaredKeepFields(eventData: Record<string, unknown>): string[] {
+  const redaction = eventData.redaction;
+  if (!isRecord(redaction) || !Array.isArray(redaction.keep)) return [];
+  return redaction.keep
+    .filter(
+      (name): name is string =>
+        typeof name === "string" && DECLARED_KEEP_NAME_RE.test(name),
+    )
+    .slice(0, MAX_DECLARED_KEEP_FIELDS);
+}
+
+function sanitizeStructuredBody(body: string, declaredKeep: string[]): string {
+  // The operator's list and the application's declaration are both name
+  // exemptions of the same kind, so the re-run honors their union.
+  const keepFields = [...new Set([...getStorageKeepFields(), ...declaredKeep])];
   try {
     const result = redactNetworkTextBody(body, {
       contentType: "application/json",
       path: "event.d.body",
       mode: "structured",
-      // The server's keep list, not the client's declaration. The re-run is a
-      // re-classification, so it has to be told the same exception the rest of
-      // this sanitizer honors, or a field the operator declared keepable is
-      // kept in db.diff and placeholdered in the request body that caused it.
-      ...(keepFieldNames.size > 0
-        ? { keepFields: getStorageKeepFields() }
-        : {}),
+      ...(keepFields.length > 0 ? { keepFields } : {}),
     });
     if (
       typeof result.body === "string" &&
