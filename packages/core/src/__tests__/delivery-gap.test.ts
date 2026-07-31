@@ -108,7 +108,10 @@ describe("a refused batch is declared, not swallowed", () => {
     // Three per-batch records could only speak for three batches; the total has
     // to reflect every failed send, not the first few.
     expect(total).toBeGreaterThan(counters.sends / 2);
-  });
+    // `flushBufferSize: 1` buys the coverage with 40 real flush cycles, so this
+    // case costs seconds where the rest of the file costs milliseconds. It ran
+    // 2.6s on a dev machine and 7.4s on a CI runner, over the 5s default.
+  }, 30_000);
 
   it("emits nothing when delivery succeeds", async () => {
     const transport = {
