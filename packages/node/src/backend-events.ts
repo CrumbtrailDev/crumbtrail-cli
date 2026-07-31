@@ -70,6 +70,20 @@ export interface BackendRequestEndEventInput extends BackendRequestEventInput {
   /** Whether the caller truncated `responseBody` at its cap. */
   responseBodyTruncated?: boolean;
   /**
+   * Where the application wrote a 5xx response, repo-relative where derivable.
+   *
+   * A failure that never touches the database has no `db.diff` and therefore no
+   * callsite, which leaves a swallowed 500 with no pointer to any line. This is
+   * the same shape as a db callsite so a reader treats both identically.
+   */
+  responseCallsite?: {
+    file: string;
+    line?: number;
+    column?: number;
+    fn?: string;
+    stack?: unknown;
+  };
+  /**
    * Field names the application declares keepable, exactly as the browser SDK's
    * `redaction.keepFields`. Exempts a NAME from the name-based deny rules; every
    * value-based check still runs, and the list is carried in the event's policy
@@ -190,6 +204,9 @@ function attachResponseEvidence(
 ): void {
   if (input.responseHeaders && Object.keys(input.responseHeaders).length > 0)
     payload.responseHeaders = { ...input.responseHeaders };
+
+  if (input.responseCallsite && typeof input.responseCallsite.file === "string")
+    payload.responseCallsite = input.responseCallsite;
 
   if (typeof input.responseBody !== "string" || input.responseBody === "")
     return;

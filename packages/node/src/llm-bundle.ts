@@ -107,6 +107,18 @@ export interface LlmBundleFrontendRequestEvidenceSummary {
   url?: string;
   status?: number;
   durationMs?: number;
+  /**
+   * Redacted snippet of what the browser sent, resolved from the session's own
+   * `net.req` event by request id.
+   *
+   * A method, a path and a status code describe the shape of a request. On any
+   * defect where the deciding value travelled in the payload — a client-supplied
+   * price the server persisted, a stale form field, a unit the handler ignored —
+   * that shape is a pointer to the problem rather than the problem.
+   */
+  requestBody?: string;
+  /** Redacted snippet of what came back, from the matching `net.res` event. */
+  responseBody?: string;
   error?: {
     message?: string;
     transport?: string;
@@ -130,6 +142,16 @@ export interface LlmBundleBackendRequestEvidenceSummary {
   route?: string;
   statusCode?: number;
   durationMs?: number;
+  /**
+   * Redacted snippet of the response the handler sent, from the matching
+   * `backend.req.end` event. Present only when the server SDK captured it.
+   */
+  responseBody?: string;
+  /**
+   * Where the app wrote a 5xx response. Callsites otherwise ride on `db.diff`,
+   * so a handler that fails without writing had no pointer at all.
+   */
+  responseCallsite?: LlmBundleDbCallsite;
   error?: {
     name?: string;
     code?: string;
@@ -219,6 +241,14 @@ export interface LlmBundleCompleteness {
   gapCount: number;
   gapsBySurface: Record<string, number>;
   gapsByReason: Record<string, number>;
+  /**
+   * Events the gaps account for, summed across those that could count.
+   *
+   * `gapCount` is a number of holes, not a size. Three gap records covering six
+   * thousand dropped events and three covering three are the same `gapCount`
+   * and are not the same session.
+   */
+  droppedEventCount: number;
   grade: "complete" | "degraded" | "fragmentary";
 }
 
@@ -335,6 +365,30 @@ export interface LlmBundleTabBoundarySummary {
   decisions: LlmBundleTabBoundaryDecisionSummary[];
 }
 
+/**
+ * One `k:'stor'` event: a local or session storage key that changed during the
+ * session. Keys and values were redacted in the browser before capture; this
+ * carries what survived rather than re-deriving anything.
+ *
+ * Counted-but-not-carried is the failure this closes. A session can hold
+ * hundreds of storage writes, report them in `eventCounts`, and expose neither
+ * the key nor the value — which makes any defect about state outliving its
+ * owner (a draft restored after it was submitted, a cache never invalidated, a
+ * flag never cleared) invisible in the artifact an agent reads.
+ */
+export interface LlmBundleStorageChange {
+  t: number;
+  iso?: string;
+  offsetMs?: number;
+  /** `local` or `session`, as the collector recorded it. */
+  area?: string;
+  /** `set`, `del`, or `clear`. */
+  op?: string;
+  key?: string;
+  oldValue?: unknown;
+  newValue?: unknown;
+}
+
 export interface LlmBundleBrowserEvidence {
   pageProbe: LlmBundlePageProbeSummary;
   failedRequests: LlmBundleFailedRequestSummary[];
@@ -342,6 +396,8 @@ export interface LlmBundleBrowserEvidence {
   consoleErrors: LlmBundleConsoleErrorSummary[];
   tabBoundaries: LlmBundleTabBoundarySummary;
   interactiveElements: InteractiveElement[];
+  /** Redaction-aware storage writes captured during the session; `[]` when none. */
+  storageChanges: LlmBundleStorageChange[];
 }
 
 export const AGENT_CONTEXT_SCHEMA_VERSION =
@@ -787,7 +843,11 @@ export function buildLlmBundle({
     events,
   );
   const browserEvidence = buildBrowserEvidence(index, events, session.startMs);
-  const fullStackEvidence = buildFullStackEvidence(index, session.startMs);
+  const fullStackEvidence = buildFullStackEvidence(
+    index,
+    session.startMs,
+    buildFullStackPayloadIndex(events),
+  );
   const media = buildMediaSummary(sessionDir, index, events, session.startMs);
   const limitations = buildLimitations(
     artifacts,
@@ -845,11 +905,14 @@ function buildCompleteness(events: BugEvent[]): LlmBundleCompleteness {
   const gapsBySurface: Record<string, number> = {};
   const gapsByReason: Record<string, number> = {};
   let gapCount = 0;
+  let droppedEventCount = 0;
 
   for (const event of events) {
     if (event.k !== CAPTURE_GAP_EVENT_KIND) continue;
     gapCount += 1;
     const payload = isRecord(event.d) ? event.d : {};
+    const dropped = finiteNumber(payload.droppedEventCount);
+    if (dropped !== undefined && dropped > 0) droppedEventCount += dropped;
     const surface =
       typeof payload.surface === "string" ? payload.surface : "unknown";
     const reason =
@@ -871,7 +934,7 @@ function buildCompleteness(events: BugEvent[]): LlmBundleCompleteness {
         ? "degraded"
         : "fragmentary";
 
-  return { gapCount, gapsBySurface, gapsByReason, grade };
+  return { gapCount, gapsBySurface, gapsByReason, droppedEventCount, grade };
 }
 
 /**
@@ -1550,7 +1613,37 @@ function buildBrowserEvidence(
     consoleErrors: buildConsoleErrorSummaries(index, events, sessionStartMs),
     tabBoundaries: buildTabBoundarySummary(index, events, sessionStartMs),
     interactiveElements: collectInteractiveElements(events),
+    storageChanges: buildStorageChanges(events, sessionStartMs),
   };
+}
+
+const MAX_STORAGE_CHANGES = 200;
+
+function buildStorageChanges(
+  events: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleStorageChange[] {
+  const changes: LlmBundleStorageChange[] = [];
+  for (const event of events) {
+    if (event.k !== "stor" || !isRecord(event.d)) continue;
+    changes.push(
+      removeUndefined({
+        t: event.t,
+        iso: iso(event.t),
+        offsetMs:
+          finiteNumber(event.offsetMs) ??
+          offsetFromStart(event.t, sessionStartMs),
+        area: safeText(event.d.type, 20),
+        op: safeText(event.d.op, 20),
+        // Already redacted by `redactStorageKey` at capture; re-run the value
+        // policy as defense in depth, the same way db images are treated.
+        key: safeText(event.d.key, 200),
+        oldValue: redactValue(event.d.oldVal, "stor.oldVal").value,
+        newValue: redactValue(event.d.newVal, "stor.newVal").value,
+      }) as LlmBundleStorageChange,
+    );
+  }
+  return changes.sort((a, b) => a.t - b.t).slice(0, MAX_STORAGE_CHANGES);
 }
 
 function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
@@ -1773,7 +1866,11 @@ function buildDatabaseReads(
           string,
           unknown
         >,
-        requestId: safeText(event.d.requestId, 200),
+        // A correlation key, not free text. `safeText` reads a 32 hex request
+        // id as a long opaque token and redacts it, which collapses every read
+        // into one bucket and makes per-request fan-out uncountable. `db.diff`
+        // has always used the correlation-aware path; reads are the same field.
+        requestId: safeCorrelationId(event.d.requestId, 200),
       }) as LlmBundleDbRead,
     );
   }
@@ -2617,9 +2714,101 @@ function boundaryPromptFromValue(
   return Object.keys(prompt).length > 0 ? prompt : undefined;
 }
 
+/**
+ * Payload snippets for one request id, resolved from the session's events.
+ *
+ * `index.fullStackRequests` is a link table: it records that a frontend request
+ * and a backend request are the same request, and carries no payloads. The
+ * payloads are in the events the link table points at, so the join is done here
+ * rather than widening the index.
+ */
+interface FullStackPayloads {
+  frontendRequestBody?: string;
+  frontendResponseBody?: string;
+  backendResponseBody?: string;
+  backendResponseCallsite?: LlmBundleDbCallsite;
+}
+
+/**
+ * Indexes redacted request and response snippets by correlation id.
+ *
+ * Every snippet goes through `redactedNetworkBodySnippet`, which re-runs the
+ * capture-time policy, so this adds no new raw-payload path: it carries evidence
+ * the session already holds into the artifact an agent actually reads.
+ */
+function buildFullStackPayloadIndex(
+  events: BugEvent[],
+): Map<string, FullStackPayloads> {
+  const byRequest = new Map<string, FullStackPayloads>();
+  const entryFor = (requestId: string): FullStackPayloads => {
+    const existing = byRequest.get(requestId);
+    if (existing) return existing;
+    const created: FullStackPayloads = {};
+    byRequest.set(requestId, created);
+    return created;
+  };
+
+  for (const event of events) {
+    if (!isRecord(event.d)) continue;
+    const requestId = safeCorrelationId(event.d.requestId);
+    if (!requestId || requestId === REDACTED_VALUE) continue;
+
+    if (event.k === "net.req") {
+      const body = redactedNetworkBodySnippet(event.d.body, event.d.bodySummary);
+      if (body) entryFor(requestId).frontendRequestBody ??= body;
+    } else if (event.k === "net.res") {
+      const body = redactedNetworkBodySnippet(event.d.body, event.d.bodySummary);
+      if (body) entryFor(requestId).frontendResponseBody ??= body;
+    } else if (event.k === "backend.req.end") {
+      const body = redactedNetworkBodySnippet(
+        event.d.responseBody,
+        event.d.responseBodySummary,
+      );
+      if (body) entryFor(requestId).backendResponseBody ??= body;
+      const callsite = normalizeDbCallsite(event.d.responseCallsite);
+      if (callsite) entryFor(requestId).backendResponseCallsite ??= callsite;
+    }
+  }
+
+  return byRequest;
+}
+
+const FULL_STACK_SUMMARY_CAP = 40;
+
+/**
+ * Applies the cap by outcome rather than by arrival.
+ *
+ * A busy page issues far more requests than the cap keeps, and the ones that
+ * failed are the reason anyone opens the bundle. Taking the first N by arrival
+ * lets a session's only 500 fall off behind forty successful polls, which reads
+ * as "nothing failed". Within a tier the original order is preserved, so a
+ * session under the cap is unchanged.
+ */
+function keepFailuresFirst<
+  T extends {
+    frontend?: { status?: number };
+    backend?: { statusCode?: number };
+  },
+>(entries: T[], cap: number): T[] {
+  if (entries.length <= cap) return entries;
+  const rank = (entry: T): number => {
+    const status = entry.backend?.statusCode ?? entry.frontend?.status ?? 0;
+    if (status >= 500) return 0;
+    if (status >= 400) return 1;
+    return 2;
+  };
+  return entries
+    .map((entry, position) => ({ entry, position, rank: rank(entry) }))
+    .sort((a, b) => a.rank - b.rank || a.position - b.position)
+    .slice(0, cap)
+    .sort((a, b) => a.position - b.position)
+    .map(({ entry }) => entry);
+}
+
 function buildFullStackEvidence(
   index: SessionIndexLike,
   sessionStartMs: number,
+  payloads: Map<string, FullStackPayloads>,
 ): LlmBundleFullStackEvidence {
   const empty: LlmBundleFullStackEvidence = {
     schemaVersion: 1,
@@ -2640,22 +2829,28 @@ function buildFullStackEvidence(
     ? index.fullStackRequests.summary
     : {};
   const linked = Array.isArray(index.fullStackRequests.linked)
-    ? index.fullStackRequests.linked
-        .map((entry) => linkedFullStackRequestFromIndex(entry, sessionStartMs))
-        .filter(
-          (entry): entry is LlmBundleLinkedFullStackRequestSummary =>
-            entry !== undefined,
-        )
-        .slice(0, 40)
+    ? keepFailuresFirst(
+        index.fullStackRequests.linked
+          .map((entry) =>
+            linkedFullStackRequestFromIndex(entry, sessionStartMs, payloads),
+          )
+          .filter(
+            (entry): entry is LlmBundleLinkedFullStackRequestSummary =>
+              entry !== undefined,
+          ),
+        FULL_STACK_SUMMARY_CAP,
+      )
     : [];
   const gaps = Array.isArray(index.fullStackRequests.gaps)
-    ? index.fullStackRequests.gaps
-        .map((entry) => fullStackGapFromIndex(entry, sessionStartMs))
-        .filter(
-          (entry): entry is LlmBundleFullStackRequestGapSummary =>
-            entry !== undefined,
-        )
-        .slice(0, 40)
+    ? keepFailuresFirst(
+        index.fullStackRequests.gaps
+          .map((entry) => fullStackGapFromIndex(entry, sessionStartMs, payloads))
+          .filter(
+            (entry): entry is LlmBundleFullStackRequestGapSummary =>
+              entry !== undefined,
+          ),
+        FULL_STACK_SUMMARY_CAP,
+      )
     : [];
   const summaryGapTypes = sanitizeGapTypes(summary.gapTypes);
   const gapTypes =
@@ -2702,17 +2897,21 @@ function buildFullStackEvidence(
 function linkedFullStackRequestFromIndex(
   value: unknown,
   sessionStartMs: number,
+  payloads: Map<string, FullStackPayloads>,
 ): LlmBundleLinkedFullStackRequestSummary | undefined {
   if (!isRecord(value)) return undefined;
   const requestId = safeCorrelationId(value.requestId);
   const sessionId = safeCorrelationId(value.sessionId);
+  const payload = requestId ? payloads.get(requestId) : undefined;
   const frontend = frontendRequestEvidenceFromIndex(
     value.frontend,
     sessionStartMs,
+    payload,
   );
   const backend = backendRequestEvidenceFromIndex(
     value.backend,
     sessionStartMs,
+    payload,
   );
   if (!requestId || !sessionId || !frontend || !backend) return undefined;
 
@@ -2722,14 +2921,25 @@ function linkedFullStackRequestFromIndex(
 function fullStackGapFromIndex(
   value: unknown,
   sessionStartMs: number,
+  payloads: Map<string, FullStackPayloads>,
 ): LlmBundleFullStackRequestGapSummary | undefined {
   if (!isRecord(value) || !isFullStackGapKind(value.type)) return undefined;
+  const requestId = safeCorrelationId(value.requestId);
+  const payload = requestId ? payloads.get(requestId) : undefined;
   const gap = removeUndefined({
     type: value.type,
-    requestId: safeCorrelationId(value.requestId),
+    requestId,
     sessionId: safeCorrelationId(value.sessionId),
-    frontend: frontendRequestEvidenceFromIndex(value.frontend, sessionStartMs),
-    backend: backendRequestEvidenceFromIndex(value.backend, sessionStartMs),
+    frontend: frontendRequestEvidenceFromIndex(
+      value.frontend,
+      sessionStartMs,
+      payload,
+    ),
+    backend: backendRequestEvidenceFromIndex(
+      value.backend,
+      sessionStartMs,
+      payload,
+    ),
   });
   return gap.frontend || gap.backend || gap.requestId || gap.sessionId
     ? gap
@@ -2739,6 +2949,7 @@ function fullStackGapFromIndex(
 function frontendRequestEvidenceFromIndex(
   value: unknown,
   sessionStartMs: number,
+  payload?: FullStackPayloads,
 ): LlmBundleFrontendRequestEvidenceSummary | undefined {
   if (!isRecord(value)) return undefined;
   const frontend = removeUndefined({
@@ -2749,6 +2960,8 @@ function frontendRequestEvidenceFromIndex(
     url: safeUrl(value.url, "index.fullStackRequests.frontend.url"),
     status: finiteNumber(value.status),
     durationMs: finiteNumber(value.durationMs),
+    requestBody: payload?.frontendRequestBody,
+    responseBody: payload?.frontendResponseBody,
     error: fullStackFrontendErrorFromIndex(value.error),
   });
   return Object.keys(frontend).length > 0 ? frontend : undefined;
@@ -2757,6 +2970,7 @@ function frontendRequestEvidenceFromIndex(
 function backendRequestEvidenceFromIndex(
   value: unknown,
   sessionStartMs: number,
+  payload?: FullStackPayloads,
 ): LlmBundleBackendRequestEvidenceSummary | undefined {
   if (!isRecord(value)) return undefined;
   const backend = removeUndefined({
@@ -2775,6 +2989,8 @@ function backendRequestEvidenceFromIndex(
     route: safeText(value.route, 160),
     statusCode: finiteNumber(value.statusCode),
     durationMs: finiteNumber(value.durationMs),
+    responseBody: payload?.backendResponseBody,
+    responseCallsite: payload?.backendResponseCallsite,
     error: fullStackBackendErrorFromIndex(value.error),
   });
   return Object.keys(backend).length > 0 ? backend : undefined;

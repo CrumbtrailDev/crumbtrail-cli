@@ -10,6 +10,8 @@ export interface BuildCaptureGapEventInput {
   reason: CaptureGapEventData["reason"];
   /** A safe diagnostic descriptor, never raw SQL or user data. */
   detail?: string;
+  /** How many events this gap accounts for, when the surface can count them. */
+  droppedEventCount?: number;
   /** Request the gap belongs to. Carried so an unterminated request names itself. */
   requestId?: string;
   t?: number;
@@ -42,11 +44,13 @@ export function buildCaptureGapEvent(
   const t = normalizeTimestamp(input.t);
   const detail = sanitizeDetail(input.detail);
   const requestId = sanitizeRequestId(input.requestId);
+  const droppedEventCount = sanitizeDroppedEventCount(input.droppedEventCount);
   const d: CaptureGapEventData = {
     kind: "capture_gap",
     surface: input.surface,
     reason: input.reason,
     ...(detail ? { detail } : {}),
+    ...(droppedEventCount !== undefined ? { droppedEventCount } : {}),
     ...(requestId ? { requestId } : {}),
     t,
   };
@@ -91,6 +95,13 @@ function sanitizeDetail(value: string | undefined): string | undefined {
  * Request ids are generated identifiers, not user data, so the value is kept
  * verbatim apart from a length bound and a whitespace trim.
  */
+/** A count, so it is bounded to a non-negative integer and nothing else. */
+function sanitizeDroppedEventCount(value: number | undefined): number | undefined {
+  if (!Number.isFinite(value)) return undefined;
+  const rounded = Math.round(value as number);
+  return rounded >= 0 ? rounded : undefined;
+}
+
 function sanitizeRequestId(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) return undefined;

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { HttpTransport } from "../http";
+import { EventDeliveryError, HttpTransport } from "../http";
 import type { BugReport } from "../../types";
 
 function makeReport(overrides?: Partial<BugReport>): BugReport {
@@ -121,7 +121,7 @@ describe("HttpTransport", () => {
     });
   });
 
-  it("does not throw when sendEvents fetch fails and sendBeacon is unavailable", async () => {
+  it("reports the loss when sendEvents fetch fails and sendBeacon is unavailable", async () => {
     await transport.startSession("ses_test", {});
 
     vi.stubGlobal(
@@ -134,9 +134,42 @@ describe("HttpTransport", () => {
       configurable: true,
     });
 
-    await expect(
-      transport.sendEvents([{ t: 1000, k: "err", d: {} }]),
-    ).resolves.toBeUndefined();
+    // Nothing carried the batch, so resolving would report a delivery that did
+    // not happen and the session would understate itself.
+    let error: EventDeliveryError | undefined;
+    try {
+      await transport.sendEvents([{ t: 1000, k: "err", d: {} }]);
+    } catch (caught) {
+      error = caught as EventDeliveryError;
+    }
+    expect(error?.status).toBe(0);
+    expect(error?.eventCount).toBe(1);
+  });
+
+  it("reports the loss when the beacon queue refuses the batch too", async () => {
+    await transport.startSession("ses_test", {});
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new Error("network error")),
+    );
+    // A burst fills the beacon queue; false means "not queued", not "sent".
+    Object.defineProperty(navigator, "sendBeacon", {
+      value: vi.fn().mockReturnValue(false),
+      writable: true,
+      configurable: true,
+    });
+
+    let error: EventDeliveryError | undefined;
+    try {
+      await transport.sendEvents([
+        { t: 1000, k: "err", d: {} },
+        { t: 1001, k: "err", d: {} },
+      ]);
+    } catch (caught) {
+      error = caught as EventDeliveryError;
+    }
+    expect(error?.eventCount).toBe(2);
   });
 
   it("sends endSession request", async () => {
@@ -261,5 +294,48 @@ describe("HttpTransport", () => {
     });
 
     await expect(transport.endSession("ses_test")).resolves.toBeUndefined();
+  });
+
+  describe("a refused batch is not a delivered batch", () => {
+    it("throws when the endpoint answers a non-2xx", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(new Response("too large", { status: 413 })),
+      );
+      await transport.startSession("ses_test", {});
+
+      await expect(
+        transport.sendEvents([{ t: 1, k: "con", d: { lv: "err", args: [] } }]),
+      ).rejects.toBeInstanceOf(EventDeliveryError);
+    });
+
+    it("reports the status and the number of events lost", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(new Response("slow down", { status: 429 })),
+      );
+      await transport.startSession("ses_test", {});
+
+      let error: EventDeliveryError | undefined;
+      try {
+        await transport.sendEvents([
+          { t: 1, k: "con", d: {} },
+          { t: 2, k: "con", d: {} },
+        ]);
+      } catch (caught) {
+        error = caught as EventDeliveryError;
+      }
+
+      expect(error).toBeInstanceOf(EventDeliveryError);
+      expect(error?.status).toBe(429);
+      expect(error?.eventCount).toBe(2);
+    });
+
+    it("still resolves on a 2xx", async () => {
+      await transport.startSession("ses_test", {});
+      await expect(
+        transport.sendEvents([{ t: 1, k: "con", d: {} }]),
+      ).resolves.toBeUndefined();
+    });
   });
 });
