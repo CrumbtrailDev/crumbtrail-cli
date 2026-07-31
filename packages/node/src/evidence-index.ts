@@ -685,7 +685,7 @@ export function buildEvidenceCandidates(
   applyCausalRerank(ordered, causalGraph);
 
   // Cap emitted candidates after re-ranking so the highest-priority items survive the truncation.
-  ordered.splice(MAX_EVIDENCE_CANDIDATES);
+  capWithDetectorDiversity(ordered);
 
   const windows = mergeWindowRanges(
     ordered.map((draft) => ({
@@ -1962,6 +1962,15 @@ function responseBodyByRequestId(events: BugEvent[]): Map<string, unknown> {
     if (event.k !== "net.res") continue;
     const id = requestIdForEvent(event);
     if (id !== undefined) out.set(id, event.d.body);
+  }
+  // Backend-only exchanges, keyed by the shared correlation id. Added second and
+  // without overwriting: when the browser saw the same response its view wins.
+  for (const event of events) {
+    if (event.k !== "backend.req.end" && event.k !== "backend.req.error")
+      continue;
+    if (event.d.body === undefined) continue;
+    const id = safeText(event.d.requestId, 200);
+    if (id !== undefined && !out.has(id)) out.set(id, event.d.body);
   }
   return out;
 }
@@ -5585,7 +5594,55 @@ function collectRequestExchanges(
     entry.resBodyMeta = event.d.bodyMeta;
     entry.status = finiteNumber(event.d.st);
   }
+  addBackendOnlyExchanges(events, exchanges);
   return exchanges;
+}
+
+/**
+ * Adds exchanges for requests no browser made.
+ *
+ * A job, a webhook, a service-to-service call or a CLI produces
+ * `backend.req.start` / `backend.req.end` and never a `net.req` / `net.res`
+ * pair, so every detector that reads an exchange was blind to that traffic —
+ * not because the evidence was weak but because it was filed under a different
+ * event kind. The backend events now carry the same `body` field the browser
+ * response carries, so the join is a rename, not a new evidence source.
+ *
+ * A browser-observed exchange always wins: when both planes saw the same
+ * correlation id the frontend view is the richer one, and it is left alone.
+ */
+function addBackendOnlyExchanges(
+  events: BugEvent[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  for (const event of events) {
+    if (event.k !== "backend.req.start" && event.k !== "backend.req.end")
+      continue;
+    const id = safeText(event.d.requestId, 200);
+    if (!id || exchanges.has(id)) continue;
+    exchanges.set(id, {
+      requestId: id,
+      req: event,
+      method: (safeText(event.d.method, 20) ?? "GET").toUpperCase(),
+      url: safeText(event.d.url, 400),
+      body: event.d.reqBody,
+    });
+  }
+  for (const event of events) {
+    if (event.k !== "backend.req.end" && event.k !== "backend.req.error")
+      continue;
+    const id = safeText(event.d.requestId, 200);
+    if (!id) continue;
+    const entry = exchanges.get(id);
+    // Only fill a slot this pass created: an exchange the browser owns keeps
+    // the browser's own response.
+    if (!entry || (entry.req.k !== "backend.req.start" && entry.req.k !== "backend.req.end"))
+      continue;
+    entry.res = event;
+    if (event.d.body !== undefined) entry.resBody = event.d.body;
+    if (event.d.reqBody !== undefined) entry.body = event.d.reqBody;
+    entry.status = finiteNumber(event.d.statusCode);
+  }
 }
 
 function isSuccessStatus(status: number | undefined): boolean {
@@ -11072,6 +11129,57 @@ function dedupeDrafts(drafts: CandidateDraft[]): CandidateDraft[] {
     // is noise in a payload an agent has to read.
     return count > 1 ? { ...draft, occurrences: count } : draft;
   });
+}
+
+/**
+ * How many candidates one detector may hold before the rest of its output is
+ * deferred behind every other detector's first findings.
+ *
+ * Measured problem: a session with a repeating failure spends the cap on it. In
+ * one 19k-event capture, `http_error` (76), `backend_http_client_error` (41),
+ * `backend_http_error` (34) and `network_error` (19) took 170 of 200 slots,
+ * overwhelmingly the same two URLs — and the only candidate naming the actual
+ * frontend race was pushed off the end. The 71st copy of one 404 tells an agent
+ * nothing the 10th did not; a detector that fired once may be the answer.
+ */
+const DETECTOR_FAIR_SHARE = 10;
+
+/**
+ * Truncates to the cap, but rations by detector first.
+ *
+ * Pass one takes each detector's best `DETECTOR_FAIR_SHARE` in rank order; pass
+ * two backfills the remaining room with everything deferred, still in rank
+ * order. With few detectors firing this is exactly the old behaviour — the
+ * rationing only binds when one detector is crowding others out.
+ */
+function capWithDetectorDiversity(ordered: CandidateDraft[]): void {
+  if (ordered.length <= MAX_EVIDENCE_CANDIDATES) return;
+
+  const rank = new Map<CandidateDraft, number>();
+  ordered.forEach((draft, position) => rank.set(draft, position));
+  const perDetector = new Map<string, number>();
+  const kept: CandidateDraft[] = [];
+  const deferred: CandidateDraft[] = [];
+
+  for (const draft of ordered) {
+    const seen = perDetector.get(draft.detector) ?? 0;
+    if (seen < DETECTOR_FAIR_SHARE && kept.length < MAX_EVIDENCE_CANDIDATES) {
+      perDetector.set(draft.detector, seen + 1);
+      kept.push(draft);
+    } else {
+      deferred.push(draft);
+    }
+  }
+
+  for (const draft of deferred) {
+    if (kept.length >= MAX_EVIDENCE_CANDIDATES) break;
+    kept.push(draft);
+  }
+
+  // Restore rank order: the two passes interleave detectors, and consumers read
+  // this list as ranked.
+  kept.sort((a, b) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0));
+  ordered.splice(0, ordered.length, ...kept);
 }
 
 function mergeWindowRanges(
