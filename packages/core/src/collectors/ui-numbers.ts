@@ -31,7 +31,10 @@ export const UI_NUM_SETTLE_MS = 500;
  * scan immediately instead of waiting for quiet that never comes.
  */
 export const UI_NUM_MAX_WAIT_MS = 1500;
-/** Hard cap on labeled tokens per region snapshot. */
+/**
+ * Hard cap on labeled tokens per region snapshot. A region carrying more than
+ * this is reported as a gap and withheld, never clipped — see `scanUiNumbers`.
+ */
 export const UI_NUM_MAX_ITEMS = 50;
 /** Labels longer than this are ignored (they are prose, not labels). */
 const MAX_LABEL_LENGTH = 64;
@@ -50,6 +53,19 @@ export interface UiNumItem {
   label: string;
   value: number;
   unit?: string;
+}
+
+/** A region withheld because it carried more than `UI_NUM_MAX_ITEMS` tokens. */
+export interface UiNumTruncatedRegion {
+  region: string;
+  /** Total labeled tokens the region held, counted past the cap. */
+  seen: number;
+}
+
+export interface UiNumScanResult {
+  /** Regions captured whole. An over-cap region is absent, never clipped. */
+  regions: Map<string, UiNumItem[]>;
+  truncated: UiNumTruncatedRegion[];
 }
 
 /**
@@ -419,24 +435,35 @@ function isLeaf(el: Element): boolean {
  * Scan visible text under `root` for labeled numeric tokens, grouped by
  * region. Pure DOM read — no mutation, no HTML capture.
  *
- * Returns `null` (an "over budget" sentinel) rather than a region map when the
- * root holds more than `maxElements` elements. `null` is deliberately distinct
- * from an empty map: a partial snapshot would be worse than none, because the
+ * Returns `null` (an "over budget" sentinel) rather than a result when the root
+ * holds more than `maxElements` elements. `null` is deliberately distinct from
+ * an empty map: a partial snapshot would be worse than none, because the
  * ui_arithmetic_mismatch detector assumes every component of a region is
  * present, so a truncated region would manufacture a high-confidence false
  * "subtotal + tax ≠ total". Over budget therefore means "no evidence", not
  * "some evidence". `maxElements` is injectable so callers (and tests) can pin
  * the ceiling; it defaults to `UI_NUM_MAX_SCAN_ELEMENTS`.
+ *
+ * A single region exceeding `UI_NUM_MAX_ITEMS` is the same hazard at a smaller
+ * scale, so it gets the same answer: the region is withheld from `regions` and
+ * named in `truncated` instead of being clipped to the first N items. Clipping
+ * is the one outcome that must not happen here — it hands the detector a region
+ * that looks complete and is not, which is exactly how a false
+ * "subtotal + tax ≠ total" is manufactured. The caller turns `truncated` into a
+ * `capture_gap` so the withheld region is visible rather than silent.
  */
 export function scanUiNumbers(
   root: Element,
   denyFields?: string[],
   maxElements: number = UI_NUM_MAX_SCAN_ELEMENTS,
   lang: string | null = null,
-): Map<string, UiNumItem[]> | null {
+): UiNumScanResult | null {
   const elements = root.querySelectorAll("*");
   if (elements.length > maxElements) return null;
   const regions = new Map<string, UiNumItem[]>();
+  // Counted past the cap so the gap can report the magnitude it withheld: a
+  // region of 51 and a region of 5,000 are different evidence problems.
+  const seenPerRegion = new Map<string, number>();
   for (const el of elements) {
     const tag = el.tagName;
     if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") continue;
@@ -457,6 +484,7 @@ export function scanUiNumbers(
     if (isDeniedNumericValue(parsed.value)) continue;
 
     const region = regionIdentifier(regionContainer(el, root));
+    seenPerRegion.set(region, (seenPerRegion.get(region) ?? 0) + 1);
     let items = regions.get(region);
     if (!items) {
       items = [];
@@ -470,7 +498,16 @@ export function scanUiNumbers(
     if (parsed.unit) item.unit = parsed.unit;
     items.push(item);
   }
-  return regions;
+
+  // Withhold every over-cap region before returning: what the caller receives
+  // is only ever regions that were captured whole.
+  const truncated: UiNumTruncatedRegion[] = [];
+  for (const [region, seen] of seenPerRegion) {
+    if (seen <= UI_NUM_MAX_ITEMS) continue;
+    regions.delete(region);
+    truncated.push({ region, seen });
+  }
+  return { regions, truncated };
 }
 
 /**
@@ -664,6 +701,10 @@ function startUiNumbersCollector(
   let deferredSince: number | undefined;
   // Previous serialized snapshot per region: emit only on change.
   const lastSnapshot = new Map<string, string>();
+  // Regions already reported as over-cap. A dashboard that mutates on a timer
+  // rescans every 500ms and would otherwise emit the same gap forever; the gap
+  // is a statement about the region, so one is the whole truth.
+  const reportedTruncated = new Set<string>();
   let observer: MutationObserver | undefined;
   // Assigned after observer setup; `let` so `disable` (defined first, callable
   // from the observer-setup catch) can release it without a TDZ reference.
@@ -714,13 +755,13 @@ function startUiNumbersCollector(
       // Locale first: the page language decides how ambiguous separators in
       // rendered numbers are read (`1,234` is a thousand in en, 1.234 in de).
       const locale = readLocale();
-      const regions = scanUiNumbers(
+      const scan = scanUiNumbers(
         document.body,
         denyFields,
         UI_NUM_MAX_SCAN_ELEMENTS,
         locale.lang,
       );
-      if (regions === null) {
+      if (scan === null) {
         // Over budget: the page has too many elements to scan safely on the
         // 500ms cadence. Permanently disable rather than emit a partial (and
         // therefore misleading) snapshot. `scan_budget_exceeded` distinguishes
@@ -731,7 +772,29 @@ function startUiNumbersCollector(
         );
         return;
       }
-      for (const [region, items] of regions) {
+      // An over-cap region is withheld rather than clipped, so without this the
+      // session would read as complete while a dense region contributed
+      // nothing. Reported per region and once each: unlike the element budget
+      // this is not a collector fault, so every other region keeps capturing.
+      for (const { region, seen } of scan.truncated) {
+        // Forget any snapshot emitted while the region was still under the cap.
+        // Otherwise a region that grows over, then shrinks back to its earlier
+        // contents, is suppressed by the change check and never re-emitted.
+        lastSnapshot.delete(region);
+        if (reportedTruncated.has(region)) continue;
+        reportedTruncated.add(region);
+        // `detail` is dropped here by design: the capture-gap sanitizer keeps
+        // only SQL and error-class classifications, and a region identifier is
+        // page-derived text that has no business being carried as evidence.
+        bus.emit(
+          buildCaptureGapEvent({
+            surface: "browser",
+            reason: "scan_budget_exceeded",
+            droppedEventCount: seen,
+          }),
+        );
+      }
+      for (const [region, items] of scan.regions) {
         if (items.length === 0) continue;
         const serialized = JSON.stringify(items);
         if (lastSnapshot.get(region) === serialized) continue;
