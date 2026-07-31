@@ -675,6 +675,8 @@ describe("llm bundle", () => {
       gapCount: 2,
       gapsBySurface: { db_diff: 1, backend_request: 1 },
       gapsByReason: { unparsed_sql: 1, header_stripped: 1 },
+      // Neither gap declares a size, so the total stays 0 rather than guessing.
+      droppedEventCount: 0,
       grade: "degraded",
     });
 

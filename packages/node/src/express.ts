@@ -1,4 +1,6 @@
 import { buildCaptureGapEvent, type BugEvent } from "crumbtrail-core";
+import { captureDbCallsite } from "./db/callsite";
+import type { DbCallsite } from "./db/callsite";
 import {
   CRUMBTRAIL_REQUEST_HEADER,
   buildBackendRequestEndEvent,
@@ -121,6 +123,11 @@ export interface CrumbtrailExpressOptions {
    * plane before it is sent.
    */
   captureResponseBody?: "off" | "error" | "all";
+  /**
+   * Repo root used to make the 5xx response callsite repo-relative. Defaults to
+   * `process.cwd()`, matching the database instrumentation's `callsiteRoot`.
+   */
+  callsiteRoot?: string;
   /** Cap on captured response bytes. Beyond it the body is truncated and marked. */
   responseBodyMaxBytes?: number;
   /**
@@ -379,6 +386,17 @@ interface ResponseRecorder {
   chunks: string[];
   bytes: number;
   truncated: boolean;
+  /**
+   * Where the application decided to fail, captured at the moment a 5xx body is
+   * first written.
+   *
+   * Callsites otherwise ride on `db.diff`, so a handler that catches its own
+   * error and returns a constant leaves no pointer anywhere: the bundle can
+   * only repeat the uninformative body the user already saw. The response
+   * write is the one place every failure passes through, whether or not it
+   * touched a database.
+   */
+  callsite?: DbCallsite;
 }
 
 /**
@@ -404,7 +422,14 @@ function attachResponseRecorder(
   if (cap <= 0) return undefined;
 
   const recorder: ResponseRecorder = { chunks: [], bytes: 0, truncated: false };
+  const captureFailureCallsite = (): void => {
+    if (recorder.callsite) return;
+    const status = safeStatusCode(res.statusCode);
+    if (status === undefined || status < 500) return;
+    recorder.callsite = captureDbCallsite(options.callsiteRoot);
+  };
   const record = (chunk: unknown): void => {
+    captureFailureCallsite();
     if (recorder.bytes >= cap) return;
     let text: string | undefined;
     if (typeof chunk === "string") text = chunk;
@@ -452,6 +477,7 @@ function readResponseEvidence(
   responseBody?: string;
   responseHeaders?: Record<string, string>;
   responseBodyTruncated?: boolean;
+  responseCallsite?: DbCallsite;
   keepFields?: readonly string[];
 } {
   const mode = options.captureResponseBody ?? "error";
@@ -465,7 +491,10 @@ function readResponseEvidence(
   if (mode === "error" && (status === undefined || status < 400))
     return Object.keys(headers).length > 0 ? { responseHeaders: headers } : {};
   if (!recorder || recorder.chunks.length === 0)
-    return Object.keys(headers).length > 0 ? { responseHeaders: headers } : {};
+    return {
+      ...(Object.keys(headers).length > 0 ? { responseHeaders: headers } : {}),
+      ...(recorder?.callsite ? { responseCallsite: recorder.callsite } : {}),
+    };
 
   const contentType = headers["content-type"];
   // A binary payload contributes nothing a reader can use and everything a
@@ -474,6 +503,7 @@ function readResponseEvidence(
     return { responseHeaders: headers };
 
   return {
+    ...(recorder.callsite ? { responseCallsite: recorder.callsite } : {}),
     responseBody: recorder.chunks.join(""),
     ...(options.keepFields && options.keepFields.length > 0
       ? { keepFields: options.keepFields }

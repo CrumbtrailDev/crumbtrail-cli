@@ -1,5 +1,31 @@
 import type { BugEvent, CrumbtrailTransport, BugReport } from "../types";
 
+/**
+ * A batch the server refused.
+ *
+ * `fetch` resolves for 4xx and 5xx alike, so a transport that only catches
+ * thrown errors treats "payload too large" and "rate limited" as delivery. The
+ * events are dropped, nothing records it, and the resulting session is
+ * indistinguishable from one where nothing happened. Throwing lets the caller
+ * declare the hole.
+ */
+export class EventDeliveryError extends Error {
+  /** HTTP status, or 0 when the request never produced a response. */
+  readonly status: number;
+  readonly eventCount: number;
+
+  constructor(status: number, eventCount: number) {
+    super(
+      status > 0
+        ? `capture endpoint rejected ${eventCount} event(s) with ${status}`
+        : `capture endpoint unreachable for ${eventCount} event(s)`,
+    );
+    this.name = "EventDeliveryError";
+    this.status = status;
+    this.eventCount = eventCount;
+  }
+}
+
 export interface HttpTransportOptions {
   authToken?: string;
 }
@@ -52,20 +78,32 @@ export class HttpTransport implements CrumbtrailTransport {
     // keepalive lets the request outlive the page (pagehide/tab close), but
     // only bodies under the browser's keepalive budget may opt in.
     if (utf8ByteLength(body) <= KEEPALIVE_MAX_BYTES) init.keepalive = true;
+    let response: Response | undefined;
     try {
-      await fetch(`${this.endpoint}/api/events`, init);
+      response = await fetch(`${this.endpoint}/api/events`, init);
     } catch {
       // Mirrors endSession: during teardown fetch can be torn down mid-flight;
       // sendBeacon is queued by the browser and survives unload. sessionId is
       // already in the body. No auth header on this path (same as endSession).
+      //
+      // The return value matters. A page that logs in a tight loop exhausts the
+      // browser's in-flight request budget, every fetch rejects, and the beacon
+      // queue is full too — so `sendBeacon` answers false and the batch is
+      // simply gone. Swallowing that is how a session drops most of a burst and
+      // still reports itself complete.
       if (
         typeof navigator !== "undefined" &&
         typeof navigator.sendBeacon === "function"
       ) {
         const blob = new Blob([body], { type: "application/json" });
-        navigator.sendBeacon(`${this.endpoint}/api/events`, blob);
+        if (navigator.sendBeacon(`${this.endpoint}/api/events`, blob)) return;
       }
+      throw new EventDeliveryError(0, events.length);
     }
+    // A refusal is not a delivery. Retrying by beacon would be refused the same
+    // way, so surface it instead: the caller turns this into a capture gap.
+    if (response && !response.ok)
+      throw new EventDeliveryError(response.status, events.length);
   }
 
   async sendBlob(
