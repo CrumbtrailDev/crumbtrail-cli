@@ -21,7 +21,6 @@ describe("MCP recallSimilarIssues (local)", () => {
   afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     delete process.env.CRUMBTRAIL_CLOUD_URL;
-    delete process.env.CRUMBTRAIL_API_KEY;
   });
 
   function seed(

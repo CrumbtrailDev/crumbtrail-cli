@@ -814,7 +814,7 @@ const TOOLS = [
   {
     name: "resolveIssue",
     description:
-      "Close the loop after diagnosing a recalled issue: record its resolution disposition in the cloud issue memory and, crucially, report which recall matches you actually reused via usedMemoryIds so the org recall index learns which past answers close real bugs. This does NOT touch the user's app, tickets, or external systems; it writes only to Crumbtrail's own memory. memoryId is a recall match id (the `id` field from recallSimilarIssues). Requires a cloud deployment (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_API_KEY); returns a gap when unconfigured.",
+      "Close the loop after diagnosing a recalled issue: record its resolution disposition in the cloud issue memory and, crucially, report which recall matches you actually reused via usedMemoryIds so the org recall index learns which past answers close real bugs. This does NOT touch the user's app, tickets, or external systems; it writes only to Crumbtrail's own memory. memoryId is a recall match id (the `id` field from recallSimilarIssues). Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -984,7 +984,6 @@ export class McpServer {
     this.bugQueue = new BugQueueManager({ bugsDir, readOnly: true });
     this.gitHostClientFactory = config.gitHostClientFactory;
   }
-
 
   start(): void {
     const rl = readline.createInterface({ input: process.stdin });
@@ -2011,9 +2010,6 @@ export class McpServer {
     return textResult(await buildRegressionContext(comparison, bDir));
   }
 
-
-
-
   // --- Distinct within-session bug grouping ---
 
   private async toolListDistinctBugs(args: Record<string, unknown>) {
@@ -2195,7 +2191,7 @@ export class McpServer {
 
   /**
    * Recall past issues that rhyme with a session or a free-text description. In
-   * cloud deployments (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_API_KEY set) this delegates
+   * cloud deployments (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN set) this delegates
    * to the org-wide semantic index; otherwise it scans the local session store
    * with a text-overlap + facet analogue so self-hosted users still get recall
    * without a vector DB.
@@ -2370,8 +2366,6 @@ export class McpServer {
     if (!result.ok) return this.learningLoopFailure(result, "getPlaybook");
     return textResult({ ...result.data, source: "cloud" });
   }
-
-
 
   /** Adapt this server's storage readers to the recall engine's injected seam.
    *  Delegates to the shared buildRecallStore so the MCP tool and the inner

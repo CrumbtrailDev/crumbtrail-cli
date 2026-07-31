@@ -88,7 +88,8 @@ function startMockCloud(): Promise<MockCloud> {
               score: 0.82,
               reasons: ["semantic", "same-route", "resolution_verified"],
               resolution: { disposition: "real-bug", rootCause: "null cart" },
-              outcomeSummary: "Fixed by guarding the empty cart; verified in prod.",
+              outcomeSummary:
+                "Fixed by guarding the empty cart; verified in prod.",
             },
           ],
         });
@@ -142,10 +143,13 @@ describe("MCP learning loop (CRUMB-113)", () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     delete process.env.CRUMBTRAIL_CLOUD_URL;
     delete process.env.CRUMBTRAIL_CLOUD_TOKEN;
-    delete process.env.CRUMBTRAIL_API_KEY;
   });
 
-  async function call(server: McpServer, name: string, args: Record<string, unknown>) {
+  async function call(
+    server: McpServer,
+    name: string,
+    args: Record<string, unknown>,
+  ) {
     const res = await server.handleMessage({
       jsonrpc: "2.0",
       id: 1,
@@ -165,11 +169,10 @@ describe("MCP learning loop (CRUMB-113)", () => {
 
   function configureCloud(url: string) {
     process.env.CRUMBTRAIL_CLOUD_URL = url;
-    process.env.CRUMBTRAIL_API_KEY = "proj-key-xyz";
     process.env.CRUMBTRAIL_CLOUD_TOKEN = "ctagt-token";
   }
 
-  it("resolveIssue posts disposition + usedMemoryIds with project-key auth and returns adopted", async () => {
+  it("resolveIssue posts disposition + usedMemoryIds with agent-token auth and returns adopted", async () => {
     mock = await startMockCloud();
     configureCloud(mock.url);
     const server = new McpServer({ outputDir: tmpDir });
@@ -182,12 +185,20 @@ describe("MCP learning loop (CRUMB-113)", () => {
     });
 
     expect(isError).toBe(false);
-    expect(parsed).toMatchObject({ ok: true, memoryId: "mem_1", adopted: 2, source: "cloud" });
+    expect(parsed).toMatchObject({
+      ok: true,
+      memoryId: "mem_1",
+      adopted: 2,
+      source: "cloud",
+    });
 
     const req = mock.requests.find((r) => r.path === "/api/memory/resolve");
     expect(req).toBeDefined();
     expect(req!.method).toBe("POST");
-    expect(req!.auth).toBe("proj-key-xyz");
+    // The memory plane is agent-token authenticated; the ingest key must never
+    // appear on it.
+    expect(req!.auth).toBeUndefined();
+    expect(req!.agentToken).toBe("ctagt-token");
     expect(req!.body).toMatchObject({
       memoryId: "mem_1",
       disposition: "real-bug",
@@ -244,7 +255,9 @@ describe("MCP learning loop (CRUMB-113)", () => {
     });
     expect(isError).toBe(false);
     expect(parsed).toMatchObject({ ok: false, source: "remote-unavailable" });
-    expect(parsed.gaps[0]).toMatch(/CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_API_KEY/);
+    expect(parsed.gaps[0]).toMatch(
+      /CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN/,
+    );
   });
 
   it("recallSimilarIssues surfaces outcomeSummary + resolution_verified reason from the cloud", async () => {
@@ -276,7 +289,10 @@ describe("MCP learning loop (CRUMB-113)", () => {
 
     expect(isError).toBe(false);
     expect(parsed).toMatchObject({ source: "cloud" });
-    expect(parsed.feedback).toMatchObject({ signal: "adopted", source: "agent" });
+    expect(parsed.feedback).toMatchObject({
+      signal: "adopted",
+      source: "agent",
+    });
 
     const req = mock.requests.find((r) => r.path === "/api/agent/feedback");
     expect(req!.method).toBe("POST");
@@ -327,7 +343,9 @@ describe("MCP learning loop (CRUMB-113)", () => {
     mock = await startMockCloud();
     configureCloud(mock.url);
     const server = new McpServer({ outputDir: tmpDir });
-    const { isError } = await call(server, "getPlaybook", { project: "bad id!" });
+    const { isError } = await call(server, "getPlaybook", {
+      project: "bad id!",
+    });
     expect(isError).toBe(true);
     expect(mock.requests).toHaveLength(0);
   });
