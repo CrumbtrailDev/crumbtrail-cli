@@ -162,9 +162,23 @@ const DEFAULT_RESPONSE_HEADER_ALLOWLIST = [
 
 const DEFAULT_RESPONSE_BODY_MAX_BYTES = 4096;
 
-/** Content types worth reading as text. Anything else is bytes to a reader. */
+/**
+ * Content types worth reading as text. Anything else is bytes to a reader.
+ *
+ * Matched by family rather than by exact type: `+json` and `+xml` cover the
+ * suffixed vocabularies (`application/problem+json` carries the sentence that
+ * explains a 4xx, `application/ld+json`, `application/vnd.api+json`), and the
+ * remaining names are the textual payloads a service actually answers with. A
+ * type missing here is not redacted, it is dropped, so the cost of being too
+ * narrow is a bundle holding a status code and nothing else.
+ */
 const TEXTUAL_CONTENT_TYPE =
-  /^(application\/(json|.*\+json|xml|.*\+xml|x-www-form-urlencoded)|text\/)/i;
+  /^(application\/(json|.*\+json|xml|.*\+xml|x-www-form-urlencoded|x-ndjson|graphql|csv|yaml|x-yaml)|text\/)/i;
+
+/** Test seam for the content-type gate. Not part of the middleware's contract. */
+export function isCapturableContentTypeForTest(contentType: string): boolean {
+  return TEXTUAL_CONTENT_TYPE.test(contentType);
+}
 
 interface RequestState {
   startedAtMs: number;

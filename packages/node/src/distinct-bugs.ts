@@ -229,7 +229,9 @@ export function groupDistinctBugs(
     clusters.push(cluster);
   }
 
-  const bugs = clusters.map((cluster) => buildBug(cluster, events));
+  const bugs = foldRepeatedRequestClusters(clusters).map((cluster) =>
+    buildBug(cluster, events),
+  );
   bugs.sort(
     (a, b) =>
       SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity] ||
@@ -237,6 +239,61 @@ export function groupDistinctBugs(
       a.bugId.localeCompare(b.bugId),
   );
   return bugs;
+}
+
+/**
+ * Folds request-keyed clusters whose members carry the same signatures into one
+ * bug.
+ *
+ * Clustering keys on the request id first, which is right for an incident whose
+ * evidence spans planes: that request's frontend response, backend status and
+ * database write belong together. It is wrong for a failure that simply
+ * repeated. Four identical `Network error from GET /api/claims/coverage`
+ * rejections arrive on four request ids and became four bugs carrying the
+ * *same* recurrence signature — the signature was computed and then not grouped
+ * on, so a caller asking "what distinct bugs are in this session" was handed the
+ * same one four times.
+ *
+ * A repeat is not always a singleton: an intermittent write path that trips two
+ * detectors per attempt produces N request clusters of two members each, all
+ * describing one defect. So the fold key is the whole member signature set, not
+ * just the one candidate — request clusters that agree on every member collapse,
+ * and a cluster whose combination of signals is unique stays on its own.
+ */
+function foldRepeatedRequestClusters(clusters: Cluster[]): Cluster[] {
+  const out: Cluster[] = [];
+  const foldedBySignature = new Map<string, Cluster>();
+
+  for (const cluster of clusters) {
+    if (!cluster.key.startsWith("req:")) {
+      out.push(cluster);
+      continue;
+    }
+    const key = clusterSignatureKey(cluster);
+    const existing = foldedBySignature.get(key);
+    if (existing) {
+      existing.members.push(...cluster.members);
+      continue;
+    }
+    // Keyed on the signature rather than the request, so the bugId is stable
+    // across runs where the same failure lands on different request ids.
+    const folded: Cluster = { key, members: [...cluster.members] };
+    foldedBySignature.set(key, folded);
+    out.push(folded);
+  }
+
+  return out;
+}
+
+/** Order-independent identity of everything a request cluster observed. */
+function clusterSignatureKey(cluster: Cluster): string {
+  const parts = cluster.members
+    .map(
+      ({ candidate }) =>
+        `${candidate.detector}|${normalizeSignature(candidate)}|${componentSignature(candidate)}`,
+    )
+    .sort();
+  return `sig:${parts.join(" ")}`;
 }
 
 export function buildDistinctBugSignature(

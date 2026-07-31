@@ -5,7 +5,11 @@ import {
   CAPTURE_GAP_EVENT_KIND,
   REDACTED_VALUE,
 } from "crumbtrail-core";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  flushBackendEvents,
+  resetBackendIntakeQueueForTest,
+} from "../backend-intake";
 import {
   BACKEND_REQUEST_END_EVENT,
   BACKEND_REQUEST_ERROR_EVENT,
@@ -31,6 +35,10 @@ class FakeResponse extends EventEmitter implements CrumbtrailExpressResponse {
 }
 
 describe("Crumbtrail Express-compatible middleware", () => {
+  // The intake queue is process-wide, so a test that leaves entries in flight
+  // would otherwise spend the next test's concurrency budget.
+  beforeEach(() => resetBackendIntakeQueueForTest());
+
   it("emits start immediately, calls next synchronously, and emits one end event on finish", async () => {
     const fetch = vi.fn().mockResolvedValue(okResponse());
     const req = fakeRequest({
@@ -519,9 +527,19 @@ function sequenceClock(...values: number[]) {
   return () => values[Math.min(index++, values.length - 1)] ?? 0;
 }
 
+/**
+ * Settles the send chain.
+ *
+ * Sends go through the intake queue, so a post is issued a turn or more after
+ * the call that asked for it, and a failed delivery schedules a follow-up event
+ * only once it has failed. Draining repeatedly reaches the fixed point rather
+ * than guessing a tick count.
+ */
 async function flushPromises() {
-  await Promise.resolve();
-  await Promise.resolve();
+  for (let round = 0; round < 4; round += 1) {
+    await Promise.resolve();
+    await flushBackendEvents();
+  }
 }
 
 /** Drains the send chain, including the follow-up a failed delivery schedules. */

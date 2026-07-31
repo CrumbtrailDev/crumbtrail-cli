@@ -10,7 +10,8 @@ export type BackendIntakeWarningKind =
   | "missing-fetch"
   | "fetch-rejected"
   | "http-error"
-  | "malformed-response";
+  | "malformed-response"
+  | "queue-overflow";
 
 export interface BackendIntakeWarning {
   kind: BackendIntakeWarningKind;
@@ -19,6 +20,12 @@ export interface BackendIntakeWarning {
   sessionId?: string;
   requestId?: string;
   eventKind?: string;
+  /** Delivery attempts made before giving up. Absent when the first try settled it. */
+  attempts?: number;
+  /** Running total of events discarded because the queue was full. */
+  dropped?: number;
+  /** Transport-level cause when the runtime reports one, e.g. `ECONNRESET`. */
+  cause?: string;
 }
 
 type FetchLike = (
@@ -72,9 +79,77 @@ export const DEFAULT_BACKEND_INTAKE_RETRIES = 2;
 export const DEFAULT_BACKEND_INTAKE_RETRY_DELAY_MS = 25;
 
 /**
- * Resolves once the event has been accepted, or once every attempt has failed.
- * Returns whether the event actually reached the capture endpoint so a caller
- * that owns a request lifecycle can record a gap when it did not.
+ * Simultaneous POSTs to the intake. The transport, not the intake, is the limit:
+ * a burst of application requests each spawning an unpooled POST exhausts
+ * sockets and the runtime rejects the surplus with a bare `TypeError`. Retrying
+ * alone does not prevent that, because each retry competes for the same
+ * exhausted transport; capping concurrency is what stops the burst forming.
+ * Measured on a 1,100-request run against a healthy local intake: 51 events
+ * lost, roughly 5%, taking the deciding value of one defect with them.
+ */
+const MAX_CONCURRENT_INTAKE_REQUESTS = 4;
+
+/**
+ * Events held while the in-flight slots are busy. Bounded because an intake that
+ * is down or wedged must cost the host application a fixed amount of memory, not
+ * an unbounded one — capture may never be the reason a process dies.
+ */
+const MAX_QUEUED_EVENTS = 1_000;
+
+/** Events coalesced into one POST. The intake route already accepts an array. */
+const MAX_EVENTS_PER_BATCH = 64;
+
+/** Overflow warnings are coalesced to this cadence so a drop storm is one line. */
+const OVERFLOW_WARNING_EVERY = 256;
+
+interface IntakeTarget {
+  url: string;
+  headers: HeadersInitLike;
+  sessionId: string;
+  fetchImpl: FetchLike;
+  signal?: AbortSignal;
+  attempts: number;
+  retryDelayMs: number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+interface QueuedEvent {
+  event: BugEvent;
+  warningContext: {
+    sessionId?: string;
+    requestId?: string;
+    eventKind?: string;
+  };
+  onWarning: SendBackendEventOptions["onWarning"];
+  settle: (delivered: boolean) => void;
+}
+
+interface Queue {
+  target: IntakeTarget;
+  entries: QueuedEvent[];
+}
+
+const queues = new Map<string, Queue>();
+let inFlight = 0;
+let queuedCount = 0;
+let droppedCount = 0;
+let idleWaiters: Array<() => void> = [];
+
+/**
+ * Hands an event to the intake, coalescing and retrying only when it has to.
+ *
+ * With capacity free and nothing queued this posts the single event immediately,
+ * exactly as it always did — the returned promise still resolves once the intake
+ * has answered, so a caller that awaits one send sees one request and learns
+ * whether it landed. The queue only engages when a burst has already saturated
+ * {@link MAX_CONCURRENT_INTAKE_REQUESTS}, at which point events coalesce into
+ * batches rather than each opening a socket.
+ *
+ * Nothing is discarded silently: a transient failure is retried, a permanent one
+ * is reported, and an overflow is reported with a running count.
+ *
+ * Resolves to whether the event actually reached the capture endpoint, so a
+ * caller that owns a request lifecycle can record a gap when it did not.
  */
 export async function sendBackendEvent(
   options: SendBackendEventOptions,
@@ -113,53 +188,84 @@ export async function sendBackendEvent(
   const headers: HeadersInitLike = { "Content-Type": "application/json" };
   const authToken = options.authToken?.trim();
   if (authToken) headers["X-Crumbtrail-Auth"] = authToken;
-  const body = JSON.stringify({ sessionId, events: [event] });
 
-  const attempts = Math.max(0, normalizeRetries(options.retries)) + 1;
-  const delayMs = normalizeRetryDelay(options.retryDelayMs);
-  const sleep = options.sleep ?? defaultSleep;
+  const target: IntakeTarget = {
+    url: `${endpoint}/api/events`,
+    headers,
+    sessionId,
+    fetchImpl,
+    signal: options.signal,
+    attempts: Math.max(0, normalizeRetries(options.retries)) + 1,
+    retryDelayMs: normalizeRetryDelay(options.retryDelayMs),
+    sleep: options.sleep ?? defaultSleep,
+  };
 
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    try {
-      const response = await fetchImpl(`${endpoint}/api/events`, {
-        method: "POST",
-        headers,
-        body,
-        signal: options.signal,
+  if (queuedCount >= MAX_QUEUED_EVENTS) {
+    droppedCount += 1;
+    if (droppedCount === 1 || droppedCount % OVERFLOW_WARNING_EVERY === 0) {
+      reportWarning(options.onWarning, {
+        kind: "queue-overflow",
+        message: `Backend intake queue is full at ${MAX_QUEUED_EVENTS} events; newest events are being discarded.`,
+        dropped: droppedCount,
+        ...warningContext,
       });
-
-      if (!response.ok) {
-        reportWarning(options.onWarning, {
-          kind: "http-error",
-          message: `Backend intake returned HTTP ${safeStatus(response.status) ?? "error"}.`,
-          status: safeStatus(response.status),
-          ...warningContext,
-        });
-        return false;
-      }
-
-      await readAndValidateResponse(response);
-      return true;
-    } catch (error) {
-      const kind = classifyCaughtError(error);
-      // Only a transport rejection is worth repeating. A malformed response
-      // means the endpoint answered, and an aborted send means the caller
-      // withdrew, so neither improves by being sent again.
-      const retryable =
-        kind === "fetch-rejected" && !isAbort(error) && attempt < attempts;
-      if (!retryable) {
-        reportWarning(options.onWarning, {
-          kind,
-          message: safeErrorMessage(error),
-          ...warningContext,
-        });
-        return false;
-      }
-      await sleep(delayMs * attempt);
     }
+    return false;
   }
 
-  return false;
+  return await new Promise<boolean>((resolve) => {
+    const key = queueKey(target, authToken);
+    const queue = queues.get(key) ?? { target, entries: [] };
+    if (!queues.has(key)) queues.set(key, queue);
+    queue.entries.push({
+      event,
+      warningContext,
+      onWarning: options.onWarning,
+      settle: resolve,
+    });
+    queuedCount += 1;
+    pump();
+  });
+}
+
+export const postBackendEvent = sendBackendEvent;
+
+/**
+ * Resolves once every queued and in-flight event has been delivered or reported.
+ *
+ * A job, a CLI or a test that finishes immediately after its last capture would
+ * otherwise exit with the tail still buffered.
+ */
+export async function flushBackendEvents(): Promise<void> {
+  if (queuedCount === 0 && inFlight === 0) return;
+  await new Promise<void>((resolve) => idleWaiters.push(resolve));
+}
+
+/** Queue depth, in-flight requests and lifetime drops. For tests and diagnostics. */
+export function backendIntakeQueueStats(): {
+  queued: number;
+  inFlight: number;
+  dropped: number;
+} {
+  return { queued: queuedCount, inFlight, dropped: droppedCount };
+}
+
+/** Clears shared queue state. Tests only — never call this from a live process. */
+export function resetBackendIntakeQueueForTest(): void {
+  queues.clear();
+  inFlight = 0;
+  queuedCount = 0;
+  droppedCount = 0;
+  idleWaiters = [];
+}
+
+/**
+ * Batched events share one envelope, so only same-session, same-credential,
+ * same-endpoint events may travel together. JSON encoding keeps the three parts
+ * unambiguous no matter what characters a URL, session ID or token contains.
+ */
+function queueKey(target: IntakeTarget, authToken: string | undefined): string {
+  return JSON.stringify([target.url, target.sessionId, authToken ?? ""]);
 }
 
 function normalizeRetries(value: number | undefined): number {
@@ -178,16 +284,146 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, ms);
     // The host application must never be held open by a capture retry.
-    if (typeof timer === "object" && typeof timer.unref === "function")
-      timer.unref();
+    (timer as { unref?: () => void }).unref?.();
   });
 }
 
-function isAbort(error: unknown): boolean {
+function pump(): void {
+  while (inFlight < MAX_CONCURRENT_INTAKE_REQUESTS) {
+    const batch = takeBatch();
+    if (!batch) break;
+    inFlight += 1;
+    // deliver() reports its own failures; this catch only guarantees that a
+    // defect inside the queue itself can never surface as an unhandled rejection
+    // in the host application, and that its entries still settle.
+    void deliver(batch.queue.target, batch.entries)
+      .catch(() => false)
+      .then((delivered) => {
+        inFlight -= 1;
+        for (const entry of batch.entries) entry.settle(delivered);
+        if (queuedCount > 0) pump();
+        else if (inFlight === 0) releaseIdleWaiters();
+      });
+  }
+}
+
+function takeBatch(): { queue: Queue; entries: QueuedEvent[] } | undefined {
+  for (const [key, queue] of queues) {
+    if (queue.entries.length === 0) {
+      queues.delete(key);
+      continue;
+    }
+    const entries = queue.entries.splice(0, MAX_EVENTS_PER_BATCH);
+    queuedCount -= entries.length;
+    if (queue.entries.length === 0) queues.delete(key);
+    return { queue, entries };
+  }
+  return undefined;
+}
+
+function releaseIdleWaiters(): void {
+  const waiters = idleWaiters;
+  idleWaiters = [];
+  for (const waiter of waiters) waiter();
+}
+
+async function deliver(
+  target: IntakeTarget,
+  entries: QueuedEvent[],
+): Promise<boolean> {
+  const body = JSON.stringify({
+    sessionId: target.sessionId,
+    events: entries.map((entry) => entry.event),
+  });
+
+  for (let attempt = 1; attempt <= target.attempts; attempt += 1) {
+    const outcome = await attemptDelivery(target, body);
+    if (outcome.ok) return true;
+    if (!outcome.retryable || attempt === target.attempts) {
+      // Only worth saying when it took more than one try; a single attempt is
+      // the unremarkable case and the field would be noise on every warning.
+      reportBatchWarning(entries, {
+        ...outcome.warning,
+        ...(attempt > 1 ? { attempts: attempt } : {}),
+      });
+      return false;
+    }
+    await target.sleep(target.retryDelayMs * attempt);
+  }
+
+  return false;
+}
+
+interface DeliveryOutcome {
+  ok: boolean;
+  retryable: boolean;
+  warning: Omit<BackendIntakeWarning, "attempts">;
+}
+
+const DELIVERED: DeliveryOutcome = {
+  ok: true,
+  retryable: false,
+  warning: { kind: "http-error", message: "" },
+};
+
+async function attemptDelivery(
+  target: IntakeTarget,
+  body: string,
+): Promise<DeliveryOutcome> {
+  try {
+    const response = await target.fetchImpl(target.url, {
+      method: "POST",
+      headers: target.headers,
+      body,
+      signal: target.signal,
+    });
+
+    if (!response.ok) {
+      const status = safeStatus(response.status);
+      return {
+        ok: false,
+        // A status is the endpoint's own answer about this payload, so sending
+        // the identical body again cannot change the verdict.
+        retryable: false,
+        warning: {
+          kind: "http-error",
+          message: `Backend intake returned HTTP ${status ?? "error"}.`,
+          ...(status !== undefined ? { status } : {}),
+        },
+      };
+    }
+
+    await readAndValidateResponse(response);
+    return DELIVERED;
+  } catch (error) {
+    const kind = classifyCaughtError(error);
+    const cause = safeErrorCause(error);
+    return {
+      ok: false,
+      // A malformed response still arrived, and an abort was asked for; neither
+      // gets better by asking again. A transport rejection usually does.
+      retryable: kind === "fetch-rejected" && !isAbortError(error),
+      warning: {
+        kind,
+        message: safeErrorMessage(error),
+        ...(cause ? { cause } : {}),
+      },
+    };
+  }
+}
+
+function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
 }
 
-export const postBackendEvent = sendBackendEvent;
+function reportBatchWarning(
+  entries: QueuedEvent[],
+  warning: BackendIntakeWarning,
+): void {
+  for (const entry of entries) {
+    reportWarning(entry.onWarning, { ...warning, ...entry.warningContext });
+  }
+}
 
 async function readAndValidateResponse(response: ResponseLike): Promise<void> {
   if (typeof response.text === "function") {
@@ -233,6 +469,9 @@ function reportWarning(
         sessionId: safeString(warning.sessionId),
         requestId: safeString(warning.requestId),
         eventKind: safeString(warning.eventKind),
+        attempts: warning.attempts,
+        dropped: warning.dropped,
+        cause: safeString(warning.cause),
       }),
     );
   } catch {
@@ -265,6 +504,24 @@ function safeErrorMessage(error: unknown): string {
   }
 
   return "Backend intake request failed.";
+}
+
+/**
+ * The transport's own reason, when the runtime attaches one.
+ *
+ * Node's fetch reports every transport failure as `TypeError` and hangs the real
+ * reason off `cause` — `ECONNRESET`, `UND_ERR_SOCKET`, `ECONNREFUSED`,
+ * `ENOTFOUND`. Without it an operator reading a warning log sees the same word
+ * for "intake is down", "DNS is wrong" and "we opened too many sockets". Only
+ * the short code is taken: a cause `message` can carry a URL, so it is not.
+ */
+function safeErrorCause(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const cause: unknown = (error as { cause?: unknown }).cause;
+  if (!isRecord(cause)) return undefined;
+  const code = cause.code ?? (cause as { name?: unknown }).name;
+  if (typeof code !== "string") return undefined;
+  return boundString(code.trim(), 64);
 }
 
 function safeStatus(status: number): number | undefined {

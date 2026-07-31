@@ -634,13 +634,14 @@ function sanitizeRecord(
       out[safeKey] = raw;
       continue;
     }
+    // `reqBody` and `responseBody` alongside `body`: each plane records the
+    // payload it saw under its own key, and those names carry the literal token
+    // `body`, so the name-based rule would sweep the one sentence that explains
+    // a 500 to `[REDACTED]` while the payload beside it stayed readable. Same
+    // gate as the browser's body — kept only when the event declares it already
+    // went through the v2 policy.
     if (
-      // `responseBody` alongside `body`: the backend plane records what a
-      // handler sent under its own key, and that name carries the literal token
-      // `body`, so the name-based rule would sweep the one sentence that
-      // explains a 500 to `[REDACTED]`. Same gate as the browser's body — it is
-      // kept only when the event declares it already went through the v2 policy.
-      (key === "body" || key === "responseBody") &&
+      (key === "body" || key === "reqBody" || key === "responseBody") &&
       fieldPath === "event.d" &&
       typeof raw === "string" &&
       declaresStructuredBodyRedaction(value)
@@ -1090,6 +1091,7 @@ const SAFE_METADATA_FIELD_NAMES = new Set([
   // path-segment sensitivity check does not sweep its descendants wholesale.
   "bodyMeta",
   "bodySummary",
+  "reqBodySummary",
   "hrefSummary",
   "newValSummary",
   "oldValSummary",
