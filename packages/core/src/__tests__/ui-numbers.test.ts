@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventBus } from "../event-bus";
 import type { BugEvent, CrumbtrailConfig } from "../types";
 import {
+  CAPTURE_GAP_EVENT_KIND,
   DEFAULT_CONFIG,
   UI_LAYOUT_EVENT_KIND,
   UI_NUM_EVENT_KIND,
@@ -11,7 +12,6 @@ import {
   parseNumericToken,
   scanUiNumbers,
   uiNumbersCollector,
-  UI_NUM_MAX_ITEMS,
   UI_NUM_MAX_SCAN_ELEMENTS,
   UI_NUM_SETTLE_MS,
 } from "../collectors/ui-numbers";
@@ -32,6 +32,10 @@ function collect() {
 
 function uiNumEvents(events: BugEvent[]): BugEvent[] {
   return events.filter((event) => event.k === UI_NUM_EVENT_KIND);
+}
+
+function captureGapEvents(events: BugEvent[]): BugEvent[] {
+  return events.filter((event) => event.k === CAPTURE_GAP_EVENT_KIND);
 }
 
 /**
@@ -125,9 +129,10 @@ describe("scanUiNumbers element budget", () => {
 
   it("returns a region map for a DOM within budget", () => {
     document.body.innerHTML = `<dl class="totals"><dt>Total</dt><dd>$9.99</dd></dl>`;
-    const regions = scanUiNumbers(document.body);
-    expect(regions).not.toBeNull();
-    expect(regions!.get("dl.totals")).toEqual([
+    const scan = scanUiNumbers(document.body);
+    expect(scan).not.toBeNull();
+    expect(scan!.truncated).toEqual([]);
+    expect(scan!.regions.get("dl.totals")).toEqual([
       { label: "Total", value: 9.99, unit: "$" },
     ]);
   });
@@ -146,8 +151,8 @@ describe("scanUiNumbers element budget", () => {
           <span>2026-07-28 <span class="badge"> · Today</span> · placed</span>
         </li>
       </ul>`;
-    const regions = scanUiNumbers(document.body);
-    expect(regions?.get("ul.order-list")).toContainEqual({
+    const scan = scanUiNumbers(document.body);
+    expect(scan?.regions.get("ul.order-list")).toContainEqual({
       label: "Order #1",
       value: Math.floor(Date.UTC(2026, 6, 28) / 86_400_000),
       unit: "iso-day",
@@ -156,7 +161,7 @@ describe("scanUiNumbers element budget", () => {
 
   it("drops rendered ISO days under sensitive labels", () => {
     document.body.innerHTML = `<dl><dt>Birthdate</dt><dd>1990-01-02</dd></dl>`;
-    expect(scanUiNumbers(document.body)?.get("dl")).toBeUndefined();
+    expect(scanUiNumbers(document.body)?.regions.get("dl")).toBeUndefined();
   });
 });
 
@@ -261,7 +266,7 @@ describe("uiNumbersCollector", () => {
     expect(uiNumEvents(events).length).toBeGreaterThanOrEqual(1);
   });
 
-  it("caps a region snapshot at 50 items", async () => {
+  it("withholds an over-cap region and reports it as a capture gap", async () => {
     const rows = Array.from(
       { length: 60 },
       (_, i) => `<dt>Line ${i}</dt><dd>$${i}.00</dd>`,
@@ -272,10 +277,58 @@ describe("uiNumbersCollector", () => {
     cleanups.push(cleanup);
     await settle(bus);
 
+    // Clipping to UI_NUM_MAX_ITEMS is the outcome this must never produce: a
+    // region that looks whole and is not manufactures a false arithmetic
+    // mismatch downstream.
+    expect(uiNumEvents(events)).toHaveLength(0);
+    const gaps = captureGapEvents(events);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0].d).toMatchObject({
+      surface: "browser",
+      reason: "scan_budget_exceeded",
+      droppedEventCount: 60,
+    });
+  });
+
+  it("keeps capturing other regions when one is over cap", async () => {
+    const rows = Array.from(
+      { length: 60 },
+      (_, i) => `<dt>Line ${i}</dt><dd>$${i}.00</dd>`,
+    ).join("");
+    document.body.innerHTML = `
+      <dl id="big">${rows}</dl>
+      <dl class="totals"><dt>Total</dt><dd>$9.99</dd></dl>`;
+
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+
+    // Unlike the element budget, an over-cap region is not a collector fault.
     const snapshots = uiNumEvents(events);
     expect(snapshots).toHaveLength(1);
-    const items = (snapshots[0].d as { items: unknown[] }).items;
-    expect(items).toHaveLength(UI_NUM_MAX_ITEMS);
+    expect(snapshots[0].d).toMatchObject({ region: "dl.totals" });
+    expect(captureGapEvents(events)).toHaveLength(1);
+  });
+
+  it("reports an over-cap region once, not on every rescan", async () => {
+    const rows = Array.from(
+      { length: 60 },
+      (_, i) => `<dt>Line ${i}</dt><dd>$${i}.00</dd>`,
+    ).join("");
+    document.body.innerHTML = `<dl id="big">${rows}</dl>`;
+
+    const { events, bus, cleanup } = collect();
+    cleanups.push(cleanup);
+    await settle(bus);
+
+    // A dashboard mutating on a timer rescans indefinitely; the gap is a
+    // statement about the region, so it is made once.
+    for (let tick = 0; tick < 3; tick += 1) {
+      document.querySelector("#big dd")!.textContent = `$${tick + 100}.00`;
+      await settle(bus);
+    }
+
+    expect(captureGapEvents(events)).toHaveLength(1);
   });
 
   it("drops items with deny-listed labels entirely (no redacted-label+value pair)", async () => {
