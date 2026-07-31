@@ -3,15 +3,17 @@
 // Three calls the MCP server makes to close the recall/adoption loop against a
 // configured Crumbtrail cloud deployment:
 //
-//   resolveIssueViaCloud       -> POST /api/memory/resolve   (project-key auth)
-//   recordAgentFeedbackViaCloud -> POST /api/agent/feedback  (agent-token auth)
+//   resolveIssueViaCloud        -> POST /api/memory/resolve  (agent-token auth)
+//   recordAgentFeedbackViaCloud -> POST /api/agent/feedback   (agent-token auth)
 //   getAgentPlaybookViaCloud    -> GET  /api/agent/playbook   (agent-token auth)
 //
-// The auth split mirrors the cloud routes exactly. `/api/memory/*` authenticates
-// with the project API key (`X-Crumbtrail-Auth: CRUMBTRAIL_API_KEY`, the same
-// header `recallViaCloud` uses), while `/api/agent/*` authenticates with an agent
-// token (`Authorization: Bearer CRUMBTRAIL_CLOUD_TOKEN`, the same secret the
-// remote artifact store uses). All three reuse `CRUMBTRAIL_CLOUD_URL` for the base.
+// All three authenticate with an agent token (`Authorization: Bearer
+// CRUMBTRAIL_CLOUD_TOKEN`, the same secret the remote artifact store uses) and
+// reuse `CRUMBTRAIL_CLOUD_URL` for the base.
+//
+// The project API key (`ctkey_`) is deliberately NOT used here. It is an
+// ingest-only credential that the browser SDK ships to every visitor, so the
+// cloud refuses it on every read and on the memory plane.
 //
 // Unlike the recall/pull helpers — which collapse every failure to `undefined`
 // because they always have a local fallback — these calls have no local analogue:
@@ -69,12 +71,6 @@ export type LearningLoopResult<T> =
     }
   | { ok: false; reason: "transport"; message: string };
 
-function projectAuth(): { base: string; apiKey: string } | undefined {
-  const base = process.env.CRUMBTRAIL_CLOUD_URL?.replace(/\/+$/, "");
-  const apiKey = process.env.CRUMBTRAIL_API_KEY;
-  return base && apiKey ? { base, apiKey } : undefined;
-}
-
 function agentAuth(): { base: string; token: string } | undefined {
   const base = process.env.CRUMBTRAIL_CLOUD_URL?.replace(/\/+$/, "");
   const token = process.env.CRUMBTRAIL_CLOUD_TOKEN;
@@ -103,7 +99,8 @@ async function parseResponse<T>(res: Response): Promise<LearningLoopResult<T>> {
 }
 
 /** Deliberately generic so a thrown error cannot leak the cloud URL or token. */
-const TRANSPORT_MESSAGE = "The request to the Crumbtrail cloud failed to complete.";
+const TRANSPORT_MESSAGE =
+  "The request to the Crumbtrail cloud failed to complete.";
 
 export interface ResolveIssueInput {
   memoryId: string;
@@ -134,13 +131,13 @@ export interface ResolveIssueResponse {
 export async function resolveIssueViaCloud(
   input: ResolveIssueInput,
 ): Promise<LearningLoopResult<ResolveIssueResponse>> {
-  const auth = projectAuth();
+  const auth = agentAuth();
   if (!auth) {
     return {
       ok: false,
       reason: "unconfigured",
       message:
-        "Cloud issue resolution requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_API_KEY.",
+        "Cloud issue resolution requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
     };
   }
   const body: Record<string, unknown> = {
@@ -151,12 +148,13 @@ export async function resolveIssueViaCloud(
   if (input.rootCause !== undefined) body.rootCause = input.rootCause;
   if (input.fixRef !== undefined) body.fixRef = input.fixRef;
   if (input.note !== undefined) body.note = input.note;
-  if (input.usedMemoryIds !== undefined) body.usedMemoryIds = input.usedMemoryIds;
+  if (input.usedMemoryIds !== undefined)
+    body.usedMemoryIds = input.usedMemoryIds;
   try {
     const res = await fetch(`${auth.base}/api/memory/resolve`, {
       method: "POST",
       headers: {
-        "X-Crumbtrail-Auth": auth.apiKey,
+        authorization: `Bearer ${auth.token}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),

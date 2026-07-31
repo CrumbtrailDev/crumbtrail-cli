@@ -295,15 +295,15 @@ export async function recallViaCloud(
   limit: number,
 ): Promise<Record<string, unknown> | undefined> {
   const base = process.env.CRUMBTRAIL_CLOUD_URL?.replace(/\/+$/, "");
-  const apiKey = process.env.CRUMBTRAIL_API_KEY;
-  if (!base || !apiKey) return undefined;
+  const token = process.env.CRUMBTRAIL_CLOUD_TOKEN;
+  if (!base || !token) return undefined;
   const params = new URLSearchParams({ limit: String(limit) });
   if (sessionId) params.set("sessionId", sessionId);
   else if (query) params.set("q", query);
   else return undefined;
   try {
     const res = await fetch(`${base}/api/memory/recall?${params.toString()}`, {
-      headers: { "X-Crumbtrail-Auth": apiKey },
+      headers: { authorization: `Bearer ${token}` },
     });
     if (!res.ok) return undefined;
     return (await res.json()) as Record<string, unknown>;
@@ -314,8 +314,8 @@ export async function recallViaCloud(
 
 /**
  * Pull a pre-assembled ticket bundle from the cloud by-ticket endpoint. Reads the
- * SAME env pair recallViaCloud uses (CRUMBTRAIL_CLOUD_URL/CRUMBTRAIL_API_KEY) and
- * authenticates with the same X-Crumbtrail-Auth project key. Returns the parsed
+ * SAME env pair recallViaCloud uses (CRUMBTRAIL_CLOUD_URL/CRUMBTRAIL_CLOUD_TOKEN)
+ * and authenticates with the same agent-token bearer. Returns the parsed
  * `{ id, status, confidence, sessionId?, bundle }` envelope on a hit, or undefined
  * on ANY miss/failure/unconfigured env — the caller then falls back to the local
  * fetch + auto-locate path. This deliberate always-fall-back shape (identical to
@@ -327,13 +327,13 @@ export async function pullBundleByTicketViaCloud(
   ticketKey: string,
 ): Promise<Record<string, unknown> | undefined> {
   const base = process.env.CRUMBTRAIL_CLOUD_URL?.replace(/\/+$/, "");
-  const apiKey = process.env.CRUMBTRAIL_API_KEY;
-  if (!base || !apiKey) return undefined;
+  const token = process.env.CRUMBTRAIL_CLOUD_TOKEN;
+  if (!base || !token) return undefined;
   const params = new URLSearchParams({ provider, ticketKey });
   try {
     const res = await fetch(
       `${base}/api/bundles/by-ticket?${params.toString()}`,
-      { headers: { "X-Crumbtrail-Auth": apiKey } },
+      { headers: { authorization: `Bearer ${token}` } },
     );
     if (!res.ok) return undefined;
     return (await res.json()) as Record<string, unknown>;
