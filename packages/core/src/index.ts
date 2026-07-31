@@ -1,7 +1,7 @@
 export { Crumbtrail } from "./bug-logger";
 export { EventBus } from "./event-bus";
 export { RingBuffer } from "./ring-buffer";
-export { HttpTransport } from "./transports/http";
+export { HttpTransport, EventDeliveryError } from "./transports/http";
 export {
   DEFAULT_SESSION_STORAGE_KEY,
   createWebSessionStore,

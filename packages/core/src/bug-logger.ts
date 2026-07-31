@@ -70,6 +70,9 @@ import {
   setRedactionKeepFields,
 } from "./redaction";
 import { buildCaptureGapEvent } from "./capture-gap";
+
+/** Cap on delivery-failure gap records per session. */
+const MAX_DELIVERY_GAP_EVENTS = 3;
 import { buildMaskedDomSnapshot, maskText } from "./masking";
 import { CAPTURE_GAP_EVENT_KIND } from "./types";
 
@@ -202,6 +205,18 @@ export class Crumbtrail {
   private remotePolicyReady: boolean;
   private samplingShed: boolean;
   private samplingGapEmitted = false;
+  /** Bounded so an endpoint that is refusing everything cannot storm the bus. */
+  private deliveryGapsEmitted = 0;
+  /** Every event lost to a failed send, including after the records are capped. */
+  private deliveryDroppedEvents = 0;
+  /** How many of `deliveryDroppedEvents` the emitted gap records already name. */
+  private deliveryDroppedDeclared = 0;
+  /**
+   * Gaps recorded after teardown began. The bus drops events once `stopped` is
+   * set, so a batch refused on the session's final flush would otherwise leave
+   * no record of itself anywhere — the one moment the gap matters most.
+   */
+  private deferredDeliveryGaps: BugEvent[] = [];
   private baselineSampled: boolean;
   private sessionStarted = false;
   /**
@@ -333,7 +348,11 @@ export class Crumbtrail {
         instance.shouldPersistEvent(event),
       );
       if (persistable.length > 0) {
-        const send = transport.sendEvents(persistable).catch(() => {});
+        const send = transport
+          .sendEvents(persistable)
+          .catch((error: unknown) => {
+            instance.recordDeliveryFailure(persistable, error);
+          });
         instance.pendingSends.add(send);
         void send.then(() => instance.pendingSends.delete(send));
       }
@@ -998,6 +1017,46 @@ export class Crumbtrail {
     this.startSessionWithCurrentIdentity();
   }
 
+  /**
+   * Records that a batch never reached the capture endpoint.
+   *
+   * Without this a refused batch is silently discarded and the session reports
+   * itself complete, which is the one failure mode a capture product cannot
+   * have: a reader has no way to tell "nothing went wrong" from "the evidence
+   * was thrown away". The gap is bounded so a failing endpoint cannot turn into
+   * its own event storm, and a batch of gap records never produces another gap.
+   */
+  private recordDeliveryFailure(events: BugEvent[], error: unknown): void {
+    // A gap about a batch of gaps would recurse for as long as the endpoint
+    // stays down.
+    if (events.every((event) => event.k === CAPTURE_GAP_EVENT_KIND)) return;
+    // Counted before the cap, so the running total stays true even once the
+    // records stop. A storm produces hundreds of failures; three records that
+    // together name sixty events would read as a rounding error rather than
+    // the session's evidence being mostly gone.
+    this.deliveryDroppedEvents += events.length;
+    if (this.deliveryGapsEmitted >= MAX_DELIVERY_GAP_EVENTS) return;
+    this.deliveryGapsEmitted += 1;
+    this.deliveryDroppedDeclared += events.length;
+    const status =
+      typeof error === "object" && error !== null && "status" in error
+        ? Number((error as { status: unknown }).status)
+        : undefined;
+    const gap = buildCaptureGapEvent({
+      surface: "browser",
+      reason: "delivery_failed",
+      droppedEventCount: events.length,
+      ...(Number.isFinite(status) && status !== 0
+        ? { detail: `HTTP ${status}` }
+        : {}),
+      sessionId: this.sessionId,
+    });
+    // Queued rather than emitted during teardown, and sent directly in stop().
+    // Emitting both ways would duplicate the record.
+    if (this.stopped) this.deferredDeliveryGaps.push(gap);
+    else this.bus.emit(gap);
+  }
+
   private emitSamplingGapIfNeeded(): void {
     if (!this.samplingShed || this.samplingGapEmitted || !this.canTransport())
       return;
@@ -1100,6 +1159,28 @@ export class Crumbtrail {
       // bus.stop() just flushed the final batch into the transport; every
       // in-flight POST must land before end-of-session finalizes the log.
       await Promise.allSettled([...this.pendingSends]);
+      // A refusal discovered on the final flush has no bus left to ride. The
+      // closing record carries whatever the capped per-batch records could not,
+      // so the session states its true loss rather than the first few batches
+      // of it.
+      const undeclared =
+        this.deliveryDroppedEvents - this.deliveryDroppedDeclared;
+      if (undeclared > 0) {
+        this.deferredDeliveryGaps.push(
+          buildCaptureGapEvent({
+            surface: "browser",
+            reason: "delivery_failed",
+            droppedEventCount: undeclared,
+            sessionId: this.sessionId,
+          }),
+        );
+        this.deliveryDroppedDeclared = this.deliveryDroppedEvents;
+      }
+      if (this.deferredDeliveryGaps.length > 0) {
+        const deferred = this.deferredDeliveryGaps;
+        this.deferredDeliveryGaps = [];
+        await this.transport.sendEvents(deferred).catch(() => {});
+      }
       await this.transport.endSession(this.sessionId);
     }
     return { sessionId: this.sessionId };

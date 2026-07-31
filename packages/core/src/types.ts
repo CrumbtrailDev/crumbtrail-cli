@@ -180,6 +180,16 @@ export interface CaptureGapEventData {
     /** The event was built but its delivery to the capture endpoint never succeeded. */
     | "delivery_failed";
   detail?: string;
+  /**
+   * How many events the gap accounts for, when the surface can count them.
+   *
+   * `detail` is a classification, not prose: it keeps SQL keywords, table names
+   * and error classes and discards everything else, so a size cannot be carried
+   * there. A reader deciding whether a session is worth trusting needs the
+   * magnitude — "three events were refused" and "six thousand were" are
+   * different sessions.
+   */
+  droppedEventCount?: number;
   /** Request the gap belongs to, so a reader can join the hole to the request that made it. */
   requestId?: string;
   t: number;
