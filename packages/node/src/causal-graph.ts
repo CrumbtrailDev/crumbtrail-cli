@@ -44,7 +44,18 @@ export interface CausalNode {
   t: number;
   requestId?: string;
   sig?: string;
+  /**
+   * Backend-plane route: the API path an `backend.req`/`backend.error`/`otel.span` served.
+   * Frontend nodes never carry it — see `pageRoute`, which is the browser-plane counterpart.
+   * The two are deliberately separate fields: a page route and an API path are different
+   * namespaces, and comparing one against the other can only ever return false.
+   */
   route?: string;
+  /**
+   * Frontend-plane route: the path of the navigation this node happened under. Present on
+   * browser nodes once a `user.nav` has committed, absent for backend nodes.
+   */
+  pageRoute?: string;
   brief: string;
   candidateId?: string;
 }
@@ -105,6 +116,24 @@ function safePath(value: unknown): string | undefined {
   );
 }
 
+/**
+ * Path portion of a navigation destination, redacted. The query string is deliberately dropped
+ * rather than redacted: it is where identifiers and free text live, and it takes no part in
+ * identifying which page a node happened on. A relative or unparseable value falls back to
+ * `safePath` on the whole string.
+ */
+function pagePathOf(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  try {
+    // A base is supplied so relative destinations ("/checkout") parse; the origin is discarded.
+    return safePath(new URL(trimmed, "https://placeholder.invalid").pathname);
+  } catch {
+    return safePath(trimmed);
+  }
+}
+
 function safeDiagnosticString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
@@ -160,7 +189,19 @@ interface DerivedNode extends CausalNode {
   srcKind: string;
   /** True when this net.res node represents a failed response (not serialized). */
   failedRes?: boolean;
+  /**
+   * Navigation epoch: how many `user.nav` nodes precede this one in time order. Equal epochs
+   * mean no navigation happened between two nodes, which is the browser-plane "same context"
+   * test. Frontend nodes only; backend nodes keep the sentinel and never compare (not
+   * serialized).
+   */
+  navEpoch: number;
+  /** Redacted destination path of a `user.nav` node, used to label its epoch (not serialized). */
+  navTo?: string;
 }
+
+/** Sentinel epoch for nodes that are not on the browser plane and never take part in the test. */
+const NO_NAV_EPOCH = -1;
 
 const CONSOLE_ERROR_KIND = "con";
 const DB_DIFF_KIND = "db.diff";
@@ -310,6 +351,20 @@ function briefFor(event: BugEvent, kind: CausalNodeKind): string {
   }
 }
 
+/**
+ * Browser-plane node kinds. These are the only nodes that carry a navigation epoch, because
+ * they are the only ones a `user.nav` is meaningfully "between".
+ */
+const FRONTEND_PLANE_KINDS = new Set<CausalNodeKind>([
+  "user.click",
+  "user.input",
+  "user.nav",
+  "net.req",
+  "net.res",
+  "frontend.error",
+  "console.error",
+]);
+
 /** Node kinds treated as "network request roots" for interaction back-scan. */
 const NET_REQ_KINDS = new Set<CausalNodeKind>(["net.req"]);
 const USER_INTERACTION_KINDS = new Set<CausalNodeKind>([
@@ -368,6 +423,10 @@ export function buildCausalGraph(input: { events: BugEvent[] }): CausalGraph {
         ? { sig: sigFor(event, kind) }
         : {}),
       ...(routeFor(event) !== undefined ? { route: routeFor(event) } : {}),
+      navEpoch: NO_NAV_EPOCH,
+      ...(kind === "user.nav" && pagePathOf(event.d.to) !== undefined
+        ? { navTo: pagePathOf(event.d.to) }
+        : {}),
       brief: briefFor(event, kind),
       srcKind: event.k,
       ...(kind === "net.res" && isFailedNetworkResponse(event)
@@ -414,6 +473,27 @@ export function buildCausalGraph(input: { events: BugEvent[] }): CausalGraph {
     (a, b) => a.t - b.t || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
   );
 
+  // --- 3b. Assign navigation epochs -------------------------------------------------------------
+  // Walk the browser plane in time order. Every `user.nav` opens a new epoch and belongs to the
+  // epoch it opened, so two nodes sharing an epoch are guaranteed to have no navigation between
+  // them. Epoch 0 covers anything captured before the first nav commits; the interaction
+  // collector emits an `init` nav when it starts, so in a real session that window is empty.
+  // `pageRoute` is the label on the epoch and may be absent (a nav whose destination did not
+  // survive redaction) without affecting the comparison, which is on the epoch itself.
+  {
+    let epoch = 0;
+    let pageRoute: string | undefined;
+    for (const node of byTime) {
+      if (!FRONTEND_PLANE_KINDS.has(node.kind)) continue;
+      if (node.kind === "user.nav") {
+        epoch += 1;
+        pageRoute = node.navTo;
+      }
+      node.navEpoch = epoch;
+      if (pageRoute !== undefined) node.pageRoute = pageRoute;
+    }
+  }
+
   // Rule 1 -- request (high): per requestId, order that request's nodes by t and connect the spine.
   const byRequestId = new Map<string, DerivedNode[]>();
   for (const node of byTime) {
@@ -437,9 +517,13 @@ export function buildCausalGraph(input: { events: BugEvent[] }): CausalGraph {
     const trigger = scanBackward(byTime, i, USER_INTERACTION_KINDS);
     if (!trigger) continue;
     const delta = node.t - trigger.t;
-    const sameContext =
-      (node.route !== undefined && node.route === trigger.route) ||
-      (node.sig !== undefined && node.sig === trigger.sig);
+    // Same navigation epoch: no page transition happened between the interaction and the
+    // request. The case this downgrades is the real false positive — a click that navigates,
+    // followed inside the 2s window by the next page's boot requests, which the click did not
+    // cause. Comparing routes or sigs here cannot work: no browser collector emits `route`, and
+    // an interaction node has no `sig`, so both sides were always undefined and this band was
+    // unreachable.
+    const sameContext = node.navEpoch === trigger.navEpoch;
     const conf: CausalConfidence =
       delta <= HIGH_CONFIDENCE_MS && sameContext ? "high" : "medium";
     addEdge(trigger.id, node.id, "interaction", conf);
@@ -506,7 +590,13 @@ export function buildCausalGraph(input: { events: BugEvent[] }): CausalGraph {
 }
 
 function stripDerived(node: DerivedNode): CausalNode {
-  const { srcKind: _srcKind, failedRes: _failedRes, ...rest } = node;
+  const {
+    srcKind: _srcKind,
+    failedRes: _failedRes,
+    navEpoch: _navEpoch,
+    navTo: _navTo,
+    ...rest
+  } = node;
   return rest;
 }
 
