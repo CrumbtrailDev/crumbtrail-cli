@@ -284,49 +284,78 @@ describe("buildCausalGraph — OTLP traceId bridge", () => {
 });
 
 describe("buildCausalGraph — interaction edge banding", () => {
+  // These events carry only fields a browser collector actually emits. In particular no `route`:
+  // no collector in crumbtrail-core sets it on a click or a net.req, so a fixture that supplies
+  // one proves nothing about a real session.
   function interactionConf(
     deltaMs: number,
-    sameRoute: boolean,
+    options: { navBetween?: boolean } = {},
   ): CausalEdge | undefined {
     const events: BugEvent[] = [
-      { t: 1000, k: "clk", d: { route: sameRoute ? "/checkout" : "/other" } },
+      { t: 900, k: "nav", d: { from: "", to: "https://app.test/checkout", tr: "init" } },
+      { t: 1000, k: "clk", d: { tag: "BUTTON", txt: "Pay" } },
+      ...(options.navBetween
+        ? [
+            {
+              t: 1000 + Math.floor(deltaMs / 2),
+              k: "nav",
+              d: { from: "https://app.test/checkout", to: "https://app.test/receipt", tr: "push" },
+            } as BugEvent,
+          ]
+        : []),
       {
         t: 1000 + deltaMs,
         k: "net.req",
-        d: {
-          id: "n1",
-          url: "https://api.test/x",
-          m: "GET",
-          route: "/checkout",
-        },
+        d: { id: "n1", url: "https://api.test/x", m: "GET" },
       },
     ];
     const graph = buildCausalGraph({ events });
-    return graph.edges.find((e) => e.kind === "interaction");
+    return graph.edges.find(
+      (e) => e.kind === "interaction" && e.from.startsWith("user.click"),
+    );
   }
 
-  it("high at 300ms with same route", () => {
-    expect(interactionConf(300, true)?.confidence).toBe("high");
+  it("high at 300ms within one navigation epoch", () => {
+    expect(interactionConf(300)?.confidence).toBe("high");
   });
 
   it("medium at 700ms (over 500ms)", () => {
-    expect(interactionConf(700, true)?.confidence).toBe("medium");
+    expect(interactionConf(700)?.confidence).toBe("medium");
   });
 
-  it("medium at 300ms when route differs (context mismatch downgrades)", () => {
-    expect(interactionConf(300, false)?.confidence).toBe("medium");
+  it("medium at 300ms when a navigation intervened (context mismatch downgrades)", () => {
+    expect(interactionConf(300, { navBetween: true })?.confidence).toBe("medium");
   });
 
   it("none at 2500ms (outside window)", () => {
-    expect(interactionConf(2500, true)).toBeUndefined();
+    expect(interactionConf(2500)).toBeUndefined();
   });
 
   it("exactly 500ms is high", () => {
-    expect(interactionConf(500, true)?.confidence).toBe("high");
+    expect(interactionConf(500)?.confidence).toBe("high");
   });
 
   it("exactly 2000ms is present (medium)", () => {
-    expect(interactionConf(2000, true)?.confidence).toBe("medium");
+    expect(interactionConf(2000)?.confidence).toBe("medium");
+  });
+
+  it("labels browser nodes with the navigation path and leaves backend nodes without one", () => {
+    const graph = buildCausalGraph({
+      events: [
+        { t: 900, k: "nav", d: { from: "", to: "https://app.test/checkout?token=abc", tr: "init" } },
+        { t: 1000, k: "clk", d: { tag: "BUTTON" } },
+        {
+          t: 1100,
+          k: "backend.req.start",
+          d: { requestId: "r1", route: "/api/orders", m: "POST" },
+        },
+      ],
+    });
+    const click = graph.nodes.find((n) => n.kind === "user.click");
+    const backend = graph.nodes.find((n) => n.kind === "backend.req");
+    expect(click?.pageRoute).toBe("/checkout");
+    expect(backend?.pageRoute).toBeUndefined();
+    expect(backend?.route).toBe("/api/orders");
   });
 });
 
