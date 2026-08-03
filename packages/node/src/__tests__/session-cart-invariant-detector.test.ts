@@ -18,6 +18,30 @@ function sessionDelete(t: number, requestId: string): BugEvent {
   } as unknown as BugEvent;
 }
 
+function cartWriteWithCallsite(t: number, requestId: string): BugEvent {
+  return {
+    t,
+    k: "db.diff",
+    d: {
+      requestId,
+      engine: "postgres",
+      op: "insert",
+      table: "cart_items",
+      pk: { id: 7 },
+      after: { id: 7, cart_id: 3, product_id: 1, qty: 2 },
+      callsite: {
+        file: "server/src/repos/cart-repo.js",
+        line: 41,
+        stack: [
+          { file: "server/src/repos/cart-repo.js", line: 41 },
+          { file: "server/src/services/cart-service.js", line: 73 },
+          { file: "server/src/routes/auth.js", line: 58 },
+        ],
+      },
+    },
+  } as unknown as BugEvent;
+}
+
 function detectors(events: BugEvent[]): string[] {
   return buildEvidenceCandidates(events, { start: 0 }).map(
     (candidate) => candidate.detector,
@@ -92,6 +116,30 @@ describe("session-bound cart invariants", () => {
       }),
     ]);
     expect(found).toContain("cart_remerged_on_login");
+  });
+
+  it("delivers the outer application frame from the duplicate effect request", () => {
+    const events = [
+      request(10, "login1", "POST", "/api/login", {}),
+      jsonResponse(20, "login1", { user: { id: 3 }, mergedLines: 1 }),
+      request(30, "cart1", "GET", "/api/cart"),
+      jsonResponse(40, "cart1", { items: [{ productId: 1, qty: 2 }] }),
+      request(50, "login2", "POST", "/api/login", {}),
+      cartWriteWithCallsite(55, "login2"),
+      jsonResponse(60, "login2", { user: { id: 3 }, mergedLines: 1 }),
+      request(70, "cart2", "GET", "/api/cart"),
+      jsonResponse(80, "cart2", {
+        items: [
+          { productId: 1, qty: 2 },
+          { productId: 1, qty: 2 },
+        ],
+      }),
+    ];
+
+    const hit = buildEvidenceCandidates(events, { start: 0 }).find(
+      (candidate) => candidate.detector === "cart_remerged_on_login",
+    );
+    expect(hit?.anchor.frame).toBe("server/src/routes/auth.js:58");
   });
 
   it("does not flag a second login when the cart stayed stable", () => {
