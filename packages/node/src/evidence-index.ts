@@ -7840,10 +7840,37 @@ function addCasefoldIdentityCollisionCandidates(
   }
 }
 
+/**
+ * The first moment this session can show the user committed state: the
+ * completion of the earliest non-GET request that succeeded.
+ *
+ * A control that claims to commit something is only interesting when there is
+ * something to commit. The rule below used to spell that in one app's
+ * vocabulary — a successful response from a single hardcoded shopping route,
+ * read as "the basket is populated" — so it could not fire on an app that has
+ * no such route. Every app has the same shape underneath: a signup, a saved
+ * draft, an uploaded file, a configured booking. What the rule needs is not a
+ * particular route, it is evidence that the click is acting on state this
+ * session already put somewhere.
+ */
+function firstCommittedStateAt(
+  exchanges: Map<string, RequestExchange>,
+): number | undefined {
+  let earliest: number | undefined;
+  for (const exchange of exchanges.values()) {
+    if (!MUTATING_METHODS.has(exchange.method)) continue;
+    if (!isSuccessStatus(exchange.status)) continue;
+    const completed = exchange.res?.t ?? exchange.req.t;
+    if (earliest === undefined || completed < earliest) earliest = completed;
+  }
+  return earliest;
+}
+
 function addBlockedDependencyActionCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
 ): void {
   const blockedScripts = events.filter(
     (event) =>
@@ -7856,24 +7883,12 @@ function addBlockedDependencyActionCandidates(
       ),
   );
   if (blockedScripts.length === 0) return;
-  const populatedCart = events.some(
-    (event) =>
-      event.k === "net.res" &&
-      isSuccessStatus(finiteNumber(event.d.st)) &&
-      /\/(?:api\/)?cart\/items(?:$|\?)/i.test(
-        safeText(
-          events.find(
-            (request) =>
-              request.k === "net.req" &&
-              requestIdForEvent(request) === requestIdForEvent(event),
-          )?.d.url,
-          400,
-        ) ?? "",
-      ),
-  );
-  if (!populatedCart) return;
+  const committedStateAt = firstCommittedStateAt(exchanges);
+  if (committedStateAt === undefined) return;
   for (const click of events) {
     if (click.k !== "clk" || !isRecord(click.d.el)) continue;
+    // The state has to exist before the action that acts on it.
+    if (click.t < committedStateAt) continue;
     const action = [
       safeText(click.d.el.path, 300),
       safeText(click.d.el.txt, 160),
@@ -7897,7 +7912,7 @@ function addBlockedDependencyActionCandidates(
     if (!blocked) continue;
     drafts.push({
       detector: "blocked_script_prevented_action",
-      title: `Checkout action produced no request after a script failed to load`,
+      title: `Action control produced no request after a script failed to load`,
       severity: "high",
       score: BROWSER_NETWORK_SCORE,
       confidence: "high",
@@ -7906,7 +7921,8 @@ function addBlockedDependencyActionCandidates(
         offsetMs: offsetForEvent(click) ?? offsetFromStart(click.t, index.start),
         route: routeAt(index.navs ?? [], click.t),
         message:
-          `The populated cart's checkout control was clicked, but no checkout/order/payment request or navigation followed within 3 seconds. ` +
+          `An action control was clicked after this session had already committed state through a successful write, ` +
+          `but no checkout/order/payment request or navigation followed within 3 seconds. ` +
           `A vendor-style script resource on this page transferred zero bytes.`,
         source: redactUrl(safeText(blocked.d.name, 400)),
       }),
@@ -8181,7 +8197,7 @@ function addBrowserNetworkIntegrityCandidates(
   exchanges: Map<string, RequestExchange>,
 ): void {
   addCasefoldIdentityCollisionCandidates(events, index, drafts, exchanges);
-  addBlockedDependencyActionCandidates(events, index, drafts);
+  addBlockedDependencyActionCandidates(events, index, drafts, exchanges);
   addAcknowledgedStateContradictionCandidates(index, drafts, exchanges);
   addRequestBurstCandidates(events, index, drafts);
   addStaleClientBuildCandidates(events, index, drafts, exchanges);
