@@ -225,6 +225,96 @@ describe("browser and network integrity", () => {
     ).not.toContain("blocked_script_prevented_action");
   });
 
+  it("flags a stalled action on an app with no cart at all", () => {
+    expect(
+      detectors([
+        ...exchange(
+          100,
+          "booking-1",
+          "POST",
+          "/api/bookings/42/passengers",
+          { passengerId: 7 },
+          { bookingId: 42, passengers: 1 },
+        ),
+        {
+          t: 150,
+          k: "perf",
+          d: {
+            metric: "res",
+            name: "https://airline.test/tag/gtm.js",
+            initiatorType: "script",
+            transferSize: 0,
+          },
+        },
+        {
+          t: 200,
+          k: "clk",
+          d: { el: { path: "button[data-testid=confirm-purchase]" } },
+        },
+      ] as unknown as BugEvent[]),
+    ).toContain("blocked_script_prevented_action");
+  });
+
+  it("accepts a zero-byte analytics script on a session that committed nothing", () => {
+    expect(
+      detectors([
+        ...exchange(
+          100,
+          "search-1",
+          "GET",
+          "/api/flights?from=BOS",
+          undefined,
+          { flights: [{ id: 1 }] },
+        ),
+        {
+          t: 150,
+          k: "perf",
+          d: {
+            metric: "res",
+            name: "https://airline.test/analytics/beacon.js",
+            initiatorType: "script",
+            transferSize: 0,
+          },
+        },
+        {
+          t: 200,
+          k: "clk",
+          d: { el: { path: "button[data-testid=submit-search]" } },
+        },
+      ] as unknown as BugEvent[]),
+    ).not.toContain("blocked_script_prevented_action");
+  });
+
+  it("accepts an action clicked before the session committed anything", () => {
+    expect(
+      detectors([
+        {
+          t: 50,
+          k: "perf",
+          d: {
+            metric: "res",
+            name: "https://airline.test/tag/gtm.js",
+            initiatorType: "script",
+            transferSize: 0,
+          },
+        },
+        {
+          t: 100,
+          k: "clk",
+          d: { el: { path: "button[data-testid=confirm-purchase]" } },
+        },
+        ...exchange(
+          200,
+          "booking-1",
+          "POST",
+          "/api/bookings/42/passengers",
+          { passengerId: 7 },
+          { bookingId: 42, passengers: 1 },
+        ),
+      ] as unknown as BugEvent[]),
+    ).not.toContain("blocked_script_prevented_action");
+  });
+
   it("flags an acknowledged state change contradicted by the next read", () => {
     expect(
       detectors([
