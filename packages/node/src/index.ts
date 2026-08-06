@@ -103,6 +103,15 @@ export {
   type CallsiteLike,
   type RepoBinding,
 } from "./code-pointers";
+export {
+  buildCodeLocations,
+  parseFrame,
+  MAX_CODE_LOCATIONS,
+  MAX_CALLER_FRAMES,
+  type CodeFrame,
+  type CodeLocation,
+  type CodeLocationVia,
+} from "./code-locations";
 export { captureDbCallsite, type DbCallsite } from "./db/callsite";
 export type { CodePointer, CodePointerResolution } from "./code-pointers";
 export {

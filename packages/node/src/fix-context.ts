@@ -16,6 +16,7 @@ import {
   extractOpinionCodePointers,
   type CodePointer,
 } from "./code-pointers";
+import { buildCodeLocations, type CodeLocation } from "./code-locations";
 
 /** A database row diff correlated to the primary window. See {@link LlmBundleDbDiff}. */
 export type FixContextDbDiff = LlmBundleDbDiff;
@@ -141,6 +142,18 @@ export interface FixContext {
    * treat absence as "no pointers available", never as an error.
    */
   code_pointers?: CodePointer[];
+  /**
+   * Where in the source each ranked signal physically came from, derived from
+   * frames the runtime reported at capture time (see `code-locations.ts`).
+   *
+   * Distinct from `code_pointers` on purpose. Those are cloud-resolved GitHub
+   * permalinks and exist only where a connector and a deploy binding do; these
+   * are available on every path, including self-host and file-store, because
+   * they come from the process that was running. OPTIONAL and additive: absent
+   * when the SDK was not capturing callsites and no candidate carried a frame.
+   * Consumers MUST treat absence as "no locations captured", never as an error.
+   */
+  code_locations?: CodeLocation[];
 }
 
 export interface BuildFixContextOptions {
@@ -202,6 +215,7 @@ export function buildFixContextFromArtifacts(
   const environment = buildEnvironment(bundle);
   const causalChain = buildCausalChain(ranked);
   const codePointers = extractOpinionCodePointers(extras.opinion);
+  const codeLocations = buildCodeLocations(bundle, ranked);
 
   return {
     schemaVersion: FIX_CONTEXT_SCHEMA_VERSION,
@@ -212,6 +226,7 @@ export function buildFixContextFromArtifacts(
     causal_chain: causalChain,
     repro_hint: reproHint,
     ...(codePointers ? { code_pointers: codePointers } : {}),
+    ...(codeLocations ? { code_locations: codeLocations } : {}),
   };
 }
 
