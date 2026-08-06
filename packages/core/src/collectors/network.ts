@@ -1127,14 +1127,19 @@ function emitEarlyRecord(
  * patch permanently. A no-op when the early module was never imported.
  */
 function drainEarlyRequests(bus: EventBus, config: CrumbtrailConfig): void {
-  for (const record of drainEarlyCapture()) {
-    if (shouldExclude(record.url, config)) continue;
+  const emit = (record: EarlyRequestRecord) => {
+    if (shouldExclude(record.url, config)) return;
     try {
       emitEarlyRecord(bus, config, record);
     } catch {
       // One malformed record never costs the rest of the queue.
     }
-  }
+  };
+  // The sink catches the requests still on the wire at this instant. They are
+  // the page's first data load more often than not, and before the sink existed
+  // they were captured by neither side: the early patch stopped recording at the
+  // drain, and the patch below was installed after they were issued.
+  for (const record of drainEarlyCapture(emit)) emit(record);
 }
 
 /* ------------------------------------------------------------------ */
