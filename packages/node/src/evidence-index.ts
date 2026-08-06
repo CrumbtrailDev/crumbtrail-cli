@@ -638,6 +638,7 @@ export function buildEvidenceCandidates(
   addBrowserNetworkIntegrityCandidates(events, index, drafts, exchanges);
   addRefundInvariantCandidates(events, index, drafts);
   addSessionCartInvariantCandidates(events, index, drafts, exchanges);
+  attachDuplicateEffectFrames(events, drafts);
   addLocaleInputCandidates(index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
   addDeclinedPaymentOrderedCandidates(events, index, drafts);
@@ -9396,6 +9397,58 @@ function dbCallsiteFrame(callsite: unknown): string | undefined {
     line: finiteNumber(callsite.line),
     col: finiteNumber(callsite.column),
   });
+}
+
+/** Prefer the outermost valid host frame for repeated-effect findings. */
+function duplicateEffectApplicationFrame(callsite: unknown): string | undefined {
+  if (!isRecord(callsite)) return undefined;
+  const frames = [
+    callsite,
+    ...(Array.isArray(callsite.stack) ? callsite.stack.filter(isRecord) : []),
+  ];
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    const frame = dbCallsiteFrame(frames[index]);
+    if (frame) return frame;
+  }
+  return undefined;
+}
+
+const DUPLICATE_EFFECT_DETECTORS = new Set([
+  "cart_remerged_on_login",
+  "concurrent_duplicate_mutation",
+  "duplicate_write",
+  "duplicate_charge",
+  "duplicate_readback",
+]);
+
+function attachDuplicateEffectFrames(
+  events: BugEvent[],
+  drafts: CandidateDraft[],
+): void {
+  const diffsByRequest = dbDiffsByRequest(events);
+  for (const draft of drafts) {
+    if (
+      !DUPLICATE_EFFECT_DETECTORS.has(draft.detector) ||
+      draft.anchor.frame ||
+      !draft.anchor.requestId
+    )
+      continue;
+    const diffs = diffsByRequest.get(draft.anchor.requestId);
+    if (!diffs) continue;
+
+    let nearest: { t: number; frame: string } | undefined;
+    for (const diff of diffs) {
+      const frame = duplicateEffectApplicationFrame(diff.d.callsite);
+      if (!frame) continue;
+      if (
+        !nearest ||
+        Math.abs(diff.t - draft.anchor.t) < Math.abs(nearest.t - draft.anchor.t)
+      ) {
+        nearest = { t: diff.t, frame };
+      }
+    }
+    if (nearest) draft.anchor.frame = nearest.frame;
+  }
 }
 
 /**
