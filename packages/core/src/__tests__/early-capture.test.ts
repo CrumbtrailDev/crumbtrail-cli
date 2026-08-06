@@ -59,7 +59,7 @@ class MockXHR {
   status = 200;
   responseText = '{"ok":true}';
   requestHeaders: Record<string, string> = {};
-  private listeners: Record<string, Array<() => void>> = {};
+  protected listeners: Record<string, Array<() => void>> = {};
 
   constructor() {
     MockXHR.instances.push(this);
@@ -83,6 +83,10 @@ class MockXHR {
   }
 
   send(_body?: unknown): void {
+    this.fireLoadend();
+  }
+
+  protected fireLoadend(): void {
     for (const fn of this.listeners.loadend ?? []) fn();
   }
 }
@@ -501,5 +505,179 @@ describe("Crumbtrail.init session adoption", () => {
     expect(readEarlyCapture()?.entries).toHaveLength(0);
     expect(readEarlyCapture()?.deferred).toBe(true);
     await logger.stop();
+  });
+});
+
+/**
+ * The window that used to swallow a page's first data load.
+ *
+ * A request issued before `Crumbtrail.init()` lands but answered after it is
+ * captured by neither patch on its own: the early patch stops taking work at the
+ * drain, and the live collector patched `fetch` after the call was already made.
+ * The backend still logs it — the early patch stamped the correlation headers —
+ * so the symptom is a request that exists on the server side and is missing from
+ * the browser timeline.
+ */
+describe("requests in flight across the drain", () => {
+  let originalFetch: typeof globalThis.fetch;
+  let originalXHR: typeof globalThis.XMLHttpRequest;
+
+  /** A fetch whose response the test resolves by hand. */
+  function pendingFetch(body = '{"total":42}', status = 200) {
+    const settlers: Array<(response: Response) => void> = [];
+    const rejecters: Array<(error: unknown) => void> = [];
+    const mock = vi.fn().mockImplementation(
+      () =>
+        new Promise<Response>((resolve, reject) => {
+          settlers.push(resolve);
+          rejecters.push(reject);
+        }),
+    );
+    return {
+      mock,
+      settle: (index = 0) => settlers[index](jsonResponse(body, status)),
+      fail: (index = 0, error: unknown = new Error("offline")) =>
+        rejecters[index](error),
+    };
+  }
+
+  /** MockXHR settles inside send(); this one waits to be told. */
+  class DeferredXHR extends MockXHR {
+    override send(_body?: unknown): void {
+      // Intentionally silent: the test calls settle().
+    }
+
+    settle(): void {
+      this.fireLoadend();
+    }
+  }
+
+  function collect(config = DEFAULT_CONFIG) {
+    const events: BugEvent[] = [];
+    const bus = new EventBus();
+    bus.subscribe((batch) => events.push(...batch));
+    const cleanup = networkCollector(bus, config, { sessionId: "ses_live_1" });
+    return { events, bus, cleanup };
+  }
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+    originalXHR = globalThis.XMLHttpRequest;
+    sessionStorage.clear();
+    MockXHR.instances = [];
+  });
+
+  afterEach(() => {
+    uninstallEarlyCapture();
+    globalThis.fetch = originalFetch;
+    globalThis.XMLHttpRequest = originalXHR;
+    sessionStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("emits a fetch that started before the drain and answered after it", async () => {
+    const pending = pendingFetch('{"total":42}');
+    globalThis.fetch = pending.mock as unknown as typeof globalThis.fetch;
+    const capture = installEarlyCapture();
+
+    const inFlight = globalThis.fetch("/api/rewards?userId=1");
+    const { events, bus, cleanup } = collect();
+    expect(events.some((event) => event.k === "net.req")).toBe(false);
+
+    pending.settle();
+    await inFlight;
+    await settleBodies();
+    bus.flush();
+    cleanup();
+
+    const req = events.find((event) => event.k === "net.req");
+    const res = events.find((event) => event.k === "net.res");
+    // The query value is redacted on the way out, as it is for any live request.
+    expect(String(req?.d.url)).toContain("/api/rewards?userId=");
+    expect(req?.d.early).toBe(true);
+    expect(req?.d.sessionId).toBe(capture?.sessionId);
+    expect(res?.d.st).toBe(200);
+    expect(res?.d.body).toBe('{"total":42}');
+    expect(req?.d.id).toBe(res?.d.id);
+  });
+
+  it("emits it exactly once, not once per patch", async () => {
+    const pending = pendingFetch();
+    globalThis.fetch = pending.mock as unknown as typeof globalThis.fetch;
+    installEarlyCapture();
+
+    const inFlight = globalThis.fetch("/api/rewards");
+    const { events, bus, cleanup } = collect();
+    pending.settle();
+    await inFlight;
+    await settleBodies();
+    bus.flush();
+    cleanup();
+
+    expect(events.filter((event) => event.k === "net.req")).toHaveLength(1);
+    expect(events.filter((event) => event.k === "net.res")).toHaveLength(1);
+    expect(readEarlyCapture()?.entries).toHaveLength(0);
+  });
+
+  it("emits net.err when the in-flight request fails after the drain", async () => {
+    const pending = pendingFetch();
+    globalThis.fetch = pending.mock as unknown as typeof globalThis.fetch;
+    installEarlyCapture();
+
+    const inFlight = globalThis.fetch("/api/rewards");
+    const { events, bus, cleanup } = collect();
+    pending.fail();
+    await expect(inFlight).rejects.toThrow("offline");
+    await settleBodies();
+    bus.flush();
+    cleanup();
+
+    const err = events.find((event) => event.k === "net.err");
+    expect(err?.d.msg).toBe("offline");
+    expect(err?.d.early).toBe(true);
+  });
+
+  it("emits an XHR that was open across the drain", async () => {
+    globalThis.XMLHttpRequest = DeferredXHR as unknown as typeof XMLHttpRequest;
+    globalThis.fetch = fetchMock();
+    installEarlyCapture();
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("GET", "/api/rewards");
+    xhr.send();
+
+    const { events, bus, cleanup } = collect();
+    (MockXHR.instances[0] as DeferredXHR).settle();
+    await settleBodies();
+    bus.flush();
+    cleanup();
+
+    const req = events.find(
+      (event) => event.k === "net.req" && event.d.url === "/api/rewards",
+    );
+    expect(req?.d.early).toBe(true);
+    expect(
+      events.some((event) => event.k === "net.res" && event.d.st === 200),
+    ).toBe(true);
+  });
+
+  it("drops the in-flight request when the window expired instead of draining", async () => {
+    const pending = pendingFetch();
+    globalThis.fetch = pending.mock as unknown as typeof globalThis.fetch;
+    const capture = installEarlyCapture();
+
+    const inFlight = globalThis.fetch("/api/rewards");
+    // stop() is what the idle timeout calls: no SDK ever arrived, so the record
+    // has nowhere to go and must not be retained.
+    capture?.stop();
+    const { events, bus, cleanup } = collect();
+    pending.settle();
+    await inFlight;
+    await settleBodies();
+    bus.flush();
+    cleanup();
+
+    expect(events.some((event) => event.k === "net.req")).toBe(false);
+    expect(readEarlyCapture()?.entries).toHaveLength(0);
   });
 });

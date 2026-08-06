@@ -77,14 +77,25 @@ export interface EarlyCapture {
   readonly sessionId: string;
   entries: EarlyRequestRecord[];
   bytes: number;
-  /** True once the SDK has drained: the patch delegates and stops recording. */
+  /** True once the SDK has drained: the patch takes no NEW requests. */
   deferred: boolean;
   stopped: boolean;
-  drain(): EarlyRequestRecord[];
+  /**
+   * Hands over the queue. An optional `sink` receives the records that were
+   * ALREADY IN FLIGHT when the drain ran and settle afterwards — without it
+   * those requests are lost to both sides: the early patch has stopped taking
+   * new work, and the live collector patched `fetch` after they were issued.
+   * That window is where a page's first data load lives.
+   */
+  drain(sink?: LateRecordSink): EarlyRequestRecord[];
   stop(): void;
 }
 
+/** Receives a request that started under the early patch and settled after the drain. */
+export type LateRecordSink = (record: EarlyRequestRecord) => void;
+
 interface EarlyCaptureState extends EarlyCapture {
+  _sink?: LateRecordSink;
   _timer?: ReturnType<typeof setTimeout>;
   _fetch?: typeof globalThis.fetch;
   _wrappedFetch?: typeof globalThis.fetch;
@@ -145,11 +156,13 @@ export function readEarlySessionId(): string | undefined {
  * Returns an empty list when nothing was queued, the window already expired, or
  * the module was never imported.
  */
-export function drainEarlyCapture(): EarlyRequestRecord[] {
+export function drainEarlyCapture(
+  sink?: LateRecordSink,
+): EarlyRequestRecord[] {
   const capture = readEarlyCapture();
   if (!capture || typeof capture.drain !== "function") return [];
   try {
-    return capture.drain();
+    return capture.drain(sink);
   } catch {
     return [];
   }
@@ -174,6 +187,53 @@ function recordedBytes(record: EarlyRequestRecord): number {
 
 function recording(state: EarlyCaptureState): boolean {
   return !state.stopped && !state.deferred;
+}
+
+/**
+ * May a request that STARTED while recording still be written down?
+ *
+ * Yes right up until `stop()`. Deferral means "take no new requests", not
+ * "abandon the ones already on the wire": those already carry this session's
+ * correlation headers, so the backend has recorded them and the browser side
+ * would be the only place they are missing.
+ */
+function settling(state: EarlyCaptureState): boolean {
+  return !state.stopped;
+}
+
+/**
+ * The per-body ceiling without the queue's byte budget, for a record handed
+ * straight to the sink. Nothing is being buffered, so there is no budget to
+ * charge — only the size cap the collector applies to any body.
+ */
+function attachDirectBody(
+  record: EarlyRequestRecord,
+  field: "reqBody" | "resBody",
+  text: string | undefined,
+): void {
+  if (!text) return;
+  if (byteLength(text) > EARLY_MAX_BODY_BYTES) return;
+  record[field] = text;
+}
+
+/**
+ * How long a late record waits for its response body before being delivered
+ * without one. A streaming or never-closed body must not cost the record.
+ */
+const LATE_BODY_TIMEOUT_MS = 3_000;
+
+/** Delivers exactly once, however the body read ends. */
+function deliverOnce(sink: LateRecordSink, record: EarlyRequestRecord) {
+  let sent = false;
+  return () => {
+    if (sent) return;
+    sent = true;
+    try {
+      sink(record);
+    } catch {
+      // A throwing sink never becomes the app's problem.
+    }
+  };
 }
 
 function pushRecord(
@@ -365,7 +425,7 @@ function recordFetchResponse(
   started: number,
   response: Response,
 ): void {
-  if (!recording(state)) return;
+  if (!settling(state)) return;
   const contentType = response.headers?.get("content-type") ?? undefined;
   const record: EarlyRequestRecord = {
     method: request.method,
@@ -381,6 +441,36 @@ function recordFetchResponse(
     ...(contentType ? { ct: contentType } : {}),
     ...(request.reqCt ? { reqCt: request.reqCt } : {}),
   };
+  const sink = state.deferred ? state._sink : undefined;
+  if (sink) {
+    // In flight across the drain. Nothing is queued — the record goes straight
+    // to the live collector, once, after its body has had its chance.
+    attachDirectBody(record, "reqBody", request.reqBody);
+    const send = deliverOnce(sink, record);
+    if (!isJsonContentType(contentType)) {
+      send();
+      return;
+    }
+    try {
+      setTimeout(send, LATE_BODY_TIMEOUT_MS);
+    } catch {
+      // No timer available: the body read below is the only path left.
+    }
+    try {
+      response
+        .clone()
+        .text()
+        .then((text) => {
+          attachDirectBody(record, "resBody", text);
+          send();
+        })
+        .catch(send);
+    } catch {
+      send();
+    }
+    return;
+  }
+
   pushRecord(state, record);
   if (request.reqBody) attachBody(state, record, "reqBody", request.reqBody);
   if (!isJsonContentType(contentType)) return;
@@ -404,7 +494,7 @@ function recordFailure(
   started: number,
   error: unknown,
 ): void {
-  if (!recording(state)) return;
+  if (!settling(state)) return;
   const record: EarlyRequestRecord = {
     method: request.method,
     url: request.url,
@@ -418,6 +508,12 @@ function recordFailure(
     err: error instanceof Error ? error.message : String(error),
     ...(request.reqCt ? { reqCt: request.reqCt } : {}),
   };
+  const sink = state.deferred ? state._sink : undefined;
+  if (sink) {
+    attachDirectBody(record, "reqBody", request.reqBody);
+    deliverOnce(sink, record)();
+    return;
+  }
   pushRecord(state, record);
   if (request.reqBody) attachBody(state, record, "reqBody", request.reqBody);
 }
@@ -502,7 +598,7 @@ function patchXhr(state: EarlyCaptureState): void {
       entry.started = Date.now();
       const finish = () => {
         try {
-          if (!recording(state)) return;
+          if (!settling(state)) return;
           const contentType =
             this.getResponseHeader?.("content-type") ?? undefined;
           const record: EarlyRequestRecord = {
@@ -518,17 +614,31 @@ function patchXhr(state: EarlyCaptureState): void {
             status: this.status,
             ...(contentType ? { ct: contentType } : {}),
           };
+          // responseText throws for a non-text responseType.
+          const responseText = () => {
+            try {
+              return isJsonContentType(contentType)
+                ? this.responseText
+                : undefined;
+            } catch {
+              return undefined;
+            }
+          };
+
+          const sink = state.deferred ? state._sink : undefined;
+          if (sink) {
+            // Already settled by the time we are here, so unlike fetch there is
+            // nothing to wait for: body and record go together.
+            attachDirectBody(record, "reqBody", pending.reqBody);
+            attachDirectBody(record, "resBody", responseText());
+            deliverOnce(sink, record)();
+            return;
+          }
+
           pushRecord(state, record);
           if (pending.reqBody)
             attachBody(state, record, "reqBody", pending.reqBody);
-          if (!isJsonContentType(contentType)) return;
-          // responseText throws for a non-text responseType.
-          let text: string | undefined;
-          try {
-            text = this.responseText;
-          } catch {
-            text = undefined;
-          }
+          const text = responseText();
           if (text) attachBody(state, record, "resBody", text);
         } catch {
           // Recording must never break the app's XHR handlers.
@@ -571,8 +681,9 @@ export function installEarlyCapture(): EarlyCapture | undefined {
       bytes: 0,
       deferred: false,
       stopped: false,
-      drain() {
+      drain(sink?: LateRecordSink) {
         this.deferred = true;
+        this._sink = typeof sink === "function" ? sink : undefined;
         if (this._timer !== undefined) {
           clearTimeout(this._timer);
           this._timer = undefined;
@@ -584,6 +695,7 @@ export function installEarlyCapture(): EarlyCapture | undefined {
       },
       stop() {
         this.stopped = true;
+        this._sink = undefined;
         this.entries = [];
         this.bytes = 0;
         if (this._timer !== undefined) {
