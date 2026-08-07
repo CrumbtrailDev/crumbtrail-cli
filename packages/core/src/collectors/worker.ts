@@ -42,7 +42,6 @@ type WorkerCtor = new (
 
 interface WorkerGlobal {
   Worker?: WorkerCtor;
-  SharedWorker?: unknown;
 }
 
 export function workerCollector(
