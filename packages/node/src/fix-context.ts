@@ -210,7 +210,7 @@ export function buildFixContextFromArtifacts(
   extras: { opinion?: Record<string, unknown> } = {},
 ): FixContext {
   const session = buildSession(sessionDir, index, bundle);
-  const primaryWindow = buildPrimaryWindow(ranked, bundle);
+  const primaryWindow = buildPrimaryWindow(ranked, bundle, resolveAnchorRequestId(index));
   const reproHint = buildReproHint(ranked);
   const environment = buildEnvironment(bundle);
   const causalChain = buildCausalChain(ranked);
@@ -340,18 +340,45 @@ function buildSession(
   }) as FixContextSession;
 }
 
+/**
+ * Turns whichever request id a candidate anchored on into the one the backend and DB planes used.
+ *
+ * A browser-plane detector anchors on the browser's own request counter; `fullStackEvidence.linked`
+ * and `databaseDiffs` are keyed by the correlation requestId. Without this the identity join below
+ * silently never fires for browser-plane candidates, and the primary window falls back to the time
+ * window alone — which pulls in every request that happened to overlap and no rows that are
+ * provably the reported one's. `causalGraph.requestIdAliases` is the join; see its doc comment.
+ *
+ * Unknown ids pass through unchanged, so a backend-plane anchor (already correlated) is untouched.
+ */
+function resolveAnchorRequestId(
+  index: Record<string, unknown>,
+): (id: string | undefined) => string | undefined {
+  const graph = index.causalGraph;
+  const aliases =
+    isRecord(graph) && isRecord(graph.requestIdAliases)
+      ? graph.requestIdAliases
+      : undefined;
+  return (id) => {
+    if (id === undefined) return undefined;
+    const alias = aliases?.[id];
+    return typeof alias === "string" ? alias : id;
+  };
+}
+
 function buildPrimaryWindow(
   ranked: EvidenceCandidate[],
   bundle: LlmBundle | undefined,
+  resolveRequestId: (id: string | undefined) => string | undefined = (id) => id,
 ): FixContextPrimaryWindow {
   const top = ranked[0];
   const window = top ? top.evidenceWindow : null;
+  const topRequestId = resolveRequestId(top?.anchor.requestId);
   const linked: LlmBundleLinkedFullStackRequestSummary[] =
     bundle?.fullStackEvidence?.linked ?? [];
 
   const matched = linked.filter((entry) => {
-    if (top?.anchor.requestId && entry.requestId === top.anchor.requestId)
-      return true;
+    if (topRequestId && entry.requestId === topRequestId) return true;
     const t = entry.frontend?.ref?.t;
     if (window && typeof t === "number")
       return t >= window.start && t <= window.end;
@@ -367,9 +394,9 @@ function buildPrimaryWindow(
     backend: {
       requests: matched.map((entry) => entry.backend),
     },
-    db_diffs: selectPrimaryWindowDbDiffs(bundle, window, top, matched),
-    db_reads: selectPrimaryWindowDbReads(bundle, window, top, matched),
-    db_activity: selectPrimaryWindowDbActivity(bundle, window, top, matched),
+    db_diffs: selectPrimaryWindowDbDiffs(bundle, window, topRequestId, matched),
+    db_reads: selectPrimaryWindowDbReads(bundle, window, topRequestId, matched),
+    db_activity: selectPrimaryWindowDbActivity(bundle, window, topRequestId, matched),
   };
 }
 
@@ -381,7 +408,7 @@ function buildPrimaryWindow(
 function selectPrimaryWindowDbDiffs(
   bundle: LlmBundle | undefined,
   window: { start: number; end: number } | null,
-  top: EvidenceCandidate | undefined,
+  topRequestId: string | undefined,
   matched: LlmBundleLinkedFullStackRequestSummary[],
 ): FixContextDbDiff[] {
   const diffs = Array.isArray(bundle?.databaseDiffs)
@@ -390,7 +417,7 @@ function selectPrimaryWindowDbDiffs(
   if (diffs.length === 0) return [];
 
   const requestIds = new Set<string>();
-  if (top?.anchor.requestId) requestIds.add(top.anchor.requestId);
+  if (topRequestId) requestIds.add(topRequestId);
   for (const entry of matched) requestIds.add(entry.requestId);
 
   return diffs.filter((diff) => {
@@ -408,7 +435,7 @@ function selectPrimaryWindowDbDiffs(
 function selectPrimaryWindowDbReads(
   bundle: LlmBundle | undefined,
   window: { start: number; end: number } | null,
-  top: EvidenceCandidate | undefined,
+  topRequestId: string | undefined,
   matched: LlmBundleLinkedFullStackRequestSummary[],
 ): FixContextDbRead[] {
   const reads = Array.isArray(bundle?.databaseReads)
@@ -417,7 +444,7 @@ function selectPrimaryWindowDbReads(
   if (reads.length === 0) return [];
 
   const requestIds = new Set<string>();
-  if (top?.anchor.requestId) requestIds.add(top.anchor.requestId);
+  if (topRequestId) requestIds.add(topRequestId);
   for (const entry of matched) requestIds.add(entry.requestId);
 
   return reads.filter((read) => {
@@ -435,7 +462,7 @@ function selectPrimaryWindowDbReads(
 function selectPrimaryWindowDbActivity(
   bundle: LlmBundle | undefined,
   window: { start: number; end: number } | null,
-  top: EvidenceCandidate | undefined,
+  topRequestId: string | undefined,
   matched: LlmBundleLinkedFullStackRequestSummary[],
 ): FixContextDbActivity[] {
   const activity = Array.isArray(bundle?.databaseActivity)
@@ -444,7 +471,7 @@ function selectPrimaryWindowDbActivity(
   if (activity.length === 0) return [];
 
   const requestIds = new Set<string>();
-  if (top?.anchor.requestId) requestIds.add(top.anchor.requestId);
+  if (topRequestId) requestIds.add(topRequestId);
   for (const entry of matched) requestIds.add(entry.requestId);
 
   return activity.filter((entry) => {
