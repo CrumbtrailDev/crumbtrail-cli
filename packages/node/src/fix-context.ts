@@ -243,63 +243,66 @@ function toSignal(candidate: EvidenceCandidate): FixContextSignal {
  * candidates (CP3). Does NOT recompute attribution and does NOT re-sort candidates: it reads the
  * root-first order that `candidates.jsonl` already carries.
  *
- * Primary root resolution walks the ranked list IN ORDER and returns the first candidate that
- * yields a chain — itself when it is a root, or its `rootCauseId` when it is a symptom.
+ * Primary root resolution: `ranked[0]` is the anchor, and nothing else is.
+ *   - if it is a root -> it is the root;
+ *   - else if it is a symptom -> resolve its `rootCauseId` against `signals`;
+ *   - else -> null.
  *
- * It used to consider `ranked[0]` alone and return null otherwise. That made one noisy candidate
- * in the top slot suppress a chain that was fully present underneath it: a generic
- * whole-session detector (an N+1 on an unrelated route is the recurring one) outranks the
- * incident's own root, and the bundle ships `causal_chain: null` while the decisive candidate
- * sits two rows down with its root and symptoms intact. Three separate defects in one
- * evaluation run were reported that way, each as "captured every decisive fact but never
- * assembled them" — the assembly existed; nothing would read past the first row to find it.
+ * A wider walk was tried and REVERTED on evidence. The reasoning was sound: a generic
+ * whole-session detector (an N+1 on an unrelated route) takes the top slot, and a chain sitting
+ * intact two rows below is discarded, which three separate evaluation defects reported as
+ * "captured every decisive fact but never assembled them". Scanning down the list for the first
+ * candidate that resolves does find a chain - just not the incident's. On a gift-card balance
+ * defect it produced `root: backend_http_client_error, HTTP 401 from GET /api/me`: a page-load
+ * auth probe on a different route, asserted as the causal story of the bug. The decisive
+ * candidate, a UI-vs-API divergence on the reported route, was `causalRole: "isolated"` and was
+ * never a chain in the first place.
  *
- * Rank still decides: the walk prefers higher-ranked anchors and stops at the first that
- * resolves, so a genuine top-ranked root is unaffected.
- *
- * Symptoms are the root's own `causes` (candidate ids), resolved against `signals` in the
- * root's already-sorted `causes` order, so output is deterministic with no map-iteration leaks.
+ * A confident wrong chain is worse than an honest null: null says "no causal structure surfaced",
+ * which is true and readable, while the walk's output says "this is why it broke" about an
+ * unrelated request. So the null stays until the real gap is closed, and the real gap is that
+ * cross-plane contradictions are not attributed to the request and rows that produced them -
+ * assembly per incident, ranked against the reported symptom. That is a change to attribution,
+ * not to this projection, and this function must not paper over it.
  */
+
 export function buildCausalChain(
   ranked: EvidenceCandidate[],
 ): FixContextCausalChain | null {
-  if (ranked.length === 0) return null;
+  const top = ranked[0];
+  if (!top) return null;
 
   const byId = new Map<string, EvidenceCandidate>();
   for (const candidate of ranked) byId.set(candidate.id, candidate);
 
-  for (const anchor of ranked) {
-    let root: EvidenceCandidate | undefined;
-    if (anchor.causalRole === "root") {
-      root = anchor;
-    } else if (anchor.causalRole === "symptom" && anchor.rootCauseId) {
-      root = byId.get(anchor.rootCauseId);
-    }
-    if (!root || root.causalRole !== "root") continue;
-
-    const causeIds = root.causes ?? [];
-    const symptoms: FixContextCausalSymptom[] = [];
-    for (const id of causeIds) {
-      const symptom = byId.get(id);
-      if (!symptom) continue;
-      symptoms.push(
-        removeUndefined({
-          id: symptom.id,
-          detector: symptom.detector,
-          title: symptom.title,
-          attributionConfidence: symptom.attributionConfidence,
-        }) as FixContextCausalSymptom,
-      );
-    }
-    if (symptoms.length === 0) continue;
-
-    return {
-      root: { id: root.id, detector: root.detector, title: root.title },
-      symptoms,
-    };
+  let root: EvidenceCandidate | undefined;
+  if (top.causalRole === "root") {
+    root = top;
+  } else if (top.causalRole === "symptom" && top.rootCauseId) {
+    root = byId.get(top.rootCauseId);
   }
+  if (!root || root.causalRole !== "root") return null;
 
-  return null;
+  const causeIds = root.causes ?? [];
+  const symptoms: FixContextCausalSymptom[] = [];
+  for (const id of causeIds) {
+    const symptom = byId.get(id);
+    if (!symptom) continue;
+    symptoms.push(
+      removeUndefined({
+        id: symptom.id,
+        detector: symptom.detector,
+        title: symptom.title,
+        attributionConfidence: symptom.attributionConfidence,
+      }) as FixContextCausalSymptom,
+    );
+  }
+  if (symptoms.length === 0) return null;
+
+  return {
+    root: { id: root.id, detector: root.detector, title: root.title },
+    symptoms,
+  };
 }
 
 function resolveSessionDir(
