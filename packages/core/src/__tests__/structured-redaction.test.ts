@@ -717,6 +717,58 @@ describe("keepFields vs the built-in deny rules", () => {
     );
     expect(parsed.password).toMatchObject({ $redacted: "[REDACTED]" });
   });
+
+  // A built-in name token is a substring guess. It may not silently delete a whole structure it
+  // merely shares a syllable with — measured on a real session, a gift-card response rendered as
+  // `{[REDACTED_KEY]:[REDACTED]}` and took the answer with it, while the sibling endpoint reported
+  // the identical number in the clear because it was not nested under a key spelled `card`.
+  describe("a heuristic name match opens a container instead of deleting it", () => {
+    it("keeps business fields nested under a card object", () => {
+      const out = structured(
+        JSON.stringify({ card: { balanceCents: 1250, initialCents: 5000 } }),
+        [],
+      );
+      expect(out.card).toMatchObject({ balanceCents: 1250, initialCents: 5000 });
+    });
+
+    // The load-bearing test. Opening the container costs no protection only if the VALUE rules
+    // still catch what the NAME used to. If this ever fails, the change above must be reverted.
+    it("still redacts a real card number nested under that same object", () => {
+      const out = structured(
+        JSON.stringify({ card: { balanceCents: 1250, number: "4111111111111111" } }),
+        [],
+      );
+      const card = out.card as Record<string, unknown>;
+      expect(card.balanceCents).toBe(1250);
+      expect(card.number).toMatchObject({ $redacted: "[REDACTED]" });
+      expect(JSON.stringify(out)).not.toContain("4111111111111111");
+    });
+
+    it("still redacts a scalar whose own name matches", () => {
+      const out = structured(JSON.stringify({ cardNumber: "4111111111111111" }), []);
+      expect(out.cardNumber).toMatchObject({ $redacted: "[REDACTED]" });
+      expect(JSON.stringify(out)).not.toContain("4111111111111111");
+    });
+
+    // An array carries its own name down to each entry, so a list of card numbers is still a list
+    // of denied scalars.
+    it("still redacts entries of a denied array", () => {
+      const out = structured(JSON.stringify({ cards: ["4111111111111111"] }), []);
+      expect(JSON.stringify(out)).not.toContain("4111111111111111");
+    });
+
+    // The application's own denyFields stays absolute: when the app says a subtree is sensitive,
+    // no heuristic here outranks it.
+    it("keeps an application deny absolute over the whole subtree", () => {
+      const out = structured(
+        JSON.stringify({ wallet: { balanceCents: 1250 } }),
+        [],
+        ["wallet"],
+      );
+      expect(out.wallet).toMatchObject({ $redacted: "[REDACTED]" });
+      expect(JSON.stringify(out)).not.toContain("1250");
+    });
+  });
 });
 
 describe("query parameters answer to the same keep list", () => {
@@ -759,4 +811,5 @@ describe("query parameters answer to the same keep list", () => {
     const parsed = new URLSearchParams(value.split("?")[1]);
     expect(parsed.get("q")).toBe(`O'Brien "x"`);
   });
+
 });
