@@ -1403,7 +1403,11 @@ function isAgentContextError(event: BugEvent): boolean {
  */
 function describeClickIntegrity(event: BugEvent): string | undefined {
   const parts: string[] = [];
-  const box = describeElementBox(event.d.el);
+  // `event.d`, not `event.d.el`: the collector puts the target's rect alongside the descriptor
+  // rather than inside it. Reading the wrong path cost a whole eval batch — the covered element
+  // rendered its box, the target silently did not, and the one fact the case turned on (the
+  // target was full-viewport) was captured and still absent from the bundle.
+  const box = describeElementBox(event.d);
   if (box) parts.push(`target ${box}`);
   const covered = event.d.covered;
   if (Array.isArray(covered) && covered.length > 0) {

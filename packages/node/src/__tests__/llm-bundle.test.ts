@@ -2324,8 +2324,10 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
             tag: "DIV",
             id: "sp-offers-frame",
             path: "div[id=sp-offers-frame]",
-            box: { w: 1512, h: 944, viewportPct: 99 },
           },
+          // Alongside `el`, not inside it — this is the shape the collector actually emits, and
+          // an earlier version of this fixture nested it and so passed against a broken read.
+          box: { w: 1512, h: 944, viewportPct: 99 },
           pos: [258, 353],
           covered: [
             {
