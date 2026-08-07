@@ -105,6 +105,14 @@ export interface LlmBundleFrontendRequestEvidenceSummary {
   sessionId?: string;
   method?: string;
   url?: string;
+  /**
+   * Which GraphQL operation this request carried, when it carried one.
+   *
+   * `POST /graphql` is every request an application makes. Without the operation, a rendered
+   * record shows one endpoint doing everything and a reader cannot tell the checkout mutation
+   * from the search query.
+   */
+  gql?: { op: string; name?: string; batch?: number };
   status?: number;
   durationMs?: number;
   /**
@@ -3088,6 +3096,7 @@ function frontendRequestEvidenceFromIndex(
     sessionId: safeCorrelationId(value.sessionId),
     method: safeText(value.method, 20),
     url: safeUrl(value.url, "index.fullStackRequests.frontend.url"),
+    gql: graphqlIdentityFromIndex(value.gql),
     status: finiteNumber(value.status),
     durationMs: finiteNumber(value.durationMs),
     requestBody: payload?.frontendRequestBody,
@@ -3095,6 +3104,17 @@ function frontendRequestEvidenceFromIndex(
     error: fullStackFrontendErrorFromIndex(value.error),
   });
   return Object.keys(frontend).length > 0 ? frontend : undefined;
+}
+
+function graphqlIdentityFromIndex(
+  value: unknown,
+): LlmBundleFrontendRequestEvidenceSummary["gql"] | undefined {
+  if (!isRecord(value)) return undefined;
+  const op = safeText(value.op, 20);
+  if (!op) return undefined;
+  const name = safeText(value.name, 120);
+  const batch = finiteNumber(value.batch);
+  return removeUndefined({ op, name, batch });
 }
 
 function backendRequestEvidenceFromIndex(
@@ -4369,10 +4389,20 @@ function summarizeFrontendRequestForMarkdown(
   return joinParts([
     frontend.method,
     frontend.url,
+    describeGraphqlOperation(frontend.gql),
     frontend.durationMs !== undefined ? `${frontend.durationMs} ms` : undefined,
     frontend.error?.transport,
     frontend.error?.message,
   ]);
+}
+
+/** `mutation UpdateCart`, `query (2 in batch)`, or nothing at all. */
+function describeGraphqlOperation(
+  gql: LlmBundleFrontendRequestEvidenceSummary["gql"],
+): string | undefined {
+  if (!gql) return undefined;
+  const batch = gql.batch !== undefined ? ` (${gql.batch} in batch)` : "";
+  return `${gql.op}${gql.name ? ` ${gql.name}` : ""}${batch}`;
 }
 
 function summarizeBackendRequestForMarkdown(
