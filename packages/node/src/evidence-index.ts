@@ -9,6 +9,7 @@ import {
 } from "crumbtrail-core";
 import { BROWSER_REDACTION_POLICY, normalizeDbEngine } from "./llm-bundle";
 import { redactedNetworkBodySnippet } from "./network-body";
+import { sanitizeSelector } from "./sanitize-selector";
 import {
   attributeCandidates,
   namesFailureOnGenericPlane,
@@ -641,6 +642,7 @@ export function buildEvidenceCandidates(
   attachDuplicateEffectFrames(events, drafts);
   addLocaleInputCandidates(index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
+  addClickInterceptedCandidates(events, index, drafts);
   addDeclinedPaymentOrderedCandidates(events, index, drafts);
   addCheckoutCorrectnessCandidates(events, index, drafts);
   addDownstreamSucceededAfterTimeoutCandidates(events, index, drafts);
@@ -9045,6 +9047,132 @@ function addRuntimeWarningCandidates(
       // Content signature, not the timestamp: a leak re-warns on every request
       // and has to read as one finding with a count, not as fifty findings.
       dedupeKey: `runtimewarning:${name}:${normalizeErrorSignature(event.d.message)}`,
+    });
+  }
+}
+
+// ─── click_target_intercepted ────────────────────────────────────────────────
+
+/**
+ * High enough to be read, deliberately not high enough to lead.
+ *
+ * A click landing on something other than the control under the cursor is a real
+ * DOM-integrity fact, but on its own it is not a defect: overlays, modals and
+ * consent banners intercept clicks correctly all day. It has to outrank the
+ * ambient session noise a reader skims past and stay under anything that names an
+ * actual fault, so the reader meets it while forming the picture rather than
+ * being told it is the answer.
+ */
+const CLICK_INTERCEPTED_SCORE = 58;
+
+/** How much of the viewport a covering element takes before it is worth saying so. */
+const LARGE_COVER_VIEWPORT_PCT = 50;
+
+/**
+ * click_target_intercepted: the element that received a click was not the element
+ * under the cursor.
+ *
+ * ============================================================================
+ * WHY THIS EXISTS, AND WHY IT WAS NOT BUILT SOONER
+ * ============================================================================
+ *
+ * The collector already captured everything this reads — `covered`, `deep`,
+ * `targetNotInStack`, and the boxes — and the bundle already rendered it into the
+ * timeline. It was deliberately left as a rendered fact rather than a detector,
+ * on the reasoning that a candidate would claim more than the evidence supports.
+ *
+ * Four eval batches disagreed. In every one, a session whose defect WAS an overlay
+ * swallowing the checkout click produced five candidates, none about the click,
+ * and a causal structure headed by an unrelated 401 on an unrelated route. The
+ * decisive fact sat in a timeline table while every ranked signal pointed
+ * somewhere else, and every reader followed the ranked signals. Evidence that is
+ * present but never ranked is, in practice, evidence that is absent.
+ *
+ * ============================================================================
+ * WHAT IT CLAIMS
+ * ============================================================================
+ *
+ * Only what was measured: this click landed somewhere other than where it looked
+ * like it landed. It does NOT claim an overlay caused the bug, does not correlate
+ * against whether a request followed, and does not fire harder when nothing
+ * happened afterwards. Each of those would be a narrower, more confident claim
+ * than the capture supports, and — worse — would silently decline to surface the
+ * fact in every case where the extra condition failed to hold.
+ *
+ * Generic by construction. Nothing here knows what a checkout is: it reads the
+ * hit-test stack the browser reported and says what it said. The same signal
+ * covers consent banners over forms, invisible iframes, stale modals, z-index
+ * regressions, and full-screen ad frames — the same failure wearing different
+ * clothes in every application.
+ */
+function addClickInterceptedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (event.k !== "clk") continue;
+
+    const covered = Array.isArray(event.d.covered) ? event.d.covered : [];
+    const targetNotInStack = event.d.targetNotInStack === true;
+    if (covered.length === 0 && !targetNotInStack) continue;
+
+    const target = isRecord(event.d.el)
+      ? (sanitizeSelector(event.d.el.path) ??
+        sanitizeSelector(event.d.el.sig) ??
+        safeText(event.d.el.tag, 40))
+      : undefined;
+    const beneath = covered.find((entry) => isRecord(entry));
+    const beneathSelector = isRecord(beneath)
+      ? (sanitizeSelector(beneath.path) ??
+        sanitizeSelector(beneath.sig) ??
+        safeText(beneath.tag, 40))
+      : undefined;
+
+    const targetBox = isRecord(event.d.box) ? event.d.box : undefined;
+    const viewportPct = finiteNumber(targetBox?.viewportPct);
+    const dominatesViewport =
+      viewportPct !== undefined && viewportPct >= LARGE_COVER_VIEWPORT_PCT;
+
+    // Stated in the order a reader needs it: what took the click, what was under
+    // it, and — only when measured — how much of the screen the receiver spans.
+    const title = [
+      targetNotInStack
+        ? "Click landed on an element outside its own hit-test stack"
+        : "Click landed on an element covering the control beneath it",
+      target ? `received by ${target}` : undefined,
+      dominatesViewport ? `spanning ${viewportPct}% of the viewport` : undefined,
+      beneathSelector ? `over ${beneathSelector}` : undefined,
+    ]
+      .filter((part): part is string => Boolean(part))
+      .join(", ");
+
+    drafts.push({
+      detector: "click_target_intercepted",
+      title,
+      // `medium` even when the receiver is full-viewport. A bigger covering
+      // element makes the fact more legible, not more certainly a defect.
+      severity: "medium",
+      score: CLICK_INTERCEPTED_SCORE,
+      // The measurement is exact; what it means for the application is not.
+      confidence: dominatesViewport ? "medium" : "low",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        // The element that RECEIVED the click. `anchor.target` is a structured
+        // descriptor rather than a selector string, so the selector belongs here.
+        elementLabel: target,
+        message: beneathSelector
+          ? `covered ${beneathSelector}`
+          : undefined,
+        source: "browser",
+      }),
+      // Per target/covered pair, not per timestamp: a shopper clicking a dead
+      // button four times is one finding, and four identical candidates would
+      // read as four separate defects.
+      dedupeKey: `clickintercepted:${target ?? ""}:${beneathSelector ?? ""}`,
     });
   }
 }
