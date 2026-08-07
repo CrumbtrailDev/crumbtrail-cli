@@ -1403,11 +1403,15 @@ function isAgentContextError(event: BugEvent): boolean {
  */
 function describeClickIntegrity(event: BugEvent): string | undefined {
   const parts: string[] = [];
+  const box = describeElementBox(event.d.el);
+  if (box) parts.push(`target ${box}`);
   const covered = event.d.covered;
   if (Array.isArray(covered) && covered.length > 0) {
     const first = covered.find((entry) => isRecord(entry));
     const selector = isRecord(first) ? interactionIdentifierOf(first) : undefined;
-    if (selector) parts.push(`over ${selector}`);
+    const coveredBox = isRecord(first) ? describeElementBox(first) : undefined;
+    if (selector)
+      parts.push(coveredBox ? `over ${selector} (${coveredBox})` : `over ${selector}`);
     else parts.push(`over ${covered.length} covered element(s)`);
   }
   const deep = event.d.deep;
@@ -1419,6 +1423,27 @@ function describeClickIntegrity(event: BugEvent): string | undefined {
     parts.push("event target was not under the cursor");
   }
   return parts.length > 0 ? parts.join("; ") : undefined;
+}
+
+/**
+ * One element's captured box, as a short phrase.
+ *
+ * Reported as viewport coverage first because that is the fact a reader acts on: a covering
+ * element at 99% of the viewport is an overlay, the same element at 4% is a badge that happens to
+ * sit above a button. Absent for any element captured before geometry was recorded, which must
+ * read as "not captured" rather than as a small element.
+ */
+function describeElementBox(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  const box = value.box;
+  if (!isRecord(box)) return undefined;
+  const w = finiteNumber(box.w);
+  const h = finiteNumber(box.h);
+  const pct = finiteNumber(box.viewportPct);
+  if (w === undefined || h === undefined) return undefined;
+  return pct !== undefined
+    ? `${w}x${h}px, ${pct}% of viewport`
+    : `${w}x${h}px`;
 }
 
 /** The selector for one element descriptor, shared by the click integrity fields and the target. */

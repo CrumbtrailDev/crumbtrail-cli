@@ -2320,10 +2320,19 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
         k: "clk",
         offsetMs: 0,
         d: {
-          el: { tag: "DIV", id: "sp-offers-frame", path: "div[id=sp-offers-frame]" },
+          el: {
+            tag: "DIV",
+            id: "sp-offers-frame",
+            path: "div[id=sp-offers-frame]",
+            box: { w: 1512, h: 944, viewportPct: 99 },
+          },
           pos: [258, 353],
           covered: [
-            { tag: "BUTTON", path: "button[data-testid=cart-checkout]" },
+            {
+              tag: "BUTTON",
+              path: "button[data-testid=cart-checkout]",
+              box: { w: 120, h: 40, viewportPct: 1 },
+            },
             { tag: "SECTION", path: "section[id=cart]" },
           ],
           targetNotInStack: true,
@@ -2347,6 +2356,10 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
     expect(click?.summary).toContain("over ");
     expect(click?.summary).toContain("button");
     expect(click?.summary).toContain("not under the cursor");
+    // Geometry is what makes this read as an overlay rather than as an ordinary ancestor: a
+    // reader given the element stack alone still cannot tell the two apart.
+    expect(click?.summary).toContain("99% of viewport");
+    expect(click?.summary).toContain("1% of viewport");
   });
 
 });
