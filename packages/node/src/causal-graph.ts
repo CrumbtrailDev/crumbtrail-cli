@@ -11,7 +11,7 @@ import {
  * input values never land here.
  */
 
-export const CAUSAL_GRAPH_SCHEMA_VERSION = "causal-graph.v1" as const;
+export const CAUSAL_GRAPH_SCHEMA_VERSION = "causal-graph.v2" as const;
 
 /**
  * 15 node kinds. The last three (`state.diff`, `decision`, `thirdparty.call`) are Phase 2
@@ -71,6 +71,25 @@ export interface CausalGraph {
   schemaVersion: typeof CAUSAL_GRAPH_SCHEMA_VERSION;
   nodes: CausalNode[];
   edges: CausalEdge[];
+  /**
+   * Browser-local request id -> correlation requestId, for the network requests that carried both.
+   *
+   * The browser numbers its own requests 1, 2, 3...; the correlation requestId is the 32-hex value
+   * the backend and the DB plane also stamp. Nodes are built with the correlated id already
+   * substituted (see step 1/2 of {@link buildCausalGraph}), but anything anchored OUTSIDE the graph
+   * — every detector anchor, in practice — carries whichever id its own plane had. A browser-plane
+   * detector therefore anchors on `"9"` while the request's nodes say `"4b7ecf19..."`, the
+   * requestId match in {@link attributeCandidates} finds nothing, and a candidate that names a
+   * contradiction between the screen and the response it came from is reported `isolated`.
+   *
+   * Isolated is not a small error here. It removes the candidate from the incident's thread, so
+   * ranking hands the top slot to whatever session-global detector fired loudest, and the bundle
+   * leads with a finding from a different route than the one the user reported.
+   *
+   * Emitted only when non-empty, and read as a pure lookup: an anchor id present here resolves to
+   * the correlated id, anything else is passed through untouched.
+   */
+  requestIdAliases?: Record<string, string>;
 }
 
 // --- Confidence / window constants -----------------------------------------------------------
@@ -586,7 +605,19 @@ export function buildCausalGraph(input: { events: BugEvent[] }): CausalGraph {
                 : 0,
   );
 
-  return { schemaVersion: CAUSAL_GRAPH_SCHEMA_VERSION, nodes, edges };
+  // Only the aliases that actually differ from the id they map to are worth carrying: an entry
+  // where both sides are equal is a no-op at lookup time and pure payload in the bundle.
+  const requestIdAliases: Record<string, string> = {};
+  for (const [browserId, requestId] of browserIdToRequestId) {
+    if (browserId !== requestId) requestIdAliases[browserId] = requestId;
+  }
+
+  return {
+    schemaVersion: CAUSAL_GRAPH_SCHEMA_VERSION,
+    nodes,
+    edges,
+    ...(Object.keys(requestIdAliases).length > 0 ? { requestIdAliases } : {}),
+  };
 }
 
 function stripDerived(node: DerivedNode): CausalNode {
@@ -885,7 +916,11 @@ function attributeCandidatesInternal(
     anchor: AttributableCandidate["anchor"],
   ): CausalNode | undefined {
     if (!anchor.requestId) return undefined;
-    const matches = nodes.filter((n) => n.requestId === anchor.requestId);
+    // Resolve a browser-local id onto the correlated one before matching. See
+    // `CausalGraph.requestIdAliases` for why an anchor and a node can name the same request with
+    // two different ids, and what it costs when they fail to meet.
+    const wanted = graph.requestIdAliases?.[anchor.requestId] ?? anchor.requestId;
+    const matches = nodes.filter((n) => n.requestId === wanted);
     if (matches.length === 0) return undefined;
     // Kind compatibility, used ONLY to break a tie at equal |delta-t|. A request routinely closes on
     // the same millisecond as its last write, and `backend.req` sorts under `db.write` by id, so the

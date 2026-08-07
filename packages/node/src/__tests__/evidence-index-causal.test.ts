@@ -744,3 +744,60 @@ describe("buildEvidenceCandidates — console_warning must not steal a console.e
     expect(backendRoot.causes ?? []).not.toContain(consoleWarn.id);
   });
 });
+
+// The browser numbers its own requests 1, 2, 3...; the backend and DB planes stamp a correlation
+// requestId. A browser-plane candidate anchors on the former, every node on the latter, and before
+// `requestIdAliases` the identity join between them silently never fired — so a candidate naming a
+// contradiction in a request's own response was reported isolated and dropped out of the incident's
+// thread entirely.
+describe("attributeCandidates — a browser-local anchor id reaches its request", () => {
+  const events: BugEvent[] = [
+    {
+      t: 100,
+      k: "net.req",
+      d: { id: "9", requestId: "corr-abc", url: "https://api.test/gift-cards", m: "GET" },
+    },
+    {
+      t: 200,
+      k: "backend.req.error",
+      d: {
+        requestId: "corr-abc",
+        method: "GET",
+        route: "/gift-cards",
+        statusCode: 500,
+        error: { name: "Error", message: "balance lookup failed" },
+      },
+    },
+    { t: 300, k: "net.res", d: { id: "9", requestId: "corr-abc", st: 500 } },
+  ];
+
+  it("publishes the alias only for ids that actually differ", () => {
+    const graph = buildCausalGraph({ events });
+    expect(graph.requestIdAliases).toEqual({ "9": "corr-abc" });
+  });
+
+  it("attributes a candidate anchored on the browser id instead of isolating it", () => {
+    const graph = buildCausalGraph({ events });
+    const attribution = attributeCandidates(
+      graph,
+      [
+        { id: "backend", anchor: { t: 200, requestId: "corr-abc" } },
+        { id: "browser", anchor: { t: 300, requestId: "9" } },
+      ],
+      (id) => (id === "backend" ? "backend_http_server_error" : "http_error"),
+    );
+    expect(attribution.get("browser")?.causalRole).not.toBe("isolated");
+  });
+
+  // The resolver is a lookup, not a rewrite: an id the graph has no alias for has to reach the
+  // requestId match unchanged, or a backend-plane anchor (already correlated) would stop matching.
+  it("leaves an id with no alias untouched", () => {
+    const graph = buildCausalGraph({ events });
+    const attribution = attributeCandidates(
+      graph,
+      [{ id: "backend", anchor: { t: 200, requestId: "corr-abc" } }],
+      () => "backend_http_server_error",
+    );
+    expect(attribution.get("backend")?.causalRole).not.toBe("isolated");
+  });
+});
