@@ -63,12 +63,49 @@ const MAX_COVERED_ELEMENTS = 3;
  * Both are best-effort and silent on failure: interaction capture must survive a
  * page that has replaced `elementsFromPoint` or throws inside a getter.
  */
+/**
+ * The clicked element's box, as whole-pixel viewport coverage.
+ *
+ * Geometry is what separates "a div was over the button" from "a full-viewport div was over the
+ * button", and only the second reads as an overlay swallowing the click. A bundle carrying the
+ * element stack without it describes the right elements and still leaves the defect arguable.
+ *
+ * Safe to carry unconditionally, and worth stating why: a bounding rect is measurement, not
+ * content. No text, no attribute values, nothing the user typed — so unlike selectors it needs no
+ * redaction pass and cannot leak by carrying a value someone interpolated into the DOM.
+ *
+ * Rounded to whole pixels and expressed as a percentage of the viewport rather than raw CSS
+ * pixels, because "covers 99% of the viewport" transfers across devices and `1512x944` does not.
+ */
+function describeElementBox(element: Element): Record<string, unknown> | undefined {
+  try {
+    const rect = element.getBoundingClientRect?.();
+    if (!rect) return undefined;
+    const w = Math.round(rect.width);
+    const h = Math.round(rect.height);
+    if (!Number.isFinite(w) || !Number.isFinite(h)) return undefined;
+    const vw = window.innerWidth || 0;
+    const vh = window.innerHeight || 0;
+    const box: Record<string, unknown> = { w, h };
+    if (vw > 0 && vh > 0) {
+      box.viewportPct = Math.min(100, Math.round(((w * h) / (vw * vh)) * 100));
+    }
+    return box;
+  } catch {
+    // A detached or cross-origin element does not cost us the click.
+    return undefined;
+  }
+}
+
 function describeClickIntegrity(
   event: MouseEvent,
   target: Element,
   config: CrumbtrailConfig,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
+
+  const box = describeElementBox(target);
+  if (box) out.box = box;
 
   try {
     const path = event.composedPath?.();
@@ -97,7 +134,13 @@ function describeClickIntegrity(
         .filter((element): element is Element => element instanceof Element)
         .filter((element) => !isBlocked(element))
         .slice(0, MAX_COVERED_ELEMENTS)
-        .map((element) => describeInteractionTarget(element, config));
+        .map((element) => {
+          const descriptor = describeInteractionTarget(element, config);
+          const elementBox = describeElementBox(element);
+          // The box belongs on the covering element as much as on the target: which of the two is
+          // viewport-sized is exactly what distinguishes an overlay from an ordinary ancestor.
+          return elementBox ? { ...descriptor, box: elementBox } : descriptor;
+        });
       if (covered.length > 0) {
         out.covered = covered;
         // Stated rather than left to be re-derived downstream. Whether the

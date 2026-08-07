@@ -181,4 +181,57 @@ describe("interactionCollector redaction", () => {
 
     cleanup();
   });
+  // Geometry, not identity. The element stack alone cannot distinguish an overlay swallowing a
+  // click from an ordinary ancestor sitting above a button; the size is what settles it. jsdom
+  // does no layout, so both rects are stubbed — this asserts the capture and the arithmetic, not
+  // a browser's measurement.
+  it("captures the clicked element's viewport coverage", () => {
+    const { events, bus, cleanup } = collect();
+    bus.flush();
+    events.length = 0;
+
+    const overlay = document.createElement("div");
+    overlay.id = "sp-offers-frame";
+    document.body.appendChild(overlay);
+    overlay.getBoundingClientRect = () =>
+      ({ width: window.innerWidth, height: window.innerHeight }) as DOMRect;
+
+    overlay.dispatchEvent(
+      new MouseEvent("click", { bubbles: true, clientX: 5, clientY: 5 }),
+    );
+    bus.flush();
+
+    const clickEvent = events.find((event) => event.k === "clk");
+    expect(clickEvent?.d.box).toMatchObject({
+      w: window.innerWidth,
+      h: window.innerHeight,
+      viewportPct: 100,
+    });
+
+    cleanup();
+  });
+
+  // A rect that cannot be read must leave the field absent, never present a zero — "not measured"
+  // and "measured as nothing" are opposite conclusions about an overlay.
+  it("omits the box when the rect cannot be read", () => {
+    const { events, bus, cleanup } = collect();
+    bus.flush();
+    events.length = 0;
+
+    const button = document.createElement("button");
+    document.body.appendChild(button);
+    button.getBoundingClientRect = () => {
+      throw new Error("detached");
+    };
+
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    bus.flush();
+
+    const clickEvent = events.find((event) => event.k === "clk");
+    expect(clickEvent).toBeDefined();
+    expect(clickEvent?.d.box).toBeUndefined();
+
+    cleanup();
+  });
+
 });
