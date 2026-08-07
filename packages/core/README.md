@@ -175,6 +175,20 @@ path, so a truncated list is never mistaken for a short one. Anything else,
 including non JSON and oversized responses, carries the content type and byte
 size only.
 
+### Form-shaped request bodies
+
+`fetch(url, { body: new URLSearchParams(form) })` and `body: new FormData(form)`
+are how a form submission is normally written, and both used to be discarded
+whole as non-text. Every field the user filled in went missing from the capture
+because of the container it arrived in.
+
+Both are now read without consuming them, and the same body redaction runs over
+the result. A `FormData` is rendered as a JSON object keyed by field name, so a
+repeated field becomes an array. File parts are described, never read: the form
+field name survives as the key and the part reports `{ file: true, bytes }`. The
+file's own name and MIME type are free text and answer to the same value rules as
+any other string in a body.
+
 ### GraphQL operation identity (`net.req d.gql`)
 
 Every GraphQL request in an application goes to the same URL, so a record keyed

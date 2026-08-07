@@ -314,7 +314,56 @@ function extractRequestBody(
     init?.body ?? (input instanceof Request ? input.body : undefined);
   if (body == null) return { nonText: false };
   if (typeof body === "string") return { body, nonText: false };
+  const readable = readStructuredBody(body);
+  if (readable !== undefined) return { body: readable, nonText: false };
   return { nonText: true };
+}
+
+/**
+ * Bodies that are not strings but are still readable text.
+ *
+ * `fetch(url, { body: new URLSearchParams(form) })` and `body: new FormData(form)` are how a form
+ * submission is normally written, and both were discarded whole as "non-text". Every field a user
+ * filled in - the quantity that was wrong, the address that was rejected, the id of the record
+ * being edited - went missing from the capture for no reason other than the container it arrived
+ * in. Both are read without consuming them, and the same body redaction runs over the result.
+ *
+ * File parts are described, never read. The form FIELD name survives as the JSON key, which is the
+ * part that matters - a reader needs to know the upload was attached to `invoice`, not what the
+ * document said. The file's own name and MIME type are free text and answer to the same value rules
+ * as any other string in a body, which redact them; only the byte count is kept, because a size is
+ * shape and not content.
+ */
+function readStructuredBody(body: unknown): string | undefined {
+  try {
+    if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+      return body.toString();
+    }
+    if (typeof FormData !== "undefined" && body instanceof FormData) {
+      const fields: Record<string, unknown> = {};
+      for (const [key, value] of body.entries()) {
+        const described =
+          typeof value === "string"
+            ? value
+            : describeFilePart(value as { size?: number });
+        const existing = fields[key];
+        if (existing === undefined) fields[key] = described;
+        else if (Array.isArray(existing)) existing.push(described);
+        else fields[key] = [existing, described];
+      }
+      return JSON.stringify(fields);
+    }
+  } catch {
+    // An exotic host implementation is reported as non-text, exactly as before.
+  }
+  return undefined;
+}
+
+function describeFilePart(file: { size?: number }): Record<string, unknown> {
+  return {
+    file: true,
+    ...(typeof file.size === "number" ? { bytes: file.size } : {}),
+  };
 }
 
 function getHeaderValue(
@@ -846,15 +895,23 @@ function wrapXHR(
       reqMetadata.push(headersResult.metadata);
     }
 
-    if (body != null && typeof body === "string") {
-      const bodyResult = redactNetworkTextBody(body, {
+    // Same reading as the fetch path: a form submission sent as FormData or URLSearchParams is
+    // text, and discarding it loses every field the user filled in.
+    const readableBody =
+      body == null
+        ? undefined
+        : typeof body === "string"
+          ? body
+          : readStructuredBody(body);
+    if (readableBody !== undefined) {
+      const bodyResult = redactNetworkTextBody(readableBody, {
         contentType: getHeaderValue(meta.requestHeaders, "content-type"),
         maxLength: config.networkMaxBodySize,
         path: "body",
         ...bodyRedactionOptions(config),
       });
       applyBodyResult(reqData, bodyResult);
-      applyGraphqlIdentity(reqData, body);
+      applyGraphqlIdentity(reqData, readableBody);
       reqMetadata.push(bodyResult.metadata);
     } else if (body != null) {
       const bodyResult = summarizeOmittedPayload(
