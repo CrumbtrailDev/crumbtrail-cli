@@ -114,4 +114,45 @@ describe("job_did_not_complete", () => {
       candidates.find((c) => c.detector === "job_did_not_complete"),
     ).toBeUndefined();
   });
+
+  // A finding that reports `isolated` drops out of the incident thread and leaves the causal chain
+  // null, which is the failure this repository has already paid for once with click_target_intercepted.
+  it("threads the finding to the request that enqueued the job", async () => {
+    const candidates = await candidatesFor([
+      {
+        t: startedAt,
+        k: "clk",
+        d: { el: { sig: "place-order", path: "button[data-testid='place-order']" } },
+      },
+      {
+        t: startedAt + 50,
+        k: "net.req",
+        d: { id: 1, requestId: "r-order", m: "POST", url: "https://app.test/api/orders" },
+      },
+      {
+        t: startedAt + 150,
+        k: "net.res",
+        d: { id: 1, requestId: "r-order", st: 200 },
+      },
+      {
+        t: startedAt + 400,
+        k: "backend.job.start",
+        d: { job: "record-payment", jobId: "j9", requestId: "r-order" },
+      },
+      {
+        t: startedAt + 900,
+        k: "backend.job.error",
+        d: {
+          job: "record-payment",
+          jobId: "j9",
+          requestId: "r-order",
+          outcome: "failure",
+          error: { name: "TypeError", message: "order not found" },
+        },
+      },
+    ]);
+
+    const found = candidates.find((c) => c.detector === "job_did_not_complete");
+    expect(found?.causalRole).not.toBe("isolated");
+  });
 });
