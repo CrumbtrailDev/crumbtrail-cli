@@ -618,6 +618,10 @@ function wrapFetch(
       pending.delete(id);
     }
     const dur = now() - startTime;
+    // Stamped when the response ARRIVED, not when its body finished. A streaming response can stay
+    // open for minutes, and dating the event at the close would put it after everything the stream
+    // caused - the timeline would report the effects before the cause.
+    const responseTime = now();
 
     const resMetadata: Array<RedactionMetadata | undefined> = [];
     const resData: Record<string, unknown> = { id, st: response.status, dur };
@@ -663,7 +667,19 @@ function wrapFetch(
         // clone() leaves the app's stream untouched — the page still reads the
         // response itself.
         const cloned = response.clone();
-        const text = await cloned.text();
+        const read = await readBoundedText(
+          cloned,
+          config.networkMaxBodySize,
+          STREAM_READ_BUDGET_MS,
+        );
+        const text = read.text;
+        if (read.openStream) {
+          // The stream outlived the read budget. Before this, `await cloned.text()` waited for a
+          // stream that may never end, and `net.res` was therefore never emitted at all: a request
+          // that streamed - progress, tokens, a log tail, an export - left a `net.req` with no
+          // response beside it, which reads as a request that never came back.
+          resData.streaming = true;
+        }
         if (text) {
           const bodyResult = redactNetworkTextBody(text, {
             contentType,
@@ -708,10 +724,96 @@ function wrapFetch(
 
     attachRedactionMetadata(resData, ...resMetadata);
 
-    bus.emit({ t: now(), k: "net.res", d: resData });
+    bus.emit({ t: responseTime, k: "net.res", d: resData });
 
     return response;
   };
+}
+
+/**
+ * How long the collector will wait for a response body before reporting what it has.
+ *
+ * A streaming response is a normal thing - progress updates, model tokens, a log tail, a large
+ * export - and `Response.text()` on one resolves when the stream CLOSES, which may be never. The
+ * old code awaited that before emitting `net.res`, so a streamed request was recorded as a request
+ * that never came back.
+ */
+const STREAM_READ_BUDGET_MS = 2_000;
+
+/**
+ * Read a cloned response body, bounded by bytes and by time.
+ *
+ * Returns whatever arrived inside the budget. `openStream` says the body had not finished, which is
+ * a fact about the response worth recording on its own: it distinguishes "the server sent this and
+ * stopped" from "the server is still sending".
+ *
+ * The clone is cancelled on the way out. The application's own copy is untouched either way.
+ */
+async function readBoundedText(
+  cloned: Response,
+  maxBytes: number,
+  budgetMs: number,
+): Promise<{ text: string; openStream: boolean }> {
+  const body = cloned.body;
+  // No readable stream to walk (older hosts, or a synthetic Response): read the whole thing, but
+  // still under the budget. `text()` on an open stream never resolves, and a host that hides the
+  // stream from us hides the timeout from us too unless the race is here as well.
+  if (!body || typeof body.getReader !== "function") {
+    const whole = await Promise.race([
+      cloned.text().then((text) => ({ text, openStream: false })),
+      new Promise<{ text: string; openStream: boolean }>((resolve) =>
+        setTimeout(() => resolve({ text: "", openStream: true }), budgetMs),
+      ),
+    ]);
+    // Let go of the clone so the buffered copy is not held open behind us. Not awaited, for the
+    // same reason as above.
+    if (whole.openStream) {
+      void Promise.resolve(cloned.body?.cancel()).catch(() => {});
+    }
+    return whole;
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const deadline = now() + budgetMs;
+  let text = "";
+  let openStream = false;
+
+  try {
+    for (;;) {
+      const remaining = deadline - now();
+      if (remaining <= 0) {
+        openStream = true;
+        break;
+      }
+      const step = await Promise.race([
+        reader.read(),
+        new Promise<"timeout">((resolve) =>
+          setTimeout(() => resolve("timeout"), remaining),
+        ),
+      ]);
+      if (step === "timeout") {
+        openStream = true;
+        break;
+      }
+      if (step.done) break;
+      text += decoder.decode(step.value, { stream: true });
+      if (text.length >= maxBytes) {
+        // Enough for the record. Whether more was coming is unknowable from here without waiting
+        // for it, which is the cost this bound exists to avoid.
+        openStream = true;
+        break;
+      }
+    }
+    if (!openStream) text += decoder.decode();
+  } finally {
+    // NOT awaited. `cancel()` on a reader with a `read()` still outstanding never settles - the
+    // very case this function exists to survive - so awaiting it reintroduces the hang one layer
+    // down. Fire it and walk away; the application's own copy is unaffected either way.
+    void Promise.resolve(reader.cancel()).catch(() => {});
+  }
+
+  return { text, openStream };
 }
 
 /* ------------------------------------------------------------------ */

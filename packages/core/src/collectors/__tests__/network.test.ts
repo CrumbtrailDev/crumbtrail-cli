@@ -213,3 +213,67 @@ describe('networkCollector – form-shaped request bodies', () => {
     expect(reqEvent().d.body).not.toBe('[1,2,3]');
   });
 });
+
+/**
+ * `Response.text()` resolves when the stream CLOSES, which for a streaming response may be never.
+ * The collector awaited that before emitting `net.res`, so a streamed request - progress updates,
+ * model tokens, a log tail, a large export - was recorded as a request that never came back.
+ */
+describe('networkCollector – streaming responses', () => {
+  let bus: EventBus;
+  let events: BugEvent[];
+  let cleanup: () => void;
+
+  beforeEach(() => {
+    bus = new EventBus();
+    events = [];
+    bus.subscribe((batch) => events.push(...batch));
+  });
+
+  afterEach(() => {
+    cleanup?.();
+    events = [];
+  });
+
+  function resEvents() {
+    bus.flush();
+    return events.filter((e) => e.k === 'net.res');
+  }
+
+  /** A body that emits one chunk and then stays open forever. */
+  function openStreamResponse(first: string) {
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(first));
+          // Deliberately never closed.
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/x-ndjson' } },
+    );
+  }
+
+  it('reports a response whose body is still open, with what arrived so far', { timeout: 20_000 }, async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(openStreamResponse('{"tick":1}\n'));
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    await globalThis.fetch('https://api.example.com/stream');
+    const [res] = resEvents();
+
+    expect(res).toBeDefined();
+    expect(res.d.st).toBe(200);
+    expect(res.d.streaming).toBe(true);
+    expect(String(res.d.body)).toContain('tick');
+  });
+
+  it('does not mark an ordinary response as streaming', async () => {
+    globalThis.fetch = makeFetchMock('{"done":true}');
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    await globalThis.fetch('https://api.example.com/once');
+    const [res] = resEvents();
+
+    expect(res.d.streaming).toBeUndefined();
+    expect(res.d.body).toBe('{"done":true}');
+  });
+});

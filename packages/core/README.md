@@ -175,6 +175,20 @@ path, so a truncated list is never mistaken for a short one. Anything else,
 including non JSON and oversized responses, carries the content type and byte
 size only.
 
+### Streaming responses
+
+`Response.text()` resolves when the stream closes, which for a streaming response
+may be never. The collector used to await that before emitting `net.res`, so a
+streamed request - progress updates, model tokens, a log tail, a large export -
+was recorded as a request that never came back.
+
+The response body is now read under a budget: 2 seconds, or
+`networkMaxBodySize`, whichever comes first. Whatever arrived inside the budget
+is captured, and `net.res` carries `streaming: true` when the body had not
+finished. The event is timestamped when the response ARRIVED rather than when its
+body ended, so a long stream cannot push its own event past the effects it
+caused.
+
 ### Worker traffic (`worker.msg`)
 
 The `workers` collector is **on by default**. A worker is a second program with
