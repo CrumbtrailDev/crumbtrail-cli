@@ -1585,6 +1585,59 @@ function fieldNameWords(name: string): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Did the APPLICATION deny this name, as opposed to a built-in heuristic matching it?
+ *
+ * The distinction decides whether a container is opened. `denyFields` is the strongest statement
+ * an application can make about its own schema and is honoured absolutely, subtree and all. The
+ * built-in tokens are substring guesses over field names, and a guess should not silently delete a
+ * structure it merely shares a syllable with.
+ */
+function isApplicationDeniedName(
+  name: string | undefined,
+  denyFields?: string[],
+): boolean {
+  if (!name || !denyFields || denyFields.length === 0) return false;
+  const compact = compactFieldName(name);
+  return denyFields.some((deny) => {
+    const denyCompact = compactFieldName(deny);
+    return denyCompact.length > 0 && compact.includes(denyCompact);
+  });
+}
+
+/**
+ * Built-in name tokens that name a business OBJECT rather than a secret.
+ *
+ * The rest of `STRUCTURED_DENY_NAME_TOKENS` name the sensitive thing itself: everything under a key
+ * called `auth`, `password`, `secret`, `cvv` or `ssn` is that secret, so dropping the whole subtree
+ * loses nothing. These two do not. A gift card, a loyalty card, a customer account are ordinary
+ * records that may merely CONTAIN a sensitive scalar, and their other fields are often the whole
+ * subject of a bug report.
+ *
+ * Kept deliberately short. Every addition trades a real class of evidence for a name-shaped guess,
+ * so a token belongs here only once a measured capture shows the guess destroying the answer.
+ */
+const STRUCTURED_OPENABLE_NAME_TOKENS = new Set(["card", "account"]);
+
+/**
+ * May a CONTAINER under this name be walked into rather than dropped whole?
+ *
+ * True only when every built-in token the name matched is an object-naming one. `cardToken` matches
+ * both `card` and `token`, so it stays closed; `giftCard` matches only `card`, so its leaves are
+ * classified individually. Names the application itself denied never reach here.
+ */
+function isOpenableHeuristicName(name: string | undefined): boolean {
+  if (!name) return false;
+  if (fieldNameWords(name).some((word) => STRUCTURED_DENY_WORD_RE.test(word)))
+    return false;
+  const compact = compactFieldName(name);
+  const matched = STRUCTURED_DENY_NAME_TOKENS.filter((token) =>
+    compact.includes(token),
+  );
+  if (matched.length === 0) return false;
+  return matched.every((token) => STRUCTURED_OPENABLE_NAME_TOKENS.has(token));
+}
+
 function isStructuredDenyName(
   name: string | undefined,
   denyFields?: string[],
@@ -1909,10 +1962,37 @@ function redactStructuredJsonValue(
   // Already redacted by an earlier pass. Re-wrapping it would replace the
   // original value's shape facts with the placeholder's own.
   if (isRedactedPlaceholder(value)) return value;
-  // A deny-listed field name redacts its entire subtree, whatever the type.
+  // A deny-listed field name redacts its entire subtree, with one narrow exception: a CONTAINER
+  // matched only by an object-naming built-in token is walked into instead.
+  //
+  // The built-in name tokens are substrings, and `card` is one of them. A gift-card object, a
+  // loyalty-card object, a card-layout config: all match, and all had their whole contents replaced
+  // by a shape placeholder because of the key they hang from. Measured on a real session, the
+  // response that decided the defect rendered as `{[REDACTED_KEY]:[REDACTED]}` while the sibling
+  // `/history` endpoint reported the identical number in the clear — it simply was not nested under
+  // a key spelled `card`. The redaction was not protecting anything there; it was deleting the
+  // answer.
+  //
+  // Opening the container costs no protection, because a name is not the only defence and never was:
+  // every leaf is still classified by its OWN name and, behind that, by its VALUE. A real PAN at
+  // `card.number` is caught by the Luhn digit-run check; a token, JWT, email or high-entropy secret
+  // by their own value rules. That is the same reasoning the `keepFields` escape hatch already
+  // relies on — see `isStructuredDenyName`, which documents that every value-based check still runs
+  // behind a kept name.
+  //
+  // An application's own `denyFields` keeps the old absolute behaviour. When the app says a subtree
+  // is sensitive, that is a statement about its data that no heuristic here can outrank.
+  const isContainer =
+    Array.isArray(value) || (value !== null && typeof value === "object");
   if (isStructuredDenyName(keyName, policy.denyFields, policy.keepFields)) {
-    fields.push({ path, reason: "deny_field", action: "redacted" });
-    return redactedShapePlaceholder(value);
+    const openable =
+      isContainer &&
+      !isApplicationDeniedName(keyName, policy.denyFields) &&
+      isOpenableHeuristicName(keyName);
+    if (!openable) {
+      fields.push({ path, reason: "deny_field", action: "redacted" });
+      return redactedShapePlaceholder(value);
+    }
   }
 
   if (Array.isArray(value)) {
