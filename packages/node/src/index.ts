@@ -153,6 +153,9 @@ export {
   buildBackendRequestStartEvent,
   buildBackendRequestEndEvent,
   buildBackendRequestErrorEvent,
+  buildBackendJobStartEvent,
+  buildBackendJobEndEvent,
+  buildBackendJobErrorEvent,
   resolveBackendRequestCorrelation,
 } from "./backend-events";
 export type {
@@ -161,6 +164,9 @@ export type {
   BackendRequestErrorEventInput,
   BackendRequestCorrelation,
   BackendRequestHeaders,
+  BackendJobEventInput,
+  BackendJobEndEventInput,
+  BackendJobErrorEventInput,
 } from "./backend-events";
 export { buildLlmBundle, writeLlmBundle } from "./llm-bundle";
 export type {

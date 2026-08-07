@@ -816,6 +816,11 @@ const IMPORTANT_EVENT_KINDS = new Set([
   // Worker traffic. A worker is a second program this SDK cannot see inside, and its message
   // protocol is the only account of what it was asked to do and what it answered.
   "worker.msg",
+  // Work outside a request. The request succeeded and the user saw a confirmation; whether the job
+  // that confirmation promised ever ran is a separate fact, and often the whole defect.
+  "backend.job.start",
+  "backend.job.end",
+  "backend.job.error",
 ]);
 
 // Writes through the SessionStore seam, not fs: llm.md/llm.json are finalize-time
@@ -1539,6 +1544,34 @@ function describeStreamEvent(event: BugEvent): string | undefined {
   ]);
 }
 
+/**
+ * One line for a background job.
+ *
+ * `skipped` is printed as its own word rather than folded into an outcome, because a job that
+ * decided there was nothing to do is the exact shape of work that was promised and never happened.
+ */
+function describeJobEvent(event: BugEvent): string | undefined {
+  const d = event.d;
+  const name = safeText(d.job, 160) ?? "job";
+  const phase = event.k === "backend.job.start" ? "started" : undefined;
+  const outcome = safeText(d.outcome, 20);
+  const duration = finiteNumber(d.durationMs);
+  const attempt = finiteNumber(d.attempt);
+  const error = isRecord(d.error)
+    ? joinParts([safeText(d.error.name, 120), safeText(d.error.message, 300)])
+    : undefined;
+
+  return joinParts([
+    `job ${name}`,
+    phase ?? outcome ?? (event.k === "backend.job.error" ? "failed" : undefined),
+    safeText(d.queue, 160),
+    attempt !== undefined && attempt > 1 ? `attempt ${attempt}` : undefined,
+    duration !== undefined ? `${duration} ms` : undefined,
+    error,
+    safeText(d.result, 300),
+  ]);
+}
+
 /** One line for a worker's lifecycle or one message of its protocol. */
 function describeWorkerEvent(event: BugEvent): string | undefined {
   const d = event.d;
@@ -1667,6 +1700,10 @@ function summarizeEvent(
 
   if (event.k === "net.sse" || event.k === "net.ws") {
     return describeStreamEvent(event);
+  }
+
+  if (event.k.startsWith("backend.job.")) {
+    return describeJobEvent(event);
   }
 
   if (event.k === "worker.msg") {
