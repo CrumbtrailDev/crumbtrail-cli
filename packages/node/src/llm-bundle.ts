@@ -813,6 +813,9 @@ const IMPORTANT_EVENT_KINDS = new Set([
   // reads as "no traffic explains this", which for a socket-driven application is false.
   "net.sse",
   "net.ws",
+  // Worker traffic. A worker is a second program this SDK cannot see inside, and its message
+  // protocol is the only account of what it was asked to do and what it answered.
+  "worker.msg",
 ]);
 
 // Writes through the SessionStore seam, not fs: llm.md/llm.json are finalize-time
@@ -1536,6 +1539,33 @@ function describeStreamEvent(event: BugEvent): string | undefined {
   ]);
 }
 
+/** One line for a worker's lifecycle or one message of its protocol. */
+function describeWorkerEvent(event: BugEvent): string | undefined {
+  const d = event.d;
+  const op = safeText(d.op, 20);
+  const script = safeUrl(d.script, "event.worker.msg.script");
+  if (!op) return undefined;
+
+  if (op === "start") return joinParts(["worker started", script]);
+  if (op === "error") {
+    return joinParts([
+      "worker error",
+      script,
+      safeText(d.msg, 300),
+      "the page's own error handlers never saw this",
+    ]);
+  }
+  if (op === "post" || op === "recv") {
+    const direction = op === "post" ? "sent to worker" : "received from worker";
+    return joinParts([
+      `worker message ${direction}`,
+      script,
+      d.opaque === true ? "opaque payload" : safeText(d.body, 400),
+    ]);
+  }
+  return undefined;
+}
+
 function summarizeEvent(
   event: BugEvent,
   index: SessionIndexLike,
@@ -1637,6 +1667,10 @@ function summarizeEvent(
 
   if (event.k === "net.sse" || event.k === "net.ws") {
     return describeStreamEvent(event);
+  }
+
+  if (event.k === "worker.msg") {
+    return describeWorkerEvent(event);
   }
 
   if (event.k === "err" || event.k === "rej") {

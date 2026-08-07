@@ -59,6 +59,7 @@ import { uiNumbersCollector } from "./collectors/ui-numbers";
 import { listenerCollector } from "./collectors/listeners";
 import { eventSourceCollector } from "./collectors/eventsource";
 import { webSocketCollector } from "./collectors/websocket";
+import { workerCollector } from "./collectors/worker";
 import { environmentCollector, buildEnvDelta } from "./collectors/environment";
 import type { EnvDeclaration } from "./types";
 import {
@@ -101,6 +102,7 @@ const COLLECTOR_MAP: Record<string, Collector> = {
   listeners: listenerCollector,
   eventSource: eventSourceCollector,
   webSocket: webSocketCollector,
+  workers: workerCollector,
 };
 
 const DEFAULT_CONFIG_POLL_INTERVAL_MS = 60_000;
