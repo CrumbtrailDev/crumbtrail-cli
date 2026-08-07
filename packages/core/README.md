@@ -175,6 +175,20 @@ path, so a truncated list is never mistaken for a short one. Anything else,
 including non JSON and oversized responses, carries the content type and byte
 size only.
 
+### GraphQL operation identity (`net.req d.gql`)
+
+Every GraphQL request in an application goes to the same URL, so a record keyed
+on method and path reports one endpoint doing everything. When a request body
+parses as GraphQL, `net.req` carries `d.gql` with `op` (`query`, `mutation`,
+`subscription`, or `unknown` for a persisted query that sent no document),
+`name` when the document or the request names one, and `batch` when the request
+carried several operations.
+
+Only the operation name and type are read. Both are code, identical for every
+user. Variables are never inspected here: they carry user input, and the body
+redaction that runs over them is the only thing entitled to decide what
+survives.
+
 ### Server-sent events (`net.sse`)
 
 The `eventSource` collector wraps the `EventSource` constructor and emits

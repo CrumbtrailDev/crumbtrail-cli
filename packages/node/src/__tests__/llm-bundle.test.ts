@@ -2478,4 +2478,57 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
     expect(markdown).toContain("unclean");
   });
 
+
+  // Every GraphQL request in an application goes to one URL, so a record keyed on method and path
+  // reports the checkout mutation, the order list and the search box as the same endpoint.
+  it("tells one GraphQL operation from another in the rendered record", async () => {
+    const events: BugEvent[] = [
+      {
+        t: 1_700_000_700_000,
+        k: "net.req",
+        offsetMs: 0,
+        d: {
+          id: 3,
+          requestId: "g3",
+          sessionId: "s1",
+          m: "POST",
+          url: "https://api.test/graphql",
+          gql: { op: "mutation", name: "UpdateCart" },
+        },
+      },
+      {
+        t: 1_700_000_700_050,
+        k: "backend.req.start",
+        offsetMs: 50,
+        d: { requestId: "g3", sessionId: "s1", method: "POST", route: "/graphql" },
+      },
+      {
+        t: 1_700_000_700_100,
+        k: "backend.req.end",
+        offsetMs: 100,
+        d: {
+          requestId: "g3",
+          sessionId: "s1",
+          method: "POST",
+          route: "/graphql",
+          statusCode: 200,
+        },
+      },
+      {
+        t: 1_700_000_700_120,
+        k: "net.res",
+        offsetMs: 120,
+        d: { id: 3, requestId: "g3", sessionId: "s1", st: 200 },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await postProcess(tmpDir);
+    const markdown = fs.readFileSync(path.join(tmpDir, "llm.md"), "utf-8");
+
+    expect(markdown).toContain("mutation UpdateCart");
+  });
+
 });

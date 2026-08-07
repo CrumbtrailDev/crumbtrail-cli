@@ -1,3 +1,4 @@
+import { applyGraphqlIdentity } from "../graphql";
 import type { EventBus } from "../event-bus";
 import type {
   CrumbtrailConfig,
@@ -525,6 +526,7 @@ function wrapFetch(
         ...bodyRedactionOptions(config),
       });
       applyBodyResult(reqData, bodyResult);
+      applyGraphqlIdentity(reqData, requestBody.body);
       reqMetadata.push(bodyResult.metadata);
     } else if (requestBody.nonText) {
       const bodyResult = summarizeOmittedPayload(
@@ -852,6 +854,7 @@ function wrapXHR(
         ...bodyRedactionOptions(config),
       });
       applyBodyResult(reqData, bodyResult);
+      applyGraphqlIdentity(reqData, body);
       reqMetadata.push(bodyResult.metadata);
     } else if (body != null) {
       const bodyResult = summarizeOmittedPayload(
@@ -1056,6 +1059,7 @@ function emitEarlyRecord(
       ...bodyRedactionOptions(config),
     });
     applyBodyResult(reqData, bodyResult);
+    applyGraphqlIdentity(reqData, record.reqBody);
     reqMetadata.push(bodyResult.metadata);
   }
 

@@ -122,6 +122,14 @@ interface FrontendRequestEvidence {
   sessionId?: string;
   method?: string;
   url?: string;
+  /**
+   * Which GraphQL operation this request carried, when it carried one.
+   *
+   * Every GraphQL request in an application shares one URL, so `POST /graphql` is the checkout
+   * mutation, the order list and the search box reported as the same endpoint. The operation is
+   * the only thing that tells them apart in a rendered record.
+   */
+  gql?: { op: string; name?: string; batch?: number };
   status?: number;
   durationMs?: number;
   error?: {
@@ -1314,10 +1322,24 @@ function summarizeFrontendRequest(
         entry.err?.d.m,
     ),
     url: safeUrl(entry.req?.d.url ?? entry.err?.d.url),
+    gql: graphqlIdentityOf(entry.req),
     status: responseStatus,
     durationMs: responseDuration,
     error: Object.keys(error).length > 0 ? error : undefined,
   });
+}
+
+/** The operation identity the collector stamped, re-validated rather than trusted. */
+function graphqlIdentityOf(
+  event: BugEvent | undefined,
+): FrontendRequestEvidence["gql"] | undefined {
+  const value = event?.d.gql;
+  if (!isRecord(value)) return undefined;
+  const op = safeLabel(value.op);
+  if (!op) return undefined;
+  const name = safeLabel(value.name);
+  const batch = finiteNumber(value.batch);
+  return removeUndefined({ op, name, batch });
 }
 
 function mergeBackendEvent(
