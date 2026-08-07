@@ -2580,4 +2580,54 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
     expect(markdown).toContain("pricing table missing");
   });
 
+
+  // The server's own copy of a response, and the line that produced it, were captured and never
+  // printed. Measured: readers asked for "the backend checkout response" and "the calculation
+  // trace" of a request the table one line above already listed.
+  it("prints the server's response and the line that produced it", async () => {
+    const events: BugEvent[] = [
+      {
+        t: 1_700_000_900_000,
+        k: "net.req",
+        offsetMs: 0,
+        d: { id: 9, requestId: "r9", sessionId: "s1", m: "POST", url: "https://api.test/checkout" },
+      },
+      {
+        t: 1_700_000_900_050,
+        k: "backend.req.start",
+        offsetMs: 50,
+        d: { requestId: "r9", sessionId: "s1", method: "POST", route: "/checkout" },
+      },
+      {
+        t: 1_700_000_900_100,
+        k: "backend.req.end",
+        offsetMs: 100,
+        d: {
+          requestId: "r9",
+          sessionId: "s1",
+          method: "POST",
+          route: "/checkout",
+          statusCode: 200,
+          responseBody: '{"discountCents":0,"promoApplied":false}',
+          responseCallsite: { file: "src/checkout.ts", line: 214, fn: "applyPromo" },
+        },
+      },
+      {
+        t: 1_700_000_900_120,
+        k: "net.res",
+        offsetMs: 120,
+        d: { id: 9, requestId: "r9", sessionId: "s1", st: 200 },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await postProcess(tmpDir);
+    const markdown = fs.readFileSync(path.join(tmpDir, "llm.md"), "utf-8");
+
+    expect(markdown).toContain("promoApplied");
+    expect(markdown).toContain("applyPromo src/checkout.ts:214");
+  });
+
 });

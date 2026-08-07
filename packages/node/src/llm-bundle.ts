@@ -4385,7 +4385,9 @@ function renderLinkedPayloads(
     .filter(
       (entry) =>
         entry.frontend.requestBody !== undefined ||
-        entry.frontend.responseBody !== undefined,
+        entry.frontend.responseBody !== undefined ||
+        entry.backend.responseBody !== undefined ||
+        entry.backend.responseCallsite !== undefined,
     );
   if (withBodies.length === 0) return [];
 
@@ -4411,6 +4413,22 @@ function renderLinkedPayloads(
     }
     if (entry.frontend.responseBody !== undefined) {
       lines.push(`  - response: \`${entry.frontend.responseBody}\``);
+    }
+    // What the SERVER built, and where. The browser's copy has been through the network and the
+    // client's own parsing; the server's is what the handler decided, and the callsite says which
+    // line decided it. Both were already captured and neither was printed - measured, readers asked
+    // for "the backend checkout response" and "the calculation trace" of a request the table above
+    // already listed.
+    if (
+      entry.backend.responseBody !== undefined &&
+      entry.backend.responseBody !== entry.frontend.responseBody
+    ) {
+      lines.push(`  - server response: \`${entry.backend.responseBody}\``);
+    }
+    if (entry.backend.responseCallsite !== undefined) {
+      lines.push(
+        `  - responded from: \`${formatCallsiteChain(entry.backend.responseCallsite)}\``,
+      );
     }
   }
   lines.push("");
