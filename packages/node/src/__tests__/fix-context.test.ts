@@ -12,10 +12,12 @@ import path from "node:path";
 import os from "node:os";
 import { postProcess } from "../post-process";
 import {
+  buildCausalChain,
   buildFixContext,
   FIX_CONTEXT_SCHEMA_VERSION,
   FixContextError,
 } from "../fix-context";
+import type { EvidenceCandidate } from "../evidence-index";
 import { runFixContext } from "../run-fix-context";
 import { McpServer } from "../mcp-server";
 
@@ -1178,5 +1180,72 @@ describe("getFixContext (MCP tool)", () => {
     });
     const result = res!.result as any;
     expect(result.isError).toBe(true);
+  });
+});
+
+describe("buildCausalChain anchor selection", () => {
+  const candidate = (over: Partial<EvidenceCandidate>): EvidenceCandidate =>
+    ({
+      id: "cand_0000",
+      detector: "noise",
+      title: "t",
+      score: 1,
+      ...over,
+    }) as EvidenceCandidate;
+
+  it("finds the chain under a top-ranked candidate that anchors nothing", () => {
+    // The failure this pins, seen on three separate defects in one evaluation
+    // run: a generic whole-session detector (an N+1 on an unrelated route) wins
+    // the top slot, and the bundle ships causal_chain: null while the incident's
+    // own root and symptom sit intact two rows below. The judges each described
+    // it as "captured every decisive fact but never assembled them" — the
+    // assembly was there; nothing read past the first row.
+    const chain = buildCausalChain([
+      candidate({ id: "cand_0001", detector: "n_plus_one", title: "N+1 on /api/products" }),
+      candidate({
+        id: "cand_0002",
+        detector: "client_param_transform",
+        title: "outbound maxPrice=28",
+        causalRole: "root",
+        causes: ["cand_0003"],
+      }),
+      candidate({
+        id: "cand_0003",
+        detector: "empty_result",
+        title: "search returned nothing",
+        causalRole: "symptom",
+        rootCauseId: "cand_0002",
+        attributionConfidence: "high",
+      }),
+    ]);
+    expect(chain).not.toBeNull();
+    expect(chain!.root.id).toBe("cand_0002");
+    expect(chain!.symptoms.map((s) => s.id)).toEqual(["cand_0003"]);
+  });
+
+  it("still prefers the highest-ranked anchor that resolves", () => {
+    // Rank has to keep deciding. Walking the list must not turn into picking
+    // whichever root happens to be cheapest to resolve.
+    const chain = buildCausalChain([
+      candidate({ id: "cand_0001", detector: "first_root", causalRole: "root", causes: ["cand_0002"] }),
+      candidate({ id: "cand_0002", detector: "sym", causalRole: "symptom", rootCauseId: "cand_0001" }),
+      candidate({ id: "cand_0003", detector: "second_root", causalRole: "root", causes: ["cand_0004"] }),
+      candidate({ id: "cand_0004", detector: "sym2", causalRole: "symptom", rootCauseId: "cand_0003" }),
+    ]);
+    expect(chain!.root.id).toBe("cand_0001");
+  });
+
+  it("is null when no candidate anywhere carries an attributed symptom", () => {
+    // The honest null. A root with no `causes` is not a chain, and inventing one
+    // would be worse than reporting none.
+    const chain = buildCausalChain([
+      candidate({ id: "cand_0001", detector: "iso", causalRole: "root", causes: [] }),
+      candidate({ id: "cand_0002", detector: "noise" }),
+    ]);
+    expect(chain).toBeNull();
+  });
+
+  it("is null for an empty candidate list", () => {
+    expect(buildCausalChain([])).toBeNull();
   });
 });
