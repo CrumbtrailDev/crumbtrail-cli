@@ -710,6 +710,13 @@ function nodeKindsForDetector(detector: string): Set<CausalNodeKind> {
     case "uncaught_error":
     case "unhandled_rejection":
       return new Set(["frontend.error"]);
+    // A detector whose whole subject is one click has to be able to reach that click's node.
+    // Without an entry here it took the empty default, the temporal fallback had no compatible
+    // kind, and it reported `isolated` — which drops it out of the incident thread and leaves
+    // `causal_chain` null even though the graph already carries interaction edges from the click
+    // to whatever did or did not follow it.
+    case "click_target_intercepted":
+      return new Set(["user.click"]);
     case "console_error":
       return new Set(["console.error"]);
     // console_warning is intentionally NOT mapped: warn-level `con` events never become graph nodes

@@ -103,3 +103,28 @@ describe("click_target_intercepted", () => {
     expect(found!.severity).toBe("medium");
   });
 });
+
+// A detector whose entire subject is one click must be able to reach that click's node. Without a
+// node-kind mapping it took the empty default, the temporal fallback found nothing compatible, and
+// the candidate reported `isolated` — out of the incident thread, with `causal_chain` null.
+describe("click_target_intercepted — attribution", () => {
+  it("reaches the click's own node instead of reporting isolated", async () => {
+    const { buildCausalGraph, attributeCandidates } = await import(
+      "../causal-graph"
+    );
+    const events: BugEvent[] = [
+      clickEvent({
+        el: { tag: "DIV", path: "div[id=sp-offers-frame]" },
+        box: { w: 1280, h: 720, viewportPct: 100 },
+        covered: [{ tag: "BUTTON", path: "button[data-testid=cart-checkout]" }],
+      }),
+    ];
+    const graph = buildCausalGraph({ events });
+    const attribution = attributeCandidates(
+      graph,
+      [{ id: "c1", anchor: { t: 1000 } }],
+      () => "click_target_intercepted",
+    );
+    expect(attribution.get("c1")?.causalRole).not.toBe("isolated");
+  });
+});
