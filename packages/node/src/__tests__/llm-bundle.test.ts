@@ -2364,4 +2364,51 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
     expect(click?.summary).toContain("1% of viewport");
   });
 
+  // The bundle rendered request SHAPE and stopped there, while the bodies sat on the same entries
+  // in llm.json. Measured over 108 bundle-only reads: three of the four failing scenarios, asked to
+  // name the one observation that would have settled the case, asked for a response body — of a
+  // request already printed in the table above.
+  it("renders payloads for linked requests, including successful ones", async () => {
+    const events: BugEvent[] = [
+      {
+        t: 1_700_000_500_000,
+        k: "net.req",
+        offsetMs: 0,
+        d: { id: 7, requestId: "r7", sessionId: "s1", m: "GET", url: "https://api.test/gift-cards/GC-1" },
+      },
+      {
+        t: 1_700_000_500_050,
+        k: "backend.req.start",
+        offsetMs: 50,
+        d: { requestId: "r7", sessionId: "s1", method: "GET", route: "/gift-cards/GC-1" },
+      },
+      {
+        t: 1_700_000_500_100,
+        k: "backend.req.end",
+        offsetMs: 100,
+        d: { requestId: "r7", sessionId: "s1", method: "GET", route: "/gift-cards/GC-1", statusCode: 200 },
+      },
+      {
+        t: 1_700_000_500_120,
+        k: "net.res",
+        offsetMs: 120,
+        d: { id: 7, requestId: "r7", sessionId: "s1", st: 200, body: '{"balanceCents":1250,"initialCents":5000}' },
+      },
+    ];
+    // Through postProcess rather than writeLlmBundle directly: the linked full-stack index is
+    // computed during post-processing and attached to the index, so a hand-built index has no
+    // linked requests to render and the assertion would pass or fail for the wrong reason.
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await postProcess(tmpDir);
+    const markdown = fs.readFileSync(path.join(tmpDir, "llm.md"), "utf-8");
+
+    expect(markdown).toContain("Linked Request Payloads");
+    // The decisive contrast, on a 200. A status line alone cannot express it.
+    expect(markdown).toContain("balanceCents");
+    expect(markdown).toContain("initialCents");
+  });
+
 });
