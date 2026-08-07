@@ -1284,12 +1284,17 @@ function buildAgentContext(
 
     if (event.k === "clk") {
       const target = interactionIdentifier(event);
+      const integrity = describeClickIntegrity(event);
+      const summary = joinParts([
+        target ? `click ${target}` : "click captured",
+        integrity,
+      ]);
       timeline.push(
         removeUndefined({
           ...base,
           kind: "click" as const,
           target,
-          summary: target ? `click ${target}` : "click captured",
+          summary,
         }),
       );
       continue;
@@ -1380,9 +1385,46 @@ function isAgentContextError(event: BugEvent): boolean {
   );
 }
 
-function interactionIdentifier(event: BugEvent): string | undefined {
-  if (!isRecord(event.d.el)) return undefined;
-  const element = event.d.el;
+/**
+ * What the click actually hit, when that differs from what it appears to have hit.
+ *
+ * `interaction.ts` captures three integrity facts alongside every click: `covered` (the elements
+ * under the cursor, from `elementsFromPoint`), `deep` (the composed-path target, which differs
+ * when the event crossed a shadow boundary) and `targetNotInStack` (the event's target is not
+ * under the cursor at all). None of them were projected: the bundle rendered every click as
+ * `click <selector>` and told the reader to "inspect the event descriptor", which is not in the
+ * bundle. So a session where an overlay swallowed the checkout click carried the decisive fact in
+ * events.ndjson and nothing whatsoever in llm.json — captured, then dropped between the two.
+ *
+ * Deliberately a plain rendering of what was captured rather than a verdict about overlays. The
+ * reader is told which element was under the cursor and left to conclude what that means; a
+ * detector that fires on "covered && no request followed" would be a narrower claim than the
+ * evidence supports, and would hide the fact in every case it declined to fire on.
+ */
+function describeClickIntegrity(event: BugEvent): string | undefined {
+  const parts: string[] = [];
+  const covered = event.d.covered;
+  if (Array.isArray(covered) && covered.length > 0) {
+    const first = covered.find((entry) => isRecord(entry));
+    const selector = isRecord(first) ? interactionIdentifierOf(first) : undefined;
+    if (selector) parts.push(`over ${selector}`);
+    else parts.push(`over ${covered.length} covered element(s)`);
+  }
+  const deep = event.d.deep;
+  if (isRecord(deep)) {
+    const selector = interactionIdentifierOf(deep);
+    if (selector) parts.push(`composed target ${selector}`);
+  }
+  if (event.d.targetNotInStack === true) {
+    parts.push("event target was not under the cursor");
+  }
+  return parts.length > 0 ? parts.join("; ") : undefined;
+}
+
+/** The selector for one element descriptor, shared by the click integrity fields and the target. */
+function interactionIdentifierOf(
+  element: Record<string, unknown>,
+): string | undefined {
   const selector =
     sanitizeSelector(element.path) ??
     sanitizeSelector(element.selector) ??
@@ -1390,6 +1432,11 @@ function interactionIdentifier(event: BugEvent): string | undefined {
     sanitizeSelector(element.name, 120) ??
     sanitizeSelector(element.id, 120);
   return selector ? safeText(selector, 240) : undefined;
+}
+
+function interactionIdentifier(event: BugEvent): string | undefined {
+  if (!isRecord(event.d.el)) return undefined;
+  return interactionIdentifierOf(event.d.el);
 }
 
 function boundAgentContextTimeline(
@@ -1512,7 +1559,12 @@ function summarizeEvent(
   }
 
   if (event.k === "clk") {
-    return "user click captured; inspect event descriptor for selectors and element context";
+    // Was a pointer to the "event descriptor", which the bundle does not contain.
+    return joinParts([
+      "user click",
+      interactionIdentifier(event),
+      describeClickIntegrity(event),
+    ]);
   }
 
   if (event.k === "inp") {
