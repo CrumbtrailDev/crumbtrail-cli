@@ -243,50 +243,63 @@ function toSignal(candidate: EvidenceCandidate): FixContextSignal {
  * candidates (CP3). Does NOT recompute attribution and does NOT re-sort candidates: it reads the
  * root-first order that `candidates.jsonl` already carries.
  *
- * Primary root resolution:
- *   - if `ranked[0].causalRole === 'root'` → ranked[0] is the root;
- *   - else if ranked[0] is a symptom → resolve its `rootCauseId` against `signals`;
- *   - else (isolated / no candidates) → null.
+ * Primary root resolution walks the ranked list IN ORDER and returns the first candidate that
+ * yields a chain — itself when it is a root, or its `rootCauseId` when it is a symptom.
+ *
+ * It used to consider `ranked[0]` alone and return null otherwise. That made one noisy candidate
+ * in the top slot suppress a chain that was fully present underneath it: a generic
+ * whole-session detector (an N+1 on an unrelated route is the recurring one) outranks the
+ * incident's own root, and the bundle ships `causal_chain: null` while the decisive candidate
+ * sits two rows down with its root and symptoms intact. Three separate defects in one
+ * evaluation run were reported that way, each as "captured every decisive fact but never
+ * assembled them" — the assembly existed; nothing would read past the first row to find it.
+ *
+ * Rank still decides: the walk prefers higher-ranked anchors and stops at the first that
+ * resolves, so a genuine top-ranked root is unaffected.
+ *
  * Symptoms are the root's own `causes` (candidate ids), resolved against `signals` in the
  * root's already-sorted `causes` order, so output is deterministic with no map-iteration leaks.
  */
-function buildCausalChain(
+export function buildCausalChain(
   ranked: EvidenceCandidate[],
 ): FixContextCausalChain | null {
-  const top = ranked[0];
-  if (!top) return null;
+  if (ranked.length === 0) return null;
 
   const byId = new Map<string, EvidenceCandidate>();
   for (const candidate of ranked) byId.set(candidate.id, candidate);
 
-  let root: EvidenceCandidate | undefined;
-  if (top.causalRole === "root") {
-    root = top;
-  } else if (top.causalRole === "symptom" && top.rootCauseId) {
-    root = byId.get(top.rootCauseId);
-  }
-  if (!root || root.causalRole !== "root") return null;
+  for (const anchor of ranked) {
+    let root: EvidenceCandidate | undefined;
+    if (anchor.causalRole === "root") {
+      root = anchor;
+    } else if (anchor.causalRole === "symptom" && anchor.rootCauseId) {
+      root = byId.get(anchor.rootCauseId);
+    }
+    if (!root || root.causalRole !== "root") continue;
 
-  const causeIds = root.causes ?? [];
-  const symptoms: FixContextCausalSymptom[] = [];
-  for (const id of causeIds) {
-    const symptom = byId.get(id);
-    if (!symptom) continue;
-    symptoms.push(
-      removeUndefined({
-        id: symptom.id,
-        detector: symptom.detector,
-        title: symptom.title,
-        attributionConfidence: symptom.attributionConfidence,
-      }) as FixContextCausalSymptom,
-    );
-  }
-  if (symptoms.length === 0) return null;
+    const causeIds = root.causes ?? [];
+    const symptoms: FixContextCausalSymptom[] = [];
+    for (const id of causeIds) {
+      const symptom = byId.get(id);
+      if (!symptom) continue;
+      symptoms.push(
+        removeUndefined({
+          id: symptom.id,
+          detector: symptom.detector,
+          title: symptom.title,
+          attributionConfidence: symptom.attributionConfidence,
+        }) as FixContextCausalSymptom,
+      );
+    }
+    if (symptoms.length === 0) continue;
 
-  return {
-    root: { id: root.id, detector: root.detector, title: root.title },
-    symptoms,
-  };
+    return {
+      root: { id: root.id, detector: root.detector, title: root.title },
+      symptoms,
+    };
+  }
+
+  return null;
 }
 
 function resolveSessionDir(
