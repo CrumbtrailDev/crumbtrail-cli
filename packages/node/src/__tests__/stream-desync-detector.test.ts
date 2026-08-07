@@ -143,3 +143,44 @@ describe("stream_desync", () => {
     expect(candidate.severity).toBe("low");
   });
 });
+
+/**
+ * The finding is a property of a STREAM, not of a protocol: it dropped, it came back, and nothing
+ * replayed the gap. A socket-driven application hits it the same way a server-sent one does, and
+ * before this the detector could only see one of the two.
+ */
+describe("stream_desync over a WebSocket", () => {
+  function ws(
+    t: number,
+    op: "open" | "error" | "close",
+    extra: Record<string, unknown> = {},
+  ): BugEvent {
+    return {
+      t,
+      k: "net.ws",
+      d: { url: "wss://app.test/api/orders/stream", op, ...extra },
+    } as unknown as BugEvent;
+  }
+
+  it("names a socket reconnect that skipped a change to the resource", () => {
+    const [candidate] = candidatesFor([
+      request(500, "a", "GET", "/api/orders"),
+      jsonResponse(600, "a", [{ id: 1, status: "pending" }]),
+      ws(1_000, "open"),
+      ws(2_000, "close", { code: 1006, clean: false, received: 1 }),
+      ws(3_000, "open", { reopen: true }),
+      request(4_000, "b", "GET", "/api/orders"),
+      jsonResponse(4_100, "b", [{ id: 1, status: "shipped" }]),
+    ]);
+
+    expect(candidate).toBeDefined();
+    expect(candidate.title).toBe(
+      "Stream reconnected without replay and the resource had changed",
+    );
+    expect(candidate.anchor.message).toContain("never delivered");
+  });
+
+  it("says nothing about a socket that opened once and stayed open", () => {
+    expect(candidatesFor([ws(1_000, "open")])).toHaveLength(0);
+  });
+});
