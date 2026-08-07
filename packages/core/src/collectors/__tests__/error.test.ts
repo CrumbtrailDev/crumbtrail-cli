@@ -145,3 +145,79 @@ describe("errorCollector", () => {
     cleanup = errorCollector(bus, DEFAULT_CONFIG);
   });
 });
+
+/**
+ * A Content Security Policy refusal is the quietest way for a feature to stop existing: no
+ * JavaScript error, because the code never ran, and no failed request, because the request was
+ * never made. A capture built on errors and network traffic is blind to it by construction.
+ */
+describe("errorCollector - content security policy", () => {
+  let bus: EventBus;
+  let events: BugEvent[];
+  let cleanup: () => void;
+
+  beforeEach(() => {
+    bus = new EventBus();
+    events = [];
+    bus.subscribe((batch) => events.push(...batch));
+    cleanup = errorCollector(bus, DEFAULT_CONFIG);
+  });
+
+  afterEach(() => cleanup());
+
+  function violate(detail: Record<string, unknown>): void {
+    document.dispatchEvent(
+      Object.assign(new Event("securitypolicyviolation"), detail),
+    );
+  }
+
+  function csp(): Array<Record<string, unknown>> {
+    bus.flush();
+    return events
+      .filter((event) => event.k === "csp")
+      .map((event) => event.d as Record<string, unknown>);
+  }
+
+  it("records what was refused and which directive refused it", () => {
+    violate({
+      effectiveDirective: "script-src",
+      disposition: "enforce",
+      blockedURI: "https://cdn.partner.test/widget.js",
+      sourceFile: "https://app.test/checkout",
+      lineNumber: 12,
+    });
+
+    expect(csp()).toMatchObject([
+      {
+        directive: "script-src",
+        disposition: "enforce",
+        blockedUri: "https://cdn.partner.test/widget.js",
+        line: 12,
+      },
+    ]);
+  });
+
+  // A report-only policy blocks nothing. Reporting it as a block would send a reader after a
+  // failure that did not happen.
+  it("keeps a report-only violation distinguishable", () => {
+    violate({
+      effectiveDirective: "connect-src",
+      disposition: "report",
+      blockedURI: "https://api.partner.test",
+    });
+
+    expect(csp()[0].disposition).toBe("report");
+  });
+
+  // The `sample` a browser may attach is a fragment of the page's own script or style text.
+  it("never carries the policy sample", () => {
+    violate({
+      effectiveDirective: "style-src",
+      disposition: "enforce",
+      blockedURI: "inline",
+      sample: "color:red /* hunter2-should-not-appear */",
+    });
+
+    expect(JSON.stringify(csp())).not.toContain("hunter2-should-not-appear");
+  });
+});

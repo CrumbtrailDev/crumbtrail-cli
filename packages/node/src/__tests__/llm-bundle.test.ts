@@ -2669,4 +2669,33 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
     expect(markdown).toContain("no_matching_order");
   });
 
+
+  // The quietest failure there is: no error, no request, and a button that does nothing.
+  it("prints a policy refusal the page reported no other way", async () => {
+    const events: BugEvent[] = [
+      {
+        t: 1_700_001_100_000,
+        k: "csp",
+        offsetMs: 0,
+        d: {
+          directive: "script-src",
+          disposition: "enforce",
+          blockedUri: "https://cdn.partner.test/widget.js",
+          file: "https://app.test/checkout",
+          line: 12,
+        },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await postProcess(tmpDir);
+    const markdown = fs.readFileSync(path.join(tmpDir, "llm.md"), "utf-8");
+
+    expect(markdown).toContain("content security policy blocked");
+    expect(markdown).toContain("widget.js");
+    expect(markdown).toContain("no error was thrown and no request was made");
+  });
+
 });
