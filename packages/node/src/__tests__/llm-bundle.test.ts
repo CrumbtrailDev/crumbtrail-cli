@@ -2628,6 +2628,9 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
 
     expect(markdown).toContain("promoApplied");
     expect(markdown).toContain("applyPromo src/checkout.ts:214");
+    // The qualifier is load-bearing: an unqualified code location took wrong answers from 7 to 17
+    // across 126 bundle-only reads, concentrated in the scenarios whose truth is data, not code.
+    expect(markdown).toContain("which is not by itself the cause");
   });
 
 

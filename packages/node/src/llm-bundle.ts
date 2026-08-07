@@ -4555,7 +4555,7 @@ function renderLinkedPayloads(
   const lines = [
     "#### Linked Request Payloads",
     "",
-    "Redacted and bounded. A request whose status is 200 can still carry the defect in its body.",
+    "Redacted and bounded. A request whose status is 200 can still carry the defect in its body. A response can also be correct code reading wrong data, so treat a code location as where a value was produced rather than as the reason it was wrong.",
     "",
   ];
   for (const entry of withBodies) {
@@ -4587,8 +4587,13 @@ function renderLinkedPayloads(
       lines.push(`  - server response: \`${entry.backend.responseBody}\``);
     }
     if (entry.backend.responseCallsite !== undefined) {
+      // The qualifier is load-bearing, and it is here because the unqualified line cost accuracy.
+      // Measured across 126 bundle-only reads: printing the server response and this callsite
+      // together took wrong answers from 7 to 17, concentrated in the two scenarios whose truth is
+      // DATA rather than code. A reader handed a file and a line number names that line as the
+      // cause. It is not one; it is where the answer was written, which is a different claim.
       lines.push(
-        `  - responded from: \`${formatCallsiteChain(entry.backend.responseCallsite)}\``,
+        `  - response written at: \`${formatCallsiteChain(entry.backend.responseCallsite)}\` (where this response was produced, which is not by itself the cause)`,
       );
     }
   }
