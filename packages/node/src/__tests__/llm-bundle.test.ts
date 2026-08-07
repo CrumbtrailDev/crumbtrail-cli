@@ -2698,4 +2698,54 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
     expect(markdown).toContain("no error was thrown and no request was made");
   });
 
+
+  // Most correctness defects are a 200 carrying the wrong value, and the wrong value is the one the
+  // user SAW. These were captured from the first release and printed by nothing, so the bundle
+  // could describe every request in a session and never state the number that made someone file the
+  // report. Verified against a real gift-card capture: the list said $12.5 and the detail said $50
+  // at the same instant, which is the entire defect in two rows.
+  it("prints what the page displayed, contradictions first", async () => {
+    const events: BugEvent[] = [
+      {
+        t: 1_700_001_200_000,
+        k: "ui.num",
+        offsetMs: 0,
+        d: {
+          region: "ul.cart-list",
+          items: [{ label: "GC-PARTIAL-002", value: 12.5, unit: "$" }],
+        },
+      },
+      {
+        t: 1_700_001_200_000,
+        k: "ui.num",
+        offsetMs: 0,
+        d: { region: "section", items: [{ label: "Balance", value: 50, unit: "$" }] },
+      },
+      {
+        t: 1_700_001_201_000,
+        k: "ui.num",
+        offsetMs: 1_000,
+        d: { region: "section", items: [{ label: "Balance", value: 12.5, unit: "$" }] },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await postProcess(tmpDir);
+    const markdown = fs.readFileSync(path.join(tmpDir, "llm.md"), "utf-8");
+
+    expect(markdown).toContain("On-screen Numbers");
+    expect(markdown).toContain("GC-PARTIAL-002");
+    // Both readings of the same label, so a reader can see them disagree.
+    expect(markdown).toContain("$50");
+    expect(markdown).toContain("$12.5");
+    // The label that moved is ranked above the one that held still; a truncation must never be what
+    // hides the contradiction.
+    const numbers = markdown.slice(markdown.indexOf("On-screen Numbers"));
+    expect(numbers.indexOf("Balance")).toBeLessThan(
+      numbers.indexOf("GC-PARTIAL-002"),
+    );
+  });
+
 });

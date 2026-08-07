@@ -406,6 +406,29 @@ export interface LlmBundleBrowserEvidence {
   interactiveElements: InteractiveElement[];
   /** Redaction-aware storage writes captured during the session; `[]` when none. */
   storageChanges: LlmBundleStorageChange[];
+  /** Labeled numbers the page displayed, grouped by label; `[]` when none. */
+  screenNumbers: LlmBundleScreenNumber[];
+}
+
+/**
+ * One labeled number the page put in front of the user, and every value it took.
+ *
+ * Most correctness defects are a 200 carrying the wrong value, and the wrong value is the one the
+ * user SAW. The `uiNumbers` collector has always captured these; nothing printed them, so the
+ * bundle could describe every request in a session and never state the number on the screen that
+ * made someone file the report.
+ *
+ * A label with more than one distinct value is listed first. That is usually the finding rather
+ * than a step towards it: on a real gift-card capture the list said `GC-PARTIAL-002 $12.5` and the
+ * detail page said `Balance $50` at the same instant, which is the entire defect in two rows.
+ */
+export interface LlmBundleScreenNumber {
+  label: string;
+  unit?: string;
+  /** Distinct values in the order first seen, with the offset each was first observed at. */
+  values: Array<{ value: number; offsetMs?: number }>;
+  /** Where on the page, innermost region selector as the collector reported it. */
+  regions: string[];
 }
 
 export const AGENT_CONTEXT_SCHEMA_VERSION =
@@ -1601,6 +1624,66 @@ function describeWorkerEvent(event: BugEvent): string | undefined {
   return undefined;
 }
 
+/** How many labels the bundle reports. Contradictions first, so a cut never drops one. */
+const MAX_SCREEN_NUMBER_LABELS = 40;
+/** How many distinct values one label reports before it is summarised by its ends. */
+const MAX_SCREEN_NUMBER_VALUES = 6;
+
+function buildScreenNumbers(
+  events: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleScreenNumber[] {
+  const byLabel = new Map<string, LlmBundleScreenNumber>();
+
+  for (const event of events) {
+    if (event.k !== "ui.num") continue;
+    const items = event.d.items;
+    if (!Array.isArray(items)) continue;
+    const region = safeText(event.d.region, 120);
+    const offsetMs = offsetFromStart(event.t, sessionStartMs);
+
+    for (const item of items) {
+      if (!isRecord(item)) continue;
+      const label = safeText(item.label, 120);
+      const value = finiteNumber(item.value);
+      if (!label || value === undefined) continue;
+
+      const existing = byLabel.get(label) ?? {
+        label,
+        ...(safeText(item.unit, 8) ? { unit: safeText(item.unit, 8) } : {}),
+        values: [],
+        regions: [],
+      };
+      if (!existing.values.some((seen) => seen.value === value)) {
+        existing.values.push(removeUndefined({ value, offsetMs }));
+      }
+      if (region && !existing.regions.includes(region)) {
+        existing.regions.push(region);
+      }
+      byLabel.set(label, existing);
+    }
+  }
+
+  return [...byLabel.values()]
+    .map((entry) =>
+      entry.values.length > MAX_SCREEN_NUMBER_VALUES
+        ? {
+            ...entry,
+            // Keep the ends: the first value and the last are what a reader compares. Dropping the
+            // middle of a counter that ticked is not a loss; dropping either end is.
+            values: [
+              ...entry.values.slice(0, MAX_SCREEN_NUMBER_VALUES - 1),
+              entry.values[entry.values.length - 1],
+            ],
+          }
+        : entry,
+    )
+    // A label that took more than one value is ranked above one that held still, because a value
+    // that moved is what someone is looking for and a truncation must never be what hides it.
+    .sort((a, b) => b.values.length - a.values.length)
+    .slice(0, MAX_SCREEN_NUMBER_LABELS);
+}
+
 function summarizeEvent(
   event: BugEvent,
   index: SessionIndexLike,
@@ -1839,6 +1922,7 @@ function buildBrowserEvidence(
     tabBoundaries: buildTabBoundarySummary(index, events, sessionStartMs),
     interactiveElements: collectInteractiveElements(events),
     storageChanges: buildStorageChanges(events, sessionStartMs),
+    screenNumbers: buildScreenNumbers(events, sessionStartMs),
   };
 }
 
@@ -4045,6 +4129,30 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
                 entry.level,
                 entry.message,
                 entry.source ?? "",
+              ]),
+          ),
+          "",
+        ]
+      : []),
+    ...(bundle.browserEvidence.screenNumbers.length > 0
+      ? [
+          "### On-screen Numbers",
+          "",
+          "What the page displayed, by label. A label carrying more than one value is listed first: the same label reading two different numbers is usually the defect rather than a step towards it.",
+          "",
+          table(
+            ["Label", "Values", "Where"],
+            bundle.browserEvidence.screenNumbers
+              .slice(0, 25)
+              .map((entry) => [
+                entry.label,
+                entry.values
+                  .map(
+                    (seen) =>
+                      `${entry.unit ?? ""}${seen.value}${seen.offsetMs !== undefined ? ` (${seen.offsetMs} ms)` : ""}`,
+                  )
+                  .join(", "),
+                entry.regions.join(", "),
               ]),
           ),
           "",
