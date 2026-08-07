@@ -2310,4 +2310,43 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
     const markdown = fs.readFileSync(path.join(tmpDir, "llm.md"), "utf-8");
     expect(markdown).not.toContain("Detect→bundle");
   });
+  // The SDK captures three integrity facts on every click (`covered`, `deep`, `targetNotInStack`)
+  // and none reached the bundle: a real session where an overlay swallowed the checkout click
+  // carried the decisive element stack in events.ndjson and rendered as a bare "click <selector>".
+  it("carries what a click actually landed on into the agent context", async () => {
+    const events: BugEvent[] = [
+      {
+        t: 1_700_000_400_000,
+        k: "clk",
+        offsetMs: 0,
+        d: {
+          el: { tag: "DIV", id: "sp-offers-frame", path: "div[id=sp-offers-frame]" },
+          pos: [258, 353],
+          covered: [
+            { tag: "BUTTON", path: "button[data-testid=cart-checkout]" },
+            { tag: "SECTION", path: "section[id=cart]" },
+          ],
+          targetNotInStack: true,
+        },
+      },
+    ];
+    const index = {
+      id: "ses_click_integrity",
+      start: events[0].t,
+      end: events[0].t,
+      dur: 0,
+      evts: events.length,
+      stats: { clk: 1 },
+    };
+
+    const bundle = await writeLlmBundle({ sessionDir: tmpDir, events, index });
+    const click = bundle.agentContext.timeline.find(
+      (entry) => entry.kind === "click",
+    );
+
+    expect(click?.summary).toContain("over ");
+    expect(click?.summary).toContain("button");
+    expect(click?.summary).toContain("not under the cursor");
+  });
+
 });
