@@ -175,6 +175,20 @@ path, so a truncated list is never mistaken for a short one. Anything else,
 including non JSON and oversized responses, carries the content type and byte
 size only.
 
+### Content Security Policy refusals (`csp`)
+
+A policy refusal is the quietest way for a feature to stop existing. The browser
+refuses a script, a stylesheet, an image or a connection, and the page reports
+nothing: no JavaScript error, because the code never ran, and no failed request,
+because the request was never made. A capture built on errors and network traffic
+is blind to it by construction, while the user watches a button do nothing.
+
+The `errors` collector now listens for `securitypolicyviolation` and emits
+`{ directive, disposition, blockedUri, file, line, st }`. `disposition` keeps a
+report-only policy distinguishable from an enforced one, since a report-only
+policy blocks nothing. The `sample` a browser may attach is a fragment of the
+page's own script or style text and is never read.
+
 ### Streaming responses
 
 `Response.text()` resolves when the stream closes, which for a streaming response

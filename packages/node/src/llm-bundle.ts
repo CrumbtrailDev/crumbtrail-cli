@@ -821,6 +821,8 @@ const IMPORTANT_EVENT_KINDS = new Set([
   "backend.job.start",
   "backend.job.end",
   "backend.job.error",
+  // A policy refusal is the quietest way for a feature to stop existing: no error, no request.
+  "csp",
 ]);
 
 // Writes through the SessionStore seam, not fs: llm.md/llm.json are finalize-time
@@ -1700,6 +1702,20 @@ function summarizeEvent(
 
   if (event.k === "net.sse" || event.k === "net.ws") {
     return describeStreamEvent(event);
+  }
+
+  if (event.k === "csp") {
+    const d2 = event.d;
+    return joinParts([
+      "content security policy blocked",
+      safeText(d2.blockedUri, 300),
+      safeText(d2.directive, 80),
+      safeText(d2.disposition, 20) === "report"
+        ? "report-only, not actually blocked"
+        : undefined,
+      safeUrl(d2.file, "event.csp.file"),
+      "no error was thrown and no request was made",
+    ]);
   }
 
   if (event.k.startsWith("backend.job.")) {

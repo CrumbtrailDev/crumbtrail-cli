@@ -92,11 +92,49 @@ export function errorCollector(
     });
   };
 
+  /**
+   * A Content Security Policy refusal.
+   *
+   * This is the quietest way for a feature to stop existing. The browser refuses to load a script,
+   * a stylesheet, an image or a connection, and the page reports nothing: no JavaScript error,
+   * because the code never ran; no failed request, because the request was never made. A capture
+   * built on errors and network traffic is blind to it by construction, while the user watches a
+   * button do nothing.
+   *
+   * It is also the only thing that distinguishes a policy refusal from the "Failed to fetch" a
+   * blocked connection otherwise produces, which reads identically to being offline.
+   *
+   * Metadata only: which directive refused, what it refused, and where. The `sample` field a browser
+   * may attach is a fragment of the page's own script or style text, so it is not read.
+   */
+  const onCspViolation = (event: SecurityPolicyViolationEvent) => {
+    const blocked = redactUrl(
+      typeof event.blockedURI === "string" ? event.blockedURI : "",
+      "blockedUri",
+    );
+    const source = redactUrl(
+      typeof event.sourceFile === "string" ? event.sourceFile : "",
+      "sourceFile",
+    );
+    const d: Record<string, unknown> = {
+      directive: event.effectiveDirective || event.violatedDirective,
+      disposition: event.disposition,
+      blockedUri: blocked.value,
+      ...(source.value ? { file: source.value } : {}),
+      ...(Number.isFinite(event.lineNumber) ? { line: event.lineNumber } : {}),
+      ...(Number.isFinite(event.statusCode) ? { st: event.statusCode } : {}),
+    };
+    attachRedactionMetadata(d, blocked.metadata, source.metadata);
+    bus.emit({ t: now(), k: "csp", d });
+  };
+
   window.addEventListener("error", onError);
   window.addEventListener("unhandledrejection", onRejection);
+  document.addEventListener("securitypolicyviolation", onCspViolation);
 
   return () => {
     window.removeEventListener("error", onError);
     window.removeEventListener("unhandledrejection", onRejection);
+    document.removeEventListener("securitypolicyviolation", onCspViolation);
   };
 }
