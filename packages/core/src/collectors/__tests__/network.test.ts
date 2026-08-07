@@ -120,3 +120,96 @@ describe('networkCollector – body deduplication', () => {
     expect(res[0].d.body).toBe('{"ping":true}');
   });
 });
+
+/**
+ * `body: new FormData(form)` and `body: new URLSearchParams(form)` are how a form submission is
+ * normally written. Both were discarded whole as "non-text", so every field the user filled in went
+ * missing from the capture because of the container it arrived in.
+ */
+describe('networkCollector – form-shaped request bodies', () => {
+  let bus: EventBus;
+  let events: BugEvent[];
+  let cleanup: () => void;
+
+  beforeEach(() => {
+    bus = new EventBus();
+    events = [];
+    bus.subscribe((batch) => events.push(...batch));
+    globalThis.fetch = makeFetchMock('{"ok":true}');
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+  });
+
+  afterEach(() => {
+    cleanup?.();
+    events = [];
+  });
+
+  function reqEvent() {
+    bus.flush();
+    return events.filter((e) => e.k === 'net.req')[0];
+  }
+
+  it('reads a URLSearchParams body', async () => {
+    await globalThis.fetch('https://api.example.com/cart', {
+      method: 'POST',
+      body: new URLSearchParams({ sku: 'ABC', qty: '3' }),
+    });
+
+    expect(String(reqEvent().d.body)).toContain('qty=3');
+  });
+
+  it('reads the fields of a FormData body', async () => {
+    const form = new FormData();
+    form.append('sku', 'ABC');
+    form.append('qty', '3');
+
+    await globalThis.fetch('https://api.example.com/cart', {
+      method: 'POST',
+      body: form,
+    });
+
+    const body = String(reqEvent().d.body);
+    expect(body).toContain('sku');
+    expect(body).toContain('ABC');
+    expect(body).toContain('3');
+  });
+
+  // Reading a file part would put a document's contents in a bug report. The form FIELD name is
+  // what a reader needs - the upload was attached to `invoice` - and it survives as the key.
+  it('describes a file part and never reads it', async () => {
+    const form = new FormData();
+    form.append('invoice', new File(['SECRET-DOCUMENT-BODY'], 'invoice.pdf', {
+      type: 'application/pdf',
+    }));
+
+    await globalThis.fetch('https://api.example.com/upload', {
+      method: 'POST',
+      body: form,
+    });
+
+    const body = String(reqEvent().d.body);
+    expect(body).toContain('invoice');
+    expect(body).toContain('"file":true');
+    expect(body).toContain('"bytes":20');
+    expect(body).not.toContain('SECRET-DOCUMENT-BODY');
+  });
+
+  // Same policy as any other body: the container it arrived in changes nothing.
+  it('redacts a form field the policy denies', async () => {
+    await globalThis.fetch('https://api.example.com/login', {
+      method: 'POST',
+      body: new URLSearchParams({ user: 'ada', password: 'hunter2-should-not-appear' }),
+    });
+
+    expect(String(reqEvent().d.body)).not.toContain('hunter2-should-not-appear');
+  });
+
+  it('still reports a truly unreadable body as non-text', async () => {
+    await globalThis.fetch('https://api.example.com/blob', {
+      method: 'POST',
+      body: new Uint8Array([1, 2, 3]),
+    });
+
+    expect(reqEvent().d.body).not.toBe('[1,2,3]');
+  });
+});
