@@ -17,6 +17,10 @@ export const BACKEND_REQUEST_START_EVENT = "backend.req.start";
 export const BACKEND_REQUEST_END_EVENT = "backend.req.end";
 export const BACKEND_REQUEST_ERROR_EVENT = "backend.req.error";
 
+export const BACKEND_JOB_START_EVENT = "backend.job.start";
+export const BACKEND_JOB_END_EVENT = "backend.job.end";
+export const BACKEND_JOB_ERROR_EVENT = "backend.job.error";
+
 export const CRUMBTRAIL_SESSION_HEADER = CORE_CRUMBTRAIL_SESSION_HEADER;
 export const CRUMBTRAIL_REQUEST_HEADER = CORE_CRUMBTRAIL_REQUEST_HEADER;
 
@@ -261,6 +265,158 @@ export function buildBackendRequestErrorEvent(
     input.sessionStartedAt,
     correlation.sessionId,
   );
+}
+
+/* ------------------------------------------------------------------ */
+/* Background jobs                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Work an application does OUTSIDE a request.
+ *
+ * Backend instrumentation was request-shaped throughout: a session recorded what the server did
+ * while the user waited and nothing about what it did afterwards. Queues, cron, retries and
+ * webhook fan-out are where a large share of enterprise defects live, and they share a signature
+ * that is invisible without this - the request succeeded, the user saw a confirmation, and the work
+ * the confirmation promised either failed, ran twice, or never ran. Measured on the
+ * orders-complete-without-a-payment-record scenario, readers given the whole bundle asked for
+ * exactly one thing: the payment-recording job's execution result. Nothing in the capture could
+ * have carried it.
+ *
+ * The correlation is the point. A job carries the sessionId and requestId of the request that
+ * enqueued it, resolved by the same function the request events use, so the job lands in the same
+ * session as the click that caused it rather than in a parallel record nobody joins. An application
+ * that puts those ids in its job payload gets that join for free; one that does not still gets the
+ * job, uncorrelated and honestly labelled as such.
+ */
+export interface BackendJobEventInput extends BackendRequestEventInput {
+  /** What the job is, e.g. `record-payment`. The stable name, not a per-run id. */
+  name: string;
+  /** This run's id, when the queue has one. */
+  jobId?: string;
+  /** Which queue or scheduler ran it. */
+  queue?: string;
+  /** 1 for a first run. A retry that finally succeeds is a different story from a clean run. */
+  attempt?: number;
+}
+
+export interface BackendJobEndEventInput extends BackendJobEventInput {
+  durationMs?: number;
+  /**
+   * How the run ended, as the application judged it.
+   *
+   * `skipped` is deliberately available and deliberately distinct from `success`: a job that
+   * decided there was nothing to do is the exact shape of the work that was promised and never
+   * happened, and collapsing it into success hides the defect this capability exists to expose.
+   */
+  outcome?: "success" | "failure" | "skipped";
+  /** What the run produced or decided, already bounded by the caller. Redacted here. */
+  result?: string;
+  /** Whether the caller truncated `result` at its cap. */
+  resultTruncated?: boolean;
+  /** As `BackendRequestEndEventInput.keepFields`. */
+  keepFields?: readonly string[];
+}
+
+export interface BackendJobErrorEventInput extends BackendJobEndEventInput {
+  error: unknown;
+}
+
+export function buildBackendJobStartEvent(input: BackendJobEventInput): BugEvent {
+  const now = normalizeTimestamp(input.now);
+  const correlation = resolveCorrelation(input);
+  const payload = buildJobPayload(input, correlation);
+  return buildEvent(
+    BACKEND_JOB_START_EVENT,
+    payload,
+    now,
+    input.sessionStartedAt,
+    correlation.sessionId,
+  );
+}
+
+export function buildBackendJobEndEvent(
+  input: BackendJobEndEventInput,
+): BugEvent {
+  const now = normalizeTimestamp(input.now);
+  const correlation = resolveCorrelation(input);
+  const payload = buildJobPayload(input, correlation);
+  if (input.outcome) payload.outcome = input.outcome;
+  if (Number.isFinite(input.durationMs))
+    payload.durationMs = Math.max(0, Math.round(input.durationMs as number));
+  attachJobResult(payload, input);
+  return buildEvent(
+    BACKEND_JOB_END_EVENT,
+    payload,
+    now,
+    input.sessionStartedAt,
+    correlation.sessionId,
+  );
+}
+
+export function buildBackendJobErrorEvent(
+  input: BackendJobErrorEventInput,
+): BugEvent {
+  const now = normalizeTimestamp(input.now);
+  const correlation = resolveCorrelation(input);
+  const payload = buildJobPayload(input, correlation);
+  payload.outcome = input.outcome ?? "failure";
+  if (Number.isFinite(input.durationMs))
+    payload.durationMs = Math.max(0, Math.round(input.durationMs as number));
+  attachJobResult(payload, input);
+
+  const error = sanitizeError(input.error);
+  payload.error = omitMetadata(error);
+  attachRedactionMetadata(payload, error.metadata);
+
+  return buildEvent(
+    BACKEND_JOB_ERROR_EVENT,
+    payload,
+    now,
+    input.sessionStartedAt,
+    correlation.sessionId,
+  );
+}
+
+function buildJobPayload(
+  input: BackendJobEventInput,
+  correlation: Correlation,
+): Record<string, unknown> {
+  const payload = buildBasePayload(input, correlation);
+  const name = sanitizeRoute(input.name);
+  // The name is the join key across runs, so an unusable one is worth saying out loud rather than
+  // silently omitting: a job event with no name cannot be grouped with its own retries.
+  payload.job = name.route ?? "unnamed";
+  if (name.truncated) payload.jobNameTruncated = true;
+
+  const jobId = normalizeId(input.jobId);
+  if (jobId) payload.jobId = jobId;
+  const queue = sanitizeRoute(input.queue);
+  if (queue.route) payload.queue = queue.route;
+  if (Number.isFinite(input.attempt))
+    payload.attempt = Math.max(1, Math.round(input.attempt as number));
+
+  attachRedactionMetadata(payload, name.metadata, queue.metadata);
+  return payload;
+}
+
+/** The same policy the response body answers to. A job result is not a weaker link. */
+function attachJobResult(
+  payload: Record<string, unknown>,
+  input: BackendJobEndEventInput,
+): void {
+  if (typeof input.result !== "string" || input.result === "") return;
+  const redacted = redactNetworkTextBody(input.result, {
+    path: "result",
+    mode: "structured",
+    ...(input.keepFields && input.keepFields.length > 0
+      ? { keepFields: [...input.keepFields] }
+      : {}),
+  });
+  if (redacted.body !== undefined) payload.result = redacted.body;
+  if (redacted.bodySummary) payload.resultSummary = redacted.bodySummary;
+  if (input.resultTruncated) payload.resultTruncated = true;
+  attachRedactionMetadata(payload, redacted.metadata);
 }
 
 function buildEvent(

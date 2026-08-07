@@ -2630,4 +2630,43 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
     expect(markdown).toContain("applyPromo src/checkout.ts:214");
   });
 
+
+  // Backend instrumentation was request-shaped throughout: the session recorded what the server did
+  // while the user waited and nothing about what it did afterwards.
+  it("prints what a background job did after the request finished", async () => {
+    const events: BugEvent[] = [
+      {
+        t: 1_700_001_000_000,
+        k: "backend.job.start",
+        offsetMs: 0,
+        d: { job: "record-payment", requestId: "r1", sessionId: "s1", queue: "payments", attempt: 2 },
+      },
+      {
+        t: 1_700_001_000_400,
+        k: "backend.job.end",
+        offsetMs: 400,
+        d: {
+          job: "record-payment",
+          requestId: "r1",
+          sessionId: "s1",
+          outcome: "skipped",
+          durationMs: 400,
+          result: '{"reason":"no_matching_order"}',
+        },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await postProcess(tmpDir);
+    const markdown = fs.readFileSync(path.join(tmpDir, "llm.md"), "utf-8");
+
+    expect(markdown).toContain("job record-payment");
+    // The word that carries the defect: the work was promised and did not happen.
+    expect(markdown).toContain("skipped");
+    expect(markdown).toContain("attempt 2");
+    expect(markdown).toContain("no_matching_order");
+  });
+
 });

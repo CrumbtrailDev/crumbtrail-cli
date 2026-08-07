@@ -669,6 +669,7 @@ export function buildEvidenceCandidates(
   addStaleViewAfterPopCandidates(events, index, drafts);
   addListenerGrowthCandidates(events, index, drafts);
   addStreamDesyncCandidates(events, index, drafts, exchanges);
+  addJobOutcomeCandidates(events, index, drafts);
 
   // Demote the 4xx responses the application returned deliberately (auth challenges, structured
   // error bodies) before dedupe so their grouped keys collapse. Ranking-only, like the beacon pass.
@@ -10683,6 +10684,110 @@ function addListenerTypeStaircaseCandidates(
       });
     }
   }
+}
+
+// ─── job_did_not_complete ────────────────────────────────────────────────────
+
+/** How many job findings one session may carry. */
+const MAX_JOB_CANDIDATES = 3;
+/** A job that failed outright. */
+const JOB_FAILED_SCORE = 66;
+/** A job that decided there was nothing to do. */
+const JOB_SKIPPED_SCORE = 58;
+/** A job that started and never reported an ending. */
+const JOB_UNFINISHED_SCORE = 52;
+
+/**
+ * job_did_not_complete: the request succeeded and the work it promised did not happen.
+ *
+ * This is the signature of a large share of enterprise defects and it is invisible from the request
+ * plane alone: the user clicked, the server answered 200, the confirmation appeared, and the job
+ * behind it failed, skipped itself, or never reported back. Nothing in the session looks wrong.
+ * The order simply has no payment against it.
+ *
+ * A `skipped` run is ranked as a finding rather than as normal operation on purpose. "Nothing to do"
+ * is exactly what a job says when the record it was supposed to act on is missing, and treating it
+ * as success is how the defect stays hidden.
+ */
+function addJobOutcomeCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const started = new Map<string, BugEvent>();
+  const emitted: CandidateDraft[] = [];
+
+  const keyOf = (event: BugEvent): string =>
+    `${safeText(event.d.job, 160) ?? "job"}:${safeText(event.d.jobId, 128) ?? ""}`;
+
+  for (const event of events) {
+    if (event.k === "backend.job.start") {
+      started.set(keyOf(event), event);
+      continue;
+    }
+    if (event.k !== "backend.job.end" && event.k !== "backend.job.error")
+      continue;
+
+    started.delete(keyOf(event));
+    const job = safeText(event.d.job, 160) ?? "job";
+    const outcome = safeText(event.d.outcome, 20);
+    const failed = event.k === "backend.job.error" || outcome === "failure";
+    if (!failed && outcome !== "skipped") continue;
+
+    const detail = isRecord(event.d.error)
+      ? (safeText(event.d.error.message, 300) ?? safeText(event.d.error.name, 120))
+      : safeText(event.d.result, 300);
+
+    emitted.push({
+      detector: "job_did_not_complete",
+      title: failed
+        ? `Background job ${job} failed after the request had already succeeded`
+        : `Background job ${job} decided there was nothing to do`,
+      severity: failed ? "high" : "medium",
+      score: failed ? JOB_FAILED_SCORE : JOB_SKIPPED_SCORE,
+      confidence: failed ? "high" : "medium",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        requestId: safeText(event.d.requestId, 128),
+        message: scrubText(
+          failed
+            ? `The job ${job} ran and failed. The request that enqueued it had already returned, so the session shows a success the application never finished delivering.${detail ? ` It reported: ${detail}` : ""}`
+            : `The job ${job} ran and skipped its work. "Nothing to do" is what a job says when the record it was meant to act on is missing, so the confirmation the user saw may describe work that never happened.${detail ? ` It reported: ${detail}` : ""}`,
+          400,
+        ),
+      }),
+      dedupeKey: `jobincomplete:${job}:${outcome ?? "failed"}`,
+    });
+  }
+
+  // A job that started and never ended is the same finding arrived at from the other side: nothing
+  // says it failed, and nothing says it worked.
+  for (const [, event] of started) {
+    const job = safeText(event.d.job, 160) ?? "job";
+    emitted.push({
+      detector: "job_did_not_complete",
+      title: `Background job ${job} started and never reported an ending`,
+      severity: "medium",
+      score: JOB_UNFINISHED_SCORE,
+      confidence: "low",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        requestId: safeText(event.d.requestId, 128),
+        message: scrubText(
+          `The job ${job} started and the session ended with no completion, failure or error recorded against it. Whether the work happened cannot be told from this capture; that it was not reported is itself the finding.`,
+          400,
+        ),
+      }),
+      dedupeKey: `jobunfinished:${job}`,
+    });
+  }
+
+  emitted
+    .sort((a, b) => b.score - a.score)
+    .slice(0, MAX_JOB_CANDIDATES)
+    .forEach((draft) => drafts.push(draft));
 }
 
 // ─── stream_desync ───────────────────────────────────────────────────────────
