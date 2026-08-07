@@ -175,6 +175,26 @@ path, so a truncated list is never mistaken for a short one. Anything else,
 including non JSON and oversized responses, carries the content type and byte
 size only.
 
+### Worker traffic (`worker.msg`)
+
+The `workers` collector is **on by default**. A worker is a second program with
+its own global scope: nothing this SDK patches exists inside it, so a `fetch`
+made there is not recorded and an error thrown there never reaches the page's
+handlers. Applications put parsing, pricing, sync and offline queues in workers,
+so a capture that says nothing about them can be silent about the whole
+computation that produced a wrong answer.
+
+What is observable from the window is the conversation. The collector wraps the
+`Worker` constructor and emits `{ id, script, op }` for `start`, for `error`
+(with the message the page never saw), and for each message as `op: "post"` and
+`op: "recv"` with a redacted `body` and a `seq` number. Messages answer to the
+same structured redaction as request bodies. A payload that is not text-shaped -
+a transferred buffer, a port - reports `opaque: true` rather than an invented
+summary.
+
+Bounded like socket frames: 2 KB per message, 40 messages per worker, 200 across
+the session.
+
 ### Form-shaped request bodies
 
 `fetch(url, { body: new URLSearchParams(form) })` and `body: new FormData(form)`

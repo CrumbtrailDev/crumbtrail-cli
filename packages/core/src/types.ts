@@ -495,6 +495,9 @@ export interface CrumbtrailConfig {
   // WebSocket lifecycle and redacted frames (`k:'net.ws'`)
   webSocket: boolean;
 
+  // Worker lifecycle and redacted messages (`k:'worker.msg'`)
+  workers: boolean;
+
   // Environment snapshot
   environment: boolean;
 
@@ -657,6 +660,8 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   eventSource: true,
 
   webSocket: true,
+
+  workers: true,
 
   environment: true,
 

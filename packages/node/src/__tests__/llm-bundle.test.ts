@@ -2531,4 +2531,53 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
     expect(markdown).toContain("mutation UpdateCart");
   });
 
+
+  // A worker is a second program with its own global scope: nothing this SDK patches exists inside
+  // it, so a failure there used to leave no trace in the bundle at all.
+  it("prints the worker conversation and the error the page never saw", async () => {
+    const events: BugEvent[] = [
+      {
+        t: 1_700_000_800_000,
+        k: "worker.msg",
+        offsetMs: 0,
+        d: { id: 1, script: "/pricing.worker.js", op: "start" },
+      },
+      {
+        t: 1_700_000_800_050,
+        k: "worker.msg",
+        offsetMs: 50,
+        d: {
+          id: 1,
+          script: "/pricing.worker.js",
+          op: "post",
+          seq: 1,
+          body: '{"op":"price","lines":3}',
+        },
+      },
+      {
+        t: 1_700_000_800_100,
+        k: "worker.msg",
+        offsetMs: 100,
+        d: {
+          id: 1,
+          script: "/pricing.worker.js",
+          op: "error",
+          msg: "pricing table missing",
+          posted: 1,
+          received: 0,
+        },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await postProcess(tmpDir);
+    const markdown = fs.readFileSync(path.join(tmpDir, "llm.md"), "utf-8");
+
+    expect(markdown).toContain("worker started");
+    expect(markdown).toContain('"op":"price"');
+    expect(markdown).toContain("pricing table missing");
+  });
+
 });
