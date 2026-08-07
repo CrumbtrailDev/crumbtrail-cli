@@ -3988,6 +3988,7 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
               ]),
           ),
           "",
+          ...renderLinkedPayloads(bundle.fullStackEvidence.linked),
         ]
       : []),
     ...(bundle.fullStackEvidence.gaps.length > 0
@@ -4237,6 +4238,76 @@ function renderCausalStructureSection(
       lines.push(
         `  - Symptom: ${symptom.id} · ${symptom.detector} — ${symptom.title}${conf}`,
       );
+    }
+  }
+  lines.push("");
+  return lines;
+}
+
+/** How many linked requests may contribute a payload block, matching the table above it. */
+const MAX_RENDERED_PAYLOADS = 10;
+
+/**
+ * The payloads of the linked requests, as blocks under the table.
+ *
+ * ============================================================================
+ * WHY THIS WAS THE LARGEST GAP IN THE BUNDLE
+ * ============================================================================
+ *
+ * `Linked Request Moments` renders a request's SHAPE — method, path, timing, status — and stopped
+ * there. Bodies were already captured, already redacted, and already present on these very entries
+ * in `llm.json`; the markdown simply never printed them. Everything in the bundle that did carry a
+ * body was failure-shaped (`LlmBundleFailedRequestSummary`, `LlmBundleNetworkErrorSummary`), which
+ * encodes an assumption that does not survive contact with real defects: that a bug announces
+ * itself with an error.
+ *
+ * Most correctness bugs are a 200 with the wrong value in it. A gift-card balance reading the
+ * issuance amount instead of the current one is a 200. A search filter excluding a row at exactly
+ * the boundary is a 200. In both, the request line is unremarkable and the answer is entirely in
+ * the body.
+ *
+ * Measured, over 108 bundle-only reads of 36 sessions: 74% ended `insufficient`, and when each
+ * reader was asked to name the ONE observation that would have settled it, three of the four
+ * failing scenarios asked for a response body — four times out of four in the gift-card case,
+ * naming the exact request that was already printed in the table one line above.
+ *
+ * Bounded to the same ten entries the table shows and printed only when a body exists, so a
+ * session of shape-only requests renders exactly as before.
+ */
+function renderLinkedPayloads(
+  linked: LlmBundleLinkedFullStackRequestSummary[],
+): string[] {
+  const withBodies = linked
+    .slice(0, MAX_RENDERED_PAYLOADS)
+    .filter(
+      (entry) =>
+        entry.frontend.requestBody !== undefined ||
+        entry.frontend.responseBody !== undefined,
+    );
+  if (withBodies.length === 0) return [];
+
+  const lines = [
+    "#### Linked Request Payloads",
+    "",
+    "Redacted and bounded. A request whose status is 200 can still carry the defect in its body.",
+    "",
+  ];
+  for (const entry of withBodies) {
+    const offset = entry.frontend.ref?.offsetMs;
+    const heading = [
+      entry.frontend.method,
+      entry.frontend.url,
+      entry.frontend.status !== undefined ? `— ${entry.frontend.status}` : undefined,
+      offset !== undefined ? `(${offset} ms)` : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ");
+    lines.push(`- **${heading}**`);
+    if (entry.frontend.requestBody !== undefined) {
+      lines.push(`  - request: \`${entry.frontend.requestBody}\``);
+    }
+    if (entry.frontend.responseBody !== undefined) {
+      lines.push(`  - response: \`${entry.frontend.responseBody}\``);
     }
   }
   lines.push("");
