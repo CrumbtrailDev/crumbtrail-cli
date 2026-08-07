@@ -260,6 +260,16 @@ function nodeKindFor(event: BugEvent): CausalNodeKind | undefined {
     // maps onto the same backend.error node kind as backend.req.error.
     case "backend.uncaught":
       return "backend.error";
+    // Background work. A job carries the requestId of the request that enqueued it, and request
+    // edges join on exactly that, so mapping a job onto the backend planes puts it in the same
+    // thread as the click it followed rather than in a plane of its own that nothing joins. A
+    // failed job is a backend failure by any reading; `backend.uncaught` already sets that
+    // precedent for server work that had no request of its own.
+    case "backend.job.start":
+    case "backend.job.end":
+      return "backend.req";
+    case "backend.job.error":
+      return "backend.error";
     case DB_DIFF_KIND:
       return "db.write";
     case OTEL_SPAN_KIND:
@@ -717,6 +727,11 @@ function nodeKindsForDetector(detector: string): Set<CausalNodeKind> {
     // to whatever did or did not follow it.
     case "click_target_intercepted":
       return new Set(["user.click"]);
+    // Without this the finding is always isolated - the same failure documented above for
+    // click_target_intercepted, and the reason a job that never ran would drop out of the incident
+    // thread it belongs to.
+    case "job_did_not_complete":
+      return new Set(["backend.error", "backend.req"]);
     case "console_error":
       return new Set(["console.error"]);
     // console_warning is intentionally NOT mapped: warn-level `con` events never become graph nodes
