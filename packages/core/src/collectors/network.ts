@@ -424,7 +424,13 @@ function applyFetchCorrelationHeaders(
 }
 
 /** Structured (v2) body redaction is the default; `redaction.mode: "full"` restores v1. */
-function bodyRedactionOptions(config: CrumbtrailConfig): {
+/**
+ * The application's own redaction settings, in the shape `redactNetworkTextBody` wants.
+ *
+ * Exported so every transport answers to one policy. A second copy would drift, and the first
+ * symptom of the drift would be a socket frame publishing a field the app had denied.
+ */
+export function bodyRedactionOptions(config: CrumbtrailConfig): {
   mode: "structured" | "full";
   denyFields?: string[];
   keepFields?: string[];

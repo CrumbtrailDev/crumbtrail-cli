@@ -10716,7 +10716,10 @@ function addStreamDesyncCandidates(
 ): void {
   const streams = new Map<string, BugEvent[]>();
   for (const event of events) {
-    if (event.k !== "net.sse") continue;
+    // Both push transports, because the finding is a property of a STREAM and not of a protocol:
+    // it dropped, it came back, and nothing replayed the gap. Server-sent events and WebSockets
+    // report the same `op`/`reopen` shape for exactly this reason.
+    if (event.k !== "net.sse" && event.k !== "net.ws") continue;
     const url = safeText(event.d.url, 400);
     if (!url) continue;
     const list = streams.get(url) ?? [];

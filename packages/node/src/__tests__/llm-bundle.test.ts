@@ -2411,4 +2411,71 @@ describe("llm bundle run compaction and detect-to-bundle latency", () => {
     expect(markdown).toContain("initialCents");
   });
 
+
+  // WebSocket traffic was captured by nothing and printed by nothing. For an application whose
+  // state arrives over a socket, a bundle that shows fetch and XHR and no frames is not a partial
+  // record, it is a misleading one: it reads as "no traffic explains this".
+  it("prints what a socket said, in both directions", async () => {
+    const events: BugEvent[] = [
+      {
+        t: 1_700_000_600_000,
+        k: "net.ws",
+        offsetMs: 0,
+        d: { id: 1, url: "wss://api.test/live", op: "open" },
+      },
+      {
+        t: 1_700_000_600_050,
+        k: "net.ws",
+        offsetMs: 50,
+        d: {
+          id: 1,
+          url: "wss://api.test/live",
+          op: "send",
+          seq: 1,
+          body: '{"op":"subscribe","room":"orders"}',
+        },
+      },
+      {
+        t: 1_700_000_600_100,
+        k: "net.ws",
+        offsetMs: 100,
+        d: {
+          id: 1,
+          url: "wss://api.test/live",
+          op: "msg",
+          seq: 1,
+          body: '{"op":"priceChanged","cents":1250}',
+        },
+      },
+      {
+        t: 1_700_000_600_200,
+        k: "net.ws",
+        offsetMs: 200,
+        d: {
+          id: 1,
+          url: "wss://api.test/live",
+          op: "close",
+          code: 1006,
+          clean: false,
+          received: 1,
+          sent: 1,
+        },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+    );
+    await postProcess(tmpDir);
+    const markdown = fs.readFileSync(path.join(tmpDir, "llm.md"), "utf-8");
+
+    expect(markdown).toContain("socket frame sent");
+    expect(markdown).toContain("subscribe");
+    // The server's own words. This is the line that was missing entirely.
+    expect(markdown).toContain("priceChanged");
+    // An unclean close mid-session is often the whole explanation for a page that stopped updating.
+    expect(markdown).toContain("code 1006");
+    expect(markdown).toContain("unclean");
+  });
+
 });
