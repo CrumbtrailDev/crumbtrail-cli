@@ -188,9 +188,18 @@ function normalize(value: string): string {
 // The core policy masks sensitive values but intentionally preserves JSON keys
 // for diagnostic shape. Derived LLM artifacts should not expose those key names
 // either, and older sessions may contain form bodies that predate the collector.
+//
+// One deliberate limit on this pass, measured. It refuses to match a value that opens a container:
+// the value alternation stops at the first `}`, so firing on an object does not redact it, it
+// corrupts it - a real capture rendered as `{[REDACTED_KEY]:[REDACTED]]","len":124,...`, valid
+// JSON turned into noise. A bare `card=` in a form body is still a card number and still redacts;
+// it is only `card: { ... }` - a gift card, a loyalty card, a business record - that this pass now
+// leaves to the structured policy, which walks the leaves and classifies each on its own name and
+// value. `[REDACTED]` is exempt from that guard - it is a placeholder core already wrote, not a
+// structure, and skipping it would leave the KEY name exposed.
 function hideSensitiveBodyFields(value: string): string {
   const sensitiveAssignment =
-    /(["']?)(?:access[-_]?token|api[-_]?key|auth(?:orization)?|bearer|card(?:[-_]?number)?|client[-_]?secret|cookie|credential(?:s)?|csrf|cvv|cvc|id[-_]?token|jwt|otp|pass(?:code|word|phrase)?|passwd|password(?:[-_]?confirmation)?|pin|private[-_]?key|pwd|refresh[-_]?token|secret|session(?:[-_]?id)?|sid|ssn|token|verification[-_]?code|xsrf)\1\s*([:=])\s*(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^,;&\s}\]]+)/gi;
+    /(["']?)(?:access[-_]?token|api[-_]?key|auth(?:orization)?|bearer|card(?:[-_]?number)?|client[-_]?secret|cookie|credential(?:s)?|csrf|cvv|cvc|id[-_]?token|jwt|otp|pass(?:code|word|phrase)?|passwd|password(?:[-_]?confirmation)?|pin|private[-_]?key|pwd|refresh[-_]?token|secret|session(?:[-_]?id)?|sid|ssn|token|verification[-_]?code|xsrf)\1\s*([:=])\s*(?:\[REDACTED\]|(?!\s*[{\[])(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^,;&\s}\]]+))/gi;
   return value
     .replace(sensitiveAssignment, "[REDACTED_KEY]$2[REDACTED]")
     .replace(/\b(?:supersecret|secret)[a-z0-9_-]*/gi, "[REDACTED]");
