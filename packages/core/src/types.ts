@@ -492,6 +492,9 @@ export interface CrumbtrailConfig {
   // Server-sent events lifecycle (`k:'net.sse'`)
   eventSource: boolean;
 
+  // WebSocket lifecycle and redacted frames (`k:'net.ws'`)
+  webSocket: boolean;
+
   // Environment snapshot
   environment: boolean;
 
@@ -652,6 +655,8 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   listeners: true,
 
   eventSource: true,
+
+  webSocket: true,
 
   environment: true,
 

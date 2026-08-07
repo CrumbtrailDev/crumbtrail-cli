@@ -184,6 +184,25 @@ recreated within 30 seconds of the last failure. That makes a stream which
 quietly drops and reconnects visible while the page shows stale data. Message
 payloads are never read.
 
+### WebSocket traffic (`net.ws`)
+
+The `webSocket` collector is **on by default**. It wraps the `WebSocket`
+constructor and emits `{ id, url, op }` for open, error, and close, with
+`received` and `sent` counts plus the close `code` and `clean` flag, and
+`reopen: true` when a socket to the same URL is recreated within 30 seconds of
+the last failure.
+
+It also carries the frames themselves, in both directions, as `op: "send"` and
+`op: "msg"` with a redacted `body` and a `seq` number. Frames answer to the same
+structured redaction policy as request and response bodies, including your own
+`denyFields` and `keepFields`, so a socket publishes no class of value your HTTP
+traffic does not. Binary frames report `binary: true` and a byte count only,
+never content.
+
+Three bounds keep a chatty socket from filling a session: 2 KB per frame, 40
+frames per socket, and 200 frames across the session. Past a cap the socket keeps
+counting and stops quoting, so the close event still reports the true totals.
+
 ### Listener accounting (`ui.listeners`)
 
 The `listeners` collector is **on by default** and disabled by `PRESET_LIGHT`.

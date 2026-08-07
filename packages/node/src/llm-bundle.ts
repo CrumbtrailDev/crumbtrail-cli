@@ -801,6 +801,10 @@ const IMPORTANT_EVENT_KINDS = new Set([
   "perf",
   "media.video",
   "media.voice",
+  // Push transports. A capture that patched fetch and XHR and then printed nothing a socket said
+  // reads as "no traffic explains this", which for a socket-driven application is false.
+  "net.sse",
+  "net.ws",
 ]);
 
 // Writes through the SessionStore seam, not fs: llm.md/llm.json are finalize-time
@@ -1483,6 +1487,47 @@ function boundAgentContextTimeline(
   return [...nonInteractions, ...interactions].sort((a, b) => a.t - b.t);
 }
 
+/**
+ * One line for a stream event, whichever transport carried it.
+ *
+ * A socket frame prints its content; a server-sent event has none to print, because that collector
+ * counts rather than quotes. The lifecycle lines matter on their own: an unclean close mid-session
+ * is often the whole explanation for a page that simply stopped updating.
+ */
+function describeStreamEvent(event: BugEvent): string | undefined {
+  const d = event.d;
+  const transport = event.k === "net.ws" ? "socket" : "stream";
+  const op = safeText(d.op, 20);
+  const url = safeUrl(d.url, `event.${event.k}.url`);
+  if (!op) return undefined;
+
+  if (op === "msg" || op === "send") {
+    const direction = op === "msg" ? "received" : "sent";
+    const body = safeText(d.body, 400);
+    const bytes = finiteNumber(d.bytes);
+    return joinParts([
+      `${transport} frame ${direction}`,
+      url,
+      d.binary === true
+        ? `binary${bytes !== undefined ? `, ${bytes} bytes` : ""}`
+        : body,
+    ]);
+  }
+
+  const received = finiteNumber(d.received) ?? finiteNumber(d.count);
+  const sent = finiteNumber(d.sent);
+  const code = finiteNumber(d.code);
+  return joinParts([
+    `${transport} ${op}`,
+    url,
+    d.reopen === true ? "reconnect" : undefined,
+    code !== undefined ? `code ${code}` : undefined,
+    d.clean === false ? "unclean" : undefined,
+    received !== undefined ? `${received} received` : undefined,
+    sent !== undefined ? `${sent} sent` : undefined,
+  ]);
+}
+
 function summarizeEvent(
   event: BugEvent,
   index: SessionIndexLike,
@@ -1580,6 +1625,10 @@ function summarizeEvent(
     const url = safeUrl(d.url, "event.net.err.url");
     const message = safeText(d.msg, 180);
     return joinParts(["network request error", method, url, message]);
+  }
+
+  if (event.k === "net.sse" || event.k === "net.ws") {
+    return describeStreamEvent(event);
   }
 
   if (event.k === "err" || event.k === "rej") {
