@@ -1193,39 +1193,37 @@ describe("buildCausalChain anchor selection", () => {
       ...over,
     }) as EvidenceCandidate;
 
-  it("finds the chain under a top-ranked candidate that anchors nothing", () => {
-    // The failure this pins, seen on three separate defects in one evaluation
-    // run: a generic whole-session detector (an N+1 on an unrelated route) wins
-    // the top slot, and the bundle ships causal_chain: null while the incident's
-    // own root and symptom sit intact two rows below. The judges each described
-    // it as "captured every decisive fact but never assembled them" — the
-    // assembly was there; nothing read past the first row.
+  it("stays null rather than assert a chain the top candidate does not anchor", () => {
+    // Deliberate, and reverted from the opposite behaviour on evidence. Walking
+    // down the ranked list for the first candidate that resolves does find a
+    // chain - just not the incident's. On a real gift-card balance defect it
+    // returned an HTTP 401 on /api/me, a page-load auth probe on a different
+    // route, as the causal story of the bug; the decisive UI-vs-API divergence
+    // was "isolated" and never a chain at all.
+    //
+    // A confident wrong chain is worse than an honest null. The real gap is in
+    // attribution - cross-plane contradictions are not linked to the request
+    // that produced them - and this projection must not paper over it.
     const chain = buildCausalChain([
       candidate({ id: "cand_0001", detector: "n_plus_one", title: "N+1 on /api/products" }),
       candidate({
         id: "cand_0002",
-        detector: "client_param_transform",
-        title: "outbound maxPrice=28",
+        detector: "unrelated_root",
+        title: "401 on /api/me",
         causalRole: "root",
         causes: ["cand_0003"],
       }),
       candidate({
         id: "cand_0003",
-        detector: "empty_result",
-        title: "search returned nothing",
+        detector: "http_error",
         causalRole: "symptom",
         rootCauseId: "cand_0002",
-        attributionConfidence: "high",
       }),
     ]);
-    expect(chain).not.toBeNull();
-    expect(chain!.root.id).toBe("cand_0002");
-    expect(chain!.symptoms.map((s) => s.id)).toEqual(["cand_0003"]);
+    expect(chain).toBeNull();
   });
 
-  it("still prefers the highest-ranked anchor that resolves", () => {
-    // Rank has to keep deciding. Walking the list must not turn into picking
-    // whichever root happens to be cheapest to resolve.
+  it("uses the top-ranked root when it does anchor a chain", () => {
     const chain = buildCausalChain([
       candidate({ id: "cand_0001", detector: "first_root", causalRole: "root", causes: ["cand_0002"] }),
       candidate({ id: "cand_0002", detector: "sym", causalRole: "symptom", rootCauseId: "cand_0001" }),
