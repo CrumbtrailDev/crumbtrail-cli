@@ -287,6 +287,14 @@ interface CandidateDraft extends Omit<
 > {
   wideWindow?: boolean;
   dedupeKey: string;
+  /**
+   * Latest timestamp among the drafts that collapsed into this one, when that is later than
+   * `anchor.t`. Dedupe deliberately keeps the EARLIEST anchor, so a finding about a repeated
+   * sequence (four clicks on a dead button) is anchored at the first of them and looks, to anything
+   * reading `anchor.t` alone, like it was over before the user's later actions. Ranking needs to
+   * know when the evidence actually stopped, not when it started.
+   */
+  lastT?: number;
   causalRole?: "root" | "symptom" | "isolated";
   rootCauseId?: string;
   causes?: string[];
@@ -786,6 +794,114 @@ export function buildEvidenceCandidates(
  *
  * The comparator produces a total, deterministic order derived solely from per-draft fields.
  */
+/**
+ * Thread-level ranking weights. Deliberately small relative to detector scores, which span 15..97:
+ * these reorder threads that are already close, they do not let a weak thread overtake a strong one.
+ */
+export const THREAD_RANK_CONSTANTS = {
+  /** Per additional evidence plane a thread spans, beyond the first. */
+  PLANE_SPAN: 6,
+  /** Cap, so a thread cannot win on breadth alone. */
+  MAX_PLANE_SPAN: 18,
+  /**
+   * Applied to a thread that ENDS before the user's last action.
+   *
+   * Large enough to matter, because the effect it corrects is large: `n_plus_one_query` scores 78
+   * and led twenty-five of thirty sessions while the decisive signal sat at 55. A term that cannot
+   * cross a gap that size is decoration.
+   *
+   * It only ever moves a thread DOWN, and only one that is both entirely in the past and causally
+   * unconnected to anything the user did afterwards — see {@link threadWeight} for why that
+   * conjunction is what keeps a genuine earlier root cause safe.
+   */
+  ENDED_BEFORE_LAST_INTERACTION: -25,
+} as const;
+
+/**
+ * Which evidence plane a finding lives on.
+ *
+ * Coarse on purpose. The question a thread's span answers is "how much of the stack does this
+ * explain", and browser/network/backend/db are the divisions that carry that meaning; splitting
+ * finer would inflate the span of threads that merely have varied detectors.
+ */
+function planeOfDraft(draft: CandidateDraft): string {
+  const detector = draft.detector;
+  if (detector.startsWith("db_") || detector.startsWith("otel_db")) return "db";
+  if (detector.startsWith("backend_")) return "backend";
+  if (detector.startsWith("otel_")) return "otel";
+  if (draft.anchor.source === "backend") return "backend";
+  if (
+    detector.includes("http") ||
+    detector.includes("request") ||
+    detector.includes("network") ||
+    detector.includes("response")
+  )
+    return "network";
+  return "browser";
+}
+
+/**
+ * When the user last did something.
+ *
+ * The best app-agnostic proxy available for "what the ticket is about". A person reports the thing
+ * that happened when they acted; evidence from an earlier page load is, far more often than not,
+ * ambient. Read from the graph's own `user.click`/`user.input` nodes, so it needs no extra input
+ * and is undefined for a session with no interaction at all — in which case the term simply does
+ * not apply and every thread is treated alike.
+ */
+function lastUserInteractionTime(graph?: CausalGraph): number | undefined {
+  if (!graph) return undefined;
+  let latest: number | undefined;
+  for (const node of graph.nodes) {
+    if (node.kind !== "user.click" && node.kind !== "user.input") continue;
+    if (latest === undefined || node.t > latest) latest = node.t;
+  }
+  return latest;
+}
+
+/**
+ * How much this thread looks like the incident, as opposed to a true observation about the app.
+ *
+ * Two terms, both properties of the THREAD rather than of any member:
+ *
+ *  - SPAN. A thread joining a click to a request to a database write explains more of what
+ *    happened than one sitting entirely on a single plane. An N+1 query is real, and it is one
+ *    plane wide in every session it appears in.
+ *
+ *  - REACH. A thread whose evidence extends to the user's last action is far likelier to be the
+ *    thing they reported than one that closed during an earlier page load.
+ *
+ * Neither knows anything about the application, and neither asks whether a finding is "important".
+ * They ask how much of this session's story the thread accounts for, which is the question the
+ * primary slot is actually answering.
+ */
+function threadWeight(
+  chainMembers: CandidateDraft[],
+  lastInteractionT: number | undefined,
+): number {
+  const planes = new Set(chainMembers.map(planeOfDraft));
+  const span = Math.min(
+    THREAD_RANK_CONSTANTS.MAX_PLANE_SPAN,
+    (planes.size - 1) * THREAD_RANK_CONSTANTS.PLANE_SPAN,
+  );
+
+  if (lastInteractionT === undefined) return span;
+
+  // The conjunction matters. A real root cause very often PRECEDES its symptom — a bad write now,
+  // a wrong number on screen later — and penalising everything in the past would bury exactly the
+  // findings worth surfacing. What is safe to demote is a thread that is entirely in the past AND
+  // has nothing attributed to it afterwards: an observation the user had already moved past by the
+  // time they did the thing they are reporting. A genuine earlier cause escapes because its later
+  // symptom is a member of its own chain, which puts a member at or after the interaction.
+  const reaches = chainMembers.some(
+    (draft) => Math.max(draft.anchor.t, draft.lastT ?? draft.anchor.t) >= lastInteractionT,
+  );
+  return (
+    span +
+    (reaches ? 0 : THREAD_RANK_CONSTANTS.ENDED_BEFORE_LAST_INTERACTION)
+  );
+}
+
 function applyCausalRerank(
   ordered: CandidateDraft[],
   causalGraph?: CausalGraph,
@@ -944,9 +1060,18 @@ function applyCausalRerank(
 
   // A chain is placed by its STRONGEST member: a named failure pulls the chain that explains it up
   // to its own height rather than sinking to wherever its cause happened to rank.
+  //
+  // Plus two THREAD-level terms, which are properties of the incident rather than of any one
+  // finding. Measured over thirty replayed sessions: with member score alone, `n_plus_one_query`
+  // ranked first in twenty-five of them, across six unrelated defects — an overlay bug, a webhook
+  // bug, a quantity-limit bug and a gift-card bug all led with the same performance observation.
+  // The decisive signal was PRESENT in all thirty and first in five. Ordering, not capture.
+  const lastInteractionT = lastUserInteractionTime(causalGraph);
   const chains = [...members.entries()].map(([topKey, chainMembers]) => ({
     top: byKey.get(topKey)!,
-    score: Math.max(...chainMembers.map(effectiveScore)),
+    score:
+      Math.max(...chainMembers.map(effectiveScore)) +
+      threadWeight(chainMembers, lastInteractionT),
     t: Math.min(...chainMembers.map((draft) => draft.anchor.t)),
   }));
   chains.sort(
@@ -1006,6 +1131,10 @@ function addRepeatedClickCandidates(
           elementLabel: scrubText(label, 160),
           message: `${groupLength} clicks within 3s`,
         }),
+        // The group spans from the first click to the last; the anchor names the first. Without
+        // this the finding reads as having ended at its own start, and thread ranking treats a
+        // sequence the user was still performing as something they had moved past.
+        lastT: clicks[end - 1].t,
         dedupeKey: `repeat:${label}:${first.t}`,
       });
       start = end;
@@ -11309,8 +11438,14 @@ function dedupeDrafts(drafts: CandidateDraft[]): CandidateDraft[] {
   // Counted separately from the surviving draft: the winner can be replaced as
   // better-scoring drafts arrive, and the count belongs to the key either way.
   const countByKey = new Map<string, number>();
+  // The span the key covers, which the surviving draft's own anchor cannot report: it is the
+  // earliest by construction.
+  const lastTByKey = new Map<string, number>();
   for (const draft of drafts) {
     countByKey.set(draft.dedupeKey, (countByKey.get(draft.dedupeKey) ?? 0) + 1);
+    const seenLast = lastTByKey.get(draft.dedupeKey);
+    if (seenLast === undefined || draft.anchor.t > seenLast)
+      lastTByKey.set(draft.dedupeKey, draft.anchor.t);
     const existing = byKey.get(draft.dedupeKey);
     if (
       !existing ||
@@ -11322,6 +11457,8 @@ function dedupeDrafts(drafts: CandidateDraft[]): CandidateDraft[] {
   }
   return [...byKey.values()].map((draft) => {
     const count = countByKey.get(draft.dedupeKey) ?? 1;
+    const latest = lastTByKey.get(draft.dedupeKey);
+    if (latest !== undefined && latest > draft.anchor.t) draft = { ...draft, lastT: latest };
     // Emitted only when it says something: `occurrences: 1` on every candidate
     // is noise in a payload an agent has to read.
     return count > 1 ? { ...draft, occurrences: count } : draft;

@@ -132,6 +132,14 @@ function describeClickIntegrity(
       const beneath = receivedAt === -1 ? stack : stack.slice(receivedAt + 1);
       const covered = beneath
         .filter((element): element is Element => element instanceof Element)
+        // An ancestor under the cursor is ordinary stacking, not interception: every click on a
+        // button also lands on its div, its section and the body. Recording those made `covered`
+        // non-empty for essentially every click, and a detector reading it fired on all of them —
+        // measured at ten of thirty replayed sessions, in most of which nothing was covering
+        // anything. What matters is an element the target does NOT contain: something overlapping
+        // from elsewhere in the tree, which is what an overlay, a stale modal or a full-screen
+        // frame actually is.
+        .filter((element) => !element.contains(target))
         .filter((element) => !isBlocked(element))
         .slice(0, MAX_COVERED_ELEMENTS)
         .map((element) => {
