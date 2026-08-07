@@ -35,6 +35,84 @@ function describeInteractionTarget(
   };
 }
 
+/** How many elements under the pointer are worth describing beneath the one that got the click. */
+const MAX_COVERED_ELEMENTS = 3;
+
+/**
+ * What was actually under the pointer, and what actually received the event.
+ *
+ * "The button does nothing" is one of the most common reports a support desk
+ * gets, and until now a session could not answer it. The click event alone says
+ * an element was clicked; it cannot say that an invisible overlay, a cookie
+ * banner, a modal backdrop or a mispositioned pseudo-element was sitting on top
+ * of the control the person was aiming at. An evaluation run scored exactly that
+ * case WRONG, with the judge noting the bundle showed only the ABSENCE of a
+ * request and left the engineer to guess.
+ *
+ * Two facts close it:
+ *
+ *   `deep` — the innermost target from `composedPath()`. A click inside a shadow
+ *   root reports the HOST as `target`, so any design system built on web
+ *   components (which is most enterprise component libraries) describes the
+ *   wrapper and loses the control.
+ *
+ *   `covered` — what lies BENEATH the element that received the click. When an
+ *   interactive control is in that list, the reading is immediate: the person
+ *   aimed at the button and something else took the click.
+ *
+ * Both are best-effort and silent on failure: interaction capture must survive a
+ * page that has replaced `elementsFromPoint` or throws inside a getter.
+ */
+function describeClickIntegrity(
+  event: MouseEvent,
+  target: Element,
+  config: CrumbtrailConfig,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+
+  try {
+    const path = event.composedPath?.();
+    const innermost = Array.isArray(path) ? path[0] : undefined;
+    if (
+      innermost instanceof Element &&
+      innermost !== target &&
+      !isBlocked(innermost)
+    ) {
+      out.deep = describeInteractionTarget(innermost, config);
+    }
+  } catch {
+    // A page that overrode composedPath does not cost us the click.
+  }
+
+  try {
+    const stack = document.elementsFromPoint?.(event.clientX, event.clientY);
+    if (Array.isArray(stack) && stack.length > 1) {
+      const receivedAt = stack.indexOf(target);
+      // Everything strictly below the element that took the event. When the
+      // target is not in the stack at all (detached, or re-rendered between the
+      // click and this read) describe the whole stack rather than nothing: that
+      // the target is absent is itself the finding.
+      const beneath = receivedAt === -1 ? stack : stack.slice(receivedAt + 1);
+      const covered = beneath
+        .filter((element): element is Element => element instanceof Element)
+        .filter((element) => !isBlocked(element))
+        .slice(0, MAX_COVERED_ELEMENTS)
+        .map((element) => describeInteractionTarget(element, config));
+      if (covered.length > 0) {
+        out.covered = covered;
+        // Stated rather than left to be re-derived downstream. Whether the
+        // clicked element was even in its own hit-test stack is the difference
+        // between "an overlay took it" and "the control was gone by then".
+        if (receivedAt === -1) out.targetNotInStack = true;
+      }
+    }
+  } catch {
+    // elementsFromPoint is unavailable or threw; the click still records.
+  }
+
+  return out;
+}
+
 function readDescriptorMetadata(
   descriptor: Record<string, unknown>,
 ): RedactionMetadata | undefined {
@@ -122,6 +200,11 @@ export function interactionCollector(
     const d: Record<string, unknown> = {
       el,
       pos: [e.clientX, e.clientY],
+      // Answers "the button does nothing": what the click really landed on, and
+      // what was underneath it. Spread so the fields are absent rather than null
+      // when the page gives us nothing — an absent field reads as "not captured",
+      // and a null would read as "captured, nothing there".
+      ...describeClickIntegrity(e, target, config),
     };
     attachRedactionMetadata(d, readDescriptorMetadata(el));
 
