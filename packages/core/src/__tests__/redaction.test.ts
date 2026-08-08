@@ -889,4 +889,20 @@ describe("keepFields on input values", () => {
   it("needs no keep for a value the classifier keeps anyway", () => {
     expect(redactInputValue("250", { name: "maxPrice" }).value).toBe("250");
   });
+
+  // A form value is a string even when it is a number, and the enum alphabet has no dot in it. Every
+  // price, rate and decimal quantity a user types lands here.
+  it("records a decimal the user typed", () => {
+    expect(redactInputValue("0.29", { name: "maxPrice", type: "number" }).value).toBe(
+      "0.29",
+    );
+    expect(redactInputValue("-12.5", { name: "adjustment" }).value).toBe("-12.5");
+  });
+
+  // Numeric classification must not become a way past the card check.
+  it("still catches a card number typed into a plain field", () => {
+    expect(redactInputValue("4111111111111111", { name: "reference" }).value).toBe(
+      REDACTED_VALUE,
+    );
+  });
 });
