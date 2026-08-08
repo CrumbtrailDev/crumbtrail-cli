@@ -474,6 +474,35 @@ export interface LlmBundleEnvironment {
  * correlated to the request via `requestId`. CP5 DB diffing. Sensitive columns were dropped in the
  * shim; bundle build re-runs the redaction policy as defense-in-depth.
  */
+/**
+ * One call the server made outward, from a `backend.http` event.
+ *
+ * The application's own semantic fields travel with it — `service`, `operation`, and whatever
+ * else the integration named (a charge id, a charge status, an attempt number) — because those are
+ * the fields that say what the call was FOR. A row reading "POST 200" proves reachability and
+ * nothing else; "payments charge succeeded, ch_0001" is the evidence.
+ */
+export interface LlmBundleOutboundCall {
+  t: number;
+  iso?: string;
+  offsetMs?: number;
+  /** The integration the application named, e.g. `payments`, `pricing`. */
+  service?: string;
+  /** What it was doing, when the application said so, e.g. `charge`. */
+  operation?: string;
+  method?: string;
+  url?: string;
+  /** `0` on a call that never got a response — the transport failed. */
+  status?: number;
+  durationMs?: number;
+  /** The transport-level failure, when there was one, e.g. `fetch failed`. */
+  error?: string;
+  /** The inbound request being served when this call went out. */
+  requestId?: string;
+  /** Redacted application-supplied fields beyond the transport ones above. */
+  detail?: Record<string, unknown>;
+}
+
 export interface LlmBundleDbDiff {
   t: number;
   iso?: string;
@@ -594,6 +623,13 @@ export interface LlmBundle {
   databaseReads: LlmBundleDbRead[];
   /** OTel DB spans/statements (`db.*` attributes), explicitly not row diffs. */
   databaseActivity: LlmBundleDbActivity[];
+  /**
+   * Calls the SERVER made outward, to a third party or a sibling service (`k:'backend.http'`);
+   * `[]` when none. Distinct from `fullStackEvidence`, which pairs a browser request with the
+   * server handler that answered it — this is the leg beyond that handler, where a gateway, a
+   * pricing service or a webhook lives.
+   */
+  outboundCalls: LlmBundleOutboundCall[];
   media: {
     alignment: {
       sessionStartMs: number;
@@ -934,6 +970,7 @@ export function buildLlmBundle({
     ),
     environment: buildEnvironment(events),
     ...(causalTree.length > 0 ? { causalTree } : {}),
+    outboundCalls: buildOutboundCalls(events, session.startMs),
     databaseDiffs: buildDatabaseDiffs(events, session.startMs),
     databaseReads: buildDatabaseReads(events, session.startMs),
     databaseActivity: buildDatabaseActivity(events, session.startMs),
@@ -2067,6 +2104,60 @@ export function normalizeDbEngine(value: unknown): DbEngine {
  * were already dropped in the shim; we re-run the shared redaction policy over each image as
  * defense-in-depth so secret-looking values can never rest in the bundle.
  */
+/** Transport fields rendered as columns; everything else the application attached goes to `detail`. */
+const OUTBOUND_TRANSPORT_FIELDS = new Set([
+  "service",
+  "operation",
+  "method",
+  "url",
+  "status",
+  "durationMs",
+  "error",
+  "requestId",
+]);
+
+function buildOutboundCalls(
+  events: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleOutboundCall[] {
+  const calls: LlmBundleOutboundCall[] = [];
+  for (const event of events) {
+    if (event.k !== "backend.http" || !isRecord(event.d)) continue;
+
+    const detail: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(event.d)) {
+      if (OUTBOUND_TRANSPORT_FIELDS.has(key) || value === undefined) continue;
+      detail[key] = value;
+    }
+
+    calls.push(
+      removeUndefined({
+        t: event.t,
+        iso: iso(event.t),
+        offsetMs:
+          finiteNumber(event.offsetMs) ??
+          offsetFromStart(event.t, sessionStartMs),
+        service: safeText(event.d.service, 80),
+        operation: safeText(event.d.operation, 80),
+        method: safeText(event.d.method, 12),
+        url: safeUrl(event.d.url, "event.backend.http.url"),
+        status: finiteNumber(event.d.status),
+        durationMs: finiteNumber(event.d.durationMs),
+        error: safeText(event.d.error, 300),
+        requestId: safeCorrelationId(event.d.requestId, 200),
+        detail:
+          Object.keys(detail).length > 0
+            ? (redactValue(detail, "backend.http.detail").value as Record<
+                string,
+                unknown
+              >)
+            : undefined,
+      }),
+    );
+  }
+  return calls;
+}
+
 function buildDatabaseDiffs(
   events: BugEvent[],
   sessionStartMs: number,
@@ -4292,6 +4383,7 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
           "",
         ]
       : []),
+    ...renderOutboundCallsSection(bundle.outboundCalls),
     ...renderDatabaseDiffSection(bundle.databaseDiffs),
     ...renderDatabaseReadSection(bundle.databaseReads ?? []),
     ...renderDatabaseActivitySection(bundle.databaseActivity),
@@ -4584,6 +4676,68 @@ function renderCausalStructureSection(
     }
   }
   lines.push("");
+  return lines;
+}
+
+/** A bound on rendered outbound calls; the rest stay in `bundle.json`. */
+const MAX_RENDERED_OUTBOUND_CALLS = 20;
+
+/**
+ * What the server called outward.
+ *
+ * `fullStackEvidence` pairs a browser request with the server handler that answered it and stops
+ * there. The leg BEYOND that handler — the payment gateway, the pricing service, the webhook — was
+ * captured as `backend.http` and rendered nowhere, so a bundle could hold a successful charge
+ * against a gateway and a sibling service that never answered, and show a reader neither.
+ *
+ * That is the whole subject of a large class of defect: the third party said yes and the callback
+ * never came, or the call failed and the application carried on as though it had not. Both are
+ * invisible in the request/response pair, because the request succeeded.
+ *
+ * The application's own fields ride in `detail` rather than being dropped to a status code. A row
+ * reading "POST 200" proves reachability; "payments charge succeeded, ch_0001" is the evidence.
+ */
+function renderOutboundCallsSection(
+  calls: LlmBundleOutboundCall[] | undefined,
+): string[] {
+  if (!calls || calls.length === 0) return [];
+  const shown = calls.slice(0, MAX_RENDERED_OUTBOUND_CALLS);
+  const lines = [
+    "## Outbound Service Calls",
+    "",
+    "Calls the server made outward, to a third party or a sibling service, correlated to the "
+      + "inbound request that issued them. A call that SUCCEEDED is as much evidence as one that "
+      + "failed: a gateway that accepted a charge and a callback that never arrived look identical "
+      + "in the request that started them. Read `status: 0` as no response at all rather than a "
+      + "zero-valued one.",
+    "",
+    table(
+      ["Offset", "Service", "Operation", "Call", "Result", "Detail", "Request ID"],
+      shown.map((call) => [
+        call.offsetMs !== undefined ? `${call.offsetMs} ms` : "unknown",
+        call.service ?? "",
+        call.operation ?? "",
+        [call.method, call.url].filter(Boolean).join(" ") || "",
+        call.error
+          ? `failed: ${call.error}`
+          : [
+              call.status !== undefined ? String(call.status) : "",
+              call.durationMs !== undefined ? `${call.durationMs} ms` : "",
+            ]
+              .filter(Boolean)
+              .join("; "),
+        call.detail ? truncate(JSON.stringify(call.detail), 300) : "",
+        call.requestId ?? "",
+      ]),
+    ),
+    "",
+  ];
+  if (calls.length > shown.length) {
+    lines.push(
+      `${calls.length - shown.length} further outbound call(s) are in \`bundle.json\` under \`outboundCalls\`.`,
+      "",
+    );
+  }
   return lines;
 }
 
