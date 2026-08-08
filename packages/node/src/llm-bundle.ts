@@ -4348,13 +4348,19 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
           ...renderLinkedPayloads(bundle.fullStackEvidence.linked),
         ]
       : []),
-    ...(bundle.fullStackEvidence.gaps.length > 0
+    // `backend-only` rows moved to their own section: a request the server received that no
+    // browser sent is traffic, not a shortfall in capture, and listing it here told a reader to
+    // discount the one row a webhook defect turns on.
+    ...(bundle.fullStackEvidence.gaps.filter(
+      (entry) => entry.type !== "backend-only",
+    ).length > 0
       ? [
           "### Partial-Linkage Gaps",
           "",
           table(
             ["Type", "Request ID", "Session ID", "Frontend", "Backend"],
             bundle.fullStackEvidence.gaps
+              .filter((entry) => entry.type !== "backend-only")
               .slice(0, 10)
               .map((entry) => [
                 entry.type,
@@ -4383,6 +4389,7 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
           "",
         ]
       : []),
+    ...renderServerInitiatedRequestsSection(bundle.fullStackEvidence),
     ...renderOutboundCallsSection(bundle.outboundCalls),
     ...renderDatabaseDiffSection(bundle.databaseDiffs),
     ...renderDatabaseReadSection(bundle.databaseReads ?? []),
@@ -4676,6 +4683,68 @@ function renderCausalStructureSection(
     }
   }
   lines.push("");
+  return lines;
+}
+
+/**
+ * Requests that reached the server with no browser request behind them.
+ *
+ * These arrive as `backend-only` linkage gaps, and calling them a GAP is the mistake: a gap is a
+ * shortcoming in capture, and the framing tells a reader to discount the row. A request the server
+ * received that no browser sent is not a capture shortcoming — it is a webhook, a payment callback,
+ * a cron, or another service, which is to say it is traffic, and often the traffic the defect is
+ * about.
+ *
+ * The section renders when NONE arrived too, and that is the point. A charge that succeeds against
+ * a gateway and a settlement callback that never comes are indistinguishable from inside the
+ * request that started them: the checkout returns 200 either way. "No request reached this server
+ * that a browser did not send" is the fact that separates them, and a reader forbidden from
+ * assuming cannot infer it from a table that simply has no such row.
+ */
+function renderServerInitiatedRequestsSection(
+  evidence: LlmBundleFullStackEvidence | undefined,
+): string[] {
+  if (!evidence) return [];
+  // Absence proves nothing when the server was never observed at all.
+  if ((evidence.summary.backendRequests ?? 0) === 0) return [];
+
+  const count = evidence.summary.gapTypes?.["backend-only"] ?? 0;
+  const shown = evidence.gaps.filter((gap) => gap.type === "backend-only");
+  const lines = [
+    "## Inbound Requests With No Browser Origin",
+    "",
+    "Requests this server received that no browser request in this session caused — webhooks, "
+      + "third-party callbacks, scheduled jobs, other services. Counted against the backend requests "
+      + "observed for this session, so read an empty list as a measured absence rather than as "
+      + "something not looked for.",
+    "",
+  ];
+  if (count === 0 || shown.length === 0) {
+    lines.push(
+      `None. Across ${evidence.summary.backendRequests} backend request(s) observed, every one was `
+        + "issued by a browser request in this session. If something was expected to call in and "
+        + "nothing did, that absence is here.",
+      "",
+    );
+    return lines;
+  }
+  lines.push(
+    table(
+      ["Request ID", "Session ID", "Request"],
+      shown.map((gap) => [
+        gap.requestId ?? gap.backend?.requestId ?? "",
+        gap.sessionId ?? gap.backend?.sessionId ?? "",
+        gap.backend ? summarizeBackendRequestForMarkdown(gap.backend) : "",
+      ]),
+    ),
+    "",
+  );
+  if (count > shown.length) {
+    lines.push(
+      `${count - shown.length} further inbound request(s) are in \`bundle.json\` under \`fullStackEvidence.gaps\`.`,
+      "",
+    );
+  }
   return lines;
 }
 
