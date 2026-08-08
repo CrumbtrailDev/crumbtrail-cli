@@ -4231,8 +4231,10 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
               "Backend",
               "Status",
             ],
-            bundle.fullStackEvidence.linked
-              .slice(0, 10)
+            selectLinkedForRendering(
+              bundle.fullStackEvidence.linked,
+              MAX_RENDERED_PAYLOADS,
+            )
               .map((entry) => [
                 entry.frontend.ref?.offsetMs !== undefined
                   ? `${entry.frontend.ref.offsetMs} ms`
@@ -4512,6 +4514,47 @@ function renderCausalStructureSection(
 const MAX_RENDERED_PAYLOADS = 10;
 
 /**
+ * Which linked requests get rendered, when there are more than the cap allows.
+ *
+ * The cap used to be `.slice(0, 10)` — the first ten, chronologically. A session opens with a burst
+ * of page-load GETs, so those ten were always the boot sequence, and the request the user's action
+ * produced was always past the cut. Measured: on the promo-code case, four readers out of four
+ * asked for "the checkout request and response showing what discount the server computed" — a
+ * request the session had captured, linked, and then declined to print, while printing ten reads of
+ * the product list.
+ *
+ * Selection instead of truncation. A request that CHANGED something, or that failed, is kept
+ * unconditionally; the remaining slots go to the most recent of the rest, because a defect is
+ * noticed after it happens and the requests nearest the end are the ones nearest the report. Output
+ * stays in chronological order either way, so a reader still gets a sequence rather than a ranking.
+ */
+export function selectLinkedForRendering(
+  linked: LlmBundleLinkedFullStackRequestSummary[],
+  limit: number,
+): LlmBundleLinkedFullStackRequestSummary[] {
+  if (linked.length <= limit) return linked;
+
+  const timeOf = (entry: LlmBundleLinkedFullStackRequestSummary): number =>
+    entry.frontend.ref?.offsetMs ?? entry.backend.start?.offsetMs ?? 0;
+  const decisive = (entry: LlmBundleLinkedFullStackRequestSummary): boolean => {
+    const method = (entry.frontend.method ?? "").toUpperCase();
+    if (method && method !== "GET" && method !== "HEAD" && method !== "OPTIONS") return true;
+    const status = entry.frontend.status ?? entry.backend.statusCode;
+    return status !== undefined && status >= 400;
+  };
+
+  const kept = linked.filter(decisive).slice(-limit);
+  const remaining = limit - kept.length;
+  const filler =
+    remaining > 0
+      ? linked.filter((entry) => !kept.includes(entry)).slice(-remaining)
+      : [];
+  return [...kept, ...filler].sort((a, b) => timeOf(a) - timeOf(b));
+}
+
+
+
+/**
  * The payloads of the linked requests, as blocks under the table.
  *
  * ============================================================================
@@ -4541,8 +4584,7 @@ const MAX_RENDERED_PAYLOADS = 10;
 function renderLinkedPayloads(
   linked: LlmBundleLinkedFullStackRequestSummary[],
 ): string[] {
-  const withBodies = linked
-    .slice(0, MAX_RENDERED_PAYLOADS)
+  const withBodies = selectLinkedForRendering(linked, MAX_RENDERED_PAYLOADS)
     .filter(
       (entry) =>
         entry.frontend.requestBody !== undefined ||
