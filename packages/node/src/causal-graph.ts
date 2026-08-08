@@ -732,6 +732,11 @@ function nodeKindsForDetector(detector: string): Set<CausalNodeKind> {
     // thread it belongs to.
     case "job_did_not_complete":
       return new Set(["backend.error", "backend.req"]);
+    // The finding IS the disagreement between a response and what was drawn from it, so the response
+    // is the node it belongs on. Without an entry here it reports `isolated` and drops out of the
+    // incident thread - the same failure already paid for by click_target_intercepted.
+    case "stale_value_rendered":
+      return new Set(["net.res", "net.req"]);
     case "console_error":
       return new Set(["console.error"]);
     // console_warning is intentionally NOT mapped: warn-level `con` events never become graph nodes

@@ -664,6 +664,7 @@ export function buildEvidenceCandidates(
   addInputRevertedCandidates(events, index, drafts);
   addFormResetAfterErrorCandidates(events, index, drafts);
   addCurrencyLocaleMismatchCandidates(events, index, drafts);
+  addStaleValueRenderedCandidates(events, index, drafts, exchanges);
   addDisplayDateTimezoneMismatchCandidates(events, index, drafts);
   addLayoutOverflowCandidates(events, index, drafts);
   addStaleViewAfterPopCandidates(events, index, drafts);
@@ -10117,6 +10118,157 @@ function addDisplayDateTimezoneMismatchCandidates(
       return;
     }
   }
+}
+
+// ─── stale_value_rendered ────────────────────────────────────────────────────
+
+/**
+ * A number the page is still showing after the server told it a different one.
+ *
+ * This is the shape of a whole class of defect that no request-plane rule can see: every request
+ * succeeded, every response was correct, and the screen is wrong. A balance updates and the header
+ * keeps the old figure; a cache serves a superseded price; a component reads a prop it captured
+ * before the mutation. Nothing in the network log looks like a failure, because nothing failed
+ * there - the defect lives entirely in the disagreement between the last value sent and the value
+ * displayed.
+ *
+ * The rule is deliberately narrow about what counts as evidence and broad about where it applies.
+ * It fires only when the SAME field changed value during the session, so a constant is never a
+ * finding, and only when the screen shows an EARLIER value of that field after a later one arrived.
+ * A screen number matching nothing, or matching the current value, says nothing either way.
+ */
+const STALE_VALUE_RENDERED_SCORE = 88;
+/** Distinct fields tracked. A response full of numbers must not become a session full of findings. */
+const MAX_TRACKED_NUMERIC_FIELDS = 200;
+/** Emissions per session. */
+const MAX_STALE_VALUE_CANDIDATES = 5;
+/** Deepest object level walked in a response body. */
+const MAX_NUMERIC_WALK_DEPTH = 6;
+
+/** One value a response carried for one field name, and when it arrived. */
+interface NumericFieldObservation {
+  value: number;
+  t: number;
+  path: string;
+}
+
+/**
+ * Numeric leaves of a response body, keyed by field NAME rather than by full path.
+ *
+ * By name because the same quantity appears at different paths in different responses - `balance`
+ * at the top of a read and at `data.card.balance` in a write's echo - and a rule keyed on the full
+ * path would treat those as unrelated fields and see no change at all.
+ */
+function collectNumericFields(
+  exchanges: Map<string, RequestExchange>,
+): Map<string, NumericFieldObservation[]> {
+  const byName = new Map<string, NumericFieldObservation[]>();
+
+  const walk = (value: unknown, name: string, path: string, depth: number, t: number): void => {
+    if (depth > MAX_NUMERIC_WALK_DEPTH) return;
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) return;
+      if (!byName.has(name) && byName.size >= MAX_TRACKED_NUMERIC_FIELDS) return;
+      const list = byName.get(name) ?? [];
+      list.push({ value, t, path });
+      byName.set(name, list);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const entry of value) walk(entry, name, path, depth + 1, t);
+      return;
+    }
+    if (!isRecord(value)) return;
+    for (const [key, entry] of Object.entries(value)) {
+      walk(entry, key.toLowerCase(), path ? `${path}.${key}` : key, depth + 1, t);
+    }
+  };
+
+  for (const exchange of exchanges.values()) {
+    if (!exchange.res || !isSuccessStatus(exchange.status)) continue;
+    const payload = responsePayload(exchange.resBody, exchange.resBodyMeta);
+    if (payload === undefined) continue;
+    walk(payload, "", "", 0, exchange.res.t);
+  }
+
+  for (const list of byName.values()) list.sort((a, b) => a.t - b.t);
+  return byName;
+}
+
+/**
+ * Whether a displayed number and a stored number are the same quantity.
+ *
+ * The x100 relation is currency minor units, which is close to universal in payment and ledger
+ * APIs: the server keeps cents and the screen shows dollars. Nothing else is allowed, because a
+ * looser tolerance would let any two numbers of similar magnitude match and the rule would report
+ * coincidences.
+ */
+function sameQuantity(shown: number, stored: number): boolean {
+  if (shown === stored) return true;
+  return Math.abs(shown * 100 - stored) < 0.5;
+}
+
+function addStaleValueRenderedCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const fields = collectNumericFields(exchanges);
+  if (fields.size === 0) return;
+
+  const emitted: CandidateDraft[] = [];
+  const seen = new Set<string>();
+
+  for (const event of events) {
+    if (event.k !== "ui.num") continue;
+    for (const item of uiNumItems(event)) {
+      for (const [name, observations] of fields) {
+        // A field that never changed cannot be shown stale, and checking it first keeps the common
+        // case (ids, counts, constants) out of the inner comparison entirely.
+        const before = observations.filter((entry) => entry.t <= event.t);
+        if (before.length < 2) continue;
+        const current = before[before.length - 1];
+        const earlier = before
+          .slice(0, -1)
+          .find((entry) => entry.value !== current.value && sameQuantity(item.value, entry.value));
+        if (!earlier) continue;
+        if (sameQuantity(item.value, current.value)) continue;
+
+        const key = `stalevalue:${name}:${item.label}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        emitted.push({
+          detector: "stale_value_rendered",
+          title: `The page is showing a superseded value for ${item.label}`,
+          severity: "high",
+          score: STALE_VALUE_RENDERED_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: event.t,
+            offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+            route: routeAt(index.navs ?? [], event.t),
+            elementLabel: scrubText(item.label, 120),
+            message: scrubText(
+              `\`${item.label}\` reads ${item.value} on screen. The last value the server sent for ` +
+                `\`${current.path || name}\` was ${current.value}, ${Math.round(event.t - current.t)} ms ` +
+                `earlier; ${earlier.value} is what that field held before it changed. Every request ` +
+                `succeeded, so the disagreement is between the response and what was rendered from it.`,
+              400,
+            ),
+          }),
+          dedupeKey: key,
+        });
+      }
+    }
+  }
+
+  drafts.push(
+    ...emitted
+      .sort((a, b) => a.anchor.t - b.anchor.t)
+      .slice(0, MAX_STALE_VALUE_CANDIDATES),
+  );
 }
 
 // ─── currency_locale_mismatch ────────────────────────────────────────────────
