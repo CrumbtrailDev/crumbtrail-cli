@@ -218,7 +218,10 @@ describe("application-declared input keeps", () => {
     vi.restoreAllMocks();
   });
 
-  async function typedValues(keepFields: string[]) {
+  async function typedValues(
+    keepFields: string[],
+    redaction: Record<string, unknown> = {},
+  ) {
     document.body.innerHTML = `
       <input id="filter" name="maxPrice">
       <input id="who" name="fullName">
@@ -235,7 +238,7 @@ describe("application-declared input keeps", () => {
       network: false,
       flushIntervalMs: 100_000,
       flushBufferSize: 1_000,
-      redaction: { keepFields },
+      redaction: { keepFields, ...redaction },
     });
 
     filter.dispatchEvent(new Event("input", { bubbles: true }));
@@ -255,6 +258,16 @@ describe("application-declared input keeps", () => {
   it("masks a name the shopper typed", async () => {
     const values = await typedValues([]);
 
+    expect(values.some((value) => value.includes("Ada"))).toBe(false);
+  });
+
+  // The deployment-level opt-out counsel required.
+  it("records nothing a user typed when the application opts out", async () => {
+    const values = await typedValues(["maxPrice", "fullName"], {
+      captureInputValues: false,
+    });
+
+    expect(values.some((value) => value.includes("250"))).toBe(false);
     expect(values.some((value) => value.includes("Ada"))).toBe(false);
   });
 

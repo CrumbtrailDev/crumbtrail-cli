@@ -24,6 +24,12 @@ export interface CliConfig {
    * is still removed.
    */
   keepFields: string[];
+  /**
+   * Whether input values a user typed may be stored. `false` makes every input a placeholder
+   * regardless of the application's own policy, since a deployment decision must outrank an
+   * application one. Defaults to `true`.
+   */
+  captureInputValues: boolean;
   ai: boolean;
   aiModel?: string;
   aiAllowAutoModel: boolean;
@@ -48,6 +54,7 @@ export function defaultCliConfig(): CliConfig {
     mcp: false,
     allowedOrigins: [],
     keepFields: [],
+    captureInputValues: true,
     ai: false,
     aiAllowAutoModel: false,
   };
@@ -81,6 +88,8 @@ export function parseCliConfig(args: string[]): CliConfig {
     } else if (args[i] === "--keep-field" && args[i + 1]) {
       config.keepFields.push(...splitFieldList(args[i + 1]));
       i++;
+    } else if (args[i] === "--no-input-values") {
+      config.captureInputValues = false;
     } else if (args[i] === "--ai") {
       config.ai = true;
     } else if (args[i] === "--ai-model" && args[i + 1]) {
@@ -108,6 +117,14 @@ export function parseCliConfig(args: string[]): CliConfig {
     ...splitFieldList(process.env.CRUMBTRAIL_KEEP_FIELDS ?? ""),
   );
   config.keepFields = [...new Set(config.keepFields)];
+
+  // The deployment-level opt-out for recording what users type. Either the flag or the environment
+  // variable turns it off; neither can turn it back on once the other has, because a switch that can
+  // only remove is the only kind a privacy control should be.
+  const inputEnv = (process.env.CRUMBTRAIL_CAPTURE_INPUT_VALUES ?? "").trim().toLowerCase();
+  if (inputEnv === "0" || inputEnv === "false" || inputEnv === "no") {
+    config.captureInputValues = false;
+  }
 
   return config;
 }

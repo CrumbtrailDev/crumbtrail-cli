@@ -247,3 +247,42 @@ describe("keep fields (--keep-field vs CRUMBTRAIL_KEEP_FIELDS)", () => {
     ]);
   });
 });
+
+/**
+ * The deployment-level opt-out counsel required. An operator's decision must outrank the
+ * application's, so this only ever removes.
+ */
+describe("input value capture (--no-input-values)", () => {
+  const ENV = "CRUMBTRAIL_CAPTURE_INPUT_VALUES";
+  const original = process.env[ENV];
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV];
+    else process.env[ENV] = original;
+  });
+
+  it("stores what users type by default", () => {
+    delete process.env[ENV];
+
+    expect(parseCliConfig([]).captureInputValues).toBe(true);
+  });
+
+  it("stops storing it on the flag", () => {
+    delete process.env[ENV];
+
+    expect(parseCliConfig(["--no-input-values"]).captureInputValues).toBe(false);
+  });
+
+  it("stops storing it on the environment variable", () => {
+    for (const value of ["0", "false", "no", "NO"]) {
+      process.env[ENV] = value;
+      expect(parseCliConfig([]).captureInputValues).toBe(false);
+    }
+  });
+
+  it("is not turned back on by an environment variable saying so", () => {
+    process.env[ENV] = "1";
+
+    expect(parseCliConfig(["--no-input-values"]).captureInputValues).toBe(false);
+  });
+});

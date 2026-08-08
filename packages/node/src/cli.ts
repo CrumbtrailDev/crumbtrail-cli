@@ -23,6 +23,7 @@ import { runFixContext } from "./run-fix-context";
 import { runInspect } from "./run-inspect";
 import { runReanalyze } from "./run-reanalyze";
 import { runCompare } from "./run-compare";
+import { setCaptureInputValues } from "crumbtrail-core";
 import { setStorageKeepFields } from "./storage-plane";
 import { readPackageVersion } from "./version";
 
@@ -86,6 +87,9 @@ Options:
   --keep-field <a,b>  Field names to keep verbatim instead of redacting by name
                       (repeatable, or set CRUMBTRAIL_KEEP_FIELDS). Value based
                       detection still removes tokens and card numbers inside them.
+  --no-input-values   Never store what users typed into form fields (or set
+                      CRUMBTRAIL_CAPTURE_INPUT_VALUES=0). Overrides the
+                      application's own redaction.captureInputValues setting.
   --whisper-model <m> Whisper model for audio transcription (default base)
   --mcp               Start the stdio MCP server instead of the HTTP server
   --ai                Enable opt in AI opinion (see --ai-model)
@@ -300,6 +304,7 @@ export async function runCli(argv: string[]): Promise<number> {
     authToken,
     allowedOrigins,
     keepFields,
+    captureInputValues,
     ai,
     aiModel,
     aiAllowAutoModel,
@@ -308,6 +313,7 @@ export async function runCli(argv: string[]): Promise<number> {
   // Applied before anything can be stored, and before the MCP branch: the MCP
   // server reads sessions the same sanitizer wrote.
   setStorageKeepFields(keepFields);
+  setCaptureInputValues(captureInputValues);
 
   if (mcp) {
     const mcpServer = new McpServer({ outputDir: output });
@@ -344,6 +350,7 @@ export async function runCli(argv: string[]): Promise<number> {
       authToken,
       allowedOrigins,
       keepFields,
+      captureInputValues,
       ai,
       aiModel,
       aiAllowAutoModel,
@@ -381,6 +388,11 @@ export function startupMessages(config: CliConfig): string[] {
     messages.push(
       `Keeping these field names verbatim instead of redacting by name: ${config.keepFields.join(", ")}`,
     );
+  }
+  // Said at boot for the mirror-image reason: it is the one setting here that makes the server store
+  // LESS than it does by default, and an operator who set it wants to see that it took.
+  if (!config.captureInputValues) {
+    messages.push("Input values are not stored: nothing a user types is recorded");
   }
   if (config.ai) {
     messages.push(
