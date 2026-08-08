@@ -4293,6 +4293,7 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
         ]
       : []),
     ...renderDatabaseDiffSection(bundle.databaseDiffs),
+    ...renderDatabaseReadSection(bundle.databaseReads ?? []),
     ...renderDatabaseActivitySection(bundle.databaseActivity),
     ...renderCausalStructureSection(bundle.causalTree),
     "## Key Timeline Moments",
@@ -4408,6 +4409,81 @@ function formatCallsiteChain(
  * chain says which line changed it, innermost frame first, so a reader working
  * a ticket goes straight to the handler instead of grepping for the table name.
  */
+/** How many distinct read rows the markdown renders. Everything is in `bundle.json` regardless. */
+const MAX_RENDERED_DB_READS = 40;
+/** Rows per table, so one wide read cannot spend every slot. */
+const MAX_RENDERED_DB_READS_PER_TABLE = 5;
+
+/**
+ * Rows the session READ.
+ *
+ * `databaseReads` has been built, redacted and written to `bundle.json` all along, and the markdown
+ * the reader is actually handed never printed a single one of them - the same shape of failure as
+ * the response bodies before them: captured, present, unrendered.
+ *
+ * The section exists because rendering only rows that CHANGED encodes the assumption that a defect
+ * is something the application did. A large class of defect is something it read: a promotion whose
+ * validity window is stored back to front so no instant can fall inside it, a flag off for one
+ * account, a price row in the wrong currency. Every request succeeds, nothing is written, and the
+ * answer is a row the session already has. Measured on the promo-code case, where the captured
+ * coupon row carries `valid_from` 2026-07-19 against `valid_until` 2026-07-18 - the entire defect,
+ * in a row the bundle held and did not show.
+ *
+ * Deduplicated on table plus row content, so a page that reads the same product twenty times costs
+ * one line, while a row whose VALUE changed between two reads is kept as two - that difference is
+ * evidence in its own right.
+ *
+ * Then capped PER TABLE rather than globally. A catalogue read returns forty product rows and a
+ * coupon lookup returns one, so a flat cap spends every slot on the catalogue and drops the single
+ * row the session turned on. Breadth of tables first, depth within a table second: the reader learns
+ * which tables the request consulted, and gets a sample of each.
+ */
+export function renderDatabaseReadSection(reads: LlmBundleDbRead[]): string[] {
+  if (reads.length === 0) return [];
+
+  const seen = new Set<string>();
+  const perTable = new Map<string, LlmBundleDbRead[]>();
+  for (const read of reads) {
+    const key = `${read.table}\u0000${JSON.stringify(read.row)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const rows = perTable.get(read.table) ?? [];
+    rows.push(read);
+    perTable.set(read.table, rows);
+  }
+
+  const shown = [...perTable.values()]
+    .flatMap((rows) => rows.slice(0, MAX_RENDERED_DB_READS_PER_TABLE))
+    .sort((a, b) => a.t - b.t)
+    .slice(0, MAX_RENDERED_DB_READS);
+  const deduped = seen.size;
+
+  const lines = [
+    "## Database Rows Read",
+    "",
+    "Rows this session's requests read, deduplicated and correlated to the request that read them. A request that answers 200 and writes nothing can still be answering out of a row that is wrong, so read these as the data the application acted on rather than as data it produced.",
+    "",
+    table(
+      ["Offset", "Table", "Key", "Row", "Request ID"],
+      shown.map((read) => [
+        read.offsetMs !== undefined ? `${read.offsetMs} ms` : "unknown",
+        read.table,
+        read.pk ? JSON.stringify(read.pk) : "",
+        truncate(JSON.stringify(read.row), 300),
+        read.requestId ?? "",
+      ]),
+    ),
+    "",
+  ];
+  if (deduped > shown.length) {
+    lines.push(
+      `${deduped - shown.length} further distinct row(s) are in \`bundle.json\` under \`databaseReads\`.`,
+      "",
+    );
+  }
+  return lines;
+}
+
 function renderDatabaseDiffSection(diffs: LlmBundleDbDiff[]): string[] {
   if (diffs.length === 0) return [];
   const shown = diffs.slice(0, 25);
