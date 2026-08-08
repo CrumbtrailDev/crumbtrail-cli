@@ -46,8 +46,12 @@ export interface GithubRepoSource {
 
 const ROOT = "/";
 
-/** Paths whose contents detection reads, independent of what the repo holds. */
-const ALWAYS_READ = [
+/**
+ * Manifests detection reads inside ONE directory, independent of what the repo
+ * holds. Applied at the repo root, at every workspace member, and at every
+ * directory the discover.ts scan pass classifies.
+ */
+const DIR_MANIFEST = [
   "package.json",
   "pnpm-workspace.yaml",
   "nx.json",
@@ -150,8 +154,19 @@ function workspaceGlobs(pkgJson: string | null): string[] {
   return [];
 }
 
-/** Expand a workspace glob against the tree. Only trailing /* and /** occur. */
+/**
+ * Expand a workspace entry against the tree. Only trailing /* and /** occur as
+ * wildcards; a literal entry ("website") resolves to that one directory, which
+ * is how detect.ts expandWorkspaceGlobs reads it. Treating a literal as a glob
+ * would yield its CHILDREN and skip the directory itself, leaving the member's
+ * package.json unhydrated and throwing UnhydratedPathError on first read.
+ */
 function expandGlob(snap: Snapshot, glob: string): string[] {
+  if (glob.startsWith("!")) return []; // exclusion, same as detect.ts
+  if (!glob.includes("*")) {
+    const literal = norm(glob);
+    return snap.dirs.has(literal) ? [literal] : [];
+  }
   const cleaned = glob.replace(/\/\*\*$/, "").replace(/\/\*$/, "");
   const base = norm(cleaned);
   const deep = glob.endsWith("/**");
@@ -162,6 +177,42 @@ function expandGlob(snap: Snapshot, glob: string): string[] {
     const rest = dir.slice(base === ROOT ? 1 : base.length + 1);
     if (!deep && rest.includes("/")) continue;
     out.push(dir);
+  }
+  return out;
+}
+
+// Mirrors discover.ts: the scan pass re-runs detect() on the children of these
+// parents plus the repo root, so those directories' manifests must be hydrated
+// even when nothing declares them as workspaces.
+const SCAN_PARENTS = ["apps", "services", "packages"];
+const SCAN_SKIP_DIRS = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  "out",
+  "coverage",
+  "target",
+  "vendor",
+  "__pycache__",
+  ".next",
+  ".git",
+]);
+const MAX_SCAN_DIRS = 200;
+
+/** The directories discover.ts would classify in its scan pass. */
+function scanDirs(snap: Snapshot): string[] {
+  const parents = [
+    ...SCAN_PARENTS.map((p) => norm(p)).filter((d) => snap.dirs.has(d)),
+    ROOT,
+  ];
+  const out: string[] = [];
+  for (const parent of parents) {
+    for (const entry of snap.children.get(parent) ?? []) {
+      if (out.length >= MAX_SCAN_DIRS) return out;
+      if (entry.startsWith(".") || SCAN_SKIP_DIRS.has(entry)) continue;
+      const dir = parent === ROOT ? `${ROOT}${entry}` : `${parent}/${entry}`;
+      if (snap.dirs.has(dir)) out.push(dir);
+    }
   }
   return out;
 }
@@ -227,7 +278,7 @@ export async function hydrateGithubReader(
 
   // Round one: fixed manifest at the repository root.
   await fetchInto(snap, source, [
-    ...ALWAYS_READ,
+    ...DIR_MANIFEST,
     ...TARGET_CANDIDATES,
     ...(options.extraPaths ?? []),
   ]);
@@ -241,11 +292,14 @@ export async function hydrateGithubReader(
       if (m) globs.push(m[1]);
     }
   }
+  // Every directory detection will classify: declared workspace members, plus
+  // the conventional dirs discover.ts scans for non-JS services.
+  const dirs = new Set<string>(scanDirs(snap));
+  for (const glob of globs) for (const d of expandGlob(snap, glob)) dirs.add(d);
+
   const memberPaths: string[] = [];
-  for (const glob of globs) {
-    for (const dir of expandGlob(snap, glob)) {
-      memberPaths.push(`${dir}/package.json`, `${dir}/index.html`);
-    }
+  for (const dir of dirs) {
+    for (const file of DIR_MANIFEST) memberPaths.push(`${dir}/${file}`);
   }
   if (memberPaths.length) await fetchInto(snap, source, memberPaths);
 
