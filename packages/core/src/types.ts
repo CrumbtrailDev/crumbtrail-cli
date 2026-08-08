@@ -293,6 +293,11 @@ export interface DbReadBulkEventData {
   emittedRows: number;
   truncatedRows: number;
   samplePks: Array<Record<string, unknown>>;
+  /**
+   * Which SELECT in the request this was, matching `stmt` on the per-row read events. Present on a
+   * zero-row read, where it is the only thing distinguishing one empty lookup from another.
+   */
+  stmt?: number;
 }
 
 export type InteractionElementDescriptor = Record<string, unknown>;

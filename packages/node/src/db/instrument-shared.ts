@@ -486,6 +486,39 @@ export function emitDbReadEvents(input: {
     );
   }
 
+  // A SELECT that matched nothing used to leave no trace at all: the per-row loop above never
+  // runs, and `rowCount > emittedRows` is `0 > 0`. So "the code asked for a row and there wasn't
+  // one" — a null dereference, an empty state, a lookup against the wrong key or the wrong time
+  // window — was the one database outcome a session could not record.
+  //
+  // It emits the same bulk event, with `rowCount: 0`. Counted against the per-request row budget so
+  // a request doing many empty lookups is bounded exactly as one reading many rows is.
+  if (rowCount === 0) {
+    const remaining = perRequestCap - (emittedReadRowsByRequest.get(requestId) ?? 0);
+    if (remaining > 0) {
+      emitDbEvent(
+        options,
+        buildDbReadBulkEvent({
+          engine,
+          table,
+          requestId,
+          rowCount: 0,
+          emittedRows: 0,
+          samplePks: [],
+          ...(stmt !== undefined ? { stmt } : {}),
+          sessionId: options.sessionId,
+          now: options.now?.(),
+          sessionStartedAt: options.sessionStartedAt,
+        }),
+      );
+      emittedReadRowsByRequest.set(
+        requestId,
+        (emittedReadRowsByRequest.get(requestId) ?? 0) + 1,
+      );
+    }
+    return;
+  }
+
   if (rowCount > emittedRows) {
     for (
       let index = emittedRows;

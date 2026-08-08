@@ -35,6 +35,8 @@ export interface BuildDbReadBulkEventInput {
   rowCount: number;
   emittedRows: number;
   samplePks: Array<Record<string, unknown>>;
+  /** Which SELECT in the request this was; the only way to tell two empty lookups apart. */
+  stmt?: number;
   sessionId?: string;
   now?: number;
   sessionStartedAt?: number | Date;
@@ -100,6 +102,7 @@ export function buildDbReadBulkEvent(
     emittedRows: input.emittedRows,
     truncatedRows: Math.max(0, input.rowCount - input.emittedRows),
     samplePks: input.samplePks,
+    ...(input.stmt !== undefined ? { stmt: input.stmt } : {}),
   };
   const event: BugEvent = {
     t: now,
