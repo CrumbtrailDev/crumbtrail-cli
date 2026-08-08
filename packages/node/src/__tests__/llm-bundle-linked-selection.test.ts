@@ -7,7 +7,9 @@ import { selectLinkedForRendering } from "../llm-bundle";
  * user's action produced - which is the one every reader asked for.
  */
 describe("which linked requests the markdown renders", () => {
-  function entry(offsetMs: number, method: string, url: string, status = 200) {
+  type Linked = Parameters<typeof selectLinkedForRendering>[0][number];
+
+  function entry(offsetMs: number, method: string, url: string, status = 200): Linked {
     return {
       requestId: `r${offsetMs}`,
       sessionId: "s1",
@@ -27,14 +29,14 @@ describe("which linked requests the markdown renders", () => {
         statusCode: status,
         start: { offsetMs },
       },
-    } as never;
+    } as unknown as Linked;
   }
 
   const boot = Array.from({ length: 15 }, (_, i) =>
     entry(i * 10, "GET", "/api/products"),
   );
 
-  function urls(entries: ReturnType<typeof entry>[]): string[] {
+  function urls(entries: Linked[]): string[] {
     return entries.map(
       (item) => (item as { frontend: { url: string } }).frontend.url,
     );
