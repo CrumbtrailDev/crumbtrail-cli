@@ -554,6 +554,24 @@ export interface LlmBundleDbRead {
   requestId?: string;
 }
 
+/**
+ * A SELECT that matched nothing.
+ *
+ * There is no row to show, which is exactly why it needs its own shape: a bundle that renders rows
+ * renders nothing for the one database outcome behind null dereferences, empty states, and lookups
+ * against the wrong key or the wrong time window.
+ */
+export interface LlmBundleEmptyRead {
+  t: number;
+  iso?: string;
+  offsetMs?: number;
+  engine: DbEngine;
+  table: string;
+  /** Which SELECT in the request this was; the only way to tell two empty lookups apart. */
+  stmt?: number;
+  requestId?: string;
+}
+
 export interface LlmBundleDbActivity {
   t: number;
   iso?: string;
@@ -622,6 +640,8 @@ export interface LlmBundle {
   databaseDiffs: LlmBundleDbDiff[];
   /** Redaction-aware rows read during the session (`k:'db.read'`); `[]` when none. */
   databaseReads: LlmBundleDbRead[];
+  /** SELECTs that matched nothing (`k:'db.read.bulk'` with `rowCount: 0`); `[]` when none. */
+  emptyReads: LlmBundleEmptyRead[];
   /** OTel DB spans/statements (`db.*` attributes), explicitly not row diffs. */
   databaseActivity: LlmBundleDbActivity[];
   /**
@@ -974,6 +994,7 @@ export function buildLlmBundle({
     outboundCalls: buildOutboundCalls(events, session.startMs),
     databaseDiffs: buildDatabaseDiffs(events, session.startMs),
     databaseReads: buildDatabaseReads(events, session.startMs),
+    emptyReads: buildEmptyReads(events, session.startMs),
     databaseActivity: buildDatabaseActivity(events, session.startMs),
     media,
     degradedCapabilities,
@@ -2287,6 +2308,34 @@ function normalizeDbCallsite(
     fn: safeText(raw.fn, 200),
     stack: stack && stack.length > 0 ? stack : undefined,
   }) as LlmBundleDbCallsite;
+}
+
+function buildEmptyReads(
+  events: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleEmptyRead[] {
+  const empties: LlmBundleEmptyRead[] = [];
+  for (const event of events) {
+    if (event.k !== "db.read.bulk" || !isRecord(event.d)) continue;
+    if (finiteNumber(event.d.rowCount) !== 0) continue;
+    const table = safeText(event.d.table, 200);
+    if (!table) continue;
+
+    empties.push(
+      removeUndefined({
+        t: event.t,
+        iso: iso(event.t),
+        offsetMs:
+          finiteNumber(event.offsetMs) ??
+          offsetFromStart(event.t, sessionStartMs),
+        engine: normalizeDbEngine(event.d.engine),
+        table,
+        stmt: finiteNumber(event.d.stmt),
+        requestId: safeCorrelationId(event.d.requestId, 200),
+      }) as LlmBundleEmptyRead,
+    );
+  }
+  return empties.sort((a, b) => a.t - b.t).slice(0, 100);
 }
 
 function buildDatabaseReads(
@@ -4438,6 +4487,7 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
     ...renderOutboundCallsSection(bundle.outboundCalls),
     ...renderDatabaseDiffSection(bundle.databaseDiffs),
     ...renderDatabaseReadSection(bundle.databaseReads ?? []),
+    ...renderEmptyReadsSection(bundle.emptyReads),
     ...renderDatabaseActivitySection(bundle.databaseActivity),
     ...renderDetectedSignalsSection(bundle.distinctBugs),
     ...renderCausalStructureSection(bundle.causalTree),
@@ -4729,6 +4779,44 @@ function renderCausalStructureSection(
   }
   lines.push("");
   return lines;
+}
+
+/**
+ * Lookups that came back with nothing.
+ *
+ * The bundle renders ROWS, so a SELECT that matched none rendered nothing, and until now the
+ * capture did not even record one — the per-row loop had no rows to walk and the truncation branch
+ * compared `0 > 0`. So the single database outcome behind null dereferences, empty states, and
+ * lookups against the wrong key or the wrong time window was the one a session could not show.
+ *
+ * It is stated as a question the code asked and an answer it got, because that is what makes it
+ * evidence: "this request asked `coupons` for something and there was nothing there" separates code
+ * that read the wrong thing from data that was wrong, and those have different fixes.
+ */
+function renderEmptyReadsSection(
+  empties: LlmBundleEmptyRead[] | undefined,
+): string[] {
+  if (!empties || empties.length === 0) return [];
+  return [
+    "## Lookups That Found Nothing",
+    "",
+    "SELECTs this session ran that matched no rows, correlated to the request that ran them. A "
+      + "query returning nothing is not an error and raises nothing, so it reaches a reader only "
+      + "here. Read it as the question the code asked and the answer it got: a lookup against the "
+      + "wrong key, the wrong tenant or the wrong time window looks exactly like this, and so does a "
+      + "row that genuinely does not exist yet.",
+    "",
+    table(
+      ["Offset", "Table", "Statement", "Request ID"],
+      empties.map((empty) => [
+        empty.offsetMs !== undefined ? `${empty.offsetMs} ms` : "unknown",
+        empty.table,
+        empty.stmt !== undefined ? `#${empty.stmt}` : "",
+        empty.requestId ?? "",
+      ]),
+    ),
+    "",
+  ];
 }
 
 /** A bound on rendered outbound calls; the rest stay in `bundle.json`. */
