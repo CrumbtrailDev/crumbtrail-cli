@@ -683,10 +683,12 @@ export function buildEvidenceCandidates(
   downrankTrackerBeacons(drafts, events, index);
 
   const deduped = dedupeDrafts(drafts);
-  // Baseline order (score desc, anchor.t asc, dedupeKey asc). The causal re-rank below only reorders
-  // symptoms relative to their roots; absent a graph it is a no-op and this order is preserved.
+  // Baseline order (correctness before efficiency, then score desc, anchor.t asc, dedupeKey asc).
+  // The causal re-rank below only reorders symptoms relative to their roots; absent a graph it is a
+  // no-op and this order is preserved.
   const ordered = deduped.sort(
     (a, b) =>
+      efficiencyRank(a.detector) - efficiencyRank(b.detector) ||
       b.score - a.score ||
       a.anchor.t - b.anchor.t ||
       a.dedupeKey.localeCompare(b.dedupeKey),
@@ -1001,6 +1003,13 @@ function applyCausalRerank(
   // Sibling / singleton order, and the tie-break everywhere else: higher effective score, then the
   // historical anchor-time and dedupeKey keys.
   const byRank = (a: CandidateDraft, b: CandidateDraft): number => {
+    // Class before score, matching the baseline order this re-rank sits on top of. Without it the
+    // re-rank puts an efficiency finding back at the top of the session whenever it happens to be a
+    // chain root, which is most sessions - the graph has no opinion about whether "expensive" beats
+    // "wrong".
+    const ca = efficiencyRank(a.detector);
+    const cb = efficiencyRank(b.detector);
+    if (ca !== cb) return ca - cb;
     const sa = effectiveScore(a);
     const sb = effectiveScore(b);
     if (sa !== sb) return sb - sa;
@@ -1070,15 +1079,26 @@ function applyCausalRerank(
   // bug, a quantity-limit bug and a gift-card bug all led with the same performance observation.
   // The decisive signal was PRESENT in all thirty and first in five. Ordering, not capture.
   const lastInteractionT = lastUserInteractionTime(causalGraph);
-  const chains = [...members.entries()].map(([topKey, chainMembers]) => ({
-    top: byKey.get(topKey)!,
-    score:
-      Math.max(...chainMembers.map(effectiveScore)) +
-      threadWeight(chainMembers, lastInteractionT),
-    t: Math.min(...chainMembers.map((draft) => draft.anchor.t)),
-  }));
+  const chains = [...members.entries()].map(([topKey, chainMembers]) => {
+    // A chain is placed by its strongest CORRECTNESS member when it has one. Scoring it by its
+    // strongest member outright let a chain whose only real content is an N+1 query borrow that
+    // query's height, and a session's whole ordering then turned on a performance observation.
+    const correctness = chainMembers.filter(
+      (draft) => efficiencyRank(draft.detector) === 0,
+    );
+    const scoredMembers = correctness.length > 0 ? correctness : chainMembers;
+    return {
+      top: byKey.get(topKey)!,
+      efficiencyOnly: correctness.length === 0 ? 1 : 0,
+      score:
+        Math.max(...scoredMembers.map(effectiveScore)) +
+        threadWeight(chainMembers, lastInteractionT),
+      t: Math.min(...chainMembers.map((draft) => draft.anchor.t)),
+    };
+  });
   chains.sort(
     (a, b) =>
+      a.efficiencyOnly - b.efficiencyOnly ||
       b.score - a.score ||
       a.t - b.t ||
       a.top.dedupeKey.localeCompare(b.top.dedupeKey),
@@ -10293,6 +10313,35 @@ function addStaleValueRenderedCandidates(
       .sort((a, b) => a.anchor.t - b.anchor.t)
       .slice(0, MAX_STALE_VALUE_CANDIDATES),
   );
+}
+
+
+/**
+ * Detectors whose subject is COST rather than correctness.
+ *
+ * An N+1 query and a slow request are real and worth fixing, and they are also true of most pages
+ * most of the time - which is why, ranked purely on score, they led 23 of 30 measured sessions while
+ * the defect the session was captured for sat eight rows down. A reader that starts at the top and
+ * stops reading is handed a performance note in answer to "the balance is wrong".
+ *
+ * So class beats score: anything that says the application produced a WRONG RESULT outranks anything
+ * that says it produced the right result expensively. Within each class, score orders as before.
+ * Nothing is dropped or rescored; the efficiency findings are still there, below the answer.
+ *
+ * The set is deliberately small and hard to argue with. `repeated_clicks` and `layout_overflow` look
+ * like performance and are not: a user clicking four times is telling you the thing did not work,
+ * and content overflowing its container is a rendering defect. Only findings whose entire claim is
+ * "this was slower or heavier than it needed to be" belong here.
+ */
+const EFFICIENCY_DETECTORS = new Set([
+  "n_plus_one_query",
+  "slow_request",
+  "latency_outlier",
+  "listener_growth",
+]);
+
+function efficiencyRank(detector: string): number {
+  return EFFICIENCY_DETECTORS.has(detector) ? 1 : 0;
 }
 
 // ─── displayed_field_mismatch ────────────────────────────────────────────────
