@@ -140,24 +140,26 @@ describe("interactionCollector", () => {
     input.name = "username";
     document.body.appendChild(input);
 
-    input.value = "alice";
+    // Free prose. The deny-biased classifier keeps numbers and short enum-like strings and redacts
+    // everything else, so this is the redacted side of the same policy a request body answers to.
+    input.value = "the totals looked wrong to me";
     input.dispatchEvent(new Event("input", { bubbles: true }));
     bus.flush();
 
     const inpEvents = events.filter((e) => e.k === "inp");
     expect(inpEvents).toHaveLength(1);
-    expect(inpEvents[0].d.val).toBe(maskText("alice"));
+    expect(inpEvents[0].d.val).toBe(maskText("the totals looked wrong to me"));
     expect(inpEvents[0].d.valSummary).toMatchObject({
       kind: "input",
       action: "redacted",
-      reason: "input_value",
+      reason: "free_text_value",
     });
     expect(inpEvents[0].d.redaction).toMatchObject({
       policy: BROWSER_REDACTION_POLICY,
       fields: [
         expect.objectContaining({
           path: "val",
-          reason: "input_value",
+          reason: "free_text_value",
           action: "redacted",
         }),
       ],

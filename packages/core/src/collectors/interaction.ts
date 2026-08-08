@@ -296,10 +296,11 @@ export function interactionCollector(
       type,
       path: "val",
     });
-    // `maskAllInputs` decides how a redacted value is rendered, not whether the value is redacted.
-    // When the redaction policy already cleared the field - the application named it in
-    // `redaction.keepFields` and its content passed every value check - masking it here would throw
-    // the answer away a second time, after the one place entitled to make that call said keep.
+    // `maskAllInputs` stays the blanket for DOM snapshots and keystrokes, where there is no field
+    // name and no policy to consult. This event has both, so the redaction policy decides and
+    // `maskAllInputs` only chooses how a value it already redacted is rendered. Re-masking a value
+    // the policy kept would throw the answer away a second time, after the one place entitled to
+    // make that call said keep.
     const val =
       isUnmasked(target) || redacted.metadata === undefined
         ? { value: target.value, summary: undefined, metadata: undefined }

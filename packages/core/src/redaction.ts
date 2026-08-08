@@ -2325,39 +2325,53 @@ export function redactInputValue(
 
   const path = options.path ?? "input.value";
   const type = options.type?.toLowerCase();
+  const keepFields = getRedactionKeepFields();
 
-  // An application-declared keep applies to a form field the same way it applies to a JSON key or a
-  // query parameter: the application named this field, so it is asserting the field holds its own
-  // data and not the user's secrets. The default is unchanged - every input is still masked unless
-  // the application asks for one by name.
-  //
-  // Two things the keep cannot buy. A credential input is never kept whatever it is called, because
-  // `keepFields` is a list of field names and an application that reuses a name for a password field
-  // would be surprised by what it published. And the value still goes through the same classifier as
-  // a body value, so a card number, a token or an email pasted into a kept field is caught on its
-  // content rather than trusted for its name.
-  const credentialInput = type === "password" || type === "email" || type === "tel";
-  if (!credentialInput && isStructuredKeepName(options.name, getRedactionKeepFields())) {
-    const classification = classifyStructuredValue(
-      value,
-      options.name,
-      undefined,
-      getRedactionKeepFields(),
-    );
-    if (classification.action === "keep") return { value };
+  // A credential input is redacted on its type alone, before anything looks at what was typed. No
+  // field name and no application setting reaches this, because the one thing worse than losing a
+  // field is publishing a password because someone named it `note`.
+  if (type === "password" || type === "email" || type === "tel") {
+    return redactedInput(value, path, "sensitive_input_value");
   }
 
-  const reason =
-    credentialInput ||
-    type === "search" ||
-    isSensitiveName(options.name)
-      ? "sensitive_input_value"
-      : "input_value";
-  const summary = buildSummary("input", "redacted", reason, value.length);
+  // A field the built-in heuristics call sensitive - `ssn`, `cvv`, `dob` - is redacted on the name.
+  // An application-declared keep overrides that here for the same reason it does in a request body:
+  // those heuristics match by substring and have real false positives.
+  if (
+    isSensitiveName(options.name) &&
+    !isStructuredKeepName(options.name, keepFields)
+  ) {
+    return redactedInput(value, path, "sensitive_input_value");
+  }
 
+  // What is left goes through the same deny-biased classifier as a value in a request body. Numbers
+  // and short enum-like strings survive; free prose, emails, JWTs, card numbers, IBANs and
+  // high-entropy strings do not, whatever field they were typed into.
+  //
+  // Recording nothing at all was the safer-looking default and it cost real answers: a shopper types
+  // a price ceiling of 0.29, the request carries 28, and a capture holding only one of those two
+  // numbers cannot show the defect that sits between them. The value is what the classifier already
+  // keeps everywhere else in this SDK; there is no reason the same "250" is evidence in a query
+  // string and a secret in the box the user typed it into.
+  const classification = classifyStructuredValue(
+    value,
+    options.name,
+    undefined,
+    keepFields,
+  );
+  if (classification.action === "keep") return { value };
+
+  return redactedInput(value, path, classification.reason ?? "input_value");
+}
+
+function redactedInput(
+  value: string,
+  path: string,
+  reason: string,
+): RedactionResult<string> {
   return withMetadata(
     REDACTED_VALUE,
     { path, reason, action: "redacted" },
-    summary,
+    buildSummary("input", "redacted", reason, value.length),
   );
 }

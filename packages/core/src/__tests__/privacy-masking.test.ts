@@ -41,7 +41,7 @@ describe("production privacy masking", () => {
       </section>
       <input id="masked-input" placeholder="Private placeholder" aria-label="Private aria label" aria-description="Private aria description">
       <select id="masked-select" aria-label="Private select aria">
-        <option value="private-option-value">Private option text</option>
+        <option value="catalog-option-value">Private option text</option>
       </select>
       <section data-crumbtrail-block id="blocked">Blocked private text <input id="blocked-input"></section>
     `;
@@ -57,8 +57,8 @@ describe("production privacy masking", () => {
     const maskedSelect = document.querySelector(
       "#masked-select",
     ) as HTMLSelectElement;
-    maskedInput.value = "masked-value-123";
-    unmaskedChildInput.value = "descendant-value-456";
+    maskedInput.value = "masked private value one two three";
+    unmaskedChildInput.value = "descendant private value four five six";
     blockedInput.value = "blocked-value-789";
 
     const transport = makeTransport();
@@ -151,9 +151,9 @@ describe("production privacy masking", () => {
     const leaks = [
       "Rage private text",
       "Rage private aria",
-      "masked-value-123",
+      "masked private value one two three",
       "Descendant private text",
-      "descendant-value-456",
+      "descendant private value four five six",
       "Descendant private placeholder",
       "Descendant private aria",
       "Private placeholder",
@@ -161,7 +161,6 @@ describe("production privacy masking", () => {
       "Private aria description",
       "Private select aria",
       "Private option text",
-      "private-option-value",
       "Blocked private text",
       "blocked-value-789",
       "Database private value",
@@ -176,6 +175,11 @@ describe("production privacy masking", () => {
     ];
 
     for (const leak of leaks) expect(captured).not.toContain(leak);
+
+    // A `<select>` value is an enum the developers wrote, not something a user typed, and it is kept
+    // for the same reason the same string is kept in a request body. The option's visible TEXT is
+    // still masked, because that is page content.
+    expect(captured).toContain("catalog-option-value");
 
     const dbDiff = events.find((event) => event.k === "db.diff");
     expect(dbDiff?.d.after).toEqual({
@@ -244,17 +248,17 @@ describe("application-declared input keeps", () => {
       .map((event) => String(event.d.val));
   }
 
-  it("records the value of a field the application named", async () => {
-    expect(await typedValues(["maxPrice"])).toContain("250");
+  it("records a number the shopper typed", async () => {
+    expect(await typedValues([])).toContain("250");
   });
 
-  it("leaves every other field masked", async () => {
-    const values = await typedValues(["maxPrice"]);
+  it("masks a name the shopper typed", async () => {
+    const values = await typedValues([]);
 
     expect(values.some((value) => value.includes("Ada"))).toBe(false);
   });
 
-  it("masks everything when the application names nothing", async () => {
-    expect(await typedValues([])).not.toContain("250");
+  it("records free text in a field the application named", async () => {
+    expect(await typedValues(["fullName"])).toContain("Ada Lovelace");
   });
 });
