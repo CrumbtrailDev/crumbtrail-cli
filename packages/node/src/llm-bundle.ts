@@ -4,6 +4,7 @@ import {
   BROWSER_REDACTION_POLICY_V2,
   CAPTURE_GAP_EVENT_KIND,
   DB_DIFF_EVENT_KIND,
+  redactInputValue,
   redactTokenLikeString,
   redactValue,
   type BugEvent,
@@ -1384,14 +1385,14 @@ function buildAgentContext(
 
     if (event.k === "inp") {
       const field = interactionIdentifier(event);
+      const typed = keptInputValue(event);
+      const what = typed !== undefined ? `typed ${typed}` : "value redacted";
       timeline.push(
         removeUndefined({
           ...base,
           kind: "input" as const,
           field,
-          summary: field
-            ? `input ${field}; value redacted`
-            : "input captured; value redacted",
+          summary: field ? `input ${field}; ${what}` : `input captured; ${what}`,
         }),
       );
       continue;
@@ -1861,7 +1862,16 @@ function summarizeEvent(
   }
 
   if (event.k === "inp") {
-    return "user input captured; raw values are not repeated in this bundle";
+    const field = interactionIdentifier(event);
+    const typed = keptInputValue(event);
+    if (typed === undefined) {
+      return joinParts([
+        "user input captured",
+        field,
+        "value withheld by the redaction policy",
+      ]);
+    }
+    return joinParts(["user typed", field, typed]);
   }
 
   if (event.k === "perf") {
@@ -2104,6 +2114,48 @@ export function normalizeDbEngine(value: unknown): DbEngine {
  * were already dropped in the shim; we re-run the shared redaction policy over each image as
  * defense-in-depth so secret-looking values can never rest in the bundle.
  */
+/**
+ * The value a user typed, when the redaction policy kept one.
+ *
+ * The renderer used to state "value redacted" for every input, unconditionally, and drop what the
+ * event carried. That was true once and has not been for some time: the capture policy now runs
+ * typed values through the same classifier as a request body, keeps numbers and short enum-like
+ * strings, and ships a `captureInputValues` opt-out for deployments that want none of it. The
+ * comment justifying that work names this exact case — the ceiling a shopper typed beside the
+ * ceiling the request carried — and the bundle a reader gets held only the second one.
+ *
+ * Nothing here loosens redaction. It renders what policy already decided to keep, and says plainly
+ * when policy kept nothing, so a withheld value cannot read as an absent one.
+ *
+ * Two gates, and the second is the one that matters. `valSummary.action === "redacted"` is the
+ * policy's own verdict on the capture side and is authoritative when present — but only a REDACTED
+ * value carries a summary, so its absence means either "policy kept this" or "nothing ever
+ * classified this". Those are not the same, and a value that reached here unprocessed would be
+ * rendered on trust alone.
+ *
+ * So the value is re-run through the same classifier regardless. `redactInputValue` is what the
+ * capture side uses; agreeing with it costs a function call and removes the need to trust the
+ * pipeline, in a renderer whose output is the thing that leaves the machine.
+ */
+function keptInputValue(event: BugEvent): string | undefined {
+  const d = event.d;
+  if (!isRecord(d)) return undefined;
+  const summary = isRecord(d.valSummary) ? d.valSummary : undefined;
+  if (summary?.action === "redacted") return undefined;
+  const value = d.val;
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  // An already-redacted value classifies as harmless, because it IS harmless — and "user typed
+  // [REDACTED]" states nothing. Withheld is the honest rendering.
+  if (value.includes(REDACTED_VALUE) || /^[*\s]+$/.test(value)) return undefined;
+
+  const name = isRecord(d.el)
+    ? (safeText(d.el.name, 80) ?? safeText(d.el.id, 80))
+    : undefined;
+  const reclassified = redactInputValue(value, { name });
+  if (reclassified.value !== value) return undefined;
+  return truncate(value, 120);
+}
+
 /** Transport fields rendered as columns; everything else the application attached goes to `detail`. */
 const OUTBOUND_TRANSPORT_FIELDS = new Set([
   "service",
