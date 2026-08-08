@@ -296,11 +296,16 @@ export function interactionCollector(
       type,
       path: "val",
     });
-    const val = isUnmasked(target)
-      ? { value: target.value, summary: undefined, metadata: undefined }
-      : config.maskAllInputs
-        ? { ...redacted, value: maskText(target.value) }
-        : redacted;
+    // `maskAllInputs` decides how a redacted value is rendered, not whether the value is redacted.
+    // When the redaction policy already cleared the field - the application named it in
+    // `redaction.keepFields` and its content passed every value check - masking it here would throw
+    // the answer away a second time, after the one place entitled to make that call said keep.
+    const val =
+      isUnmasked(target) || redacted.metadata === undefined
+        ? { value: target.value, summary: undefined, metadata: undefined }
+        : config.maskAllInputs
+          ? { ...redacted, value: maskText(target.value) }
+          : redacted;
     const d: Record<string, unknown> = {
       el,
       val: val.value,

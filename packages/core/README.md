@@ -99,8 +99,8 @@ a search term with a quote in it, an address line a validator wrongly rejects,
 a decimal comma amount: a hash of any of those tells an agent nothing.
 
 `redaction.keepFields` names those fields. It is matched on the whole field
-name, never as a substring, and it applies to JSON keys and query string
-parameters alike:
+name, never as a substring, and it applies to JSON keys, query string
+parameters and form input values alike:
 
 ```ts
 Crumbtrail.init({
@@ -117,6 +117,11 @@ What a keep does and does not do:
 - It never disables **value based detection**. An email, a JWT, a card number,
   a token, or a high entropy secret sitting in a kept field is still redacted.
 - Your own `denyFields` entry still wins over your keep for the same name.
+- On a **form input** it is matched against the field's `name`, and a
+  `password`, `email` or `tel` input is never kept whatever it is called. Every
+  other input stays masked, which is the default in every session capture tool
+  and is not what this list changes. It exists so that recovering one field does
+  not mean editing your markup with `data-crumbtrail-unmask`.
 
 The capture server takes the same list, so a name kept in a `db.diff` row is
 also kept in the request body and query string that produced it:

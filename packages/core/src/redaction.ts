@@ -2325,10 +2325,30 @@ export function redactInputValue(
 
   const path = options.path ?? "input.value";
   const type = options.type?.toLowerCase();
+
+  // An application-declared keep applies to a form field the same way it applies to a JSON key or a
+  // query parameter: the application named this field, so it is asserting the field holds its own
+  // data and not the user's secrets. The default is unchanged - every input is still masked unless
+  // the application asks for one by name.
+  //
+  // Two things the keep cannot buy. A credential input is never kept whatever it is called, because
+  // `keepFields` is a list of field names and an application that reuses a name for a password field
+  // would be surprised by what it published. And the value still goes through the same classifier as
+  // a body value, so a card number, a token or an email pasted into a kept field is caught on its
+  // content rather than trusted for its name.
+  const credentialInput = type === "password" || type === "email" || type === "tel";
+  if (!credentialInput && isStructuredKeepName(options.name, getRedactionKeepFields())) {
+    const classification = classifyStructuredValue(
+      value,
+      options.name,
+      undefined,
+      getRedactionKeepFields(),
+    );
+    if (classification.action === "keep") return { value };
+  }
+
   const reason =
-    type === "password" ||
-    type === "email" ||
-    type === "tel" ||
+    credentialInput ||
     type === "search" ||
     isSensitiveName(options.name)
       ? "sensitive_input_value"
