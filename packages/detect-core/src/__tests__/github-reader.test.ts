@@ -13,6 +13,8 @@ import {
   type GithubRepoSource,
   type GithubTreeEntry,
 } from "../readers/github";
+import { detect } from "../detect";
+import { discoverServices } from "../discover";
 
 function source(
   files: Record<string, string>,
@@ -116,6 +118,84 @@ describe("hydrateGithubReader", () => {
     expect(r.readFile("/apps/web/package.json")).toBe('{"name":"web"}');
   });
 
+  it("hydrates literal workspace entries, not their children", async () => {
+    // Regression: expanding "website" as a glob skipped the directory itself,
+    // so every member manifest stayed unhydrated and the first read threw.
+    const { src } = source(
+      {
+        "package.json": JSON.stringify({
+          workspaces: ["website", "job-server"],
+        }),
+        "website/package.json": '{"name":"website"}',
+        "job-server/package.json": '{"name":"job-server"}',
+      },
+      ["website", "job-server"],
+    );
+    const r = await hydrateGithubReader(src);
+    expect(r.readFile("/website/package.json")).toBe('{"name":"website"}');
+    expect(r.readFile("/job-server/package.json")).toBe(
+      '{"name":"job-server"}',
+    );
+  });
+
+  it("hydrates literal pnpm workspace entries", async () => {
+    const { src } = source(
+      {
+        "package.json": "{}",
+        "pnpm-workspace.yaml": 'packages:\n  - "website"\n',
+        "website/package.json": '{"name":"website"}',
+      },
+      ["website"],
+    );
+    const r = await hydrateGithubReader(src);
+    expect(r.readFile("/website/package.json")).toBe('{"name":"website"}');
+  });
+
+  it("hydrates the directories the discovery scan classifies", async () => {
+    // No workspaces at all: these dirs are reachable only via the scan pass.
+    const { src } = source(
+      {
+        "package.json": "{}",
+        "api/pyproject.toml": "[project]\nname='api'\n",
+        "services/billing/Gemfile": "source 'x'\n",
+        "apps/web/index.html": "<html></html>",
+        "packages/ui/package.json": '{"name":"ui"}',
+      },
+      [
+        "api",
+        "services",
+        "services/billing",
+        "apps",
+        "apps/web",
+        "packages",
+        "packages/ui",
+      ],
+    );
+    const r = await hydrateGithubReader(src);
+    expect(r.readFile("/api/pyproject.toml")).toContain("api");
+    expect(r.readFile("/services/billing/Gemfile")).toContain("source");
+    expect(r.readFile("/apps/web/index.html")).toBe("<html></html>");
+    expect(r.readFile("/packages/ui/package.json")).toBe('{"name":"ui"}');
+  });
+
+  it("keeps hydration to three rounds and skips absent manifests", async () => {
+    const { src, calls } = source(
+      {
+        "package.json": JSON.stringify({ workspaces: ["website"] }),
+        "website/package.json": '{"name":"website"}',
+        "docs/readme.md": "x",
+      },
+      ["website", "docs"],
+    );
+    await hydrateGithubReader(src);
+    expect(calls.tree).toBe(1);
+    // Only manifests that actually exist cost a blob fetch.
+    expect(calls.paths.sort()).toEqual([
+      "package.json",
+      "website/package.json",
+    ]);
+  });
+
   it("returns null for a file the repository does not have", async () => {
     const { src } = source({ "package.json": "{}" });
     const r = await hydrateGithubReader(src);
@@ -138,6 +218,43 @@ describe("hydrateGithubReader", () => {
     const r = await hydrateGithubReader(src);
     await r.prefetch(["/src/deep.ts", null, undefined]);
     expect(r.readFile("/src/deep.ts")).toBe("body");
+  });
+});
+
+describe("hydration covers what detection actually reads", () => {
+  it("discovers a literal-workspace repo without an unhydrated read", async () => {
+    // The cloud-onboarding regression, end to end: hydrate → detect → discover.
+    const { src } = source(
+      {
+        "package.json": JSON.stringify({
+          name: "root",
+          workspaces: ["website", "job-server"],
+        }),
+        "website/package.json": JSON.stringify({
+          name: "website",
+          dependencies: { next: "15.0.0" },
+          scripts: { dev: "next dev" },
+        }),
+        "website/app/layout.tsx": "export default function L() {}",
+        "job-server/package.json": JSON.stringify({
+          name: "job-server",
+          scripts: { start: "node index.js" },
+          main: "index.js",
+        }),
+        "job-server/index.js": "run()",
+        "api/pyproject.toml": "[project]\nname='api'\n",
+      },
+      ["website", "website/app", "job-server", "api"],
+    );
+    const reader = await hydrateGithubReader(src);
+    const root = detect("/", reader);
+    const found = discoverServices("/", root, reader, {
+      alreadyWired: () => false,
+    });
+    expect(found.map((c) => c.relDir).sort()).toEqual(
+      expect.arrayContaining(["job-server", "website"]),
+    );
+    expect(found.find((c) => c.relDir === "website")?.recipe).toBe("next");
   });
 });
 
