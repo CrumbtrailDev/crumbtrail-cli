@@ -2353,8 +2353,19 @@ export function redactInputValue(
   // numbers cannot show the defect that sits between them. The value is what the classifier already
   // keeps everywhere else in this SDK; there is no reason the same "250" is evidence in a query
   // string and a secret in the box the user typed it into.
+  // A form value is always a string, including when what the user typed is a number. `0.29` is not
+  // enum-shaped - the dot is not in the enum alphabet - so classifying it as text would redact every
+  // price, rate, weight and decimal quantity anyone types, which is most of the numbers that matter.
+  // Classified as the number it is when it round-trips exactly, so the Luhn check that catches a
+  // card number typed into a plain field still runs on it.
+  const asNumber = Number(value);
+  const numeric =
+    value.trim() === value &&
+    Number.isFinite(asNumber) &&
+    String(asNumber) === value;
+
   const classification = classifyStructuredValue(
-    value,
+    numeric ? asNumber : value,
     options.name,
     undefined,
     keepFields,
