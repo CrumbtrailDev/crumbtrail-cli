@@ -442,8 +442,12 @@ function redactQueryString(
         params.append(safeKey, "");
       } else if (
         kept &&
-        classifyStructuredValue(value, key, undefined, keepFields).action ===
-          "keep"
+        classifyStructuredValue(
+          asNumberIfNumeric(value),
+          key,
+          undefined,
+          keepFields,
+        ).action === "keep"
       ) {
         params.append(safeKey, value);
       } else {
@@ -2317,6 +2321,27 @@ export function redactStoredValue(
   );
 }
 
+/**
+ * The number a text field is carrying, or the text itself.
+ *
+ * Anywhere a value arrives as text - a form input, a query parameter, a form-encoded body - a number
+ * the user or the application meant arrives as a string. `0.29` is not enum-shaped, because the dot
+ * is not in the enum alphabet, so the deny-biased classifier reads it as free prose and deletes it.
+ * That silently removed every price, rate, weight, percentage and decimal quantity from the text
+ * planes while keeping the identical value in a JSON body, and the disagreement between the two is
+ * exactly what a filter or rounding defect lives in.
+ *
+ * Converted only on an exact round trip, so `0123` (a padded code) and `1e5` stay text and are
+ * judged as text. Everything the classifier does to a number still applies, including the Luhn check
+ * that catches a card number typed into a plain field.
+ */
+function asNumberIfNumeric(value: string): string | number {
+  if (value.trim() !== value) return value;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || String(parsed) !== value) return value;
+  return parsed;
+}
+
 export function redactInputValue(
   value: string,
   options: InputValueRedactionOptions = {},
@@ -2353,19 +2378,8 @@ export function redactInputValue(
   // numbers cannot show the defect that sits between them. The value is what the classifier already
   // keeps everywhere else in this SDK; there is no reason the same "250" is evidence in a query
   // string and a secret in the box the user typed it into.
-  // A form value is always a string, including when what the user typed is a number. `0.29` is not
-  // enum-shaped - the dot is not in the enum alphabet - so classifying it as text would redact every
-  // price, rate, weight and decimal quantity anyone types, which is most of the numbers that matter.
-  // Classified as the number it is when it round-trips exactly, so the Luhn check that catches a
-  // card number typed into a plain field still runs on it.
-  const asNumber = Number(value);
-  const numeric =
-    value.trim() === value &&
-    Number.isFinite(asNumber) &&
-    String(asNumber) === value;
-
   const classification = classifyStructuredValue(
-    numeric ? asNumber : value,
+    asNumberIfNumeric(value),
     options.name,
     undefined,
     keepFields,

@@ -899,6 +899,25 @@ describe("keepFields on input values", () => {
     expect(redactInputValue("-12.5", { name: "adjustment" }).value).toBe("-12.5");
   });
 
+  // The same value in the same declared field, arriving as a query parameter instead of as a typed
+  // input. A decimal deleted here and kept in the JSON body one line below is the disagreement a
+  // filter or rounding defect lives in.
+  it("keeps a decimal in a kept query parameter", () => {
+    setRedactionKeepFields(["maxPrice"]);
+
+    expect(redactUrl("https://app.test/api/search?maxPrice=0.29", "url").value).toContain(
+      "maxPrice=0.29",
+    );
+  });
+
+  it("still redacts a decimal in a parameter the application did not name", () => {
+    setRedactionKeepFields(["maxPrice"]);
+
+    expect(redactUrl("https://app.test/api/search?salary=52000.5", "url").value).not.toContain(
+      "52000.5",
+    );
+  });
+
   // Numeric classification must not become a way past the card check.
   it("still catches a card number typed into a plain field", () => {
     expect(redactInputValue("4111111111111111", { name: "reference" }).value).toBe(
