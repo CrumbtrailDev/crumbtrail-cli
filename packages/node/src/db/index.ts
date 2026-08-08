@@ -37,9 +37,8 @@ export {
   classifyStatement,
   leadingSqlKeyword,
   looksLikePotentialWrite,
-  planReturning,
 } from "./sql";
-export type { ReturningPlan, StatementClassification } from "./sql";
+export type { StatementClassification } from "./sql";
 export type { InstrumentDbClientOptions } from "./instrument-shared";
 export {
   instrumentMysqlClient,
