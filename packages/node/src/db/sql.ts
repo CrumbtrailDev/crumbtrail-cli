@@ -467,11 +467,92 @@ function isRecord(value: unknown): value is SqlAst {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Appends `RETURNING *` (Postgres after-image strategy) when the statement lacks one. */
-export function ensureReturning(sql: string): string {
-  return /\breturning\b/i.test(sql)
-    ? sql
-    : `${sql.replace(/;\s*$/, "")} RETURNING *`;
+export interface ReturningPlan {
+  /** The statement to execute. */
+  text: string;
+  /**
+   * The columns the host asked for, when the statement's own `RETURNING` list was widened to `*`.
+   * Rows are projected back to these before the host sees them, so widening buys a complete
+   * after-image without changing what the caller receives. `undefined` means hand the result back
+   * untouched.
+   */
+  projectTo?: readonly string[];
+}
+
+/**
+ * How to run a mutation so the after-image is the whole row.
+ *
+ * Three cases, and the middle one is the reason this is not a one-liner. A statement with no
+ * `RETURNING` gets `RETURNING *` appended — invisible, because the caller was not reading rows.
+ * A statement that already says `RETURNING *` is left alone. A statement with its OWN narrow list
+ * (`RETURNING id`) used to be left alone too, and that is how an `INSERT INTO jobs (type, payload,
+ * status, ...) RETURNING id` reached the bundle as `{"id":1}` — every column that said what the
+ * write actually did, dropped, because the application happened to only need the key back.
+ *
+ * So the list is widened to `*` and the rows are projected back down to what the caller asked for.
+ * Only for a plain, unaliased identifier list: an alias or an expression cannot be reconstructed
+ * from `*`, so those keep their narrow after-image rather than risk handing the host a row that is
+ * missing a column it named.
+ */
+export function planReturning(sql: string): ReturningPlan {
+  const at = findTopLevelKeyword(sql, ["returning"]);
+  if (at === undefined) {
+    return { text: `${sql.replace(/;\s*$/, "")} RETURNING *` };
+  }
+  const clause = sql
+    .slice(at + "returning".length)
+    .replace(/;\s*$/, "")
+    .trim();
+  const items = splitTopLevelCommas(clause).map((item) => item.trim());
+  if (items.length === 0 || items.some((item) => !isPlainColumnRef(item))) {
+    return { text: sql };
+  }
+  if (items.includes("*")) return { text: sql };
+  return {
+    text: `${sql.slice(0, at)}RETURNING *`,
+    projectTo: items.map(returnedColumnName),
+  };
+}
+
+/**
+ * Postgres folds an unquoted identifier to lower case in the result keys; a quoted one keeps the
+ * case it was written with. The projection reads result keys, so it has to match that.
+ */
+function returnedColumnName(identifier: string): string {
+  const trimmed = identifier.trim();
+  return trimmed.startsWith('"')
+    ? normalizeIdentifier(trimmed)
+    : trimmed.toLowerCase();
+}
+
+function isPlainColumnRef(item: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_$]*$/.test(item) || /^"[^"]+"$/.test(item);
+}
+
+/** Splits on commas that are not inside parentheses, quotes, or comments. */
+export function splitTopLevelCommas(fragment: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  let index = 0;
+  while (index < fragment.length) {
+    const skipped = skipSqlRegion(fragment, index);
+    if (skipped !== undefined) {
+      index = skipped;
+      continue;
+    }
+    const character = fragment[index];
+    if (character === "(") depth += 1;
+    else if (character === ")") depth = Math.max(0, depth - 1);
+    else if (character === "," && depth === 0) {
+      parts.push(fragment.slice(start, index));
+      start = index + 1;
+    }
+    index += 1;
+  }
+  const tail = fragment.slice(start);
+  if (tail.trim() || parts.length > 0) parts.push(tail);
+  return parts.filter((part) => part.trim().length > 0);
 }
 
 /**

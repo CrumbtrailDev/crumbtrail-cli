@@ -1,12 +1,13 @@
 import {
   classifyStatement,
-  ensureReturning,
+  planReturning,
   leadingSqlKeyword,
   parseLimitOffset,
   parseMutation,
   parseRead,
   type ParsedMutation,
   type ParsedRead,
+  type ReturningPlan,
 } from "./sql";
 import {
   emitGap,
@@ -42,8 +43,11 @@ const ENGINE = "postgres" as const;
 /**
  * Wraps a duck-typed `pg` client/pool so INSERT/UPDATE/DELETE statements executed within a request
  * scope record a `db.diff` event (op, table, primary key, after-image; before-image behind
- * `captureBefore`). The shim appends `RETURNING *` when absent to read the after-image, and reads
- * the result rows otherwise. Only the promise-returning `query(text, params)` form is instrumented;
+ * `captureBefore`). The shim runs every mutation with `RETURNING *` — appended when absent, widened
+ * from a plain narrow list when present — and projects the rows back to the columns the caller
+ * named, so the after-image is whole and the host sees what it asked for. `result.fields` still
+ * describes the widened statement. Only the promise-returning `query(text, params)` form is
+ * instrumented;
  * config-object and callback forms pass straight through. Engine is Postgres only; the builder is
  * driver-agnostic so other engines can slot in later. A pool's `connect()` result is proxied too,
  * so mutations issued through acquired clients retain the same instrumentation and pool lifecycle.
@@ -146,16 +150,16 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
 
     // RETURNING handling is diff-capture work too; if it throws, run the original statement so the
     // host's query is never broken by instrumentation.
-    let instrumentedText: string;
+    let plan: ReturningPlan;
     try {
-      instrumentedText = ensureReturning(text);
+      plan = planReturning(text);
     } catch (error) {
       emitGap(options, { reason: "capture_exception", error });
       return client.query(text, paramArray);
     }
 
     // The host mutation. Its own errors propagate normally — we never swallow the caller's query.
-    const result = await client.query(instrumentedText, paramArray);
+    const result = await client.query(plan.text, paramArray);
 
     // Diff capture/emit is best-effort: a parse/build/emit failure here degrades to "no diff
     // emitted" rather than breaking the host query, whose result is returned unchanged.
@@ -177,6 +181,19 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       });
     } catch (error) {
       emitGap(options, { reason: "capture_exception", error });
+    }
+
+    // Widening `RETURNING id` to `RETURNING *` bought the after-image, and the host must not pay
+    // for it: the rows it receives carry exactly the columns it named. Projection builds new
+    // objects, so the full rows the diff already holds are untouched.
+    if (plan.projectTo && Array.isArray(result.rows)) {
+      try {
+        result.rows = result.rows.map((row) =>
+          isRecord(row) ? projectRow(row, plan.projectTo!) : row,
+        );
+      } catch (error) {
+        emitGap(options, { reason: "capture_exception", error });
+      }
     }
 
     return result;
@@ -219,6 +236,17 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+function projectRow(
+  row: Record<string, unknown>,
+  columns: readonly string[],
+): Record<string, unknown> {
+  const projected: Record<string, unknown> = {};
+  for (const column of columns) {
+    if (column in row) projected[column] = row[column];
+  }
+  return projected;
 }
 
 function instrumentAcquiredClient(
