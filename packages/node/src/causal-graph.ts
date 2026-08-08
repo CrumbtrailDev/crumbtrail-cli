@@ -736,6 +736,7 @@ function nodeKindsForDetector(detector: string): Set<CausalNodeKind> {
     // is the node it belongs on. Without an entry here it reports `isolated` and drops out of the
     // incident thread - the same failure already paid for by click_target_intercepted.
     case "stale_value_rendered":
+    case "displayed_field_mismatch":
       return new Set(["net.res", "net.req"]);
     case "console_error":
       return new Set(["console.error"]);
