@@ -1691,8 +1691,11 @@ describe("llm bundle", () => {
         "Full-stack linkage gap summaries are capped at 40 of 45.",
       ]),
     );
-    expect(markdown).toContain("req-9");
-    expect(markdown).not.toContain("req-10");
+    // All 45 are GETs of equal standing, so selection falls back to the most RECENT ten. That is
+    // the point of the change: the ten a reader is shown are the ten nearest the report, not the
+    // page-load burst the session happened to open with.
+    expect(markdown).toContain("req-39");
+    expect(markdown).not.toContain("req-9\n");
     expect(markdown).toContain("gap-9");
     expect(markdown).not.toContain("gap-10");
   });
