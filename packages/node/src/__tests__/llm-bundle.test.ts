@@ -1201,9 +1201,12 @@ describe("llm bundle", () => {
           k: "snap",
           summary: expect.stringContaining("raw values are not repeated"),
         }),
+        // This fixture's value is the `[REDACTED]` placeholder, so the bundle reports it as
+        // withheld rather than repeating it. A value the policy KEEPS is rendered — see
+        // llm-bundle-typed-values.test.ts.
         expect.objectContaining({
           k: "inp",
-          summary: expect.stringContaining("raw values are not repeated"),
+          summary: expect.stringContaining("withheld by the redaction policy"),
         }),
       ]),
     );
