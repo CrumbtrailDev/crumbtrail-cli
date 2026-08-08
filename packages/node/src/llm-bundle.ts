@@ -4295,6 +4295,7 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
     ...renderDatabaseDiffSection(bundle.databaseDiffs),
     ...renderDatabaseReadSection(bundle.databaseReads ?? []),
     ...renderDatabaseActivitySection(bundle.databaseActivity),
+    ...renderDetectedSignalsSection(bundle.distinctBugs),
     ...renderCausalStructureSection(bundle.causalTree),
     "## Key Timeline Moments",
     "",
@@ -4583,6 +4584,79 @@ function renderCausalStructureSection(
     }
   }
   lines.push("");
+  return lines;
+}
+
+/**
+ * A bound, not a ranking. `distinctBugs` arrives severity-ordered, and a session that produced more
+ * than this many separate findings is one where the top of the list is what a reader can act on.
+ */
+const MAX_RENDERED_SIGNALS = 12;
+
+/**
+ * What the detectors found.
+ *
+ * The detectors run, group into distinct bugs, and land in `bundle.json` — and until now nothing
+ * put them in the rendered bundle, so a reader with `llm.md` and nothing else never saw them. Only
+ * the causal tree made it through, and that shows a finding solely when it is a ROOT with symptoms
+ * attributed to it. A session whose findings are unrelated to each other renders no tree at all,
+ * and every one of them is silently dropped.
+ *
+ * Measured on one capture: five findings computed, one rendered. The one that named the defect —
+ * a click received by a full-viewport element covering the button beneath it — was among the four
+ * discarded, while the reader was left inferring from a 401 on an unrelated endpoint.
+ *
+ * These are signals, not verdicts, and the wording says so: a detector reports a measurement, and
+ * whether it explains the reported symptom is the reader's call. Understating that would trade one
+ * failure mode for a worse one, since a confident wrong lead is more expensive than no lead.
+ */
+function renderDetectedSignalsSection(bugs: DistinctBug[] | undefined): string[] {
+  if (!bugs || bugs.length === 0) return [];
+  const shown = bugs.slice(0, MAX_RENDERED_SIGNALS);
+  const lines = [
+    "## Detected Signals",
+    "",
+    "What the detectors measured in this session, most severe first. Each is a measurement, not a "
+      + "verdict: a signal can be a pre-existing condition unrelated to the reported symptom, and the "
+      + "reported symptom can have no signal at all. Read them as leads to confirm against the "
+      + "evidence above, and treat the absence of a signal as no evidence either way.",
+    "",
+    table(
+      ["Offset", "Severity", "Detector", "Finding", "Where"],
+      shown.map((bug) => [
+        bug.window?.start !== undefined && bug.firstSeen !== undefined
+          ? `${bug.firstSeen - bug.window.start} ms`
+          : "unknown",
+        bug.severity,
+        bug.representative.detector,
+        // Title AND message. A detector puts the specifics in whichever of the two it has — the
+        // click detector names the covered control in its title and carries no message at all, so
+        // preferring one over the other drops the part that identifies the defect.
+        truncate(
+          [
+            bug.title,
+            bug.representative.message && bug.representative.message !== bug.title
+              ? bug.representative.message
+              : undefined,
+          ]
+            .filter((part): part is string => Boolean(part))
+            .join(" — "),
+          400,
+        ),
+        bug.representative.frame
+          ?? bug.representative.requestId
+          ?? bug.representative.route
+          ?? "",
+      ]),
+    ),
+    "",
+  ];
+  if (bugs.length > shown.length) {
+    lines.push(
+      `${bugs.length - shown.length} further signal(s) are in \`bundle.json\` under \`distinctBugs\`.`,
+      "",
+    );
+  }
   return lines;
 }
 
