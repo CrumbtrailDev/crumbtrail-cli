@@ -605,7 +605,7 @@ describe("browser redaction policy", () => {
     });
   });
 
-  it("redacts form and input values regardless of field type", () => {
+  it("redacts free text and credential inputs whatever the field is called", () => {
     const text = redactInputValue("hello world", {
       name: "comment",
       type: "text",
@@ -616,7 +616,7 @@ describe("browser redaction policy", () => {
     });
 
     expect(text.value).toBe(REDACTED_VALUE);
-    expect(text.summary).toMatchObject({ reason: "input_value" });
+    expect(text.summary).toMatchObject({ reason: "free_text_value" });
     expect(password.value).toBe(REDACTED_VALUE);
     expect(password.summary).toMatchObject({ reason: "sensitive_input_value" });
   });
@@ -842,12 +842,14 @@ describe("attachRedactionMetadata", () => {
 describe("keepFields on input values", () => {
   afterEach(() => setRedactionKeepFields([]));
 
-  it("keeps a field the application named", () => {
-    setRedactionKeepFields(["maxPrice"]);
+  // Free text is what the keep list buys on an input, the same as in a request body: the search term
+  // with a quote in it, the address line a validator wrongly rejects.
+  it("keeps free text in a field the application named", () => {
+    setRedactionKeepFields(["searchTerm"]);
 
     expect(
-      redactInputValue("250", { name: "maxPrice", type: "number" }).value,
-    ).toBe("250");
+      redactInputValue("red shoes size 12", { name: "searchTerm" }).value,
+    ).toBe("red shoes size 12");
   });
 
   it("still masks every field the application did not name", () => {
@@ -883,9 +885,8 @@ describe("keepFields on input values", () => {
     ).toBe(REDACTED_VALUE);
   });
 
-  it("changes nothing when the application declares no keeps", () => {
-    expect(redactInputValue("250", { name: "maxPrice" }).value).toBe(
-      REDACTED_VALUE,
-    );
+  // The keep list is for free-text fields. A number was already evidence under the default policy.
+  it("needs no keep for a value the classifier keeps anyway", () => {
+    expect(redactInputValue("250", { name: "maxPrice" }).value).toBe("250");
   });
 });

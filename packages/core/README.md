@@ -118,10 +118,7 @@ What a keep does and does not do:
   a token, or a high entropy secret sitting in a kept field is still redacted.
 - Your own `denyFields` entry still wins over your keep for the same name.
 - On a **form input** it is matched against the field's `name`, and a
-  `password`, `email` or `tel` input is never kept whatever it is called. Every
-  other input stays masked, which is the default in every session capture tool
-  and is not what this list changes. It exists so that recovering one field does
-  not mean editing your markup with `data-crumbtrail-unmask`.
+  `password`, `email` or `tel` input is never kept whatever it is called.
 
 The capture server takes the same list, so a name kept in a `db.diff` row is
 also kept in the request body and query string that produced it:
@@ -136,11 +133,21 @@ setting that makes the server store more than it did before.
 
 ## Production capture
 
-Page text, input values, keystrokes, clipboard content, DOM snapshots, and
-database row values are masked before they enter the local ring buffer. Add
-`data-crumbtrail-unmask` to one element when its text or value is safe to
-capture. Add `data-crumbtrail-block` to exclude an element and its descendants
-entirely.
+Page text, keystrokes, clipboard content, DOM snapshots, and database row values
+are masked before they enter the local ring buffer. Add `data-crumbtrail-unmask`
+to one element when its text or value is safe to capture. Add
+`data-crumbtrail-block` to exclude an element and its descendants entirely.
+
+**Input values** answer to the redaction policy rather than to a blanket mask, so
+they behave the same way the same value does in a request body: numbers and short
+enum-like strings are recorded, and free prose, emails, JWTs, card numbers, IBANs
+and high-entropy strings are replaced by `[REDACTED]`. A `password`, `email` or
+`tel` input is redacted on its type before anything reads it. `redaction.keepFields`
+recovers free text in a field you name.
+
+This is why the price a shopper typed and the price the request carried can both
+appear in one capture, which is the whole of a large class of filter and validation
+defects.
 
 Remote capture policy can only add masking. Clear text or values are captured
 only when `data-crumbtrail-unmask` is added to that individual safe element.
