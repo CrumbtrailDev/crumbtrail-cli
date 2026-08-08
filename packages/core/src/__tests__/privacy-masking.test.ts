@@ -198,3 +198,63 @@ describe("production privacy masking", () => {
     await logger.stop();
   });
 });
+
+/**
+ * `maskAllInputs` decides how a masked value is rendered. It is not a second, independent decision
+ * about whether to mask, and when it behaved like one it silently overrode the redaction policy that
+ * had already cleared the field.
+ */
+describe("application-declared input keeps", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+    vi.restoreAllMocks();
+  });
+
+  async function typedValues(keepFields: string[]) {
+    document.body.innerHTML = `
+      <input id="filter" name="maxPrice">
+      <input id="who" name="fullName">
+    `;
+    const filter = document.querySelector("#filter") as HTMLInputElement;
+    const who = document.querySelector("#who") as HTMLInputElement;
+    filter.value = "250";
+    who.value = "Ada Lovelace";
+
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      transportInstance: transport,
+      environment: false,
+      network: false,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1_000,
+      redaction: { keepFields },
+    });
+
+    filter.dispatchEvent(new Event("input", { bubbles: true }));
+    who.dispatchEvent(new Event("input", { bubbles: true }));
+    await logger.stop();
+
+    return transport.sendEvents.mock.calls
+      .flatMap(([events]) => events as Array<{ k: string; d: { val?: unknown } }>)
+      .filter((event) => event.k === "inp")
+      .map((event) => String(event.d.val));
+  }
+
+  it("records the value of a field the application named", async () => {
+    expect(await typedValues(["maxPrice"])).toContain("250");
+  });
+
+  it("leaves every other field masked", async () => {
+    const values = await typedValues(["maxPrice"]);
+
+    expect(values.some((value) => value.includes("Ada"))).toBe(false);
+  });
+
+  it("masks everything when the application names nothing", async () => {
+    expect(await typedValues([])).not.toContain("250");
+  });
+});

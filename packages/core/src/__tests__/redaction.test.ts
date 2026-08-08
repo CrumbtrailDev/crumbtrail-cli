@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   BROWSER_REDACTION_POLICY,
   REDACTED_STORAGE_KEY,
@@ -16,6 +16,7 @@ import {
   redactUrl,
   redactUrlsInText,
   redactValue,
+  setRedactionKeepFields,
   summarizeBinaryPayload,
   summarizeOmittedPayload,
 } from "../redaction";
@@ -828,5 +829,63 @@ describe("attachRedactionMetadata", () => {
     const target: Record<string, unknown> = { foo: "bar" };
     attachRedactionMetadata(target, undefined);
     expect(target).not.toHaveProperty("redaction");
+  });
+});
+
+/**
+ * Every input is masked by default, which is what Datadog, Sentry and PostHog all do and is not a
+ * decision this SDK reopens. What the body and query-string planes already offer and this one did
+ * not is a way for an application to name one of its own fields and get it back. Without it, the
+ * only opt-in is a DOM attribute, so a filter value that explains a whole class of defect can only
+ * be recovered by editing markup.
+ */
+describe("keepFields on input values", () => {
+  afterEach(() => setRedactionKeepFields([]));
+
+  it("keeps a field the application named", () => {
+    setRedactionKeepFields(["maxPrice"]);
+
+    expect(
+      redactInputValue("250", { name: "maxPrice", type: "number" }).value,
+    ).toBe("250");
+  });
+
+  it("still masks every field the application did not name", () => {
+    setRedactionKeepFields(["maxPrice"]);
+
+    expect(redactInputValue("Ada Lovelace", { name: "fullName" }).value).toBe(
+      REDACTED_VALUE,
+    );
+  });
+
+  // The keep is a statement about the field, not about whatever ends up typed into it.
+  it("catches a secret pasted into a kept field on its content", () => {
+    setRedactionKeepFields(["note", "reference"]);
+
+    expect(redactInputValue("4111111111111111", { name: "note" }).value).toBe(
+      REDACTED_VALUE,
+    );
+    expect(
+      redactInputValue("ada@example.com", { name: "reference" }).value,
+    ).toBe(REDACTED_VALUE);
+  });
+
+  // `keepFields` is a list of names. An application that happens to use one for a credential input
+  // would otherwise publish the credential, so the input type overrules the name.
+  it("refuses to keep a credential input whatever it is called", () => {
+    setRedactionKeepFields(["token", "contact"]);
+
+    expect(
+      redactInputValue("hunter2", { name: "token", type: "password" }).value,
+    ).toBe(REDACTED_VALUE);
+    expect(
+      redactInputValue("555-0100", { name: "contact", type: "tel" }).value,
+    ).toBe(REDACTED_VALUE);
+  });
+
+  it("changes nothing when the application declares no keeps", () => {
+    expect(redactInputValue("250", { name: "maxPrice" }).value).toBe(
+      REDACTED_VALUE,
+    );
   });
 });
