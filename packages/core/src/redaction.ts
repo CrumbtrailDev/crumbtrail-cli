@@ -1870,6 +1870,26 @@ export function classifyStructuredValue(
  */
 let redactionKeepFields: string[] = [];
 
+/**
+ * Whether what a user types is recorded at all.
+ *
+ * The opt-out. Recording input values is the default and is what makes a filter or validation
+ * defect legible - the ceiling a shopper typed beside the ceiling the request carried. A deployment
+ * that would rather hold none of it sets `redaction.captureInputValues: false` and every input
+ * becomes a placeholder, whatever the field is called and whatever `keepFields` says. This is a
+ * one-way switch by design: it can only remove, never add.
+ */
+let captureInputValues = true;
+
+/** Set from `config.redaction.captureInputValues` at init. Omitted means `true`. */
+export function setCaptureInputValues(enabled: boolean | undefined): void {
+  captureInputValues = enabled !== false;
+}
+
+export function getCaptureInputValues(): boolean {
+  return captureInputValues;
+}
+
 /** Set from `config.redaction.keepFields` at init. Pass `[]` to restore defaults. */
 export function setRedactionKeepFields(names: readonly string[] = []): void {
   redactionKeepFields = names.filter(
@@ -2351,6 +2371,11 @@ export function redactInputValue(
   const path = options.path ?? "input.value";
   const type = options.type?.toLowerCase();
   const keepFields = getRedactionKeepFields();
+
+  // The deployment-level opt-out, checked before anything reads the value or its field name.
+  if (!getCaptureInputValues()) {
+    return redactedInput(value, path, "input_value");
+  }
 
   // A credential input is redacted on its type alone, before anything looks at what was typed. No
   // field name and no application setting reaches this, because the one thing worse than losing a

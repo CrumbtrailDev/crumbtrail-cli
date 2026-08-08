@@ -149,6 +149,12 @@ This is why the price a shopper typed and the price the request carried can both
 appear in one capture, which is the whole of a large class of filter and validation
 defects.
 
+To record none of it, set `redaction: { captureInputValues: false }`. Every input
+becomes `[REDACTED]` whatever the field is called, and `keepFields` cannot bring one
+back. Operators can enforce the same thing at the capture server with
+`crumbtrail-server serve --no-input-values` or `CRUMBTRAIL_CAPTURE_INPUT_VALUES=0`,
+which overrides whatever the application asked for — the switch only ever removes.
+
 Remote capture policy can only add masking. Clear text or values are captured
 only when `data-crumbtrail-unmask` is added to that individual safe element.
 

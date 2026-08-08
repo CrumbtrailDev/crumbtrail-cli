@@ -69,6 +69,7 @@ import {
   redactUrl,
   redactValue,
   type PayloadSummary,
+  setCaptureInputValues,
   setRedactionKeepFields,
 } from "./redaction";
 import { buildCaptureGapEvent } from "./capture-gap";
@@ -276,6 +277,7 @@ export class Crumbtrail {
     // from module scope rather than from config, because they are reached from
     // places that never see a config object.
     setRedactionKeepFields(config.redaction?.keepFields ?? []);
+    setCaptureInputValues(config.redaction?.captureInputValues);
 
     // Non-browser guard (SSR, `next build`). init() is documented as a
     // module-scope call, so it runs during server render/build where `window`

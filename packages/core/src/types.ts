@@ -405,11 +405,20 @@ export interface CrumbtrailConfig {
    *   review body, a search term, a mangled address line) and a shape
    *   placeholder would tell an agent nothing. Value-based detection still
    *   runs inside a kept field, and a `denyFields` entry wins over a keep.
+   * - `captureInputValues` (default `true`): whether what a user types is
+   *   recorded at all. When recorded it answers to the same deny-biased
+   *   classifier as a request body, so a number or a short code survives and
+   *   free prose, an email, a card number or a token does not, and a
+   *   `password`, `email` or `tel` input is dropped on its type before
+   *   anything reads it. Set `false` to opt out entirely: every input value
+   *   becomes a placeholder regardless of the field, and `keepFields` cannot
+   *   bring one back. Nothing else about redaction changes.
    */
   redaction?: {
     mode?: "structured" | "full";
     denyFields?: string[];
     keepFields?: string[];
+    captureInputValues?: boolean;
   };
 
   // Interaction

@@ -16,6 +16,7 @@ import {
   redactUrl,
   redactUrlsInText,
   redactValue,
+  setCaptureInputValues,
   setRedactionKeepFields,
   summarizeBinaryPayload,
   summarizeOmittedPayload,
@@ -923,5 +924,57 @@ describe("keepFields on input values", () => {
     expect(redactInputValue("4111111111111111", { name: "reference" }).value).toBe(
       REDACTED_VALUE,
     );
+  });
+});
+
+/**
+ * The opt-out counsel required. A deployment that would rather hold none of what users type sets one
+ * flag and holds none of it, whatever any field is named.
+ */
+describe("captureInputValues opt-out", () => {
+  afterEach(() => {
+    setCaptureInputValues(true);
+    setRedactionKeepFields([]);
+  });
+
+  it("records input values by default", () => {
+    expect(redactInputValue("250", { name: "maxPrice" }).value).toBe("250");
+  });
+
+  it("records nothing a user typed when the deployment opts out", () => {
+    setCaptureInputValues(false);
+
+    expect(redactInputValue("250", { name: "maxPrice" }).value).toBe(
+      REDACTED_VALUE,
+    );
+  });
+
+  // The switch can only remove. An application keep must not be able to undo a deployment decision.
+  it("cannot be overridden by keepFields", () => {
+    setCaptureInputValues(false);
+    setRedactionKeepFields(["searchTerm", "maxPrice"]);
+
+    expect(redactInputValue("red shoes", { name: "searchTerm" }).value).toBe(
+      REDACTED_VALUE,
+    );
+    expect(redactInputValue("250", { name: "maxPrice" }).value).toBe(
+      REDACTED_VALUE,
+    );
+  });
+
+  it("leaves the rest of the redaction policy alone", () => {
+    setCaptureInputValues(false);
+    setRedactionKeepFields(["maxPrice"]);
+
+    expect(
+      redactUrl("https://app.test/api/search?maxPrice=0.29", "url").value,
+    ).toContain("maxPrice=0.29");
+  });
+
+  // Omitted is not "off": an application that says nothing gets the documented default.
+  it("treats an unset value as on", () => {
+    setCaptureInputValues(undefined);
+
+    expect(redactInputValue("250", { name: "maxPrice" }).value).toBe("250");
   });
 });
