@@ -665,6 +665,7 @@ export function buildEvidenceCandidates(
   addFormResetAfterErrorCandidates(events, index, drafts);
   addCurrencyLocaleMismatchCandidates(events, index, drafts);
   addStaleValueRenderedCandidates(events, index, drafts, exchanges);
+  addDisplayedFieldMismatchCandidates(events, index, drafts, exchanges);
   addDisplayDateTimezoneMismatchCandidates(events, index, drafts);
   addLayoutOverflowCandidates(events, index, drafts);
   addStaleViewAfterPopCandidates(events, index, drafts);
@@ -10153,46 +10154,68 @@ interface NumericFieldObservation {
 }
 
 /**
- * Numeric leaves of a response body, keyed by field NAME rather than by full path.
+ * Numeric leaves of a response body that name ONE quantity, keyed by endpoint and field name.
  *
- * By name because the same quantity appears at different paths in different responses - `balance`
- * at the top of a read and at `data.card.balance` in a write's echo - and a rule keyed on the full
- * path would treat those as unrelated fields and see no change at all.
+ * Two scoping rules, and both are load-bearing rather than tidiness. Keyed by endpoint because
+ * `total` on the cart and `total` on the ledger are different quantities that happen to share a
+ * word. And a name that appears more than once in a SINGLE response is dropped outright: that is a
+ * per-row field on a collection - a price on each of seven products - and comparing one row's value
+ * against another row's over time reports every list as stale. That exact false positive is what
+ * this function was rewritten to remove, after the first version reported five product prices and
+ * missed the balance the case was about.
  */
 function collectNumericFields(
   exchanges: Map<string, RequestExchange>,
 ): Map<string, NumericFieldObservation[]> {
-  const byName = new Map<string, NumericFieldObservation[]>();
-
-  const walk = (value: unknown, name: string, path: string, depth: number, t: number): void => {
-    if (depth > MAX_NUMERIC_WALK_DEPTH) return;
-    if (typeof value === "number") {
-      if (!Number.isFinite(value)) return;
-      if (!byName.has(name) && byName.size >= MAX_TRACKED_NUMERIC_FIELDS) return;
-      const list = byName.get(name) ?? [];
-      list.push({ value, t, path });
-      byName.set(name, list);
-      return;
-    }
-    if (Array.isArray(value)) {
-      for (const entry of value) walk(entry, name, path, depth + 1, t);
-      return;
-    }
-    if (!isRecord(value)) return;
-    for (const [key, entry] of Object.entries(value)) {
-      walk(entry, key.toLowerCase(), path ? `${path}.${key}` : key, depth + 1, t);
-    }
-  };
+  const byKey = new Map<string, NumericFieldObservation[]>();
+  /** Keys proven to be per-row rather than scalar, and therefore not comparable over time. */
+  const repeated = new Set<string>();
 
   for (const exchange of exchanges.values()) {
     if (!exchange.res || !isSuccessStatus(exchange.status)) continue;
     const payload = responsePayload(exchange.resBody, exchange.resBodyMeta);
     if (payload === undefined) continue;
-    walk(payload, "", "", 0, exchange.res.t);
+    const endpoint = capturedUrlPath(exchange.url ?? "") ?? "";
+    const t = exchange.res.t;
+    const inThisResponse = new Map<string, NumericFieldObservation>();
+    const countedHere = new Set<string>();
+
+    const walk = (value: unknown, name: string, path: string, depth: number): void => {
+      if (depth > MAX_NUMERIC_WALK_DEPTH) return;
+      if (typeof value === "number") {
+        if (!Number.isFinite(value) || !name) return;
+        const key = `${endpoint}\u0000${name}`;
+        if (countedHere.has(key)) {
+          repeated.add(key);
+          return;
+        }
+        countedHere.add(key);
+        inThisResponse.set(key, { value, t, path });
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const entry of value) walk(entry, name, path, depth + 1);
+        return;
+      }
+      if (!isRecord(value)) return;
+      for (const [key, entry] of Object.entries(value)) {
+        walk(entry, key.toLowerCase(), path ? `${path}.${key}` : key, depth + 1);
+      }
+    };
+
+    walk(payload, "", "", 0);
+
+    for (const [key, observation] of inThisResponse) {
+      if (!byKey.has(key) && byKey.size >= MAX_TRACKED_NUMERIC_FIELDS) continue;
+      const list = byKey.get(key) ?? [];
+      list.push(observation);
+      byKey.set(key, list);
+    }
   }
 
-  for (const list of byName.values()) list.sort((a, b) => a.t - b.t);
-  return byName;
+  for (const key of repeated) byKey.delete(key);
+  for (const list of byKey.values()) list.sort((a, b) => a.t - b.t);
+  return byKey;
 }
 
 /**
@@ -10223,7 +10246,8 @@ function addStaleValueRenderedCandidates(
   for (const event of events) {
     if (event.k !== "ui.num") continue;
     for (const item of uiNumItems(event)) {
-      for (const [name, observations] of fields) {
+      for (const [key_, observations] of fields) {
+        const name = key_.slice(key_.indexOf("\u0000") + 1);
         // A field that never changed cannot be shown stale, and checking it first keeps the common
         // case (ids, counts, constants) out of the inner comparison entirely.
         const before = observations.filter((entry) => entry.t <= event.t);
@@ -10268,6 +10292,163 @@ function addStaleValueRenderedCandidates(
     ...emitted
       .sort((a, b) => a.anchor.t - b.anchor.t)
       .slice(0, MAX_STALE_VALUE_CANDIDATES),
+  );
+}
+
+// ─── displayed_field_mismatch ────────────────────────────────────────────────
+
+/**
+ * The page put the wrong field of the right record on screen.
+ *
+ * A gift card labelled "Balance" showing the amount it was issued with. A cart labelled "Total"
+ * showing the subtotal. An account labelled "Available" showing the limit. Every request succeeded
+ * and every response was correct, so nothing on the request plane is a finding - and the value on
+ * screen is not stale either, because the server never sent it for that field. It sent it for a
+ * DIFFERENT field of the same record, which is the whole defect and also names its own fix.
+ *
+ * The rule needs three things to agree before it says anything: a label that matches one field of a
+ * record by name, a displayed value that does not match that field, and a sibling field of the same
+ * record that it does match. Two of the three is a coincidence; all three is a wiring mistake.
+ */
+const DISPLAYED_FIELD_MISMATCH_SCORE = 92;
+/** Emissions per session. */
+const MAX_DISPLAYED_FIELD_MISMATCH_CANDIDATES = 5;
+
+/** Numeric fields of one record from one response, with whatever identifies the record. */
+interface ResponseRecord {
+  /** Field name (lowercased, no separators) to value. */
+  fields: Map<string, number>;
+  /** Original field names, for a message that quotes what the developer wrote. */
+  originalNames: Map<string, string>;
+  /** Human identity of the record, when it carries one. */
+  identity?: string;
+  t: number;
+}
+
+/** `balance_cents` / `balanceCents` / `BalanceCents` all compare as `balance`. */
+function comparableFieldName(name: string): string {
+  const compact = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+  // Minor-unit and quantity suffixes name the representation, not the quantity. Stripping them is
+  // what lets a label of "Balance" reach a field called `balanceCents`.
+  return compact.replace(/(cents|amount|value|count|qty|quantity)$/, "") || compact;
+}
+
+/** Records carried by every successful response in the session. */
+function collectResponseRecords(
+  exchanges: Map<string, RequestExchange>,
+): ResponseRecord[] {
+  const records: ResponseRecord[] = [];
+
+  const walk = (value: unknown, depth: number, t: number): void => {
+    if (depth > MAX_NUMERIC_WALK_DEPTH) return;
+    if (Array.isArray(value)) {
+      for (const entry of value) walk(entry, depth + 1, t);
+      return;
+    }
+    if (!isRecord(value)) return;
+
+    const fields = new Map<string, number>();
+    const originalNames = new Map<string, string>();
+    let identity: string | undefined;
+    for (const [key, entry] of Object.entries(value)) {
+      if (typeof entry === "number" && Number.isFinite(entry)) {
+        const name = comparableFieldName(key);
+        // First occurrence wins, so `balance` is not overwritten by a later `balanceDue`.
+        if (!fields.has(name)) {
+          fields.set(name, entry);
+          originalNames.set(name, key);
+        }
+      } else if (
+        typeof entry === "string" &&
+        identity === undefined &&
+        /^(code|sku|reference|number|name|title|label)$/.test(key.toLowerCase())
+      ) {
+        identity = safeText(entry, 60);
+      } else {
+        walk(entry, depth + 1, t);
+      }
+    }
+    // Two numeric fields minimum: a record with one number has no sibling to be confused with.
+    if (fields.size >= 2) {
+      records.push(removeUndefined({ fields, originalNames, identity, t }) as ResponseRecord);
+    }
+  };
+
+  for (const exchange of exchanges.values()) {
+    if (!exchange.res || !isSuccessStatus(exchange.status)) continue;
+    const payload = responsePayload(exchange.resBody, exchange.resBodyMeta);
+    if (payload === undefined) continue;
+    walk(payload, 0, exchange.res.t);
+  }
+
+  return records;
+}
+
+function addDisplayedFieldMismatchCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const records = collectResponseRecords(exchanges);
+  if (records.length === 0) return;
+
+  const emitted: CandidateDraft[] = [];
+  const seen = new Set<string>();
+
+  for (const event of events) {
+    if (event.k !== "ui.num") continue;
+    for (const item of uiNumItems(event)) {
+      const labelName = comparableFieldName(item.label);
+      if (labelName.length < 3) continue;
+
+      for (const record of records) {
+        if (record.t > event.t) continue;
+        const named = record.fields.get(labelName);
+        if (named === undefined || sameQuantity(item.value, named)) continue;
+
+        const sibling = [...record.fields].find(
+          ([name, value]) => name !== labelName && sameQuantity(item.value, value),
+        );
+        if (!sibling) continue;
+
+        const key = `displayedfield:${item.label}:${sibling[0]}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const namedField = record.originalNames.get(labelName) ?? labelName;
+        const siblingField = record.originalNames.get(sibling[0]) ?? sibling[0];
+        emitted.push({
+          detector: "displayed_field_mismatch",
+          title: `\`${item.label}\` on screen is showing \`${siblingField}\`, not \`${namedField}\``,
+          severity: "high",
+          score: DISPLAYED_FIELD_MISMATCH_SCORE,
+          confidence: "high",
+          anchor: removeUndefined({
+            t: event.t,
+            offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+            route: routeAt(index.navs ?? [], event.t),
+            elementLabel: scrubText(item.label, 120),
+            message: scrubText(
+              `The page shows ${item.value} beside "${item.label}"` +
+                (record.identity ? ` for ${record.identity}` : "") +
+                `. The response carries \`${namedField}\` = ${named} and \`${siblingField}\` = ${sibling[1]} ` +
+                `on that same record, and what is displayed is the second one. Every request ` +
+                `succeeded and the response is correct, so the wrong field is being read where it ` +
+                `is rendered.`,
+              400,
+            ),
+          }),
+          dedupeKey: key,
+        });
+      }
+    }
+  }
+
+  drafts.push(
+    ...emitted
+      .sort((a, b) => a.anchor.t - b.anchor.t)
+      .slice(0, MAX_DISPLAYED_FIELD_MISMATCH_CANDIDATES),
   );
 }
 
