@@ -48,6 +48,22 @@ export const MAX_CLIENT_FRAMES = 5;
 const V8_FRAME =
   /^\s*at\s+(?:(?<fn>[^\s(][^(]*?)\s+\()?(?<file>[^\s()]+?):(?<line>\d+):(?<column>\d+)\)?\s*$/;
 
+/**
+ * Frames with no script behind them.
+ *
+ * V8 renders a frame with no source as `<anonymous>:1:1`, and the position makes
+ * it match the frame grammar exactly. Measured on a real capture: an SDK frame
+ * emitted from a `<anonymous>` context produced the code location
+ * `<anonymous>:305`, which is a path a reader cannot open and a line that means
+ * nothing — the confidently-wrong location this module refuses by name. A file
+ * with no `/` and no `.` is not a script.
+ */
+function isOpenableScript(file: string): boolean {
+  if (file.startsWith("<") || file.startsWith("eval at ")) return false;
+  if (file === "native" || file === "unknown location") return false;
+  return file.includes("/") || file.includes("\\");
+}
+
 function normalizeScriptUrl(raw: string): string {
   const query = raw.indexOf("?");
   const withoutQuery = query === -1 ? raw : raw.slice(0, query);
@@ -62,7 +78,7 @@ export function parseClientFrame(
   const groups = match?.groups;
   if (!groups?.file) return undefined;
   const file = normalizeScriptUrl(groups.file);
-  if (file.length === 0) return undefined;
+  if (file.length === 0 || !isOpenableScript(file)) return undefined;
   const frame: LlmBundleDbCallsite = {
     file,
     line: Number(groups.line),

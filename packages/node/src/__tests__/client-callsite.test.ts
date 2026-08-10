@@ -104,3 +104,24 @@ describe("clientCallsiteFromStack", () => {
     expect(callsite?.file).not.toContain("client/src");
   });
 });
+
+describe("frames with no script behind them", () => {
+  it("refuses <anonymous>", () => {
+    // Measured on a real capture: this produced the code location
+    // `<anonymous>:305` — a path nobody can open, on a line that means nothing.
+    expect(parseClientFrame("    at <anonymous>:305:14")).toBeUndefined();
+    expect(parseClientFrame("    at foo (<anonymous>:1:1)")).toBeUndefined();
+  });
+
+  it("refuses native and eval frames", () => {
+    expect(parseClientFrame("    at Array.map (native:1:1)")).toBeUndefined();
+    expect(parseClientFrame("    at eval at boot (x:1:1)")).toBeUndefined();
+  });
+
+  it("still accepts a real script", () => {
+    // The other direction. A refusal rule wide enough to drop real frames would
+    // empty the field this whole change exists to fill.
+    expect(parseClientFrame("    at go (http://h/src/a.js:2:3)")?.file).toBe("http://h/src/a.js");
+    expect(parseClientFrame("    at go (/srv/app/a.js:2:3)")?.file).toBe("/srv/app/a.js");
+  });
+});
