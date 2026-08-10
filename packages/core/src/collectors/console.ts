@@ -1,6 +1,7 @@
 import type { EventBus } from "../event-bus";
 import type { CrumbtrailConfig, CollectorCleanup } from "../types";
 import { safeStringify, now } from "../utils";
+import { captureCallStack } from "../call-stack";
 import {
   attachRedactionMetadata,
   redactNetworkTextBody,
@@ -64,23 +65,38 @@ export function consoleCollector(
   for (const method of METHODS) {
     originals.set(method, console[method]);
 
-    console[method] = (...args: unknown[]) => {
+    // Named and held in a binding because it is the stack BOUNDARY: every frame
+    // at and above it is the SDK, and `captureCallStack` needs the function
+    // itself to say so. An anonymous arrow assigned straight onto `console`
+    // could not be pointed at.
+    const instrumentedConsole = (...args: unknown[]) => {
       const redactedArgs = config.captureRawConsole
         ? args.map((a) => safeStringify(a))
         : args.map((a, index) => redactConsoleArg(a, `args[${index}]`));
+      // Captured relative to THIS wrapper, so the first frame is the
+      // application's `console.error(...)` call and not the collector standing
+      // in front of it. `new Error().stack` here named this file, and
+      // `evidence-index` takes the first frame as the code location — so the
+      // only client-side code location the SDK produced today pointed at the
+      // SDK's own bundle.
+      const raw =
+        method === "error" ? captureCallStack(instrumentedConsole) : undefined;
       const stack =
-        method === "error"
-          ? config.captureRawConsole
-            ? { value: new Error().stack }
-            : redactConsoleStack(new Error().stack)
-          : undefined;
+        raw === undefined
+          ? undefined
+          : config.captureRawConsole
+            ? { value: raw }
+            : redactConsoleStack(raw);
       const d: Record<string, unknown> = {
         lv: LEVEL_MAP[method],
         args: redactedArgs.map((arg) =>
           typeof arg === "string" ? arg : arg.value,
         ),
       };
-      if (method === "error") d.stk = stack?.value;
+      // Only when there IS one. Assigning undefined would put an empty `stk`
+      // slot on every console.error from an engine that cannot strip frames,
+      // which reads downstream as "captured, and it was blank".
+      if (stack?.value !== undefined) d.stk = stack.value;
       if (!config.captureRawConsole) {
         attachRedactionMetadata(
           d,
@@ -93,6 +109,7 @@ export function consoleCollector(
       bus.emit({ t: now(), k: "con", d });
       originals.get(method)!.apply(console, args);
     };
+    console[method] = instrumentedConsole;
   }
 
   return () => {

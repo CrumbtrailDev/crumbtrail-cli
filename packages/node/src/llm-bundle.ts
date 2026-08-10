@@ -18,6 +18,7 @@ import {
 import { sanitizeSelector } from "./sanitize-selector";
 import { groupDistinctBugs, type DistinctBug } from "./distinct-bugs";
 import { redactedNetworkBodySnippet } from "./network-body";
+import { clientCallsiteFromStack } from "./client-callsite";
 import type { EvidenceCandidate } from "./evidence-index";
 import type { CausalConfidence } from "./causal-graph";
 import { defaultSessionStore } from "./session-store";
@@ -128,6 +129,21 @@ export interface LlmBundleFrontendRequestEvidenceSummary {
   requestBody?: string;
   /** Redacted snippet of what came back, from the matching `net.res` event. */
   responseBody?: string;
+  /**
+   * Where the application asked for this request, from the stack the browser
+   * SDK captured at the call.
+   *
+   * The backend half of a linked request has carried a callsite for a while, on
+   * `responseCallsite` and on the writes riding under `db.diff`. The frontend
+   * half carried none, so a session whose defect never reached the server — or
+   * reached it and got a correct answer back — produced a bundle naming only
+   * server files. The reason written beside `responseCallsite` holds here
+   * unchanged: a page that renders wrong without throwing had no pointer at all.
+   *
+   * Same shape as the database callsite, deliberately: it is the same question,
+   * and `code_locations` already knows how to render a caller chain from it.
+   */
+  requestCallsite?: LlmBundleDbCallsite;
   error?: {
     message?: string;
     transport?: string;
@@ -3177,6 +3193,7 @@ function boundaryPromptFromValue(
 interface FullStackPayloads {
   frontendRequestBody?: string;
   frontendResponseBody?: string;
+  frontendRequestCallsite?: LlmBundleDbCallsite;
   backendResponseBody?: string;
   backendResponseCallsite?: LlmBundleDbCallsite;
 }
@@ -3208,6 +3225,8 @@ function buildFullStackPayloadIndex(
     if (event.k === "net.req") {
       const body = redactedNetworkBodySnippet(event.d.body, event.d.bodySummary);
       if (body) entryFor(requestId).frontendRequestBody ??= body;
+      const callsite = clientCallsiteFromStack(event.d.stk);
+      if (callsite) entryFor(requestId).frontendRequestCallsite ??= callsite;
     } else if (event.k === "net.res") {
       const body = redactedNetworkBodySnippet(event.d.body, event.d.bodySummary);
       if (body) entryFor(requestId).frontendResponseBody ??= body;
@@ -3415,6 +3434,7 @@ function frontendRequestEvidenceFromIndex(
     durationMs: finiteNumber(value.durationMs),
     requestBody: payload?.frontendRequestBody,
     responseBody: payload?.frontendResponseBody,
+    requestCallsite: payload?.frontendRequestCallsite,
     error: fullStackFrontendErrorFromIndex(value.error),
   });
   return Object.keys(frontend).length > 0 ? frontend : undefined;

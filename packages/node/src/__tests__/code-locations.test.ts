@@ -202,3 +202,107 @@ describe("buildCodeLocations", () => {
     ]);
   });
 });
+
+// The client plane.
+//
+// Measured on nine real harness bundles across five scenarios: ZERO carried any
+// code location from the browser. For `autofill-stomped-by-effect`, whose ground
+// truth is a stale closure in a React page, the locations were a Node internal
+// and a backend repository write — the page's own filename appeared nowhere in
+// the 47KB bundle. These pin the plane back on.
+describe("buildCodeLocations — client request callsites", () => {
+  const linkedBundle = (over: Record<string, unknown> = {}): LlmBundle =>
+    ({
+      databaseDiffs: [
+        {
+          requestId: "req-1",
+          callsite: { file: "server/src/repos/addresses-repo.js", line: 20, fn: "insertAddress" },
+        },
+      ],
+      fullStackEvidence: {
+        linked: [
+          {
+            requestId: "req-1",
+            sessionId: "ses-1",
+            frontend: {
+              requestId: "req-1",
+              requestCallsite: {
+                file: "http://127.0.0.1:5637/src/lib/api-addresses.js",
+                line: 12,
+                column: 9,
+                fn: "saveAddress",
+                stack: [
+                  { file: "http://127.0.0.1:5637/src/pages/Account.jsx", line: 88, column: 13, fn: "onSave" },
+                ],
+              },
+            },
+            backend: {},
+          },
+        ],
+        gaps: [],
+      },
+      ...over,
+    }) as unknown as LlmBundle;
+
+  it("emits the client line alongside the server write for one request", () => {
+    const locations = buildCodeLocations(linkedBundle(), [
+      candidate({ id: "cand_0007", anchor: { t: 1, requestId: "req-1" } } as Partial<EvidenceCandidate>),
+    ]);
+    const via = locations?.map((location) => location.via);
+    // Both planes. Before this, the `db.write` branch returned early and the
+    // client line — the one a fix to a client defect has to change — was never
+    // reachable at all.
+    expect(via).toContain("db.write");
+    expect(via).toContain("client.request");
+  });
+
+  it("keeps the component that called the helper, as a caller frame", () => {
+    const locations = buildCodeLocations(linkedBundle(), [
+      candidate({ id: "cand_0007", anchor: { t: 1, requestId: "req-1" } } as Partial<EvidenceCandidate>),
+    ]);
+    const client = locations?.find((location) => location.via === "client.request");
+    expect(client?.path).toBe("http://127.0.0.1:5637/src/lib/api-addresses.js");
+    expect(client?.fn).toBe("saveAddress");
+    // The helper is shared by every request in the app; Account.jsx is the file
+    // the defect is in. Losing the caller chain would name the wrong one.
+    expect(client?.callers?.[0]?.path).toBe("http://127.0.0.1:5637/src/pages/Account.jsx");
+  });
+
+  it("emits a client location for a request the server never answered", () => {
+    // A gap is a frontend request with no backend counterpart — a client-side
+    // story by construction, and the case where the client line is the only one.
+    const bundle = {
+      databaseDiffs: [],
+      fullStackEvidence: {
+        linked: [],
+        gaps: [
+          {
+            type: "frontend_only",
+            requestId: "req-9",
+            frontend: {
+              requestId: "req-9",
+              requestCallsite: { file: "http://127.0.0.1:5637/src/lib/thirdparty.js", line: 4, column: 1 },
+            },
+          },
+        ],
+      },
+    } as unknown as LlmBundle;
+    const locations = buildCodeLocations(bundle, []);
+    expect(locations?.[0]?.via).toBe("client.request");
+    expect(locations?.[0]?.path).toBe("http://127.0.0.1:5637/src/lib/thirdparty.js");
+  });
+
+  it("is still undefined when the browser captured no callsite", () => {
+    // The negative direction. Without it, a change that emitted a client
+    // location unconditionally — from a request id alone, with no frame behind
+    // it — would pass every test above.
+    const bundle = {
+      databaseDiffs: [],
+      fullStackEvidence: {
+        linked: [{ requestId: "req-2", sessionId: "s", frontend: { requestId: "req-2" }, backend: {} }],
+        gaps: [],
+      },
+    } as unknown as LlmBundle;
+    expect(buildCodeLocations(bundle, [])).toBeUndefined();
+  });
+});
