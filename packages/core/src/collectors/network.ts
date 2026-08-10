@@ -1243,6 +1243,19 @@ function emitEarlyRecord(
     reqMetadata.push(bodyResult.metadata);
   }
 
+  // The callsite the EARLY snippet captured, replayed with the rest of the
+  // record. In an application that installs the snippet this is the only path a
+  // `net.req` takes — measured at 26 of 26 in a captured session — so a callsite
+  // on `wrapFetch` alone would be a producer nothing downstream ever sees.
+  if (record.stk) {
+    const stackResult = redactNetworkTextBody(record.stk, {
+      contentType: "text/plain",
+      path: "stk",
+    });
+    if (stackResult.body !== undefined) reqData.stk = stackResult.body;
+    reqMetadata.push(stackResult.metadata);
+  }
+
   attachRedactionMetadata(reqData, ...reqMetadata);
   bus.emit({ t: record.t, k: "net.req", d: reqData });
 
