@@ -746,9 +746,31 @@ export const DETECTOR_ANCHORING_DECLARED: ReadonlyMap<string, string> = new Map(
     "console_warning",
     "warn-level `con` events never become graph nodes — `nodeKindFor` emits console.error for error level only — so a warning has no node of its own, and mapping it to console.error would steal a real node from a genuine console_error candidate",
   ],
+  // The five below were ALREADY reasoned about, in `findTemporalNode`: "a KNOWN
+  // detector with NO causal node family ... must NOT temporal-match arbitrary
+  // nodes -- it stays isolated so it never steals a request-spine node from the
+  // candidate that actually belongs to it." That is a deliberate decision, so
+  // filing them as unreviewed debt would report a design choice as an oversight
+  // and inflate the debt count with entries nobody should ever "fix".
   [
     "user_marker",
-    "a marker is the reporter's annotation of a moment, not an observation of the system; attributing it to whatever node sits nearest in time would put the user's bookmark in the causal position of a cause",
+    "named in findTemporalNode as a known detector with no causal node family: it must not temporal-match arbitrary nodes, or it steals a request-spine node from the candidate that actually belongs to it",
+  ],
+  [
+    "repeated_clicks",
+    "named in findTemporalNode as a known detector with no causal node family: it must not temporal-match arbitrary nodes, or it steals a request-spine node from the candidate that actually belongs to it",
+  ],
+  [
+    "page_probe_failure",
+    "named in findTemporalNode as a known detector with no causal node family: it must not temporal-match arbitrary nodes, or it steals a request-spine node from the candidate that actually belongs to it",
+  ],
+  [
+    "media_degradation",
+    "named in findTemporalNode as a known detector with no causal node family: it must not temporal-match arbitrary nodes, or it steals a request-spine node from the candidate that actually belongs to it",
+  ],
+  [
+    "tab_boundary_gap",
+    "named in findTemporalNode as a known detector with no causal node family: it must not temporal-match arbitrary nodes, or it steals a request-spine node from the candidate that actually belongs to it",
   ],
   [
     "transcript_complaint",
@@ -810,18 +832,15 @@ export const DETECTOR_ANCHORING_UNREVIEWED: ReadonlySet<string> = new Set([
   "listener_growth",
   "locale_decimal_scale_shift",
   "lost_update",
-  "media_degradation",
   "money_scale_shift",
   "mutations_missing_entity_audit",
   "n_plus_one_query",
   "notification_lifecycle_order_inverted",
   "order_committed_with_negative_inventory",
   "orphaned_reference",
-  "page_probe_failure",
   "pagination_first_page_offset",
   "pricing_total_ignored_by_checkout",
   "refund_total_exceeded",
-  "repeated_clicks",
   "report_total_contradicts_source_row",
   "request_reconnect_storm",
   "request_target_row_mismatch",
@@ -839,7 +858,6 @@ export const DETECTOR_ANCHORING_UNREVIEWED: ReadonlySet<string> = new Set([
   "state_flip_flop",
   "stored_active_markup",
   "stream_desync",
-  "tab_boundary_gap",
   "ui_api_divergence",
   "ui_arithmetic_mismatch",
 ]);
