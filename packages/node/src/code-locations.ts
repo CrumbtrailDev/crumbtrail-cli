@@ -162,6 +162,10 @@ export function buildCodeLocations(
   const seen = new Set<string>();
 
   const push = (location: CodeLocation) => {
+    // The cap is enforced HERE, not only at each loop top. A candidate can now
+    // yield two locations — the server line and the client line — so a top-of-
+    // loop check alone lets the array finish one over.
+    if (locations.length >= MAX_CODE_LOCATIONS) return;
     const key = keyOf(location);
     if (seen.has(key)) return;
     seen.add(key);
@@ -277,9 +281,14 @@ export function buildCodeLocations(
   // unranked writes are last — and present because a session whose defect never
   // produced a server signal at all is precisely the session that has no other
   // code evidence, and is the case this field was added for.
-  for (const [requestId, callsite] of clientByRequest) {
+  for (const callsite of clientByRequest.values()) {
     if (locations.length >= MAX_CODE_LOCATIONS) break;
-    pushCallsite(callsite, "client.request", requestId);
+    // `unranked`, matching the database tail. `signalId` is documented as the
+    // ranked signal a location came from, and nothing ranked this one; a real
+    // request id here would send a reader looking for a signal that is not
+    // there. Requests a candidate DID rank are already in `locations` and are
+    // turned away by the file:line dedupe above, keeping their checkable id.
+    pushCallsite(callsite, "client.request", "unranked");
   }
 
   return locations.length > 0 ? locations : undefined;

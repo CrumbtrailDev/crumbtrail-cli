@@ -306,3 +306,74 @@ describe("buildCodeLocations — client request callsites", () => {
     expect(buildCodeLocations(bundle, [])).toBeUndefined();
   });
 });
+
+describe("buildCodeLocations — the unranked client tail", () => {
+  const helper = (line: number) => ({
+    file: "http://127.0.0.1:5637/src/lib/api.js",
+    line,
+    column: 9,
+    fn: "request",
+  });
+
+  const linkedWith = (requestIds: string[], lineFor: (id: string, i: number) => number): LlmBundle =>
+    ({
+      databaseDiffs: [],
+      fullStackEvidence: {
+        linked: requestIds.map((requestId, i) => ({
+          requestId,
+          sessionId: "s",
+          frontend: { requestId, requestCallsite: helper(lineFor(requestId, i)) },
+          backend: {},
+        })),
+        gaps: [],
+      },
+    }) as unknown as LlmBundle;
+
+  it("labels a client location no candidate ranked as unranked", () => {
+    // The request id is NOT a signal id. `signalId` is what makes a location
+    // checkable — a reader follows it back to the claim behind the path — and a
+    // request id sends them looking for a signal that does not exist.
+    const locations = buildCodeLocations(linkedWith(["req-9"], () => 40), []);
+    expect(locations?.[0]?.signalId).toBe("unranked");
+    expect(locations?.[0]?.signalId).not.toBe("req-9");
+  });
+
+  it("leaves a ranked request's own signal id alone", () => {
+    const locations = buildCodeLocations(
+      linkedWith(["req-a", "req-b"], (_id, i) => 12 + i),
+      [candidate({ id: "cand_0001", anchor: { t: 1, requestId: "req-a" } } as never)],
+    );
+    const ranked = locations?.find((location) => location.line === 12);
+    const tail = locations?.find((location) => location.line === 13);
+    expect(ranked?.signalId).toBe("cand_0001");
+    expect(tail?.signalId).toBe("unranked");
+  });
+
+  it("still stops at the cap when a candidate yields two locations", () => {
+    // Eleven single-location candidates take the count to MAX - 1, so the
+    // twelfth — which yields BOTH a server write and a client request — is the
+    // one that overflows an array whose cap is only checked at the loop top.
+    const singles = Array.from({ length: MAX_CODE_LOCATIONS - 1 }, (_, i) =>
+      candidate({ id: `cand_s${i}`, anchor: { t: i, frame: `file-${i}.js:1` } } as never),
+    );
+    const bundle = {
+      databaseDiffs: [{ requestId: "req-x", callsite: { file: "server/w.js", line: 1 } }],
+      fullStackEvidence: {
+        linked: [
+          {
+            requestId: "req-x",
+            sessionId: "s",
+            frontend: { requestId: "req-x", requestCallsite: { file: "http://h/c.js", line: 1 } },
+            backend: {},
+          },
+        ],
+        gaps: [],
+      },
+    } as unknown as LlmBundle;
+    const locations = buildCodeLocations(bundle, [
+      ...singles,
+      candidate({ id: "cand_both", anchor: { t: 99, requestId: "req-x" } } as never),
+    ]);
+    expect(locations).toHaveLength(MAX_CODE_LOCATIONS);
+  });
+});
