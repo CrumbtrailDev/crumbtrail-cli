@@ -106,6 +106,30 @@ export interface FixContextCausalChain {
 }
 
 /**
+ * Why no chain was projected. One of three states, and they are NOT
+ * interchangeable:
+ *
+ * - `no_signals` — nothing ranked at all. There was no incident to explain.
+ * - `top_candidate_isolated` — the highest-ranked signal, the one that names the
+ *   incident, could not be attached to the causal graph. The chain's absence is a
+ *   fact about OUR attribution, not about the application.
+ * - `root_attributed_no_symptoms` — a root was resolved and it explains nothing
+ *   downstream, so the projection has one end of a chain and no other.
+ *
+ * `detector` names the signal that could not be placed, so a reader can see which
+ * observation is missing from the graph rather than being told only that
+ * something is.
+ */
+export interface FixContextCausalAbsence {
+  reason:
+    | "no_signals"
+    | "top_candidate_isolated"
+    | "root_attributed_no_symptoms";
+  detector?: string;
+  signalId?: string;
+}
+
+/**
  * A deterministic detector output. `basis` makes it explicit that `baseScore`
  * is a reproducible heuristic score, not a contextual model judgment.
  *
@@ -133,6 +157,25 @@ export interface FixContext {
    * as "no causal structure surfaced".
    */
   causal_chain: FixContextCausalChain | null;
+  /**
+   * Why {@link FixContext.causal_chain} is null, when it is. Absent whenever a
+   * chain is present.
+   *
+   * A bare null says "no causal structure surfaced", which is true and which a
+   * reader cannot act on. Measured across nine captured sessions from five
+   * scenarios, `causal_chain` was null in all nine — and in eight of them the top
+   * candidate was the detector that NAMES the incident, sitting `isolated`
+   * because nothing had decided which node kind it anchors on. "The signal that
+   * identifies your bug could not be placed in the graph" and "these events
+   * genuinely have no causal relationship" are opposite facts, and the field
+   * that reported both identically is the reason nobody noticed for nine
+   * sessions.
+   *
+   * This does NOT widen what is claimed. No chain is asserted, nothing is
+   * guessed, and `causal_chain` stays null — the absence simply stops being
+   * silent.
+   */
+  causal_chain_absence?: FixContextCausalAbsence;
   repro_hint: FixContextReproHint | null;
   /**
    * Cloud-resolved GitHub code pointers projected from the session's canonical
@@ -213,7 +256,7 @@ export function buildFixContextFromArtifacts(
   const primaryWindow = buildPrimaryWindow(ranked, bundle, resolveAnchorRequestId(index));
   const reproHint = buildReproHint(ranked);
   const environment = buildEnvironment(bundle);
-  const causalChain = buildCausalChain(ranked);
+  const causal = projectCausalChain(ranked);
   const codePointers = extractOpinionCodePointers(extras.opinion);
   const codeLocations = buildCodeLocations(bundle, ranked);
 
@@ -223,7 +266,8 @@ export function buildFixContextFromArtifacts(
     signals: ranked.map(toSignal),
     primary_window: primaryWindow,
     environment,
-    causal_chain: causalChain,
+    causal_chain: causal.chain,
+    ...(causal.absence ? { causal_chain_absence: causal.absence } : {}),
     repro_hint: reproHint,
     ...(codePointers ? { code_pointers: codePointers } : {}),
     ...(codeLocations ? { code_locations: codeLocations } : {}),
@@ -269,8 +313,26 @@ function toSignal(candidate: EvidenceCandidate): FixContextSignal {
 export function buildCausalChain(
   ranked: EvidenceCandidate[],
 ): FixContextCausalChain | null {
+  return projectCausalChain(ranked).chain;
+}
+
+/**
+ * The chain and, when there is none, the reason.
+ *
+ * One function rather than two so the reason can never disagree with the null it
+ * explains. A second function mirroring these branches would drift the first time
+ * one of them changed, and a WRONG explanation of an absence is worse than the
+ * bare null it replaced — it is a confident claim about our own instrument.
+ *
+ * Every `return` below is byte-for-byte the same decision the projection made
+ * before; nothing is newly refused and nothing newly accepted.
+ */
+export function projectCausalChain(ranked: EvidenceCandidate[]): {
+  chain: FixContextCausalChain | null;
+  absence?: FixContextCausalAbsence;
+} {
   const top = ranked[0];
-  if (!top) return null;
+  if (!top) return { chain: null, absence: { reason: "no_signals" } };
 
   const byId = new Map<string, EvidenceCandidate>();
   for (const candidate of ranked) byId.set(candidate.id, candidate);
@@ -281,7 +343,12 @@ export function buildCausalChain(
   } else if (top.causalRole === "symptom" && top.rootCauseId) {
     root = byId.get(top.rootCauseId);
   }
-  if (!root || root.causalRole !== "root") return null;
+  if (!root || root.causalRole !== "root") {
+    return {
+      chain: null,
+      absence: { reason: "top_candidate_isolated", detector: top.detector, signalId: top.id },
+    };
+  }
 
   const causeIds = root.causes ?? [];
   const symptoms: FixContextCausalSymptom[] = [];
@@ -297,11 +364,18 @@ export function buildCausalChain(
       }) as FixContextCausalSymptom,
     );
   }
-  if (symptoms.length === 0) return null;
+  if (symptoms.length === 0) {
+    return {
+      chain: null,
+      absence: { reason: "root_attributed_no_symptoms", detector: root.detector, signalId: root.id },
+    };
+  }
 
   return {
-    root: { id: root.id, detector: root.detector, title: root.title },
-    symptoms,
+    chain: {
+      root: { id: root.id, detector: root.detector, title: root.title },
+      symptoms,
+    },
   };
 }
 
