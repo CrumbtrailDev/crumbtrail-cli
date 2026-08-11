@@ -5,6 +5,7 @@ import {
   canInjectCorrelationHeaders,
   resolveOutboundCorrelation,
 } from "./correlation";
+import { captureCodeOrigin } from "./code-origin";
 import { createWebSessionStore } from "./session-store";
 import { DEFAULT_CONFIG } from "./types";
 import { generateSessionId } from "./utils";
@@ -64,6 +65,16 @@ export interface EarlyRequestRecord {
   resBody?: string;
   /** Set instead of `status` when the request never produced a response. */
   err?: string;
+  /**
+   * App frames that issued this request, innermost first, as `url:line:col`.
+   *
+   * Captured here and not at the drain because by then the stack is gone: this
+   * patch is the only code standing in the call path during the blind window,
+   * and the blind window is where a page's first data load lives. Like the body
+   * text above it, the value rests in page memory and leaves only through the
+   * drain, which is where configuration exists to suppress it.
+   */
+  origin?: string[];
 }
 
 export interface EarlyCapture {
@@ -114,6 +125,7 @@ interface PreparedRequest {
   spanId?: string;
   reqBody?: string;
   reqCt?: string;
+  origin?: string[];
 }
 
 const JSON_CONTENT_TYPE = /json/i;
@@ -371,11 +383,14 @@ function patchFetch(state: EarlyCaptureState): void {
       const headers = readHeaders(input, init) ?? new Headers();
       const correlation = applyCorrelation(state.sessionId, url, headers);
       const rawBody = init?.body;
+      // One frame out: this wrapper is what the app called.
+      const origin = captureCodeOrigin(1);
       prepared = {
         method: extractMethod(input, init),
         url,
         sessionId: state.sessionId,
         ...correlation,
+        ...(origin ? { origin } : {}),
         ...(typeof rawBody === "string" ? { reqBody: rawBody } : {}),
         ...(headers.get("content-type")
           ? { reqCt: headers.get("content-type") as string }
@@ -437,6 +452,7 @@ function recordFetchResponse(
     ...(request.requestId ? { requestId: request.requestId } : {}),
     ...(request.traceId ? { traceId: request.traceId } : {}),
     ...(request.spanId ? { spanId: request.spanId } : {}),
+    ...(request.origin ? { origin: request.origin } : {}),
     status: response.status,
     ...(contentType ? { ct: contentType } : {}),
     ...(request.reqCt ? { reqCt: request.reqCt } : {}),
@@ -505,6 +521,7 @@ function recordFailure(
     ...(request.requestId ? { requestId: request.requestId } : {}),
     ...(request.traceId ? { traceId: request.traceId } : {}),
     ...(request.spanId ? { spanId: request.spanId } : {}),
+    ...(request.origin ? { origin: request.origin } : {}),
     err: error instanceof Error ? error.message : String(error),
     ...(request.reqCt ? { reqCt: request.reqCt } : {}),
   };
@@ -582,11 +599,14 @@ function patchXhr(state: EarlyCaptureState): void {
           // Header rejected (wrong readyState): the request still goes out.
         }
       });
+      // One frame out: `send()` is what the app called.
+      const origin = captureCodeOrigin(1);
       request = {
         method: entry.method,
         url: entry.url,
         sessionId: state.sessionId,
         ...correlation,
+        ...(origin ? { origin } : {}),
         ...(typeof body === "string" ? { reqBody: body } : {}),
       };
     } catch {
@@ -611,6 +631,7 @@ function patchXhr(state: EarlyCaptureState): void {
             ...(pending.requestId ? { requestId: pending.requestId } : {}),
             ...(pending.traceId ? { traceId: pending.traceId } : {}),
             ...(pending.spanId ? { spanId: pending.spanId } : {}),
+            ...(pending.origin ? { origin: pending.origin } : {}),
             status: this.status,
             ...(contentType ? { ct: contentType } : {}),
           };

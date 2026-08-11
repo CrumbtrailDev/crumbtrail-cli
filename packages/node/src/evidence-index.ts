@@ -268,6 +268,28 @@ export interface EvidenceCandidate {
      * silently sending someone to the wrong file.
      */
     minifiedFrame?: string;
+    /**
+     * Client source provenance: the app frames that ISSUED this signal's
+     * request, innermost first, as `file:line:col`.
+     *
+     * Separate from `frame` because they answer different questions and a
+     * browser-plane signal can have both. `frame` is where the failure was
+     * observed — which, for a request that reached a database, is a server
+     * callsite. These are where the browser asked for it. A silent client
+     * defect throws nothing, so this is the only client location the session
+     * contains, and collapsing it into `frame` would make one of the two
+     * disappear on exactly the signals that have both.
+     *
+     * Resolved through the build's source map on the same pass `frame` is,
+     * with the generated originals kept in `minifiedClientFrames`.
+     */
+    clientFrames?: string[];
+    /**
+     * The generated locations `clientFrames` were resolved FROM, set only for
+     * the frames source-map resolution actually replaced. Same contract as
+     * `minifiedFrame`: kept so a mapping can be verified rather than trusted.
+     */
+    minifiedClientFrames?: string[];
     target?: TargetDescriptor;
   };
   /** Causal role assigned by the confidence-gated re-rank (CP3). Additive/optional. */
@@ -314,6 +336,54 @@ interface RequestInfo {
 // these are finalize-time cold-plane files, and an embedder that decorates the
 // store (the hosted cloud's at-rest envelope encryption) must see them, or they
 // stay plaintext on the volume while the rest of the session is sealed.
+/** Upper bound on client origin frames carried per candidate. Mirrors the SDK's own cap. */
+const MAX_CLIENT_FRAMES = 4;
+
+/**
+ * Copies the client frames a `net.req` recorded onto every candidate anchored
+ * on that request.
+
+ * Attribution is by `requestId` only — the one identifier the browser stamps on
+ * the wire and the backend echoes back — because anything looser (same URL,
+ * nearby timestamp) would attach a location to a signal it did not come from,
+ * and a wrong location is worse than none.
+ *
+ * Additive: no existing field is overwritten. In particular `anchor.frame` is
+ * left alone even when it is absent, because `frame` means "where the failure
+ * was observed" and a request's origin is not that.
+ */
+function attachClientOrigins(
+  candidates: EvidenceCandidate[],
+  events: BugEvent[],
+): EvidenceCandidate[] {
+  const byRequest = new Map<string, string[]>();
+  for (const event of events) {
+    if (event.k !== "net.req") continue;
+    const requestId = event.d.requestId;
+    const origin = event.d.origin;
+    if (typeof requestId !== "string" || requestId.length === 0) continue;
+    if (!Array.isArray(origin) || byRequest.has(requestId)) continue;
+    const frames = origin
+      .filter((frame): frame is string => typeof frame === "string")
+      .map((frame) => safeText(frame, 300))
+      .filter((frame): frame is string => Boolean(frame))
+      .slice(0, MAX_CLIENT_FRAMES);
+    if (frames.length > 0) byRequest.set(requestId, frames);
+  }
+  if (byRequest.size === 0) return candidates;
+
+  return candidates.map((candidate) => {
+    const requestId = candidate.anchor.requestId;
+    if (!requestId || candidate.anchor.clientFrames) return candidate;
+    const frames = byRequest.get(requestId);
+    if (!frames) return candidate;
+    return {
+      ...candidate,
+      anchor: { ...candidate.anchor, clientFrames: frames },
+    };
+  });
+}
+
 /**
  * Rewrites every candidate's `frame` to the original source location, keeping
  * the generated one as `minifiedFrame`.
@@ -332,7 +402,12 @@ function resolveCandidateFrames(
 ): EvidenceCandidate[] {
   const dir = process.env.CRUMBTRAIL_SOURCEMAP_DIR?.trim();
   if (!dir) return candidates;
-  if (!candidates.some((candidate) => candidate.anchor.frame)) {
+  if (
+    !candidates.some(
+      (candidate) =>
+        candidate.anchor.frame || candidate.anchor.clientFrames?.length,
+    )
+  ) {
     return candidates;
   }
 
@@ -343,12 +418,38 @@ function resolveCandidateFrames(
 
   return candidates.map((candidate) => {
     const frame = candidate.anchor.frame;
-    if (!frame) return candidate;
-    const resolved = resolveFrame(frame, lookup, cache);
-    if (!resolved || resolved === frame) return candidate;
+    const clientFrames = candidate.anchor.clientFrames;
+    const resolved = frame ? resolveFrame(frame, lookup, cache) : undefined;
+    const frameMoved = Boolean(resolved && resolved !== frame);
+
+    // Client frames go through the SAME resolver, lookup and cache — a browser
+    // frame naming a bundler chunk is the case source maps exist for, and a
+    // second resolution path would be a second thing to keep correct. Frames
+    // that do not resolve keep their generated form, per frame, so a partially
+    // covering map improves what it covers and damages nothing else.
+    let clientMoved = false;
+    const resolvedClientFrames = clientFrames?.map((clientFrame) => {
+      const mapped = resolveFrame(clientFrame, lookup, cache);
+      if (!mapped || mapped === clientFrame) return clientFrame;
+      clientMoved = true;
+      return mapped;
+    });
+
+    if (!frameMoved && !clientMoved) return candidate;
     return {
       ...candidate,
-      anchor: { ...candidate.anchor, frame: resolved, minifiedFrame: frame },
+      anchor: {
+        ...candidate.anchor,
+        ...(frameMoved && resolved
+          ? { frame: resolved, minifiedFrame: frame }
+          : {}),
+        ...(clientMoved && resolvedClientFrames && clientFrames
+          ? {
+              clientFrames: resolvedClientFrames,
+              minifiedClientFrames: clientFrames,
+            }
+          : {}),
+      },
     };
   });
 }
@@ -718,7 +819,7 @@ export function buildEvidenceCandidates(
     ),
   );
 
-  return ordered.map((draft, index) => {
+  const finalized: EvidenceCandidate[] = ordered.map((draft, index) => {
     const id = `cand_${String(index + 1).padStart(4, "0")}`;
     const window = windows.find(
       (candidateWindow) =>
@@ -759,6 +860,8 @@ export function buildEvidenceCandidates(
       },
     };
   });
+
+  return attachClientOrigins(finalized, events);
 }
 
 /**

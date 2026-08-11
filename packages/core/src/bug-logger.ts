@@ -1390,6 +1390,12 @@ function applyRemoteMaskingMode(
   }
   if (masking?.maskAllText === true) config.maskAllText = true;
   if (masking?.maskAllInputs === true) config.maskAllInputs = true;
+  // Client source provenance: paths and line numbers, never values, but still
+  // something an operator may decide not to ship off the device. Tighten-only,
+  // like everything else here — a policy can switch it off, and `false` in the
+  // app's own config cannot be overridden back on from the network.
+  if (masking?.captureCodeOrigin === false || settings.captureCodeOrigin === false)
+    config.networkCaptureOrigin = false;
 }
 
 function applyRemoteSampling(

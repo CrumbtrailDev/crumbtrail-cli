@@ -52,7 +52,18 @@ export const MAX_CALLER_FRAMES = 4;
 /** What kind of evidence put us at this line. */
 export type CodeLocationVia =
   | "db.write"
-  | "signal";
+  | "signal"
+  /**
+   * The client module that ISSUED the request behind this signal, recorded by
+   * the browser SDK at `fetch`/`send` time.
+   *
+   * Named apart from the other two because it is the only one that names the
+   * browser tier, and the whole point of the field is that a reader can tell
+   * which tier they are being sent to. A `db.write` for the same signal is the
+   * server line that stored the result; this is the client line that asked for
+   * it, and a defect can live at either end.
+   */
+  | "client.request";
 
 /** One frame: a path a person can open, and the line they should look at. */
 export interface CodeFrame {
@@ -171,6 +182,39 @@ export function buildCodeLocations(
     }
   }
 
+  /**
+   * The client module that issued this candidate's request, if the browser
+   * recorded one.
+   *
+   * The innermost app frame is the location; the frames above it become
+   * `callers`, for the same reason a db.write's stack does — an app that
+   * fetches through an `apiClient` helper has the helper innermost and the line
+   * a fix must change one or two frames out, and only a reader can tell which.
+   * `parseFrame` still governs: a frame without a line number is refused here
+   * exactly as it is everywhere else.
+   */
+  const pushClientLocation = (candidate: EvidenceCandidate): boolean => {
+    const frames = candidate.anchor?.clientFrames;
+    if (!frames || frames.length === 0) return false;
+    const parsed = frames
+      .map((frame) => parseFrame(frame))
+      .filter((frame): frame is CodeFrame => frame !== undefined);
+    const [innermost, ...callers] = parsed;
+    if (!innermost) return false;
+    push({
+      ...innermost,
+      via: "client.request",
+      signalId: candidate.id,
+      signalTitle: candidate.title,
+      ...(callers.length > 0
+        ? { callers: callers.slice(0, MAX_CALLER_FRAMES) }
+        : {}),
+      // Same contract as `minifiedFrame`: set only when resolution moved a frame.
+      ...(candidate.anchor?.minifiedClientFrames ? { sourceMapped: true } : {}),
+    });
+    return true;
+  };
+
   for (const candidate of ranked) {
     if (locations.length >= MAX_CODE_LOCATIONS) break;
 
@@ -186,20 +230,33 @@ export function buildCodeLocations(
           ? { callers: structured.stack.slice(0, MAX_CALLER_FRAMES).map(frameFromCallsite) }
           : {}),
       });
+      // Deliberately NOT `continue`. A request that reached the database has a
+      // server callsite AND, when the SDK recorded it, the client line that
+      // issued the request. Stopping at the first would publish the tier the
+      // reader is least likely to need: a browser defect whose only location is
+      // a repository file under `server/` argues for the wrong class of fix.
+      // The client location is emitted immediately after its own db.write, so
+      // the ranked order is untouched — the pair belongs to one signal.
+      pushClientLocation(candidate);
       continue;
     }
 
     const frame = parseFrame(candidate.anchor?.frame);
-    if (!frame) continue;
-    push({
-      ...frame,
-      via: "signal",
-      signalId: candidate.id,
-      signalTitle: candidate.title,
-      // `minifiedFrame` is set by `evidence-index` only when a source map moved
-      // the frame, so its presence IS the record that resolution happened.
-      ...(candidate.anchor?.minifiedFrame ? { sourceMapped: true } : {}),
-    });
+    if (frame) {
+      push({
+        ...frame,
+        via: "signal",
+        signalId: candidate.id,
+        signalTitle: candidate.title,
+        // `minifiedFrame` is set by `evidence-index` only when a source map moved
+        // the frame, so its presence IS the record that resolution happened.
+        ...(candidate.anchor?.minifiedFrame ? { sourceMapped: true } : {}),
+      });
+    }
+    // A browser signal that never wrote a row — and one that carries no frame
+    // of its own, which is every silent client defect — still knows which
+    // module issued its request.
+    pushClientLocation(candidate);
   }
 
   // Writes whose request never produced a ranked candidate. Last, because

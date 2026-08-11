@@ -388,6 +388,23 @@ export interface CrumbtrailConfig {
   networkMaxBodySize: number;
   networkExcludeUrls: string[];
   networkCaptureHeaders: boolean;
+  /**
+   * Record which client module issued each request, as `url:line:col` app
+   * frames on `net.req` (`d.origin`). Default `true`.
+   *
+   * This is the only client-side code provenance a silent defect produces:
+   * nothing throws, so no stack is captured anywhere else, and a bundle built
+   * from such a session can otherwise name only backend files. Frames are
+   * paths and line numbers — never values — and the URLs go through the same
+   * `redactUrl` every other captured URL does, so a query string cannot ride
+   * along. Vendor frames are dropped at capture.
+   *
+   * Set `false` to opt out: no stack is materialized at request time and
+   * `d.origin` is never emitted, including for requests the early-capture
+   * patch queued before `init()` ran. A remote capture policy may turn this
+   * off but never on, matching the tighten-only rule the masking policy uses.
+   */
+  networkCaptureOrigin: boolean;
   networkCorrelationHeaders: boolean;
   networkCorrelationAllowedOrigins: string[];
   /**
@@ -620,6 +637,7 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   networkMaxBodySize: 51200,
   networkExcludeUrls: [],
   networkCaptureHeaders: true,
+  networkCaptureOrigin: true,
   networkCorrelationHeaders: true,
   networkCorrelationAllowedOrigins: [],
 

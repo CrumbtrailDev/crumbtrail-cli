@@ -15,6 +15,7 @@ import {
   type BodyRedactionResult,
   type RedactionMetadata,
 } from "../redaction";
+import { captureCodeOrigin } from "../code-origin";
 import {
   CRUMBTRAIL_REQUEST_HEADER,
   CRUMBTRAIL_SESSION_HEADER,
@@ -513,6 +514,45 @@ function applyResponseBodyMeta(
 }
 
 /* ------------------------------------------------------------------ */
+/* Client source provenance                                            */
+/* ------------------------------------------------------------------ */
+
+/** Splits `url:line:col` so the URL half can be redacted without losing the position. */
+const ORIGIN_FRAME_POSITION = /^(.*):(\d+):(\d+)$/;
+
+/**
+ * Writes the app frames that issued a request onto `d.origin`.
+ *
+ * Gated on `networkCaptureOrigin` at the point of emission rather than at
+ * capture, so the same suppression covers a live request and one the early
+ * patch queued before any configuration existed. Each frame's URL goes through
+ * `redactUrl` — a script served with a signed query string would otherwise
+ * carry that token into the buffer — and the `line:col` is reattached after,
+ * because a frame without a position is a label, not a location.
+ *
+ * Frames that lose their position to redaction are dropped rather than
+ * repaired: a half-location sends a reader to the top of a file.
+ */
+function applyOriginFrames(
+  target: Record<string, unknown>,
+  frames: string[] | undefined,
+  config: CrumbtrailConfig,
+  metadata: Array<RedactionMetadata | undefined>,
+): void {
+  if (!config.networkCaptureOrigin) return;
+  if (!frames || frames.length === 0) return;
+  const redacted: string[] = [];
+  for (const frame of frames) {
+    const match = ORIGIN_FRAME_POSITION.exec(frame);
+    if (!match) continue;
+    const urlResult = redactUrl(match[1], "origin");
+    metadata.push(urlResult.metadata);
+    redacted.push(`${urlResult.value}:${match[2]}:${match[3]}`);
+  }
+  if (redacted.length > 0) target.origin = redacted;
+}
+
+/* ------------------------------------------------------------------ */
 /* Fetch wrapper                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -536,6 +576,11 @@ function wrapFetch(
     const id = nextId++;
     const method = extractMethod(input, init);
     const startTime = now();
+    // Taken here, synchronously, while the app's frames are still on the
+    // stack: after the first await they are gone.
+    const originFrames = config.networkCaptureOrigin
+      ? captureCodeOrigin(1)
+      : undefined;
     const fetchArgs = applyFetchCorrelationHeaders(
       input,
       init,
@@ -552,6 +597,7 @@ function wrapFetch(
       method,
       url: urlResult.value,
     };
+    applyOriginFrames(reqData, originFrames, config, reqMetadata);
     if (fetchArgs.sessionId) reqData.sessionId = fetchArgs.sessionId;
     if (fetchArgs.requestId) reqData.requestId = fetchArgs.requestId;
     if (fetchArgs.traceId) reqData.traceId = fetchArgs.traceId;
@@ -973,6 +1019,10 @@ function wrapXHR(
     }
 
     meta.startTime = now();
+    // `send()` is what the app called, so its caller is one frame out.
+    const originFrames = config.networkCaptureOrigin
+      ? captureCodeOrigin(1)
+      : undefined;
 
     const urlResult = redactUrl(meta.url, "url");
     const reqMetadata: Array<RedactionMetadata | undefined> = [
@@ -983,6 +1033,7 @@ function wrapXHR(
       method: meta.method,
       url: urlResult.value,
     };
+    applyOriginFrames(reqData, originFrames, config, reqMetadata);
     if (meta.sessionId) reqData.sessionId = meta.sessionId;
     if (meta.requestId) reqData.requestId = meta.requestId;
     if (meta.traceId) reqData.traceId = meta.traceId;
@@ -1205,6 +1256,7 @@ function emitEarlyRecord(
     url: urlResult.value,
     early: true,
   };
+  applyOriginFrames(reqData, record.origin, config, reqMetadata);
   if (record.sessionId) reqData.sessionId = record.sessionId;
   if (record.requestId) reqData.requestId = record.requestId;
   if (record.traceId) reqData.traceId = record.traceId;

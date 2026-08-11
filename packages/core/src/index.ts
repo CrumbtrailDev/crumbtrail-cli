@@ -29,6 +29,11 @@ export {
   resolveOutboundCorrelation,
 } from "./correlation";
 export type { W3CTraceContext, OutboundCorrelation } from "./correlation";
+export {
+  captureCodeOrigin,
+  MAX_ORIGIN_FRAMES,
+  MAX_ORIGIN_FRAME_LENGTH,
+} from "./code-origin";
 export { buildCaptureGapEvent } from "./capture-gap";
 export type { BuildCaptureGapEventInput } from "./capture-gap";
 export {
