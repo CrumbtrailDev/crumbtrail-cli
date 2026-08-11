@@ -13,11 +13,7 @@ import path from "node:path";
 import { buildAgentPrompt, buildOtlpSnippets } from "crumbtrail-install-shared";
 import type { Stack } from "crumbtrail-core";
 import type { Recipe } from "../detect";
-import {
-  RECIPE_REGISTRY,
-  scopedKeyRef,
-  type KeyRef,
-} from "../recipe-registry";
+import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
 import { defaultInjectIO, type InjectIO } from "./io";
 import type { Plan } from "./types";
 import {
@@ -48,15 +44,12 @@ import {
 const KEY_PLACEHOLDER = "<your-ingest-key>";
 
 /**
- * How this app reads its key: the recipe's reference, named for the app when
- * the caller scoped it. Everything that mentions the variable — the injected
- * expression, the agent prompt, the stamped `keyEnvVar` — goes through here, so
- * a scoped install can never end up telling the customer one name and reading
- * another.
+ * How this app reads its key: the recipe's own reference, unchanged. One ingest
+ * key covers the whole project, so every app in a repository reads the same
+ * variable for its framework and the init call carries the app's name instead.
  */
 function keyRefFor(input: BuildPlanInput): KeyRef | undefined {
-  const base = RECIPE_REGISTRY[input.recipe].keyRef;
-  return base ? scopedKeyRef(base, input.keyScope ?? null) : undefined;
+  return RECIPE_REGISTRY[input.recipe].keyRef;
 }
 
 /** The code expression an injected snippet uses to read the key. */
@@ -84,13 +77,13 @@ export interface BuildPlanInput {
    */
   stack?: Stack;
   /**
-   * Names this app's key variable for the app rather than for its framework, so
-   * several apps wired out of one repository do not all ask for the same
-   * `CRUMBTRAIL_KEY`. Callers that wire a repository pass
-   * `keyScopeForDir(relDir)`; a single app run from its own root passes nothing
-   * and keeps the plain framework name.
+   * Which app in the project this is, baked into the injected init call so a
+   * session says where it came from. One key covers the whole project, so
+   * without this a repository of six apps is six anonymous senders. Callers
+   * that wire a repository pass the app's name; a single app run from its own
+   * root can pass nothing and stay unlabelled.
    */
-  keyScope?: string | null;
+  serviceName?: string | null;
   options?: BuildPlanOptions;
 }
 
@@ -269,7 +262,7 @@ function firstExistingDir(io: InjectIO, ...dirs: string[]): string | null {
 
 function planNext(input: BuildPlanInput, io: InjectIO): Plan {
   const { cwd } = input;
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!);
+  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
   // Prefer `src/` when the app uses a src directory.
   const usesSrc =
     io.exists(path.join(cwd, "src", "app")) ||
@@ -330,7 +323,7 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
 
 function planSvelteKit(input: BuildPlanInput, io: InjectIO): Plan {
   const target = path.join(input.cwd, "src", "hooks.client.ts");
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!);
+  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
   if (io.exists(target)) {
     return prependWithPreflight(input, io, target, block);
   }
@@ -347,7 +340,7 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
     ? path.join(cwd, "app")
     : cwd;
   const target = path.join(baseDir, "plugins", "crumbtrail.client.ts");
-  const block = nuxtPluginSnippet(input.endpoint, keyExprFor(input)!);
+  const block = nuxtPluginSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
   if (io.exists(target)) {
     const existing = io.readFile(target);
     if (existing && referencesCrumbtrail(existing)) return skipPlan(input);
@@ -360,7 +353,7 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
 }
 
 function planVite(input: BuildPlanInput, io: InjectIO): Plan {
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!);
+  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the Vite entry from index.html — wire it manually.",
@@ -387,8 +380,8 @@ function planNode(input: BuildPlanInput, io: InjectIO): Plan {
   const keyExpr = keyExprFor(input)!;
   const block =
     input.recipe === "nestjs"
-      ? nestInitSnippet(input.endpoint, keyExpr)
-      : nodeInitSnippet(input.endpoint, keyExpr);
+      ? nestInitSnippet(input.endpoint, keyExpr, input.serviceName)
+      : nodeInitSnippet(input.endpoint, keyExpr, input.serviceName);
 
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -415,7 +408,7 @@ function planNode(input: BuildPlanInput, io: InjectIO): Plan {
 function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   const { endpoint } = input;
   const keyExpr = keyExprFor(input)!;
-  const block = nodeInitSnippet(endpoint, keyExpr);
+  const block = nodeInitSnippet(endpoint, keyExpr, input.serviceName);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the Node server entry — wire it manually.",
@@ -489,7 +482,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
  * <RemixBrowser> and break hydration (a deliberate divergence from planNext).
  */
 function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!);
+  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve app/entry.client.* — on a React Router 7 default template the client entry is hidden, so run `npx react-router reveal` to unhide app/entry.client.tsx (and entry.server.tsx), then re-run the wizard. Otherwise add the snippet to your Remix client entry manually (do not let the CLI create it; it would omit hydrateRoot).",
@@ -505,7 +498,7 @@ function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
  * guidance, not an apology.
  */
 function planAstro(input: BuildPlanInput, _io: InjectIO): Plan {
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!);
+  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
   return fallbackPlan(input, block, [
     "Astro has no single client entry — add this snippet inside a client-side <script> in a shared layout (e.g. src/layouts/*.astro) so it runs on every page.",
   ]);
@@ -521,14 +514,22 @@ function planAngular(input: BuildPlanInput, _io: InjectIO): Plan {
   // process.env, so there is no hands-off env var to read (hence no keyRef in the
   // registry). Emit guidance to add the key to environment.ts and wire it by hand
   // rather than injecting code that would reference an undefined variable.
-  const block = clientInitSnippet(input.endpoint, "environment.crumbtrailKey");
+  const block = clientInitSnippet(
+    input.endpoint,
+    "environment.crumbtrailKey",
+    input.serviceName,
+  );
   return fallbackPlan(input, block, [
     "Angular has no browser-safe env-var mechanism — add `crumbtrailKey: '<your-ingest-key>'` to src/environments/environment.ts (get your key from the dashboard), import `environment`, and prepend the snippet above bootstrapApplication in src/main.ts.",
   ]);
 }
 
 function planReactNative(input: BuildPlanInput, io: InjectIO): Plan {
-  const block = reactNativeInitSnippet(input.endpoint, keyExprFor(input)!);
+  const block = reactNativeInitSnippet(
+    input.endpoint,
+    keyExprFor(input)!,
+    input.serviceName,
+  );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the React Native entry (App/_layout/index) — wire it manually.",

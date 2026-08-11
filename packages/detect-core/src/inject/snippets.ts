@@ -5,13 +5,51 @@
 // from the dashboard. This keeps the live credential out of committed source.
 
 /**
+ * Single-quoted string literal in Prettier's `singleQuote: true` style: wraps the
+ * value in single quotes, escaping backslashes and single quotes. Used by the
+ * Nest snippet, whose scaffold ships that Prettier default — everything else
+ * uses `JSON.stringify` (double quotes, Prettier's own default).
+ */
+function singleQuoted(value: string): string {
+  return `'${value.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
+}
+
+/**
+ * Which app in the project the injected code says it is.
+ *
+ * One ingest key covers the whole project, so the key no longer carries the
+ * app. The init call does, and it is the installer that knows the name — an app
+ * wired by hand and left without one simply records no app label, which is why
+ * an absent name emits nothing rather than a placeholder.
+ */
+function serviceLines(
+  serviceName: string | null | undefined,
+  indent: string,
+  quote: (value: string) => string,
+): string[] {
+  return serviceName ? [`${indent}service: ${quote(serviceName)},`] : [];
+}
+
+/** The same name as a trailing argument in a single-line options object. */
+function serviceArg(
+  serviceName: string | null | undefined,
+  quote: (value: string) => string,
+): string {
+  return serviceName ? `, service: ${quote(serviceName)}` : "";
+}
+
+/**
  * Client init block (Next / SvelteKit / Vite / …). Matches the README's init
  * shape, but reads the key from the environment via `keyExpr` (a code expression
  * such as `import.meta.env.VITE_CRUMBTRAIL_KEY` or
  * `process.env.NEXT_PUBLIC_CRUMBTRAIL_KEY`) rather than baking in the literal —
  * so nothing sensitive lands in version control.
  */
-export function clientInitSnippet(endpoint: string, keyExpr: string): string {
+export function clientInitSnippet(
+  endpoint: string,
+  keyExpr: string,
+  serviceName?: string | null,
+): string {
   return [
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
     "",
@@ -19,6 +57,7 @@ export function clientInitSnippet(endpoint: string, keyExpr: string): string {
     "  ...PRESET_PASSIVE,",
     `  httpEndpoint: ${JSON.stringify(endpoint)},`,
     `  httpAuthToken: ${keyExpr},`,
+    ...serviceLines(serviceName, "  ", JSON.stringify),
     "});",
   ].join("\n");
 }
@@ -28,7 +67,11 @@ export function clientInitSnippet(endpoint: string, keyExpr: string): string {
  * by Nuxt) so it runs client-side on startup. Reads the key from `keyExpr`
  * (Nuxt is Vite-based, so `import.meta.env.VITE_CRUMBTRAIL_KEY`).
  */
-export function nuxtPluginSnippet(endpoint: string, keyExpr: string): string {
+export function nuxtPluginSnippet(
+  endpoint: string,
+  keyExpr: string,
+  serviceName?: string | null,
+): string {
   return [
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
     "",
@@ -37,6 +80,7 @@ export function nuxtPluginSnippet(endpoint: string, keyExpr: string): string {
     "    ...PRESET_PASSIVE,",
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
+    ...serviceLines(serviceName, "    ", JSON.stringify),
     "  });",
     "});",
   ].join("\n");
@@ -49,13 +93,17 @@ export function nuxtPluginSnippet(endpoint: string, keyExpr: string): string {
  * dynamically imported so the block is valid whether the entry file is ESM,
  * CommonJS, or TypeScript, and it is a plain expression (no top-level await) so
  * it is safe to prepend at the very top of an entry file. The ingest key is read
- * from `keyExpr` — the variable this app was told to use, which in a monorepo
- * is its own rather than the shared `process.env.CRUMBTRAIL_KEY` the SDK falls
- * back to (never inlined server-side). Express apps can additionally add
+ * from `keyExpr` (never inlined server-side) — one variable for the whole
+ * project, with `service` naming which app in it this is. Express apps can
+ * additionally add
  * `createCrumbtrailExpressMiddleware` for per-request capture (see
  * crumbtrail-node's README).
  */
-export function nodeInitSnippet(endpoint: string, keyExpr: string): string {
+export function nodeInitSnippet(
+  endpoint: string,
+  keyExpr: string,
+  serviceName?: string | null,
+): string {
   return [
     "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections, and",
     "// console.error, and instruments whichever SQL driver this app already uses",
@@ -65,10 +113,10 @@ export function nodeInitSnippet(endpoint: string, keyExpr: string): string {
     "// Crumbtrail dashboard). Express apps can also add",
     "// createCrumbtrailExpressMiddleware for per-request capture.",
     'import("crumbtrail-node")',
-    // The token is passed rather than left to the SDK's own default, because
-    // the app it belongs to may not be the only one in this repository: each
-    // app reads its own variable, and only the caller knows which.
-    `  .then(({ autoCapture }) => autoCapture({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr} }))`,
+    // The token is passed rather than left to the SDK's own default so the
+    // snippet reads the framework's variable rather than whatever the SDK
+    // happens to fall back to.
+    `  .then(({ autoCapture }) => autoCapture({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr}${serviceArg(serviceName, JSON.stringify)} }))`,
     "  .catch(() => {});",
   ].join("\n");
 }
@@ -88,7 +136,7 @@ export function expressMiddlewareImportSnippet(style: "esm" | "cjs"): string {
  * Request middleware registration, inserted immediately after
  * `const <appVar> = express()`. Emits backend.req.* start/finish spans so
  * frontend sessions link to backend requests. Reads the same key expression the
- * autoCapture block uses, which in a monorepo is this app's own variable.
+ * autoCapture block uses.
  */
 export function expressRequestMiddlewareSnippet(
   appVar: string,
@@ -135,16 +183,6 @@ export function expressManualWiringSnippet(
 }
 
 /**
- * Single-quoted string literal in Prettier's `singleQuote: true` style: wraps the
- * value in single quotes, escaping backslashes and single quotes. Kept local to
- * the Nest snippet, whose scaffold ships that Prettier default — everything else
- * uses `JSON.stringify` (double quotes, Prettier's own default).
- */
-function singleQuoted(value: string): string {
-  return `'${value.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}'`;
-}
-
-/**
  * NestJS server init. Byte-for-byte the same wiring as `nodeInitSnippet` — a
  * dynamically-imported `autoCapture` prepended into `src/main.ts` — but emitted
  * with SINGLE quotes to match Nest scaffolds' Prettier default
@@ -154,7 +192,11 @@ function singleQuoted(value: string): string {
  * first commit. Every other backend-JS recipe (express/hono/fastify/node) keeps
  * the double-quoted snippet, which matches Prettier's own default.
  */
-export function nestInitSnippet(endpoint: string, keyExpr: string): string {
+export function nestInitSnippet(
+  endpoint: string,
+  keyExpr: string,
+  serviceName?: string | null,
+): string {
   return [
     "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections, and",
     "// console.error, and instruments whichever SQL driver this app already uses",
@@ -164,7 +206,7 @@ export function nestInitSnippet(endpoint: string, keyExpr: string): string {
     "// Crumbtrail dashboard). Express apps can also add",
     "// createCrumbtrailExpressMiddleware for per-request capture.",
     "import('crumbtrail-node')",
-    `  .then(({ autoCapture }) => autoCapture({ endpoint: ${singleQuoted(endpoint)}, authToken: ${keyExpr} }))`,
+    `  .then(({ autoCapture }) => autoCapture({ endpoint: ${singleQuoted(endpoint)}, authToken: ${keyExpr}${serviceArg(serviceName, singleQuoted)} }))`,
     "  .catch(() => {});",
   ].join("\n");
 }
@@ -181,6 +223,7 @@ export function nestInitSnippet(endpoint: string, keyExpr: string): string {
 export function reactNativeInitSnippet(
   endpoint: string,
   keyExpr: string,
+  serviceName?: string | null,
 ): string {
   return [
     'import { createReactNativeCrumbtrail } from "crumbtrail-react-native";',
@@ -189,6 +232,7 @@ export function reactNativeInitSnippet(
     "  config: {",
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
+    ...serviceLines(serviceName, "    ", JSON.stringify),
     "  },",
     "});",
   ].join("\n");

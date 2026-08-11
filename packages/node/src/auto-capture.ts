@@ -63,6 +63,12 @@ export interface AutoCaptureOptions {
   sessionId?: string;
   /** Extra session metadata merged into the headless session start. */
   metadata?: Record<string, unknown>;
+  /**
+   * Which app in the project this process is. One ingest key covers a whole
+   * project, so the key cannot say — this can. The name is created on first
+   * sight and reused after, and a key minted for a single app ignores it.
+   */
+  service?: string;
   /** Injectable fetch (tests); forwarded to `startHeadlessSession`. */
   fetchImpl?: typeof fetch;
   /**
@@ -254,7 +260,11 @@ export async function autoCapture(
       endpoint: options.endpoint,
       sessionId: stableSessionId,
       authToken,
-      metadata: { ...options.metadata, capture: "auto" },
+      metadata: {
+        ...(options.service ? { service: options.service } : {}),
+        ...options.metadata,
+        capture: "auto",
+      },
       fetchImpl: options.fetchImpl,
     });
 

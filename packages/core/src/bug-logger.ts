@@ -960,6 +960,7 @@ export class Crumbtrail {
         .startSession(this.sessionId, {
           url: currentPageUrl(),
           ua: typeof navigator !== "undefined" ? navigator.userAgent : "",
+          ...(this.config.service ? { service: this.config.service } : {}),
           ...this.identity,
         })
         .catch(() => {});
