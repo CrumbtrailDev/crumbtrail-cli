@@ -106,13 +106,20 @@ export interface FixContextCausalChain {
 }
 
 /**
- * Why no chain was projected. One of three states, and they are NOT
+ * Why no chain was projected. One of four states, and they are NOT
  * interchangeable:
  *
  * - `no_signals` — nothing ranked at all. There was no incident to explain.
  * - `top_candidate_isolated` — the highest-ranked signal, the one that names the
- *   incident, could not be attached to the causal graph. The chain's absence is a
- *   fact about OUR attribution, not about the application.
+ *   incident, could not be attached to the causal graph: nothing compatible was
+ *   there to attach it to. The chain's absence is a fact about OUR attribution,
+ *   not about the application.
+ * - `top_candidate_lost_contention` — the highest-ranked signal COULD have been
+ *   attached. A node it describes existed and was in reach, and another
+ *   candidate had already claimed it, because attribution is
+ *   one-candidate-per-node and settles ties by arrival order. This is not a
+ *   missing observation; it is one that was displaced, and the two were
+ *   previously reported with the same word.
  * - `root_attributed_no_symptoms` — a root was resolved and it explains nothing
  *   downstream, so the projection has one end of a chain and no other.
  *
@@ -124,9 +131,24 @@ export interface FixContextCausalAbsence {
   reason:
     | "no_signals"
     | "top_candidate_isolated"
+    | "top_candidate_lost_contention"
     | "root_attributed_no_symptoms";
   detector?: string;
   signalId?: string;
+  /**
+   * The graph node the top signal lost. Set only for
+   * `top_candidate_lost_contention`; it resolves against `causal_graph`'s nodes.
+   */
+  contendedNodeId?: string;
+  /**
+   * The signal id that holds {@link contendedNodeId} instead. Set only for
+   * `top_candidate_lost_contention`, and only when that signal is in this
+   * bundle — a contest whose winner was capped out of the emitted set still
+   * reports the contest.
+   */
+  incumbentSignalId?: string;
+  /** The incumbent's detector, when the incumbent is present in the signals. */
+  incumbentDetector?: string;
 }
 
 /**
@@ -344,6 +366,32 @@ export function projectCausalChain(ranked: EvidenceCandidate[]): {
     root = byId.get(top.rootCauseId);
   }
   if (!root || root.causalRole !== "root") {
+    // A top candidate that LOST a contest is a different fact from one that had
+    // nothing to attach to, and reporting both as "isolated" made the reason
+    // string wrong about 40% of the population it described. The chain stays
+    // null either way — nothing is newly claimed here, only correctly named.
+    //
+    // Keyed on the CAUSE, not on the `contention` payload. The incumbent's
+    // candidate can be capped out of the emitted set, which drops the payload
+    // while the cause stands — and keying on the payload would then report
+    // "could not be placed" about a signal whose own record says it lost a
+    // contest, reintroducing this finding's false statement one field over.
+    if (top.isolationCause === "lost-contention") {
+      const incumbent = top.contention
+        ? byId.get(top.contention.heldBy)
+        : undefined;
+      return {
+        chain: null,
+        absence: removeUndefined({
+          reason: "top_candidate_lost_contention",
+          detector: top.detector,
+          signalId: top.id,
+          contendedNodeId: top.contention ? top.contention.nodeId : undefined,
+          incumbentSignalId: incumbent ? incumbent.id : undefined,
+          incumbentDetector: incumbent ? incumbent.detector : undefined,
+        }) as FixContextCausalAbsence,
+      };
+    }
     return {
       chain: null,
       absence: { reason: "top_candidate_isolated", detector: top.detector, signalId: top.id },
