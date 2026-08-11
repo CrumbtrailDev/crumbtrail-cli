@@ -664,7 +664,29 @@ export interface CandidateAttribution {
 
 export interface AttributableCandidate {
   id: string;
-  anchor: { t: number; requestId?: string; route?: string };
+  anchor: {
+    t: number;
+    requestId?: string;
+    route?: string;
+    /**
+     * Plane-identifying anchor fields, read ONLY by {@link derivedNodeKinds}.
+     *
+     * These are not new information: every one is already on
+     * `EvidenceCandidate.anchor`, written by the detector at the moment it
+     * pushed its draft. They are carried here so a detector's node family can
+     * be DERIVED from the evidence it anchored on rather than looked up in a
+     * table somebody has to remember to extend.
+     *
+     * `source` is a provenance label — a database engine name for the db plane,
+     * `"backend"` for server-side signals, a transport or probe phase
+     * otherwise. `table` is set by the database detectors. `method`/`url`
+     * together are a request line.
+     */
+    source?: string;
+    table?: string;
+    method?: string;
+    url?: string;
+  };
 }
 
 /**
@@ -745,6 +767,10 @@ export const DETECTOR_ANCHORING_DECLARED: ReadonlyMap<string, string> = new Map(
   [
     "console_warning",
     "warn-level `con` events never become graph nodes — `nodeKindFor` emits console.error for error level only — so a warning has no node of its own, and mapping it to console.error would steal a real node from a genuine console_error candidate",
+  ],
+  [
+    "runtime_warning",
+    "the backend twin of console_warning: it fires on `backend.warning`, a kind absent from `nodeKindFor`, so a Node process warning has no node of its own. It anchors with `source: \"backend\"`, which is the one place a plane rule over anchor shape would have swept it onto a `backend.req`/`backend.error` node belonging to the request that actually failed — 57 times across 59 captured sessions, more than any other isolated detector. Declared here so that decision is written down rather than resting on a rule nobody wrote",
   ],
   // The five below were ALREADY reasoned about, in `findTemporalNode`: "a KNOWN
   // detector with NO causal node family ... must NOT temporal-match arbitrary
@@ -849,7 +875,8 @@ export const DETECTOR_ANCHORING_UNREVIEWED: ReadonlySet<string> = new Set([
   "result_row_loss",
   "retry_schedule_clock_shift",
   "rtl_physical_layout_rules",
-  "runtime_warning",
+  // runtime_warning left this set by being REVIEWED, not by being mapped: see its
+  // entry in DETECTOR_ANCHORING_DECLARED.
   "same_request_row_rewritten",
   "shared_state_bleed",
   "stale_client_build",
@@ -917,6 +944,109 @@ function nodeKindsForDetector(detector: string): Set<CausalNodeKind> {
         return new Set(["otel.span", "otel.log"]);
       return new Set();
   }
+}
+
+/**
+ * The database engines a `db.diff`/`db.read` event can be tagged with, mirrored
+ * from `DbEngine` in crumbtrail-core.
+ *
+ * Restated here rather than imported because this module holds no other
+ * dependency on the db plane's types, and because the members are the load
+ * bearing part: an anchor whose `source` is one of these came off a database
+ * event, and nothing else in the SDK writes those four strings into
+ * `anchor.source`.
+ */
+const DB_ENGINE_SOURCES: ReadonlySet<string> = new Set([
+  "postgres",
+  "mysql",
+  "mssql",
+  "sqlite",
+]);
+
+/**
+ * Node kinds derivable from the SHAPE of a candidate's anchor, for detectors the
+ * hand-maintained table above does not name.
+ *
+ * ============================================================================
+ * WHY DERIVE INSTEAD OF ADDING ANOTHER `case`
+ * ============================================================================
+ *
+ * `nodeKindsForDetector` grew one `case` at a time — `click_target_intercepted`,
+ * `job_did_not_complete`, `stale_value_rendered`, `displayed_field_mismatch` —
+ * and each of those comments says it is the same defect being paid for again. A
+ * fifth `case` would be the fifth payment. The property that decides a
+ * detector's node family is not its NAME; it is which plane's event it anchored
+ * on, and the anchor already says so:
+ *
+ *   - `source` is a database engine, or `table` is set  -> the anchor is a row
+ *     the database changed, so `db.write`, the one db node kind the graph emits.
+ *   - `method` AND `url` are both set -> the anchor is a request line, so the
+ *     network planes.
+ *
+ * Both rules are CONJUNCTIVE or name a field only one plane's detectors write.
+ * A bare `url` is not enough (`stale_view_after_pop` and
+ * `rtl_physical_layout_rules` carry one and are browser-plane findings); a bare
+ * `route` is on almost every anchor and identifies nothing. A rule that fired
+ * broadly would attach everything, which passes every "is it connected" test
+ * and destroys ranking, because `net.req`/`net.res` sit on the request spine and
+ * are the most numerous nodes in a session.
+ *
+ * `source === "backend"` is deliberately NOT a rule. Measured over 59 captured
+ * sessions the only detectors carrying it are the `backend_` prefixed ones the
+ * table already covers, plus `runtime_warning` — which must stay isolated
+ * (`backend.warning` is absent from {@link nodeKindFor}, so it has no node of
+ * its own, and see its entry in {@link DETECTOR_ANCHORING_DECLARED}). A rule
+ * that buys no attachment and whose one live case is harmful is latent risk,
+ * not coverage.
+ *
+ * ============================================================================
+ * WHAT THIS DELIBERATELY DOES NOT REACH
+ * ============================================================================
+ *
+ * Browser-plane detectors — `listener_growth`, `input_reverted`,
+ * `ui_arithmetic_mismatch`, `currency_locale_mismatch` — anchor with nothing but
+ * `{t, offsetMs, route, message}`. No anchor field identifies their plane, so
+ * they are not derivable here and stay isolated. Reaching them means carrying
+ * the EVENT KIND a detector fired on down to its anchor, which is a change at
+ * every draft push site in `evidence-index.ts` and is not attempted here.
+ */
+function derivedNodeKinds(
+  anchor: AttributableCandidate["anchor"],
+): Set<CausalNodeKind> | undefined {
+  if (
+    anchor.table !== undefined ||
+    (anchor.source !== undefined && DB_ENGINE_SOURCES.has(anchor.source))
+  ) {
+    return new Set(["db.write"]);
+  }
+  if (anchor.method !== undefined && anchor.url !== undefined) {
+    return new Set(["net.res", "net.req"]);
+  }
+  return undefined;
+}
+
+/**
+ * The node kinds a candidate may attribute to, by declared precedence.
+ *
+ *   1. A REVIEWED decision that it has no node ({@link DETECTOR_ANCHORING_DECLARED})
+ *      wins over everything. `console_warning` and `runtime_warning` are there
+ *      because their events never become nodes at all, and no amount of anchor
+ *      shape may talk them onto one belonging to something else.
+ *   2. The explicit table, which is a statement someone checked.
+ *   3. The derivation above, for everything the table does not name.
+ *   4. Empty — isolated, and visible as such: `causal-anchoring-declared.test.ts`
+ *      fails when an emitted detector is neither mapped, prefix-covered, nor
+ *      declared with a reason, so a detector shipped tomorrow cannot land in
+ *      this branch silently.
+ */
+function nodeKindsFor(
+  detector: string,
+  anchor: AttributableCandidate["anchor"],
+): Set<CausalNodeKind> {
+  if (DETECTOR_ANCHORING_DECLARED.has(detector)) return new Set();
+  const explicit = nodeKindsForDetector(detector);
+  if (explicit.size > 0) return explicit;
+  return derivedNodeKinds(anchor) ?? new Set();
 }
 
 /**
@@ -1153,8 +1283,15 @@ function attributeCandidatesInternal(
     // user_marker, repeated_clicks) must NOT temporal-match arbitrary nodes -- it stays isolated so it
     // never steals a request-spine node from the candidate that actually belongs to it. Only when no
     // detector is supplied at all (detectorById -> undefined) do we allow an unrestricted match.
+    //
+    // This is the ONE place the derivation in `nodeKindsFor` applies. Step 1 keeps reading the
+    // explicit table alone, and the asymmetry is the point: there the candidate has already been
+    // identified by requestId and the kind only breaks a tie at equal |delta-t|, so an INFERRED
+    // family would be allowed to move a candidate off the node its own request identity picked.
+    // Here there is no identity at all and the family is the entire gate, which is exactly where a
+    // detector nobody mapped goes silently isolated.
     const kinds =
-      detector !== undefined ? nodeKindsForDetector(detector) : undefined;
+      detector !== undefined ? nodeKindsFor(detector, anchor) : undefined;
     if (kinds !== undefined && kinds.size === 0) return undefined;
     // A DB write detector names ONE write. The nearest unowned `db.write` node is some OTHER write
     // of the same request, and handing it that node makes the candidate report a write it does not
@@ -1163,8 +1300,13 @@ function attributeCandidatesInternal(
     // emitted chain is write order shifted by a slot — which is how a candidate came to name a
     // write that happened after it as its own cause. Its own node is `db.write` at the same
     // instant in the same request; anything else is not it, so it stays isolated instead.
+    //
+    // Read off the RESOLVED family, not off `DB_WRITE_DETECTORS`, so a detector that reached
+    // `db.write` by derivation carries the same bar. A derived write family that skipped it would
+    // reintroduce precisely the write-order-shifted-by-a-slot cascade described above, in the set
+    // of detectors nobody has hand-checked — the worst place to have it.
     const ownWriteOnly =
-      detector !== undefined && DB_WRITE_DETECTORS.has(detector);
+      kinds !== undefined && kinds.size === 1 && kinds.has("db.write");
     const matches = nodes.filter((n) => {
       if (excluded.has(n.id)) return false;
       if (Math.abs(n.t - anchor.t) > CAUSAL_MAP_WINDOW_MS) return false;

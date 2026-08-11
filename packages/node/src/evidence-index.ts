@@ -243,6 +243,13 @@ export interface EvidenceCandidate {
      */
     source?: string;
     /**
+     * The database table the anchoring row belongs to, set by the database
+     * detectors. Already emitted in every session — declared here because the
+     * causal attribution now READS it (see `derivedNodeKinds`), and a field a
+     * behaviour depends on must be in the type rather than only in the data.
+     */
+    table?: string;
+    /**
      * Column names a row-identity comparison rested on, sorted. Set by the
      * database detectors that claim two rows are the same, so a reader can see
      * what was compared instead of taking the claim on faith.
@@ -922,6 +929,15 @@ function applyCausalRerank(
           t: draft.anchor.t,
           requestId: draft.anchor.requestId,
           route: draft.anchor.route,
+          // Plane-identifying fields, forwarded verbatim so `attributeCandidates` can DERIVE a
+          // detector's node family from the evidence it anchored on instead of looking the
+          // detector's name up in a table that has to be remembered. See `derivedNodeKinds`.
+          // Nothing new is computed here and nothing is re-derived: these are the same values the
+          // detector wrote when it pushed its draft.
+          source: draft.anchor.source,
+          table: draft.anchor.table,
+          method: draft.anchor.method,
+          url: draft.anchor.url,
         },
       })),
       (id) => detectorByKey.get(id),
