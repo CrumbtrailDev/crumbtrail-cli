@@ -13,7 +13,11 @@ import path from "node:path";
 import { buildAgentPrompt, buildOtlpSnippets } from "crumbtrail-install-shared";
 import type { Stack } from "crumbtrail-core";
 import type { Recipe } from "../detect";
-import { RECIPE_REGISTRY } from "../recipe-registry";
+import {
+  RECIPE_REGISTRY,
+  scopedKeyRef,
+  type KeyRef,
+} from "../recipe-registry";
 import { defaultInjectIO, type InjectIO } from "./io";
 import type { Plan } from "./types";
 import {
@@ -43,9 +47,21 @@ import {
  */
 const KEY_PLACEHOLDER = "<your-ingest-key>";
 
-/** The code expression an injected snippet uses to read the key, per recipe. */
-function keyExprFor(recipe: Recipe): string | undefined {
-  return RECIPE_REGISTRY[recipe].keyRef?.expr;
+/**
+ * How this app reads its key: the recipe's reference, named for the app when
+ * the caller scoped it. Everything that mentions the variable — the injected
+ * expression, the agent prompt, the stamped `keyEnvVar` — goes through here, so
+ * a scoped install can never end up telling the customer one name and reading
+ * another.
+ */
+function keyRefFor(input: BuildPlanInput): KeyRef | undefined {
+  const base = RECIPE_REGISTRY[input.recipe].keyRef;
+  return base ? scopedKeyRef(base, input.keyScope ?? null) : undefined;
+}
+
+/** The code expression an injected snippet uses to read the key. */
+function keyExprFor(input: BuildPlanInput): string | undefined {
+  return keyRefFor(input)?.expr;
 }
 
 export interface BuildPlanOptions {
@@ -67,6 +83,14 @@ export interface BuildPlanInput {
    * every other recipe.
    */
   stack?: Stack;
+  /**
+   * Names this app's key variable for the app rather than for its framework, so
+   * several apps wired out of one repository do not all ask for the same
+   * `CRUMBTRAIL_KEY`. Callers that wire a repository pass
+   * `keyScopeForDir(relDir)`; a single app run from its own root passes nothing
+   * and keeps the plain framework name.
+   */
+  keyScope?: string | null;
   options?: BuildPlanOptions;
 }
 
@@ -107,7 +131,7 @@ function fallbackPlan(
         endpoint: input.endpoint,
         apiKey: KEY_PLACEHOLDER,
       },
-      RECIPE_REGISTRY[input.recipe].keyRef,
+      keyRefFor(input),
     ),
     warnings,
   };
@@ -245,7 +269,7 @@ function firstExistingDir(io: InjectIO, ...dirs: string[]): string | null {
 
 function planNext(input: BuildPlanInput, io: InjectIO): Plan {
   const { cwd } = input;
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input.recipe)!);
+  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!);
   // Prefer `src/` when the app uses a src directory.
   const usesSrc =
     io.exists(path.join(cwd, "src", "app")) ||
@@ -306,7 +330,7 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
 
 function planSvelteKit(input: BuildPlanInput, io: InjectIO): Plan {
   const target = path.join(input.cwd, "src", "hooks.client.ts");
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input.recipe)!);
+  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!);
   if (io.exists(target)) {
     return prependWithPreflight(input, io, target, block);
   }
@@ -323,7 +347,7 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
     ? path.join(cwd, "app")
     : cwd;
   const target = path.join(baseDir, "plugins", "crumbtrail.client.ts");
-  const block = nuxtPluginSnippet(input.endpoint, keyExprFor(input.recipe)!);
+  const block = nuxtPluginSnippet(input.endpoint, keyExprFor(input)!);
   if (io.exists(target)) {
     const existing = io.readFile(target);
     if (existing && referencesCrumbtrail(existing)) return skipPlan(input);
@@ -336,7 +360,7 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
 }
 
 function planVite(input: BuildPlanInput, io: InjectIO): Plan {
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input.recipe)!);
+  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the Vite entry from index.html — wire it manually.",
@@ -360,10 +384,11 @@ function planVite(input: BuildPlanInput, io: InjectIO): Plan {
  * double-quoted `nodeInitSnippet` (Prettier's own default).
  */
 function planNode(input: BuildPlanInput, io: InjectIO): Plan {
+  const keyExpr = keyExprFor(input)!;
   const block =
     input.recipe === "nestjs"
-      ? nestInitSnippet(input.endpoint)
-      : nodeInitSnippet(input.endpoint);
+      ? nestInitSnippet(input.endpoint, keyExpr)
+      : nodeInitSnippet(input.endpoint, keyExpr);
 
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -389,7 +414,8 @@ function planNode(input: BuildPlanInput, io: InjectIO): Plan {
  */
 function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   const { endpoint } = input;
-  const block = nodeInitSnippet(endpoint);
+  const keyExpr = keyExprFor(input)!;
+  const block = nodeInitSnippet(endpoint, keyExpr);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the Node server entry — wire it manually.",
@@ -410,15 +436,15 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   const wired = style
     ? wireExpressMiddleware(
         existing,
-        (appVar) => expressRequestMiddlewareSnippet(appVar, endpoint),
-        (appVar) => expressErrorMiddlewareSnippet(appVar, endpoint),
+        (appVar) => expressRequestMiddlewareSnippet(appVar, endpoint, keyExpr),
+        (appVar) => expressErrorMiddlewareSnippet(appVar, endpoint, keyExpr),
       )
     : null;
 
   if (wired == null) {
     // Anchors not found: prepend autoCapture plus a TODO block with exact copy
     // and paste instructions, and surface the same guidance in wizard output.
-    const combined = `${block}\n\n${expressManualWiringSnippet(endpoint)}`;
+    const combined = `${block}\n\n${expressManualWiringSnippet(endpoint, keyExpr)}`;
     return prependWithPreflight(input, io, target, combined, [
       "Express request middleware was NOT wired automatically (no `const app = express()` / `app.listen(...)` anchors found). Follow the TODO block added at the top of the entry: register createCrumbtrailExpressMiddleware before your routes and createCrumbtrailExpressErrorMiddleware after them, or backend request spans stay empty.",
     ]);
@@ -463,7 +489,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
  * <RemixBrowser> and break hydration (a deliberate divergence from planNext).
  */
 function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input.recipe)!);
+  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve app/entry.client.* — on a React Router 7 default template the client entry is hidden, so run `npx react-router reveal` to unhide app/entry.client.tsx (and entry.server.tsx), then re-run the wizard. Otherwise add the snippet to your Remix client entry manually (do not let the CLI create it; it would omit hydrateRoot).",
@@ -479,7 +505,7 @@ function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
  * guidance, not an apology.
  */
 function planAstro(input: BuildPlanInput, _io: InjectIO): Plan {
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input.recipe)!);
+  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!);
   return fallbackPlan(input, block, [
     "Astro has no single client entry — add this snippet inside a client-side <script> in a shared layout (e.g. src/layouts/*.astro) so it runs on every page.",
   ]);
@@ -502,7 +528,7 @@ function planAngular(input: BuildPlanInput, _io: InjectIO): Plan {
 }
 
 function planReactNative(input: BuildPlanInput, io: InjectIO): Plan {
-  const block = reactNativeInitSnippet(input.endpoint, keyExprFor(input.recipe)!);
+  const block = reactNativeInitSnippet(input.endpoint, keyExprFor(input)!);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the React Native entry (App/_layout/index) — wire it manually.",
@@ -589,7 +615,7 @@ export function buildPlan(
   // Stamp the env var the injected code reads its key from, so the wizard can
   // print "set <VAR> in .env — get your key from the dashboard". Undefined for
   // recipes that inject no key (tauri / otlp / angular) or when already wired.
-  const envVar = RECIPE_REGISTRY[input.recipe].keyRef?.envVar;
+  const envVar = keyRefFor(input)?.envVar;
   if (envVar && plan.kind !== "skip-already-wired") {
     plan.keyEnvVar = envVar;
   }
