@@ -49,22 +49,26 @@ export function nuxtPluginSnippet(endpoint: string, keyExpr: string): string {
  * dynamically imported so the block is valid whether the entry file is ESM,
  * CommonJS, or TypeScript, and it is a plain expression (no top-level await) so
  * it is safe to prepend at the very top of an entry file. The ingest key is read
- * from process.env.CRUMBTRAIL_KEY, which autoCapture loads from the `.env` the
- * user sets (never inlined server-side). Express apps can additionally add
+ * from `keyExpr` — the variable this app was told to use, which in a monorepo
+ * is its own rather than the shared `process.env.CRUMBTRAIL_KEY` the SDK falls
+ * back to (never inlined server-side). Express apps can additionally add
  * `createCrumbtrailExpressMiddleware` for per-request capture (see
  * crumbtrail-node's README).
  */
-export function nodeInitSnippet(endpoint: string): string {
+export function nodeInitSnippet(endpoint: string, keyExpr: string): string {
   return [
     "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections, and",
     "// console.error, and instruments whichever SQL driver this app already uses",
     "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
     "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
-    "// from process.env.CRUMBTRAIL_KEY — set it in your .env (get your key from the",
+    `// from ${keyExpr} — set it in your .env (get your key from the`,
     "// Crumbtrail dashboard). Express apps can also add",
     "// createCrumbtrailExpressMiddleware for per-request capture.",
     'import("crumbtrail-node")',
-    `  .then(({ autoCapture }) => autoCapture({ endpoint: ${JSON.stringify(endpoint)} }))`,
+    // The token is passed rather than left to the SDK's own default, because
+    // the app it belongs to may not be the only one in this repository: each
+    // app reads its own variable, and only the caller knows which.
+    `  .then(({ autoCapture }) => autoCapture({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr} }))`,
     "  .catch(() => {});",
   ].join("\n");
 }
@@ -83,14 +87,15 @@ export function expressMiddlewareImportSnippet(style: "esm" | "cjs"): string {
 /**
  * Request middleware registration, inserted immediately after
  * `const <appVar> = express()`. Emits backend.req.* start/finish spans so
- * frontend sessions link to backend requests. Reads the same
- * process.env.CRUMBTRAIL_KEY the autoCapture block uses.
+ * frontend sessions link to backend requests. Reads the same key expression the
+ * autoCapture block uses, which in a monorepo is this app's own variable.
  */
 export function expressRequestMiddlewareSnippet(
   appVar: string,
   endpoint: string,
+  keyExpr: string,
 ): string {
-  return `${appVar}.use(createCrumbtrailExpressMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: process.env.CRUMBTRAIL_KEY }));`;
+  return `${appVar}.use(createCrumbtrailExpressMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr} }));`;
 }
 
 /**
@@ -100,8 +105,9 @@ export function expressRequestMiddlewareSnippet(
 export function expressErrorMiddlewareSnippet(
   appVar: string,
   endpoint: string,
+  keyExpr: string,
 ): string {
-  return `${appVar}.use(createCrumbtrailExpressErrorMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: process.env.CRUMBTRAIL_KEY }));`;
+  return `${appVar}.use(createCrumbtrailExpressErrorMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr} }));`;
 }
 
 /**
@@ -110,7 +116,10 @@ export function expressErrorMiddlewareSnippet(
  * and paste lines so the user (or their coding agent) can finish the wiring.
  * Comment-only: safe to prepend anywhere.
  */
-export function expressManualWiringSnippet(endpoint: string): string {
+export function expressManualWiringSnippet(
+  endpoint: string,
+  keyExpr: string,
+): string {
   return [
     "// TODO(crumbtrail): finish Express request capture. Crumbtrail could not find",
     "// your express() app and app.listen anchors, so add these lines yourself:",
@@ -118,10 +127,10 @@ export function expressManualWiringSnippet(endpoint: string): string {
     '//   import { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } from "crumbtrail-node";',
     "//",
     "//   // right after `const app = express()`, before your routes:",
-    `//   app.use(createCrumbtrailExpressMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: process.env.CRUMBTRAIL_KEY }));`,
+    `//   app.use(createCrumbtrailExpressMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr} }));`,
     "//",
     "//   // after your routes, right before `app.listen(...)`:",
-    `//   app.use(createCrumbtrailExpressErrorMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: process.env.CRUMBTRAIL_KEY }));`,
+    `//   app.use(createCrumbtrailExpressErrorMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr} }));`,
   ].join("\n");
 }
 
@@ -145,17 +154,17 @@ function singleQuoted(value: string): string {
  * first commit. Every other backend-JS recipe (express/hono/fastify/node) keeps
  * the double-quoted snippet, which matches Prettier's own default.
  */
-export function nestInitSnippet(endpoint: string): string {
+export function nestInitSnippet(endpoint: string, keyExpr: string): string {
   return [
     "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections, and",
     "// console.error, and instruments whichever SQL driver this app already uses",
     "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
     "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
-    "// from process.env.CRUMBTRAIL_KEY — set it in your .env (get your key from the",
+    `// from ${keyExpr} — set it in your .env (get your key from the`,
     "// Crumbtrail dashboard). Express apps can also add",
     "// createCrumbtrailExpressMiddleware for per-request capture.",
     "import('crumbtrail-node')",
-    `  .then(({ autoCapture }) => autoCapture({ endpoint: ${singleQuoted(endpoint)} }))`,
+    `  .then(({ autoCapture }) => autoCapture({ endpoint: ${singleQuoted(endpoint)}, authToken: ${keyExpr} }))`,
     "  .catch(() => {});",
   ].join("\n");
 }

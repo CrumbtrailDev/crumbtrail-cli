@@ -55,7 +55,11 @@ import {
 } from "./verify";
 import { discoverServices, type ServiceCandidate } from "./discover";
 import { otlpGuidePlan, renderOtlpGuide } from "./otlp-guide";
-import { RECIPE_REGISTRY, sdkInstallSpec } from "./recipe-registry";
+import {
+  RECIPE_REGISTRY,
+  keyScopeForDir,
+  sdkInstallSpec,
+} from "./recipe-registry";
 import { dashboardBase, resolveEndpoint } from "./net";
 import {
   color,
@@ -1010,6 +1014,11 @@ export async function runBatchWizard(
         entryFile: c.detected.entryFile,
         nextVersion: c.detected.nextVersion,
         stack: c.detected.otlpStack ?? undefined,
+        // Every app in this run gets its own key, so every app needs its own
+        // variable to read it from. Without this a repository of Express
+        // services would be told to set one `CRUMBTRAIL_KEY` to five different
+        // values.
+        keyScope: keyScopeForDir(c.relDir),
         options: { force: parsed.yes },
       }, defaultInjectIO);
 

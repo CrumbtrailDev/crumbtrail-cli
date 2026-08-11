@@ -79,6 +79,49 @@ const NODE_KEY: KeyRef = {
 };
 
 /**
+ * The suffix that makes one app's key variable its own, or null for an app at
+ * the repository root.
+ *
+ * A recipe's variable name is a constant, so every Express app in a monorepo
+ * asks for the same `CRUMBTRAIL_KEY`. Each app has its own ingest key, and
+ * whether they collide then depends entirely on how that repository is
+ * deployed: separate environments per app and they are fine, one shared `.env`
+ * or one process holding several apps and the last value written wins, which
+ * puts four apps' sessions under the fifth app's name. The name is also what
+ * the wizard prints next to each key, and five identical names is not something
+ * a reader can act on.
+ *
+ * The suffix comes from the app's directory rather than from the selection, so
+ * the survey, the install and the pull request all derive the same name without
+ * having to agree on anything: an app at `services/job-engine` is always
+ * `..._SERVICES_JOB_ENGINE`, whether it was wired alone or with five others.
+ */
+export function keyScopeForDir(relDir: string): string | null {
+  const cleaned = relDir.replace(/^[./]+/, "").replace(/\/+$/, "");
+  if (cleaned === "") return null;
+  const scope = cleaned
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return scope === "" ? null : scope;
+}
+
+/**
+ * The same key reference, named for one app rather than for its framework.
+ *
+ * The expression is rewritten alongside the variable, because the injected code
+ * and the value the customer sets have to be the same name — a scoped variable
+ * the generated code does not read is worse than no scoping at all. The
+ * framework's public prefix stays where it is: `NEXT_PUBLIC_` is what makes the
+ * value reach browser code, so the suffix goes on the end.
+ */
+export function scopedKeyRef(base: KeyRef, scope: string | null): KeyRef {
+  if (!scope) return base;
+  const envVar = `${base.envVar}_${scope}`;
+  return { envVar, expr: base.expr.replace(base.envVar, envVar) };
+}
+
+/**
  * Capability floors for the SDK packages the installer adds. A bare `npm
  * install crumbtrail-node` resolves whatever the registry says is latest at run
  * time — which once left freshly wired services on stale 0.2.x installs when a
