@@ -686,6 +686,51 @@ describe("autoCapture", () => {
     );
   });
 
+  // One ingest key covers the whole project, so the key cannot say which app
+  // this process is. The session handshake has to, or a repository of six
+  // backends arrives as six anonymous senders.
+  it("names its app in the session handshake", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        service: "job-engine",
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+      }),
+    );
+
+    const start = calls.find((c) => c.url.endsWith("/api/session/start"));
+    expect(start).toBeDefined();
+    const body = JSON.parse(String(start!.init.body)) as {
+      metadata: Record<string, unknown>;
+    };
+    expect(body.metadata.service).toBe("job-engine");
+  });
+
+  it("sends no app name when it was not given one", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+      }),
+    );
+
+    const start = calls.find((c) => c.url.endsWith("/api/session/start"));
+    const body = JSON.parse(String(start!.init.body)) as {
+      metadata: Record<string, unknown>;
+    };
+    expect(body.metadata).not.toHaveProperty("service");
+  });
+
   it("restores console.error and removes hooks on stop()", async () => {
     const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
     const originalError = vi.fn();

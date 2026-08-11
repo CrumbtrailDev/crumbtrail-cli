@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import path from "node:path";
 import { buildPlan, supportsInstrumentationClient } from "../inject/recipes";
-import { keyScopeForDir, scopedKeyRef } from "../recipe-registry";
 import { fakeInjectIO } from "./helpers";
 
 const CWD = "/proj";
@@ -965,17 +964,15 @@ describe("buildPlan — Express middleware wiring", () => {
   });
 });
 
-// One key per app means one variable per app.
+// One key per project means the injected code has to say which app it is.
 //
-// A recipe's variable name is a constant, so every Express service in a
-// monorepo asked for the same CRUMBTRAIL_KEY while each held a different key.
-// In a repository deployed from one environment the last value written wins,
-// and four apps' sessions arrive under the fifth app's name. Scoping the name
-// by the app's directory is what stops that, and the scoped name has to reach
-// the injected code as well as the printed guidance — a variable the customer
-// sets and the code never reads is worse than no scoping at all.
-describe("buildPlan — per app key variables", () => {
-  it("scopes the variable AND the expression the injected code reads", () => {
+// The key used to carry the app, and a repository of six apps meant six
+// secrets. Now one CRUMBTRAIL_KEY covers the project and the init call names
+// the app. The name has to reach the emitted code, not just the printed
+// guidance: a name the customer sees and the code never sends attributes
+// nothing.
+describe("buildPlan — the app names itself", () => {
+  it("bakes the app's name into a backend init call", () => {
     const io = fakeInjectIO({
       [p("package.json")]: "{}",
       [p("server.js")]: "x\n",
@@ -986,34 +983,37 @@ describe("buildPlan — per app key variables", () => {
         recipe: "express",
         endpoint: ENDPOINT,
         entryFile: p("server.js"),
-        keyScope: keyScopeForDir("services/job-engine"),
+        serviceName: "job-engine",
       },
       io,
     );
-    expect(plan.keyEnvVar).toBe("CRUMBTRAIL_KEY_SERVICES_JOB_ENGINE");
-    expect(plan.content).toContain(
-      "process.env.CRUMBTRAIL_KEY_SERVICES_JOB_ENGINE",
-    );
+    // Same variable every app in the repository reads, because there is now
+    // only one key to read.
+    expect(plan.keyEnvVar).toBe("CRUMBTRAIL_KEY");
+    expect(plan.content).toContain("process.env.CRUMBTRAIL_KEY");
+    expect(plan.content).toContain('service: "job-engine"');
     expectNoKeyLiteral(plan.content);
   });
 
-  it("keeps the framework's public prefix in front, where the bundler needs it", () => {
-    const ref = scopedKeyRef(
+  it("bakes it into a browser init call too", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({ dependencies: { vite: "^5" } }),
+      [p("src/main.ts")]: "x\n",
+    });
+    const plan = buildPlan(
       {
-        envVar: "NEXT_PUBLIC_CRUMBTRAIL_KEY",
-        expr: "process.env.NEXT_PUBLIC_CRUMBTRAIL_KEY",
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src/main.ts"),
+        serviceName: "website",
       },
-      keyScopeForDir("apps/website"),
+      io,
     );
-    expect(ref.envVar).toBe("NEXT_PUBLIC_CRUMBTRAIL_KEY_APPS_WEBSITE");
-    expect(ref.expr).toBe(
-      "process.env.NEXT_PUBLIC_CRUMBTRAIL_KEY_APPS_WEBSITE",
-    );
+    expect(plan.content).toContain('service: "website"');
   });
 
-  it("leaves a root app on the plain name, having nothing to collide with", () => {
-    expect(keyScopeForDir("")).toBeNull();
-    expect(keyScopeForDir(".")).toBeNull();
+  it("emits no service field when the app was not named", () => {
     const io = fakeInjectIO({
       [p("package.json")]: "{}",
       [p("server.js")]: "x\n",
@@ -1024,15 +1024,10 @@ describe("buildPlan — per app key variables", () => {
         recipe: "express",
         endpoint: ENDPOINT,
         entryFile: p("server.js"),
-        keyScope: keyScopeForDir(""),
       },
       io,
     );
     expect(plan.keyEnvVar).toBe("CRUMBTRAIL_KEY");
-  });
-
-  it("turns a directory into a usable identifier", () => {
-    expect(keyScopeForDir("apps/my-web.app")).toBe("APPS_MY_WEB_APP");
-    expect(keyScopeForDir("./packages/api/")).toBe("PACKAGES_API");
+    expect(plan.content).not.toContain("service:");
   });
 });

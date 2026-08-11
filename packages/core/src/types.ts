@@ -486,6 +486,15 @@ export interface CrumbtrailConfig {
   configEndpoint?: string;
   /** Project key sent with cloud capture config requests. */
   projectKey?: string;
+  /**
+   * Which app in the project this session belongs to.
+   *
+   * One ingest key covers a whole project, so the key cannot say which app
+   * sent a session — this can. The name is created on first sight and reused
+   * after, and a key minted for a single app ignores it. Leave it unset and
+   * the session simply carries no app label.
+   */
+  service?: string;
   /** Config poll cadence when `configEndpoint` and `projectKey` are supplied. */
   configPollIntervalMs: number;
 
