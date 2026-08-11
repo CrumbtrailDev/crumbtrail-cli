@@ -18,7 +18,10 @@ import {
 import { sanitizeSelector } from "./sanitize-selector";
 import { groupDistinctBugs, type DistinctBug } from "./distinct-bugs";
 import { redactedNetworkBodySnippet } from "./network-body";
-import { clientCallsiteFromStack } from "./client-callsite";
+import {
+  clientCallsiteFromStack,
+  clientCallsiteResolver,
+} from "./client-callsite";
 import type { EvidenceCandidate } from "./evidence-index";
 import type { CausalConfidence } from "./causal-graph";
 import { defaultSessionStore } from "./session-store";
@@ -555,6 +558,15 @@ export interface LlmBundleDbCallsite {
   line?: number;
   column?: number;
   fn?: string;
+  /**
+   * The generated path `file` was resolved FROM, when a source map resolved it.
+   *
+   * Present only on a frame that actually moved. Its absence means the path is
+   * as the runtime reported it — so a reader can tell a resolved location from an
+   * unresolved one instead of having to trust that resolution ran, and the claim
+   * stays checkable against the build.
+   */
+  minifiedFile?: string;
   /** App frames above this one, innermost first. Never nested further. */
   stack?: LlmBundleDbCallsite[];
 }
@@ -3209,6 +3221,9 @@ function buildFullStackPayloadIndex(
   events: BugEvent[],
 ): Map<string, FullStackPayloads> {
   const byRequest = new Map<string, FullStackPayloads>();
+  // Built once for the whole index, not per event: the lookup carries the parsed
+  // map cache, and a production chunk is expensive to parse exactly once.
+  const resolveClient = clientCallsiteResolver();
   const entryFor = (requestId: string): FullStackPayloads => {
     const existing = byRequest.get(requestId);
     if (existing) return existing;
@@ -3225,7 +3240,12 @@ function buildFullStackPayloadIndex(
     if (event.k === "net.req") {
       const body = redactedNetworkBodySnippet(event.d.body, event.d.bodySummary);
       if (body) entryFor(requestId).frontendRequestBody ??= body;
-      const callsite = clientCallsiteFromStack(event.d.stk);
+      // Resolved HERE, at the single point a client callsite enters the bundle,
+      // so `fullStackEvidence` and `code_locations` cannot disagree about which
+      // file a reader should open.
+      const parsed = clientCallsiteFromStack(event.d.stk);
+      const callsite =
+        parsed && resolveClient ? resolveClient(parsed) : parsed;
       if (callsite) entryFor(requestId).frontendRequestCallsite ??= callsite;
     } else if (event.k === "net.res") {
       const body = redactedNetworkBodySnippet(event.d.body, event.d.bodySummary);

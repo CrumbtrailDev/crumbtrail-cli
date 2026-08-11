@@ -32,6 +32,12 @@
  */
 
 import type { LlmBundleDbCallsite } from "./llm-bundle";
+import {
+  directorySourceMapLookup,
+  resolveFrame,
+  type SourceMap,
+  type SourceMapLookup,
+} from "./source-map";
 
 /** How many frames of a client stack are kept, innermost first. */
 export const MAX_CLIENT_FRAMES = 5;
@@ -58,9 +64,38 @@ const V8_FRAME =
  * nothing — the confidently-wrong location this module refuses by name. A file
  * with no `/` and no `.` is not a script.
  */
+/**
+ * Schemes that parse as a location and are not the application's code.
+ *
+ * A browser extension patches `fetch` on the page, so its frames appear in an
+ * application stack looking exactly like application frames — a URL, a path, a
+ * line and a column, all well formed. Publishing one names a file in SOMEBODY
+ * ELSE'S extension as the place to fix the defect, and it is not a file the
+ * reader can open, edit, or even obtain.
+ *
+ * This is not hypothetical for this product: one of the captured scenarios is an
+ * ad blocker interfering with checkout, which is precisely a session where an
+ * extension's frames are on the stack and the defect is not in them.
+ *
+ * `blob:` and `data:` go too. Both are real script sources and neither is a file
+ * that survives the page, so a reader sent to one has nothing to open.
+ */
+const FOREIGN_SCHEMES = [
+  "chrome-extension:",
+  "moz-extension:",
+  "safari-web-extension:",
+  "safari-extension:",
+  "ms-browser-extension:",
+  "blob:",
+  "data:",
+  "about:",
+];
+
 function isOpenableScript(file: string): boolean {
   if (file.startsWith("<") || file.startsWith("eval at ")) return false;
   if (file === "native" || file === "unknown location") return false;
+  const lower = file.toLowerCase();
+  if (FOREIGN_SCHEMES.some((scheme) => lower.startsWith(scheme))) return false;
   return file.includes("/") || file.includes("\\");
 }
 
@@ -115,4 +150,89 @@ export function clientCallsiteFromStack(
   if (!innermost) return undefined;
   const callers = frames.slice(1);
   return callers.length > 0 ? { ...innermost, stack: callers } : innermost;
+}
+
+/* ------------------------------------------------------------------ */
+/* Source maps                                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A client callsite resolved back to the file a person edits.
+ *
+ * ============================================================================
+ * WHY THIS EXISTS
+ * ============================================================================
+ *
+ * Without it this whole feature only works on a dev server. `evidence-index`
+ * resolves source maps, but it resolves `candidate.anchor.frame` and nothing
+ * else — a client callsite travels a different road (`net.req.stk` →
+ * `clientCallsiteFromStack` → `code_locations`) and never passed through it.
+ *
+ * On a Vite dev server the browser reports `/src/pages/Account.jsx:88:13`, which
+ * is already the file a person edits, so the gap is invisible. On a production
+ * build it reports `/assets/index-a3f2c1.js:1:48213` — a file nobody wrote and a
+ * line that does not exist in the repository, which is the exact outcome
+ * `source-map.ts` opens by naming as "technically true and practically useless".
+ *
+ * ============================================================================
+ * FAILURE IS ALWAYS "LEAVE IT ALONE"
+ * ============================================================================
+ *
+ * Unparseable frame, no map, corrupt map, uncovered position: every one of them
+ * returns the callsite untouched, matching `resolveCandidateFrames`. A frame a
+ * reader knows is minified is better than a frame silently pointed at the wrong
+ * file, and `minifiedFile` keeps the generated path so the resolution is
+ * checkable rather than merely asserted.
+ */
+export function resolveClientCallsite(
+  callsite: LlmBundleDbCallsite,
+  lookup: SourceMapLookup,
+  cache?: Map<string, SourceMap | undefined>,
+): LlmBundleDbCallsite {
+  const resolveOne = (frame: LlmBundleDbCallsite): LlmBundleDbCallsite => {
+    // A frame with no position cannot be resolved: a source map is looked up BY
+    // generated line and column, so there is nothing to ask it.
+    if (frame.line === undefined || frame.column === undefined) return frame;
+    const resolved = resolveFrame(
+      `${frame.file}:${frame.line}:${frame.column}`,
+      lookup,
+      cache,
+    );
+    if (!resolved) return frame;
+    const parsed = /^(.*):(\d+):(\d+)$/.exec(resolved);
+    if (!parsed) return frame;
+    return {
+      ...frame,
+      file: parsed[1],
+      line: Number(parsed[2]),
+      column: Number(parsed[3]),
+      minifiedFile: frame.file,
+    };
+  };
+
+  const head = resolveOne(callsite);
+  if (!callsite.stack || callsite.stack.length === 0) return head;
+  return { ...head, stack: callsite.stack.map(resolveOne) };
+}
+
+/**
+ * The resolver configured by `CRUMBTRAIL_SOURCEMAP_DIR`, or undefined when it is
+ * unset.
+ *
+ * Off by default and gated on exactly the same variable as the candidate-frame
+ * resolution, because two source-map switches that can disagree is a support
+ * question nobody can answer from the artifact.
+ *
+ * The map cache is per call rather than per process: a session's frames sit in a
+ * handful of chunks, parsing a production map is the expensive part, and a cache
+ * outliving the call would serve a stale map after a rebuild.
+ */
+export function clientCallsiteResolver():
+  | ((callsite: LlmBundleDbCallsite) => LlmBundleDbCallsite)
+  | undefined {
+  const dir = process.env.CRUMBTRAIL_SOURCEMAP_DIR?.trim();
+  if (!dir) return undefined;
+  const lookup = directorySourceMapLookup(dir);
+  const cache = new Map<string, SourceMap | undefined>();
+  return (callsite) => resolveClientCallsite(callsite, lookup, cache);
 }

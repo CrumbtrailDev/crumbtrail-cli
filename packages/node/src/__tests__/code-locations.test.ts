@@ -377,3 +377,52 @@ describe("buildCodeLocations — the unranked client tail", () => {
     expect(locations).toHaveLength(MAX_CODE_LOCATIONS);
   });
 });
+
+/**
+ * The flag on the OTHER road into this function.
+ *
+ * `sourceMapped` was set only from `anchor.minifiedFrame`, which a structured
+ * client callsite never has — so a client location resolved through a source map
+ * arrived looking exactly like a direct frame. That is the same "a build artifact
+ * presented as a fact" problem the flag was added to prevent, on the path that
+ * needs it most: a browser frame is minified far more often than a server one.
+ */
+describe("buildCodeLocations — a mapped client callsite says so", () => {
+  const bundleWithClientCallsite = (callsite: unknown) =>
+    ({
+      fullStackEvidence: {
+        linked: [{ requestId: "req-1", frontend: { requestCallsite: callsite } }],
+      },
+    }) as unknown as Parameters<typeof buildCodeLocations>[0];
+
+  it("marks a client location that a source map resolved", () => {
+    const locations = buildCodeLocations(
+      bundleWithClientCallsite({
+        file: "client/src/pages/Account.jsx",
+        line: 88,
+        column: 13,
+        minifiedFile: "https://app.example.test/assets/index-a3f2c1.js",
+      }),
+      [candidate({ id: "cand_0001", anchor: { t: 1, requestId: "req-1" } } as never)],
+    );
+    expect(locations?.[0]).toMatchObject({
+      path: "client/src/pages/Account.jsx",
+      via: "client.request",
+      sourceMapped: true,
+    });
+  });
+
+  it("does not mark one the runtime reported directly", () => {
+    // The negative half. Without it the flag could be attached unconditionally
+    // and every assertion above would still pass.
+    const locations = buildCodeLocations(
+      bundleWithClientCallsite({
+        file: "http://127.0.0.1:5637/src/pages/Account.jsx",
+        line: 88,
+        column: 13,
+      }),
+      [candidate({ id: "cand_0001", anchor: { t: 1, requestId: "req-1" } } as never)],
+    );
+    expect(locations?.[0]?.sourceMapped).toBeUndefined();
+  });
+});

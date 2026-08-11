@@ -217,6 +217,11 @@ export function buildCodeLocations(
       via,
       signalId,
       ...(signalTitle ? { signalTitle } : {}),
+      // The same flag the candidate-frame path sets from `anchor.minifiedFrame`.
+      // A structured callsite that was source-mapped is exactly as much a build
+      // artifact as a flattened one, and a reader told nothing would take it for
+      // a direct frame.
+      ...(callsite.minifiedFile ? { sourceMapped: true } : {}),
       ...(callsite.stack && callsite.stack.length > 0
         ? { callers: callsite.stack.slice(0, MAX_CALLER_FRAMES).map(frameFromCallsite) }
         : {}),
