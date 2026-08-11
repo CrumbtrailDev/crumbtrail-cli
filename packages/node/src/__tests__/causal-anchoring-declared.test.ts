@@ -157,6 +157,23 @@ describe("causal anchoring is declared, never defaulted", () => {
     expect(emittedDetectors().length).toBeGreaterThanOrEqual(90);
   });
 
+  it("extracts a plausible number of RULES, or says so instead of passing", () => {
+    // The second load-bearing control, and the mirror of the one above.
+    // `ruleCoveredDetectors` scrapes `nodeKindsForDetector` by source text —
+    // `case "..."`, `startsWith(...)`, and the `DB_WRITE_DETECTORS` literal — so
+    // any restructuring of that function can make the scrape return almost
+    // nothing. With no floor, that failure mode is SILENT in the friendly
+    // direction: fewer rules found means MORE detectors look undecided, the
+    // assertion below starts listing detectors that are in fact mapped, and
+    // somebody "fixes" it by declaring them. Pin the shape of the scrape itself.
+    const { prefixes, explicit } = ruleCoveredDetectors();
+    expect(prefixes).toContain("backend_");
+    expect(prefixes).toContain("otel_");
+    expect(explicit.size).toBeGreaterThanOrEqual(20);
+    expect(explicit).toContain("click_target_intercepted");
+    expect(explicit).toContain("db_mutation");
+  });
+
   it("gives every emitted detector a mapping, a prefix rule, or a written decision", () => {
     const { prefixes, explicit } = ruleCoveredDetectors();
     const undecided = emittedDetectors().filter(
