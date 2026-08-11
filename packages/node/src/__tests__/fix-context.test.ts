@@ -13,6 +13,7 @@ import os from "node:os";
 import { postProcess } from "../post-process";
 import {
   buildCausalChain,
+  projectCausalChain,
   buildFixContext,
   FIX_CONTEXT_SCHEMA_VERSION,
   FixContextError,
@@ -1245,5 +1246,66 @@ describe("buildCausalChain anchor selection", () => {
 
   it("is null for an empty candidate list", () => {
     expect(buildCausalChain([])).toBeNull();
+  });
+});
+
+describe("causal_chain_absence", () => {
+  const signal = (over: Record<string, unknown>) =>
+    ({
+      schemaVersion: 1,
+      id: "cand_0001",
+      detector: "input_reverted",
+      title: "A keystroke was overwritten by a programmatic write",
+      severity: "high",
+      score: 90,
+      confidence: "high",
+      anchor: { t: 1 },
+      ...over,
+    }) as unknown as EvidenceCandidate;
+
+  it("names the signal that could not be placed in the graph", () => {
+    // The measured case: 8 of 9 captured sessions had the detector that NAMES
+    // the incident sitting `isolated`, and the bundle reported that identically
+    // to "these events are genuinely unrelated".
+    const { chain, absence } = projectCausalChain([
+      signal({ causalRole: "isolated" }),
+      signal({ id: "cand_0002", detector: "n_plus_one_query", causalRole: "root" }),
+    ]);
+    expect(chain).toBeNull();
+    expect(absence).toEqual({
+      reason: "top_candidate_isolated",
+      detector: "input_reverted",
+      signalId: "cand_0001",
+    });
+  });
+
+  it("distinguishes a root that explains nothing from a top candidate that could not be placed", () => {
+    const { chain, absence } = projectCausalChain([
+      signal({ id: "cand_0007", detector: "db_mutation", causalRole: "root", causes: [] }),
+    ]);
+    expect(chain).toBeNull();
+    expect(absence?.reason).toBe("root_attributed_no_symptoms");
+  });
+
+  it("says so when there was nothing to explain", () => {
+    expect(projectCausalChain([]).absence).toEqual({ reason: "no_signals" });
+  });
+
+  it("reports NO absence when a chain was projected", () => {
+    // The negative direction. Without it, a producer that attached an absence
+    // unconditionally would pass every assertion above while telling every
+    // reader that the chain it just handed them is missing.
+    const { chain, absence } = projectCausalChain([
+      signal({ id: "cand_0008", detector: "backend_http_client_error", causalRole: "root", causes: ["cand_0009"] }),
+      signal({ id: "cand_0009", detector: "http_error", causalRole: "symptom", rootCauseId: "cand_0008" }),
+    ]);
+    expect(chain).not.toBeNull();
+    expect(absence).toBeUndefined();
+  });
+
+  it("leaves buildCausalChain's own contract untouched", () => {
+    // The projection was refactored to report its reason, NOT to change what it
+    // refuses. Same input, same null.
+    expect(buildCausalChain([signal({ causalRole: "isolated" })])).toBeNull();
   });
 });
