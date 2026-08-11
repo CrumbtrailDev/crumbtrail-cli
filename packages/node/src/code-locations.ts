@@ -52,6 +52,7 @@ export const MAX_CALLER_FRAMES = 4;
 /** What kind of evidence put us at this line. */
 export type CodeLocationVia =
   | "db.write"
+  | "client.request"
   | "signal";
 
 /** One frame: a path a person can open, and the line they should look at. */
@@ -137,11 +138,17 @@ function keyOf(frame: CodeFrame): string {
 /**
  * The code locations behind the ranked signals, in ranked order.
  *
- * Two sources, and the structured one wins where they overlap. A `db.diff`
- * callsite carries a function name and a caller chain; a candidate's `anchor.frame`
- * is a formatted string that has already lost both. Where a candidate names a
- * request that also produced a write, the write's structured frame is the better
- * record of the same fact.
+ * Three sources, and the structured ones win over the flattened one. A `db.diff`
+ * callsite and a browser request callsite each carry a function name and a caller
+ * chain; a candidate's `anchor.frame` is a formatted string that has already lost
+ * both. Where a candidate names a request that produced either, the structured
+ * frame is the better record of the same fact.
+ *
+ * The two structured sources do NOT compete with each other. A write callsite is
+ * the server line that changed the row; a request callsite is the client line
+ * that asked for it. For a defect where the server did exactly as it was told —
+ * and a bundle that names only the server argues actively for the wrong fix —
+ * those are the two ends a reader has to hold at once, so both are emitted.
  *
  * Returns undefined rather than an empty array when nothing was captured, so a
  * consumer can tell "the SDK was not capturing callsites" from "it was, and there
@@ -155,6 +162,10 @@ export function buildCodeLocations(
   const seen = new Set<string>();
 
   const push = (location: CodeLocation) => {
+    // The cap is enforced HERE, not only at each loop top. A candidate can now
+    // yield two locations — the server line and the client line — so a top-of-
+    // loop check alone lets the array finish one over.
+    if (locations.length >= MAX_CODE_LOCATIONS) return;
     const key = keyOf(location);
     if (seen.has(key)) return;
     seen.add(key);
@@ -171,23 +182,76 @@ export function buildCodeLocations(
     }
   }
 
+  // The same join, on the other side of the wire. The full-stack link table
+  // already establishes that a browser request and a server request are one
+  // request; where the browser recorded which line issued it, that line is a
+  // location for the same ranked signal.
+  const clientByRequest = new Map<string, LlmBundleDbCallsite>();
+  for (const entry of bundle?.fullStackEvidence?.linked ?? []) {
+    const callsite = entry.frontend?.requestCallsite;
+    if (callsite && !clientByRequest.has(entry.requestId)) {
+      clientByRequest.set(entry.requestId, callsite);
+    }
+  }
+  for (const gap of bundle?.fullStackEvidence?.gaps ?? []) {
+    // A gap is a request the two planes could NOT be linked across — the
+    // frontend fired and no backend request answered to it. That is not a
+    // reason to drop its callsite: a request the server never saw is a
+    // client-side story by construction, and one of the cases where the client
+    // line is the ONLY line there is.
+    const callsite = gap.frontend?.requestCallsite;
+    const requestId = gap.requestId ?? gap.frontend?.requestId;
+    if (callsite && requestId && !clientByRequest.has(requestId)) {
+      clientByRequest.set(requestId, callsite);
+    }
+  }
+
+  const pushCallsite = (
+    callsite: LlmBundleDbCallsite,
+    via: CodeLocationVia,
+    signalId: string,
+    signalTitle?: string,
+  ) => {
+    push({
+      ...frameFromCallsite(callsite),
+      via,
+      signalId,
+      ...(signalTitle ? { signalTitle } : {}),
+      // The same flag the candidate-frame path sets from `anchor.minifiedFrame`.
+      // A structured callsite that was source-mapped is exactly as much a build
+      // artifact as a flattened one, and a reader told nothing would take it for
+      // a direct frame.
+      ...(callsite.minifiedFile ? { sourceMapped: true } : {}),
+      ...(callsite.stack && callsite.stack.length > 0
+        ? { callers: callsite.stack.slice(0, MAX_CALLER_FRAMES).map(frameFromCallsite) }
+        : {}),
+    });
+  };
+
   for (const candidate of ranked) {
     if (locations.length >= MAX_CODE_LOCATIONS) break;
 
     const requestId = candidate.anchor?.requestId;
     const structured = requestId ? byRequest.get(requestId) : undefined;
     if (structured) {
-      push({
-        ...frameFromCallsite(structured),
-        via: "db.write",
-        signalId: candidate.id,
-        signalTitle: candidate.title,
-        ...(structured.stack && structured.stack.length > 0
-          ? { callers: structured.stack.slice(0, MAX_CALLER_FRAMES).map(frameFromCallsite) }
-          : {}),
-      });
-      continue;
+      pushCallsite(structured, "db.write", candidate.id, candidate.title);
     }
+
+    // Not an alternative to the write above, and not a duplicate of it. A write
+    // callsite says which server line changed the row; a request callsite says
+    // which client line asked for it. They are two planes of one request, and
+    // for a defect where the server did exactly as it was told they are the two
+    // ends a reader has to compare. `push` still dedupes by file and line, so a
+    // single-process app that somehow reports both at one place stays one entry.
+    const client = requestId ? clientByRequest.get(requestId) : undefined;
+    if (client) {
+      pushCallsite(client, "client.request", candidate.id, candidate.title);
+    }
+
+    // The signal's own flattened frame is the fallback for a candidate that had
+    // no structured callsite on either side — where one exists, it is the same
+    // fact with the function name and caller chain already lost.
+    if (structured || client) continue;
 
     const frame = parseFrame(candidate.anchor?.frame);
     if (!frame) continue;
@@ -216,6 +280,20 @@ export function buildCodeLocations(
         ? { callers: diff.callsite.stack.slice(0, MAX_CALLER_FRAMES).map(frameFromCallsite) }
         : {}),
     });
+  }
+
+  // Client requests nothing ranked either. Last, for the same reason the
+  // unranked writes are last — and present because a session whose defect never
+  // produced a server signal at all is precisely the session that has no other
+  // code evidence, and is the case this field was added for.
+  for (const callsite of clientByRequest.values()) {
+    if (locations.length >= MAX_CODE_LOCATIONS) break;
+    // `unranked`, matching the database tail. `signalId` is documented as the
+    // ranked signal a location came from, and nothing ranked this one; a real
+    // request id here would send a reader looking for a signal that is not
+    // there. Requests a candidate DID rank are already in `locations` and are
+    // turned away by the file:line dedupe above, keeping their checkable id.
+    pushCallsite(callsite, "client.request", "unranked");
   }
 
   return locations.length > 0 ? locations : undefined;

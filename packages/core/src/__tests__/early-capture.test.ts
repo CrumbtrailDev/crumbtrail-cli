@@ -681,3 +681,33 @@ describe("requests in flight across the drain", () => {
     expect(readEarlyCapture()?.entries).toHaveLength(0);
   });
 });
+
+describe("early capture — request callsite", () => {
+  it("records the application frame that issued the request, and not its own", async () => {
+    // The measured reason this lives here and not only in the live collector:
+    // in a captured nine-session corpus EVERY `net.req` arrived through the
+    // early replay path (`early: true`, 26 of 26). A callsite added only to
+    // `wrapFetch` is a producer wired to a channel with no arrivals.
+    const original = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response("{}", { status: 200, headers: { "content-type": "application/json" } })) as typeof globalThis.fetch;
+    try {
+      const capture = installEarlyCapture();
+      expect(capture).toBeDefined();
+      async function saveAddressFromApplicationCode() {
+        await globalThis.fetch("https://api.example.com/addresses", { method: "POST" });
+      }
+      await saveAddressFromApplicationCode();
+      const [record] = capture!.drain();
+      expect(record?.stk).toBeTypeOf("string");
+      const frames = String(record!.stk).split("\n").slice(1);
+      expect(frames[0]).toContain("saveAddressFromApplicationCode");
+      // Both directions. The SDK's own wrapper must not be the frame a reader
+      // is sent to — that is the failure this whole change exists to prevent.
+      expect(String(record!.stk)).not.toContain("earlyFetch");
+      expect(String(record!.stk)).not.toContain("early-capture.ts");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});

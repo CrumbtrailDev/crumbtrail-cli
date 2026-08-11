@@ -18,6 +18,10 @@ import {
 import { sanitizeSelector } from "./sanitize-selector";
 import { groupDistinctBugs, type DistinctBug } from "./distinct-bugs";
 import { redactedNetworkBodySnippet } from "./network-body";
+import {
+  clientCallsiteFromStack,
+  clientCallsiteResolver,
+} from "./client-callsite";
 import type { EvidenceCandidate } from "./evidence-index";
 import type { CausalConfidence } from "./causal-graph";
 import { defaultSessionStore } from "./session-store";
@@ -128,6 +132,21 @@ export interface LlmBundleFrontendRequestEvidenceSummary {
   requestBody?: string;
   /** Redacted snippet of what came back, from the matching `net.res` event. */
   responseBody?: string;
+  /**
+   * Where the application asked for this request, from the stack the browser
+   * SDK captured at the call.
+   *
+   * The backend half of a linked request has carried a callsite for a while, on
+   * `responseCallsite` and on the writes riding under `db.diff`. The frontend
+   * half carried none, so a session whose defect never reached the server — or
+   * reached it and got a correct answer back — produced a bundle naming only
+   * server files. The reason written beside `responseCallsite` holds here
+   * unchanged: a page that renders wrong without throwing had no pointer at all.
+   *
+   * Same shape as the database callsite, deliberately: it is the same question,
+   * and `code_locations` already knows how to render a caller chain from it.
+   */
+  requestCallsite?: LlmBundleDbCallsite;
   error?: {
     message?: string;
     transport?: string;
@@ -539,6 +558,15 @@ export interface LlmBundleDbCallsite {
   line?: number;
   column?: number;
   fn?: string;
+  /**
+   * The generated path `file` was resolved FROM, when a source map resolved it.
+   *
+   * Present only on a frame that actually moved. Its absence means the path is
+   * as the runtime reported it — so a reader can tell a resolved location from an
+   * unresolved one instead of having to trust that resolution ran, and the claim
+   * stays checkable against the build.
+   */
+  minifiedFile?: string;
   /** App frames above this one, innermost first. Never nested further. */
   stack?: LlmBundleDbCallsite[];
 }
@@ -3177,6 +3205,7 @@ function boundaryPromptFromValue(
 interface FullStackPayloads {
   frontendRequestBody?: string;
   frontendResponseBody?: string;
+  frontendRequestCallsite?: LlmBundleDbCallsite;
   backendResponseBody?: string;
   backendResponseCallsite?: LlmBundleDbCallsite;
 }
@@ -3192,6 +3221,9 @@ function buildFullStackPayloadIndex(
   events: BugEvent[],
 ): Map<string, FullStackPayloads> {
   const byRequest = new Map<string, FullStackPayloads>();
+  // Built once for the whole index, not per event: the lookup carries the parsed
+  // map cache, and a production chunk is expensive to parse exactly once.
+  const resolveClient = clientCallsiteResolver();
   const entryFor = (requestId: string): FullStackPayloads => {
     const existing = byRequest.get(requestId);
     if (existing) return existing;
@@ -3208,6 +3240,13 @@ function buildFullStackPayloadIndex(
     if (event.k === "net.req") {
       const body = redactedNetworkBodySnippet(event.d.body, event.d.bodySummary);
       if (body) entryFor(requestId).frontendRequestBody ??= body;
+      // Resolved HERE, at the single point a client callsite enters the bundle,
+      // so `fullStackEvidence` and `code_locations` cannot disagree about which
+      // file a reader should open.
+      const parsed = clientCallsiteFromStack(event.d.stk);
+      const callsite =
+        parsed && resolveClient ? resolveClient(parsed) : parsed;
+      if (callsite) entryFor(requestId).frontendRequestCallsite ??= callsite;
     } else if (event.k === "net.res") {
       const body = redactedNetworkBodySnippet(event.d.body, event.d.bodySummary);
       if (body) entryFor(requestId).frontendResponseBody ??= body;
@@ -3415,6 +3454,7 @@ function frontendRequestEvidenceFromIndex(
     durationMs: finiteNumber(value.durationMs),
     requestBody: payload?.frontendRequestBody,
     responseBody: payload?.frontendResponseBody,
+    requestCallsite: payload?.frontendRequestCallsite,
     error: fullStackFrontendErrorFromIndex(value.error),
   });
   return Object.keys(frontend).length > 0 ? frontend : undefined;

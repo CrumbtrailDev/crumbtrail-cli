@@ -8,6 +8,7 @@ import {
 import { createWebSessionStore } from "./session-store";
 import { DEFAULT_CONFIG } from "./types";
 import { generateSessionId } from "./utils";
+import { captureCallStack } from "./call-stack";
 
 /**
  * First-fetch capture, installed before the SDK exists.
@@ -64,6 +65,16 @@ export interface EarlyRequestRecord {
   resBody?: string;
   /** Set instead of `status` when the request never produced a response. */
   err?: string;
+  /**
+   * The application stack at the call, SDK frames already removed.
+   *
+   * Captured HERE and not only in the live collector, because in an application
+   * that installs the early snippet the live `fetch` wrapper may emit nothing at
+   * all: every `net.req` in a measured nine-session corpus arrived through this
+   * replay path, `early: true`, and a callsite added only to `wrapFetch` was a
+   * producer wired to a channel with no arrivals.
+   */
+  stk?: string;
 }
 
 export interface EarlyCapture {
@@ -109,6 +120,8 @@ interface PreparedRequest {
   method: string;
   url: string;
   sessionId: string;
+  /** Application stack at the call. See {@link EarlyRequestRecord.stk}. */
+  stk?: string;
   requestId?: string;
   traceId?: string;
   spanId?: string;
@@ -363,6 +376,11 @@ function patchFetch(state: EarlyCaptureState): void {
   ): Promise<Response> {
     if (!recording(state)) return originalFetch(input, init);
 
+    // Synchronously, at the top: this is the only moment the application's own
+    // frames are on the stack. `earlyFetch` is the boundary, so every frame at
+    // and above it — the SDK's — is dropped by construction.
+    const callStack = captureCallStack(wrapped);
+
     let prepared: PreparedRequest | undefined;
     let nextInput: RequestInfo | URL = input;
     let nextInit = init;
@@ -375,6 +393,7 @@ function patchFetch(state: EarlyCaptureState): void {
         method: extractMethod(input, init),
         url,
         sessionId: state.sessionId,
+        ...(callStack !== undefined ? { stk: callStack } : {}),
         ...correlation,
         ...(typeof rawBody === "string" ? { reqBody: rawBody } : {}),
         ...(headers.get("content-type")
@@ -440,6 +459,7 @@ function recordFetchResponse(
     status: response.status,
     ...(contentType ? { ct: contentType } : {}),
     ...(request.reqCt ? { reqCt: request.reqCt } : {}),
+    ...(request.stk ? { stk: request.stk } : {}),
   };
   const sink = state.deferred ? state._sink : undefined;
   if (sink) {
@@ -507,6 +527,7 @@ function recordFailure(
     ...(request.spanId ? { spanId: request.spanId } : {}),
     err: error instanceof Error ? error.message : String(error),
     ...(request.reqCt ? { reqCt: request.reqCt } : {}),
+    ...(request.stk ? { stk: request.stk } : {}),
   };
   const sink = state.deferred ? state._sink : undefined;
   if (sink) {
