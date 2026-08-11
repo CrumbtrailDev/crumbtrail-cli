@@ -98,6 +98,60 @@ function roleOf(
   return attribution.get("c1")!.causalRole;
 }
 
+describe("a derived candidate lands on the right node, not merely on some node", () => {
+  it("joins the thread as a symptom of the request that caused it", () => {
+    // "Not isolated" is only half a proof. A rule that attaches a finding to the
+    // WRONG node of the right family passes every "is it connected" assertion
+    // and still destroys ranking. So this reads back WHERE the candidate landed,
+    // through the one place attribution makes it observable: the causal roles.
+    //
+    // Two nodes of one request, joined by a request edge. The mapped detector
+    // sits on the request; the DERIVED one sits on the response 400ms later. If
+    // the derivation put `response_race` on the response, it is a symptom whose
+    // root is the request candidate — and the request candidate names it back.
+    // If it had grabbed the request node instead, the roles would invert.
+    const graph: CausalGraph = {
+      schemaVersion: "causal-graph.v2",
+      nodes: [
+        node("net.req:1000", "net.req", 1000),
+        node("net.res:1400", "net.res", 1400),
+      ],
+      edges: [
+        {
+          from: "net.req:1000",
+          to: "net.res:1400",
+          kind: "request",
+          confidence: "high",
+        },
+      ],
+    };
+    const attribution = attributeCandidates(
+      graph,
+      [
+        { id: "the-request", anchor: { t: 1000 } as never },
+        {
+          id: "the-race",
+          anchor: {
+            t: 1400,
+            method: "GET",
+            url: "http://x/api/search",
+          } as never,
+        },
+      ],
+      (id) => (id === "the-race" ? "response_race" : "network_error"),
+    );
+    expect(attribution.get("the-race")).toEqual({
+      causalRole: "symptom",
+      rootCauseId: "the-request",
+      attributionConfidence: "high",
+    });
+    expect(attribution.get("the-request")).toEqual({
+      causalRole: "root",
+      causes: ["the-race"],
+    });
+  });
+});
+
 describe("derivation attaches the planes an anchor identifies", () => {
   const NET_GRAPH = graphOf([node("net.res:1000", "net.res", 1000)]);
 
