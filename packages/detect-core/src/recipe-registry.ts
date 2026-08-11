@@ -94,8 +94,12 @@ const NODE_KEY: KeyRef = {
  * floor exists, is recipe-managed, and is not ahead of its workspace manifest.
  */
 export const SDK_VERSION_FLOORS: Record<string, string> = {
-  "crumbtrail-core": "0.8.0",
-  "crumbtrail-node": "0.16.1",
+  // 0.15.0 / 0.26.0 are the first releases that accept `service` on init and
+  // on autoCapture. Below them the injected code still runs, but the name it
+  // passes is dropped and every app in the project ingests unlabelled — a
+  // silent loss of the attribution one key per project depends on.
+  "crumbtrail-core": "0.15.0",
+  "crumbtrail-node": "0.26.0",
   "crumbtrail-react-native": "0.3.2",
   "crumbtrail-tauri": "0.3.2",
 };
