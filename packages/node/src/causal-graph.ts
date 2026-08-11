@@ -699,8 +699,176 @@ const DB_WRITE_DETECTORS = new Set([
 ]);
 
 /**
+ * Detectors that have NO node of their own, each with the reason.
+ *
+ * ============================================================================
+ * WHY THIS LIST EXISTS AT ALL
+ * ============================================================================
+ *
+ * `nodeKindsForDetector` used to end in a silent empty default, and its own
+ * history is the argument against that. Four detectors were added to it one at a
+ * time — `click_target_intercepted`, `job_did_not_complete`, `stale_value_rendered`,
+ * `displayed_field_mismatch` — and each carries a comment saying it is "the same
+ * failure already paid for by click_target_intercepted". Four payments for one
+ * defect is not four bugs; it is a default that hides the question.
+ *
+ * Measured across nine captured sessions from five scenarios: the top-ranked
+ * candidate was `causalRole: "isolated"` in 8 of 9, and in 0 of 9 did it take part
+ * in any causal edge. Every one of those top candidates was the detector that
+ * NAMES the incident — `input_reverted` on the autofill defect,
+ * `stale_view_after_pop` on the back-button defect,
+ * `blocked_script_prevented_action` on the adblock defect — and none of them was in
+ * the table. `causal_chain` was null in all nine, correctly, because
+ * `buildCausalChain` anchors on `ranked[0]` and only `ranked[0]`, a decision
+ * already made on recorded evidence and NOT reopened here.
+ *
+ * ============================================================================
+ * WHY THE UNREVIEWED ENTRIES ARE NOT SIMPLY CLASSIFIED
+ * ============================================================================
+ *
+ * Deciding which node kind a detector anchors on is a claim about where its
+ * evidence came from. Making 80 such claims from the detector NAMES, with no
+ * firing evidence for most of them, is exactly the guess that produces a
+ * confident wrong chain — the outcome `buildCausalChain`'s own note says is worse
+ * than an honest null. So `unreviewed` is a stated debt, not a classification: it
+ * says "nobody has looked", which is true, instead of "this anchors nowhere",
+ * which is not known.
+ *
+ * The ratchet is the point. A detector added tomorrow cannot land here silently:
+ * `causal-anchoring-declared.test.ts` fails when an emitted detector is neither
+ * mapped, prefix-covered, nor declared below, and it fails when the `unreviewed`
+ * count GROWS. Reviewing one is a one-line change from `unreviewed` to a reason or
+ * to a mapping; adding a new unreviewed one is a test failure.
+ */
+export const DETECTOR_ANCHORING_DECLARED: ReadonlyMap<string, string> = new Map([
+  // Reviewed. Each of these genuinely has no node, and the reason is checkable.
+  [
+    "console_warning",
+    "warn-level `con` events never become graph nodes — `nodeKindFor` emits console.error for error level only — so a warning has no node of its own, and mapping it to console.error would steal a real node from a genuine console_error candidate",
+  ],
+  // The five below were ALREADY reasoned about, in `findTemporalNode`: "a KNOWN
+  // detector with NO causal node family ... must NOT temporal-match arbitrary
+  // nodes -- it stays isolated so it never steals a request-spine node from the
+  // candidate that actually belongs to it." That is a deliberate decision, so
+  // filing them as unreviewed debt would report a design choice as an oversight
+  // and inflate the debt count with entries nobody should ever "fix".
+  [
+    "user_marker",
+    "named in findTemporalNode as a known detector with no causal node family: it must not temporal-match arbitrary nodes, or it steals a request-spine node from the candidate that actually belongs to it",
+  ],
+  [
+    "repeated_clicks",
+    "named in findTemporalNode as a known detector with no causal node family: it must not temporal-match arbitrary nodes, or it steals a request-spine node from the candidate that actually belongs to it",
+  ],
+  [
+    "page_probe_failure",
+    "named in findTemporalNode as a known detector with no causal node family: it must not temporal-match arbitrary nodes, or it steals a request-spine node from the candidate that actually belongs to it",
+  ],
+  [
+    "media_degradation",
+    "named in findTemporalNode as a known detector with no causal node family: it must not temporal-match arbitrary nodes, or it steals a request-spine node from the candidate that actually belongs to it",
+  ],
+  [
+    "tab_boundary_gap",
+    "named in findTemporalNode as a known detector with no causal node family: it must not temporal-match arbitrary nodes, or it steals a request-spine node from the candidate that actually belongs to it",
+  ],
+  [
+    "transcript_complaint",
+    "derived from ticket prose rather than from a captured event, so there is no event in this session it could anchor on",
+  ],
+]);
+
+/**
+ * Emitted detectors nobody has yet decided an anchoring for.
+ *
+ * A debt with a ratchet on it, not a classification — see the note on
+ * {@link DETECTOR_ANCHORING_DECLARED}. Entries leave this set by being mapped in
+ * `nodeKindsForDetector` or declared with a reason above, and the conformance test
+ * refuses to let it grow.
+ */
+export const DETECTOR_ANCHORING_UNREVIEWED: ReadonlySet<string> = new Set([
+  "accepted_text_was_truncated",
+  "acknowledged_batch_rows_missing",
+  "acknowledged_state_contradicted_by_read",
+  "acknowledged_write_lost",
+  "acknowledged_write_never_landed",
+  "api_route_returned_document",
+  "batch_applied_count_exceeds_staged_rows",
+  "batch_value_shift",
+  "blocked_script_prevented_action",
+  "cached_empty_result_after_data_arrived",
+  "cart_lost_after_session_expiry",
+  "cart_remerged_on_login",
+  "casefold_duplicate_identity_accepted",
+  "checkout_committed_after_pricing_timeout",
+  "concurrent_duplicate_mutation",
+  "content_type_body_mismatch",
+  "counter_contradiction",
+  "country_postal_validation_mismatch",
+  "cross_user_read",
+  "currency_locale_mismatch",
+  "db_delta_mismatch",
+  "declined_payment_ordered",
+  "derived_count_below_observed_inserts",
+  "display_date_timezone_mismatch",
+  "download_empty_body",
+  "downstream_succeeded_after_timeout",
+  "duplicate_charge",
+  "duplicate_readback",
+  "duplicate_restock",
+  "existing_children_reparented_to_new_row",
+  "filter_contradiction",
+  "form_reset_after_error",
+  "fractional_cent_rounding",
+  "ineffective_input",
+  "ineffective_submit",
+  "inflight_request_invalidated_by_session_rotation",
+  "input_reverted",
+  "interpolation_artifact",
+  "invalid_webhook_signature_accepted",
+  "job_drain_left_work_deferred",
+  "latency_outlier",
+  "layout_overflow",
+  "listener_growth",
+  "locale_decimal_scale_shift",
+  "lost_update",
+  "money_scale_shift",
+  "mutations_missing_entity_audit",
+  "n_plus_one_query",
+  "notification_lifecycle_order_inverted",
+  "order_committed_with_negative_inventory",
+  "orphaned_reference",
+  "pagination_first_page_offset",
+  "pricing_total_ignored_by_checkout",
+  "refund_total_exceeded",
+  "report_total_contradicts_source_row",
+  "request_reconnect_storm",
+  "request_target_row_mismatch",
+  "response_exceeded_requested_limit",
+  "response_race",
+  "result_row_loss",
+  "retry_schedule_clock_shift",
+  "rtl_physical_layout_rules",
+  "runtime_warning",
+  "same_request_row_rewritten",
+  "shared_state_bleed",
+  "stale_client_build",
+  "stale_value_writeback",
+  "stale_view_after_pop",
+  "state_flip_flop",
+  "stored_active_markup",
+  "stream_desync",
+  "ui_api_divergence",
+  "ui_arithmetic_mismatch",
+]);
+
+/**
  * Maps a candidate detector family onto the node kinds it can attribute to. Deterministic; used
  * only by the temporal fallback (precedence step 2) when a candidate has no requestId match.
+ *
+ * An empty result is still an empty result — this function's BEHAVIOUR is unchanged, and
+ * deliberately so. What changed is that falling through is now a declared state rather than a
+ * default nobody sees: see {@link DETECTOR_ANCHORING_DECLARED}.
  */
 function nodeKindsForDetector(detector: string): Set<CausalNodeKind> {
   if (detector.startsWith("backend_"))
