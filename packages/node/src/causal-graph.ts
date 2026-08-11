@@ -655,11 +655,81 @@ export const CAUSAL_MAP_WINDOW_MS = 2000;
 
 export type CausalRole = "root" | "symptom" | "isolated";
 
+/**
+ * Why one candidate ended `isolated`.
+ *
+ * Isolation had exactly one shape in the output — absence — while it has three
+ * materially different causes, and the difference decides whether anything is
+ * wrong at all:
+ *
+ * - `no-node-family` — the detector anchors on nothing this graph builds nodes
+ *   from, so it has no node family and staying isolated is CORRECT. The five
+ *   detectors named in {@link findTemporalNode} and everything in
+ *   {@link DETECTOR_ANCHORING_DECLARED} land here by design.
+ * - `no-compatible-node` — the detector HAS a node family and this session
+ *   simply contained no node of a compatible kind inside the window. Nothing
+ *   was taken from it; there was nothing to take.
+ * - `lost-contention` — a compatible node existed, was in reach, and an
+ *   incumbent candidate already owned it. This candidate lost a contest, and
+ *   the allocator decides that contest by arrival order (`anchor.t`, then
+ *   {@link ownershipPriority}, then id), not by which candidate the node
+ *   actually describes.
+ *
+ * The third was invisible, and its invisibility produced a false statement in
+ * the product's own output: `projectCausalChain` reported every non-root top
+ * candidate as `top_candidate_isolated`, i.e. "this signal could not be placed",
+ * when 40% of the isolated population had in fact been placed and then displaced.
+ * Measured over a 60-cycle run: 54 of 134 isolated candidates across 31 distinct
+ * scenarios were contention losses, and the only way to recover that was to
+ * replay the allocator out of band.
+ */
+export type IsolationCause =
+  | "no-node-family"
+  | "no-compatible-node"
+  | "lost-contention";
+
+/** The node a candidate lost, and to whom. Set only for `lost-contention`. */
+export interface ContentionLoss {
+  /** The graph node this candidate could have taken. */
+  nodeId: string;
+  /** The candidate id that owns that node instead. */
+  heldBy: string;
+  /**
+   * Which precedence step the loss happened at.
+   *
+   * `requestId` is the stronger claim: the node was picked by the candidate's
+   * own request identity (step 1) and was already owned. `temporal` means every
+   * compatible node inside {@link CAUSAL_MAP_WINDOW_MS} was owned (step 2).
+   *
+   * When BOTH are true, `requestId` is reported, because a shared request
+   * identity is a statement about the candidate and temporal proximity is a
+   * statement about the clock. NOTE: the out-of-band replay in the harness
+   * (`agent-eval/harness2/diagnose.mjs`, `classifyIsolated`) tests the temporal
+   * reach FIRST and so labels that same candidate `temporal`. The two artifacts
+   * will disagree on those candidates by design, not by drift.
+   */
+  step: "requestId" | "temporal";
+}
+
 export interface CandidateAttribution {
   causalRole: CausalRole;
   rootCauseId?: string;
   causes?: string[];
   attributionConfidence?: CausalConfidence;
+  /**
+   * Why this candidate is isolated. Present ONLY when `causalRole` is
+   * `isolated`; optional and additive, so no existing consumer changes.
+   *
+   * Absent on the empty-graph short circuit in {@link attributeCandidates}:
+   * with no graph there is no allocation to diagnose, and naming a cause there
+   * would be an assertion about a question nobody asked.
+   */
+  isolationCause?: IsolationCause;
+  /**
+   * The node lost and the candidate holding it. Present ONLY when
+   * `isolationCause` is `lost-contention`.
+   */
+  contention?: ContentionLoss;
 }
 
 export interface AttributableCandidate {
@@ -1182,6 +1252,10 @@ function weakerConfidence(
  * failure over the generic surfacing of the same event (see {@link ownershipPriority}), then the
  * smaller candidate id; the loser falls back to (2)/(3).
  *
+ * An isolated candidate also carries WHY it is isolated — {@link IsolationCause} — and, when it
+ * lost a contest, the node it lost and the candidate holding it ({@link ContentionLoss}). That is
+ * a record of the outcome and nothing more: no candidate's node changes because of it.
+ *
  * Classification (over reverse adjacency effect->cause): nearest candidate-bearing ancestor = root;
  * this candidate becomes a symptom whose rootCauseId is that ancestor and whose attributionConfidence
  * is the WEAKEST edge confidence along the path, then clamped to `low` when both ends of the claim
@@ -1272,11 +1346,25 @@ function attributeCandidatesInternal(
     })[0];
   }
 
+  /**
+   * The outcome of precedence step 2, with the REASON when it produced nothing.
+   *
+   * The node returned in the `node` case is byte-for-byte the node the previous
+   * implementation returned; `lost` is pure observation, computed from the same
+   * predicate with the ownership filter lifted, and is never consulted when
+   * choosing.
+   */
+  type TemporalOutcome =
+    | { node: CausalNode }
+    | { node: undefined; cause: "no-node-family" }
+    | { node: undefined; cause: "no-compatible-node" }
+    | { node: undefined; cause: "lost-contention"; lost: CausalNode };
+
   function findTemporalNode(
     candidateId: string,
     anchor: AttributableCandidate["anchor"],
     excluded: Set<string>,
-  ): CausalNode | undefined {
+  ): TemporalOutcome {
     const detector = detectorById(candidateId);
     // When a detector is known, restrict to its compatible node-kind family. A KNOWN detector with
     // NO causal node family (e.g. page_probe_failure, media_degradation, tab_boundary_gap,
@@ -1292,7 +1380,8 @@ function attributeCandidatesInternal(
     // detector nobody mapped goes silently isolated.
     const kinds =
       detector !== undefined ? nodeKindsFor(detector, anchor) : undefined;
-    if (kinds !== undefined && kinds.size === 0) return undefined;
+    if (kinds !== undefined && kinds.size === 0)
+      return { node: undefined, cause: "no-node-family" };
     // A DB write detector names ONE write. The nearest unowned `db.write` node is some OTHER write
     // of the same request, and handing it that node makes the candidate report a write it does not
     // describe. Worse, it cascades: when a named failure takes the node for the write they share,
@@ -1307,54 +1396,126 @@ function attributeCandidatesInternal(
     // of detectors nobody has hand-checked — the worst place to have it.
     const ownWriteOnly =
       kinds !== undefined && kinds.size === 1 && kinds.has("db.write");
-    const matches = nodes.filter((n) => {
-      if (excluded.has(n.id)) return false;
+    // Every node this candidate is ELIGIBLE for, ownership aside. Splitting the
+    // one filter into eligibility and then ownership is what lets an empty
+    // result say WHICH of the two emptied it. The conditions and their order are
+    // unchanged, and `excluded` is still applied before anything is chosen, so
+    // the selected node cannot move.
+    const eligible = nodes.filter((n) => {
       if (Math.abs(n.t - anchor.t) > CAUSAL_MAP_WINDOW_MS) return false;
       if (kinds && !kinds.has(n.kind)) return false;
       if (ownWriteOnly && n.kind === "db.write" && n.t !== anchor.t)
         return false;
       return true;
     });
-    if (matches.length === 0) return undefined;
-    return [...matches].sort((a, b) => {
-      const da = Math.abs(a.t - anchor.t);
-      const db = Math.abs(b.t - anchor.t);
-      if (da !== db) return da - db;
-      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-    })[0];
+    const nearestFirst = (list: CausalNode[]): CausalNode =>
+      [...list].sort((a, b) => {
+        const da = Math.abs(a.t - anchor.t);
+        const db = Math.abs(b.t - anchor.t);
+        if (da !== db) return da - db;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      })[0];
+
+    const matches = eligible.filter((n) => !excluded.has(n.id));
+    if (matches.length === 0) {
+      // Eligible nodes existed and every one of them is already owned: this
+      // candidate did not fail to find a node, it was outranked for one.
+      if (eligible.length > 0)
+        return {
+          node: undefined,
+          cause: "lost-contention",
+          lost: nearestFirst(eligible),
+        };
+      return { node: undefined, cause: "no-compatible-node" };
+    }
+    return { node: nearestFirst(matches) };
   }
 
-  // Resolve one candidate to a node, arbitrating contention. Returns the node id or undefined.
-  function resolve(candidate: AttributableCandidate): string | undefined {
+  /**
+   * One candidate's mapping outcome: the node it took, or — when it took none —
+   * why.
+   *
+   * The diagnosis is RECORDED, never consulted. Every `nodeToCandidate.set` and
+   * every return value below is the same as before; the only new work is
+   * remembering what the existing branches already knew and used to discard.
+   */
+  interface Resolution {
+    nodeId: string | undefined;
+    cause?: IsolationCause;
+    contention?: ContentionLoss;
+  }
+
+  // Resolve one candidate to a node, arbitrating contention.
+  function resolve(candidate: AttributableCandidate): Resolution {
     const excluded = new Set<string>(nodeToCandidate.keys());
 
     // Precedence 1: requestId match (may already be owned -> arbitrate).
+    let requestIdLoss: ContentionLoss | undefined;
     const reqNode = findRequestIdNode(candidate.id, candidate.anchor);
     if (reqNode) {
       const owner = nodeToCandidate.get(reqNode.id);
       if (owner === undefined) {
         nodeToCandidate.set(reqNode.id, candidate.id);
-        return reqNode.id;
+        return { nodeId: reqNode.id };
       }
       // Contention: smaller anchor.t, then the named failure over the generic plane surfacing of
       // the same event, then smaller id. Since sortedCandidates is processed in that order, the
       // incumbent always wins requestId contention; the loser falls through.
+      //
+      // Falling through is still what happens. What is new is that the loss is
+      // remembered: this candidate and the incumbent named the SAME request, so
+      // if step 2 also fails this is the node it lost and `owner` is who took it.
+      requestIdLoss = { nodeId: reqNode.id, heldBy: owner, step: "requestId" };
     }
 
     // Precedence 2: temporal + compatible-kind fallback over still-unowned nodes.
-    const tempNode = findTemporalNode(candidate.id, candidate.anchor, excluded);
-    if (tempNode) {
-      nodeToCandidate.set(tempNode.id, candidate.id);
-      return tempNode.id;
+    const temporal = findTemporalNode(candidate.id, candidate.anchor, excluded);
+    if (temporal.node) {
+      nodeToCandidate.set(temporal.node.id, candidate.id);
+      return { nodeId: temporal.node.id };
     }
 
-    // Precedence 3: isolated.
-    return undefined;
+    // Precedence 3: isolated — and now it says which of the three isolations it is.
+    // A requestId loss outranks a temporal one: see ContentionLoss.step.
+    if (requestIdLoss)
+      return {
+        nodeId: undefined,
+        cause: "lost-contention",
+        contention: requestIdLoss,
+      };
+    if (temporal.cause === "lost-contention") {
+      const heldBy = nodeToCandidate.get(temporal.lost.id);
+      // `heldBy` is always set — a node is only ineligible here because it is
+      // owned — but the map is the authority, so an unowned node degrades to the
+      // honest weaker answer rather than to an invented incumbent.
+      if (heldBy !== undefined)
+        return {
+          nodeId: undefined,
+          cause: "lost-contention",
+          contention: { nodeId: temporal.lost.id, heldBy, step: "temporal" },
+        };
+      return { nodeId: undefined, cause: "no-compatible-node" };
+    }
+    return { nodeId: undefined, cause: temporal.cause };
   }
 
+  // candidate id -> why it is isolated, for the candidates that took no node.
+  const isolationById = new Map<
+    string,
+    { cause?: IsolationCause; contention?: ContentionLoss }
+  >();
+
   for (const candidate of sortedCandidates) {
-    const nodeId = resolve(candidate);
-    candidateToNode.set(candidate.id, nodeId);
+    const resolution = resolve(candidate);
+    candidateToNode.set(candidate.id, resolution.nodeId);
+    // Only a candidate that ends with NO node is isolated. One that loses the
+    // requestId contest and then wins a temporal node is attributed, and must
+    // carry no contention record at all.
+    if (resolution.nodeId === undefined)
+      isolationById.set(candidate.id, {
+        cause: resolution.cause,
+        contention: resolution.contention,
+      });
   }
 
   // --- 2. Reverse adjacency (effect -> causes) --------------------------------------------------
@@ -1527,7 +1688,12 @@ function attributeCandidatesInternal(
   for (const candidate of candidates) {
     const nodeId = candidateToNode.get(candidate.id);
     if (nodeId === undefined) {
-      attribution.set(candidate.id, { causalRole: "isolated" });
+      const isolation = isolationById.get(candidate.id);
+      attribution.set(candidate.id, {
+        causalRole: "isolated",
+        ...(isolation?.cause ? { isolationCause: isolation.cause } : {}),
+        ...(isolation?.contention ? { contention: isolation.contention } : {}),
+      });
       continue;
     }
     const ancestor = nearestCandidateAncestor(nodeId);

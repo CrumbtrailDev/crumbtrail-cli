@@ -15,7 +15,12 @@ import {
   namesFailureOnGenericPlane,
 } from "./causal-graph";
 import { defaultSessionStore } from "./session-store";
-import type { CausalConfidence, CausalGraph } from "./causal-graph";
+import type {
+  CausalConfidence,
+  CausalGraph,
+  ContentionLoss,
+  IsolationCause,
+} from "./causal-graph";
 import {
   directorySourceMapLookup,
   resolveFrame,
@@ -285,6 +290,20 @@ export interface EvidenceCandidate {
   causes?: string[];
   /** Weakest edge confidence along the causal path from root to this symptom. */
   attributionConfidence?: CausalConfidence;
+  /**
+   * For an isolated candidate, WHY it is isolated. Additive/optional.
+   *
+   * `isolated` used to be one word for three different situations, one of which
+   * — losing a one-candidate-per-node contest — is not an absence of evidence at
+   * all. See {@link IsolationCause}.
+   */
+  isolationCause?: IsolationCause;
+  /**
+   * The node this candidate lost and the candidate that holds it, when
+   * `isolationCause` is `lost-contention`. `heldBy` is a candidate id from THIS
+   * artifact, so a reader can resolve it against the emitted candidates.
+   */
+  contention?: ContentionLoss;
   evidenceWindow: { start: number; end: number; windowId: string };
 }
 
@@ -306,6 +325,9 @@ interface CandidateDraft extends Omit<
   rootCauseId?: string;
   causes?: string[];
   attributionConfidence?: CausalConfidence;
+  isolationCause?: IsolationCause;
+  /** `heldBy` is a dedupeKey here, remapped to the emitted candidate id on emit. */
+  contention?: ContentionLoss;
 }
 
 interface RequestInfo {
@@ -741,6 +763,13 @@ export function buildEvidenceCandidates(
           .filter((v): v is string => v !== undefined)
           .sort((a, b) => a.localeCompare(b))
       : undefined;
+    const heldById = draft.contention
+      ? idByDedupeKey.get(draft.contention.heldBy)
+      : undefined;
+    const contention =
+      draft.contention && heldById
+        ? { ...draft.contention, heldBy: heldById }
+        : undefined;
     return {
       schemaVersion: CANDIDATE_SCHEMA_VERSION,
       id,
@@ -759,6 +788,13 @@ export function buildEvidenceCandidates(
       ...(draft.attributionConfidence
         ? { attributionConfidence: draft.attributionConfidence }
         : {}),
+      ...(draft.isolationCause ? { isolationCause: draft.isolationCause } : {}),
+      // `heldBy` is a dedupeKey inside the attributor; the artifact speaks in
+      // emitted candidate ids, exactly as `rootCauseId` above does. A key that
+      // does not resolve (its candidate was capped out of the emitted set) drops
+      // the whole record rather than shipping a dangling reference — the cause
+      // then reads `lost-contention` with no incumbent named, which is true.
+      ...(contention ? { contention } : {}),
       evidenceWindow: {
         start: window.start,
         end: window.end,
@@ -951,6 +987,13 @@ function applyCausalRerank(
       if (attr.causes !== undefined) draft.causes = attr.causes;
       if (attr.attributionConfidence !== undefined)
         draft.attributionConfidence = attr.attributionConfidence;
+      // Copied field by field like everything above it, so a new attribution
+      // field is inert until it is listed HERE. That is why these two lines
+      // exist: without them the contention record is born invisible and the
+      // product still cannot say why a candidate is isolated.
+      if (attr.isolationCause !== undefined)
+        draft.isolationCause = attr.isolationCause;
+      if (attr.contention !== undefined) draft.contention = attr.contention;
     }
   }
 
