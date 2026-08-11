@@ -692,12 +692,13 @@ describe("early capture — request callsite", () => {
     globalThis.fetch = (async () =>
       new Response("{}", { status: 200, headers: { "content-type": "application/json" } })) as typeof globalThis.fetch;
     try {
-      const capture = installEarlyCapture({ sessionId: "ses_test" });
+      const capture = installEarlyCapture();
+      expect(capture).toBeDefined();
       async function saveAddressFromApplicationCode() {
         await globalThis.fetch("https://api.example.com/addresses", { method: "POST" });
       }
       await saveAddressFromApplicationCode();
-      const [record] = capture.drain();
+      const [record] = capture!.drain();
       expect(record?.stk).toBeTypeOf("string");
       const frames = String(record!.stk).split("\n").slice(1);
       expect(frames[0]).toContain("saveAddressFromApplicationCode");
