@@ -277,3 +277,78 @@ describe('networkCollector – streaming responses', () => {
     expect(res.d.body).toBe('{"done":true}');
   });
 });
+
+/**
+ * Which line of the application asked for the request.
+ *
+ * The frontend half of a linked full-stack request carried no callsite, so a
+ * bundle for a client-plane defect named server files and nothing else. These
+ * pin BOTH directions: the caller is present, and the SDK is not.
+ */
+describe('networkCollector – request callsite', () => {
+  let bus: EventBus;
+  let events: BugEvent[];
+  let cleanup: () => void;
+
+  beforeEach(() => {
+    bus = new EventBus();
+    events = [];
+    bus.subscribe((batch) => events.push(...batch));
+  });
+
+  afterEach(() => {
+    cleanup?.();
+    events = [];
+  });
+
+  async function saveAddressFromApplicationCode() {
+    await globalThis.fetch('https://api.example.com/addresses', {
+      method: 'POST',
+      body: '{"city":"Toronto"}',
+    });
+  }
+
+  it('records the application frame that issued the request', async () => {
+    globalThis.fetch = makeFetchMock('{"ok":true}');
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    await saveAddressFromApplicationCode();
+    bus.flush();
+
+    const [req] = events.filter((e) => e.k === 'net.req');
+    expect(req.d.stk).toBeTypeOf('string');
+    const frames = String(req.d.stk).split('\n').slice(1);
+    expect(frames[0]).toContain('saveAddressFromApplicationCode');
+  });
+
+  it('does not name the collector itself as the callsite', async () => {
+    globalThis.fetch = makeFetchMock('{"ok":true}');
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    await saveAddressFromApplicationCode();
+    bus.flush();
+
+    const [req] = events.filter((e) => e.k === 'net.req');
+    // `network.ts` appearing anywhere in the stack would mean the wrapper's own
+    // frames survived — the failure mode that made the existing console capture
+    // point a reader at the SDK's bundle.
+    expect(String(req.d.stk)).not.toContain('collectors/network.ts');
+    expect(String(req.d.stk)).not.toContain('instrumentedFetch');
+  });
+
+  it('captures the callsite on a request that succeeds', async () => {
+    // The whole point. A 200 produces no error, no console entry and no ranked
+    // failure — and is exactly the shape of a defect where the server did as it
+    // was told and the client asked for the wrong thing.
+    globalThis.fetch = makeFetchMock('{"ok":true}');
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    await saveAddressFromApplicationCode();
+    bus.flush();
+
+    const [req] = events.filter((e) => e.k === 'net.req');
+    const [res] = events.filter((e) => e.k === 'net.res');
+    expect(res.d.st).toBe(200);
+    expect(req.d.stk).toBeTypeOf('string');
+  });
+});

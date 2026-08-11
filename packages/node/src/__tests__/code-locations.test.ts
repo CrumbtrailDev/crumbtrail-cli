@@ -202,3 +202,227 @@ describe("buildCodeLocations", () => {
     ]);
   });
 });
+
+// The client plane.
+//
+// Measured on nine real harness bundles across five scenarios: ZERO carried any
+// code location from the browser. For `autofill-stomped-by-effect`, whose ground
+// truth is a stale closure in a React page, the locations were a Node internal
+// and a backend repository write — the page's own filename appeared nowhere in
+// the 47KB bundle. These pin the plane back on.
+describe("buildCodeLocations — client request callsites", () => {
+  const linkedBundle = (over: Record<string, unknown> = {}): LlmBundle =>
+    ({
+      databaseDiffs: [
+        {
+          requestId: "req-1",
+          callsite: { file: "server/src/repos/addresses-repo.js", line: 20, fn: "insertAddress" },
+        },
+      ],
+      fullStackEvidence: {
+        linked: [
+          {
+            requestId: "req-1",
+            sessionId: "ses-1",
+            frontend: {
+              requestId: "req-1",
+              requestCallsite: {
+                file: "http://127.0.0.1:5637/src/lib/api-addresses.js",
+                line: 12,
+                column: 9,
+                fn: "saveAddress",
+                stack: [
+                  { file: "http://127.0.0.1:5637/src/pages/Account.jsx", line: 88, column: 13, fn: "onSave" },
+                ],
+              },
+            },
+            backend: {},
+          },
+        ],
+        gaps: [],
+      },
+      ...over,
+    }) as unknown as LlmBundle;
+
+  it("emits the client line alongside the server write for one request", () => {
+    const locations = buildCodeLocations(linkedBundle(), [
+      candidate({ id: "cand_0007", anchor: { t: 1, requestId: "req-1" } } as Partial<EvidenceCandidate>),
+    ]);
+    const via = locations?.map((location) => location.via);
+    // Both planes. Before this, the `db.write` branch returned early and the
+    // client line — the one a fix to a client defect has to change — was never
+    // reachable at all.
+    expect(via).toContain("db.write");
+    expect(via).toContain("client.request");
+  });
+
+  it("keeps the component that called the helper, as a caller frame", () => {
+    const locations = buildCodeLocations(linkedBundle(), [
+      candidate({ id: "cand_0007", anchor: { t: 1, requestId: "req-1" } } as Partial<EvidenceCandidate>),
+    ]);
+    const client = locations?.find((location) => location.via === "client.request");
+    expect(client?.path).toBe("http://127.0.0.1:5637/src/lib/api-addresses.js");
+    expect(client?.fn).toBe("saveAddress");
+    // The helper is shared by every request in the app; Account.jsx is the file
+    // the defect is in. Losing the caller chain would name the wrong one.
+    expect(client?.callers?.[0]?.path).toBe("http://127.0.0.1:5637/src/pages/Account.jsx");
+  });
+
+  it("emits a client location for a request the server never answered", () => {
+    // A gap is a frontend request with no backend counterpart — a client-side
+    // story by construction, and the case where the client line is the only one.
+    const bundle = {
+      databaseDiffs: [],
+      fullStackEvidence: {
+        linked: [],
+        gaps: [
+          {
+            type: "frontend_only",
+            requestId: "req-9",
+            frontend: {
+              requestId: "req-9",
+              requestCallsite: { file: "http://127.0.0.1:5637/src/lib/thirdparty.js", line: 4, column: 1 },
+            },
+          },
+        ],
+      },
+    } as unknown as LlmBundle;
+    const locations = buildCodeLocations(bundle, []);
+    expect(locations?.[0]?.via).toBe("client.request");
+    expect(locations?.[0]?.path).toBe("http://127.0.0.1:5637/src/lib/thirdparty.js");
+  });
+
+  it("is still undefined when the browser captured no callsite", () => {
+    // The negative direction. Without it, a change that emitted a client
+    // location unconditionally — from a request id alone, with no frame behind
+    // it — would pass every test above.
+    const bundle = {
+      databaseDiffs: [],
+      fullStackEvidence: {
+        linked: [{ requestId: "req-2", sessionId: "s", frontend: { requestId: "req-2" }, backend: {} }],
+        gaps: [],
+      },
+    } as unknown as LlmBundle;
+    expect(buildCodeLocations(bundle, [])).toBeUndefined();
+  });
+});
+
+describe("buildCodeLocations — the unranked client tail", () => {
+  const helper = (line: number) => ({
+    file: "http://127.0.0.1:5637/src/lib/api.js",
+    line,
+    column: 9,
+    fn: "request",
+  });
+
+  const linkedWith = (requestIds: string[], lineFor: (id: string, i: number) => number): LlmBundle =>
+    ({
+      databaseDiffs: [],
+      fullStackEvidence: {
+        linked: requestIds.map((requestId, i) => ({
+          requestId,
+          sessionId: "s",
+          frontend: { requestId, requestCallsite: helper(lineFor(requestId, i)) },
+          backend: {},
+        })),
+        gaps: [],
+      },
+    }) as unknown as LlmBundle;
+
+  it("labels a client location no candidate ranked as unranked", () => {
+    // The request id is NOT a signal id. `signalId` is what makes a location
+    // checkable — a reader follows it back to the claim behind the path — and a
+    // request id sends them looking for a signal that does not exist.
+    const locations = buildCodeLocations(linkedWith(["req-9"], () => 40), []);
+    expect(locations?.[0]?.signalId).toBe("unranked");
+    expect(locations?.[0]?.signalId).not.toBe("req-9");
+  });
+
+  it("leaves a ranked request's own signal id alone", () => {
+    const locations = buildCodeLocations(
+      linkedWith(["req-a", "req-b"], (_id, i) => 12 + i),
+      [candidate({ id: "cand_0001", anchor: { t: 1, requestId: "req-a" } } as never)],
+    );
+    const ranked = locations?.find((location) => location.line === 12);
+    const tail = locations?.find((location) => location.line === 13);
+    expect(ranked?.signalId).toBe("cand_0001");
+    expect(tail?.signalId).toBe("unranked");
+  });
+
+  it("still stops at the cap when a candidate yields two locations", () => {
+    // Eleven single-location candidates take the count to MAX - 1, so the
+    // twelfth — which yields BOTH a server write and a client request — is the
+    // one that overflows an array whose cap is only checked at the loop top.
+    const singles = Array.from({ length: MAX_CODE_LOCATIONS - 1 }, (_, i) =>
+      candidate({ id: `cand_s${i}`, anchor: { t: i, frame: `file-${i}.js:1` } } as never),
+    );
+    const bundle = {
+      databaseDiffs: [{ requestId: "req-x", callsite: { file: "server/w.js", line: 1 } }],
+      fullStackEvidence: {
+        linked: [
+          {
+            requestId: "req-x",
+            sessionId: "s",
+            frontend: { requestId: "req-x", requestCallsite: { file: "http://h/c.js", line: 1 } },
+            backend: {},
+          },
+        ],
+        gaps: [],
+      },
+    } as unknown as LlmBundle;
+    const locations = buildCodeLocations(bundle, [
+      ...singles,
+      candidate({ id: "cand_both", anchor: { t: 99, requestId: "req-x" } } as never),
+    ]);
+    expect(locations).toHaveLength(MAX_CODE_LOCATIONS);
+  });
+});
+
+/**
+ * The flag on the OTHER road into this function.
+ *
+ * `sourceMapped` was set only from `anchor.minifiedFrame`, which a structured
+ * client callsite never has — so a client location resolved through a source map
+ * arrived looking exactly like a direct frame. That is the same "a build artifact
+ * presented as a fact" problem the flag was added to prevent, on the path that
+ * needs it most: a browser frame is minified far more often than a server one.
+ */
+describe("buildCodeLocations — a mapped client callsite says so", () => {
+  const bundleWithClientCallsite = (callsite: unknown) =>
+    ({
+      fullStackEvidence: {
+        linked: [{ requestId: "req-1", frontend: { requestCallsite: callsite } }],
+      },
+    }) as unknown as Parameters<typeof buildCodeLocations>[0];
+
+  it("marks a client location that a source map resolved", () => {
+    const locations = buildCodeLocations(
+      bundleWithClientCallsite({
+        file: "client/src/pages/Account.jsx",
+        line: 88,
+        column: 13,
+        minifiedFile: "https://app.example.test/assets/index-a3f2c1.js",
+      }),
+      [candidate({ id: "cand_0001", anchor: { t: 1, requestId: "req-1" } } as never)],
+    );
+    expect(locations?.[0]).toMatchObject({
+      path: "client/src/pages/Account.jsx",
+      via: "client.request",
+      sourceMapped: true,
+    });
+  });
+
+  it("does not mark one the runtime reported directly", () => {
+    // The negative half. Without it the flag could be attached unconditionally
+    // and every assertion above would still pass.
+    const locations = buildCodeLocations(
+      bundleWithClientCallsite({
+        file: "http://127.0.0.1:5637/src/pages/Account.jsx",
+        line: 88,
+        column: 13,
+      }),
+      [candidate({ id: "cand_0001", anchor: { t: 1, requestId: "req-1" } } as never)],
+    );
+    expect(locations?.[0]?.sourceMapped).toBeUndefined();
+  });
+});

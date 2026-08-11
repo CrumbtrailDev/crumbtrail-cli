@@ -27,6 +27,7 @@ import {
   type EarlyRequestRecord,
 } from "../early-capture";
 import { now } from "../utils";
+import { captureCallStack } from "../call-stack";
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -536,6 +537,9 @@ function wrapFetch(
     const id = nextId++;
     const method = extractMethod(input, init);
     const startTime = now();
+    // Synchronously, before the first await: after one the application's frames
+    // are gone from the stack and what remains is the microtask that resumed us.
+    const callStack = captureCallStack(instrumentedFetch);
     const fetchArgs = applyFetchCorrelationHeaders(
       input,
       init,
@@ -584,6 +588,23 @@ function wrapFetch(
       );
       applyBodyResult(reqData, bodyResult);
       reqMetadata.push(bodyResult.metadata);
+    }
+
+    // Which line of the application asked for this request.
+    //
+    // The backend half of a linked full-stack request has carried a callsite for
+    // a while (`responseCallsite`, and the callsites riding on `db.diff`); the
+    // frontend half carried none, so a bundle for a defect that never reached
+    // the server — or reached it and got a correct 200 back — named no client
+    // file at all. The rationale written for the backend field applies here
+    // unchanged: a page that renders wrong without throwing had no pointer.
+    if (callStack !== undefined) {
+      const stackResult = redactNetworkTextBody(callStack, {
+        contentType: "text/plain",
+        path: "stk",
+      });
+      if (stackResult.body !== undefined) reqData.stk = stackResult.body;
+      reqMetadata.push(stackResult.metadata);
     }
 
     attachRedactionMetadata(reqData, ...reqMetadata);
@@ -1220,6 +1241,19 @@ function emitEarlyRecord(
     applyBodyResult(reqData, bodyResult);
     applyGraphqlIdentity(reqData, record.reqBody);
     reqMetadata.push(bodyResult.metadata);
+  }
+
+  // The callsite the EARLY snippet captured, replayed with the rest of the
+  // record. In an application that installs the snippet this is the only path a
+  // `net.req` takes — measured at 26 of 26 in a captured session — so a callsite
+  // on `wrapFetch` alone would be a producer nothing downstream ever sees.
+  if (record.stk) {
+    const stackResult = redactNetworkTextBody(record.stk, {
+      contentType: "text/plain",
+      path: "stk",
+    });
+    if (stackResult.body !== undefined) reqData.stk = stackResult.body;
+    reqMetadata.push(stackResult.metadata);
   }
 
   attachRedactionMetadata(reqData, ...reqMetadata);
