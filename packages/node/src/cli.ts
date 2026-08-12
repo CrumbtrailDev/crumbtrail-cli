@@ -21,6 +21,7 @@ import {
 import { runScan } from "./run-scan";
 import { runFixContext } from "./run-fix-context";
 import { runInspect } from "./run-inspect";
+import { runBacktest } from "./run-backtest";
 import { runReanalyze } from "./run-reanalyze";
 import { runCompare } from "./run-compare";
 import { setCaptureInputValues } from "crumbtrail-core";
@@ -60,6 +61,7 @@ Commands:
   inspect   Summarize a finalized session's manifest + artifacts (hot-plane only)
   compare   Compare two recorded sessions or releases
   reanalyze Rebuild finalized sessions' artifacts with the current analyzer
+  backtest  Replay finalized sessions and report what would change, writing nothing
   help      Show this help
 
 Global options:
@@ -155,6 +157,24 @@ Options:
 Examples:
   crumbtrail-server reanalyze ses_123
   crumbtrail-server reanalyze --all --dry-run`,
+  backtest: `crumbtrail-server backtest — replay finalized sessions and report what would change
+
+Answers "what would the current analyzer flag on evidence I already have?" before
+anything is rewritten. Each session's artifacts are copied to a temp directory, the
+replay runs there, and the candidates it produces are diffed against the stored ones.
+The session directory is only ever read, so the evidence being tested against is
+never the thing the test changes. Use reanalyze when you want the stored artifacts
+rebuilt for real.
+
+Options:
+  <session>   Session id (resolved under the sessions dir) or a path to a session directory
+  --all       Back test every finalized session under the sessions dir
+  --json      Emit the per-session diff and totals as JSON
+  --output    Sessions directory used to resolve a bare session id or --all
+
+Examples:
+  crumbtrail-server backtest ses_123
+  crumbtrail-server backtest --all --json`,
   inspect: `crumbtrail-server inspect — summarize a finalized session's manifest + artifacts
 
 Reads hot-plane artifacts only (manifest.json, else index.json); never the raw event log.
@@ -293,6 +313,10 @@ export async function runCli(argv: string[]): Promise<number> {
     return await runReanalyze(rest);
   }
 
+  if (command === "backtest") {
+    return await runBacktest(rest);
+  }
+
   // command === 'serve'
   const {
     port,
@@ -392,7 +416,9 @@ export function startupMessages(config: CliConfig): string[] {
   // Said at boot for the mirror-image reason: it is the one setting here that makes the server store
   // LESS than it does by default, and an operator who set it wants to see that it took.
   if (!config.captureInputValues) {
-    messages.push("Input values are not stored: nothing a user types is recorded");
+    messages.push(
+      "Input values are not stored: nothing a user types is recorded",
+    );
   }
   if (config.ai) {
     messages.push(
