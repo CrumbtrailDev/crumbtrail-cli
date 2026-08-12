@@ -47,6 +47,7 @@ function liveSession(): {
       url: "/api/login",
       st: 401,
       id: `b${i}`,
+      requestId: `shared-login-${i}`,
     });
     events.push({
       t: at(seconds),
@@ -80,6 +81,7 @@ function liveSession(): {
     url: "/api/me",
     st: 401,
     id: "bme",
+    requestId: "shared-me",
   });
   events.push({
     t: at(436),
@@ -138,6 +140,7 @@ function liveSession(): {
     url: "/api/checkout",
     st: 400,
     id: "bck",
+    requestId: "shared-checkout",
   });
   events.push({
     t: at(499),

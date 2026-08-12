@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { BugEvent, TargetDescriptor } from "crumbtrail-core";
-import { writeEvidenceIndex } from "../evidence-index";
+import { buildEvidenceCandidates, writeEvidenceIndex } from "../evidence-index";
 
 describe("evidence-index mixed page evidence artifacts", () => {
   let tmpDir: string;
@@ -803,5 +803,89 @@ describe("evidence-index mixed page evidence artifacts", () => {
     );
     expect(candidate).toBeDefined();
     expect(candidate?.anchor.frame).toBeUndefined();
+  });
+});
+
+/**
+ * A frontend candidate must be stamped with the identity the backend also holds.
+ *
+ * The browser network collector numbers its own requests with `nextId++`, which
+ * restarts at 1 on every page load, and separately stamps the shared correlation
+ * id (`X-Crumbtrail-Request-Id`) on the request, response and error of the same
+ * exchange. Anchoring a candidate on the counter left the two planes unable to
+ * join on identity at all.
+ */
+describe("evidence-index frontend candidate correlation identity", () => {
+  const CORRELATION_ID = "4bf92f3577b34da6a3ce929d0e0e4736";
+
+  /**
+   * One failed exchange as post-process emits it: a `net.req`/`net.res` pair
+   * carrying the page-local id 7, plus the `failedReqs` index entry derived from
+   * that response. `correlationId` is stamped on all three when the exchange
+   * carried correlation headers, and on none of them when it did not.
+   */
+  function failedExchange(correlationId?: string) {
+    const correlation =
+      correlationId === undefined ? {} : { requestId: correlationId };
+    const events: BugEvent[] = [
+      {
+        t: 1000,
+        k: "net.req",
+        offsetMs: 0,
+        d: { id: 7, m: "POST", url: "/api/checkout", ...correlation },
+      },
+      {
+        t: 1050,
+        k: "net.res",
+        offsetMs: 50,
+        d: { id: 7, st: 500, ...correlation },
+      },
+    ];
+    const failedReq = {
+      t: 1050,
+      m: "POST",
+      url: "/api/checkout",
+      st: 500,
+      id: 7,
+      reason: "http_status",
+      ...correlation,
+    };
+    return buildEvidenceCandidates(events, {
+      id: "ses_correlation",
+      start: 1000,
+      failedReqs: [failedReq],
+    }).find((candidate) => candidate.detector === "http_error");
+  }
+
+  it("anchors on the shared correlation id, not the page-local counter", () => {
+    const candidate = failedExchange(CORRELATION_ID);
+    expect(candidate).toBeDefined();
+    expect(candidate!.anchor.requestId).toBe(CORRELATION_ID);
+    expect(candidate!.anchor.requestId).not.toBe("7");
+    // The transport-local join still resolves the originating request, so the
+    // candidate keeps the method and url it reads from `net.req`.
+    expect(candidate!.anchor.method).toBe("POST");
+    expect(candidate!.anchor.url).toBe("/api/checkout");
+  });
+
+  it("falls back to the page-local counter when the exchange carried no correlation id", () => {
+    const candidate = failedExchange(undefined);
+    expect(candidate).toBeDefined();
+    expect(candidate!.anchor.requestId).toBe("7");
+    expect(candidate!.anchor.method).toBe("POST");
+    expect(candidate!.anchor.url).toBe("/api/checkout");
+  });
+
+  it("keeps the two kinds of id distinguishable by shape", () => {
+    // The contract downstream consumers read: a bare run of digits is a browser
+    // counter, anything else is a correlation id.
+    const localCounter = failedExchange(undefined)!.anchor.requestId!;
+    const correlation = failedExchange(CORRELATION_ID)!.anchor.requestId!;
+    expect(localCounter).toMatch(/^\d+$/);
+    expect(correlation).not.toMatch(/^\d+$/);
+
+    // An all-digit correlation id would be read as a counter, so it is refused
+    // and the page-local id stands rather than a value nothing can classify.
+    expect(failedExchange("123456")!.anchor.requestId).toBe("7");
   });
 });

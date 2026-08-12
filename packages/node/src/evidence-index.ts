@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import {
+  CRUMBTRAIL_REQUEST_ID_MAX_LENGTH,
   redactTokenLikeString,
   redactUrl as redactCoreUrl,
   type BrowserRedactionPolicy,
@@ -149,7 +150,10 @@ export interface EvidenceIndexInput {
       m?: string;
       url?: string;
       st?: number;
+      /** Browser-local sequence number, restarted at 1 on every page load. */
       id?: string | number;
+      /** Shared correlation id, when the exchange carried one. See {@link requestIdForValue}. */
+      requestId?: string;
       reason?: string;
       code?: string;
       message?: string;
@@ -158,7 +162,10 @@ export interface EvidenceIndexInput {
     networkErrors?: Array<{
       t: number;
       offsetMs?: number;
+      /** Browser-local sequence number, restarted at 1 on every page load. */
       id?: string | number;
+      /** Shared correlation id, when the exchange carried one. See {@link requestIdForValue}. */
+      requestId?: string;
       method?: string;
       m?: string;
       url?: string;
@@ -457,8 +464,13 @@ export function buildEvidenceCandidates(
     // an "HTTP 0" candidate here would double-count the same failure.
     if (failed.reason === "network_error") continue;
     const response = responseForFailedRequest(events, failed);
+    // Two different ids, deliberately. `requestById` is keyed by the transport's
+    // own page-local sequence number, so the lookup has to use that; the anchor
+    // publishes the shared correlation id, which is the only key the backend
+    // plane also holds.
+    const transportId = response ? networkRequestId(response.d.id) : undefined;
+    const req = transportId ? requestById.get(transportId) : undefined;
     const reqId = requestIdForEvent(response);
-    const req = reqId ? requestById.get(reqId) : undefined;
     const detector =
       failed.reason === "application_failure"
         ? "app_2xx_failure"
@@ -12518,7 +12530,36 @@ function requestIdForEvent(event: BugEvent | undefined): string | undefined {
   return requestIdForValue(event.d);
 }
 
+/**
+ * A browser-local network id is a bare run of digits — `nextId++` from the page's
+ * network collector. A shared correlation id never is: it is either a 32 hex
+ * character W3C trace id or a `req_`-prefixed token. Consumers on the other side
+ * of the bundle read the shape to tell the two apart, so a correlation id that
+ * happened to be all digits would be read as a page counter and is refused here.
+ */
+const LOCAL_NETWORK_ID_SHAPE = /^\d+$/;
+
+/**
+ * The identity to join one network exchange on.
+ *
+ * Prefers the shared correlation id (`X-Crumbtrail-Request-Id`, stamped on the
+ * request, response and error of the same exchange by the browser collector and
+ * echoed by the backend), because that is the only id both planes hold. The
+ * browser-local sequence number is the fallback for an exchange that carried no
+ * correlation headers — it restarts at 1 on every page load, so it can only ever
+ * join browser events to each other.
+ */
 function requestIdForValue(value: Record<string, unknown>): string | undefined {
+  const correlationId = safeText(
+    value.requestId,
+    CRUMBTRAIL_REQUEST_ID_MAX_LENGTH,
+  );
+  if (
+    correlationId !== undefined &&
+    !LOCAL_NETWORK_ID_SHAPE.test(correlationId)
+  )
+    return correlationId;
+
   const numericId = finiteNumber(value.id);
   return numericId !== undefined ? String(numericId) : safeText(value.id, 120);
 }
