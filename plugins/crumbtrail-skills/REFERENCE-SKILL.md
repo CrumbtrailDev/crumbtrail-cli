@@ -1,6 +1,6 @@
 ---
 name: reference
-description: Worked example and template for a Crumbtrail failure archetype skill. Read this before writing a new archetype skill. This is a template rather than an archetype, so it will not help you diagnose anything on its own.
+description: Worked example and template for a Crumbtrail failure archetype skill. Read this before writing a new archetype skill. It lives outside `skills/` because it is a template rather than an archetype, so no loader installs it and it will not help you diagnose anything on its own.
 ---
 
 # Reference shape for a Crumbtrail archetype skill

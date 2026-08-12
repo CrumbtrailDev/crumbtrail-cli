@@ -470,7 +470,11 @@ export function buildEvidenceCandidates(
     // plane also holds.
     const transportId = response ? networkRequestId(response.d.id) : undefined;
     const req = transportId ? requestById.get(transportId) : undefined;
-    const reqId = requestIdForEvent(response);
+    // The index entry carries the correlation id too, stamped at post-process
+    // time. Fall back to it when the `net.res` event is missing — capture
+    // truncation drops events long before it drops index entries, and an
+    // anchor with no requestId is one the backend plane cannot join to.
+    const reqId = requestIdForEvent(response) ?? requestIdForValue(failed);
     const detector =
       failed.reason === "application_failure"
         ? "app_2xx_failure"

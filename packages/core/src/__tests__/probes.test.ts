@@ -206,6 +206,77 @@ describe("failure discipline", () => {
     expect(itemsRead).toBe(0);
   });
 
+  it("stops walking a storage area the moment the deadline fires mid iteration", async () => {
+    // The loop over one area is synchronous, so a real timer can never interleave with it and the
+    // per-iteration abort check can only be reached by firing the deadline from inside the loop
+    // itself. Fake timers make that possible: `key(0)` advances past the 20ms deadline, which
+    // aborts the controller synchronously, and the check at the top of the next iteration refuses
+    // the remaining 499 keys.
+    vi.useFakeTimers();
+    try {
+      let itemsRead = 0;
+      const watched: ProbeStorageLike = {
+        get length() {
+          return 500;
+        },
+        key: (index: number) => {
+          itemsRead += 1;
+          if (index === 0) vi.advanceTimersByTime(30);
+          return `k${index}`;
+        },
+        getItem: () => "v",
+      };
+
+      const result = await runProbe("storage.snapshot", {
+        timeoutMs: 20,
+        getStorageAreas: () => [{ area: "local", storage: watched }],
+      });
+
+      expect(result.ok).toBe(false);
+      // Exactly one key was read before the abort was noticed. Without the per-iteration check
+      // this walks all 500 and hands the deadline no way to stop it.
+      expect(itemsRead).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never rejects because the host's own clock threw", async () => {
+    // `ctx.now` is host code, and rule 1 does not have an exception for it. Both the opening
+    // reading and the one taken while handling the failure go through it.
+    const trap = trapUnhandledRejections();
+    try {
+      const result = await runProbe("flags.current", {
+        now: () => {
+          throw new Error("clock exploded");
+        },
+        getDeclaredEnv: () => {
+          throw new Error("provider exploded");
+        },
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toBe("provider exploded");
+      expect(result.latencyMs).toBeGreaterThanOrEqual(0);
+
+      await flushMicrotasks();
+      expect(trap.seen).toEqual([]);
+    } finally {
+      trap.stop();
+    }
+  });
+
+  it("still answers when the host's clock throws on a probe that succeeds", async () => {
+    const result = await runProbe("runtime.env", {
+      now: () => {
+        throw new Error("clock exploded");
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.latencyMs).toBeGreaterThanOrEqual(0);
+  });
+
   it("turns a throwing probe into ok:false and never propagates", async () => {
     const trap = trapUnhandledRejections();
     try {

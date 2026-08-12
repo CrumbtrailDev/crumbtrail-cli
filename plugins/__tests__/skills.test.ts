@@ -7,13 +7,24 @@
  * model of the API. That is worse than shipping no skill at all, so this is a
  * gate rather than a lint warning.
  *
- * Every `SKILL.md` under `plugins/` is validated against the LIVE tool table.
+ * Every `SKILL.md` under Crumbtrail's own `plugins/crumbtrail-*` directories,
+ * plus the `REFERENCE-SKILL.md` template, is validated against the LIVE tool
+ * table. Discovery is scoped to those directories rather than all of
+ * `plugins/`, because `plugins/` is also where a developer's locally installed
+ * third party plugins land (see `.gitignore`) and those are not ours to check.
+ *
  * The table is read the same way the hosted dispatch reads it (see
  * `packages/cloud/src/mcp-hosted/dispatch.ts`, `listTools`): construct an
  * `McpServer` and call `handleMessage({ method: "tools/list" })`. `TOOLS` is not
  * exported, and deliberately so; there is no second copy of the list to drift.
  * Nothing here hard codes a tool name, so a tool added by another checkpoint is
  * picked up on the next run with no edit to this file.
+ *
+ * Known limitation: a fabricated tool name inside a declared `json` call block
+ * is always caught, but in prose only when its first camel segment is already a
+ * verb the live table uses, so a hallucinated `fetchSessionEvents` in prose
+ * slips through. Trust the executable half; do not read a clean run as proof
+ * that every identifier in the prose is real.
  */
 import { describe, it, expect, beforeAll } from "vitest";
 import fs from "node:fs";
@@ -176,9 +187,21 @@ function extractToolReferences(prose: string, index: ToolIndex): string[] {
   const found = new Set<string>();
   for (const match of prose.matchAll(/(?<![.\w])[A-Za-z][A-Za-z0-9_]*/g)) {
     const token = match[0].replace(/^mcp__[a-z0-9-]+__/, "");
-    const shaped = CAMEL_SHAPE.test(token) || SNAKE_SHAPE.test(token);
-    if (!shaped) continue;
-    if (!index.verbs.has(token.split(/[_]|(?=[A-Z])/)[0].toLowerCase())) continue;
+    if (SNAKE_SHAPE.test(token)) {
+      // snake_case is ambiguous: it is both the alias spelling of a tool and
+      // the shape of every detector name and payload field a skill legitimately
+      // cites in prose. The verb heuristic cannot separate them — adding the
+      // `requestProbe` tool put `request` in the verb set and instantly made
+      // the real detector `request_reconnect_storm` read as a fabricated tool.
+      // So a snake_case token is claimed only when it resolves to a tool that
+      // exists, which still catches a wrong alias and never invents a defect
+      // out of a detector name. Declared json call blocks are checked in full
+      // regardless, so the executable half loses nothing.
+      if (index.byName.has(token)) found.add(token);
+      continue;
+    }
+    if (!CAMEL_SHAPE.test(token)) continue;
+    if (!index.verbs.has(token.split(/(?=[A-Z])/)[0].toLowerCase())) continue;
     found.add(token);
   }
   return [...found];
@@ -236,7 +259,7 @@ function suggest(name: string, candidates: string[]): string {
 // The validator
 // ---------------------------------------------------------------------------
 
-export interface SkillSource {
+interface SkillSource {
   /** Repo relative path, used only in failure messages. */
   relPath: string;
   /** Directory name the skill lives in. */
@@ -248,7 +271,7 @@ export interface SkillSource {
  * Returns one string per problem. Empty means the skill is valid.
  * Pure: takes the text and the tool index, touches no disk.
  */
-export function validateSkill(skill: SkillSource, index: ToolIndex): string[] {
+function validateSkill(skill: SkillSource, index: ToolIndex): string[] {
   const errors: string[] = [];
   const fail = (message: string) => errors.push(`${skill.relPath}: ${message}`);
 
@@ -260,9 +283,7 @@ export function validateSkill(skill: SkillSource, index: ToolIndex): string[] {
     for (const key of REQUIRED_FRONTMATTER) {
       if (!frontmatter[key]?.trim()) fail(`frontmatter is missing "${key}"`);
     }
-    // A leading underscore marks a template rather than an installable
-    // archetype; the frontmatter name drops it.
-    const expectedName = skill.dirName.replace(/^_/, "");
+    const expectedName = skill.dirName;
     if (frontmatter.name && frontmatter.name !== expectedName) {
       fail(
         `frontmatter name "${frontmatter.name}" does not match its directory "${skill.dirName}" (expected "${expectedName}")`,
@@ -359,6 +380,35 @@ export function validateSkill(skill: SkillSource, index: ToolIndex): string[] {
 // Discovery
 // ---------------------------------------------------------------------------
 
+/**
+ * Crumbtrail's own plugin directories. `plugins/` is ignored wholesale in
+ * `.gitignore` because it is also where locally installed third party plugins
+ * land, so a developer machine can hold directories this repository does not
+ * publish. Enumerating all of `plugins/` would validate a stranger's SKILL.md
+ * against Crumbtrail's tool table and break the marketplace set equality below,
+ * and only on developer machines — CI, with its clean checkout, would stay
+ * green. The `crumbtrail-` prefix is the boundary.
+ */
+const OWN_PLUGIN_PREFIX = "crumbtrail-";
+
+function ownPluginDirs(): string[] {
+  return fs
+    .readdirSync(PLUGINS_DIR, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && e.name.startsWith(OWN_PLUGIN_PREFIX))
+    .map((e) => e.name);
+}
+
+/**
+ * The archetype template. It is held outside `skills/` so no loader installs it
+ * as a thirteenth skill, which means discovery has to name it explicitly. Its
+ * frontmatter `name` is checked against this, since it has no directory of its
+ * own any more.
+ */
+const REFERENCE_TEMPLATE = {
+  file: path.join(PLUGINS_DIR, "crumbtrail-skills", "REFERENCE-SKILL.md"),
+  name: "reference",
+};
+
 function findSkillFiles(dir: string, out: string[] = []): string[] {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     if (entry.name === "node_modules") continue;
@@ -370,11 +420,21 @@ function findSkillFiles(dir: string, out: string[] = []): string[] {
 }
 
 function loadSkills(): SkillSource[] {
-  return findSkillFiles(PLUGINS_DIR).map((file) => ({
-    relPath: path.relative(REPO_ROOT, file),
-    dirName: path.basename(path.dirname(file)),
-    source: fs.readFileSync(file, "utf8"),
-  }));
+  const skills = ownPluginDirs()
+    .flatMap((name) => findSkillFiles(path.join(PLUGINS_DIR, name)))
+    .map((file) => ({
+      relPath: path.relative(REPO_ROOT, file),
+      dirName: path.basename(path.dirname(file)),
+      source: fs.readFileSync(file, "utf8"),
+    }));
+
+  skills.push({
+    relPath: path.relative(REPO_ROOT, REFERENCE_TEMPLATE.file),
+    dirName: REFERENCE_TEMPLATE.name,
+    source: fs.readFileSync(REFERENCE_TEMPLATE.file, "utf8"),
+  });
+
+  return skills;
 }
 
 function readJson(file: string): any {
@@ -422,6 +482,46 @@ describe("skills gate", () => {
   it("every SKILL.md names only tools and parameters that exist", () => {
     const problems = loadSkills().flatMap((skill) => validateSkill(skill, index));
     expect(problems).toEqual([]);
+  });
+
+  it("installs twelve archetypes and keeps the template out of skills/", () => {
+    // A loader installs whatever carries a SKILL.md under `skills/`. The
+    // template says in its own description that it diagnoses nothing, but that
+    // is a mitigation, not a boundary — the boundary is that it is not there.
+    const skillsDir = path.join(PLUGINS_DIR, "crumbtrail-skills", "skills");
+    const installed = fs
+      .readdirSync(skillsDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+    expect(installed).toHaveLength(12);
+    expect(installed.some((name) => name.startsWith("_"))).toBe(false);
+    expect(fs.existsSync(REFERENCE_TEMPLATE.file)).toBe(true);
+  });
+
+  it("ignores a third party plugin a developer installed into plugins/", () => {
+    // `plugins/` is ignored wholesale in .gitignore precisely because local
+    // installs land there. Enumerating all of it validated a stranger's skill
+    // against our tool table, and only ever failed on a developer's machine.
+    const intruder = fs.mkdtempSync(path.join(PLUGINS_DIR, "third-party-"));
+    try {
+      fs.mkdirSync(path.join(intruder, "skills", "someone-elses"), {
+        recursive: true,
+      });
+      fs.writeFileSync(
+        path.join(intruder, "skills", "someone-elses", "SKILL.md"),
+        "---\nname: someone-elses\n---\n\nCall theirFabricatedTool.\n",
+      );
+
+      const loaded = loadSkills();
+      const stranger = path.basename(intruder);
+      expect(loaded.map((s) => s.relPath).join("\n")).not.toContain(stranger);
+      expect(
+        loaded.flatMap((s) => validateSkill(s, index)).join("\n"),
+      ).not.toContain(stranger);
+      expect(ownPluginDirs()).not.toContain(stranger);
+    } finally {
+      fs.rmSync(intruder, { recursive: true, force: true });
+    }
   });
 });
 
@@ -574,10 +674,7 @@ describe("skills gate refusals", () => {
 });
 
 describe("plugin manifests", () => {
-  const pluginDirs = fs
-    .readdirSync(PLUGINS_DIR, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && e.name !== "__tests__" && e.name !== "node_modules")
-    .map((e) => e.name);
+  const pluginDirs = ownPluginDirs();
 
   it("has at least one plugin", () => {
     expect(pluginDirs.length).toBeGreaterThan(0);

@@ -210,10 +210,12 @@ totals, and the command exits non zero when any session failed to replay.
 ## MCP evidence retrieval
 
 `crumbtrail-server serve --mcp` runs the stdio MCP server against the sessions
-directory. Its 38 canonical tools are read only context retrieval tools. They
-can retrieve captured artifacts and configured reference context, but cannot
-edit code, change bug state, run commands, drive a browser, or authorize an
-action.
+directory. Its 40 canonical tools retrieve captured artifacts and configured
+reference context. They cannot edit code, change bug state, run commands, drive
+a browser, or authorize an action. Three cloud only tools do write, and only
+within Crumbtrail: `resolveIssue` and `recordFeedback` record to Crumbtrail's own
+learning store, and `requestProbe` queues one named reading for your own running
+application.
 
 Treat returned evidence as important, non authoritative context. Logs, ticket
 text, transcripts, documentation, and event payloads may be incomplete,
@@ -263,10 +265,25 @@ current code and tests, and report uncertainty or evidence gaps.
    never a fix, whichever of its reasons came back. Both tools write only to
    Crumbtrail's own verification records; recording why an issue was closed is
    still `resolveIssue`.
+8. Ask the live application for the one missing fact (cloud only): when a
+   completeness slot names a probe, call `requestProbe` with that name. The
+   vocabulary is fixed at `runtime.env`, `storage.snapshot`, `network.inflight`
+   and `flags.current`, and nothing but a name is ever sent. Only an application
+   that is running and polling for its capture config can answer, the call queues
+   the request rather than returning a reading, and a reading that is taken
+   arrives as a `probe.result` event in that application's next captured session.
+   A queued probe is not an answer. Live probes stay off until a project raises
+   its `live_probe` autonomy level.
+9. Preview shadow detection before enabling it (cloud only): `shadowBacktest`
+   replays the detectors over 1 to 90 days of a project's history and reports
+   what they would have proposed, writing no detection state. A `days` value
+   outside that range is refused, not clamped. Read each candidate's `thresholds`
+   in full: a rule in `undecidable` is neither a pass nor a failure, so `clears`
+   covers only the rules a past detection can decide.
 
-The two verification tools call a Crumbtrail cloud deployment, so they need
-`CRUMBTRAIL_CLOUD_URL` and `CRUMBTRAIL_CLOUD_TOKEN` and report a gap when those
-are unset. `getWindowCorrelation` needs neither: it reads the same cold event
+The verification, probe, and back test tools call a Crumbtrail cloud deployment,
+so they need `CRUMBTRAIL_CLOUD_URL` and `CRUMBTRAIL_CLOUD_TOKEN` and report a gap
+when those are unset. `getWindowCorrelation` needs neither: it reads the same cold event
 stream `getWindow` reads, through the same store, so it answers identically for a
 local session and a hosted one.
 
@@ -274,8 +291,9 @@ Canonical names use camel case; generated snake case aliases are accepted but
 do not add capabilities. The catalog covers session discovery and detail,
 ranked and regression context, detector free window correlation, bug queue
 triage, distinct bug recurrence, similar issue recall, the learning loop (issue
-resolution, feedback, and tenant playbook), fix verification, and component,
-storage, cookie, transcript, and frame lookup.
+resolution, feedback, and tenant playbook), fix verification, live probe
+requests, shadow detection back tests, and component, storage, cookie,
+transcript, and frame lookup.
 
 ## Database diffing
 

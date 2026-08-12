@@ -21,6 +21,16 @@ function netRes(t: number, dur: number): BugEvent {
   return { t, k: "net.res", d: { dur, st: 200, bodyMeta: { bytes: 500 } } };
 }
 
+/**
+ * An event of a kind with no entry in `NUMERIC_FIELDS_BY_KIND`, so a stream
+ * built from it runs exactly one test: the volume scorer on `err`. That keeps
+ * the Benjamini-Hochberg denominator at 1 and lets a p value assertion be about
+ * the scorer rather than about the multiple comparison correction.
+ */
+function errAt(t: number): BugEvent {
+  return { t, k: "err", d: { msg: "boom" } };
+}
+
 describe("correlateWindow — window boundaries", () => {
   it("puts an event at exactly t0 in the highlight, never the baseline", () => {
     const events: BugEvent[] = [
@@ -176,8 +186,10 @@ describe("correlateWindow — scorer floors and shapes", () => {
         netRes(T0 - 4 * WIDTH + i * 1000, 100),
       ),
       ...Array.from({ length: 10 }, (_, i) => netRes(T0 + i * 500, 100)),
-      ...Array.from({ length: 12 }, (_, i) => ({
-        t: T0 + i * 500,
+      // 25 rather than 12: the volume floor is a floor on the COMBINED count,
+      // and this kind has no baseline events at all to contribute to it.
+      ...Array.from({ length: 25 }, (_, i) => ({
+        t: T0 + i * 400,
         k: "err",
         d: { msg: "boom" },
       })),
@@ -189,7 +201,7 @@ describe("correlateWindow — scorer floors and shapes", () => {
       scorer: "volume-delta",
       direction: "increase",
       baselineStat: 0,
-      highlightStat: 12,
+      highlightStat: 25,
     });
   });
 
@@ -271,6 +283,20 @@ describe("correlateWindow — scorer floors and shapes", () => {
     });
   });
 
+  it("does not test a kind whose combined count sits at the old floor", () => {
+    // The concrete case the floor exists for: 5 events in the 4x baseline and 5
+    // in the highlight. The uncorrected normal put this at p = 0.018, which
+    // survived the q = 0.05 cut and was reported as a real rate increase. The
+    // exact two sided binomial is 0.066, so the correct answer is silence.
+    const events: BugEvent[] = [
+      ...Array.from({ length: 5 }, (_, i) => errAt(T0 - 4 * WIDTH + i * 1000)),
+      ...Array.from({ length: 5 }, (_, i) => errAt(T0 + i * 1000)),
+    ];
+    const result = correlateWindow(events, { t0: T0, t1: T1 });
+    expect(result.testsRun).toBe(0);
+    expect(result.rows).toEqual([]);
+  });
+
   it("orders surviving rows by p value", () => {
     const events: BugEvent[] = [
       ...Array.from({ length: 30 }, (_, i) => ({
@@ -295,5 +321,111 @@ describe("correlateWindow — scorer floors and shapes", () => {
         result.rows[i - 1]?.pValue as number,
       );
     }
+  });
+});
+
+describe("correlateWindow — volume p value calibration", () => {
+  /**
+   * The volume p value is the only number in this module a caller acts on
+   * directly, and nothing else in this file pins it: the other volume
+   * assertions are `< 1e-20` on a case so extreme that any monotone function of
+   * the counts would pass. So the arithmetic was free to be wrong, and it was —
+   * the normal approximation ran with no continuity correction, which deflates
+   * every volume p value by a factor of two to four.
+   *
+   * Each case below is one event kind with no numeric fields, so exactly one
+   * test runs and the Benjamini-Hochberg denominator is 1. At the default 4x
+   * multiplier the conditional distribution of the highlight count is
+   * Binomial(total, 0.2).
+   *
+   * `corrected` is the value this module must return: `2 * Phi(-(|k - n*p0| -
+   * 0.5) / sqrt(n*p0*(1-p0)))`. `uncorrected` is what it returned before the
+   * fix, and `exact` is the two sided binomial, computed by summing the tail
+   * pmf. The corrected value has to sit between the two: the correction closes
+   * most of the gap to the exact test without overshooting past it.
+   */
+  const CASES: Array<{
+    baseline: number;
+    highlight: number;
+    corrected: number;
+    uncorrected: number;
+    exact: number;
+  }> = [
+    {
+      baseline: 15,
+      highlight: 10,
+      corrected: 0.024449,
+      uncorrected: 0.012419,
+      exact: 0.034664,
+    },
+    {
+      baseline: 26,
+      highlight: 14,
+      corrected: 0.0297,
+      uncorrected: 0.017706,
+      exact: 0.038815,
+    },
+    {
+      baseline: 33,
+      highlight: 17,
+      corrected: 0.021556,
+      uncorrected: 0.013328,
+      exact: 0.028883,
+    },
+  ];
+
+  for (const testCase of CASES) {
+    const total = testCase.baseline + testCase.highlight;
+    it(`prices ${testCase.highlight} of ${total} at the continuity corrected value`, () => {
+      const events: BugEvent[] = [
+        ...Array.from({ length: testCase.baseline }, (_, i) =>
+          errAt(T0 - 4 * WIDTH + i * 1000),
+        ),
+        ...Array.from({ length: testCase.highlight }, (_, i) =>
+          errAt(T0 + i * 400),
+        ),
+      ];
+      const result = correlateWindow(events, { t0: T0, t1: T1 });
+      expect(result.testsRun).toBe(1);
+      const row = result.rows.find((entry) => entry.scorer === "volume-delta");
+      expect(row).toBeDefined();
+
+      // Pinned to the hand computed corrected value, five decimals.
+      expect(row?.pValue).toBeCloseTo(testCase.corrected, 5);
+      // And bracketed, which is the property that survives a change of fit:
+      // strictly more conservative than the uncorrected normal, still no more
+      // conservative than the exact binomial it approximates.
+      expect(row?.pValue).toBeGreaterThan(testCase.uncorrected);
+      expect(row?.pValue).toBeLessThan(testCase.exact);
+    });
+  }
+
+  it("says nothing when the highlight count sits exactly on its expected rate", () => {
+    // 40 baseline and 10 highlight is precisely the 4x rate. The test runs and
+    // reports nothing, which is the case that proves silence here comes from
+    // the scorer answering rather than from the floor skipping it.
+    const events: BugEvent[] = [
+      ...Array.from({ length: 40 }, (_, i) => errAt(T0 - 4 * WIDTH + i * 1000)),
+      ...Array.from({ length: 10 }, (_, i) => errAt(T0 + i * 400)),
+    ];
+    const result = correlateWindow(events, { t0: T0, t1: T1 });
+    expect(result.testsRun).toBe(1);
+    expect(result.rows).toEqual([]);
+  });
+
+  it("still reads a rate drop as a decrease after the absolute value", () => {
+    // `direction` comes from the rescaled counts, not from the sign of z, so
+    // taking |k - mean| inside the correction must not flatten a drop.
+    const events: BugEvent[] = [
+      ...Array.from({ length: 100 }, (_, i) => errAt(T0 - 4 * WIDTH + i * 400)),
+      ...Array.from({ length: 5 }, (_, i) => errAt(T0 + i * 400)),
+    ];
+    const result = correlateWindow(events, { t0: T0, t1: T1 });
+    const row = result.rows.find((entry) => entry.scorer === "volume-delta");
+    expect(row).toMatchObject({
+      direction: "decrease",
+      baselineStat: 25,
+      highlightStat: 5,
+    });
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   benjaminiHochberg,
   erfc,
+  kolmogorovQ,
   ksTwoSample,
   standardNormalCdf,
 } from "../stats";
@@ -67,10 +68,24 @@ describe("ksTwoSample", () => {
   });
 
   it("handles ties without inventing a step", () => {
+    // Two identical constant arrays are NOT a test of tie handling: naive per
+    // observation stepping walks both sides in lockstep and also lands on 0.
+    // Kept only because it pins the trivial case.
     const constant = [5, 5, 5, 5, 5, 5];
     const result = ksTwoSample(constant, [...constant]);
     expect(result.d).toBe(0);
     expect(result.pValue).toBe(1);
+
+    // Asymmetric ties, where the tie group runs out on one side first. An
+    // implementation that advanced a single index per branch would measure the
+    // gap in the middle of the tie group at x = 1 and report 1/2 here, then
+    // exit the loop before the other side caught up. The true CDFs both reach
+    // 1 at x = 1, so the answer is 0.
+    expect(ksTwoSample([1, 1], [1]).d).toBe(0);
+
+    // Same shape, non zero answer: F_a(1) = 2/3 against F_b(1) = 1. Naive
+    // stepping measures 1/3 versus 1 and reports 2/3.
+    expect(ksTwoSample([1, 1, 2], [1]).d).toBeCloseTo(1 / 3, 12);
   });
 
   it("measures a one sided tail correctly", () => {
@@ -91,6 +106,54 @@ describe("ksTwoSample", () => {
     );
     expect(result.d).toBe(0);
     expect(Number.isFinite(result.pValue)).toBe(true);
+  });
+});
+
+describe("kolmogorovQ", () => {
+  /**
+   * The alternating series is truncated at 100 terms. For lambda near 0 the
+   * terms barely decay, so the truncation leaves a residual the size of the
+   * last term and the sum lands nowhere near its true value of 1. Unguarded,
+   * lambda = 0.001 returned 0.02 and lambda = 0.005 returned 0.397: a
+   * significant, then borderline, verdict for two distributions that are
+   * identical to within a thousandth of a step.
+   */
+  it("returns 1 for a lambda too small for the series to converge", () => {
+    for (const lambda of [1e-6, 0.001, 0.005, 0.01, 0.05, 0.1, 0.19]) {
+      expect(kolmogorovQ(lambda)).toBe(1);
+    }
+  });
+
+  it("is 1 at the cutoff itself, so the guard introduces no discontinuity", () => {
+    // Q(0.2) = 2 * (e^-0.08 - e^-0.32 + e^-0.72 - ...) = 0.999999999999, so
+    // the guard's flat 1 is exact to eleven decimals at the boundary and the
+    // series takes over from there with no visible step.
+    expect(kolmogorovQ(0.2)).toBeCloseTo(1, 11);
+    expect(kolmogorovQ(0.21)).toBeCloseTo(1, 10);
+  });
+
+  it("matches hand computed values where the series is converged", () => {
+    // Q(0.5) = 2 * (e^-0.5 - e^-2 + e^-4.5 - e^-8 + ...).
+    expect(kolmogorovQ(0.5)).toBeCloseTo(0.963945243665, 10);
+    // Q(1) = 2 * (e^-2 - e^-8 + e^-18 - ...).
+    expect(kolmogorovQ(1)).toBeCloseTo(0.269999671677, 10);
+    // Q(1.36), near the classic 5% critical value of the one sample statistic.
+    expect(kolmogorovQ(1.36)).toBeCloseTo(0.049485876755, 10);
+  });
+
+  it("is monotone decreasing above the cutoff", () => {
+    const lambdas = [0.2, 0.3, 0.5, 0.8, 1, 1.5, 2, 3];
+    for (let i = 1; i < lambdas.length; i += 1) {
+      expect(kolmogorovQ(lambdas[i] as number)).toBeLessThanOrEqual(
+        kolmogorovQ(lambdas[i - 1] as number),
+      );
+    }
+  });
+
+  it("returns 1 for a non positive or non finite lambda", () => {
+    expect(kolmogorovQ(0)).toBe(1);
+    expect(kolmogorovQ(-1)).toBe(1);
+    expect(kolmogorovQ(Number.NaN)).toBe(1);
   });
 });
 

@@ -69,6 +69,16 @@ import {
   type IssueDisposition,
   type LearningLoopResult,
 } from "./learning-loop";
+import {
+  BACKTEST_MAX_DAYS,
+  BACKTEST_MIN_DAYS,
+  DEFAULT_BACKTEST_DAYS,
+  isProbeName,
+  PROBE_NAMES,
+  requestProbeViaCloud,
+  shadowBacktestViaCloud,
+  type ProbeName,
+} from "./probe-plane";
 
 interface BugEvent {
   t: number;
@@ -954,6 +964,62 @@ const TOOLS = [
       required: ["project", "canonicalIssueId"],
     },
   },
+  /** @stability experimental */
+  {
+    name: "requestProbe",
+    description:
+      "Ask a project's running application to take one named reading, so you can close the single evidence gap a bundle told you about. Reach for it when a completeness slot names a probe, for example network.inflight or storage.snapshot, as the thing that would answer the question. " +
+      `A probe is a name and nothing else. The vocabulary is exactly ${PROBE_NAMES.length}: ${PROBE_NAMES.join(", ")}. No selector, URL, expression or other parameter is sent, and a name outside that list is refused here before any request is made. ` +
+      "TWO LIMITS, AND NEITHER IS A FORMALITY. First, only a live application answers a probe: one that is running right now and polling for its capture config. A stopped app, a finished session and a recording answer nothing, so this cannot recover a fact about the past. " +
+      "Second, this call QUEUES a request and the cloud answers 202. Queued is not answered, and it is not a promise that it will be. If a reading is ever taken it arrives as a probe.result event inside that application's next captured session, so read it there with getEvents or getWindow instead of expecting it in this response, and until you have read it you still do not have the fact. The request is never delivered after the returned expiresAt. Asking twice renews the one pending request rather than queueing a second. " +
+      "Live probes are off until a project raises its live_probe autonomy level, so a project that never opted in is refused with live_probe_disabled. This queues an instruction for your own application and writes nothing to your tickets or any external system. " +
+      "Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        project: {
+          type: "string",
+          description: "The Crumbtrail project id whose application to ask.",
+        },
+        probe: {
+          type: "string",
+          enum: [...PROBE_NAMES],
+          description: `The probe to run. One of: ${PROBE_NAMES.join(", ")}.`,
+        },
+      },
+      required: ["project", "probe"],
+    },
+  },
+  /** @stability experimental */
+  {
+    name: "shadowBacktest",
+    description:
+      "Replay the shadow detectors over a bounded window of one project's recorded history and report what they WOULD have proposed, before anything is switched on. It writes no detection state: no candidate, no occurrence, no issue event. " +
+      `\`days\` is a whole number of days from ${BACKTEST_MIN_DAYS} to ${BACKTEST_MAX_DAYS} and defaults to ${DEFAULT_BACKTEST_DAYS}. A value outside that range is refused rather than quietly narrowed, because an answer over a window you did not ask for would read as history that was never scanned. ` +
+      "Every candidate carries a `thresholds` verdict against the project's current code fix rules, with three parts you must read together: `clears`, `failedRules` and `undecidable`. AN UNDECIDABLE RULE IS NOT A PASS. A rule lands in `undecidable`, with a reason, when a past detection cannot carry the evidence to decide it, such as diff size, which exists only once a fix is generated. `clears` speaks only for the decidable rules, so a candidate with `clears` true and a non empty `undecidable` list has been partly checked, never approved. Read `undecidableRules` on the report for how many were left open across the run. " +
+      "`autonomy.wouldPropose` says whether the project's current level would act at all today. The report is a preview and is capped, so `truncated` true means detections were left out of `candidates` while `totalDetections` still counts them all. " +
+      "Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        project: {
+          type: "string",
+          description: "The Crumbtrail project id to replay history for.",
+        },
+        days: {
+          type: "integer",
+          minimum: BACKTEST_MIN_DAYS,
+          maximum: BACKTEST_MAX_DAYS,
+          description: `Replay window length in days, ${BACKTEST_MIN_DAYS} to ${BACKTEST_MAX_DAYS}. Defaults to ${DEFAULT_BACKTEST_DAYS}. Out of range is refused, not clamped.`,
+        },
+        maxTokens: {
+          ...MAX_TOKENS_SCHEMA,
+          description: `${MAX_TOKENS_DESCRIPTION} shadowBacktest budgets one list: candidates are dropped from the end, and each dropReport ref names the dropped candidate as <detector>:<stableSignature>.`,
+        },
+      },
+      required: ["project"],
+    },
+  },
   /** @stability stable */
   {
     name: "getWindowCorrelation",
@@ -1200,6 +1266,10 @@ export class McpServer {
         return this.toolStartFixVerification(args);
       case "getFixVerification":
         return this.toolGetFixVerification(args);
+      case "requestProbe":
+        return this.toolRequestProbe(args);
+      case "shadowBacktest":
+        return this.toolShadowBacktest(args);
       case "resolveSignature":
         return this.toolResolveSignature(args);
       case "locateInteractiveElements":
@@ -2575,6 +2645,158 @@ export class McpServer {
       project: ids.projectId,
       canonicalIssueId: ids.canonicalIssueId,
     });
+  }
+
+  // --- Live probe plane and shadow back test -------------------------------
+  // Both call an agent-plane cloud route with a `ctagt_` token, so both follow
+  // the fix-verification tools above: validate locally against the cloud's own
+  // `validId` rule before spending a round trip, report an unconfigured host as
+  // a gap rather than an error, and pass the cloud's own semantics through
+  // instead of collapsing them into a yes.
+
+  /** The cloud's `validId` shape, applied here so a malformed id is refused
+   *  before any network call rather than earning a 404. */
+  private static readonly CLOUD_ID_SHAPE = /^[A-Za-z0-9_]{1,128}$/;
+
+  private cloudProjectId(
+    args: Record<string, unknown>,
+    tool: string,
+  ): { projectId: string } | { error: string } {
+    const projectId = stringField(args.project)?.trim();
+    if (!projectId || !McpServer.CLOUD_ID_SHAPE.test(projectId))
+      return {
+        error: `${tool} requires a valid project id (letters, digits, underscore; up to 128 chars)`,
+      };
+    return { projectId };
+  }
+
+  /**
+   * Queue one named probe for a project's running application.
+   *
+   * Everything this renders is written so a queued request cannot be misread as
+   * an answer: `queued` and `answered` are separate fields, `answered` is always
+   * false here, and the interpretation names where a reading would actually
+   * appear. Agent-token auth.
+   */
+  private async toolRequestProbe(args: Record<string, unknown>) {
+    const ids = this.cloudProjectId(args, "requestProbe");
+    if ("error" in ids) return errorResult(ids.error);
+    const probe = stringField(args.probe)?.trim();
+    // Refused locally against the same frozen allowlist the SDK and the cloud
+    // share, so an invented probe name never reaches the network.
+    if (!isProbeName(probe)) {
+      return errorResult(
+        `requestProbe requires a probe from the fixed vocabulary: ${PROBE_NAMES.join(", ")}`,
+      );
+    }
+    const result = await requestProbeViaCloud({
+      projectId: ids.projectId,
+      probeName: probe as ProbeName,
+    });
+    if (!result.ok) return this.learningLoopFailure(result, "requestProbe");
+    const queued = isRecord(result.data?.queued)
+      ? (result.data.queued as Record<string, unknown>)
+      : undefined;
+    return textResult({
+      source: "cloud",
+      project: ids.projectId,
+      probe,
+      queued: true,
+      answered: false,
+      requestedAt: stringField(queued?.requestedAt) ?? null,
+      expiresAt: stringField(queued?.expiresAt) ?? null,
+      interpretation:
+        "The request is on record and will be handed to this project's application the next time it polls for its capture config. Nothing has run yet.",
+      caveat:
+        "A queued probe is not an answer. Only an application that is running and polling can take the reading, and if it does the reading arrives as a probe.result event in that application's next captured session: read it with getEvents or getWindow. The request is never delivered after expiresAt.",
+    });
+  }
+
+  /** The cloud refuses an out of bounds `days` rather than clamping it, so this
+   *  refuses the same values locally and for the same reason: an answer over a
+   *  window the caller did not ask for would read as history that was scanned. */
+  private backtestDays(
+    args: Record<string, unknown>,
+  ): { days?: number } | { error: string } {
+    if (args.days === undefined) return {};
+    const value = args.days;
+    if (
+      typeof value !== "number" ||
+      !Number.isInteger(value) ||
+      value < BACKTEST_MIN_DAYS ||
+      value > BACKTEST_MAX_DAYS
+    ) {
+      return {
+        error: `shadowBacktest requires days to be a whole number between ${BACKTEST_MIN_DAYS} and ${BACKTEST_MAX_DAYS} (it is refused, never clamped)`,
+      };
+    }
+    return { days: value };
+  }
+
+  /**
+   * Replay the shadow detectors over a project's recorded history.
+   *
+   * `thresholds.undecidable` is passed through verbatim on every candidate and
+   * counted on the report, because the one way to misuse this answer is to read
+   * a partial check as an approval. Agent-token auth, and the route writes no
+   * detection state.
+   */
+  private async toolShadowBacktest(args: Record<string, unknown>) {
+    const budget = this.maxTokensOf(args);
+    if ("error" in budget) return errorResult(budget.error);
+    const ids = this.cloudProjectId(args, "shadowBacktest");
+    if ("error" in ids) return errorResult(ids.error);
+    const days = this.backtestDays(args);
+    if ("error" in days) return errorResult(days.error);
+
+    const result = await shadowBacktestViaCloud({
+      projectId: ids.projectId,
+      days: days.days,
+    });
+    if (!result.ok) return this.learningLoopFailure(result, "shadowBacktest");
+    const report = result.data;
+    const candidates = Array.isArray(report.candidates)
+      ? report.candidates
+      : [];
+    const undecidableRules = candidates.reduce(
+      (total, candidate) =>
+        total +
+        (Array.isArray(candidate?.thresholds?.undecidable)
+          ? candidate.thresholds.undecidable.length
+          : 0),
+      0,
+    );
+    const payload = {
+      source: "cloud",
+      ...report,
+      candidates,
+      returned: candidates.length,
+      /** How many threshold rules across the run could not be decided at all. */
+      undecidableRules,
+      caveat:
+        "An undecidable rule is not a pass. `clears` speaks only for the rules a past detection can decide, so a candidate with undecidable rules has been partly checked and not approved. Nothing here was proposed, filed or recorded: it is what the detectors would have done.",
+    };
+    if (budget.maxTokens === undefined) return textResult(payload);
+    return this.budgetedTextResult(
+      payload as unknown as Record<string, unknown>,
+      [
+        budgetPlane(
+          "candidates",
+          candidates,
+          (candidate) => `${candidate.detector}:${candidate.stableSignature}`,
+        ),
+      ],
+      budget.maxTokens,
+      {
+        onKept: (out, kept) => {
+          const keptCandidates = kept.get("candidates") ?? [];
+          out.returned = keptCandidates.length;
+          out.truncated =
+            report.truncated === true ||
+            keptCandidates.length < candidates.length;
+        },
+      },
+    );
   }
 
   /** Adapt this server's storage readers to the recall engine's injected seam.

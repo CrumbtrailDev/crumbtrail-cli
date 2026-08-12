@@ -21,8 +21,12 @@ const T0 = 5_000;
 const T1 = 6_000;
 
 /**
- * Baseline: 12 `net.res` and 4 `err` over the four seconds before t0.
- * Highlight: 20 `net.res` and 8 `err` in the one second from t0.
+ * Baseline: 12 `net.res` and 14 `err` over the four seconds before t0.
+ * Highlight: 20 `net.res` and 12 `err` in the one second from t0.
+ *
+ * Both kinds have to clear `MIN_VOLUME_EVENTS` on their COMBINED count for the
+ * volume scorer to run at all, which is why `err` carries a baseline rather
+ * than being a pure highlight spike.
  *
  * `net.res` is the louder of the two spikes by construction, so it must rank
  * first; `err` is the second row, which is what the budget test needs something
@@ -47,11 +51,11 @@ function spikeEvents(): BugEvent[] {
       d: { id: `hot_${index}`, st: 200, dur: 100 },
     });
   }
-  for (let index = 0; index < 4; index += 1) {
-    events.push({ t: 1_500 + index * 800, k: "err", d: { msg: "boom" } });
+  for (let index = 0; index < 14; index += 1) {
+    events.push({ t: 1_100 + index * 280, k: "err", d: { msg: "boom" } });
   }
-  for (let index = 0; index < 8; index += 1) {
-    events.push({ t: T0 + index * 100, k: "err", d: { msg: "boom" } });
+  for (let index = 0; index < 12; index += 1) {
+    events.push({ t: T0 + index * 80, k: "err", d: { msg: "boom" } });
   }
   return events;
 }
@@ -192,8 +196,8 @@ describe("getWindowCorrelation", () => {
       t1: T1,
     });
 
-    expect(parsed.baseline).toEqual({ t0: 1_000, t1: T0, events: 16 });
-    expect(parsed.highlight).toEqual({ t0: T0, t1: T1, events: 28 });
+    expect(parsed.baseline).toEqual({ t0: 1_000, t1: T0, events: 26 });
+    expect(parsed.highlight).toEqual({ t0: T0, t1: T1, events: 32 });
     expect(parsed.rows[0]).toMatchObject({
       dimension: "volume",
       kind: "net.res",
