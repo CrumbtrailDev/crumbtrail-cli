@@ -23,6 +23,12 @@ import { createCrumbtrailRequestHeaders } from "./correlation";
 import { readEarlySessionId } from "./early-capture";
 import { createAutoFlagController } from "./auto-flag";
 import {
+  isProbeName,
+  runProbe,
+  type ProbeContext,
+  type ProbeName,
+} from "./probes";
+import {
   errorDetector,
   request5xxDetector,
   rageClickDetector,
@@ -115,6 +121,26 @@ type FlightRecorderState =
   | "tailing"
   | "finalizing"
   | "finalized";
+/**
+ * The event a probe result rests as. One event per probe, carrying the whole {@link ProbeResult}
+ * including a failed one, because "the probe ran and could not answer" is itself the answer to
+ * "is this source available in production".
+ */
+export const PROBE_RESULT_EVENT_KIND = "probe.result";
+
+/**
+ * Probes accepted from a single config poll. Probes run inside a customer's live application, so
+ * the server cannot ask for an unbounded amount of work; anything past this is dropped.
+ */
+const MAX_REMOTE_PROBES = 4;
+
+/**
+ * Entries scanned in a `probes` array before the field is refused outright. A legitimate request
+ * names at most {@link MAX_REMOTE_PROBES} probes, so a longer list is not a request, and scanning
+ * it would be work an unauthenticated response body chose for us.
+ */
+const MAX_REMOTE_PROBE_ENTRIES = 64;
+
 const REMOTE_CONFIG_KEYS = [
   "captureSampleRate",
   "baselineSampleRate",
@@ -696,10 +722,18 @@ export class Crumbtrail {
         if (!response.ok && response.status >= 400) return;
         const payload: unknown = await response.json();
         if (stopped || generation !== this.configPollGeneration) return;
-        if (this.applyRemoteConfig(payload)) this.remotePolicyReady = true;
+        const settings = readRemotePolicySettings(payload);
+        if (settings) {
+          this.applyRemoteConfig(settings);
+          this.remotePolicyReady = true;
+        }
         this.updateFlightRecorderState();
         this.startSessionIfAllowed();
         this.emitSamplingGapIfNeeded();
+        // Probes run after the policy is live, not during it: a probe result is an event, and an
+        // event emitted while `remotePolicyReady` is still false is dropped by the admission
+        // predicate before it reaches the bus.
+        if (settings) await this.runRemoteProbes(settings, generation);
       } catch {
         // Retain the last known policy when the config service is unavailable.
       }
@@ -724,9 +758,7 @@ export class Crumbtrail {
     this.configPollingCleanup = undefined;
   }
 
-  private applyRemoteConfig(payload: unknown): boolean {
-    const settings = readRemotePolicySettings(payload);
-    if (!settings) return false;
+  private applyRemoteConfig(settings: Record<string, unknown>): void {
     const oldSampleRate = this.config.captureSampleRate;
     const oldBaselineSampleRate = this.config.baselineSampleRate;
     let shouldReconfigureAutoFlag = false;
@@ -775,7 +807,62 @@ export class Crumbtrail {
       this.canCapture()
     )
       void this.flag({ tags: ["config:trigger"] });
-    return true;
+  }
+
+  /**
+   * Run the probes a config poll asked for and rest each answer as one event.
+   *
+   * The whole of what a server may say is a name from {@link PROBE_NAMES}. No value from the
+   * payload is ever handed to a probe: `runProbe` takes the name and a context this instance
+   * builds from its own state, so there is nothing a response body can put inside a probe.
+   *
+   * Serial, not concurrent. This is someone else's production application, and one probe at a
+   * time bounds the peak cost to one probe's bounds rather than four probes' bounds.
+   */
+  private async runRemoteProbes(
+    settings: Record<string, unknown>,
+    generation: number,
+  ): Promise<void> {
+    const names = readRemoteProbeNames(settings);
+    if (names.length === 0) return;
+
+    for (const name of names) {
+      // A kill switch, a stop, or a newer poll all mean this run is no longer wanted. Checked
+      // per probe because the loop awaits, so any of the three can arrive mid run.
+      if (this.stopped || this.killSwitch) return;
+      if (generation !== this.configPollGeneration) return;
+      const result = await runProbe(name, this.probeContext());
+      if (this.stopped || this.killSwitch) return;
+      if (generation !== this.configPollGeneration) return;
+      this.bus.emit({
+        t: now(),
+        k: PROBE_RESULT_EVENT_KIND,
+        d: { ...result } as unknown as Record<string, unknown>,
+      });
+    }
+  }
+
+  /**
+   * Everything a probe is allowed to read from this instance. Each supplier takes the probe's
+   * deadline signal and refuses once it has fired, so an abandoned probe cannot pull a state
+   * provider of the host application's after the answer has stopped being wanted.
+   *
+   * `getStorageAreas` is deliberately absent: `runProbe` falls back to the ambient
+   * `localStorage` and `sessionStorage`, guarded, which is the correct source in a browser and
+   * correctly reports `unavailable` outside one.
+   */
+  private probeContext(): ProbeContext {
+    return {
+      getDeclaredEnv: (signal) =>
+        signal.aborted
+          ? undefined
+          : { flags: this.declaredFlags, config: this.declaredConfig },
+      getState: (name, signal) => {
+        if (signal.aborted) return undefined;
+        const provider = this.stateProviders.get(name);
+        return provider ? provider() : undefined;
+      },
+    };
   }
 
   private resampleSession(): void {
@@ -1343,6 +1430,39 @@ function readRemotePolicySettings(
   return hasRecognizedRemotePolicy(merged) ? merged : undefined;
 }
 
+/**
+ * Read the probes a config poll asked to run.
+ *
+ * This is the one remote field that causes code to run rather than a number to change, so it is
+ * read far more strictly than the rest of the policy envelope:
+ *
+ * - **Names only.** Every entry must be a plain string. One entry shaped as an object refuses the
+ *   whole field, rather than being reduced to whatever string could be salvaged from it. An object
+ *   carrying a `selector`, `url`, `path` or `expression` is not a malformed probe request, it is a
+ *   request for a different mechanism than the one that exists, and answering part of it would be
+ *   the beginning of a parameterised probe.
+ * - **Allowlisted.** A name that is not in `PROBE_NAMES` is dropped in silence. There is no
+ *   normalization, no trimming and no case folding, so nothing can be massaged onto the list.
+ * - **Bounded.** At most {@link MAX_REMOTE_PROBES} run per poll, and a list longer than
+ *   {@link MAX_REMOTE_PROBE_ENTRIES} is refused before it is scanned.
+ * - **Deduplicated**, so a repeated name cannot spend the budget four times over.
+ */
+function readRemoteProbeNames(settings: Record<string, unknown>): ProbeName[] {
+  const raw = settings.probes;
+  if (!Array.isArray(raw)) return [];
+  if (raw.length > MAX_REMOTE_PROBE_ENTRIES) return [];
+  if (raw.some((entry) => typeof entry !== "string")) return [];
+
+  const accepted: ProbeName[] = [];
+  for (const entry of raw) {
+    if (!isProbeName(entry)) continue;
+    if (accepted.includes(entry)) continue;
+    accepted.push(entry);
+    if (accepted.length === MAX_REMOTE_PROBES) break;
+  }
+  return accepted;
+}
+
 function applyRemoteConsentMode(
   config: CrumbtrailConfig,
   settings: Record<string, unknown>,
@@ -1604,6 +1724,10 @@ function hasRecognizedRemotePolicy(settings: Record<string, unknown>): boolean {
   if (typeof settings.respectGpc === "boolean") return true;
   if (hasRecognizedRemoteMasking(settings)) return true;
   if (hasRecognizedRemoteSampling(settings)) return true;
+  // A poll that only asks for probes is still a poll worth applying, so a probe request does not
+  // have to be smuggled alongside a policy change to be honoured. A refused `probes` field
+  // recognizes nothing, which is what keeps a rejected request from taking this path.
+  if (readRemoteProbeNames(settings).length > 0) return true;
   return hasRecognizedRemoteTriggers(settings);
 }
 

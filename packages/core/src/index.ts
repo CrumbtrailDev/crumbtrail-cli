@@ -1,4 +1,4 @@
-export { Crumbtrail } from "./bug-logger";
+export { Crumbtrail, PROBE_RESULT_EVENT_KIND } from "./bug-logger";
 export { EventBus } from "./event-bus";
 export { RingBuffer } from "./ring-buffer";
 export { HttpTransport, EventDeliveryError } from "./transports/http";
@@ -133,7 +133,6 @@ export type {
   ContextCompleteness,
   Escalation,
   EvidenceGap,
-  CaptureDirective,
   RankedBundle,
   AssembleBundleInput,
 } from "./fusion";
