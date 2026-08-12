@@ -14,8 +14,15 @@ import {
 export const CAUSAL_GRAPH_SCHEMA_VERSION = "causal-graph.v2" as const;
 
 /**
- * 15 node kinds. The last three (`state.diff`, `decision`, `thirdparty.call`) are Phase 2
+ * 16 node kinds. The last three (`state.diff`, `decision`, `thirdparty.call`) are Phase 2
  * reserved: valid members of the union but never emitted by `buildCausalGraph` in CP1.
+ *
+ * `db.error` is deliberately NOT folded into `db.write`. A statement that RAISED did not write
+ * anything, and the write-plane rules read `db.write` as "this row changed" — `isDbWriteEnd`
+ * clamps a write-to-write causal claim on exactly that reading, and the own-write-only bar in the
+ * temporal fallback assumes the node names a write the candidate performed. A failed statement
+ * satisfies neither, so giving it the write kind would make those rules answer a question about
+ * an event that never happened.
  */
 export type CausalNodeKind =
   | "user.click"
@@ -26,6 +33,7 @@ export type CausalNodeKind =
   | "backend.req"
   | "backend.error"
   | "db.write"
+  | "db.error"
   | "otel.span"
   | "otel.log"
   | "frontend.error"
@@ -224,6 +232,13 @@ const NO_NAV_EPOCH = -1;
 
 const CONSOLE_ERROR_KIND = "con";
 const DB_DIFF_KIND = "db.diff";
+/**
+ * The event kind for a statement the application issued and the database REFUSED. Mirrored from
+ * `DB_ERROR_EVENT_KIND` in crumbtrail-core rather than imported, for the same reason
+ * {@link DB_ENGINE_SOURCES} is restated: this module holds no other dependency on the db plane's
+ * types, and the string is the load-bearing part.
+ */
+const DB_ERROR_KIND = "db.error";
 const OTEL_SPAN_KIND = "backend.otel.span";
 const OTEL_LOG_KIND = "backend.otel.log";
 
@@ -272,6 +287,11 @@ function nodeKindFor(event: BugEvent): CausalNodeKind | undefined {
       return "backend.error";
     case DB_DIFF_KIND:
       return "db.write";
+    // A statement that raised is a real thing that happened inside the request, at a known
+    // instant, carrying that request's id. Without a node it can never be placed, so the most
+    // decisive database observable the capture path collects could only ever be isolated.
+    case DB_ERROR_KIND:
+      return "db.error";
     case OTEL_SPAN_KIND:
       return "otel.span";
     case OTEL_LOG_KIND:
@@ -367,6 +387,10 @@ function briefFor(event: BugEvent, kind: CausalNodeKind): string {
       return `backend error ${sigFor(event, kind) ?? ""}`.trim();
     case "db.write":
       return `db ${safeString(event.d.op) ?? "write"} ${safeString(event.d.table) ?? ""}`.trim();
+    case "db.error":
+      return `db ${safeString(event.d.op) ?? "statement"} ${safeString(event.d.table) ?? ""} raised`
+        .replace(/\s+/g, " ")
+        .trim();
     case "otel.span":
       return `span ${safePath(event.d.name) ?? ""}`.trim();
     case "otel.log":
@@ -1005,6 +1029,12 @@ function nodeKindsForDetector(detector: string): Set<CausalNodeKind> {
       return new Set(["net.res", "net.req"]);
     case "console_error":
       return new Set(["console.error"]);
+    // Mapped explicitly rather than left to `derivedNodeKinds`, which would read this anchor's
+    // engine `source` and its `table` and answer `db.write`. Both fields are true of it and the
+    // conclusion is not: the statement raised, so no row changed, and the node it belongs on is
+    // the one built from its own event.
+    case "db_statement_failed":
+      return new Set(["db.error"]);
     // console_warning is intentionally NOT mapped: warn-level `con` events never become graph nodes
     // (nodeKindFor only emits console.error for error-level), so a warning has no node of its own.
     // Falling through to the empty default keeps it isolated instead of stealing a real
@@ -1774,6 +1804,11 @@ function connectRequestSpine(
       case "otel.span":
         return 1;
       case "db.write":
+        return 2;
+      // Same stage as a write: both are database work the handler did while serving the request,
+      // and both precede whatever the handler then returned. Time still decides the order between
+      // them; this rank only breaks a shared-millisecond tie.
+      case "db.error":
         return 2;
       case "otel.log":
         return 2;

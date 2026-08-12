@@ -286,6 +286,18 @@ export interface EvidenceCandidate {
      */
     table?: string;
     /**
+     * The normalized, value-free shape of the statement this signal is about —
+     * the same string `databaseErrors[].shape` renders, carried here so the
+     * ranked opinion names the statement rather than only the table it touched.
+     *
+     * Produced by `normalizeStatementShape` at capture time, which is the one
+     * place that guarantee is made; it is re-bounded here and otherwise passed
+     * through unchanged, exactly as the rendering path does. Re-scrubbing it
+     * would make the ranked list and the rendered evidence disagree about the
+     * same string, which is worse than either treatment on its own.
+     */
+    statementShape?: string;
+    /**
      * Column names a row-identity comparison rested on, sorted. Set by the
      * database detectors that claim two rows are the same, so a reader can see
      * what was compared instead of taking the claim on faith.
@@ -709,6 +721,7 @@ export function buildEvidenceCandidates(
   addConsoleWarningCandidates(events, index, drafts);
   addOtelErrorCandidates(events, index, drafts);
   addBackendErrorCandidates(events, index, drafts);
+  addDbErrorCandidates(events, index, drafts);
   addDbDiffCandidates(events, index, drafts);
   addDbFieldDivergenceCandidates(events, index, drafts);
   addDuplicateWriteCandidates(events, index, drafts);
@@ -2066,6 +2079,80 @@ function addBackendErrorCandidates(
       // while the response's end event carries e.g. 500 — including status would split one
       // request into two candidates. dedupeDrafts keeps the higher-scored error.
       dedupeKey: `backend:${requestId ?? event.t}`,
+    });
+  }
+}
+
+/**
+ * A statement the application issued and the database REFUSED.
+ *
+ * The invariant, and it names no application: a request that asked the database to do something
+ * and was told no did not do the thing it reported doing. That is a fault of the statement, not of
+ * the tooling, and every field of the finding comes from the observable itself — the engine, the
+ * operation, the table, the value-free statement shape, the database's own error code and the
+ * driver's error class, all correlated to the request they happened inside.
+ *
+ * Why this is a CANDIDATE and not only a rendered row: `db.error` was collected and shown to the
+ * reader as `databaseErrors`, and nothing that produces the ranked opinion could see it. So an
+ * incident whose root cause is stated verbatim by a failing statement was ranked entirely by
+ * per-detector severity constants belonging to whatever else happened to fire — the failing
+ * statement could not promote anything, however decisive it was.
+ *
+ * Deliberately NOT the twin of `db_mutation`: that detector says a row changed. This one says a
+ * row did not, which is why it carries its own node kind rather than borrowing the write plane's.
+ */
+function addDbErrorCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (event.k !== "db.error") continue;
+
+    const requestId = safeText(event.d.requestId, 120);
+    const op = safeText(event.d.op, 20) ?? "other";
+    const table = safeText(event.d.table, 200);
+    // The same treatment `buildDatabaseErrors` gives it: bounded, otherwise unchanged. The value
+    // was made value-free by `normalizeStatementShape` at capture, and re-deriving that judgement
+    // here would produce a second opinion about a string the reader already sees.
+    const statementShape = safeText(event.d.shape, 400);
+    // The database's own code first — a closed vocabulary — and the driver's error class name
+    // only when the driver reported no code. Never a message: that is where values travel.
+    const code = safeText(event.d.code, 64);
+    const errorCode = code ?? safeText(event.d.errorName, 120);
+    const subject = table ? `on ${table}` : "statement";
+    // `other` is the op vocabulary's "did not parse to one of the known verbs". Printing it reads
+    // as a claim about the statement; omitting it says the same thing without the false note. The
+    // driver's error CLASS is omitted from the title for the same reason — `Error` names nothing —
+    // while both stay on the anchor, where a reader can see exactly what was and was not reported.
+    const verb = op === "other" ? "" : `${op} `;
+
+    drafts.push({
+      detector: "db_statement_failed",
+      title:
+        `Database ${verb}${subject} was refused${code ? ` (${code})` : ""}`.trim(),
+      severity: "high",
+      // Level with `backend_request_error`, on purpose. A refused statement is at least as
+      // decisive as the request failure it usually produces, and claiming MORE would be an
+      // ordering opinion about detectors this change did not measure.
+      score: 90,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId,
+        table,
+        statementShape,
+        errorCode,
+        // The engine name, matching what every other db-plane detector writes here.
+        source: normalizeDbEngine(event.d.engine),
+      }),
+      // Keyed on the request and what was attempted, so one statement retried inside a request
+      // collapses while two different failing statements in it stay two findings. Falls back to
+      // the event time when the capture carried no request id, mirroring the backend path.
+      dedupeKey: `dberror:${requestId ?? event.t}:${op}:${table ?? ""}:${statementShape ?? ""}`,
     });
   }
 }
