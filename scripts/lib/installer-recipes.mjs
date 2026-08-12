@@ -424,7 +424,8 @@ INSTALLER_RECIPES["rr7-revealed"] = {
 //   typecheckCap   — dispatch to the typecheck runner (no build/serve/ingest)
 //   clientEntry    — the entry the plan must prepend into (relative to app)
 //   typecheckPacks — packed pack-manifest keys installed before typecheck
-//                    (react-native/tauri need crumbtrail-core + their SDK)
+//                    (react-native needs crumbtrail-core + its own SDK; tauri
+//                    needs only core, since its transport is a core subpath)
 //   typecheckCmd   — argv run in the app dir; exit 0 = pass
 //   warningMustContain — substrings the plan warnings must carry (Tauri Rust steps)
 
@@ -459,15 +460,15 @@ INSTALLER_RECIPES["expo"] = {
 // over vite (src-tauri/ + @tauri-apps dep) and resolves the frontend entry from
 // index.html; the plan prepends the TauriTransport init. Cap adds two Rust-side
 // warnings the JS injection can't perform (plugin registration + capability
-// permission). RED on current main: no tauri tarball channel AND planTauri
-// emitted no Rust warnings — GREEN after both.
+// permission). TauriTransport ships as the crumbtrail-core/tauri subpath, so
+// the only tarball this recipe needs is the core one.
 INSTALLER_RECIPES["tauri"] = {
   recipe: "tauri",
   fixtureDir: path.join(fixturesRoot, "tauri"),
   typecheckCap: true,
   expectedPlanKind: "prepend",
   clientEntry: path.join("src", "main.ts"),
-  typecheckPacks: ["core", "tauri"],
+  typecheckPacks: ["core"],
   typecheckCmd: ["npx", "tsc", "--noEmit"],
   warningMustContain: ["tauri-plugin-crumbtrail", "crumbtrail:default"],
   buildCmd: null,
