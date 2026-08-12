@@ -38,6 +38,7 @@ import {
   type StageResult,
 } from "./preflight";
 import {
+  createIngestKey,
   inferProjectName,
   inferServiceName,
   provisionFlow,
@@ -47,6 +48,14 @@ import {
   UpgradeRequiredError,
   type ProvisionResult,
 } from "./provision";
+import {
+  applyEnvEdits,
+  buildEnvKeyEdits,
+  defaultEnvFileIO,
+  planEnvKeyWrite,
+  type EnvFileIO,
+  type EnvKeyPlan,
+} from "./env-file";
 import {
   pollForRealEvent,
   pollForServices,
@@ -88,12 +97,7 @@ function __dirnameCompat(): string {
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
 export type Command =
-  | "wizard"
-  | "login"
-  | "logout"
-  | "verify"
-  | "help"
-  | "version";
+  "wizard" | "login" | "logout" | "verify" | "help" | "version";
 
 export interface ParsedArgs {
   command: Command;
@@ -101,6 +105,12 @@ export interface ParsedArgs {
   project?: string;
   noBrowser: boolean;
   skipVerify: boolean;
+  /**
+   * Do not mint an ingest key or write one to an env file — print the variable
+   * to set instead. For anyone whose secrets come from a vault or a platform's
+   * own env UI, where a key on a developer's disk is the wrong artifact.
+   */
+  noWriteKey: boolean;
   endpoint?: string;
   /**
    * Monorepo root only: wire exactly these services (repeatable `--only`,
@@ -134,6 +144,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     yes: false,
     noBrowser: false,
     skipVerify: false,
+    noWriteKey: false,
     all: false,
     json: false,
   };
@@ -158,6 +169,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
         break;
       case "--skip-verify":
         parsed.skipVerify = true;
+        break;
+      case "--no-write-key":
+        parsed.noWriteKey = true;
         break;
       case "--project":
         parsed.project = args[++i];
@@ -227,6 +241,8 @@ Options:
                              the repo root — wires just that package
   --no-browser               Use the device-code login flow
   --skip-verify              Don't wait for the first event
+  --no-write-key             Don't mint or write an ingest key; print the
+                             variable to set instead
   --endpoint <url>           Cloud endpoint (else $CRUMBTRAIL_BASE_URL, else default)
   --help, -h                 Show this help
   --version, -v              Print the version
@@ -392,6 +408,9 @@ export interface WizardDeps {
   detect: (cwd: string) => DetectResult;
   ensureToken: typeof ensureToken;
   provisionFlow: typeof provisionFlow;
+  createIngestKey: typeof createIngestKey;
+  /** Filesystem + git boundary for the env key write (faked in tests). */
+  envFileIO: EnvFileIO;
   installSdk: (input: InstallSdkInput) => Promise<InstallSdkResult>;
   buildPlan: typeof buildPlan;
   executePlan: typeof executePlan;
@@ -418,6 +437,8 @@ export function defaultDeps(): WizardDeps {
     detect,
     ensureToken,
     provisionFlow,
+    createIngestKey,
+    envFileIO: defaultEnvFileIO,
     installSdk,
     buildPlan,
     executePlan,
@@ -615,15 +636,18 @@ export async function runWizard(
   // "skip-already-wired" — self-cancelling injection on a fresh setup. So the
   // plan is computed against the pre-install repo; only executePlan (below,
   // after install) mutates files, keeping injection the LAST repo-mutating step.
-  const plan = deps.buildPlan({
-    cwd,
-    recipe: result.recipe,
-    endpoint: base,
-    entryFile: result.entryFile,
-    nextVersion: result.nextVersion,
-    stack: result.otlpStack ?? undefined,
-    options: { force: parsed.yes },
-  }, defaultInjectIO);
+  const plan = deps.buildPlan(
+    {
+      cwd,
+      recipe: result.recipe,
+      endpoint: base,
+      entryFile: result.entryFile,
+      nextVersion: result.nextVersion,
+      stack: result.otlpStack ?? undefined,
+      options: { force: parsed.yes },
+    },
+    defaultInjectIO,
+  );
 
   // 5. Install the SDK (repo-mutating: adds deps to package.json).
   const install = await deps.installSdk({
@@ -648,16 +672,34 @@ export async function runWizard(
     packages: install.packages,
   });
 
-  // 6. Next steps — the installer is hands-off: it mints no key, so there is no
-  // synthetic check to run. We still (optionally) wait for the first real event,
-  // which arrives if the user sets their key + starts the app during the wait.
+  // 7. The ingest key. Last of the repo-mutating steps and separate from the
+  // injection apply on purpose: if this fails, the wiring above is still
+  // correct and worth keeping, so it reports rather than rolling anything back.
+  const keyWrite = await writeIngestKey({
+    base,
+    token,
+    projectId: provisioned.projectId,
+    appDir: cwd,
+    repoRoot: cwd,
+    varName: plan.keyEnvVar,
+    parsed,
+    deps,
+  });
+
+  // 8. Next steps. With the key on disk the first-event wait is a real wait on
+  // the app starting, rather than a wait on a manual step nobody was told to do.
   const notes: string[] = [];
   if (!install.installed && install.note) notes.push(install.note);
   notes.push(...inject.notes);
+  if (keyWrite.note) notes.push(keyWrite.note);
 
-  const setKeyHint = plan.keyEnvVar
-    ? `Set ${plan.keyEnvVar} in your .env to your ingest key`
-    : "Set your ingest key";
+  const keyReady =
+    keyWrite.status === "written" || keyWrite.status === "already-set";
+  const setKeyHint = keyReady
+    ? "Start your app"
+    : plan.keyEnvVar
+      ? `Set ${plan.keyEnvVar} in your .env to your ingest key`
+      : "Set your ingest key";
 
   // User-facing links point at the app host (the SPA), not the API host.
   const appBase = dashboardBase(base);
@@ -668,7 +710,9 @@ export async function runWizard(
   } else {
     ui.out(
       color.dim(
-        `${setKeyHint} — mint one at ${appBase}/settings, then start your app.`,
+        keyReady
+          ? "Now start your dev server and load a page in your browser."
+          : `${setKeyHint} — mint one at ${appBase}/settings, then start your app.`,
       ),
     );
     const poll = await pollWithSigint(
@@ -697,7 +741,11 @@ export async function runWizard(
         "Stopped waiting for the first event — load your app any time.",
       );
     } else {
-      notes.push(`No event yet — ${setKeyHint.toLowerCase()} and start your app.`);
+      notes.push(
+        keyReady
+          ? "No event yet — start your app and load a page."
+          : `No event yet — ${setKeyHint.toLowerCase()} and start your app.`,
+      );
     }
     // Point the user at the next lever — pulling in the evidence sources they
     // already run. Pointer only, no prompt.
@@ -713,6 +761,8 @@ export async function runWizard(
     notes,
     plan.keyEnvVar,
     sessionUrl,
+    keyWrite,
+    cwd,
   );
   return 0;
 }
@@ -739,7 +789,9 @@ function printEvidenceSourcesPointer(ui: Ui, base: string): void {
     ),
   );
   ui.out(color.dim("queried at incident time and added to each bug's bundle."));
-  ui.out(`  Evidence sources: ${color.cyan(`${dashboardBase(base)}/settings`)}`);
+  ui.out(
+    `  Evidence sources: ${color.cyan(`${dashboardBase(base)}/settings`)}`,
+  );
 }
 
 // ── Batch wizard (monorepo root) ─────────────────────────────────────────────
@@ -756,8 +808,11 @@ export interface ServiceOutcome {
   recipe: Recipe;
   status: ServiceStatus;
   serviceId?: string;
-  /** Env var the injected code reads its key from (hands-off — user sets it). */
+  /** Env var the injected code reads its key from. */
   keyEnvVar?: string;
+  /** True once this run wrote the project's key into that variable, which is
+   *  what decides whether the summary still asks for it. */
+  keyWritten?: boolean;
   filesTouched: string[];
   notes: string[];
   error?: string;
@@ -1003,19 +1058,22 @@ export async function runBatchWizard(
       // buildPlan BEFORE installSdk — see the single-package path: the plan's
       // idempotency check keys off package.json referencing crumbtrail-core, so
       // installing first would self-cancel injection.
-      const plan = deps.buildPlan({
-        cwd: c.dir,
-        recipe,
-        endpoint: base,
-        entryFile: c.detected.entryFile,
-        nextVersion: c.detected.nextVersion,
-        stack: c.detected.otlpStack ?? undefined,
-        // One key covers the whole project, so the injected code is what says
-        // which app sent a session. Without this a repository of Express
-        // services would arrive as five anonymous senders.
-        serviceName: c.name,
-        options: { force: parsed.yes },
-      }, defaultInjectIO);
+      const plan = deps.buildPlan(
+        {
+          cwd: c.dir,
+          recipe,
+          endpoint: base,
+          entryFile: c.detected.entryFile,
+          nextVersion: c.detected.nextVersion,
+          stack: c.detected.otlpStack ?? undefined,
+          // One key covers the whole project, so the injected code is what says
+          // which app sent a session. Without this a repository of Express
+          // services would arrive as five anonymous senders.
+          serviceName: c.name,
+          options: { force: parsed.yes },
+        },
+        defaultInjectIO,
+      );
 
       const install = await deps.installSdk({
         cwd: c.dir,
@@ -1070,13 +1128,32 @@ export async function runBatchWizard(
     }
   }
 
-  // 6. Next steps — hands-off: no keys were minted, so there's no synthetic
-  // check. We still open ONE shared wait for real events (arriving if the user
-  // sets each key + starts the service during the wait).
   const reporting = outcomes.filter(
     (o) => o.status === "wired" || o.status === "guidance",
   );
   const batchNotes: string[] = [];
+
+  // 6. The ingest key: one for the project, written into every wired service's
+  // env file. Runs before the shared wait, so that wait is now a wait on
+  // services starting rather than on a manual step nobody was told to do.
+  const keyWrites = await writeIngestKeys({
+    base,
+    token,
+    projectId: project.id,
+    repoRoot: root,
+    targets: reporting.map((o) => ({
+      label: o.name,
+      appDir: path.resolve(root, o.relDir),
+      varName: o.keyEnvVar,
+    })),
+    parsed,
+    deps,
+  });
+  for (const outcome of reporting) {
+    const write = keyWrites.get(outcome.name);
+    if (write?.note) outcome.notes.push(write.note);
+    outcome.keyWritten = write?.status === "written";
+  }
   if (parsed.skipVerify) {
     // One note for the run, not one per service — the same line repeated N
     // times is noise, not information.
@@ -1085,7 +1162,10 @@ export async function runBatchWizard(
     // User-facing links point at the app host (the SPA), not the API host.
     const appBase = dashboardBase(base);
     for (const o of reporting) {
-      if (o.keyEnvVar) {
+      // Only the services whose key did NOT land still carry a manual step.
+      // Telling someone to set a variable this run just wrote for them is how
+      // they end up pasting a second key over a working one.
+      if (o.keyEnvVar && !o.keyWritten) {
         o.notes.push(
           `Set ${o.keyEnvVar} in this service's .env (mint at ${appBase}/settings).`,
         );
@@ -1270,6 +1350,215 @@ interface SdkInstallState {
   packages: string[];
 }
 
+// ── Ingest key ───────────────────────────────────────────────────────────────
+
+export interface KeyWriteOutcome {
+  status:
+    | "written"
+    | "already-set"
+    | "refused-tracked"
+    | "no-variable"
+    | "skipped-flag"
+    | "failed";
+  /** The env file involved, when there is one. */
+  file?: string;
+  varName?: string;
+  /** Extra line for the end-of-run summary's notes. */
+  note?: string;
+}
+
+/**
+ * The step that finishes the job: mint the project's ingest key and put it in
+ * the app's env file.
+ *
+ * Sequenced deliberately. env-file.ts decides where the key would go and
+ * whether that is safe BEFORE anything is minted, so the refusal paths
+ * (`--no-write-key`, a git-tracked env file, a variable already pointed at a
+ * key) cost no credential at all. Only a decision of "ready" reaches the
+ * network. See env-file.ts for the rules the write itself follows.
+ */
+export interface KeyTarget {
+  /** Names the service in batch output; empty on the single-package path. */
+  label: string;
+  /** The package being wired — where its env file lives. */
+  appDir: string;
+  varName: string | undefined;
+}
+
+/**
+ * Write the project's ingest key into every target's env file, minting AT MOST
+ * ONE key for the whole run.
+ *
+ * One key per project is the model (`POST /api/projects/:id/keys`), so a
+ * monorepo of nine services shares one credential and nine env files receive
+ * the same value. Minting per service would leave eight redundant live keys on
+ * a plan that counts them, and would make revoking one a partial revocation.
+ */
+async function writeIngestKeys(args: {
+  base: string;
+  token: string;
+  projectId: string;
+  /** The git work tree this run is in, which owns the .gitignore. */
+  repoRoot: string;
+  targets: KeyTarget[];
+  parsed: ParsedArgs;
+  deps: WizardDeps;
+}): Promise<Map<string, KeyWriteOutcome>> {
+  const { ui } = args.deps;
+  const results = new Map<string, KeyWriteOutcome>();
+  const named = (label: string) => (label ? `${label}: ` : "");
+
+  // 1. Decide everything first. No credential exists yet, so every refusal
+  // below costs nothing and leaves nothing behind.
+  const plans = new Map<string, EnvKeyPlan>();
+  for (const target of args.targets) {
+    if (!target.varName) {
+      results.set(target.label, { status: "no-variable" });
+      continue;
+    }
+    if (args.parsed.noWriteKey) {
+      results.set(target.label, {
+        status: "skipped-flag",
+        varName: target.varName,
+        note: `Key not written (--no-write-key). Set ${target.varName} yourself.`,
+      });
+      continue;
+    }
+    try {
+      plans.set(
+        target.label,
+        planEnvKeyWrite({
+          appDir: target.appDir,
+          repoRoot: args.repoRoot,
+          varName: target.varName,
+          io: args.deps.envFileIO,
+        }),
+      );
+    } catch (err) {
+      results.set(target.label, {
+        status: "failed",
+        varName: target.varName,
+        note: `Could not work out where to put the ingest key (${errMessage(err)}). Set ${target.varName} yourself.`,
+      });
+    }
+  }
+
+  // 2. Report the decisions that need no key.
+  for (const [label, plan] of plans) {
+    if (plan.kind === "already-set") {
+      ui.out(
+        `${color.green("✓")} ${named(label)}${color.bold(plan.varName)} is already set in ${color.cyan(rel(args.repoRoot, plan.file))} — left as it is.`,
+      );
+      results.set(label, {
+        status: "already-set",
+        file: plan.file,
+        varName: plan.varName,
+      });
+    } else if (plan.kind === "refused-tracked") {
+      // Adding it to .gitignore now would not untrack it, so the next commit
+      // would publish the key. Nothing is minted and nothing is written.
+      const where = rel(args.repoRoot, plan.file);
+      ui.out(
+        `${color.yellow("!")} ${named(label)}${color.cyan(where)} is tracked by git, so Crumbtrail will not write a key into it.`,
+      );
+      results.set(label, {
+        status: "refused-tracked",
+        file: plan.file,
+        varName: plan.varName,
+        note: `${where} is committed to git, so no key was written there. Move it out of version control, or set ${plan.varName} from your own secret store.`,
+      });
+    } else if (plan.kind === "no-variable") {
+      results.set(label, { status: "no-variable" });
+    }
+  }
+
+  const ready = [...plans].filter(([, p]) => p.kind === "ready");
+  if (ready.length === 0) return results;
+
+  // 3. One key for the run.
+  let key: string;
+  try {
+    key = await args.deps.createIngestKey(
+      args.base,
+      args.token,
+      args.projectId,
+      args.deps.fetchImpl,
+    );
+  } catch (err) {
+    for (const [label, plan] of ready) {
+      results.set(label, {
+        status: "failed",
+        varName: plan.kind === "ready" ? plan.varName : undefined,
+        note: `Could not mint an ingest key (${errMessage(err)}). Mint one in the dashboard and set it yourself.`,
+      });
+    }
+    return results;
+  }
+
+  // 4. Write. Each target applies all-or-nothing on its own, so one service's
+  // unwritable env file does not undo the eight that worked.
+  for (const [label, plan] of ready) {
+    if (plan.kind !== "ready") continue;
+    const where = rel(args.repoRoot, plan.file);
+    try {
+      applyEnvEdits(buildEnvKeyEdits(plan, key), args.deps.envFileIO);
+      ui.out(
+        `${color.green("✓")} ${named(label)}wrote ${color.bold(plan.varName)} to ${color.cyan(where)}.`,
+      );
+      if (plan.ignore) {
+        // Saying this is not optional. A file that was about to be committed
+        // silently is not any more, and someone who does not know that will go
+        // looking for why their env file stopped showing up in `git status`.
+        ui.out(
+          color.dim(
+            `  Added ${where} to .gitignore — it holds a live key now.`,
+          ),
+        );
+      }
+      results.set(label, {
+        status: "written",
+        file: plan.file,
+        varName: plan.varName,
+      });
+    } catch (err) {
+      // The key exists on the server but reached this file. Say so plainly: a
+      // key minted and lost is worse than one never minted, because nothing on
+      // the dashboard shows which run created it.
+      results.set(label, {
+        status: "failed",
+        file: plan.file,
+        varName: plan.varName,
+        note: `Minted an ingest key but could not write it to ${where} (${errMessage(err)}). Set ${plan.varName} from the dashboard instead.`,
+      });
+    }
+  }
+  return results;
+}
+
+/** The single-package path's one target. */
+async function writeIngestKey(args: {
+  base: string;
+  token: string;
+  projectId: string;
+  appDir: string;
+  repoRoot: string;
+  varName: string | undefined;
+  parsed: ParsedArgs;
+  deps: WizardDeps;
+}): Promise<KeyWriteOutcome> {
+  const results = await writeIngestKeys({
+    ...args,
+    targets: [{ label: "", appDir: args.appDir, varName: args.varName }],
+  });
+  return results.get("") ?? { status: "no-variable" };
+}
+
+/** A path as the reader would type it, falling back to absolute off-tree. */
+function rel(from: string, target: string): string {
+  const relative = path.relative(from, target);
+  return relative && !relative.startsWith("..") ? relative : target;
+}
+
 /** Announce + apply the injection plan, handling dirty-confirm and AI fallback. */
 async function applyInjection(
   plan: Plan,
@@ -1419,6 +1708,8 @@ function printSummary(
   notes: string[],
   keyEnvVar?: string,
   sessionUrl?: string,
+  keyWrite?: KeyWriteOutcome,
+  repoRoot?: string,
 ): void {
   // User-facing links point at the app host (the SPA), not the API host.
   const appBase = dashboardBase(base);
@@ -1427,11 +1718,23 @@ function printSummary(
   ui.out(`  Project:   ${p.projectName}`);
   ui.out(`  Service:   ${p.serviceName}`);
   if (keyEnvVar) {
-    // Hands-off: the installer wrote no key. Tell the user the var to set and
-    // where to mint the value.
-    ui.out(
-      `  Ingest key: set ${color.bold(keyEnvVar)} in .env ${color.dim(`(mint at ${appBase}/settings)`)}`,
-    );
+    // The one line that used to say the setup was not finished. It now reports
+    // what happened to the key rather than handing the job back by default.
+    const where =
+      keyWrite?.file && repoRoot ? rel(repoRoot, keyWrite.file) : ".env";
+    if (keyWrite?.status === "written") {
+      ui.out(
+        `  Ingest key: wrote ${color.bold(keyEnvVar)} to ${color.cyan(where)}`,
+      );
+    } else if (keyWrite?.status === "already-set") {
+      ui.out(
+        `  Ingest key: ${color.bold(keyEnvVar)} was already set in ${color.cyan(where)}`,
+      );
+    } else {
+      ui.out(
+        `  Ingest key: set ${color.bold(keyEnvVar)} in .env ${color.dim(`(mint at ${appBase}/settings)`)}`,
+      );
+    }
   }
   if (filesTouched.length > 0) {
     ui.out(`  Files:     ${filesTouched.join("\n             ")}`);
@@ -1491,7 +1794,8 @@ export function resolveAuthProbe(
   projectId: string | undefined,
   env: NodeJS.ProcessEnv,
 ): AuthProbe {
-  const explicit = (key && key.trim()) || (env.CRUMBTRAIL_KEY && env.CRUMBTRAIL_KEY.trim());
+  const explicit =
+    (key && key.trim()) || (env.CRUMBTRAIL_KEY && env.CRUMBTRAIL_KEY.trim());
   if (explicit) return { kind: "ingestKey", key: explicit };
   const stored = loadAuth(env);
   if (stored && stored.token && stored.endpoint === base) {
@@ -1518,7 +1822,9 @@ function renderPreflight(result: PreflightResult, ui: Ui): void {
   ui.out("");
   for (const s of result.stages) {
     const ms = s.status === "skipped" ? "" : color.dim(`(${s.ms}ms)`);
-    ui.out(`  ${STAGE_GLYPH[s.status]} ${STAGE_LABEL[s.stage]}  ${s.reason} ${ms}`.trimEnd());
+    ui.out(
+      `  ${STAGE_GLYPH[s.status]} ${STAGE_LABEL[s.stage]}  ${s.reason} ${ms}`.trimEnd(),
+    );
   }
   ui.out("");
   ui.out(
@@ -1528,7 +1834,10 @@ function renderPreflight(result: PreflightResult, ui: Ui): void {
   );
 }
 
-async function runVerify(parsed: ParsedArgs, deps: WizardDeps): Promise<number> {
+async function runVerify(
+  parsed: ParsedArgs,
+  deps: WizardDeps,
+): Promise<number> {
   const base = resolveEndpoint(parsed.endpoint, deps.env);
   const probe = resolveAuthProbe(base, parsed.key, parsed.project, deps.env);
   const result = await deps.runPreflight({

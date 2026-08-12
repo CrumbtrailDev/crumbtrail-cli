@@ -1,8 +1,11 @@
-// Provisioning: pick/create a project and add a service via the existing cloud
-// routes, carrying the CLI bearer token. Hands-off — it does NOT mint an ingest
-// key; the user mints one in the dashboard and sets it in their env. See
-// plans/cli-setup-wizard-design.md §4. Network calls inherit net.ts's
-// single-retry + method/URL-in-message policy.
+// Provisioning: pick/create a project, add a service, and mint the project's
+// ingest key, via the existing cloud routes and carrying the CLI bearer token.
+// Network calls inherit net.ts's single-retry + method/URL-in-message policy.
+//
+// Minting is deliberately NOT part of provisionFlow. env-file.ts decides first
+// whether the key has anywhere safe to go, and only then is one minted, so a
+// rerun against an already configured app does not leave a live unused
+// credential behind on every pass. The wizard sequences the two.
 
 import type { Stack } from "crumbtrail-core";
 import type { Recipe } from "./detect";
@@ -130,6 +133,34 @@ export async function createService(
   });
 }
 
+/**
+ * Mint a project-scoped ingest key and return it in plaintext.
+ *
+ * The route is additive by default: it issues another key and leaves existing
+ * ones live, which is the right shape here. Rotating would kill the key a
+ * deployed app is already using, and this wizard has no business doing that to
+ * a project it was merely pointed at.
+ *
+ * Plaintext is returned exactly once, by the server, and is never stored
+ * anywhere by this process — the caller writes it straight into the app's env
+ * file. See env-file.ts for the rules that write follows.
+ */
+export async function createIngestKey(
+  base: string,
+  token: string,
+  projectId: string,
+  fetchImpl?: typeof fetch,
+): Promise<string> {
+  const res = await requestJson<{ keyId?: string; apiKey?: string }>(
+    `${base}/api/projects/${projectId}/keys`,
+    { method: "POST", token, body: {}, fetchImpl },
+  );
+  if (typeof res.apiKey !== "string" || res.apiKey.length === 0) {
+    throw new Error("The server minted a key but returned no value for it.");
+  }
+  return res.apiKey;
+}
+
 // ── Orchestrated flow ────────────────────────────────────────────────────────
 
 export interface ProvisionInput {
@@ -236,11 +267,12 @@ export interface ProvisionServiceInput {
 }
 
 /**
- * Add one service to an already-resolved project. Hands-off: it does NOT mint an
- * ingest key — the user mints one in the dashboard and sets it in their env. The
- * created service is what gives them somewhere to mint that key against.
- * Prompt-free by design: the batch installer names services from detection
- * rather than asking N times.
+ * Add one service to an already-resolved project.
+ *
+ * Still key-free, and still on purpose: one key covers the whole project, so
+ * minting is a project-level step the wizard runs once, not something each
+ * service repeats. Prompt-free by design too — the batch installer names
+ * services from detection rather than asking N times.
  */
 export async function provisionService(
   input: ProvisionServiceInput,
@@ -296,9 +328,10 @@ export function uniqueServiceNames(
 
 /**
  * Resolve a project and add a service to it, returned to the wizard for the
- * summary. Hands-off — no key is minted. Composed from resolveProject +
- * provisionService so the single-package path keeps its exact behavior
- * (including the interactive "Service name" prompt).
+ * summary. Composed from resolveProject + provisionService so the
+ * single-package path keeps its exact behavior (including the interactive
+ * "Service name" prompt). The key is minted later, by the wizard, once
+ * env-file.ts has confirmed it has somewhere safe to go.
  */
 export async function provisionFlow(
   input: ProvisionInput,
