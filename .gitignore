@@ -51,9 +51,16 @@ Business Climate/market-first-verdict.md
 docs/research/
 docs/superpowers/
 plan/
+# `plugins/` is where locally installed third-party plugins land, so it is
+# ignored wholesale and the published ones are re-included by name.
 plugins/*
 !plugins/crumbtrail-mcp/
 !plugins/crumbtrail-mcp/**
+!plugins/crumbtrail-skills/
+!plugins/crumbtrail-skills/**
+!plugins/__tests__/
+!plugins/__tests__/**
+!plugins/vitest.config.ts
 
 # ── GSD baseline (auto-generated) ──
 .gsd

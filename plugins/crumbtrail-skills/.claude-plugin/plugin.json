@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "crumbtrail-skills",
+  "description": "Failure archetype skills for Crumbtrail. Each skill pairs one recurring failure shape with the exact Crumbtrail MCP calls that confirm or rule it out, so an agent troubleshoots against a recorded session instead of a generic checklist.",
+  "version": "0.1.0",
+  "author": { "name": "Crumbtrail", "url": "https://github.com/CrumbtrailDev" },
+  "homepage": "https://crumbtrail.ai",
+  "repository": "https://github.com/CrumbtrailDev/crumbtrail-cli",
+  "license": "MIT",
+  "keywords": [
+    "debugging",
+    "skills",
+    "failure-archetypes",
+    "troubleshooting",
+    "bug-context"
+  ]
+}

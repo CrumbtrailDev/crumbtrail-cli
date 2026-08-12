@@ -45,6 +45,10 @@ jobs:
       # `pnpm test` is `pnpm -r test`, which only reaches workspace packages.
       # scripts/ is not one, so the dev harness gates need their own run.
       - run: pnpm test:dev-harness
+      # plugins/ is not a workspace package either. This suite validates every
+      # SKILL.md against the live MCP tool table, so a skill naming a tool or a
+      # parameter that does not exist fails CI rather than an agent's turn.
+      - run: pnpm test:plugins
 
       # Dogfood the pre-deploy gate mechanism: the locally-built CLI must exit
       # NON-zero when the config is broken, which is what makes `.github/actions/verify`
