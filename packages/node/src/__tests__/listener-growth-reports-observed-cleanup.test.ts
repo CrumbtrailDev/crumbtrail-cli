@@ -139,4 +139,52 @@ describe("listener staircase reports observed churn instead of an assumed mechan
     expect(message).toMatch(/not observed|records the live count only/i);
     expect(message).not.toContain("0 removal");
   });
+
+  it("calls the span unmeasured when the counters restart mid-session", () => {
+    // A second init() in one page resets the collector's cumulative counters,
+    // so the later reading's totals are SMALLER than the earlier one's. The
+    // two readings no longer describe one span, and subtracting them anyway
+    // would manufacture "0 registrations, 0 removals" while five listeners are
+    // demonstrably live.
+    const message = String(
+      staircaseFor(
+        walk(
+          [1, 2, 3, 4, 5],
+          [
+            [9, 4],
+            [10, 4],
+            [3, 0],
+            [4, 0],
+            [5, 0],
+          ],
+        ),
+      )?.anchor?.message,
+    );
+    expect(message).toContain("1 → 5");
+    expect(message).toMatch(/not observed|records the live count only/i);
+    expect(message).not.toContain("0 removal");
+    expect(message).not.toContain("0 registration");
+  });
+
+  it("calls the span unmeasured when churn and live count disagree", () => {
+    // added - removed must equal the change in the live count; when it does
+    // not, the two readings are not one span and nothing may be reported from
+    // subtracting them.
+    const message = String(
+      staircaseFor(
+        walk(
+          [1, 2, 3, 4, 5],
+          [
+            [1, 0],
+            [2, 0],
+            [3, 0],
+            [4, 0],
+            [99, 0],
+          ],
+        ),
+      )?.anchor?.message,
+    );
+    expect(message).toMatch(/not observed|records the live count only/i);
+    expect(message).not.toContain("98 registration");
+  });
 });

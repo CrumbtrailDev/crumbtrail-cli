@@ -11220,28 +11220,42 @@ function listenerChurnByType(
  * reading lacks the counters.
  *
  * The span is the whole session between the two readings rather than the path
- * they were taken on, and that is stated. It is also arithmetically consistent
- * with the live figures either way: the live counts in `byType` are session
- * totals read at those two moments, so registrations minus removals over the
- * span is exactly the change in the live count.
+ * they were taken on, and that is stated.
+ *
+ * The counters are cumulative and monotone WITHIN one instrumented run, and
+ * that is the only condition under which the two readings describe one span:
+ * registrations minus removals over it is then exactly the change in the live
+ * count. A capture where the collector was torn down and started again mid-page
+ * breaks it — the later reading's counters begin at zero, so subtracting gives
+ * a negative or an incoherent pair. That is checked here rather than assumed,
+ * and a span that fails the check is UNMEASURED, which reads as the degraded
+ * wording. Clamping the subtraction instead would have manufactured the exact
+ * false zero this whole change exists to remove.
  */
 function describeListenerChurn(
   type: string,
   first: BugEvent,
   last: BugEvent,
+  liveDelta: number,
 ): string {
   const before = listenerChurnByType(first)?.get(type);
   const after = listenerChurnByType(last)?.get(type);
-  if (!before || !after) {
+  const added = after && before ? after.added - before.added : undefined;
+  const removed = after && before ? after.removed - before.removed : undefined;
+  if (
+    added === undefined ||
+    removed === undefined ||
+    added < 0 ||
+    removed < 0 ||
+    added - removed !== liveDelta
+  ) {
     return (
       `This capture records the live count only — registrations and removals were not ` +
-      `counted separately — so whether any cleanup ran is not observed here. The same rising ` +
-      `curve is produced by a subscription per mount that is never removed, and by one whose ` +
-      `removals simply do not keep up.`
+      `counted separately over that span — so whether any cleanup ran is not observed here. ` +
+      `The same rising curve is produced by a subscription per mount that is never removed, ` +
+      `and by one whose removals simply do not keep up.`
     );
   }
-  const added = Math.max(0, after.added - before.added);
-  const removed = Math.max(0, after.removed - before.removed);
   const observed =
     `Over that span the census recorded ${added} registration${added === 1 ? "" : "s"} ` +
     `of a "${type}" listener and ${removed} removal${removed === 1 ? "" : "s"}, across the whole session.`;
@@ -11328,7 +11342,7 @@ function addListenerTypeStaircaseCandidates(
           message:
             `Across ${readings.length} arrivals at ${path}, live "${type}" listeners ` +
             `went ${series[0]} → ${series[series.length - 1]} and never decreased. ` +
-            `${describeListenerChurn(type, first, last)} ` +
+            `${describeListenerChurn(type, first, last, series[series.length - 1] - series[0])} ` +
             `Every handler still registered fires again on each event, so the work is ` +
             `repeated once per earlier visit.`,
         }),
