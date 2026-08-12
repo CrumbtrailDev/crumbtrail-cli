@@ -64,17 +64,19 @@ When you have a moment in time and want everything around it, read the window ra
 }
 ```
 
-If the archetype is one that repeats, ask whether this failure has been seen before. `getRecurrence` takes a signature, so resolve one first:
+If the archetype is one that repeats, ask whether this failure has been seen before. `getRecurrence` takes a signature, so get one from the tool that groups failures across sessions:
 
 ```json
 [
   {
-    "tool": "resolveSignature",
-    "params": { "sessionId": "<sessionId>", "signature": "<candidate signature>" }
+    "tool": "listDistinctBugs",
+    "params": { "mode": "cross-session" }
   },
-  { "tool": "getRecurrence", "params": { "signature": "<resolved signature>" } }
+  { "tool": "getRecurrence", "params": { "signature": "<signature from the list above>" } }
 ]
 ```
+
+`recallSimilarIssues` is the other source of a signature, and it carries how past instances were resolved. Do not reach for `resolveSignature` here: it searches a session's interactive element map and does not return a recurrence signature.
 
 Two more entry points are worth knowing. `getFixContext` returns the whole ranked bundle for one session in a single call, which is the right move once you know which session matters. `listDistinctBugs` with `mode` set to the cross session value groups the same failure across sessions.
 
