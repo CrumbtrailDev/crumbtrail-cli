@@ -814,9 +814,10 @@ export function buildPlan(
   // Stamp the env var the injected code reads its key from, so the wizard can
   // print "set <VAR> in .env — get your key from the dashboard". Undefined for
   // recipes that inject no key (tauri / otlp / angular) or when already wired.
-  const envVar = keyRefFor(input)?.envVar;
-  if (envVar && plan.kind !== "skip-already-wired") {
-    plan.keyEnvVar = envVar;
+  const keyRef = keyRefFor(input);
+  if (keyRef && plan.kind !== "skip-already-wired") {
+    plan.keyEnvVar = keyRef.envVar;
+    if (keyRef.compileTime) plan.keyIsCompileTime = true;
   }
   return plan;
 }

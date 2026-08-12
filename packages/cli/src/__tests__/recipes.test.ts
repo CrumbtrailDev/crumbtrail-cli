@@ -339,6 +339,18 @@ describe("buildPlan — Flutter", () => {
     expect(plan.warnings.join(" ")).toContain("--dart-define=CRUMBTRAIL_KEY");
   });
 
+  it("marks the key compile-time, so the wizard writes no .env for it", () => {
+    const io = fakeInjectIO({ [MAIN]: SIMPLE_MAIN });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: MAIN },
+      io,
+    );
+    // Writing the key into a .env here would mint a live credential into a
+    // file the app never reads, and every step printed after it would report
+    // success for an app that captures nothing.
+    expect(plan.keyIsCompileTime).toBe(true);
+  });
+
   it("names the app, since one key covers the whole project", () => {
     const io = fakeInjectIO({ [MAIN]: SIMPLE_MAIN });
     const plan = buildPlan(

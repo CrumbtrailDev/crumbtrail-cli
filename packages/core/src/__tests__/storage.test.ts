@@ -91,6 +91,31 @@ describe("storageCollector", () => {
     cleanup();
   });
 
+  /**
+   * The consented capture path. Live probes gained a stricter, structure preserving key treatment
+   * because a probe is answered by a bystander's browser; this path records the session that
+   * actually hit the defect, so its keys are unchanged and the probe work must not touch them.
+   */
+  it("still emits an identifier bearing key verbatim in its snapshot", () => {
+    localStorage.setItem("user_12345_prefs", "{}");
+    sessionStorage.setItem("cart:alice@example.com:items", "[]");
+
+    const cleanup = storageCollector(
+      bus,
+      makeConfig({ captureIdb: false, captureCacheApi: false }),
+    );
+    bus.flush();
+
+    const snap = events.filter((e) => e.k === "snap")[0];
+    const d = snap.d as Record<string, Record<string, string>>;
+    expect(d.localStorage).toEqual({ user_12345_prefs: REDACTED_VALUE });
+    expect(d.sessionStorage).toEqual({
+      "cart:alice@example.com:items": REDACTED_VALUE,
+    });
+
+    cleanup();
+  });
+
   it("setItem monkey-patch emits stor event with old and new values", () => {
     localStorage.setItem("key1", "old");
 

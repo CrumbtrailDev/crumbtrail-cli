@@ -7,6 +7,7 @@ export type Command =
   | "inspect"
   | "compare"
   | "reanalyze"
+  | "backtest"
   | "help";
 
 export interface ParsedCommand {
@@ -23,6 +24,7 @@ const COMMAND_WORDS = new Set<Command>([
   "inspect",
   "compare",
   "reanalyze",
+  "backtest",
   "help",
 ]);
 const HELP_FLAGS = new Set(["--help", "-h"]);

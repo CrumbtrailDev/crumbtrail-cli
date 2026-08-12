@@ -41,6 +41,9 @@ function failure(opts: {
       url: opts.url,
       st: opts.status,
       id: opts.browserId,
+      // post-process carries the exchange's correlation id onto the index entry
+      // alongside the browser-local id; see `correlationIdOf` in post-process.ts.
+      ...(opts.requestId !== undefined ? { requestId: opts.requestId } : {}),
     },
   };
 }

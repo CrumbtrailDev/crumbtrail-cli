@@ -321,8 +321,12 @@ export function buildAgentPrompt(
     "do not refactor or touch anything else, then verify the build still passes.",
     "",
     `Ingest endpoint: ${endpoint}`,
-    `Ingest key:      read it from the ${envVar} environment variable — the user`,
-    "                 sets it in their .env. Do NOT hard-code the key in source.",
+    // Phrased for both callers. The CLI writes this variable into the app's env
+    // file itself; the dashboard's copy-the-snippet path leaves it to a person.
+    // Naming the file rather than who fills it is true either way, and the one
+    // instruction that matters — never inline the key — is the same for both.
+    `Ingest key:      read it from the ${envVar} environment variable, which is`,
+    "                 set in the app's env file. Do NOT hard-code it in source.",
     "",
     "This is a JavaScript/TypeScript project. Do the following:",
     "  1. Install the SDK:  npm install crumbtrail-core",

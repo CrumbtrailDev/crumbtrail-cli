@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "crumbtrail",
+  "owner": {
+    "name": "Crumbtrail",
+    "url": "https://github.com/CrumbtrailDev"
+  },
+  "plugins": [
+    {
+      "name": "crumbtrail-mcp",
+      "source": "./plugins/crumbtrail-mcp",
+      "description": "Connects the Crumbtrail MCP server so Claude can read recorded browser sessions: clicks, requests, backend spans, and the exact database rows that changed, served as one ranked fix bundle.",
+      "license": "MIT"
+    },
+    {
+      "name": "crumbtrail-skills",
+      "source": "./plugins/crumbtrail-skills",
+      "description": "Failure archetype skills that pair one recurring failure shape with the exact Crumbtrail MCP calls that confirm or rule it out.",
+      "license": "MIT"
+    }
+  ]
+}

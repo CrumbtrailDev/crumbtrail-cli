@@ -51,7 +51,7 @@ export async function runReanalyze(rest: string[]): Promise<number> {
 
   const sessionDirs = all
     ? findFinalizedSessionDirs(outputDir)
-    : [resolveTarget(target as string, outputDir)];
+    : [resolveSessionTarget(target as string, outputDir)];
 
   if (sessionDirs.length === 0) {
     process.stderr.write(
@@ -117,7 +117,7 @@ async function reanalyzeOne(
  * both the flat layout and the V2 `{tenant}/{app}/{date}/{sessionId}` partition
  * without assuming a fixed depth.
  */
-function findFinalizedSessionDirs(outputDir: string): string[] {
+export function findFinalizedSessionDirs(outputDir: string): string[] {
   const found: string[] = [];
   const walk = (dir: string, depth: number): void => {
     if (depth > 5) return;
@@ -162,7 +162,11 @@ function formatReports(reports: ReanalyzeReport[], dryRun: boolean): string {
   return lines.join("\n");
 }
 
-function resolveTarget(target: string, outputDir: string): string {
+/** Resolves a bare session id or a path argument to a session directory. */
+export function resolveSessionTarget(
+  target: string,
+  outputDir: string,
+): string {
   if (
     target.includes("/") ||
     target.includes("\\") ||

@@ -29,6 +29,16 @@ export interface KeyRef {
   envVar: string;
   /** The exact code expression the snippet uses to read it. */
   expr: string;
+  /**
+   * The value is baked in at BUILD time, not read from the environment when the
+   * app runs. Only Flutter: a released Dart app has no environment to read on
+   * iOS or Android, so the name is supplied with `--dart-define`.
+   *
+   * Load-bearing, not cosmetic. The wizard writes the key into an env file by
+   * default; doing that here would produce a file the app never reads and an
+   * app that captures nothing, with every printed step claiming success.
+   */
+  compileTime?: boolean;
 }
 
 export interface RecipeMeta {
@@ -102,6 +112,7 @@ const NODE_KEY: KeyRef = {
 const FLUTTER_KEY: KeyRef = {
   envVar: "CRUMBTRAIL_KEY",
   expr: "String.fromEnvironment('CRUMBTRAIL_KEY')",
+  compileTime: true,
 };
 
 /**
