@@ -24,6 +24,7 @@ import {
 } from "./token-estimate";
 import { compareSessions } from "./compare";
 import { buildRegressionContext } from "./compare/regression-context";
+import { correlateWindow } from "./window-correlation";
 import { type Symptom, type GitHostClient } from "crumbtrail-core";
 import {
   buildDistinctBugSignature,
@@ -899,6 +900,41 @@ const TOOLS = [
       required: ["project"],
     },
   },
+  /** @stability stable */
+  {
+    name: "getWindowCorrelation",
+    description:
+      "Answer 'what measurably changed during this window' for a recorded session, with no detector involved. It holds the highlight window [t0,t1] against the quiet stretch immediately before it and reports which event kinds changed rate and which numeric fields changed distribution, ranked by p value and cut at a Benjamini Hochberg false discovery rate. Reach for it instead of getWindow when you know roughly WHEN the failure happened but not WHAT went wrong: when getSessionManifest surfaced no candidate, when the candidate it surfaced does not explain the symptom, or when a detector fired and you want to know what else moved at the same moment. getWindow hands you the raw events and leaves the reading to you; this tells you which of them are unusual for this session. A low p value is a CORRELATION and not a cause. It says the window differs from its baseline, never that the row caused the failure, and a busy window will contain changes that are consequences of the bug or coincidences beside it. Treat each row as a lead, confirm it against the raw events with getWindow, and do not ship a fix whose only evidence is a p value. An empty rows list means nothing cleared the significance cut, not that the session is healthy. Reads only the cold event stream, so it answers the same way for local and hosted sessions.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        sessionId: { type: "string" },
+        t0: {
+          type: "number",
+          description:
+            "Highlight window start (absolute ms, inclusive). Same units as manifest.session.startMs and candidate.evidenceWindow.start.",
+        },
+        t1: {
+          type: "number",
+          description: "Highlight window end (absolute ms, inclusive)",
+        },
+        baselineMultiplier: {
+          type: "number",
+          description:
+            "Baseline width as a multiple of the highlight width, default 4, clamped to 1..50. The baseline is the half open span [t0 - multiplier * (t1 - t0), t0), so an event landing exactly on t0 belongs to the highlight and is never counted twice. Widen it for a steadier baseline, narrow it when the session changed behaviour shortly before t0.",
+        },
+        limit: {
+          type: "number",
+          description: "Max rows to return (default and hard cap 500)",
+        },
+        maxTokens: {
+          ...MAX_TOKENS_SCHEMA,
+          description: `${MAX_TOKENS_DESCRIPTION} getWindowCorrelation budgets one list: rows are already ordered most significant first, so they are dropped from the end, and each dropReport ref names the dropped row as <kind>.<field>.`,
+        },
+      },
+      required: ["sessionId", "t0", "t1"],
+    },
+  },
 ];
 
 // Canonical tool names are camelCase. Every tool also accepts a snake_case
@@ -1114,6 +1150,8 @@ export class McpServer {
         return this.toolGetSessionManifest(args);
       case "getWindow":
         return this.toolGetWindow(args);
+      case "getWindowCorrelation":
+        return this.toolGetWindowCorrelation(args);
       case "getEvidence":
         return this.toolGetEvidence(args);
       case "getStorageSnapshot":
@@ -2512,6 +2550,76 @@ export class McpServer {
           const keptCount = kept.get("events")!.length;
           out.returned = keptCount;
           out.truncated = matched.length > keptCount;
+        },
+      },
+    );
+  }
+
+  /**
+   * Detector free window scoring. Reads the SAME cold stream as getWindow, and
+   * reads it the same way: `this.store` only, never `fs`. A direct fs read here
+   * would work on a developer's laptop and return "Session not found" for every
+   * hosted session, because in cloud mode the artifacts live behind
+   * RemoteMcpReadStore and nothing is on disk to find.
+   */
+  private async toolGetWindowCorrelation(args: Record<string, unknown>) {
+    const budget = this.maxTokensOf(args);
+    if ("error" in budget) return errorResult(budget.error);
+    const dir = await this.sessionDirAsync(args.sessionId as string);
+    const t0 = numberField(args.t0);
+    const t1 = numberField(args.t1);
+    if (t0 === undefined || t1 === undefined)
+      return errorResult(
+        "getWindowCorrelation requires numeric t0 and t1 (absolute ms)",
+      );
+
+    const events = await this.readColdEventsAsync(dir);
+    if (events === undefined && !(await this.sessionExistsAsync(dir)))
+      return errorResult("Session not found");
+
+    const requestedMultiplier = numberField(args.baselineMultiplier);
+    const baselineMultiplier =
+      requestedMultiplier === undefined
+        ? 4
+        : Math.max(1, Math.min(50, requestedMultiplier));
+
+    // A session with no cold stream is a real, answerable case: the windows are
+    // empty and nothing changed. Scoring the empty array keeps that answer the
+    // same shape as every other one instead of a second bespoke payload.
+    const correlation = correlateWindow(events ?? [], {
+      t0,
+      t1,
+      baselineMultiplier,
+    });
+    const returned = correlation.rows.slice(0, this.windowCap(args.limit));
+    const payload = {
+      sessionId: args.sessionId,
+      units: "absolute-ms",
+      baseline: correlation.baseline,
+      highlight: correlation.highlight,
+      baselineMultiplier: correlation.baselineMultiplier,
+      q: correlation.q,
+      testsRun: correlation.testsRun,
+      count: correlation.rows.length,
+      returned: returned.length,
+      truncated: correlation.rows.length > returned.length,
+      caveat:
+        "Each row is a correlation, not a cause: it says the highlight window differs from its baseline. Confirm a row against the raw events with getWindow before acting on it.",
+      rows: returned,
+    };
+    if (budget.maxTokens === undefined) return textResult(payload);
+    // Rows arrive most significant first, so the budget drops from the TAIL and
+    // the strongest lead is never the first casualty. Rows carry no id, so a
+    // drop-report ref is the dimension it scored: "<kind>.<field>".
+    return this.budgetedTextResult(
+      payload as unknown as Record<string, unknown>,
+      [budgetPlane("rows", returned, (row) => `${row.kind}.${row.field}`)],
+      budget.maxTokens,
+      {
+        onKept: (out, kept) => {
+          const keptCount = kept.get("rows")!.length;
+          out.returned = keptCount;
+          out.truncated = correlation.rows.length > keptCount;
         },
       },
     );
