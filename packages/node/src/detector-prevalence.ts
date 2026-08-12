@@ -26,10 +26,26 @@ export interface DetectorPrevalence {
   /** The store root that was scanned, resolved. */
   corpusRoot: string;
   /**
-   * How many sessions OTHER than this one the scan read. This is the denominator, and it travels
-   * with every count so a reader is never shown a proportion whose base they cannot see.
+   * How many sessions OTHER than this one the scan ACTUALLY READ. This is the denominator, and it
+   * travels with every count so a reader is never shown a proportion whose base they cannot see.
+   *
+   * When {@link DetectorPrevalence.truncated} is true this is the cap, not the store's size: the
+   * denominator names the scanned set and never the set that exists. A count over a silently
+   * truncated corpus is worse than no count, because it is indistinguishable from a complete one.
    */
   priorSessions: number;
+  /**
+   * True when the store held more prior sessions than {@link MAX_SCANNED_PRIOR_SESSIONS} and only
+   * the most recent were read. Every consumer that renders {@link DetectorPrevalence.priorSessions}
+   * must say so, in the number AND in any prose that explains what the number means — a truthful
+   * count under a sentence claiming it covers the whole store is still a fabricated measurement.
+   *
+   * Optional because this interface is part of the published SDK surface and an embedder that
+   * builds one — {@link WriteLlmBundleInput.prevalence} takes a caller-supplied measurement —
+   * would otherwise stop compiling on an upgrade. Absent means the same as false: a scan that did
+   * not truncate. Read it as `=== true`, never as truthiness on a field that may not be there.
+   */
+  truncated?: boolean;
   /** detector -> how many of those prior sessions it fired in AT LEAST ONCE. */
   firedIn: Record<string, number>;
 }
@@ -54,6 +70,31 @@ export interface DetectorPrevalence {
  * not consulted by any ranking, score, severity or candidate-ordering input, here or downstream.
  */
 export const MIN_PRIOR_SESSIONS_FOR_PREVALENCE = 12;
+
+/**
+ * How many prior sessions one measurement is allowed to READ.
+ *
+ * This scan runs on the finalize path, where a user is waiting for their bundle, and it costs one
+ * JSON read and parse per prior session. Measured on a real-sized `llm.json` the uncapped scan is
+ * linear at about 1.5 ms per prior session: unnoticeable at the 60 sessions it was first measured
+ * on, about 1.8 s at a thousand, and about 15 s at ten thousand — and a customer's store only ever
+ * grows. An observable that gets slower forever is a defect however useful the number is.
+ *
+ * A cap is only admissible because the count it produces still travels with an HONEST denominator:
+ * above the cap the reader is told the scanned set — `3 of 200 most recent prior sessions` — and
+ * never the store's size, which the scan did not look at. See {@link DetectorPrevalence.truncated}.
+ *
+ * It must stay at or above {@link MIN_PRIOR_SESSIONS_FOR_PREVALENCE}: the floor is applied to the
+ * SCANNED count, so a cap below the floor would make every measurement fall under it and silently
+ * remove the column from every store in the world.
+ *
+ * KNOWN AND NOT CLOSED BY THIS CAP: enumerating the store to find the most recent sessions is still
+ * a whole-tree synchronous walk inside `SessionStore.listSessions`, measured at about 0.3 ms per
+ * session in the store. The cap removes the JSON read and parse, which is about 80% of the cost;
+ * the remaining walk is a bound on a different seam (a store listing that can stop early without
+ * losing the symlink-containment checks that walk performs) and belongs with that seam, not here.
+ */
+export const MAX_SCANNED_PRIOR_SESSIONS = 200;
 
 /** `{tenant}/{app}/{YYYY-MM-DD}/{sessionId}` — the depth of a finalized session below its store. */
 const PARTITION_DEPTH = 4;
@@ -100,6 +141,45 @@ export interface MeasureDetectorPrevalenceOptions {
   corpusRoot?: string;
   /** Override the disclosure floor. Defaults to {@link MIN_PRIOR_SESSIONS_FOR_PREVALENCE}. */
   minPriorSessions?: number;
+  /**
+   * Override how many prior sessions may be read. Defaults to {@link MAX_SCANNED_PRIOR_SESSIONS}.
+   *
+   * Lowering it below the effective floor yields no measurement at all, since the floor is applied
+   * to the scanned count; a caller that lowers this for a test must lower `minPriorSessions` too.
+   */
+  maxScannedSessions?: number;
+}
+
+/**
+ * The order the cap selects in: MOST RECENT FIRST, by the `{YYYY-MM-DD}` date partition the session
+ * is stored under, then by session id, then by resolved path.
+ *
+ * A cap without a defined order is not a measurement. `listSessions` walks the tree with a stack
+ * and returns whatever order the filesystem handed it, so "the first 200" would differ between two
+ * runs over the same store and between two machines holding the same sessions — a number nobody can
+ * reproduce and nobody can check. Recency is the order the reader is already being told about
+ * ("most recent prior sessions") and the only one that makes a base rate mean anything: a store's
+ * OLDEST sessions describe an application that may no longer exist.
+ *
+ * Both keys are read from the path, not from `meta.json`, so ordering costs no extra I/O — the
+ * point of the cap is to stop reading files. Session ids are time-ordered strings, so they break
+ * ties within a day in the same direction. The final compare on the full resolved path makes the
+ * order TOTAL rather than merely sorted: `listSessions` accepts a session at any depth, so a store
+ * shaped differently can yield sessions with no date partition at all (they sort last, together),
+ * and ids are only unique within a tenant/app. Without that last key a sort over an unordered input
+ * stays unordered wherever the first two keys tie.
+ */
+function compareByRecencyDescending(a: string, b: string): number {
+  const aDate = path.basename(path.dirname(a));
+  const bDate = path.basename(path.dirname(b));
+  const aKey = DATE_PARTITION.test(aDate) ? aDate : "";
+  const bKey = DATE_PARTITION.test(bDate) ? bDate : "";
+  if (aKey !== bKey) return aKey < bKey ? 1 : -1;
+  const aId = path.basename(a);
+  const bId = path.basename(b);
+  if (aId !== bId) return aId < bId ? 1 : -1;
+  if (a === b) return 0;
+  return a < b ? 1 : -1;
 }
 
 /**
@@ -113,6 +193,11 @@ export interface MeasureDetectorPrevalenceOptions {
  *
  * Presence is counted ONCE PER SESSION, not once per firing. The question is "in how many sessions
  * does this appear", and a detector that fires forty times in one session is not thereby common.
+ *
+ * At most {@link MAX_SCANNED_PRIOR_SESSIONS} sessions are read, most recent first, so the finalize
+ * path costs a bounded amount of work in a store of any size. When that bound bites, the result
+ * says so through {@link DetectorPrevalence.truncated} and every renderer must pass it on: the
+ * denominator this returns is always the number of sessions actually read.
  */
 export async function measureDetectorPrevalence(
   options: MeasureDetectorPrevalenceOptions,
@@ -128,10 +213,19 @@ export async function measureDetectorPrevalence(
     // the session id inside its meta.json are not guaranteed to agree, and excluding the current
     // session by the wrong one of those would let it count itself as its own prior.
     const self = path.resolve(options.sessionDir);
+    const cap = options.maxScannedSessions ?? MAX_SCANNED_PRIOR_SESSIONS;
+    const priors = (await defaultSessionStore.listSessions(corpusRoot))
+      .map(({ dir }) => path.resolve(dir))
+      .filter((dir) => dir !== self)
+      .sort(compareByRecencyDescending);
+    // Truncation is decided BEFORE any file is read, and recorded, because it changes what the
+    // denominator is allowed to say. The scan reads only what it will count, and counts only what
+    // it read: `priorSessions` below is the size of the scanned slice, never the store's size.
+    const truncated = priors.length > cap;
+    const scanned = truncated ? priors.slice(0, cap) : priors;
     const firedIn: Record<string, number> = {};
     let priorSessions = 0;
-    for (const { dir } of await defaultSessionStore.listSessions(corpusRoot)) {
-      if (path.resolve(dir) === self) continue;
+    for (const dir of scanned) {
       priorSessions += 1;
       const detectors = new Set<string>();
       for (const bug of await readSessionDistinctBugs(dir)) {
@@ -146,7 +240,7 @@ export async function measureDetectorPrevalence(
         firedIn[detector] = (firedIn[detector] ?? 0) + 1;
     }
     if (priorSessions < floor) return undefined;
-    return { corpusRoot, priorSessions, firedIn };
+    return { corpusRoot, priorSessions, truncated, firedIn };
   } catch {
     return undefined;
   }

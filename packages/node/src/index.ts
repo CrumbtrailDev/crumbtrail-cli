@@ -180,6 +180,7 @@ export {
   deriveCorpusRoot,
   measureDetectorPrevalence,
   MIN_PRIOR_SESSIONS_FOR_PREVALENCE,
+  MAX_SCANNED_PRIOR_SESSIONS,
 } from "./detector-prevalence";
 export type {
   DetectorPrevalence,
