@@ -5220,6 +5220,11 @@ function renderDetectedSignalsSection(
 ): string[] {
   if (!bugs || bugs.length === 0) return [];
   const shown = bugs.slice(0, MAX_RENDERED_SIGNALS);
+  // Whether ANY row of THIS bundle carries a base-rate measurement. A property of the data being
+  // rendered, computed from the same cell function the table uses, so the column, its cells and
+  // the paragraph that teaches it can never disagree about whether the measurement exists.
+  const baseRateCells = shown.map((bug) => detectorBaseRateCell(bug, prevalence));
+  const baseRateMeasured = baseRateCells.some((cell) => cell !== "");
   const lines = [
     "## Detected Signals",
     "",
@@ -5254,28 +5259,38 @@ function renderDetectedSignalsSection(
     // wallpaper every time, at the top of the page, where it is read as the headline. The only
     // thing that separates the two is a fact about the OTHER sessions, which is why it arrives
     // here as its own disclosure rather than as an adjustment to anything above it.
-    "`Base rate` is how many of the sessions already recorded for this application, other than "
-      + "this one, the same detector fired in. It answers what no grade above it can: whether the "
-      + "finding is peculiar to this incident or a standing condition of the application. A "
-      + "detector that fires in most sessions was firing before the reported symptom existed, "
-      + "however severe it is and however well it is attached here, and a headline taken from one "
-      + "is a lead pointing at the background. A blank cell means the value is UNKNOWN, not low: "
-      + "too few sessions are recorded yet to say anything, which is where every application "
-      + "starts. Read a low count as \"rarely seen in what has been recorded\" — the store knows "
-      + "only the sessions it holds, so it is never proof that a finding is new. Nothing here "
-      + "moves a row: the table is ordered exactly as it would be without this column."
-      // Appended ONLY when the scan was capped, and the paragraph above is byte-identical when it
-      // was not. The sentence above says the denominator is the sessions recorded for this
-      // application; under a cap that is false, and a truthful cell under a false paragraph is
-      // still a fabricated number. The count and its denominator travel together — so the
-      // denominator's MEANING has to travel with them too.
-      + (prevalence?.truncated === true
-        ? " This store holds more sessions than one bundle is allowed to read, so the counts "
-          + `above were measured over the ${prevalence.priorSessions} MOST RECENT prior sessions `
-          + "only, chosen by their recorded date. The denominator names exactly what was read: "
-          + "nothing here says anything about the older sessions, in either direction."
-        : ""),
-    "",
+    //
+    // Emitted only when some row of THIS bundle actually carries the measurement. A bundle with no
+    // prevalence at all renders every cell of the column blank, and teaching a reader how to weigh
+    // a grade this bundle holds no value of spends their context on nothing — the lesson and the
+    // measurement travel together or neither is emitted. When one row is measured this is
+    // byte-identical to what shipped before the condition existed.
+    ...(baseRateMeasured
+      ? [
+        "`Base rate` is how many of the sessions already recorded for this application, other than "
+          + "this one, the same detector fired in. It answers what no grade above it can: whether the "
+          + "finding is peculiar to this incident or a standing condition of the application. A "
+          + "detector that fires in most sessions was firing before the reported symptom existed, "
+          + "however severe it is and however well it is attached here, and a headline taken from one "
+          + "is a lead pointing at the background. A blank cell means the value is UNKNOWN, not low: "
+          + "too few sessions are recorded yet to say anything, which is where every application "
+          + "starts. Read a low count as \"rarely seen in what has been recorded\" — the store knows "
+          + "only the sessions it holds, so it is never proof that a finding is new. Nothing here "
+          + "moves a row: the table is ordered exactly as it would be without this column."
+          // Appended ONLY when the scan was capped, and the paragraph above is byte-identical when it
+          // was not. The sentence above says the denominator is the sessions recorded for this
+          // application; under a cap that is false, and a truthful cell under a false paragraph is
+          // still a fabricated number. The count and its denominator travel together — so the
+          // denominator's MEANING has to travel with them too.
+          + (prevalence?.truncated === true
+            ? " This store holds more sessions than one bundle is allowed to read, so the counts "
+              + `above were measured over the ${prevalence.priorSessions} MOST RECENT prior sessions `
+              + "only, chosen by their recorded date. The denominator names exactly what was read: "
+              + "nothing here says anything about the older sessions, in either direction."
+            : ""),
+          "",
+        ]
+      : []),
     table(
       [
         "Offset",
@@ -5283,11 +5298,11 @@ function renderDetectedSignalsSection(
         "Detector",
         "Support",
         "Why unattached",
-        "Base rate",
+        ...(baseRateMeasured ? ["Base rate"] : []),
         "Finding",
         "Where",
       ],
-      shown.map((bug) => [
+      shown.map((bug, at) => [
         bug.window?.start !== undefined && bug.firstSeen !== undefined
           ? `${bug.firstSeen - bug.window.start} ms`
           : "unknown",
@@ -5301,10 +5316,12 @@ function renderDetectedSignalsSection(
         // renders as nothing rather than as a placeholder word: `none` or `n/a` in this cell would
         // read as an assertion about a row that was never isolated at all.
         isolationReasonCell(bug),
-        // Empty on every row of every session in a store with too few priors to measure — which
-        // is every session of a new application. Absence renders as nothing, never as a zero or a
-        // percentage, because a default state that reads as an assertion is worse than a silence.
-        detectorBaseRateCell(bug, prevalence),
+        // Empty on the rows this bundle holds no measurement for. Absence renders as nothing,
+        // never as a zero or a percentage, because a default state that reads as an assertion is
+        // worse than a silence — and when EVERY row is empty the column is gone entirely, on the
+        // same condition as its header above and its paragraph before it, so a reader is never
+        // shown a column of blanks with a lesson attached. One measured row keeps all three.
+        ...(baseRateMeasured ? [baseRateCells[at]] : []),
         // Title AND message. A detector puts the specifics in whichever of the two it has — the
         // click detector names the covered control in its title and carries no message at all, so
         // preferring one over the other drops the part that identifies the defect.

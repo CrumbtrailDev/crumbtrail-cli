@@ -211,14 +211,20 @@ describe("a detector's cross-session base rate reaches the reader", () => {
     expect(rareCell.fired * 2).toBeLessThan(rareCell.priors);
   });
 
-  it("renders the cell BLANK, asserting nothing, when the store holds too few prior sessions", async () => {
+  it("asserts NOTHING — no column, no lesson — when the store holds too few prior sessions", async () => {
     const { root } = storeWithPriors(MIN_PRIOR_SESSIONS_FOR_PREVALENCE - 1);
     const markdown = await renderInStore(root);
 
-    // The column is still there — the reader is told the question exists — and the cell is empty.
-    expect(headerCells(markdown)).toContain(BASE_RATE_COLUMN);
-    expect(cell(markdown, COMMON, BASE_RATE_COLUMN)).toBe("");
-    expect(cell(markdown, RARE, BASE_RATE_COLUMN)).toBe("");
+    // Every cell of the column would be empty here, so the column goes with them, and so does the
+    // paragraph that teaches how to read it: a lesson about a grade this bundle carries no value
+    // of spends the reader's context on nothing. Both directions are pinned in
+    // `detector-base-rate-column-suppressed-when-empty.test.ts`.
+    //
+    // This assertion was INVERTED when that rule shipped. It read
+    // `expect(headerCells(markdown)).toContain(BASE_RATE_COLUMN)` with two `cell(...)` checks for
+    // the empty string — an empty column WITH its header. The case's real subject, below, is that
+    // an absence is never turned into an assertion, and suppression strengthens it.
+    expect(headerCells(markdown)).not.toContain(BASE_RATE_COLUMN);
 
     // And the absence is nowhere turned into an assertion, in the cell or in the prose around it.
     const section = detectedSignalsSection(markdown);
@@ -235,7 +241,10 @@ describe("a detector's cross-session base rate reaches the reader", () => {
     // nothing else. An observable that inferred its corpus would call every detector universal.
     const { root } = storeWithPriors(0);
     const markdown = await renderInStore(root);
-    expect(cell(markdown, COMMON, BASE_RATE_COLUMN)).toBe("");
+    // The point of the case, unchanged: no count is manufactured out of the session itself. The
+    // `cell(markdown, COMMON, BASE_RATE_COLUMN)` check that stood here asserted the empty cell of
+    // a column that is now suppressed entirely — a suppressed column has no cells to read.
+    expect(headerCells(markdown)).not.toContain(BASE_RATE_COLUMN);
     expect(detectedSignalsSection(markdown)).not.toContain("of 1 prior sessions");
   });
 
