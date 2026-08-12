@@ -362,9 +362,27 @@ function readIndexAudioSummary(
   }
 }
 
+/**
+ * Options for the derived artifacts a post-process run produces.
+ */
+export interface PostProcessOptions {
+  /**
+   * The store to measure detector base rates ACROSS. Defaults to the store root derived from
+   * `sessionDir`, which is what a deployment wants: every session of an application accumulates
+   * in one partition tree and that tree IS the corpus.
+   *
+   * Passed explicitly when it is not — a session replayed, imported or repaired into a directory
+   * of its own has a corpus of exactly itself, and a base rate measured there would report every
+   * detector as universal. That number would look precisely like a real one, which is why the
+   * corpus is a parameter rather than always an inference.
+   */
+  corpusRoot?: string;
+}
+
 export async function postProcess(
   sessionDir: string,
   whisperModel?: string,
+  options?: PostProcessOptions,
 ): Promise<void> {
   const eventsPath = path.join(sessionDir, "events.ndjson");
   const events = fs.existsSync(eventsPath) ? await readEvents(eventsPath) : [];
@@ -378,6 +396,9 @@ export async function postProcess(
     events: audioResult.events,
     truncation,
     audio: audioResult.audio,
+    ...(options?.corpusRoot !== undefined
+      ? { corpusRoot: options.corpusRoot }
+      : {}),
   });
 }
 
@@ -392,6 +413,8 @@ interface AnalyzeSessionInput {
    * first finalize must do.
    */
   coldEvidence?: ColdEvidenceArtifacts;
+  /** Explicit corpus root for detector base rates; derived from `sessionDir` when omitted. */
+  corpusRoot?: string;
 }
 
 /**
@@ -401,6 +424,8 @@ interface AnalyzeSessionInput {
  */
 async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
   const { sessionDir, truncation } = input;
+  const corpusRootInput =
+    input.corpusRoot !== undefined ? { corpusRoot: input.corpusRoot } : {};
   const audioResult: AudioProcessResult = {
     events: input.events,
     ...(input.audio !== undefined ? { audio: input.audio } : {}),
@@ -428,6 +453,7 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
       events: mergedEvents,
       index,
       candidates,
+      ...corpusRootInput,
     });
     await writeTwoPlaneSessionArtifacts({
       sessionDir,
@@ -623,6 +649,7 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
     events: mergedEvents,
     index,
     candidates,
+    ...corpusRootInput,
   });
   await writeTwoPlaneSessionArtifacts({
     sessionDir,

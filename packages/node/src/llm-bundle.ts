@@ -25,6 +25,10 @@ import {
 import type { EvidenceCandidate } from "./evidence-index";
 import type { CausalConfidence } from "./causal-graph";
 import { defaultSessionStore } from "./session-store";
+import {
+  measureDetectorPrevalence,
+  type DetectorPrevalence,
+} from "./detector-prevalence";
 
 export const BROWSER_REDACTION_POLICY =
   "crumbtrail.browser-redaction.v1" as const;
@@ -637,6 +641,19 @@ export interface LlmBundle {
    * `[]` when no signals were detected. See {@link DistinctBug}.
    */
   distinctBugs: DistinctBug[];
+  /**
+   * How often each of this session's detectors fired in the OTHER sessions already in the store —
+   * the one question a per-session analysis structurally cannot answer, because the answer is a
+   * fact about the store. See {@link DetectorPrevalence}.
+   *
+   * ABSENT, rather than zero-filled, whenever the store holds too few prior sessions to say
+   * anything: a first session has no priors, so unknown is this field's default state, and
+   * consumers MUST render its absence as nothing at all. An absent base rate is not a low one.
+   *
+   * Additive disclosure. It is not an input to any ordering, score or severity, and
+   * `distinctBugs` is the same list in the same order whether this is present or not.
+   */
+  detectorPrevalence?: LlmBundleDetectorPrevalence;
   /** Redaction-aware environment snapshot for the session, or `null` when none was captured. */
   environment: LlmBundleEnvironment | null;
   /**
@@ -686,6 +703,28 @@ export interface LlmBundle {
   inspectionGuide: Array<{ step: number; path: string; purpose: string }>;
 }
 
+/**
+ * The cross-session base rate of the detectors THIS session produced, carried into the bundle so
+ * the count and its denominator travel together. A bare proportion whose base a reader cannot see
+ * is not a measurement they can weigh.
+ *
+ * Only detectors this session actually produced appear: the bundle describes this session, and the
+ * store's full detector census belongs to the store, not to one incident's brief.
+ */
+export interface LlmBundleDetectorPrevalence {
+  /** Sessions other than this one that the scan actually READ — the denominator. */
+  priorSessions: number;
+  /**
+   * Present and true only when the store held more prior sessions than the scan is allowed to read
+   * and the most recent were taken. Then `priorSessions` is the scanned slice, not the store, and
+   * both the cell and the paragraph that explains it must name the slice. Omitted entirely when the
+   * whole store was read, so a complete measurement carries no field at all rather than a `false`.
+   */
+  truncated?: boolean;
+  /** Per detector present in this session, how many of those prior sessions it fired in. */
+  detectors: Array<{ detector: string; priorSessionsFiredIn: number }>;
+}
+
 /** A downstream symptom nested under a root in {@link LlmBundleCausalRoot}. */
 export interface LlmBundleCausalSymptom {
   id: string;
@@ -717,6 +756,22 @@ export interface WriteLlmBundleInput {
   index: SessionIndexLike;
   /** Ranked evidence candidates for the session; grouped into `distinctBugs`. Defaults to `[]`. */
   candidates?: EvidenceCandidate[];
+  /**
+   * Where to measure detector base rates ACROSS. Defaults to the store root derived from
+   * `sessionDir`, which is correct for a deployment. Pass it when the corpus is somewhere else —
+   * a session replayed or imported into a directory of its own would otherwise measure itself
+   * against a corpus of one and report every detector as universal.
+   *
+   * Read only by {@link writeLlmBundle}, which does the scan; {@link buildLlmBundle} is pure and
+   * takes the finished measurement through `prevalence` instead.
+   */
+  corpusRoot?: string;
+  /**
+   * A base-rate measurement made by the caller. When omitted, {@link writeLlmBundle} measures it
+   * and {@link buildLlmBundle} renders no base rates at all — the absence renders as nothing,
+   * never as zero.
+   */
+  prevalence?: DetectorPrevalence;
 }
 
 interface RedactionAccumulator {
@@ -919,7 +974,20 @@ const IMPORTANT_EVENT_KINDS = new Set([
 export async function writeLlmBundle(
   input: WriteLlmBundleInput,
 ): Promise<LlmBundle> {
-  const bundle = buildLlmBundle(input);
+  // Measured here rather than inside buildLlmBundle because it is the one part of the bundle that
+  // reads OTHER sessions, and buildLlmBundle stays a pure function of this one. It never throws
+  // and returns undefined on any failure, so a store that cannot be scanned costs the reader a
+  // disclosure and never costs them a bundle.
+  const prevalence =
+    input.prevalence ??
+    (await measureDetectorPrevalence({
+      sessionDir: input.sessionDir,
+      ...(input.corpusRoot !== undefined ? { corpusRoot: input.corpusRoot } : {}),
+    }));
+  const bundle = buildLlmBundle({
+    ...input,
+    ...(prevalence !== undefined ? { prevalence } : {}),
+  });
   const markdown = renderLlmMarkdown(bundle);
 
   await defaultSessionStore.writeArtifact(input.sessionDir, "llm.md", markdown);
@@ -937,6 +1005,7 @@ export function buildLlmBundle({
   events,
   index,
   candidates,
+  prevalence,
 }: WriteLlmBundleInput): LlmBundle {
   const meta = readJsonRecord(path.join(sessionDir, "meta.json")) ?? {};
   const generatedAt = Date.now();
@@ -971,6 +1040,14 @@ export function buildLlmBundle({
   );
   const causalTree = buildCausalTree(candidates ?? []);
   const firstErrorEventAt = computeFirstErrorEventAt(browserEvidence, index);
+  const distinctBugs = applyFlagNoteTitles(
+    groupDistinctBugs(candidates ?? [], events),
+    events,
+  );
+  const detectorPrevalence = projectDetectorPrevalence(
+    distinctBugs,
+    prevalence,
+  );
 
   return {
     schemaVersion: 1,
@@ -993,10 +1070,8 @@ export function buildLlmBundle({
     agentContext: buildAgentContext(events, index, session.startMs),
     browserEvidence,
     fullStackEvidence,
-    distinctBugs: applyFlagNoteTitles(
-      groupDistinctBugs(candidates ?? [], events),
-      events,
-    ),
+    distinctBugs,
+    ...(detectorPrevalence !== undefined ? { detectorPrevalence } : {}),
     environment: buildEnvironment(events),
     ...(causalTree.length > 0 ? { causalTree } : {}),
     outboundCalls: buildOutboundCalls(events, session.startMs),
@@ -4479,7 +4554,10 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
     ...renderDatabaseDiffSection(bundle.databaseDiffs),
     ...renderDatabaseReadSection(bundle.databaseReads ?? []),
     ...renderDatabaseActivitySection(bundle.databaseActivity),
-    ...renderDetectedSignalsSection(bundle.distinctBugs),
+    ...renderDetectedSignalsSection(
+      bundle.distinctBugs,
+      bundle.detectorPrevalence,
+    ),
     ...renderCausalStructureSection(bundle.causalTree),
     "## Key Timeline Moments",
     "",
@@ -4856,7 +4934,10 @@ const MAX_RENDERED_SIGNALS = 12;
  * whether it explains the reported symptom is the reader's call. Understating that would trade one
  * failure mode for a worse one, since a confident wrong lead is more expensive than no lead.
  */
-function renderDetectedSignalsSection(bugs: DistinctBug[] | undefined): string[] {
+function renderDetectedSignalsSection(
+  bugs: DistinctBug[] | undefined,
+  prevalence: LlmBundleDetectorPrevalence | undefined,
+): string[] {
   if (!bugs || bugs.length === 0) return [];
   const shown = bugs.slice(0, MAX_RENDERED_SIGNALS);
   const lines = [
@@ -4867,14 +4948,83 @@ function renderDetectedSignalsSection(bugs: DistinctBug[] | undefined): string[]
       + "reported symptom can have no signal at all. Read them as leads to confirm against the "
       + "evidence above, and treat the absence of a signal as no evidence either way.",
     "",
+    "`Support` is how much of THIS session's evidence stands behind the finding, which severity "
+      + "cannot say: `corroborated` and `attached` mean the signal was connected to the rest of the "
+      + "session, `unattached` means the tooling measured it but could not connect it to anything "
+      + "here — so it may be a pre-existing condition rather than the cause of the reported symptom, "
+      + "and it is not ranked any lower for it — and `not-assessed` means no causal attribution ran, "
+      + "so the question was never asked.",
+    "",
+    // The grade stays whole — three states, no variants — and the reason sits BESIDE it. All three
+    // causes mean the same thing for how far to trust a headline, which is why they must not fork
+    // the grade; but they mean very different things for what to do next, which is why a reader
+    // who is shown only the grade is under-informed. `no-node-family` and `no-compatible-node` say
+    // the session held nothing of the kind this signal could attach to; `lost-contention` says it
+    // DID, and another finding took it — an absence of connection, not an absence of evidence.
+    "`Why unattached` is the reason the tooling could not connect an `unattached` finding: "
+      + "`no-node-family` means this kind of signal has nothing in the session it could attach to, "
+      + "`no-compatible-node` means there was nothing close enough in time or request to attach it "
+      + "to, and `lost-contention` means there WAS — and another finding, named in the cell, holds "
+      + "it instead. A blank cell is not a finding about the row: it means the question does not "
+      + "arise, because the signal was connected or attribution never ran.",
+    "",
+    // The grade above says how well this signal connected to THIS session. It cannot say whether
+    // the signal is peculiar to this session at all, and connectedness is exactly what a permanent
+    // background condition has the most of — so the reassuring grade lands on the application's
+    // wallpaper every time, at the top of the page, where it is read as the headline. The only
+    // thing that separates the two is a fact about the OTHER sessions, which is why it arrives
+    // here as its own disclosure rather than as an adjustment to anything above it.
+    "`Base rate` is how many of the sessions already recorded for this application, other than "
+      + "this one, the same detector fired in. It answers what no grade above it can: whether the "
+      + "finding is peculiar to this incident or a standing condition of the application. A "
+      + "detector that fires in most sessions was firing before the reported symptom existed, "
+      + "however severe it is and however well it is attached here, and a headline taken from one "
+      + "is a lead pointing at the background. A blank cell means the value is UNKNOWN, not low: "
+      + "too few sessions are recorded yet to say anything, which is where every application "
+      + "starts. Read a low count as \"rarely seen in what has been recorded\" — the store knows "
+      + "only the sessions it holds, so it is never proof that a finding is new. Nothing here "
+      + "moves a row: the table is ordered exactly as it would be without this column."
+      // Appended ONLY when the scan was capped, and the paragraph above is byte-identical when it
+      // was not. The sentence above says the denominator is the sessions recorded for this
+      // application; under a cap that is false, and a truthful cell under a false paragraph is
+      // still a fabricated number. The count and its denominator travel together — so the
+      // denominator's MEANING has to travel with them too.
+      + (prevalence?.truncated === true
+        ? " This store holds more sessions than one bundle is allowed to read, so the counts "
+          + `above were measured over the ${prevalence.priorSessions} MOST RECENT prior sessions `
+          + "only, chosen by their recorded date. The denominator names exactly what was read: "
+          + "nothing here says anything about the older sessions, in either direction."
+        : ""),
+    "",
     table(
-      ["Offset", "Severity", "Detector", "Finding", "Where"],
+      [
+        "Offset",
+        "Severity",
+        "Detector",
+        "Support",
+        "Why unattached",
+        "Base rate",
+        "Finding",
+        "Where",
+      ],
       shown.map((bug) => [
         bug.window?.start !== undefined && bug.firstSeen !== undefined
           ? `${bug.firstSeen - bug.window.start} ms`
           : "unknown",
         bug.severity,
         bug.representative.detector,
+        // Absent when the candidate predates the grade (an artifact written by an older SDK). That
+        // reads the same way to the reader as a session nothing was attributed for: nobody told
+        // them. It must never silently render as if the signal had been placed.
+        bug.representative.support ?? "not-assessed",
+        // Empty on every row where the question does not arise — which is most of them. Absence
+        // renders as nothing rather than as a placeholder word: `none` or `n/a` in this cell would
+        // read as an assertion about a row that was never isolated at all.
+        isolationReasonCell(bug),
+        // Empty on every row of every session in a store with too few priors to measure — which
+        // is every session of a new application. Absence renders as nothing, never as a zero or a
+        // percentage, because a default state that reads as an assertion is worse than a silence.
+        detectorBaseRateCell(bug, prevalence),
         // Title AND message. A detector puts the specifics in whichever of the two it has — the
         // click detector names the covered control in its title and carries no message at all, so
         // preferring one over the other drops the part that identifies the defect.
@@ -4904,6 +5054,91 @@ function renderDetectedSignalsSection(bugs: DistinctBug[] | undefined): string[]
     );
   }
   return lines;
+}
+
+/**
+ * Narrow a whole-store measurement down to the detectors this session actually produced.
+ *
+ * `undefined` in, `undefined` out — a session rendered without a corpus, or in a store too small
+ * to say anything yet, carries no field at all rather than a field full of zeros. Those two states
+ * mean opposite things and a zero would report the wrong one.
+ *
+ * Detector order follows `distinctBugs`, so the projection introduces no ordering of its own.
+ */
+function projectDetectorPrevalence(
+  bugs: DistinctBug[],
+  prevalence: DetectorPrevalence | undefined,
+): LlmBundleDetectorPrevalence | undefined {
+  if (!prevalence) return undefined;
+  const detectors: LlmBundleDetectorPrevalence["detectors"] = [];
+  const seen = new Set<string>();
+  for (const bug of bugs) {
+    const detector = bug.representative.detector;
+    if (!detector || seen.has(detector)) continue;
+    seen.add(detector);
+    detectors.push({
+      detector,
+      priorSessionsFiredIn: prevalence.firedIn[detector] ?? 0,
+    });
+  }
+  return {
+    priorSessions: prevalence.priorSessions,
+    ...(prevalence.truncated === true ? { truncated: true } : {}),
+    detectors,
+  };
+}
+
+/**
+ * The `Base rate` cell for one signal row.
+ *
+ * A count with its denominator, never a bare percentage: `3 of 47 prior sessions` can be argued
+ * with, and `6%` cannot. Blank whenever the bundle carries no measurement, which is every session
+ * in a store too new to have priors — and blank is the whole point. A cell reading `0%` or `first
+ * occurrence` on a store nobody could measure would be an assertion manufactured out of an
+ * absence, and this project has already paid once for a number that could not tell "we looked and
+ * found nothing" from "we never looked".
+ *
+ * A measured zero, by contrast, IS printed: `0 of 47 prior sessions` is something the store
+ * actually observed, and the difference between that and a blank cell is the difference between a
+ * measurement and a missing one.
+ *
+ * When the scan was capped the cell names the SCANNED set and nothing else — `3 of 200 most recent
+ * prior sessions`. It never names the store's size, because the scan did not look at the rest of
+ * the store, and a denominator that quietly stands for sessions nobody read is the same fabricated
+ * number this cell exists to avoid, wearing a bigger figure.
+ */
+function detectorBaseRateCell(
+  bug: DistinctBug,
+  prevalence: LlmBundleDetectorPrevalence | undefined,
+): string {
+  if (!prevalence) return "";
+  const entry = prevalence.detectors.find(
+    (row) => row.detector === bug.representative.detector,
+  );
+  if (!entry) return "";
+  const scope = prevalence.truncated === true ? "most recent prior" : "prior";
+  return `${entry.priorSessionsFiredIn} of ${prevalence.priorSessions} ${scope} sessions`;
+}
+
+/**
+ * The `Why unattached` cell for one signal row.
+ *
+ * Keyed from the cluster REPRESENTATIVE, which is where the row's title, detector and support
+ * already come from, while its severity is a cluster MAX. A reason taken from the best- or
+ * worst-placed member would describe a different finding than the one the row names — this
+ * codebase has paid for keying a reader-facing string on the wrong member of a group before.
+ *
+ * `lost-contention` names the holder, because "another finding took the node" is only actionable
+ * if the reader can go and look at that finding. `${id} · ${detector}` matches how the Causal
+ * Structure section of this same document refers to a candidate.
+ */
+function isolationReasonCell(bug: DistinctBug): string {
+  const cause = bug.representative.isolationCause;
+  if (!cause) return "";
+  const holder = bug.representative.isolationHeldBy;
+  return holder
+    ? `${cause} — held by ${holder.candidateId} · ${holder.detector}`
+    : cause;
 }
 
 /** How many linked requests may contribute a payload block, matching the table above it. */

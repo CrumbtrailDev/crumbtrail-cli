@@ -1,6 +1,7 @@
 import { hashString } from "crumbtrail-core";
 import type { BugEvent, TargetDescriptor } from "crumbtrail-core";
-import type { EvidenceCandidate } from "./evidence-index";
+import type { EvidenceCandidate, SupportGrade } from "./evidence-index";
+import type { IsolationCause } from "./causal-graph";
 import { redactedNetworkBodySnippet } from "./network-body";
 
 export const DISTINCT_BUGS_SCHEMA_VERSION = 1 as const;
@@ -54,6 +55,38 @@ export interface DistinctBug {
      * so it travels with the bug rather than staying behind on the candidate.
      */
     frame?: string;
+    /**
+     * How much of the session's evidence stands behind THIS representative — carried from the
+     * representative candidate, never aggregated over the cluster.
+     *
+     * It lives here, beside `title` and `detector`, because those come from the representative too
+     * while `DistinctBug.severity` is a cluster MAX. A support grade taken as a cluster max would
+     * print a reassuring word next to a headline belonging to a member the graph could not place
+     * at all — the same defect this field exists to close, one field over. Keying a reader-facing
+     * string on the wrong member of a group is a mistake this codebase has already made and paid
+     * for once.
+     */
+    support?: SupportGrade;
+    /**
+     * WHY the representative could not be attached, carried from the representative candidate for
+     * exactly the reasons `support` above is — and only ever set when `support` is `unattached`,
+     * because the question does not arise otherwise.
+     *
+     * The grade says how far to trust the headline; this says what produced that grade, which is
+     * the difference between "nothing of this kind was in the session" and "something was, and
+     * this signal lost it to another finding". Those call for opposite next moves and the reader
+     * was being shown neither.
+     */
+    isolationCause?: IsolationCause;
+    /**
+     * What holds the node this representative lost, when `isolationCause` is `lost-contention`.
+     *
+     * Resolved against the FULL emitted candidate list, whose id space `contention.heldBy` already
+     * speaks, so the name is exact rather than inferred. Absent when the holder is not among the
+     * emitted candidates — the reason then stands alone, which is true, rather than naming an
+     * incumbent that cannot be resolved.
+     */
+    isolationHeldBy?: { candidateId: string; detector: string };
     /** Bounded, redacted payload evidence for this representative's failed request. */
     bodySnippet?: { request?: string; response?: string };
   };
@@ -229,8 +262,13 @@ export function groupDistinctBugs(
     clusters.push(cluster);
   }
 
+  // Built over EVERY candidate, not over a cluster: the node a candidate lost is routinely held by
+  // a finding that clustered elsewhere.
+  const candidatesById = new Map(
+    candidates.map((candidate) => [candidate.id, candidate] as const),
+  );
   const bugs = foldRepeatedRequestClusters(clusters).map((cluster) =>
-    buildBug(cluster, events),
+    buildBug(cluster, events, candidatesById),
   );
   bugs.sort(
     (a, b) =>
@@ -397,7 +435,29 @@ export function groupDistinctBugRecurrences(
   );
 }
 
-function buildBug(cluster: Cluster, events: BugEvent[]): DistinctBug {
+/**
+ * The candidate holding the node `candidate` lost, named so a reader can find it.
+ *
+ * A bare candidate id is a reference into `CANDIDATES.md`, a document the rendered bundle's reader
+ * is never given — naming the holder only by id would move the same "the answer is in a file you
+ * do not have" failure one field over. The id travels WITH the detector, never instead of it.
+ */
+function holderOf(
+  candidate: EvidenceCandidate,
+  candidatesById: Map<string, EvidenceCandidate>,
+): { candidateId: string; detector: string } | undefined {
+  const heldBy = candidate.contention?.heldBy;
+  if (heldBy === undefined) return undefined;
+  const holder = candidatesById.get(heldBy);
+  if (!holder) return undefined;
+  return { candidateId: holder.id, detector: holder.detector };
+}
+
+function buildBug(
+  cluster: Cluster,
+  events: BugEvent[],
+  candidatesById: Map<string, EvidenceCandidate>,
+): DistinctBug {
   const candidates = cluster.members.map((member) => member.candidate);
   // Representative = highest score, then earliest, then lowest id (deterministic).
   const representative = [...candidates].sort(
@@ -477,6 +537,20 @@ function buildBug(cluster: Cluster, events: BugEvent[]): DistinctBug {
       target: representative.anchor.target,
       requestId: representative.anchor.requestId,
       frame: representative.anchor.frame,
+      support: representative.support,
+      // Gated on the grade the row actually renders, not on `causalRole`: `support` is optional
+      // for read-back from an artifact written before it existed, and a row reading
+      // `not-assessed` beside a reason for isolation would contradict itself in two adjacent
+      // cells. One condition makes the two structurally unable to disagree.
+      isolationCause:
+        representative.support === "unattached"
+          ? representative.isolationCause
+          : undefined,
+      isolationHeldBy:
+        representative.support === "unattached" &&
+        representative.isolationCause === "lost-contention"
+          ? holderOf(representative, candidatesById)
+          : undefined,
       bodySnippet: failedRequestBodySnippet(representative, events),
     }) as DistinctBug["representative"],
     frontendEvidence,

@@ -172,12 +172,24 @@ export { buildLlmBundle, writeLlmBundle } from "./llm-bundle";
 export type {
   LlmBundle,
   LlmBundleCompleteness,
+  LlmBundleDetectorPrevalence,
   SessionIndexLike,
   WriteLlmBundleInput,
 } from "./llm-bundle";
 export {
+  deriveCorpusRoot,
+  measureDetectorPrevalence,
+  MIN_PRIOR_SESSIONS_FOR_PREVALENCE,
+  MAX_SCANNED_PRIOR_SESSIONS,
+} from "./detector-prevalence";
+export type {
+  DetectorPrevalence,
+  MeasureDetectorPrevalenceOptions,
+} from "./detector-prevalence";
+export {
   postProcess,
   reanalyzeSession,
+  type PostProcessOptions,
   type ReanalyzeSessionResult,
 } from "./post-process";
 export { inspectSession, formatInspection, InspectError } from "./inspect";

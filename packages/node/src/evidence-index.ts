@@ -28,6 +28,37 @@ import {
 } from "./source-map";
 
 export const CANDIDATE_SCHEMA_VERSION = 1 as const;
+
+/**
+ * How much of the session's evidence stands behind a signal — the SDK's own confidence that it
+ * could ATTACH that signal to the session, expressed to the reader instead of thrown away.
+ *
+ * The ranker already computes this and then discards it: severity, a per-detector constant chosen
+ * when the detector was written, decides the reader's headline on its own. Severity says how bad
+ * this KIND of finding is; it cannot say whether THIS instance was connected to anything else that
+ * happened. Two signals of identical severity, one placed in the causal chain and one the graph
+ * could not place at all, render identically, and the reader has no way to tell which is which.
+ *
+ * - `not-assessed` — no causal attribution ran for this session, so the question was never asked.
+ *   NOT the same as a failed attempt, and never collapsed into one.
+ * - `unattached`   — attribution ran and could not connect this signal to anything else here. The
+ *   measurement stands; what is missing is any link between it and the rest of the session.
+ * - `attached`     — placed in the session's causal structure, with nothing further corroborating.
+ * - `corroborated` — placed AND backed by another signal: a root that explains a symptom, or a
+ *   symptom whose link to its root is graded above the request spine's bare time ordering.
+ *
+ * This is a QUALIFIER, never a rank. Nothing here reorders, demotes or rescores anything, and it
+ * must stay that way: the SDK's own measurement is that a top-ranked candidate is very often
+ * `isolated` AND is very often the detector that names the incident, so demoting unattached
+ * signals would bury the correct finding in most sessions. The defect is that the reader is not
+ * TOLD, not that the order is wrong.
+ */
+export type SupportGrade =
+  | "not-assessed"
+  | "unattached"
+  | "attached"
+  | "corroborated";
+
 const MAX_EVIDENCE_CANDIDATES = 200;
 
 /**
@@ -282,6 +313,15 @@ export interface EvidenceCandidate {
     minifiedFrame?: string;
     target?: TargetDescriptor;
   };
+  /**
+   * How much of this session's evidence stands behind this signal, DERIVED from the causal
+   * attribution the re-rank already computed. Additive/optional; see {@link SupportGrade}.
+   *
+   * Optional because a candidate read back from an artifact written by an older SDK genuinely
+   * does not carry one, and a reader must be able to tell that apart from a graded signal. Every
+   * candidate this module emits carries it.
+   */
+  support?: SupportGrade;
   /** Causal role assigned by the confidence-gated re-rank (CP3). Additive/optional. */
   causalRole?: "root" | "symptom" | "isolated";
   /** For a symptom, the candidate id of its attributed root cause. */
@@ -435,6 +475,47 @@ function normalizeEvidenceEvents(events: BugEvent[]): BugEvent[] {
     if (t === undefined || k === undefined) return [];
     return [{ ...event, t, k, d: isRecord(event.d) ? event.d : {} }];
   });
+}
+
+/**
+ * Derives a candidate's {@link SupportGrade} from the causal attribution already attached to it.
+ *
+ * PURE, and a function of `causalRole` / `causes` / `attributionConfidence` ONLY. It reads what
+ * attribution concluded and never re-decides it, so no detector can assert its own support: a
+ * detector that set this field directly would be back to the per-detector constant this grade
+ * exists to complement.
+ *
+ * The three states stay genuinely distinct because `applyCausalRerank` only attributes when a
+ * non-empty graph exists. With no graph `causalRole` is left `undefined` — NOT `"isolated"` — so
+ * "nothing was asked" cannot be mistaken for "I asked and could not place it".
+ *
+ * `isolationCause` deliberately does NOT change the grade. All three of its values mean the same
+ * thing to a reader deciding how far to trust a headline: this signal was not connected to the
+ * rest of the session. WHY it was not connected is a separate question, answered where the
+ * candidate is described in full rather than by splitting this grade into variants that would
+ * read as degrees of trust they are not.
+ */
+function supportGrade(draft: {
+  causalRole?: "root" | "symptom" | "isolated";
+  causes?: string[];
+  attributionConfidence?: CausalConfidence;
+}): SupportGrade {
+  if (draft.causalRole === undefined) return "not-assessed";
+  if (draft.causalRole === "isolated") return "unattached";
+  if (draft.causalRole === "root") {
+    // A root that explains a symptom has a second signal standing behind it; a root with nothing
+    // attributed to it is placed but alone.
+    return draft.causes !== undefined && draft.causes.length > 0
+      ? "corroborated"
+      : "attached";
+  }
+  // A symptom's link to its root is only as good as the weakest edge along it. A `low` link is the
+  // request spine's time ordering restated — the ranker already refuses to let it bind a chain, so
+  // it must not read here as corroboration either.
+  return draft.attributionConfidence === "high" ||
+    draft.attributionConfidence === "medium"
+    ? "corroborated"
+    : "attached";
 }
 
 export function buildEvidenceCandidates(
@@ -778,6 +859,10 @@ export function buildEvidenceCandidates(
       severity: draft.severity,
       score: draft.score,
       confidence: draft.confidence,
+      // Emitted unconditionally, unlike the optional causal fields below: "not-assessed" is a real
+      // answer and omitting it would leave a reader unable to tell an ungraded candidate from one
+      // this SDK never graded. DERIVED here and nowhere else — no draft carries a `support`.
+      support: supportGrade(draft),
       ...(draft.occurrences !== undefined
         ? { occurrences: draft.occurrences }
         : {}),
@@ -12083,6 +12168,13 @@ function renderCandidatesMarkdown(
       // Causal structure (CP4): additive per-candidate lines from the CP3 re-rank fields.
       if (candidate.causalRole)
         lines.push(`* Causal role: ${candidate.causalRole}`);
+      // WHY an isolated candidate is isolated has been computed and recorded since the attributor
+      // learned to tell the three cases apart, and no document ever printed it — so a reader of
+      // this file saw `isolated` and could not tell "nothing of this kind was in the session" from
+      // "something was, and this candidate lost it to another signal". The support grade in the
+      // rendered bundle says how far to trust the finding; this line says what produced that.
+      if (candidate.causalRole === "isolated" && candidate.isolationCause)
+        lines.push(`* Isolation cause: ${candidate.isolationCause}`);
       if (candidate.causalRole === "symptom" && candidate.rootCauseId) {
         // A `low` attribution is the request spine's time ordering, not an established cause. The
         // ranker does not let it set position (see applyCausalRerank), so this document must not
