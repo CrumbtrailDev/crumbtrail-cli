@@ -1379,6 +1379,69 @@ describe("postProcess", async () => {
     expect(index.failedReqs[0].st).toBe(500);
   });
 
+  it("carries the shared correlation id onto failed request and network error index entries", async () => {
+    // The index entry is what the analyzer anchors a frontend candidate on. With
+    // only the browser-local `id` on it, that anchor named a page counter that
+    // restarts at 1 per load, and no backend event could ever join to it.
+    const correlationId = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const events = [
+      {
+        t: 1000,
+        k: "net.req",
+        d: { id: 1, m: "POST", url: "/api/data", requestId: correlationId },
+      },
+      {
+        t: 1100,
+        k: "net.res",
+        d: { id: 1, st: 500, requestId: correlationId },
+      },
+      {
+        t: 1200,
+        k: "net.req",
+        d: { id: 2, m: "POST", url: "/api/save", requestId: "req_zz_second" },
+      },
+      {
+        t: 1300,
+        k: "net.err",
+        d: {
+          id: 2,
+          method: "POST",
+          url: "/api/save",
+          msg: "Failed to fetch",
+          transport: "fetch",
+          requestId: "req_zz_second",
+        },
+      },
+      // No correlation headers on this exchange, so nothing is invented for it.
+      {
+        t: 1400,
+        k: "net.req",
+        d: { id: 3, m: "GET", url: "/api/plain" },
+      },
+      { t: 1500, k: "net.res", d: { id: 3, st: 503 } },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    );
+    await postProcess(tmpDir);
+    const index = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, "index.json"), "utf-8"),
+    );
+
+    const byUrl = (url: string) =>
+      index.failedReqs.find((entry: { url?: string }) => entry.url === url);
+    expect(byUrl("/api/data").requestId).toBe(correlationId);
+    expect(byUrl("/api/data").id).toBe(1);
+    expect(byUrl("/api/save").requestId).toBe("req_zz_second");
+    expect(byUrl("/api/plain").requestId).toBeUndefined();
+    expect(byUrl("/api/plain").id).toBe(3);
+
+    expect(index.networkErrors).toHaveLength(1);
+    expect(index.networkErrors[0].requestId).toBe("req_zz_second");
+    expect(index.networkErrors[0].id).toBe(2);
+  });
+
   it("counts SDK network failures (net.err) as failed requests", async () => {
     const events = [
       {
