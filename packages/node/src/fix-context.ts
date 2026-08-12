@@ -8,6 +8,7 @@ import type {
   LlmBundleBackendRequestEvidenceSummary,
   LlmBundleDbDiff,
   LlmBundleDbRead,
+  LlmBundleDbError,
   LlmBundleDbActivity,
   LlmBundleFrontendRequestEvidenceSummary,
   LlmBundleLinkedFullStackRequestSummary,
@@ -21,6 +22,8 @@ import { buildCodeLocations, type CodeLocation } from "./code-locations";
 /** A database row diff correlated to the primary window. See {@link LlmBundleDbDiff}. */
 export type FixContextDbDiff = LlmBundleDbDiff;
 export type FixContextDbRead = LlmBundleDbRead;
+/** A statement that was attempted and raised, correlated to the primary window. */
+export type FixContextDbError = LlmBundleDbError;
 export type FixContextDbActivity = LlmBundleDbActivity;
 
 /**
@@ -80,6 +83,17 @@ export interface FixContextPrimaryWindow {
    * capture is disabled or no reads matched the primary request/window.
    */
   db_reads: FixContextDbRead[];
+  /**
+   * Statements attempted in the primary window that the database REFUSED (`db.error`). Empty when
+   * every statement the window issued succeeded.
+   *
+   * This plane is the one that can be decisive on its own. `db_diffs` and `db_reads` can only
+   * describe statements that completed, so a request whose fault IS the failing statement used to
+   * present as a request with no database evidence at all — and a request that ran two statements
+   * and lost one presented as confidently complete. Consumers MUST NOT read `[]` as "the database
+   * was fine"; read it as "no statement in this window was observed to raise".
+   */
+  db_errors: FixContextDbError[];
   /**
    * OTel DB span activity in the primary window. These are statements/operations only, never
    * before/after row diffs.
@@ -518,6 +532,7 @@ function buildPrimaryWindow(
     },
     db_diffs: selectPrimaryWindowDbDiffs(bundle, window, topRequestId, matched),
     db_reads: selectPrimaryWindowDbReads(bundle, window, topRequestId, matched),
+    db_errors: selectPrimaryWindowDbErrors(bundle, window, topRequestId, matched),
     db_activity: selectPrimaryWindowDbActivity(bundle, window, topRequestId, matched),
   };
 }
@@ -578,6 +593,33 @@ function selectPrimaryWindowDbReads(
     )
       return true;
     return read.requestId !== undefined && requestIds.has(read.requestId);
+  });
+}
+
+function selectPrimaryWindowDbErrors(
+  bundle: LlmBundle | undefined,
+  window: { start: number; end: number } | null,
+  topRequestId: string | undefined,
+  matched: LlmBundleLinkedFullStackRequestSummary[],
+): FixContextDbError[] {
+  const errors = Array.isArray(bundle?.databaseErrors)
+    ? bundle!.databaseErrors
+    : [];
+  if (errors.length === 0) return [];
+
+  const requestIds = new Set<string>();
+  if (topRequestId) requestIds.add(topRequestId);
+  for (const entry of matched) requestIds.add(entry.requestId);
+
+  return errors.filter((error) => {
+    if (
+      window &&
+      typeof error.t === "number" &&
+      error.t >= window.start &&
+      error.t <= window.end
+    )
+      return true;
+    return error.requestId !== undefined && requestIds.has(error.requestId);
   });
 }
 

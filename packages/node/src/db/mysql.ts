@@ -3,6 +3,7 @@ import {
   emitGap,
   emitDbEvent,
   emitDbDiffEvents,
+  emitDbErrorEvent,
   emitDbReadEvents,
   emitImagelessDbDiff,
   extractPk,
@@ -358,7 +359,23 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
 
       // Reads: SELECTs never mutate, so run first and capture the returned rows best-effort.
       if (!parsed) {
-        const result = await run(sql, values);
+        // A statement that RAISES is recorded and its error rethrown untouched. Deliberately not
+        // behind `captureReads`: that flag caps row IMAGES, and a failure record carries no rows.
+        let result: unknown;
+        try {
+          result = await run(sql, values);
+        } catch (error) {
+          emitDbErrorEvent({
+            engine: ENGINE,
+            op: parsedRead ? "select" : "other",
+            table: parsedRead?.table ?? null,
+            statement: sql,
+            requestId,
+            error,
+            options,
+          });
+          throw error;
+        }
         if (options.captureReads && parsedRead) {
           try {
             const payload = resultPayload(result);
@@ -382,7 +399,21 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
 
       // INSERT: run first (no pre-image needed), then re-read the after-image by insertId.
       if (parsed.op === "insert") {
-        const result = await run(sql, values);
+        let result: unknown;
+        try {
+          result = await run(sql, values);
+        } catch (error) {
+          emitDbErrorEvent({
+            engine: ENGINE,
+            op: parsed.op,
+            table: parsed.table,
+            statement: sql,
+            requestId,
+            error,
+            options,
+          });
+          throw error;
+        }
         try {
           await captureInsert(parsed, result, requestId);
         } catch (error) {
@@ -411,7 +442,21 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
         }
       }
 
-      const result = await run(sql, values);
+      let result: unknown;
+      try {
+        result = await run(sql, values);
+      } catch (error) {
+        emitDbErrorEvent({
+          engine: ENGINE,
+          op: parsedMutation.op,
+          table: parsedMutation.table,
+          statement: sql,
+          requestId,
+          error,
+          options,
+        });
+        throw error;
+      }
       try {
         if (parsedMutation.op === "update") {
           await captureUpdate(parsedMutation, result, requestId, preRows);

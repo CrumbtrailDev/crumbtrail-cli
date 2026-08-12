@@ -31,6 +31,7 @@ export {
 export type { W3CTraceContext, OutboundCorrelation } from "./correlation";
 export { buildCaptureGapEvent } from "./capture-gap";
 export type { BuildCaptureGapEventInput } from "./capture-gap";
+export { normalizeStatementShape } from "./db-statement-shape";
 export {
   buildMaskedDomSnapshot,
   isBlocked,
@@ -57,6 +58,8 @@ export type {
   DbEngine,
   DbReadBulkEventData,
   DbReadEventData,
+  DbErrorEventData,
+  DbErrorOp,
   CaptureGapEventData,
   EnvDeclaration,
   EnvSnapshot,
@@ -79,6 +82,7 @@ export {
   DB_DIFF_EVENT_KIND,
   DB_READ_BULK_EVENT_KIND,
   DB_READ_EVENT_KIND,
+  DB_ERROR_EVENT_KIND,
   CAPTURE_GAP_EVENT_KIND,
   UI_NUM_EVENT_KIND,
   UI_LISTENERS_EVENT_KIND,

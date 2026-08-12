@@ -586,6 +586,26 @@ export interface LlmBundleDbRead {
   requestId?: string;
 }
 
+/**
+ * One database statement the host ATTEMPTED and the database REFUSED (`k:'db.error'`).
+ *
+ * Distinct from a capture gap, which says our own instrumentation broke. Every field is an
+ * identifier, a classification or the database's own error code: no bind value and no driver
+ * message reaches here, and `shape` is the statement with every literal replaced.
+ */
+export interface LlmBundleDbError {
+  t: number;
+  iso?: string;
+  offsetMs?: number;
+  engine: DbEngine;
+  op: string;
+  table: string | null;
+  shape: string;
+  code: string | null;
+  errorName: string;
+  requestId?: string;
+}
+
 export interface LlmBundleDbActivity {
   t: number;
   iso?: string;
@@ -667,6 +687,14 @@ export interface LlmBundle {
   databaseDiffs: LlmBundleDbDiff[];
   /** Redaction-aware rows read during the session (`k:'db.read'`); `[]` when none. */
   databaseReads: LlmBundleDbRead[];
+  /**
+   * Statements that were attempted and RAISED (`k:'db.error'`).
+   *
+   * Optional and OMITTED when empty, not emitted as `[]`. A session in which nothing failed must
+   * serialize exactly as it did before this plane existed — the absence of a failure is not a
+   * finding, and every existing bundle would otherwise gain a field that says nothing.
+   */
+  databaseErrors?: LlmBundleDbError[];
   /** OTel DB spans/statements (`db.*` attributes), explicitly not row diffs. */
   databaseActivity: LlmBundleDbActivity[];
   /**
@@ -1039,6 +1067,7 @@ export function buildLlmBundle({
     fullStackEvidence,
   );
   const causalTree = buildCausalTree(candidates ?? []);
+  const databaseErrors = buildDatabaseErrors(events, session.startMs);
   const firstErrorEventAt = computeFirstErrorEventAt(browserEvidence, index);
   const distinctBugs = applyFlagNoteTitles(
     groupDistinctBugs(candidates ?? [], events),
@@ -1077,6 +1106,7 @@ export function buildLlmBundle({
     outboundCalls: buildOutboundCalls(events, session.startMs),
     databaseDiffs: buildDatabaseDiffs(events, session.startMs),
     databaseReads: buildDatabaseReads(events, session.startMs),
+    ...(databaseErrors.length > 0 ? { databaseErrors } : {}),
     databaseActivity: buildDatabaseActivity(events, session.startMs),
     media,
     degradedCapabilities,
@@ -2430,6 +2460,38 @@ function buildDatabaseReads(
     );
   }
   return reads.sort((a, b) => a.t - b.t).slice(0, 200);
+}
+
+function buildDatabaseErrors(
+  events: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleDbError[] {
+  const errors: LlmBundleDbError[] = [];
+  for (const event of events) {
+    if (event.k !== "db.error" || !isRecord(event.d)) continue;
+    const shape = safeText(event.d.shape, 400);
+    if (!shape) continue;
+
+    errors.push(
+      removeUndefined({
+        t: event.t,
+        iso: iso(event.t),
+        offsetMs:
+          finiteNumber(event.offsetMs) ??
+          offsetFromStart(event.t, sessionStartMs),
+        engine: normalizeDbEngine(event.d.engine),
+        op: safeText(event.d.op, 20) ?? "other",
+        table: safeText(event.d.table, 200) ?? null,
+        shape,
+        // A closed vocabulary of short codes, not free text, so it travels as a
+        // correlation-style identifier rather than through the prose-shaped path.
+        code: safeCorrelationId(event.d.code, 64) ?? null,
+        errorName: safeText(event.d.errorName, 120) ?? "UnknownError",
+        requestId: safeCorrelationId(event.d.requestId, 200),
+      }) as LlmBundleDbError,
+    );
+  }
+  return errors.sort((a, b) => a.t - b.t).slice(0, 200);
 }
 
 function buildDatabaseActivity(
@@ -4551,6 +4613,7 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
         ]
       : []),
     ...renderOutboundCallsSection(bundle.outboundCalls),
+    ...renderDatabaseErrorSection(bundle.databaseErrors ?? []),
     ...renderDatabaseDiffSection(bundle.databaseDiffs),
     ...renderDatabaseReadSection(bundle.databaseReads ?? []),
     ...renderDatabaseActivitySection(bundle.databaseActivity),
@@ -4741,6 +4804,58 @@ export function renderDatabaseReadSection(reads: LlmBundleDbRead[]): string[] {
   if (deduped > shown.length) {
     lines.push(
       `${deduped - shown.length} further distinct row(s) are in \`bundle.json\` under \`databaseReads\`.`,
+      "",
+    );
+  }
+  return lines;
+}
+
+/** How many failed statements the markdown renders. Everything is in `bundle.json` regardless. */
+const MAX_RENDERED_DB_ERRORS = 25;
+
+/**
+ * Statements the database REFUSED.
+ *
+ * This section exists because every other database section in this file can only describe
+ * statements that SUCCEEDED. When a statement raised, the adapter's `await` rejected with it and
+ * nothing was emitted at all — so an incident whose fault IS the failing statement rendered as a
+ * request with no database evidence, and the reader had to infer the most decisive fact in the
+ * session from its absence. Worse than absent, it was confidently incomplete: a request that ran
+ * two statements and lost one showed the surviving one and said nothing about the other.
+ *
+ * It is rendered BEFORE row changes deliberately. A reader who sees that the write was rejected,
+ * with the code the database returned, does not need to reason about the rows that did change.
+ *
+ * What is deliberately NOT here: bind values and the driver's error message. `shape` is the
+ * statement with every literal replaced, and `code`/`errorName` are a closed-vocabulary code and a
+ * class name. That is enough to find the statement in the repository and to know why it failed,
+ * and it is the SDK's standing stance on error text everywhere else.
+ */
+function renderDatabaseErrorSection(errors: LlmBundleDbError[]): string[] {
+  if (errors.length === 0) return [];
+  const shown = errors.slice(0, MAX_RENDERED_DB_ERRORS);
+  const lines = [
+    "## Database Statements That Failed",
+    "",
+    "Statements this session issued that the database refused, correlated to the request that issued them. These are the application's own failures, not gaps in capture: each one ran and was rejected. Bind values and driver messages are deliberately not carried — the statement shape, the table and the database's own error code are what identify it.",
+    "",
+    table(
+      ["Offset", "Op", "Table", "Error code", "Error class", "Statement shape", "Request ID"],
+      shown.map((error) => [
+        error.offsetMs !== undefined ? `${error.offsetMs} ms` : "unknown",
+        error.op,
+        error.table ?? "",
+        error.code ?? "",
+        error.errorName,
+        truncate(error.shape, 300),
+        error.requestId ?? "",
+      ]),
+    ),
+    "",
+  ];
+  if (errors.length > shown.length) {
+    lines.push(
+      `${errors.length - shown.length} further failed statement(s) are in \`bundle.json\` under \`databaseErrors\`.`,
       "",
     );
   }

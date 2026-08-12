@@ -11,6 +11,7 @@ import {
 import {
   emitGap,
   emitDbDiffEvents,
+  emitDbErrorEvent,
   emitDbReadEvents,
   extractPk,
   isRecord,
@@ -92,7 +93,25 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
     if (!requestId) return client.query(text, params);
 
     if (!parsed) {
-      const result = await client.query(text, params);
+      // The host read (or other statement). If it RAISES, record what was attempted and what the
+      // database said, then rethrow the driver's own error untouched. Recording is deliberately
+      // NOT behind `captureReads`: that flag caps row IMAGES, and a failure record carries no
+      // rows. Gating it there would leave a failed SELECT invisible on every default install.
+      let result: DuckTypedPgQueryResult;
+      try {
+        result = await client.query(text, params);
+      } catch (error) {
+        emitDbErrorEvent({
+          engine: ENGINE,
+          op: parsedRead ? "select" : "other",
+          table: parsedRead?.table ?? null,
+          statement: text,
+          requestId,
+          error,
+          options,
+        });
+        throw error;
+      }
       if (options.captureReads && parsedRead) {
         try {
           const rows = (result.rows ?? []).filter(isRecord);
@@ -151,11 +170,46 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       instrumentedText = ensureReturning(text);
     } catch (error) {
       emitGap(options, { reason: "capture_exception", error });
-      return client.query(text, paramArray);
+      // We declined to instrument this mutation, but it is still the host's statement: if it
+      // raises, the failure is the application's and gets recorded like any other. Two events on
+      // this path is correct and says two different things — our RETURNING rewrite failed, AND
+      // their statement failed — and they have different owners.
+      try {
+        return await client.query(text, paramArray);
+      } catch (queryError) {
+        emitDbErrorEvent({
+          engine: ENGINE,
+          op: parsed.op,
+          table: parsed.table,
+          statement: text,
+          requestId,
+          error: queryError,
+          options,
+        });
+        throw queryError;
+      }
     }
 
     // The host mutation. Its own errors propagate normally — we never swallow the caller's query.
-    const result = await client.query(instrumentedText, paramArray);
+    // We now also RECORD the failure on the way past: a mutation that raised is the decisive
+    // observable in exactly the incidents where nothing else explains the response.
+    let result: DuckTypedPgQueryResult;
+    try {
+      result = await client.query(instrumentedText, paramArray);
+    } catch (error) {
+      emitDbErrorEvent({
+        engine: ENGINE,
+        op: parsed.op,
+        table: parsed.table,
+        // The statement as the host wrote it, not our RETURNING-augmented rewrite: the reader is
+        // looking for this statement in their own repository.
+        statement: text,
+        requestId,
+        error,
+        options,
+      });
+      throw error;
+    }
 
     // Diff capture/emit is best-effort: a parse/build/emit failure here degrades to "no diff
     // emitted" rather than breaking the host query, whose result is returned unchanged.

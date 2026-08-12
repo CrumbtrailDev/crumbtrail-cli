@@ -134,6 +134,18 @@ export const DB_READ_EVENT_KIND = "db.read" as const;
 /** Canonical event kind for an aggregate capped database read summary (`k:'db.read.bulk'`). */
 export const DB_READ_BULK_EVENT_KIND = "db.read.bulk" as const;
 
+/**
+ * Canonical event kind for a database statement that was ATTEMPTED and RAISED (`k:'db.error'`).
+ *
+ * Deliberately NOT a `capture_gap`. A capture gap says *our instrumentation* could not collect
+ * something; this says *the application's statement failed*. Those are two different facts with
+ * two different owners, and collapsing them tells a reader the tooling broke when in truth the
+ * write blew up. Without this kind the capture vocabulary can only describe statements that
+ * succeeded, so the decisive observable in a "the request 500ed because the statement raised"
+ * incident is absent from the bundle and the reader has to infer it.
+ */
+export const DB_ERROR_EVENT_KIND = "db.error" as const;
+
 /** Canonical event kind for a bounded record of evidence the capture path could not collect. */
 export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
 
@@ -293,6 +305,35 @@ export interface DbReadBulkEventData {
   emittedRows: number;
   truncatedRows: number;
   samplePks: Array<Record<string, unknown>>;
+}
+
+/** Operation a `db.error` event records. Wider than `DbDiffOp`: a read can raise too. */
+export type DbErrorOp = "select" | "insert" | "update" | "delete" | "other";
+
+/**
+ * Type-specific payload (`d`) of a `k:'db.error'` event: one statement that the host issued and
+ * the database refused.
+ *
+ * Every field is an identifier, a classification or a code. **No bind value and no driver error
+ * message may ever appear here.** `code` is the database's own error code (`23505`,
+ * `ER_DUP_ENTRY`, `SQLITE_CONSTRAINT`), which is a closed vocabulary, and `errorName` is the error
+ * class name only — the same stance `captureErrorName` already takes. `shape` is the statement
+ * with every literal replaced by a placeholder, so it names what was attempted without carrying
+ * what it was attempted with.
+ */
+export interface DbErrorEventData {
+  engine: DbEngine;
+  op: DbErrorOp;
+  /** Table the statement addressed, or `null` when the statement did not parse to one. */
+  table: string | null;
+  /** Normalized statement shape: identifiers and keywords only, every literal replaced by `?`. */
+  shape: string;
+  /** The database's own error code, when the driver reported one. Never a message. */
+  code: string | null;
+  /** Error class name only, never the message. */
+  errorName: string;
+  requestId: string;
+  t: number;
 }
 
 export type InteractionElementDescriptor = Record<string, unknown>;

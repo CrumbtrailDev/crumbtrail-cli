@@ -6,10 +6,12 @@ import {
   type DbDiffBulkEventData,
   type DbDiffOp,
   type DbEngine,
+  type DbErrorOp,
 } from "crumbtrail-core";
 import { captureDbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import { buildDbDiffEvent } from "./diff-event";
+import { buildDbErrorEvent } from "./error-event";
 import { buildDbReadBulkEvent, buildDbReadEvent } from "./read-event";
 
 /**
@@ -404,6 +406,53 @@ export function emitImagelessDbDiff(input: {
         sessionStartedAt: options.sessionStartedAt,
       }),
     );
+  }
+}
+
+/**
+ * Records that a host statement was attempted and RAISED, then hands the error straight back.
+ *
+ * This is the engine-agnostic seam every adapter uses, and it exists because the capture
+ * vocabulary could otherwise only describe statements that succeeded: the host `query` rejected,
+ * the adapter's `await` rejected with it, and no event was emitted at all. In an incident whose
+ * fault IS the failing statement, that dropped the single most decisive observable.
+ *
+ * Two guarantees, both load-bearing:
+ *
+ * 1. **It never changes host behavior.** Every failure inside emission is swallowed here — the
+ *    caller's `catch` rethrows the driver's original error untouched either way. Instrumentation
+ *    that masked an application error would be strictly worse than instrumentation that recorded
+ *    nothing.
+ * 2. **It is not a capture gap.** `capture_exception` means *our* code threw. This means *their*
+ *    statement failed. Same shaped event, opposite owner, and a reader acts on them differently.
+ */
+export function emitDbErrorEvent(input: {
+  engine: DbEngine;
+  op: DbErrorOp;
+  table: string | null;
+  statement: string;
+  requestId: string;
+  error: unknown;
+  options: InstrumentDbClientOptions;
+}): void {
+  const { options } = input;
+  try {
+    emitDbEvent(
+      options,
+      buildDbErrorEvent({
+        engine: input.engine,
+        op: input.op,
+        table: input.table,
+        statement: input.statement,
+        error: input.error,
+        requestId: input.requestId,
+        sessionId: options.sessionId,
+        now: options.now?.(),
+        sessionStartedAt: options.sessionStartedAt,
+      }),
+    );
+  } catch {
+    // Building or routing the record is capture work. It may never decide what the caller sees.
   }
 }
 
