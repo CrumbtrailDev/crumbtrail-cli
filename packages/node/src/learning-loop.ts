@@ -1,13 +1,15 @@
 // --- Per-tenant learning loop cloud client (CRUMB-113) ---------------------
 //
-// Three calls the MCP server makes to close the recall/adoption loop against a
+// The calls the MCP server makes to close the recall/adoption loop against a
 // configured Crumbtrail cloud deployment:
 //
-//   resolveIssueViaCloud        -> POST /api/memory/resolve  (agent-token auth)
-//   recordAgentFeedbackViaCloud -> POST /api/agent/feedback   (agent-token auth)
-//   getAgentPlaybookViaCloud    -> GET  /api/agent/playbook   (agent-token auth)
+//   resolveIssueViaCloud        -> POST /api/memory/resolve      (agent-token auth)
+//   recordAgentFeedbackViaCloud -> POST /api/agent/feedback       (agent-token auth)
+//   getAgentPlaybookViaCloud    -> GET  /api/agent/playbook       (agent-token auth)
+//   startFixVerificationViaCloud-> POST /api/agent/verification   (agent-token auth)
+//   getFixVerificationViaCloud  -> GET  /api/agent/verification   (agent-token auth)
 //
-// All three authenticate with an agent token (`Authorization: Bearer
+// All of them authenticate with an agent token (`Authorization: Bearer
 // CRUMBTRAIL_CLOUD_TOKEN`, the same secret the remote artifact store uses) and
 // reuse `CRUMBTRAIL_CLOUD_URL` for the base.
 //
@@ -236,6 +238,138 @@ export async function getAgentPlaybookViaCloud(
       { headers: { Authorization: `Bearer ${auth.token}` } },
     );
     return await parseResponse<{ rules: unknown[] }>(res);
+  } catch {
+    return { ok: false, reason: "transport", message: TRANSPORT_MESSAGE };
+  }
+}
+
+// --- Fix verification -------------------------------------------------------
+//
+// The cloud watches a canonical issue's signature for a bounded observation
+// window after a fix and reaches ONE terminal verdict. The trust-critical thesis
+// lives in the cloud's verification-engine.ts and is repeated here because this
+// client is what an agent actually reads: an absence of evidence is never a
+// verified fix. Two of the three verdicts, and every one of the inconclusive
+// reasons, mean "we could not tell" rather than "it held".
+
+/** Terminal verdicts the cloud verification engine can reach. Mirrors
+ *  `VerificationResult` in packages/cloud/src/canonical-verifications.ts. */
+export type VerificationResultValue = "verified" | "recurred" | "inconclusive";
+
+/** The CLOSED reason vocabulary every terminal verdict carries. Mirrors
+ *  `VerificationReason` in packages/cloud/src/verification-engine.ts. */
+export const VERIFICATION_REASONS = [
+  "recurrence_detected",
+  "clean_observation_window",
+  "window_incomplete",
+  "window_too_short",
+  "no_telemetry",
+  "insufficient_traffic",
+  "no_recurrence_low_traffic",
+] as const;
+
+/**
+ * The reasons that accompany an `inconclusive` verdict — the engine could not
+ * tell, so the fix is NOT established. Listed for the tool description, never
+ * used to override the `result` the cloud sent: `result` is authoritative and
+ * this array is documentation the agent can read.
+ */
+export const INCONCLUSIVE_VERIFICATION_REASONS = [
+  "window_incomplete",
+  "window_too_short",
+  "no_telemetry",
+  "insufficient_traffic",
+] as const;
+
+/**
+ * One issue's verification state, exactly the shape
+ * `packages/cloud/src/routes/agent-verification-routes.ts` returns.
+ *
+ * `state` is three-valued on purpose: `none` means nothing was ever opened,
+ * `open` means a window is in flight and NOTHING has been concluded, and
+ * `terminal` means the runtime reached a verdict. An open window never carries
+ * a result, so "we do not know yet" stays distinguishable from "we checked".
+ */
+export interface FixVerificationView {
+  state: "open" | "terminal" | "none";
+  observationStart: string | null;
+  observationEnd: string | null;
+  result: VerificationResultValue | null;
+  reason: string | null;
+  strategy: string | null;
+  confidence: number | null;
+}
+
+export interface StartFixVerificationResponse extends FixVerificationView {
+  /** False when the issue already had a live window: the POST is idempotent and
+   *  hands back the existing window rather than opening a second one. */
+  opened: boolean;
+}
+
+const VERIFICATION_UNCONFIGURED =
+  "Fix verification requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.";
+
+/**
+ * Open an observation window for one canonical issue after applying a fix.
+ * Idempotent server side: an issue with a live window gets that window back with
+ * `opened: false` and no second `verification_started` event.
+ */
+export async function startFixVerificationViaCloud(input: {
+  projectId: string;
+  canonicalIssueId: string;
+}): Promise<LearningLoopResult<StartFixVerificationResponse>> {
+  const auth = agentAuth();
+  if (!auth) {
+    return {
+      ok: false,
+      reason: "unconfigured",
+      message: VERIFICATION_UNCONFIGURED,
+    };
+  }
+  try {
+    const res = await fetch(`${auth.base}/api/agent/verification`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${auth.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        project: input.projectId,
+        issue: input.canonicalIssueId,
+      }),
+    });
+    return await parseResponse<StartFixVerificationResponse>(res);
+  } catch {
+    return { ok: false, reason: "transport", message: TRANSPORT_MESSAGE };
+  }
+}
+
+/**
+ * Read the current verification state for one canonical issue. Read-only; it
+ * never opens a window, so polling it is free of side effects.
+ */
+export async function getFixVerificationViaCloud(input: {
+  projectId: string;
+  canonicalIssueId: string;
+}): Promise<LearningLoopResult<FixVerificationView>> {
+  const auth = agentAuth();
+  if (!auth) {
+    return {
+      ok: false,
+      reason: "unconfigured",
+      message: VERIFICATION_UNCONFIGURED,
+    };
+  }
+  const params = new URLSearchParams({
+    project: input.projectId,
+    issue: input.canonicalIssueId,
+  });
+  try {
+    const res = await fetch(
+      `${auth.base}/api/agent/verification?${params.toString()}`,
+      { headers: { Authorization: `Bearer ${auth.token}` } },
+    );
+    return await parseResponse<FixVerificationView>(res);
   } catch {
     return { ok: false, reason: "transport", message: TRANSPORT_MESSAGE };
   }

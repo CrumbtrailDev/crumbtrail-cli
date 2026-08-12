@@ -25,14 +25,49 @@ interface CapturedReq {
   body: any;
 }
 
+/** Mutable bodies the verification endpoints answer with. Held by reference so a
+ *  test can reshape the cloud's verdict after the server is already listening. */
+interface MockCloudState {
+  verificationOpen: Record<string, unknown>;
+  verificationView: Record<string, unknown>;
+  /** Status both verification endpoints answer with. 200 unless a test wants a
+   *  refusal, which the client must surface as an error rather than a gap. */
+  verificationStatus: number;
+}
+
 interface MockCloud {
   url: string;
   requests: CapturedReq[];
+  state: MockCloudState;
   stop(): Promise<void>;
 }
 
+/** A window in flight: nothing concluded, so every verdict field is null. */
+const OPEN_WINDOW = {
+  state: "open",
+  observationStart: "2026-08-01T00:00:00.000Z",
+  observationEnd: "2026-08-08T00:00:00.000Z",
+  result: null,
+  reason: null,
+  strategy: null,
+  confidence: null,
+};
+
 function startMockCloud(): Promise<MockCloud> {
   const requests: CapturedReq[] = [];
+  const state: MockCloudState = {
+    verificationStatus: 200,
+    verificationOpen: { opened: true, ...OPEN_WINDOW },
+    verificationView: {
+      state: "terminal",
+      observationStart: "2026-08-01T00:00:00.000Z",
+      observationEnd: "2026-08-08T00:00:00.000Z",
+      result: "verified",
+      reason: "clean_observation_window",
+      strategy: "stable_signature_recurrence",
+      confidence: 0.83,
+    },
+  };
   const server = http.createServer((req, res) => {
     const u = new URL(req.url ?? "", "http://mock.local");
     const chunks: Buffer[] = [];
@@ -110,6 +145,12 @@ function startMockCloud(): Promise<MockCloud> {
           rules: [{ id: "rule_1", text: "Check the cart is non-empty" }],
         });
       }
+      if (u.pathname === "/api/agent/verification") {
+        if (req.method === "POST")
+          return send(state.verificationStatus, state.verificationOpen);
+        if (req.method === "GET")
+          return send(state.verificationStatus, state.verificationView);
+      }
       send(404, { error: "Not found", code: "not_found" });
     });
   });
@@ -122,6 +163,7 @@ function startMockCloud(): Promise<MockCloud> {
       resolve({
         url: `http://127.0.0.1:${addr.port}`,
         requests,
+        state,
         stop: () =>
           new Promise<void>((r, j) => server.close((e) => (e ? j(e) : r()))),
       });
@@ -359,5 +401,284 @@ describe("MCP learning loop (CRUMB-113)", () => {
     expect(isError).toBe(false);
     expect(parsed).toMatchObject({ ok: false, source: "remote-unavailable" });
     expect(parsed.gaps[0]).toMatch(/CRUMBTRAIL_CLOUD_TOKEN/);
+  });
+
+  // --- Fix verification (CP-V2) --------------------------------------------
+  //
+  // The invariant under test is the cloud verification engine's own: an absence
+  // of evidence is never a verified fix. The MCP payload is the last place that
+  // can be enforced, so the inconclusive cases below are the load-bearing ones,
+  // not the happy path.
+  describe("fix verification", () => {
+    it("startFixVerification posts project + issue with the agent token and returns the open window", async () => {
+      mock = await startMockCloud();
+      configureCloud(mock.url);
+      const server = new McpServer({ outputDir: tmpDir });
+
+      const { isError, parsed } = await call(server, "startFixVerification", {
+        project: "proj_1",
+        canonicalIssueId: "ci_42",
+      });
+
+      expect(isError).toBe(false);
+      expect(parsed).toMatchObject({
+        source: "cloud",
+        project: "proj_1",
+        canonicalIssueId: "ci_42",
+        opened: true,
+        state: "open",
+        result: null,
+        conclusive: false,
+        fixConfirmed: false,
+        recurred: false,
+        observationEnd: "2026-08-08T00:00:00.000Z",
+      });
+      // An open window must never read as a fix that held.
+      expect(parsed.interpretation).toMatch(/NOTHING has been concluded/);
+
+      const req = mock.requests.find(
+        (r) => r.path === "/api/agent/verification",
+      );
+      expect(req).toBeDefined();
+      expect(req!.method).toBe("POST");
+      // The verification plane is agent-token authenticated; the ingest key
+      // must never appear on it.
+      expect(req!.auth).toBeUndefined();
+      expect(req!.agentToken).toBe("ctagt-token");
+      // The tool's `canonicalIssueId` is the route's `issue` on the wire.
+      expect(req!.body).toEqual({ project: "proj_1", issue: "ci_42" });
+    });
+
+    it("startFixVerification surfaces opened:false when the cloud handed back a live window", async () => {
+      mock = await startMockCloud();
+      mock.state.verificationOpen = { opened: false, ...OPEN_WINDOW };
+      configureCloud(mock.url);
+      const server = new McpServer({ outputDir: tmpDir });
+
+      const { parsed } = await call(server, "startFixVerification", {
+        project: "proj_1",
+        canonicalIssueId: "ci_42",
+      });
+      expect(parsed.opened).toBe(false);
+      expect(parsed.state).toBe("open");
+      expect(parsed.fixConfirmed).toBe(false);
+    });
+
+    it("getFixVerification reads with bearer auth and passes result + reason through verbatim", async () => {
+      mock = await startMockCloud();
+      configureCloud(mock.url);
+      const server = new McpServer({ outputDir: tmpDir });
+
+      const { isError, parsed } = await call(server, "getFixVerification", {
+        project: "proj_1",
+        canonicalIssueId: "ci_42",
+      });
+
+      expect(isError).toBe(false);
+      expect(parsed).toMatchObject({
+        source: "cloud",
+        state: "terminal",
+        result: "verified",
+        reason: "clean_observation_window",
+        strategy: "stable_signature_recurrence",
+        confidence: 0.83,
+        conclusive: true,
+        fixConfirmed: true,
+        recurred: false,
+      });
+
+      const req = mock.requests.find(
+        (r) => r.path === "/api/agent/verification",
+      );
+      expect(req!.method).toBe("GET");
+      expect(req!.agentToken).toBe("ctagt-token");
+      expect(req!.query.project).toBe("proj_1");
+      expect(req!.query.issue).toBe("ci_42");
+    });
+
+    // THE safety catch. An agent that reads "inconclusive" as "done" defeats the
+    // whole feature, so the rendered payload must not contain the word anywhere
+    // — not in a field, not in a derived boolean's name, not in the prose.
+    it("an insufficient_traffic verdict never renders as verified anywhere in the payload", async () => {
+      mock = await startMockCloud();
+      mock.state.verificationView = {
+        state: "terminal",
+        observationStart: "2026-08-01T00:00:00.000Z",
+        observationEnd: "2026-08-08T00:00:00.000Z",
+        result: "inconclusive",
+        reason: "insufficient_traffic",
+        strategy: "stable_signature_recurrence",
+        confidence: null,
+      };
+      configureCloud(mock.url);
+      const server = new McpServer({ outputDir: tmpDir });
+
+      const { isError, parsed, text } = await call(
+        server,
+        "getFixVerification",
+        { project: "proj_1", canonicalIssueId: "ci_42" },
+      );
+
+      expect(isError).toBe(false);
+      // The load-bearing assertion, first: the whole serialised payload — keys,
+      // values and prose alike — must not contain the word anywhere.
+      expect(text.toLowerCase()).not.toContain("verified");
+      expect(parsed.result).toBe("inconclusive");
+      expect(parsed.reason).toBe("insufficient_traffic");
+      expect(parsed.fixConfirmed).toBe(false);
+      expect(parsed.recurred).toBe(false);
+      expect(parsed.confidence).toBeNull();
+      expect(parsed.interpretation).toMatch(/could not tell/);
+      expect(parsed.interpretation).toMatch(/NOT a fix/);
+    });
+
+    it.each([
+      "window_incomplete",
+      "window_too_short",
+      "no_telemetry",
+      "insufficient_traffic",
+    ])(
+      "the inconclusive reason %s renders as unestablished, never as verified",
+      async (reason) => {
+        mock = await startMockCloud();
+        mock.state.verificationView = {
+          state: "terminal",
+          observationStart: "2026-08-01T00:00:00.000Z",
+          observationEnd: "2026-08-08T00:00:00.000Z",
+          result: "inconclusive",
+          reason,
+          strategy: "stable_signature_recurrence",
+          confidence: null,
+        };
+        configureCloud(mock.url);
+        const server = new McpServer({ outputDir: tmpDir });
+
+        const { parsed, text } = await call(server, "getFixVerification", {
+          project: "proj_1",
+          canonicalIssueId: "ci_42",
+        });
+        expect(parsed.reason).toBe(reason);
+        expect(parsed.fixConfirmed).toBe(false);
+        expect(text.toLowerCase()).not.toContain("verified");
+      },
+    );
+
+    it("a recurred verdict says the fix did not hold and confirms nothing", async () => {
+      mock = await startMockCloud();
+      mock.state.verificationView = {
+        state: "terminal",
+        observationStart: "2026-08-01T00:00:00.000Z",
+        observationEnd: "2026-08-08T00:00:00.000Z",
+        result: "recurred",
+        reason: "recurrence_detected",
+        strategy: "stable_signature_recurrence",
+        confidence: 1,
+      };
+      configureCloud(mock.url);
+      const server = new McpServer({ outputDir: tmpDir });
+
+      const { parsed, text } = await call(server, "getFixVerification", {
+        project: "proj_1",
+        canonicalIssueId: "ci_42",
+      });
+      expect(parsed.recurred).toBe(true);
+      expect(parsed.fixConfirmed).toBe(false);
+      expect(parsed.interpretation).toMatch(/did NOT hold/);
+      expect(text.toLowerCase()).not.toContain("verified");
+    });
+
+    it("state none says nothing was ever measured rather than reporting a clean result", async () => {
+      mock = await startMockCloud();
+      mock.state.verificationView = {
+        state: "none",
+        observationStart: null,
+        observationEnd: null,
+        result: null,
+        reason: null,
+        strategy: null,
+        confidence: null,
+      };
+      configureCloud(mock.url);
+      const server = new McpServer({ outputDir: tmpDir });
+
+      const { parsed, text } = await call(server, "getFixVerification", {
+        project: "proj_1",
+        canonicalIssueId: "ci_42",
+      });
+      expect(parsed.state).toBe("none");
+      expect(parsed.conclusive).toBe(false);
+      expect(parsed.fixConfirmed).toBe(false);
+      expect(parsed.interpretation).toMatch(/nothing has been measured/);
+      expect(text.toLowerCase()).not.toContain("verified");
+    });
+
+    it.each(["startFixVerification", "getFixVerification"])(
+      "%s rejects a malformed project id before any network call",
+      async (tool) => {
+        mock = await startMockCloud();
+        configureCloud(mock.url);
+        const server = new McpServer({ outputDir: tmpDir });
+        const { isError } = await call(server, tool, {
+          project: "bad id!",
+          canonicalIssueId: "ci_42",
+        });
+        expect(isError).toBe(true);
+        expect(mock.requests).toHaveLength(0);
+      },
+    );
+
+    it.each(["startFixVerification", "getFixVerification"])(
+      "%s rejects a missing canonicalIssueId before any network call",
+      async (tool) => {
+        mock = await startMockCloud();
+        configureCloud(mock.url);
+        const server = new McpServer({ outputDir: tmpDir });
+        const { isError, text } = await call(server, tool, {
+          project: "proj_1",
+        });
+        expect(isError).toBe(true);
+        expect(text).toMatch(/canonicalIssueId/);
+        expect(mock.requests).toHaveLength(0);
+      },
+    );
+
+    it.each(["startFixVerification", "getFixVerification"])(
+      "%s reports a gap (not an error) when the cloud is unconfigured",
+      async (tool) => {
+        const server = new McpServer({ outputDir: tmpDir });
+        const { isError, parsed } = await call(server, tool, {
+          project: "proj_1",
+          canonicalIssueId: "ci_42",
+        });
+        expect(isError).toBe(false);
+        expect(parsed).toMatchObject({
+          ok: false,
+          source: "remote-unavailable",
+        });
+        expect(parsed.gaps[0]).toMatch(
+          /CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN/,
+        );
+      },
+    );
+
+    it("a cloud rejection is an error the agent sees, never a quiet non-result", async () => {
+      mock = await startMockCloud();
+      // An issue the token cannot reach is a 404 from the route.
+      mock.state.verificationStatus = 404;
+      mock.state.verificationView = {
+        error: "Canonical issue not found",
+        code: "not_found",
+      };
+      configureCloud(mock.url);
+      const server = new McpServer({ outputDir: tmpDir });
+
+      const { isError, text } = await call(server, "getFixVerification", {
+        project: "proj_1",
+        canonicalIssueId: "ci_42",
+      });
+      expect(isError).toBe(true);
+      expect(text).toMatch(/getFixVerification failed/);
+      expect(text).toMatch(/Canonical issue not found \(not_found\)/);
+    });
   });
 });
