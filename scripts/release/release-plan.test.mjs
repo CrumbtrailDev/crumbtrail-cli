@@ -51,7 +51,7 @@ describe("release package selection", () => {
     const core = pkg("crumbtrail-core");
     const cli = pkg("crumbtrail", {
       devDependencies: { "crumbtrail-core": "workspace:^" },
-      tsupConfig: '// noExternal: ["crumbtrail-core"]\nexport default { noExternal: ["crumbtrail-detect-core"] }',
+      tsupConfig: '// noExternal: ["crumbtrail-core"]\nexport default { noExternal: ["crumbtrail-unrelated"] }',
     });
     expect(selectReleasePackages({ packages: [core, cli], changedFiles: ["packages/core/src/index.ts"] }).map((entry) => entry.name))
       .toEqual(["crumbtrail-core"]);
@@ -81,16 +81,20 @@ describe("release package selection", () => {
     ]);
   });
 
-  it("propagates a bundled detect-core change directly to CLI", () => {
-    const detectCore = pkg("crumbtrail-detect-core");
+  it("propagates a bundled core change directly to the CLI", () => {
+    // The live one-hop case: the CLI declares core as a devDependency and tsup
+    // bundles it, so core source lands inside the CLI tarball and a core change
+    // has to select the CLI too. This is the invariant the fold nearly broke —
+    // the CLI silently dropped out of the release set until noExternal said so.
+    const core = pkg("crumbtrail-core");
     const cli = pkg("crumbtrail", {
-      devDependencies: { "crumbtrail-detect-core": "workspace:^" },
-      tsupConfig: 'export default { noExternal: ["crumbtrail-detect-core"] }',
+      devDependencies: { "crumbtrail-core": "workspace:^" },
+      tsupConfig: 'export default { noExternal: ["crumbtrail-core"] }',
     });
     expect(selectReleasePackages({
-      packages: [detectCore, cli],
-      changedFiles: ["packages/detect-core/src/index.ts"],
-    }).map((entry) => entry.name)).toEqual(["crumbtrail", "crumbtrail-detect-core"]);
+      packages: [core, cli],
+      changedFiles: ["packages/core/src/index.ts"],
+    }).map((entry) => entry.name)).toEqual(["crumbtrail", "crumbtrail-core"]);
   });
 
   it("propagates a changed workspace runtime dependency to its public consumer", () => {
@@ -191,10 +195,10 @@ describe("release package selection", () => {
 
     // This list is every public package the workspace still has, because after
     // the package consolidation each one does depend on core: the React and
-    // Tauri adapters became crumbtrail-core subpaths, and install-shared became
-    // the crumbtrail-detect-core/install subpath, so the three packages that
-    // used to sit outside the propagation graph no longer exist to sit outside
-    // it. The tripwire is unchanged in spirit — if this list ever grows, a
+    // Tauri adapters became crumbtrail-core subpaths, and detection and
+    // install-shared became the crumbtrail package and its /install subpath, so
+    // the four packages that used to sit outside the propagation graph no
+    // longer exist to sit outside it. The tripwire is unchanged in spirit — if this list ever grows, a
     // workspace metadata edit is quietly republishing something new, and that
     // is a change someone has to justify.
     expect(selected.map((pkg) => pkg.name)).toEqual([
@@ -324,21 +328,23 @@ describe("release artifact safety", () => {
   });
 
   it("publishes selected artifacts in dependency-safe topological order", () => {
+    // crumbtrail-middle is synthetic: the real workspace is one hop deep now,
+    // and the ordering has to keep holding if a middle package ever returns.
     const packages = [
       { name: "crumbtrail", version: "1.0.0" },
       { name: "crumbtrail-core", version: "1.0.0" },
-      { name: "crumbtrail-detect-core", version: "1.0.0" },
+      { name: "crumbtrail-middle", version: "1.0.0" },
       { name: "crumbtrail-node", version: "1.0.0" },
     ];
     const ordered = topologicallyOrderReleasePackages(packages, new Map([
-      ["crumbtrail", ["crumbtrail-detect-core"]],
-      ["crumbtrail-detect-core", ["crumbtrail-core"]],
+      ["crumbtrail", ["crumbtrail-middle"]],
+      ["crumbtrail-middle", ["crumbtrail-core"]],
       ["crumbtrail-node", ["crumbtrail-core"]],
       ["crumbtrail-core", []],
     ]));
     expect(ordered.map((entry) => entry.name)).toEqual([
       "crumbtrail-core",
-      "crumbtrail-detect-core",
+      "crumbtrail-middle",
       "crumbtrail",
       "crumbtrail-node",
     ]);

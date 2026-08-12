@@ -61,7 +61,6 @@
     "prepack": "node ../../scripts/assert-publish-safe.mjs",
     "prepublishOnly": "node ../../scripts/assert-publish-safe.mjs",
     "build": "tsup",
-    "pretest": "pnpm --filter crumbtrail-detect-core build",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
