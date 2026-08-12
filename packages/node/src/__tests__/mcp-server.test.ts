@@ -120,7 +120,7 @@ describe("MCP Server", () => {
     });
     expect(res).not.toBeNull();
     const result = res!.result as any;
-    // 38 = 38 minus solveContext, resolveCapsule, and searchSpecs, which left
+    // 38 = the 35 left after solveContext, resolveCapsule, and searchSpecs went
     // with the third-party integration surfaces they queried, plus
     // getWindowCorrelation, startFixVerification and getFixVerification.
     expect(result.tools).toHaveLength(38);
