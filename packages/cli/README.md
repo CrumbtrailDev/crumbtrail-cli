@@ -17,7 +17,9 @@ Running `npx crumbtrail` walks the full path in one pass:
 1. **Detects** your stack — Next.js, Vite, React, Vue, Svelte, Express, Hono, Node,
    and non-JS services like Django, Rails, Go and .NET.
 2. **Logs you in** (opens a browser, or use `--no-browser` for a device code).
-3. **Provisions** a project and service, and mints an ingest key.
+3. **Provisions** a project and service, mints the project's ingest key, and
+   writes it into your app's env file — see "What it writes" for the rules that
+   write follows, and `--no-write-key` to opt out.
 4. **Installs** the right SDK package and **injects** the setup code into your entry
    file. This is the only step that writes to your repo, and it always runs last.
 5. **Verifies** the wiring end to end, then waits for your first real event.
@@ -34,17 +36,18 @@ crumbtrail logout          Delete the cached token
 crumbtrail verify          Preflight an endpoint + key (DNS, TLS, auth) — PASS/FAIL
 ```
 
-| Option | Description |
-| --- | --- |
-| `--yes`, `-y` | Skip confirmations (required with `--project` in CI) |
-| `--project <id>` | Attach to an existing project instead of creating one |
-| `--only <name>` | Monorepo: wire only this service (repeatable) |
-| `--all` | Monorepo: wire every service it can, no prompts |
-| `--workspace <dir>` | Wire just one package dir instead of the whole repo |
-| `--no-browser` | Use the device-code login flow |
-| `--skip-verify` | Don't wait for the first event |
-| `--endpoint <url>` | Cloud endpoint (else `$CRUMBTRAIL_BASE_URL`, else the default) |
-| `--version`, `-v` | Print the version |
+| Option              | Description                                                    |
+| ------------------- | -------------------------------------------------------------- |
+| `--yes`, `-y`       | Skip confirmations (required with `--project` in CI)           |
+| `--project <id>`    | Attach to an existing project instead of creating one          |
+| `--only <name>`     | Monorepo: wire only this service (repeatable)                  |
+| `--all`             | Monorepo: wire every service it can, no prompts                |
+| `--workspace <dir>` | Wire just one package dir instead of the whole repo            |
+| `--no-browser`      | Use the device-code login flow                                 |
+| `--skip-verify`     | Don't wait for the first event                                 |
+| `--no-write-key`    | Don't mint or write a key; print the variable to set instead   |
+| `--endpoint <url>`  | Cloud endpoint (else `$CRUMBTRAIL_BASE_URL`, else the default) |
+| `--version`, `-v`   | Print the version                                              |
 
 ### Non-interactive / CI
 
@@ -59,7 +62,7 @@ npx crumbtrail --yes --project prj_1234abcd --only web --skip-verify
 
 `crumbtrail verify` runs a fast **synthetic preflight** against any environment's
 endpoint and key and returns PASS/FAIL in a few seconds — point it at prod from
-your laptop or CI *before* you deploy, to catch a wrong key, wrong endpoint, or a
+your laptop or CI _before_ you deploy, to catch a wrong key, wrong endpoint, or a
 TLS cert/host mismatch that would otherwise leave you silently sending nothing.
 
 ```bash
@@ -70,7 +73,7 @@ It runs three staged checks, each reporting PASS/FAIL with the exact reason and
 elapsed time:
 
 1. **DNS** — the endpoint host resolves.
-2. **TLS** — the certificate is actually valid *for that host* (this is what
+2. **TLS** — the certificate is actually valid _for that host_ (this is what
    catches a `*.up.railway.app`-style cert/host mismatch).
 3. **Auth** — a real authenticated round-trip on the same path the SDK uses. A
    `200` passes; `401`/`403` means a bad or expired key; `404` means the wrong
@@ -81,12 +84,12 @@ Unlike the setup wizard's verify step, this does **not** wait for live traffic �
 it actively probes the config. It is non-interactive (no prompts, no browser), so
 it is safe to run in CI.
 
-| Option | Description |
-| --- | --- |
-| `--endpoint <url>` | Endpoint to probe (else `$CRUMBTRAIL_BASE_URL`, else the default) |
+| Option              | Description                                                                    |
+| ------------------- | ------------------------------------------------------------------------------ |
+| `--endpoint <url>`  | Endpoint to probe (else `$CRUMBTRAIL_BASE_URL`, else the default)              |
 | `--key <ingestKey>` | Ingest key to probe with (else `$CRUMBTRAIL_KEY`, else the cached login token) |
-| `--project <id>` | Project id for the authenticated GET fallback when no key is given |
-| `--json` | Emit a machine-readable result (`{ ok, endpoint, stages[] }`) for CI |
+| `--project <id>`    | Project id for the authenticated GET fallback when no key is given             |
+| `--json`            | Emit a machine-readable result (`{ ok, endpoint, stages[] }`) for CI           |
 
 The exit code is **`0` when every runnable stage passes and non-zero on any
 failure**, so it drops straight into a CI gate:
@@ -143,18 +146,39 @@ CLI and the composite action never echo the key.
 
 ## What it writes
 
-Only one kind of change, in the package it's wiring:
+Two kinds of change, in the package it's wiring:
 
 - the SDK import and `Crumbtrail.init(...)` call in your entry file
+- your ingest key, in an env file, plus a `.gitignore` entry for that file
 
-The wizard is **hands-off with your ingest key**: it never writes the key to a
-file. The injected code reads it from a framework-appropriate environment
-variable, and the wizard tells you which one to set — for example
-`NEXT_PUBLIC_CRUMBTRAIL_KEY` (Next), `VITE_CRUMBTRAIL_KEY` (Vite / SvelteKit /
-Nuxt / Remix), `PUBLIC_CRUMBTRAIL_KEY` (Astro), `EXPO_PUBLIC_CRUMBTRAIL_KEY`
-(Expo / React Native), or `CRUMBTRAIL_KEY` (Node backends). Mint the key in the
-dashboard and set that variable in your own `.env`, so a live credential never
-lands in committed source.
+The injected code reads the key from a framework-appropriate environment
+variable — `NEXT_PUBLIC_CRUMBTRAIL_KEY` (Next), `VITE_CRUMBTRAIL_KEY` (Vite /
+SvelteKit / Nuxt / Remix), `PUBLIC_CRUMBTRAIL_KEY` (Astro),
+`EXPO_PUBLIC_CRUMBTRAIL_KEY` (Expo / React Native), or `CRUMBTRAIL_KEY` (Node
+backends) — and the wizard mints the key and sets that variable for you.
+
+Writing a live credential to disk follows four rules, and the wizard tells you
+which one applied:
+
+- **It never writes into a file git already tracks.** Adding that file to
+  `.gitignore` afterwards would not untrack it, so the next commit would
+  publish the key. In that case nothing is minted and the wizard hands the
+  variable back to you.
+- **It excludes the file it writes.** An env file that isn't ignored yet gets a
+  `.gitignore` entry in the same step, so a live key is never one `git add .`
+  from being committed.
+- **It never overwrites a variable that already has a value.** A rerun against
+  a configured app leaves your key exactly where it is.
+- **It reuses one key per project.** A monorepo of nine services shares one
+  credential rather than accumulating nine.
+
+An existing `.env.local` or `.env` is used before a new file is created. With
+neither present, a bundled variable goes to `.env.local` and a server variable
+to `.env`, created `0600`. The key value is never printed to your terminal.
+
+Pass `--no-write-key` to skip all of this and set the variable yourself, which
+is the right choice when your secrets come from a vault or your platform's own
+environment UI.
 
 It won't touch a package that is already wired, and it never edits libraries or
 config-only packages.
