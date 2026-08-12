@@ -159,59 +159,75 @@ describe("release package selection", () => {
     ]);
   });
 
-  it("derives the complete Phase 0 release set", async () => {
-    // c7dacf4 is the last commit immediately before PR #17. Keep this test
-    // tied to the real release range so the workflow cannot silently grow the
-    // Phase 0 publish set as workspace metadata changes.
-    // Add this checkpoint's uncommitted package paths so the test has the same
-    // release range it will see once this commit becomes HEAD in CI.
-    const changedFiles = new Set(await changedFilesSince(repositoryRoot, "c7dacf4"));
-    for (const file of [
-      "packages/core/package.json",
-      "packages/node/package.json",
-      "packages/detect-core/package.json",
-      "packages/cli/package.json",
-      "packages/install-shared/package.json",
-      "packages/react-native/package.json",
-      "packages/tauri/package.json",
-    ]) changedFiles.add(file);
-    const plan = await createReleasePlan({
-      rootDir: repositoryRoot,
-      baseRef: "c7dacf4",
-      changedFiles: [...changedFiles],
-    });
-    // Asserts the SET, not hardcoded version strings.
+  // Base-ref plumbing must keep resolving in a fresh clone. This test used to
+  // pin the literal SHA c7dacf4 as its baseline; the GitHub repository was
+  // recreated and its history rebuilt, so that object now survives only in
+  // local stores and CI could never resolve it again. Refs that a clone always
+  // has are the only safe ones to name here.
+  it("resolves a base ref that exists in any clone", async () => {
+    await expect(changedFilesSince(repositoryRoot, "HEAD")).resolves.toEqual([]);
+  });
+
+  it("derives the full public release set from a single core change", async () => {
+    // The invariant this test exists to protect is that the publish set cannot
+    // silently GROW as workspace metadata changes. That is a property of the
+    // package graph — runtime/peer/optional workspace deps and tsup noExternal
+    // bundling — so the graph is read live from the real repository while the
+    // release input and the expected names stay a deliberate, pinned fixture.
     //
-    // The versions this used to pin went stale the moment any package was bumped,
-    // because createReleasePlan reads the live manifests while the expectation was
-    // frozen. Not hypothetical: bdea8ce bumped the CLI to 0.7.3 and detect-core to
-    // 0.2.1 against expectations of 0.7.2 and 0.2.0, and ci went red and stayed red
-    // until this was rewritten. Re-pinning numbers only re-arms the same tripwire on
-    // the next release.
+    // Both inputs are explicit rather than derived from git history. The old
+    // version of this test asked git for a diff against a frozen SHA, which
+    // coupled a policy assertion to the shape of the commit graph: it went stale
+    // on every release, and it broke outright when the repository history was
+    // rebuilt. Passing the release input directly is what makes the expected set
+    // reviewable — a change to these names is a change someone has to justify.
     //
-    // The invariant this test exists to protect, per the comment above, is that the
-    // publish set cannot silently GROW. That is a property of the NAMES, so the names
-    // stay pinned and versions are checked against the manifests instead.
-    //
-    // crumbtrail-react is in this set: the frozen c7dacf4 baseline reaches back past
-    // react's own last release, so it selects here even though a real release from
-    // the last published commit would not include it. Listed to keep the assertion
-    // honest about what this range derives, and a standing reason to pass a base ref
-    // at the last published commit rather than this one.
-    expect(plan.packages.map((pkg) => pkg.name)).toEqual([
+    // The input is deliberately minimal: one changed manifest and one version
+    // bump. Everything else in the expected set below arrives by propagation
+    // through the live graph, so the assertion tests the selection policy rather
+    // than restating a hand-written answer.
+    const packages = await discoverPackages(repositoryRoot);
+    const changedFiles = ["packages/core/package.json"];
+    const versionChangedPackageNames = ["crumbtrail-core"];
+    const selected = selectReleasePackages({ packages, changedFiles, versionChangedPackageNames });
+
+    // crumbtrail-react is deliberately ABSENT, and its absence is the point of
+    // this assertion. It declares no workspace dependency and is bundled into
+    // nothing, so no amount of propagation can reach it — only a change to
+    // packages/react itself selects it. It appeared in the old expected set
+    // solely because the frozen baseline reached back past react's own last
+    // release and swept packages/react into the diff. If react ever gains a
+    // workspace dependency, or any package gains a noExternal entry, this list
+    // grows and this test fails, which is exactly the tripwire that keeps a
+    // workspace metadata edit from quietly republishing every public package.
+    expect(selected.map((pkg) => pkg.name)).toEqual([
       "crumbtrail",
       "crumbtrail-core",
       "crumbtrail-detect-core",
       "crumbtrail-install-shared",
       "crumbtrail-node",
-      "crumbtrail-react",
       "crumbtrail-react-native",
       "crumbtrail-tauri",
     ]);
-    // Every selected artifact publishes at exactly its manifest version. This is the
-    // property the pinned strings were reaching for, and unlike them it cannot go
-    // stale.
-    for (const pkg of plan.packages) {
+
+    // The release-blocking guard, run against the real graph rather than a
+    // synthetic one: nothing may propagate into the publish set on a changed
+    // runtime contract without receiving its own version bump. Bumping core
+    // alone must be rejected, and it must name every consumer left behind.
+    expect(() => assertVersionedRuntimeConsumers(selected, versionChangedPackageNames))
+      .toThrow(/crumbtrail-detect-core.*crumbtrail-install-shared.*crumbtrail-node.*crumbtrail-react-native.*crumbtrail-tauri/);
+    // Bumping every propagated consumer clears it.
+    expect(() => assertVersionedRuntimeConsumers(selected, selected.map((pkg) => pkg.name))).not.toThrow();
+
+    // Every selected artifact publishes at exactly its manifest version.
+    //
+    // The versions this test used to pin went stale the moment any package was
+    // bumped, because selection reads the live manifests while the expectation
+    // was frozen. Not hypothetical: bdea8ce bumped the CLI to 0.7.3 and
+    // detect-core to 0.2.1 against expectations of 0.7.2 and 0.2.0, and ci went
+    // red and stayed red until this was rewritten. Reading the manifest back off
+    // disk asserts the same property without re-arming that tripwire.
+    for (const pkg of selected) {
       const manifest = JSON.parse(
         await readFile(
           path.join(repositoryRoot, pkg.relativeDir, "package.json"),
