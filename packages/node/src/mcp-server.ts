@@ -124,7 +124,7 @@ const MAX_TOKENS_SCHEMA = {
  */
 const FIX_CONTEXT_MAX_TOKENS_SCHEMA = {
   ...MAX_TOKENS_SCHEMA,
-  description: `${MAX_TOKENS_DESCRIPTION} In this bundle the order is ranked signals, then database statements that failed, then database row diffs, then database pre state reads, then database span activity, then the correlated requests. The backend and frontend request lists are budgeted together as one list named primary_window.requests, so the same index in primary_window.backend.requests and primary_window.frontend.requests always describes the same linked request. causal_chain is a projection over signals rather than a list of its own: it is kept only when every signal it names survived, and is otherwise dropped whole and named in dropReport.`,
+  description: `${MAX_TOKENS_DESCRIPTION} In this bundle the order is ranked signals, then database statements that failed, then the statements that ran, then database row diffs, then database pre state reads, then database span activity, then the correlated requests. The backend and frontend request lists are budgeted together as one list named primary_window.requests, so the same index in primary_window.backend.requests and primary_window.frontend.requests always describes the same linked request. causal_chain is a projection over signals rather than a list of its own: it is kept only when every signal it names survived, and is otherwise dropped whole and named in dropReport.`,
 };
 
 /**
@@ -138,7 +138,10 @@ const FIX_CONTEXT_MAX_TOKENS_SCHEMA = {
  * only plane that names a root cause, so it is spent first. Statements that
  * RAISED come next: a rejected statement is frequently the whole answer, it is
  * the one database plane that can be decisive on its own, and there are never
- * many of them, so it is the cheapest plane to keep whole. Database evidence
+ * many of them, so it is the cheapest plane to keep whole. The statements that
+ * RAN come next, because they are the only plane that says what the request
+ * ASKED rather than what it got back, and a predicate defect is unreadable
+ * from rows alone. Database evidence
  * carries the row level state those detectors reason over, with row diffs
  * before pre state reads before statement only OTel activity. The requests come
  * last: they are the bulkiest plane and the most redundant, since every kept
@@ -166,6 +169,12 @@ const FIX_CONTEXT_BUDGET_PLANES: ReadonlyArray<
       "primary_window.db_errors",
       context.primary_window.db_errors,
       (error) => `db.error:${error.table ?? "?"}@t=${error.t}`,
+    ),
+  (context) =>
+    budgetPlane(
+      "primary_window.db_statements",
+      context.primary_window.db_statements,
+      (statement) => `db.statement:${statement.table ?? "?"}@t=${statement.t}`,
     ),
   (context) =>
     budgetPlane(
@@ -2550,8 +2559,7 @@ export class McpServer {
             kind: "top-candidate",
             status: top ? "ref-omitted" : "no-candidates",
             candidate: top,
-            anchor:
-              top && isRecord(top.anchor) ? top.anchor : undefined,
+            anchor: top && isRecord(top.anchor) ? top.anchor : undefined,
             evidenceWindow:
               top && isRecord(top.evidenceWindow)
                 ? top.evidenceWindow

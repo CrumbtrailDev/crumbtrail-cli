@@ -615,6 +615,7 @@ function minimalEvidenceDrops(context: FixContext): PromptDrop[] {
     ["primary_window.db_diffs", context.primary_window.db_diffs],
     ["primary_window.db_reads", context.primary_window.db_reads],
     ["primary_window.db_errors", context.primary_window.db_errors],
+    ["primary_window.db_statements", context.primary_window.db_statements],
     ["primary_window.db_activity", context.primary_window.db_activity],
   ] as const) {
     if (entries.length > 0)
@@ -658,6 +659,7 @@ function minimalEvidenceSlice(context: FixContext): FixContext {
       db_diffs: [],
       db_reads: [],
       db_errors: [],
+      db_statements: [],
       db_activity: [],
     },
     environment: null,

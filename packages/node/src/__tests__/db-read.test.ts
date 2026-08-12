@@ -7,6 +7,14 @@ import {
 import { instrumentPgClient, parseRead } from "../db";
 import { DEFAULT_MAX_SESSION_EVENT_BYTES } from "../writer";
 
+/**
+ * `db.statement` is emitted for EVERY instrumented statement, whatever it returned, so it appears
+ * in every stream in this file and is evidence about neither row reads nor row diffs — which is
+ * what these suites bind. Its own behaviour, including that it survives when nothing else is
+ * captured, is bound in `db-successful-statement.test.ts`.
+ */
+const notStatement = (event: BugEvent): boolean => event.k !== "db.statement";
+
 const DB_READ_EVENT_KIND = "db.read";
 const DB_READ_BULK_EVENT_KIND = "db.read.bulk";
 
@@ -47,7 +55,9 @@ describe("instrumentPgClient read capture", () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(client, {
       requestId: "req-default-off",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("SELECT * FROM invoice_rankings WHERE tenant_id = $1", [
@@ -66,7 +76,9 @@ describe("instrumentPgClient read capture", () => {
       requestId: "req-read",
       sessionId: "ses-read",
       captureReads: true,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
       now: () => 1_800_000_000_250,
       sessionStartedAt: 1_800_000_000_000,
     });
@@ -102,7 +114,9 @@ describe("instrumentPgClient read capture", () => {
       requestId: "req-bulk",
       captureReads: true,
       maxReadRowsPerStatement: 2,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("SELECT * FROM invoice_rankings");
@@ -131,7 +145,9 @@ describe("instrumentPgClient read capture", () => {
       captureReads: true,
       maxReadRowsPerStatement: 3,
       maxReadRowsPerRequest: 4,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("SELECT * FROM invoice_rankings WHERE tenant_id = $1", [
@@ -164,7 +180,9 @@ describe("instrumentPgClient read capture", () => {
       captureReads: true,
       maxReadRowsPerStatement: 2,
       maxReadRowsPerRequest: 2,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("SELECT * FROM invoice_rankings WHERE tenant_id = $1", [
@@ -197,7 +215,9 @@ describe("instrumentPgClient read capture", () => {
       requestId: "req-size-budget",
       captureReads: true,
       maxReadRowsPerStatement: 3,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("SELECT * FROM invoice_rankings");

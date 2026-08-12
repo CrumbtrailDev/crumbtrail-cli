@@ -147,6 +147,7 @@ describe("buildFixContext", async () => {
       // statement carried no database evidence at all. Always present, `[]` when nothing raised.
       "db_errors",
       "db_reads",
+      "db_statements",
       "frontend",
     ]);
     expect(fc.session.id).toBe(SESSION_ID);

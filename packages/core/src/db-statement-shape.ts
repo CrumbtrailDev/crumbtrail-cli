@@ -24,7 +24,32 @@ function stripComments(sql: string): string {
   return sql.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
 }
 
-export function normalizeStatementShape(sql: string): string {
+/**
+ * Any token still carrying a quote character after the literal passes above.
+ *
+ * The literal passes assume the statement's quoting is balanced. A statement built by string
+ * interpolation need not be: `LIKE '%o'brien%'` tokenizes as the literal `'%o'` followed by the
+ * bare word `brien%'`, so the pass replaces the first and leaves a fragment of the customer's
+ * value standing in what is documented as a value-free shape. The fragment is exactly the input
+ * that broke the statement, which is exactly the input most worth not retaining.
+ *
+ * So a residual quote is treated as proof that tokenization failed, and the whole token it sits in
+ * is discarded — the same "the safe reading of an ambiguous token is the one that discards it"
+ * stance the doc comment above already takes. Statements whose quoting balances are untouched by
+ * this pass, because they have no quote left for it to match.
+ */
+const RESIDUAL_QUOTED_TOKEN = /[^\s(),;]*['"`\[\]][^\s(),;]*/g;
+
+/**
+ * @param sql raw statement text. Never stored, never returned.
+ * @param label redaction-metadata attribution for the belt-and-braces token pass. Defaults to the
+ *   failing-statement surface this file was written for; the succeeding-statement surface passes
+ *   its own so the two are told apart in redaction metadata.
+ */
+export function normalizeStatementShape(
+  sql: string,
+  label = "db.error.shape",
+): string {
   if (typeof sql !== "string" || sql.length === 0) return "";
   const withoutLiterals = stripComments(sql)
     // Single-quoted strings, including doubled-quote escapes.
@@ -40,13 +65,12 @@ export function normalizeStatementShape(sql: string): string {
     // Numeric literals, including hex, exponent and decimal forms.
     .replace(/\b0x[0-9a-f]+\b/gi, PLACEHOLDER)
     .replace(/(?<![\w.])\d+(?:\.\d+)?(?:e[+-]?\d+)?/gi, PLACEHOLDER)
+    // Unbalanced quoting means the passes above mis-tokenized: discard what is left of it.
+    .replace(RESIDUAL_QUOTED_TOKEN, PLACEHOLDER)
     .replace(/\s+/g, " ")
     .trim();
 
   // Belt and braces: the same credential-shaped-token pass `capture_gap.detail` already applies.
-  const redacted = redactTokenLikeString(
-    withoutLiterals,
-    "db.error.shape",
-  ).value;
+  const redacted = redactTokenLikeString(withoutLiterals, label).value;
   return redacted.slice(0, MAX_STATEMENT_SHAPE_LENGTH);
 }

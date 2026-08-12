@@ -583,6 +583,43 @@ export interface LlmBundleDbRead {
   table: string;
   pk: Record<string, unknown> | null;
   row: Record<string, unknown>;
+  /**
+   * Normalized shape of the SELECT that produced this row, when the adapter had the statement
+   * text. Keywords, identifiers and placeholders only — every literal is replaced before it is
+   * stored, so no bind value and no customer value travels here.
+   *
+   * Present because a row cannot be read against the question it answered otherwise. `row` says
+   * what the database held; `shape` says what was asked for it, and a filter with the wrong
+   * boolean grouping produces a perfectly correct-looking row from a perfectly successful query.
+   */
+  shape?: string;
+  requestId?: string;
+}
+
+/**
+ * One database statement the host issued that the database ACCEPTED (`k:'db.statement'`).
+ *
+ * The counterpart of {@link LlmBundleDbError}, and the plane that makes a successful query legible
+ * at all. `databaseDiffs` and `databaseReads` describe a statement through what it returned, so a
+ * statement returning nothing — a SELECT matching zero rows, a transaction boundary, an UPDATE
+ * that matched nothing — left no trace, and one that DID return rows was described by the rows
+ * rather than by what it asked. Every defect in what was ASKED lives here and nowhere else.
+ *
+ * Same subtractive contract as the failed plane: `shape` carries no literal, and `rowCount` is a
+ * count and not a row.
+ */
+export interface LlmBundleDbStatement {
+  t: number;
+  iso?: string;
+  offsetMs?: number;
+  engine: DbEngine;
+  op: string;
+  table: string | null;
+  shape: string;
+  /** Rows returned or affected; `null` when the driver reported no count. `0` is meaningful. */
+  rowCount: number | null;
+  /** 1-based ordinal within the request, so execution order survives the sort. */
+  seq?: number;
   requestId?: string;
 }
 
@@ -687,6 +724,14 @@ export interface LlmBundle {
   databaseDiffs: LlmBundleDbDiff[];
   /** Redaction-aware rows read during the session (`k:'db.read'`); `[]` when none. */
   databaseReads: LlmBundleDbRead[];
+  /**
+   * Statements that were attempted and SUCCEEDED (`k:'db.statement'`).
+   *
+   * Optional and OMITTED when empty rather than emitted as `[]`, matching `databaseErrors`: a
+   * session captured by an SDK or an engine that does not record statements must not present as a
+   * session that ran none.
+   */
+  databaseStatements?: LlmBundleDbStatement[];
   /**
    * Statements that were attempted and RAISED (`k:'db.error'`).
    *
@@ -1068,6 +1113,7 @@ export function buildLlmBundle({
   );
   const causalTree = buildCausalTree(candidates ?? []);
   const databaseErrors = buildDatabaseErrors(events, session.startMs);
+  const databaseStatements = buildDatabaseStatements(events, session.startMs);
   const firstErrorEventAt = computeFirstErrorEventAt(browserEvidence, index);
   const distinctBugs = applyFlagNoteTitles(
     groupDistinctBugs(candidates ?? [], events),
@@ -1107,6 +1153,7 @@ export function buildLlmBundle({
     databaseDiffs: buildDatabaseDiffs(events, session.startMs),
     databaseReads: buildDatabaseReads(events, session.startMs),
     ...(databaseErrors.length > 0 ? { databaseErrors } : {}),
+    ...(databaseStatements.length > 0 ? { databaseStatements } : {}),
     databaseActivity: buildDatabaseActivity(events, session.startMs),
     media,
     degradedCapabilities,
@@ -2451,6 +2498,9 @@ function buildDatabaseReads(
           string,
           unknown
         >,
+        // Omitted, never emitted empty, when the adapter had no statement text: `removeUndefined`
+        // drops it, so a reader is never handed a blank field that looks like "asked nothing".
+        shape: safeText(event.d.shape, 400) || undefined,
         // A correlation key, not free text. `safeText` reads a 32 hex request
         // id as a long opaque token and redacts it, which collapses every read
         // into one bucket and makes per-request fan-out uncountable. `db.diff`
@@ -2460,6 +2510,38 @@ function buildDatabaseReads(
     );
   }
   return reads.sort((a, b) => a.t - b.t).slice(0, 200);
+}
+
+function buildDatabaseStatements(
+  events: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleDbStatement[] {
+  const statements: LlmBundleDbStatement[] = [];
+  for (const event of events) {
+    if (event.k !== "db.statement" || !isRecord(event.d)) continue;
+    const shape = safeText(event.d.shape, 400);
+    // A statement record whose whole content is the shape says nothing without one.
+    if (!shape) continue;
+
+    statements.push(
+      removeUndefined({
+        t: event.t,
+        iso: iso(event.t),
+        offsetMs:
+          finiteNumber(event.offsetMs) ??
+          offsetFromStart(event.t, sessionStartMs),
+        engine: normalizeDbEngine(event.d.engine),
+        op: safeText(event.d.op, 20) ?? "other",
+        table: safeText(event.d.table, 200) ?? null,
+        shape,
+        // `?? null` and not `|| null`: zero rows is the answer this plane exists to carry.
+        rowCount: finiteNumber(event.d.rowCount) ?? null,
+        seq: finiteNumber(event.d.seq),
+        requestId: safeCorrelationId(event.d.requestId, 200),
+      }) as LlmBundleDbStatement,
+    );
+  }
+  return statements.sort((a, b) => a.t - b.t).slice(0, 200);
 }
 
 function buildDatabaseErrors(
@@ -4614,6 +4696,9 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
       : []),
     ...renderOutboundCallsSection(bundle.outboundCalls),
     ...renderDatabaseErrorSection(bundle.databaseErrors ?? []),
+    // What was ASKED, before what came back: the two statement planes sit together, and a reader
+    // who can see the predicate does not have to infer it from the rows it selected.
+    ...renderDatabaseStatementSection(bundle.databaseStatements ?? []),
     ...renderDatabaseDiffSection(bundle.databaseDiffs),
     ...renderDatabaseReadSection(bundle.databaseReads ?? []),
     ...renderDatabaseActivitySection(bundle.databaseActivity),
@@ -4804,6 +4889,86 @@ export function renderDatabaseReadSection(reads: LlmBundleDbRead[]): string[] {
   if (deduped > shown.length) {
     lines.push(
       `${deduped - shown.length} further distinct row(s) are in \`bundle.json\` under \`databaseReads\`.`,
+      "",
+    );
+  }
+  return lines;
+}
+
+/** How many distinct statement shapes the markdown renders. All are in `bundle.json` regardless. */
+const MAX_RENDERED_DB_STATEMENTS = 40;
+
+/**
+ * Statements the database ACCEPTED.
+ *
+ * Every other database section describes a statement by its RESULT: rows that changed, rows that
+ * came back, spans a collector saw. That can only ever answer "what did the database hold", and a
+ * large class of defect is in the QUESTION — a predicate whose boolean grouping binds the wrong
+ * way, a filter that was dropped, a join that widened, a lookup keyed on the wrong column. Those
+ * queries execute perfectly. They return rows that look right, or no rows at all, and until this
+ * section existed the bundle recorded a successful request with nothing wrong in it.
+ *
+ * The zero-row case is why this is a section and not a column on the rows-read table: a SELECT
+ * that matches nothing emits no row, so it appeared in no plane whatsoever. `Rows` of `0` here is
+ * the difference between "the lookup missed" and "the lookup never happened".
+ *
+ * Deduplicated on request plus shape, so a statement that ran in a loop costs one line and carries
+ * its own repeat count — which is itself the evidence in a fan-out.
+ *
+ * What is deliberately NOT here: bind values. `shape` is the statement with every literal
+ * replaced, the same contract the failed-statement section keeps, and it is not relaxed because
+ * the statement worked.
+ */
+function renderDatabaseStatementSection(
+  statements: LlmBundleDbStatement[],
+): string[] {
+  if (statements.length === 0) return [];
+
+  const grouped = new Map<
+    string,
+    { statement: LlmBundleDbStatement; runs: number; rows: number | null }
+  >();
+  for (const statement of statements) {
+    const key = `${statement.requestId ?? ""}\u0000${statement.shape}`;
+    const existing = grouped.get(key);
+    if (!existing) {
+      grouped.set(key, { statement, runs: 1, rows: statement.rowCount });
+      continue;
+    }
+    existing.runs += 1;
+    if (typeof statement.rowCount === "number") {
+      existing.rows = (existing.rows ?? 0) + statement.rowCount;
+    }
+  }
+
+  const shown = [...grouped.values()]
+    .sort((a, b) => a.statement.t - b.statement.t)
+    .slice(0, MAX_RENDERED_DB_STATEMENTS);
+
+  const lines = [
+    "## Database Statements That Ran",
+    "",
+    "What this session's requests ASKED the database, correlated to the request that asked it. Read these against the rows above: a statement that succeeded and returned the wrong rows — or no rows — is indistinguishable from a correct one until the predicate itself is visible. `Rows` of 0 means the statement matched nothing, which is evidence rather than absence. Bind values are deliberately not carried; every literal is replaced.",
+    "",
+    table(
+      ["Offset", "Op", "Table", "Rows", "Runs", "Statement shape", "Request ID"],
+      shown.map((entry) => [
+        entry.statement.offsetMs !== undefined
+          ? `${entry.statement.offsetMs} ms`
+          : "unknown",
+        entry.statement.op,
+        entry.statement.table ?? "",
+        entry.rows === null ? "unknown" : String(entry.rows),
+        String(entry.runs),
+        truncate(entry.statement.shape, 300),
+        entry.statement.requestId ?? "",
+      ]),
+    ),
+    "",
+  ];
+  if (grouped.size > shown.length) {
+    lines.push(
+      `${grouped.size - shown.length} further distinct statement(s) are in \`bundle.json\` under \`databaseStatements\`.`,
       "",
     );
   }

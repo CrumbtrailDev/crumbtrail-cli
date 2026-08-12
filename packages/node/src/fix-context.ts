@@ -9,6 +9,7 @@ import type {
   LlmBundleDbDiff,
   LlmBundleDbRead,
   LlmBundleDbError,
+  LlmBundleDbStatement,
   LlmBundleDbActivity,
   LlmBundleFrontendRequestEvidenceSummary,
   LlmBundleLinkedFullStackRequestSummary,
@@ -24,6 +25,8 @@ export type FixContextDbDiff = LlmBundleDbDiff;
 export type FixContextDbRead = LlmBundleDbRead;
 /** A statement that was attempted and raised, correlated to the primary window. */
 export type FixContextDbError = LlmBundleDbError;
+/** A statement that was attempted and succeeded, correlated to the primary window. */
+export type FixContextDbStatement = LlmBundleDbStatement;
 export type FixContextDbActivity = LlmBundleDbActivity;
 
 /**
@@ -94,6 +97,17 @@ export interface FixContextPrimaryWindow {
    * was fine"; read it as "no statement in this window was observed to raise".
    */
   db_errors: FixContextDbError[];
+  /**
+   * Statements the primary window issued that the database ACCEPTED (`db.statement`).
+   *
+   * The plane that says what the request ASKED. `db_diffs` and `db_reads` can only describe a
+   * statement through what it returned, so a wrong predicate on a query that runs perfectly — the
+   * common case, not the exotic one — presented as a window full of correct-looking evidence, and
+   * a SELECT that matched zero rows presented as no statement at all. Empty when the capture path
+   * recorded no statement for this window; consumers MUST NOT read `[]` as "the request issued no
+   * queries".
+   */
+  db_statements: FixContextDbStatement[];
   /**
    * OTel DB span activity in the primary window. These are statements/operations only, never
    * before/after row diffs.
@@ -533,6 +547,7 @@ function buildPrimaryWindow(
     db_diffs: selectPrimaryWindowDbDiffs(bundle, window, topRequestId, matched),
     db_reads: selectPrimaryWindowDbReads(bundle, window, topRequestId, matched),
     db_errors: selectPrimaryWindowDbErrors(bundle, window, topRequestId, matched),
+    db_statements: selectPrimaryWindowDbStatements(bundle, window, topRequestId, matched),
     db_activity: selectPrimaryWindowDbActivity(bundle, window, topRequestId, matched),
   };
 }
@@ -620,6 +635,35 @@ function selectPrimaryWindowDbErrors(
     )
       return true;
     return error.requestId !== undefined && requestIds.has(error.requestId);
+  });
+}
+
+function selectPrimaryWindowDbStatements(
+  bundle: LlmBundle | undefined,
+  window: { start: number; end: number } | null,
+  topRequestId: string | undefined,
+  matched: LlmBundleLinkedFullStackRequestSummary[],
+): FixContextDbStatement[] {
+  const statements = Array.isArray(bundle?.databaseStatements)
+    ? bundle!.databaseStatements
+    : [];
+  if (statements.length === 0) return [];
+
+  const requestIds = new Set<string>();
+  if (topRequestId) requestIds.add(topRequestId);
+  for (const entry of matched) requestIds.add(entry.requestId);
+
+  return statements.filter((statement) => {
+    if (
+      window &&
+      typeof statement.t === "number" &&
+      statement.t >= window.start &&
+      statement.t <= window.end
+    )
+      return true;
+    return (
+      statement.requestId !== undefined && requestIds.has(statement.requestId)
+    );
   });
 }
 

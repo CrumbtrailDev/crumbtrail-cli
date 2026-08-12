@@ -13,8 +13,10 @@ import {
   emitDbDiffEvents,
   emitDbErrorEvent,
   emitDbReadEvents,
+  emitDbStatementEvent,
   extractPk,
   isRecord,
+  nextStatementSeq,
   pkKey,
   type InstrumentDbClientOptions,
 } from "./instrument-shared";
@@ -59,6 +61,9 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
   const readStatementsByRequest = new Map<string, number>();
+  // Every instrumented statement, not only the SELECTs whose rows were captured: this is what
+  // gives a statement that returned nothing an ordinal, and so a place in the request's order.
+  const statementsByRequest = new Map<string, number>();
 
   const wrappedQuery = async (
     text: unknown,
@@ -112,6 +117,20 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         });
         throw error;
       }
+      // Record what the statement ASKED, whatever it returned. Rows describe what the database
+      // held; only the shape describes what was requested of it, and a SELECT that matched nothing
+      // emits no row at all — so without this the operation is not merely thin, it is absent.
+      // Outside `captureReads` on purpose: that flag caps row IMAGES and this record carries none.
+      emitDbStatementEvent({
+        engine: ENGINE,
+        op: parsedRead ? "select" : "other",
+        table: parsedRead?.table ?? null,
+        statement: text,
+        rowCount: resultRowCount(result),
+        seq: nextStatementSeq(statementsByRequest, requestId),
+        requestId,
+        options,
+      });
       if (options.captureReads && parsedRead) {
         try {
           const rows = (result.rows ?? []).filter(isRecord);
@@ -130,6 +149,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
             emittedReadRowsByRequest,
             readStatementsByRequest,
             queryShape: parseLimitOffset(text, params),
+            statement: text,
           });
         } catch (error) {
           emitGap(options, { reason: "capture_exception", error });
@@ -175,7 +195,18 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       // this path is correct and says two different things — our RETURNING rewrite failed, AND
       // their statement failed — and they have different owners.
       try {
-        return await client.query(text, paramArray);
+        const uninstrumented = await client.query(text, paramArray);
+        emitDbStatementEvent({
+          engine: ENGINE,
+          op: parsed.op,
+          table: parsed.table,
+          statement: text,
+          rowCount: resultRowCount(uninstrumented),
+          seq: nextStatementSeq(statementsByRequest, requestId),
+          requestId,
+          options,
+        });
+        return uninstrumented;
       } catch (queryError) {
         emitDbErrorEvent({
           engine: ENGINE,
@@ -210,6 +241,22 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       });
       throw error;
     }
+
+    // The statement ran. Record what it asked before deciding what it changed: a mutation whose
+    // WHERE matched no row changes nothing and so appears in no diff, which is the same silence a
+    // mutation that never ran would leave.
+    emitDbStatementEvent({
+      engine: ENGINE,
+      op: parsed.op,
+      table: parsed.table,
+      // The statement as the host wrote it, not our RETURNING-augmented rewrite: the reader is
+      // looking for this statement in their own repository.
+      statement: text,
+      rowCount: resultRowCount(result),
+      seq: nextStatementSeq(statementsByRequest, requestId),
+      requestId,
+      options,
+    });
 
     // Diff capture/emit is best-effort: a parse/build/emit failure here degrades to "no diff
     // emitted" rather than breaking the host query, whose result is returned unchanged.
@@ -259,9 +306,10 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
                 release,
               );
             };
-            return (connect as (...values: unknown[]) => unknown).apply(target, [
-              wrappedCallback,
-            ]);
+            return (connect as (...values: unknown[]) => unknown).apply(
+              target,
+              [wrappedCallback],
+            );
           }
 
           return Promise.resolve(
@@ -273,6 +321,13 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+/** Rows the driver reported, preferring its own count over the length of the rows it returned. */
+function resultRowCount(result: DuckTypedPgQueryResult): number | null {
+  if (typeof result?.rowCount === "number" && Number.isFinite(result.rowCount))
+    return result.rowCount;
+  return Array.isArray(result?.rows) ? result.rows.length : null;
 }
 
 function instrumentAcquiredClient(

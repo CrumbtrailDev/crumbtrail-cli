@@ -5,9 +5,11 @@ import {
   emitDbDiffEvents,
   emitDbErrorEvent,
   emitDbReadEvents,
+  emitDbStatementEvent,
   emitImagelessDbDiff,
   extractPk,
   isRecord,
+  nextStatementSeq,
   normalizeMaxRowsPerStatement,
   pkKey,
   type InstrumentDbClientOptions,
@@ -59,6 +61,17 @@ function mutationHeader(
     return payload as unknown as DuckTypedMysqlResultHeader;
   }
   return undefined;
+}
+
+/**
+ * Rows a mysql2 result reports: the length of the rows array for a SELECT, `affectedRows` for a
+ * mutation, `null` when the payload is neither.
+ */
+function resultRowCount(result: unknown): number | null {
+  const payload = resultPayload(result);
+  if (Array.isArray(payload)) return payload.length;
+  const header = mutationHeader(payload);
+  return header ? header.affectedRows : null;
 }
 
 function isPositiveInt(value: unknown): value is number {
@@ -132,6 +145,9 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
   const readStatementsByRequest = new Map<string, number>();
+  // Every instrumented statement, not only the SELECTs whose rows were captured: this is what
+  // gives a statement that returned nothing an ordinal, and so a place in the request's order.
+  const statementsByRequest = new Map<string, number>();
   const rawQuery = client.query.bind(client) as MysqlMethod;
   const rawExecute =
     typeof (client as { execute?: unknown }).execute === "function"
@@ -376,6 +392,19 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           });
           throw error;
         }
+        // Record what the statement ASKED, whatever it returned. Outside `captureReads` on
+        // purpose: that flag caps row IMAGES and this record carries none, and a SELECT that
+        // matched nothing emits no row event at all.
+        emitDbStatementEvent({
+          engine: ENGINE,
+          op: parsedRead ? "select" : "other",
+          table: parsedRead?.table ?? null,
+          statement: sql,
+          rowCount: resultRowCount(result),
+          seq: nextStatementSeq(statementsByRequest, requestId),
+          requestId,
+          options,
+        });
         if (options.captureReads && parsedRead) {
           try {
             const payload = resultPayload(result);
@@ -389,6 +418,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
               options,
               emittedReadRowsByRequest,
               readStatementsByRequest,
+              statement: sql,
             });
           } catch (error) {
             emitGap(options, { reason: "capture_exception", error });
@@ -414,6 +444,16 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           });
           throw error;
         }
+        emitDbStatementEvent({
+          engine: ENGINE,
+          op: parsed.op,
+          table: parsed.table,
+          statement: sql,
+          rowCount: resultRowCount(result),
+          seq: nextStatementSeq(statementsByRequest, requestId),
+          requestId,
+          options,
+        });
         try {
           await captureInsert(parsed, result, requestId);
         } catch (error) {
@@ -457,6 +497,18 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
         });
         throw error;
       }
+      // A mutation whose WHERE matched nothing changes no row and so appears in no diff — the
+      // same silence a mutation that never ran would leave. The statement record separates them.
+      emitDbStatementEvent({
+        engine: ENGINE,
+        op: parsedMutation.op,
+        table: parsedMutation.table,
+        statement: sql,
+        rowCount: resultRowCount(result),
+        seq: nextStatementSeq(statementsByRequest, requestId),
+        requestId,
+        options,
+      });
       try {
         if (parsedMutation.op === "update") {
           await captureUpdate(parsedMutation, result, requestId, preRows);

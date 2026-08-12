@@ -146,6 +146,16 @@ export const DB_READ_BULK_EVENT_KIND = "db.read.bulk" as const;
  */
 export const DB_ERROR_EVENT_KIND = "db.error" as const;
 
+/**
+ * Canonical event kind for a database statement that was ATTEMPTED and SUCCEEDED (`k:'db.statement'`).
+ *
+ * The counterpart of {@link DB_ERROR_EVENT_KIND}, and the reason it exists is symmetry the capture
+ * vocabulary lacked: a statement that RAISED could be described by what it asked, while a statement
+ * that SUCCEEDED could only be described by what it returned. A SELECT returning zero rows produced
+ * nothing at all, so the operation was wholly invisible.
+ */
+export const DB_STATEMENT_EVENT_KIND = "db.statement" as const;
+
 /** Canonical event kind for a bounded record of evidence the capture path could not collect. */
 export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
 
@@ -283,6 +293,16 @@ export interface DbReadEventData {
    */
   stmt?: number;
   /**
+   * Normalized shape of the SELECT that produced this row, when the adapter had the statement
+   * text. Same subtractive contract as {@link DbStatementEventData.shape}: keywords, identifiers
+   * and placeholders only.
+   *
+   * It rides on the row rather than only on the statement event because a row on its own says what
+   * the database held, never what was asked for it. A row that looks correct and a predicate that
+   * selected it wrongly are the same evidence until the two are joined.
+   */
+  shape?: string;
+  /**
    * Resolved LIMIT/OFFSET window the statement ran with, when the adapter
    * could parse one. Pagination arithmetic bugs live entirely in this shape: a
    * first-page request whose SELECT ran `OFFSET 1` drops the first row of the
@@ -332,6 +352,43 @@ export interface DbErrorEventData {
   code: string | null;
   /** Error class name only, never the message. */
   errorName: string;
+  requestId: string;
+  t: number;
+}
+
+/** Operation a `db.statement` event records. Same vocabulary as {@link DbErrorOp}. */
+export type DbStatementOp = DbErrorOp;
+
+/**
+ * Type-specific payload (`d`) of a `k:'db.statement'` event: one statement the host issued that
+ * the database ACCEPTED.
+ *
+ * `db.diff` and `db.read` describe a statement only through what it returned, so a statement that
+ * returned nothing — a SELECT matching zero rows, a `BEGIN`, an UPDATE that matched nothing —
+ * produced no evidence at all, and a statement that DID return rows was described by the rows
+ * rather than by what it asked for. Defects in what was ASKED (predicate precedence, a boolean
+ * grouping, a filter that is wrong or missing, a lookup that misses) are therefore unreadable
+ * whenever the statement executes fine, which is the common case.
+ *
+ * Same subtractive contract as {@link DbErrorEventData}: `shape` is the statement with every
+ * literal replaced by a placeholder, no bind value travels, and `rowCount` is a count and not a
+ * row.
+ */
+export interface DbStatementEventData {
+  engine: DbEngine;
+  op: DbStatementOp;
+  /** Table the statement addressed, or `null` when the statement did not parse to one. */
+  table: string | null;
+  /** Normalized statement shape: identifiers and keywords only, every literal replaced by `?`. */
+  shape: string;
+  /**
+   * Rows the statement returned or affected, when the driver reported a count; `null` when it did
+   * not. `0` is the load-bearing value: it is the only way a lookup that matched nothing is
+   * distinguishable from a lookup that never ran.
+   */
+  rowCount: number | null;
+  /** 1-based ordinal of this statement within its request, so execution order survives. */
+  seq: number;
   requestId: string;
   t: number;
 }
