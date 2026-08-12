@@ -466,7 +466,6 @@ Without those three steps every Crumbtrail `invoke` fails.
 | [`crumbtrail`](https://www.npmjs.com/package/crumbtrail)                           | The `npx crumbtrail` setup wizard                          |
 | [`crumbtrail-node`](https://www.npmjs.com/package/crumbtrail-node)                 | Self-hosted server, Express middleware, MCP evidence tools |
 | [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native) | React Native and Expo bindings                             |
-| [`crumbtrail-detect-core`](https://www.npmjs.com/package/crumbtrail-detect-core)   | Framework detection and injection planning                 |
 
 The React error boundary and state-capture hook, and the Tauri desktop
 transport, are subpaths of this package rather than packages of their own — see
