@@ -55,11 +55,21 @@ export const NUMERIC_FIELDS_BY_KIND: Readonly<
 
 /**
  * Minimum combined baseline + highlight count before the volume scorer runs.
- * Its p value comes from a normal approximation to a binomial, which is not
- * trustworthy on a handful of events; below this the honest answer is "no test
- * was run" rather than a confident verdict built on four events.
+ *
+ * The volume p value comes from a continuity corrected normal approximation to
+ * a binomial with success probability `p0 = 1 / (1 + multiplier)`. That
+ * approximation is only usable once the expected count in the shorter window,
+ * `total * p0`, reaches about 5. At the default 4x multiplier `p0` is 0.2, so
+ * 25 is the smallest total that clears it. Below the floor the honest answer is
+ * "no test was run" rather than a confident verdict built on a handful of
+ * events.
+ *
+ * A higher multiplier makes `p0` smaller and so needs a larger total for the
+ * same guarantee; the floor is stated for the default rather than derived per
+ * call, because a caller widening the baseline is asking for a longer quiet
+ * stretch, not for a weaker test.
  */
-export const MIN_VOLUME_EVENTS = 10;
+export const MIN_VOLUME_EVENTS = 25;
 
 /** Minimum sample size on EACH side before the KS scorer runs, same reason. */
 export const MIN_KS_SAMPLES = 5;
@@ -207,8 +217,10 @@ export function correlateWindow(
  *
  * Conditional on the total count `N = baseline + highlight`, the number landing
  * in the highlight is binomial with `p0 = highlightWidth / (highlightWidth +
- * baselineWidth)`, which reduces to `1 / (1 + multiplier)`. The normal
- * approximation to that binomial gives a two sided p value. Comparing raw
+ * baselineWidth)`, which reduces to `1 / (1 + multiplier)`. The continuity
+ * corrected normal approximation to that binomial gives a two sided p value,
+ * and `MIN_VOLUME_EVENTS` keeps that approximation inside its usable range.
+ * Comparing raw
  * counts instead would report every window as a 4x drop purely because the
  * baseline is four times longer.
  */
@@ -234,9 +246,22 @@ function scoreVolume(
     const mean = total * p0;
     const sd = Math.sqrt(total * p0 * (1 - p0));
     if (!(sd > 0)) continue;
-    const z = (highlightCount - mean) / sd;
-    // Two sided: 2 * P(Z <= -|z|).
-    const pValue = Math.min(1, 2 * standardNormalCdf(-Math.abs(z)));
+    // Continuity correction. The binomial is discrete and the normal is not, so
+    // the tail P(X >= k) is approximated by the normal mass beyond k - 0.5, not
+    // beyond k. Without the 0.5 the p value is anti-conservative by a factor of
+    // two to four at realistic session sizes — at total 20 with 9 in the
+    // highlight, 0.0052 against an exact two sided binomial of 0.0200. That
+    // error does not merely mislabel one row: the Benjamini-Hochberg stage
+    // downstream converts p values into a stated false discovery rate, so
+    // uniformly deflated inputs mean the delivered FDR is not the `q` reported.
+    //
+    // `Math.max(0, ...)` keeps a count within half an event of the mean at
+    // p = 1 instead of flipping the sign of the correction. The reported
+    // `direction` is derived from the counts and not from `z`, so clamping here
+    // cannot mislabel a rise as a fall.
+    const z = (Math.abs(highlightCount - mean) - 0.5) / sd;
+    // Two sided: 2 * P(Z <= -z).
+    const pValue = Math.min(1, 2 * standardNormalCdf(-Math.max(0, z)));
 
     // The baseline count rescaled to a highlight length window. Its comparison
     // with `highlightCount` has the same sign as `z` by construction:

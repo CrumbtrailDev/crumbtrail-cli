@@ -73,10 +73,55 @@ export type LearningLoopResult<T> =
     }
   | { ok: false; reason: "transport"; message: string };
 
+/**
+ * Bases the agent token may be sent to. The token is a tenant wide secret carried in an
+ * `Authorization` header, so a plain `http:` base would put it on the wire in cleartext for
+ * anyone on the path. Loopback is exempt because it never leaves the machine and is how the
+ * cloud is run locally.
+ */
+function isTransportSecureBase(base: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(base);
+  } catch {
+    return false;
+  }
+  if (url.protocol === "https:") return true;
+  return (
+    url.protocol === "http:" &&
+    (url.hostname === "localhost" ||
+      url.hostname === "127.0.0.1" ||
+      url.hostname === "[::1]")
+  );
+}
+
+function cloudBase(): string | undefined {
+  return process.env.CRUMBTRAIL_CLOUD_URL?.replace(/\/+$/, "") || undefined;
+}
+
 function agentAuth(): { base: string; token: string } | undefined {
-  const base = process.env.CRUMBTRAIL_CLOUD_URL?.replace(/\/+$/, "");
+  const base = cloudBase();
   const token = process.env.CRUMBTRAIL_CLOUD_TOKEN;
-  return base && token ? { base, token } : undefined;
+  if (!base || !token) return undefined;
+  if (!isTransportSecureBase(base)) return undefined;
+  return { base, token };
+}
+
+const INSECURE_BASE_MESSAGE =
+  "CRUMBTRAIL_CLOUD_URL must use https (localhost is the only exception). The agent token is not sent over plain http.";
+
+/**
+ * The gap a call reports when it has no usable cloud. A base that is set but refused is reported
+ * as its own reason rather than as a missing variable, so an operator is not sent looking for a
+ * value that is already there.
+ */
+function unconfigured<T>(message: string): LearningLoopResult<T> {
+  const base = cloudBase();
+  return {
+    ok: false,
+    reason: "unconfigured",
+    message: base && !isTransportSecureBase(base) ? INSECURE_BASE_MESSAGE : message,
+  };
 }
 
 /** Parse a cloud response into a LearningLoopResult. On a non-2xx the cloud
@@ -135,12 +180,9 @@ export async function resolveIssueViaCloud(
 ): Promise<LearningLoopResult<ResolveIssueResponse>> {
   const auth = agentAuth();
   if (!auth) {
-    return {
-      ok: false,
-      reason: "unconfigured",
-      message:
-        "Cloud issue resolution requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
-    };
+    return unconfigured(
+      "Cloud issue resolution requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
+    );
   }
   const body: Record<string, unknown> = {
     memoryId: input.memoryId,
@@ -185,12 +227,9 @@ export async function recordAgentFeedbackViaCloud(
 ): Promise<LearningLoopResult<{ feedback: unknown }>> {
   const auth = agentAuth();
   if (!auth) {
-    return {
-      ok: false,
-      reason: "unconfigured",
-      message:
-        "Recording agent feedback requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
-    };
+    return unconfigured(
+      "Recording agent feedback requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
+    );
   }
   const body: Record<string, unknown> = {
     projectId: input.projectId,
@@ -224,12 +263,9 @@ export async function getAgentPlaybookViaCloud(
 ): Promise<LearningLoopResult<{ rules: unknown[] }>> {
   const auth = agentAuth();
   if (!auth) {
-    return {
-      ok: false,
-      reason: "unconfigured",
-      message:
-        "Reading the tenant playbook requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
-    };
+    return unconfigured(
+      "Reading the tenant playbook requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
+    );
   }
   const params = new URLSearchParams({ project: projectId });
   try {
@@ -320,11 +356,7 @@ export async function startFixVerificationViaCloud(input: {
 }): Promise<LearningLoopResult<StartFixVerificationResponse>> {
   const auth = agentAuth();
   if (!auth) {
-    return {
-      ok: false,
-      reason: "unconfigured",
-      message: VERIFICATION_UNCONFIGURED,
-    };
+    return unconfigured(VERIFICATION_UNCONFIGURED);
   }
   try {
     const res = await fetch(`${auth.base}/api/agent/verification`, {
@@ -354,11 +386,7 @@ export async function getFixVerificationViaCloud(input: {
 }): Promise<LearningLoopResult<FixVerificationView>> {
   const auth = agentAuth();
   if (!auth) {
-    return {
-      ok: false,
-      reason: "unconfigured",
-      message: VERIFICATION_UNCONFIGURED,
-    };
+    return unconfigured(VERIFICATION_UNCONFIGURED);
   }
   const params = new URLSearchParams({
     project: input.projectId,

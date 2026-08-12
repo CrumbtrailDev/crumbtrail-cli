@@ -316,6 +316,25 @@ function capTable(
   };
 }
 
+/**
+ * The clock a probe run measures itself with. A host supplied `now` is used when it answers a
+ * finite number and `Date.now` stands in whenever it throws or answers anything else, so no
+ * latency reading can fail the run it is only describing.
+ */
+function safeClock(now: ProbeContext["now"]): () => number {
+  if (typeof now !== "function") return Date.now;
+  return () => {
+    try {
+      const value = now();
+      return typeof value === "number" && Number.isFinite(value)
+        ? value
+        : Date.now();
+    } catch {
+      return Date.now();
+    }
+  };
+}
+
 function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw new Error("aborted");
 }
@@ -494,7 +513,10 @@ export async function runProbe(
   name: string,
   ctx: ProbeContext = {},
 ): Promise<ProbeResult> {
-  const nowFn = typeof ctx.now === "function" ? ctx.now : Date.now;
+  // Rule 1 is absolute, and the host's clock is host code: a `ctx.now` that throws must not turn
+  // into an exception raised inside someone else's application. Wrapped once here so every later
+  // reading, including the ones taken while handling a failure, is safe.
+  const nowFn = safeClock(ctx.now);
   const start = nowFn();
 
   if (!isProbeName(name)) {

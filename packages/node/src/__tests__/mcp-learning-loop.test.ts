@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -660,6 +660,52 @@ describe("MCP learning loop (CRUMB-113)", () => {
         );
       },
     );
+
+    it.each(["startFixVerification", "getFixVerification"])(
+      "%s refuses a plain http cloud rather than putting the agent token on the wire",
+      async (tool) => {
+        process.env.CRUMBTRAIL_CLOUD_URL = "http://cloud.crumbtrail.test";
+        process.env.CRUMBTRAIL_CLOUD_TOKEN = "ctagt-token";
+        const fetchSpy = vi.spyOn(globalThis, "fetch");
+        try {
+          const server = new McpServer({ outputDir: tmpDir });
+          const { isError, parsed, text } = await call(server, tool, {
+            project: "proj_1",
+            canonicalIssueId: "ci_42",
+          });
+
+          expect(isError).toBe(false);
+          expect(parsed).toMatchObject({
+            ok: false,
+            source: "remote-unavailable",
+          });
+          expect(parsed.gaps[0]).toMatch(/https/);
+          // The refusal names the variable, never the value or the token.
+          expect(text).not.toContain("ctagt-token");
+          expect(text).not.toContain("cloud.crumbtrail.test");
+          // Nothing was sent anywhere.
+          expect(fetchSpy).not.toHaveBeenCalled();
+        } finally {
+          fetchSpy.mockRestore();
+        }
+      },
+    );
+
+    it("still uses a loopback http cloud, which is how it is run locally", async () => {
+      mock = await startMockCloud();
+      configureCloud(mock.url);
+      expect(mock.url.startsWith("http://127.0.0.1:")).toBe(true);
+      const server = new McpServer({ outputDir: tmpDir });
+
+      const { isError } = await call(server, "getFixVerification", {
+        project: "proj_1",
+        canonicalIssueId: "ci_42",
+      });
+      expect(isError).toBe(false);
+      expect(
+        mock.requests.some((r) => r.path === "/api/agent/verification"),
+      ).toBe(true);
+    });
 
     it("a cloud rejection is an error the agent sees, never a quiet non-result", async () => {
       mock = await startMockCloud();

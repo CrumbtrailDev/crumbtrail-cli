@@ -716,8 +716,13 @@ export class Crumbtrail {
       if (stopped || typeof fetch !== "function") return;
       const generation = ++this.configPollGeneration;
       try {
+        // `no-store`: the config route answers with `Cache-Control: private, max-age=60` and the
+        // default poll interval is exactly that, so an HTTP cache hit would replay the previous
+        // body. A replayed body re-runs whatever probe it asked for and rests a second copy of the
+        // answer, which for `storage.snapshot` is a duplicate payload out of a live application.
         const response = await fetch(configPollingUrl(options), {
           method: "GET",
+          cache: "no-store",
         });
         if (!response.ok && response.status >= 400) return;
         const payload: unknown = await response.json();
@@ -745,6 +750,12 @@ export class Crumbtrail {
       if (stopped) return;
       stopped = true;
       clearInterval(timer);
+      // Bumping the generation here, rather than in `stopConfigPolling`, is what makes the
+      // disposer handed to the caller interrupt a probe run that is already mid loop: the loop
+      // guards on the generation, and `stopped` above is a local of this closure that the loop
+      // cannot see. Without it a stop only prevents the next poll, while up to four probes keep
+      // running and resting events after the host asked polling to stop.
+      this.configPollGeneration += 1;
       if (this.configPollingCleanup === stop)
         this.configPollingCleanup = undefined;
     };
@@ -753,7 +764,7 @@ export class Crumbtrail {
   }
 
   private stopConfigPolling(): void {
-    this.configPollGeneration += 1;
+    // The generation bump lives in the disposer itself, which this delegates to.
     this.configPollingCleanup?.();
     this.configPollingCleanup = undefined;
   }
@@ -827,12 +838,18 @@ export class Crumbtrail {
     if (names.length === 0) return;
 
     for (const name of names) {
-      // A kill switch, a stop, or a newer poll all mean this run is no longer wanted. Checked
-      // per probe because the loop awaits, so any of the three can arrive mid run.
-      if (this.stopped || this.killSwitch) return;
+      // `canTransport()` is the same predicate that admits an event, so a probe reads the end
+      // user's application only in the states where its answer would be allowed to leave it.
+      // That covers stop, the kill switch and remote policy readiness, and adds consent: under
+      // `consentMode: "required"` with consent not yet given, no probe touches the visitor's
+      // storage at all rather than reading it and dropping the result at the bus.
+      //
+      // Checked per probe because the loop awaits, so any of those can arrive mid run — including
+      // consent being revoked — and a newer poll generation retires this run outright.
+      if (!this.canTransport()) return;
       if (generation !== this.configPollGeneration) return;
       const result = await runProbe(name, this.probeContext());
-      if (this.stopped || this.killSwitch) return;
+      if (!this.canTransport()) return;
       if (generation !== this.configPollGeneration) return;
       this.bus.emit({
         t: now(),
@@ -1724,10 +1741,11 @@ function hasRecognizedRemotePolicy(settings: Record<string, unknown>): boolean {
   if (typeof settings.respectGpc === "boolean") return true;
   if (hasRecognizedRemoteMasking(settings)) return true;
   if (hasRecognizedRemoteSampling(settings)) return true;
-  // A poll that only asks for probes is still a poll worth applying, so a probe request does not
-  // have to be smuggled alongside a policy change to be honoured. A refused `probes` field
-  // recognizes nothing, which is what keeps a rejected request from taking this path.
-  if (readRemoteProbeNames(settings).length > 0) return true;
+  // `probes` is deliberately not one of these. Recognizing a policy is what sets
+  // `remotePolicyReady`, which is what unblocks capture, so a response carrying nothing but a
+  // probe request must not be able to grant itself the readiness its own results then ride on.
+  // A probe request is honoured on a poll that also carried a real policy field, and dropped on
+  // one that did not.
   return hasRecognizedRemoteTriggers(settings);
 }
 

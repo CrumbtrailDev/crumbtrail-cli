@@ -116,13 +116,10 @@ export function ksTwoSample(a: number[], b: number[]): KsTwoSampleResult {
     const gap = Math.abs(fa - fb);
     if (gap > d) d = gap;
   }
-  // One sample exhausted first; the other's remaining mass can only widen the
-  // gap up to the trailing 1 - F difference, which the loop above already saw
-  // at its last step except when the tail is entirely one sided.
-  if (i < n || j < m) {
-    const gap = Math.abs((i < n ? 1 : fa) - (j < m ? 1 : fb));
-    if (gap > d) d = gap;
-  }
+  // No trailing correction is needed. The loop only exits once a side is
+  // exhausted, and a side is exhausted only by an advance that set its F to 1
+  // and was followed by a gap measurement in the same iteration. The remaining
+  // mass on the other side can only close that gap, never widen it.
 
   const ne = (n * m) / (n + m);
   const sqrtNe = Math.sqrt(ne);
@@ -131,11 +128,23 @@ export function ksTwoSample(a: number[], b: number[]): KsTwoSampleResult {
 }
 
 /**
- * `Q(lambda)` for the Kolmogorov distribution. Converges fast; 100 terms is far
- * more than the series ever needs and costs nothing.
+ * `Q(lambda)` for the Kolmogorov distribution.
+ *
+ * The alternating series `2 * sum (-1)^(j-1) exp(-2 j^2 lambda^2)` converges
+ * fast for moderate lambda, but its terms barely decay as lambda approaches 0:
+ * truncating at any fixed term count leaves a residual the size of the last
+ * term, so the sum drifts arbitrarily far from its true value of 1. At
+ * lambda = 0.001 a 100 term truncation returns 0.02 — a maximally significant
+ * verdict for two distributions that are essentially identical.
+ *
+ * `Q` is 1 to twelve decimal places for every lambda at or below 0.2, so
+ * returning 1 below that cutoff is exact to the precision anything here cares
+ * about and removes the divergent regime entirely. Above it the series is fully
+ * converged well inside the 100 term budget.
  */
-function kolmogorovQ(lambda: number): number {
+export function kolmogorovQ(lambda: number): number {
   if (!Number.isFinite(lambda) || lambda <= 0) return 1;
+  if (lambda < 0.2) return 1;
   let sum = 0;
   for (let j = 1; j <= 100; j += 1) {
     const term =

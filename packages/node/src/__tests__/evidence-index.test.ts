@@ -876,6 +876,58 @@ describe("evidence-index frontend candidate correlation identity", () => {
     expect(candidate!.anchor.url).toBe("/api/checkout");
   });
 
+  it("still anchors on the correlation id when capture truncation dropped the response event", () => {
+    // Capture truncation drops raw events long before it drops index entries,
+    // so a session can hold a complete `failedReqs` entry with no `net.res` to
+    // match it. The correlation id is on the entry itself; without it the
+    // candidate anchors with no requestId and the backend plane cannot join.
+    const candidate = buildEvidenceCandidates(
+      [],
+      {
+        id: "ses_truncated",
+        start: 1000,
+        failedReqs: [
+          {
+            t: 1050,
+            m: "POST",
+            url: "/api/checkout",
+            st: 500,
+            id: 7,
+            reason: "http_status",
+            requestId: CORRELATION_ID,
+          },
+        ],
+      },
+    ).find((entry) => entry.detector === "http_error");
+
+    expect(candidate).toBeDefined();
+    expect(candidate!.anchor.requestId).toBe(CORRELATION_ID);
+  });
+
+  it("keeps two truncated failures apart by their correlation ids", () => {
+    // Dedupe falls back to the timestamp when there is no id, so two distinct
+    // exchanges recorded at the same millisecond collapsed into one candidate.
+    const other = "9f1c2d3e4a5b6c7d8e9f0a1b2c3d4e5f";
+    const failed = (requestId: string) => ({
+      t: 1050,
+      m: "POST",
+      url: "/api/checkout",
+      st: 500,
+      reason: "http_status",
+      requestId,
+    });
+    const candidates = buildEvidenceCandidates([], {
+      id: "ses_truncated_pair",
+      start: 1000,
+      failedReqs: [failed(CORRELATION_ID), failed(other)],
+    }).filter((entry) => entry.detector === "http_error");
+
+    expect(candidates).toHaveLength(2);
+    expect(candidates.map((c) => c.anchor.requestId).sort()).toEqual(
+      [CORRELATION_ID, other].sort(),
+    );
+  });
+
   it("keeps the two kinds of id distinguishable by shape", () => {
     // The contract downstream consumers read: a bare run of digits is a browser
     // counter, anything else is a correlation id.

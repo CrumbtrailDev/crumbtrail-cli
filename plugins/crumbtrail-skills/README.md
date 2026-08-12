@@ -2,7 +2,7 @@
 
 Failure archetype skills for Crumbtrail. Each skill takes one recurring failure shape and pairs it with the exact Crumbtrail MCP calls that confirm or rule it out, so an agent troubleshoots against a recorded session rather than a generic checklist.
 
-Twelve archetype skills ship here, plus `_reference`, which is the template rather than an archetype.
+Twelve archetype skills ship here, under `skills/`. The template they are written from is `REFERENCE-SKILL.md`, which sits outside `skills/` so no loader installs it as a thirteenth skill.
 
 ## Install
 
@@ -28,11 +28,11 @@ Every skill in `skills/` uses the same five sections, in this order:
 4. `## Telling it apart`: how to separate this archetype from the ones it resembles.
 5. `## What a null result means`: what an empty answer rules out, and what it does not.
 
-`skills/_reference/SKILL.md` is the worked example. Read it before adding a skill. The leading underscore marks it as a template rather than an archetype, and its frontmatter `name` drops that underscore.
+`REFERENCE-SKILL.md` is the worked example. Read it before adding a skill. It is held outside `skills/` on purpose: a template that sits next to the archetypes gets discovered and installed like one, and only this repository's own gate would notice.
 
 ## The gate
 
-`plugins/__tests__/skills.test.ts` validates every `SKILL.md` under `plugins/` against the live MCP tool table, read the same way the hosted dispatch reads it: it constructs an `McpServer` and calls `tools/list`. A skill that names a tool which does not exist, or passes a parameter a tool does not accept, or omits a parameter a tool requires, fails the suite. The generated snake_case aliases are accepted too, since the server accepts them. The same suite checks that the five sections are present and in order, that frontmatter carries a `name` and a `description` and that the `name` matches the directory, that every `json` call block parses, that a skill declares at least one call, and that the root marketplace lists every plugin present and nothing that is absent.
+`plugins/__tests__/skills.test.ts` validates every `SKILL.md` under Crumbtrail's own `plugins/crumbtrail-*` directories, plus `REFERENCE-SKILL.md`, against the live MCP tool table, read the same way the hosted dispatch reads it: it constructs an `McpServer` and calls `tools/list`. A skill that names a tool which does not exist, or passes a parameter a tool does not accept, or omits a parameter a tool requires, fails the suite. The generated snake_case aliases are accepted too, since the server accepts them. The same suite checks that the five sections are present and in order, that frontmatter carries a `name` and a `description` and that the `name` matches the directory, that every `json` call block parses, that a skill declares at least one call, and that the root marketplace lists every `crumbtrail-*` plugin present and nothing that is absent. Discovery is scoped that way because `plugins/` is also where locally installed third party plugins land, and those are not Crumbtrail's to validate.
 
 ```bash
 pnpm test:plugins
