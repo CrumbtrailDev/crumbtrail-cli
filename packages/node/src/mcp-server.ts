@@ -55,12 +55,17 @@ import {
   FEEDBACK_SIGNALS,
   FEEDBACK_SUBJECT_KINDS,
   getAgentPlaybookViaCloud,
+  getFixVerificationViaCloud,
+  INCONCLUSIVE_VERIFICATION_REASONS,
   ISSUE_DISPOSITIONS,
   MAX_USED_MEMORY_IDS,
   recordAgentFeedbackViaCloud,
   resolveIssueViaCloud,
+  startFixVerificationViaCloud,
+  VERIFICATION_REASONS,
   type FeedbackSignal,
   type FeedbackSubjectKind,
+  type FixVerificationView,
   type IssueDisposition,
   type LearningLoopResult,
 } from "./learning-loop";
@@ -902,6 +907,55 @@ const TOOLS = [
   },
   /** @stability stable */
   {
+    name: "startFixVerification",
+    description:
+      "Open an observation window on a canonical issue after you applied a fix, so the cloud can watch whether the same signature comes back. Call it once, after the fix is deployed and reachable by real traffic: a window opened before the fix ships measures the broken code. It is idempotent, so an issue that already has a live window gets that same window back with opened:false and no second window is opened. Opening a window concludes NOTHING by itself. It returns state 'open' with a null result; read the verdict later with getFixVerification, and not before observationEnd. This writes only to Crumbtrail's own verification records and never touches your app, your tickets, or any external system. Recording WHY an issue was closed is a separate act with a separate tool: use resolveIssue for the disposition, root cause and fix reference. Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        project: {
+          type: "string",
+          description: "The Crumbtrail project id the issue belongs to.",
+        },
+        canonicalIssueId: {
+          type: "string",
+          description:
+            "The canonical issue id to open a verification window for.",
+        },
+      },
+      required: ["project", "canonicalIssueId"],
+    },
+  },
+  /** @stability stable */
+  {
+    name: "getFixVerification",
+    description:
+      "Read whether a fix actually held for a canonical issue. Read-only, no side effects, safe to poll. " +
+      "`state` is three valued and you must branch on it: 'none' means no window was ever opened and nothing has been measured, 'open' means a window is still in flight and NOTHING has been concluded yet, and 'terminal' means the cloud reached its one verdict. " +
+      "A terminal `result` is exactly one of three values. 'verified' means measured traffic across a complete window with zero recurrence, so the fix held. 'recurred' means the signature came back inside the window, so the fix did NOT hold. 'inconclusive' means the cloud could not tell. " +
+      "ONLY 'verified' means the fix held. AN INCONCLUSIVE VERDICT IS NOT A FIX. It is an absence of evidence, and an absence of evidence is never a verified fix. Do not close the issue, do not report success, and do not move on because the answer came back inconclusive: the bug may still be live and merely unobserved. " +
+      `\`reason\` comes from a closed vocabulary of exactly ${VERIFICATION_REASONS.length}: ${VERIFICATION_REASONS.join(", ")}. ` +
+      "'recurrence_detected' and 'clean_observation_window' accompany the decisive verdicts, and 'no_recurrence_low_traffic' accompanies a decisive but deliberately modest low volume verdict. " +
+      `The remaining ${INCONCLUSIVE_VERIFICATION_REASONS.length} each mean 'we could not tell', not 'it is fixed': 'window_incomplete' (the window has not fully elapsed), 'window_too_short' (the span was too small to carry signal), 'no_telemetry' (no traffic signal existed at all, which is categorically different from a measured zero) and 'insufficient_traffic' (too few sessions to conclude). ` +
+      "The payload also carries `fixConfirmed`, true only for a terminal 'verified'. When it is false, treat the fix as unestablished no matter what else the payload says. " +
+      "Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        project: {
+          type: "string",
+          description: "The Crumbtrail project id the issue belongs to.",
+        },
+        canonicalIssueId: {
+          type: "string",
+          description: "The canonical issue id to read the verdict for.",
+        },
+      },
+      required: ["project", "canonicalIssueId"],
+    },
+  },
+  /** @stability stable */
+  {
     name: "getWindowCorrelation",
     description:
       "Answer 'what measurably changed during this window' for a recorded session, with no detector involved. It holds the highlight window [t0,t1] against the quiet stretch immediately before it and reports which event kinds changed rate and which numeric fields changed distribution, ranked by p value and cut at a Benjamini Hochberg false discovery rate. Reach for it instead of getWindow when you know roughly WHEN the failure happened but not WHAT went wrong: when getSessionManifest surfaced no candidate, when the candidate it surfaced does not explain the symptom, or when a detector fired and you want to know what else moved at the same moment. getWindow hands you the raw events and leaves the reading to you; this tells you which of them are unusual for this session. A low p value is a CORRELATION and not a cause. It says the window differs from its baseline, never that the row caused the failure, and a busy window will contain changes that are consequences of the bug or coincidences beside it. Treat each row as a lead, confirm it against the raw events with getWindow, and do not ship a fix whose only evidence is a p value. An empty rows list means nothing cleared the significance cut, not that the session is healthy. Reads only the cold event stream, so it answers the same way for local and hosted sessions.",
@@ -1142,6 +1196,10 @@ export class McpServer {
         return this.toolRecordFeedback(args);
       case "getPlaybook":
         return this.toolGetPlaybook(args);
+      case "startFixVerification":
+        return this.toolStartFixVerification(args);
+      case "getFixVerification":
+        return this.toolGetFixVerification(args);
       case "resolveSignature":
         return this.toolResolveSignature(args);
       case "locateInteractiveElements":
@@ -2403,6 +2461,120 @@ export class McpServer {
     const result = await getAgentPlaybookViaCloud(project);
     if (!result.ok) return this.learningLoopFailure(result, "getPlaybook");
     return textResult({ ...result.data, source: "cloud" });
+  }
+
+  // --- Fix verification ----------------------------------------------------
+  // The one invariant these two tools exist to protect, stated in the cloud's
+  // verification-engine.ts: an absence of evidence is never a verified fix.
+  // Every rendering below is written so that an inconclusive verdict cannot be
+  // misread as a successful one, including by an agent that skims.
+
+  /** Both tools take the same two ids and both are validated with the same rule
+   *  the cloud route's `validId` applies, so a malformed id is refused here
+   *  rather than spending a round trip to earn a 404. */
+  private verificationIds(
+    args: Record<string, unknown>,
+    tool: string,
+  ): { projectId: string; canonicalIssueId: string } | { error: string } {
+    const shape = /^[A-Za-z0-9_]{1,128}$/;
+    const projectId = stringField(args.project)?.trim();
+    if (!projectId || !shape.test(projectId))
+      return {
+        error: `${tool} requires a valid project id (letters, digits, underscore; up to 128 chars)`,
+      };
+    const canonicalIssueId = stringField(args.canonicalIssueId)?.trim();
+    if (!canonicalIssueId || !shape.test(canonicalIssueId))
+      return {
+        error: `${tool} requires a valid canonicalIssueId (letters, digits, underscore; up to 128 chars)`,
+      };
+    return { projectId, canonicalIssueId };
+  }
+
+  /**
+   * Plain language reading of one verification view.
+   *
+   * The only branch that says a fix held is a TERMINAL `verified`. Everything
+   * else — no window, an open window, a recurrence, and every inconclusive
+   * reason — says plainly that nothing is established, because the agent acting
+   * on this text is the last place the invariant can be enforced.
+   */
+  private static verificationInterpretation(view: FixVerificationView): string {
+    if (view.state === "none")
+      return "No observation window has ever been opened for this issue, so nothing has been measured. Open one with startFixVerification once the fix is deployed.";
+    if (view.state === "open")
+      return "An observation window is still in flight and NOTHING has been concluded yet. Do not treat this as a fix that held. Ask again after observationEnd.";
+    if (view.result === "verified")
+      return "The fix held: measured traffic across a complete observation window with zero recurrence of this signature.";
+    if (view.result === "recurred")
+      return "The fix did NOT hold: this signature came back inside the observation window. Reopen the investigation.";
+    return `Crumbtrail could not tell (reason: ${view.reason ?? "unknown"}). That is an absence of evidence, and an absence of evidence is NOT a fix. Do not close the issue on this result: leave the fix under observation, or gather more traffic and ask again.`;
+  }
+
+  private static readonly VERIFICATION_CAVEAT =
+    "An absence of evidence is never a confirmed fix. Trust `fixConfirmed` and `result`: an inconclusive verdict means 'we could not tell', never 'it held'.";
+
+  /** Shared rendering for both verification tools. `fixConfirmed` is computed
+   *  here, from a terminal state AND a `verified` result, so no caller can
+   *  synthesise a success from a partial view. */
+  private renderVerification(
+    view: FixVerificationView,
+    identity: { project: string; canonicalIssueId: string },
+    extra?: Record<string, unknown>,
+  ) {
+    const conclusive = view.state === "terminal";
+    return textResult({
+      source: "cloud",
+      ...identity,
+      ...extra,
+      state: view.state,
+      result: view.result ?? null,
+      reason: view.reason ?? null,
+      strategy: view.strategy ?? null,
+      confidence: view.confidence ?? null,
+      observationStart: view.observationStart ?? null,
+      observationEnd: view.observationEnd ?? null,
+      conclusive,
+      fixConfirmed: conclusive && view.result === "verified",
+      recurred: conclusive && view.result === "recurred",
+      interpretation: McpServer.verificationInterpretation(view),
+      caveat: McpServer.VERIFICATION_CAVEAT,
+    });
+  }
+
+  /**
+   * Open an observation window after a fix. The cloud route is idempotent, so a
+   * retrying agent gets the live window back with `opened: false` instead of a
+   * second one. Agent-token auth.
+   */
+  private async toolStartFixVerification(args: Record<string, unknown>) {
+    const ids = this.verificationIds(args, "startFixVerification");
+    if ("error" in ids) return errorResult(ids.error);
+    const result = await startFixVerificationViaCloud(ids);
+    if (!result.ok)
+      return this.learningLoopFailure(result, "startFixVerification");
+    const { opened, ...view } = result.data;
+    return this.renderVerification(
+      view,
+      { project: ids.projectId, canonicalIssueId: ids.canonicalIssueId },
+      { opened: opened === true },
+    );
+  }
+
+  /**
+   * Read the verdict. `result` and `reason` are passed through verbatim from the
+   * cloud so the closed reason vocabulary reaches the agent unaltered; the
+   * derived booleans and prose are added beside them, never in place of them.
+   */
+  private async toolGetFixVerification(args: Record<string, unknown>) {
+    const ids = this.verificationIds(args, "getFixVerification");
+    if ("error" in ids) return errorResult(ids.error);
+    const result = await getFixVerificationViaCloud(ids);
+    if (!result.ok)
+      return this.learningLoopFailure(result, "getFixVerification");
+    return this.renderVerification(result.data, {
+      project: ids.projectId,
+      canonicalIssueId: ids.canonicalIssueId,
+    });
   }
 
   /** Adapt this server's storage readers to the recall engine's injected seam.
