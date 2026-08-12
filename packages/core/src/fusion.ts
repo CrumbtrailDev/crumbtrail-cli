@@ -135,15 +135,6 @@ export interface EvidenceGap {
   kind?: "source-unavailable";
 }
 
-export interface CaptureDirective {
-  /** The bug signature this raises capture for. */
-  signature: string;
-  /** Lanes to collect more deeply next time. */
-  raise: EvidenceLane[];
-  scope: "signature" | "session";
-  reason: string;
-}
-
 export interface RankedBundle {
   schemaVersion: typeof FUSION_SCHEMA_VERSION;
   symptom: Symptom;
@@ -152,8 +143,6 @@ export interface RankedBundle {
   /** Advisory only. Consumers may ignore and use evidence directly. */
   opinion: { stance: "advisory"; hypotheses: Hypothesis[] };
   gaps: EvidenceGap[];
-  /** Advisory-only: suggested capture escalations when evidence is thin. */
-  directives: CaptureDirective[];
   /** How much actionable context this bundle carries. Advisory, never gates. */
   contextCompleteness: ContextCompleteness;
   /** What the consuming agent should do when context is thin. Advisory. */
@@ -211,7 +200,6 @@ export function assembleBundle(input: AssembleBundleInput): RankedBundle {
     evidence,
     opinion: { stance: "advisory", hypotheses },
     gaps,
-    directives: suggestCaptureDirectives(input.symptom, input.evidence, gaps),
     contextCompleteness,
     escalation,
     ...(located ? { located } : {}),
@@ -226,8 +214,8 @@ function clamp01(value: number): number {
 }
 
 /** Informative lanes for completeness breadth — the lanes that actually
- *  discriminate a cause. Mirrors {@link INFORMATIVE_LANES} intent but includes
- *  `env` since a present env difference is real context.
+ *  discriminate a cause. Includes `env`, since a present env difference is real
+ *  context.
  *
  *  `tickets`, `conversations`, and `deploys` are deliberately ABSENT, and this is
  *  not an oversight to correct. Breadth here saturates at three lanes and feeds
@@ -607,54 +595,3 @@ function classifyHypotheses(
     .map((entry) => entry.hypothesis);
 }
 
-// --- capture directives (formerly capture-directive.ts) -------------------
-
-/** Lanes worth escalating capture on when evidence is thin.
- *
- *  `tickets`, `conversations`, and `deploys` can never belong here, for a stronger
- *  reason than the completeness list: these lanes are not CAPTURED. They are read
- *  from external systems of record, so there is no capture knob to turn and a
- *  directive naming one would be uninstructable. */
-const INFORMATIVE_LANES: EvidenceLane[] = ["network", "db", "browser", "flow"];
-
-function slugify(title: string): string {
-  return title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-}
-
-function signatureFor(symptom: Symptom): string {
-  if (symptom.errorSig && symptom.errorSig.length > 0) return symptom.errorSig;
-  const slug = slugify(symptom.title ?? "");
-  return slug.length > 0 ? slug : "unknown";
-}
-
-/**
- * Pure, deterministic: given a symptom, the (complete) evidence gathered,
- * and any evidence gaps, suggest at most one CaptureDirective raising the
- * informative lanes that are still missing when evidence is thin.
- *
- * Advisory only — never mutates anything.
- */
-function suggestCaptureDirectives(
-  symptom: Symptom,
-  evidence: EvidenceItem[],
-  gaps: EvidenceGap[],
-): CaptureDirective[] {
-  const thin = evidence.length === 0 || gaps.length > 0;
-  if (!thin) return [];
-
-  const present = new Set(evidence.map((e) => e.lane));
-  const missing = INFORMATIVE_LANES.filter((lane) => !present.has(lane));
-  if (missing.length === 0) return [];
-
-  return [
-    {
-      signature: signatureFor(symptom),
-      raise: missing,
-      scope: "signature",
-      reason: `thin evidence for this signature; raise capture on: ${missing.join(", ")}`,
-    },
-  ];
-}

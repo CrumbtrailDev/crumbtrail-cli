@@ -93,7 +93,14 @@ interface ConsoleErrorIndexEntry {
 interface NetworkErrorIndexEntry {
   t: number;
   offsetMs?: number;
+  /** Browser-local sequence number, restarted at 1 on every page load. */
   id?: string | number;
+  /**
+   * Shared correlation id (`X-Crumbtrail-Request-Id`) when the exchange carried
+   * one. Carried onto the index entry so the analyzer can join this failure to
+   * the backend's view of the same request, which `id` cannot do.
+   */
+  requestId?: string;
   m?: string;
   method?: string;
   url?: string;
@@ -268,7 +275,14 @@ interface SessionIndex {
     m: string;
     url: string;
     st: number;
+    /** Browser-local sequence number, restarted at 1 on every page load. */
     id?: string | number;
+    /**
+     * Shared correlation id (`X-Crumbtrail-Request-Id`) when the exchange carried
+     * one. Carried onto the index entry so the analyzer can join this failure to
+     * the backend's view of the same request, which `id` cannot do.
+     */
+    requestId?: string;
     reason?: string;
     code?: string;
     message?: string;
@@ -539,6 +553,7 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
         ...(typeof event.d.id === "string" || typeof event.d.id === "number"
           ? { id: event.d.id }
           : {}),
+        ...correlationIdFields(event),
         ...(applicationFailure ?? { reason: "http_status" }),
       });
     }
@@ -564,6 +579,7 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
           ...(typeof event.d.id === "string" || typeof event.d.id === "number"
             ? { id: event.d.id }
             : {}),
+          ...correlationIdFields(event),
           reason: "network_error",
           ...(message !== undefined ? { message } : {}),
         });
@@ -865,6 +881,18 @@ function isCountableNetworkFailure(event: BugEvent): boolean {
   );
 }
 
+/**
+ * The exchange's shared correlation id, in spreadable form.
+ *
+ * The browser collector stamps `requestId` on the `net.req`, `net.res` and
+ * `net.err` of one exchange together, so an index entry derived from any of them
+ * carries the same key the backend saw.
+ */
+function correlationIdFields(event: BugEvent): { requestId?: string } {
+  const requestId = safeString(event.d.requestId);
+  return requestId === undefined ? {} : { requestId };
+}
+
 function summarizeNetworkErrorEvent(
   event: BugEvent,
 ): NetworkErrorIndexEntry | undefined {
@@ -876,6 +904,7 @@ function summarizeNetworkErrorEvent(
     ...(typeof event.d.id === "string" || typeof event.d.id === "number"
       ? { id: event.d.id }
       : {}),
+    ...correlationIdFields(event),
     m: safeString(event.d.m),
     method: safeString(event.d.method),
     url: safeUrl(event.d.url),

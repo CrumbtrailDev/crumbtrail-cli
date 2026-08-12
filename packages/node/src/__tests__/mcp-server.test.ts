@@ -120,12 +120,19 @@ describe("MCP Server", () => {
     });
     expect(res).not.toBeNull();
     const result = res!.result as any;
-    // 35 = 38 minus solveContext, resolveCapsule, and searchSpecs, which left
-    // with the third-party integration surfaces they queried.
-    expect(result.tools).toHaveLength(35);
+    // 40 = the 35 left after solveContext, resolveCapsule, and searchSpecs went
+    // with the third-party integration surfaces they queried, plus
+    // getWindowCorrelation, startFixVerification and getFixVerification, plus
+    // the two agent-plane tools requestProbe and shadowBacktest.
+    expect(result.tools).toHaveLength(40);
     const names = result.tools.map((t: any) => t.name);
     expect(names).toContain("listSessions");
     expect(names).toContain("getFixContext");
+    expect(names).toContain("getWindowCorrelation");
+    expect(names).toContain("startFixVerification");
+    expect(names).toContain("getFixVerification");
+    expect(names).toContain("requestProbe");
+    expect(names).toContain("shadowBacktest");
     // The integration tools left with evidence-sources/, ticket/, and
     // knowledge/; re-adding a name here without an implementation should fail.
     for (const gone of ["solveContext", "resolveCapsule", "searchSpecs"]) {

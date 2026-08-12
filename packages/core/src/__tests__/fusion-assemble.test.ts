@@ -61,36 +61,4 @@ describe("assembleBundle", () => {
 
     expect(bundle.gaps).toEqual(gaps);
   });
-
-  it("surfaces one capture directive raising all informative lanes for all-empty input with a gap", () => {
-    const symptom: Symptom = { title: "checkout fails" };
-    const gaps = [
-      { lane: "network" as const, reason: "no recorded sessions compared" },
-    ];
-
-    const bundle = assembleBundle({ symptom, evidence: [], intent: [], gaps });
-
-    expect(bundle.directives).toHaveLength(1);
-    expect(bundle.directives[0].raise).toEqual([
-      "network",
-      "db",
-      "browser",
-      "flow",
-    ]);
-    expect(bundle.directives[0].scope).toBe("signature");
-  });
-
-  it("yields no capture directives when evidence covers all informative lanes with no gaps", () => {
-    const symptom: Symptom = { title: "checkout fails" };
-    const evidence = [
-      item({ id: "e1", lane: "network" }),
-      item({ id: "e2", lane: "db" }),
-      item({ id: "e3", lane: "browser" }),
-      item({ id: "e4", lane: "flow" }),
-    ];
-
-    const bundle = assembleBundle({ symptom, evidence, intent: [] });
-
-    expect(bundle.directives).toEqual([]);
-  });
 });

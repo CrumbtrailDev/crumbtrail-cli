@@ -1,4 +1,4 @@
-export { Crumbtrail } from "./bug-logger";
+export { Crumbtrail, PROBE_RESULT_EVENT_KIND } from "./bug-logger";
 export { EventBus } from "./event-bus";
 export { RingBuffer } from "./ring-buffer";
 export { HttpTransport, EventDeliveryError } from "./transports/http";
@@ -133,7 +133,6 @@ export type {
   ContextCompleteness,
   Escalation,
   EvidenceGap,
-  CaptureDirective,
   RankedBundle,
   AssembleBundleInput,
 } from "./fusion";
@@ -144,6 +143,25 @@ export type {
   EvidenceQuery,
   EvidenceSourceResult,
 } from "./evidence-source";
+export {
+  PROBE_NAMES,
+  PROBE_DEFAULT_TIMEOUT_MS,
+  PROBE_MAX_TIMEOUT_MS,
+  PROBE_DEFAULT_MAX_ROWS,
+  PROBE_MAX_MAX_ROWS,
+  PROBE_DEFAULT_MAX_BYTES,
+  PROBE_MAX_MAX_BYTES,
+  isProbeName,
+  runProbe,
+} from "./probes";
+export type {
+  ProbeName,
+  ProbeResult,
+  ProbeContext,
+  ProbeEnvDeclaration,
+  ProbeStorageArea,
+  ProbeStorageLike,
+} from "./probes";
 export { STACK_IDS } from "./stacks";
 export type { Stack } from "./stacks";
 export {

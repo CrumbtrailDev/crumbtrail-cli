@@ -181,6 +181,42 @@ action, or `flag()` triggers capture. The recorder adds the configured tail
 before finalizing the report. A cloud config response can disable capture with
 `killSwitch: true`; the SDK clears its buffer as soon as that response arrives.
 
+### Live probes
+
+A capture config response can also name probes to run, under a `probes` field. A probe answers one
+question about the running application and rests its answer as a `probe.result` event, so an agent
+reading the session afterwards sees what the app actually looked like at that moment rather than
+what the code implies it looked like. Four probes exist and the server can name nothing else:
+`runtime.env`, `storage.snapshot`, `network.inflight` and `flags.current`.
+
+The whole of what a server may say is a name. Probes take no selector, no URL, no path and no
+expression, so no value from a config response reaches probe code, and one entry shaped as an object
+rather than a string refuses the entire field rather than being salvaged. A name outside the four is
+dropped without normalization. At most four probes run per poll, repeats are collapsed, and a list
+longer than 64 entries is refused before it is read.
+
+They run one at a time, only after the remote policy has been applied, and each gets its own
+deadline: 2 seconds, 200 rows and 32 KB of serialized rows by default. A probe that hangs is
+abandoned at the deadline. A kill switch, a `stop()` or a newer poll ends the run between probes. A
+probe never throws: a failure rests as a `probe.result` carrying `ok: false` and a short reason,
+because "this source was not available in production" is itself an answer. Values pass through the
+same redaction the rest of capture uses.
+
+A probe is answered by whichever application instance is polling when the request goes out. That is
+not the session an agent is investigating, and by the time a bundle is being read that session has
+ended, so a probe reports on a bystander rather than on the person who hit the defect. Read every
+reading as "the app looks like this right now", never as "the failing session looked like this".
+
+`storage.snapshot` is the reading where that distinction changes what is emitted, so its keys get a
+stricter treatment than the ordinary storage capture uses. It reports which keys exist, how many,
+what pattern each follows and how many bytes each holds. It does not report any stored value, which
+is replaced unconditionally, and it does not report the identifying part of a key: an email address,
+a user id, an order number, a phone number or any other span that could carry a value is replaced
+with `*`, so `session:alice@example.com:cart` is reported as `session:*:cart`. A key from which no
+ordinary word survives is reported as `[REDACTED_KEY]`. A plain word in a key is kept, which is what
+makes two patterns tellable apart, so a key that spells out a person's name in ordinary letters is
+the one case this cannot catch.
+
 ### Response body summaries (`net.res`)
 
 `net.res` keeps carrying the redacted response body as text in `d.body`. It also

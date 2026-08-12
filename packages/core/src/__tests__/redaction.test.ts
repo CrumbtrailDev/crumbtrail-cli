@@ -10,6 +10,7 @@ import {
   redactHeaders,
   redactInputValue,
   redactNetworkTextBody,
+  redactProbeStorageKey,
   redactStorageKey,
   redactStoredValue,
   redactTokenLikeString,
@@ -603,6 +604,67 @@ describe("browser redaction policy", () => {
       kind: "storage",
       action: "redacted",
       reason: "storage_value",
+    });
+  });
+
+  /**
+   * `redactProbeStorageKey` is the storage key treatment for the live probe path, where the browser
+   * answering is a bystander's rather than the recorded session's. It keeps a key's shape and drops
+   * every span that could name a person. `redactStorageKey`, the consented collector's treatment,
+   * is deliberately untouched by all of this.
+   */
+  describe("redactProbeStorageKey", () => {
+    it("replaces only the identifying span and keeps the pattern", () => {
+      expect(redactProbeStorageKey("session:alice@example.com:cart").value).toBe(
+        "session:*:cart",
+      );
+      expect(redactProbeStorageKey("user_12345_prefs").value).toBe(
+        "user_*_prefs",
+      );
+      expect(redactProbeStorageKey("phone:+1-555-123-4567").value).toBe(
+        "phone:+*-*-*-*",
+      );
+    });
+
+    it("keeps a key that names nothing but structure exactly as it is", () => {
+      for (const key of ["theme", "cart", "featureFlags", "@scope/pkg"]) {
+        const result = redactProbeStorageKey(key);
+        expect(result.value).toBe(key);
+        expect(result.metadata).toBeUndefined();
+      }
+    });
+
+    it("falls back to the collector's verdict where there is no pattern to preserve", () => {
+      // No separators, so structure preservation buys nothing and the stricter rule stands.
+      expect(redactProbeStorageKey("refreshToken").value).toBe(
+        REDACTED_STORAGE_KEY,
+      );
+      expect(redactProbeStorageKey("user12345").value).toBe(
+        REDACTED_STORAGE_KEY,
+      );
+    });
+
+    it("redacts a key that is a token rather than a name", () => {
+      const result = redactProbeStorageKey(
+        "sess_550e8400-e29b-41d4-a716-446655440000",
+      );
+
+      expect(result.value).toBe(REDACTED_STORAGE_KEY);
+      expect(result.metadata?.fields[0]).toMatchObject({
+        reason: "storage_key_token_like",
+      });
+    });
+
+    it("leaves the collector's own key treatment alone", () => {
+      // The same inputs, through the consented capture path, keep answering what they answered.
+      expect(redactStorageKey("user_12345_prefs").value).toBe(
+        "user_12345_prefs",
+      );
+      expect(redactStorageKey("cart:alice@example.com:items").value).toBe(
+        "cart:alice@example.com:items",
+      );
+      expect(redactStorageKey("theme").value).toBe("theme");
+      expect(redactStorageKey("refreshToken").value).toBe(REDACTED_STORAGE_KEY);
     });
   });
 
