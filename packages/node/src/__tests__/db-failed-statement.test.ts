@@ -329,6 +329,40 @@ describe("delivery: the record reaches the reader", () => {
     expect(markdown).not.toContain("Database Statements That Failed");
   });
 
+  it("joins the real adapter to the real renderer end to end, with no hand-written event", async () => {
+    // Every other test in this file grades ONE side of the emitter→builder join: the capture tests
+    // assert what the adapter emits, the delivery tests render a fixture this file authored. If a
+    // field name diverged between the two, both groups would stay green while the mechanism
+    // reached nobody — which is the failure this plane exists to stop, one layer up. So this test
+    // authors nothing: the events come out of `instrumentPgClient` and go straight into
+    // `postProcess`.
+    const captured: BugEvent[] = [];
+    const db = instrumentPgClient(
+      clientRejecting(/insert/i, new DriverError("duplicate key value", "23505")),
+      {
+        requestId: "rq-e2e",
+        emit: (event) => captured.push(event),
+        now: () => 1250,
+        sessionStartedAt: 1000,
+      },
+    );
+    await expect(
+      db.query("INSERT INTO ledger (user_id, delta) VALUES ($1, $2)", [7, 100]),
+    ).rejects.toThrow();
+    expect(captured.length).toBeGreaterThan(0);
+
+    const { markdown, bundle } = await render([
+      ...baseEvents([]),
+      ...(captured as unknown as Record<string, unknown>[]),
+    ]);
+
+    expect(markdown).toContain("## Database Statements That Failed");
+    expect(markdown).toContain("23505");
+    expect(bundle.databaseErrors?.[0]).toMatchObject({ table: "ledger", code: "23505" });
+    // And the driver's message still does not travel, measured on the artifact the reader reads.
+    expect(markdown).not.toContain("duplicate key value");
+  });
+
   it("scopes db_errors onto the fix-context primary window by requestId", async () => {
     const bundle = {
       session: { id: "ses-scope", startMs: 1000, endMs: 2000 },
