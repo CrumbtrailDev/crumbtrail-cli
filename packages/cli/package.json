@@ -1,6 +1,6 @@
 {
   "name": "crumbtrail",
-  "version": "0.8.1",
+  "version": "0.30.0",
   "description": "Set up Crumbtrail in one command: npx crumbtrail detects your framework, wires in the SDK, and verifies the first event. See https://crumbtrail.ai",
   "license": "MIT",
   "repository": {
@@ -50,7 +50,7 @@
   "scripts": {
     "prepack": "node ../../scripts/assert-publish-safe.mjs",
     "prepublishOnly": "node ../../scripts/assert-publish-safe.mjs",
-    "prebuild": "pnpm --filter crumbtrail-install-shared --filter crumbtrail-detect-core build",
+    "prebuild": "pnpm --filter crumbtrail-detect-core build",
     "build": "tsup",
     "pretest": "pnpm --filter crumbtrail-detect-core build",
     "test": "vitest run",
@@ -62,7 +62,6 @@
   "devDependencies": {
     "@types/node": "^25.5.0",
     "crumbtrail-core": "workspace:^",
-    "crumbtrail-install-shared": "workspace:^",
     "crumbtrail-detect-core": "workspace:^"
   },
   "homepage": "https://crumbtrail.ai",

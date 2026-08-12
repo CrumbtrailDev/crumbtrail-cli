@@ -35,7 +35,7 @@ const LOG_DIR = path.join(REPO_ROOT, '.harness-logs');
 
 // Packages worth watching: the ones a target actually loads at runtime. Watching
 // all nine wastes CPU on packages no local target consumes.
-const WATCHED = ['crumbtrail-core', 'crumbtrail-node', 'crumbtrail-react'];
+const WATCHED = ['crumbtrail-core', 'crumbtrail-node', 'crumbtrail-detect-core'];
 
 const options = parseArgs(process.argv.slice(2));
 const children = [];

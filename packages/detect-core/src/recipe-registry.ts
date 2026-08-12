@@ -94,14 +94,14 @@ const NODE_KEY: KeyRef = {
  * floor exists, is recipe-managed, and is not ahead of its workspace manifest.
  */
 export const SDK_VERSION_FLOORS: Record<string, string> = {
-  // 0.15.0 / 0.26.0 are the first releases that accept `service` on init and
-  // on autoCapture. Below them the injected code still runs, but the name it
-  // passes is dropped and every app in the project ingests unlabelled — a
-  // silent loss of the attribution one key per project depends on.
-  "crumbtrail-core": "0.15.0",
-  "crumbtrail-node": "0.26.0",
-  "crumbtrail-react-native": "0.3.2",
-  "crumbtrail-tauri": "0.3.2",
+  // 0.30.0 is the first lockstep release: every published SDK moved to one
+  // shared version, and the React and Tauri adapters became subpaths of
+  // crumbtrail-core rather than their own packages. Below it the injected code
+  // imports `crumbtrail-core/react` and `crumbtrail-core/tauri`, which do not
+  // resolve, so the floor is a hard requirement rather than a nicety.
+  "crumbtrail-core": "0.30.0",
+  "crumbtrail-node": "0.30.0",
+  "crumbtrail-react-native": "0.30.0",
 };
 
 /**
@@ -131,7 +131,10 @@ export function sdkInstallSpec(pkg: string): string {
 export const RECIPE_REGISTRY: Record<Recipe, RecipeMeta> = {
   tauri: {
     stack: "vite", // no "tauri" Stack id — Tauri frontends are typically vite
-    sdkPackages: ["crumbtrail-core", "crumbtrail-tauri"],
+    // TauriTransport ships as the crumbtrail-core/tauri subpath, so there is no
+    // second package to install. @tauri-apps/api is an optional peer of core
+    // and every Tauri v2 frontend already depends on it.
+    sdkPackages: ["crumbtrail-core"],
     serviceName: "app",
     kind: "inject",
   },

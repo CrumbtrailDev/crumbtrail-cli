@@ -247,7 +247,7 @@ export function reactNativeInitSnippet(
 export function tauriInitSnippet(): string {
   return [
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
-    'import { TauriTransport } from "crumbtrail-tauri";',
+    'import { TauriTransport } from "crumbtrail-core/tauri";',
     "",
     "Crumbtrail.init({ ...PRESET_PASSIVE, transportInstance: new TauriTransport() });",
   ].join("\n");

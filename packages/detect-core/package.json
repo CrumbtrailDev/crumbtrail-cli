@@ -1,7 +1,7 @@
 {
   "name": "crumbtrail-detect-core",
-  "version": "0.3.1",
-  "description": "Side-effect-free Crumbtrail project detection and injection planning.",
+  "version": "0.30.0",
+  "description": "Side-effect-free Crumbtrail project detection and injection planning, plus the shared install recipes, OTLP facts and agent prompts on the crumbtrail-detect-core/install subpath.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -22,6 +22,11 @@
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js",
       "require": "./dist/testing.cjs"
+    },
+    "./install": {
+      "types": "./dist/install/index.d.ts",
+      "import": "./dist/install/index.js",
+      "require": "./dist/install/index.cjs"
     },
     "./package.json": "./package.json"
   },
@@ -45,8 +50,7 @@
     "crumbtrail-core": "workspace:^"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
-    "crumbtrail-install-shared": "workspace:^"
+    "@types/node": "^25.5.0"
   },
   "homepage": "https://crumbtrail.ai",
   "bugs": {

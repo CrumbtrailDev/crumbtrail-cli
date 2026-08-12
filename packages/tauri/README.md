@@ -1,14 +1,12 @@
-# crumbtrail-tauri
+# tauri-plugin-crumbtrail
 
-Tauri v2 plugin for [Crumbtrail](https://crumbtrail.ai). Replaces the HTTP transport with native IPC — no separate server process needed.
+The Rust half of [Crumbtrail](https://crumbtrail.ai)'s Tauri v2 support,
+published to crates.io. It receives capture events over native IPC and writes
+them to disk, so a desktop app needs no separate server process.
 
-## Install
-
-```bash
-npm install crumbtrail-tauri crumbtrail-core
-```
-
-Plus the Rust crate, below.
+The JavaScript half is **`crumbtrail-core/tauri`**, a subpath of
+[`crumbtrail-core`](../core). There is no `crumbtrail-tauri` npm package: the
+transport is 58 lines and did not earn a package of its own.
 
 ## Setup
 
@@ -46,17 +44,20 @@ Add to `src-tauri/capabilities/default.json`:
 }
 ```
 
+Skip this and every Crumbtrail `invoke` fails.
+
 ### 3. JavaScript side
 
 ```bash
-pnpm add crumbtrail-core crumbtrail-tauri
+npm install crumbtrail-core
 ```
 
 ```typescript
-import { Crumbtrail } from "crumbtrail-core";
-import { TauriTransport } from "crumbtrail-tauri";
+import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";
+import { TauriTransport } from "crumbtrail-core/tauri";
 
 const logger = Crumbtrail.init({
+  ...PRESET_PASSIVE,
   transportInstance: new TauriTransport(),
 });
 
@@ -67,14 +68,26 @@ logger.mark("app-ready");
 await logger.stop();
 ```
 
+Or let the wizard do all three steps it can:
+
+```bash
+npx crumbtrail
+```
+
+The wizard injects the JavaScript side and then prints the two Rust steps,
+which it cannot perform for you.
+
 ## How it works
 
-The `TauriTransport` class implements `CrumbtrailTransport` using Tauri's `invoke()` IPC instead of HTTP `fetch()`. Events flow directly to the Rust backend which handles:
+`TauriTransport` implements `CrumbtrailTransport` using Tauri's `invoke()` IPC
+instead of HTTP `fetch()`. Events flow directly to the Rust backend, which
+handles:
 
 - **Session management** — creates session directories, writes `meta.json`
 - **NDJSON writing** — appends events to `events.ndjson`
 - **Blob storage** — writes binary files (screenshots, video chunks)
-- **Post-processing** — generates `index.json` with error/request/navigation summaries
+- **Post-processing** — generates `index.json` with error, request and
+  navigation summaries
 
 ## Session storage
 
@@ -93,7 +106,8 @@ On macOS: `~/Library/Application Support/<bundle-id>/crumbtrail-sessions/`
 
 ## MCP compatibility
 
-The MCP server from `crumbtrail-node` reads session directories directly. Point it at the same output path to use MCP tools with Tauri-captured sessions:
+The MCP server from `crumbtrail-node` reads session directories directly. Point
+it at the same output path to use MCP tools with Tauri-captured sessions:
 
 ```bash
 crumbtrail-server --output ~/Library/Application\ Support/<bundle-id>/crumbtrail-sessions

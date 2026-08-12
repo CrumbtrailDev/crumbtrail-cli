@@ -59,8 +59,8 @@ function bundledWorkspaceDependencies(pkg) {
 
   // noExternal affects the packed build even when the imported workspace
   // package is listed as a dev dependency. This is intentionally broader than
-  // runtimeContractDependencies: CLI bundles install-shared and detect-core
-  // from devDependencies, so their source changes must reach the CLI release.
+  // runtimeContractDependencies: the CLI bundles detect-core from
+  // devDependencies, so its source changes must reach the CLI release.
   return Object.entries(declaredDependencies(pkg.manifest))
     .filter(([name, version]) => isWorkspaceSpec(version) && noExternal.has(name))
     .map(([name]) => name);

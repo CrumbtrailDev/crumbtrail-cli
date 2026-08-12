@@ -40,9 +40,9 @@ not guaranteed to be public yet, and a self-hosted deploy has no public
 registry mirror at all), the wizard automatically re-installs from the deploy's
 own packed tarballs — discovered via `GET <base>/install/manifest.json` and
 fetched from `GET <base>/install/<package>-<version>.tgz` — with no separate
-step required. `crumbtrail-react-native` is packed as an **optional** SDK
-channel (alongside `crumbtrail-react` and `crumbtrail-tauri`): a broken/missing
-pack for it only disables that fallback, it never blocks the core install.
+step required. `crumbtrail-react-native` is packed as the one **optional** SDK
+channel: a broken or missing pack for it only disables that fallback, it never
+blocks the core install.
 
 ### Manual install
 

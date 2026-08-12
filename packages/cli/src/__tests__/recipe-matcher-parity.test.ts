@@ -223,7 +223,7 @@ describe("recipe matcher parity", () => {
     expect(RECIPE_REGISTRY).toMatchObject({
       tauri: {
         stack: "vite",
-        sdkPackages: ["crumbtrail-core", "crumbtrail-tauri"],
+        sdkPackages: ["crumbtrail-core"],
         serviceName: "app",
         kind: "inject",
       },
