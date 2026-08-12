@@ -7,10 +7,10 @@
 //   2. cleanliness  — git status on the target; dirty -> needs-confirm (unless force)
 //   3. sanity       — target is a readable module (prepend) or safe-to-create
 // Any failure or ambiguity -> fallback-ai plan carrying the filled snippet +
-// buildAgentPrompt(...) from crumbtrail-install-shared.
+// buildAgentPrompt(...) from ../install.
 
 import path from "node:path";
-import { buildAgentPrompt, buildOtlpSnippets } from "crumbtrail-install-shared";
+import { buildAgentPrompt, buildOtlpSnippets } from "../install/index.js";
 import type { Stack } from "crumbtrail-core";
 import type { Recipe } from "../detect";
 import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
@@ -739,12 +739,12 @@ function planReactNative(input: BuildPlanInput, io: InjectIO): Plan {
 /**
  * Two Rust-side steps the CLI can't perform (JS injection only): without them
  * the wired JS transport invokes a plugin that isn't registered, so capture
- * silently does nothing. Sourced from packages/tauri/README.md steps 1–2 —
+ * silently does nothing. Sourced from packages/tauri/README.md steps 1-2 —
  * kept short, pointing at the README for the exact snippets.
  */
 const TAURI_RUST_WARNINGS = [
-  "Tauri also needs a Rust step the CLI can't do: register the plugin in src-tauri — add `tauri-plugin-crumbtrail` to Cargo.toml and `.plugin(tauri_plugin_crumbtrail::init())` in lib.rs (crumbtrail-tauri README, step 1).",
-  "Grant the plugin permission: add `crumbtrail:default` to src-tauri/capabilities/default.json, or every Crumbtrail invoke fails (crumbtrail-tauri README, step 2).",
+  "Tauri also needs a Rust step the CLI can't do: register the plugin in src-tauri — add `tauri-plugin-crumbtrail` to Cargo.toml and `.plugin(tauri_plugin_crumbtrail::init())` in lib.rs (packages/tauri/README.md, step 1).",
+  "Grant the plugin permission: add `crumbtrail:default` to src-tauri/capabilities/default.json, or every Crumbtrail invoke fails (packages/tauri/README.md, step 2).",
 ];
 
 function planTauri(input: BuildPlanInput, io: InjectIO): Plan {

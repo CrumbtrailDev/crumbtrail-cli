@@ -374,15 +374,103 @@ collector emits one `ui.layout` event per navigation with
 locale-vs-rendered-number contradiction, and horizontal overflow from a long
 translated label, joinable without capturing any DOM.
 
+## React
+
+The React bindings live on the `crumbtrail-core/react` subpath. Nothing extra to
+install: React is an optional peer dependency, so a project that never imports
+this subpath never has to have React at all.
+
+Wrap a subtree so a render error is flagged as a bug with the surrounding
+session already captured:
+
+```tsx
+import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";
+import { CrumbtrailErrorBoundary } from "crumbtrail-core/react";
+
+const crumbtrail = Crumbtrail.init({
+  ...PRESET_PASSIVE,
+  httpEndpoint: "https://api.crumbtrail.ai",
+  httpAuthToken: process.env.CRUMBTRAIL_KEY,
+});
+
+export function App() {
+  return (
+    <CrumbtrailErrorBoundary logger={crumbtrail} fallback={<p>Something broke.</p>}>
+      <Checkout />
+    </CrumbtrailErrorBoundary>
+  );
+}
+```
+
+| Prop | Type | Description |
+| --- | --- | --- |
+| `logger` | `Crumbtrail` | The instance returned by `Crumbtrail.init()`. |
+| `children` | `ReactNode` | The subtree to guard. |
+| `fallback` | `ReactNode` | Optional UI to render after an error. |
+
+`useBugState` registers a value so it is attached to any bug flagged while the
+component is mounted:
+
+```tsx
+import { useBugState } from "crumbtrail-core/react";
+
+function Checkout({ crumbtrail }) {
+  const [cart, setCart] = useState([]);
+  const [step, setStep] = useState("address");
+
+  useBugState(crumbtrail, "cart", cart);
+  useBugState(crumbtrail, "step", step);
+
+  // ...
+}
+```
+
+Values are **redacted by default** using the same policy as the rest of the SDK,
+so a state field called `token` or `password` never leaves the browser in the
+clear. Pass `{ captureRawState: true }` as the fourth argument only when you are
+certain the value is safe.
+
+React 18 or newer. For React Native and Expo, use
+[`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native)
+instead: its peer dependencies are native and must not reach a web bundle.
+
+## Tauri
+
+The Tauri v2 transport lives on the `crumbtrail-core/tauri` subpath. It replaces
+the HTTP transport with native IPC, so a desktop app needs no server process.
+`@tauri-apps/api` is an optional peer dependency, which every Tauri v2 frontend
+already has.
+
+```typescript
+import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";
+import { TauriTransport } from "crumbtrail-core/tauri";
+
+const logger = Crumbtrail.init({
+  ...PRESET_PASSIVE,
+  transportInstance: new TauriTransport(),
+});
+```
+
+`TauriTransport` sends events over Tauri's `invoke()` IPC to the Rust side,
+which owns session directories, NDJSON writing, blob storage and
+post-processing. That Rust half is the `tauri-plugin-crumbtrail` crate, and it
+must be registered separately — see
+[`packages/tauri/README.md`](https://github.com/CrumbtrailDev/crumbtrail-cli/blob/main/packages/tauri/README.md)
+for the Cargo dependency, the `.plugin(...)` call and the capability permission.
+Without those three steps every Crumbtrail `invoke` fails.
+
 ## Related packages
 
 | Package                                                                            | Use it for                                                 |
 | ---------------------------------------------------------------------------------- | ---------------------------------------------------------- |
 | [`crumbtrail`](https://www.npmjs.com/package/crumbtrail)                           | The `npx crumbtrail` setup wizard                          |
 | [`crumbtrail-node`](https://www.npmjs.com/package/crumbtrail-node)                 | Self-hosted server, Express middleware, MCP evidence tools |
-| [`crumbtrail-react`](https://www.npmjs.com/package/crumbtrail-react)               | React error boundary and state-capture hook                |
-| [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native) | React Native bindings                                      |
-| [`crumbtrail-tauri`](https://www.npmjs.com/package/crumbtrail-tauri)               | Tauri desktop bindings                                     |
+| [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native) | React Native and Expo bindings                             |
+| [`crumbtrail-detect-core`](https://www.npmjs.com/package/crumbtrail-detect-core)   | Framework detection and injection planning                 |
+
+The React error boundary and state-capture hook, and the Tauri desktop
+transport, are subpaths of this package rather than packages of their own — see
+[React](#react) and [Tauri](#tauri) above.
 
 ## Links
 

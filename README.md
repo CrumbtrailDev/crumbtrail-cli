@@ -13,17 +13,32 @@ them require it.
 | Package | Description |
 | --- | --- |
 | [`crumbtrail`](packages/cli) | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. |
-| [`crumbtrail-core`](packages/core) | Framework-agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. |
+| [`crumbtrail-core`](packages/core) | Framework-agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. React bindings on the `/react` subpath, Tauri bindings on `/tauri`. |
 | [`crumbtrail-node`](packages/node) | Node.js server: session store, backend capture, the local dashboard. |
-| [`crumbtrail-react`](packages/react) | React bindings. |
-| [`crumbtrail-react-native`](packages/react-native) | React Native and Expo bindings. |
+| [`crumbtrail-react-native`](packages/react-native) | React Native and Expo bindings. Its own package because its native peer dependencies must not reach a web bundle. |
 | [`crumbtrail-capacitor`](packages/capacitor) | Capacitor and Ionic bindings: adds device, app lifecycle, connectivity and deep link context to the web capture already running in the WebView. |
-| [`crumbtrail-tauri`](packages/tauri) | Tauri (Rust desktop) bindings. |
-| [`crumbtrail_flutter`](packages/flutter) | Flutter SDK (pub.dev). Both of Flutter's error surfaces, app lifecycle, navigation and environment. |
-| [`Crumbtrail` (Swift)](packages/swift) | Native iOS, macOS, tvOS and watchOS SDK. Swift Package Manager, no dependencies. |
-| [`ai.crumbtrail:crumbtrail-android`](packages/kotlin) | Native Android SDK in Kotlin. No transitive dependencies. |
-| [`crumbtrail-install-shared`](packages/install-shared) | Install recipes and agent prompts shared by the CLI and the dashboard. |
-| [`crumbtrail-detect-core`](packages/detect-core) | Framework detection and injection planning, shared by the CLI and cloud automation. Reads only and writes nothing. |
+| [`crumbtrail-detect-core`](packages/detect-core) | Framework detection and injection planning, shared by the CLI and cloud automation. Reads only and writes nothing. Install recipes and agent prompts on the `/install` subpath. |
+
+Those six are the whole npm surface, and they all publish at one shared version.
+A given release is the same number everywhere, so there is no question of which
+versions go together.
+
+React and Tauri have no package of their own: they are the `crumbtrail-core/react`
+and `crumbtrail-core/tauri` subpaths, because each was a few hundred lines of
+bindings rather than an SDK. React Native and Capacitor stay separate because
+each is a real SDK with platform peer dependencies behind it.
+
+### Other registries
+
+The native SDKs are not npm packages and cannot be subpaths of one. Each has a
+single home on its own platform's registry.
+
+| SDK | Registry |
+| --- | --- |
+| [`Crumbtrail` (Swift)](packages/swift) | Swift Package Manager. Native iOS, macOS, tvOS and watchOS. No dependencies. |
+| [`ai.crumbtrail:crumbtrail-android`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies. |
+| [`crumbtrail_flutter`](packages/flutter) | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment. |
+| [`tauri-plugin-crumbtrail`](packages/tauri/rust) | crates.io. The Rust half of Tauri support; its JavaScript half is `crumbtrail-core/tauri`. |
 
 ## Quick start
 

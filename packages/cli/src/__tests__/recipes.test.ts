@@ -619,7 +619,7 @@ describe("buildPlan — Tauri", () => {
     );
     expect(plan.kind).toBe("prepend");
     expect(plan.content).toContain("transportInstance: new TauriTransport()");
-    expect(plan.content).toContain('from "crumbtrail-tauri"');
+    expect(plan.content).toContain('from "crumbtrail-core/tauri"');
     // transportInstance override, NOT the `transport` string-mode field.
     expect(plan.content).not.toMatch(/transport:\s*new TauriTransport/);
     // Tauri routes to the local Rust store — it injects no key, so there is no

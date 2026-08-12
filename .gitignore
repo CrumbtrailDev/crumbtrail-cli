@@ -132,3 +132,6 @@ packages/swift/.swiftpm/
 # Kotlin / Gradle build output
 packages/kotlin/build/
 packages/kotlin/.gradle/
+
+# Agent worktrees. Local only — never a gitlink in a commit.
+.worktrees/

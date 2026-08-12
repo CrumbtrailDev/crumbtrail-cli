@@ -272,7 +272,7 @@ INSTALLER_RECIPES["otlp-fastapi"] = {
   portSlot: 49618,
   // The emitted guidance snippet must carry the FIXED facts: the %20-escaped
   // Bearer header, the compression posture, and both wire protocols — all
-  // sourced from OTLP_CAPABILITY_FACTS in crumbtrail-install-shared.
+  // sourced from OTLP_CAPABILITY_FACTS in crumbtrail-detect-core/install.
   snippetMustContain: [
     "Authorization=Bearer%20",
     "OTEL_EXPORTER_OTLP_COMPRESSION=none",
@@ -424,7 +424,8 @@ INSTALLER_RECIPES["rr7-revealed"] = {
 //   typecheckCap   — dispatch to the typecheck runner (no build/serve/ingest)
 //   clientEntry    — the entry the plan must prepend into (relative to app)
 //   typecheckPacks — packed pack-manifest keys installed before typecheck
-//                    (react-native/tauri need crumbtrail-core + their SDK)
+//                    (react-native needs crumbtrail-core + its own SDK; tauri
+//                    needs only core, since its transport is a core subpath)
 //   typecheckCmd   — argv run in the app dir; exit 0 = pass
 //   warningMustContain — substrings the plan warnings must carry (Tauri Rust steps)
 
@@ -459,15 +460,15 @@ INSTALLER_RECIPES["expo"] = {
 // over vite (src-tauri/ + @tauri-apps dep) and resolves the frontend entry from
 // index.html; the plan prepends the TauriTransport init. Cap adds two Rust-side
 // warnings the JS injection can't perform (plugin registration + capability
-// permission). RED on current main: no tauri tarball channel AND planTauri
-// emitted no Rust warnings — GREEN after both.
+// permission). TauriTransport ships as the crumbtrail-core/tauri subpath, so
+// the only tarball this recipe needs is the core one.
 INSTALLER_RECIPES["tauri"] = {
   recipe: "tauri",
   fixtureDir: path.join(fixturesRoot, "tauri"),
   typecheckCap: true,
   expectedPlanKind: "prepend",
   clientEntry: path.join("src", "main.ts"),
-  typecheckPacks: ["core", "tauri"],
+  typecheckPacks: ["core"],
   typecheckCmd: ["npx", "tsc", "--noEmit"],
   warningMustContain: ["tauri-plugin-crumbtrail", "crumbtrail:default"],
   buildCmd: null,
@@ -477,7 +478,7 @@ INSTALLER_RECIPES["tauri"] = {
     {
       id: "tauri-typecheck",
       description:
-        "the wizard prepends the TauriTransport init into the frontend entry, the packed crumbtrail-tauri tarball installs, and the frontend `tsc --noEmit` typechecks clean",
+        "the wizard prepends the TauriTransport init into the frontend entry, the packed crumbtrail-core tarball installs, and the frontend `tsc --noEmit` typechecks clean",
       status: "active",
     },
     {

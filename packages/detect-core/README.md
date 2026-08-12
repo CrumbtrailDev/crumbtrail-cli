@@ -19,5 +19,4 @@ Recipe targeting is a behavioral contract. Changing which file a recipe targets
 changes every pull request opened by cloud automation. Any recipe target change
 requires a minor version bump at minimum—never a patch release.
 
-Publish after `crumbtrail-core` and `crumbtrail-install-shared`, and before the
-`crumbtrail` CLI package.
+Publish after `crumbtrail-core` and before the `crumbtrail` CLI package.

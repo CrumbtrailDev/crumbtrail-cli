@@ -17,7 +17,7 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const providerRecipesPath = path.resolve(
   __dirname,
-  "../../../node/src/provider-recipes.json",
+  "../../../../node/src/provider-recipes.json",
 );
 
 interface ProviderRecipe {
