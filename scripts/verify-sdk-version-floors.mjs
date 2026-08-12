@@ -86,6 +86,18 @@ async function workspaceVersions() {
   return versions;
 }
 
+/** Does this recipe object literal declare `packageEcosystem: "pub"`? */
+function isPubRecipe(objectLiteral) {
+  if (!objectLiteral || !ts.isObjectLiteralExpression(objectLiteral)) return false;
+  return objectLiteral.properties.some(
+    (property) =>
+      ts.isPropertyAssignment(property) &&
+      propertyName(property) === "packageEcosystem" &&
+      ts.isStringLiteralLike(property.initializer) &&
+      property.initializer.text === "pub",
+  );
+}
+
 async function main() {
   const source = await fs.readFile(registryPath, "utf8");
   const file = ts.createSourceFile(registryPath, source, ts.ScriptTarget.Latest, true);
@@ -102,8 +114,13 @@ async function main() {
       floors = staticStringRecord(node.initializer, "SDK_VERSION_FLOORS");
     }
     if (ts.isPropertyAssignment(node) && propertyName(node) === "sdkPackages") {
-      for (const packageName of stringArray(node.initializer, "RECIPE_REGISTRY.sdkPackages")) {
-        installerPackages.add(packageName);
+      // Floors are an npm mechanism: they are spelled `pkg@>=x.y.z` and checked
+      // against a workspace package.json. A recipe whose SDK lives on pub.dev
+      // has neither, so it is not floor-managed and must not be demanded here.
+      if (!isPubRecipe(node.parent)) {
+        for (const packageName of stringArray(node.initializer, "RECIPE_REGISTRY.sdkPackages")) {
+          installerPackages.add(packageName);
+        }
       }
     }
     ts.forEachChild(node, visit);

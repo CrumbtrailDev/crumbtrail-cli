@@ -833,4 +833,57 @@ describe("detect", () => {
     expect(r.recipe).toBe("node");
     expect(r.otlpStack).toBeNull();
   });
+
+  it("detects a Flutter app with no package.json anywhere", () => {
+    const root = tmp({
+      "pubspec.yaml": [
+        "name: my_app",
+        "environment:",
+        "  sdk: '>=3.4.0 <4.0.0'",
+        "dependencies:",
+        "  flutter:",
+        "    sdk: flutter",
+        "",
+      ].join("\n"),
+      "lib/main.dart": "void main() {\n  runApp(const MyApp());\n}\n",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBe("flutter");
+    expect(r.entryFile).toBe(path.join(root, "lib", "main.dart"));
+    expect(r.ambiguous).toBe(false);
+    expect(r.packageJsonPath).toBeNull();
+  });
+
+  it("is ambiguous when lib/main.dart is missing", () => {
+    const root = tmp({
+      "pubspec.yaml": "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBe("flutter");
+    expect(r.entryFile).toBeNull();
+    expect(r.ambiguous).toBe(true);
+  });
+
+  it("ignores a pure Dart package, which has no widget bindings to wire", () => {
+    // A Dart CLI or server has a pubspec too. Claiming the Flutter recipe there
+    // would inject against bindings the project does not have.
+    const root = tmp({
+      "pubspec.yaml": "name: my_cli\ndependencies:\n  args: ^2.0.0\n",
+      "lib/main.dart": "void main() {}\n",
+    });
+    expect(detect(root).recipe).toBeNull();
+  });
+
+  it("wins over a JS toolchain sharing the same root", () => {
+    // A Flutter app whose repo also carries a package.json for tooling. The app
+    // that ships to a phone is the one worth wiring.
+    const root = tmp({
+      "pubspec.yaml": "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+      "lib/main.dart": "void main() {\n  runApp(const MyApp());\n}\n",
+      "package.json": JSON.stringify({ devDependencies: { vite: "5.0.0" } }),
+      "index.html": '<script type="module" src="/src/main.ts"></script>',
+      "src/main.ts": "console.log('tooling');",
+    });
+    expect(detect(root).recipe).toBe("flutter");
+  });
 });

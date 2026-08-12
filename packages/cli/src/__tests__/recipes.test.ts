@@ -300,6 +300,150 @@ describe("buildPlan — SvelteKit / Nuxt", () => {
   });
 });
 
+describe("buildPlan — Flutter", () => {
+  const MAIN = p("lib", "main.dart");
+  const SIMPLE_MAIN =
+    "import 'package:flutter/material.dart';\n\nvoid main() {\n  runApp(const MyApp());\n}\n";
+
+  it("rewrites main() so capture starts before the first frame", () => {
+    const io = fakeInjectIO({ [MAIN]: SIMPLE_MAIN });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: MAIN },
+      io,
+    );
+    // Not a prepend: the start call has to be awaited INSIDE main, before
+    // runApp, or the session id from the previous launch is never restored.
+    expect(plan.kind).toBe("rewrite");
+    expect(plan.targetPath).toBe(MAIN);
+    expect(plan.content).toContain("Future<void> main() async {");
+    expect(plan.content).toContain("await Crumbtrail.start(const CrumbtrailConfig(");
+    expect(plan.content).toContain(`endpoint: '${ENDPOINT}',`);
+    expect(plan.content!.indexOf("Crumbtrail.start")).toBeLessThan(
+      plan.content!.indexOf("runApp"),
+    );
+    expectNoKeyLiteral(plan.content);
+  });
+
+  it("reads the key at compile time, which is all Dart has", () => {
+    const io = fakeInjectIO({ [MAIN]: SIMPLE_MAIN });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: MAIN },
+      io,
+    );
+    expect(plan.content).toContain(
+      "ingestKey: String.fromEnvironment('CRUMBTRAIL_KEY'),",
+    );
+    expect(plan.keyEnvVar).toBe("CRUMBTRAIL_KEY");
+    // A released Flutter app has no runtime environment to read, so telling the
+    // user to put the key in .env would produce an app that captures nothing.
+    expect(plan.warnings.join(" ")).toContain("--dart-define=CRUMBTRAIL_KEY");
+  });
+
+  it("names the app, since one key covers the whole project", () => {
+    const io = fakeInjectIO({ [MAIN]: SIMPLE_MAIN });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "flutter",
+        endpoint: ENDPOINT,
+        entryFile: MAIN,
+        serviceName: "checkout-app",
+      },
+      io,
+    );
+    expect(plan.content).toContain("service: 'checkout-app',");
+  });
+
+  it("says navigation needs the observer, which injection cannot add", () => {
+    const io = fakeInjectIO({ [MAIN]: SIMPLE_MAIN });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: MAIN },
+      io,
+    );
+    // The observer has to be handed to the app's navigator, and the injector
+    // cannot edit a widget tree. Silence here means timelines with no screens.
+    expect(plan.warnings.join(" ")).toContain("CrumbtrailNavigatorObserver");
+  });
+
+  it("hands back DART guidance, never a JS agent prompt, when main is unusual", () => {
+    const io = fakeInjectIO({
+      [MAIN]: "void main() => runApp(const MyApp());\n",
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: MAIN },
+      io,
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.snippet).toContain("crumbtrail_flutter");
+    expect(plan.agentPrompt).toContain("flutter pub add crumbtrail_flutter");
+    // The registry stack is a typing placeholder. Emitting the JS prompt here
+    // would tell an agent to npm install into a project with no package.json.
+    expect(plan.agentPrompt).not.toContain("npm install");
+    expect(plan.agentPrompt).not.toContain("crumbtrail-core");
+    expectNoKeyLiteral(plan.agentPrompt);
+  });
+
+  it("falls back when lib/main.dart could not be resolved", () => {
+    const io = fakeInjectIO({});
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: null },
+      io,
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.warnings.join(" ")).toContain("lib/main.dart");
+  });
+
+  it("skips an app already wired, so a re-run does not wire main twice", () => {
+    const io = fakeInjectIO({
+      [MAIN]:
+        "import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';\nvoid main() {}\n",
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: MAIN },
+      io,
+    );
+    expect(plan.kind).toBe("skip-already-wired");
+  });
+
+  it("skips when the pubspec already depends on the SDK", () => {
+    // Project-level idempotency has to read the pubspec: a Flutter project has
+    // no package.json, so the JS check alone would report "not wired" forever.
+    const io = fakeInjectIO({
+      [p("pubspec.yaml")]: "dependencies:\n  crumbtrail_flutter: ^0.1.0\n",
+      [MAIN]: SIMPLE_MAIN,
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: MAIN },
+      io,
+    );
+    expect(plan.kind).toBe("skip-already-wired");
+  });
+
+  it("asks before editing a dirty main.dart, and rewrites when confirmed", () => {
+    const io = fakeInjectIO({ [MAIN]: SIMPLE_MAIN }, { dirty: [MAIN] });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: MAIN },
+      io,
+    );
+    expect(plan.kind).toBe("needs-confirm-dirty");
+    // Whole-file, not a prepended block — applying this as a prepend would
+    // duplicate the file's own contents.
+    expect(plan.applyMode).toBe("rewrite");
+
+    const forced = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "flutter",
+        endpoint: ENDPOINT,
+        entryFile: MAIN,
+        options: { force: true },
+      },
+      io,
+    );
+    expect(forced.kind).toBe("rewrite");
+  });
+});
+
 describe("buildPlan — Capacitor", () => {
   it("prepends the async init reading the Vite env key, for an Ionic React app", () => {
     const io = fakeInjectIO({

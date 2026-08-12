@@ -40,6 +40,23 @@ export interface RecipeMeta {
   stack: Stack;
   /** SDK packages the installer adds for this recipe. */
   sdkPackages: string[];
+  /**
+   * Which package registry `sdkPackages` live in. Absent means npm, which every
+   * recipe but `flutter` uses. The installer branches on this: a Dart package
+   * is added with `flutter pub add`, and npm's version floors and tarball
+   * fallback do not apply to it.
+   */
+  packageEcosystem?: "npm" | "pub";
+  /**
+   * The stack label reported to the dashboard when the `Stack` union has no id
+   * for this recipe. `Stack` is a closed vocabulary shared with the design
+   * system (it picks a brand mark from it), so widening it for a recipe is a
+   * cross-package change; the createService call accepts a plain string, and
+   * this is where a recipe says what it actually is. The telemetry behind it
+   * exists to aim SDK work, so reporting the nearest JS framework instead would
+   * defeat the point.
+   */
+  reportedStack?: string;
   /** Default service label when no workspace name overrides it. */
   serviceName: string;
   /** How the recipe is applied. */
@@ -76,6 +93,15 @@ const EXPO_KEY: KeyRef = {
 const NODE_KEY: KeyRef = {
   envVar: "CRUMBTRAIL_KEY",
   expr: "process.env.CRUMBTRAIL_KEY",
+};
+// Dart has no runtime environment lookup in a released app — `Platform.environment`
+// does not exist on iOS or Android. `String.fromEnvironment` is the compile-time
+// equivalent, substituted from `--dart-define` at build time, which is the same
+// hands-off posture as every other recipe: the key is named here and supplied by
+// the build, never written into source by the installer.
+const FLUTTER_KEY: KeyRef = {
+  envVar: "CRUMBTRAIL_KEY",
+  expr: "String.fromEnvironment('CRUMBTRAIL_KEY')",
 };
 
 /**
@@ -148,6 +174,20 @@ export const RECIPE_REGISTRY: Record<Recipe, RecipeMeta> = {
     // planCapacitor detects that host and overrides both the key expression and
     // the env var it reports — see the keyEnvVar guard in buildPlan.
     keyRef: VITE_KEY,
+  },
+  flutter: {
+    // Placeholder for typing only — `Stack` has no flutter id, and `react` is
+    // simply the nearest client-app entry in a closed JS vocabulary. Every
+    // Flutter-specific decision reads `reportedStack` or the recipe itself, and
+    // planFlutter deliberately builds its own Dart guidance rather than the
+    // JS-flavoured buildAgentPrompt output this stack would produce.
+    stack: "react",
+    reportedStack: "flutter",
+    sdkPackages: ["crumbtrail_flutter"],
+    packageEcosystem: "pub",
+    serviceName: "app",
+    kind: "inject",
+    keyRef: FLUTTER_KEY,
   },
   next: {
     stack: "nextjs",

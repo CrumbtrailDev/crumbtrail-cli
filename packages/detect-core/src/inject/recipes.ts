@@ -21,6 +21,7 @@ import {
   prependIntoSource,
   referencesCrumbtrail,
   wireExpressMiddleware,
+  wireFlutterMain,
   withTrailingNewline,
 } from "./text";
 import {
@@ -30,6 +31,9 @@ import {
   expressManualWiringSnippet,
   expressMiddlewareImportSnippet,
   expressRequestMiddlewareSnippet,
+  FLUTTER_IMPORT_LINE,
+  flutterInitLines,
+  flutterInitSnippet,
   nestInitSnippet,
   nodeInitSnippet,
   nuxtPluginSnippet,
@@ -235,6 +239,13 @@ function installedNextVersion(cwd: string, io: InjectIO): string | null {
  * that is going to be skipped anyway.
  */
 export function projectAlreadyWired(cwd: string, io: InjectIO): boolean {
+  // A Flutter project has no package.json at all, so the JS check below would
+  // report "not wired" forever and a re-run would wire main.dart twice.
+  const pubspec = io.readFile(path.join(cwd, "pubspec.yaml"));
+  if (pubspec != null && /^\s*crumbtrail_flutter\s*:/m.test(pubspec)) {
+    return true;
+  }
+
   const text = io.readFile(path.join(cwd, "package.json"));
   if (text == null) return false;
   try {
@@ -601,6 +612,116 @@ function planCapacitor(input: BuildPlanInput, io: InjectIO): Plan {
   return prependWithPreflight(input, io, entryFile, block, warnings);
 }
 
+/**
+ * Flutter.
+ *
+ * The only recipe that edits inside a function rather than prepending. Capture
+ * has to start before `runApp` and has to be awaited, so `wireFlutterMain`
+ * transforms `main`: import added, `main` made async, the start call inserted as
+ * its first statement. When the file is not in a shape that can be transformed
+ * with certainty, this hands back Dart guidance rather than a near-miss edit —
+ * a wrong guess here either fails to compile or, worse, compiles and captures
+ * nothing.
+ *
+ * It does NOT use `fallbackPlan`. That builds a JavaScript agent prompt from the
+ * registry stack, which for a Dart app would instruct an agent to install npm
+ * packages into a project that has no package.json.
+ */
+function planFlutter(input: BuildPlanInput, io: InjectIO): Plan {
+  const keyExpr = keyExprFor(input)!;
+  const snippet = flutterInitSnippet(
+    input.endpoint,
+    keyExpr,
+    input.serviceName,
+  );
+  // The key is compile-time in Dart, so it is supplied at build rather than
+  // read from a .env the app can see at runtime. Say so once, everywhere.
+  const buildNote =
+    "Flutter reads the key at build time — pass it with `--dart-define=CRUMBTRAIL_KEY=<your-ingest-key>` on `flutter run` and `flutter build` (get your key from the dashboard).";
+
+  const flutterFallback = (warnings: string[]): Plan => ({
+    recipe: input.recipe,
+    kind: "fallback-ai",
+    targetPath: null,
+    content: null,
+    snippet,
+    agentPrompt: [
+      "Wire the Crumbtrail Flutter SDK into this app.",
+      "",
+      "1. Run `flutter pub add crumbtrail_flutter`.",
+      "2. In lib/main.dart, make `main` async and await `Crumbtrail.start` before `runApp`:",
+      "",
+      snippet,
+      "",
+      "3. Add `CrumbtrailNavigatorObserver()` to the app's navigatorObservers (or the router's observers) so screen changes are captured.",
+      `4. ${buildNote}`,
+    ].join("\n"),
+    warnings,
+  });
+
+  const target = input.entryFile;
+  if (!target) {
+    return flutterFallback([
+      "Could not resolve lib/main.dart — wire it manually.",
+      buildNote,
+    ]);
+  }
+
+  const existing = io.readFile(target);
+  if (existing == null) {
+    return flutterFallback([
+      `Could not read ${target}; wire it manually.`,
+      buildNote,
+    ]);
+  }
+  if (referencesCrumbtrail(existing)) {
+    return skipPlan(input);
+  }
+
+  const wired = wireFlutterMain(
+    existing,
+    FLUTTER_IMPORT_LINE,
+    flutterInitLines(input.endpoint, keyExpr, input.serviceName),
+  );
+  if (wired == null) {
+    return flutterFallback([
+      `Could not find a single \`main()\` to wire in ${target} (an arrow-bodied main, or more than one, is not transformed automatically).`,
+      buildNote,
+    ]);
+  }
+
+  const warnings = [
+    buildNote,
+    // Errors and lifecycle are installed by start(); navigation is not, because
+    // the observer has to be handed to the app's navigator and the injector
+    // cannot edit a widget tree. Without it a timeline has no screen context.
+    "Add `CrumbtrailNavigatorObserver()` to your MaterialApp's `navigatorObservers` (or your router's `observers`) to capture screen changes.",
+  ];
+
+  const status = io.gitStatus(input.cwd, target);
+  if (status.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: target,
+      content: wired,
+      applyMode: "rewrite",
+      warnings: [
+        ...warnings,
+        `${target} has uncommitted changes — confirm (or re-run with force) before editing.`,
+      ],
+    };
+  }
+
+  return {
+    recipe: input.recipe,
+    kind: "rewrite",
+    targetPath: target,
+    content: wired,
+    warnings,
+  };
+}
+
 function planReactNative(input: BuildPlanInput, io: InjectIO): Plan {
   const block = reactNativeInitSnippet(
     input.endpoint,
@@ -710,6 +831,8 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
       return planTauri(input, io);
     case "capacitor":
       return planCapacitor(input, io);
+    case "flutter":
+      return planFlutter(input, io);
     case "react-native":
       return planReactNative(input, io);
     case "next":

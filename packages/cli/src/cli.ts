@@ -334,8 +334,25 @@ export async function installSdk(
   if (packages.length === 0) {
     return { installed: false, packages: [] };
   }
-  const { cmd, add } = pmInvocation(input.packageManager);
   const run = input.spawnFn ?? realSpawn;
+
+  // Dart packages live on pub.dev, not npm. Nothing below this branch applies to
+  // them: there is no detected package manager, no npm version floor, and the
+  // deploy's tarball fallback serves npm tarballs only.
+  if (RECIPE_REGISTRY[input.recipe].packageEcosystem === "pub") {
+    input.ui.out(
+      `Installing SDK: ${color.cyan(`flutter pub add ${packages.join(" ")}`)}`,
+    );
+    const pubCode = run("flutter", ["pub", "add", ...packages], input.cwd);
+    if (pubCode === 0) return { installed: true, packages };
+    return {
+      installed: false,
+      packages,
+      note: `\`flutter pub add ${packages.join(" ")}\` failed — check that the Flutter SDK is on your PATH, then run it yourself.`,
+    };
+  }
+
+  const { cmd, add } = pmInvocation(input.packageManager);
   // Pin the registry install to the CLI's version floors so a stale dist-tag
   // can never leave a freshly wired service on an old SDK. The tarball fallback
   // below keeps bare names (tarball URLs are resolved by name prefix).

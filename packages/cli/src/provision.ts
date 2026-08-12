@@ -249,7 +249,12 @@ export async function provisionService(
   // Prefer the DETECTED otlp stack when present; otherwise the registry stack.
   // For otlp the registry value is only a placeholder, so input.stack is what
   // actually files the service under django/flask/fastapi/go/rails/dotnet.
-  const serviceStack = input.stack ?? RECIPE_REGISTRY[input.recipe].stack;
+  // `reportedStack` covers the recipes the closed `Stack` vocabulary has no id
+  // for (flutter). Without it the service files under the placeholder the
+  // registry carries for typing, and the telemetry that exists to aim SDK work
+  // would read a Flutter app as a React one.
+  const meta = RECIPE_REGISTRY[input.recipe];
+  const serviceStack = input.stack ?? meta.reportedStack ?? meta.stack;
   const service = await createService(
     base,
     token,

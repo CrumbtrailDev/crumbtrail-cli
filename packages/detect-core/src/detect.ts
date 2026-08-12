@@ -28,6 +28,9 @@ export type Recipe =
   // running in a native WebView, so it wires the SAME web capture as its
   // underlying frontend recipe and adds the native-side context on top.
   | "capacitor"
+  // Flutter. The one recipe with no JavaScript anywhere in it: the project is a
+  // pubspec, the SDK is a pub package, and the entry is Dart.
+  | "flutter"
   | "nestjs"
   | "express"
   | "hono"
@@ -434,6 +437,31 @@ export function resolveAngularEntry(
   return reader.isFile(full) ? full : null;
 }
 
+/**
+ * Resolve the Flutter injection entry — deterministically `lib/main.dart`. Null
+ * when absent (→ ambiguous). Flutter's own tooling creates it and every template
+ * keeps it there, so a project without one is not a shape we should guess at.
+ */
+export function resolveFlutterEntry(
+  cwd: string,
+  reader: FileReader = localFsReader(cwd),
+): string | null {
+  const full = path.join(cwd, "lib", "main.dart");
+  return reader.isFile(full) ? full : null;
+}
+
+/**
+ * Is this pubspec a FLUTTER project rather than a plain Dart one?
+ *
+ * `sdk: flutter` under dependencies is the marker, and it is the right one: a
+ * pure Dart package (a CLI, a server) has a pubspec too, but none of the widget
+ * bindings this recipe injects against. Parsed as text — a YAML parser would be
+ * a dependency bought for one line.
+ */
+function isFlutterPubspec(text: string): boolean {
+  return /^\s*sdk:\s*flutter\s*$/m.test(text);
+}
+
 function mergedDeps(pkg: PackageJson | null): Record<string, string> {
   if (!pkg) return {};
   return { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
@@ -617,6 +645,24 @@ const RECIPE_MATCHERS: ReadonlyArray<
       reasons.push(
         "found `@capacitor/core` dependency and a resolvable web entry",
       );
+      return { entryFile, nextVersion: null };
+    },
+  ],
+  [
+    // Flutter, ordered with the other shell recipes and before every JS
+    // matcher. It cannot collide with them in practice — a Flutter app has no
+    // package.json, so `deps` is empty and no JS matcher can fire — but a repo
+    // that keeps a Flutter app and a JS toolchain at the same root should still
+    // wire the Flutter app, which is the thing that ships to a phone.
+    //
+    // Filesystem-only, like the `otlp` matcher: no package.json required.
+    "flutter",
+    ({ root, reasons, reader }) => {
+      const pubspec = safeRead(path.join(root, "pubspec.yaml"), reader);
+      if (pubspec == null || !isFlutterPubspec(pubspec)) return null;
+      reasons.push("found pubspec.yaml with a `sdk: flutter` dependency");
+      const entryFile = resolveFlutterEntry(root, reader);
+      if (!entryFile) reasons.push("could not resolve lib/main.dart");
       return { entryFile, nextVersion: null };
     },
   ],
@@ -905,6 +951,7 @@ export function detect(
       recipe === "hono" ||
       recipe === "fastify" ||
       recipe === "react-native" ||
+      recipe === "flutter" ||
       recipe === "node") &&
     !entryFile
   ) {

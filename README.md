@@ -19,6 +19,9 @@ them require it.
 | [`crumbtrail-react-native`](packages/react-native) | React Native and Expo bindings. |
 | [`crumbtrail-capacitor`](packages/capacitor) | Capacitor and Ionic bindings: adds device, app lifecycle, connectivity and deep link context to the web capture already running in the WebView. |
 | [`crumbtrail-tauri`](packages/tauri) | Tauri (Rust desktop) bindings. |
+| [`crumbtrail_flutter`](packages/flutter) | Flutter SDK (pub.dev). Both of Flutter's error surfaces, app lifecycle, navigation and environment. |
+| [`Crumbtrail` (Swift)](packages/swift) | Native iOS, macOS, tvOS and watchOS SDK. Swift Package Manager, no dependencies. |
+| [`ai.crumbtrail:crumbtrail-android`](packages/kotlin) | Native Android SDK in Kotlin. No transitive dependencies. |
 | [`crumbtrail-install-shared`](packages/install-shared) | Install recipes and agent prompts shared by the CLI and the dashboard. |
 | [`crumbtrail-detect-core`](packages/detect-core) | Framework detection and injection planning, shared by the CLI and cloud automation. Reads only and writes nothing. |
 

@@ -368,6 +368,51 @@ describe("wizard orchestration", () => {
 describe("installSdk — tarball fallback (registry unavailable)", () => {
   const uiSink: Ui = { out: () => {}, err: () => {} };
 
+  it("installs the Flutter SDK with pub, never a JS package manager", async () => {
+    const calls: { cmd: string; args: string[] }[] = [];
+    const result = await realInstallSdk({
+      cwd: "/app",
+      // Detection finds no lockfile in a Flutter app, and it does not matter:
+      // a Dart package is not on npm, so the package manager is irrelevant.
+      packageManager: null,
+      recipe: "flutter",
+      base: "https://deploy.example",
+      ui: uiSink,
+      spawnFn: (cmd, args) => {
+        calls.push({ cmd, args });
+        return 0;
+      },
+      fetchImpl: (async () => {
+        throw new Error("the pub path must not touch the network");
+      }) as unknown as typeof fetch,
+    });
+
+    expect(result.installed).toBe(true);
+    expect(calls).toEqual([
+      { cmd: "flutter", args: ["pub", "add", "crumbtrail_flutter"] },
+    ]);
+    // npm version floors are spelled `pkg@>=x.y.z` and mean nothing to pub.
+    expect(JSON.stringify(calls)).not.toContain(">=");
+  });
+
+  it("tells the user to check their PATH when pub add fails", async () => {
+    const result = await realInstallSdk({
+      cwd: "/app",
+      packageManager: null,
+      recipe: "flutter",
+      base: "https://deploy.example",
+      ui: uiSink,
+      spawnFn: () => 1,
+      fetchImpl: (async () => {
+        // The deploy's tarball fallback serves npm tarballs; there is nothing
+        // there for a Dart package, so it must not be attempted.
+        throw new Error("no tarball fallback for pub");
+      }) as unknown as typeof fetch,
+    });
+    expect(result.installed).toBe(false);
+    expect(result.note).toContain("Flutter SDK is on your PATH");
+  });
+
   it("falls back to the deploy's /install tarballs when the registry install fails", async () => {
     const calls: string[][] = [];
     // First (registry) install fails; the tarball-URL install succeeds.
