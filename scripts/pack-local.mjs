@@ -120,7 +120,8 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
     `core=${path.basename(core)} node=${path.basename(node)} cli=${path.basename(cli)}`,
   );
 
-  // Optional SDK channels: react + react-native + tauri. Best-effort — a
+  // Optional SDK channels: react + react-native + capacitor + tauri.
+  // Best-effort — a
   // missing/broken pack warns and is simply absent from the manifest (the
   // installer stays fully functional for the core trio; the wizard's tarball
   // fallback for that SDK is just unavailable until the pack succeeds).
@@ -136,6 +137,12 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
     outDir,
     logFn,
   });
+  const capacitor = await packOptional({
+    filter: "crumbtrail-capacitor",
+    packageDir: path.join(repoRoot, "packages", "capacitor"),
+    outDir,
+    logFn,
+  });
   const tauri = await packOptional({
     filter: "crumbtrail-tauri",
     packageDir: path.join(repoRoot, "packages", "tauri"),
@@ -145,7 +152,7 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
   logFn(
     "pack-optional",
     "pass",
-    `react=${react ? path.basename(react) : "(absent)"} reactNative=${reactNative ? path.basename(reactNative) : "(absent)"} tauri=${tauri ? path.basename(tauri) : "(absent)"}`,
+    `react=${react ? path.basename(react) : "(absent)"} reactNative=${reactNative ? path.basename(reactNative) : "(absent)"} capacitor=${capacitor ? path.basename(capacitor) : "(absent)"} tauri=${tauri ? path.basename(tauri) : "(absent)"}`,
   );
 
   const manifest = {
@@ -159,6 +166,7 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
     // discovery only resolves them when listed).
     ...(react ? { react } : {}),
     ...(reactNative ? { reactNative } : {}),
+    ...(capacitor ? { capacitor } : {}),
     ...(tauri ? { tauri } : {}),
   };
   const manifestPath = path.join(outDir, "pack-manifest.json");

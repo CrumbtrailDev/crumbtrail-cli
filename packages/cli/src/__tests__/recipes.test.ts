@@ -300,6 +300,107 @@ describe("buildPlan — SvelteKit / Nuxt", () => {
   });
 });
 
+describe("buildPlan — Capacitor", () => {
+  it("prepends the async init reading the Vite env key, for an Ionic React app", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("src", "main.tsx")]: "createRoot(document.body);\n",
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "capacitor",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.tsx"),
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.content).toContain("createCapacitorCrumbtrailAsync");
+    expect(plan.content).toContain(`httpEndpoint: "${ENDPOINT}"`);
+    expect(plan.content).toContain(
+      "httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY",
+    );
+    expectNoKeyLiteral(plan.content);
+    expect(plan.keyEnvVar).toBe("VITE_CRUMBTRAIL_KEY");
+  });
+
+  it("never leaves a floating rejection at the top of the entry file", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("src", "main.tsx")]: "createRoot(document.body);\n",
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "capacitor",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.tsx"),
+      },
+      io,
+    );
+    expect(plan.content).toContain(".catch(() => {});");
+  });
+
+  it("reads environment.ts and reports no env var for an Ionic Angular app", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("src", "main.ts")]: "platformBrowserDynamic();\n",
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "capacitor",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.content).toContain("httpAuthToken: environment.crumbtrailKey");
+    // An Angular browser build cannot read a VITE_ var, so reporting one would
+    // send the user to configure something with no effect.
+    expect(plan.content).not.toContain("import.meta.env");
+    expect(plan.keyEnvVar).toBeUndefined();
+    expect(plan.warnings.join(" ")).toContain("environment.ts");
+  });
+
+  it("tells the user which optional plugins produce which context", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("src", "main.tsx")]: "createRoot(document.body);\n",
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "capacitor",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.tsx"),
+      },
+      io,
+    );
+    const warnings = plan.warnings.join(" ");
+    expect(warnings).toContain("@capacitor/device");
+    expect(warnings).toContain("cap sync");
+  });
+
+  it("falls back to AI when the Capacitor web entry is unresolved", () => {
+    const io = fakeInjectIO({ [p("package.json")]: "{}" });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "capacitor",
+        endpoint: ENDPOINT,
+        entryFile: null,
+      },
+      io,
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.snippet).toContain("createCapacitorCrumbtrailAsync");
+    expectNoKeyLiteral(plan.agentPrompt);
+  });
+});
+
 describe("buildPlan — React Native", () => {
   it("prepends the imperative createReactNativeCrumbtrail block reading the Expo env key", () => {
     const io = fakeInjectIO({

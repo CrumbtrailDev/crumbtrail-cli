@@ -239,6 +239,38 @@ export function reactNativeInitSnippet(
 }
 
 /**
+ * Capacitor / Ionic init block. Prepended into the web entry.
+ *
+ * Calls `createCapacitorCrumbtrailAsync`, which runs `Crumbtrail.init` for the
+ * normal web capture and then attaches the native collectors. The async form is
+ * the injected one on purpose: it restores a session id persisted by a previous
+ * launch before init, and without that every cold start opens a fresh session,
+ * so a once-a-day intermittent bug never accumulates into one signature.
+ *
+ * `.catch(() => {})` because this is prepended at the very top of an entry file
+ * — a rejected floating promise there would surface as an unhandled rejection
+ * in the app's own error reporting, and telemetry setup must never do that.
+ */
+export function capacitorInitSnippet(
+  endpoint: string,
+  keyExpr: string,
+  serviceName?: string | null,
+): string {
+  return [
+    'import { createCapacitorCrumbtrailAsync } from "crumbtrail-capacitor";',
+    "",
+    "createCapacitorCrumbtrailAsync({",
+    "  config: {",
+    `    httpEndpoint: ${JSON.stringify(endpoint)},`,
+    `    httpAuthToken: ${keyExpr},`,
+    ...serviceLines(serviceName, "    ", JSON.stringify),
+    "  },",
+    "})",
+    "  .catch(() => {});",
+  ].join("\n");
+}
+
+/**
  * Tauri init block. Prepended into the frontend entry. Uses the core
  * `transportInstance` override (NOT the `transport` string-mode field) with a
  * `TauriTransport`, which routes bug reports to the local Rust store via the

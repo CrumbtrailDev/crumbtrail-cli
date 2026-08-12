@@ -24,6 +24,10 @@ export type Recipe =
   | "astro"
   | "angular"
   | "vite-spa"
+  // Capacitor / Ionic. A shell recipe like `tauri`: the app is a web build
+  // running in a native WebView, so it wires the SAME web capture as its
+  // underlying frontend recipe and adds the native-side context on top.
+  | "capacitor"
   | "nestjs"
   | "express"
   | "hono"
@@ -589,6 +593,30 @@ const RECIPE_MATCHERS: ReadonlyArray<
         reasons.push(
           "could not resolve a local frontend entry from index.html",
         );
+      return { entryFile, nextVersion: null };
+    },
+  ],
+  [
+    // Capacitor / Ionic, ordered directly after `tauri` and before every
+    // frontend matcher. A Capacitor app is ALSO a Vite or Angular app, so
+    // whichever matcher runs first wins — and the phone build is the more
+    // specific fact, since it is the one that changes what capture is possible
+    // (device, lifecycle, radio, deep links).
+    //
+    // The matcher returns null rather than a null entry when it cannot resolve
+    // a web entry it understands. That is deliberate: falling through leaves a
+    // Next-plus-Capacitor project on the working `next` recipe with web-only
+    // capture, which is strictly better than claiming the Capacitor recipe and
+    // then handing back guidance.
+    "capacitor",
+    ({ root, deps, reasons, reader }) => {
+      if (!("@capacitor/core" in deps)) return null;
+      const entryFile =
+        resolveViteEntry(root, reader) ?? resolveAngularEntry(root, reader);
+      if (!entryFile) return null;
+      reasons.push(
+        "found `@capacitor/core` dependency and a resolvable web entry",
+      );
       return { entryFile, nextVersion: null };
     },
   ],

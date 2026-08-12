@@ -101,6 +101,9 @@ export const SDK_VERSION_FLOORS: Record<string, string> = {
   "crumbtrail-core": "0.15.0",
   "crumbtrail-node": "0.26.0",
   "crumbtrail-react-native": "0.3.2",
+  // 0.1.0 is the first published release; there is no older SDK to guard
+  // against, so the floor simply names the package's opening version.
+  "crumbtrail-capacitor": "0.1.0",
   "crumbtrail-tauri": "0.3.2",
 };
 
@@ -134,6 +137,17 @@ export const RECIPE_REGISTRY: Record<Recipe, RecipeMeta> = {
     sdkPackages: ["crumbtrail-core", "crumbtrail-tauri"],
     serviceName: "app",
     kind: "inject",
+  },
+  capacitor: {
+    stack: "vite", // no "capacitor" Stack id — vite is the closest generic frontend stack
+    sdkPackages: ["crumbtrail-core", "crumbtrail-capacitor"],
+    serviceName: "app",
+    kind: "inject",
+    // Vite-based Ionic/Capacitor apps (React, Vue, vanilla) read
+    // import.meta.env. An Ionic ANGULAR app has no such mechanism, so
+    // planCapacitor detects that host and overrides both the key expression and
+    // the env var it reports — see the keyEnvVar guard in buildPlan.
+    keyRef: VITE_KEY,
   },
   next: {
     stack: "nextjs",
