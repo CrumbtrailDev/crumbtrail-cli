@@ -144,6 +144,25 @@ export type {
   EvidenceQuery,
   EvidenceSourceResult,
 } from "./evidence-source";
+export {
+  PROBE_NAMES,
+  PROBE_DEFAULT_TIMEOUT_MS,
+  PROBE_MAX_TIMEOUT_MS,
+  PROBE_DEFAULT_MAX_ROWS,
+  PROBE_MAX_MAX_ROWS,
+  PROBE_DEFAULT_MAX_BYTES,
+  PROBE_MAX_MAX_BYTES,
+  isProbeName,
+  runProbe,
+} from "./probes";
+export type {
+  ProbeName,
+  ProbeResult,
+  ProbeContext,
+  ProbeEnvDeclaration,
+  ProbeStorageArea,
+  ProbeStorageLike,
+} from "./probes";
 export { STACK_IDS } from "./stacks";
 export type { Stack } from "./stacks";
 export {
