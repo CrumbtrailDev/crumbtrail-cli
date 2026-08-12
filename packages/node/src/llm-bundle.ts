@@ -712,8 +712,15 @@ export interface LlmBundle {
  * store's full detector census belongs to the store, not to one incident's brief.
  */
 export interface LlmBundleDetectorPrevalence {
-  /** Sessions in the store other than this one that the scan read — the denominator. */
+  /** Sessions other than this one that the scan actually READ — the denominator. */
   priorSessions: number;
+  /**
+   * Present and true only when the store held more prior sessions than the scan is allowed to read
+   * and the most recent were taken. Then `priorSessions` is the scanned slice, not the store, and
+   * both the cell and the paragraph that explains it must name the slice. Omitted entirely when the
+   * whole store was read, so a complete measurement carries no field at all rather than a `false`.
+   */
+  truncated?: boolean;
   /** Per detector present in this session, how many of those prior sessions it fired in. */
   detectors: Array<{ detector: string; priorSessionsFiredIn: number }>;
 }
@@ -4976,7 +4983,18 @@ function renderDetectedSignalsSection(
       + "too few sessions are recorded yet to say anything, which is where every application "
       + "starts. Read a low count as \"rarely seen in what has been recorded\" — the store knows "
       + "only the sessions it holds, so it is never proof that a finding is new. Nothing here "
-      + "moves a row: the table is ordered exactly as it would be without this column.",
+      + "moves a row: the table is ordered exactly as it would be without this column."
+      // Appended ONLY when the scan was capped, and the paragraph above is byte-identical when it
+      // was not. The sentence above says the denominator is the sessions recorded for this
+      // application; under a cap that is false, and a truthful cell under a false paragraph is
+      // still a fabricated number. The count and its denominator travel together — so the
+      // denominator's MEANING has to travel with them too.
+      + (prevalence?.truncated === true
+        ? " This store holds more sessions than one bundle is allowed to read, so the counts "
+          + `above were measured over the ${prevalence.priorSessions} MOST RECENT prior sessions `
+          + "only, chosen by their recorded date. The denominator names exactly what was read: "
+          + "nothing here says anything about the older sessions, in either direction."
+        : ""),
     "",
     table(
       [
@@ -5063,7 +5081,11 @@ function projectDetectorPrevalence(
       priorSessionsFiredIn: prevalence.firedIn[detector] ?? 0,
     });
   }
-  return { priorSessions: prevalence.priorSessions, detectors };
+  return {
+    priorSessions: prevalence.priorSessions,
+    ...(prevalence.truncated === true ? { truncated: true } : {}),
+    detectors,
+  };
 }
 
 /**
@@ -5079,6 +5101,11 @@ function projectDetectorPrevalence(
  * A measured zero, by contrast, IS printed: `0 of 47 prior sessions` is something the store
  * actually observed, and the difference between that and a blank cell is the difference between a
  * measurement and a missing one.
+ *
+ * When the scan was capped the cell names the SCANNED set and nothing else — `3 of 200 most recent
+ * prior sessions`. It never names the store's size, because the scan did not look at the rest of
+ * the store, and a denominator that quietly stands for sessions nobody read is the same fabricated
+ * number this cell exists to avoid, wearing a bigger figure.
  */
 function detectorBaseRateCell(
   bug: DistinctBug,
@@ -5089,7 +5116,8 @@ function detectorBaseRateCell(
     (row) => row.detector === bug.representative.detector,
   );
   if (!entry) return "";
-  return `${entry.priorSessionsFiredIn} of ${prevalence.priorSessions} prior sessions`;
+  const scope = prevalence.truncated === true ? "most recent prior" : "prior";
+  return `${entry.priorSessionsFiredIn} of ${prevalence.priorSessions} ${scope} sessions`;
 }
 
 /**
