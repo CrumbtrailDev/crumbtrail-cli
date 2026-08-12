@@ -121,3 +121,7 @@ scripts/.out/
 # Swift Package Manager build output
 packages/swift/.build/
 packages/swift/.swiftpm/
+
+# Kotlin / Gradle build output
+packages/kotlin/build/
+packages/kotlin/.gradle/
