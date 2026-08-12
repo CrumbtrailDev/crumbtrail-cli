@@ -28,7 +28,7 @@
 
 import { buildEnvSnapshot } from "./collectors/environment";
 import {
-  redactStorageKey,
+  redactProbeStorageKey,
   redactStoredValue,
   redactTokenLikeString,
   redactUrl,
@@ -375,9 +375,20 @@ const runtimeEnvProbe: ProbeFn = async (_ctx, signal) => {
 };
 
 /**
- * What the app has stashed in Web Storage. Keys and values cross exactly the redaction path the
- * storage collector uses, so a probe can never surface a value the collector would have masked. The
- * raw byte length survives redaction, because "this key holds 40KB" is the useful part.
+ * What the app has stashed in Web Storage right now.
+ *
+ * Read this one against who answers it. A probe is taken by whichever application instance polls
+ * next, so the storage described here belongs to some visitor who is present, not to the session an
+ * agent is investigating and not to anyone involved in the defect. That makes the ordinary storage
+ * collector's key handling wrong here: the collector is recording the session that actually hit the
+ * bug, so it can emit a key verbatim, and `session:alice@example.com:cart` from a bystander is a
+ * different thing entirely.
+ *
+ * So keys go through {@link redactProbeStorageKey}, which keeps the shape and drops every span that
+ * could name a person, and values go through the collector's `redactStoredValue`, which replaces
+ * every non empty value unconditionally. What is left answers the question the probe is for: which
+ * keys exist, how many, and which patterns they follow. The raw byte length survives redaction,
+ * because "this key holds 40KB" is the useful part.
  */
 const storageSnapshotProbe: ProbeFn = async (ctx, signal) => {
   const supplied = ctx.getStorageAreas
@@ -396,7 +407,7 @@ const storageSnapshotProbe: ProbeFn = async (ctx, signal) => {
       const key = storage.key(index);
       if (key === null) continue;
       const raw = storage.getItem(key);
-      const keyResult = redactStorageKey(key, `${label}.key`);
+      const keyResult = redactProbeStorageKey(key, `${label}.key`);
       const valueResult = redactStoredValue(raw, {
         key,
         path: `${label}.${keyResult.value}.value`,

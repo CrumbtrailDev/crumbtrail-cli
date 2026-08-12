@@ -524,3 +524,91 @@ describe("runtime.env", () => {
     expect(result.latencyMs).toBeGreaterThanOrEqual(0);
   });
 });
+
+/**
+ * A probe is answered by whichever application instance polls next, so the storage it describes
+ * belongs to a bystander rather than to the session under investigation. These fix the line between
+ * the shape of a key, which is the probe's whole product, and the part of a key that names a
+ * person, which was never the question.
+ */
+describe("storage.snapshot keys from an uninvolved visitor", () => {
+  async function keysFor(...keys: string[]): Promise<string[]> {
+    const result = await runProbe("storage.snapshot", {
+      getStorageAreas: areas({
+        area: "localStorage",
+        storage: fakeStorage(keys.map((key) => [key, "x"] as [string, string])),
+      }),
+    });
+    expect(result.ok).toBe(true);
+    return result.rows.map((row) => String(row[1]));
+  }
+
+  it("never emits an email address carried in a key", async () => {
+    const [treated] = await keysFor("cart:alice@example.com:items");
+
+    expect(treated).toBe("cart:*:items");
+    expect(treated).not.toContain("alice");
+    expect(treated).not.toContain("example.com");
+  });
+
+  it("never emits a numeric id carried in a key", async () => {
+    const [prefs, order] = await keysFor("user_12345_prefs", "order#A1B2C3-4455");
+
+    expect(prefs).toBe("user_*_prefs");
+    expect(order).toBe("order#*-*");
+    expect(prefs).not.toContain("12345");
+    // Judged as one span, so the order code cannot leak a letter at a time either.
+    expect(order).not.toMatch(/A|B|C|1|2|3|4455/);
+  });
+
+  it("never emits a phone number carried in a key", async () => {
+    const [treated] = await keysFor("checkout|4155550123|draft");
+
+    expect(treated).toBe("checkout|*|draft");
+    expect(treated).not.toContain("4155550123");
+  });
+
+  it("keeps two different key patterns apart, and keeps the count", async () => {
+    const treated = await keysFor(
+      "session:alice@example.com:cart",
+      "session:bob@example.com:cart",
+      "profile_9001_avatar",
+      "theme",
+    );
+
+    expect(treated).toEqual([
+      "session:*:cart",
+      "session:*:cart",
+      "profile_*_avatar",
+      "theme",
+    ]);
+    // One row per key, so "how many keys exist" survives even where two of them share a pattern.
+    expect(treated).toHaveLength(4);
+    expect(new Set(treated).size).toBe(3);
+  });
+
+  it("reports a key with no structural word left as a redacted key, not as punctuation", async () => {
+    const [email, digits] = await keysFor("bob.smith@corp.io", "user12345");
+
+    expect(email).toBe(REDACTED_STORAGE_KEY);
+    expect(digits).toBe(REDACTED_STORAGE_KEY);
+  });
+
+  it("still redacts every stored value unconditionally", async () => {
+    const result = await runProbe("storage.snapshot", {
+      getStorageAreas: areas({
+        area: "localStorage",
+        storage: fakeStorage([
+          ["theme", "dark"],
+          ["cart:items", "[{\"sku\":\"A\"}]"],
+        ]),
+      }),
+    });
+
+    expect(result.rows.map((row) => row[2])).toEqual([
+      REDACTED_VALUE,
+      REDACTED_VALUE,
+    ]);
+    expect(JSON.stringify(result)).not.toContain("dark");
+  });
+});

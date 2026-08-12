@@ -202,6 +202,21 @@ probe never throws: a failure rests as a `probe.result` carrying `ok: false` and
 because "this source was not available in production" is itself an answer. Values pass through the
 same redaction the rest of capture uses.
 
+A probe is answered by whichever application instance is polling when the request goes out. That is
+not the session an agent is investigating, and by the time a bundle is being read that session has
+ended, so a probe reports on a bystander rather than on the person who hit the defect. Read every
+reading as "the app looks like this right now", never as "the failing session looked like this".
+
+`storage.snapshot` is the reading where that distinction changes what is emitted, so its keys get a
+stricter treatment than the ordinary storage capture uses. It reports which keys exist, how many,
+what pattern each follows and how many bytes each holds. It does not report any stored value, which
+is replaced unconditionally, and it does not report the identifying part of a key: an email address,
+a user id, an order number, a phone number or any other span that could carry a value is replaced
+with `*`, so `session:alice@example.com:cart` is reported as `session:*:cart`. A key from which no
+ordinary word survives is reported as `[REDACTED_KEY]`. A plain word in a key is kept, which is what
+makes two patterns tellable apart, so a key that spells out a person's name in ordinary letters is
+the one case this cannot catch.
+
 ### Response body summaries (`net.res`)
 
 `net.res` keeps carrying the redacted response body as text in `d.body`. It also

@@ -2312,6 +2312,138 @@ export function redactStorageKey(
   return { value: key };
 }
 
+/**
+ * What stands in for one identifying segment of a probed storage key. A glob, because the treated
+ * key is read as a pattern: `session:*:cart` says a `session:<something>:cart` key exists without
+ * saying whose.
+ */
+export const REDACTED_KEY_SEGMENT = "*";
+
+/** Runs of anything that is not a letter or a digit. These are the key's structure. */
+const PROBE_KEY_SEPARATOR_RE = /([^A-Za-z0-9]+)/;
+
+/**
+ * An email inside a key, matched without crossing the separators a key is built from, so
+ * `session:alice@example.com:cart` yields `alice@example.com` and not `session:alice@example.com`.
+ */
+const PROBE_KEY_EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+
+/** Longest key treated. Beyond this the tail is dropped rather than walked. */
+const PROBE_KEY_MAX_LENGTH = 128;
+
+/** Longest word kept verbatim. A longer run of letters is not a word, it is a value. */
+const PROBE_KEY_MAX_WORD_LENGTH = 24;
+
+/**
+ * Uppercase letters a kept word may carry. `userPrefs` and `APIKey` pass; `ABCDEFGH`, which is a
+ * value wearing a word's clothes, does not.
+ */
+const PROBE_KEY_MAX_UPPERCASE = 4;
+
+function isPlainKeyWord(span: string): boolean {
+  if (span.length === 0 || span.length > PROBE_KEY_MAX_WORD_LENGTH) return false;
+  if (/[0-9]/.test(span)) return false;
+  let uppercase = 0;
+  for (let index = 0; index < span.length; index += 1) {
+    const code = span.charCodeAt(index);
+    if (code >= 65 && code <= 90) uppercase += 1;
+  }
+  if (uppercase > PROBE_KEY_MAX_UPPERCASE) return false;
+  return redactTokenLikeString(span).value === span;
+}
+
+/**
+ * A storage key on its way out of an *uninvolved* browser.
+ *
+ * A live probe is answered by whichever application instance polls next, which is not the session
+ * an agent is investigating and not a person who has anything to do with the defect. The ordinary
+ * storage collector can afford to emit a key verbatim, because it is recording the session that
+ * actually hit the bug. A probe cannot, so this is a second, stricter treatment and
+ * {@link redactStorageKey} is deliberately left alone.
+ *
+ * What survives is the key's shape and nothing else: separators verbatim, plain words verbatim, and
+ * {@link REDACTED_KEY_SEGMENT} for every span that could name a person or carry a value. An email is
+ * removed first, because its local part and domain are otherwise ordinary words. After that a span
+ * of letters and digits is judged whole, so `order#A1B2C3` cannot leak `A`, `B` and `C` one letter
+ * at a time.
+ *
+ * The result answers what the probe is for, which is which keys exist, how many, and which patterns
+ * they follow, and refuses the part that was never the question. A key from which no word survives
+ * is reported as {@link REDACTED_STORAGE_KEY} rather than as a skeleton of punctuation.
+ *
+ * A key with no separator has no pattern to preserve, so structure preservation buys nothing there
+ * and the collector's stricter whole key verdict is kept instead. That is why a bare `refreshToken`
+ * is still reported as {@link REDACTED_STORAGE_KEY}.
+ *
+ * Known limit: a bare given name in a key, as in `cart:alice:items`, is indistinguishable from a
+ * route word and is kept. Detecting it would need a name list, and every name list is both wrong
+ * and enormous.
+ */
+export function redactProbeStorageKey(
+  key: string,
+  path = "storage.key",
+): RedactionResult<string> {
+  if (key === "") return { value: "" };
+
+  const bounded = key.slice(0, PROBE_KEY_MAX_LENGTH);
+
+  // A key that carries a token shape is a value, not a name, and a value has no pattern worth
+  // preserving. Checked over the whole key, so a token spanning several spans is caught too.
+  if (redactTokenLikeString(bounded, path).metadata) {
+    return withMetadata(REDACTED_STORAGE_KEY, {
+      path,
+      reason: "storage_key_token_like",
+      action: "redacted",
+    });
+  }
+
+  // Nothing to preserve in a key with no separators, so the collector's stricter verdict stands.
+  if (/^[A-Za-z0-9]+$/.test(bounded)) {
+    const collectorResult = redactStorageKey(bounded, path);
+    if (collectorResult.value !== bounded) return collectorResult;
+  }
+
+  PROBE_KEY_EMAIL_RE.lastIndex = 0;
+  const withoutEmails = bounded.replace(
+    PROBE_KEY_EMAIL_RE,
+    REDACTED_KEY_SEGMENT,
+  );
+
+  let redactedSpans = withoutEmails === bounded ? 0 : 1;
+  let keptWords = 0;
+
+  const treated = withoutEmails
+    .split(PROBE_KEY_SEPARATOR_RE)
+    .map((part, index) => {
+      // `split` with one capture group alternates content, separator, content, ...
+      if (index % 2 === 1) return part;
+      if (part === "") return part;
+      if (isPlainKeyWord(part)) {
+        keptWords += 1;
+        return part;
+      }
+      redactedSpans += 1;
+      return REDACTED_KEY_SEGMENT;
+    })
+    .join("");
+
+  if (keptWords === 0) {
+    return withMetadata(REDACTED_STORAGE_KEY, {
+      path,
+      reason: "probe_storage_key",
+      action: "redacted",
+    });
+  }
+
+  if (redactedSpans === 0 && treated === key) return { value: key };
+
+  return withMetadata(treated, {
+    path,
+    reason: "probe_storage_key_segment",
+    action: "redacted",
+  });
+}
+
 export function redactStoredValue(
   value: string | null | undefined,
   options: StoredValueRedactionOptions = {},
