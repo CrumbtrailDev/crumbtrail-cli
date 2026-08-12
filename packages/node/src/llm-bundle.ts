@@ -4867,14 +4867,25 @@ function renderDetectedSignalsSection(bugs: DistinctBug[] | undefined): string[]
       + "reported symptom can have no signal at all. Read them as leads to confirm against the "
       + "evidence above, and treat the absence of a signal as no evidence either way.",
     "",
+    "`Support` is how much of THIS session's evidence stands behind the finding, which severity "
+      + "cannot say: `corroborated` and `attached` mean the signal was connected to the rest of the "
+      + "session, `unattached` means the tooling measured it but could not connect it to anything "
+      + "here — so it may be a pre-existing condition rather than the cause of the reported symptom, "
+      + "and it is not ranked any lower for it — and `not-assessed` means no causal attribution ran, "
+      + "so the question was never asked.",
+    "",
     table(
-      ["Offset", "Severity", "Detector", "Finding", "Where"],
+      ["Offset", "Severity", "Detector", "Support", "Finding", "Where"],
       shown.map((bug) => [
         bug.window?.start !== undefined && bug.firstSeen !== undefined
           ? `${bug.firstSeen - bug.window.start} ms`
           : "unknown",
         bug.severity,
         bug.representative.detector,
+        // Absent when the candidate predates the grade (an artifact written by an older SDK). That
+        // reads the same way to the reader as a session nothing was attributed for: nobody told
+        // them. It must never silently render as if the signal had been placed.
+        bug.representative.support ?? "not-assessed",
         // Title AND message. A detector puts the specifics in whichever of the two it has — the
         // click detector names the covered control in its title and carries no message at all, so
         // preferring one over the other drops the part that identifies the defect.

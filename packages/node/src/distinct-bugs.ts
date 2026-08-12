@@ -1,6 +1,6 @@
 import { hashString } from "crumbtrail-core";
 import type { BugEvent, TargetDescriptor } from "crumbtrail-core";
-import type { EvidenceCandidate } from "./evidence-index";
+import type { EvidenceCandidate, SupportGrade } from "./evidence-index";
 import { redactedNetworkBodySnippet } from "./network-body";
 
 export const DISTINCT_BUGS_SCHEMA_VERSION = 1 as const;
@@ -54,6 +54,18 @@ export interface DistinctBug {
      * so it travels with the bug rather than staying behind on the candidate.
      */
     frame?: string;
+    /**
+     * How much of the session's evidence stands behind THIS representative — carried from the
+     * representative candidate, never aggregated over the cluster.
+     *
+     * It lives here, beside `title` and `detector`, because those come from the representative too
+     * while `DistinctBug.severity` is a cluster MAX. A support grade taken as a cluster max would
+     * print a reassuring word next to a headline belonging to a member the graph could not place
+     * at all — the same defect this field exists to close, one field over. Keying a reader-facing
+     * string on the wrong member of a group is a mistake this codebase has already made and paid
+     * for once.
+     */
+    support?: SupportGrade;
     /** Bounded, redacted payload evidence for this representative's failed request. */
     bodySnippet?: { request?: string; response?: string };
   };
@@ -477,6 +489,7 @@ function buildBug(cluster: Cluster, events: BugEvent[]): DistinctBug {
       target: representative.anchor.target,
       requestId: representative.anchor.requestId,
       frame: representative.anchor.frame,
+      support: representative.support,
       bodySnippet: failedRequestBodySnippet(representative, events),
     }) as DistinctBug["representative"],
     frontendEvidence,
