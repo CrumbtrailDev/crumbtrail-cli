@@ -11187,6 +11187,73 @@ function listenerCountsByType(
   return counts.size > 0 ? counts : undefined;
 }
 
+/**
+ * Cumulative registrations and removals per event type, when the capture
+ * carries them.
+ *
+ * `undefined` means the reading does not record churn — an older SDK, or a
+ * bundle captured before the collector kept these counters. It NEVER means the
+ * counters were zero, and no caller may render it as zero: "nothing was
+ * removed" and "removals were not counted" are different statements, and only
+ * one of them is evidence.
+ */
+function listenerChurnByType(
+  event: BugEvent,
+): Map<string, { added: number; removed: number }> | undefined {
+  const churnByType = event.d.churnByType;
+  if (!Array.isArray(churnByType)) return undefined;
+  const churn = new Map<string, { added: number; removed: number }>();
+  for (const entry of churnByType) {
+    if (!Array.isArray(entry) || entry.length < 3) continue;
+    const type = safeText(entry[0], 60);
+    const added = finiteNumber(entry[1]);
+    const removed = finiteNumber(entry[2]);
+    if (!type || added === undefined || removed === undefined) continue;
+    churn.set(type, { added, removed });
+  }
+  return churn.size > 0 ? churn : undefined;
+}
+
+/**
+ * What the census RECORDED about one event type between two readings, as a
+ * sentence — or the honest statement that it recorded nothing, when either
+ * reading lacks the counters.
+ *
+ * The span is the whole session between the two readings rather than the path
+ * they were taken on, and that is stated. It is also arithmetically consistent
+ * with the live figures either way: the live counts in `byType` are session
+ * totals read at those two moments, so registrations minus removals over the
+ * span is exactly the change in the live count.
+ */
+function describeListenerChurn(
+  type: string,
+  first: BugEvent,
+  last: BugEvent,
+): string {
+  const before = listenerChurnByType(first)?.get(type);
+  const after = listenerChurnByType(last)?.get(type);
+  if (!before || !after) {
+    return (
+      `This capture records the live count only — registrations and removals were not ` +
+      `counted separately — so whether any cleanup ran is not observed here. The same rising ` +
+      `curve is produced by a subscription per mount that is never removed, and by one whose ` +
+      `removals simply do not keep up.`
+    );
+  }
+  const added = Math.max(0, after.added - before.added);
+  const removed = Math.max(0, after.removed - before.removed);
+  const observed =
+    `Over that span the census recorded ${added} registration${added === 1 ? "" : "s"} ` +
+    `of a "${type}" listener and ${removed} removal${removed === 1 ? "" : "s"}, across the whole session.`;
+  if (removed === 0) {
+    return (
+      `${observed} No removal of a "${type}" listener was recorded at any point in it, so ` +
+      `nothing in the session was seen to release one.`
+    );
+  }
+  return `${observed} Removals were recorded, but fewer than registrations over the same span.`;
+}
+
 /** Arrivals at one path that must show the staircase before it is a trend. */
 const LISTENER_STAIRCASE_MIN_VISITS = 3;
 /** Minimum growth for one event type across those arrivals. */
@@ -11245,6 +11312,7 @@ function addListenerTypeStaircaseCandidates(
       }
       const delta = series[series.length - 1] - series[0];
       if (!monotone || delta < LISTENER_STAIRCASE_MIN_DELTA) continue;
+      const first = readings[0].event;
       const last = readings[readings.length - 1].event;
       drafts.push({
         detector: "listener_growth",
@@ -11260,9 +11328,9 @@ function addListenerTypeStaircaseCandidates(
           message:
             `Across ${readings.length} arrivals at ${path}, live "${type}" listeners ` +
             `went ${series[0]} → ${series[series.length - 1]} and never decreased. ` +
-            `A subscription made on every mount with no cleanup on unmount produces exactly ` +
-            `this staircase; each leaked handler still fires, so work is repeated once per ` +
-            `earlier visit.`,
+            `${describeListenerChurn(type, first, last)} ` +
+            `Every handler still registered fires again on each event, so the work is ` +
+            `repeated once per earlier visit.`,
         }),
         dedupeKey: `listenerstaircase:${path}:${type}`,
       });

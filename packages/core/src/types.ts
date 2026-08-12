@@ -168,8 +168,25 @@ export const UI_NUM_EVENT_KIND = "ui.num" as const;
 
 /**
  * Canonical event kind for the live event-listener gauge (`k:'ui.listeners'`).
- * Payload: `{ total, byType: [[type, count], …], url }` — counts only, never a
- * reference to a target or a listener.
+ * Payload: `{ total, byType: [[type, count], …], churnByType: [[type,
+ * registrations, removals], …], stk: [[type, stack], …], url }` — counts, and
+ * a bounded number of registration call stacks. Never a reference to a target
+ * or a listener, and never the listener's own code.
+ *
+ * `stk` is a NEW data class on this event: application stack text, in the same
+ * shape and under the same redaction as the request lane's `stk`. It is bounded
+ * four ways — the first registration per (target kind, event type) only, a cap
+ * on how many keys are ever captured for, a few frames and a character ceiling
+ * per stack, and at most a couple of sites per gauge, each reported once per
+ * session. On engines without `Error.captureStackTrace` it is absent rather
+ * than guessed at.
+ *
+ * `byType` is the LIVE count per event type; `churnByType` carries the
+ * CUMULATIVE registrations and removals for the same types, in the same order,
+ * so a rising live count can be read as what it was — registrations that were
+ * never matched by removals, or registrations outpacing them — rather than
+ * inferred. Its absence on a reading means the counters were not captured,
+ * which is not the same as zero removals.
  */
 export const UI_LISTENERS_EVENT_KIND = "ui.listeners" as const;
 

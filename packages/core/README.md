@@ -301,11 +301,33 @@ counting and stops quoting, so the close event still reports the true totals.
 
 The `listeners` collector is **on by default** and disabled by `PRESET_LIGHT`.
 It patches `addEventListener` and `removeEventListener` to keep a running count
-per event type, and emits `{ total, byType, url }` on every navigation and
-whenever the total grows by 25 since the last reading. That makes a view which
-re-subscribes on every render and never unsubscribes visible before it starts
-firing handlers twice. It stores counts only, never a target or a listener, and
-only sees registrations made after `init()`.
+per event type, and emits `{ total, byType, churnByType, stk, url }` on every
+navigation and whenever the total grows by 25 since the last reading. That makes
+a view which re-subscribes on every render and never unsubscribes visible before
+it starts firing handlers twice. It only sees registrations made after `init()`.
+
+`byType` is the LIVE count per event type. `churnByType` carries the cumulative
+registrations and removals for the same types, in the same order, because the
+live count alone cannot tell "registered and never removed" from "registered
+faster than removed" — both leave the same rising curve, and a consumer that
+reads only the curve and states which one happened is stating something nothing
+observed. A reading without `churnByType` means those counters were not
+captured, which is not the same as no removals.
+
+`stk` carries a **bounded number of registration call stacks** — where in the
+application a listener was registered — in the same shape and under the same
+redaction as a request's `stk`. This is stack text, so it is application file
+paths, line numbers and function names: a new data class on this event, and the
+only thing here that is not a count. It is still never a target, never a
+listener, and never the listener's own code. Four bounds keep it small: only the
+first registration per (target kind, event type) is captured, at most 128 such
+keys are ever captured for, each stack is cut to 3 frames and 400 characters,
+and a gauge reports at most 2 of them — each site once per session, never
+repeated on later gauges. On engines without `Error.captureStackTrace` (Firefox,
+Safari) the field is absent rather than guessed at, because a wrong location is
+worse than none. A framework that registers its own delegated listeners will
+name its own internals as the callsite for those types; that is where the
+registration genuinely happened.
 
 ### On-screen numbers (`ui.num`)
 
