@@ -35,7 +35,7 @@ class PgError extends Error {
 /** A client whose SELECTs succeed and whose one INSERT raises, as a real driver does. */
 function rejectingPgClient(error: Error) {
   return {
-    query(text: string) {
+    query(text: string, _params?: unknown[]) {
       if (/^\s*insert/i.test(text)) return Promise.reject(error);
       return Promise.resolve({ rows: [{ id: 1 }], rowCount: 1 });
     },
@@ -92,7 +92,7 @@ describe("a database statement that RAISED is recorded, not silently dropped", (
   it("a SELECT that raises is recorded too — the gap is not specific to writes", async () => {
     const events: BugEvent[] = [];
     const client = {
-      query(text: string) {
+      query(text: string, _params?: unknown[]) {
         if (/^\s*select/i.test(text))
           return Promise.reject(new PgError('column "reward_tier" does not exist', "42703"));
         return Promise.resolve({ rows: [], rowCount: 0 });
