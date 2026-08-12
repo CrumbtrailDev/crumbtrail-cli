@@ -1,0 +1,8 @@
+# Dart / Flutter build output. `pubspec.lock` is deliberately not committed:
+# this is a library, so the lock file of whichever app depends on it is the one
+# that decides versions.
+.dart_tool/
+.packages
+build/
+pubspec.lock
+.flutter-plugins-dependencies
