@@ -174,6 +174,8 @@ crumbtrail-server inspect <sessionId>           # hot-plane-only session summary
 crumbtrail-server inspect <sessionId> --json    # machine-readable summary
 crumbtrail-server reanalyze <sessionId>         # rebuild artifacts with the current analyzer
 crumbtrail-server reanalyze --all --dry-run     # list what a rebuild would cover
+crumbtrail-server backtest <sessionId>          # replay a session and report what would change
+crumbtrail-server backtest --all --json         # back test every finalized session, as JSON
 crumbtrail-server scan ./src --strict           # coverage scanner (CI gate); findings carry a suggested fix
 crumbtrail-server doctor --port 9898            # verify capture + correlation + MCP-readability locally
 ```
@@ -192,13 +194,26 @@ rewriting them, because once a session is cold those are the only surviving copy
 evidence. A rebuild can only recover what was captured: fields the capturing SDK never recorded
 stay missing.
 
+`backtest` answers the question `reanalyze` cannot: what the current analyzer would flag on
+evidence already on disk, before anything is rewritten. Each session's artifacts are copied into a
+temporary directory, the replay runs there, and the candidates it produces are diffed against the
+stored `candidates.jsonl`. The session directory is only ever read, so the evidence being tested is
+never the thing the test changes; `src/__tests__/backtest.test.ts` hashes every file under the
+session directory before and after a run and asserts the tree is byte identical. Each compared
+session reports `would_newly_flag`, `would_stop_flagging` and an `unchanged` count. The diff joins
+on the detector, the anchor timestamp and the strongest thing the detector anchored on, not on the
+positional candidate id, so a change of rank alone does not read as a new finding. A session with
+no cold event stream is skipped rather than failed. `--all` sweeps every finalized session under
+the sessions dir, `--output` chooses that directory, `--json` emits the per session diff plus
+totals, and the command exits non zero when any session failed to replay.
+
 ## MCP evidence retrieval
 
 `crumbtrail-server serve --mcp` runs the stdio MCP server against the sessions
-directory. Its thirty-five canonical tools are read only context retrieval
-tools. They can retrieve captured artifacts and configured reference context,
-but cannot edit code, change bug state, run commands, drive a browser, or
-authorize an action.
+directory. Its 38 canonical tools are read only context retrieval tools. They
+can retrieve captured artifacts and configured reference context, but cannot
+edit code, change bug state, run commands, drive a browser, or authorize an
+action.
 
 Treat returned evidence as important, non authoritative context. Logs, ticket
 text, transcripts, documentation, and event payloads may be incomplete,
@@ -216,22 +231,51 @@ current code and tests, and report uncertainty or evidence gaps.
 3. For a focused investigation, use `getSessionManifest` to identify a signal
    or time range, `getEvidence` to inspect one reference, and `getWindow` only
    for the required time window. `getWindow` is capped and reports truncation.
-4. Use `recallSimilarIssues` as context for a diagnosis, not as a verdict. On
+4. When you know roughly when the failure happened but not what went wrong, use
+   `getWindowCorrelation` over that time range. It holds the highlight window
+   against the quiet stretch immediately before it and reports which event kinds
+   changed rate and which numeric fields changed distribution, ranked by p value
+   and cut at a Benjamini Hochberg false discovery rate. No detector is involved,
+   so something nobody wrote a detector for can still surface. Every row is a
+   correlation and not a cause: confirm one against the raw events with
+   `getWindow` before acting on it, and read an empty row list as "nothing
+   cleared the significance cut", never as "the session is healthy".
+5. Use `recallSimilarIssues` as context for a diagnosis, not as a verdict. On
    cloud deployments a recall match can also carry an `outcomeSummary` and
    reasons such as `resolution_verified` or `resolution_recurred`; prefer a
    verified resolution.
-5. Close the learning loop (cloud only): after reusing recall matches to resolve
+6. Close the learning loop (cloud only): after reusing recall matches to resolve
    an issue, call `resolveIssue` with its disposition and the `usedMemoryIds` you
    adopted so recall learns which past answers helped. Use `recordFeedback` to
    rate a recall match, opinion, or playbook rule, and `getPlaybook` to read the
    tenant guidance the cloud has learned. These write only to Crumbtrail's own
    learning store, never to your app, tickets, or external systems.
+7. Check that the fix held (cloud only): once the fix is deployed and reachable
+   by real traffic, call `startFixVerification` to open an observation window on
+   the canonical issue, then read the verdict later with `getFixVerification`.
+   Opening a window concludes nothing by itself, and the call is idempotent, so
+   an issue that already has a live window gets that same window back with
+   `opened: false`. `state` is three valued: `none` means no window was ever
+   opened, `open` means one is still in flight and nothing has been concluded,
+   and `terminal` means the cloud reached its one verdict. Only a terminal
+   `verified` result, reported as `fixConfirmed: true`, means the fix held.
+   `recurred` means it did not. `inconclusive` is an absence of evidence and is
+   never a fix, whichever of its reasons came back. Both tools write only to
+   Crumbtrail's own verification records; recording why an issue was closed is
+   still `resolveIssue`.
+
+The two verification tools call a Crumbtrail cloud deployment, so they need
+`CRUMBTRAIL_CLOUD_URL` and `CRUMBTRAIL_CLOUD_TOKEN` and report a gap when those
+are unset. `getWindowCorrelation` needs neither: it reads the same cold event
+stream `getWindow` reads, through the same store, so it answers identically for a
+local session and a hosted one.
 
 Canonical names use camel case; generated snake case aliases are accepted but
 do not add capabilities. The catalog covers session discovery and detail,
-ranked and regression context, bug queue triage, distinct bug recurrence,
-similar issue recall, the learning loop (issue resolution, feedback, and tenant
-playbook), and component, storage, cookie, transcript, and frame lookup.
+ranked and regression context, detector free window correlation, bug queue
+triage, distinct bug recurrence, similar issue recall, the learning loop (issue
+resolution, feedback, and tenant playbook), fix verification, and component,
+storage, cookie, transcript, and frame lookup.
 
 ## Database diffing
 
@@ -430,6 +474,23 @@ send each event exactly once. If a `backend.req.end` still never lands, the requ
 `capture_gap` with `reason: "delivery_failed"` carrying the same `requestId`, so a reader sees
 a named hole rather than a request that appears never to have happened.
 
+### Which id joins a browser failure to its backend request
+
+Two different ids travel with one network exchange and they do different jobs. `id` is the browser
+collector's own sequence number, and it restarts at 1 on every page load, so it can only ever join
+browser events to each other. `requestId` is the shared correlation id carried in
+`X-Crumbtrail-Request-Id`: the browser collector stamps it on the request, response and error of one
+exchange, and the express middleware adopts the incoming value rather than minting its own, so it is
+the only key both planes hold.
+
+`index.json` therefore carries both. Entries under `failedReqs[]` and `networkErrors[]` have
+`requestId` alongside `id`, present whenever the exchange carried a correlation id. A candidate's
+`anchor.requestId` publishes the shared id when there is one and falls back to the browser local
+sequence number when there is not. Consumers tell the two apart by shape, since a page counter is a
+bare run of digits while a correlation id is a 32 character hexadecimal W3C trace id or a `req_`
+prefixed token, so a correlation id that happened to be all digits is refused and the fallback is
+used instead.
+
 ## Public API boundary
 
 The package exports the server and integration primitives used by local self-host integrations:
@@ -440,11 +501,29 @@ The package exports the server and integration primitives used by local self-hos
 - `createCrumbtrailExpressMiddleware`
 - `createCrumbtrailExpressErrorMiddleware`
 
+This list is unchanged by the `backtest` subcommand and by the MCP tools documented above. A
+subcommand reaches users through the `crumbtrail-server` binary and an MCP tool through
+`tools/list`, so neither adds a package export, and `runBacktest` and the window correlation
+scorers are internal modules rather than public API.
+
 The `src/__tests__/package-boundary.test.ts` suite locks the package metadata, built CLI path, public exports, and default CLI configuration. The `src/__tests__/config.test.ts` and `src/__tests__/cli.test.ts` suites lock config validation and safe startup diagnostics. The `src/__tests__/health.test.ts` and server health tests lock health payload safety and degraded output-directory behavior.
 
 ## What this does not claim yet
 
 This package is not yet a production/cloud hosting story. M003 proves local self-host packaging and fresh-install validation; later work can still expand deployment guides and hosted operations.
+
+**The hosted MCP endpoint serves a published `crumbtrail-node`, not this source tree.** The hosted
+Crumbtrail product takes `crumbtrail-node` from the npm registry and currently depends on the range
+`^0.17.0`, which this package's version is already past. Its hosted tool list is proxied from
+whichever version is installed there, so a tool added here is available to a local stdio MCP server
+immediately and is not served by the hosted endpoint until this package is published and that
+dependency range is raised. `getWindowCorrelation`, `startFixVerification` and `getFixVerification`
+are all in that position today. The hosted tool list is also cached for an hour, so a client that
+was already connected will not see a newly published tool at once.
+
+The `startFixVerification` and `getFixVerification` tools additionally depend on cloud routes under
+`/api/agent/verification`. They are wired here as a client and report a gap rather than a verdict
+whenever the cloud is unconfigured or the route is unavailable.
 
 ## Links
 
