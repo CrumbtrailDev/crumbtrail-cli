@@ -1,9 +1,9 @@
 # Incremental yield benchmark report
 
-Crumbtrail node package version: 0.26.0.
+Crumbtrail node package version: 0.27.0.
 Run: local.
 Revision: local.
-Generation timestamp: 2026-08-11T18:09:47.278Z.
+Generation timestamp: 2026-08-12T13:54:55.105Z.
 This report is generated from supplied arm result files. Do not hand edit it.
 
 ## Scope
