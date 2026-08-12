@@ -1,0 +1,19 @@
+{
+  "capabilities": [
+    "app-lifecycle",
+    "device-info"
+  ],
+  "d": {
+    "msg": "The request timed out.",
+    "source": "unhandled-async",
+    "stk": "CrumbtrailDemo.OrderService.load()"
+  },
+  "k": "rej",
+  "platform": "ios",
+  "schemaVersion": 1,
+  "sdk": {
+    "name": "crumbtrail-fixture",
+    "version": "0.0.0-fixture"
+  },
+  "t": 1754000000000
+}

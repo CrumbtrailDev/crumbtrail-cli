@@ -117,3 +117,7 @@ scripts/.out/
 
 # Local dev harness process logs
 .harness-logs/
+
+# Swift Package Manager build output
+packages/swift/.build/
+packages/swift/.swiftpm/

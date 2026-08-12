@@ -1,0 +1,44 @@
+{
+  "$comment": "Normative transport shape. See docs/specs/native-sdk-wire-contract.md.",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Crumbtrail-Auth": "<ingest key; omit the header entirely when unset, never send empty>"
+  },
+  "endpoints": {
+    "sessionStart": {
+      "path": "/api/session/start",
+      "body": {
+        "sessionId": "ses_20260812_090000_0123456789ab",
+        "metadata": {
+          "service": "app",
+          "platform": "ios",
+          "app": { "id": "ai.crumbtrail.demo", "version": "1.4.0", "build": "204" },
+          "device": {
+            "model": "iPhone15,2",
+            "manufacturer": "Apple",
+            "os": "iOS",
+            "osVersion": "18.2"
+          }
+        }
+      }
+    },
+    "events": {
+      "path": "/api/events",
+      "body": {
+        "sessionId": "ses_20260812_090000_0123456789ab",
+        "events": "<array of event objects; see events/>"
+      }
+    },
+    "sessionEnd": {
+      "path": "/api/session/end",
+      "body": { "sessionId": "ses_20260812_090000_0123456789ab" }
+    }
+  },
+  "delivery": {
+    "$comment": "A non-2xx response is a refusal, not a delivery. Three outcomes must be distinguished.",
+    "2xx": "delivered",
+    "networkFailure": "retry per queue policy",
+    "non2xx": "do not retry the identical batch; record a capture gap"
+  }
+}

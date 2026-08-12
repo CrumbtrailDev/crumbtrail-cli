@@ -1,0 +1,41 @@
+{
+  "capabilities": [
+    "app-lifecycle",
+    "device-info"
+  ],
+  "d": {
+    "h": 852,
+    "nodes": [
+      {
+        "bounds": {
+          "height": 852,
+          "width": 393,
+          "x": 0,
+          "y": 0
+        },
+        "componentName": "CheckoutViewController",
+        "role": "screen"
+      },
+      {
+        "bounds": {
+          "height": 48,
+          "width": 361,
+          "x": 16,
+          "y": 720
+        },
+        "label": "Pay now",
+        "role": "button",
+        "testID": "checkout-pay"
+      }
+    ],
+    "w": 393
+  },
+  "k": "view-snapshot",
+  "platform": "ios",
+  "schemaVersion": 1,
+  "sdk": {
+    "name": "crumbtrail-fixture",
+    "version": "0.0.0-fixture"
+  },
+  "t": 1754000000000
+}

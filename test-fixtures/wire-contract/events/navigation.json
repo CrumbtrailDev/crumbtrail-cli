@@ -1,0 +1,19 @@
+{
+  "capabilities": [
+    "app-lifecycle",
+    "device-info"
+  ],
+  "d": {
+    "name": "CheckoutViewController",
+    "path": "/checkout",
+    "source": "navigation-controller"
+  },
+  "k": "navigation",
+  "platform": "ios",
+  "schemaVersion": 1,
+  "sdk": {
+    "name": "crumbtrail-fixture",
+    "version": "0.0.0-fixture"
+  },
+  "t": 1754000000000
+}

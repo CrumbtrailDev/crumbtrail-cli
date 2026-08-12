@@ -1,0 +1,20 @@
+{
+  "capabilities": [
+    "app-lifecycle",
+    "device-info"
+  ],
+  "d": {
+    "msg": "Fatal error: index out of range",
+    "signal": "SIGABRT",
+    "source": "previous-launch",
+    "stk": "CrumbtrailDemo.CartView.item(at:)"
+  },
+  "k": "native-crash",
+  "platform": "ios",
+  "schemaVersion": 1,
+  "sdk": {
+    "name": "crumbtrail-fixture",
+    "version": "0.0.0-fixture"
+  },
+  "t": 1754000000000
+}
