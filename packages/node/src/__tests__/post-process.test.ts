@@ -408,9 +408,19 @@ describe("postProcess", async () => {
         firstEventKind: "clk",
       }),
     ]);
+    // Every descriptor field the dictionary already carries is dropped from the
+    // event, so a signature that repeats costs one ref.
     expect(coldEvents[0].d.el).toEqual({ sigRef: 1 });
+    // This element's signature is the exception: the dictionary redacts an
+    // identifier WHOLE the moment sanitization touches it ("[REDACTED]"), while
+    // the event's own sanitized value keeps the non-secret prefix. Those are two
+    // different strings, so the event's value rides along and wins on read —
+    // the round trip returns what this event actually carried, not the entry's
+    // coarser stand-in. Neither string contains the secret; that is asserted
+    // over every cold surface below.
     expect(coldEvents.find((event) => event.t === 10_500)?.d.el).toEqual({
       sigRef: 2,
+      sig: "sig_[REDACTED]",
     });
     expect(serializedColdSurfaces).toContain("[REDACTED]");
     for (const [surface, content] of Object.entries(coldSurfaces)) {
