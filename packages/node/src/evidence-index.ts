@@ -1203,8 +1203,23 @@ function applyCausalRerank(
     members.set(top, list);
   }
 
-  // Root first, then each subtree in sibling-rank order. Pre-order, so no member can precede the
-  // cause it was attributed to.
+  // The chain LEADS with the member that placed it — its highest effective score — and the
+  // root-first pre-order follows unchanged behind that head.
+  //
+  // The pre-order alone used to be the whole rule, on the guarantee that no member can precede the
+  // cause it was attributed to. That guarantee is deliberately relaxed for the head, and only for
+  // the head, because it costs the reader the thing the chain was ranked for. A chain is placed by
+  // its strongest member (below), so when the root is a generic observation and the named failure
+  // hangs off it, the pre-order hands the reader the WEAKEST statement of the incident as the
+  // headline while the evidence that earned the position sits two to five rows down. Measured over
+  // a frozen replay: of the sessions the ranker already ordered correctly, the first row was almost
+  // always the chain's strongest member, and the incorrect ones concentrate in the shape above,
+  // where a weaker root leads and the placing member sits below it. Promoting the placing member
+  // costs nothing in the common case — a chain whose root
+  // is already its strongest member is untouched — and in the defective case it puts the evidence
+  // that named the fault first. Causality stays legible one line down: the head is MOVED, never
+  // copied, so it appears exactly once, and the cause it was attributed to is the row immediately
+  // after it. Ranking only; no score is mutated here.
   const layout = (top: CandidateDraft): CandidateDraft[] => {
     const out: CandidateDraft[] = [];
     const walk = (draft: CandidateDraft): void => {
@@ -1215,6 +1230,11 @@ function applyCausalRerank(
         walk(child);
     };
     walk(top);
+    // First one wins on ties, which is the pre-order's own order and so the existing tie-break.
+    let head = 0;
+    for (let i = 1; i < out.length; i++)
+      if (effectiveScore(out[i]!) > effectiveScore(out[head]!)) head = i;
+    if (head > 0) out.unshift(...out.splice(head, 1));
     return out;
   };
 
