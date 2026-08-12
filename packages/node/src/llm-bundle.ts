@@ -4874,8 +4874,29 @@ function renderDetectedSignalsSection(bugs: DistinctBug[] | undefined): string[]
       + "and it is not ranked any lower for it — and `not-assessed` means no causal attribution ran, "
       + "so the question was never asked.",
     "",
+    // The grade stays whole — three states, no variants — and the reason sits BESIDE it. All three
+    // causes mean the same thing for how far to trust a headline, which is why they must not fork
+    // the grade; but they mean very different things for what to do next, which is why a reader
+    // who is shown only the grade is under-informed. `no-node-family` and `no-compatible-node` say
+    // the session held nothing of the kind this signal could attach to; `lost-contention` says it
+    // DID, and another finding took it — an absence of connection, not an absence of evidence.
+    "`Why unattached` is the reason the tooling could not connect an `unattached` finding: "
+      + "`no-node-family` means this kind of signal has nothing in the session it could attach to, "
+      + "`no-compatible-node` means there was nothing close enough in time or request to attach it "
+      + "to, and `lost-contention` means there WAS — and another finding, named in the cell, holds "
+      + "it instead. A blank cell is not a finding about the row: it means the question does not "
+      + "arise, because the signal was connected or attribution never ran.",
+    "",
     table(
-      ["Offset", "Severity", "Detector", "Support", "Finding", "Where"],
+      [
+        "Offset",
+        "Severity",
+        "Detector",
+        "Support",
+        "Why unattached",
+        "Finding",
+        "Where",
+      ],
       shown.map((bug) => [
         bug.window?.start !== undefined && bug.firstSeen !== undefined
           ? `${bug.firstSeen - bug.window.start} ms`
@@ -4886,6 +4907,10 @@ function renderDetectedSignalsSection(bugs: DistinctBug[] | undefined): string[]
         // reads the same way to the reader as a session nothing was attributed for: nobody told
         // them. It must never silently render as if the signal had been placed.
         bug.representative.support ?? "not-assessed",
+        // Empty on every row where the question does not arise — which is most of them. Absence
+        // renders as nothing rather than as a placeholder word: `none` or `n/a` in this cell would
+        // read as an assertion about a row that was never isolated at all.
+        isolationReasonCell(bug),
         // Title AND message. A detector puts the specifics in whichever of the two it has — the
         // click detector names the covered control in its title and carries no message at all, so
         // preferring one over the other drops the part that identifies the defect.
@@ -4915,6 +4940,27 @@ function renderDetectedSignalsSection(bugs: DistinctBug[] | undefined): string[]
     );
   }
   return lines;
+}
+
+/**
+ * The `Why unattached` cell for one signal row.
+ *
+ * Keyed from the cluster REPRESENTATIVE, which is where the row's title, detector and support
+ * already come from, while its severity is a cluster MAX. A reason taken from the best- or
+ * worst-placed member would describe a different finding than the one the row names — this
+ * codebase has paid for keying a reader-facing string on the wrong member of a group before.
+ *
+ * `lost-contention` names the holder, because "another finding took the node" is only actionable
+ * if the reader can go and look at that finding. `${id} · ${detector}` matches how the Causal
+ * Structure section of this same document refers to a candidate.
+ */
+function isolationReasonCell(bug: DistinctBug): string {
+  const cause = bug.representative.isolationCause;
+  if (!cause) return "";
+  const holder = bug.representative.isolationHeldBy;
+  return holder
+    ? `${cause} — held by ${holder.candidateId} · ${holder.detector}`
+    : cause;
 }
 
 /** How many linked requests may contribute a payload block, matching the table above it. */
