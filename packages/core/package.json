@@ -1,7 +1,7 @@
 {
   "name": "crumbtrail-core",
-  "version": "0.16.0",
-  "description": "Capture the console, network, DOM and state around a bug and hand it to a coding agent as evidence. Zero-dependency browser SDK. See https://crumbtrail.ai",
+  "version": "0.30.0",
+  "description": "Capture the console, network, DOM and state around a bug and hand it to a coding agent as evidence. Zero-dependency browser SDK, with optional React and Tauri adapters on the crumbtrail-core/react and crumbtrail-core/tauri subpaths. See https://crumbtrail.ai",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -22,7 +22,11 @@
     "javascript",
     "typescript",
     "redaction",
-    "telemetry"
+    "telemetry",
+    "react",
+    "error-boundary",
+    "tauri",
+    "desktop"
   ],
   "type": "module",
   "main": "./dist/index.cjs",
@@ -39,6 +43,16 @@
       "import": "./dist/early.js",
       "require": "./dist/early.cjs"
     },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js",
+      "require": "./dist/react/index.cjs"
+    },
+    "./tauri": {
+      "types": "./dist/tauri/index.d.ts",
+      "import": "./dist/tauri/index.js",
+      "require": "./dist/tauri/index.cjs"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -46,6 +60,26 @@
   ],
   "publishConfig": {
     "access": "public"
+  },
+  "peerDependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "@tauri-apps/api": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "^2.0.0",
+    "@testing-library/react": "^16.1.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "scripts": {
     "prepack": "node ../../scripts/assert-publish-safe.mjs",

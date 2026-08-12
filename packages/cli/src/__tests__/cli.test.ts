@@ -546,14 +546,20 @@ describe("installSdk — tarball fallback (registry unavailable)", () => {
   });
 
   it("resolves react-native + tauri from the deploy's optional tarball channels", async () => {
-    // CP5: react-native/tauri are packed as optional channels now, so a failed
+    // CP5: react-native is packed as an optional channel now, so a failed
     // registry install must fall through to the SAME manifest-driven tarball
     // discovery as the core recipes (no more 'not yet distributable' dead-end).
+    //
+    // Tauri is in this loop with NO second package: TauriTransport ships as the
+    // crumbtrail-core/tauri subpath, so the tarball it needs is the core one it
+    // already installs. Keeping it here proves the tauri recipe still probes the
+    // manifest rather than dead-ending, which is the behaviour CP5 added.
+    const extraPackage = {
+      "react-native": "crumbtrail-react-native",
+      tauri: null,
+    } as const;
     for (const recipe of ["react-native", "tauri"] as const) {
-      const pkg =
-        recipe === "react-native"
-          ? "crumbtrail-react-native"
-          : "crumbtrail-tauri";
+      const pkg = extraPackage[recipe];
       const calls: string[][] = [];
       const spawnFn = (_cmd: string, args: string[]) => {
         calls.push(args);
@@ -572,7 +578,6 @@ describe("installSdk — tarball fallback (registry unavailable)", () => {
               "crumbtrail-node-0.1.0.tgz",
               "crumbtrail-0.1.0.tgz",
               "crumbtrail-react-native-0.1.0.tgz",
-              "crumbtrail-tauri-0.1.0.tgz",
             ],
           }),
         };
@@ -591,11 +596,12 @@ describe("installSdk — tarball fallback (registry unavailable)", () => {
       expect(probed).toBe(true); // DID probe the manifest (was skipped before CP5)
       expect(result.installed).toBe(true);
       expect(result.note).toContain("install tarballs");
-      // Second spawn installs the discovered tarball URLs (core + the SDK pkg).
+      // Second spawn installs the discovered tarball URLs: core, plus the SDK
+      // package when the recipe has one of its own.
       expect(calls[1]).toEqual([
         "install",
         "https://deploy.example/install/crumbtrail-core-0.1.0.tgz",
-        `https://deploy.example/install/${pkg}-0.1.0.tgz`,
+        ...(pkg ? [`https://deploy.example/install/${pkg}-0.1.0.tgz`] : []),
       ]);
     }
   });

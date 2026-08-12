@@ -124,3 +124,6 @@ scripts/.out/
 
 # Local dev harness process logs
 .harness-logs/
+
+# Agent worktrees. Local only — never a gitlink in a commit.
+.worktrees/

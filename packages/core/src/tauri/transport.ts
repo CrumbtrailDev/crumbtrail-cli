@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { BugEvent, CrumbtrailTransport, BugReport } from "crumbtrail-core";
+import type { BugEvent, CrumbtrailTransport, BugReport } from "../types";
 
 export class TauriTransport implements CrumbtrailTransport {
   private sessionId = "";

@@ -51,29 +51,31 @@ describe("release package selection", () => {
     const core = pkg("crumbtrail-core");
     const cli = pkg("crumbtrail", {
       devDependencies: { "crumbtrail-core": "workspace:^" },
-      tsupConfig: '// noExternal: ["crumbtrail-core"]\nexport default { noExternal: ["crumbtrail-install-shared"] }',
+      tsupConfig: '// noExternal: ["crumbtrail-core"]\nexport default { noExternal: ["crumbtrail-detect-core"] }',
     });
     expect(selectReleasePackages({ packages: [core, cli], changedFiles: ["packages/core/src/index.ts"] }).map((entry) => entry.name))
       .toEqual(["crumbtrail-core"]);
   });
 
-  it("propagates bundled dev dependencies through install-shared, detect-core, and CLI", () => {
-    const installShared = pkg("crumbtrail-install-shared");
+  it("propagates a bundled dev dependency two hops, through detect-core into the CLI", () => {
+    // Two hops is the case worth pinning: a bundled dependency of a bundled
+    // dependency still changes the CLI tarball, so it must still select the CLI.
+    const inner = pkg("crumbtrail-design-system");
     const detectCore = pkg("crumbtrail-detect-core", {
-      devDependencies: { "crumbtrail-install-shared": "workspace:^" },
-      tsupConfig: 'export default { noExternal: ["crumbtrail-install-shared"] }',
+      devDependencies: { "crumbtrail-design-system": "workspace:^" },
+      tsupConfig: 'export default { noExternal: ["crumbtrail-design-system"] }',
     });
     const cli = pkg("crumbtrail", {
       devDependencies: { "crumbtrail-detect-core": "workspace:^" },
       tsupConfig: 'export default { noExternal: ["crumbtrail-detect-core"] }',
     });
     expect(selectReleasePackages({
-      packages: [installShared, detectCore, cli],
-      changedFiles: ["packages/install-shared/src/index.ts"],
+      packages: [inner, detectCore, cli],
+      changedFiles: ["packages/design-system/src/index.ts"],
     }).map((entry) => entry.name)).toEqual([
       "crumbtrail",
+      "crumbtrail-design-system",
       "crumbtrail-detect-core",
-      "crumbtrail-install-shared",
     ]);
   });
 
@@ -143,19 +145,15 @@ describe("release package selection", () => {
         "packages/node/package.json",
         "packages/detect-core/package.json",
         "packages/cli/package.json",
-        "packages/install-shared/package.json",
         "packages/react-native/package.json",
-        "packages/tauri/package.json",
       ],
     });
     expect(plan.packages.map((entry) => entry.name)).toEqual([
       "crumbtrail",
       "crumbtrail-core",
       "crumbtrail-detect-core",
-      "crumbtrail-install-shared",
       "crumbtrail-node",
       "crumbtrail-react-native",
-      "crumbtrail-tauri",
     ]);
   });
 
@@ -191,23 +189,20 @@ describe("release package selection", () => {
     const versionChangedPackageNames = ["crumbtrail-core"];
     const selected = selectReleasePackages({ packages, changedFiles, versionChangedPackageNames });
 
-    // crumbtrail-react is deliberately ABSENT, and its absence is the point of
-    // this assertion. It declares no workspace dependency and is bundled into
-    // nothing, so no amount of propagation can reach it — only a change to
-    // packages/react itself selects it. It appeared in the old expected set
-    // solely because the frozen baseline reached back past react's own last
-    // release and swept packages/react into the diff. If react ever gains a
-    // workspace dependency, or any package gains a noExternal entry, this list
-    // grows and this test fails, which is exactly the tripwire that keeps a
-    // workspace metadata edit from quietly republishing every public package.
+    // This list is every public package the workspace still has, because after
+    // the package consolidation each one does depend on core: the React and
+    // Tauri adapters became crumbtrail-core subpaths, and install-shared became
+    // the crumbtrail-detect-core/install subpath, so the three packages that
+    // used to sit outside the propagation graph no longer exist to sit outside
+    // it. The tripwire is unchanged in spirit — if this list ever grows, a
+    // workspace metadata edit is quietly republishing something new, and that
+    // is a change someone has to justify.
     expect(selected.map((pkg) => pkg.name)).toEqual([
       "crumbtrail",
       "crumbtrail-core",
       "crumbtrail-detect-core",
-      "crumbtrail-install-shared",
       "crumbtrail-node",
       "crumbtrail-react-native",
-      "crumbtrail-tauri",
     ]);
 
     // The release-blocking guard, run against the real graph rather than a
@@ -215,7 +210,7 @@ describe("release package selection", () => {
     // runtime contract without receiving its own version bump. Bumping core
     // alone must be rejected, and it must name every consumer left behind.
     expect(() => assertVersionedRuntimeConsumers(selected, versionChangedPackageNames))
-      .toThrow(/crumbtrail-detect-core.*crumbtrail-install-shared.*crumbtrail-node.*crumbtrail-react-native.*crumbtrail-tauri/);
+      .toThrow(/crumbtrail-detect-core.*crumbtrail-node.*crumbtrail-react-native/);
     // Bumping every propagated consumer clears it.
     expect(() => assertVersionedRuntimeConsumers(selected, selected.map((pkg) => pkg.name))).not.toThrow();
 
@@ -334,19 +329,16 @@ describe("release artifact safety", () => {
       { name: "crumbtrail", version: "1.0.0" },
       { name: "crumbtrail-core", version: "1.0.0" },
       { name: "crumbtrail-detect-core", version: "1.0.0" },
-      { name: "crumbtrail-install-shared", version: "1.0.0" },
       { name: "crumbtrail-node", version: "1.0.0" },
     ];
     const ordered = topologicallyOrderReleasePackages(packages, new Map([
       ["crumbtrail", ["crumbtrail-detect-core"]],
-      ["crumbtrail-detect-core", ["crumbtrail-install-shared"]],
-      ["crumbtrail-install-shared", []],
+      ["crumbtrail-detect-core", ["crumbtrail-core"]],
       ["crumbtrail-node", ["crumbtrail-core"]],
       ["crumbtrail-core", []],
     ]));
     expect(ordered.map((entry) => entry.name)).toEqual([
       "crumbtrail-core",
-      "crumbtrail-install-shared",
       "crumbtrail-detect-core",
       "crumbtrail",
       "crumbtrail-node",

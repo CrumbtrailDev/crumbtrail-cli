@@ -272,7 +272,7 @@ INSTALLER_RECIPES["otlp-fastapi"] = {
   portSlot: 49618,
   // The emitted guidance snippet must carry the FIXED facts: the %20-escaped
   // Bearer header, the compression posture, and both wire protocols — all
-  // sourced from OTLP_CAPABILITY_FACTS in crumbtrail-install-shared.
+  // sourced from OTLP_CAPABILITY_FACTS in crumbtrail-detect-core/install.
   snippetMustContain: [
     "Authorization=Bearer%20",
     "OTEL_EXPORTER_OTLP_COMPRESSION=none",
@@ -477,7 +477,7 @@ INSTALLER_RECIPES["tauri"] = {
     {
       id: "tauri-typecheck",
       description:
-        "the wizard prepends the TauriTransport init into the frontend entry, the packed crumbtrail-tauri tarball installs, and the frontend `tsc --noEmit` typechecks clean",
+        "the wizard prepends the TauriTransport init into the frontend entry, the packed crumbtrail-core tarball installs, and the frontend `tsc --noEmit` typechecks clean",
       status: "active",
     },
     {
