@@ -12,13 +12,13 @@ them require it.
 
 | Package | Description |
 | --- | --- |
-| [`crumbtrail`](packages/cli) | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. |
+| [`crumbtrail`](packages/cli) | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. Also the detection and injection-planning library the hosted product imports, with install recipes and agent prompts on the `/install` subpath. |
 | [`crumbtrail-core`](packages/core) | Framework-agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. React bindings on the `/react` subpath, Tauri bindings on `/tauri`. |
 | [`crumbtrail-node`](packages/node) | Node.js server: session store, backend capture, the local dashboard. |
 | [`crumbtrail-react-native`](packages/react-native) | React Native bindings. Separate because its React Native peer dependencies must not reach a web bundle. |
-| [`crumbtrail-detect-core`](packages/detect-core) | Framework detection and injection planning, shared by the CLI and cloud automation. Reads only and writes nothing. Install recipes and agent prompts on the `/install` subpath. |
 
-All five publish at one shared version. A given release is the same number
+
+All four publish at one shared version. A given release is the same number
 everywhere, so there is no question of which versions go together.
 
 `packages/tauri` holds the `tauri-plugin-crumbtrail` Rust crate, published to

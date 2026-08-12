@@ -1,12 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import {
-  detect,
-  detectPackageManager,
-  localFsReader,
-  memoryReader,
-} from "../detect";
+import { detect, detectPackageManager, localFsReader } from "../detect";
+// memoryReader is test-only and deliberately absent from the public barrel.
+import { memoryReader } from "../testing";
 import { cleanup, makeTmpRepo } from "./helpers";
 
 describe("FileReader root bounds the upward lockfile walk", () => {

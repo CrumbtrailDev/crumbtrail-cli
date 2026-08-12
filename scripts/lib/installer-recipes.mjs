@@ -272,7 +272,7 @@ INSTALLER_RECIPES["otlp-fastapi"] = {
   portSlot: 49618,
   // The emitted guidance snippet must carry the FIXED facts: the %20-escaped
   // Bearer header, the compression posture, and both wire protocols — all
-  // sourced from OTLP_CAPABILITY_FACTS in crumbtrail-detect-core/install.
+  // sourced from OTLP_CAPABILITY_FACTS in crumbtrail/install.
   snippetMustContain: [
     "Authorization=Bearer%20",
     "OTEL_EXPORTER_OTLP_COMPRESSION=none",

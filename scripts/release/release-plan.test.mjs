@@ -57,25 +57,27 @@ describe("release package selection", () => {
       .toEqual(["crumbtrail-core"]);
   });
 
-  it("propagates a bundled dev dependency two hops, through detect-core into the CLI", () => {
+  it("propagates a bundled dev dependency two hops into the CLI", () => {
     // Two hops is the case worth pinning: a bundled dependency of a bundled
     // dependency still changes the CLI tarball, so it must still select the CLI.
-    const inner = pkg("crumbtrail-design-system");
-    const detectCore = pkg("crumbtrail-detect-core", {
-      devDependencies: { "crumbtrail-design-system": "workspace:^" },
-      tsupConfig: 'export default { noExternal: ["crumbtrail-design-system"] }',
+    // The packages here are synthetic — the real workspace no longer has a
+    // two-hop bundling chain, and the policy still has to hold if one returns.
+    const inner = pkg("crumbtrail-inner");
+    const middle = pkg("crumbtrail-middle", {
+      devDependencies: { "crumbtrail-inner": "workspace:^" },
+      tsupConfig: 'export default { noExternal: ["crumbtrail-inner"] }',
     });
     const cli = pkg("crumbtrail", {
-      devDependencies: { "crumbtrail-detect-core": "workspace:^" },
-      tsupConfig: 'export default { noExternal: ["crumbtrail-detect-core"] }',
+      devDependencies: { "crumbtrail-middle": "workspace:^" },
+      tsupConfig: 'export default { noExternal: ["crumbtrail-middle"] }',
     });
     expect(selectReleasePackages({
-      packages: [inner, detectCore, cli],
-      changedFiles: ["packages/design-system/src/index.ts"],
+      packages: [inner, middle, cli],
+      changedFiles: ["packages/inner/src/index.ts"],
     }).map((entry) => entry.name)).toEqual([
       "crumbtrail",
-      "crumbtrail-design-system",
-      "crumbtrail-detect-core",
+      "crumbtrail-inner",
+      "crumbtrail-middle",
     ]);
   });
 
@@ -143,7 +145,6 @@ describe("release package selection", () => {
         "tsconfig.json",
         "packages/core/package.json",
         "packages/node/package.json",
-        "packages/detect-core/package.json",
         "packages/cli/package.json",
         "packages/react-native/package.json",
       ],
@@ -151,7 +152,6 @@ describe("release package selection", () => {
     expect(plan.packages.map((entry) => entry.name)).toEqual([
       "crumbtrail",
       "crumbtrail-core",
-      "crumbtrail-detect-core",
       "crumbtrail-node",
       "crumbtrail-react-native",
     ]);
@@ -200,7 +200,6 @@ describe("release package selection", () => {
     expect(selected.map((pkg) => pkg.name)).toEqual([
       "crumbtrail",
       "crumbtrail-core",
-      "crumbtrail-detect-core",
       "crumbtrail-node",
       "crumbtrail-react-native",
     ]);
@@ -210,7 +209,7 @@ describe("release package selection", () => {
     // runtime contract without receiving its own version bump. Bumping core
     // alone must be rejected, and it must name every consumer left behind.
     expect(() => assertVersionedRuntimeConsumers(selected, versionChangedPackageNames))
-      .toThrow(/crumbtrail-detect-core.*crumbtrail-node.*crumbtrail-react-native/);
+      .toThrow(/crumbtrail-node.*crumbtrail-react-native/);
     // Bumping every propagated consumer clears it.
     expect(() => assertVersionedRuntimeConsumers(selected, selected.map((pkg) => pkg.name))).not.toThrow();
 

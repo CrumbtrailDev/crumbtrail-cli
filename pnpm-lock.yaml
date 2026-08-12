@@ -56,9 +56,6 @@ importers:
       crumbtrail-core:
         specifier: workspace:^
         version: link:../core
-      crumbtrail-detect-core:
-        specifier: workspace:^
-        version: link:../detect-core
 
   packages/core:
     devDependencies:
@@ -80,16 +77,6 @@ importers:
       react-dom:
         specifier: ^19.0.0
         version: 19.2.7(react@19.2.7)
-
-  packages/detect-core:
-    dependencies:
-      crumbtrail-core:
-        specifier: workspace:^
-        version: link:../core
-    devDependencies:
-      '@types/node':
-        specifier: ^25.5.0
-        version: 25.9.5
 
   packages/node:
     dependencies:

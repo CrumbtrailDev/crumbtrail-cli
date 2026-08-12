@@ -21,7 +21,7 @@ import {
   githubInjectIO,
   type GithubTreeEntry,
   type GithubRepoSource,
-} from "crumbtrail-detect-core";
+} from "../index";
 import { materializePlan, type ExecutorIO } from "../inject/executor";
 
 const FIXTURES = path.resolve(__dirname, "../../../../test-fixtures/installers");
