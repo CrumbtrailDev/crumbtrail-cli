@@ -146,10 +146,12 @@ describe("release package selection", () => {
         "packages/detect-core/package.json",
         "packages/cli/package.json",
         "packages/react-native/package.json",
+        "packages/capacitor/package.json",
       ],
     });
     expect(plan.packages.map((entry) => entry.name)).toEqual([
       "crumbtrail",
+      "crumbtrail-capacitor",
       "crumbtrail-core",
       "crumbtrail-detect-core",
       "crumbtrail-node",
@@ -199,6 +201,7 @@ describe("release package selection", () => {
     // is a change someone has to justify.
     expect(selected.map((pkg) => pkg.name)).toEqual([
       "crumbtrail",
+      "crumbtrail-capacitor",
       "crumbtrail-core",
       "crumbtrail-detect-core",
       "crumbtrail-node",
@@ -210,7 +213,7 @@ describe("release package selection", () => {
     // runtime contract without receiving its own version bump. Bumping core
     // alone must be rejected, and it must name every consumer left behind.
     expect(() => assertVersionedRuntimeConsumers(selected, versionChangedPackageNames))
-      .toThrow(/crumbtrail-detect-core.*crumbtrail-node.*crumbtrail-react-native/);
+      .toThrow(/crumbtrail-capacitor.*crumbtrail-detect-core.*crumbtrail-node.*crumbtrail-react-native/);
     // Bumping every propagated consumer clears it.
     expect(() => assertVersionedRuntimeConsumers(selected, selected.map((pkg) => pkg.name))).not.toThrow();
 
