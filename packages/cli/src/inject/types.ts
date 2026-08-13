@@ -44,4 +44,11 @@ export interface Plan {
    * it. Undefined for recipes that inject no key (tauri / otlp / angular).
    */
   keyEnvVar?: string;
+  /**
+   * `keyEnvVar` is supplied at BUILD time rather than read from the environment
+   * at run time (Flutter's `--dart-define`). The wizard must not write the key
+   * into an env file for these: the app would never read it, and every printed
+   * step would report success for an app that captures nothing.
+   */
+  keyIsCompileTime?: boolean;
 }

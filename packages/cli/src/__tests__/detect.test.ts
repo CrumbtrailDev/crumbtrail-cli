@@ -276,6 +276,72 @@ describe("detect", () => {
     expect(r.ambiguous).toBe(true);
   });
 
+  it("detects an Ionic React (Vite) Capacitor app and resolves the web entry", () => {
+    const root = tmp({
+      "package.json": JSON.stringify({
+        dependencies: { "@capacitor/core": "6.0.0", react: "18.0.0" },
+        devDependencies: { vite: "5.0.0" },
+      }),
+      "index.html": '<script type="module" src="/src/main.tsx"></script>',
+      "src/main.tsx": "createRoot(document.getElementById('root'));",
+      "capacitor.config.ts": "export default { appId: 'ai.crumbtrail.demo' };",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBe("capacitor");
+    expect(r.entryFile).toBe(path.join(root, "src", "main.tsx"));
+    expect(r.ambiguous).toBe(false);
+  });
+
+  it("detects an Ionic Angular Capacitor app via src/main.ts", () => {
+    const root = tmp({
+      "package.json": JSON.stringify({
+        dependencies: {
+          "@capacitor/core": "6.0.0",
+          "@angular/core": "18.0.0",
+        },
+      }),
+      "src/main.ts": "platformBrowserDynamic().bootstrapModule(AppModule);",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBe("capacitor");
+    expect(r.entryFile).toBe(path.join(root, "src", "main.ts"));
+  });
+
+  it("wins over vite-spa, because the phone build is the more specific fact", () => {
+    const root = tmp({
+      "package.json": JSON.stringify({
+        dependencies: { "@capacitor/core": "6.0.0" },
+        devDependencies: { vite: "5.0.0" },
+      }),
+      "index.html": '<script type="module" src="/src/main.ts"></script>',
+      "src/main.ts": "console.log('app');",
+    });
+    expect(detect(root).recipe).toBe("capacitor");
+  });
+
+  it("falls through to the frontend recipe when no web entry resolves", () => {
+    // A Next + Capacitor project. Claiming `capacitor` here would trade a
+    // working injection for guidance, so detection declines and `next` wins.
+    const root = tmp({
+      "package.json": JSON.stringify({
+        dependencies: { "@capacitor/core": "6.0.0", next: "15.0.0" },
+      }),
+      "app/layout.tsx": "export default function Layout() {}",
+    });
+    expect(detect(root).recipe).toBe("next");
+  });
+
+  it("does not claim a plain web app that merely mentions capacitor", () => {
+    const root = tmp({
+      "package.json": JSON.stringify({
+        devDependencies: { vite: "5.0.0" },
+      }),
+      "index.html": '<script type="module" src="/src/main.ts"></script>',
+      "src/main.ts": "console.log('app');",
+    });
+    expect(detect(root).recipe).toBe("vite-spa");
+  });
+
   it("detects an Expo app via the expo-router root layout", () => {
     const root = tmp({
       "package.json": JSON.stringify({ dependencies: { expo: "51.0.0" } }),
@@ -763,5 +829,58 @@ describe("detect", () => {
     const r = detect(root);
     expect(r.recipe).toBe("node");
     expect(r.otlpStack).toBeNull();
+  });
+
+  it("detects a Flutter app with no package.json anywhere", () => {
+    const root = tmp({
+      "pubspec.yaml": [
+        "name: my_app",
+        "environment:",
+        "  sdk: '>=3.4.0 <4.0.0'",
+        "dependencies:",
+        "  flutter:",
+        "    sdk: flutter",
+        "",
+      ].join("\n"),
+      "lib/main.dart": "void main() {\n  runApp(const MyApp());\n}\n",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBe("flutter");
+    expect(r.entryFile).toBe(path.join(root, "lib", "main.dart"));
+    expect(r.ambiguous).toBe(false);
+    expect(r.packageJsonPath).toBeNull();
+  });
+
+  it("is ambiguous when lib/main.dart is missing", () => {
+    const root = tmp({
+      "pubspec.yaml": "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBe("flutter");
+    expect(r.entryFile).toBeNull();
+    expect(r.ambiguous).toBe(true);
+  });
+
+  it("ignores a pure Dart package, which has no widget bindings to wire", () => {
+    // A Dart CLI or server has a pubspec too. Claiming the Flutter recipe there
+    // would inject against bindings the project does not have.
+    const root = tmp({
+      "pubspec.yaml": "name: my_cli\ndependencies:\n  args: ^2.0.0\n",
+      "lib/main.dart": "void main() {}\n",
+    });
+    expect(detect(root).recipe).toBeNull();
+  });
+
+  it("wins over a JS toolchain sharing the same root", () => {
+    // A Flutter app whose repo also carries a package.json for tooling. The app
+    // that ships to a phone is the one worth wiring.
+    const root = tmp({
+      "pubspec.yaml": "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+      "lib/main.dart": "void main() {\n  runApp(const MyApp());\n}\n",
+      "package.json": JSON.stringify({ devDependencies: { vite: "5.0.0" } }),
+      "index.html": '<script type="module" src="/src/main.ts"></script>',
+      "src/main.ts": "console.log('tooling');",
+    });
+    expect(detect(root).recipe).toBe("flutter");
   });
 });

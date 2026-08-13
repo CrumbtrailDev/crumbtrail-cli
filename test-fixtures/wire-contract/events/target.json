@@ -1,0 +1,32 @@
+{
+  "capabilities": [
+    "app-lifecycle",
+    "device-info"
+  ],
+  "d": {
+    "fatal": false,
+    "msg": "tap handler threw",
+    "source": "caught"
+  },
+  "k": "err",
+  "platform": "ios",
+  "schemaVersion": 1,
+  "sdk": {
+    "name": "crumbtrail-fixture",
+    "version": "0.0.0-fixture"
+  },
+  "t": 1754000000000,
+  "target": {
+    "bounds": {
+      "height": 48,
+      "width": 361,
+      "x": 16,
+      "y": 720
+    },
+    "componentName": "CheckoutButton",
+    "label": "Pay now",
+    "role": "button",
+    "routePath": "/checkout",
+    "testID": "checkout-pay"
+  }
+}

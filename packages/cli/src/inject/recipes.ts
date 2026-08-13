@@ -21,14 +21,19 @@ import {
   prependIntoSource,
   referencesCrumbtrail,
   wireExpressMiddleware,
+  wireFlutterMain,
   withTrailingNewline,
 } from "./text";
 import {
+  capacitorInitSnippet,
   clientInitSnippet,
   expressErrorMiddlewareSnippet,
   expressManualWiringSnippet,
   expressMiddlewareImportSnippet,
   expressRequestMiddlewareSnippet,
+  FLUTTER_IMPORT_LINE,
+  flutterInitLines,
+  flutterInitSnippet,
   nestInitSnippet,
   nodeInitSnippet,
   nuxtPluginSnippet,
@@ -47,8 +52,22 @@ const KEY_PLACEHOLDER = "<your-ingest-key>";
  * How this app reads its key: the recipe's own reference, unchanged. One ingest
  * key covers the whole project, so every app in a repository reads the same
  * variable for its framework and the init call carries the app's name instead.
+ *
+ * `capacitor` is the one recipe whose key mechanism is not fixed by the recipe
+ * alone, because Ionic ships both a Vite flavour and an Angular one. An Angular
+ * browser build exposes no env var at all, so it gets NO key ref — the same
+ * answer the `angular` recipe gives, reached the same way. This is the single
+ * decision point: `buildPlan` reads `envVar` from here and the snippet reads
+ * `expr` from here, so the two can never disagree.
  */
 function keyRefFor(input: BuildPlanInput): KeyRef | undefined {
+  if (
+    input.recipe === "capacitor" &&
+    input.entryFile &&
+    isAngularHostedCapacitor(input.entryFile)
+  ) {
+    return undefined;
+  }
   return RECIPE_REGISTRY[input.recipe].keyRef;
 }
 
@@ -220,6 +239,13 @@ function installedNextVersion(cwd: string, io: InjectIO): string | null {
  * that is going to be skipped anyway.
  */
 export function projectAlreadyWired(cwd: string, io: InjectIO): boolean {
+  // A Flutter project has no package.json at all, so the JS check below would
+  // report "not wired" forever and a re-run would wire main.dart twice.
+  const pubspec = io.readFile(path.join(cwd, "pubspec.yaml"));
+  if (pubspec != null && /^\s*crumbtrail_flutter\s*:/m.test(pubspec)) {
+    return true;
+  }
+
   const text = io.readFile(path.join(cwd, "package.json"));
   if (text == null) return false;
   try {
@@ -524,6 +550,178 @@ function planAngular(input: BuildPlanInput, _io: InjectIO): Plan {
   ]);
 }
 
+/**
+ * The two web hosts a Capacitor app can be wired through, and the only thing
+ * that differs between them: how browser code is allowed to read an env var.
+ */
+const CAPACITOR_ANGULAR_KEY_EXPR = "environment.crumbtrailKey";
+
+/**
+ * Ionic ships both a Vite flavour (React/Vue/vanilla) and an Angular one, and
+ * they disagree on exactly one point. A Vite build substitutes
+ * `import.meta.env.VITE_*` at bundle time; a standard Angular browser build
+ * exposes neither `import.meta.env` nor `process.env`, so injecting the Vite
+ * expression there would emit code that references an undefined value and fail
+ * at runtime with no useful error.
+ *
+ * The entry file is the discriminator, and it is unambiguous: `resolveViteEntry`
+ * only resolves through a root `index.html`, while `resolveAngularEntry` only
+ * ever returns `src/main.ts`.
+ */
+function isAngularHostedCapacitor(entryFile: string): boolean {
+  return path.basename(entryFile) === "main.ts";
+}
+
+/**
+ * Capacitor / Ionic.
+ *
+ * Injects into the web entry, exactly like the Vite and Angular recipes — the
+ * app IS a web build. The difference is which init it calls:
+ * `createCapacitorCrumbtrailAsync` runs the same `Crumbtrail.init` underneath
+ * and then attaches the native collectors, so the wired app gets both halves
+ * rather than web capture with a phone-shaped blind spot.
+ */
+function planCapacitor(input: BuildPlanInput, io: InjectIO): Plan {
+  const entryFile = input.entryFile;
+  const angularHosted = entryFile ? isAngularHostedCapacitor(entryFile) : false;
+  const keyExpr = angularHosted
+    ? CAPACITOR_ANGULAR_KEY_EXPR
+    : keyExprFor(input)!;
+  const block = capacitorInitSnippet(input.endpoint, keyExpr, input.serviceName);
+
+  // Native plugins are optional peers, so the SDK degrades rather than failing
+  // without them — but a user who installs none gets web capture and no phone
+  // context at all, which is the outcome they came here to avoid. Say so.
+  const warnings = [
+    "Capacitor context comes from optional plugins — install the ones you want captured: @capacitor/app (foreground/background, deep links), @capacitor/device (model, OS, WebView version), @capacitor/network (connectivity), @capacitor/preferences (session continuity across cold starts).",
+    "Run `npx cap sync` after installing, or the native projects will not pick the plugins up.",
+  ];
+  if (angularHosted) {
+    warnings.push(
+      "Angular has no browser-safe env-var mechanism — add `crumbtrailKey: '<your-ingest-key>'` to src/environments/environment.ts (get your key from the dashboard) and import `environment` in src/main.ts.",
+    );
+  }
+
+  if (!entryFile) {
+    return fallbackPlan(input, block, [
+      "Could not resolve the Capacitor web entry — wire it manually.",
+      ...warnings,
+    ]);
+  }
+
+  return prependWithPreflight(input, io, entryFile, block, warnings);
+}
+
+/**
+ * Flutter.
+ *
+ * The only recipe that edits inside a function rather than prepending. Capture
+ * has to start before `runApp` and has to be awaited, so `wireFlutterMain`
+ * transforms `main`: import added, `main` made async, the start call inserted as
+ * its first statement. When the file is not in a shape that can be transformed
+ * with certainty, this hands back Dart guidance rather than a near-miss edit —
+ * a wrong guess here either fails to compile or, worse, compiles and captures
+ * nothing.
+ *
+ * It does NOT use `fallbackPlan`. That builds a JavaScript agent prompt from the
+ * registry stack, which for a Dart app would instruct an agent to install npm
+ * packages into a project that has no package.json.
+ */
+function planFlutter(input: BuildPlanInput, io: InjectIO): Plan {
+  const keyExpr = keyExprFor(input)!;
+  const snippet = flutterInitSnippet(
+    input.endpoint,
+    keyExpr,
+    input.serviceName,
+  );
+  // The key is compile-time in Dart, so it is supplied at build rather than
+  // read from a .env the app can see at runtime. Say so once, everywhere.
+  const buildNote =
+    "Flutter reads the key at build time — pass it with `--dart-define=CRUMBTRAIL_KEY=<your-ingest-key>` on `flutter run` and `flutter build` (get your key from the dashboard).";
+
+  const flutterFallback = (warnings: string[]): Plan => ({
+    recipe: input.recipe,
+    kind: "fallback-ai",
+    targetPath: null,
+    content: null,
+    snippet,
+    agentPrompt: [
+      "Wire the Crumbtrail Flutter SDK into this app.",
+      "",
+      "1. Run `flutter pub add crumbtrail_flutter`.",
+      "2. In lib/main.dart, make `main` async and await `Crumbtrail.start` before `runApp`:",
+      "",
+      snippet,
+      "",
+      "3. Add `CrumbtrailNavigatorObserver()` to the app's navigatorObservers (or the router's observers) so screen changes are captured.",
+      `4. ${buildNote}`,
+    ].join("\n"),
+    warnings,
+  });
+
+  const target = input.entryFile;
+  if (!target) {
+    return flutterFallback([
+      "Could not resolve lib/main.dart — wire it manually.",
+      buildNote,
+    ]);
+  }
+
+  const existing = io.readFile(target);
+  if (existing == null) {
+    return flutterFallback([
+      `Could not read ${target}; wire it manually.`,
+      buildNote,
+    ]);
+  }
+  if (referencesCrumbtrail(existing)) {
+    return skipPlan(input);
+  }
+
+  const wired = wireFlutterMain(
+    existing,
+    FLUTTER_IMPORT_LINE,
+    flutterInitLines(input.endpoint, keyExpr, input.serviceName),
+  );
+  if (wired == null) {
+    return flutterFallback([
+      `Could not find a single \`main()\` to wire in ${target} (an arrow-bodied main, or more than one, is not transformed automatically).`,
+      buildNote,
+    ]);
+  }
+
+  const warnings = [
+    buildNote,
+    // Errors and lifecycle are installed by start(); navigation is not, because
+    // the observer has to be handed to the app's navigator and the injector
+    // cannot edit a widget tree. Without it a timeline has no screen context.
+    "Add `CrumbtrailNavigatorObserver()` to your MaterialApp's `navigatorObservers` (or your router's `observers`) to capture screen changes.",
+  ];
+
+  const status = io.gitStatus(input.cwd, target);
+  if (status.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: target,
+      content: wired,
+      applyMode: "rewrite",
+      warnings: [
+        ...warnings,
+        `${target} has uncommitted changes — confirm (or re-run with force) before editing.`,
+      ],
+    };
+  }
+
+  return {
+    recipe: input.recipe,
+    kind: "rewrite",
+    targetPath: target,
+    content: wired,
+    warnings,
+  };
+}
+
 function planReactNative(input: BuildPlanInput, io: InjectIO): Plan {
   const block = reactNativeInitSnippet(
     input.endpoint,
@@ -616,9 +814,10 @@ export function buildPlan(
   // Stamp the env var the injected code reads its key from, so the wizard can
   // print "set <VAR> in .env — get your key from the dashboard". Undefined for
   // recipes that inject no key (tauri / otlp / angular) or when already wired.
-  const envVar = keyRefFor(input)?.envVar;
-  if (envVar && plan.kind !== "skip-already-wired") {
-    plan.keyEnvVar = envVar;
+  const keyRef = keyRefFor(input);
+  if (keyRef && plan.kind !== "skip-already-wired") {
+    plan.keyEnvVar = keyRef.envVar;
+    if (keyRef.compileTime) plan.keyIsCompileTime = true;
   }
   return plan;
 }
@@ -631,6 +830,10 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
   switch (input.recipe) {
     case "tauri":
       return planTauri(input, io);
+    case "capacitor":
+      return planCapacitor(input, io);
+    case "flutter":
+      return planFlutter(input, io);
     case "react-native":
       return planReactNative(input, io);
     case "next":

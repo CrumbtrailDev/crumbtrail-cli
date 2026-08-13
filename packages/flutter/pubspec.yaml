@@ -1,0 +1,28 @@
+name: crumbtrail_flutter
+description: Flutter SDK for Crumbtrail. Captures errors, network, navigation and app lifecycle around a bug, in the form a coding agent can act on.
+version: 0.1.0
+homepage: https://crumbtrail.ai
+repository: https://github.com/CrumbtrailDev/crumbtrail-cli
+issue_tracker: https://github.com/CrumbtrailDev/crumbtrail-cli/issues
+
+environment:
+  sdk: ^3.5.0
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # The ONLY runtime dependency, and it is a first-party flutter.dev package.
+  # Session continuity across cold starts needs durable storage, and making that
+  # opt-in would mean every launch opens a new session by default — turning a
+  # user's week of intermittent reports into unrelated one-event sessions.
+  # Device and OS facts come from dart:io instead of device_info_plus, so that
+  # is one dependency rather than three.
+  shared_preferences: ^2.3.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:

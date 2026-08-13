@@ -239,6 +239,91 @@ export function reactNativeInitSnippet(
 }
 
 /**
+ * Capacitor / Ionic init block. Prepended into the web entry.
+ *
+ * Calls `createCapacitorCrumbtrailAsync`, which runs `Crumbtrail.init` for the
+ * normal web capture and then attaches the native collectors. The async form is
+ * the injected one on purpose: it restores a session id persisted by a previous
+ * launch before init, and without that every cold start opens a fresh session,
+ * so a once-a-day intermittent bug never accumulates into one signature.
+ *
+ * `.catch(() => {})` because this is prepended at the very top of an entry file
+ * — a rejected floating promise there would surface as an unhandled rejection
+ * in the app's own error reporting, and telemetry setup must never do that.
+ */
+export function capacitorInitSnippet(
+  endpoint: string,
+  keyExpr: string,
+  serviceName?: string | null,
+): string {
+  return [
+    'import { createCapacitorCrumbtrailAsync } from "crumbtrail-capacitor";',
+    "",
+    "createCapacitorCrumbtrailAsync({",
+    "  config: {",
+    `    httpEndpoint: ${JSON.stringify(endpoint)},`,
+    `    httpAuthToken: ${keyExpr},`,
+    ...serviceLines(serviceName, "    ", JSON.stringify),
+    "  },",
+    "})",
+    "  .catch(() => {});",
+  ].join("\n");
+}
+
+/** The Dart import the Flutter recipe adds to `lib/main.dart`. */
+export const FLUTTER_IMPORT_LINE =
+  "import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';";
+
+/**
+ * The Flutter start call, as the lines that go inside `main`.
+ *
+ * Returned as lines rather than a block because this is the one recipe whose
+ * code is inserted INSIDE a function, so the caller indents it to match the
+ * `main` it found.
+ *
+ * Awaited on purpose: `Crumbtrail.start` reads the persisted session id before
+ * it resolves, and a fire-and-forget call would let `runApp` race it, so every
+ * cold start would open a fresh session and a once-a-day intermittent bug would
+ * never accumulate into one signature.
+ *
+ * `const` is what makes the compile-time key work: `String.fromEnvironment` is
+ * a const constructor, substituted from `--dart-define` at build time. Dart
+ * apps have no runtime environment to read on iOS or Android.
+ */
+export function flutterInitLines(
+  endpoint: string,
+  keyExpr: string,
+  serviceName?: string | null,
+): string[] {
+  return [
+    "await Crumbtrail.start(const CrumbtrailConfig(",
+    `  endpoint: ${singleQuoted(endpoint)},`,
+    `  ingestKey: ${keyExpr},`,
+    ...serviceLines(serviceName, "  ", singleQuoted),
+    "));",
+  ];
+}
+
+/** The same wiring as a whole-file example, for guidance when the transform bails. */
+export function flutterInitSnippet(
+  endpoint: string,
+  keyExpr: string,
+  serviceName?: string | null,
+): string {
+  return [
+    FLUTTER_IMPORT_LINE,
+    "",
+    "Future<void> main() async {",
+    ...flutterInitLines(endpoint, keyExpr, serviceName).map(
+      (line) => `  ${line}`,
+    ),
+    "",
+    "  runApp(const MyApp());",
+    "}",
+  ].join("\n");
+}
+
+/**
  * Tauri init block. Prepended into the frontend entry. Uses the core
  * `transportInstance` override (NOT the `transport` string-mode field) with a
  * `TauriTransport`, which routes bug reports to the local Rust store via the

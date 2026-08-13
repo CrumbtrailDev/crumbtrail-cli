@@ -1,0 +1,21 @@
+{
+  "capabilities": [
+    "app-lifecycle",
+    "device-info"
+  ],
+  "d": {
+    "args": [
+      "checkout failed",
+      "{\"orderId\":42}"
+    ],
+    "lv": "err"
+  },
+  "k": "con",
+  "platform": "ios",
+  "schemaVersion": 1,
+  "sdk": {
+    "name": "crumbtrail-fixture",
+    "version": "0.0.0-fixture"
+  },
+  "t": 1754000000000
+}

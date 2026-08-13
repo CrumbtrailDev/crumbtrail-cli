@@ -4,6 +4,7 @@ import {
   prependIntoSource,
   prologueEnd,
   referencesCrumbtrail,
+  wireFlutterMain,
 } from "../inject/text";
 
 const BLOCK =
@@ -77,5 +78,139 @@ describe("analyzeSource / referencesCrumbtrail", () => {
     expect(referencesCrumbtrail('import x from "crumbtrail-node";')).toBe(true);
     expect(referencesCrumbtrail("import x from 'crumbtrail-core';")).toBe(true);
     expect(referencesCrumbtrail("nothing here")).toBe(false);
+  });
+
+  it("flags the Dart package, whose name has no hyphen", () => {
+    // Missing this would re-wire an already-wired Flutter app on every re-run.
+    expect(
+      referencesCrumbtrail(
+        "import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';",
+      ),
+    ).toBe(true);
+  });
+});
+
+const IMPORT_LINE = "import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';";
+const INIT_LINES = [
+  "await Crumbtrail.start(const CrumbtrailConfig(",
+  "  endpoint: 'https://ingest.example.com',",
+  "));",
+];
+
+describe("wireFlutterMain", () => {
+  it("makes a synchronous main async and starts capture before runApp", () => {
+    const src = [
+      "import 'package:flutter/material.dart';",
+      "",
+      "void main() {",
+      "  runApp(const MyApp());",
+      "}",
+      "",
+    ].join("\n");
+    const out = wireFlutterMain(src, IMPORT_LINE, INIT_LINES)!;
+    expect(out).not.toBeNull();
+    // Future<void>, not `void`: an async void main cannot be awaited by
+    // anything and Dart's own lints flag it.
+    expect(out).toContain("Future<void> main() async {");
+    expect(out).not.toContain("void main() {");
+    expect(out).toContain(IMPORT_LINE);
+    // Capture must be running before the first frame, or the errors thrown
+    // during startup — the ones hardest to reproduce — are simply not seen.
+    expect(out.indexOf("Crumbtrail.start")).toBeLessThan(
+      out.indexOf("runApp"),
+    );
+    expect(out.indexOf(IMPORT_LINE)).toBeLessThan(out.indexOf("main()"));
+  });
+
+  it("leaves an already-async main's signature alone", () => {
+    const src = [
+      "import 'package:flutter/material.dart';",
+      "",
+      "Future<void> main() async {",
+      "  await setup();",
+      "  runApp(const MyApp());",
+      "}",
+      "",
+    ].join("\n");
+    const out = wireFlutterMain(src, IMPORT_LINE, INIT_LINES)!;
+    expect(out).toContain("Future<void> main() async {");
+    // Inserted first, so capture is live before the app's own async setup —
+    // which is code that can itself throw.
+    expect(out.indexOf("Crumbtrail.start")).toBeLessThan(
+      out.indexOf("await setup();"),
+    );
+  });
+
+  it("handles `void main() async`", () => {
+    const src = "void main() async {\n  runApp(const MyApp());\n}\n";
+    const out = wireFlutterMain(src, IMPORT_LINE, INIT_LINES)!;
+    expect(out).toContain("void main() async {");
+    expect(out).toContain("Crumbtrail.start");
+  });
+
+  it("indents the inserted call to match the main it found", () => {
+    const src = "void main() {\n  runApp(const MyApp());\n}\n";
+    const out = wireFlutterMain(src, IMPORT_LINE, INIT_LINES)!;
+    expect(out).toContain("  await Crumbtrail.start(const CrumbtrailConfig(");
+    expect(out).toContain("    endpoint: 'https://ingest.example.com',");
+  });
+
+  it("puts the import after existing directives, never above them", () => {
+    // Dart requires directives before declarations, and a `library` line has to
+    // stay first — inserting above it would not compile.
+    const src = [
+      "library my_app;",
+      "",
+      "import 'package:flutter/material.dart';",
+      "import 'src/home.dart';",
+      "",
+      "void main() {",
+      "  runApp(const MyApp());",
+      "}",
+      "",
+    ].join("\n");
+    const out = wireFlutterMain(src, IMPORT_LINE, INIT_LINES)!;
+    const lines = out.split("\n");
+    expect(lines[0]).toBe("library my_app;");
+    expect(lines.indexOf(IMPORT_LINE)).toBe(
+      lines.indexOf("import 'src/home.dart';") + 1,
+    );
+  });
+
+  it("declines an arrow-bodied main rather than guessing", () => {
+    // A near-miss edit here either fails to compile or, worse, compiles and
+    // captures nothing. Guidance is the better answer.
+    const src = "void main() => runApp(const MyApp());\n";
+    expect(wireFlutterMain(src, IMPORT_LINE, INIT_LINES)).toBeNull();
+  });
+
+  it("declines a main that takes arguments", () => {
+    const src = "void main(List<String> args) {\n  runApp(const MyApp());\n}\n";
+    expect(wireFlutterMain(src, IMPORT_LINE, INIT_LINES)).toBeNull();
+  });
+
+  it("declines when more than one main is present", () => {
+    const src = [
+      "void main() {",
+      "  runApp(const MyApp());",
+      "}",
+      "",
+      "void main() {",
+      "  runApp(const OtherApp());",
+      "}",
+      "",
+    ].join("\n");
+    expect(wireFlutterMain(src, IMPORT_LINE, INIT_LINES)).toBeNull();
+  });
+
+  it("declines a file with no main at all", () => {
+    expect(wireFlutterMain("class Foo {}\n", IMPORT_LINE, INIT_LINES)).toBeNull();
+  });
+
+  it("preserves CRLF line endings", () => {
+    const src = "import 'package:flutter/material.dart';\r\nvoid main() {\r\n  runApp(const MyApp());\r\n}\r\n";
+    const out = wireFlutterMain(src, IMPORT_LINE, INIT_LINES)!;
+    expect(out).toContain("\r\n");
+    expect(out.replace(/\r\n/g, "")).not.toContain("\n");
   });
 });

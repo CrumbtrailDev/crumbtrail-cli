@@ -350,8 +350,25 @@ export async function installSdk(
   if (packages.length === 0) {
     return { installed: false, packages: [] };
   }
-  const { cmd, add } = pmInvocation(input.packageManager);
   const run = input.spawnFn ?? realSpawn;
+
+  // Dart packages live on pub.dev, not npm. Nothing below this branch applies to
+  // them: there is no detected package manager, no npm version floor, and the
+  // deploy's tarball fallback serves npm tarballs only.
+  if (RECIPE_REGISTRY[input.recipe].packageEcosystem === "pub") {
+    input.ui.out(
+      `Installing SDK: ${color.cyan(`flutter pub add ${packages.join(" ")}`)}`,
+    );
+    const pubCode = run("flutter", ["pub", "add", ...packages], input.cwd);
+    if (pubCode === 0) return { installed: true, packages };
+    return {
+      installed: false,
+      packages,
+      note: `\`flutter pub add ${packages.join(" ")}\` failed — check that the Flutter SDK is on your PATH, then run it yourself.`,
+    };
+  }
+
+  const { cmd, add } = pmInvocation(input.packageManager);
   // Pin the registry install to the CLI's version floors so a stale dist-tag
   // can never leave a freshly wired service on an old SDK. The tarball fallback
   // below keeps bare names (tarball URLs are resolved by name prefix).
@@ -681,7 +698,10 @@ export async function runWizard(
     projectId: provisioned.projectId,
     appDir: cwd,
     repoRoot: cwd,
-    varName: plan.keyEnvVar,
+    // A compile-time key (Flutter) has no env file to live in. Writing one
+    // would mint a live credential into a file the app never reads, and every
+    // line printed after it would report success for an app capturing nothing.
+    varName: plan.keyIsCompileTime ? undefined : plan.keyEnvVar,
     parsed,
     deps,
   });
@@ -697,9 +717,11 @@ export async function runWizard(
     keyWrite.status === "written" || keyWrite.status === "already-set";
   const setKeyHint = keyReady
     ? "Start your app"
-    : plan.keyEnvVar
-      ? `Set ${plan.keyEnvVar} in your .env to your ingest key`
-      : "Set your ingest key";
+    : plan.keyIsCompileTime
+      ? `Rebuild with --dart-define=${plan.keyEnvVar}=<your-ingest-key>`
+      : plan.keyEnvVar
+        ? `Set ${plan.keyEnvVar} in your .env to your ingest key`
+        : "Set your ingest key";
 
   // User-facing links point at the app host (the SPA), not the API host.
   const appBase = dashboardBase(base);
@@ -763,6 +785,7 @@ export async function runWizard(
     sessionUrl,
     keyWrite,
     cwd,
+    plan.keyIsCompileTime,
   );
   return 0;
 }
@@ -810,6 +833,8 @@ export interface ServiceOutcome {
   serviceId?: string;
   /** Env var the injected code reads its key from. */
   keyEnvVar?: string;
+  /** That variable is supplied at build time, so it has no env file to go in. */
+  keyIsCompileTime?: boolean;
   /** True once this run wrote the project's key into that variable, which is
    *  what decides whether the summary still asks for it. */
   keyWritten?: boolean;
@@ -1105,6 +1130,7 @@ export async function runBatchWizard(
         status: applied.status,
         serviceId: svc.serviceId,
         keyEnvVar: plan.keyEnvVar,
+        keyIsCompileTime: plan.keyIsCompileTime,
         filesTouched: applied.filesTouched,
         notes: [
           ...(!install.installed && install.note ? [install.note] : []),
@@ -1144,7 +1170,7 @@ export async function runBatchWizard(
     targets: reporting.map((o) => ({
       label: o.name,
       appDir: path.resolve(root, o.relDir),
-      varName: o.keyEnvVar,
+      varName: o.keyIsCompileTime ? undefined : o.keyEnvVar,
     })),
     parsed,
     deps,
@@ -1167,7 +1193,9 @@ export async function runBatchWizard(
       // they end up pasting a second key over a working one.
       if (o.keyEnvVar && !o.keyWritten) {
         o.notes.push(
-          `Set ${o.keyEnvVar} in this service's .env (mint at ${appBase}/settings).`,
+          o.keyIsCompileTime
+            ? `Pass --dart-define=${o.keyEnvVar}=<your-ingest-key> to flutter run and flutter build (mint at ${appBase}/settings).`
+            : `Set ${o.keyEnvVar} in this service's .env (mint at ${appBase}/settings).`,
         );
       }
     }
@@ -1710,6 +1738,7 @@ function printSummary(
   sessionUrl?: string,
   keyWrite?: KeyWriteOutcome,
   repoRoot?: string,
+  keyIsCompileTime?: boolean,
 ): void {
   // User-facing links point at the app host (the SPA), not the API host.
   const appBase = dashboardBase(base);
@@ -1729,6 +1758,11 @@ function printSummary(
     } else if (keyWrite?.status === "already-set") {
       ui.out(
         `  Ingest key: ${color.bold(keyEnvVar)} was already set in ${color.cyan(where)}`,
+      );
+    } else if (keyIsCompileTime) {
+      // Dart bakes the value in at build time, so there is no file to point at.
+      ui.out(
+        `  Ingest key: build with ${color.bold(`--dart-define=${keyEnvVar}=<your-ingest-key>`)} ${color.dim(`(mint at ${appBase}/settings)`)}`,
       );
     } else {
       ui.out(

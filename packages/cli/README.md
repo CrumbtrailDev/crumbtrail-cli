@@ -15,7 +15,8 @@ That's the whole install. There's nothing to add to `package.json` first.
 Running `npx crumbtrail` walks the full path in one pass:
 
 1. **Detects** your stack — Next.js, Vite, React, Vue, Svelte, Express, Hono, Node,
-   and non-JS services like Django, Rails, Go and .NET.
+   phone apps (React Native, Expo, Capacitor, Ionic, Flutter), and non-JS services
+   like Django, Rails, Go and .NET.
 2. **Logs you in** (opens a browser, or use `--no-browser` for a device code).
 3. **Provisions** a project and service, mints the project's ingest key, and
    writes it into your app's env file — see "What it writes" for the rules that
@@ -149,6 +150,8 @@ CLI and the composite action never echo the key.
 Two kinds of change, in the package it's wiring:
 
 - the SDK import and `Crumbtrail.init(...)` call in your entry file
+- for a Flutter app, the import plus an awaited `Crumbtrail.start(...)` as the
+  first statement of `main()` (capture has to be running before the first frame)
 - your ingest key, in an env file, plus a `.gitignore` entry for that file
 
 The injected code reads the key from a framework-appropriate environment
@@ -179,6 +182,14 @@ to `.env`, created `0600`. The key value is never printed to your terminal.
 Pass `--no-write-key` to skip all of this and set the variable yourself, which
 is the right choice when your secrets come from a vault or your platform's own
 environment UI.
+
+Flutter is the one exception to the `.env` part, because Dart has no runtime
+environment to read on a phone. The injected code reads the key at compile time,
+so you pass it to the build instead:
+
+```bash
+flutter run --dart-define=CRUMBTRAIL_KEY=<your-ingest-key>
+```
 
 It won't touch a package that is already wired, and it never edits libraries or
 config-only packages.

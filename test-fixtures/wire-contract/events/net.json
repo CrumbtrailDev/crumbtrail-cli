@@ -1,0 +1,22 @@
+{
+  "capabilities": [
+    "app-lifecycle",
+    "device-info"
+  ],
+  "d": {
+    "dur": 318,
+    "method": "POST",
+    "ok": false,
+    "source": "urlsession",
+    "status": 402,
+    "url": "https://api.example.com/v1/orders"
+  },
+  "k": "net",
+  "platform": "ios",
+  "schemaVersion": 1,
+  "sdk": {
+    "name": "crumbtrail-fixture",
+    "version": "0.0.0-fixture"
+  },
+  "t": 1754000000000
+}

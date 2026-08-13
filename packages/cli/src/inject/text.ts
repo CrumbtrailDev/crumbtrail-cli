@@ -53,9 +53,15 @@ export function prologueEnd(lines: string[]): number {
   return end;
 }
 
-/** True when the source already references either Crumbtrail SDK package. */
+/**
+ * True when the source already references a Crumbtrail SDK package.
+ *
+ * `crumbtrail_flutter` is included because Dart is the one ecosystem whose
+ * package name is not spelled with a hyphen, and an underscore name would not
+ * match the JS pattern — leaving a wired Flutter app to be wired a second time.
+ */
 export function referencesCrumbtrail(text: string): boolean {
-  return /crumbtrail-core|crumbtrail-node/.test(text);
+  return /crumbtrail-core|crumbtrail-node|crumbtrail_flutter/.test(text);
 }
 
 /**
@@ -141,6 +147,72 @@ export function wireExpressMiddleware(
   // Insert bottom-up so earlier indices stay valid.
   out.splice(listenIdx, 0, indentOf(lines[listenIdx]) + makeErrorLine(appVar));
   out.splice(appIdx + 1, 0, indentOf(lines[appIdx]) + makeRequestLine(appVar));
+  return bom + out.join(eol);
+}
+
+// --- Flutter main() wiring ---------------------------------------------------
+
+/** `void main() {`, `Future<void> main() async {`, and the shapes between. */
+const DART_MAIN_RE =
+  /^(\s*)(?:Future<void>|void)\s+main\s*\(\s*\)\s*(async\s+)?\{\s*$/;
+
+/** A Dart import/export directive at the top of a file. */
+const DART_IMPORT_RE = /^\s*(?:import|export)\s+['"]/;
+
+/**
+ * Wire Crumbtrail into a Flutter `lib/main.dart`.
+ *
+ * Prepending cannot work here, unlike every JS recipe. Capture has to start
+ * *inside* `main`, before `runApp`, and it has to be awaited — the session id
+ * from the previous launch is read from disk, and not awaiting it means every
+ * cold start opens a new session. So this transforms the function: it inserts
+ * the import after the existing directives, makes `main` async when it is not
+ * already, and inserts the awaited start call as the first statement.
+ *
+ * Returns null unless the file has exactly one `main` in a shape it recognises.
+ * The caller then falls back to guidance. A near-miss guess here would either
+ * fail to compile or, worse, compile while capturing nothing.
+ */
+export function wireFlutterMain(
+  existing: string,
+  importLine: string,
+  initLines: string[],
+): string | null {
+  const { bom, eol, lines } = analyzeSource(existing);
+
+  const matches: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (DART_MAIN_RE.test(lines[i])) matches.push(i);
+  }
+  // Zero matches means an arrow-bodied `void main() => runApp(...)`, a main with
+  // arguments, or something else entirely. More than one means we cannot tell
+  // which is the entry point. Either way, guessing is worse than guidance.
+  if (matches.length !== 1) return null;
+
+  const mainIdx = matches[0];
+  const match = lines[mainIdx].match(DART_MAIN_RE)!;
+  const indent = match[1];
+  const isAsync = Boolean(match[2]);
+
+  const out = [...lines];
+  // Rewrite the signature when main is synchronous. `Future<void>` rather than
+  // `void`: an async function returning void cannot be awaited by anything, and
+  // Dart's own lints flag it.
+  if (!isAsync) {
+    out[mainIdx] = `${indent}Future<void> main() async {`;
+  }
+  const body = initLines.map((line) => (line ? `${indent}  ${line}` : ""));
+  out.splice(mainIdx + 1, 0, ...body, "");
+
+  // Imports must precede declarations in Dart, so the import goes after the last
+  // existing directive rather than at the very top — inserting above a
+  // `library`/`part of` line would not compile.
+  let importIdx = 0;
+  for (let i = 0; i < mainIdx; i++) {
+    if (DART_IMPORT_RE.test(lines[i])) importIdx = i + 1;
+  }
+  out.splice(importIdx, 0, importLine);
+
   return bom + out.join(eol);
 }
 

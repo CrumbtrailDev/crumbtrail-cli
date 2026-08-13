@@ -110,9 +110,9 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
     `core=${path.basename(core)} node=${path.basename(node)} cli=${path.basename(cli)}`,
   );
 
-  // Optional SDK channel: react-native. React and Tauri used to pack here as
-  // their own tarballs; they are now the `crumbtrail-core/react` and
-  // `crumbtrail-core/tauri` subpaths, so they ship inside the core tarball
+  // Optional SDK channels: react-native + capacitor. React and Tauri used to
+  // pack here as their own tarballs; they are now the `crumbtrail-core/react`
+  // and `crumbtrail-core/tauri` subpaths, so they ship inside the core tarball
   // packed above and need no channel of their own. Best-effort — a
   // missing/broken pack warns and is simply absent from the manifest (the
   // installer stays fully functional for the core trio; the wizard's tarball
@@ -123,10 +123,16 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
     outDir,
     logFn,
   });
+  const capacitor = await packOptional({
+    filter: "crumbtrail-capacitor",
+    packageDir: path.join(repoRoot, "packages", "capacitor"),
+    outDir,
+    logFn,
+  });
   logFn(
     "pack-optional",
     "pass",
-    `reactNative=${reactNative ? path.basename(reactNative) : "(absent)"}`,
+    `reactNative=${reactNative ? path.basename(reactNative) : "(absent)"} capacitor=${capacitor ? path.basename(capacitor) : "(absent)"}`,
   );
 
   const manifest = {
@@ -139,6 +145,7 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
     // them as absent-by-default (install-routes omits them; the CLI's tarball
     // discovery only resolves them when listed).
     ...(reactNative ? { reactNative } : {}),
+    ...(capacitor ? { capacitor } : {}),
   };
   const manifestPath = path.join(outDir, "pack-manifest.json");
   await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);

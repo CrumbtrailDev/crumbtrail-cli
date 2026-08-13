@@ -427,6 +427,39 @@ describe("wizard orchestration", () => {
     expect(lines.join("\n")).toMatch(/added .* to \.gitignore/i);
   });
 
+  it("writes no env file for a compile-time key, and says --dart-define instead", async () => {
+    const steps: string[] = [];
+    const envFileIO = fakeEnvIO();
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps },
+      {
+        ui,
+        envFileIO,
+        buildPlan: vi.fn(() => {
+          steps.push("build");
+          return {
+            recipe: "flutter",
+            kind: "rewrite",
+            targetPath: "/app/lib/main.dart",
+            content: "// wired",
+            warnings: [],
+            keyEnvVar: "CRUMBTRAIL_KEY",
+            keyIsCompileTime: true,
+          } as Plan;
+        }) as unknown as WizardDeps["buildPlan"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+
+    // Dart bakes the value in at build time. A .env here would be a live
+    // credential in a file the app never reads, with every printed step
+    // reporting success for an app that captures nothing.
+    expect(envFileIO.files.size).toBe(0);
+    expect(steps).not.toContain("mint-key");
+    expect(lines.join("\n")).toContain("--dart-define=CRUMBTRAIL_KEY");
+  });
+
   // Adding the file to .gitignore afterwards would not untrack it, so the very
   // next commit would publish the key. Nothing is minted at all.
   it("mints nothing when the env file is tracked by git", async () => {
@@ -502,6 +535,51 @@ describe("wizard orchestration", () => {
 
 describe("installSdk — tarball fallback (registry unavailable)", () => {
   const uiSink: Ui = { out: () => {}, err: () => {} };
+
+  it("installs the Flutter SDK with pub, never a JS package manager", async () => {
+    const calls: { cmd: string; args: string[] }[] = [];
+    const result = await realInstallSdk({
+      cwd: "/app",
+      // Detection finds no lockfile in a Flutter app, and it does not matter:
+      // a Dart package is not on npm, so the package manager is irrelevant.
+      packageManager: null,
+      recipe: "flutter",
+      base: "https://deploy.example",
+      ui: uiSink,
+      spawnFn: (cmd, args) => {
+        calls.push({ cmd, args });
+        return 0;
+      },
+      fetchImpl: (async () => {
+        throw new Error("the pub path must not touch the network");
+      }) as unknown as typeof fetch,
+    });
+
+    expect(result.installed).toBe(true);
+    expect(calls).toEqual([
+      { cmd: "flutter", args: ["pub", "add", "crumbtrail_flutter"] },
+    ]);
+    // npm version floors are spelled `pkg@>=x.y.z` and mean nothing to pub.
+    expect(JSON.stringify(calls)).not.toContain(">=");
+  });
+
+  it("tells the user to check their PATH when pub add fails", async () => {
+    const result = await realInstallSdk({
+      cwd: "/app",
+      packageManager: null,
+      recipe: "flutter",
+      base: "https://deploy.example",
+      ui: uiSink,
+      spawnFn: () => 1,
+      fetchImpl: (async () => {
+        // The deploy's tarball fallback serves npm tarballs; there is nothing
+        // there for a Dart package, so it must not be attempted.
+        throw new Error("no tarball fallback for pub");
+      }) as unknown as typeof fetch,
+    });
+    expect(result.installed).toBe(false);
+    expect(result.note).toContain("Flutter SDK is on your PATH");
+  });
 
   it("falls back to the deploy's /install tarballs when the registry install fails", async () => {
     const calls: string[][] = [];

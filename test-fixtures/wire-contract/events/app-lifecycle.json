@@ -1,0 +1,18 @@
+{
+  "capabilities": [
+    "app-lifecycle",
+    "device-info"
+  ],
+  "d": {
+    "source": "app-lifecycle",
+    "state": "background"
+  },
+  "k": "app-lifecycle",
+  "platform": "ios",
+  "schemaVersion": 1,
+  "sdk": {
+    "name": "crumbtrail-fixture",
+    "version": "0.0.0-fixture"
+  },
+  "t": 1754000000000
+}
