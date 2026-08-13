@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "pnpm -r build",
+    "pretest": "pnpm --filter crumbtrail-core build",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r --if-present run typecheck",
     "lint": "eslint .",

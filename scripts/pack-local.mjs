@@ -88,20 +88,13 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
   logFn(
     "build",
     "start",
-    "packages=crumbtrail-core,crumbtrail-node,crumbtrail-design-system,crumbtrail-detect-core,crumbtrail",
+    "packages=crumbtrail-core,crumbtrail-node,crumbtrail",
   );
   await run("pnpm", ["--filter", "crumbtrail-core", "build"], repoRoot);
   await run("pnpm", ["--filter", "crumbtrail-node", "build"], repoRoot);
-  // The CLI (package name `crumbtrail`) depends on the design system and on
-  // detect-core, which now carries the shared install-instruction builders on
-  // its `/install` subpath. Both must be built before `pnpm pack` can resolve
-  // the CLI's workspace deps into its bundle.
-  await run(
-    "pnpm",
-    ["--filter", "crumbtrail-design-system", "build"],
-    repoRoot,
-  );
-  await run("pnpm", ["--filter", "crumbtrail-detect-core", "build"], repoRoot);
+  // The CLI (package name `crumbtrail`) now carries detection, injection
+  // planning and the shared install-instruction builders as its own source, so
+  // it has no workspace package to build first beyond core.
   await run("pnpm", ["--filter", "crumbtrail", "build"], repoRoot);
   logFn("build", "pass");
 

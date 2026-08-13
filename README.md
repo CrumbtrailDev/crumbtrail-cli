@@ -12,16 +12,14 @@ them require it.
 
 | Package | Description |
 | --- | --- |
-| [`crumbtrail`](packages/cli) | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. |
+| [`crumbtrail`](packages/cli) | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. Also the detection and injection-planning library the hosted product imports, with install recipes and agent prompts on the `/install` subpath. |
 | [`crumbtrail-core`](packages/core) | Framework-agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. React bindings on the `/react` subpath, Tauri bindings on `/tauri`. |
 | [`crumbtrail-node`](packages/node) | Node.js server: session store, backend capture, the local dashboard. |
 | [`crumbtrail-react-native`](packages/react-native) | React Native and Expo bindings. Its own package because its native peer dependencies must not reach a web bundle. |
 | [`crumbtrail-capacitor`](packages/capacitor) | Capacitor and Ionic bindings: adds device, app lifecycle, connectivity and deep link context to the web capture already running in the WebView. |
-| [`crumbtrail-detect-core`](packages/detect-core) | Framework detection and injection planning, shared by the CLI and cloud automation. Reads only and writes nothing. Install recipes and agent prompts on the `/install` subpath. |
 
-Those six are the whole npm surface, and they all publish at one shared version.
-A given release is the same number everywhere, so there is no question of which
-versions go together.
+All five publish at one shared version. A given release is the same number
+everywhere, so there is no question of which versions go together.
 
 React and Tauri have no package of their own: they are the `crumbtrail-core/react`
 and `crumbtrail-core/tauri` subpaths, because each was a few hundred lines of

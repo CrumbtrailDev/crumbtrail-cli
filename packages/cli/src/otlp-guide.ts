@@ -11,10 +11,10 @@
 
 import path from "node:path";
 import type { Stack } from "crumbtrail-core";
-import { OTLP_GUIDE_FILENAME } from "crumbtrail-detect-core";
+import { OTLP_GUIDE_FILENAME } from "./otlp";
 import type { Plan } from "./inject";
 
-export { OTLP_GUIDE_FILENAME } from "crumbtrail-detect-core";
+export { OTLP_GUIDE_FILENAME } from "./otlp";
 
 export interface OtlpGuideInput {
   stack: Stack;

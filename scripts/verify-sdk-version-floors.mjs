@@ -7,7 +7,7 @@ import ts from "typescript";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(scriptDir, "..");
-const registryPath = path.join(rootDir, "packages/detect-core/src/recipe-registry.ts");
+const registryPath = path.join(rootDir, "packages/cli/src/recipe-registry.ts");
 
 const RELEASE_VERSION = /^(\d+)\.(\d+)\.(\d+)$/;
 
