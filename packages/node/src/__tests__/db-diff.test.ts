@@ -13,6 +13,14 @@ import {
   DEFAULT_SENSITIVE_DB_COLUMNS,
 } from "../db";
 
+/**
+ * `db.statement` is emitted for EVERY instrumented statement, whatever it returned, so it appears
+ * in every stream in this file and is evidence about neither row reads nor row diffs — which is
+ * what these suites bind. Its own behaviour, including that it survives when nothing else is
+ * captured, is bound in `db-successful-statement.test.ts`.
+ */
+const notStatement = (event: BugEvent): boolean => event.k !== "db.statement";
+
 /** A fake duck-typed pg client that returns canned rows and records every query. */
 function fakePgClient(
   handler: (
@@ -121,7 +129,9 @@ describe("instrumentPgClient", () => {
     const db = instrumentPgClient(client, {
       requestId: "req-1",
       sessionId: "ses",
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     await db.query("INSERT INTO orders (name) VALUES ($1)", ["Ada"]);
@@ -145,7 +155,9 @@ describe("instrumentPgClient", () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(client, {
       requestId: "req-d",
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     await db.query("DELETE FROM widgets WHERE id = $1", [9]);
@@ -167,7 +179,9 @@ describe("instrumentPgClient", () => {
     const db = instrumentPgClient(client, {
       requestId: "req-u",
       captureBefore: true,
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     await db.query("UPDATE orders SET status = $1 WHERE id = $2", [
@@ -188,7 +202,9 @@ describe("instrumentPgClient", () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(client, {
       requestId: "r",
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     await db.query("SELECT * FROM users WHERE id = $1", [1]);
@@ -202,7 +218,9 @@ describe("instrumentPgClient", () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(client, {
       getRequestId: () => undefined,
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     await db.query("INSERT INTO t (a) VALUES ($1)", [1]);
@@ -230,7 +248,9 @@ describe("instrumentPgClient", () => {
     const db = instrumentPgClient(client, {
       requestId: "req-u",
       captureBefore: true,
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     const result = await db.query(
@@ -264,6 +284,7 @@ describe("instrumentPgClient", () => {
     const db = instrumentPgClient(client, {
       requestId: "req-1",
       emit: (event) => {
+        if (!notStatement(event)) return;
         primaryEvents.push(event);
         if (event.k === DB_DIFF_EVENT_KIND) {
           throw new Error("sink exploded");
@@ -293,7 +314,9 @@ describe("instrumentPgClient", () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(client, {
       requestId: "r",
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     await db.query("INSERT INTO sessions (token) VALUES ($1)", ["x"]);
@@ -321,7 +344,9 @@ describe("instrumentPgClient", () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(pool, {
       requestId: "req-pool",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     const client = await db.connect();
@@ -362,7 +387,9 @@ describe("instrumentPgClient", () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(pool, {
       requestId: "req-callback-pool",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -403,14 +430,16 @@ describe("instrumentPgClient", () => {
       },
       {
         requestId: "req-pool-query",
-        emit: (event) => events.push(event),
+        emit: (event) => {
+          if (notStatement(event)) events.push(event);
+        },
       },
     );
 
-    await instrumented.query(
-      "UPDATE orders SET status = $1 WHERE id = $2",
-      ["ready", 11],
-    );
+    await instrumented.query("UPDATE orders SET status = $1 WHERE id = $2", [
+      "ready",
+      11,
+    ]);
 
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
@@ -451,7 +480,9 @@ describe("instrumentPgClient", () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(pool, {
       requestId: "req-uninstrumented",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
     let callbackClient: unknown;
 
@@ -493,7 +524,9 @@ describe("correlation reuse", () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(client, {
       ...ctx,
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
     await db.query("UPDATE orders SET paid = $1 WHERE id = $2", [false, 1]);
 

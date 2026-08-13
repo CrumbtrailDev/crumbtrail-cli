@@ -57,6 +57,15 @@ interface SignatureDictionaryEntry {
   sig: string;
   path?: string;
   tag?: string;
+  /**
+   * The remaining `d.el` fields — text, label, href, name, id, class — that are
+   * IDENTICAL on every event sharing this signature, so hoisting them here
+   * describes the element rather than inventing a value for it. A field that
+   * varies between two events, or is absent from one of them, never reaches
+   * this map; it rides the cold event instead. Additive: a dictionary written
+   * before this field existed simply has none.
+   */
+  desc?: Record<string, string>;
   firstSeen: number;
   firstEventKind: string;
 }
@@ -68,7 +77,7 @@ interface SignatureDictionary {
 
 interface SignatureDictionaryBuildResult {
   dictionary: SignatureDictionary;
-  signatureIds: Map<string, number>;
+  entriesBySig: Map<string, SignatureDictionaryEntry>;
 }
 
 export interface WriteTwoPlaneSessionArtifactsInput {
@@ -95,7 +104,7 @@ export interface ColdEvidenceArtifacts {
 export async function writeColdEvidenceArtifacts(
   input: WriteColdEvidenceArtifactsInput,
 ): Promise<ColdEvidenceArtifacts> {
-  const { dictionary: signatures, signatureIds } = buildSignatureDictionary(
+  const { dictionary: signatures, entriesBySig } = buildSignatureDictionary(
     input.events,
   );
   await writeGeneratedArtifact(
@@ -105,7 +114,7 @@ export async function writeColdEvidenceArtifacts(
   );
 
   const coldEvents = input.events.map((event) =>
-    prepareColdEvent(event, signatureIds),
+    prepareColdEvent(event, entriesBySig),
   );
   const coldNdjson =
     coldEvents.length > 0
@@ -132,10 +141,18 @@ export async function writeColdEvidenceArtifacts(
  * Rehydrates the cold event stream back into analyzable {@link BugEvent}s.
  *
  * This is the read inverse of {@link writeColdEvidenceArtifacts}: it
- * decompresses `events.ndjson.zst` and expands each `d.el = { sigRef }` back
- * into the `{ sig, path, tag }` shape the analyzer expects, using
- * `signatures.json` as the dictionary. Without that expansion every element
- * anchored detector sees a bare numeric ref and silently stops matching.
+ * decompresses `events.ndjson.zst` and expands each `d.el = { sigRef, ... }`
+ * back into the descriptor shape the analyzer expects, using `signatures.json`
+ * as the dictionary. Without that expansion every element anchored detector
+ * sees a bare numeric ref and silently stops matching.
+ *
+ * The expansion is the whole descriptor, not just its identity half. Readers
+ * take an element's text, label and href off `d.el` to say WHICH element a
+ * finding is about; a round trip that returned only `{ sig, path, tag }` would
+ * make two different elements indistinguishable, which both hides findings and
+ * merges unrelated ones. Fields the dictionary hoisted (identical on every
+ * event for that signature) come from the entry; fields that varied come off
+ * the event itself and win, so no event is ever described by another's value.
  *
  * Returns undefined when the session has no cold artifact (a live session that
  * has not finalized yet, where `events.ndjson` is still the source of truth).
@@ -231,16 +248,52 @@ function rehydrateColdEvent(
   const sigRef = finiteNumber(el?.sigRef);
   if (sigRef === undefined) return event;
   const entry = bySigRef.get(sigRef);
-  // A dangling ref means signatures.json is missing or truncated. Drop the
-  // placeholder rather than leave `{ sigRef }` behind, so detectors treat the
-  // element as absent instead of matching against a meaningless shape.
-  const rehydrated = entry
-    ? removeUndefined({ sig: entry.sig, path: entry.path, tag: entry.tag })
-    : undefined;
+  // Per-event fields last: they are the value THIS event carried, so they
+  // override anything the dictionary hoisted for the signature.
+  const rehydrated: Record<string, unknown> = {
+    ...(entry
+      ? removeUndefined({
+          sig: entry.sig,
+          path: entry.path,
+          tag: entry.tag,
+          ...dictionaryDescriptorFields(entry),
+        })
+      : {}),
+  };
+  for (const [key, value] of Object.entries(el ?? {})) {
+    if (key === COLD_ELEMENT_REF_KEY) continue;
+    rehydrated[key] = value;
+  }
   const nextData = { ...data };
-  if (rehydrated) nextData.el = rehydrated;
+  // A dangling ref with nothing else on it means signatures.json is missing or
+  // truncated. Drop the placeholder rather than leave `{ sigRef }` behind, so
+  // detectors treat the element as absent instead of matching against a
+  // meaningless shape. Per-event fields that did survive are still real
+  // evidence, so they are kept even when the entry cannot be resolved.
+  if (Object.keys(rehydrated).length > 0) nextData.el = rehydrated;
   else delete nextData.el;
   return { ...event, d: nextData } as BugEvent;
+}
+
+/**
+ * The hoisted descriptor half of an entry, defensively narrowed.
+ *
+ * `signatures.json` is read back off disk and may have been written by an older
+ * build (no `desc` at all) or edited by hand, so only string values under
+ * structurally safe names are admitted.
+ */
+function dictionaryDescriptorFields(
+  entry: SignatureDictionaryEntry,
+): Record<string, string> {
+  const desc = (entry as { desc?: unknown }).desc;
+  if (!isRecord(desc)) return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(desc)) {
+    if (key === COLD_ELEMENT_REF_KEY || RESERVED_ELEMENT_KEYS.has(key)) continue;
+    const safe = safeString(value);
+    if (safe !== undefined && sanitizeKey(key, "d.el") === key) out[key] = safe;
+  }
+  return out;
 }
 
 export async function writeTwoPlaneSessionArtifacts(
@@ -309,53 +362,163 @@ export function sanitizeEventForStorage(event: BugEvent): BugEvent {
   ) as unknown as BugEvent;
 }
 
+/** The key the cold event carries instead of repeating the signature string. */
+const COLD_ELEMENT_REF_KEY = "sigRef";
+/**
+ * Descriptor names the entry already models at its top level, so `desc` never
+ * shadows them. `d.el.id` (the element's DOM id) is deliberately NOT here: the
+ * entry's numeric `id` lives beside `desc`, not inside it, so there is no
+ * collision and the DOM id is hoisted like any other descriptive field.
+ */
+const RESERVED_ELEMENT_KEYS = new Set(["sig", "path", "tag"]);
+
+/**
+ * Builds the signature dictionary, hoisting into it only what it can describe
+ * without inventing anything.
+ *
+ * Two passes, deliberately. The identity of an element (`sig`) is stable by
+ * construction, but everything descriptive about it is not: the same button's
+ * text changes as the UI updates, so a first-seen value replayed onto every
+ * later event would fabricate evidence — the same class of defect as dropping
+ * the field altogether, only harder to notice. A field is therefore hoisted
+ * only when every event carrying that signature agreed on it; the moment two
+ * events disagree, or one lacks the field, it is demoted and travels per event.
+ *
+ * Values are compared after {@link safeString} normalization, which is the same
+ * normalization the entry stores, so a field longer than the entry's cap still
+ * dedupes to the entry instead of being re-stored in full on every event.
+ */
 function buildSignatureDictionary(
   events: BugEvent[],
 ): SignatureDictionaryBuildResult {
-  const bySig = new Map<string, SignatureDictionaryEntry>();
-  const signatureIds = new Map<string, number>();
+  interface Accumulator {
+    id: number;
+    sig: string;
+    firstSeen: number;
+    firstEventKind: string;
+    /** Fields agreed on by every occurrence so far. */
+    shared: Map<string, string>;
+  }
+  const bySig = new Map<string, Accumulator>();
 
   for (const event of events) {
     const data = isRecord(event.d) ? event.d : {};
     const el = isRecord(data.el) ? data.el : undefined;
     const sig = safeId(el?.sig);
-    if (!el || !sig || bySig.has(sig)) continue;
-    const id = bySig.size + 1;
-    signatureIds.set(sig, id);
-    const sanitized = sanitizeRecord(el, "d.el");
-    bySig.set(
-      sig,
-      removeUndefined({
-        id,
+    if (!el || !sig) continue;
+    const observed = normalizedDescriptorFields(sanitizeRecord(el, "d.el"));
+    const existing = bySig.get(sig);
+    if (!existing) {
+      bySig.set(sig, {
+        id: bySig.size + 1,
         sig: sanitizeIdentifier(sig, "d.el.sig"),
-        path: safeString(sanitized.path),
-        tag: safeString(sanitized.tag),
         firstSeen: finiteNumber(event.t) ?? 0,
         firstEventKind: safeString(event.k) ?? "unknown",
+        shared: observed,
+      });
+      continue;
+    }
+    for (const [key, value] of existing.shared) {
+      if (observed.get(key) !== value) existing.shared.delete(key);
+    }
+  }
+
+  const entriesBySig = new Map<string, SignatureDictionaryEntry>();
+  for (const [sig, acc] of bySig) {
+    const desc: Record<string, string> = {};
+    for (const [key, value] of acc.shared) {
+      if (RESERVED_ELEMENT_KEYS.has(key)) continue;
+      desc[key] = value;
+    }
+    entriesBySig.set(
+      sig,
+      removeUndefined({
+        id: acc.id,
+        sig: acc.sig,
+        path: acc.shared.get("path"),
+        tag: acc.shared.get("tag"),
+        desc: Object.keys(desc).length > 0 ? desc : undefined,
+        firstSeen: acc.firstSeen,
+        firstEventKind: acc.firstEventKind,
       }),
     );
   }
 
   return {
-    dictionary: { schemaVersion: 1, entries: [...bySig.values()] },
-    signatureIds,
+    dictionary: { schemaVersion: 1, entries: [...entriesBySig.values()] },
+    entriesBySig,
   };
+}
+
+/**
+ * The already-sanitized `d.el` reduced to the string fields a dictionary entry
+ * is able to hold, under the entry's own normalization. Non-strings and empty
+ * strings are never hoisted; they stay on the event.
+ */
+function normalizedDescriptorFields(
+  el: Record<string, unknown>,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const [key, value] of Object.entries(el)) {
+    if (key === COLD_ELEMENT_REF_KEY) continue;
+    const safe = safeString(value);
+    if (safe !== undefined) out.set(key, safe);
+  }
+  return out;
 }
 
 function prepareColdEvent(
   event: BugEvent,
-  signatureIds: Map<string, number>,
+  entriesBySig: Map<string, SignatureDictionaryEntry>,
 ): BugEvent {
   const sanitized = sanitizeEventForStorage(event);
   const data = isRecord(event.d) ? event.d : {};
   const el = isRecord(data.el) ? data.el : undefined;
   const sig = safeId(el?.sig);
-  const sigRef = sig ? signatureIds.get(sig) : undefined;
+  const entry = sig ? entriesBySig.get(sig) : undefined;
   if (!isRecord(sanitized.d)) sanitized.d = {};
-  if (sigRef !== undefined) {
-    sanitized.d = { ...sanitized.d, el: { sigRef } };
+  if (entry !== undefined) {
+    const sanitizedEl = isRecord(sanitized.d.el) ? sanitized.d.el : {};
+    sanitized.d = {
+      ...sanitized.d,
+      el: {
+        [COLD_ELEMENT_REF_KEY]: entry.id,
+        ...residualElementFields(sanitizedEl, entry),
+      },
+    };
   }
   return sanitized;
+}
+
+/**
+ * What the cold event still has to carry: every `d.el` field the dictionary
+ * entry does not already say the same thing about.
+ *
+ * This is field-agnostic on purpose. It restores the descriptor the readers
+ * consume — text, label, href, name — without this module having to know which
+ * of them any particular reader looks at, and it keeps the size win for the
+ * fields (signature, structural path) that repeat unchanged across a session.
+ */
+function residualElementFields(
+  el: Record<string, unknown>,
+  entry: SignatureDictionaryEntry,
+): Record<string, unknown> {
+  const hoisted = dictionaryDescriptorFields(entry);
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(el)) {
+    if (key === COLD_ELEMENT_REF_KEY) continue;
+    const shared =
+      key === "sig"
+        ? entry.sig
+        : key === "path"
+          ? entry.path
+          : key === "tag"
+            ? entry.tag
+            : hoisted[key];
+    if (shared !== undefined && safeString(value) === shared) continue;
+    out[key] = value;
+  }
+  return out;
 }
 
 async function buildManifest(

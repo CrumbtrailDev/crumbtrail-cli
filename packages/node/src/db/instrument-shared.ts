@@ -6,11 +6,19 @@ import {
   type DbDiffBulkEventData,
   type DbDiffOp,
   type DbEngine,
+  type DbErrorOp,
+  type DbStatementOp,
+  normalizeStatementShape,
 } from "crumbtrail-core";
 import { captureDbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import { buildDbDiffEvent } from "./diff-event";
+import { buildDbErrorEvent } from "./error-event";
 import { buildDbReadBulkEvent, buildDbReadEvent } from "./read-event";
+import {
+  buildDbStatementEvent,
+  DB_STATEMENT_SHAPE_LABEL,
+} from "./statement-event";
 
 /**
  * Engine-agnostic emission pipeline shared by every DB adapter. All functions here are synchronous
@@ -408,6 +416,118 @@ export function emitImagelessDbDiff(input: {
 }
 
 /**
+ * Records that a host statement was attempted and RAISED, then hands the error straight back.
+ *
+ * This is the engine-agnostic seam every adapter uses, and it exists because the capture
+ * vocabulary could otherwise only describe statements that succeeded: the host `query` rejected,
+ * the adapter's `await` rejected with it, and no event was emitted at all. In an incident whose
+ * fault IS the failing statement, that dropped the single most decisive observable.
+ *
+ * Two guarantees, both load-bearing:
+ *
+ * 1. **It never changes host behavior.** Every failure inside emission is swallowed here — the
+ *    caller's `catch` rethrows the driver's original error untouched either way. Instrumentation
+ *    that masked an application error would be strictly worse than instrumentation that recorded
+ *    nothing.
+ * 2. **It is not a capture gap.** `capture_exception` means *our* code threw. This means *their*
+ *    statement failed. Same shaped event, opposite owner, and a reader acts on them differently.
+ */
+export function emitDbErrorEvent(input: {
+  engine: DbEngine;
+  op: DbErrorOp;
+  table: string | null;
+  statement: string;
+  requestId: string;
+  error: unknown;
+  options: InstrumentDbClientOptions;
+}): void {
+  const { options } = input;
+  try {
+    emitDbEvent(
+      options,
+      buildDbErrorEvent({
+        engine: input.engine,
+        op: input.op,
+        table: input.table,
+        statement: input.statement,
+        error: input.error,
+        requestId: input.requestId,
+        sessionId: options.sessionId,
+        now: options.now?.(),
+        sessionStartedAt: options.sessionStartedAt,
+      }),
+    );
+  } catch {
+    // Building or routing the record is capture work. It may never decide what the caller sees.
+  }
+}
+
+/**
+ * Records that a host statement was attempted and SUCCEEDED, and never changes what the caller
+ * sees.
+ *
+ * The mirror of {@link emitDbErrorEvent}, and it closes the asymmetry that one left behind: the
+ * capture vocabulary could say what a FAILING statement asked and could never say what a
+ * SUCCEEDING one asked. Rows are not that answer — they are what the database held, not what was
+ * requested of it — and a statement that returned no rows produced no evidence whatsoever.
+ *
+ * Deliberately NOT gated on `captureReads`, for the same reason the error seam is not: that flag
+ * caps row IMAGES, and this record carries none. Gating it there would leave every default install
+ * exactly as blind to a wrong predicate as it is today.
+ *
+ * Every failure inside emission is swallowed. Instrumentation may not decide whether the host's
+ * statement succeeded.
+ */
+export function emitDbStatementEvent(input: {
+  engine: DbEngine;
+  op: DbStatementOp;
+  table: string | null;
+  statement: string;
+  rowCount?: number | null;
+  /** Per-request statement counter, owned by the adapter so execution order survives. */
+  seq: number;
+  requestId: string;
+  options: InstrumentDbClientOptions;
+}): void {
+  const { options } = input;
+  try {
+    emitDbEvent(
+      options,
+      buildDbStatementEvent({
+        engine: input.engine,
+        op: input.op,
+        table: input.table,
+        statement: input.statement,
+        rowCount: input.rowCount,
+        seq: input.seq,
+        requestId: input.requestId,
+        sessionId: options.sessionId,
+        now: options.now?.(),
+        sessionStartedAt: options.sessionStartedAt,
+      }),
+    );
+  } catch {
+    // Building or routing the record is capture work. It may never decide what the caller sees.
+  }
+}
+
+/**
+ * Allocates the next 1-based statement ordinal for a request.
+ *
+ * Separate from the read ordinal (`db.read.stmt`), which counts only SELECTs whose rows were
+ * captured. This one counts every instrumented statement, so a reader can order what the request
+ * did — including the statements that returned nothing and so appear nowhere else.
+ */
+export function nextStatementSeq(
+  statementsByRequest: Map<string, number>,
+  requestId: string,
+): number {
+  const seq = (statementsByRequest.get(requestId) ?? 0) + 1;
+  statementsByRequest.set(requestId, seq);
+  return seq;
+}
+
+/**
  * Emits capped, redacted `db.read` events for a SELECT's rows plus a `db.read.bulk` summary when
  * more rows exist than were emitted. Honors both the per-statement cap and the per-request budget
  * tracked in `emittedReadRowsByRequest`.
@@ -428,8 +548,26 @@ export function emitDbReadEvents(input: {
   readStatementsByRequest?: Map<string, number>;
   /** Resolved LIMIT/OFFSET the statement ran with, when the adapter parsed one. */
   queryShape?: { limit?: number; offset?: number };
+  /**
+   * Raw statement text, normalized once here and carried on every row it produced.
+   *
+   * A row alone cannot distinguish "the database holds the wrong value" from "the predicate
+   * selected the wrong row", and those two have different fixes. Normalized per statement rather
+   * than per row so the cost is paid once.
+   */
+  statement?: string;
 }): void {
   const { engine, table, requestId, rows, rowCount, options } = input;
+  let shape: string | undefined;
+  try {
+    shape = input.statement
+      ? normalizeStatementShape(input.statement, DB_STATEMENT_SHAPE_LABEL) ||
+        undefined
+      : undefined;
+  } catch {
+    // Shaping is capture work; a row without a shape beats no row at all.
+    shape = undefined;
+  }
   const emittedReadRowsByRequest = input.emittedReadRowsByRequest;
   const readStatementsByRequest = input.readStatementsByRequest;
   let stmt: number | undefined;
@@ -470,6 +608,7 @@ export function emitDbReadEvents(input: {
           row,
           requestId,
           ...(stmt !== undefined ? { stmt } : {}),
+          ...(shape !== undefined ? { shape } : {}),
           queryShape: input.queryShape,
           sessionId: options.sessionId,
           redactColumns: options.redactColumns,

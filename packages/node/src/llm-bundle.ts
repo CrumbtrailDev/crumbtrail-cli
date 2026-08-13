@@ -583,6 +583,63 @@ export interface LlmBundleDbRead {
   table: string;
   pk: Record<string, unknown> | null;
   row: Record<string, unknown>;
+  /**
+   * Normalized shape of the SELECT that produced this row, when the adapter had the statement
+   * text. Keywords, identifiers and placeholders only — every literal is replaced before it is
+   * stored, so no bind value and no customer value travels here.
+   *
+   * Present because a row cannot be read against the question it answered otherwise. `row` says
+   * what the database held; `shape` says what was asked for it, and a filter with the wrong
+   * boolean grouping produces a perfectly correct-looking row from a perfectly successful query.
+   */
+  shape?: string;
+  requestId?: string;
+}
+
+/**
+ * One database statement the host issued that the database ACCEPTED (`k:'db.statement'`).
+ *
+ * The counterpart of {@link LlmBundleDbError}, and the plane that makes a successful query legible
+ * at all. `databaseDiffs` and `databaseReads` describe a statement through what it returned, so a
+ * statement returning nothing — a SELECT matching zero rows, a transaction boundary, an UPDATE
+ * that matched nothing — left no trace, and one that DID return rows was described by the rows
+ * rather than by what it asked. Every defect in what was ASKED lives here and nowhere else.
+ *
+ * Same subtractive contract as the failed plane: `shape` carries no literal, and `rowCount` is a
+ * count and not a row.
+ */
+export interface LlmBundleDbStatement {
+  t: number;
+  iso?: string;
+  offsetMs?: number;
+  engine: DbEngine;
+  op: string;
+  table: string | null;
+  shape: string;
+  /** Rows returned or affected; `null` when the driver reported no count. `0` is meaningful. */
+  rowCount: number | null;
+  /** 1-based ordinal within the request, so execution order survives the sort. */
+  seq?: number;
+  requestId?: string;
+}
+
+/**
+ * One database statement the host ATTEMPTED and the database REFUSED (`k:'db.error'`).
+ *
+ * Distinct from a capture gap, which says our own instrumentation broke. Every field is an
+ * identifier, a classification or the database's own error code: no bind value and no driver
+ * message reaches here, and `shape` is the statement with every literal replaced.
+ */
+export interface LlmBundleDbError {
+  t: number;
+  iso?: string;
+  offsetMs?: number;
+  engine: DbEngine;
+  op: string;
+  table: string | null;
+  shape: string;
+  code: string | null;
+  errorName: string;
   requestId?: string;
 }
 
@@ -667,6 +724,22 @@ export interface LlmBundle {
   databaseDiffs: LlmBundleDbDiff[];
   /** Redaction-aware rows read during the session (`k:'db.read'`); `[]` when none. */
   databaseReads: LlmBundleDbRead[];
+  /**
+   * Statements that were attempted and SUCCEEDED (`k:'db.statement'`).
+   *
+   * Optional and OMITTED when empty rather than emitted as `[]`, matching `databaseErrors`: a
+   * session captured by an SDK or an engine that does not record statements must not present as a
+   * session that ran none.
+   */
+  databaseStatements?: LlmBundleDbStatement[];
+  /**
+   * Statements that were attempted and RAISED (`k:'db.error'`).
+   *
+   * Optional and OMITTED when empty, not emitted as `[]`. A session in which nothing failed must
+   * serialize exactly as it did before this plane existed — the absence of a failure is not a
+   * finding, and every existing bundle would otherwise gain a field that says nothing.
+   */
+  databaseErrors?: LlmBundleDbError[];
   /** OTel DB spans/statements (`db.*` attributes), explicitly not row diffs. */
   databaseActivity: LlmBundleDbActivity[];
   /**
@@ -1039,6 +1112,8 @@ export function buildLlmBundle({
     fullStackEvidence,
   );
   const causalTree = buildCausalTree(candidates ?? []);
+  const databaseErrors = buildDatabaseErrors(events, session.startMs);
+  const databaseStatements = buildDatabaseStatements(events, session.startMs);
   const firstErrorEventAt = computeFirstErrorEventAt(browserEvidence, index);
   const distinctBugs = applyFlagNoteTitles(
     groupDistinctBugs(candidates ?? [], events),
@@ -1077,6 +1152,8 @@ export function buildLlmBundle({
     outboundCalls: buildOutboundCalls(events, session.startMs),
     databaseDiffs: buildDatabaseDiffs(events, session.startMs),
     databaseReads: buildDatabaseReads(events, session.startMs),
+    ...(databaseErrors.length > 0 ? { databaseErrors } : {}),
+    ...(databaseStatements.length > 0 ? { databaseStatements } : {}),
     databaseActivity: buildDatabaseActivity(events, session.startMs),
     media,
     degradedCapabilities,
@@ -2421,6 +2498,9 @@ function buildDatabaseReads(
           string,
           unknown
         >,
+        // Omitted, never emitted empty, when the adapter had no statement text: `removeUndefined`
+        // drops it, so a reader is never handed a blank field that looks like "asked nothing".
+        shape: safeText(event.d.shape, 400) || undefined,
         // A correlation key, not free text. `safeText` reads a 32 hex request
         // id as a long opaque token and redacts it, which collapses every read
         // into one bucket and makes per-request fan-out uncountable. `db.diff`
@@ -2430,6 +2510,70 @@ function buildDatabaseReads(
     );
   }
   return reads.sort((a, b) => a.t - b.t).slice(0, 200);
+}
+
+function buildDatabaseStatements(
+  events: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleDbStatement[] {
+  const statements: LlmBundleDbStatement[] = [];
+  for (const event of events) {
+    if (event.k !== "db.statement" || !isRecord(event.d)) continue;
+    const shape = safeText(event.d.shape, 400);
+    // A statement record whose whole content is the shape says nothing without one.
+    if (!shape) continue;
+
+    statements.push(
+      removeUndefined({
+        t: event.t,
+        iso: iso(event.t),
+        offsetMs:
+          finiteNumber(event.offsetMs) ??
+          offsetFromStart(event.t, sessionStartMs),
+        engine: normalizeDbEngine(event.d.engine),
+        op: safeText(event.d.op, 20) ?? "other",
+        table: safeText(event.d.table, 200) ?? null,
+        shape,
+        // `?? null` and not `|| null`: zero rows is the answer this plane exists to carry.
+        rowCount: finiteNumber(event.d.rowCount) ?? null,
+        seq: finiteNumber(event.d.seq),
+        requestId: safeCorrelationId(event.d.requestId, 200),
+      }) as LlmBundleDbStatement,
+    );
+  }
+  return statements.sort((a, b) => a.t - b.t).slice(0, 200);
+}
+
+function buildDatabaseErrors(
+  events: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleDbError[] {
+  const errors: LlmBundleDbError[] = [];
+  for (const event of events) {
+    if (event.k !== "db.error" || !isRecord(event.d)) continue;
+    const shape = safeText(event.d.shape, 400);
+    if (!shape) continue;
+
+    errors.push(
+      removeUndefined({
+        t: event.t,
+        iso: iso(event.t),
+        offsetMs:
+          finiteNumber(event.offsetMs) ??
+          offsetFromStart(event.t, sessionStartMs),
+        engine: normalizeDbEngine(event.d.engine),
+        op: safeText(event.d.op, 20) ?? "other",
+        table: safeText(event.d.table, 200) ?? null,
+        shape,
+        // A closed vocabulary of short codes, not free text, so it travels as a
+        // correlation-style identifier rather than through the prose-shaped path.
+        code: safeCorrelationId(event.d.code, 64) ?? null,
+        errorName: safeText(event.d.errorName, 120) ?? "UnknownError",
+        requestId: safeCorrelationId(event.d.requestId, 200),
+      }) as LlmBundleDbError,
+    );
+  }
+  return errors.sort((a, b) => a.t - b.t).slice(0, 200);
 }
 
 function buildDatabaseActivity(
@@ -4551,6 +4695,10 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
         ]
       : []),
     ...renderOutboundCallsSection(bundle.outboundCalls),
+    ...renderDatabaseErrorSection(bundle.databaseErrors ?? []),
+    // What was ASKED, before what came back: the two statement planes sit together, and a reader
+    // who can see the predicate does not have to infer it from the rows it selected.
+    ...renderDatabaseStatementSection(bundle.databaseStatements ?? []),
     ...renderDatabaseDiffSection(bundle.databaseDiffs),
     ...renderDatabaseReadSection(bundle.databaseReads ?? []),
     ...renderDatabaseActivitySection(bundle.databaseActivity),
@@ -4741,6 +4889,138 @@ export function renderDatabaseReadSection(reads: LlmBundleDbRead[]): string[] {
   if (deduped > shown.length) {
     lines.push(
       `${deduped - shown.length} further distinct row(s) are in \`bundle.json\` under \`databaseReads\`.`,
+      "",
+    );
+  }
+  return lines;
+}
+
+/** How many distinct statement shapes the markdown renders. All are in `bundle.json` regardless. */
+const MAX_RENDERED_DB_STATEMENTS = 40;
+
+/**
+ * Statements the database ACCEPTED.
+ *
+ * Every other database section describes a statement by its RESULT: rows that changed, rows that
+ * came back, spans a collector saw. That can only ever answer "what did the database hold", and a
+ * large class of defect is in the QUESTION — a predicate whose boolean grouping binds the wrong
+ * way, a filter that was dropped, a join that widened, a lookup keyed on the wrong column. Those
+ * queries execute perfectly. They return rows that look right, or no rows at all, and until this
+ * section existed the bundle recorded a successful request with nothing wrong in it.
+ *
+ * The zero-row case is why this is a section and not a column on the rows-read table: a SELECT
+ * that matches nothing emits no row, so it appeared in no plane whatsoever. `Rows` of `0` here is
+ * the difference between "the lookup missed" and "the lookup never happened".
+ *
+ * Deduplicated on request plus shape, so a statement that ran in a loop costs one line and carries
+ * its own repeat count — which is itself the evidence in a fan-out.
+ *
+ * What is deliberately NOT here: bind values. `shape` is the statement with every literal
+ * replaced, the same contract the failed-statement section keeps, and it is not relaxed because
+ * the statement worked.
+ */
+function renderDatabaseStatementSection(
+  statements: LlmBundleDbStatement[],
+): string[] {
+  if (statements.length === 0) return [];
+
+  const grouped = new Map<
+    string,
+    { statement: LlmBundleDbStatement; runs: number; rows: number | null }
+  >();
+  for (const statement of statements) {
+    const key = `${statement.requestId ?? ""}\u0000${statement.shape}`;
+    const existing = grouped.get(key);
+    if (!existing) {
+      grouped.set(key, { statement, runs: 1, rows: statement.rowCount });
+      continue;
+    }
+    existing.runs += 1;
+    if (typeof statement.rowCount === "number") {
+      existing.rows = (existing.rows ?? 0) + statement.rowCount;
+    }
+  }
+
+  const shown = [...grouped.values()]
+    .sort((a, b) => a.statement.t - b.statement.t)
+    .slice(0, MAX_RENDERED_DB_STATEMENTS);
+
+  const lines = [
+    "## Database Statements That Ran",
+    "",
+    "What this session's requests ASKED the database, correlated to the request that asked it. Read these against the rows above: a statement that succeeded and returned the wrong rows — or no rows — is indistinguishable from a correct one until the predicate itself is visible. `Rows` of 0 means the statement matched nothing, which is evidence rather than absence. Bind values are deliberately not carried; every literal is replaced.",
+    "",
+    table(
+      ["Offset", "Op", "Table", "Rows", "Runs", "Statement shape", "Request ID"],
+      shown.map((entry) => [
+        entry.statement.offsetMs !== undefined
+          ? `${entry.statement.offsetMs} ms`
+          : "unknown",
+        entry.statement.op,
+        entry.statement.table ?? "",
+        entry.rows === null ? "unknown" : String(entry.rows),
+        String(entry.runs),
+        truncate(entry.statement.shape, 300),
+        entry.statement.requestId ?? "",
+      ]),
+    ),
+    "",
+  ];
+  if (grouped.size > shown.length) {
+    lines.push(
+      `${grouped.size - shown.length} further distinct statement(s) are in \`bundle.json\` under \`databaseStatements\`.`,
+      "",
+    );
+  }
+  return lines;
+}
+
+/** How many failed statements the markdown renders. Everything is in `bundle.json` regardless. */
+const MAX_RENDERED_DB_ERRORS = 25;
+
+/**
+ * Statements the database REFUSED.
+ *
+ * This section exists because every other database section in this file can only describe
+ * statements that SUCCEEDED. When a statement raised, the adapter's `await` rejected with it and
+ * nothing was emitted at all — so an incident whose fault IS the failing statement rendered as a
+ * request with no database evidence, and the reader had to infer the most decisive fact in the
+ * session from its absence. Worse than absent, it was confidently incomplete: a request that ran
+ * two statements and lost one showed the surviving one and said nothing about the other.
+ *
+ * It is rendered BEFORE row changes deliberately. A reader who sees that the write was rejected,
+ * with the code the database returned, does not need to reason about the rows that did change.
+ *
+ * What is deliberately NOT here: bind values and the driver's error message. `shape` is the
+ * statement with every literal replaced, and `code`/`errorName` are a closed-vocabulary code and a
+ * class name. That is enough to find the statement in the repository and to know why it failed,
+ * and it is the SDK's standing stance on error text everywhere else.
+ */
+function renderDatabaseErrorSection(errors: LlmBundleDbError[]): string[] {
+  if (errors.length === 0) return [];
+  const shown = errors.slice(0, MAX_RENDERED_DB_ERRORS);
+  const lines = [
+    "## Database Statements That Failed",
+    "",
+    "Statements this session issued that the database refused, correlated to the request that issued them. These are the application's own failures, not gaps in capture: each one ran and was rejected. Bind values and driver messages are deliberately not carried — the statement shape, the table and the database's own error code are what identify it.",
+    "",
+    table(
+      ["Offset", "Op", "Table", "Error code", "Error class", "Statement shape", "Request ID"],
+      shown.map((error) => [
+        error.offsetMs !== undefined ? `${error.offsetMs} ms` : "unknown",
+        error.op,
+        error.table ?? "",
+        error.code ?? "",
+        error.errorName,
+        truncate(error.shape, 300),
+        error.requestId ?? "",
+      ]),
+    ),
+    "",
+  ];
+  if (errors.length > shown.length) {
+    lines.push(
+      `${errors.length - shown.length} further failed statement(s) are in \`bundle.json\` under \`databaseErrors\`.`,
       "",
     );
   }
@@ -4940,6 +5220,11 @@ function renderDetectedSignalsSection(
 ): string[] {
   if (!bugs || bugs.length === 0) return [];
   const shown = bugs.slice(0, MAX_RENDERED_SIGNALS);
+  // Whether ANY row of THIS bundle carries a base-rate measurement. A property of the data being
+  // rendered, computed from the same cell function the table uses, so the column, its cells and
+  // the paragraph that teaches it can never disagree about whether the measurement exists.
+  const baseRateCells = shown.map((bug) => detectorBaseRateCell(bug, prevalence));
+  const baseRateMeasured = baseRateCells.some((cell) => cell !== "");
   const lines = [
     "## Detected Signals",
     "",
@@ -4974,28 +5259,38 @@ function renderDetectedSignalsSection(
     // wallpaper every time, at the top of the page, where it is read as the headline. The only
     // thing that separates the two is a fact about the OTHER sessions, which is why it arrives
     // here as its own disclosure rather than as an adjustment to anything above it.
-    "`Base rate` is how many of the sessions already recorded for this application, other than "
-      + "this one, the same detector fired in. It answers what no grade above it can: whether the "
-      + "finding is peculiar to this incident or a standing condition of the application. A "
-      + "detector that fires in most sessions was firing before the reported symptom existed, "
-      + "however severe it is and however well it is attached here, and a headline taken from one "
-      + "is a lead pointing at the background. A blank cell means the value is UNKNOWN, not low: "
-      + "too few sessions are recorded yet to say anything, which is where every application "
-      + "starts. Read a low count as \"rarely seen in what has been recorded\" — the store knows "
-      + "only the sessions it holds, so it is never proof that a finding is new. Nothing here "
-      + "moves a row: the table is ordered exactly as it would be without this column."
-      // Appended ONLY when the scan was capped, and the paragraph above is byte-identical when it
-      // was not. The sentence above says the denominator is the sessions recorded for this
-      // application; under a cap that is false, and a truthful cell under a false paragraph is
-      // still a fabricated number. The count and its denominator travel together — so the
-      // denominator's MEANING has to travel with them too.
-      + (prevalence?.truncated === true
-        ? " This store holds more sessions than one bundle is allowed to read, so the counts "
-          + `above were measured over the ${prevalence.priorSessions} MOST RECENT prior sessions `
-          + "only, chosen by their recorded date. The denominator names exactly what was read: "
-          + "nothing here says anything about the older sessions, in either direction."
-        : ""),
-    "",
+    //
+    // Emitted only when some row of THIS bundle actually carries the measurement. A bundle with no
+    // prevalence at all renders every cell of the column blank, and teaching a reader how to weigh
+    // a grade this bundle holds no value of spends their context on nothing — the lesson and the
+    // measurement travel together or neither is emitted. When one row is measured this is
+    // byte-identical to what shipped before the condition existed.
+    ...(baseRateMeasured
+      ? [
+        "`Base rate` is how many of the sessions already recorded for this application, other than "
+          + "this one, the same detector fired in. It answers what no grade above it can: whether the "
+          + "finding is peculiar to this incident or a standing condition of the application. A "
+          + "detector that fires in most sessions was firing before the reported symptom existed, "
+          + "however severe it is and however well it is attached here, and a headline taken from one "
+          + "is a lead pointing at the background. A blank cell means the value is UNKNOWN, not low: "
+          + "too few sessions are recorded yet to say anything, which is where every application "
+          + "starts. Read a low count as \"rarely seen in what has been recorded\" — the store knows "
+          + "only the sessions it holds, so it is never proof that a finding is new. Nothing here "
+          + "moves a row: the table is ordered exactly as it would be without this column."
+          // Appended ONLY when the scan was capped, and the paragraph above is byte-identical when it
+          // was not. The sentence above says the denominator is the sessions recorded for this
+          // application; under a cap that is false, and a truthful cell under a false paragraph is
+          // still a fabricated number. The count and its denominator travel together — so the
+          // denominator's MEANING has to travel with them too.
+          + (prevalence?.truncated === true
+            ? " This store holds more sessions than one bundle is allowed to read, so the counts "
+              + `above were measured over the ${prevalence.priorSessions} MOST RECENT prior sessions `
+              + "only, chosen by their recorded date. The denominator names exactly what was read: "
+              + "nothing here says anything about the older sessions, in either direction."
+            : ""),
+          "",
+        ]
+      : []),
     table(
       [
         "Offset",
@@ -5003,11 +5298,11 @@ function renderDetectedSignalsSection(
         "Detector",
         "Support",
         "Why unattached",
-        "Base rate",
+        ...(baseRateMeasured ? ["Base rate"] : []),
         "Finding",
         "Where",
       ],
-      shown.map((bug) => [
+      shown.map((bug, at) => [
         bug.window?.start !== undefined && bug.firstSeen !== undefined
           ? `${bug.firstSeen - bug.window.start} ms`
           : "unknown",
@@ -5021,10 +5316,12 @@ function renderDetectedSignalsSection(
         // renders as nothing rather than as a placeholder word: `none` or `n/a` in this cell would
         // read as an assertion about a row that was never isolated at all.
         isolationReasonCell(bug),
-        // Empty on every row of every session in a store with too few priors to measure — which
-        // is every session of a new application. Absence renders as nothing, never as a zero or a
-        // percentage, because a default state that reads as an assertion is worse than a silence.
-        detectorBaseRateCell(bug, prevalence),
+        // Empty on the rows this bundle holds no measurement for. Absence renders as nothing,
+        // never as a zero or a percentage, because a default state that reads as an assertion is
+        // worse than a silence — and when EVERY row is empty the column is gone entirely, on the
+        // same condition as its header above and its paragraph before it, so a reader is never
+        // shown a column of blanks with a lesson attached. One measured row keeps all three.
+        ...(baseRateMeasured ? [baseRateCells[at]] : []),
         // Title AND message. A detector puts the specifics in whichever of the two it has — the
         // click detector names the covered control in its title and carries no message at all, so
         // preferring one over the other drops the part that identifies the defect.

@@ -7,6 +7,14 @@ import {
 } from "crumbtrail-core";
 import { instrumentPgClient } from "../db";
 
+/**
+ * `db.statement` is emitted for EVERY instrumented statement, whatever it returned, so it appears
+ * in every stream in this file and is evidence about neither row reads nor row diffs — which is
+ * what these suites bind. Its own behaviour, including that it survives when nothing else is
+ * captured, is bound in `db-successful-statement.test.ts`.
+ */
+const notStatement = (event: BugEvent): boolean => event.k !== "db.statement";
+
 function rows(count: number) {
   return Array.from({ length: count }, (_, index) => ({
     id: index + 1,
@@ -32,7 +40,9 @@ describe("instrumentPgClient bulk cap", () => {
     const db = instrumentPgClient(client, {
       requestId: "req-under",
       maxRowsPerStatement: 3,
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     await db.query("UPDATE orders SET status = $1 WHERE status = $2", [
@@ -52,7 +62,9 @@ describe("instrumentPgClient bulk cap", () => {
     const db = instrumentPgClient(client, {
       requestId: "req-exact",
       maxRowsPerStatement: 3,
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     await db.query("UPDATE orders SET status = $1 WHERE status = $2", [
@@ -74,7 +86,9 @@ describe("instrumentPgClient bulk cap", () => {
       requestId: "req-over",
       sessionId: "ses-over",
       maxRowsPerStatement: 3,
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
       now: () => 1_700_000_000_250,
       sessionStartedAt: 1_700_000_000_000,
     });
@@ -117,7 +131,9 @@ describe("instrumentPgClient bulk cap", () => {
     const db = instrumentPgClient(client, {
       requestId: "req-custom",
       maxRowsPerStatement: 1,
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     await db.query("INSERT INTO orders (status) VALUES ($1)", ["ready"]);
@@ -138,7 +154,9 @@ describe("instrumentPgClient bulk cap", () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(client, {
       requestId: "req-default",
-      emit: (e) => events.push(e),
+      emit: (e) => {
+        if (notStatement(e)) events.push(e);
+      },
     });
 
     await db.query("DELETE FROM orders WHERE status = $1", ["stale"]);

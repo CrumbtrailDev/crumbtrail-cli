@@ -16,6 +16,14 @@ import {
 } from "../backend-events";
 import { instrumentPgClient, resolveDbRequestContext } from "../db";
 
+/**
+ * `db.statement` is emitted for EVERY instrumented statement, whatever it returned, so it appears
+ * in every stream in this file and is evidence about neither row reads nor row diffs — which is
+ * what these suites bind. Its own behaviour, including that it survives when nothing else is
+ * captured, is bound in `db-successful-statement.test.ts`.
+ */
+const notStatement = (event: BugEvent): boolean => event.k !== "db.statement";
+
 describe("backend event contract helpers", () => {
   it("links backend start events from core-created Crumbtrail request headers", () => {
     const headers = createCrumbtrailRequestHeaders(
@@ -300,8 +308,18 @@ describe("backend event contract helpers", () => {
     // Innermost app frame first, repo-relative, with the caller chain above it.
     expect(event.d.error).toMatchObject({
       frames: [
-        { file: "server/src/services/order-service.js", line: 118, column: 11, fn: "placeOrder" },
-        { file: "server/src/routes/checkout.js", line: 41, column: 20, fn: "postCheckout" },
+        {
+          file: "server/src/services/order-service.js",
+          line: 118,
+          column: 11,
+          fn: "placeOrder",
+        },
+        {
+          file: "server/src/routes/checkout.js",
+          line: 41,
+          column: 20,
+          fn: "postCheckout",
+        },
       ],
     });
     // Node internals and dependency frames are never the answer.
@@ -388,7 +406,9 @@ describe("backend event contract helpers", () => {
     };
     const db = instrumentPgClient(client, {
       ...context,
-      emit: (event) => dbEvents.push(event),
+      emit: (event) => {
+        if (notStatement(event)) dbEvents.push(event);
+      },
     });
 
     await db.query("UPDATE orders SET status = $1 WHERE id = $2", [

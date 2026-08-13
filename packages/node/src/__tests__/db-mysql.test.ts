@@ -13,6 +13,14 @@ import {
 } from "crumbtrail-core";
 import { instrumentMysqlClient } from "../db/mysql";
 
+/**
+ * `db.statement` is emitted for EVERY instrumented statement, whatever it returned, so it appears
+ * in every stream in this file and is evidence about neither row reads nor row diffs — which is
+ * what these suites bind. Its own behaviour, including that it survives when nothing else is
+ * captured, is bound in `db-successful-statement.test.ts`.
+ */
+const notStatement = (event: BugEvent): boolean => event.k !== "db.statement";
+
 type MysqlMethod = "query" | "execute";
 type MysqlHandler = (
   sql: string,
@@ -50,7 +58,9 @@ describe("instrumentMysqlClient inserts", () => {
     const db = instrumentMysqlClient(client, {
       requestId: "req-ins",
       sessionId: "ses",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("INSERT INTO orders (name) VALUES (?)", ["Ada"]);
@@ -76,7 +86,9 @@ describe("instrumentMysqlClient inserts", () => {
     const events: BugEvent[] = [];
     const db = instrumentMysqlClient(client, {
       requestId: "req-multi",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("INSERT INTO orders (name) VALUES (?), (?), (?)", [
@@ -107,7 +119,9 @@ describe("instrumentMysqlClient inserts", () => {
     const events: BugEvent[] = [];
     const db = instrumentMysqlClient(client, {
       requestId: "req-empty-reread",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("INSERT INTO orders (name) VALUES (?)", ["Ada"]);
@@ -134,7 +148,9 @@ describe("instrumentMysqlClient inserts", () => {
     const db = instrumentMysqlClient(client, {
       requestId: "req-comp",
       pkColumns: { order_items: ["order_id", "sku"] },
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("INSERT INTO order_items (order_id, sku) VALUES (?, ?)", [
@@ -162,7 +178,9 @@ describe("instrumentMysqlClient updates", () => {
     const db = instrumentMysqlClient(client, {
       requestId: "req-upd",
       captureBefore: true,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("UPDATE orders SET status = ? WHERE id = ?", ["shipped", 3]);
@@ -194,7 +212,9 @@ describe("instrumentMysqlClient updates", () => {
     const events: BugEvent[] = [];
     const db = instrumentMysqlClient(client, {
       requestId: "req-upd-off",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("UPDATE orders SET status = ? WHERE id = ?", ["shipped", 3]);
@@ -228,7 +248,9 @@ describe("instrumentMysqlClient updates", () => {
     const db = instrumentMysqlClient(client, {
       requestId: "req-vanish",
       captureBefore: true,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("UPDATE orders SET status = ? WHERE status = ?", [
@@ -278,6 +300,7 @@ describe("instrumentMysqlClient updates", () => {
       requestId: "req-before-only-emit-failure",
       captureBefore: true,
       emit: (event) => {
+        if (!notStatement(event)) return;
         primaryEvents.push(event);
         if (event.k === DB_DIFF_EVENT_KIND) throw new Error("sink failure");
       },
@@ -316,7 +339,9 @@ describe("instrumentMysqlClient updates", () => {
       requestId: "req-vanish-bulk",
       captureBefore: true,
       maxRowsPerStatement: 2,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("UPDATE orders SET status = ? WHERE status = ?", [
@@ -366,7 +391,9 @@ describe("instrumentMysqlClient updates", () => {
     const db = instrumentMysqlClient(client, {
       requestId: "req-nowhere",
       captureBefore: true,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("UPDATE orders SET status = ?", ["archived"]);
@@ -391,7 +418,9 @@ describe("instrumentMysqlClient deletes", () => {
     const events: BugEvent[] = [];
     const db = instrumentMysqlClient(client, {
       requestId: "req-del",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("DELETE FROM widgets WHERE id = ?", [9]);
@@ -416,7 +445,9 @@ describe("instrumentMysqlClient deletes", () => {
     const events: BugEvent[] = [];
     const db = instrumentMysqlClient(client, {
       requestId: "req-del-fail",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     const result = await db.query("DELETE FROM widgets WHERE id = ?", [9]);
@@ -445,7 +476,9 @@ describe("instrumentMysqlClient deletes", () => {
     const db = instrumentMysqlClient(client, {
       requestId: "req-bulk",
       maxRowsPerStatement: 3,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("DELETE FROM orders WHERE status = ?", ["stale"]);
@@ -480,7 +513,9 @@ describe("instrumentMysqlClient reads", () => {
       requestId: "req-read",
       captureReads: true,
       maxReadRowsPerStatement: 2,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("SELECT * FROM invoice_rankings WHERE tenant_id = ?", [
@@ -518,7 +553,9 @@ describe("instrumentMysqlClient safety", () => {
     const events: BugEvent[] = [];
     const db = instrumentMysqlClient(client, {
       getRequestId: () => undefined,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("INSERT INTO orders (name) VALUES (?)", ["Ada"]);
@@ -553,7 +590,9 @@ describe("instrumentMysqlClient safety", () => {
     const db = instrumentMysqlClient(client, {
       requestId: "req-passthru",
       captureReads: true,
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.query("TRUNCATE TABLE orders", []);
@@ -571,7 +610,9 @@ describe("instrumentMysqlClient safety", () => {
     const events: BugEvent[] = [];
     const db = instrumentMysqlClient(client, {
       requestId: "req-bare",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     const result = await db.query("INSERT INTO orders (name) VALUES (?)", [
@@ -593,7 +634,9 @@ describe("instrumentMysqlClient safety", () => {
     const events: BugEvent[] = [];
     const db = instrumentMysqlClient(client, {
       requestId: "req-exec",
-      emit: (event) => events.push(event),
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
     });
 
     await db.execute("INSERT INTO orders (name) VALUES (?)", ["Bo"]);
