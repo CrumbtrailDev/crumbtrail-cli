@@ -19,6 +19,7 @@ import {
 import { sdkInstallSpec } from "../recipe-registry";
 import type { ServiceCandidate } from "../discover";
 import type { Prompter, Ui } from "../ui";
+import type { EnvFileIO } from "../env-file";
 
 function captureUi(): { ui: Ui; lines: string[] } {
   const lines: string[] = [];
@@ -67,9 +68,38 @@ function createPlan(): Plan {
     targetPath: "/app/src/main.ts",
     content: "// init",
     warnings: [],
-    // Hands-off: the injected code reads its key from this env var; the wizard
-    // prints the var name + "mint in the dashboard" (it writes no key itself).
+    // The injected code reads its key from this env var, and the wizard mints
+    // a key and writes it there.
     keyEnvVar: "VITE_CRUMBTRAIL_KEY",
+  };
+}
+
+/**
+ * An in-memory stand-in for the env writer's filesystem + git.
+ *
+ * Defaults describe the ordinary case: no env file yet, nothing tracked,
+ * nothing ignored — so a fresh app creates `.env.local` AND gains a .gitignore
+ * entry, which is the path most worth exercising.
+ */
+export function fakeEnvIO(
+  seed: Record<string, string> = {},
+  opts: { tracked?: string[]; ignored?: string[] } = {},
+): EnvFileIO & { files: Map<string, string> } {
+  const files = new Map(Object.entries(seed));
+  const matches = (list: string[] | undefined, target: string) =>
+    (list ?? []).some((t) => target === t || target.endsWith(`/${t}`));
+  return {
+    files,
+    exists: (p) => files.has(p),
+    readFile: (p) => files.get(p) ?? null,
+    writeFile: (p, content) => {
+      files.set(p, content);
+    },
+    remove: (p) => {
+      files.delete(p);
+    },
+    isTracked: (_cwd, target) => matches(opts.tracked, target),
+    isIgnored: (_cwd, target) => matches(opts.ignored, target),
   };
 }
 
@@ -98,6 +128,11 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
         serviceName: "web",
       };
     }) as unknown as WizardDeps["provisionFlow"],
+    createIngestKey: vi.fn(async () => {
+      h.steps.push("mint-key");
+      return "ctkey_test123";
+    }) as unknown as WizardDeps["createIngestKey"],
+    envFileIO: fakeEnvIO(),
     installSdk: vi.fn(async () => {
       h.steps.push("install");
       return { installed: true, packages: ["crumbtrail-core"] };
@@ -264,7 +299,11 @@ describe("verify subcommand dispatch", () => {
         },
       ],
     })) as unknown as WizardDeps["runPreflight"];
-    const deps = makeDeps(h, { runPreflight, ui, env: { CRUMBTRAIL_KEY: "ck" } });
+    const deps = makeDeps(h, {
+      runPreflight,
+      ui,
+      env: { CRUMBTRAIL_KEY: "ck" },
+    });
     const code = await runCli(["node", "cli", "verify", "--json"], deps);
     expect(code).toBe(1);
     const parsed = JSON.parse(lines.join("\n").trim());
@@ -313,7 +352,11 @@ describe("wizard orchestration", () => {
     // buildPlan runs BEFORE installSdk (it must analyze the pre-install repo so
     // its idempotency check doesn't see the SDK deps installSdk just added and
     // self-cancel injection); executePlan still runs last, after install.
-    // Hands-off: the wizard mints no key, so there is no synthetic-session check.
+    //
+    // The key is minted AFTER execute and BEFORE poll, and that order is the
+    // point: minting last means every refusal path costs no credential, and
+    // minting before the wait means the wait is on the app starting rather than
+    // on a manual step nobody was told to do.
     expect(steps).toEqual([
       "detect",
       "login",
@@ -321,15 +364,18 @@ describe("wizard orchestration", () => {
       "build",
       "install",
       "execute",
+      "mint-key",
       "poll",
     ]);
     const out = lines.join("\n");
     expect(out).toContain("checkout"); // project
     expect(out).toContain("web"); // service
-    // No masked key is printed — instead the wizard names the env var to set and
-    // points the user at the dashboard to mint the value.
+    // The variable is named, and the summary reports the key as placed rather
+    // than handing the job back.
     expect(out).toContain("VITE_CRUMBTRAIL_KEY");
-    expect(out).toContain("/settings");
+    expect(out).toMatch(/wrote VITE_CRUMBTRAIL_KEY to/i);
+    // The key VALUE still never reaches the terminal. Scrollback, CI logs and
+    // screen shares all outlive the run.
     expect(out).not.toMatch(/ctkey_|bgk_|bl_key_/);
     expect(out).toContain("/bugs"); // dashboard link
     expect(out).toContain("/sessions/sess-1"); // deep link to the live session
@@ -362,6 +408,95 @@ describe("wizard orchestration", () => {
     await runCli(["node", "cli"], deps);
     expect(steps.indexOf("build")).toBeLessThan(steps.indexOf("install"));
     expect(steps.indexOf("install")).toBeLessThan(steps.indexOf("execute"));
+  });
+
+  it("writes the minted key into the app's env file and excludes that file", async () => {
+    const steps: string[] = [];
+    const envFileIO = fakeEnvIO();
+    const { ui, lines } = captureUi();
+    await runCli(["node", "cli"], makeDeps({ steps }, { ui, envFileIO }));
+
+    expect(envFileIO.files.get("/app/.env.local")).toContain(
+      "VITE_CRUMBTRAIL_KEY=ctkey_test123",
+    );
+    // A secret in a file that would be committed on the next `git add .` is the
+    // failure the ignore entry exists to prevent.
+    expect(envFileIO.files.get("/app/.gitignore")).toContain(".env.local");
+    // And the reader is told, because their env file has just quietly stopped
+    // appearing in `git status`.
+    expect(lines.join("\n")).toMatch(/added .* to \.gitignore/i);
+  });
+
+  // Adding the file to .gitignore afterwards would not untrack it, so the very
+  // next commit would publish the key. Nothing is minted at all.
+  it("mints nothing when the env file is tracked by git", async () => {
+    const steps: string[] = [];
+    const envFileIO = fakeEnvIO(
+      { "/app/.env": "EXISTING=1\n" },
+      { tracked: [".env"] },
+    );
+    const { ui, lines } = captureUi();
+    await runCli(["node", "cli"], makeDeps({ steps }, { ui, envFileIO }));
+
+    expect(steps).not.toContain("mint-key");
+    expect(envFileIO.files.get("/app/.env")).toBe("EXISTING=1\n");
+    const out = lines.join("\n");
+    expect(out).toMatch(/tracked by git/i);
+    // And it still says what to do instead, rather than only refusing.
+    expect(out).toMatch(/VITE_CRUMBTRAIL_KEY/);
+  });
+
+  it("mints nothing when the variable already holds a key", async () => {
+    const steps: string[] = [];
+    const envFileIO = fakeEnvIO({
+      "/app/.env.local": "VITE_CRUMBTRAIL_KEY=ctkey_theirs\n",
+    });
+    const { ui, lines } = captureUi();
+    await runCli(["node", "cli"], makeDeps({ steps }, { ui, envFileIO }));
+
+    expect(steps).not.toContain("mint-key");
+    expect(envFileIO.files.get("/app/.env.local")).toBe(
+      "VITE_CRUMBTRAIL_KEY=ctkey_theirs\n",
+    );
+    expect(lines.join("\n")).toMatch(/already set/i);
+  });
+
+  it("--no-write-key mints nothing and hands the variable back", async () => {
+    const steps: string[] = [];
+    const envFileIO = fakeEnvIO();
+    const { ui, lines } = captureUi();
+    await runCli(
+      ["node", "cli", "--no-write-key"],
+      makeDeps({ steps }, { ui, envFileIO }),
+    );
+
+    expect(steps).not.toContain("mint-key");
+    expect(envFileIO.files.size).toBe(0);
+    expect(lines.join("\n")).toMatch(/--no-write-key/);
+  });
+
+  it("keeps the wiring when the key write fails, and says the key is unplaced", async () => {
+    const steps: string[] = [];
+    const envFileIO = fakeEnvIO();
+    const failing = {
+      ...envFileIO,
+      writeFile: () => {
+        throw new Error("read-only filesystem");
+      },
+    };
+    const { ui, lines } = captureUi();
+    const code = await runCli(
+      ["node", "cli"],
+      makeDeps({ steps }, { ui, envFileIO: failing }),
+    );
+
+    // The injection above it is still correct and worth keeping, so a failed
+    // env write reports rather than rolling the wiring back.
+    expect(code).toBe(0);
+    expect(steps).toContain("execute");
+    const out = lines.join("\n");
+    expect(out).toMatch(/could not write it/i);
+    expect(out).not.toMatch(/ctkey_/);
   });
 });
 
@@ -411,14 +546,20 @@ describe("installSdk — tarball fallback (registry unavailable)", () => {
   });
 
   it("resolves react-native + tauri from the deploy's optional tarball channels", async () => {
-    // CP5: react-native/tauri are packed as optional channels now, so a failed
+    // CP5: react-native is packed as an optional channel now, so a failed
     // registry install must fall through to the SAME manifest-driven tarball
     // discovery as the core recipes (no more 'not yet distributable' dead-end).
+    //
+    // Tauri is in this loop with NO second package: TauriTransport ships as the
+    // crumbtrail-core/tauri subpath, so the tarball it needs is the core one it
+    // already installs. Keeping it here proves the tauri recipe still probes the
+    // manifest rather than dead-ending, which is the behaviour CP5 added.
+    const extraPackage = {
+      "react-native": "crumbtrail-react-native",
+      tauri: null,
+    } as const;
     for (const recipe of ["react-native", "tauri"] as const) {
-      const pkg =
-        recipe === "react-native"
-          ? "crumbtrail-react-native"
-          : "crumbtrail-tauri";
+      const pkg = extraPackage[recipe];
       const calls: string[][] = [];
       const spawnFn = (_cmd: string, args: string[]) => {
         calls.push(args);
@@ -437,7 +578,6 @@ describe("installSdk — tarball fallback (registry unavailable)", () => {
               "crumbtrail-node-0.1.0.tgz",
               "crumbtrail-0.1.0.tgz",
               "crumbtrail-react-native-0.1.0.tgz",
-              "crumbtrail-tauri-0.1.0.tgz",
             ],
           }),
         };
@@ -456,11 +596,12 @@ describe("installSdk — tarball fallback (registry unavailable)", () => {
       expect(probed).toBe(true); // DID probe the manifest (was skipped before CP5)
       expect(result.installed).toBe(true);
       expect(result.note).toContain("install tarballs");
-      // Second spawn installs the discovered tarball URLs (core + the SDK pkg).
+      // Second spawn installs the discovered tarball URLs: core, plus the SDK
+      // package when the recipe has one of its own.
       expect(calls[1]).toEqual([
         "install",
         "https://deploy.example/install/crumbtrail-core-0.1.0.tgz",
-        `https://deploy.example/install/${pkg}-0.1.0.tgz`,
+        ...(pkg ? [`https://deploy.example/install/${pkg}-0.1.0.tgz`] : []),
       ]);
     }
   });

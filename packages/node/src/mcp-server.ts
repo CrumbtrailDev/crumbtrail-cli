@@ -24,6 +24,7 @@ import {
 } from "./token-estimate";
 import { compareSessions } from "./compare";
 import { buildRegressionContext } from "./compare/regression-context";
+import { correlateWindow } from "./window-correlation";
 import { type Symptom, type GitHostClient } from "crumbtrail-core";
 import {
   buildDistinctBugSignature,
@@ -54,15 +55,30 @@ import {
   FEEDBACK_SIGNALS,
   FEEDBACK_SUBJECT_KINDS,
   getAgentPlaybookViaCloud,
+  getFixVerificationViaCloud,
+  INCONCLUSIVE_VERIFICATION_REASONS,
   ISSUE_DISPOSITIONS,
   MAX_USED_MEMORY_IDS,
   recordAgentFeedbackViaCloud,
   resolveIssueViaCloud,
+  startFixVerificationViaCloud,
+  VERIFICATION_REASONS,
   type FeedbackSignal,
   type FeedbackSubjectKind,
+  type FixVerificationView,
   type IssueDisposition,
   type LearningLoopResult,
 } from "./learning-loop";
+import {
+  BACKTEST_MAX_DAYS,
+  BACKTEST_MIN_DAYS,
+  DEFAULT_BACKTEST_DAYS,
+  isProbeName,
+  PROBE_NAMES,
+  requestProbeViaCloud,
+  shadowBacktestViaCloud,
+  type ProbeName,
+} from "./probe-plane";
 
 interface BugEvent {
   t: number;
@@ -917,6 +933,148 @@ const TOOLS = [
       required: ["project"],
     },
   },
+  /** @stability stable */
+  {
+    name: "startFixVerification",
+    description:
+      "Open an observation window on a canonical issue after you applied a fix, so the cloud can watch whether the same signature comes back. Call it once, after the fix is deployed and reachable by real traffic: a window opened before the fix ships measures the broken code. It is idempotent, so an issue that already has a live window gets that same window back with opened:false and no second window is opened. Opening a window concludes NOTHING by itself. It returns state 'open' with a null result; read the verdict later with getFixVerification, and not before observationEnd. This writes only to Crumbtrail's own verification records and never touches your app, your tickets, or any external system. Recording WHY an issue was closed is a separate act with a separate tool: use resolveIssue for the disposition, root cause and fix reference. Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        project: {
+          type: "string",
+          description: "The Crumbtrail project id the issue belongs to.",
+        },
+        canonicalIssueId: {
+          type: "string",
+          description:
+            "The canonical issue id to open a verification window for.",
+        },
+      },
+      required: ["project", "canonicalIssueId"],
+    },
+  },
+  /** @stability stable */
+  {
+    name: "getFixVerification",
+    description:
+      "Read whether a fix actually held for a canonical issue. Read-only, no side effects, safe to poll. " +
+      "`state` is three valued and you must branch on it: 'none' means no window was ever opened and nothing has been measured, 'open' means a window is still in flight and NOTHING has been concluded yet, and 'terminal' means the cloud reached its one verdict. " +
+      "A terminal `result` is exactly one of three values. 'verified' means measured traffic across a complete window with zero recurrence, so the fix held. 'recurred' means the signature came back inside the window, so the fix did NOT hold. 'inconclusive' means the cloud could not tell. " +
+      "ONLY 'verified' means the fix held. AN INCONCLUSIVE VERDICT IS NOT A FIX. It is an absence of evidence, and an absence of evidence is never a verified fix. Do not close the issue, do not report success, and do not move on because the answer came back inconclusive: the bug may still be live and merely unobserved. " +
+      `\`reason\` comes from a closed vocabulary of exactly ${VERIFICATION_REASONS.length}: ${VERIFICATION_REASONS.join(", ")}. ` +
+      "'recurrence_detected' and 'clean_observation_window' accompany the decisive verdicts, and 'no_recurrence_low_traffic' accompanies a decisive but deliberately modest low volume verdict. " +
+      `The remaining ${INCONCLUSIVE_VERIFICATION_REASONS.length} each mean 'we could not tell', not 'it is fixed': 'window_incomplete' (the window has not fully elapsed), 'window_too_short' (the span was too small to carry signal), 'no_telemetry' (no traffic signal existed at all, which is categorically different from a measured zero) and 'insufficient_traffic' (too few sessions to conclude). ` +
+      "The payload also carries `fixConfirmed`, true only for a terminal 'verified'. When it is false, treat the fix as unestablished no matter what else the payload says. " +
+      "Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        project: {
+          type: "string",
+          description: "The Crumbtrail project id the issue belongs to.",
+        },
+        canonicalIssueId: {
+          type: "string",
+          description: "The canonical issue id to read the verdict for.",
+        },
+      },
+      required: ["project", "canonicalIssueId"],
+    },
+  },
+  /** @stability experimental */
+  {
+    name: "requestProbe",
+    description:
+      "Ask a project's running application to take one named reading, so you can close the single evidence gap a bundle told you about. Reach for it when a completeness slot names a probe, for example network.inflight or storage.snapshot, as the thing that would answer the question. " +
+      `A probe is a name and nothing else. The vocabulary is exactly ${PROBE_NAMES.length}: ${PROBE_NAMES.join(", ")}. No selector, URL, expression or other parameter is sent, and a name outside that list is refused here before any request is made. ` +
+      "TWO LIMITS, AND NEITHER IS A FORMALITY. First, only a live application answers a probe: one that is running right now and polling for its capture config. A stopped app, a finished session and a recording answer nothing, so this cannot recover a fact about the past. " +
+      "Second, this call QUEUES a request and the cloud answers 202. Queued is not answered, and it is not a promise that it will be. If a reading is ever taken it arrives as a probe.result event inside that application's next captured session, so read it there with getEvents or getWindow instead of expecting it in this response, and until you have read it you still do not have the fact. The request is never delivered after the returned expiresAt. Asking twice renews the one pending request rather than queueing a second. " +
+      "WHO ANSWERS IT IS NOT WHO YOU ARE INVESTIGATING. A probe is taken by whichever application instance happens to be polling, which is some visitor present right now, not the session in your bundle. Treat a reading as what the app looks like today, never as what the failing session looked like. " +
+      "storage.snapshot therefore reports shape only: which keys exist, how many, what pattern each follows and how many bytes each holds. Every stored value is replaced, and so is the identifying part of a key, so session:alice@example.com:cart arrives as session:*:cart. You cannot read a person's data out of it, and you cannot use it to confirm one user's state. " +
+      "Live probes are off until a project raises its live_probe autonomy level, so a project that never opted in is refused with live_probe_disabled. This queues an instruction for your own application and writes nothing to your tickets or any external system. " +
+      "Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        project: {
+          type: "string",
+          description: "The Crumbtrail project id whose application to ask.",
+        },
+        probe: {
+          type: "string",
+          enum: [...PROBE_NAMES],
+          description: `The probe to run. One of: ${PROBE_NAMES.join(", ")}.`,
+        },
+      },
+      required: ["project", "probe"],
+    },
+  },
+  /** @stability experimental */
+  {
+    name: "shadowBacktest",
+    description:
+      "Replay the shadow detectors over a bounded window of one project's recorded history and report what they WOULD have proposed, before anything is switched on. It writes no detection state: no candidate, no occurrence, no issue event. " +
+      `\`days\` is a whole number of days from ${BACKTEST_MIN_DAYS} to ${BACKTEST_MAX_DAYS} and defaults to ${DEFAULT_BACKTEST_DAYS}. A value outside that range is refused rather than quietly narrowed, because an answer over a window you did not ask for would read as history that was never scanned. ` +
+      "Every candidate carries a `thresholds` verdict against the project's current code fix rules, with three parts you must read together: `clears`, `failedRules` and `undecidable`. AN UNDECIDABLE RULE IS NOT A PASS. A rule lands in `undecidable`, with a reason, when a past detection cannot carry the evidence to decide it, such as diff size, which exists only once a fix is generated. `clears` speaks only for the decidable rules, so a candidate with `clears` true and a non empty `undecidable` list has been partly checked, never approved. Read `undecidableRules` on the report for how many were left open across the run. " +
+      "`autonomy.wouldPropose` says whether the project's current level would act at all today. The report is a preview and is capped, so `truncated` true means detections were left out of `candidates` while `totalDetections` still counts them all. " +
+      "Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        project: {
+          type: "string",
+          description: "The Crumbtrail project id to replay history for.",
+        },
+        days: {
+          type: "integer",
+          minimum: BACKTEST_MIN_DAYS,
+          maximum: BACKTEST_MAX_DAYS,
+          description: `Replay window length in days, ${BACKTEST_MIN_DAYS} to ${BACKTEST_MAX_DAYS}. Defaults to ${DEFAULT_BACKTEST_DAYS}. Out of range is refused, not clamped.`,
+        },
+        maxTokens: {
+          ...MAX_TOKENS_SCHEMA,
+          description: `${MAX_TOKENS_DESCRIPTION} shadowBacktest budgets one list: candidates are dropped from the end, and each dropReport ref names the dropped candidate as <detector>:<stableSignature>.`,
+        },
+      },
+      required: ["project"],
+    },
+  },
+  /** @stability stable */
+  {
+    name: "getWindowCorrelation",
+    description:
+      "Answer 'what measurably changed during this window' for a recorded session, with no detector involved. It holds the highlight window [t0,t1] against the quiet stretch immediately before it and reports which event kinds changed rate and which numeric fields changed distribution, ranked by p value and cut at a Benjamini Hochberg false discovery rate. Reach for it instead of getWindow when you know roughly WHEN the failure happened but not WHAT went wrong: when getSessionManifest surfaced no candidate, when the candidate it surfaced does not explain the symptom, or when a detector fired and you want to know what else moved at the same moment. getWindow hands you the raw events and leaves the reading to you; this tells you which of them are unusual for this session. A low p value is a CORRELATION and not a cause. It says the window differs from its baseline, never that the row caused the failure, and a busy window will contain changes that are consequences of the bug or coincidences beside it. Treat each row as a lead, confirm it against the raw events with getWindow, and do not ship a fix whose only evidence is a p value. An empty rows list means nothing cleared the significance cut, not that the session is healthy. Reads only the cold event stream, so it answers the same way for local and hosted sessions.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        sessionId: { type: "string" },
+        t0: {
+          type: "number",
+          description:
+            "Highlight window start (absolute ms, inclusive). Same units as manifest.session.startMs and candidate.evidenceWindow.start.",
+        },
+        t1: {
+          type: "number",
+          description: "Highlight window end (absolute ms, inclusive)",
+        },
+        baselineMultiplier: {
+          type: "number",
+          description:
+            "Baseline width as a multiple of the highlight width, default 4, clamped to 1..50. The baseline is the half open span [t0 - multiplier * (t1 - t0), t0), so an event landing exactly on t0 belongs to the highlight and is never counted twice. Widen it for a steadier baseline, narrow it when the session changed behaviour shortly before t0.",
+        },
+        limit: {
+          type: "number",
+          description: "Max rows to return (default and hard cap 500)",
+        },
+        maxTokens: {
+          ...MAX_TOKENS_SCHEMA,
+          description: `${MAX_TOKENS_DESCRIPTION} getWindowCorrelation budgets one list: rows are already ordered most significant first, so they are dropped from the end, and each dropReport ref names the dropped row as <kind>.<field>.`,
+        },
+      },
+      required: ["sessionId", "t0", "t1"],
+    },
+  },
 ];
 
 // Canonical tool names are camelCase. Every tool also accepts a snake_case
@@ -1124,6 +1282,14 @@ export class McpServer {
         return this.toolRecordFeedback(args);
       case "getPlaybook":
         return this.toolGetPlaybook(args);
+      case "startFixVerification":
+        return this.toolStartFixVerification(args);
+      case "getFixVerification":
+        return this.toolGetFixVerification(args);
+      case "requestProbe":
+        return this.toolRequestProbe(args);
+      case "shadowBacktest":
+        return this.toolShadowBacktest(args);
       case "resolveSignature":
         return this.toolResolveSignature(args);
       case "locateInteractiveElements":
@@ -1132,6 +1298,8 @@ export class McpServer {
         return this.toolGetSessionManifest(args);
       case "getWindow":
         return this.toolGetWindow(args);
+      case "getWindowCorrelation":
+        return this.toolGetWindowCorrelation(args);
       case "getEvidence":
         return this.toolGetEvidence(args);
       case "getStorageSnapshot":
@@ -2385,6 +2553,272 @@ export class McpServer {
     return textResult({ ...result.data, source: "cloud" });
   }
 
+  // --- Fix verification ----------------------------------------------------
+  // The one invariant these two tools exist to protect, stated in the cloud's
+  // verification-engine.ts: an absence of evidence is never a verified fix.
+  // Every rendering below is written so that an inconclusive verdict cannot be
+  // misread as a successful one, including by an agent that skims.
+
+  /** Both tools take the same two ids and both are validated with the same rule
+   *  the cloud route's `validId` applies, so a malformed id is refused here
+   *  rather than spending a round trip to earn a 404. */
+  private verificationIds(
+    args: Record<string, unknown>,
+    tool: string,
+  ): { projectId: string; canonicalIssueId: string } | { error: string } {
+    const shape = /^[A-Za-z0-9_]{1,128}$/;
+    const projectId = stringField(args.project)?.trim();
+    if (!projectId || !shape.test(projectId))
+      return {
+        error: `${tool} requires a valid project id (letters, digits, underscore; up to 128 chars)`,
+      };
+    const canonicalIssueId = stringField(args.canonicalIssueId)?.trim();
+    if (!canonicalIssueId || !shape.test(canonicalIssueId))
+      return {
+        error: `${tool} requires a valid canonicalIssueId (letters, digits, underscore; up to 128 chars)`,
+      };
+    return { projectId, canonicalIssueId };
+  }
+
+  /**
+   * Plain language reading of one verification view.
+   *
+   * The only branch that says a fix held is a TERMINAL `verified`. Everything
+   * else — no window, an open window, a recurrence, and every inconclusive
+   * reason — says plainly that nothing is established, because the agent acting
+   * on this text is the last place the invariant can be enforced.
+   */
+  private static verificationInterpretation(view: FixVerificationView): string {
+    if (view.state === "none")
+      return "No observation window has ever been opened for this issue, so nothing has been measured. Open one with startFixVerification once the fix is deployed.";
+    if (view.state === "open")
+      return "An observation window is still in flight and NOTHING has been concluded yet. Do not treat this as a fix that held. Ask again after observationEnd.";
+    if (view.result === "verified")
+      return "The fix held: measured traffic across a complete observation window with zero recurrence of this signature.";
+    if (view.result === "recurred")
+      return "The fix did NOT hold: this signature came back inside the observation window. Reopen the investigation.";
+    return `Crumbtrail could not tell (reason: ${view.reason ?? "unknown"}). That is an absence of evidence, and an absence of evidence is NOT a fix. Do not close the issue on this result: leave the fix under observation, or gather more traffic and ask again.`;
+  }
+
+  private static readonly VERIFICATION_CAVEAT =
+    "An absence of evidence is never a confirmed fix. Trust `fixConfirmed` and `result`: an inconclusive verdict means 'we could not tell', never 'it held'.";
+
+  /** Shared rendering for both verification tools. `fixConfirmed` is computed
+   *  here, from a terminal state AND a `verified` result, so no caller can
+   *  synthesise a success from a partial view. */
+  private renderVerification(
+    view: FixVerificationView,
+    identity: { project: string; canonicalIssueId: string },
+    extra?: Record<string, unknown>,
+  ) {
+    const conclusive = view.state === "terminal";
+    return textResult({
+      source: "cloud",
+      ...identity,
+      ...extra,
+      state: view.state,
+      result: view.result ?? null,
+      reason: view.reason ?? null,
+      strategy: view.strategy ?? null,
+      confidence: view.confidence ?? null,
+      observationStart: view.observationStart ?? null,
+      observationEnd: view.observationEnd ?? null,
+      conclusive,
+      fixConfirmed: conclusive && view.result === "verified",
+      recurred: conclusive && view.result === "recurred",
+      interpretation: McpServer.verificationInterpretation(view),
+      caveat: McpServer.VERIFICATION_CAVEAT,
+    });
+  }
+
+  /**
+   * Open an observation window after a fix. The cloud route is idempotent, so a
+   * retrying agent gets the live window back with `opened: false` instead of a
+   * second one. Agent-token auth.
+   */
+  private async toolStartFixVerification(args: Record<string, unknown>) {
+    const ids = this.verificationIds(args, "startFixVerification");
+    if ("error" in ids) return errorResult(ids.error);
+    const result = await startFixVerificationViaCloud(ids);
+    if (!result.ok)
+      return this.learningLoopFailure(result, "startFixVerification");
+    const { opened, ...view } = result.data;
+    return this.renderVerification(
+      view,
+      { project: ids.projectId, canonicalIssueId: ids.canonicalIssueId },
+      { opened: opened === true },
+    );
+  }
+
+  /**
+   * Read the verdict. `result` and `reason` are passed through verbatim from the
+   * cloud so the closed reason vocabulary reaches the agent unaltered; the
+   * derived booleans and prose are added beside them, never in place of them.
+   */
+  private async toolGetFixVerification(args: Record<string, unknown>) {
+    const ids = this.verificationIds(args, "getFixVerification");
+    if ("error" in ids) return errorResult(ids.error);
+    const result = await getFixVerificationViaCloud(ids);
+    if (!result.ok)
+      return this.learningLoopFailure(result, "getFixVerification");
+    return this.renderVerification(result.data, {
+      project: ids.projectId,
+      canonicalIssueId: ids.canonicalIssueId,
+    });
+  }
+
+  // --- Live probe plane and shadow back test -------------------------------
+  // Both call an agent-plane cloud route with a `ctagt_` token, so both follow
+  // the fix-verification tools above: validate locally against the cloud's own
+  // `validId` rule before spending a round trip, report an unconfigured host as
+  // a gap rather than an error, and pass the cloud's own semantics through
+  // instead of collapsing them into a yes.
+
+  /** The cloud's `validId` shape, applied here so a malformed id is refused
+   *  before any network call rather than earning a 404. */
+  private static readonly CLOUD_ID_SHAPE = /^[A-Za-z0-9_]{1,128}$/;
+
+  private cloudProjectId(
+    args: Record<string, unknown>,
+    tool: string,
+  ): { projectId: string } | { error: string } {
+    const projectId = stringField(args.project)?.trim();
+    if (!projectId || !McpServer.CLOUD_ID_SHAPE.test(projectId))
+      return {
+        error: `${tool} requires a valid project id (letters, digits, underscore; up to 128 chars)`,
+      };
+    return { projectId };
+  }
+
+  /**
+   * Queue one named probe for a project's running application.
+   *
+   * Everything this renders is written so a queued request cannot be misread as
+   * an answer: `queued` and `answered` are separate fields, `answered` is always
+   * false here, and the interpretation names where a reading would actually
+   * appear. Agent-token auth.
+   */
+  private async toolRequestProbe(args: Record<string, unknown>) {
+    const ids = this.cloudProjectId(args, "requestProbe");
+    if ("error" in ids) return errorResult(ids.error);
+    const probe = stringField(args.probe)?.trim();
+    // Refused locally against the same frozen allowlist the SDK and the cloud
+    // share, so an invented probe name never reaches the network.
+    if (!isProbeName(probe)) {
+      return errorResult(
+        `requestProbe requires a probe from the fixed vocabulary: ${PROBE_NAMES.join(", ")}`,
+      );
+    }
+    const result = await requestProbeViaCloud({
+      projectId: ids.projectId,
+      probeName: probe as ProbeName,
+    });
+    if (!result.ok) return this.learningLoopFailure(result, "requestProbe");
+    const queued = isRecord(result.data?.queued)
+      ? (result.data.queued as Record<string, unknown>)
+      : undefined;
+    return textResult({
+      source: "cloud",
+      project: ids.projectId,
+      probe,
+      queued: true,
+      answered: false,
+      requestedAt: stringField(queued?.requestedAt) ?? null,
+      expiresAt: stringField(queued?.expiresAt) ?? null,
+      interpretation:
+        "The request is on record and will be handed to this project's application the next time it polls for its capture config. Nothing has run yet.",
+      caveat:
+        "A queued probe is not an answer. Only an application that is running and polling can take the reading, and if it does the reading arrives as a probe.result event in that application's next captured session: read it with getEvents or getWindow. The request is never delivered after expiresAt.",
+    });
+  }
+
+  /** The cloud refuses an out of bounds `days` rather than clamping it, so this
+   *  refuses the same values locally and for the same reason: an answer over a
+   *  window the caller did not ask for would read as history that was scanned. */
+  private backtestDays(
+    args: Record<string, unknown>,
+  ): { days?: number } | { error: string } {
+    if (args.days === undefined) return {};
+    const value = args.days;
+    if (
+      typeof value !== "number" ||
+      !Number.isInteger(value) ||
+      value < BACKTEST_MIN_DAYS ||
+      value > BACKTEST_MAX_DAYS
+    ) {
+      return {
+        error: `shadowBacktest requires days to be a whole number between ${BACKTEST_MIN_DAYS} and ${BACKTEST_MAX_DAYS} (it is refused, never clamped)`,
+      };
+    }
+    return { days: value };
+  }
+
+  /**
+   * Replay the shadow detectors over a project's recorded history.
+   *
+   * `thresholds.undecidable` is passed through verbatim on every candidate and
+   * counted on the report, because the one way to misuse this answer is to read
+   * a partial check as an approval. Agent-token auth, and the route writes no
+   * detection state.
+   */
+  private async toolShadowBacktest(args: Record<string, unknown>) {
+    const budget = this.maxTokensOf(args);
+    if ("error" in budget) return errorResult(budget.error);
+    const ids = this.cloudProjectId(args, "shadowBacktest");
+    if ("error" in ids) return errorResult(ids.error);
+    const days = this.backtestDays(args);
+    if ("error" in days) return errorResult(days.error);
+
+    const result = await shadowBacktestViaCloud({
+      projectId: ids.projectId,
+      days: days.days,
+    });
+    if (!result.ok) return this.learningLoopFailure(result, "shadowBacktest");
+    const report = result.data;
+    const candidates = Array.isArray(report.candidates)
+      ? report.candidates
+      : [];
+    const undecidableRules = candidates.reduce(
+      (total, candidate) =>
+        total +
+        (Array.isArray(candidate?.thresholds?.undecidable)
+          ? candidate.thresholds.undecidable.length
+          : 0),
+      0,
+    );
+    const payload = {
+      source: "cloud",
+      ...report,
+      candidates,
+      returned: candidates.length,
+      /** How many threshold rules across the run could not be decided at all. */
+      undecidableRules,
+      caveat:
+        "An undecidable rule is not a pass. `clears` speaks only for the rules a past detection can decide, so a candidate with undecidable rules has been partly checked and not approved. Nothing here was proposed, filed or recorded: it is what the detectors would have done.",
+    };
+    if (budget.maxTokens === undefined) return textResult(payload);
+    return this.budgetedTextResult(
+      payload as unknown as Record<string, unknown>,
+      [
+        budgetPlane(
+          "candidates",
+          candidates,
+          (candidate) => `${candidate.detector}:${candidate.stableSignature}`,
+        ),
+      ],
+      budget.maxTokens,
+      {
+        onKept: (out, kept) => {
+          const keptCandidates = kept.get("candidates") ?? [];
+          out.returned = keptCandidates.length;
+          out.truncated =
+            report.truncated === true ||
+            keptCandidates.length < candidates.length;
+        },
+      },
+    );
+  }
+
   /** Adapt this server's storage readers to the recall engine's injected seam.
    *  Delegates to the shared buildRecallStore so the MCP tool and the inner
    *  /api/solve-context endpoint locate against an identical store. */
@@ -2530,6 +2964,76 @@ export class McpServer {
           const keptCount = kept.get("events")!.length;
           out.returned = keptCount;
           out.truncated = matched.length > keptCount;
+        },
+      },
+    );
+  }
+
+  /**
+   * Detector free window scoring. Reads the SAME cold stream as getWindow, and
+   * reads it the same way: `this.store` only, never `fs`. A direct fs read here
+   * would work on a developer's laptop and return "Session not found" for every
+   * hosted session, because in cloud mode the artifacts live behind
+   * RemoteMcpReadStore and nothing is on disk to find.
+   */
+  private async toolGetWindowCorrelation(args: Record<string, unknown>) {
+    const budget = this.maxTokensOf(args);
+    if ("error" in budget) return errorResult(budget.error);
+    const dir = await this.sessionDirAsync(args.sessionId as string);
+    const t0 = numberField(args.t0);
+    const t1 = numberField(args.t1);
+    if (t0 === undefined || t1 === undefined)
+      return errorResult(
+        "getWindowCorrelation requires numeric t0 and t1 (absolute ms)",
+      );
+
+    const events = await this.readColdEventsAsync(dir);
+    if (events === undefined && !(await this.sessionExistsAsync(dir)))
+      return errorResult("Session not found");
+
+    const requestedMultiplier = numberField(args.baselineMultiplier);
+    const baselineMultiplier =
+      requestedMultiplier === undefined
+        ? 4
+        : Math.max(1, Math.min(50, requestedMultiplier));
+
+    // A session with no cold stream is a real, answerable case: the windows are
+    // empty and nothing changed. Scoring the empty array keeps that answer the
+    // same shape as every other one instead of a second bespoke payload.
+    const correlation = correlateWindow(events ?? [], {
+      t0,
+      t1,
+      baselineMultiplier,
+    });
+    const returned = correlation.rows.slice(0, this.windowCap(args.limit));
+    const payload = {
+      sessionId: args.sessionId,
+      units: "absolute-ms",
+      baseline: correlation.baseline,
+      highlight: correlation.highlight,
+      baselineMultiplier: correlation.baselineMultiplier,
+      q: correlation.q,
+      testsRun: correlation.testsRun,
+      count: correlation.rows.length,
+      returned: returned.length,
+      truncated: correlation.rows.length > returned.length,
+      caveat:
+        "Each row is a correlation, not a cause: it says the highlight window differs from its baseline. Confirm a row against the raw events with getWindow before acting on it.",
+      rows: returned,
+    };
+    if (budget.maxTokens === undefined) return textResult(payload);
+    // Rows arrive most significant first, so the budget drops from the TAIL and
+    // the strongest lead is never the first casualty. Rows carry no id, so a
+    // drop-report ref is the dimension it scored: "<kind>.<field>".
+    return this.budgetedTextResult(
+      payload as unknown as Record<string, unknown>,
+      [budgetPlane("rows", returned, (row) => `${row.kind}.${row.field}`)],
+      budget.maxTokens,
+      {
+        onKept: (out, kept) => {
+          const keptCount = kept.get("rows")!.length;
+          out.returned = keptCount;
+          out.truncated = correlation.rows.length > keptCount;
         },
       },
     );

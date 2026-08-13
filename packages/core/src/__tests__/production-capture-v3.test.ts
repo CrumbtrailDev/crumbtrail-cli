@@ -295,7 +295,11 @@ describe("production capture v3", () => {
     const request = fetch.mock.calls[0] as unknown as [string, RequestInit];
     const url = new URL(request[0]);
     expect(url.searchParams.get("projectKey")).toBe("project_42");
-    expect(request[1]).toEqual({ method: "GET" });
+    // `no-store` is load bearing, not incidental: the route serves
+    // `Cache-Control: private, max-age=60` and the poll interval is also 60s,
+    // so a cache hit would replay a one shot probe claim and run the probe a
+    // second time.
+    expect(request[1]).toEqual({ method: "GET", cache: "no-store" });
     expect((logger as any).config).toMatchObject({
       consentMode: "required",
       maskAllText: true,

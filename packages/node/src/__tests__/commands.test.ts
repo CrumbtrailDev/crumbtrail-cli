@@ -51,6 +51,13 @@ describe('parseCommand', () => {
     });
   });
 
+  it('routes the backtest subcommand and strips the command word', () => {
+    expect(parseCommand(['backtest', '--all', '--json'])).toEqual({
+      command: 'backtest',
+      rest: ['--all', '--json'],
+    });
+  });
+
   it('still defaults bare flags to serve', () => {
     expect(parseCommand(['--port', '3000'])).toEqual({ command: 'serve', rest: ['--port', '3000'] });
   });

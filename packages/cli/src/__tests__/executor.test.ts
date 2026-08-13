@@ -22,7 +22,7 @@ describe("executePlan — golden create/prepend on a real repo", () => {
   };
 
   // Regression: buildPlan's `io` default was dropped when detection moved into
-  // crumbtrail-detect-core, so every one-argument caller — the wizard itself and
+  // the detection core, so every one-argument caller — the wizard itself and
   // the installer harness — passed `undefined` and died on `io.readFile`. Every
   // other test here supplies `io` explicitly, which is exactly why the suite
   // stayed green while `npx crumbtrail` was broken for all recipes. Calling with

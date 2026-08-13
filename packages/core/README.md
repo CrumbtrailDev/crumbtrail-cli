@@ -181,6 +181,42 @@ action, or `flag()` triggers capture. The recorder adds the configured tail
 before finalizing the report. A cloud config response can disable capture with
 `killSwitch: true`; the SDK clears its buffer as soon as that response arrives.
 
+### Live probes
+
+A capture config response can also name probes to run, under a `probes` field. A probe answers one
+question about the running application and rests its answer as a `probe.result` event, so an agent
+reading the session afterwards sees what the app actually looked like at that moment rather than
+what the code implies it looked like. Four probes exist and the server can name nothing else:
+`runtime.env`, `storage.snapshot`, `network.inflight` and `flags.current`.
+
+The whole of what a server may say is a name. Probes take no selector, no URL, no path and no
+expression, so no value from a config response reaches probe code, and one entry shaped as an object
+rather than a string refuses the entire field rather than being salvaged. A name outside the four is
+dropped without normalization. At most four probes run per poll, repeats are collapsed, and a list
+longer than 64 entries is refused before it is read.
+
+They run one at a time, only after the remote policy has been applied, and each gets its own
+deadline: 2 seconds, 200 rows and 32 KB of serialized rows by default. A probe that hangs is
+abandoned at the deadline. A kill switch, a `stop()` or a newer poll ends the run between probes. A
+probe never throws: a failure rests as a `probe.result` carrying `ok: false` and a short reason,
+because "this source was not available in production" is itself an answer. Values pass through the
+same redaction the rest of capture uses.
+
+A probe is answered by whichever application instance is polling when the request goes out. That is
+not the session an agent is investigating, and by the time a bundle is being read that session has
+ended, so a probe reports on a bystander rather than on the person who hit the defect. Read every
+reading as "the app looks like this right now", never as "the failing session looked like this".
+
+`storage.snapshot` is the reading where that distinction changes what is emitted, so its keys get a
+stricter treatment than the ordinary storage capture uses. It reports which keys exist, how many,
+what pattern each follows and how many bytes each holds. It does not report any stored value, which
+is replaced unconditionally, and it does not report the identifying part of a key: an email address,
+a user id, an order number, a phone number or any other span that could carry a value is replaced
+with `*`, so `session:alice@example.com:cart` is reported as `session:*:cart`. A key from which no
+ordinary word survives is reported as `[REDACTED_KEY]`. A plain word in a key is kept, which is what
+makes two patterns tellable apart, so a key that spells out a person's name in ordinary letters is
+the one case this cannot catch.
+
 ### Response body summaries (`net.res`)
 
 `net.res` keeps carrying the redacted response body as text in `d.body`. It also
@@ -360,15 +396,102 @@ collector emits one `ui.layout` event per navigation with
 locale-vs-rendered-number contradiction, and horizontal overflow from a long
 translated label, joinable without capturing any DOM.
 
+## React
+
+The React bindings live on the `crumbtrail-core/react` subpath. Nothing extra to
+install: React is an optional peer dependency, so a project that never imports
+this subpath never has to have React at all.
+
+Wrap a subtree so a render error is flagged as a bug with the surrounding
+session already captured:
+
+```tsx
+import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";
+import { CrumbtrailErrorBoundary } from "crumbtrail-core/react";
+
+const crumbtrail = Crumbtrail.init({
+  ...PRESET_PASSIVE,
+  httpEndpoint: "https://api.crumbtrail.ai",
+  httpAuthToken: process.env.CRUMBTRAIL_KEY,
+});
+
+export function App() {
+  return (
+    <CrumbtrailErrorBoundary logger={crumbtrail} fallback={<p>Something broke.</p>}>
+      <Checkout />
+    </CrumbtrailErrorBoundary>
+  );
+}
+```
+
+| Prop | Type | Description |
+| --- | --- | --- |
+| `logger` | `Crumbtrail` | The instance returned by `Crumbtrail.init()`. |
+| `children` | `ReactNode` | The subtree to guard. |
+| `fallback` | `ReactNode` | Optional UI to render after an error. |
+
+`useBugState` registers a value so it is attached to any bug flagged while the
+component is mounted:
+
+```tsx
+import { useBugState } from "crumbtrail-core/react";
+
+function Checkout({ crumbtrail }) {
+  const [cart, setCart] = useState([]);
+  const [step, setStep] = useState("address");
+
+  useBugState(crumbtrail, "cart", cart);
+  useBugState(crumbtrail, "step", step);
+
+  // ...
+}
+```
+
+Values are **redacted by default** using the same policy as the rest of the SDK,
+so a state field called `token` or `password` never leaves the browser in the
+clear. Pass `{ captureRawState: true }` as the fourth argument only when you are
+certain the value is safe.
+
+React 18 or newer. For React Native and Expo, use
+[`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native)
+instead: its peer dependencies are native and must not reach a web bundle.
+
+## Tauri
+
+The Tauri v2 transport lives on the `crumbtrail-core/tauri` subpath. It replaces
+the HTTP transport with native IPC, so a desktop app needs no server process.
+`@tauri-apps/api` is an optional peer dependency, which every Tauri v2 frontend
+already has.
+
+```typescript
+import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";
+import { TauriTransport } from "crumbtrail-core/tauri";
+
+const logger = Crumbtrail.init({
+  ...PRESET_PASSIVE,
+  transportInstance: new TauriTransport(),
+});
+```
+
+`TauriTransport` sends events over Tauri's `invoke()` IPC to the Rust side,
+which owns session directories, NDJSON writing, blob storage and
+post-processing. That Rust half is the `tauri-plugin-crumbtrail` crate, and it
+must be registered separately — see
+[`packages/tauri/README.md`](https://github.com/CrumbtrailDev/crumbtrail-cli/blob/main/packages/tauri/README.md)
+for the Cargo dependency, the `.plugin(...)` call and the capability permission.
+Without those three steps every Crumbtrail `invoke` fails.
+
 ## Related packages
 
 | Package                                                                            | Use it for                                                 |
 | ---------------------------------------------------------------------------------- | ---------------------------------------------------------- |
 | [`crumbtrail`](https://www.npmjs.com/package/crumbtrail)                           | The `npx crumbtrail` setup wizard                          |
 | [`crumbtrail-node`](https://www.npmjs.com/package/crumbtrail-node)                 | Self-hosted server, Express middleware, MCP evidence tools |
-| [`crumbtrail-react`](https://www.npmjs.com/package/crumbtrail-react)               | React error boundary and state-capture hook                |
-| [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native) | React Native bindings                                      |
-| [`crumbtrail-tauri`](https://www.npmjs.com/package/crumbtrail-tauri)               | Tauri desktop bindings                                     |
+| [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native) | React Native and Expo bindings                             |
+
+The React error boundary and state-capture hook, and the Tauri desktop
+transport, are subpaths of this package rather than packages of their own — see
+[React](#react) and [Tauri](#tauri) above.
 
 ## Links
 

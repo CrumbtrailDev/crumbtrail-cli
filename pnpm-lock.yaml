@@ -56,43 +56,27 @@ importers:
       crumbtrail-core:
         specifier: workspace:^
         version: link:../core
-      crumbtrail-detect-core:
-        specifier: workspace:^
-        version: link:../detect-core
-      crumbtrail-install-shared:
-        specifier: workspace:^
-        version: link:../install-shared
 
-  packages/core: {}
-
-  packages/detect-core:
-    dependencies:
-      crumbtrail-core:
-        specifier: workspace:^
-        version: link:../core
+  packages/core:
     devDependencies:
-      '@types/node':
-        specifier: ^25.5.0
-        version: 25.9.5
-      crumbtrail-install-shared:
-        specifier: workspace:^
-        version: link:../install-shared
-
-  packages/install-shared:
-    dependencies:
-      crumbtrail-core:
-        specifier: workspace:^
-        version: link:../core
-    devDependencies:
-      '@types/node':
-        specifier: ^25.5.0
-        version: 25.9.5
+      '@tauri-apps/api':
+        specifier: ^2.0.0
+        version: 2.11.1
+      '@testing-library/react':
+        specifier: ^16.1.0
+        version: 16.3.2(@testing-library/dom@10.4.1)(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
       '@types/react':
         specifier: ^19.0.0
         version: 19.2.17
+      '@types/react-dom':
+        specifier: ^19.0.0
+        version: 19.2.3(@types/react@19.2.17)
       react:
         specifier: ^19.0.0
         version: 19.2.7
+      react-dom:
+        specifier: ^19.0.0
+        version: 19.2.7(react@19.2.7)
 
   packages/node:
     dependencies:
@@ -121,33 +105,6 @@ importers:
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
-
-  packages/react:
-    devDependencies:
-      '@testing-library/react':
-        specifier: ^16.1.0
-        version: 16.3.2(@testing-library/dom@10.4.1)(@types/react-dom@19.2.3(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)
-      '@types/react':
-        specifier: ^19.0.0
-        version: 19.2.17
-      '@types/react-dom':
-        specifier: ^19.0.0
-        version: 19.2.3(@types/react@19.2.17)
-      happy-dom:
-        specifier: ^17.4.0
-        version: 17.6.3
-      react:
-        specifier: ^19.0.0
-        version: 19.2.7
-      react-dom:
-        specifier: ^19.0.0
-        version: 19.2.7(react@19.2.7)
-      typescript:
-        specifier: ^5.7.0
-        version: 5.9.3
-      vitest:
-        specifier: ^4.1.10
-        version: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(happy-dom@17.6.3)(jsdom@26.1.0)(vite@7.3.6(@types/node@25.9.5)(terser@5.49.0)(yaml@2.9.0))
 
   packages/react-native:
     dependencies:
@@ -178,25 +135,6 @@ importers:
         version: 8.5.1(postcss@8.5.18)(typescript@5.9.3)(yaml@2.9.0)
       typescript:
         specifier: ^5.7.0
-        version: 5.9.3
-      vitest:
-        specifier: ^4.1.10
-        version: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(happy-dom@17.6.3)(jsdom@26.1.0)(vite@7.3.6(@types/node@25.9.5)(terser@5.49.0)(yaml@2.9.0))
-
-  packages/tauri:
-    dependencies:
-      '@tauri-apps/api':
-        specifier: ^2.0.0
-        version: 2.11.1
-    devDependencies:
-      crumbtrail-core:
-        specifier: workspace:^
-        version: link:../core
-      tsup:
-        specifier: ^8.5.0
-        version: 8.5.1(postcss@8.5.18)(typescript@5.9.3)(yaml@2.9.0)
-      typescript:
-        specifier: ^5.8.3
         version: 5.9.3
       vitest:
         specifier: ^4.1.10

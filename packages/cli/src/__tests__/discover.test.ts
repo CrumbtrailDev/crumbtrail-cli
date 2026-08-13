@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import path from "node:path";
-import { detect, memoryReader } from "../detect";
+import { detect } from "../detect";
+// memoryReader is test-only and deliberately absent from the public barrel.
+import { memoryReader } from "../testing";
 import { discoverServices, looksLikeLibrary } from "../discover";
 import { cleanup, makeTmpRepo } from "./helpers";
 

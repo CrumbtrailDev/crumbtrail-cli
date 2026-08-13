@@ -2,7 +2,9 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "dist",
-    "rootDir": "src"
+    "rootDir": "src",
+    // The `crumbtrail-core/react` adapter under src/react compiles JSX types.
+    "jsx": "react-jsx"
   },
   "include": ["src"]
 }

@@ -88,23 +88,13 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
   logFn(
     "build",
     "start",
-    "packages=crumbtrail-core,crumbtrail-node,crumbtrail-design-system,crumbtrail-install-shared,crumbtrail",
+    "packages=crumbtrail-core,crumbtrail-node,crumbtrail",
   );
   await run("pnpm", ["--filter", "crumbtrail-core", "build"], repoRoot);
   await run("pnpm", ["--filter", "crumbtrail-node", "build"], repoRoot);
-  // The CLI (package name `crumbtrail`) depends on the design system and the
-  // shared install-instruction builders — both must be built before `pnpm
-  // pack` can resolve the CLI's workspace deps into its bundle.
-  await run(
-    "pnpm",
-    ["--filter", "crumbtrail-design-system", "build"],
-    repoRoot,
-  );
-  await run(
-    "pnpm",
-    ["--filter", "crumbtrail-install-shared", "build"],
-    repoRoot,
-  );
+  // The CLI (package name `crumbtrail`) now carries detection, injection
+  // planning and the shared install-instruction builders as its own source, so
+  // it has no workspace package to build first beyond core.
   await run("pnpm", ["--filter", "crumbtrail", "build"], repoRoot);
   logFn("build", "pass");
 
@@ -120,32 +110,23 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
     `core=${path.basename(core)} node=${path.basename(node)} cli=${path.basename(cli)}`,
   );
 
-  // Optional SDK channels: react + react-native + tauri. Best-effort — a
+  // Optional SDK channel: react-native. React and Tauri used to pack here as
+  // their own tarballs; they are now the `crumbtrail-core/react` and
+  // `crumbtrail-core/tauri` subpaths, so they ship inside the core tarball
+  // packed above and need no channel of their own. Best-effort — a
   // missing/broken pack warns and is simply absent from the manifest (the
   // installer stays fully functional for the core trio; the wizard's tarball
   // fallback for that SDK is just unavailable until the pack succeeds).
-  const react = await packOptional({
-    filter: "crumbtrail-react",
-    packageDir: path.join(repoRoot, "packages", "react"),
-    outDir,
-    logFn,
-  });
   const reactNative = await packOptional({
     filter: "crumbtrail-react-native",
     packageDir: path.join(repoRoot, "packages", "react-native"),
     outDir,
     logFn,
   });
-  const tauri = await packOptional({
-    filter: "crumbtrail-tauri",
-    packageDir: path.join(repoRoot, "packages", "tauri"),
-    outDir,
-    logFn,
-  });
   logFn(
     "pack-optional",
     "pass",
-    `react=${react ? path.basename(react) : "(absent)"} reactNative=${reactNative ? path.basename(reactNative) : "(absent)"} tauri=${tauri ? path.basename(tauri) : "(absent)"}`,
+    `reactNative=${reactNative ? path.basename(reactNative) : "(absent)"}`,
   );
 
   const manifest = {
@@ -157,9 +138,7 @@ export async function packLocal({ outDir, logFn = phaseLog }) {
     // Optional keys — present only when the pack succeeded. Consumers must treat
     // them as absent-by-default (install-routes omits them; the CLI's tarball
     // discovery only resolves them when listed).
-    ...(react ? { react } : {}),
     ...(reactNative ? { reactNative } : {}),
-    ...(tauri ? { tauri } : {}),
   };
   const manifestPath = path.join(outDir, "pack-manifest.json");
   await fs.writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
