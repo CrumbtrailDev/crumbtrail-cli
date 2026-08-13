@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { readSessionDistinctBugs } from "./recall";
 import {
@@ -109,6 +110,20 @@ const PARTITION_DEPTH = 4;
 const DATE_PARTITION = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
+ * The spelling the store would publish for a directory, falling back to plain resolution when the
+ * path cannot be resolved. A failure here must not abort the measurement: the only thing this feeds
+ * is an identity comparison, and a directory that cannot be resolved matches nothing either way.
+ */
+function realpathOrResolve(dir: string): string {
+  const resolved = path.resolve(dir);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+/**
  * The store root a finalized session belongs to, or `undefined` when the directory is not a
  * finalized session inside one.
  *
@@ -195,7 +210,13 @@ export async function measureDetectorPrevalence(
     // Identity by resolved path, not by directory name: a replayed session's directory name and
     // the session id inside its meta.json are not guaranteed to agree, and excluding the current
     // session by the wrong one of those would let it count itself as its own prior.
-    const self = path.resolve(options.sessionDir);
+    //
+    // REALPATH, not merely resolve: the store publishes the realpath of every session it returns,
+    // so a caller that names its own session through a symlinked ancestor — a macOS `/var/folders`
+    // temp root, a bind-mounted store — would compare two spellings of one directory, fail to match
+    // either, and let the current session count itself as its own prior. That inflates the
+    // denominator by one and, at the boundary, reports a corpus as overflowed when it was not.
+    const self = realpathOrResolve(options.sessionDir);
     const cap = options.maxScannedSessions ?? MAX_SCANNED_PRIOR_SESSIONS;
     // `cap + 2`, and the two are both load-bearing. One extra so `truncated` below can still tell
     // "exactly the cap" from "more than the cap" — the decision is `> cap`, which needs cap+1 to
@@ -210,7 +231,12 @@ export async function measureDetectorPrevalence(
     const priors = (
       await defaultSessionStore.listSessions(corpusRoot, { limit: cap + 2 })
     )
-      .map(({ dir }) => path.resolve(dir))
+      // Both sides of the identity test go through the SAME resolution. The store publishes the
+      // path it walked to, which is the caller-supplied root joined with directory names — it
+      // checks the realpath for containment but does not return it. So the two spellings of one
+      // directory only ever agree once both are resolved. At most `cap + 2` entries reach this, so
+      // the extra syscalls are bounded by the cap and not by the size of the store.
+      .map(({ dir }) => realpathOrResolve(dir))
       .filter((dir) => dir !== self)
       .sort(compareSessionDirsByRecencyDescending);
     // Truncation is decided BEFORE any file is read, and recorded, because it changes what the
