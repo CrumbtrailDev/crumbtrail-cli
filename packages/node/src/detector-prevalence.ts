@@ -1,6 +1,10 @@
+import fs from "node:fs";
 import path from "node:path";
 import { readSessionDistinctBugs } from "./recall";
-import { defaultSessionStore } from "./session-store";
+import {
+  compareSessionDirsByRecencyDescending,
+  defaultSessionStore,
+} from "./session-store";
 
 /**
  * A detector's CROSS-SESSION base rate: how many of the other sessions already in this store the
@@ -88,11 +92,15 @@ export const MIN_PRIOR_SESSIONS_FOR_PREVALENCE = 12;
  * SCANNED count, so a cap below the floor would make every measurement fall under it and silently
  * remove the column from every store in the world.
  *
- * KNOWN AND NOT CLOSED BY THIS CAP: enumerating the store to find the most recent sessions is still
- * a whole-tree synchronous walk inside `SessionStore.listSessions`, measured at about 0.3 ms per
- * session in the store. The cap removes the JSON read and parse, which is about 80% of the cost;
- * the remaining walk is a bound on a different seam (a store listing that can stop early without
- * losing the symlink-containment checks that walk performs) and belongs with that seam, not here.
+ * The cap is PUSHED DOWN into the store rather than applied to what the store returns: see
+ * `ListSessionsOptions` on the store seam. A cap applied afterwards still pays realpath containment
+ * and the `meta.json` recognition check on every session that exists, and only then throws all but
+ * this many away.
+ *
+ * KNOWN AND NOT CLOSED BY PUSHING THE CAP DOWN: the store still enumerates the tree with one
+ * synchronous `readdirSync` per directory, so finding the candidates remains linear in the size of
+ * the store and still blocks the event loop for its duration. What the bound removes is the
+ * containment and recognition work, not the enumeration.
  */
 export const MAX_SCANNED_PRIOR_SESSIONS = 200;
 
@@ -100,6 +108,20 @@ export const MAX_SCANNED_PRIOR_SESSIONS = 200;
 const PARTITION_DEPTH = 4;
 
 const DATE_PARTITION = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * The spelling the store would publish for a directory, falling back to plain resolution when the
+ * path cannot be resolved. A failure here must not abort the measurement: the only thing this feeds
+ * is an identity comparison, and a directory that cannot be resolved matches nothing either way.
+ */
+function realpathOrResolve(dir: string): string {
+  const resolved = path.resolve(dir);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
 
 /**
  * The store root a finalized session belongs to, or `undefined` when the directory is not a
@@ -151,36 +173,12 @@ export interface MeasureDetectorPrevalenceOptions {
 }
 
 /**
- * The order the cap selects in: MOST RECENT FIRST, by the `{YYYY-MM-DD}` date partition the session
- * is stored under, then by session id, then by resolved path.
- *
- * A cap without a defined order is not a measurement. `listSessions` walks the tree with a stack
- * and returns whatever order the filesystem handed it, so "the first 200" would differ between two
- * runs over the same store and between two machines holding the same sessions — a number nobody can
- * reproduce and nobody can check. Recency is the order the reader is already being told about
- * ("most recent prior sessions") and the only one that makes a base rate mean anything: a store's
- * OLDEST sessions describe an application that may no longer exist.
- *
- * Both keys are read from the path, not from `meta.json`, so ordering costs no extra I/O — the
- * point of the cap is to stop reading files. Session ids are time-ordered strings, so they break
- * ties within a day in the same direction. The final compare on the full resolved path makes the
- * order TOTAL rather than merely sorted: `listSessions` accepts a session at any depth, so a store
- * shaped differently can yield sessions with no date partition at all (they sort last, together),
- * and ids are only unique within a tenant/app. Without that last key a sort over an unordered input
- * stays unordered wherever the first two keys tie.
+ * The order the cap selects in — MOST RECENT FIRST, by date partition, then session id, then path —
+ * is now a property of the STORE, because a bound the store cannot see is a bound the store cannot
+ * act on. It lives beside the listing it orders: {@link compareSessionDirsByRecencyDescending}.
+ * The rationale for each key, and for why the order has to be TOTAL rather than merely sorted, is
+ * recorded there.
  */
-function compareByRecencyDescending(a: string, b: string): number {
-  const aDate = path.basename(path.dirname(a));
-  const bDate = path.basename(path.dirname(b));
-  const aKey = DATE_PARTITION.test(aDate) ? aDate : "";
-  const bKey = DATE_PARTITION.test(bDate) ? bDate : "";
-  if (aKey !== bKey) return aKey < bKey ? 1 : -1;
-  const aId = path.basename(a);
-  const bId = path.basename(b);
-  if (aId !== bId) return aId < bId ? 1 : -1;
-  if (a === b) return 0;
-  return a < b ? 1 : -1;
-}
 
 /**
  * Count, over every other session in the corpus, how many of them each detector fired in.
@@ -212,12 +210,35 @@ export async function measureDetectorPrevalence(
     // Identity by resolved path, not by directory name: a replayed session's directory name and
     // the session id inside its meta.json are not guaranteed to agree, and excluding the current
     // session by the wrong one of those would let it count itself as its own prior.
-    const self = path.resolve(options.sessionDir);
+    //
+    // REALPATH, not merely resolve: the store publishes the realpath of every session it returns,
+    // so a caller that names its own session through a symlinked ancestor — a macOS `/var/folders`
+    // temp root, a bind-mounted store — would compare two spellings of one directory, fail to match
+    // either, and let the current session count itself as its own prior. That inflates the
+    // denominator by one and, at the boundary, reports a corpus as overflowed when it was not.
+    const self = realpathOrResolve(options.sessionDir);
     const cap = options.maxScannedSessions ?? MAX_SCANNED_PRIOR_SESSIONS;
-    const priors = (await defaultSessionStore.listSessions(corpusRoot))
-      .map(({ dir }) => path.resolve(dir))
+    // `cap + 2`, and the two are both load-bearing. One extra so `truncated` below can still tell
+    // "exactly the cap" from "more than the cap" — the decision is `> cap`, which needs cap+1 to
+    // exist. A second because `self` may be among the most recent and is filtered out here, so the
+    // listing must be able to give up one entry to it and still hold cap+1 priors. At cap+1 a store
+    // of exactly cap+2 sessions whose current session sorts inside the window would report
+    // `truncated: false` over a corpus that really did overflow.
+    //
+    // The sort is re-applied to the (now at most cap+2) survivors rather than trusted from the
+    // store: an alternate SessionStore implementation is free to ignore `limit`, and this caller's
+    // published numbers must not depend on which store is installed.
+    const priors = (
+      await defaultSessionStore.listSessions(corpusRoot, { limit: cap + 2 })
+    )
+      // Both sides of the identity test go through the SAME resolution. The store publishes the
+      // path it walked to, which is the caller-supplied root joined with directory names — it
+      // checks the realpath for containment but does not return it. So the two spellings of one
+      // directory only ever agree once both are resolved. At most `cap + 2` entries reach this, so
+      // the extra syscalls are bounded by the cap and not by the size of the store.
+      .map(({ dir }) => realpathOrResolve(dir))
       .filter((dir) => dir !== self)
-      .sort(compareByRecencyDescending);
+      .sort(compareSessionDirsByRecencyDescending);
     // Truncation is decided BEFORE any file is read, and recorded, because it changes what the
     // denominator is allowed to say. The scan reads only what it will count, and counts only what
     // it read: `priorSessions` below is the size of the scanned slice, never the store's size.

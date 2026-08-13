@@ -142,7 +142,12 @@ describe("buildFixContext", async () => {
       "backend",
       "db_activity",
       "db_diffs",
+      // Statements that were ATTEMPTED and RAISED. Added deliberately: every other db plane can
+      // only describe statements that succeeded, so a request whose fault IS the failing
+      // statement carried no database evidence at all. Always present, `[]` when nothing raised.
+      "db_errors",
       "db_reads",
+      "db_statements",
       "frontend",
     ]);
     expect(fc.session.id).toBe(SESSION_ID);

@@ -19,6 +19,8 @@ export interface BuildDbReadEventInput {
   requestId: string;
   /** 1-based ordinal of the SELECT within this request. */
   stmt?: number;
+  /** Already-normalized shape of the SELECT that produced this row. Never raw statement text. */
+  shape?: string;
   /** Resolved LIMIT/OFFSET the statement ran with, when the adapter parsed one. */
   queryShape?: { limit?: number; offset?: number };
   sessionId?: string;
@@ -64,6 +66,10 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
   };
   if (Number.isInteger(input.stmt) && (input.stmt as number) > 0)
     d.stmt = input.stmt;
+  // Omitted rather than emitted empty: an empty shape is indistinguishable from an absent one to
+  // a reader, and a key that is always present but sometimes meaningless reads as an answer.
+  if (typeof input.shape === "string" && input.shape.length > 0)
+    d.shape = input.shape;
   const shape = input.queryShape;
   if (shape && (shape.limit !== undefined || shape.offset !== undefined)) {
     d.q = {

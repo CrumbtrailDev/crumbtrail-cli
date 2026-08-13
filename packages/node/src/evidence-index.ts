@@ -293,6 +293,18 @@ export interface EvidenceCandidate {
      */
     table?: string;
     /**
+     * The normalized, value-free shape of the statement this signal is about —
+     * the same string `databaseErrors[].shape` renders, carried here so the
+     * ranked opinion names the statement rather than only the table it touched.
+     *
+     * Produced by `normalizeStatementShape` at capture time, which is the one
+     * place that guarantee is made; it is re-bounded here and otherwise passed
+     * through unchanged, exactly as the rendering path does. Re-scrubbing it
+     * would make the ranked list and the rendered evidence disagree about the
+     * same string, which is worse than either treatment on its own.
+     */
+    statementShape?: string;
+    /**
      * Column names a row-identity comparison rested on, sorted. Set by the
      * database detectors that claim two rows are the same, so a reader can see
      * what was compared instead of taking the claim on faith.
@@ -725,6 +737,7 @@ export function buildEvidenceCandidates(
   addConsoleWarningCandidates(events, index, drafts);
   addOtelErrorCandidates(events, index, drafts);
   addBackendErrorCandidates(events, index, drafts);
+  addDbErrorCandidates(events, index, drafts);
   addDbDiffCandidates(events, index, drafts);
   addDbFieldDivergenceCandidates(events, index, drafts);
   addDuplicateWriteCandidates(events, index, drafts);
@@ -1206,8 +1219,23 @@ function applyCausalRerank(
     members.set(top, list);
   }
 
-  // Root first, then each subtree in sibling-rank order. Pre-order, so no member can precede the
-  // cause it was attributed to.
+  // The chain LEADS with the member that placed it — its highest effective score — and the
+  // root-first pre-order follows unchanged behind that head.
+  //
+  // The pre-order alone used to be the whole rule, on the guarantee that no member can precede the
+  // cause it was attributed to. That guarantee is deliberately relaxed for the head, and only for
+  // the head, because it costs the reader the thing the chain was ranked for. A chain is placed by
+  // its strongest member (below), so when the root is a generic observation and the named failure
+  // hangs off it, the pre-order hands the reader the WEAKEST statement of the incident as the
+  // headline while the evidence that earned the position sits two to five rows down. Measured over
+  // a frozen replay: of the sessions the ranker already ordered correctly, the first row was almost
+  // always the chain's strongest member, and the incorrect ones concentrate in the shape above,
+  // where a weaker root leads and the placing member sits below it. Promoting the placing member
+  // costs nothing in the common case — a chain whose root
+  // is already its strongest member is untouched — and in the defective case it puts the evidence
+  // that named the fault first. Causality stays legible one line down: the head is MOVED, never
+  // copied, so it appears exactly once, and the cause it was attributed to is the row immediately
+  // after it. Ranking only; no score is mutated here.
   const layout = (top: CandidateDraft): CandidateDraft[] => {
     const out: CandidateDraft[] = [];
     const walk = (draft: CandidateDraft): void => {
@@ -1218,6 +1246,11 @@ function applyCausalRerank(
         walk(child);
     };
     walk(top);
+    // First one wins on ties, which is the pre-order's own order and so the existing tie-break.
+    let head = 0;
+    for (let i = 1; i < out.length; i++)
+      if (effectiveScore(out[i]!) > effectiveScore(out[head]!)) head = i;
+    if (head > 0) out.unshift(...out.splice(head, 1));
     return out;
   };
 
@@ -2082,6 +2115,80 @@ function addBackendErrorCandidates(
       // while the response's end event carries e.g. 500 — including status would split one
       // request into two candidates. dedupeDrafts keeps the higher-scored error.
       dedupeKey: `backend:${requestId ?? event.t}`,
+    });
+  }
+}
+
+/**
+ * A statement the application issued and the database REFUSED.
+ *
+ * The invariant, and it names no application: a request that asked the database to do something
+ * and was told no did not do the thing it reported doing. That is a fault of the statement, not of
+ * the tooling, and every field of the finding comes from the observable itself — the engine, the
+ * operation, the table, the value-free statement shape, the database's own error code and the
+ * driver's error class, all correlated to the request they happened inside.
+ *
+ * Why this is a CANDIDATE and not only a rendered row: `db.error` was collected and shown to the
+ * reader as `databaseErrors`, and nothing that produces the ranked opinion could see it. So an
+ * incident whose root cause is stated verbatim by a failing statement was ranked entirely by
+ * per-detector severity constants belonging to whatever else happened to fire — the failing
+ * statement could not promote anything, however decisive it was.
+ *
+ * Deliberately NOT the twin of `db_mutation`: that detector says a row changed. This one says a
+ * row did not, which is why it carries its own node kind rather than borrowing the write plane's.
+ */
+function addDbErrorCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (event.k !== "db.error") continue;
+
+    const requestId = safeText(event.d.requestId, 120);
+    const op = safeText(event.d.op, 20) ?? "other";
+    const table = safeText(event.d.table, 200);
+    // The same treatment `buildDatabaseErrors` gives it: bounded, otherwise unchanged. The value
+    // was made value-free by `normalizeStatementShape` at capture, and re-deriving that judgement
+    // here would produce a second opinion about a string the reader already sees.
+    const statementShape = safeText(event.d.shape, 400);
+    // The database's own code first — a closed vocabulary — and the driver's error class name
+    // only when the driver reported no code. Never a message: that is where values travel.
+    const code = safeText(event.d.code, 64);
+    const errorCode = code ?? safeText(event.d.errorName, 120);
+    const subject = table ? `on ${table}` : "statement";
+    // `other` is the op vocabulary's "did not parse to one of the known verbs". Printing it reads
+    // as a claim about the statement; omitting it says the same thing without the false note. The
+    // driver's error CLASS is omitted from the title for the same reason — `Error` names nothing —
+    // while both stay on the anchor, where a reader can see exactly what was and was not reported.
+    const verb = op === "other" ? "" : `${op} `;
+
+    drafts.push({
+      detector: "db_statement_failed",
+      title:
+        `Database ${verb}${subject} was refused${code ? ` (${code})` : ""}`.trim(),
+      severity: "high",
+      // Level with `backend_request_error`, on purpose. A refused statement is at least as
+      // decisive as the request failure it usually produces, and claiming MORE would be an
+      // ordering opinion about detectors this change did not measure.
+      score: 90,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs:
+          offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId,
+        table,
+        statementShape,
+        errorCode,
+        // The engine name, matching what every other db-plane detector writes here.
+        source: normalizeDbEngine(event.d.engine),
+      }),
+      // Keyed on the request and what was attempted, so one statement retried inside a request
+      // collapses while two different failing statements in it stay two findings. Falls back to
+      // the event time when the capture carried no request id, mirroring the backend path.
+      dedupeKey: `dberror:${requestId ?? event.t}:${op}:${table ?? ""}:${statementShape ?? ""}`,
     });
   }
 }
@@ -11096,6 +11203,87 @@ function listenerCountsByType(
   return counts.size > 0 ? counts : undefined;
 }
 
+/**
+ * Cumulative registrations and removals per event type, when the capture
+ * carries them.
+ *
+ * `undefined` means the reading does not record churn — an older SDK, or a
+ * bundle captured before the collector kept these counters. It NEVER means the
+ * counters were zero, and no caller may render it as zero: "nothing was
+ * removed" and "removals were not counted" are different statements, and only
+ * one of them is evidence.
+ */
+function listenerChurnByType(
+  event: BugEvent,
+): Map<string, { added: number; removed: number }> | undefined {
+  const churnByType = event.d.churnByType;
+  if (!Array.isArray(churnByType)) return undefined;
+  const churn = new Map<string, { added: number; removed: number }>();
+  for (const entry of churnByType) {
+    if (!Array.isArray(entry) || entry.length < 3) continue;
+    const type = safeText(entry[0], 60);
+    const added = finiteNumber(entry[1]);
+    const removed = finiteNumber(entry[2]);
+    if (!type || added === undefined || removed === undefined) continue;
+    churn.set(type, { added, removed });
+  }
+  return churn.size > 0 ? churn : undefined;
+}
+
+/**
+ * What the census RECORDED about one event type between two readings, as a
+ * sentence — or the honest statement that it recorded nothing, when either
+ * reading lacks the counters.
+ *
+ * The span is the whole session between the two readings rather than the path
+ * they were taken on, and that is stated.
+ *
+ * The counters are cumulative and monotone WITHIN one instrumented run, and
+ * that is the only condition under which the two readings describe one span:
+ * registrations minus removals over it is then exactly the change in the live
+ * count. A capture where the collector was torn down and started again mid-page
+ * breaks it — the later reading's counters begin at zero, so subtracting gives
+ * a negative or an incoherent pair. That is checked here rather than assumed,
+ * and a span that fails the check is UNMEASURED, which reads as the degraded
+ * wording. Clamping the subtraction instead would have manufactured the exact
+ * false zero this whole change exists to remove.
+ */
+function describeListenerChurn(
+  type: string,
+  first: BugEvent,
+  last: BugEvent,
+  liveDelta: number,
+): string {
+  const before = listenerChurnByType(first)?.get(type);
+  const after = listenerChurnByType(last)?.get(type);
+  const added = after && before ? after.added - before.added : undefined;
+  const removed = after && before ? after.removed - before.removed : undefined;
+  if (
+    added === undefined ||
+    removed === undefined ||
+    added < 0 ||
+    removed < 0 ||
+    added - removed !== liveDelta
+  ) {
+    return (
+      `This capture records the live count only — registrations and removals were not ` +
+      `counted separately over that span — so whether any cleanup ran is not observed here. ` +
+      `The same rising curve is produced by a subscription per mount that is never removed, ` +
+      `and by one whose removals simply do not keep up.`
+    );
+  }
+  const observed =
+    `Over that span the census recorded ${added} registration${added === 1 ? "" : "s"} ` +
+    `of a "${type}" listener and ${removed} removal${removed === 1 ? "" : "s"}, across the whole session.`;
+  if (removed === 0) {
+    return (
+      `${observed} No removal of a "${type}" listener was recorded at any point in it, so ` +
+      `nothing in the session was seen to release one.`
+    );
+  }
+  return `${observed} Removals were recorded, but fewer than registrations over the same span.`;
+}
+
 /** Arrivals at one path that must show the staircase before it is a trend. */
 const LISTENER_STAIRCASE_MIN_VISITS = 3;
 /** Minimum growth for one event type across those arrivals. */
@@ -11154,6 +11342,7 @@ function addListenerTypeStaircaseCandidates(
       }
       const delta = series[series.length - 1] - series[0];
       if (!monotone || delta < LISTENER_STAIRCASE_MIN_DELTA) continue;
+      const first = readings[0].event;
       const last = readings[readings.length - 1].event;
       drafts.push({
         detector: "listener_growth",
@@ -11169,9 +11358,9 @@ function addListenerTypeStaircaseCandidates(
           message:
             `Across ${readings.length} arrivals at ${path}, live "${type}" listeners ` +
             `went ${series[0]} → ${series[series.length - 1]} and never decreased. ` +
-            `A subscription made on every mount with no cleanup on unmount produces exactly ` +
-            `this staircase; each leaked handler still fires, so work is repeated once per ` +
-            `earlier visit.`,
+            `${describeListenerChurn(type, first, last, series[series.length - 1] - series[0])} ` +
+            `Every handler still registered fires again on each event, so the work is ` +
+            `repeated once per earlier visit.`,
         }),
         dedupeKey: `listenerstaircase:${path}:${type}`,
       });

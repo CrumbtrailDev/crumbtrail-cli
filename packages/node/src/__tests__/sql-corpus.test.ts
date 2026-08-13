@@ -3,6 +3,14 @@ import { CAPTURE_GAP_EVENT_KIND, type BugEvent } from "crumbtrail-core";
 import { instrumentPgClient } from "../db";
 import { classifyStatement } from "../db/sql";
 
+/**
+ * `db.statement` is emitted for EVERY instrumented statement, whatever it returned, so it appears
+ * in every stream in this file and is evidence about neither row reads nor row diffs — which is
+ * what these suites bind. Its own behaviour, including that it survives when nothing else is
+ * captured, is bound in `db-successful-statement.test.ts`.
+ */
+const notStatement = (event: BugEvent): boolean => event.k !== "db.statement";
+
 function capture(sql: string): Promise<BugEvent[]> {
   const events: BugEvent[] = [];
   const client = {
@@ -12,7 +20,9 @@ function capture(sql: string): Promise<BugEvent[]> {
   };
   const db = instrumentPgClient(client, {
     requestId: "req-corpus",
-    emit: (event) => events.push(event),
+    emit: (event) => {
+      if (notStatement(event)) events.push(event);
+    },
   });
   return db.query(sql).then(() => events);
 }
