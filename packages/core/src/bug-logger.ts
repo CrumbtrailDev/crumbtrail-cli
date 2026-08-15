@@ -1344,9 +1344,24 @@ export class Crumbtrail {
     // flag, so a collector that throws on teardown cannot take the session's
     // last batch down with it.
     this.bus.flush();
-    if (this.widgetCleanup) this.widgetCleanup();
-    this.autoFlagCleanup?.();
-    this.stopConfigPolling();
+    // These three run BEFORE the collector loop and are teardown in exactly the
+    // same sense, so they answer to the same rule: a throw here must not strand
+    // everything below. `widgetCleanup` is DOM teardown against nodes the host
+    // page owns and may have moved or removed, which is the most plausible throw
+    // in the whole of stop(). Unguarded, it skipped the collector loop, both
+    // flushes and `abortFlightRecorder()`, leaving a pending flag() tail promise
+    // that never settles for the caller awaiting it.
+    for (const teardown of [
+      this.widgetCleanup,
+      this.autoFlagCleanup,
+      () => this.stopConfigPolling(),
+    ]) {
+      try {
+        teardown?.();
+      } catch {
+        // Same reasoning as the collector loop below: shutdown continues.
+      }
+    }
     // Collector cleanup is not only teardown: the performance collector's
     // finalizers emit the scores that are knowable nowhere else — `inp`,
     // `cls.score`, `lcp.final` — from this loop. So the loop runs, and its
@@ -1366,6 +1381,11 @@ export class Crumbtrail {
         // unguarded loop made all of that hostage to any collector's teardown.
       }
     }
+    // Every cleanup has now run, so the list holds nothing but closures over
+    // collector state that the teardown just released. Dropped alongside the
+    // ring buffer and the state providers below, and dropped here so a second
+    // stop() cannot run any of them twice.
+    this.cleanups = [];
     this.bus.flush();
     this.stopped = true;
     // Kept after the flag, where it has always been: with `stopped` set,

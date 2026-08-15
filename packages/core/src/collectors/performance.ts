@@ -625,5 +625,11 @@ export function performanceCollector(
     doc?.removeEventListener("keydown", freezeLcp, true);
     doc?.removeEventListener("pointerdown", freezeLcp, true);
     disconnectAll();
+    // The INP ranking is bounded at MAX_TRACKED_INTERACTIONS, so holding it was
+    // retained garbage rather than a leak — but the finalizers above have
+    // already read everything they will ever read out of it, and the map would
+    // otherwise outlive the collector for the whole lifetime of the instance
+    // that owned it.
+    interactions.clear();
   };
 }
