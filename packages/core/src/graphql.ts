@@ -102,7 +102,7 @@ function identityOfEntry(entry: unknown): GraphqlIdentity | undefined {
 
 /** Drop leading whitespace, `#` comments and BOM so the operation keyword is first. */
 function stripLeadingTrivia(document: string): string {
-  let rest = document.replace(/^﻿/, "");
+  let rest = document.replace(/^\uFEFF/, "");
   for (;;) {
     const trimmed = rest.replace(/^\s+/, "");
     if (trimmed.startsWith("#")) {
