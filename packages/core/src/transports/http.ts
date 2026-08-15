@@ -26,6 +26,25 @@ export class EventDeliveryError extends Error {
   }
 }
 
+/**
+ * A stored object the server refused.
+ *
+ * Separate from {@link EventDeliveryError} because it carries no event count: a
+ * blob is one artifact, and reporting it as "rejected 0 events" would read as a
+ * refusal that cost nothing.
+ */
+export class BlobDeliveryError extends Error {
+  readonly status: number;
+  readonly objectName: string;
+
+  constructor(objectName: string, status: number) {
+    super(`capture endpoint refused ${objectName} with ${status}`);
+    this.name = "BlobDeliveryError";
+    this.status = status;
+    this.objectName = objectName;
+  }
+}
+
 export interface HttpTransportOptions {
   authToken?: string;
 }
@@ -118,11 +137,15 @@ export class HttpTransport implements CrumbtrailTransport {
     if (metadata) {
       headers["X-Metadata"] = JSON.stringify(metadata);
     }
-    await fetch(`${this.endpoint}/api/blob/${name}`, {
+    const response = await fetch(`${this.endpoint}/api/blob/${name}`, {
       method: "POST",
       headers,
       body: blob,
     });
+    // A refusal is not a delivery. Session replay in particular is refused with
+    // 403 by a project that has not opted in, and a caller that read that as
+    // success would keep uploading a recording the server is discarding.
+    if (!response.ok) throw new BlobDeliveryError(name, response.status);
   }
 
   async startSession(

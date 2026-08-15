@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "format": "crumbtrail.replay.v1",
+  "sessionId": "sess_fixture_0001",
+  "startedAt": 1784731358410,
+  "durationMs": 33510,
+  "masking": "inputs_masked",
+  "chunks": [
+    {
+      "seq": 0,
+      "startOffsetMs": 0,
+      "endOffsetMs": 32100,
+      "bytes": 612,
+      "checkout": true
+    },
+    {
+      "seq": 1,
+      "startOffsetMs": 32100,
+      "endOffsetMs": 33510,
+      "bytes": 214,
+      "checkout": false
+    }
+  ],
+  "truncated": false,
+  "droppedChunks": 0
+}
