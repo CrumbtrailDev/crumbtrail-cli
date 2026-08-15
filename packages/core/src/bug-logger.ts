@@ -45,10 +45,7 @@ const PRESETS: Record<CrumbtrailPreset, Partial<CrumbtrailConfig>> = {
 };
 import { generateSessionId, now } from "./utils";
 import { HttpTransport } from "./transports/http";
-import {
-  createWebSessionStore,
-  type SessionStore,
-} from "./session-store";
+import { createWebSessionStore, type SessionStore } from "./session-store";
 import { consoleCollector } from "./collectors/console";
 import { errorCollector } from "./collectors/error";
 import { interactionCollector } from "./collectors/interaction";
@@ -67,14 +64,19 @@ import { eventSourceCollector } from "./collectors/eventsource";
 import { webSocketCollector } from "./collectors/websocket";
 import { workerCollector } from "./collectors/worker";
 import { environmentCollector, buildEnvDelta } from "./collectors/environment";
-import type { EnvDeclaration } from "./types";
+import type { EnvDeclaration, EnvSnapshot } from "./types";
+// Internal module: `flags.ts` is deliberately not re-exported from `index.ts`. Flag diffing is
+// an implementation detail of `setEnv`, not SDK surface an integrator calls.
+import { diffFlags, type NormalizedFlag } from "./flags";
 import {
   attachRedactionMetadata,
+  mergeRedactionMetadata,
   REDACTED_VALUE,
   redactNetworkTextBody,
   redactUrl,
   redactValue,
   type PayloadSummary,
+  type RedactionMetadata,
   setCaptureInputValues,
   setRedactionKeepFields,
 } from "./redaction";
@@ -115,12 +117,7 @@ export const COLLECTOR_MAP: Record<string, Collector> = {
 const DEFAULT_CONFIG_POLL_INTERVAL_MS = 60_000;
 const EMAIL_SHAPED_VALUE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
 type FlightRecorderState =
-  | "armed"
-  | "buffering"
-  | "triggered"
-  | "tailing"
-  | "finalizing"
-  | "finalized";
+  "armed" | "buffering" | "triggered" | "tailing" | "finalizing" | "finalized";
 /**
  * The event a probe result rests as. One event per probe, carrying the whole {@link ProbeResult}
  * including a failed one, because "the probe ran and could not answer" is itself the answer to
@@ -1227,18 +1224,73 @@ export class Crumbtrail {
    * Declaratively attach vendor-agnostic feature flags / config to the session environment.
    * Values are redacted before they rest. Merges into the declared env; if the initial
    * `k:'env'` snapshot has already been emitted (the normal case, since `setEnv` is called
-   * after `init`), it emits a `k:'env'` delta event ({ kind:'delta' }). If called before the
-   * snapshot is emitted (e.g. environment collector disabled or not yet run), the values are
-   * folded into the snapshot instead.
+   * after `init`), it emits a `k:'env'` delta event ({ kind:'delta' }) scoped to what actually
+   * moved: `flags`/`config` carry only the changed keys, and `flagChanges` carries the
+   * before/after pair for each changed flag. A re-declaration that changes nothing emits no
+   * event at all, so a reader can tell "the app re-declares its flags on every route change"
+   * from "the flag flipped mid session". If called before the snapshot is emitted (e.g.
+   * environment collector disabled or not yet run), the values are folded into the snapshot
+   * instead and nothing is emitted.
    */
   setEnv(declaration: EnvDeclaration): void {
+    // `diffFlags` treats `next` as an authoritative full re-declaration, which is what makes a
+    // removal detectable. `setEnv` is documented as MERGE semantics, so the incoming
+    // declaration is a partial — handing it over directly would report every untouched key as
+    // a removal. Compare against the post-merge state instead. The honest consequence: a
+    // removal is unreachable through `setEnv`, because merging cannot remove a key.
+    const flagDiff = declaration.flags
+      ? diffFlags(this.declaredFlags, {
+          ...this.declaredFlags,
+          ...declaration.flags,
+        })
+      : undefined;
+    const configDiff = declaration.config
+      ? diffFlags(this.declaredConfig, {
+          ...this.declaredConfig,
+          ...declaration.config,
+        })
+      : undefined;
+
     if (declaration.flags) Object.assign(this.declaredFlags, declaration.flags);
     if (declaration.config)
       Object.assign(this.declaredConfig, declaration.config);
 
     if (!this.envEmitted) return;
 
-    const delta = buildEnvDelta(declaration.flags, declaration.config);
+    const changedFlagKeys = flagDiff ? Object.keys(flagDiff.changed) : [];
+    const changedConfigKeys = configDiff ? Object.keys(configDiff.changed) : [];
+    if (changedFlagKeys.length === 0 && changedConfigKeys.length === 0) return;
+
+    const delta = buildEnvDelta(
+      pickKeys(this.declaredFlags, changedFlagKeys),
+      pickKeys(this.declaredConfig, changedConfigKeys),
+    );
+
+    if (flagDiff && changedFlagKeys.length > 0) {
+      // `from`/`to` hold real flag values, and a flag value carries a secret exactly as easily
+      // as a flag key does — a rotated API key moves through here as a "change".
+      //
+      // Each side is redacted as `{ [flagKey]: value }` under `env.flags`, the same path and
+      // therefore the same key-aware policy the snapshot applies. Redacting the whole
+      // `changed` record in one pass would not do: a sensitive flag NAME would collapse the
+      // entire `{ from, to }` wrapper to the placeholder string, destroying the shape the
+      // field exists to carry.
+      const changes: Record<string, { from: unknown; to: unknown }> = {};
+      const metadata: Array<RedactionMetadata | undefined> = [
+        delta.redaction as RedactionMetadata | undefined,
+      ];
+      for (const key of changedFlagKeys) {
+        const change = flagDiff.changed[key];
+        const from = redactFlagSide(key, change.from);
+        const to = redactFlagSide(key, change.to);
+        metadata.push(from.metadata, to.metadata);
+        changes[key] = { from: from.value, to: to.value };
+      }
+      delta.flagChanges = changes as EnvSnapshot["flagChanges"];
+      const merged = mergeRedactionMetadata(...metadata);
+      if (merged) delta.redaction = dedupeRedactionFields(merged);
+    }
+
     this.bus.emit({
       t: now(),
       k: "env",
@@ -1366,6 +1418,54 @@ function extractJsonCandidates(text: string): string[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Redact one side of a flag change under the flag's own key, so the key-aware `env.flags`
+ * policy sees the flag name exactly as it does in the snapshot. Returns `undefined` unchanged:
+ * an absent side means the key did not exist, which is not a value to redact.
+ */
+function redactFlagSide(
+  key: string,
+  side: NormalizedFlag | undefined,
+): { value: NormalizedFlag | undefined; metadata?: RedactionMetadata } {
+  if (side === undefined) return { value: undefined };
+  const result = redactValue({ [key]: side.value }, "env.flags");
+  const value: NormalizedFlag = { value: result.value[key] };
+  if (side.variant !== undefined) value.variant = side.variant;
+  return { value, ...(result.metadata ? { metadata: result.metadata } : {}) };
+}
+
+/**
+ * Collapse field entries that repeat because the same flag key was redacted on the delta's
+ * `flags` and on both sides of its change record. They describe one decision about one key,
+ * so reporting it three times would overstate what was found.
+ */
+function dedupeRedactionFields(metadata: RedactionMetadata): RedactionMetadata {
+  const seen = new Set<string>();
+  const fields = metadata.fields.filter((field) => {
+    const id = `${field.path}|${field.reason}|${field.action}`;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  return { ...metadata, fields };
+}
+
+/**
+ * Narrow a declared-env record to the named keys. Used to scope a `setEnv` delta to what
+ * actually moved, so a re-declaration of twenty flags where one flipped ships one key.
+ */
+function pickKeys(
+  source: Record<string, unknown>,
+  keys: string[],
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(source, key))
+      out[key] = source[key];
+  }
+  return out;
 }
 
 function hasGlobalPrivacyControl(): boolean {
@@ -1736,7 +1836,10 @@ function isTriggerConfigKey(key: (typeof REMOTE_CONFIG_KEYS)[number]): boolean {
 
 function hasRecognizedRemotePolicy(settings: Record<string, unknown>): boolean {
   if (typeof settings.killSwitch === "boolean") return true;
-  if (settings.consentMode === "implicit" || settings.consentMode === "required")
+  if (
+    settings.consentMode === "implicit" ||
+    settings.consentMode === "required"
+  )
     return true;
   if (typeof settings.respectGpc === "boolean") return true;
   if (hasRecognizedRemoteMasking(settings)) return true;
@@ -1749,7 +1852,9 @@ function hasRecognizedRemotePolicy(settings: Record<string, unknown>): boolean {
   return hasRecognizedRemoteTriggers(settings);
 }
 
-function hasRecognizedRemoteMasking(settings: Record<string, unknown>): boolean {
+function hasRecognizedRemoteMasking(
+  settings: Record<string, unknown>,
+): boolean {
   const masking = asRecord(settings.masking) ?? asRecord(settings.privacy);
   const mode =
     readString(masking?.mode) ??
@@ -1773,7 +1878,9 @@ function hasRecognizedRemoteMasking(settings: Record<string, unknown>): boolean 
   );
 }
 
-function hasRecognizedRemoteSampling(settings: Record<string, unknown>): boolean {
+function hasRecognizedRemoteSampling(
+  settings: Record<string, unknown>,
+): boolean {
   const sampling = asRecord(settings.sampling);
   return [
     sampling?.captureSampleRate,
@@ -1789,7 +1896,9 @@ function hasRecognizedRemoteSampling(settings: Record<string, unknown>): boolean
   ].some((value) => readRate(value) !== undefined);
 }
 
-function hasRecognizedRemoteTriggers(settings: Record<string, unknown>): boolean {
+function hasRecognizedRemoteTriggers(
+  settings: Record<string, unknown>,
+): boolean {
   const triggers = asRecord(settings.triggers);
   if (!triggers) return false;
   return [
@@ -1818,7 +1927,8 @@ function hasRecognizedRemoteTriggers(settings: Record<string, unknown>): boolean
     triggers.abandonedFlows,
     triggers.onAbandonedFlow,
   ].some(
-    (value) => triggerSwitch(value) !== undefined || readDuration(value) !== undefined,
+    (value) =>
+      triggerSwitch(value) !== undefined || readDuration(value) !== undefined,
   );
 }
 
