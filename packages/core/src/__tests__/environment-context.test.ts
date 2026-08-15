@@ -1,5 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildEnvSnapshot } from "../collectors/environment";
+import {
+  buildEnvSnapshot,
+  environmentCollector,
+} from "../collectors/environment";
+import { EventBus } from "../event-bus";
+import {
+  DEFAULT_CONFIG,
+  type BugEvent,
+  type CrumbtrailConfig,
+  type EnvSnapshot,
+} from "../types";
 import type { RedactionMetadata } from "../redaction";
 
 /**
@@ -194,6 +204,166 @@ describe("env snapshot: connection and hardware", () => {
 
     expect(() => buildEnvSnapshot()).not.toThrow();
     expect("connection" in buildEnvSnapshot()).toBe(false);
+  });
+});
+
+/**
+ * D3: first-party `utm_*` capture, off unless the integrator turns it on. The
+ * privacy weight sits on two things being true at once — the default captures
+ * nothing, and an enabled build still cannot reach a cross-site click id.
+ */
+
+/** Replaces `window` with a stub whose `location.search` is the given query. */
+function stubSearch(search: string): void {
+  vi.stubGlobal("window", { location: { search } });
+}
+
+/** Runs the real collector and returns the emitted `k:'env'` event. */
+function collectEnvEvent(config: CrumbtrailConfig): BugEvent {
+  const bus = new EventBus();
+  const events: BugEvent[] = [];
+  bus.subscribe((batch) => events.push(...batch));
+  const cleanup = environmentCollector(bus, config, { sessionId: "ses_utm" });
+  bus.flush();
+  cleanup();
+  bus.stop();
+  expect(events).toHaveLength(1);
+  expect(events[0].k).toBe("env");
+  return events[0];
+}
+
+const FULL_CAMPAIGN_SEARCH =
+  "?utm_source=newsletter&utm_medium=email&utm_campaign=spring_sale" +
+  "&utm_term=running+shoes&utm_content=header_link" +
+  "&gclid=Cj0KCQjwabcdEFGH&fbclid=IwAR1abcdefghijkl" +
+  "&msclkid=abc123def456&ttclid=ttc_987654321";
+
+describe("env snapshot: campaign capture is off by default", () => {
+  it("captures no campaign labels under DEFAULT_CONFIG even on a utm-laden URL", () => {
+    // Pinned against DEFAULT_CONFIG itself rather than a literal, so flipping the
+    // shipped default turns this red instead of silently widening what is captured.
+    expect(DEFAULT_CONFIG.campaign).toBe(false);
+
+    stubSearch(FULL_CAMPAIGN_SEARCH);
+    const event = collectEnvEvent(DEFAULT_CONFIG);
+    const snapshot = event.d as unknown as EnvSnapshot;
+
+    expect("campaign" in snapshot).toBe(false);
+    expect(JSON.stringify(event)).not.toContain("newsletter");
+  });
+
+  it("captures nothing when campaign is explicitly disabled", () => {
+    stubSearch(FULL_CAMPAIGN_SEARCH);
+    const snapshot = buildEnvSnapshot(undefined, undefined, {
+      campaign: false,
+    });
+    expect("campaign" in snapshot).toBe(false);
+  });
+});
+
+describe("env snapshot: campaign capture when enabled", () => {
+  it("emits the five utm labels and no cross-site click id anywhere in the event", () => {
+    stubSearch(FULL_CAMPAIGN_SEARCH);
+    const event = collectEnvEvent({ ...DEFAULT_CONFIG, campaign: true });
+    const snapshot = event.d as unknown as EnvSnapshot;
+
+    expect(snapshot.campaign).toEqual({
+      source: "newsletter",
+      medium: "email",
+      campaign: "spring_sale",
+      term: "running shoes",
+      content: "header_link",
+    });
+
+    // The click ids are asserted absent from the whole emitted event, not just
+    // from `campaign`: the point is that no path routes around the allowlist.
+    const serialized = JSON.stringify(event);
+    for (const forbidden of [
+      "gclid",
+      "fbclid",
+      "msclkid",
+      "ttclid",
+      "Cj0KCQjwabcdEFGH",
+      "IwAR1abcdefghijkl",
+      "abc123def456",
+      "ttc_987654321",
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+  });
+
+  it("omits the campaign key entirely when the URL carries no utm_ parameters", () => {
+    stubSearch("?page=2&q=shoes&gclid=Cj0KCQjwabcdEFGH");
+    const event = collectEnvEvent({ ...DEFAULT_CONFIG, campaign: true });
+    const snapshot = event.d as unknown as EnvSnapshot;
+
+    expect("campaign" in snapshot).toBe(false);
+    expect(JSON.stringify(event)).not.toContain("gclid");
+  });
+
+  it("omits the campaign key when there is no query string at all", () => {
+    stubSearch("");
+    const snapshot = buildEnvSnapshot(undefined, undefined, { campaign: true });
+    expect("campaign" in snapshot).toBe(false);
+  });
+
+  it("does not throw when reading location throws", () => {
+    vi.stubGlobal("window", {
+      get location(): never {
+        throw new Error("blocked by sandbox");
+      },
+    });
+
+    expect(() =>
+      buildEnvSnapshot(undefined, undefined, { campaign: true }),
+    ).not.toThrow();
+    expect(
+      "campaign" in buildEnvSnapshot(undefined, undefined, { campaign: true }),
+    ).toBe(false);
+  });
+
+  it("merges campaign redaction metadata with the flag, config and referrer metadata", () => {
+    stubSearch(
+      "?utm_source=newsletter&utm_campaign=sk_live_abcdefghijklmnopqrst",
+    );
+    stubReferrer("https://ref.example.com/landing?token=abc123def456ghi789");
+
+    const snapshot = buildEnvSnapshot(
+      { authToken: "sk_live_abcdefghijklmnopqrst" },
+      { apiKey: "sk_live_zyxwvutsrqponmlkjihg" },
+      { campaign: true },
+    );
+
+    // The clean label survives, the token-like one does not rest in the clear.
+    expect(snapshot.campaign?.source).toBe("newsletter");
+    // Asserted as a present-but-masked value, not merely "not the secret": an
+    // absent key would satisfy a bare inequality and prove nothing.
+    expect(snapshot.campaign?.campaign).toBe("[REDACTED]");
+
+    const paths = metadataOf(snapshot.redaction).fields.map(
+      (field) => field.path,
+    );
+    expect(paths.some((path) => path.startsWith("campaign."))).toBe(true);
+    expect(paths.some((path) => path.startsWith("env.referrer"))).toBe(true);
+    expect(paths.some((path) => path.startsWith("env.flags"))).toBe(true);
+    expect(paths.some((path) => path.startsWith("env.config"))).toBe(true);
+  });
+});
+
+describe("env snapshot: buildEnvSnapshot arity is not a breaking change", () => {
+  it("behaves identically with two arguments and with an explicit campaign:false", () => {
+    stubSearch(FULL_CAMPAIGN_SEARCH);
+    const flags = { beta: true };
+    const config = { region: "eu" };
+
+    const twoArg = buildEnvSnapshot(flags, config);
+    const explicitOff = buildEnvSnapshot(flags, config, { campaign: false });
+
+    expect(twoArg).toEqual(explicitOff);
+    expect("campaign" in twoArg).toBe(false);
+    expect(buildEnvSnapshot()).toEqual(
+      buildEnvSnapshot(undefined, undefined, {}),
+    );
   });
 });
 

@@ -3,11 +3,17 @@ import type {
   CrumbtrailConfig,
   CollectorCleanup,
   CollectorContext,
+  EnvCampaign,
   EnvConnection,
   EnvDevice,
   EnvSnapshot,
 } from "../types";
-import { redactUrl, redactValue, type RedactionMetadata } from "../redaction";
+import {
+  redactCampaignParams,
+  redactUrl,
+  redactValue,
+  type RedactionMetadata,
+} from "../redaction";
 import { now } from "../utils";
 
 /**
@@ -22,11 +28,13 @@ import { now } from "../utils";
  */
 export function environmentCollector(
   bus: EventBus,
-  _config: CrumbtrailConfig,
+  config: CrumbtrailConfig,
   context: CollectorContext,
 ): CollectorCleanup {
   const declared = context.getDeclaredEnv?.() ?? {};
-  const snapshot = buildEnvSnapshot(declared.flags, declared.config);
+  const snapshot = buildEnvSnapshot(declared.flags, declared.config, {
+    campaign: config.campaign,
+  });
 
   bus.emit({
     t: now(),
@@ -38,10 +46,20 @@ export function environmentCollector(
   return () => {};
 }
 
+/** Optional snapshot behaviours the caller opts into. Absent means every one is off. */
+export interface EnvSnapshotOptions {
+  /**
+   * Read first-party `utm_*` labels off `location.search`. Off unless the integrator
+   * turned `campaign` on, so a two-argument call captures nothing extra.
+   */
+  campaign?: boolean;
+}
+
 /** Builds the redaction-aware snapshot payload. Exported for direct unit testing. */
 export function buildEnvSnapshot(
   flags?: Record<string, unknown>,
   config?: Record<string, unknown>,
+  options?: EnvSnapshotOptions,
 ): EnvSnapshot {
   const snapshot: EnvSnapshot = { kind: "snapshot" };
 
@@ -78,6 +96,10 @@ export function buildEnvSnapshot(
     if (result.metadata) addRedactionMetadata(snapshot, result.metadata);
   }
 
+  // Off unless the integrator asked for it. `DEFAULT_CONFIG.campaign` is `false`,
+  // so the default build never reads the entry URL's query string at all.
+  if (options?.campaign === true) applyCampaign(snapshot);
+
   const device = safeDevice();
   if (device) snapshot.device = device;
 
@@ -94,6 +116,59 @@ export function buildEnvSnapshot(
   applyDeclaredEnv(snapshot, flags, config);
 
   return snapshot;
+}
+
+/**
+ * The only mapping between the wire parameter names and the snapshot's field
+ * names. Every key here is a literal `utm_*` name that `redactCampaignParams`
+ * already allows, so nothing outside that allowlist has a field to land in even
+ * if the redaction layer ever returned one.
+ */
+const CAMPAIGN_FIELD_BY_PARAM: Record<string, keyof EnvCampaign> = {
+  utm_source: "source",
+  utm_medium: "medium",
+  utm_campaign: "campaign",
+  utm_term: "term",
+  utm_content: "content",
+};
+
+/**
+ * Reads first-party campaign labels off the entry URL through the campaign
+ * allowlist in `redaction.ts`. Cross-site click identifiers (`gclid`, `fbclid`,
+ * `msclkid`, `ttclid` and family) are not readable through that function and are
+ * not readable here either — this code never touches `location.search` except
+ * through it.
+ *
+ * The `campaign` key is omitted when no label survived, so an enabled build on a
+ * page with no `utm_*` looks exactly like a disabled one. Redaction metadata is
+ * still merged when the allowlist redacted or dropped something, because that
+ * happened whether or not a label came out the other side.
+ */
+function applyCampaign(snapshot: EnvSnapshot): void {
+  const search = safeLocationSearch();
+  if (!search) return;
+
+  const result = redactCampaignParams(search);
+
+  const campaign: EnvCampaign = {};
+  for (const [param, value] of Object.entries(result.value)) {
+    const field = CAMPAIGN_FIELD_BY_PARAM[param];
+    if (field) campaign[field] = value;
+  }
+  if (Object.keys(campaign).length > 0) snapshot.campaign = campaign;
+
+  if (result.metadata) addRedactionMetadata(snapshot, result.metadata);
+}
+
+function safeLocationSearch(): string | undefined {
+  try {
+    if (typeof window === "undefined") return undefined;
+    const search: unknown = window.location?.search;
+    return typeof search === "string" && search !== "" ? search : undefined;
+  } catch {
+    // location can throw in sandboxed/cross-origin contexts.
+    return undefined;
+  }
 }
 
 /**
