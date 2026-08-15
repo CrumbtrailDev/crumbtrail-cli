@@ -481,6 +481,40 @@ export interface LlmBundleAgentContext {
 }
 
 /**
+ * A flag value paired with the provider variant that produced it, when one is known.
+ *
+ * Mirrors `NormalizedFlag` in `packages/core/src/flags.ts`, which is deliberately not
+ * re-exported from `crumbtrail-core`'s entry point (see the note at `bug-logger.ts:68`), so
+ * this side of the wire reads the shape rather than importing it.
+ */
+export interface LlmBundleFlagValue {
+  value: unknown;
+  /** Provider variant key, present only when the app declared a string one. */
+  variant?: string;
+}
+
+/**
+ * One flag moving, stamped with the `k:'env'` event that reported the move.
+ *
+ * This is a sequence rather than a map keyed by flag name on purpose. A flag that flips on and
+ * back off inside one session is the single most diagnostic thing a flag can do, and a
+ * last-write-wins map reports it as "unchanged" — the two moves collapse onto each other and
+ * the artifact says nothing happened. Ordered entries keep both moves, in the order they
+ * happened, next to the offset an agent can line up against the error timeline.
+ */
+export interface LlmBundleFlagChange {
+  t: number;
+  iso?: string;
+  offsetMs?: number;
+  /** Flag name, as the app declared it. */
+  flag: string;
+  /** State before the move. Absent means the flag did not exist yet. */
+  from?: LlmBundleFlagValue;
+  /** State after the move. Absent means the flag was removed. */
+  to?: LlmBundleFlagValue;
+}
+
+/**
  * Merged, redaction-aware environment snapshot surfaced from the session's `k:'env'` events
  * (initial snapshot + any `setEnv` deltas). Device fields are best-effort; `flags`/`config`
  * were redacted in the browser before capture. `null` when no env was captured.
@@ -513,10 +547,20 @@ export interface LlmBundleEnvironment {
   /** `navigator.hardwareConcurrency`. */
   hardwareConcurrency?: number;
   /**
-   * Flags that changed during the session, keyed by flag name, merged across every `k:'env'`
-   * event last-write-wins. Values are redacted the same way `flags` is.
+   * Provider variant key per flag, for flags the app declared as `{ value, variant }` rather
+   * than a bare value. Merged last-write-wins alongside `flags`, so it names the variant in
+   * force at the end of the session.
+   *
+   * `flags` carries the declaration verbatim, which means a wrapped flag lands there as an
+   * opaque object indistinguishable from a flag whose value simply is an object. An agent
+   * asking "which arm of the experiment was this user in" needs the answer named, not encoded.
    */
-  flagChanges?: Record<string, { from: unknown; to: unknown }>;
+  flagVariants?: Record<string, string>;
+  /**
+   * Every flag move the session reported, oldest first. Empty-to-absent: the key is omitted
+   * when no `k:'env'` event carried a change. Values are redacted the same way `flags` is.
+   */
+  flagChanges?: LlmBundleFlagChange[];
 }
 
 /**
@@ -1210,7 +1254,7 @@ export function buildLlmBundle({
     fullStackEvidence,
     distinctBugs,
     ...(detectorPrevalence !== undefined ? { detectorPrevalence } : {}),
-    environment: buildEnvironment(events),
+    environment: buildEnvironment(events, session.startMs),
     ...(causalTree.length > 0 ? { causalTree } : {}),
     outboundCalls: buildOutboundCalls(events, session.startMs),
     databaseDiffs: buildDatabaseDiffs(events, session.startMs),
@@ -2245,7 +2289,100 @@ function buildStorageChanges(
   return changes.sort((a, b) => a.t - b.t).slice(0, MAX_STORAGE_CHANGES);
 }
 
-function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
+const MAX_FLAG_CHANGES = 200;
+
+/**
+ * True when `value` is the provider wrapper shape `{ value, variant? }` rather than a flag
+ * value that merely happens to be an object.
+ *
+ * The key-subset check is what keeps this honest: `{ value: 1, other: 2 }` is a payload, not a
+ * wrapper, and reading a variant out of it would misdescribe the declaration. Kept in step with
+ * `isFlagWrapper` in `packages/core/src/flags.ts`; that module is intentionally private to
+ * `crumbtrail-core`, so the bundle reads the shape instead of importing the reader.
+ */
+function isFlagWrapper(
+  value: unknown,
+): value is { value: unknown; variant?: unknown } {
+  if (!isRecord(value)) return false;
+  if (!("value" in value)) return false;
+  for (const key of Object.keys(value)) {
+    if (key !== "value" && key !== "variant") return false;
+  }
+  return true;
+}
+
+/** The variant a declared flag value names, or `undefined` when it names none. */
+function flagVariantOf(value: unknown): string | undefined {
+  if (!isFlagWrapper(value)) return undefined;
+  return safeText(value.variant, 120);
+}
+
+/**
+ * Read one side of a wire `flagChanges` entry into a bundle flag value.
+ *
+ * `undefined` in, `undefined` out: an absent side means the flag did not exist on that side,
+ * which is information, not a value to redact. The value is re-redacted under
+ * `environment.flags` keyed by the flag's own name, so the key-aware policy sees the flag name
+ * exactly as it does in the merged `flags` record — defense in depth over the browser-side
+ * redaction that already ran.
+ */
+function readFlagSide(
+  flag: string,
+  side: unknown,
+): LlmBundleFlagValue | undefined {
+  if (side === undefined || side === null) return undefined;
+  // Core emits `{ value, variant? }`; a raw or hand-written event may carry a bare value.
+  const raw = isFlagWrapper(side) ? side.value : side;
+  const variant = flagVariantOf(side);
+  const redacted = redactValue({ [flag]: raw }, "environment.flags").value as
+    | Record<string, unknown>
+    | undefined;
+  const out: LlmBundleFlagValue = { value: redacted?.[flag] };
+  if (variant !== undefined) out.variant = variant;
+  return out;
+}
+
+/**
+ * Flatten the session's `k:'env'` events into one ordered flag-change history.
+ *
+ * Every change on an event shares that event's timestamp, and events are visited in the order
+ * the session recorded them, so the sort is stable within an event and chronological across
+ * them.
+ */
+function buildFlagChanges(
+  envEvents: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleFlagChange[] {
+  const changes: LlmBundleFlagChange[] = [];
+  for (const event of envEvents) {
+    const d = event.d as Partial<EnvSnapshot>;
+    if (!isRecord(d.flagChanges)) continue;
+    for (const flag of Object.keys(d.flagChanges)) {
+      const change = d.flagChanges[flag];
+      if (!isRecord(change)) continue;
+      changes.push(
+        removeUndefined({
+          t: event.t,
+          iso: iso(event.t),
+          offsetMs:
+            finiteNumber(event.offsetMs) ??
+            offsetFromStart(event.t, sessionStartMs),
+          flag,
+          from: readFlagSide(flag, change.from),
+          to: readFlagSide(flag, change.to),
+        }) as LlmBundleFlagChange,
+      );
+    }
+  }
+  return changes
+    .sort((a, b) => a.t - b.t)
+    .slice(0, MAX_FLAG_CHANGES);
+}
+
+function buildEnvironment(
+  events: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleEnvironment | null {
   const envEvents = events.filter((event) => event.k === "env");
   if (envEvents.length === 0) return null;
 
@@ -2276,28 +2413,36 @@ function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
     hardwareConcurrency: finiteNumber(base.hardwareConcurrency),
   });
 
-  // Merge flags/config/flagChanges across the snapshot and every delta, last-write-wins.
+  // Merge flags/config across the snapshot and every delta, last-write-wins. Flag CHANGES are
+  // deliberately not merged this way — see `buildFlagChanges`, which keeps them ordered.
   const flags: Record<string, unknown> = {};
   const config: Record<string, unknown> = {};
-  const flagChanges: Record<string, unknown> = {};
+  const flagVariants: Record<string, string> = {};
   let hasFlags = false;
   let hasConfig = false;
-  let hasFlagChanges = false;
   for (const event of envEvents) {
     const d = event.d as Partial<EnvSnapshot>;
     if (isRecord(d.flags)) {
       Object.assign(flags, d.flags);
       hasFlags = true;
+      for (const flag of Object.keys(d.flags)) {
+        const variant = flagVariantOf(d.flags[flag]);
+        if (variant !== undefined) flagVariants[flag] = variant;
+      }
     }
     if (isRecord(d.config)) {
       Object.assign(config, d.config);
       hasConfig = true;
     }
-    // Changes arrive on later `flag-snapshot`/`delta` events rather than the base snapshot, so
-    // they are merged here for the same reason flags are: the base alone would lose them.
+    // A change record names the variant in force after the move even when the app never
+    // re-declared the flag itself, so it is a second source for the same question.
     if (isRecord(d.flagChanges)) {
-      Object.assign(flagChanges, d.flagChanges);
-      hasFlagChanges = true;
+      for (const flag of Object.keys(d.flagChanges)) {
+        const change = d.flagChanges[flag];
+        if (!isRecord(change)) continue;
+        const variant = flagVariantOf(change.to);
+        if (variant !== undefined) flagVariants[flag] = variant;
+      }
     }
   }
   // Defense-in-depth: flags/config are redacted in the browser, but re-run the redaction path
@@ -2307,11 +2452,11 @@ function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
     environment.flags = redactValue(flags, "environment.flags").value;
   if (hasConfig)
     environment.config = redactValue(config, "environment.config").value;
-  if (hasFlagChanges)
-    environment.flagChanges = redactValue(
-      flagChanges,
-      "environment.flagChanges",
-    ).value as Record<string, { from: unknown; to: unknown }>;
+  if (Object.keys(flagVariants).length > 0)
+    environment.flagVariants = flagVariants;
+
+  const flagChanges = buildFlagChanges(envEvents, sessionStartMs);
+  if (flagChanges.length > 0) environment.flagChanges = flagChanges;
 
   return environment;
 }
@@ -4946,12 +5091,51 @@ function renderEnvironmentSection(
     lines.push(
       `- Config keys: ${Object.keys(environment.config).sort().join(", ") || "none"} (values redacted in browser before capture)`,
     );
-  if (environment.flagChanges)
+  if (environment.flagVariants)
     lines.push(
-      `- Flags changed during session: ${Object.keys(environment.flagChanges).sort().join(", ") || "none"} (values redacted in browser before capture)`,
+      `- Flag variants: ${Object.entries(environment.flagVariants)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([flag, variant]) => `${flag}=${variant}`)
+        .join(", ")}`,
     );
+  if (environment.flagChanges && environment.flagChanges.length > 0) {
+    // One line per move, in order. A summary line naming the changed flags would re-lose the
+    // on-then-off case the ordered history exists to keep.
+    lines.push(
+      "- Flags changed during session (values redacted in browser before capture):",
+    );
+    for (const change of environment.flagChanges) {
+      lines.push(
+        `  - ${formatFlagChangeTime(change)} ${change.flag}: ${formatFlagSide(change.from)} -> ${formatFlagSide(change.to)}`,
+      );
+    }
+  }
   lines.push("");
   return lines;
+}
+
+/** `+1240ms` when the session start is known, otherwise the event's ISO stamp or raw epoch. */
+function formatFlagChangeTime(change: LlmBundleFlagChange): string {
+  if (change.offsetMs !== undefined) return `+${change.offsetMs}ms`;
+  return change.iso ?? String(change.t);
+}
+
+/**
+ * One side of a flag move as a short literal. `absent` rather than an empty string, because
+ * "the flag did not exist" and "the flag was the empty string" are different findings.
+ */
+function formatFlagSide(side: LlmBundleFlagValue | undefined): string {
+  if (side === undefined) return "absent";
+  let rendered: string;
+  try {
+    rendered = JSON.stringify(side.value) ?? String(side.value);
+  } catch {
+    rendered = String(side.value);
+  }
+  if (rendered.length > 120) rendered = `${rendered.slice(0, 117)}...`;
+  return side.variant === undefined
+    ? rendered
+    : `${rendered} (variant ${side.variant})`;
 }
 
 /** `insertReview server/src/repos/reviews-repo.js:5 < handler server/src/routes/reviews.js:41` */
