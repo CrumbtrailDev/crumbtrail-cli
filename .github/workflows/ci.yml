@@ -148,3 +148,57 @@ jobs:
             );
             process.exit(failed ? 1 : 0);
           '
+
+  # ── Native SDK conformance suites ────────────────────────────────────────
+  # packages/swift, packages/kotlin and packages/flutter each ship a wire
+  # contract suite that asserts the same envelope shape as the JS SDKs. Those
+  # suites are the only thing preventing the four languages drifting apart, so
+  # they run as first-class jobs. Deliberately no `|| true` and no
+  # `continue-on-error`: a suite that cannot run has to fail the job, because a
+  # green check that proves nothing is worse than no check at all.
+  # scripts/dev-harness/ci-workflow.test.mjs enforces exactly that.
+
+  swift:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # macOS rather than Linux: Package.swift declares `.macOS(.v10_15)`, so
+      # the contract, session, queue and redaction layers build here, while the
+      # UIKit collectors compile out under their existing
+      # `#if canImport(UIKit) && !os(macOS)` guards.
+      - run: swift test --package-path packages/swift
+
+  kotlin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # Matches `jvmToolchain(21)` in packages/kotlin/build.gradle.kts.
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          # packages/kotlin has NO Gradle wrapper — only build.gradle.kts and
+          # settings.gradle.kts — so the version has to be pinned here.
+          gradle-version: "9.7.0"
+      # ANDROID_HOME is unset on this runner and no android.jar is present, so
+      # build.gradle.kts takes its documented fallback branch: it excludes
+      # `**/android/**` from the main source set and builds everything else.
+      # This job therefore covers the contract, session, transport, queue and
+      # redaction layers — it does NOT compile or test the Android bindings.
+      # Do not read a green check here as Android coverage.
+      - run: gradle test
+        working-directory: packages/kotlin
+
+  flutter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+        working-directory: packages/flutter
+      - run: flutter test
+        working-directory: packages/flutter
