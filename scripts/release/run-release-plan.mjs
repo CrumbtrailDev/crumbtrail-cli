@@ -90,6 +90,9 @@ if (mode === "dry-run") {
     .map((pkg) => artifactsByName.get(pkg.name));
   const result = await preflightAndPublishArtifacts(orderedArtifacts, {
     lookupIntegrity: npmPackageIntegrity,
+    // Lets a single failed package strand only its own dependents instead of
+    // every package ordered behind it.
+    dependenciesByName,
     publish: async (artifact) => {
       await run("pnpm", ["publish", artifact.tarballPath, "--access", "public", "--no-git-checks"], {
         cwd: rootDir,

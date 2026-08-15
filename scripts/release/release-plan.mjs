@@ -268,8 +268,25 @@ export async function tarballIntegrity(tarballPath) {
  * immutable name@version before publishing any new tarball, allowing a failed
  * batch to resume only when the already-published artifact exactly matches the
  * local tarball that this run packed.
+ *
+ * One package failing to publish does NOT abandon the rest of the release. A
+ * lockstep release publishes one shared version across every package, so
+ * aborting at the first failure is what strands the set half-released: the
+ * 0.32.0 run published crumbtrail-core and crumbtrail, then died on the very
+ * first publish of crumbtrail-capacitor — a brand-new name with no trusted
+ * publisher yet, so npm answered the OIDC exchange with a 404 — and left
+ * crumbtrail-node and crumbtrail-react-native on the previous version even
+ * though nothing was wrong with them. Everything the failure did not make
+ * unsafe is published, and the run fails at the end with the full picture.
+ *
+ * `dependenciesByName` is what makes "unsafe" precise: a dependent of a failed
+ * package is skipped rather than attempted, because publishing it would point
+ * users at a dependency version that is not on the registry.
  */
-export async function preflightAndPublishArtifacts(artifacts, { lookupIntegrity = npmPackageIntegrity, publish } = {}) {
+export async function preflightAndPublishArtifacts(
+  artifacts,
+  { lookupIntegrity = npmPackageIntegrity, publish, dependenciesByName } = {},
+) {
   if (typeof publish !== "function") throw new Error("A package publisher is required.");
   const checked = [];
   for (const artifact of artifacts) {
@@ -292,8 +309,48 @@ export async function preflightAndPublishArtifacts(artifacts, { lookupIntegrity 
   const toPublish = checked
     .filter(({ publishedIntegrity }) => publishedIntegrity === null)
     .map(({ artifact }) => artifact);
-  for (const artifact of toPublish) await publish(artifact);
-  return { published: toPublish, skipped };
+
+  const dependenciesFor = (name) => {
+    const dependencies = dependenciesByName instanceof Map
+      ? dependenciesByName.get(name)
+      : dependenciesByName?.[name];
+    return [...(dependencies ?? [])];
+  };
+
+  const published = [];
+  const failed = [];
+  const blocked = [];
+  const unpublishable = new Set();
+  for (const artifact of toPublish) {
+    const missingDependencies = dependenciesFor(artifact.name).filter((name) => unpublishable.has(name));
+    if (missingDependencies.length > 0) {
+      unpublishable.add(artifact.name);
+      blocked.push({ artifact, dependencies: missingDependencies });
+      continue;
+    }
+    try {
+      await publish(artifact);
+      published.push(artifact);
+    } catch (error) {
+      unpublishable.add(artifact.name);
+      failed.push({ artifact, error });
+    }
+  }
+
+  if (failed.length > 0) {
+    const describeFailure = ({ artifact, error }) => `${artifact.name}@${artifact.version} (${error.message})`;
+    const describeBlocked = ({ artifact, dependencies }) => `${artifact.name}@${artifact.version} (needs ${dependencies.join(", ")})`;
+    const parts = [`Failed to publish: ${failed.map(describeFailure).join("; ")}.`];
+    if (blocked.length > 0) parts.push(`Not attempted, dependency unpublished: ${blocked.map(describeBlocked).join("; ")}.`);
+    parts.push(published.length > 0
+      ? `Published: ${published.map((artifact) => `${artifact.name}@${artifact.version}`).join(", ")}.`
+      : "Published: none.");
+    const error = new Error(parts.join(" "));
+    error.releaseResult = { published, skipped, failed, blocked };
+    throw error;
+  }
+
+  return { published, skipped, failed, blocked };
 }
 
 export function topologicallyOrderReleasePackages(packages, dependenciesByName) {
