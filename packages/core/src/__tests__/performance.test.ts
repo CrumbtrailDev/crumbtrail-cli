@@ -12,6 +12,8 @@ class MockPerformanceObserver {
     "layout-shift",
     "largest-contentful-paint",
     "first-input",
+    "navigation",
+    "paint",
   ];
 
   callback: (list: { getEntries: () => any[] }) => void;
@@ -459,6 +461,198 @@ describe("performanceCollector", () => {
       "layout-shift",
       "largest-contentful-paint",
       "first-input",
+      "navigation",
+      "paint",
     ];
+  });
+
+  it("emits perf event with metric=ttfb for navigation entries", async () => {
+    const performanceCollector = await loadCollector();
+    performanceCollector(bus, DEFAULT_CONFIG);
+
+    const observer = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "navigation",
+    );
+    expect(observer).toBeDefined();
+
+    observer!.simulateEntries([
+      {
+        entryType: "navigation",
+        name: "https://example.com/",
+        startTime: 0,
+        responseStart: 210,
+        domContentLoadedEventEnd: 640,
+        loadEventEnd: 1180,
+      },
+    ]);
+
+    bus.flush();
+    expect(events).toHaveLength(1);
+    expect(events[0].k).toBe("perf");
+    expect(events[0].d.metric).toBe("ttfb");
+    expect(events[0].d.value).toBe(210);
+    expect(events[0].d.domContentLoadedEventEnd).toBe(640);
+    expect(events[0].d.loadEventEnd).toBe(1180);
+  });
+
+  it("measures ttfb from startTime, not from zero", async () => {
+    // A prerendered or restored navigation does not start at zero, so a raw
+    // `responseStart` would overstate the server's share of the wait.
+    const performanceCollector = await loadCollector();
+    performanceCollector(bus, DEFAULT_CONFIG);
+
+    MockPerformanceObserver.instances
+      .find((o) => o.observeOptions?.type === "navigation")!
+      .simulateEntries([
+        {
+          entryType: "navigation",
+          startTime: 40,
+          responseStart: 210,
+          domContentLoadedEventEnd: 640,
+          loadEventEnd: 1180,
+        },
+      ]);
+
+    bus.flush();
+    expect(events).toHaveLength(1);
+    expect(events[0].d.value).toBe(170);
+  });
+
+  it("emits perf event with metric=fcp only for the contentful paint entry", async () => {
+    // The `paint` entry type also carries `first-paint`, which fires for a
+    // background fill and is not FCP. Emitting on it would report a vital the
+    // page never reached.
+    const performanceCollector = await loadCollector();
+    performanceCollector(bus, DEFAULT_CONFIG);
+
+    const observer = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "paint",
+    );
+    expect(observer).toBeDefined();
+
+    observer!.simulateEntries([
+      { entryType: "paint", name: "first-paint", startTime: 300 },
+    ]);
+    bus.flush();
+    expect(events).toHaveLength(0);
+
+    observer!.simulateEntries([
+      { entryType: "paint", name: "first-contentful-paint", startTime: 812.5 },
+    ]);
+    bus.flush();
+    expect(events).toHaveLength(1);
+    expect(events[0].k).toBe("perf");
+    expect(events[0].d.metric).toBe("fcp");
+    expect(events[0].d.value).toBe(812.5);
+  });
+
+  it("does not spend the vitals budget on a rejected paint entry", async () => {
+    // A skipped entry must be skipped before the budget is touched, otherwise a
+    // repeated non-FCP paint could shed a real vital.
+    const performanceCollector = await loadCollector();
+    performanceCollector(bus, DEFAULT_CONFIG);
+
+    const paintObserver = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "paint",
+    )!;
+    const clsObserver = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "layout-shift",
+    )!;
+
+    paintObserver.simulateEntries(
+      Array.from({ length: 300 }, () => ({
+        entryType: "paint",
+        name: "first-paint",
+        startTime: 300,
+      })),
+    );
+    clsObserver.simulateEntries([
+      { entryType: "layout-shift", value: 0.2, hadRecentInput: false },
+    ]);
+    bus.flush();
+
+    expect(events.filter((e) => e.k === "capture_gap")).toHaveLength(0);
+    expect(
+      events.filter((e) => e.k === "perf" && e.d.metric === "cls"),
+    ).toHaveLength(1);
+  });
+
+  it("observes navigation and paint with buffered: true", async () => {
+    // Both happen before any SDK could plausibly have loaded, so without the
+    // buffer replay a late init() misses them permanently.
+    const performanceCollector = await loadCollector();
+    performanceCollector(bus, DEFAULT_CONFIG);
+
+    for (const type of ["navigation", "paint"]) {
+      const observer = MockPerformanceObserver.instances.find(
+        (o) => o.observeOptions?.type === type,
+      );
+      expect(observer, `no observer registered for ${type}`).toBeDefined();
+      expect(observer!.observeOptions.buffered).toBe(true);
+    }
+  });
+
+  it("keeps the other observers when paint is unsupported", async () => {
+    MockPerformanceObserver.supportedEntryTypes = [
+      "resource",
+      "longtask",
+      "layout-shift",
+      "largest-contentful-paint",
+      "first-input",
+      "navigation",
+    ];
+    const origObserve = MockPerformanceObserver.prototype.observe;
+    MockPerformanceObserver.prototype.observe = function (options: any) {
+      if (
+        !(MockPerformanceObserver as any).supportedEntryTypes.includes(
+          options.type,
+        )
+      ) {
+        throw new DOMException(
+          `${options.type} is not supported`,
+          "NotSupportedError",
+        );
+      }
+      origObserve.call(this, options);
+    };
+
+    try {
+      const performanceCollector = await loadCollector();
+      expect(() => performanceCollector(bus, DEFAULT_CONFIG)).not.toThrow();
+
+      expect(
+        MockPerformanceObserver.instances.find(
+          (o) => o.observeOptions?.type === "paint",
+        ),
+      ).toBeUndefined();
+
+      const navObserver = MockPerformanceObserver.instances.find(
+        (o) => o.observeOptions?.type === "navigation",
+      );
+      expect(navObserver).toBeDefined();
+      navObserver!.simulateEntries([
+        {
+          entryType: "navigation",
+          startTime: 0,
+          responseStart: 210,
+          domContentLoadedEventEnd: 640,
+          loadEventEnd: 1180,
+        },
+      ]);
+      bus.flush();
+      expect(events).toHaveLength(1);
+      expect(events[0].d.metric).toBe("ttfb");
+    } finally {
+      MockPerformanceObserver.prototype.observe = origObserve;
+      MockPerformanceObserver.supportedEntryTypes = [
+        "resource",
+        "longtask",
+        "layout-shift",
+        "largest-contentful-paint",
+        "first-input",
+        "navigation",
+        "paint",
+      ];
+    }
   });
 });

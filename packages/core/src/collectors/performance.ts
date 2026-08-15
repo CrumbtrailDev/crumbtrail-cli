@@ -19,6 +19,12 @@ interface EntryTypeConfig {
   type: string;
   metric: string;
   budget: PerfBudgetName;
+  /**
+   * Optional per-entry filter, for the entry types that carry more than one
+   * metric. An entry this rejects is skipped before any budget is spent, so a
+   * type we only partly care about cannot eat another type's allowance.
+   */
+  accepts?: (entry: any) => boolean;
   extract: (entry: any) => Record<string, unknown>;
 }
 
@@ -80,6 +86,28 @@ const ENTRY_TYPES: EntryTypeConfig[] = [
       delay: entry.processingStart - entry.startTime,
       name: entry.name,
     }),
+  },
+  {
+    // Time to first byte: how long the server took to start answering, which is
+    // what separates a slow backend from a slow render when a page feels stuck.
+    type: "navigation",
+    metric: "ttfb",
+    budget: "vitals",
+    extract: (entry) => ({
+      value: entry.responseStart - entry.startTime,
+      domContentLoadedEventEnd: entry.domContentLoadedEventEnd,
+      loadEventEnd: entry.loadEventEnd,
+    }),
+  },
+  {
+    // First contentful paint. The `paint` entry type also carries `first-paint`,
+    // which fires for a background fill and says nothing about content being
+    // visible, so only the contentful entry is a vital.
+    type: "paint",
+    metric: "fcp",
+    budget: "vitals",
+    accepts: (entry) => entry.name === "first-contentful-paint",
+    extract: (entry) => ({ value: entry.startTime }),
   },
 ];
 
@@ -196,10 +224,14 @@ export function performanceCollector(
     try {
       const observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
+          if (cfg.accepts && !cfg.accepts(entry)) continue;
           if (!emitPerf(cfg.budget, cfg.metric, () => cfg.extract(entry)))
             return;
         }
       });
+      // `buffered: true` is load bearing, not decoration: navigation and paint
+      // timing both happen before any SDK could plausibly have loaded, so a late
+      // `init()` misses them permanently without the buffer replay.
       observer.observe({ type: cfg.type, buffered: true });
       observers.push(observer);
       observersByBudget[cfg.budget].push(observer);
