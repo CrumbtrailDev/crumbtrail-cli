@@ -4,9 +4,21 @@ import { attachRedactionMetadata, redactUrl } from "../redaction";
 import type { CrumbtrailConfig, CollectorCleanup } from "../types";
 import { now } from "../utils";
 
+/**
+ * Which emission budget an entry type answers to.
+ *
+ * `bulk` is for the per-occurrence types the page can produce without bound —
+ * one per resource fetched, one per long task. `vitals` is the reserved
+ * allowance for the score-class metrics, of which a session produces a handful.
+ * Keeping them apart is what stops a resource storm from shedding the one
+ * layout-shift or largest-contentful-paint entry that carries the answer.
+ */
+type PerfBudgetName = "bulk" | "vitals";
+
 interface EntryTypeConfig {
   type: string;
   metric: string;
+  budget: PerfBudgetName;
   extract: (entry: any) => Record<string, unknown>;
 }
 
@@ -14,6 +26,7 @@ const ENTRY_TYPES: EntryTypeConfig[] = [
   {
     type: "resource",
     metric: "res",
+    budget: "bulk",
     extract: (entry) => {
       const name = redactUrl(String(entry.name ?? ""), "name");
       const data: Record<string, unknown> = {
@@ -29,6 +42,7 @@ const ENTRY_TYPES: EntryTypeConfig[] = [
   {
     type: "longtask",
     metric: "longtask",
+    budget: "bulk",
     extract: (entry) => ({
       duration: entry.duration,
       name: entry.name,
@@ -37,6 +51,7 @@ const ENTRY_TYPES: EntryTypeConfig[] = [
   {
     type: "layout-shift",
     metric: "cls",
+    budget: "vitals",
     extract: (entry) => ({
       value: entry.value,
       hadRecentInput: entry.hadRecentInput,
@@ -45,6 +60,7 @@ const ENTRY_TYPES: EntryTypeConfig[] = [
   {
     type: "largest-contentful-paint",
     metric: "lcp",
+    budget: "vitals",
     extract: (entry) => {
       const data: Record<string, unknown> = {
         startTime: entry.startTime,
@@ -59,6 +75,7 @@ const ENTRY_TYPES: EntryTypeConfig[] = [
   {
     type: "first-input",
     metric: "fid",
+    budget: "vitals",
     extract: (entry) => ({
       delay: entry.processingStart - entry.startTime,
       name: entry.name,
@@ -67,7 +84,7 @@ const ENTRY_TYPES: EntryTypeConfig[] = [
 ];
 
 /**
- * Per-session ceiling on `perf` events.
+ * Per-session ceiling on the bulk `perf` events — `resource` and `longtask`.
  *
  * This collector observes every resource the page ever loads, so on a page that
  * polls, retries, or falls into a render loop it emits without bound. Observed
@@ -82,6 +99,39 @@ const ENTRY_TYPES: EntryTypeConfig[] = [
  */
 const MAX_PERF_EVENTS_PER_SESSION = 1_000;
 
+/**
+ * Reserved allowance for the score-class metrics.
+ *
+ * Before this reserve existed, every entry type answered to one shared counter,
+ * so the runaway resource case above did not just shed resource entries: it shed
+ * the layout-shift and largest-contentful-paint entries too, and then
+ * disconnected their observers. The metric went silently absent in exactly the
+ * sessions where a stalled or thrashing page made it the evidence that mattered.
+ *
+ * A session produces a handful of these, not hundreds, so this ceiling is far
+ * above ordinary use and exists only so a pathological animation loop cannot
+ * turn the reserve into a second unbounded channel. Exhausting it is reported as
+ * its own capture gap and disconnects only the vitals observers.
+ */
+const MAX_VITALS_EVENTS_PER_SESSION = 250;
+
+interface PerfBudget {
+  limit: number;
+  /** Capture-gap detail written once, when this budget is exhausted. */
+  detail: string;
+}
+
+const PERF_BUDGETS: Record<PerfBudgetName, PerfBudget> = {
+  bulk: {
+    limit: MAX_PERF_EVENTS_PER_SESSION,
+    detail: `perf events capped at ${MAX_PERF_EVENTS_PER_SESSION} for this session`,
+  },
+  vitals: {
+    limit: MAX_VITALS_EVENTS_PER_SESSION,
+    detail: `vitals perf events capped at ${MAX_VITALS_EVENTS_PER_SESSION} for this session`,
+  },
+};
+
 export function performanceCollector(
   bus: EventBus,
   _config: CrumbtrailConfig,
@@ -91,43 +141,68 @@ export function performanceCollector(
   }
 
   const observers: PerformanceObserver[] = [];
-  let emitted = 0;
-  let budgetReported = false;
+  const observersByBudget: Record<PerfBudgetName, PerformanceObserver[]> = {
+    bulk: [],
+    vitals: [],
+  };
+  const spent: Record<PerfBudgetName, number> = { bulk: 0, vitals: 0 };
+  const gapReported: Record<PerfBudgetName, boolean> = {
+    bulk: false,
+    vitals: false,
+  };
 
   const disconnectAll = (): void => {
     for (const observer of observers) observer.disconnect();
+  };
+
+  /**
+   * Spend one unit of `budget` and emit a `perf` event, or report the budget's
+   * exhaustion once and stop observing the entry types that answer to it.
+   *
+   * `data` is a thunk so a shed entry never pays for extraction, which for
+   * resource entries means URL redaction.
+   *
+   * Returns whether the event was emitted, so a caller that emits outside an
+   * observer callback (a finalize hook, say) can tell shed from delivered.
+   */
+  const emitPerf = (
+    budget: PerfBudgetName,
+    metric: string,
+    data: () => Record<string, unknown>,
+  ): boolean => {
+    const { limit, detail } = PERF_BUDGETS[budget];
+    if (spent[budget] >= limit) {
+      if (!gapReported[budget]) {
+        gapReported[budget] = true;
+        bus.emit(
+          buildCaptureGapEvent({
+            surface: "browser",
+            reason: "scan_budget_exceeded",
+            detail,
+          }),
+        );
+        // Nothing further will be emitted for this budget, so stop paying for
+        // the observation of its entry types. Other budgets keep observing.
+        for (const observer of observersByBudget[budget]) observer.disconnect();
+      }
+      return false;
+    }
+    spent[budget] += 1;
+    bus.emit({ t: now(), k: "perf", d: { metric, ...data() } });
+    return true;
   };
 
   for (const cfg of ENTRY_TYPES) {
     try {
       const observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
-          if (emitted >= MAX_PERF_EVENTS_PER_SESSION) {
-            if (!budgetReported) {
-              budgetReported = true;
-              bus.emit(
-                buildCaptureGapEvent({
-                  surface: "browser",
-                  reason: "scan_budget_exceeded",
-                  detail: `perf events capped at ${MAX_PERF_EVENTS_PER_SESSION} for this session`,
-                }),
-              );
-              // Nothing further will be emitted, so stop paying for the
-              // observation too.
-              disconnectAll();
-            }
+          if (!emitPerf(cfg.budget, cfg.metric, () => cfg.extract(entry)))
             return;
-          }
-          emitted += 1;
-          bus.emit({
-            t: now(),
-            k: "perf",
-            d: { metric: cfg.metric, ...cfg.extract(entry) },
-          });
         }
       });
       observer.observe({ type: cfg.type, buffered: true });
       observers.push(observer);
+      observersByBudget[cfg.budget].push(observer);
     } catch {
       // Entry type not supported — skip
     }

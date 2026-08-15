@@ -127,6 +127,107 @@ describe("performanceCollector", () => {
     expect(resourceObserver!.disconnected).toBe(true);
   });
 
+  it("keeps a score event after a resource storm exhausts the bulk budget", async () => {
+    // The bug this guards: one shared counter meant a runaway page shed the
+    // largest-contentful-paint entry too, and disconnected its observer, so the
+    // metric went absent in exactly the sessions that needed it.
+    const performanceCollector = await loadCollector();
+    performanceCollector(bus, DEFAULT_CONFIG);
+
+    const resourceObserver = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "resource",
+    )!;
+    const lcpObserver = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "largest-contentful-paint",
+    )!;
+
+    resourceObserver.simulateEntries(
+      Array.from({ length: 1_200 }, (_, i) => ({
+        entryType: "resource",
+        name: `https://example.com/api/poll/${i}`,
+        duration: 1,
+        transferSize: 1,
+        initiatorType: "fetch",
+      })),
+    );
+    lcpObserver.simulateEntries([
+      {
+        entryType: "largest-contentful-paint",
+        startTime: 4321,
+        size: 90_000,
+        element: { tagName: "IMG" },
+      },
+    ]);
+    bus.flush();
+
+    // The score event survives.
+    const lcp = events.filter((e) => e.k === "perf" && e.d.metric === "lcp");
+    expect(lcp).toHaveLength(1);
+    expect(lcp[0].d.startTime).toBe(4321);
+
+    // The bulk budget is exhausted and reported once, and only its observer
+    // stopped.
+    expect(
+      events.filter((e) => e.k === "perf" && e.d.metric === "res"),
+    ).toHaveLength(1_000);
+    expect(events.filter((e) => e.k === "capture_gap")).toHaveLength(1);
+    expect(resourceObserver.disconnected).toBe(true);
+    expect(lcpObserver.disconnected).toBe(false);
+  });
+
+  it("caps the vitals reserve separately and stops only the vitals observers", async () => {
+    const performanceCollector = await loadCollector();
+    performanceCollector(bus, DEFAULT_CONFIG);
+
+    const resourceObserver = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "resource",
+    )!;
+    const clsObserver = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "layout-shift",
+    )!;
+    const lcpObserver = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "largest-contentful-paint",
+    )!;
+
+    clsObserver.simulateEntries(
+      Array.from({ length: 300 }, () => ({
+        entryType: "layout-shift",
+        value: 0.01,
+        hadRecentInput: false,
+      })),
+    );
+    bus.flush();
+
+    expect(events.filter((e) => e.k === "perf")).toHaveLength(250);
+    const gaps = events.filter((e) => e.k === "capture_gap");
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0].d.reason).toBe("scan_budget_exceeded");
+    expect(gaps[0].d.surface).toBe("browser");
+    // `buildCaptureGapEvent` keeps only classifications, so free-text detail is
+    // dropped here exactly as it is for the bulk budget's gap.
+    expect(gaps[0].d.detail).toBeUndefined();
+
+    // Vitals observers stop; the bulk ones keep going and keep their own budget.
+    expect(clsObserver.disconnected).toBe(true);
+    expect(lcpObserver.disconnected).toBe(true);
+    expect(resourceObserver.disconnected).toBe(false);
+
+    resourceObserver.simulateEntries([
+      {
+        entryType: "resource",
+        name: "https://example.com/after",
+        duration: 5,
+        transferSize: 5,
+        initiatorType: "fetch",
+      },
+    ]);
+    bus.flush();
+    expect(
+      events.filter((e) => e.k === "perf" && e.d.metric === "res"),
+    ).toHaveLength(1);
+    expect(events.filter((e) => e.k === "capture_gap")).toHaveLength(1);
+  });
+
   it("redacts query values from resource timing URLs", async () => {
     const performanceCollector = await loadCollector();
     performanceCollector(bus, DEFAULT_CONFIG);
