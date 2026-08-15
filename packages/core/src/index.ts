@@ -1,4 +1,4 @@
-export { Crumbtrail, PROBE_RESULT_EVENT_KIND } from "./bug-logger";
+export { COLLECTOR_MAP, Crumbtrail, PROBE_RESULT_EVENT_KIND } from "./bug-logger";
 export { EventBus } from "./event-bus";
 export { RingBuffer } from "./ring-buffer";
 export { HttpTransport, EventDeliveryError } from "./transports/http";
@@ -63,7 +63,10 @@ export type {
   DbStatementEventData,
   DbStatementOp,
   CaptureGapEventData,
+  EnvCampaign,
+  EnvConnection,
   EnvDeclaration,
+  EnvDevice,
   EnvSnapshot,
   FlagBugOptions,
   InteractionElementDescriptor,

@@ -91,7 +91,7 @@ type Collector = (
   context: CollectorContext,
 ) => CollectorCleanup;
 
-const COLLECTOR_MAP: Record<string, Collector> = {
+export const COLLECTOR_MAP: Record<string, Collector> = {
   environment: environmentCollector,
   console: consoleCollector,
   errors: errorCollector,
