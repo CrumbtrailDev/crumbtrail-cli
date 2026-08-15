@@ -53,6 +53,9 @@ describe("performanceCollector", () => {
 
   afterEach(() => {
     delete (globalThis as any).PerformanceObserver;
+    // Visibility is stubbed per test; leaving a document hidden would leak into
+    // the next one.
+    delete (document as any).visibilityState;
   });
 
   // Lazy import so PerformanceObserver is available when the module evaluates
@@ -590,6 +593,283 @@ describe("performanceCollector", () => {
       expect(observer, `no observer registered for ${type}`).toBeDefined();
       expect(observer!.observeOptions.buffered).toBe(true);
     }
+  });
+
+  // --- Interaction to next paint --------------------------------------------
+
+  /** The `event` observer, which carries the interaction entries INP is built from. */
+  function eventObserver(): MockPerformanceObserver {
+    const observer = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "event",
+    );
+    expect(
+      observer,
+      "no observer registered for the event entry type",
+    ).toBeDefined();
+    return observer!;
+  }
+
+  function interaction(
+    interactionId: number,
+    duration: number,
+    name = "pointerdown",
+  ) {
+    return { entryType: "event", name, duration, interactionId };
+  }
+
+  /** Simulate the page being hidden, which is what finalizes a closed session. */
+  function hidePage() {
+    Object.defineProperty(document, "visibilityState", {
+      value: "hidden",
+      configurable: true,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }
+
+  function showPage() {
+    Object.defineProperty(document, "visibilityState", {
+      value: "visible",
+      configurable: true,
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }
+
+  function inpEvents() {
+    return events.filter((e) => e.k === "perf" && e.d.metric === "inp");
+  }
+
+  it("reports the worst interaction as inp on finalization", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    eventObserver().simulateEntries([
+      interaction(1, 40),
+      interaction(2, 120, "click"),
+      interaction(3, 80),
+    ]);
+    bus.flush();
+    // Nothing is knowable until the session stops accumulating.
+    expect(inpEvents()).toHaveLength(0);
+
+    cleanup();
+    bus.flush();
+
+    // 3 interactions: floor(3 / 50) = 0 candidates dropped, so the worst wins.
+    expect(inpEvents()).toHaveLength(1);
+    expect(inpEvents()[0].d.value).toBe(120);
+    expect(inpEvents()[0].d.eventType).toBe("click");
+    expect(inpEvents()[0].d.interactionCount).toBe(3);
+  });
+
+  it("collapses entries sharing an interactionId to that interaction's worst duration", async () => {
+    // One interaction fans out into pointerdown, pointerup and click entries.
+    // Counting them separately would both inflate the interaction count and let
+    // three views of one slow tap outrank three genuinely distinct ones.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    eventObserver().simulateEntries([
+      interaction(7, 60, "pointerdown"),
+      interaction(7, 210, "click"),
+      interaction(7, 90, "pointerup"),
+    ]);
+    cleanup();
+    bus.flush();
+
+    expect(inpEvents()).toHaveLength(1);
+    expect(inpEvents()[0].d.value).toBe(210);
+    expect(inpEvents()[0].d.eventType).toBe("click");
+    expect(inpEvents()[0].d.interactionCount).toBe(1);
+  });
+
+  it("excludes entries with interactionId 0 entirely", async () => {
+    // `interactionId: 0` means the platform did not attribute the event to a
+    // user interaction, so scoring it would report latency nobody waited on.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    eventObserver().simulateEntries([
+      interaction(0, 5_000, "pointermove"),
+      interaction(0, 4_000, "pointermove"),
+      interaction(4, 70, "keydown"),
+    ]);
+    cleanup();
+    bus.flush();
+
+    expect(inpEvents()).toHaveLength(1);
+    expect(inpEvents()[0].d.value).toBe(70);
+    expect(inpEvents()[0].d.eventType).toBe("keydown");
+    expect(inpEvents()[0].d.interactionCount).toBe(1);
+  });
+
+  it("emits no inp at all when every entry is unattributed", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    eventObserver().simulateEntries([interaction(0, 900, "pointermove")]);
+    cleanup();
+    bus.flush();
+
+    expect(inpEvents()).toHaveLength(0);
+  });
+
+  it("drops one candidate per 50 interactions", async () => {
+    // The specification, worked by hand:
+    //   60 interactions, ids 1..60, durations 40, 50, 60, ... 630
+    //   (duration of interaction i = 40 + (i - 1) * 10).
+    //   Ranked worst first: 630, 620, 610, ...
+    //   Candidates dropped = floor(60 / 50) = 1.
+    //   Reported = the 2nd worst = 620, from interaction 59.
+    // Reporting the plain maximum here would give 630; reporting the median or
+    // a fixed percentile would give neither.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    eventObserver().simulateEntries(
+      Array.from({ length: 60 }, (_, i) =>
+        interaction(i + 1, 40 + i * 10, `evt-${i + 1}`),
+      ),
+    );
+    cleanup();
+    bus.flush();
+
+    expect(inpEvents()).toHaveLength(1);
+    expect(inpEvents()[0].d.value).toBe(620);
+    expect(inpEvents()[0].d.eventType).toBe("evt-59");
+    expect(inpEvents()[0].d.interactionCount).toBe(60);
+  });
+
+  it("keeps reporting the maximum just below the first drop boundary", async () => {
+    // 49 interactions: floor(49 / 50) = 0, so nothing is dropped and the worst
+    // interaction is the score. This pins the boundary the previous test moves
+    // past, so an off-by-one in the divisor cannot pass both.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    eventObserver().simulateEntries(
+      Array.from({ length: 49 }, (_, i) => interaction(i + 1, 40 + i * 10)),
+    );
+    cleanup();
+    bus.flush();
+
+    // Worst = 40 + 48 * 10 = 520.
+    expect(inpEvents()[0].d.value).toBe(520);
+    expect(inpEvents()[0].d.interactionCount).toBe(49);
+  });
+
+  it("observes the event entry type with a 40ms duration threshold", async () => {
+    const performanceCollector = await loadCollector();
+    performanceCollector(bus, DEFAULT_CONFIG);
+
+    expect(eventObserver().observeOptions).toEqual({
+      type: "event",
+      buffered: true,
+      durationThreshold: 40,
+    });
+  });
+
+  it("degrades silently when the event entry type is unsupported", async () => {
+    MockPerformanceObserver.supportedEntryTypes = [
+      "resource",
+      "longtask",
+      "layout-shift",
+      "largest-contentful-paint",
+      "first-input",
+      "navigation",
+      "paint",
+    ];
+    const origObserve = MockPerformanceObserver.prototype.observe;
+    MockPerformanceObserver.prototype.observe = function (options: any) {
+      if (
+        !(MockPerformanceObserver as any).supportedEntryTypes.includes(
+          options.type,
+        )
+      ) {
+        throw new DOMException(
+          `${options.type} is not supported`,
+          "NotSupportedError",
+        );
+      }
+      origObserve.call(this, options);
+    };
+
+    try {
+      const performanceCollector = await loadCollector();
+      let cleanup!: () => void;
+      expect(() => {
+        cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+      }).not.toThrow();
+
+      expect(
+        MockPerformanceObserver.instances.find(
+          (o) => o.observeOptions?.type === "event",
+        ),
+      ).toBeUndefined();
+
+      // Every other observer still works, and finalizing emits no INP.
+      const lcpObserver = MockPerformanceObserver.instances.find(
+        (o) => o.observeOptions?.type === "largest-contentful-paint",
+      );
+      expect(lcpObserver).toBeDefined();
+      lcpObserver!.simulateEntries([
+        {
+          entryType: "largest-contentful-paint",
+          startTime: 900,
+          size: 100,
+          element: null,
+        },
+      ]);
+      cleanup();
+      bus.flush();
+
+      expect(
+        events.filter((e) => e.k === "perf" && e.d.metric === "lcp"),
+      ).toHaveLength(1);
+      expect(inpEvents()).toHaveLength(0);
+    } finally {
+      MockPerformanceObserver.prototype.observe = origObserve;
+    }
+  });
+
+  it("emits inp when the page is hidden, and never a second time", async () => {
+    // A session that is closed rather than finalized still has to report, and a
+    // tab that is hidden and shown repeatedly must not report the same score
+    // over and over.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    eventObserver().simulateEntries([interaction(1, 150, "click")]);
+
+    hidePage();
+    bus.flush();
+    expect(inpEvents()).toHaveLength(1);
+    expect(inpEvents()[0].d.value).toBe(150);
+
+    showPage();
+    hidePage();
+    bus.flush();
+    expect(inpEvents()).toHaveLength(1);
+
+    // Finalization after a visibility change must not duplicate it either.
+    cleanup();
+    bus.flush();
+    expect(inpEvents()).toHaveLength(1);
+  });
+
+  it("stops listening for visibility changes after cleanup", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    const observer = eventObserver();
+    cleanup();
+    bus.flush();
+    expect(inpEvents()).toHaveLength(0);
+
+    // A second collector must own the next session's score, not this one.
+    observer.simulateEntries([interaction(1, 300)]);
+    hidePage();
+    bus.flush();
+    expect(inpEvents()).toHaveLength(0);
   });
 
   it("keeps the other observers when paint is unsupported", async () => {

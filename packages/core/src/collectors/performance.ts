@@ -149,6 +149,50 @@ interface PerfBudget {
   detail: string;
 }
 
+/**
+ * Interaction to next paint (INP).
+ *
+ * INP is not an entry the platform hands over finished: it is a score derived
+ * from every interaction in the session, so it can only be reported once the
+ * session stops accumulating. That is why it lives outside `ENTRY_TYPES` — the
+ * table there is one-entry-in, one-event-out — and emits from a finalize hook.
+ *
+ * Only interactions at or above this many milliseconds are observed at all.
+ * Below it the interaction is not perceptible as slow, and observing every
+ * keystroke and pointer event on a busy page is the kind of unbounded work this
+ * collector is elsewhere careful to avoid.
+ */
+const INP_DURATION_THRESHOLD = 40;
+
+/**
+ * The estimator drops one candidate per this many interactions.
+ *
+ * Reporting the plain maximum makes the score hostage to a single unlucky
+ * interaction, which on a long session is close to guaranteed. The standard
+ * estimator instead ranks interactions by duration and reads the
+ * `floor(count / 50)`-th worst: the maximum below 50 interactions, the second
+ * worst from 50, the third worst from 100, and so on.
+ */
+const INP_CANDIDATE_INTERVAL = 50;
+
+/**
+ * Ceiling on the interaction records kept for the estimator.
+ *
+ * A long-lived single-page app can produce interactions indefinitely, and one
+ * record per interaction held for the life of the session is a leak. Past this
+ * many distinct interactions the estimator is far enough into the tail that the
+ * next candidate barely moves, so the count keeps rising honestly while the
+ * ranking stops growing and the reported candidate clamps to the deepest record
+ * still held.
+ */
+const MAX_TRACKED_INTERACTIONS = 1_000;
+
+/** The worst observed duration for one `interactionId`, and what caused it. */
+interface InteractionRecord {
+  duration: number;
+  eventType: string;
+}
+
 const PERF_BUDGETS: Record<PerfBudgetName, PerfBudget> = {
   bulk: {
     limit: MAX_PERF_EVENTS_PER_SESSION,
@@ -220,6 +264,108 @@ export function performanceCollector(
     return true;
   };
 
+  /**
+   * Scores that are only knowable when the session stops accumulating.
+   *
+   * Each hook is run on cleanup and whenever the page is hidden, so a session
+   * that is closed rather than finalized still reports. A hook therefore owns
+   * its own once-guard; being called more than once is the normal case.
+   */
+  const finalizers: Array<() => void> = [];
+  const runFinalizers = (): void => {
+    for (const finalize of finalizers) finalize();
+  };
+
+  // --- Interaction to next paint --------------------------------------------
+  const interactions = new Map<number, InteractionRecord>();
+  /**
+   * Distinct interactions seen, including any past `MAX_TRACKED_INTERACTIONS`
+   * that are no longer individually held. The estimator's rank comes from this,
+   * so shedding records makes the score more conservative, never wrong about
+   * how much the user did.
+   */
+  let interactionCount = 0;
+  let inpEmitted = false;
+
+  const recordInteraction = (entry: any): void => {
+    // `interactionId` 0 means the platform did not attribute the event to a
+    // user interaction at all, so it is not a candidate for an interaction
+    // score. Non-numeric ids are equally not interactions.
+    const id = entry?.interactionId;
+    if (typeof id !== "number" || id === 0) return;
+
+    const duration = Number(entry.duration);
+    if (!Number.isFinite(duration)) return;
+    const eventType = String(entry.name ?? "");
+
+    const existing = interactions.get(id);
+    if (existing) {
+      // One interaction fans out into several event entries — pointerdown,
+      // pointerup, click. The interaction's latency is the worst of them, not
+      // their sum and not whichever arrived last.
+      if (duration > existing.duration) {
+        existing.duration = duration;
+        existing.eventType = eventType;
+      }
+      return;
+    }
+
+    interactionCount += 1;
+    if (interactions.size >= MAX_TRACKED_INTERACTIONS) return;
+    interactions.set(id, { duration, eventType });
+  };
+
+  const emitInp = (): void => {
+    if (inpEmitted || interactions.size === 0) return;
+
+    const ranked = [...interactions.values()].sort(
+      (a, b) => b.duration - a.duration,
+    );
+    const rank = Math.min(
+      Math.floor(interactionCount / INP_CANDIDATE_INTERVAL),
+      ranked.length - 1,
+    );
+    const candidate = ranked[rank];
+
+    // `emitPerf` returns false when the vitals budget is already spent, in
+    // which case nothing was reported and the guard stays open: a later
+    // finalize cannot succeed either, but claiming an emission that never
+    // happened would be a lie the reader cannot see.
+    inpEmitted = emitPerf("vitals", "inp", () => ({
+      value: candidate.duration,
+      eventType: candidate.eventType,
+      interactionCount,
+    }));
+  };
+
+  finalizers.push(emitInp);
+
+  try {
+    const observer = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) recordInteraction(entry);
+    });
+    // `durationThreshold` is the whole reason this observer is affordable: the
+    // platform filters out the fast interactions before the callback runs.
+    observer.observe({
+      type: "event",
+      buffered: true,
+      durationThreshold: INP_DURATION_THRESHOLD,
+    } as PerformanceObserverInit);
+    observers.push(observer);
+    // Its one emission spends the vitals budget, so it stops when that budget
+    // does — after which no INP event can be emitted anyway.
+    observersByBudget.vitals.push(observer);
+  } catch {
+    // `event` timing unsupported — INP is simply absent, and every other
+    // observer is unaffected.
+  }
+
+  const doc: Document | undefined = globalThis.document;
+  const onVisibilityChange = (): void => {
+    if (doc?.visibilityState === "hidden") runFinalizers();
+  };
+  doc?.addEventListener("visibilitychange", onVisibilityChange);
+
   for (const cfg of ENTRY_TYPES) {
     try {
       const observer = new PerformanceObserver((list) => {
@@ -240,5 +386,11 @@ export function performanceCollector(
     }
   }
 
-  return disconnectAll;
+  return () => {
+    // Finalize before disconnecting: the derived scores are only reported here,
+    // and a disconnected observer cannot contribute anything more to them.
+    runFinalizers();
+    doc?.removeEventListener("visibilitychange", onVisibilityChange);
+    disconnectAll();
+  };
 }
