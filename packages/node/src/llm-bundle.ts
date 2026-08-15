@@ -4,6 +4,7 @@ import {
   BROWSER_REDACTION_POLICY_V2,
   CAPTURE_GAP_EVENT_KIND,
   DB_DIFF_EVENT_KIND,
+  normalizeFlagValue,
   redactInputValue,
   redactTokenLikeString,
   redactValue,
@@ -2424,29 +2425,20 @@ function buildStorageChanges(
 const MAX_FLAG_CHANGES = 200;
 
 /**
- * True when `value` is the provider wrapper shape `{ value, variant? }` rather than a flag
- * value that merely happens to be an object.
+ * What counts as the provider wrapper shape `{ value, variant? }`, rather than a flag value that
+ * merely happens to be an object, is decided by `normalizeFlagValue` in `crumbtrail-core` — the
+ * same function the browser SDK normalizes with before the event is ever written.
  *
- * The key-subset check is what keeps this honest: `{ value: 1, other: 2 }` is a payload, not a
- * wrapper, and reading a variant out of it would misdescribe the declaration. Kept in step with
- * `isFlagWrapper` in `packages/core/src/flags.ts`; that module is intentionally private to
- * `crumbtrail-core`, so the bundle reads the shape instead of importing the reader.
+ * A second copy of the rule lived here and had already drifted: it accepted a non-string
+ * `variant` where core rejects it, so for `{ value: "a", variant: 42 }` the two modules
+ * disagreed about what the flag's value even was. Any non-core producer of `d.flags` reaches
+ * this path — the OTLP ingest and the four mobile SDKs among them.
  */
-function isFlagWrapper(
-  value: unknown,
-): value is { value: unknown; variant?: unknown } {
-  if (!isRecord(value)) return false;
-  if (!("value" in value)) return false;
-  for (const key of Object.keys(value)) {
-    if (key !== "value" && key !== "variant") return false;
-  }
-  return true;
-}
 
 /** The variant a declared flag value names, or `undefined` when it names none. */
 function flagVariantOf(value: unknown): string | undefined {
-  if (!isFlagWrapper(value)) return undefined;
-  return safeText(value.variant, 120);
+  const variant = normalizeFlagValue(value).variant;
+  return variant === undefined ? undefined : safeText(variant, 120);
 }
 
 /**
@@ -2464,7 +2456,8 @@ function readFlagSide(
 ): LlmBundleFlagValue | undefined {
   if (side === undefined || side === null) return undefined;
   // Core emits `{ value, variant? }`; a raw or hand-written event may carry a bare value.
-  const raw = isFlagWrapper(side) ? side.value : side;
+  // `normalizeFlagValue` folds both, by the same rule core applied at capture.
+  const raw = normalizeFlagValue(side).value;
   const variant = flagVariantOf(side);
   const redacted = redactValue({ [flag]: raw }, "environment.flags").value as
     | Record<string, unknown>

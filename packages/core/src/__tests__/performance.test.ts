@@ -212,10 +212,20 @@ describe("performanceCollector", () => {
     // dropped here exactly as it is for the bulk budget's gap.
     expect(gaps[0].d.detail).toBeUndefined();
 
-    // Vitals observers stop; the bulk ones keep going and keep their own budget.
-    expect(clsObserver.disconnected).toBe(true);
-    expect(lcpObserver.disconnected).toBe(true);
+    // The bulk observers keep going and keep their own budget. The two vitals
+    // observers here keep going too, because each also feeds a finalized score
+    // that spends the separate `vitalsFinal` reserve: disconnecting them would
+    // starve those scores of input rather than of allowance. Only the vitals
+    // entry types that emit and nothing else — first-input, navigation, paint —
+    // stop here.
+    expect(clsObserver.disconnected).toBe(false);
+    expect(lcpObserver.disconnected).toBe(false);
     expect(resourceObserver.disconnected).toBe(false);
+    expect(
+      MockPerformanceObserver.instances.find(
+        (o) => o.observeOptions?.type === "first-input",
+      )!.disconnected,
+    ).toBe(true);
 
     resourceObserver.simulateEntries([
       {
@@ -1104,12 +1114,17 @@ describe("performanceCollector", () => {
     expect(clsScores()).toHaveLength(1);
   });
 
-  it("sheds cls.score as a capture gap rather than reporting a partial one", async () => {
-    // The score answers to the same vitals budget as the per-shift events, so
-    // a session that exhausts the budget loses the score too. What must not
-    // happen is a number built from only the shifts that fitted: an
-    // understated score reads as a calm page, and nothing tells the reader
-    // otherwise. The capture gap is what makes the absence legible.
+  it("reports a complete cls.score after the raw shift stream is shed", async () => {
+    // The raw per-shift stream and the score are separate budgets, and this is
+    // the case that separation exists for. The score is what the issue page,
+    // the evidence brief and the agent context read; the per-shift stream is an
+    // optional complement to it. Shedding the stream on a page with hundreds of
+    // shifts is correct, and losing the score with it — as one shared budget
+    // did — silences the metric on exactly the janky page that needed it.
+    //
+    // What must not happen is a score built from only the shifts that fitted:
+    // an understated number reads as a calm page. So scoring continues past the
+    // point where emission stops, and the reported score covers all 300.
     const performanceCollector = await loadCollector();
     const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
 
@@ -1118,16 +1133,18 @@ describe("performanceCollector", () => {
     );
     bus.flush();
 
-    // 250 per-shift events emitted, the rest shed.
+    // 250 per-shift events emitted, the rest shed, and the shedding is legible.
     expect(
       events.filter((e) => e.k === "perf" && e.d.metric === "cls"),
     ).toHaveLength(250);
+    expect(events.filter((e) => e.k === "capture_gap")).toHaveLength(1);
 
     cleanup();
     bus.flush();
 
-    expect(clsScores()).toHaveLength(0);
-    expect(events.filter((e) => e.k === "capture_gap")).toHaveLength(1);
+    expect(clsScores()).toHaveLength(1);
+    expect(clsScores()[0].d.shiftCount).toBe(300);
+    expect(clsScores()[0].d.value).toBeCloseTo(3, 5);
   });
 
   // --- Finalized largest contentful paint ------------------------------------

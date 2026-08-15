@@ -9,11 +9,19 @@ import { now } from "../utils";
  *
  * `bulk` is for the per-occurrence types the page can produce without bound —
  * one per resource fetched, one per long task. `vitals` is the reserved
- * allowance for the score-class metrics, of which a session produces a handful.
- * Keeping them apart is what stops a resource storm from shedding the one
- * layout-shift or largest-contentful-paint entry that carries the answer.
+ * allowance for the raw score-class entries. Keeping them apart is what stops a
+ * resource storm from shedding the one layout-shift or largest-contentful-paint
+ * entry that carries the answer.
+ *
+ * `vitalsFinal` is a third, tiny reserve that only the finalized scores spend —
+ * `cls.score`, `lcp.final`, `inp`. Those three are the whole point of the
+ * collector: they are what the issue page, the evidence brief and the agent
+ * context read, while the raw entries are an optional complement to them. They
+ * are also emitted last, from the finalize hooks, so sharing a counter with the
+ * raw stream made them the first thing a janky page starved — and a janky page
+ * is exactly the session whose score matters.
  */
-type PerfBudgetName = "bulk" | "vitals";
+type PerfBudgetName = "bulk" | "vitals" | "vitalsFinal";
 
 interface EntryTypeConfig {
   type: string;
@@ -128,7 +136,7 @@ const ENTRY_TYPES: EntryTypeConfig[] = [
 const MAX_PERF_EVENTS_PER_SESSION = 1_000;
 
 /**
- * Reserved allowance for the score-class metrics.
+ * Reserved allowance for the raw score-class entries.
  *
  * Before this reserve existed, every entry type answered to one shared counter,
  * so the runaway resource case above did not just shed resource entries: it shed
@@ -139,9 +147,28 @@ const MAX_PERF_EVENTS_PER_SESSION = 1_000;
  * A session produces a handful of these, not hundreds, so this ceiling is far
  * above ordinary use and exists only so a pathological animation loop cannot
  * turn the reserve into a second unbounded channel. Exhausting it is reported as
- * its own capture gap and disconnects only the vitals observers.
+ * its own capture gap.
  */
 const MAX_VITALS_EVENTS_PER_SESSION = 250;
+
+/**
+ * Reserved allowance for the finalized scores, which nothing else may spend.
+ *
+ * A session emits at most three of these — `cls.score`, `lcp.final`, `inp` — and
+ * emits them last, from the finalize hooks. While they answered to the raw
+ * `vitals` budget above, a page with more than 250 layout shifts spent that
+ * budget on the raw stream and left the finalizers nothing, so the score went
+ * absent on precisely the janky page that the raw stream exists to describe.
+ * Absent vitals is the documented ordinary state downstream, so the failure was
+ * invisible there too.
+ *
+ * A separate name rather than "cap the raw stream at limit minus five" because a
+ * shared counter is what caused this: with one counter the two channels stay
+ * coupled and any later change to either limit silently re-creates the
+ * starvation. Five leaves headroom for a fourth finalized score without
+ * revisiting this.
+ */
+const MAX_FINALIZED_VITALS_EVENTS_PER_SESSION = 5;
 
 interface PerfBudget {
   limit: number;
@@ -179,13 +206,34 @@ const INP_CANDIDATE_INTERVAL = 50;
  * Ceiling on the interaction records kept for the estimator.
  *
  * A long-lived single-page app can produce interactions indefinitely, and one
- * record per interaction held for the life of the session is a leak. Past this
- * many distinct interactions the estimator is far enough into the tail that the
- * next candidate barely moves, so the count keeps rising honestly while the
- * ranking stops growing and the reported candidate clamps to the deepest record
- * still held.
+ * record per interaction held for the life of the session is a leak. What is
+ * kept is the *worst* interactions seen, not the first ones seen: the estimator
+ * only ever reads into the slow end of the ranking, so the fast interactions
+ * carry no information the score can use.
+ *
+ * Keeping the first N instead made the clamp actively wrong rather than merely
+ * approximate. At 50,000 interactions the rank asked for the 999th worst of the
+ * whole session but indexed into a prefix of a thousand early ones, so a
+ * genuinely unresponsive app reported an INP near the `durationThreshold` floor
+ * and read as `good`. Keeping the worst N makes the clamp conservative in the
+ * safe direction: a clamped score over-reports latency rather than hiding it.
  */
 const MAX_TRACKED_INTERACTIONS = 1_000;
+
+/**
+ * How far past the ceiling the record set is allowed to grow before it is
+ * pruned back down to it.
+ *
+ * Pruning sorts, so doing it on every insert past the ceiling would be a sort
+ * per interaction. This amortizes it to one sort per `INTERACTION_PRUNE_SLACK`
+ * new interactions.
+ *
+ * The slack also makes eviction of a live interaction effectively impossible: a
+ * pruned id would have to receive a further entry, and the entries of one
+ * interaction (pointerdown, pointerup, click) all arrive within that
+ * interaction, not 250 distinct interactions later.
+ */
+const INTERACTION_PRUNE_SLACK = 250;
 
 /** The worst observed duration for one `interactionId`, and what caused it. */
 interface InteractionRecord {
@@ -222,6 +270,10 @@ const PERF_BUDGETS: Record<PerfBudgetName, PerfBudget> = {
     limit: MAX_VITALS_EVENTS_PER_SESSION,
     detail: `vitals perf events capped at ${MAX_VITALS_EVENTS_PER_SESSION} for this session`,
   },
+  vitalsFinal: {
+    limit: MAX_FINALIZED_VITALS_EVENTS_PER_SESSION,
+    detail: `finalized vitals perf events capped at ${MAX_FINALIZED_VITALS_EVENTS_PER_SESSION} for this session`,
+  },
 };
 
 export function performanceCollector(
@@ -233,14 +285,29 @@ export function performanceCollector(
   }
 
   const observers: PerformanceObserver[] = [];
+  /**
+   * Which observers to stop when a budget is exhausted.
+   *
+   * Only observers whose entries do nothing but emit are listed. An observer
+   * that also feeds a finalized score keeps running past its budget, because
+   * the score answers to `vitalsFinal` and stopping the observation would
+   * starve it of input instead of of allowance. `vitalsFinal` therefore has no
+   * observers of its own: nothing observes on its behalf.
+   */
   const observersByBudget: Record<PerfBudgetName, PerformanceObserver[]> = {
     bulk: [],
     vitals: [],
+    vitalsFinal: [],
   };
-  const spent: Record<PerfBudgetName, number> = { bulk: 0, vitals: 0 };
+  const spent: Record<PerfBudgetName, number> = {
+    bulk: 0,
+    vitals: 0,
+    vitalsFinal: 0,
+  };
   const gapReported: Record<PerfBudgetName, boolean> = {
     bulk: false,
     vitals: false,
+    vitalsFinal: false,
   };
 
   const disconnectAll = (): void => {
@@ -274,7 +341,8 @@ export function performanceCollector(
           }),
         );
         // Nothing further will be emitted for this budget, so stop paying for
-        // the observation of its entry types. Other budgets keep observing.
+        // the observation of the entry types that do nothing but emit. Other
+        // budgets keep observing, and so do the observers that feed a score.
         for (const observer of observersByBudget[budget]) observer.disconnect();
       }
       return false;
@@ -307,6 +375,15 @@ export function performanceCollector(
   let interactionCount = 0;
   let inpEmitted = false;
 
+  /** Drop all but the worst `MAX_TRACKED_INTERACTIONS` records. */
+  const pruneInteractions = (): void => {
+    const kept = [...interactions.entries()]
+      .sort((a, b) => b[1].duration - a[1].duration)
+      .slice(0, MAX_TRACKED_INTERACTIONS);
+    interactions.clear();
+    for (const [id, record] of kept) interactions.set(id, record);
+  };
+
   const recordInteraction = (entry: any): void => {
     // `interactionId` 0 means the platform did not attribute the event to a
     // user interaction at all, so it is not a candidate for an interaction
@@ -331,8 +408,13 @@ export function performanceCollector(
     }
 
     interactionCount += 1;
-    if (interactions.size >= MAX_TRACKED_INTERACTIONS) return;
     interactions.set(id, { duration, eventType });
+    if (
+      interactions.size >
+      MAX_TRACKED_INTERACTIONS + INTERACTION_PRUNE_SLACK
+    ) {
+      pruneInteractions();
+    }
   };
 
   const emitInp = (): void => {
@@ -347,11 +429,12 @@ export function performanceCollector(
     );
     const candidate = ranked[rank];
 
-    // `emitPerf` returns false when the vitals budget is already spent, in
-    // which case nothing was reported and the guard stays open: a later
-    // finalize cannot succeed either, but claiming an emission that never
-    // happened would be a lie the reader cannot see.
-    inpEmitted = emitPerf("vitals", "inp", () => ({
+    // Spends `vitalsFinal`, the reserve no raw entry can touch, so no volume of
+    // observed interactions can shed the score they exist to produce.
+    // `emitPerf` still returns false if that reserve is somehow spent, in which
+    // case nothing was reported and the guard stays open: claiming an emission
+    // that never happened would be a lie the reader cannot see.
+    inpEmitted = emitPerf("vitalsFinal", "inp", () => ({
       value: candidate.duration,
       eventType: candidate.eventType,
       interactionCount,
@@ -406,9 +489,9 @@ export function performanceCollector(
 
   const emitCls = (): void => {
     if (clsEmitted || clsShiftCount === 0) return;
-    // As with INP, the guard takes the emission's own answer: a score shed by an
-    // exhausted budget was never reported, so it must not be recorded as sent.
-    clsEmitted = emitPerf("vitals", "cls.score", () => ({
+    // As with INP: the reserved `vitalsFinal` budget, and a guard that takes the
+    // emission's own answer rather than assuming it landed.
+    clsEmitted = emitPerf("vitalsFinal", "cls.score", () => ({
       value: clsMaxWindow,
       shiftCount: clsShiftCount,
     }));
@@ -459,7 +542,7 @@ export function performanceCollector(
     // Nothing observed after finalization can be part of the load either.
     lcpFrozen = true;
     const candidate = lcpCandidate;
-    lcpEmitted = emitPerf("vitals", "lcp.final", () => ({ ...candidate }));
+    lcpEmitted = emitPerf("vitalsFinal", "lcp.final", () => ({ ...candidate }));
   };
 
   finalizers.push(emitLcpFinal);
@@ -482,9 +565,10 @@ export function performanceCollector(
       durationThreshold: INP_DURATION_THRESHOLD,
     } as PerformanceObserverInit);
     observers.push(observer);
-    // Its one emission spends the vitals budget, so it stops when that budget
-    // does — after which no INP event can be emitted anyway.
-    observersByBudget.vitals.push(observer);
+    // Deliberately registered against no budget. This observer emits nothing:
+    // it only feeds the estimator, whose one emission spends `vitalsFinal`.
+    // Stopping it when the raw `vitals` budget runs out would have thrown away
+    // interaction data the score still had allowance to report.
   } catch {
     // `event` timing unsupported — INP is simply absent, and every other
     // observer is unaffected.
@@ -507,15 +591,14 @@ export function performanceCollector(
     try {
       const observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
-          // Scoring runs before the budget question, because a shed entry
-          // still moved the page. Today this ordering is not observable — the
-          // scores answer to the same `vitals` budget as the raw entries, so a
-          // budget that sheds the entries sheds the score with them — but it
-          // is the ordering that stays correct if the two ever separate.
+          // Scoring runs before the budget question, and keeps running after
+          // it: a shed entry still moved the page, and the score it feeds
+          // spends the separate `vitalsFinal` reserve. So a spent raw budget
+          // stops the raw stream and nothing else — `continue`, not `return`,
+          // because the rest of this batch still has to be scored.
           record?.(entry);
           if (cfg.accepts && !cfg.accepts(entry)) continue;
-          if (!emitPerf(cfg.budget, cfg.metric, () => cfg.extract(entry)))
-            return;
+          emitPerf(cfg.budget, cfg.metric, () => cfg.extract(entry));
         }
       });
       // `buffered: true` is load bearing, not decoration: navigation and paint
@@ -523,7 +606,12 @@ export function performanceCollector(
       // `init()` misses them permanently without the buffer replay.
       observer.observe({ type: cfg.type, buffered: true });
       observers.push(observer);
-      observersByBudget[cfg.budget].push(observer);
+      // An observer that also feeds a finalized score stays connected past its
+      // budget; only a pure emitter is worth stopping. Scoring is an O(1)
+      // numeric update per entry and holds no growing state, so the cost of
+      // staying connected is bounded even on a thrashing page, while the score
+      // it produces is the collector's actual output.
+      if (!record) observersByBudget[cfg.budget].push(observer);
     } catch {
       // Entry type not supported — skip
     }

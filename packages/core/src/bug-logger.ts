@@ -65,8 +65,9 @@ import { webSocketCollector } from "./collectors/websocket";
 import { workerCollector } from "./collectors/worker";
 import { environmentCollector, buildEnvDelta } from "./collectors/environment";
 import type { EnvDeclaration, EnvSnapshot } from "./types";
-// Internal module: `flags.ts` is deliberately not re-exported from `index.ts`. Flag diffing is
-// an implementation detail of `setEnv`, not SDK surface an integrator calls.
+// `diffFlags` is an implementation detail of `setEnv`, not SDK surface an integrator calls, and
+// stays unexported. `normalizeFlagValue` is exported from `index.ts` because `crumbtrail-node`
+// has to read the same wrapper shape back out of captured events.
 import { diffFlags, type NormalizedFlag } from "./flags";
 import {
   attachRedactionMetadata,
@@ -1354,7 +1355,16 @@ export class Crumbtrail {
     // that drops everything, and an app that calls stop() explicitly rather
     // than letting the tab go hidden would lose its vitals entirely.
     for (const cleanup of this.cleanups) {
-      cleanup();
+      try {
+        cleanup();
+      } catch {
+        // One collector failing to tear down must not take the rest of the
+        // shutdown with it. Everything after this loop is load bearing: the
+        // second flush ships the finalized vitals emitted above, and
+        // `abortFlightRecorder()` settles a pending flag() tail promise that
+        // would otherwise never resolve for the caller awaiting it. An
+        // unguarded loop made all of that hostage to any collector's teardown.
+      }
     }
     this.bus.flush();
     this.stopped = true;
