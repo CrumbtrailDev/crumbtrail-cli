@@ -208,8 +208,11 @@ describe("environment: PostHog-parity context fields", () => {
     expect(bundle.environment).not.toHaveProperty("hardwareConcurrency");
   });
 
-  it("merges flagChanges across the snapshot and later flag-snapshot events", () => {
-    // Changes arrive after the base snapshot, so reading `base` alone would lose them.
+  it("records every flag move as its own ordered entry across the snapshot and later flag-snapshot events", () => {
+    // Changes arrive after the base snapshot, so reading `base` alone would lose them. The
+    // third event flips `checkout_v2` back off: a map keyed by flag name would collapse that
+    // onto the first move and report the flag as unchanged, so the two entries surviving in
+    // order is the assertion, not an incidental detail of it.
     const bundle = bundleFor([
       envSnapshot({}),
       {
@@ -228,11 +231,41 @@ describe("environment: PostHog-parity context fields", () => {
           flagChanges: { pricing_tier: { from: "a", to: "b" } },
         },
       } as unknown as BugEvent,
+      {
+        t: 4_000,
+        k: "env",
+        d: {
+          kind: "flag-snapshot",
+          flagChanges: { checkout_v2: { from: true, to: false } },
+        },
+      } as unknown as BugEvent,
     ]);
-    expect(bundle.environment?.flagChanges).toEqual({
-      checkout_v2: { from: false, to: true },
-      pricing_tier: { from: "a", to: "b" },
-    });
+    expect(bundle.environment?.flagChanges).toEqual([
+      {
+        t: 2_000,
+        iso: "1970-01-01T00:00:02.000Z",
+        offsetMs: 1_000,
+        flag: "checkout_v2",
+        from: { value: false },
+        to: { value: true },
+      },
+      {
+        t: 3_000,
+        iso: "1970-01-01T00:00:03.000Z",
+        offsetMs: 2_000,
+        flag: "pricing_tier",
+        from: { value: "a" },
+        to: { value: "b" },
+      },
+      {
+        t: 4_000,
+        iso: "1970-01-01T00:00:04.000Z",
+        offsetMs: 3_000,
+        flag: "checkout_v2",
+        from: { value: true },
+        to: { value: false },
+      },
+    ]);
   });
 
   it("renders the new fields in the markdown Environment section", () => {
@@ -252,6 +285,14 @@ describe("environment: PostHog-parity context fields", () => {
           hardwareConcurrency: 10,
           flagChanges: { checkout_v2: { from: false, to: true } },
         }),
+        {
+          t: 2_500,
+          k: "env",
+          d: {
+            kind: "flag-snapshot",
+            flagChanges: { checkout_v2: { from: true, to: false } },
+          },
+        } as unknown as BugEvent,
       ]),
     );
     expect(markdown).toContain("- Referrer: https://news.example.com/story");
@@ -260,7 +301,15 @@ describe("environment: PostHog-parity context fields", () => {
     expect(markdown).toContain("- Connection: 4g, 50 ms rtt");
     expect(markdown).toContain("- Device memory: 8 GB");
     expect(markdown).toContain("- CPU cores: 10");
-    expect(markdown).toContain("- Flags changed during session: checkout_v2");
+    // One bullet per move, in order, each stamped with its offset. A single summary line naming
+    // the changed flags would render this on-then-off pair as one entry and lose the flip.
+    expect(markdown).toContain(
+      [
+        "- Flags changed during session (values redacted in browser before capture):",
+        "  - +500ms checkout_v2: false -> true",
+        "  - +1500ms checkout_v2: true -> false",
+      ].join("\n"),
+    );
   });
 });
 

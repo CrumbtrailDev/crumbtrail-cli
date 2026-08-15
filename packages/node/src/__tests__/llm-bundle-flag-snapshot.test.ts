@@ -102,9 +102,19 @@ describe("environment: flag-snapshot does not displace the base snapshot", () =>
       newCheckout: false,
       legacyNav: false,
     });
-    expect(bundle.environment?.flagChanges).toEqual({
-      newCheckout: { from: { value: true }, to: { value: false } },
-    });
+    // The delta's move is the only one reported, and it keeps the stamp that lets an agent line
+    // it up against the error timeline. The later flag-snapshot restates the resolved value but
+    // reports no move, so it must not add an entry of its own.
+    expect(bundle.environment?.flagChanges).toEqual([
+      {
+        t: 3_000,
+        iso: "1970-01-01T00:00:03.000Z",
+        offsetMs: 2_000,
+        flag: "newCheckout",
+        from: { value: true },
+        to: { value: false },
+      },
+    ]);
   });
 
   it("still produces an environment when a flag-snapshot is the only env event", () => {
