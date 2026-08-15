@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, describe, it, expect } from "vitest";
-import type { BugEvent } from "crumbtrail-core";
+import type { BugEvent, EnvSnapshot } from "crumbtrail-core";
 import { buildLlmBundle, renderLlmMarkdown } from "../llm-bundle";
 
 /**
@@ -114,5 +114,235 @@ describe("environment: appBuild", () => {
       envSnapshot({ appBuild: "snapshot-build" }),
     ]);
     expect(bundle.environment?.appBuild).toBe("snapshot-build");
+  });
+});
+
+describe("environment: PostHog-parity context fields", () => {
+  it("carries the referrer through the URL redaction path", () => {
+    const bundle = bundleFor([
+      envSnapshot({
+        referrer: "https://news.example.com/story?utm_x=abc#frag",
+      }),
+    ]);
+    // Hash dropped, query values redacted — the arrival path survives, the payload does not.
+    expect(bundle.environment?.referrer).toBe(
+      "https://news.example.com/story?utm_x=%5BREDACTED%5D",
+    );
+  });
+
+  it("carries first-party campaign labels", () => {
+    const bundle = bundleFor([
+      envSnapshot({
+        campaign: { source: "newsletter", medium: "email", campaign: "august" },
+      }),
+    ]);
+    expect(bundle.environment?.campaign).toEqual({
+      source: "newsletter",
+      medium: "email",
+      campaign: "august",
+    });
+  });
+
+  it("omits campaign entirely when no label survived sanitizing", () => {
+    const bundle = bundleFor([envSnapshot({ campaign: { source: "  " } })]);
+    expect(bundle.environment).not.toHaveProperty("campaign");
+  });
+
+  it("carries device display characteristics", () => {
+    const bundle = bundleFor([
+      envSnapshot({
+        device: {
+          dpr: 2,
+          screen: { w: 2560, h: 1440 },
+          orientation: "landscape-primary",
+        },
+      }),
+    ]);
+    expect(bundle.environment?.device).toEqual({
+      dpr: 2,
+      screen: { w: 2560, h: 1440 },
+      orientation: "landscape-primary",
+    });
+  });
+
+  it("drops a malformed screen while keeping the rest of the device", () => {
+    const bundle = bundleFor([
+      envSnapshot({ device: { dpr: 3, screen: { w: "wide", h: 1440 } } }),
+    ]);
+    expect(bundle.environment?.device).toEqual({ dpr: 3 });
+  });
+
+  it("carries the connection, including a false saveData", () => {
+    const bundle = bundleFor([
+      envSnapshot({
+        connection: {
+          effectiveType: "4g",
+          downlink: 10,
+          rtt: 50,
+          saveData: false,
+        },
+      }),
+    ]);
+    // `false` is a real reading, not an absent one, so it must survive removeUndefined.
+    expect(bundle.environment?.connection).toEqual({
+      effectiveType: "4g",
+      downlink: 10,
+      rtt: 50,
+      saveData: false,
+    });
+  });
+
+  it("carries deviceMemory and hardwareConcurrency as numbers", () => {
+    const bundle = bundleFor([
+      envSnapshot({ deviceMemory: 8, hardwareConcurrency: 10 }),
+    ]);
+    expect(bundle.environment?.deviceMemory).toBe(8);
+    expect(bundle.environment?.hardwareConcurrency).toBe(10);
+  });
+
+  it("omits non-numeric device counters rather than emitting a string", () => {
+    const bundle = bundleFor([
+      envSnapshot({ deviceMemory: "8", hardwareConcurrency: Number.NaN }),
+    ]);
+    expect(bundle.environment).not.toHaveProperty("deviceMemory");
+    expect(bundle.environment).not.toHaveProperty("hardwareConcurrency");
+  });
+
+  it("merges flagChanges across the snapshot and later flag-snapshot events", () => {
+    // Changes arrive after the base snapshot, so reading `base` alone would lose them.
+    const bundle = bundleFor([
+      envSnapshot({}),
+      {
+        t: 2_000,
+        k: "env",
+        d: {
+          kind: "flag-snapshot",
+          flagChanges: { checkout_v2: { from: false, to: true } },
+        },
+      } as unknown as BugEvent,
+      {
+        t: 3_000,
+        k: "env",
+        d: {
+          kind: "flag-snapshot",
+          flagChanges: { pricing_tier: { from: "a", to: "b" } },
+        },
+      } as unknown as BugEvent,
+    ]);
+    expect(bundle.environment?.flagChanges).toEqual({
+      checkout_v2: { from: false, to: true },
+      pricing_tier: { from: "a", to: "b" },
+    });
+  });
+
+  it("renders the new fields in the markdown Environment section", () => {
+    // A field carried into the JSON but never rendered is still invisible to a reading agent.
+    const markdown = renderLlmMarkdown(
+      bundleFor([
+        envSnapshot({
+          referrer: "https://news.example.com/story",
+          campaign: { source: "newsletter" },
+          device: {
+            dpr: 2,
+            screen: { w: 2560, h: 1440 },
+            orientation: "landscape-primary",
+          },
+          connection: { effectiveType: "4g", rtt: 50 },
+          deviceMemory: 8,
+          hardwareConcurrency: 10,
+          flagChanges: { checkout_v2: { from: false, to: true } },
+        }),
+      ]),
+    );
+    expect(markdown).toContain("- Referrer: https://news.example.com/story");
+    expect(markdown).toContain("- Campaign: source=newsletter");
+    expect(markdown).toContain("- Device: 2560x1440, dpr 2, landscape-primary");
+    expect(markdown).toContain("- Connection: 4g, 50 ms rtt");
+    expect(markdown).toContain("- Device memory: 8 GB");
+    expect(markdown).toContain("- CPU cores: 10");
+    expect(markdown).toContain("- Flags changed during session: checkout_v2");
+  });
+});
+
+/**
+ * Runtime companion to the `_envWhitelistIsExhaustive` sentinel in `llm-bundle.ts`.
+ *
+ * The sentinel proves every `EnvSnapshot` key has a matching key on `LlmBundleEnvironment`. It
+ * cannot prove `buildEnvironment` actually populates it — a declared-but-never-assigned field
+ * type-checks fine and drops silently at runtime. This test closes that half.
+ */
+describe("environment: whitelist exhaustiveness", () => {
+  /**
+   * Keys that are captured on the wire but deliberately never surfaced as a bundle field.
+   *
+   * Widening this array is the reviewable act: adding an entry here is how a field becomes an
+   * accepted drop instead of an accident, so every entry carries its reason.
+   */
+  const NOT_SURFACED_IN_THE_BUNDLE: Array<keyof EnvSnapshot> = [
+    // Wire-level discriminator between snapshot / delta / flag-snapshot. The bundle merges all
+    // three into one environment object, so the discriminator has no meaning afterwards.
+    "kind",
+    // Browser-side redaction bookkeeping. It describes the capture pipeline, not the app under
+    // test, and an agent reasoning about the defect has no use for it.
+    "redaction",
+  ];
+
+  // `Required<EnvSnapshot>` is the second half of the guard: adding a field to `EnvSnapshot`
+  // without adding it here is a compile error in this file.
+  const everyField: Required<EnvSnapshot> = {
+    kind: "snapshot",
+    userAgent: "Mozilla/5.0 (Macintosh) TestAgent/1.0",
+    browser: { name: "Chrome", version: "141.0" },
+    os: "macOS 15",
+    viewport: { w: 1440, h: 900 },
+    locale: "en-CA",
+    timezone: "America/Toronto",
+    appBuild: "2026.08.15-a1b2c3",
+    flags: { checkout_v2: true },
+    config: { region: "eu" },
+    referrer: "https://news.example.com/story",
+    campaign: {
+      source: "newsletter",
+      medium: "email",
+      campaign: "august",
+      term: "bugs",
+      content: "cta",
+    },
+    device: {
+      dpr: 2,
+      screen: { w: 2560, h: 1440 },
+      orientation: "landscape-primary",
+    },
+    connection: { effectiveType: "4g", downlink: 10, rtt: 50, saveData: false },
+    deviceMemory: 8,
+    hardwareConcurrency: 10,
+    flagChanges: { checkout_v2: { from: false, to: true } },
+    redaction: { policy: "browser-v2" },
+  };
+
+  it("round trips every EnvSnapshot key that is not an explicit exclusion", () => {
+    const bundle = bundleFor([
+      { t: 1_500, k: "env", d: everyField } as unknown as BugEvent,
+    ]);
+    const environment = bundle.environment;
+    expect(environment).not.toBeNull();
+
+    const missing = (
+      Object.keys(everyField) as Array<keyof EnvSnapshot>
+    ).filter(
+      (key) =>
+        !NOT_SURFACED_IN_THE_BUNDLE.includes(key) &&
+        !Object.prototype.hasOwnProperty.call(environment, key),
+    );
+    expect(missing).toEqual([]);
+  });
+
+  it("does not surface the excluded keys", () => {
+    const bundle = bundleFor([
+      { t: 1_500, k: "env", d: everyField } as unknown as BugEvent,
+    ]);
+    for (const key of NOT_SURFACED_IN_THE_BUNDLE) {
+      expect(bundle.environment).not.toHaveProperty(key);
+    }
   });
 });

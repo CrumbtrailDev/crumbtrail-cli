@@ -9,6 +9,9 @@ import {
   redactValue,
   type BugEvent,
   type DbEngine,
+  type EnvCampaign,
+  type EnvConnection,
+  type EnvDevice,
   type EnvSnapshot,
 } from "crumbtrail-core";
 import {
@@ -497,7 +500,61 @@ export interface LlmBundleEnvironment {
   appBuild?: string;
   flags?: Record<string, unknown>;
   config?: Record<string, unknown>;
+  /** `document.referrer` at session start. Redacted through the normal URL path. */
+  referrer?: string;
+  /** First-party `utm_*` acquisition labels. Only present when capture had `campaign` enabled. */
+  campaign?: EnvCampaign;
+  /** Display characteristics that change how a rendering defect reproduces. */
+  device?: EnvDevice;
+  /** Network Information API view of the connection at session start. */
+  connection?: EnvConnection;
+  /** `navigator.deviceMemory` in GiB, where the runtime exposes it. */
+  deviceMemory?: number;
+  /** `navigator.hardwareConcurrency`. */
+  hardwareConcurrency?: number;
+  /**
+   * Flags that changed during the session, keyed by flag name, merged across every `k:'env'`
+   * event last-write-wins. Values are redacted the same way `flags` is.
+   */
+  flagChanges?: Record<string, { from: unknown; to: unknown }>;
 }
+
+/**
+ * `EnvSnapshot` keys the bundle deliberately does not surface as its own environment field.
+ *
+ * - `kind` discriminates snapshot/delta/flag-snapshot at the wire level. The bundle merges those
+ *   events into one environment, so the discriminator has no meaning after the merge.
+ * - `redaction` is browser-side redaction bookkeeping, not evidence about the app.
+ * - `flags` and `config` ARE carried, and are named here only because they are populated by the
+ *   merge loop below rather than by the `removeUndefined` block. Listing them keeps the exclusion
+ *   set readable: nothing in it is a silent drop.
+ */
+type EnvSnapshotDeliberatelyExcluded =
+  | "kind"
+  | "redaction"
+  | "flags"
+  | "config";
+
+/** Any `EnvSnapshot` field that is neither carried into the bundle nor explicitly excluded. */
+type UncarriedEnvSnapshotKey = Exclude<
+  keyof EnvSnapshot,
+  keyof LlmBundleEnvironment | EnvSnapshotDeliberatelyExcluded
+>;
+
+/**
+ * Fail-loud guard on the environment whitelist.
+ *
+ * `buildEnvironment` is an explicit whitelist, so a field added to `EnvSnapshot` and captured on
+ * the wire is silently discarded at bundle time unless someone remembers to widen the whitelist
+ * too. That failure looks like a capture bug and gets debugged as one. This sentinel turns it into
+ * a compile error instead: the moment an `EnvSnapshot` key is neither a key of
+ * `LlmBundleEnvironment` nor named in `EnvSnapshotDeliberatelyExcluded`, `UncarriedEnvSnapshotKey`
+ * stops being `never` and the annotation below resolves to `never`, which `true` cannot satisfy.
+ */
+const _envWhitelistIsExhaustive: UncarriedEnvSnapshotKey extends never
+  ? true
+  : never = true;
+void _envWhitelistIsExhaustive;
 
 /**
  * Redaction-aware summary of one `k:'db.diff'` event (a row that changed during a request),
@@ -2209,13 +2266,23 @@ function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
     // Capture already bounds this to 120 token-safe characters; bound it again here so a raw
     // event that bypassed the collector cannot widen the field.
     appBuild: safeText(base.appBuild, 120),
+    // `document.referrer` is a URL, so it goes through the URL redaction path (query values
+    // stripped, hash dropped) rather than plain text redaction.
+    referrer: safeUrl(base.referrer, "environment.referrer"),
+    campaign: sanitizeCampaign(base.campaign),
+    device: sanitizeDevice(base.device),
+    connection: sanitizeConnection(base.connection),
+    deviceMemory: finiteNumber(base.deviceMemory),
+    hardwareConcurrency: finiteNumber(base.hardwareConcurrency),
   });
 
-  // Merge flags/config across the snapshot and every delta, preserving last-write-wins order.
+  // Merge flags/config/flagChanges across the snapshot and every delta, last-write-wins.
   const flags: Record<string, unknown> = {};
   const config: Record<string, unknown> = {};
+  const flagChanges: Record<string, unknown> = {};
   let hasFlags = false;
   let hasConfig = false;
+  let hasFlagChanges = false;
   for (const event of envEvents) {
     const d = event.d as Partial<EnvSnapshot>;
     if (isRecord(d.flags)) {
@@ -2226,6 +2293,12 @@ function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
       Object.assign(config, d.config);
       hasConfig = true;
     }
+    // Changes arrive on later `flag-snapshot`/`delta` events rather than the base snapshot, so
+    // they are merged here for the same reason flags are: the base alone would lose them.
+    if (isRecord(d.flagChanges)) {
+      Object.assign(flagChanges, d.flagChanges);
+      hasFlagChanges = true;
+    }
   }
   // Defense-in-depth: flags/config are redacted in the browser, but re-run the redaction path
   // at bundle time so secret-looking values can never rest in the bundle even if a raw event
@@ -2234,8 +2307,48 @@ function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
     environment.flags = redactValue(flags, "environment.flags").value;
   if (hasConfig)
     environment.config = redactValue(config, "environment.config").value;
+  if (hasFlagChanges)
+    environment.flagChanges = redactValue(
+      flagChanges,
+      "environment.flagChanges",
+    ).value as Record<string, { from: unknown; to: unknown }>;
 
   return environment;
+}
+
+/** First-party `utm_*` labels only. Cross-site click ids are never captured upstream. */
+function sanitizeCampaign(value: unknown): EnvCampaign | undefined {
+  if (!isRecord(value)) return undefined;
+  const campaign = removeUndefined({
+    source: safeText(value.source, 120),
+    medium: safeText(value.medium, 120),
+    campaign: safeText(value.campaign, 120),
+    term: safeText(value.term, 120),
+    content: safeText(value.content, 120),
+  }) as EnvCampaign;
+  return Object.keys(campaign).length > 0 ? campaign : undefined;
+}
+
+function sanitizeDevice(value: unknown): EnvDevice | undefined {
+  if (!isRecord(value)) return undefined;
+  const device = removeUndefined({
+    dpr: finiteNumber(value.dpr),
+    // The screen is the same `{ w, h }` shape as the viewport and gets the same treatment.
+    screen: sanitizeViewport(value.screen),
+    orientation: safeText(value.orientation, 40),
+  }) as EnvDevice;
+  return Object.keys(device).length > 0 ? device : undefined;
+}
+
+function sanitizeConnection(value: unknown): EnvConnection | undefined {
+  if (!isRecord(value)) return undefined;
+  const connection = removeUndefined({
+    effectiveType: safeText(value.effectiveType, 20),
+    downlink: finiteNumber(value.downlink),
+    rtt: finiteNumber(value.rtt),
+    saveData: typeof value.saveData === "boolean" ? value.saveData : undefined,
+  }) as EnvConnection;
+  return Object.keys(connection).length > 0 ? connection : undefined;
 }
 
 /**
@@ -4797,6 +4910,34 @@ function renderEnvironmentSection(
   if (environment.timezone) lines.push(`- Timezone: ${environment.timezone}`);
   if (environment.appBuild)
     lines.push(`- Release build: ${environment.appBuild}`);
+  if (environment.referrer) lines.push(`- Referrer: ${environment.referrer}`);
+  if (environment.campaign)
+    lines.push(
+      `- Campaign: ${Object.entries(environment.campaign)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(", ")}`,
+    );
+  if (environment.device) {
+    const { dpr, screen, orientation } = environment.device;
+    const parts: string[] = [];
+    if (screen) parts.push(`${screen.w}x${screen.h}`);
+    if (dpr !== undefined) parts.push(`dpr ${dpr}`);
+    if (orientation) parts.push(orientation);
+    if (parts.length > 0) lines.push(`- Device: ${parts.join(", ")}`);
+  }
+  if (environment.connection) {
+    const { effectiveType, downlink, rtt, saveData } = environment.connection;
+    const parts: string[] = [];
+    if (effectiveType) parts.push(effectiveType);
+    if (downlink !== undefined) parts.push(`${downlink} Mbps`);
+    if (rtt !== undefined) parts.push(`${rtt} ms rtt`);
+    if (saveData !== undefined) parts.push(`saveData ${saveData}`);
+    if (parts.length > 0) lines.push(`- Connection: ${parts.join(", ")}`);
+  }
+  if (environment.deviceMemory !== undefined)
+    lines.push(`- Device memory: ${environment.deviceMemory} GB`);
+  if (environment.hardwareConcurrency !== undefined)
+    lines.push(`- CPU cores: ${environment.hardwareConcurrency}`);
   if (environment.flags)
     lines.push(
       `- Feature flags: ${Object.keys(environment.flags).sort().join(", ") || "none"} (values redacted in browser before capture)`,
@@ -4804,6 +4945,10 @@ function renderEnvironmentSection(
   if (environment.config)
     lines.push(
       `- Config keys: ${Object.keys(environment.config).sort().join(", ") || "none"} (values redacted in browser before capture)`,
+    );
+  if (environment.flagChanges)
+    lines.push(
+      `- Flags changed during session: ${Object.keys(environment.flagChanges).sort().join(", ") || "none"} (values redacted in browser before capture)`,
     );
   lines.push("");
   return lines;
