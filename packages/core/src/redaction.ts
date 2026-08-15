@@ -470,6 +470,119 @@ function redactQueryString(
   };
 }
 
+/**
+ * The only query parameter names campaign capture may read. First-party UTM
+ * labels, nothing else.
+ *
+ * Stated as a closed literal list rather than a prefix test on purpose: a
+ * `utm_*` prefix rule would silently admit whatever a vendor invents next, and
+ * a widening should be a visible edit to this array with a reviewer attached.
+ * Cross-site advertising identifiers — `gclid`, `fbclid`, `msclkid`, `ttclid`,
+ * `_fbp`, `li_fat_id` and the rest of that family — are deliberately absent and
+ * are never read, so they cannot reach the output path even as `[REDACTED]`.
+ */
+const CAMPAIGN_PARAM_NAMES = [
+  "utm_source",
+  "utm_medium",
+  "utm_campaign",
+  "utm_term",
+  "utm_content",
+] as const;
+
+/**
+ * A campaign label is a short human-authored word or phrase. Anything past this
+ * is not a label, so it is dropped rather than truncated: a truncated prefix of
+ * an unexpected value is still that value's first 200 characters resting in the
+ * payload, which is exactly the artifact this bound exists to prevent.
+ */
+const CAMPAIGN_VALUE_MAX_LENGTH = 200;
+
+/**
+ * Read first-party campaign labels out of a `location.search` string.
+ *
+ * This is a narrow, named exception to the policy in {@link redactQueryString},
+ * which redacts every query value it sees and CONTINUES to do so — including
+ * for `utm_*`. Nothing here changes what any URL captured from a network event,
+ * a navigation, a referrer or an error frame reports. The asymmetry is the
+ * point: a campaign label read deliberately from the session's own entry URL is
+ * a different artifact from an arbitrary URL observed in flight, where the SDK
+ * has no idea what a parameter means and must assume the worst.
+ *
+ * The allowance is deny-biased in three ways. Only the five literal names in
+ * {@link CAMPAIGN_PARAM_NAMES} are read at all. Every value that survives still
+ * goes through {@link redactTokenLikeString} and the value-based half of
+ * {@link classifyStructuredValue}, so an email, a JWT, a card number, an IBAN or
+ * a high-entropy secret smuggled into `utm_campaign` is redacted like anywhere
+ * else. And anything longer than {@link CAMPAIGN_VALUE_MAX_LENGTH} is dropped.
+ *
+ * The parameter's own name is passed as its keep name, which exempts it from the
+ * free-text catch-all only — a campaign label is frequently a multi-word phrase
+ * ("Spring Sale 2026") that the catch-all would otherwise treat as free text.
+ * Every value-based check above that catch-all still runs.
+ *
+ * Repeated parameters are read once: the first occurrence wins, as it does for
+ * `URLSearchParams.get`.
+ *
+ * @param search A `location.search` value, with or without the leading `?`.
+ */
+export function redactCampaignParams(
+  search: string,
+): RedactionResult<Record<string, string>> {
+  const output: Record<string, string> = {};
+  if (!search) return { value: output };
+
+  const hashIndex = search.indexOf("#");
+  const beforeHash = hashIndex >= 0 ? search.slice(0, hashIndex) : search;
+  const query = beforeHash.startsWith("?") ? beforeHash.slice(1) : beforeHash;
+  if (!query) return { value: output };
+
+  const params = new URLSearchParams(query);
+  const fields: RedactionField[] = [];
+
+  for (const name of CAMPAIGN_PARAM_NAMES) {
+    const raw = params.get(name);
+    if (raw === null || raw === "") continue;
+    const path = `campaign.${name}`;
+
+    if (raw.length > CAMPAIGN_VALUE_MAX_LENGTH) {
+      fields.push({
+        path,
+        reason: "campaign_value_length_limit",
+        action: "dropped",
+      });
+      continue;
+    }
+
+    if (redactTokenLikeString(raw, path).value !== raw) {
+      output[name] = REDACTED_VALUE;
+      fields.push({
+        path,
+        reason: "campaign_token_like_value",
+        action: "redacted",
+      });
+      continue;
+    }
+
+    const classification = classifyStructuredValue(raw, name, undefined, [
+      name,
+    ]);
+    if (classification.action === "redact") {
+      output[name] = REDACTED_VALUE;
+      fields.push({
+        path,
+        reason: `campaign_${classification.reason}`,
+        action: "redacted",
+      });
+      continue;
+    }
+
+    output[name] = raw;
+  }
+
+  const metadata = metadataFromFields(fields);
+  return { value: output, ...(metadata ? { metadata } : {}) };
+}
+
 function sanitizeKeyName(key: string): string {
   return redactTokenLikeString(key).value === key ? key : REDACTED_KEY;
 }
