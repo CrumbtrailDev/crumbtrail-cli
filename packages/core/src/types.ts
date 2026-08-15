@@ -417,7 +417,7 @@ export type InteractionElementDescriptorFactory = (
 
 /**
  * Declarative environment input the host app passes to `logger.setEnv`. Both fields are
- * vendor-agnostic free-form maps (no LaunchDarkly/PostHog adapters). Values are redacted
+ * vendor-agnostic free-form maps, with no per vendor flag adapters. Values are redacted
  * through the browser redaction policy before they rest in any `k:'env'` event.
  */
 export interface EnvDeclaration {

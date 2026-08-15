@@ -896,8 +896,8 @@ describe("attachRedactionMetadata", () => {
 });
 
 /**
- * Every input is masked by default, which is what Datadog, Sentry and PostHog all do and is not a
- * decision this SDK reopens. What the body and query-string planes already offer and this one did
+ * Every input is masked by default, which is what the established observability and analytics SDKs
+ * all do and is not a decision this SDK reopens. What the body and query-string planes already offer and this one did
  * not is a way for an application to name one of its own fields and get it back. Without it, the
  * only opt-in is a DOM attribute, so a filter value that explains a whole class of defect can only
  * be recovered by editing markup.
