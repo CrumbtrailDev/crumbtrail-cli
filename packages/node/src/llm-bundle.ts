@@ -489,6 +489,12 @@ export interface LlmBundleEnvironment {
   viewport?: { w: number; h: number };
   locale?: string;
   timezone?: string;
+  /**
+   * Public client release identity declared by `<meta name="app-build">`, captured into the
+   * `k:'env'` snapshot. An agent reasoning about a regression needs to know which build it
+   * happened on, so this is carried through the whitelist rather than dropped.
+   */
+  appBuild?: string;
   flags?: Record<string, unknown>;
   config?: Record<string, unknown>;
 }
@@ -2200,6 +2206,9 @@ function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
     viewport: sanitizeViewport(base.viewport),
     locale: safeText(base.locale, 60),
     timezone: safeText(base.timezone, 80),
+    // Capture already bounds this to 120 token-safe characters; bound it again here so a raw
+    // event that bypassed the collector cannot widen the field.
+    appBuild: safeText(base.appBuild, 120),
   });
 
   // Merge flags/config across the snapshot and every delta, preserving last-write-wins order.
@@ -4786,6 +4795,8 @@ function renderEnvironmentSection(
     );
   if (environment.locale) lines.push(`- Locale: ${environment.locale}`);
   if (environment.timezone) lines.push(`- Timezone: ${environment.timezone}`);
+  if (environment.appBuild)
+    lines.push(`- Release build: ${environment.appBuild}`);
   if (environment.flags)
     lines.push(
       `- Feature flags: ${Object.keys(environment.flags).sort().join(", ") || "none"} (values redacted in browser before capture)`,
