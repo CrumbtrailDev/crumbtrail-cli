@@ -23,6 +23,11 @@ import { createCrumbtrailRequestHeaders } from "./correlation";
 import { readEarlySessionId } from "./early-capture";
 import { createAutoFlagController } from "./auto-flag";
 import {
+  ReplayRecorder,
+  replaySupported,
+  type ReplayMasking,
+} from "./replay/index";
+import {
   isProbeName,
   runProbe,
   type ProbeContext,
@@ -260,6 +265,18 @@ export class Crumbtrail {
   private sessionMetadataWrite: Promise<void> = Promise.resolve();
   private stopped = false;
   private identity: CrumbtrailIdentity = {};
+
+  /**
+   * Session replay, off until the server says a project asked for it.
+   *
+   * There is no local option to switch this on. Replay records the pages a
+   * customer's own end users see, so the decision belongs to the customer's
+   * project settings rather than to whoever wired the SDK in, and it arrives on
+   * the same config poll as the kill switch.
+   */
+  private replayEnabled = false;
+  private replayMasking: ReplayMasking = "inputs_masked";
+  private replay: ReplayRecorder | undefined;
 
   private constructor(
     config: CrumbtrailConfig,
@@ -834,6 +851,14 @@ export class Crumbtrail {
       }
     }
 
+    if (typeof settings.replayEnabled === "boolean")
+      this.replayEnabled = settings.replayEnabled;
+    if (
+      settings.replayMasking === "inputs_masked" ||
+      settings.replayMasking === "text_masked"
+    )
+      this.replayMasking = settings.replayMasking;
+
     if (
       oldSampleRate !== this.config.captureSampleRate ||
       oldBaselineSampleRate !== this.config.baselineSampleRate
@@ -841,6 +866,7 @@ export class Crumbtrail {
       this.resampleSession();
     this.applyConsentPolicy();
     this.updateFlightRecorderState();
+    this.updateReplayState();
     if (shouldReconfigureAutoFlag) this.configureAutoFlagController();
     this.startSessionIfAllowed();
     this.emitSamplingGapIfNeeded();
@@ -1158,6 +1184,42 @@ export class Crumbtrail {
       return;
     this.sessionStarted = true;
     this.startSessionWithCurrentIdentity();
+    this.updateReplayState();
+  }
+
+  /**
+   * Start or stop session replay to match the project's setting.
+   *
+   * Only ever recorded for a session that is already being sent: a replay of a
+   * session the server has no row for is an artifact nothing can reach.
+   *
+   * Masking is fixed for the life of a recording. A manifest states one masking
+   * mode, and a recording whose second half was taken under a different one
+   * would be a recording no reader could characterize. A changed setting takes
+   * effect on the next session, which is what the settings page says it does.
+   */
+  private updateReplayState(): void {
+    const shouldRecord =
+      this.replayEnabled &&
+      this.sessionStarted &&
+      this.canTransport() &&
+      replaySupported();
+    if (shouldRecord) {
+      if (this.replay) return;
+      this.replay = new ReplayRecorder({
+        sessionId: this.sessionId,
+        masking: this.replayMasking,
+        send: (name, body) => this.transport.sendBlob(name, body),
+      });
+      this.replay.start();
+      return;
+    }
+    const running = this.replay;
+    this.replay = undefined;
+    // Detached rather than awaited: this runs from a config poll, and a poll
+    // must not wait on an upload. `stop` flushes what it has before it tears
+    // down, so the buffered tail still lands.
+    void running?.stop().catch(() => {});
   }
 
   /**
@@ -1344,6 +1406,35 @@ export class Crumbtrail {
     // flag, so a collector that throws on teardown cannot take the session's
     // last batch down with it.
     this.bus.flush();
+    // Session replay is torn down first, and awaited. Two reasons it belongs
+    // here rather than after the flag:
+    //
+    // Its last chunk is the interval a session that ended in a failure was
+    // failing in, and it uploads through `transport.sendBlob` against a session
+    // the server still has open — so it has to land before `endSession()`
+    // finalizes the log below. Awaiting it inline is what makes that ordering
+    // real; `updateReplayState()` may only detach the same call because a
+    // config poll must not block on an upload.
+    //
+    // And it runs while the session is still live, on the same side of the flag
+    // as the collector loop. The recorder reaches the transport directly rather
+    // than through the bus, so nothing it does today is dropped by
+    // `canTransport()` — but a recorder that tears down before the flag cannot
+    // start depending on that, and this is the side that stays correct.
+    //
+    // Guarded like every other teardown in this sequence. `ReplayRecorder.stop()`
+    // is `async`, so a throw inside it arrives as the rejection `.catch()`
+    // already absorbs and the `try` is redundant today; it is here so that the
+    // rule holds by inspection rather than by everyone re-deriving that fact,
+    // because a `stop` that ever threw past that chain would strand the second
+    // flush, the flag, `abortFlightRecorder()` and `endSession()`.
+    const replay = this.replay;
+    this.replay = undefined;
+    try {
+      await replay?.stop().catch(() => {});
+    } catch {
+      // Shutdown continues, same as everywhere else in this sequence.
+    }
     // These three run BEFORE the collector loop and are teardown in exactly the
     // same sense, so they answer to the same rule: a throw here must not strand
     // everything below. `widgetCleanup` is DOM teardown against nodes the host
@@ -1390,7 +1481,9 @@ export class Crumbtrail {
     this.stopped = true;
     // Kept after the flag, where it has always been: with `stopped` set,
     // canCapture() is false, so an armed recorder settles to "armed" rather
-    // than reopening as "buffering" on the way out.
+    // than reopening as "buffering" on the way out. The session replay
+    // recorder is torn down at the top of stop() instead, for the opposite
+    // reason: see there.
     this.abortFlightRecorder();
     this.stateProviders.clear();
     this.bus.stop();

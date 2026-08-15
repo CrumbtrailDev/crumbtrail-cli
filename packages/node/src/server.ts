@@ -109,6 +109,38 @@ const ALLOWED_BLOB_ARTIFACT_NAMES = new Set([
   VIDEO_ARTIFACT_NAME,
   AUDIO_ARTIFACT_NAME,
 ]);
+
+/** The session replay manifest, rewritten by the recorder on every flush. */
+const REPLAY_MANIFEST_NAME = "replay.json";
+
+/**
+ * A replay chunk.
+ *
+ * Matched by pattern rather than listed, because there is one per chunk and a
+ * session has many. The anchors and the exact digit count are load bearing:
+ * this string becomes a filesystem path, so a pattern accepting a suffix, a
+ * shorter run of digits, or a trailing newline would leave the traversal check
+ * to catch what this one let through.
+ */
+const REPLAY_CHUNK_PATTERN = /^replay-\d{6}\.json\.gz$/u;
+
+/**
+ * Per-chunk ceiling, far below the 25 MB general blob cap.
+ *
+ * A chunk is a few seconds of gzipped DOM deltas; on real pages that lands in
+ * the tens of kilobytes, and a megabyte is already a page doing something
+ * pathological.
+ */
+const MAX_REPLAY_CHUNK_BYTES = 2 * 1024 * 1024;
+const MAX_REPLAY_MANIFEST_BYTES = 4 * 1024 * 1024;
+
+function isReplayArtifactName(name: string): boolean {
+  return name === REPLAY_MANIFEST_NAME || REPLAY_CHUNK_PATTERN.test(name);
+}
+
+function isWritableBlobName(name: string): boolean {
+  return ALLOWED_BLOB_ARTIFACT_NAMES.has(name) || isReplayArtifactName(name);
+}
 const MAX_METADATA_HEADER_BYTES = 8 * 1024;
 const DEFAULT_OTLP_AUTO_SESSION_WINDOW_MS = 30 * 60 * 1000;
 const DEFAULT_OTLP_TRACE_SESSION_CACHE = 2048;
@@ -736,9 +768,7 @@ async function serveSessionArtifact(
     return;
   }
 
-  const storeName = windowsMatch
-    ? `windows/${windowsMatch[1]}`
-    : artifactName;
+  const storeName = windowsMatch ? `windows/${windowsMatch[1]}` : artifactName;
   const artifactPath = path.join(sessionDir, storeName);
   const safePath = safeRegularFilePath(sessionDir, artifactPath);
   if (!safePath) {
@@ -1840,7 +1870,7 @@ export function createServer(config: ServerConfig): http.Server {
       const blobMatch = urlPath.match(/^\/api\/blob\/(.+)$/);
       if (req.method === "POST" && blobMatch) {
         const name = decodeUrlPathSegment(blobMatch[1]);
-        if (!name || !ALLOWED_BLOB_ARTIFACT_NAMES.has(name)) {
+        if (!name || !isWritableBlobName(name)) {
           jsonError(res, 400, "Invalid blob name", "invalid_blob_name", false);
           return;
         }
@@ -1849,7 +1879,17 @@ export function createServer(config: ServerConfig): http.Server {
           sessions,
           Array.isArray(sessionId) ? sessionId[0] : sessionId,
         );
-        const data = await readBody(req, maxBlobBytes);
+        // Replay artifacts carry their own, much lower ceiling. The read limit
+        // is what stands in front of a misbehaving tab, because the body has to
+        // be read before anything else can judge it.
+        const data = await readBody(
+          req,
+          name === REPLAY_MANIFEST_NAME
+            ? MAX_REPLAY_MANIFEST_BYTES
+            : REPLAY_CHUNK_PATTERN.test(name)
+              ? MAX_REPLAY_CHUNK_BYTES
+              : maxBlobBytes,
+        );
         assertWritableArtifactPath(sessionDir, path.join(sessionDir, name));
         await writeBlob(sessionDir, name, data);
         await writeAudioUploadMetadata(req, sessionDir, name, data);
