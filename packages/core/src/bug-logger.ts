@@ -69,14 +69,20 @@ import { eventSourceCollector } from "./collectors/eventsource";
 import { webSocketCollector } from "./collectors/websocket";
 import { workerCollector } from "./collectors/worker";
 import { environmentCollector, buildEnvDelta } from "./collectors/environment";
-import type { EnvDeclaration } from "./types";
+import type { EnvDeclaration, EnvSnapshot } from "./types";
+// `diffFlags` is an implementation detail of `setEnv`, not SDK surface an integrator calls, and
+// stays unexported. `normalizeFlagValue` is exported from `index.ts` because `crumbtrail-node`
+// has to read the same wrapper shape back out of captured events.
+import { diffFlags, type NormalizedFlag } from "./flags";
 import {
   attachRedactionMetadata,
+  mergeRedactionMetadata,
   REDACTED_VALUE,
   redactNetworkTextBody,
   redactUrl,
   redactValue,
   type PayloadSummary,
+  type RedactionMetadata,
   setCaptureInputValues,
   setRedactionKeepFields,
 } from "./redaction";
@@ -93,7 +99,7 @@ type Collector = (
   context: CollectorContext,
 ) => CollectorCleanup;
 
-const COLLECTOR_MAP: Record<string, Collector> = {
+export const COLLECTOR_MAP: Record<string, Collector> = {
   environment: environmentCollector,
   console: consoleCollector,
   errors: errorCollector,
@@ -538,6 +544,40 @@ export class Crumbtrail {
     const flaggedAt = now();
     const note =
       options?.note === undefined ? undefined : maskText(options.note);
+
+    // Resolved flag/config state at flag time. The session-start snapshot plus deltas answers
+    // "what were the flags at t0"; only this answers "what were they at the moment this broke",
+    // without a reader replaying every delta by hand. Emitted at `flaggedAt` so it lands in the
+    // same window as the evidence it explains. Nothing declared means nothing emitted: an empty
+    // snapshot is noise, and noise in a bundle costs a reader attention.
+    //
+    // Gated on `envEmitted` for the same reason `setEnv` is: with the environment collector
+    // disabled the session carries no `k:'env'` event at all, and a flag snapshot appearing
+    // where the app switched env capture off would contradict that configuration.
+    if (
+      this.envEmitted &&
+      (Object.keys(this.declaredFlags).length > 0 ||
+        Object.keys(this.declaredConfig).length > 0)
+    ) {
+      // `buildEnvDelta` is the one place flags/config go through `redactValue` under the
+      // `env.flags`/`env.config` paths; reusing it keeps the snapshot on the same policy as
+      // the snapshot and delta rather than growing a second redaction path that can drift.
+      const flagSnapshot = buildEnvDelta(
+        this.declaredFlags,
+        this.declaredConfig,
+      );
+      flagSnapshot.kind = "flag-snapshot";
+      this.bus.emit(
+        {
+          t: flaggedAt,
+          k: "env",
+          d: flagSnapshot as unknown as Record<string, unknown>,
+        },
+        // Without this the flight recorder finalization path drops the event, so the feature
+        // would work in the ordinary case and vanish in exactly the case it was built for.
+        { bypassAdmission: finalizerOriginated },
+      );
+    }
 
     // Capture provider state snapshots at flag time so they land in the same window.
     const stateProviderNames = Array.from(this.stateProviders.keys());
@@ -1281,18 +1321,73 @@ export class Crumbtrail {
    * Declaratively attach vendor-agnostic feature flags / config to the session environment.
    * Values are redacted before they rest. Merges into the declared env; if the initial
    * `k:'env'` snapshot has already been emitted (the normal case, since `setEnv` is called
-   * after `init`), it emits a `k:'env'` delta event ({ kind:'delta' }). If called before the
-   * snapshot is emitted (e.g. environment collector disabled or not yet run), the values are
-   * folded into the snapshot instead.
+   * after `init`), it emits a `k:'env'` delta event ({ kind:'delta' }) scoped to what actually
+   * moved: `flags`/`config` carry only the changed keys, and `flagChanges` carries the
+   * before/after pair for each changed flag. A re-declaration that changes nothing emits no
+   * event at all, so a reader can tell "the app re-declares its flags on every route change"
+   * from "the flag flipped mid session". If called before the snapshot is emitted (e.g.
+   * environment collector disabled or not yet run), the values are folded into the snapshot
+   * instead and nothing is emitted.
    */
   setEnv(declaration: EnvDeclaration): void {
+    // `diffFlags` treats `next` as an authoritative full re-declaration, which is what makes a
+    // removal detectable. `setEnv` is documented as MERGE semantics, so the incoming
+    // declaration is a partial — handing it over directly would report every untouched key as
+    // a removal. Compare against the post-merge state instead. The honest consequence: a
+    // removal is unreachable through `setEnv`, because merging cannot remove a key.
+    const flagDiff = declaration.flags
+      ? diffFlags(this.declaredFlags, {
+          ...this.declaredFlags,
+          ...declaration.flags,
+        })
+      : undefined;
+    const configDiff = declaration.config
+      ? diffFlags(this.declaredConfig, {
+          ...this.declaredConfig,
+          ...declaration.config,
+        })
+      : undefined;
+
     if (declaration.flags) Object.assign(this.declaredFlags, declaration.flags);
     if (declaration.config)
       Object.assign(this.declaredConfig, declaration.config);
 
     if (!this.envEmitted) return;
 
-    const delta = buildEnvDelta(declaration.flags, declaration.config);
+    const changedFlagKeys = flagDiff ? Object.keys(flagDiff.changed) : [];
+    const changedConfigKeys = configDiff ? Object.keys(configDiff.changed) : [];
+    if (changedFlagKeys.length === 0 && changedConfigKeys.length === 0) return;
+
+    const delta = buildEnvDelta(
+      pickKeys(this.declaredFlags, changedFlagKeys),
+      pickKeys(this.declaredConfig, changedConfigKeys),
+    );
+
+    if (flagDiff && changedFlagKeys.length > 0) {
+      // `from`/`to` hold real flag values, and a flag value carries a secret exactly as easily
+      // as a flag key does — a rotated API key moves through here as a "change".
+      //
+      // Each side is redacted as `{ [flagKey]: value }` under `env.flags`, the same path and
+      // therefore the same key-aware policy the snapshot applies. Redacting the whole
+      // `changed` record in one pass would not do: a sensitive flag NAME would collapse the
+      // entire `{ from, to }` wrapper to the placeholder string, destroying the shape the
+      // field exists to carry.
+      const changes: Record<string, { from: unknown; to: unknown }> = {};
+      const metadata: Array<RedactionMetadata | undefined> = [
+        delta.redaction as RedactionMetadata | undefined,
+      ];
+      for (const key of changedFlagKeys) {
+        const change = flagDiff.changed[key];
+        const from = redactFlagSide(key, change.from);
+        const to = redactFlagSide(key, change.to);
+        metadata.push(from.metadata, to.metadata);
+        changes[key] = { from: from.value, to: to.value };
+      }
+      delta.flagChanges = changes as EnvSnapshot["flagChanges"];
+      const merged = mergeRedactionMetadata(...metadata);
+      if (merged) delta.redaction = dedupeRedactionFields(merged);
+    }
+
     this.bus.emit({
       t: now(),
       k: "env",
@@ -1307,21 +1402,89 @@ export class Crumbtrail {
     // final batch to a subscriber that drops every event in it. That batch is
     // the last flush-interval of the session: on a fast flow it holds the
     // failing click and its request, the exact evidence the session exists
-    // to keep.
+    // to keep. It is flushed ahead of the cleanup loop as well as ahead of the
+    // flag, so a collector that throws on teardown cannot take the session's
+    // last batch down with it.
     this.bus.flush();
-    this.stopped = true;
-    // Before the transport is asked to end the session: the recorder's last
-    // chunk is the interval a session that ended in a failure was failing in.
+    // Session replay is torn down first, and awaited. Two reasons it belongs
+    // here rather than after the flag:
+    //
+    // Its last chunk is the interval a session that ended in a failure was
+    // failing in, and it uploads through `transport.sendBlob` against a session
+    // the server still has open — so it has to land before `endSession()`
+    // finalizes the log below. Awaiting it inline is what makes that ordering
+    // real; `updateReplayState()` may only detach the same call because a
+    // config poll must not block on an upload.
+    //
+    // And it runs while the session is still live, on the same side of the flag
+    // as the collector loop. The recorder reaches the transport directly rather
+    // than through the bus, so nothing it does today is dropped by
+    // `canTransport()` — but a recorder that tears down before the flag cannot
+    // start depending on that, and this is the side that stays correct.
+    //
+    // Guarded like every other teardown in this sequence. `ReplayRecorder.stop()`
+    // is `async`, so a throw inside it arrives as the rejection `.catch()`
+    // already absorbs and the `try` is redundant today; it is here so that the
+    // rule holds by inspection rather than by everyone re-deriving that fact,
+    // because a `stop` that ever threw past that chain would strand the second
+    // flush, the flag, `abortFlightRecorder()` and `endSession()`.
     const replay = this.replay;
     this.replay = undefined;
-    await replay?.stop().catch(() => {});
-    if (this.widgetCleanup) this.widgetCleanup();
-    this.autoFlagCleanup?.();
-    this.stopConfigPolling();
-    this.abortFlightRecorder();
-    for (const cleanup of this.cleanups) {
-      cleanup();
+    try {
+      await replay?.stop().catch(() => {});
+    } catch {
+      // Shutdown continues, same as everywhere else in this sequence.
     }
+    // These three run BEFORE the collector loop and are teardown in exactly the
+    // same sense, so they answer to the same rule: a throw here must not strand
+    // everything below. `widgetCleanup` is DOM teardown against nodes the host
+    // page owns and may have moved or removed, which is the most plausible throw
+    // in the whole of stop(). Unguarded, it skipped the collector loop, both
+    // flushes and `abortFlightRecorder()`, leaving a pending flag() tail promise
+    // that never settles for the caller awaiting it.
+    for (const teardown of [
+      this.widgetCleanup,
+      this.autoFlagCleanup,
+      () => this.stopConfigPolling(),
+    ]) {
+      try {
+        teardown?.();
+      } catch {
+        // Same reasoning as the collector loop below: shutdown continues.
+      }
+    }
+    // Collector cleanup is not only teardown: the performance collector's
+    // finalizers emit the scores that are knowable nowhere else — `inp`,
+    // `cls.score`, `lcp.final` — from this loop. So the loop runs, and its
+    // emissions are flushed, while the session is still live. Setting
+    // `stopped` first would have handed those three straight to a subscriber
+    // that drops everything, and an app that calls stop() explicitly rather
+    // than letting the tab go hidden would lose its vitals entirely.
+    for (const cleanup of this.cleanups) {
+      try {
+        cleanup();
+      } catch {
+        // One collector failing to tear down must not take the rest of the
+        // shutdown with it. Everything after this loop is load bearing: the
+        // second flush ships the finalized vitals emitted above, and
+        // `abortFlightRecorder()` settles a pending flag() tail promise that
+        // would otherwise never resolve for the caller awaiting it. An
+        // unguarded loop made all of that hostage to any collector's teardown.
+      }
+    }
+    // Every cleanup has now run, so the list holds nothing but closures over
+    // collector state that the teardown just released. Dropped alongside the
+    // ring buffer and the state providers below, and dropped here so a second
+    // stop() cannot run any of them twice.
+    this.cleanups = [];
+    this.bus.flush();
+    this.stopped = true;
+    // Kept after the flag, where it has always been: with `stopped` set,
+    // canCapture() is false, so an armed recorder settles to "armed" rather
+    // than reopening as "buffering" on the way out. The session replay
+    // recorder is torn down at the top of stop() instead, for the opposite
+    // reason: see there.
+    this.abortFlightRecorder();
     this.stateProviders.clear();
     this.bus.stop();
     this.ringBuffer.clear();
@@ -1425,6 +1588,54 @@ function extractJsonCandidates(text: string): string[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Redact one side of a flag change under the flag's own key, so the key-aware `env.flags`
+ * policy sees the flag name exactly as it does in the snapshot. Returns `undefined` unchanged:
+ * an absent side means the key did not exist, which is not a value to redact.
+ */
+function redactFlagSide(
+  key: string,
+  side: NormalizedFlag | undefined,
+): { value: NormalizedFlag | undefined; metadata?: RedactionMetadata } {
+  if (side === undefined) return { value: undefined };
+  const result = redactValue({ [key]: side.value }, "env.flags");
+  const value: NormalizedFlag = { value: result.value[key] };
+  if (side.variant !== undefined) value.variant = side.variant;
+  return { value, ...(result.metadata ? { metadata: result.metadata } : {}) };
+}
+
+/**
+ * Collapse field entries that repeat because the same flag key was redacted on the delta's
+ * `flags` and on both sides of its change record. They describe one decision about one key,
+ * so reporting it three times would overstate what was found.
+ */
+function dedupeRedactionFields(metadata: RedactionMetadata): RedactionMetadata {
+  const seen = new Set<string>();
+  const fields = metadata.fields.filter((field) => {
+    const id = `${field.path}|${field.reason}|${field.action}`;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+  return { ...metadata, fields };
+}
+
+/**
+ * Narrow a declared-env record to the named keys. Used to scope a `setEnv` delta to what
+ * actually moved, so a re-declaration of twenty flags where one flipped ships one key.
+ */
+function pickKeys(
+  source: Record<string, unknown>,
+  keys: string[],
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(source, key))
+      out[key] = source[key];
+  }
+  return out;
 }
 
 function hasGlobalPrivacyControl(): boolean {

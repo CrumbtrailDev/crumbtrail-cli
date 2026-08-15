@@ -467,8 +467,12 @@ describe("Crumbtrail", () => {
     const sentEvents = mockTransport.sendBugReport.mock.calls[0][1];
     const envEvents = sentEvents.filter((e: any) => e.k === "env");
 
-    // initial snapshot + setEnv delta
-    expect(envEvents.map((e: any) => e.d.kind)).toEqual(["snapshot", "delta"]);
+    // initial snapshot + setEnv delta + the resolved flag snapshot `flagBug` emits at flag time
+    expect(envEvents.map((e: any) => e.d.kind)).toEqual([
+      "snapshot",
+      "delta",
+      "flag-snapshot",
+    ]);
     const delta = envEvents[1];
     expect(delta.d.flags.newCheckout).toBe(true);
     expect(delta.d.config.region).toBe("eu");

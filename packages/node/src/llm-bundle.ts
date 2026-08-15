@@ -4,11 +4,15 @@ import {
   BROWSER_REDACTION_POLICY_V2,
   CAPTURE_GAP_EVENT_KIND,
   DB_DIFF_EVENT_KIND,
+  normalizeFlagValue,
   redactInputValue,
   redactTokenLikeString,
   redactValue,
   type BugEvent,
   type DbEngine,
+  type EnvCampaign,
+  type EnvConnection,
+  type EnvDevice,
   type EnvSnapshot,
 } from "crumbtrail-core";
 import {
@@ -478,6 +482,40 @@ export interface LlmBundleAgentContext {
 }
 
 /**
+ * A flag value paired with the provider variant that produced it, when one is known.
+ *
+ * Mirrors `NormalizedFlag` in `packages/core/src/flags.ts`, which is deliberately not
+ * re-exported from `crumbtrail-core`'s entry point (see the note at `bug-logger.ts:68`), so
+ * this side of the wire reads the shape rather than importing it.
+ */
+export interface LlmBundleFlagValue {
+  value: unknown;
+  /** Provider variant key, present only when the app declared a string one. */
+  variant?: string;
+}
+
+/**
+ * One flag moving, stamped with the `k:'env'` event that reported the move.
+ *
+ * This is a sequence rather than a map keyed by flag name on purpose. A flag that flips on and
+ * back off inside one session is the single most diagnostic thing a flag can do, and a
+ * last-write-wins map reports it as "unchanged" — the two moves collapse onto each other and
+ * the artifact says nothing happened. Ordered entries keep both moves, in the order they
+ * happened, next to the offset an agent can line up against the error timeline.
+ */
+export interface LlmBundleFlagChange {
+  t: number;
+  iso?: string;
+  offsetMs?: number;
+  /** Flag name, as the app declared it. */
+  flag: string;
+  /** State before the move. Absent means the flag did not exist yet. */
+  from?: LlmBundleFlagValue;
+  /** State after the move. Absent means the flag was removed. */
+  to?: LlmBundleFlagValue;
+}
+
+/**
  * Merged, redaction-aware environment snapshot surfaced from the session's `k:'env'` events
  * (initial snapshot + any `setEnv` deltas). Device fields are best-effort; `flags`/`config`
  * were redacted in the browser before capture. `null` when no env was captured.
@@ -489,9 +527,79 @@ export interface LlmBundleEnvironment {
   viewport?: { w: number; h: number };
   locale?: string;
   timezone?: string;
+  /**
+   * Public client release identity declared by `<meta name="app-build">`, captured into the
+   * `k:'env'` snapshot. An agent reasoning about a regression needs to know which build it
+   * happened on, so this is carried through the whitelist rather than dropped.
+   */
+  appBuild?: string;
   flags?: Record<string, unknown>;
   config?: Record<string, unknown>;
+  /** `document.referrer` at session start. Redacted through the normal URL path. */
+  referrer?: string;
+  /** First-party `utm_*` acquisition labels. Only present when capture had `campaign` enabled. */
+  campaign?: EnvCampaign;
+  /** Display characteristics that change how a rendering defect reproduces. */
+  device?: EnvDevice;
+  /** Network Information API view of the connection at session start. */
+  connection?: EnvConnection;
+  /** `navigator.deviceMemory` in GiB, where the runtime exposes it. */
+  deviceMemory?: number;
+  /** `navigator.hardwareConcurrency`. */
+  hardwareConcurrency?: number;
+  /**
+   * Provider variant key per flag, for flags the app declared as `{ value, variant }` rather
+   * than a bare value. Merged last-write-wins alongside `flags`, so it names the variant in
+   * force at the end of the session.
+   *
+   * `flags` carries the declaration verbatim, which means a wrapped flag lands there as an
+   * opaque object indistinguishable from a flag whose value simply is an object. An agent
+   * asking "which arm of the experiment was this user in" needs the answer named, not encoded.
+   */
+  flagVariants?: Record<string, string>;
+  /**
+   * Every flag move the session reported, oldest first. Empty-to-absent: the key is omitted
+   * when no `k:'env'` event carried a change. Values are redacted the same way `flags` is.
+   */
+  flagChanges?: LlmBundleFlagChange[];
 }
+
+/**
+ * `EnvSnapshot` keys the bundle deliberately does not surface as its own environment field.
+ *
+ * - `kind` discriminates snapshot/delta/flag-snapshot at the wire level. The bundle merges those
+ *   events into one environment, so the discriminator has no meaning after the merge.
+ * - `redaction` is browser-side redaction bookkeeping, not evidence about the app.
+ * - `flags` and `config` ARE carried, and are named here only because they are populated by the
+ *   merge loop below rather than by the `removeUndefined` block. Listing them keeps the exclusion
+ *   set readable: nothing in it is a silent drop.
+ */
+type EnvSnapshotDeliberatelyExcluded =
+  | "kind"
+  | "redaction"
+  | "flags"
+  | "config";
+
+/** Any `EnvSnapshot` field that is neither carried into the bundle nor explicitly excluded. */
+type UncarriedEnvSnapshotKey = Exclude<
+  keyof EnvSnapshot,
+  keyof LlmBundleEnvironment | EnvSnapshotDeliberatelyExcluded
+>;
+
+/**
+ * Fail-loud guard on the environment whitelist.
+ *
+ * `buildEnvironment` is an explicit whitelist, so a field added to `EnvSnapshot` and captured on
+ * the wire is silently discarded at bundle time unless someone remembers to widen the whitelist
+ * too. That failure looks like a capture bug and gets debugged as one. This sentinel turns it into
+ * a compile error instead: the moment an `EnvSnapshot` key is neither a key of
+ * `LlmBundleEnvironment` nor named in `EnvSnapshotDeliberatelyExcluded`, `UncarriedEnvSnapshotKey`
+ * stops being `never` and the annotation below resolves to `never`, which `true` cannot satisfy.
+ */
+const _envWhitelistIsExhaustive: UncarriedEnvSnapshotKey extends never
+  ? true
+  : never = true;
+void _envWhitelistIsExhaustive;
 
 /**
  * Redaction-aware summary of one `k:'db.diff'` event (a row that changed during a request),
@@ -657,6 +765,128 @@ export interface LlmBundleDbActivity {
   upgradeHint: string;
 }
 
+/**
+ * The five Core Web Vitals the cloud reads, and nothing else.
+ *
+ * This vocabulary is a cross-repo contract: the cloud's normalizer accepts
+ * exactly these keys and silently drops anything outside the set, so an extra
+ * key here is not an error the reader ever sees, it is data thrown away.
+ */
+export type LlmBundleVitalName = "lcp" | "cls" | "inp" | "ttfb" | "fcp";
+
+/** Core Web Vitals rating bands, as the specification names them. */
+export type LlmBundleVitalRating = "good" | "needs_improvement" | "poor";
+
+export interface LlmBundleVital {
+  value: number;
+  /**
+   * Optional in the contract. Present here for all five metrics because all
+   * five have published thresholds; a metric without a defensible threshold
+   * would omit this rather than invent one.
+   */
+  rating?: LlmBundleVitalRating;
+}
+
+/**
+ * Finalized web vitals for the session.
+ *
+ * Partial by design. A metric whose finalized score event never arrived is
+ * OMITTED, never null and never zero: a page that produced no layout shift and
+ * a page whose score was never reported are different facts, and a zero would
+ * report the second as the first.
+ */
+export type LlmBundleVitals = Partial<
+  Record<LlmBundleVitalName, LlmBundleVital>
+>;
+
+/**
+ * Which `k:'perf'` metric name carries each canonical vital.
+ *
+ * The collector emits both a stream of raw per-entry candidates (`lcp`,
+ * `cls`) and a single finalized score (`lcp.final`, `cls.score`). Only the
+ * finalized events are aggregated. The raw `lcp` stream is a series of
+ * ever-larger guesses, so its last member is whichever candidate happened to
+ * arrive last rather than the one the collector froze as the answer; reading it
+ * would produce a plausible number that is quietly wrong. The raw stream stays
+ * in `events.ndjson` for a reader chasing a jumpy page.
+ */
+const VITAL_SOURCE_METRICS: Record<string, LlmBundleVitalName> = {
+  "lcp.final": "lcp",
+  "cls.score": "cls",
+  inp: "inp",
+  ttfb: "ttfb",
+  fcp: "fcp",
+};
+
+/**
+ * Core Web Vitals thresholds, in one table rather than at call sites.
+ *
+ * `good` is the upper bound of the good band inclusive; anything above `poor`
+ * is poor, and the span between them is `needs_improvement`. Times are
+ * milliseconds; CLS is unitless.
+ */
+const VITAL_THRESHOLDS: Record<
+  LlmBundleVitalName,
+  { good: number; poor: number }
+> = {
+  lcp: { good: 2500, poor: 4000 },
+  cls: { good: 0.1, poor: 0.25 },
+  inp: { good: 200, poor: 500 },
+  ttfb: { good: 800, poor: 1800 },
+  fcp: { good: 1800, poor: 3000 },
+};
+
+function rateVital(
+  name: LlmBundleVitalName,
+  value: number,
+): LlmBundleVitalRating {
+  const { good, poor } = VITAL_THRESHOLDS[name];
+  if (value <= good) return "good";
+  if (value > poor) return "poor";
+  return "needs_improvement";
+}
+
+/**
+ * Projects the session's finalized `k:'perf'` score events onto the canonical
+ * five vitals the cloud reads.
+ *
+ * Returns `undefined` — not an empty object — when no score event was captured,
+ * so the `vitals` key is omitted entirely rather than present and empty. A
+ * session ended in a way that discards the final batch simply reports fewer
+ * metrics; every metric is independent and an absent one costs nothing.
+ */
+export function summarizeVitals(
+  events: BugEvent[],
+): LlmBundleVitals | undefined {
+  const vitals: LlmBundleVitals = {};
+  let found = false;
+
+  for (const event of events) {
+    if (event.k !== "perf") continue;
+    const d = isRecord(event.d) ? event.d : undefined;
+    if (!d) continue;
+    const metric = typeof d.metric === "string" ? d.metric : undefined;
+    if (metric === undefined) continue;
+    const name = Object.prototype.hasOwnProperty.call(
+      VITAL_SOURCE_METRICS,
+      metric,
+    )
+      ? VITAL_SOURCE_METRICS[metric]
+      : undefined;
+    if (name === undefined) continue;
+    const value = finiteNumber(d.value);
+    if (value === undefined) continue;
+
+    // Last finalized reading wins. Each score is emitted once per session, so
+    // this only matters for a replayed or merged stream, where the later
+    // reading is the more complete one.
+    vitals[name] = { value, rating: rateVital(name, value) };
+    found = true;
+  }
+
+  return found ? vitals : undefined;
+}
+
 export interface LlmBundle {
   schemaVersion: 1;
   kind: "crumbtrail.agent-session-bundle";
@@ -713,6 +943,14 @@ export interface LlmBundle {
   detectorPrevalence?: LlmBundleDetectorPrevalence;
   /** Redaction-aware environment snapshot for the session, or `null` when none was captured. */
   environment: LlmBundleEnvironment | null;
+  /**
+   * Finalized Core Web Vitals for the session, keyed by {@link LlmBundleVitalName}.
+   *
+   * OMITTED entirely when the session captured no finalized score event, and
+   * individual metrics are omitted the same way. Additive: nothing in the
+   * bundle is ordered, scored or gated by it.
+   */
+  vitals?: LlmBundleVitals;
   /**
    * Root → symptom causal tree projected from detector signals' CP3 causal fields. Additive
    * and optional: absent when no candidate carries `causalRole: 'root'` with attributed symptoms.
@@ -1123,6 +1361,7 @@ export function buildLlmBundle({
     distinctBugs,
     prevalence,
   );
+  const vitals = summarizeVitals(events);
 
   return {
     schemaVersion: 1,
@@ -1147,7 +1386,8 @@ export function buildLlmBundle({
     fullStackEvidence,
     distinctBugs,
     ...(detectorPrevalence !== undefined ? { detectorPrevalence } : {}),
-    environment: buildEnvironment(events),
+    environment: buildEnvironment(events, session.startMs),
+    ...(vitals !== undefined ? { vitals } : {}),
     ...(causalTree.length > 0 ? { causalTree } : {}),
     outboundCalls: buildOutboundCalls(events, session.startMs),
     databaseDiffs: buildDatabaseDiffs(events, session.startMs),
@@ -2182,7 +2422,92 @@ function buildStorageChanges(
   return changes.sort((a, b) => a.t - b.t).slice(0, MAX_STORAGE_CHANGES);
 }
 
-function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
+const MAX_FLAG_CHANGES = 200;
+
+/**
+ * What counts as the provider wrapper shape `{ value, variant? }`, rather than a flag value that
+ * merely happens to be an object, is decided by `normalizeFlagValue` in `crumbtrail-core` — the
+ * same function the browser SDK normalizes with before the event is ever written.
+ *
+ * A second copy of the rule lived here and had already drifted: it accepted a non-string
+ * `variant` where core rejects it, so for `{ value: "a", variant: 42 }` the two modules
+ * disagreed about what the flag's value even was. Any non-core producer of `d.flags` reaches
+ * this path — the OTLP ingest and the four mobile SDKs among them.
+ */
+
+/** The variant a declared flag value names, or `undefined` when it names none. */
+function flagVariantOf(value: unknown): string | undefined {
+  const variant = normalizeFlagValue(value).variant;
+  return variant === undefined ? undefined : safeText(variant, 120);
+}
+
+/**
+ * Read one side of a wire `flagChanges` entry into a bundle flag value.
+ *
+ * `undefined` in, `undefined` out: an absent side means the flag did not exist on that side,
+ * which is information, not a value to redact. The value is re-redacted under
+ * `environment.flags` keyed by the flag's own name, so the key-aware policy sees the flag name
+ * exactly as it does in the merged `flags` record — defense in depth over the browser-side
+ * redaction that already ran.
+ */
+function readFlagSide(
+  flag: string,
+  side: unknown,
+): LlmBundleFlagValue | undefined {
+  if (side === undefined || side === null) return undefined;
+  // Core emits `{ value, variant? }`; a raw or hand-written event may carry a bare value.
+  // `normalizeFlagValue` folds both, by the same rule core applied at capture.
+  const raw = normalizeFlagValue(side).value;
+  const variant = flagVariantOf(side);
+  const redacted = redactValue({ [flag]: raw }, "environment.flags").value as
+    | Record<string, unknown>
+    | undefined;
+  const out: LlmBundleFlagValue = { value: redacted?.[flag] };
+  if (variant !== undefined) out.variant = variant;
+  return out;
+}
+
+/**
+ * Flatten the session's `k:'env'` events into one ordered flag-change history.
+ *
+ * Every change on an event shares that event's timestamp, and events are visited in the order
+ * the session recorded them, so the sort is stable within an event and chronological across
+ * them.
+ */
+function buildFlagChanges(
+  envEvents: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleFlagChange[] {
+  const changes: LlmBundleFlagChange[] = [];
+  for (const event of envEvents) {
+    const d = event.d as Partial<EnvSnapshot>;
+    if (!isRecord(d.flagChanges)) continue;
+    for (const flag of Object.keys(d.flagChanges)) {
+      const change = d.flagChanges[flag];
+      if (!isRecord(change)) continue;
+      changes.push(
+        removeUndefined({
+          t: event.t,
+          iso: iso(event.t),
+          offsetMs:
+            finiteNumber(event.offsetMs) ??
+            offsetFromStart(event.t, sessionStartMs),
+          flag,
+          from: readFlagSide(flag, change.from),
+          to: readFlagSide(flag, change.to),
+        }) as LlmBundleFlagChange,
+      );
+    }
+  }
+  return changes
+    .sort((a, b) => a.t - b.t)
+    .slice(0, MAX_FLAG_CHANGES);
+}
+
+function buildEnvironment(
+  events: BugEvent[],
+  sessionStartMs: number,
+): LlmBundleEnvironment | null {
   const envEvents = events.filter((event) => event.k === "env");
   if (envEvents.length === 0) return null;
 
@@ -2200,11 +2525,24 @@ function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
     viewport: sanitizeViewport(base.viewport),
     locale: safeText(base.locale, 60),
     timezone: safeText(base.timezone, 80),
+    // Capture already bounds this to 120 token-safe characters; bound it again here so a raw
+    // event that bypassed the collector cannot widen the field.
+    appBuild: safeText(base.appBuild, 120),
+    // `document.referrer` is a URL, so it goes through the URL redaction path (query values
+    // stripped, hash dropped) rather than plain text redaction.
+    referrer: safeUrl(base.referrer, "environment.referrer"),
+    campaign: sanitizeCampaign(base.campaign),
+    device: sanitizeDevice(base.device),
+    connection: sanitizeConnection(base.connection),
+    deviceMemory: finiteNumber(base.deviceMemory),
+    hardwareConcurrency: finiteNumber(base.hardwareConcurrency),
   });
 
-  // Merge flags/config across the snapshot and every delta, preserving last-write-wins order.
+  // Merge flags/config across the snapshot and every delta, last-write-wins. Flag CHANGES are
+  // deliberately not merged this way — see `buildFlagChanges`, which keeps them ordered.
   const flags: Record<string, unknown> = {};
   const config: Record<string, unknown> = {};
+  const flagVariants: Record<string, string> = {};
   let hasFlags = false;
   let hasConfig = false;
   for (const event of envEvents) {
@@ -2212,10 +2550,24 @@ function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
     if (isRecord(d.flags)) {
       Object.assign(flags, d.flags);
       hasFlags = true;
+      for (const flag of Object.keys(d.flags)) {
+        const variant = flagVariantOf(d.flags[flag]);
+        if (variant !== undefined) flagVariants[flag] = variant;
+      }
     }
     if (isRecord(d.config)) {
       Object.assign(config, d.config);
       hasConfig = true;
+    }
+    // A change record names the variant in force after the move even when the app never
+    // re-declared the flag itself, so it is a second source for the same question.
+    if (isRecord(d.flagChanges)) {
+      for (const flag of Object.keys(d.flagChanges)) {
+        const change = d.flagChanges[flag];
+        if (!isRecord(change)) continue;
+        const variant = flagVariantOf(change.to);
+        if (variant !== undefined) flagVariants[flag] = variant;
+      }
     }
   }
   // Defense-in-depth: flags/config are redacted in the browser, but re-run the redaction path
@@ -2225,8 +2577,48 @@ function buildEnvironment(events: BugEvent[]): LlmBundleEnvironment | null {
     environment.flags = redactValue(flags, "environment.flags").value;
   if (hasConfig)
     environment.config = redactValue(config, "environment.config").value;
+  if (Object.keys(flagVariants).length > 0)
+    environment.flagVariants = flagVariants;
+
+  const flagChanges = buildFlagChanges(envEvents, sessionStartMs);
+  if (flagChanges.length > 0) environment.flagChanges = flagChanges;
 
   return environment;
+}
+
+/** First-party `utm_*` labels only. Cross-site click ids are never captured upstream. */
+function sanitizeCampaign(value: unknown): EnvCampaign | undefined {
+  if (!isRecord(value)) return undefined;
+  const campaign = removeUndefined({
+    source: safeText(value.source, 120),
+    medium: safeText(value.medium, 120),
+    campaign: safeText(value.campaign, 120),
+    term: safeText(value.term, 120),
+    content: safeText(value.content, 120),
+  }) as EnvCampaign;
+  return Object.keys(campaign).length > 0 ? campaign : undefined;
+}
+
+function sanitizeDevice(value: unknown): EnvDevice | undefined {
+  if (!isRecord(value)) return undefined;
+  const device = removeUndefined({
+    dpr: finiteNumber(value.dpr),
+    // The screen is the same `{ w, h }` shape as the viewport and gets the same treatment.
+    screen: sanitizeViewport(value.screen),
+    orientation: safeText(value.orientation, 40),
+  }) as EnvDevice;
+  return Object.keys(device).length > 0 ? device : undefined;
+}
+
+function sanitizeConnection(value: unknown): EnvConnection | undefined {
+  if (!isRecord(value)) return undefined;
+  const connection = removeUndefined({
+    effectiveType: safeText(value.effectiveType, 20),
+    downlink: finiteNumber(value.downlink),
+    rtt: finiteNumber(value.rtt),
+    saveData: typeof value.saveData === "boolean" ? value.saveData : undefined,
+  }) as EnvConnection;
+  return Object.keys(connection).length > 0 ? connection : undefined;
 }
 
 /**
@@ -4786,6 +5178,36 @@ function renderEnvironmentSection(
     );
   if (environment.locale) lines.push(`- Locale: ${environment.locale}`);
   if (environment.timezone) lines.push(`- Timezone: ${environment.timezone}`);
+  if (environment.appBuild)
+    lines.push(`- Release build: ${environment.appBuild}`);
+  if (environment.referrer) lines.push(`- Referrer: ${environment.referrer}`);
+  if (environment.campaign)
+    lines.push(
+      `- Campaign: ${Object.entries(environment.campaign)
+        .map(([key, value]) => `${key}=${value}`)
+        .join(", ")}`,
+    );
+  if (environment.device) {
+    const { dpr, screen, orientation } = environment.device;
+    const parts: string[] = [];
+    if (screen) parts.push(`${screen.w}x${screen.h}`);
+    if (dpr !== undefined) parts.push(`dpr ${dpr}`);
+    if (orientation) parts.push(orientation);
+    if (parts.length > 0) lines.push(`- Device: ${parts.join(", ")}`);
+  }
+  if (environment.connection) {
+    const { effectiveType, downlink, rtt, saveData } = environment.connection;
+    const parts: string[] = [];
+    if (effectiveType) parts.push(effectiveType);
+    if (downlink !== undefined) parts.push(`${downlink} Mbps`);
+    if (rtt !== undefined) parts.push(`${rtt} ms rtt`);
+    if (saveData !== undefined) parts.push(`saveData ${saveData}`);
+    if (parts.length > 0) lines.push(`- Connection: ${parts.join(", ")}`);
+  }
+  if (environment.deviceMemory !== undefined)
+    lines.push(`- Device memory: ${environment.deviceMemory} GB`);
+  if (environment.hardwareConcurrency !== undefined)
+    lines.push(`- CPU cores: ${environment.hardwareConcurrency}`);
   if (environment.flags)
     lines.push(
       `- Feature flags: ${Object.keys(environment.flags).sort().join(", ") || "none"} (values redacted in browser before capture)`,
@@ -4794,8 +5216,51 @@ function renderEnvironmentSection(
     lines.push(
       `- Config keys: ${Object.keys(environment.config).sort().join(", ") || "none"} (values redacted in browser before capture)`,
     );
+  if (environment.flagVariants)
+    lines.push(
+      `- Flag variants: ${Object.entries(environment.flagVariants)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([flag, variant]) => `${flag}=${variant}`)
+        .join(", ")}`,
+    );
+  if (environment.flagChanges && environment.flagChanges.length > 0) {
+    // One line per move, in order. A summary line naming the changed flags would re-lose the
+    // on-then-off case the ordered history exists to keep.
+    lines.push(
+      "- Flags changed during session (values redacted in browser before capture):",
+    );
+    for (const change of environment.flagChanges) {
+      lines.push(
+        `  - ${formatFlagChangeTime(change)} ${change.flag}: ${formatFlagSide(change.from)} -> ${formatFlagSide(change.to)}`,
+      );
+    }
+  }
   lines.push("");
   return lines;
+}
+
+/** `+1240ms` when the session start is known, otherwise the event's ISO stamp or raw epoch. */
+function formatFlagChangeTime(change: LlmBundleFlagChange): string {
+  if (change.offsetMs !== undefined) return `+${change.offsetMs}ms`;
+  return change.iso ?? String(change.t);
+}
+
+/**
+ * One side of a flag move as a short literal. `absent` rather than an empty string, because
+ * "the flag did not exist" and "the flag was the empty string" are different findings.
+ */
+function formatFlagSide(side: LlmBundleFlagValue | undefined): string {
+  if (side === undefined) return "absent";
+  let rendered: string;
+  try {
+    rendered = JSON.stringify(side.value) ?? String(side.value);
+  } catch {
+    rendered = String(side.value);
+  }
+  if (rendered.length > 120) rendered = `${rendered.slice(0, 117)}...`;
+  return side.variant === undefined
+    ? rendered
+    : `${rendered} (variant ${side.variant})`;
 }
 
 /** `insertReview server/src/repos/reviews-repo.js:5 < handler server/src/routes/reviews.js:41` */

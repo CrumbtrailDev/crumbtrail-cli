@@ -1,4 +1,10 @@
 export { Crumbtrail, PROBE_RESULT_EVENT_KIND } from "./bug-logger";
+// Exported for `crumbtrail-node`, which reads the same provider flag shapes out
+// of captured `env` events. One rule for what counts as a `{ value, variant }`
+// wrapper, in one place: a second copy had already diverged on non-string
+// variants, so the two packages disagreed about a flag's value.
+export { normalizeFlagValue } from "./flags";
+export type { NormalizedFlag } from "./flags";
 export { EventBus } from "./event-bus";
 export { RingBuffer } from "./ring-buffer";
 export { HttpTransport, EventDeliveryError } from "./transports/http";
@@ -63,7 +69,10 @@ export type {
   DbStatementEventData,
   DbStatementOp,
   CaptureGapEventData,
+  EnvCampaign,
+  EnvConnection,
   EnvDeclaration,
+  EnvDevice,
   EnvSnapshot,
   FlagBugOptions,
   InteractionElementDescriptor,

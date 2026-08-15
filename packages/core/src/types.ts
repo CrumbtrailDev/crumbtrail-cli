@@ -428,13 +428,47 @@ export interface EnvDeclaration {
 }
 
 /**
+ * First-party acquisition labels lifted from `utm_*` query parameters. Cross-site advertising
+ * click identifiers (`gclid`, `fbclid`, `msclkid`, `ttclid`) are deliberately never captured.
+ * Gated behind {@link CrumbtrailConfig.campaign}, which defaults to `false`.
+ */
+export interface EnvCampaign {
+  source?: string;
+  medium?: string;
+  campaign?: string;
+  term?: string;
+  content?: string;
+}
+
+/** Display characteristics that change how a rendering defect reproduces. */
+export interface EnvDevice {
+  /** `devicePixelRatio`. */
+  dpr?: number;
+  /** Screen size in CSS pixels, distinct from the viewport. */
+  screen?: { w: number; h: number };
+  /** Screen orientation type, e.g. `portrait-primary`. */
+  orientation?: string;
+}
+
+/** Network Information API view of the connection, when the runtime exposes it. */
+export interface EnvConnection {
+  effectiveType?: string;
+  downlink?: number;
+  rtt?: number;
+  saveData?: boolean;
+}
+
+/**
  * Redaction-aware environment snapshot captured once at session start (the `d` payload of a
  * `k:'env'` event with `kind:'snapshot'`). Browser/device fields are best-effort and guarded
  * for non-browser/SSR runtimes; `locale`/`timezone` are available in Node via `Intl`.
  */
 export interface EnvSnapshot {
-  /** Discriminates the initial full snapshot from later `setEnv` deltas. */
-  kind: "snapshot" | "delta";
+  /**
+   * Discriminates the initial full snapshot, a later `setEnv` delta, and a flag-state snapshot
+   * emitted at flag or error time.
+   */
+  kind: "snapshot" | "delta" | "flag-snapshot";
   userAgent?: string;
   browser?: { name: string; version?: string };
   os?: string;
@@ -447,6 +481,18 @@ export interface EnvSnapshot {
   flags?: Record<string, unknown>;
   /** Redacted runtime config declared via `setEnv`. */
   config?: Record<string, unknown>;
+  /** `document.referrer` at session start, redaction applied. */
+  referrer?: string;
+  /** First-party `utm_*` campaign labels. Only present when `campaign` is enabled. */
+  campaign?: EnvCampaign;
+  device?: EnvDevice;
+  connection?: EnvConnection;
+  /** `navigator.deviceMemory` in GiB, where exposed. */
+  deviceMemory?: number;
+  /** `navigator.hardwareConcurrency`. */
+  hardwareConcurrency?: number;
+  /** Flags that changed since the previous snapshot, keyed by flag name. */
+  flagChanges?: Record<string, { from: unknown; to: unknown }>;
   /** Browser redaction metadata for any redacted flag/config values. */
   redaction?: unknown;
 }
@@ -634,6 +680,13 @@ export interface CrumbtrailConfig {
   // Environment snapshot
   environment: boolean;
 
+  /**
+   * Capture first-party `utm_*` campaign labels into the environment snapshot. A sub-behaviour
+   * of the `environment` collector, not a collector of its own. Defaults to `false`: enabling it
+   * by default is a privacy commitment that needs founder sign off.
+   */
+  campaign: boolean;
+
   // Widget
   widget: boolean;
 
@@ -797,6 +850,8 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   workers: true,
 
   environment: true,
+
+  campaign: false,
 
   widget: false,
 
