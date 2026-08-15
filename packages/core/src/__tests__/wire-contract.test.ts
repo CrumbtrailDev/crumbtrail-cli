@@ -24,6 +24,7 @@ import {
   FIXTURE_TIMESTAMP,
   canonicalJson,
   encodeWireEvent,
+  eventFixtureCanonical,
   listEventFixtureNames,
   readEventFixture,
   readEventFixtureText,
@@ -229,5 +230,194 @@ describe("event envelope invariants", () => {
     });
     expect(owned.sessionId).toBe("ses_20260812_090000_0123456789ab");
     expect(owned.offsetMs).toBe(1200);
+  });
+});
+
+/**
+ * Per kind conformance: one `BugEvent` built in `crumbtrail-core`, compared to
+ * the fixture the Swift, Kotlin and Dart suites compare against.
+ *
+ * The shape of this block is deliberately the same as `WireContractTest.kt` and
+ * `wire_contract_test.dart`: a single event builder that stamps the fixed
+ * envelope, a table of one payload per fixture, and one assertion per entry
+ * whose failure message names the fixture path. Substituting the SDK identity
+ * is the same move those suites make — they construct with
+ * `crumbtrail-fixture / 0.0.0-fixture` rather than their real name and version,
+ * so everything else can be asserted verbatim.
+ *
+ * `schemaVersion` and `platform` are set explicitly on every event rather than
+ * defaulted by the encoder. That is the contract `toWireEnvelope` documents: an
+ * absent value is passed through absent, because a browser event must not start
+ * claiming a platform its emitter never asserted. The fixtures all carry both
+ * fields, so the events built here carry them too.
+ */
+describe("per kind fixture conformance", () => {
+  interface FixtureCase {
+    /** The `k` short code the fixture carries, which is not always its file name. */
+    kind: string;
+    data: Record<string, unknown>;
+    target?: TargetDescriptor;
+  }
+
+  const fixtureEvent = ({ kind, data, target }: FixtureCase): BugEvent => ({
+    t: FIXTURE_TIMESTAMP,
+    k: kind,
+    d: data,
+    schemaVersion: 1,
+    platform: "ios",
+    sdk: FIXTURE_SDK,
+    capabilities: FIXTURE_CAPABILITIES,
+    ...(target ? { target } : {}),
+  });
+
+  /**
+   * One entry per file in `test-fixtures/wire-contract/events/`, keyed by file
+   * name. The coverage assertion below compares these keys against the
+   * directory listing, so a fixture added without an entry here fails rather
+   * than leaving the reference implementation quietly exempt from the new kind.
+   */
+  const CASES: Record<string, FixtureCase> = {
+    "app-lifecycle": {
+      kind: "app-lifecycle",
+      data: { state: "background", source: "app-lifecycle" },
+    },
+    con: {
+      kind: "con",
+      data: { lv: "err", args: ["checkout failed", '{"orderId":42}'] },
+    },
+    env: {
+      kind: "env",
+      data: {
+        kind: "snapshot",
+        device: {
+          model: "iPhone15,2",
+          manufacturer: "Apple",
+          os: "iOS",
+          osVersion: "18.2",
+        },
+        app: { id: "ai.crumbtrail.demo", version: "1.4.0", build: "204" },
+        battery: { level: 0.42, charging: false },
+        locale: "en-GB",
+      },
+    },
+    err: {
+      kind: "err",
+      data: {
+        msg: "Unexpected nil while unwrapping an Optional value",
+        stk:
+          "CrumbtrailDemo.CheckoutViewController.submit()\n" +
+          "CrumbtrailDemo.CheckoutViewController.tap()",
+        fatal: true,
+        source: "uncaught-exception",
+      },
+    },
+    "native-crash": {
+      kind: "native-crash",
+      data: {
+        msg: "Fatal error: index out of range",
+        stk: "CrumbtrailDemo.CartView.item(at:)",
+        signal: "SIGABRT",
+        source: "previous-launch",
+      },
+    },
+    "nav-intent": {
+      kind: "nav-intent",
+      data: { action: "back", source: "hardware-back" },
+    },
+    navigation: {
+      kind: "navigation",
+      data: {
+        name: "CheckoutViewController",
+        path: "/checkout",
+        source: "navigation-controller",
+      },
+    },
+    "net-status": {
+      kind: "net-status",
+      data: { connected: false, type: "none", kind: "change" },
+    },
+    net: {
+      kind: "net",
+      data: {
+        url: "https://api.example.com/v1/orders",
+        method: "POST",
+        status: 402,
+        ok: false,
+        dur: 318,
+        source: "urlsession",
+      },
+    },
+    rej: {
+      kind: "rej",
+      data: {
+        msg: "The request timed out.",
+        stk: "CrumbtrailDemo.OrderService.load()",
+        source: "unhandled-async",
+      },
+    },
+    // Named for what it exercises rather than for its kind: the payload is an
+    // ordinary `err`, and the fixture exists for the target descriptor on it.
+    target: {
+      kind: "err",
+      data: { msg: "tap handler threw", fatal: false, source: "caught" },
+      target: {
+        role: "button",
+        label: "Pay now",
+        testID: "checkout-pay",
+        componentName: "CheckoutButton",
+        routePath: "/checkout",
+        bounds: { x: 16, y: 720, width: 361, height: 48 },
+      },
+    },
+    "view-snapshot": {
+      kind: "view-snapshot",
+      data: {
+        w: 393,
+        h: 852,
+        nodes: [
+          {
+            role: "screen",
+            componentName: "CheckoutViewController",
+            bounds: { x: 0, y: 0, width: 393, height: 852 },
+          },
+          {
+            role: "button",
+            label: "Pay now",
+            testID: "checkout-pay",
+            bounds: { x: 16, y: 720, width: 361, height: 48 },
+          },
+        ],
+      },
+    },
+  };
+
+  it.each(Object.keys(CASES).sort())("matches events/%s.json", (name) => {
+    const event = fixtureEvent(CASES[name] as FixtureCase);
+    const expected = eventFixtureCanonical(name);
+    const where = `test-fixtures/wire-contract/events/${name}.json`;
+
+    // First against the `BugEvent` itself, with no encoder in between. Core's
+    // transport sends the event object as it stands (`transports/http.ts:72`),
+    // so this is the assertion that holds the reference implementation to the
+    // fixture rather than holding a test-local encoder to it. It also proves
+    // the envelope's two omission rules are inert across the whole corpus:
+    // every fixture carries capabilities, and the one target present names an
+    // element.
+    expect(
+      canonicalJson(event),
+      `core event does not match ${where}`,
+    ).toBe(expected);
+
+    // Then through the shared encoder the other suites' writers mirror, so a
+    // future omission rule that changed one of these fixtures fails here too.
+    expect(encodeWireEvent(event), `wire form does not match ${where}`).toBe(
+      expected,
+    );
+  });
+
+  it("asserts every fixture on disk, and no fixture that is not", () => {
+    // EVENT_FIXTURE_COUNT catches a fixture being added. This catches one being
+    // renamed, which keeps the count identical while leaving a kind unasserted.
+    expect(Object.keys(CASES).sort()).toEqual(listEventFixtureNames());
   });
 });
