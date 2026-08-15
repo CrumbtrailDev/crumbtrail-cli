@@ -764,6 +764,128 @@ export interface LlmBundleDbActivity {
   upgradeHint: string;
 }
 
+/**
+ * The five Core Web Vitals the cloud reads, and nothing else.
+ *
+ * This vocabulary is a cross-repo contract: the cloud's normalizer accepts
+ * exactly these keys and silently drops anything outside the set, so an extra
+ * key here is not an error the reader ever sees, it is data thrown away.
+ */
+export type LlmBundleVitalName = "lcp" | "cls" | "inp" | "ttfb" | "fcp";
+
+/** Core Web Vitals rating bands, as the specification names them. */
+export type LlmBundleVitalRating = "good" | "needs_improvement" | "poor";
+
+export interface LlmBundleVital {
+  value: number;
+  /**
+   * Optional in the contract. Present here for all five metrics because all
+   * five have published thresholds; a metric without a defensible threshold
+   * would omit this rather than invent one.
+   */
+  rating?: LlmBundleVitalRating;
+}
+
+/**
+ * Finalized web vitals for the session.
+ *
+ * Partial by design. A metric whose finalized score event never arrived is
+ * OMITTED, never null and never zero: a page that produced no layout shift and
+ * a page whose score was never reported are different facts, and a zero would
+ * report the second as the first.
+ */
+export type LlmBundleVitals = Partial<
+  Record<LlmBundleVitalName, LlmBundleVital>
+>;
+
+/**
+ * Which `k:'perf'` metric name carries each canonical vital.
+ *
+ * The collector emits both a stream of raw per-entry candidates (`lcp`,
+ * `cls`) and a single finalized score (`lcp.final`, `cls.score`). Only the
+ * finalized events are aggregated. The raw `lcp` stream is a series of
+ * ever-larger guesses, so its last member is whichever candidate happened to
+ * arrive last rather than the one the collector froze as the answer; reading it
+ * would produce a plausible number that is quietly wrong. The raw stream stays
+ * in `events.ndjson` for a reader chasing a jumpy page.
+ */
+const VITAL_SOURCE_METRICS: Record<string, LlmBundleVitalName> = {
+  "lcp.final": "lcp",
+  "cls.score": "cls",
+  inp: "inp",
+  ttfb: "ttfb",
+  fcp: "fcp",
+};
+
+/**
+ * Core Web Vitals thresholds, in one table rather than at call sites.
+ *
+ * `good` is the upper bound of the good band inclusive; anything above `poor`
+ * is poor, and the span between them is `needs_improvement`. Times are
+ * milliseconds; CLS is unitless.
+ */
+const VITAL_THRESHOLDS: Record<
+  LlmBundleVitalName,
+  { good: number; poor: number }
+> = {
+  lcp: { good: 2500, poor: 4000 },
+  cls: { good: 0.1, poor: 0.25 },
+  inp: { good: 200, poor: 500 },
+  ttfb: { good: 800, poor: 1800 },
+  fcp: { good: 1800, poor: 3000 },
+};
+
+function rateVital(
+  name: LlmBundleVitalName,
+  value: number,
+): LlmBundleVitalRating {
+  const { good, poor } = VITAL_THRESHOLDS[name];
+  if (value <= good) return "good";
+  if (value > poor) return "poor";
+  return "needs_improvement";
+}
+
+/**
+ * Projects the session's finalized `k:'perf'` score events onto the canonical
+ * five vitals the cloud reads.
+ *
+ * Returns `undefined` — not an empty object — when no score event was captured,
+ * so the `vitals` key is omitted entirely rather than present and empty. A
+ * session ended in a way that discards the final batch simply reports fewer
+ * metrics; every metric is independent and an absent one costs nothing.
+ */
+export function summarizeVitals(
+  events: BugEvent[],
+): LlmBundleVitals | undefined {
+  const vitals: LlmBundleVitals = {};
+  let found = false;
+
+  for (const event of events) {
+    if (event.k !== "perf") continue;
+    const d = isRecord(event.d) ? event.d : undefined;
+    if (!d) continue;
+    const metric = typeof d.metric === "string" ? d.metric : undefined;
+    if (metric === undefined) continue;
+    const name = Object.prototype.hasOwnProperty.call(
+      VITAL_SOURCE_METRICS,
+      metric,
+    )
+      ? VITAL_SOURCE_METRICS[metric]
+      : undefined;
+    if (name === undefined) continue;
+    const value = finiteNumber(d.value);
+    if (value === undefined) continue;
+
+    // Last finalized reading wins. Each score is emitted once per session, so
+    // this only matters for a replayed or merged stream, where the later
+    // reading is the more complete one.
+    vitals[name] = { value, rating: rateVital(name, value) };
+    found = true;
+  }
+
+  return found ? vitals : undefined;
+}
+
 export interface LlmBundle {
   schemaVersion: 1;
   kind: "crumbtrail.agent-session-bundle";
@@ -820,6 +942,14 @@ export interface LlmBundle {
   detectorPrevalence?: LlmBundleDetectorPrevalence;
   /** Redaction-aware environment snapshot for the session, or `null` when none was captured. */
   environment: LlmBundleEnvironment | null;
+  /**
+   * Finalized Core Web Vitals for the session, keyed by {@link LlmBundleVitalName}.
+   *
+   * OMITTED entirely when the session captured no finalized score event, and
+   * individual metrics are omitted the same way. Additive: nothing in the
+   * bundle is ordered, scored or gated by it.
+   */
+  vitals?: LlmBundleVitals;
   /**
    * Root → symptom causal tree projected from detector signals' CP3 causal fields. Additive
    * and optional: absent when no candidate carries `causalRole: 'root'` with attributed symptoms.
@@ -1230,6 +1360,7 @@ export function buildLlmBundle({
     distinctBugs,
     prevalence,
   );
+  const vitals = summarizeVitals(events);
 
   return {
     schemaVersion: 1,
@@ -1255,6 +1386,7 @@ export function buildLlmBundle({
     distinctBugs,
     ...(detectorPrevalence !== undefined ? { detectorPrevalence } : {}),
     environment: buildEnvironment(events, session.startMs),
+    ...(vitals !== undefined ? { vitals } : {}),
     ...(causalTree.length > 0 ? { causalTree } : {}),
     outboundCalls: buildOutboundCalls(events, session.startMs),
     databaseDiffs: buildDatabaseDiffs(events, session.startMs),

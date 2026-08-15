@@ -5,8 +5,10 @@ import { execFileSync } from "node:child_process";
 import { redactTokenLikeString, redactUrl } from "crumbtrail-core";
 import {
   summarizeRedaction,
+  summarizeVitals,
   writeLlmBundle,
   type LlmBundleRedactionSummary,
+  type LlmBundleVitals,
 } from "./llm-bundle";
 import { writeEvidenceIndex } from "./evidence-index";
 import {
@@ -297,6 +299,13 @@ interface SessionIndex {
   pageProbe?: PageProbeIndexSummary;
   storageSummary?: StorageSummary;
   redaction: LlmBundleRedactionSummary;
+  /**
+   * Finalized Core Web Vitals for the session. Same shape and same vocabulary
+   * as `LlmBundle.vitals`, aggregated by the same function, so a reader that
+   * understands one artifact understands the other. Omitted when the session
+   * captured no finalized score event.
+   */
+  vitals?: LlmBundleVitals;
   audio?: PostProcessAudioSummary;
   fullStackRequests?: FullStackRequestsIndexSection;
   causalGraph?: CausalGraph;
@@ -616,6 +625,7 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
   const fullStackRequests = buildFullStackRequestsIndex(mergedEvents);
   const causalGraph = buildCausalGraph({ events: mergedEvents });
   const redaction = summarizeRedaction(mergedEvents);
+  const vitals = summarizeVitals(mergedEvents);
   const pageProbeSummary = finalizePageProbeSummary(pageProbe);
 
   const start = mergedEvents[0].t;
@@ -642,6 +652,7 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
     ...(pageProbeSummary !== undefined ? { pageProbe: pageProbeSummary } : {}),
     ...(storageSummary !== undefined ? { storageSummary } : {}),
     redaction,
+    ...(vitals !== undefined ? { vitals } : {}),
     ...(audioResult.audio !== undefined ? { audio: audioResult.audio } : {}),
     ...(fullStackRequests !== undefined ? { fullStackRequests } : {}),
     causalGraph,
