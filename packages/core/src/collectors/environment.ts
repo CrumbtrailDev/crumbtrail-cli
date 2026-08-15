@@ -3,9 +3,11 @@ import type {
   CrumbtrailConfig,
   CollectorCleanup,
   CollectorContext,
+  EnvConnection,
+  EnvDevice,
   EnvSnapshot,
 } from "../types";
-import { redactValue, type RedactionMetadata } from "../redaction";
+import { redactUrl, redactValue, type RedactionMetadata } from "../redaction";
 import { now } from "../utils";
 
 /**
@@ -64,6 +66,31 @@ export function buildEnvSnapshot(
   const appBuild = safeAppBuild();
   if (appBuild) snapshot.appBuild = appBuild;
 
+  // An empty `document.referrer` means there was no referrer. Emitting `""`
+  // would instead claim a referrer that happened to be blank, so the key is
+  // omitted entirely. The value is redacted with the same `redactUrl` policy a
+  // `referrer` request header already gets (see URL_HEADER_NAMES in
+  // redaction.ts), so a query string carrying a token is stripped here too.
+  const referrer = safeReferrer();
+  if (referrer) {
+    const result = redactUrl(referrer, "env.referrer");
+    snapshot.referrer = result.value;
+    if (result.metadata) addRedactionMetadata(snapshot, result.metadata);
+  }
+
+  const device = safeDevice();
+  if (device) snapshot.device = device;
+
+  const connection = safeConnection();
+  if (connection) snapshot.connection = connection;
+
+  const deviceMemory = safeNavigatorNumber("deviceMemory");
+  if (deviceMemory !== undefined) snapshot.deviceMemory = deviceMemory;
+
+  const hardwareConcurrency = safeNavigatorNumber("hardwareConcurrency");
+  if (hardwareConcurrency !== undefined)
+    snapshot.hardwareConcurrency = hardwareConcurrency;
+
   applyDeclaredEnv(snapshot, flags, config);
 
   return snapshot;
@@ -121,8 +148,22 @@ function applyDeclaredEnv(
   }
 
   if (metadataItems.length > 0) {
-    target.redaction = mergeMetadata(metadataItems);
+    addRedactionMetadata(target, mergeMetadata(metadataItems));
   }
+}
+
+/**
+ * Folds one more source of redaction metadata into `target.redaction` instead
+ * of replacing what is already there. Flags/config are no longer the only
+ * source — the referrer redacts too, and later snapshot fields may as well — so
+ * every writer goes through here and none of them can drop another's fields.
+ */
+function addRedactionMetadata(
+  target: EnvSnapshot,
+  metadata: RedactionMetadata,
+): void {
+  const existing = target.redaction as RedactionMetadata | undefined;
+  target.redaction = existing ? mergeMetadata([existing, metadata]) : metadata;
 }
 
 function mergeMetadata(items: RedactionMetadata[]): RedactionMetadata {
@@ -130,6 +171,114 @@ function mergeMetadata(items: RedactionMetadata[]): RedactionMetadata {
     policy: items[0].policy,
     fields: items.flatMap((item) => item.fields),
   };
+}
+
+function safeReferrer(): string | undefined {
+  try {
+    if (
+      typeof document !== "undefined" &&
+      typeof document.referrer === "string" &&
+      document.referrer.trim() !== ""
+    ) {
+      return document.referrer;
+    }
+  } catch {
+    // document can throw in sandboxed/SSR contexts.
+  }
+  return undefined;
+}
+
+/**
+ * Display characteristics a rendering defect reproduces against. Each read is
+ * guarded on its own so a runtime that exposes `screen` without
+ * `screen.orientation` still contributes `dpr` and `screen`.
+ */
+function safeDevice(): EnvDevice | undefined {
+  const device: EnvDevice = {};
+
+  try {
+    if (
+      typeof window !== "undefined" &&
+      isFiniteNumber(window.devicePixelRatio)
+    )
+      device.dpr = window.devicePixelRatio;
+  } catch {
+    // window may be unavailable outside a browser.
+  }
+
+  try {
+    const screen = typeof window !== "undefined" ? window.screen : undefined;
+    if (screen && isFiniteNumber(screen.width) && isFiniteNumber(screen.height))
+      device.screen = { w: screen.width, h: screen.height };
+  } catch {
+    // screen is absent in non-browser runtimes.
+  }
+
+  try {
+    // Read as `unknown`: the DOM lib types `type` as a closed literal union,
+    // but a real runtime may expose anything (or nothing) here.
+    const orientation: unknown =
+      typeof window !== "undefined"
+        ? window.screen?.orientation?.type
+        : undefined;
+    if (typeof orientation === "string" && orientation !== "")
+      device.orientation = orientation;
+  } catch {
+    // Screen Orientation API is not universal.
+  }
+
+  return Object.keys(device).length > 0 ? device : undefined;
+}
+
+/**
+ * Network Information API view of the connection. Absent in most runtimes
+ * (including happy-dom and every non-Chromium browser), which is a normal
+ * result rather than an error: the whole object is omitted.
+ */
+function safeConnection(): EnvConnection | undefined {
+  try {
+    if (typeof navigator === "undefined") return undefined;
+    const raw = (
+      navigator as Navigator & {
+        connection?: {
+          effectiveType?: unknown;
+          downlink?: unknown;
+          rtt?: unknown;
+          saveData?: unknown;
+        };
+      }
+    ).connection;
+    if (!raw || typeof raw !== "object") return undefined;
+
+    const connection: EnvConnection = {};
+    if (typeof raw.effectiveType === "string" && raw.effectiveType !== "")
+      connection.effectiveType = raw.effectiveType;
+    if (isFiniteNumber(raw.downlink)) connection.downlink = raw.downlink;
+    if (isFiniteNumber(raw.rtt)) connection.rtt = raw.rtt;
+    if (typeof raw.saveData === "boolean") connection.saveData = raw.saveData;
+
+    return Object.keys(connection).length > 0 ? connection : undefined;
+  } catch {
+    // navigator can throw in sandboxed/SSR contexts.
+  }
+  return undefined;
+}
+
+function safeNavigatorNumber(
+  name: "deviceMemory" | "hardwareConcurrency",
+): number | undefined {
+  try {
+    if (typeof navigator === "undefined") return undefined;
+    const value = (navigator as Navigator & Record<string, unknown>)[name];
+    if (isFiniteNumber(value) && value > 0) return value;
+  } catch {
+    // navigator can throw in sandboxed/SSR contexts.
+  }
+  return undefined;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function safeUserAgent(): string | undefined {
