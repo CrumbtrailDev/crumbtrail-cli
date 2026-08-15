@@ -416,6 +416,55 @@ describe("server", () => {
     ).toBe(false);
   });
 
+  it("stores session replay artifacts, and refuses names it does not recognise", async () => {
+    await request(
+      server,
+      "POST",
+      "/api/session/start",
+      { sessionId: "ses_replay", metadata: {} },
+      authHeaders,
+    );
+    const blobHeaders = {
+      "Content-Type": "application/octet-stream",
+      "X-Session-Id": "ses_replay",
+      ...authHeaders,
+    };
+
+    for (const name of ["replay.json", "replay-000000.json.gz"]) {
+      const res = await request(
+        server,
+        "POST",
+        `/api/blob/${name}`,
+        Buffer.from("chunk"),
+        blobHeaders,
+      );
+      expect(res.status).toBe(200);
+      expect(
+        fs.existsSync(path.join(findSessionDir(tmpDir, "ses_replay"), name)),
+      ).toBe(true);
+    }
+
+    // Matched by an anchored pattern with an exact digit count, because the
+    // name becomes a filesystem path. A shorter run of digits, a suffix, or a
+    // different extension is not a replay chunk.
+    for (const name of [
+      "replay-0.json.gz",
+      "replay-000000.json",
+      "replay-000000.json.gz.bak",
+      "replay-00000a.json.gz",
+    ]) {
+      const res = await request(
+        server,
+        "POST",
+        `/api/blob/${name}`,
+        Buffer.from("chunk"),
+        blobHeaders,
+      );
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({ code: "invalid_blob_name" });
+    }
+  });
+
   it("rejects oversized blobs before writing the file", async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     server = createServer({

@@ -23,6 +23,11 @@ import { createCrumbtrailRequestHeaders } from "./correlation";
 import { readEarlySessionId } from "./early-capture";
 import { createAutoFlagController } from "./auto-flag";
 import {
+  ReplayRecorder,
+  replaySupported,
+  type ReplayMasking,
+} from "./replay/index";
+import {
   isProbeName,
   runProbe,
   type ProbeContext,
@@ -45,10 +50,7 @@ const PRESETS: Record<CrumbtrailPreset, Partial<CrumbtrailConfig>> = {
 };
 import { generateSessionId, now } from "./utils";
 import { HttpTransport } from "./transports/http";
-import {
-  createWebSessionStore,
-  type SessionStore,
-} from "./session-store";
+import { createWebSessionStore, type SessionStore } from "./session-store";
 import { consoleCollector } from "./collectors/console";
 import { errorCollector } from "./collectors/error";
 import { interactionCollector } from "./collectors/interaction";
@@ -115,12 +117,7 @@ const COLLECTOR_MAP: Record<string, Collector> = {
 const DEFAULT_CONFIG_POLL_INTERVAL_MS = 60_000;
 const EMAIL_SHAPED_VALUE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
 type FlightRecorderState =
-  | "armed"
-  | "buffering"
-  | "triggered"
-  | "tailing"
-  | "finalizing"
-  | "finalized";
+  "armed" | "buffering" | "triggered" | "tailing" | "finalizing" | "finalized";
 /**
  * The event a probe result rests as. One event per probe, carrying the whole {@link ProbeResult}
  * including a failed one, because "the probe ran and could not answer" is itself the answer to
@@ -262,6 +259,18 @@ export class Crumbtrail {
   private sessionMetadataWrite: Promise<void> = Promise.resolve();
   private stopped = false;
   private identity: CrumbtrailIdentity = {};
+
+  /**
+   * Session replay, off until the server says a project asked for it.
+   *
+   * There is no local option to switch this on. Replay records the pages a
+   * customer's own end users see, so the decision belongs to the customer's
+   * project settings rather than to whoever wired the SDK in, and it arrives on
+   * the same config poll as the kill switch.
+   */
+  private replayEnabled = false;
+  private replayMasking: ReplayMasking = "inputs_masked";
+  private replay: ReplayRecorder | undefined;
 
   private constructor(
     config: CrumbtrailConfig,
@@ -802,6 +811,14 @@ export class Crumbtrail {
       }
     }
 
+    if (typeof settings.replayEnabled === "boolean")
+      this.replayEnabled = settings.replayEnabled;
+    if (
+      settings.replayMasking === "inputs_masked" ||
+      settings.replayMasking === "text_masked"
+    )
+      this.replayMasking = settings.replayMasking;
+
     if (
       oldSampleRate !== this.config.captureSampleRate ||
       oldBaselineSampleRate !== this.config.baselineSampleRate
@@ -809,6 +826,7 @@ export class Crumbtrail {
       this.resampleSession();
     this.applyConsentPolicy();
     this.updateFlightRecorderState();
+    this.updateReplayState();
     if (shouldReconfigureAutoFlag) this.configureAutoFlagController();
     this.startSessionIfAllowed();
     this.emitSamplingGapIfNeeded();
@@ -1126,6 +1144,42 @@ export class Crumbtrail {
       return;
     this.sessionStarted = true;
     this.startSessionWithCurrentIdentity();
+    this.updateReplayState();
+  }
+
+  /**
+   * Start or stop session replay to match the project's setting.
+   *
+   * Only ever recorded for a session that is already being sent: a replay of a
+   * session the server has no row for is an artifact nothing can reach.
+   *
+   * Masking is fixed for the life of a recording. A manifest states one masking
+   * mode, and a recording whose second half was taken under a different one
+   * would be a recording no reader could characterize. A changed setting takes
+   * effect on the next session, which is what the settings page says it does.
+   */
+  private updateReplayState(): void {
+    const shouldRecord =
+      this.replayEnabled &&
+      this.sessionStarted &&
+      this.canTransport() &&
+      replaySupported();
+    if (shouldRecord) {
+      if (this.replay) return;
+      this.replay = new ReplayRecorder({
+        sessionId: this.sessionId,
+        masking: this.replayMasking,
+        send: (name, body) => this.transport.sendBlob(name, body),
+      });
+      this.replay.start();
+      return;
+    }
+    const running = this.replay;
+    this.replay = undefined;
+    // Detached rather than awaited: this runs from a config poll, and a poll
+    // must not wait on an upload. `stop` flushes what it has before it tears
+    // down, so the buffered tail still lands.
+    void running?.stop().catch(() => {});
   }
 
   /**
@@ -1256,6 +1310,11 @@ export class Crumbtrail {
     // to keep.
     this.bus.flush();
     this.stopped = true;
+    // Before the transport is asked to end the session: the recorder's last
+    // chunk is the interval a session that ended in a failure was failing in.
+    const replay = this.replay;
+    this.replay = undefined;
+    await replay?.stop().catch(() => {});
     if (this.widgetCleanup) this.widgetCleanup();
     this.autoFlagCleanup?.();
     this.stopConfigPolling();
@@ -1736,7 +1795,10 @@ function isTriggerConfigKey(key: (typeof REMOTE_CONFIG_KEYS)[number]): boolean {
 
 function hasRecognizedRemotePolicy(settings: Record<string, unknown>): boolean {
   if (typeof settings.killSwitch === "boolean") return true;
-  if (settings.consentMode === "implicit" || settings.consentMode === "required")
+  if (
+    settings.consentMode === "implicit" ||
+    settings.consentMode === "required"
+  )
     return true;
   if (typeof settings.respectGpc === "boolean") return true;
   if (hasRecognizedRemoteMasking(settings)) return true;
@@ -1749,7 +1811,9 @@ function hasRecognizedRemotePolicy(settings: Record<string, unknown>): boolean {
   return hasRecognizedRemoteTriggers(settings);
 }
 
-function hasRecognizedRemoteMasking(settings: Record<string, unknown>): boolean {
+function hasRecognizedRemoteMasking(
+  settings: Record<string, unknown>,
+): boolean {
   const masking = asRecord(settings.masking) ?? asRecord(settings.privacy);
   const mode =
     readString(masking?.mode) ??
@@ -1773,7 +1837,9 @@ function hasRecognizedRemoteMasking(settings: Record<string, unknown>): boolean 
   );
 }
 
-function hasRecognizedRemoteSampling(settings: Record<string, unknown>): boolean {
+function hasRecognizedRemoteSampling(
+  settings: Record<string, unknown>,
+): boolean {
   const sampling = asRecord(settings.sampling);
   return [
     sampling?.captureSampleRate,
@@ -1789,7 +1855,9 @@ function hasRecognizedRemoteSampling(settings: Record<string, unknown>): boolean
   ].some((value) => readRate(value) !== undefined);
 }
 
-function hasRecognizedRemoteTriggers(settings: Record<string, unknown>): boolean {
+function hasRecognizedRemoteTriggers(
+  settings: Record<string, unknown>,
+): boolean {
   const triggers = asRecord(settings.triggers);
   if (!triggers) return false;
   return [
@@ -1818,7 +1886,8 @@ function hasRecognizedRemoteTriggers(settings: Record<string, unknown>): boolean
     triggers.abandonedFlows,
     triggers.onAbandonedFlow,
   ].some(
-    (value) => triggerSwitch(value) !== undefined || readDuration(value) !== undefined,
+    (value) =>
+      triggerSwitch(value) !== undefined || readDuration(value) !== undefined,
   );
 }
 
