@@ -310,8 +310,13 @@ describe("release artifact safety", () => {
         registry.set(entry.name, entry.integrity);
       },
     })).rejects.toThrow("transient npm failure");
-    expect(firstAttemptPublished).toEqual(["crumbtrail-core", "crumbtrail-node"]);
-    expect(registry).toEqual(new Map([["crumbtrail-core", "sha512-core"]]));
+    // crumbtrail does not depend on crumbtrail-node, so the node failure is no
+    // reason to strand it on the previous version.
+    expect(firstAttemptPublished).toEqual(["crumbtrail-core", "crumbtrail-node", "crumbtrail"]);
+    expect(registry).toEqual(new Map([
+      ["crumbtrail-core", "sha512-core"],
+      ["crumbtrail", "sha512-cli"],
+    ]));
 
     const rerunPublished = [];
     const rerun = await preflightAndPublishArtifacts(artifacts, {
@@ -321,13 +326,67 @@ describe("release artifact safety", () => {
         registry.set(entry.name, entry.integrity);
       },
     });
-    expect(rerun.skipped.map((entry) => entry.name)).toEqual(["crumbtrail-core"]);
-    expect(rerunPublished).toEqual(["crumbtrail-node", "crumbtrail"]);
+    expect(rerun.skipped.map((entry) => entry.name)).toEqual(["crumbtrail-core", "crumbtrail"]);
+    expect(rerunPublished).toEqual(["crumbtrail-node"]);
     expect(registry).toEqual(new Map([
       ["crumbtrail-core", "sha512-core"],
       ["crumbtrail-node", "sha512-node"],
       ["crumbtrail", "sha512-cli"],
     ]));
+  });
+
+  it("publishes the rest of a lockstep set when one package fails, and reports every outcome", async () => {
+    // The 0.32.0 release in the field: a brand-new package name has no trusted
+    // publisher on npm yet, so its very first publish 404s while every other
+    // package in the set is perfectly publishable.
+    const attempted = [];
+    const failure = preflightAndPublishArtifacts([
+      artifact("crumbtrail-core", "sha512-core"),
+      artifact("crumbtrail-capacitor", "sha512-capacitor"),
+      artifact("crumbtrail-node", "sha512-node"),
+      artifact("crumbtrail-react-native", "sha512-rn"),
+    ], {
+      lookupIntegrity: async () => null,
+      dependenciesByName: new Map([
+        ["crumbtrail-capacitor", ["crumbtrail-core"]],
+        ["crumbtrail-node", ["crumbtrail-core"]],
+        ["crumbtrail-react-native", ["crumbtrail-core"]],
+      ]),
+      publish: async (entry) => {
+        attempted.push(entry.name);
+        if (entry.name === "crumbtrail-capacitor") throw new Error("404 Not Found - PUT");
+      },
+    });
+    await expect(failure).rejects.toThrow("Failed to publish: crumbtrail-capacitor@1.0.0 (404 Not Found - PUT)");
+    await expect(failure).rejects.toThrow("Published: crumbtrail-core@1.0.0, crumbtrail-node@1.0.0, crumbtrail-react-native@1.0.0");
+    expect(attempted).toEqual([
+      "crumbtrail-core",
+      "crumbtrail-capacitor",
+      "crumbtrail-node",
+      "crumbtrail-react-native",
+    ]);
+  });
+
+  it("never publishes a package whose failed dependency is missing from the registry", async () => {
+    const attempted = [];
+    const failure = preflightAndPublishArtifacts([
+      artifact("crumbtrail-core", "sha512-core"),
+      artifact("crumbtrail-node", "sha512-node"),
+      artifact("crumbtrail-react-native", "sha512-rn"),
+    ], {
+      lookupIntegrity: async () => null,
+      dependenciesByName: new Map([
+        ["crumbtrail-node", ["crumbtrail-core"]],
+        ["crumbtrail-react-native", ["crumbtrail-node"]],
+      ]),
+      publish: async (entry) => {
+        attempted.push(entry.name);
+        if (entry.name === "crumbtrail-core") throw new Error("registry rejected the tarball");
+      },
+    });
+    await expect(failure).rejects.toThrow("Not attempted, dependency unpublished: crumbtrail-node@1.0.0 (needs crumbtrail-core); crumbtrail-react-native@1.0.0 (needs crumbtrail-node)");
+    await expect(failure).rejects.toThrow("Published: none.");
+    expect(attempted).toEqual(["crumbtrail-core"]);
   });
 
   it("publishes selected artifacts in dependency-safe topological order", () => {
