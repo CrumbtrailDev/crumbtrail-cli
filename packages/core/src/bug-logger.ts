@@ -527,6 +527,40 @@ export class Crumbtrail {
     const note =
       options?.note === undefined ? undefined : maskText(options.note);
 
+    // Resolved flag/config state at flag time. The session-start snapshot plus deltas answers
+    // "what were the flags at t0"; only this answers "what were they at the moment this broke",
+    // without a reader replaying every delta by hand. Emitted at `flaggedAt` so it lands in the
+    // same window as the evidence it explains. Nothing declared means nothing emitted: an empty
+    // snapshot is noise, and noise in a bundle costs a reader attention.
+    //
+    // Gated on `envEmitted` for the same reason `setEnv` is: with the environment collector
+    // disabled the session carries no `k:'env'` event at all, and a flag snapshot appearing
+    // where the app switched env capture off would contradict that configuration.
+    if (
+      this.envEmitted &&
+      (Object.keys(this.declaredFlags).length > 0 ||
+        Object.keys(this.declaredConfig).length > 0)
+    ) {
+      // `buildEnvDelta` is the one place flags/config go through `redactValue` under the
+      // `env.flags`/`env.config` paths; reusing it keeps the snapshot on the same policy as
+      // the snapshot and delta rather than growing a second redaction path that can drift.
+      const flagSnapshot = buildEnvDelta(
+        this.declaredFlags,
+        this.declaredConfig,
+      );
+      flagSnapshot.kind = "flag-snapshot";
+      this.bus.emit(
+        {
+          t: flaggedAt,
+          k: "env",
+          d: flagSnapshot as unknown as Record<string, unknown>,
+        },
+        // Without this the flight recorder finalization path drops the event, so the feature
+        // would work in the ordinary case and vanish in exactly the case it was built for.
+        { bypassAdmission: finalizerOriginated },
+      );
+    }
+
     // Capture provider state snapshots at flag time so they land in the same window.
     const stateProviderNames = Array.from(this.stateProviders.keys());
     for (const [name, provider] of this.stateProviders) {
