@@ -935,4 +935,364 @@ describe("performanceCollector", () => {
       ];
     }
   });
+
+  // --- Session-windowed cumulative layout shift ------------------------------
+
+  function clsObserver(): MockPerformanceObserver {
+    const observer = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "layout-shift",
+    );
+    expect(
+      observer,
+      "no observer registered for the layout-shift entry type",
+    ).toBeDefined();
+    return observer!;
+  }
+
+  function shift(value: number, startTime: number, hadRecentInput = false) {
+    return { entryType: "layout-shift", value, startTime, hadRecentInput };
+  }
+
+  function clsScores() {
+    return events.filter((e) => e.k === "perf" && e.d.metric === "cls.score");
+  }
+
+  it("reports the worst session window as cls.score on finalization", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    clsObserver().simulateEntries([shift(0.1, 0), shift(0.2, 400)]);
+    bus.flush();
+    // A score is only knowable once the session stops accumulating.
+    expect(clsScores()).toHaveLength(0);
+
+    cleanup();
+    bus.flush();
+
+    expect(clsScores()).toHaveLength(1);
+    expect(clsScores()[0].d.value).toBeCloseTo(0.3, 5);
+    expect(clsScores()[0].d.shiftCount).toBe(2);
+  });
+
+  it("breaks a window on a gap longer than one second", async () => {
+    // Two shifts 900ms apart belong together; the third arrives 1100ms after
+    // the second and starts a new window. Summing the session instead would
+    // report 0.5, and reporting the last window would report 0.3 only by
+    // accident, so the value is chosen to make the largest window the middle
+    // answer.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    clsObserver().simulateEntries([
+      shift(0.1, 0),
+      shift(0.1, 900),
+      shift(0.3, 2_000),
+    ]);
+    cleanup();
+    bus.flush();
+
+    // Windows: [0.1 + 0.1] and [0.3]. Worst = 0.3.
+    expect(clsScores()).toHaveLength(1);
+    expect(clsScores()[0].d.value).toBeCloseTo(0.3, 5);
+    expect(clsScores()[0].d.shiftCount).toBe(3);
+  });
+
+  it("breaks a window that spans more than five seconds, even without a gap", async () => {
+    // Every gap here is 900ms, so the gap boundary never fires. Only the span
+    // boundary separates these, which is why this fixture cannot pass with the
+    // span check missing: without it the whole run is one window worth 1.4.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    clsObserver().simulateEntries([
+      shift(0.1, 0),
+      shift(0.1, 900),
+      shift(0.1, 1_800),
+      shift(0.1, 2_700),
+      shift(0.1, 3_600),
+      shift(0.1, 4_500),
+      // 5400 - 0 = 5400 > 5000, so the window breaks here despite the 900ms gap.
+      shift(0.4, 5_400),
+      shift(0.4, 6_300),
+    ]);
+    cleanup();
+    bus.flush();
+
+    // Windows: [6 x 0.1 = 0.6] and [0.4 + 0.4 = 0.8]. Worst = 0.8.
+    expect(clsScores()[0].d.value).toBeCloseTo(0.8, 5);
+    expect(clsScores()[0].d.shiftCount).toBe(8);
+  });
+
+  it("keeps shifts exactly on both boundaries inside the same window", async () => {
+    // Gaps of exactly 1000ms and a span of exactly 5000ms are within the
+    // window, not past it. This pins the comparison as strictly greater than,
+    // so an off-by-one that breaks early cannot pass alongside the two tests
+    // above.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    clsObserver().simulateEntries([
+      shift(0.1, 0),
+      shift(0.1, 1_000),
+      shift(0.1, 2_000),
+      shift(0.1, 3_000),
+      shift(0.1, 4_000),
+      shift(0.1, 5_000),
+    ]);
+    cleanup();
+    bus.flush();
+
+    expect(clsScores()[0].d.value).toBeCloseTo(0.6, 5);
+    expect(clsScores()[0].d.shiftCount).toBe(6);
+  });
+
+  it("reports an earlier window when it is the worst one", async () => {
+    // The score is the maximum window, not the latest one.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    clsObserver().simulateEntries([shift(0.5, 0), shift(0.1, 9_000)]);
+    cleanup();
+    bus.flush();
+
+    expect(clsScores()[0].d.value).toBeCloseTo(0.5, 5);
+  });
+
+  it("excludes shifts that followed a user interaction", async () => {
+    // A shift the user caused by clicking is the page responding, not the page
+    // moving under them, so it is not part of the score.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    clsObserver().simulateEntries([
+      shift(0.9, 0, true),
+      shift(0.2, 100),
+      shift(0.8, 200, true),
+    ]);
+    cleanup();
+    bus.flush();
+
+    expect(clsScores()).toHaveLength(1);
+    expect(clsScores()[0].d.value).toBeCloseTo(0.2, 5);
+    expect(clsScores()[0].d.shiftCount).toBe(1);
+  });
+
+  it("emits no cls.score when the page never shifted", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    cleanup();
+    bus.flush();
+    expect(clsScores()).toHaveLength(0);
+  });
+
+  it("emits cls.score when the page is hidden, and never a second time", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    clsObserver().simulateEntries([shift(0.25, 0)]);
+
+    hidePage();
+    bus.flush();
+    expect(clsScores()).toHaveLength(1);
+    expect(clsScores()[0].d.value).toBeCloseTo(0.25, 5);
+
+    showPage();
+    hidePage();
+    cleanup();
+    bus.flush();
+    expect(clsScores()).toHaveLength(1);
+  });
+
+  it("sheds cls.score as a capture gap rather than reporting a partial one", async () => {
+    // The score answers to the same vitals budget as the per-shift events, so
+    // a session that exhausts the budget loses the score too. What must not
+    // happen is a number built from only the shifts that fitted: an
+    // understated score reads as a calm page, and nothing tells the reader
+    // otherwise. The capture gap is what makes the absence legible.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    clsObserver().simulateEntries(
+      Array.from({ length: 300 }, (_, i) => shift(0.01, i)),
+    );
+    bus.flush();
+
+    // 250 per-shift events emitted, the rest shed.
+    expect(
+      events.filter((e) => e.k === "perf" && e.d.metric === "cls"),
+    ).toHaveLength(250);
+
+    cleanup();
+    bus.flush();
+
+    expect(clsScores()).toHaveLength(0);
+    expect(events.filter((e) => e.k === "capture_gap")).toHaveLength(1);
+  });
+
+  // --- Finalized largest contentful paint ------------------------------------
+
+  function lcpObserverOf(): MockPerformanceObserver {
+    const observer = MockPerformanceObserver.instances.find(
+      (o) => o.observeOptions?.type === "largest-contentful-paint",
+    );
+    expect(
+      observer,
+      "no observer registered for the largest-contentful-paint entry type",
+    ).toBeDefined();
+    return observer!;
+  }
+
+  function candidate(startTime: number, size: number, tagName?: string) {
+    return {
+      entryType: "largest-contentful-paint",
+      startTime,
+      size,
+      element: tagName ? { tagName } : null,
+    };
+  }
+
+  function lcpFinals() {
+    return events.filter((e) => e.k === "perf" && e.d.metric === "lcp.final");
+  }
+
+  function press(type: "keydown" | "pointerdown") {
+    document.dispatchEvent(new Event(type));
+  }
+
+  it("reports the last candidate as lcp.final on finalization", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    lcpObserverOf().simulateEntries([
+      candidate(500, 1_000, "P"),
+      candidate(1_200, 20_000, "H1"),
+      candidate(3_000, 90_000, "IMG"),
+    ]);
+    bus.flush();
+    // Every candidate is a guess until nothing can replace it.
+    expect(lcpFinals()).toHaveLength(0);
+
+    cleanup();
+    bus.flush();
+
+    expect(lcpFinals()).toHaveLength(1);
+    expect(lcpFinals()[0].d.value).toBe(3_000);
+    expect(lcpFinals()[0].d.size).toBe(90_000);
+    expect(lcpFinals()[0].d.element).toBe("IMG");
+  });
+
+  it("freezes lcp at the first keydown", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    lcpObserverOf().simulateEntries([candidate(500, 1_000, "P")]);
+    press("keydown");
+    // Content that arrives after the user has acted is a consequence of that
+    // action, not part of the load they waited through.
+    lcpObserverOf().simulateEntries([candidate(9_000, 500_000, "IMG")]);
+    cleanup();
+    bus.flush();
+
+    expect(lcpFinals()).toHaveLength(1);
+    expect(lcpFinals()[0].d.value).toBe(500);
+    expect(lcpFinals()[0].d.element).toBe("P");
+  });
+
+  it("freezes lcp at the first pointerdown", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    lcpObserverOf().simulateEntries([candidate(640, 4_000, "H1")]);
+    press("pointerdown");
+    lcpObserverOf().simulateEntries([candidate(7_500, 300_000, "IMG")]);
+    cleanup();
+    bus.flush();
+
+    expect(lcpFinals()).toHaveLength(1);
+    expect(lcpFinals()[0].d.value).toBe(640);
+    expect(lcpFinals()[0].d.element).toBe("H1");
+  });
+
+  it("omits element when the candidate has none", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    lcpObserverOf().simulateEntries([candidate(800, 2_000)]);
+    cleanup();
+    bus.flush();
+
+    expect(lcpFinals()).toHaveLength(1);
+    expect(lcpFinals()[0].d.element).toBeUndefined();
+  });
+
+  it("emits no lcp.final when no candidate was ever observed", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    cleanup();
+    bus.flush();
+    expect(lcpFinals()).toHaveLength(0);
+  });
+
+  it("emits lcp.final when the page is hidden, and never a second time", async () => {
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    lcpObserverOf().simulateEntries([candidate(1_100, 10_000, "IMG")]);
+
+    hidePage();
+    bus.flush();
+    expect(lcpFinals()).toHaveLength(1);
+    expect(lcpFinals()[0].d.value).toBe(1_100);
+
+    // A candidate arriving after finalization cannot reopen the answer.
+    lcpObserverOf().simulateEntries([candidate(8_000, 900_000, "VIDEO")]);
+    showPage();
+    hidePage();
+    cleanup();
+    bus.flush();
+
+    expect(lcpFinals()).toHaveLength(1);
+    expect(lcpFinals()[0].d.value).toBe(1_100);
+  });
+
+  it("removes the interaction listeners on cleanup", async () => {
+    // The freeze listeners outlive the observers unless they are removed, and a
+    // collector that keeps listening after cleanup holds the whole closure —
+    // including every tracked interaction — alive on the document.
+    const performanceCollector = await loadCollector();
+    const removed = vi.spyOn(document, "removeEventListener");
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    cleanup();
+
+    const types = removed.mock.calls.map((call) => call[0]);
+    expect(types).toContain("keydown");
+    expect(types).toContain("pointerdown");
+    expect(types).toContain("visibilitychange");
+    removed.mockRestore();
+  });
+
+  it("still emits the per-candidate lcp and per-shift cls events", async () => {
+    // The scores are added alongside the raw entries, not in place of them: a
+    // reader following a jumpy page still needs to see which shifts happened
+    // and when, which a single number cannot carry.
+    const performanceCollector = await loadCollector();
+    const cleanup = performanceCollector(bus, DEFAULT_CONFIG);
+
+    clsObserver().simulateEntries([shift(0.1, 0), shift(0.2, 400)]);
+    lcpObserverOf().simulateEntries([candidate(500, 1_000, "P")]);
+    cleanup();
+    bus.flush();
+
+    expect(
+      events.filter((e) => e.k === "perf" && e.d.metric === "cls"),
+    ).toHaveLength(2);
+    expect(
+      events.filter((e) => e.k === "perf" && e.d.metric === "lcp"),
+    ).toHaveLength(1);
+    expect(clsScores()).toHaveLength(1);
+    expect(lcpFinals()).toHaveLength(1);
+  });
 });

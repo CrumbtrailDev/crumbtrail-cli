@@ -193,6 +193,26 @@ interface InteractionRecord {
   eventType: string;
 }
 
+/**
+ * Cumulative layout shift is a windowed score, not a running total.
+ *
+ * A raw sum over the whole session punishes a long-lived page for existing: an
+ * hour of small, unrelated reflows eventually outscores a single catastrophic
+ * jump, and the number stops meaning "how badly did the page move under the
+ * user". The standard score instead groups shifts into sessions and reports the
+ * worst group, so the answer is the worst thing that happened rather than the
+ * sum of everything that ever happened.
+ *
+ * A window ends when either boundary is crossed: more than
+ * `CLS_WINDOW_GAP_MS` of quiet since the previous shift, or more than
+ * `CLS_WINDOW_SPAN_MS` since the window's first shift. Both are needed. The gap
+ * alone lets a continuously thrashing animation accumulate forever; the span
+ * alone merges two unrelated bursts that happen to sit inside the same five
+ * seconds.
+ */
+const CLS_WINDOW_GAP_MS = 1_000;
+const CLS_WINDOW_SPAN_MS = 5_000;
+
 const PERF_BUDGETS: Record<PerfBudgetName, PerfBudget> = {
   bulk: {
     limit: MAX_PERF_EVENTS_PER_SESSION,
@@ -340,6 +360,116 @@ export function performanceCollector(
 
   finalizers.push(emitInp);
 
+  // --- Cumulative layout shift ----------------------------------------------
+  /** The worst window seen so far, which is the reported score. */
+  let clsMaxWindow = 0;
+  /** Running sum of the window currently open. */
+  let clsWindowSum = 0;
+  /** Start time of the open window, for the span boundary. */
+  let clsWindowStart = 0;
+  /** Start time of the last shift in the open window, for the gap boundary. */
+  let clsWindowLast = 0;
+  let clsWindowOpen = false;
+  /** Scoring shifts observed, so an absent score reads as "no shifts". */
+  let clsShiftCount = 0;
+  let clsEmitted = false;
+
+  const recordLayoutShift = (entry: any): void => {
+    // A shift within 500ms of a user interaction is the page responding to that
+    // interaction, not moving under the user, and the score excludes it.
+    if (entry?.hadRecentInput) return;
+
+    const value = Number(entry?.value);
+    if (!Number.isFinite(value)) return;
+
+    // An entry without a usable timestamp still has to be scored — dropping it
+    // would understate a real shift — so it lands at the origin, which keeps it
+    // inside the first window rather than opening a spurious one.
+    const rawStart = Number(entry?.startTime);
+    const startTime = Number.isFinite(rawStart) ? rawStart : 0;
+
+    if (
+      !clsWindowOpen ||
+      startTime - clsWindowLast > CLS_WINDOW_GAP_MS ||
+      startTime - clsWindowStart > CLS_WINDOW_SPAN_MS
+    ) {
+      clsWindowOpen = true;
+      clsWindowSum = 0;
+      clsWindowStart = startTime;
+    }
+
+    clsWindowSum += value;
+    clsWindowLast = startTime;
+    clsShiftCount += 1;
+    if (clsWindowSum > clsMaxWindow) clsMaxWindow = clsWindowSum;
+  };
+
+  const emitCls = (): void => {
+    if (clsEmitted || clsShiftCount === 0) return;
+    // As with INP, the guard takes the emission's own answer: a score shed by an
+    // exhausted budget was never reported, so it must not be recorded as sent.
+    clsEmitted = emitPerf("vitals", "cls.score", () => ({
+      value: clsMaxWindow,
+      shiftCount: clsShiftCount,
+    }));
+  };
+
+  finalizers.push(emitCls);
+
+  // --- Largest contentful paint ---------------------------------------------
+  /**
+   * The most recent candidate, which is the answer only once nothing can
+   * replace it.
+   *
+   * The platform reports LCP as a stream of ever-larger candidates, so any one
+   * of them is a guess that a later entry may overturn. Emitting per candidate
+   * leaves a reader to work out which one was final; this keeps the last and
+   * reports it once.
+   */
+  let lcpCandidate: Record<string, unknown> | undefined;
+  /**
+   * Set at the first user interaction. The specification stops LCP there
+   * because content that appears after the user has acted is a consequence of
+   * that action rather than part of the load the user waited through.
+   */
+  let lcpFrozen = false;
+  let lcpEmitted = false;
+
+  const recordLcpCandidate = (entry: any): void => {
+    if (lcpFrozen) return;
+    const startTime = Number(entry?.startTime);
+    if (!Number.isFinite(startTime)) return;
+
+    const data: Record<string, unknown> = {
+      value: startTime,
+      size: entry.size,
+    };
+    if (entry.element?.tagName) {
+      data.element = entry.element.tagName;
+    }
+    lcpCandidate = data;
+  };
+
+  const freezeLcp = (): void => {
+    lcpFrozen = true;
+  };
+
+  const emitLcpFinal = (): void => {
+    if (lcpEmitted || !lcpCandidate) return;
+    // Nothing observed after finalization can be part of the load either.
+    lcpFrozen = true;
+    const candidate = lcpCandidate;
+    lcpEmitted = emitPerf("vitals", "lcp.final", () => ({ ...candidate }));
+  };
+
+  finalizers.push(emitLcpFinal);
+
+  /** Per-entry-type recorders for the metrics that are scored, not reported. */
+  const recorders: Record<string, (entry: any) => void> = {
+    "layout-shift": recordLayoutShift,
+    "largest-contentful-paint": recordLcpCandidate,
+  };
+
   try {
     const observer = new PerformanceObserver((list) => {
       for (const entry of list.getEntries()) recordInteraction(entry);
@@ -366,10 +496,23 @@ export function performanceCollector(
   };
   doc?.addEventListener("visibilitychange", onVisibilityChange);
 
+  // The two events the specification treats as the user having acted. `click`
+  // is deliberately absent: it fires after `pointerdown` for the same act, so
+  // listening for it would only ever freeze later than the act itself.
+  doc?.addEventListener("keydown", freezeLcp, true);
+  doc?.addEventListener("pointerdown", freezeLcp, true);
+
   for (const cfg of ENTRY_TYPES) {
+    const record = recorders[cfg.type];
     try {
       const observer = new PerformanceObserver((list) => {
         for (const entry of list.getEntries()) {
+          // Scoring runs before the budget question, because a shed entry
+          // still moved the page. Today this ordering is not observable — the
+          // scores answer to the same `vitals` budget as the raw entries, so a
+          // budget that sheds the entries sheds the score with them — but it
+          // is the ordering that stays correct if the two ever separate.
+          record?.(entry);
           if (cfg.accepts && !cfg.accepts(entry)) continue;
           if (!emitPerf(cfg.budget, cfg.metric, () => cfg.extract(entry)))
             return;
@@ -391,6 +534,8 @@ export function performanceCollector(
     // and a disconnected observer cannot contribute anything more to them.
     runFinalizers();
     doc?.removeEventListener("visibilitychange", onVisibilityChange);
+    doc?.removeEventListener("keydown", freezeLcp, true);
+    doc?.removeEventListener("pointerdown", freezeLcp, true);
     disconnectAll();
   };
 }
