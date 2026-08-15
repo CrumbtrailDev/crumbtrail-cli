@@ -1339,16 +1339,29 @@ export class Crumbtrail {
     // final batch to a subscriber that drops every event in it. That batch is
     // the last flush-interval of the session: on a fast flow it holds the
     // failing click and its request, the exact evidence the session exists
-    // to keep.
+    // to keep. It is flushed ahead of the cleanup loop as well as ahead of the
+    // flag, so a collector that throws on teardown cannot take the session's
+    // last batch down with it.
     this.bus.flush();
-    this.stopped = true;
     if (this.widgetCleanup) this.widgetCleanup();
     this.autoFlagCleanup?.();
     this.stopConfigPolling();
-    this.abortFlightRecorder();
+    // Collector cleanup is not only teardown: the performance collector's
+    // finalizers emit the scores that are knowable nowhere else — `inp`,
+    // `cls.score`, `lcp.final` — from this loop. So the loop runs, and its
+    // emissions are flushed, while the session is still live. Setting
+    // `stopped` first would have handed those three straight to a subscriber
+    // that drops everything, and an app that calls stop() explicitly rather
+    // than letting the tab go hidden would lose its vitals entirely.
     for (const cleanup of this.cleanups) {
       cleanup();
     }
+    this.bus.flush();
+    this.stopped = true;
+    // Kept after the flag, where it has always been: with `stopped` set,
+    // canCapture() is false, so an armed recorder settles to "armed" rather
+    // than reopening as "buffering" on the way out.
+    this.abortFlightRecorder();
     this.stateProviders.clear();
     this.bus.stop();
     this.ringBuffer.clear();
