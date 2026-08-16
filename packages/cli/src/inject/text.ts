@@ -106,19 +106,91 @@ export function detectExpressModuleStyle(text: string): "esm" | "cjs" | null {
 }
 
 /**
+ * Count the parameters of the first callback passed to an `app.use(` call,
+ * given everything on the line after `.use(`. Returns null when the argument is
+ * not an inline function (a string route, a bare identifier, an options object).
+ *
+ * Express decides a middleware is an ERROR handler purely by arity: four
+ * declared parameters. That is the only signal available in source text, so it
+ * is the one used here.
+ */
+function inlineCallbackArity(rest: string): number | null {
+  // Strip an `async` keyword and a `function` keyword with an optional name, so
+  // both `(a, b, c, d) =>` and `function handler(a, b, c, d)` reduce to `(`.
+  const head = rest
+    .replace(/^\s*async\s+/, "")
+    .replace(/^\s*function\s*[A-Za-z_$][\w$]*\s*/, "")
+    .replace(/^\s*function\s*/, "")
+    .replace(/^\s*/, "");
+  if (!head.startsWith("(")) return null;
+
+  let depth = 0;
+  let commas = 0;
+  let sawContent = false;
+  for (let i = 0; i < head.length; i++) {
+    const ch = head[i];
+    if (ch === "(" || ch === "[" || ch === "{" || ch === "<") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}" || ch === ">") {
+      depth--;
+      if (depth === 0) return sawContent ? commas + 1 : 0;
+    } else if (ch === "," && depth === 1) commas++;
+    else if (depth === 1 && ch.trim() !== "") sawContent = true;
+  }
+  // Unbalanced: the parameter list runs past the text we were given.
+  return null;
+}
+
+/**
+ * Index of the first existing Express error handler registered on `appVar`, or
+ * -1 when there is none.
+ *
+ * Express runs error handlers in registration order and stops at the first one
+ * that ends the response. A real install (Alertbase PR #544) put Crumbtrail's
+ * handler just above `app.listen`, which in `job-server` and
+ * `user-billing-service` placed it BELOW a handler that always responds, so it
+ * never ran and those services captured no errors at all.
+ */
+function findExistingErrorHandler(
+  lines: string[],
+  appVar: string,
+  fromIdx: number,
+): number {
+  const useRe = new RegExp(`^\\s*${appVar}\\.use\\(`);
+  for (let i = fromIdx; i < lines.length; i++) {
+    if (!useRe.test(lines[i])) continue;
+    // Join a few lines so a parameter list broken across lines still parses.
+    const joined = lines.slice(i, i + 6).join(" ");
+    const rest = joined.slice(joined.indexOf(`${appVar}.use(`) + `${appVar}.use(`.length);
+    if (inlineCallbackArity(rest) === 4) return i;
+  }
+  return -1;
+}
+
+export interface ExpressWiring {
+  text: string;
+  /** Which anchor the error middleware was placed above. */
+  errorAnchor: "existing-error-handler" | "listen";
+}
+
+/**
  * Wire the Express request + error middleware into `existing` when the entry
  * matches the common shape: a `const app = express()` line followed later by an
- * `app.listen(...)` line. The request middleware line is inserted immediately
- * after the app creation (before any routes); the error middleware line is
- * inserted just above the listen call (after the routes). Preserves BOM and EOL
- * style. Returns null when either anchor is missing so the caller can fall back
- * to guidance instead of mis-wiring.
+ * `app.listen(...)` line.
+ *
+ * The request middleware line is inserted immediately after the app creation, so
+ * it sees every route. The error middleware goes above the FIRST existing error
+ * handler when there is one, because a handler that already ended the response
+ * means nothing below it ever runs; with no existing handler it goes just above
+ * the listen call as before, which is still after the routes.
+ *
+ * Preserves BOM and EOL style. Returns null when either anchor is missing so the
+ * caller can fall back to guidance instead of mis-wiring.
  */
 export function wireExpressMiddleware(
   existing: string,
   makeRequestLine: (appVar: string) => string,
   makeErrorLine: (appVar: string) => string,
-): string | null {
+): ExpressWiring | null {
   const { bom, eol, lines } = analyzeSource(existing);
 
   let appIdx = -1;
@@ -142,12 +214,18 @@ export function wireExpressMiddleware(
   }
   if (listenIdx < 0) return null;
 
+  const existingErrIdx = findExistingErrorHandler(lines, appVar, appIdx + 1);
+  const errorIdx = existingErrIdx >= 0 ? existingErrIdx : listenIdx;
+
   const indentOf = (line: string) => line.match(/^\s*/)?.[0] ?? "";
   const out = [...lines];
   // Insert bottom-up so earlier indices stay valid.
-  out.splice(listenIdx, 0, indentOf(lines[listenIdx]) + makeErrorLine(appVar));
+  out.splice(errorIdx, 0, indentOf(lines[errorIdx]) + makeErrorLine(appVar));
   out.splice(appIdx + 1, 0, indentOf(lines[appIdx]) + makeRequestLine(appVar));
-  return bom + out.join(eol);
+  return {
+    text: bom + out.join(eol),
+    errorAnchor: existingErrIdx >= 0 ? "existing-error-handler" : "listen",
+  };
 }
 
 // --- Flutter main() wiring ---------------------------------------------------

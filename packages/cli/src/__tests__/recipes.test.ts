@@ -70,6 +70,65 @@ describe("buildPlan — Next.js", () => {
     expect(plan.targetPath).toBe(p("src", "instrumentation-client.ts"));
   });
 
+  // Regression (Alertbase PR #544): the real install created
+  // `website/src/instrumentation-client.ts` beside an existing root
+  // `instrumentation-client.js` holding Sentry and PostHog. That app keeps its
+  // pages under src/, so Next resolves from src/ and the NEW file wins — the
+  // customer loses two vendors to gain one. Only `.ts` in one directory was
+  // ever checked. Now every loadable extension in both directories is.
+  it("wires into an existing root instrumentation-client.js instead of creating a src sibling", () => {
+    const existing = [
+      'import * as Sentry from "@sentry/nextjs";',
+      'import posthog from "posthog-js";',
+      "Sentry.init({});",
+    ].join("\n");
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("src", "pages")]: "",
+      [p("instrumentation-client.js")]: existing,
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "next", endpoint: ENDPOINT, nextVersion: "15.5.12" },
+      io,
+    );
+    // "prepend", not "create": the customer's Sentry and PostHog init survives
+    // because we join their file rather than write a competing one.
+    expect(plan.kind).toBe("prepend");
+    expect(plan.targetPath).toBe(p("instrumentation-client.js"));
+    expect(plan.content).toContain('from "crumbtrail-core"');
+    // Nothing is planned at the path the old code would have created.
+    expect(plan.targetPath).not.toBe(p("src", "instrumentation-client.ts"));
+  });
+
+  it("prefers the instrumentation-client Next actually loads and reports the other as untouched", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("src", "pages")]: "",
+      [p("src", "instrumentation-client.tsx")]: "export {};\n",
+      [p("instrumentation-client.js")]: "export {};\n",
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "next", endpoint: ENDPOINT, nextVersion: "15.5.12" },
+      io,
+    );
+    // src/ holds the pages dir, so Next resolves from src/ and that file wins.
+    expect(plan.targetPath).toBe(p("src", "instrumentation-client.tsx"));
+    expect(plan.warnings.join(" ")).toContain("instrumentation-client.js");
+  });
+
+  it("still creates the file when the app has none", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("src", "app")]: "",
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "next", endpoint: ENDPOINT, nextVersion: "15.5.12" },
+      io,
+    );
+    expect(plan.kind).toBe("create");
+    expect(plan.targetPath).toBe(p("src", "instrumentation-client.ts"));
+  });
+
   // Regression (CP2): a legacy (<15.3) app-router-ONLY project must NEVER prepend
   // client init into app/layout.tsx — the root layout is a Server Component that
   // never ships to the browser, so that path silently captures nothing. It must
@@ -1153,6 +1212,104 @@ describe("buildPlan — Express middleware wiring", () => {
     expect(content).toContain(`endpoint: "${ENDPOINT}"`);
     expect(content).toContain("authToken: process.env.CRUMBTRAIL_KEY");
     expectNoKeyLiteral(content);
+  });
+
+  // Regression (Alertbase PR #544): `job-server` and `user-billing-service` both
+  // register a four argument error handler that always responds, immediately
+  // above `app.listen`. Anchoring on listen put Crumbtrail's handler BELOW it,
+  // where Express never reaches it, so those two services captured no errors.
+  const ENTRY_WITH_ERROR_HANDLER = [
+    'import express from "express";',
+    "",
+    "const app = express();",
+    "",
+    'app.get("/", (req, res) => res.send("ok"));',
+    "",
+    "app.use((error: any, req: Request, res: Response, next: NextFunction) => {",
+    '  res.status(500).json({ error: "boom" });',
+    "});",
+    "",
+    "app.listen(3000);",
+    "",
+  ].join("\n");
+
+  it("places the error middleware above an existing four argument error handler", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.ts")]: ENTRY_WITH_ERROR_HANDLER,
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.ts") },
+      io,
+    );
+    expect(plan.kind).toBe("rewrite");
+    const content = plan.content ?? "";
+    const routeIdx = content.indexOf('app.get("/"');
+    const ourErrIdx = content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware(");
+    const theirErrIdx = content.indexOf("app.use((error: any");
+    const listenIdx = content.indexOf("app.listen(");
+    // After the routes, but BEFORE the handler that ends the response.
+    expect(ourErrIdx).toBeGreaterThan(routeIdx);
+    expect(ourErrIdx).toBeLessThan(theirErrIdx);
+    expect(theirErrIdx).toBeLessThan(listenIdx);
+    expect(plan.warnings.join(" ")).toContain("existing error handler");
+  });
+
+  it("handles a function-form error handler with the parameter list split across lines", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.js")]: [
+        'import express from "express";',
+        "const app = express();",
+        'app.get("/", (req, res) => res.send("ok"));',
+        "app.use(function (",
+        "  err,",
+        "  req,",
+        "  res,",
+        "  next",
+        ") {",
+        "  res.status(500).end();",
+        "});",
+        "app.listen(3000);",
+        "",
+      ].join("\n"),
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      io,
+    );
+    const content = plan.content ?? "";
+    expect(content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware(")).toBeLessThan(
+      content.indexOf("app.use(function ("),
+    );
+  });
+
+  it("ignores non error middleware and route mounts when picking the anchor", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.js")]: [
+        'import express from "express";',
+        "const app = express();",
+        "app.use(express.json());",
+        'app.use("/users", userRoutes);',
+        "app.use((req, res, next) => next());",
+        'app.get("/", (req, res) => res.send("ok"));',
+        "app.listen(3000);",
+        "",
+      ].join("\n"),
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      io,
+    );
+    const content = plan.content ?? "";
+    // No four argument handler here, so the listen anchor still applies.
+    expect(content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware(")).toBeLessThan(
+      content.indexOf("app.listen("),
+    );
+    expect(content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware(")).toBeGreaterThan(
+      content.indexOf('app.get("/"'),
+    );
   });
 
   it("rewrites a CJS entry with a require of the middleware pair", () => {

@@ -286,6 +286,60 @@ function firstExistingDir(io: InjectIO, ...dirs: string[]): string | null {
   return dirs.find((d) => io.exists(d)) ?? null;
 }
 
+/**
+ * Every extension Next will auto-load an instrumentation-client under. Checking
+ * only `.ts` is how a real install (Alertbase PR #544) created
+ * `website/src/instrumentation-client.ts` next to an existing root
+ * `instrumentation-client.js` carrying Sentry and PostHog. That app keeps its
+ * pages in `src/`, so Next resolves from `src/` and the NEW file wins: the
+ * customer would have silently lost two vendors to gain one.
+ */
+const INSTRUMENTATION_CLIENT_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".mts",
+  ".cts",
+] as const;
+
+export interface InstrumentationClientLookup {
+  /** The file Next will actually load, or null when there is none. */
+  loaded: string | null;
+  /**
+   * Every other instrumentation-client on disk. Next ignores these, so we must
+   * not edit them and the caller reports them as untouched.
+   */
+  shadowed: string[];
+}
+
+/**
+ * Find the instrumentation-client Next will load.
+ *
+ * Next accepts the file at the project root or under `src/`, and resolves it
+ * from whichever directory holds `app/` or `pages/`. `baseDir` is that
+ * directory, so a file there wins over one in the other candidate directory.
+ * Callers must wire into `loaded` rather than creating a sibling: a second file
+ * does not merge with the first, it replaces it.
+ */
+export function findInstrumentationClient(
+  io: InjectIO,
+  cwd: string,
+  baseDir: string,
+): InstrumentationClientLookup {
+  const otherDir = baseDir === cwd ? path.join(cwd, "src") : cwd;
+  const found: string[] = [];
+  for (const dir of [baseDir, otherDir]) {
+    for (const ext of INSTRUMENTATION_CLIENT_EXTENSIONS) {
+      const candidate = path.join(dir, `instrumentation-client${ext}`);
+      if (io.exists(candidate)) found.push(candidate);
+    }
+  }
+  return { loaded: found[0] ?? null, shadowed: found.slice(1) };
+}
+
 function planNext(input: BuildPlanInput, io: InjectIO): Plan {
   const { cwd } = input;
   const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
@@ -301,14 +355,28 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
   const effectiveVersion = installedNextVersion(cwd, io) ?? input.nextVersion;
 
   if (supportsInstrumentationClient(effectiveVersion)) {
-    const target = path.join(baseDir, "instrumentation-client.ts");
-    if (io.exists(target)) {
-      const existing = io.readFile(target);
+    const { loaded, shadowed } = findInstrumentationClient(io, cwd, baseDir);
+    if (loaded) {
+      const existing = io.readFile(loaded);
       if (existing && referencesCrumbtrail(existing)) return skipPlan(input);
-      // A user-owned instrumentation-client already exists — prepend into it.
-      return prependWithPreflight(input, io, target, block);
+      // A user-owned instrumentation-client already exists — prepend into it,
+      // whatever its extension and whichever of the two directories it sits in.
+      // Creating a sibling would replace it rather than join it.
+      return prependWithPreflight(
+        input,
+        io,
+        loaded,
+        block,
+        shadowed.length
+          ? [
+              `Wired into ${path.relative(cwd, loaded)}, the instrumentation client Next loads. Left untouched because Next ignores them: ${shadowed
+                .map((p) => path.relative(cwd, p))
+                .join(", ")}.`,
+            ]
+          : undefined,
+      );
     }
-    return createPlan(input, target, block);
+    return createPlan(input, path.join(baseDir, "instrumentation-client.ts"), block);
   }
 
   // Older Next (<15.3): instrumentation-client.ts is NOT auto-loaded, so the
@@ -472,11 +540,13 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   // Full rewrite: middleware wired around the routes, plus the autoCapture block
   // and the middleware import prepended after any shebang/directive prologue.
   const content = prependIntoSource(
-    wired,
+    wired.text,
     `${block}\n\n${expressMiddlewareImportSnippet(style!)}`,
   );
   const warnings = [
-    "Wired Express request middleware (before routes) and error middleware (after routes) for backend request capture.",
+    wired.errorAnchor === "existing-error-handler"
+      ? "Wired Express request middleware (before routes) and error middleware above the app's existing error handler, so it is reached before that handler ends the response."
+      : "Wired Express request middleware (before routes) and error middleware (after routes) for backend request capture.",
   ];
   const status = io.gitStatus(input.cwd, target);
   if (status.dirty && !input.options?.force) {
