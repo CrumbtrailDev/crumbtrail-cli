@@ -120,11 +120,13 @@ describe("MCP Server", () => {
     });
     expect(res).not.toBeNull();
     const result = res!.result as any;
-    // 40 = the 35 left after solveContext, resolveCapsule, and searchSpecs went
+    // 42 = the 35 left after solveContext, resolveCapsule, and searchSpecs went
     // with the third-party integration surfaces they queried, plus
     // getWindowCorrelation, startFixVerification and getFixVerification, plus
-    // the two agent-plane tools requestProbe and shadowBacktest.
-    expect(result.tools).toHaveLength(40);
+    // the two agent-plane tools requestProbe and shadowBacktest, plus the two
+    // client-notes write tools (recallSimilarIssues became recallIssueContext,
+    // one for one).
+    expect(result.tools).toHaveLength(42);
     const names = result.tools.map((t: any) => t.name);
     expect(names).toContain("listSessions");
     expect(names).toContain("getFixContext");
@@ -133,6 +135,11 @@ describe("MCP Server", () => {
     expect(names).toContain("getFixVerification");
     expect(names).toContain("requestProbe");
     expect(names).toContain("shadowBacktest");
+    expect(names).toContain("recallIssueContext");
+    expect(names).toContain("recordClientNote");
+    expect(names).toContain("amendClientNote");
+    // Replaced by recallIssueContext, which returns cautions as well.
+    expect(names).not.toContain("recallSimilarIssues");
     // The integration tools left with evidence-sources/, ticket/, and
     // knowledge/; re-adding a name here without an implementation should fail.
     for (const gone of ["solveContext", "resolveCapsule", "searchSpecs"]) {

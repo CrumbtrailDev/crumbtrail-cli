@@ -116,8 +116,8 @@ server is reading the hosted store:
 ```json
 [
   {
-    "tool": "recallSimilarIssues",
-    "params": { "sessionId": "<sessionId>", "query": "cannot read properties of undefined", "limit": 5 }
+    "tool": "recallIssueContext",
+    "params": { "sessionId": "<sessionId>", "text": "cannot read properties of undefined", "limit": 5 }
   },
   { "tool": "listDistinctBugs", "params": { "mode": "cross-session" } }
 ]

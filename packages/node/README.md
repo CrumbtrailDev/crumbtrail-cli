@@ -242,15 +242,24 @@ current code and tests, and report uncertainty or evidence gaps.
    correlation and not a cause: confirm one against the raw events with
    `getWindow` before acting on it, and read an empty row list as "nothing
    cleared the significance cut", never as "the session is healthy".
-5. Use `recallSimilarIssues` as context for a diagnosis, not as a verdict. On
-   cloud deployments a recall match can also carry an `outcomeSummary` and
-   reasons such as `resolution_verified` or `resolution_recurred`; prefer a
-   verified resolution.
+5. Use `recallIssueContext` as context for a diagnosis, not as a verdict. One
+   call returns three sections: `duplicates` (exact only, and `checked: false`
+   when you supplied nothing to match on), `precedents` (ranked, with per-arm
+   availability and an `ambiguous` flag), and `cautions` (what we already know
+   about this client). On cloud deployments a precedent can also carry an
+   `outcomeSummary` and reasons such as `resolution_verified` or
+   `resolution_recurred`; prefer a verified resolution. Without a cloud,
+   `cautions` comes back `available: false, reason: "cloud_only"` and never as
+   an empty list, because "we did not look" is not "there are no warnings".
 6. Close the learning loop (cloud only): after reusing recall matches to resolve
    an issue, call `resolveIssue` with its disposition and the `usedMemoryIds` you
    adopted so recall learns which past answers helped. Use `recordFeedback` to
    rate a recall match, opinion, or playbook rule, and `getPlaybook` to read the
-   tenant guidance the cloud has learned. A resolution recorded this way carries
+   tenant guidance the cloud has learned. Report precedents you tried and
+   rejected via `resolveIssue`'s `rejectedMemoryIds`, which records why and
+   stops that fix being proposed again. Write down what you learned about the
+   client with `recordClientNote`, and add to an existing note with
+   `amendClientNote`; those are what come back as `cautions`. A resolution recorded this way carries
    provenance `agent`, because it is the agent's claim; only a person acting in
    an authenticated Crumbtrail session records a confirmed human outcome, and
    the learning loop weighs the two differently. These write only to

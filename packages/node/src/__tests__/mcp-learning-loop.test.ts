@@ -8,7 +8,8 @@ import { McpServer } from "../mcp-server";
 /**
  * CRUMB-113: the MCP server wires four things into the per-tenant learning loop.
  *  - resolveIssue   -> POST /api/memory/resolve  with optional usedMemoryIds (agent-token auth)
- *  - recallSimilarIssues surfaces outcomeSummary + resolution_* reasons from the cloud
+ *  - recallIssueContext returns duplicates + precedents + cautions in one call
+ *  - recordClientNote / amendClientNote -> POST /api/memory/notes[/:id/amend]
  *  - recordFeedback -> POST /api/agent/feedback  (agent-token auth)
  *  - getPlaybook    -> GET  /api/agent/playbook  (agent-token auth)
  *
@@ -33,6 +34,10 @@ interface MockCloudState {
   /** Status both verification endpoints answer with. 200 unless a test wants a
    *  refusal, which the client must surface as an error rather than a gap. */
   verificationStatus: number;
+  /** Status POST /api/memory/notes answers with. 201 unless a test wants one of
+   *  the three refusals the notes route can produce. */
+  noteStatus: number;
+  noteRejection: Record<string, unknown>;
 }
 
 interface MockCloud {
@@ -56,6 +61,8 @@ const OPEN_WINDOW = {
 function startMockCloud(): Promise<MockCloud> {
   const requests: CapturedReq[] = [];
   const state: MockCloudState = {
+    noteStatus: 201,
+    noteRejection: {},
     verificationStatus: 200,
     verificationOpen: { opened: true, ...OPEN_WINDOW },
     verificationView: {
@@ -125,25 +132,88 @@ function startMockCloud(): Promise<MockCloud> {
           ...(used ? { adopted: used.length } : {}),
         });
       }
-      if (u.pathname === "/api/memory/recall") {
+      if (req.method === "POST" && u.pathname === "/api/memory/recall") {
+        const recallBody = (body ?? {}) as Record<string, unknown>;
         return send(200, {
-          indexed: true,
-          matches: [
-            {
-              id: "mem_1",
-              title: "Checkout 500",
-              source: "session",
-              sourceRef: "sess-a",
-              route: "/checkout",
-              errorFamily: "http_500",
-              severity: "high",
-              score: 0.82,
-              reasons: ["semantic", "same-route", "resolution_verified"],
-              resolution: { disposition: "real-bug", rootCause: "null cart" },
-              outcomeSummary:
-                "Fixed by guarding the empty cart; verified in prod.",
-            },
+          projectId: recallBody.projectId ?? null,
+          include: recallBody.include ?? [
+            "duplicates",
+            "precedents",
+            "cautions",
           ],
+          duplicates: { requested: true, checked: false, truncated: false, matches: [] },
+          precedents: {
+            requested: true,
+            ambiguous: false,
+            margin: 0.4,
+            threshold: 0.1,
+            arms: { vector: { available: true }, lexical: { available: true } },
+            results: [
+              {
+                id: "mem_1",
+                title: "Checkout 500",
+                source: "session",
+                sourceRef: "sess-a",
+                route: "/checkout",
+                errorFamily: "http_500",
+                score: 0.82,
+                fusedScore: 0.5,
+                placements: { vector: 1, lexical: 2 },
+                agreement: 0.75,
+                resolution: { disposition: "real-bug", rootCause: "null cart" },
+                outcomeSummary:
+                  "Fixed by guarding the empty cart; verified in prod.",
+              },
+            ],
+          },
+          cautions: {
+            requested: true,
+            notes: [
+              {
+                id: "cnt_1",
+                scopeLevel: "client",
+                subjectKey: "checkout",
+                kind: "gotcha",
+                body: "Their staging gateway rejects test cards on Fridays.",
+                supersedes: [{ id: "cnt_0", scopeLevel: "general" }],
+              },
+            ],
+            matched: 1,
+            fetched: 1,
+            limit: 50,
+            truncated: false,
+            truncatedCount: 0,
+            playbookRules: [],
+            playbookRuleCap: 40,
+            playbookEvictsAtCap: true,
+          },
+        });
+      }
+      const amendMatch = u.pathname.match(
+        /^\/api\/memory\/notes\/([^/]+)\/amend$/,
+      );
+      if (req.method === "POST" && amendMatch) {
+        return send(200, {
+          status: "amended",
+          code: 200,
+          created: false,
+          amended: true,
+          id: decodeURIComponent(amendMatch[1]!),
+          note: { id: decodeURIComponent(amendMatch[1]!), outcome: (body as any)?.outcome ?? null },
+        });
+      }
+      if (req.method === "POST" && u.pathname === "/api/memory/notes") {
+        const noteBody = (body ?? {}) as Record<string, unknown>;
+        if (state.noteStatus !== 201) {
+          return send(state.noteStatus, state.noteRejection);
+        }
+        return send(201, {
+          status: "created",
+          code: 201,
+          created: true,
+          amended: false,
+          id: `cnt_${String(noteBody.slug)}`,
+          note: { id: `cnt_${String(noteBody.slug)}`, ...noteBody },
         });
       }
       if (req.method === "POST" && u.pathname === "/api/agent/feedback") {
@@ -401,18 +471,204 @@ describe("MCP learning loop (CRUMB-113)", () => {
     );
   });
 
-  it("recallSimilarIssues surfaces outcomeSummary + resolution_verified reason from the cloud", async () => {
+  it("recallIssueContext returns all three sections from one POST", async () => {
     mock = await startMockCloud();
     configureCloud(mock.url);
     const server = new McpServer({ outputDir: tmpDir });
 
-    const { parsed } = await call(server, "recallSimilarIssues", {
-      query: "checkout 500 error",
+    const { parsed } = await call(server, "recallIssueContext", {
+      text: "checkout 500 error",
+      projectId: "proj_1",
     });
     expect(parsed.source).toBe("cloud");
-    const match = parsed.matches[0];
-    expect(match.outcomeSummary).toMatch(/verified in prod/);
-    expect(match.reasons).toContain("resolution_verified");
+    const precedent = parsed.precedents.results[0];
+    expect(precedent.outcomeSummary).toMatch(/verified in prod/);
+    // Per arm availability and the ambiguity gate survive the hop.
+    expect(parsed.precedents.arms.vector.available).toBe(true);
+    expect(parsed.precedents.ambiguous).toBe(false);
+    // "Could not check" stays distinguishable from "nothing found".
+    expect(parsed.duplicates.checked).toBe(false);
+    // Truncation disclosure and the playbook contrast are not flattened away.
+    expect(parsed.cautions.truncatedCount).toBe(0);
+    expect(parsed.cautions.playbookEvictsAtCap).toBe(true);
+    expect(parsed.cautions.notes[0].supersedes[0].id).toBe("cnt_0");
+
+    const req = mock.requests.find((r) => r.path === "/api/memory/recall");
+    expect(req!.method).toBe("POST");
+    expect(req!.agentToken).toBe("ctagt-token");
+    expect(req!.body).toMatchObject({ text: "checkout 500 error" });
+  });
+
+  it("recallIssueContext puts cautions back into an include that dropped it", async () => {
+    mock = await startMockCloud();
+    configureCloud(mock.url);
+    const server = new McpServer({ outputDir: tmpDir });
+
+    await call(server, "recallIssueContext", {
+      text: "checkout 500 error",
+      include: ["precedents"],
+    });
+    const req = mock.requests.find((r) => r.path === "/api/memory/recall");
+    // The request that leaves this machine already carries cautions. The cloud
+    // enforces the same rule; neither side relies on the other to do it.
+    expect(req!.body.include).toEqual(["precedents", "cautions"]);
+  });
+
+  it("recordClientNote posts a note with bearer auth", async () => {
+    mock = await startMockCloud();
+    configureCloud(mock.url);
+    const server = new McpServer({ outputDir: tmpDir });
+
+    const { isError, parsed } = await call(server, "recordClientNote", {
+      projectId: "proj_1",
+      scopeLevel: "client",
+      subjectKey: "checkout",
+      slug: "friday-test-cards",
+      kind: "gotcha",
+      body: "Their staging gateway rejects test cards on Fridays.",
+    });
+    expect(isError).toBe(false);
+    expect(parsed).toMatchObject({ status: "created", source: "cloud" });
+
+    const req = mock.requests.find((r) => r.path === "/api/memory/notes");
+    expect(req!.method).toBe("POST");
+    expect(req!.agentToken).toBe("ctagt-token");
+    expect(req!.body).toMatchObject({
+      scopeLevel: "client",
+      kind: "gotcha",
+      slug: "friday-test-cards",
+    });
+  });
+
+  it("recordClientNote surfaces a near_match refusal with its code, not as a success", async () => {
+    mock = await startMockCloud();
+    mock.state.noteStatus = 409;
+    mock.state.noteRejection = {
+      error: "A note that already says roughly this exists.",
+      code: "near_match",
+      action_required: "choose_one",
+    };
+    configureCloud(mock.url);
+    const server = new McpServer({ outputDir: tmpDir });
+
+    const { isError, text } = await call(server, "recordClientNote", {
+      scopeLevel: "general",
+      subjectKey: "checkout",
+      slug: "friday-test-cards",
+      kind: "gotcha",
+      body: "Their staging gateway rejects test cards on Fridays.",
+    });
+    expect(isError).toBe(true);
+    expect(text).toMatch(/near_match/);
+  });
+
+  it("recordClientNote rejects an unknown kind before any network call", async () => {
+    mock = await startMockCloud();
+    configureCloud(mock.url);
+    const server = new McpServer({ outputDir: tmpDir });
+    const { isError } = await call(server, "recordClientNote", {
+      scopeLevel: "client",
+      subjectKey: "checkout",
+      slug: "s",
+      kind: "vibes",
+      body: "b",
+    });
+    expect(isError).toBe(true);
+    expect(mock.requests).toHaveLength(0);
+  });
+
+  it("amendClientNote appends to one note and can flip its outcome", async () => {
+    mock = await startMockCloud();
+    configureCloud(mock.url);
+    const server = new McpServer({ outputDir: tmpDir });
+
+    const { isError, parsed } = await call(server, "amendClientNote", {
+      id: "cnt_1",
+      amendment: "Still true after the gateway upgrade.",
+      outcome: "held",
+    });
+    expect(isError).toBe(false);
+    expect(parsed).toMatchObject({ status: "amended", id: "cnt_1" });
+
+    const req = mock.requests.find((r) => r.path.endsWith("/amend"));
+    expect(req!.path).toBe("/api/memory/notes/cnt_1/amend");
+    expect(req!.body).toMatchObject({
+      amendment: "Still true after the gateway upgrade.",
+      outcome: "held",
+    });
+    // Body is never amendable on this path.
+    expect(req!.body.body).toBeUndefined();
+  });
+
+  it("resolveIssue records each rejected precedent as a rejected_solution note", async () => {
+    mock = await startMockCloud();
+    configureCloud(mock.url);
+    const server = new McpServer({ outputDir: tmpDir });
+
+    const { isError, parsed } = await call(server, "resolveIssue", {
+      memoryId: "mem_1",
+      disposition: "real-bug",
+      projectId: "proj_1",
+      rejectedMemoryIds: [
+        { memoryId: "mem_9", reason: "That fix targets the v1 cart API." },
+      ],
+    });
+    expect(isError).toBe(false);
+    expect(parsed.rejectionsLanded).toBe(1);
+    expect(parsed.rejections[0]).toMatchObject({
+      memoryId: "mem_9",
+      landed: true,
+    });
+
+    const req = mock.requests.find((r) => r.path === "/api/memory/notes");
+    expect(req!.body).toMatchObject({
+      kind: "rejected_solution",
+      // The flip out of future precedents keys on this.
+      subjectMemoryId: "mem_9",
+      subjectKey: "issue_memory:mem_9",
+      body: "That fix targets the v1 cart API.",
+    });
+  });
+
+  it("resolveIssue reports a rejection that did not land instead of hiding it", async () => {
+    mock = await startMockCloud();
+    mock.state.noteStatus = 503;
+    mock.state.noteRejection = {
+      error: "The near match guard could not run.",
+      code: "guard_unavailable",
+    };
+    configureCloud(mock.url);
+    const server = new McpServer({ outputDir: tmpDir });
+
+    const { isError, parsed } = await call(server, "resolveIssue", {
+      memoryId: "mem_1",
+      disposition: "real-bug",
+      rejectedMemoryIds: [{ memoryId: "mem_9", reason: "Wrong subsystem." }],
+    });
+    // The resolution itself landed, so this is not an error — but the rejection
+    // did not, and says so rather than being folded into the success.
+    expect(isError).toBe(false);
+    expect(parsed.rejectionsLanded).toBe(0);
+    expect(parsed.rejections[0]).toMatchObject({
+      memoryId: "mem_9",
+      landed: false,
+      code: "guard_unavailable",
+    });
+  });
+
+  it("resolveIssue refuses a rejection with no reason, before any write", async () => {
+    mock = await startMockCloud();
+    configureCloud(mock.url);
+    const server = new McpServer({ outputDir: tmpDir });
+    const { isError } = await call(server, "resolveIssue", {
+      memoryId: "mem_1",
+      disposition: "real-bug",
+      rejectedMemoryIds: ["mem_9"],
+    });
+    expect(isError).toBe(true);
+    // Nothing was written: a malformed rejection is an argument error, not a
+    // half-applied resolve.
+    expect(mock.requests).toHaveLength(0);
   });
 
   it("recordFeedback posts an agent signal with bearer auth and source=agent", async () => {
