@@ -287,39 +287,14 @@ export function buildRecallStore(outputDir: string): RecallStore {
   };
 }
 
-/** Delegate recall to the cloud org-memory index when configured. Returns
- *  undefined (falling back to local) on any misconfiguration or transport error. */
-export async function recallViaCloud(
-  sessionId: string | undefined,
-  query: string | undefined,
-  limit: number,
-): Promise<Record<string, unknown> | undefined> {
-  const base = process.env.CRUMBTRAIL_CLOUD_URL?.replace(/\/+$/, "");
-  const token = process.env.CRUMBTRAIL_CLOUD_TOKEN;
-  if (!base || !token) return undefined;
-  const params = new URLSearchParams({ limit: String(limit) });
-  if (sessionId) params.set("sessionId", sessionId);
-  else if (query) params.set("q", query);
-  else return undefined;
-  try {
-    const res = await fetch(`${base}/api/memory/recall?${params.toString()}`, {
-      headers: { authorization: `Bearer ${token}` },
-    });
-    if (!res.ok) return undefined;
-    return (await res.json()) as Record<string, unknown>;
-  } catch {
-    return undefined;
-  }
-}
-
 /**
  * Pull a pre-assembled ticket bundle from the cloud by-ticket endpoint. Reads the
- * SAME env pair recallViaCloud uses (CRUMBTRAIL_CLOUD_URL/CRUMBTRAIL_CLOUD_TOKEN)
+ * SAME env pair the learning-loop client uses (CRUMBTRAIL_CLOUD_URL/CRUMBTRAIL_CLOUD_TOKEN)
  * and authenticates with the same agent-token bearer. Returns the parsed
  * `{ id, status, confidence, sessionId?, bundle }` envelope on a hit, or undefined
  * on ANY miss/failure/unconfigured env — the caller then falls back to the local
- * fetch + auto-locate path. This deliberate always-fall-back shape (identical to
- * recallViaCloud) makes the pull a fast path, never a hard dependency: a cloud
+ * fetch + auto-locate path. This deliberate always-fall-back shape makes the
+ * pull a fast path, never a hard dependency: a cloud
  * outage degrades to local behavior, it never fails the MCP call.
  */
 export async function pullBundleByTicketViaCloud(
@@ -340,4 +315,50 @@ export async function pullBundleByTicketViaCloud(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Local exact-duplicate lookup: distinct bugs in the session store whose
+ * signature is one of `signatures`.
+ *
+ * Exact only, deliberately. The cloud's `duplicates` section is signature or
+ * `(source, sourceRef)` equality with no threshold and no closest-match
+ * fallback, and the local analogue keeps that contract: a near miss is a
+ * precedent, never a duplicate. `recallLocal` is the fuzzy path and stays where
+ * it is.
+ */
+export async function recallLocalDuplicates(
+  store: RecallStore,
+  signatures: readonly string[],
+  limit: number,
+): Promise<Record<string, unknown>[]> {
+  const wanted = new Set(signatures.filter(Boolean));
+  if (wanted.size === 0) return [];
+  const seen = new Set<string>();
+  const matches: Record<string, unknown>[] = [];
+  for (const { id, dir } of await store.listSessions()) {
+    for (const raw of await store.readDistinctBugs(dir)) {
+      if (!store.isDistinctBugRecord(raw)) continue;
+      const bug = raw as unknown as DistinctBug;
+      const signature = buildDistinctBugSignature(bug);
+      if (!signature || !wanted.has(signature) || seen.has(signature)) continue;
+      seen.add(signature);
+      matches.push(
+        removeUndefined({
+          sessionId: id,
+          bugId: bug.bugId,
+          signature,
+          title: bug.title,
+          route: bug.representative?.route,
+          errorFamily: bug.representative?.detector,
+          severity: bug.severity,
+          // How the equality was established. Never a score: this section has
+          // none.
+          via: "signature",
+        }),
+      );
+      if (matches.length >= limit) return matches;
+    }
+  }
+  return matches;
 }

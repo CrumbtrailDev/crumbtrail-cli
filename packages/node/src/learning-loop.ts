@@ -433,3 +433,358 @@ export async function getFixVerificationViaCloud(input: {
     return { ok: false, reason: "transport", message: TRANSPORT_MESSAGE };
   }
 }
+
+// --- Client ticket memory: three-section recall + the notes write path ------
+//
+//   recallIssueContextViaCloud  -> POST /api/memory/recall            (agent-token auth)
+//   recordClientNoteViaCloud    -> POST /api/memory/notes             (agent-token auth)
+//   amendClientNoteViaCloud     -> POST /api/memory/notes/:id/amend   (agent-token auth)
+//
+// These replace the old `GET /api/memory/recall` single-list read. The cloud
+// keeps that route alive for the deployment window only; nothing in this
+// package calls it any more.
+
+/**
+ * The three sections of a recall answer, and the one a caller cannot drop.
+ *
+ * Mirrors `RECALL_SECTIONS` / `MANDATORY_RECALL_SECTION` in the cloud's
+ * `routes/memory-routes.ts`. The rule is enforced on BOTH sides on purpose: the
+ * cloud adds `cautions` back to whatever `include` it receives, and this client
+ * adds it back before the request is even sent, so a local (non-cloud) run and
+ * an older cloud both behave the same way.
+ */
+export const RECALL_SECTIONS = [
+  "duplicates",
+  "precedents",
+  "cautions",
+] as const;
+export type RecallSection = (typeof RECALL_SECTIONS)[number];
+
+/** `cautions` carries what we already know will bite on this client. An agent
+ *  narrowing its way out of the warnings is the one narrowing we refuse. */
+export const MANDATORY_RECALL_SECTION: RecallSection = "cautions";
+
+/**
+ * Normalise an `include` list. Returns `undefined` for "all three" and never
+ * returns a list without {@link MANDATORY_RECALL_SECTION} in it.
+ *
+ * An unknown entry is an error rather than a silent drop: a typo that quietly
+ * removes a section is the same failure as omitting the section.
+ */
+export function withMandatoryCautions(
+  raw: unknown,
+): RecallSection[] | undefined | "invalid" {
+  if (raw === undefined || raw === null) return undefined;
+  if (!Array.isArray(raw) || raw.length === 0) return "invalid";
+  const requested = new Set<RecallSection>();
+  for (const entry of raw) {
+    if (typeof entry !== "string") return "invalid";
+    if (!(RECALL_SECTIONS as readonly string[]).includes(entry)) {
+      return "invalid";
+    }
+    requested.add(entry as RecallSection);
+  }
+  requested.add(MANDATORY_RECALL_SECTION);
+  return RECALL_SECTIONS.filter((section) => requested.has(section));
+}
+
+/** Note kinds the cloud accepts. Mirrors `CLIENT_NOTE_KINDS`. */
+export const CLIENT_NOTE_KINDS = [
+  "gotcha",
+  "constraint",
+  "environment",
+  "preference",
+  "rejected_solution",
+] as const;
+export type ClientNoteKind = (typeof CLIENT_NOTE_KINDS)[number];
+
+/** The scope ladder. Mirrors `NOTE_SCOPE_LEVELS`. */
+export const NOTE_SCOPE_LEVELS = ["general", "client", "end_customer"] as const;
+export type NoteScopeLevel = (typeof NOTE_SCOPE_LEVELS)[number];
+
+/** Where a note stands now. Mirrors `CLIENT_NOTE_OUTCOMES`. */
+export const CLIENT_NOTE_OUTCOMES = [
+  "open",
+  "held",
+  "resolved",
+  "obsolete",
+] as const;
+export type ClientNoteOutcome = (typeof CLIENT_NOTE_OUTCOMES)[number];
+
+/** Mirrors `AXIS_CAUSE_VALUES` in the cloud's `ticket/axes.ts`. */
+export const AXIS_CAUSE_VALUES = [
+  "code",
+  "data",
+  "infrastructure",
+  "configuration",
+  "client-environment",
+  "intentional-change",
+  "third-party",
+  "unknown",
+] as const;
+export type AxisCause = (typeof AXIS_CAUSE_VALUES)[number];
+
+/** Mirrors `AXIS_SYMPTOM_VALUES` in the cloud's `ticket/axes.ts`. */
+export const AXIS_SYMPTOM_VALUES = [
+  "crash",
+  "wrong-data",
+  "slow",
+  "blocked-access",
+  "missing-ui",
+  "unknown",
+] as const;
+export type AxisSymptom = (typeof AXIS_SYMPTOM_VALUES)[number];
+
+/** The kind whose write also flips the referenced memory row out of the
+ *  precedents WHERE clause. */
+export const NOTE_KIND_REJECTED_SOLUTION: ClientNoteKind = "rejected_solution";
+
+export interface RecallIssueContextInput {
+  projectId?: string;
+  sessionId?: string;
+  text?: string;
+  source?: string;
+  sourceRef?: string;
+  bugSignatures?: string[];
+  limit?: number;
+  cautionsLimit?: number;
+  endCustomer?: string;
+  accountId?: string;
+  axisLocation?: string;
+  axisCause?: AxisCause;
+  kinds?: ClientNoteKind[];
+  /** Already normalised by {@link withMandatoryCautions}. */
+  include?: RecallSection[];
+}
+
+/**
+ * Ask the cloud all three questions in one call: is this a duplicate, has a
+ * lookalike been fixed before, and what do we already know that will bite.
+ *
+ * Unlike the old recall helper this does NOT collapse a failure to `undefined`.
+ * `cautions` has no offline analogue, so a failure that silently degraded to
+ * the local path would hand the agent an answer with the warnings quietly
+ * missing. The caller decides what to do with the reason.
+ */
+export async function recallIssueContextViaCloud(
+  input: RecallIssueContextInput,
+): Promise<LearningLoopResult<Record<string, unknown>>> {
+  const auth = agentAuth();
+  if (!auth) {
+    return unconfigured(
+      "Cloud issue context recall requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
+    );
+  }
+  const body: Record<string, unknown> = {};
+  const copy = <K extends keyof RecallIssueContextInput>(key: K): void => {
+    const value = input[key];
+    if (value !== undefined) body[key as string] = value;
+  };
+  copy("projectId");
+  copy("sessionId");
+  copy("text");
+  copy("source");
+  copy("sourceRef");
+  copy("bugSignatures");
+  copy("limit");
+  copy("cautionsLimit");
+  copy("endCustomer");
+  copy("accountId");
+  copy("axisLocation");
+  copy("axisCause");
+  copy("kinds");
+  // Belt and braces: whatever reached this function, cautions is in the ask.
+  if (input.include !== undefined) {
+    const sections = new Set<RecallSection>(input.include);
+    sections.add(MANDATORY_RECALL_SECTION);
+    body.include = RECALL_SECTIONS.filter((section) => sections.has(section));
+  }
+  try {
+    const res = await fetch(`${auth.base}/api/memory/recall`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${auth.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    return await parseResponse<Record<string, unknown>>(res);
+  } catch {
+    return { ok: false, reason: "transport", message: TRANSPORT_MESSAGE };
+  }
+}
+
+export interface RecordClientNoteInput {
+  projectId?: string;
+  scopeLevel: NoteScopeLevel;
+  endCustomer?: string;
+  subjectKey: string;
+  slug: string;
+  kind: ClientNoteKind;
+  body: string;
+  outcome?: ClientNoteOutcome;
+  axisLocation?: string;
+  axisCause?: AxisCause;
+  axisSymptom?: AxisSymptom;
+  accountIds?: string[];
+  /** Required for a `rejected_solution` note: the memory row being rejected. */
+  subjectMemoryId?: string;
+  /** Override for the near-match guard. Refused without `distinctBecause`. */
+  confirmDistinct?: boolean;
+  distinctBecause?: string;
+}
+
+/**
+ * Record a client note, or amend one on an exact id collision.
+ *
+ * The interesting outcomes are NOT transport failures and must not be rendered
+ * as such: `409 near_match` is the guard asking the caller to choose one of the
+ * candidates it found, `409 cap_reached` means the active cap is full and a
+ * note must be archived first, and `503 guard_unavailable` means the guard
+ * could not run so the create was refused rather than let through unguarded.
+ * Each arrives as `reason: "rejected"` with the cloud's own `code`, which the
+ * MCP tool surfaces verbatim.
+ */
+export async function recordClientNoteViaCloud(
+  input: RecordClientNoteInput,
+): Promise<LearningLoopResult<Record<string, unknown>>> {
+  const auth = agentAuth();
+  if (!auth) {
+    return unconfigured(
+      "Recording a client note requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
+    );
+  }
+  const body: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (value !== undefined) body[key] = value;
+  }
+  try {
+    const res = await fetch(`${auth.base}/api/memory/notes`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${auth.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    return await parseResponse<Record<string, unknown>>(res);
+  } catch {
+    return { ok: false, reason: "transport", message: TRANSPORT_MESSAGE };
+  }
+}
+
+export interface AmendClientNoteInput {
+  id: string;
+  amendment: string;
+  outcome?: ClientNoteOutcome;
+}
+
+/**
+ * Append an amendment to an existing note's sealed history, optionally flipping
+ * its outcome. `body` is deliberately not amendable: replacing a note's text is
+ * a separate act that archives the old text first, and it is not exposed here.
+ */
+export async function amendClientNoteViaCloud(
+  input: AmendClientNoteInput,
+): Promise<LearningLoopResult<Record<string, unknown>>> {
+  const auth = agentAuth();
+  if (!auth) {
+    return unconfigured(
+      "Amending a client note requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
+    );
+  }
+  const body: Record<string, unknown> = { amendment: input.amendment };
+  if (input.outcome !== undefined) body.outcome = input.outcome;
+  try {
+    const res = await fetch(
+      `${auth.base}/api/memory/notes/${encodeURIComponent(input.id)}/amend`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${auth.token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      },
+    );
+    return await parseResponse<Record<string, unknown>>(res);
+  } catch {
+    return { ok: false, reason: "transport", message: TRANSPORT_MESSAGE };
+  }
+}
+
+/** One rejected fix, and why the agent rejected it. */
+export interface RejectedMemory {
+  memoryId: string;
+  reason: string;
+}
+
+/** What happened to one rejection. `landed: false` is always accompanied by a
+ *  machine `code` and a message, never by silence. */
+export interface RejectedMemoryOutcome {
+  memoryId: string;
+  landed: boolean;
+  noteId?: string;
+  status?: string;
+  code?: string;
+  message?: string;
+}
+
+export const MAX_REJECTED_MEMORY_IDS = 20;
+
+/**
+ * Record each rejected fix as a `rejected_solution` note.
+ *
+ * There is no `rejectedMemoryIds` field on `POST /api/memory/resolve`, and
+ * inventing one on the wire would have been the wrong shape: the rejection has
+ * to flip `issue_memory.outcome_state` to `'rejected'` so the row leaves the
+ * precedents WHERE clause, and the only endpoint that performs that flip — in
+ * the same transaction as the note that explains it — is the notes route with
+ * `kind: "rejected_solution"`. So a rejection is a note write, and this is
+ * where the composition lives.
+ *
+ * `slug` and `subjectKey` are both derived from the rejected memory id, which
+ * makes the note id deterministic per rejected fix: rejecting the same fix
+ * twice AMENDS the first note rather than creating a second one.
+ *
+ * Every outcome is reported per id. A guard refusal on one rejection must not
+ * hide the others, and must not be mistaken for the rejection having landed.
+ */
+export async function recordRejectedSolutionsViaCloud(
+  rejected: readonly RejectedMemory[],
+  context: { projectId?: string; endCustomer?: string },
+): Promise<RejectedMemoryOutcome[]> {
+  const outcomes: RejectedMemoryOutcome[] = [];
+  for (const entry of rejected) {
+    const result = await recordClientNoteViaCloud({
+      projectId: context.projectId,
+      // Client scope: the rejection is a fact about this client's codebase, not
+      // a rule that spans every tenant we serve.
+      scopeLevel: "client",
+      endCustomer: context.endCustomer,
+      subjectKey: `issue_memory:${entry.memoryId}`,
+      slug: `rejected-fix-${entry.memoryId}`,
+      kind: NOTE_KIND_REJECTED_SOLUTION,
+      body: entry.reason,
+      subjectMemoryId: entry.memoryId,
+    });
+    if (result.ok) {
+      const id = result.data.id;
+      const status = result.data.status;
+      outcomes.push({
+        memoryId: entry.memoryId,
+        landed: true,
+        noteId: typeof id === "string" ? id : undefined,
+        status: typeof status === "string" ? status : undefined,
+      });
+      continue;
+    }
+    outcomes.push({
+      memoryId: entry.memoryId,
+      landed: false,
+      code: result.reason === "rejected" ? result.code : result.reason,
+      message: result.message,
+    });
+  }
+  return outcomes;
+}

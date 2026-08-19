@@ -76,7 +76,7 @@ If the archetype is one that repeats, ask whether this failure has been seen bef
 ]
 ```
 
-`recallSimilarIssues` is the other source of a signature, and it carries how past instances were resolved. Do not reach for `resolveSignature` here: it searches a session's interactive element map and does not return a recurrence signature.
+`recallIssueContext` is the other source of a signature: its `precedents` section carries how past instances were resolved, and its `duplicates` section answers exact signature equality with no threshold at all. Do not reach for `resolveSignature` here: it searches a session's interactive element map and does not return a recurrence signature.
 
 Two more entry points are worth knowing. `getFixContext` returns the whole ranked bundle for one session in a single call, which is the right move once you know which session matters. `listDistinctBugs` with `mode` set to the cross session value groups the same failure across sessions.
 

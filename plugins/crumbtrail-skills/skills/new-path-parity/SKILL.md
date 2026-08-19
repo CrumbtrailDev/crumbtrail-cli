@@ -52,7 +52,7 @@ will see named in the candidate list, are `ui_api_divergence`, `displayed_field_
 `db_write_read_column_split`, `result_row_loss` and `stale_client_build`.
 
 One operational limit worth knowing before you plan the work: `getRegressionContext` and
-`recallSimilarIssues` read the session tree directly and are refused when the server is running
+`recallIssueContext` read the session tree directly and are refused when the server is running
 against the hosted store. Both are available when you are reading local recordings.
 
 ## Call sequence
