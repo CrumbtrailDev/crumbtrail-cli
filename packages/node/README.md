@@ -250,8 +250,12 @@ current code and tests, and report uncertainty or evidence gaps.
    an issue, call `resolveIssue` with its disposition and the `usedMemoryIds` you
    adopted so recall learns which past answers helped. Use `recordFeedback` to
    rate a recall match, opinion, or playbook rule, and `getPlaybook` to read the
-   tenant guidance the cloud has learned. These write only to Crumbtrail's own
-   learning store, never to your app, tickets, or external systems.
+   tenant guidance the cloud has learned. A resolution recorded this way carries
+   provenance `agent`, because it is the agent's claim; only a person acting in
+   an authenticated Crumbtrail session records a confirmed human outcome, and
+   the learning loop weighs the two differently. These write only to
+   Crumbtrail's own learning store, never to your app, tickets, or external
+   systems.
 7. Check that the fix held (cloud only): once the fix is deployed and reachable
    by real traffic, call `startFixVerification` to open an observation window on
    the canonical issue, then read the verdict later with `getFixVerification`.

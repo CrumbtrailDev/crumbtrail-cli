@@ -7,7 +7,7 @@ import { McpServer } from "../mcp-server";
 
 /**
  * CRUMB-113: the MCP server wires four things into the per-tenant learning loop.
- *  - resolveIssue   -> POST /api/memory/resolve  with optional usedMemoryIds (project-key auth)
+ *  - resolveIssue   -> POST /api/memory/resolve  with optional usedMemoryIds (agent-token auth)
  *  - recallSimilarIssues surfaces outcomeSummary + resolution_* reasons from the cloud
  *  - recordFeedback -> POST /api/agent/feedback  (agent-token auth)
  *  - getPlaybook    -> GET  /api/agent/playbook  (agent-token auth)
@@ -101,10 +101,27 @@ function startMockCloud(): Promise<MockCloud> {
         const used = Array.isArray(memBody.usedMemoryIds)
           ? memBody.usedMemoryIds
           : undefined;
+        // The cloud requires provenance and answers 400 invalid_provenance when
+        // it is absent or outside the vocabulary. Mirrored here so a client that
+        // stopped sending it fails these tests instead of failing in the field.
+        if (
+          !["inferred", "agent", "human-confirmed"].includes(
+            memBody.provenance as string,
+          )
+        ) {
+          return send(400, {
+            error:
+              "provenance must be one of: inferred, agent, human-confirmed",
+            code: "invalid_provenance",
+          });
+        }
         return send(200, {
           ok: true,
           memoryId: memBody.memoryId,
-          resolution: { disposition: memBody.disposition, source: "human" },
+          resolution: {
+            disposition: memBody.disposition,
+            provenance: memBody.provenance,
+          },
           ...(used ? { adopted: used.length } : {}),
         });
       }
@@ -246,7 +263,89 @@ describe("MCP learning loop (CRUMB-113)", () => {
       disposition: "real-bug",
       usedMemoryIds: ["mem_1", "mem_2"],
       rootCause: "null cart",
+      // The cloud requires provenance and 400s without it. An MCP call is a
+      // model's claim, so it goes on the wire as "agent" and never as a
+      // person's confirmation.
+      provenance: "agent",
     });
+  });
+
+  it("resolveIssue always sends provenance 'agent', whatever the agent passes", async () => {
+    mock = await startMockCloud();
+    configureCloud(mock.url);
+    const server = new McpServer({ outputDir: tmpDir });
+
+    // An agent that tries to claim a person confirmed the resolution — by the
+    // documented wire name or by any near miss — is ignored, not obeyed. The
+    // tool takes no provenance argument, so there is nothing to override.
+    const { isError } = await call(server, "resolveIssue", {
+      memoryId: "mem_1",
+      disposition: "real-bug",
+      provenance: "human-confirmed",
+      source: "human",
+      confirmed: true,
+    });
+
+    expect(isError).toBe(false);
+    const req = mock.requests.find((r) => r.path === "/api/memory/resolve");
+    expect(req!.body.provenance).toBe("agent");
+    expect(req!.body).not.toHaveProperty("source");
+    expect(req!.body).not.toHaveProperty("confirmed");
+  });
+
+  it("the resolveIssue tool schema exposes no provenance argument", async () => {
+    const server = new McpServer({ outputDir: tmpDir });
+    const listed = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/list",
+      params: {},
+    });
+    const resolveTool = (listed!.result as any).tools.find(
+      (t: { name: string }) => t.name === "resolveIssue",
+    );
+    expect(resolveTool).toBeDefined();
+    expect(Object.keys(resolveTool.inputSchema.properties)).not.toContain(
+      "provenance",
+    );
+    expect(resolveTool.inputSchema.required).not.toContain("provenance");
+  });
+
+  /**
+   * The guard that outlives this file: no shipped source in the SDK may put
+   * "human-confirmed" on the wire. The string is allowed to exist exactly once,
+   * in learning-loop.ts, where it is a vocabulary constant documenting what the
+   * cloud accepts — never at a call site. A human's confirmation is recorded
+   * through an authenticated dashboard session, not by an agent asserting it.
+   */
+  it("no shipped source outside the provenance vocabulary mentions human-confirmed", () => {
+    const srcRoot = path.resolve(__dirname, "..", "..", "..");
+    const offenders: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (
+            entry.name === "node_modules" ||
+            entry.name === "dist" ||
+            entry.name === "__tests__"
+          )
+            continue;
+          walk(full);
+          continue;
+        }
+        if (!/\.(ts|tsx|mts|cts)$/.test(entry.name)) continue;
+        if (!fs.readFileSync(full, "utf-8").includes("human-confirmed"))
+          continue;
+        offenders.push(path.relative(srcRoot, full).split(path.sep).join("/"));
+      }
+    };
+    for (const pkg of fs.readdirSync(srcRoot, { withFileTypes: true })) {
+      if (!pkg.isDirectory()) continue;
+      const src = path.join(srcRoot, pkg.name, "src");
+      if (fs.existsSync(src)) walk(src);
+    }
+    expect(offenders).toEqual(["node/src/learning-loop.ts"]);
   });
 
   it("resolveIssue omits usedMemoryIds when not provided (no adopted count)", async () => {

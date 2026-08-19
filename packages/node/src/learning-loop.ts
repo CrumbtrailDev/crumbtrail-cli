@@ -36,6 +36,28 @@ export const ISSUE_DISPOSITIONS = [
 ] as const;
 export type IssueDisposition = (typeof ISSUE_DISPOSITIONS)[number];
 
+/** Who produced a resolution, on POST /api/memory/resolve. Mirrors the server's
+ *  `OUTCOME_PROVENANCES` in packages/cloud/src/ticket-outcomes.ts.
+ *
+ *  - `inferred`          — read out of a tracker's own close data; nobody was asked.
+ *  - `agent`             — a model's claim. Useful signal, never ground truth.
+ *  - `human-confirmed`   — a person decided it through an authenticated session.
+ *
+ *  The cloud requires it and rejects a request that omits it with 400
+ *  `invalid_provenance`. It is NOT defaulted here either, and specifically never
+ *  defaulted to `human-confirmed`: the route used to hard code
+ *  `source: "human", confirmed: true` on every write, so an agent's guess was
+ *  stored as a person's confirmation in the one dataset the learning loop
+ *  weights. A default anywhere on the path — client or caller — restores that
+ *  laundering quietly, so every caller states its own provenance. */
+export const ISSUE_RESOLUTION_PROVENANCES = [
+  "inferred",
+  "agent",
+  "human-confirmed",
+] as const;
+export type IssueResolutionProvenance =
+  (typeof ISSUE_RESOLUTION_PROVENANCES)[number];
+
 /** Feedback subject kinds the cloud accepts on POST /api/agent/feedback. Mirrors
  *  the server's `LEARNING_FEEDBACK_SUBJECT_KINDS` in packages/cloud/src/learning-feedback.ts. */
 export const FEEDBACK_SUBJECT_KINDS = [
@@ -120,7 +142,8 @@ function unconfigured<T>(message: string): LearningLoopResult<T> {
   return {
     ok: false,
     reason: "unconfigured",
-    message: base && !isTransportSecureBase(base) ? INSECURE_BASE_MESSAGE : message,
+    message:
+      base && !isTransportSecureBase(base) ? INSECURE_BASE_MESSAGE : message,
   };
 }
 
@@ -152,6 +175,10 @@ const TRANSPORT_MESSAGE =
 export interface ResolveIssueInput {
   memoryId: string;
   disposition: IssueDisposition;
+  /** Required, and deliberately not optional: see ISSUE_RESOLUTION_PROVENANCES.
+   *  A caller that cannot honestly claim a person confirmed the resolution
+   *  sends `agent`. */
+  provenance: IssueResolutionProvenance;
   duplicateOf?: string;
   rootCause?: string;
   fixRef?: string;
@@ -173,7 +200,10 @@ export interface ResolveIssueResponse {
 
 /**
  * Record a resolution disposition for an indexed issue memory, optionally
- * reporting which recall matches the agent adopted. Project-key auth.
+ * reporting which recall matches the agent adopted. Agent-token auth.
+ *
+ * `provenance` is always sent; the cloud answers 400 `invalid_provenance` when
+ * it is missing or unrecognised.
  */
 export async function resolveIssueViaCloud(
   input: ResolveIssueInput,
@@ -187,6 +217,7 @@ export async function resolveIssueViaCloud(
   const body: Record<string, unknown> = {
     memoryId: input.memoryId,
     disposition: input.disposition,
+    provenance: input.provenance,
   };
   if (input.duplicateOf !== undefined) body.duplicateOf = input.duplicateOf;
   if (input.rootCause !== undefined) body.rootCause = input.rootCause;

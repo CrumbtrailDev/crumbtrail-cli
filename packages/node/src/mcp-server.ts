@@ -848,7 +848,7 @@ const TOOLS = [
   {
     name: "resolveIssue",
     description:
-      "Close the loop after diagnosing a recalled issue: record its resolution disposition in the cloud issue memory and, crucially, report which recall matches you actually reused via usedMemoryIds so the org recall index learns which past answers close real bugs. This does NOT touch the user's app, tickets, or external systems; it writes only to Crumbtrail's own memory. memoryId is a recall match id (the `id` field from recallSimilarIssues). Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
+      "Close the loop after diagnosing a recalled issue: record its resolution disposition in the cloud issue memory and, crucially, report which recall matches you actually reused via usedMemoryIds so the org recall index learns which past answers close real bugs. This does NOT touch the user's app, tickets, or external systems; it writes only to Crumbtrail's own memory. memoryId is a recall match id (the `id` field from recallSimilarIssues). The resolution is recorded with provenance 'agent', because it is your claim rather than a person's confirmation; a human confirming a resolution does so in the Crumbtrail dashboard, and no tool argument can stand in for that. Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -2455,7 +2455,18 @@ export class McpServer {
   /**
    * Resolve an indexed issue memory in the cloud, optionally reporting the
    * recall matches the agent adopted (usedMemoryIds) so the org recall index
-   * learns which prior answers close real bugs. Project-key auth.
+   * learns which prior answers close real bugs. Agent-token auth.
+   *
+   * Provenance is fixed at "agent" here and is not a tool argument. Every call
+   * on this path arrives from a model over stdio; there is no channel on it
+   * that authenticates a person, so a caller-supplied human provenance would be
+   * an agent's claim wearing a person's label. That is exactly what the
+   * cloud route stopped doing when it dropped its hard coded
+   * `source: "human", confirmed: true`, and the learning loop weights confirmed
+   * human outcomes, so restoring it here would weight guesses again. A person's
+   * confirmation is recorded through an authenticated dashboard session, which
+   * is the only place a human is actually present. Do not add a provenance
+   * argument to this tool.
    */
   private async toolResolveIssue(args: Record<string, unknown>) {
     const memoryId = stringField(args.memoryId)?.trim();
@@ -2488,6 +2499,7 @@ export class McpServer {
     const result = await resolveIssueViaCloud({
       memoryId,
       disposition: disposition as IssueDisposition,
+      provenance: "agent",
       duplicateOf: stringField(args.duplicateOf),
       rootCause: stringField(args.rootCause),
       fixRef: stringField(args.fixRef),
