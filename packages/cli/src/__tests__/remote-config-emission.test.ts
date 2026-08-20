@@ -1,12 +1,14 @@
 // Every browser init the installer writes must opt into the capture config poll.
 //
-// The poll is the only path a project's capture settings have into a running
-// app: the kill switch, the auto flag triggers and their tail, baseline
-// sampling, consent mode, client side masking, session replay and live probes
-// all arrive on it. An init that omits `remoteConfig` produces an app whose
-// settings page saves, persists and displays as applied while changing nothing,
-// which is why this is asserted per snippet builder rather than once — a recipe
-// added later must not be able to drop the line quietly.
+// The poll is the only path these capture settings have into a running app: the
+// auto flag triggers and their tail, baseline sampling, consent mode, client
+// side masking, switching session replay on, and live probe delivery all arrive
+// on it. The kill switch, the budgets, row value redaction and the replay write
+// refusal are enforced at ingest instead, so those are not at stake here. An
+// init that omits `remoteConfig` produces an app whose settings page saves,
+// persists and displays as applied while changing nothing, which is why this is
+// asserted per snippet builder rather than once — a recipe added later must not
+// be able to drop the line quietly.
 
 import { describe, expect, it } from "vitest";
 import path from "node:path";

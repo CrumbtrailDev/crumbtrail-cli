@@ -18,9 +18,11 @@ function singleQuoted(value: string): string {
  * The line that makes the project's capture settings reach the running app.
  *
  * Without it the SDK never polls `/api/capture-config`, and every setting that
- * only exists on that poll — the kill switch, the auto flag triggers and their
- * tail, baseline sampling, consent mode, client side masking, session replay,
- * and live probes — saves in the dashboard and changes nothing in the app. It
+ * only exists on that poll — the auto flag triggers and their tail, baseline
+ * sampling, consent mode, client side masking, switching session replay on,
+ * and live probe delivery — saves in the dashboard and changes nothing in the
+ * app. The kill switch, the budgets, row value redaction and the replay write
+ * refusal are not in that set: ingest enforces those whatever a client sends. It
  * is emitted rather than defaulted on in the SDK because the poll is fail
  * closed, so it is only correct for a client pointed at Crumbtrail, which is
  * exactly what the installer is wiring. No endpoint and no second copy of the

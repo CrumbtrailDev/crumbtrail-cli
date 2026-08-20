@@ -647,10 +647,13 @@ export interface CrumbtrailConfig {
    * Poll Crumbtrail for this project's capture settings after initialization.
    *
    * This is what makes the project's settings page reach the running app: the
-   * kill switch, the auto flag triggers and their tail, baseline sampling,
-   * consent mode, client side masking, session replay, and live probes all
-   * arrive on that poll and nowhere else. Off by default because the poll is
-   * fail closed — capture waits for the first policy response — so a client
+   * auto flag triggers and their tail, baseline sampling, consent mode, client
+   * side masking, switching session replay on, and live probe delivery all
+   * arrive on that poll and nowhere else. The kill switch, the capture budgets,
+   * row value redaction and the refusal of replay writes are enforced at ingest
+   * too, so those hold whatever the client is running, and the poll only lets a
+   * client stop buffering sooner. Off by default because the poll is fail
+   * closed — capture waits for the first policy response — so a client
    * pointed at something that does not serve the config route must not be
    * switched into waiting for one. Every install path the installer writes
    * sets it, because every one of those points at Crumbtrail.
