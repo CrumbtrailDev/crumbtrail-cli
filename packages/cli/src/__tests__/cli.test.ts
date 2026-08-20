@@ -377,7 +377,7 @@ describe("wizard orchestration", () => {
     // The key VALUE still never reaches the terminal. Scrollback, CI logs and
     // screen shares all outlive the run.
     expect(out).not.toMatch(/ctkey_|bgk_|bl_key_/);
-    expect(out).toContain("/bugs"); // dashboard link
+    expect(out).toContain("/issues"); // dashboard link
     expect(out).toContain("/sessions/sess-1"); // deep link to the live session
     expect(out).toContain("/app/src/main.ts"); // injection names the file
   });

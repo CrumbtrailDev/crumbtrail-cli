@@ -846,11 +846,14 @@ function planOtlp(input: BuildPlanInput): Plan {
   const otlp = buildOtlpSnippets({
     endpoint: input.endpoint,
     apiKey: KEY_PLACEHOLDER,
+    serviceName: input.serviceName,
   });
   const snippet = [
     otlp.env,
     "",
     otlp.authHeader,
+    "",
+    otlp.serviceName,
     "",
     otlp.sessionAttr,
     "",
@@ -862,13 +865,15 @@ function planOtlp(input: BuildPlanInput): Plan {
     targetPath: null,
     content: null,
     snippet,
-    // No service name here: this is the OTLP branch, and the receiver reads an
-    // app only from the ingest key, which under a project key names none. An
-    // instruction to stamp the app would be a promise nothing keeps yet.
-    agentPrompt: buildAgentPrompt(stack, {
-      endpoint: input.endpoint,
-      apiKey: KEY_PLACEHOLDER,
-    }),
+    // The receiver resolves an app from the standard `service.name` resource
+    // attribute when the ingest key names none, so the OTLP path can declare
+    // which app it is: the snippet sets OTEL_SERVICE_NAME and the prompt says
+    // to keep it.
+    agentPrompt: buildAgentPrompt(
+      stack,
+      { endpoint: input.endpoint, apiKey: KEY_PLACEHOLDER },
+      { serviceName: input.serviceName },
+    ),
     warnings: [],
   };
 }
