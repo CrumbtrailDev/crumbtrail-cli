@@ -198,3 +198,80 @@ describe("resolveProject with --project", () => {
     expect(project).toEqual({ id: "prj_7f3a", name: "prj_7f3a" });
   });
 });
+
+describe("resolveProject interactive default", () => {
+  /** Records what the picker was offered and answers with `pick`. */
+  function prompterThatPicks(pick: number) {
+    const seen: { labels: string[]; def?: number } = { labels: [] };
+    return {
+      seen,
+      prompter: {
+        ask: vi.fn(async (_q: string, def?: string) => def ?? ""),
+        confirm: vi.fn(async () => true),
+        select: vi.fn(async (_q: string, labels: string[], def?: number) => {
+          seen.labels = labels;
+          seen.def = def;
+          return pick;
+        }),
+        multiselect: vi.fn(async () => []),
+        close: vi.fn(),
+      } as unknown as Parameters<typeof resolveProject>[0]["prompter"],
+    };
+  }
+
+  const ui = {
+    out: vi.fn(),
+    err: vi.fn(),
+    step: vi.fn(),
+    warn: vi.fn(),
+    ok: vi.fn(),
+  } as unknown as Parameters<typeof resolveProject>[0]["ui"];
+
+  function listing(projects: Array<{ id: string; name: string }>) {
+    return vi.fn(async (url: string | URL | Request) => {
+      if (String(url).includes("/api/projects"))
+        return jsonResponse(200, { projects });
+      return jsonResponse(200, {});
+    }) as unknown as typeof fetch;
+  }
+
+  it("offers the existing project first, so joining is the default", async () => {
+    const { seen, prompter } = prompterThatPicks(0);
+    const project = await resolveProject({
+      base: "http://127.0.0.1:1",
+      token: "bl_cli_x",
+      ui,
+      prompter,
+      assumeYes: false,
+      defaultProjectName: "checkout",
+      fetchImpl: listing([{ id: "p1", name: "Acme" }]),
+    });
+    // Index 0 is the tenant's project, not "Create a new project".
+    expect(seen.labels[0]).toBe("Acme");
+    expect(seen.labels[1]).toContain("Create a new project");
+    expect(seen.def).toBe(0);
+    expect(project).toMatchObject({ id: "p1", name: "Acme" });
+  });
+
+  it("still creates one when the reader picks the last row", async () => {
+    const { prompter } = prompterThatPicks(1);
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST")
+        return jsonResponse(200, { id: "p2", name: "checkout" });
+      if (String(url).includes("/api/projects"))
+        return jsonResponse(200, { projects: [{ id: "p1", name: "Acme" }] });
+      return jsonResponse(200, {});
+    }) as unknown as typeof fetch;
+
+    const project = await resolveProject({
+      base: "http://127.0.0.1:1",
+      token: "bl_cli_x",
+      ui,
+      prompter,
+      assumeYes: false,
+      defaultProjectName: "checkout",
+      fetchImpl,
+    });
+    expect(project).toMatchObject({ id: "p2", name: "checkout" });
+  });
+});

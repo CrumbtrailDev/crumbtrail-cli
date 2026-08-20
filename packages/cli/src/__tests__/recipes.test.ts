@@ -1160,6 +1160,31 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
     expect(plan.keyEnvVar).toBeUndefined();
   });
 
+  it("names the app, because a project key names none", () => {
+    const io = fakeInjectIO({});
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "otlp",
+        endpoint: ENDPOINT,
+        stack: "fastapi",
+        serviceName: "billing-api",
+      },
+      io,
+    );
+    // The receiver resolves an app from service.name when the key names none,
+    // and every OTLP SDK sets service.name from OTEL_SERVICE_NAME.
+    expect(plan.snippet).toContain("OTEL_SERVICE_NAME=billing-api");
+    expect(plan.agentPrompt).toContain("OTEL_SERVICE_NAME=billing-api");
+
+    // With no provisioned name, it asks for one rather than filing under none.
+    const unnamed = buildPlan(
+      { cwd: CWD, recipe: "otlp", endpoint: ENDPOINT, stack: "fastapi" },
+      io,
+    );
+    expect(unnamed.snippet).toContain("OTEL_SERVICE_NAME=<your-app-name>");
+  });
+
   it("keys the agent prompt to the DETECTED stack, not the registry placeholder", () => {
     const io = fakeInjectIO({});
     // The registry placeholder for otlp is "django"; a detected go stack must

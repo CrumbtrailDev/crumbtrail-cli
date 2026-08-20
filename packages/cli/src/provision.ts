@@ -236,23 +236,27 @@ export async function resolveProject(
   } else {
     const existing = await listProjects(base, token, fetchImpl);
     if (existing.length > 0 && !input.assumeYes) {
+      // The existing projects come first, so the default is joining one rather
+      // than making another. A tenant with exactly one project is the common
+      // case, and offering "Create a new project" as the default landed a
+      // first application in a second project the dashboard is not scoped to.
       const labels = [
-        `Create a new project (${input.defaultProjectName})`,
         ...existing.map((p) => p.name),
+        `Create a new project (${input.defaultProjectName})`,
       ];
       const choice = await prompter.select(
         "Which project should this app report to?",
         labels,
         0,
       );
-      if (choice === 0) {
+      if (choice === existing.length) {
         const name = await prompter.ask(
           "New project name",
           input.defaultProjectName,
         );
         project = await createProject(base, token, name, fetchImpl);
       } else {
-        project = existing[choice - 1];
+        project = existing[choice];
       }
     } else {
       // No existing projects, or --yes, which cannot ask. A second unattended

@@ -78,6 +78,12 @@ describe("install-instructions snippets", () => {
     expect(s.authHeader).toContain("Authorization=Bearer%20bl_live_xyz");
     expect(s.authHeader).not.toContain("Authorization=Bearer bl_live_xyz");
     expect(s.sessionAttr).toContain("crumbtrail.session.id");
+    // One key covers a whole project, so the exporter has to say which app it
+    // is. The receiver reads service.name; every OTLP SDK sets it from this.
+    expect(s.serviceName).toBe("OTEL_SERVICE_NAME=<your-app-name>");
+    expect(
+      buildOtlpSnippets({ ...keys, serviceName: "billing-api" }).serviceName,
+    ).toBe("OTEL_SERVICE_NAME=billing-api");
     expect(s.note).toContain("/v1/traces");
     expect(s.note).toContain("/v1/logs");
   });

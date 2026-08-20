@@ -234,6 +234,11 @@ export interface OtlpSnippets {
   authHeader: string;
   /** Resource attribute that files spans/logs into a Crumbtrail session. */
   sessionAttr: string;
+  /** The app this telemetry belongs to. One ingest key covers a whole project,
+   *  so under a project key the key names no app and this is the only thing
+   *  that can. The receiver reads the standard `service.name` resource
+   *  attribute, which every OTLP SDK sets from this variable. */
+  serviceName: string;
   /** Human note about the appended /v1/traces + /v1/logs paths. */
   note: string;
 }
@@ -247,12 +252,14 @@ export interface OtlpSnippets {
  *   • OTEL_EXPORTER_OTLP_HEADERS    → X-Crumbtrail-Auth=<key> (or Bearer%20<key>)
  *   • OTEL_EXPORTER_OTLP_COMPRESSION→ none (recommended) — gzip is accepted too
  *   • OTEL_RESOURCE_ATTRIBUTES      → crumbtrail.session.id=<id>
+ *   • OTEL_SERVICE_NAME             → the app this telemetry belongs to
  * Verified against docs/integrations/* and the ingest routes.
  */
 export function buildOtlpSnippets({
   endpoint,
   apiKey,
-}: EndpointKey): OtlpSnippets {
+  serviceName,
+}: EndpointKey & { serviceName?: string | null }): OtlpSnippets {
   const [protobuf, jsonProtocol] = OTLP_CAPABILITY_FACTS.protocols;
   return {
     env: [
@@ -266,7 +273,8 @@ export function buildOtlpSnippets({
       `# OTEL_EXPORTER_OTLP_HEADERS=${otlpBearerHeaderValue(apiKey)}`,
     ].join("\n"),
     sessionAttr: `OTEL_RESOURCE_ATTRIBUTES=${OTLP_CAPABILITY_FACTS.sessionAttribute}=<your-session-id>`,
-    note: `Crumbtrail's OTLP receiver appends ${OTLP_CAPABILITY_FACTS.paths.join(" and ")} to the endpoint above — don't include those paths yourself. Set the ${OTLP_CAPABILITY_FACTS.sessionAttribute} resource attribute to join backend spans to the frontend session.`,
+    serviceName: `OTEL_SERVICE_NAME=${serviceName ?? "<your-app-name>"}`,
+    note: `Crumbtrail's OTLP receiver appends ${OTLP_CAPABILITY_FACTS.paths.join(" and ")} to the endpoint above — don't include those paths yourself. Set the ${OTLP_CAPABILITY_FACTS.sessionAttribute} resource attribute to join backend spans to the frontend session, and OTEL_SERVICE_NAME to say which app in the project this is.`,
   };
 }
 
@@ -320,6 +328,8 @@ export function buildAgentPrompt(
   const { kind, backendJs } = getInstallVariant(stack);
   const { endpoint, apiKey } = keys;
 
+  const serviceName = opts.serviceName?.trim() || null;
+
   if (kind === "otlp") {
     return [
       "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
@@ -336,13 +346,17 @@ export function buildAgentPrompt(
       "     this key in your environment, not in committed source.",
       "  3. Stamp the resource attribute crumbtrail.session.id so spans/logs join",
       "     the right session.",
-      "  4. Keep your existing exporter — add Crumbtrail alongside it.",
-      "  5. Verify the app still builds and starts.",
+      // One ingest key covers a whole project, so the key names no app. The
+      // receiver reads service.name instead, and every OTLP SDK sets it from
+      // OTEL_SERVICE_NAME.
+      `  4. Set OTEL_SERVICE_NAME=${serviceName ?? "<your-app-name>"} so this app's`,
+      "     telemetry is filed under it rather than under no app at all.",
+      "  5. Keep your existing exporter — add Crumbtrail alongside it.",
+      "  6. Verify the app still builds and starts.",
     ].join("\n");
   }
 
   const { envVar, expr } = opts.keyEnv ?? keyEnvRef(stack);
-  const serviceName = opts.serviceName?.trim() || null;
   const jsLines = [
     "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
     "do not refactor or touch anything else, then verify the build still passes.",

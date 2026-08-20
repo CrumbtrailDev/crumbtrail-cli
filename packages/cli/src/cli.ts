@@ -749,7 +749,7 @@ export async function runWizard(
       // (spec §4), and open it in the browser when one is available.
       sessionUrl = poll.sessionId
         ? `${appBase}/sessions/${encodeURIComponent(poll.sessionId)}`
-        : `${appBase}/bugs`;
+        : `${appBase}/issues`;
       ui.out(`${color.green("✓")} First real event received!`);
       ui.out(`  Watch it live: ${color.cyan(sessionUrl)}`);
       if (canUseBrowser(parsed.noBrowser, deps.env)) {
@@ -1351,7 +1351,7 @@ function printBatchSummary(
   ];
   ui.out("");
   ui.out(`  ${parts.join(" · ")}`);
-  ui.out(`  Dashboard: ${color.cyan(`${dashboardBase(base)}/bugs`)}`);
+  ui.out(`  Dashboard: ${color.cyan(`${dashboardBase(base)}/issues`)}`);
 
   const notes = [
     ...outcomes.flatMap((o) => o.notes.map((n) => `${o.name}: ${n}`)),
@@ -1776,7 +1776,7 @@ function printSummary(
   if (sessionUrl) {
     ui.out(`  Session:   ${color.cyan(sessionUrl)}`);
   }
-  ui.out(`  Dashboard: ${color.cyan(`${appBase}/bugs`)}`);
+  ui.out(`  Dashboard: ${color.cyan(`${appBase}/issues`)}`);
   if (notes.length > 0) {
     ui.out("");
     for (const n of notes) ui.out(color.dim(`  note: ${n}`));
