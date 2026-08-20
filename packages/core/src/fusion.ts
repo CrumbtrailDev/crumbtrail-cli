@@ -20,8 +20,39 @@ export interface Symptom {
   title: string;
   description?: string;
   release?: string;
+  /**
+   * A URL carried by the report: the page the reporter was on, or the tracker's
+   * own link to the ticket. It is a loose TEXT hint — {@link rankEvidence}
+   * scores it as a case-insensitive substring of an evidence item's signature
+   * or brief — and it is deliberately NOT the correlation key.
+   *
+   * Ticket normalisers set this to the tracker's issue URL, which never appears
+   * inside application evidence. Put the application path in {@link route}
+   * instead; that is the field the incident-location scorer compares.
+   */
   url?: string;
+  /**
+   * The application route the reported failure happened on, as the application
+   * itself records it: a path such as `/checkout` or `/api/orders/:id`, with no
+   * scheme, host, query string or fragment.
+   *
+   * This is the correlation key behind the "same route" facet of the
+   * incident-location scorer, which compares it for EQUALITY (trimmed,
+   * case-insensitive) against a recorded bug's `representative.route`. A value
+   * carrying a host or a query string therefore matches nothing, and belongs in
+   * {@link url}.
+   */
+  route?: string;
   user?: string;
+  /**
+   * The error family the report is about, in the same vocabulary the capture
+   * side uses for a distinct bug's `representative.detector` — the detector id,
+   * for example `console_error` or `net_5xx`, NOT a stack hash or a message.
+   *
+   * The "same error family" facet compares it for exact equality against that
+   * detector id, so any other vocabulary silently scores zero. Leave it unset
+   * when the report does not name one; an invented value is worse than none.
+   */
   errorSig?: string;
   source?: string;
 }

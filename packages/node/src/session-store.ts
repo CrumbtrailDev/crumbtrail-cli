@@ -646,6 +646,36 @@ function safeSegment(value: string): boolean {
   return SEGMENT_PATTERN.test(value) && value !== "." && value !== "..";
 }
 
+/**
+ * Normalise one identity value into the partition path segment a finalized
+ * session is stored under, or `undefined` when it cannot be one.
+ *
+ * The finalizer writes a session to `{outputDir}/{tenant}/{app}/{date}/{id}`
+ * where `tenant` and `app` are this normalisation of `meta.tenant` and
+ * `meta.app` — lower cased, everything outside `[a-z0-9._-]` collapsed to `-`,
+ * trimmed of leading and trailing dashes and cut to 80 characters. A reader
+ * that wants to address one tenant's partition has to derive the directory name
+ * the SAME way the writer did, so this is the one implementation of that rule
+ * and both sides call it.
+ *
+ * It answers `undefined` rather than substituting a placeholder: a caller
+ * NARROWING to a tenant must get nothing when the tenant id is unusable, never
+ * the `local` partition the writer falls back to. `SessionManager`'s own
+ * fallbacks stay at the writer's call site, where they belong.
+ */
+export function normalizePartitionSegment(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const text = String(value).trim().toLowerCase();
+  if (!text) return undefined;
+  const normalized = text
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  if (!normalized || normalized === "." || normalized === "..")
+    return undefined;
+  return normalized;
+}
+
 // Tenant-scoped lookup that deliberately never enumerates outside
 // {outputDir}/{tenant}/{app}/{YYYY-MM-DD}/{sessionId}. Preserves the cloud isolation
 // model (one tenant can never discover another's sessions) behind the same seam.

@@ -5,7 +5,10 @@ import zlib from "node:zlib";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { BugEvent, Symptom } from "crumbtrail-core";
 import { buildRecallStore } from "./recall";
-import { locateAndAssemble } from "./locate-incident";
+import {
+  locateAndAssemble,
+  type LocateIncidentOptions,
+} from "./locate-incident";
 import { SessionManager } from "./session";
 import type { SessionManagerConfig } from "./session";
 import { BugQueueManager } from "./bug-queue";
@@ -1766,15 +1769,11 @@ export function createServer(config: ServerConfig): http.Server {
         }
         const symptom = body.symptom as unknown as Symptom;
         const rawOptions = isRecord(body.options) ? body.options : {};
-        const opts: {
-          threshold?: number;
-          margin?: number;
-          accountId?: string;
-          now?: number;
-          ticketCreatedAt?: number;
-          tenantId?: string;
-          projectId?: string;
-        } = {};
+        // Typed as the engine's own options so a field that the engine does not
+        // read cannot be accepted here and silently dropped. That is exactly how
+        // tenantId/projectId came to be parsed off the wire, threaded into an
+        // options object the locate engine had never declared, and ignored.
+        const opts: LocateIncidentOptions = {};
         if (typeof rawOptions.threshold === "number") {
           opts.threshold = rawOptions.threshold;
         }
@@ -1785,18 +1784,43 @@ export function createServer(config: ServerConfig): http.Server {
           opts.accountId = rawOptions.accountId;
         }
         if (typeof rawOptions.now === "number") opts.now = rawOptions.now;
-        // Ticket created-time anchors the sessionless (Mode A) fallback window to
-        // when the incident was reported rather than "now", so a ticket solved
-        // days later still scans the right span. Threaded from the cloud webhook,
-        // which has it on the Jira issue; absent ⇒ gatherAdapterEvidence uses now.
-        if (typeof rawOptions.ticketCreatedAt === "number") {
-          opts.ticketCreatedAt = rawOptions.ticketCreatedAt;
+        // Scope narrowing, refused rather than approximated. Both failure modes
+        // below would look like a working request while the locate ranked over
+        // a partition the caller did not ask for, or over none at all:
+        //  - a project id alone is not a narrowing, because a project id is
+        //    unique only inside its tenant;
+        //  - a blank id narrows to nothing, and "no incident found" is the same
+        //    answer a genuine miss gives, so the caller's bug stays invisible.
+        const rawTenant = rawOptions.tenantId;
+        const rawProject = rawOptions.projectId;
+        const hasTenant = typeof rawTenant === "string";
+        const hasProject = typeof rawProject === "string";
+        if (hasProject && !hasTenant) {
+          jsonError(
+            res,
+            400,
+            "options.projectId requires options.tenantId",
+            "invalid_scope",
+            false,
+          );
+          return;
         }
-        if (typeof rawOptions.tenantId === "string") {
-          opts.tenantId = rawOptions.tenantId;
+        if (
+          (hasTenant && !rawTenant.trim()) ||
+          (hasProject && !rawProject.trim())
+        ) {
+          jsonError(
+            res,
+            400,
+            "options.tenantId and options.projectId must not be blank",
+            "invalid_scope",
+            false,
+          );
+          return;
         }
-        if (typeof rawOptions.projectId === "string") {
-          opts.projectId = rawOptions.projectId;
+        if (hasTenant) {
+          opts.scope = { tenantId: rawTenant };
+          if (hasProject) opts.scope.projectId = rawProject;
         }
         const { bundle, match } = await locateAndAssemble(
           symptom,
