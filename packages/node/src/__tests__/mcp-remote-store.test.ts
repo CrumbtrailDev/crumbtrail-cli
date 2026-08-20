@@ -74,6 +74,15 @@ interface MockCloudOptions {
   sessionResponse?: SessionResponseMode;
   /** How many rows the listing has in total. Paged with limit/offset. */
   sessionCount?: number;
+  /**
+   * Which rows go out in a shape the client cannot map to a session.
+   *
+   * The real route's `s.id` is a text column, so this is not reachable through
+   * it today — but RemoteMcpReadStore is exported from a published package and
+   * a page it cannot parse must still advance the offset. Indexes are into the
+   * full listing, newest first.
+   */
+  unparseableRow?: (index: number) => boolean;
   /** Retry-After seconds sent with a 429. */
   retryAfter?: number;
   artifactResponse?: ArtifactResponseMode;
@@ -165,6 +174,7 @@ const artifacts: Record<string, string> = {
 function startMockCloud({
   sessionResponse = "normal",
   sessionCount = 1,
+  unparseableRow = () => false,
   retryAfter,
   artifactResponse = "normal",
   artifactFraming = "chunked",
@@ -236,7 +246,7 @@ function startMockCloud({
       // "prove" a bounded read against a backend that never bounded anything.
       const limit = Number(url.searchParams.get("limit") ?? "100");
       const offset = Number(url.searchParams.get("offset") ?? "0");
-      const all = Array.from({ length: sessionCount }, (_, index) =>
+      const rowFor = (index: number) =>
         index === 0
           ? {
               id: SESSION_ID,
@@ -255,7 +265,11 @@ function startMockCloud({
               errorCount: 0,
               failedRequestCount: 0,
               completeness: "full",
-            },
+            };
+      const all = Array.from({ length: sessionCount }, (_, index) =>
+        // A blank id is what the client refuses to map. The row still occupies
+        // its place in the page the route serves.
+        unparseableRow(index) ? { ...rowFor(index), id: "" } : rowFor(index),
       );
       const body = JSON.stringify({
         sessions: all.slice(offset, offset + limit),
@@ -751,6 +765,52 @@ describe("MCP remote read store", () => {
     );
     expect(listReads).toHaveLength(1);
     expect(listReads[0]!.path).toContain("limit=6");
+  });
+
+  // The paging offset counts the rows the SERVER sent, not the rows this client
+  // managed to map. Counting the kept ones instead made the next request start
+  // inside the page just read, so a single dropped row put a session in the
+  // listing twice.
+  it("advances the offset past rows it could not parse", async () => {
+    mock = await startMockCloud({
+      sessionCount: 250,
+      unparseableRow: (index) => index === 5,
+    });
+    const store = new RemoteMcpReadStore({ baseUrl: mock.baseUrl, token: TOKEN });
+
+    const listing = await store.listSessions({ limit: 240 });
+
+    const ids = listing.sessions.map((session) => session.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toHaveLength(240);
+    expect(listing.truncated).toBe(true);
+    // Three pages of 100, 100 and 42 rows: offsets step by what was served.
+    const offsets = mock.requests
+      .filter((request) => request.path.startsWith("/api/agent/sessions?"))
+      .map((request) => new URL(request.path, "http://mock.local").searchParams.get("offset"));
+    expect(offsets).toEqual(["0", "100", "200"]);
+  });
+
+  // The same arithmetic taken to its end: a page where NOTHING maps left the
+  // offset where it was, so the store re-requested offset=0 until something
+  // else failed. That is a hang inside a tool call, which is worse than the
+  // truncation this change set out to fix.
+  it("stops instead of re-reading a page it could not parse at all", async () => {
+    mock = await startMockCloud({
+      sessionCount: 100,
+      unparseableRow: () => true,
+    });
+    const store = new RemoteMcpReadStore({ baseUrl: mock.baseUrl, token: TOKEN });
+
+    const listing = await store.listSessions();
+
+    expect(listing).toEqual({ sessions: [], truncated: false });
+    const listReads = mock.requests.filter((request) =>
+      request.path.startsWith("/api/agent/sessions?"),
+    );
+    // The full page, then the empty one past it. Never the same window twice.
+    expect(listReads).toHaveLength(2);
+    expect(listReads[1]!.path).toContain("offset=100");
   });
 
   it("pushes the time and release filters at the route instead of scanning", async () => {

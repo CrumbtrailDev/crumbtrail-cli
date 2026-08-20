@@ -115,6 +115,16 @@ interface RemoteMcpReadStoreConfig {
 
 export class RemoteMcpReadStore implements McpReadStore {
   private static readonly MAX_BODY_BYTES = 16 * 1024 * 1024;
+  /**
+   * Ceiling on the rows one listing will consume.
+   *
+   * Every request advances the offset by the rows the server sent, so a listing
+   * against a finite table ends on a short page. This bounds the pathological
+   * case instead of trusting that: an endpoint that answers every offset with a
+   * full page of rows this client discards would otherwise page forever inside
+   * one tool call, and a hang is worse than a truncated answer.
+   */
+  private static readonly MAX_SCANNED_ROWS = 5_000;
   private readonly baseUrl: string;
   private readonly token: string;
   private readonly timeoutMs: number;
@@ -146,22 +156,29 @@ export class RemoteMcpReadStore implements McpReadStore {
   async listSessions(query: McpSessionQuery = {}): Promise<McpSessionListing> {
     const wanted = Math.max(1, Math.min(500, Math.floor(query.limit ?? 100)));
     const sessions: McpSessionEntry[] = [];
+    // Rows the SERVER sent, which is not the same number as the rows that were
+    // kept: a row this client cannot parse still occupies its place in the
+    // route's ORDER BY. The offset has to count what was consumed, or the next
+    // request re-reads the tail of the page it just read — the same session
+    // twice in the listing, and no forward progress at all when a whole page is
+    // unparseable.
+    let consumed = 0;
 
     // One row past what the caller asked for, so a full page is distinguishable
     // from a page that happens to end exactly on the limit.
-    while (sessions.length <= wanted) {
+    while (
+      sessions.length <= wanted &&
+      consumed < RemoteMcpReadStore.MAX_SCANNED_ROWS
+    ) {
       const page = Math.min(100, wanted + 1 - sessions.length);
-      const result = await this.fetchSessionPage(
-        query,
-        page,
-        sessions.length,
-      );
+      const result = await this.fetchSessionPage(query, page, consumed);
       if (!result.ok) {
         return { sessions, truncated: false, unavailable: result.failure };
       }
+      consumed += result.rowCount;
       sessions.push(...result.sessions);
-      // A short PAGE ends the listing, not a short mapped result: a row the
-      // client could not parse still consumed one of the rows the server had.
+      // A short PAGE ends the listing, not a short mapped result. This also
+      // covers an empty page, since `page` is never less than one.
       if (result.rowCount < page) {
         return { sessions, truncated: false };
       }
