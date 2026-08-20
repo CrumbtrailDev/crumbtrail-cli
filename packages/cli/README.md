@@ -222,4 +222,9 @@ for the three-line manual setup.
 
 ## License
 
-MIT
+PolyForm Shield 1.0.0. Free to use, read, modify and run, including inside a
+commercial business. The one thing it stops is using the installer to build a
+product that competes with Crumbtrail. See [LICENSE](LICENSE).
+
+The SDKs it installs are MIT, so nothing the installer puts into your
+application carries any restriction.
