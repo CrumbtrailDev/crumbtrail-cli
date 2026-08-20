@@ -222,6 +222,8 @@ export interface EvidenceIndexInput {
       line?: number;
       col?: number;
       stk?: string;
+      /** React component path, set only for boundary-caught crashes. */
+      componentStk?: string;
     }>;
     navs?: Array<{ t: number; to?: string }>;
     tabBoundaries?: Array<{
@@ -330,6 +332,13 @@ export interface EvidenceCandidate {
      * silently sending someone to the wrong file.
      */
     minifiedFrame?: string;
+    /**
+     * The React component path a render crash happened inside, present only for
+     * a crash caught by a `CrumbtrailErrorBoundary`. A render crash's JS stack
+     * names the reconciler frames that rethrew it; this names the components,
+     * which is what tells a reader which file to open.
+     */
+    componentStack?: string;
     target?: TargetDescriptor;
   };
   /**
@@ -682,6 +691,7 @@ export function buildEvidenceCandidates(
         url: redactUrl(entry.url),
         message: scrubText(entry.msg, 220),
         frame: codeFrameOf(entry),
+        componentStack: scrubText(entry.componentStk, 600),
       }),
       // Content-signature dedupe: a repeatedly re-thrown TypeError (same message + route) collapses
       // to one candidate instead of one-per-timestamp. Keep err vs rej distinct (different bug type).

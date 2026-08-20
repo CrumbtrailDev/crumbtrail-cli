@@ -27,8 +27,8 @@ describe("CrumbtrailReactNativeErrorBoundary", () => {
       type: "err",
       data: {
         msg: "boom",
-        stack: error.stack,
-        componentStack: errorInfo.componentStack,
+        stk: error.stack,
+        componentStk: errorInfo.componentStack,
         source: "react-native-error-boundary",
       },
     });
@@ -50,8 +50,6 @@ describe("CrumbtrailReactNativeErrorBoundary", () => {
 
     const event = logger.addEvent.mock.calls[0]![0];
     expect(event.data.msg).toBe("password=[REDACTED]");
-    expect(event.data.stack).not.toContain(
-      "sk_fake_abcdefghijklmnopqrstuvwxyz",
-    );
+    expect(event.data.stk).not.toContain("sk_fake_abcdefghijklmnopqrstuvwxyz");
   });
 });
