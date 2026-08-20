@@ -5,9 +5,12 @@ import ai.crumbtrail.sdk.CrumbtrailConfig
 import ai.crumbtrail.sdk.CrumbtrailDeviceInfo
 import ai.crumbtrail.sdk.CrumbtrailEventKind
 import ai.crumbtrail.sdk.CrumbtrailHttpTransport
+import ai.crumbtrail.sdk.CrumbtrailPendingCrash
+import ai.crumbtrail.sdk.CrumbtrailPendingCrashStore
 import ai.crumbtrail.sdk.CrumbtrailSessionStore
 import ai.crumbtrail.sdk.JsonValue
 import ai.crumbtrail.sdk.PersistedSession
+import ai.crumbtrail.sdk.installCrashHandler
 import android.app.Activity
 import android.app.Application
 import android.content.Context
@@ -52,6 +55,56 @@ class SharedPreferencesSessionStore(
 
     override fun clear() {
         prefs.edit().remove(key).apply()
+    }
+}
+
+/**
+ * `SharedPreferences`-backed pending crash store.
+ *
+ * Written with `commit()`, not `apply()`. `apply()` hands the write to a
+ * background thread and returns; in an uncaught-exception handler the process
+ * dies before that thread runs, so the crash report is lost exactly when it
+ * matters. `commit()` writes synchronously, which is a disk write on the main
+ * thread — permitted by the platform's default thread policy, unlike the
+ * network call this replaces.
+ */
+class SharedPreferencesPendingCrashStore(
+    context: Context,
+    private val key: String = "ai.crumbtrail.pending-crash",
+) : CrumbtrailPendingCrashStore {
+    private val prefs: SharedPreferences =
+        context.applicationContext.getSharedPreferences("ai.crumbtrail", Context.MODE_PRIVATE)
+
+    override fun write(crash: CrumbtrailPendingCrash) {
+        val json = JSONObject()
+            .put("message", crash.message)
+            .put("stack", crash.stack ?: JSONObject.NULL)
+            .put("thread", crash.thread ?: JSONObject.NULL)
+            .put("at", crash.at)
+        prefs.edit().putString(key, json.toString()).commit()
+    }
+
+    override fun read(): CrumbtrailPendingCrash? {
+        val raw = prefs.getString(key, null) ?: return null
+        return try {
+            val json = JSONObject(raw)
+            val message = json.optString("message")
+            // A record written by an older SDK, or corrupted on disk, must not
+            // report a crash with no message rather than crash the host again.
+            if (message.isEmpty()) null
+            else CrumbtrailPendingCrash(
+                message = message,
+                stack = json.optString("stack").takeIf { it.isNotEmpty() },
+                thread = json.optString("thread").takeIf { it.isNotEmpty() },
+                at = json.optLong("at", 0),
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    override fun clear() {
+        prefs.edit().remove(key).commit()
     }
 }
 
@@ -101,42 +154,11 @@ fun startCrumbtrail(
         store = SharedPreferencesSessionStore(application),
         deviceInfo = readAndroidDeviceInfo(application),
     )
-    if (config.collectors.errors) installCrashHandler(logger)
+    if (config.collectors.errors) {
+        installCrashHandler(logger, SharedPreferencesPendingCrashStore(application))
+    }
     if (config.collectors.appLifecycle) installLifecycleCollector(application, logger)
     return logger
-}
-
-/**
- * Capture an uncaught exception on the way down.
- *
- * Unlike iOS, Android's default handler gives us a brief window before the
- * process dies, so this attempts a synchronous flush rather than deferring to
- * the next launch. It is best effort and explicitly time-bounded by the
- * transport's own timeouts: blocking a dying process for longer would turn a
- * crash into an ANR, which is strictly worse for the user than a lost report.
- *
- * It always chains to the previous handler. Replacing it outright would silently
- * disable whatever crash reporting the host already had.
- */
-fun installCrashHandler(logger: Crumbtrail) {
-    val previous = Thread.getDefaultUncaughtExceptionHandler()
-    Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-        runCatching {
-            logger.addEvent(
-                CrumbtrailEventKind.NATIVE_CRASH,
-                JsonValue.of(
-                    "msg" to JsonValue.Str(throwable.message ?: throwable.toString()),
-                    "stk" to JsonValue.Str(throwable.stackTraceToString()),
-                    "fatal" to JsonValue.Bool(true),
-                    "thread" to JsonValue.Str(thread.name),
-                    "source" to JsonValue.Str("uncaught-exception"),
-                ),
-            )
-            logger.flush()
-        }
-        previous?.uncaughtException(thread, throwable)
-    }
-    logger.registerCleanup { Thread.setDefaultUncaughtExceptionHandler(previous) }
 }
 
 /**

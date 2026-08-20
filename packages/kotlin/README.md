@@ -62,7 +62,7 @@ in an app.
 
 | Event | Source |
 | --- | --- |
-| `native-crash` | An uncaught exception, flushed on the way down |
+| `native-crash` | An uncaught exception, delivered on the next launch |
 | `err` | Errors you report with `recordError` |
 | `net` | HTTP requests you report with `recordRequest` |
 | `app-lifecycle` | Foreground and background transitions |
@@ -71,11 +71,18 @@ in an app.
 
 ### Crashes
 
-Android's default handler gives a brief window before the process dies, so the
-crash is recorded and flushed synchronously rather than deferred to the next
-launch. It is best effort and bounded by the transport's own timeouts: blocking
-a dying process for longer would turn a crash into an ANR, which is worse for
-the user than a lost report.
+A crash handler cannot deliver its own crash. The default handler runs on the
+crashing thread, which for most Android crashes is the main thread, and any
+network call there is answered with `NetworkOnMainThreadException` — so the
+handler writes the crash to `SharedPreferences` and the next launch sends it as a
+`native-crash` with `source: "previous-launch"`. iOS defers for the same reason.
+
+The record is cleared before it is sent, not after. If delivery were what cleared
+it and delivery kept failing, the same crash would be re-reported on every launch
+forever.
+
+The cost is honest and worth stating: a crash on a user's last ever launch of the
+app is never reported.
 
 Crumbtrail always chains to whatever handler was already installed, so adding
 this SDK does not silently disable an existing crash reporter.
@@ -168,6 +175,17 @@ Redaction is deny-biased and runs before anything leaves the device:
 Events are buffered and flushed on a batch size, on a timer, and when the app
 goes to the background — the last reliable moment before Android may kill the
 process.
+
+Every delivery runs on the SDK's own daemon thread, never on the thread that
+called in. That is not a detail: the session announce happens in
+`Application.onCreate` and the background flush in an activity lifecycle
+callback, both of them main thread, where the platform's default StrictMode
+policy throws `NetworkOnMainThreadException` for any network operation. One
+thread rather than a pool, so batches leave in the order they were captured.
+
+`stop()` is the exception that waits: it flushes and closes the session, and
+blocks for up to two seconds so a caller shutting the SDK down knows the tail of
+the session left the device.
 
 The buffer is bounded (2,000 events by default). A hot logging loop or ten
 minutes offline would otherwise grow it until the OS kills the app for memory,

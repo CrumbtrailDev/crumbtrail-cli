@@ -289,14 +289,17 @@ class CrumbtrailTest {
         endpoint = "https://api.crumbtrail.ai",
         service = "app",
         flushBatchSize = batchSize,
-        // No timer: a background flush would race every assertion below.
+        // No timer: a background flush would race every assertion below. The
+        // tests below also pass `CrumbtrailInlineDelivery`, which has no timer
+        // of its own and makes each delivery observable the moment it is asked
+        // for. Production never uses it — see CrumbtrailDelivery.
         flushIntervalSeconds = 0,
     )
 
     @Test
     fun `announces the session and emits a startup environment snapshot`() {
         val transport = CapturingTransport()
-        val logger = Crumbtrail(config(), transport, MemorySessionStore(), scheduler = null)
+        val logger = Crumbtrail(config(), transport, MemorySessionStore(), delivery = CrumbtrailInlineDelivery)
 
         assertEquals(logger.sessionId, transport.startedSession)
         logger.flush()
@@ -306,7 +309,7 @@ class CrumbtrailTest {
     @Test
     fun `a refusal becomes a declared gap instead of a silent loss`() {
         val transport = CapturingTransport(failWith = 413)
-        val logger = Crumbtrail(config(), transport, MemorySessionStore(), scheduler = null)
+        val logger = Crumbtrail(config(), transport, MemorySessionStore(), delivery = CrumbtrailInlineDelivery)
 
         logger.flush()
 
@@ -327,7 +330,7 @@ class CrumbtrailTest {
                 if (attempts == 1) throw CrumbtrailDeliveryException.Unreachable(events.size)
             }
         }
-        val logger = Crumbtrail(config(), transport, MemorySessionStore(), scheduler = null)
+        val logger = Crumbtrail(config(), transport, MemorySessionStore(), delivery = CrumbtrailInlineDelivery)
 
         logger.flush()
         assertTrue(logger.gaps.isEmpty(), "a network failure is retried, not declared lost")
@@ -339,7 +342,7 @@ class CrumbtrailTest {
     fun `flushes automatically once the batch size is reached`() {
         val transport = CapturingTransport()
         val logger = Crumbtrail(
-            config(batchSize = 2), transport, MemorySessionStore(), scheduler = null
+            config(batchSize = 2), transport, MemorySessionStore(), delivery = CrumbtrailInlineDelivery
         )
         // The startup env event is already buffered, so one more reaches 2.
         logger.addEvent(CrumbtrailEventKind.ERROR, JsonValue.of("msg" to JsonValue.Str("x")))
@@ -349,7 +352,7 @@ class CrumbtrailTest {
     @Test
     fun `recordRequest redacts the url before it is buffered`() {
         val transport = CapturingTransport()
-        val logger = Crumbtrail(config(), transport, MemorySessionStore(), scheduler = null)
+        val logger = Crumbtrail(config(), transport, MemorySessionStore(), delivery = CrumbtrailInlineDelivery)
 
         logger.recordRequest(
             url = "https://api.example.com/v1?access_token=abc123",
@@ -368,7 +371,7 @@ class CrumbtrailTest {
     @Test
     fun `stop flushes and closes the session`() {
         val transport = CapturingTransport()
-        val logger = Crumbtrail(config(), transport, MemorySessionStore(), scheduler = null)
+        val logger = Crumbtrail(config(), transport, MemorySessionStore(), delivery = CrumbtrailInlineDelivery)
 
         logger.stop()
         assertEquals(logger.sessionId, transport.endedSession)
@@ -382,7 +385,7 @@ class CrumbtrailTest {
         val store = MemorySessionStore()
         var clock = 1_000L
         val logger = Crumbtrail(
-            config(), CapturingTransport(), store, scheduler = null, clock = { clock }
+            config(), CapturingTransport(), store, delivery = CrumbtrailInlineDelivery, clock = { clock }
         )
         clock = 50_000
         logger.addEvent(CrumbtrailEventKind.ERROR, JsonValue.of())
