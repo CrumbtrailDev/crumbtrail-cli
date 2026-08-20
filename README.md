@@ -132,4 +132,13 @@ pnpm test
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Two licences, split by what ships where.
+
+The SDKs are **MIT**: `crumbtrail-core`, `crumbtrail-node`,
+`crumbtrail-react-native`, `crumbtrail-capacitor`, and the mobile SDKs. These
+end up inside your application, so they carry no restriction at all.
+
+The installer, `crumbtrail`, is **PolyForm Shield 1.0.0**. It runs on your
+machine and in CI rather than shipping inside your product. Free to use, read,
+modify and run; the one thing it stops is building a competing product out of
+it. See [packages/cli/LICENSE](packages/cli/LICENSE).
