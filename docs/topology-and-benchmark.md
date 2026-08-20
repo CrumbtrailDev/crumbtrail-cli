@@ -12,6 +12,8 @@ pnpm --filter crumbtrail-topology-harness generate
 
 CI runs `check:matrix` before regeneration. It compares the generated scenarios with the committed matrix while ignoring the run specific stamp, then uploads the stamped JSON artifact.
 
+The `crumbtrail-node` version is part of what it compares, because the matrix is a claim about what a given SDK version achieved. A version bump therefore has to regenerate both artifacts in the same change, or the gate fails on every commit afterwards until someone does.
+
 BullMQ worker coverage models a queue handoff with two JSON streams. The enqueue scope sends a payload string containing correlation. A separate worker module accepts only that string, creates its own event sink, resolves correlation through the Node SDK, and returns an independent event stream. The harness merges the streams only after worker execution. This exercises the serialization boundary without requiring Redis.
 
 The incremental yield benchmark is a rerunnable scaffold, not a measured lift claim. Its typed corpus includes an executable seeded reproduction for every bug. Its arms, runner, scorer, sample fixture, and fixed analysis plan live in `packages/topology-harness`. The current [benchmark report](../packages/topology-harness/benchmark/report.generated.md) honestly reports no measured lift until real arm files are supplied. The [preregistration](../packages/topology-harness/benchmark/PREREGISTRATION.md) fixes the matched arm method before collection.
