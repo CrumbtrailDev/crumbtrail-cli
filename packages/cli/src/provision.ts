@@ -218,7 +218,21 @@ export async function resolveProject(
   let project: Project;
 
   if (input.projectId) {
-    project = { id: input.projectId, name: input.projectId };
+    // Look the name up rather than printing the id under a "Project:" label.
+    // The dashboard's setup wizard passes --project when it is adding an app
+    // to a project the reader is already looking at, so the line under the
+    // command is the one place the two surfaces have to agree, and `prj_7f3a`
+    // agrees with nothing the reader has seen. A failed or unmatched read
+    // falls back to the id, which is still true, just less useful.
+    let name = input.projectId;
+    try {
+      const existing = await listProjects(base, token, fetchImpl);
+      const match = existing.find((p) => p.id === input.projectId);
+      if (match) name = match.name;
+    } catch {
+      /* the id stands in; naming the project is not worth failing the run */
+    }
+    project = { id: input.projectId, name };
   } else {
     const existing = await listProjects(base, token, fetchImpl);
     if (existing.length > 0 && !input.assumeYes) {
