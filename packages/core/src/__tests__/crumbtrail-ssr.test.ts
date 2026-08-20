@@ -6,7 +6,7 @@
 // undefined. Before the guard, the collectors' `window.addEventListener` calls
 // threw `ReferenceError: window is not defined` and failed the host build.
 import { describe, expect, it, vi } from "vitest";
-import { Crumbtrail } from "../bug-logger";
+import { Crumbtrail } from "../crumbtrail";
 import { PRESET_PASSIVE } from "../types";
 
 describe("Crumbtrail.init() outside a browser (SSR / build / Node)", () => {

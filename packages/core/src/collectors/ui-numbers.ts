@@ -713,7 +713,7 @@ function startUiNumbersCollector(
 
   // Failure policy: the collector self-disables inside its own scan path and
   // degrades to a single `capture_gap` event, rather than relying on
-  // bug-logger to wrap collector callbacks — core has no manifest writer for
+  // crumbtrail to wrap collector callbacks — core has no manifest writer for
   // `degradedCollection` (that field is assembled server-side). One broken
   // collector never breaks the page or the session, and placing the guard
   // here covers the MutationObserver/debounce internals too.

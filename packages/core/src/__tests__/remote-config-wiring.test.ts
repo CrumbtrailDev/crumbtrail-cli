@@ -12,7 +12,7 @@
 // handed a second copy of the key it already carries.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Crumbtrail } from "../bug-logger";
+import { Crumbtrail } from "../crumbtrail";
 
 function makeTransport() {
   return {

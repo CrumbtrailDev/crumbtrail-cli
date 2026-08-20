@@ -18,7 +18,7 @@ import {
 import { EventBus } from "../event-bus";
 import { networkCollector } from "../collectors/network";
 import { DEFAULT_CONFIG, type BugEvent } from "../types";
-import { Crumbtrail } from "../bug-logger";
+import { Crumbtrail } from "../crumbtrail";
 import { DEFAULT_SESSION_STORAGE_KEY } from "../session-store";
 
 /* ------------------------------------------------------------------ */

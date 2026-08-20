@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Crumbtrail } from "../bug-logger";
+import { Crumbtrail } from "../crumbtrail";
 import { CAPTURE_GAP_EVENT_KIND, type BugEvent } from "../types";
 
 // A batch the endpoint refuses used to be discarded as if it had been

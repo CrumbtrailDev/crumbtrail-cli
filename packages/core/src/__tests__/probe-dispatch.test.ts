@@ -48,8 +48,8 @@ vi.mock("../probes", async (importOriginal) => {
 });
 
 // Imported after vi.mock so the logger binds to the wrapped registry.
-const { Crumbtrail } = await import("../bug-logger");
-const { PROBE_RESULT_EVENT_KIND } = await import("../bug-logger");
+const { Crumbtrail } = await import("../crumbtrail");
+const { PROBE_RESULT_EVENT_KIND } = await import("../crumbtrail");
 const { PROBE_NAMES } = await import("../probes");
 
 /** Collectors off: this suite asserts on exact event counts, so nothing else may emit. */

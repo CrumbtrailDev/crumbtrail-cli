@@ -144,12 +144,12 @@ describe("nav-signal", () => {
       const events: BugEvent[] = [];
       const bus = new EventBus();
       bus.subscribe((batch) => events.push(...batch));
-      // Registration order matches bug-logger's COLLECTOR_MAP:
+      // Registration order matches crumbtrail's COLLECTOR_MAP:
       // interactions before uiNumbers.
       const interactionCleanup = interactionCollector(bus, DEFAULT_CONFIG);
       const uiNumbersCleanup = uiNumbersCollector(bus, DEFAULT_CONFIG);
       const stop = () => {
-        // bug-logger stop() runs cleanups in registration order.
+        // crumbtrail stop() runs cleanups in registration order.
         interactionCleanup();
         uiNumbersCleanup();
       };
