@@ -140,6 +140,37 @@ describe("resolveProject with --project", () => {
     expect(d.lines.join("\n")).toContain("Checkout");
   });
 
+  it("joins a project that already carries the inferred name under --yes", async () => {
+    // An unattended second run in the same app infers the same name again.
+    // Creating a second project under it split the app's sessions across two
+    // identical looking rows, and neither one held the whole story.
+    const d = deps();
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, {
+        projects: [{ id: "prj_existing", name: "Inferred", createdAt: "" }],
+      }),
+    );
+
+    const project = await resolveProject({
+      ...d,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    } as Parameters<typeof resolveProject>[0]);
+
+    // Matched ignoring case: the two names are indistinguishable to whoever
+    // would have to pick between them.
+    expect(project).toEqual({
+      id: "prj_existing",
+      name: "Inferred",
+      createdAt: "",
+    });
+    // And nothing was created.
+    expect(
+      fetchImpl.mock.calls.filter(
+        (c) => (c[1] as { method?: string } | undefined)?.method === "POST",
+      ).length,
+    ).toBe(0);
+  });
+
   it("falls back to the id when the list cannot be read", async () => {
     const d = deps();
     const fetchImpl = vi.fn(async () => {

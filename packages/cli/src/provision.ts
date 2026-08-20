@@ -255,13 +255,20 @@ export async function resolveProject(
         project = existing[choice - 1];
       }
     } else {
-      // No existing projects, or --yes: create one with the inferred name.
-      project = await createProject(
-        base,
-        token,
-        input.defaultProjectName,
-        fetchImpl,
+      // No existing projects, or --yes, which cannot ask. A second unattended
+      // run in the same app inferred the same name again and created a second
+      // project under it, so the app's sessions split across two identical
+      // looking rows in the dashboard and neither one held the whole story.
+      // An exact name match is the same app by the only test available here,
+      // so it is joined rather than duplicated. Case is ignored, because the
+      // two names are indistinguishable to whoever has to pick between them.
+      const wanted = input.defaultProjectName.trim().toLowerCase();
+      const already = existing.find(
+        (p) => p.name.trim().toLowerCase() === wanted,
       );
+      project =
+        already ??
+        (await createProject(base, token, input.defaultProjectName, fetchImpl));
     }
   }
   ui.out(`${color.green("✓")} Project: ${color.bold(project.name)}`);
