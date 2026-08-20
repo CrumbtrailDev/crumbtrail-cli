@@ -3,6 +3,7 @@ import path from "node:path";
 import {
   defaultSessionStore,
   assertWritableSessionArtifactPath,
+  normalizePartitionSegment,
   safeRegularFilePath,
 } from "./session-store";
 import { postProcess as defaultPostProcess } from "./post-process";
@@ -696,15 +697,7 @@ function buildSessionPartition(
 }
 
 function partitionSegment(value: unknown, fallback: string): string {
-  if (typeof value !== "string" && typeof value !== "number") return fallback;
-  const text = String(value).trim().toLowerCase();
-  if (!text) return fallback;
-  const normalized = text
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 80);
-  if (!normalized || normalized === "." || normalized === "..") return fallback;
-  return normalized;
+  return normalizePartitionSegment(value) ?? fallback;
 }
 
 function isoDate(value: number): string {

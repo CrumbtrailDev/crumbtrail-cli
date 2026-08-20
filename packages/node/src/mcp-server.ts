@@ -53,6 +53,7 @@ import {
   type LocalIssueProfile,
   type RecallStore,
 } from "./recall";
+import type { CloudCredentials } from "./cloud-auth";
 import {
   amendClientNoteViaCloud,
   AXIS_CAUSE_VALUES,
@@ -126,6 +127,25 @@ export interface McpServerConfig {
   outputDir: string;
   /** Test seam for the session-artifact read backend used by MCP read tools. */
   readStore?: McpReadStore;
+  /**
+   * Cloud credentials for the memory and learning tools, supplied per caller.
+   *
+   * These ten tools — recallIssueContext, resolveIssue, recordClientNote,
+   * amendClientNote, recordFeedback, getPlaybook, startFixVerification,
+   * getFixVerification, requestProbe and shadowBacktest — talk to a Crumbtrail
+   * cloud deployment with an agent token. A stdio server run by one engineer
+   * leaves this unset and the token comes from `CRUMBTRAIL_CLOUD_TOKEN`, which
+   * is correct for every call that process will ever make.
+   *
+   * A HOSTED deployment has no such token: it serves every tenant from one
+   * process, and the only credential that is correct for a call is the calling
+   * tenant's own agent token, which is known per request. Passing it here is
+   * what lets a hosted dispatcher build a server per request and serve these
+   * ten tools instead of withholding them. When it is set the process
+   * environment is not consulted at all, so one tenant's request can never be
+   * answered with another's credential.
+   */
+  cloudCredentials?: CloudCredentials;
   /**
    * Test-only seam: overrides how the git-host client is constructed for
    * `solveContext`'s intent-inference path. Production code leaves this
@@ -1393,12 +1413,17 @@ export class McpServer {
   private bugQueue: BugQueueManager;
   private gitHostClientFactory?: McpServerConfig["gitHostClientFactory"];
 
+  /** See {@link McpServerConfig.cloudCredentials}. Undefined means the cloud
+   *  calls read the process environment, which is the self-hosted model. */
+  private cloudCredentials?: CloudCredentials;
+
   constructor(config: McpServerConfig) {
     this.outputDir = config.outputDir;
     this.store = config.readStore ?? selectMcpReadStore(this.outputDir);
     const bugsDir = path.join(path.dirname(this.outputDir), "bugs");
     this.bugQueue = new BugQueueManager({ bugsDir, readOnly: true });
     this.gitHostClientFactory = config.gitHostClientFactory;
+    this.cloudCredentials = config.cloudCredentials;
   }
 
   start(): void {
@@ -2882,7 +2907,7 @@ export class McpServer {
       axisCause: axisCause as AxisCause | undefined,
       kinds: kinds as ClientNoteKind[] | undefined,
       include,
-    });
+    }, this.cloudCredentials);
     if (cloud.ok) return textResult({ ...cloud.data, source: "cloud" });
 
     return this.localIssueContext(args, sections, limit, cloud.message);
@@ -2991,7 +3016,7 @@ export class McpServer {
       fixRef: stringField(args.fixRef),
       note: stringField(args.note),
       usedMemoryIds,
-    });
+    }, this.cloudCredentials);
     if (!result.ok) return this.learningLoopFailure(result, "resolveIssue");
 
     // Each rejection is a `rejected_solution` note, which is the only write
@@ -3000,10 +3025,14 @@ export class McpServer {
     // rejection that was refused says so rather than being folded into the
     // success.
     if (rejected && rejected.length > 0) {
-      const rejections = await recordRejectedSolutionsViaCloud(rejected, {
-        projectId: stringField(args.projectId),
-        endCustomer: stringField(args.endCustomer),
-      });
+      const rejections = await recordRejectedSolutionsViaCloud(
+        rejected,
+        {
+          projectId: stringField(args.projectId),
+          endCustomer: stringField(args.endCustomer),
+        },
+        this.cloudCredentials,
+      );
       return textResult({
         ...result.data,
         rejections,
@@ -3088,7 +3117,7 @@ export class McpServer {
       subjectMemoryId: stringField(args.subjectMemoryId),
       confirmDistinct: args.confirmDistinct === true ? true : undefined,
       distinctBecause: stringField(args.distinctBecause),
-    });
+    }, this.cloudCredentials);
     if (!result.ok) return this.learningLoopFailure(result, "recordClientNote");
     return textResult({ ...result.data, source: "cloud" });
   }
@@ -3113,7 +3142,7 @@ export class McpServer {
       id,
       amendment,
       outcome: outcome as ClientNoteOutcome | undefined,
-    });
+    }, this.cloudCredentials);
     if (!result.ok) return this.learningLoopFailure(result, "amendClientNote");
     return textResult({ ...result.data, source: "cloud" });
   }
@@ -3152,7 +3181,7 @@ export class McpServer {
       subjectRef,
       signal: signal as FeedbackSignal,
       note: stringField(args.note),
-    });
+    }, this.cloudCredentials);
     if (!result.ok) return this.learningLoopFailure(result, "recordFeedback");
     return textResult({ ...result.data, source: "cloud" });
   }
@@ -3168,7 +3197,7 @@ export class McpServer {
         "getPlaybook requires a valid project id (letters, digits, underscore; up to 128 chars)",
       );
     }
-    const result = await getAgentPlaybookViaCloud(project);
+    const result = await getAgentPlaybookViaCloud(project, this.cloudCredentials);
     if (!result.ok) return this.learningLoopFailure(result, "getPlaybook");
     return textResult({ ...result.data, source: "cloud" });
   }
@@ -3259,7 +3288,10 @@ export class McpServer {
   private async toolStartFixVerification(args: Record<string, unknown>) {
     const ids = this.verificationIds(args, "startFixVerification");
     if ("error" in ids) return errorResult(ids.error);
-    const result = await startFixVerificationViaCloud(ids);
+    const result = await startFixVerificationViaCloud(
+      ids,
+      this.cloudCredentials,
+    );
     if (!result.ok)
       return this.learningLoopFailure(result, "startFixVerification");
     const { opened, ...view } = result.data;
@@ -3278,7 +3310,7 @@ export class McpServer {
   private async toolGetFixVerification(args: Record<string, unknown>) {
     const ids = this.verificationIds(args, "getFixVerification");
     if ("error" in ids) return errorResult(ids.error);
-    const result = await getFixVerificationViaCloud(ids);
+    const result = await getFixVerificationViaCloud(ids, this.cloudCredentials);
     if (!result.ok)
       return this.learningLoopFailure(result, "getFixVerification");
     return this.renderVerification(result.data, {
@@ -3329,10 +3361,13 @@ export class McpServer {
         `requestProbe requires a probe from the fixed vocabulary: ${PROBE_NAMES.join(", ")}`,
       );
     }
-    const result = await requestProbeViaCloud({
-      projectId: ids.projectId,
-      probeName: probe as ProbeName,
-    });
+    const result = await requestProbeViaCloud(
+      {
+        projectId: ids.projectId,
+        probeName: probe as ProbeName,
+      },
+      this.cloudCredentials,
+    );
     if (!result.ok) return this.learningLoopFailure(result, "requestProbe");
     const queued = isRecord(result.data?.queued)
       ? (result.data.queued as Record<string, unknown>)
@@ -3389,10 +3424,13 @@ export class McpServer {
     const days = this.backtestDays(args);
     if ("error" in days) return errorResult(days.error);
 
-    const result = await shadowBacktestViaCloud({
-      projectId: ids.projectId,
-      days: days.days,
-    });
+    const result = await shadowBacktestViaCloud(
+      {
+        projectId: ids.projectId,
+        days: days.days,
+      },
+      this.cloudCredentials,
+    );
     if (!result.ok) return this.learningLoopFailure(result, "shadowBacktest");
     const report = result.data;
     const candidates = Array.isArray(report.candidates)

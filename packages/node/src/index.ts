@@ -82,6 +82,10 @@ export { BugQueueManager } from "./bug-queue";
 export type { BugReport as ServerBugReport, BugQueueConfig } from "./bug-queue";
 export { McpServer } from "./mcp-server";
 export type { McpServerConfig } from "./mcp-server";
+// The credential pair a hosted embedder passes per caller through
+// `McpServerConfig.cloudCredentials`. Exported because a hosted dispatcher has
+// to name the type to build one; the resolver itself stays internal.
+export type { CloudCredentials } from "./cloud-auth";
 export {
   buildFixContext,
   FixContextError,

@@ -15,8 +15,10 @@ import {
   scoreLocalIssue,
   tokenizeIssueText,
   type LocalIssueProfile,
+  type RecallScope,
   type RecallStore,
 } from "./recall";
+import { normalizePartitionSegment } from "./session-store";
 
 // --- Incident-location engine v1 ("which recorded session IS this ticket?") ---
 //
@@ -86,6 +88,27 @@ export interface LocateIncidentOptions {
   margin?: number;
   /** Narrow candidates to this account when a candidate's account is known. */
   accountId?: string;
+  /**
+   * The tenant partition (and optionally the project inside it) this locate is
+   * allowed to see.
+   *
+   * A scope is HONOURED, not advisory. It is pushed into
+   * {@link RecallStore.listSessions} so the walk is rooted at the caller's
+   * partition and an out-of-scope session is never a candidate, and every
+   * candidate that does come back is independently re-checked against its own
+   * recorded `meta.tenant` / `meta.app` — so a store that ignored the scope
+   * still cannot put another tenant's session into the ranking.
+   *
+   * ABSENT means the whole store, deliberately. That is the self-hosted,
+   * single-tenant model this package was built for: the output directory is one
+   * organisation's own capture directory and is itself the boundary, so there
+   * is no partition to narrow to and requiring one would break every local
+   * install. A multi-tenant caller therefore always passes a scope; the cloud
+   * additionally re-checks the located session against the caller's partition
+   * before publishing anything from it, because a boundary that exists in one
+   * place only is a boundary that stops existing when that place has a bug.
+   */
+  scope?: RecallScope;
 }
 
 /** One ranked recorded session/bug scored against the ticket symptom. Carries
@@ -138,9 +161,16 @@ function firstString(
  * Build a recall query profile from a ticket symptom. Reuses tokenizeIssueText
  * so the query is tokenized exactly like a bug profile:
  *  - tokens      ← title + description
- *  - route       ← symptom.url
+ *  - route       ← symptom.route
  *  - errorFamily ← symptom.errorSig
  *  - facetTokens ← tokenized symptom.release
+ *
+ * `route` reads {@link Symptom.route}, NOT `symptom.url`. The candidate side of
+ * the same-route facet is a recorded bug's `representative.route` — an
+ * application path such as `/checkout` — and `url` is the report's own link,
+ * which for every ticket normaliser is the tracker's issue URL. Comparing those
+ * two can only ever be false, which is what left the facet, worth 0.2 of the
+ * match score, permanently dead.
  */
 export function symptomProfile(symptom: Symptom): LocalIssueProfile {
   const tokens = tokenizeIssueText(
@@ -150,7 +180,7 @@ export function symptomProfile(symptom: Symptom): LocalIssueProfile {
   );
   return {
     tokens,
-    route: symptom.url,
+    route: symptom.route,
     errorFamily: symptom.errorSig,
     facetTokens: tokenizeIssueText(symptom.release ?? ""),
   };
@@ -175,13 +205,48 @@ async function candidateSessionTime(
 
 /** Release recorded for a candidate session, mirroring firstString usage in
  *  mcp-server.ts (release / releaseId / version from meta.json). */
-async function candidateRelease(
-  dir: string,
-  store: RecallStore,
-): Promise<string | undefined> {
-  const meta = await store.readJsonRecord(dir, "meta.json");
+function candidateRelease(
+  meta: Record<string, unknown> | undefined,
+): string | undefined {
   if (!meta) return undefined;
   return firstString(meta, ["release", "releaseId", "version"]);
+}
+
+/**
+ * Second, store-independent check that a candidate really belongs to the
+ * caller's partition, read from the session's OWN `meta.json` rather than from
+ * the path it was found at.
+ *
+ * The rooted listing in {@link RecallStore.listSessions} is the narrowing. This
+ * is the guard that survives a store which did not perform it — an in-memory
+ * fake, a future remote store, a refactor that drops the argument — because the
+ * cost of that mistake is one tenant's evidence published into another's
+ * ticket.
+ *
+ * An UNRECORDED tenant or app is treated as unknown and passes, matching how
+ * {@link candidateAccountId} handles an absent account: sessions captured by a
+ * self-hosted install carry no tenant at all, and reading absence as a mismatch
+ * would empty the ranking for every one of them. Absence is only reachable when
+ * the listing was not rooted, since a rooted walk returns sessions from one
+ * partition by construction.
+ */
+function candidateInScope(
+  meta: Record<string, unknown> | undefined,
+  scope: RecallScope | undefined,
+): boolean {
+  if (!scope) return true;
+  const tenant = normalizePartitionSegment(meta?.tenant);
+  if (
+    tenant !== undefined &&
+    tenant !== normalizePartitionSegment(scope.tenantId)
+  ) {
+    return false;
+  }
+  if (scope.projectId === undefined) return true;
+  const app = normalizePartitionSegment(meta?.app);
+  return (
+    app === undefined || app === normalizePartitionSegment(scope.projectId)
+  );
 }
 
 /**
@@ -243,7 +308,9 @@ export async function locateIncident(
   const symptomRelease = symptom.release?.trim();
 
   const candidates: RankedCandidate[] = [];
-  for (const { id, dir } of await store.listSessions()) {
+  for (const { id, dir } of await store.listSessions(opts.scope)) {
+    const meta = await store.readJsonRecord(dir, "meta.json");
+    if (!candidateInScope(meta, opts.scope)) continue;
     const bundle =
       (await store.readJsonRecord(dir, "llm.json")) ??
       (await store.readJsonRecord(dir, "bundle.json")) ??
@@ -257,7 +324,7 @@ export async function locateIncident(
       continue;
     }
     const sessionTime = await candidateSessionTime(dir, store, bundle);
-    const release = await candidateRelease(dir, store);
+    const release = candidateRelease(meta);
     for (const raw of await store.readDistinctBugs(dir)) {
       if (!store.isDistinctBugRecord(raw)) continue;
       const bug = raw as unknown as DistinctBug;

@@ -90,19 +90,22 @@ function bug(partial: Partial<FakeBug> & { bugId: string }): FakeBug {
   };
 }
 
-/** A symptom whose title/route/error-family strongly rhyme with the default bug. */
+/** A symptom whose title/route/error-family strongly rhyme with the default bug.
+ *  `url` carries what a real ticket normaliser puts there — the tracker's own
+ *  issue link — so the same-route facet can only fire off `route`. */
 const strongSymptom: Symptom = {
   title: "checkout failed span error",
-  url: "/checkout",
+  url: "https://acme.atlassian.net/browse/SUP-4211",
+  route: "/checkout",
   errorSig: "console_error",
 };
 
 describe("symptomProfile", () => {
-  it("maps title+description → tokens, url → route, errorSig → errorFamily, release → facetTokens", () => {
+  it("maps title+description → tokens, route → route, errorSig → errorFamily, release → facetTokens", () => {
     const profile = symptomProfile({
       title: "Checkout fails",
       description: "500 on submit",
-      url: "/checkout",
+      route: "/checkout",
       errorSig: "net_5xx",
       release: "2.1.0",
     });
@@ -113,7 +116,19 @@ describe("symptomProfile", () => {
     expect(profile.facetTokens).toEqual(tokenizeIssueText("2.1.0"));
   });
 
-  it("tolerates a bare title (no description/url/errorSig/release)", async () => {
+  it("never reads the tracker link in `url` as the application route", () => {
+    // The candidate side of the same-route facet is a recorded bug's
+    // `representative.route` — an application path. Every ticket normaliser
+    // puts the tracker's own issue URL in `url`, which matches no application
+    // route, so reading it here is what left the facet permanently dead.
+    const profile = symptomProfile({
+      title: "Checkout fails",
+      url: "https://acme.atlassian.net/browse/SUP-4211",
+    });
+    expect(profile.route).toBeUndefined();
+  });
+
+  it("tolerates a bare title (no description/route/errorSig/release)", async () => {
     const profile = symptomProfile({ title: "boom" });
     expect(profile.tokens).toEqual(["boom"]);
     expect(profile.route).toBeUndefined();
@@ -135,9 +150,7 @@ describe("locateIncident — outcome", async () => {
       expect.arrayContaining(["semantic", "same-route", "same-error"]),
     );
     // Never fabricate a sessionId: every candidate id comes from listSessions().
-    const ids = new Set(
-      (await store.listSessions()).map((s) => s.id),
-    );
+    const ids = new Set((await store.listSessions()).map((s) => s.id));
     for (const candidate of result.candidates) {
       expect(ids.has(candidate.sessionId)).toBe(true);
     }
@@ -191,9 +204,13 @@ describe("locateIncident — outcome", async () => {
         ],
       },
     ]);
-    const result = await locateIncident({ title: "login redirect loop" }, store, {
-      now: 1_000,
-    });
+    const result = await locateIncident(
+      { title: "login redirect loop" },
+      store,
+      {
+        now: 1_000,
+      },
+    );
     expect(result.outcome).toBe("inconclusive");
     expect(result.candidates).toEqual([]);
   });
@@ -440,7 +457,9 @@ describe("locateIncident — account narrowing", async () => {
       },
     ]);
 
-    const unfiltered = await locateIncident(strongSymptom, store, { now: 1_000 });
+    const unfiltered = await locateIncident(strongSymptom, store, {
+      now: 1_000,
+    });
     const targetWithoutNarrowing = unfiltered.candidates.find(
       (candidate) => candidate.sessionId === "session-target",
     );
@@ -482,8 +501,8 @@ describe("locateIncident — calibration logging", async () => {
         ]),
         { now: 1_000 },
       );
-      const lines = stderr.mock.calls.map(([chunk]) =>
-        JSON.parse(String(chunk)) as Record<string, unknown>,
+      const lines = stderr.mock.calls.map(
+        ([chunk]) => JSON.parse(String(chunk)) as Record<string, unknown>,
       );
 
       expect(lines[0]).toMatchObject({
@@ -655,5 +674,212 @@ describe("locatedEvidence — no-baseline adapter", () => {
   it("tolerates a bug with missing/empty evidence arrays", () => {
     const located = { bugId: "bug-empty" } as unknown as DistinctBug;
     expect(locatedEvidence(located, "sess-z")).toEqual([]);
+  });
+});
+
+describe("locateIncident — the same-route facet", () => {
+  // The 4-facet base score is 0.6·text + 0.2·route + 0.1·error + 0.1·env
+  // (recall.ts). One field on the symptom is therefore worth 0.2 of the score,
+  // which is the difference between clearing the 0.5 match bar and telling the
+  // customer "no incident found". Before `Symptom.route` existed the facet read
+  // `symptom.url` — the tracker's own issue link — and could never fire.
+  const store = () =>
+    fakeStore([
+      {
+        id: "sess-route",
+        index: { end: 1_000 },
+        bugs: [
+          bug({
+            bugId: "bug-route",
+            title: "Order submit returns 500",
+            representative: {
+              detector: "net_5xx",
+              message: "POST /api/orders 500",
+              route: "/checkout",
+            },
+          }),
+        ],
+      },
+    ]);
+  /** A real ticket: prose, and the tracker's link to itself. No route. */
+  const ticket: Symptom = {
+    title: "Order submit returns 500",
+    url: "https://acme.atlassian.net/browse/SUP-4211",
+  };
+
+  it("adds exactly 0.2 and flips the ticket from inconclusive to matched", async () => {
+    const dead = await locateIncident(ticket, store(), { now: 1_000 });
+    const live = await locateIncident(
+      { ...ticket, route: "/checkout" },
+      store(),
+      {
+        now: 1_000,
+      },
+    );
+
+    expect(dead.candidates[0].reasons).not.toContain("same-route");
+    expect(live.candidates[0].reasons).toContain("same-route");
+    expect(
+      live.candidates[0].confidence - dead.candidates[0].confidence,
+    ).toBeCloseTo(0.2, 10);
+    // The measured before/after: below the bar, then over it.
+    expect(dead.candidates[0].confidence).toBeLessThan(DEFAULT_MATCH_THRESHOLD);
+    expect(dead.outcome).toBe("inconclusive");
+    expect(live.candidates[0].confidence).toBeGreaterThanOrEqual(
+      DEFAULT_MATCH_THRESHOLD,
+    );
+    expect(live.outcome).toBe("matched");
+  });
+
+  it("stays dead when the route is a tracker URL rather than an application path", async () => {
+    // The candidate side is an application path, compared for equality. A value
+    // that carries a scheme and host matches nothing, which is why `url` and
+    // `route` are separate fields rather than one loose field.
+    const result = await locateIncident(
+      { ...ticket, route: "https://acme.example.com/checkout?step=2" },
+      store(),
+      { now: 1_000 },
+    );
+    expect(result.candidates[0].reasons).not.toContain("same-route");
+  });
+});
+
+describe("locateIncident — tenant scope", () => {
+  /**
+   * A store that honours a scope the way `buildRecallStore` does: the scope is
+   * the ROOT of the walk, so an out-of-scope session is never enumerated.
+   */
+  function partitionedStore(
+    sessions: Array<FakeSession & { tenant: string; app: string }>,
+  ): RecallStore {
+    const inner = fakeStore(sessions);
+    return {
+      ...inner,
+      listSessions: async (scope) => {
+        if (!scope) return sessions.map((s) => ({ id: s.id, dir: s.id }));
+        return sessions
+          .filter(
+            (s) =>
+              s.tenant === scope.tenantId &&
+              (scope.projectId === undefined || s.app === scope.projectId),
+          )
+          .map((s) => ({ id: s.id, dir: s.id }));
+      },
+    };
+  }
+
+  /** A store that IGNORES the scope, standing in for a fake, a remote store, or
+   *  a refactor that dropped the argument. The engine must still not rank the
+   *  foreign session. */
+  function leakyStore(
+    sessions: Array<FakeSession & { tenant: string; app: string }>,
+  ): RecallStore {
+    return fakeStore(sessions);
+  }
+
+  const sessions = [
+    {
+      id: "sess-a",
+      tenant: "tenant-a",
+      app: "shop",
+      meta: { tenant: "tenant-a", app: "shop" },
+      bugs: [bug({ bugId: "bug-a" })],
+    },
+    {
+      id: "sess-b",
+      tenant: "tenant-b",
+      app: "shop",
+      meta: { tenant: "tenant-b", app: "shop" },
+      bugs: [bug({ bugId: "bug-b" })],
+    },
+  ];
+
+  it("ranks only the caller's own tenant when the store honours the scope", async () => {
+    const result = await locateIncident(
+      strongSymptom,
+      partitionedStore(sessions),
+      {
+        now: 1_000,
+        scope: { tenantId: "tenant-a" },
+      },
+    );
+    expect(result.candidates.map((c) => c.sessionId)).toEqual(["sess-a"]);
+  });
+
+  it("still refuses a foreign session when the store ignored the scope", async () => {
+    const result = await locateIncident(strongSymptom, leakyStore(sessions), {
+      now: 1_000,
+      scope: { tenantId: "tenant-a" },
+    });
+    expect(result.candidates.map((c) => c.sessionId)).toEqual(["sess-a"]);
+  });
+
+  it("narrows to one application inside the tenant when a projectId is given", async () => {
+    const withApps = [
+      ...sessions,
+      {
+        id: "sess-a-admin",
+        tenant: "tenant-a",
+        app: "admin",
+        meta: { tenant: "tenant-a", app: "admin" },
+        bugs: [bug({ bugId: "bug-a-admin" })],
+      },
+    ];
+    const result = await locateIncident(strongSymptom, leakyStore(withApps), {
+      now: 1_000,
+      scope: { tenantId: "tenant-a", projectId: "shop" },
+    });
+    expect(result.candidates.map((c) => c.sessionId)).toEqual(["sess-a"]);
+  });
+
+  it("ranks every session when no scope is given — the self-hosted model", async () => {
+    const result = await locateIncident(
+      strongSymptom,
+      partitionedStore(sessions),
+      {
+        now: 1_000,
+      },
+    );
+    expect(result.candidates.map((c) => c.sessionId).sort()).toEqual([
+      "sess-a",
+      "sess-b",
+    ]);
+  });
+
+  it("keeps a session that records no tenant at all", async () => {
+    // Self-hosted captures carry no tenant. Reading absence as a mismatch would
+    // empty the ranking for every one of them.
+    const untagged = [
+      {
+        id: "sess-plain",
+        tenant: "tenant-a",
+        app: "shop",
+        bugs: [bug({ bugId: "bug-plain" })],
+      },
+    ];
+    const result = await locateIncident(strongSymptom, leakyStore(untagged), {
+      now: 1_000,
+      scope: { tenantId: "tenant-a" },
+    });
+    expect(result.candidates.map((c) => c.sessionId)).toEqual(["sess-plain"]);
+  });
+
+  it("matches the tenant through the same normalisation the writer used", async () => {
+    // The partition directory is a normalised segment, so a caller passing the
+    // raw tenant id must still match the session written under it.
+    const mixed = [
+      {
+        id: "sess-norm",
+        tenant: "acme-inc",
+        app: "shop",
+        meta: { tenant: "Acme Inc", app: "shop" },
+        bugs: [bug({ bugId: "bug-norm" })],
+      },
+    ];
+    const result = await locateIncident(strongSymptom, leakyStore(mixed), {
+      now: 1_000,
+      scope: { tenantId: "ACME  Inc" },
+    });
+    expect(result.candidates.map((c) => c.sessionId)).toEqual(["sess-norm"]);
   });
 });

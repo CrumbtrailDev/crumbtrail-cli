@@ -7,9 +7,15 @@
 //   shadowBacktestViaCloud  -> GET  /api/agent/shadow-backtest  (agent-token auth)
 //
 // They authenticate exactly like the learning-loop and fix-verification calls in
-// `learning-loop.ts`: `Authorization: Bearer CRUMBTRAIL_CLOUD_TOKEN` against
-// `CRUMBTRAIL_CLOUD_URL`. The project API key (`ctkey_`) is ingest-only and the
-// cloud refuses it on both of these routes.
+// `learning-loop.ts`, through the shared seam in `cloud-auth.ts`: an agent token
+// supplied per call by a hosted dispatcher, or `CRUMBTRAIL_CLOUD_TOKEN` against
+// `CRUMBTRAIL_CLOUD_URL` when none was. The project API key (`ctkey_`) is
+// ingest-only and the cloud refuses it on both of these routes.
+//
+// Using the shared resolver also brings these two calls under the https rule the
+// learning-loop calls already had: their own copy of the env read did not check
+// the base, so an agent token could be put on the wire in cleartext by pointing
+// CRUMBTRAIL_CLOUD_URL at a plain http host.
 //
 // Neither call has a local analogue — there is no offline way to ask a running
 // application a question, and no offline copy of a project's history to replay —
@@ -18,16 +24,11 @@
 // than flattening a refusal into an empty answer.
 
 import { PROBE_NAMES, isProbeName, type ProbeName } from "crumbtrail-core";
+import { cloudAuthGap, resolveCloudAuth } from "./cloud-auth";
+import type { CloudCredentials } from "./cloud-auth";
 import type { LearningLoopResult } from "./learning-loop";
 
 export { PROBE_NAMES, isProbeName, type ProbeName };
-
-/** Env pair both calls need. Mirrors `agentAuth()` in learning-loop.ts. */
-function agentAuth(): { base: string; token: string } | undefined {
-  const base = process.env.CRUMBTRAIL_CLOUD_URL?.replace(/\/+$/, "");
-  const token = process.env.CRUMBTRAIL_CLOUD_TOKEN;
-  return base && token ? { base, token } : undefined;
-}
 
 /** Deliberately generic so a thrown error cannot leak the cloud URL or token. */
 const TRANSPORT_MESSAGE =
@@ -54,10 +55,8 @@ async function parseResponse<T>(res: Response): Promise<LearningLoopResult<T>> {
   return { ok: false, reason: "rejected", status: res.status, code, message };
 }
 
-const PROBE_UNCONFIGURED =
-  "Live probes require CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.";
-const BACKTEST_UNCONFIGURED =
-  "The shadow back test requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.";
+const PROBE_UNCONFIGURED = "Live probes require";
+const BACKTEST_UNCONFIGURED = "The shadow back test requires";
 
 /**
  * One queued probe row, exactly the `queued` object
@@ -86,13 +85,20 @@ export interface RequestProbeResponse {
  * one row rather than queueing two. It answers 202, never 200, because nothing
  * has run at the moment it returns.
  */
-export async function requestProbeViaCloud(input: {
-  projectId: string;
-  probeName: ProbeName;
-}): Promise<LearningLoopResult<RequestProbeResponse>> {
-  const auth = agentAuth();
+export async function requestProbeViaCloud(
+  input: {
+    projectId: string;
+    probeName: ProbeName;
+  },
+  credentials?: CloudCredentials,
+): Promise<LearningLoopResult<RequestProbeResponse>> {
+  const auth = resolveCloudAuth(credentials);
   if (!auth) {
-    return { ok: false, reason: "unconfigured", message: PROBE_UNCONFIGURED };
+    return {
+      ok: false,
+      reason: "unconfigured",
+      message: cloudAuthGap(PROBE_UNCONFIGURED, credentials),
+    };
   }
   try {
     const res = await fetch(`${auth.base}/api/agent/probe`, {
@@ -184,16 +190,19 @@ export interface ShadowBacktestReport {
  * Replay the shadow detectors over a bounded window of one project's history and
  * report what they WOULD have proposed. The route writes no detection state.
  */
-export async function shadowBacktestViaCloud(input: {
-  projectId: string;
-  days?: number;
-}): Promise<LearningLoopResult<ShadowBacktestReport>> {
-  const auth = agentAuth();
+export async function shadowBacktestViaCloud(
+  input: {
+    projectId: string;
+    days?: number;
+  },
+  credentials?: CloudCredentials,
+): Promise<LearningLoopResult<ShadowBacktestReport>> {
+  const auth = resolveCloudAuth(credentials);
   if (!auth) {
     return {
       ok: false,
       reason: "unconfigured",
-      message: BACKTEST_UNCONFIGURED,
+      message: cloudAuthGap(BACKTEST_UNCONFIGURED, credentials),
     };
   }
   const params = new URLSearchParams({ project: input.projectId });

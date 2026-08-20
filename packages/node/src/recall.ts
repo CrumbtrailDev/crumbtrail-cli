@@ -1,5 +1,9 @@
+import path from "node:path";
 import { buildDistinctBugSignature, type DistinctBug } from "./distinct-bugs";
-import { defaultSessionStore } from "./session-store";
+import {
+  defaultSessionStore,
+  normalizePartitionSegment,
+} from "./session-store";
 
 // --- Local issue recall ("have we seen this before?") ---------------------
 // A dependency-free, offline analogue of the cloud hybrid recall: text overlap
@@ -11,12 +15,42 @@ import { defaultSessionStore } from "./session-store";
 // through a small `RecallStore` seam rather than reaching into the server class.
 
 /**
+ * The partition a caller is entitled to see.
+ *
+ * A hosted deployment stores every tenant's sessions under one sessions
+ * directory, partitioned as `{sessionsDir}/{tenant}/{app}/{date}/{id}`. A
+ * caller acting for one tenant may only ever be shown that tenant's subtree, so
+ * a scope is a NARROWING and never a hint: a store that is handed one and
+ * cannot honour it must answer with no sessions at all rather than with a wider
+ * set. Answering wider is how a ticket in one tenant gets matched to another
+ * tenant's recorded session.
+ *
+ * `projectId` is the application segment (`meta.app`) inside the tenant. It is
+ * optional because a tenant-wide locate is a real case; `tenantId` is not,
+ * because a project id is unique only within its tenant and a project-only
+ * narrowing would have to span every tenant to be evaluated.
+ */
+export interface RecallScope {
+  tenantId: string;
+  projectId?: string;
+}
+
+/**
  * Storage seam the recall engine depends on. The MCP server satisfies this by
  * delegating to its session store + JSON readers; tests can supply an in-memory
  * fake to exercise ranking/dedup/limit without any real MCP server or files.
  */
 export interface RecallStore {
-  listSessions(): Promise<Array<{ id: string; dir: string }>>;
+  /**
+   * Every session the caller may see. With a {@link RecallScope} the result
+   * MUST be confined to that partition — see the type for why an implementation
+   * that cannot confine it returns nothing instead of everything. Omitting the
+   * scope means the whole store, which is the self-hosted single-tenant model
+   * where the store root IS the boundary.
+   */
+  listSessions(
+    scope?: RecallScope,
+  ): Promise<Array<{ id: string; dir: string }>>;
   readJsonRecord(
     dir: string,
     name: string,
@@ -275,46 +309,44 @@ export function isDistinctBugRecord(bug: unknown): bug is DistinctBug {
   );
 }
 
+/**
+ * Resolve the directory a scoped listing may walk, or `undefined` when the scope
+ * names no reachable partition.
+ *
+ * The narrowing is the ROOT, not a filter applied afterwards: an out-of-scope
+ * session is never enumerated, so it can never be scored, ranked or returned.
+ * Segment names are derived with the same normalisation the finalizer used to
+ * write them, and a tenant or project id that does not normalise to a usable
+ * segment resolves to `undefined` — no candidates — rather than widening to the
+ * store root.
+ */
+function scopedSessionsRoot(
+  outputDir: string,
+  scope: RecallScope | undefined,
+): string | undefined {
+  if (!scope) return outputDir;
+  const tenant = normalizePartitionSegment(scope.tenantId);
+  if (!tenant) return undefined;
+  if (scope.projectId === undefined) return path.join(outputDir, tenant);
+  const project = normalizePartitionSegment(scope.projectId);
+  if (!project) return undefined;
+  return path.join(outputDir, tenant, project);
+}
+
 /** Build a RecallStore rooted at `outputDir` from the shared storage readers.
  *  Identical to the store McpServer.recallStore() constructs, so the MCP tool
  *  and the inner /api/solve-context endpoint locate against the same data. */
 export function buildRecallStore(outputDir: string): RecallStore {
   return {
-    listSessions: () => defaultSessionStore.listSessions(outputDir),
+    listSessions: (scope) => {
+      const root = scopedSessionsRoot(outputDir, scope);
+      if (root === undefined) return Promise.resolve([]);
+      return defaultSessionStore.listSessions(root);
+    },
     readJsonRecord: (dir, name) => readSessionJsonRecord(dir, name),
     readDistinctBugs: (dir) => readSessionDistinctBugs(dir),
     isDistinctBugRecord: (x) => isDistinctBugRecord(x),
   };
-}
-
-/**
- * Pull a pre-assembled ticket bundle from the cloud by-ticket endpoint. Reads the
- * SAME env pair the learning-loop client uses (CRUMBTRAIL_CLOUD_URL/CRUMBTRAIL_CLOUD_TOKEN)
- * and authenticates with the same agent-token bearer. Returns the parsed
- * `{ id, status, confidence, sessionId?, bundle }` envelope on a hit, or undefined
- * on ANY miss/failure/unconfigured env — the caller then falls back to the local
- * fetch + auto-locate path. This deliberate always-fall-back shape makes the
- * pull a fast path, never a hard dependency: a cloud
- * outage degrades to local behavior, it never fails the MCP call.
- */
-export async function pullBundleByTicketViaCloud(
-  provider: string,
-  ticketKey: string,
-): Promise<Record<string, unknown> | undefined> {
-  const base = process.env.CRUMBTRAIL_CLOUD_URL?.replace(/\/+$/, "");
-  const token = process.env.CRUMBTRAIL_CLOUD_TOKEN;
-  if (!base || !token) return undefined;
-  const params = new URLSearchParams({ provider, ticketKey });
-  try {
-    const res = await fetch(
-      `${base}/api/bundles/by-ticket?${params.toString()}`,
-      { headers: { authorization: `Bearer ${token}` } },
-    );
-    if (!res.ok) return undefined;
-    return (await res.json()) as Record<string, unknown>;
-  } catch {
-    return undefined;
-  }
 }
 
 /**
