@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { COLLECTOR_MAP, Crumbtrail } from "../bug-logger";
+import { COLLECTOR_MAP, Crumbtrail } from "../crumbtrail";
 import type { BugEvent } from "../types";
 
 /**

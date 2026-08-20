@@ -1,4 +1,4 @@
-export { Crumbtrail, PROBE_RESULT_EVENT_KIND } from "./bug-logger";
+export { Crumbtrail, PROBE_RESULT_EVENT_KIND } from "./crumbtrail";
 // Exported for `crumbtrail-node`, which reads the same provider flag shapes out
 // of captured `env` events. One rule for what counts as a `{ value, variant }`
 // wrapper, in one place: a second copy had already diverged on non-string

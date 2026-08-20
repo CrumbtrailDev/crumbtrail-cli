@@ -1,12 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { COLLECTOR_MAP } from "../bug-logger";
+import { COLLECTOR_MAP } from "../crumbtrail";
 import { DEFAULT_CONFIG } from "../types";
 
 /**
  * Adding a collector is a three place edit: the `COLLECTOR_MAP` entry, the `CrumbtrailConfig`
  * key, and the `DEFAULT_CONFIG` default. Missing the third silently disables the collector at
- * runtime with no type error: the mount loop in `bug-logger.ts` gates each collector on
+ * runtime with no type error: the mount loop in `crumbtrail.ts` gates each collector on
  * `config[key]`, and an absent key is falsy.
  *
  * These tests make that failure loud.

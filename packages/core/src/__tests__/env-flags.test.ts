@@ -7,7 +7,7 @@
  * from a mid-session flip — which is the question a flag-caused regression asks.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Crumbtrail } from "../bug-logger";
+import { Crumbtrail } from "../crumbtrail";
 import { REDACTED_VALUE } from "../redaction";
 
 function mockTransport() {

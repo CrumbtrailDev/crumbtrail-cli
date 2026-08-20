@@ -13,7 +13,7 @@
 // because the wizard prepends an un-caught `createReactNativeCrumbtrail(...)`
 // at the top of the app entry file.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Crumbtrail } from "../bug-logger";
+import { Crumbtrail } from "../crumbtrail";
 import type { CrumbtrailConfig } from "../types";
 
 /**

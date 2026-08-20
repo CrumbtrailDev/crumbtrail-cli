@@ -485,7 +485,7 @@ export interface LlmBundleAgentContext {
  * A flag value paired with the provider variant that produced it, when one is known.
  *
  * Mirrors `NormalizedFlag` in `packages/core/src/flags.ts`, which is deliberately not
- * re-exported from `crumbtrail-core`'s entry point (see the note at `bug-logger.ts:68`), so
+ * re-exported from `crumbtrail-core`'s entry point (see the note at `crumbtrail.ts:68`), so
  * this side of the wire reads the shape rather than importing it.
  */
 export interface LlmBundleFlagValue {

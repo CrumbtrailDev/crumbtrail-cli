@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Crumbtrail } from "../bug-logger";
+import { Crumbtrail } from "../crumbtrail";
 
 function makeStorage(initial?: Record<string, string>) {
   const store = new Map<string, string>(Object.entries(initial ?? {}));

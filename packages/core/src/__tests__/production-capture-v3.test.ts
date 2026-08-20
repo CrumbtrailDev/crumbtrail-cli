@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Crumbtrail } from "../bug-logger";
+import { Crumbtrail } from "../crumbtrail";
 
 function makeTransport() {
   return {

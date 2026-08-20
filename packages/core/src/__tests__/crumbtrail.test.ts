@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Crumbtrail } from "../bug-logger";
+import { Crumbtrail } from "../crumbtrail";
 import {
   CRUMBTRAIL_REQUEST_HEADER,
   CRUMBTRAIL_REQUEST_ID_MAX_LENGTH,
