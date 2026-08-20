@@ -101,13 +101,27 @@ describe("resolveProject with --project", () => {
     return {
       base: "https://api.example.dev",
       token: "t",
-      ui: { out: (line: string) => lines.push(line) },
-      prompter: {
-        select: () => {
-          throw new Error("must not prompt when --project was given");
+      ui: {
+        out: (line?: string) => {
+          lines.push(line ?? "");
         },
-        ask: () => {
-          throw new Error("must not prompt when --project was given");
+        err: (line?: string) => {
+          lines.push(line ?? "");
+        },
+        status: () => {},
+      },
+      prompter: {
+        select: (): never => {
+          throw new Error("must not prompt in these cases");
+        },
+        ask: (): never => {
+          throw new Error("must not prompt in these cases");
+        },
+        confirm: (): never => {
+          throw new Error("must not prompt in these cases");
+        },
+        multiSelect: (): never => {
+          throw new Error("must not prompt in these cases");
         },
       },
       assumeYes: true,
@@ -164,11 +178,7 @@ describe("resolveProject with --project", () => {
       createdAt: "",
     });
     // And nothing was created.
-    expect(
-      fetchImpl.mock.calls.filter(
-        (c) => (c[1] as { method?: string } | undefined)?.method === "POST",
-      ).length,
-    ).toBe(0);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to the id when the list cannot be read", async () => {
