@@ -77,6 +77,9 @@ import {
 import {
   alert,
   banner,
+  chip,
+  headline,
+  outcomeBar,
   caps,
   field,
   glyphs,
@@ -244,7 +247,7 @@ const TAGLINE = "Bug context for coding agents. Set it up in one command.";
  */
 function usage(): string {
   const g = glyphs();
-  const head = (t: string) => color.bold(t);
+  const head = (t: string) => chip(` ${t.toUpperCase()} `, "brandDeep");
   const flag = (f: string, text: string) =>
     `  ${color.brand(f.padEnd(26))} ${text}`;
   const cmd = (c: string, text: string) =>
@@ -1415,10 +1418,10 @@ function printBatchSummary(
 ): void {
   const g = glyphs();
   const mark: Record<ServiceStatus, string> = {
-    wired: color.green(g.tick),
-    guidance: color.green(g.tick),
-    "skipped-already-wired": color.dim(g.bullet),
-    failed: color.red(g.cross),
+    wired: chip(` ${g.tick} `, "success"),
+    guidance: chip(` ${g.tick} `, "success"),
+    "skipped-already-wired": chip(` ${g.bullet} `, "muted"),
+    failed: chip(` ${g.cross} `, "danger"),
   };
   const width = Math.max(...outcomes.map((o) => o.name.length), 4);
   // Absolute temp/monorepo paths make the summary unreadable; the user already
@@ -1426,10 +1429,7 @@ function printBatchSummary(
   const rel = (p: string) => path.relative(root, p) || p;
 
   ui.out("");
-  ui.out(`  ${rule(caps().width - 4)}`);
-  ui.out(
-    `  ${color.green(g.tick)} ${color.bold("Setup complete")} ${color.dim("— project")} ${color.bold(color.brand(projectName))}`,
-  );
+  ui.out(outcomeBar(`${g.tick}  Setup complete — project ${projectName}`));
   ui.out("");
   for (const o of outcomes) {
     const detail =
@@ -1879,8 +1879,7 @@ function printSummary(
   const appBase = dashboardBase(base);
   const g = glyphs();
   ui.out("");
-  ui.out(`  ${rule(caps().width - 4)}`);
-  ui.out(`  ${color.green(g.tick)} ${color.bold("Setup complete")}`);
+  ui.out(outcomeBar(`${g.tick}  Setup complete`));
   ui.out("");
   ui.out(field("Project", color.bold(p.projectName)));
   ui.out(field("Service", color.bold(p.serviceName)));
@@ -1989,11 +1988,14 @@ export function resolveAuthProbe(
   return { kind: "none" };
 }
 
-const STAGE_GLYPH: Record<StageResult["status"], string> = {
-  pass: color.green(glyphs().tick),
-  fail: color.red(glyphs().cross),
-  skipped: color.yellow("○"),
-};
+// Built per call, not as a module constant: a constant would freeze the colour
+// depth at import time, before the terminal has been probed.
+function stageGlyph(status: StageResult["status"]): string {
+  const g = glyphs();
+  if (status === "pass") return chip(` ${g.tick} `, "success");
+  if (status === "fail") return chip(` ${g.cross} `, "danger");
+  return chip(` ${caps().unicode ? "○" : "-"} `, "muted");
+}
 
 const STAGE_LABEL: Record<StageResult["stage"], string> = {
   dns: "DNS ",
@@ -2003,19 +2005,29 @@ const STAGE_LABEL: Record<StageResult["stage"], string> = {
 
 function renderPreflight(result: PreflightResult, ui: Ui): void {
   ui.out("");
-  ui.out(`${color.bold("Crumbtrail preflight")} → ${result.endpoint}`);
+  ui.out(
+    `  ${chip(" PREFLIGHT ", "brandDeep")}  ${color.bold(result.endpoint)}`,
+  );
   ui.out("");
   for (const s of result.stages) {
     const ms = s.status === "skipped" ? "" : color.dim(`(${s.ms}ms)`);
     ui.out(
-      `  ${STAGE_GLYPH[s.status]} ${STAGE_LABEL[s.stage]}  ${s.reason} ${ms}`.trimEnd(),
+      `  ${stageGlyph(s.status)} ${STAGE_LABEL[s.stage]}  ${s.reason} ${ms}`.trimEnd(),
     );
   }
   ui.out("");
   ui.out(
     result.ok
-      ? `${color.green("PASS")} — endpoint and key are reachable and authenticated`
-      : `${color.red("FAIL")} — fix the failing stage above before deploying`,
+      ? headline(
+          "PASS",
+          "endpoint and key are reachable and authenticated",
+          "success",
+        )
+      : headline(
+          "FAIL",
+          "fix the failing stage above before deploying",
+          "danger",
+        ),
   );
 }
 

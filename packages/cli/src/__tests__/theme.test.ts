@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   banner,
+  bar,
+  chip,
   caps,
   color,
   detectCapabilities,
@@ -185,9 +187,41 @@ describe("rendering", () => {
     pin({ unicode: false, colorLevel: 0 });
     expect(glyphs().tick).toBe("+");
     expect(ok("done")).toContain("+ done");
-    expect(step(1, 6, "Detect")).toContain("> ");
+    expect(step(1, 6, "Detect")).toContain("1/6");
     // eslint-disable-next-line no-control-regex
     expect(banner("1.2.3", "tag").join("\n")).not.toMatch(/[^\x00-\x7F]/);
+  });
+
+  it("sets a fill's foreground as well as its background, at every depth", () => {
+    // A background with no explicit foreground is the classic terminal bug: it
+    // inherits the user's text color, and lands as blue-on-blue for half of them.
+    for (const level of [1, 2, 3] as const) {
+      pin({ colorLevel: level });
+      const painted = chip(" 3/6 ", "brandDeep");
+      expect(painted).toMatch(new RegExp(`${ESC}\\[(48;[25];|(4|10)[0-9])`));
+      expect(painted).toMatch(new RegExp(`${ESC}\\[(38;[25];|(3|9)[0-9])`));
+      expect(painted.endsWith(`${ESC}[0m`)).toBe(true);
+    }
+  });
+
+  it("gives a colorless terminal the chip's text and no padding", () => {
+    pin({ colorLevel: 0 });
+    expect(chip(" 3/6 ")).toBe("3/6");
+    expect(bar("crumbtrail", 40)).toBe("crumbtrail");
+  });
+
+  it("fills the bar to the requested width and no further", () => {
+    pin({ colorLevel: 3 });
+    expect(visibleLength(bar("crumbtrail", 40))).toBe(40);
+    // An over-long line is cut rather than allowed to wrap: a wrapped fill
+    // paints a second bar across the row below it.
+    expect(visibleLength(bar("x".repeat(80), 40))).toBe(40);
+  });
+
+  it("flattens the bar's sweep to one flat fill below truecolor", () => {
+    pin({ colorLevel: 2 });
+    const painted = bar("ab", 2);
+    expect(painted.split(`${ESC}[48;5;39m`).length - 1).toBe(1);
   });
 
   it("fits the banner to the terminal without wrapping", () => {

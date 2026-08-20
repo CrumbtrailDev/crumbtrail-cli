@@ -186,27 +186,35 @@ export function resetCapabilities(next?: TerminalCapabilities): void {
 //
 // One entry per semantic role. Each carries its truecolor value plus hand-picked
 // 256-color and 16-color stand-ins, so the same call site stays deliberate at
-// every depth instead of collapsing to white. Foreground only — we never paint a
-// background, so the output reads on light and dark terminals alike.
+// every depth instead of collapsing to white.
+//
+// Backgrounds are painted only as *fills*: a saturated brand or semantic color
+// with its own foreground set on top (`chip`, `bar`). Both halves are explicit,
+// so a fill reads the same on a white terminal and a black one. What we never
+// paint is a "surface" tint — a soft grey panel behind ordinary text — because
+// that silently assumes the terminal's own background and lands as a smear on
+// whichever half of the world guessed the other way.
 
 interface Ink {
   rgb: readonly [number, number, number];
   x256: number;
   basic: number;
+  /** Which text color stays legible on top of this one used as a fill. */
+  on: "dark" | "light";
 }
 
 const INK = {
   // Crumbtrail blue #0099FF, plus the two ends of its gradient ramp.
-  brand: { rgb: [0, 153, 255], x256: 39, basic: 36 },
-  brandLift: { rgb: [92, 204, 255], x256: 81, basic: 96 },
-  brandDeep: { rgb: [0, 102, 224], x256: 26, basic: 34 },
-  success: { rgb: [52, 180, 141], x256: 36, basic: 32 },
-  warn: { rgb: [226, 160, 63], x256: 179, basic: 33 },
-  danger: { rgb: [242, 85, 90], x256: 203, basic: 31 },
-  muted: { rgb: [141, 144, 150], x256: 245, basic: 37 },
+  brand: { rgb: [0, 153, 255], x256: 39, basic: 36, on: "dark" },
+  brandLift: { rgb: [92, 204, 255], x256: 81, basic: 96, on: "dark" },
+  brandDeep: { rgb: [0, 102, 224], x256: 26, basic: 34, on: "light" },
+  success: { rgb: [52, 180, 141], x256: 36, basic: 32, on: "dark" },
+  warn: { rgb: [226, 160, 63], x256: 179, basic: 33, on: "dark" },
+  danger: { rgb: [242, 85, 90], x256: 203, basic: 31, on: "light" },
+  muted: { rgb: [141, 144, 150], x256: 245, basic: 37, on: "dark" },
 } as const satisfies Record<string, Ink>;
 
-type InkName = keyof typeof INK;
+export type InkName = keyof typeof INK;
 
 function fgCode(name: InkName, level: ColorLevel): string {
   const value = INK[name];
@@ -222,6 +230,34 @@ function fgCode(name: InkName, level: ColorLevel): string {
     default:
       return "";
   }
+}
+
+function bgCode(name: InkName, level: ColorLevel): string {
+  const value = INK[name];
+  switch (level) {
+    case 3: {
+      const [r, g, b] = value.rgb;
+      return `${CSI}48;2;${r};${g};${b}m`;
+    }
+    case 2:
+      return `${CSI}48;5;${value.x256}m`;
+    case 1:
+      // The 16-color background codes are the foreground codes plus ten.
+      return `${CSI}${value.basic + 10}m`;
+    default:
+      return "";
+  }
+}
+
+/** The foreground that goes on top of a fill: near-black, or near-white. */
+function fillText(on: "dark" | "light", level: ColorLevel): string {
+  if (level === 0) return "";
+  if (on === "light") {
+    if (level === 3) return `${CSI}38;2;255;255;255m`;
+    return level === 2 ? `${CSI}38;5;231m` : `${CSI}97m`;
+  }
+  if (level === 3) return `${CSI}38;2;6;18;28m`;
+  return level === 2 ? `${CSI}38;5;232m` : `${CSI}30m`;
 }
 
 function wrap(open: string, s: string): string {
@@ -288,6 +324,50 @@ export function gradient(s: string): string {
   return painted + RESET;
 }
 
+/**
+ * A filled label — `chip(" 3/6 ")` — carrying its own foreground. Pass the text
+ * with the padding you want inside the fill; a colorless terminal gets the text
+ * back trimmed, so the same call site reads correctly with no color at all.
+ */
+export function chip(text: string, name: InkName = "brand"): string {
+  const level = caps().colorLevel;
+  if (level === 0) return text.trim();
+  return `${bgCode(name, level)}${fillText(INK[name].on, level)}${CSI}1m${text}${RESET}`;
+}
+
+/**
+ * A full-width filled bar. At truecolor the fill is swept along the brand ramp
+ * left to right; below that it is a single flat brand fill, which is the honest
+ * answer rather than a banded approximation. The text on top is near-black at
+ * every depth, because both ends of the ramp are light enough to need it.
+ */
+export function bar(
+  content: string,
+  width = caps().width,
+  name: InkName = "brand",
+): string {
+  const level = caps().colorLevel;
+  const plain = content.length > width ? content.slice(0, width) : content;
+  const padded = plain.padEnd(width);
+  if (level === 0) return padded.trimEnd();
+  const text = fillText(INK[name].on, level);
+  if (level < 3 || name !== "brand")
+    return `${bgCode(name, level)}${text}${CSI}1m${padded}${RESET}`;
+
+  const from = INK.brandLift.rgb;
+  const to = INK.brand.rgb;
+  const span = Math.max(1, padded.length - 1);
+  let out = `${text}${CSI}1m`;
+  for (const [i, ch] of [...padded].entries()) {
+    const t = i / span;
+    const r = Math.round(from[0] + (to[0] - from[0]) * t);
+    const g = Math.round(from[1] + (to[1] - from[1]) * t);
+    const b = Math.round(from[2] + (to[2] - from[2]) * t);
+    out += `${CSI}48;2;${r};${g};${b}m${ch}`;
+  }
+  return out + RESET;
+}
+
 // ── Glyphs ───────────────────────────────────────────────────────────────────
 
 export interface Glyphs {
@@ -300,6 +380,7 @@ export interface Glyphs {
   crumb: string;
   crumbSmall: string;
   rule: string;
+  rail: string;
   spinner: string[];
 }
 
@@ -313,6 +394,7 @@ const UNICODE_GLYPHS: Glyphs = {
   crumb: "●",
   crumbSmall: "·",
   rule: "─",
+  rail: "│",
   // Braille frames: one cell wide everywhere, unlike the emoji-style spinners
   // that render double-width in some terminals and tear the redraw.
   spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
@@ -328,6 +410,7 @@ const ASCII_GLYPHS: Glyphs = {
   crumb: "o",
   crumbSmall: ".",
   rule: "-",
+  rail: "|",
   spinner: ["|", "/", "-", "\\"],
 };
 
@@ -373,13 +456,17 @@ export function visibleLength(s: string): number {
 }
 
 // Every status line sits on the same two-space gutter as the banner, the step
-// headers and the summary, so a long transcript reads as one column.
-export const ok = (s: string): string => `  ${color.green(glyphs().tick)} ${s}`;
-export const bad = (s: string): string => `  ${color.red(glyphs().cross)} ${s}`;
+// headers and the summary, so a long transcript reads as one column. The state
+// lives in a filled square at the head of the line rather than in the wording,
+// which is what lets the eye find the one failure in forty lines.
+export const ok = (s: string): string =>
+  `  ${chip(` ${glyphs().tick} `, "success")} ${s}`;
+export const bad = (s: string): string =>
+  `  ${chip(` ${glyphs().cross} `, "danger")} ${s}`;
 export const alert = (s: string): string =>
-  `  ${color.yellow(glyphs().warn)} ${s}`;
+  `  ${chip(` ${glyphs().warn} `, "warn")} ${s}`;
 export const note = (s: string): string =>
-  `  ${color.dim(glyphs().bullet)} ${color.dim(s)}`;
+  `  ${color.brandDeep(glyphs().bullet)} ${color.dim(s)}`;
 
 /** A dim brand rule sized to the terminal. */
 export function rule(width = caps().width): string {
@@ -387,37 +474,60 @@ export function rule(width = caps().width): string {
 }
 
 /**
- * A numbered step header. The number carries the color so the eye can find its
- * place in a long transcript without the text having to shout.
+ * A numbered step header: a filled step counter, the title, and a rail running
+ * out to the right margin so each step reads as a band rather than a sentence.
  */
 export function step(n: number, total: number, title: string): string {
-  return `\n  ${color.brand(glyphs().pointer)} ${color.brand(`${n}/${total}`)}  ${color.bold(title)}`;
+  const head = `  ${chip(` ${n}/${total} `, "brandDeep")}  ${color.bold(title)}`;
+  const trail = caps().width - visibleLength(head) - 3;
+  const tail =
+    trail > 3 ? ` ${color.brandDeep(glyphs().rule.repeat(trail))}` : "";
+  return `\n${head}${tail}`;
+}
+
+/**
+ * A headline for a finished phase — the one line a reader should catch while
+ * scrolling past. `chip` carries the state, the title carries the detail.
+ */
+export function headline(
+  label: string,
+  title: string,
+  name: InkName = "success",
+): string {
+  return `  ${chip(` ${label} `, name)}  ${color.bold(title)}`;
+}
+
+/** The end-cap of a run: one full-width filled line stating how it went. */
+export function outcomeBar(label: string, name: InkName = "success"): string {
+  const inner = Math.max(24, caps().width - 4);
+  return `  ${bar(`  ${label}`, inner, name)}`;
 }
 
 /** An aligned "  Label:    value" summary row. */
 export function field(label: string, value: string, pad = 11): string {
-  return `  ${color.dim(`${label}:`.padEnd(pad))} ${value}`;
+  return `  ${color.brandDeep(glyphs().rail)} ${color.dim(`${label}:`.padEnd(pad))} ${value}`;
 }
 
 /**
- * The wordmark: a trail of crumbs leading to the name — the product's own
- * metaphor, and cheap enough to render anywhere. Narrow and ASCII-only
+ * The wordmark, set in a filled brand bar: the trail of crumbs leading to the
+ * name, the version pinned to the right edge. Narrow, ASCII-only and colorless
  * terminals get the same shape with plainer parts, never a broken box.
  */
 export function banner(version: string, tagline: string): string[] {
   const g = glyphs();
   const width = caps().width;
-  const trail = [
-    color.brandDeep(g.crumbSmall),
-    color.brand(g.crumbSmall),
-    color.brandLift(g.crumb),
-  ].join(" ");
-  const head = `  ${trail}  ${color.bold(gradient("crumbtrail"))}`;
-  const stamp = color.dim(`v${version}`);
-  const gap = width - visibleLength(head) - visibleLength(stamp) - 2;
-  const title =
-    gap > 1 ? `${head}${" ".repeat(gap)}${stamp}` : `${head}  ${stamp}`;
-  return ["", title, `  ${rule(width - 4)}`, `  ${color.dim(tagline)}`];
+  const inner = Math.max(24, width - 4);
+  const left = `  ${g.crumbSmall} ${g.crumbSmall} ${g.crumb}  crumbtrail`;
+  const stamp = `v${version}  `;
+  const gap = inner - left.length - stamp.length;
+  const content =
+    gap > 1 ? `${left}${" ".repeat(gap)}${stamp}` : `${left}  ${stamp}`;
+  return [
+    "",
+    `  ${bar(content, inner)}`,
+    `  ${color.brandDeep(g.rule.repeat(inner))}`,
+    `  ${color.dim(tagline)}`,
+  ];
 }
 
 // ── Spinner ──────────────────────────────────────────────────────────────────
