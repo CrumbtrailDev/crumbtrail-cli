@@ -14,6 +14,7 @@ import {
   type IngestPollConfig,
 } from "./poll";
 import { color, type Ui } from "./ui";
+import { caps, glyphs, startSpinner } from "./theme";
 
 /**
  * The reserved prefix the cloud recognizes and refuses to persist. Retained so
@@ -174,13 +175,15 @@ export async function pollForRealEvent(
   const sleep = opts.sleepFn ?? realSleep;
   opts.ui.out("");
   opts.ui.out(
-    color.bold("Now start your dev server and load a page in your browser."),
+    `${color.brand(glyphs().arrow)} ${color.bold("Now start your dev server and load a page in your browser.")}`,
   );
-  if (!opts.ui.status) {
-    opts.ui.out(
-      color.dim("Waiting for the first real event… (Ctrl-C to skip)"),
-    );
-  }
+  // One live line for the whole wait. On a TTY it animates; everywhere else it
+  // prints once and stays quiet, so a CI log gets one line rather than a
+  // thousand.
+  const spinner = startSpinner(
+    opts.ui,
+    "Waiting for the first real event… (Ctrl-C to skip)",
+  );
 
   // Anchor "what's new" in the cloud's own id namespace BEFORE the user acts:
   // snapshot the sessions that already exist. Any session absent from this
@@ -190,7 +193,7 @@ export async function pollForRealEvent(
   // timestamp check. Skip the snapshot entirely if we were already cancelled,
   // so an aborted poll does zero network work.
   if (opts.signal?.aborted) {
-    opts.ui.status?.();
+    spinner.stop();
     return { outcome: "cancelled" };
   }
   let baselineIds: Set<string> | undefined;
@@ -216,14 +219,12 @@ export async function pollForRealEvent(
     const delay = nextPollDelayMs(state, config);
     // Elapsed comes from the (pure) state machine, so the ticker is exact for
     // the budget it's counting against, not wall-clock guesswork.
-    opts.ui.status?.(
-      color.dim(
-        `Waiting for the first real event… ${Math.round((state.elapsedMs + delay) / 1000)}s (Ctrl-C to skip)`,
-      ),
+    spinner.setLabel(
+      `Waiting for the first real event… ${Math.round((state.elapsedMs + delay) / 1000)}s (Ctrl-C to skip)`,
     );
     await sleep(delay, opts.signal);
     if (opts.signal?.aborted) {
-      opts.ui.status?.();
+      spinner.stop();
       return { outcome: "cancelled" };
     }
     let found: boolean;
@@ -243,7 +244,7 @@ export async function pollForRealEvent(
     }
     state = recordPollAttempt(state, found, delay, config);
   }
-  opts.ui.status?.();
+  spinner.stop();
   return state.status === "found"
     ? { outcome: "found", sessionId }
     : { outcome: "timedout" };
@@ -316,22 +317,24 @@ export async function pollForServices(
   const found = new Map<string, string>();
 
   opts.ui.out("");
-  opts.ui.out(color.bold("Now start your services so they can report in."));
-  if (!opts.ui.status) {
-    opts.ui.out(color.dim("Waiting for first events… (Ctrl-C to skip)"));
-  }
+  opts.ui.out(
+    `${color.brand(glyphs().arrow)} ${color.bold("Now start your services so they can report in.")}`,
+  );
+  const spinner = startSpinner(
+    opts.ui,
+    "Waiting for first events… (Ctrl-C to skip)",
+  );
 
+  const sep = caps().unicode ? " · " : " | ";
   let state = initialIngestPollState();
   while (state.status === "waiting") {
     const delay = nextPollDelayMs(state, config);
-    opts.ui.status?.(
-      color.dim(
-        `Waiting for first events… ${found.size}/${total} services · ${Math.round((state.elapsedMs + delay) / 1000)}s (Ctrl-C to skip)`,
-      ),
+    spinner.setLabel(
+      `Waiting for first events… ${found.size}/${total} services${sep}${Math.round((state.elapsedMs + delay) / 1000)}s (Ctrl-C to skip)`,
     );
     await sleep(delay, opts.signal);
     if (opts.signal?.aborted) {
-      opts.ui.status?.();
+      spinner.stop();
       return { outcome: "cancelled", found: Object.fromEntries(found) };
     }
     try {
@@ -347,9 +350,11 @@ export async function pollForServices(
       )) {
         if (!wanted.has(serviceId) || found.has(serviceId)) continue;
         found.set(serviceId, sessionId);
-        // Clear the ticker before printing, or the lines collide.
-        opts.ui.status?.();
+        // Clear the live line before printing, or the next repaint lands on
+        // top of the arrival notice.
+        spinner.pause();
         opts.onFound?.(serviceId, sessionId);
+        spinner.resume();
       }
     } catch {
       // A transient read failure just means "not yet" — keep polling.
@@ -357,7 +362,7 @@ export async function pollForServices(
     // Terminal only when every service reported; otherwise ride the budget out.
     state = recordPollAttempt(state, found.size === total, delay, config);
   }
-  opts.ui.status?.();
+  spinner.stop();
   return {
     outcome: state.status === "found" ? "found" : "timedout",
     found: Object.fromEntries(found),

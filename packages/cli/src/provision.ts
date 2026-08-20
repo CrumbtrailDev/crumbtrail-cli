@@ -12,6 +12,7 @@ import type { Recipe } from "./detect";
 import { RECIPE_REGISTRY } from "./recipe-registry";
 import { ApiError, requestJson } from "./net";
 import { color, type Prompter, type Ui } from "./ui";
+import { ok } from "./theme";
 
 export interface Project {
   id: string;
@@ -275,7 +276,7 @@ export async function resolveProject(
         (await createProject(base, token, input.defaultProjectName, fetchImpl));
     }
   }
-  ui.out(`${color.green("✓")} Project: ${color.bold(project.name)}`);
+  ui.out(ok(`Project: ${color.bold(color.brand(project.name))}`));
   return project;
 }
 
@@ -319,7 +320,7 @@ export async function provisionService(
     { name: input.serviceName, stack: serviceStack },
     fetchImpl,
   );
-  ui.out(`${color.green("✓")} Service: ${color.bold(service.name)}`);
+  ui.out(ok(`Service: ${color.bold(color.brand(service.name))}`));
 
   return { serviceId: service.id, serviceName: service.name };
 }
