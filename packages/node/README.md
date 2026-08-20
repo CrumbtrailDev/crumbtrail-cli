@@ -228,6 +228,15 @@ current code and tests, and report uncertainty or evidence gaps.
 1. Start with `getLatestIssue` for the newest error class failure, or use
    `listSessions` to choose a recording. Use `listBugs` followed by
    `getBugReport` when triaging the bug queue.
+
+   `listSessions` answers with `{sessions, returned, truncated}`. `limit`
+   bounds the read itself, not just the output, and the time and release
+   filters are applied by the read store rather than after the fact, so a
+   narrow request costs less read budget. When the read stops early the result
+   carries an `unavailable` reason: `read_quota_exhausted` with the seconds to
+   wait, `unauthorized` for a rejected token, or `unreachable`. A short list is
+   never the same answer as an empty account, and `getLatestIssue` reports the
+   same reasons rather than saying no issue was found.
 2. For one recording, use `getFixContext` for a ranked summary. Use
    `getRegressionContext` only to compare two recordings across releases.
 3. For a focused investigation, use `getSessionManifest` to identify a signal

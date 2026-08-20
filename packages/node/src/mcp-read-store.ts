@@ -1,7 +1,66 @@
 import { defaultSessionStore } from "./session-store";
 
+/**
+ * What a store already knows about a session without reading an artifact.
+ *
+ * A remote listing answers with these fields on the wire, so a caller that only
+ * needs a row's shape must not pay a second request per session to rebuild
+ * them. A local store leaves the summary undefined, because reading meta.json
+ * off disk costs nothing and the numbers live only inside the artifacts.
+ */
+export interface McpSessionSummary {
+  /** The service the session was ingested under. NOT the SDK's `app`: that
+   *  lives in meta.json and the two are set from different fields. */
+  service?: string;
+  start?: number;
+  end?: number;
+  errorCount?: number;
+  failedRequestCount?: number;
+  title?: string;
+}
+
+export interface McpSessionEntry {
+  id: string;
+  dir: string;
+  /** Undefined when the store cannot answer without reading artifacts. */
+  summary?: McpSessionSummary;
+}
+
+/** Filters a store may push at its backend instead of making the caller scan. */
+export interface McpSessionQuery {
+  /** Rows wanted. A store answers at most this many and says if more matched. */
+  limit?: number;
+  /** Epoch ms lower bound on session start. */
+  after?: number;
+  /** Epoch ms upper bound on session start. */
+  before?: number;
+  release?: string;
+}
+
+/**
+ * Why a listing could not be answered in full.
+ *
+ * This exists because the alternative was silence: a 429 from the read limiter,
+ * an expired token and a network failure all used to collapse to an empty list,
+ * which the tools reported as "you have no sessions". A reader cannot act on
+ * that. Each of these is a different next step for them.
+ */
+export interface McpSessionListingFailure {
+  reason: "read_quota_exhausted" | "unauthorized" | "unreachable";
+  retryAfterSeconds?: number;
+}
+
+export interface McpSessionListing {
+  /** Everything that was read, which may be a prefix of what matched. */
+  sessions: McpSessionEntry[];
+  /** True when more sessions matched than were returned. */
+  truncated: boolean;
+  /** Set when the listing stopped early. `sessions` is then partial. */
+  unavailable?: McpSessionListingFailure;
+}
+
 export interface McpReadStore {
-  listSessions(): Promise<Array<{ id: string; dir: string }>>;
+  listSessions(query?: McpSessionQuery): Promise<McpSessionListing>;
   resolveSessionDir(sessionId: string): Promise<string>;
   readArtifact(sessionDir: string, name: string): Promise<Buffer | undefined>;
   statArtifact(
@@ -13,8 +72,16 @@ export interface McpReadStore {
 export class FilesystemMcpReadStore implements McpReadStore {
   constructor(private readonly outputDir: string) {}
 
-  async listSessions(): Promise<Array<{ id: string; dir: string }>> {
-    return defaultSessionStore.listSessions(this.outputDir);
+  /**
+   * The query is deliberately not pushed down. Every filter it carries is
+   * answered by meta.json, which is a local file read the caller is going to
+   * make anyway, so filtering here would cost the same reads and lose the
+   * caller's ability to fall back on aliases (release/releaseId/version). The
+   * remote store is where a pushed down filter buys anything.
+   */
+  async listSessions(): Promise<McpSessionListing> {
+    const sessions = await defaultSessionStore.listSessions(this.outputDir);
+    return { sessions, truncated: false };
   }
 
   // resolveSessionDir stays SYNC on the store (pure path resolution, no artifact
@@ -48,6 +115,16 @@ interface RemoteMcpReadStoreConfig {
 
 export class RemoteMcpReadStore implements McpReadStore {
   private static readonly MAX_BODY_BYTES = 16 * 1024 * 1024;
+  /**
+   * Ceiling on the rows one listing will consume.
+   *
+   * Every request advances the offset by the rows the server sent, so a listing
+   * against a finite table ends on a short page. This bounds the pathological
+   * case instead of trusting that: an endpoint that answers every offset with a
+   * full page of rows this client discards would otherwise page forever inside
+   * one tool call, and a hang is worse than a truncated answer.
+   */
+  private static readonly MAX_SCANNED_ROWS = 5_000;
   private readonly baseUrl: string;
   private readonly token: string;
   private readonly timeoutMs: number;
@@ -62,41 +139,133 @@ export class RemoteMcpReadStore implements McpReadStore {
     this.timeoutMs = timeoutMs;
   }
 
-  async listSessions(): Promise<Array<{ id: string; dir: string }>> {
-    const sessions: Array<{ id: string; dir: string }> = [];
-    const limit = 100;
+  /**
+   * One bounded, filtered request instead of a full scan.
+   *
+   * This used to page `/api/agent/sessions` up to fifty times, forward none of
+   * the filters the route parses, and throw away every field but the id, which
+   * forced each caller into one artifact read per session to rebuild what had
+   * already been on the wire. On a tenant with a few hundred sessions that
+   * exhausted the agent read limiter inside a single tool call, and the 429
+   * came back as an empty list.
+   *
+   * So: the filters go in the query string, the limit bounds the request rather
+   * than the output, the payload's own per session numbers are kept, and a
+   * failure is reported as a failure with whatever was read before it.
+   */
+  async listSessions(query: McpSessionQuery = {}): Promise<McpSessionListing> {
+    const wanted = Math.max(1, Math.min(500, Math.floor(query.limit ?? 100)));
+    const sessions: McpSessionEntry[] = [];
+    // Rows the SERVER sent, which is not the same number as the rows that were
+    // kept: a row this client cannot parse still occupies its place in the
+    // route's ORDER BY. The offset has to count what was consumed, or the next
+    // request re-reads the tail of the page it just read — the same session
+    // twice in the listing, and no forward progress at all when a whole page is
+    // unparseable.
+    let consumed = 0;
 
-    try {
-      for (let page = 0; page < 50; page += 1) {
-        const body = await this.fetchBody(
-          `/api/agent/sessions?limit=${limit}&offset=${page * limit}`,
-        );
-        if (!body) return [];
-        const payload: unknown = JSON.parse(body.toString("utf-8"));
-        if (
-          typeof payload !== "object" ||
-          payload === null ||
-          !Array.isArray((payload as { sessions?: unknown }).sessions)
-        ) {
-          return [];
-        }
-
-        const pageSessions = (payload as { sessions: unknown[] }).sessions;
-        sessions.push(
-          ...pageSessions
-            .filter(
-              (session): session is { id: string } =>
-                typeof session === "object" &&
-                session !== null &&
-                typeof (session as { id?: unknown }).id === "string",
-            )
-            .map((session) => ({ id: session.id, dir: session.id })),
-        );
-        if (pageSessions.length < limit) return sessions;
+    // One row past what the caller asked for, so a full page is distinguishable
+    // from a page that happens to end exactly on the limit.
+    while (
+      sessions.length <= wanted &&
+      consumed < RemoteMcpReadStore.MAX_SCANNED_ROWS
+    ) {
+      const page = Math.min(100, wanted + 1 - sessions.length);
+      const result = await this.fetchSessionPage(query, page, consumed);
+      if (!result.ok) {
+        return { sessions, truncated: false, unavailable: result.failure };
       }
-      return sessions;
+      consumed += result.rowCount;
+      sessions.push(...result.sessions);
+      // A short PAGE ends the listing, not a short mapped result. This also
+      // covers an empty page, since `page` is never less than one.
+      if (result.rowCount < page) {
+        return { sessions, truncated: false };
+      }
+    }
+    return { sessions: sessions.slice(0, wanted), truncated: true };
+  }
+
+  private sessionListPath(
+    query: McpSessionQuery,
+    limit: number,
+    offset: number,
+  ): string {
+    const params = new URLSearchParams({
+      limit: String(limit),
+      offset: String(offset),
+    });
+    // The route reads these as `since`/`until` ISO timestamps and as an exact
+    // release tag. Anything it cannot parse it ignores, so an unusable bound is
+    // never sent rather than silently widening the read.
+    const since = isoOrUndefined(query.after);
+    if (since) params.set("since", since);
+    const until = isoOrUndefined(query.before);
+    if (until) params.set("until", until);
+    const release = query.release?.trim();
+    if (release) params.set("release", release);
+    return `/api/agent/sessions?${params.toString()}`;
+  }
+
+  private async fetchSessionPage(
+    query: McpSessionQuery,
+    limit: number,
+    offset: number,
+  ): Promise<
+    | { ok: true; sessions: McpSessionEntry[]; rowCount: number }
+    | { ok: false; failure: McpSessionListingFailure }
+  > {
+    const path = this.sessionListPath(query, limit, offset);
+    const response = await this.fetchListing(path);
+    if (!response.ok) return { ok: false, failure: response.failure };
+    let payload: unknown;
+    try {
+      payload = JSON.parse(response.body.toString("utf-8"));
     } catch {
-      return [];
+      return { ok: false, failure: { reason: "unreachable" } };
+    }
+    const rows = isRecord(payload) ? payload.sessions : undefined;
+    if (!Array.isArray(rows)) {
+      return { ok: false, failure: { reason: "unreachable" } };
+    }
+    return {
+      ok: true,
+      sessions: rows.map(toSessionEntry).filter(isEntry),
+      rowCount: rows.length,
+    };
+  }
+
+  /**
+   * Fetches a listing and keeps the status, because the status IS the answer
+   * here. `fetchBody` collapses every non ok response to undefined, which is
+   * right for an artifact (missing or unreadable are the same next step) and
+   * wrong for a listing (quota, auth and outage are three different ones).
+   */
+  private async fetchListing(
+    path: string,
+  ): Promise<
+    | { ok: true; body: Buffer }
+    | { ok: false; failure: McpSessionListingFailure }
+  > {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await globalThis.fetch(`${this.baseUrl}${path}`, {
+        headers: { Authorization: `Bearer ${this.token}` },
+        signal: controller.signal,
+      });
+      if (!response.ok || this.exceedsBodyLimit(response)) {
+        void response.body?.cancel().catch(() => undefined);
+        return { ok: false, failure: listingFailure(response) };
+      }
+      const body = await this.readBoundedBody(response);
+      return body === undefined
+        ? { ok: false, failure: { reason: "unreachable" } }
+        : { ok: true, body };
+    } catch {
+      return { ok: false, failure: { reason: "unreachable" } };
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
@@ -358,6 +527,79 @@ export class RemoteMcpReadStore implements McpReadStore {
       reader.releaseLock();
     }
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isoOrUndefined(epochMs: number | undefined): string | undefined {
+  if (typeof epochMs !== "number" || !Number.isFinite(epochMs)) return undefined;
+  const date = new Date(epochMs);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function epochOrUndefined(value: unknown): number | undefined {
+  const direct = finiteNumber(value);
+  if (direct !== undefined) return direct;
+  const text = nonEmptyString(value);
+  if (!text) return undefined;
+  const parsed = Date.parse(text);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+/**
+ * Keeps the per session numbers the listing already carried. Before this they
+ * were dropped on the floor and re fetched one artifact at a time.
+ */
+function toSessionEntry(row: unknown): McpSessionEntry | undefined {
+  if (!isRecord(row)) return undefined;
+  const id = nonEmptyString(row.id);
+  if (!id) return undefined;
+  const summary: McpSessionSummary = {
+    service: nonEmptyString(row.serviceName),
+    start: epochOrUndefined(row.startedAt),
+    end: epochOrUndefined(row.finalizedAt),
+    errorCount: finiteNumber(row.errorCount),
+    failedRequestCount: finiteNumber(row.failedRequestCount),
+    title: nonEmptyString(row.title),
+  };
+  return { id, dir: id, summary };
+}
+
+function isEntry(entry: McpSessionEntry | undefined): entry is McpSessionEntry {
+  return entry !== undefined;
+}
+
+/**
+ * A 429 is the read limiter, and it is the one failure with a stated recovery,
+ * so its Retry-After travels with it. 401/403 is a token the operator has to
+ * replace. Everything else is an outage from the caller's point of view.
+ */
+function listingFailure(response: Response): McpSessionListingFailure {
+  if (response.status === 429) {
+    const header = Number(response.headers.get("retry-after"));
+    return {
+      reason: "read_quota_exhausted",
+      ...(Number.isFinite(header) && header >= 0
+        ? { retryAfterSeconds: header }
+        : {}),
+    };
+  }
+  if (response.status === 401 || response.status === 403) {
+    return { reason: "unauthorized" };
+  }
+  return { reason: "unreachable" };
 }
 
 interface DirectArtifactHandoff {

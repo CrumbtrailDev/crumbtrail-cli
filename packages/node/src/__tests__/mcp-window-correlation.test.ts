@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import type { BugEvent } from "crumbtrail-core";
 import { McpServer } from "../mcp-server";
-import type { McpReadStore } from "../mcp-read-store";
+import type {
+  McpReadStore,
+  McpSessionListing,
+} from "../mcp-read-store";
 
 /**
  * The getWindowCorrelation MCP tool.
@@ -80,8 +83,11 @@ class InMemoryReadStore implements McpReadStore {
     private readonly artifacts: Record<string, string>,
   ) {}
 
-  async listSessions(): Promise<Array<{ id: string; dir: string }>> {
-    return [{ id: this.sessionId, dir: this.sessionId }];
+  async listSessions(): Promise<McpSessionListing> {
+    return {
+      sessions: [{ id: this.sessionId, dir: this.sessionId }],
+      truncated: false,
+    };
   }
 
   async resolveSessionDir(sessionId: string): Promise<string> {
