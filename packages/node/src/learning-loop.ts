@@ -24,6 +24,14 @@
 // the MCP tool can tell the agent *why* a write did not land (unconfigured vs.
 // rejected vs. transport) instead of silently swallowing it.
 
+import {
+  cloudAuthGap,
+  resolveCloudAuth,
+  type CloudCredentials,
+} from "./cloud-auth";
+
+export type { CloudCredentials };
+
 /** Dispositions the cloud accepts on POST /api/memory/resolve. Mirrors the
  *  server's `DISPOSITIONS` allowlist in packages/cloud/src/routes/memory-routes.ts. */
 export const ISSUE_DISPOSITIONS = [
@@ -96,54 +104,19 @@ export type LearningLoopResult<T> =
   | { ok: false; reason: "transport"; message: string };
 
 /**
- * Bases the agent token may be sent to. The token is a tenant wide secret carried in an
- * `Authorization` header, so a plain `http:` base would put it on the wire in cleartext for
- * anyone on the path. Loopback is exempt because it never leaves the machine and is how the
- * cloud is run locally.
- */
-function isTransportSecureBase(base: string): boolean {
-  let url: URL;
-  try {
-    url = new URL(base);
-  } catch {
-    return false;
-  }
-  if (url.protocol === "https:") return true;
-  return (
-    url.protocol === "http:" &&
-    (url.hostname === "localhost" ||
-      url.hostname === "127.0.0.1" ||
-      url.hostname === "[::1]")
-  );
-}
-
-function cloudBase(): string | undefined {
-  return process.env.CRUMBTRAIL_CLOUD_URL?.replace(/\/+$/, "") || undefined;
-}
-
-function agentAuth(): { base: string; token: string } | undefined {
-  const base = cloudBase();
-  const token = process.env.CRUMBTRAIL_CLOUD_TOKEN;
-  if (!base || !token) return undefined;
-  if (!isTransportSecureBase(base)) return undefined;
-  return { base, token };
-}
-
-const INSECURE_BASE_MESSAGE =
-  "CRUMBTRAIL_CLOUD_URL must use https (localhost is the only exception). The agent token is not sent over plain http.";
-
-/**
  * The gap a call reports when it has no usable cloud. A base that is set but refused is reported
  * as its own reason rather than as a missing variable, so an operator is not sent looking for a
- * value that is already there.
+ * value that is already there — and a hosted caller is never sent looking at an environment
+ * variable that path does not read.
  */
-function unconfigured<T>(message: string): LearningLoopResult<T> {
-  const base = cloudBase();
+function unconfigured<T>(
+  stem: string,
+  credentials?: CloudCredentials,
+): LearningLoopResult<T> {
   return {
     ok: false,
     reason: "unconfigured",
-    message:
-      base && !isTransportSecureBase(base) ? INSECURE_BASE_MESSAGE : message,
+    message: cloudAuthGap(stem, credentials),
   };
 }
 
@@ -207,12 +180,11 @@ export interface ResolveIssueResponse {
  */
 export async function resolveIssueViaCloud(
   input: ResolveIssueInput,
+  credentials?: CloudCredentials,
 ): Promise<LearningLoopResult<ResolveIssueResponse>> {
-  const auth = agentAuth();
+  const auth = resolveCloudAuth(credentials);
   if (!auth) {
-    return unconfigured(
-      "Cloud issue resolution requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
-    );
+    return unconfigured("Cloud issue resolution requires", credentials);
   }
   const body: Record<string, unknown> = {
     memoryId: input.memoryId,
@@ -255,12 +227,11 @@ export interface RecordFeedbackInput {
  */
 export async function recordAgentFeedbackViaCloud(
   input: RecordFeedbackInput,
+  credentials?: CloudCredentials,
 ): Promise<LearningLoopResult<{ feedback: unknown }>> {
-  const auth = agentAuth();
+  const auth = resolveCloudAuth(credentials);
   if (!auth) {
-    return unconfigured(
-      "Recording agent feedback requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
-    );
+    return unconfigured("Recording agent feedback requires", credentials);
   }
   const body: Record<string, unknown> = {
     projectId: input.projectId,
@@ -291,12 +262,11 @@ export async function recordAgentFeedbackViaCloud(
  */
 export async function getAgentPlaybookViaCloud(
   projectId: string,
+  credentials?: CloudCredentials,
 ): Promise<LearningLoopResult<{ rules: unknown[] }>> {
-  const auth = agentAuth();
+  const auth = resolveCloudAuth(credentials);
   if (!auth) {
-    return unconfigured(
-      "Reading the tenant playbook requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
-    );
+    return unconfigured("Reading the tenant playbook requires", credentials);
   }
   const params = new URLSearchParams({ project: projectId });
   try {
@@ -373,21 +343,23 @@ export interface StartFixVerificationResponse extends FixVerificationView {
   opened: boolean;
 }
 
-const VERIFICATION_UNCONFIGURED =
-  "Fix verification requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.";
+const VERIFICATION_UNCONFIGURED = "Fix verification requires";
 
 /**
  * Open an observation window for one canonical issue after applying a fix.
  * Idempotent server side: an issue with a live window gets that window back with
  * `opened: false` and no second `verification_started` event.
  */
-export async function startFixVerificationViaCloud(input: {
-  projectId: string;
-  canonicalIssueId: string;
-}): Promise<LearningLoopResult<StartFixVerificationResponse>> {
-  const auth = agentAuth();
+export async function startFixVerificationViaCloud(
+  input: {
+    projectId: string;
+    canonicalIssueId: string;
+  },
+  credentials?: CloudCredentials,
+): Promise<LearningLoopResult<StartFixVerificationResponse>> {
+  const auth = resolveCloudAuth(credentials);
   if (!auth) {
-    return unconfigured(VERIFICATION_UNCONFIGURED);
+    return unconfigured(VERIFICATION_UNCONFIGURED, credentials);
   }
   try {
     const res = await fetch(`${auth.base}/api/agent/verification`, {
@@ -411,13 +383,16 @@ export async function startFixVerificationViaCloud(input: {
  * Read the current verification state for one canonical issue. Read-only; it
  * never opens a window, so polling it is free of side effects.
  */
-export async function getFixVerificationViaCloud(input: {
-  projectId: string;
-  canonicalIssueId: string;
-}): Promise<LearningLoopResult<FixVerificationView>> {
-  const auth = agentAuth();
+export async function getFixVerificationViaCloud(
+  input: {
+    projectId: string;
+    canonicalIssueId: string;
+  },
+  credentials?: CloudCredentials,
+): Promise<LearningLoopResult<FixVerificationView>> {
+  const auth = resolveCloudAuth(credentials);
   if (!auth) {
-    return unconfigured(VERIFICATION_UNCONFIGURED);
+    return unconfigured(VERIFICATION_UNCONFIGURED, credentials);
   }
   const params = new URLSearchParams({
     project: input.projectId,
@@ -568,12 +543,11 @@ export interface RecallIssueContextInput {
  */
 export async function recallIssueContextViaCloud(
   input: RecallIssueContextInput,
+  credentials?: CloudCredentials,
 ): Promise<LearningLoopResult<Record<string, unknown>>> {
-  const auth = agentAuth();
+  const auth = resolveCloudAuth(credentials);
   if (!auth) {
-    return unconfigured(
-      "Cloud issue context recall requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
-    );
+    return unconfigured("Cloud issue context recall requires", credentials);
   }
   const body: Record<string, unknown> = {};
   const copy = <K extends keyof RecallIssueContextInput>(key: K): void => {
@@ -647,12 +621,11 @@ export interface RecordClientNoteInput {
  */
 export async function recordClientNoteViaCloud(
   input: RecordClientNoteInput,
+  credentials?: CloudCredentials,
 ): Promise<LearningLoopResult<Record<string, unknown>>> {
-  const auth = agentAuth();
+  const auth = resolveCloudAuth(credentials);
   if (!auth) {
-    return unconfigured(
-      "Recording a client note requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
-    );
+    return unconfigured("Recording a client note requires", credentials);
   }
   const body: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(input)) {
@@ -686,12 +659,11 @@ export interface AmendClientNoteInput {
  */
 export async function amendClientNoteViaCloud(
   input: AmendClientNoteInput,
+  credentials?: CloudCredentials,
 ): Promise<LearningLoopResult<Record<string, unknown>>> {
-  const auth = agentAuth();
+  const auth = resolveCloudAuth(credentials);
   if (!auth) {
-    return unconfigured(
-      "Amending a client note requires CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN.",
-    );
+    return unconfigured("Amending a client note requires", credentials);
   }
   const body: Record<string, unknown> = { amendment: input.amendment };
   if (input.outcome !== undefined) body.outcome = input.outcome;
@@ -753,21 +725,25 @@ export const MAX_REJECTED_MEMORY_IDS = 20;
 export async function recordRejectedSolutionsViaCloud(
   rejected: readonly RejectedMemory[],
   context: { projectId?: string; endCustomer?: string },
+  credentials?: CloudCredentials,
 ): Promise<RejectedMemoryOutcome[]> {
   const outcomes: RejectedMemoryOutcome[] = [];
   for (const entry of rejected) {
-    const result = await recordClientNoteViaCloud({
-      projectId: context.projectId,
-      // Client scope: the rejection is a fact about this client's codebase, not
-      // a rule that spans every tenant we serve.
-      scopeLevel: "client",
-      endCustomer: context.endCustomer,
-      subjectKey: `issue_memory:${entry.memoryId}`,
-      slug: `rejected-fix-${entry.memoryId}`,
-      kind: NOTE_KIND_REJECTED_SOLUTION,
-      body: entry.reason,
-      subjectMemoryId: entry.memoryId,
-    });
+    const result = await recordClientNoteViaCloud(
+      {
+        projectId: context.projectId,
+        // Client scope: the rejection is a fact about this client's codebase, not
+        // a rule that spans every tenant we serve.
+        scopeLevel: "client",
+        endCustomer: context.endCustomer,
+        subjectKey: `issue_memory:${entry.memoryId}`,
+        slug: `rejected-fix-${entry.memoryId}`,
+        kind: NOTE_KIND_REJECTED_SOLUTION,
+        body: entry.reason,
+        subjectMemoryId: entry.memoryId,
+      },
+      credentials,
+    );
     if (result.ok) {
       const id = result.data.id;
       const status = result.data.status;

@@ -294,9 +294,30 @@ current code and tests, and report uncertainty or evidence gaps.
    in full: a rule in `undecidable` is neither a pass nor a failure, so `clears`
    covers only the rules a past detection can decide.
 
-The verification, probe, and back test tools call a Crumbtrail cloud deployment,
-so they need `CRUMBTRAIL_CLOUD_URL` and `CRUMBTRAIL_CLOUD_TOKEN` and report a gap
-when those are unset. `getWindowCorrelation` needs neither: it reads the same cold event
+The recall, learning loop, verification, probe, and back test tools call a
+Crumbtrail cloud deployment with an agent token, and report a gap rather than an
+answer when they have no usable credentials. A stdio server takes that pair from
+`CRUMBTRAIL_CLOUD_URL` and `CRUMBTRAIL_CLOUD_TOKEN`, which is correct for every
+call one process makes.
+
+An embedder that serves more than one tenant from one process has no such pair,
+because the only correct credential for a call is the calling tenant's own agent
+token. Pass it per caller instead, as `cloudCredentials` on `McpServerConfig`:
+
+```ts
+new McpServer({
+  outputDir,
+  readStore,
+  cloudCredentials: { baseUrl: callerCloudUrl, token: callerAgentToken },
+});
+```
+
+Explicit credentials replace the environment rather than merging with it, so a
+process that happens to carry `CRUMBTRAIL_CLOUD_TOKEN` can never answer one
+caller with another caller's token. The token is only ever sent to an https base,
+or to loopback, whichever source it came from.
+
+`getWindowCorrelation` needs no credentials at all: it reads the same cold event
 stream `getWindow` reads, through the same store, so it answers identically for a
 local session and a hosted one.
 
