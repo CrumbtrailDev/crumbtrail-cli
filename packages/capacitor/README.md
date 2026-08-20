@@ -41,6 +41,7 @@ createCapacitorCrumbtrailAsync({
   config: {
     httpEndpoint: "https://api.crumbtrail.ai",
     httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,
+    remoteConfig: true, // take the kill switch and capture settings from the project
     service: "app",
   },
 }).catch(() => {});
@@ -58,6 +59,7 @@ createCapacitorCrumbtrailAsync({
   config: {
     httpEndpoint: "https://api.crumbtrail.ai",
     httpAuthToken: environment.crumbtrailKey,
+    remoteConfig: true,
     service: "app",
   },
 }).catch(() => {});

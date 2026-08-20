@@ -101,8 +101,15 @@ Crumbtrail.init({
   ...PRESET_PASSIVE,
   httpEndpoint: "https://api.crumbtrail.ai",
   httpAuthToken: process.env.CRUMBTRAIL_KEY,
+  remoteConfig: true,
 });
 ```
+
+`remoteConfig: true` is what lets the project's capture settings reach the app.
+Without it the SDK never asks Crumbtrail for them, so the auto flag triggers,
+sampling, consent mode, masking, session replay and live probes all stay at
+whatever this call says. The kill switch and the capture budgets are enforced at
+ingest as well, so those hold either way. The installer writes it for you.
 
 ## Failure archetype skills
 

@@ -121,7 +121,8 @@ function startWithRawPollPayload(
     ...extra,
     transportInstance: transport,
     configEndpoint: "/api/capture-config",
-    projectKey: "ctkey_test",
+    httpAuthToken: "ctkey_test",
+    remoteConfig: true,
     configPollIntervalMs: 100_000,
     flushIntervalMs: 100_000,
     // Flush on every emit so an assertion never races the batch interval.

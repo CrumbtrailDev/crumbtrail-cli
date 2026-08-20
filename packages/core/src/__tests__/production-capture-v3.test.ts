@@ -253,7 +253,8 @@ describe("production capture v3", () => {
     const logger = Crumbtrail.init({
       transportInstance: transport,
       configEndpoint: "https://capture.example.test/config",
-      projectKey: "project_42",
+      httpAuthToken: "project_42",
+      remoteConfig: true,
       network: false,
       environment: false,
       domSnapshot: false,
@@ -338,7 +339,8 @@ describe("production capture v3", () => {
     const logger = Crumbtrail.init({
       transportInstance: transport,
       configEndpoint: "https://capture.example.test/config",
-      projectKey: "project_42",
+      httpAuthToken: "project_42",
+      remoteConfig: true,
       network: false,
       environment: false,
       domSnapshot: false,
@@ -396,7 +398,8 @@ describe("production capture v3", () => {
     const logger = Crumbtrail.init({
       transportInstance: transport,
       configEndpoint: "https://capture.example.test/config",
-      projectKey: "project_42",
+      httpAuthToken: "project_42",
+      remoteConfig: true,
       configPollIntervalMs: 1_000,
       network: false,
       environment: false,
@@ -475,7 +478,8 @@ describe("production capture v3", () => {
     const logger = Crumbtrail.init({
       transportInstance: transport,
       configEndpoint: "https://capture.example.test/config",
-      projectKey: "project_42",
+      httpAuthToken: "project_42",
+      remoteConfig: true,
       configPollIntervalMs: 1_000,
       network: false,
       environment: false,

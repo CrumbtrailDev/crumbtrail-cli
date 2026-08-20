@@ -643,10 +643,31 @@ export interface CrumbtrailConfig {
   flightRecorder: boolean;
   /** Capture duration after a flight recorder trigger before finalizing. */
   flightRecorderTailMs: number;
-  /** Optional cloud capture config endpoint polled after initialization. */
+  /**
+   * Poll Crumbtrail for this project's capture settings after initialization.
+   *
+   * This is what makes the project's settings page reach the running app: the
+   * auto flag triggers and their tail, baseline sampling, consent mode, client
+   * side masking, switching session replay on, and live probe delivery all
+   * arrive on that poll and nowhere else. The kill switch, the capture budgets,
+   * row value redaction and the refusal of replay writes are enforced at ingest
+   * too, so those hold whatever the client is running, and the poll only lets a
+   * client stop buffering sooner. Off by default because the poll is fail
+   * closed — capture waits for the first policy response — so a client
+   * pointed at something that does not serve the config route must not be
+   * switched into waiting for one. Every install path the installer writes
+   * sets it, because every one of those points at Crumbtrail.
+   *
+   * Needs `httpAuthToken`: the poll authenticates with the project ingest key
+   * the client already carries, so nothing is configured twice.
+   */
+  remoteConfig: boolean;
+  /**
+   * Where that poll goes. Defaults to `/api/capture-config` on `httpEndpoint`,
+   * which is where Crumbtrail serves it. Set it only for a self hosted config
+   * service that lives somewhere else.
+   */
   configEndpoint?: string;
-  /** Project key sent with cloud capture config requests. */
-  projectKey?: string;
   /**
    * Which app in the project this session belongs to.
    *
@@ -656,7 +677,7 @@ export interface CrumbtrailConfig {
    * the session simply carries no app label.
    */
   service?: string;
-  /** Config poll cadence when `configEndpoint` and `projectKey` are supplied. */
+  /** Config poll cadence when `remoteConfig` is on. */
   configPollIntervalMs: number;
 
   // Heartbeat
@@ -835,6 +856,7 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   baselineSampleRate: 0,
   flightRecorder: false,
   flightRecorderTailMs: 60_000,
+  remoteConfig: false,
   configPollIntervalMs: 60_000,
 
   heartbeat: true,

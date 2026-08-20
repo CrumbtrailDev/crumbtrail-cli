@@ -15,6 +15,24 @@ function singleQuoted(value: string): string {
 }
 
 /**
+ * The line that makes the project's capture settings reach the running app.
+ *
+ * Without it the SDK never polls `/api/capture-config`, and every setting that
+ * only exists on that poll — the auto flag triggers and their tail, baseline
+ * sampling, consent mode, client side masking, switching session replay on,
+ * and live probe delivery — saves in the dashboard and changes nothing in the
+ * app. The kill switch, the budgets, row value redaction and the replay write
+ * refusal are not in that set: ingest enforces those whatever a client sends. It
+ * is emitted rather than defaulted on in the SDK because the poll is fail
+ * closed, so it is only correct for a client pointed at Crumbtrail, which is
+ * exactly what the installer is wiring. No endpoint and no second copy of the
+ * key: the SDK derives both from `httpEndpoint` and `httpAuthToken` above.
+ */
+function remoteConfigLine(indent: string): string {
+  return `${indent}remoteConfig: true,`;
+}
+
+/**
  * Which app in the project the injected code says it is.
  *
  * One ingest key covers the whole project, so the key no longer carries the
@@ -57,6 +75,7 @@ export function clientInitSnippet(
     "  ...PRESET_PASSIVE,",
     `  httpEndpoint: ${JSON.stringify(endpoint)},`,
     `  httpAuthToken: ${keyExpr},`,
+    remoteConfigLine("  "),
     ...serviceLines(serviceName, "  ", JSON.stringify),
     "});",
   ].join("\n");
@@ -80,6 +99,7 @@ export function nuxtPluginSnippet(
     "    ...PRESET_PASSIVE,",
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
+    remoteConfigLine("    "),
     ...serviceLines(serviceName, "    ", JSON.stringify),
     "  });",
     "});",
@@ -232,6 +252,7 @@ export function reactNativeInitSnippet(
     "  config: {",
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
+    remoteConfigLine("    "),
     ...serviceLines(serviceName, "    ", JSON.stringify),
     "  },",
     "});",
@@ -263,6 +284,7 @@ export function capacitorInitSnippet(
     "  config: {",
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
+    remoteConfigLine("    "),
     ...serviceLines(serviceName, "    ", JSON.stringify),
     "  },",
     "})",

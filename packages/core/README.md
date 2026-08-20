@@ -30,6 +30,7 @@ Crumbtrail.init({
   ...PRESET_PASSIVE,
   httpEndpoint: "https://api.crumbtrail.ai",
   httpAuthToken: process.env.CRUMBTRAIL_KEY,
+  remoteConfig: true,
 });
 ```
 
@@ -164,8 +165,9 @@ grants permission:
 ```ts
 const crumbtrail = Crumbtrail.init({
   consentMode: "required",
-  configEndpoint: "https://capture.example.com/config",
-  projectKey: "project_123",
+  httpEndpoint: "https://api.crumbtrail.ai",
+  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,
+  remoteConfig: true,
 });
 
 crumbtrail.consent(true);
@@ -175,6 +177,19 @@ await crumbtrail.flag();
 
 Global Privacy Control is respected by default. Email shaped identifiers are
 discarded by `identify`.
+
+`remoteConfig: true` is what makes the project's capture settings reach the
+running app. With it on, the SDK polls `/api/capture-config` on `httpEndpoint`
+using the ingest key it already holds, and the auto flag triggers, flight
+recorder tail, baseline sampling, consent mode, masking mode, session replay and
+live probes are taken from the project rather than from this call. Those reach
+an app on that poll and on no other path. The kill switch, the per project
+capture budgets, row value redaction and the refusal of a replay write from a
+project that has not opted in are enforced at ingest as well, so they take
+effect on the next upload whatever the client is running. It is off by default,
+and every install path the `crumbtrail` installer writes turns it on. The poll is fail closed: capture waits for the first policy
+response, so do not turn it on against a host that does not serve the route.
+Point `configEndpoint` somewhere else only for a self hosted config service.
 
 Set `flightRecorder: true` to buffer locally until an error, signal, widget
 action, or `flag()` triggers capture. The recorder adds the configured tail
@@ -413,6 +428,7 @@ const crumbtrail = Crumbtrail.init({
   ...PRESET_PASSIVE,
   httpEndpoint: "https://api.crumbtrail.ai",
   httpAuthToken: process.env.CRUMBTRAIL_KEY,
+  remoteConfig: true,
 });
 
 export function App() {

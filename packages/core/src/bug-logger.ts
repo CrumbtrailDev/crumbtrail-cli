@@ -290,7 +290,7 @@ export class Crumbtrail {
     this.transport = transport;
     this.ringBuffer = ringBuffer;
     this.sessionId = sessionId;
-    this.remotePolicyReady = !(config.configEndpoint && config.projectKey);
+    this.remotePolicyReady = !remoteConfigProjectKey(config);
     this.consentGranted =
       config.consentMode === "implicit" &&
       !(config.respectGpc && hasGlobalPrivacyControl());
@@ -500,10 +500,11 @@ export class Crumbtrail {
         .catch(() => {});
     }
 
-    if (config.configEndpoint && config.projectKey) {
+    const remoteConfigKey = remoteConfigProjectKey(config);
+    if (remoteConfigKey) {
       instance.startConfigPolling({
-        endpoint: config.configEndpoint,
-        projectKey: config.projectKey,
+        endpoint: captureConfigEndpoint(config),
+        projectKey: remoteConfigKey,
         intervalMs: config.configPollIntervalMs,
       });
     }
@@ -1665,6 +1666,35 @@ function normalizeInterval(intervalMs: number | undefined): number {
   if (!Number.isFinite(intervalMs) || (intervalMs ?? 0) <= 0)
     return DEFAULT_CONFIG_POLL_INTERVAL_MS;
   return Math.max(1_000, Math.round(intervalMs as number));
+}
+
+/**
+ * The key this client's capture config poll authenticates with, or `undefined`
+ * when it does not poll at all.
+ *
+ * Both halves are required and neither is asked for twice: `remoteConfig` is
+ * the opt in the installer writes, and the poll authenticates with the ingest
+ * key the client already carries. A client with no key has no project to ask
+ * about, so it stays unpolicied rather than waiting forever on a poll that
+ * could never be answered.
+ */
+function remoteConfigProjectKey(config: CrumbtrailConfig): string | undefined {
+  return config.remoteConfig && config.httpAuthToken
+    ? config.httpAuthToken
+    : undefined;
+}
+
+/**
+ * Where the capture config poll goes.
+ *
+ * Derived from `httpEndpoint` the same way the ingest paths are, so the route
+ * stays an SDK detail that upgrades with the package instead of a path frozen
+ * into every customer's committed source. `configEndpoint` overrides it for a
+ * self hosted config service.
+ */
+function captureConfigEndpoint(config: CrumbtrailConfig): string {
+  if (config.configEndpoint) return config.configEndpoint;
+  return `${config.httpEndpoint.replace(/\/+$/, "")}/api/capture-config`;
 }
 
 function configPollingUrl(options: CaptureConfigPollingOptions): string {

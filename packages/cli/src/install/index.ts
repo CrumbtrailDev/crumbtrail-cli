@@ -383,6 +383,11 @@ export function buildAgentPrompt(
       : []),
     `         httpEndpoint: "${endpoint}",`,
     `         httpAuthToken: ${expr},`,
+    // Without this the SDK never polls Crumbtrail for the project's capture
+    // settings, so the kill switch, the auto flag triggers, sampling, masking,
+    // consent mode, session replay and live probes all stay at whatever this
+    // call happens to say and the project's own settings never reach the app.
+    "         remoteConfig: true,",
     "       });",
     ...(serviceName
       ? [
