@@ -72,6 +72,10 @@ interface MockCloud {
 
 interface MockCloudOptions {
   sessionResponse?: SessionResponseMode;
+  /** How many rows the listing has in total. Paged with limit/offset. */
+  sessionCount?: number;
+  /** Retry-After seconds sent with a 429. */
+  retryAfter?: number;
   artifactResponse?: ArtifactResponseMode;
   artifactFraming?: ArtifactFraming;
   headSupport?: HeadSupport;
@@ -160,6 +164,8 @@ const artifacts: Record<string, string> = {
 
 function startMockCloud({
   sessionResponse = "normal",
+  sessionCount = 1,
+  retryAfter,
   artifactResponse = "normal",
   artifactFraming = "chunked",
   headSupport = "head",
@@ -192,7 +198,9 @@ function startMockCloud({
         return;
       }
       if (sessionResponse === "rate-limited") {
-        res.writeHead(429);
+        res.writeHead(429, retryAfter === undefined
+          ? undefined
+          : { "retry-after": String(retryAfter) });
         res.end();
         return;
       }
@@ -223,16 +231,35 @@ function startMockCloud({
         res.flushHeaders();
         return;
       }
+      // The real route pages with limit/offset and answers newest first, and
+      // it carries per session counts. The mock has to do both or a test can
+      // "prove" a bounded read against a backend that never bounded anything.
+      const limit = Number(url.searchParams.get("limit") ?? "100");
+      const offset = Number(url.searchParams.get("offset") ?? "0");
+      const all = Array.from({ length: sessionCount }, (_, index) =>
+        index === 0
+          ? {
+              id: SESSION_ID,
+              startedAt: "2026-07-15T12:00:00.000Z",
+              finalizedAt: "2026-07-15T12:01:00.000Z",
+              errorCount: 1,
+              failedRequestCount: 1,
+              completeness: "full",
+            }
+          : {
+              id: `sess_bulk_${String(index).padStart(4, "0")}`,
+              startedAt: new Date(
+                Date.parse("2026-07-15T12:00:00.000Z") - index * 60_000,
+              ).toISOString(),
+              finalizedAt: null,
+              errorCount: 0,
+              failedRequestCount: 0,
+              completeness: "full",
+            },
+      );
       const body = JSON.stringify({
-        sessions: [
-          {
-            id: SESSION_ID,
-            startedAt: "2026-07-15T12:00:00.000Z",
-            finalizedAt: "2026-07-15T12:01:00.000Z",
-            completeness: "full",
-          },
-        ],
-        pagination: { limit: 100, offset: 0, total: 1 },
+        sessions: all.slice(offset, offset + limit),
+        pagination: { limit, offset, total: all.length },
       });
       res.writeHead(200, {
         "content-type": "application/json",
@@ -409,6 +436,31 @@ async function callTool(
   return JSON.parse(result.content[0].text);
 }
 
+/** Like callTool, but keeps the failure instead of asserting it away. */
+async function callToolRaw(
+  server: McpServer,
+  name: string,
+  args: Record<string, unknown>,
+) {
+  const response = await server.handleMessage({
+    jsonrpc: "2.0",
+    id: name,
+    method: "tools/call",
+    params: { name, arguments: args },
+  });
+  return response!.result as {
+    content: Array<{ text: string }>;
+    isError?: boolean;
+  };
+}
+
+function remoteServer(baseUrl: string, outputDir: string): McpServer {
+  return new McpServer({
+    outputDir,
+    readStore: new RemoteMcpReadStore({ baseUrl, token: TOKEN }),
+  });
+}
+
 describe("MCP remote read store", () => {
   let mock: MockCloud | undefined;
   let tmpDir: string | undefined;
@@ -431,8 +483,9 @@ describe("MCP remote read store", () => {
       }),
     });
 
-    const sessions = await callTool(server, "listSessions", {});
-    expect(sessions).toEqual([
+    const listing = await callTool(server, "listSessions", {});
+    expect(listing).toMatchObject({ returned: 1, truncated: false });
+    expect(listing.sessions).toEqual([
       expect.objectContaining({ id: SESSION_ID, app: "remote-shop" }),
     ]);
 
@@ -599,7 +652,7 @@ describe("MCP remote read store", () => {
     ).toBe(true);
   });
 
-  it("returns an empty list when the session response body stalls", async () => {
+  it("reports a stalled listing body as unreachable, not as empty", async () => {
     mock = await startMockCloud({ sessionResponse: "stalled" });
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
     const server = new McpServer({
@@ -611,43 +664,143 @@ describe("MCP remote read store", () => {
       }),
     });
 
-    await expect(callTool(server, "listSessions", {})).resolves.toEqual([]);
+    const result = await callToolRaw(server, "listSessions", {});
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/could not be reached/i);
   });
 
-  it("returns an empty list when the session response is malformed JSON", async () => {
-    mock = await startMockCloud({ sessionResponse: "malformed-json" });
+  // These four used to assert an empty list and `isError` undefined, which is
+  // the defect stated as a test: a rejected token, a spent read quota and a
+  // dead endpoint all reported "you have no sessions" to the reader. Each one
+  // is now a failure that names itself.
+  it.each([
+    [
+      "401 unauthorized",
+      "unauthorized",
+      /cloud read token was rejected/i,
+    ],
+    [
+      "429 rate limited",
+      "rate-limited",
+      /read quota is exhausted/i,
+    ],
+    ["500 server error", "server-error", /could not be reached/i],
+    ["malformed JSON", "malformed-json", /could not be reached/i],
+  ] as const)("reports %s as a failure, not an empty account", async (
+    _label,
+    sessionResponse,
+    expected,
+  ) => {
+    mock = await startMockCloud({ sessionResponse });
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
-    const server = new McpServer({
-      outputDir: path.join(tmpDir, "sessions"),
-      readStore: new RemoteMcpReadStore({
-        baseUrl: mock.baseUrl,
-        token: TOKEN,
-      }),
+    const server = remoteServer(mock.baseUrl, path.join(tmpDir, "sessions"));
+
+    const result = await callToolRaw(server, "listSessions", {});
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(expected);
+    // Never renders as an empty result an agent would report as "no sessions".
+    expect(result.content[0]!.text).not.toBe("[]");
+  });
+
+  it("names the retry window the read limiter gave it", async () => {
+    mock = await startMockCloud({
+      sessionResponse: "rate-limited",
+      retryAfter: 37,
+    });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
+    const server = remoteServer(mock.baseUrl, path.join(tmpDir, "sessions"));
+
+    const result = await callToolRaw(server, "listSessions", {});
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain("Retry in 37s");
+  });
+
+  // The reported defect: getLatestIssue answered "no session with error-class
+  // evidence" while the sessions existed and only the read budget had run out.
+  it("does not report a spent read quota as an account with no issues", async () => {
+    mock = await startMockCloud({ sessionResponse: "rate-limited" });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
+    const server = remoteServer(mock.baseUrl, path.join(tmpDir, "sessions"));
+
+    const result = await callToolRaw(server, "getLatestIssue", {});
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/read quota is exhausted/i);
+    expect(result.content[0]!.text).not.toMatch(
+      /No finalized session with error-class evidence/i,
+    );
+  });
+
+  // `limit` used to cap the OUTPUT: every recorded session was listed and one
+  // meta.json read for each of them before the slice, so asking for five rows
+  // out of five hundred sessions still spent five hundred reads.
+  it("bounds the read by the limit rather than slicing afterwards", async () => {
+    mock = await startMockCloud({ sessionCount: 500 });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
+    const server = remoteServer(mock.baseUrl, path.join(tmpDir, "sessions"));
+
+    const listing = await callTool(server, "listSessions", { limit: 5 });
+    expect(listing.truncated).toBe(true);
+
+    const artifactReads = mock.requests.filter((request) =>
+      request.path.includes("/artifacts/"),
+    );
+    // Five rows asked for, five sessions read. Never five hundred.
+    expect(artifactReads.length).toBeLessThanOrEqual(5);
+    const listReads = mock.requests.filter((request) =>
+      request.path.startsWith("/api/agent/sessions?"),
+    );
+    expect(listReads).toHaveLength(1);
+    expect(listReads[0]!.path).toContain("limit=6");
+  });
+
+  it("pushes the time and release filters at the route instead of scanning", async () => {
+    mock = await startMockCloud({ sessionCount: 3 });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
+    const server = remoteServer(mock.baseUrl, path.join(tmpDir, "sessions"));
+
+    await callTool(server, "listSessions", {
+      after: Date.parse("2026-07-15T00:00:00.000Z"),
+      before: Date.parse("2026-07-16T00:00:00.000Z"),
+      release: "v9.9.9",
     });
 
-    await expect(callTool(server, "listSessions", {})).resolves.toEqual([]);
+    const listRead = mock.requests.find((request) =>
+      request.path.startsWith("/api/agent/sessions?"),
+    );
+    expect(listRead?.path).toContain(
+      `since=${encodeURIComponent("2026-07-15T00:00:00.000Z")}`,
+    );
+    expect(listRead?.path).toContain(
+      `until=${encodeURIComponent("2026-07-16T00:00:00.000Z")}`,
+    );
+    expect(listRead?.path).toContain("release=v9.9.9");
   });
 
-  it.each([
-    ["401 unauthorized", "unauthorized"],
-    ["429 rate limited", "rate-limited"],
-    ["500 server error", "server-error"],
-  ] as const)(
-    "returns an empty list on %s",
-    async (_label, sessionResponse) => {
-      mock = await startMockCloud({ sessionResponse });
-      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
-      const server = new McpServer({
-        outputDir: path.join(tmpDir, "sessions"),
-        readStore: new RemoteMcpReadStore({
-          baseUrl: mock.baseUrl,
-          token: TOKEN,
-        }),
-      });
+  // The listing already carries errorCount and failedRequestCount. Reading one
+  // index.json per session to rediscover them is what spent the budget before
+  // this tool answered anything, and index.json is the largest artifact a
+  // session has.
+  it("finds the latest issue without an index read per session", async () => {
+    mock = await startMockCloud({ sessionCount: 300 });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
+    const server = remoteServer(mock.baseUrl, path.join(tmpDir, "sessions"));
 
-      await expect(callTool(server, "listSessions", {})).resolves.toEqual([]);
-    },
-  );
+    const context = await callTool(server, "getLatestIssue", {});
+    expect(context.session.id).toBe(SESSION_ID);
+
+    const indexReads = mock.requests.filter((request) =>
+      request.path.includes("/artifacts/index.json"),
+    );
+    // Every index read belongs to the one session it settled on. Before this,
+    // there was one per listed session, three hundred of them, before the tool
+    // had answered anything at all.
+    expect(
+      indexReads.every((request) => request.path.includes(SESSION_ID)),
+    ).toBe(true);
+    expect(
+      mock.requests.filter((request) => request.path.includes("sess_bulk_")),
+    ).toEqual([]);
+  });
 
   it("frames artifact responses the way the endpoint under test really does", async () => {
     // Guards the mock against drifting back into sending a header production
@@ -900,7 +1053,11 @@ describe("MCP remote read store", () => {
       timeoutMs: 25,
     });
 
-    await expect(store.listSessions()).resolves.toEqual([]);
+    await expect(store.listSessions()).resolves.toEqual({
+      sessions: [],
+      truncated: false,
+      unavailable: { reason: "unreachable" },
+    });
   });
 
   it("selects the remote store only when both cloud environment variables are set", () => {

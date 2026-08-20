@@ -162,6 +162,8 @@ Read the alignment counts before you read the divergences.
 
 An empty `listSessions` result for a release filter usually means the app never sent a release
 label, not that no session exists for that release. Drop the filter and match on time instead.
+Check `unavailable` on the result first: when it is set the read stopped early and the list is
+partial, so an empty list there says nothing about what the app recorded.
 
 Missing backend or database event kinds in the manifest mean those SDKs are not installed in the
 recorded environment. That is a gap in instrumentation, not evidence that the new path skipped a

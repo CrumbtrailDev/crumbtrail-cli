@@ -549,7 +549,11 @@ describe("MCP Server", () => {
       params: { name: "listSessions", arguments: {} },
     });
     const result = res!.result as any;
-    const sessions = JSON.parse(result.content[0].text);
+    const listing = JSON.parse(result.content[0].text);
+    // The listing states how much of itself it is, so a short list is never
+    // mistaken for the whole account.
+    expect(listing.truncated).toBe(false);
+    const sessions = listing.sessions;
     expect(sessions.map((session: any) => session.id).sort()).toEqual([
       "sess-1",
       "sess-2",
@@ -575,7 +579,7 @@ describe("MCP Server", () => {
       params: { name: "listSessions", arguments: { app: "test-app" } },
     });
     const result = res!.result as any;
-    const sessions = JSON.parse(result.content[0].text);
+    const sessions = JSON.parse(result.content[0].text).sessions;
     expect(sessions).toHaveLength(1);
     expect(sessions[0].app).toBe("test-app");
   });
@@ -605,7 +609,7 @@ describe("MCP Server", () => {
       },
     });
     const result = res!.result as any;
-    const sessions = JSON.parse(result.content[0].text);
+    const sessions = JSON.parse(result.content[0].text).sessions;
     expect(sessions.map((session: any) => session.id)).toEqual([
       "sess-release",
     ]);
@@ -632,7 +636,7 @@ describe("MCP Server", () => {
       params: { name: "listSessions", arguments: { app: "test-app" } },
     });
     const result = res!.result as any;
-    const sessions = JSON.parse(result.content[0].text);
+    const sessions = JSON.parse(result.content[0].text).sessions;
     const row = sessions.find((session: any) => session.id === "sess-aliased");
     // release/build are first-class on the compact row even though the app used
     // the `version`/`commit` aliases; raw aliases stay out of list views.
