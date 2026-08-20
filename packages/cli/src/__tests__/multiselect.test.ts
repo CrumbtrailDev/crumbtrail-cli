@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   fitToWidth,
   initialMultiSelectState,
@@ -9,6 +9,19 @@ import {
   type MultiSelectItem,
   type MultiSelectState,
 } from "../ui";
+import { resetCapabilities } from "../theme";
+
+// Pin the terminal so the rendered rows are the same on every machine: the
+// glyphs and colours these assertions name are capability-dependent.
+beforeEach(() =>
+  resetCapabilities({
+    colorLevel: 0,
+    unicode: true,
+    width: 80,
+    interactive: true,
+  }),
+);
+afterEach(() => resetCapabilities());
 
 const items: MultiSelectItem[] = [
   { label: "apps/web", checked: true, selectable: true },
@@ -81,7 +94,8 @@ const interactiveItems: MultiSelectItem[] = [
 
 function press(state: MultiSelectState, key: Keypress): MultiSelectState {
   const r = reduceMultiSelectKey(state, key, interactiveItems);
-  if (r.kind !== "continue") throw new Error(`expected continue, got ${r.kind}`);
+  if (r.kind !== "continue")
+    throw new Error(`expected continue, got ${r.kind}`);
   return r.state;
 }
 

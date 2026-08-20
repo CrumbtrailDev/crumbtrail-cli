@@ -18,6 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import { ApiError, requestJson } from "./net";
 import { color, readStdinLine, type Ui } from "./ui";
+import { ok } from "./theme";
 
 // ── PKCE ─────────────────────────────────────────────────────────────────────
 
@@ -302,7 +303,7 @@ export async function loginBrowser(opts: LoginOptions): Promise<TokenResponse> {
     throw new Error("could not open a browser");
   }
   opts.ui.out(`Opened your browser to authorize the CLI:`);
-  opts.ui.out(`  ${color.cyan(authorizeUrl)}`);
+  opts.ui.out(`  ${color.brand(authorizeUrl)}`);
   opts.ui.out(
     color.dim(`Waiting for approval… (or paste the code shown in the browser)`),
   );
@@ -360,8 +361,10 @@ export async function loginDevice(opts: LoginOptions): Promise<TokenResponse> {
   });
   opts.ui.out("");
   opts.ui.out(`To authorize this CLI, visit:`);
-  opts.ui.out(`  ${color.cyan(device.verificationUri)}`);
-  opts.ui.out(`and enter the code:  ${color.bold(device.userCode)}`);
+  opts.ui.out(`  ${color.brand(device.verificationUri)}`);
+  opts.ui.out(
+    `and enter the code:  ${color.bold(color.brandLift(device.userCode))}`,
+  );
   opts.ui.out(color.dim("Waiting for approval…"));
 
   const intervalMs = opts.pollIntervalMs ?? Math.max(1, device.interval) * 1000;
@@ -467,6 +470,6 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
     { token: minted.token, expiresAt: minted.expiresAt, endpoint: opts.base },
     env,
   );
-  opts.ui.out(color.green("Logged in ✓"));
+  opts.ui.out(ok("Logged in."));
   return minted.token;
 }

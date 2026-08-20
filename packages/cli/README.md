@@ -206,6 +206,24 @@ flutter run --dart-define=CRUMBTRAIL_KEY=<your-ingest-key>
 It won't touch a package that is already wired, and it never edits libraries or
 config-only packages.
 
+## Terminal output
+
+The wizard negotiates colour and glyphs with your terminal once, at startup, and
+renders down to whatever it finds. Truecolor terminals get the full brand
+palette; 256-colour and 16-colour terminals get the nearest stand-ins; a
+terminal that cannot do ANSI at all gets plain text. Piped or redirected output
+is always plain, so `npx crumbtrail > setup.log` stays greppable.
+
+Glyphs work the same way. Where UTF-8 is not safe — legacy Windows console under
+code page 437, or a `C`/`POSIX` locale — the box drawing, dots and ticks become
+ASCII, and typographic punctuation is folded down with them.
+
+| Variable             | Effect                                                                                                          |
+| -------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `NO_COLOR`           | Turn colour off entirely.                                                                                       |
+| `FORCE_COLOR`        | `0` off, `1` sixteen colours, `2` 256, `3` truecolor. Wins over detection, including when the output is a pipe. |
+| `CRUMBTRAIL_ASCII=1` | Force ASCII glyphs and punctuation, keeping colour.                                                             |
+
 ## Prefer to wire it by hand?
 
 Nothing here is magic — see [`crumbtrail-core`](https://www.npmjs.com/package/crumbtrail-core)

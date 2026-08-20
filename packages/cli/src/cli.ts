@@ -74,6 +74,23 @@ import {
   type Prompter,
   type Ui,
 } from "./ui";
+import {
+  alert,
+  banner,
+  chip,
+  headline,
+  outcomeBar,
+  caps,
+  field,
+  glyphs,
+  note,
+  ok,
+  rule,
+  step,
+} from "./theme";
+
+/** How many numbered steps the single-package wizard shows. */
+const TOTAL_STEPS = 6;
 
 // ── Version ──────────────────────────────────────────────────────────────────
 
@@ -221,37 +238,84 @@ export function parseArgs(argv: string[]): ParsedArgs {
   return parsed;
 }
 
-const USAGE = `crumbtrail — set up Crumbtrail in your app
+const TAGLINE = "Bug context for coding agents. Set it up in one command.";
 
-Usage:
-  crumbtrail [options]        Run the setup wizard (detect → login → wire → verify)
-  crumbtrail login            Log in and cache a token, nothing else
-  crumbtrail logout           Delete the cached token
-  crumbtrail verify           Preflight an endpoint + key (DNS, TLS, auth) — PASS/FAIL
+/**
+ * Help text. Built per call rather than as a constant so it picks up the
+ * terminal's real colour depth and width, and so `--help` piped to a file is
+ * plain text.
+ */
+function usage(): string {
+  const g = glyphs();
+  const head = (t: string) => chip(` ${t.toUpperCase()} `, "brandDeep");
+  const flag = (f: string, text: string) =>
+    `  ${color.brand(f.padEnd(26))} ${text}`;
+  const cmd = (c: string, text: string) =>
+    `  ${color.bold(c.padEnd(26))} ${color.dim(text)}`;
 
-In a monorepo, run it from the repo root: it scans every workspace and service,
-shows you what it found, and wires the ones you pick.
-
-Options:
-  --yes, -y                  Skip confirmations (required with --project in CI)
-  --project <id>             Attach to an existing project (skip creation)
-  --only <name>              Monorepo: wire only this service (repeatable)
-  --all                      Monorepo: wire every service it can, no prompt
-  --workspace <dir>          Target one package dir (relative to cwd) instead of
-                             the repo root — wires just that package
-  --no-browser               Use the device-code login flow
-  --skip-verify              Don't wait for the first event
-  --no-write-key             Don't mint or write an ingest key; print the
-                             variable to set instead
-  --endpoint <url>           Cloud endpoint (else $CRUMBTRAIL_BASE_URL, else default)
-  --help, -h                 Show this help
-  --version, -v              Print the version
-
-verify options (pre-deploy check — point it at any environment):
-  --endpoint <url>           Endpoint to probe (else $CRUMBTRAIL_BASE_URL, else default)
-  --key <ingestKey>          Ingest key to probe with (else $CRUMBTRAIL_KEY, else cached login)
-  --project <id>             Project id for the auth GET fallback (no key)
-  --json                     Emit a machine-readable result (exit 0 = pass, non-0 = fail)`;
+  return [
+    ...banner(readVersion(), TAGLINE),
+    "",
+    head("Usage"),
+    cmd(
+      "crumbtrail [options]",
+      `Run the setup wizard (detect ${g.arrow} login ${g.arrow} wire ${g.arrow} verify)`,
+    ),
+    cmd("crumbtrail login", "Log in and cache a token, nothing else"),
+    cmd("crumbtrail logout", "Delete the cached token"),
+    cmd(
+      "crumbtrail verify",
+      "Preflight an endpoint + key (DNS, TLS, auth) — PASS/FAIL",
+    ),
+    "",
+    color.dim(
+      "In a monorepo, run it from the repo root: it scans every workspace and service,",
+    ),
+    color.dim("shows you what it found, and wires the ones you pick."),
+    "",
+    head("Options"),
+    flag("--yes, -y", "Skip confirmations (required with --project in CI)"),
+    flag("--project <id>", "Attach to an existing project (skip creation)"),
+    flag("--only <name>", "Monorepo: wire only this service (repeatable)"),
+    flag("--all", "Monorepo: wire every service it can, no prompt"),
+    flag(
+      "--workspace <dir>",
+      "Target one package dir (relative to cwd) instead of",
+    ),
+    `  ${" ".repeat(26)} the repo root — wires just that package`,
+    flag("--no-browser", "Use the device-code login flow"),
+    flag("--skip-verify", "Don't wait for the first event"),
+    flag("--no-write-key", "Don't mint or write an ingest key; print the"),
+    `  ${" ".repeat(26)} variable to set instead`,
+    flag(
+      "--endpoint <url>",
+      "Cloud endpoint (else $CRUMBTRAIL_BASE_URL, else default)",
+    ),
+    flag("--help, -h", "Show this help"),
+    flag("--version, -v", "Print the version"),
+    "",
+    head("verify options"),
+    color.dim("  Pre-deploy check — point it at any environment."),
+    flag(
+      "--endpoint <url>",
+      "Endpoint to probe (else $CRUMBTRAIL_BASE_URL, else default)",
+    ),
+    flag(
+      "--key <ingestKey>",
+      "Ingest key to probe with (else $CRUMBTRAIL_KEY, else cached login)",
+    ),
+    flag("--project <id>", "Project id for the auth GET fallback (no key)"),
+    flag(
+      "--json",
+      "Emit a machine-readable result (exit 0 = pass, non-0 = fail)",
+    ),
+    "",
+    head("Appearance"),
+    color.dim(
+      `  NO_COLOR / FORCE_COLOR set the colour depth; CRUMBTRAIL_ASCII=1 forces plain ASCII.`,
+    ),
+  ].join("\n");
+}
 
 // ── SDK install ──────────────────────────────────────────────────────────────
 
@@ -372,7 +436,7 @@ export async function installSdk(
   // deploy's tarball fallback serves npm tarballs only.
   if (meta.packageEcosystem === "pub") {
     input.ui.out(
-      `Installing SDK: ${color.cyan(`flutter pub add ${packages.join(" ")}`)}`,
+      `  ${color.dim("Installing SDK:")} ${color.brand(`flutter pub add ${packages.join(" ")}`)}`,
     );
     const pubCode = run("flutter", ["pub", "add", ...packages], input.cwd);
     if (pubCode === 0) return { installed: true, packages };
@@ -395,7 +459,9 @@ export async function installSdk(
   // correct, but the echoed line is something people copy into a shell, where
   // an unquoted `>` would redirect stdout into a file. Quote it for display.
   const shown = specs.map((spec) => `'${spec}'`).join(" ");
-  input.ui.out(`Installing SDK: ${color.cyan(`${cmd} ${add} ${shown}`)}`);
+  input.ui.out(
+    `  ${color.dim("Installing SDK:")} ${color.brand(`${cmd} ${add} ${shown}`)}`,
+  );
   const code = run(cmd, [add, ...specs], input.cwd);
   if (code === 0) {
     return { installed: true, packages };
@@ -567,8 +633,8 @@ export async function runWizard(
   // mistaken for "your first event" (verify.ts wizardStart filter).
   const wizardStart = Date.now();
 
-  ui.out(color.bold("\nCrumbtrail setup"));
-  ui.out(color.dim(`Endpoint: ${base}\n`));
+  for (const line of banner(readVersion(), TAGLINE)) ui.out(line);
+  ui.out(color.dim(`  Endpoint  ${base}`));
 
   // 1. Detect. A monorepo root forks to the batch installer, which scans every
   // service and wires the ones the user picks. Everything below this fork is the
@@ -578,6 +644,7 @@ export async function runWizard(
   // that dir means a package inside a monorepo classifies as itself (not as the
   // monorepo root), so the wizard wires exactly it instead of forking to the
   // batch scan.
+  ui.out(step(1, TOTAL_STEPS, "Detect your framework"));
   let cwd = deps.cwd;
   if (parsed.workspace) {
     const resolved = resolveWorkspaceDir(deps.cwd, parsed.workspace);
@@ -615,10 +682,11 @@ export async function runWizard(
     }
     return 1;
   }
-  ui.out(`${color.green("✓")} Detected ${color.bold(result.recipe)} project.`);
-  for (const n of result.notes) ui.out(color.dim(`  · ${n}`));
+  ui.out(ok(`Detected a ${color.bold(color.brand(result.recipe))} project.`));
+  for (const n of result.notes) ui.out(note(n));
 
   // 2. Login (reuse a cached token when possible).
+  ui.out(step(2, TOTAL_STEPS, "Sign in"));
   let token: string;
   try {
     token = await deps.ensureToken({
@@ -635,6 +703,7 @@ export async function runWizard(
   }
 
   // 3. Provision project + service + key.
+  ui.out(step(3, TOTAL_STEPS, "Create the project and service"));
   const pkgName = readPkgName(cwd);
   const defaultProjectName = inferProjectName(pkgName, path.basename(cwd));
   const defaultServiceName = inferServiceName(result.recipe);
@@ -657,7 +726,7 @@ export async function runWizard(
     if (err instanceof UpgradeRequiredError) {
       ui.err("");
       ui.err(color.yellow(err.message));
-      if (err.upgradeUrl) ui.err(`Upgrade: ${color.cyan(err.upgradeUrl)}`);
+      if (err.upgradeUrl) ui.err(`  Upgrade: ${color.brand(err.upgradeUrl)}`);
       return 1;
     }
     ui.err(color.red(`Provisioning failed: ${errMessage(err)}`));
@@ -685,6 +754,7 @@ export async function runWizard(
   );
 
   // 5. Install the SDK (repo-mutating: adds deps to package.json).
+  ui.out(step(4, TOTAL_STEPS, "Install the SDK"));
   const install = await deps.installSdk({
     cwd,
     packageManager: result.packageManager,
@@ -694,14 +764,15 @@ export async function runWizard(
     fetchImpl: deps.fetchImpl,
   });
   if (install.installed) {
-    ui.out(`${color.green("✓")} Installed ${install.packages.join(", ")}.`);
+    ui.out(ok(`Installed ${color.bold(install.packages.join(", "))}.`));
   } else if (install.note) {
-    ui.out(color.yellow(`! ${install.note}`));
+    ui.out(alert(color.yellow(install.note)));
   }
 
   // 6. Inject — the LAST repo-mutating step, applying the pre-computed plan via
   // CP3's executor. The install result rides along so a dirty-file decline can
   // tell the user their package.json already changed (partial state).
+  ui.out(step(5, TOTAL_STEPS, "Wire it into your code"));
   const inject = await applyInjection(plan, parsed, deps, {
     installed: install.installed,
     packages: install.packages,
@@ -757,6 +828,7 @@ export async function runWizard(
       "Nothing is wired yet, so there is no first event to wait for. Install the SDK, then run `npx crumbtrail` again.",
     );
   } else {
+    ui.out(step(6, TOTAL_STEPS, "Catch your first event"));
     ui.out(
       color.dim(
         keyReady
@@ -777,8 +849,8 @@ export async function runWizard(
       sessionUrl = poll.sessionId
         ? `${appBase}/sessions/${encodeURIComponent(poll.sessionId)}`
         : `${appBase}/issues`;
-      ui.out(`${color.green("✓")} First real event received!`);
-      ui.out(`  Watch it live: ${color.cyan(sessionUrl)}`);
+      ui.out(ok(color.bold("First real event received.")));
+      ui.out(`  Watch it live: ${color.brand(sessionUrl)}`);
       if (canUseBrowser(parsed.noBrowser, deps.env)) {
         const open = deps.openBrowserFn ?? openBrowser;
         if (await open(sessionUrl)) {
@@ -827,20 +899,25 @@ export async function runWizard(
  */
 function printEvidenceSourcesPointer(ui: Ui, base: string): void {
   ui.out("");
-  ui.out(color.bold("Next: make each ticket's evidence more complete."));
+  ui.out(`  ${rule(caps().width - 4)}`);
+  ui.out(
+    `  ${color.bold("Next")}  ${color.dim("make each ticket's evidence more complete")}`,
+  );
   ui.out(
     color.dim(
-      "Crumbtrail's SDK stands alone, but it can also fold in evidence from tools",
+      "  Crumbtrail's SDK stands alone, but it can also fold in evidence from tools",
     ),
   );
   ui.out(
     color.dim(
-      "you already run — Sentry, CloudWatch, Splunk, Datadog, PostHog, Cloudflare —",
+      "  you already run — Sentry, CloudWatch, Splunk, Datadog, PostHog, Cloudflare —",
     ),
   );
-  ui.out(color.dim("queried at incident time and added to each bug's bundle."));
   ui.out(
-    `  Evidence sources: ${color.cyan(`${dashboardBase(base)}/settings`)}`,
+    color.dim("  queried at incident time and added to each bug's bundle."),
+  );
+  ui.out(
+    `  ${color.dim("Evidence sources:")}  ${color.brand(`${dashboardBase(base)}/settings`)}`,
   );
 }
 
@@ -967,13 +1044,15 @@ export async function runBatchWizard(
   const candidates = deps.discoverServices(root, ctx.root);
   const selectableCount = candidates.filter((c) => c.selectable).length;
   ui.out(
-    `${color.green("✓")} Monorepo — found ${color.bold(String(candidates.length))} package(s), ${color.bold(String(selectableCount))} wireable.`,
+    ok(
+      `Monorepo — found ${color.bold(String(candidates.length))} package(s), ${color.bold(color.brand(String(selectableCount)))} wireable.`,
+    ),
   );
   if (selectableCount === 0) {
     ui.err("");
     ui.err(color.red("Nothing here can be wired."));
     for (const c of candidates) {
-      ui.err(color.dim(`  · ${c.relDir} — ${candidateHint(c)}`));
+      ui.err(note(`${c.relDir} — ${candidateHint(c)}`));
     }
     ui.err(
       "Supported: Next.js, SvelteKit, Nuxt, Remix, Astro, Angular, Vite SPA, NestJS, Express, Hono, Fastify, a Node server, or a non-JS backend that speaks OpenTelemetry (Django, Flask, FastAPI, Go, Rails, .NET).",
@@ -1000,7 +1079,7 @@ export async function runBatchWizard(
       ),
     );
     for (const c of candidates) {
-      if (c.selectable) ui.err(color.dim(`  · ${c.relDir}`));
+      if (c.selectable) ui.err(note(c.relDir));
     }
     return 1;
   } else {
@@ -1012,7 +1091,7 @@ export async function runBatchWizard(
   }
   const selected = indices.map((i) => candidates[i]);
   if (selected.length === 0) {
-    ui.out(color.yellow("Nothing selected — no changes made."));
+    ui.out(alert(color.yellow("Nothing selected — no changes made.")));
     return 0;
   }
 
@@ -1053,7 +1132,7 @@ export async function runBatchWizard(
     if (err instanceof UpgradeRequiredError) {
       ui.err("");
       ui.err(color.yellow(err.message));
-      if (err.upgradeUrl) ui.err(`Upgrade: ${color.cyan(err.upgradeUrl)}`);
+      if (err.upgradeUrl) ui.err(`  Upgrade: ${color.brand(err.upgradeUrl)}`);
       return 1;
     }
     ui.err(color.red(`Provisioning failed: ${errMessage(err)}`));
@@ -1077,13 +1156,12 @@ export async function runBatchWizard(
     const name = serviceNames[i];
     ui.out("");
     ui.out(
-      color.bold(`[${i + 1}/${selected.length}] ${c.relDir}`) +
-        color.dim(` — ${stackLabel(c)}`),
+      `  ${color.brand(glyphs().pointer)} ${color.brand(`${i + 1}/${selected.length}`)}  ${color.bold(c.relDir)}${color.dim(` — ${stackLabel(c)}`)}`,
     );
 
     if (c.flags.includes("already-wired")) {
       // Don't mint a key for a service whose plan would self-cancel anyway.
-      ui.out(`${color.green("✓")} Already wired — leaving it untouched.`);
+      ui.out(ok("Already wired — leaving it untouched."));
       outcomes.push({
         name,
         relDir: c.relDir,
@@ -1136,7 +1214,7 @@ export async function runBatchWizard(
         fetchImpl: deps.fetchImpl,
       });
       if (install.installed) {
-        ui.out(`${color.green("✓")} Installed ${install.packages.join(", ")}.`);
+        ui.out(ok(`Installed ${color.bold(install.packages.join(", "))}.`));
       } else if (install.note) {
         ui.out(color.yellow(`! ${install.note}`));
       }
@@ -1244,7 +1322,7 @@ export async function runBatchWizard(
           const o = byServiceId.get(serviceId);
           if (!o) return;
           o.sessionUrl = `${appBase}/sessions/${encodeURIComponent(sessionId)}`;
-          ui.out(`${color.green("✓")} ${o.name}: first event received.`);
+          ui.out(ok(`${color.bold(o.name)}: first event received.`));
         },
         fetchImpl: deps.fetchImpl,
       },
@@ -1308,7 +1386,9 @@ async function applyBatchInjection(
     });
     const res = deps.executePlan(otlpGuidePlan(candidate.dir, body));
     deps.ui.out(
-      `${color.green("✓")} Speaks OpenTelemetry — no SDK needed. Wrote ${color.cyan(res.written.join(", "))}.`,
+      ok(
+        `Speaks OpenTelemetry — no SDK needed. Wrote ${color.brand(res.written.join(", "))}.`,
+      ),
     );
     return {
       status: "guidance",
@@ -1336,11 +1416,12 @@ function printBatchSummary(
   outcomes: ServiceOutcome[],
   batchNotes: string[] = [],
 ): void {
+  const g = glyphs();
   const mark: Record<ServiceStatus, string> = {
-    wired: color.green("✓"),
-    guidance: color.green("✓"),
-    "skipped-already-wired": color.dim("·"),
-    failed: color.red("✗"),
+    wired: chip(` ${g.tick} `, "success"),
+    guidance: chip(` ${g.tick} `, "success"),
+    "skipped-already-wired": chip(` ${g.bullet} `, "muted"),
+    failed: chip(` ${g.cross} `, "danger"),
   };
   const width = Math.max(...outcomes.map((o) => o.name.length), 4);
   // Absolute temp/monorepo paths make the summary unreadable; the user already
@@ -1348,7 +1429,7 @@ function printBatchSummary(
   const rel = (p: string) => path.relative(root, p) || p;
 
   ui.out("");
-  ui.out(color.bold(`Setup complete — project "${projectName}"`));
+  ui.out(outcomeBar(`${g.tick}  Setup complete — project ${projectName}`));
   ui.out("");
   for (const o of outcomes) {
     const detail =
@@ -1357,7 +1438,7 @@ function printBatchSummary(
         : o.status === "skipped-already-wired"
           ? color.dim("already wired — skipped")
           : o.sessionUrl
-            ? color.cyan(o.sessionUrl)
+            ? color.brand(o.sessionUrl)
             : o.filesTouched.length > 0
               ? color.dim(o.filesTouched.map(rel).join(", "))
               : "";
@@ -1377,8 +1458,8 @@ function printBatchSummary(
       : []),
   ];
   ui.out("");
-  ui.out(`  ${parts.join(" · ")}`);
-  ui.out(`  Dashboard: ${color.cyan(`${dashboardBase(base)}/issues`)}`);
+  ui.out(`  ${color.dim(parts.join(caps().unicode ? " · " : " | "))}`);
+  ui.out(field("Dashboard", color.brand(`${dashboardBase(base)}/issues`)));
 
   const notes = [
     ...outcomes.flatMap((o) => o.notes.map((n) => `${o.name}: ${n}`)),
@@ -1389,8 +1470,9 @@ function printBatchSummary(
   }
   if (notes.length > 0) {
     ui.out("");
-    for (const n of notes) ui.out(color.dim(`  note: ${n}`));
+    for (const n of notes) ui.out(note(n));
   }
+  ui.out("");
 }
 
 interface InjectionResult {
@@ -1502,7 +1584,9 @@ async function writeIngestKeys(args: {
   for (const [label, plan] of plans) {
     if (plan.kind === "already-set") {
       ui.out(
-        `${color.green("✓")} ${named(label)}${color.bold(plan.varName)} is already set in ${color.cyan(rel(args.repoRoot, plan.file))} — left as it is.`,
+        ok(
+          `${named(label)}${color.bold(plan.varName)} is already set in ${color.brand(rel(args.repoRoot, plan.file))} — left as it is.`,
+        ),
       );
       results.set(label, {
         status: "already-set",
@@ -1514,7 +1598,9 @@ async function writeIngestKeys(args: {
       // would publish the key. Nothing is minted and nothing is written.
       const where = rel(args.repoRoot, plan.file);
       ui.out(
-        `${color.yellow("!")} ${named(label)}${color.cyan(where)} is tracked by git, so Crumbtrail will not write a key into it.`,
+        alert(
+          `${named(label)}${color.brand(where)} is tracked by git, so Crumbtrail will not write a key into it.`,
+        ),
       );
       results.set(label, {
         status: "refused-tracked",
@@ -1558,7 +1644,9 @@ async function writeIngestKeys(args: {
     try {
       applyEnvEdits(buildEnvKeyEdits(plan, key), args.deps.envFileIO);
       ui.out(
-        `${color.green("✓")} ${named(label)}wrote ${color.bold(plan.varName)} to ${color.cyan(where)}.`,
+        ok(
+          `${named(label)}wrote ${color.bold(plan.varName)} to ${color.brand(where)}.`,
+        ),
       );
       if (plan.ignore) {
         // Saying this is not optional. A file that was about to be committed
@@ -1627,7 +1715,7 @@ async function applyInjection(
   for (const w of plan.warnings) ui.out(color.dim(`  · ${w}`));
 
   if (plan.kind === "skip-already-wired") {
-    ui.out(`${color.green("✓")} Already wired — leaving your code untouched.`);
+    ui.out(ok("Already wired — leaving your code untouched."));
     return { filesTouched, notes };
   }
 
@@ -1665,7 +1753,9 @@ async function applyInjection(
     // Intentional path (not an apology): a non-JS backend that already speaks
     // OpenTelemetry. Print the OTLP setup guidance + agent prompt; touch nothing.
     ui.out(
-      `${color.green("✓")} Detected a non-JS backend that already speaks OpenTelemetry — no SDK needed.`,
+      ok(
+        "Detected a non-JS backend that already speaks OpenTelemetry — no SDK needed.",
+      ),
     );
     ui.out(color.dim("Point your existing OTLP exporter at Crumbtrail:"));
     if (plan.snippet) ui.out(plan.snippet);
@@ -1680,13 +1770,13 @@ async function applyInjection(
   }
 
   if (plan.kind === "needs-confirm-dirty") {
-    const ok = parsed.yes
+    const approved = parsed.yes
       ? true
       : await deps.prompter.confirm(
           `${plan.targetPath} has uncommitted changes — prepend into it anyway?`,
           false,
         );
-    if (!ok) {
+    if (!approved) {
       ui.out(
         color.yellow("Left your file untouched. Add this to the top yourself:"),
       );
@@ -1708,19 +1798,21 @@ async function applyInjection(
     }
     const res = deps.executePlan(plan, undefined, { confirmDirty: true });
     filesTouched.push(...res.written);
-    ui.out(`${color.green("✓")} ${describeWrites(res)}`);
+    ui.out(ok(describeWrites(res)));
     return { filesTouched, notes };
   }
 
   // create / prepend
   if (plan.targetPath) {
     ui.out(
-      `${plan.kind === "create" ? "Creating" : "Editing"} ${color.cyan(plan.targetPath)}…`,
+      color.dim(
+        `  ${plan.kind === "create" ? "Creating" : "Editing"} ${plan.targetPath}…`,
+      ),
     );
   }
   const res = deps.executePlan(plan);
   filesTouched.push(...res.written);
-  ui.out(`${color.green("✓")} ${describeWrites(res)}`);
+  ui.out(ok(describeWrites(res)));
   return { filesTouched, notes };
 }
 
@@ -1785,10 +1877,12 @@ function printSummary(
 ): void {
   // User-facing links point at the app host (the SPA), not the API host.
   const appBase = dashboardBase(base);
+  const g = glyphs();
   ui.out("");
-  ui.out(color.bold("Setup complete"));
-  ui.out(`  Project:   ${p.projectName}`);
-  ui.out(`  Service:   ${p.serviceName}`);
+  ui.out(outcomeBar(`${g.tick}  Setup complete`));
+  ui.out("");
+  ui.out(field("Project", color.bold(p.projectName)));
+  ui.out(field("Service", color.bold(p.serviceName)));
   if (keyEnvVar) {
     // The one line that used to say the setup was not finished. It now reports
     // what happened to the key rather than handing the job back by default.
@@ -1796,34 +1890,47 @@ function printSummary(
       keyWrite?.file && repoRoot ? rel(repoRoot, keyWrite.file) : ".env";
     if (keyWrite?.status === "written") {
       ui.out(
-        `  Ingest key: wrote ${color.bold(keyEnvVar)} to ${color.cyan(where)}`,
+        field(
+          "Ingest key",
+          `wrote ${color.bold(keyEnvVar)} to ${color.brand(where)}`,
+        ),
       );
     } else if (keyWrite?.status === "already-set") {
       ui.out(
-        `  Ingest key: ${color.bold(keyEnvVar)} was already set in ${color.cyan(where)}`,
+        field(
+          "Ingest key",
+          `${color.bold(keyEnvVar)} was already set in ${color.brand(where)}`,
+        ),
       );
     } else if (keyIsCompileTime) {
       // Dart bakes the value in at build time, so there is no file to point at.
       ui.out(
-        `  Ingest key: build with ${color.bold(`--dart-define=${keyEnvVar}=<your-ingest-key>`)} ${color.dim(`(mint at ${appBase}/settings)`)}`,
+        field(
+          "Ingest key",
+          `build with ${color.bold(`--dart-define=${keyEnvVar}=<your-ingest-key>`)} ${color.dim(`(mint at ${appBase}/settings)`)}`,
+        ),
       );
     } else {
       ui.out(
-        `  Ingest key: set ${color.bold(keyEnvVar)} in .env ${color.dim(`(mint at ${appBase}/settings)`)}`,
+        field(
+          "Ingest key",
+          `set ${color.bold(keyEnvVar)} in .env ${color.dim(`(mint at ${appBase}/settings)`)}`,
+        ),
       );
     }
   }
   if (filesTouched.length > 0) {
-    ui.out(`  Files:     ${filesTouched.join("\n             ")}`);
+    ui.out(field("Files", filesTouched.join(`\n${" ".repeat(14)}`)));
   }
   if (sessionUrl) {
-    ui.out(`  Session:   ${color.cyan(sessionUrl)}`);
+    ui.out(field("Session", color.brand(sessionUrl)));
   }
-  ui.out(`  Dashboard: ${color.cyan(`${appBase}/issues`)}`);
+  ui.out(field("Dashboard", color.brand(`${appBase}/issues`)));
   if (notes.length > 0) {
     ui.out("");
-    for (const n of notes) ui.out(color.dim(`  note: ${n}`));
+    for (const n of notes) ui.out(note(n));
   }
+  ui.out("");
 }
 
 function errMessage(err: unknown): string {
@@ -1881,11 +1988,14 @@ export function resolveAuthProbe(
   return { kind: "none" };
 }
 
-const STAGE_GLYPH: Record<StageResult["status"], string> = {
-  pass: color.green("✓"),
-  fail: color.red("✗"),
-  skipped: color.yellow("○"),
-};
+// Built per call, not as a module constant: a constant would freeze the colour
+// depth at import time, before the terminal has been probed.
+function stageGlyph(status: StageResult["status"]): string {
+  const g = glyphs();
+  if (status === "pass") return chip(` ${g.tick} `, "success");
+  if (status === "fail") return chip(` ${g.cross} `, "danger");
+  return chip(` ${caps().unicode ? "○" : "-"} `, "muted");
+}
 
 const STAGE_LABEL: Record<StageResult["stage"], string> = {
   dns: "DNS ",
@@ -1895,19 +2005,29 @@ const STAGE_LABEL: Record<StageResult["stage"], string> = {
 
 function renderPreflight(result: PreflightResult, ui: Ui): void {
   ui.out("");
-  ui.out(`${color.bold("Crumbtrail preflight")} → ${result.endpoint}`);
+  ui.out(
+    `  ${chip(" PREFLIGHT ", "brandDeep")}  ${color.bold(result.endpoint)}`,
+  );
   ui.out("");
   for (const s of result.stages) {
     const ms = s.status === "skipped" ? "" : color.dim(`(${s.ms}ms)`);
     ui.out(
-      `  ${STAGE_GLYPH[s.status]} ${STAGE_LABEL[s.stage]}  ${s.reason} ${ms}`.trimEnd(),
+      `  ${stageGlyph(s.status)} ${STAGE_LABEL[s.stage]}  ${s.reason} ${ms}`.trimEnd(),
     );
   }
   ui.out("");
   ui.out(
     result.ok
-      ? `${color.green("PASS")} — endpoint and key are reachable and authenticated`
-      : `${color.red("FAIL")} — fix the failing stage above before deploying`,
+      ? headline(
+          "PASS",
+          "endpoint and key are reachable and authenticated",
+          "success",
+        )
+      : headline(
+          "FAIL",
+          "fix the failing stage above before deploying",
+          "danger",
+        ),
   );
 }
 
@@ -1943,12 +2063,12 @@ export async function runCli(
     return 0;
   }
   if (parsed.command === "help") {
-    deps.ui.out(USAGE);
+    deps.ui.out(usage());
     return 0;
   }
   if (parsed.unknown) {
     deps.ui.err(`Unknown argument: ${parsed.unknown}\n`);
-    deps.ui.err(USAGE);
+    deps.ui.err(usage());
     return 1;
   }
   if (parsed.command === "login") return runLogin(parsed, deps);
@@ -1965,7 +2085,7 @@ export async function runCli(
       ),
     );
     deps.ui.err("");
-    deps.ui.err(USAGE);
+    deps.ui.err(usage());
     return 1;
   }
 

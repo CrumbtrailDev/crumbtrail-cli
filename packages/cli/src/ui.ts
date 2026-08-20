@@ -1,23 +1,15 @@
-// Tiny terminal helpers — color + prompts over plain stdin/readline, no CLI
-// framework dependency (keeps npx cold-start fast, per §1). All output goes
-// through `Ui`, an injectable sink so the wizard is testable without a real TTY.
+// Tiny terminal helpers — prompts over plain stdin/readline, no CLI framework
+// dependency (keeps npx cold-start fast, per §1). All output goes through `Ui`,
+// an injectable sink so the wizard is testable without a real TTY.
+//
+// Colour, glyphs and terminal capability detection live in ./theme — this file
+// re-exports `color` so the long-standing `import { color } from "./ui"` call
+// sites keep working.
 
 import readline from "node:readline";
+import { caps, color, foldForTerminal, glyphs } from "./theme";
 
-const useColor = process.stdout.isTTY === true && process.env.NO_COLOR == null;
-
-function paint(code: string, s: string): string {
-  return useColor ? `[${code}m${s}[0m` : s;
-}
-
-export const color = {
-  bold: (s: string) => paint("1", s),
-  dim: (s: string) => paint("2", s),
-  green: (s: string) => paint("32", s),
-  cyan: (s: string) => paint("36", s),
-  yellow: (s: string) => paint("33", s),
-  red: (s: string) => paint("31", s),
-};
+export { color };
 
 /** Output sink — swappable in tests to capture lines instead of writing stdout. */
 export interface Ui {
@@ -32,10 +24,16 @@ export interface Ui {
 }
 
 export const consoleUi: Ui = {
-  out: (line = "") => process.stdout.write(line + "\n"),
-  err: (line = "") => process.stderr.write(line + "\n"),
+  // Every line leaving the process passes through the ASCII fold, so a console
+  // that cannot render UTF-8 gets readable punctuation instead of mojibake.
+  out: (line = "") => process.stdout.write(foldForTerminal(line) + "\n"),
+  err: (line = "") => process.stderr.write(foldForTerminal(line) + "\n"),
   status: (line = "") => {
-    if (process.stdout.isTTY !== true) return;
+    // Needs BOTH a TTY and ANSI support: the in-place rewrite below is an escape
+    // sequence, and a console that cannot process it would print the sequence
+    // itself. `interactive` already carries both conditions.
+    if (!caps().interactive) return;
+    line = foldForTerminal(line);
     // \r + erase-line, then the fresh status text (nothing for a clear).
     process.stdout.write(`\r[2K${line}`);
   },
@@ -75,8 +73,7 @@ export interface Prompter {
 }
 
 export type SelectionParse =
-  | { ok: true; indices: number[] }
-  | { ok: false; error: string };
+  { ok: true; indices: number[] } | { ok: false; error: string };
 
 /**
  * Parse a multi-select answer. Pure and separately exported so the grammar is
@@ -147,11 +144,13 @@ export function parseSelection(
 /** Render one multiSelect row: "   1. [x] apps/web   next". */
 function renderItem(item: MultiSelectItem, index: number): string {
   const hint = item.hint ? `  ${color.dim(item.hint)}` : "";
+  const g = glyphs();
   if (!item.selectable) {
-    return `   ${color.dim("-")}  ${color.dim("·")}  ${color.dim(item.label)}${hint}`;
+    return `   ${color.dim("-")}  ${color.dim(g.bullet)}  ${color.dim(item.label)}${hint}`;
   }
-  const n = color.cyan(String(index + 1).padStart(2));
-  return `  ${n}. ${item.checked ? "[x]" : "[ ]"} ${item.label}${hint}`;
+  const n = color.brand(String(index + 1).padStart(2));
+  const box = item.checked ? color.green("[x]") : color.dim("[ ]");
+  return `  ${n}. ${box} ${item.label}${hint}`;
 }
 
 /**
@@ -264,20 +263,25 @@ export function renderInteractiveItem(
   state: MultiSelectState,
 ): string {
   const hint = item.hint ? `  ${color.dim(item.hint)}` : "";
+  const g = glyphs();
   if (!item.selectable) {
-    return `    ${color.dim("·")}  ${color.dim(item.label)}${hint}`;
+    return `    ${color.dim(g.bullet)}  ${color.dim(item.label)}${hint}`;
   }
-  const pointer = index === state.cursor ? color.cyan("❯") : " ";
-  const box = state.checked[index]
-    ? color.green("[x]")
-    : color.dim("[ ]");
-  const label =
-    index === state.cursor ? color.bold(item.label) : item.label;
+  const active = index === state.cursor;
+  const pointer = active ? color.brand(g.pointer) : " ";
+  const box = state.checked[index] ? color.green("[x]") : color.dim("[ ]");
+  const label = active ? color.bold(item.label) : item.label;
   return `  ${pointer} ${box} ${label}${hint}`;
 }
 
-export const INTERACTIVE_KEYS_HINT =
-  "↑/↓ move · space toggle · a all/none · enter confirm";
+/** The key legend under the interactive list, in whatever glyphs render here. */
+export function interactiveKeysHint(): string {
+  const sep = caps().unicode ? " · " : " | ";
+  const move = caps().unicode ? "↑/↓" : "up/down";
+  return [`${move} move`, "space toggle", "a all/none", "enter confirm"].join(
+    sep,
+  );
+}
 
 /**
  * Clip a rendered line to the terminal width without counting ANSI escapes,
@@ -305,11 +309,7 @@ export function fitToWidth(line: string, width: number): string {
 
 /** True when we can run the raw-mode checkbox list on this terminal. */
 function canRunInteractive(): boolean {
-  return (
-    process.stdin.isTTY === true &&
-    process.stdout.isTTY === true &&
-    process.env.TERM !== "dumb"
-  );
+  return caps().interactive && typeof process.stdin.setRawMode === "function";
 }
 
 /**
@@ -334,7 +334,7 @@ function interactiveMultiSelect(
 
     const paint = (lines: string[]) => {
       const width = process.stdout.columns ?? 80;
-      const clipped = lines.map((l) => fitToWidth(l, width));
+      const clipped = lines.map((l) => fitToWidth(foldForTerminal(l), width));
       const up = painted > 0 ? `[${painted}A` : "";
       process.stdout.write(`${up}[0J${clipped.join("\n")}\n`);
       painted = clipped.length;
@@ -343,7 +343,7 @@ function interactiveMultiSelect(
     const frame = () => [
       q,
       ...items.map((it, i) => renderInteractiveItem(it, i, state)),
-      color.dim(INTERACTIVE_KEYS_HINT),
+      color.dim(interactiveKeysHint()),
     ];
 
     const restore = () => {
@@ -353,7 +353,10 @@ function interactiveMultiSelect(
       process.stdout.write("[?25h");
     };
 
-    const onKeypress = (_str: string | undefined, key: Keypress | undefined) => {
+    const onKeypress = (
+      _str: string | undefined,
+      key: Keypress | undefined,
+    ) => {
       const result = reduceMultiSelectKey(state, key ?? {}, items);
       if (result.kind === "abort") {
         restore();
@@ -367,7 +370,7 @@ function interactiveMultiSelect(
         paint([
           q,
           ...items.map((it, i) => renderInteractiveItem(it, i, final)),
-          `${color.green("✓")} ${count} of ${selectable} selected`,
+          `${color.green(glyphs().tick)} ${count} of ${selectable} selected`,
         ]);
         restore();
         resolve(result.indices);
@@ -392,7 +395,7 @@ function rl(): readline.Interface {
 function question(prompt: string): Promise<string> {
   const r = rl();
   return new Promise((resolve) => {
-    r.question(prompt, (answer) => {
+    r.question(foldForTerminal(prompt), (answer) => {
       r.close();
       resolve(answer);
     });
@@ -420,12 +423,14 @@ export const stdinPrompter: Prompter = {
       while (true) {
         const lines = [
           q,
-          ...labels.map((l, i) => `  ${color.cyan(String(i + 1))}. ${l}`),
+          ...labels.map((l, i) => `  ${color.brand(String(i + 1))}. ${l}`),
         ];
-        process.stdout.write(lines.join("\n") + "\n");
+        process.stdout.write(foldForTerminal(lines.join("\n")) + "\n");
         const answer = await new Promise<string>((resolve) => {
           r.question(
-            `Choose ${color.dim(`(1-${labels.length}, default ${def + 1})`)}: `,
+            foldForTerminal(
+              `Choose ${color.dim(`(1-${labels.length}, default ${def + 1})`)}: `,
+            ),
             resolve,
           );
         });
@@ -434,7 +439,9 @@ export const stdinPrompter: Prompter = {
         const n = Number(trimmed);
         if (Number.isInteger(n) && n >= 1 && n <= labels.length) return n - 1;
         process.stdout.write(
-          color.yellow(`Enter a number between 1 and ${labels.length}.\n`),
+          foldForTerminal(
+            color.yellow(`Enter a number between 1 and ${labels.length}.\n`),
+          ),
         );
       }
     } finally {
@@ -447,16 +454,20 @@ export const stdinPrompter: Prompter = {
     try {
       while (true) {
         const lines = [q, ...items.map(renderItem)];
-        process.stdout.write(lines.join("\n") + "\n");
+        process.stdout.write(foldForTerminal(lines.join("\n")) + "\n");
         const answer = await new Promise<string>((resolve) => {
           r.question(
-            `Enter numbers ${color.dim('(e.g. 1,3 or 1-2), "all", "none", or Enter for the checked defaults')}: `,
+            foldForTerminal(
+              `Enter numbers ${color.dim('(e.g. 1,3 or 1-2), "all", "none", or Enter for the checked defaults')}: `,
+            ),
             resolve,
           );
         });
         const parsed = parseSelection(answer, items);
         if (parsed.ok) return parsed.indices;
-        process.stdout.write(color.yellow(`${parsed.error}\n`));
+        process.stdout.write(
+          foldForTerminal(color.yellow(`${parsed.error}\n`)),
+        );
       }
     } finally {
       r.close();
