@@ -115,6 +115,27 @@ describe("install-instructions snippets", () => {
     expect(p).not.toContain("crumbtrail-node");
   });
 
+  it("agent prompt names the app, so its sessions can be found again", () => {
+    // Every path that writes the init block itself already sets `service`.
+    // This one did not, so an install handed to a coding agent produced
+    // sessions filed against the project and no app — unattributed in the
+    // product, and invisible to the wizard's confirm step, which matches
+    // arriving sessions by service.
+    const p = buildAgentPrompt("react", keys, { serviceName: "checkout-web" });
+    expect(p).toContain('service: "checkout-web",');
+    expect(p).toContain("Keep the service field exactly as written");
+    // Still hands-off about the key.
+    expect(p).not.toContain("bl_live_xyz");
+  });
+
+  it("agent prompt omits the app rather than inventing a placeholder", () => {
+    // Matching the injected snippets: an app wired without a name records no
+    // app label, and a placeholder left in source would be worse than absent.
+    const p = buildAgentPrompt("react", keys, { serviceName: "  " });
+    expect(p).not.toContain("service:");
+    expect(p).not.toContain("Keep the service field");
+  });
+
   it("agent prompt uses Next's public env var for the nextjs stack", () => {
     const p = buildAgentPrompt("nextjs", keys);
     expect(p).not.toContain("bl_live_xyz");

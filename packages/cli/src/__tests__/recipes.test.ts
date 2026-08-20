@@ -243,6 +243,25 @@ describe("buildPlan — Next.js", () => {
     expect(plan.warnings.join(" ")).toMatch(/use client|Server Component/i);
   });
 
+  it("hands the AI fallback the app name the injection would have written", () => {
+    // The injected snippets all carry `service`; the prompt that stands in for
+    // them dropped it, so an install done by pasting this text into a coding
+    // agent produced sessions with no app on them.
+    const io = fakeInjectIO({ [p("package.json")]: "{}" });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "next",
+        endpoint: ENDPOINT,
+        nextVersion: "13.0.0",
+        serviceName: "checkout-web",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.agentPrompt).toContain('service: "checkout-web",');
+  });
+
   it("falls back to AI when older Next has no layout/_app", () => {
     const io = fakeInjectIO({ [p("package.json")]: "{}" });
     const plan = buildPlan(

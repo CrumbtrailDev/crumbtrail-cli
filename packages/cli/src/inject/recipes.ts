@@ -143,7 +143,7 @@ function fallbackPlan(
         endpoint: input.endpoint,
         apiKey: KEY_PLACEHOLDER,
       },
-      keyRefFor(input),
+      { keyEnv: keyRefFor(input), serviceName: input.serviceName },
     ),
     warnings,
   };
@@ -862,6 +862,9 @@ function planOtlp(input: BuildPlanInput): Plan {
     targetPath: null,
     content: null,
     snippet,
+    // No service name here: this is the OTLP branch, and the receiver reads an
+    // app only from the ingest key, which under a project key names none. An
+    // instruction to stamp the app would be a promise nothing keeps yet.
     agentPrompt: buildAgentPrompt(stack, {
       endpoint: input.endpoint,
       apiKey: KEY_PLACEHOLDER,
