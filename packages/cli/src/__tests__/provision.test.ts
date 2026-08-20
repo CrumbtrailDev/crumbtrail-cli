@@ -4,6 +4,7 @@ import {
   inferProjectName,
   inferServiceName,
   listProjects,
+  resolveProject,
   UpgradeRequiredError,
 } from "../provision";
 
@@ -91,5 +92,109 @@ describe("single-retry on transient failure", () => {
       listProjects("http://127.0.0.1:9/base", "bl_cli_x", fetchImpl),
     ).rejects.toThrow(/GET http:\/\/127\.0\.0\.1:9\/base\/api\/projects/);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("resolveProject with --project", () => {
+  const deps = () => {
+    const lines: string[] = [];
+    return {
+      base: "https://api.example.dev",
+      token: "t",
+      ui: {
+        out: (line?: string) => {
+          lines.push(line ?? "");
+        },
+        err: (line?: string) => {
+          lines.push(line ?? "");
+        },
+        status: () => {},
+      },
+      prompter: {
+        select: (): never => {
+          throw new Error("must not prompt in these cases");
+        },
+        ask: (): never => {
+          throw new Error("must not prompt in these cases");
+        },
+        confirm: (): never => {
+          throw new Error("must not prompt in these cases");
+        },
+        multiSelect: (): never => {
+          throw new Error("must not prompt in these cases");
+        },
+      },
+      assumeYes: true,
+      defaultProjectName: "inferred",
+      lines,
+    };
+  };
+
+  it("names the project rather than printing its id", async () => {
+    // The dashboard wizard passes --project when it is adding an app to a
+    // project the reader is already looking at. Echoing `prj_7f3a` back under
+    // a "Project:" label agrees with nothing they have seen.
+    const d = deps();
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, {
+        projects: [
+          { id: "prj_7f3a", name: "Checkout", createdAt: "" },
+          { id: "prj_other", name: "Other", createdAt: "" },
+        ],
+      }),
+    );
+
+    const project = await resolveProject({
+      ...d,
+      projectId: "prj_7f3a",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    } as Parameters<typeof resolveProject>[0]);
+
+    expect(project).toEqual({ id: "prj_7f3a", name: "Checkout" });
+    expect(d.lines.join("\n")).toContain("Checkout");
+  });
+
+  it("joins a project that already carries the inferred name under --yes", async () => {
+    // An unattended second run in the same app infers the same name again.
+    // Creating a second project under it split the app's sessions across two
+    // identical looking rows, and neither one held the whole story.
+    const d = deps();
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, {
+        projects: [{ id: "prj_existing", name: "Inferred", createdAt: "" }],
+      }),
+    );
+
+    const project = await resolveProject({
+      ...d,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    } as Parameters<typeof resolveProject>[0]);
+
+    // Matched ignoring case: the two names are indistinguishable to whoever
+    // would have to pick between them.
+    expect(project).toEqual({
+      id: "prj_existing",
+      name: "Inferred",
+      createdAt: "",
+    });
+    // And nothing was created.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to the id when the list cannot be read", async () => {
+    const d = deps();
+    const fetchImpl = vi.fn(async () => {
+      throw econnreset();
+    });
+
+    const project = await resolveProject({
+      ...d,
+      projectId: "prj_7f3a",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    } as Parameters<typeof resolveProject>[0]);
+
+    // Still true, just less useful. Naming the project is not worth failing a
+    // run that is otherwise fine.
+    expect(project).toEqual({ id: "prj_7f3a", name: "prj_7f3a" });
   });
 });

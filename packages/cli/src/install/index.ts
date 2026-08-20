@@ -286,10 +286,36 @@ export function buildOtlpSnippets({
  * `PUBLIC_` prefix and Expo/React Native's `EXPO_PUBLIC_` (`process.env`, not
  * `import.meta.env`) — pass the exact ref so the prompt matches the injected code.
  */
+export interface AgentPromptOptions {
+  /**
+   * Override the env var / expression pair the prompt names. The CLI passes the
+   * recipe's exact ref so the prompt names the same variable the injected
+   * snippet reads (Astro's PUBLIC_, Expo's EXPO_PUBLIC_), which the coarse
+   * Stack alone cannot distinguish.
+   */
+  keyEnv?: KeyEnvRef;
+  /**
+   * Which app in the project this install is, as it was provisioned.
+   *
+   * One ingest key covers a whole project, so the key cannot say which app a
+   * session came from; the init call does. Every path that writes the init
+   * block itself already passes this (see `serviceLines` in inject/snippets.ts,
+   * and the dashboard's own copyable snippet). The agent prompt was the one
+   * that did not, so an install done by handing this text to a coding agent
+   * produced sessions filed against the project and no app, which is a state
+   * the product renders as unattributed and the wizard's confirm step, which
+   * matches arriving sessions by service, can never see.
+   *
+   * Absent means absent: with no name the field is omitted rather than filled
+   * with a placeholder, matching the injected snippets.
+   */
+  serviceName?: string | null;
+}
+
 export function buildAgentPrompt(
   stack: Stack,
   keys: EndpointKey,
-  keyEnv?: KeyEnvRef,
+  opts: AgentPromptOptions = {},
 ): string {
   const { kind, backendJs } = getInstallVariant(stack);
   const { endpoint, apiKey } = keys;
@@ -315,7 +341,8 @@ export function buildAgentPrompt(
     ].join("\n");
   }
 
-  const { envVar, expr } = keyEnv ?? keyEnvRef(stack);
+  const { envVar, expr } = opts.keyEnv ?? keyEnvRef(stack);
+  const serviceName = opts.serviceName?.trim() || null;
   const jsLines = [
     "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
     "do not refactor or touch anything else, then verify the build still passes.",
@@ -334,9 +361,22 @@ export function buildAgentPrompt(
     "  3. Initialize once at the app entry point with PRESET_PASSIVE:",
     "       Crumbtrail.init({",
     "         ...PRESET_PASSIVE,",
+    // Named first, on purpose: it is the field an agent is most likely to drop
+    // as decoration, and it is the one that decides whether the session can be
+    // found again.
+    ...(serviceName
+      ? [`         service: ${JSON.stringify(serviceName)},`]
+      : []),
     `         httpEndpoint: "${endpoint}",`,
     `         httpAuthToken: ${expr},`,
     "       });",
+    ...(serviceName
+      ? [
+          "     Keep the service field exactly as written. It is how this app is",
+          "     identified in Crumbtrail, and a session without it is filed under",
+          "     no app at all.",
+        ]
+      : []),
   ];
   if (backendJs && stack === "express") {
     jsLines.push(

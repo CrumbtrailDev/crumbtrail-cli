@@ -59,6 +59,10 @@ Outside a TTY the wizard refuses to guess. Pass `--yes` and an existing
 npx crumbtrail --yes --project prj_1234abcd --only web --skip-verify
 ```
 
+`--yes` without `--project` infers a project name from the app and uses the
+project already carrying that name, ignoring case, rather than creating a
+second one under it. Nothing already carrying that name means it is created.
+
 ## Verify your setup / pre-deploy check
 
 `crumbtrail verify` runs a fast **synthetic preflight** against any environment's
