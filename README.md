@@ -29,14 +29,16 @@ each is a real SDK with platform peer dependencies behind it.
 ### Other registries
 
 The native SDKs are not npm packages and cannot be subpaths of one. Each has a
-single home on its own platform's registry.
+single home on its own platform's registry. Two of them are built and tested
+here but not released yet, so the status column is the one to read first: the
+setup wizard will not wire an app against a package it cannot resolve.
 
-| SDK | Registry |
-| --- | --- |
-| [`Crumbtrail` (Swift)](packages/swift) | Swift Package Manager. Native iOS, macOS, tvOS and watchOS. No dependencies. |
-| [`ai.crumbtrail:crumbtrail-android`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies. |
-| [`crumbtrail_flutter`](packages/flutter) | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment. |
-| [`tauri-plugin-crumbtrail`](packages/tauri/rust) | crates.io. The Rust half of Tauri support; its JavaScript half is `crumbtrail-core/tauri`. |
+| SDK | Registry | Status |
+| --- | --- | --- |
+| [`Crumbtrail` (Swift)](packages/swift) | Swift Package Manager. Native iOS, macOS, tvOS and watchOS. No dependencies. | Consumable by Git URL |
+| [`tauri-plugin-crumbtrail`](packages/tauri/rust) | crates.io. The Rust half of Tauri support; its JavaScript half is `crumbtrail-core/tauri`. | Published |
+| [`ai.crumbtrail:crumbtrail-android`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies. | Not published yet |
+| [`crumbtrail_flutter`](packages/flutter) | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment. | Not published yet |
 
 ## Quick start
 

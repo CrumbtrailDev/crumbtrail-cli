@@ -351,20 +351,38 @@ export async function installSdk(
     return { installed: false, packages: [] };
   }
   const run = input.spawnFn ?? realSpawn;
+  const meta = RECIPE_REGISTRY[input.recipe];
+
+  // A package that is not on its registry cannot be added, and saying so is the
+  // whole job here. Attempting it produces a failure whose real cause — the
+  // package does not exist — is invisible in the exit code, so the wizard would
+  // report something it does not know and send the user to debug their own
+  // toolchain.
+  if (meta.sdkUnpublished) {
+    const registry = meta.packageEcosystem === "pub" ? "pub.dev" : "npm";
+    return {
+      installed: false,
+      packages,
+      note: `${packages.join(", ")} is not published on ${registry} yet, so this app cannot be wired automatically. Nothing was installed and no files were changed.`,
+    };
+  }
 
   // Dart packages live on pub.dev, not npm. Nothing below this branch applies to
   // them: there is no detected package manager, no npm version floor, and the
   // deploy's tarball fallback serves npm tarballs only.
-  if (RECIPE_REGISTRY[input.recipe].packageEcosystem === "pub") {
+  if (meta.packageEcosystem === "pub") {
     input.ui.out(
       `Installing SDK: ${color.cyan(`flutter pub add ${packages.join(" ")}`)}`,
     );
     const pubCode = run("flutter", ["pub", "add", ...packages], input.cwd);
     if (pubCode === 0) return { installed: true, packages };
+    // Deliberately does not name a cause. The exit code says the command
+    // failed, not why, and the two usual reasons — no Flutter SDK on PATH, and
+    // the package not resolving — send the user to completely different places.
     return {
       installed: false,
       packages,
-      note: `\`flutter pub add ${packages.join(" ")}\` failed — check that the Flutter SDK is on your PATH, then run it yourself.`,
+      note: `\`flutter pub add ${packages.join(" ")}\` failed. Run it yourself to see what pub reported.`,
     };
   }
 
@@ -726,9 +744,18 @@ export async function runWizard(
   // User-facing links point at the app host (the SPA), not the API host.
   const appBase = dashboardBase(base);
 
+  // Nothing was installed and nothing was wired, so no event can arrive. Waiting
+  // for one would spend the user's time on a countdown with a foregone answer,
+  // and end on "no event yet" as though they had done something wrong.
+  const nothingWired = !install.installed && install.packages.length > 0;
+
   let sessionUrl: string | undefined;
   if (parsed.skipVerify) {
     notes.push("Verification skipped (--skip-verify).");
+  } else if (nothingWired) {
+    notes.push(
+      "Nothing is wired yet, so there is no first event to wait for. Install the SDK, then run `npx crumbtrail` again.",
+    );
   } else {
     ui.out(
       color.dim(
@@ -1601,6 +1628,22 @@ async function applyInjection(
 
   if (plan.kind === "skip-already-wired") {
     ui.out(`${color.green("✓")} Already wired — leaving your code untouched.`);
+    return { filesTouched, notes };
+  }
+
+  // An import for a package that is not installed does not fail softly: it
+  // fails the build. When the SDK could not be added, the honest outcome is an
+  // untouched repo plus a note — not a wired app that no longer compiles and an
+  // edit the user has to find and revert by hand. `otlp` is unaffected: it has
+  // no SDK packages, so `installSdk` reports a skip rather than a failure.
+  if (sdkInstall && !sdkInstall.installed && sdkInstall.packages.length > 0) {
+    const pkgs = sdkInstall.packages.join(", ");
+    ui.out(
+      color.yellow(`Left your code untouched — ${pkgs} is not installed.`),
+    );
+    notes.push(
+      `Skipped wiring ${plan.targetPath ?? "your entry file"}: install ${pkgs}, then run \`npx crumbtrail\` again.`,
+    );
     return { filesTouched, notes };
   }
 

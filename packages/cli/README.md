@@ -158,6 +158,14 @@ Two kinds of change, in the package it's wiring:
   first statement of `main()` (capture has to be running before the first frame)
 - your ingest key, in an env file, plus a `.gitignore` entry for that file
 
+It writes none of it when the SDK could not be installed. An import for a package
+that is not there does not degrade, it fails the build, so a failed install ends
+with your repository untouched and a note saying what to install.
+
+Flutter is in that state right now: `crumbtrail_flutter` is not on pub.dev yet,
+so a Flutter app is detected and reported but not wired. See
+[`packages/flutter`](../flutter) for depending on it from source in the meantime.
+
 The injected code reads the key from a framework-appropriate environment
 variable — `NEXT_PUBLIC_CRUMBTRAIL_KEY` (Next), `VITE_CRUMBTRAIL_KEY` (Vite /
 SvelteKit / Nuxt / Remix), `PUBLIC_CRUMBTRAIL_KEY` (Astro),

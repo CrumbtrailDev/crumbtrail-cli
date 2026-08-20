@@ -58,6 +58,19 @@ export interface RecipeMeta {
    */
   packageEcosystem?: "npm" | "pub";
   /**
+   * Set when `sdkPackages` are not on their registry yet.
+   *
+   * The installer then refuses to attempt the add, and the wizard writes no
+   * imports, because wiring an app against a package that cannot resolve leaves
+   * the build broken and the user hunting for an edit they never asked for —
+   * while every step printed afterwards reports success. Detection still fires,
+   * so the user is told what was found and what is missing rather than being
+   * told their stack is unsupported.
+   *
+   * Delete the flag the day the package is published; nothing else changes.
+   */
+  sdkUnpublished?: true;
+  /**
    * The stack label reported to the dashboard when the `Stack` union has no id
    * for this recipe. `Stack` is a closed vocabulary shared with the design
    * system (it picks a brand mark from it), so widening it for a recipe is a
@@ -202,6 +215,10 @@ export const RECIPE_REGISTRY: Record<Recipe, RecipeMeta> = {
     reportedStack: "flutter",
     sdkPackages: ["crumbtrail_flutter"],
     packageEcosystem: "pub",
+    // `crumbtrail_flutter` is built and tested in packages/flutter but has
+    // never been released: there is no pub.dev entry and no pub publish job in
+    // .github/workflows/release.yml, which only walks `packages/*/package.json`.
+    sdkUnpublished: true,
     serviceName: "app",
     kind: "inject",
     keyRef: FLUTTER_KEY,

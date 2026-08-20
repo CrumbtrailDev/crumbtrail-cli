@@ -16,7 +16,7 @@ import {
   type DetectResult,
   type Plan,
 } from "../index";
-import { sdkInstallSpec } from "../recipe-registry";
+import { RECIPE_REGISTRY, sdkInstallSpec } from "../recipe-registry";
 import type { ServiceCandidate } from "../discover";
 import type { Prompter, Ui } from "../ui";
 import type { EnvFileIO } from "../env-file";
@@ -402,6 +402,39 @@ describe("wizard orchestration", () => {
     expect(lines.join("\n")).toContain("/sessions/sess-1");
   });
 
+  it("writes nothing when the SDK could not be installed", async () => {
+    const steps: string[] = [];
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps },
+      {
+        ui,
+        installSdk: vi.fn(async () => {
+          steps.push("install");
+          return {
+            installed: false,
+            packages: ["crumbtrail_flutter"],
+            note: "crumbtrail_flutter is not published on pub.dev yet, so this app cannot be wired automatically. Nothing was installed and no files were changed.",
+          };
+        }),
+      },
+    );
+
+    await runCli(["node", "cli"], deps);
+
+    // An import for a package that is not installed does not fail softly: it
+    // fails the build. Wiring it anyway left the user with an app that no
+    // longer compiled and an edit they had to find and revert by hand, while
+    // every step printed afterwards reported success.
+    expect(steps).not.toContain("execute");
+    expect(deps.executePlan).not.toHaveBeenCalled();
+    const out = lines.join("\n");
+    expect(out).toContain("Left your code untouched");
+    expect(out).toContain("not published on pub.dev");
+    // And no countdown on an event that cannot arrive.
+    expect(steps).not.toContain("poll");
+  });
+
   it("plans before install, installs before executing (build<install<execute)", async () => {
     const steps: string[] = [];
     const deps = makeDeps({ steps });
@@ -536,12 +569,10 @@ describe("wizard orchestration", () => {
 describe("installSdk — tarball fallback (registry unavailable)", () => {
   const uiSink: Ui = { out: () => {}, err: () => {} };
 
-  it("installs the Flutter SDK with pub, never a JS package manager", async () => {
+  it("refuses to add a package that is not on its registry, and says why", async () => {
     const calls: { cmd: string; args: string[] }[] = [];
     const result = await realInstallSdk({
       cwd: "/app",
-      // Detection finds no lockfile in a Flutter app, and it does not matter:
-      // a Dart package is not on npm, so the package manager is irrelevant.
       packageManager: null,
       recipe: "flutter",
       base: "https://deploy.example",
@@ -555,30 +586,79 @@ describe("installSdk — tarball fallback (registry unavailable)", () => {
       }) as unknown as typeof fetch,
     });
 
-    expect(result.installed).toBe(true);
-    expect(calls).toEqual([
-      { cmd: "flutter", args: ["pub", "add", "crumbtrail_flutter"] },
-    ]);
-    // npm version floors are spelled `pkg@>=x.y.z` and mean nothing to pub.
-    expect(JSON.stringify(calls)).not.toContain(">=");
+    // `crumbtrail_flutter` is built here but has never been released, so
+    // `flutter pub add` can only fail — at dependency resolution, with an exit
+    // code that says nothing about why. Running it anyway produced a failure
+    // the wizard then explained wrongly, sending the user to check their PATH.
+    expect(calls).toEqual([]);
+    expect(result.installed).toBe(false);
+    expect(result.note).toContain("pub.dev");
+    expect(result.note).toContain("crumbtrail_flutter");
   });
 
-  it("tells the user to check their PATH when pub add fails", async () => {
-    const result = await realInstallSdk({
-      cwd: "/app",
-      packageManager: null,
-      recipe: "flutter",
-      base: "https://deploy.example",
-      ui: uiSink,
-      spawnFn: () => 1,
-      fetchImpl: (async () => {
-        // The deploy's tarball fallback serves npm tarballs; there is nothing
-        // there for a Dart package, so it must not be attempted.
-        throw new Error("no tarball fallback for pub");
-      }) as unknown as typeof fetch,
-    });
-    expect(result.installed).toBe(false);
-    expect(result.note).toContain("Flutter SDK is on your PATH");
+  it("uses pub, never a JS package manager, once the package is published", async () => {
+    // The day `crumbtrail_flutter` ships, `sdkUnpublished` comes off the
+    // registry entry and this is the path that runs. Removing it here keeps
+    // that path covered instead of leaving it untested until the release.
+    const meta = RECIPE_REGISTRY.flutter;
+    const wasUnpublished = meta.sdkUnpublished;
+    delete meta.sdkUnpublished;
+    const calls: { cmd: string; args: string[] }[] = [];
+    try {
+      const result = await realInstallSdk({
+        cwd: "/app",
+        // Detection finds no lockfile in a Flutter app, and it does not matter:
+        // a Dart package is not on npm, so the package manager is irrelevant.
+        packageManager: null,
+        recipe: "flutter",
+        base: "https://deploy.example",
+        ui: uiSink,
+        spawnFn: (cmd, args) => {
+          calls.push({ cmd, args });
+          return 0;
+        },
+        fetchImpl: (async () => {
+          throw new Error("the pub path must not touch the network");
+        }) as unknown as typeof fetch,
+      });
+
+      expect(result.installed).toBe(true);
+      expect(calls).toEqual([
+        { cmd: "flutter", args: ["pub", "add", "crumbtrail_flutter"] },
+      ]);
+      // npm version floors are spelled `pkg@>=x.y.z` and mean nothing to pub.
+      expect(JSON.stringify(calls)).not.toContain(">=");
+    } finally {
+      if (wasUnpublished) meta.sdkUnpublished = wasUnpublished;
+    }
+  });
+
+  it("names no cause when pub add itself fails", async () => {
+    const meta = RECIPE_REGISTRY.flutter;
+    const wasUnpublished = meta.sdkUnpublished;
+    delete meta.sdkUnpublished;
+    try {
+      const result = await realInstallSdk({
+        cwd: "/app",
+        packageManager: null,
+        recipe: "flutter",
+        base: "https://deploy.example",
+        ui: uiSink,
+        spawnFn: () => 1,
+        fetchImpl: (async () => {
+          // The deploy's tarball fallback serves npm tarballs; there is nothing
+          // there for a Dart package, so it must not be attempted.
+          throw new Error("no tarball fallback for pub");
+        }) as unknown as typeof fetch,
+      });
+      expect(result.installed).toBe(false);
+      // An exit code says the command failed, not why. "Check your PATH" was a
+      // guess, and it sent Flutter users to debug a toolchain that was fine.
+      expect(result.note).not.toMatch(/PATH/i);
+      expect(result.note).toContain("flutter pub add crumbtrail_flutter");
+    } finally {
+      if (wasUnpublished) meta.sdkUnpublished = wasUnpublished;
+    }
   });
 
   it("falls back to the deploy's /install tarballs when the registry install fails", async () => {
