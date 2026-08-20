@@ -26,8 +26,8 @@ describe("CrumbtrailErrorBoundary", () => {
       type: "err",
       data: {
         msg: "boom",
-        stack: error.stack,
-        componentStack: errorInfo.componentStack,
+        stk: error.stack,
+        componentStk: errorInfo.componentStack,
         source: "react-error-boundary",
       },
     });
@@ -48,10 +48,8 @@ describe("CrumbtrailErrorBoundary", () => {
 
     const event = logger.addEvent.mock.calls[0]![0];
     expect(event.data.msg).toBe("password=[REDACTED]");
-    expect(event.data.stack).not.toContain(
-      "sk_fake_abcdefghijklmnopqrstuvwxyz",
-    );
-    expect(event.data.componentStack).toBe("\n  at PasswordForm");
+    expect(event.data.stk).not.toContain("sk_fake_abcdefghijklmnopqrstuvwxyz");
+    expect(event.data.componentStk).toBe("\n  at PasswordForm");
   });
 
   it("does not expose raw malformed JSON-like sensitive boundary strings", () => {
@@ -69,7 +67,7 @@ describe("CrumbtrailErrorBoundary", () => {
 
     const event = logger.addEvent.mock.calls[0]![0];
     expect(event.data.msg).toBe("[REDACTED]");
-    expect(event.data.stack).toBe("[REDACTED]");
+    expect(event.data.stk).toBe("[REDACTED]");
     expect(JSON.stringify(event.data)).not.toContain("hunter2");
     expect(JSON.stringify(event.data)).not.toContain(
       "sk_fake_abcdefghijklmnopqrstuvwxyz",
@@ -89,7 +87,7 @@ describe("CrumbtrailErrorBoundary", () => {
 
     const event = logger.addEvent.mock.calls[0]![0];
     expect(event.data.msg).toBe("address=[REDACTED]");
-    expect(event.data.stack).toBe("[REDACTED]");
+    expect(event.data.stk).toBe("[REDACTED]");
     expect(JSON.stringify(event.data)).not.toContain("123 Main St");
     expect(JSON.stringify(event.data)).not.toContain("2000-01-01");
     expect(JSON.stringify(event.data)).not.toContain("12345");

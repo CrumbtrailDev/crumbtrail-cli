@@ -28,8 +28,25 @@ export interface ReactNativeCrumbtrailResult {
   collectors: ReactNativeCollectorController;
 }
 
+/**
+ * The core config a React Native app starts from.
+ *
+ * Every entry here switches off a `crumbtrail-core` collector that binds a DOM
+ * event target. React Native has no DOM: it sets `global.window = global`, which
+ * is enough to pass a `typeof window` check while carrying no
+ * `addEventListener`, and it never defines a `document` instance at all.
+ *
+ * `errors` is on the list for the same reason as the rest, and is easy to
+ * misread because RN has an `errors` collector of its own. They are different
+ * things: core's reads `window`'s `error` / `unhandledrejection` events, which
+ * RN never fires, while `startReactNativeCollectors` installs the `ErrorUtils`
+ * global handler that RN actually reports through. Leaving core's on buys no
+ * capture and risks reporting the same throw twice on any runtime that later
+ * grows a `window.addEventListener`.
+ */
 const REACT_NATIVE_DEFAULT_CONFIG: Partial<CrumbtrailConfig> = {
   network: false,
+  errors: false,
   interactions: false,
   keystrokes: false,
   scroll: false,

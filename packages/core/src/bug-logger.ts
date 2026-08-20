@@ -451,7 +451,16 @@ export class Crumbtrail {
     // entry); the transport's keepalive/sendBeacon path then gives the batch a
     // real chance to leave the page. Guarded because a caller-supplied
     // `transportInstance` lets init() run without a window (SSR/programmatic).
-    if (typeof window !== "undefined") {
+    //
+    // `window` existing is not enough to conclude there is an event target
+    // behind it. React Native's `setUpGlobals` does `global.window = global`,
+    // so RN passes a `typeof window` check while carrying no
+    // `addEventListener` at all — an unguarded call here is a TypeError thrown
+    // out of init() on the first launch of every RN app.
+    if (
+      typeof window !== "undefined" &&
+      typeof window.addEventListener === "function"
+    ) {
       const flushOnPageHide = () => bus.flush();
       window.addEventListener("pagehide", flushOnPageHide);
       instance.cleanups.push(() =>

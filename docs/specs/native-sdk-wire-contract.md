@@ -97,11 +97,26 @@ outside this list gets no cross platform treatment on the ingest side.
 | `navigation` | A screen or route change | `name`, `path`, `key`, `url`, `source` |
 | `nav-intent` | A navigation the user asked for | `action`, `source` |
 | `app-lifecycle` | Foreground/background transitions | `state`, `source`, `kind` |
-| `native-crash` | A native crash captured on next launch | `msg`, `stk`, `signal`, `source` |
+| `native-crash` | A native crash captured on next launch | `msg`, `stk`, `signal`, `thread`, `at`, `source` |
 | `view-snapshot` | A view tree snapshot | `nodes`, `w`, `h` |
 
 `err` carries `fatal: true` only for a failure that actually terminated the
 process. A caught and reported exception is `fatal: false`.
+
+`native-crash` is delivered by the launch AFTER the one that crashed, so its
+envelope `t` is the relaunch, not the crash. `at` carries the Unix milliseconds
+the crash was actually recorded, and `source` names where it came from
+(`previous-launch`). Both are optional: an SDK that cannot know the crash time
+omits `at` rather than reporting the relaunch as the crash.
+
+`err` also allows `componentStk`, the framework component path a render crash
+happened inside. It is emitted by the React and React Native error boundaries
+and by nothing else, and it is a separate key rather than part of `stk` because
+the two answer different questions: a render crash's `stk` names the reconciler
+frames that rethrew it, while `componentStk` names the components it happened
+in, which is what points at the file to open. The stack key is `stk` on every
+SDK, boundaries included; an SDK that sends `stack` delivers a crash the
+analyzer indexes with no stack and no code frame.
 
 ### Target descriptor
 

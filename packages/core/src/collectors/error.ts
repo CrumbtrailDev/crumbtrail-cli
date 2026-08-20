@@ -128,13 +128,38 @@ export function errorCollector(
     bus.emit({ t: now(), k: "csp", d });
   };
 
-  window.addEventListener("error", onError);
-  window.addEventListener("unhandledrejection", onRejection);
-  document.addEventListener("securitypolicyviolation", onCspViolation);
+  // Both targets are checked, and checked separately.
+  //
+  // React Native reaches here: `global.window = global` makes `typeof window`
+  // an object, so init()'s non-browser escape hatch does not fire, but that
+  // global has no `addEventListener` and RN never defines a `document`
+  // instance. An unguarded bind is then a TypeError (window) or a
+  // ReferenceError (document) thrown straight out of `Crumbtrail.init`, which
+  // on RN means the host app dies at launch. RN reports its own errors through
+  // `ErrorUtils` in `crumbtrail-react-native`; this collector simply has
+  // nothing to bind to there, so it installs what exists and no more.
+  const windowEvents =
+    typeof window !== "undefined" &&
+    typeof window.addEventListener === "function";
+  const documentEvents =
+    typeof document !== "undefined" &&
+    typeof document.addEventListener === "function";
+
+  if (windowEvents) {
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+  }
+  if (documentEvents) {
+    document.addEventListener("securitypolicyviolation", onCspViolation);
+  }
 
   return () => {
-    window.removeEventListener("error", onError);
-    window.removeEventListener("unhandledrejection", onRejection);
-    document.removeEventListener("securitypolicyviolation", onCspViolation);
+    if (windowEvents) {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+    }
+    if (documentEvents) {
+      document.removeEventListener("securitypolicyviolation", onCspViolation);
+    }
   };
 }

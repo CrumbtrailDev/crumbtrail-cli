@@ -1,9 +1,5 @@
 package ai.crumbtrail.sdk
 
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
-
 object CrumbtrailSdk {
     const val NAME = "crumbtrail-kotlin"
     const val VERSION = "0.1.0"
@@ -137,12 +133,13 @@ class Crumbtrail(
     val platform: CrumbtrailPlatform = CrumbtrailPlatform.ANDROID,
     private val capabilities: List<String> = emptyList(),
     private val clock: () -> Long = System::currentTimeMillis,
-    private val scheduler: ScheduledExecutorService? =
-        Executors.newSingleThreadScheduledExecutor { runnable ->
-            // Daemon, so a running flush timer can never hold the JVM (or a
-            // test run) open after the app is done with it.
-            Thread(runnable, "crumbtrail-flush").apply { isDaemon = true }
-        },
+    /**
+     * Where delivery and the flush timer run. See [CrumbtrailDelivery]: the
+     * default keeps every network call off the caller's thread, which is what
+     * makes the SDK safe to call from `Application.onCreate`, an activity
+     * lifecycle callback and an uncaught-exception handler.
+     */
+    private val delivery: CrumbtrailDelivery = CrumbtrailBackgroundDelivery(),
 ) {
     val sessionId: String
     private val queue = CrumbtrailEventQueue(config.queueCapacity)
@@ -158,15 +155,18 @@ class Crumbtrail(
         val session = CrumbtrailSessionResolver.resolve(store, config.sessionIdleMs, clock())
         sessionId = session.id
 
-        transport.startSession(
-            sessionId,
-            JsonValue.of(
-                "service" to JsonValue.str(config.service),
-                "platform" to JsonValue.Str(platform.wireValue),
-                "app" to deviceInfo.appJson(),
-                "device" to deviceInfo.deviceJson(),
-            ),
+        // Off the caller's thread like every other post. This one runs from
+        // `Application.onCreate`, so announcing the session inline was network
+        // on the main thread — swallowed by the transport's own `runCatching`,
+        // which meant every Android session silently lost the metadata that
+        // names which app it came from.
+        val sessionMetadata = JsonValue.of(
+            "service" to JsonValue.str(config.service),
+            "platform" to JsonValue.Str(platform.wireValue),
+            "app" to deviceInfo.appJson(),
+            "device" to deviceInfo.deviceJson(),
         )
+        delivery.submit { transport.startSession(sessionId, sessionMetadata) }
 
         if (config.collectors.environment) {
             addEvent(
@@ -180,12 +180,7 @@ class Crumbtrail(
             )
         }
 
-        scheduler?.takeIf { config.flushIntervalSeconds > 0 }?.scheduleWithFixedDelay(
-            { runCatching { flush() } },
-            config.flushIntervalSeconds,
-            config.flushIntervalSeconds,
-            TimeUnit.SECONDS,
-        )
+        delivery.repeatEvery(config.flushIntervalSeconds) { deliverPending() }
     }
 
     fun addEvent(kind: CrumbtrailEventKind, data: JsonValue, target: CrumbtrailTarget? = null) =
@@ -254,6 +249,15 @@ class Crumbtrail(
      * timeline keeps its order.
      */
     fun flush() {
+        delivery.submit { deliverPending() }
+    }
+
+    /**
+     * The delivery itself. Private on purpose: it performs blocking network I/O,
+     * so the only way to reach it is through [delivery], and no caller gets to
+     * run it on its own thread.
+     */
+    private fun deliverPending() {
         val batch = queue.drain()
         if (batch.isEmpty()) return
         try {
@@ -276,8 +280,24 @@ class Crumbtrail(
         stopped = true
         cleanups.asReversed().forEach { runCatching(it) }
         cleanups.clear()
-        scheduler?.shutdownNow()
-        flush()
-        transport.endSession(sessionId)
+        // Waited on, unlike an ordinary flush: a caller that stops the SDK is
+        // entitled to know the tail of the session left the device. Bounded,
+        // because stop() is usually called from the main thread and a caller
+        // asking to shut down must not be handed an ANR for it.
+        val handle = delivery.submit {
+            deliverPending()
+            transport.endSession(sessionId)
+        }
+        handle.await(STOP_DELIVERY_TIMEOUT_MS)
+        delivery.shutdown()
+    }
+
+    private companion object {
+        /**
+         * How long [stop] waits for the final batch and `endSession`. Long
+         * enough for a round trip on a slow connection, short enough that it
+         * cannot become the reason an app is killed for not responding.
+         */
+        const val STOP_DELIVERY_TIMEOUT_MS = 2_000L
     }
 }

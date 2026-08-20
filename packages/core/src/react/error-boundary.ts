@@ -31,12 +31,20 @@ export class CrumbtrailErrorBoundary extends Component<
   componentDidCatch(error: Error, errorInfo: ErrorInfo): void {
     // Error boundary events are privacy-safe by default; raw error capture belongs in
     // caller-owned custom events, not in this automatic boundary path.
+    //
+    // `stk` and `componentStk`, not `stack`/`componentStack`. `err` events are
+    // read by key, not by shape: the analyzer indexes `d.stk` and nothing else
+    // (post-process.ts), and the code frame, the LLM bundle and the cloud brief
+    // are all built from that index entry. A boundary crash that emits `stack`
+    // still reaches the raw event log, but arrives at the agent as a bare
+    // message with no stack and no file — which is the one thing a boundary was
+    // installed to provide.
     this.props.logger.addEvent({
       type: "err",
       data: {
         msg: redactReactSnapshot(error.message),
-        stack: redactReactSnapshot(error.stack),
-        componentStack: redactReactSnapshot(errorInfo.componentStack),
+        stk: redactReactSnapshot(error.stack),
+        componentStk: redactReactSnapshot(errorInfo.componentStack),
         source: "react-error-boundary",
       },
     });

@@ -29,12 +29,16 @@ export class CrumbtrailReactNativeErrorBoundary extends Component<
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo): void {
+    // Keys match the wire contract's `err` event and core's own error
+    // collector: the analyzer indexes `d.stk`, so a boundary that emitted
+    // `stack` delivered a crash with no stack trace and no code frame. See the
+    // note on the web boundary in `crumbtrail-core/react`.
     this.props.logger.addEvent({
       type: "err",
       data: {
         msg: redactReactNativeSnapshot(error.message),
-        stack: redactReactNativeSnapshot(error.stack),
-        componentStack: redactReactNativeSnapshot(errorInfo.componentStack),
+        stk: redactReactNativeSnapshot(error.stack),
+        componentStk: redactReactNativeSnapshot(errorInfo.componentStack),
         source: "react-native-error-boundary",
       },
     });

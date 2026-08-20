@@ -271,6 +271,11 @@ interface SessionIndex {
     line?: number;
     col?: number;
     stk?: string;
+    // The React component path, present only on a crash caught by a
+    // `CrumbtrailErrorBoundary` (web or React Native). A render crash's JS
+    // stack names the framework internals that rethrew it; this names the
+    // components it happened inside, which is what points at the file to open.
+    componentStk?: string;
   }>;
   failedReqs: Array<{
     t: number;
@@ -541,6 +546,8 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
       if (col !== undefined) entry.col = col;
       const stk = safeStackString(event.d.stk);
       if (stk) entry.stk = stk;
+      const componentStk = safeStackString(event.d.componentStk);
+      if (componentStk) entry.componentStk = componentStk;
       errs.push(entry);
     }
 

@@ -11,6 +11,20 @@ SDK uses.
 
 ## Install
 
+`crumbtrail_flutter` is not on pub.dev yet, so `flutter pub add crumbtrail_flutter`
+will not resolve and `npx crumbtrail` will not wire a Flutter app automatically.
+Until it ships, depend on it from source:
+
+```yaml
+dependencies:
+  crumbtrail_flutter:
+    git:
+      url: https://github.com/CrumbtrailDev/crumbtrail-cli.git
+      path: packages/flutter
+```
+
+Once it is published this becomes the usual pair:
+
 ```yaml
 dependencies:
   crumbtrail_flutter: ^0.1.0
