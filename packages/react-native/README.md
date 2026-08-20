@@ -93,6 +93,7 @@ createReactNativeCrumbtrail({
   config: {
     httpEndpoint: "https://app.crumbtrail.ai", // or your self-host endpoint
     httpAuthToken: "<project api key>",
+    remoteConfig: true, // take the kill switch and capture settings from the project
   },
 });
 ```
