@@ -791,6 +791,7 @@ export async function runWizard(
     base,
     token,
     projectId: provisioned.projectId,
+    projectName: provisioned.projectName,
     appDir: cwd,
     repoRoot: cwd,
     // A compile-time key (Flutter) has no env file to live in. Writing one
@@ -1301,6 +1302,7 @@ export async function runBatchWizard(
     base,
     token,
     projectId: project.id,
+    projectName: project.name,
     repoRoot: root,
     targets: reporting.map((o) => ({
       label: o.name,
@@ -1610,6 +1612,8 @@ async function writeIngestKeys(args: {
   base: string;
   token: string;
   projectId: string;
+  /** Named in the "left as it is" line, so a key from another project shows. */
+  projectName: string;
   /** The git work tree this run is in, which owns the .gitignore. */
   repoRoot: string;
   targets: KeyTarget[];
@@ -1660,7 +1664,11 @@ async function writeIngestKeys(args: {
     if (plan.kind === "already-set") {
       ui.out(
         ok(
-          `${named(label)}${color.bold(plan.varName)} is already set in ${color.brand(rel(args.repoRoot, plan.file))} — left as it is.`,
+          // Naming the project is the whole point. The value is never
+          // inspected — an ingest key cannot be resolved to its project
+          // without a read credential — so the one way a second project's key
+          // becomes visible is saying which project this run wired.
+          `${named(label)}${color.bold(plan.varName)} is already set in ${color.brand(rel(args.repoRoot, plan.file))} — left as it is. Events from this app go wherever that key points, which is only ${color.bold(args.projectName)} if it was minted there.`,
         ),
       );
       results.set(label, {
@@ -1768,6 +1776,7 @@ async function writeIngestKey(args: {
   base: string;
   token: string;
   projectId: string;
+  projectName: string;
   appDir: string;
   repoRoot: string;
   varName: string | undefined;
