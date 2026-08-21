@@ -31,7 +31,11 @@ export function normalizeBase(base: string): string {
  * SPA); a custom `--endpoint` / CRUMBTRAIL_BASE_URL is returned unchanged, since
  * a self-host typically serves the API and dashboard from one origin.
  */
-export function dashboardBase(base: string): string {
+export function dashboardBase(base: string, appBaseUrl?: string): string {
+  // What the deployment said about itself always wins. Guessing worked only for
+  // the hosted default: on a self-hosted or local stack the dashboard is a
+  // different port, and the guess sent every printed link to a 404.
+  if (appBaseUrl && appBaseUrl.trim()) return normalizeBase(appBaseUrl);
   return normalizeBase(base) === DEFAULT_ENDPOINT ? DEFAULT_APP_URL : base;
 }
 

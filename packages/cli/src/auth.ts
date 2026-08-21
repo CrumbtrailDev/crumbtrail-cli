@@ -45,6 +45,12 @@ export interface StoredAuth {
   expiresAt: string;
   /** Endpoint the token was minted against — a token is only reused for its base. */
   endpoint: string;
+  /**
+   * Where this deployment serves its dashboard, as the server reported it.
+   * Locally the API and the app are different ports, so it cannot be derived
+   * from `endpoint`, and every link the wizard printed from the API base 404ed.
+   */
+  appBaseUrl?: string;
 }
 
 export function configDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -68,6 +74,9 @@ export function loadAuth(
         token: parsed.token,
         expiresAt: String(parsed.expiresAt ?? ""),
         endpoint: String(parsed.endpoint ?? ""),
+        ...(typeof parsed.appBaseUrl === "string" && parsed.appBaseUrl
+          ? { appBaseUrl: parsed.appBaseUrl }
+          : {}),
       };
     }
   } catch {
@@ -227,6 +236,8 @@ export function startCallbackServer(): Promise<CallbackServer> {
 export interface TokenResponse {
   token: string;
   expiresAt: string;
+  /** The deployment's dashboard origin, when the server reported it. */
+  appBaseUrl?: string;
 }
 
 /** Exchange a browser-handoff grant code + PKCE verifier for a CLI token. */
@@ -467,7 +478,12 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
 
   const minted = await login(opts);
   saveAuth(
-    { token: minted.token, expiresAt: minted.expiresAt, endpoint: opts.base },
+    {
+      token: minted.token,
+      expiresAt: minted.expiresAt,
+      endpoint: opts.base,
+      ...(minted.appBaseUrl ? { appBaseUrl: minted.appBaseUrl } : {}),
+    },
     env,
   );
   opts.ui.out(ok("Logged in."));

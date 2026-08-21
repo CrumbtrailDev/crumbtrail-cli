@@ -347,7 +347,17 @@ export function bar(
   name: InkName = "brand",
 ): string {
   const level = caps().colorLevel;
-  const plain = content.length > width ? content.slice(0, width) : content;
+  // Marked, never silent. A bare slice ate the last characters of the line, and
+  // the end of that line is where the bar carries its payload: the run printed
+  // "Setup complete - project kartbu" for a project named kartbug.
+  const mark = glyphs().ellipsis;
+  const plain =
+    content.length > width
+      ? `${content.slice(0, Math.max(0, width - mark.length))}${mark}`.slice(
+          0,
+          width,
+        )
+      : content;
   const padded = plain.padEnd(width);
   if (level === 0) return padded.trimEnd();
   const text = fillText(INK[name].on, level);
@@ -381,6 +391,8 @@ export interface Glyphs {
   crumbSmall: string;
   rule: string;
   rail: string;
+  /** Marks a line the terminal was too narrow to hold. */
+  ellipsis: string;
   spinner: string[];
 }
 
@@ -395,6 +407,7 @@ const UNICODE_GLYPHS: Glyphs = {
   crumbSmall: "·",
   rule: "─",
   rail: "│",
+  ellipsis: "…",
   // Braille frames: one cell wide everywhere, unlike the emoji-style spinners
   // that render double-width in some terminals and tear the redraw.
   spinner: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
@@ -411,6 +424,7 @@ const ASCII_GLYPHS: Glyphs = {
   crumbSmall: ".",
   rule: "-",
   rail: "|",
+  ellipsis: "...",
   spinner: ["|", "/", "-", "\\"],
 };
 

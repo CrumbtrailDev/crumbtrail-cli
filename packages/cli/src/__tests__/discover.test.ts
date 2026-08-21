@@ -137,10 +137,33 @@ describe("discoverServices", () => {
       "apps/web/index.html":
         '<div id=root></div><script type="module" src="/src/main.ts"></script>',
       "apps/web/src/main.ts": "",
+      // Declared AND installed. A declaration on its own is a stale range, not
+      // a wired app.
+      "node_modules/crumbtrail-core/package.json": pkg({
+        name: "crumbtrail-core",
+      }),
     });
     const web = discoverServices(repo, detect(repo))[0];
     expect(web.flags).toContain("already-wired");
     expect(web.defaultChecked).toBe(false);
+  });
+
+  it("does not mark a package whose SDK range was never installed", () => {
+    repo = makeTmpRepo({
+      "package.json": pkg({ name: "shop", private: true }),
+      "pnpm-workspace.yaml": "packages:\n  - 'apps/*'\n",
+      "apps/web/package.json": pkg({
+        name: "web",
+        dependencies: { vite: "^5.0.0", "crumbtrail-core": "^0.1.0" },
+        scripts: { dev: "vite" },
+      }),
+      "apps/web/index.html":
+        '<div id=root></div><script type="module" src="/src/main.ts"></script>',
+      "apps/web/src/main.ts": "",
+    });
+    const web = discoverServices(repo, detect(repo))[0];
+    expect(web.flags).not.toContain("already-wired");
+    expect(web.defaultChecked).toBe(true);
   });
 
   it("treats an OTLP service with an existing guide as already wired", () => {

@@ -206,6 +206,21 @@ export class HttpTransport implements CrumbtrailTransport {
     }
   }
 
+  /**
+   * The one line a cold start needs.
+   *
+   * A wrong endpoint, an ad blocker, a CSP rule and a CORS refusal all reject
+   * the `fetch` itself, so none of them reach a status code and none of them
+   * used to print anything. The integrator saw a clean console, a passing
+   * health check and an empty dashboard, with nothing to tell them apart.
+   */
+  private warnUnreachable(what: string): void {
+    this.warnOnce(
+      "unreachable",
+      `could not reach the capture endpoint at ${this.endpoint} while sending ${what}, so nothing is being captured. A wrong endpoint, a stopped local server, an ad blocker, a CSP rule or a CORS refusal all fail this way.`,
+    );
+  }
+
   /** The refusal already known before a batch is even serialized, if any. */
   private standingRefusal(eventCount: number): EventDeliveryError | undefined {
     if (this.startRefusedStatus > 0) {
@@ -333,6 +348,7 @@ export class HttpTransport implements CrumbtrailTransport {
       // the user leave — without the ingest key, be refused server side, and
       // return `true` for "queued" anyway. That is a phantom delivery, so the
       // loss is reported instead of dressed up as success.
+      this.warnUnreachable("captured events");
       if (this.authToken) {
         this.warnOnce(
           "beacon-auth",
@@ -376,8 +392,18 @@ export class HttpTransport implements CrumbtrailTransport {
     }
     // A refusal is not a delivery. Retrying by beacon would be refused the same
     // way, so surface it instead: the caller turns this into a capture gap.
-    if (!response.ok)
+    if (!response.ok) {
+      // The server already wrote the sentence that explains this ("A project
+      // API key is required", the cap wall, the pause wall). Reporting a bare
+      // status instead sent the integrator to guess at a cause the response
+      // body was holding.
+      const reason = await readRefusalMessage(response);
+      this.warnOnce(
+        `events:${response.status}`,
+        `the capture endpoint refused events with HTTP ${response.status}${reason ? `: ${reason}` : ""}`,
+      );
       throw new EventDeliveryError(response.status, events.length);
+    }
   }
 
   async sendBlob(
@@ -408,11 +434,20 @@ export class HttpTransport implements CrumbtrailTransport {
     metadata: Record<string, unknown>,
   ): Promise<void> {
     this.sessionId = sessionId;
-    const response = await fetch(`${this.endpoint}/api/session/start`, {
-      method: "POST",
-      headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ sessionId, metadata }),
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${this.endpoint}/api/session/start`, {
+        method: "POST",
+        headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ sessionId, metadata }),
+      });
+    } catch {
+      // The caller swallows this rejection, so this warning is the only trace
+      // an unreachable endpoint leaves. It is also the first request the SDK
+      // makes, which makes it the earliest possible moment to say so.
+      this.warnUnreachable("the session start");
+      throw new SessionDeliveryError("start", 0);
+    }
     if (response.ok) {
       this.startRefusedStatus = 0;
       return;
@@ -422,9 +457,10 @@ export class HttpTransport implements CrumbtrailTransport {
     // between a session that reports itself healthy for its whole lifetime
     // while nothing lands, and one that says so on the first batch.
     this.startRefusedStatus = response.status;
+    const reason = await readRefusalMessage(response);
     this.warnOnce(
       `session-start:${response.status}`,
-      `session start was refused with HTTP ${response.status}; nothing from this session will be captured`,
+      `session start was refused with HTTP ${response.status}${reason ? `: ${reason}` : ""}; nothing from this session will be captured`,
     );
     throw new SessionDeliveryError("start", response.status);
   }
@@ -517,6 +553,31 @@ export class HttpTransport implements CrumbtrailTransport {
  * Tolerant on purpose: a 202 that is not a shed (or whose body cannot be read)
  * stays a delivery. Only an explicit `capture:"shed"` turns into back-pressure.
  */
+/**
+ * The server's own explanation of a refusal.
+ *
+ * Six distinct causes share one status on the ingest route, and the response
+ * body is the only thing that separates them. Echoing it costs one clone and
+ * turns "HTTP 401" into the sentence the server already wrote.
+ */
+async function readRefusalMessage(
+  response: Response,
+): Promise<string | undefined> {
+  let parsed: unknown;
+  try {
+    parsed = await response.clone().json();
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const record = parsed as Record<string, unknown>;
+  for (const key of ["error", "message", "detail"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
 async function readShedResponse(
   response: Response,
 ): Promise<{ reason: string; retryAfterSeconds: number } | undefined> {

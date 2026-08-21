@@ -308,9 +308,37 @@ export function projectAlreadyWired(cwd: string, io: InjectIO): boolean {
       devDependencies?: Record<string, string>;
     };
     const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-    return CRUMBTRAIL_SDK_PACKAGES.some((name) => name in deps);
+    return CRUMBTRAIL_SDK_PACKAGES.some(
+      (name) => name in deps && sdkPackageInstalled(cwd, io, name),
+    );
   } catch {
     return false;
+  }
+}
+
+/**
+ * True when `name` resolves from `cwd` — the dependency is declared AND on disk.
+ *
+ * A declaration alone is not wiring. A repo can carry a stale range for an SDK
+ * nobody ever installed, and reading that as "already wired" skipped the app
+ * entirely: the wizard reported the service set up, injection never ran, the
+ * install never ran, and the app then failed to start on an import of a package
+ * that was not there. Walks up like node resolution so a hoisted monorepo
+ * install (root `node_modules`) counts for a nested package.
+ */
+function sdkPackageInstalled(
+  cwd: string,
+  io: InjectIO,
+  name: string,
+): boolean {
+  let dir = path.resolve(cwd);
+  for (;;) {
+    if (io.exists(path.join(dir, "node_modules", name, "package.json"))) {
+      return true;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return false;
+    dir = parent;
   }
 }
 

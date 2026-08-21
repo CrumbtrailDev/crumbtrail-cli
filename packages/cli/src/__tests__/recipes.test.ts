@@ -9,6 +9,9 @@ const ENDPOINT = "https://ingest.example.com";
 // live minted key. Injected code reads the key from an env var, never a literal.
 const KEY_PLACEHOLDER = "<your-ingest-key>";
 const p = (...parts: string[]) => path.join(CWD, ...parts);
+// A declared dependency is only wiring once it is actually on disk, so every
+// "already wired" fixture has to install the package as well as declare it.
+const installed = (pkg: string) => p("node_modules", pkg, "package.json");
 
 // A snippet/plan-content must never leak a real ingest-key literal. The historic
 // key prefixes were `ctkey_` / `bgk_` / `bl_ingest_`; guard against all of them.
@@ -286,6 +289,7 @@ describe("buildPlan — idempotency", () => {
       [p("package.json")]: JSON.stringify({
         dependencies: { "crumbtrail-core": "0.1.0" },
       }),
+      [installed("crumbtrail-core")]: "{}",
     });
     const plan = buildPlan(
       {
@@ -310,6 +314,49 @@ describe("buildPlan — idempotency", () => {
     const plan = buildPlan(
       {
         cwd: CWD,
+        recipe: "next",
+        endpoint: ENDPOINT,
+        nextVersion: "15.4.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("skip-already-wired");
+  });
+
+  it("does not skip a package that declares the SDK but never installed it", () => {
+    // The playground carried a stale `crumbtrail-core` range with nothing in
+    // node_modules. Reading the declaration as wiring skipped the app whole:
+    // the summary said the service was set up, no install ran, no injection
+    // ran, and the app then failed to boot on an unresolvable import.
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "^0.8.0" },
+      }),
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "next",
+        endpoint: ENDPOINT,
+        nextVersion: "15.4.0",
+      },
+      io,
+    );
+    expect(plan.kind).not.toBe("skip-already-wired");
+  });
+
+  it("counts a hoisted install in a parent node_modules", () => {
+    // pnpm/npm workspaces install once at the repo root, so a nested package
+    // has the SDK available with no node_modules of its own.
+    const io = fakeInjectIO({
+      [path.join(CWD, "apps", "web", "package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.36.0" },
+      }),
+      [installed("crumbtrail-core")]: "{}",
+    });
+    const plan = buildPlan(
+      {
+        cwd: path.join(CWD, "apps", "web"),
         recipe: "next",
         endpoint: ENDPOINT,
         nextVersion: "15.4.0",
@@ -743,6 +790,7 @@ describe("buildPlan — Tauri", () => {
       [p("package.json")]: JSON.stringify({
         dependencies: { "crumbtrail-core": "0.1.0" },
       }),
+      [installed("crumbtrail-core")]: "{}",
     });
     const plan = buildPlan(
       {
@@ -881,6 +929,7 @@ describe("buildPlan — backend-JS recipes (express/hono/fastify)", () => {
         [p("package.json")]: JSON.stringify({
           dependencies: { "crumbtrail-node": "0.1.0" },
         }),
+        [installed("crumbtrail-node")]: "{}",
       });
       const plan = buildPlan(
         {
@@ -1653,6 +1702,7 @@ describe("buildPlan — idempotency covers every SDK package", () => {
         [p("package.json")]: JSON.stringify({
           dependencies: { [pkg]: "0.1.0" },
         }),
+        [installed(pkg)]: "{}",
         [p(entry)]: "export default {};\n",
       });
       const plan = buildPlan(
