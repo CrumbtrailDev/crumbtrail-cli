@@ -791,6 +791,7 @@ export async function runWizard(
     base,
     token,
     projectId: provisioned.projectId,
+    projectName: provisioned.projectName,
     appDir: cwd,
     repoRoot: cwd,
     // A compile-time key (Flutter) has no env file to live in. Writing one
@@ -819,7 +820,7 @@ export async function runWizard(
         : "Set your ingest key";
 
   // User-facing links point at the app host (the SPA), not the API host.
-  const appBase = dashboardBase(base);
+  const appBase = appBaseFor(base, deps.env);
 
   // Nothing was installed and nothing was wired, so no event can arrive. Waiting
   // for one would spend the user's time on a countdown with a foregone answer,
@@ -838,7 +839,7 @@ export async function runWizard(
     ui.out(
       color.dim(
         keyReady
-          ? "Now start your dev server and load a page in your browser."
+          ? "Now start your dev server (restart it if it is already running, so it reads the new key) and load a page in your browser."
           : `${setKeyHint} — mint one at ${appBase}/settings, then start your app.`,
       ),
     );
@@ -870,7 +871,7 @@ export async function runWizard(
     } else {
       notes.push(
         keyReady
-          ? "No event yet — start your app and load a page."
+          ? "No event yet — start your app, or restart it if it was already running when the key was written, then load a page."
           : `No event yet — ${setKeyHint.toLowerCase()} and start your app.`,
       );
     }
@@ -903,6 +904,22 @@ export async function runWizard(
  * Settings › Evidence sources card). Copy is deliberately limited to adapters
  * that actually exist so it can't over-promise.
  */
+/**
+ * The dashboard origin for `base`, preferring what the deployment reported when
+ * this CLI logged in. Falls back to the hosted guess for a run with no stored
+ * login (an env token in CI), which is where the guess is right anyway.
+ */
+function appBaseFor(
+  base: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const stored = loadAuth(env);
+  return dashboardBase(
+    base,
+    stored && stored.endpoint === base ? stored.appBaseUrl : undefined,
+  );
+}
+
 function printEvidenceSourcesPointer(ui: Ui, base: string): void {
   ui.out("");
   ui.out(`  ${rule(caps().width - 4)}`);
@@ -923,7 +940,7 @@ function printEvidenceSourcesPointer(ui: Ui, base: string): void {
     color.dim("  queried at incident time and added to each bug's bundle."),
   );
   ui.out(
-    `  ${color.dim("Evidence sources:")}  ${color.brand(`${dashboardBase(base)}/settings`)}`,
+    `  ${color.dim("Evidence sources:")}  ${color.brand(`${appBaseFor(base)}/settings`)}`,
   );
 }
 
@@ -1285,6 +1302,7 @@ export async function runBatchWizard(
     base,
     token,
     projectId: project.id,
+    projectName: project.name,
     repoRoot: root,
     targets: reporting.map((o) => ({
       label: o.name,
@@ -1305,7 +1323,7 @@ export async function runBatchWizard(
     batchNotes.push("Verification skipped (--skip-verify).");
   } else if (reporting.length > 0) {
     // User-facing links point at the app host (the SPA), not the API host.
-    const appBase = dashboardBase(base);
+    const appBase = appBaseFor(base, deps.env);
     for (const o of reporting) {
       // Only the services whose key did NOT land still carry a manual step.
       // Telling someone to set a variable this run just wrote for them is how
@@ -1448,9 +1466,26 @@ function printBatchSummary(
   // knows where their repo is.
   const rel = (p: string) => path.relative(root, p) || p;
 
+  const wiredCount = outcomes.filter(
+    (o) =>
+      o.status === "wired" ||
+      o.status === "guidance" ||
+      o.status === "skipped-already-wired",
+  ).length;
   ui.out("");
-  ui.out(outcomeBar(`${g.tick}  Setup complete — project ${projectName}`));
+  // The bar states the outcome only. The project name used to ride on the end
+  // of this line, where a narrow terminal clipped it: a project called kartbug
+  // was reported back as "kartbu".
+  ui.out(
+    wiredCount === outcomes.length
+      ? outcomeBar(`${g.tick}  Setup complete`)
+      : outcomeBar(
+          `${g.warn}  Setup incomplete — ${outcomes.length - wiredCount} of ${outcomes.length} services still need you`,
+          "warn",
+        ),
+  );
   ui.out("");
+  ui.out(field("Project", color.bold(projectName)));
   for (const o of outcomes) {
     const detail =
       o.status === "failed"
@@ -1488,7 +1523,7 @@ function printBatchSummary(
   ];
   ui.out("");
   ui.out(`  ${color.dim(parts.join(caps().unicode ? " · " : " | "))}`);
-  ui.out(field("Dashboard", color.brand(`${dashboardBase(base)}/issues`)));
+  ui.out(field("Dashboard", color.brand(`${appBaseFor(base)}/issues`)));
 
   const notes = [
     ...outcomes.flatMap((o) => o.notes.map((n) => `${o.name}: ${n}`)),
@@ -1577,6 +1612,8 @@ async function writeIngestKeys(args: {
   base: string;
   token: string;
   projectId: string;
+  /** Named in the "left as it is" line, so a key from another project shows. */
+  projectName: string;
   /** The git work tree this run is in, which owns the .gitignore. */
   repoRoot: string;
   targets: KeyTarget[];
@@ -1627,7 +1664,11 @@ async function writeIngestKeys(args: {
     if (plan.kind === "already-set") {
       ui.out(
         ok(
-          `${named(label)}${color.bold(plan.varName)} is already set in ${color.brand(rel(args.repoRoot, plan.file))} — left as it is.`,
+          // Naming the project is the whole point. The value is never
+          // inspected — an ingest key cannot be resolved to its project
+          // without a read credential — so the one way a second project's key
+          // becomes visible is saying which project this run wired.
+          `${named(label)}${color.bold(plan.varName)} is already set in ${color.brand(rel(args.repoRoot, plan.file))} — left as it is. Events from this app go wherever that key points, which is only ${color.bold(args.projectName)} if it was minted there.`,
         ),
       );
       results.set(label, {
@@ -1690,6 +1731,16 @@ async function writeIngestKeys(args: {
           `${named(label)}wrote ${color.bold(plan.varName)} to ${color.brand(where)}.`,
         ),
       );
+      // A dev server that was already running holds the old environment, so it
+      // sends events with no key and gets a 401 for every one of them. Nothing
+      // downstream can tell that apart from an app nobody has opened, which is
+      // how "I set the key and nothing arrives" became the commonest question
+      // about this wizard.
+      ui.out(
+        color.dim(
+          `  Restart your dev server if it is running — it reads ${plan.varName} at startup.`,
+        ),
+      );
       if (plan.ignore) {
         // Saying this is not optional. A file that was about to be committed
         // silently is not any more, and someone who does not know that will go
@@ -1725,6 +1776,7 @@ async function writeIngestKey(args: {
   base: string;
   token: string;
   projectId: string;
+  projectName: string;
   appDir: string;
   repoRoot: string;
   varName: string | undefined;
@@ -1918,10 +1970,21 @@ function printSummary(
   keyIsCompileTime?: boolean,
 ): void {
   // User-facing links point at the app host (the SPA), not the API host.
-  const appBase = dashboardBase(base);
+  const appBase = appBaseFor(base);
   const g = glyphs();
+  // A key the wizard could not write is a step the user still has to do, and
+  // this bar was printing "Setup complete" directly above the line asking them
+  // to do it.
+  const keyOutstanding =
+    keyEnvVar !== undefined &&
+    keyWrite?.status !== "written" &&
+    keyWrite?.status !== "already-set";
   ui.out("");
-  ui.out(outcomeBar(`${g.tick}  Setup complete`));
+  ui.out(
+    keyOutstanding
+      ? outcomeBar(`${g.warn}  Setup incomplete — one step left`, "warn")
+      : outcomeBar(`${g.tick}  Setup complete`),
+  );
   ui.out("");
   ui.out(field("Project", color.bold(p.projectName)));
   ui.out(field("Service", color.bold(p.serviceName)));
@@ -2121,9 +2184,18 @@ export async function runCli(
 
   // Non-TTY guard — BEFORE any prompt. CI must pass --yes AND --project.
   if (!deps.isTTY && !(parsed.yes && parsed.project)) {
+    // Naming --project alone read as a circle: the wizard is what creates the
+    // project, so a first-time user has no id to pass and no way to get one
+    // from this message. Say where an id comes from, and that a first run
+    // belongs in a real terminal.
     deps.ui.err(
       color.red(
         "Non-interactive shell detected. Pass --yes and --project <id> to run without prompts.",
+      ),
+    );
+    deps.ui.err(
+      color.dim(
+        "Setting up for the first time? Run `npx crumbtrail` in an interactive terminal — it creates the project for you. In CI, take the id from an existing project's dashboard URL and set CRUMBTRAIL_TOKEN as well.",
       ),
     );
     deps.ui.err("");
