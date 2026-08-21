@@ -1,7 +1,9 @@
+import { BRAND_FONT_STACK } from "../brand-type";
+
 export const WIDGET_CSS = `
   :host {
     all: initial;
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: ${BRAND_FONT_STACK};
     font-size: 14px;
     color: #e0e0e0;
   }

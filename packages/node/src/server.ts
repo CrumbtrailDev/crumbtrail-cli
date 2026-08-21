@@ -4,6 +4,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { BugEvent, Symptom } from "crumbtrail-core";
+import { BRAND_FONT_STACK } from "crumbtrail-core";
 import { buildRecallStore } from "./recall";
 import {
   locateAndAssemble,
@@ -683,7 +684,7 @@ function renderSessionPage(
   <meta charset="utf-8">
   <title>Crumbtrail session ${escapeHtml(sessionId)}</title>
   <style>
-    body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px;line-height:1.45;color:#171717}
+    body{font-family:${BRAND_FONT_STACK};margin:32px;line-height:1.45;color:#171717}
     code{background:#f4f4f5;padding:2px 4px;border-radius:4px}
     li{margin:6px 0}
   </style>

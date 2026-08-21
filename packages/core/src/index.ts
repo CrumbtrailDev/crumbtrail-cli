@@ -178,6 +178,7 @@ export type {
   ProbeStorageLike,
 } from "./probes";
 export { STACK_IDS } from "./stacks";
+export { BRAND_FONT_STACK, BRAND_MONO_STACK } from "./brand-type";
 export type { Stack } from "./stacks";
 export {
   CAPSULE_SCHEMA_VERSION,
