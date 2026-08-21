@@ -4,6 +4,7 @@
 // stays network-free.
 
 import { createHash, randomBytes } from "node:crypto";
+import { BRAND_FONT_STACK } from "crumbtrail-core";
 import { spawn } from "node:child_process";
 import {
   chmodSync,
@@ -172,7 +173,7 @@ export interface CallbackServer {
 }
 
 const CALLBACK_PAGE = `<!doctype html><html><head><meta charset="utf-8"><title>Crumbtrail CLI</title>
-<style>body{font-family:system-ui,sans-serif;background:radial-gradient(circle at top,#16341f33,transparent 34rem),#0f172a;color:#e2e8f0;display:grid;place-items:center;min-height:100vh;margin:0}
+<style>body{font-family:${BRAND_FONT_STACK};background:radial-gradient(circle at top,#16341f33,transparent 34rem),#0f172a;color:#e2e8f0;display:grid;place-items:center;min-height:100vh;margin:0}
 .card{background:#1e293b;border:1px solid #334155;padding:2rem 2.5rem;border-radius:12px;text-align:center;box-shadow:0 24px 80px rgba(2,6,23,.5)}
 h1{color:#22c55e;margin:0 0 .5rem;font-size:1.25rem}p{margin:0;color:#94a3b8}</style></head>
 <body><div class="card"><h1>Crumbtrail connected ✓</h1><p>You can close this tab and return to your terminal.</p></div></body></html>`;
