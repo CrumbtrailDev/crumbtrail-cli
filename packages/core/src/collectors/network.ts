@@ -23,10 +23,11 @@ import {
   resolveOutboundCorrelation,
 } from "../correlation";
 import {
+  EARLY_MAX_ENTRIES,
   drainEarlyCapture,
   type EarlyRequestRecord,
 } from "../early-capture";
-import { now } from "../utils";
+import { now, readStructuredBody } from "../utils";
 import { captureCallStack } from "../call-stack";
 
 /* ------------------------------------------------------------------ */
@@ -318,53 +319,6 @@ function extractRequestBody(
   const readable = readStructuredBody(body);
   if (readable !== undefined) return { body: readable, nonText: false };
   return { nonText: true };
-}
-
-/**
- * Bodies that are not strings but are still readable text.
- *
- * `fetch(url, { body: new URLSearchParams(form) })` and `body: new FormData(form)` are how a form
- * submission is normally written, and both were discarded whole as "non-text". Every field a user
- * filled in - the quantity that was wrong, the address that was rejected, the id of the record
- * being edited - went missing from the capture for no reason other than the container it arrived
- * in. Both are read without consuming them, and the same body redaction runs over the result.
- *
- * File parts are described, never read. The form FIELD name survives as the JSON key, which is the
- * part that matters - a reader needs to know the upload was attached to `invoice`, not what the
- * document said. The file's own name and MIME type are free text and answer to the same value rules
- * as any other string in a body, which redact them; only the byte count is kept, because a size is
- * shape and not content.
- */
-function readStructuredBody(body: unknown): string | undefined {
-  try {
-    if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
-      return body.toString();
-    }
-    if (typeof FormData !== "undefined" && body instanceof FormData) {
-      const fields: Record<string, unknown> = {};
-      for (const [key, value] of body.entries()) {
-        const described =
-          typeof value === "string"
-            ? value
-            : describeFilePart(value as { size?: number });
-        const existing = fields[key];
-        if (existing === undefined) fields[key] = described;
-        else if (Array.isArray(existing)) existing.push(described);
-        else fields[key] = [existing, described];
-      }
-      return JSON.stringify(fields);
-    }
-  } catch {
-    // An exotic host implementation is reported as non-text, exactly as before.
-  }
-  return undefined;
-}
-
-function describeFilePart(file: { size?: number }): Record<string, unknown> {
-  return {
-    file: true,
-    ...(typeof file.size === "number" ? { bytes: file.size } : {}),
-  };
 }
 
 function getHeaderValue(
@@ -1329,7 +1283,11 @@ function emitEarlyRecord(
  * Drains the `crumbtrail-core/early` queue into the bus and defers the early
  * patch permanently. A no-op when the early module was never imported.
  */
-function drainEarlyRequests(bus: EventBus, config: CrumbtrailConfig): void {
+function drainEarlyRequests(
+  bus: EventBus,
+  config: CrumbtrailConfig,
+  context?: CollectorContext,
+): void {
   const emit = (record: EarlyRequestRecord) => {
     if (shouldExclude(record.url, config)) return;
     try {
@@ -1338,11 +1296,49 @@ function drainEarlyRequests(bus: EventBus, config: CrumbtrailConfig): void {
       // One malformed record never costs the rest of the queue.
     }
   };
+
+  // The queue is one-shot: `drain()` empties it and can never be re-run, while
+  // the bus refuses every event until the remote capture policy lands. Emitting
+  // into that window destroys the records — and they are the requests that
+  // rendered the first screen, already stamped with the correlation headers the
+  // backend recorded, so their loss orphans backend evidence with nothing left
+  // to say it happened. So the drain still runs first (the early patch must stop
+  // taking new requests before the live patch below is installed, or every
+  // request would be captured twice), but the records are HELD here until
+  // admission is decided, then released or discarded.
+  let release: "holding" | "open" | "denied" = "open";
+  const held: EarlyRequestRecord[] = [];
+  const accept = (record: EarlyRequestRecord) => {
+    if (release === "denied") return;
+    if (release === "open") {
+      emit(record);
+      return;
+    }
+    held.push(record);
+    // The same cap the early queue itself carries; nothing may grow unbounded
+    // in a page Crumbtrail did not write.
+    while (held.length > EARLY_MAX_ENTRIES) held.shift();
+  };
+
+  if (context?.whenCaptureAdmitted) {
+    release = "holding";
+    context.whenCaptureAdmitted((admitted) => {
+      if (!admitted) {
+        release = "denied";
+        held.length = 0;
+        return;
+      }
+      release = "open";
+      const pending = held.splice(0, held.length);
+      for (const record of pending) emit(record);
+    });
+  }
+
   // The sink catches the requests still on the wire at this instant. They are
   // the page's first data load more often than not, and before the sink existed
   // they were captured by neither side: the early patch stopped recording at the
   // drain, and the patch below was installed after they were issued.
-  for (const record of drainEarlyCapture(emit)) emit(record);
+  for (const record of drainEarlyCapture(accept)) accept(record);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1356,7 +1352,7 @@ export function networkCollector(
 ): CollectorCleanup {
   // Drain before patching: the queued requests happened before this collector
   // existed, so they belong at the head of the network timeline.
-  drainEarlyRequests(bus, config);
+  drainEarlyRequests(bus, config, context);
 
   const originalFetch = globalThis.fetch;
   const shouldPatchFetch = typeof originalFetch === "function";

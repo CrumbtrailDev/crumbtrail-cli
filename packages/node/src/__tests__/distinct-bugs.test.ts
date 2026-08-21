@@ -1,9 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { BugEvent } from "crumbtrail-core";
-import {
-  buildDistinctBugSignature,
-  groupDistinctBugs,
-} from "../distinct-bugs";
+import { buildDistinctBugSignature, groupDistinctBugs } from "../distinct-bugs";
 import { computeDistinctBugSignatures } from "../index";
 import type { EvidenceCandidate } from "../evidence-index";
 
@@ -187,16 +184,18 @@ describe("groupDistinctBugs", () => {
       response: expect.stringContaining("[REDACTED_KEY]"),
     });
     expect(bug.representative.bodySnippet?.request).toContain("amount=42");
-    expect(bug.representative.bodySnippet?.response).toContain("payment failed");
+    expect(bug.representative.bodySnippet?.response).toContain(
+      "payment failed",
+    );
     expect(JSON.stringify(bug.representative.bodySnippet)).not.toContain(
       "supersecret",
     );
     expect(bug.representative.bodySnippet?.request?.length).toBeLessThanOrEqual(
       300,
     );
-    expect(bug.representative.bodySnippet?.response?.length).toBeLessThanOrEqual(
-      300,
-    );
+    expect(
+      bug.representative.bodySnippet?.response?.length,
+    ).toBeLessThanOrEqual(300);
   });
 
   it("omits the representative body snippet when the failed request has no bodies", () => {
@@ -481,9 +480,7 @@ describe("buildDistinctBugSignature", () => {
         bug("/jobs/550e8400-e29b-41d4-a716-446655440000"),
       ),
     ).toBe(idSignature);
-    expect(buildDistinctBugSignature(bug("/jobs/deadbeef"))).toBe(
-      idSignature,
-    );
+    expect(buildDistinctBugSignature(bug("/jobs/deadbeef"))).toBe(idSignature);
     expect(buildDistinctBugSignature(bug("/jobs/feedback"))).not.toBe(
       idSignature,
     );
@@ -522,16 +519,18 @@ describe("buildDistinctBugSignature", () => {
     });
 
     expect(signatures.legacy).toBe("bugsig:1du09jm");
-    expect(buildDistinctBugSignature({
-      title: "Unhandled rejection: Failed to fetch",
-      representative: {
+    expect(
+      buildDistinctBugSignature({
         title: "Unhandled rejection: Failed to fetch",
-        detector: "unhandled_rejection",
-        severity: "high",
-        message: "Unhandled rejection: Failed to fetch",
-        route: "https://alertbase.ai/dashboard/jobs?tab=2#x",
-      },
-    })).toBe(signatures.current);
+        representative: {
+          title: "Unhandled rejection: Failed to fetch",
+          detector: "unhandled_rejection",
+          severity: "high",
+          message: "Unhandled rejection: Failed to fetch",
+          route: "https://alertbase.ai/dashboard/jobs?tab=2#x",
+        },
+      }),
+    ).toBe(signatures.current);
   });
 });
 
@@ -594,5 +593,147 @@ describe("repeated multi-candidate request clusters", () => {
       events,
     );
     expect(bugs).toHaveLength(2);
+  });
+});
+
+// The recurrence signature used to run `\d+` -> `#` over the whole message, so
+// "HTTP 403 from POST /login" and "HTTP 500 from POST /login" hashed to one
+// canonical issue. The cloud's grouping layer keeps 403 and 500 apart; identity
+// must not re-merge them here.
+describe("http status codes survive signature normalization", () => {
+  const httpBug = (status: number) => ({
+    title: `HTTP ${status} from POST /api/login`,
+    representative: {
+      title: `HTTP ${status} from POST /api/login`,
+      detector: "http_error",
+      severity: "high" as const,
+      message: `HTTP ${status} from POST /api/login`,
+      route: "/login",
+      method: "POST",
+      status,
+    },
+  });
+
+  it("keeps a 403 and a 500 on one endpoint distinct", () => {
+    expect(buildDistinctBugSignature(httpBug(403))).not.toBe(
+      buildDistinctBugSignature(httpBug(500)),
+    );
+  });
+
+  it("keeps axios-style status-code phrasing distinct", () => {
+    const bug = (status: number) => ({
+      title: "Request failed",
+      representative: {
+        title: "Request failed",
+        detector: "http_error",
+        severity: "high" as const,
+        message: `Request failed with status code ${status}`,
+        route: "/login",
+      },
+    });
+    expect(buildDistinctBugSignature(bug(404))).not.toBe(
+      buildDistinctBugSignature(bug(502)),
+    );
+  });
+
+  it("still collapses genuinely variable numbers", () => {
+    const bug = (id: number) => ({
+      title: "Invoice missing",
+      representative: {
+        title: "Invoice missing",
+        detector: "db_mutation",
+        severity: "high" as const,
+        message: `Invoice ${id} ranked 3 instead of 1`,
+        route: "/jobs/invoice-digest",
+      },
+    });
+    expect(buildDistinctBugSignature(bug(123))).toBe(
+      buildDistinctBugSignature(bug(4567)),
+    );
+  });
+
+  it("keeps in-session 403 and 500 clusters apart", () => {
+    const bugs = groupDistinctBugs([
+      candidate({
+        id: "cand_403",
+        detector: "http_error",
+        title: "HTTP 403 from POST /api/login",
+        severity: "high",
+        score: 70,
+        anchor: {
+          t: 1000,
+          route: "/login",
+          requestId: "req-403",
+          method: "POST",
+          url: "https://app.example.com/api/login",
+          status: 403,
+        },
+      }),
+      candidate({
+        id: "cand_500",
+        detector: "http_error",
+        title: "HTTP 500 from POST /api/login",
+        severity: "high",
+        score: 90,
+        anchor: {
+          t: 1200,
+          route: "/login",
+          requestId: "req-500",
+          method: "POST",
+          url: "https://app.example.com/api/login",
+          status: 500,
+        },
+      }),
+    ]);
+    expect(bugs).toHaveLength(2);
+    expect(
+      new Set(bugs.map((bug) => buildDistinctBugSignature(bug))).size,
+    ).toBe(2);
+  });
+});
+
+// The failing request's url reached the anchor and then stopped: representative
+// and the evidence refs had no url field, so the cloud could not build a
+// resource-level route key and unrelated single-page-app failures merged.
+describe("the failing request url reaches the representative", () => {
+  const bugs = groupDistinctBugs([
+    candidate({
+      id: "cand_url",
+      detector: "http_error",
+      title: "HTTP 500 from POST /api/pay",
+      severity: "high",
+      score: 90,
+      anchor: {
+        t: 1000,
+        route: "/checkout",
+        requestId: "req-url",
+        method: "POST",
+        url: "https://app.example.com/api/pay",
+        status: 500,
+      },
+    }),
+  ]);
+
+  it("carries anchor.url onto representative", () => {
+    expect(bugs[0].representative.url).toBe("https://app.example.com/api/pay");
+  });
+
+  it("carries anchor.url onto the evidence ref", () => {
+    expect(bugs[0].frontendEvidence[0].url).toBe(
+      "https://app.example.com/api/pay",
+    );
+  });
+
+  it("omits url when the candidate has none", () => {
+    const [bug] = groupDistinctBugs([
+      candidate({
+        id: "cand_nourl",
+        detector: "console_error",
+        title: "Console error: boom",
+        anchor: { t: 1000, message: "boom" },
+      }),
+    ]);
+    expect("url" in bug.representative).toBe(false);
+    expect("url" in bug.frontendEvidence[0]).toBe(false);
   });
 });

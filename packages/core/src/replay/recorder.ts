@@ -39,9 +39,9 @@ import {
 import {
   NodeIds,
   isExcluded,
+  isRecordableAttribute,
   maskText,
   maskValue,
-  serializeAttributes,
   serializeNode,
   type SerializeOptions,
 } from "./serialize";
@@ -407,6 +407,11 @@ export class ReplayRecorder {
         const target = record.target as Element;
         const id = this.ids.known(target);
         if (id === undefined || !record.attributeName) continue;
+        // The same filter the opening snapshot applies. Without it a page that
+        // writes a form value through setAttribute puts the raw value into the
+        // chunk, and the snapshot's careful exclusion of `value`, `nonce`,
+        // `integrity` and `on*` lasts exactly until the first mutation.
+        if (!isRecordableAttribute(record.attributeName)) continue;
         const value = target.getAttribute(record.attributeName);
         attrs.push([
           id,

@@ -139,6 +139,18 @@ export async function startStubCloud(opts) {
     ) {
       return send(res, 200, { apiKey });
     }
+    // One key covers a whole project, so this — not the per-service route above
+    // — is what the wizard calls (provision.ts createIngestKey). Without it the
+    // mint failed, the wizard wrote no .env, and every recipe's key reached the
+    // app only because this harness handed it over through the environment:
+    // the exact reason a middleware that reads the key at module load looked
+    // healthy here while capturing nothing on a real install.
+    if (
+      req.method === "POST" &&
+      urlPath.match(/^\/api\/projects\/([^/]+)\/keys$/)
+    ) {
+      return send(res, 200, { keyId: "key_stub_0001", apiKey });
+    }
 
     // ── login (device / browser token exchange) — unused when auth is seeded ─
     if (req.method === "POST" && urlPath === "/api/cli/device") {

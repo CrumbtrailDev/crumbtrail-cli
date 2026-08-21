@@ -41,8 +41,86 @@ describe("keystrokeCollector", () => {
     expect(events).toHaveLength(1);
     expect(events[0].k).toBe("key");
     expect(events[0].d.key).toBe("*");
-    expect(events[0].d.code).toBe("KeyA");
+    // Masked, so the class rather than the physical key (see the leak test below).
+    expect(events[0].d.code).toBe("Letter");
     expect(events[0].d.dir).toBe("dn");
+  });
+
+  // A masked `key` is worth nothing if `code` still names the physical key:
+  // `{key:"*",code:"KeyH"}{key:"*",code:"KeyU"}...` spells the password out, and
+  // `mod:"s"` restores its capitalization. The assertion is on the whole
+  // serialized event, not on a sibling field, because the tests above assert
+  // `key === "*"` and never looked at `code`.
+  it("leaves no trace of a masked character anywhere in the event", () => {
+    const input = document.createElement("input");
+    input.type = "password";
+    document.body.appendChild(input);
+
+    const typed: Array<[string, string]> = [
+      ["h", "KeyH"],
+      ["U", "KeyU"],
+      ["n", "KeyN"],
+      ["7", "Digit7"],
+      ["!", "Digit1"],
+    ];
+    for (const [key, code] of typed) {
+      dispatchKey("keydown", {
+        key,
+        code,
+        target: input,
+        shiftKey: key === "U" || key === "!",
+      });
+    }
+    bus.flush();
+
+    const serialized = JSON.stringify(events);
+    for (const [, code] of typed) {
+      expect(serialized).not.toContain(code);
+    }
+    expect(events).toHaveLength(typed.length);
+    expect(events.map((event) => event.d.key)).toEqual([
+      "*",
+      "*",
+      "*",
+      "*",
+      "*",
+    ]);
+    // The class survives, so the rhythm and shape of the entry stay readable
+    // without the characters.
+    expect(events.map((event) => event.d.code)).toEqual([
+      "Letter",
+      "Letter",
+      "Letter",
+      "Digit",
+      "Digit",
+    ]);
+
+    input.remove();
+  });
+
+  // Navigation and control keys type no character, and they are the ones worth
+  // reading `code` for: Tab order, Enter submitting a half-filled form.
+  it("keeps the real code for keys that type nothing", () => {
+    const input = document.createElement("input");
+    input.type = "password";
+    document.body.appendChild(input);
+
+    dispatchKey("keydown", { key: "Tab", code: "Tab", target: input });
+    dispatchKey("keydown", { key: "Enter", code: "Enter", target: input });
+    dispatchKey("keydown", {
+      key: "ArrowLeft",
+      code: "ArrowLeft",
+      target: input,
+    });
+    bus.flush();
+
+    expect(events.map((event) => event.d.code)).toEqual([
+      "Tab",
+      "Enter",
+      "ArrowLeft",
+    ]);
+
+    input.remove();
   });
 
   it("captures keyup events", () => {

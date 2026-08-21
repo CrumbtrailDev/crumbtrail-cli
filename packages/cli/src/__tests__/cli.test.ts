@@ -382,6 +382,27 @@ describe("wizard orchestration", () => {
     expect(out).toContain("/app/src/main.ts"); // injection names the file
   });
 
+  it("names the app it just created in the injected init", async () => {
+    // The wizard provisions the service and prints its name, then wired code
+    // that reported under no app at all: sessions arrived project-scoped and
+    // unattributed, invisible to the confirm step that matches by service.
+    const steps: string[] = [];
+    const seen: (string | null | undefined)[] = [];
+    const deps = makeDeps(
+      { steps },
+      {
+        buildPlan: vi.fn((input: { serviceName?: string | null }) => {
+          steps.push("build");
+          seen.push(input.serviceName);
+          return createPlan();
+        }) as unknown as WizardDeps["buildPlan"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    // provisionFlow returned serviceName "web".
+    expect(seen).toEqual(["web"]);
+  });
+
   it("opens the live session in the browser on the first real event", async () => {
     const steps: string[] = [];
     const openBrowserFn = vi.fn(async () => true);
@@ -911,6 +932,89 @@ describe("batch installer (monorepo root)", () => {
     expect(out).toContain("2 wired");
     expect(out).toContain("1 failed");
     expect(out).toContain("Re-run `crumbtrail` to retry");
+  });
+
+  it("injects the name it PROVISIONED, not the raw package name", async () => {
+    // apps/web is published as @acme/web; the service is provisioned as `web`
+    // (inferServiceName strips the scope, uniqueServiceNames de-collides). If
+    // the injected init says "@acme/web" the sessions are filed under a label no
+    // provisioned service has, and the batch verify — which polls the
+    // PROVISIONED service ids — can never match, so every service reports
+    // "No event yet" while events are landing.
+    const steps: string[] = [];
+    const seen: (string | null | undefined)[] = [];
+    const deps = batchDeps(
+      steps,
+      [candidate({ relDir: "apps/web", name: "@acme/web", recipe: "next" })],
+      {
+        buildPlan: vi.fn((input: { cwd: string; serviceName?: string }) => {
+          steps.push(`build:${input.cwd}`);
+          seen.push(input.serviceName);
+          return { ...createPlan(), targetPath: `${input.cwd}/src/main.ts` };
+        }) as unknown as WizardDeps["buildPlan"],
+      },
+    );
+    const code = await runCli(["node", "cli"], deps);
+    expect(code).toBe(0);
+    expect(steps).toContain("provision:web");
+    expect(seen).toEqual(["web"]);
+  });
+
+  it("says what actually happened when the SDK install failed", async () => {
+    // Zero files touched is not the same as "already wired": wiring is withheld
+    // on purpose when the SDK could not be installed. Reporting that row as
+    // "already wired — skipped" tells the user a service is set up when nothing
+    // happened to it.
+    const steps: string[] = [];
+    const deps = batchDeps(
+      steps,
+      [candidate({ relDir: "services/api", recipe: "express" })],
+      {
+        installSdk: vi.fn(async (input: { cwd: string }) => {
+          steps.push(`install:${input.cwd}`);
+          return {
+            installed: false,
+            packages: ["crumbtrail-core", "crumbtrail-node"],
+            note: "npm install failed (offline registry).",
+          };
+        }) as unknown as WizardDeps["installSdk"],
+      },
+    );
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).not.toContain("already wired");
+    expect(out).toContain("not wired");
+    expect(out).toContain("crumbtrail-core, crumbtrail-node");
+  });
+
+  it("says what actually happened when the user declined the edit", async () => {
+    const steps: string[] = [];
+    const deps = batchDeps(
+      steps,
+      [candidate({ relDir: "apps/web", recipe: "next" })],
+      {
+        buildPlan: vi.fn((input: { cwd: string }) => {
+          steps.push(`build:${input.cwd}`);
+          return {
+            ...createPlan(),
+            kind: "needs-confirm-dirty" as const,
+            targetPath: `${input.cwd}/src/main.ts`,
+          };
+        }) as unknown as WizardDeps["buildPlan"],
+      },
+    );
+    // Decline the "prepend into a dirty file anyway?" question.
+    deps.prompter = { ...deps.prompter, confirm: async () => false };
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).not.toContain("already wired");
+    expect(out).toContain("not wired");
   });
 
   it("does not mint a key for an already-wired service", async () => {

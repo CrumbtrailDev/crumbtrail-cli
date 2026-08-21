@@ -5,8 +5,23 @@ import { captureCallStack } from "../call-stack";
 import {
   attachRedactionMetadata,
   redactNetworkTextBody,
+  type PayloadSummary,
   type RedactionMetadata,
 } from "../redaction";
+
+/**
+ * What to store when redaction returned no body.
+ *
+ * `?? ""` erased the whole log line. `redactNetworkTextBody` overrides a
+ * declared `text/plain` whenever `looksLikeJson` is true, so
+ * `console.log("{userId: 42, status: failed}")` — JSON-shaped and not JSON —
+ * fails JSON.parse, comes back with only a summary, and the argument became an
+ * empty string even though nothing sensitive was found. error.ts has always
+ * handled this case with a placeholder; console did not.
+ */
+function bodyPlaceholder(summary: PayloadSummary | undefined): string {
+  return summary ? `[${summary.action}:${summary.reason}]` : "[REDACTED]";
+}
 
 const LEVEL_MAP: Record<string, string> = {
   log: "log",
@@ -28,7 +43,7 @@ function redactConsoleArg(
       path,
     });
     return {
-      value: safeStringify(result.body ?? ""),
+      value: safeStringify(result.body ?? bodyPlaceholder(result.bodySummary)),
       metadata: result.metadata,
     };
   }

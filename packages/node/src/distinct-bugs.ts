@@ -21,6 +21,13 @@ export interface DistinctBugEvidenceRef {
   method?: string;
   status?: number;
   route?: string;
+  /**
+   * The failing REQUEST's url, already redacted at candidate-build time. Kept
+   * beside `route` (the page the request was made from) rather than folded into
+   * it: on a single-page app every request shares one page route, so the page
+   * alone cannot tell two unrelated failures apart.
+   */
+  url?: string;
   target?: TargetDescriptor;
   message?: string;
 }
@@ -45,6 +52,14 @@ export interface DistinctBug {
     severity: DistinctBugSeverity;
     message?: string;
     route?: string;
+    /**
+     * The failing REQUEST's url, carried from the winning candidate's anchor
+     * and already redacted there (query values are stripped before it is ever
+     * set). `route` is the PAGE; this is the resource that failed, and it is
+     * what a consumer needs to key one incident to one endpoint instead of
+     * merging every failure that happened on one single-page-app page.
+     */
+    url?: string;
     method?: string;
     status?: number;
     target?: TargetDescriptor;
@@ -513,7 +528,9 @@ function buildBug(
     new Set(
       candidates
         .map((candidate) => candidate.anchor.route)
-        .filter((route): route is string => typeof route === "string" && route !== ""),
+        .filter(
+          (route): route is string => typeof route === "string" && route !== "",
+        ),
     ),
   ).sort((a, b) => a.localeCompare(b));
 
@@ -532,6 +549,7 @@ function buildBug(
       severity: representative.severity,
       message: representative.anchor.message,
       route: representative.anchor.route,
+      url: representative.anchor.url,
       method: representative.anchor.method,
       status: representative.anchor.status,
       target: representative.anchor.target,
@@ -647,6 +665,7 @@ function toEvidenceRef(candidate: EvidenceCandidate): DistinctBugEvidenceRef {
     method: candidate.anchor.method,
     status: candidate.anchor.status,
     route: candidate.anchor.route,
+    url: candidate.anchor.url,
     target: candidate.anchor.target,
     message: candidate.anchor.message,
   }) as DistinctBugEvidenceRef;
@@ -681,11 +700,72 @@ function normalizeText(source: string): string {
     .trim();
 }
 
+/**
+ * An HTTP status code named in the text, together with the phrasing that makes
+ * it a status code rather than a quantity: `HTTP 403`, `HTTP/1.1 500`,
+ * `status 404`, `status code 502`, `code: 401`, `returned 503`,
+ * `responded with 429`. Only 1xx-5xx three-digit runs qualify, and a longer
+ * digit run (an id that happens to start 404...) never does.
+ */
+const HTTP_STATUS_IN_TEXT =
+  /((?:^|[^a-z\d])(?:http\/\d(?:\.\d)?|http|https|status(?:\s+code)?|code|returned|responded\s+with)[\s:=]+)([1-5]\d{2})(?!\d)/g;
+
+const DIGIT_LETTERS = "abcdefghij";
+/**
+ * Delimiter wrapped around a shielded status code. A control character, so it
+ * can never collide with an ordinary word spelled from the letters a-j and turn
+ * that word back into digits.
+ */
+const SHIELD = "\u0001";
+/** Digits as delimited letters, so the digit-run collapse cannot reach them. */
+function shieldDigits(code: string): string {
+  const letters = Array.from(
+    code,
+    (digit) => DIGIT_LETTERS[Number(digit)],
+  ).join("");
+  return `${SHIELD}${letters}${SHIELD}`;
+}
+
+/**
+ * Splitting on the delimiter rather than matching a pattern containing it: the
+ * odd segments are exactly the shielded runs, and no control character has to
+ * appear inside a regular expression.
+ */
+function unshieldDigits(text: string): string {
+  return text
+    .split(SHIELD)
+    .map((segment, position) =>
+      position % 2 === 1 && /^[a-j]+$/.test(segment)
+        ? Array.from(segment, (letter) =>
+            String(DIGIT_LETTERS.indexOf(letter)),
+          ).join("")
+        : segment,
+    )
+    .join("");
+}
+
+/**
+ * Normalizes a message for the recurrence signature: digit runs collapse to `#`
+ * so ids, counters and timestamps embedded in a message do not split one
+ * recurring bug into many.
+ *
+ * HTTP status codes are the exception and survive intact. `HTTP 403 from POST
+ * /login` and `HTTP 500 from POST /login` are different failures with different
+ * fixes, and collapsing both to `http # from post /login` re-merged, at
+ * identity time, exactly what the grouping layer works to keep apart.
+ */
 function normalizeRecurrenceText(source: string): string {
-  return source
-    .toLowerCase()
-    .replace(/\[redacted\]/g, "")
-    .replace(/\d+/g, "#")
+  return unshieldDigits(
+    source
+      .toLowerCase()
+      .replace(/\[redacted\]/g, "")
+      .replace(
+        HTTP_STATUS_IN_TEXT,
+        (_match, prefix: string, code: string) =>
+          `${prefix}${shieldDigits(code)}`,
+      )
+      .replace(/\d+/g, "#"),
+  )
     .replace(/\s+/g, " ")
     .trim();
 }

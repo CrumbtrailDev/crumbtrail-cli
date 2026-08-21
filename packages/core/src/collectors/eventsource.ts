@@ -55,7 +55,8 @@ export function eventSourceCollector(
       let count = 0;
       const previousEnd = lastEnded.get(href);
       const reopen =
-        previousEnd !== undefined && now() - previousEnd <= SSE_REOPEN_WINDOW_MS;
+        previousEnd !== undefined &&
+        now() - previousEnd <= SSE_REOPEN_WINDOW_MS;
 
       try {
         this.addEventListener("open", () => {

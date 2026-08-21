@@ -130,14 +130,45 @@ export function nodeInitSnippet(
     "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
     "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
     `// from ${keyExpr} — set it in your .env (get your key from the`,
-    "// Crumbtrail dashboard). Express apps can also add",
-    "// createCrumbtrailExpressMiddleware for per-request capture.",
+    "// Crumbtrail dashboard).",
     'import("crumbtrail-node")',
     // The token is passed rather than left to the SDK's own default so the
     // snippet reads the framework's variable rather than whatever the SDK
     // happens to fall back to.
     `  .then(({ autoCapture }) => autoCapture({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr}${serviceArg(serviceName, JSON.stringify)} }))`,
     "  .catch(() => {});",
+  ].join("\n");
+}
+
+/**
+ * Guarded `.env` load, emitted with the Express middleware wiring.
+ *
+ * The middleware options object (`{ endpoint, authToken: process.env.<VAR> }`)
+ * is built while the entry module is evaluated. Nothing has loaded the project's
+ * `.env` by then: `autoCapture` loads it itself, but it is reached through a
+ * dynamic import that resolves in a later microtask, after every `app.use(...)`
+ * line has already run. Without this the middleware carries no token,
+ * `sendBackendEvent` omits the `X-Crumbtrail-Auth` header, and every
+ * `backend.req.*` event is rejected — so crash capture works, the wizard reports
+ * success, and frontend to backend linkage stays empty forever.
+ *
+ * Only fills the key in when it is absent, and Node's own loader never
+ * overwrites a variable that is already set, so a real environment still wins.
+ * `Reflect.get` rather than `process.loadEnvFile?.()` so the emitted line also
+ * type checks in a TypeScript entry whose `@types/node` predates Node 20.12.
+ */
+export function expressEnvPreloadSnippet(keyEnvVar: string): string {
+  return [
+    `// Crumbtrail — load .env so ${keyEnvVar} is set before the middleware below`,
+    "// reads it (the middleware options are built as this file is evaluated).",
+    `if (!process.env.${keyEnvVar}) {`,
+    "  try {",
+    '    const loadEnvFile = Reflect.get(process, "loadEnvFile");',
+    '    if (typeof loadEnvFile === "function") loadEnvFile.call(process);',
+    "  } catch {",
+    "    // No .env, or Node < 20.12: keep whatever the environment already has.",
+    "  }",
+    "}",
   ].join("\n");
 }
 
@@ -223,8 +254,7 @@ export function nestInitSnippet(
     "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
     "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
     `// from ${keyExpr} — set it in your .env (get your key from the`,
-    "// Crumbtrail dashboard). Express apps can also add",
-    "// createCrumbtrailExpressMiddleware for per-request capture.",
+    "// Crumbtrail dashboard).",
     "import('crumbtrail-node')",
     `  .then(({ autoCapture }) => autoCapture({ endpoint: ${singleQuoted(endpoint)}, authToken: ${keyExpr}${serviceArg(serviceName, singleQuoted)} }))`,
     "  .catch(() => {});",
@@ -233,29 +263,56 @@ export function nestInitSnippet(
 
 /**
  * React Native / Expo init block. Imperative + prepend-safe: it calls
- * `createReactNativeCrumbtrail` (which runs `Crumbtrail.init` and installs the
- * global ErrorUtils crash handler) — the same posture as the node recipe. We do
- * NOT wrap a `<CrumbtrailReactNativeProvider>`, because the injection engine only
- * prepends a block or creates a file; it cannot transform JSX. The key is read
- * from `keyExpr` (Expo exposes `process.env.EXPO_PUBLIC_CRUMBTRAIL_KEY` to the
- * app bundle) rather than inlined, keeping it out of committed source.
+ * `createReactNativeCrumbtrailAsync` (which runs `Crumbtrail.init` and installs
+ * the global ErrorUtils crash handler) — the same posture as the node recipe. We
+ * do NOT wrap a `<CrumbtrailReactNativeProvider>`, because the injection engine
+ * only prepends a block or creates a file; it cannot transform JSX. The key is
+ * read from `keyExpr` (Expo exposes `process.env.EXPO_PUBLIC_CRUMBTRAIL_KEY` to
+ * the app bundle) rather than inlined, keeping it out of committed source.
+ *
+ * The AWAITED factory is the injected one on purpose, for the reason the
+ * Capacitor and Flutter recipes give: with a store it restores the session id
+ * persisted by the previous launch before init. The sync factory builds no
+ * session store, and React Native has no backing store for the core default
+ * `sessionPersistence: "session"`, so every cold start would open a fresh
+ * session — on the one platform where cold starts are the norm — and a
+ * once-a-day intermittent bug would never accumulate into one signature.
+ *
+ * `asyncStorage` says the app already depends on
+ * `@react-native-async-storage/async-storage`. The import is emitted ONLY then:
+ * Metro resolves every import at bundle time, even one inside a try, so
+ * emitting it unconditionally would turn a missing optional peer into an app
+ * that no longer builds. Without it the caller warns, and continuity waits for
+ * the peer.
+ *
+ * `.catch(() => {})` because this is prepended at the very top of an entry file
+ * — a rejected floating promise there would surface as an unhandled rejection
+ * in the app's own error reporting, and telemetry setup must never do that.
  */
 export function reactNativeInitSnippet(
   endpoint: string,
   keyExpr: string,
   serviceName?: string | null,
+  asyncStorage = false,
 ): string {
   return [
-    'import { createReactNativeCrumbtrail } from "crumbtrail-react-native";',
+    ...(asyncStorage
+      ? [
+          'import AsyncStorage from "@react-native-async-storage/async-storage";',
+        ]
+      : []),
+    'import { createReactNativeCrumbtrailAsync } from "crumbtrail-react-native";',
     "",
-    "createReactNativeCrumbtrail({",
+    "createReactNativeCrumbtrailAsync({",
+    ...(asyncStorage ? ["  asyncStorage: AsyncStorage,"] : []),
     "  config: {",
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
     remoteConfigLine("    "),
     ...serviceLines(serviceName, "    ", JSON.stringify),
     "  },",
-    "});",
+    "})",
+    "  .catch(() => {});",
   ].join("\n");
 }
 

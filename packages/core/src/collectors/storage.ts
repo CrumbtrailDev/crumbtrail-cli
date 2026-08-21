@@ -6,6 +6,7 @@ import {
   redactCookieMap,
   redactStorageKey,
   redactStoredValue,
+  uniqueOutputKey,
   type RedactionMetadata,
   type RedactionResult,
 } from "../redaction";
@@ -25,11 +26,21 @@ function parseCookies(cookieStr: string): Record<string, string> {
   return map;
 }
 
-function dumpStorage(storage: Storage): Record<string, string> {
+/**
+ * The store's current contents, minus anything the deployment excluded.
+ *
+ * `storageExcludeKeys` gated `setItem`, `removeItem` and the cross-tab handler
+ * and not this, so a key already present at `init()` had its NAME published in
+ * the opening snapshot despite an explicit opt-out.
+ */
+function dumpStorage(
+  storage: Storage,
+  excludeKeys: Set<string>,
+): Record<string, string> {
   const map: Record<string, string> = {};
   for (let i = 0; i < storage.length; i++) {
     const key = storage.key(i);
-    if (key !== null) {
+    if (key !== null && !excludeKeys.has(key)) {
       map[key] = storage.getItem(key) ?? "";
     }
   }
@@ -46,12 +57,16 @@ function redactStorageSnapshot(
 
   for (const [key, value] of Object.entries(values)) {
     const keyResult = redactStorageKey(key, `${type}.key`);
+    // Every sensitive key redacts to one constant, so `authToken`,
+    // `refreshToken` and `user_session_secret` used to write a single entry.
+    // The suffix keeps the count honest without naming anything.
+    const outKey = uniqueOutputKey(keyResult.value, out);
     const valueResult = redactStoredValue(value, {
       key,
       maxLength: maxLen,
-      path: `${type}.${keyResult.value}.value`,
+      path: `${type}.${outKey}.value`,
     });
-    out[keyResult.value] = valueResult.value;
+    out[outKey] = valueResult.value;
     metadataItems.push(keyResult.metadata, valueResult.metadata);
   }
 
@@ -159,12 +174,12 @@ export function storageCollector(
     config.cookieMaskNames,
   );
   const localStorageSnap = redactStorageSnapshot(
-    dumpStorage(localStorage),
+    dumpStorage(localStorage, excludeKeys),
     "localStorage",
     maxLen,
   );
   const sessionStorageSnap = redactStorageSnapshot(
-    dumpStorage(sessionStorage),
+    dumpStorage(sessionStorage, excludeKeys),
     "sessionStorage",
     maxLen,
   );
@@ -247,51 +262,90 @@ export function storageCollector(
   const origSessionClear = sessionStorage.clear.bind(sessionStorage);
 
   // --- Patched method factories ---
+  function recordSet(
+    type: "local" | "session",
+    storage: Storage,
+    key: string,
+    value: string,
+  ): void {
+    if (!excludeKeys.has(key)) {
+      const keyResult = redactStorageKey(key, `${type}.key`);
+      const d: Record<string, unknown> = {
+        type,
+        op: "set",
+        key: keyResult.value,
+      };
+      const oldValMetadata = assignRedactedStorageValue(
+        d,
+        "oldVal",
+        redactStoredValue(storage.getItem(key), {
+          key,
+          maxLength: maxLen,
+          path: `${type}.${keyResult.value}.oldVal`,
+        }),
+      );
+      const newValMetadata = assignRedactedStorageValue(
+        d,
+        "newVal",
+        redactStoredValue(value, {
+          key,
+          maxLength: maxLen,
+          path: `${type}.${keyResult.value}.newVal`,
+        }),
+      );
+      attachRedactionMetadata(
+        d,
+        keyResult.metadata,
+        oldValMetadata,
+        newValMetadata,
+      );
+      bus.emit({
+        t: now(),
+        k: "stor",
+        d,
+      });
+    }
+  }
+
   function makeSetItem(
     type: "local" | "session",
     storage: Storage,
     origFn: (key: string, value: string) => void,
   ) {
     return function patchedSetItem(key: string, value: string) {
-      if (!excludeKeys.has(key)) {
-        const keyResult = redactStorageKey(key, `${type}.key`);
-        const d: Record<string, unknown> = {
-          type,
-          op: "set",
-          key: keyResult.value,
-        };
-        const oldValMetadata = assignRedactedStorageValue(
-          d,
-          "oldVal",
-          redactStoredValue(storage.getItem(key), {
-            key,
-            maxLength: maxLen,
-            path: `${type}.${keyResult.value}.oldVal`,
-          }),
-        );
-        const newValMetadata = assignRedactedStorageValue(
-          d,
-          "newVal",
-          redactStoredValue(value, {
-            key,
-            maxLength: maxLen,
-            path: `${type}.${keyResult.value}.newVal`,
-          }),
-        );
-        attachRedactionMetadata(
-          d,
-          keyResult.metadata,
-          oldValMetadata,
-          newValMetadata,
-        );
-        bus.emit({
-          t: now(),
-          k: "stor",
-          d,
-        });
-      }
+      recordSet(type, storage, key, value);
       return origFn(key, value);
     };
+  }
+
+  function recordRemove(
+    type: "local" | "session",
+    storage: Storage,
+    key: string,
+  ): void {
+    if (!excludeKeys.has(key)) {
+      const keyResult = redactStorageKey(key, `${type}.key`);
+      const d: Record<string, unknown> = {
+        type,
+        op: "del",
+        key: keyResult.value,
+      };
+      const oldValMetadata = assignRedactedStorageValue(
+        d,
+        "oldVal",
+        redactStoredValue(storage.getItem(key), {
+          key,
+          maxLength: maxLen,
+          path: `${type}.${keyResult.value}.oldVal`,
+        }),
+      );
+      attachRedactionMetadata(d, keyResult.metadata, oldValMetadata);
+      bus.emit({
+        t: now(),
+        k: "stor",
+        d,
+      });
+    }
   }
 
   function makeRemoveItem(
@@ -300,56 +354,79 @@ export function storageCollector(
     origFn: (key: string) => void,
   ) {
     return function patchedRemoveItem(key: string) {
-      if (!excludeKeys.has(key)) {
-        const keyResult = redactStorageKey(key, `${type}.key`);
-        const d: Record<string, unknown> = {
-          type,
-          op: "del",
-          key: keyResult.value,
-        };
-        const oldValMetadata = assignRedactedStorageValue(
-          d,
-          "oldVal",
-          redactStoredValue(storage.getItem(key), {
-            key,
-            maxLength: maxLen,
-            path: `${type}.${keyResult.value}.oldVal`,
-          }),
-        );
-        attachRedactionMetadata(d, keyResult.metadata, oldValMetadata);
-        bus.emit({
-          t: now(),
-          k: "stor",
-          d,
-        });
-      }
+      recordRemove(type, storage, key);
       return origFn(key);
     };
   }
 
+  function recordClear(type: "local" | "session"): void {
+    bus.emit({
+      t: now(),
+      k: "stor",
+      d: { type, op: "clear" },
+    });
+  }
+
   function makeClear(type: "local" | "session", origFn: () => void) {
     return function patchedClear() {
-      bus.emit({
-        t: now(),
-        k: "stor",
-        d: { type, op: "clear" },
-      });
+      recordClear(type);
       return origFn();
     };
   }
 
-  // Patch prototype (works in real browsers where instance methods resolve via prototype)
-  Storage.prototype.setItem = makeSetItem(
-    "local",
-    localStorage,
-    origProtoSetItem,
-  );
-  Storage.prototype.removeItem = makeRemoveItem(
-    "local",
-    localStorage,
-    origProtoRemoveItem,
-  );
-  Storage.prototype.clear = makeClear("local", origProtoClear);
+  /**
+   * Which store a prototype call was actually made against.
+   *
+   * The prototype patch used to hardcode `"local"` and read `oldVal` out of
+   * `localStorage`, so `Storage.prototype.setItem.call(sessionStorage, k, v)` —
+   * the usual way a wrapper bypasses an instance patch — was recorded as a
+   * local write with a previous value taken from the wrong store.
+   */
+  function storageOf(self: unknown): {
+    type: "local" | "session";
+    storage: Storage;
+  } {
+    try {
+      if (self === sessionStorage)
+        return { type: "session", storage: sessionStorage };
+      if (self instanceof Storage) return { type: "local", storage: self };
+    } catch {
+      // Cross-origin or a host without Storage: fall through to localStorage.
+    }
+    return { type: "local", storage: localStorage };
+  }
+
+  // Patch the prototype, for a call that reaches the method through it rather
+  // than through one of the two instances patched below.
+  //
+  // These wrappers are deliberately not arrow functions and they call the
+  // original with `.call(this, …)`. The original taken off `Storage.prototype`
+  // is unbound, and a real browser throws `TypeError: Illegal invocation` when
+  // it is invoked with no receiver — from inside the host page's own write, so
+  // the SDK would break the application it is there to observe. happy-dom does
+  // not, which is why the suite never saw it.
+  Storage.prototype.setItem = function patchedProtoSetItem(
+    this: Storage,
+    key: string,
+    value: string,
+  ) {
+    const { type, storage } = storageOf(this);
+    recordSet(type, storage, key, value);
+    return origProtoSetItem.call(this ?? storage, key, value);
+  };
+  Storage.prototype.removeItem = function patchedProtoRemoveItem(
+    this: Storage,
+    key: string,
+  ) {
+    const { type, storage } = storageOf(this);
+    recordRemove(type, storage, key);
+    return origProtoRemoveItem.call(this ?? storage, key);
+  };
+  Storage.prototype.clear = function patchedProtoClear(this: Storage) {
+    const { type, storage } = storageOf(this);
+    recordClear(type);
+    return origProtoClear.call(this ?? storage);
+  };
 
   // Patch instances via Object.defineProperty (works in Proxy-based environments
   // like happy-dom where direct assignment and prototype patching are bypassed)

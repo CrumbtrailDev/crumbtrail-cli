@@ -115,7 +115,9 @@ describe("pollForServices", () => {
       sleepFn: noSleep,
       // Tight budget so the state machine gives up quickly.
       config: { initialDelayMs: 1000, maxDelayMs: 1000, timeoutMs: 3000 },
-      fetchImpl: stagedFetch([[{ id: "s-web", serviceId: "svc-web" }]]),
+      // First page is the baseline snapshot (nothing existed yet); web reports
+      // after that, api never does.
+      fetchImpl: stagedFetch([[], [{ id: "s-web", serviceId: "svc-web" }]]),
     });
 
     expect(res.outcome).toBe("timedout");
@@ -138,6 +140,51 @@ describe("pollForServices", () => {
       fetchImpl: stagedFetch([[]]),
     });
     expect(res.outcome).toBe("cancelled");
+    expect(res.found).toEqual({});
+  });
+
+  it("accepts an event whose cloud timestamp lands just before wizardStart", async () => {
+    // Two unsynchronized wall clocks: the cloud can stamp startedAt a moment
+    // before the CLI opened its window. The single-package poll absorbs that
+    // (baseline ids first, bounded skew as the fallback); the batch poll passed
+    // no guard at all, so it compared with ZERO tolerance and rejected genuine
+    // first events — every service reported "No event yet" while the dashboard
+    // showed the sessions.
+    const wizardStart = Date.now();
+    const skewed = new Date(wizardStart - 30_000).toISOString();
+    const res = await pollForServices({
+      base: "http://x",
+      token: "t",
+      projectId: "p1",
+      ui: silentUi,
+      wizardStart,
+      serviceIds: ["svc-web"],
+      sleepFn: noSleep,
+      fetchImpl: stagedFetch([
+        [], // baseline snapshot: nothing existed yet
+        [{ id: "s-web", serviceId: "svc-web", startedAt: skewed }],
+      ]),
+    });
+    expect(res.outcome).toBe("found");
+    expect(res.found).toEqual({ "svc-web": "s-web" });
+  });
+
+  it("ignores a session that already existed when the wait opened", async () => {
+    // The identity baseline is what makes the skew tolerance safe: a session
+    // from an earlier run must not be reported as this run's first event.
+    const stale = { id: "s-old", serviceId: "svc-web", startedAt: null };
+    const res = await pollForServices({
+      base: "http://x",
+      token: "t",
+      projectId: "p1",
+      ui: silentUi,
+      wizardStart: Date.now(),
+      serviceIds: ["svc-web"],
+      sleepFn: noSleep,
+      config: { initialDelayMs: 1000, maxDelayMs: 1000, timeoutMs: 3000 },
+      fetchImpl: stagedFetch([[stale]]),
+    });
+    expect(res.outcome).toBe("timedout");
     expect(res.found).toEqual({});
   });
 

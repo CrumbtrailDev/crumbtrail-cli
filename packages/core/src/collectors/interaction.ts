@@ -77,7 +77,9 @@ const MAX_COVERED_ELEMENTS = 3;
  * Rounded to whole pixels and expressed as a percentage of the viewport rather than raw CSS
  * pixels, because "covers 99% of the viewport" transfers across devices and `1512x944` does not.
  */
-function describeElementBox(element: Element): Record<string, unknown> | undefined {
+function describeElementBox(
+  element: Element,
+): Record<string, unknown> | undefined {
   try {
     const rect = element.getBoundingClientRect?.();
     if (!rect) return undefined;
@@ -237,15 +239,34 @@ export function interactionCollector(
   const inputVersions = new WeakMap<Element, number>();
   const observationTimers = new Set<ReturnType<typeof setTimeout>>();
 
+  /**
+   * Whether the deployment opted this element out.
+   *
+   * `matches` tested the exact event target, so `ignoreSelectors:
+   * [".private-panel"]` captured every click on a button INSIDE the panel — the
+   * button does not match the selector. `masking.isBlocked` does the same job
+   * with `closest()`, and two opt-outs that behave differently is a
+   * configuration contract nobody can hold. The list was also never consulted
+   * by the input or submit paths, so values from an ignored subtree were
+   * captured regardless.
+   */
+  const isIgnored = (target: Element): boolean =>
+    config.ignoreSelectors.some((selector) => {
+      try {
+        return target.closest(selector) !== null;
+      } catch {
+        // An invalid selector is the integrator's typo, not a reason to throw
+        // into their page.
+        return false;
+      }
+    });
+
   // --- Clicks ---
   const onClick = (e: MouseEvent) => {
     const target = e.target;
     if (!(target instanceof Element)) return;
     if (isBlocked(target)) return;
-
-    for (const sel of config.ignoreSelectors) {
-      if (target.matches(sel)) return;
-    }
+    if (isIgnored(target)) return;
 
     const el = describeInteractionTarget(target, config);
     const d: Record<string, unknown> = {
@@ -288,13 +309,25 @@ export function interactionCollector(
     ))
       return;
     if (isBlocked(target)) return;
+    if (isIgnored(target)) return;
 
     const el = describeInteractionTarget(target, config);
     const type = target instanceof HTMLInputElement ? target.type : undefined;
+    // `maskInputTypes` was read by the keystroke collector and by nothing else,
+    // so a deployment that listed `number` to keep a 2FA code out of capture
+    // got masked keystrokes and the code itself in clear on the very next `inp`
+    // event — the classifier keeps a number, and it never saw the setting.
+    const maskedByPolicy =
+      !isUnmasked(target) &&
+      type !== undefined &&
+      config.maskInputTypes.some(
+        (entry) => entry.toLowerCase() === type.toLowerCase(),
+      );
     const redacted = redactInputValue(target.value, {
       name: target.name || undefined,
       type,
       path: "val",
+      maskedByPolicy,
     });
     // `maskAllInputs` stays the blanket for DOM snapshots and keystrokes, where there is no field
     // name and no policy to consult. This event has both, so the redaction policy decides and
@@ -342,18 +375,20 @@ export function interactionCollector(
         const name = target.getAttribute("name");
         const id = target.getAttribute("id");
         if (name || id) {
-          observed = Array.from(
-            document.querySelectorAll<
-              HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
-            >("input, textarea, select"),
-          ).find(
-            (candidate) =>
-              candidate.tagName === target.tagName &&
-              candidate.getAttribute("type") === target.getAttribute("type") &&
-              (name
-                ? candidate.getAttribute("name") === name
-                : candidate.getAttribute("id") === id),
-          ) ?? target;
+          observed =
+            Array.from(
+              document.querySelectorAll<
+                HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement
+              >("input, textarea, select"),
+            ).find(
+              (candidate) =>
+                candidate.tagName === target.tagName &&
+                candidate.getAttribute("type") ===
+                  target.getAttribute("type") &&
+                (name
+                  ? candidate.getAttribute("name") === name
+                  : candidate.getAttribute("id") === id),
+            ) ?? target;
         }
       } else if ((inputVersions.get(observed) ?? 0) !== version) {
         return;
@@ -390,6 +425,7 @@ export function interactionCollector(
     const target = e.target;
     if (!(target instanceof HTMLFormElement)) return;
     if (isBlocked(target)) return;
+    if (isIgnored(target)) return;
 
     const el = describeInteractionTarget(target, config);
     const d: Record<string, unknown> = {

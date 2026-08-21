@@ -4,6 +4,7 @@ import {
   attachRedactionMetadata,
   redactNetworkTextBody,
   redactUrl,
+  type PayloadSummary,
 } from "../redaction";
 import { now } from "../utils";
 import { bodyRedactionOptions } from "./network";
@@ -34,6 +35,12 @@ export const WORKER_MAX_MESSAGES = 40;
 export const WORKER_MAX_MESSAGES_TOTAL = 200;
 /** Redacted bytes kept per message. */
 export const WORKER_MAX_MESSAGE_BYTES = 2_048;
+/** Redacted characters kept from a worker error message. */
+const WORKER_MAX_ERROR_MESSAGE_CHARS = 300;
+
+function bodyPlaceholder(summary: PayloadSummary | undefined): string {
+  return summary ? `[${summary.action}:${summary.reason}]` : "[REDACTED]";
+}
 
 type WorkerCtor = new (
   scriptURL: string | URL,
@@ -79,10 +86,14 @@ export function workerCollector(
         emit(d);
         return;
       }
+      // No declared content type. Declaring `application/json` was the belief
+      // that the structured policy falls back to whole-value treatment when the
+      // text does not parse — it does not. A `json` kind that fails JSON.parse
+      // ends in `dropped: malformed_json_body` with no body at all, so
+      // `worker.postMessage("ready")` was replaced by a stub that blamed the
+      // application. Undeclared, `looksLikeJson` classifies, and anything that
+      // is not JSON keeps its free-text scrub.
       const result = redactNetworkTextBody(text, {
-        // A message has no Content-Type. It is structured data, and the structured policy falls
-        // back to whole-value treatment when the text does not parse.
-        contentType: "application/json",
         maxLength: WORKER_MAX_MESSAGE_BYTES,
         path: "message",
         ...bodyRedactionOptions(config),
@@ -110,7 +121,8 @@ export function workerCollector(
       let quoted = 0;
 
       const mayQuote = (): boolean =>
-        quoted < WORKER_MAX_MESSAGES && totalMessages < WORKER_MAX_MESSAGES_TOTAL;
+        quoted < WORKER_MAX_MESSAGES &&
+        totalMessages < WORKER_MAX_MESSAGES_TOTAL;
       const spend = (): void => {
         quoted += 1;
         totalMessages += 1;
@@ -129,16 +141,32 @@ export function workerCollector(
         // A worker that throws reports here and nowhere else: the page's own error handlers never
         // see it, so without this the failure leaves no trace at all.
         this.addEventListener("error", (event: ErrorEvent) => {
-          emit({
+          const d: Record<string, unknown> = {
             id: workerId,
             script,
             op: "error",
             posted,
             received,
-            ...(typeof event.message === "string"
-              ? { msg: event.message.slice(0, 300) }
-              : {}),
-          });
+          };
+          // An error message is free text the application wrote, and workers
+          // are where credentials get used: "auth failed for sk_live_…" is an
+          // ordinary thing for one to throw. Every other error surface scrubs
+          // this field (collectors/error.ts does exactly this for err/rej), and
+          // a worker error reaches no other surface — window.onerror never sees
+          // it — so an unscrubbed message here is the only copy and it is
+          // published verbatim.
+          if (typeof event.message === "string" && event.message.length > 0) {
+            // Redact first, then truncate. Truncating first can cut a token
+            // in half, and the half that survives matches no token pattern.
+            const result = redactNetworkTextBody(event.message, {
+              contentType: "text/plain",
+              path: "msg",
+            });
+            const text = result.body ?? bodyPlaceholder(result.bodySummary);
+            d.msg = text.slice(0, WORKER_MAX_ERROR_MESSAGE_CHARS);
+            attachRedactionMetadata(d, result.metadata);
+          }
+          emit(d);
         });
       } catch {
         // A host Worker without addEventListener still works; it just reports nothing.
@@ -189,7 +217,11 @@ function stringifyPayload(payload: unknown): string | undefined {
     // `{}` from a non-empty object means nothing was enumerable, which is the signature of a host
     // object rather than data.
     if (text === undefined) return undefined;
-    if (text === "{}" && Object.keys(payload).length === 0 && !isPlainObject(payload)) {
+    if (
+      text === "{}" &&
+      Object.keys(payload).length === 0 &&
+      !isPlainObject(payload)
+    ) {
       return undefined;
     }
     return text;

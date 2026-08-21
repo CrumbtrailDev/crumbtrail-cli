@@ -24,7 +24,6 @@ export {
   CRUMBTRAIL_SESSION_HEADER,
   CRUMBTRAIL_SESSION_HEADER_LOWER,
   createCrumbtrailRequestHeaders,
-  generateRequestId,
   W3C_TRACEPARENT_HEADER,
   parseTraceparent,
   formatTraceparent,

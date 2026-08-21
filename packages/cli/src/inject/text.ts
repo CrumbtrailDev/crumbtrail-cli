@@ -56,12 +56,18 @@ export function prologueEnd(lines: string[]): number {
 /**
  * True when the source already references a Crumbtrail SDK package.
  *
- * `crumbtrail_flutter` is included because Dart is the one ecosystem whose
- * package name is not spelled with a hyphen, and an underscore name would not
- * match the JS pattern — leaving a wired Flutter app to be wired a second time.
+ * Every SDK package is listed, not just the two the web and node recipes
+ * install: a React Native entry imports `crumbtrail-react-native` and a
+ * Capacitor entry imports `crumbtrail-capacitor`, and neither mentions
+ * `crumbtrail-core`, so a narrower pattern let an already-wired mobile app be
+ * wired a second time. `crumbtrail_flutter` is included because Dart is the one
+ * ecosystem whose package name is not spelled with a hyphen, and an underscore
+ * name would not match the JS pattern.
  */
 export function referencesCrumbtrail(text: string): boolean {
-  return /crumbtrail-core|crumbtrail-node|crumbtrail_flutter/.test(text);
+  return /crumbtrail-core|crumbtrail-node|crumbtrail-react-native|crumbtrail-capacitor|crumbtrail_flutter/.test(
+    text,
+  );
 }
 
 /**
@@ -92,7 +98,8 @@ export function prependIntoSource(existing: string, block: string): string {
 // --- Express middleware wiring ----------------------------------------------
 
 /** `const app = express()` (also let/var), capturing the app variable name. */
-const EXPRESS_APP_RE = /^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*express\s*\(\s*\)/;
+const EXPRESS_APP_RE =
+  /^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*express\s*\(\s*\)/;
 
 /**
  * Detect the entry's module style from how `express` itself is imported.
@@ -160,7 +167,9 @@ function findExistingErrorHandler(
     if (!useRe.test(lines[i])) continue;
     // Join a few lines so a parameter list broken across lines still parses.
     const joined = lines.slice(i, i + 6).join(" ");
-    const rest = joined.slice(joined.indexOf(`${appVar}.use(`) + `${appVar}.use(`.length);
+    const rest = joined.slice(
+      joined.indexOf(`${appVar}.use(`) + `${appVar}.use(`.length,
+    );
     if (inlineCallbackArity(rest) === 4) return i;
   }
   return -1;

@@ -114,4 +114,18 @@ describe("consoleCollector", () => {
     expect(() => console.log("still works")).not.toThrow();
     expect(() => console.error("still works")).not.toThrow();
   });
+
+  // `redactNetworkTextBody` overrides the declared text/plain whenever the
+  // string LOOKS like JSON, so a JSON-shaped string that is not JSON fails to
+  // parse, returns a summary and no body, and `?? ""` erased the whole line.
+  it("states the omission instead of emptying a JSON-shaped log line", () => {
+    console.log("{userId: 42, status: failed}");
+    bus.flush();
+
+    const entry = events.find((event) => event.k === "con");
+    const args = (entry?.d as { args?: unknown[] }).args ?? [];
+    expect(String(args[0])).not.toBe("");
+    expect(String(args[0])).not.toBe('""');
+    expect(String(args[0])).toContain("malformed_json_body");
+  });
 });

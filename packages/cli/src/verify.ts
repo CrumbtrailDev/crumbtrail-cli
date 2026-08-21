@@ -325,6 +325,31 @@ export async function pollForServices(
     "Waiting for first events… (Ctrl-C to skip)",
   );
 
+  // The same skew-proof anchor the single-service poll takes: snapshot the ids
+  // that already exist BEFORE the user starts anything, so "new" is decided in
+  // the cloud's own id namespace rather than by comparing its `startedAt`
+  // against our local wall clock. Without it this poll fell back to a strict
+  // `startedAt >= wizardStart` with zero tolerance and rejected genuine first
+  // events, leaving every service reported as "No event yet" while the
+  // dashboard showed the sessions. A failed snapshot degrades to the bounded
+  // skew check rather than to that cliff.
+  let baselineIds: Set<string> | undefined;
+  try {
+    const existing = await fetchSessions(
+      opts.base,
+      opts.token,
+      opts.projectId,
+      opts.fetchImpl,
+    );
+    baselineIds = new Set(existing.map((s) => s.id));
+  } catch {
+    baselineIds = undefined;
+  }
+  const guard: RealSessionGuard = {
+    baselineIds,
+    skewToleranceMs: POLL_SKEW_TOLERANCE_MS,
+  };
+
   const sep = caps().unicode ? " · " : " | ";
   let state = initialIngestPollState();
   while (state.status === "waiting") {
@@ -347,6 +372,7 @@ export async function pollForServices(
       for (const [serviceId, sessionId] of realSessionsByService(
         sessions,
         opts.wizardStart,
+        guard,
       )) {
         if (!wanted.has(serviceId) || found.has(serviceId)) continue;
         found.set(serviceId, sessionId);

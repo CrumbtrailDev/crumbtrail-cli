@@ -71,6 +71,75 @@ describe("storageCollector", () => {
     vi.restoreAllMocks();
   });
 
+  // The prototype patch used to be handed the *unbound* Storage.prototype
+  // method and invoke it as `origFn(key, value)` with no receiver. A real
+  // browser throws `TypeError: Illegal invocation` from inside the host page's
+  // own write, so the SDK breaks the application it is observing. The same
+  // wrapper hardcoded `type: "local"` and read `oldVal` out of localStorage,
+  // so a sessionStorage write through it was filed against the wrong store.
+  describe("the prototype patch", () => {
+    it("calls the original with the receiver it was given", () => {
+      const cleanup = storageCollector(
+        bus,
+        makeConfig({ captureIdb: false, captureCacheApi: false }),
+      );
+
+      expect(() =>
+        Storage.prototype.setItem.call(sessionStorage, "theme", "dark"),
+      ).not.toThrow();
+      expect(sessionStorage.getItem("theme")).toBe("dark");
+
+      expect(() =>
+        Storage.prototype.removeItem.call(sessionStorage, "theme"),
+      ).not.toThrow();
+      expect(sessionStorage.getItem("theme")).toBeNull();
+
+      cleanup();
+    });
+
+    it("files the write against the store it actually happened in", () => {
+      const cleanup = storageCollector(
+        bus,
+        makeConfig({ captureIdb: false, captureCacheApi: false }),
+      );
+      events.length = 0;
+
+      Storage.prototype.setItem.call(sessionStorage, "step", "2");
+      bus.flush();
+
+      const stor = events.filter((event) => event.k === "stor");
+      expect(stor).toHaveLength(1);
+      expect(stor[0].d).toMatchObject({
+        type: "session",
+        op: "set",
+        key: "step",
+      });
+
+      cleanup();
+    });
+
+    // The key exists only in sessionStorage, so an oldVal read from
+    // localStorage reports "there was nothing here before" about a write that
+    // overwrote something.
+    it("reads the previous value from the same store", () => {
+      sessionStorage.setItem("step", "1");
+      const cleanup = storageCollector(
+        bus,
+        makeConfig({ captureIdb: false, captureCacheApi: false }),
+      );
+      events.length = 0;
+
+      Storage.prototype.setItem.call(sessionStorage, "step", "2");
+      bus.flush();
+
+      const stor = events.filter((event) => event.k === "stor")[0];
+      expect(stor.d).toMatchObject({ type: "session" });
+      expect(stor.d.oldVal).toBeDefined();
+
+      cleanup();
+    });
+  });
+
   it("emits snap event with localStorage and sessionStorage contents on init", () => {
     localStorage.setItem("lk", "lv");
     sessionStorage.setItem("sk", "sv");
@@ -208,6 +277,57 @@ describe("storageCollector", () => {
     const storEvents = events.filter((e) => e.k === "stor");
     expect(storEvents).toHaveLength(1);
     expect(storEvents[0].d.key).toBe("tracked");
+
+    cleanup();
+  });
+
+  // A key already present at init() had its NAME published in the opening
+  // snapshot despite an explicit opt-out: the exclude list gated setItem,
+  // removeItem and the cross-tab handler, and never the snapshot.
+  it("storageExcludeKeys are skipped by the opening snapshot too", () => {
+    localStorage.setItem("patient_record_blob", "{}");
+    sessionStorage.setItem("patient_record_blob", "{}");
+    localStorage.setItem("tracked", "{}");
+
+    const cleanup = storageCollector(
+      bus,
+      makeConfig({
+        storageExcludeKeys: ["patient_record_blob"],
+        captureIdb: false,
+        captureCacheApi: false,
+      }),
+    );
+    bus.flush();
+
+    const snap = events.filter((event) => event.k === "snap")[0];
+    expect(JSON.stringify(snap.d)).not.toContain("patient_record_blob");
+    expect(
+      (snap.d as Record<string, Record<string, string>>).localStorage,
+    ).toHaveProperty("tracked");
+
+    cleanup();
+  });
+
+  // Every sensitive key redacts to the same constant, so three tokens used to
+  // collapse into one snapshot entry and "the token was never written" became
+  // indistinguishable from "it was written under three names".
+  it("keeps one snapshot entry per sensitive key", () => {
+    localStorage.setItem("authToken", "a");
+    localStorage.setItem("refreshToken", "b");
+    localStorage.setItem("user_session_secret", "c");
+
+    const cleanup = storageCollector(
+      bus,
+      makeConfig({ captureIdb: false, captureCacheApi: false }),
+    );
+    bus.flush();
+
+    const snap = events.filter((event) => event.k === "snap")[0];
+    const local = (snap.d as Record<string, Record<string, string>>)
+      .localStorage;
+    expect(Object.keys(local)).toHaveLength(3);
+    // The names themselves stay redacted; only the cardinality survives.
+    expect(Object.keys(local).join(",")).not.toContain("authToken");
 
     cleanup();
   });

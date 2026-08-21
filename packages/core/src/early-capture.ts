@@ -7,7 +7,7 @@ import {
 } from "./correlation";
 import { createWebSessionStore } from "./session-store";
 import { DEFAULT_CONFIG } from "./types";
-import { generateSessionId } from "./utils";
+import { generateSessionId, readStructuredBody } from "./utils";
 import { captureCallStack } from "./call-stack";
 
 /**
@@ -107,6 +107,10 @@ export type LateRecordSink = (record: EarlyRequestRecord) => void;
 
 interface EarlyCaptureState extends EarlyCapture {
   _sink?: LateRecordSink;
+  /** Queued records whose response body is still being read. */
+  _awaitingBody?: Set<EarlyRequestRecord>;
+  /** Records the drain held back for their body, to be delivered through `_sink`. */
+  _heldForBody?: Set<EarlyRequestRecord>;
   _timer?: ReturnType<typeof setTimeout>;
   _fetch?: typeof globalThis.fetch;
   _wrappedFetch?: typeof globalThis.fetch;
@@ -130,6 +134,20 @@ interface PreparedRequest {
 }
 
 const JSON_CONTENT_TYPE = /json/i;
+
+/**
+ * The request body as text, when it is readable as text.
+ *
+ * A string is itself; `URLSearchParams` and `FormData` are read through the
+ * same reader the live collector uses. Reading only strings meant that the
+ * pre-init form submission — the request most likely to carry the input that
+ * broke — arrived with no body at all, and that an early GraphQL call lost its
+ * operation name and collapsed into one endpoint.
+ */
+function earlyRequestBody(body: unknown): string | undefined {
+  if (typeof body === "string") return body;
+  return readStructuredBody(body);
+}
 
 function globalScope(): Record<string, unknown> | undefined {
   try {
@@ -267,13 +285,21 @@ function attachBody(
   field: "reqBody" | "resBody",
   text: string,
 ): void {
-  if (!recording(state)) return;
+  // `settling`, not `recording`: a body that lands after the drain still
+  // belongs to a request that started while recording, and the record is either
+  // still queued or held back for exactly this. Refusing it here is what used
+  // to drop the body of the page's own first data load.
+  if (!settling(state)) return;
   if (!text) return;
-  // A response body lands asynchronously; the record may already have been
-  // evicted by the entry cap, in which case the bytes must not be charged.
-  if (!state.entries.includes(record)) return;
   const size = byteLength(text);
   if (size > EARLY_MAX_BODY_BYTES) return;
+  // A response body lands asynchronously; the record may already have been
+  // evicted by the entry cap, or drained, in which case no queue bytes are
+  // charged because there is no queue holding it.
+  if (!state.entries.includes(record)) {
+    if (state._heldForBody?.has(record)) record[field] = text;
+    return;
+  }
   if (state.bytes + size > EARLY_MAX_BYTES) return;
   record[field] = text;
   state.bytes += size;
@@ -294,13 +320,7 @@ function resolveEarlySessionId(): string {
   } catch {
     // Storage denied in a sandboxed frame: mint a fresh id instead.
   }
-  try {
-    return generateSessionId();
-  } catch {
-    // generateSessionId requires crypto.getRandomValues. Without it the SDK
-    // cannot run either, but early capture still must not throw into the page.
-    return `ses_early_${Date.now().toString(36)}`;
-  }
+  return generateSessionId();
 }
 
 function extractUrl(input: unknown): string {
@@ -388,14 +408,14 @@ function patchFetch(state: EarlyCaptureState): void {
       const url = extractUrl(input);
       const headers = readHeaders(input, init) ?? new Headers();
       const correlation = applyCorrelation(state.sessionId, url, headers);
-      const rawBody = init?.body;
+      const reqBody = earlyRequestBody(init?.body);
       prepared = {
         method: extractMethod(input, init),
         url,
         sessionId: state.sessionId,
         ...(callStack !== undefined ? { stk: callStack } : {}),
         ...correlation,
-        ...(typeof rawBody === "string" ? { reqBody: rawBody } : {}),
+        ...(reqBody !== undefined ? { reqBody } : {}),
         ...(headers.get("content-type")
           ? { reqCt: headers.get("content-type") as string }
           : {}),
@@ -495,16 +515,43 @@ function recordFetchResponse(
   if (request.reqBody) attachBody(state, record, "reqBody", request.reqBody);
   if (!isJsonContentType(contentType)) return;
 
+  // Announce the pending read BEFORE it starts. A drain that lands in this
+  // window would otherwise hand the record over without its body and there
+  // would be no second chance: `drain()` empties the queue once. Instead the
+  // drain holds this record back and `settleBody` delivers it through the same
+  // late sink the in-flight requests use.
+  (state._awaitingBody ??= new Set()).add(record);
+  const settleBody = (text?: string) => {
+    const wasAwaited = state._awaitingBody?.delete(record) ?? false;
+    if (text !== undefined) attachBody(state, record, "resBody", text);
+    if (!wasAwaited) return;
+    if (!state._heldForBody?.delete(record)) return;
+    const sink = state._sink;
+    if (!sink) return;
+    try {
+      sink(record);
+    } catch {
+      // A throwing sink never becomes the app's problem.
+    }
+  };
+
   // Read a clone so the app's stream is untouched, and do it off the response
   // path: the page never waits on capture.
   try {
+    // A body that never closes must not cost the record itself.
+    try {
+      setTimeout(() => settleBody(), LATE_BODY_TIMEOUT_MS);
+    } catch {
+      // No timer available: the read below is the only path left.
+    }
     response
       .clone()
       .text()
-      .then((text) => attachBody(state, record, "resBody", text))
-      .catch(() => {});
+      .then((text) => settleBody(text))
+      .catch(() => settleBody());
   } catch {
     // Already-consumed or unclonable body: metadata only.
+    settleBody();
   }
 }
 
@@ -603,12 +650,13 @@ function patchXhr(state: EarlyCaptureState): void {
           // Header rejected (wrong readyState): the request still goes out.
         }
       });
+      const reqBody = earlyRequestBody(body);
       request = {
         method: entry.method,
         url: entry.url,
         sessionId: state.sessionId,
         ...correlation,
-        ...(typeof body === "string" ? { reqBody: body } : {}),
+        ...(reqBody !== undefined ? { reqBody } : {}),
       };
     } catch {
       request = undefined;
@@ -617,11 +665,38 @@ function patchXhr(state: EarlyCaptureState): void {
     if (request) {
       const pending = request;
       entry.started = Date.now();
+      // `loadend` fires for load, error, timeout and abort alike, and a request
+      // that never reached a server reports `status === 0`. Recorded as a
+      // status it replayed as a SUCCESSFUL response with status 0: not counted
+      // as a failed request, no severity flush, no retry-storm bucket — the
+      // opposite reading of the "first data load failed" case this snippet
+      // exists to catch. The settle event is what distinguishes them, so it is
+      // recorded as it happens and the record branches on it, matching the
+      // fetch path's `err`.
+      let failure: string | undefined;
+      const markFailure = (message: string) => () => {
+        failure ??= message;
+      };
+      for (const [event, message] of [
+        ["error", "network error"],
+        ["timeout", "request timed out"],
+        ["abort", "request aborted"],
+      ] as const) {
+        try {
+          this.addEventListener(event, markFailure(message));
+        } catch {
+          // A host XHR without this event simply cannot report it.
+        }
+      }
       const finish = () => {
         try {
           if (!settling(state)) return;
           const contentType =
             this.getResponseHeader?.("content-type") ?? undefined;
+          // A settled XHR with no status never reached a server, however the
+          // host reported it.
+          const settledWithoutResponse =
+            failure ?? (this.status === 0 ? "network error" : undefined);
           const record: EarlyRequestRecord = {
             method: pending.method,
             url: pending.url,
@@ -632,7 +707,9 @@ function patchXhr(state: EarlyCaptureState): void {
             ...(pending.requestId ? { requestId: pending.requestId } : {}),
             ...(pending.traceId ? { traceId: pending.traceId } : {}),
             ...(pending.spanId ? { spanId: pending.spanId } : {}),
-            status: this.status,
+            ...(settledWithoutResponse
+              ? { err: settledWithoutResponse }
+              : { status: this.status }),
             ...(contentType ? { ct: contentType } : {}),
           };
           // responseText throws for a non-text responseType.
@@ -709,7 +786,19 @@ export function installEarlyCapture(): EarlyCapture | undefined {
           clearTimeout(this._timer);
           this._timer = undefined;
         }
-        const drained = this.entries;
+        // A record whose response body is still being read is handed over when
+        // the body lands, not now: the drain is one-shot, so a record released
+        // here goes out with metadata only and can never be corrected. Without
+        // a sink to deliver it later there is nothing to wait for, so it goes
+        // out as it is rather than being lost.
+        const awaiting = this._sink ? this._awaitingBody : undefined;
+        const drained: EarlyRequestRecord[] = [];
+        const heldForBody = new Set<EarlyRequestRecord>();
+        for (const record of this.entries) {
+          if (awaiting?.has(record)) heldForBody.add(record);
+          else drained.push(record);
+        }
+        this._heldForBody = heldForBody;
         this.entries = [];
         this.bytes = 0;
         return drained;
@@ -718,6 +807,8 @@ export function installEarlyCapture(): EarlyCapture | undefined {
         this.stopped = true;
         this._sink = undefined;
         this.entries = [];
+        this._awaitingBody = undefined;
+        this._heldForBody = undefined;
         this.bytes = 0;
         if (this._timer !== undefined) {
           clearTimeout(this._timer);

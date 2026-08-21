@@ -11,7 +11,9 @@
 //                       (packages/cli/src/inject/types.ts PlanKind)
 //   buildCmd          — argv to build the wired fixture (CP1+ drives the app)
 //   runCmd            — argv to start the wired fixture (CP1+ hits it to capture)
-//   wireAssertions    — ordered checks proving the wiring reached the stub.
+//   wireAssertions    — ordered checks proving the wiring reached the stub
+//                       (authed-session-start, boom-error-event,
+//                       backend-req-event, client-bundle-shipped).
 //                       { id, description, status } where status is:
 //                         "active"    — enforced this checkpoint
 //                         "todo-cp1"  — encoded now, enforced from CP1 (skipped)
@@ -53,6 +55,17 @@ export const INSTALLER_RECIPES = {
         // the console.error'd + thrown route must land a captured error event.
         description:
           "hitting /boom surfaces a captured error event (live app drive)",
+        status: "active",
+      },
+      {
+        id: "backend-req-event",
+        // Express is the only recipe that wires request middleware. That
+        // middleware builds its options — including the ingest key — while the
+        // entry module is evaluated, so it is the one piece that can silently
+        // post unauthenticated while crash capture looks healthy. Assert a real
+        // per-request span lands (and, via assertAuthPresent, that it was authed).
+        description:
+          "a plain request surfaces a backend.req.* span (Express middleware live)",
         status: "active",
       },
     ],
@@ -153,6 +166,12 @@ export const INSTALLER_RECIPES = {
         id: "boom-error-event",
         description:
           "hitting /boom surfaces a captured error event (live app drive)",
+        status: "active",
+      },
+      {
+        id: "backend-req-event",
+        description:
+          "a plain request surfaces a backend.req.* span (Express middleware live)",
         status: "active",
       },
     ],
@@ -317,6 +336,41 @@ INSTALLER_RECIPES["nuxt4"] = {
       id: "client-bundle-shipped",
       description:
         "the injected Crumbtrail.init + ingest endpoint ship in the built Nuxt client bundle (only true when the plugin lands in app/plugins/)",
+      status: "active",
+    },
+    {
+      id: "authed-session-start",
+      description:
+        "loading the built page in a browser pushes an authed session/start + event batch to the ingest stub",
+      status: "active",
+    },
+  ],
+};
+
+// nuxt3 — hand-authored minimal Nuxt 3 app that ALSO has a root app/ directory
+// (app/router.options.ts, which Nuxt 3 supports). Nuxt 3 scans plugins/ from the
+// project root; app/plugins/ is Nuxt 4's layout and Nuxt 3 never looks there.
+// The RED bug: planNuxt chose the directory by a bare `app/` existence probe, so
+// this shape was misread as Nuxt 4 and the plugin landed somewhere nothing loads
+// — a silent zero capture behind a green "wired in" line. GREEN: the installed
+// nuxt major decides, the plugin is created at plugins/crumbtrail.client.ts, and
+// a headless page load pushes an authed session + event batch.
+INSTALLER_RECIPES["nuxt3"] = {
+  recipe: "nuxt",
+  fixtureDir: path.join(fixturesRoot, "nuxt3"),
+  expectedPlanKind: "create",
+  browserLoad: true,
+  clientEntry: path.join("plugins", "crumbtrail.client.ts"),
+  bundleDir: path.join(".output", "public"),
+  buildCmd: ["npm", "run", "build"],
+  runCmd: ["node", ".output/server/index.mjs"],
+  portFlag: null,
+  portSlot: 49622,
+  wireAssertions: [
+    {
+      id: "client-bundle-shipped",
+      description:
+        "the injected Crumbtrail.init + ingest endpoint ship in the built Nuxt 3 client bundle (only true when the plugin lands in the ROOT plugins/)",
       status: "active",
     },
     {
@@ -529,6 +583,10 @@ const FIXTURE_PROVENANCE = {
     prune: [".git", "node_modules", ".next"],
     note: "pages-router template; pinned <15.3 so the legacy prepend path applies.",
   },
+  // Hand-authored: `nuxi init` only ever scaffolds the current major, and this
+  // fixture needs the Nuxt 3 layout WITH a root app/ directory, which no
+  // generator produces.
+  nuxt3: { generator: null },
   nuxt4: {
     generator: "npx --yes nuxi@latest init app --template minimal",
     outDir: "app",

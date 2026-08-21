@@ -121,9 +121,28 @@ export const COLLECTOR_MAP: Record<string, Collector> = {
 };
 
 const DEFAULT_CONFIG_POLL_INTERVAL_MS = 60_000;
+
+/**
+ * How long capture waits for the remote capture policy before falling back to
+ * the local config.
+ *
+ * `remoteConfig: true` is what the CLI installer writes into every generated
+ * init block, and until the policy lands `canTransport()` is false, so the
+ * whole session is refused at admission. Without a bound, a blocked config
+ * route, an offline first load, or an endpoint that answers with no policy at
+ * all means a session that captures nothing, forever, and cannot even say so —
+ * the gap record needs `canTransport()` too. The wait is bounded instead, and
+ * the fallback declares itself with a `policy_unavailable` gap.
+ */
+export const REMOTE_POLICY_TIMEOUT_MS = 5_000;
 const EMAIL_SHAPED_VALUE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
+/**
+ * There is no terminal state: a recorder that has finalized a window re-arms to
+ * "buffering" for the next one, because a session's second failure deserves a
+ * report as much as its first.
+ */
 type FlightRecorderState =
-  "armed" | "buffering" | "triggered" | "tailing" | "finalizing" | "finalized";
+  "armed" | "buffering" | "triggered" | "tailing" | "finalizing";
 /**
  * The event a probe result rests as. One event per probe, carrying the whole {@link ProbeResult}
  * including a failed one, because "the probe ran and could not answer" is itself the answer to
@@ -237,6 +256,12 @@ export class Crumbtrail {
   private explicitConsent?: boolean;
   private killSwitch = false;
   private remotePolicyReady: boolean;
+  private remotePolicyTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Collectors holding evidence that cannot be re-read, waiting for admission
+   * to be decided. See `CollectorContext.whenCaptureAdmitted`.
+   */
+  private admissionWaiters: Array<(admitted: boolean) => void> = [];
   private samplingShed: boolean;
   private samplingGapEmitted = false;
   /** Bounded so an endpoint that is refusing everything cannot storm the bus. */
@@ -418,6 +443,7 @@ export class Crumbtrail {
       });
     }
 
+    bus.setMaxBufferedEvents(config.ringBufferMaxEvents);
     bus.start(config.flushIntervalMs, config.flushBufferSize);
 
     bus.setAdmissionPredicate((event) => instance.shouldAdmitEvent(event));
@@ -479,6 +505,7 @@ export class Crumbtrail {
       },
       registerStateProvider: (name, provider) =>
         instance.registerStateProvider(name, provider),
+      whenCaptureAdmitted: (settle) => instance.whenCaptureAdmitted(settle),
     };
 
     instance.configureAutoFlagController();
@@ -530,10 +557,7 @@ export class Crumbtrail {
       this.updateFlightRecorderState();
       if (this.flightRecorderState === "buffering")
         return this.triggerFlightRecorder(options);
-      if (
-        this.flightRecorderState === "finalizing" ||
-        this.flightRecorderState === "finalized"
-      )
+      if (this.flightRecorderState === "finalizing")
         return { bugId: this.createBugId() };
     }
 
@@ -742,10 +766,12 @@ export class Crumbtrail {
       this.ringBuffer.clear();
       this.abortFlightRecorder();
       this.updateFlightRecorderState();
+      this.settleAdmissionWaiters();
       return;
     }
     this.updateFlightRecorderState();
     this.startSessionIfAllowed();
+    this.settleAdmissionWaiters();
     this.emitSamplingGapIfNeeded();
   }
 
@@ -768,6 +794,11 @@ export class Crumbtrail {
     this.stopConfigPolling();
     this.remotePolicyReady = false;
     this.updateFlightRecorderState();
+    this.clearRemotePolicyTimer();
+    this.remotePolicyTimer = setTimeout(
+      () => this.applyRemotePolicyFallback(),
+      REMOTE_POLICY_TIMEOUT_MS,
+    );
     const intervalMs = normalizeInterval(options.intervalMs);
     let stopped = false;
 
@@ -790,9 +821,11 @@ export class Crumbtrail {
         if (settings) {
           this.applyRemoteConfig(settings);
           this.remotePolicyReady = true;
+          this.clearRemotePolicyTimer();
         }
         this.updateFlightRecorderState();
         this.startSessionIfAllowed();
+        this.settleAdmissionWaiters();
         this.emitSamplingGapIfNeeded();
         // Probes run after the policy is live, not during it: a probe result is an event, and an
         // event emitted while `remotePolicyReady` is still false is dropped by the admission
@@ -858,6 +891,7 @@ export class Crumbtrail {
         this.bus.clear();
         this.ringBuffer.clear();
         this.abortFlightRecorder();
+        this.settleAdmissionWaiters();
       }
     }
 
@@ -1071,8 +1105,14 @@ export class Crumbtrail {
       this.flightRecorderTimer = undefined;
       this.flightRecorderTailResolver = undefined;
       this.flightRecorderFinalization = undefined;
-      this.flightRecorderState = "finalized";
+      // Finalization ends a WINDOW, not the session. Left "finalized", the
+      // recorder refused every event for the rest of the instance's life — no
+      // events, no ring buffer, and no gap record saying capture had stopped —
+      // while the auto flag controller went on raising signals that could never
+      // produce a report. The ring buffer is cleared because the next window
+      // starts here, not because there will not be one.
       this.ringBuffer.clear();
+      this.flightRecorderState = this.canCapture() ? "buffering" : "armed";
     };
     void finalization.then(complete, complete);
     return finalization;
@@ -1095,8 +1135,7 @@ export class Crumbtrail {
     if (
       this.flightRecorderState === "triggered" ||
       this.flightRecorderState === "tailing" ||
-      this.flightRecorderState === "finalizing" ||
-      this.flightRecorderState === "finalized"
+      this.flightRecorderState === "finalizing"
     )
       return;
     this.flightRecorderState = this.canCapture() ? "buffering" : "armed";
@@ -1114,6 +1153,7 @@ export class Crumbtrail {
       this.ringBuffer.clear();
       this.abortFlightRecorder();
     }
+    this.settleAdmissionWaiters();
   }
 
   private startSessionWithCurrentIdentity(): void {
@@ -1167,9 +1207,7 @@ export class Crumbtrail {
 
   private isFlightRecorderTerminal(): boolean {
     return (
-      this.config.flightRecorder &&
-      (this.flightRecorderState === "finalizing" ||
-        this.flightRecorderState === "finalized")
+      this.config.flightRecorder && this.flightRecorderState === "finalizing"
     );
   }
 
@@ -1272,6 +1310,90 @@ export class Crumbtrail {
     else this.bus.emit(gap);
   }
 
+  /**
+   * Registers a collector that must not release unrepeatable evidence until
+   * admission has been decided. Settles immediately when the answer is already
+   * known, so a session with no remote policy pays nothing.
+   */
+  private whenCaptureAdmitted(settle: (admitted: boolean) => void): void {
+    if (this.canTransport()) {
+      this.runAdmissionWaiter(settle, true);
+      return;
+    }
+    if (this.isCaptureDenied()) {
+      this.runAdmissionWaiter(settle, false);
+      return;
+    }
+    this.admissionWaiters.push(settle);
+  }
+
+  /**
+   * Denied for good, as opposed to merely undecided.
+   *
+   * Consent that has not been granted yet is NOT a denial: `consentMode:
+   * "explicit"` grants it later in the same session, and discarding the early
+   * queue the moment init runs would throw away the first-screen requests of
+   * every consent-gated app. Only an explicit `consent(false)` decides against.
+   */
+  private isCaptureDenied(): boolean {
+    return this.stopped || this.killSwitch || this.explicitConsent === false;
+  }
+
+  private runAdmissionWaiter(
+    settle: (admitted: boolean) => void,
+    admitted: boolean,
+  ): void {
+    try {
+      settle(admitted);
+    } catch {
+      // A collector that throws on release never becomes the host app's problem.
+    }
+  }
+
+  /**
+   * Answers every waiting collector, once admission is decided either way.
+   * A no-op while the answer is still pending, which is what keeps the early
+   * queue held rather than discarded.
+   */
+  private settleAdmissionWaiters(): void {
+    if (this.admissionWaiters.length === 0) return;
+    const admitted = this.canTransport();
+    if (!admitted && !this.isCaptureDenied()) return;
+    const waiters = this.admissionWaiters;
+    this.admissionWaiters = [];
+    for (const waiter of waiters) this.runAdmissionWaiter(waiter, admitted);
+  }
+
+  private clearRemotePolicyTimer(): void {
+    if (this.remotePolicyTimer !== undefined) {
+      clearTimeout(this.remotePolicyTimer);
+      this.remotePolicyTimer = undefined;
+    }
+  }
+
+  /**
+   * Opens the gate on the local config when the remote policy cannot be had,
+   * and records a `policy_unavailable` gap so the session states what it fell
+   * back to instead of looking like a session where nothing happened. Polling
+   * continues: a policy that arrives later still applies.
+   */
+  private applyRemotePolicyFallback(): void {
+    this.clearRemotePolicyTimer();
+    if (this.remotePolicyReady || this.stopped) return;
+    this.remotePolicyReady = true;
+    this.updateFlightRecorderState();
+    this.startSessionIfAllowed();
+    this.settleAdmissionWaiters();
+    this.emitSamplingGapIfNeeded();
+    this.bus.emit(
+      buildCaptureGapEvent({
+        surface: "browser",
+        reason: "policy_unavailable",
+        sessionId: this.sessionId,
+      }),
+    );
+  }
+
   private emitSamplingGapIfNeeded(): void {
     if (!this.samplingShed || this.samplingGapEmitted || !this.canTransport())
       return;
@@ -1318,6 +1440,19 @@ export class Crumbtrail {
 
   resume(): void {
     this.bus.resume();
+    // A pause the host held long enough to overrun the buffer cost events. The
+    // session says how many rather than resuming as if it had not.
+    const dropped = this.bus.takeDroppedEventCount();
+    if (dropped === 0) return;
+    this.bus.emit(
+      buildCaptureGapEvent({
+        surface: "browser",
+        reason: "buffer_overflow",
+        droppedEventCount: dropped,
+        sessionId: this.sessionId,
+      }),
+    );
+    this.bus.flush();
   }
 
   registerStateProvider(name: string, provider: () => unknown): () => void {
@@ -1406,6 +1541,15 @@ export class Crumbtrail {
   }
 
   async stop(): Promise<{ sessionId: string }> {
+    // A session ending while the remote policy is still outstanding takes the
+    // same fallback the timeout takes: open on the local config, say so with a
+    // gap, and release the collectors still holding unrepeatable evidence — the
+    // early queue above all. This runs BEFORE the flush and before `stopped` is
+    // set, because after either one the released events meet a bus that refuses
+    // them, which is the failure the handshake exists to prevent.
+    this.applyRemotePolicyFallback();
+    this.clearRemotePolicyTimer();
+    this.settleAdmissionWaiters();
     // Ship everything captured up to this instant BEFORE tearing down.
     // shouldPersistEvent consults canTransport(), which is false once
     // `stopped` is set — so a flush that runs after the flag would hand the

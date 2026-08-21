@@ -106,20 +106,86 @@ export function describeElement(el: Element): ElementDescriptor {
   return desc;
 }
 
+/**
+ * Bodies that are not strings but are still readable text.
+ *
+ * Shared by the live network collector and by `crumbtrail-core/early`, so a
+ * form submission issued before init is recorded exactly as the same call
+ * issued after it. It lives here rather than in the collector because the early
+ * entry point must not pull the collector (and the whole redaction module) into
+ * the bundle that sits at the top of the host's entry file.
+ *
+ * `fetch(url, { body: new URLSearchParams(form) })` and `body: new FormData(form)` are how a form
+ * submission is normally written, and both were discarded whole as "non-text". Every field a user
+ * filled in - the quantity that was wrong, the address that was rejected, the id of the record
+ * being edited - went missing from the capture for no reason other than the container it arrived
+ * in. Both are read without consuming them, and the same body redaction runs over the result.
+ *
+ * File parts are described, never read. The form FIELD name survives as the JSON key, which is the
+ * part that matters - a reader needs to know the upload was attached to `invoice`, not what the
+ * document said. The file's own name and MIME type are free text and answer to the same value rules
+ * as any other string in a body, which redact them; only the byte count is kept, because a size is
+ * shape and not content.
+ */
+export function readStructuredBody(body: unknown): string | undefined {
+  try {
+    if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+      return body.toString();
+    }
+    if (typeof FormData !== "undefined" && body instanceof FormData) {
+      const fields: Record<string, unknown> = {};
+      for (const [key, value] of body.entries()) {
+        const described =
+          typeof value === "string"
+            ? value
+            : describeFilePart(value as { size?: number });
+        const existing = fields[key];
+        if (existing === undefined) fields[key] = described;
+        else if (Array.isArray(existing)) existing.push(described);
+        else fields[key] = [existing, described];
+      }
+      return JSON.stringify(fields);
+    }
+  } catch {
+    // An exotic host implementation is reported as non-text, exactly as before.
+  }
+  return undefined;
+}
+
+function describeFilePart(file: { size?: number }): Record<string, unknown> {
+  return {
+    file: true,
+    ...(typeof file.size === "number" ? { bytes: file.size } : {}),
+  };
+}
+
 export function generateSessionId(): string {
   const d = new Date();
   const p = (n: number, len = 2) => String(n).padStart(len, "0");
   return `ses_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}_${randomHex(6)}`;
 }
 
+/**
+ * Random hex, from WebCrypto where there is any.
+ *
+ * A runtime without `crypto.getRandomValues` — an older Node doing SSR, an
+ * embedded WebView, a harness with no polyfill — used to make this throw, and
+ * `Crumbtrail.init()` calls it before anything is wrapped in a try/catch, so the
+ * exception escaped into the host application's entry point and failed the
+ * render. The SDK does not break the app it is watching. A session id is an
+ * opaque correlation key rather than a secret, and `correlation.ts` already
+ * falls back the same way for the trace ids that travel beside it on the wire,
+ * so the fallback keeps one behaviour across both instead of two.
+ */
 function randomHex(byteLength: number): string {
   const bytes = new Uint8Array(byteLength);
-  if (!globalThis.crypto?.getRandomValues) {
-    throw new Error(
-      "Crumbtrail requires crypto.getRandomValues to generate session IDs safely",
-    );
+  const getRandomValues = globalThis.crypto?.getRandomValues;
+  if (getRandomValues) {
+    getRandomValues.call(globalThis.crypto, bytes);
+  } else {
+    for (let i = 0; i < byteLength; i++)
+      bytes[i] = Math.floor(Math.random() * 256);
   }
-  globalThis.crypto.getRandomValues(bytes);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
     "",
   );

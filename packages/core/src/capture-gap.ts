@@ -33,6 +33,17 @@ const SQL_KEYWORD_RE =
 const SQL_TABLE_RE =
   /\b(?:INTO|UPDATE|FROM|TABLE)\s+((?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*)(?:\s*\.\s*(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*)){0,2})/i;
 const ERROR_CLASS_RE = /\b(Error|[A-Z][A-Za-z0-9_$]*(?:Error|Exception))\b/g;
+/**
+ * A delivery refusal names itself by HTTP status and nothing else.
+ *
+ * `detail` is a classification whitelist, so before this pattern existed
+ * `"HTTP 413"` matched no rule and was normalized away — 401, 413 and 429 all
+ * reached the reader as a gap with no detail at all. The status is the whole
+ * diagnosis: wrong key, batch too big, throttled. Bounded to the three digit
+ * status range so it stays a classification and cannot smuggle an id or a
+ * count through.
+ */
+const HTTP_STATUS_RE = /\bHTTP\s+([1-5]\d{2})\b(?!\d)/i;
 
 /**
  * Builds the canonical bounded completeness event. The input detail is redacted defensively and
@@ -128,6 +139,9 @@ function redactDetailValue(value: string): string {
  */
 function captureGapClassifications(value: string): string[] {
   const classifications: string[] = [];
+  const httpStatus = HTTP_STATUS_RE.exec(value)?.[1];
+  if (httpStatus) classifications.push(`HTTP ${httpStatus}`);
+
   const keyword = SQL_KEYWORD_RE.exec(value)?.[1];
   if (keyword) classifications.push(keyword.toUpperCase());
 

@@ -1,10 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventBus } from "../../event-bus";
 import { DEFAULT_CONFIG, type BugEvent } from "../../types";
-import {
-  SSE_REOPEN_WINDOW_MS,
-  eventSourceCollector,
-} from "../eventsource";
+import { SSE_REOPEN_WINDOW_MS, eventSourceCollector } from "../eventsource";
 
 /**
  * happy-dom has no EventSource, so a stub stands in for the host
@@ -90,9 +87,7 @@ describe("eventSourceCollector", () => {
 
     const closeEvent = sse().find((event) => event.d.op === "close");
     expect(closeEvent?.d.count).toBe(1);
-    expect(
-      (StubEventSource.instances[0] as StubEventSource).closed,
-    ).toBe(true);
+    expect((StubEventSource.instances[0] as StubEventSource).closed).toBe(true);
   });
 
   it("marks a stream reopened after a recent failure", () => {

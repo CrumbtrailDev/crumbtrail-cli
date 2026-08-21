@@ -17,6 +17,10 @@
 //               first-class ingest target; flagged coming-soon.
 
 import { STACK_IDS, type Stack } from "crumbtrail-core";
+import {
+  expressEnvPreloadSnippet,
+  nodeInitSnippet,
+} from "../inject/snippets.js";
 
 export type InstallVariantKind = "js" | "otlp" | "infra";
 
@@ -158,16 +162,15 @@ export function buildBackendJsNote(stack: Stack): string {
     ].join("\n");
   }
   return [
-    "// Backend (Hono / Node) — crumbtrail-node ships no framework middleware here.",
-    "// Open a headless session and record server-side events against it:",
-    'import { startHeadlessSession } from "crumbtrail-node";',
-    "",
-    "const session = await startHeadlessSession({",
-    "  endpoint: CRUMBTRAIL_ENDPOINT,",
-    "  authToken: CRUMBTRAIL_KEY,",
-    '  sessionId: "<your-session-id>",',
-    "});",
-    "// session.record(event) to attach server events; session.end() when done.",
+    "// Backend (Hono / Node) — crumbtrail-node ships no framework middleware here,",
+    "// so autoCapture is the whole wiring. Prepend it at the top of the server",
+    "// entry file: it opens a headless session and records uncaught exceptions,",
+    "// unhandled rejections and console.error against it, with no per-event code.",
+    'import("crumbtrail-node")',
+    "  .then(({ autoCapture }) =>",
+    "    autoCapture({ endpoint: CRUMBTRAIL_ENDPOINT, authToken: CRUMBTRAIL_KEY }),",
+    "  )",
+    "  .catch(() => {});",
     "",
     "// Prefer OpenTelemetry? Point your OTLP exporter at the receiver instead.",
   ].join("\n");
@@ -357,6 +360,10 @@ export function buildAgentPrompt(
   }
 
   const { envVar, expr } = opts.keyEnv ?? keyEnvRef(stack);
+
+  if (backendJs)
+    return backendJsPrompt(stack, endpoint, envVar, expr, serviceName);
+
   const jsLines = [
     "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
     "do not refactor or touch anything else, then verify the build still passes.",
@@ -397,37 +404,80 @@ export function buildAgentPrompt(
         ]
       : []),
   ];
-  if (backendJs && stack === "express") {
-    jsLines.push(
-      "  4. This is an Express backend — also install crumbtrail-node and capture",
-      "     server errors and requests with its Express middleware:",
+  jsLines.push("  4. Change nothing else, then verify the build still passes.");
+  return jsLines.join("\n");
+}
+
+/**
+ * The backend-JS hand-off prompt.
+ *
+ * Deliberately NOT the browser prompt with a middleware paragraph bolted on.
+ * `Crumbtrail.init` is the browser entry point: in a Node process `window` is
+ * undefined, so it returns an inert instance with no collectors, no event loop
+ * and no network — an agent that follows such a prompt produces a build that
+ * passes and an app that captures nothing, with every printed step reading as
+ * success. `autoCapture` is what every backend recipe actually injects, so it is
+ * what this says, in the exact shape the injector writes (see `nodeInitSnippet`).
+ */
+function backendJsPrompt(
+  stack: Stack,
+  endpoint: string,
+  envVar: string,
+  expr: string,
+  serviceName: string | null,
+): string {
+  const lines = [
+    "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
+    "do not refactor or touch anything else, then verify the build still passes.",
+    "",
+    `Ingest endpoint: ${endpoint}`,
+    `Ingest key:      read it from the ${envVar} environment variable, which is`,
+    "                 set in the app's env file. Do NOT hard-code it in source.",
+    "",
+    "This is a JavaScript/TypeScript BACKEND. Do NOT call Crumbtrail.init here:",
+    "that is the browser entry point and it returns an inert instance in Node —",
+    "no collectors, no network, no session. Do the following:",
+    "  1. Install the SDK:  npm install crumbtrail-node",
+    "  2. Prepend this block at the VERY TOP of the server entry file, above the",
+    "     other imports, so capture is installed before anything can throw:",
+    ...nodeInitSnippet(endpoint, expr, serviceName)
+      .split("\n")
+      .map((line) => `       ${line}`),
+    "     autoCapture records uncaught exceptions, unhandled rejections and",
+    "     console.error against a headless session, and loads the app's .env",
+    "     itself so the key above is set by the time it starts.",
+  ];
+  if (serviceName) {
+    lines.push(
+      "     Keep the service field exactly as written. It is how this app is",
+      "     identified in Crumbtrail, and a session without it is filed under",
+      "     no app at all.",
+    );
+  }
+  if (stack === "express") {
+    lines.push(
+      "  3. This is an Express app — also register the request and error",
+      "     middleware, or backend request spans (and frontend-to-backend",
+      "     linkage) stay empty. The options object is built while this file is",
+      "     evaluated, so load .env first or the middleware posts with no key:",
+      ...expressEnvPreloadSnippet(envVar)
+        .split("\n")
+        .map((line) => `       ${line}`),
       "       import {",
       "         createCrumbtrailExpressMiddleware,",
       "         createCrumbtrailExpressErrorMiddleware,",
       '       } from "crumbtrail-node";',
-      `       const opts = { endpoint: "${endpoint}", authToken: process.env.CRUMBTRAIL_KEY };`,
-      "       app.use(createCrumbtrailExpressMiddleware(opts));      // before your routes",
-      "       app.use(createCrumbtrailExpressErrorMiddleware(opts)); // after your routes",
-      "  5. Change nothing else, then verify the build still passes.",
-    );
-  } else if (backendJs) {
-    jsLines.push(
-      "  4. This is also a backend. Install crumbtrail-node; it ships no framework",
-      "     middleware for this stack, so open a headless session and record",
-      "     server-side events against it:",
-      '       import { startHeadlessSession } from "crumbtrail-node";',
-      "       const session = await startHeadlessSession({",
-      `         endpoint: "${endpoint}",`,
-      "         authToken: process.env.CRUMBTRAIL_KEY,",
-      '         sessionId: "<your-session-id>",',
-      "       });",
-      "       // session.record(event) for server events; session.end() when the request ends.",
-      "  5. Change nothing else, then verify the build still passes.",
+      `       const crumbtrailOptions = { endpoint: "${endpoint}", authToken: ${expr} };`,
+      "       app.use(createCrumbtrailExpressMiddleware(crumbtrailOptions));      // before your routes",
+      "       app.use(createCrumbtrailExpressErrorMiddleware(crumbtrailOptions)); // after your routes",
+      "  4. Change nothing else, then verify the build still passes.",
     );
   } else {
-    jsLines.push(
+    lines.push(
+      "  3. crumbtrail-node ships no framework middleware for this stack, so the",
+      "     block above is the whole wiring — add nothing else.",
       "  4. Change nothing else, then verify the build still passes.",
     );
   }
-  return jsLines.join("\n");
+  return lines.join("\n");
 }

@@ -179,19 +179,38 @@ export function serializeAttributes(
 ): unknown[] {
   const pairs: unknown[] = [];
   for (const attr of Array.from(element.attributes)) {
-    const name = attr.name.toLowerCase();
-    if (DROPPED_ATTRIBUTES.has(name)) continue;
-    // An event handler attribute is never recorded. The decoder drops these
-    // again; this stops them being uploaded in the first place.
-    if (name.startsWith("on")) continue;
-    // A form control's current value lives in its property once the page has
-    // touched it, and is carried by masked input events instead. Recording the
-    // attribute would publish whatever the markup was built with.
-    if (name === "value" || name === "checked") continue;
+    if (!isRecordableAttribute(attr.name)) continue;
     pairs.push(options.intern(attr.name));
     pairs.push(attr.value === "" ? null : options.intern(attr.value));
   }
   return pairs;
+}
+
+/**
+ * Whether an attribute may be written into a chunk at all.
+ *
+ * The snapshot path and the mutation path must agree on this, and for a while
+ * they did not: the opening snapshot dropped these names and the mutation
+ * branch re-read `getAttribute` with no filter, so
+ * `input.setAttribute("value", "4111111111111111")` — the ordinary vanilla or
+ * jQuery way to prefill or clear a field — put the raw value straight into a
+ * chunk, defeating the module's guarantee that an unmasked value never exists
+ * in a buffer, a chunk, or a request body. `nonce` and `integrity` leaked by
+ * the same route, and an inline handler carries page source.
+ *
+ * - `srcdoc`/`integrity`/`nonce`: content or security material, never layout.
+ * - `on*`: an event handler is page source, and the decoder drops it anyway.
+ * - `value`/`checked`: a form control's current state lives in its property
+ *   once the page has touched it and is carried by masked input events. The
+ *   attribute is whatever the markup was built with, or whatever the page just
+ *   wrote into it.
+ */
+export function isRecordableAttribute(attributeName: string): boolean {
+  const name = attributeName.toLowerCase();
+  if (DROPPED_ATTRIBUTES.has(name)) return false;
+  if (name.startsWith("on")) return false;
+  if (name === "value" || name === "checked") return false;
+  return true;
 }
 
 /**
