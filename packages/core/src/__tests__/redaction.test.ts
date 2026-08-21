@@ -1,3 +1,4 @@
+import { fakeStripeLiveKey } from "./fixtures/fake-secrets";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   BROWSER_REDACTION_POLICY,
@@ -141,14 +142,14 @@ describe("browser redaction policy", () => {
     const result = redactHeaders({
       Authorization: "Bearer secret-token-value",
       "content-type": "application/json",
-      "x-request-id": "7f".repeat(20),
+      "x-content-hash": "7f".repeat(20),
       sk_fake_abcdefghijklmnopqrstuvwxyz: "header-name-secret",
       sk_demo_abcdefghijklmnopqrstuvwxyz: "second-header-name-secret",
     });
 
     expect(result.value.Authorization).toBe(REDACTED_VALUE);
     expect(result.value["content-type"]).toBe("application/json");
-    expect(result.value["x-request-id"]).toBe(REDACTED_VALUE);
+    expect(result.value["x-content-hash"]).toBe(REDACTED_VALUE);
     expect(result.value[REDACTED_STORAGE_KEY]).toBe(REDACTED_VALUE);
     expect(result.value[`${REDACTED_STORAGE_KEY}_2`]).toBe(REDACTED_VALUE);
     expect(result.metadata?.fields.map((field) => field.reason)).toEqual(
@@ -157,6 +158,54 @@ describe("browser redaction policy", () => {
     expect(JSON.stringify(result)).not.toContain("sk_live");
     expect(JSON.stringify(result)).not.toContain("sk_test");
     expect(JSON.stringify(result)).not.toContain("header-name-secret");
+  });
+
+  // A W3C trace id is exactly 32 hex characters, and so is the usual
+  // x-request-id, so the generic long-hex token pattern ate both. Those headers
+  // are the one field that joins a captured session to the customer's own
+  // Splunk / Datadog / CloudWatch record, and destroying them only bites the
+  // accounts that already propagate tracing — the ones where the join works.
+  it("preserves the correlation headers the product joins on", () => {
+    const traceparent =
+      "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    const requestId = "9f8c2d3e4b5a6978c0d1e2f3a4b5c6d7";
+    const result = redactHeaders({
+      traceparent,
+      tracestate: "congo=t61rcWkgMzE",
+      "x-request-id": requestId,
+      "x-correlation-id": "5f2b9a1c-7e0d-4c3a-9b2e-1d8f6a4c0b77",
+      "x-amzn-trace-id": "Root=1-5759e988-bd862e3fe1be46a994272793",
+      "x-b3-traceid": "80f198ee56343ba864fe8b2a57d3eff7",
+      b3: "80f198ee56343ba864fe8b2a57d3eff7-e457b5a2e4d86bd1-1",
+    });
+
+    expect(result.value.traceparent).toBe(traceparent);
+    expect(result.value["x-request-id"]).toBe(requestId);
+    expect(result.value["x-b3-traceid"]).toBe(
+      "80f198ee56343ba864fe8b2a57d3eff7",
+    );
+    expect(result.value["x-amzn-trace-id"]).toBe(
+      "Root=1-5759e988-bd862e3fe1be46a994272793",
+    );
+    expect(JSON.stringify(result.value)).not.toContain(REDACTED_VALUE);
+  });
+
+  // The exemption is for shape-only patterns. A credential misfiled into a
+  // correlation header is still a credential.
+  it("still redacts a real secret misfiled into a correlation header", () => {
+    const jwt =
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c";
+    const stripeKey = fakeStripeLiveKey();
+    const result = redactHeaders({
+      "x-request-id": jwt,
+      "x-correlation-id": stripeKey,
+      traceparent: "Bearer abcdefghijklmnopqrstuvwxyz",
+    });
+
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(jwt);
+    expect(serialized).not.toContain(stripeKey);
+    expect(serialized).not.toContain("abcdefghijklmnopqrstuvwxyz");
   });
 
   it("redacts URL-bearing headers with URL policy", () => {
@@ -615,9 +664,9 @@ describe("browser redaction policy", () => {
    */
   describe("redactProbeStorageKey", () => {
     it("replaces only the identifying span and keeps the pattern", () => {
-      expect(redactProbeStorageKey("session:alice@example.com:cart").value).toBe(
-        "session:*:cart",
-      );
+      expect(
+        redactProbeStorageKey("session:alice@example.com:cart").value,
+      ).toBe("session:*:cart");
       expect(redactProbeStorageKey("user_12345_prefs").value).toBe(
         "user_*_prefs",
       );
@@ -956,10 +1005,12 @@ describe("keepFields on input values", () => {
   // A form value is a string even when it is a number, and the enum alphabet has no dot in it. Every
   // price, rate and decimal quantity a user types lands here.
   it("records a decimal the user typed", () => {
-    expect(redactInputValue("0.29", { name: "maxPrice", type: "number" }).value).toBe(
-      "0.29",
+    expect(
+      redactInputValue("0.29", { name: "maxPrice", type: "number" }).value,
+    ).toBe("0.29");
+    expect(redactInputValue("-12.5", { name: "adjustment" }).value).toBe(
+      "-12.5",
     );
-    expect(redactInputValue("-12.5", { name: "adjustment" }).value).toBe("-12.5");
   });
 
   // The same value in the same declared field, arriving as a query parameter instead of as a typed
@@ -968,24 +1019,24 @@ describe("keepFields on input values", () => {
   it("keeps a decimal in a kept query parameter", () => {
     setRedactionKeepFields(["maxPrice"]);
 
-    expect(redactUrl("https://app.test/api/search?maxPrice=0.29", "url").value).toContain(
-      "maxPrice=0.29",
-    );
+    expect(
+      redactUrl("https://app.test/api/search?maxPrice=0.29", "url").value,
+    ).toContain("maxPrice=0.29");
   });
 
   it("still redacts a decimal in a parameter the application did not name", () => {
     setRedactionKeepFields(["maxPrice"]);
 
-    expect(redactUrl("https://app.test/api/search?salary=52000.5", "url").value).not.toContain(
-      "52000.5",
-    );
+    expect(
+      redactUrl("https://app.test/api/search?salary=52000.5", "url").value,
+    ).not.toContain("52000.5");
   });
 
   // Numeric classification must not become a way past the card check.
   it("still catches a card number typed into a plain field", () => {
-    expect(redactInputValue("4111111111111111", { name: "reference" }).value).toBe(
-      REDACTED_VALUE,
-    );
+    expect(
+      redactInputValue("4111111111111111", { name: "reference" }).value,
+    ).toBe(REDACTED_VALUE);
   });
 });
 

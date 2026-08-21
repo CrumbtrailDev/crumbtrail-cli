@@ -22,7 +22,12 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { HttpTransport, EventDeliveryError } from "../transports/http";
+import {
+  HttpTransport,
+  EventDeliveryError,
+  CaptureShedError,
+  SessionDeliveryError,
+} from "../transports/http";
 import { readTransportFixture } from "./wire-contract-fixtures";
 
 const ENDPOINT = "http://localhost:9898";
@@ -259,11 +264,18 @@ describe("transport envelope conformance", () => {
   describe("delivery semantics", () => {
     const delivery = requireObject(fixture.delivery, "delivery");
 
-    it("distinguishes the three outcomes the contract names", async () => {
+    it("distinguishes every outcome the contract names", async () => {
       // Named rather than assumed: if the fixture stops describing one of
       // these, the branch below it is no longer contract backed.
       expect(Object.keys(delivery).sort()).toEqual(
-        ["$comment", "2xx", "networkFailure", "non2xx"].sort(),
+        [
+          "$comment",
+          "2xx",
+          "networkFailure",
+          "non2xx",
+          "capture202Shed",
+          "sessionStart",
+        ].sort(),
       );
     });
 
@@ -301,6 +313,48 @@ describe("transport envelope conformance", () => {
         configurable: true,
       });
 
+      await expect(DRIVERS.events(transport)).rejects.toBeInstanceOf(
+        EventDeliveryError,
+      );
+    });
+
+    it("treats a 202 capture shed as a discard rather than a delivery", async () => {
+      const transport = new HttpTransport(ENDPOINT, { authToken: TOKEN });
+      await DRIVERS.sessionStart(transport);
+
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(
+          new Response(
+            JSON.stringify({
+              ok: true,
+              capture: "shed",
+              reason: "bytes_per_day",
+              retryAfterSeconds: 30,
+            }),
+            { status: 202, headers: { "Retry-After": "30" } },
+          ),
+        ),
+      );
+
+      const error: unknown = await DRIVERS.events(transport).catch(
+        (caught) => caught as CaptureShedError,
+      );
+      expect(error).toBeInstanceOf(CaptureShedError);
+      expect((error as CaptureShedError).reason).toBe("bytes_per_day");
+    });
+
+    it("stops capture when the session the contract keys everything by was refused", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(new Response("no", { status: 402 })),
+      );
+      const transport = new HttpTransport(ENDPOINT, { authToken: TOKEN });
+
+      await expect(DRIVERS.sessionStart(transport)).rejects.toBeInstanceOf(
+        SessionDeliveryError,
+      );
+      // "do not post a session's worth of events into a 404"
       await expect(DRIVERS.events(transport)).rejects.toBeInstanceOf(
         EventDeliveryError,
       );

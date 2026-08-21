@@ -1,7 +1,11 @@
 import type { EventBus } from "../event-bus";
 import type { CrumbtrailConfig, CollectorCleanup } from "../types";
 import { truncate, now } from "../utils";
-import { attachRedactionMetadata, redactNetworkTextBody } from "../redaction";
+import {
+  attachRedactionMetadata,
+  redactNetworkTextBody,
+  type PayloadSummary,
+} from "../redaction";
 import { isBlocked, isUnmasked, maskText } from "../masking";
 
 export function clipboardCollector(
@@ -25,19 +29,28 @@ export function clipboardCollector(
 
     const d: Record<string, unknown> = { op: type };
     if (txt) {
-      const truncated = truncate(txt, maxLen);
       if (target && isUnmasked(target)) {
-        d.txt = truncated;
+        d.txt = truncate(txt, maxLen);
       } else if (config.maskAllText) {
-        d.txt = maskText(truncated);
+        d.txt = maskText(truncate(txt, maxLen));
       } else if (config.captureRawClipboard) {
-        d.txt = truncated;
+        d.txt = truncate(txt, maxLen);
       } else {
-        const redacted = redactNetworkTextBody(truncated, {
+        // Redact the whole text, then truncate. Truncating first can cut a
+        // token in half, and the half that survives matches no token pattern
+        // and is stored in the clear.
+        const redacted = redactNetworkTextBody(txt, {
           contentType: "text/plain",
           path: "txt",
         });
-        d.txt = redacted.body ?? "";
+        // `?? ""` erased the paste. `looksLikeJson` overrides the declared
+        // text/plain, so `{"amount": 12.50,}` — JSON-shaped and not JSON — came
+        // back with only a summary and the content that caused the bug was
+        // gone. error.ts states the omission instead of hiding it.
+        d.txt = truncate(
+          redacted.body ?? bodyPlaceholder(redacted.bodySummary),
+          maxLen,
+        );
         if (redacted.bodySummary) d.txtSummary = redacted.bodySummary;
         attachRedactionMetadata(d, redacted.metadata);
       }
@@ -70,4 +83,8 @@ function resolveTarget(event: Event): Element | undefined {
   return anchor instanceof Element
     ? anchor
     : (anchor.parentElement ?? undefined);
+}
+
+function bodyPlaceholder(summary: PayloadSummary | undefined): string {
+  return summary ? `[${summary.action}:${summary.reason}]` : "[REDACTED]";
 }

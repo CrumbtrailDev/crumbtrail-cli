@@ -496,13 +496,107 @@ export async function writeEvidenceIndex(
 }
 
 function normalizeEvidenceEvents(events: BugEvent[]): BugEvent[] {
-  return events.flatMap((event) => {
-    const t = finiteSafeTimestamp(event.t);
-    const k =
-      typeof event.k === "string" && event.k.length > 0 ? event.k : undefined;
-    if (t === undefined || k === undefined) return [];
-    return [{ ...event, t, k, d: isRecord(event.d) ? event.d : {} }];
-  });
+  return expandNativeNetworkEvents(
+    events.flatMap((event) => {
+      const t = finiteSafeTimestamp(event.t);
+      const k =
+        typeof event.k === "string" && event.k.length > 0 ? event.k : undefined;
+      if (t === undefined || k === undefined) return [];
+      return [{ ...event, t, k, d: isRecord(event.d) ? event.d : {} }];
+    }),
+  );
+}
+
+/**
+ * Payload keys a native `net` event carries that are already understood on the
+ * browser plane and must survive the rewrite verbatim.
+ */
+const NATIVE_NET_CARRIED_KEYS = [
+  "sessionId",
+  "requestId",
+  "traceId",
+  "spanId",
+  "hdrs",
+  "reqHdrs",
+] as const;
+
+/**
+ * Rewrites native `k:"net"` events into the `net.req` / `net.res` pair the rest
+ * of this file reads.
+ *
+ * `docs/specs/native-sdk-wire-contract.md` fixes ONE event per completed
+ * request for every SDK that is not built on `crumbtrail-core` — Swift, Kotlin,
+ * Dart — with the status under `d.status`. The browser collector emits three
+ * events with the status under `d.st`. This file was written against the
+ * browser spelling only, so before this normalisation every mobile session's
+ * network plane indexed as an empty set: failed requests, latency outliers,
+ * retry storms and every full stack join were computed over nothing, and a
+ * session with a 500 on checkout was graded as if the request never happened.
+ *
+ * Normalising here rather than teaching forty odd predicates a second spelling
+ * keeps one shape in the analyzer and one place for the next SDK to join.
+ *
+ * The array is returned untouched when no `net` event is present, so a browser
+ * session takes no new code path at all.
+ */
+function expandNativeNetworkEvents(events: BugEvent[]): BugEvent[] {
+  if (!events.some((event) => event.k === "net")) return events;
+
+  const out: BugEvent[] = [];
+  let synthesized = 0;
+  for (const event of events) {
+    if (event.k !== "net" || !isRecord(event.d)) {
+      out.push(event);
+      continue;
+    }
+    const d = event.d;
+    const dur = finiteNumber(d.dur);
+    // The transport-local join key. Native SDKs send no page-local sequence
+    // number, so one is synthesised — deliberately NOT a bare run of digits,
+    // which `requestIdForValue` reads as a browser counter.
+    const id = networkRequestId(d.id) ?? `nat_${(synthesized += 1)}`;
+    const carried: Record<string, unknown> = {};
+    for (const key of NATIVE_NET_CARRIED_KEYS) {
+      if (d[key] !== undefined) carried[key] = d[key];
+    }
+    const method = safeText(d.method, 20);
+    const url = safeText(d.url, 400);
+    const source = safeText(d.source, 40);
+
+    // The request is dated by working back from the completion the SDK
+    // reported. `dur` is the only thing that can place it, and a missing or
+    // negative one collapses the exchange to a point rather than inventing a
+    // start time before the session.
+    const startedAt =
+      dur !== undefined && dur >= 0 ? Math.max(0, event.t - dur) : event.t;
+
+    out.push({
+      ...event,
+      t: startedAt,
+      k: "net.req",
+      d: removeUndefined({ id, method, url, source, ...carried }),
+    });
+    out.push({
+      ...event,
+      k: "net.res",
+      d: removeUndefined({
+        id,
+        st: finiteNumber(d.status),
+        dur,
+        method,
+        url,
+        source,
+        ok: typeof d.ok === "boolean" ? d.ok : undefined,
+        body: d.body,
+        ...carried,
+      }),
+    });
+  }
+  // Only the synthesised request start can be out of order, and only relative
+  // to events the SDK reported while the request was in flight. Sorting is
+  // confined to the expanded case so a browser session's ordering is byte for
+  // byte what it was.
+  return out.sort((a, b) => a.t - b.t);
 }
 
 /**
@@ -551,6 +645,9 @@ export function buildEvidenceCandidates(
   index: EvidenceIndexInput["index"],
   causalGraph?: CausalGraph,
 ): EvidenceCandidate[] {
+  // Idempotent: the expansion leaves no `k:"net"` behind, so the pass
+  // writeEvidenceIndex already made is a no-op here.
+  events = expandNativeNetworkEvents(events);
   index = withNavigationContext(events, index);
   const requestById = collectRequests(events);
   const responseIds = new Set<string>();

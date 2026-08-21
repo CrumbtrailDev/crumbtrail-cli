@@ -82,6 +82,13 @@ await crumbtrail.flagBug({
 Also on the instance: `addEvent`, `registerStateProvider`, `setEnv`,
 `createRequestHeaders`, `pause`, `resume`, `stop`, `getSessionId`.
 
+`createRequestHeaders()` is for a transport Crumbtrail does not patch, such as a
+WebSocket frame, a server action, or a queue message. It returns the session
+header, the request id header, and a `traceparent`, exactly what the automatic
+fetch and XHR paths stamp, so a request you stamp yourself joins the same
+backend evidence as one Crumbtrail stamped. Pass your own request id only if you
+already have one to keep.
+
 ## Redaction is on by default
 
 Crumbtrail is meant to be pointed at real traffic, so scrubbing is not opt in.

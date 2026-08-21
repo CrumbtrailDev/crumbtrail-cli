@@ -6,41 +6,41 @@ export const CRUMBTRAIL_SESSION_HEADER_LOWER =
 export const CRUMBTRAIL_REQUEST_HEADER_LOWER =
   CRUMBTRAIL_REQUEST_HEADER.toLowerCase();
 
-const REQUEST_ID_PREFIX = "req";
-const REQUEST_ID_RANDOM_LENGTH = 12;
 export const CRUMBTRAIL_REQUEST_ID_MAX_LENGTH = 64;
 
-function randomBase36(length: number): string {
-  let value = "";
-  while (value.length < length) {
-    value += Math.random().toString(36).slice(2);
-  }
-  return value.slice(0, length);
-}
-
-export function generateRequestId(): string {
-  return `${REQUEST_ID_PREFIX}_${Date.now().toString(36)}_${randomBase36(REQUEST_ID_RANDOM_LENGTH)}`.slice(
-    0,
-    CRUMBTRAIL_REQUEST_ID_MAX_LENGTH,
-  );
-}
-
-function normalizeRequestId(requestId: string | undefined): string {
+function normalizeRequestId(
+  requestId: string | undefined,
+  fallback: string,
+): string {
   if (requestId && requestId.length <= CRUMBTRAIL_REQUEST_ID_MAX_LENGTH)
     return requestId;
-  return generateRequestId();
+  return fallback;
 }
 
+/**
+ * The correlation headers for one outbound request, for an application stamping
+ * a transport Crumbtrail does not patch: a WebSocket frame, a server action, a
+ * worker, a queue message.
+ *
+ * It emits exactly what the automatic path emits — the trace id as the request
+ * id, and the `traceparent` it came from. It used to mint a `req_<base36>`
+ * identifier and no traceparent, so a request stamped this way carried a key no
+ * OTLP span would ever contain and gave the backend no context to continue:
+ * two vocabularies on one wire, and the manually stamped half could never be
+ * joined to its own backend evidence.
+ */
 export function createCrumbtrailRequestHeaders(
   sessionId: string,
   requestId?: string,
-): Record<
-  typeof CRUMBTRAIL_SESSION_HEADER | typeof CRUMBTRAIL_REQUEST_HEADER,
-  string
-> {
+): Record<string, string> {
+  const correlation = resolveOutboundCorrelation({
+    sessionId,
+    existingRequestId: requestId,
+  });
   return {
-    [CRUMBTRAIL_SESSION_HEADER]: sessionId,
-    [CRUMBTRAIL_REQUEST_HEADER]: normalizeRequestId(requestId),
+    [CRUMBTRAIL_SESSION_HEADER]: correlation.sessionId,
+    [CRUMBTRAIL_REQUEST_HEADER]: correlation.requestId,
+    [W3C_TRACEPARENT_HEADER]: correlation.traceparent,
   };
 }
 
@@ -197,7 +197,7 @@ export function resolveOutboundCorrelation(input: {
 }): OutboundCorrelation {
   const existing = parseTraceparent(input.existingTraceparent);
   const ctx = existing ?? generateTraceContext();
-  const requestId = normalizeRequestId(input.existingRequestId ?? ctx.traceId);
+  const requestId = normalizeRequestId(input.existingRequestId, ctx.traceId);
   return {
     sessionId: input.sessionId,
     requestId,

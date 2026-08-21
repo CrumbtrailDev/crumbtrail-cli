@@ -98,11 +98,16 @@ describe("install-instructions snippets", () => {
     expect(note).not.toContain("crumbtrailErrorMiddleware(");
   });
 
-  it("Hono/Node backend note uses the headless session — no framework middleware", () => {
+  it("Hono/Node backend note auto-captures — no framework middleware", () => {
     for (const stack of ["hono", "node"] as const) {
       const note = buildBackendJsNote(stack);
       expect(note).toContain("crumbtrail-node");
-      expect(note).toContain("startHeadlessSession");
+      expect(note).toContain("autoCapture");
+      // startHeadlessSession records nothing on its own: it hands back a session
+      // the host then has to feed by hand, so a reader who follows it ships an
+      // app that builds and captures nothing.
+      expect(note).not.toContain("startHeadlessSession");
+      expect(note).not.toContain("<your-session-id>");
       expect(note).not.toContain("createCrumbtrailExpressMiddleware");
       expect(note).not.toContain("attachCrumbtrail");
     }
@@ -150,7 +155,7 @@ describe("install-instructions snippets", () => {
 
   it("agent prompt wires the real Express middleware for the express stack", () => {
     const p = buildAgentPrompt("express", keys);
-    expect(p).toContain("PRESET_PASSIVE");
+    expect(p).toContain("autoCapture");
     expect(p).toContain("crumbtrail-node");
     expect(p).toContain("createCrumbtrailExpressMiddleware");
     expect(p).toContain("createCrumbtrailExpressErrorMiddleware");
@@ -161,18 +166,44 @@ describe("install-instructions snippets", () => {
     expect(p).not.toContain("attachCrumbtrail");
   });
 
-  it("agent prompt uses the headless session for non-express backend-JS stacks", () => {
-    for (const stack of ["hono", "node"] as const) {
+  it("agent prompt runs in Node for every backend-JS stack, not the browser SDK", () => {
+    // Crumbtrail.init is the BROWSER entry point: in a Node process `window` is
+    // undefined and it returns an inert instance — no collectors, no event loop,
+    // no network, no session. A prompt that says to call it at a server entry
+    // point builds cleanly and captures nothing, which is the worst shape a
+    // failure can take. autoCapture is what every backend recipe injects and is
+    // what this prompt must say.
+    for (const stack of ["express", "hono", "node"] as const) {
       const p = buildAgentPrompt(stack, keys);
-      expect(p).toContain("PRESET_PASSIVE");
       expect(p).toContain("crumbtrail-node");
-      expect(p).toContain("startHeadlessSession");
+      expect(p).toContain("autoCapture");
+      expect(p).toContain('import("crumbtrail-node")');
+      // The prompt names Crumbtrail.init only to say not to call it here.
+      expect(p).not.toContain("Crumbtrail.init({");
+      expect(p).toContain("Do NOT call Crumbtrail.init here");
+      expect(p).not.toContain("PRESET_PASSIVE");
+      // startHeadlessSession only hands back a session the host must feed itself.
+      expect(p).not.toContain("startHeadlessSession");
+      expect(p).not.toContain("<your-session-id>");
       expect(p).not.toContain("bl_live_xyz");
       expect(p).toContain("process.env.CRUMBTRAIL_KEY");
-      // Express-only middleware must not leak into non-express stacks.
-      expect(p).not.toContain("createCrumbtrailExpressMiddleware");
       expect(p).not.toContain("attachCrumbtrail");
     }
+  });
+
+  it("agent prompt keeps the Express middleware pair express-only", () => {
+    for (const stack of ["hono", "node"] as const) {
+      const p = buildAgentPrompt(stack, keys);
+      expect(p).not.toContain("createCrumbtrailExpressMiddleware");
+    }
+    const express = buildAgentPrompt("express", keys);
+    expect(express).toContain("createCrumbtrailExpressMiddleware");
+    expect(express).toContain("createCrumbtrailExpressErrorMiddleware");
+  });
+
+  it("agent prompt names the app in the backend autoCapture call too", () => {
+    const p = buildAgentPrompt("node", keys, { serviceName: "payments-api" });
+    expect(p).toContain('service: "payments-api"');
   });
 
   it("agent prompt uses the OTLP path (no SDK) for non-JS backends", () => {

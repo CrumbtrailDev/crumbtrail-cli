@@ -92,7 +92,11 @@ describe("HttpTransport", () => {
     expect(call[1].keepalive).toBeUndefined();
   });
 
+  // A beacon carries no headers, so it can only be a real delivery path where
+  // the ingest endpoint needs no credential. The authenticated case reports the
+  // loss instead — see http-refusals.test.ts.
   it("falls back to sendBeacon on sendEvents fetch failure", async () => {
+    const transport = new HttpTransport(endpoint);
     await transport.startSession("ses_test", {});
 
     vi.stubGlobal(
@@ -259,6 +263,7 @@ describe("HttpTransport", () => {
   });
 
   it("falls back to sendBeacon on endSession fetch failure", async () => {
+    const transport = new HttpTransport(endpoint);
     await transport.startSession("ses_test", {});
 
     vi.stubGlobal(
@@ -281,6 +286,7 @@ describe("HttpTransport", () => {
   });
 
   it("does not throw when endSession fetch fails and sendBeacon is unavailable", async () => {
+    const transport = new HttpTransport(endpoint);
     await transport.startSession("ses_test", {});
 
     vi.stubGlobal(
@@ -298,11 +304,11 @@ describe("HttpTransport", () => {
 
   describe("a refused batch is not a delivered batch", () => {
     it("throws when the endpoint answers a non-2xx", async () => {
+      await transport.startSession("ses_test", {});
       vi.stubGlobal(
         "fetch",
         vi.fn().mockResolvedValue(new Response("too large", { status: 413 })),
       );
-      await transport.startSession("ses_test", {});
 
       await expect(
         transport.sendEvents([{ t: 1, k: "con", d: { lv: "err", args: [] } }]),
@@ -310,11 +316,11 @@ describe("HttpTransport", () => {
     });
 
     it("reports the status and the number of events lost", async () => {
+      await transport.startSession("ses_test", {});
       vi.stubGlobal(
         "fetch",
         vi.fn().mockResolvedValue(new Response("slow down", { status: 429 })),
       );
-      await transport.startSession("ses_test", {});
 
       let error: EventDeliveryError | undefined;
       try {

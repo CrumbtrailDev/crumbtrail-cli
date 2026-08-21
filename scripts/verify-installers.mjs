@@ -4,9 +4,11 @@
 //
 // For each recipe: pack the SDK+CLI locally, stand up a fresh temp app from a
 // real fixture, drive the REAL setup wizard against a stub cloud, then assert the
-// wiring actually landed (entry file wired, no key written — the installer is
-// hands-off) and an AUTHED session reached the ingest stub once the harness
-// supplies the key via the env var the injected code reads (as a user would).
+// wiring actually landed (entry file wired, the minted key written into the app's
+// env file) and that an AUTHED session reached the ingest stub with the app
+// started plainly — no --env-file, and the key NOT re-supplied through the
+// process environment, so anything that reads the key at module load has to find
+// it the way a real install does.
 // The install-order and wizardStart-poll fixes are exercised for real because
 // the pipeline runs the wizard's own exported functions (defaultDeps() from
 // packages/cli/dist), not a re-implementation.
@@ -270,17 +272,33 @@ async function runRecipeInproc({ name, packed, tmpRoot }) {
       `entry file ${detected.entryFile} was NOT wired (no crumbtrail-node reference) — injection self-cancelled after SDK install`,
     );
   }
-  // 2. Hands-off: the installer writes NO ingest key to .env — the user sets it.
-  // Assert no CRUMBTRAIL_KEY line was written; the injected snippet reads it from
-  // process.env, which the boom-drive below supplies to prove the authed
-  // round-trip (the way a user who set their env would get).
-  const envText = (await readFileSafe(path.join(appDir, ".env"))) ?? "";
-  if (/^CRUMBTRAIL_KEY=/m.test(envText)) {
-    throw new Error(
-      `hands-off installer must not write CRUMBTRAIL_KEY to .env, but it did`,
-    );
+  // 2. The key: the wizard mints one and writes it into the app's env file, and
+  // the drive below deliberately does NOT re-supply it through the process
+  // environment. That is the whole point — code that reads the key at module
+  // load, before anything has loaded .env, passes when the harness hands the key
+  // over as an env var and captures nothing on a real install.
+  const keyVar = preflightPlan.keyEnvVar ?? "CRUMBTRAIL_KEY";
+  const envFile = await firstEnvFileWith(appDir, keyVar);
+  const keyInEnvFile = envFile != null;
+  if (preflightPlan.keyEnvVar && !preflightPlan.keyIsCompileTime) {
+    if (!keyInEnvFile) {
+      throw new Error(
+        `wizard did not write ${keyVar} into an env file — the app has no key to read`,
+      );
+    }
+    if (!envFile.text.includes(stub.apiKey)) {
+      throw new Error(
+        `${envFile.path} does not carry the minted key (expected ${stub.apiKey})`,
+      );
+    }
   }
-  phase("PASS", `${name}:injected`, `entry wired; no key written to .env`);
+  phase(
+    "PASS",
+    `${name}:injected`,
+    keyInEnvFile
+      ? `entry wired; key in ${path.basename(envFile.path)}`
+      : "entry wired",
+  );
 
   // 2b. Live app drive (CP1): when a recipe carries an active boom-error-event
   // assertion, boot the wired app for real (real SDK installed, plain node start
@@ -297,9 +315,13 @@ async function runRecipeInproc({ name, packed, tmpRoot }) {
       packed,
       stub,
       ingest,
-      // Hands-off: the wizard wrote no key, so the harness supplies it via the
-      // env var the injected snippet reads (CRUMBTRAIL_KEY for backend recipes).
-      keyEnvVar: preflightPlan.keyEnvVar ?? "CRUMBTRAIL_KEY",
+      // Null when the wizard already wrote the key into the app's env file: the
+      // app must find it there itself, exactly as it does for a real user. Only
+      // when no key landed on disk does the harness stand in for the user and
+      // supply it through the environment.
+      keyEnvVar: keyInEnvFile
+        ? null
+        : (preflightPlan.keyEnvVar ?? "CRUMBTRAIL_KEY"),
     });
   }
 
@@ -324,6 +346,21 @@ async function runRecipeInproc({ name, packed, tmpRoot }) {
         throw new Error(
           "hitting /boom did NOT surface a captured backend error event " +
             "(k='backend.uncaught') in the ingest stub",
+        );
+      }
+    }
+    if (wa.id === "backend-req-event") {
+      const state = backendReqState(ingest);
+      if (!state.seen) {
+        throw new Error(
+          "no backend.req.* span reached the ingest stub — the Express request " +
+            "middleware never reported, so frontend-to-backend linkage is empty",
+        );
+      }
+      if (!state.authed) {
+        throw new Error(
+          "a backend.req.* span reached the ingest stub with no X-Crumbtrail-Auth " +
+            "header — the middleware was built before the .env key was loaded",
         );
       }
     }
@@ -411,12 +448,12 @@ async function runRecipeBinary({ name, packed, tmpRoot }) {
       `packed binary did not wire the entry file\n${out.slice(-1500)}`,
     );
   }
-  // Hands-off: the binary writes NO ingest key to .env (the user sets it), so
-  // assert the absence of a key line rather than its contents.
-  const envText = (await readFileSafe(path.join(appDir, ".env"))) ?? "";
-  if (/^CRUMBTRAIL_KEY=/m.test(envText)) {
+  // The binary mints the project's key and writes it into the app's env file;
+  // an install that leaves the app with no key to read is a silent zero capture.
+  const keyFile = await firstEnvFileWith(appDir, "CRUMBTRAIL_KEY");
+  if (!keyFile) {
     throw new Error(
-      `packed binary must not write CRUMBTRAIL_KEY to .env (hands-off)\n${out.slice(-1500)}`,
+      `packed binary wired the entry but wrote no CRUMBTRAIL_KEY env file\n${out.slice(-1500)}`,
     );
   }
   // No synthetic ingest check remains (no key is minted) and binary mode never
@@ -725,6 +762,57 @@ async function waitFor(predicate, timeoutMs) {
   return predicate();
 }
 
+/**
+ * The env file in `appDir` that carries `varName`, or null. The wizard picks
+ * between `.env` and `.env.local` itself (env-file.ts chooseEnvFile), so the
+ * harness looks for the variable rather than assuming the file.
+ */
+async function firstEnvFileWith(appDir, varName) {
+  for (const file of [".env", ".env.local"]) {
+    const full = path.join(appDir, file);
+    const text = await readFileSafe(full);
+    if (text != null && new RegExp(`^${varName}=`, "m").test(text)) {
+      return { path: full, text };
+    }
+  }
+  return null;
+}
+
+/**
+ * How a per-request backend span reached the stub, if it did at all.
+ *
+ * Distinct from the crash assertion: autoCapture produces `backend.uncaught`
+ * with no key of its own to get wrong, while the Express middleware options are
+ * built as the entry module is evaluated, and that was the one piece that
+ * silently posted unauthenticated when the key lived in a `.env` file. So the
+ * event arriving is not enough — the batch carrying it has to be authed.
+ *
+ * The middleware only reports for a request that names a session, which is what
+ * the frontend SDK stamps on its own calls, so the harness sends that header
+ * too. Frontend-to-backend linkage is built entirely out of these events.
+ */
+function backendReqState(ingest) {
+  let seen = false;
+  let authed = false;
+  for (const rec of ingest.seen("/api/events")) {
+    const events = rec.body?.events;
+    if (!Array.isArray(events)) continue;
+    if (
+      !events.some(
+        (ev) => ev && typeof ev.k === "string" && ev.k.startsWith("backend.req."),
+      )
+    ) {
+      continue;
+    }
+    seen = true;
+    if (rec.auth) authed = true;
+  }
+  return { seen, authed };
+}
+
+/** Header the frontend SDK stamps on its requests; the middleware needs it. */
+const HARNESS_SESSION_HEADER = "x-crumbtrail-session-id";
+
 /** True once the ingest stub recorded an auto-captured backend error event. */
 function hasBoomErrorEvent(ingest) {
   for (const rec of ingest.seen("/api/events")) {
@@ -738,9 +826,9 @@ function hasBoomErrorEvent(ingest) {
 
 /**
  * Boot the wizard-wired backend app for real and hit /boom so autoCapture
- * records a server-side error event. Hands-off: the installer wrote no key, so
- * the harness supplies it through the environment (`keyEnvVar` = CRUMBTRAIL_KEY)
- * exactly as a user who set their env would — autoCapture reads it from there.
+ * records a server-side error event. The key normally comes from the env file
+ * the wizard wrote (`keyEnvVar` null); it is only supplied through the
+ * environment when nothing landed on disk.
  * The packed SDK tarballs (core + node) are installed over the wizard's seeded
  * stub so the injected `import("crumbtrail-node")` resolves to the real
  * `autoCapture`.
@@ -784,9 +872,13 @@ async function driveBoomCapture({
   const port = recipe.portSlot;
   const server = startServer(recipe.runCmd[0], recipe.runCmd.slice(1), {
     cwd: appDir,
-    // Hands-off: the installer wrote no .env, so the harness supplies the key the
-    // way a user would — via the environment. autoCapture reads it from there.
-    env: { PORT: String(port), [keyEnvVar]: stub.apiKey },
+    // `keyEnvVar` is null when the wizard wrote the key into the app's env file:
+    // the app then has to load it itself, which is the real user's situation and
+    // the only way this harness can see a module-load key read go wrong.
+    env: {
+      PORT: String(port),
+      ...(keyEnvVar ? { [keyEnvVar]: stub.apiKey } : {}),
+    },
   });
   const baseUrl = `http://127.0.0.1:${port}`;
   try {
@@ -830,6 +922,33 @@ async function driveBoomCapture({
         `no captured crash event after hitting /boom (crashMode; the bounded ` +
           `flush must land the event before process.exit)\n${server.log.slice(-1500)}`,
       );
+    }
+
+    // A plain request too: the crash path never exercises the request
+    // middleware, so without this the harness cannot tell a wired middleware
+    // from one that is posting unauthenticated and being rejected.
+    if (recipe.wireAssertions.some((w) => w.id === "backend-req-event")) {
+      try {
+        await fetch(`${baseUrl}/`, {
+          headers: { [HARNESS_SESSION_HEADER]: "ses_installer_harness" },
+          signal: AbortSignal.timeout(3_000),
+        });
+      } catch {
+        // The capture is what matters, not the response.
+      }
+      if (!(await waitFor(() => backendReqState(ingest).seen, 8_000))) {
+        throw new Error(
+          `no backend.req.* span after a plain request\n${server.log.slice(-1500)}`,
+        );
+      }
+      if (!backendReqState(ingest).authed) {
+        throw new Error(
+          `backend.req.* span reached ingest with NO X-Crumbtrail-Auth header — ` +
+            `the middleware read the key before the .env file was loaded\n` +
+            server.log.slice(-1500),
+        );
+      }
+      phase("PASS", `${name}:req-drive`, `authed request span captured`);
     }
 
     // Trigger the throwing route; the record is fire-and-forget, so retry a few

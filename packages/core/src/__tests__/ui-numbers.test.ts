@@ -159,9 +159,35 @@ describe("scanUiNumbers element budget", () => {
     });
   });
 
-  it("drops rendered ISO days under sensitive labels", () => {
-    document.body.innerHTML = `<dl><dt>Birthdate</dt><dd>1990-01-02</dd></dl>`;
-    expect(scanUiNumbers(document.body)?.regions.get("dl")).toBeUndefined();
+  // The file's own header claimed "sensitive labels such as DOB are rejected by
+  // the existing label gate". Only the one-word spellings were: `dob` and
+  // `birthdate` matched as whole words, so "Date of Birth" (the way an account,
+  // patient or HR screen actually renders it) classified as free text, which
+  // the gate excludes rather than denies, and "Birthday" classified as keep
+  // outright. An epoch-day number under a readable label is a recoverable date
+  // of birth.
+  it.each([
+    "Birthdate",
+    "Date of Birth",
+    "Birthday",
+    "date_of_birth",
+    "Patient DOB",
+    "Birth Date",
+  ])("drops a rendered ISO day under the label %s", (label) => {
+    document.body.innerHTML = `<dl><dt>${label}</dt><dd>1990-01-02</dd></dl>`;
+    const scan = scanUiNumbers(document.body);
+    expect(scan?.regions.get("dl")).toBeUndefined();
+    expect(JSON.stringify([...(scan?.regions ?? [])])).not.toContain("7306");
+  });
+
+  // Over-redaction is its own bug: an ordinary dated row still captures.
+  it("still captures a rendered ISO day under an ordinary label", () => {
+    document.body.innerHTML = `<dl><dt>Shipped</dt><dd>1990-01-02</dd></dl>`;
+    expect(scanUiNumbers(document.body)?.regions.get("dl")).toContainEqual({
+      label: "Shipped",
+      value: Math.floor(Date.UTC(1990, 0, 2) / 86_400_000),
+      unit: "iso-day",
+    });
   });
 });
 
@@ -757,7 +783,9 @@ describe("uiNumbersCollector", () => {
 
     for (const snapshot of uiNumEvents(events)) {
       expect(snapshot.d).toMatchObject({ lang: null, dir: "ltr" });
-      expect(snapshot.d.items).toEqual([{ label: "Total", value: 42, unit: "$" }]);
+      expect(snapshot.d.items).toEqual([
+        { label: "Total", value: 42, unit: "$" },
+      ]);
     }
 
     window.history.replaceState(null, "", "/");

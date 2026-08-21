@@ -28,6 +28,7 @@ import {
   capacitorInitSnippet,
   clientInitSnippet,
   expressErrorMiddlewareSnippet,
+  expressEnvPreloadSnippet,
   expressManualWiringSnippet,
   expressMiddlewareImportSnippet,
   expressRequestMiddlewareSnippet,
@@ -231,6 +232,59 @@ function installedNextVersion(cwd: string, io: InjectIO): string | null {
   }
 }
 
+/** True when this package.json declares `name` as a dependency of any kind. */
+function dependsOn(cwd: string, io: InjectIO, name: string): boolean {
+  const text = io.readFile(path.join(cwd, "package.json"));
+  if (text == null) return false;
+  try {
+    const pkg = JSON.parse(text) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+      peerDependencies?: Record<string, string>;
+    };
+    return (
+      name in
+      { ...pkg.dependencies, ...pkg.devDependencies, ...pkg.peerDependencies }
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every npm package whose presence means this app is already wired. The mobile
+ * SDKs are on the list because they are what a React Native / Capacitor install
+ * actually adds: leaving them off let a re-run mint a second service and a
+ * second ingest key for an app that was already reporting.
+ */
+const CRUMBTRAIL_SDK_PACKAGES = [
+  "crumbtrail-core",
+  "crumbtrail-node",
+  "crumbtrail-react-native",
+  "crumbtrail-capacitor",
+] as const;
+
+/**
+ * The installed `nuxt` MAJOR from `node_modules/nuxt/package.json`, or null when
+ * nuxt is not installed / unreadable. Read from what will actually run rather
+ * than the declared range, for the same reason `installedNextVersion` is: a
+ * range like `^3` says nothing about which srcDir layout the resolved install
+ * scans.
+ */
+function installedNuxtMajor(cwd: string, io: InjectIO): number | null {
+  const text = io.readFile(
+    path.join(cwd, "node_modules", "nuxt", "package.json"),
+  );
+  if (text == null) return null;
+  try {
+    const pkg = JSON.parse(text) as { version?: string };
+    const major = Number.parseInt(String(pkg.version ?? "").trim(), 10);
+    return Number.isFinite(major) ? major : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * True when this package already depends on a Crumbtrail SDK. Load-bearing for
  * the batch installer, which must decide whether to provision a service BEFORE
@@ -254,7 +308,7 @@ export function projectAlreadyWired(cwd: string, io: InjectIO): boolean {
       devDependencies?: Record<string, string>;
     };
     const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-    return "crumbtrail-core" in deps || "crumbtrail-node" in deps;
+    return CRUMBTRAIL_SDK_PACKAGES.some((name) => name in deps);
   } catch {
     return false;
   }
@@ -342,7 +396,11 @@ export function findInstrumentationClient(
 
 function planNext(input: BuildPlanInput, io: InjectIO): Plan {
   const { cwd } = input;
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
+  const block = clientInitSnippet(
+    input.endpoint,
+    keyExprFor(input)!,
+    input.serviceName,
+  );
   // Prefer `src/` when the app uses a src directory.
   const usesSrc =
     io.exists(path.join(cwd, "src", "app")) ||
@@ -376,7 +434,11 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
           : undefined,
       );
     }
-    return createPlan(input, path.join(baseDir, "instrumentation-client.ts"), block);
+    return createPlan(
+      input,
+      path.join(baseDir, "instrumentation-client.ts"),
+      block,
+    );
   }
 
   // Older Next (<15.3): instrumentation-client.ts is NOT auto-loaded, so the
@@ -417,7 +479,11 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
 
 function planSvelteKit(input: BuildPlanInput, io: InjectIO): Plan {
   const target = path.join(input.cwd, "src", "hooks.client.ts");
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
+  const block = clientInitSnippet(
+    input.endpoint,
+    keyExprFor(input)!,
+    input.serviceName,
+  );
   if (io.exists(target)) {
     return prependWithPreflight(input, io, target, block);
   }
@@ -426,15 +492,26 @@ function planSvelteKit(input: BuildPlanInput, io: InjectIO): Plan {
 
 function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
   const { cwd } = input;
-  // Nuxt 4's default srcDir is app/, so plugins are scanned from app/plugins/.
-  // Target app/plugins/ when an app/ directory exists (mirrors planNext's
-  // usesSrc probe); fall back to the repo-root plugins/ for Nuxt 3. Getting this
-  // wrong is a silent zero-capture: Nuxt 4 never loads a root plugins/ file.
-  const baseDir = io.exists(path.join(cwd, "app"))
-    ? path.join(cwd, "app")
-    : cwd;
+  // Nuxt 4's default srcDir is app/, so plugins are scanned from app/plugins/;
+  // Nuxt 3 scans plugins/ from the project root. Getting this wrong is a silent
+  // zero-capture in either direction — neither version loads the other's path.
+  //
+  // The installed major decides it. A bare `app/` existence probe does not: Nuxt
+  // 3 also recognises a root-level app/ directory (app/router.options.ts), so
+  // such a project was misread as Nuxt 4 and got a plugin Nuxt 3 never scans.
+  // The probe stays as the fallback for when the version cannot be read (nuxt
+  // not installed yet), where an app/ directory is still the best signal there
+  // is.
+  const major = installedNuxtMajor(cwd, io);
+  const usesAppDir =
+    major != null ? major >= 4 : io.exists(path.join(cwd, "app"));
+  const baseDir = usesAppDir ? path.join(cwd, "app") : cwd;
   const target = path.join(baseDir, "plugins", "crumbtrail.client.ts");
-  const block = nuxtPluginSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
+  const block = nuxtPluginSnippet(
+    input.endpoint,
+    keyExprFor(input)!,
+    input.serviceName,
+  );
   if (io.exists(target)) {
     const existing = io.readFile(target);
     if (existing && referencesCrumbtrail(existing)) return skipPlan(input);
@@ -447,7 +524,11 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
 }
 
 function planVite(input: BuildPlanInput, io: InjectIO): Plan {
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
+  const block = clientInitSnippet(
+    input.endpoint,
+    keyExprFor(input)!,
+    input.serviceName,
+  );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the Vite entry from index.html — wire it manually.",
@@ -501,7 +582,9 @@ function planNode(input: BuildPlanInput, io: InjectIO): Plan {
  */
 function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   const { endpoint } = input;
-  const keyExpr = keyExprFor(input)!;
+  const keyRef = keyRefFor(input)!;
+  const keyExpr = keyRef.expr;
+  const keyEnvVar = keyRef.envVar;
   const block = nodeInitSnippet(endpoint, keyExpr, input.serviceName);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -531,7 +614,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   if (wired == null) {
     // Anchors not found: prepend autoCapture plus a TODO block with exact copy
     // and paste instructions, and surface the same guidance in wizard output.
-    const combined = `${block}\n\n${expressManualWiringSnippet(endpoint, keyExpr)}`;
+    const combined = `${block}\n\n${expressEnvPreloadSnippet(keyEnvVar)}\n\n${expressManualWiringSnippet(endpoint, keyExpr)}`;
     return prependWithPreflight(input, io, target, combined, [
       "Express request middleware was NOT wired automatically (no `const app = express()` / `app.listen(...)` anchors found). Follow the TODO block added at the top of the entry: register createCrumbtrailExpressMiddleware before your routes and createCrumbtrailExpressErrorMiddleware after them, or backend request spans stay empty.",
     ]);
@@ -541,7 +624,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   // and the middleware import prepended after any shebang/directive prologue.
   const content = prependIntoSource(
     wired.text,
-    `${block}\n\n${expressMiddlewareImportSnippet(style!)}`,
+    `${block}\n\n${expressEnvPreloadSnippet(keyEnvVar)}\n\n${expressMiddlewareImportSnippet(style!)}`,
   );
   const warnings = [
     wired.errorAnchor === "existing-error-handler"
@@ -578,7 +661,11 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
  * <RemixBrowser> and break hydration (a deliberate divergence from planNext).
  */
 function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
+  const block = clientInitSnippet(
+    input.endpoint,
+    keyExprFor(input)!,
+    input.serviceName,
+  );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve app/entry.client.* — on a React Router 7 default template the client entry is hidden, so run `npx react-router reveal` to unhide app/entry.client.tsx (and entry.server.tsx), then re-run the wizard. Otherwise add the snippet to your Remix client entry manually (do not let the CLI create it; it would omit hydrateRoot).",
@@ -594,7 +681,11 @@ function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
  * guidance, not an apology.
  */
 function planAstro(input: BuildPlanInput, _io: InjectIO): Plan {
-  const block = clientInitSnippet(input.endpoint, keyExprFor(input)!, input.serviceName);
+  const block = clientInitSnippet(
+    input.endpoint,
+    keyExprFor(input)!,
+    input.serviceName,
+  );
   return fallbackPlan(input, block, [
     "Astro has no single client entry — add this snippet inside a client-side <script> in a shared layout (e.g. src/layouts/*.astro) so it runs on every page.",
   ]);
@@ -657,7 +748,11 @@ function planCapacitor(input: BuildPlanInput, io: InjectIO): Plan {
   const keyExpr = angularHosted
     ? CAPACITOR_ANGULAR_KEY_EXPR
     : keyExprFor(input)!;
-  const block = capacitorInitSnippet(input.endpoint, keyExpr, input.serviceName);
+  const block = capacitorInitSnippet(
+    input.endpoint,
+    keyExpr,
+    input.serviceName,
+  );
 
   // Native plugins are optional peers, so the SDK degrades rather than failing
   // without them — but a user who installs none gets web capture and no phone
@@ -793,17 +888,33 @@ function planFlutter(input: BuildPlanInput, io: InjectIO): Plan {
 }
 
 function planReactNative(input: BuildPlanInput, io: InjectIO): Plan {
+  // Session continuity needs a store, and on React Native that is AsyncStorage.
+  // Only wire it when the app already has it: Metro resolves every import at
+  // bundle time, so emitting the import for a package that is not installed
+  // would trade a lost session id for an app that does not build.
+  const hasAsyncStorage = dependsOn(
+    input.cwd,
+    io,
+    "@react-native-async-storage/async-storage",
+  );
   const block = reactNativeInitSnippet(
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    hasAsyncStorage,
   );
+  const warnings = hasAsyncStorage
+    ? []
+    : [
+        "No @react-native-async-storage/async-storage in this app, so Crumbtrail wired capture without session continuity: every cold start opens a new session, and an intermittent bug never accumulates into one signature. Install it (`npx expo install @react-native-async-storage/async-storage`) and re-run `npx crumbtrail` to wire the store in.",
+      ];
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the React Native entry (App/_layout/index) — wire it manually.",
+      ...warnings,
     ]);
   }
-  return prependWithPreflight(input, io, input.entryFile, block);
+  return prependWithPreflight(input, io, input.entryFile, block, warnings);
 }
 
 /**

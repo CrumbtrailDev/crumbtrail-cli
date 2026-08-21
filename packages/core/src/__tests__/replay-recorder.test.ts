@@ -214,6 +214,48 @@ describe("ReplayRecorder", () => {
     await recorder.stop();
   });
 
+  // The opening snapshot drops `value`, `nonce`, `integrity` and every `on*`
+  // handler. The mutation branch used to re-read getAttribute with no filter at
+  // all, so the guarantee lasted exactly until the first setAttribute — and
+  // `el.setAttribute("value", ...)` is the ordinary vanilla/jQuery way to
+  // prefill or clear a field. Asserted against the whole decompressed chunk,
+  // not against a sibling field.
+  it("never writes a mutated form value or security attribute into a chunk", async () => {
+    const { recorder, uploads } = makeRecorder();
+    document.body.innerHTML =
+      '<form><input id="card" name="card"><script id="s"></script></form>';
+    recorder.start();
+    await recorder.flush();
+
+    const pan = "4111111111111111";
+    document.querySelector("#card")!.setAttribute("value", pan);
+    document.querySelector("#s")!.setAttribute("nonce", "n0nc3-abc123");
+    document.querySelector("#s")!.setAttribute("integrity", "sha384-zzz");
+    document
+      .querySelector("#card")!
+      .setAttribute("onfocus", "stealTheThing(document.cookie)");
+    // A layout attribute through the same path still records, so the filter is
+    // a filter and not a mute button.
+    document.querySelector("#card")!.setAttribute("class", "is-invalid");
+    await settle();
+    await recorder.flush();
+
+    const serialized = JSON.stringify(
+      await Promise.all(
+        uploads
+          .filter((entry) => entry.name.endsWith(".json.gz"))
+          .map(async (entry) => JSON.parse(await gunzip(entry.bytes))),
+      ),
+    );
+    expect(serialized).not.toContain(pan);
+    expect(serialized).not.toContain("n0nc3-abc123");
+    expect(serialized).not.toContain("sha384-zzz");
+    expect(serialized).not.toContain("stealTheThing");
+    expect(serialized).toContain("is-invalid");
+
+    await recorder.stop();
+  });
+
   it("masks rendered text as well under text_masked", async () => {
     const { recorder, uploads } = makeRecorder({ masking: "text_masked" });
     document.body.innerHTML = "<p>Order 4471 failed</p>";

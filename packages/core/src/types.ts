@@ -217,7 +217,44 @@ export interface CaptureGapEventData {
     /** A request emitted `backend.req.start` and was closed out without a terminal status. */
     | "request_unterminated"
     /** The event was built but its delivery to the capture endpoint never succeeded. */
-    | "delivery_failed";
+    | "delivery_failed"
+    /**
+     * The remote capture policy never arrived — blocked by a client-side
+     * blocker, offline on first load, or an endpoint that answers with no
+     * policy at all. Capture fell back to the local config rather than staying
+     * closed for the life of the session, and this says so.
+     */
+    | "policy_unavailable"
+    /** Events were dropped from the pending batch because the bus buffer hit its cap. */
+    | "buffer_overflow"
+    /**
+     * Reasons authored by the hosted capture edge rather than by an SDK.
+     *
+     * The edge writes `k:"capture_gap"` events of its own when it sheds or
+     * refuses a batch, so this event kind has two producers. They are listed
+     * here because a reader narrowing on `d.kind === "capture_gap"` reads both,
+     * and a union that only described the client half made every server
+     * authored gap an untyped value the reader had to treat as a free string.
+     *
+     * The five rejection reasons stay distinct because the customer's next step
+     * differs: a card, a plan, fewer sessions, a slower burst, or nothing at all.
+     */
+    /** Project capture is switched off at the edge. */
+    | "kill_switch"
+    /** The project's hourly session budget is spent. */
+    | "sessions_per_hour"
+    /** The project's daily byte budget is spent. */
+    | "bytes_per_day"
+    /** Tenant burst limiter, before the request was dispatched (429). */
+    | "rate_limited_ingest"
+    /** Tenant burst limiter inside session start (429). */
+    | "rate_limited_session_start"
+    /** The trial ended without a subscription (402). */
+    | "trial_expired"
+    /** The subscription was cancelled after repeated charge failures (402). */
+    | "payment_failed"
+    /** The monthly session cap for the account's tier is spent (402). */
+    | "upgrade_required";
   detail?: string;
   /**
    * How many events the gap accounts for, when the surface can count them.
@@ -553,9 +590,12 @@ export interface CrumbtrailConfig {
   networkCorrelationAllowedOrigins: string[];
   /**
    * Network JSON-body redaction policy.
-   * - `mode: "structured"` (default): JSON bodies ≤ 16 KB keep their structure;
-   *   each value goes through the deny-biased v2 classifier and redacted values
-   *   carry non-recoverable shape metadata. Tagged `crumbtrail.browser-redaction.v2`.
+   * - `mode: "structured"` (default): every captured JSON body keeps its
+   *   structure; each value goes through the deny-biased v2 classifier and
+   *   redacted values carry non-recoverable shape metadata. Tagged
+   *   `crumbtrail.browser-redaction.v2`. There is no size threshold: a body
+   *   large enough to store is large enough to walk, so redaction strength
+   *   never varies with payload size.
    * - `mode: "full"`: restores the v1 whole-body behavior exactly.
    * - `denyFields`: extra field names added to the redaction deny list,
    *   matched as substrings of the compacted (lowercased, alphanumeric-only)
@@ -583,6 +623,12 @@ export interface CrumbtrailConfig {
   };
 
   // Interaction
+  /**
+   * Input types masked before the classifier sees the value, for `inp` events
+   * and keystrokes alike. Use it for a type whose contents are sensitive
+   * whatever was typed into it: the default list masks `number`, so a 2FA code
+   * is not kept the way an ordinary quantity is.
+   */
   maskInputTypes: string[];
   /**
    * Always masks DOM derived text before it enters the browser ring buffer.
@@ -591,9 +637,18 @@ export interface CrumbtrailConfig {
    */
   maskAllText: true;
   /**
-   * Always masks input and keystroke values before they enter the browser ring
-   * buffer. Use data-crumbtrail-unmask only on an individual element that is
-   * safe to capture.
+   * Always masks keystrokes, and renders every redacted input value as a mask
+   * rather than a placeholder, before either enters the browser ring buffer.
+   * Use data-crumbtrail-unmask only on an individual element that is safe to
+   * capture.
+   *
+   * It is not a blanket over captured input values, and describing it as one
+   * was wrong: an `inp` event has a field name and a policy, so what it stores
+   * is decided by the same deny-biased classifier as a request body — free
+   * prose, an email, a card number, a token and a high-entropy secret are
+   * redacted, a number or a short code is kept. `maskInputTypes` masks a whole
+   * input type ahead of that judgement, and `redaction.captureInputValues:
+   * false` is the blanket that stops input values being recorded at all.
    */
   maskAllInputs: true;
   ignoreSelectors: string[];
@@ -966,6 +1021,16 @@ export interface CollectorContext {
    * at flag time through the same redaction/truncation path as app state providers.
    */
   registerStateProvider?: (name: string, provider: () => unknown) => () => void;
+  /**
+   * Settles once admission has been DECIDED, with whether capture may proceed.
+   *
+   * A collector holding evidence that cannot be re-read — the one-shot
+   * `crumbtrail-core/early` queue is the only one today — must not emit it while
+   * the bus is still refusing events, because a refused event is gone for good.
+   * `true` means release it now, `false` means discard it. Absent means there is
+   * no gate to wait on, so release immediately.
+   */
+  whenCaptureAdmitted?: (settle: (admitted: boolean) => void) => void;
 }
 
 export interface CrumbtrailTransport {

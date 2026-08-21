@@ -6,8 +6,7 @@ export const BROWSER_REDACTION_POLICY = "crumbtrail.browser-redaction.v1";
  */
 export const BROWSER_REDACTION_POLICY_V2 = "crumbtrail.browser-redaction.v2";
 export type BrowserRedactionPolicy =
-  | typeof BROWSER_REDACTION_POLICY
-  | typeof BROWSER_REDACTION_POLICY_V2;
+  typeof BROWSER_REDACTION_POLICY | typeof BROWSER_REDACTION_POLICY_V2;
 export const REDACTED_VALUE = "[REDACTED]";
 export const REDACTED_STORAGE_KEY = "[REDACTED_KEY]";
 
@@ -77,10 +76,16 @@ export interface BodyRedactionOptions {
   maxLength?: number;
   path?: string;
   /**
-   * "structured": JSON bodies ≤ {@link STRUCTURED_BODY_MAX_BYTES} go through the
-   * v2 per-value classifier (structure preserved, sensitive values replaced with
-   * `[REDACTED]` + shape metadata, policy tag bumped to v2). "full" (default at
-   * this layer) keeps the v1 whole-body behavior exactly.
+   * "structured": every JSON body the caller is willing to store goes through
+   * the v2 per-value classifier (structure preserved, sensitive values replaced
+   * with `[REDACTED]` + shape metadata, policy tag bumped to v2). "full"
+   * (default at this layer) keeps the v1 whole-body behavior exactly.
+   *
+   * There is deliberately no size gate here. Redaction strength must not be a
+   * function of payload size: a size-gated downgrade silently applies a weaker
+   * policy to exactly the large bodies most likely to contain a card number or
+   * an address book. `maxLength` is the only size decision, and it drops the
+   * body rather than downgrading how it is scrubbed.
    */
   mode?: StructuredRedactionMode;
   /**
@@ -124,6 +129,13 @@ export interface InputValueRedactionOptions {
   name?: string;
   type?: string;
   path?: string;
+  /**
+   * The caller has already decided this field is masked — the element carries a
+   * sensitivity marker, or its `type` is on the deployment's
+   * `maskInputTypes` list. Redacted on that alone, before anything reads the
+   * value or consults the classifier, exactly as `password` is.
+   */
+  maskedByPolicy?: boolean;
 }
 
 const SENSITIVE_HEADER_NAMES = new Set([
@@ -251,7 +263,17 @@ const SENSITIVE_COMPACT_SUFFIXES = [
   "xsrftoken",
 ];
 
-const TOKEN_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+/**
+ * `generic: true` marks a pattern that matches by shape alone rather than by a
+ * declared secret prefix. Those two are the ones that also match a correlation
+ * id — a W3C trace id is exactly 32 hex characters — so a caller that knows the
+ * field is an id can skip them while keeping every prefix-anchored rule.
+ */
+const TOKEN_PATTERNS: Array<{
+  pattern: RegExp;
+  reason: string;
+  generic?: boolean;
+}> = [
   {
     pattern: /\b(?:Bearer|Token|Basic)\s+[A-Za-z0-9._~+/=-]{8,}\b/gi,
     reason: "auth_scheme_token",
@@ -265,9 +287,45 @@ const TOKEN_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
       /(?:sk|pk|rk|ghp|gho|ghu|ghs|glpat|xox[baprs])[-_][A-Za-z0-9_.=-]{12,}/gi,
     reason: "prefixed_token",
   },
-  { pattern: /\b[A-Fa-f0-9]{32,}\b/g, reason: "long_hex_token" },
-  { pattern: /\b[A-Za-z0-9_-]{40,}\b/g, reason: "long_token_like_string" },
+  { pattern: /\b[A-Fa-f0-9]{32,}\b/g, reason: "long_hex_token", generic: true },
+  {
+    pattern: /\b[A-Za-z0-9_-]{40,}\b/g,
+    reason: "long_token_like_string",
+    generic: true,
+  },
 ];
+
+/**
+ * Headers whose entire purpose is to join this session to a record in the
+ * customer's own logging (Splunk, Datadog, CloudWatch, any OTel backend).
+ *
+ * Their values are ids by specification, not credentials, and they are exactly
+ * the shape the generic token patterns match — a W3C trace id is 32 hex
+ * characters, and so is the usual `x-request-id`. Scrubbing them destroys the
+ * one field that makes a captured session findable on the other side, and it
+ * only bites the accounts that already propagate tracing, i.e. the ones where
+ * the join was going to work. Prefix-anchored secret patterns (Bearer, JWT,
+ * `sk_`/`ghp_`/…) still run on these values, so a credential misfiled into one
+ * is still caught.
+ */
+const CORRELATION_HEADER_NAMES = new Set([
+  "b3",
+  "traceparent",
+  "tracestate",
+  "x-amzn-trace-id",
+  "x-b3-flags",
+  "x-b3-parentspanid",
+  "x-b3-sampled",
+  "x-b3-spanid",
+  "x-b3-traceid",
+  "x-cloud-trace-context",
+  "x-correlation-id",
+  "x-datadog-parent-id",
+  "x-datadog-span-id",
+  "x-datadog-trace-id",
+  "x-request-id",
+  "x-trace-id",
+]);
 const REDACTED_KEY = "[REDACTED_KEY]";
 const SENSITIVE_PATH_PRECEDERS = new Set([
   "code",
@@ -398,11 +456,13 @@ function buildSummary(
 export function redactTokenLikeString(
   value: string,
   path = "value",
+  options: { skipGenericShapePatterns?: boolean } = {},
 ): RedactionResult<string> {
   let output = value;
   const fields: RedactionField[] = [];
 
-  for (const { pattern, reason } of TOKEN_PATTERNS) {
+  for (const { pattern, reason, generic } of TOKEN_PATTERNS) {
+    if (generic && options.skipGenericShapePatterns) continue;
     pattern.lastIndex = 0;
     let matched = false;
     output = output.replace(pattern, () => {
@@ -587,7 +647,18 @@ function sanitizeKeyName(key: string): string {
   return redactTokenLikeString(key).value === key ? key : REDACTED_KEY;
 }
 
-function uniqueOutputKey(key: string, output: Record<string, unknown>): string {
+/**
+ * A collision-free name for a redacted key in an output map.
+ *
+ * Every sensitive key redacts to the same constant, so three tokens in
+ * localStorage used to write one entry and the reader could not tell "the token
+ * was never written" from "the token was written under three different names".
+ * The suffix keeps the cardinality without saying anything about the names.
+ */
+export function uniqueOutputKey(
+  key: string,
+  output: Record<string, unknown>,
+): string {
   if (!Object.prototype.hasOwnProperty.call(output, key)) return key;
   let suffix = 2;
   while (Object.prototype.hasOwnProperty.call(output, `${key}_${suffix}`))
@@ -1096,7 +1167,9 @@ export function redactHeaders(
       ? redactUrl(rawValue, `${path}.${outputName}`)
       : normalized === "link" || headerValueLooksUrlLike(rawValue)
         ? redactUrlLikeHeaderValue(rawValue, `${path}.${outputName}`)
-        : redactTokenLikeString(rawValue, `${path}.${outputName}`);
+        : redactTokenLikeString(rawValue, `${path}.${outputName}`, {
+            skipGenericShapePatterns: CORRELATION_HEADER_NAMES.has(normalized),
+          });
     output[outputName] = valueResult.value;
     if (valueResult.metadata) fields.push(...valueResult.metadata.fields);
   }
@@ -1206,7 +1279,7 @@ export function redactCookieMap(
   const metadataItems: Array<RedactionMetadata | undefined> = [];
 
   for (const [name, value] of Object.entries(cookies)) {
-    const safeName = sanitizeKeyName(name);
+    const safeName = uniqueOutputKey(sanitizeKeyName(name), output);
     const result = redactCookieValue(
       name,
       value,
@@ -1298,7 +1371,10 @@ function redactJsonValue(
   // key-name redaction above still wins on a sensitive column.
   if (value instanceof Date) {
     const time = value.getTime();
-    return { value: Number.isFinite(time) ? value.toISOString() : null, fields: [] };
+    return {
+      value: Number.isFinite(time) ? value.toISOString() : null,
+      fields: [],
+    };
   }
 
   if (value !== null && typeof value === "object") {
@@ -1622,9 +1698,6 @@ function replaceSensitiveMarkupPayloadAttributes(attrs: string): string {
 
 export type StructuredRedactionMode = "structured" | "full";
 
-/** JSON bodies above this size skip the structured walk and keep v1 behavior. */
-export const STRUCTURED_BODY_MAX_BYTES = 16_384;
-
 export type RedactedShapeCharset = "alpha" | "num" | "alnum" | "mixed";
 
 /**
@@ -1647,8 +1720,7 @@ export interface RedactedValueShape {
 }
 
 export type StructuredClassification =
-  | { action: "keep" }
-  | { action: "redact"; reason: string };
+  { action: "keep" } | { action: "redact"; reason: string };
 
 /**
  * V2 additions to the field-name deny list, matched as substrings of the
@@ -1668,6 +1740,12 @@ const STRUCTURED_DENY_NAME_TOKENS = [
   "address",
   "iban",
   "account",
+  // Date of birth. `dob` and `birthdate` were matched as whole words only, so
+  // "Date of Birth" (compacted: dateofbirth), "date_of_birth" and "Birthday"
+  // all classified as keep — and a birth date is directly identifying under
+  // GDPR and HIPAA alike. As a substring this also covers birthDay, birthYear,
+  // birthPlace and patientBirthDate.
+  "birth",
 ];
 
 /**
@@ -1824,9 +1902,31 @@ function shannonEntropyBitsPerChar(value: string): number {
   return entropy;
 }
 
+/**
+ * Whether a string looks randomly generated rather than authored.
+ *
+ * Two bands. At 24 characters and up, entropy alone decides: nothing an
+ * application names its states is that long and that varied. Between 16 and 23
+ * characters entropy alone cannot separate `AKIAIOSFODNN7EXAMPLE` (3.68
+ * bits/char) from `subscription_active` (3.68), so that band additionally
+ * requires the character mixing a generated secret has and an enum name does
+ * not: either both letter cases, or digits interleaved into letters with no
+ * word separator. `PAYMENT_DECLINED`, `INTERNAL_ERROR_500` and
+ * `order_status_new` all fail that second test and stay verbatim.
+ *
+ * Below 16 characters nothing is claimed: the band is dominated by status
+ * words, currency codes and short ids, and the value-shape rules above
+ * (Luhn, IBAN, JWT, prefixed tokens) already cover the sensitive cases.
+ */
 function isHighEntropyString(value: string): boolean {
-  if (value.length < 24 || /\s/.test(value)) return false;
-  return shannonEntropyBitsPerChar(value) >= 3.5;
+  if (value.length < 16 || /\s/.test(value)) return false;
+  const bits = shannonEntropyBitsPerChar(value);
+  if (value.length >= 24) return bits >= 3.5;
+  if (bits < 3.6) return false;
+  const mixedCase = /[a-z]/.test(value) && /[A-Z]/.test(value);
+  const digitsInWord =
+    /[0-9]/.test(value) && /[A-Za-z]/.test(value) && !/[_\-./: ]/.test(value);
+  return mixedCase || digitsInWord;
 }
 
 /** Lazily-initialized per-session random salt for shape hashes. */
@@ -1868,7 +1968,8 @@ function fnv1a32Hex(value: string): string {
  * space is trivially enumerable (numeric with len < 12, or any len < 6).
  */
 export function computeRedactedShape(value: unknown): RedactedValueShape {
-  const text = typeof value === "string" ? value : JSON.stringify(value) ?? "";
+  const text =
+    typeof value === "string" ? value : (JSON.stringify(value) ?? "");
   const charset: RedactedShapeCharset = /^[A-Za-z]+$/.test(text)
     ? "alpha"
     : /^[0-9]+$/.test(text)
@@ -1935,8 +2036,7 @@ export function classifyStructuredValue(
     }
     return { action: "keep" };
   }
-  if (value === null || typeof value === "boolean")
-    return { action: "keep" };
+  if (value === null || typeof value === "boolean") return { action: "keep" };
   if (typeof value !== "string")
     return { action: "redact", reason: "unknown_value" };
   if (STRUCTURED_EMAIL_RE.test(value))
@@ -2243,11 +2343,7 @@ export function redactNetworkTextBody(
 
   if (kind === "form") return redactFormBody(body, path);
 
-  if (
-    kind === "json" &&
-    options.mode === "structured" &&
-    body.length <= STRUCTURED_BODY_MAX_BYTES
-  ) {
+  if (kind === "json" && options.mode === "structured") {
     // Structured (v2) treatment. Any failure — malformed JSON or an unexpected
     // walker error — falls through to the v1 path below; never throw upward.
     try {
@@ -2454,7 +2550,8 @@ const PROBE_KEY_MAX_WORD_LENGTH = 24;
 const PROBE_KEY_MAX_UPPERCASE = 4;
 
 function isPlainKeyWord(span: string): boolean {
-  if (span.length === 0 || span.length > PROBE_KEY_MAX_WORD_LENGTH) return false;
+  if (span.length === 0 || span.length > PROBE_KEY_MAX_WORD_LENGTH)
+    return false;
   if (/[0-9]/.test(span)) return false;
   let uppercase = 0;
   for (let index = 0; index < span.length; index += 1) {
@@ -2627,6 +2724,14 @@ export function redactInputValue(
   // field is publishing a password because someone named it `note`.
   if (type === "password" || type === "email" || type === "tel") {
     return redactedInput(value, path, "sensitive_input_value");
+  }
+
+  // The caller's own masking decision, which is the only place `maskInputTypes`
+  // is visible. It settles before the classifier runs, because a deployment
+  // that listed `number` did so to stop a 2FA code being recorded, and the
+  // classifier keeps a number.
+  if (options.maskedByPolicy) {
+    return redactedInput(value, path, "masked_input_type");
   }
 
   // A field the built-in heuristics call sensitive - `ssn`, `cvv`, `dob` - is redacted on the name.

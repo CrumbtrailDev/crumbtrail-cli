@@ -1,3 +1,4 @@
+import { fakeStripeLiveKey } from "../../__tests__/fixtures/fake-secrets";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { EventBus } from "../../event-bus";
 import { DEFAULT_CONFIG, type BugEvent } from "../../types";
@@ -59,7 +60,9 @@ describe("workerCollector", () => {
   it("records that a worker was started and which script it ran", () => {
     spawn();
 
-    expect(msgs()).toMatchObject([{ op: "start", script: "/pricing.worker.js" }]);
+    expect(msgs()).toMatchObject([
+      { op: "start", script: "/pricing.worker.js" },
+    ]);
   });
 
   // The worker's own protocol names the inputs and outputs of a computation this SDK cannot see
@@ -101,6 +104,50 @@ describe("workerCollector", () => {
       op: "error",
       msg: "pricing table missing",
     });
+  });
+
+  // A worker error reaches no other surface, so this string is the only copy of
+  // it. Applications throw credentials into error messages ("auth failed for
+  // a live-key-shaped value), and every other error surface scrubs this field. The
+  // assertion is on the whole serialized event, not on a sibling field.
+  it("redacts a secret in a worker error message", () => {
+    const worker = spawn();
+    const secret = fakeStripeLiveKey("51H8xQ2eZvKYlo2CabcdEFGHijklmnop");
+    worker.dispatchEvent(
+      Object.assign(new Event("error"), {
+        message: `auth failed for ${secret}`,
+      }),
+    );
+
+    const entry = msgs().at(-1);
+    expect(JSON.stringify(entry)).not.toContain(secret);
+    expect(entry).toMatchObject({ op: "error" });
+    // The sentence around the secret is what makes the failure legible, so it
+    // survives; only the token is replaced.
+    expect(String(entry?.msg)).toContain("auth failed for");
+  });
+
+  it("redacts a tokenized URL in a worker error message", () => {
+    const worker = spawn();
+    worker.dispatchEvent(
+      Object.assign(new Event("error"), {
+        message:
+          "GET https://api.example.com/sync?token=abc123XYZsecret failed",
+      }),
+    );
+
+    expect(JSON.stringify(msgs().at(-1))).not.toContain("abc123XYZsecret");
+  });
+
+  // Same mistake as the socket collector: declaring `application/json` on a
+  // message that is not JSON dropped it entirely and blamed the application.
+  it("keeps the content of a non-JSON message", () => {
+    const worker = spawn();
+    worker.postMessage("ready");
+
+    const entry = msgs().find((item) => item.op === "post");
+    expect(entry?.body).toBe("ready");
+    expect(entry?.bodySummary).toBeUndefined();
   });
 
   it("stops quoting past the cap", () => {

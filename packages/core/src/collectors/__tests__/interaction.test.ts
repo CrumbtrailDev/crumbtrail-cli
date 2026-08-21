@@ -92,6 +92,77 @@ describe("interactionCollector", () => {
     document.body.removeChild(el);
   });
 
+  // `matches` tested the exact event target, so a click on a button INSIDE an
+  // ignored panel was captured with its full descriptor, and the input and
+  // submit paths never consulted the list at all.
+  it("skips everything inside an ignoreSelectors subtree", () => {
+    cleanup();
+    cleanup = interactionCollector(bus, {
+      ...DEFAULT_CONFIG,
+      ignoreSelectors: [".private-panel"],
+    });
+    bus.flush();
+    events.length = 0;
+
+    const panel = document.createElement("div");
+    panel.className = "private-panel";
+    panel.innerHTML =
+      '<form id="pf"><button id="pay">Pay</button><input name="note"></form>';
+    document.body.appendChild(panel);
+
+    (panel.querySelector("#pay") as HTMLButtonElement).click();
+    const input = panel.querySelector("input") as HTMLInputElement;
+    input.value = "my private note about the failure";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    (panel.querySelector("#pf") as HTMLFormElement).dispatchEvent(
+      new Event("submit", { bubbles: true }),
+    );
+    bus.flush();
+
+    expect(events).toHaveLength(0);
+
+    document.body.removeChild(panel);
+  });
+
+  // Structural identifiers are exempt from text masking because a masked
+  // selector correlates nothing — but a page that templates an address into an
+  // id (`<tr id={`user-${email}`}>`) put it into the descriptor in clear.
+  it("does not publish PII templated into an id or class", () => {
+    const row = document.createElement("div");
+    row.id = "user-alice@example.com";
+    row.className = "row-4111111111111111";
+    document.body.appendChild(row);
+
+    row.click();
+    bus.flush();
+
+    const serialized = JSON.stringify(events.filter((e) => e.k === "clk"));
+    expect(serialized).not.toContain("alice@example.com");
+    expect(serialized).not.toContain("4111111111111111");
+
+    document.body.removeChild(row);
+  });
+
+  // Over-redaction is its own bug: an ordinary id is the field that makes a
+  // click correlatable at all.
+  it("keeps an ordinary id and class verbatim", () => {
+    const row = document.createElement("div");
+    row.id = "user-12345-prefs";
+    row.className = "list-row";
+    document.body.appendChild(row);
+
+    row.click();
+    bus.flush();
+
+    const el = events.filter((e) => e.k === "clk")[0].d.el as Record<
+      string,
+      unknown
+    >;
+    expect(el.id).toBe("user-12345-prefs");
+
+    document.body.removeChild(row);
+  });
+
   it("uses configured safe descriptors and propagates descriptor redaction metadata", () => {
     cleanup();
     const descriptorRedaction = {
@@ -187,6 +258,61 @@ describe("interactionCollector", () => {
       reason: "sensitive_input_value",
     });
     expect(JSON.stringify(inpEvents[0].d)).not.toContain("secret123");
+
+    document.body.removeChild(input);
+  });
+
+  // `maskInputTypes` was read by the keystroke collector and by nothing else,
+  // so a deployment that listed `number` — the default list does — got masked
+  // keystrokes and the 2FA code itself in clear on the next `inp` event,
+  // because the classifier keeps a number and never saw the setting.
+  it("masks an input whose type is on maskInputTypes", () => {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.name = "code";
+    document.body.appendChild(input);
+
+    input.value = "482913";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    const inpEvents = events.filter((e) => e.k === "inp");
+    expect(JSON.stringify(inpEvents)).not.toContain("482913");
+    expect(inpEvents[0].d.valSummary).toMatchObject({
+      reason: "masked_input_type",
+    });
+
+    document.body.removeChild(input);
+  });
+
+  // Over-redaction is its own bug: a quantity is the evidence that explains a
+  // pricing defect, and a type nobody asked to mask is still captured.
+  it("keeps a value whose type is not on maskInputTypes", () => {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.name = "quantity";
+    document.body.appendChild(input);
+
+    input.value = "12";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    expect(events.filter((e) => e.k === "inp")[0].d.val).toBe("12");
+
+    document.body.removeChild(input);
+  });
+
+  it("honours data-crumbtrail-unmask over maskInputTypes", () => {
+    const input = document.createElement("input");
+    input.type = "number";
+    input.setAttribute("data-crumbtrail-unmask", "");
+    document.body.appendChild(input);
+
+    input.value = "7";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    bus.flush();
+
+    expect(events.filter((e) => e.k === "inp")[0].d.val).toBe("7");
 
     document.body.removeChild(input);
   });
@@ -343,9 +469,7 @@ describe("interactionCollector", () => {
     bus.flush();
 
     expect(
-      events.some(
-        (event) => event.k === "inp" && event.d.ev === "state",
-      ),
+      events.some((event) => event.k === "inp" && event.d.ev === "state"),
     ).toBe(false);
 
     document.body.removeChild(input);
@@ -505,7 +629,12 @@ describe("click integrity", () => {
 
   const clickOn = (element: Element, init: Partial<MouseEventInit> = {}) => {
     element.dispatchEvent(
-      new MouseEvent("click", { bubbles: true, clientX: 10, clientY: 20, ...init }),
+      new MouseEvent("click", {
+        bubbles: true,
+        clientX: 10,
+        clientY: 20,
+        ...init,
+      }),
     );
     bus.flush();
     return events.find((event) => event.k === "clk");
@@ -534,7 +663,8 @@ describe("click integrity", () => {
     // A control that re-rendered or detached between the click and the read.
     // "The target was gone" and "something covered it" call for different fixes,
     // so the record must not leave them looking the same.
-    document.body.innerHTML = '<button id="gone">Gone</button><div id="other"></div>';
+    document.body.innerHTML =
+      '<button id="gone">Gone</button><div id="other"></div>';
     const button = document.getElementById("gone")!;
     const other = document.getElementById("other")!;
     stubStack([other, document.body]);
@@ -572,7 +702,12 @@ describe("click integrity", () => {
     const inner = root.getElementById("inner")!;
 
     inner.dispatchEvent(
-      new MouseEvent("click", { bubbles: true, composed: true, clientX: 1, clientY: 1 }),
+      new MouseEvent("click", {
+        bubbles: true,
+        composed: true,
+        clientX: 1,
+        clientY: 1,
+      }),
     );
     bus.flush();
 

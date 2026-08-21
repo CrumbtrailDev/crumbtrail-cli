@@ -748,6 +748,12 @@ export async function runWizard(
       entryFile: result.entryFile,
       nextVersion: result.nextVersion,
       stack: result.otlpStack ?? undefined,
+      // The name we just provisioned (not the one we asked for — the cloud
+      // de-dups). One key covers the whole project, so the injected init is the
+      // only thing that says which app a session came from; without it the
+      // wizard creates a named service and then wires code that reports under
+      // no app at all.
+      serviceName: provisioned.serviceName,
       options: { force: parsed.yes },
     },
     defaultInjectIO,
@@ -927,6 +933,8 @@ export type ServiceStatus =
   | "wired" // files written
   | "guidance" // OTLP guide written, or the AI-fallback snippet printed
   | "skipped-already-wired" // pre-existing wiring; no service minted
+  | "withheld" // SDK install failed, so wiring was deliberately not applied
+  | "declined" // target had uncommitted changes and the edit was declined
   | "failed"; // provision / plan / execute threw
 
 export interface ServiceOutcome {
@@ -1199,7 +1207,13 @@ export async function runBatchWizard(
           // One key covers the whole project, so the injected code is what says
           // which app sent a session. Without this a repository of Express
           // services would arrive as five anonymous senders.
-          serviceName: c.name,
+          //
+          // The PROVISIONED name, never the raw package.json name: `@acme/web`
+          // is provisioned as `web`, and the cloud may de-dup again. Injecting
+          // the raw name files sessions under a label no service has, and the
+          // verify below polls the provisioned service ids, so it would report
+          // "No event yet" for every service while events were landing.
+          serviceName: svc.serviceName,
           options: { force: parsed.yes },
         },
         defaultInjectIO,
@@ -1399,13 +1413,15 @@ async function applyBatchInjection(
   }
 
   const applied = await applyInjection(plan, parsed, deps, ctx.sdkInstall);
-  const status: ServiceStatus =
-    plan.kind === "fallback-ai"
-      ? "guidance"
-      : applied.filesTouched.length > 0
-        ? "wired"
-        : "skipped-already-wired";
-  return { status, filesTouched: applied.filesTouched, notes: applied.notes };
+  // Straight from what injection reported. Inferring the status from
+  // `filesTouched.length` read a withheld install and a declined edit as
+  // "already wired", so the summary told the user a service was set up when
+  // nothing had been done to it.
+  return {
+    status: applied.outcome,
+    filesTouched: applied.filesTouched,
+    notes: applied.notes,
+  };
 }
 
 function printBatchSummary(
@@ -1421,6 +1437,10 @@ function printBatchSummary(
     wired: chip(` ${g.tick} `, "success"),
     guidance: chip(` ${g.tick} `, "success"),
     "skipped-already-wired": chip(` ${g.bullet} `, "muted"),
+    // Nothing was wired in either case, and the user has something to do about
+    // it — so neither reads as a quiet skip.
+    withheld: chip(` ${g.cross} `, "warn"),
+    declined: chip(` ${g.cross} `, "warn"),
     failed: chip(` ${g.cross} `, "danger"),
   };
   const width = Math.max(...outcomes.map((o) => o.name.length), 4);
@@ -1435,13 +1455,17 @@ function printBatchSummary(
     const detail =
       o.status === "failed"
         ? color.red(`failed: ${o.error}`)
-        : o.status === "skipped-already-wired"
-          ? color.dim("already wired — skipped")
-          : o.sessionUrl
-            ? color.brand(o.sessionUrl)
-            : o.filesTouched.length > 0
-              ? color.dim(o.filesTouched.map(rel).join(", "))
-              : "";
+        : o.status === "withheld"
+          ? color.yellow("not wired — the SDK could not be installed")
+          : o.status === "declined"
+            ? color.yellow("not wired — you declined the edit")
+            : o.status === "skipped-already-wired"
+              ? color.dim("already wired — skipped")
+              : o.sessionUrl
+                ? color.brand(o.sessionUrl)
+                : o.filesTouched.length > 0
+                  ? color.dim(o.filesTouched.map(rel).join(", "))
+                  : "";
     ui.out(
       `  ${mark[o.status]} ${o.name.padEnd(width)}  ${color.dim(o.relDir.padEnd(24))} ${detail}`,
     );
@@ -1453,6 +1477,11 @@ function printBatchSummary(
     `${count("wired")} wired`,
     ...(count("guidance") > 0 ? [`${count("guidance")} guidance`] : []),
     ...(count("failed") > 0 ? [`${count("failed")} failed`] : []),
+    // Counted apart from "skipped": nothing was wired and the user has a next
+    // step, which a skip does not carry.
+    ...(count("withheld") + count("declined") > 0
+      ? [`${count("withheld") + count("declined")} not wired`]
+      : []),
     ...(count("skipped-already-wired") > 0
       ? [`${count("skipped-already-wired")} skipped`]
       : []),
@@ -1465,7 +1494,7 @@ function printBatchSummary(
     ...outcomes.flatMap((o) => o.notes.map((n) => `${o.name}: ${n}`)),
     ...batchNotes,
   ];
-  if (count("failed") > 0) {
+  if (count("failed") + count("withheld") + count("declined") > 0) {
     notes.push("Re-run `crumbtrail` to retry — wired services are skipped.");
   }
   if (notes.length > 0) {
@@ -1475,7 +1504,20 @@ function printBatchSummary(
   ui.out("");
 }
 
+/**
+ * What injection DID, stated rather than inferred.
+ *
+ * "No files touched" covers four different outcomes — already wired, wiring
+ * withheld because the SDK install failed, an edit the user declined, and
+ * printed guidance — and the batch summary used to read them all as "already
+ * wired — skipped", telling the user a service was set up when nothing had
+ * happened to it.
+ */
+type InjectionOutcome =
+  "wired" | "skipped-already-wired" | "withheld" | "declined" | "guidance";
+
 interface InjectionResult {
+  outcome: InjectionOutcome;
   filesTouched: string[];
   notes: string[];
 }
@@ -1716,7 +1758,7 @@ async function applyInjection(
 
   if (plan.kind === "skip-already-wired") {
     ui.out(ok("Already wired — leaving your code untouched."));
-    return { filesTouched, notes };
+    return { outcome: "skipped-already-wired", filesTouched, notes };
   }
 
   // An import for a package that is not installed does not fail softly: it
@@ -1732,7 +1774,7 @@ async function applyInjection(
     notes.push(
       `Skipped wiring ${plan.targetPath ?? "your entry file"}: install ${pkgs}, then run \`npx crumbtrail\` again.`,
     );
-    return { filesTouched, notes };
+    return { outcome: "withheld", filesTouched, notes };
   }
 
   if (plan.kind === "fallback-ai") {
@@ -1746,7 +1788,7 @@ async function applyInjection(
       ui.out(plan.agentPrompt);
     }
     notes.push("Injection fell back to a manual snippet / AI prompt.");
-    return { filesTouched, notes };
+    return { outcome: "guidance", filesTouched, notes };
   }
 
   if (plan.kind === "otlp-guidance") {
@@ -1766,7 +1808,7 @@ async function applyInjection(
     notes.push(
       "OTLP backend — printed OpenTelemetry setup guidance; no files were changed.",
     );
-    return { filesTouched, notes };
+    return { outcome: "guidance", filesTouched, notes };
   }
 
   if (plan.kind === "needs-confirm-dirty") {
@@ -1794,12 +1836,12 @@ async function applyInjection(
           `${pkgs} ${were} already installed, so your package.json is already updated — only the code import above is still manual.`,
         );
       }
-      return { filesTouched, notes };
+      return { outcome: "declined", filesTouched, notes };
     }
     const res = deps.executePlan(plan, undefined, { confirmDirty: true });
     filesTouched.push(...res.written);
     ui.out(ok(describeWrites(res)));
-    return { filesTouched, notes };
+    return { outcome: "wired", filesTouched, notes };
   }
 
   // create / prepend
@@ -1813,7 +1855,7 @@ async function applyInjection(
   const res = deps.executePlan(plan);
   filesTouched.push(...res.written);
   ui.out(ok(describeWrites(res)));
-  return { filesTouched, notes };
+  return { outcome: "wired", filesTouched, notes };
 }
 
 /** Name the files a write touched — "Wrote 2 file(s)." is nobody's payoff. */

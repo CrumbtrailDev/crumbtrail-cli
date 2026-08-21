@@ -5,7 +5,6 @@ import {
   CRUMBTRAIL_REQUEST_ID_MAX_LENGTH,
   CRUMBTRAIL_SESSION_HEADER,
   DEFAULT_CONFIG,
-  generateRequestId,
 } from "../index";
 
 describe("Crumbtrail", () => {
@@ -86,19 +85,11 @@ describe("Crumbtrail", () => {
     expect(headers[CRUMBTRAIL_REQUEST_HEADER].length).toBeLessThanOrEqual(
       CRUMBTRAIL_REQUEST_ID_MAX_LENGTH,
     );
-    expect(headers[CRUMBTRAIL_REQUEST_HEADER]).toMatch(
-      /^req_[a-z0-9]+_[a-z0-9]+$/,
-    );
+    // The trace id, not a second identifier vocabulary. See
+    // manual-correlation-headers.test.ts.
+    expect(headers[CRUMBTRAIL_REQUEST_HEADER]).toMatch(/^[0-9a-f]{32}$/);
 
     await logger.stop();
-  });
-
-  it("generateRequestId() produces bounded request IDs", () => {
-    const requestId = generateRequestId();
-    expect(requestId.length).toBeLessThanOrEqual(
-      CRUMBTRAIL_REQUEST_ID_MAX_LENGTH,
-    );
-    expect(requestId).toMatch(/^req_[a-z0-9]+_[a-z0-9]+$/);
   });
 
   it("keeps network correlation header injection enabled by default with no cross-origin allowlist", () => {

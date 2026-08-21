@@ -109,4 +109,23 @@ describe("clipboardCollector", () => {
     expect(events).toHaveLength(0);
     cleanup = clipboardCollector(bus, DEFAULT_CONFIG);
   });
+
+  // Same swallow as the console collector: a JSON-shaped paste that is not JSON
+  // came back with only a summary, and `?? ""` erased the pasted content that
+  // caused the bug.
+  it("states the omission instead of emptying a JSON-shaped paste", () => {
+    cleanup();
+    cleanup = clipboardCollector(bus, {
+      ...DEFAULT_CONFIG,
+      maskAllText: false as unknown as true,
+    });
+    events.length = 0;
+
+    document.dispatchEvent(makeClipboardEvent("paste", '{"amount": 12.50,}'));
+    bus.flush();
+
+    const entry = events.find((event) => event.k === "clip");
+    expect(entry?.d.txt).not.toBe("");
+    expect(String(entry?.d.txt)).toContain("malformed_json_body");
+  });
 });

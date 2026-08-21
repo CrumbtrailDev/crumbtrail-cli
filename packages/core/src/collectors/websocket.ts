@@ -76,11 +76,15 @@ export function webSocketCollector(
       const d: Record<string, unknown> = { id: socketId, url, op, seq };
 
       if (typeof payload === "string") {
+        // No declared content type. Declaring `application/json` was the belief
+        // that the structured policy falls back to whole-value treatment when
+        // the text does not parse — it does not. A `json` kind that fails
+        // JSON.parse ends in `dropped: malformed_json_body` with no body at
+        // all, so socket.io (`42["priceUpdate",…]`), STOMP, a bare `PING` and
+        // any pipe-delimited tick were replaced by a stub that blamed the
+        // application for sending bad JSON. Undeclared, `looksLikeJson`
+        // classifies, and anything that is not JSON keeps its free-text scrub.
         const result = redactNetworkTextBody(payload, {
-          // A socket frame has no Content-Type. JSON is what applications send, and the structured
-          // policy falls back to whole-value treatment when the text does not parse, so declaring
-          // it costs nothing when the guess is wrong.
-          contentType: "application/json",
           maxLength: WS_MAX_FRAME_BYTES,
           path: "frame",
           ...bodyRedactionOptions(config),

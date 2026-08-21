@@ -104,6 +104,34 @@ export function keystrokeCollector(
     return Boolean(redactValue({ [name]: "x" }, "key.el").metadata);
   }
 
+  /**
+   * The physical key, or a class of it when the character is masked.
+   *
+   * `KeyboardEvent.code` names the key by position, so `code: "KeyH"` beside
+   * `key: "*"` still spells the password out — and `mod: "s"` restores its
+   * capitalization. Masking `key` and shipping `code` redacts nothing.
+   *
+   * What `code` is actually worth reading for is navigation and control: Tab
+   * order, Enter submitting a half-filled form, Escape closing a dialog, an
+   * arrow key moving a selection. Those keys type no character and leak
+   * nothing, so they keep their real `code`. Anything that produces a
+   * character collapses to its class, which preserves the rhythm and the
+   * shape of what was typed without preserving what it said.
+   */
+  function maskedCode(e: KeyboardEvent): string | undefined {
+    const code = e.code;
+    if (!code) return undefined;
+    // A single-character `key` is a typed character whatever key produced it.
+    if (typeof e.key === "string" && e.key.length === 1) {
+      if (/^Digit\d$|^Numpad\d$/.test(code)) return "Digit";
+      if (/^Key[A-Z]$/.test(code)) return "Letter";
+      return "Char";
+    }
+    if (/^Key[A-Z]$/.test(code)) return "Letter";
+    if (/^Digit\d$|^Numpad\d$/.test(code)) return "Digit";
+    return code;
+  }
+
   function emitKeyEvent(e: KeyboardEvent, dir: "dn" | "up"): void {
     const t = now();
 
@@ -132,9 +160,10 @@ export function keystrokeCollector(
           path: "key",
         })
       : undefined;
+    const codeValue = masked ? maskedCode(e) : e.code;
     const d: Record<string, unknown> = {
       key: masked ? "*" : e.key,
-      code: e.code,
+      ...(codeValue !== undefined ? { code: codeValue } : {}),
       dir,
       el,
       mod: getModifiers(e),

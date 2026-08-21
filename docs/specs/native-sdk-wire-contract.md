@@ -48,13 +48,33 @@ A non-2xx response is **not** a delivery. `fetch`-style APIs resolve for 4xx and
 large" and "rate limited" as success, drop the batch, and produce a session
 indistinguishable from one where nothing happened.
 
-Every SDK must distinguish three outcomes and record the third:
+Every SDK must distinguish four outcomes and record the last two:
 
 1. **2xx** — delivered.
 2. **Network failure** — the request produced no response. Retry per the
    SDK's queue policy.
 3. **Non-2xx** — the server refused. Do not retry the identical batch; surface
    it as a capture gap so the missing window is declared rather than implied.
+4. **202 capture shed** — the server accepted the request and discarded the
+   evidence. The body carries `{ "capture": "shed", "reason", "retryAfterSeconds" }`
+   and a `Retry-After` header. 202 passes an "is this a success" test, so an SDK
+   that only checks the status keeps flushing at full rate into a project that is
+   storing nothing. Record a capture gap carrying the server's `reason`, and send
+   nothing further until `Retry-After` has passed.
+
+`/api/session/start` is not exempt. A refused start leaves no session on the
+server, so every later `/api/events` post for that id is refused too, including
+the capture gap events that would have declared the hole. An SDK that ignores the
+start response produces a session that looks healthy client side for its whole
+lifetime while nothing lands. Stop capture, say so once on the platform's log,
+and do not post a session's worth of events into a 404.
+
+An unload-time beacon (`navigator.sendBeacon` and its equivalents) carries no
+request headers, so it cannot carry the ingest key. On an authenticated project it
+is not a delivery path: its `true` means "queued", the server refuses it for
+missing credentials, and reporting that as delivery is how the final batch — the
+one holding the failure that made the user leave — disappears from a session that
+reports itself complete. Record the loss instead.
 
 ## Event envelope
 

@@ -6,7 +6,6 @@ import { networkCollector } from "../collectors/network";
 import {
   BROWSER_REDACTION_POLICY,
   BROWSER_REDACTION_POLICY_V2,
-  STRUCTURED_BODY_MAX_BYTES,
   classifyStructuredValue,
   computeRedactedShape,
   redactNetworkTextBody,
@@ -97,6 +96,40 @@ describe("classifyStructuredValue", () => {
       expect(classifyStructuredValue(value)).toEqual({ action: "keep" });
     },
   );
+
+  // The entropy floor used to sit at 24 characters and the enum-keep took
+  // anything up to 24, so nothing covered the 16-23 window: an AWS access key
+  // id under a neutral name classified as "keep" and was stored in full.
+  it.each([
+    ["AKIAIOSFODNN7EXAMPLE", "accessKeyId"],
+    ["ASIAY34FZKBOKMUTVV7A", "principalRef"],
+    ["AIzaSyD3aBcDeFgHiJkLm", "mapsRef"],
+    ["s3cr3tV4lue9xQzTop", "deviceHandle"],
+    ["1a2b3c4d5e6f7g8h", "nodeRef"],
+  ])("redacts the 16-23 character secret %s", (value, name) => {
+    expect(classifyStructuredValue(value, name)).toMatchObject({
+      action: "redact",
+      reason: "high_entropy_value",
+    });
+  });
+
+  // Over-redaction is its own bug: an application's own state names are the
+  // most diagnostically useful strings in a body, and they live in the same
+  // length band.
+  it.each([
+    "PAYMENT_DECLINED",
+    "INTERNAL_ERROR_500",
+    "subscription_active",
+    "AWAITING_SHIPMENT",
+    "order_status_new",
+    "credit_card_type",
+    "in_progress_stage",
+    "en-US-california",
+  ])("keeps the enum-shaped name %s", (value) => {
+    expect(classifyStructuredValue(value, "status")).toEqual({
+      action: "keep",
+    });
+  });
 
   it("redacts email-shaped values", () => {
     expect(classifyStructuredValue("omar@example.com")).toMatchObject({
@@ -372,19 +405,49 @@ describe("redactNetworkTextBody structured mode", () => {
     expect(result.metadata?.policy).toBe(BROWSER_REDACTION_POLICY);
   });
 
-  it("falls back to v1 behavior for oversize JSON bodies", () => {
+  // Redaction strength must not be a function of payload size. A size gate here
+  // used to hand every body between 16 KB and the 50 KB capture limit to the v1
+  // path, which has no Luhn check, no email-in-value check and no entropy check
+  // — so the same payload redacted at 10 KB and leaked in the clear at 17 KB,
+  // and the integrator had no way to see which one they were getting.
+  it.each([
+    ["under the old gate", 10_000],
+    ["over the old gate", 17_000],
+    ["near the capture limit", 45_000],
+  ])("redacts identically %s", (_label, pad) => {
+    const pan = "4111111111111111";
+    const email = "alice@example.com";
     const body = JSON.stringify({
-      pad: "x".repeat(STRUCTURED_BODY_MAX_BYTES),
-      password: "secret",
+      pan,
+      recipients: [email],
+      filler: "x".repeat(pad),
     });
     const result = redactNetworkTextBody(body, {
       ...jsonOpts,
-      maxLength: STRUCTURED_BODY_MAX_BYTES * 4,
+      maxLength: 51_200,
     });
-    // v1 JSON path: sensitive key masked as a plain string, no shape objects.
-    const parsed = JSON.parse(result.body!) as Record<string, unknown>;
-    expect(parsed.password).toBe("[REDACTED]");
-    expect(result.metadata?.policy).toBe(BROWSER_REDACTION_POLICY);
+
+    expect(result.body).toBeDefined();
+    expect(result.body).not.toContain(pan);
+    expect(result.body).not.toContain(email);
+    expect(result.metadata?.policy).toBe(BROWSER_REDACTION_POLICY_V2);
+  });
+
+  it("still drops a body past maxLength rather than downgrading its policy", () => {
+    const body = JSON.stringify({
+      pan: "4111111111111111",
+      pad: "x".repeat(60_000),
+    });
+    const result = redactNetworkTextBody(body, {
+      ...jsonOpts,
+      maxLength: 51_200,
+    });
+
+    expect(result.body).toBeUndefined();
+    expect(result.bodySummary).toMatchObject({
+      action: "summarized",
+      reason: "payload_too_large",
+    });
   });
 
   it('mode "full" restores v1 output exactly', () => {
@@ -445,12 +508,14 @@ describe("networkCollector structured redaction", () => {
   });
 
   it("applies structured redaction to JSON request and response bodies by default", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({ discount: 0, couponCode: "EXPIRED5", token: "abc" }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      ),
-    );
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ discount: 0, couponCode: "EXPIRED5", token: "abc" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
     const { events, bus, cleanup } = collect();
 
     await globalThis.fetch("https://api.example.com/checkout", {
@@ -463,10 +528,7 @@ describe("networkCollector structured redaction", () => {
     const req = events.find((e) => e.k === "net.req")!;
     const res = events.find((e) => e.k === "net.res")!;
 
-    const reqBody = JSON.parse(req.d.body as string) as Record<
-      string,
-      unknown
-    >;
+    const reqBody = JSON.parse(req.d.body as string) as Record<string, unknown>;
     expect(reqBody.couponCode).toBe("EXPIRED5");
     expect(reqBody.password).toMatchObject({ $redacted: "[REDACTED]" });
     expect(req.d.body).not.toContain("hunter2!");
@@ -474,10 +536,7 @@ describe("networkCollector structured redaction", () => {
       BROWSER_REDACTION_POLICY_V2,
     );
 
-    const resBody = JSON.parse(res.d.body as string) as Record<
-      string,
-      unknown
-    >;
+    const resBody = JSON.parse(res.d.body as string) as Record<string, unknown>;
     expect(resBody.discount).toBe(0);
     expect(resBody.couponCode).toBe("EXPIRED5");
     expect(resBody.token).toMatchObject({ $redacted: "[REDACTED]" });
@@ -586,7 +645,10 @@ describe("redaction.keepFields", () => {
   }
 
   it("redacts free text under an undeclared name", () => {
-    const parsed = structured(JSON.stringify({ body: "hello there world" }), []);
+    const parsed = structured(
+      JSON.stringify({ body: "hello there world" }),
+      [],
+    );
     expect(parsed.body).toMatchObject({ $redacted: "[REDACTED]" });
   });
 
@@ -598,8 +660,8 @@ describe("redaction.keepFields", () => {
   });
 
   it("keeps a declared search term so the query that broke is readable", () => {
-    const parsed = structured(JSON.stringify({ q: "O'Brien \"widget\"" }));
-    expect(parsed.q).toBe("O'Brien \"widget\"");
+    const parsed = structured(JSON.stringify({ q: 'O\'Brien "widget"' }));
+    expect(parsed.q).toBe('O\'Brien "widget"');
   });
 
   it("matches the whole compacted name, never a substring", () => {
@@ -625,12 +687,15 @@ describe("redaction.keepFields", () => {
   });
 
   it("lets a denyFields entry win over a keep for the same name", () => {
-    const result = redactNetworkTextBody(JSON.stringify({ body: "free text" }), {
-      mode: "structured",
-      contentType: "application/json",
-      keepFields: ["body"],
-      denyFields: ["body"],
-    });
+    const result = redactNetworkTextBody(
+      JSON.stringify({ body: "free text" }),
+      {
+        mode: "structured",
+        contentType: "application/json",
+        keepFields: ["body"],
+        denyFields: ["body"],
+      },
+    );
     const parsed = JSON.parse(result.body as string) as Record<string, unknown>;
     expect(parsed.body).toMatchObject({ $redacted: "[REDACTED]" });
   });
@@ -661,7 +726,11 @@ describe("redaction.keepFields", () => {
 });
 
 describe("keepFields vs the built-in deny rules", () => {
-  function structured(body: string, keepFields: string[], denyFields?: string[]) {
+  function structured(
+    body: string,
+    keepFields: string[],
+    denyFields?: string[],
+  ) {
     const result = redactNetworkTextBody(body, {
       mode: "structured",
       contentType: "application/json",
@@ -672,9 +741,9 @@ describe("keepFields vs the built-in deny rules", () => {
   }
 
   it("overrides a built-in substring false positive (auth in author)", () => {
-    expect(structured(JSON.stringify({ author: "A. Shopper" }), []).author).toMatchObject(
-      { $redacted: "[REDACTED]" },
-    );
+    expect(
+      structured(JSON.stringify({ author: "A. Shopper" }), []).author,
+    ).toMatchObject({ $redacted: "[REDACTED]" });
     expect(
       structured(JSON.stringify({ author: "A. Shopper" }), ["author"]).author,
     ).toBe("A. Shopper");
@@ -728,14 +797,19 @@ describe("keepFields vs the built-in deny rules", () => {
         JSON.stringify({ card: { balanceCents: 1250, initialCents: 5000 } }),
         [],
       );
-      expect(out.card).toMatchObject({ balanceCents: 1250, initialCents: 5000 });
+      expect(out.card).toMatchObject({
+        balanceCents: 1250,
+        initialCents: 5000,
+      });
     });
 
     // The load-bearing test. Opening the container costs no protection only if the VALUE rules
     // still catch what the NAME used to. If this ever fails, the change above must be reverted.
     it("still redacts a real card number nested under that same object", () => {
       const out = structured(
-        JSON.stringify({ card: { balanceCents: 1250, number: "4111111111111111" } }),
+        JSON.stringify({
+          card: { balanceCents: 1250, number: "4111111111111111" },
+        }),
         [],
       );
       const card = out.card as Record<string, unknown>;
@@ -745,7 +819,10 @@ describe("keepFields vs the built-in deny rules", () => {
     });
 
     it("still redacts a scalar whose own name matches", () => {
-      const out = structured(JSON.stringify({ cardNumber: "4111111111111111" }), []);
+      const out = structured(
+        JSON.stringify({ cardNumber: "4111111111111111" }),
+        [],
+      );
       expect(out.cardNumber).toMatchObject({ $redacted: "[REDACTED]" });
       expect(JSON.stringify(out)).not.toContain("4111111111111111");
     });
@@ -753,7 +830,10 @@ describe("keepFields vs the built-in deny rules", () => {
     // An array carries its own name down to each entry, so a list of card numbers is still a list
     // of denied scalars.
     it("still redacts entries of a denied array", () => {
-      const out = structured(JSON.stringify({ cards: ["4111111111111111"] }), []);
+      const out = structured(
+        JSON.stringify({ cards: ["4111111111111111"] }),
+        [],
+      );
       expect(JSON.stringify(out)).not.toContain("4111111111111111");
     });
 
@@ -804,12 +884,12 @@ describe("query parameters answer to the same keep list", () => {
 
   it("keeps punctuation in a search term, which is the whole point", () => {
     setRedactionKeepFields(["q"]);
-    const value = redactUrl(`/api/search?q=${encodeURIComponent(`O'Brien "x"`)}`)
-      .value;
+    const value = redactUrl(
+      `/api/search?q=${encodeURIComponent(`O'Brien "x"`)}`,
+    ).value;
     // Read it back the way a query string is actually parsed: toString()
     // form-encodes the space as `+`, which decodeURIComponent does not undo.
     const parsed = new URLSearchParams(value.split("?")[1]);
     expect(parsed.get("q")).toBe(`O'Brien "x"`);
   });
-
 });

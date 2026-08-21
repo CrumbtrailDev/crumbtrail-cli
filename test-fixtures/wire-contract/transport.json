@@ -36,9 +36,11 @@
     }
   },
   "delivery": {
-    "$comment": "A non-2xx response is a refusal, not a delivery. Three outcomes must be distinguished.",
+    "$comment": "A non-2xx response is a refusal, not a delivery. Four outcomes must be distinguished.",
     "2xx": "delivered",
     "networkFailure": "retry per queue policy",
-    "non2xx": "do not retry the identical batch; record a capture gap"
+    "non2xx": "do not retry the identical batch; record a capture gap",
+    "capture202Shed": "202 with body {capture:\"shed\", reason, retryAfterSeconds} accepted the request and discarded the evidence: record a capture gap carrying the server's reason, and send nothing further until Retry-After has passed",
+    "sessionStart": "a refused /api/session/start leaves no session, so every later /api/events for that id is refused too. Stop capture, say so once on the platform's log, and do not post a session's worth of events into a 404"
   }
 }

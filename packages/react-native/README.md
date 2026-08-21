@@ -22,7 +22,8 @@ fetched from the deploy instead of the npm registry.)
 The wizard detects a React Native / Expo app by the presence of a `react-native`
 or `expo` dependency, installs `crumbtrail-core` + `crumbtrail-react-native`
 with your project's package manager, and prepends a
-`createReactNativeCrumbtrail(...)` init block to the first entry file it finds,
+`createReactNativeCrumbtrailAsync(...)` init block to the first entry file it
+finds,
 in this order:
 
 1. `app/_layout.{tsx,jsx,js}` — the Expo Router root layout
@@ -87,22 +88,31 @@ absent:
 ### What the wizard writes
 
 ```ts
-import { createReactNativeCrumbtrail } from "crumbtrail-react-native";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { createReactNativeCrumbtrailAsync } from "crumbtrail-react-native";
 
-createReactNativeCrumbtrail({
+createReactNativeCrumbtrailAsync({
+  asyncStorage: AsyncStorage,
   config: {
     httpEndpoint: "https://app.crumbtrail.ai", // or your self-host endpoint
-    httpAuthToken: "<project api key>",
+    httpAuthToken: process.env.EXPO_PUBLIC_CRUMBTRAIL_KEY,
     remoteConfig: true, // take the kill switch and capture settings from the project
   },
-});
+}).catch(() => {});
 ```
 
-This is the full setup, not a subset: `createReactNativeCrumbtrail` calls
-`Crumbtrail.init`, installs the global `ErrorUtils` crash handler, and starts
-every capability-gated collector. It is prepended imperatively (no
-`<Provider>` wrapper) because the wizard's injector only ever prepends a block
-or creates a file — it cannot transform JSX.
+This is the full setup, not a subset: it calls `Crumbtrail.init`, installs the
+global `ErrorUtils` crash handler, and starts every capability-gated collector.
+It is prepended imperatively (no `<Provider>` wrapper) because the wizard's
+injector only ever prepends a block or creates a file — it cannot transform JSX.
+
+The awaited form with `asyncStorage` is what the wizard writes because it
+restores the session id the previous launch persisted before the logger starts.
+Without a store, every cold start opens a new session — on the platform where
+cold starts are the norm — so a once-a-day intermittent bug never accumulates
+into one signature. Install the peer with `npx expo install
+@react-native-async-storage/async-storage`, or the injected import will not
+resolve.
 
 ### Manual setup (self-host)
 

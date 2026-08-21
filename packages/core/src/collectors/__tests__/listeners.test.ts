@@ -90,7 +90,9 @@ describe("listenerCollector", () => {
     history.pushState({}, "", "/with-effect");
     window.addEventListener("route-effect", () => {});
 
-    await new Promise((resolve) => setTimeout(resolve, LISTENER_SETTLE_MS + 20));
+    await new Promise((resolve) =>
+      setTimeout(resolve, LISTENER_SETTLE_MS + 20),
+    );
 
     expect(gauges().length).toBe(before + 2);
     expect(countFor(latest(), "route-effect")).toBe(1);

@@ -351,7 +351,10 @@ describe("buildPlan — SvelteKit / Nuxt", () => {
   it("creates a Nuxt client plugin wrapped in defineNuxtPlugin reading the Vite env key", () => {
     // No app/ dir (Nuxt 3 default): the plugin lands in the repo-root plugins/.
     const io = fakeInjectIO({ [p("package.json")]: "{}" });
-    const plan = buildPlan({ cwd: CWD, recipe: "nuxt", endpoint: ENDPOINT }, io);
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "nuxt", endpoint: ENDPOINT },
+      io,
+    );
     expect(plan.kind).toBe("create");
     expect(plan.targetPath).toBe(p("plugins", "crumbtrail.client.ts"));
     expect(plan.content).toContain("defineNuxtPlugin");
@@ -371,7 +374,10 @@ describe("buildPlan — SvelteKit / Nuxt", () => {
       [p("package.json")]: "{}",
       [p("app")]: "", // marker: exists() is true for the app/ dir
     });
-    const plan = buildPlan({ cwd: CWD, recipe: "nuxt", endpoint: ENDPOINT }, io);
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "nuxt", endpoint: ENDPOINT },
+      io,
+    );
     expect(plan.kind).toBe("create");
     expect(plan.targetPath).toBe(p("app", "plugins", "crumbtrail.client.ts"));
     expect(plan.content).toContain("defineNuxtPlugin");
@@ -394,7 +400,9 @@ describe("buildPlan — Flutter", () => {
     expect(plan.kind).toBe("rewrite");
     expect(plan.targetPath).toBe(MAIN);
     expect(plan.content).toContain("Future<void> main() async {");
-    expect(plan.content).toContain("await Crumbtrail.start(const CrumbtrailConfig(");
+    expect(plan.content).toContain(
+      "await Crumbtrail.start(const CrumbtrailConfig(",
+    );
     expect(plan.content).toContain(`endpoint: '${ENDPOINT}',`);
     expect(plan.content!.indexOf("Crumbtrail.start")).toBeLessThan(
       plan.content!.indexOf("runApp"),
@@ -890,8 +898,9 @@ describe("buildPlan — backend-JS recipes (express/hono/fastify)", () => {
 
 describe("buildPlan — backend fallback prompt is stack-appropriate", () => {
   // The AI fallback prompt must reflect the real crumbtrail-node surface:
-  // Express is the only stack with framework middleware; hono + fastify (node)
-  // wire a headless session instead. No invented names in any of them.
+  // autoCapture everywhere (the browser Crumbtrail.init is inert in Node), plus
+  // the middleware pair for Express, the only stack that has one. No invented
+  // names in any of them.
   const fallback = (recipe: "express" | "hono" | "fastify") => {
     const io = fakeInjectIO({ [p("package.json")]: "{}" });
     const plan = buildPlan(
@@ -906,14 +915,16 @@ describe("buildPlan — backend fallback prompt is stack-appropriate", () => {
     const prompt = fallback("express");
     expect(prompt).toContain("createCrumbtrailExpressMiddleware");
     expect(prompt).toContain("createCrumbtrailExpressErrorMiddleware");
+    expect(prompt).toContain("autoCapture");
     expect(prompt).not.toContain("startHeadlessSession");
     expect(prompt).not.toContain("attachCrumbtrail");
   });
 
   for (const recipe of ["hono", "fastify"] as const) {
-    it(`${recipe}: uses a headless session, not Express middleware`, () => {
+    it(`${recipe}: uses autoCapture, not Express middleware`, () => {
       const prompt = fallback(recipe);
-      expect(prompt).toContain("startHeadlessSession");
+      expect(prompt).toContain("autoCapture");
+      expect(prompt).not.toContain("startHeadlessSession");
       expect(prompt).not.toContain("createCrumbtrailExpressMiddleware");
       expect(prompt).not.toContain("attachCrumbtrail");
     });
@@ -1231,7 +1242,12 @@ describe("buildPlan — Express middleware wiring", () => {
       [p("server.js")]: ESM_ENTRY,
     });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+      },
       io,
     );
     expect(plan.kind).toBe("rewrite");
@@ -1243,9 +1259,13 @@ describe("buildPlan — Express middleware wiring", () => {
     );
     // Ordering: app creation -> request middleware -> routes -> error middleware -> listen.
     const appIdx = content.indexOf("const app = express()");
-    const reqIdx = content.indexOf("app.use(createCrumbtrailExpressMiddleware(");
+    const reqIdx = content.indexOf(
+      "app.use(createCrumbtrailExpressMiddleware(",
+    );
     const routeIdx = content.indexOf('app.get("/"');
-    const errIdx = content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware(");
+    const errIdx = content.indexOf(
+      "app.use(createCrumbtrailExpressErrorMiddleware(",
+    );
     const listenIdx = content.indexOf("app.listen(");
     expect(appIdx).toBeGreaterThan(-1);
     expect(reqIdx).toBeGreaterThan(appIdx);
@@ -1283,13 +1303,20 @@ describe("buildPlan — Express middleware wiring", () => {
       [p("server.ts")]: ENTRY_WITH_ERROR_HANDLER,
     });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.ts") },
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.ts"),
+      },
       io,
     );
     expect(plan.kind).toBe("rewrite");
     const content = plan.content ?? "";
     const routeIdx = content.indexOf('app.get("/"');
-    const ourErrIdx = content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware(");
+    const ourErrIdx = content.indexOf(
+      "app.use(createCrumbtrailExpressErrorMiddleware(",
+    );
     const theirErrIdx = content.indexOf("app.use((error: any");
     const listenIdx = content.indexOf("app.listen(");
     // After the routes, but BEFORE the handler that ends the response.
@@ -1319,13 +1346,18 @@ describe("buildPlan — Express middleware wiring", () => {
       ].join("\n"),
     });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+      },
       io,
     );
     const content = plan.content ?? "";
-    expect(content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware(")).toBeLessThan(
-      content.indexOf("app.use(function ("),
-    );
+    expect(
+      content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware("),
+    ).toBeLessThan(content.indexOf("app.use(function ("));
   });
 
   it("ignores non error middleware and route mounts when picking the anchor", () => {
@@ -1343,17 +1375,22 @@ describe("buildPlan — Express middleware wiring", () => {
       ].join("\n"),
     });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+      },
       io,
     );
     const content = plan.content ?? "";
     // No four argument handler here, so the listen anchor still applies.
-    expect(content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware(")).toBeLessThan(
-      content.indexOf("app.listen("),
-    );
-    expect(content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware(")).toBeGreaterThan(
-      content.indexOf('app.get("/"'),
-    );
+    expect(
+      content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware("),
+    ).toBeLessThan(content.indexOf("app.listen("));
+    expect(
+      content.indexOf("app.use(createCrumbtrailExpressErrorMiddleware("),
+    ).toBeGreaterThan(content.indexOf('app.get("/"'));
   });
 
   it("rewrites a CJS entry with a require of the middleware pair", () => {
@@ -1362,15 +1399,24 @@ describe("buildPlan — Express middleware wiring", () => {
       [p("server.js")]: CJS_ENTRY,
     });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+      },
       io,
     );
     expect(plan.kind).toBe("rewrite");
     expect(plan.content).toContain(
       'const { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } = require("crumbtrail-node");',
     );
-    expect(plan.content).toContain("app.use(createCrumbtrailExpressMiddleware(");
-    expect(plan.content).toContain("app.use(createCrumbtrailExpressErrorMiddleware(");
+    expect(plan.content).toContain(
+      "app.use(createCrumbtrailExpressMiddleware(",
+    );
+    expect(plan.content).toContain(
+      "app.use(createCrumbtrailExpressErrorMiddleware(",
+    );
   });
 
   it("needs-confirm-dirty with applyMode rewrite when the entry is dirty", () => {
@@ -1379,22 +1425,35 @@ describe("buildPlan — Express middleware wiring", () => {
       { dirty: [p("server.js")] },
     );
     const plan = buildPlan(
-      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+      },
       io,
     );
     expect(plan.kind).toBe("needs-confirm-dirty");
     expect(plan.applyMode).toBe("rewrite");
-    expect(plan.content).toContain("app.use(createCrumbtrailExpressMiddleware(");
+    expect(plan.content).toContain(
+      "app.use(createCrumbtrailExpressMiddleware(",
+    );
   });
 
   it("falls back to prepend + TODO instructions when anchors are missing", () => {
     // Has an express import but no `const app = express()` / listen anchors.
     const io = fakeInjectIO({
       [p("package.json")]: "{}",
-      [p("server.js")]: 'import express from "express";\nconst app = buildApp();\n',
+      [p("server.js")]:
+        'import express from "express";\nconst app = buildApp();\n',
     });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "express", endpoint: ENDPOINT, entryFile: p("server.js") },
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+      },
       io,
     );
     expect(plan.kind).toBe("prepend");
@@ -1403,7 +1462,9 @@ describe("buildPlan — Express middleware wiring", () => {
     expect(plan.content).toContain("createCrumbtrailExpressMiddleware");
     expect(plan.content).toContain("createCrumbtrailExpressErrorMiddleware");
     // The wizard surfaces the same guidance.
-    expect(plan.warnings.join(" ")).toContain("createCrumbtrailExpressMiddleware");
+    expect(plan.warnings.join(" ")).toContain(
+      "createCrumbtrailExpressMiddleware",
+    );
   });
 
   it("does not wire middleware for non express backend recipes", () => {
@@ -1487,5 +1548,174 @@ describe("buildPlan — the app names itself", () => {
     );
     expect(plan.keyEnvVar).toBe("CRUMBTRAIL_KEY");
     expect(plan.content).not.toContain("service:");
+  });
+});
+
+// ── Silent zero-capture regressions ─────────────────────────────────────────
+//
+// Every case here is an install that reports success and captures nothing.
+
+describe("buildPlan — Express middleware reaches the key in .env", () => {
+  const ESM_ENTRY = [
+    'import express from "express";',
+    "",
+    "const app = express();",
+    'app.get("/", (_req, res) => res.json({ ok: true }));',
+    "app.listen(3000);",
+    "",
+  ].join("\n");
+
+  const expressPlan = (entry: string) =>
+    buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("index.js"),
+      },
+      fakeInjectIO({ [p("package.json")]: "{}", [p("index.js")]: entry }),
+    );
+
+  it("loads .env before the middleware options object is built", () => {
+    // The middleware's `authToken: process.env.CRUMBTRAIL_KEY` is evaluated while
+    // the entry module runs. autoCapture's own .env load happens later (inside a
+    // dynamic import), so without an earlier load the middleware posts with no
+    // X-Crumbtrail-Auth header and every backend.req.* event is rejected — while
+    // crash capture works and the wizard reports success.
+    const plan = expressPlan(ESM_ENTRY);
+    expect(plan.kind).toBe("rewrite");
+    const content = plan.content as string;
+    expect(content).toContain("loadEnvFile");
+    expect(content.indexOf("loadEnvFile")).toBeLessThan(
+      content.indexOf("createCrumbtrailExpressMiddleware({"),
+    );
+    // Never clobber a real environment: only fill the key in when it is absent.
+    expect(content).toContain("if (!process.env.CRUMBTRAIL_KEY)");
+  });
+
+  it("loads .env on the manual-wiring fallback too", () => {
+    // No `const app = express()` / `app.listen` anchors: the user wires the
+    // middleware by hand from the TODO block, into the same module-load window.
+    const plan = expressPlan("createServer();\n");
+    expect(plan.kind).toBe("prepend");
+    expect(plan.content).toContain("loadEnvFile");
+  });
+});
+
+describe("buildPlan — Nuxt plugin directory is version-gated", () => {
+  const nuxtIO = (files: Record<string, string>) =>
+    fakeInjectIO({ [p("package.json")]: "{}", ...files });
+
+  const nuxtPlan = (files: Record<string, string>) =>
+    buildPlan({ cwd: CWD, recipe: "nuxt", endpoint: ENDPOINT }, nuxtIO(files));
+
+  it("keeps a Nuxt 3 plugin at the repo root even when app/ exists", () => {
+    // Nuxt 3 recognises a root app/ directory (app/router.options.ts), so the
+    // bare existence probe misreads such a project as Nuxt 4 and writes a plugin
+    // into app/plugins/, which Nuxt 3 never scans: silent zero capture.
+    const plan = nuxtPlan({
+      [p("app")]: "",
+      [p("app", "router.options.ts")]: "export default {};\n",
+      [p("node_modules", "nuxt", "package.json")]: JSON.stringify({
+        version: "3.19.2",
+      }),
+    });
+    expect(plan.targetPath).toBe(p("plugins", "crumbtrail.client.ts"));
+  });
+
+  it("uses app/plugins for an installed Nuxt 4", () => {
+    const plan = nuxtPlan({
+      [p("app")]: "",
+      [p("node_modules", "nuxt", "package.json")]: JSON.stringify({
+        version: "4.4.8",
+      }),
+    });
+    expect(plan.targetPath).toBe(p("app", "plugins", "crumbtrail.client.ts"));
+  });
+
+  it("falls back to the app/ probe when the installed version is unreadable", () => {
+    expect(nuxtPlan({ [p("app")]: "" }).targetPath).toBe(
+      p("app", "plugins", "crumbtrail.client.ts"),
+    );
+    expect(nuxtPlan({}).targetPath).toBe(p("plugins", "crumbtrail.client.ts"));
+  });
+});
+
+describe("buildPlan — idempotency covers every SDK package", () => {
+  for (const [recipe, pkg, entry] of [
+    ["react-native", "crumbtrail-react-native", "App.tsx"],
+    ["capacitor", "crumbtrail-capacitor", "src/main.ts"],
+  ] as const) {
+    it(`skips a ${recipe} app already depending on ${pkg}`, () => {
+      // Without this the batch installer mints a SECOND service and a second
+      // ingest key for an app that is already wired.
+      const io = fakeInjectIO({
+        [p("package.json")]: JSON.stringify({
+          dependencies: { [pkg]: "0.1.0" },
+        }),
+        [p(entry)]: "export default {};\n",
+      });
+      const plan = buildPlan(
+        { cwd: CWD, recipe, endpoint: ENDPOINT, entryFile: p(entry) },
+        io,
+      );
+      expect(plan.kind).toBe("skip-already-wired");
+    });
+
+    it(`skips a ${recipe} entry that already imports ${pkg}`, () => {
+      const io = fakeInjectIO({
+        [p("package.json")]: "{}",
+        [p(entry)]: `import { x } from "${pkg}";\n`,
+      });
+      const plan = buildPlan(
+        { cwd: CWD, recipe, endpoint: ENDPOINT, entryFile: p(entry) },
+        io,
+      );
+      expect(plan.kind).toBe("skip-already-wired");
+    });
+  }
+});
+
+describe("buildPlan — React Native session continuity", () => {
+  const rnPlan = (pkg: string) =>
+    buildPlan(
+      {
+        cwd: CWD,
+        recipe: "react-native",
+        endpoint: ENDPOINT,
+        entryFile: p("App.tsx"),
+      },
+      fakeInjectIO({
+        [p("package.json")]: pkg,
+        [p("App.tsx")]: "export default function App() {}\n",
+      }),
+    );
+
+  it("wires the store when the app has AsyncStorage, so a cold start resumes", () => {
+    // The sync factory builds no session store, and RN has no backing store for
+    // sessionPersistence: "session" — so every cold start opens a new session and
+    // an intermittent mobile defect never accumulates into one signature.
+    const plan = rnPlan(
+      JSON.stringify({
+        dependencies: { "@react-native-async-storage/async-storage": "1.23.1" },
+      }),
+    );
+    expect(plan.content).toContain("createReactNativeCrumbtrailAsync");
+    expect(plan.content).toContain("asyncStorage: AsyncStorage");
+    expect(plan.content).toContain(
+      'import AsyncStorage from "@react-native-async-storage/async-storage";',
+    );
+    expect(plan.content).toContain(".catch(() => {});");
+    expect(plan.warnings).toEqual([]);
+  });
+
+  it("never imports AsyncStorage when the app does not have it", () => {
+    // Metro resolves every import at bundle time, so emitting this import for a
+    // package that is not installed would trade a lost session id for an app
+    // that no longer builds.
+    const plan = rnPlan("{}");
+    expect(plan.content).toContain("createReactNativeCrumbtrailAsync");
+    expect(plan.content).not.toContain("async-storage");
+    expect(plan.warnings.some((w) => w.includes("async-storage"))).toBe(true);
   });
 });

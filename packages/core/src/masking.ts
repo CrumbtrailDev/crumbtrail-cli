@@ -1,5 +1,9 @@
 import type { CrumbtrailConfig } from "./types";
-import { redactUrl } from "./redaction";
+import {
+  REDACTED_VALUE,
+  classifyStructuredValue,
+  redactUrl,
+} from "./redaction";
 
 const UNMASK_ATTRIBUTE = "data-crumbtrail-unmask";
 const BLOCK_ATTRIBUTE = "data-crumbtrail-block";
@@ -48,6 +52,14 @@ export function buildMaskedDomSnapshot(
   root: Element,
   config: CrumbtrailConfig,
 ): string {
+  // `sanitizeElement` removes blocked CHILDREN and never tested the root it was
+  // handed, so a snapshot rooted at (or scoped to) a payment panel or a PHI
+  // card serialized the whole blocked subtree with ordinary masking — silently
+  // defeating the strongest opt-out the SDK offers. `isBlocked` uses
+  // `closest()`, so a root inside a blocked ancestor is caught too.
+  if (isBlocked(root)) {
+    return `<${root.tagName.toLowerCase()} ${BLOCK_ATTRIBUTE}></${root.tagName.toLowerCase()}>`;
+  }
   const clone = root.cloneNode(true) as Element;
   sanitizeElement(clone, config);
   return clone.outerHTML;
@@ -112,6 +124,55 @@ const SAFE_DESCRIPTOR_FIELDS = new Set([
   "selector",
   "xpath",
 ]);
+
+/**
+ * Structural identifier fields that are read straight off the page and may
+ * therefore carry whatever the page templated into them.
+ *
+ * They are exempt from text masking because a masked selector correlates
+ * nothing — but exempt from masking is not exempt from redaction. A row
+ * rendered as `<tr id={`user-${email}`}>` put the address into `clk.d.el.id` in
+ * clear with no redaction metadata. `ui-numbers.ts` guards exactly this hazard
+ * for its region identifiers, citing the same example; the interaction lane,
+ * reading the same page's ids, did not.
+ *
+ * The gate is the classifier's, minus its free-text catch-all: an ordinary id
+ * (`submit-btn`, `user-12345-prefs`) is enum-shaped and survives, and only
+ * PII-shaped content — an email, a card number, a JWT, a token or a
+ * high-entropy secret — is replaced.
+ */
+const IDENTIFIER_DESCRIPTOR_FIELDS = new Set(["id", "cls", "class", "name"]);
+
+/**
+ * Structural paths, which embed the same identifiers as `[id=…]` segments.
+ * `sig` is not listed: it is a one-way hash of the path and carries nothing
+ * readable, and it is the field that correlates an element across sessions.
+ */
+const PATH_DESCRIPTOR_FIELDS = new Set(["path", "selector", "xpath"]);
+const PATH_ATTRIBUTE_SEGMENT_RE = /\[([\w:.-]+)=([^\]]*)\]/g;
+
+function sanitizePathFragment(value: string): string {
+  return value.replace(
+    PATH_ATTRIBUTE_SEGMENT_RE,
+    (match, name: string, attributeValue: string) => {
+      const safe = sanitizeIdentifierFragment(attributeValue);
+      return safe === attributeValue ? match : `[${name}=${safe}]`;
+    },
+  );
+}
+
+function sanitizeIdentifierFragment(value: string): string {
+  // Value-shape checks only: no key name is passed, because an identifier is
+  // not a field name and `input[name="cardNumber"]` is structure, not content.
+  const classification = classifyStructuredValue(value);
+  if (
+    classification.action === "redact" &&
+    classification.reason !== "free_text_value"
+  ) {
+    return REDACTED_VALUE;
+  }
+  return value;
+}
 const URL_ATTRIBUTES = ["action", "formaction", "href", "poster", "src"];
 
 function maskDescriptorRecord(
@@ -133,6 +194,9 @@ function maskDescriptorValue(
 ): unknown {
   if (typeof value === "string") {
     if (field === "href") return redactUrl(value, field).value;
+    if (IDENTIFIER_DESCRIPTOR_FIELDS.has(field))
+      return sanitizeIdentifierFragment(value);
+    if (PATH_DESCRIPTOR_FIELDS.has(field)) return sanitizePathFragment(value);
     if (SAFE_DESCRIPTOR_FIELDS.has(field)) return value;
     return config.maskAllText || config.maskAllInputs ? maskText(value) : value;
   }
@@ -146,7 +210,8 @@ function maskDescriptorValue(
 function sanitizeUrlAttributes(element: Element): void {
   for (const name of URL_ATTRIBUTES) {
     const value = element.getAttribute(name);
-    if (value !== null) element.setAttribute(name, redactUrl(value, name).value);
+    if (value !== null)
+      element.setAttribute(name, redactUrl(value, name).value);
   }
 }
 

@@ -2,6 +2,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Crumbtrail } from "../crumbtrail";
+import { buildMaskedDomSnapshot } from "../masking";
+import { DEFAULT_CONFIG } from "../types";
 
 function makeTransport() {
   return {
@@ -84,8 +86,7 @@ describe("production privacy masking", () => {
           "aria-description": element.getAttribute("aria-description"),
           selectedOptionText: selected?.text,
           selectedOptionValue: selected?.value,
-          href:
-            element instanceof HTMLAnchorElement ? element.href : undefined,
+          href: element instanceof HTMLAnchorElement ? element.href : undefined,
         };
       },
     });
@@ -246,7 +247,9 @@ describe("application-declared input keeps", () => {
     await logger.stop();
 
     return transport.sendEvents.mock.calls
-      .flatMap(([events]) => events as Array<{ k: string; d: { val?: unknown } }>)
+      .flatMap(
+        ([events]) => events as Array<{ k: string; d: { val?: unknown } }>,
+      )
       .filter((event) => event.k === "inp")
       .map((event) => String(event.d.val));
   }
@@ -273,5 +276,60 @@ describe("application-declared input keeps", () => {
 
   it("records free text in a field the application named", async () => {
     expect(await typedValues(["fullName"])).toContain("Ada Lovelace");
+  });
+});
+
+// `sanitizeElement` removes blocked CHILDREN and never tested the root it was
+// handed, so a snapshot scoped to a blocked element serialized the whole
+// subtree with only ordinary masking — the strongest opt-out the SDK offers,
+// silently defeated.
+describe("buildMaskedDomSnapshot and data-crumbtrail-block", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  // Ordinary masking is not the same guarantee: an element marked
+  // data-crumbtrail-unmask contributes clear text through it by design, and
+  // structure, ids and hrefs survive it entirely. Inside a blocked subtree none
+  // of that may be serialized at all.
+  it("returns nothing for a root that is itself blocked", () => {
+    document.body.innerHTML =
+      '<section data-crumbtrail-block id="pay-panel">' +
+      "<span data-crumbtrail-unmask>Card 4111111111111111</span>" +
+      '<a id="receipt-for-alice" href="/receipts/alice@example.com">Receipt</a>' +
+      "</section>";
+
+    const html = buildMaskedDomSnapshot(
+      document.querySelector("#pay-panel") as HTMLElement,
+      DEFAULT_CONFIG,
+    );
+
+    expect(html).not.toContain("4111111111111111");
+    expect(html).not.toContain("alice@example.com");
+    expect(html).not.toContain("receipt-for-alice");
+  });
+
+  it("returns nothing for a root inside a blocked ancestor", () => {
+    document.body.innerHTML =
+      '<section data-crumbtrail-block><div id="inner">' +
+      "<span data-crumbtrail-unmask>Card 4111111111111111</span></div></section>";
+
+    const html = buildMaskedDomSnapshot(
+      document.querySelector("#inner") as HTMLElement,
+      DEFAULT_CONFIG,
+    );
+
+    expect(html).not.toContain("4111111111111111");
+  });
+
+  it("still snapshots an ordinary root", () => {
+    document.body.innerHTML = '<section id="ok"><p>Total</p></section>';
+
+    const html = buildMaskedDomSnapshot(
+      document.querySelector("#ok") as HTMLElement,
+      DEFAULT_CONFIG,
+    );
+
+    expect(html).toContain("<p>");
   });
 });

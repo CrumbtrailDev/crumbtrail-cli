@@ -150,14 +150,19 @@ describe("generateSessionId", () => {
     expect(ids.size).toBe(20);
   });
 
-  it("fails closed when secure browser randomness is unavailable", () => {
+  it("still produces an id, rather than throwing, without WebCrypto", () => {
+    // The throw this used to pin escaped `Crumbtrail.init()` into the host
+    // application's entry point and failed SSR renders on any runtime with no
+    // WebCrypto. A session id is an opaque correlation key rather than a
+    // secret, and the trace ids that ride beside it on the wire already fall
+    // back the same way, so the id degrades instead of the host app.
     const original = globalThis.crypto;
     Object.defineProperty(globalThis, "crypto", {
       value: undefined,
       configurable: true,
     });
     try {
-      expect(() => generateSessionId()).toThrow("crypto.getRandomValues");
+      expect(generateSessionId()).toMatch(/^ses_\d{8}_\d{6}_[0-9a-f]{12}$/);
     } finally {
       Object.defineProperty(globalThis, "crypto", {
         value: original,

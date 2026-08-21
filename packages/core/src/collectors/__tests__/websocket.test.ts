@@ -1,3 +1,4 @@
+import { fakeStripeLiveKey } from "../../__tests__/fixtures/fake-secrets";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { EventBus } from "../../event-bus";
 import { DEFAULT_CONFIG, type BugEvent } from "../../types";
@@ -95,7 +96,9 @@ describe("webSocketCollector", () => {
     socket.send(JSON.stringify({ op: "subscribe", room: "orders" }));
     socket.receive(JSON.stringify({ op: "priceChanged", cents: 1250 }));
 
-    const frames = ws().filter((frame) => frame.op === "send" || frame.op === "msg");
+    const frames = ws().filter(
+      (frame) => frame.op === "send" || frame.op === "msg",
+    );
     expect(frames).toHaveLength(2);
     expect(frames[0]).toMatchObject({ op: "send", seq: 1 });
     expect(String(frames[0].body)).toContain("subscribe");
@@ -118,6 +121,34 @@ describe("webSocketCollector", () => {
 
     const frame = ws().find((entry) => entry.op === "msg");
     expect(String(frame?.body)).not.toContain("hunter2-should-not-appear");
+  });
+
+  // The frame content is the reason this collector quotes frames instead of
+  // counting them. Declaring `application/json` on every frame meant a frame
+  // that is not JSON — which is most text protocols — came back with no body
+  // and a summary blaming the application for malformed JSON.
+  it.each([
+    ["socket.io", '42["priceUpdate",{"cents":1250}]'],
+    ["a bare keepalive", "PING"],
+    ["STOMP", "SEND\ndestination:/queue/a\n\nbody^@"],
+    ["a delimited tick", "AAPL|229.10|+0.4"],
+  ])("keeps the content of a %s frame", (_label, payload) => {
+    const socket = open();
+    socket.receive(payload);
+
+    const frame = ws().find((entry) => entry.op === "msg");
+    expect(frame?.body).toBeDefined();
+    expect(String(frame?.body)).toContain(payload.slice(0, 6));
+    expect(frame?.bodySummary).toBeUndefined();
+  });
+
+  it("still redacts a secret in a non-JSON frame", () => {
+    const socket = open();
+    const secret = fakeStripeLiveKey();
+    socket.receive(`AUTH ${secret}`);
+
+    const frame = ws().find((entry) => entry.op === "msg");
+    expect(JSON.stringify(frame)).not.toContain(secret);
   });
 
   // A chatty socket is a normal thing and must not be able to fill a session with itself. Counting
@@ -153,7 +184,11 @@ describe("webSocketCollector", () => {
     first.dispatchEvent(closeEvent(1006, false));
     open();
 
-    expect(ws().filter((entry) => entry.op === "open").at(-1)).toMatchObject({
+    expect(
+      ws()
+        .filter((entry) => entry.op === "open")
+        .at(-1),
+    ).toMatchObject({
       reopen: true,
     });
   });
@@ -163,7 +198,11 @@ describe("webSocketCollector", () => {
     first.dispatchEvent(closeEvent(1006, false));
     open("wss://api.example.test/other");
 
-    expect(ws().filter((entry) => entry.op === "open").at(-1)?.reopen).toBeUndefined();
+    expect(
+      ws()
+        .filter((entry) => entry.op === "open")
+        .at(-1)?.reopen,
+    ).toBeUndefined();
   });
 
   it("restores the host constructor on cleanup", () => {

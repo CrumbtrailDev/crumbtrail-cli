@@ -182,9 +182,7 @@ function safeAppBuild(): string | undefined {
       .querySelector('meta[name="app-build"]')
       ?.getAttribute("content")
       ?.trim();
-    return value && /^[A-Za-z0-9._-]{1,120}$/.test(value)
-      ? value
-      : undefined;
+    return value && /^[A-Za-z0-9._-]{1,120}$/.test(value) ? value : undefined;
   } catch {
     return undefined;
   }

@@ -123,7 +123,10 @@ const SPACE_GROUP_RE = /[\u00a0\u202f\u2009 ]/g;
  * digits is ambiguous (`1,234`), and the page language breaks the tie; any
  * other single-separator shape is a decimal.
  */
-function normalizeNumericCore(core: string, lang: string | null): string | null {
+function normalizeNumericCore(
+  core: string,
+  lang: string | null,
+): string | null {
   let text = core
     .replace(ARABIC_INDIC_DIGIT_RE, (d) => {
       const code = d.charCodeAt(0);
@@ -152,7 +155,8 @@ function normalizeNumericCore(core: string, lang: string | null): string | null 
       // Ambiguous (`1,234` / `1.234`): the page language decides which side
       // of the Atlantic the grouping convention comes from.
       const commaDecimal = usesCommaDecimal(lang);
-      decimalSep = sep === "," ? (commaDecimal ? "," : null) : commaDecimal ? null : ".";
+      decimalSep =
+        sep === "," ? (commaDecimal ? "," : null) : commaDecimal ? null : ".";
     } else if (sep === "," && tail.length > 2 && !usesCommaDecimal(lang)) {
       // `12,3456` on a dot-decimal page is neither grouping nor money.
       return null;
@@ -285,10 +289,7 @@ function isHiddenElement(el: Element): boolean {
     node = node.parentElement
   ) {
     const style = (node as HTMLElement).style;
-    if (
-      style &&
-      (style.display === "none" || style.visibility === "hidden")
-    ) {
+    if (style && (style.display === "none" || style.visibility === "hidden")) {
       return true;
     }
   }
@@ -296,7 +297,10 @@ function isHiddenElement(el: Element): boolean {
 }
 
 function normalizeLabelText(text: string | null | undefined): string | null {
-  const trimmed = text?.replace(/\s+/g, " ").trim().replace(/[:：]$/, "");
+  const trimmed = text
+    ?.replace(/\s+/g, " ")
+    .trim()
+    .replace(/[:：]$/, "");
   if (!trimmed || trimmed.length > MAX_LABEL_LENGTH) return null;
   // A label that is itself a bare numeric token labels nothing.
   if (NUM_TOKEN_RE.test(trimmed)) return null;
@@ -310,10 +314,7 @@ function precedingSiblingLabel(start: Node): string | null {
     sibling = sibling.previousSibling
   ) {
     if (sibling.nodeType === 8 /* comment */) continue;
-    if (
-      sibling.nodeType === 1 &&
-      isHiddenElement(sibling as Element)
-    ) {
+    if (sibling.nodeType === 1 && isHiddenElement(sibling as Element)) {
       continue;
     }
     const label = normalizeLabelText(sibling.textContent);
@@ -818,7 +819,8 @@ function startUiNumbersCollector(
     // Deferral ceiling: under continuous mutation (a ticker, a stream) the
     // settle window re-arms forever, so once deferral has lasted
     // UI_NUM_MAX_WAIT_MS the scan runs now instead of waiting for quiet.
-    const wait = at - deferredSince >= UI_NUM_MAX_WAIT_MS ? 0 : UI_NUM_SETTLE_MS;
+    const wait =
+      at - deferredSince >= UI_NUM_MAX_WAIT_MS ? 0 : UI_NUM_SETTLE_MS;
     settleTimer = setTimeout(runScan, wait);
   };
 
