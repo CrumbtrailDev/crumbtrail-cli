@@ -5,6 +5,7 @@ import path from "node:path";
 import type { BugEvent } from "crumbtrail-core";
 import { McpServer } from "../mcp-server";
 import type {
+  McpArtifactRead,
   McpReadStore,
   McpSessionListing,
 } from "../mcp-read-store";
@@ -101,21 +102,22 @@ class InMemoryReadStore implements McpReadStore {
   async readArtifact(
     sessionDir: string,
     name: string,
-  ): Promise<Buffer | undefined> {
+  ): Promise<McpArtifactRead> {
     this.reads.push(`${sessionDir}/${name}`);
-    if (sessionDir !== this.sessionId) return undefined;
+    if (sessionDir !== this.sessionId)
+      return { ok: false, reason: "session_missing" };
     const artifact = this.artifacts[name];
-    return artifact === undefined ? undefined : Buffer.from(artifact, "utf-8");
+    return artifact === undefined
+      ? { ok: false, reason: "artifact_missing" }
+      : { ok: true, body: Buffer.from(artifact, "utf-8") };
   }
 
   async statArtifact(
     sessionDir: string,
     name: string,
   ): Promise<{ bytes: number; isDir: boolean } | undefined> {
-    const buffer = await this.readArtifact(sessionDir, name);
-    return buffer === undefined
-      ? undefined
-      : { bytes: buffer.byteLength, isDir: false };
+    const read = await this.readArtifact(sessionDir, name);
+    return read.ok ? { bytes: read.body.byteLength, isDir: false } : undefined;
   }
 }
 
