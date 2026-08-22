@@ -46,13 +46,24 @@ setup wizard will not wire an app against a package it cannot resolve.
 npx crumbtrail
 ```
 
-Needs Node 22.15 or newer. On an older Node this fails with npm's own
-`EBADENGINE` before the wizard prints anything.
+Needs Node 22.15 or newer. On an older Node the wizard stops and says so
+before it reads or writes anything in your repo.
 
 The wizard detects your stack, installs the right packages, and injects the
 setup code for you. For Express backends it wires both crash capture and the
 request and error middleware, so backend request spans link up with frontend
 sessions out of the box.
+
+If nothing arrives after you start your app, run:
+
+```bash
+npx crumbtrail verify
+```
+
+It resolves the host, opens TLS, and sends one authenticated test event that
+the cloud accepts and does not keep. That separates a problem in your setup
+from a problem reaching Crumbtrail, which is otherwise the hardest thing to
+tell apart from an empty dashboard.
 
 ## MCP bug context
 

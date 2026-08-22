@@ -200,6 +200,72 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
   return { ...base, ...over };
 }
 
+describe("wizard first-event wait — what is actually outstanding", () => {
+  it("blames the missing snippet, not the dev server, when nothing was injected", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        // fallback-ai prints a snippet and touches nothing. The key still
+        // lands and the SDK still installs, so the old guard (install failed?)
+        // never fired and the timeout told the user to restart an app that was
+        // never wired.
+        buildPlan: vi.fn(() => ({
+          recipe: "vite-spa",
+          kind: "fallback-ai" as const,
+          warnings: [],
+          keyEnvVar: "VITE_CRUMBTRAIL_KEY",
+          snippet: "Crumbtrail.init({ key: process.env.VITE_CRUMBTRAIL_KEY })",
+        })) as unknown as WizardDeps["buildPlan"],
+        pollForRealEvent: vi.fn(async () => ({
+          outcome: "timeout" as const,
+        })) as unknown as WizardDeps["pollForRealEvent"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("still has to go into your entry file");
+    expect(out).not.toContain("restart it if it was already running");
+  });
+
+  it("names the diagnostic that separates their problem from ours", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        pollForRealEvent: vi.fn(async () => ({
+          outcome: "timeout" as const,
+        })) as unknown as WizardDeps["pollForRealEvent"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    // `crumbtrail verify` answers the whole "is it me or is it you" ticket
+    // category, and appeared in usage() and nowhere a stuck person would look.
+    expect(lines.join("\n")).toContain("npx crumbtrail verify");
+  });
+});
+
+describe("Node version floor", () => {
+  it("stops before touching the repo on a Node older than the engines range", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui });
+    const code = await runCli(["node", "cli"], deps, "v20.11.0");
+    expect(code).toBe(1);
+    expect(lines.join("\n")).toContain("Node 22.15.0 or newer");
+    expect(lines.join("\n")).toContain("Node 20.11.0");
+    // npm only warns on an unmet engines range, so nothing else stops this.
+    expect(deps.detect).not.toHaveBeenCalled();
+  });
+
+  it("runs on a Node at or above the floor", async () => {
+    const deps = makeDeps({ steps: [] });
+    expect(await runCli(["node", "cli"], deps, "v22.15.0")).toBe(0);
+    expect(await runCli(["node", "cli"], deps, "v24.0.0")).toBe(0);
+  });
+});
+
 describe("parseArgs", () => {
   it("parses flags, subcommands, and both --k v / --k=v forms", () => {
     expect(parseArgs(["node", "cli", "--help"]).command).toBe("help");
@@ -414,8 +480,11 @@ describe("wizard orchestration", () => {
     const openBrowserFn = vi.fn(async () => true);
     const deps = makeDeps({ steps }, { openBrowserFn });
     await runCli(["node", "cli"], deps);
+    // Project scoped. A bare /sessions/<id> hits the dashboard's catch-all,
+    // which drops the id and picks the project from the browser's last-used
+    // value — so the payoff link opened some other project's session list.
     expect(openBrowserFn).toHaveBeenCalledWith(
-      "http://127.0.0.1:9999/sessions/sess-1",
+      "http://127.0.0.1:9999/p/p1/sessions/sess-1",
     );
   });
 
@@ -1487,7 +1556,7 @@ describe("wizard — evidence-source onboarding pointer (BUG-14)", () => {
     expect(code).toBe(0);
     const out = lines.join("\n");
     expect(out).toContain("Evidence sources:");
-    expect(out).toContain("http://127.0.0.1:9999/settings");
+    expect(out).toContain("http://127.0.0.1:9999/p/p1/integrations");
     // Only adapters that actually exist may be named.
     for (const provider of [
       "Sentry",

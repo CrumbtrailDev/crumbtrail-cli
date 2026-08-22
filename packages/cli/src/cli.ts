@@ -868,6 +868,12 @@ export async function runWizard(
   // for one would spend the user's time on a countdown with a foregone answer,
   // and end on "no event yet" as though they had done something wrong.
   const nothingWired = !install.installed && install.packages.length > 0;
+  // Nothing reached the user's entry file: the plan fell back to a snippet
+  // they were asked to paste, or they declined the prepend. The key is on
+  // disk and the SDK is installed, so waiting is still right — they may paste
+  // while it waits — but the wait is on them, not on their dev server.
+  const awaitingManualWiring =
+    inject.outcome === "guidance" || inject.outcome === "declined";
 
   let sessionUrl: string | undefined;
   if (parsed.skipVerify) {
@@ -881,8 +887,10 @@ export async function runWizard(
     ui.out(
       color.dim(
         keyReady
-          ? "In another terminal, start your dev server (restart it if it is already running, so it reads the new key) and load a page in your browser. This one stays here watching for the event."
-          : `${setKeyHint} — mint one at ${appBase}/settings, then start your app.`,
+          ? awaitingManualWiring
+            ? "Add the snippet above to your entry file, then start your dev server and load a page. This one stays here watching for the event."
+            : "In another terminal, start your dev server (restart it if it is already running, so it reads the new key) and load a page in your browser. This one stays here watching for the event."
+          : `${setKeyHint} — mint one at ${appUrl(appBase, "/settings", provisioned.projectId)}, then start your app.`,
       ),
     );
     const poll = await pollWithSigint(
@@ -896,8 +904,12 @@ export async function runWizard(
       // The emotional payoff: deep-link straight to the captured session
       // (spec §4), and open it in the browser when one is available.
       sessionUrl = poll.sessionId
-        ? `${appBase}/sessions/${encodeURIComponent(poll.sessionId)}`
-        : `${appBase}/issues`;
+        ? appUrl(
+            appBase,
+            `/sessions/${encodeURIComponent(poll.sessionId)}`,
+            provisioned.projectId,
+          )
+        : appUrl(appBase, "/issues", provisioned.projectId);
       ui.out(ok(color.bold("First real event received.")));
       ui.out(`  Watch it live: ${color.brand(sessionUrl)}`);
       if (canUseBrowser(parsed.noBrowser, deps.env)) {
@@ -911,15 +923,27 @@ export async function runWizard(
         "Stopped waiting for the first event — load your app any time.",
       );
     } else {
+      // Which step is still outstanding, rather than one sentence about the
+      // dev server. Two outcomes reach this wait with nothing injected — a
+      // fallback snippet the user was asked to paste, and a prepend they
+      // declined — and telling those users to restart their app sends them
+      // looking for a fault in a step they never completed.
       notes.push(
-        keyReady
-          ? "No event yet — start your app, or restart it if it was already running when the key was written, then load a page."
-          : `No event yet — ${setKeyHint.toLowerCase()} and start your app.`,
+        !keyReady
+          ? `No event yet — ${setKeyHint.toLowerCase()} and start your app.`
+          : awaitingManualWiring
+            ? "No event yet — the snippet above still has to go into your entry file. Paste it, then start your app."
+            : keyWrite.status === "already-set"
+              ? `No event yet — ${plan.keyEnvVar ?? "the ingest key"} was already set, and Crumbtrail left it alone. If that key was not minted in ${provisioned.projectName}, events are going wherever it points instead.`
+              : "No event yet — start your app, or restart it if it was already running when the key was written, then load a page.",
+      );
+      notes.push(
+        `Check the connection itself with \`npx crumbtrail verify\`: it resolves the host, opens TLS, and sends one authenticated test event, so it separates a problem here from a problem on your side.`,
       );
     }
     // Point the user at the next lever — pulling in the evidence sources they
     // already run. Pointer only, no prompt.
-    printEvidenceSourcesPointer(ui, base);
+    printEvidenceSourcesPointer(ui, base, provisioned.projectId);
   }
 
   // 7. Summary.
@@ -962,7 +986,28 @@ function appBaseFor(
   );
 }
 
-function printEvidenceSourcesPointer(ui: Ui, base: string): void {
+/**
+ * A dashboard URL that lands where it says it lands.
+ *
+ * Every route naming a record lives under /p/:projectId. A bare
+ * `/sessions/<id>` misses that and hits the dashboard's catch-all, which drops
+ * the id and resolves the project from whatever that browser looked at last —
+ * so the link printed on success opened some other project's session list, and
+ * the "mint a key here" link opened some other project's key card, which is how
+ * a valid key ends up capturing into the wrong project with nothing on either
+ * side able to notice.
+ */
+function appUrl(appBase: string, path: string, projectId?: string): string {
+  return projectId
+    ? `${appBase}/p/${encodeURIComponent(projectId)}${path}`
+    : `${appBase}${path}`;
+}
+
+function printEvidenceSourcesPointer(
+  ui: Ui,
+  base: string,
+  projectId?: string,
+): void {
   ui.out("");
   ui.out(`  ${rule(caps().width - 4)}`);
   ui.out(
@@ -982,7 +1027,9 @@ function printEvidenceSourcesPointer(ui: Ui, base: string): void {
     color.dim("  queried at incident time and added to each bug's bundle."),
   );
   ui.out(
-    `  ${color.dim("Evidence sources:")}  ${color.brand(`${appBaseFor(base)}/settings`)}`,
+    `  ${color.dim("Evidence sources:")}  ${color.brand(
+      appUrl(appBaseFor(base), "/integrations", projectId),
+    )}`,
   );
 }
 
@@ -1376,8 +1423,8 @@ export async function runBatchWizard(
       if (o.keyEnvVar && !o.keyWritten) {
         o.notes.push(
           o.keyIsCompileTime
-            ? `Pass --dart-define=${o.keyEnvVar}=<your-ingest-key> to flutter run and flutter build (mint at ${appBase}/settings).`
-            : `Set ${o.keyEnvVar} in this service's .env (mint at ${appBase}/settings).`,
+            ? `Pass --dart-define=${o.keyEnvVar}=<your-ingest-key> to flutter run and flutter build (mint at ${appUrl(appBase, "/settings", project.id)}).`
+            : `Set ${o.keyEnvVar} in this service's .env (mint at ${appUrl(appBase, "/settings", project.id)}).`,
         );
       }
     }
@@ -1398,7 +1445,11 @@ export async function runBatchWizard(
         onFound: (serviceId, sessionId) => {
           const o = byServiceId.get(serviceId);
           if (!o) return;
-          o.sessionUrl = `${appBase}/sessions/${encodeURIComponent(sessionId)}`;
+          o.sessionUrl = appUrl(
+            appBase,
+            `/sessions/${encodeURIComponent(sessionId)}`,
+            project.id,
+          );
           ui.out(ok(`${color.bold(o.name)}: first event received.`));
         },
         fetchImpl: deps.fetchImpl,
@@ -1409,7 +1460,14 @@ export async function runBatchWizard(
       // Stragglers are expected — the user hasn't started every service. This is
       // information, not a failure.
       for (const o of byServiceId.values()) {
-        if (!o.sessionUrl) o.notes.push("No event yet — start this service.");
+        // A guidance service was never wired: its snippet is the outstanding
+        // step, and in a monorepo that snippet scrolled off many services ago.
+        if (!o.sessionUrl)
+          o.notes.push(
+            o.status === "guidance"
+              ? "No event yet — this service was not wired for you. Add the snippet printed for it above, then start it."
+              : "No event yet — start this service.",
+          );
       }
     }
   }
@@ -1417,10 +1475,18 @@ export async function runBatchWizard(
   // Same onboarding pointer as the single-package path — once for the batch,
   // only when a verify actually ran (something is wired and reporting).
   if (!parsed.skipVerify && reporting.length > 0) {
-    printEvidenceSourcesPointer(ui, base);
+    printEvidenceSourcesPointer(ui, base, project.id);
   }
 
-  printBatchSummary(ui, base, root, project.name, outcomes, batchNotes);
+  printBatchSummary(
+    ui,
+    base,
+    root,
+    project.id,
+    project.name,
+    outcomes,
+    batchNotes,
+  );
 
   const attempted = outcomes.filter(
     (o) => o.status !== "skipped-already-wired",
@@ -1491,6 +1557,7 @@ function printBatchSummary(
   ui: Ui,
   base: string,
   root: string,
+  projectId: string,
   projectName: string,
   outcomes: ServiceOutcome[],
   batchNotes: string[] = [],
@@ -1568,7 +1635,12 @@ function printBatchSummary(
   ];
   ui.out("");
   ui.out(`  ${color.dim(parts.join(caps().unicode ? " · " : " | "))}`);
-  ui.out(field("Dashboard", color.brand(`${appBaseFor(base)}/issues`)));
+  ui.out(
+    field(
+      "Dashboard",
+      color.brand(appUrl(appBaseFor(base), "/issues", projectId)),
+    ),
+  );
 
   const notes = [
     ...outcomes.flatMap((o) => o.notes.map((n) => `${o.name}: ${n}`)),
@@ -2076,14 +2148,14 @@ function printSummary(
       ui.out(
         field(
           "Ingest key",
-          `build with ${color.bold(`--dart-define=${keyEnvVar}=<your-ingest-key>`)} ${color.dim(`(mint at ${appBase}/settings)`)}`,
+          `build with ${color.bold(`--dart-define=${keyEnvVar}=<your-ingest-key>`)} ${color.dim(`(mint at ${appUrl(appBase, "/settings", p.projectId)})`)}`,
         ),
       );
     } else {
       ui.out(
         field(
           "Ingest key",
-          `set ${color.bold(keyEnvVar)} in .env ${color.dim(`(mint at ${appBase}/settings)`)}`,
+          `set ${color.bold(keyEnvVar)} in .env ${color.dim(`(mint at ${appUrl(appBase, "/settings", p.projectId)})`)}`,
         ),
       );
     }
@@ -2094,7 +2166,9 @@ function printSummary(
   if (sessionUrl) {
     ui.out(field("Session", color.brand(sessionUrl)));
   }
-  ui.out(field("Dashboard", color.brand(`${appBase}/issues`)));
+  ui.out(
+    field("Dashboard", color.brand(appUrl(appBase, "/issues", p.projectId))),
+  );
   if (notes.length > 0) {
     ui.out("");
     for (const n of notes) ui.out(note(n));
@@ -2250,11 +2324,43 @@ async function runVerify(
 
 // ── Entry ────────────────────────────────────────────────────────────────────
 
+/** The floor the package's `engines` field declares. */
+const MIN_NODE = [22, 15, 0] as const;
+
+/**
+ * npm treats an unmet `engines` range as a warning unless the user has set
+ * `engine-strict=true`, so the README's promise that an old Node stops the
+ * install before anything runs was not true for most people. On Node 20 the
+ * wizard started, edited files, and failed somewhere in the middle. This is
+ * the check that makes the promise true, and it says the version it found.
+ */
+function nodeTooOld(version: string): boolean {
+  const parts = version.replace(/^v/, "").split(".").map(Number);
+  for (const [index, floor] of MIN_NODE.entries()) {
+    const part = parts[index];
+    if (!Number.isFinite(part)) return false;
+    if ((part as number) !== floor) return (part as number) < floor;
+  }
+  return false;
+}
+
 export async function runCli(
   argv: string[],
   deps: WizardDeps = defaultDeps(),
+  nodeVersion: string = process.version,
 ): Promise<number> {
   const parsed = parseArgs(argv);
+
+  // Before anything reads the repo or writes to it.
+  if (parsed.command !== "version" && nodeTooOld(nodeVersion)) {
+    deps.ui.err(
+      `Crumbtrail needs Node ${MIN_NODE.join(".")} or newer. This is Node ${nodeVersion.replace(/^v/, "")}.`,
+    );
+    deps.ui.err(
+      "Upgrade Node, then run `npx crumbtrail` again. Nothing has been changed in this repo.",
+    );
+    return 1;
+  }
 
   if (parsed.command === "version") {
     deps.ui.out(readVersion());
