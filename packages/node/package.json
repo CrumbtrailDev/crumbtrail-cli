@@ -53,7 +53,7 @@
   "scripts": {
     "prepack": "node ../../scripts/assert-publish-safe.mjs",
     "prepublishOnly": "node ../../scripts/assert-publish-safe.mjs",
-    "build": "tsup",
+    "build": "rm -rf dist && tsup",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
