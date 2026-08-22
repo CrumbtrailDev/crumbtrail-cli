@@ -2037,12 +2037,12 @@ export class McpServer {
       const target = this.resolveTarget(args);
       if ("error" in target) return errorResult(target.error);
       events = this.readBugEvents(target.dir);
-    } else {
-      const read = await this.requireEvents(
-        await this.sessionDirAsync(args.sessionId as string),
-      );
-      if ("error" in read) return errorResult(read.error);
-      events = read.value;
+      } else {
+        const read = await this.requireEvents(
+          await this.sessionDirAsync(args.sessionId as string),
+        );
+        if ("error" in read) return errorResult(read.error);
+        events = read.value;
     }
     events = this.filterEvents(events, args);
     events = events.slice(0, this.eventCap(args.limit));
