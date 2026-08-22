@@ -892,7 +892,7 @@ describe("MCP remote read store", () => {
     const store = new RemoteMcpReadStore({ baseUrl: mock.baseUrl, token: TOKEN });
 
     await expect(store.readArtifact(SESSION_ID, "index.json")).resolves.toEqual(
-      Buffer.from(artifacts["index.json"]),
+      { ok: true, body: Buffer.from(artifacts["index.json"]) },
     );
     await expect(store.statArtifact(SESSION_ID, "index.json")).resolves.toEqual({
       bytes: Buffer.byteLength(artifacts["index.json"]),
@@ -1058,7 +1058,7 @@ describe("MCP remote read store", () => {
 
     await expect(
       store.readArtifact(SESSION_ID, "index.json"),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual({ ok: false, reason: "unreachable" });
 
     // A HEAD against a handler that never calls end() never resolves at all:
     // node holds the header back, so there is nothing to read a size from and

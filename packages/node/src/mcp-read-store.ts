@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { defaultSessionStore } from "./session-store";
 
 /**
@@ -59,6 +60,35 @@ export interface McpSessionListing {
   unavailable?: McpSessionListingFailure;
 }
 
+/**
+ * Why an artifact could not be read.
+ *
+ * The same reason `McpSessionListingFailure` exists, one level down. Every
+ * failure a read can hit — the session is not there, it is there but still
+ * processing, the artifact was never written, the token expired, the read
+ * limiter said no, the request timed out — used to collapse to `undefined`,
+ * and every tool built on it printed the same sentence: "Session not found".
+ * That sentence is true for exactly one of those causes and actively
+ * misleading for the rest, and it sent readers hunting for a session id that
+ * was correct all along.
+ */
+export type McpArtifactFailure =
+  /** The session exists; this artifact was never written for it. */
+  | "artifact_missing"
+  /** No such session, or it does not belong to this token. */
+  | "session_missing"
+  /** The session is finalized but not yet indexed, so nothing to read yet. */
+  | "session_processing"
+  | "too_large"
+  | "read_quota_exhausted"
+  | "unauthorized"
+  /** Timeout, network failure, or a response this client could not parse. */
+  | "unreachable";
+
+export type McpArtifactRead =
+  | { ok: true; body: Buffer }
+  | { ok: false; reason: McpArtifactFailure };
+
 export interface McpReadStore {
   /**
    * Where this store reads from, in one phrase, for an empty result to name.
@@ -72,7 +102,13 @@ export interface McpReadStore {
   describe(): string;
   listSessions(query?: McpSessionQuery): Promise<McpSessionListing>;
   resolveSessionDir(sessionId: string): Promise<string>;
-  readArtifact(sessionDir: string, name: string): Promise<Buffer | undefined>;
+  /**
+   * Read one artifact, saying why when it cannot. There is deliberately no
+   * Buffer-or-undefined variant beside this: a caller that discards the reason
+   * is how the "Session not found" defect happened, and the cheapest guard
+   * against it coming back is having nowhere to discard it.
+   */
+  readArtifact(sessionDir: string, name: string): Promise<McpArtifactRead>;
   statArtifact(
     sessionDir: string,
     name: string,
@@ -108,8 +144,16 @@ export class FilesystemMcpReadStore implements McpReadStore {
   async readArtifact(
     sessionDir: string,
     name: string,
-  ): Promise<Buffer | undefined> {
-    return defaultSessionStore.readArtifact(sessionDir, name);
+  ): Promise<McpArtifactRead> {
+    const body = await defaultSessionStore.readArtifact(sessionDir, name);
+    if (body) return { ok: true, body };
+    // On disk the two absences are cheaply distinguishable, and they lead to
+    // different next steps: a missing directory means the id is wrong, a
+    // missing file inside one means the capture never wrote that artifact.
+    return {
+      ok: false,
+      reason: existsSync(sessionDir) ? "artifact_missing" : "session_missing",
+    };
   }
 
   async statArtifact(
@@ -254,6 +298,44 @@ export class RemoteMcpReadStore implements McpReadStore {
   }
 
   /**
+   * One artifact read that keeps the reason. `fetchBody` stays for the stat
+   * fallback below, where a size is either measurable or not and there is no
+   * third thing to say.
+   */
+  private async fetchArtifact(path: string): Promise<McpArtifactRead> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await globalThis.fetch(`${this.baseUrl}${path}`, {
+        headers: { Authorization: `Bearer ${this.token}` },
+        signal: controller.signal,
+      });
+      const artifact = await this.followDirectArtifactHandoff(
+        path,
+        "GET",
+        response,
+        controller.signal,
+      );
+      if (!artifact) return { ok: false, reason: "unreachable" };
+      if (!artifact.ok) {
+        return { ok: false, reason: await artifactFailure(artifact) };
+      }
+      if (this.exceedsBodyLimit(artifact)) {
+        void artifact.body?.cancel().catch(() => undefined);
+        return { ok: false, reason: "too_large" };
+      }
+      const body = await this.readBoundedBody(artifact);
+      return body === undefined
+        ? { ok: false, reason: "unreachable" }
+        : { ok: true, body };
+    } catch {
+      return { ok: false, reason: "unreachable" };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /**
    * Fetches a listing and keeps the status, because the status IS the answer
    * here. `fetchBody` collapses every non ok response to undefined, which is
    * right for an artifact (missing or unreadable are the same next step) and
@@ -294,8 +376,8 @@ export class RemoteMcpReadStore implements McpReadStore {
   async readArtifact(
     sessionId: string,
     name: string,
-  ): Promise<Buffer | undefined> {
-    return this.fetchBody(this.artifactPath(sessionId, name));
+  ): Promise<McpArtifactRead> {
+    return this.fetchArtifact(this.artifactPath(sessionId, name));
   }
 
   async statArtifact(
@@ -322,7 +404,7 @@ export class RemoteMcpReadStore implements McpReadStore {
     // Crumbtrail's own cloud declares the length and takes the cheap path
     // above; it did not always, and the omission silently doubled every stat.
     // This path is for endpoints that still omit the header.
-    const bytes = await this.fetchBody(path, "byteLength");
+    const bytes = await this.fetchBodyLength(path);
     return bytes === undefined ? undefined : { bytes, isDir: false };
   }
 
@@ -410,15 +492,12 @@ export class RemoteMcpReadStore implements McpReadStore {
     }
   }
 
-  private fetchBody(path: string): Promise<Buffer | undefined>;
-  private fetchBody(
-    path: string,
-    mode: "byteLength",
-  ): Promise<number | undefined>;
-  private async fetchBody(
-    path: string,
-    mode: "buffer" | "byteLength" = "buffer",
-  ): Promise<Buffer | number | undefined> {
+  /**
+   * The BYTE LENGTH of an artifact, for the stat fallback below. It keeps no
+   * reason because a size is either measurable or not, and a stat has no
+   * sentence to print either way.
+   */
+  private async fetchBodyLength(path: string): Promise<number | undefined> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
     try {
@@ -436,9 +515,7 @@ export class RemoteMcpReadStore implements McpReadStore {
         void artifact?.body?.cancel().catch(() => undefined);
         return undefined;
       }
-      return mode === "buffer"
-        ? await this.readBoundedBody(artifact)
-        : await this.readBoundedBodyByteLength(artifact);
+      return await this.readBoundedBodyByteLength(artifact);
     } catch {
       return undefined;
     } finally {
@@ -604,6 +681,48 @@ function isEntry(entry: McpSessionEntry | undefined): entry is McpSessionEntry {
  * so its Retry-After travels with it. 401/403 is a token the operator has to
  * replace. Everything else is an outage from the caller's point of view.
  */
+/** The error `code` the cloud puts in a JSON error body, when it sent one. */
+async function errorCode(response: Response): Promise<string | undefined> {
+  const declared = Number(response.headers.get("content-length"));
+  // An error body is a short JSON object. Anything claiming to be large is not
+  // one, and reading it would turn a failed read into a download.
+  if (Number.isFinite(declared) && declared > 64 * 1024) {
+    void response.body?.cancel().catch(() => undefined);
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(await response.text());
+    const code = isRecord(parsed) ? parsed.code : undefined;
+    return typeof code === "string" ? code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Map one failed artifact response onto a reason a reader can act on.
+ *
+ * The status alone is not enough, and 404 is why: the cloud answers a session
+ * that is not there (or not yours) with its existence hiding `not_found`,
+ * while a session that exists but never wrote this artifact answers with the
+ * inner server's own 404 passed through. Same status, opposite next steps.
+ */
+async function artifactFailure(
+  response: Response,
+): Promise<McpArtifactFailure> {
+  if (response.status === 429) return "read_quota_exhausted";
+  if (response.status === 401 || response.status === 403) return "unauthorized";
+  if (response.status === 413) return "too_large";
+  const code = await errorCode(response);
+  if (code === "session_processing") return "session_processing";
+  if (code === "artifact_too_large") return "too_large";
+  if (code === "artifact_timeout") return "unreachable";
+  if (response.status === 404) {
+    return code === "not_found" ? "session_missing" : "artifact_missing";
+  }
+  return "unreachable";
+}
+
 function listingFailure(response: Response): McpSessionListingFailure {
   if (response.status === 429) {
     const header = Number(response.headers.get("retry-after"));

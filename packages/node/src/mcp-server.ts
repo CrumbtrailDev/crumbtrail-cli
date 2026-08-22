@@ -37,6 +37,7 @@ import {
 import {
   FilesystemMcpReadStore,
   selectMcpReadStore,
+  type McpArtifactFailure,
   type McpReadStore,
   type McpSessionEntry,
   type McpSessionListingFailure,
@@ -1634,17 +1635,87 @@ export class McpServer {
       .map((line) => JSON.parse(line));
   }
 
+  /** The bytes when the read worked, and nothing when it did not. For the
+   *  reads whose only honest answer is "there is nothing here"; anything that
+   *  reports a failure to the caller reads the store directly. */
+  private async artifactBytes(
+    dir: string,
+    name: string,
+  ): Promise<Buffer | undefined> {
+    const read = await this.store.readArtifact(dir, name);
+    return read.ok ? read.body : undefined;
+  }
+
+  /**
+   * One sentence naming what actually stopped a read.
+   *
+   * Every one of these used to be "Session not found", which is true for
+   * exactly one of them. A reader given that sentence for a session that was
+   * still indexing, or for a token that had expired, spent their time checking
+   * an id that was right.
+   */
+  private readFailureText(reason: McpArtifactFailure, artifact: string): string {
+    switch (reason) {
+      case "session_missing":
+        return `Session not found. Nothing with that id is in ${this.store.describe()}.`;
+      case "artifact_missing":
+        return `This session exists but holds no ${artifact}. A session that has not been finalized has no artifacts yet: end it, or wait for the idle sweep, then read it again.`;
+      case "session_processing":
+        return "This session is finalized but has not been indexed yet, so none of its artifacts exist to read. Try again shortly.";
+      case "read_quota_exhausted":
+        return "The agent read limit was reached, so this read was refused before it happened. Nothing about the session changed. Wait and try again.";
+      case "unauthorized":
+        return `This token cannot read that session. It may have expired, or the session may belong to a project the token does not cover (${this.store.describe()}).`;
+      case "too_large":
+        return `The ${artifact} for this session is too large to return whole. Use getWindow to read a bounded slice of it.`;
+      case "unreachable":
+        return `Could not reach ${this.store.describe()}. The session may be intact; this read is not.`;
+    }
+  }
+
+  /** A session JSON artifact, or the reason there is none to return. */
+  private async requireJson(
+    dir: string,
+    name: string,
+  ): Promise<{ value: Record<string, unknown> } | { error: string }> {
+    const read = await this.store.readArtifact(dir, name);
+    if (!read.ok) return { error: this.readFailureText(read.reason, name) };
+    try {
+      const parsed: unknown = JSON.parse(read.body.toString("utf-8"));
+      if (isRecord(parsed)) return { value: parsed };
+    } catch {
+      // Fall through to the same sentence: a body that will not parse and a
+      // body that is not an object are one fact to the reader.
+    }
+    return {
+      error: `The ${name} for this session could not be read as JSON. The session is there; this artifact is damaged.`,
+    };
+  }
+
+  /** The session's events, or the reason there are none to return. */
+  private async requireEvents(
+    dir: string,
+  ): Promise<{ value: BugEvent[] } | { error: string }> {
+    const outcome = await this.readEventsOutcome(dir);
+    return outcome.ok
+      ? { value: outcome.events }
+      : { error: this.readFailureText(outcome.reason, "event stream") };
+  }
+
+  /**
+   * The event stream, however it was stored.
+   *
+   * This used to ask for `events.ndjson` alone while `readColdEventsAsync`
+   * tried the zstd stream first and fell back to the plain one. A cold hosted
+   * session stores only `events.ndjson.zst`, so `getWindow` worked on it and
+   * `getEvents`, `getErrorContext` and every other tool built on this one
+   * answered "Session not found" for a session id `listSessions` had just
+   * handed the reader. There is one event read now, and this is it.
+   */
   private async readEventsAsync(
     sessionDir: string,
   ): Promise<BugEvent[] | undefined> {
-    const buf = await this.store.readArtifact(sessionDir, "events.ndjson");
-    if (!buf) return undefined;
-    const content = buf.toString("utf-8").trim();
-    if (!content) return [];
-    return content
-      .split("\n")
-      .filter(Boolean)
-      .map((line) => JSON.parse(line));
+    return this.readColdEventsAsync(sessionDir);
   }
 
   /**
@@ -1850,8 +1921,9 @@ export class McpServer {
 
   private async toolGetIndex(args: Record<string, unknown>) {
     const dir = await this.sessionDirAsync(args.sessionId as string);
-    const index = await this.readJsonRecordAsync(dir, "index.json");
-    if (!index) return errorResult("Session not found");
+    const read = await this.requireJson(dir, "index.json");
+    if ("error" in read) return errorResult(read.error);
+    const index = read.value;
     return textResult(this.compactIndex(index));
   }
 
@@ -1890,11 +1962,11 @@ export class McpServer {
       if ("error" in target) return errorResult(target.error);
       events = this.readBugEvents(target.dir);
     } else {
-      const sessionEvents = await this.readEventsAsync(
+      const read = await this.requireEvents(
         await this.sessionDirAsync(args.sessionId as string),
       );
-      if (sessionEvents === undefined) return errorResult("Session not found");
-      events = sessionEvents;
+      if ("error" in read) return errorResult(read.error);
+      events = read.value;
     }
     events = this.filterEvents(events, args);
     events = events.slice(0, this.eventCap(args.limit));
@@ -1905,8 +1977,9 @@ export class McpServer {
     const budget = this.maxTokensOf(args);
     if ("error" in budget) return errorResult(budget.error);
     const dir = await this.sessionDirAsync(args.sessionId as string);
-    const events = await this.readEventsAsync(dir);
-    if (events === undefined) return errorResult("Session not found");
+    const read = await this.requireEvents(dir);
+    if ("error" in read) return errorResult(read.error);
+    const events = read.value;
     const windowMs = typeof args.windowMs === "number" ? args.windowMs : 2000;
     const errors = events
       .filter((event) => event.k === "err" || event.k === "rej")
@@ -1945,8 +2018,9 @@ export class McpServer {
     const budget = this.maxTokensOf(args);
     if ("error" in budget) return errorResult(budget.error);
     const dir = await this.sessionDirAsync(args.sessionId as string);
-    const index = await this.readJsonRecordAsync(dir, "index.json");
-    if (!index) return errorResult("Session not found");
+    const read = await this.requireJson(dir, "index.json");
+    if ("error" in read) return errorResult(read.error);
+    const index = read.value;
     const requests = Array.isArray(index.failedReqs)
       ? index.failedReqs.slice(0, this.eventCap(args.limit))
       : [];
@@ -1992,8 +2066,9 @@ export class McpServer {
     const sessionId = args.sessionId as string;
     const requestId = args.requestId as string;
     const dir = await this.sessionDirAsync(sessionId);
-    const index = await this.readJsonRecordAsync(dir, "index.json");
-    if (!index) return errorResult("Session not found");
+    const read = await this.requireJson(dir, "index.json");
+    if ("error" in read) return errorResult(read.error);
+    const index = read.value;
     const fullStackRequests = isRecord(index.fullStackRequests)
       ? index.fullStackRequests
       : undefined;
@@ -3508,8 +3583,9 @@ export class McpServer {
     // entry point, so agents can plan follow-up budgets from it.
     if (manifest) return textResult(attachTokenEstimate(manifest));
 
-    const index = await this.readJsonRecordAsync(dir, "index.json");
-    if (!index) return errorResult("Session not found");
+    const read = await this.requireJson(dir, "index.json");
+    if ("error" in read) return errorResult(read.error);
+    const index = read.value;
     return textResult(
       attachTokenEstimate(await this.synthesizeManifestAsync(dir, index)),
     );
@@ -3833,18 +3909,47 @@ export class McpServer {
   private async readColdEventsAsync(
     dir: string,
   ): Promise<BugEvent[] | undefined> {
+    const outcome = await this.readEventsOutcome(dir);
+    return outcome.ok ? outcome.events : undefined;
+  }
+
+  /**
+   * The one event read, keeping the reason when there is nothing to return.
+   *
+   * The zstd stream is tried first because a cold hosted session stores only
+   * that; the plain one is the local and pre-compression shape. When neither
+   * is there, the reason reported is the more specific of the two: a missing
+   * session is a fact about the session, and a missing artifact is a fact
+   * about the session's capture, so the first outranks the second.
+   */
+  private async readEventsOutcome(
+    dir: string,
+  ): Promise<
+    { ok: true; events: BugEvent[] } | { ok: false; reason: McpArtifactFailure }
+  > {
     const cold = await this.store.readArtifact(dir, "events.ndjson.zst");
-    if (cold) {
+    if (cold.ok) {
       if (typeof zlib.zstdDecompressSync !== "function") {
         throw new Error(
           "Crumbtrail cold storage requires Node.js >=22.15.0 for zstd decompression.",
         );
       }
-      return this.parseEvents(zlib.zstdDecompressSync(cold).toString("utf-8"));
+      return {
+        ok: true,
+        events: this.parseEvents(
+          zlib.zstdDecompressSync(cold.body).toString("utf-8"),
+        ),
+      };
     }
     const plain = await this.store.readArtifact(dir, "events.ndjson");
-    if (plain) return this.parseEvents(plain.toString("utf-8"));
-    return undefined;
+    if (plain.ok) {
+      return { ok: true, events: this.parseEvents(plain.body.toString("utf-8")) };
+    }
+    return {
+      ok: false,
+      reason:
+        cold.reason === "artifact_missing" ? plain.reason : cold.reason,
+    };
   }
 
   private parseEvents(content: string): BugEvent[] {
@@ -3859,10 +3964,7 @@ export class McpServer {
   private async readCandidatesJsonlAsync(
     dir: string,
   ): Promise<Record<string, unknown>[]> {
-    const candidatesBuf = await this.store.readArtifact(
-      dir,
-      "candidates.jsonl",
-    );
+    const candidatesBuf = await this.artifactBytes(dir, "candidates.jsonl");
     if (candidatesBuf) {
       const out: Record<string, unknown>[] = [];
       for (const line of candidatesBuf.toString("utf-8").split("\n")) {
@@ -4088,7 +4190,7 @@ export class McpServer {
     name: string,
   ): Promise<Record<string, unknown> | undefined> {
     try {
-      const buf = await this.store.readArtifact(dir, name);
+      const buf = await this.artifactBytes(dir, name);
       if (!buf) return undefined;
       const parsed: unknown = JSON.parse(buf.toString("utf-8"));
       return isRecord(parsed) ? parsed : undefined;
@@ -4105,8 +4207,9 @@ export class McpServer {
     if ("error" in budget) return errorResult(budget.error);
     const sessionId = args.sessionId as string;
     const dir = await this.sessionDirAsync(sessionId);
-    const events = await this.readEventsAsync(dir);
-    if (events === undefined) return errorResult("Session not found");
+    const read = await this.requireEvents(dir);
+    if ("error" in read) return errorResult(read.error);
+    const events = read.value;
     const matching = events.filter((event) => event.k === kind);
     const returned = matching.slice(0, this.windowCap(args.limit));
     if (budget.maxTokens === undefined) return textResult(returned);
@@ -4152,8 +4255,9 @@ export class McpServer {
       );
     }
     const dir = await this.sessionDirAsync(args.sessionId as string);
-    const data = await this.readJsonRecordAsync(dir, "index.json");
-    if (!data) return errorResult("Session not found");
+    const indexRead = await this.requireJson(dir, "index.json");
+    if ("error" in indexRead) return errorResult(indexRead.error);
+    const data = indexRead.value;
     const frames = Array.isArray(data.frames)
       ? data.frames.filter(
           (frame): frame is { t: number; file: string } =>
@@ -4175,7 +4279,7 @@ export class McpServer {
       }
     }
 
-    const frame = await this.store.readArtifact(dir, `frames/${nearest.file}`);
+    const frame = await this.artifactBytes(dir, `frames/${nearest.file}`);
     if (!frame) return errorResult(`Frame file not found: ${nearest.file}`);
     return imageResult(frame.toString("base64"));
   }
@@ -4190,7 +4294,7 @@ export class McpServer {
     const filename = args.filename as string;
     if (!isSafeFrameFilename(filename))
       return errorResult("Invalid frame filename");
-    const frame = await this.store.readArtifact(dir, `frames/${filename}`);
+    const frame = await this.artifactBytes(dir, `frames/${filename}`);
     if (!frame) return errorResult(`Frame file not found: ${filename}`);
     return imageResult(frame.toString("base64"));
   }

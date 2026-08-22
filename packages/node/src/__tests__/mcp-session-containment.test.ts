@@ -70,14 +70,14 @@ describe("McpServer session containment (post SessionStore delegation)", () => {
 
     const index = await callTool("getIndex", { sessionId: "leaky" });
     expect(index.isError).toBe(true);
-    expect(index.content[0].text).toBe("Session not found");
+    expect(index.content[0].text).toContain("Session not found");
     expect(JSON.stringify(index)).not.toContain(secret);
 
     const events = await callTool("getEvents", { sessionId: "leaky" });
     // Missing sessions are explicit rather than indistinguishable from no events.
     expect(JSON.stringify(events)).not.toContain(secret);
     expect(events.isError).toBe(true);
-    expect(events.content[0].text).toBe("Session not found");
+    expect(events.content[0].text).toContain("Session not found");
 
     // The escaping session must not surface through enumeration either.
     const sessions = await callTool("listSessions", {});
@@ -95,7 +95,7 @@ describe("McpServer session containment (post SessionStore delegation)", () => {
     );
     const index = await callTool("getIndex", { sessionId: traversalId });
     expect(index.isError).toBe(true);
-    expect(index.content[0].text).toBe("Session not found");
+    expect(index.content[0].text).toContain("Session not found");
     expect(JSON.stringify(index)).not.toContain(secret);
   });
 
