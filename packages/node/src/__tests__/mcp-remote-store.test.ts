@@ -907,6 +907,23 @@ describe("MCP remote read store", () => {
     ).toEqual([]);
   });
 
+  // The gate used to be a stat, which answers only present or absent, so an
+  // expired token came back as "No finalized session found ... Run
+  // post-processing first" — a step that does not exist on a hosted
+  // deployment, aimed at a session that was there all along.
+  it("names the real reason a fix context could not be read", async () => {
+    mock = await startMockCloud({ artifactResponse: "unauthorized" });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
+    const server = remoteServer(mock.baseUrl, path.join(tmpDir, "sessions"));
+
+    const result = await callToolRaw(server, "getFixContext", {
+      sessionId: SESSION_ID,
+    });
+    const text = String(result.content?.[0]?.text ?? "");
+    expect(text).toContain("This token cannot read that session");
+    expect(text).not.toContain("post-processing");
+  });
+
   it("frames artifact responses the way the endpoint under test really does", async () => {
     // Guards the mock against drifting back into sending a header production
     // may not send. Every stat assertion below is only worth as much as this.

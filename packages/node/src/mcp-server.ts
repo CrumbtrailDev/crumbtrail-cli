@@ -2159,7 +2159,10 @@ export class McpServer {
         status: "unavailable",
         gaps: [],
         diagnostics: [
-          "No full-stack request evidence was generated for this session. Run post-processing with request correlation enabled before using this MCP lookup.",
+          // Names the capture side condition rather than a local command: a
+          // hosted reader has no post-processing step to run, and telling them
+          // to run one sent them looking for a command that does not exist.
+          `This session in ${this.store.describe()} holds no full-stack request evidence, so there is nothing here to join a frontend request to its backend work. That evidence is written at capture time by a backend SDK stamping the correlation id, so a session recorded without one never has it, and no read can recover it afterwards.`,
         ],
       });
     }
@@ -2589,13 +2592,15 @@ export class McpServer {
     const sessionId = args.sessionId as string;
     const dir = await this.sessionDirAsync(sessionId);
     try {
-      if (!(await this.store.statArtifact(dir, "index.json"))) {
-        throw new FixContextError(
-          "session-not-found",
-          `No finalized session found at ${dir} (missing index.json). Run post-processing first.`,
-        );
+      // Read it rather than stat it. A stat answers present or absent, so an
+      // expired token, a refused read and a session still indexing all arrived
+      // as one sentence telling a cloud reader to run a post-processing step
+      // that does not exist on a hosted deployment.
+      const required = await this.requireJson(dir, "index.json");
+      if ("error" in required) {
+        throw new FixContextError("session-not-found", required.error);
       }
-      const index = (await this.readJsonRecordAsync(dir, "index.json")) ?? {};
+      const index = required.value;
       const bundle =
         (await this.readJsonRecordAsync(dir, "llm.json")) ??
         (await this.readJsonRecordAsync(dir, "bundle.json"));
