@@ -436,6 +436,46 @@ export interface LlmBundleBrowserEvidence {
   storageChanges: LlmBundleStorageChange[];
   /** Labeled numbers the page displayed, grouped by label; `[]` when none. */
   screenNumbers: LlmBundleScreenNumber[];
+  /**
+   * Requests that SUCCEEDED in the window before the first error-class event.
+   *
+   * `failedRequests` answers "which request broke", and for a large share of real
+   * defects nothing did: the request returned 200 and carried the wrong value.
+   * A cart that answers `{"items": null}` with a 200 is the bug, and every
+   * handoff the product builds — the markdown export, the agent context, the
+   * MCP fix context, the issue page's correlated-record counts — read only the
+   * failed set, so that response was captured perfectly and then reached none
+   * of them. The reader's only route to it was calling `getWindow` with two
+   * epoch timestamps they had to work out themselves.
+   *
+   * These are deliberately NOT presented as suspects. Nothing here is known to
+   * be wrong; they are what the page asked for and got back immediately before
+   * it broke, which is the set a person reads first and the set an agent cannot
+   * reconstruct from an error message. `[]` when the session recorded no error
+   * to anchor on, or no successful request inside the window.
+   */
+  precedingRequests: LlmBundlePrecedingRequestSummary[];
+}
+
+/**
+ * One request that completed successfully in the window before the failure.
+ *
+ * Same shape as a failed request minus the failure fields, because the reader
+ * is doing the same thing with it: looking at what was sent and what came back.
+ */
+export interface LlmBundlePrecedingRequestSummary {
+  t: number;
+  iso?: string;
+  offsetMs?: number;
+  /** Milliseconds between this response and the first error-class event. */
+  beforeErrorMs?: number;
+  method?: string;
+  url?: string;
+  status?: number;
+  /** Bounded, redacted request payload evidence when it was captured. */
+  requestBody?: string;
+  /** Bounded, redacted response payload evidence when it was captured. */
+  responseBody?: string;
 }
 
 /**
@@ -1332,7 +1372,23 @@ export function buildLlmBundle({
     index,
     events,
   );
-  const browserEvidence = buildBrowserEvidence(index, events, session.startMs);
+  const browserEvidenceBase = buildBrowserEvidence(
+    index,
+    events,
+    session.startMs,
+  );
+  // The error anchor is derived FROM the browser evidence, so the requests that
+  // led up to it can only be attached once that evidence exists.
+  const firstErrorEventAt = computeFirstErrorEventAt(browserEvidenceBase, index);
+  const browserEvidence: LlmBundleBrowserEvidence = {
+    ...browserEvidenceBase,
+    precedingRequests: buildPrecedingRequests(
+      events,
+      session.startMs,
+      firstErrorEventAt,
+      browserEvidenceBase.failedRequests,
+    ),
+  };
   const fullStackEvidence = buildFullStackEvidence(
     index,
     session.startMs,
@@ -1352,7 +1408,6 @@ export function buildLlmBundle({
   const causalTree = buildCausalTree(candidates ?? []);
   const databaseErrors = buildDatabaseErrors(events, session.startMs);
   const databaseStatements = buildDatabaseStatements(events, session.startMs);
-  const firstErrorEventAt = computeFirstErrorEventAt(browserEvidence, index);
   const distinctBugs = applyFlagNoteTitles(
     groupDistinctBugs(candidates ?? [], events),
     events,
@@ -2390,7 +2445,78 @@ function buildBrowserEvidence(
     interactiveElements: collectInteractiveElements(events),
     storageChanges: buildStorageChanges(events, sessionStartMs),
     screenNumbers: buildScreenNumbers(events, sessionStartMs),
+    // Filled by the caller, which is the only place the error anchor exists:
+    // computeFirstErrorEventAt reads this very object, so the anchor cannot be
+    // known until after it is built. Left empty rather than optional so the
+    // field is never absent from a bundle.
+    precedingRequests: [],
   };
+}
+
+/** How far back from the first error a successful request still counts as context. */
+export const PRECEDING_REQUEST_WINDOW_MS = 15_000;
+/** Upper bound on preceding requests carried, newest first. */
+const MAX_PRECEDING_REQUESTS = 12;
+
+/**
+ * The successful responses immediately before the failure, newest first.
+ *
+ * Bounded three ways on purpose: a time window, a count cap, and exclusion of
+ * anything already reported as a failure. A busy page issues far more requests
+ * than a reader will look at, and repeating a failed request here would make
+ * the same request read as two different findings.
+ */
+function buildPrecedingRequests(
+  events: BugEvent[],
+  sessionStartMs: number,
+  firstErrorEventAt: number | undefined,
+  failedRequests: LlmBundleFailedRequestSummary[],
+): LlmBundlePrecedingRequestSummary[] {
+  if (firstErrorEventAt === undefined) return [];
+  const windowStart = firstErrorEventAt - PRECEDING_REQUEST_WINDOW_MS;
+  const alreadyReported = new Set(
+    failedRequests.map((entry) => `${entry.t}${SIGNATURE_SEPARATOR}${entry.url ?? ""}`),
+  );
+
+  const responses = events.filter((event) => {
+    if (event.k !== "net.res") return false;
+    if (!Number.isFinite(event.t)) return false;
+    if (event.t > firstErrorEventAt || event.t < windowStart) return false;
+    // Real capture writes `st`; OTLP-derived and hand-built events sometimes
+    // carry `status`. Both are read so neither shape silently drops out.
+    const status = finiteNumber(event.d.st) ?? finiteNumber(event.d.status);
+    // No status is not a success. An unknown outcome belongs to whatever
+    // recorded it, not to a list whose whole claim is "these came back fine".
+    if (status === undefined || status >= 400) return false;
+    return !alreadyReported.has(`${event.t}${SIGNATURE_SEPARATOR}${safeUrl(event.d.url, "net.res.url") ?? ""}`);
+  });
+
+  responses.sort((a, b) => b.t - a.t);
+
+  return responses.slice(0, MAX_PRECEDING_REQUESTS).map((response) => {
+    const request = requestForNetworkEvent(events, response);
+    return removeUndefined({
+      t: response.t,
+      iso: iso(response.t),
+      offsetMs: offsetFromStart(response.t, sessionStartMs),
+      beforeErrorMs: Math.max(0, firstErrorEventAt - response.t),
+      method:
+        safeText(response.d.m, 20) ??
+        safeText(response.d.method, 20) ??
+        (request ? safeText(request.d.m, 20) : undefined),
+      url:
+        safeUrl(response.d.url, "net.res.url") ??
+        (request ? safeUrl(request.d.url, "net.req.url") : undefined),
+      status: finiteNumber(response.d.st) ?? finiteNumber(response.d.status),
+      requestBody: request
+        ? redactedNetworkBodySnippet(request.d.body, request.d.bodySummary)
+        : undefined,
+      responseBody: redactedNetworkBodySnippet(
+        response.d.body,
+        response.d.bodySummary,
+      ),
+    }) as LlmBundlePrecedingRequestSummary;
+  });
 }
 
 const MAX_STORAGE_CHANGES = 200;
@@ -4858,6 +4984,35 @@ export function renderLlmMarkdown(bundle: LlmBundle): string {
                 req.requestBody ?? "",
                 req.responseBody ?? "",
               ]),
+          ),
+          "",
+        ]
+      : []),
+    ...(bundle.browserEvidence.precedingRequests.length > 0
+      ? [
+          "### Requests That Succeeded Just Before The Failure",
+          "",
+          "None of these failed. They are what the page asked for and got back in the seconds before the first error, because a correct-looking response carrying the wrong value is a defect no failure list can report.",
+          "",
+          table(
+            [
+              "Before error",
+              "Method",
+              "Status",
+              "URL",
+              "Request body",
+              "Response body",
+            ],
+            bundle.browserEvidence.precedingRequests.map((req) => [
+              req.beforeErrorMs !== undefined
+                ? `${req.beforeErrorMs} ms`
+                : "unknown",
+              req.method ?? "",
+              req.status !== undefined ? String(req.status) : "",
+              req.url ?? "",
+              req.requestBody ?? "",
+              req.responseBody ?? "",
+            ]),
           ),
           "",
         ]

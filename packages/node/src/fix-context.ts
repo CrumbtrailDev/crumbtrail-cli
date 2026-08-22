@@ -12,6 +12,7 @@ import type {
   LlmBundleDbStatement,
   LlmBundleDbActivity,
   LlmBundleFrontendRequestEvidenceSummary,
+  LlmBundlePrecedingRequestSummary,
   LlmBundleLinkedFullStackRequestSummary,
 } from "./llm-bundle";
 import {
@@ -76,6 +77,17 @@ export interface FixContextPrimaryWindow {
   backend: {
     requests: LlmBundleBackendRequestEvidenceSummary[];
   };
+  /**
+   * Requests that SUCCEEDED just before the first error, with their bodies.
+   *
+   * `frontend.requests` and `backend.requests` are both drawn from
+   * `fullStackEvidence.linked`, which pairs a browser request with its backend
+   * span. A browser-only session has no such pairs, so both were `[]` and this
+   * whole structure reported no request evidence for the exact defect shape
+   * that has no failed request to report: a 200 carrying the wrong value.
+   * Empty when the session recorded no error to anchor on.
+   */
+  preceding_requests: LlmBundlePrecedingRequestSummary[];
   /**
    * Database row diffs correlated to the primary window (CP5 DB diffing). Empty when the session
    * captured no `db.diff` events in the window. Consumers MUST treat `[]` as "no DB evidence".
@@ -564,6 +576,7 @@ function buildPrimaryWindow(
     backend: {
       requests: matched.map((entry) => entry.backend),
     },
+    preceding_requests: bundle?.browserEvidence?.precedingRequests ?? [],
     db_diffs: selectPrimaryWindowDbDiffs(bundle, window, topRequestId, matched),
     db_reads: selectPrimaryWindowDbReads(bundle, window, topRequestId, matched),
     db_errors: selectPrimaryWindowDbErrors(bundle, window, topRequestId, matched),

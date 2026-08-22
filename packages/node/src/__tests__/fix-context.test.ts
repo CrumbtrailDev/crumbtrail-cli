@@ -150,6 +150,7 @@ describe("buildFixContext", async () => {
       "db_reads",
       "db_statements",
       "frontend",
+      "preceding_requests",
     ]);
     expect(fc.session.id).toBe(SESSION_ID);
     expect(fc.session.app).toBe("shop");
