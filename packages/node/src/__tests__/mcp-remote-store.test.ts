@@ -600,7 +600,7 @@ describe("MCP remote read store", () => {
       };
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toMatch(
-        /remote artifact store|remote artifact stores/i,
+        /reads this machine.s disk/i,
       );
     }
 

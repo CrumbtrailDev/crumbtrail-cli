@@ -11,6 +11,56 @@ import { estimateTokens } from "../token-estimate";
 import type { EvidenceItem } from "crumbtrail-core";
 
 
+describe("MCP Server tool advertisement in cloud mode", () => {
+  const cloudStore = {
+    describe: () => "the Crumbtrail cloud tenant",
+    listSessions: async () => ({ sessions: [], truncated: false }),
+    resolveSessionDir: async (id: string) => id,
+    readArtifact: async () => ({ ok: false as const, reason: "unreachable" as const }),
+    statArtifact: async () => undefined,
+  };
+
+  it("withholds the local-disk tools instead of advertising a guaranteed refusal", async () => {
+    const cloud = new McpServer({ outputDir: "/nonexistent", readStore: cloudStore });
+    const listed = (
+      (await cloud.handleMessage({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+      } as never)) as any
+    ).result.tools.map((t: { name: string }) => t.name);
+    for (const name of ["listBugs", "getRegressionContext", "getFrame", "getFrameById"]) {
+      expect(listed).not.toContain(name);
+    }
+    expect(listed).toContain("listSessions");
+
+    // Still refused by name, and the refusal says which store it is reading.
+    const called = (
+      (await cloud.handleMessage({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "getRegressionContext", arguments: {} },
+      } as never)) as any
+    ).result;
+    expect(called.isError).toBe(true);
+    expect(called.content[0].text).toContain("the Crumbtrail cloud tenant");
+  });
+
+  it("advertises everything when the artifacts really are on this machine", async () => {
+    const local = new McpServer({ outputDir: fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-adv-")) });
+    const listed = (
+      (await local.handleMessage({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+      } as never)) as any
+    ).result.tools.map((t: { name: string }) => t.name);
+    expect(listed).toContain("getRegressionContext");
+    expect(listed).toContain("listBugs");
+  });
+});
+
 describe("MCP Server recurrence over an unreadable store", () => {
   // A rejected token used to reach these two tools as an empty list, which
   // reads as "your account has no recurring bugs" — the one answer that makes
@@ -28,7 +78,7 @@ describe("MCP Server recurrence over an unreadable store", () => {
           unavailable: { reason },
         }),
         resolveSessionDir: async (id: string) => id,
-        readArtifact: async () => undefined,
+        readArtifact: async () => ({ ok: false as const, reason: "unreachable" as const }),
         statArtifact: async () => undefined,
       },
     });
@@ -718,6 +768,30 @@ describe("MCP Server", () => {
     expect(index.id).toBe("sess-idx");
     expect(index.evts).toBe(2);
     expect(index.errs).toHaveLength(1);
+  });
+
+  it("getIndex says how much of a long session its summary left out", async () => {
+    createSession(
+      "sess-idx-capped",
+      [{ t: 1000, k: "nav", d: { to: "/home" } }],
+      {
+        errs: Array.from({ length: 25 }, (_, i) => ({ t: 1000 + i, msg: `e${i}` })),
+        failedReqs: Array.from({ length: 23 }, (_, i) => ({ t: 1000 + i, url: `/r${i}` })),
+      },
+    );
+
+    const res = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 51,
+      method: "tools/call",
+      params: { name: "getIndex", arguments: { sessionId: "sess-idx-capped" } },
+    });
+    const index = JSON.parse((res!.result as any).content[0].text);
+    expect(index.errs).toHaveLength(20);
+    expect(index.failedReqs).toHaveLength(20);
+    // The cap is fine; hiding it was not. 20 of 25 must not read as 20 of 20.
+    expect(index.omittedFromSummary).toMatchObject({ errs: 5, failedReqs: 3 });
+    expect(index.omittedFromSummary.message).toContain("capped at 20");
   });
 
   it("getIndex resolves finalized v2 partition paths by session id", async () => {

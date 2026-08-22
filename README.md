@@ -112,7 +112,9 @@ Use progressive disclosure to keep context focused: start with
 recording. For a chosen session, use `getFixContext` for a ranked summary or
 follow `getSessionManifest` to `getEvidence` and then `getWindow` only when
 the evidence needs more detail. Use `getRegressionContext` only when comparing
-two recordings across releases. When you know roughly when a failure happened
+two recordings across releases, and only against a local output directory: it
+reads this machine's disk, so a server configured against a cloud tenant does
+not offer it. When you know roughly when a failure happened
 but not what went wrong, `getWindowCorrelation` reports which event kinds and
 numeric fields differ between that window and the quiet stretch before it, with
 no detector involved; treat each row as a lead to confirm with `getWindow`, not

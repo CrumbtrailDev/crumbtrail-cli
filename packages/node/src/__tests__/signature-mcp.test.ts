@@ -189,7 +189,7 @@ describe("MCP signature resolve / locate surface", () => {
       signature: "sig_pay_btn",
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Session not found");
+    expect(result.content[0].text).toContain("Could not read that session");
   });
 
   it("locateInteractiveElements returns a deterministic ranked list (occurrences desc, then label, then signature)", async () => {
@@ -253,7 +253,7 @@ describe("MCP signature resolve / locate surface", () => {
       sessionId: "nope",
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Session not found");
+    expect(result.content[0].text).toContain("Could not read that session");
   });
 
   it("snake_case aliases dispatch to the same handlers", async () => {

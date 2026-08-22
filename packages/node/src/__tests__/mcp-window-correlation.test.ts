@@ -233,7 +233,7 @@ describe("getWindowCorrelation", () => {
       t1: T1,
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Session not found");
+    expect(result.content[0].text).toContain("Could not read that session");
   });
 
   it("truncates with a dropReport under maxTokens", async () => {

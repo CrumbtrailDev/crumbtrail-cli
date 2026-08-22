@@ -1351,6 +1351,24 @@ const LEGACY_LOCAL_BUG_QUEUE_TOOLS = new Set([
   "getBugLLMContext",
 ]);
 
+/**
+ * Tools that read local disk directly and therefore cannot answer at all when
+ * this server is configured against a cloud tenant.
+ *
+ * They are WITHHELD from `tools/list` rather than advertised and refused, which
+ * is the same rule the hosted transport already applies: a tool that answers
+ * every call with a refusal costs the agent a turn, a tool call and a plan
+ * built around an answer it will never get. `docs/llms.txt` recommends
+ * getRegressionContext by name, so a cloud reader was being sent at a tool the
+ * server had already decided to refuse.
+ */
+const FILESYSTEM_ONLY_TOOLS = new Set([
+  ...LEGACY_LOCAL_BUG_QUEUE_TOOLS,
+  "getRegressionContext",
+  "getFrame",
+  "getFrameById",
+]);
+
 const MCP_READ_ONLY_INSTRUCTIONS = [
   "Crumbtrail MCP retrieves context for resolving bugs and never changes your applications, files, tickets, queues, or external systems. Its only writes are to Crumbtrail's own learning loop: resolveIssue records a resolution disposition, the recall matches you adopted and any precedents you rejected, recordFeedback logs a learning signal, and recordClientNote/amendClientNote store durable notes about the client, so recall and the tenant playbook improve over time.",
   "Recommended workflows: (1) getLatestIssue for the newest captured failure; (2) listSessions, then getSessionManifest, getWindow, and getEvidence for progressive session investigation; (3) listDistinctBugs({mode:'cross-session'}) and getRecurrence for recurrence analysis.",
@@ -1367,6 +1385,21 @@ function textResult(data: unknown) {
 function imageResult(base64Data: string, mimeType = "image/jpeg") {
   return { content: [{ type: "image", data: base64Data, mimeType }] };
 }
+
+/**
+ * What a failed session read actually means.
+ *
+ * Every artifact failure — a 404, a rejected token, an exhausted read quota, an
+ * artifact over the body limit, a timeout — arrives at the tools as the same
+ * `undefined`, and the tools used to render all of it as the flat assertion
+ * "Session not found". The most common cause is the one that sentence hides:
+ * an agent token scoped to project A reading a session in project B is refused
+ * as a 404, so the reader is told the session does not exist while looking
+ * straight at it in the dashboard. This message asserts only what is known and
+ * names the causes worth checking.
+ */
+const SESSION_UNREADABLE =
+  "Could not read that session. This is every read failure, not proof the session is gone: the id may not exist in the configured store, it may have aged past the project's retention window, the artifact may be over the read size limit, the read quota may be exhausted, or the agent token may be scoped to a different project than the session. A project scoped token is refused for another project's session in exactly the same way a missing session is, so check the token's project scope before concluding the session was deleted.";
 
 /**
  * Says what stopped the read and what to do about it. Each reason is a
@@ -1470,7 +1503,7 @@ export class McpServer {
         return {
           jsonrpc: "2.0",
           id: msg.id!,
-          result: { tools: TOOLS },
+          result: { tools: this.advertisedTools() },
         };
 
       case "tools/call": {
@@ -1506,17 +1539,29 @@ export class McpServer {
     }
   }
 
+  /** True when session artifacts are on this machine rather than in a tenant. */
+  private readsLocalDisk(): boolean {
+    return this.store instanceof FilesystemMcpReadStore;
+  }
+
+  /**
+   * The tools this server can actually answer. Withholding beats advertising a
+   * guaranteed refusal; see {@link FILESYSTEM_ONLY_TOOLS}.
+   */
+  private advertisedTools(): typeof TOOLS {
+    return this.readsLocalDisk()
+      ? TOOLS
+      : TOOLS.filter((tool) => !FILESYSTEM_ONLY_TOOLS.has(tool.name));
+  }
+
   private async callTool(
     rawName: string,
     args: Record<string, unknown>,
   ): Promise<unknown> {
     const name = TOOL_NAME_ALIASES.get(rawName) ?? rawName;
-    if (
-      LEGACY_LOCAL_BUG_QUEUE_TOOLS.has(name) &&
-      !(this.store instanceof FilesystemMcpReadStore)
-    ) {
+    if (FILESYSTEM_ONLY_TOOLS.has(name) && !this.readsLocalDisk()) {
       return errorResult(
-        "Legacy local bug-queue tools are unavailable for remote artifact stores; use session evidence tools instead.",
+        `${name} reads this machine's disk, so it cannot answer while this server is configured against ${this.store.describe()}. It is not advertised in tools/list here. Use listSessions, getSessionManifest, getWindow and getEvidence, which read the same evidence through the cloud.`,
       );
     }
     switch (name) {
@@ -1933,6 +1978,21 @@ export class McpServer {
     return textResult(this.compactIndex(index));
   }
 
+  /**
+   * How many of a list were kept, and how many were left behind.
+   *
+   * The cap itself is fine; hiding it was not. A session with 200 errors used
+   * to report 20 with nothing to distinguish it from a session that had 20, so
+   * a reader could conclude they had seen the errors.
+   */
+  private static capList(
+    value: unknown,
+    cap: number,
+  ): { kept: unknown[]; omitted: number } | undefined {
+    if (!Array.isArray(value)) return undefined;
+    return { kept: value.slice(0, cap), omitted: Math.max(0, value.length - cap) };
+  }
+
   /** Keep the list-level index at summary altitude; drill into linked requests separately. */
   private compactIndex(
     index: Record<string, unknown>,
@@ -1940,16 +2000,26 @@ export class McpServer {
     const fullStack = isRecord(index.fullStackRequests)
       ? index.fullStackRequests
       : undefined;
+    const errs = McpServer.capList(index.errs, 20);
+    const failedReqs = McpServer.capList(index.failedReqs, 20);
+    const omitted =
+      (errs?.omitted ?? 0) + (failedReqs?.omitted ?? 0) > 0
+        ? removeUndefined({
+            errs: errs?.omitted || undefined,
+            failedReqs: failedReqs?.omitted || undefined,
+            message:
+              "This index is a summary and these lists are capped at 20. Read the omitted items with getWindow or getEvidence rather than treating the counts above as the whole session.",
+          })
+        : undefined;
     return removeUndefined({
       id: stringField(index.id),
       start: numberField(index.start),
       end: numberField(index.end),
       dur: numberField(index.dur),
       evts: numberField(index.evts),
-      errs: Array.isArray(index.errs) ? index.errs.slice(0, 20) : undefined,
-      failedReqs: Array.isArray(index.failedReqs)
-        ? index.failedReqs.slice(0, 20)
-        : undefined,
+      errs: errs?.kept,
+      failedReqs: failedReqs?.kept,
+      omittedFromSummary: omitted,
       stats: isRecord(index.stats) ? index.stats : undefined,
       fullStackRequests: fullStack
         ? {
@@ -2557,7 +2627,7 @@ export class McpServer {
     const legacy = await this.readJsonRecordAsync(dir, "diagnosis.json");
     if (legacy) return textResult(normalizeAiOpinion(legacy));
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
     return errorResult("No opinion generated yet for this session.");
   }
 
@@ -2630,12 +2700,7 @@ export class McpServer {
       !(await this.sessionExistsAsync(aDir)) ||
       !(await this.sessionExistsAsync(bDir))
     )
-      return errorResult("Session not found");
-    if (!(this.store instanceof FilesystemMcpReadStore)) {
-      return errorResult(
-        "getRegressionContext is unavailable for remote artifact stores; use getSessionManifest/getWindow/getEvidence to compare retrieved evidence without local-disk fallback.",
-      );
-    }
+      return errorResult(SESSION_UNREADABLE);
     const comparison = await compareSessions(aDir, bDir);
     return textResult(await buildRegressionContext(comparison, bDir));
   }
@@ -2665,7 +2730,7 @@ export class McpServer {
       return errorResult("sessionId is required");
     const dir = await this.sessionDirAsync(args.sessionId as string);
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
     const bugs = await this.readDistinctBugsAsync(dir);
     return textResult(
       bugs
@@ -2729,7 +2794,7 @@ export class McpServer {
   private async toolGetBug(args: Record<string, unknown>) {
     const dir = await this.sessionDirAsync(args.sessionId as string);
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
     const bugId = args.bugId as string;
     const bug = (await this.readDistinctBugsAsync(dir)).find(
       (entry) => stringField(entry.bugId) === bugId,
@@ -2929,7 +2994,7 @@ export class McpServer {
         const found = (await store.listSessions()).find(
           (session) => session.id === sessionId,
         );
-        if (!found) return errorResult(`Session not found: ${sessionId}`);
+        if (!found) return errorResult(`${SESSION_UNREADABLE} Session id: ${sessionId}.`);
         profile = await sessionIssueProfile(found.dir, store);
         excludeSessionId = sessionId;
       } else if (text) {
@@ -3662,7 +3727,15 @@ export class McpServer {
         eventCounts: isRecord(index.stats) ? index.stats : {},
         errorMarkers: errs.slice(0, 20),
         failedRequests: failedReqs.slice(0, 20),
+        // A synthesized manifest is a summary of a session that never had one,
+        // and these three lists are capped. Saying so is the difference between
+        // a short session and a long one read shallowly.
+        omitted: removeUndefined({
+          errorMarkers: Math.max(0, errs.length - 20) || undefined,
+          failedRequests: Math.max(0, failedReqs.length - 20) || undefined,
+        }),
       },
+      candidatesOmitted: Math.max(0, candidates.length - 20) || undefined,
       candidates: candidates.slice(0, 20).map((candidate) =>
         removeUndefined({
           id: stringField(candidate.id),
@@ -3696,7 +3769,7 @@ export class McpServer {
     const events = await this.readColdEventsAsync(dir);
     if (events === undefined) {
       if (!(await this.sessionExistsAsync(dir)))
-        return errorResult("Session not found");
+        return errorResult(SESSION_UNREADABLE);
       const empty = {
         sessionId: args.sessionId,
         t0: Math.min(t0, t1),
@@ -3749,8 +3822,7 @@ export class McpServer {
   /**
    * Detector free window scoring. Reads the SAME cold stream as getWindow, and
    * reads it the same way: `this.store` only, never `fs`. A direct fs read here
-   * would work on a developer's laptop and return "Session not found" for every
-   * hosted session, because in cloud mode the artifacts live behind
+   * would work on a developer's laptop and refuse every hosted session as unreadable, because in cloud mode the artifacts live behind
    * RemoteMcpReadStore and nothing is on disk to find.
    */
   private async toolGetWindowCorrelation(args: Record<string, unknown>) {
@@ -3766,7 +3838,7 @@ export class McpServer {
 
     const events = await this.readColdEventsAsync(dir);
     if (events === undefined && !(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
 
     const requestedMultiplier = numberField(args.baselineMultiplier);
     const baselineMultiplier =
@@ -3831,7 +3903,7 @@ export class McpServer {
     // an 82-scored symptom of `attributionConfidence: low`.
     if (!isNonEmptyString(ref)) {
       if (!(await this.sessionExistsAsync(dir)))
-        return errorResult("Session not found");
+        return errorResult(SESSION_UNREADABLE);
       const top = candidates[0];
       return textResult(
         attachTokenEstimate(
@@ -3915,7 +3987,7 @@ export class McpServer {
     }
 
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
 
     return textResult(
       attachTokenEstimate({
@@ -4072,7 +4144,7 @@ export class McpServer {
     const signature = stringField(args.signature) ?? stringField(args.sig);
     const dir = await this.sessionDirAsync(sessionId);
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
     if (!signature)
       return errorResult(
         "resolveSignature requires a non-empty signature string",
@@ -4101,7 +4173,7 @@ export class McpServer {
     const sessionId = args.sessionId as string;
     const dir = await this.sessionDirAsync(sessionId);
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
 
     const text = stringField(args.text)?.trim().toLowerCase();
     const role = (stringField(args.role) ?? stringField(args.tag))
@@ -4292,11 +4364,6 @@ export class McpServer {
   }
 
   private async toolGetFrame(args: Record<string, unknown>) {
-    if (!(this.store instanceof FilesystemMcpReadStore)) {
-      return errorResult(
-        "Frame images are unavailable for remote artifact stores; use getWindow and redacted evidence metadata instead.",
-      );
-    }
     const dir = await this.sessionDirAsync(args.sessionId as string);
     const indexRead = await this.requireJson(dir, "index.json");
     if ("error" in indexRead) return errorResult(indexRead.error);
@@ -4328,11 +4395,6 @@ export class McpServer {
   }
 
   private async toolGetFrameById(args: Record<string, unknown>) {
-    if (!(this.store instanceof FilesystemMcpReadStore)) {
-      return errorResult(
-        "Frame images are unavailable for remote artifact stores; use getWindow and redacted evidence metadata instead.",
-      );
-    }
     const dir = await this.sessionDirAsync(args.sessionId as string);
     const filename = args.filename as string;
     if (!isSafeFrameFilename(filename))
