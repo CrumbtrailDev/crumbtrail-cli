@@ -60,6 +60,16 @@ export interface McpSessionListing {
 }
 
 export interface McpReadStore {
+  /**
+   * Where this store reads from, in one phrase, for an empty result to name.
+   *
+   * "No sessions found" is the same sentence whether the agent is reading the
+   * cloud tenant or the local disk, and the two have opposite next steps. A
+   * client configured with no cloud credentials silently reads the machine it
+   * runs on, so a reader whose bug is in the cloud saw a technically correct
+   * refusal that never mentioned which side it had looked at.
+   */
+  describe(): string;
   listSessions(query?: McpSessionQuery): Promise<McpSessionListing>;
   resolveSessionDir(sessionId: string): Promise<string>;
   readArtifact(sessionDir: string, name: string): Promise<Buffer | undefined>;
@@ -71,6 +81,10 @@ export interface McpReadStore {
 
 export class FilesystemMcpReadStore implements McpReadStore {
   constructor(private readonly outputDir: string) {}
+
+  describe(): string {
+    return `the local session directory at ${this.outputDir} (no CRUMBTRAIL_CLOUD_URL/CRUMBTRAIL_CLOUD_TOKEN are set, so this is reading the machine the server runs on, not a Crumbtrail cloud tenant)`;
+  }
 
   /**
    * The query is deliberately not pushed down. Every filter it carries is
@@ -137,6 +151,10 @@ export class RemoteMcpReadStore implements McpReadStore {
     this.baseUrl = baseUrl.replace(/\/+$/, "");
     this.token = token;
     this.timeoutMs = timeoutMs;
+  }
+
+  describe(): string {
+    return `the Crumbtrail cloud tenant at ${this.baseUrl}`;
   }
 
   /**

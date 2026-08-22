@@ -83,6 +83,10 @@ class InMemoryReadStore implements McpReadStore {
     private readonly artifacts: Record<string, string>,
   ) {}
 
+  describe(): string {
+    return "an in-memory test store";
+  }
+
   async listSessions(): Promise<McpSessionListing> {
     return {
       sessions: [{ id: this.sessionId, dir: this.sessionId }],

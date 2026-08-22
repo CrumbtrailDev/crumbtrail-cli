@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Crumbtrail } from "../crumbtrail";
+import { Crumbtrail, __resetGpcWarningForTests } from "../crumbtrail";
 import {
   CRUMBTRAIL_REQUEST_HEADER,
   CRUMBTRAIL_REQUEST_ID_MAX_LENGTH,
@@ -1022,5 +1022,67 @@ describe("stop() delivery ordering", () => {
     expect(order.indexOf("endSession")).toBeGreaterThan(
       order.indexOf("send:done"),
     );
+  });
+});
+
+// Global Privacy Control was the one capture-killer with no signal anywhere:
+// respectGpc defaults on, some browsers send GPC by default, and the transport
+// never complains because nothing is ever handed to it. A correct install with
+// a green setup wizard captured permanently nothing, silently.
+describe("Global Privacy Control", () => {
+  beforeEach(() => {
+    __resetGpcWarningForTests();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response('{"ok":true}')),
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("says once that the browser turned capture off", () => {
+    vi.stubGlobal("navigator", { globalPrivacyControl: true });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    Crumbtrail.init({ key: "ctkey_test", endpoint: "https://example.test" });
+    Crumbtrail.init({ key: "ctkey_test", endpoint: "https://example.test" });
+
+    const gpcWarnings = warn.mock.calls.filter((call) =>
+      String(call[0]).includes("Global Privacy Control"),
+    );
+    expect(gpcWarnings).toHaveLength(1);
+    expect(String(gpcWarnings[0][0])).toContain("respectGpc");
+  });
+
+  it("stays quiet when the browser does not send it", () => {
+    vi.stubGlobal("navigator", {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    Crumbtrail.init({ key: "ctkey_test", endpoint: "https://example.test" });
+
+    expect(
+      warn.mock.calls.filter((call) =>
+        String(call[0]).includes("Global Privacy Control"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("stays quiet when the integrator has opted out of respecting it", () => {
+    vi.stubGlobal("navigator", { globalPrivacyControl: true });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    Crumbtrail.init({
+      key: "ctkey_test",
+      endpoint: "https://example.test",
+      respectGpc: false,
+    });
+
+    expect(
+      warn.mock.calls.filter((call) =>
+        String(call[0]).includes("Global Privacy Control"),
+      ),
+    ).toHaveLength(0);
   });
 });

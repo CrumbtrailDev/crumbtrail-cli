@@ -694,6 +694,26 @@ export async function runWizard(
       ui.err(
         "Supported: Next.js, SvelteKit, Nuxt, Remix, Astro, Angular, Vite SPA, NestJS, Express, Hono, Fastify, a Node server, or a non-JS backend that speaks OpenTelemetry (Django, Flask, FastAPI, Go, Rails, .NET).",
       );
+      // No recipe is not the same as no route. Create React App, plain webpack,
+      // Vue CLI and Electron all capture correctly once init runs; only the
+      // automatic wiring is missing. Ending on the supported list alone read as
+      // "your app is not supported", which for a React app also contradicts
+      // what the site says.
+      ui.err("");
+      ui.err(
+        "No recipe does not mean no capture. Any JavaScript app can be wired by hand in two steps:",
+      );
+      ui.err(color.dim("  1. npm install crumbtrail-core"));
+      ui.err(
+        color.dim(
+          '  2. Crumbtrail.init({ key: "<your ctkey_ key>" }) as early as your app starts',
+        ),
+      );
+      ui.err(
+        color.dim(
+          `     Mint the key, and copy the exact snippet for your setup, at ${appBaseFor(base, deps.env)}/setup`,
+        ),
+      );
     }
     return 1;
   }
@@ -861,7 +881,7 @@ export async function runWizard(
     ui.out(
       color.dim(
         keyReady
-          ? "Now start your dev server (restart it if it is already running, so it reads the new key) and load a page in your browser."
+          ? "In another terminal, start your dev server (restart it if it is already running, so it reads the new key) and load a page in your browser. This one stays here watching for the event."
           : `${setKeyHint} — mint one at ${appBase}/settings, then start your app.`,
       ),
     );
@@ -1825,9 +1845,13 @@ async function writeIngestKey(args: {
  * a reader can match against the file in front of them.
  */
 function keyLabel(key: { apiKey: string; keyId?: string }): string {
+  // The tail leads because it is the half a reader can match: it is in the env
+  // file in front of them and in the dashboard's key list. The internal id
+  // appears nowhere either of those places shows, so printing it bare read as a
+  // third key that could not be found anywhere.
   const tail = key.apiKey.slice(-6);
-  const id = key.keyId ? `${key.keyId}, ` : "";
-  return color.dim(` (new key ${id}ending ${tail})`);
+  const id = key.keyId ? `, internal id ${key.keyId}` : "";
+  return color.dim(` (new key ending ${tail}${id})`);
 }
 
 /** A path as the reader would type it, falling back to absolute off-tree. */
@@ -2258,9 +2282,16 @@ export async function runCli(
     // project, so a first-time user has no id to pass and no way to get one
     // from this message. Say where an id comes from, and that a first run
     // belongs in a real terminal.
+    // Name only what is actually missing. Listing both flags unconditionally
+    // told a reader who had just passed --project to pass --project, which
+    // reads as the flag having been rejected rather than accepted.
+    const missing = [
+      parsed.yes ? null : "--yes",
+      parsed.project ? null : "--project <id>",
+    ].filter(Boolean);
     deps.ui.err(
       color.red(
-        "Non-interactive shell detected. Pass --yes and --project <id> to run without prompts.",
+        `Non-interactive shell detected. Pass ${missing.join(" and ")} to run without prompts.`,
       ),
     );
     deps.ui.err(

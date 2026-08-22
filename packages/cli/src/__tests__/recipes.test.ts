@@ -1642,6 +1642,17 @@ describe("buildPlan — Express middleware reaches the key in .env", () => {
     expect(content).toContain("if (!process.env.CRUMBTRAIL_KEY)");
   });
 
+  it("loads .env.local as well as .env", () => {
+    // chooseEnvFile prefers an existing .env.local for any variable, including
+    // the non-bundled CRUMBTRAIL_KEY, while a bare loadEnvFile() reads .env
+    // only. Any Express repo that already had a .env.local therefore got a
+    // green "wrote CRUMBTRAIL_KEY", a green "Setup complete", and a backend
+    // posting with no auth header.
+    const content = expressPlan(ESM_ENTRY).content as string;
+    expect(content).toContain('".env.local"');
+    expect(content).toContain('".env"');
+  });
+
   it("loads .env on the manual-wiring fallback too", () => {
     // No `const app = express()` / `app.listen` anchors: the user wires the
     // middleware by hand from the TODO block, into the same module-load window.

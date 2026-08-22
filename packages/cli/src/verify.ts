@@ -175,7 +175,10 @@ export async function pollForRealEvent(
   const sleep = opts.sleepFn ?? realSleep;
   opts.ui.out("");
   opts.ui.out(
-    `${color.brand(glyphs().arrow)} ${color.bold("Now start your dev server and load a page in your browser.")}`,
+    // Named as a second terminal on purpose: this one is blocked on the poll
+    // below, so "start your dev server" here read as an instruction the reader
+    // could not carry out, and the spinner ticking up looked like the reason.
+    `${color.brand(glyphs().arrow)} ${color.bold("In another terminal, start your dev server and load a page in your browser.")}`,
   );
   // One live line for the whole wait. On a TTY it animates; everywhere else it
   // prints once and stays quiet, so a CI log gets one line rather than a
