@@ -142,19 +142,29 @@ export function keyEnvRef(stack: Stack): KeyEnvRef {
  *   • Express is the only stack with framework middleware
  *     (createCrumbtrailExpressMiddleware / createCrumbtrailExpressErrorMiddleware).
  *   • Hono / Node ship no framework middleware, so they open a headless session
- *     (startHeadlessSession) and record server-side events against it.
+ *     with autoCapture and record server-side errors against it.
  */
 export function buildBackendJsNote(stack: Stack): string {
+  const { expr: keyExpr } = keyEnvRef(stack);
+  const configLines = [
+    "const crumbtrailEndpoint = process.env.CRUMBTRAIL_BASE_URL;",
+    `const crumbtrailKey = ${keyExpr};`,
+    "if (!crumbtrailEndpoint || !crumbtrailKey) {",
+    '  throw new Error("Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY before starting the app.");',
+    "}",
+  ];
+
   if (stack === "express") {
     return [
       "// Backend (Express) — also capture server-side errors and requests.",
-      "// Reuse the same ingest endpoint + key you set on the SDK above.",
+      "// Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY in the server environment.",
       "import {",
       "  createCrumbtrailExpressMiddleware,",
       "  createCrumbtrailExpressErrorMiddleware,",
       '} from "crumbtrail-node";',
       "",
-      "const crumbtrailOptions = { endpoint: CRUMBTRAIL_ENDPOINT, authToken: CRUMBTRAIL_KEY };",
+      ...configLines,
+      "const crumbtrailOptions = { endpoint: crumbtrailEndpoint, authToken: crumbtrailKey };",
       "app.use(createCrumbtrailExpressMiddleware(crumbtrailOptions));      // before your routes",
       "app.use(createCrumbtrailExpressErrorMiddleware(crumbtrailOptions)); // after your routes",
       "",
@@ -166,9 +176,11 @@ export function buildBackendJsNote(stack: Stack): string {
     "// so autoCapture is the whole wiring. Prepend it at the top of the server",
     "// entry file: it opens a headless session and records uncaught exceptions,",
     "// unhandled rejections and console.error against it, with no per-event code.",
+    "// Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY in the server environment.",
+    ...configLines,
     'import("crumbtrail-node")',
     "  .then(({ autoCapture }) =>",
-    "    autoCapture({ endpoint: CRUMBTRAIL_ENDPOINT, authToken: CRUMBTRAIL_KEY }),",
+    "    autoCapture({ endpoint: crumbtrailEndpoint, authToken: crumbtrailKey }),",
     "  )",
     "  .catch(() => {});",
     "",
@@ -235,7 +247,7 @@ export interface OtlpSnippets {
   env: string;
   /** Auth header carried by the exporter (X-Crumbtrail-Auth or Bearer). */
   authHeader: string;
-  /** Resource attribute that files spans/logs into a Crumbtrail session. */
+  /** Optional resource attribute that joins spans/logs to a known session. */
   sessionAttr: string;
   /** The app this telemetry belongs to. One ingest key covers a whole project,
    *  so under a project key the key names no app and this is the only thing
@@ -254,7 +266,7 @@ export interface OtlpSnippets {
  *   • OTEL_EXPORTER_OTLP_PROTOCOL   → http/protobuf or http/json
  *   • OTEL_EXPORTER_OTLP_HEADERS    → X-Crumbtrail-Auth=<key> (or Bearer%20<key>)
  *   • OTEL_EXPORTER_OTLP_COMPRESSION→ none (recommended) — gzip is accepted too
- *   • OTEL_RESOURCE_ATTRIBUTES      → crumbtrail.session.id=<id>
+ *   • OTEL_RESOURCE_ATTRIBUTES      → optionally crumbtrail.session.id=<id>
  *   • OTEL_SERVICE_NAME             → the app this telemetry belongs to
  * Verified against docs/integrations/* and the ingest routes.
  */
@@ -275,9 +287,12 @@ export function buildOtlpSnippets({
       `# Or, if your exporter sends a Bearer token (note the %20-escaped space):`,
       `# OTEL_EXPORTER_OTLP_HEADERS=${otlpBearerHeaderValue(apiKey)}`,
     ].join("\n"),
-    sessionAttr: `OTEL_RESOURCE_ATTRIBUTES=${OTLP_CAPABILITY_FACTS.sessionAttribute}=<your-session-id>`,
+    sessionAttr: [
+      `# Optional: set this when you have a frontend session id to join backend telemetry to it:`,
+      `# OTEL_RESOURCE_ATTRIBUTES=${OTLP_CAPABILITY_FACTS.sessionAttribute}=<your-session-id>`,
+    ].join("\n"),
     serviceName: `OTEL_SERVICE_NAME=${serviceName ?? "<your-app-name>"}`,
-    note: `Crumbtrail's OTLP receiver appends ${OTLP_CAPABILITY_FACTS.paths.join(" and ")} to the endpoint above — don't include those paths yourself. Set the ${OTLP_CAPABILITY_FACTS.sessionAttribute} resource attribute to join backend spans to the frontend session, and OTEL_SERVICE_NAME to say which app in the project this is.`,
+    note: `Crumbtrail's OTLP receiver appends ${OTLP_CAPABILITY_FACTS.paths.join(" and ")} to the endpoint above — don't include those paths yourself. Session joining is optional: set ${OTLP_CAPABILITY_FACTS.sessionAttribute} when you have a frontend session id and want backend spans/logs in that session; otherwise Crumbtrail creates a session from the telemetry. Set OTEL_SERVICE_NAME to say which app in the project this is.`,
   };
 }
 
@@ -288,8 +303,8 @@ export function buildOtlpSnippets({
  * else, and verify the build. Hands-off with the key: the JS prompt tells the
  * agent to read the key from a framework-correct env var (which the user sets)
  * and NEVER to hard-code it, so a live credential can't land in committed source.
- * Only the OTLP path references the key value directly — there it's an env-var
- * header (OTEL_EXPORTER_OTLP_HEADERS), not source.
+ * The prompt never carries the key value. It tells the reader to set the
+ * framework/server environment variable and has the coding agent read it there.
  *
  * `keyEnv` overrides how the JS prompt names the key var. `keyEnvRef(stack)` only
  * knows the coarse stack (nextjs/react/vue/svelte/vite/server), so callers with a
@@ -317,8 +332,8 @@ export interface AgentPromptOptions {
    * the product renders as unattributed and the wizard's confirm step, which
    * matches arriving sessions by service, can never see.
    *
-   * Absent means absent: with no name the field is omitted rather than filled
-   * with a placeholder, matching the injected snippets.
+   * Absent means the prompt uses `<your-app-name>` and tells the reader to
+   * replace it with a stable name before running the app.
    */
   serviceName?: string | null;
 }
@@ -329,11 +344,14 @@ export function buildAgentPrompt(
   opts: AgentPromptOptions = {},
 ): string {
   const { kind, backendJs } = getInstallVariant(stack);
-  const { endpoint, apiKey } = keys;
+  const { endpoint } = keys;
 
-  const serviceName = opts.serviceName?.trim() || null;
+  const explicitServiceName = opts.serviceName?.trim() || null;
+  const serviceName = explicitServiceName ?? "<your-app-name>";
+  const hasExplicitServiceName = explicitServiceName !== null;
 
   if (kind === "otlp") {
+    const otlpKeyEnv = opts.keyEnv?.envVar ?? keyEnvRef(stack).envVar;
     return [
       "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
       "do not refactor or touch anything else, then verify the build still passes.",
@@ -344,16 +362,24 @@ export function buildAgentPrompt(
       "second SDK. Instead, add Crumbtrail as an additional OTLP/HTTP exporter:",
       `  1. Set OTEL_EXPORTER_OTLP_ENDPOINT=${endpoint} (the exporter appends`,
       "     /v1/traces and /v1/logs — do not add those paths).",
-      `  2. Send the auth header X-Crumbtrail-Auth: ${apiKey} on every export`,
-      "     (or Authorization: Bearer <key> if your exporter prefers that). Keep",
-      "     this key in your environment, not in committed source.",
-      "  3. Stamp the resource attribute crumbtrail.session.id so spans/logs join",
-      "     the right session.",
+      `  2. Set ${otlpKeyEnv} in the runtime environment to your Crumbtrail ingest key.`,
+      `     Configure the exporter to read ${otlpKeyEnv} when sending`,
+      "     X-Crumbtrail-Auth (or Authorization: Bearer <key> if it prefers that).",
+      "     Never put the key value in committed source.",
+      `  3. Optional: set ${OTLP_CAPABILITY_FACTS.sessionAttribute} when you have a`,
+      "     frontend session id and want backend spans/logs joined to that session.",
+      "     Do not block setup on this: sessionless OTLP is accepted and Crumbtrail",
+      "     creates a session from the telemetry.",
       // One ingest key covers a whole project, so the key names no app. The
       // receiver reads service.name instead, and every OTLP SDK sets it from
       // OTEL_SERVICE_NAME.
-      `  4. Set OTEL_SERVICE_NAME=${serviceName ?? "<your-app-name>"} so this app's`,
+      `  4. Set OTEL_SERVICE_NAME=${serviceName} so this app's`,
       "     telemetry is filed under it rather than under no app at all.",
+      ...(hasExplicitServiceName
+        ? []
+        : [
+            "     Replace <your-app-name> with a stable name for this app before running it.",
+          ]),
       "  5. Keep your existing exporter — add Crumbtrail alongside it.",
       "  6. Verify the app still builds and starts.",
     ].join("\n");
@@ -362,7 +388,14 @@ export function buildAgentPrompt(
   const { envVar, expr } = opts.keyEnv ?? keyEnvRef(stack);
 
   if (backendJs)
-    return backendJsPrompt(stack, endpoint, envVar, expr, serviceName);
+    return backendJsPrompt(
+      stack,
+      endpoint,
+      envVar,
+      expr,
+      serviceName,
+      hasExplicitServiceName,
+    );
 
   const jsLines = [
     "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
@@ -385,9 +418,7 @@ export function buildAgentPrompt(
     // Named first, on purpose: it is the field an agent is most likely to drop
     // as decoration, and it is the one that decides whether the session can be
     // found again.
-    ...(serviceName
-      ? [`         service: ${JSON.stringify(serviceName)},`]
-      : []),
+    `         service: ${JSON.stringify(serviceName)},`,
     `         httpEndpoint: "${endpoint}",`,
     `         httpAuthToken: ${expr},`,
     // Without this the SDK never polls Crumbtrail for the project's capture
@@ -396,13 +427,15 @@ export function buildAgentPrompt(
     // call happens to say and the project's own settings never reach the app.
     "         remoteConfig: true,",
     "       });",
-    ...(serviceName
+    ...(hasExplicitServiceName
       ? [
           "     Keep the service field exactly as written. It is how this app is",
           "     identified in Crumbtrail, and a session without it is filed under",
           "     no app at all.",
         ]
-      : []),
+      : [
+          "     Replace <your-app-name> with a stable name for this app before running it.",
+        ]),
   ];
   jsLines.push("  4. Change nothing else, then verify the build still passes.");
   return jsLines.join("\n");
@@ -424,7 +457,8 @@ function backendJsPrompt(
   endpoint: string,
   envVar: string,
   expr: string,
-  serviceName: string | null,
+  serviceName: string,
+  hasExplicitServiceName: boolean,
 ): string {
   const lines = [
     "You are setting up Crumbtrail in this project. Make ONLY the changes below,",
@@ -447,11 +481,15 @@ function backendJsPrompt(
     "     console.error against a headless session, and loads the app's .env",
     "     itself so the key above is set by the time it starts.",
   ];
-  if (serviceName) {
+  if (hasExplicitServiceName) {
     lines.push(
       "     Keep the service field exactly as written. It is how this app is",
       "     identified in Crumbtrail, and a session without it is filed under",
       "     no app at all.",
+    );
+  } else {
+    lines.push(
+      "     Replace <your-app-name> with a stable name for this app before running it.",
     );
   }
   if (stack === "express") {

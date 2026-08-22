@@ -1214,7 +1214,11 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
     expectNoKeyLiteral(plan.snippet);
     // Agent prompt routes to the no-SDK OTLP variant (no PRESET_PASSIVE).
     expect(plan.agentPrompt).toContain(ENDPOINT);
-    expect(plan.agentPrompt).toContain(KEY_PLACEHOLDER);
+    // The coding-agent hand-off uses the runtime env var instead of carrying
+    // even the placeholder key into the prompt.
+    expect(plan.agentPrompt).not.toContain(KEY_PLACEHOLDER);
+    expect(plan.agentPrompt).toContain("CRUMBTRAIL_KEY");
+    expect(plan.agentPrompt).toContain("sessionless OTLP is accepted");
     expect(plan.agentPrompt).not.toContain("PRESET_PASSIVE");
     // otlp injects no key via an env var — it uses OTLP headers instead.
     expect(plan.keyEnvVar).toBeUndefined();

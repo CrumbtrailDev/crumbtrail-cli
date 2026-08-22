@@ -93,6 +93,16 @@ describe("install-instructions snippets", () => {
     expect(note).toContain("crumbtrail-node");
     expect(note).toContain("createCrumbtrailExpressMiddleware");
     expect(note).toContain("createCrumbtrailExpressErrorMiddleware");
+    // The copyable note must declare the values it passes to the middleware.
+    expect(note).toContain(
+      "const crumbtrailEndpoint = process.env.CRUMBTRAIL_BASE_URL;",
+    );
+    expect(note).toContain("const crumbtrailKey = process.env.CRUMBTRAIL_KEY;");
+    expect(note).toContain(
+      "endpoint: crumbtrailEndpoint, authToken: crumbtrailKey",
+    );
+    expect(note).not.toContain("endpoint: CRUMBTRAIL_ENDPOINT");
+    expect(note).not.toContain("authToken: CRUMBTRAIL_KEY");
     // No invented names.
     expect(note).not.toContain("attachCrumbtrail");
     expect(note).not.toContain("crumbtrailErrorMiddleware(");
@@ -110,6 +120,15 @@ describe("install-instructions snippets", () => {
       expect(note).not.toContain("<your-session-id>");
       expect(note).not.toContain("createCrumbtrailExpressMiddleware");
       expect(note).not.toContain("attachCrumbtrail");
+      expect(note).toContain(
+        "const crumbtrailEndpoint = process.env.CRUMBTRAIL_BASE_URL;",
+      );
+      expect(note).toContain(
+        "const crumbtrailKey = process.env.CRUMBTRAIL_KEY;",
+      );
+      expect(note).toContain(
+        "autoCapture({ endpoint: crumbtrailEndpoint, authToken: crumbtrailKey })",
+      );
     }
   });
 
@@ -139,12 +158,12 @@ describe("install-instructions snippets", () => {
     expect(p).not.toContain("bl_live_xyz");
   });
 
-  it("agent prompt omits the app rather than inventing a placeholder", () => {
-    // Matching the injected snippets: an app wired without a name records no
-    // app label, and a placeholder left in source would be worse than absent.
+  it("agent prompt requires a stable app name when none was supplied", () => {
     const p = buildAgentPrompt("react", keys, { serviceName: "  " });
-    expect(p).not.toContain("service:");
-    expect(p).not.toContain("Keep the service field");
+    expect(p).toContain('service: "<your-app-name>",');
+    expect(p).toContain(
+      "Replace <your-app-name> with a stable name for this app before running it.",
+    );
   });
 
   it("agent prompt uses Next's public env var for the nextjs stack", () => {
@@ -211,10 +230,17 @@ describe("install-instructions snippets", () => {
     expect(p).toContain(
       "OTEL_EXPORTER_OTLP_ENDPOINT=https://app.crumbtrail.com",
     );
-    // OTLP auth is an env-var header (OTEL_EXPORTER_OTLP_HEADERS), not source, so
-    // it legitimately carries the key value.
-    expect(p).toContain("X-Crumbtrail-Auth: bl_live_xyz");
+    // The prompt must not carry a live key into a coding agent. It tells the
+    // reader to set the server env var and have the exporter read it.
+    expect(p).not.toContain("bl_live_xyz");
+    expect(p).toContain("CRUMBTRAIL_KEY");
     expect(p).toContain("crumbtrail.session.id");
+    expect(p).toContain("Optional");
+    expect(p).toContain("sessionless OTLP is accepted");
+    expect(p).toContain("OTEL_SERVICE_NAME=<your-app-name>");
+    expect(p).toContain(
+      "Replace <your-app-name> with a stable name for this app before running it.",
+    );
     expect(p).not.toContain("PRESET_PASSIVE");
   });
 
