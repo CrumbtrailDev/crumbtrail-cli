@@ -238,7 +238,10 @@ current code and tests, and report uncertainty or evidence gaps.
    never the same answer as an empty account, and `getLatestIssue` reports the
    same reasons rather than saying no issue was found.
 2. For one recording, use `getFixContext` for a ranked summary. Use
-   `getRegressionContext` only to compare two recordings across releases.
+   `getRegressionContext` only to compare two recordings across releases. It,
+   the `listBugs` family and the frame tools read this machine's disk, so a
+   server configured against a cloud tenant withholds them from `tools/list`
+   rather than advertising a call it would always refuse.
 3. For a focused investigation, use `getSessionManifest` to identify a signal
    or time range, `getEvidence` to inspect one reference, and `getWindow` only
    for the required time window. `getWindow` is capped and reports truncation.
