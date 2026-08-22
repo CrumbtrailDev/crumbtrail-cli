@@ -724,7 +724,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
     const server = new McpServer({ outputDir: tmpDir });
 
     const { isError, parsed } = await call(server, "getPlaybook", {
-      project: "proj_1",
+      projectId: "proj_1",
     });
     expect(isError).toBe(false);
     expect(parsed.source).toBe("cloud");
@@ -741,7 +741,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
     configureCloud(mock.url);
     const server = new McpServer({ outputDir: tmpDir });
     const { isError } = await call(server, "getPlaybook", {
-      project: "bad id!",
+      projectId: "bad id!",
     });
     expect(isError).toBe(true);
     expect(mock.requests).toHaveLength(0);
@@ -751,7 +751,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
     // Fully unconfigured: agent auth needs CRUMBTRAIL_CLOUD_TOKEN, which is absent.
     const server = new McpServer({ outputDir: tmpDir });
     const { isError, parsed } = await call(server, "getPlaybook", {
-      project: "proj_1",
+      projectId: "proj_1",
     });
     expect(isError).toBe(false);
     expect(parsed).toMatchObject({ ok: false, source: "remote-unavailable" });
@@ -771,14 +771,14 @@ describe("MCP learning loop (CRUMB-113)", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, parsed } = await call(server, "startFixVerification", {
-        project: "proj_1",
+        projectId: "proj_1",
         canonicalIssueId: "ci_42",
       });
 
       expect(isError).toBe(false);
       expect(parsed).toMatchObject({
         source: "cloud",
-        project: "proj_1",
+        projectId: "proj_1",
         canonicalIssueId: "ci_42",
         opened: true,
         state: "open",
@@ -811,7 +811,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { parsed } = await call(server, "startFixVerification", {
-        project: "proj_1",
+        projectId: "proj_1",
         canonicalIssueId: "ci_42",
       });
       expect(parsed.opened).toBe(false);
@@ -825,7 +825,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, parsed } = await call(server, "getFixVerification", {
-        project: "proj_1",
+        projectId: "proj_1",
         canonicalIssueId: "ci_42",
       });
 
@@ -871,7 +871,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
       const { isError, parsed, text } = await call(
         server,
         "getFixVerification",
-        { project: "proj_1", canonicalIssueId: "ci_42" },
+        { projectId: "proj_1", canonicalIssueId: "ci_42" },
       );
 
       expect(isError).toBe(false);
@@ -909,7 +909,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
         const server = new McpServer({ outputDir: tmpDir });
 
         const { parsed, text } = await call(server, "getFixVerification", {
-          project: "proj_1",
+          projectId: "proj_1",
           canonicalIssueId: "ci_42",
         });
         expect(parsed.reason).toBe(reason);
@@ -933,7 +933,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { parsed, text } = await call(server, "getFixVerification", {
-        project: "proj_1",
+        projectId: "proj_1",
         canonicalIssueId: "ci_42",
       });
       expect(parsed.recurred).toBe(true);
@@ -957,7 +957,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { parsed, text } = await call(server, "getFixVerification", {
-        project: "proj_1",
+        projectId: "proj_1",
         canonicalIssueId: "ci_42",
       });
       expect(parsed.state).toBe("none");
@@ -974,7 +974,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
         configureCloud(mock.url);
         const server = new McpServer({ outputDir: tmpDir });
         const { isError } = await call(server, tool, {
-          project: "bad id!",
+          projectId: "bad id!",
           canonicalIssueId: "ci_42",
         });
         expect(isError).toBe(true);
@@ -989,7 +989,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
         configureCloud(mock.url);
         const server = new McpServer({ outputDir: tmpDir });
         const { isError, text } = await call(server, tool, {
-          project: "proj_1",
+          projectId: "proj_1",
         });
         expect(isError).toBe(true);
         expect(text).toMatch(/canonicalIssueId/);
@@ -1002,7 +1002,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
       async (tool) => {
         const server = new McpServer({ outputDir: tmpDir });
         const { isError, parsed } = await call(server, tool, {
-          project: "proj_1",
+          projectId: "proj_1",
           canonicalIssueId: "ci_42",
         });
         expect(isError).toBe(false);
@@ -1025,7 +1025,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
         try {
           const server = new McpServer({ outputDir: tmpDir });
           const { isError, parsed, text } = await call(server, tool, {
-            project: "proj_1",
+            projectId: "proj_1",
             canonicalIssueId: "ci_42",
           });
 
@@ -1053,7 +1053,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError } = await call(server, "getFixVerification", {
-        project: "proj_1",
+        projectId: "proj_1",
         canonicalIssueId: "ci_42",
       });
       expect(isError).toBe(false);
@@ -1074,7 +1074,7 @@ describe("MCP learning loop (CRUMB-113)", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, text } = await call(server, "getFixVerification", {
-        project: "proj_1",
+        projectId: "proj_1",
         canonicalIssueId: "ci_42",
       });
       expect(isError).toBe(true);

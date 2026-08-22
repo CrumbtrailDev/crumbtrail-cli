@@ -42,6 +42,7 @@ import {
   type McpSessionEntry,
   type McpSessionListingFailure,
 } from "./mcp-read-store";
+import { readPackageVersion } from "./version";
 import type { EvidenceCandidate } from "./evidence-index";
 import type { LlmBundle } from "./llm-bundle";
 import {
@@ -1172,12 +1173,12 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        project: {
+        projectId: {
           type: "string",
           description: "The Crumbtrail project id to read the playbook for.",
         },
       },
-      required: ["project"],
+      required: ["projectId"],
     },
   },
   /** @stability stable */
@@ -1188,7 +1189,7 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        project: {
+        projectId: {
           type: "string",
           description: "The Crumbtrail project id the issue belongs to.",
         },
@@ -1198,7 +1199,7 @@ const TOOLS = [
             "The canonical issue id to open a verification window for.",
         },
       },
-      required: ["project", "canonicalIssueId"],
+      required: ["projectId", "canonicalIssueId"],
     },
   },
   /** @stability stable */
@@ -1217,7 +1218,7 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        project: {
+        projectId: {
           type: "string",
           description: "The Crumbtrail project id the issue belongs to.",
         },
@@ -1226,7 +1227,7 @@ const TOOLS = [
           description: "The canonical issue id to read the verdict for.",
         },
       },
-      required: ["project", "canonicalIssueId"],
+      required: ["projectId", "canonicalIssueId"],
     },
   },
   /** @stability experimental */
@@ -1244,7 +1245,7 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        project: {
+        projectId: {
           type: "string",
           description: "The Crumbtrail project id whose application to ask.",
         },
@@ -1254,7 +1255,7 @@ const TOOLS = [
           description: `The probe to run. One of: ${PROBE_NAMES.join(", ")}.`,
         },
       },
-      required: ["project", "probe"],
+      required: ["projectId", "probe"],
     },
   },
   /** @stability experimental */
@@ -1269,7 +1270,7 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        project: {
+        projectId: {
           type: "string",
           description: "The Crumbtrail project id to replay history for.",
         },
@@ -1284,7 +1285,7 @@ const TOOLS = [
           description: `${MAX_TOKENS_DESCRIPTION} shadowBacktest budgets one list: candidates are dropped from the end, and each dropReport ref names the dropped candidate as <detector>:<stableSignature>.`,
         },
       },
-      required: ["project"],
+      required: ["projectId"],
     },
   },
   /** @stability stable */
@@ -1490,7 +1491,9 @@ export class McpServer {
           result: {
             protocolVersion: "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "crumbtrail-mcp", version: "0.1.0" },
+            // The package's own version. A hardcoded 0.1.0 read as an ancient
+            // install next to a published 0.36.x and invited "am I outdated?".
+            serverInfo: { name: "crumbtrail-mcp", version: readPackageVersion() },
             instructions: MCP_READ_ONLY_INSTRUCTIONS,
           },
         };
@@ -3374,7 +3377,7 @@ export class McpServer {
    * read-only.
    */
   private async toolGetPlaybook(args: Record<string, unknown>) {
-    const project = stringField(args.project)?.trim();
+    const project = stringField(args.projectId)?.trim();
     if (!project || !/^[A-Za-z0-9_]{1,128}$/.test(project)) {
       return errorResult(
         "getPlaybook requires a valid project id (letters, digits, underscore; up to 128 chars)",
@@ -3399,7 +3402,7 @@ export class McpServer {
     tool: string,
   ): { projectId: string; canonicalIssueId: string } | { error: string } {
     const shape = /^[A-Za-z0-9_]{1,128}$/;
-    const projectId = stringField(args.project)?.trim();
+    const projectId = stringField(args.projectId)?.trim();
     if (!projectId || !shape.test(projectId))
       return {
         error: `${tool} requires a valid project id (letters, digits, underscore; up to 128 chars)`,
@@ -3440,7 +3443,7 @@ export class McpServer {
    *  synthesise a success from a partial view. */
   private renderVerification(
     view: FixVerificationView,
-    identity: { project: string; canonicalIssueId: string },
+    identity: { projectId: string; canonicalIssueId: string },
     extra?: Record<string, unknown>,
   ) {
     const conclusive = view.state === "terminal";
@@ -3480,7 +3483,7 @@ export class McpServer {
     const { opened, ...view } = result.data;
     return this.renderVerification(
       view,
-      { project: ids.projectId, canonicalIssueId: ids.canonicalIssueId },
+      { projectId: ids.projectId, canonicalIssueId: ids.canonicalIssueId },
       { opened: opened === true },
     );
   }
@@ -3497,7 +3500,7 @@ export class McpServer {
     if (!result.ok)
       return this.learningLoopFailure(result, "getFixVerification");
     return this.renderVerification(result.data, {
-      project: ids.projectId,
+      projectId: ids.projectId,
       canonicalIssueId: ids.canonicalIssueId,
     });
   }
@@ -3517,7 +3520,7 @@ export class McpServer {
     args: Record<string, unknown>,
     tool: string,
   ): { projectId: string } | { error: string } {
-    const projectId = stringField(args.project)?.trim();
+    const projectId = stringField(args.projectId)?.trim();
     if (!projectId || !McpServer.CLOUD_ID_SHAPE.test(projectId))
       return {
         error: `${tool} requires a valid project id (letters, digits, underscore; up to 128 chars)`,
@@ -3557,7 +3560,7 @@ export class McpServer {
       : undefined;
     return textResult({
       source: "cloud",
-      project: ids.projectId,
+      projectId: ids.projectId,
       probe,
       queued: true,
       answered: false,
