@@ -170,6 +170,12 @@ export interface McpServerConfig {
 const MAX_TOKENS_DESCRIPTION =
   "Optional response token budget. Estimated as ceil(chars/4) of the serialized JSON. This low cost heuristic can undercount dense content such as non ASCII text, base64, or punctuation, so budget conservatively. When set, the response's budgeted lists compete for the same budget in a fixed priority order, and items are dropped whole from the bottom of a list rather than rewritten. A list nested inside a kept item is part of that item's cost and is not trimmed on its own. The response gains tokenEstimate and budgetSatisfied, plus a dropReport naming each trimmed list when anything was omitted. budgetSatisfied is false whenever tokenEstimate exceeds maxTokens, which is what happens when the fixed fields and the dropReport cannot fit however much is trimmed; budgetNotice then reports a budget large enough for that exact response. Omit maxTokens for the full payload.";
 
+/**
+ * The budget applied to the fix-context bundle when the caller names none.
+ * Sized to leave a coding agent room to work after reading the evidence.
+ */
+const DEFAULT_FIX_CONTEXT_MAX_TOKENS = 25_000;
+
 const MAX_TOKENS_SCHEMA = {
   type: "integer" as const,
   minimum: 1,
@@ -182,7 +188,7 @@ const MAX_TOKENS_SCHEMA = {
  */
 const FIX_CONTEXT_MAX_TOKENS_SCHEMA = {
   ...MAX_TOKENS_SCHEMA,
-  description: `${MAX_TOKENS_DESCRIPTION} In this bundle the order is ranked signals, then database statements that failed, then the statements that ran, then database row diffs, then database pre state reads, then database span activity, then the correlated requests. The backend and frontend request lists are budgeted together as one list named primary_window.requests, so the same index in primary_window.backend.requests and primary_window.frontend.requests always describes the same linked request. causal_chain is a projection over signals rather than a list of its own: it is kept only when every signal it names survived, and is otherwise dropped whole and named in dropReport.`,
+  description: `${MAX_TOKENS_DESCRIPTION} In this bundle the order is ranked signals, then database statements that failed, then the statements that ran, then database row diffs, then database pre state reads, then database span activity, then the correlated requests. The backend and frontend request lists are budgeted together as one list named primary_window.requests, so the same index in primary_window.backend.requests and primary_window.frontend.requests always describes the same linked request. causal_chain is a projection over signals rather than a list of its own: it is kept only when every signal it names survived, and is otherwise dropped whole and named in dropReport. Omitting maxTokens does NOT return the full payload here: this bundle defaults to ${DEFAULT_FIX_CONTEXT_MAX_TOKENS} tokens, because it commonly serializes to many times that and is read into a coding agent's context. Raise it to read more; dropReport names what was omitted and budgetNotice names a budget that would fit.`,
 };
 
 /**
@@ -1232,7 +1238,7 @@ const TOOLS = [
       "Second, this call QUEUES a request and the cloud answers 202. Queued is not answered, and it is not a promise that it will be. If a reading is ever taken it arrives as a probe.result event inside that application's next captured session, so read it there with getEvents or getWindow instead of expecting it in this response, and until you have read it you still do not have the fact. The request is never delivered after the returned expiresAt. Asking twice renews the one pending request rather than queueing a second. " +
       "WHO ANSWERS IT IS NOT WHO YOU ARE INVESTIGATING. A probe is taken by whichever application instance happens to be polling, which is some visitor present right now, not the session in your bundle. Treat a reading as what the app looks like today, never as what the failing session looked like. " +
       "storage.snapshot therefore reports shape only: which keys exist, how many, what pattern each follows and how many bytes each holds. Every stored value is replaced, and so is the identifying part of a key, so session:alice@example.com:cart arrives as session:*:cart. You cannot read a person's data out of it, and you cannot use it to confirm one user's state. " +
-      "Live probes are off until a project raises its live_probe autonomy level, so a project that never opted in is refused with live_probe_disabled. This queues an instruction for your own application and writes nothing to your tickets or any external system. " +
+      "Live probes are ON for a new project: live_probe starts at the alert autonomy level, so a project that has changed nothing answers probes. It is opt out, not opt in, and a project that lowered live_probe to hold is refused with live_probe_disabled. This queues an instruction for your own application and writes nothing to your tickets or any external system. " +
       "Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
     inputSchema: {
       type: "object" as const,
@@ -2400,11 +2406,19 @@ export class McpServer {
    * worse than no chain at all.
    */
   private fixContextResult(context: FixContext, maxTokens: number | undefined) {
-    if (maxTokens === undefined) return textResult(context);
+    // A default, not "unbounded". This bundle routinely serializes to tens of
+    // thousands of tokens — one real session measured about 87,000, with 200
+    // signals of which 60 were one repeated detector — and it is delivered
+    // into a coding agent's context window, where spending the whole budget on
+    // the evidence leaves nothing to fix the bug with. The budgeted path
+    // already reports what it dropped and how to read it separately, so
+    // trimming by default costs the caller nothing they are not told about.
+    // Pass a larger maxTokens for more; the drop report says how much larger.
+    const budget = maxTokens ?? DEFAULT_FIX_CONTEXT_MAX_TOKENS;
     return this.budgetedTextResult(
       context as unknown as Record<string, unknown>,
       FIX_CONTEXT_BUDGET_PLANES.map((plane) => plane(context)),
-      maxTokens,
+      budget,
       {
         extraDrops: (kept) => orphanedChainDrop(context, kept),
         onKept: (out, _kept, report) => {
@@ -2555,11 +2569,21 @@ export class McpServer {
 
   private async toolListDistinctBugs(args: Record<string, unknown>) {
     if (args.mode === "cross-session") {
-      return textResult(
-        (await this.recurrenceRollups(args)).map((rollup) =>
-          this.compactRecurrence(rollup),
-        ),
-      );
+      const { rollups, unavailable } = await this.recurrenceRollups(args);
+      // Nothing read and a reason why: an error, not an empty account.
+      if (unavailable && rollups.length === 0)
+        return errorResult(listingFailureMessage(unavailable));
+      const compact = rollups.map((rollup) => this.compactRecurrence(rollup));
+      // A partial read still answers, and still says it is partial.
+      return unavailable
+        ? textResult({
+            recurrences: compact,
+            unavailable: {
+              ...unavailable,
+              detail: listingFailureMessage(unavailable),
+            },
+          })
+        : textResult(compact);
     }
 
     if (!this.isSafeSessionId(args.sessionId))
@@ -2607,7 +2631,9 @@ export class McpServer {
   private async toolGetRecurrence(args: Record<string, unknown>) {
     const signature = stringField(args.signature);
     if (!signature) return errorResult("signature is required");
-    const inputs = await this.recurrenceInputs(args);
+    const { inputs, unavailable } = await this.recurrenceInputs(args);
+    if (unavailable && inputs.length === 0)
+      return errorResult(listingFailureMessage(unavailable));
     const recurrences = groupDistinctBugRecurrences(inputs);
     let recurrence = recurrences.find((entry) => entry.signature === signature);
     if (!recurrence && signature.startsWith("bugsig:")) {
@@ -2649,17 +2675,32 @@ export class McpServer {
       : [];
   }
 
-  private async recurrenceRollups(
-    args: Record<string, unknown>,
-  ): Promise<DistinctBugRecurrence[]> {
-    return groupDistinctBugRecurrences(await this.recurrenceInputs(args));
+  private async recurrenceRollups(args: Record<string, unknown>): Promise<{
+    rollups: DistinctBugRecurrence[];
+    unavailable?: McpSessionListingFailure;
+  }> {
+    const { inputs, unavailable } = await this.recurrenceInputs(args);
+    const rollups = groupDistinctBugRecurrences(inputs);
+    return unavailable ? { rollups, unavailable } : { rollups };
   }
 
-  private async recurrenceInputs(
-    args: Record<string, unknown>,
-  ): Promise<DistinctBugRecurrenceInput[]> {
+  /**
+   * The grouped-bug inputs, plus the reason the session listing stopped early.
+   *
+   * The listing's `unavailable` reason used to be dropped here, so a rejected
+   * cloud token produced an empty array and both cross-session tools answered
+   * "no recurring bugs" for an account they could not read at all. That is the
+   * failure `listSessions` already refuses to make, and it is worse here: the
+   * server's own recommended workflow names `listDistinctBugs` for recurrence
+   * analysis, so it is where a caller with a stale token starts.
+   */
+  private async recurrenceInputs(args: Record<string, unknown>): Promise<{
+    inputs: DistinctBugRecurrenceInput[];
+    unavailable?: McpSessionListingFailure;
+  }> {
     const inputs: DistinctBugRecurrenceInput[] = [];
-    for (const { id, dir } of (await this.store.listSessions()).sessions) {
+    const listing = await this.store.listSessions();
+    for (const { id, dir } of listing.sessions) {
       const meta = (await this.readJsonRecordAsync(dir, "meta.json")) ?? {};
       if (typeof args.app === "string" && meta.app !== args.app) continue;
       if (typeof args.tenant === "string" && meta.tenant !== args.tenant)
@@ -2679,7 +2720,9 @@ export class McpServer {
         if (this.isDistinctBugRecord(bug)) inputs.push({ bug, session });
       }
     }
-    return inputs;
+    return listing.unavailable
+      ? { inputs, unavailable: listing.unavailable }
+      : { inputs };
   }
 
   private distinctBugOrder(
