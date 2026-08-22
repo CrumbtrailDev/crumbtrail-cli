@@ -275,7 +275,7 @@ describe("MCP hierarchical retrieval", () => {
       sessionId: "nope",
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Could not read that session");
+    expect(result.content[0].text).toContain("Session not found");
   });
 
   it("getWindow bounds events by [t0,t1] (absolute ms)", async () => {

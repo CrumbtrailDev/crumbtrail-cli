@@ -195,7 +195,7 @@ describe("MCP live probe plane and shadow back test", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, parsed, text } = await call(server, "requestProbe", {
-        project: "proj_1",
+        projectId: "proj_1",
         probe: "network.inflight",
       });
 
@@ -209,7 +209,7 @@ describe("MCP live probe plane and shadow back test", () => {
       });
       expect(parsed).toMatchObject({
         source: "cloud",
-        project: "proj_1",
+        projectId: "proj_1",
         probe: "network.inflight",
         queued: true,
         answered: false,
@@ -225,7 +225,7 @@ describe("MCP live probe plane and shadow back test", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, text } = await call(server, "requestProbe", {
-        project: "proj_1",
+        projectId: "proj_1",
         probe: "storage.dump",
       });
 
@@ -240,7 +240,7 @@ describe("MCP live probe plane and shadow back test", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, text } = await call(server, "requestProbe", {
-        project: "bad id!",
+        projectId: "bad id!",
         probe: "runtime.env",
       });
 
@@ -253,7 +253,7 @@ describe("MCP live probe plane and shadow back test", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, parsed } = await call(server, "requestProbe", {
-        project: "proj_1",
+        projectId: "proj_1",
         probe: "runtime.env",
       });
 
@@ -276,7 +276,7 @@ describe("MCP live probe plane and shadow back test", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, text } = await call(server, "requestProbe", {
-        project: "proj_1",
+        projectId: "proj_1",
         probe: "runtime.env",
       });
 
@@ -293,7 +293,7 @@ describe("MCP live probe plane and shadow back test", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, parsed, text } = await call(server, "shadowBacktest", {
-        project: "proj_1",
+        projectId: "proj_1",
         days: 30,
       });
 
@@ -321,7 +321,7 @@ describe("MCP live probe plane and shadow back test", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError } = await call(server, "shadowBacktest", {
-        project: "proj_1",
+        projectId: "proj_1",
       });
 
       expect(isError).toBe(false);
@@ -336,7 +336,7 @@ describe("MCP live probe plane and shadow back test", () => {
         const server = new McpServer({ outputDir: tmpDir });
 
         const { isError, text } = await call(server, "shadowBacktest", {
-          project: "proj_1",
+          projectId: "proj_1",
           days,
         });
 
@@ -351,7 +351,7 @@ describe("MCP live probe plane and shadow back test", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, parsed } = await call(server, "shadowBacktest", {
-        project: "proj_1",
+        projectId: "proj_1",
       });
 
       expect(isError).toBe(false);
@@ -372,7 +372,7 @@ describe("MCP live probe plane and shadow back test", () => {
       const server = new McpServer({ outputDir: tmpDir });
 
       const { isError, text } = await call(server, "shadowBacktest", {
-        project: "proj_1",
+        projectId: "proj_1",
       });
 
       expect(isError).toBe(true);

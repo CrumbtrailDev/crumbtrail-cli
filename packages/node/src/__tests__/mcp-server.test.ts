@@ -8,6 +8,7 @@ import { postProcess } from "../post-process";
 import { buildFixContext } from "../fix-context";
 import { runFixContext } from "../run-fix-context";
 import { estimateTokens } from "../token-estimate";
+import { readPackageVersion } from "../version";
 import type { EvidenceItem } from "crumbtrail-core";
 
 
@@ -198,7 +199,9 @@ describe("MCP Server", () => {
     expect(result.protocolVersion).toBe("2024-11-05");
     expect(result.capabilities).toEqual({ tools: {} });
     expect(result.serverInfo.name).toBe("crumbtrail-mcp");
-    expect(result.serverInfo.version).toBe("0.1.0");
+    // The package's real version, so a reader can tell a stale install from a
+    // current one instead of always seeing 0.1.0.
+    expect(result.serverInfo.version).toBe(readPackageVersion());
   });
 
   it("initialized notification returns null", async () => {

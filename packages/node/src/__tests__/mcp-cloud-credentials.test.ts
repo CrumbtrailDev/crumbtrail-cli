@@ -130,27 +130,27 @@ const CLOUD_TOOLS: Array<{
   },
   {
     name: "getPlaybook",
-    args: { project: "proj_1" },
+    args: { projectId: "proj_1" },
     path: "/api/agent/playbook",
   },
   {
     name: "startFixVerification",
-    args: { project: "proj_1", canonicalIssueId: "iss_1" },
+    args: { projectId: "proj_1", canonicalIssueId: "iss_1" },
     path: "/api/agent/verification",
   },
   {
     name: "getFixVerification",
-    args: { project: "proj_1", canonicalIssueId: "iss_1" },
+    args: { projectId: "proj_1", canonicalIssueId: "iss_1" },
     path: "/api/agent/verification",
   },
   {
     name: "requestProbe",
-    args: { project: "proj_1", probe: "network.inflight" },
+    args: { projectId: "proj_1", probe: "network.inflight" },
     path: "/api/agent/probe",
   },
   {
     name: "shadowBacktest",
-    args: { project: "proj_1" },
+    args: { projectId: "proj_1" },
     path: "/api/agent/shadow-backtest",
   },
 ];
@@ -220,7 +220,7 @@ describe("McpServerConfig.cloudCredentials — the per-caller credential seam", 
       cloudCredentials: { baseUrl: mock!.url, token: "ctagt_caller_a" },
     });
 
-    await call(server, "getPlaybook", { project: "proj_1" });
+    await call(server, "getPlaybook", { projectId: "proj_1" });
 
     const req = mock!.requests.find((r) => r.path === "/api/agent/playbook");
     expect(req!.agentToken).toBe("ctagt_caller_a");
@@ -239,8 +239,8 @@ describe("McpServerConfig.cloudCredentials — the per-caller credential seam", 
       cloudCredentials: { baseUrl: mock!.url, token: "ctagt_caller_b" },
     });
 
-    await call(a, "getPlaybook", { project: "proj_a" });
-    await call(b, "getPlaybook", { project: "proj_b" });
+    await call(a, "getPlaybook", { projectId: "proj_a" });
+    await call(b, "getPlaybook", { projectId: "proj_b" });
 
     const tokens = mock!.requests
       .filter((r) => r.path === "/api/agent/playbook")
@@ -254,7 +254,7 @@ describe("McpServerConfig.cloudCredentials — the per-caller credential seam", 
     process.env.CRUMBTRAIL_CLOUD_TOKEN = "ctagt_self_hosted";
     const server = new McpServer({ outputDir: tmpDir });
 
-    await call(server, "getPlaybook", { project: "proj_1" });
+    await call(server, "getPlaybook", { projectId: "proj_1" });
 
     const req = mock!.requests.find((r) => r.path === "/api/agent/playbook");
     expect(req!.agentToken).toBe("ctagt_self_hosted");
@@ -265,14 +265,14 @@ describe("McpServerConfig.cloudCredentials — the per-caller credential seam", 
     // that path deliberately never reads — is a wrong answer that costs an hour.
     const selfHosted = new McpServer({ outputDir: tmpDir });
     expect(
-      await call(selfHosted, "getPlaybook", { project: "proj_1" }),
+      await call(selfHosted, "getPlaybook", { projectId: "proj_1" }),
     ).toMatch(/CRUMBTRAIL_CLOUD_URL and CRUMBTRAIL_CLOUD_TOKEN/);
 
     const hosted = new McpServer({
       outputDir: tmpDir,
       cloudCredentials: { baseUrl: "", token: "" },
     });
-    const text = await call(hosted, "getPlaybook", { project: "proj_1" });
+    const text = await call(hosted, "getPlaybook", { projectId: "proj_1" });
     expect(text).not.toMatch(/CRUMBTRAIL_CLOUD_URL/);
     expect(text).toMatch(/agent token for the calling tenant/);
   });
@@ -285,7 +285,7 @@ describe("McpServerConfig.cloudCredentials — the per-caller credential seam", 
         token: "ctagt_caller_a",
       },
     });
-    const text = await call(server, "getPlaybook", { project: "proj_1" });
+    const text = await call(server, "getPlaybook", { projectId: "proj_1" });
     expect(text).toMatch(/must use https/);
     expect(mock!.requests).toHaveLength(0);
   });
@@ -297,7 +297,7 @@ describe("McpServerConfig.cloudCredentials — the per-caller credential seam", 
       outputDir: tmpDir,
       cloudCredentials: { baseUrl: `${mock!.url}/`, token: "ctagt_caller_a" },
     });
-    await call(server, "getPlaybook", { project: "proj_1" });
+    await call(server, "getPlaybook", { projectId: "proj_1" });
     const req = mock!.requests.find((r) => r.path === "/api/agent/playbook");
     expect(req).toBeDefined();
     expect(req!.agentToken).toBe("ctagt_caller_a");
