@@ -661,12 +661,21 @@ function toSessionEntry(row: unknown): McpSessionEntry | undefined {
   if (!isRecord(row)) return undefined;
   const id = nonEmptyString(row.id);
   if (!id) return undefined;
+  const errorCount = finiteNumber(row.errorCount);
+  const failedRequestCount = finiteNumber(row.failedRequestCount);
+  // A summary means "the listing already answered the evidence question", and
+  // a row that carries neither count did not answer it. Building one anyway
+  // turned an index the cloud could not read into a confident zero, and the
+  // caller then reported a project full of bugs as having none.
+  if (errorCount === undefined && failedRequestCount === undefined) {
+    return { id, dir: id };
+  }
   const summary: McpSessionSummary = {
     service: nonEmptyString(row.serviceName),
     start: epochOrUndefined(row.startedAt),
     end: epochOrUndefined(row.finalizedAt),
-    errorCount: finiteNumber(row.errorCount),
-    failedRequestCount: finiteNumber(row.failedRequestCount),
+    errorCount,
+    failedRequestCount,
     title: nonEmptyString(row.title),
   };
   return { id, dir: id, summary };
