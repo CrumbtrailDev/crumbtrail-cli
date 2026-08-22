@@ -247,6 +247,14 @@ export interface PostProcessAudioSummary {
   };
 }
 
+/**
+ * Window and cap for `precedingReqs`. Kept identical to the llm bundle's own
+ * PRECEDING_REQUEST_WINDOW_MS so the index and the bundle can never disagree
+ * about which requests preceded the failure.
+ */
+const PRECEDING_REQUEST_WINDOW_MS = 15_000;
+const MAX_PRECEDING_REQS = 12;
+
 interface SessionIndex {
   id: string;
   start: number;
@@ -294,6 +302,28 @@ interface SessionIndex {
     code?: string;
     message?: string;
     phase?: string;
+  }>;
+  /**
+   * Requests that SUCCEEDED shortly before the first error-class event.
+   *
+   * `failedReqs` answers "which request broke", and for a large share of real
+   * defects nothing did — the call returned 200 and carried the wrong value.
+   * Every reader downstream of this index (the agent evidence brief, the
+   * dashboard's correlated-record counts) read only the failed list, so a 200
+   * carrying `items: null` was captured and then reached none of them. Absent
+   * when the session recorded no error to anchor on.
+   */
+  precedingReqs?: Array<{
+    t: number;
+    m: string;
+    url: string;
+    st: number;
+    /** Milliseconds between this response and the first error-class event. */
+    beforeErrorMs: number;
+    /** Browser-local sequence number, restarted at 1 on every page load. */
+    id?: string | number;
+    /** Shared correlation id, when the exchange carried one. */
+    requestId?: string;
   }>;
   networkErrors?: NetworkErrorIndexEntry[];
   consoleErrors?: ConsoleErrorIndexEntry[];
@@ -502,6 +532,9 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
   const navs: SessionIndex["navs"] = [];
   const stats: Record<string, number> = {};
   const netReqs = new Map<string, { m: string; url: string }>();
+  // Every successful response, unfiltered. Narrowed to the pre-error window
+  // after the loop, because the first error is only known once it has run.
+  const okReqs: NonNullable<SessionIndex["precedingReqs"]> = [];
   const tabBoundaries: TabBoundaryIndexEntry[] = [];
   const pageProbe = createPageProbeSummary();
   let storageSummary: StorageSummary | undefined;
@@ -574,6 +607,26 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
       });
     }
 
+    if (event.k === "net.res" && !isFailedNetworkResponse(event)) {
+      const req = netReqs.get(String(event.d.id));
+      const st = typeof event.d.st === "number" ? event.d.st : undefined;
+      // No status is not a success. An unknown outcome must not join a list
+      // whose entire claim is "these came back fine".
+      if (st !== undefined) {
+        okReqs.push({
+          t: event.t,
+          m: req?.m || "",
+          url: req?.url || "",
+          st,
+          beforeErrorMs: 0,
+          ...(typeof event.d.id === "string" || typeof event.d.id === "number"
+            ? { id: event.d.id }
+            : {}),
+          ...correlationIdFields(event),
+        });
+      }
+    }
+
     if (event.k === "net.err") {
       const networkError = summarizeNetworkErrorEvent(event);
       if (networkError) networkErrors.push(networkError);
@@ -638,6 +691,29 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
   const start = mergedEvents[0].t;
   const end = mergedEvents[mergedEvents.length - 1].t;
 
+  // Narrow the successful responses to the ones that led up to the failure.
+  // Same window and cap the bundle applies, so the index and the bundle can
+  // never disagree about which requests preceded the error.
+  const errorTimes = [
+    ...errs.map((e) => e.t),
+    ...failedReqs.map((r) => r.t),
+    ...networkErrors.map((e) => e.t),
+    ...consoleErrors.map((e) => e.t),
+  ].filter((t) => Number.isFinite(t));
+  const firstErrorAt = errorTimes.length > 0 ? Math.min(...errorTimes) : undefined;
+  const precedingReqs =
+    firstErrorAt === undefined
+      ? []
+      : okReqs
+          .filter(
+            (r) =>
+              r.t <= firstErrorAt &&
+              r.t >= firstErrorAt - PRECEDING_REQUEST_WINDOW_MS,
+          )
+          .sort((a, b) => b.t - a.t)
+          .slice(0, MAX_PRECEDING_REQS)
+          .map((r) => ({ ...r, beforeErrorMs: Math.max(0, firstErrorAt - r.t) }));
+
   const index: SessionIndex = {
     id: path.basename(sessionDir),
     start,
@@ -646,6 +722,7 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
     evts: mergedEvents.length,
     errs,
     failedReqs,
+    ...(precedingReqs.length > 0 ? { precedingReqs } : {}),
     ...(networkErrors.length > 0 ? { networkErrors } : {}),
     ...(consoleErrors.length > 0 ? { consoleErrors } : {}),
     navs,

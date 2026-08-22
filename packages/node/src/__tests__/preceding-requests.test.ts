@@ -97,3 +97,29 @@ describe("preceding requests", () => {
     expect(urls.some((u) => u?.includes("/api/late"))).toBe(false);
   });
 });
+
+describe("preceding requests on the session index", () => {
+  it("is the same window and cap the bundle uses", async () => {
+    // The index is what the cloud's evidence brief reads. Two different
+    // definitions of "preceded the failure" would let the brief and the
+    // bundle name different requests for the same session.
+    const { postProcess } = await import("../post-process");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "preceding-idx-"));
+    scratch.push(dir);
+    fs.writeFileSync(
+      path.join(dir, "meta.json"),
+      JSON.stringify({ id: "s2", app: "test", env: "local" }),
+    );
+    fs.writeFileSync(
+      path.join(dir, "events.ndjson"),
+      CART.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    );
+    await postProcess(dir);
+    const index = JSON.parse(
+      fs.readFileSync(path.join(dir, "index.json"), "utf-8"),
+    ) as { precedingReqs?: Array<{ url: string; st: number }> };
+    expect(index.precedingReqs).toHaveLength(1);
+    expect(index.precedingReqs?.[0]?.st).toBe(200);
+    expect(index.precedingReqs?.[0]?.url).toContain("/api/cart");
+  });
+});
