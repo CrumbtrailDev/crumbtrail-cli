@@ -656,6 +656,7 @@ function minimalEvidenceSlice(context: FixContext): FixContext {
     primary_window: {
       frontend: { window: null, anchor: null, requests: [] },
       backend: { requests: [] },
+      preceding_requests: [],
       db_diffs: [],
       db_reads: [],
       db_errors: [],
