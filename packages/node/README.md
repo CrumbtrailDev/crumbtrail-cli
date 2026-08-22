@@ -294,8 +294,8 @@ current code and tests, and report uncertainty or evidence gaps.
    that is running and polling for its capture config can answer, the call queues
    the request rather than returning a reading, and a reading that is taken
    arrives as a `probe.result` event in that application's next captured session.
-   A queued probe is not an answer. Live probes stay off until a project raises
-   its `live_probe` autonomy level.
+   A queued probe is not an answer. Live probes are on for a new project, so
+   this is opt out: a project that lowered `live_probe` to `hold` is refused.
 9. Preview shadow detection before enabling it (cloud only): `shadowBacktest`
    replays the detectors over 1 to 90 days of a project's history and reports
    what they would have proposed, writing no detection state. A `days` value

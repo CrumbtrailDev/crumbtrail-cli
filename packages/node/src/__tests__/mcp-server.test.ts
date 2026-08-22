@@ -10,6 +10,61 @@ import { runFixContext } from "../run-fix-context";
 import { estimateTokens } from "../token-estimate";
 import type { EvidenceItem } from "crumbtrail-core";
 
+
+describe("MCP Server recurrence over an unreadable store", () => {
+  // A rejected token used to reach these two tools as an empty list, which
+  // reads as "your account has no recurring bugs" — the one answer that makes
+  // an agent stop looking.
+  function serverWithFailure(
+    reason: "unauthorized" | "read_quota_exhausted" | "unreachable",
+  ): McpServer {
+    return new McpServer({
+      outputDir: "/nonexistent",
+      readStore: {
+        describe: () => "the Crumbtrail cloud tenant",
+        listSessions: async () => ({
+          sessions: [],
+          truncated: false,
+          unavailable: { reason },
+        }),
+        resolveSessionDir: async (id: string) => id,
+        readArtifact: async () => undefined,
+        statArtifact: async () => undefined,
+      },
+    });
+  }
+
+  async function call(server: McpServer, name: string, args: unknown) {
+    return await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name, arguments: args },
+    } as never);
+  }
+
+  it("listDistinctBugs cross-session errors on a rejected token instead of answering []", async () => {
+    const res = await call(serverWithFailure("unauthorized"), "listDistinctBugs", {
+      mode: "cross-session",
+    });
+    const result = (res as any).result;
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("authorization failure");
+    expect(result.content[0].text).not.toBe("[]");
+  });
+
+  it("getRecurrence errors on an exhausted read quota instead of reporting not found", async () => {
+    const res = await call(
+      serverWithFailure("read_quota_exhausted"),
+      "getRecurrence",
+      { signature: "sig-1" },
+    );
+    const result = (res as any).result;
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("read quota");
+  });
+});
+
 describe("MCP Server", () => {
   let tmpDir: string;
   let server: McpServer;
@@ -1710,22 +1765,29 @@ describe("MCP Server", () => {
       );
     }
 
-    it("getFixContext without maxTokens is byte-identical to the raw contract", async () => {
+    it("getFixContext without maxTokens carries the whole contract under a default budget", async () => {
       createSession("sess-cp4-id", [
         { t: 1000, k: "nav", d: { to: "/checkout" } },
         { t: 2000, k: "err", d: { msg: "boom" } },
       ]);
       writeCandidates("sess-cp4-id", fatCandidates(3));
 
-      const { text, result } = await callTool("getFixContext", {
+      const { text, parsed, result } = await callTool("getFixContext", {
         sessionId: "sess-cp4-id",
       });
       expect(result.isError).toBeFalsy();
       const expected = await buildFixContext(path.join(tmpDir, "sess-cp4-id"), {
         outputDir: tmpDir,
       });
-      expect(text).toBe(JSON.stringify(expected, null, 2));
-      expect(text).not.toContain("tokenEstimate");
+      // A bundle that fits keeps every field of the raw contract; the default
+      // budget only adds the accounting fields on top.
+      for (const key of Object.keys(expected)) {
+        expect(parsed[key]).toEqual(
+          (expected as unknown as Record<string, unknown>)[key],
+        );
+      }
+      expect(parsed.budgetSatisfied).toBe(true);
+      expect(parsed.tokenEstimate).toBe(estimateTokens(text!));
       expect(text).not.toContain("dropReport");
     });
 
@@ -2290,21 +2352,21 @@ describe("MCP Server", () => {
       expect(tiny.parsed.events).toEqual([]);
     });
 
-    it("getFixContext without maxTokens is byte-identical even when every plane is bulky", async () => {
+    it("getFixContext without maxTokens still answers within the default budget", async () => {
       bulkySession("sess-planes-identical", causalCandidates(9));
 
-      const { text } = await callTool("getFixContext", {
+      const { text, parsed } = await callTool("getFixContext", {
         sessionId: "sess-planes-identical",
       });
-      const expected = await buildFixContext(
-        path.join(tmpDir, "sess-planes-identical"),
-        { outputDir: tmpDir },
-      );
-      expect(text).toBe(JSON.stringify(expected, null, 2));
-      expect(text).not.toContain("tokenEstimate");
-      expect(text).not.toContain("dropReport");
-      expect(text).not.toContain("budgetSatisfied");
-      expect(text).not.toContain("budgetNotice");
+      // The point of the default: a caller who named no budget is never handed
+      // an unbounded bundle, and whatever was left out is named rather than
+      // silently missing.
+      expect(parsed.tokenEstimate).toBe(estimateTokens(text!));
+      expect(parsed.tokenEstimate).toBeLessThanOrEqual(25_000);
+      expect(parsed.budgetSatisfied).toBe(true);
+      if (parsed.dropReport) {
+        expect(parsed.dropReport.message).toBeTruthy();
+      }
     });
 
 
@@ -2401,8 +2463,10 @@ describe("MCP Server", () => {
       expect(result.isError).toBeFalsy();
       expect(parsed.schemaVersion).toBe("fix-context.v2");
       expect(parsed.session.id).toBe("sess-latest-new");
-      // No maxTokens -> byte-identical to the raw contract (no budgeting fields).
-      expect(JSON.stringify(parsed)).not.toContain("tokenEstimate");
+      // No maxTokens is a default budget, not an unbounded read, so the
+      // accounting fields are present either way.
+      expect(parsed.tokenEstimate).toBeGreaterThan(0);
+      expect(parsed.budgetSatisfied).toBe(true);
 
       // Its only input, maxTokens, is honored through the same budgeting path.
       const budgeted = await callTool("getLatestIssue", { maxTokens: 100000 });
