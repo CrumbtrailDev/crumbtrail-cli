@@ -1240,9 +1240,11 @@ describe("MCP Server", () => {
       gaps: [],
     });
     expect(parsed.linked).toBeUndefined();
-    expect(parsed.diagnostics.join(" ")).toMatch(
-      /no full-stack request evidence generated|No full-stack request evidence was generated/i,
-    );
+    const diagnostics = parsed.diagnostics.join(" ");
+    expect(diagnostics).toMatch(/holds no full-stack request evidence/i);
+    // Names the capture side condition, and never a local command: a hosted
+    // reader has no post-processing step to run.
+    expect(diagnostics).not.toMatch(/post-processing/i);
   });
 
   it("getLinkedRequestContext returns not-found when no linked entry or gap matches", async () => {
