@@ -2647,6 +2647,7 @@ export class McpServer {
       return errorResult(listingFailureMessage(listing.unavailable));
     }
     const matching: Array<{ id: string; start: number }> = [];
+    let unread = 0;
     for (const entry of listing.sessions) {
       // index.json is the largest artifact a session has, and reading one per
       // session is what used to burn the read budget before this tool answered
@@ -2663,7 +2664,13 @@ export class McpServer {
         continue;
       }
       const index = await this.readJsonRecordAsync(entry.dir, "index.json");
-      if (!index) continue;
+      if (!index) {
+        // Counted, not skipped. A session whose evidence could not be read is
+        // not a session with no evidence, and reporting the second when the
+        // first happened is how this tool told people their project was clean.
+        unread += 1;
+        continue;
+      }
       if (
         (Array.isArray(index.errs) && index.errs.length > 0) ||
         (Array.isArray(index.failedReqs) && index.failedReqs.length > 0)
@@ -2683,6 +2690,11 @@ export class McpServer {
       if (listing.truncated) {
         return errorResult(
           `No session with error-class evidence among the ${LATEST_ISSUE_SCAN} most recent, and older sessions were not read. Use listSessions with after/before/release to search a specific window.`,
+        );
+      }
+      if (unread > 0) {
+        return errorResult(
+          `Could not read the evidence index for ${unread} of the ${listing.sessions.length} most recent sessions in ${this.store.describe()}, and none of the sessions it could read carried error-class evidence. This is not an answer about whether your project has bugs. Retry, or name a session directly with getSessionManifest.`,
         );
       }
       return errorResult(

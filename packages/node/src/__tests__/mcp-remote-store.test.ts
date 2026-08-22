@@ -83,6 +83,12 @@ interface MockCloudOptions {
    * full listing, newest first.
    */
   unparseableRow?: (index: number) => boolean;
+  /**
+   * Serve rows with no evidence counts at all, which is what the real route
+   * sends for a session whose index it could not read: missing, oversized, or
+   * timed out. It is NOT the same wire shape as a session with zero errors.
+   */
+  countlessRows?: boolean;
   /** Retry-After seconds sent with a 429. */
   retryAfter?: number;
   artifactResponse?: ArtifactResponseMode;
@@ -175,6 +181,7 @@ function startMockCloud({
   sessionResponse = "normal",
   sessionCount = 1,
   unparseableRow = () => false,
+  countlessRows = false,
   retryAfter,
   artifactResponse = "normal",
   artifactFraming = "chunked",
@@ -266,11 +273,16 @@ function startMockCloud({
               failedRequestCount: 0,
               completeness: "full",
             };
-      const all = Array.from({ length: sessionCount }, (_, index) =>
+      const all = Array.from({ length: sessionCount }, (_, index) => {
+        const row = countlessRows
+          ? (({ errorCount, failedRequestCount, ...rest }) => rest)(
+              rowFor(index),
+            )
+          : rowFor(index);
         // A blank id is what the client refuses to map. The row still occupies
         // its place in the page the route serves.
-        unparseableRow(index) ? { ...rowFor(index), id: "" } : rowFor(index),
-      );
+        return unparseableRow(index) ? { ...row, id: "" } : row;
+      });
       const body = JSON.stringify({
         sessions: all.slice(offset, offset + limit),
         pagination: { limit, offset, total: all.length },
@@ -857,6 +869,39 @@ describe("MCP remote read store", () => {
     expect(
       indexReads.every((request) => request.path.includes(SESSION_ID)),
     ).toBe(true);
+    expect(
+      mock.requests.filter((request) => request.path.includes("sess_bulk_")),
+    ).toEqual([]);
+  });
+
+  // The failure this closes: the listing built a summary for every row whether
+  // or not the row carried counts, so a row the cloud could not read counted as
+  // a session with zero errors, and getLatestIssue told people who had a
+  // project full of bugs that they had none.
+  it("says it could not read rather than reporting a clean project", async () => {
+    mock = await startMockCloud({
+      sessionCount: 5,
+      countlessRows: true,
+      artifactResponse: "unauthorized",
+    });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
+    const server = remoteServer(mock.baseUrl, path.join(tmpDir, "sessions"));
+
+    const result = await callToolRaw(server, "getLatestIssue", {});
+    const text = String(result.content?.[0]?.text ?? "");
+    expect(text).toContain("Could not read the evidence index for 5");
+    expect(text).not.toContain("No finalized session with error-class");
+  });
+
+  // The other half of the same rule: a row that really does carry counts is an
+  // answer, and the rows carrying zero must keep costing no index read.
+  it("still answers from the counts the listing did carry", async () => {
+    mock = await startMockCloud({ sessionCount: 5 });
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-mcp-remote-"));
+    const server = remoteServer(mock.baseUrl, path.join(tmpDir, "sessions"));
+
+    const context = await callTool(server, "getLatestIssue", {});
+    expect(context.session.id).toBe(SESSION_ID);
     expect(
       mock.requests.filter((request) => request.path.includes("sess_bulk_")),
     ).toEqual([]);

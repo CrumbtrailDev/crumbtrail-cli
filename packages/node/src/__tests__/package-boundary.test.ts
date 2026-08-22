@@ -59,7 +59,12 @@ describe("package runtime boundary", () => {
       "utf8",
     );
 
-    expect(tsupConfig).toContain('entry: ["src/index.ts", "src/cli.ts"]');
+    // Two builds, not one, and the split is deliberate: an ESM build of the
+    // CLI inlines core's import.meta and breaks under require, so the
+    // executable ships CJS only while the library entry stays dual.
+    expect(tsupConfig).toContain('entry: ["src/cli.ts"]');
+    expect(tsupConfig).toContain('format: ["cjs"]');
+    expect(tsupConfig).toContain('entry: ["src/index.ts"]');
     expect(tsupConfig).toContain('format: ["esm", "cjs"]');
     expect(tsupConfig).toContain("dts: true");
   });
