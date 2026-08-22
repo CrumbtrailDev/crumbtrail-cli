@@ -16,22 +16,21 @@ const timeoutMs = 8_000;
 
 /**
  * The hosted cloud namespace-imports crumbtrail-node and reads
- * NODE_CONTRACT_CAPABILITIES to decide whether the installed contract supports
- * the tenant context factory, the provider neutral ticket comment, and the
- * evidence source fetch injection seam. It gates on `=== true` and fails closed
- * on anything else, so a bundler that tree shakes or reshapes the marker would
- * silently disable those features with a green build. Assert the built dist in
- * BOTH formats a consumer can load.
+ * NODE_CONTRACT_CAPABILITIES to decide which contract surfaces the installed
+ * package supports. It gates on `=== true` and fails closed on anything else,
+ * so a bundler that tree shook or reshaped the marker would silently disable
+ * those features with a green build.
+ *
+ * The map is deliberately EMPTY since the third-party integration surfaces left
+ * this package (see src/node-contract-capabilities.ts). This asserts the marker
+ * is still exported, still a plain object, and still carries nothing — a key
+ * appearing here without the code behind it would switch a cloud feature on.
  */
-const EXPECTED_NODE_CONTRACT_CAPABILITIES = {
-  tenantContextFactory: true,
-  ticketComment: true,
-  evidenceSourceFetchInjection: true,
-};
+const EXPECTED_NODE_CONTRACT_CAPABILITIES = {};
 
 function assertCapabilityMarker(format, modulePath, namespace) {
   const marker = namespace?.NODE_CONTRACT_CAPABILITIES;
-  if (!marker) {
+  if (!marker || typeof marker !== "object") {
     throw new Error(
       `${format} dist (${path.relative(packageRoot, modulePath)}) does not export NODE_CONTRACT_CAPABILITIES`,
     );
@@ -181,8 +180,46 @@ async function assertDegradedOutputDir(healthUrl, outputDir, headers = {}) {
   }
 }
 
+/**
+ * A built file that nothing references is a file nothing runs, and `dist/cli.js`
+ * shipped broken for exactly that reason: esbuild's ESM output answers the
+ * bundled `require("fs")` with `Dynamic require of "fs" is not supported`, and
+ * since `bin` pointed at the CJS twin, no suite and no consumer ever loaded it.
+ * The executable now has one form, and this asserts both halves of that: the
+ * advertised bin starts, and no second build of it is lying around beside it.
+ */
+async function assertSingleExecutableEntry() {
+  const distDir = path.join(packageRoot, "dist");
+  const strays = (await fs.readdir(distDir)).filter(
+    (name) => /^cli\..*js$/.test(name) && name !== path.basename(cliPath),
+  );
+  if (strays.length > 0) {
+    throw new Error(
+      `dist ships ${strays.join(", ")} beside the ${path.basename(cliPath)} that bin points at; an unreferenced build of the CLI is never loaded, so it is never known to be broken`,
+    );
+  }
+
+  const help = spawn(process.execPath, [cliPath, "--help"], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, NO_COLOR: "1" },
+  });
+  let stdout = "";
+  let stderr = "";
+  help.stdout.setEncoding("utf8");
+  help.stderr.setEncoding("utf8");
+  help.stdout.on("data", (chunk) => (stdout += chunk));
+  help.stderr.on("data", (chunk) => (stderr += chunk));
+  const code = await new Promise((resolve) => help.once("exit", resolve));
+  if (code !== 0 || !stdout.includes("Usage:")) {
+    throw new Error(
+      `${path.basename(cliPath)} --help exited ${code} without printing usage\nstdout=${boundedTail(stdout)}\nstderr=${boundedTail(stderr)}`,
+    );
+  }
+}
+
 async function main() {
   await fs.access(cliPath);
+  await assertSingleExecutableEntry();
   await assertBuiltCapabilityMarker();
 
   const tmpRoot = await fs.mkdtemp(
