@@ -247,6 +247,18 @@ export interface FixContext {
    * Consumers MUST treat absence as "no locations captured", never as an error.
    */
   code_locations?: CodeLocation[];
+  /**
+   * Present only when at least one `code_locations` entry is a served script URL
+   * with no source map behind it.
+   *
+   * Says, in the payload the agent reads, that those lines are positions in the
+   * SERVED module and not in the reader's file. A dev server rewrites JSX and
+   * injects a preamble, so the numbers do not line up and an agent that opens
+   * the path at that line finds nothing — or, worse, finds something unrelated.
+   * Follows `causal_chain_absence`: state the limit where the field is, rather
+   * than letting a confident-looking value stand unqualified.
+   */
+  code_locations_note?: string;
 }
 
 export interface BuildFixContextOptions {
@@ -309,6 +321,9 @@ export function buildFixContextFromArtifacts(
   const causal = projectCausalChain(ranked);
   const codePointers = extractOpinionCodePointers(extras.opinion);
   const codeLocations = buildCodeLocations(bundle, ranked);
+  const servedLocations = (codeLocations ?? []).filter(
+    (location) => location.servedUrl,
+  ).length;
 
   return {
     schemaVersion: FIX_CONTEXT_SCHEMA_VERSION,
@@ -321,6 +336,11 @@ export function buildFixContextFromArtifacts(
     repro_hint: reproHint,
     ...(codePointers ? { code_pointers: codePointers } : {}),
     ...(codeLocations ? { code_locations: codeLocations } : {}),
+    ...(servedLocations > 0
+      ? {
+          code_locations_note: `${servedLocations} of these ${servedLocations === 1 ? "locations is" : "locations are"} a URL the script was served from, marked servedUrl. Its line is a position in the served module, not in the source file of the same name — a dev server rewrites and prepends to it — so do not open that path at that line and expect the reported code. Treat it as naming the module only. Set CRUMBTRAIL_SOURCEMAP_DIR to the build's source map directory to resolve these to real repository paths and lines.`,
+        }
+      : {}),
   };
 }
 

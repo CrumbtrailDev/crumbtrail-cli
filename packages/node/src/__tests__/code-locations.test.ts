@@ -16,6 +16,7 @@ import {
   MAX_CALLER_FRAMES,
   MAX_CODE_LOCATIONS,
   buildCodeLocations,
+  isServedUrl,
   parseFrame,
 } from "../code-locations";
 import type { EvidenceCandidate } from "../evidence-index";
@@ -424,5 +425,54 @@ describe("buildCodeLocations — a mapped client callsite says so", () => {
       [candidate({ id: "cand_0001", anchor: { t: 1, requestId: "req-1" } } as never)],
     );
     expect(locations?.[0]?.sourceMapped).toBeUndefined();
+  });
+});
+
+// A served URL is not a file path, and its line is not a line in the file of
+// the same name. Measured on a real capture: `http://localhost:5599/src/App.tsx:19:11`
+// for an App.tsx whose last line is 3 — the dev server rewrites JSX and
+// prepends its own preamble, so the number belongs to the served module. The
+// URL is still worth reporting; presenting it as a place to open is not.
+describe("served script URLs", () => {
+  it("recognises http and https paths, and nothing else", () => {
+    expect(isServedUrl("http://localhost:5599/src/App.tsx")).toBe(true);
+    expect(isServedUrl("https://app.example.com/assets/main-a1b2.js")).toBe(true);
+    expect(isServedUrl("src/App.tsx")).toBe(false);
+    expect(isServedUrl("/Users/me/app/src/App.tsx")).toBe(false);
+    expect(isServedUrl("file:///Users/me/app/src/App.tsx")).toBe(false);
+  });
+
+  it("marks a signal frame that is a served URL", () => {
+    const [location] = buildCodeLocations(undefined, [
+      candidate({
+        anchor: { t: 1, frame: "http://localhost:5599/src/App.tsx:19:11" },
+      }),
+    ])!;
+    expect(location.path).toBe("http://localhost:5599/src/App.tsx");
+    expect(location.line).toBe(19);
+    // The fact is carried through unchanged; only the caveat is added.
+    expect(location.servedUrl).toBe(true);
+  });
+
+  it("does not mark a real repository path", () => {
+    const [location] = buildCodeLocations(undefined, [
+      candidate({ anchor: { t: 1, frame: "client/src/lib/api-search.js:59:21" } }),
+    ])!;
+    expect(location.servedUrl).toBeUndefined();
+  });
+
+  it("does not mark a frame a source map already resolved", () => {
+    // Once a map has moved it, `path` is the file the map named, not the URL.
+    const [location] = buildCodeLocations(undefined, [
+      candidate({
+        anchor: {
+          t: 1,
+          frame: "src/pages/Account.jsx:88:13",
+          minifiedFrame: "http://host/assets/main-a1b2.js:1:24488",
+        },
+      }),
+    ])!;
+    expect(location.sourceMapped).toBe(true);
+    expect(location.servedUrl).toBeUndefined();
   });
 });

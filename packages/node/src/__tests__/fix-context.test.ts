@@ -15,6 +15,7 @@ import {
   buildCausalChain,
   projectCausalChain,
   buildFixContext,
+  buildFixContextFromArtifacts,
   FIX_CONTEXT_SCHEMA_VERSION,
   FixContextError,
 } from "../fix-context";
@@ -1312,5 +1313,51 @@ describe("causal_chain_absence", () => {
     // The projection was refactored to report its reason, NOT to change what it
     // refuses. Same input, same null.
     expect(buildCausalChain([signal({ causalRole: "isolated" })])).toBeNull();
+  });
+});
+
+// The payload an agent reads must not present a served URL's line as a line in
+// the reader's file. Measured on a real capture: the single code location handed
+// over was `http://localhost:5599/src/App.tsx:19:11` for a three-line App.tsx,
+// so an agent following it opens the file and finds nothing at line 19.
+describe("fix context — served script URLs are qualified", () => {
+  const ranked = (frame: string) =>
+    [
+      {
+        schemaVersion: 1,
+        id: "cand_0001",
+        detector: "console_error",
+        title: "TypeError in App",
+        severity: "high",
+        score: 90,
+        confidence: "high",
+        anchor: { t: 1, frame },
+      },
+    ] as unknown as EvidenceCandidate[];
+
+  it("adds a note naming the limit when a location is a served URL", () => {
+    const context = buildFixContextFromArtifacts(
+      "/tmp/sess",
+      {},
+      undefined,
+      ranked("http://localhost:5599/src/App.tsx:19:11"),
+    );
+    expect(context.code_locations?.[0]?.servedUrl).toBe(true);
+    expect(context.code_locations_note).toContain("servedUrl");
+    expect(context.code_locations_note).toContain("CRUMBTRAIL_SOURCEMAP_DIR");
+    // The note must say the line is not in the source file, since that is the
+    // exact mistake it exists to stop.
+    expect(context.code_locations_note).toContain("not in the source file");
+  });
+
+  it("adds no note when every location is a real path", () => {
+    const context = buildFixContextFromArtifacts(
+      "/tmp/sess",
+      {},
+      undefined,
+      ranked("client/src/lib/api-search.js:59:21"),
+    );
+    expect(context.code_locations?.[0]?.servedUrl).toBeUndefined();
+    expect(context.code_locations_note).toBeUndefined();
   });
 });

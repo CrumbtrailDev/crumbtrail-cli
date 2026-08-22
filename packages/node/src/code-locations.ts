@@ -63,6 +63,22 @@ export interface CodeFrame {
   column?: number;
   /** The enclosing function, when the runtime reported one. */
   fn?: string;
+  /**
+   * True when `path` is the URL a script was SERVED from rather than a file on
+   * disk, and no source map moved it.
+   *
+   * The line then belongs to the served module, which is not the reader's file:
+   * a dev server rewrites JSX and injects its own preamble, so a three-line
+   * `App.tsx` is served as dozens and the reported line resolves to nothing.
+   * Measured on a real capture: `http://localhost:5599/src/App.tsx:19:11` for a
+   * file whose last line is 3.
+   *
+   * Not resolved here, because resolving it means guessing which repo file a URL
+   * came from, which this module refuses by name. Marked instead, so a reader —
+   * or an agent about to open the file — is told the line needs a source map
+   * before it means anything. `CRUMBTRAIL_SOURCEMAP_DIR` is what resolves it.
+   */
+  servedUrl?: boolean;
 }
 
 /**
@@ -120,6 +136,23 @@ export function parseFrame(frame: unknown): CodeFrame | undefined {
   const location: CodeFrame = { path: rawPath, line: Number(line) };
   if (column !== undefined) location.column = Number(column);
   return location;
+}
+
+/**
+ * Is this path a script URL rather than a file on disk?
+ *
+ * Only http and https. A `file://` frame names a real file, and the schemes
+ * this module already drops as non-application code never reach here.
+ */
+export function isServedUrl(candidatePath: string): boolean {
+  return /^https?:\/\//i.test(candidatePath.trim());
+}
+
+/** Mark a frame whose path is a served URL, unless a source map already moved
+ *  it — a mapped frame's path is the file the map named, not the URL. */
+function markServed<T extends CodeFrame>(frame: T, sourceMapped: boolean): T {
+  if (!sourceMapped && isServedUrl(frame.path)) frame.servedUrl = true;
+  return frame;
 }
 
 function frameFromCallsite(callsite: LlmBundleDbCallsite): CodeFrame {
@@ -213,7 +246,7 @@ export function buildCodeLocations(
     signalTitle?: string,
   ) => {
     push({
-      ...frameFromCallsite(callsite),
+      ...markServed(frameFromCallsite(callsite), Boolean(callsite.minifiedFile)),
       via,
       signalId,
       ...(signalTitle ? { signalTitle } : {}),
@@ -223,7 +256,13 @@ export function buildCodeLocations(
       // a direct frame.
       ...(callsite.minifiedFile ? { sourceMapped: true } : {}),
       ...(callsite.stack && callsite.stack.length > 0
-        ? { callers: callsite.stack.slice(0, MAX_CALLER_FRAMES).map(frameFromCallsite) }
+        ? {
+            callers: callsite.stack
+              .slice(0, MAX_CALLER_FRAMES)
+              .map((entry) =>
+                markServed(frameFromCallsite(entry), Boolean(entry.minifiedFile)),
+              ),
+          }
         : {}),
     });
   };
@@ -256,7 +295,7 @@ export function buildCodeLocations(
     const frame = parseFrame(candidate.anchor?.frame);
     if (!frame) continue;
     push({
-      ...frame,
+      ...markServed(frame, Boolean(candidate.anchor?.minifiedFrame)),
       via: "signal",
       signalId: candidate.id,
       signalTitle: candidate.title,
@@ -273,11 +312,21 @@ export function buildCodeLocations(
     if (locations.length >= MAX_CODE_LOCATIONS) break;
     if (!diff.callsite) continue;
     push({
-      ...frameFromCallsite(diff.callsite),
+      ...markServed(
+        frameFromCallsite(diff.callsite),
+        Boolean(diff.callsite.minifiedFile),
+      ),
       via: "db.write",
       signalId: diff.requestId ?? "unranked",
+      ...(diff.callsite.minifiedFile ? { sourceMapped: true } : {}),
       ...(diff.callsite.stack && diff.callsite.stack.length > 0
-        ? { callers: diff.callsite.stack.slice(0, MAX_CALLER_FRAMES).map(frameFromCallsite) }
+        ? {
+            callers: diff.callsite.stack
+              .slice(0, MAX_CALLER_FRAMES)
+              .map((entry) =>
+                markServed(frameFromCallsite(entry), Boolean(entry.minifiedFile)),
+              ),
+          }
         : {}),
     });
   }
