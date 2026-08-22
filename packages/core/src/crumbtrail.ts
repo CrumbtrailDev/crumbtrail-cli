@@ -487,10 +487,24 @@ export class Crumbtrail {
       typeof window !== "undefined" &&
       typeof window.addEventListener === "function"
     ) {
-      const flushOnPageHide = () => bus.flush();
-      window.addEventListener("pagehide", flushOnPageHide);
+      const onPageHide = () => {
+        bus.flush();
+        // And CLOSE it. A flush alone left the session open, and nothing else
+        // ever ended it: `stop()` is the host's call to make and a closed tab
+        // never makes it, so the server's idle sweeper was the only thing that
+        // finished the session — half an hour later, during which the session
+        // could not be read. The end request rides `keepalive`, so it outlives
+        // the page and still carries the ingest key.
+        if (config.endOnPageHide === false) return;
+        try {
+          void Promise.resolve(transport.endSession(sessionId)).catch(() => {});
+        } catch {
+          // Teardown on an unloading page never takes the host down with it.
+        }
+      };
+      window.addEventListener("pagehide", onPageHide);
       instance.cleanups.push(() =>
-        window.removeEventListener("pagehide", flushOnPageHide),
+        window.removeEventListener("pagehide", onPageHide),
       );
     }
 

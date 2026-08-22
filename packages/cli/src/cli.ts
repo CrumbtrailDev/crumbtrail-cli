@@ -25,7 +25,9 @@ import {
 import {
   canUseBrowser,
   clearAuth as clearStoredAuth,
+  describeIdentity,
   ensureToken,
+  fetchIdentity,
   loadAuth,
   openBrowser,
 } from "./auth";
@@ -114,7 +116,13 @@ function __dirnameCompat(): string {
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
 export type Command =
-  "wizard" | "login" | "logout" | "verify" | "help" | "version";
+  | "wizard"
+  | "login"
+  | "logout"
+  | "token"
+  | "verify"
+  | "help"
+  | "version";
 
 export interface ParsedArgs {
   command: Command;
@@ -224,7 +232,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
           parsed.workspace = a.slice("--workspace=".length);
         } else if (
           !commandSet &&
-          (a === "login" || a === "logout" || a === "verify")
+          (a === "login" ||
+            a === "logout" ||
+            a === "token" ||
+            a === "verify")
         ) {
           parsed.command = a;
           commandSet = true;
@@ -263,6 +274,10 @@ function usage(): string {
     ),
     cmd("crumbtrail login", "Log in and cache a token, nothing else"),
     cmd("crumbtrail logout", "Delete the cached token"),
+    cmd(
+      "crumbtrail token",
+      "Print the cached CLI token (set it as CRUMBTRAIL_TOKEN in CI)",
+    ),
     cmd(
       "crumbtrail verify",
       "Preflight an endpoint + key (DNS, TLS, auth) — PASS/FAIL",
@@ -702,6 +717,12 @@ export async function runWizard(
     return 1;
   }
 
+  // Who this token belongs to. Memoized in auth.ts, so the line ensureToken
+  // already printed and the wrong-account message below share one request.
+  const identityLabel = describeIdentity(
+    await fetchIdentity(base, token, deps.fetchImpl),
+  );
+
   // 3. Provision project + service + key.
   ui.out(step(3, TOTAL_STEPS, "Create the project and service"));
   const pkgName = readPkgName(cwd);
@@ -720,6 +741,7 @@ export async function runWizard(
       projectId: parsed.project,
       defaultProjectName,
       defaultServiceName,
+      identityLabel,
       fetchImpl: deps.fetchImpl,
     });
   } catch (err) {
@@ -1207,6 +1229,9 @@ export async function runBatchWizard(
         stack: c.detected.otlpStack,
         serviceName: name,
         ui,
+        identityLabel: describeIdentity(
+          await fetchIdentity(base, token, deps.fetchImpl),
+        ),
         fetchImpl: deps.fetchImpl,
       });
 
@@ -1700,7 +1725,7 @@ async function writeIngestKeys(args: {
   if (ready.length === 0) return results;
 
   // 3. One key for the run.
-  let key: string;
+  let key: { apiKey: string; keyId?: string };
   try {
     key = await args.deps.createIngestKey(
       args.base,
@@ -1725,10 +1750,10 @@ async function writeIngestKeys(args: {
     if (plan.kind !== "ready") continue;
     const where = rel(args.repoRoot, plan.file);
     try {
-      applyEnvEdits(buildEnvKeyEdits(plan, key), args.deps.envFileIO);
+      applyEnvEdits(buildEnvKeyEdits(plan, key.apiKey), args.deps.envFileIO);
       ui.out(
         ok(
-          `${named(label)}wrote ${color.bold(plan.varName)} to ${color.brand(where)}.`,
+          `${named(label)}wrote ${color.bold(plan.varName)} to ${color.brand(where)}${keyLabel(key)}.`,
         ),
       );
       // A dev server that was already running holds the old environment, so it
@@ -1788,6 +1813,21 @@ async function writeIngestKey(args: {
     targets: [{ label: "", appDir: args.appDir, varName: args.varName }],
   });
   return results.get("") ?? { status: "no-variable" };
+}
+
+/**
+ * Name the key that was just written, so it can be told apart from the others.
+ *
+ * Minting is additive on purpose — rotating would kill the key an already
+ * deployed app is using — so every run leaves one more live key on the project,
+ * and the dashboard's key list gives no clue which one is in this app's env
+ * file. The id is what that list is keyed by, and the last characters are what
+ * a reader can match against the file in front of them.
+ */
+function keyLabel(key: { apiKey: string; keyId?: string }): string {
+  const tail = key.apiKey.slice(-6);
+  const id = key.keyId ? `${key.keyId}, ` : "";
+  return color.dim(` (new key ${id}ending ${tail})`);
 }
 
 /** A path as the reader would type it, falling back to absolute off-tree. */
@@ -2062,6 +2102,35 @@ async function runLogin(parsed: ParsedArgs, deps: WizardDeps): Promise<number> {
   }
 }
 
+/**
+ * Print the cached CLI token so it can be pasted into CI as CRUMBTRAIL_TOKEN.
+ *
+ * This is the ONLY way to get a credential the CLI accepts non-interactively.
+ * The dashboard mints ingest keys and agent tokens; neither authenticates the
+ * CLI, and the wizard used to send CI users to look for a "CLI token" there
+ * that does not exist. The value goes to stdout alone (everything else goes to
+ * stderr) so `crumbtrail token` can be piped straight into a secret store.
+ */
+function runPrintToken(parsed: ParsedArgs, deps: WizardDeps): number {
+  const base = resolveEndpoint(parsed.endpoint, deps.env);
+  const stored = loadAuth(deps.env);
+  if (!stored || !stored.token || stored.endpoint !== base) {
+    deps.ui.err(
+      color.red(
+        `No saved login for ${base}. Run \`crumbtrail login\` first (add --endpoint <url> for a self-hosted deployment).`,
+      ),
+    );
+    return 1;
+  }
+  deps.ui.err(
+    color.dim(
+      `CLI token for ${base}${stored.expiresAt ? `, valid until ${stored.expiresAt}` : ""}. Set it as CRUMBTRAIL_TOKEN in CI.`,
+    ),
+  );
+  deps.ui.out(stored.token);
+  return 0;
+}
+
 function runLogout(deps: WizardDeps): number {
   const cleared = clearStoredAuth(deps.env);
   deps.ui.out(cleared ? "Logged out." : "No saved login to clear.");
@@ -2178,6 +2247,7 @@ export async function runCli(
   }
   if (parsed.command === "login") return runLogin(parsed, deps);
   if (parsed.command === "logout") return runLogout(deps);
+  if (parsed.command === "token") return runPrintToken(parsed, deps);
   // `verify` is non-interactive by design (no prompts, no browser) so it runs
   // before the TTY guard — pointing it at prod from CI is the whole point.
   if (parsed.command === "verify") return runVerify(parsed, deps);

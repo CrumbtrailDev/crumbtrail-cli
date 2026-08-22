@@ -824,6 +824,144 @@ describe("server", () => {
     ).toEqual([event]);
   });
 
+  it("POST /api/session/end reports a session whose every kind was unrecognized as degraded", async () => {
+    // The far end of the same problem: `{ ok: true, accepted: 4 }` on the way
+    // in and `degraded: false` on the way out, for a session that holds nothing
+    // anybody can read.
+    await request(
+      server,
+      "POST",
+      "/api/session/start",
+      { sessionId: "ses_all_unknown", metadata: {} },
+      authHeaders,
+    );
+    await request(
+      server,
+      "POST",
+      "/api/events",
+      {
+        sessionId: "ses_all_unknown",
+        events: [
+          { t: 1000, k: "telemetry.blip", d: {} },
+          { t: 1001, k: "telemetry.blop", d: {} },
+        ],
+      },
+      authHeaders,
+    );
+    const res = await request(
+      server,
+      "POST",
+      "/api/session/end",
+      { sessionId: "ses_all_unknown" },
+      authHeaders,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, processed: true, degraded: true });
+    const warnings = (
+      res.body as { postProcess: { warnings?: Array<{ code: string }> } }
+    ).postProcess.warnings;
+    expect(warnings?.some((w) => w.code === "nothing_indexable")).toBe(true);
+  });
+
+  it("POST /api/session/end leaves a quiet but understood session undegraded", async () => {
+    await request(
+      server,
+      "POST",
+      "/api/session/start",
+      { sessionId: "ses_quiet", metadata: {} },
+      authHeaders,
+    );
+    await request(
+      server,
+      "POST",
+      "/api/events",
+      {
+        sessionId: "ses_quiet",
+        events: [{ t: 1000, k: "clk", d: { el: { tag: "BUTTON" } } }],
+      },
+      authHeaders,
+    );
+    const res = await request(
+      server,
+      "POST",
+      "/api/session/end",
+      { sessionId: "ses_quiet" },
+      authHeaders,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, degraded: false });
+  });
+
+  it("POST /api/events canonicalizes long-form kinds the dashboard already labels", async () => {
+    // `error`, `console` and `network` come from hand-written snippets, the
+    // OTLP path and the mobile SDKs. The dashboard labels all three; nothing
+    // downstream could index any of them, so a session made of them was empty.
+    await request(
+      server,
+      "POST",
+      "/api/session/start",
+      { sessionId: "ses_aliases", metadata: {} },
+      authHeaders,
+    );
+    const res = await request(
+      server,
+      "POST",
+      "/api/events",
+      {
+        sessionId: "ses_aliases",
+        events: [
+          { t: 1000, k: "error", d: { msg: "boom" } },
+          { t: 1001, k: "Console", d: { lv: "err", msg: "bad" } },
+          { t: 1002, k: "network", d: { url: "/api/cart", m: "GET" } },
+        ],
+      },
+      authHeaders,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, accepted: 3, indexed: 3 });
+    expect(res.body).not.toHaveProperty("unrecognizedKinds");
+    expect(
+      readNdjson(
+        path.join(findSessionDir(tmpDir, "ses_aliases"), "events.ndjson"),
+      ).map((event) => (event as { k: string }).k),
+    ).toEqual(["err", "con", "net.req"]);
+  });
+
+  it("POST /api/events reports the kinds it cannot index rather than claiming a clean success", async () => {
+    await request(
+      server,
+      "POST",
+      "/api/session/start",
+      { sessionId: "ses_unknown_kinds", metadata: {} },
+      authHeaders,
+    );
+    const res = await request(
+      server,
+      "POST",
+      "/api/events",
+      {
+        sessionId: "ses_unknown_kinds",
+        events: [
+          { t: 1000, k: "telemetry.blip", d: {} },
+          { t: 1001, k: "telemetry.blip", d: {} },
+          { t: 1002, k: "err", d: { msg: "boom" } },
+        ],
+      },
+      authHeaders,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      ok: true,
+      accepted: 3,
+      indexed: 1,
+      unrecognizedKinds: ["telemetry.blip"],
+    });
+  });
+
   it("POST /api/events preserves planned target descriptors through post-processed fix-context output", async () => {
     const sessionId = "ses_ingested_target_context";
     const target = {

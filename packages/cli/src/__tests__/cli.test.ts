@@ -20,6 +20,7 @@ import { RECIPE_REGISTRY, sdkInstallSpec } from "../recipe-registry";
 import type { ServiceCandidate } from "../discover";
 import type { Prompter, Ui } from "../ui";
 import type { EnvFileIO } from "../env-file";
+import { saveAuth } from "../auth";
 
 function captureUi(): { ui: Ui; lines: string[] } {
   const lines: string[] = [];
@@ -130,7 +131,7 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
     }) as unknown as WizardDeps["provisionFlow"],
     createIngestKey: vi.fn(async () => {
       h.steps.push("mint-key");
-      return "ctkey_test123";
+      return { apiKey: "ctkey_test123", keyId: "key_test" };
     }) as unknown as WizardDeps["createIngestKey"],
     envFileIO: fakeEnvIO(),
     installSdk: vi.fn(async () => {
@@ -374,6 +375,11 @@ describe("wizard orchestration", () => {
     // than handing the job back.
     expect(out).toContain("VITE_CRUMBTRAIL_KEY");
     expect(out).toMatch(/wrote VITE_CRUMBTRAIL_KEY to/i);
+    // Which key. Minting is additive on purpose, so after a second run the
+    // project holds two live keys and the dashboard list cannot say which one
+    // is in this app's env file. The id and the tail can.
+    expect(out).toContain("key_test");
+    expect(out).toMatch(/ending est123/);
     // The key VALUE still never reaches the terminal. Scrollback, CI logs and
     // screen shares all outlive the run.
     expect(out).not.toMatch(/ctkey_|bgk_|bl_key_/);
@@ -1556,5 +1562,65 @@ describe("installSdk — registry install is version pinned", () => {
     }
     // The result reports bare package names (used for notes + tarball fallback).
     expect(result.packages).toEqual(["crumbtrail-core", "crumbtrail-node"]);
+  });
+});
+
+describe("crumbtrail token", () => {
+  it("prints the cached CLI token on stdout, with the guidance on stderr", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "bl-token-"));
+    try {
+      const env = {
+        XDG_CONFIG_HOME: home,
+        CRUMBTRAIL_BASE_URL: "https://cloud.example",
+      };
+      saveAuth(
+        {
+          token: "bl_cli_" + "z".repeat(48),
+          expiresAt: "2099-01-01T00:00:00Z",
+          endpoint: "https://cloud.example",
+        },
+        env,
+      );
+      const out: string[] = [];
+      const err: string[] = [];
+      const steps: string[] = [];
+      const deps = makeDeps(
+        { steps },
+        {
+          env,
+          ui: { out: (l = "") => out.push(l), err: (l = "") => err.push(l) },
+        },
+      );
+      const code = await runCli(["node", "cli", "token"], deps);
+      expect(code).toBe(0);
+      // Pipeable: the value and nothing else.
+      expect(out.join("\n").trim()).toBe("bl_cli_" + "z".repeat(48));
+      expect(err.join("\n")).toContain("CRUMBTRAIL_TOKEN");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses with the way out when nothing is cached for this endpoint", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), "bl-token-"));
+    try {
+      const err: string[] = [];
+      const steps: string[] = [];
+      const deps = makeDeps(
+        { steps },
+        {
+          env: {
+            XDG_CONFIG_HOME: home,
+            CRUMBTRAIL_BASE_URL: "https://cloud.example",
+          },
+          ui: { out: () => {}, err: (l = "") => err.push(l) },
+        },
+      );
+      const code = await runCli(["node", "cli", "token"], deps);
+      expect(code).toBe(1);
+      expect(err.join("\n")).toMatch(/crumbtrail login/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

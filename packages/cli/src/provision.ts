@@ -119,19 +119,62 @@ export async function createProject(
   }
 }
 
+export async function listServices(
+  base: string,
+  token: string,
+  projectId: string,
+  fetchImpl?: typeof fetch,
+): Promise<Service[]> {
+  const res = await requestJson<{ services?: Service[] }>(
+    `${base}/api/projects/${projectId}/services`,
+    { token, fetchImpl },
+  );
+  return Array.isArray(res.services) ? res.services : [];
+}
+
+/**
+ * Create a service, or adopt the one that already carries this name.
+ *
+ * Service names are unique per project, ignoring case, so the second run of the
+ * wizard in a wired app used to die on a 409 before it ever reached the
+ * already-wired check further down. Re-running is the single most natural thing
+ * somebody does when they are not sure the first run worked, so a name that is
+ * taken is treated as "this is the same app, carry on" rather than a failure.
+ *
+ * The 409 is still the source of truth for the collision: only after the server
+ * refuses do we read the list back, which keeps the happy path one request and
+ * makes the adopted service the real row rather than a guess.
+ */
 export async function createService(
   base: string,
   token: string,
   projectId: string,
   args: { name: string; stack?: string },
   fetchImpl?: typeof fetch,
-): Promise<Service> {
-  return requestJson<Service>(`${base}/api/projects/${projectId}/services`, {
-    method: "POST",
-    token,
-    body: { name: args.name, stack: args.stack },
-    fetchImpl,
-  });
+): Promise<Service & { adopted?: boolean }> {
+  try {
+    return await requestJson<Service>(
+      `${base}/api/projects/${projectId}/services`,
+      {
+        method: "POST",
+        token,
+        body: { name: args.name, stack: args.stack },
+        fetchImpl,
+      },
+    );
+  } catch (err) {
+    if (!(err instanceof ApiError) || err.status !== 409) throw err;
+    const wanted = args.name.trim().toLowerCase();
+    const existing = await listServices(base, token, projectId, fetchImpl);
+    const match = existing.find(
+      (service) => service.name.trim().toLowerCase() === wanted,
+    );
+    // No match after a name-taken 409 means the collision is with something
+    // this token cannot read, and inventing a service would be worse than the
+    // original error. The server's own words stand.
+    if (!match) throw err;
+    return { ...match, adopted: true };
+  }
 }
 
 /**
@@ -145,13 +188,18 @@ export async function createService(
  * Plaintext is returned exactly once, by the server, and is never stored
  * anywhere by this process — the caller writes it straight into the app's env
  * file. See env-file.ts for the rules that write follows.
+ *
+ * The key id comes back with it because additive minting means a project can
+ * hold several live keys, and the dashboard lists them all. Without the id the
+ * run cannot say WHICH of those rows is the one now sitting in the app's env
+ * file, which is the question a second run leaves behind.
  */
 export async function createIngestKey(
   base: string,
   token: string,
   projectId: string,
   fetchImpl?: typeof fetch,
-): Promise<string> {
+): Promise<{ apiKey: string; keyId?: string }> {
   const res = await requestJson<{ keyId?: string; apiKey?: string }>(
     `${base}/api/projects/${projectId}/keys`,
     { method: "POST", token, body: {}, fetchImpl },
@@ -159,7 +207,10 @@ export async function createIngestKey(
   if (typeof res.apiKey !== "string" || res.apiKey.length === 0) {
     throw new Error("The server minted a key but returned no value for it.");
   }
-  return res.apiKey;
+  return {
+    apiKey: res.apiKey,
+    ...(typeof res.keyId === "string" && res.keyId ? { keyId: res.keyId } : {}),
+  };
 }
 
 // ── Orchestrated flow ────────────────────────────────────────────────────────
@@ -184,6 +235,8 @@ export interface ProvisionInput {
   /** Inferred defaults (from detection / package.json / git). */
   defaultProjectName: string;
   defaultServiceName: string;
+  /** Who the token belongs to, for the wrong-account message. */
+  identityLabel?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -192,6 +245,8 @@ export interface ProvisionResult {
   projectName: string;
   serviceId: string;
   serviceName: string;
+  /** True when the service already existed and this run reused it. */
+  adopted?: boolean;
 }
 
 export interface ResolveProjectInput {
@@ -284,6 +339,8 @@ export interface ProvisionServiceInput {
   base: string;
   token: string;
   projectId: string;
+  /** Who the token belongs to, for the wrong-account message. */
+  identityLabel?: string;
   recipe: Recipe;
   /** Detected otlp stack; overrides the registry placeholder. */
   stack?: Stack | null;
@@ -302,7 +359,7 @@ export interface ProvisionServiceInput {
  */
 export async function provisionService(
   input: ProvisionServiceInput,
-): Promise<{ serviceId: string; serviceName: string }> {
+): Promise<{ serviceId: string; serviceName: string; adopted?: boolean }> {
   const { base, token, ui, fetchImpl } = input;
   // Prefer the DETECTED otlp stack when present; otherwise the registry stack.
   // For otlp the registry value is only a placeholder, so input.stack is what
@@ -313,16 +370,56 @@ export async function provisionService(
   // would read a Flutter app as a React one.
   const meta = RECIPE_REGISTRY[input.recipe];
   const serviceStack = input.stack ?? meta.reportedStack ?? meta.stack;
-  const service = await createService(
-    base,
-    token,
-    input.projectId,
-    { name: input.serviceName, stack: serviceStack },
-    fetchImpl,
+  let service: Service & { adopted?: boolean };
+  try {
+    service = await createService(
+      base,
+      token,
+      input.projectId,
+      { name: input.serviceName, stack: serviceStack },
+      fetchImpl,
+    );
+  } catch (err) {
+    throw explainWrongAccount(err, input.projectId, input.identityLabel);
+  }
+  ui.out(
+    ok(
+      service.adopted
+        ? `Service: ${color.bold(color.brand(service.name))} ${color.dim("(already in this project — reusing it)")}`
+        : `Service: ${color.bold(color.brand(service.name))}`,
+    ),
   );
-  ui.out(ok(`Service: ${color.bold(color.brand(service.name))}`));
 
-  return { serviceId: service.id, serviceName: service.name };
+  return {
+    serviceId: service.id,
+    serviceName: service.name,
+    ...(service.adopted ? { adopted: true } : {}),
+  };
+}
+
+/**
+ * Rewrite the cloud's 404 for a project id that is real but belongs to another
+ * workspace.
+ *
+ * A CLI token is validated against the ENDPOINT and never against the project,
+ * so a stale token for a different tenant sails through login and dies here as
+ * "Project not found" — which reads as a bad id, and sends the reader off to
+ * re-check an id that was correct all along. The account is the thing that is
+ * wrong, so the message names it.
+ */
+export function explainWrongAccount(
+  err: unknown,
+  projectId: string,
+  identityLabel?: string,
+): unknown {
+  if (!(err instanceof ApiError) || err.status !== 404) return err;
+  const who = identityLabel ? ` as ${identityLabel}` : "";
+  return new Error(
+    `The account you are signed in${who} has no project ${projectId}. ` +
+      `The id is probably right and the account is wrong: run ` +
+      `\`crumbtrail logout\`, then \`npx crumbtrail\` again to sign in as the ` +
+      `owner of that project. (${err.message})`,
+  );
 }
 
 /**
@@ -385,6 +482,7 @@ export async function provisionFlow(
     stack: input.stack,
     serviceName,
     ui: input.ui,
+    ...(input.identityLabel ? { identityLabel: input.identityLabel } : {}),
     fetchImpl: input.fetchImpl,
   });
 
@@ -393,5 +491,6 @@ export async function provisionFlow(
     projectName: project.name,
     serviceId: service.serviceId,
     serviceName: service.serviceName,
+    ...(service.adopted ? { adopted: true } : {}),
   };
 }

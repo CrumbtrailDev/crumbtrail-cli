@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   authFilePath,
   clearAuth,
+  clearIdentityCache,
+  describeIdentity,
   ensureToken,
   loadAuth,
   loginBrowser,
@@ -26,6 +28,15 @@ interface MockOptions {
   devicePendingPolls?: number;
   /** Token minted by exchange/device. */
   mintToken?: string;
+  /**
+   * How many of the FIRST device polls answer 429 with a Retry-After, the way
+   * cloud's auth limiter does once the per-IP budget is spent.
+   */
+  deviceRateLimitedPolls?: number;
+  /** Retry-After seconds sent with those 429s. */
+  retryAfterSeconds?: number;
+  /** Identity payload for GET /auth/me. */
+  identity?: Record<string, unknown>;
 }
 
 interface MockServer {
@@ -66,6 +77,18 @@ async function startMockCloud(opts: MockOptions = {}): Promise<MockServer> {
       const body = JSON.parse((await readBody(req)) || "{}");
       if (body.deviceCode) {
         devicePolls += 1;
+        if (devicePolls <= (opts.deviceRateLimitedPolls ?? 0)) {
+          res.writeHead(429, {
+            "Content-Type": "application/json",
+            "Retry-After": String(opts.retryAfterSeconds ?? 1),
+          });
+          return res.end(
+            JSON.stringify({
+              error: "Too many authentication attempts",
+              code: "rate_limited",
+            }),
+          );
+        }
         if (devicePolls <= (opts.devicePendingPolls ?? 0)) {
           return send(400, {
             error: "authorization pending",
@@ -79,6 +102,14 @@ async function startMockCloud(opts: MockOptions = {}): Promise<MockServer> {
       }
       exchanges += 1;
       return send(200, { token: mintToken, expiresAt: "2099-01-01T00:00:00Z" });
+    }
+    if (req.method === "GET" && url.pathname === "/auth/me") {
+      const auth = req.headers.authorization ?? "";
+      const token = auth.replace(/^Bearer\s+/i, "");
+      if (opts.validTokens && !opts.validTokens.has(token)) {
+        return send(401, { error: "unauthorized", code: "unauthorized" });
+      }
+      return send(200, opts.identity ?? { userId: "usr_1", tenantId: "ten_1" });
     }
     if (req.method === "POST" && url.pathname === "/api/cli/device") {
       return send(201, {
@@ -258,6 +289,108 @@ describe("device flow", () => {
     expect(token).toBe(mint);
     expect(mock.devicePolls).toBe(3); // 2 pending + 1 success
     await mock.close();
+  });
+});
+
+describe("device flow rate limiting", () => {
+  it("waits out a 429 and keeps polling instead of failing the login", async () => {
+    // The exact shape that killed the previous hunt: the CLI spent the per-IP
+    // auth budget on its own polls, and the FIRST answer after that was a 429 —
+    // which used to abort the login while the code was still valid.
+    const mint = "bl_cli_" + "r".repeat(48);
+    const mock = await startMockCloud({
+      deviceRateLimitedPolls: 2,
+      devicePendingPolls: 3, // 2 rate-limited + 1 pending, then the token
+      mintToken: mint,
+      retryAfterSeconds: 1,
+    });
+    const lines: string[] = [];
+    const token = await ensureToken({
+      base: mock.baseUrl,
+      ui: { out: (l = "") => lines.push(l), err: () => {} },
+      noBrowser: true,
+      env,
+      pollIntervalMs: 5,
+      pollWindowMs: 50,
+      pollBudget: 10,
+    });
+    expect(token).toBe(mint);
+    expect(mock.devicePolls).toBe(4);
+    // And it said so, rather than looking hung.
+    expect(lines.join("\n")).toMatch(/rate limiting sign-in attempts/i);
+    await mock.close();
+  }, 15000);
+
+  it("keeps its polls inside a budget so the human's approval still fits", async () => {
+    // 6 polls against a budget of 2 per 100ms window cannot finish in under two
+    // full windows. The real numbers (5 per minute against the cloud's 10) are
+    // the same arithmetic: the CLI never spends more than half the budget.
+    const mint = "bl_cli_" + "b".repeat(48);
+    const mock = await startMockCloud({ devicePendingPolls: 5, mintToken: mint });
+    const startedAt = Date.now();
+    const token = await ensureToken({
+      base: mock.baseUrl,
+      ui: silentUi,
+      noBrowser: true,
+      env,
+      pollIntervalMs: 1,
+      pollWindowMs: 100,
+      pollBudget: 2,
+    });
+    expect(token).toBe(mint);
+    expect(mock.devicePolls).toBe(6);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(180);
+    await mock.close();
+  }, 15000);
+
+  it("stores the dashboard origin the device flow reported", async () => {
+    // The device verification URI is a DASHBOARD route, so its origin is the
+    // app host. Without this the wizard's closing "Dashboard: …" link pointed
+    // at the API port, which answers {"error":"Not found"}.
+    const mock = await startMockCloud({ mintToken: "bl_cli_" + "d".repeat(48) });
+    await ensureToken({
+      base: mock.baseUrl,
+      ui: silentUi,
+      noBrowser: true,
+      env,
+      pollIntervalMs: 5,
+    });
+    expect(loadAuth(env)?.appBaseUrl).toBe(mock.baseUrl);
+    await mock.close();
+  });
+});
+
+describe("naming the account that is being reused", () => {
+  it("says whose login it is reusing", async () => {
+    const stored = "bl_cli_" + "s".repeat(48);
+    const mock = await startMockCloud({
+      validTokens: new Set([stored]),
+      identity: {
+        userId: "usr_1",
+        tenantId: "ten_1",
+        email: "someone@example.com",
+      },
+    });
+    saveAuth(
+      { token: stored, expiresAt: "2099-01-01T00:00:00Z", endpoint: mock.baseUrl },
+      env,
+    );
+    clearIdentityCache();
+    const lines: string[] = [];
+    const token = await ensureToken({
+      base: mock.baseUrl,
+      ui: { out: (l = "") => lines.push(l), err: () => {} },
+      env,
+    });
+    expect(token).toBe(stored);
+    expect(lines.join("\n")).toContain("someone@example.com");
+    await mock.close();
+  });
+
+  it("falls back to the workspace id when the deployment reports no email", async () => {
+    clearIdentityCache();
+    expect(describeIdentity({ tenantId: "ten_9" })).toBe("workspace ten_9");
+    expect(describeIdentity(undefined)).toBe("unknown account");
   });
 });
 

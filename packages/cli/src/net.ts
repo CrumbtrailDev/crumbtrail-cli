@@ -61,16 +61,42 @@ export class ApiError extends Error {
   readonly code?: string;
   /** Parsed JSON body, when the response carried one. */
   readonly body?: unknown;
+  /**
+   * `Retry-After`, in seconds, when the server sent one. A 429 without this is
+   * a wait of unknown length; a 429 WITH it is an instruction, and the only way
+   * a polling caller can stop hammering a limiter is to be told the number.
+   */
+  readonly retryAfterSeconds?: number;
   constructor(
     message: string,
-    opts: { status: number; code?: string; body?: unknown },
+    opts: {
+      status: number;
+      code?: string;
+      body?: unknown;
+      retryAfterSeconds?: number;
+    },
   ) {
     super(message);
     this.name = "ApiError";
     this.status = opts.status;
     this.code = opts.code;
     this.body = opts.body;
+    this.retryAfterSeconds = opts.retryAfterSeconds;
   }
+}
+
+/**
+ * Parse a `Retry-After` header. RFC 9110 allows delay-seconds or an HTTP-date;
+ * the cloud sends seconds, but a proxy in front of it may rewrite to a date, so
+ * both are read. Returns undefined for anything unusable, and never a negative.
+ */
+export function parseRetryAfter(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Math.max(0, Number(trimmed));
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) return undefined;
+  return Math.max(0, Math.ceil((at - Date.now()) / 1000));
 }
 
 /** Network-layer failure (never got an HTTP status). Carries method+URL context. */
@@ -127,6 +153,7 @@ export interface RequestOptions {
 interface RawResponse {
   status: number;
   text: string;
+  retryAfterSeconds?: number;
 }
 
 async function rawRequest(
@@ -149,7 +176,12 @@ async function rawRequest(
     signal: opts.signal,
   });
   const text = await res.text();
-  return { status: res.status, text };
+  const retryAfterSeconds = parseRetryAfter(res.headers?.get?.("retry-after") ?? null);
+  return {
+    status: res.status,
+    text,
+    ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }),
+  };
 }
 
 function parseJson(text: string): unknown {
@@ -226,6 +258,9 @@ export async function requestJson<T = unknown>(
     status: raw.status,
     code,
     body: parsed,
+    ...(raw.retryAfterSeconds === undefined
+      ? {}
+      : { retryAfterSeconds: raw.retryAfterSeconds }),
   });
 }
 

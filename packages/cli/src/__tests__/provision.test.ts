@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import { ApiError } from "../net";
 import {
   createProject,
+  createService,
+  explainWrongAccount,
   inferProjectName,
   inferServiceName,
   listProjects,
@@ -273,5 +276,83 @@ describe("resolveProject interactive default", () => {
       fetchImpl,
     });
     expect(project).toMatchObject({ id: "p2", name: "checkout" });
+  });
+});
+
+describe("createService on a name that is already taken", () => {
+  it("adopts the existing service instead of failing the run", async () => {
+    // The second `npx crumbtrail` in a wired app: the cloud refuses the name
+    // (unique per project, ignoring case) and the run used to exit 1 before it
+    // ever reached its own already-wired check.
+    const calls: string[] = [];
+    const fetchImpl = vi.fn(async (url: unknown, init?: unknown) => {
+      const method = ((init as { method?: string })?.method ?? "GET").toUpperCase();
+      calls.push(`${method} ${String(url)}`);
+      if (method === "POST") {
+        return jsonResponse(409, {
+          error:
+            "This project already has a service named web. Service names are unique within a project, ignoring case.",
+          code: "service_name_taken",
+          conflicts: ["web"],
+        });
+      }
+      return jsonResponse(200, {
+        services: [{ id: "svc_1", name: "Web" }],
+      });
+    }) as unknown as typeof fetch;
+
+    const service = await createService(
+      "https://cloud.example",
+      "bl_cli_x",
+      "prj_1",
+      { name: "web", stack: "react" },
+      fetchImpl,
+    );
+    expect(service).toMatchObject({ id: "svc_1", name: "Web", adopted: true });
+    expect(calls).toEqual([
+      "POST https://cloud.example/api/projects/prj_1/services",
+      "GET https://cloud.example/api/projects/prj_1/services",
+    ]);
+  });
+
+  it("re-throws when nothing in the project actually carries that name", async () => {
+    const fetchImpl = vi.fn(async (_url: unknown, init?: unknown) => {
+      const method = ((init as { method?: string })?.method ?? "GET").toUpperCase();
+      if (method === "POST") {
+        return jsonResponse(409, {
+          error: "This project already has a service named web.",
+          code: "service_name_taken",
+        });
+      }
+      return jsonResponse(200, { services: [{ id: "svc_2", name: "api" }] });
+    }) as unknown as typeof fetch;
+
+    await expect(
+      createService(
+        "https://cloud.example",
+        "bl_cli_x",
+        "prj_1",
+        { name: "web" },
+        fetchImpl,
+      ),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+});
+
+describe("explainWrongAccount", () => {
+  it("turns the cloud's 404 into an account problem, naming the account", () => {
+    const err = new ApiError("Project not found (POST /services) [404]", {
+      status: 404,
+    });
+    const rewritten = explainWrongAccount(err, "prj_9fd0", "someone@example.com");
+    expect(String((rewritten as Error).message)).toContain(
+      "signed in as someone@example.com has no project prj_9fd0",
+    );
+    expect(String((rewritten as Error).message)).toContain("crumbtrail logout");
+  });
+
+  it("leaves every other failure exactly as it was", () => {
+    const err = new ApiError("boom", { status: 500 });
+    expect(explainWrongAccount(err, "prj_1", "someone@example.com")).toBe(err);
   });
 });

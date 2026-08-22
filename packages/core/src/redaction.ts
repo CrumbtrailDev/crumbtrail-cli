@@ -500,6 +500,14 @@ function redactQueryString(
     for (const value of values) {
       if (value === "") {
         params.append(safeKey, "");
+      } else if (isHarmlessQueryValue(key, value)) {
+        // Pagination, sorting and paging cursors made of plain numbers. The
+        // keep list is application declared and empty by default, so
+        // `?page=1&limit=20` came back as `?page=[REDACTED]&limit=[REDACTED]`
+        // on every session — hiding which page a defect happened on, and
+        // protecting a number that is not a secret in any deployment. A
+        // sensitive NAME still overrides this: `?token=1` is redacted.
+        params.append(safeKey, value);
       } else if (
         kept &&
         classifyStructuredValue(
@@ -528,6 +536,20 @@ function redactQueryString(
     value: serialized ? `?${serialized}` : "",
     ...(metadata ? { metadata } : {}),
   };
+}
+
+/**
+ * A query value that carries no risk regardless of the keep list: a short plain
+ * number under a name that is not sensitive.
+ *
+ * Deliberately narrow. Numbers only (no free text, no ids that merely look
+ * numeric at 12 digits — an account number is numeric too), capped at four
+ * digits, and a sensitive name still wins. That admits page, limit, offset,
+ * step, quantity and their kin, and nothing that could be a credential.
+ */
+function isHarmlessQueryValue(key: string, value: string): boolean {
+  if (isSensitiveName(key)) return false;
+  return /^-?[0-9]{1,4}$/.test(value);
 }
 
 /**
@@ -900,7 +922,45 @@ function isSecretLikePathSegment(segment: string, previous: string): boolean {
     !isPlainRouteWord(previous, segment)
   )
     return true;
-  return /^[A-Za-z0-9_-]{16,39}$/.test(segment) && /[A-Z0-9_-]/.test(segment);
+  // The length-and-shape rule, for an opaque identifier sitting in a path with
+  // nothing around it to say what it is.
+  //
+  // It used to be `/^[A-Za-z0-9_-]{16,39}$/ && /[A-Z0-9_-]/`, whose second test
+  // a single hyphen satisfies — so it read as "any 16 to 39 character slug with
+  // a hyphen in it is a secret". `aurora-desk-lamp` (16) was redacted while
+  // `nimbus-keyboard` (15) and `flux-mouse` (10) came through untouched: the
+  // same URL shape, opposite outcomes, decided by length alone. A session then
+  // showed `/product/[REDACTED]` three navigations from `/product/nimbus-keyboard`,
+  // and no reader could tell those were the same kind of page.
+  //
+  // A product slug is words. A key is not. So a segment that decomposes into
+  // word-shaped parts is kept, and everything else in that length band is still
+  // redacted.
+  if (!/^[A-Za-z0-9_-]{16,39}$/.test(segment)) return false;
+  return !isWordLikeSlug(segment);
+}
+
+/**
+ * Does this segment read as words a person wrote, rather than an opaque value?
+ *
+ * Split on the separators slugs use, every part has to look like a word (letters
+ * with a vowel in them) or a small number — `aurora-desk-lamp`, `winter-sale-2024`,
+ * `checkout-v2`. One part that is a run of mixed letters and digits, or a
+ * consonant run with no vowel, fails the whole segment, which is what keeps
+ * `sk_live_4eC39HqLyjWDarjt`, `AKIAIOSFODNN7EXAMPLE` and a raw hex id redacted.
+ */
+function isWordLikeSlug(segment: string): boolean {
+  const parts = segment.split(/[-_]/);
+  if (parts.length === 0) return false;
+  return parts.every((part) => {
+    if (part.length === 0) return false;
+    // A version or year fragment: v2, 2024, 3.
+    if (/^[A-Za-z]?[0-9]{1,4}$/.test(part)) return true;
+    if (!/^[A-Za-z]+$/.test(part)) return false;
+    // A word has a vowel. A 16 character run of consonants does not, and is far
+    // more likely to be an encoded value than a noun.
+    return /[aeiouy]/i.test(part);
+  });
 }
 
 function redactRelativeUrl(url: string, path: string): RedactionResult<string> {

@@ -838,6 +838,17 @@ export interface CrumbtrailConfig {
   httpAuthToken?: string;
   flushIntervalMs: number;
   flushBufferSize: number;
+  /**
+   * Close the session when the page goes away (`pagehide`: tab close,
+   * navigation, bfcache entry). On by default in a browser.
+   *
+   * Without it nothing ends a session that the host never calls `stop()` on,
+   * and the server only reclaims it through the idle sweeper — 30 minutes of
+   * idleness, checked every 5, so a session stayed unreadable for around 35
+   * minutes after the person closed the tab. The end request goes out with
+   * `keepalive`, so it survives the unload and still carries the ingest key.
+   */
+  endOnPageHide: boolean;
 
   // Blob sender (wired from transport by default; override for custom handling)
   sendBlob?: (name: string, blob: Blob) => void;
@@ -971,6 +982,7 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   httpAuthToken: "",
   flushIntervalMs: 5000,
   flushBufferSize: 100,
+  endOnPageHide: true,
 
   sessionPersistence: "session",
   sessionIdleMs: 1_800_000, // 30 minutes

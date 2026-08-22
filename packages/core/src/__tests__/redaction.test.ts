@@ -32,7 +32,7 @@ describe("browser redaction policy", () => {
     );
 
     expect(result.value).toBe(
-      `https://example.com/reset/${encodeURIComponent(REDACTED_VALUE)}?token=%5BREDACTED%5D&page=%5BREDACTED%5D`,
+      `https://example.com/reset/${encodeURIComponent(REDACTED_VALUE)}?token=%5BREDACTED%5D&page=2`,
     );
     expect(result.metadata?.fields.map((field) => field.reason)).toEqual(
       expect.arrayContaining([
@@ -113,6 +113,40 @@ describe("browser redaction policy", () => {
     expect(
       passwordPath.metadata?.fields.map((field) => field.reason),
     ).toContain("url_path_secret_segment");
+  });
+
+  it("keeps word-like product slugs in the URL path", () => {
+    // The length band alone used to make any 16+ character hyphenated slug a
+    // secret, so a product page URL arrived unreadable. A slug is words and
+    // small numbers joined by separators; a key is not.
+    for (const path of [
+      "/products/aurora-desk-lamp",
+      "/products/nimbus-keyboard",
+      "/products/winter-sale-2024",
+      "/blog/how-to-debug-faster",
+      "/docs/getting_started_guide",
+    ]) {
+      expect(redactUrl(`https://shop.test${path}`).value).toBe(
+        `https://shop.test${path}`,
+      );
+    }
+  });
+
+  it("still redacts real keys and tokens in the URL path", () => {
+    for (const secret of [
+      "sk_live_51H8xKLMnOpQrStUv",
+      "AKIAIOSFODNN7EXAMPLE",
+      "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+      "eyJhbGciOiJIUzI1NiIsInR5cCI6",
+    ]) {
+      const result = redactUrl(`https://api.test/resource/${secret}`);
+      expect(result.value).not.toContain(secret);
+      expect(result.metadata?.fields.map((field) => field.reason)).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/^url_path_(secret_segment|token)$/),
+        ]),
+      );
+    }
   });
 
   it("redacts double-encoded and structured URL path secrets", () => {

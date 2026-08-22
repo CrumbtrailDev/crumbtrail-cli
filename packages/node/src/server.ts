@@ -25,6 +25,7 @@ import {
   type AiDiagnosisConfig,
 } from "./ai-diagnosis";
 import { defaultSessionStore } from "./session-store";
+import { canonicalEventKind, classifyEventKinds } from "./event-kinds";
 import { startSessionSweeper } from "./session-sweeper";
 import { startFastFinalizer, type FastFinalizeHandle } from "./fast-finalize";
 import { buildHealthPayload, buildPublicHealthPayload } from "./health";
@@ -932,6 +933,12 @@ function validateAndNormalizeEvent(event: unknown, index: number): BugEvent {
       false,
     );
   }
+  // Long-form spellings (`error`, `console`, `navigation`, `network`) come from
+  // hand-written init snippets, the OTLP path and the mobile SDKs, and the
+  // dashboard already labels them — but nothing downstream could index them.
+  // Normalizing here is what makes one vocabulary out of two.
+  const canonicalKind = canonicalEventKind(event.k);
+  if (canonicalKind !== event.k) event.k = canonicalKind;
   if (!isRecord(event.d)) {
     throw new RequestValidationError(
       400,
@@ -1740,12 +1747,24 @@ export function createServer(config: ServerConfig): http.Server {
         const append = await appendEvents(sessionDir, validatedEvents, {
           maxEventBytes: maxSessionEventBytes,
         });
+        // How much of this batch will actually become something. A batch of
+        // kinds nothing indexes used to answer `{ ok: true, accepted: 4,
+        // dropped: 0 }`, which reads as success and is a lie by omission: the
+        // session it produced was empty.
+        const kinds = classifyEventKinds(validatedEvents);
         // Fast-finalize hook, after the successful append only. notifyIngest
         // never throws into the request path (classification/scheduling
         // errors are logged to stderr inside the handle). body.sessionId is a
         // string here — getExistingSessionDirOrThrow rejected anything else.
         fastFinalizer?.notifyIngest(body.sessionId as string, validatedEvents);
-        json(res, 200, { ok: true, ...append });
+        json(res, 200, {
+          ok: true,
+          ...append,
+          indexed: kinds.indexed,
+          ...(kinds.unrecognizedKinds.length > 0
+            ? { unrecognizedKinds: kinds.unrecognizedKinds }
+            : {}),
+        });
         return;
       }
 
