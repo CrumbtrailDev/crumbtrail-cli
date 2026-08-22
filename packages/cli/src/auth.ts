@@ -269,6 +269,82 @@ export async function validateToken(
   }
 }
 
+// ── Who is signed in ─────────────────────────────────────────────────────────
+
+/**
+ * The account a token belongs to, as far as this deployment will say.
+ *
+ * A token is validated against the ENDPOINT, never against the project, so a
+ * token left over from another workspace passes every check the CLI makes and
+ * then fails deep inside provisioning as "Project not found" — which reads as a
+ * wrong project id, and sends the user off to re-check an id that was right.
+ * Naming the account on the line that says a login is being reused is what
+ * makes that failure legible before it happens.
+ */
+export interface Identity {
+  userId?: string;
+  tenantId?: string;
+  email?: string;
+  workspaceName?: string;
+}
+
+/** One line naming the account: email if the deployment reports one, else ids. */
+export function describeIdentity(identity: Identity | undefined): string {
+  if (!identity) return "unknown account";
+  if (identity.email) {
+    return identity.workspaceName
+      ? `${identity.email} · ${identity.workspaceName}`
+      : identity.email;
+  }
+  if (identity.workspaceName) return identity.workspaceName;
+  if (identity.tenantId) return `workspace ${identity.tenantId}`;
+  if (identity.userId) return `user ${identity.userId}`;
+  return "unknown account";
+}
+
+const identityCache = new Map<string, Identity | undefined>();
+
+/**
+ * Read GET /auth/me for the token's account. Never throws: identity is context,
+ * and a deployment that will not answer must not be able to fail a setup run.
+ * Memoized per endpoint+token so naming the account costs one request a run.
+ */
+export async function fetchIdentity(
+  base: string,
+  token: string,
+  fetchImpl?: typeof fetch,
+): Promise<Identity | undefined> {
+  const cacheKey = `${base}\u0000${token}`;
+  if (identityCache.has(cacheKey)) return identityCache.get(cacheKey);
+  let identity: Identity | undefined;
+  try {
+    const me = await requestJson<Record<string, unknown>>(`${base}/auth/me`, {
+      token,
+      fetchImpl,
+    });
+    const str = (value: unknown): string | undefined =>
+      typeof value === "string" && value.trim() ? value.trim() : undefined;
+    identity = {
+      ...(str(me?.userId) ? { userId: str(me?.userId) } : {}),
+      ...(str(me?.tenantId) ? { tenantId: str(me?.tenantId) } : {}),
+      ...(str(me?.email) ? { email: str(me?.email) } : {}),
+      ...(str(me?.workspaceName) ?? str(me?.tenantName)
+        ? { workspaceName: str(me?.workspaceName) ?? str(me?.tenantName) }
+        : {}),
+    };
+    if (Object.keys(identity).length === 0) identity = undefined;
+  } catch {
+    identity = undefined;
+  }
+  identityCache.set(cacheKey, identity);
+  return identity;
+}
+
+/** Test seam: drop the memoized identities. */
+export function clearIdentityCache(): void {
+  identityCache.clear();
+}
+
 // ── Login flows ──────────────────────────────────────────────────────────────
 
 export interface LoginOptions {
@@ -281,6 +357,10 @@ export interface LoginOptions {
   env?: NodeJS.ProcessEnv;
   /** Device-poll interval override for tests (ms). */
   pollIntervalMs?: number;
+  /** Sliding budget window for device polls (ms); default POLL_WINDOW_MS. */
+  pollWindowMs?: number;
+  /** Device polls allowed per window; default DEVICE_POLL_BUDGET. */
+  pollBudget?: number;
   /** Browser hand-off deadline in ms (default 5 min); overridable in tests. */
   browserDeadlineMs?: number;
   /**
@@ -296,7 +376,8 @@ export interface LoginOptions {
 /** Env var carrying a pre-minted CLI token for non-interactive (CI) runs. */
 export const TOKEN_ENV_VAR = "CRUMBTRAIL_TOKEN";
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number): Promise<void> =>
+  new Promise<void>((r) => setTimeout(r, ms));
 
 /**
  * Browser hand-off: open <base>/cli/authorize?port=&challenge=, then race the
@@ -362,8 +443,57 @@ interface DeviceStart {
 }
 
 /**
+ * How many token polls this CLI will spend inside `POLL_WINDOW_MS`.
+ *
+ * The cloud's auth limiter allows 10 requests a minute and buckets them BY
+ * CLIENT IP as well as by credential — and the approval the user performs in
+ * their browser comes from the same IP whenever the browser is on this machine,
+ * which is the normal case. Polling at the advertised 5s interval therefore
+ * spent the whole per-IP budget in 45 seconds, against a code that lives for
+ * 300, and then blocked the human's own approval as well as itself.
+ *
+ * So the CLI spends at most half the budget and leaves the rest for the person.
+ * Five polls a minute is a worst case of ~12s between an approval and the
+ * terminal noticing it, in exchange for a login that cannot lock itself out.
+ */
+export const DEVICE_POLL_BUDGET = 5;
+export const POLL_WINDOW_MS = 60_000;
+
+/**
+ * Spend one unit of a sliding-window budget, waiting if it is exhausted.
+ * Returns the ms it waited. `spent` is mutated: it holds the timestamps of the
+ * polls already made inside the window.
+ */
+async function awaitPollSlot(args: {
+  spent: number[];
+  budget: number;
+  windowMs: number;
+  minGapMs: number;
+  now: () => number;
+  sleepFn: (ms: number) => Promise<void>;
+}): Promise<void> {
+  const { spent, budget, windowMs, minGapMs, now, sleepFn } = args;
+  const at = now();
+  while (spent.length > 0 && spent[0]! <= at - windowMs) spent.shift();
+  const sinceLast = spent.length > 0 ? at - spent[spent.length - 1]! : Infinity;
+  let wait = sinceLast >= minGapMs ? 0 : minGapMs - sinceLast;
+  if (spent.length >= budget) {
+    // The window is full: wait for the oldest poll to age out of it.
+    wait = Math.max(wait, spent[0]! + windowMs - at);
+  }
+  if (wait > 0) await sleepFn(wait);
+  spent.push(now());
+  while (spent.length > 0 && spent[0]! <= now() - windowMs) spent.shift();
+}
+
+/**
  * Device flow: request a code, print it, poll /api/cli/token until approval.
  * `authorization_pending` (400) keeps polling; `invalid_grant` aborts.
+ *
+ * A 429 is NOT fatal here. It means this CLI (or the person approving from the
+ * same address) has spent the auth budget, and the only correct response is to
+ * wait out the `Retry-After` the server sent and carry on polling — failing the
+ * login instead is how `crumbtrail login` used to kill its own approval.
  */
 export async function loginDevice(opts: LoginOptions): Promise<TokenResponse> {
   const device = await requestJson<DeviceStart>(`${opts.base}/api/cli/device`, {
@@ -379,8 +509,18 @@ export async function loginDevice(opts: LoginOptions): Promise<TokenResponse> {
   );
   opts.ui.out(color.dim("Waiting for approval…"));
 
+  // The dashboard origin, straight from the deployment: `verificationUri` is a
+  // dashboard route, so the origin serving it IS the app host. Locally the API
+  // and the app are different ports, and without this every link the wizard
+  // printed afterwards ("Dashboard: …/issues") pointed at the API and 404ed.
+  const appBaseUrl = appOriginOf(device.verificationUri);
+
   const intervalMs = opts.pollIntervalMs ?? Math.max(1, device.interval) * 1000;
+  const windowMs = opts.pollWindowMs ?? POLL_WINDOW_MS;
+  const budget = opts.pollBudget ?? DEVICE_POLL_BUDGET;
   const deadline = Date.now() + Math.max(1, device.expiresIn) * 1000;
+  const spent: number[] = [];
+  let warnedRateLimited = false;
 
   while (true) {
     if (Date.now() > deadline) {
@@ -388,21 +528,66 @@ export async function loginDevice(opts: LoginOptions): Promise<TokenResponse> {
         "Device authorization expired — run `crumbtrail login` again.",
       );
     }
-    await sleep(intervalMs);
+    await awaitPollSlot({
+      spent,
+      budget,
+      windowMs,
+      minGapMs: intervalMs,
+      now: Date.now,
+      sleepFn: sleep,
+    });
     try {
-      return await requestJson<TokenResponse>(`${opts.base}/api/cli/token`, {
-        method: "POST",
-        body: { deviceCode: device.deviceCode },
-        fetchImpl: opts.fetchImpl,
-        // Don't retry-on-5xx here; the polling loop is the retry.
-        retry: false,
-      });
+      const minted = await requestJson<TokenResponse>(
+        `${opts.base}/api/cli/token`,
+        {
+          method: "POST",
+          body: { deviceCode: device.deviceCode },
+          fetchImpl: opts.fetchImpl,
+          // Don't retry-on-5xx here; the polling loop is the retry.
+          retry: false,
+        },
+      );
+      return {
+        ...minted,
+        ...(minted.appBaseUrl || !appBaseUrl ? {} : { appBaseUrl }),
+      };
     } catch (err) {
       if (err instanceof ApiError && err.code === "authorization_pending") {
         continue;
       }
+      if (err instanceof ApiError && err.status === 429) {
+        // Told to wait: obey the number, and say so once so a stalled-looking
+        // terminal is explained rather than mysterious.
+        const waitSeconds = Math.max(1, err.retryAfterSeconds ?? 30);
+        if (!warnedRateLimited) {
+          warnedRateLimited = true;
+          opts.ui.out(
+            color.dim(
+              `Crumbtrail is rate limiting sign-in attempts — waiting ${waitSeconds}s, then checking again. Your code is still valid.`,
+            ),
+          );
+        }
+        await sleep(waitSeconds * 1000);
+        // A denied attempt still counts against the window on the server, so
+        // it counts here too; anything else walks straight back into the wall.
+        spent.push(Date.now());
+        continue;
+      }
       throw err;
     }
+  }
+}
+
+/**
+ * The origin of a dashboard URL the server gave us (`…/cli/activate`), or
+ * undefined when it is not parseable. Only the origin is kept: the path is the
+ * server's business, the origin is what every later link needs.
+ */
+export function appOriginOf(verificationUri: string): string | undefined {
+  try {
+    return new URL(verificationUri).origin;
+  } catch {
+    return undefined;
   }
 }
 
@@ -443,13 +628,25 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
   if (envToken) {
     const state = await validateToken(opts.base, envToken, opts.fetchImpl);
     if (state === "valid") {
-      opts.ui.out(color.dim(`Using ${TOKEN_ENV_VAR} from the environment.`));
+      const identity = await fetchIdentity(opts.base, envToken, opts.fetchImpl);
+      opts.ui.out(
+        color.dim(
+          `Using ${TOKEN_ENV_VAR} from the environment (${describeIdentity(identity)}).`,
+        ),
+      );
       return envToken;
     }
+    // "Create one in the dashboard" was a dead end: the dashboard mints ingest
+    // keys and agent tokens, and neither of those authenticates the CLI. The
+    // only thing that does is a CLI token, and the only thing that makes one is
+    // an interactive login — so say that, and say how to get its value out.
     throw new Error(
       `${TOKEN_ENV_VAR} was set but ${opts.base} rejected it (401). ` +
-        `Check the token value (create one in the dashboard), or point at the ` +
-        `right deployment with --endpoint <url>.`,
+        `It must be a CLI token (starts with \`bl_cli_\`) — an ingest key ` +
+        `(\`ctkey_\`) or an agent token (\`ctagt_\`) will not authenticate the ` +
+        `CLI. Run \`crumbtrail login\` on a machine with a browser, then ` +
+        `\`crumbtrail token\` to print the value to copy into CI. Add ` +
+        `--endpoint <url> if this is not the deployment you logged in to.`,
     );
   }
 
@@ -457,7 +654,12 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
   if (stored && stored.token && stored.endpoint === opts.base) {
     const state = await validateToken(opts.base, stored.token, opts.fetchImpl);
     if (state === "valid") {
-      opts.ui.out(color.dim("Using your saved Crumbtrail login."));
+      const identity = await fetchIdentity(opts.base, stored.token, opts.fetchImpl);
+      opts.ui.out(
+        color.dim(
+          `Using your saved Crumbtrail login (${describeIdentity(identity)}). Run \`crumbtrail logout\` to sign in as somebody else.`,
+        ),
+      );
       return stored.token;
     }
     clearAuth(env);
@@ -471,9 +673,11 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
   if (opts.allowInteractiveLogin === false) {
     throw new Error(
       `No Crumbtrail login available and this shell isn't interactive. ` +
-        `Set ${TOKEN_ENV_VAR}=<your CLI token> (create one in the dashboard) to ` +
-        `run in CI, or run the wizard in an interactive terminal. ` +
-        `Add --endpoint <url> if you point at a self-hosted Crumbtrail.`,
+        `To run in CI: run \`crumbtrail login\` once on a machine with a ` +
+        `browser, print the token with \`crumbtrail token\`, and set it as ` +
+        `${TOKEN_ENV_VAR}. The dashboard's agent tokens are for the MCP server ` +
+        `and are rejected here. Add --endpoint <url> if you point at a ` +
+        `self-hosted Crumbtrail.`,
     );
   }
 

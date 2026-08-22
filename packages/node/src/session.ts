@@ -6,6 +6,7 @@ import {
   normalizePartitionSegment,
   safeRegularFilePath,
 } from "./session-store";
+import { INDEXED_EVENT_KINDS } from "./event-kinds";
 import { postProcess as defaultPostProcess } from "./post-process";
 import type { PostProcessAudioSummary } from "./post-process";
 import {
@@ -40,7 +41,7 @@ export interface SessionFinalizationResult {
     error?: string;
     audio?: PostProcessAudioSummary;
     warnings?: Array<{
-      capability: "audio" | "video";
+      capability: "audio" | "video" | "events";
       code: string;
       message: string;
     }>;
@@ -352,14 +353,16 @@ export class SessionManager {
     }
 
     const audio = await readAudioSummary(sessionDir);
+    const nothingIndexed = await nothingIndexableWarning(sessionDir);
     const warnings = [
       audioDegradationWarning(audio),
       videoDegradationWarning(sessionDir),
+      nothingIndexed,
     ].filter(
       (
         warning,
       ): warning is {
-        capability: "audio" | "video";
+        capability: "audio" | "video" | "events";
         code: string;
         message: string;
       } => warning !== undefined,
@@ -883,6 +886,56 @@ function audioDegradationWarning(
     message:
       audio.transcription.message ??
       "Audio transcription degraded; audio.webm was preserved",
+  };
+}
+
+/**
+ * A session that captured events and indexed none of them.
+ *
+ * `degraded: false` on such a session was the wrong answer: it says the
+ * finalize went fine, and it did — post-process ran, wrote an index, and found
+ * nothing in the batch it could file as an error, a failed request or a
+ * navigation. That is the state a caller most needs to hear about, because it
+ * is what an unrecognized event kind looks like from the far end, and it is
+ * indistinguishable from a healthy quiet session unless somebody says so.
+ */
+async function nothingIndexableWarning(
+  sessionDir: string,
+): Promise<
+  { capability: "events"; code: string; message: string } | undefined
+> {
+  let index: unknown;
+  try {
+    const raw = await defaultSessionStore.readArtifact(
+      sessionDir,
+      "index.json",
+    );
+    index = raw ? JSON.parse(raw.toString("utf-8")) : undefined;
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(index)) return undefined;
+  const events = typeof index.evts === "number" ? index.evts : 0;
+  if (events <= 0) return undefined;
+  const empty = (value: unknown): boolean =>
+    !Array.isArray(value) || value.length === 0;
+  if (!empty(index.errs) || !empty(index.failedReqs) || !empty(index.navs)) {
+    return undefined;
+  }
+  // Empty index lists alone are not a fault: a passive session of clicks and
+  // lifecycle events is quiet, understood, and perfectly healthy. What is a
+  // fault is a session in which NOTHING was a kind this build can do anything
+  // with — the state an unrecognized kind produces, and the one that is
+  // otherwise indistinguishable from that quiet session.
+  const kinds = isRecord(index.stats) ? Object.keys(index.stats).sort() : [];
+  if (kinds.length === 0) return undefined;
+  if (kinds.some((kind) => INDEXED_EVENT_KINDS.has(kind))) return undefined;
+  return {
+    capability: "events",
+    code: "nothing_indexable",
+    message:
+      `Captured ${events} event${events === 1 ? "" : "s"}, and recognized none of them: ` +
+      `${kinds.join(", ")}. Nothing was indexed as an error, a failed request or a navigation.`,
   };
 }
 

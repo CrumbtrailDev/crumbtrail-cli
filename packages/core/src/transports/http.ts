@@ -146,6 +146,30 @@ const MAX_EVENTS_BODY_BYTES = 1_000_000;
  */
 const MAX_BISECT_DEPTH = 6;
 
+/**
+ * A receiver running on this machine — `crumbtrail-node`, which accepts
+ * unauthenticated sessions on purpose. Used only to decide whether a missing
+ * ingest key is worth a console line: on a local receiver it is normal, and
+ * anywhere else it means nothing will be captured.
+ */
+function isLocalEndpoint(endpoint: string): boolean {
+  let host = "";
+  try {
+    host = new URL(endpoint).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "::1" ||
+    host === "[::1]" ||
+    host === "0.0.0.0" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local")
+  );
+}
+
 function utf8ByteLength(text: string): number {
   if (typeof TextEncoder !== "undefined") {
     return new TextEncoder().encode(text).byteLength;
@@ -177,6 +201,24 @@ export class HttpTransport implements CrumbtrailTransport {
   constructor(endpoint: string, options?: HttpTransportOptions) {
     this.endpoint = endpoint.replace(/\/+$/, "");
     this.authToken = options?.authToken;
+    if (!this.authToken && !isLocalEndpoint(this.endpoint)) {
+      // The one line that closes the commonest cold-start dead end.
+      //
+      // Every wizard-written init reads its key from an environment variable,
+      // and a bundler resolves that variable when the dev server BOOTS. A dev
+      // server that was already running when the key was written therefore
+      // compiles `undefined` into the bundle, sends every request unauthorized,
+      // and gets a 401 on session start. The refusal warning below does fire,
+      // but only once traffic happens and without naming the cause, so the
+      // integrator sees a working app, an empty dashboard, and no reason.
+      //
+      // A local receiver is exempt: `crumbtrail-node` accepts unauthenticated
+      // sessions by design, so warning there would be noise on every dev boot.
+      this.warnOnce(
+        "no-auth-token",
+        `Crumbtrail.init() received no ingest key (httpAuthToken is undefined), so ${this.endpoint} will refuse this session and nothing will be captured. The key normally comes from an environment variable that your bundler or runtime reads at STARTUP — set it in your env file and restart the dev server, because a server that is already running will not pick up a new value.`,
+      );
+    }
   }
 
   private withAuthHeaders(
@@ -510,15 +552,23 @@ export class HttpTransport implements CrumbtrailTransport {
     const body = JSON.stringify({ sessionId });
     let response: Response | undefined;
     try {
+      // `keepalive` is what makes this survive an unload. A plain fetch is
+      // cancelled the moment the document goes away, and the sendBeacon
+      // fallback that used to cover that cannot carry `X-Crumbtrail-Auth`, so
+      // on an authenticated project nothing closed the session at all — it sat
+      // unreadable until the idle sweeper reached it, half an hour later. A
+      // keepalive fetch keeps the headers and is well inside the 64KB cap this
+      // body (a session id) uses a few dozen bytes of.
       response = await fetch(`${this.endpoint}/api/session/end`, {
         method: "POST",
         headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
         body,
+        keepalive: true,
       });
     } catch {
-      // A beacon carries no header, so on an authenticated project it cannot
-      // deliver this either. Say so rather than posting a request that will be
-      // refused.
+      // Only reached when keepalive itself is unavailable or refused (an old
+      // engine, or a body over the cap — not this one). A beacon carries no
+      // header, so an authenticated project cannot deliver this either.
       if (this.authToken) {
         this.warnOnce(
           "beacon-auth-end",

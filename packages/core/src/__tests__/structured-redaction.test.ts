@@ -854,10 +854,24 @@ describe("keepFields vs the built-in deny rules", () => {
 describe("query parameters answer to the same keep list", () => {
   afterEach(() => setRedactionKeepFields([]));
 
-  it("redacts every query value by default", () => {
+  it("redacts every undeclared word value by default", () => {
     setRedactionKeepFields([]);
     expect(redactUrl("/api/search?q=widget&productId=1").value).toBe(
-      "/api/search?q=%5BREDACTED%5D&productId=%5BREDACTED%5D",
+      "/api/search?q=%5BREDACTED%5D&productId=1",
+    );
+  });
+
+  it("keeps short plain numbers so pagination survives an empty keep list", () => {
+    setRedactionKeepFields([]);
+    expect(redactUrl("/api/search?page=1&limit=20&offset=0").value).toBe(
+      "/api/search?page=1&limit=20&offset=0",
+    );
+  });
+
+  it("still redacts a number under a sensitive parameter name", () => {
+    setRedactionKeepFields([]);
+    expect(redactUrl("/api/search?token=1&page=1").value).toBe(
+      "/api/search?token=%5BREDACTED%5D&page=1",
     );
   });
 

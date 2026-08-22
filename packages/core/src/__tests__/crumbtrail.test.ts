@@ -916,6 +916,38 @@ describe("Crumbtrail", () => {
       await logger.stop();
     });
 
+    it("ends the session on pagehide, so a closed tab does not wait for the sweeper", async () => {
+      // Nothing else ends a session the host never calls stop() on: the server
+      // reclaimed it through a 30 minute idle sweep checked every 5, so the
+      // session stayed unreadable for over half an hour after the tab closed.
+      const mockTransport = makeMockTransport();
+      const logger = Crumbtrail.init({
+        transportInstance: mockTransport as any,
+        flushIntervalMs: 100_000,
+      });
+
+      window.dispatchEvent(new Event("pagehide"));
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(mockTransport.endSession).toHaveBeenCalledTimes(1);
+      await logger.stop();
+    });
+
+    it("leaves the session open on pagehide when endOnPageHide is off", async () => {
+      const mockTransport = makeMockTransport();
+      const logger = Crumbtrail.init({
+        transportInstance: mockTransport as any,
+        flushIntervalMs: 100_000,
+        endOnPageHide: false,
+      });
+
+      window.dispatchEvent(new Event("pagehide"));
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(mockTransport.endSession).not.toHaveBeenCalled();
+      await logger.stop();
+    });
+
     it("stop() removes the severity tap and the pagehide listener", async () => {
       const mockTransport = makeMockTransport();
       const logger = Crumbtrail.init({

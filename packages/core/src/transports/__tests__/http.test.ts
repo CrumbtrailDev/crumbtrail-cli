@@ -180,6 +180,8 @@ describe("HttpTransport", () => {
     await transport.startSession("ses_test", {});
     await transport.endSession("ses_test");
 
+    // keepalive is what lets this survive an unload while still carrying the
+    // ingest key, which the sendBeacon fallback could never do.
     expect(fetch).toHaveBeenCalledWith(`${endpoint}/api/session/end`, {
       method: "POST",
       headers: {
@@ -187,6 +189,7 @@ describe("HttpTransport", () => {
         "X-Crumbtrail-Auth": "test-token",
       },
       body: JSON.stringify({ sessionId: "ses_test" }),
+      keepalive: true,
     });
   });
 
