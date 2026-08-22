@@ -2524,7 +2524,7 @@ export class McpServer {
         );
       }
       return errorResult(
-        "No finalized session with error-class evidence found under the configured read store; use listSessions to inspect recorded sessions.",
+        `No finalized session with error-class evidence found in ${this.store.describe()}. Use listSessions to inspect recorded sessions.`,
       );
     }
     return this.toolGetFixContext({ ...args, sessionId: latest.id });

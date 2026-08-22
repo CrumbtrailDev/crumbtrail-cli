@@ -46,6 +46,9 @@ setup wizard will not wire an app against a package it cannot resolve.
 npx crumbtrail
 ```
 
+Needs Node 22.15 or newer. On an older Node this fails with npm's own
+`EBADENGINE` before the wizard prints anything.
+
 The wizard detects your stack, installs the right packages, and injects the
 setup code for you. For Express backends it wires both crash capture and the
 request and error middleware, so backend request spans link up with frontend
@@ -56,14 +59,38 @@ sessions out of the box.
 Crumbtrail MCP retrieves context for resolving bugs. It is read only: it can
 retrieve captured evidence and configured reference context, but it cannot
 edit code, change bug state, run commands, drive a browser, or authorize an
-action. Configure a client with the published Node package:
+action.
+
+If you capture to Crumbtrail cloud, point the client straight at it. Nothing to
+install, and nothing running on your machine. Generate the `ctagt_` token in the
+dashboard under Settings, Projects and keys, Agent access:
+
+```json
+{
+  "mcpServers": {
+    "crumbtrail": {
+      "type": "http",
+      "url": "https://your-crumbtrail-host/mcp",
+      "headers": { "Authorization": "Bearer <the ctagt_ token>" }
+    }
+  }
+}
+```
+
+To run the server locally instead, pass the same cloud credentials through the
+environment. Without them the server reads the sessions on your own disk, which
+is the right answer only if that is where you captured them:
 
 ```json
 {
   "mcpServers": {
     "crumbtrail": {
       "command": "npx",
-      "args": ["-y", "--package", "crumbtrail-node", "crumbtrail-server", "serve", "--mcp"]
+      "args": ["-y", "--package", "crumbtrail-node", "crumbtrail-server", "--mcp"],
+      "env": {
+        "CRUMBTRAIL_CLOUD_URL": "https://your-crumbtrail-host",
+        "CRUMBTRAIL_CLOUD_TOKEN": "<the ctagt_ token>"
+      }
     }
   }
 }
@@ -129,7 +156,7 @@ Runnable end-to-end examples live in [`examples/`](examples):
 
 ## Development
 
-Requires Node 20+ and pnpm.
+Requires Node 22.15+ and pnpm, matching the floor the published packages declare.
 
 ```bash
 pnpm install

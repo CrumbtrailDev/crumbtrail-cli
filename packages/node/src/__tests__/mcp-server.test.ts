@@ -2416,8 +2416,14 @@ describe("MCP Server", () => {
       const { result } = await callTool("getLatestIssue", {});
       expect(result.isError).toBe(true);
       expect(result.content[0].text).toContain(
-        "No finalized session with error-class evidence found under",
+        "No finalized session with error-class evidence found in",
       );
+      // The empty answer names which store it read. The same sentence for the
+      // cloud tenant and for the local disk has opposite next steps, and a
+      // client configured with no cloud credentials reads the local disk
+      // silently.
+      expect(result.content[0].text).toContain("local session directory");
+      expect(result.content[0].text).toContain("CRUMBTRAIL_CLOUD_URL");
       expect(result.content[0].text).toContain("listSessions");
     });
 

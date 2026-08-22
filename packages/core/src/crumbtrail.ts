@@ -316,9 +316,11 @@ export class Crumbtrail {
     this.ringBuffer = ringBuffer;
     this.sessionId = sessionId;
     this.remotePolicyReady = !remoteConfigProjectKey(config);
-    this.consentGranted =
-      config.consentMode === "implicit" &&
-      !(config.respectGpc && hasGlobalPrivacyControl());
+    const gpcSuppressed = Boolean(
+      config.respectGpc && hasGlobalPrivacyControl(),
+    );
+    if (gpcSuppressed) warnGpcSuppressedCapture();
+    this.consentGranted = config.consentMode === "implicit" && !gpcSuppressed;
     this.samplingShed = !isSampled(config.captureSampleRate);
     this.baselineSampled =
       !this.samplingShed && isSampled(config.baselineSampleRate);
@@ -1160,6 +1162,8 @@ export class Crumbtrail {
       this.explicitConsent ??
       (this.config.consentMode === "implicit" &&
         !(this.config.respectGpc && hasGlobalPrivacyControl()));
+    if (this.config.respectGpc && hasGlobalPrivacyControl())
+      warnGpcSuppressedCapture();
     if (nextConsent === this.consentGranted) return;
     this.consentGranted = nextConsent;
     if (!nextConsent) {
@@ -1804,6 +1808,36 @@ function pickKeys(
       out[key] = source[key];
   }
   return out;
+}
+
+/**
+ * Say, once, that the reader's own browser turned capture off.
+ *
+ * `respectGpc` defaults on, and Brave and DuckDuckGo send Global Privacy
+ * Control by default, so an integrator on one of those browsers had a correct
+ * install, a green setup wizard and permanently empty capture, with no line
+ * anywhere naming the cause. The transport never gets a chance to complain
+ * because nothing is ever handed to it. Never throws: a host with an unusual
+ * console must not be taken down by a diagnostic.
+ */
+let gpcWarned = false;
+function warnGpcSuppressedCapture(): void {
+  if (gpcWarned) return;
+  gpcWarned = true;
+  try {
+    if (typeof console !== "undefined" && typeof console.warn === "function") {
+      console.warn(
+        "[crumbtrail] this browser sends Global Privacy Control, so nothing is being captured. Some browsers send it by default. Set respectGpc: false in the init config to capture anyway, or use a browser that does not send it.",
+      );
+    }
+  } catch {
+    // Diagnostics never break the host page.
+  }
+}
+
+/** Test seam: the warning is once per page, and a suite is one page. */
+export function __resetGpcWarningForTests(): void {
+  gpcWarned = false;
 }
 
 function hasGlobalPrivacyControl(): boolean {
