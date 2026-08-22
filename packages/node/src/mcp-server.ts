@@ -1369,6 +1369,21 @@ function imageResult(base64Data: string, mimeType = "image/jpeg") {
 }
 
 /**
+ * What a failed session read actually means.
+ *
+ * Every artifact failure — a 404, a rejected token, an exhausted read quota, an
+ * artifact over the body limit, a timeout — arrives at the tools as the same
+ * `undefined`, and the tools used to render all of it as the flat assertion
+ * "Session not found". The most common cause is the one that sentence hides:
+ * an agent token scoped to project A reading a session in project B is refused
+ * as a 404, so the reader is told the session does not exist while looking
+ * straight at it in the dashboard. This message asserts only what is known and
+ * names the causes worth checking.
+ */
+const SESSION_UNREADABLE =
+  "Could not read that session. This is every read failure, not proof the session is gone: the id may not exist in the configured store, it may have aged past the project's retention window, the artifact may be over the read size limit, the read quota may be exhausted, or the agent token may be scoped to a different project than the session. A project scoped token is refused for another project's session in exactly the same way a missing session is, so check the token's project scope before concluding the session was deleted.";
+
+/**
  * Says what stopped the read and what to do about it. Each reason is a
  * different next step, which is the whole reason the store reports one.
  */
@@ -2557,7 +2572,7 @@ export class McpServer {
     const legacy = await this.readJsonRecordAsync(dir, "diagnosis.json");
     if (legacy) return textResult(normalizeAiOpinion(legacy));
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
     return errorResult("No opinion generated yet for this session.");
   }
 
@@ -2630,7 +2645,7 @@ export class McpServer {
       !(await this.sessionExistsAsync(aDir)) ||
       !(await this.sessionExistsAsync(bDir))
     )
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
     if (!(this.store instanceof FilesystemMcpReadStore)) {
       return errorResult(
         "getRegressionContext is unavailable for remote artifact stores; use getSessionManifest/getWindow/getEvidence to compare retrieved evidence without local-disk fallback.",
@@ -2665,7 +2680,7 @@ export class McpServer {
       return errorResult("sessionId is required");
     const dir = await this.sessionDirAsync(args.sessionId as string);
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
     const bugs = await this.readDistinctBugsAsync(dir);
     return textResult(
       bugs
@@ -2729,7 +2744,7 @@ export class McpServer {
   private async toolGetBug(args: Record<string, unknown>) {
     const dir = await this.sessionDirAsync(args.sessionId as string);
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
     const bugId = args.bugId as string;
     const bug = (await this.readDistinctBugsAsync(dir)).find(
       (entry) => stringField(entry.bugId) === bugId,
@@ -2929,7 +2944,7 @@ export class McpServer {
         const found = (await store.listSessions()).find(
           (session) => session.id === sessionId,
         );
-        if (!found) return errorResult(`Session not found: ${sessionId}`);
+        if (!found) return errorResult(`${SESSION_UNREADABLE} Session id: ${sessionId}.`);
         profile = await sessionIssueProfile(found.dir, store);
         excludeSessionId = sessionId;
       } else if (text) {
@@ -3696,7 +3711,7 @@ export class McpServer {
     const events = await this.readColdEventsAsync(dir);
     if (events === undefined) {
       if (!(await this.sessionExistsAsync(dir)))
-        return errorResult("Session not found");
+        return errorResult(SESSION_UNREADABLE);
       const empty = {
         sessionId: args.sessionId,
         t0: Math.min(t0, t1),
@@ -3749,8 +3764,7 @@ export class McpServer {
   /**
    * Detector free window scoring. Reads the SAME cold stream as getWindow, and
    * reads it the same way: `this.store` only, never `fs`. A direct fs read here
-   * would work on a developer's laptop and return "Session not found" for every
-   * hosted session, because in cloud mode the artifacts live behind
+   * would work on a developer's laptop and refuse every hosted session as unreadable, because in cloud mode the artifacts live behind
    * RemoteMcpReadStore and nothing is on disk to find.
    */
   private async toolGetWindowCorrelation(args: Record<string, unknown>) {
@@ -3766,7 +3780,7 @@ export class McpServer {
 
     const events = await this.readColdEventsAsync(dir);
     if (events === undefined && !(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
 
     const requestedMultiplier = numberField(args.baselineMultiplier);
     const baselineMultiplier =
@@ -3831,7 +3845,7 @@ export class McpServer {
     // an 82-scored symptom of `attributionConfidence: low`.
     if (!isNonEmptyString(ref)) {
       if (!(await this.sessionExistsAsync(dir)))
-        return errorResult("Session not found");
+        return errorResult(SESSION_UNREADABLE);
       const top = candidates[0];
       return textResult(
         attachTokenEstimate(
@@ -3915,7 +3929,7 @@ export class McpServer {
     }
 
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
 
     return textResult(
       attachTokenEstimate({
@@ -4072,7 +4086,7 @@ export class McpServer {
     const signature = stringField(args.signature) ?? stringField(args.sig);
     const dir = await this.sessionDirAsync(sessionId);
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
     if (!signature)
       return errorResult(
         "resolveSignature requires a non-empty signature string",
@@ -4101,7 +4115,7 @@ export class McpServer {
     const sessionId = args.sessionId as string;
     const dir = await this.sessionDirAsync(sessionId);
     if (!(await this.sessionExistsAsync(dir)))
-      return errorResult("Session not found");
+      return errorResult(SESSION_UNREADABLE);
 
     const text = stringField(args.text)?.trim().toLowerCase();
     const role = (stringField(args.role) ?? stringField(args.tag))

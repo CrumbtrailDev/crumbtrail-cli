@@ -275,7 +275,7 @@ describe("MCP hierarchical retrieval", () => {
       sessionId: "nope",
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Session not found");
+    expect(result.content[0].text).toContain("Could not read that session");
   });
 
   it("getWindow bounds events by [t0,t1] (absolute ms)", async () => {
@@ -370,7 +370,7 @@ describe("MCP hierarchical retrieval", () => {
       t1: 1,
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Session not found");
+    expect(result.content[0].text).toContain("Could not read that session");
   });
 
   it("getEvidence resolves by candidate id", async () => {
@@ -423,7 +423,7 @@ describe("MCP hierarchical retrieval", () => {
       ref: "cand_0001",
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Session not found");
+    expect(result.content[0].text).toContain("Could not read that session");
   });
 
   it("snake_case aliases dispatch to the same handlers", async () => {
