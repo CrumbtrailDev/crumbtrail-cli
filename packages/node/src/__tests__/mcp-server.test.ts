@@ -1394,7 +1394,7 @@ describe("MCP Server", () => {
 
     const result = res!.result as any;
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("Could not read that session");
+    expect(result.content[0].text).toContain("Session not found");
   });
 
   it("getLinkedRequestContext degrades malformed fullStackRequests shapes to unavailable", async () => {
@@ -1777,14 +1777,14 @@ describe("MCP Server", () => {
       // valid session with no events.
       const missSession = await callTool("getEvents", { sessionId: "ghost" });
       expect(missSession.result.isError).toBe(true);
-      expect(missSession.result.content[0].text).toContain("Could not read that session");
+      expect(missSession.result.content[0].text).toContain("Session not found");
 
       // Session failedRequests discovers the missing session via index.json.
       const missFR = await callTool("getFailedRequests", {
         sessionId: "ghost",
       });
       expect(missFR.result.isError).toBe(true);
-      expect(missFR.result.content[0].text).toContain("Could not read that session");
+      expect(missFR.result.content[0].text).toContain("Session not found");
     });
   });
 
