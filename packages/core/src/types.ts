@@ -839,8 +839,9 @@ export interface CrumbtrailConfig {
   flushIntervalMs: number;
   flushBufferSize: number;
   /**
-   * Close the session when the page goes away (`pagehide`: tab close,
-   * navigation, bfcache entry). On by default in a browser.
+   * Close the session when the page goes away (`pagehide`: tab close or
+   * navigation) or becomes hidden (`visibilitychange`). A bfcache entry keeps
+   * the session open. On by default in a browser.
    *
    * Without it nothing ends a session that the host never calls `stop()` on,
    * and the server only reclaims it through the idle sweeper — 30 minutes of

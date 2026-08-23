@@ -36,6 +36,16 @@ Crumbtrail.init({
 
 That's the whole integration — capture runs in the background from there.
 
+### Leaving the page
+
+In a browser, `pagehide` and `visibilitychange` close the current session when
+the page is closed, navigated away from, or sent to the background. Final event
+batches are delivered with a lifecycle safe request. A page entering the back
+forward cache keeps its session open, so returning to it does not lose the rest
+of the visit. A page that was already closed and then becomes visible again
+starts a new session. Set `endOnPageHide: false` only when your application
+owns session boundaries and will call `stop()` itself.
+
 ### Catching the requests that beat init
 
 `init()` usually runs from an async import, so the fetches that render the

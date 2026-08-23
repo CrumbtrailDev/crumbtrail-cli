@@ -948,6 +948,56 @@ describe("Crumbtrail", () => {
       await logger.stop();
     });
 
+    it("keeps a back forward cache visit open", async () => {
+      const mockTransport = makeMockTransport();
+      const logger = Crumbtrail.init({
+        transportInstance: mockTransport as any,
+        flushIntervalMs: 100_000,
+      });
+      const pagehide = new Event("pagehide") as Event & {
+        persisted?: boolean;
+      };
+      pagehide.persisted = true;
+
+      window.dispatchEvent(pagehide);
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(mockTransport.endSession).not.toHaveBeenCalled();
+      await logger.stop();
+    });
+
+    it("ends a session when a page stays hidden and starts a new visit when it returns", async () => {
+      const mockTransport = makeMockTransport();
+      const logger = Crumbtrail.init({
+        transportInstance: mockTransport as any,
+        flushIntervalMs: 100_000,
+      });
+      const previousVisibility = document.visibilityState;
+      try {
+        Object.defineProperty(document, "visibilityState", {
+          configurable: true,
+          value: "hidden",
+        });
+        document.dispatchEvent(new Event("visibilitychange"));
+        await new Promise((r) => setTimeout(r, 0));
+        expect(mockTransport.endSession).toHaveBeenCalledTimes(1);
+
+        Object.defineProperty(document, "visibilityState", {
+          configurable: true,
+          value: "visible",
+        });
+        document.dispatchEvent(new Event("visibilitychange"));
+        await new Promise((r) => setTimeout(r, 0));
+        expect(mockTransport.startSession).toHaveBeenCalledTimes(2);
+      } finally {
+        Object.defineProperty(document, "visibilityState", {
+          configurable: true,
+          value: previousVisibility,
+        });
+        await logger.stop();
+      }
+    });
+
     it("stop() removes the severity tap and the pagehide listener", async () => {
       const mockTransport = makeMockTransport();
       const logger = Crumbtrail.init({
@@ -1019,6 +1069,53 @@ describe("stop() delivery ordering", () => {
     releaseSend();
     await stopping;
     expect(order.indexOf("send:done")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("endSession")).toBeGreaterThan(
+      order.indexOf("send:done"),
+    );
+  });
+
+  it("awaits in-flight event batches before a hidden page ends the session", async () => {
+    const order: string[] = [];
+    let releaseSend: () => void = () => {};
+    const sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    const transport = {
+      async sendEvents() {
+        order.push("send:start");
+        await sendGate;
+        order.push("send:done");
+      },
+      async sendBlob() {},
+      async startSession() {},
+      async endSession() {
+        order.push("endSession");
+      },
+      async sendBugReport() {},
+    };
+    const logger = Crumbtrail.init({
+      transportInstance: transport,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1000,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    logger.mark("tail event");
+    const previousVisibility = document.visibilityState;
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(order).toContain("send:start");
+    expect(order).not.toContain("endSession");
+    releaseSend();
+    await logger.stop();
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: previousVisibility,
+    });
     expect(order.indexOf("endSession")).toBeGreaterThan(
       order.indexOf("send:done"),
     );
