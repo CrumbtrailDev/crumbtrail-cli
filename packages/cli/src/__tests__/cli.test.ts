@@ -432,6 +432,7 @@ describe("wizard orchestration", () => {
       "install",
       "execute",
       "mint-key",
+      "preflight",
       "poll",
     ]);
     const out = lines.join("\n");
@@ -527,8 +528,68 @@ describe("wizard orchestration", () => {
     const out = lines.join("\n");
     expect(out).toContain("Left your code untouched");
     expect(out).toContain("not published on pub.dev");
+    expect(steps).not.toContain("mint-key");
+    expect(out).toMatch(/setup incomplete/i);
     // And no countdown on an event that cannot arrive.
     expect(steps).not.toContain("poll");
+  });
+
+  it("probes a written key and reports a rejected key before waiting", async () => {
+    const steps: string[] = [];
+    const { ui, lines } = captureUi();
+    const pollForRealEvent = vi.fn(async () => {
+      steps.push("poll");
+      return { outcome: "timedout" as const };
+    }) as unknown as WizardDeps["pollForRealEvent"];
+    const runPreflight = vi.fn(async () => {
+      steps.push("preflight");
+      return {
+        ok: false,
+        endpoint: "http://127.0.0.1:9999",
+        stages: [
+          {
+            stage: "auth" as const,
+            status: "fail" as const,
+            reason:
+              "ingest key rejected: key belongs to another project (HTTP 401)",
+            ms: 1,
+          },
+        ],
+      };
+    }) as unknown as WizardDeps["runPreflight"];
+    const deps = makeDeps({ steps }, { ui, pollForRealEvent, runPreflight });
+
+    await runCli(["node", "cli"], deps);
+
+    expect(steps).toContain("mint-key");
+    expect(steps).toContain("preflight");
+    expect(steps).not.toContain("poll");
+    expect(lines.join("\n")).toContain("key belongs to another project");
+    expect(lines.join("\n")).toContain("First-event wait skipped");
+  });
+
+  it("does not wait for a Tauri cloud event", async () => {
+    const steps: string[] = [];
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps },
+      {
+        ui,
+        detect: vi.fn(() => detectResult({ recipe: "tauri" })),
+        buildPlan: vi.fn(() => ({
+          recipe: "tauri",
+          kind: "create" as const,
+          targetPath: "/app/src/main.ts",
+          content: "// tauri init",
+          warnings: ["Complete the Rust plugin steps."],
+        })) as unknown as WizardDeps["buildPlan"],
+      },
+    );
+
+    await runCli(["node", "cli"], deps);
+
+    expect(steps).not.toContain("poll");
+    expect(lines.join("\n")).toContain("stores events locally");
   });
 
   it("plans before install, installs before executing (build<install<execute)", async () => {
@@ -1120,6 +1181,37 @@ describe("batch installer (monorepo root)", () => {
     expect(lines.join("\n")).toContain("already wired");
   });
 
+  it("does not wait for a Tauri service in the cloud poll", async () => {
+    const steps: string[] = [];
+    const dir = "/app/apps/desktop";
+    const deps = batchDeps(
+      steps,
+      [
+        candidate({
+          relDir: "apps/desktop",
+          recipe: "tauri",
+          detected: detectResult({ cwd: dir, recipe: "tauri" }),
+        }),
+      ],
+      {
+        buildPlan: vi.fn(() => ({
+          recipe: "tauri" as const,
+          kind: "create" as const,
+          targetPath: `${dir}/src/main.ts`,
+          content: "// tauri init",
+          warnings: [],
+        })) as unknown as WizardDeps["buildPlan"],
+      },
+    );
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    await runCli(["node", "cli"], deps);
+
+    expect(steps).not.toContain("poll");
+    expect(lines.join("\n")).toContain("stores events locally");
+  });
+
   it("writes a guide file for an OTLP service and never spawns a package manager", async () => {
     const steps: string[] = [];
     const spawnFn = vi.fn(() => 0);
@@ -1509,14 +1601,17 @@ describe("wizard — --workspace targeting (BUG-6)", () => {
   });
 });
 
-describe("wizard — dirty-file decline notes SDK install (BUG-8)", () => {
-  it("states the SDK was already installed and package.json changed on a decline", async () => {
+describe("wizard — dirty-file decline covers the complete local setup", () => {
+  it("leaves SDK, package.json, env, and key untouched on a decline", async () => {
     const steps: string[] = [];
     const { ui, lines } = captureUi();
+    const confirm = vi.fn(async () => false);
+    const envFileIO = fakeEnvIO();
     const deps = makeDeps(
       { steps },
       {
         ui,
+        envFileIO,
         buildPlan: vi.fn(() => {
           steps.push("build");
           return {
@@ -1531,19 +1626,23 @@ describe("wizard — dirty-file decline notes SDK install (BUG-8)", () => {
           steps.push("install");
           return { installed: true, packages: ["crumbtrail-core"] };
         }),
-        // Decline the "prepend into a dirty file?" confirmation.
-        prompter: { ...noopPrompter, confirm: async () => false },
+        prompter: { ...noopPrompter, confirm },
       },
     );
     const code = await runCli(["node", "cli"], deps);
     expect(code).toBe(0);
-    // The decline path never writes the file.
+    // The decline is asked before installSdk, so no local setup write runs.
     expect(steps).not.toContain("execute");
+    expect(steps).not.toContain("install");
+    expect(steps).not.toContain("mint-key");
+    expect(envFileIO.files.size).toBe(0);
     const out = lines.join("\n");
-    expect(out).toContain("crumbtrail-core");
-    expect(out).toContain("package.json");
-    expect(out).toMatch(/already installed/i);
-    expect(out).toMatch(/manual/i);
+    expect(confirm).toHaveBeenCalledWith(
+      expect.stringContaining("No leaves all local files unchanged"),
+      false,
+    );
+    expect(out).toMatch(/no ingest key was minted/i);
+    expect(out).toMatch(/setup incomplete/i);
   });
 });
 

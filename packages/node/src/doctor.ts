@@ -7,6 +7,7 @@ import {
   buildBackendRequestErrorEvent,
   buildBackendRequestStartEvent,
 } from "./backend-events";
+import { isDoctorProbeSessionId } from "./doctor-probes";
 import { McpServer } from "./mcp-server";
 import { createServer } from "./server";
 
@@ -35,7 +36,6 @@ export function evaluateDoctor(checks: DoctorCheck[]): DoctorReport {
   return { ok: failed === 0, checks, summary };
 }
 
-const PROBE_SESSION_PREFIXES = ["ses_probe_", "ses_otlp_probe_"];
 const COMPUTED_IMPORT = /import\(\s*(?!'crumbtrail-core'\s*\))/m;
 
 /** Static check: generated browser wiring must use a literal crumbtrail-core specifier. */
@@ -100,12 +100,7 @@ export function countBrowserSessions(outputDir: string): number {
       if (!entry.isDirectory()) continue;
       const full = path.join(dir, entry.name);
       if (fs.existsSync(path.join(full, "meta.json"))) {
-        if (
-          !PROBE_SESSION_PREFIXES.some((prefix) =>
-            entry.name.startsWith(prefix),
-          )
-        )
-          count += 1;
+        if (!isDoctorProbeSessionId(entry.name)) count += 1;
       } else {
         stack.push(full);
       }

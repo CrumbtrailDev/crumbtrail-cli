@@ -1214,7 +1214,11 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
     expectNoKeyLiteral(plan.snippet);
     // Agent prompt routes to the no-SDK OTLP variant (no PRESET_PASSIVE).
     expect(plan.agentPrompt).toContain(ENDPOINT);
-    expect(plan.agentPrompt).toContain(KEY_PLACEHOLDER);
+    // The coding-agent hand-off uses the runtime env var instead of carrying
+    // even the placeholder key into the prompt.
+    expect(plan.agentPrompt).not.toContain(KEY_PLACEHOLDER);
+    expect(plan.agentPrompt).toContain("CRUMBTRAIL_KEY");
+    expect(plan.agentPrompt).toContain("sessionless OTLP is accepted");
     expect(plan.agentPrompt).not.toContain("PRESET_PASSIVE");
     // otlp injects no key via an env var — it uses OTLP headers instead.
     expect(plan.keyEnvVar).toBeUndefined();
@@ -1643,11 +1647,8 @@ describe("buildPlan — Express middleware reaches the key in .env", () => {
   });
 
   it("loads .env.local as well as .env", () => {
-    // chooseEnvFile prefers an existing .env.local for any variable, including
-    // the non-bundled CRUMBTRAIL_KEY, while a bare loadEnvFile() reads .env
-    // only. Any Express repo that already had a .env.local therefore got a
-    // green "wrote CRUMBTRAIL_KEY", a green "Setup complete", and a backend
-    // posting with no auth header.
+    // The installer prefers .env for a server key, but an existing .env.local
+    // remains a supported fallback and the preload must load both candidates.
     const content = expressPlan(ESM_ENTRY).content as string;
     expect(content).toContain('".env.local"');
     expect(content).toContain('".env"');

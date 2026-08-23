@@ -55,6 +55,7 @@ import {
   buildEnvKeyEdits,
   defaultEnvFileIO,
   planEnvKeyWrite,
+  readEnvVar,
   type EnvFileIO,
   type EnvKeyPlan,
 } from "./env-file";
@@ -803,14 +804,21 @@ export async function runWizard(
 
   // 5. Install the SDK (repo-mutating: adds deps to package.json).
   ui.out(step(4, TOTAL_STEPS, "Install the SDK"));
-  const install = await deps.installSdk({
-    cwd,
-    packageManager: result.packageManager,
-    recipe: result.recipe,
-    base,
-    ui,
-    fetchImpl: deps.fetchImpl,
-  });
+  // The dirty-file prompt governs the whole local setup transaction. Asking it
+  // after installSdk used to leave package.json changed, and the later env-key
+  // write still happened after a "No". Review every local write first so a
+  // decline really means hands-off.
+  const injectionDecision = await confirmInjection(plan, parsed, deps);
+  const install: InstallSdkResult = injectionDecision.approved
+    ? await deps.installSdk({
+        cwd,
+        packageManager: result.packageManager,
+        recipe: result.recipe,
+        base,
+        ui,
+        fetchImpl: deps.fetchImpl,
+      })
+    : { installed: false, packages: [] };
   if (install.installed) {
     ui.out(ok(`Installed ${color.bold(install.packages.join(", "))}.`));
   } else if (install.note) {
@@ -818,31 +826,51 @@ export async function runWizard(
   }
 
   // 6. Inject — the LAST repo-mutating step, applying the pre-computed plan via
-  // CP3's executor. The install result rides along so a dirty-file decline can
-  // tell the user their package.json already changed (partial state).
+  // CP3's executor. The install result still guards against imports for an SDK
+  // that failed to install.
   ui.out(step(5, TOTAL_STEPS, "Wire it into your code"));
-  const inject = await applyInjection(plan, parsed, deps, {
-    installed: install.installed,
-    packages: install.packages,
-  });
+  const inject = await applyInjection(
+    plan,
+    parsed,
+    deps,
+    {
+      installed: install.installed,
+      packages: install.packages,
+    },
+    {
+      dirtyDecision: injectionDecision.approved,
+      warningsPrinted: true,
+    },
+  );
 
   // 7. The ingest key. Last of the repo-mutating steps and separate from the
   // injection apply on purpose: if this fails, the wiring above is still
   // correct and worth keeping, so it reports rather than rolling anything back.
-  const keyWrite = await writeIngestKey({
-    base,
-    token,
-    projectId: provisioned.projectId,
-    projectName: provisioned.projectName,
-    appDir: cwd,
-    repoRoot: cwd,
-    // A compile-time key (Flutter) has no env file to live in. Writing one
-    // would mint a live credential into a file the app never reads, and every
-    // line printed after it would report success for an app capturing nothing.
-    varName: plan.keyIsCompileTime ? undefined : plan.keyEnvVar,
-    parsed,
-    deps,
-  });
+  const sdkInstallFailed = !install.installed && install.packages.length > 0;
+  const keyWrite =
+    !sdkInstallFailed &&
+    inject.outcome !== "withheld" &&
+    inject.outcome !== "declined"
+      ? await writeIngestKey({
+          base,
+          token,
+          projectId: provisioned.projectId,
+          projectName: provisioned.projectName,
+          appDir: cwd,
+          repoRoot: cwd,
+          // A compile-time key (Flutter) has no env file to live in. Writing one
+          // would mint a live credential into a file the app never reads, and every
+          // line printed after it would report success for an app capturing nothing.
+          varName: plan.keyIsCompileTime ? undefined : plan.keyEnvVar,
+          parsed,
+          deps,
+        })
+      : skippedKeyWrite(
+          plan.keyEnvVar,
+          inject.outcome === "declined"
+            ? "No ingest key was minted because the local wiring changes were declined."
+            : "No ingest key was minted because the SDK was not installed and the app was not wired.",
+        );
 
   // 8. Next steps. With the key on disk the first-event wait is a real wait on
   // the app starting, rather than a wait on a manual step nobody was told to do.
@@ -867,7 +895,8 @@ export async function runWizard(
   // Nothing was installed and nothing was wired, so no event can arrive. Waiting
   // for one would spend the user's time on a countdown with a foregone answer,
   // and end on "no event yet" as though they had done something wrong.
-  const nothingWired = !install.installed && install.packages.length > 0;
+  const nothingWired = sdkInstallFailed || inject.outcome === "declined";
+  const cloudEventUnavailable = result.recipe === "tauri";
   // Nothing reached the user's entry file: the plan fell back to a snippet
   // they were asked to paste, or they declined the prepend. The key is on
   // disk and the SDK is installed, so waiting is still right — they may paste
@@ -880,7 +909,13 @@ export async function runWizard(
     notes.push("Verification skipped (--skip-verify).");
   } else if (nothingWired) {
     notes.push(
-      "Nothing is wired yet, so there is no first event to wait for. Install the SDK, then run `npx crumbtrail` again.",
+      inject.outcome === "declined"
+        ? "Nothing was changed, so there is no first event to wait for. Add the snippet above when you are ready, then run `npx crumbtrail` again."
+        : "Nothing is wired yet, so there is no first event to wait for. Install the SDK, then run `npx crumbtrail` again.",
+    );
+  } else if (cloudEventUnavailable) {
+    notes.push(
+      "Tauri stores events locally through its Rust plugin; it does not send a cloud event for this wizard to wait for. Complete the Rust plugin and permission steps above, then inspect the local session store.",
     );
   } else {
     ui.out(step(6, TOTAL_STEPS, "Catch your first event"));
@@ -893,6 +928,27 @@ export async function runWizard(
           : `${setKeyHint} — mint one at ${appUrl(appBase, "/settings", provisioned.projectId)}, then start your app.`,
       ),
     );
+    const keyProbe = await probeWrittenKey(base, keyWrite, deps);
+    if (keyProbe && !keyProbe.ok) {
+      notes.push(
+        `First-event wait skipped — ${preflightFailureReason(keyProbe)}.`,
+      );
+      printEvidenceSourcesPointer(ui, base, provisioned.projectId);
+      printSummary(
+        ui,
+        base,
+        provisioned,
+        inject.filesTouched,
+        notes,
+        plan.keyEnvVar,
+        sessionUrl,
+        keyWrite,
+        cwd,
+        plan.keyIsCompileTime,
+        inject.outcome === "withheld" || inject.outcome === "declined",
+      );
+      return 0;
+    }
     const poll = await pollWithSigint(
       base,
       token,
@@ -958,6 +1014,7 @@ export async function runWizard(
     keyWrite,
     cwd,
     plan.keyIsCompileTime,
+    inject.outcome === "withheld" || inject.outcome === "declined",
   );
   return 0;
 }
@@ -1328,14 +1385,20 @@ export async function runBatchWizard(
         defaultInjectIO,
       );
 
-      const install = await deps.installSdk({
-        cwd: c.dir,
-        packageManager: c.detected.packageManager ?? ctx.root.packageManager,
-        recipe,
-        base,
-        ui,
-        fetchImpl: deps.fetchImpl,
-      });
+      // Ask about the complete local transaction before installing dependencies
+      // or touching an env file. A decline of the entry-file edit must not
+      // leave package.json or a live key behind.
+      const injectionDecision = await confirmInjection(plan, parsed, deps);
+      const install: InstallSdkResult = injectionDecision.approved
+        ? await deps.installSdk({
+            cwd: c.dir,
+            packageManager: c.detected.packageManager ?? ctx.root.packageManager,
+            recipe,
+            base,
+            ui,
+            fetchImpl: deps.fetchImpl,
+          })
+        : { installed: false, packages: [] };
       if (install.installed) {
         ui.out(ok(`Installed ${color.bold(install.packages.join(", "))}.`));
       } else if (install.note) {
@@ -1350,6 +1413,8 @@ export async function runBatchWizard(
           installed: install.installed,
           packages: install.packages,
         },
+        dirtyDecision: injectionDecision.approved,
+        warningsPrinted: true,
       });
       outcomes.push({
         name: svc.serviceName,
@@ -1385,6 +1450,7 @@ export async function runBatchWizard(
   const reporting = outcomes.filter(
     (o) => o.status === "wired" || o.status === "guidance",
   );
+  const cloudReporting = reporting.filter((o) => o.recipe !== "tauri");
   const batchNotes: string[] = [];
 
   // 6. The ingest key: one for the project, written into every wired service's
@@ -1413,7 +1479,7 @@ export async function runBatchWizard(
     // One note for the run, not one per service — the same line repeated N
     // times is noise, not information.
     batchNotes.push("Verification skipped (--skip-verify).");
-  } else if (reporting.length > 0) {
+  } else if (cloudReporting.length > 0) {
     // User-facing links point at the app host (the SPA), not the API host.
     const appBase = appBaseFor(base, deps.env);
     for (const o of reporting) {
@@ -1429,52 +1495,74 @@ export async function runBatchWizard(
       }
     }
 
+    const probeKey = [...keyWrites.values()].find((write) => write.probeKey);
+    const keyProbe = probeKey
+      ? await probeWrittenKey(base, probeKey, deps)
+      : undefined;
     const byServiceId = new Map(
-      reporting
+      cloudReporting
         .filter((o) => o.serviceId)
         .map((o) => [o.serviceId as string, o]),
     );
-    const poll = await pollServicesWithSigint(
-      {
-        base,
-        token,
-        projectId: project.id,
-        ui,
-        wizardStart,
-        serviceIds: [...byServiceId.keys()],
-        onFound: (serviceId, sessionId) => {
-          const o = byServiceId.get(serviceId);
-          if (!o) return;
-          o.sessionUrl = appUrl(
-            appBase,
-            `/sessions/${encodeURIComponent(sessionId)}`,
-            project.id,
-          );
-          ui.out(ok(`${color.bold(o.name)}: first event received.`));
+    if (keyProbe && !keyProbe.ok) {
+      const reason = `First-event wait skipped — ${preflightFailureReason(keyProbe)}.`;
+      for (const o of cloudReporting) o.notes.push(reason);
+    } else {
+      const poll = await pollServicesWithSigint(
+        {
+          base,
+          token,
+          projectId: project.id,
+          ui,
+          wizardStart,
+          serviceIds: [...byServiceId.keys()],
+          onFound: (serviceId, sessionId) => {
+            const o = byServiceId.get(serviceId);
+            if (!o) return;
+            o.sessionUrl = appUrl(
+              appBase,
+              `/sessions/${encodeURIComponent(sessionId)}`,
+              project.id,
+            );
+            ui.out(ok(`${color.bold(o.name)}: first event received.`));
+          },
+          fetchImpl: deps.fetchImpl,
         },
-        fetchImpl: deps.fetchImpl,
-      },
-      deps,
-    );
-    if (poll.outcome !== "found") {
-      // Stragglers are expected — the user hasn't started every service. This is
-      // information, not a failure.
-      for (const o of byServiceId.values()) {
-        // A guidance service was never wired: its snippet is the outstanding
-        // step, and in a monorepo that snippet scrolled off many services ago.
-        if (!o.sessionUrl)
-          o.notes.push(
-            o.status === "guidance"
-              ? "No event yet — this service was not wired for you. Add the snippet printed for it above, then start it."
-              : "No event yet — start this service.",
-          );
+        deps,
+      );
+      if (poll.outcome !== "found") {
+        // Stragglers are expected — the user hasn't started every service. This is
+        // information, not a failure.
+        for (const o of byServiceId.values()) {
+          // A guidance service was never wired: its snippet is the outstanding
+          // step, and in a monorepo that snippet scrolled off many services ago.
+          if (!o.sessionUrl)
+            o.notes.push(
+              o.status === "guidance"
+                ? "No event yet — this service was not wired for you. Add the snippet printed for it above, then start it."
+                : "No event yet — start this service.",
+            );
+        }
       }
     }
+  } else if (reporting.some((o) => o.recipe === "tauri")) {
+    batchNotes.push(
+      "Tauri stores events locally through its Rust plugin; it does not send a cloud event for this wizard to wait for. Complete the Rust plugin and permission steps above, then inspect the local session store.",
+    );
+  }
+  if (
+    !parsed.skipVerify &&
+    cloudReporting.length > 0 &&
+    reporting.some((o) => o.recipe === "tauri")
+  ) {
+    batchNotes.push(
+      "Tauri stores events locally and was not included in the cloud first-event wait.",
+    );
   }
 
   // Same onboarding pointer as the single-package path — once for the batch,
   // only when a verify actually ran (something is wired and reporting).
-  if (!parsed.skipVerify && reporting.length > 0) {
+  if (!parsed.skipVerify && cloudReporting.length > 0) {
     printEvidenceSourcesPointer(ui, base, project.id);
   }
 
@@ -1508,6 +1596,8 @@ async function applyBatchInjection(
     deps: WizardDeps;
     base: string;
     sdkInstall?: SdkInstallState;
+    dirtyDecision?: boolean;
+    warningsPrinted?: boolean;
   },
 ): Promise<{
   status: ServiceStatus;
@@ -1541,7 +1631,10 @@ async function applyBatchInjection(
     };
   }
 
-  const applied = await applyInjection(plan, parsed, deps, ctx.sdkInstall);
+  const applied = await applyInjection(plan, parsed, deps, ctx.sdkInstall, {
+    dirtyDecision: ctx.dirtyDecision,
+    warningsPrinted: ctx.warningsPrinted,
+  });
   // Straight from what injection reported. Inferring the status from
   // `filesTouched.length` read a withheld install and a declined edit as
   // "already wired", so the summary told the user a service was set up when
@@ -1674,8 +1767,49 @@ interface InjectionResult {
   notes: string[];
 }
 
-/** What installSdk did just before injection — so a dirty-file decline can state
- *  the partial state (deps already added to package.json) accurately. */
+interface InjectionApplyOptions {
+  /** Set before SDK install so a decline cannot leave package/env edits behind. */
+  dirtyDecision?: boolean;
+  /** The plan warnings were printed while asking for the decision. */
+  warningsPrinted?: boolean;
+}
+
+/**
+ * Ask for the one local-change decision before any repo-mutating step.
+ *
+ * The prompt deliberately names the whole transaction: entry file, dependency
+ * manifests/lockfile, and env file/gitignore. A "No" therefore means all local
+ * files stay byte-for-byte unchanged; cloud provisioning is already complete
+ * and is reported separately by the summary.
+ */
+async function confirmInjection(
+  plan: Plan,
+  parsed: ParsedArgs,
+  deps: WizardDeps,
+): Promise<{ approved: boolean }> {
+  for (const w of plan.warnings) deps.ui.out(color.dim(`  · ${w}`));
+  if (plan.kind !== "needs-confirm-dirty") return { approved: true };
+  if (RECIPE_REGISTRY[plan.recipe].sdkUnpublished) return { approved: true };
+  if (parsed.yes) return { approved: true };
+
+  const packages = sdkPackagesFor(plan.recipe);
+  const writes = [
+    plan.targetPath ? `edit ${plan.targetPath}` : null,
+    packages.length > 0
+      ? `install ${packages.join(", ")} (updates package manifests/lockfiles)`
+      : null,
+    plan.keyEnvVar && !plan.keyIsCompileTime
+      ? `write ${plan.keyEnvVar} to the app env file and update .gitignore`
+      : null,
+  ].filter((item): item is string => item !== null);
+  const approved = await deps.prompter.confirm(
+    `${writes.join(", ")}. Continue? No leaves all local files unchanged.`,
+    false,
+  );
+  return { approved };
+}
+
+/** What installSdk did just before injection, so failed installs can withhold wiring. */
 interface SdkInstallState {
   installed: boolean;
   packages: string[];
@@ -1690,12 +1824,15 @@ export interface KeyWriteOutcome {
     | "refused-tracked"
     | "no-variable"
     | "skipped-flag"
+    | "skipped-no-wiring"
     | "failed";
   /** The env file involved, when there is one. */
   file?: string;
   varName?: string;
   /** Extra line for the end-of-run summary's notes. */
   note?: string;
+  /** In-memory only; lets the wizard probe the key without printing it. */
+  probeKey?: string;
 }
 
 /**
@@ -1792,6 +1929,10 @@ async function writeIngestKeys(args: {
         status: "already-set",
         file: plan.file,
         varName: plan.varName,
+        probeKey: readEnvVar(
+          args.deps.envFileIO.readFile(plan.file) ?? "",
+          plan.varName,
+        ),
       });
     } else if (plan.kind === "refused-tracked") {
       // Adding it to .gitignore now would not untrack it, so the next commit
@@ -1872,6 +2013,7 @@ async function writeIngestKeys(args: {
         status: "written",
         file: plan.file,
         varName: plan.varName,
+        probeKey: key.apiKey,
       });
     } catch (err) {
       // The key exists on the server but reached this file. Say so plainly: a
@@ -1907,6 +2049,40 @@ async function writeIngestKey(args: {
   return results.get("") ?? { status: "no-variable" };
 }
 
+function skippedKeyWrite(
+  varName: string | undefined,
+  note: string,
+): KeyWriteOutcome {
+  return {
+    status: "skipped-no-wiring",
+    ...(varName ? { varName } : {}),
+    note,
+  };
+}
+
+/**
+ * Validate a key the wizard just placed before starting a long event wait.
+ * The probe uses the same synthetic, non-persisting session as `crumbtrail
+ * verify`, so a 401/404 or transport failure can be reported immediately.
+ */
+async function probeWrittenKey(
+  base: string,
+  keyWrite: KeyWriteOutcome,
+  deps: WizardDeps,
+): Promise<PreflightResult | undefined> {
+  if (!keyWrite.probeKey) return undefined;
+  return deps.runPreflight({
+    endpoint: base,
+    probe: { kind: "ingestKey", key: keyWrite.probeKey },
+    fetchImpl: deps.fetchImpl,
+  });
+}
+
+function preflightFailureReason(result: PreflightResult): string {
+  const failed = result.stages.find((stage) => stage.status === "fail");
+  return failed?.reason ?? "the endpoint or ingest key could not be validated";
+}
+
 /**
  * Name the key that was just written, so it can be told apart from the others.
  *
@@ -1938,11 +2114,14 @@ async function applyInjection(
   parsed: ParsedArgs,
   deps: WizardDeps,
   sdkInstall?: SdkInstallState,
+  options: InjectionApplyOptions = {},
 ): Promise<InjectionResult> {
   const { ui } = deps;
   const filesTouched: string[] = [];
   const notes: string[] = [];
-  for (const w of plan.warnings) ui.out(color.dim(`  · ${w}`));
+  if (!options.warningsPrinted) {
+    for (const w of plan.warnings) ui.out(color.dim(`  · ${w}`));
+  }
 
   if (plan.kind === "skip-already-wired") {
     ui.out(ok("Already wired — leaving your code untouched."));
@@ -2000,12 +2179,14 @@ async function applyInjection(
   }
 
   if (plan.kind === "needs-confirm-dirty") {
-    const approved = parsed.yes
-      ? true
-      : await deps.prompter.confirm(
-          `${plan.targetPath} has uncommitted changes — prepend into it anyway?`,
-          false,
-        );
+    const approved = Object.hasOwn(options, "dirtyDecision")
+      ? options.dirtyDecision === true
+      : parsed.yes
+        ? true
+        : await deps.prompter.confirm(
+            `${plan.targetPath} has uncommitted changes — edit it and apply the complete local setup anyway?`,
+            false,
+          );
     if (!approved) {
       ui.out(
         color.yellow("Left your file untouched. Add this to the top yourself:"),
@@ -2014,16 +2195,6 @@ async function applyInjection(
       notes.push(
         `Skipped editing ${plan.targetPath} (uncommitted changes) — paste the snippet above into it manually.`,
       );
-      // The SDK install already ran (it precedes injection), so on a decline the
-      // repo is in a partial state: package.json changed even though no code was
-      // injected. Say so explicitly rather than let the user think nothing moved.
-      if (sdkInstall?.installed && sdkInstall.packages.length > 0) {
-        const pkgs = sdkInstall.packages.join(", ");
-        const were = sdkInstall.packages.length > 1 ? "were" : "was";
-        notes.push(
-          `${pkgs} ${were} already installed, so your package.json is already updated — only the code import above is still manual.`,
-        );
-      }
       return { outcome: "declined", filesTouched, notes };
     }
     const res = deps.executePlan(plan, undefined, { confirmDirty: true });
@@ -2104,6 +2275,7 @@ function printSummary(
   keyWrite?: KeyWriteOutcome,
   repoRoot?: string,
   keyIsCompileTime?: boolean,
+  setupIncomplete = false,
 ): void {
   // User-facing links point at the app host (the SPA), not the API host.
   const appBase = appBaseFor(base);
@@ -2117,7 +2289,7 @@ function printSummary(
     keyWrite?.status !== "already-set";
   ui.out("");
   ui.out(
-    keyOutstanding
+    keyOutstanding || setupIncomplete
       ? outcomeBar(`${g.warn}  Setup incomplete — one step left`, "warn")
       : outcomeBar(`${g.tick}  Setup complete`),
   );

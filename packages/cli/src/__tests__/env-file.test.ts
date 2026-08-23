@@ -13,6 +13,7 @@ import {
   chooseEnvFile,
   isSafeEnvValue,
   planEnvKeyWrite,
+  readEnvVar,
   upsertEnvVar,
   type EnvFileIO,
 } from "../env-file";
@@ -117,10 +118,37 @@ describe("isSafeEnvValue", () => {
   );
 });
 
+describe("readEnvVar", () => {
+  it("reads an existing value without exposing unrelated assignments", () => {
+    expect(
+      readEnvVar(
+        "OTHER=1\nexport CRUMBTRAIL_KEY=ctkey_existing\n",
+        "CRUMBTRAIL_KEY",
+      ),
+    ).toBe("ctkey_existing");
+    expect(readEnvVar("CRUMBTRAIL_KEY=\n", "CRUMBTRAIL_KEY")).toBeUndefined();
+  });
+});
+
 describe("chooseEnvFile", () => {
   it("prefers an existing .env.local", () => {
     const io = fakeIO({ "/app/.env.local": "", "/app/.env": "" });
     expect(chooseEnvFile("/app", VAR, io)).toBe("/app/.env.local");
+  });
+
+  it("prefers .env for a server key when both env files exist", () => {
+    const io = fakeIO({ "/app/.env.local": "", "/app/.env": "" });
+    expect(chooseEnvFile("/app", "CRUMBTRAIL_KEY", io)).toBe("/app/.env");
+  });
+
+  it("keeps a server key already present in the fallback file", () => {
+    const io = fakeIO({
+      "/app/.env.local": "CRUMBTRAIL_KEY=ctkey_existing\n",
+      "/app/.env": "OTHER=1\n",
+    });
+    expect(chooseEnvFile("/app", "CRUMBTRAIL_KEY", io)).toBe(
+      "/app/.env.local",
+    );
   });
 
   it("uses an existing .env rather than creating a second file", () => {

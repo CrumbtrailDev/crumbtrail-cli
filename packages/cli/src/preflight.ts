@@ -95,7 +95,10 @@ export type AuthProbe =
  * Map an auth round-trip's HTTP status to a stage result. 2xx = PASS; 401/403 =
  * bad/expired key; 404 = wrong endpoint/path; anything else surfaces the status.
  */
-export function classifyAuthStatus(status: number): {
+export function classifyAuthStatus(
+  status: number,
+  detail?: string,
+): {
   status: StageStatus;
   reason: string;
 } {
@@ -103,7 +106,12 @@ export function classifyAuthStatus(status: number): {
     return { status: "pass", reason: `authenticated (HTTP ${status})` };
   }
   if (status === 401 || status === 403) {
-    return { status: "fail", reason: `bad or expired ingest key (HTTP ${status})` };
+    return {
+      status: "fail",
+      reason: detail
+        ? `ingest key rejected: ${detail} (HTTP ${status})`
+        : `bad or expired ingest key (HTTP ${status})`,
+    };
   }
   if (status === 404) {
     return { status: "fail", reason: "wrong endpoint or path (HTTP 404)" };
@@ -300,6 +308,16 @@ function describeError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function apiErrorDetail(err: ApiError): string | undefined {
+  if (!err.body || typeof err.body !== "object") return undefined;
+  const body = err.body as Record<string, unknown>;
+  for (const key of ["error", "message", "detail"]) {
+    const value = body[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
 /**
  * Run the staged preflight. Stages short-circuit downward — a DNS failure skips
  * TLS + auth (they can't succeed), and a TLS failure skips auth — so the report
@@ -403,7 +421,8 @@ export async function runPreflight(
       if (err instanceof AuthTimeoutError || err instanceof NoCredentialError) {
         return { status: "fail" as const, reason: err.message };
       }
-      if (err instanceof ApiError) return classifyAuthStatus(err.status);
+      if (err instanceof ApiError)
+        return classifyAuthStatus(err.status, apiErrorDetail(err));
       // No HTTP status reached — a transport failure.
       return {
         status: "fail" as const,

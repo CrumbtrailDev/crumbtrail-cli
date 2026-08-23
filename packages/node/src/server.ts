@@ -41,6 +41,8 @@ import {
 export interface ServerConfig {
   port: number;
   outputDir: string;
+  /** Existing capture-policy keep list; exact OTLP IP names opt out of their default scrub. */
+  keepFields?: readonly string[];
   whisperModel?: string;
   /** Override the session finalization post-processing step (e.g. to skip whisper transcription in tests). */
   postProcess?: SessionManagerConfig["postProcess"];
@@ -1878,9 +1880,11 @@ export function createServer(config: ServerConfig): http.Server {
           urlPath === "/v1/traces"
             ? convertOtlpTraceToEvents(
                 body as Parameters<typeof convertOtlpTraceToEvents>[0],
+                { keepFields: config.keepFields },
               )
             : convertOtlpLogsToEvents(
                 body as Parameters<typeof convertOtlpLogsToEvents>[0],
+                { keepFields: config.keepFields },
               );
         if (events.length > maxEventBatchSize) {
           jsonError(

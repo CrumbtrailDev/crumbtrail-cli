@@ -42,6 +42,7 @@ import {
   type McpSessionEntry,
   type McpSessionListingFailure,
 } from "./mcp-read-store";
+import { isDoctorProbeSessionId } from "./doctor-probes";
 import { readPackageVersion } from "./version";
 import type { EvidenceCandidate } from "./evidence-index";
 import type { LlmBundle } from "./llm-bundle";
@@ -2653,7 +2654,12 @@ export class McpServer {
     }
     const matching: Array<{ id: string; start: number }> = [];
     let unread = 0;
+    let doctorProbesSkipped = 0;
     for (const entry of listing.sessions) {
+      if (isDoctorProbeSessionId(entry.id)) {
+        doctorProbesSkipped += 1;
+        continue;
+      }
       // index.json is the largest artifact a session has, and reading one per
       // session is what used to burn the read budget before this tool answered
       // anything. The listing already carries both counts, so it only reads
@@ -2686,6 +2692,10 @@ export class McpServer {
     matching.sort((a, b) => b.start - a.start || a.id.localeCompare(b.id));
     const latest = matching[0];
     if (!latest) {
+      const probes =
+        doctorProbesSkipped > 0
+          ? " Doctor probe sessions were skipped."
+          : "";
       // Absence is only reportable as absence when the whole listing was read.
       // A partial listing says so instead, because "you have no sessions" and
       // "I ran out of read budget" are opposite next steps for the reader.
@@ -2694,7 +2704,7 @@ export class McpServer {
       }
       if (listing.truncated) {
         return errorResult(
-          `No session with error-class evidence among the ${LATEST_ISSUE_SCAN} most recent, and older sessions were not read. Use listSessions with after/before/release to search a specific window.`,
+          `No session with error-class evidence among the ${LATEST_ISSUE_SCAN} most recent.${probes} Older sessions were not read. Use listSessions with after/before/release to search a specific window.`,
         );
       }
       if (unread > 0) {
@@ -2703,7 +2713,7 @@ export class McpServer {
         );
       }
       return errorResult(
-        `No finalized session with error-class evidence found in ${this.store.describe()}. Use listSessions to inspect recorded sessions.`,
+        `No finalized session with error-class evidence found in ${this.store.describe()}.${probes} Use listSessions to inspect recorded sessions.`,
       );
     }
     return this.toolGetFixContext({ ...args, sessionId: latest.id });
