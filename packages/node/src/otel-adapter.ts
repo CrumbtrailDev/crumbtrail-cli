@@ -1,4 +1,5 @@
 import {
+  BROWSER_REDACTION_POLICY,
   REDACTED_VALUE,
   mergeRedactionMetadata,
   redactNetworkTextBody,
@@ -63,6 +64,11 @@ export interface OtlpTraceRequest {
   resourceSpans?: OtlpResourceSpans[];
 }
 
+export interface OtlpAdapterOptions {
+  /** Exact OTLP attribute names the operator has explicitly kept. */
+  keepFields?: readonly string[];
+}
+
 function readSessionId(attrs: Record<string, unknown>): string | undefined {
   const value = attrs[CRUMBTRAIL_SESSION_ATTRIBUTE];
   return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -82,11 +88,51 @@ function publicResourceAttributes(
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
+/** Exact OTLP semantic-convention names that carry producer-supplied IP data. */
+const OTLP_IP_ATTRIBUTE_KEYS = new Set(["net.host.ip", "net.peer.ip"]);
+
 function redactAttributes(
   attrs: Record<string, unknown>,
   path: string,
+  options: OtlpAdapterOptions = {},
 ): RedactionResult<Record<string, unknown>> {
-  return redactValue(attrs, path);
+  const redacted = redactValue(attrs, path);
+  const keepFields = new Set(
+    (options.keepFields ?? []).map((field) =>
+      field.toLowerCase().replace(/[^a-z0-9]/g, ""),
+    ),
+  );
+  const ipFields: RedactionMetadata["fields"] = [];
+  const value = { ...redacted.value };
+
+  for (const key of OTLP_IP_ATTRIBUTE_KEYS) {
+    if (!(key in attrs)) continue;
+    const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (keepFields.has(normalized)) {
+      value[key] = attrs[key];
+      continue;
+    }
+    value[key] = REDACTED_VALUE;
+    ipFields.push({
+      path: `${path}.${key}`,
+      reason: "sensitive_otlp_ip_attribute",
+      action: "redacted",
+    });
+  }
+
+  if (ipFields.length === 0)
+    return {
+      value,
+      ...(redacted.metadata ? { metadata: redacted.metadata } : {}),
+    };
+
+  return {
+    value,
+    metadata: mergeRedactionMetadata(redacted.metadata, {
+      policy: BROWSER_REDACTION_POLICY,
+      fields: ipFields,
+    }),
+  };
 }
 
 function redactText(value: string, path: string): BodyRedactionResult {
@@ -108,7 +154,10 @@ const MAX_SPAN_EVENTS = 32;
  * skipping redaction would make span events the one un-scrubbed channel in the
  * OTLP path.
  */
-function convertSpanEvents(events: OtlpSpanEvent[] | undefined): {
+function convertSpanEvents(
+  events: OtlpSpanEvent[] | undefined,
+  options: OtlpAdapterOptions,
+): {
   value: Array<Record<string, unknown>>;
   metadata: Array<RedactionMetadata | undefined>;
 } {
@@ -117,7 +166,11 @@ function convertSpanEvents(events: OtlpSpanEvent[] | undefined): {
 
   for (const spanEvent of (events ?? []).slice(0, MAX_SPAN_EVENTS)) {
     const attrs = attributesToMap(spanEvent.attributes);
-    const redacted = redactAttributes(attrs, "otel.span.event.attributes");
+    const redacted = redactAttributes(
+      attrs,
+      "otel.span.event.attributes",
+      options,
+    );
     metadata.push(redacted.metadata);
 
     const entry: Record<string, unknown> = {};
@@ -136,6 +189,7 @@ function convertSpanEvents(events: OtlpSpanEvent[] | undefined): {
 
 export function convertOtlpTraceToEvents(
   payload: OtlpTraceRequest | undefined,
+  options: OtlpAdapterOptions = {},
 ): BugEvent[] {
   const events: BugEvent[] = [];
   for (const rs of payload?.resourceSpans ?? []) {
@@ -145,6 +199,7 @@ export function convertOtlpTraceToEvents(
     const redactedResourceAttrs = redactAttributes(
       publicResourceAttributes(resourceAttrs) ?? {},
       "otel.resource.attributes",
+      options,
     );
     for (const ss of rs.scopeSpans ?? []) {
       for (const span of ss.spans ?? []) {
@@ -160,6 +215,7 @@ export function convertOtlpTraceToEvents(
         const redactedSpanAttrs = redactAttributes(
           spanAttrs,
           "otel.span.attributes",
+          options,
         );
         const redactedStatusMessage = span.status?.message
           ? redactText(span.status.message, "otel.span.statusMessage")
@@ -185,7 +241,7 @@ export function convertOtlpTraceToEvents(
         if (Object.keys(redactedResourceAttrs.value).length > 0)
           d.resourceAttributes = redactedResourceAttrs.value;
         if (redactedStatusMessage) d.statusMessage = redactedStatusMessage.body;
-        const spanEvents = convertSpanEvents(span.events);
+        const spanEvents = convertSpanEvents(span.events, options);
         if (spanEvents.value.length > 0) d.spanEvents = spanEvents.value;
         const redaction = mergeRedactionMetadata(
           redactedResourceAttrs.metadata,
@@ -234,6 +290,7 @@ export interface OtlpLogsRequest {
 
 export function convertOtlpLogsToEvents(
   payload: OtlpLogsRequest | undefined,
+  options: OtlpAdapterOptions = {},
 ): BugEvent[] {
   const events: BugEvent[] = [];
   for (const rl of payload?.resourceLogs ?? []) {
@@ -243,6 +300,7 @@ export function convertOtlpLogsToEvents(
     const redactedResourceAttrs = redactAttributes(
       publicResourceAttributes(resourceAttrs) ?? {},
       "otel.resource.attributes",
+      options,
     );
     for (const sl of rl.scopeLogs ?? []) {
       for (const log of sl.logRecords ?? []) {
@@ -259,6 +317,7 @@ export function convertOtlpLogsToEvents(
         const redactedLogAttrs = redactAttributes(
           logAttrs,
           "otel.log.attributes",
+          options,
         );
         const redactedBody =
           typeof log.body?.stringValue === "string"

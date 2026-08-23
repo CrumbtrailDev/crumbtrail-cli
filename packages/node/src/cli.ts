@@ -89,6 +89,8 @@ Options:
   --keep-field <a,b>  Field names to keep verbatim instead of redacting by name
                       (repeatable, or set CRUMBTRAIL_KEEP_FIELDS). Value based
                       detection still removes tokens and card numbers inside them.
+                      For OTLP, explicitly list net.host.ip/net.peer.ip to keep
+                      those two IP attributes instead of the default scrub.
   --no-input-values   Never store what users typed into form fields (or set
                       CRUMBTRAIL_CAPTURE_INPUT_VALUES=0). Overrides the
                       application's own redaction.captureInputValues setting.
@@ -351,6 +353,7 @@ export async function runCli(argv: string[]): Promise<number> {
   const server = createServer({
     port,
     outputDir: output,
+    keepFields,
     whisperModel,
     staticDir,
     authToken,

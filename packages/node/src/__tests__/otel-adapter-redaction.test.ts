@@ -11,6 +11,100 @@ describe("OTLP adapter redaction", () => {
   const parentSpanId = "aabbccddeeff0011";
   const token = "sk_fake_abcdefghijklmnopqrstuvwxyz1234567890";
 
+  it("redacts the standard OTLP IP attributes at resource and span boundaries", () => {
+    const [event] = convertOtlpTraceToEvents({
+      resourceSpans: [
+        {
+          resource: {
+            attributes: [
+              { key: "service.name", value: { stringValue: "api" } },
+              {
+                key: "net.host.ip",
+                value: { stringValue: "10.1.2.3" },
+              },
+            ],
+          },
+          scopeSpans: [
+            {
+              spans: [
+                {
+                  attributes: [
+                    {
+                      key: "net.peer.ip",
+                      value: { stringValue: "203.0.113.9" },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(
+      (event.d.resourceAttributes as Record<string, unknown>)["net.host.ip"],
+    ).toBe(REDACTED_VALUE);
+    expect((event.d.attributes as Record<string, unknown>)["net.peer.ip"]).toBe(
+      REDACTED_VALUE,
+    );
+    expect(event.d.redaction).toMatchObject({
+      fields: expect.arrayContaining([
+        expect.objectContaining({
+          path: "otel.resource.attributes.net.host.ip",
+          reason: "sensitive_otlp_ip_attribute",
+        }),
+        expect.objectContaining({
+          path: "otel.span.attributes.net.peer.ip",
+          reason: "sensitive_otlp_ip_attribute",
+        }),
+      ]),
+    });
+    expect(JSON.stringify(event)).not.toContain("10.1.2.3");
+    expect(JSON.stringify(event)).not.toContain("203.0.113.9");
+  });
+
+  it("honors an explicit keep-field opt-out for the standard OTLP IP attributes", () => {
+    const [event] = convertOtlpTraceToEvents(
+      {
+        resourceSpans: [
+          {
+            resource: {
+              attributes: [
+                {
+                  key: "net.host.ip",
+                  value: { stringValue: "10.1.2.3" },
+                },
+              ],
+            },
+            scopeSpans: [
+              {
+                spans: [
+                  {
+                    attributes: [
+                      {
+                        key: "net.peer.ip",
+                        value: { stringValue: "203.0.113.9" },
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      { keepFields: ["net.host.ip", "net.peer.ip"] },
+    );
+
+    expect(
+      (event.d.resourceAttributes as Record<string, unknown>)["net.host.ip"],
+    ).toBe("10.1.2.3");
+    expect((event.d.attributes as Record<string, unknown>)["net.peer.ip"]).toBe(
+      "203.0.113.9",
+    );
+  });
+
   it("redacts span attributes and status messages while preserving correlation fields", () => {
     const [event] = convertOtlpTraceToEvents({
       resourceSpans: [
