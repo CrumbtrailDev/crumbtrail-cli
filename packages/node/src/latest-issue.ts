@@ -1,4 +1,5 @@
 import { defaultSessionStore } from "./session-store";
+import { isDoctorProbeSessionId } from "./doctor-probes";
 
 /**
  * Shared "latest issue" resolver behind BOTH the `getLatestIssue` MCP tool and
@@ -25,14 +26,30 @@ export interface LatestIssue {
   dir: string;
 }
 
+export interface LatestIssueResolution {
+  issue?: LatestIssue;
+  doctorProbesSkipped: number;
+}
+
 export async function resolveLatestIssue(opts: {
   outputDir: string;
 }): Promise<LatestIssue | undefined> {
+  return (await resolveLatestIssueWithDiagnostics(opts)).issue;
+}
+
+export async function resolveLatestIssueWithDiagnostics(opts: {
+  outputDir: string;
+}): Promise<LatestIssueResolution> {
   let best: { sessionId: string; dir: string; recency: number } | undefined;
+  let doctorProbesSkipped = 0;
 
   for (const { id, dir } of await defaultSessionStore.listSessions(
     opts.outputDir,
   )) {
+    if (isDoctorProbeSessionId(id)) {
+      doctorProbesSkipped += 1;
+      continue;
+    }
     const index = await readJsonRecord(dir, "index.json");
     if (!index) continue; // not finalized
     if (!(await hasErrorClassEvidence(dir, index))) continue;
@@ -43,7 +60,10 @@ export async function resolveLatestIssue(opts: {
     }
   }
 
-  return best ? { sessionId: best.sessionId, dir: best.dir } : undefined;
+  return {
+    issue: best ? { sessionId: best.sessionId, dir: best.dir } : undefined,
+    doctorProbesSkipped,
+  };
 }
 
 function beats(

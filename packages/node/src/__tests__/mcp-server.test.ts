@@ -2570,6 +2570,25 @@ describe("MCP Server", () => {
       expect(result.content[0].text).toContain("listSessions");
     });
 
+    it("getLatestIssue skips doctor probes while explicit reads still work", async () => {
+      const probeId = "ses_otlp_probe_only";
+      createSession(probeId, [
+        { t: 3000, k: "err", d: { msg: "doctor synthetic failure" } },
+      ]);
+
+      const latest = await callTool("getLatestIssue", {});
+      expect(latest.result.isError).toBe(true);
+      expect(latest.result.content[0].text).toContain(
+        "Doctor probe sessions were skipped.",
+      );
+
+      const explicit = await callTool("getFixContext", {
+        sessionId: probeId,
+      });
+      expect(explicit.result.isError).toBeFalsy();
+      expect(explicit.parsed.session.id).toBe(probeId);
+    });
+
     it("get_latest_issue snake_case alias dispatches to the same handler", async () => {
       createSession("sess-alias", [{ t: 3000, k: "err", d: { msg: "x" } }]);
       const { parsed, result } = await callTool("get_latest_issue", {});

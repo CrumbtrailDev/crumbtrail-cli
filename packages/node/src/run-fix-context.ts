@@ -5,7 +5,7 @@ import {
   FixContextError,
   type FixContext,
 } from "./fix-context";
-import { resolveLatestIssue } from "./latest-issue";
+import { resolveLatestIssueWithDiagnostics } from "./latest-issue";
 
 /** Flags whose next argv entry is a value, not a positional target. */
 const VALUE_FLAGS = ["--output", "--interval", "--timeout"];
@@ -68,15 +68,19 @@ export async function runFixContext(
     reason: string;
   }> => {
     if (latest) {
-      const hit = await resolveLatestIssue({ outputDir });
-      if (!hit) {
+      const resolution = await resolveLatestIssueWithDiagnostics({ outputDir });
+      if (!resolution.issue) {
+        const reason =
+          resolution.doctorProbesSkipped > 0
+            ? `No finalized session with error-class evidence found under ${outputDir}; Doctor probe sessions were skipped. Run a session and wait for finalize, or pass a session id.`
+            : `No finalized session with error-class evidence found under ${outputDir}; run a session and wait for finalize, or pass a session id.`;
         return {
-          reason: `No finalized session with error-class evidence found under ${outputDir}; run a session and wait for finalize, or pass a session id.`,
+          reason,
         };
       }
       try {
         return {
-          context: await buildFixContext(hit.dir, { outputDir }),
+          context: await buildFixContext(resolution.issue.dir, { outputDir }),
           reason: "",
         };
       } catch (err) {

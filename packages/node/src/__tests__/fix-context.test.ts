@@ -92,13 +92,16 @@ const EVENTS = [
   },
 ];
 
-async function seedSession(outputDir: string): Promise<string> {
-  const sessionDir = path.join(outputDir, SESSION_ID);
+async function seedSession(
+  outputDir: string,
+  sessionId = SESSION_ID,
+): Promise<string> {
+  const sessionDir = path.join(outputDir, sessionId);
   fs.mkdirSync(sessionDir, { recursive: true });
   fs.writeFileSync(
     path.join(sessionDir, "meta.json"),
     JSON.stringify({
-      id: SESSION_ID,
+      id: sessionId,
       app: "shop",
       source: "crumbtrail-extension",
       start: 1000,
@@ -1064,6 +1067,32 @@ describe("runFixContext --latest / --follow (CLI)", () => {
     expect(errWrites.join("")).toContain(
       "No finalized session with error-class evidence found under",
     );
+  });
+
+  it("--latest skips doctor probes, while an explicit probe id remains readable", async () => {
+    const probeId = "ses_otlp_probe_only";
+    await seedSession(tmpDir, probeId);
+
+    const latestCode = await runFixContext([
+      "--latest",
+      "--output",
+      tmpDir,
+      "--json",
+    ]);
+    expect(latestCode).toBe(1);
+    expect(outWrites.join("")).toBe("");
+    expect(errWrites.join("")).toContain(
+      "Doctor probe sessions were skipped.",
+    );
+
+    const explicitCode = await runFixContext([
+      probeId,
+      "--output",
+      tmpDir,
+      "--json",
+    ]);
+    expect(explicitCode).toBe(0);
+    expect(JSON.parse(outWrites.join("")).session.id).toBe(probeId);
   });
 
   it("--follow emits the contract once the session finalizes mid-poll (progress on stderr, context on stdout)", async () => {

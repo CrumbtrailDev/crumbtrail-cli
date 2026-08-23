@@ -72,6 +72,26 @@ describe("resolveLatestIssue", () => {
     ).toBeUndefined();
   });
 
+  it("skips finalized doctor probe sessions when no application session qualifies", async () => {
+    seed("ses_probe_123", {
+      index: {
+        end: 9000,
+        errs: [{ t: 8999, msg: "doctor synthetic failure" }],
+      },
+      candidates: [
+        { id: "cand_probe", detector: "otel_span_error", severity: "high" },
+      ],
+    });
+    seed("ses_otlp_probe_456", {
+      index: {
+        end: 10000,
+        failedReqs: [{ t: 9999, st: 500, url: "/__crumbtrail/otlp-probe" }],
+      },
+    });
+
+    expect(await resolveLatestIssue({ outputDir: tmpDir })).toBeUndefined();
+  });
+
   it("ignores non-finalized sessions (no index.json), whatever else they contain", async () => {
     seed("ses_live", {
       index: null,
