@@ -34,6 +34,19 @@ export class UpgradeRequiredError extends Error {
   }
 }
 
+/** A project route rejected a token that is valid for this endpoint. */
+export class ProjectAccessError extends Error {
+  readonly projectId: string;
+  readonly status: number;
+
+  constructor(message: string, projectId: string, status: number) {
+    super(message);
+    this.name = "ProjectAccessError";
+    this.projectId = projectId;
+    this.status = status;
+  }
+}
+
 // ── Pure inference helpers (unit-tested) ─────────────────────────────────────
 
 /**
@@ -199,18 +212,25 @@ export async function createIngestKey(
   token: string,
   projectId: string,
   fetchImpl?: typeof fetch,
+  identityLabel?: string,
 ): Promise<{ apiKey: string; keyId?: string }> {
-  const res = await requestJson<{ keyId?: string; apiKey?: string }>(
-    `${base}/api/projects/${projectId}/keys`,
-    { method: "POST", token, body: {}, fetchImpl },
-  );
-  if (typeof res.apiKey !== "string" || res.apiKey.length === 0) {
-    throw new Error("The server minted a key but returned no value for it.");
+  try {
+    const res = await requestJson<{ keyId?: string; apiKey?: string }>(
+      `${base}/api/projects/${projectId}/keys`,
+      { method: "POST", token, body: {}, fetchImpl },
+    );
+    if (typeof res.apiKey !== "string" || res.apiKey.length === 0) {
+      throw new Error("The server minted a key but returned no value for it.");
+    }
+    return {
+      apiKey: res.apiKey,
+      ...(typeof res.keyId === "string" && res.keyId
+        ? { keyId: res.keyId }
+        : {}),
+    };
+  } catch (err) {
+    throw explainWrongAccount(err, projectId, identityLabel);
   }
-  return {
-    apiKey: res.apiKey,
-    ...(typeof res.keyId === "string" && res.keyId ? { keyId: res.keyId } : {}),
-  };
 }
 
 // ── Orchestrated flow ────────────────────────────────────────────────────────
@@ -412,13 +432,20 @@ export function explainWrongAccount(
   projectId: string,
   identityLabel?: string,
 ): unknown {
-  if (!(err instanceof ApiError) || err.status !== 404) return err;
+  if (
+    !(err instanceof ApiError) ||
+    (err.status !== 403 && err.status !== 404)
+  ) {
+    return err;
+  }
   const who = identityLabel ? ` as ${identityLabel}` : "";
-  return new Error(
-    `The account you are signed in${who} has no project ${projectId}. ` +
-      `The id is probably right and the account is wrong: run ` +
-      `\`crumbtrail logout\`, then \`npx crumbtrail\` again to sign in as the ` +
-      `owner of that project. (${err.message})`,
+  return new ProjectAccessError(
+    `The account you are signed in${who} cannot see project ${projectId}. ` +
+      `The project id is probably right and this saved login is for another ` +
+      `account. Run \`crumbtrail logout\`, then \`npx crumbtrail\` again to ` +
+      `sign in as the owner of that project. (${err.message})`,
+    projectId,
+    err.status,
   );
 }
 

@@ -24,6 +24,7 @@ import { promisify } from "node:util";
 import tls from "node:tls";
 import { randomUUID } from "node:crypto";
 import { ApiError, requestJson } from "./net";
+import { explainWrongAccount } from "./provision";
 import { CLI_CHECK_PREFIX } from "./verify";
 
 export type StageName = "dns" | "tls" | "auth";
@@ -265,12 +266,19 @@ function realAuthRoundTrip(
       const q = probe.projectId
         ? `?projectId=${encodeURIComponent(probe.projectId)}`
         : "";
-      await requestJson(`${base}/api/sessions${q}`, {
-        token: probe.token,
-        retry: false,
-        fetchImpl,
-        signal: controller.signal,
-      });
+      try {
+        await requestJson(`${base}/api/sessions${q}`, {
+          token: probe.token,
+          retry: false,
+          fetchImpl,
+          signal: controller.signal,
+        });
+      } catch (err) {
+        if (probe.projectId) {
+          throw explainWrongAccount(err, probe.projectId);
+        }
+        throw err;
+      }
       return 200;
     } catch (err) {
       // The abort we triggered surfaces as an abort/NetworkError; report it as a
