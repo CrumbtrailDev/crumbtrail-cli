@@ -45,6 +45,7 @@ import {
   inferServiceName,
   provisionFlow,
   provisionService,
+  ProjectAccessError,
   resolveProject,
   uniqueServiceNames,
   UpgradeRequiredError,
@@ -862,6 +863,7 @@ export async function runWizard(
           // would mint a live credential into a file the app never reads, and every
           // line printed after it would report success for an app capturing nothing.
           varName: plan.keyIsCompileTime ? undefined : plan.keyEnvVar,
+          identityLabel,
           parsed,
           deps,
         })
@@ -925,7 +927,7 @@ export async function runWizard(
           ? awaitingManualWiring
             ? "Add the snippet above to your entry file, then start your dev server and load a page. This one stays here watching for the event."
             : "In another terminal, start your dev server (restart it if it is already running, so it reads the new key) and load a page in your browser. This one stays here watching for the event."
-          : `${setKeyHint} — mint one at ${appUrl(appBase, "/settings", provisioned.projectId)}, then start your app.`,
+          : `${setKeyHint}. Mint one at ${appUrl(appBase, "/setup", provisioned.projectId)}, then start your app.`,
       ),
     );
     const keyProbe = await probeWrittenKey(base, keyWrite, deps);
@@ -945,7 +947,9 @@ export async function runWizard(
         keyWrite,
         cwd,
         plan.keyIsCompileTime,
-        inject.outcome === "withheld" || inject.outcome === "declined",
+        inject.outcome === "guidance" ||
+          inject.outcome === "withheld" ||
+          inject.outcome === "declined",
       );
       return 0;
     }
@@ -1014,7 +1018,9 @@ export async function runWizard(
     keyWrite,
     cwd,
     plan.keyIsCompileTime,
-    inject.outcome === "withheld" || inject.outcome === "declined",
+    inject.outcome === "guidance" ||
+      inject.outcome === "withheld" ||
+      inject.outcome === "declined",
   );
   return 0;
 }
@@ -1110,12 +1116,12 @@ export interface ServiceOutcome {
   keyEnvVar?: string;
   /** That variable is supplied at build time, so it has no env file to go in. */
   keyIsCompileTime?: boolean;
-  /** True once this run wrote the project's key into that variable, which is
-   *  what decides whether the summary still asks for it. */
-  keyWritten?: boolean;
+  /** True when the service has a key available for the configured variable. */
+  keyReady?: boolean;
   filesTouched: string[];
   notes: string[];
   error?: string;
+  errorKind?: "project-access";
   sessionUrl?: string;
 }
 
@@ -1130,13 +1136,19 @@ function stackLabel(c: ServiceCandidate): string {
 function candidateHint(c: ServiceCandidate): string {
   const stack = stackLabel(c);
   if (c.flags.includes("no-recipe")) return "no supported framework";
-  if (c.flags.includes("already-wired")) return `${stack} · already wired`;
-  if (c.flags.includes("otlp"))
-    return `${stack} · OTLP guidance, no code changes`;
   if (c.flags.includes("likely-library"))
-    return `${stack} · library? probably not an app`;
-  if (c.flags.includes("ambiguous")) return `${stack} · entry file unclear`;
-  return stack;
+    return `${stack} · shared library, select only if it runs as a service`;
+  if (c.flags.includes("otlp"))
+    return c.flags.includes("already-wired")
+      ? `${stack} · guide exists, skipped`
+      : `${stack} · guidance writes a setup file`;
+  if (c.flags.includes("already-wired"))
+    return `${stack} · complete for this endpoint, skipped`;
+  if (c.flags.includes("ambiguous"))
+    return `${stack} · entry unclear, selecting shows the setup guidance`;
+  if (c.integration?.found && !c.integration.complete)
+    return `${stack} · setup incomplete, selecting shows what is missing`;
+  return `${stack} · selecting installs and wires it`;
 }
 
 function toMultiSelectItems(candidates: ServiceCandidate[]): MultiSelectItem[] {
@@ -1212,7 +1224,9 @@ export async function runBatchWizard(
   const root = deps.cwd;
 
   // 1. Scan.
-  const candidates = deps.discoverServices(root, ctx.root);
+  const candidates = deps.discoverServices(root, ctx.root, undefined, {
+    endpoint: base,
+  });
   const selectableCount = candidates.filter((c) => c.selectable).length;
   ui.out(
     ok(
@@ -1281,6 +1295,9 @@ export async function runBatchWizard(
     ui.err(color.red(`Login failed: ${errMessage(err)}`));
     return 1;
   }
+  const identityLabel = describeIdentity(
+    await fetchIdentity(base, token, deps.fetchImpl),
+  );
 
   // 4. Project (once — every service reports into the same project).
   const defaultProjectName = inferProjectName(
@@ -1332,7 +1349,7 @@ export async function runBatchWizard(
 
     if (c.flags.includes("already-wired")) {
       // Don't mint a key for a service whose plan would self-cancel anyway.
-      ui.out(ok("Already wired — leaving it untouched."));
+      ui.out(ok("Complete for this endpoint. Leaving it untouched."));
       outcomes.push({
         name,
         relDir: c.relDir,
@@ -1353,9 +1370,7 @@ export async function runBatchWizard(
         stack: c.detected.otlpStack,
         serviceName: name,
         ui,
-        identityLabel: describeIdentity(
-          await fetchIdentity(base, token, deps.fetchImpl),
-        ),
+        identityLabel,
         fetchImpl: deps.fetchImpl,
       });
 
@@ -1443,6 +1458,9 @@ export async function runBatchWizard(
         filesTouched: [],
         notes: [],
         error: message,
+        ...(err instanceof ProjectAccessError
+          ? { errorKind: "project-access" as const }
+          : {}),
       });
     }
   }
@@ -1461,6 +1479,7 @@ export async function runBatchWizard(
     token,
     projectId: project.id,
     projectName: project.name,
+    identityLabel,
     repoRoot: root,
     targets: reporting.map((o) => ({
       label: o.name,
@@ -1473,7 +1492,8 @@ export async function runBatchWizard(
   for (const outcome of reporting) {
     const write = keyWrites.get(outcome.name);
     if (write?.note) outcome.notes.push(write.note);
-    outcome.keyWritten = write?.status === "written";
+    outcome.keyReady =
+      write?.status === "written" || write?.status === "already-set";
   }
   if (parsed.skipVerify) {
     // One note for the run, not one per service — the same line repeated N
@@ -1486,11 +1506,11 @@ export async function runBatchWizard(
       // Only the services whose key did NOT land still carry a manual step.
       // Telling someone to set a variable this run just wrote for them is how
       // they end up pasting a second key over a working one.
-      if (o.keyEnvVar && !o.keyWritten) {
+      if (o.keyEnvVar && !o.keyReady) {
         o.notes.push(
           o.keyIsCompileTime
-            ? `Pass --dart-define=${o.keyEnvVar}=<your-ingest-key> to flutter run and flutter build (mint at ${appUrl(appBase, "/settings", project.id)}).`
-            : `Set ${o.keyEnvVar} in this service's .env (mint at ${appUrl(appBase, "/settings", project.id)}).`,
+            ? `Pass --dart-define=${o.keyEnvVar}=<your-ingest-key> to flutter run and flutter build (mint at ${appUrl(appBase, "/setup", project.id)}).`
+            : `Set ${o.keyEnvVar} in this service's .env (mint at ${appUrl(appBase, "/setup", project.id)}).`,
         );
       }
     }
@@ -1658,7 +1678,7 @@ function printBatchSummary(
   const g = glyphs();
   const mark: Record<ServiceStatus, string> = {
     wired: chip(` ${g.tick} `, "success"),
-    guidance: chip(` ${g.tick} `, "success"),
+    guidance: chip(` ${g.warn} `, "warn"),
     "skipped-already-wired": chip(` ${g.bullet} `, "muted"),
     // Nothing was wired in either case, and the user has something to do about
     // it — so neither reads as a quiet skip.
@@ -1671,21 +1691,25 @@ function printBatchSummary(
   // knows where their repo is.
   const rel = (p: string) => path.relative(root, p) || p;
 
+  const ready = (o: ServiceOutcome) =>
+    o.status === "skipped-already-wired" ||
+    (o.status === "wired" && o.keyReady === true);
+  const readyCount = outcomes.filter(ready).length;
   const wiredCount = outcomes.filter(
-    (o) =>
-      o.status === "wired" ||
-      o.status === "guidance" ||
-      o.status === "skipped-already-wired",
+    (o) => o.status === "wired" && o.keyReady === true,
+  ).length;
+  const needsKeyCount = outcomes.filter(
+    (o) => o.status === "wired" && o.keyReady !== true,
   ).length;
   ui.out("");
   // The bar states the outcome only. The project name used to ride on the end
   // of this line, where a narrow terminal clipped it: a project called kartbug
   // was reported back as "kartbu".
   ui.out(
-    wiredCount === outcomes.length
+    readyCount === outcomes.length
       ? outcomeBar(`${g.tick}  Setup complete`)
       : outcomeBar(
-          `${g.warn}  Setup incomplete — ${outcomes.length - wiredCount} of ${outcomes.length} services still need you`,
+          `${g.warn}  Setup incomplete. ${outcomes.length - readyCount} of ${outcomes.length} services still need you`,
           "warn",
         ),
   );
@@ -1696,16 +1720,20 @@ function printBatchSummary(
       o.status === "failed"
         ? color.red(`failed: ${o.error}`)
         : o.status === "withheld"
-          ? color.yellow("not wired — the SDK could not be installed")
+          ? color.yellow("not wired. The SDK could not be installed")
           : o.status === "declined"
-            ? color.yellow("not wired — you declined the edit")
-            : o.status === "skipped-already-wired"
-              ? color.dim("already wired — skipped")
-              : o.sessionUrl
-                ? color.brand(o.sessionUrl)
-                : o.filesTouched.length > 0
-                  ? color.dim(o.filesTouched.map(rel).join(", "))
-                  : "";
+            ? color.yellow("not wired. You declined the edit")
+            : o.status === "wired" && o.keyReady !== true
+              ? color.yellow("needs ingest key")
+              : o.status === "guidance"
+                ? color.yellow("manual setup needed")
+                : o.status === "skipped-already-wired"
+                  ? color.dim("complete for this endpoint · skipped")
+                  : o.sessionUrl
+                    ? color.brand(o.sessionUrl)
+                    : o.filesTouched.length > 0
+                      ? color.dim(o.filesTouched.map(rel).join(", "))
+                      : "";
     ui.out(
       `  ${mark[o.status]} ${o.name.padEnd(width)}  ${color.dim(o.relDir.padEnd(24))} ${detail}`,
     );
@@ -1714,7 +1742,8 @@ function printBatchSummary(
   const count = (s: ServiceStatus) =>
     outcomes.filter((o) => o.status === s).length;
   const parts = [
-    `${count("wired")} wired`,
+    `${wiredCount} wired`,
+    ...(needsKeyCount > 0 ? [`${needsKeyCount} need a key`] : []),
     ...(count("guidance") > 0 ? [`${count("guidance")} guidance`] : []),
     ...(count("failed") > 0 ? [`${count("failed")} failed`] : []),
     // Counted apart from "skipped": nothing was wired and the user has a next
@@ -1739,8 +1768,23 @@ function printBatchSummary(
     ...outcomes.flatMap((o) => o.notes.map((n) => `${o.name}: ${n}`)),
     ...batchNotes,
   ];
-  if (count("failed") + count("withheld") + count("declined") > 0) {
-    notes.push("Re-run `crumbtrail` to retry — wired services are skipped.");
+  const projectAccessFailure = outcomes.some(
+    (o) => o.errorKind === "project-access",
+  );
+  const retryableFailure = outcomes.some(
+    (o) =>
+      (o.status === "failed" ||
+        o.status === "withheld" ||
+        o.status === "declined") &&
+      o.errorKind !== "project-access",
+  );
+  if (projectAccessFailure) {
+    notes.push(
+      "Run `crumbtrail logout`, then `npx crumbtrail` again to sign in as the owner of this project.",
+    );
+  }
+  if (retryableFailure) {
+    notes.push("Run `crumbtrail` again to retry. Wired services are skipped.");
   }
   if (notes.length > 0) {
     ui.out("");
@@ -1868,6 +1912,7 @@ async function writeIngestKeys(args: {
   projectId: string;
   /** Named in the "left as it is" line, so a key from another project shows. */
   projectName: string;
+  identityLabel: string;
   /** The git work tree this run is in, which owns the .gitignore. */
   repoRoot: string;
   targets: KeyTarget[];
@@ -1965,13 +2010,17 @@ async function writeIngestKeys(args: {
       args.token,
       args.projectId,
       args.deps.fetchImpl,
+      args.identityLabel,
     );
   } catch (err) {
     for (const [label, plan] of ready) {
       results.set(label, {
         status: "failed",
         varName: plan.kind === "ready" ? plan.varName : undefined,
-        note: `Could not mint an ingest key (${errMessage(err)}). Mint one in the dashboard and set it yourself.`,
+        note:
+          err instanceof ProjectAccessError
+            ? errMessage(err)
+            : `Could not mint an ingest key (${errMessage(err)}). Mint one in the dashboard and set it yourself.`,
       });
     }
     return results;
@@ -2036,6 +2085,7 @@ async function writeIngestKey(args: {
   token: string;
   projectId: string;
   projectName: string;
+  identityLabel: string;
   appDir: string;
   repoRoot: string;
   varName: string | undefined;
@@ -2124,7 +2174,7 @@ async function applyInjection(
   }
 
   if (plan.kind === "skip-already-wired") {
-    ui.out(ok("Already wired — leaving your code untouched."));
+    ui.out(ok("Complete for this endpoint. Leaving your code untouched."));
     return { outcome: "skipped-already-wired", filesTouched, notes };
   }
 
@@ -2290,7 +2340,7 @@ function printSummary(
   ui.out("");
   ui.out(
     keyOutstanding || setupIncomplete
-      ? outcomeBar(`${g.warn}  Setup incomplete — one step left`, "warn")
+      ? outcomeBar(`${g.warn}  Setup incomplete. One step remains.`, "warn")
       : outcomeBar(`${g.tick}  Setup complete`),
   );
   ui.out("");
@@ -2320,14 +2370,14 @@ function printSummary(
       ui.out(
         field(
           "Ingest key",
-          `build with ${color.bold(`--dart-define=${keyEnvVar}=<your-ingest-key>`)} ${color.dim(`(mint at ${appUrl(appBase, "/settings", p.projectId)})`)}`,
+          `build with ${color.bold(`--dart-define=${keyEnvVar}=<your-ingest-key>`)} ${color.dim(`(mint at ${appUrl(appBase, "/setup", p.projectId)})`)}`,
         ),
       );
     } else {
       ui.out(
         field(
           "Ingest key",
-          `set ${color.bold(keyEnvVar)} in .env ${color.dim(`(mint at ${appUrl(appBase, "/settings", p.projectId)})`)}`,
+          `set ${color.bold(keyEnvVar)} in .env ${color.dim(`(mint at ${appUrl(appBase, "/setup", p.projectId)})`)}`,
         ),
       );
     }

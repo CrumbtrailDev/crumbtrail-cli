@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { executePlan } from "../inject/executor";
 import { buildPlan } from "../inject/recipes";
@@ -29,7 +29,13 @@ describe("executePlan — golden create/prepend on a real repo", () => {
   // a single argument is the whole point of this test; don't "fix" it by
   // passing defaultInjectIO.
   it("defaults io to the real filesystem when called with only an input", () => {
-    const root = tmp({ "package.json": "{}", "src/app.d.ts": "" });
+    const root = tmp({
+      "package.json": JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.37.0" },
+      }),
+      "node_modules/crumbtrail-core/package.json": "{}",
+      "src/app.d.ts": "",
+    });
     const plan = buildPlan({
       cwd: root,
       recipe: "sveltekit",
@@ -39,9 +45,21 @@ describe("executePlan — golden create/prepend on a real repo", () => {
   });
 
   it("creates a SvelteKit hooks.client.ts and is then idempotent on re-run", () => {
-    const root = tmp({ "package.json": "{}", "src/app.d.ts": "" });
+    const root = tmp({
+      "package.json": JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.37.0", "crumbtrail-node": "0.37.0" },
+      }),
+      "node_modules/crumbtrail-core/package.json": "{}",
+      "node_modules/crumbtrail-node/package.json": "{}",
+      "src/app.d.ts": "",
+    });
     const plan = buildPlan(
-      { cwd: root, recipe: "sveltekit", endpoint: ENDPOINT },
+      {
+        cwd: root,
+        recipe: "sveltekit",
+        endpoint: ENDPOINT,
+        serviceName: "web",
+      },
       defaultInjectIO,
     );
     expect(plan.kind).toBe("create");
@@ -58,10 +76,16 @@ describe("executePlan — golden create/prepend on a real repo", () => {
     );
     expect(written).not.toMatch(/ctkey_|bgk_|bl_ingest_/);
     expect(written.endsWith("\n")).toBe(true);
+    writeFileSync(path.join(root, ".env.local"), "VITE_CRUMBTRAIL_KEY=ctkey_test\n");
 
-    // Re-detect after writing the file -> target now references crumbtrail -> skip.
+    // Re-detect after the code and key are present -> the complete integration skips.
     const second = buildPlan(
-      { cwd: root, recipe: "sveltekit", endpoint: ENDPOINT },
+      {
+        cwd: root,
+        recipe: "sveltekit",
+        endpoint: ENDPOINT,
+        serviceName: "web",
+      },
       defaultInjectIO,
     );
     expect(second.kind).toBe("skip-already-wired");
@@ -196,7 +220,6 @@ describe("executePlan — all-or-nothing rollback", () => {
 });
 
 // Helper: write a new file body without committing, so git sees it dirty.
-import { writeFileSync } from "node:fs";
 function makeTmpRepoDirty(root: string, rel: string, content: string): void {
   writeFileSync(path.join(root, rel), content);
   // sanity: the file exists and differs from HEAD
@@ -217,12 +240,25 @@ describe("executePlan — Express rewrite", () => {
   ].join("\n");
 
   it("applies a rewrite plan: middleware wired around routes on disk", () => {
-    const root = makeTmpRepo({ "package.json": "{}", "server.js": ENTRY });
+    const root = makeTmpRepo({
+      "package.json": JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.37.0", "crumbtrail-node": "0.37.0" },
+      }),
+      "node_modules/crumbtrail-core/package.json": "{}",
+      "node_modules/crumbtrail-node/package.json": "{}",
+      "server.js": ENTRY,
+    });
     gitInit(root);
     roots.push(root);
     const entry = path.join(root, "server.js");
     const plan = buildPlan(
-      { cwd: root, recipe: "express", endpoint: ENDPOINT, entryFile: entry },
+      {
+        cwd: root,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: entry,
+        serviceName: "api",
+      },
       defaultInjectIO,
     );
     expect(plan.kind).toBe("rewrite");
@@ -235,12 +271,19 @@ describe("executePlan — Express rewrite", () => {
     expect(out.indexOf("app.listen(")).toBeGreaterThan(
       out.indexOf("app.use(createCrumbtrailExpressErrorMiddleware("),
     );
-    // Idempotent: a re-run sees the crumbtrail reference and skips.
-    const again = buildPlan(
-      { cwd: root, recipe: "express", endpoint: ENDPOINT, entryFile: entry },
+    // Idempotent: a re-run sees the complete code and configured key and skips.
+    writeFileSync(path.join(root, ".env"), "CRUMBTRAIL_KEY=ctkey_test\n");
+    const completeAgain = buildPlan(
+      {
+        cwd: root,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: entry,
+        serviceName: "api",
+      },
       defaultInjectIO,
     );
-    expect(again.kind).toBe("skip-already-wired");
+    expect(completeAgain.kind).toBe("skip-already-wired");
   });
 
   it("applies a confirmed dirty rewrite as a full file replace", () => {

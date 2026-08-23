@@ -13,6 +13,7 @@ afterEach(() => {
 });
 
 const pkg = (o: Record<string, unknown>) => JSON.stringify(o);
+const ENDPOINT = "https://ingest.example.com";
 
 /**
  * A realistic polyglot monorepo: JS workspaces + non-JS services that have no
@@ -136,14 +137,26 @@ describe("discoverServices", () => {
       }),
       "apps/web/index.html":
         '<div id=root></div><script type="module" src="/src/main.ts"></script>',
-      "apps/web/src/main.ts": "",
+      "apps/web/src/main.ts": [
+        'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
+        "Crumbtrail.init({",
+        "  ...PRESET_PASSIVE,",
+        `  httpEndpoint: "${ENDPOINT}",`,
+        "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+        "  remoteConfig: true,",
+        '  service: "web",',
+        "});",
+      ].join("\n"),
+      "apps/web/.env.local": "VITE_CRUMBTRAIL_KEY=ctkey_test\n",
       // Declared AND installed. A declaration on its own is a stale range, not
       // a wired app.
       "node_modules/crumbtrail-core/package.json": pkg({
         name: "crumbtrail-core",
       }),
     });
-    const web = discoverServices(repo, detect(repo))[0];
+    const web = discoverServices(repo, detect(repo), undefined, {
+      endpoint: ENDPOINT,
+    })[0];
     expect(web.flags).toContain("already-wired");
     expect(web.defaultChecked).toBe(false);
   });

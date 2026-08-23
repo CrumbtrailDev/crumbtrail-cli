@@ -1067,7 +1067,28 @@ describe("batch installer (monorepo root)", () => {
     expect(out).toContain("refusing to overwrite existing file");
     expect(out).toContain("2 wired");
     expect(out).toContain("1 failed");
-    expect(out).toContain("Re-run `crumbtrail` to retry");
+    expect(out).toContain("Run `crumbtrail` again to retry");
+  });
+
+  it("does not call code changes wired when the key is still missing", async () => {
+    const steps: string[] = [];
+    const deps = batchDeps(steps, [
+      candidate({ relDir: "apps/web" }),
+      candidate({ relDir: "services/api", recipe: "express" }),
+    ]);
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    await runCli(["node", "cli", "--no-write-key"], deps);
+
+    const out = lines.join("\n");
+    expect(out).toContain("Setup incomplete");
+    expect(out).toContain("0 wired");
+    expect(out).toContain("2 need a key");
+    expect(out).not.toContain("Setup complete");
+    expect(out).toContain("Set VITE_CRUMBTRAIL_KEY yourself");
+    expect(out).toContain("/p/p1/setup");
+    expect(out).not.toContain("/settings");
   });
 
   it("injects the name it PROVISIONED, not the raw package name", async () => {
@@ -1178,7 +1199,7 @@ describe("batch installer (monorepo root)", () => {
     expect(steps).toContain("provision:web");
     expect(steps).not.toContain("provision:admin");
     expect(steps).not.toContain("install:/app/apps/admin");
-    expect(lines.join("\n")).toContain("already wired");
+    expect(lines.join("\n")).toContain("complete for this endpoint");
   });
 
   it("does not wait for a Tauri service in the cloud poll", async () => {
@@ -1417,7 +1438,7 @@ describe("wizard — detection-quality notes (CP6)", () => {
     const code = await runCli(["node", "cli"], deps);
     expect(code).toBe(0);
     const out = lines.join("\n");
-    expect(out).toContain("✓ Detected");
+    expect(out).toContain("Detected a ");
     expect(out).toContain(DOCKER_COMING_SOON_NOTE);
   });
 

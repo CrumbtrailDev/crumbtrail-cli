@@ -196,7 +196,7 @@ export function executePlan(
       kind: plan.kind,
       written: [],
       skipped: true,
-      message: "Already wired — skipped.",
+      message: "Complete for this endpoint. Skipped.",
     };
   }
   if (plan.kind === "fallback-ai") {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ApiError } from "../net";
 import {
+  createIngestKey,
   createProject,
   createService,
   explainWrongAccount,
@@ -8,6 +9,7 @@ import {
   inferServiceName,
   listProjects,
   resolveProject,
+  ProjectAccessError,
   UpgradeRequiredError,
 } from "../provision";
 
@@ -344,11 +346,47 @@ describe("explainWrongAccount", () => {
     const err = new ApiError("Project not found (POST /services) [404]", {
       status: 404,
     });
-    const rewritten = explainWrongAccount(err, "prj_9fd0", "someone@example.com");
+    const rewritten = explainWrongAccount(
+      err,
+      "prj_9fd0",
+      "someone@example.com",
+    );
     expect(String((rewritten as Error).message)).toContain(
-      "signed in as someone@example.com has no project prj_9fd0",
+      "signed in as someone@example.com cannot see project prj_9fd0",
     );
     expect(String((rewritten as Error).message)).toContain("crumbtrail logout");
+  });
+
+  it("recognizes a forbidden project route as an account problem too", () => {
+    const err = new ApiError("Forbidden (POST /keys) [403]", { status: 403 });
+    const rewritten = explainWrongAccount(
+      err,
+      "prj_9fd0",
+      "someone@example.com",
+    );
+    expect(rewritten).toBeInstanceOf(ProjectAccessError);
+    expect(String((rewritten as Error).message)).toContain(
+      "cannot see project",
+    );
+  });
+
+  it("rewrites key minting access failures with the same account guidance", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(404, { error: "Project not found" }),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      createIngestKey(
+        "https://cloud.example",
+        "bl_cli_x",
+        "prj_9fd0",
+        fetchImpl,
+        "someone@example.com",
+      ),
+    ).rejects.toMatchObject({
+      name: "ProjectAccessError",
+      message: expect.stringContaining("crumbtrail logout"),
+    });
   });
 
   it("leaves every other failure exactly as it was", () => {

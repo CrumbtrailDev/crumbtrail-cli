@@ -203,6 +203,15 @@ const REMOTE_CONFIG_KEYS = [
 const SEVERITY_FLUSH_MIN_INTERVAL_MS = 1000;
 
 /**
+ * Give a page entering the back forward cache time to announce that it is a
+ * persisted transition before treating a visibility change as a session end.
+ * The timer is zero by design: it yields to the rest of the lifecycle events
+ * in the same turn, while a page that is merely backgrounded still closes on
+ * the next turn.
+ */
+const PAGE_HIDDEN_END_DELAY_MS = 0;
+
+/**
  * Transport that drops every call. Backs the inert instance returned when
  * `init()` runs outside a browser, guaranteeing no socket is opened during SSR
  * or a build step.
@@ -290,6 +299,12 @@ export class Crumbtrail {
   private sessionMetadataWrite: Promise<void> = Promise.resolve();
   private stopped = false;
   private identity: CrumbtrailIdentity = {};
+  private sessionStore?: SessionStore;
+  private lifecycleTimer?: ReturnType<typeof setTimeout>;
+  private lifecycleClosePromise?: Promise<void>;
+  private lifecycleClosing = false;
+  private lifecycleSuspended = false;
+  private lifecycleEndPromise?: Promise<void>;
 
   /**
    * Session replay, off until the server says a project asked for it.
@@ -309,12 +324,14 @@ export class Crumbtrail {
     transport: CrumbtrailTransport,
     ringBuffer: RingBuffer,
     sessionId: string,
+    sessionStore?: SessionStore,
   ) {
     this.config = config;
     this.bus = bus;
     this.transport = transport;
     this.ringBuffer = ringBuffer;
     this.sessionId = sessionId;
+    this.sessionStore = sessionStore;
     this.remotePolicyReady = !remoteConfigProjectKey(config);
     const gpcSuppressed = Boolean(
       config.respectGpc && hasGlobalPrivacyControl(),
@@ -413,6 +430,7 @@ export class Crumbtrail {
       transport,
       ringBuffer,
       sessionId,
+      sessionStore,
     );
 
     // Send events to transport. Flight recorder sessions deliberately keep pre-trigger events
@@ -441,7 +459,7 @@ export class Crumbtrail {
     // its rolling idle window alive across reloads.
     if (useSessionStore && sessionStore) {
       bus.subscribe(() => {
-        writePersistedSession(sessionStore, sessionId);
+        writePersistedSession(sessionStore, instance.sessionId);
       });
     }
 
@@ -474,11 +492,13 @@ export class Crumbtrail {
       }),
     );
 
-    // Last-chance flush on page teardown. `pagehide` is the most reliable
-    // end-of-life signal across browsers (tab close, navigation, bfcache
-    // entry); the transport's keepalive/sendBeacon path then gives the batch a
-    // real chance to leave the page. Guarded because a caller-supplied
-    // `transportInstance` lets init() run without a window (SSR/programmatic).
+    // Last-chance flush and close on page lifecycle changes. `pagehide` is the
+    // most reliable end-of-life signal across browsers (tab close and
+    // navigation), while `visibilitychange` covers mobile backgrounding where
+    // pagehide may never arrive. The transport's keepalive/sendBeacon path then
+    // gives the final batch and end request a real chance to leave the page.
+    // Guarded because a caller-supplied `transportInstance` lets init() run
+    // without a window (SSR/programmatic).
     //
     // `window` existing is not enough to conclude there is an event target
     // behind it. React Native's `setUpGlobals` does `global.window = global`,
@@ -489,29 +509,66 @@ export class Crumbtrail {
       typeof window !== "undefined" &&
       typeof window.addEventListener === "function"
     ) {
-      const onPageHide = () => {
-        bus.flush();
-        // And CLOSE it. A flush alone left the session open, and nothing else
-        // ever ended it: `stop()` is the host's call to make and a closed tab
-        // never makes it, so the server's idle sweeper was the only thing that
-        // finished the session — half an hour later, during which the session
-        // could not be read. The end request rides `keepalive`, so it outlives
-        // the page and still carries the ingest key.
-        if (config.endOnPageHide === false) return;
-        try {
-          void Promise.resolve(transport.endSession(sessionId)).catch(() => {});
-        } catch {
-          // Teardown on an unloading page never takes the host down with it.
+      const cancelLifecycleTimer = () => instance.cancelLifecycleTimer();
+      const onPageHide = (event: Event & { persisted?: boolean }) => {
+        // A persisted pagehide means the document is entering the back forward
+        // cache. Keep that visit open: closing it here would discard the rest
+        // of the visit when the page is restored. The pending visibility timer
+        // is cancelled before the page is frozen.
+        if (event.persisted) {
+          cancelLifecycleTimer();
+          bus.flush();
+          return;
         }
+        if (config.endOnPageHide === false) {
+          bus.flush();
+          return;
+        }
+        // Start the keepalive end request before the unload task can be
+        // discarded. The orderly path used for a page that is merely hidden
+        // can await its event sends; a real navigation or tab close cannot.
+        void instance.closeForLifecycle(true);
+      };
+      const onPageShow = (event: Event & { persisted?: boolean }) => {
+        if (event.persisted) void instance.resumeFromLifecycle();
+      };
+      const onVisibilityChange = () => {
+        if (document.visibilityState === "hidden") {
+          if (config.endOnPageHide !== false)
+            instance.scheduleLifecycleClose();
+          return;
+        }
+        cancelLifecycleTimer();
+        void instance.resumeFromLifecycle();
       };
       window.addEventListener("pagehide", onPageHide);
-      instance.cleanups.push(() =>
-        window.removeEventListener("pagehide", onPageHide),
-      );
+      window.addEventListener("pageshow", onPageShow);
+      if (
+        typeof document !== "undefined" &&
+        typeof document.addEventListener === "function"
+      ) {
+        document.addEventListener("visibilitychange", onVisibilityChange);
+      }
+      instance.cleanups.push(() => {
+        cancelLifecycleTimer();
+        window.removeEventListener("pagehide", onPageHide);
+        window.removeEventListener("pageshow", onPageShow);
+        if (
+          typeof document !== "undefined" &&
+          typeof document.removeEventListener === "function"
+        ) {
+          document.removeEventListener(
+            "visibilitychange",
+            onVisibilityChange,
+          );
+        }
+      });
     }
 
     const collectorContext: CollectorContext = {
-      sessionId,
+      get sessionId() {
+        return instance.sessionId;
+      },
       getDeclaredEnv: () => ({
         flags: instance.declaredFlags,
         config: instance.declaredConfig,
@@ -1199,6 +1256,115 @@ export class Crumbtrail {
     }
   }
 
+  /** Schedule a close for a page that remains hidden after lifecycle events settle. */
+  private scheduleLifecycleClose(): void {
+    if (
+      this.stopped ||
+      this.lifecycleSuspended ||
+      this.lifecycleClosing ||
+      this.lifecycleClosePromise ||
+      this.lifecycleTimer !== undefined
+    )
+      return;
+    this.lifecycleTimer = setTimeout(() => {
+      this.lifecycleTimer = undefined;
+      void this.closeForLifecycle(false);
+    }, PAGE_HIDDEN_END_DELAY_MS);
+  }
+
+  private cancelLifecycleTimer(): void {
+    if (this.lifecycleTimer === undefined) return;
+    clearTimeout(this.lifecycleTimer);
+    this.lifecycleTimer = undefined;
+  }
+
+  /**
+   * Close one browser visit without tearing down the instance.
+   *
+   * A hidden page can return from the back forward cache. The collectors and
+   * bus therefore stay installed, but capture is suspended after the final
+   * batch and resumes under a new session id when the page becomes visible.
+   * The final event sends and session start are awaited before endSession so
+   * the server cannot finalize an incomplete log.
+   */
+  private closeForLifecycle(immediateEnd: boolean): Promise<void> {
+    if (
+      this.stopped ||
+      this.lifecycleSuspended ||
+      this.lifecycleClosePromise
+    ) {
+      if (immediateEnd) this.startLifecycleEnd();
+      return this.lifecycleClosePromise ?? Promise.resolve();
+    }
+
+    this.lifecycleClosePromise = (async () => {
+      // Flush while transport admission is still open. Setting the lifecycle
+      // gate first would make the subscriber discard the final batch.
+      this.bus.flush();
+      this.lifecycleClosing = true;
+      try {
+        if (immediateEnd) this.startLifecycleEnd();
+        await this.sessionMetadataWrite;
+        await Promise.allSettled([...this.pendingSends]);
+
+        const replay = this.replay;
+        this.replay = undefined;
+        try {
+          await replay?.stop().catch(() => {});
+        } catch {
+          // A page leaving the foreground must not keep the host application
+          // alive because replay teardown failed.
+        }
+
+        if (this.deferredDeliveryGaps.length > 0) {
+          const deferred = this.deferredDeliveryGaps;
+          this.deferredDeliveryGaps = [];
+          await this.transport.sendEvents(deferred).catch(() => {});
+        }
+        if (!immediateEnd) this.startLifecycleEnd();
+        await this.lifecycleEndPromise;
+        this.lifecycleSuspended = true;
+      } finally {
+        this.lifecycleClosing = false;
+      }
+    })().finally(() => {
+      this.lifecycleClosePromise = undefined;
+      this.lifecycleEndPromise = undefined;
+    });
+    return this.lifecycleClosePromise;
+  }
+
+  /** Start the unload safe close without waiting for async teardown work. */
+  private startLifecycleEnd(): void {
+    if (this.lifecycleEndPromise || !this.sessionStarted) return;
+    try {
+      this.lifecycleEndPromise = Promise.resolve(
+        this.transport.endSession(this.sessionId),
+      ).catch(() => {});
+    } catch {
+      this.lifecycleEndPromise = Promise.resolve();
+    }
+  }
+
+  /** Start a new visit when a hidden page becomes visible again. */
+  private resumeFromLifecycle(): Promise<void> | undefined {
+    const closing = this.lifecycleClosePromise;
+    if (closing) {
+      return closing.then(() => {
+        void this.resumeFromLifecycle();
+      });
+    }
+    if (this.stopped || !this.lifecycleSuspended) return undefined;
+
+    this.sessionId = generateSessionId();
+    if (this.sessionStore) writePersistedSession(this.sessionStore, this.sessionId);
+    this.sessionStarted = false;
+    this.lifecycleSuspended = false;
+    this.sessionMetadataWrite = Promise.resolve();
+    this.startSessionIfAllowed();
+    return this.sessionMetadataWrite;
+  }
+
   private shouldAdmitEvent(event: BugEvent): boolean {
     if (!this.canTransport()) return false;
     if (this.isFlightRecorderTerminal()) return false;
@@ -1232,6 +1398,8 @@ export class Crumbtrail {
   private canTransport(): boolean {
     return (
       !this.stopped &&
+      !this.lifecycleClosing &&
+      !this.lifecycleSuspended &&
       this.remotePolicyReady &&
       this.consentGranted &&
       !this.killSwitch
@@ -1324,7 +1492,7 @@ export class Crumbtrail {
     });
     // Queued rather than emitted during teardown, and sent directly in stop().
     // Emitting both ways would duplicate the record.
-    if (this.stopped) this.deferredDeliveryGaps.push(gap);
+    if (this.stopped || this.lifecycleClosing) this.deferredDeliveryGaps.push(gap);
     else this.bus.emit(gap);
   }
 
@@ -1559,6 +1727,8 @@ export class Crumbtrail {
   }
 
   async stop(): Promise<{ sessionId: string }> {
+    this.cancelLifecycleTimer();
+    if (this.lifecycleClosePromise) await this.lifecycleClosePromise;
     // A session ending while the remote policy is still outstanding takes the
     // same fallback the timeout takes: open on the local config, say so with a
     // gap, and release the collectors still holding unrepeatable evidence — the

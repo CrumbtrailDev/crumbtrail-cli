@@ -17,8 +17,14 @@
 
 import path from "node:path";
 import { detect, type DetectResult, type Recipe } from "./detect";
-import { projectAlreadyWired, type InjectIO } from "./inject";
+import {
+  inspectIntegration,
+  type InjectIO,
+  type IntegrationCheckInput,
+  type IntegrationStatus,
+} from "./inject";
 import { OTLP_GUIDE_FILENAME } from "./otlp";
+import { inferServiceName } from "./provision";
 import { localFsReader } from "./readers/local-fs";
 import type { FileReader } from "./readers/types";
 import { RECIPE_REGISTRY } from "./recipe-registry";
@@ -64,11 +70,17 @@ export interface ServiceCandidate {
   defaultChecked: boolean;
   /** False when nothing can be wired here (no recipe matched). */
   selectable: boolean;
+  /** Shared completeness evidence used by the prompt and the plan builder. */
+  integration?: IntegrationStatus;
 }
 
 export interface DiscoverDeps {
   detect?: (cwd: string, reader?: FileReader) => DetectResult;
-  /** True when this dir already depends on a Crumbtrail SDK. */
+  /** Endpoint this run is installing for. Missing means completeness is unproven. */
+  endpoint?: string;
+  /** Override the shared completeness check for tests and hosted readers. */
+  integration?: (input: IntegrationCheckInput) => IntegrationStatus;
+  /** Legacy override retained for callers that supply their own detection. */
   alreadyWired?: (dir: string) => boolean;
 }
 
@@ -80,8 +92,8 @@ function injectIOFromReader(reader: FileReader): InjectIO {
     readFile: (p) => reader.readFile(p),
     // A FileReader has no working tree, so there is no honest answer here.
     // Throwing rather than returning a plausible "clean" keeps a future caller
-    // from silently getting a wrong answer. Unreachable today: the only
-    // consumer, projectAlreadyWired, reads files and never asks for git status.
+    // from silently getting a wrong answer. Completeness inspection is read only
+    // and never asks for git status.
     gitStatus: () => {
       throw new Error("gitStatus is unavailable through a FileReader");
     },
@@ -133,7 +145,8 @@ function classify(
   source: CandidateSource,
   fallbackName: string,
   reader: FileReader,
-  deps: Required<Pick<DiscoverDeps, "detect" | "alreadyWired">>,
+  deps: Required<Pick<DiscoverDeps, "detect" | "integration">> &
+    Pick<DiscoverDeps, "endpoint" | "alreadyWired">,
 ): ServiceCandidate {
   const detected = deps.detect(dir, reader);
   const recipe = detected.recipe;
@@ -143,9 +156,20 @@ function classify(
   const isOtlp = recipe === "otlp";
   // An OTLP service has no package.json to inspect, so "already wired" for it
   // means the guide file is already sitting there from a previous run.
+  const integration =
+    recipe != null && !isOtlp && deps.endpoint
+      ? deps.integration({
+          cwd: dir,
+          recipe,
+          endpoint: deps.endpoint,
+          entryFile: detected.entryFile,
+          serviceName: inferServiceName(recipe, pkg?.name ?? fallbackName),
+          io: injectIOFromReader(reader),
+        })
+      : undefined;
   const wired = isOtlp
     ? reader.isFile(path.join(dir, OTLP_GUIDE_FILENAME))
-    : recipe != null && deps.alreadyWired(dir);
+    : integration?.complete ?? deps.alreadyWired?.(dir) ?? false;
 
   if (recipe == null) flags.push("no-recipe");
   if (isOtlp) flags.push("otlp");
@@ -174,6 +198,7 @@ function classify(
     flags,
     defaultChecked,
     selectable,
+    integration,
   };
 }
 
@@ -189,9 +214,9 @@ export function discoverServices(
 ): ServiceCandidate[] {
   const deps = {
     detect: overrides.detect ?? detect,
-    alreadyWired:
-      overrides.alreadyWired ??
-      ((dir: string) => projectAlreadyWired(dir, injectIOFromReader(reader))),
+    endpoint: overrides.endpoint,
+    integration: overrides.integration ?? inspectIntegration,
+    alreadyWired: overrides.alreadyWired,
   };
 
   const byDir = new Map<string, ServiceCandidate>();
