@@ -188,26 +188,52 @@ export function upsertEnvVar(
   };
 }
 
+/** Read a variable from env-file text without exposing the whole file. */
+export function readEnvVar(content: string, name: string): string | undefined {
+  for (const line of content.split("\n")) {
+    const match = assignmentAt(line, name);
+    if (!match) continue;
+    const value = unquote(match[2]);
+    return value.length > 0 ? value : undefined;
+  }
+  return undefined;
+}
+
 /**
  * The env file this app's key belongs in.
  *
- * An existing file always wins over creating a new one, because a second env
- * file that shadows or is shadowed by the first is a debugging problem nobody
- * asked for. With nothing to go on, a bundled variable goes to `.env.local`
- * (the file every frontend toolchain gitignores by default) and a server
- * variable to `.env`.
+ * The order follows the loader the generated SDK code actually uses. A bundled
+ * variable prefers `.env.local`; a server variable prefers `.env`, because
+ * `crumbtrail-node` loads `.env` at startup. An existing file in that order
+ * wins over creating a new one, so the wizard does not split one app's config
+ * across two env files.
  */
 export function chooseEnvFile(
   appDir: string,
   varName: string,
   io: EnvFileIO,
 ): string {
-  for (const candidate of [".env.local", ".env"]) {
+  const bundled =
+    /^(VITE_|NEXT_PUBLIC_|PUBLIC_|EXPO_PUBLIC_|NUXT_PUBLIC_)/.test(varName);
+  const candidates = bundled
+    ? [".env.local", ".env"]
+    : [".env", ".env.local"];
+  // Preserve a value already present in either candidate, even when the
+  // loader-preferred file is the other one. Otherwise a repo with CRUMBTRAIL_KEY
+  // in .env.local and an unrelated .env would receive a second live key.
+  for (const candidate of candidates) {
+    const full = path.join(appDir, candidate);
+    if (
+      io.exists(full) &&
+      readEnvVar(io.readFile(full) ?? "", varName) !== undefined
+    ) {
+      return full;
+    }
+  }
+  for (const candidate of candidates) {
     const full = path.join(appDir, candidate);
     if (io.exists(full)) return full;
   }
-  const bundled =
-    /^(VITE_|NEXT_PUBLIC_|PUBLIC_|EXPO_PUBLIC_|NUXT_PUBLIC_)/.test(varName);
   return path.join(appDir, bundled ? ".env.local" : ".env");
 }
 

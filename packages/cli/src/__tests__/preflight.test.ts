@@ -43,6 +43,9 @@ describe("classifyAuthStatus", () => {
     });
     expect(classifyAuthStatus(401).status).toBe("fail");
     expect(classifyAuthStatus(401).reason).toMatch(/bad or expired/i);
+    expect(
+      classifyAuthStatus(401, "key belongs to another project").reason,
+    ).toBe("ingest key rejected: key belongs to another project (HTTP 401)");
     expect(classifyAuthStatus(403).reason).toMatch(/bad or expired/i);
     expect(classifyAuthStatus(404)).toEqual({
       status: "fail",
