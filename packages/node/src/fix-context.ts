@@ -12,6 +12,7 @@ import type {
   LlmBundleDbStatement,
   LlmBundleDbActivity,
   LlmBundleFrontendRequestEvidenceSummary,
+  LlmBundleFailedRequestSummary,
   LlmBundlePrecedingRequestSummary,
   LlmBundleLinkedFullStackRequestSummary,
 } from "./llm-bundle";
@@ -88,6 +89,13 @@ export interface FixContextPrimaryWindow {
    * Empty when the session recorded no error to anchor on.
    */
   preceding_requests: LlmBundlePrecedingRequestSummary[];
+  /**
+   * Failed browser requests from the finalized evidence bundle. These carry
+   * redacted request and response bodies when capture recorded them, so the
+   * issue handoff does not make an agent reconstruct the cause from raw time
+   * windows.
+   */
+  failed_requests?: LlmBundleFailedRequestSummary[];
   /**
    * Database row diffs correlated to the primary window (CP5 DB diffing). Empty when the session
    * captured no `db.diff` events in the window. Consumers MUST treat `[]` as "no DB evidence".
@@ -577,12 +585,33 @@ function buildPrimaryWindow(
       requests: matched.map((entry) => entry.backend),
     },
     preceding_requests: bundle?.browserEvidence?.precedingRequests ?? [],
+    failed_requests: selectPrimaryFailedRequests(bundle, top),
     db_diffs: selectPrimaryWindowDbDiffs(bundle, window, topRequestId, matched),
     db_reads: selectPrimaryWindowDbReads(bundle, window, topRequestId, matched),
     db_errors: selectPrimaryWindowDbErrors(bundle, window, topRequestId, matched),
     db_statements: selectPrimaryWindowDbStatements(bundle, window, topRequestId, matched),
     db_activity: selectPrimaryWindowDbActivity(bundle, window, topRequestId, matched),
   };
+}
+
+/** Keep the issue's own failed request first, without hiding the full session tool. */
+function selectPrimaryFailedRequests(
+  bundle: LlmBundle | undefined,
+  top: EvidenceCandidate | undefined,
+): LlmBundleFailedRequestSummary[] {
+  const failed = bundle?.browserEvidence?.failedRequests ?? [];
+  if (!top) return failed;
+
+  const method = top.anchor.method?.toUpperCase();
+  const url = top.anchor.url;
+  const status = top.anchor.status;
+  const matching = failed.filter(
+    (request) =>
+      (method === undefined || request.method?.toUpperCase() === method) &&
+      (url === undefined || request.url === url) &&
+      (status === undefined || request.status === status),
+  );
+  return matching.length > 0 ? matching : failed;
 }
 
 /**

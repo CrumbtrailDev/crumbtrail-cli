@@ -847,6 +847,49 @@ describe("MCP Server", () => {
     expect(parsed).toHaveLength(3);
   });
 
+  it("getFailedRequests returns the redacted payload evidence from the bundle", async () => {
+    createSession("sess-rich-failure", [
+      { t: 1000, k: "net.res", d: { st: 400 } },
+    ]);
+    fs.writeFileSync(
+      path.join(tmpDir, "sess-rich-failure", "llm.json"),
+      JSON.stringify({
+        browserEvidence: {
+          failedRequests: [
+            {
+              t: 1000,
+              method: "POST",
+              url: "/api/checkout",
+              status: 400,
+              requestBody: '{"couponCode":"EXPIRED5"}',
+              responseBody: '{"error":"expired_coupon"}',
+            },
+          ],
+        },
+      }),
+    );
+
+    const res = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: "rich-failure",
+      method: "tools/call",
+      params: {
+        name: "getFailedRequests",
+        arguments: { sessionId: "sess-rich-failure" },
+      },
+    });
+    const result = res!.result as any;
+    expect(JSON.parse(result.content[0].text)).toEqual([
+      expect.objectContaining({
+        method: "POST",
+        url: "/api/checkout",
+        status: 400,
+        requestBody: '{"couponCode":"EXPIRED5"}',
+        responseBody: '{"error":"expired_coupon"}',
+      }),
+    ]);
+  });
+
   it("getEvents filters by kind", async () => {
     const events = [
       { t: 1000, k: "nav", d: { to: "/home" } },

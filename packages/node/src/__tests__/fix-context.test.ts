@@ -152,6 +152,7 @@ describe("buildFixContext", async () => {
       "db_errors",
       "db_reads",
       "db_statements",
+      "failed_requests",
       "frontend",
       "preceding_requests",
     ]);
@@ -202,7 +203,52 @@ describe("buildFixContext", async () => {
     const fc = await buildFixContext(sessionDir);
     expect(fc.primary_window.db_diffs).toEqual([]);
     expect(fc.primary_window.db_reads).toEqual([]);
+    expect(fc.primary_window.failed_requests).toEqual([
+      expect.objectContaining({
+        method: "POST",
+        url: "https://app.test/api/checkout",
+        status: 500,
+      }),
+    ]);
     expect(fc.environment).toBeNull();
+  });
+
+  it("carries failed request payload evidence into the primary window", () => {
+    const fc = buildFixContextFromArtifacts(
+      SESSION_ID,
+      { id: SESSION_ID, start: 1000, end: 2000, dur: 1000 },
+      {
+        session: {
+          id: SESSION_ID,
+          startMs: 1000,
+          endMs: 2000,
+          durationMs: 1000,
+        },
+        browserEvidence: {
+          failedRequests: [
+            {
+              t: 1500,
+              method: "POST",
+              url: "/api/checkout",
+              status: 400,
+              requestBody: '{"couponCode":"EXPIRED5"}',
+              responseBody: '{"error":"expired_coupon"}',
+            },
+          ],
+          precedingRequests: [],
+        },
+      } as any,
+      [],
+    );
+    expect(fc.primary_window.failed_requests).toEqual([
+      expect.objectContaining({
+        method: "POST",
+        url: "/api/checkout",
+        status: 400,
+        requestBody: '{"couponCode":"EXPIRED5"}',
+        responseBody: '{"error":"expired_coupon"}',
+      }),
+    ]);
   });
 
   it("populates environment from the session env snapshot with secrets redacted", async () => {
