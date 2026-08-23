@@ -203,8 +203,11 @@ so you pass it to the build instead:
 flutter run --dart-define=CRUMBTRAIL_KEY=<your-ingest-key>
 ```
 
-It won't touch a package that is already wired, and it never edits libraries or
-config-only packages.
+It won't touch a package whose reachable Crumbtrail setup already matches the
+target endpoint, has a configured ingest key and service name, and enables
+remote configuration where the SDK supports it. When an SDK is present but
+the setup is incomplete, the wizard names what is missing and does not add a
+second initialization. It never edits libraries or configuration only packages.
 
 ## Terminal output
 

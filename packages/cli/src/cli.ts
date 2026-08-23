@@ -1130,13 +1130,19 @@ function stackLabel(c: ServiceCandidate): string {
 function candidateHint(c: ServiceCandidate): string {
   const stack = stackLabel(c);
   if (c.flags.includes("no-recipe")) return "no supported framework";
-  if (c.flags.includes("already-wired")) return `${stack} · already wired`;
-  if (c.flags.includes("otlp"))
-    return `${stack} · OTLP guidance, no code changes`;
   if (c.flags.includes("likely-library"))
-    return `${stack} · library? probably not an app`;
-  if (c.flags.includes("ambiguous")) return `${stack} · entry file unclear`;
-  return stack;
+    return `${stack} · shared library, select only if it runs as a service`;
+  if (c.flags.includes("otlp"))
+    return c.flags.includes("already-wired")
+      ? `${stack} · guide exists, skipped`
+      : `${stack} · guidance writes a setup file`;
+  if (c.flags.includes("already-wired"))
+    return `${stack} · complete for this endpoint, skipped`;
+  if (c.flags.includes("ambiguous"))
+    return `${stack} · entry unclear, selecting shows the setup guidance`;
+  if (c.integration?.found && !c.integration.complete)
+    return `${stack} · setup incomplete, selecting shows what is missing`;
+  return `${stack} · selecting installs and wires it`;
 }
 
 function toMultiSelectItems(candidates: ServiceCandidate[]): MultiSelectItem[] {
@@ -1212,7 +1218,9 @@ export async function runBatchWizard(
   const root = deps.cwd;
 
   // 1. Scan.
-  const candidates = deps.discoverServices(root, ctx.root);
+  const candidates = deps.discoverServices(root, ctx.root, undefined, {
+    endpoint: base,
+  });
   const selectableCount = candidates.filter((c) => c.selectable).length;
   ui.out(
     ok(
@@ -1332,7 +1340,7 @@ export async function runBatchWizard(
 
     if (c.flags.includes("already-wired")) {
       // Don't mint a key for a service whose plan would self-cancel anyway.
-      ui.out(ok("Already wired — leaving it untouched."));
+      ui.out(ok("Complete for this endpoint. Leaving it untouched."));
       outcomes.push({
         name,
         relDir: c.relDir,
@@ -1700,7 +1708,7 @@ function printBatchSummary(
           : o.status === "declined"
             ? color.yellow("not wired — you declined the edit")
             : o.status === "skipped-already-wired"
-              ? color.dim("already wired — skipped")
+              ? color.dim("complete for this endpoint · skipped")
               : o.sessionUrl
                 ? color.brand(o.sessionUrl)
                 : o.filesTouched.length > 0
@@ -2124,7 +2132,7 @@ async function applyInjection(
   }
 
   if (plan.kind === "skip-already-wired") {
-    ui.out(ok("Already wired — leaving your code untouched."));
+    ui.out(ok("Complete for this endpoint. Leaving your code untouched."));
     return { outcome: "skipped-already-wired", filesTouched, notes };
   }
 

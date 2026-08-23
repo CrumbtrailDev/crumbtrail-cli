@@ -1178,7 +1178,7 @@ describe("batch installer (monorepo root)", () => {
     expect(steps).toContain("provision:web");
     expect(steps).not.toContain("provision:admin");
     expect(steps).not.toContain("install:/app/apps/admin");
-    expect(lines.join("\n")).toContain("already wired");
+    expect(lines.join("\n")).toContain("complete for this endpoint");
   });
 
   it("does not wait for a Tauri service in the cloud poll", async () => {
@@ -1417,7 +1417,7 @@ describe("wizard — detection-quality notes (CP6)", () => {
     const code = await runCli(["node", "cli"], deps);
     expect(code).toBe(0);
     const out = lines.join("\n");
-    expect(out).toContain("✓ Detected");
+    expect(out).toContain("Detected a ");
     expect(out).toContain(DOCKER_COMING_SOON_NOTE);
   });
 

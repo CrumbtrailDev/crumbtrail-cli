@@ -284,7 +284,7 @@ describe("buildPlan — Next.js", () => {
 });
 
 describe("buildPlan — idempotency", () => {
-  it("skips when package.json already depends on crumbtrail-core", () => {
+  it("does not skip when package.json only depends on crumbtrail-core", () => {
     const io = fakeInjectIO({
       [p("package.json")]: JSON.stringify({
         dependencies: { "crumbtrail-core": "0.1.0" },
@@ -300,12 +300,11 @@ describe("buildPlan — idempotency", () => {
       },
       io,
     );
-    expect(plan.kind).toBe("skip-already-wired");
-    // Nothing to set: an already-wired plan carries no env-var guidance.
-    expect(plan.keyEnvVar).toBeUndefined();
+    expect(plan.kind).not.toBe("skip-already-wired");
+    expect(plan.keyEnvVar).toBe("NEXT_PUBLIC_CRUMBTRAIL_KEY");
   });
 
-  it("skips when the target file already references crumbtrail", () => {
+  it("does not skip a target that references Crumbtrail without complete configuration", () => {
     const io = fakeInjectIO({
       [p("package.json")]: "{}",
       [p("instrumentation-client.ts")]:
@@ -320,7 +319,8 @@ describe("buildPlan — idempotency", () => {
       },
       io,
     );
-    expect(plan.kind).toBe("skip-already-wired");
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.warnings.join(" ")).toContain("the install endpoint");
   });
 
   it("does not skip a package that declares the SDK but never installed it", () => {
@@ -345,7 +345,7 @@ describe("buildPlan — idempotency", () => {
     expect(plan.kind).not.toBe("skip-already-wired");
   });
 
-  it("counts a hoisted install in a parent node_modules", () => {
+  it("does not treat a hoisted SDK alone as a complete integration", () => {
     // pnpm/npm workspaces install once at the repo root, so a nested package
     // has the SDK available with no node_modules of its own.
     const io = fakeInjectIO({
@@ -363,7 +363,7 @@ describe("buildPlan — idempotency", () => {
       },
       io,
     );
-    expect(plan.kind).toBe("skip-already-wired");
+    expect(plan.kind).not.toBe("skip-already-wired");
   });
 });
 
@@ -538,7 +538,7 @@ describe("buildPlan — Flutter", () => {
     expect(plan.warnings.join(" ")).toContain("lib/main.dart");
   });
 
-  it("skips an app already wired, so a re-run does not wire main twice", () => {
+  it("does not call an app complete when main only imports the SDK", () => {
     const io = fakeInjectIO({
       [MAIN]:
         "import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';\nvoid main() {}\n",
@@ -547,10 +547,10 @@ describe("buildPlan — Flutter", () => {
       { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: MAIN },
       io,
     );
-    expect(plan.kind).toBe("skip-already-wired");
+    expect(plan.kind).not.toBe("skip-already-wired");
   });
 
-  it("skips when the pubspec already depends on the SDK", () => {
+  it("does not treat a pubspec dependency alone as complete", () => {
     // Project-level idempotency has to read the pubspec: a Flutter project has
     // no package.json, so the JS check alone would report "not wired" forever.
     const io = fakeInjectIO({
@@ -561,7 +561,7 @@ describe("buildPlan — Flutter", () => {
       { cwd: CWD, recipe: "flutter", endpoint: ENDPOINT, entryFile: MAIN },
       io,
     );
-    expect(plan.kind).toBe("skip-already-wired");
+    expect(plan.kind).not.toBe("skip-already-wired");
   });
 
   it("asks before editing a dirty main.dart, and rewrites when confirmed", () => {
@@ -785,7 +785,7 @@ describe("buildPlan — Tauri", () => {
     expect(warnings).toContain("crumbtrail:default");
   });
 
-  it("skips when the project already references crumbtrail", () => {
+  it("does not treat a Tauri dependency alone as complete", () => {
     const io = fakeInjectIO({
       [p("package.json")]: JSON.stringify({
         dependencies: { "crumbtrail-core": "0.1.0" },
@@ -801,7 +801,7 @@ describe("buildPlan — Tauri", () => {
       },
       io,
     );
-    expect(plan.kind).toBe("skip-already-wired");
+    expect(plan.kind).not.toBe("skip-already-wired");
   });
 });
 
@@ -924,7 +924,7 @@ describe("buildPlan — backend-JS recipes (express/hono/fastify)", () => {
       expectNoKeyLiteral(plan.agentPrompt);
     });
 
-    it(`${recipe}: skips when the project already references crumbtrail`, () => {
+    it(`${recipe}: does not treat the SDK dependency alone as complete`, () => {
       const io = fakeInjectIO({
         [p("package.json")]: JSON.stringify({
           dependencies: { "crumbtrail-node": "0.1.0" },
@@ -940,7 +940,7 @@ describe("buildPlan — backend-JS recipes (express/hono/fastify)", () => {
         },
         io,
       );
-      expect(plan.kind).toBe("skip-already-wired");
+      expect(plan.kind).not.toBe("skip-already-wired");
     });
   }
 });
@@ -1707,7 +1707,7 @@ describe("buildPlan — idempotency covers every SDK package", () => {
     ["react-native", "crumbtrail-react-native", "App.tsx"],
     ["capacitor", "crumbtrail-capacitor", "src/main.ts"],
   ] as const) {
-    it(`skips a ${recipe} app already depending on ${pkg}`, () => {
+    it(`does not treat a ${recipe} dependency as a complete app`, () => {
       // Without this the batch installer mints a SECOND service and a second
       // ingest key for an app that is already wired.
       const io = fakeInjectIO({
@@ -1721,10 +1721,10 @@ describe("buildPlan — idempotency covers every SDK package", () => {
         { cwd: CWD, recipe, endpoint: ENDPOINT, entryFile: p(entry) },
         io,
       );
-      expect(plan.kind).toBe("skip-already-wired");
+      expect(plan.kind).not.toBe("skip-already-wired");
     });
 
-    it(`skips a ${recipe} entry that already imports ${pkg}`, () => {
+    it(`does not treat a ${recipe} import without configuration as complete`, () => {
       const io = fakeInjectIO({
         [p("package.json")]: "{}",
         [p(entry)]: `import { x } from "${pkg}";\n`,
@@ -1733,7 +1733,7 @@ describe("buildPlan — idempotency covers every SDK package", () => {
         { cwd: CWD, recipe, endpoint: ENDPOINT, entryFile: p(entry) },
         io,
       );
-      expect(plan.kind).toBe("skip-already-wired");
+      expect(plan.kind).not.toBe("skip-already-wired");
     });
   }
 });

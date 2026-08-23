@@ -3,7 +3,8 @@
 // is the only module that mutates the filesystem.
 //
 // Pre-flight order, before ANY write is planned:
-//   1. idempotency  — project/target already references crumbtrail-core/-node -> skip
+//   1. completeness — the reachable integration matches this endpoint, key,
+//      service and remote config -> skip
 //   2. cleanliness  — git status on the target; dirty -> needs-confirm (unless force)
 //   3. sanity       — target is a readable module (prepend) or safe-to-create
 // Any failure or ambiguity -> fallback-ai plan carrying the filled snippet +
@@ -14,6 +15,10 @@ import { buildAgentPrompt, buildOtlpSnippets } from "../install/index.js";
 import type { Stack } from "crumbtrail-core";
 import type { Recipe } from "../detect";
 import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
+import {
+  inspectIntegration,
+  type IntegrationStatus,
+} from "./integration";
 import { defaultInjectIO, type InjectIO } from "./io";
 import type { Plan } from "./types";
 import {
@@ -117,7 +122,7 @@ function skipPlan(input: BuildPlanInput, warnings: string[] = []): Plan {
     content: null,
     warnings: [
       ...warnings,
-      "Project already references Crumbtrail — nothing to inject.",
+      "The Crumbtrail integration is complete for this endpoint and service. Nothing to inject.",
     ],
   };
 }
@@ -148,6 +153,76 @@ function fallbackPlan(
     ),
     warnings,
   };
+}
+
+function incompleteSnippet(input: BuildPlanInput): string {
+  const keyExpr = keyExprFor(input) ?? "environment.crumbtrailKey";
+  switch (input.recipe) {
+    case "capacitor":
+      return capacitorInitSnippet(input.endpoint, keyExpr, input.serviceName);
+    case "flutter":
+      return [
+        FLUTTER_IMPORT_LINE,
+        "",
+        ...flutterInitLines(input.endpoint, keyExpr, input.serviceName),
+      ].join("\n");
+    case "nestjs":
+      return nestInitSnippet(input.endpoint, keyExpr, input.serviceName);
+    case "react-native":
+      return reactNativeInitSnippet(input.endpoint, keyExpr, input.serviceName);
+    case "tauri":
+      return tauriInitSnippet();
+    case "express":
+    case "fastify":
+    case "hono":
+    case "node":
+      return nodeInitSnippet(input.endpoint, keyExpr, input.serviceName);
+    case "nuxt":
+      return nuxtPluginSnippet(input.endpoint, keyExpr, input.serviceName);
+    default:
+      return clientInitSnippet(input.endpoint, keyExpr, input.serviceName);
+  }
+}
+
+const INTEGRATION_REQUIREMENT_COPY: Record<
+  IntegrationStatus["missing"][number],
+  string
+> = {
+  sdk: "one or more required Crumbtrail SDK packages",
+  entry: "a reachable Crumbtrail entry point",
+  endpoint: "the install endpoint",
+  "ingest-key": "an ingest key in the configured environment variable",
+  "service-name": "an app or service name",
+  "remote-config": "remote configuration",
+};
+
+function incompletePlan(
+  input: BuildPlanInput,
+  status: IntegrationStatus,
+): Plan {
+  const missing = status.missing
+    .map((requirement) => INTEGRATION_REQUIREMENT_COPY[requirement])
+    .join(", ");
+  return fallbackPlan(input, incompleteSnippet(input), [
+    `Found an existing Crumbtrail integration, but it is incomplete for ${input.endpoint}. Missing ${missing}. Update that integration in place. The installer will not add another initialization.`,
+  ]);
+}
+
+function existingIntegrationPlan(
+  input: BuildPlanInput,
+  io: InjectIO,
+  source: string,
+): Plan | null {
+  if (!referencesCrumbtrail(source)) return null;
+  const status = inspectIntegration({
+    cwd: input.cwd,
+    recipe: input.recipe,
+    endpoint: input.endpoint,
+    entryFile: input.entryFile,
+    serviceName: input.serviceName,
+    io,
+  });
+  return status.complete ? skipPlan(input) : incompletePlan(input, status);
 }
 
 function createPlan(
@@ -185,9 +260,8 @@ function prependWithPreflight(
       `Could not read ${target}; use the snippet or AI prompt to wire it manually.`,
     ]);
   }
-  if (referencesCrumbtrail(existing)) {
-    return skipPlan(input, warnings);
-  }
+  const existingPlan = existingIntegrationPlan(input, io, existing);
+  if (existingPlan) return existingPlan;
   const status = io.gitStatus(input.cwd, target);
   if (status.dirty && !input.options?.force) {
     return {
@@ -252,19 +326,6 @@ function dependsOn(cwd: string, io: InjectIO, name: string): boolean {
 }
 
 /**
- * Every npm package whose presence means this app is already wired. The mobile
- * SDKs are on the list because they are what a React Native / Capacitor install
- * actually adds: leaving them off let a re-run mint a second service and a
- * second ingest key for an app that was already reporting.
- */
-const CRUMBTRAIL_SDK_PACKAGES = [
-  "crumbtrail-core",
-  "crumbtrail-node",
-  "crumbtrail-react-native",
-  "crumbtrail-capacitor",
-] as const;
-
-/**
  * The installed `nuxt` MAJOR from `node_modules/nuxt/package.json`, or null when
  * nuxt is not installed / unreadable. Read from what will actually run rather
  * than the declared range, for the same reason `installedNextVersion` is: a
@@ -282,63 +343,6 @@ function installedNuxtMajor(cwd: string, io: InjectIO): number | null {
     return Number.isFinite(major) ? major : null;
   } catch {
     return null;
-  }
-}
-
-/**
- * True when this package already depends on a Crumbtrail SDK. Load-bearing for
- * the batch installer, which must decide whether to provision a service BEFORE
- * it builds a plan — `buildPlan` uses this to self-cancel into
- * `skip-already-wired`, so a re-run must not mint a second key for a service
- * that is going to be skipped anyway.
- */
-export function projectAlreadyWired(cwd: string, io: InjectIO): boolean {
-  // A Flutter project has no package.json at all, so the JS check below would
-  // report "not wired" forever and a re-run would wire main.dart twice.
-  const pubspec = io.readFile(path.join(cwd, "pubspec.yaml"));
-  if (pubspec != null && /^\s*crumbtrail_flutter\s*:/m.test(pubspec)) {
-    return true;
-  }
-
-  const text = io.readFile(path.join(cwd, "package.json"));
-  if (text == null) return false;
-  try {
-    const pkg = JSON.parse(text) as {
-      dependencies?: Record<string, string>;
-      devDependencies?: Record<string, string>;
-    };
-    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-    return CRUMBTRAIL_SDK_PACKAGES.some(
-      (name) => name in deps && sdkPackageInstalled(cwd, io, name),
-    );
-  } catch {
-    return false;
-  }
-}
-
-/**
- * True when `name` resolves from `cwd` — the dependency is declared AND on disk.
- *
- * A declaration alone is not wiring. A repo can carry a stale range for an SDK
- * nobody ever installed, and reading that as "already wired" skipped the app
- * entirely: the wizard reported the service set up, injection never ran, the
- * install never ran, and the app then failed to start on an import of a package
- * that was not there. Walks up like node resolution so a hoisted monorepo
- * install (root `node_modules`) counts for a nested package.
- */
-function sdkPackageInstalled(
-  cwd: string,
-  io: InjectIO,
-  name: string,
-): boolean {
-  let dir = path.resolve(cwd);
-  for (;;) {
-    if (io.exists(path.join(dir, "node_modules", name, "package.json"))) {
-      return true;
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) return false;
-    dir = parent;
   }
 }
 
@@ -444,7 +448,10 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
     const { loaded, shadowed } = findInstrumentationClient(io, cwd, baseDir);
     if (loaded) {
       const existing = io.readFile(loaded);
-      if (existing && referencesCrumbtrail(existing)) return skipPlan(input);
+      if (existing) {
+        const existingPlan = existingIntegrationPlan(input, io, existing);
+        if (existingPlan) return existingPlan;
+      }
       // A user-owned instrumentation-client already exists — prepend into it,
       // whatever its extension and whichever of the two directories it sits in.
       // Creating a sibling would replace it rather than join it.
@@ -542,7 +549,10 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
   );
   if (io.exists(target)) {
     const existing = io.readFile(target);
-    if (existing && referencesCrumbtrail(existing)) return skipPlan(input);
+    if (existing) {
+      const existingPlan = existingIntegrationPlan(input, io, existing);
+      if (existingPlan) return existingPlan;
+    }
     // Don't clobber an existing user plugin of the same name — hand off.
     return fallbackPlan(input, block, [
       `${target} already exists and isn't Crumbtrail's — wire it manually.`,
@@ -626,9 +636,8 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
       `Could not read ${target}; use the snippet or AI prompt to wire it manually.`,
     ]);
   }
-  if (referencesCrumbtrail(existing)) {
-    return skipPlan(input);
-  }
+  const existingPlan = existingIntegrationPlan(input, io, existing);
+  if (existingPlan) return existingPlan;
 
   const style = detectExpressModuleStyle(existing);
   const wired = style
@@ -867,9 +876,8 @@ function planFlutter(input: BuildPlanInput, io: InjectIO): Plan {
       buildNote,
     ]);
   }
-  if (referencesCrumbtrail(existing)) {
-    return skipPlan(input);
-  }
+  const existingPlan = existingIntegrationPlan(input, io, existing);
+  if (existingPlan) return existingPlan;
 
   const wired = wireFlutterMain(
     existing,
@@ -1040,10 +1048,19 @@ export function buildPlan(
 }
 
 function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
-  // Project-level idempotency runs first for every recipe.
-  if (projectAlreadyWired(input.cwd, io)) {
-    return skipPlan(input);
-  }
+  // Dependency presence is not enough. Only a complete integration for this
+  // endpoint and service may skip the write. An incomplete reachable setup is
+  // handed back as guidance so the existing initializer is repaired in place.
+  const integration = inspectIntegration({
+    cwd: input.cwd,
+    recipe: input.recipe,
+    endpoint: input.endpoint,
+    entryFile: input.entryFile,
+    serviceName: input.serviceName,
+    io,
+  });
+  if (integration.complete) return skipPlan(input);
+  if (integration.found) return incompletePlan(input, integration);
   switch (input.recipe) {
     case "tauri":
       return planTauri(input, io);
