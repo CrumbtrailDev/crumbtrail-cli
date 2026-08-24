@@ -288,7 +288,7 @@ function usage(): string {
     ),
     "",
     color.dim(
-      "In a monorepo, run it from the repo root: it scans every workspace and service,",
+      "With more than one app, run it from the repo root: it scans every workspace and service,",
     ),
     color.dim("shows you what it found, and wires the ones you pick."),
     "",
@@ -683,6 +683,26 @@ export async function runWizard(
   const result = deps.detect(cwd);
   if (result.isMonorepo) {
     return runBatchWizard(parsed, deps, { base, wizardStart, root: result });
+  }
+
+  // A repo root can hold several services without any workspace file linking
+  // them — `admin/` next to `api/`, a root package.json with no framework deps.
+  // --help promises the root run scans every service, and detection can already
+  // name these, so they are wired from the root like real workspaces instead of
+  // the user being sent to cd into each one and start over.
+  if (!result.recipe && !parsed.workspace) {
+    const siblings = deps.discoverServices(cwd, result, undefined, {
+      endpoint: base,
+      includeUnlinkedApps: true,
+    });
+    if (siblings.some((c) => c.selectable)) {
+      return runBatchWizard(parsed, deps, {
+        base,
+        wizardStart,
+        root: result,
+        includeUnlinkedApps: true,
+      });
+    }
   }
 
   if (!result.recipe) {
@@ -1244,6 +1264,8 @@ interface BatchContext {
   base: string;
   wizardStart: number;
   root: DetectResult;
+  /** Root holds unlinked sibling services rather than declared workspaces. */
+  includeUnlinkedApps?: boolean;
 }
 
 /**
@@ -1266,11 +1288,14 @@ export async function runBatchWizard(
   // 1. Scan.
   const candidates = deps.discoverServices(root, ctx.root, undefined, {
     endpoint: base,
+    includeUnlinkedApps: ctx.includeUnlinkedApps,
   });
   const selectableCount = candidates.filter((c) => c.selectable).length;
   ui.out(
     ok(
-      `Monorepo — found ${color.bold(String(candidates.length))} package(s), ${color.bold(color.brand(String(selectableCount)))} wireable.`,
+      ctx.includeUnlinkedApps
+        ? `Repo root — found ${color.bold(String(candidates.length))} service(s), ${color.bold(color.brand(String(selectableCount)))} wireable.`
+        : `Monorepo — found ${color.bold(String(candidates.length))} package(s), ${color.bold(color.brand(String(selectableCount)))} wireable.`,
     ),
   );
   if (selectableCount === 0) {
@@ -1300,7 +1325,7 @@ export async function runBatchWizard(
     ui.err("");
     ui.err(
       color.red(
-        `Monorepo at ${root}, but this shell is not interactive. Pass --only <service> (repeatable) or --all.`,
+        `${ctx.includeUnlinkedApps ? "Several services under" : "Monorepo at"} ${root}, but this shell is not interactive. Pass --only <service> (repeatable) or --all.`,
       ),
     );
     for (const c of candidates) {

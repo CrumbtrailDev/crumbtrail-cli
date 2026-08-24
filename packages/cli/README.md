@@ -160,6 +160,11 @@ Two kinds of change, in the package it's wiring:
   first statement of `main()` (capture has to be running before the first frame)
 - your ingest key, in an env file, plus a `.gitignore` entry for that file
 
+Browser inits also carry an empty `networkCorrelationAllowedOrigins` list with a
+comment saying what belongs in it. Fill it in when your API is on another origin,
+or frontend and backend evidence never join. See
+[If your frontend and backend are separate services](#if-your-frontend-and-backend-are-separate-services).
+
 It writes none of it when the SDK could not be installed. An import for a package
 that is not there does not degrade, it fails the build, so a failed install ends
 with your repository untouched and a note saying what to install.
@@ -210,6 +215,43 @@ target endpoint, has a configured ingest key and service name, and enables
 remote configuration where the SDK supports it. When an SDK is present but
 the setup is incomplete, the wizard names what is missing and does not add a
 second initialization. It never edits libraries or configuration only packages.
+
+## If your frontend and backend are separate services
+
+The injected browser init carries one field you have to fill in yourself:
+
+```ts
+networkCorrelationAllowedOrigins: [],
+```
+
+Crumbtrail joins a session to its backend requests by stamping
+`X-Crumbtrail-Session-Id`, `X-Crumbtrail-Request-Id` and W3C `traceparent` on
+outbound calls. Calls to the page's own origin are stamped automatically. Calls
+to another origin, which is every call from a browser app to an API on a
+different host or port, are stamped only when that origin is listed here:
+
+```ts
+networkCorrelationAllowedOrigins: [
+  "https://api.example.com",
+  "http://localhost:4000",
+],
+```
+
+Leave it empty and both halves still capture, but they never join: the session
+holds the failing click and the backend holds the failing request, with nothing
+connecting the two. The wizard does not guess the origins, because stamping an
+origin your app did not name would send trace context to a third party API and
+add a CORS preflight to calls that had none.
+
+Two things to check on the backend side: its CORS
+`Access-Control-Allow-Headers` has to cover `x-crumbtrail-session-id`,
+`x-crumbtrail-request-id` and `traceparent`, and the backend itself needs the
+Crumbtrail SDK wired so it records the requests those headers arrive on. Run the
+wizard once per service to do that.
+
+When a request would have been stamped and its origin is not listed, the SDK
+prints one line to the browser console naming that origin, so a missing entry
+shows up while you are testing rather than as an empty dashboard later.
 
 ## Terminal output
 

@@ -995,6 +995,76 @@ function batchDeps(
   );
 }
 
+// Defect class: a repo root with no framework of its own but real sibling
+// services. --help promises the root run scans every service; it used to print
+// "No supported framework" and tell the reader to cd into each directory.
+describe("batch installer (unlinked sibling services)", () => {
+  function siblingDeps(steps: string[], candidates: ServiceCandidate[]) {
+    const seen: { includeUnlinkedApps?: boolean }[] = [];
+    const deps = batchDeps(steps, candidates, {
+      detect: vi.fn(() => {
+        steps.push("detect");
+        // No workspaces, no recipe — the exact shape that used to dead-end.
+        return detectResult({
+          cwd: "/app",
+          isMonorepo: false,
+          ambiguous: true,
+          recipe: null,
+          entryFile: null,
+          reasons: ["looked in /app; package.json has no dependencies matching a recipe"],
+        });
+      }),
+      discoverServices: vi.fn(
+        (
+          _root: string,
+          _rootResult: DetectResult,
+          _reader: unknown,
+          over: { includeUnlinkedApps?: boolean } = {},
+        ) => {
+          steps.push("discover");
+          seen.push(over);
+          return over.includeUnlinkedApps ? candidates : [];
+        },
+      ) as unknown as WizardDeps["discoverServices"],
+    });
+    return { deps, seen };
+  }
+
+  it("offers both sibling services from the root instead of dead-ending", async () => {
+    const steps: string[] = [];
+    const { deps, seen } = siblingDeps(steps, [
+      candidate({ relDir: "admin", recipe: "vite-spa", source: "scan" }),
+      candidate({ relDir: "api", recipe: "hono", source: "scan" }),
+    ]);
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    const code = await runCli(["node", "cli", "--all"], deps);
+    expect(code).toBe(0);
+    const out = lines.join("\n");
+    expect(out).not.toContain("No supported framework");
+    expect(out).not.toContain("cd apps/web && npx crumbtrail");
+    expect(out).toContain("Repo root");
+    expect(steps).toContain("provision:admin");
+    expect(steps).toContain("provision:api");
+    // One login and one project for the pair, exactly like a real workspace.
+    expect(steps.filter((s) => s === "login")).toHaveLength(1);
+    expect(steps.filter((s) => s === "project")).toHaveLength(1);
+    expect(seen.every((o) => o.includeUnlinkedApps === true)).toBe(true);
+  });
+
+  it("still dead-ends honestly when nothing nearby is wireable", async () => {
+    const steps: string[] = [];
+    const { deps } = siblingDeps(steps, []);
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    const code = await runCli(["node", "cli"], deps);
+    expect(code).toBe(1);
+    expect(lines.join("\n")).toContain("No supported framework in /app");
+  });
+});
+
 describe("batch installer (monorepo root)", () => {
   it("wires every checked service: one login, one project, one poll", async () => {
     const steps: string[] = [];

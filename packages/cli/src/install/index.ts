@@ -426,7 +426,18 @@ export function buildAgentPrompt(
     // consent mode, session replay and live probes all stay at whatever this
     // call happens to say and the project's own settings never reach the app.
     "         remoteConfig: true,",
+    // Empty by default, and an empty list means only same origin calls carry the
+    // session, request and traceparent headers. A browser app calling an API on
+    // another host is the normal multi service shape, so without this field
+    // named here the hand-off produces an install whose frontend and backend
+    // evidence never joins, silently.
+    "         networkCorrelationAllowedOrigins: [],",
     "       });",
+    "     Fill networkCorrelationAllowedOrigins with every backend origin this app",
+    '     calls, for example "https://api.example.com", taking them from the app\'s',
+    "     own API base URL configuration. Cross origin requests are joined to the",
+    "     session only when their origin is listed. Do not add origins the app does",
+    "     not call.",
     ...(hasExplicitServiceName
       ? [
           "     Keep the service field exactly as written. It is how this app is",

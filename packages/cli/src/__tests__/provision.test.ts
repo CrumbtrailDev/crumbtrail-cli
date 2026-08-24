@@ -270,8 +270,56 @@ describe("resolveProject interactive default", () => {
     }) as unknown as typeof fetch;
   }
 
-  it("offers the existing project first, so joining is the default", async () => {
+  it("defaults to a new project when nothing ties the repo to an existing one", async () => {
     const { seen, prompter } = prompterThatPicks(0);
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST")
+        return jsonResponse(200, { id: "p2", name: "checkout" });
+      if (String(url).includes("/api/projects"))
+        return jsonResponse(200, { projects: [{ id: "p1", name: "Acme" }] });
+      return jsonResponse(200, {});
+    }) as unknown as typeof fetch;
+
+    const project = await resolveProject({
+      base: "http://127.0.0.1:1",
+      token: "bl_cli_x",
+      ui,
+      prompter,
+      assumeYes: false,
+      defaultProjectName: "checkout",
+      fetchImpl,
+    });
+    // A blind Enter must not file this repo's telemetry into somebody else's
+    // project: the default row creates a project named after this repo.
+    expect(seen.labels[0]).toContain("Create a new project (checkout)");
+    expect(seen.labels[1]).toBe("Acme");
+    expect(seen.def).toBe(0);
+    expect(project).toMatchObject({ id: "p2", name: "checkout" });
+  });
+
+  it("defaults to the existing project whose name matches this repo", async () => {
+    const { seen, prompter } = prompterThatPicks(1);
+    const project = await resolveProject({
+      base: "http://127.0.0.1:1",
+      token: "bl_cli_x",
+      ui,
+      prompter,
+      assumeYes: false,
+      defaultProjectName: "Checkout",
+      fetchImpl: listing([
+        { id: "p1", name: "Acme" },
+        { id: "p2", name: "checkout" },
+      ]),
+    });
+    // The name match is the one signal that the repo already maps to a
+    // project, so joining it is the safe blind answer and leads the list.
+    expect(seen.def).toBe(1);
+    expect(seen.labels[2]).toContain("Create a new project");
+    expect(project).toMatchObject({ id: "p2", name: "checkout" });
+  });
+
+  it("still joins an existing project when the reader picks its row", async () => {
+    const { prompter } = prompterThatPicks(1);
     const project = await resolveProject({
       base: "http://127.0.0.1:1",
       token: "bl_cli_x",
@@ -281,15 +329,11 @@ describe("resolveProject interactive default", () => {
       defaultProjectName: "checkout",
       fetchImpl: listing([{ id: "p1", name: "Acme" }]),
     });
-    // Index 0 is the tenant's project, not "Create a new project".
-    expect(seen.labels[0]).toBe("Acme");
-    expect(seen.labels[1]).toContain("Create a new project");
-    expect(seen.def).toBe(0);
     expect(project).toMatchObject({ id: "p1", name: "Acme" });
   });
 
-  it("still creates one when the reader picks the last row", async () => {
-    const { prompter } = prompterThatPicks(1);
+  it("creates one when the reader picks the create row", async () => {
+    const { prompter } = prompterThatPicks(0);
     const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       if (init?.method === "POST")
         return jsonResponse(200, { id: "p2", name: "checkout" });

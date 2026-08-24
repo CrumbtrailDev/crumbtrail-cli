@@ -45,6 +45,52 @@ type PendingRequestMap = Map<
 >;
 
 /* ------------------------------------------------------------------ */
+/* Correlation allowlist diagnostics                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Says once, per backend origin, that a request which was otherwise ready to
+ * carry correlation headers went out without them.
+ *
+ * `networkCorrelationAllowedOrigins` defaults to empty and a browser app calling
+ * a backend on another origin is the normal shape of a multi service product, so
+ * the default outcome is a session whose frontend and backend evidence never
+ * joins. Nothing in the request, the session, or the dashboard names the cause,
+ * which makes a correct looking install indistinguishable from a broken one.
+ * This is the one line that names it.
+ *
+ * Deliberately quiet: `console.info`, once per origin per page, and capped, so a
+ * production app with a chatty API prints at most a handful of lines. Never
+ * throws — a host with an unusual console must not be taken down by a
+ * diagnostic.
+ */
+const CORRELATION_HINT_MAX_ORIGINS = 10;
+const correlationHintedOrigins = new Set<string>();
+
+function hintCorrelationOriginNotAllowed(url: string): void {
+  try {
+    const base = (globalThis as { location?: { href?: string } }).location
+      ?.href;
+    const origin = new URL(url, base).origin;
+    if (correlationHintedOrigins.has(origin)) return;
+    if (correlationHintedOrigins.size >= CORRELATION_HINT_MAX_ORIGINS) return;
+    correlationHintedOrigins.add(origin);
+    if (typeof console !== "undefined" && typeof console.info === "function") {
+      console.info(
+        `[crumbtrail] requests to ${origin} are not carrying session correlation headers, so this session's frontend and backend evidence will not be joined. Add ${origin} to networkCorrelationAllowedOrigins in your Crumbtrail.init config to join them.`,
+      );
+    }
+  } catch {
+    // Diagnostics never break the host page.
+  }
+}
+
+/** Test seam: the hint is once per page, and a suite is one page. */
+export function __resetCorrelationHintsForTests(): void {
+  correlationHintedOrigins.clear();
+}
+
+/* ------------------------------------------------------------------ */
 /* Body deduplication                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -378,10 +424,19 @@ function applyFetchCorrelationHeaders(
   const existingHeaders = headersToInit(input, init);
   const url = extractUrlString(input);
 
+  if (!config.networkCorrelationHeaders) {
+    return { input, init, requestHeaders: headersToRecord(existingHeaders) };
+  }
+
   if (
-    !config.networkCorrelationHeaders ||
     !canInjectCorrelationHeaders(url, config.networkCorrelationAllowedOrigins)
   ) {
+    // Only a request that would otherwise have been stamped is worth naming: an
+    // app with no session yet has a different problem, and saying so here would
+    // point at the wrong setting.
+    if (existingHeaders?.get(CRUMBTRAIL_SESSION_HEADER) ?? context?.sessionId) {
+      hintCorrelationOriginNotAllowed(url);
+    }
     return { input, init, requestHeaders: headersToRecord(existingHeaders) };
   }
 
@@ -871,13 +926,23 @@ function wrapXHR(
       return origSend.call(this, body);
     }
 
-    if (
+    const correlationAllowed =
       config.networkCorrelationHeaders &&
       canInjectCorrelationHeaders(
         meta.url,
         config.networkCorrelationAllowedOrigins,
-      )
+      );
+
+    if (
+      !correlationAllowed &&
+      config.networkCorrelationHeaders &&
+      (getHeaderValue(meta.requestHeaders, CRUMBTRAIL_SESSION_HEADER) ??
+        context?.sessionId)
     ) {
+      hintCorrelationOriginNotAllowed(meta.url);
+    }
+
+    if (correlationAllowed) {
       const existingSessionId = getHeaderValue(
         meta.requestHeaders,
         CRUMBTRAIL_SESSION_HEADER,

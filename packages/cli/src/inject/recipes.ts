@@ -13,7 +13,8 @@
 import path from "node:path";
 import { buildAgentPrompt, buildOtlpSnippets } from "../install/index.js";
 import type { Stack } from "crumbtrail-core";
-import type { Recipe } from "../detect";
+import { isBuildOutputPath, type Recipe } from "../detect";
+import type { FileReader } from "../readers/types";
 import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
 import {
   inspectIntegration,
@@ -1031,11 +1032,47 @@ function planOtlp(input: BuildPlanInput): Plan {
  * Build the injection Plan for a detected recipe. Reads only (via `io`); the
  * returned Plan is plain data the executor applies all-or-nothing.
  */
+/**
+ * A build artifact is never a legal injection target, whatever the caller says.
+ *
+ * Detection already refuses them, but buildPlan is also called directly (the
+ * dashboard wizard, the batch installer, tests), and an edit written into
+ * `dist/` is the worst possible failure: the run reports success, `tsc` erases
+ * the edit on the next build, and the dev command that runs the source never
+ * loaded it — silent zero capture with a green checkmark. Dropping the entry to
+ * null here routes the recipe to its manual-snippet fallback, with the reason
+ * stated.
+ */
+function refuseBuildOutputEntry(
+  input: BuildPlanInput,
+  io: InjectIO,
+): { input: BuildPlanInput; warning: string | null } {
+  const entry = input.entryFile;
+  if (!entry) return { input, warning: null };
+  const reader: FileReader = {
+    readFile: (p) => io.readFile(p),
+    isFile: (p) => io.exists(p),
+    isDir: (p) => io.exists(p),
+    readDir: () => [],
+    root: input.cwd,
+  };
+  if (!isBuildOutputPath(input.cwd, entry, reader)) {
+    return { input, warning: null };
+  }
+  return {
+    input: { ...input, entryFile: null },
+    warning: `${path.relative(input.cwd, entry) || entry} is build output, not source. Injecting there would be erased by the next build and never loaded by the dev command, so it was refused — wire the source entry manually with the snippet below.`,
+  };
+}
+
 export function buildPlan(
   input: BuildPlanInput,
   io: InjectIO = defaultInjectIO,
 ): Plan {
+  const refused = refuseBuildOutputEntry(input, io);
+  input = refused.input;
   const plan = dispatchPlan(input, io);
+  if (refused.warning) plan.warnings = [refused.warning, ...plan.warnings];
   // Stamp the env var the injected code reads its key from, so the wizard can
   // print "set <VAR> in .env — get your key from the dashboard". Undefined for
   // recipes that inject no key (tauri / otlp / angular) or when already wired.

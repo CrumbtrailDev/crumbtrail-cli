@@ -95,6 +95,7 @@ export interface DetectResult {
 interface PackageJson {
   name?: string;
   main?: string;
+  module?: string;
   bin?: string | Record<string, string>;
   scripts?: Record<string, string>;
   dependencies?: Record<string, string>;
@@ -353,33 +354,195 @@ export function resolveReactNativeEntry(
   return null;
 }
 
-/** Pull a node script/module path out of a `start`-style command. */
+/** Node runners whose next non-flag file argument is the module being run. */
+const NODE_RUNNERS = new Set([
+  "node",
+  "nodemon",
+  "ts-node",
+  "ts-node-dev",
+  "tsx",
+  "swc-node",
+  "babel-node",
+  "bun",
+  "deno",
+]);
+
+const JS_FILE_RE = /\.[cm]?[jt]sx?$/;
+
+/**
+ * Pull a node script/module path out of a `start`-style command.
+ *
+ * Tokenized rather than matched in one regex because real dev scripts put
+ * non-flag words between the runner and the file — `tsx watch src/index.ts`,
+ * `nodemon --exec ts-node src/index.ts` — and the old single-regex form
+ * silently returned null for every one of them, which is what sent `hono`
+ * detection to `main` (a build artifact) instead of the source entry.
+ */
 export function parseNodeInvocation(script: string): string | null {
-  const m = script.match(
-    /\b(?:node|nodemon|ts-node|tsx)\b(?:\s+(?:--?[^\s]+))*\s+([^\s&|]+\.[cm]?[jt]s)\b/,
+  // Only the first command in a chain runs the app; `&& tsc` is not an entry.
+  const head = script.split(/&&|\|\||[;|&]/)[0];
+  const tokens = head.trim().split(/\s+/).filter(Boolean);
+  const runnerAt = tokens.findIndex((t) =>
+    NODE_RUNNERS.has(t.replace(/^.*\//, "")),
   );
-  return m ? m[1] : null;
+  if (runnerAt < 0) return null;
+  for (const token of tokens.slice(runnerAt + 1)) {
+    if (token.startsWith("-")) continue;
+    if (JS_FILE_RE.test(token)) return token;
+  }
+  return null;
 }
 
+/** Directory names that only ever hold compiler/bundler output. */
+const BUILD_OUTPUT_DIRS = new Set([
+  "dist",
+  "build",
+  "out",
+  "output",
+  ".next",
+  ".nuxt",
+  ".output",
+  ".svelte-kit",
+  ".vercel",
+  ".netlify",
+  ".turbo",
+  "coverage",
+]);
+
+const TSCONFIG_FILES = [
+  "tsconfig.json",
+  "tsconfig.build.json",
+  "tsconfig.app.json",
+];
+
+/** `compilerOptions.outDir` values declared by this package's tsconfigs. */
+function tsconfigPaths(
+  cwd: string,
+  reader: FileReader,
+  field: "outDir" | "rootDir",
+): string[] {
+  const found: string[] = [];
+  for (const file of TSCONFIG_FILES) {
+    const text = safeRead(path.join(cwd, file), reader);
+    if (!text) continue;
+    // Text-scanned, not parsed: tsconfig is JSONC and a JSON.parse would throw
+    // on the comments every generated tsconfig ships with.
+    const m = text.match(new RegExp(`"${field}"\\s*:\\s*"([^"]+)"`));
+    if (m) found.push(m[1]);
+  }
+  return found;
+}
+
+function isWithin(parent: string, child: string): boolean {
+  const rel = path.relative(parent, child);
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/**
+ * Is `candidate` a build artifact rather than a source file?
+ *
+ * Injecting into build output is silent zero capture: the next `tsc`/bundler
+ * run deletes the edit, and a dev command that runs the source never loads it
+ * at all. So build output is refused as an injection target as a CLASS — by
+ * directory name and by every tsconfig `outDir` this package declares — not
+ * case by case.
+ */
+export function isBuildOutputPath(
+  cwd: string,
+  candidate: string,
+  reader: FileReader = localFsReader(cwd),
+): boolean {
+  const root = path.resolve(cwd);
+  const abs = path.resolve(candidate);
+  const rel = path.relative(root, abs);
+  // Outside the package: not this package's build shape to judge.
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return false;
+  const dirs = rel.split(path.sep).slice(0, -1);
+  if (dirs.some((d) => BUILD_OUTPUT_DIRS.has(d))) return true;
+  for (const outDir of tsconfigPaths(root, reader, "outDir")) {
+    if (isWithin(path.resolve(root, outDir), abs)) return true;
+  }
+  return false;
+}
+
+/** Dev-first script order: what actually runs in development wins. */
+const ENTRY_SCRIPT_KEYS = [
+  "dev",
+  "start:dev",
+  "dev:server",
+  "develop",
+  "start",
+  "serve",
+  "start:prod",
+];
+
+/**
+ * Resolve the SOURCE entry a Node-flavoured backend actually runs.
+ *
+ * Order is load-bearing. `main`/`bin` on a TypeScript service point at the
+ * compiled artifact (`dist/index.js`), so the dev/start scripts — the commands
+ * that really boot the app — are consulted first, then the manifest fields,
+ * then the conventional source entry under the tsconfig `rootDir`. Any
+ * candidate that resolves inside build output is discarded outright: returning
+ * null sends the caller to the manual-snippet fallback, which is honest, where
+ * returning `dist/index.js` looks like success and captures nothing.
+ */
 function resolveNodeEntry(
   cwd: string,
   pkg: PackageJson,
   reader: FileReader,
+  reasons?: string[],
 ): string | null {
   const candidates: string[] = [];
+  const scripts = pkg.scripts ?? {};
+  for (const key of ENTRY_SCRIPT_KEYS) {
+    const script = scripts[key];
+    if (typeof script !== "string") continue;
+    const fromScript = parseNodeInvocation(script);
+    if (fromScript) candidates.push(fromScript);
+  }
   if (typeof pkg.main === "string") candidates.push(pkg.main);
+  if (typeof pkg.module === "string") candidates.push(pkg.module);
   if (typeof pkg.bin === "string") candidates.push(pkg.bin);
   else if (pkg.bin && typeof pkg.bin === "object") {
     const first = Object.values(pkg.bin)[0];
     if (first) candidates.push(first);
   }
-  if (pkg.scripts?.start) {
-    const fromStart = parseNodeInvocation(pkg.scripts.start);
-    if (fromStart) candidates.push(fromStart);
-  }
+  const rejected: string[] = [];
   for (const c of candidates) {
     const full = path.join(cwd, c);
-    if (reader.isFile(full)) return full;
+    if (!reader.isFile(full)) continue;
+    if (isBuildOutputPath(cwd, full, reader)) {
+      if (!rejected.includes(c)) rejected.push(c);
+      continue;
+    }
+    return full;
+  }
+  if (rejected.length === 0) return null;
+
+  // Every declared entry was build output. Only now — never as a general
+  // widening of the `node` matcher — look for the conventional source entry
+  // under the tsconfig `rootDir`, so a TypeScript service whose only manifest
+  // pointer is `dist/` still gets wired where the source lives.
+  for (const dir of [...tsconfigPaths(cwd, reader, "rootDir"), "src"]) {
+    for (const base of ["index", "main", "server", "app"]) {
+      for (const ext of [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]) {
+        const full = path.join(cwd, dir, base + ext);
+        if (reader.isFile(full) && !isBuildOutputPath(cwd, full, reader)) {
+          if (reasons) {
+            reasons.push(
+              `package.json pointed at build output (${rejected.join(", ")}); wiring the source entry instead`,
+            );
+          }
+          return full;
+        }
+      }
+    }
+  }
+  if (reasons) {
+    reasons.push(
+      `refused build output as an injection target (${rejected.join(", ")}) — a build would erase the edit and the dev command never loads it`,
+    );
   }
   return null;
 }
@@ -773,7 +936,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!("express" in deps) || !pkg) return null;
       reasons.push("found `express` dependency");
       return {
-        entryFile: resolveNodeEntry(root, pkg, reader),
+        entryFile: resolveNodeEntry(root, pkg, reader, reasons),
         nextVersion: null,
       };
     },
@@ -784,7 +947,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!("hono" in deps) || !pkg) return null;
       reasons.push("found `hono` dependency");
       return {
-        entryFile: resolveNodeEntry(root, pkg, reader),
+        entryFile: resolveNodeEntry(root, pkg, reader, reasons),
         nextVersion: null,
       };
     },
@@ -795,7 +958,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!("fastify" in deps) || !pkg) return null;
       reasons.push("found `fastify` dependency");
       return {
-        entryFile: resolveNodeEntry(root, pkg, reader),
+        entryFile: resolveNodeEntry(root, pkg, reader, reasons),
         nextVersion: null,
       };
     },
@@ -819,7 +982,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
     "node",
     ({ root, pkg, reasons, reader }) => {
       if (!pkg) return null;
-      const nodeEntry = resolveNodeEntry(root, pkg, reader);
+      const nodeEntry = resolveNodeEntry(root, pkg, reader, reasons);
       if (!nodeEntry) return null;
       reasons.push("resolved a Node server entry from package.json");
       return { entryFile: nodeEntry, nextVersion: null };

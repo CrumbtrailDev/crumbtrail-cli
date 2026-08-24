@@ -1781,3 +1781,52 @@ describe("buildPlan — React Native session continuity", () => {
     expect(plan.warnings.some((w) => w.includes("async-storage"))).toBe(true);
   });
 });
+
+// Defect class: a caller handing buildPlan a build artifact as the entry. The
+// write reports success, the next `tsc` erases it, and the dev command that
+// runs the source never loaded it — zero capture under a green checkmark.
+describe("buildPlan refuses build output as an injection target", () => {
+  const io = () =>
+    fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { hono: "^4.0.0" },
+      }),
+      [p("dist", "index.js")]: "// built",
+      [p("src", "index.ts")]: "import { Hono } from 'hono'",
+      [p("tsconfig.json")]: JSON.stringify({
+        compilerOptions: { outDir: "dist" },
+      }),
+    });
+
+  it("falls back to the manual snippet and says why", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: ENDPOINT,
+        entryFile: p("dist", "index.js"),
+        serviceName: "api",
+      },
+      io(),
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.targetPath).toBeNull();
+    expect(plan.warnings.join("\n")).toMatch(/build output/);
+    expectNoKeyLiteral(plan.content);
+  });
+
+  it("wires a source entry unchanged", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      io(),
+    );
+    expect(plan.targetPath).toBe(p("src", "index.ts"));
+    expect(plan.warnings.join("\n")).not.toMatch(/build output/);
+  });
+});

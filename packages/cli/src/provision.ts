@@ -321,27 +321,44 @@ export async function resolveProject(
   } else {
     const existing = await listProjects(base, token, fetchImpl);
     if (existing.length > 0 && !input.assumeYes) {
-      // The existing projects come first, so the default is joining one rather
-      // than making another. A tenant with exactly one project is the common
-      // case, and offering "Create a new project" as the default landed a
-      // first application in a second project the dashboard is not scoped to.
-      const labels = [
-        ...existing.map((p) => p.name),
-        `Create a new project (${input.defaultProjectName})`,
-      ];
+      // Which option is safe to accept blind decides the order.
+      //
+      // A blind Enter has to be the harmless answer. Defaulting to the first
+      // existing project made it the opposite: in a tenant with several
+      // projects, the first row belongs to somebody else's app, so pressing
+      // Enter filed this repo's production telemetry into their project — a
+      // mistake nothing in the run afterwards reveals. Creating a project too
+      // many is visible, empty, and deletable.
+      //
+      // The one case where joining IS established is an existing project whose
+      // name matches the name inferred from this repo. Then that project leads
+      // and is the default, which keeps a re-run out of a duplicate project.
+      const wanted = input.defaultProjectName.trim().toLowerCase();
+      const matchIndex = existing.findIndex(
+        (p) => p.name.trim().toLowerCase() === wanted,
+      );
+      const createLabel = `Create a new project (${input.defaultProjectName})`;
+      const labels =
+        matchIndex >= 0
+          ? [...existing.map((p) => p.name), createLabel]
+          : [createLabel, ...existing.map((p) => p.name)];
       const choice = await prompter.select(
         "Which project should this app report to?",
         labels,
-        0,
+        matchIndex >= 0 ? matchIndex : 0,
       );
-      if (choice === existing.length) {
+      const createChosen =
+        matchIndex >= 0 ? choice === existing.length : choice === 0;
+      if (createChosen) {
+        // Created only after the name is confirmed — never before the pick, so
+        // a run abandoned at the prompt leaves no empty project behind.
         const name = await prompter.ask(
           "New project name",
           input.defaultProjectName,
         );
         project = await createProject(base, token, name, fetchImpl);
       } else {
-        project = existing[choice];
+        project = existing[matchIndex >= 0 ? choice : choice - 1];
       }
     } else {
       // No existing projects, or --yes, which cannot ask. A second unattended

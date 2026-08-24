@@ -33,6 +33,48 @@ function remoteConfigLine(indent: string): string {
 }
 
 /**
+ * The lines that decide whether a frontend session ever joins its backend.
+ *
+ * `networkCorrelationAllowedOrigins` defaults to empty, and an empty list means
+ * the SDK stamps its session, request and traceparent headers on same origin
+ * calls only. Every multi service app is cross origin — a browser app on one
+ * host calling an API on another — so the default outcome there is a session
+ * whose frontend and backend evidence never joins, with nothing in the wizard,
+ * the app or the dashboard saying why. Emitting the field in the init the
+ * installer writes is what makes the setting visible at the moment someone can
+ * act on it.
+ *
+ * Origins the installer already knows are filled in. Where it knows none, the
+ * field is still emitted, empty, with the one comment that says what goes in it
+ * and what it costs to leave it empty. It is never guessed: stamping an origin
+ * the app did not name would send trace context to a third party and trigger
+ * CORS preflights on calls that had none.
+ */
+function correlationOriginsLines(
+  backendOrigins: readonly string[] | null | undefined,
+  indent: string,
+  quote: (value: string) => string,
+): string[] {
+  const origins = (backendOrigins ?? []).filter(
+    (origin) => origin.trim().length > 0,
+  );
+  const list = origins.map(quote).join(", ");
+  const comment =
+    origins.length > 0
+      ? [
+          `${indent}// Backend origins this app calls. Cross origin calls are joined to the`,
+          `${indent}// session only when their origin is listed here. Add any this misses.`,
+        ]
+      : [
+          `${indent}// Backend origins this app calls. Cross origin calls are joined to the`,
+          `${indent}// session only when their origin is listed here, so leaving this empty`,
+          `${indent}// means frontend and backend evidence stay separate. Same origin calls`,
+          `${indent}// are always joined. Example: ${quote("https://api.example.com")}`,
+        ];
+  return [...comment, `${indent}networkCorrelationAllowedOrigins: [${list}],`];
+}
+
+/**
  * Which app in the project the injected code says it is.
  *
  * One ingest key covers the whole project, so the key no longer carries the
@@ -67,6 +109,7 @@ export function clientInitSnippet(
   endpoint: string,
   keyExpr: string,
   serviceName?: string | null,
+  backendOrigins?: readonly string[] | null,
 ): string {
   return [
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
@@ -76,6 +119,7 @@ export function clientInitSnippet(
     `  httpEndpoint: ${JSON.stringify(endpoint)},`,
     `  httpAuthToken: ${keyExpr},`,
     remoteConfigLine("  "),
+    ...correlationOriginsLines(backendOrigins, "  ", JSON.stringify),
     ...serviceLines(serviceName, "  ", JSON.stringify),
     "});",
   ].join("\n");
@@ -90,6 +134,7 @@ export function nuxtPluginSnippet(
   endpoint: string,
   keyExpr: string,
   serviceName?: string | null,
+  backendOrigins?: readonly string[] | null,
 ): string {
   return [
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
@@ -100,6 +145,7 @@ export function nuxtPluginSnippet(
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
     remoteConfigLine("    "),
+    ...correlationOriginsLines(backendOrigins, "    ", JSON.stringify),
     ...serviceLines(serviceName, "    ", JSON.stringify),
     "  });",
     "});",
@@ -300,6 +346,7 @@ export function reactNativeInitSnippet(
   keyExpr: string,
   serviceName?: string | null,
   asyncStorage = false,
+  backendOrigins?: readonly string[] | null,
 ): string {
   return [
     ...(asyncStorage
@@ -315,6 +362,7 @@ export function reactNativeInitSnippet(
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
     remoteConfigLine("    "),
+    ...correlationOriginsLines(backendOrigins, "    ", JSON.stringify),
     ...serviceLines(serviceName, "    ", JSON.stringify),
     "  },",
     "})",
@@ -339,6 +387,7 @@ export function capacitorInitSnippet(
   endpoint: string,
   keyExpr: string,
   serviceName?: string | null,
+  backendOrigins?: readonly string[] | null,
 ): string {
   return [
     'import { createCapacitorCrumbtrailAsync } from "crumbtrail-capacitor";',
@@ -348,6 +397,7 @@ export function capacitorInitSnippet(
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
     remoteConfigLine("    "),
+    ...correlationOriginsLines(backendOrigins, "    ", JSON.stringify),
     ...serviceLines(serviceName, "    ", JSON.stringify),
     "  },",
     "})",

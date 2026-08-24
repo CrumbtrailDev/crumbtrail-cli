@@ -43,14 +43,22 @@ function makeMonorepo(): string {
     }),
     "packages/api/index.js": "require('express')()",
 
-    // A BUILT shared library. main → a file that exists, so detect() lands on
-    // the `node` recipe and it looks perfectly wireable. It isn't: nothing runs
-    // it, so it would never emit a session.
+    // An UNBUILT shared library. main → a source file that exists, so detect()
+    // lands on the `node` recipe and it looks perfectly wireable. It isn't:
+    // nothing runs it, so it would never emit a session.
     "packages/shared-types/package.json": pkg({
       name: "shared-types",
+      main: "index.js",
+    }),
+    "packages/shared-types/index.js": "module.exports = {}",
+
+    // A library whose ONLY entry is build output. Injecting into dist is
+    // erased by the next build, so there is nothing here to wire at all.
+    "packages/built-only/package.json": pkg({
+      name: "built-only",
       main: "dist/index.js",
     }),
-    "packages/shared-types/dist/index.js": "module.exports = {}",
+    "packages/built-only/dist/index.js": "module.exports = {}",
 
     // Config-only package: nothing to wire at all.
     "packages/tsconfig/package.json": pkg({ name: "tsconfig" }),
@@ -74,6 +82,7 @@ describe("discoverServices", () => {
     expect(Object.keys(byRel).sort()).toEqual([
       "apps/web",
       "packages/api",
+      "packages/built-only",
       "packages/shared-types",
       "packages/tsconfig",
       "services/etl",
@@ -114,6 +123,18 @@ describe("discoverServices", () => {
     expect(lib?.defaultChecked).toBe(false);
     // Still selectable: if it really is a service, the user can check it.
     expect(lib?.selectable).toBe(true);
+  });
+
+  it("refuses a package whose only entry is build output", () => {
+    repo = makeMonorepo();
+    const built = discoverServices(repo, detect(repo)).find(
+      (c) => c.relDir === "packages/built-only",
+    );
+    // `main: dist/index.js` used to resolve and looked wireable. Injecting
+    // there is erased by the next build, so it is not an entry at all.
+    expect(built?.recipe).toBeNull();
+    expect(built?.selectable).toBe(false);
+    expect(built?.detected.reasons.join(" ")).toMatch(/build output/);
   });
 
   it("lists a package with no recipe but refuses to select it", () => {
@@ -253,5 +274,69 @@ describe("looksLikeLibrary", () => {
     expect(looksLikeLibrary("express", {})).toBe(false);
     expect(looksLikeLibrary("next", {})).toBe(false);
     expect(looksLikeLibrary(null, {})).toBe(false);
+  });
+});
+
+// Defect class: a repo root whose services are plain sibling directories with
+// no workspace file linking them. Detection can already name them, so they are
+// wireable from the root — not a reason to send the user to cd into each one.
+describe("unlinked sibling services", () => {
+  let root: string | undefined;
+  afterEach(() => {
+    if (root) cleanup(root);
+    root = undefined;
+  });
+
+  const makeSiblingRepo = () =>
+    makeTmpRepo({
+      // Root manifest carries no framework deps and links nothing.
+      "package.json": pkg({ name: "asiniq", private: true }),
+      "admin/package.json": pkg({
+        name: "admin",
+        devDependencies: { vite: "^5.0.0" },
+        scripts: { dev: "vite" },
+      }),
+      "admin/index.html":
+        '<div id=root></div><script type="module" src="/src/main.tsx"></script>',
+      "admin/src/main.tsx": "",
+      "api/package.json": pkg({
+        name: "api",
+        main: "dist/index.js",
+        dependencies: { hono: "^4.0.0" },
+        scripts: { dev: "tsx watch src/index.ts", build: "tsc" },
+      }),
+      "api/tsconfig.json": JSON.stringify({
+        compilerOptions: { rootDir: "src", outDir: "dist" },
+      }),
+      "api/src/index.ts": "import { Hono } from 'hono'",
+      "api/dist/index.js": "// built",
+      "chrome-extension/manifest.json": "{}",
+    });
+
+  it("is invisible without the flag, since a workspace file is authoritative", () => {
+    root = makeSiblingRepo();
+    const found = discoverServices(root, detect(root), undefined, {
+      endpoint: ENDPOINT,
+    });
+    expect(found.map((c) => c.relDir)).toEqual([]);
+  });
+
+  it("offers both services from the root, pre-checked, wired at the source", () => {
+    root = makeSiblingRepo();
+    const found = discoverServices(root, detect(root), undefined, {
+      endpoint: ENDPOINT,
+      includeUnlinkedApps: true,
+    });
+    const byRel = Object.fromEntries(found.map((c) => [c.relDir, c]));
+    expect(Object.keys(byRel).sort()).toEqual(["admin", "api"]);
+    expect(byRel.admin.recipe).toBe("vite-spa");
+    expect(byRel.api.recipe).toBe("hono");
+    expect(found.filter((c) => c.defaultChecked).map((c) => c.relDir).sort()).toEqual(
+      ["admin", "api"],
+    );
+    // Never the build output that `main` points at.
+    expect(byRel.api.detected.entryFile).toBe(
+      path.join(root!, "api", "src", "index.ts"),
+    );
   });
 });
