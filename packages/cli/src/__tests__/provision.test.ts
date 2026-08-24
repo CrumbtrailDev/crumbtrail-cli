@@ -159,6 +159,36 @@ describe("resolveProject with --project", () => {
     expect(d.lines.join("\n")).toContain("Checkout");
   });
 
+  it("refuses a --project this account cannot see, naming the account", async () => {
+    const d = deps();
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(200, {
+        projects: [{ id: "prj_mine", name: "Mine", createdAt: "" }],
+      }),
+    );
+
+    let thrown: unknown;
+    try {
+      await resolveProject({
+        ...d,
+        projectId: "prj_theirs",
+        identityLabel: "someone@example.com",
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+      } as Parameters<typeof resolveProject>[0]);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toMatchObject({
+      name: "ProjectAccessError",
+      message: expect.stringMatching(
+        /signed in as someone@example.com cannot see project prj_theirs/,
+      ),
+    });
+    expect((thrown as Error).message).toContain("crumbtrail logout");
+    expect(d.lines.join("\n")).not.toContain("Project:");
+    expect(d.lines.join("\n")).not.toMatch(/Project not found/i);
+  });
+
   it("joins a project that already carries the inferred name under --yes", async () => {
     // An unattended second run in the same app infers the same name again.
     // Creating a second project under it split the app's sessions across two
@@ -355,6 +385,17 @@ describe("explainWrongAccount", () => {
       "signed in as someone@example.com cannot see project prj_9fd0",
     );
     expect(String((rewritten as Error).message)).toContain("crumbtrail logout");
+    expect(String((rewritten as Error).message)).not.toMatch(/Project not found/i);
+  });
+
+  it("says the project is missing when a 404 has no signed in account to name", () => {
+    const err = new ApiError("Project not found (POST /keys) [404]", {
+      status: 404,
+    });
+    const rewritten = explainWrongAccount(err, "prj_1");
+    expect(String((rewritten as Error).message)).toBe(
+      "No project prj_1 exists. Check the id.",
+    );
   });
 
   it("recognizes a forbidden project route as an account problem too", () => {
@@ -392,5 +433,17 @@ describe("explainWrongAccount", () => {
   it("leaves every other failure exactly as it was", () => {
     const err = new ApiError("boom", { status: 500 });
     expect(explainWrongAccount(err, "prj_1", "someone@example.com")).toBe(err);
+  });
+});
+
+describe("createIngestKey 404", () => {
+  it("reports a missing project rather than echoing Project not found", async () => {
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(404, { error: "Project not found", code: "not_found" }),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      createIngestKey("https://cloud.example", "bl_cli_x", "prj_gone", fetchImpl),
+    ).rejects.toThrow("No project prj_gone exists. Check the id.");
   });
 });

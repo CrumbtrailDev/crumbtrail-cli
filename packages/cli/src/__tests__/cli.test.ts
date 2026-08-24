@@ -1355,7 +1355,7 @@ describe("batch installer (monorepo root)", () => {
 
     expect(await runCli(["node", "cli"], deps)).toBe(1);
     expect(steps).not.toContain("login");
-    expect(lines.join("\n")).toContain("Nothing here can be wired");
+    expect(lines.join("\n")).toContain("Nothing in /app can be wired");
   });
 });
 
@@ -1490,7 +1490,11 @@ describe("wizard — detection-quality notes (CP6)", () => {
     );
     const code = await runCli(["node", "cli"], deps);
     expect(code).toBe(1);
-    expect(lines.join("\n")).toContain(DOCKER_COMING_SOON_NOTE);
+    const out = lines.join("\n");
+    expect(out).toContain(DOCKER_COMING_SOON_NOTE);
+    expect(out).toContain("No supported framework in /app");
+    expect(out).toContain("cd apps/web && npx crumbtrail");
+    expect(out).toContain("cd <project folder> && npx crumbtrail");
   });
 });
 

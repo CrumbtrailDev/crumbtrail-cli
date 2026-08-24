@@ -886,6 +886,75 @@ export function matchRecipe(ctx: MatchContext): {
   return { recipe: null, entryFile: null, nextVersion: null, otlpStack: null };
 }
 
+
+const NEARBY_SKIP = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  "out",
+  "coverage",
+  "target",
+  "vendor",
+  "__pycache__",
+  ".next",
+  ".git",
+]);
+const NEARBY_NEST = new Set(["apps", "packages", "services"]);
+const NEARBY_LIMIT = 8;
+
+/**
+ * Immediate (and conventional nested) directories under `root` that look like
+ * an app: they contain a package.json. Used when detection fails so the wizard
+ * can name a concrete `cd` target instead of only listing supported stacks.
+ */
+export function findNearbyProjectDirs(
+  root: string,
+  reader: FileReader,
+): string[] {
+  const found: string[] = [];
+  const consider = (abs: string, rel: string) => {
+    if (found.length >= NEARBY_LIMIT) return;
+    if (reader.isFile(path.join(abs, "package.json"))) found.push(rel);
+  };
+  for (const entry of reader.readDir(root)) {
+    if (found.length >= NEARBY_LIMIT) break;
+    if (entry.startsWith(".") || NEARBY_SKIP.has(entry)) continue;
+    const abs = path.join(root, entry);
+    if (!reader.isDir(abs)) continue;
+    consider(abs, entry);
+    if (!NEARBY_NEST.has(entry)) continue;
+    for (const child of reader.readDir(abs)) {
+      if (found.length >= NEARBY_LIMIT) break;
+      if (child.startsWith(".") || NEARBY_SKIP.has(child)) continue;
+      const childAbs = path.join(abs, child);
+      if (reader.isDir(childAbs)) consider(childAbs, `${entry}/${child}`);
+    }
+  }
+  return found;
+}
+
+function describeNoRecipe(
+  root: string,
+  packageJsonPath: string | null,
+  pkg: PackageJson | null,
+  deps: Record<string, string>,
+): string {
+  if (!packageJsonPath) {
+    return `looked in ${root}; no package.json`;
+  }
+  if (!pkg) {
+    return `looked in ${root}; package.json is not valid JSON`;
+  }
+  const names = Object.keys(deps);
+  if (names.length === 0) {
+    return `looked in ${root}; package.json has no dependencies matching a recipe`;
+  }
+  const shown = names.slice(0, 8);
+  const extra =
+    names.length > shown.length ? `, and ${names.length - shown.length} more` : "";
+  return `looked in ${root}; package.json has no matching framework dependency (found ${shown.join(", ")}${extra})`;
+}
+
 /**
  * Classify a single package directory. For a monorepo root this reports the
  * workspace list and marks the result ambiguous — the caller picks a workspace
@@ -938,9 +1007,15 @@ export function detect(
     // A Deno project (deno.json/deno.jsonc, no package.json) gets a distinct,
     // recognizable reason so the wizard can explain it isn't supported yet
     // rather than falling back to the generic "no recipe matched" hint.
-    if (!pkg && hasDenoMarker(root, reader))
+    if (!pkg && hasDenoMarker(root, reader)) {
       reasons.push(DENO_UNSUPPORTED_REASON);
-    else reasons.push("no recipe matched");
+      const marker = reader.isFile(path.join(root, "deno.json"))
+        ? "deno.json"
+        : "deno.jsonc";
+      reasons.push(`looked in ${root}; found ${marker} and no package.json`);
+    } else {
+      reasons.push(describeNoRecipe(root, packageJsonPath, pkg, deps));
+    }
   } else if (
     (recipe === "tauri" ||
       recipe === "remix" ||

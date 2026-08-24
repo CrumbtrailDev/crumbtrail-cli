@@ -277,6 +277,8 @@ export interface ResolveProjectInput {
   assumeYes: boolean;
   projectId?: string;
   defaultProjectName: string;
+  /** Who the token belongs to, for the wrong-account message. */
+  identityLabel?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -298,17 +300,24 @@ export async function resolveProject(
     // The dashboard's setup wizard passes --project when it is adding an app
     // to a project the reader is already looking at, so the line under the
     // command is the one place the two surfaces have to agree, and `prj_7f3a`
-    // agrees with nothing the reader has seen. A failed or unmatched read
-    // falls back to the id, which is still true, just less useful.
-    let name = input.projectId;
+    // agrees with nothing the reader has seen.
+    //
+    // A saved login is validated against the endpoint, never against this id,
+    // so a token for another account used to sail through and print the id as
+    // if the project were ours, then die on createService as "Project not
+    // found". If this account's list does not contain the id, fail here and
+    // name the account: the id was copied off Setup, so the login is what is
+    // wrong. A network failure still falls back to the id; naming is not
+    // worth failing a run that can still succeed.
     try {
       const existing = await listProjects(base, token, fetchImpl);
       const match = existing.find((p) => p.id === input.projectId);
-      if (match) name = match.name;
-    } catch {
-      /* the id stands in; naming the project is not worth failing the run */
+      if (!match) throw projectNotVisible(input.projectId, input.identityLabel);
+      project = { id: match.id, name: match.name };
+    } catch (err) {
+      if (err instanceof ProjectAccessError) throw err;
+      project = { id: input.projectId, name: input.projectId };
     }
-    project = { id: input.projectId, name };
   } else {
     const existing = await listProjects(base, token, fetchImpl);
     if (existing.length > 0 && !input.assumeYes) {
@@ -418,15 +427,46 @@ export async function provisionService(
 }
 
 /**
- * Rewrite the cloud's 404 for a project id that is real but belongs to another
- * workspace.
+ * Rewrite a cloud refusal on a named project.
  *
- * A CLI token is validated against the ENDPOINT and never against the project,
- * so a stale token for a different tenant sails through login and dies here as
- * "Project not found" — which reads as a bad id, and sends the reader off to
- * re-check an id that was correct all along. The account is the thing that is
- * wrong, so the message names it.
+ * The API hides another tenant's project behind the same 404 as a missing id,
+ * so the wizard used to print "Project not found" for both. That reads as a bad
+ * id and sends the reader off to re-check a string they copied off their own
+ * Setup page. Split the two:
+ *
+ *   - we know who is signed in → the project is not visible to that account,
+ *     and the fix is to sign in as the account that owns it
+ *   - we do not → no such project, and the id itself is what failed
+ *
+ * A 403 is always the first case: the route exists and the token was refused.
  */
+export function projectNotVisible(
+  projectId: string,
+  identityLabel?: string,
+  status = 404,
+): ProjectAccessError {
+  if (!identityLabel && status === 404) {
+    return new ProjectAccessError(
+      projectMissingMessage(projectId),
+      projectId,
+      status,
+    );
+  }
+  const who = identityLabel ? ` as ${identityLabel}` : "";
+  return new ProjectAccessError(
+    `The account you are signed in${who} cannot see project ${projectId}. ` +
+      `The project id is probably right and this saved login is for another ` +
+      `account. Run \`crumbtrail logout\`, then \`npx crumbtrail\` again to ` +
+      `sign in as the owner of that project.`,
+    projectId,
+    status,
+  );
+}
+
+export function projectMissingMessage(projectId: string): string {
+  return `No project ${projectId} exists. Check the id.`;
+}
+
 export function explainWrongAccount(
   err: unknown,
   projectId: string,
@@ -438,15 +478,7 @@ export function explainWrongAccount(
   ) {
     return err;
   }
-  const who = identityLabel ? ` as ${identityLabel}` : "";
-  return new ProjectAccessError(
-    `The account you are signed in${who} cannot see project ${projectId}. ` +
-      `The project id is probably right and this saved login is for another ` +
-      `account. Run \`crumbtrail logout\`, then \`npx crumbtrail\` again to ` +
-      `sign in as the owner of that project. (${err.message})`,
-    projectId,
-    err.status,
-  );
+  return projectNotVisible(projectId, identityLabel, err.status);
 }
 
 /**

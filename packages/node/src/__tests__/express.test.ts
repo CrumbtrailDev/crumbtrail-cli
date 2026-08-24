@@ -123,19 +123,22 @@ describe("Crumbtrail Express-compatible middleware", () => {
     expect(warnings).toEqual([
       expect.objectContaining({
         kind: "fetch-rejected",
-        message: "Error",
+        message:
+          "Backend events could not reach the capture endpoint; nothing was captured",
         sessionId: "ses_warn",
         requestId: "req_warn",
       }),
       expect.objectContaining({
         kind: "fetch-rejected",
-        message: "Error",
+        message:
+          "Backend events could not reach the capture endpoint; nothing was captured",
         sessionId: "ses_warn",
         requestId: "req_warn",
       }),
       expect.objectContaining({
         kind: "fetch-rejected",
-        message: "Error",
+        message:
+          "Backend events could not reach the capture endpoint; nothing was captured",
         sessionId: "ses_warn",
         eventKind: CAPTURE_GAP_EVENT_KIND,
       }),

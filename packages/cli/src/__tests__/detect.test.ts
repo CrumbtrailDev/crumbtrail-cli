@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { detect, detectPackageManager, localFsReader } from "../detect";
+import { detect, detectPackageManager, findNearbyProjectDirs, localFsReader } from "../detect";
 // memoryReader is test-only and deliberately absent from the public barrel.
 import { memoryReader } from "../testing";
 import { cleanup, makeTmpRepo } from "./helpers";
@@ -882,5 +882,62 @@ describe("detect", () => {
       "src/main.ts": "console.log('tooling');",
     });
     expect(detect(root).recipe).toBe("flutter");
+  });
+});
+
+describe("no-recipe reasons name what was inspected", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    while (roots.length) cleanup(roots.pop()!);
+  });
+  const tmp = (files: Record<string, string>) => {
+    const r = makeTmpRepo(files);
+    roots.push(r);
+    return r;
+  };
+
+  it("says there is no package.json and names the directory", () => {
+    const root = tmp({});
+    const r = detect(root);
+    expect(r.recipe).toBeNull();
+    expect(r.reasons.some((x) => x.includes(root) && x.includes("no package.json"))).toBe(
+      true,
+    );
+    expect(r.reasons).not.toContain("no recipe matched");
+  });
+
+  it("says package.json has no matching dependency", () => {
+    const root = tmp({
+      "package.json": JSON.stringify({
+        name: "utils",
+        dependencies: { lodash: "4.17.21" },
+      }),
+    });
+    const r = detect(root);
+    expect(r.recipe).toBeNull();
+    const trail = r.reasons.join("\n");
+    expect(trail).toContain(root);
+    expect(trail).toContain("package.json");
+    expect(trail).toContain("lodash");
+    expect(r.reasons).not.toContain("no recipe matched");
+  });
+
+  it("still names the directory for a Deno project", () => {
+    const root = tmp({ "deno.json": JSON.stringify({ tasks: {} }) });
+    const r = detect(root);
+    expect(r.reasons).toContain("Deno projects aren't supported yet");
+    expect(
+      r.reasons.some((x) => x.includes(root) && x.includes("deno.json")),
+    ).toBe(true);
+  });
+
+  it("lists nearby app folders under conventional parents", () => {
+    const root = tmp({
+      "apps/web/package.json": JSON.stringify({ name: "web" }),
+      "apps/api/package.json": JSON.stringify({ name: "api" }),
+    });
+    const nearby = findNearbyProjectDirs(root, localFsReader(root));
+    expect(nearby).toContain("apps/web");
+    expect(nearby).toContain("apps/api");
   });
 });

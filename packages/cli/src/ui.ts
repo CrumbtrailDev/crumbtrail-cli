@@ -132,7 +132,7 @@ export function parseSelection(
       if (!selectable(i)) {
         return {
           ok: false,
-          error: `${n} (${items[i].label}) has no supported framework — it can't be wired.`,
+          error: `${n} (${items[i].label}) has no supported framework. It cannot be wired.`,
         };
       }
       picked.add(i);

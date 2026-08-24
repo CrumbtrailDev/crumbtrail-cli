@@ -50,6 +50,8 @@ crumbtrail verify          Preflight an endpoint + key (DNS, TLS, auth) — PASS
 | `--endpoint <url>`  | Cloud endpoint (else `$CRUMBTRAIL_BASE_URL`, else the default) |
 | `--version`, `-v`   | Print the version                                              |
 
+A saved login is reused only for the endpoint it was minted against. If `--project` names a project that account cannot see, the wizard names the signed in account and tells you to run `crumbtrail logout`.
+
 ### Non-interactive / CI
 
 Outside a TTY the wizard refuses to guess. Pass `--yes` and an existing

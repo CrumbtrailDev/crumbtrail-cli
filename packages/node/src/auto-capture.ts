@@ -90,12 +90,14 @@ export interface AutoCaptureOptions {
   onCrashExit?: (code: number) => void;
   /**
    * Notified whenever an ingest send fails — the session handshake could not be
-   * reached (TLS/DNS/non-2xx) or a captured error's POST was rejected. Without
-   * this, such failures are swallowed and capture goes silently dark. Wire it to
-   * the host's logger to make ingest problems observable. It is called
-   * best-effort and its own throws are swallowed, so it can never break the host
-   * or the capture path. Avoid calling the patched `console.error` from here
-   * during the `record` phase — prefer a real logger.
+   * reached (TLS/DNS) or a captured error's POST was rejected. Wire it to the
+   * host's logger to make ingest problems observable in that logger. A server
+   * explained refusal (a revoked key, a cap wall) additionally reaches the
+   * process console by default, once per condition, like the browser SDK; a
+   * transport rejection is only console logged under `CRUMBTRAIL_DEBUG`. It is
+   * called best-effort and its own throws are swallowed, so it can never break
+   * the host or the capture path. Avoid calling the patched `console.error`
+   * from here during the `record` phase — prefer a real logger.
    */
   onError?: (error: unknown, context: AutoCaptureErrorContext) => void;
   /**
@@ -205,8 +207,17 @@ export async function autoCapture(
   const originalConsoleError = consoleRef.error;
   const debug = options.debug ?? isTruthyFlag(proc.env.CRUMBTRAIL_DEBUG);
 
+  // One default console line per refused phase+status, process lifetime. A
+  // revoked key refuses the session start on every re-establish attempt; the
+  // sentence that explains it is worth printing once, not on each backoff.
+  const surfacedRefusals = new Set<string>();
+
   // Surface an ingest failure that would otherwise be swallowed. Best-effort:
   // its own throws are contained so diagnostics can never break the host.
+  // A server explained refusal (the 401 of a revoked key, a cap wall) reaches
+  // the operator by default, matching the browser SDK's console line; a
+  // transport rejection stays behind the `debug` flag because it is usually
+  // transient and the session self-heals on its backoff.
   const emitError = (
     error: unknown,
     context: AutoCaptureErrorContext,
@@ -214,6 +225,17 @@ export async function autoCapture(
     try {
       if (options.onError) {
         options.onError(error, context);
+      } else if (
+        error instanceof HeadlessRequestError &&
+        typeof error.status === "number"
+      ) {
+        const key = `${context.phase}:${error.status}`;
+        if (surfacedRefusals.has(key)) return;
+        surfacedRefusals.add(key);
+        originalConsoleError.call(
+          consoleRef,
+          `[crumbtrail] ${refusalSentence(error, context.phase)}`,
+        );
       } else if (debug) {
         originalConsoleError.call(
           consoleRef,
@@ -502,6 +524,24 @@ export async function autoCapture(
 function isTruthyFlag(value: string | undefined): boolean {
   if (!value) return false;
   return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+/**
+ * The default console sentence for a server explained refusal, phrased like the
+ * browser SDK's: the status, the server's own sentence, and the consequence.
+ */
+function refusalSentence(error: HeadlessRequestError, phase: string): string {
+  const refused =
+    phase === "session-start"
+      ? "session start"
+      : phase === "record"
+        ? "backend events"
+        : `ingest ${phase}`;
+  return (
+    `the capture endpoint refused ${refused} with HTTP ${error.status}` +
+    `${error.serverMessage ? `: ${error.serverMessage}` : ""}` +
+    "; nothing from this session will be captured"
+  );
 }
 
 /**

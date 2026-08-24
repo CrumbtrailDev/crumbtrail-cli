@@ -507,6 +507,38 @@ describe("token reuse + logout", () => {
     await mock.close();
   });
 
+  it("does not reuse a saved login minted for a different endpoint", async () => {
+    const stored = "bl_cli_" + "x".repeat(48);
+    const mint = "bl_cli_" + "y".repeat(48);
+    const mock = await startMockCloud({
+      mintToken: mint,
+      validTokens: new Set([stored, mint]),
+    });
+    saveAuth(
+      {
+        token: stored,
+        expiresAt: "2099-01-01T00:00:00Z",
+        endpoint: "https://api.other.example",
+      },
+      env,
+    );
+    const lines: string[] = [];
+    const token = await ensureToken({
+      base: mock.baseUrl,
+      ui: { out: (l = "") => lines.push(l), err: () => {} },
+      env,
+      noBrowser: true,
+      pollIntervalMs: 5,
+    });
+    expect(token).toBe(mint);
+    expect(lines.join("\n")).toContain("https://api.other.example");
+    expect(lines.join("\n")).toContain(mock.baseUrl);
+    expect(lines.join("\n")).toMatch(/Saved login is for/);
+    expect(loadAuth(env)?.token).toBe(mint);
+    expect(loadAuth(env)?.endpoint).toBe(mock.baseUrl);
+    await mock.close();
+  });
+
   it("clears an invalid stored token and re-logs in", async () => {
     const stale = "bl_cli_" + "e".repeat(48);
     const fresh = "bl_cli_" + "f".repeat(48);
