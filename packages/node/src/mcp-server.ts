@@ -191,7 +191,7 @@ const MAX_TOKENS_SCHEMA = {
  */
 const FIX_CONTEXT_MAX_TOKENS_SCHEMA = {
   ...MAX_TOKENS_SCHEMA,
-  description: `${MAX_TOKENS_DESCRIPTION} In this bundle the order is ranked signals, then database statements that failed, then the statements that ran, then database row diffs, then database pre state reads, then database span activity, then the correlated requests. The backend and frontend request lists are budgeted together as one list named primary_window.requests, so the same index in primary_window.backend.requests and primary_window.frontend.requests always describes the same linked request. causal_chain is a projection over signals rather than a list of its own: it is kept only when every signal it names survived, and is otherwise dropped whole and named in dropReport. Omitting maxTokens does NOT return the full payload here: this bundle defaults to ${DEFAULT_FIX_CONTEXT_MAX_TOKENS} tokens, because it commonly serializes to many times that and is read into a coding agent's context. Raise it to read more; dropReport names what was omitted and budgetNotice names a budget that would fit.`,
+  description: `${MAX_TOKENS_DESCRIPTION} In this bundle the order is ranked signals, then failed request summaries with captured redacted request and response bodies, then database statements that failed, then the statements that ran, then database row diffs, then database pre state reads, then database span activity, then the correlated requests. The backend and frontend request lists are budgeted together as one list named primary_window.requests, so the same index in primary_window.backend.requests and primary_window.frontend.requests always describes the same linked request. causal_chain is a projection over signals rather than a list of its own: it is kept only when every signal it names survived, and is otherwise dropped whole and named in dropReport. Omitting maxTokens does NOT return the full payload here: this bundle defaults to ${DEFAULT_FIX_CONTEXT_MAX_TOKENS} tokens, because it commonly serializes to many times that and is read into a coding agent's context. Raise it to read more; dropReport names what was omitted and budgetNotice names a budget that would fit.`,
 };
 
 /**
@@ -202,7 +202,9 @@ const FIX_CONTEXT_MAX_TOKENS_SCHEMA = {
  * drop.
  *
  * Order rationale: the ranked signal list is the point of the bundle and the
- * only plane that names a root cause, so it is spent first. Statements that
+ * only plane that names a root cause, so it is spent first. Failed request
+ * summaries come immediately after it because they name the request and carry
+ * the captured payload that explains the failure. Statements that
  * RAISED come next: a rejected statement is frequently the whole answer, it is
  * the one database plane that can be decisive on its own, and there are never
  * many of them, so it is the cheapest plane to keep whole. The statements that
@@ -231,6 +233,13 @@ const FIX_CONTEXT_BUDGET_PLANES: ReadonlyArray<
   (context: FixContext) => BudgetPlane
 > = [
   (context) => budgetPlane("signals", context.signals, (signal) => signal.id),
+  (context) =>
+    budgetPlane(
+      "primary_window.failed_requests",
+      context.primary_window.failed_requests ?? [],
+      (request) =>
+        `${request.method ?? "request"}:${request.url ?? "failed"}`,
+    ),
   (context) =>
     budgetPlane(
       "primary_window.db_errors",
@@ -2101,18 +2110,28 @@ export class McpServer {
     const read = await this.requireJson(dir, "index.json");
     if ("error" in read) return errorResult(read.error);
     const index = read.value;
-    const requests = Array.isArray(index.failedReqs)
-      ? index.failedReqs.slice(0, this.eventCap(args.limit))
-      : [];
+    const bundle =
+      (await this.readJsonRecordAsync(dir, "llm.json")) ??
+      (await this.readJsonRecordAsync(dir, "bundle.json"));
+    const browserEvidence = isRecord(bundle?.browserEvidence)
+      ? bundle.browserEvidence
+      : undefined;
+    const enriched = Array.isArray(browserEvidence?.failedRequests)
+      ? browserEvidence.failedRequests.filter(isRecord)
+      : undefined;
+    const indexed = Array.isArray(index.failedReqs) ? index.failedReqs : [];
+    const allRequests =
+      enriched && (enriched.length > 0 || indexed.length === 0)
+        ? enriched
+        : indexed;
+    const requests = allRequests.slice(0, this.eventCap(args.limit));
     if (budget.maxTokens === undefined) return textResult(requests);
     return this.budgetedTextResult(
       {
         sessionId: args.sessionId,
-        count: Array.isArray(index.failedReqs) ? index.failedReqs.length : 0,
+        count: allRequests.length,
         returned: requests.length,
-        truncated:
-          Array.isArray(index.failedReqs) &&
-          index.failedReqs.length > requests.length,
+        truncated: allRequests.length > requests.length,
       },
       [
         budgetPlane("requests", requests, (request) =>
@@ -2129,8 +2148,7 @@ export class McpServer {
           const keptCount = kept.get("requests")!.length;
           out.returned = keptCount;
           out.truncated =
-            Array.isArray(index.failedReqs) &&
-            index.failedReqs.length > keptCount;
+            allRequests.length > keptCount;
         },
       },
     );

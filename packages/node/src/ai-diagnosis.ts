@@ -612,6 +612,7 @@ function minimalEvidenceDrops(context: FixContext): PromptDrop[] {
   for (const [path, entries] of [
     ["primary_window.frontend.requests", context.primary_window.frontend.requests],
     ["primary_window.backend.requests", context.primary_window.backend.requests],
+    ["primary_window.failed_requests", context.primary_window.failed_requests ?? []],
     ["primary_window.db_diffs", context.primary_window.db_diffs],
     ["primary_window.db_reads", context.primary_window.db_reads],
     ["primary_window.db_errors", context.primary_window.db_errors],
@@ -657,6 +658,7 @@ function minimalEvidenceSlice(context: FixContext): FixContext {
       frontend: { window: null, anchor: null, requests: [] },
       backend: { requests: [] },
       preceding_requests: [],
+      failed_requests: [],
       db_diffs: [],
       db_reads: [],
       db_errors: [],
