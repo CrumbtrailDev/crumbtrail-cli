@@ -20,8 +20,17 @@ import {
   CRUMBTRAIL_SESSION_HEADER,
   W3C_TRACEPARENT_HEADER,
   canInjectCorrelationHeaders,
+  isCorrelationOriginHeaderRejected,
   resolveOutboundCorrelation,
 } from "../correlation";
+import {
+  canProbeOrigin,
+  crossOriginTargetOf,
+  isReplayableFetchBody,
+  isReplayableXhrBody,
+  recordProbeAttempt,
+  reportCorrelationHeadersRejected,
+} from "../correlation-fallback";
 import {
   EARLY_MAX_ENTRIES,
   drainEarlyCapture,
@@ -69,6 +78,10 @@ const correlationHintedOrigins = new Set<string>();
 
 function hintCorrelationOriginNotAllowed(url: string): void {
   try {
+    // An origin we disabled ourselves because its CORS policy refuses the
+    // headers has already been explained, in a warning that says the opposite
+    // of "add it to the allowlist". Two contradictory lines is worse than one.
+    if (isCorrelationOriginHeaderRejected(url)) return;
     const base = (globalThis as { location?: { href?: string } }).location
       ?.href;
     const origin = new URL(url, base).origin;
@@ -420,6 +433,8 @@ function applyFetchCorrelationHeaders(
   requestId?: string;
   traceId?: string;
   spanId?: string;
+  /** True only when this call added a header the application had not set. */
+  injected?: boolean;
 } {
   const existingHeaders = headersToInit(input, init);
   const url = extractUrlString(input);
@@ -477,6 +492,8 @@ function applyFetchCorrelationHeaders(
       requestId: correlation.requestId,
       traceId: correlation.traceId,
       spanId: correlation.spanId,
+      injected:
+        !existingSessionId || !existingRequestId || !existingTraceparent,
     };
   } catch {
     return { input, init, requestHeaders: headersToRecord(existingHeaders) };
@@ -520,6 +537,89 @@ function applyResponseBodyMeta(
 ): void {
   const meta = buildResponseBodyMeta(input);
   if (meta) target.bodyMeta = meta;
+}
+
+/* ------------------------------------------------------------------ */
+/* Correlation header rejection: the retry                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Decides whether a failed request is a candidate for the unstamped retry, and
+ * returns the origin it targets.
+ *
+ * Refuses anything the retry cannot honestly test: a request we did not stamp,
+ * a same-origin request (never preflighted), an origin already disabled or
+ * already probed to its cap, and an abort — an `AbortController` firing is the
+ * application's own decision and replaying it would defy it.
+ */
+function correlationRetryTarget(input: {
+  url: string;
+  injected: boolean;
+  error: unknown;
+}): string | undefined {
+  if (!input.injected) return undefined;
+  if (input.error instanceof Error && input.error.name === "AbortError")
+    return undefined;
+  if (isCorrelationOriginHeaderRejected(input.url)) return undefined;
+  const origin = crossOriginTargetOf(input.url);
+  if (!origin) return undefined;
+  if (!canProbeOrigin(origin)) return undefined;
+  return origin;
+}
+
+/**
+ * Replays a failed fetch without correlation headers, exactly once.
+ *
+ * Returns the recovered `Response` when the unstamped attempt succeeds, which
+ * is the only outcome that proves the headers were the cause. Returns
+ * `undefined` in every other case, and the caller then fails the request the
+ * way the application would have failed it on its own.
+ */
+async function retryFetchWithoutCorrelation(args: {
+  originalFetch: typeof globalThis.fetch;
+  input: RequestInfo | URL;
+  init: RequestInit | undefined;
+  url: string;
+  injected: boolean;
+  error: unknown;
+}): Promise<Response | undefined> {
+  const origin = correlationRetryTarget(args);
+  if (!origin) return undefined;
+
+  const replay = isReplayableFetchBody(
+    args.input,
+    args.init as { body?: unknown; duplex?: unknown } | undefined,
+  );
+  if (!replay.safe) {
+    // Cannot prove the cause without sending the body twice, and sending a
+    // stream twice sends it wrong. Fail as the app would have, and stop
+    // stamping so we cannot be the cause of the next failure either.
+    reportCorrelationHeadersRejected(origin, { unverified: true });
+    return undefined;
+  }
+
+  recordProbeAttempt(origin);
+  try {
+    // `args.input`/`args.init` are the application's own arguments. The stamped
+    // headers went onto a copy, so this replay carries exactly what the app
+    // asked for.
+    //
+    // Called through `globalThis`, not as `args.originalFetch(...)`: the method
+    // form passes `args` as the receiver and Chrome answers "Failed to execute
+    // 'fetch' on 'Window': Illegal invocation", which the catch below would
+    // read as the backend being unreachable.
+    const response = await args.originalFetch.call(
+      globalThis,
+      args.input,
+      args.init,
+    );
+    reportCorrelationHeadersRejected(origin);
+    return response;
+  } catch {
+    // Failed both ways: the backend is unreachable, not fussy about headers.
+    // Say nothing and change nothing.
+    return undefined;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -625,6 +725,36 @@ function wrapFetch(
     try {
       response = await originalFetch(fetchArgs.input, fetchArgs.init);
     } catch (error) {
+      // A stamped cross-origin request that failed before any response is the
+      // shape a rejected CORS preflight takes. Retry it once without our
+      // headers; if that works, the headers were the cause, and the app gets
+      // the response it would have got without Crumbtrail installed.
+      const recovered = await retryFetchWithoutCorrelation({
+        originalFetch,
+        input,
+        init,
+        url,
+        injected: fetchArgs.injected === true,
+        error,
+      });
+      if (recovered) {
+        response = recovered;
+        // The request that actually reached the server carried no correlation
+        // headers, so the response has no backend counterpart to join to.
+        // Claiming the ids on `net.res` would invent a join that does not exist.
+        fetchArgs.sessionId = undefined;
+        fetchArgs.requestId = undefined;
+        fetchArgs.traceId = undefined;
+        fetchArgs.spanId = undefined;
+      } else {
+        emitFetchFailure(error);
+        throw error;
+      }
+    } finally {
+      pending.delete(id);
+    }
+
+    function emitFetchFailure(error: unknown): void {
       // Network-level failure (offline, DNS, CORS, abort): there is no Response,
       // so emit a net.err carrying the request identity instead of a net.res.
       const errData: Record<string, unknown> = {
@@ -643,10 +773,8 @@ function wrapFetch(
       if (fetchArgs.spanId) errData.spanId = fetchArgs.spanId;
       attachRedactionMetadata(errData, urlResult.metadata);
       bus.emit({ t: now(), k: "net.err", d: errData });
-      throw error;
-    } finally {
-      pending.delete(id);
     }
+
     const dur = now() - startTime;
     // Stamped when the response ARRIVED, not when its body finished. A streaming response can stay
     // open for minutes, and dating the event at the close would put it after everything the stream
@@ -879,8 +1007,86 @@ function wrapXHR(
       requestId?: string;
       traceId?: string;
       spanId?: string;
+      /** Arguments of the app's own `open()`, so a retry reopens identically. */
+      openArgs: [string, string | URL, ...unknown[]];
+      /** Headers the application set, without the ones Crumbtrail added. */
+      appHeaders: Record<string, string>;
+      /** The body the app passed to `send()`, for a replay. */
+      body?: Document | XMLHttpRequestBodyInit | null;
+      /** True only when Crumbtrail added a correlation header to this request. */
+      injected: boolean;
+      /** One retry per request, ever. */
+      retried: boolean;
     }
   >();
+
+  // Registered once per XHR instance, from `open()`. Registration order decides
+  // handler order, and `open()` is the earliest hook we have: an application
+  // that assigns `xhr.onerror` after `open()` — the common shape — is behind us,
+  // so `stopImmediatePropagation` can hide a failure we are about to repair. An
+  // application that assigns it before `open()` sees the error first; the retry
+  // still runs and still stops us breaking its later requests.
+  const guarded = new WeakSet<XMLHttpRequest>();
+
+  const retryXhrWithoutCorrelation = function (
+    this: XMLHttpRequest,
+    event: Event,
+  ): void {
+    const meta = xhrMeta.get(this);
+    if (!meta || meta.excluded || meta.retried || !meta.injected) return;
+
+    const origin = correlationRetryTarget({
+      url: meta.url,
+      injected: true,
+      error: undefined,
+    });
+    if (!origin) return;
+
+    meta.retried = true;
+
+    const replay = isReplayableXhrBody(meta.body);
+    if (!replay.safe) {
+      reportCorrelationHeadersRejected(origin, { unverified: true });
+      return;
+    }
+
+    // The app must not see this attempt at all: the whole point is that it
+    // behaves as if Crumbtrail were absent.
+    event.stopImmediatePropagation();
+    recordProbeAttempt(origin);
+
+    // Whatever happens next, the wire carries no correlation headers, so the
+    // response has no backend counterpart to join to.
+    meta.sessionId = undefined;
+    meta.requestId = undefined;
+    meta.traceId = undefined;
+    meta.spanId = undefined;
+
+    try {
+      this.addEventListener(
+        "load",
+        () => reportCorrelationHeadersRejected(origin),
+        { once: true },
+      );
+      (
+        origOpen as unknown as (
+          this: XMLHttpRequest,
+          ...args: unknown[]
+        ) => void
+      ).call(this, ...meta.openArgs);
+      for (const [name, value] of Object.entries(meta.appHeaders)) {
+        try {
+          origSetRequestHeader.call(this, name, value);
+        } catch {
+          // A header the host refuses on the second pass is not worth failing on.
+        }
+      }
+      origSend.call(this, meta.body);
+    } catch {
+      // Reopening failed (an unusual host, or an XHR the app already aborted).
+      // Nothing was proved, so nothing is claimed.
+    }
+  };
 
   xhrPrototype.open = function (
     method: string,
@@ -897,7 +1103,20 @@ function wrapXHR(
       startTime: 0,
       excluded,
       requestHeaders: {},
+      openArgs: [method, url, ...rest],
+      appHeaders: {},
+      injected: false,
+      retried: false,
     });
+
+    if (!excluded && !guarded.has(this)) {
+      guarded.add(this);
+      try {
+        this.addEventListener("error", retryXhrWithoutCorrelation);
+      } catch {
+        // A host without addEventListener simply does not get the fallback.
+      }
+    }
 
     return (
       origOpen as unknown as (
@@ -925,6 +1144,11 @@ function wrapXHR(
     if (!meta || meta.excluded) {
       return origSend.call(this, body);
     }
+
+    // Snapshotted before injection, so a replay carries the app's headers and
+    // only the app's headers.
+    meta.appHeaders = { ...meta.requestHeaders };
+    meta.body = body;
 
     const correlationAllowed =
       config.networkCorrelationHeaders &&
@@ -977,6 +1201,7 @@ function wrapXHR(
               meta.sessionId,
             );
             meta.requestHeaders[CRUMBTRAIL_SESSION_HEADER] = meta.sessionId;
+            meta.injected = true;
           } catch {
             meta.sessionId = undefined;
           }
@@ -990,6 +1215,7 @@ function wrapXHR(
               meta.requestId,
             );
             meta.requestHeaders[CRUMBTRAIL_REQUEST_HEADER] = meta.requestId;
+            meta.injected = true;
           } catch {
             meta.requestId = undefined;
           }
@@ -1004,6 +1230,7 @@ function wrapXHR(
             );
             meta.requestHeaders[W3C_TRACEPARENT_HEADER] =
               correlation.traceparent;
+            meta.injected = true;
           } catch {
             meta.traceId = undefined;
             meta.spanId = undefined;

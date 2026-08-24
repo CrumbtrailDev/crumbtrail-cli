@@ -64,12 +64,16 @@ function correlationOriginsLines(
       ? [
           `${indent}// Backend origins this app calls. Cross origin calls are joined to the`,
           `${indent}// session only when their origin is listed here. Add any this misses.`,
+          `${indent}// Each origin listed must allow x-crumbtrail-session-id,`,
+          `${indent}// x-crumbtrail-request-id and traceparent in Access-Control-Allow-Headers.`,
         ]
       : [
           `${indent}// Backend origins this app calls. Cross origin calls are joined to the`,
           `${indent}// session only when their origin is listed here, so leaving this empty`,
           `${indent}// means frontend and backend evidence stay separate. Same origin calls`,
           `${indent}// are always joined. Example: ${quote("https://api.example.com")}`,
+          `${indent}// Each origin listed must allow x-crumbtrail-session-id,`,
+          `${indent}// x-crumbtrail-request-id and traceparent in Access-Control-Allow-Headers.`,
         ];
   return [...comment, `${indent}networkCorrelationAllowedOrigins: [${list}],`];
 }

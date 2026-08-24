@@ -23,9 +23,11 @@ import {
 import { defaultInjectIO, type InjectIO } from "./io";
 import type { Plan } from "./types";
 import {
+  corsWideningGuidance,
   detectExpressModuleStyle,
   prependIntoSource,
   referencesCrumbtrail,
+  widenCorsAllowedHeaders,
   wireExpressMiddleware,
   wireFlutterMain,
   withTrailingNewline,
@@ -263,17 +265,38 @@ function prependWithPreflight(
   }
   const existingPlan = existingIntegrationPlan(input, io, existing);
   if (existingPlan) return existingPlan;
+
+  // Wiring a backend whose CORS config pins an explicit header list, without
+  // widening that list, wires an app the browser will refuse to talk to the
+  // moment correlation is on. So the widening rides along with this edit.
+  const cors = widenCorsAllowedHeaders(existing);
+  const corsWarnings = [
+    ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
+    ...(cors.needsManual ? [corsWideningGuidance()] : []),
+  ];
+  const allWarnings = [...warnings, ...corsWarnings];
+
   const status = io.gitStatus(input.cwd, target);
   if (status.dirty && !input.options?.force) {
     return {
       recipe: input.recipe,
       kind: "needs-confirm-dirty",
       targetPath: target,
-      content: block,
+      content: cors.changed ? prependIntoSource(cors.text, block) : block,
+      ...(cors.changed ? { applyMode: "rewrite" as const } : {}),
       warnings: [
-        ...warnings,
+        ...allWarnings,
         `${target} has uncommitted changes — confirm (or re-run with force) before prepending.`,
       ],
+    };
+  }
+  if (cors.changed) {
+    return {
+      recipe: input.recipe,
+      kind: "rewrite",
+      targetPath: target,
+      content: prependIntoSource(cors.text, block),
+      warnings: allWarnings,
     };
   }
   return {
@@ -281,9 +304,16 @@ function prependWithPreflight(
     kind: "prepend",
     targetPath: target,
     content: block,
-    warnings,
+    warnings: allWarnings,
   };
 }
+
+/**
+ * Listed as its own change in the wizard summary, because it edits code the
+ * user did not ask us to touch and they must be able to see that in the diff.
+ */
+const CORS_WIDENED_WARNING =
+  "Widened the CORS allowed headers to admit x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent. Without this the browser blocks every cross origin request once correlation is on.";
 
 // --- idempotency (project-level) --------------------------------------------
 
@@ -660,11 +690,14 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
 
   // Full rewrite: middleware wired around the routes, plus the autoCapture block
   // and the middleware import prepended after any shebang/directive prologue.
+  const cors = widenCorsAllowedHeaders(wired.text);
   const content = prependIntoSource(
-    wired.text,
+    cors.text,
     `${block}\n\n${expressEnvPreloadSnippet(keyEnvVar)}\n\n${expressMiddlewareImportSnippet(style!)}`,
   );
   const warnings = [
+    ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
+    ...(cors.needsManual ? [corsWideningGuidance()] : []),
     wired.errorAnchor === "existing-error-handler"
       ? "Wired Express request middleware (before routes) and error middleware above the app's existing error handler, so it is reached before that handler ends the response."
       : "Wired Express request middleware (before routes) and error middleware (after routes) for backend request capture.",

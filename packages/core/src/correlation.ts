@@ -158,12 +158,64 @@ function normalizeAllowedOrigin(value: string): string | undefined {
   return urlOrigin(trimmed);
 }
 
+/* ------------------------------------------------------------------ */
+/* Header-rejected origins                                             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Origins whose CORS policy refuses the correlation headers.
+ *
+ * Adding a backend to `networkCorrelationAllowedOrigins` makes the browser send
+ * `x-crumbtrail-session-id`, `x-crumbtrail-request-id` and `traceparent` on
+ * every cross-origin request, which turns them into preflighted requests. A
+ * backend whose `Access-Control-Allow-Headers` does not list them fails the
+ * preflight, and the browser then refuses the *application's* request — turning
+ * on correlation takes the customer's app down.
+ *
+ * The collectors detect that shape at runtime and record the origin here. From
+ * that point on `canInjectCorrelationHeaders` answers `false` for it, so the
+ * app behaves exactly as it would with Crumbtrail absent. Session scoped on
+ * purpose: it is a property of the deployed backend, and a reload is the
+ * natural moment to re-test after the backend is fixed.
+ */
+const headerRejectedOrigins = new Set<string>();
+
+/** Normalizes to an origin, resolving relative urls against the current page. */
+export function correlationOriginOf(requestUrl: string): string | undefined {
+  return urlOrigin(requestUrl, runtimeOrigin());
+}
+
+/** True once this origin has been observed rejecting the correlation headers. */
+export function isCorrelationOriginHeaderRejected(requestUrl: string): boolean {
+  const origin = correlationOriginOf(requestUrl);
+  return origin !== undefined && headerRejectedOrigins.has(origin);
+}
+
+/**
+ * Records that `origin` refuses the correlation headers. Returns `true` the
+ * first time, so the caller can warn exactly once per origin.
+ */
+export function markCorrelationOriginHeaderRejected(origin: string): boolean {
+  if (headerRejectedOrigins.has(origin)) return false;
+  headerRejectedOrigins.add(origin);
+  return true;
+}
+
+/** Test seam: the registry is once per page, and a suite is one page. */
+export function __resetCorrelationHeaderRejectionsForTests(): void {
+  headerRejectedOrigins.clear();
+}
+
 /**
  * Decides whether Crumbtrail may stamp outbound correlation headers.
  *
  * Same-origin requests are allowed automatically. Cross-origin requests must match an
  * explicit backend-origin allowlist so the default does not trigger CORS preflights or
  * leak trace context to third-party services.
+ *
+ * An origin that has already been observed rejecting the headers in a CORS
+ * preflight is refused even when it is on the allowlist: correlation is worth
+ * less than the customer's application working.
  */
 export function canInjectCorrelationHeaders(
   requestUrl: string,
@@ -172,6 +224,7 @@ export function canInjectCorrelationHeaders(
   const currentOrigin = runtimeOrigin();
   const requestOrigin = urlOrigin(requestUrl, currentOrigin);
   if (!requestOrigin) return false;
+  if (headerRejectedOrigins.has(requestOrigin)) return false;
   if (currentOrigin && requestOrigin === currentOrigin) return true;
 
   return allowedOrigins.some(

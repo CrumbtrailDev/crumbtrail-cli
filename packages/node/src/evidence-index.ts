@@ -2145,6 +2145,52 @@ function addConsoleWarningCandidates(
   }
 }
 
+/**
+ * A backend failure's headline, built from whatever actually distinguishes it.
+ *
+ * A request-shaped failure is named by the endpoint it happened on. A
+ * request-LESS one — `backend.uncaught`, the auto-captured crash — has no
+ * method and no route, and naming it by the two fields it does not have
+ * produced the byte-identical line "Backend error from request" for every
+ * crash in the process. Two unrelated faults (a `TypeError` reading a property
+ * in one module, a thrown probe error in another) arrived as two findings a
+ * reader could not tell apart, while the error class and message that separate
+ * them were already computed and went only to the anchor.
+ *
+ * So the title falls back through what is available: error class, then the
+ * first line of the message, then the status. Every input is derived from the
+ * error itself, so the same crash titles identically on every run while
+ * distinct crashes cannot collide. The class rides along on a routed title too
+ * — one endpoint can fail in several distinct ways.
+ */
+function backendFailureTitle(parts: {
+  status?: number;
+  method?: string;
+  route?: string;
+  errorClass?: string;
+  message?: string;
+}): string {
+  const statusPart = parts.status ? `HTTP ${parts.status}` : "error";
+  const detail = firstLine(parts.message, 120);
+  if (parts.route) {
+    const suffix = parts.errorClass ? `: ${parts.errorClass}` : "";
+    return `Backend ${statusPart} from ${parts.method ?? "request"} ${parts.route}${suffix}`;
+  }
+  const subject = parts.errorClass ?? (parts.status ? statusPart : undefined);
+  if (subject && detail && detail !== subject)
+    return `Backend ${subject}: ${detail}`;
+  if (subject) return `Backend ${subject}`;
+  if (detail) return `Backend error: ${detail}`;
+  return `Backend ${statusPart} from ${parts.method ?? "request"}`;
+}
+
+/** The first line of a message, bounded — a stack-carrying message must not become the title. */
+function firstLine(value: string | undefined, max: number): string | undefined {
+  if (!value) return undefined;
+  const line = value.split("\n")[0]?.trim();
+  return line ? truncate(line, max) : undefined;
+}
+
 function addBackendErrorCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
@@ -2199,8 +2245,13 @@ function addBackendErrorCandidates(
 
     drafts.push({
       detector,
-      title:
-        `Backend ${status ? `HTTP ${status}` : "error"} from ${method ?? "request"} ${route ?? ""}`.trim(),
+      title: backendFailureTitle({
+        status,
+        method,
+        route: titleUrl(route),
+        errorClass: safeText(error?.name, 80) ?? safeText(error?.code, 80),
+        message,
+      }),
       severity,
       score,
       confidence: "high",
@@ -12211,7 +12262,9 @@ function addApiRouteReturnedDocumentCandidates(
           `The call succeeded and any write it performed is committed, but a caller parsing ` +
           `this as JSON throws — the failure the user sees belongs to the parse, not to the request.`,
       }),
-      dedupeKey: `apidocument:${url}`,
+      // Path only: the query is the request's data, not the endpoint's identity,
+      // so one endpoint serving HTML is one finding however it was parameterised.
+      dedupeKey: `apidocument:${titleUrl(url) ?? url}`,
     });
   }
 }

@@ -159,19 +159,50 @@ export interface DistinctBugRecurrence {
   occurrences: DistinctBugRecurrenceOccurrence[];
 }
 
-// Detectors whose evidence is observed on the back end (server-side telemetry). Everything else
-// is a client-observed signal (network failures are observed by the browser even when the fault is
-// server-side; full-stack linkage already ties those together via requestId).
-const BACKEND_DETECTORS = new Set(["otel_span_error", "otel_log_error"]);
-// Evidence read off the db.diff plane. The per-request invariant detectors
-// belong here with the generic surfacing: their evidence IS a row image, so a
-// reader filtering a distinct bug's db evidence must see the detector that
-// named the bug, not only the writes around it.
-const DB_DETECTORS = new Set([
-  "db_mutation",
-  "db_field_divergence",
-  "duplicate_write",
-]);
+/**
+ * Detectors whose evidence is a row image, named outside the `db_` convention.
+ *
+ * The per-request invariant detectors belong on the db plane with the generic
+ * surfacing: their evidence IS a row image, so a reader filtering a distinct
+ * bug's db evidence must see the detector that named the bug, not only the
+ * writes around it. `db_mutation` and `db_field_divergence` are carried by the
+ * prefix; `duplicate_write` is the one that is not.
+ */
+const DB_PLANE_DETECTORS = new Set(["duplicate_write"]);
+
+/**
+ * Which plane observed a detector's evidence, decided by the detector's NAME.
+ *
+ * This used to be a two-entry allowlist (`otel_span_error`, `otel_log_error`)
+ * with everything else filed as frontend, so the entire first-party server
+ * lane — every `backend_*` detector — landed in `frontendEvidence`. An issue
+ * titled "Backend HTTP 500 from POST /internal/invoices/finalize" persisted
+ * `{frontend: 1, backend: 0}`, telling a reader the server plane recorded
+ * nothing about a failure the server plane is the only witness to.
+ *
+ * Naming is the authority because the SDK's own detector vocabulary already
+ * follows it, and because the cloud (`canonical-evidence.ts#detectorPlane`)
+ * now attributes planes by exactly these prefixes. Deciding it the same way at
+ * both ends means a detector added on either side is counted correctly the day
+ * it ships, with no list to keep in sync. A detector outside the prefixes was
+ * observed in the page: network failures are seen by the browser even when the
+ * fault is server-side, and full-stack linkage already ties those to the
+ * server plane through `requestId`.
+ */
+export type EvidencePlane = "frontend" | "backend" | "db";
+
+export function detectorPlane(detector: string | undefined): EvidencePlane {
+  if (!detector) return "frontend";
+  const name = detector.toLowerCase();
+  if (
+    name.startsWith("db_") ||
+    name.startsWith("otel_db_") ||
+    DB_PLANE_DETECTORS.has(name)
+  )
+    return "db";
+  if (name.startsWith("backend_") || name.startsWith("otel_")) return "backend";
+  return "frontend";
+}
 
 // Detectors whose failures share one root cause regardless of which page they fired on. A blocked
 // third-party fetch (classic "Unhandled rejection: Failed to fetch") repeats once per navigation, so
@@ -510,13 +541,12 @@ function buildBug(
 
   const refs = candidates.map(toEvidenceRef);
   const frontendEvidence = refs.filter(
-    (ref) =>
-      !BACKEND_DETECTORS.has(ref.detector) && !DB_DETECTORS.has(ref.detector),
+    (ref) => detectorPlane(ref.detector) === "frontend",
   );
-  const backendEvidence = refs.filter((ref) =>
-    BACKEND_DETECTORS.has(ref.detector),
+  const backendEvidence = refs.filter(
+    (ref) => detectorPlane(ref.detector) === "backend",
   );
-  const dbDiffs = refs.filter((ref) => DB_DETECTORS.has(ref.detector));
+  const dbDiffs = refs.filter((ref) => detectorPlane(ref.detector) === "db");
 
   const candidateIds = candidates
     .map((candidate) => candidate.id)
@@ -692,12 +722,41 @@ function normalizeSignature(candidate: EvidenceCandidate): string {
 }
 
 function normalizeText(source: string): string {
-  return source
+  return stripUrlQueries(source)
     .toLowerCase()
     .replace(/\[redacted\]/g, "")
     .replace(/\d+/g, "#")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * A URL-like token inside free text: an absolute URL, or a path starting at `/`.
+ * Stops at whitespace and at the punctuation that ends a URL inside prose.
+ */
+const URL_LIKE_TOKEN = /(?:https?:\/\/|\/)[^\s"'<>)\]}]*/gi;
+
+/**
+ * Drops the query string and fragment from every URL inside a text, keeping the
+ * path.
+ *
+ * The query is the request's DATA, not its identity. One failing endpoint
+ * reached with two different searches produced two issues — "HTTP 404 from GET
+ * /v2/search" and "HTTP 404 from GET /v2/search?q=[REDACTED]" — because the
+ * query rode into the grouping key through the candidate's message and title.
+ * The same 404 on the same path is one bug however it was parameterised, and
+ * the full URL is still carried verbatim on the anchor and on every evidence
+ * ref, so nothing is lost from the evidence.
+ *
+ * Applied to identity ONLY. A page whose view is selected by a query parameter
+ * still keeps its own component signature, which is built from the anchor's
+ * route rather than from this text.
+ */
+function stripUrlQueries(source: string): string {
+  return source.replace(URL_LIKE_TOKEN, (token) => {
+    const cut = token.search(/[?#]/);
+    return cut === -1 ? token : token.slice(0, cut);
+  });
 }
 
 /**
@@ -756,7 +815,7 @@ function unshieldDigits(text: string): string {
  */
 function normalizeRecurrenceText(source: string): string {
   return unshieldDigits(
-    source
+    stripUrlQueries(source)
       .toLowerCase()
       .replace(/\[redacted\]/g, "")
       .replace(

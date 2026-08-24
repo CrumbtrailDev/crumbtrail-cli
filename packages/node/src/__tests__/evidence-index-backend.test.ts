@@ -212,3 +212,105 @@ describe("buildEvidenceCandidates — console warnings", () => {
     expect(warnings[0].anchor.t).toBe(1000);
   });
 });
+
+describe("buildEvidenceCandidates — backend crash titles", () => {
+  function uncaught(t: number, error: Record<string, unknown>): BugEvent {
+    return { t, k: "backend.uncaught", d: { error } };
+  }
+
+  it("gives two unrelated request-less crashes two different titles", () => {
+    const events: BugEvent[] = [
+      uncaught(1000, {
+        name: "TypeError",
+        message: "Cannot read properties of undefined (reading 'seatPolicy')",
+        stack: "at auth.js:41:12",
+      }),
+      uncaught(2000, {
+        name: "Error",
+        message: "deliberate probe failure",
+        stack: "at meta.js:12:3",
+      }),
+    ];
+    const titles = buildEvidenceCandidates(events, { start: 1000 })
+      .filter((c) => c.detector === "backend_request_error")
+      .map((c) => c.title);
+    expect(titles.length).toBe(2);
+    expect(new Set(titles).size).toBe(2);
+    expect(titles.some((title) => title.includes("seatPolicy"))).toBe(true);
+    expect(titles.some((title) => title.includes("probe failure"))).toBe(true);
+    expect(titles).not.toContain("Backend error from request");
+  });
+
+  it("titles the same crash identically on every run", () => {
+    const crash = () =>
+      buildEvidenceCandidates([uncaught(1000, { name: "TypeError", message: "boom" })], {
+        start: 1000,
+      })[0].title;
+    expect(crash()).toBe(crash());
+    expect(crash()).toBe("Backend TypeError: boom");
+  });
+
+  it("falls back to the message when the error carries no class", () => {
+    const [cand] = buildEvidenceCandidates(
+      [uncaught(1000, { message: "connection terminated unexpectedly" })],
+      { start: 1000 },
+    );
+    expect(cand.title).toBe("Backend error: connection terminated unexpectedly");
+  });
+
+  it("keeps the endpoint form when a route is known, and names the error class too", () => {
+    const [cand] = buildEvidenceCandidates(
+      [
+        {
+          t: 1000,
+          k: "backend.req.error",
+          d: {
+            requestId: "req-1",
+            method: "POST",
+            pathname: "/api/checkout",
+            statusCode: 500,
+            error: { name: "TypeError", message: "boom" },
+          },
+        },
+      ],
+      { start: 1000 },
+    );
+    expect(cand.title).toBe(
+      "Backend HTTP 500 from POST /api/checkout: TypeError",
+    );
+  });
+
+  it("keeps the query string out of a backend title but on the anchor", () => {
+    const [cand] = buildEvidenceCandidates(
+      [
+        {
+          t: 1000,
+          k: "backend.req.end",
+          d: {
+            requestId: "req-2",
+            method: "GET",
+            pathname: "/v2/search?q=shoes",
+            statusCode: 404,
+          },
+        },
+      ],
+      { start: 1000 },
+    );
+    expect(cand.title).toBe("Backend HTTP 404 from GET /v2/search");
+    expect(cand.anchor.url).toContain("/v2/search?q=");
+  });
+
+  it("bounds a long message so a title stays a headline", () => {
+    const [cand] = buildEvidenceCandidates(
+      [
+        uncaught(1000, {
+          name: "Error",
+          message: `pool timeout ${"and again ".repeat(60)}`,
+        }),
+      ],
+      { start: 1000 },
+    );
+    expect(cand.title.startsWith("Backend Error: pool timeout")).toBe(true);
+    expect(cand.title.length).toBeLessThanOrEqual(140);
+  });
+});

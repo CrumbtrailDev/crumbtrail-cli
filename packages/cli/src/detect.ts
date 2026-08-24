@@ -8,9 +8,21 @@
 
 import path from "node:path";
 import type { Stack } from "crumbtrail-core";
+import {
+  parsePnpmWorkspace,
+  resolveWorkspacePackageManager,
+  type PackageManager,
+  type PackageManagerResolution,
+} from "./install/workspace-package-manager";
 import { localFsReader } from "./readers/local-fs";
 import type { FileReader } from "./readers/types";
 
+export {
+  parsePnpmWorkspace,
+  resolveWorkspacePackageManager,
+  type PackageManagerResolution,
+  type PackageManagerSource,
+} from "./install/workspace-package-manager";
 export { localFsReader } from "./readers/local-fs";
 export type { FileReader } from "./readers/types";
 
@@ -42,7 +54,7 @@ export type Recipe =
   // VARIABLE detected `Stack` out of detection via `DetectResult.otlpStack`.
   | "otlp";
 
-export type PackageManager = "pnpm" | "yarn" | "bun" | "npm";
+export type { PackageManager } from "./install/workspace-package-manager";
 
 export interface WorkspacePackage {
   /** package.json `name`, falling back to the directory basename. */
@@ -57,6 +69,13 @@ export interface DetectResult {
   /** Winning recipe, or null when nothing matched. */
   recipe: Recipe | null;
   packageManager: PackageManager | null;
+  /**
+   * The full workspace-scoped decision behind `packageManager`: where it was
+   * decided, what decided it, and any lockfile inside a workspace member that
+   * was deliberately ignored. Optional only so hand-built fixtures stay valid;
+   * `detect()` always sets it.
+   */
+  packageManagerInfo?: PackageManagerResolution;
   /**
    * Absolute path to the file the recipe would edit (vite-spa / node), when it
    * could be resolved with confidence. null for create-a-new-file recipes and
@@ -120,48 +139,18 @@ function readPackageJson(dir: string, reader: FileReader): PackageJson | null {
   }
 }
 
-/** Walk up from `startDir` to the filesystem root looking for a known lockfile. */
+/**
+ * The package manager every install in this run must use.
+ *
+ * Resolved from the WORKSPACE, not from `startDir` — see
+ * `install/workspace-package-manager.ts` for why a per-directory answer split
+ * one wizard run across two package managers and damaged the repo.
+ */
 export function detectPackageManager(
   startDir: string,
   reader: FileReader = localFsReader(startDir),
 ): PackageManager | null {
-  let dir = path.resolve(startDir);
-
-  while (true) {
-    if (reader.isFile(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
-    if (
-      reader.isFile(path.join(dir, "bun.lockb")) ||
-      reader.isFile(path.join(dir, "bun.lock"))
-    )
-      return "bun";
-    if (reader.isFile(path.join(dir, "yarn.lock"))) return "yarn";
-    if (reader.isFile(path.join(dir, "package-lock.json"))) return "npm";
-    const parent = path.dirname(dir);
-    if (dir === reader.root || parent === dir) return null;
-    dir = parent;
-  }
-}
-
-/** Extract the `packages:` list from a pnpm-workspace.yaml without a YAML dep. */
-export function parsePnpmWorkspace(text: string): string[] {
-  const out: string[] = [];
-  let inPackages = false;
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.replace(/#.*$/, "");
-    if (/^packages\s*:/.test(line)) {
-      inPackages = true;
-      continue;
-    }
-    if (!inPackages) continue;
-    const item = line.match(/^\s*-\s*["']?([^"'#]+?)["']?\s*$/);
-    if (item) {
-      out.push(item[1].trim());
-      continue;
-    }
-    // A new, non-indented top-level key ends the packages block.
-    if (/^\S/.test(line)) inPackages = false;
-  }
-  return out;
+  return resolveWorkspacePackageManager(startDir, reader).manager;
 }
 
 function expandWorkspaceGlobs(
@@ -1049,7 +1038,6 @@ export function matchRecipe(ctx: MatchContext): {
   return { recipe: null, entryFile: null, nextVersion: null, otlpStack: null };
 }
 
-
 const NEARBY_SKIP = new Set([
   "node_modules",
   "dist",
@@ -1114,7 +1102,9 @@ function describeNoRecipe(
   }
   const shown = names.slice(0, 8);
   const extra =
-    names.length > shown.length ? `, and ${names.length - shown.length} more` : "";
+    names.length > shown.length
+      ? `, and ${names.length - shown.length} more`
+      : "";
   return `looked in ${root}; package.json has no matching framework dependency (found ${shown.join(", ")}${extra})`;
 }
 
@@ -1133,7 +1123,8 @@ export function detect(
     ? path.join(root, "package.json")
     : null;
   const pkg = packageJsonPath ? readPackageJson(root, reader) : null;
-  const packageManager = detectPackageManager(root, reader);
+  const packageManagerInfo = resolveWorkspacePackageManager(root, reader);
+  const packageManager = packageManagerInfo.manager;
 
   const workspaces = detectWorkspaces(root, pkg, reader);
   const isMonorepo = !!workspaces && workspaces.length > 0;
@@ -1201,6 +1192,7 @@ export function detect(
     packageJsonPath,
     recipe,
     packageManager,
+    packageManagerInfo,
     entryFile,
     nextVersion,
     otlpStack,
