@@ -15,10 +15,6 @@ From your app's root:
 npx crumbtrail
 ```
 
-(Pre-npm-publish, the same wizard runs via `curl -fsSL https://app.crumbtrail.ai/install.sh | sh`,
-which resolves to `npx --yes <cli-tarball-url>` — the identical wizard, just
-fetched from the deploy instead of the npm registry.)
-
 The wizard detects a React Native / Expo app by the presence of a `react-native`
 or `expo` dependency, installs `crumbtrail-core` + `crumbtrail-react-native`
 with your project's package manager, and prepends a

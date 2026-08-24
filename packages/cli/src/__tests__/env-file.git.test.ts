@@ -119,6 +119,56 @@ describe("env key writing against a real git repository", () => {
     );
   });
 
+  // Three services, one root .gitignore, one run. The reported failure was
+  // that only the last service's entry survived, so the other two env files
+  // held a live key and showed up untracked-and-unignored in `git status`.
+  it("ignores every service's env file when one run wires three of them", () => {
+    const services = ["services/api", "services/web", "services/worker"];
+    for (const dir of services) {
+      mkdirSync(path.join(repo, dir), { recursive: true });
+    }
+
+    // Every decision is taken before any write, which is the order the wizard
+    // uses so that a refusal costs no minted credential — and the order that
+    // made plan-time .gitignore content clobber itself.
+    const plans = services.map((dir) => {
+      const plan = planEnvKeyWrite({
+        appDir: path.join(repo, dir),
+        repoRoot: repo,
+        varName: "CRUMBTRAIL_KEY",
+        io: defaultEnvFileIO,
+      });
+      if (plan.kind !== "ready")
+        throw new Error(`expected ready for ${dir}, got ${plan.kind}`);
+      return plan;
+    });
+
+    const announced: string[] = [];
+    for (const plan of plans) {
+      announced.push(
+        ...applyEnvEdits(buildEnvKeyEdits(plan, KEY), defaultEnvFileIO)
+          .ignoreEntriesAdded,
+      );
+    }
+
+    for (const dir of services) {
+      expect(
+        defaultEnvFileIO.readFile(path.join(repo, dir, ".env")),
+      ).toContain(KEY);
+      // Asked of git, not of our own file: this is the property that matters.
+      expect(defaultEnvFileIO.isIgnored(repo, `${dir}/.env`)).toBe(true);
+    }
+    expect(announced).toEqual(services.map((dir) => `${dir}/.env`));
+
+    // Nothing holding a key is left visible to `git add .`.
+    const untracked = execFileSync(
+      "git",
+      ["status", "--porcelain", "--untracked-files=all"],
+      { cwd: repo, encoding: "utf8" },
+    );
+    expect(untracked).not.toMatch(/\.env$/m);
+  });
+
   it("treats a directory that is not a git repository as nothing tracked", () => {
     const plain = mkdtempSync(path.join(tmpdir(), "crumbtrail-nogit-"));
     try {

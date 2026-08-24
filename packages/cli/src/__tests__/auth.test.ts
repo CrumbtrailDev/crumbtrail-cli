@@ -37,6 +37,12 @@ interface MockOptions {
   retryAfterSeconds?: number;
   /** Identity payload for GET /auth/me. */
   identity?: Record<string, unknown>;
+  /**
+   * Whether this origin serves the dashboard's sign-in pages (/cli/authorize,
+   * /cli/activate). False plays a deployment that reports an API-only origin as
+   * its dashboard — the shape that 404ed every sign-in link the CLI printed.
+   */
+  signInPages?: boolean;
 }
 
 interface MockServer {
@@ -119,6 +125,14 @@ async function startMockCloud(opts: MockOptions = {}): Promise<MockServer> {
         expiresIn: 300,
         interval: 1,
       });
+    }
+    if (
+      req.method === "GET" &&
+      (url.pathname === "/cli/authorize" || url.pathname === "/cli/activate")
+    ) {
+      if (opts.signInPages === false) return send(404, { error: "not found" });
+      res.writeHead(200, { "Content-Type": "text/html" });
+      return res.end("<!doctype html><title>Crumbtrail</title>");
     }
     send(404, { error: "not found" });
   }) as http.Server & { baseUrlRef?: string };
@@ -255,6 +269,91 @@ describe("browser hand-off", () => {
   });
 });
 
+describe("sign-in links land on the dashboard, not the API host", () => {
+  it("opens /cli/authorize on the dashboard origin, not the API base", async () => {
+    const mint = "bl_cli_" + "c".repeat(48);
+    // Two origins, the way the hosted deployment is split: api.* answers the
+    // CLI, app.* serves the SPA that /cli/authorize lives in.
+    const api = await startMockCloud({ mintToken: mint, signInPages: false });
+    const app = await startMockCloud({ mintToken: mint });
+    let openedUrl = "";
+    const openFn = (authorizeUrl: string): boolean => {
+      openedUrl = authorizeUrl;
+      const port = new URL(authorizeUrl).searchParams.get("port");
+      http.get(`http://127.0.0.1:${port}/callback?code=grant-123`);
+      return true;
+    };
+    const token = await ensureToken({
+      base: api.baseUrl,
+      ui: silentUi,
+      openFn,
+      env: { ...env, CRUMBTRAIL_APP_URL: app.baseUrl },
+    });
+    expect(token).toBe(mint);
+    expect(openedUrl.startsWith(`${app.baseUrl}/cli/authorize?`)).toBe(true);
+    // The token exchange still went to the API base, not the dashboard.
+    expect(api.exchanges).toBe(1);
+    expect(app.exchanges).toBe(0);
+    await api.close();
+    await app.close();
+  });
+
+  it("does not open a sign-in page that 404s — it falls back to the device flow", async () => {
+    const mint = "bl_cli_" + "d".repeat(48);
+    const mock = await startMockCloud({ mintToken: mint, signInPages: false });
+    let opened = false;
+    const openFn = (): boolean => {
+      opened = true;
+      return true;
+    };
+    const token = await ensureToken({
+      base: mock.baseUrl,
+      ui: silentUi,
+      openFn,
+      env,
+      pollIntervalMs: 5,
+    });
+    expect(token).toBe(mint);
+    expect(opened).toBe(false); // never sent to a 404
+    expect(mock.devicePolls).toBeGreaterThan(0);
+    await mock.close();
+  });
+
+  it("warns, instead of going quiet, when the device page 404s", async () => {
+    const mint = "bl_cli_" + "e".repeat(48);
+    const mock = await startMockCloud({ mintToken: mint, signInPages: false });
+    const lines: string[] = [];
+    const ui = { out: (l: string) => lines.push(l), err: () => {} };
+    const token = await ensureToken({
+      base: mock.baseUrl,
+      ui,
+      openFn: () => false,
+      env,
+      pollIntervalMs: 5,
+    });
+    expect(token).toBe(mint);
+    const printed = lines.join("\n");
+    expect(printed).toContain("returns 404");
+    expect(printed).toContain("CRUMBTRAIL_APP_URL");
+    await mock.close();
+  });
+
+  it("stores the resolved dashboard origin, so later links use it", async () => {
+    const mint = "bl_cli_" + "f".repeat(48);
+    const mock = await startMockCloud({ mintToken: mint });
+    const withOverride = { ...env, CRUMBTRAIL_APP_URL: "https://app.example" };
+    await ensureToken({
+      base: mock.baseUrl,
+      ui: silentUi,
+      openFn: () => false,
+      env: withOverride,
+      pollIntervalMs: 5,
+    });
+    expect(loadAuth(withOverride)?.appBaseUrl).toBe("https://app.example");
+    await mock.close();
+  });
+});
+
 describe("browser hand-off deadline", () => {
   it("rejects with an actionable message when no approval arrives before the deadline", async () => {
     // Browser "opens" but the callback is never hit and no code is pasted, so
@@ -326,7 +425,10 @@ describe("device flow rate limiting", () => {
     // full windows. The real numbers (5 per minute against the cloud's 10) are
     // the same arithmetic: the CLI never spends more than half the budget.
     const mint = "bl_cli_" + "b".repeat(48);
-    const mock = await startMockCloud({ devicePendingPolls: 5, mintToken: mint });
+    const mock = await startMockCloud({
+      devicePendingPolls: 5,
+      mintToken: mint,
+    });
     const startedAt = Date.now();
     const token = await ensureToken({
       base: mock.baseUrl,
@@ -347,7 +449,9 @@ describe("device flow rate limiting", () => {
     // The device verification URI is a DASHBOARD route, so its origin is the
     // app host. Without this the wizard's closing "Dashboard: …" link pointed
     // at the API port, which answers {"error":"Not found"}.
-    const mock = await startMockCloud({ mintToken: "bl_cli_" + "d".repeat(48) });
+    const mock = await startMockCloud({
+      mintToken: "bl_cli_" + "d".repeat(48),
+    });
     await ensureToken({
       base: mock.baseUrl,
       ui: silentUi,
@@ -372,7 +476,11 @@ describe("naming the account that is being reused", () => {
       },
     });
     saveAuth(
-      { token: stored, expiresAt: "2099-01-01T00:00:00Z", endpoint: mock.baseUrl },
+      {
+        token: stored,
+        expiresAt: "2099-01-01T00:00:00Z",
+        endpoint: mock.baseUrl,
+      },
       env,
     );
     clearIdentityCache();

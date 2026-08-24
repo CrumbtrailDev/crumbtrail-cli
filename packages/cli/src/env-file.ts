@@ -250,11 +250,32 @@ export function appendIgnoreEntry(content: string, entry: string): string {
 
 // ── Decision + edits ─────────────────────────────────────────────────────────
 
-export interface EnvEdit {
+/** A whole-file write of content decided before the apply. */
+export interface EnvWriteEdit {
+  kind: "write";
   path: string;
   mode: "create" | "update";
   content: string;
 }
+
+/**
+ * "Make sure this .gitignore lists this path", resolved against the file's
+ * CONTENT AT WRITE TIME rather than at plan time.
+ *
+ * Declarative on purpose. One wizard run wires every service in a monorepo
+ * from one root .gitignore, so several edits target the same file. Content
+ * computed while planning is content computed from the same pre-image for all
+ * of them, and applying those in sequence keeps only the last entry — every
+ * earlier service's env file is left holding a live key that nothing excludes.
+ * An entry to ensure composes; a rendered file does not.
+ */
+export interface IgnoreEntryEdit {
+  kind: "ignore-entry";
+  path: string;
+  entry: string;
+}
+
+export type EnvEdit = EnvWriteEdit | IgnoreEntryEdit;
 
 export type EnvKeyPlan =
   /** The recipe reads no key variable (OTLP guidance, or a manual fallback). */
@@ -271,7 +292,7 @@ export type EnvKeyPlan =
       mode: "create" | "update";
       prior: string;
       /** Set when the file is not ignored yet and an entry has to be added. */
-      ignore: EnvEdit | null;
+      ignore: IgnoreEntryEdit | null;
     };
 
 export interface PlanEnvKeyInput {
@@ -309,16 +330,12 @@ export function planEnvKeyWrite(input: PlanEnvKeyInput): EnvKeyPlan {
   const probe = upsertEnvVar(prior, varName, "probe");
   if (probe.conflict) return { kind: "already-set", file, varName };
 
-  let ignore: EnvEdit | null = null;
+  let ignore: IgnoreEntryEdit | null = null;
   if (!io.isIgnored(repoRoot, relToRepo)) {
-    const ignorePath = path.join(repoRoot, ".gitignore");
-    const priorIgnore = io.exists(ignorePath)
-      ? (io.readFile(ignorePath) ?? "")
-      : "";
     ignore = {
-      path: ignorePath,
-      mode: io.exists(ignorePath) ? "update" : "create",
-      content: appendIgnoreEntry(priorIgnore, relToRepo),
+      kind: "ignore-entry",
+      path: path.join(repoRoot, ".gitignore"),
+      entry: relToRepo,
     };
   }
 
@@ -345,10 +362,20 @@ export function buildEnvKeyEdits(plan: EnvKeyPlan, key: string): EnvEdit[] {
   }
   const next = upsertEnvVar(plan.prior, plan.varName, key);
   const edits: EnvEdit[] = [
-    { path: plan.file, mode: plan.mode, content: next.content },
+    { kind: "write", path: plan.file, mode: plan.mode, content: next.content },
   ];
   if (plan.ignore) edits.push(plan.ignore);
   return edits;
+}
+
+export interface ApplyEnvEditsResult {
+  /** Paths actually written, in apply order. */
+  written: string[];
+  /**
+   * Ignore entries this apply really appended. An entry the file already
+   * listed is absent, so a caller cannot announce protection it did not add.
+   */
+  ignoreEntriesAdded: string[];
 }
 
 /**
@@ -359,22 +386,39 @@ export function buildEnvKeyEdits(plan: EnvKeyPlan, key: string): EnvEdit[] {
  * and worth keeping, and undoing someone's working injection over a failed
  * `.env` write would be a worse outcome than telling them to set one variable.
  */
-export function applyEnvEdits(edits: EnvEdit[], io: EnvFileIO): string[] {
+export function applyEnvEdits(
+  edits: EnvEdit[],
+  io: EnvFileIO,
+): ApplyEnvEditsResult {
   const preimages: {
     path: string;
     existed: boolean;
     content: string | null;
   }[] = [];
   const written: string[] = [];
+  const ignoreEntriesAdded: string[] = [];
   try {
     for (const edit of edits) {
       const existed = io.exists(edit.path);
       const prior = existed ? io.readFile(edit.path) : null;
+      let content: string;
+      if (edit.kind === "ignore-entry") {
+        // Re-read here, not at plan time: an earlier edit in this same apply
+        // may have already appended another service's entry to this file.
+        content = appendIgnoreEntry(prior ?? "", edit.entry);
+        // Already listed — by a rule this run added, or by one that was
+        // already there. Writing an identical file would report an addition
+        // that did not happen.
+        if (existed && content === prior) continue;
+        ignoreEntriesAdded.push(edit.entry);
+      } else {
+        content = edit.content;
+      }
       preimages.push({ path: edit.path, existed, content: prior });
-      io.writeFile(edit.path, edit.content);
+      io.writeFile(edit.path, content);
       written.push(edit.path);
     }
-    return written;
+    return { written, ignoreEntriesAdded };
   } catch (err) {
     for (const pre of preimages.reverse()) {
       if (!pre.existed) io.remove(pre.path);

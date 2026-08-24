@@ -511,14 +511,18 @@ export async function installSdk(
     return {
       installed: false,
       packages,
-      note: `SDK install via ${cmd} failed; the ${input.base}/install tarball fallback also failed — wire manually or run: curl -fsSL ${input.base}/install.sh | sh`,
+      // No install script is pointed at here on purpose. The line this replaced
+      // told people to pipe `<cloud>/install.sh` into a shell, and no
+      // deployment has ever served that route, so the one instruction printed
+      // at the moment the install failed was itself a 404.
+      note: `SDK install via ${cmd} failed, and so did the ${input.base}/install tarball fallback. Run \`${cmd} ${add} ${shown}\` in this app yourself to see what ${cmd} reports, then run \`npx crumbtrail\` again.`,
     };
   }
 
   return {
     installed: false,
     packages,
-    note: `SDK install via ${cmd} failed — install the tarballs instead: curl -fsSL ${input.base}/install.sh | sh`,
+    note: `SDK install via ${cmd} failed. Run \`${cmd} ${add} ${shown}\` in this app yourself to see what ${cmd} reports, then run \`npx crumbtrail\` again.`,
   };
 }
 
@@ -955,7 +959,15 @@ export async function runWizard(
     const keyProbe = await probeWrittenKey(base, keyWrite, deps);
     if (keyProbe && !keyProbe.ok) {
       notes.push(
-        `First-event wait skipped — ${preflightFailureReason(keyProbe)}.`,
+        keyRejectionNote(
+          {
+            name: "",
+            write: keyWrite,
+            ...(keyWrite.file ? { where: rel(cwd, keyWrite.file) } : {}),
+            mintUrl: appUrl(appBase, "/setup", provisioned.projectId),
+          },
+          keyProbe,
+        ),
       );
       printEvidenceSourcesPointer(ui, base, provisioned.projectId);
       printSummary(
@@ -1068,6 +1080,7 @@ function appBaseFor(
   return dashboardBase(
     base,
     stored && stored.endpoint === base ? stored.appBaseUrl : undefined,
+    env,
   );
 }
 
@@ -1543,18 +1556,39 @@ export async function runBatchWizard(
       }
     }
 
-    const probeKey = [...keyWrites.values()].find((write) => write.probeKey);
-    const keyProbe = probeKey
-      ? await probeWrittenKey(base, probeKey, deps)
-      : undefined;
+    // Probe each service's OWN key, one probe per distinct key value, and let
+    // a rejection speak only for the services carrying that key.
+    const keyProbes = await probeServiceKeys(
+      cloudReporting.map((o) => ({
+        name: o.name,
+        write: keyWrites.get(o.name),
+        where: keyWrites.get(o.name)?.file
+          ? rel(root, keyWrites.get(o.name)!.file!)
+          : undefined,
+        mintUrl: appUrl(appBase, "/setup", project.id),
+      })),
+      (key) =>
+        deps.runPreflight({
+          endpoint: base,
+          probe: { kind: "ingestKey", key },
+          fetchImpl: deps.fetchImpl,
+        }),
+    );
+    for (const o of cloudReporting) {
+      const probe = keyProbes.get(o.name);
+      if (probe && !probe.ok) o.notes.push(probe.note);
+    }
+    const waitable = cloudReporting.filter(
+      (o) => keyProbes.get(o.name)?.ok !== false,
+    );
     const byServiceId = new Map(
-      cloudReporting
+      waitable
         .filter((o) => o.serviceId)
         .map((o) => [o.serviceId as string, o]),
     );
-    if (keyProbe && !keyProbe.ok) {
-      const reason = `First-event wait skipped — ${preflightFailureReason(keyProbe)}.`;
-      for (const o of cloudReporting) o.notes.push(reason);
+    if (byServiceId.size === 0) {
+      // Every service that could report has a key the cloud will not accept,
+      // so there is nothing to wait for. Each already carries its own reason.
     } else {
       const poll = await pollServicesWithSigint(
         {
@@ -2060,7 +2094,10 @@ async function writeIngestKeys(args: {
     if (plan.kind !== "ready") continue;
     const where = rel(args.repoRoot, plan.file);
     try {
-      applyEnvEdits(buildEnvKeyEdits(plan, key.apiKey), args.deps.envFileIO);
+      const applied = applyEnvEdits(
+        buildEnvKeyEdits(plan, key.apiKey),
+        args.deps.envFileIO,
+      );
       ui.out(
         ok(
           `${named(label)}wrote ${color.bold(plan.varName)} to ${color.brand(where)}${keyLabel(key)}.`,
@@ -2076,7 +2113,10 @@ async function writeIngestKeys(args: {
           `  Restart your dev server if it is running — it reads ${plan.varName} at startup.`,
         ),
       );
-      if (plan.ignore) {
+      // Reported from what the apply actually appended, never from the plan:
+      // a plan can want an entry the file turns out to list already, and a
+      // claim that .gitignore now covers this file has to be true.
+      if (applied.ignoreEntriesAdded.length > 0) {
         // Saying this is not optional. A file that was about to be committed
         // silently is not any more, and someone who does not know that will go
         // looking for why their env file stopped showing up in `git status`.
@@ -2154,6 +2194,85 @@ async function probeWrittenKey(
     probe: { kind: "ingestKey", key: keyWrite.probeKey },
     fetchImpl: deps.fetchImpl,
   });
+}
+
+/** One service's key, as the run left it, for `probeServiceKeys`. */
+export interface KeyProbeTarget {
+  /** Service name, and the key of the returned map. */
+  name: string;
+  write: KeyWriteOutcome | undefined;
+  /** Repo-relative env file holding the key, when there is one. */
+  where?: string;
+  /** Where a replacement key is minted, named in the stale-key note. */
+  mintUrl?: string;
+}
+
+export interface KeyProbeVerdict {
+  ok: true;
+}
+export interface KeyProbeRejection {
+  ok: false;
+  note: string;
+}
+
+/**
+ * Probe the ingest key each service actually carries, one probe per DISTINCT
+ * key, and attribute every verdict only to the services carrying that key.
+ *
+ * Both halves are the fix for the same defect. The wizard mints ONE key and
+ * writes it into every service it wired, but a service whose env file already
+ * held a key keeps that one untouched — and a leftover from an older install is
+ * exactly the key that fails. Probing "the first key found across the run"
+ * therefore tested a credential this run never wrote, and then broadcast that
+ * one rejection to every service, so a single stale line in a single .env made
+ * a nine service install report itself as nine broken services.
+ *
+ * Services with no key to probe are absent from the result: unknown is not a
+ * rejection, and the event wait is what decides those.
+ */
+export async function probeServiceKeys(
+  targets: KeyProbeTarget[],
+  probe: (key: string) => Promise<PreflightResult>,
+): Promise<Map<string, KeyProbeVerdict | KeyProbeRejection>> {
+  const seen = new Map<string, PreflightResult>();
+  const out = new Map<string, KeyProbeVerdict | KeyProbeRejection>();
+  for (const target of targets) {
+    const key = target.write?.probeKey;
+    if (!key) continue;
+    let result = seen.get(key);
+    if (!result) {
+      result = await probe(key);
+      seen.set(key, result);
+    }
+    out.set(
+      target.name,
+      result.ok
+        ? { ok: true }
+        : { ok: false, note: keyRejectionNote(target, result) },
+    );
+  }
+  return out;
+}
+
+/**
+ * Say whose key was rejected. A key this run wrote failing is a broken install;
+ * a key that was already in the file failing is a leftover pointing nowhere,
+ * and the two need completely different sentences.
+ */
+function keyRejectionNote(
+  target: KeyProbeTarget,
+  result: PreflightResult,
+): string {
+  const reason = preflightFailureReason(result);
+  if (target.write?.status !== "already-set") {
+    return `First-event wait skipped — ${reason}.`;
+  }
+  const varName = target.write.varName ?? "the ingest key";
+  const where = target.where ? ` in ${target.where}` : "";
+  const mint = target.mintUrl
+    ? ` Mint a replacement at ${target.mintUrl}.`
+    : "";
+  return `The ${varName} already set${where} was left as it was found, and Crumbtrail rejected it — ${reason}. This service will not report until that value is replaced.${mint}`;
 }
 
 function preflightFailureReason(result: PreflightResult): string {
