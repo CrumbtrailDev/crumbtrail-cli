@@ -257,6 +257,7 @@ export function resetBackendIntakeQueueForTest(): void {
   queuedCount = 0;
   droppedCount = 0;
   idleWaiters = [];
+  defaultConsoleLines.clear();
 }
 
 /**
@@ -380,6 +381,11 @@ async function attemptDelivery(
 
     if (!response.ok) {
       const status = safeStatus(response.status);
+      // The server wrote the sentence that explains this refusal (a revoked
+      // key, a payload over the cap, a paused project). A bare status left an
+      // operator guessing at a cause the response body was holding, and the
+      // browser SDK had already taught the console line to carry it.
+      const reason = await readRefusalReason(response);
       return {
         ok: false,
         // A status is the endpoint's own answer about this payload, so sending
@@ -387,7 +393,9 @@ async function attemptDelivery(
         retryable: false,
         warning: {
           kind: "http-error",
-          message: `Backend intake returned HTTP ${status ?? "error"}.`,
+          message:
+            `The capture endpoint refused backend events with HTTP ${status ?? "error"}` +
+            `${reason ? `: ${reason}` : ""}; nothing from this session will be captured`,
           ...(status !== undefined ? { status } : {}),
         },
       };
@@ -398,18 +406,50 @@ async function attemptDelivery(
   } catch (error) {
     const kind = classifyCaughtError(error);
     const cause = safeErrorCause(error);
+    const abort = isAbortError(error);
     return {
       ok: false,
       // A malformed response still arrived, and an abort was asked for; neither
       // gets better by asking again. A transport rejection usually does.
-      retryable: kind === "fetch-rejected" && !isAbortError(error),
+      retryable: kind === "fetch-rejected" && !abort,
       warning: {
         kind,
-        message: safeErrorMessage(error),
+        message:
+          kind === "fetch-rejected" && !abort
+            ? `Backend events could not reach the capture endpoint` +
+              `${cause ? ` (${cause})` : ""}; nothing was captured`
+            : safeErrorMessage(error),
         ...(cause ? { cause } : {}),
       },
     };
   }
+}
+
+/**
+ * The server's own explanation of a refusal.
+ *
+ * Ingest read the `error`/`message`/`detail` fields off the JSON body, exactly
+ * like the browser transport's `readRefusalMessage`; a body that is not JSON
+ * (or has none of those fields) contributes no reason. The raw text is
+ * deliberately NOT read: a refusal body can carry a secret, and echoing it
+ * whole would leak what the refusal was protecting.
+ */
+async function readRefusalReason(
+  response: ResponseLike,
+): Promise<string | undefined> {
+  if (typeof response.json !== "function") return undefined;
+  let parsed: unknown;
+  try {
+    parsed = await response.json();
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+  for (const key of ["error", "message", "detail"]) {
+    const value = parsed[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -453,29 +493,75 @@ function normalizeEndpoint(endpoint: string | undefined): string {
   return trimmed.replace(/\/+$/, "");
 }
 
+/**
+ * One default console line per distinct refusal condition, process lifetime.
+ *
+ * A revoked key makes every event 401; without this a ``[crumbtrail]`` line
+ * would narrate each one of them. Keyed by condition so one refusal is said
+ * once, and a different refusal (a new status, a recovery failure) still gets
+ * its own line.
+ */
+const defaultConsoleLines = new Set<string>();
+
 function reportWarning(
   onWarning: SendBackendEventOptions["onWarning"],
   warning: BackendIntakeWarning,
 ): void {
-  if (!onWarning) return;
+  const surfaced = removeUndefined({
+    kind: warning.kind,
+    message:
+      boundString(warning.message, MAX_WARNING_MESSAGE_LENGTH) ??
+      "Backend intake warning.",
+    status: warning.status,
+    sessionId: safeString(warning.sessionId),
+    requestId: safeString(warning.requestId),
+    eventKind: safeString(warning.eventKind),
+    attempts: warning.attempts,
+    dropped: warning.dropped,
+    cause: safeString(warning.cause),
+  });
+
+  // A wired callback owns surfacing: skipping it would silence a sink the
+  // integrator chose, and printing the default line on top would duplicate it.
+  if (onWarning) {
+    try {
+      onWarning(surfaced);
+    } catch {
+      // Warning callbacks must never affect the host application response path.
+    }
+    return;
+  }
+
+  // No callback wired. A refusal the server explained must still reach the
+  // operator, the way the browser SDK's default console line does. The
+  // queue-overflow warning is exempt from the once-per-condition dedup because
+  // it already reports at its own drop-storm cadence; a dedup key would silence
+  // its later counts.
+  if (warning.kind === "queue-overflow") {
+    emitDefaultConsole(surfaced.message);
+    return;
+  }
+  const key = defaultConsoleKey(surfaced);
+  if (defaultConsoleLines.has(key)) return;
+  defaultConsoleLines.add(key);
+  emitDefaultConsole(surfaced.message);
+}
+
+/** Once-per-condition key for the default console line. */
+function defaultConsoleKey(warning: BackendIntakeWarning): string {
+  if (warning.kind === "http-error") {
+    return `http:${warning.status ?? "unknown"}`;
+  }
+  return warning.kind;
+}
+
+function emitDefaultConsole(message: string): void {
   try {
-    onWarning(
-      removeUndefined({
-        kind: warning.kind,
-        message:
-          boundString(warning.message, MAX_WARNING_MESSAGE_LENGTH) ??
-          "Backend intake warning.",
-        status: warning.status,
-        sessionId: safeString(warning.sessionId),
-        requestId: safeString(warning.requestId),
-        eventKind: safeString(warning.eventKind),
-        attempts: warning.attempts,
-        dropped: warning.dropped,
-        cause: safeString(warning.cause),
-      }),
-    );
+    if (typeof console !== "undefined" && typeof console.warn === "function") {
+      console.warn(`[crumbtrail] ${message}`);
+    }
   } catch {
-    // Warning callbacks must never affect the host application response path.
+    // A replaced console must not take the host application down with it.
   }
 }
 

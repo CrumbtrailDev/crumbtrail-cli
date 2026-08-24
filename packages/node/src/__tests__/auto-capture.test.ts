@@ -431,8 +431,54 @@ describe("autoCapture", () => {
       }),
     );
 
-    // No diagnostic noise for a healthy-by-default install.
+    // No diagnostic noise for a healthy-by-default install. A transport
+    // rejection is usually transient and the session self-heals; only a server
+    // explained refusal gets a default console line (tested below).
     expect(originalError).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a server explained session start refusal to the default console once", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const originalError = vi.fn();
+    const consoleImpl = { error: originalError };
+    let clock = 1000;
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      if (String(url).endsWith("/api/session/start")) {
+        return new Response(
+          JSON.stringify({ error: "This project API key was not accepted." }),
+          { status: 401 },
+        );
+      }
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    }) as unknown as typeof fetch;
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl,
+        fetchImpl,
+        nowImpl: () => clock,
+      }),
+    );
+
+    // The boot handshake was refused and the server's sentence reaches the
+    // default console even with no onError wired.
+    expect(originalError).toHaveBeenCalledTimes(1);
+    expect(originalError.mock.calls[0][0]).toContain(
+      "[crumbtrail] the capture endpoint refused session start with HTTP 401: This project API key was not accepted.; nothing from this session will be captured",
+    );
+
+    // A later capture, after the backoff gate opens, is refused again — but the
+    // same condition is still one console line. (The mirrored console.error
+    // passes the error through the original sink, so count refusal lines only.)
+    clock += 60_000;
+    consoleImpl.error(new Error("later failure"));
+    await new Promise((r) => setTimeout(r, 0));
+    const refusalLines = originalError.mock.calls.filter((call) =>
+      String(call[0]).startsWith("[crumbtrail]"),
+    );
+    expect(refusalLines).toHaveLength(1);
   });
 
   const startCountOf = (calls: FetchCall[]): number =>

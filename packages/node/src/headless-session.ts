@@ -24,11 +24,19 @@ export interface HeadlessSession {
 export class HeadlessRequestError extends Error {
   readonly status: number;
   readonly retryAfterMs?: number;
-  constructor(message: string, status: number, retryAfterMs?: number) {
+  /** The server's own refusal sentence, when the response body carried one. */
+  readonly serverMessage?: string;
+  constructor(
+    message: string,
+    status: number,
+    retryAfterMs?: number,
+    serverMessage?: string,
+  ) {
     super(message);
     this.name = "HeadlessRequestError";
     this.status = status;
     if (retryAfterMs !== undefined) this.retryAfterMs = retryAfterMs;
+    if (serverMessage !== undefined) this.serverMessage = serverMessage;
   }
 }
 
@@ -89,14 +97,16 @@ async function postJson(
     parsed = { error: text || `HTTP ${response.status}` };
   }
   if (!response.ok) {
-    const message =
-      isRecord(parsed) && typeof parsed.error === "string"
-        ? parsed.error
-        : `HTTP ${response.status}`;
+    const serverMessage =
+      isRecord(parsed) && typeof parsed.error === "string" && parsed.error.trim()
+        ? parsed.error.trim()
+        : undefined;
+    const message = serverMessage ?? `HTTP ${response.status}`;
     throw new HeadlessRequestError(
       `Crumbtrail headless session request failed: ${message}`,
       response.status,
       parseRetryAfter(response.headers.get("retry-after")),
+      serverMessage,
     );
   }
   return isRecord(parsed) ? parsed : {};

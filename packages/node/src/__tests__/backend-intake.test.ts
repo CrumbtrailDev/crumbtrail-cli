@@ -106,7 +106,8 @@ describe("backend intake client", () => {
     expect(warnings).toEqual([
       {
         kind: "fetch-rejected",
-        message: "Error",
+        message:
+          "Backend events could not reach the capture endpoint; nothing was captured",
         sessionId: "ses_event",
         requestId: "req_123",
         eventKind: "backend.req.start",
@@ -131,10 +132,14 @@ describe("backend intake client", () => {
       onWarning: warnings.push.bind(warnings),
     });
 
+    // The refusal body here is not JSON the SDK can attribute to the server, so
+    // no reason is appended — and the raw body is never echoed, because a
+    // refusal body can carry a secret.
     expect(warnings).toEqual([
       {
         kind: "http-error",
-        message: "Backend intake returned HTTP 401.",
+        message:
+          "The capture endpoint refused backend events with HTTP 401; nothing from this session will be captured",
         status: 401,
         sessionId: "ses_event",
         requestId: "req_123",
@@ -143,6 +148,87 @@ describe("backend intake client", () => {
     ]);
     await expect(fetch.mock.results[0].value).resolves.toBeDefined();
     expect(JSON.stringify(warnings)).not.toContain("local-secret-token");
+    const refused = (await fetch.mock.results[0].value) as {
+      text: ReturnType<typeof vi.fn>;
+    };
+    expect(refused.text).not.toHaveBeenCalled();
+  });
+
+  it("carries the server's refusal sentence instead of a bare status", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 401,
+      json: vi.fn().mockResolvedValue({
+        error: "This project API key was not accepted. It may have been revoked.",
+        code: "unauthorized",
+      }),
+    });
+    const warnings: BackendIntakeWarning[] = [];
+
+    await sendBackendEvent({
+      event: baseEvent,
+      authToken: "local-secret-token",
+      fetch,
+      onWarning: warnings.push.bind(warnings),
+    });
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({
+      kind: "http-error",
+      status: 401,
+      message:
+        "The capture endpoint refused backend events with HTTP 401: This project API key was not accepted. It may have been revoked.; nothing from this session will be captured",
+    });
+  });
+
+  it("prints the refusal to the default console once when no callback is wired", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: vi.fn().mockResolvedValue({
+          error:
+            "This project API key was not accepted. It may have been revoked.",
+        }),
+      });
+
+      // Three events, all refused the same way: one console line, not three.
+      await sendBackendEvent({ event: baseEvent, fetch, retries: 0 });
+      await sendBackendEvent({ event: baseEvent, fetch, retries: 0 });
+      await sendBackendEvent({ event: baseEvent, fetch, retries: 0 });
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toBe(
+        "[crumbtrail] The capture endpoint refused backend events with HTTP 401: This project API key was not accepted. It may have been revoked.; nothing from this session will be captured",
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("keeps a wired onWarning the only surface (no default console duplication)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const warnings: BackendIntakeWarning[] = [];
+      const fetch = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 401,
+        json: vi.fn().mockResolvedValue({ error: "key not accepted" }),
+      });
+
+      await sendBackendEvent({
+        event: baseEvent,
+        fetch,
+        retries: 0,
+        onWarning: (w) => warnings.push(w),
+      });
+
+      expect(warnings).toHaveLength(1);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("converts malformed JSON response text into a safe warning", async () => {
