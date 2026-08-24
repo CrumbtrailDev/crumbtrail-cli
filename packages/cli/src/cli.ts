@@ -17,6 +17,8 @@ import {
   defaultInjectIO,
   detect,
   executePlan,
+  findNearbyProjectDirs,
+  localFsReader,
   type DetectResult,
   type PackageManager,
   type Plan,
@@ -631,7 +633,7 @@ export function resolveWorkspaceDir(
   }
   if (!io.isFile(path.join(dir, "package.json"))) {
     return {
-      error: `--workspace ${workspace}: ${dir} has no package.json — point it at a package directory.`,
+      error: `--workspace ${workspace}: looked in ${dir}; no package.json. Point --workspace at a package directory.`,
     };
   }
   return { dir };
@@ -684,15 +686,35 @@ export async function runWizard(
     if (isDeno) {
       ui.err(
         color.red(
-          "Deno projects aren't supported yet — Crumbtrail can't wire this one.",
+          `No supported framework in ${result.cwd}. This directory looks like a Deno project, which Crumbtrail cannot wire yet.`,
         ),
       );
     } else {
-      ui.err(color.red("Couldn't detect a supported framework here."));
+      ui.err(
+        color.red(`No supported framework in ${result.cwd}.`),
+      );
     }
     for (const r of result.reasons) ui.err(color.dim(`  · ${r}`));
     for (const n of result.notes) ui.err(color.dim(`  · ${n}`));
     if (!isDeno) {
+      const nearby = findNearbyProjectDirs(
+        result.cwd,
+        localFsReader(result.cwd),
+      );
+      ui.err("");
+      if (nearby.length > 0) {
+        ui.err(
+          "The app is probably in a subdirectory. Run the wizard from one of these:",
+        );
+        for (const rel of nearby) {
+          ui.err(color.dim(`  cd ${rel} && npx crumbtrail`));
+        }
+      } else {
+        ui.err("If this is a monorepo, run from the app package:");
+        ui.err(color.dim("  cd apps/web && npx crumbtrail"));
+        ui.err("If you ran this from the folder above the project:");
+        ui.err(color.dim("  cd <project folder> && npx crumbtrail"));
+      }
       ui.err(
         "Supported: Next.js, SvelteKit, Nuxt, Remix, Astro, Angular, Vite SPA, NestJS, Express, Hono, Fastify, a Node server, or a non-JS backend that speaks OpenTelemetry (Django, Flask, FastAPI, Go, Rails, .NET).",
       );
@@ -1135,7 +1157,12 @@ function stackLabel(c: ServiceCandidate): string {
 /** The trailing hint that explains why a row is unchecked (or unselectable). */
 function candidateHint(c: ServiceCandidate): string {
   const stack = stackLabel(c);
-  if (c.flags.includes("no-recipe")) return "no supported framework";
+  if (c.flags.includes("no-recipe")) {
+    const detail = c.detected.reasons[0];
+    return detail
+      ? `no supported framework (${detail})`
+      : "no supported framework";
+  }
   if (c.flags.includes("likely-library"))
     return `${stack} · shared library, select only if it runs as a service`;
   if (c.flags.includes("otlp"))
@@ -1183,7 +1210,7 @@ export function resolveSelection(
       }
       if (!candidates[i].selectable) {
         return {
-          error: `--only ${want}: no supported framework detected there — it can't be wired.`,
+          error: `--only ${want}: looked in ${candidates[i].dir}; no supported framework${candidates[i].detected.reasons.length ? ` (${candidates[i].detected.reasons.join("; ")})` : ""}. It cannot be wired.`,
         };
       }
       if (!indices.includes(i)) indices.push(i);
@@ -1235,7 +1262,7 @@ export async function runBatchWizard(
   );
   if (selectableCount === 0) {
     ui.err("");
-    ui.err(color.red("Nothing here can be wired."));
+    ui.err(color.red(`Nothing in ${root} can be wired.`));
     for (const c of candidates) {
       ui.err(note(`${c.relDir} — ${candidateHint(c)}`));
     }
@@ -1260,7 +1287,7 @@ export async function runBatchWizard(
     ui.err("");
     ui.err(
       color.red(
-        "Monorepo root, but there's no TTY to pick services. Pass --only <service> (repeatable) or --all.",
+        `Monorepo at ${root}, but this shell is not interactive. Pass --only <service> (repeatable) or --all.`,
       ),
     );
     for (const c of candidates) {
