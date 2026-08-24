@@ -1341,6 +1341,7 @@ export async function runBatchWizard(
       assumeYes: parsed.yes,
       projectId: parsed.project,
       defaultProjectName,
+      identityLabel,
       fetchImpl: deps.fetchImpl,
     });
   } catch (err) {

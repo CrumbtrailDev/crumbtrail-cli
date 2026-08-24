@@ -275,11 +275,11 @@ export async function validateToken(
  * The account a token belongs to, as far as this deployment will say.
  *
  * A token is validated against the ENDPOINT, never against the project, so a
- * token left over from another workspace passes every check the CLI makes and
- * then fails deep inside provisioning as "Project not found" — which reads as a
- * wrong project id, and sends the user off to re-check an id that was right.
- * Naming the account on the line that says a login is being reused is what
- * makes that failure legible before it happens.
+ * token left over from another workspace used to pass every check the CLI
+ * made and then fail deep inside provisioning as "Project not found". Naming
+ * the account on the line that says a login is being reused, and checking
+ * `--project` against that account's list before creating a service, is what
+ * makes that failure name the login instead of the id.
  */
 export interface Identity {
   userId?: string;
@@ -663,7 +663,20 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
       return stored.token;
     }
     clearAuth(env);
-    opts.ui.out(color.dim("Saved login expired — signing in again."));
+    opts.ui.out(color.dim("Saved login expired. Signing in again."));
+  } else if (
+    stored?.token &&
+    stored.endpoint &&
+    stored.endpoint !== opts.base
+  ) {
+    // A token minted for another deployment is not a token for this one.
+    // Don't reuse it, and say so: silent fall-through to a fresh login made
+    // it look as if this machine had no login at all.
+    opts.ui.out(
+      color.dim(
+        `Saved login is for ${stored.endpoint}, not ${opts.base}. Signing in to this endpoint.`,
+      ),
+    );
   }
 
   // No env token and no reusable cached token — the only way forward is an
