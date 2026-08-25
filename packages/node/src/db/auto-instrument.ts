@@ -36,6 +36,7 @@ import { instrumentPgClient } from "./pg";
 import { instrumentMysqlClient } from "./mysql";
 import { instrumentSqliteDatabase } from "./sqlite";
 import { instrumentMssqlPool } from "./mssql";
+import { instrumentPostgresSql } from "./postgres-js";
 import type { InstrumentDbClientOptions } from "./instrument-shared";
 
 /** Marks an already-wrapped factory so a second install is a no-op. */
@@ -44,6 +45,10 @@ const PATCHED = Symbol.for("crumbtrail.db.autoInstrumented");
 /** Drivers this module knows how to wrap, in the order they are attempted. */
 export const AUTO_INSTRUMENT_DRIVERS = [
   "pg",
+  // porsager/postgres. Attempted before mysql2 for the same reason `pg` is
+  // first: a Postgres app is the common case, and the two Postgres drivers are
+  // mutually exclusive in practice.
+  "postgres",
   "mysql2",
   "mysql2/promise",
   "better-sqlite3",
@@ -64,13 +69,35 @@ export interface AutoInstrumentDbOptions
   drivers?: readonly AutoInstrumentDriver[];
   /** Module resolver seam. Defaults to a CJS `require` off this module. */
   resolve?: (specifier: string) => unknown;
+  /**
+   * Replace a resolved module's whole export, for drivers whose export IS the
+   * factory (postgres.js) and so have no property to swap. Returns whether the
+   * replacement took. Defaults to writing `require.cache`.
+   */
+  replaceModule?: (specifier: string, value: unknown) => boolean;
+  /**
+   * Whether the host application loads its dependencies as ES modules.
+   * Defaults to reading `"type"` from the nearest `package.json`.
+   */
+  hostIsEsm?: () => boolean;
   /** Reported once per install with what was and was not patched. */
   onReport?: (report: AutoInstrumentReport) => void;
 }
 
 export interface AutoInstrumentDriverResult {
   driver: AutoInstrumentDriver;
-  status: "patched" | "not-installed" | "unsupported-shape" | "already-patched";
+  status:
+    | "patched"
+    | "not-installed"
+    | "unsupported-shape"
+    | "already-patched"
+    /**
+     * The driver was found and wrapped in the CommonJS module graph, and the
+     * host application loads it as an ES module — a separate copy the wrap
+     * cannot reach. Reported separately from `patched` because claiming capture
+     * that will not happen is worse than admitting it did not.
+     */
+    | "esm-unreachable";
   /** Present for every status except `patched`; never invented. */
   detail?: string;
 }
@@ -184,11 +211,18 @@ function defaultResolve(specifier: string): unknown {
 }
 
 /** Per-driver patch plans. Each returns the statuses it produced. */
+/** Seams patchDriver needs that are not per-statement instrumentation options. */
+interface PatchContext {
+  replaceModule: (specifier: string, value: unknown) => boolean;
+  hostIsEsm: () => boolean;
+}
+
 function patchDriver(
   driver: AutoInstrumentDriver,
   moduleExports: unknown,
   options: InstrumentDbClientOptions,
   restorations: Restoration[],
+  context: PatchContext,
 ): AutoInstrumentDriverResult {
   const mod = asRecord(moduleExports);
   if (!mod) {
@@ -257,6 +291,14 @@ function patchDriver(
         detail: "no callable default export",
       };
     }
+  } else if (driver === "postgres") {
+    return patchPostgresJs(
+      moduleExports,
+      mod,
+      options,
+      restorations,
+      context,
+    );
   } else if (driver === "mssql") {
     statuses.push(
       patchFactory(
@@ -287,6 +329,136 @@ function patchDriver(
 }
 
 /**
+ * postgres.js has no factory PROPERTY to replace: `module.exports` IS the
+ * factory (`postgres(url, options)`), and the ESM build's default export is a
+ * frozen namespace binding. So the module's whole export is swapped in the
+ * loader's cache instead, which is why `autoCapture` must run before the app
+ * requires its database client — the CLI's prepend-injected snippet does.
+ *
+ * A bundled or transpiled copy that DOES expose a writable `default` is handled
+ * first, because replacing a property is strictly safer than replacing a module.
+ */
+function patchPostgresJs(
+  moduleExports: unknown,
+  mod: Record<string, unknown>,
+  options: InstrumentDbClientOptions,
+  restorations: Restoration[],
+  context: PatchContext,
+): AutoInstrumentDriverResult {
+  const wrap = (instance: unknown): unknown =>
+    instrumentPostgresSql(instance, options);
+
+  if (typeof mod.default === "function") {
+    const status = patchFactory(mod, "default", wrap, restorations);
+    return status === "patched" || status === "already-patched"
+      ? { driver: "postgres", status }
+      : { driver: "postgres", status, detail: "default export is not writable" };
+  }
+
+  if (typeof moduleExports !== "function") {
+    return {
+      driver: "postgres",
+      status: "unsupported-shape",
+      detail: "module export is neither a factory nor a namespace",
+    };
+  }
+  if (isPatched(moduleExports)) {
+    return { driver: "postgres", status: "already-patched" };
+  }
+
+  // Build the wrapper with the same machinery every other driver uses, in a
+  // holder object, then install the holder's result as the module's export.
+  const holder: Record<string, unknown> = { factory: moduleExports };
+  const holderRestorations: Restoration[] = [];
+  const status = patchFactory(holder, "factory", wrap, holderRestorations);
+  if (status !== "patched") {
+    return {
+      driver: "postgres",
+      status: "unsupported-shape",
+      detail: "factory could not be wrapped",
+    };
+  }
+
+  if (!context.replaceModule("postgres", holder.factory)) {
+    return {
+      driver: "postgres",
+      status: "unsupported-shape",
+      detail:
+        "the resolved postgres module could not be replaced in the loader cache",
+    };
+  }
+
+  // `restore()` writes `target[key] = original`; this slot turns that write back
+  // into a module replacement, so the driver is restorable like every other one.
+  const slot = {
+    set factory(value: unknown) {
+      context.replaceModule("postgres", value);
+    },
+    get factory(): unknown {
+      return undefined;
+    },
+  };
+  restorations.push({
+    target: slot as unknown as Record<string, unknown>,
+    key: "factory",
+    original: moduleExports,
+  });
+
+  if (context.hostIsEsm()) {
+    return {
+      driver: "postgres",
+      status: "esm-unreachable",
+      detail:
+        "the app loads postgres.js as an ES module, a separate copy from the " +
+        "one wrapped here; call instrumentPostgresSql(sql) on your pool",
+    };
+  }
+  return { driver: "postgres", status: "patched" };
+}
+
+/** Replace a resolved module's export in the CommonJS loader cache. */
+function defaultReplaceModule(specifier: string, value: unknown): boolean {
+  try {
+    const resolved = require.resolve(specifier);
+    const entry = require.cache?.[resolved];
+    if (!entry) return false;
+    entry.exports = value;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the host application loads its dependencies as ES modules, per the
+ * nearest `package.json`. A best-effort read: when it cannot be answered the
+ * answer is "no", because reporting a driver as unreachable when it is in fact
+ * instrumented would send a reader to fix something that is not broken.
+ */
+function defaultHostIsEsm(): boolean {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fs = require("node:fs") as typeof import("node:fs");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const path = require("node:path") as typeof import("node:path");
+    let dir = process.cwd();
+    for (let depth = 0; depth < 6; depth += 1) {
+      const file = path.join(dir, "package.json");
+      if (fs.existsSync(file)) {
+        const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf-8"));
+        return asRecord(parsed)?.type === "module";
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {
+    // An unreadable package.json is not a reason to under-report capture.
+  }
+  return false;
+}
+
+/**
  * Wrap every DB driver the host actually depends on, so `db.diff` evidence is
  * captured without the app writing an `instrument*` call.
  *
@@ -299,10 +471,13 @@ export function autoInstrumentDbClients(
   const {
     drivers = AUTO_INSTRUMENT_DRIVERS,
     resolve = defaultResolve,
+    replaceModule = defaultReplaceModule,
+    hostIsEsm = defaultHostIsEsm,
     onReport,
     ...instrumentOptions
   } = options;
 
+  const context: PatchContext = { replaceModule, hostIsEsm };
   const restorations: Restoration[] = [];
   const results: AutoInstrumentDriverResult[] = [];
 
@@ -322,7 +497,13 @@ export function autoInstrumentDbClients(
     }
     try {
       results.push(
-        patchDriver(driver, moduleExports, instrumentOptions, restorations),
+        patchDriver(
+          driver,
+          moduleExports,
+          instrumentOptions,
+          restorations,
+          context,
+        ),
       );
     } catch (error) {
       results.push({
@@ -356,20 +537,58 @@ export function autoInstrumentDbClients(
   return report;
 }
 
-/** One line naming what is and is not instrumented. Empty when nothing matched. */
+/**
+ * One line naming what is and is not instrumented.
+ *
+ * It used to return an empty string whenever nothing was patched, which is
+ * exactly the case worth reporting: an app whose driver this build cannot wrap
+ * got a silent install and a session with no database evidence in it, and
+ * nothing anywhere connected the two. Now the silence has a sentence.
+ */
 export function formatAutoInstrumentReport(
   report: AutoInstrumentReport,
 ): string {
   const patched = report.results
     .filter((r) => r.status === "patched")
     .map((r) => r.driver);
-  if (patched.length === 0) return "";
-  const unsupported = report.results.filter(
-    (r) => r.status === "unsupported-shape",
+  const blocked = report.results.filter(
+    (r) => r.status === "unsupported-shape" || r.status === "esm-unreachable",
   );
-  const tail =
-    unsupported.length > 0
-      ? `; not instrumented: ${unsupported.map((r) => `${r.driver} (${r.detail ?? "unsupported"})`).join(", ")}`
+  const blockedTail =
+    blocked.length > 0
+      ? `not instrumented: ${blocked
+          .map((r) => `${r.driver} (${r.detail ?? "unsupported"})`)
+          .join(", ")}`
       : "";
-  return `[crumbtrail] database capture active for ${patched.join(", ")}${tail}`;
+
+  if (patched.length > 0) {
+    return `[crumbtrail] database capture active for ${patched.join(", ")}${
+      blockedTail ? `; ${blockedTail}` : ""
+    }`;
+  }
+
+  if (blocked.length > 0) {
+    return (
+      "[crumbtrail] no database driver was instrumented, so this session will " +
+      `carry no database evidence; ${blockedTail}`
+    );
+  }
+
+  // The documented opt-out (`drivers: []`) attempted nothing, so there is
+  // nothing to report and no silence to explain.
+  if (report.results.length === 0) return "";
+
+  const attempted = report.results.map((r) => r.driver);
+  return (
+    "[crumbtrail] no database driver was instrumented, so this session will " +
+    "carry no database evidence: none of the supported drivers " +
+    `(${attempted.join(", ")}) is installed in this application`
+  );
+}
+
+/** Whether anything at all ended up wrapped. Drives whether the line is loud. */
+export function autoInstrumentPatchedAnything(
+  report: AutoInstrumentReport,
+): boolean {
+  return report.results.some((r) => r.status === "patched");
 }

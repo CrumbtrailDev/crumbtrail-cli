@@ -605,6 +605,33 @@ describe("detect", () => {
     expect(r.workspaces.map((w) => w.name)).toEqual(["site"]);
   });
 
+  it("expands nested workspace patterns and applies exclusions", () => {
+    const root = tmp({
+      "package.json": JSON.stringify({ name: "root" }),
+      "pnpm-workspace.yaml": [
+        "packages:",
+        "  - 'apps/*/*'",
+        "  - 'apps/**'",
+        "  - 'packages/**'",
+        "  - '!apps/legacy'",
+      ].join("\n"),
+      "apps/team/web/package.json": JSON.stringify({ name: "@team/web" }),
+      "apps/team/docs/package.json": JSON.stringify({ name: "@team/docs" }),
+      "apps/legacy/package.json": JSON.stringify({ name: "legacy" }),
+      "packages/group/api/package.json": JSON.stringify({ name: "@group/api" }),
+      "packages/top/package.json": JSON.stringify({ name: "top" }),
+      "unlisted/package.json": JSON.stringify({ name: "unlisted" }),
+    });
+
+    const r = detect(root);
+    expect(r.workspaces.map((w) => path.relative(root, w.dir)).sort()).toEqual([
+      "apps/team/docs",
+      "apps/team/web",
+      "packages/group/api",
+      "packages/top",
+    ]);
+  });
+
   it("is ambiguous with no recipe match", () => {
     const root = tmp({ "package.json": JSON.stringify({ name: "lib" }) });
     const r = detect(root);

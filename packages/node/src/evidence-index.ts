@@ -936,6 +936,7 @@ export function buildEvidenceCandidates(
   addUiArithmeticMismatchCandidates(events, index, drafts);
   addUiApiDivergenceCandidates(events, index, drafts);
   addOtelDbActivityCandidates(events, index, drafts);
+  addSlowDependencySpanCandidates(events, index, drafts);
 
   // Full-recall detectors. Append-only: every rule above keeps its position and
   // its ranking, and these read evidence the pipeline already captured but no
@@ -6407,6 +6408,190 @@ function hasOtelDbAttributes(attrs: Record<string, unknown>): boolean {
     safeText(attrs["db.operation.name"], 80) !== undefined ||
     safeText(attrs["db.query.text"], 220) !== undefined
   );
+}
+
+// ─── Slow backend dependencies ──────────────────────────────────────────────
+//
+// The gap this closes: a span was ranked only when it FAILED (otel_span_error
+// fires on statusCode ERROR or HTTP 500 and above), while both slowness rules
+// read browser `net.res` events and nothing else. So a database, cache, queue
+// or outbound HTTP call that took 30 seconds and then SUCCEEDED reached the
+// bundle, was rendered as activity, and produced no ranked issue. The reader
+// got the browser symptom and never got the dependency that caused it.
+//
+// Everything below reuses the two thresholds the browser plane already uses,
+// deliberately: MIN_LATENCY_SAMPLES, LATENCY_OUTLIER_FACTOR,
+// MIN_LATENCY_OUTLIER_MS and the 5,000 ms absolute floor. A second, different
+// definition of "slow" would put two numbers in the product for one idea, and a
+// reader comparing a browser finding with a backend one would be comparing two
+// gradings.
+
+/** Absolute floor at which a call is slow whatever the session looked like. Mirrors `slow_request`. */
+const SLOW_SPAN_MS = 5_000;
+/** Where `slow_request` stops calling it medium. Same number, same reason. */
+const VERY_SLOW_SPAN_MS = 15_000;
+
+/** OTel SpanKind, as the OTLP wire encodes it. */
+const SPAN_KIND_SERVER = 2;
+const SPAN_KIND_CLIENT = 3;
+const SPAN_KIND_PRODUCER = 4;
+const SPAN_KIND_CONSUMER = 5;
+
+/** Cache engines that report themselves through the database attributes. */
+const CACHE_SYSTEMS = new Set([
+  "redis",
+  "valkey",
+  "memcached",
+  "hazelcast",
+  "aerospike",
+]);
+
+type SpanDependencyKind = "database" | "cache" | "queue" | "HTTP" | "dependency";
+
+/**
+ * What a span calls OUT to, or undefined when the span is not a dependency call.
+ *
+ * The `undefined` cases carry the design decision. A SERVER span IS the request,
+ * so ranking it as slow would restate whatever already reported that request as
+ * slow: the browser `net.res` for the same call, ranked by `slow_request` or
+ * `latency_outlier`. That is the duplicate this returns undefined to avoid. An
+ * INTERNAL span is in-process work, not an infrastructure dependency, and a span
+ * that names no system and declares no kind is not identifiable as either.
+ */
+function otelSpanDependency(
+  d: Record<string, unknown>,
+): SpanDependencyKind | undefined {
+  const kind = finiteNumber(d.kind);
+  if (kind === SPAN_KIND_SERVER) return undefined;
+
+  const attrs = isRecord(d.attributes) ? d.attributes : {};
+  if (hasOtelDbAttributes(attrs)) {
+    const system = safeText(attrs["db.system"], 80)?.toLowerCase();
+    const name = safeText(attrs["db.system.name"], 80)?.toLowerCase();
+    return CACHE_SYSTEMS.has(system ?? "") || CACHE_SYSTEMS.has(name ?? "")
+      ? "cache"
+      : "database";
+  }
+  if (
+    safeText(attrs["messaging.system"], 80) !== undefined ||
+    safeText(attrs["messaging.destination.name"], 200) !== undefined ||
+    kind === SPAN_KIND_PRODUCER ||
+    kind === SPAN_KIND_CONSUMER
+  )
+    return "queue";
+  if (kind !== SPAN_KIND_CLIENT) return undefined;
+  if (
+    safeText(attrs["http.request.method"], 20) !== undefined ||
+    safeText(attrs["http.method"], 20) !== undefined ||
+    safeText(attrs["url.full"], 400) !== undefined ||
+    safeText(attrs["http.url"], 400) !== undefined
+  )
+    return "HTTP";
+  // A CLIENT span that names no system is still an outbound call the service
+  // waited on, which is all this rule needs to be true.
+  return "dependency";
+}
+
+/**
+ * `otel_slow_dependency` and `otel_dependency_latency_outlier`: a backend call
+ * out to infrastructure took long enough to be the incident, and returned fine.
+ *
+ * Two rules over one set of spans, exactly as the browser plane has two:
+ *
+ *  1. Absolute. At or above {@link SLOW_SPAN_MS} the call is slow on its own
+ *     terms, whatever else the session did, and at or above
+ *     {@link VERY_SLOW_SPAN_MS} it is high severity. Same numbers and same
+ *     severities as `slow_request`, because it is the same judgement about the
+ *     same unit: wall time a user waited on.
+ *  2. Relative. Below that floor, a call is only slow against its own session:
+ *     at least {@link MIN_LATENCY_SAMPLES} dependency calls to compare with, at
+ *     least {@link LATENCY_OUTLIER_FACTOR} times their median, and at least
+ *     {@link MIN_LATENCY_OUTLIER_MS} in absolute terms so a fast session cannot
+ *     manufacture an outlier from noise. Copied from `latency_outlier`, and the
+ *     same guard against overlap: anything over the absolute floor is left to
+ *     rule 1 rather than reported twice.
+ *
+ * Error spans are skipped. `otel_span_error` already ranks those, and a call
+ * that failed after 30 seconds is one finding, not two.
+ */
+function addSlowDependencySpanCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  const samples: {
+    event: BugEvent;
+    dur: number;
+    dependency: SpanDependencyKind;
+  }[] = [];
+  for (const event of events) {
+    if (event.k !== OTEL_SPAN_KIND) continue;
+    const status = otelHttpStatus(event.d.attributes);
+    if (event.d.statusCode === "ERROR" || (status ?? 0) >= 500) continue;
+    const dur = finiteNumber(event.d.durationMs);
+    if (dur === undefined || dur < 0) continue;
+    const dependency = otelSpanDependency(event.d);
+    if (!dependency) continue;
+    samples.push({ event, dur, dependency });
+  }
+  if (samples.length === 0) return;
+
+  const median = medianOf(samples.map((sample) => sample.dur));
+  const outlierThreshold = Math.max(
+    median * LATENCY_OUTLIER_FACTOR,
+    MIN_LATENCY_OUTLIER_MS,
+  );
+
+  for (const { event, dur, dependency } of samples) {
+    const name = scrubText(event.d.name, 160);
+    const service = safeText(event.d.serviceName, 80);
+    const requestId =
+      safeText(event.d.traceId, 120) ?? safeText(event.d.requestId, 120);
+    const spanId = safeText(event.d.spanId, 120);
+    const label = name ?? `${dependency} call`;
+    const suffix = service ? ` [${service}]` : "";
+    const anchorBase = {
+      t: event.t,
+      offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+      route: routeAt(index.navs ?? [], event.t),
+      requestId,
+      status: otelHttpStatus(event.d.attributes),
+      source: service,
+      frame: spanCodeFrame(event.d),
+    };
+
+    if (dur >= SLOW_SPAN_MS) {
+      drafts.push({
+        detector: "otel_slow_dependency",
+        title: `Slow ${dependency} call: ${Math.round(dur)} ms ${label}${suffix}`,
+        severity: dur >= VERY_SLOW_SPAN_MS ? "high" : "medium",
+        score: dur >= VERY_SLOW_SPAN_MS ? 78 : 64,
+        confidence: "high",
+        anchor: removeUndefined({
+          ...anchorBase,
+          message: `${label} took ${Math.round(dur)} ms and returned without an error, so nothing failed and the time was spent inside this ${dependency} call`,
+        }),
+        dedupeKey: `otelslowdep:${spanId ?? event.t}`,
+      });
+      continue;
+    }
+
+    if (samples.length < MIN_LATENCY_SAMPLES) continue;
+    if (dur < outlierThreshold) continue;
+    const ratio = median > 0 ? Math.round(dur / median) : undefined;
+    drafts.push({
+      detector: "otel_dependency_latency_outlier",
+      title: `${dependency} latency outlier: ${Math.round(dur)} ms${ratio ? ` (${ratio}× the session median of ${Math.round(median)} ms)` : ""} ${label}${suffix}`,
+      severity: "medium",
+      score: 68,
+      confidence: "medium",
+      anchor: removeUndefined({
+        ...anchorBase,
+        message: `${label} took ${Math.round(dur)} ms against a median of ${Math.round(median)} ms across ${samples.length} backend dependency calls in this session, far below any absolute threshold but an outlier against this session's own distribution`,
+      }),
+      dedupeKey: `oteldeplatency:${spanId ?? event.t}`,
+    });
+  }
 }
 
 // ═══ Full-recall detectors ══════════════════════════════════════════════════

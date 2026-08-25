@@ -122,6 +122,28 @@ describe("a rejected ingest key is not a wired service", () => {
     const text = render([outcome({})]).join("\n");
     expect(text).toContain("1 wired");
     expect(text).not.toContain("key rejected");
-    expect(text).toMatch(/Setup complete/);
+    // Nothing is outstanding, so the bar is not "Setup incomplete" — but no
+    // event arrived either (no sessionUrl on the outcome), and only a received
+    // event may be called complete.
+    expect(text).not.toMatch(/Setup incomplete/);
+    expect(text).toMatch(/Wiring complete\. No event captured yet\./);
+  });
+
+  it("only calls itself complete once the event actually arrived", () => {
+    const text = render([
+      outcome({ sessionUrl: "https://app.example.com/sessions/s1" }),
+    ]).join("\n");
+    expect(text).toMatch(/Setup complete\. First event received\./);
+  });
+
+  it("counts the applications that reported when only some did", () => {
+    const text = render([
+      outcome({ sessionUrl: "https://app.example.com/sessions/s1" }),
+      outcome({ name: "api", relDir: "apps/api", recipe: "express" }),
+    ]).join("\n");
+    expect(text).toMatch(
+      /Wiring complete\. 1 of 2 applications have reported an event\./,
+    );
+    expect(text).not.toMatch(/Setup complete/);
   });
 });

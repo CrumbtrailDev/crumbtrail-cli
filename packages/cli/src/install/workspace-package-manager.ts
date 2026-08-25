@@ -83,8 +83,33 @@ interface RootPackageJson {
  * pattern with no wildcard matches that exact directory.
  */
 export function patternMatches(pattern: string, relPath: string): boolean {
-  const clean = pattern.replace(/^\.\//, "").replace(/\/+$/, "");
-  return segmentsMatch(clean.split("/"), relPath.split("/"));
+  const clean = normalizeWorkspacePath(pattern);
+  return segmentsMatch(
+    clean.split("/"),
+    normalizeWorkspacePath(relPath).split("/"),
+  );
+}
+
+/** Match a workspace member path against positive and negative patterns. */
+export function workspacePatternsMatch(
+  patterns: readonly string[],
+  relPath: string,
+): boolean {
+  const excluded = patterns
+    .filter((pattern) => pattern.trim().startsWith("!"))
+    .some((pattern) => patternMatches(pattern.trim().slice(1), relPath));
+  if (excluded) return false;
+  return patterns
+    .filter((pattern) => !pattern.trim().startsWith("!"))
+    .some((pattern) => patternMatches(pattern.trim(), relPath));
+}
+
+function normalizeWorkspacePath(value: string): string {
+  const normalized = value
+    .replaceAll("\\", "/")
+    .replace(/^\.\//, "")
+    .replace(/\/+$/, "");
+  return normalized || ".";
 }
 
 /** One path segment against one pattern segment: `*` and `?` inside a segment. */
@@ -216,13 +241,7 @@ function ownsMember(
 
   const patterns = workspacePatterns(dir, reader);
   if (patterns !== null) {
-    const excluded = patterns
-      .filter((p) => p.startsWith("!"))
-      .some((p) => patternMatches(p.slice(1), rel));
-    if (excluded) return false;
-    return patterns
-      .filter((p) => !p.startsWith("!"))
-      .some((p) => patternMatches(p, rel));
+    return workspacePatternsMatch(patterns, rel);
   }
 
   return CONTAINMENT_MARKERS.some((marker) =>

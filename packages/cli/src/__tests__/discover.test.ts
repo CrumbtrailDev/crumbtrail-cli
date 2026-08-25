@@ -223,6 +223,33 @@ describe("discoverServices", () => {
     expect(api[0].source).toBe("workspace");
   });
 
+  it("preserves scoped package names so a short selector cannot guess", () => {
+    repo = makeTmpRepo({
+      "package.json": pkg({ name: "shop", private: true }),
+      "pnpm-workspace.yaml": "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+      "apps/web/package.json": pkg({
+        name: "@acme/web",
+        dependencies: { vite: "^5.0.0" },
+      }),
+      "apps/web/index.html":
+        '<script type="module" src="/src/main.ts"></script>',
+      "apps/web/src/main.ts": "",
+      "packages/web/package.json": pkg({
+        name: "@other/web",
+        dependencies: { vite: "^5.0.0" },
+      }),
+      "packages/web/index.html":
+        '<script type="module" src="/src/main.ts"></script>',
+      "packages/web/src/main.ts": "",
+    });
+
+    const found = discoverServices(repo, detect(repo));
+    expect(found.map((candidate) => candidate.name)).toEqual([
+      "@acme/web",
+      "@other/web",
+    ]);
+  });
+
   it("does not report the root itself as a service", () => {
     repo = makeMonorepo();
     const found = discoverServices(repo, detect(repo));

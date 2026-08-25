@@ -125,6 +125,11 @@ export {
   instrumentMssqlPool,
   instrumentMysqlClient,
   instrumentPgClient,
+  // Reachable from the package root on purpose: an ESM app loads postgres.js as
+  // a different module instance than the one auto instrumentation can patch, so
+  // the runtime tells those customers to call this themselves. A fix the message
+  // names has to be importable from where it tells them to import it.
+  instrumentPostgresSql,
   instrumentSqliteDatabase,
   resolveDbRequestContext,
   classifyStatement,

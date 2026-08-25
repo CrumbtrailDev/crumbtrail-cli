@@ -287,7 +287,7 @@ function classify(
 
   return {
     dir,
-    name: pkg?.name?.split("/").pop() ?? fallbackName,
+    name: pkg?.name ?? fallbackName,
     relDir: path.relative(root, dir) || ".",
     source,
     detected,

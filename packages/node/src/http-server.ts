@@ -1,6 +1,6 @@
 import nodeHttp from "node:http";
 import nodeHttps from "node:https";
-import { buildCaptureGapEvent, type BugEvent } from "crumbtrail-core";
+import { buildCaptureGapEvent, redactUrl, type BugEvent } from "crumbtrail-core";
 import {
   buildBackendRequestEndEvent,
   buildBackendRequestStartEvent,
@@ -17,6 +17,7 @@ import {
 import { isBackendRequestClaimed } from "./backend-request-claim";
 import { getProcessSessionId } from "./process-session";
 import {
+  readRequestCorrelation,
   runInBackendRequestContext,
   updateBackendRequestContext,
   type BackendRequestContext,
@@ -363,4 +364,539 @@ function readNow(now: () => number): number {
   } catch {
     return Date.now();
   }
+}
+
+/**
+ * Outbound HTTP capture: the calls this process makes to everything else.
+ *
+ * ============================================================================
+ * WHY THIS EXISTS
+ * ============================================================================
+ *
+ * Everything above records requests that ARRIVE. Nothing recorded the requests
+ * this process SENDS, and that is where an infrastructure failure actually
+ * lives. When a checkout 500s because the pricing service timed out, because
+ * DNS stopped resolving the cache, or because a dependency answered 502, the
+ * inbound request is captured in full and the call that caused it is not
+ * captured at all. The session then shows a failing endpoint with no reason
+ * inside it, and a diagnosis has to guess.
+ *
+ * `backend.http` was already the kind for this — evidence-index reads it for the
+ * pricing, declined-payment and downstream-timeout detectors, and llm-bundle
+ * renders it as "calls the server made outward" — and nothing in any SDK had
+ * ever emitted one. This is the producer.
+ *
+ * Three deliberate choices, all about not paying for capture with correctness:
+ *
+ * - **Observation, never interception.** Each `ClientRequest` has its own `emit`
+ *   shadowed, exactly like the server hub above. No listener is added, so a
+ *   request whose `error` the host does not handle still crashes the process the
+ *   way it always did. Capture must not convert an unhandled error into silence.
+ * - **Headers and bodies are never read.** Only the method, the redacted URL,
+ *   the status, the duration and the transport error class. An outbound call
+ *   carries this process's own credentials to a third party; reading its headers
+ *   would move a secret into the evidence stream.
+ * - **The capture endpoint is excluded.** Ingest posts events over the same
+ *   transports this patches. Without the exclusion, one captured event produces
+ *   an outbound call that produces an event, forever.
+ *
+ * One known limit, stated rather than hidden: the patch replaces `request` and
+ * `get` on the module object, which is what `require("http")` and
+ * `import http from "node:http"` both hand out. A caller that took a NAMED ESM
+ * import (`import { request } from "node:http"`) holds a binding snapshotted at
+ * load time and is not covered. `fetch` is patched separately because Node's
+ * fetch does not travel through `http.request` at all.
+ */
+
+/** Event kind for one call this process made outward. */
+export const BACKEND_OUTBOUND_EVENT = "backend.http";
+
+/** How an outbound call failed, when it failed before a status existed. */
+export type OutboundErrorKind =
+  | "timeout"
+  | "dns"
+  | "connection"
+  | "tls"
+  | "abort"
+  | "error";
+
+export interface OutboundHttpCaptureOptions {
+  /** Sink for the `backend.http` events. Its own throws are swallowed. */
+  emit: (event: BugEvent) => void;
+  /**
+   * Origins never captured, lower-cased and without a trailing slash (for
+   * example `https://ingest.crumbtrail.dev`). The capture endpoint belongs here
+   * or ingest observes itself. A bare host is matched too, so a value with no
+   * scheme still excludes.
+   */
+  ignoreOrigins?: readonly string[];
+  /** `node:http` to patch (tests). Defaults to the real module. */
+  httpImpl?: Record<string, unknown>;
+  /** `node:https` to patch (tests). Defaults to the real module. */
+  httpsImpl?: Record<string, unknown>;
+  /** Object carrying `fetch` to patch (tests). Defaults to `globalThis`. */
+  fetchHost?: { fetch?: unknown };
+  /** Injectable clock (tests). Defaults to `Date.now`. */
+  now?: () => number;
+  /** Per-install ceiling on captured calls, bounding a runaway process. */
+  maxCalls?: number;
+}
+
+export interface OutboundHttpCaptureHandle {
+  stop(): void;
+}
+
+/**
+ * Matches the inbound ceiling. A process that makes more outbound calls than
+ * this inside one capture is past the point where reading them one by one is
+ * how anybody finds the defect.
+ */
+const DEFAULT_MAX_OUTBOUND_CALLS = 2000;
+
+/** Longest URL recorded, after redaction. */
+const MAX_OUTBOUND_URL = 500;
+
+/**
+ * Hostname labels that name a gateway rather than the thing behind it, so the
+ * service name falls through to the next label: `api.stripe.com` is the stripe
+ * service, not the api service.
+ */
+const GENERIC_HOST_LABELS = new Set(["api", "www", "app", "svc", "service"]);
+
+interface OutboundObservation {
+  method: string;
+  url: string;
+  host?: string;
+  startedAt: number;
+}
+
+/** Install outbound call capture. `stop()` restores every patched function. */
+export function installOutboundHttpCapture(
+  options: OutboundHttpCaptureOptions,
+): OutboundHttpCaptureHandle {
+  const now = options.now ?? Date.now;
+  const budget = options.maxCalls ?? DEFAULT_MAX_OUTBOUND_CALLS;
+  const ignored = normalizeIgnoredOrigins(options.ignoreOrigins);
+  const restore: (() => void)[] = [];
+  let captured = 0;
+  let stopped = false;
+
+  const settle = (
+    observation: OutboundObservation,
+    outcome: { status?: number; errorKind?: OutboundErrorKind; error?: string },
+  ): void => {
+    if (stopped) return;
+    const target = readRequestCorrelation();
+    const sessionId = target?.sessionId ?? getProcessSessionId();
+    // Same rule as the inbound recorder: an event with no session has nowhere
+    // to land, so it is never built.
+    if (!sessionId) return;
+    const endedAt = readNow(now);
+    const d: Record<string, unknown> = {
+      method: observation.method,
+      url: observation.url,
+      durationMs: Math.max(0, endedAt - observation.startedAt),
+      status: outcome.status ?? 0,
+    };
+    if (observation.host) {
+      d.host = observation.host;
+      const service = serviceNameFor(observation.host);
+      if (service) d.service = service;
+    }
+    if (outcome.errorKind) d.errorKind = outcome.errorKind;
+    if (outcome.error) d.error = outcome.error;
+    if (target?.requestId) d.requestId = target.requestId;
+    safeEmit(options.emit, { t: endedAt, k: BACKEND_OUTBOUND_EVENT, d, sessionId });
+  };
+
+  /**
+   * Decide whether this call is captured, and open an observation if so. Cheap
+   * on purpose: an ignored origin costs a URL build and a set lookup, and a
+   * process with no session costs the same, because both are the hot path on a
+   * server that is not being captured right now.
+   */
+  const open = (
+    method: string,
+    rawUrl: string | undefined,
+  ): OutboundObservation | undefined => {
+    if (stopped || captured >= budget || !rawUrl) return undefined;
+    let parsed: URL | undefined;
+    try {
+      parsed = new URL(rawUrl);
+    } catch {
+      parsed = undefined;
+    }
+    if (parsed && isIgnoredOrigin(parsed, ignored)) return undefined;
+    const redacted = safeRedactUrl(rawUrl);
+    if (!redacted) return undefined;
+    captured += 1;
+    return {
+      method: method.toUpperCase().slice(0, 12),
+      url: redacted,
+      ...(parsed ? { host: parsed.hostname.toLowerCase() } : {}),
+      startedAt: readNow(now),
+    };
+  };
+
+  for (const [mod, protocol] of [
+    [options.httpImpl ?? (nodeHttp as unknown as Record<string, unknown>), "http:"],
+    [options.httpsImpl ?? (nodeHttps as unknown as Record<string, unknown>), "https:"],
+  ] as const) {
+    for (const key of ["request", "get"]) {
+      patchClientFactory(mod, key, protocol, open, settle, restore);
+    }
+  }
+
+  patchFetch(options.fetchHost ?? (globalThis as { fetch?: unknown }), open, settle, restore);
+
+  return {
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      for (const undo of restore) {
+        try {
+          undo();
+        } catch {
+          // Restoring must never throw either.
+        }
+      }
+      restore.length = 0;
+    },
+  };
+}
+
+/**
+ * Shadow `http.request` / `http.get` (and the https pair) so the returned
+ * `ClientRequest` is observed. The original is always called with the original
+ * arguments and its return value is always returned unchanged.
+ */
+function patchClientFactory(
+  mod: Record<string, unknown>,
+  key: string,
+  protocol: string,
+  open: (method: string, url: string | undefined) => OutboundObservation | undefined,
+  settle: (
+    observation: OutboundObservation,
+    outcome: { status?: number; errorKind?: OutboundErrorKind; error?: string },
+  ) => void,
+  restore: (() => void)[],
+): void {
+  const original = mod?.[key];
+  if (typeof original !== "function") return;
+  const originalFn = original as (...args: unknown[]) => unknown;
+
+  const patched = function (this: unknown, ...args: unknown[]): unknown {
+    const request = originalFn.apply(this, args);
+    try {
+      const described = describeClientRequest(args, protocol);
+      const observation = described
+        ? open(described.method, described.url)
+        : undefined;
+      if (observation) observeClientRequest(request, observation, settle);
+    } catch {
+      // Capture must never decide whether the host's call is made.
+    }
+    return request;
+  };
+
+  try {
+    Object.defineProperty(mod, key, {
+      value: patched,
+      writable: true,
+      configurable: true,
+      enumerable: true,
+    });
+  } catch {
+    // A frozen module export stays uninstrumented rather than fatal.
+    return;
+  }
+  restore.push(() => {
+    if (mod[key] !== patched) return;
+    mod[key] = originalFn;
+  });
+}
+
+/**
+ * Observe one `ClientRequest` by shadowing its own `emit`.
+ *
+ * Deliberately not `request.on("error", …)`: a ClientRequest whose `error` has
+ * no listener terminates the process, and adding one here would silently keep a
+ * process alive that Node was going to kill. Shadowing `emit` sees the same
+ * event without becoming a listener, so the host's crash semantics are exactly
+ * what they were.
+ */
+function observeClientRequest(
+  request: unknown,
+  observation: OutboundObservation,
+  settle: (
+    observation: OutboundObservation,
+    outcome: { status?: number; errorKind?: OutboundErrorKind; error?: string },
+  ) => void,
+): void {
+  const holder = request as { emit?: unknown };
+  if (!holder || typeof holder.emit !== "function") return;
+  const originalEmit = holder.emit as (...args: unknown[]) => unknown;
+  let settled = false;
+
+  const patched = function (this: unknown, ...args: unknown[]): unknown {
+    try {
+      if (!settled) {
+        if (args[0] === "response") {
+          settled = true;
+          const status = numericStatus(
+            (args[1] as { statusCode?: unknown } | undefined)?.statusCode,
+          );
+          settle(observation, status !== undefined ? { status } : {});
+        } else if (args[0] === "error") {
+          settled = true;
+          settle(observation, classifyOutboundError(args[1]));
+        } else if (args[0] === "timeout") {
+          settled = true;
+          settle(observation, { errorKind: "timeout", error: "TimeoutError" });
+        }
+      }
+    } catch {
+      // Observation must never reach the host's own request handling.
+    }
+    return originalEmit.apply(this, args);
+  };
+
+  try {
+    Object.defineProperty(holder, "emit", {
+      value: patched,
+      writable: true,
+      configurable: true,
+      enumerable: false,
+    });
+  } catch {
+    // A frozen request object simply goes unobserved.
+  }
+}
+
+/** Shadow `fetch`, which on Node does not travel through `http.request`. */
+function patchFetch(
+  host: { fetch?: unknown },
+  open: (method: string, url: string | undefined) => OutboundObservation | undefined,
+  settle: (
+    observation: OutboundObservation,
+    outcome: { status?: number; errorKind?: OutboundErrorKind; error?: string },
+  ) => void,
+  restore: (() => void)[],
+): void {
+  const original = host?.fetch;
+  if (typeof original !== "function") return;
+  const originalFn = original as (...args: unknown[]) => Promise<unknown>;
+
+  const patched = function (this: unknown, ...args: unknown[]): Promise<unknown> {
+    let observation: OutboundObservation | undefined;
+    try {
+      observation = open(describeFetchMethod(args), describeFetchUrl(args));
+    } catch {
+      observation = undefined;
+    }
+    const result = originalFn.apply(this, args);
+    if (!observation) return result;
+    const active = observation;
+    return result.then(
+      (response) => {
+        try {
+          const status = numericStatus(
+            (response as { status?: unknown } | undefined)?.status,
+          );
+          settle(active, status !== undefined ? { status } : {});
+        } catch {
+          // Never let observation change what the caller receives.
+        }
+        return response;
+      },
+      (error: unknown) => {
+        try {
+          settle(active, classifyOutboundError(error));
+        } catch {
+          // Same: the caller's rejection is rethrown untouched below.
+        }
+        throw error;
+      },
+    );
+  };
+
+  try {
+    Object.defineProperty(host, "fetch", {
+      value: patched,
+      writable: true,
+      configurable: true,
+      enumerable: true,
+    });
+  } catch {
+    return;
+  }
+  restore.push(() => {
+    if (host.fetch !== patched) return;
+    host.fetch = originalFn;
+  });
+}
+
+/** Method and absolute URL for an `http.request`/`http.get` argument list. */
+function describeClientRequest(
+  args: readonly unknown[],
+  protocol: string,
+): { method: string; url: string } | undefined {
+  const first = args[0];
+  const optionsArg = isPlainObject(args[1])
+    ? (args[1] as Record<string, unknown>)
+    : isPlainObject(first)
+      ? (first as Record<string, unknown>)
+      : undefined;
+  const method =
+    typeof optionsArg?.method === "string" ? optionsArg.method : "GET";
+
+  if (typeof first === "string") return { method, url: first };
+  if (first instanceof URL) return { method, url: first.toString() };
+  if (!optionsArg) return undefined;
+
+  const host =
+    stringOf(optionsArg.hostname) ?? stringOf(optionsArg.host) ?? "localhost";
+  const scheme = stringOf(optionsArg.protocol) ?? protocol;
+  const port = optionsArg.port === undefined ? "" : `:${String(optionsArg.port)}`;
+  const path = stringOf(optionsArg.path) ?? "/";
+  // `host` may already carry the port; do not append a second one.
+  const authority = host.includes(":") ? host : `${host}${port}`;
+  return { method, url: `${scheme}//${authority}${path}` };
+}
+
+function describeFetchUrl(args: readonly unknown[]): string | undefined {
+  const first = args[0];
+  if (typeof first === "string") return first;
+  if (first instanceof URL) return first.toString();
+  const url = (first as { url?: unknown } | undefined)?.url;
+  return typeof url === "string" ? url : undefined;
+}
+
+function describeFetchMethod(args: readonly unknown[]): string {
+  const init = args[1] as { method?: unknown } | undefined;
+  if (typeof init?.method === "string") return init.method;
+  const request = args[0] as { method?: unknown } | undefined;
+  if (typeof request?.method === "string") return request.method;
+  return "GET";
+}
+
+/**
+ * The transport's own verdict, mapped to a small vocabulary a reader can act
+ * on. Only the error's code and class name are used; a transport error message
+ * can carry a full URL with credentials in it, so it is never recorded.
+ */
+function classifyOutboundError(error: unknown): {
+  status: number;
+  errorKind: OutboundErrorKind;
+  error: string;
+} {
+  const codes = collectErrorCodes(error);
+  const kind: OutboundErrorKind = codes.some((code) =>
+    /^(ETIMEDOUT|ESOCKETTIMEDOUT|UND_ERR_CONNECT_TIMEOUT|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|TimeoutError)$/.test(
+      code,
+    ),
+  )
+    ? "timeout"
+    : codes.some((code) => /^(ENOTFOUND|EAI_AGAIN)$/.test(code))
+      ? "dns"
+      : codes.some((code) => code.startsWith("ERR_TLS") || code.includes("CERT"))
+        ? "tls"
+        : codes.some((code) => /^(ABORT_ERR|AbortError)$/.test(code))
+          ? "abort"
+          : codes.some((code) =>
+                /^(ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|EPIPE|EADDRNOTAVAIL|UND_ERR_SOCKET|ERR_SOCKET_CONNECTION_TIMEOUT)$/.test(
+                  code,
+                ),
+              )
+            ? "connection"
+            : "error";
+  return { status: 0, errorKind: kind, error: codes[0] ?? "Error" };
+}
+
+/** Codes and class names from an error and its `cause` chain, outermost first. */
+function collectErrorCodes(error: unknown): string[] {
+  const codes: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current; depth += 1) {
+    const record = current as { code?: unknown; name?: unknown; cause?: unknown };
+    // The cause's code is the specific one (`ECONNREFUSED` under a bare
+    // `TypeError`), so it must be able to outrank the wrapper's class name.
+    if (typeof record.code === "string" && record.code.trim())
+      codes.push(record.code.trim().slice(0, 64));
+    if (typeof record.name === "string" && record.name.trim())
+      codes.push(record.name.trim().slice(0, 64));
+    current = record.cause;
+  }
+  // A bare wrapper class ranks below anything specific underneath it.
+  return codes.sort((a, b) =>
+    Number(GENERIC_ERROR_NAMES.has(a)) - Number(GENERIC_ERROR_NAMES.has(b)),
+  );
+}
+
+const GENERIC_ERROR_NAMES = new Set(["Error", "TypeError", "FetchError"]);
+
+function normalizeIgnoredOrigins(
+  origins: readonly string[] | undefined,
+): { origins: Set<string>; hosts: Set<string> } {
+  const result = { origins: new Set<string>(), hosts: new Set<string>() };
+  for (const entry of origins ?? []) {
+    const trimmed = entry?.trim().replace(/\/+$/, "").toLowerCase();
+    if (!trimmed) continue;
+    try {
+      const parsed = new URL(
+        /^[a-z][a-z0-9+.-]*:\/\//.test(trimmed) ? trimmed : `http://${trimmed}`,
+      );
+      result.origins.add(`${parsed.protocol}//${parsed.host}`);
+      result.hosts.add(parsed.hostname);
+    } catch {
+      result.hosts.add(trimmed);
+    }
+  }
+  return result;
+}
+
+function isIgnoredOrigin(
+  parsed: URL,
+  ignored: { origins: Set<string>; hosts: Set<string> },
+): boolean {
+  if (ignored.origins.has(`${parsed.protocol}//${parsed.host}`.toLowerCase()))
+    return true;
+  return ignored.hosts.has(parsed.hostname.toLowerCase());
+}
+
+/** The dependency this host names, for the service-aware detectors. */
+function serviceNameFor(host: string): string | undefined {
+  if (!host || /^\d+(\.\d+)*$/.test(host) || host.includes(":")) return undefined;
+  const labels = host.split(".").filter(Boolean);
+  if (labels.length === 0) return undefined;
+  const first = labels[0].toLowerCase();
+  if (GENERIC_HOST_LABELS.has(first) && labels.length > 1)
+    return labels[1].toLowerCase().slice(0, 80);
+  return first.slice(0, 80);
+}
+
+function safeRedactUrl(url: string): string | undefined {
+  try {
+    const value = redactUrl(url, "backend.http.url").value;
+    return value ? value.slice(0, MAX_OUTBOUND_URL) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A status code only when the runtime really produced one. */
+function numericStatus(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+function stringOf(value: unknown): string | undefined {
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function isPlainObject(value: unknown): boolean {
+  return (
+    value !== null && typeof value === "object" && !(value instanceof URL)
+  );
 }

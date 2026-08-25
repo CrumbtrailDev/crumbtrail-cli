@@ -486,6 +486,10 @@ describe("autoCapture", () => {
         processImpl: proc,
         consoleImpl,
         fetchImpl,
+        // The DB report is a separate lane with its own contract (it always
+        // states when no driver was instrumented); this test is about ingest
+        // failures staying quiet.
+        instrumentDatabases: false,
       }),
     );
 
@@ -517,6 +521,7 @@ describe("autoCapture", () => {
         consoleImpl,
         fetchImpl,
         nowImpl: () => clock,
+        instrumentDatabases: false,
       }),
     );
 
@@ -976,5 +981,184 @@ describe("autoCapture double install", () => {
     const secondError = vi.fn();
     await install("api", secondError);
     expect(secondError).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// COMPLETENESS: a capture outage must leave a mark
+// ============================================================================
+
+describe("autoCapture completeness ledger", () => {
+  it("holds evidence produced while the endpoint is down and delivers it when the endpoint returns", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    let clock = 1_000;
+    let reachable = false;
+    const calls: FetchCall[] = [];
+    const fetchImpl = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        if (!reachable) throw new TypeError("fetch failed");
+        calls.push({ url: String(url), init: init ?? {} });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    ) as unknown as typeof fetch;
+
+    const consoleImpl = { error: vi.fn() };
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl,
+        fetchImpl,
+        nowImpl: () => clock,
+        instrumentDatabases: false,
+        captureLogs: false,
+        captureRuntimeWarnings: false,
+        captureHttpRequests: false,
+        captureOutboundHttp: false,
+      }),
+    );
+
+    // The boot handshake failed, so nothing is live. An error raised now used to
+    // be discarded without a trace.
+    consoleImpl.error(new Error("db timeout during the outage"));
+    await Promise.resolve();
+    expect(calls).toHaveLength(0);
+
+    // The endpoint comes back and the backoff gate opens.
+    reachable = true;
+    clock += 60_000;
+    consoleImpl.error(new Error("later failure"));
+    await vi.waitFor(() => {
+      const kinds = eventsFrom(calls).map((e) => e.k);
+      expect(kinds.filter((k) => k === AUTO_CAPTURE_ERROR_EVENT)).toHaveLength(
+        2,
+      );
+    });
+
+    // Both errors landed, including the one raised while the endpoint was dark.
+    const messages = eventsFrom(calls)
+      .filter((e) => e.k === AUTO_CAPTURE_ERROR_EVENT)
+      .map((e) => (e.d.error as { message?: string } | undefined)?.message);
+    expect(messages).toContain("db timeout during the outage");
+    expect(messages).toContain("later failure");
+  });
+
+  it("records a capture gap for evidence that could not be held", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    let clock = 1_000;
+    let reachable = false;
+    const calls: FetchCall[] = [];
+    const fetchImpl = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        if (!reachable) throw new TypeError("fetch failed");
+        calls.push({ url: String(url), init: init ?? {} });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    ) as unknown as typeof fetch;
+
+    const consoleImpl = { error: vi.fn() };
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl,
+        fetchImpl,
+        nowImpl: () => clock,
+        // One held event; everything past it must be counted, not silently lost.
+        maxPendingEvents: 1,
+        instrumentDatabases: false,
+        captureLogs: false,
+        captureRuntimeWarnings: false,
+        captureHttpRequests: false,
+        captureOutboundHttp: false,
+      }),
+    );
+
+    for (let index = 0; index < 4; index += 1) {
+      consoleImpl.error(new Error(`failure ${index}`));
+      await Promise.resolve();
+    }
+
+    reachable = true;
+    clock += 60_000;
+    consoleImpl.error(new Error("recovered"));
+
+    await vi.waitFor(() => {
+      const gap = eventsFrom(calls).find((e) => e.k === "capture_gap");
+      expect(gap).toBeDefined();
+      // The count is the point: a brief that knows three events are missing is
+      // worth far more than one that quietly is missing them.
+      expect(gap?.d.droppedEventCount).toBeGreaterThanOrEqual(1);
+      expect(gap?.d.reason).toBe("delivery_failed");
+    });
+  });
+
+  it("records that the process was terminated by a signal", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    // `kill` is what the handler uses to re-raise the signal once it has
+    // recorded; the fake records the call instead of ending the test runner.
+    const kill = vi.fn();
+    (proc as unknown as { kill: unknown }).kill = kill;
+    (proc as unknown as { pid: number }).pid = 4321;
+    const { fetchImpl, calls } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        instrumentDatabases: false,
+        captureLogs: false,
+        captureRuntimeWarnings: false,
+        captureHttpRequests: false,
+        captureOutboundHttp: false,
+      }),
+    );
+
+    proc.emit("SIGTERM" as never);
+
+    await vi.waitFor(() => {
+      const lifecycle = eventsFrom(calls).find(
+        (e) => e.k === "session.lifecycle",
+      );
+      expect(lifecycle).toBeDefined();
+      expect(lifecycle?.d.action).toBe("process-terminated");
+      expect(lifecycle?.d.reason).toBe("SIGTERM");
+      expect(lifecycle?.d.pid).toBe(4321);
+    });
+
+    // Having recorded, the handler removes itself and re-raises, so the process
+    // still dies exactly as the operator asked.
+    await vi.waitFor(() => {
+      expect(kill).toHaveBeenCalledWith(4321, "SIGTERM");
+    });
+    expect(proc.listenerCount("SIGTERM" as never)).toBe(0);
+  });
+
+  it("names the session start metadata that identifies the process", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    (proc as unknown as { pid: number }).pid = 99;
+    (proc as unknown as { uptime: () => number }).uptime = () => 12.5;
+    (proc as unknown as { version: string }).version = "v24.0.0";
+    const { fetchImpl, calls } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        instrumentDatabases: false,
+      }),
+    );
+
+    const start = calls.find((c) => c.url.endsWith("/api/session/start"));
+    const body = JSON.parse(start?.init.body as string) as {
+      metadata?: { process?: Record<string, unknown> };
+    };
+    expect(body.metadata?.process?.pid).toBe(99);
+    expect(body.metadata?.process?.uptimeMs).toBe(12_500);
+    expect(body.metadata?.process?.node).toBe("v24.0.0");
   });
 });

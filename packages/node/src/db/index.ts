@@ -6,6 +6,7 @@ import {
 export {
   AUTO_INSTRUMENT_DRIVERS,
   autoInstrumentDbClients,
+  autoInstrumentPatchedAnything,
   formatAutoInstrumentReport,
   type AutoInstrumentDbOptions,
   type AutoInstrumentDriver,
@@ -25,6 +26,10 @@ export {
   type BuildDbReadBulkEventInput,
   type BuildDbReadEventInput,
 } from "./read-event";
+export {
+  instrumentPostgresSql,
+  type DuckTypedPostgresSql,
+} from "./postgres-js";
 export {
   instrumentPgClient,
   parseMutation,

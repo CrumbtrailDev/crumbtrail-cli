@@ -6,6 +6,7 @@ import {
   compareSdkVersions,
   installSdk as realInstallSdk,
   isCliEntrypoint,
+  normalizeRepoUrl,
   parseArgs,
   probeServiceKeys,
   resolveWorkspaceDir,
@@ -251,6 +252,76 @@ describe("wizard first-event wait — what is actually outstanding", () => {
   });
 });
 
+describe("normalizeRepoUrl", () => {
+  // The identity sent with every create. Two clones of one repository have to
+  // reduce to one string, or the CLI reports the same app as two.
+  it("reduces every clone form of one repository to the same name", () => {
+    for (const url of [
+      "git@github.com:acme/billing.git",
+      "https://github.com/acme/billing.git",
+      "https://github.com/acme/billing",
+      "ssh://git@github.com/acme/billing.git",
+      "GIT@GitHub.com:Acme/Billing",
+    ]) {
+      expect(normalizeRepoUrl(url)).toBe("github.com/acme/billing");
+    }
+  });
+
+  it("leaves a host it does not recognize alone rather than guessing", () => {
+    expect(normalizeRepoUrl("https://git.internal:7999/team/app.git")).toBe(
+      "git.internal:7999/team/app",
+    );
+  });
+});
+
+describe("the final verdict says whether anything was captured", () => {
+  // "Setup complete" used to be decided by the ingest key alone, so a run that
+  // had just printed "No event yet, start your app" still certified itself as
+  // done three lines later. The README's promise is a confirmed first event.
+  const timingOut = (ui: Ui) =>
+    makeDeps(
+      { steps: [] },
+      {
+        ui,
+        pollForRealEvent: vi.fn(async () => ({
+          outcome: "timeout" as const,
+        })) as unknown as WizardDeps["pollForRealEvent"],
+      },
+    );
+
+  it("will not call a run complete when no event ever arrived", async () => {
+    const { ui, lines } = captureUi();
+    const code = await runCli(["node", "cli"], timingOut(ui));
+    const out = lines.join("\n");
+    expect(out).not.toContain("Setup complete");
+    expect(out).toContain("Wiring complete. No event captured yet.");
+    // Nothing is outstanding for the reader to fix, so this is not a failure a
+    // script should act on: the app has simply not been started yet.
+    expect(code).toBe(0);
+  });
+
+  it("calls it complete once the event is in", async () => {
+    const { ui, lines } = captureUi();
+    const code = await runCli(["node", "cli"], makeDeps({ steps: [] }, { ui }));
+    expect(lines.join("\n")).toContain("Setup complete. First event received.");
+    expect(code).toBe(0);
+  });
+
+  it("claims nothing about capture when the wait was skipped", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(["node", "cli", "--skip-verify"], makeDeps({ steps: [] }, { ui }));
+    const out = lines.join("\n");
+    expect(out).toContain("Wiring complete. First event not verified.");
+    expect(out).not.toContain("Setup complete");
+  });
+
+  it("calls the object what the dashboard calls it", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(["node", "cli"], makeDeps({ steps: [] }, { ui }));
+    expect(lines.join("\n")).toMatch(/Application:\s+web/);
+  });
+});
+
 describe("Node version floor", () => {
   it("stops before touching the repo on a Node older than the engines range", async () => {
     const { ui, lines } = captureUi();
@@ -448,9 +519,13 @@ describe("wizard orchestration", () => {
     expect(out).toMatch(/wrote VITE_CRUMBTRAIL_KEY to/i);
     // Which key. Minting is additive on purpose, so after a second run the
     // project holds two live keys and the dashboard list cannot say which one
-    // is in this app's env file. The id and the tail can.
-    expect(out).toContain("key_test");
+    // is in this app's env file. The tail can, and it is the only half of the
+    // answer the reader can look up: the id the API returns beside it is a
+    // database row id that neither the env file nor the dashboard prints, so
+    // "internal id key_test" was an identifier with nowhere to match it.
     expect(out).toMatch(/ending est123/);
+    expect(out).not.toContain("internal id");
+    expect(out).not.toContain("key_test");
     // The key VALUE still never reaches the terminal. Scrollback, CI logs and
     // screen shares all outlive the run.
     expect(out).not.toMatch(/ctkey_|bgk_|bl_key_/);
@@ -718,10 +793,14 @@ describe("wizard orchestration", () => {
     );
 
     // The injection above it is still correct and worth keeping, so a failed
-    // env write reports rather than rolling the wiring back.
-    expect(code).toBe(0);
+    // env write reports rather than rolling the wiring back. The run is still
+    // unfinished though: without the key on disk the app reports nothing, the
+    // summary says "Setup incomplete", and the exit code has to agree with it
+    // or a script reads this run as a success.
+    expect(code).toBe(1);
     expect(steps).toContain("execute");
     const out = lines.join("\n");
+    expect(out).toContain("Setup incomplete");
     expect(out).toMatch(/could not write it/i);
     expect(out).not.toMatch(/ctkey_/);
   });
@@ -1070,6 +1149,49 @@ describe("batch installer (unlinked sibling services)", () => {
   });
 });
 
+describe("batch installer: an empty selection has two opposite meanings", () => {
+  // A rerun in a repository that is fully wired opens the list with every box
+  // unchecked, because "already wired" is exactly what turns the default off.
+  // Pressing Enter then printed "Nothing selected, no changes made", which is
+  // the same sentence a reader gets when the CLI found nothing it could wire.
+  it("says the repository is already wired rather than that nothing was picked", async () => {
+    const steps: string[] = [];
+    const deps = batchDeps(steps, [
+      candidate({ relDir: "apps/web", flags: ["already-wired"], defaultChecked: false }),
+      candidate({
+        relDir: "services/api",
+        recipe: "express",
+        flags: ["already-wired"],
+        defaultChecked: false,
+      }),
+    ]);
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    const code = await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(code).toBe(0);
+    expect(out).toContain("already wired for");
+    expect(out).toContain("Nothing to do");
+    expect(out).not.toContain("Nothing selected");
+    // Nothing was provisioned to say it: the answer is known before login.
+    expect(steps).not.toContain("login");
+  });
+
+  it("still says nothing was picked when there was something to pick", async () => {
+    const steps: string[] = [];
+    const deps = batchDeps(steps, [
+      candidate({ relDir: "apps/web", defaultChecked: false }),
+    ]);
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    const code = await runCli(["node", "cli"], deps);
+    expect(code).toBe(0);
+    expect(lines.join("\n")).toContain("Nothing selected");
+  });
+});
+
 describe("batch installer (monorepo root)", () => {
   it("wires every checked service: one login, one project, one poll", async () => {
     const steps: string[] = [];
@@ -1133,8 +1255,11 @@ describe("batch installer (monorepo root)", () => {
 
     const code = await runCli(["node", "cli"], deps);
 
-    // A partial batch is still a success — two of three services got wired.
-    expect(code).toBe(0);
+    // A partial batch is not a success. It prints "Setup incomplete. 1 of 3
+    // applications still need you", and a CI step that wires a repository has
+    // to be able to act on that: exit 0 here meant a pipeline went green with
+    // a service that reports nothing.
+    expect(code).toBe(1);
     // The service AFTER the failure still ran: the batch did not abort.
     expect(steps).toContain("provision:admin");
     expect(steps).toContain("execute:/app/apps/admin/src/main.ts");
@@ -1362,7 +1487,9 @@ describe("batch installer (monorepo root)", () => {
     }) as unknown as WizardDeps["executePlan"];
 
     const code = await runCli(["node", "cli"], deps);
-    expect(code).toBe(0);
+    // An OTLP service is never wired by this run: the guide file names a manual
+    // exporter step, so the batch reports itself incomplete and exits non zero.
+    expect(code).toBe(1);
     // otlp has no SDK packages — installSdk must early-return, not shell out.
     expect(spawnFn).not.toHaveBeenCalled();
     expect(written).toEqual(["/app/services/payments/CRUMBTRAIL-OTLP.md"]);
@@ -1533,7 +1660,10 @@ describe("wizard — OTLP backend (non-JS)", () => {
       },
     );
     const code = await runCli(["node", "cli"], deps);
-    expect(code).toBe(0);
+    // Guidance only: nothing was wired and the exporter step is still on the
+    // reader, which the summary bar has always said and the exit code now says
+    // too.
+    expect(code).toBe(1);
     // The empty SDK package list must NOT spawn a package manager.
     expect(spawnFn).not.toHaveBeenCalled();
     // The guidance path never calls the executor (it prints, touches nothing).
@@ -1778,7 +1908,9 @@ describe("wizard — dirty-file decline covers the complete local setup", () => 
       },
     );
     const code = await runCli(["node", "cli"], deps);
-    expect(code).toBe(0);
+    // Declining leaves the app unwired, which the summary calls "Setup
+    // incomplete". The exit code says the same.
+    expect(code).toBe(1);
     // The decline is asked before installSdk, so no local setup write runs.
     expect(steps).not.toContain("execute");
     expect(steps).not.toContain("install");
@@ -1791,6 +1923,12 @@ describe("wizard — dirty-file decline covers the complete local setup", () => 
     );
     expect(out).toMatch(/no ingest key was minted/i);
     expect(out).toMatch(/setup incomplete/i);
+    // The prompt said "No leaves all local files unchanged" and nothing else,
+    // while a project and an application had already been created in the
+    // reader's dashboard. The cloud half is not undone by a No, so the question
+    // has to name it before it is asked.
+    expect(out).toMatch(/already created in your dashboard/i);
+    expect(out).toMatch(/application web/i);
   });
 });
 
@@ -2070,6 +2208,24 @@ describe("a word that is not a subcommand", () => {
     const deps = makeDeps({ steps: [] }, { ui });
     expect(await runCli(["node", "cli", "--frobnicate"], deps)).toBe(1);
     expect(lines.join("\n")).toContain("Unknown argument");
+  });
+
+  it("refuses a flag whose value is another flag, instead of using it", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui });
+    // This used to set the project id to the literal "--yes" and carry on,
+    // wiring a typo's worth of telemetry into whatever project that named.
+    expect(await runCli(["node", "cli", "--project", "--yes"], deps)).toBe(1);
+    expect(lines.join("\n")).toContain("--project requires a value");
+  });
+
+  it("refuses a trailing flag with no value, instead of throwing", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui });
+    // `--only` with nothing after it reached .toLowerCase() on undefined and
+    // ended the run with an internal TypeError.
+    expect(await runCli(["node", "cli", "--only"], deps)).toBe(1);
+    expect(lines.join("\n")).toContain("--only requires a value");
   });
 
   it("recognizes the words people actually type", () => {

@@ -11,6 +11,7 @@ import type { Stack } from "crumbtrail-core";
 import {
   parsePnpmWorkspace,
   resolveWorkspacePackageManager,
+  workspacePatternsMatch,
   type PackageManager,
   type PackageManagerResolution,
 } from "./install/workspace-package-manager";
@@ -20,6 +21,7 @@ import type { FileReader } from "./readers/types";
 export {
   parsePnpmWorkspace,
   resolveWorkspacePackageManager,
+  workspacePatternsMatch,
   type PackageManagerResolution,
   type PackageManagerSource,
 } from "./install/workspace-package-manager";
@@ -163,26 +165,30 @@ function expandWorkspaceGlobs(
   reader: FileReader,
 ): string[] {
   const dirs = new Set<string>();
-  for (const pattern of patterns) {
-    if (pattern.startsWith("!")) continue; // ignore exclusions
-    const wildcard = pattern.endsWith("/*") || pattern.endsWith("/**");
-    if (wildcard) {
-      const base = path.join(cwd, pattern.replace(/\/\*\*?$/, ""));
-      if (!reader.isDir(base)) continue;
-      for (const entry of reader.readDir(base)) {
-        const full = path.join(base, entry);
-        if (
-          reader.isDir(full) &&
-          reader.isFile(path.join(full, "package.json"))
-        ) {
-          dirs.add(full);
-        }
-      }
-    } else if (!pattern.includes("*")) {
-      const full = path.join(cwd, pattern);
-      if (reader.isFile(path.join(full, "package.json"))) dirs.add(full);
-    }
+  if (
+    reader.isFile(path.join(cwd, "package.json")) &&
+    workspacePatternsMatch(patterns, ".")
+  ) {
+    dirs.add(cwd);
   }
+
+  const visit = (dir: string): void => {
+    for (const entry of reader.readDir(dir)) {
+      if (entry === "node_modules" || entry === ".git") continue;
+      const full = path.join(dir, entry);
+      if (!reader.isDir(full)) continue;
+      const rel = path.relative(cwd, full).split(path.sep).join("/");
+      if (
+        reader.isFile(path.join(full, "package.json")) &&
+        workspacePatternsMatch(patterns, rel)
+      ) {
+        dirs.add(full);
+      }
+      visit(full);
+    }
+  };
+
+  visit(cwd);
   return [...dirs].sort();
 }
 

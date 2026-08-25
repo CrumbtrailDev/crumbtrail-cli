@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ApiError } from "../net";
 import {
+  compareIdentity,
   createIngestKey,
   createProject,
   createService,
@@ -8,6 +9,7 @@ import {
   inferProjectName,
   inferServiceName,
   listProjects,
+  provisionService,
   resolveProject,
   ProjectAccessError,
   UpgradeRequiredError,
@@ -412,6 +414,222 @@ describe("createService on a name that is already taken", () => {
         fetchImpl,
       ),
     ).rejects.toMatchObject({ status: 409 });
+  });
+});
+
+describe("service identity: two repositories that both call an app api", () => {
+  // A project holds one application per name, ignoring case, so `api` in one
+  // repository and `api` in another are one row to the cloud and their events
+  // arrive mixed under it. The name is all the CLI used to send.
+  it("sends the repository and the source path with the create", async () => {
+    let body: Record<string, unknown> = {};
+    const fetchImpl = vi.fn(async (_url: unknown, init?: unknown) => {
+      body = JSON.parse(String((init as { body?: string }).body));
+      return jsonResponse(201, { id: "svc_1", name: "api" });
+    }) as unknown as typeof fetch;
+
+    await createService(
+      "https://cloud.example",
+      "ctcli_x",
+      "prj_1",
+      {
+        name: "api",
+        stack: "express",
+        identity: { repo: "github.com/acme/billing", sourcePath: "services/api" },
+      },
+      fetchImpl,
+    );
+    expect(body).toMatchObject({
+      name: "api",
+      repo: "github.com/acme/billing",
+      sourcePath: "services/api",
+    });
+  });
+
+  it("reports an adopted row from another repository as a different application", async () => {
+    const fetchImpl = vi.fn(async (_url: unknown, init?: unknown) => {
+      const method = ((init as { method?: string })?.method ?? "GET").toUpperCase();
+      if (method === "POST") {
+        return jsonResponse(409, {
+          error: "This project already has a service named api.",
+          code: "service_name_taken",
+        });
+      }
+      return jsonResponse(200, {
+        services: [
+          { id: "svc_1", name: "api", repo: "github.com/acme/orders" },
+        ],
+      });
+    }) as unknown as typeof fetch;
+
+    const service = await createService(
+      "https://cloud.example",
+      "ctcli_x",
+      "prj_1",
+      { name: "api", identity: { repo: "github.com/acme/billing" } },
+      fetchImpl,
+    );
+    expect(service).toMatchObject({
+      id: "svc_1",
+      adopted: true,
+      adoptionMatch: "other-source",
+    });
+  });
+
+  it("keeps re-adoption of the same repository quiet", async () => {
+    const fetchImpl = vi.fn(async (_url: unknown, init?: unknown) => {
+      const method = ((init as { method?: string })?.method ?? "GET").toUpperCase();
+      if (method === "POST") {
+        return jsonResponse(409, {
+          error: "This project already has a service named api.",
+          code: "service_name_taken",
+        });
+      }
+      return jsonResponse(200, {
+        services: [
+          {
+            id: "svc_1",
+            name: "api",
+            repo: "github.com/acme/billing",
+            sourcePath: "services/api",
+          },
+        ],
+      });
+    }) as unknown as typeof fetch;
+
+    const service = await createService(
+      "https://cloud.example",
+      "ctcli_x",
+      "prj_1",
+      {
+        name: "api",
+        identity: { repo: "github.com/acme/billing", sourcePath: "services/api" },
+      },
+      fetchImpl,
+    );
+    expect(service).toMatchObject({ adopted: true, adoptionMatch: "same-source" });
+  });
+});
+
+describe("provisionService output", () => {
+  const capture = () => {
+    const lines: string[] = [];
+    return { lines, ui: { out: (l = "") => lines.push(l), err: () => {} } };
+  };
+
+  it("calls the object an application, the way the dashboard does", async () => {
+    const { ui, lines } = capture();
+    const fetchImpl = vi.fn(async () =>
+      jsonResponse(201, { id: "svc_1", name: "api" }),
+    ) as unknown as typeof fetch;
+
+    await provisionService({
+      base: "https://cloud.example",
+      token: "ctcli_x",
+      projectId: "prj_1",
+      recipe: "express",
+      serviceName: "api",
+      ui,
+      fetchImpl,
+    });
+    const out = lines.join("\n");
+    expect(out).toContain("Application: api");
+    expect(out).not.toMatch(/^\s*Service:/m);
+  });
+
+  it("warns when the reused application belongs to another repository", async () => {
+    const { ui, lines } = capture();
+    const fetchImpl = vi.fn(async (_url: unknown, init?: unknown) => {
+      const method = ((init as { method?: string })?.method ?? "GET").toUpperCase();
+      if (method === "POST") {
+        return jsonResponse(409, {
+          error: "This project already has a service named api.",
+          code: "service_name_taken",
+        });
+      }
+      return jsonResponse(200, {
+        services: [{ id: "svc_1", name: "api", repo: "github.com/acme/orders" }],
+      });
+    }) as unknown as typeof fetch;
+
+    const res = await provisionService({
+      base: "https://cloud.example",
+      token: "ctcli_x",
+      projectId: "prj_1",
+      recipe: "express",
+      serviceName: "api",
+      identity: { repo: "github.com/acme/billing", sourcePath: "." },
+      ui,
+      fetchImpl,
+    });
+    expect(lines.join("\n")).toMatch(/belongs to a different repository/);
+    // Carried into the end of run summary too: this one is a decision, not
+    // background.
+    expect(res.adoptionNote).toMatch(/different repository/);
+  });
+
+  it("does not put a plain rerun's name match into the summary", async () => {
+    const { ui, lines } = capture();
+    const fetchImpl = vi.fn(async (_url: unknown, init?: unknown) => {
+      const method = ((init as { method?: string })?.method ?? "GET").toUpperCase();
+      if (method === "POST") {
+        return jsonResponse(409, {
+          error: "This project already has a service named api.",
+          code: "service_name_taken",
+        });
+      }
+      // What every deployment returns today: no identity on the row.
+      return jsonResponse(200, { services: [{ id: "svc_1", name: "api" }] });
+    }) as unknown as typeof fetch;
+
+    const res = await provisionService({
+      base: "https://cloud.example",
+      token: "ctcli_x",
+      projectId: "prj_1",
+      recipe: "express",
+      serviceName: "api",
+      identity: { repo: "github.com/acme/billing", sourcePath: "." },
+      ui,
+      fetchImpl,
+    });
+    expect(res).toMatchObject({ adopted: true, adoptionMatch: "unknown-source" });
+    expect(res.adoptionNote).toBeUndefined();
+    expect(lines.join("\n")).toMatch(/matched on the name alone/);
+  });
+});
+
+describe("compareIdentity", () => {
+  it("says unknown when the cloud returned no identity at all", () => {
+    // Every row created before the CLI started sending one. Adoption still has
+    // to work, so this may never read as a clash.
+    expect(compareIdentity({}, { repo: "github.com/acme/billing" })).toBe(
+      "unknown-source",
+    );
+  });
+
+  it("treats a different directory in the same repository as a different app", () => {
+    expect(
+      compareIdentity(
+        { repo: "github.com/acme/billing", sourcePath: "services/api" },
+        { repo: "github.com/acme/billing", sourcePath: "services/jobs" },
+      ),
+    ).toBe("other-source");
+  });
+
+  it("matches case insensitively, the way the cloud's name rule does", () => {
+    expect(
+      compareIdentity(
+        { repo: "GitHub.com/Acme/Billing", sourcePath: "." },
+        { repo: "github.com/acme/billing", sourcePath: "." },
+      ),
+    ).toBe("same-source");
+  });
+
+  it("will not certify a path match with no repository beside it", () => {
+    // `.` and `.` in two different checkouts is not evidence of anything.
+    expect(
+      compareIdentity({ sourcePath: "." }, { sourcePath: "." }),
+    ).toBe("unknown-source");
   });
 });
 

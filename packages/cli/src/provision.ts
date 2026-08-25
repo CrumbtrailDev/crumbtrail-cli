@@ -22,6 +22,29 @@ export interface Project {
 export interface Service {
   id: string;
   name: string;
+  /**
+   * Repository-relative directory the service was detected in, as the cloud
+   * holds it. Null on every row the CLI created before it started sending one.
+   */
+  sourcePath?: string | null;
+  /** The repository the service belongs to, when the cloud carries one. */
+  repo?: string | null;
+}
+
+/**
+ * Which repository, and which directory inside it, this run is wiring.
+ *
+ * A project can hold one service per name, ignoring case, so `api` in one
+ * repository and `api` in another are the same row to the cloud. Sending the
+ * identity is what lets the two be told apart: the cloud already has a
+ * `source_path` column for the directory, and the repository is what
+ * distinguishes two apps whose directory is `.` in both.
+ */
+export interface ServiceIdentity {
+  /** Repository-relative app directory, e.g. `services/api` or `.`. */
+  sourcePath?: string;
+  /** Stable repository name, from the git origin remote where there is one. */
+  repo?: string;
 }
 
 /** Thrown on a 402 from POST /api/projects — carries the upgrade copy + URL. */
@@ -157,21 +180,39 @@ export async function listServices(
  * The 409 is still the source of truth for the collision: only after the server
  * refuses do we read the list back, which keeps the happy path one request and
  * makes the adopted service the real row rather than a guess.
+ *
+ * Adoption matches the name, because that is what the cloud's uniqueness rule
+ * is built on. The name alone cannot tell "the same app, run again" from "a
+ * different repository that also calls its backend api", so the identity this
+ * run sends is compared against the identity the existing row carries, and the
+ * three answers are reported separately: same repository, different
+ * repository, or unknown because the row predates the CLI sending one.
  */
+export type AdoptionMatch = "same-source" | "other-source" | "unknown-source";
+
 export async function createService(
   base: string,
   token: string,
   projectId: string,
-  args: { name: string; stack?: string },
+  args: { name: string; stack?: string; identity?: ServiceIdentity },
   fetchImpl?: typeof fetch,
-): Promise<Service & { adopted?: boolean }> {
+): Promise<Service & { adopted?: boolean; adoptionMatch?: AdoptionMatch }> {
+  const identity = args.identity ?? {};
   try {
     return await requestJson<Service>(
       `${base}/api/projects/${projectId}/services`,
       {
         method: "POST",
         token,
-        body: { name: args.name, stack: args.stack },
+        body: {
+          name: args.name,
+          stack: args.stack,
+          // Sent so the cloud can hold two same-named apps apart. A deployment
+          // that does not read these ignores them, which is why the adoption
+          // below still has to cope with a row that carries neither.
+          ...(identity.sourcePath ? { sourcePath: identity.sourcePath } : {}),
+          ...(identity.repo ? { repo: identity.repo } : {}),
+        },
         fetchImpl,
       },
     );
@@ -186,8 +227,34 @@ export async function createService(
     // this token cannot read, and inventing a service would be worse than the
     // original error. The server's own words stand.
     if (!match) throw err;
-    return { ...match, adopted: true };
+    return { ...match, adopted: true, adoptionMatch: compareIdentity(match, identity) };
   }
+}
+
+/** Same repository, another one, or no way to tell from what the cloud returned. */
+export function compareIdentity(
+  existing: Pick<Service, "sourcePath" | "repo">,
+  identity: ServiceIdentity,
+): AdoptionMatch {
+  const norm = (v?: string | null) => (v ?? "").trim().toLowerCase();
+  const theirRepo = norm(existing.repo);
+  const ourRepo = norm(identity.repo);
+  if (theirRepo && ourRepo) {
+    if (theirRepo !== ourRepo) return "other-source";
+    // Same repository. A different directory inside it is still a different app.
+    const theirPath = norm(existing.sourcePath);
+    const ourPath = norm(identity.sourcePath);
+    if (theirPath && ourPath && theirPath !== ourPath) return "other-source";
+    return "same-source";
+  }
+  const theirPath = norm(existing.sourcePath);
+  const ourPath = norm(identity.sourcePath);
+  // A path with no repository beside it says which directory, not which
+  // checkout, so a match here is only ever evidence of the same directory.
+  if (theirPath && ourPath) {
+    return theirPath === ourPath ? "unknown-source" : "other-source";
+  }
+  return "unknown-source";
 }
 
 /**
@@ -255,6 +322,8 @@ export interface ProvisionInput {
   /** Inferred defaults (from detection / package.json / git). */
   defaultProjectName: string;
   defaultServiceName: string;
+  /** Which repository and directory this app lives in. */
+  identity?: ServiceIdentity;
   /** Who the token belongs to, for the wrong-account message. */
   identityLabel?: string;
   fetchImpl?: typeof fetch;
@@ -267,6 +336,10 @@ export interface ProvisionResult {
   serviceName: string;
   /** True when the service already existed and this run reused it. */
   adopted?: boolean;
+  /** How much of that reuse the cloud's own identity could confirm. */
+  adoptionMatch?: AdoptionMatch;
+  /** Carried into the run summary when reuse could be the wrong application. */
+  adoptionNote?: string;
 }
 
 export interface ResolveProjectInput {
@@ -391,6 +464,8 @@ export interface ProvisionServiceInput {
   /** Detected otlp stack; overrides the registry placeholder. */
   stack?: Stack | null;
   serviceName: string;
+  /** Which repository and directory this app lives in, sent with the create. */
+  identity?: ServiceIdentity;
   ui: Ui;
   fetchImpl?: typeof fetch;
 }
@@ -403,9 +478,14 @@ export interface ProvisionServiceInput {
  * service repeats. Prompt-free by design too — the batch installer names
  * services from detection rather than asking N times.
  */
-export async function provisionService(
-  input: ProvisionServiceInput,
-): Promise<{ serviceId: string; serviceName: string; adopted?: boolean }> {
+export async function provisionService(input: ProvisionServiceInput): Promise<{
+  serviceId: string;
+  serviceName: string;
+  adopted?: boolean;
+  adoptionMatch?: AdoptionMatch;
+  /** Printed by the caller's summary when adoption could be the wrong app. */
+  adoptionNote?: string;
+}> {
   const { base, token, ui, fetchImpl } = input;
   // Prefer the DETECTED otlp stack when present; otherwise the registry stack.
   // For otlp the registry value is only a placeholder, so input.stack is what
@@ -416,31 +496,82 @@ export async function provisionService(
   // would read a Flutter app as a React one.
   const meta = RECIPE_REGISTRY[input.recipe];
   const serviceStack = input.stack ?? meta.reportedStack ?? meta.stack;
-  let service: Service & { adopted?: boolean };
+  let service: Service & { adopted?: boolean; adoptionMatch?: AdoptionMatch };
   try {
     service = await createService(
       base,
       token,
       input.projectId,
-      { name: input.serviceName, stack: serviceStack },
+      {
+        name: input.serviceName,
+        stack: serviceStack,
+        ...(input.identity ? { identity: input.identity } : {}),
+      },
       fetchImpl,
     );
   } catch (err) {
     throw explainWrongAccount(err, input.projectId, input.identityLabel);
   }
+  // "Application" is what the dashboard calls this object. The CLI used to call
+  // it a service here and then link the reader to a page that has no such word
+  // on it.
+  const label = `Application: ${color.bold(color.brand(service.name))}`;
   ui.out(
     ok(
       service.adopted
-        ? `Service: ${color.bold(color.brand(service.name))} ${color.dim("(already in this project — reusing it)")}`
-        : `Service: ${color.bold(color.brand(service.name))}`,
+        ? `${label} ${color.dim(adoptionSuffix(service.adoptionMatch))}`
+        : label,
     ),
   );
+  const line = service.adopted
+    ? adoptionWarning(service.name, service.adoptionMatch, input.identity)
+    : undefined;
+  // A verified clash is a decision the reader has to make now, so it is a
+  // warning and it is repeated in the end of run summary. A name match the
+  // cloud could not qualify is context: every rerun of a wired app produces
+  // one, and carrying it into the summary each time would train the reader to
+  // skip the line that matters.
+  const clash = service.adoptionMatch === "other-source";
+  if (line) ui.out(clash ? color.yellow(`! ${line}`) : color.dim(`  ${line}`));
 
   return {
     serviceId: service.id,
     serviceName: service.name,
     ...(service.adopted ? { adopted: true } : {}),
+    ...(service.adoptionMatch ? { adoptionMatch: service.adoptionMatch } : {}),
+    ...(clash && line ? { adoptionNote: line } : {}),
   };
+}
+
+function adoptionSuffix(match?: AdoptionMatch): string {
+  return match === "same-source"
+    ? "(this repository already has it here, reusing it)"
+    : "(already in this project, reusing it)";
+}
+
+/**
+ * What the reader has to know when an existing application was reused.
+ *
+ * Reusing the row is right when it is the same app run again, and it is the
+ * whole reason a second run does not die on a 409. It is wrong when the name
+ * happens to be shared with an app in another repository, because both then
+ * file their events under one application and neither reader can separate
+ * them. The CLI cannot tell which case it is unless the cloud returns the
+ * identity, so it says which of the two it verified.
+ */
+function adoptionWarning(
+  name: string,
+  match?: AdoptionMatch,
+  identity?: ServiceIdentity,
+): string | undefined {
+  if (match === "same-source") return undefined;
+  const here = identity?.repo
+    ? ` This run is wiring ${identity.repo}${identity.sourcePath && identity.sourcePath !== "." ? `/${identity.sourcePath}` : ""}.`
+    : "";
+  if (match === "other-source") {
+    return `The application named ${name} in this project belongs to a different repository or directory, and reusing it would file both sets of events under one application.${here} Re run with a distinct name (the CLI asks for one), or pick another project.`;
+  }
+  return `An application named ${name} already existed in this project and was reused. The cloud returned no repository for it, so this run matched on the name alone.${here} If another repository also reports an application called ${name} here, their events land together.`;
 }
 
 /**
@@ -558,6 +689,7 @@ export async function provisionFlow(
     stack: input.stack,
     serviceName,
     ui: input.ui,
+    ...(input.identity ? { identity: input.identity } : {}),
     ...(input.identityLabel ? { identityLabel: input.identityLabel } : {}),
     fetchImpl: input.fetchImpl,
   });
@@ -568,5 +700,7 @@ export async function provisionFlow(
     serviceId: service.serviceId,
     serviceName: service.serviceName,
     ...(service.adopted ? { adopted: true } : {}),
+    ...(service.adoptionMatch ? { adoptionMatch: service.adoptionMatch } : {}),
+    ...(service.adoptionNote ? { adoptionNote: service.adoptionNote } : {}),
   };
 }
