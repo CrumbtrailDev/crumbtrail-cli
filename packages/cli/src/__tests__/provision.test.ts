@@ -60,7 +60,7 @@ describe("createProject 402", () => {
     ) as unknown as typeof fetch;
 
     await expect(
-      createProject("http://127.0.0.1:1", "bl_cli_x", "app", fetchImpl),
+      createProject("http://127.0.0.1:1", "ctcli_x", "app", fetchImpl),
     ).rejects.toMatchObject({
       name: "UpgradeRequiredError",
       message: expect.stringContaining("Upgrade to add more"),
@@ -82,7 +82,7 @@ describe("single-retry on transient failure", () => {
 
     const projects = await listProjects(
       "http://127.0.0.1:1",
-      "bl_cli_x",
+      "ctcli_x",
       fetchImpl,
     );
     expect(projects).toEqual([{ id: "p1", name: "app" }]);
@@ -94,7 +94,7 @@ describe("single-retry on transient failure", () => {
       throw econnreset();
     }) as unknown as typeof fetch;
     await expect(
-      listProjects("http://127.0.0.1:9/base", "bl_cli_x", fetchImpl),
+      listProjects("http://127.0.0.1:9/base", "ctcli_x", fetchImpl),
     ).rejects.toThrow(/GET http:\/\/127\.0\.0\.1:9\/base\/api\/projects/);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
@@ -282,7 +282,7 @@ describe("resolveProject interactive default", () => {
 
     const project = await resolveProject({
       base: "http://127.0.0.1:1",
-      token: "bl_cli_x",
+      token: "ctcli_x",
       ui,
       prompter,
       assumeYes: false,
@@ -301,7 +301,7 @@ describe("resolveProject interactive default", () => {
     const { seen, prompter } = prompterThatPicks(1);
     const project = await resolveProject({
       base: "http://127.0.0.1:1",
-      token: "bl_cli_x",
+      token: "ctcli_x",
       ui,
       prompter,
       assumeYes: false,
@@ -322,7 +322,7 @@ describe("resolveProject interactive default", () => {
     const { prompter } = prompterThatPicks(1);
     const project = await resolveProject({
       base: "http://127.0.0.1:1",
-      token: "bl_cli_x",
+      token: "ctcli_x",
       ui,
       prompter,
       assumeYes: false,
@@ -344,7 +344,7 @@ describe("resolveProject interactive default", () => {
 
     const project = await resolveProject({
       base: "http://127.0.0.1:1",
-      token: "bl_cli_x",
+      token: "ctcli_x",
       ui,
       prompter,
       assumeYes: false,
@@ -379,7 +379,7 @@ describe("createService on a name that is already taken", () => {
 
     const service = await createService(
       "https://cloud.example",
-      "bl_cli_x",
+      "ctcli_x",
       "prj_1",
       { name: "web", stack: "react" },
       fetchImpl,
@@ -406,7 +406,7 @@ describe("createService on a name that is already taken", () => {
     await expect(
       createService(
         "https://cloud.example",
-        "bl_cli_x",
+        "ctcli_x",
         "prj_1",
         { name: "web" },
         fetchImpl,
@@ -463,7 +463,7 @@ describe("explainWrongAccount", () => {
     await expect(
       createIngestKey(
         "https://cloud.example",
-        "bl_cli_x",
+        "ctcli_x",
         "prj_9fd0",
         fetchImpl,
         "someone@example.com",
@@ -487,7 +487,7 @@ describe("createIngestKey 404", () => {
     ) as unknown as typeof fetch;
 
     await expect(
-      createIngestKey("https://cloud.example", "bl_cli_x", "prj_gone", fetchImpl),
+      createIngestKey("https://cloud.example", "ctcli_x", "prj_gone", fetchImpl),
     ).rejects.toThrow("No project prj_gone exists. Check the id.");
   });
 });

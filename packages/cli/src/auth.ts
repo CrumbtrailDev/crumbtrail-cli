@@ -311,6 +311,35 @@ export function describeIdentity(identity: Identity | undefined): string {
 const identityCache = new Map<string, Identity | undefined>();
 
 /**
+ * Dashboard origins deployments reported about THEMSELVES during this run.
+ *
+ * The API origin and the dashboard origin are different hosts on every stack
+ * that is not the hosted default, so a link built from the API base 404s. The
+ * login flow learns the real one from the token response and caches it in
+ * auth.json — but a run authenticated by CRUMBTRAIL_TOKEN never logs in, so it
+ * had no source at all and printed the API base as the dashboard. Anything the
+ * deployment reports, from any endpoint and whatever the token source, is
+ * remembered here for the rest of the run.
+ */
+const reportedAppBases = new Map<string, string>();
+
+export function rememberAppBase(base: string, appBaseUrl?: string): void {
+  if (appBaseUrl && appBaseUrl.trim()) {
+    reportedAppBases.set(normalizeBase(base), normalizeBase(appBaseUrl));
+  }
+}
+
+/** What this deployment said its dashboard origin is, if it has said. */
+export function reportedAppBase(base: string): string | undefined {
+  return reportedAppBases.get(normalizeBase(base));
+}
+
+/** Test seam: drop the remembered origins. */
+export function clearReportedAppBases(): void {
+  reportedAppBases.clear();
+}
+
+/**
  * Read GET /auth/me for the token's account. Never throws: identity is context,
  * and a deployment that will not answer must not be able to fail a setup run.
  * Memoized per endpoint+token so naming the account costs one request a run.
@@ -330,6 +359,10 @@ export async function fetchIdentity(
     });
     const str = (value: unknown): string | undefined =>
       typeof value === "string" && value.trim() ? value.trim() : undefined;
+    // /auth/me is the one authenticated call every run makes whatever its token
+    // came from, so it is where a run with no login can still learn where this
+    // deployment serves its dashboard.
+    rememberAppBase(base, str(me?.appBaseUrl) ?? str(me?.publicBaseUrl));
     identity = {
       ...(str(me?.userId) ? { userId: str(me?.userId) } : {}),
       ...(str(me?.tenantId) ? { tenantId: str(me?.tenantId) } : {}),
@@ -720,7 +753,7 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
     // an interactive login — so say that, and say how to get its value out.
     throw new Error(
       `${TOKEN_ENV_VAR} was set but ${opts.base} rejected it (401). ` +
-        `It must be a CLI token (starts with \`bl_cli_\`) — an ingest key ` +
+        `It must be a CLI token (starts with \`ctcli_\`) — an ingest key ` +
         `(\`ctkey_\`) or an agent token (\`ctagt_\`) will not authenticate the ` +
         `CLI. Run \`crumbtrail login\` on a machine with a browser, then ` +
         `\`crumbtrail token\` to print the value to copy into CI. Add ` +
@@ -781,6 +814,7 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
   }
 
   const minted = await login(opts);
+  rememberAppBase(opts.base, minted.appBaseUrl);
   saveAuth(
     {
       token: minted.token,

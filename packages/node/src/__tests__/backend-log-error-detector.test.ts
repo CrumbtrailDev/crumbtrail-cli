@@ -43,6 +43,15 @@ describe("backend_log_error", () => {
     expect(candidate.anchor.errorCode).toBe("UpstreamError");
   });
 
+  it("prefers the SDK's stamped request id over the logger's own field", () => {
+    const event = buildBackendLogEvent(parseStructuredLogLine(PINO_503_LINE)!, {
+      now: 10,
+      requestId: "c70509ea9b1f4d3ea1d8b0f2c3a45671",
+    });
+    const [candidate] = candidatesFor([event]);
+    expect(candidate.anchor.requestId).toBe("c70509ea9b1f4d3ea1d8b0f2c3a45671");
+  });
+
   it("keeps a warn-level line, but under anything that names a fault", () => {
     const [warn] = candidatesFor([
       logEvent('{"level":40,"msg":"retrying upstream"}'),

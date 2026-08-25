@@ -515,6 +515,14 @@ Warn and above by default (`logLevel` moves the floor), the message, error and
 stack pass through the same redaction as any other captured text, only bounded
 scalar context fields ride along, and one install caps at 500 events so a log
 storm cannot flood a session. The host's own write always happens, unchanged.
+
+A line written while a request is being handled carries that request's id, and
+is filed to the session the request belongs to — the browser's, when a browser
+correlated the call. So the click that got the 500 and the log line explaining
+it share one join key instead of landing in two unrelated issues. The same
+applies to a `console.error` raised inside a handler. A line written between
+requests keeps the process's own session and carries no request id, exactly as
+before.
 The `backend_log_error` detector surfaces an error or fatal line as a
 high-severity candidate carrying the logged stack, collapsed by content so an
 upstream outage logged once per request reads as one finding. Disable with

@@ -16,6 +16,11 @@ import {
 } from "./backend-response";
 import { isBackendRequestClaimed } from "./backend-request-claim";
 import { getProcessSessionId } from "./process-session";
+import {
+  runInBackendRequestContext,
+  updateBackendRequestContext,
+  type BackendRequestContext,
+} from "./request-context";
 
 /**
  * Inbound HTTP request capture for every Node backend, with no application code.
@@ -129,7 +134,18 @@ function hubFor(prototypes: readonly object[]): ServerHub | undefined {
     const original = holder.emit;
     if (typeof original !== "function") continue;
     const patched = function (this: unknown, ...args: unknown[]): unknown {
-      if (args[0] === "request") {
+      if (args[0] !== "request") {
+        return (original as (...a: unknown[]) => unknown).apply(this, args);
+      }
+      // The whole downstream dispatch runs inside one request context, so
+      // anything the handler produces — a log line written through a file
+      // descriptor, a database diff, a warning — can name the request it
+      // happened in. The store is established EMPTY and filled by the sinks
+      // below, because a request the recorders skip must still leave the
+      // handler running in a context (an Express middleware claiming it later
+      // upgrades this same store rather than opening a competing one).
+      const context: BackendRequestContext = {};
+      return runInBackendRequestContext(context, () => {
         try {
           const req = args[1] as ServerRequestLike | undefined;
           const res = args[2] as BackendResponseLike | undefined;
@@ -137,8 +153,8 @@ function hubFor(prototypes: readonly object[]): ServerHub | undefined {
         } catch {
           // Capture must never throw back into the host's request dispatch.
         }
-      }
-      return (original as (...a: unknown[]) => unknown).apply(this, args);
+        return (original as (...a: unknown[]) => unknown).apply(this, args);
+      });
     };
     // An own property on the prototype: `http.Server.prototype` inherits `emit`
     // from EventEmitter, so this shadows it for servers of this kind only and is
@@ -201,6 +217,22 @@ export function installHttpRequestCapture(
       headers: req.headers,
       processSessionId,
       now: startedAtMs,
+    });
+
+    // Publish the correlation to the ambient context before anything else runs
+    // in this request. Done even when the request is about to be skipped for
+    // want of a session, because the id is what a `db.diff` or a log line joins
+    // on and `readRequestCorrelation` decides on its own what is safe to use.
+    updateBackendRequestContext({
+      requestId:
+        typeof startEvent.d.requestId === "string"
+          ? startEvent.d.requestId
+          : undefined,
+      sessionId:
+        typeof startEvent.sessionId === "string"
+          ? startEvent.sessionId
+          : undefined,
+      sessionIdSource: sessionIdSourceOf(startEvent),
     });
 
     // No session at all — neither correlated nor process-owned — means the

@@ -33,6 +33,7 @@ import {
   fetchIdentity,
   loadAuth,
   openBrowser,
+  reportedAppBase,
 } from "./auth";
 import {
   exitCodeFor,
@@ -73,7 +74,7 @@ import { discoverServices, type ServiceCandidate } from "./discover";
 import { isBackendRecipe, resolveBackendOrigins } from "./backend-origins";
 import { otlpGuidePlan, renderOtlpGuide } from "./otlp-guide";
 import { RECIPE_REGISTRY, sdkInstallSpec } from "./recipe-registry";
-import { dashboardBase, resolveEndpoint } from "./net";
+import { APP_URL_ENV_VAR, dashboardBase, resolveEndpoint } from "./net";
 import {
   color,
   consoleUi,
@@ -117,6 +118,98 @@ function readVersion(): string {
 function __dirnameCompat(): string {
   if (typeof __dirname !== "undefined") return __dirname;
   return process.cwd();
+}
+
+/** Order two dotted numeric versions. A prerelease suffix sorts below its release. */
+export function compareSdkVersions(a: string, b: string): number {
+  const parts = (v: string): number[] => {
+    const core = /^(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
+    if (!core) return [0, 0, 0, 0];
+    const prerelease = /^\d+\.\d+\.\d+-/.test(v.trim()) ? 0 : 1;
+    return [Number(core[1]), Number(core[2]), Number(core[3]), prerelease];
+  };
+  const left = parts(a);
+  const right = parts(b);
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return left[i] < right[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+/** A released x.y.z, or undefined for anything else (prerelease, unreadable). */
+function releaseVersion(version: string): string | undefined {
+  return /^\d+\.\d+\.\d+$/.test(version.trim()) ? version.trim() : undefined;
+}
+
+/**
+ * The install spec for one SDK package, floored at THIS CLI's own version.
+ *
+ * `SDK_VERSION_FLOORS` is a CAPABILITY floor — the oldest SDK the recipes still
+ * work against — and it is deliberately not raised for every release. That is
+ * the right rule for a resolver that takes the newest matching version, and the
+ * wrong one for pnpm 10+/11, whose release-age gate silently skips versions
+ * published in the last few days: a run of `crumbtrail` 0.37.0 asking for
+ * `>=0.31.0` resolved `crumbtrail-node` 0.36.0 hours after 0.37.0 shipped, and
+ * 0.36.0's backend log capture does not work. The SDKs and the CLI are released
+ * in lockstep, so the CLI's own version is a version that exists on the
+ * registry, and asking for it by name is what makes pnpm's gate step aside.
+ * The capability floor still wins when it is HIGHER (a CLI older than the
+ * recipes it carries cannot happen, but the max costs nothing).
+ */
+export function sdkInstallSpecForCli(
+  pkg: string,
+  cliVersion: string = readVersion(),
+): string {
+  const declared = sdkInstallSpec(pkg);
+  const capabilityFloor = declared.startsWith(`${pkg}@>=`)
+    ? declared.slice(pkg.length + 3)
+    : undefined;
+  // A prerelease CLI must not demand a prerelease SDK that was never published.
+  const ownVersion = releaseVersion(cliVersion);
+  if (!ownVersion) return declared;
+  if (!capabilityFloor) return `${pkg}@>=${ownVersion}`;
+  return compareSdkVersions(ownVersion, capabilityFloor) > 0
+    ? `${pkg}@>=${ownVersion}`
+    : declared;
+}
+
+/**
+ * The version of `pkg` as it actually sits on disk for an app at `cwd`, or
+ * undefined when it is not there. Walks up through parent `node_modules` because
+ * npm and yarn hoist, and a pnpm workspace links the dependency into the app's
+ * own `node_modules` while the store lives at the root.
+ *
+ * This is the only honest answer to "did the install work". A package manager's
+ * exit code is not: pnpm 10+/11 exits 1 with ERR_PNPM_IGNORED_BUILDS whenever
+ * ANY dependency in the tree has an unapproved build script (esbuild, sharp,
+ * prisma…), long after the packages it was asked to add are installed.
+ */
+export function resolvedSdkVersion(
+  cwd: string,
+  pkg: string,
+): string | undefined {
+  let dir = path.resolve(cwd);
+  for (;;) {
+    const manifest = path.join(
+      dir,
+      "node_modules",
+      ...pkg.split("/"),
+      "package.json",
+    );
+    try {
+      const parsed = JSON.parse(readFileSync(manifest, "utf8")) as {
+        version?: string;
+      };
+      if (typeof parsed.version === "string" && parsed.version.trim()) {
+        return parsed.version.trim();
+      }
+    } catch {
+      // not here — keep walking up
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
 }
 
 // ── Arg parsing ──────────────────────────────────────────────────────────────
@@ -341,12 +434,55 @@ export interface InstallSdkInput {
   spawnFn?: (cmd: string, args: string[], cwd: string) => number;
   /** Injected fetch for the tarball-manifest fallback (tests); defaults to global. */
   fetchImpl?: typeof fetch;
+  /** Injected on-disk version reader (tests); defaults to `resolvedSdkVersion`. */
+  resolvedVersionFn?: (cwd: string, pkg: string) => string | undefined;
+  /** This CLI's own version (tests); defaults to its package.json. */
+  cliVersion?: string;
 }
 
 export interface InstallSdkResult {
   installed: boolean;
   packages: string[];
   note?: string;
+}
+
+/**
+ * A loud line when the SDK that landed is OLDER than the CLI that wired it.
+ *
+ * The CLI and the SDKs ship in lockstep, so anything below this CLI's version
+ * is a resolver that did not take what was asked for — in practice pnpm's
+ * `minimumReleaseAge` gate skipping a version published in the last few days.
+ * That is invisible in the install output (pnpm prints a quiet "0.37.0 is
+ * available" line), and the user's app then captures with an SDK whose
+ * behaviour does not match what setup just told them. Naming the cause and the
+ * exact command is the difference between a five-minute fix and a bug report.
+ */
+function staleSdkNote(
+  cwd: string,
+  packages: string[],
+  cliVersion: string,
+  cmd: string,
+  add: string,
+  resolveVersion: (cwd: string, pkg: string) => string | undefined,
+): string | undefined {
+  const own = releaseVersion(cliVersion);
+  if (!own) return undefined;
+  const stale: string[] = [];
+  for (const pkg of packages) {
+    const version = resolveVersion(cwd, pkg);
+    if (version && compareSdkVersions(version, own) < 0) {
+      stale.push(`${pkg}@${version}`);
+    }
+  }
+  if (stale.length === 0) return undefined;
+  const pinned = packages.map((pkg) => `${pkg}@${own}`).join(" ");
+  return (
+    `Your package manager installed ${stale.join(", ")}, older than this ` +
+    `CLI (${own}). The usual cause is a release-age setting that skips ` +
+    `recently published versions (pnpm's minimumReleaseAge, on by default in ` +
+    `pnpm 10 and 11). Older SDKs do not capture everything this setup ` +
+    `assumes, so pin them: \`${cmd} ${add} ${pinned}\`.`
+  );
 }
 
 function sdkPackagesFor(recipe: Recipe): string[] {
@@ -463,10 +599,12 @@ export async function installSdk(
   }
 
   const { cmd, add } = pmInvocation(input.packageManager);
-  // Pin the registry install to the CLI's version floors so a stale dist-tag
-  // can never leave a freshly wired service on an old SDK. The tarball fallback
-  // below keeps bare names (tarball URLs are resolved by name prefix).
-  const specs = packages.map(sdkInstallSpec);
+  // Pin the registry install to at least this CLI's own version, so neither a
+  // stale dist-tag nor a package manager's release-age gate can leave a freshly
+  // wired service on an older SDK. The tarball fallback below keeps bare names
+  // (tarball URLs are resolved by name prefix).
+  const cliVersion = input.cliVersion ?? readVersion();
+  const specs = packages.map((pkg) => sdkInstallSpecForCli(pkg, cliVersion));
   // Specs carry a `>=` range. Spawning below is shell-free so the raw argv is
   // correct, but the echoed line is something people copy into a shell, where
   // an unquoted `>` would redirect stdout into a file. Quote it for display.
@@ -474,9 +612,38 @@ export async function installSdk(
   input.ui.out(
     `  ${color.dim("Installing SDK:")} ${color.brand(`${cmd} ${add} ${shown}`)}`,
   );
+  const resolveVersion = input.resolvedVersionFn ?? resolvedSdkVersion;
   const code = run(cmd, [add, ...specs], input.cwd);
+  const versionNote = (): string | undefined =>
+    staleSdkNote(input.cwd, packages, cliVersion, cmd, add, resolveVersion);
   if (code === 0) {
-    return { installed: true, packages };
+    const note = versionNote();
+    return { installed: true, packages, ...(note ? { note } : {}) };
+  }
+
+  // A nonzero exit is not the same as "not installed". pnpm 10+/11 exits 1 with
+  // ERR_PNPM_IGNORED_BUILDS whenever ANY dependency in the tree has an
+  // unapproved build script — esbuild, sharp and prisma between them cover a
+  // large share of real repos — with the packages it was asked to add already
+  // on disk. Trusting the code alone made the wizard announce "crumbtrail-node
+  // is not installed", withhold the wiring, and send the user round a loop that
+  // could not end: running the add command by hand succeeds-with-warning in
+  // exactly the same way. Ask the disk instead.
+  const onDisk = packages.map((pkg) => resolveVersion(input.cwd, pkg));
+  if (onDisk.every((version) => version !== undefined)) {
+    const stale = versionNote();
+    const landed = packages.map((pkg, i) => `${pkg}@${onDisk[i]}`).join(", ");
+    const plural = packages.length > 1 ? "are" : "is";
+    return {
+      installed: true,
+      packages,
+      note:
+        `${cmd} exited nonzero but ${landed} ${plural} installed, so setup ` +
+        `continued. The message ${cmd} printed above is about your project, ` +
+        `not about Crumbtrail — pnpm exits nonzero for ignored build scripts ` +
+        `(ERR_PNPM_IGNORED_BUILDS) even when the add succeeded.` +
+        (stale ? ` ${stale}` : ""),
+    };
   }
 
   // Registry install failed — fall back to the deploy's packed tarballs,
@@ -897,6 +1064,10 @@ export async function runWizard(
     : { installed: false, packages: [] };
   if (install.installed) {
     ui.out(ok(`Installed ${color.bold(install.packages.join(", "))}.`));
+    // An install can succeed and still be worth a word: a nonzero exit code the
+    // wizard looked past, or a version older than this CLI. Printing it only on
+    // failure hid both.
+    if (install.note) ui.out(alert(color.yellow(install.note)));
   } else if (install.note) {
     ui.out(alert(color.yellow(install.note)));
   }
@@ -952,7 +1123,7 @@ export async function runWizard(
   // 8. Next steps. With the key on disk the first-event wait is a real wait on
   // the app starting, rather than a wait on a manual step nobody was told to do.
   const notes: string[] = [];
-  if (!install.installed && install.note) notes.push(install.note);
+  if (install.note) notes.push(install.note);
   notes.push(...inject.notes);
   notes.push(
     ...correlationNotes(result.recipe, singleAppOrigins, 0, inject.outcome),
@@ -1120,19 +1291,54 @@ export async function runWizard(
  * that actually exist so it can't over-promise.
  */
 /**
- * The dashboard origin for `base`, preferring what the deployment reported when
- * this CLI logged in. Falls back to the hosted guess for a run with no stored
- * login (an env token in CI), which is where the guess is right anyway.
+ * What this deployment has said its dashboard origin is: anything it reported
+ * during this run first, then a saved login for the SAME endpoint.
+ *
+ * The token's source is deliberately not part of this. It used to be, by
+ * accident: only the login path recorded an appBaseUrl, so a run authenticated
+ * by CRUMBTRAIL_TOKEN fell through to the guess and finished by printing
+ * `Dashboard: http://127.0.0.1:19890/...` — the API port — which 404s on every
+ * split-origin deployment, local stacks included.
+ */
+function reportedAppBaseFor(
+  base: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const runReported = reportedAppBase(base);
+  if (runReported) return runReported;
+  const stored = loadAuth(env);
+  return stored && stored.endpoint === base ? stored.appBaseUrl : undefined;
+}
+
+/**
+ * The dashboard origin for `base`, preferring what the deployment reported.
+ * Falls back to the hosted guess, which is right for the hosted default and a
+ * guess everywhere else — see `dashboardGuessCaveat`.
  */
 function appBaseFor(
   base: string,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const stored = loadAuth(env);
-  return dashboardBase(
-    base,
-    stored && stored.endpoint === base ? stored.appBaseUrl : undefined,
-    env,
+  return dashboardBase(base, reportedAppBaseFor(base, env), env);
+}
+
+/**
+ * One line when the dashboard link is a GUESS rather than something the
+ * deployment reported, and the guess is the kind that 404s: a split-origin
+ * self-host or local stack. Silence would leave the user clicking a dead link
+ * with nothing naming the fix.
+ */
+function dashboardGuessCaveat(
+  base: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (env[APP_URL_ENV_VAR]?.trim()) return undefined;
+  if (reportedAppBaseFor(base, env)) return undefined;
+  if (appBaseFor(base, env) !== base) return undefined;
+  return (
+    `${base} did not report a dashboard origin, so the links above assume it ` +
+    `serves the dashboard itself. If they 404, set ${APP_URL_ENV_VAR} to your ` +
+    `dashboard origin (locally that is usually port 19892) and run this again.`
   );
 }
 
@@ -1608,6 +1814,7 @@ export async function runBatchWizard(
         : { installed: false, packages: [] };
       if (install.installed) {
         ui.out(ok(`Installed ${color.bold(install.packages.join(", "))}.`));
+        if (install.note) ui.out(color.yellow(`! ${install.note}`));
       } else if (install.note) {
         ui.out(color.yellow(`! ${install.note}`));
       }
@@ -1633,7 +1840,7 @@ export async function runBatchWizard(
         keyIsCompileTime: plan.keyIsCompileTime,
         filesTouched: applied.filesTouched,
         notes: [
-          ...(!install.installed && install.note ? [install.note] : []),
+          ...(install.note ? [install.note] : []),
           ...applied.notes,
           // The APPLIED status, not the plan's intent: a service whose wiring
           // fell back to a snippet must not be told its correlation is live.
@@ -2011,9 +2218,11 @@ export function printBatchSummary(
     ),
   );
 
+  const guessCaveat = dashboardGuessCaveat(base);
   const notes = [
     ...outcomes.flatMap((o) => o.notes.map((n) => `${o.name}: ${n}`)),
     ...batchNotes,
+    ...(guessCaveat ? [guessCaveat] : []),
   ];
   const projectAccessFailure = outcomes.some(
     (o) => o.errorKind === "project-access",
@@ -2542,6 +2751,23 @@ async function applyInjection(
     ui.out(
       color.yellow(`Left your code untouched — ${pkgs} is not installed.`),
     );
+    // The wiring is withheld, but the wiring is still the thing the user came
+    // for. Returning here skipped the snippet and the agent prompt the
+    // fallback-ai branch below prints, so the one run that most needed a
+    // paste-this ending was the only run that never showed one.
+    if (plan.snippet || plan.agentPrompt) {
+      ui.out(
+        color.dim(`Once ${pkgs} is installed, this is the wiring it needs:`),
+      );
+      if (plan.snippet) {
+        ui.out(color.dim("Paste this into your entry file:"));
+        ui.out(plan.snippet);
+      }
+      if (plan.agentPrompt) {
+        ui.out(color.dim("\nOr hand this to your coding agent:"));
+        ui.out(plan.agentPrompt);
+      }
+    }
     notes.push(
       `Skipped wiring ${plan.targetPath ?? "your entry file"}: install ${pkgs}, then run \`npx crumbtrail\` again.`,
     );
@@ -2753,9 +2979,11 @@ function printSummary(
   ui.out(
     field("Dashboard", color.brand(appUrl(appBase, "/issues", p.projectId))),
   );
-  if (notes.length > 0) {
+  const caveat = dashboardGuessCaveat(base);
+  const allNotes = caveat ? [...notes, caveat] : notes;
+  if (allNotes.length > 0) {
     ui.out("");
-    for (const n of notes) ui.out(note(n));
+    for (const n of allNotes) ui.out(note(n));
   }
   ui.out("");
 }
@@ -2928,6 +3156,33 @@ function nodeTooOld(version: string): boolean {
   return false;
 }
 
+/**
+ * Words people type expecting a setup subcommand. The wizard is the bare
+ * command, so each of these has exactly one answer, and it is one line long.
+ */
+const WIZARD_ALIASES = new Set([
+  "setup",
+  "init",
+  "install",
+  "start",
+  "wizard",
+  "configure",
+  "config",
+  "onboard",
+  "add",
+  "connect",
+]);
+
+export function wizardAliasHint(arg: string): string | undefined {
+  const word = arg.trim().replace(/^-+/, "").toLowerCase();
+  if (!WIZARD_ALIASES.has(word)) return undefined;
+  return (
+    `There is no \`${word}\` subcommand — the setup wizard is just ` +
+    `\`crumbtrail\`, run inside the app you want to wire up. ` +
+    `Run it with no arguments (\`npx crumbtrail\`).`
+  );
+}
+
 export async function runCli(
   argv: string[],
   deps: WizardDeps = defaultDeps(),
@@ -2955,6 +3210,17 @@ export async function runCli(
     return 0;
   }
   if (parsed.unknown) {
+    // A word someone reasonably expected to be a subcommand is not an unknown
+    // argument to them — it is the command they came to run. `crumbtrail setup`
+    // answering "Unknown argument: setup" plus thirty lines of help reads as a
+    // broken install, when the only thing wrong is that the wizard has no
+    // subcommand: it IS the bare command.
+    const hint = wizardAliasHint(parsed.unknown);
+    if (hint) {
+      deps.ui.err(hint);
+      deps.ui.err(color.dim("Run `crumbtrail --help` for everything else."));
+      return 1;
+    }
     deps.ui.err(`Unknown argument: ${parsed.unknown}\n`);
     deps.ui.err(usage());
     return 1;

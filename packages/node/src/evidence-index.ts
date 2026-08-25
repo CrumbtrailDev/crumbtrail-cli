@@ -640,6 +640,52 @@ function supportGrade(draft: {
     : "attached";
 }
 
+/**
+ * What the backend plane says a correlated request was aimed at.
+ *
+ * A frontend failure whose `net.req` did not survive the retained window has no
+ * method and no url of its own, and every title minted from it read "HTTP 500
+ * from request unknown URL" while the backend record for the SAME request — two
+ * lines down in the same bundle — named the endpoint outright. The correlation
+ * id is the join, so the display target is recovered rather than invented: the
+ * value shown is the backend's own already-redacted `pathname`/`route`, not a
+ * reconstruction.
+ *
+ * Newly captured sessions rarely need this — `net.res` now carries its own
+ * method and url — but a session captured by an older SDK, or one whose
+ * response arrived through a transport that reports no url, still joins here.
+ */
+function collectBackendRequestTargets(
+  events: BugEvent[],
+): Map<string, { method?: string; url?: string }> {
+  const targets = new Map<string, { method?: string; url?: string }>();
+  for (const event of events) {
+    if (
+      event.k !== "backend.req.start" &&
+      event.k !== "backend.req.end" &&
+      event.k !== "backend.req.error"
+    )
+      continue;
+    const requestId = safeText(event.d.requestId, 120);
+    if (!requestId) continue;
+    const method = safeText(event.d.method, 20);
+    const url =
+      redactUrl(event.d.pathname) ??
+      redactUrl(event.d.route) ??
+      redactUrl(event.d.url);
+    if (method === undefined && url === undefined) continue;
+    const existing = targets.get(requestId);
+    targets.set(
+      requestId,
+      removeUndefined({
+        method: existing?.method ?? method,
+        url: existing?.url ?? url,
+      }),
+    );
+  }
+  return targets;
+}
+
 export function buildEvidenceCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
@@ -650,6 +696,7 @@ export function buildEvidenceCandidates(
   events = expandNativeNetworkEvents(events);
   index = withNavigationContext(events, index);
   const requestById = collectRequests(events);
+  const backendTargets = collectBackendRequestTargets(events);
   const responseIds = new Set<string>();
   const drafts: CandidateDraft[] = [];
 
@@ -678,12 +725,20 @@ export function buildEvidenceCandidates(
       failed.reason === "application_failure"
         ? "app_2xx_failure"
         : "http_error";
+    // The frontend's own view first; the backend's record of the same
+    // correlated request only when the frontend view is blank.
+    const backendTarget = reqId ? backendTargets.get(reqId) : undefined;
+    const failedMethod =
+      failed.m || req?.method || backendTarget?.method || undefined;
+    const failedUrl =
+      failed.url || req?.url || backendTarget?.url || undefined;
+    const failedTarget = titleUrl(failedUrl ?? "") ?? "unknown URL";
     drafts.push({
       detector,
       title:
         failed.reason === "application_failure"
-          ? `Application failure in ${failed.m || req?.method || "request"} ${titleUrl(failed.url || req?.url || "") ?? "unknown URL"}`
-          : `HTTP ${failed.st ?? "error"} from ${failed.m || req?.method || "request"} ${titleUrl(failed.url || req?.url || "") ?? "unknown URL"}`,
+          ? `Application failure in ${failedMethod ?? "request"} ${failedTarget}`
+          : `HTTP ${failed.st ?? "error"} from ${failedMethod ?? "request"} ${failedTarget}`,
       severity:
         failed.reason === "application_failure" || (failed.st ?? 0) >= 500
           ? "high"
@@ -701,8 +756,8 @@ export function buildEvidenceCandidates(
           offsetForEvent(response) ?? offsetFromStart(failed.t, index.start),
         route: routeAt(index.navs ?? [], failed.t),
         requestId: reqId,
-        method: failed.m || req?.method,
-        url: redactUrl(failed.url || req?.url),
+        method: failedMethod,
+        url: redactUrl(failedUrl),
         status: failed.st,
         errorCode: scrubText(failed.code, 160),
         message: scrubText(failed.message, 220),
@@ -714,9 +769,13 @@ export function buildEvidenceCandidates(
 
   for (const entry of index.networkErrors ?? []) {
     const requestId = requestIdForValue(entry);
+    const backendTarget = requestId ? backendTargets.get(requestId) : undefined;
+    const errMethod =
+      entry.method || entry.m || backendTarget?.method || undefined;
+    const errUrl = entry.url || backendTarget?.url || undefined;
     drafts.push({
       detector: "network_error",
-      title: `Network error from ${entry.method || entry.m || "request"} ${titleUrl(entry.url || "") ?? "unknown URL"}`,
+      title: `Network error from ${errMethod ?? "request"} ${titleUrl(errUrl ?? "") ?? "unknown URL"}`,
       severity: "high",
       score: 86,
       confidence: "high",
@@ -725,8 +784,8 @@ export function buildEvidenceCandidates(
         offsetMs: entry.offsetMs ?? offsetFromStart(entry.t, index.start),
         route: routeAt(index.navs ?? [], entry.t),
         requestId,
-        method: entry.method || entry.m,
-        url: redactUrl(entry.url),
+        method: errMethod,
+        url: redactUrl(errUrl),
         message: scrubText(entry.msg, 220),
         source: entry.transport,
       }),
@@ -2169,12 +2228,23 @@ function backendFailureTitle(parts: {
   method?: string;
   route?: string;
   errorClass?: string;
-  message?: string;
+  /** The error's headline, already stripped of stack frames by {@link errorHeadline}. */
+  headline?: string;
 }): string {
   const statusPart = parts.status ? `HTTP ${parts.status}` : "error";
-  const detail = firstLine(parts.message, 120);
+  const detail = dropClassPrefix(parts.headline, parts.errorClass);
   if (parts.route) {
-    const suffix = parts.errorClass ? `: ${parts.errorClass}` : "";
+    // What the error SAID, not what class it was. A route already names the
+    // endpoint, so the remaining job of the suffix is to separate one way that
+    // endpoint fails from another — and `TypeError` separates far fewer of them
+    // than "cannot read properties of undefined (reading 'total')" does. The
+    // class stays on the anchor either way, and is still the suffix when the
+    // error carried no message.
+    const suffix = detail
+      ? `: ${detail}`
+      : parts.errorClass
+        ? `: ${parts.errorClass}`
+        : "";
     return `Backend ${statusPart} from ${parts.method ?? "request"} ${parts.route}${suffix}`;
   }
   const subject = parts.errorClass ?? (parts.status ? statusPart : undefined);
@@ -2185,11 +2255,146 @@ function backendFailureTitle(parts: {
   return `Backend ${statusPart} from ${parts.method ?? "request"}`;
 }
 
-/** The first line of a message, bounded — a stack-carrying message must not become the title. */
-function firstLine(value: string | undefined, max: number): string | undefined {
-  if (!value) return undefined;
-  const line = value.split("\n")[0]?.trim();
-  return line ? truncate(line, max) : undefined;
+/**
+ * The one line of an error a title can carry: its message, without the stack.
+ *
+ * Two things conspired to put a whole stack in the title. `safeText` collapses
+ * every run of whitespace to a single space before any of this runs, so a
+ * newline-split was already a no-op by the time it was asked for; and a message
+ * arriving with its frames appended (an error whose `message` IS the stack,
+ * which is what a re-thrown or string-wrapped error produces) has no newline to
+ * split on in the first place. The result was a 135 character title cut
+ * mid-word, byte-similar for every error thrown from the same file, and unusable
+ * as the scannable identity of a finding.
+ *
+ * So this reads the RAW value ahead of the collapse, takes its first line, and
+ * then cuts at the first thing that looks like a stack frame — a `at …` run
+ * followed by a `path:line:column`. The full message and the resolved frame both
+ * remain on the anchor, where the stack belongs.
+ */
+function errorHeadline(value: unknown, max: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const line = value.split("\n")[0] ?? value;
+  const withoutFrames = stripStackFrames(line);
+  return scrubText(withoutFrames, max);
+}
+
+/** `at …` followed by a `path:line:column` — a stack frame, not prose. */
+const STACK_FRAME_LOCATION_RE =
+  /(?:[/\\]|file:|node:|https?:\/\/|<anonymous>)\S*:\d+:\d+/;
+const STACK_FRAME_START_RE = /\s+at\s+(?=\S)/g;
+
+function stripStackFrames(value: string): string {
+  STACK_FRAME_START_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = STACK_FRAME_START_RE.exec(value)) !== null) {
+    // Bounded lookahead: one frame is well under this, and an unbounded test
+    // over a very long collapsed stack is the only cost worth avoiding here.
+    if (!STACK_FRAME_LOCATION_RE.test(value.slice(match.index, match.index + 400)))
+      continue;
+    const head = value.slice(0, match.index).trim();
+    // A message that is nothing BUT frames keeps its frames: an empty title
+    // says less than an ugly one.
+    if (head) return head;
+  }
+  return value;
+}
+
+/**
+ * Drops a leading `TypeError: ` from a detail that is about to be printed after
+ * the very same class name. `Backend TypeError: TypeError: x is not a function`
+ * spends a third of a title saying one thing twice.
+ */
+function dropClassPrefix(
+  detail: string | undefined,
+  errorClass: string | undefined,
+): string | undefined {
+  if (!detail) return undefined;
+  if (!errorClass) return detail;
+  const prefix = `${errorClass}: `;
+  if (!detail.startsWith(prefix)) return detail;
+  const rest = detail.slice(prefix.length).trim();
+  return rest || detail;
+}
+
+/** One backend request's span and identity, as the request events reported it. */
+interface BackendRequestSpan {
+  requestId?: string;
+  start: number;
+  end: number;
+  method?: string;
+  pathname?: string;
+  route?: string;
+  status?: number;
+}
+
+/**
+ * The request a request-LESS backend crash happened inside.
+ *
+ * `backend.uncaught` is emitted by the process-level crash handler, which sees
+ * an error and nothing else — no method, no route, no status. When the crash
+ * happened inside a request the middleware DID record all three, on its own
+ * events, and the finding still surfaced with an empty representative: the
+ * reader was told the backend threw and not where. Worse, the two events
+ * describing one fault keyed differently and arrived as two findings.
+ *
+ * The join is the request that was open at the instant of the crash, and only
+ * when exactly ONE was. A server handling two requests concurrently cannot say
+ * from timing alone which one crashed, and attributing the crash to the wrong
+ * endpoint is worse evidence than attributing it to none — so an ambiguous
+ * instant adopts nothing and the crash stays honestly request-less.
+ */
+function collectBackendRequestSpans(events: BugEvent[]): BackendRequestSpan[] {
+  const open = new Map<string, BackendRequestSpan>();
+  const spans: BackendRequestSpan[] = [];
+  for (const event of events) {
+    const kind = event.k;
+    if (
+      kind !== "backend.req.start" &&
+      kind !== "backend.req.end" &&
+      kind !== "backend.req.error"
+    )
+      continue;
+    const requestId = safeText(event.d.requestId, 120);
+    const key = requestId ?? `t:${event.t}`;
+    if (kind === "backend.req.start") {
+      const span: BackendRequestSpan = removeUndefined({
+        requestId,
+        start: event.t,
+        end: Number.POSITIVE_INFINITY,
+        method: safeText(event.d.method, 20),
+        pathname: redactUrl(event.d.pathname),
+        route: redactUrl(event.d.route),
+      }) as BackendRequestSpan;
+      open.set(key, span);
+      spans.push(span);
+      continue;
+    }
+    const span = open.get(key);
+    if (!span) continue;
+    span.end = event.t;
+    span.status =
+      span.status ??
+      finiteNumber(event.d.statusCode) ??
+      (isRecord(event.d.error)
+        ? finiteNumber(event.d.error.statusCode)
+        : undefined);
+    open.delete(key);
+  }
+  return spans;
+}
+
+function backendRequestSpanAt(
+  spans: BackendRequestSpan[],
+  t: number,
+): BackendRequestSpan | undefined {
+  let found: BackendRequestSpan | undefined;
+  for (const span of spans) {
+    if (span.start > t || span.end < t) continue;
+    if (found) return undefined;
+    found = span;
+  }
+  return found;
 }
 
 function addBackendErrorCandidates(
@@ -2197,6 +2402,7 @@ function addBackendErrorCandidates(
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
 ): void {
+  const spans = collectBackendRequestSpans(events);
   // Backend errors are NOT summarized into the SessionIndex — scan raw events.
   // Shared dedupe namespace collapses a request that emits both backend.req.error
   // and backend.req.end into a single candidate (the higher score wins via dedupeDrafts).
@@ -2210,9 +2416,20 @@ function addBackendErrorCandidates(
     if (!isError && !isEnd) continue;
 
     const error = isRecord(event.d.error) ? event.d.error : undefined;
+    // A crash the process-level handler reported carries no request context of
+    // its own. When exactly one request was open at that instant, the
+    // middleware's own record of it supplies the missing where — including the
+    // correlation id, which makes the crash and the request error dedupe into
+    // one finding instead of arriving as two descriptions of one fault.
+    const enclosing =
+      event.k === "backend.uncaught"
+        ? backendRequestSpanAt(spans, event.t)
+        : undefined;
     const status =
-      finiteNumber(event.d.statusCode) ?? finiteNumber(error?.statusCode);
-    const requestId = safeText(event.d.requestId, 120);
+      finiteNumber(event.d.statusCode) ??
+      finiteNumber(error?.statusCode) ??
+      enclosing?.status;
+    const requestId = safeText(event.d.requestId, 120) ?? enclosing?.requestId;
 
     let detector: string;
     let severity: CandidateDraft["severity"];
@@ -2233,13 +2450,13 @@ function addBackendErrorCandidates(
       continue;
     }
 
-    const method = safeText(event.d.method, 20);
+    const method = safeText(event.d.method, 20) ?? enclosing?.method;
     // The concrete path first, the framework's route pattern only as a fallback.
     // A title reading "POST /:id/run" names five different endpoints at once, and
     // the same value keys the dedupe below, so distinct failing endpoints used to
     // collapse into one finding. `pathname` is on the same event.
-    const pathname = redactUrl(event.d.pathname);
-    const routePattern = redactUrl(event.d.route);
+    const pathname = redactUrl(event.d.pathname) ?? enclosing?.pathname;
+    const routePattern = redactUrl(event.d.route) ?? enclosing?.route;
     const route = pathname ?? routePattern;
     const errorCode = safeText(error?.code, 160) ?? safeText(error?.name, 160);
     const message = scrubText(error?.message, 220);
@@ -2251,7 +2468,7 @@ function addBackendErrorCandidates(
         method,
         route: titleUrl(route),
         errorClass: safeText(error?.name, 80) ?? safeText(error?.code, 80),
-        message,
+        headline: errorHeadline(error?.message, 100),
       }),
       severity,
       score,
@@ -9663,14 +9880,19 @@ function addBackendLogErrorCandidates(
         ? `${truncate(message, 90)} — ${truncate(errorMessage, 90)}`
         : (message ?? errorMessage ?? "message unavailable");
     const fields = isRecord(event.d.fields) ? event.d.fields : undefined;
-    const requestId = fields
-      ? safeText(
-          LOG_REQUEST_ID_FIELDS.map((name) => fields[name]).find(
-            (value) => typeof value === "string" || typeof value === "number",
-          ),
-          120,
-        )
-      : undefined;
+    // The SDK's own stamp is the join key the request span carries; the
+    // logger's field (pino's uuid) names a different id space, so it is only
+    // a fallback for logs captured outside any request.
+    const requestId =
+      safeText(event.d.requestId, 120) ??
+      (fields
+        ? safeText(
+            LOG_REQUEST_ID_FIELDS.map((name) => fields[name]).find(
+              (value) => typeof value === "string" || typeof value === "number",
+            ),
+            120,
+          )
+        : undefined);
 
     drafts.push({
       detector: "backend_log_error",

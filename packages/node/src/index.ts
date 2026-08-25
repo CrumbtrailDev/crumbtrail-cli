@@ -441,3 +441,18 @@ export type {
   BackendResponseCaptureOptions,
   BackendResponseLike,
 } from "./backend-response";
+
+// ── Ambient request context ──────────────────────────────────────────────────
+// Append-only block. Do not reorder the exports above.
+// The request a piece of backend evidence was produced inside, carried on the
+// async path so a log line stamps the SAME request id as the request span that
+// provoked it. The request recorders establish it; a host instrumenting its own
+// background work (a queue consumer resuming a request's job) can establish one
+// too, so that work's evidence joins the request that queued it.
+export {
+  getBackendRequestContext,
+  readRequestCorrelation,
+  runInBackendRequestContext,
+  updateBackendRequestContext,
+} from "./request-context";
+export type { BackendRequestContext } from "./request-context";

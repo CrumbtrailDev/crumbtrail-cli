@@ -366,3 +366,67 @@ describe("networkCollector – request callsite", () => {
     expect(req.d.stk).toBeTypeOf("string");
   });
 });
+
+// `net.res` used to carry `id` alone, so learning WHICH request failed meant
+// finding the paired `net.req` — and the pair is not guaranteed to survive. A
+// request that started before the retained window, or before a truncated
+// upload's cut, left its failing response standing alone, and the session index
+// recorded it as `{m:"", url:"", st:500}`. `net.err` has always carried method
+// and url; the response carries them for the same reason.
+describe("networkCollector – a response names its own request", () => {
+  let bus: EventBus;
+  let events: BugEvent[];
+  let cleanup: () => void;
+
+  beforeEach(() => {
+    bus = new EventBus();
+    events = [];
+    bus.subscribe((batch) => events.push(...batch));
+  });
+
+  afterEach(() => {
+    cleanup?.();
+    events = [];
+  });
+
+  it("stamps method and url on a fetch response", async () => {
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue(
+        new Response('{"error":"boom"}', {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    await globalThis.fetch("https://api.example.com/api/orders?limit=200", {
+      method: "POST",
+    });
+    bus.flush();
+
+    const [res] = events.filter((e) => e.k === "net.res");
+    expect(res.d.st).toBe(500);
+    expect(res.d.method).toBe("POST");
+    expect(String(res.d.url)).toContain("/api/orders");
+  });
+
+  it("redacts the response url with the same policy the request url gets", async () => {
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValue(new Response("{}", { status: 401 }));
+    cleanup = networkCollector(bus, DEFAULT_CONFIG);
+
+    await globalThis.fetch(
+      "https://api.example.com/api/auth/whoami?token=abcdef0123456789",
+    );
+    bus.flush();
+
+    const [req] = events.filter((e) => e.k === "net.req");
+    const [res] = events.filter((e) => e.k === "net.res");
+    expect(res.d.url).toBe(req.d.url);
+    // Route redaction keeps the endpoint; the credential still goes.
+    expect(String(res.d.url)).toContain("/api/auth/whoami");
+    expect(String(res.d.url)).not.toContain("abcdef0123456789");
+  });
+});

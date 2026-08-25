@@ -158,7 +158,7 @@ function isTransient(err: unknown): boolean {
 
 export interface RequestOptions {
   method?: string;
-  /** Bearer token (CLI `bl_cli_…` or Supabase). */
+  /** Bearer token (CLI `ctcli_…` or Supabase). */
   token?: string;
   /** JSON body — serialized and sent with application/json. */
   body?: unknown;

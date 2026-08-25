@@ -288,6 +288,15 @@ ordinary word survives is reported as `[REDACTED_KEY]`. A plain word in a key is
 makes two patterns tellable apart, so a key that spells out a person's name in ordinary letters is
 the one case this cannot catch.
 
+### Response identity (`net.res`)
+
+`net.res` carries `d.method` and `d.url` — the same values, under the same
+redaction, as the `net.req` it answers. A reader does not have to find the paired
+request to learn which endpoint a response came from, which matters because the
+pair is not guaranteed: a request that started before the retained window, or
+before a truncated upload's cut, leaves its response standing alone. `net.err`
+has always carried both for the same reason.
+
 ### Response body summaries (`net.res`)
 
 `net.res` keeps carrying the redacted response body as text in `d.body`. It also

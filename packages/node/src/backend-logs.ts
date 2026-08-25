@@ -1,6 +1,7 @@
 import nodeFs from "node:fs";
 import type { BugEvent } from "crumbtrail-core";
 import { redactTokenLikeString, redactValue } from "crumbtrail-core";
+import { readRequestCorrelation } from "./request-context";
 
 /**
  * Canonical event kind for one structured log line the backend wrote while
@@ -163,6 +164,16 @@ export function buildBackendLogEvent(
     sessionId?: string;
     sessionStartedAt?: number | Date;
     now?: number;
+    /**
+     * The request this line was written inside, when one was in flight.
+     *
+     * This is the join key. Without it a logged error and the browser click
+     * that provoked it share nothing an occurrence can be grouped on, and each
+     * half reports that no counterpart was found. `requestId` is the id the
+     * request's own `backend.req.*` events carry — the browser's trace id when
+     * a browser correlated the call — never a second id minted here.
+     */
+    requestId?: string;
   } = {},
 ): BugEvent {
   const now = Number.isFinite(context.now)
@@ -189,6 +200,7 @@ export function buildBackendLogEvent(
           }
         : null,
       ...(parsed.logger ? { logger: parsed.logger } : {}),
+      ...(context.requestId ? { requestId: context.requestId } : {}),
       ...(parsed.fields ? { fields: parsed.fields } : {}),
     },
   };
@@ -365,11 +377,22 @@ export function installBackendLogCapture(
     if (LEVEL_RANK[parsed.level] < floor) return;
     emitted += 1;
     try {
+      // Which request is being handled on this async path, if any. A pointer
+      // read on the current async resource, so it costs nothing on a write
+      // that turns out not to be a log line at all, and it never throws: a
+      // line written outside every request keeps exactly its old shape.
+      const correlation = readRequestCorrelation();
       options.emit(
         buildBackendLogEvent(parsed, {
-          sessionId: options.sessionId,
+          // A request a browser correlated owns the line written inside it:
+          // filing it to the process session instead is what put the log and
+          // the click it explains into two unjoinable halves.
+          sessionId: correlation?.sessionId ?? options.sessionId,
           sessionStartedAt: options.sessionStartedAt,
           now: options.now?.(),
+          ...(correlation?.requestId
+            ? { requestId: correlation.requestId }
+            : {}),
         }),
       );
     } catch {

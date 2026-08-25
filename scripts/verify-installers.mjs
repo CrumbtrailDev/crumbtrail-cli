@@ -182,7 +182,7 @@ async function runRecipeInproc({ name, packed, tmpRoot }) {
   phase("PASS", `${name}:stub-cloud`, `base=${stub.baseUrl}`);
 
   // Seed the login cache so the non-TTY run skips the browser/device flow.
-  seedAuthCache(xdgDir, { base: stub.baseUrl, token: "bl_cli_seeded_token" });
+  seedAuthCache(xdgDir, { base: stub.baseUrl, token: "ctcli_seeded_token" });
   // A STALE pre-wizardStart real session: the wizardStart poll filter must
   // ignore it (current code wrongly accepts it — that is fix #4's target).
   const staleId = "ses_stub_stale_pre_wizard";
@@ -406,7 +406,7 @@ async function runRecipeBinary({ name, packed, tmpRoot }) {
     tarballsDir,
     autoRealSession: true,
   });
-  seedAuthCache(xdgDir, { base: stub.baseUrl, token: "bl_cli_seeded_token" });
+  seedAuthCache(xdgDir, { base: stub.baseUrl, token: "ctcli_seeded_token" });
   stub.seedSession({
     id: "ses_stub_stale_pre_wizard",
     startedAt: Date.now() - 3_600_000,

@@ -258,7 +258,7 @@ describe("buildEvidenceCandidates — backend crash titles", () => {
     expect(cand.title).toBe("Backend error: connection terminated unexpectedly");
   });
 
-  it("keeps the endpoint form when a route is known, and names the error class too", () => {
+  it("keeps the endpoint form when a route is known, and names what the error said", () => {
     const [cand] = buildEvidenceCandidates(
       [
         {
@@ -270,6 +270,30 @@ describe("buildEvidenceCandidates — backend crash titles", () => {
             pathname: "/api/checkout",
             statusCode: 500,
             error: { name: "TypeError", message: "boom" },
+          },
+        },
+      ],
+      { start: 1000 },
+    );
+    // The message, not the class: the route already names the endpoint, so the
+    // suffix exists to separate one way it fails from another, and "boom"
+    // separates more of them than "TypeError" does. The class stays on the
+    // anchor, and is still the suffix when the error carried no message.
+    expect(cand.title).toBe("Backend HTTP 500 from POST /api/checkout: boom");
+  });
+
+  it("names the error class when the error carried no message", () => {
+    const [cand] = buildEvidenceCandidates(
+      [
+        {
+          t: 1000,
+          k: "backend.req.error",
+          d: {
+            requestId: "req-1",
+            method: "POST",
+            pathname: "/api/checkout",
+            statusCode: 500,
+            error: { name: "TypeError" },
           },
         },
       ],
@@ -312,5 +336,105 @@ describe("buildEvidenceCandidates — backend crash titles", () => {
     );
     expect(cand.title.startsWith("Backend Error: pool timeout")).toBe(true);
     expect(cand.title.length).toBeLessThanOrEqual(140);
+  });
+
+  it("keeps a stack out of the title when the message carries its own frames", () => {
+    const [cand] = buildEvidenceCandidates(
+      [
+        uncaught(1000, {
+          name: "Error",
+          message:
+            "Error: api exploded\n    at /private/tmp/app/index.js:38:40\n    at Layer.handle [as handle_request] (/private/tmp/app/node_modules/express/lib/router/layer.js:95:5)",
+        }),
+      ],
+      { start: 1000 },
+    );
+    expect(cand.title).toBe("Backend Error: api exploded");
+    expect(cand.anchor.message).toContain("index.js:38:40");
+  });
+
+  it("keeps a stack out of the title when the frames arrive on one line", () => {
+    // The shape the collapse produces before this ever runs: `safeText` turns
+    // every newline into a space, so a newline split alone is not a defence.
+    const [cand] = buildEvidenceCandidates(
+      [
+        uncaught(1000, {
+          name: "TypeError",
+          message:
+            "cannot read properties of undefined (reading 'total')    at /srv/app/cart.js:12:7    at Layer.handle (/srv/app/node_modules/express/lib/router/layer.js:95:5)",
+        }),
+      ],
+      { start: 1000 },
+    );
+    expect(cand.title).toBe(
+      "Backend TypeError: cannot read properties of undefined (reading 'total')",
+    );
+  });
+
+  it("keeps prose that merely contains the word at", () => {
+    const [cand] = buildEvidenceCandidates(
+      [uncaught(1000, { name: "Error", message: "checkout failed at step 2" })],
+      { start: 1000 },
+    );
+    expect(cand.title).toBe("Backend Error: checkout failed at step 2");
+  });
+
+  it("names the request a request-less crash happened inside", () => {
+    const candidates = buildEvidenceCandidates(
+      [
+        {
+          t: 900,
+          k: "backend.req.start",
+          d: {
+            requestId: "req-9",
+            method: "POST",
+            pathname: "/api/orders",
+            route: "/api/orders",
+          },
+        },
+        uncaught(1000, { name: "Error", message: "api exploded" }),
+        {
+          t: 1100,
+          k: "backend.req.end",
+          d: { requestId: "req-9", method: "POST", statusCode: 500 },
+        },
+      ],
+      { start: 900 },
+    );
+    const cand = candidates.find(
+      (c) => c.detector === "backend_request_error",
+    )!;
+    expect(cand.anchor.route).toBe("/api/orders");
+    expect(cand.anchor.method).toBe("POST");
+    expect(cand.anchor.status).toBe(500);
+    expect(cand.anchor.requestId).toBe("req-9");
+    expect(cand.title).toBe(
+      "Backend HTTP 500 from POST /api/orders: api exploded",
+    );
+  });
+
+  it("leaves a crash request-less when two requests were open at once", () => {
+    const candidates = buildEvidenceCandidates(
+      [
+        {
+          t: 900,
+          k: "backend.req.start",
+          d: { requestId: "req-a", method: "POST", pathname: "/api/orders" },
+        },
+        {
+          t: 950,
+          k: "backend.req.start",
+          d: { requestId: "req-b", method: "GET", pathname: "/api/me" },
+        },
+        uncaught(1000, { name: "Error", message: "api exploded" }),
+      ],
+      { start: 900 },
+    );
+    const cand = candidates.find(
+      (c) => c.detector === "backend_request_error",
+    )!;
+    expect(cand.anchor.route).toBeUndefined();
+    expect(cand.anchor.method).toBeUndefined();
+    expect(cand.title).toBe("Backend Error: api exploded");
   });
 });

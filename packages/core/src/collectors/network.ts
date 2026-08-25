@@ -781,8 +781,24 @@ function wrapFetch(
     // caused - the timeline would report the effects before the cause.
     const responseTime = now();
 
-    const resMetadata: Array<RedactionMetadata | undefined> = [];
-    const resData: Record<string, unknown> = { id, st: response.status, dur };
+    const resMetadata: Array<RedactionMetadata | undefined> = [urlResult.metadata];
+    // The response names its own request. `net.res` used to carry `id` alone, so
+    // every reader had to find the paired `net.req` to learn WHICH request
+    // failed - and the pair is not guaranteed to survive: a request that started
+    // before the capture window, before the ring buffer's oldest retained event,
+    // or before a truncated upload's cut leaves its response standing alone. The
+    // index then recorded the failure as `{m:"", url:"", st:500}` and every
+    // downstream title read "HTTP 500 from request unknown URL". `net.err`
+    // already carries method and url for exactly this reason, and the native SDK
+    // wire contract puts them on the response too; this makes the browser's
+    // failing response as self-describing as both.
+    const resData: Record<string, unknown> = {
+      id,
+      method,
+      url: urlResult.value,
+      st: response.status,
+      dur,
+    };
     if (fetchArgs.sessionId) resData.sessionId = fetchArgs.sessionId;
     if (fetchArgs.requestId) resData.requestId = fetchArgs.requestId;
     if (fetchArgs.traceId) resData.traceId = fetchArgs.traceId;
@@ -1297,9 +1313,15 @@ function wrapXHR(
 
     const emitResponse = () => {
       const dur = now() - meta.startTime;
-      const resMetadata: Array<RedactionMetadata | undefined> = [];
+      const resMetadata: Array<RedactionMetadata | undefined> = [
+        urlResult.metadata,
+      ];
+      // Self-describing for the same reason the fetch path is: see the comment
+      // on the fetch `net.res` payload.
       const resData: Record<string, unknown> = {
         id: meta.id,
+        method: meta.method,
+        url: urlResult.value,
         st: this.status,
         dur,
       };
@@ -1526,9 +1548,15 @@ function emitEarlyRecord(
     return;
   }
 
-  const resMetadata: Array<RedactionMetadata | undefined> = [];
+  const resMetadata: Array<RedactionMetadata | undefined> = [
+    urlResult.metadata,
+  ];
+  // Self-describing for the same reason the fetch path is: see the comment on
+  // the fetch `net.res` payload.
   const resData: Record<string, unknown> = {
     id,
+    method: record.method,
+    url: urlResult.value,
     st: record.status ?? 0,
     dur: record.dur,
     early: true,

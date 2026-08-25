@@ -80,7 +80,7 @@ export async function startStubCloud(opts) {
 
   /** @type {Array<{id:string,startedAt:string,serviceId:string|null,serviceName:string|null,finalizedAt:string|null}>} */
   const sessions = [];
-  let mintedToken = seededToken ?? "bl_cli_" + "s".repeat(48);
+  let mintedToken = seededToken ?? "ctcli_" + "s".repeat(48);
   let devicePolls = 0;
   /** GET /api/sessions count; read #0 is the poll's baseline snapshot. */
   let sessionsReads = 0;

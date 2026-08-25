@@ -30,6 +30,7 @@ import {
   clearProcessSessionId,
   setProcessSessionId,
 } from "./process-session";
+import { readRequestCorrelation } from "./request-context";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -405,10 +406,30 @@ export async function autoCapture(
     live: HeadlessSession,
     error: unknown,
     source: AutoCaptureSource,
-  ): Promise<void> =>
-    live
-      .record(buildErrorEvent(error, source))
+  ): Promise<void> => {
+    const event = buildErrorEvent(error, source);
+    // An error logged inside a browser correlated request belongs to that
+    // browser's session, exactly like the request's own events — otherwise the
+    // click and the sentence explaining it land in two sessions that share
+    // nothing. Only the logged path is re-routed: a crash is the process's own
+    // ending, and its bounded exit flush goes through the live session.
+    const correlated =
+      source === "console.error" ? readRequestCorrelation()?.sessionId : undefined;
+    if (correlated && correlated !== live.sessionId) {
+      return sendBackendEvent({
+        event: { ...event, sessionId: correlated },
+        sessionId: correlated,
+        endpoint: options.endpoint,
+        ...(authToken ? { authToken } : {}),
+        ...(options.fetchImpl ? { fetch: options.fetchImpl } : {}),
+      })
+        .then(() => undefined)
+        .catch((sendErr) => emitError(sendErr, { phase: "record", source }));
+    }
+    return live
+      .record(event)
       .catch((sendErr) => emitError(sendErr, { phase: "record", source }));
+  };
 
   // Best-effort record. Returns the in-flight record promise (already
   // `.catch`-guarded so it never rejects) so a crash handler can bound-flush it;
@@ -553,7 +574,33 @@ export async function autoCapture(
         minLevel: options.logLevel,
         ...options.logStreams,
         emit: (event) => {
-          if (stopped || !session) return;
+          if (stopped) return;
+          // A line written inside a browser correlated request belongs to the
+          // BROWSER's session, exactly like the request events themselves —
+          // that is the whole point of the join. Filing it to the process
+          // session instead is what produced two issues, the click's and the
+          // log's, each reporting no counterpart. The log capture resolves the
+          // target and stamps it on the event; anything it did not correlate
+          // still rides the headless session as before.
+          const correlated =
+            typeof event.sessionId === "string" &&
+            event.sessionId &&
+            event.sessionId !== stableSessionId
+              ? event.sessionId
+              : undefined;
+          if (correlated) {
+            void sendBackendEvent({
+              event,
+              sessionId: correlated,
+              endpoint: options.endpoint,
+              ...(authToken ? { authToken } : {}),
+              ...(options.fetchImpl ? { fetch: options.fetchImpl } : {}),
+            }).catch((sendErr) =>
+              emitError(sendErr, { phase: "record", source: "console.error" }),
+            );
+            return;
+          }
+          if (!session) return;
           void session
             .record(event)
             .catch((sendErr) =>
@@ -702,12 +749,18 @@ function generateSessionId(): string {
 
 function buildErrorEvent(error: unknown, source: AutoCaptureSource): BugEvent {
   const normalized = normalizeError(error);
+  // The request being handled when this was raised, when there was one. A
+  // `console.error` inside a handler is the same failure as the 500 the browser
+  // saw; without the request's id on it, the two are two issues that each
+  // report no counterpart found.
+  const correlation = readRequestCorrelation();
   return {
     t: Date.now(),
     k: AUTO_CAPTURE_ERROR_EVENT,
     d: {
       source,
       error: normalized,
+      ...(correlation?.requestId ? { requestId: correlation.requestId } : {}),
     },
   };
 }

@@ -8,6 +8,11 @@ import {
 import { claimBackendRequest } from "./backend-request-claim";
 import { getProcessSessionId } from "./process-session";
 import {
+  getBackendRequestContext,
+  runInBackendRequestContext,
+  updateBackendRequestContext,
+} from "./request-context";
+import {
   CRUMBTRAIL_REQUEST_HEADER,
   buildBackendRequestEndEvent,
   buildBackendRequestErrorEvent,
@@ -232,7 +237,25 @@ export function createCrumbtrailExpressMiddleware(
       attemptSend(startEvent, options, state.sessionId);
       attachFinishListener(req, res, options, state);
 
-      next();
+      // The rest of the chain — every later middleware, the route handler, and
+      // everything they await — runs knowing which request it is inside, so a
+      // log line the handler writes carries THIS request's id rather than a
+      // second one the logger minted. The claim above means this middleware's
+      // ids are the ones the request's events carry, so they overwrite an http
+      // recorder's store rather than deferring to it.
+      const correlation = {
+        requestId: state.requestId,
+        sessionId: state.sessionId,
+        sessionIdSource: sessionIdSourceOf(startEvent) ?? "missing",
+      };
+      if (getBackendRequestContext()) {
+        updateBackendRequestContext(correlation);
+        next();
+        return;
+      }
+      runInBackendRequestContext(correlation, () => {
+        next();
+      });
     };
 
   if (options.captureRuntimeWarnings !== false) {
@@ -275,10 +298,19 @@ export function createCrumbtrailExpressMiddleware(
         ...options.logStreams,
         emit: (event) => {
           const now = readNow(options);
+          // A line written INSIDE a request already resolved its own session
+          // and carries that request's id; the "most recent session" guess is
+          // only for lines written between requests. Preferring the guess here
+          // would refile a correlated line onto whichever session happened to
+          // be last, which on a server handling two users at once is the wrong
+          // one.
           const session =
-            lastSession && now - lastSession.atMs <= WARNING_SESSION_FRESH_MS
+            (typeof event.sessionId === "string" && event.sessionId
+              ? event.sessionId
+              : undefined) ??
+            (lastSession && now - lastSession.atMs <= WARNING_SESSION_FRESH_MS
               ? lastSession.sessionId
-              : undefined;
+              : undefined);
           // Same rule as the warning capture: the intake path addresses an
           // existing session, so a line with no live session is dropped rather
           // than misfiled onto one that plausibly ended.
@@ -424,6 +456,14 @@ function createMinimalState(
     now,
   });
   return stateFromEvent(event, now);
+}
+
+/** Where a built event's session id came from, per its own correlation record. */
+function sessionIdSourceOf(event: BugEvent): string | undefined {
+  const correlation = event.d.correlation;
+  if (correlation === null || typeof correlation !== "object") return undefined;
+  const source = (correlation as { sessionIdSource?: unknown }).sessionIdSource;
+  return typeof source === "string" ? source : undefined;
 }
 
 function stateFromEvent(event: BugEvent, startedAtMs: number): RequestState {
