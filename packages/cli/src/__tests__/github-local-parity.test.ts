@@ -18,6 +18,7 @@ import {
   localFsReader,
   defaultInjectIO,
   hydrateGithubReader,
+  prefetchImportClosure,
   githubInjectIO,
   type GithubTreeEntry,
   type GithubRepoSource,
@@ -141,7 +142,7 @@ describe("GitHub and local paths produce identical plans", () => {
       // detection must agree on what this project IS.
       expect(ghDetect.recipe).toBe(localRecipe);
       // Round two: the injection target only becomes known after detection.
-      await ghReader.prefetch([ghDetect.entryFile]);
+      await prefetchImportClosure(ghReader, [ghDetect.entryFile]);
       const ghPlan = buildPlan(
         {
           cwd: "/",
