@@ -31,10 +31,49 @@ Crumbtrail.init({
   httpEndpoint: "https://api.crumbtrail.ai",
   httpAuthToken: process.env.CRUMBTRAIL_KEY,
   remoteConfig: true,
+  // Backend origins this app calls. Leave it out only if your API is served
+  // from the same origin as the page. See below.
+  networkCorrelationAllowedOrigins: ["https://api.example.com"],
 });
 ```
 
 That's the whole integration — capture runs in the background from there.
+
+### Joining a backend on another origin
+
+Crumbtrail joins a frontend session to its backend requests by stamping three
+headers on outbound calls: `X-Crumbtrail-Session-Id`, `X-Crumbtrail-Request-Id`
+and W3C `traceparent`. Same origin calls are stamped automatically. Cross origin
+calls are stamped only when you list the backend origin:
+
+```ts
+Crumbtrail.init({
+  ...PRESET_PASSIVE,
+  networkCorrelationAllowedOrigins: [
+    "https://api.example.com",
+    "http://localhost:4000",
+  ],
+});
+```
+
+The default is an empty list, which means an app whose API lives on another host
+or port captures frontend evidence and backend evidence that never join: the
+session shows the failing click, the backend shows the failing request, and
+nothing connects them. If your frontend and API are separate services, this
+setting is required, not optional.
+
+The default is empty on purpose. Stamping every outbound request would send
+trace context to third party APIs the app happens to call, and would add a CORS
+preflight to requests that had none, so the origins are yours to name. The
+literal `"self"` is accepted as a stand in for the page's own origin.
+
+When a request would have been stamped but its origin is not listed, the SDK
+prints one `console.info` line naming that origin, once per origin per page, so
+a missing entry is visible in the browser console rather than silent.
+
+Your backend must also let the three headers through CORS, with
+`Access-Control-Allow-Headers` covering `x-crumbtrail-session-id`,
+`x-crumbtrail-request-id` and `traceparent`.
 
 ### Leaving the page
 
@@ -450,18 +489,21 @@ const crumbtrail = Crumbtrail.init({
 
 export function App() {
   return (
-    <CrumbtrailErrorBoundary logger={crumbtrail} fallback={<p>Something broke.</p>}>
+    <CrumbtrailErrorBoundary
+      logger={crumbtrail}
+      fallback={<p>Something broke.</p>}
+    >
       <Checkout />
     </CrumbtrailErrorBoundary>
   );
 }
 ```
 
-| Prop | Type | Description |
-| --- | --- | --- |
-| `logger` | `Crumbtrail` | The instance returned by `Crumbtrail.init()`. |
-| `children` | `ReactNode` | The subtree to guard. |
-| `fallback` | `ReactNode` | Optional UI to render after an error. |
+| Prop       | Type         | Description                                   |
+| ---------- | ------------ | --------------------------------------------- |
+| `logger`   | `Crumbtrail` | The instance returned by `Crumbtrail.init()`. |
+| `children` | `ReactNode`  | The subtree to guard.                         |
+| `fallback` | `ReactNode`  | Optional UI to render after an error.         |
 
 `useBugState` registers a value so it is attached to any bug flagged while the
 component is mounted:

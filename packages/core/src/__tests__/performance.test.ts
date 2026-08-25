@@ -265,7 +265,7 @@ describe("performanceCollector", () => {
     bus.flush();
     expect(events).toHaveLength(1);
     expect(events[0].d.name).toBe(
-      "https://example.com/api/data?token=%5BREDACTED%5D",
+      "https://example.com/api/data?token=[REDACTED]",
     );
     expect(JSON.stringify(events[0].d)).not.toContain(
       "sk_demo_12345678901234567890",

@@ -737,3 +737,149 @@ describe("the failing request url reaches the representative", () => {
     expect("url" in bug.frontendEvidence[0]).toBe(false);
   });
 });
+
+describe("evidence lanes are decided by the detector's name", () => {
+  function laneBug(detector: string, requestId: string) {
+    return candidate({
+      id: `cand_${detector}`,
+      detector,
+      title: `${detector} fired`,
+      severity: "high",
+      score: 90,
+      anchor: {
+        t: 1000,
+        offsetMs: 0,
+        route: "/checkout",
+        requestId,
+        method: "POST",
+        url: "/internal/invoices/finalize",
+        status: 500,
+        message: `${detector} message`,
+      },
+    });
+  }
+
+  it("files a backend_* detector on the backend lane, not the frontend one", () => {
+    const [bug] = groupDistinctBugs([
+      laneBug("backend_request_error", "req-backend"),
+    ]);
+    expect(bug.backendEvidence.map((ref) => ref.detector)).toEqual([
+      "backend_request_error",
+    ]);
+    expect(bug.frontendEvidence).toEqual([]);
+  });
+
+  it("keeps otel_* on the backend lane and otel_db_* on the db lane", () => {
+    const [span] = groupDistinctBugs([laneBug("otel_span_error", "req-span")]);
+    expect(span.backendEvidence.length).toBe(1);
+
+    const [db] = groupDistinctBugs([laneBug("otel_db_activity", "req-otel-db")]);
+    expect(db.dbDiffs?.map((ref) => ref.detector)).toEqual(["otel_db_activity"]);
+    expect(db.frontendEvidence).toEqual([]);
+  });
+
+  it("keeps db_* and duplicate_write on the db lane", () => {
+    for (const detector of [
+      "db_statement_failed",
+      "db_mutation",
+      "duplicate_write",
+    ]) {
+      const [bug] = groupDistinctBugs([laneBug(detector, `req-${detector}`)]);
+      expect(bug.dbDiffs?.map((ref) => ref.detector)).toEqual([detector]);
+    }
+  });
+
+  it("leaves a browser-observed detector on the frontend lane", () => {
+    for (const detector of ["http_error", "console_error", "network_error"]) {
+      const [bug] = groupDistinctBugs([laneBug(detector, `req-${detector}`)]);
+      expect(bug.frontendEvidence.map((ref) => ref.detector)).toEqual([
+        detector,
+      ]);
+      expect(bug.backendEvidence).toEqual([]);
+    }
+  });
+
+  it("counts each plane once for a full-stack bug correlated on one request", () => {
+    const [bug] = groupDistinctBugs([
+      laneBug("http_error", "req-full"),
+      laneBug("backend_request_error", "req-full"),
+      laneBug("db_statement_failed", "req-full"),
+    ]);
+    expect({
+      frontend: bug.frontendEvidence.length,
+      backend: bug.backendEvidence.length,
+      db: bug.dbDiffs?.length ?? 0,
+    }).toEqual({ frontend: 1, backend: 1, db: 1 });
+  });
+});
+
+describe("a query string is data, not identity", () => {
+  function searchFailure(id: string, url: string, t: number) {
+    return candidate({
+      id,
+      detector: "http_error",
+      title: `HTTP 404 from GET ${url}`,
+      severity: "medium",
+      score: 70,
+      anchor: {
+        t,
+        offsetMs: 0,
+        route: "/search",
+        requestId: id,
+        method: "GET",
+        url,
+        status: 404,
+      },
+    });
+  }
+
+  const plain = "https://api.example.com/v2/search";
+  const queried = "https://api.example.com/v2/search?q=%5BREDACTED%5D";
+
+  it("collapses two failures on one endpoint that differ only in query string", () => {
+    const bugs = groupDistinctBugs([
+      searchFailure("req-1", plain, 1000),
+      searchFailure("req-2", queried, 1200),
+    ]);
+    expect(bugs.length).toBe(1);
+  });
+
+  it("gives them one recurrence signature", () => {
+    expect(
+      buildDistinctBugSignature({
+        title: `HTTP 404 from GET ${plain}`,
+        representative: {
+          detector: "http_error",
+          title: `HTTP 404 from GET ${plain}`,
+          route: plain,
+          severity: "medium",
+        },
+      } as never),
+    ).toBe(
+      buildDistinctBugSignature({
+        title: `HTTP 404 from GET ${queried}`,
+        representative: {
+          detector: "http_error",
+          title: `HTTP 404 from GET ${queried}`,
+          route: queried,
+          severity: "medium",
+        },
+      } as never),
+    );
+  });
+
+  it("keeps the full url, query included, on the evidence payload", () => {
+    const [bug] = groupDistinctBugs([searchFailure("req-2", queried, 1200)]);
+    expect(bug.representative.url).toBe(queried);
+    expect(bug.frontendEvidence[0].url).toBe(queried);
+  });
+
+  it("still separates two different endpoints and two different statuses", () => {
+    expect(
+      groupDistinctBugs([
+        searchFailure("req-1", plain, 1000),
+        searchFailure("req-3", "https://api.example.com/v2/orders", 1200),
+      ]).length,
+    ).toBe(2);
+  });
+});

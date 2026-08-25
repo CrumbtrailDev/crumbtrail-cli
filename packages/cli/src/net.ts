@@ -26,15 +26,37 @@ export function normalizeBase(base: string): string {
 }
 
 /**
- * Map a resolved API base to the browser dashboard base for user-facing links.
- * Only the default cloud endpoint is rewritten (api → app host, which serves the
- * SPA); a custom `--endpoint` / CRUMBTRAIL_BASE_URL is returned unchanged, since
- * a self-host typically serves the API and dashboard from one origin.
+ * Env var that pins the browser dashboard origin.
+ *
+ * Last resort, and it exists because the deployment can be wrong about itself:
+ * the dashboard origin the cloud reports is its `PUBLIC_BASE_URL`, so a stack
+ * configured with the API origin there tells every CLI that the API host serves
+ * the dashboard, and every link the CLI prints 404s with nothing the user can
+ * do about it. This is the one lever that ends that, so it outranks everything.
  */
-export function dashboardBase(base: string, appBaseUrl?: string): string {
-  // What the deployment said about itself always wins. Guessing worked only for
-  // the hosted default: on a self-hosted or local stack the dashboard is a
-  // different port, and the guess sent every printed link to a 404.
+export const APP_URL_ENV_VAR = "CRUMBTRAIL_APP_URL";
+
+/**
+ * The single source of truth for the browser dashboard origin. Every
+ * user-facing link — the sign-in page, "mint a key here", the session
+ * deep-link — is built on what this returns, and nothing else may guess.
+ *
+ * Precedence: CRUMBTRAIL_APP_URL → what the deployment reported about itself →
+ * the hosted rewrite (api → app host, which serves the SPA). A custom
+ * `--endpoint` / CRUMBTRAIL_BASE_URL with nothing reported is returned
+ * unchanged, since a self-host typically serves API and dashboard from one
+ * origin.
+ */
+export function dashboardBase(
+  base: string,
+  appBaseUrl?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const override = env[APP_URL_ENV_VAR]?.trim();
+  if (override) return normalizeBase(override);
+  // What the deployment said about itself wins over guessing. Guessing worked
+  // only for the hosted default: on a self-hosted or local stack the dashboard
+  // is a different port, and the guess sent every printed link to a 404.
   if (appBaseUrl && appBaseUrl.trim()) return normalizeBase(appBaseUrl);
   return normalizeBase(base) === DEFAULT_ENDPOINT ? DEFAULT_APP_URL : base;
 }
@@ -176,7 +198,9 @@ async function rawRequest(
     signal: opts.signal,
   });
   const text = await res.text();
-  const retryAfterSeconds = parseRetryAfter(res.headers?.get?.("retry-after") ?? null);
+  const retryAfterSeconds = parseRetryAfter(
+    res.headers?.get?.("retry-after") ?? null,
+  );
   return {
     status: res.status,
     text,

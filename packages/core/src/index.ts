@@ -31,6 +31,7 @@ export {
   generateSpanId,
   generateTraceContext,
   canInjectCorrelationHeaders,
+  isCorrelationOriginHeaderRejected,
   resolveOutboundCorrelation,
 } from "./correlation";
 export type { W3CTraceContext, OutboundCorrelation } from "./correlation";

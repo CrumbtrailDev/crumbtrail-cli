@@ -126,7 +126,7 @@ describe("environment: PostHog-parity context fields", () => {
     ]);
     // Hash dropped, query values redacted — the arrival path survives, the payload does not.
     expect(bundle.environment?.referrer).toBe(
-      "https://news.example.com/story?utm_x=%5BREDACTED%5D",
+      "https://news.example.com/story?utm_x=[REDACTED]",
     );
   });
 

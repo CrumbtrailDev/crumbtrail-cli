@@ -150,7 +150,7 @@ describe("interactionCollector redaction", () => {
     );
     expect(initNav?.d).toMatchObject({
       from: "",
-      to: `http://localhost:3000/start?token=${encodeURIComponent(REDACTED_VALUE)}`,
+      to: `http://localhost:3000/start?token=${REDACTED_VALUE}`,
       toOrigin: "http://localhost:3000",
       frame: expect.objectContaining({
         top: true,
@@ -171,8 +171,8 @@ describe("interactionCollector redaction", () => {
       (event) => event.k === "nav" && event.d.tr === "push",
     );
     expect(pushNav?.d).toMatchObject({
-      from: `http://localhost:3000/start?token=${encodeURIComponent(REDACTED_VALUE)}`,
-      to: `http://localhost:3000/checkout?session=${encodeURIComponent(REDACTED_VALUE)}`,
+      from: `http://localhost:3000/start?token=${REDACTED_VALUE}`,
+      to: `http://localhost:3000/checkout?session=${REDACTED_VALUE}`,
       fromOrigin: "http://localhost:3000",
       toOrigin: "http://localhost:3000",
     });

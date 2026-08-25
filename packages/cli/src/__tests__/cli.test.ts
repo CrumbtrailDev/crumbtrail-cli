@@ -6,6 +6,7 @@ import {
   installSdk as realInstallSdk,
   isCliEntrypoint,
   parseArgs,
+  probeServiceKeys,
   resolveWorkspaceDir,
   runCli,
   type WizardDeps,
@@ -994,6 +995,76 @@ function batchDeps(
   );
 }
 
+// Defect class: a repo root with no framework of its own but real sibling
+// services. --help promises the root run scans every service; it used to print
+// "No supported framework" and tell the reader to cd into each directory.
+describe("batch installer (unlinked sibling services)", () => {
+  function siblingDeps(steps: string[], candidates: ServiceCandidate[]) {
+    const seen: { includeUnlinkedApps?: boolean }[] = [];
+    const deps = batchDeps(steps, candidates, {
+      detect: vi.fn(() => {
+        steps.push("detect");
+        // No workspaces, no recipe — the exact shape that used to dead-end.
+        return detectResult({
+          cwd: "/app",
+          isMonorepo: false,
+          ambiguous: true,
+          recipe: null,
+          entryFile: null,
+          reasons: ["looked in /app; package.json has no dependencies matching a recipe"],
+        });
+      }),
+      discoverServices: vi.fn(
+        (
+          _root: string,
+          _rootResult: DetectResult,
+          _reader: unknown,
+          over: { includeUnlinkedApps?: boolean } = {},
+        ) => {
+          steps.push("discover");
+          seen.push(over);
+          return over.includeUnlinkedApps ? candidates : [];
+        },
+      ) as unknown as WizardDeps["discoverServices"],
+    });
+    return { deps, seen };
+  }
+
+  it("offers both sibling services from the root instead of dead-ending", async () => {
+    const steps: string[] = [];
+    const { deps, seen } = siblingDeps(steps, [
+      candidate({ relDir: "admin", recipe: "vite-spa", source: "scan" }),
+      candidate({ relDir: "api", recipe: "hono", source: "scan" }),
+    ]);
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    const code = await runCli(["node", "cli", "--all"], deps);
+    expect(code).toBe(0);
+    const out = lines.join("\n");
+    expect(out).not.toContain("No supported framework");
+    expect(out).not.toContain("cd apps/web && npx crumbtrail");
+    expect(out).toContain("Repo root");
+    expect(steps).toContain("provision:admin");
+    expect(steps).toContain("provision:api");
+    // One login and one project for the pair, exactly like a real workspace.
+    expect(steps.filter((s) => s === "login")).toHaveLength(1);
+    expect(steps.filter((s) => s === "project")).toHaveLength(1);
+    expect(seen.every((o) => o.includeUnlinkedApps === true)).toBe(true);
+  });
+
+  it("still dead-ends honestly when nothing nearby is wireable", async () => {
+    const steps: string[] = [];
+    const { deps } = siblingDeps(steps, []);
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    const code = await runCli(["node", "cli"], deps);
+    expect(code).toBe(1);
+    expect(lines.join("\n")).toContain("No supported framework in /app");
+  });
+});
+
 describe("batch installer (monorepo root)", () => {
   it("wires every checked service: one login, one project, one poll", async () => {
     const steps: string[] = [];
@@ -1815,5 +1886,111 @@ describe("crumbtrail token", () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  });
+});
+
+describe("probeServiceKeys", () => {
+  const fail = (reason: string) => ({
+    ok: false as const,
+    endpoint: "http://cloud.example",
+    stages: [
+      { stage: "auth" as const, status: "fail" as const, reason, ms: 1 },
+    ],
+  });
+  const pass = {
+    ok: true as const,
+    endpoint: "http://cloud.example",
+    stages: [
+      { stage: "auth" as const, status: "pass" as const, reason: "", ms: 1 },
+    ],
+  };
+
+  it("probes the key each service carries, not the first one it can find", async () => {
+    // The shape that broke: one service's .env already held a dead legacy key,
+    // so it was recorded first, and the wizard probed THAT instead of the key
+    // it had just minted and written into the other eight.
+    const probed: string[] = [];
+    const verdicts = await probeServiceKeys(
+      [
+        {
+          name: "legacy",
+          write: {
+            status: "already-set",
+            varName: "CRUMBTRAIL_KEY",
+            probeKey: "bgk_stale",
+          },
+          where: "apps/legacy/.env",
+          mintUrl: "http://app.example/p/proj_1/setup",
+        },
+        {
+          name: "web",
+          write: { status: "written", probeKey: "ctkey_fresh" },
+        },
+        {
+          name: "api",
+          write: { status: "written", probeKey: "ctkey_fresh" },
+        },
+      ],
+      async (key) => {
+        probed.push(key);
+        return key === "bgk_stale"
+          ? fail("ingest key rejected: not accepted (HTTP 401)")
+          : pass;
+      },
+    );
+
+    // One probe per DISTINCT key: the fresh key is not re-probed per service.
+    expect(probed).toEqual(["bgk_stale", "ctkey_fresh"]);
+    // The rejection speaks only for the service holding the rejected key.
+    expect(verdicts.get("legacy")?.ok).toBe(false);
+    expect(verdicts.get("web")?.ok).toBe(true);
+    expect(verdicts.get("api")?.ok).toBe(true);
+  });
+
+  it("names a leftover key as a leftover, not as a failed install", async () => {
+    const verdicts = await probeServiceKeys(
+      [
+        {
+          name: "legacy",
+          write: {
+            status: "already-set",
+            varName: "CRUMBTRAIL_KEY",
+            probeKey: "bgk_stale",
+          },
+          where: "apps/legacy/.env",
+          mintUrl: "http://app.example/p/proj_1/setup",
+        },
+      ],
+      async () => fail("ingest key rejected: not accepted (HTTP 401)"),
+    );
+    const verdict = verdicts.get("legacy");
+    expect(verdict?.ok).toBe(false);
+    const note = verdict && !verdict.ok ? verdict.note : "";
+    expect(note).toContain("apps/legacy/.env");
+    expect(note).toContain("CRUMBTRAIL_KEY");
+    expect(note).toContain("http://app.example/p/proj_1/setup");
+    // The install itself was fine, so it must not claim otherwise.
+    expect(note).not.toContain("First-event wait skipped");
+  });
+
+  it("still calls a key this run wrote a failed install", async () => {
+    const verdicts = await probeServiceKeys(
+      [{ name: "web", write: { status: "written", probeKey: "ctkey_x" } }],
+      async () => fail("ingest key rejected: not accepted (HTTP 401)"),
+    );
+    const verdict = verdicts.get("web");
+    expect(verdict && !verdict.ok ? verdict.note : "").toContain(
+      "First-event wait skipped",
+    );
+  });
+
+  it("says nothing about a service with no key to probe", async () => {
+    const verdicts = await probeServiceKeys(
+      [{ name: "flutter", write: { status: "no-variable" } }],
+      async () => {
+        throw new Error("must not probe");
+      },
+    );
+    expect(verdicts.size).toBe(0);
   });
 });

@@ -211,7 +211,7 @@ describe("planEnvKeyWrite", () => {
     if (plan.kind !== "ready")
       throw new Error(`expected ready, got ${plan.kind}`);
     expect(plan.ignore?.path).toBe(path.join(ROOT, ".gitignore"));
-    expect(plan.ignore?.content).toContain(".env.local");
+    expect(plan.ignore?.entry).toBe(".env.local");
   });
 
   it("adds no .gitignore entry when the file is already excluded", () => {
@@ -241,7 +241,7 @@ describe("planEnvKeyWrite", () => {
     // The entry is the path FROM the repo root, since that is the .gitignore
     // it lands in — "apps/web/.env.local", never a bare ".env.local" that
     // would also swallow other packages' files.
-    expect(plan.ignore?.content).toContain("apps/web/.env.local");
+    expect(plan.ignore?.entry).toBe("apps/web/.env.local");
   });
 });
 
@@ -256,8 +256,14 @@ describe("buildEnvKeyEdits", () => {
     });
     const edits = buildEnvKeyEdits(plan, KEY);
     expect(edits).toHaveLength(2);
+    expect(edits[0]).toMatchObject({ kind: "write" });
+    if (edits[0].kind !== "write") throw new Error("expected a write edit");
     expect(edits[0].content).toContain(`${VAR}=${KEY}`);
-    expect(edits[1].path).toBe(path.join(ROOT, ".gitignore"));
+    expect(edits[1]).toEqual({
+      kind: "ignore-entry",
+      path: path.join(ROOT, ".gitignore"),
+      entry: ".env.local",
+    });
   });
 
   it("refuses a value that could not be written unquoted", () => {
@@ -293,14 +299,16 @@ describe("appendIgnoreEntry", () => {
 describe("applyEnvEdits", () => {
   it("writes every edit", () => {
     const io = fakeIO();
-    const written = applyEnvEdits(
+    const { written, ignoreEntriesAdded } = applyEnvEdits(
       [
-        { path: "/repo/.env", mode: "create", content: "A=1\n" },
-        { path: "/repo/.gitignore", mode: "create", content: ".env\n" },
+        { kind: "write", path: "/repo/.env", mode: "create", content: "A=1\n" },
+        { kind: "ignore-entry", path: "/repo/.gitignore", entry: ".env" },
       ],
       io,
     );
     expect(written).toHaveLength(2);
+    expect(ignoreEntriesAdded).toEqual([".env"]);
+    expect(io.files.get("/repo/.gitignore")).toContain(".env");
     expect(io.files.get("/repo/.env")).toBe("A=1\n");
   });
 
@@ -318,13 +326,60 @@ describe("applyEnvEdits", () => {
     expect(() =>
       applyEnvEdits(
         [
-          { path: "/repo/.env", mode: "update", content: "CHANGED=1\n" },
-          { path: "/repo/.gitignore", mode: "create", content: ".env\n" },
+          {
+            kind: "write",
+            path: "/repo/.env",
+            mode: "update",
+            content: "CHANGED=1\n",
+          },
+          { kind: "ignore-entry", path: "/repo/.gitignore", entry: ".env" },
         ],
         failing,
       ),
     ).toThrow(/disk full/);
     expect(io.files.get("/repo/.env")).toBe("ORIGINAL=1\n");
     expect(io.files.has("/repo/.gitignore")).toBe(false);
+  });
+
+  // The multi-service clobber: several services in one repo share one root
+  // .gitignore, and an entry rendered while planning is rendered from the same
+  // pre-image for all of them.
+  it("keeps every service's entry when several target one .gitignore", () => {
+    const io = fakeIO();
+    const services = ["services/api", "services/web", "services/worker"];
+    const plans = services.map((dir) =>
+      planEnvKeyWrite({
+        appDir: path.join(ROOT, dir),
+        repoRoot: ROOT,
+        varName: "CRUMBTRAIL_KEY",
+        io,
+      }),
+    );
+
+    const added: string[] = [];
+    for (const plan of plans) {
+      added.push(
+        ...applyEnvEdits(buildEnvKeyEdits(plan, KEY), io).ignoreEntriesAdded,
+      );
+    }
+
+    const ignore = io.files.get(path.join(ROOT, ".gitignore")) ?? "";
+    for (const dir of services) {
+      expect(io.files.get(path.join(ROOT, dir, ".env"))).toContain(KEY);
+      expect(ignore).toContain(`${dir}/.env`);
+    }
+    // And every entry announced is an entry that landed.
+    expect(added).toEqual(services.map((dir) => `${dir}/.env`));
+  });
+
+  it("reports no addition for an entry the file already lists", () => {
+    const io = fakeIO({ "/repo/.gitignore": ".env\n" });
+    const { written, ignoreEntriesAdded } = applyEnvEdits(
+      [{ kind: "ignore-entry", path: "/repo/.gitignore", entry: ".env" }],
+      io,
+    );
+    expect(written).toEqual([]);
+    expect(ignoreEntriesAdded).toEqual([]);
+    expect(io.files.get("/repo/.gitignore")).toBe(".env\n");
   });
 });

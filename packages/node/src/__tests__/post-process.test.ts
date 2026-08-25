@@ -1100,7 +1100,7 @@ describe("postProcess", async () => {
           requestId: "req-linked",
           sessionId: "sess-1",
           method: "POST",
-          url: "/api/checkout?token=%5BREDACTED%5D",
+          url: "/api/checkout?token=[REDACTED]",
           status: 502,
           durationMs: 60,
         }),
@@ -1110,7 +1110,7 @@ describe("postProcess", async () => {
           start: { t: 1010, k: "backend.req.start" },
           errorRef: { t: 1050, k: "backend.req.error" },
           method: "POST",
-          url: "/api/checkout?api_key=%5BREDACTED%5D",
+          url: "/api/checkout?api_key=[REDACTED]",
           pathname: "/api/checkout",
           route: "/api/checkout",
           statusCode: 502,
@@ -1165,10 +1165,10 @@ describe("postProcess", async () => {
     expect(markdown).toContain("req-linked");
     expect(markdown).toContain("sess-1");
     expect(markdown).toContain(
-      "POST; /api/checkout?token=%5BREDACTED%5D; 60 ms",
+      "POST; /api/checkout?token=[REDACTED]; 60 ms",
     );
     expect(markdown).toContain(
-      "POST; /api/checkout?api_key=%5BREDACTED%5D; 40 ms; linked; UPSTREAM_FAILED",
+      "POST; /api/checkout?api_key=[REDACTED]; 40 ms; linked; UPSTREAM_FAILED",
     );
     expect(markdown).toContain("502 / 502");
 
@@ -1202,7 +1202,7 @@ describe("postProcess", async () => {
       sessionId: "sess-1",
       frontend: expect.objectContaining({
         method: "GET",
-        url: "/api/frontend-only?token=%5BREDACTED%5D",
+        url: "/api/frontend-only?token=[REDACTED]",
         status: 200,
       }),
     });
@@ -1235,7 +1235,7 @@ describe("postProcess", async () => {
     expect(markdown).toContain("frontend-only");
     expect(markdown).toContain("req-front");
     expect(markdown).toContain(
-      "GET; /api/frontend-only?token=%5BREDACTED%5D; 10 ms",
+      "GET; /api/frontend-only?token=[REDACTED]; 10 ms",
     );
     expect(markdown).toContain("backend-generated-request-id");
     expect(markdown).toContain("backend_req_1");
@@ -2122,7 +2122,7 @@ describe("postProcess", async () => {
         t: 2060,
         m: "POST",
         st: 502,
-        url: "https://api.example.test/pay?token=%5BREDACTED%5D",
+        url: "https://api.example.test/pay?token=[REDACTED]",
       }),
     ]);
     expect(index.networkErrors).toEqual([

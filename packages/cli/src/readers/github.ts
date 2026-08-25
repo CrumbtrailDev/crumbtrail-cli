@@ -53,6 +53,12 @@ const ROOT = "/";
  */
 const DIR_MANIFEST = [
   "package.json",
+  // Read for `compilerOptions.outDir`/`rootDir`: entry resolution refuses build
+  // output as an injection target, and the outDir is where a package declares
+  // which directory that is.
+  "tsconfig.json",
+  "tsconfig.build.json",
+  "tsconfig.app.json",
   "pnpm-workspace.yaml",
   "nx.json",
   "project.json",

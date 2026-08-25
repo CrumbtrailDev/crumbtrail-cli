@@ -8,9 +8,21 @@
 
 import path from "node:path";
 import type { Stack } from "crumbtrail-core";
+import {
+  parsePnpmWorkspace,
+  resolveWorkspacePackageManager,
+  type PackageManager,
+  type PackageManagerResolution,
+} from "./install/workspace-package-manager";
 import { localFsReader } from "./readers/local-fs";
 import type { FileReader } from "./readers/types";
 
+export {
+  parsePnpmWorkspace,
+  resolveWorkspacePackageManager,
+  type PackageManagerResolution,
+  type PackageManagerSource,
+} from "./install/workspace-package-manager";
 export { localFsReader } from "./readers/local-fs";
 export type { FileReader } from "./readers/types";
 
@@ -42,7 +54,7 @@ export type Recipe =
   // VARIABLE detected `Stack` out of detection via `DetectResult.otlpStack`.
   | "otlp";
 
-export type PackageManager = "pnpm" | "yarn" | "bun" | "npm";
+export type { PackageManager } from "./install/workspace-package-manager";
 
 export interface WorkspacePackage {
   /** package.json `name`, falling back to the directory basename. */
@@ -57,6 +69,13 @@ export interface DetectResult {
   /** Winning recipe, or null when nothing matched. */
   recipe: Recipe | null;
   packageManager: PackageManager | null;
+  /**
+   * The full workspace-scoped decision behind `packageManager`: where it was
+   * decided, what decided it, and any lockfile inside a workspace member that
+   * was deliberately ignored. Optional only so hand-built fixtures stay valid;
+   * `detect()` always sets it.
+   */
+  packageManagerInfo?: PackageManagerResolution;
   /**
    * Absolute path to the file the recipe would edit (vite-spa / node), when it
    * could be resolved with confidence. null for create-a-new-file recipes and
@@ -95,6 +114,7 @@ export interface DetectResult {
 interface PackageJson {
   name?: string;
   main?: string;
+  module?: string;
   bin?: string | Record<string, string>;
   scripts?: Record<string, string>;
   dependencies?: Record<string, string>;
@@ -119,48 +139,18 @@ function readPackageJson(dir: string, reader: FileReader): PackageJson | null {
   }
 }
 
-/** Walk up from `startDir` to the filesystem root looking for a known lockfile. */
+/**
+ * The package manager every install in this run must use.
+ *
+ * Resolved from the WORKSPACE, not from `startDir` — see
+ * `install/workspace-package-manager.ts` for why a per-directory answer split
+ * one wizard run across two package managers and damaged the repo.
+ */
 export function detectPackageManager(
   startDir: string,
   reader: FileReader = localFsReader(startDir),
 ): PackageManager | null {
-  let dir = path.resolve(startDir);
-
-  while (true) {
-    if (reader.isFile(path.join(dir, "pnpm-lock.yaml"))) return "pnpm";
-    if (
-      reader.isFile(path.join(dir, "bun.lockb")) ||
-      reader.isFile(path.join(dir, "bun.lock"))
-    )
-      return "bun";
-    if (reader.isFile(path.join(dir, "yarn.lock"))) return "yarn";
-    if (reader.isFile(path.join(dir, "package-lock.json"))) return "npm";
-    const parent = path.dirname(dir);
-    if (dir === reader.root || parent === dir) return null;
-    dir = parent;
-  }
-}
-
-/** Extract the `packages:` list from a pnpm-workspace.yaml without a YAML dep. */
-export function parsePnpmWorkspace(text: string): string[] {
-  const out: string[] = [];
-  let inPackages = false;
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.replace(/#.*$/, "");
-    if (/^packages\s*:/.test(line)) {
-      inPackages = true;
-      continue;
-    }
-    if (!inPackages) continue;
-    const item = line.match(/^\s*-\s*["']?([^"'#]+?)["']?\s*$/);
-    if (item) {
-      out.push(item[1].trim());
-      continue;
-    }
-    // A new, non-indented top-level key ends the packages block.
-    if (/^\S/.test(line)) inPackages = false;
-  }
-  return out;
+  return resolveWorkspacePackageManager(startDir, reader).manager;
 }
 
 function expandWorkspaceGlobs(
@@ -353,33 +343,195 @@ export function resolveReactNativeEntry(
   return null;
 }
 
-/** Pull a node script/module path out of a `start`-style command. */
+/** Node runners whose next non-flag file argument is the module being run. */
+const NODE_RUNNERS = new Set([
+  "node",
+  "nodemon",
+  "ts-node",
+  "ts-node-dev",
+  "tsx",
+  "swc-node",
+  "babel-node",
+  "bun",
+  "deno",
+]);
+
+const JS_FILE_RE = /\.[cm]?[jt]sx?$/;
+
+/**
+ * Pull a node script/module path out of a `start`-style command.
+ *
+ * Tokenized rather than matched in one regex because real dev scripts put
+ * non-flag words between the runner and the file — `tsx watch src/index.ts`,
+ * `nodemon --exec ts-node src/index.ts` — and the old single-regex form
+ * silently returned null for every one of them, which is what sent `hono`
+ * detection to `main` (a build artifact) instead of the source entry.
+ */
 export function parseNodeInvocation(script: string): string | null {
-  const m = script.match(
-    /\b(?:node|nodemon|ts-node|tsx)\b(?:\s+(?:--?[^\s]+))*\s+([^\s&|]+\.[cm]?[jt]s)\b/,
+  // Only the first command in a chain runs the app; `&& tsc` is not an entry.
+  const head = script.split(/&&|\|\||[;|&]/)[0];
+  const tokens = head.trim().split(/\s+/).filter(Boolean);
+  const runnerAt = tokens.findIndex((t) =>
+    NODE_RUNNERS.has(t.replace(/^.*\//, "")),
   );
-  return m ? m[1] : null;
+  if (runnerAt < 0) return null;
+  for (const token of tokens.slice(runnerAt + 1)) {
+    if (token.startsWith("-")) continue;
+    if (JS_FILE_RE.test(token)) return token;
+  }
+  return null;
 }
 
+/** Directory names that only ever hold compiler/bundler output. */
+const BUILD_OUTPUT_DIRS = new Set([
+  "dist",
+  "build",
+  "out",
+  "output",
+  ".next",
+  ".nuxt",
+  ".output",
+  ".svelte-kit",
+  ".vercel",
+  ".netlify",
+  ".turbo",
+  "coverage",
+]);
+
+const TSCONFIG_FILES = [
+  "tsconfig.json",
+  "tsconfig.build.json",
+  "tsconfig.app.json",
+];
+
+/** `compilerOptions.outDir` values declared by this package's tsconfigs. */
+function tsconfigPaths(
+  cwd: string,
+  reader: FileReader,
+  field: "outDir" | "rootDir",
+): string[] {
+  const found: string[] = [];
+  for (const file of TSCONFIG_FILES) {
+    const text = safeRead(path.join(cwd, file), reader);
+    if (!text) continue;
+    // Text-scanned, not parsed: tsconfig is JSONC and a JSON.parse would throw
+    // on the comments every generated tsconfig ships with.
+    const m = text.match(new RegExp(`"${field}"\\s*:\\s*"([^"]+)"`));
+    if (m) found.push(m[1]);
+  }
+  return found;
+}
+
+function isWithin(parent: string, child: string): boolean {
+  const rel = path.relative(parent, child);
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/**
+ * Is `candidate` a build artifact rather than a source file?
+ *
+ * Injecting into build output is silent zero capture: the next `tsc`/bundler
+ * run deletes the edit, and a dev command that runs the source never loads it
+ * at all. So build output is refused as an injection target as a CLASS — by
+ * directory name and by every tsconfig `outDir` this package declares — not
+ * case by case.
+ */
+export function isBuildOutputPath(
+  cwd: string,
+  candidate: string,
+  reader: FileReader = localFsReader(cwd),
+): boolean {
+  const root = path.resolve(cwd);
+  const abs = path.resolve(candidate);
+  const rel = path.relative(root, abs);
+  // Outside the package: not this package's build shape to judge.
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return false;
+  const dirs = rel.split(path.sep).slice(0, -1);
+  if (dirs.some((d) => BUILD_OUTPUT_DIRS.has(d))) return true;
+  for (const outDir of tsconfigPaths(root, reader, "outDir")) {
+    if (isWithin(path.resolve(root, outDir), abs)) return true;
+  }
+  return false;
+}
+
+/** Dev-first script order: what actually runs in development wins. */
+const ENTRY_SCRIPT_KEYS = [
+  "dev",
+  "start:dev",
+  "dev:server",
+  "develop",
+  "start",
+  "serve",
+  "start:prod",
+];
+
+/**
+ * Resolve the SOURCE entry a Node-flavoured backend actually runs.
+ *
+ * Order is load-bearing. `main`/`bin` on a TypeScript service point at the
+ * compiled artifact (`dist/index.js`), so the dev/start scripts — the commands
+ * that really boot the app — are consulted first, then the manifest fields,
+ * then the conventional source entry under the tsconfig `rootDir`. Any
+ * candidate that resolves inside build output is discarded outright: returning
+ * null sends the caller to the manual-snippet fallback, which is honest, where
+ * returning `dist/index.js` looks like success and captures nothing.
+ */
 function resolveNodeEntry(
   cwd: string,
   pkg: PackageJson,
   reader: FileReader,
+  reasons?: string[],
 ): string | null {
   const candidates: string[] = [];
+  const scripts = pkg.scripts ?? {};
+  for (const key of ENTRY_SCRIPT_KEYS) {
+    const script = scripts[key];
+    if (typeof script !== "string") continue;
+    const fromScript = parseNodeInvocation(script);
+    if (fromScript) candidates.push(fromScript);
+  }
   if (typeof pkg.main === "string") candidates.push(pkg.main);
+  if (typeof pkg.module === "string") candidates.push(pkg.module);
   if (typeof pkg.bin === "string") candidates.push(pkg.bin);
   else if (pkg.bin && typeof pkg.bin === "object") {
     const first = Object.values(pkg.bin)[0];
     if (first) candidates.push(first);
   }
-  if (pkg.scripts?.start) {
-    const fromStart = parseNodeInvocation(pkg.scripts.start);
-    if (fromStart) candidates.push(fromStart);
-  }
+  const rejected: string[] = [];
   for (const c of candidates) {
     const full = path.join(cwd, c);
-    if (reader.isFile(full)) return full;
+    if (!reader.isFile(full)) continue;
+    if (isBuildOutputPath(cwd, full, reader)) {
+      if (!rejected.includes(c)) rejected.push(c);
+      continue;
+    }
+    return full;
+  }
+  if (rejected.length === 0) return null;
+
+  // Every declared entry was build output. Only now — never as a general
+  // widening of the `node` matcher — look for the conventional source entry
+  // under the tsconfig `rootDir`, so a TypeScript service whose only manifest
+  // pointer is `dist/` still gets wired where the source lives.
+  for (const dir of [...tsconfigPaths(cwd, reader, "rootDir"), "src"]) {
+    for (const base of ["index", "main", "server", "app"]) {
+      for (const ext of [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]) {
+        const full = path.join(cwd, dir, base + ext);
+        if (reader.isFile(full) && !isBuildOutputPath(cwd, full, reader)) {
+          if (reasons) {
+            reasons.push(
+              `package.json pointed at build output (${rejected.join(", ")}); wiring the source entry instead`,
+            );
+          }
+          return full;
+        }
+      }
+    }
+  }
+  if (reasons) {
+    reasons.push(
+      `refused build output as an injection target (${rejected.join(", ")}) — a build would erase the edit and the dev command never loads it`,
+    );
   }
   return null;
 }
@@ -773,7 +925,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!("express" in deps) || !pkg) return null;
       reasons.push("found `express` dependency");
       return {
-        entryFile: resolveNodeEntry(root, pkg, reader),
+        entryFile: resolveNodeEntry(root, pkg, reader, reasons),
         nextVersion: null,
       };
     },
@@ -784,7 +936,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!("hono" in deps) || !pkg) return null;
       reasons.push("found `hono` dependency");
       return {
-        entryFile: resolveNodeEntry(root, pkg, reader),
+        entryFile: resolveNodeEntry(root, pkg, reader, reasons),
         nextVersion: null,
       };
     },
@@ -795,7 +947,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!("fastify" in deps) || !pkg) return null;
       reasons.push("found `fastify` dependency");
       return {
-        entryFile: resolveNodeEntry(root, pkg, reader),
+        entryFile: resolveNodeEntry(root, pkg, reader, reasons),
         nextVersion: null,
       };
     },
@@ -819,7 +971,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
     "node",
     ({ root, pkg, reasons, reader }) => {
       if (!pkg) return null;
-      const nodeEntry = resolveNodeEntry(root, pkg, reader);
+      const nodeEntry = resolveNodeEntry(root, pkg, reader, reasons);
       if (!nodeEntry) return null;
       reasons.push("resolved a Node server entry from package.json");
       return { entryFile: nodeEntry, nextVersion: null };
@@ -886,7 +1038,6 @@ export function matchRecipe(ctx: MatchContext): {
   return { recipe: null, entryFile: null, nextVersion: null, otlpStack: null };
 }
 
-
 const NEARBY_SKIP = new Set([
   "node_modules",
   "dist",
@@ -951,7 +1102,9 @@ function describeNoRecipe(
   }
   const shown = names.slice(0, 8);
   const extra =
-    names.length > shown.length ? `, and ${names.length - shown.length} more` : "";
+    names.length > shown.length
+      ? `, and ${names.length - shown.length} more`
+      : "";
   return `looked in ${root}; package.json has no matching framework dependency (found ${shown.join(", ")}${extra})`;
 }
 
@@ -970,7 +1123,8 @@ export function detect(
     ? path.join(root, "package.json")
     : null;
   const pkg = packageJsonPath ? readPackageJson(root, reader) : null;
-  const packageManager = detectPackageManager(root, reader);
+  const packageManagerInfo = resolveWorkspacePackageManager(root, reader);
+  const packageManager = packageManagerInfo.manager;
 
   const workspaces = detectWorkspaces(root, pkg, reader);
   const isMonorepo = !!workspaces && workspaces.length > 0;
@@ -994,13 +1148,25 @@ export function detect(
   const otlpStack: Stack | null = match.otlpStack;
 
   let ambiguous = false;
-  if (isMonorepo) {
+  // A root package that is ITSELF a runnable app — a Hono/Express API whose dev
+  // script points at a source entry, with the frontend as the only declared
+  // workspace — is the common "root API + nested web app" layout. Blanking its
+  // match because a workspace file exists made the root invisible to the batch
+  // scan, so full stack capture was unreachable from setup on that layout. The
+  // proof required is the resolved entry: a root that only carries framework
+  // deps for tooling never resolves one, and stays ambiguous exactly as before.
+  const rootIsOwnApp = isMonorepo && recipe != null && match.entryFile != null;
+  if (isMonorepo && !rootIsOwnApp) {
     // A workspace root can carry framework deps too, but there is no single app
     // to wire — force the caller to pick a workspace. Don't guess an entry.
     ambiguous = true;
     entryFile = null;
     reasons.push(
       `monorepo root with ${workspaces!.length} workspace package(s); pick a workspace to wire`,
+    );
+  } else if (rootIsOwnApp) {
+    reasons.push(
+      `monorepo root with ${workspaces!.length} workspace package(s); the root package is itself a runnable ${recipe} service, so it is wireable alongside them`,
     );
   } else if (!recipe) {
     ambiguous = true;
@@ -1038,6 +1204,7 @@ export function detect(
     packageJsonPath,
     recipe,
     packageManager,
+    packageManagerInfo,
     entryFile,
     nextVersion,
     otlpStack,

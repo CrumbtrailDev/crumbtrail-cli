@@ -90,13 +90,15 @@ describe("declared keep fields at rest", () => {
 
   it("ignores a malformed or oversized declaration", () => {
     const body = storedBody(
-      v2({ error: "handler threw" }, [
+      // Not a plain sentence: a value that only a valid declaration could keep,
+      // so the assertion tests the declaration rather than the free-text rules.
+      v2({ error: "42P01: relation _result_2 does not exist" }, [
         "x".repeat(200),
         "not a field\n",
         ...Array.from({ length: 80 }, (_, i) => `pad${i}`),
       ]),
     );
-    expect(body.error).not.toBe("handler threw");
+    expect(body.error).not.toBe("42P01: relation _result_2 does not exist");
   });
 
   it("does not re-wrap a value an earlier pass already placeholdered", () => {

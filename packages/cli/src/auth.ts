@@ -17,7 +17,13 @@ import {
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { ApiError, requestJson } from "./net";
+import {
+  APP_URL_ENV_VAR,
+  ApiError,
+  dashboardBase,
+  normalizeBase,
+  requestJson,
+} from "./net";
 import { color, readStdinLine, type Ui } from "./ui";
 import { ok } from "./theme";
 
@@ -328,7 +334,7 @@ export async function fetchIdentity(
       ...(str(me?.userId) ? { userId: str(me?.userId) } : {}),
       ...(str(me?.tenantId) ? { tenantId: str(me?.tenantId) } : {}),
       ...(str(me?.email) ? { email: str(me?.email) } : {}),
-      ...(str(me?.workspaceName) ?? str(me?.tenantName)
+      ...((str(me?.workspaceName) ?? str(me?.tenantName))
         ? { workspaceName: str(me?.workspaceName) ?? str(me?.tenantName) }
         : {}),
     };
@@ -388,7 +394,20 @@ const sleep = (ms: number): Promise<void> =>
 export async function loginBrowser(opts: LoginOptions): Promise<TokenResponse> {
   const { verifier, challenge } = pkcePair();
   const server = await startCallbackServer();
-  const authorizeUrl = `${opts.base}/cli/authorize?port=${server.port}&challenge=${challenge}`;
+  // /cli/authorize is a DASHBOARD route. Building it on `opts.base` pointed it
+  // at the API host, which never serves the SPA, so the browser this flow opens
+  // landed on a 404 in every deployment — hosted included — and the CLI then
+  // sat waiting five minutes for an approval the user could not give.
+  const appBase = dashboardBase(opts.base, undefined, opts.env ?? process.env);
+  const authorizeUrl = `${appBase}/cli/authorize?port=${server.port}&challenge=${challenge}`;
+  const missing = await signInPageMissing(authorizeUrl, opts.fetchImpl);
+  if (missing) {
+    // Opening a 404 and then waiting on it is the worst of both. Bail out so
+    // the device flow gets its turn: that one is told the dashboard origin by
+    // the deployment instead of deriving it.
+    server.close();
+    throw new Error(missing);
+  }
   const open = opts.openFn ?? openBrowser;
   const opened = await open(authorizeUrl);
   if (!opened) {
@@ -501,19 +520,31 @@ export async function loginDevice(opts: LoginOptions): Promise<TokenResponse> {
     body: {},
     fetchImpl: opts.fetchImpl,
   });
+  // The dashboard origin, resolved ONCE here and reused for every link this
+  // login and the wizard after it will print. `verificationUri` is a dashboard
+  // route, so the origin serving it IS the app host — but CRUMBTRAIL_APP_URL
+  // outranks it, because a deployment whose PUBLIC_BASE_URL points at its own
+  // API host reports an origin that serves no dashboard at all.
+  const appBaseUrl = dashboardBase(
+    opts.base,
+    appOriginOf(device.verificationUri),
+    opts.env ?? process.env,
+  );
+  const activateUrl = signInUrl(appBaseUrl, device.verificationUri);
+
   opts.ui.out("");
   opts.ui.out(`To authorize this CLI, visit:`);
-  opts.ui.out(`  ${color.brand(device.verificationUri)}`);
+  opts.ui.out(`  ${color.brand(activateUrl)}`);
   opts.ui.out(
     `and enter the code:  ${color.bold(color.brandLift(device.userCode))}`,
   );
+  const missing = await signInPageMissing(activateUrl, opts.fetchImpl);
+  if (missing) {
+    // Never leave someone staring at a link that cannot work. Naming the lever
+    // is the difference between a stuck login and a fixed one.
+    opts.ui.out(color.yellow(`! ${missing}`));
+  }
   opts.ui.out(color.dim("Waiting for approval…"));
-
-  // The dashboard origin, straight from the deployment: `verificationUri` is a
-  // dashboard route, so the origin serving it IS the app host. Locally the API
-  // and the app are different ports, and without this every link the wizard
-  // printed afterwards ("Dashboard: …/issues") pointed at the API and 404ed.
-  const appBaseUrl = appOriginOf(device.verificationUri);
 
   const intervalMs = opts.pollIntervalMs ?? Math.max(1, device.interval) * 1000;
   const windowMs = opts.pollWindowMs ?? POLL_WINDOW_MS;
@@ -547,10 +578,10 @@ export async function loginDevice(opts: LoginOptions): Promise<TokenResponse> {
           retry: false,
         },
       );
-      return {
-        ...minted,
-        ...(minted.appBaseUrl || !appBaseUrl ? {} : { appBaseUrl }),
-      };
+      // The resolved origin wins over whatever the token response repeated:
+      // it already deferred to the deployment, and if it did not, that is the
+      // user's CRUMBTRAIL_APP_URL saying the deployment is wrong.
+      return { ...minted, appBaseUrl };
     } catch (err) {
       if (err instanceof ApiError && err.code === "authorization_pending") {
         continue;
@@ -591,16 +622,63 @@ export function appOriginOf(verificationUri: string): string | undefined {
   }
 }
 
+/**
+ * Put a sign-in URL on the dashboard origin, keeping the path the server chose.
+ * The path is the deployment's business; the origin is ours, because only one
+ * host in a split deployment serves the SPA these routes live in.
+ */
+export function signInUrl(appBase: string, uriOrPath: string): string {
+  const base = normalizeBase(appBase);
+  try {
+    const parsed = new URL(uriOrPath);
+    return `${base}${parsed.pathname}${parsed.search}`;
+  } catch {
+    return `${base}${uriOrPath.startsWith("/") ? "" : "/"}${uriOrPath}`;
+  }
+}
+
+/**
+ * Confirm a sign-in page exists before sending someone to it, and return the
+ * line to show when it does not.
+ *
+ * Only a 404 counts. A redirect to a login screen, a 401, a 5xx, or no answer
+ * at all are all things a working dashboard does; a 404 means this origin does
+ * not serve the page, which is the one failure the user can actually fix.
+ */
+export async function signInPageMissing(
+  url: string,
+  fetchImpl?: typeof fetch,
+): Promise<string | undefined> {
+  let status: number;
+  try {
+    const doFetch = fetchImpl ?? fetch;
+    const res = await doFetch(url, { method: "GET" });
+    status = res.status;
+  } catch {
+    return undefined;
+  }
+  if (status !== 404) return undefined;
+  const origin = appOriginOf(url) ?? url;
+  return (
+    `${url} returns 404 — ${origin} is not serving Crumbtrail's dashboard. ` +
+    `Set ${APP_URL_ENV_VAR} to your dashboard URL and run \`crumbtrail login\` again.`
+  );
+}
+
 /** Pick the login flow: browser hand-off when viable, else device fallback. */
 export async function login(opts: LoginOptions): Promise<TokenResponse> {
   const env = opts.env ?? process.env;
   if (canUseBrowser(opts.noBrowser ?? false, env)) {
     try {
       return await loginBrowser(opts);
-    } catch {
+    } catch (err) {
+      // Say WHY. "Unavailable" alone sent people looking at their browser when
+      // the real cause was a dashboard origin that serves no sign-in page.
+      const why =
+        err instanceof Error && err.message ? ` (${err.message})` : "";
       opts.ui.out(
         color.dim(
-          "Browser hand-off unavailable — falling back to device code.",
+          `Browser hand-off unavailable${why} — falling back to device code.`,
         ),
       );
       return loginDevice(opts);
@@ -654,7 +732,11 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
   if (stored && stored.token && stored.endpoint === opts.base) {
     const state = await validateToken(opts.base, stored.token, opts.fetchImpl);
     if (state === "valid") {
-      const identity = await fetchIdentity(opts.base, stored.token, opts.fetchImpl);
+      const identity = await fetchIdentity(
+        opts.base,
+        stored.token,
+        opts.fetchImpl,
+      );
       opts.ui.out(
         color.dim(
           `Using your saved Crumbtrail login (${describeIdentity(identity)}). Run \`crumbtrail logout\` to sign in as somebody else.`,

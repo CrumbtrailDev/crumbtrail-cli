@@ -1143,8 +1143,8 @@ describe("Global Privacy Control", () => {
     vi.stubGlobal("navigator", { globalPrivacyControl: true });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    Crumbtrail.init({ key: "ctkey_test", endpoint: "https://example.test" });
-    Crumbtrail.init({ key: "ctkey_test", endpoint: "https://example.test" });
+    Crumbtrail.init({ httpAuthToken: "ctkey_test", httpEndpoint: "https://example.test" });
+    Crumbtrail.init({ httpAuthToken: "ctkey_test", httpEndpoint: "https://example.test" });
 
     const gpcWarnings = warn.mock.calls.filter((call) =>
       String(call[0]).includes("Global Privacy Control"),
@@ -1157,7 +1157,7 @@ describe("Global Privacy Control", () => {
     vi.stubGlobal("navigator", {});
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    Crumbtrail.init({ key: "ctkey_test", endpoint: "https://example.test" });
+    Crumbtrail.init({ httpAuthToken: "ctkey_test", httpEndpoint: "https://example.test" });
 
     expect(
       warn.mock.calls.filter((call) =>
@@ -1171,8 +1171,8 @@ describe("Global Privacy Control", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     Crumbtrail.init({
-      key: "ctkey_test",
-      endpoint: "https://example.test",
+      httpAuthToken: "ctkey_test",
+      httpEndpoint: "https://example.test",
       respectGpc: false,
     });
 

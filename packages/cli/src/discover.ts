@@ -82,6 +82,17 @@ export interface DiscoverDeps {
   integration?: (input: IntegrationCheckInput) => IntegrationStatus;
   /** Legacy override retained for callers that supply their own detection. */
   alreadyWired?: (dir: string) => boolean;
+  /**
+   * Keep JS apps found by the scan even though no workspace file declares them.
+   *
+   * Set ONLY when the root itself declares no workspaces and matched no recipe
+   * — the "plain sibling directories" layout (`admin/` + `api/` with nothing
+   * linking them). Without it the scan drops every JS candidate, so a repo root
+   * that had already identified both services told the user to cd into each one
+   * and run the wizard again. With it, those dirs are wireable targets from the
+   * root, exactly like real workspace packages.
+   */
+  includeUnlinkedApps?: boolean;
 }
 
 function injectIOFromReader(reader: FileReader): InjectIO {
@@ -146,7 +157,7 @@ function classify(
   fallbackName: string,
   reader: FileReader,
   deps: Required<Pick<DiscoverDeps, "detect" | "integration">> &
-    Pick<DiscoverDeps, "endpoint" | "alreadyWired">,
+    Pick<DiscoverDeps, "endpoint" | "alreadyWired" | "includeUnlinkedApps">,
 ): ServiceCandidate {
   const detected = deps.detect(dir, reader);
   const recipe = detected.recipe;
@@ -182,7 +193,8 @@ function classify(
   // Everything else stays listed and selectable, just off by default.
   const defaultChecked =
     selectable &&
-    source === "workspace" &&
+    (source === "workspace" ||
+      (source === "scan" && deps.includeUnlinkedApps === true)) &&
     RECIPE_REGISTRY[recipe].kind === "inject" &&
     !detected.ambiguous &&
     !flags.includes("likely-library") &&
@@ -217,9 +229,31 @@ export function discoverServices(
     endpoint: overrides.endpoint,
     integration: overrides.integration ?? inspectIntegration,
     alreadyWired: overrides.alreadyWired,
+    includeUnlinkedApps: overrides.includeUnlinkedApps,
   };
 
   const byDir = new Map<string, ServiceCandidate>();
+
+  // The root package itself, when it is a runnable app rather than a workspace
+  // shell. `detect` proves that (a matched recipe AND a resolved entry, which is
+  // what clears `ambiguous` on a monorepo root), so a plain turborepo/pnpm root
+  // whose package.json only holds tooling still contributes no row. Without this
+  // the "root API + nested frontend" layout offered the frontend alone, and the
+  // backend half of every session was unreachable from setup.
+  const rootDir = path.resolve(root);
+  if (rootResult.recipe != null && !rootResult.ambiguous) {
+    byDir.set(
+      rootDir,
+      classify(
+        root,
+        rootDir,
+        "workspace",
+        path.basename(rootDir),
+        reader,
+        deps,
+      ),
+    );
+  }
 
   for (const ws of rootResult.workspaces) {
     const dir = path.resolve(ws.dir);
@@ -244,10 +278,16 @@ export function discoverServices(
       if (!reader.isDir(dir) || byDir.has(dir)) continue;
       scanned += 1;
       const candidate = classify(root, dir, "scan", entry, reader, deps);
-      // The scan exists solely to surface non-JS services. A JS package that
-      // isn't a declared workspace is not ours to wire — leaving it out keeps
-      // the list honest and avoids picking up examples/ and fixtures/.
-      if (candidate.recipe === "otlp") byDir.set(dir, candidate);
+      // In a declared monorepo the scan exists solely to surface non-JS
+      // services: a JS package the workspace file does not list is not ours to
+      // wire, and keeping it out avoids picking up examples/ and fixtures/.
+      //
+      // With `includeUnlinkedApps` there IS no workspace file to be
+      // authoritative, so that rule would discard the only apps in the repo.
+      const keep =
+        candidate.recipe === "otlp" ||
+        (deps.includeUnlinkedApps === true && candidate.recipe != null);
+      if (keep) byDir.set(dir, candidate);
     }
   }
 

@@ -138,13 +138,13 @@ describe("evidence-index mixed page evidence artifacts", () => {
         expect.objectContaining({
           detector: "backend_request_error",
           anchor: expect.objectContaining({
-            route: `/reset/${encodeURIComponent("[REDACTED]")}`,
+            route: "/reset/[REDACTED]",
           }),
         }),
       ]),
     );
     expect(timeline).toContain(
-      "perf: performance res https://cdn.example.test/%5BREDACTED%5D/app.js?token=%5BREDACTED%5D",
+      "perf: performance res https://cdn.example.test/[REDACTED]/app.js?token=[REDACTED]",
     );
     expect(timeline).toContain("snap: storage/cookie snapshot; values omitted");
     expect(search).toContain("input changed; raw value omitted");

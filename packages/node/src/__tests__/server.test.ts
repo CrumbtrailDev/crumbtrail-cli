@@ -1210,7 +1210,7 @@ describe("server", () => {
     ).toBe(true);
     expect(storedEvents[3].target).toMatchObject(target);
     expect(storedEvents[8].d.screenshotUri).toBe(
-      "https://screenshots.example.test/expo-cache/crumbtrail/crash-checkout.jpg?token=%5BREDACTED%5D",
+      "https://screenshots.example.test/expo-cache/crumbtrail/crash-checkout.jpg?token=[REDACTED]",
     );
     expect(JSON.stringify(storedEvents)).not.toContain("sk_fake_mobile_secret");
 
@@ -1239,7 +1239,7 @@ describe("server", () => {
     expect(timeline).toContain("view snapshot Submit order");
     expect(timeline).toContain("native crash Unhandled JS exception");
     expect(timeline).toContain(
-      "https://screenshots.example.test/expo-cache/crumbtrail/crash-checkout.jpg?token=%5BREDACTED%5D",
+      "https://screenshots.example.test/expo-cache/crumbtrail/crash-checkout.jpg?token=[REDACTED]",
     );
     expect(timeline).not.toContain("sk_fake_mobile_secret");
 
@@ -1257,7 +1257,7 @@ describe("server", () => {
         (row) =>
           row.type === "event" &&
           row.k === "native-crash" &&
-          String(row.text).includes("token=%5BREDACTED%5D"),
+          String(row.text).includes("token=[REDACTED]"),
       ),
     ).toBe(true);
     expect(JSON.stringify(searchRows)).not.toContain("sk_fake_mobile_secret");

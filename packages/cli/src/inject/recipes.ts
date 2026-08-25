@@ -13,7 +13,8 @@
 import path from "node:path";
 import { buildAgentPrompt, buildOtlpSnippets } from "../install/index.js";
 import type { Stack } from "crumbtrail-core";
-import type { Recipe } from "../detect";
+import { isBuildOutputPath, type Recipe } from "../detect";
+import type { FileReader } from "../readers/types";
 import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
 import {
   inspectIntegration,
@@ -22,9 +23,11 @@ import {
 import { defaultInjectIO, type InjectIO } from "./io";
 import type { Plan } from "./types";
 import {
+  corsWideningGuidance,
   detectExpressModuleStyle,
   prependIntoSource,
   referencesCrumbtrail,
+  widenCorsAllowedHeaders,
   wireExpressMiddleware,
   wireFlutterMain,
   withTrailingNewline,
@@ -109,6 +112,18 @@ export interface BuildPlanInput {
    * root can pass nothing and stay unlabelled.
    */
   serviceName?: string | null;
+  /**
+   * Backend origins this app calls, emitted as
+   * `networkCorrelationAllowedOrigins` in the browser init.
+   *
+   * The SDK stamps its correlation headers on same origin calls plus these, and
+   * nowhere else, so an empty list is a frontend whose evidence never joins its
+   * backend. The caller resolves them from the repository (see
+   * ../backend-origins) rather than the recipe guessing a framework default:
+   * an origin the app does not call costs a CORS preflight on a request that
+   * had none. Absent or empty keeps the honest empty field and its comment.
+   */
+  backendOrigins?: readonly string[] | null;
   options?: BuildPlanOptions;
 }
 
@@ -159,7 +174,12 @@ function incompleteSnippet(input: BuildPlanInput): string {
   const keyExpr = keyExprFor(input) ?? "environment.crumbtrailKey";
   switch (input.recipe) {
     case "capacitor":
-      return capacitorInitSnippet(input.endpoint, keyExpr, input.serviceName);
+      return capacitorInitSnippet(
+        input.endpoint,
+        keyExpr,
+        input.serviceName,
+        input.backendOrigins,
+      );
     case "flutter":
       return [
         FLUTTER_IMPORT_LINE,
@@ -169,7 +189,13 @@ function incompleteSnippet(input: BuildPlanInput): string {
     case "nestjs":
       return nestInitSnippet(input.endpoint, keyExpr, input.serviceName);
     case "react-native":
-      return reactNativeInitSnippet(input.endpoint, keyExpr, input.serviceName);
+      return reactNativeInitSnippet(
+        input.endpoint,
+        keyExpr,
+        input.serviceName,
+        false,
+        input.backendOrigins,
+      );
     case "tauri":
       return tauriInitSnippet();
     case "express":
@@ -178,9 +204,19 @@ function incompleteSnippet(input: BuildPlanInput): string {
     case "node":
       return nodeInitSnippet(input.endpoint, keyExpr, input.serviceName);
     case "nuxt":
-      return nuxtPluginSnippet(input.endpoint, keyExpr, input.serviceName);
+      return nuxtPluginSnippet(
+        input.endpoint,
+        keyExpr,
+        input.serviceName,
+        input.backendOrigins,
+      );
     default:
-      return clientInitSnippet(input.endpoint, keyExpr, input.serviceName);
+      return clientInitSnippet(
+        input.endpoint,
+        keyExpr,
+        input.serviceName,
+        input.backendOrigins,
+      );
   }
 }
 
@@ -262,17 +298,38 @@ function prependWithPreflight(
   }
   const existingPlan = existingIntegrationPlan(input, io, existing);
   if (existingPlan) return existingPlan;
+
+  // Wiring a backend whose CORS config pins an explicit header list, without
+  // widening that list, wires an app the browser will refuse to talk to the
+  // moment correlation is on. So the widening rides along with this edit.
+  const cors = widenCorsAllowedHeaders(existing);
+  const corsWarnings = [
+    ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
+    ...(cors.needsManual ? [corsWideningGuidance()] : []),
+  ];
+  const allWarnings = [...warnings, ...corsWarnings];
+
   const status = io.gitStatus(input.cwd, target);
   if (status.dirty && !input.options?.force) {
     return {
       recipe: input.recipe,
       kind: "needs-confirm-dirty",
       targetPath: target,
-      content: block,
+      content: cors.changed ? prependIntoSource(cors.text, block) : block,
+      ...(cors.changed ? { applyMode: "rewrite" as const } : {}),
       warnings: [
-        ...warnings,
+        ...allWarnings,
         `${target} has uncommitted changes — confirm (or re-run with force) before prepending.`,
       ],
+    };
+  }
+  if (cors.changed) {
+    return {
+      recipe: input.recipe,
+      kind: "rewrite",
+      targetPath: target,
+      content: prependIntoSource(cors.text, block),
+      warnings: allWarnings,
     };
   }
   return {
@@ -280,9 +337,16 @@ function prependWithPreflight(
     kind: "prepend",
     targetPath: target,
     content: block,
-    warnings,
+    warnings: allWarnings,
   };
 }
+
+/**
+ * Listed as its own change in the wizard summary, because it edits code the
+ * user did not ask us to touch and they must be able to see that in the diff.
+ */
+const CORS_WIDENED_WARNING =
+  "Widened the CORS allowed headers to admit x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent. Without this the browser blocks every cross origin request once correlation is on.";
 
 // --- idempotency (project-level) --------------------------------------------
 
@@ -432,6 +496,7 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   // Prefer `src/` when the app uses a src directory.
   const usesSrc =
@@ -518,6 +583,7 @@ function planSvelteKit(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   if (io.exists(target)) {
     return prependWithPreflight(input, io, target, block);
@@ -546,6 +612,7 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   if (io.exists(target)) {
     const existing = io.readFile(target);
@@ -566,6 +633,7 @@ function planVite(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -659,11 +727,14 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
 
   // Full rewrite: middleware wired around the routes, plus the autoCapture block
   // and the middleware import prepended after any shebang/directive prologue.
+  const cors = widenCorsAllowedHeaders(wired.text);
   const content = prependIntoSource(
-    wired.text,
+    cors.text,
     `${block}\n\n${expressEnvPreloadSnippet(keyEnvVar)}\n\n${expressMiddlewareImportSnippet(style!)}`,
   );
   const warnings = [
+    ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
+    ...(cors.needsManual ? [corsWideningGuidance()] : []),
     wired.errorAnchor === "existing-error-handler"
       ? "Wired Express request middleware (before routes) and error middleware above the app's existing error handler, so it is reached before that handler ends the response."
       : "Wired Express request middleware (before routes) and error middleware (after routes) for backend request capture.",
@@ -702,6 +773,7 @@ function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -722,6 +794,7 @@ function planAstro(input: BuildPlanInput, _io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   return fallbackPlan(input, block, [
     "Astro has no single client entry — add this snippet inside a client-side <script> in a shared layout (e.g. src/layouts/*.astro) so it runs on every page.",
@@ -742,6 +815,7 @@ function planAngular(input: BuildPlanInput, _io: InjectIO): Plan {
     input.endpoint,
     "environment.crumbtrailKey",
     input.serviceName,
+    input.backendOrigins,
   );
   return fallbackPlan(input, block, [
     "Angular has no browser-safe env-var mechanism — add `crumbtrailKey: '<your-ingest-key>'` to src/environments/environment.ts (get your key from the dashboard), import `environment`, and prepend the snippet above bootstrapApplication in src/main.ts.",
@@ -789,6 +863,7 @@ function planCapacitor(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExpr,
     input.serviceName,
+    input.backendOrigins,
   );
 
   // Native plugins are optional peers, so the SDK degrades rather than failing
@@ -938,6 +1013,7 @@ function planReactNative(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     hasAsyncStorage,
+    input.backendOrigins,
   );
   const warnings = hasAsyncStorage
     ? []
@@ -1031,11 +1107,47 @@ function planOtlp(input: BuildPlanInput): Plan {
  * Build the injection Plan for a detected recipe. Reads only (via `io`); the
  * returned Plan is plain data the executor applies all-or-nothing.
  */
+/**
+ * A build artifact is never a legal injection target, whatever the caller says.
+ *
+ * Detection already refuses them, but buildPlan is also called directly (the
+ * dashboard wizard, the batch installer, tests), and an edit written into
+ * `dist/` is the worst possible failure: the run reports success, `tsc` erases
+ * the edit on the next build, and the dev command that runs the source never
+ * loaded it — silent zero capture with a green checkmark. Dropping the entry to
+ * null here routes the recipe to its manual-snippet fallback, with the reason
+ * stated.
+ */
+function refuseBuildOutputEntry(
+  input: BuildPlanInput,
+  io: InjectIO,
+): { input: BuildPlanInput; warning: string | null } {
+  const entry = input.entryFile;
+  if (!entry) return { input, warning: null };
+  const reader: FileReader = {
+    readFile: (p) => io.readFile(p),
+    isFile: (p) => io.exists(p),
+    isDir: (p) => io.exists(p),
+    readDir: () => [],
+    root: input.cwd,
+  };
+  if (!isBuildOutputPath(input.cwd, entry, reader)) {
+    return { input, warning: null };
+  }
+  return {
+    input: { ...input, entryFile: null },
+    warning: `${path.relative(input.cwd, entry) || entry} is build output, not source. Injecting there would be erased by the next build and never loaded by the dev command, so it was refused — wire the source entry manually with the snippet below.`,
+  };
+}
+
 export function buildPlan(
   input: BuildPlanInput,
   io: InjectIO = defaultInjectIO,
 ): Plan {
+  const refused = refuseBuildOutputEntry(input, io);
+  input = refused.input;
   const plan = dispatchPlan(input, io);
+  if (refused.warning) plan.warnings = [refused.warning, ...plan.warnings];
   // Stamp the env var the injected code reads its key from, so the wizard can
   // print "set <VAR> in .env — get your key from the dashboard". Undefined for
   // recipes that inject no key (tauri / otlp / angular) or when already wired.

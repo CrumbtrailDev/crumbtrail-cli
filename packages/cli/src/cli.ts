@@ -69,6 +69,7 @@ import {
   type PollServicesResult,
 } from "./verify";
 import { discoverServices, type ServiceCandidate } from "./discover";
+import { isBackendRecipe, resolveBackendOrigins } from "./backend-origins";
 import { otlpGuidePlan, renderOtlpGuide } from "./otlp-guide";
 import { RECIPE_REGISTRY, sdkInstallSpec } from "./recipe-registry";
 import { dashboardBase, resolveEndpoint } from "./net";
@@ -288,7 +289,7 @@ function usage(): string {
     ),
     "",
     color.dim(
-      "In a monorepo, run it from the repo root: it scans every workspace and service,",
+      "With more than one app, run it from the repo root: it scans every workspace and service,",
     ),
     color.dim("shows you what it found, and wires the ones you pick."),
     "",
@@ -511,14 +512,18 @@ export async function installSdk(
     return {
       installed: false,
       packages,
-      note: `SDK install via ${cmd} failed; the ${input.base}/install tarball fallback also failed — wire manually or run: curl -fsSL ${input.base}/install.sh | sh`,
+      // No install script is pointed at here on purpose. The line this replaced
+      // told people to pipe `<cloud>/install.sh` into a shell, and no
+      // deployment has ever served that route, so the one instruction printed
+      // at the moment the install failed was itself a 404.
+      note: `SDK install via ${cmd} failed, and so did the ${input.base}/install tarball fallback. Run \`${cmd} ${add} ${shown}\` in this app yourself to see what ${cmd} reports, then run \`npx crumbtrail\` again.`,
     };
   }
 
   return {
     installed: false,
     packages,
-    note: `SDK install via ${cmd} failed — install the tarballs instead: curl -fsSL ${input.base}/install.sh | sh`,
+    note: `SDK install via ${cmd} failed. Run \`${cmd} ${add} ${shown}\` in this app yourself to see what ${cmd} reports, then run \`npx crumbtrail\` again.`,
   };
 }
 
@@ -681,6 +686,26 @@ export async function runWizard(
     return runBatchWizard(parsed, deps, { base, wizardStart, root: result });
   }
 
+  // A repo root can hold several services without any workspace file linking
+  // them — `admin/` next to `api/`, a root package.json with no framework deps.
+  // --help promises the root run scans every service, and detection can already
+  // name these, so they are wired from the root like real workspaces instead of
+  // the user being sent to cd into each one and start over.
+  if (!result.recipe && !parsed.workspace) {
+    const siblings = deps.discoverServices(cwd, result, undefined, {
+      endpoint: base,
+      includeUnlinkedApps: true,
+    });
+    if (siblings.some((c) => c.selectable)) {
+      return runBatchWizard(parsed, deps, {
+        base,
+        wizardStart,
+        root: result,
+        includeUnlinkedApps: true,
+      });
+    }
+  }
+
   if (!result.recipe) {
     const isDeno = result.reasons.includes(DENO_UNSUPPORTED_REASON);
     if (isDeno) {
@@ -806,6 +831,7 @@ export async function runWizard(
   // "skip-already-wired" — self-cancelling injection on a fresh setup. So the
   // plan is computed against the pre-install repo; only executePlan (below,
   // after install) mutates files, keeping injection the LAST repo-mutating step.
+  const singleAppOrigins = resolveBackendOrigins(cwd, localFsReader(cwd));
   const plan = deps.buildPlan(
     {
       cwd,
@@ -820,6 +846,11 @@ export async function runWizard(
       // wizard creates a named service and then wires code that reports under
       // no app at all.
       serviceName: provisioned.serviceName,
+      // Correlation is off unless the emitted init names the origins this app
+      // calls, so read them out of the app's own dev proxy and env config. A
+      // single-package run knows of no sibling services, so that is the whole
+      // source here; the batch path adds the backends it is wiring alongside.
+      backendOrigins: singleAppOrigins,
       options: { force: parsed.yes },
     },
     defaultInjectIO,
@@ -901,6 +932,7 @@ export async function runWizard(
   const notes: string[] = [];
   if (!install.installed && install.note) notes.push(install.note);
   notes.push(...inject.notes);
+  notes.push(...correlationNotes(result.recipe, singleAppOrigins, 0));
   if (keyWrite.note) notes.push(keyWrite.note);
 
   const keyReady =
@@ -955,7 +987,15 @@ export async function runWizard(
     const keyProbe = await probeWrittenKey(base, keyWrite, deps);
     if (keyProbe && !keyProbe.ok) {
       notes.push(
-        `First-event wait skipped — ${preflightFailureReason(keyProbe)}.`,
+        keyRejectionNote(
+          {
+            name: "",
+            write: keyWrite,
+            ...(keyWrite.file ? { where: rel(cwd, keyWrite.file) } : {}),
+            mintUrl: appUrl(appBase, "/setup", provisioned.projectId),
+          },
+          keyProbe,
+        ),
       );
       printEvidenceSourcesPointer(ui, base, provisioned.projectId);
       printSummary(
@@ -1068,6 +1108,7 @@ function appBaseFor(
   return dashboardBase(
     base,
     stored && stored.endpoint === base ? stored.appBaseUrl : undefined,
+    env,
   );
 }
 
@@ -1178,6 +1219,32 @@ function candidateHint(c: ServiceCandidate): string {
   return `${stack} · selecting installs and wires it`;
 }
 
+/**
+ * What the run did about frontend to backend correlation, in the service's own
+ * notes. Silence here is what made this the longest lived gap in setup: the
+ * emitted list is the only thing that turns the shared_request_id join on, and
+ * a wizard that never mentions it leaves the user with two unrelated piles of
+ * evidence and no reason to suspect a setting.
+ */
+export function correlationNotes(
+  recipe: Recipe,
+  origins: readonly string[],
+  backendCount: number,
+): string[] {
+  if (isBackendRecipe(recipe)) return [];
+  if (origins.length > 0) {
+    return [
+      `Frontend to backend correlation enabled for ${origins.join(", ")}. Each of those must allow x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent in its CORS allowed headers, or the browser blocks the preflight. Calls to any other origin stay unjoined until you add it to networkCorrelationAllowedOrigins.`,
+    ];
+  }
+  if (backendCount > 0) {
+    return [
+      "No backend origin could be read from this app's config, so networkCorrelationAllowedOrigins is empty and its calls to the backend will not join the same session. Add the API origin to that list in the injected init.",
+    ];
+  }
+  return [];
+}
+
 function toMultiSelectItems(candidates: ServiceCandidate[]): MultiSelectItem[] {
   return candidates.map((c) => ({
     label: c.relDir,
@@ -1231,6 +1298,8 @@ interface BatchContext {
   base: string;
   wizardStart: number;
   root: DetectResult;
+  /** Root holds unlinked sibling services rather than declared workspaces. */
+  includeUnlinkedApps?: boolean;
 }
 
 /**
@@ -1253,11 +1322,14 @@ export async function runBatchWizard(
   // 1. Scan.
   const candidates = deps.discoverServices(root, ctx.root, undefined, {
     endpoint: base,
+    includeUnlinkedApps: ctx.includeUnlinkedApps,
   });
   const selectableCount = candidates.filter((c) => c.selectable).length;
   ui.out(
     ok(
-      `Monorepo — found ${color.bold(String(candidates.length))} package(s), ${color.bold(color.brand(String(selectableCount)))} wireable.`,
+      ctx.includeUnlinkedApps
+        ? `Repo root — found ${color.bold(String(candidates.length))} service(s), ${color.bold(color.brand(String(selectableCount)))} wireable.`
+        : `Monorepo — found ${color.bold(String(candidates.length))} package(s), ${color.bold(color.brand(String(selectableCount)))} wireable.`,
     ),
   );
   if (selectableCount === 0) {
@@ -1287,7 +1359,7 @@ export async function runBatchWizard(
     ui.err("");
     ui.err(
       color.red(
-        `Monorepo at ${root}, but this shell is not interactive. Pass --only <service> (repeatable) or --all.`,
+        `${ctx.includeUnlinkedApps ? "Several services under" : "Monorepo at"} ${root}, but this shell is not interactive. Pass --only <service> (repeatable) or --all.`,
       ),
     );
     for (const c of candidates) {
@@ -1302,6 +1374,13 @@ export async function runBatchWizard(
     );
   }
   const selected = indices.map((i) => candidates[i]);
+  // The backend halves of this run. A browser app whose init does not name them
+  // stamps no correlation headers on its calls to them, so the frontend and
+  // backend evidence for one click never joins — which is the whole point of
+  // wiring both in a single pass.
+  const backendSiblings = selected
+    .filter((c) => isBackendRecipe(c.recipe))
+    .map((c) => ({ dir: c.dir, detected: c.detected }));
   if (selected.length === 0) {
     ui.out(alert(color.yellow("Nothing selected — no changes made.")));
     return 0;
@@ -1389,6 +1468,13 @@ export async function runBatchWizard(
       continue;
     }
 
+    // What this app declares for itself, plus the dev origins of the backends
+    // being wired beside it. Empty for a backend (it is the thing being called)
+    // and for a lone frontend whose repo names no backend origin anywhere.
+    const backendOrigins = isBackendRecipe(recipe)
+      ? []
+      : resolveBackendOrigins(c.dir, localFsReader(c.dir), backendSiblings);
+
     try {
       const svc = await deps.provisionService({
         base,
@@ -1423,6 +1509,7 @@ export async function runBatchWizard(
           // verify below polls the provisioned service ids, so it would report
           // "No event yet" for every service while events were landing.
           serviceName: svc.serviceName,
+          backendOrigins,
           options: { force: parsed.yes },
         },
         defaultInjectIO,
@@ -1471,6 +1558,7 @@ export async function runBatchWizard(
         notes: [
           ...(!install.installed && install.note ? [install.note] : []),
           ...applied.notes,
+          ...correlationNotes(recipe, backendOrigins, backendSiblings.length),
         ],
       });
     } catch (err) {
@@ -1543,18 +1631,39 @@ export async function runBatchWizard(
       }
     }
 
-    const probeKey = [...keyWrites.values()].find((write) => write.probeKey);
-    const keyProbe = probeKey
-      ? await probeWrittenKey(base, probeKey, deps)
-      : undefined;
+    // Probe each service's OWN key, one probe per distinct key value, and let
+    // a rejection speak only for the services carrying that key.
+    const keyProbes = await probeServiceKeys(
+      cloudReporting.map((o) => ({
+        name: o.name,
+        write: keyWrites.get(o.name),
+        where: keyWrites.get(o.name)?.file
+          ? rel(root, keyWrites.get(o.name)!.file!)
+          : undefined,
+        mintUrl: appUrl(appBase, "/setup", project.id),
+      })),
+      (key) =>
+        deps.runPreflight({
+          endpoint: base,
+          probe: { kind: "ingestKey", key },
+          fetchImpl: deps.fetchImpl,
+        }),
+    );
+    for (const o of cloudReporting) {
+      const probe = keyProbes.get(o.name);
+      if (probe && !probe.ok) o.notes.push(probe.note);
+    }
+    const waitable = cloudReporting.filter(
+      (o) => keyProbes.get(o.name)?.ok !== false,
+    );
     const byServiceId = new Map(
-      cloudReporting
+      waitable
         .filter((o) => o.serviceId)
         .map((o) => [o.serviceId as string, o]),
     );
-    if (keyProbe && !keyProbe.ok) {
-      const reason = `First-event wait skipped — ${preflightFailureReason(keyProbe)}.`;
-      for (const o of cloudReporting) o.notes.push(reason);
+    if (byServiceId.size === 0) {
+      // Every service that could report has a key the cloud will not accept,
+      // so there is nothing to wait for. Each already carries its own reason.
     } else {
       const poll = await pollServicesWithSigint(
         {
@@ -2060,7 +2169,10 @@ async function writeIngestKeys(args: {
     if (plan.kind !== "ready") continue;
     const where = rel(args.repoRoot, plan.file);
     try {
-      applyEnvEdits(buildEnvKeyEdits(plan, key.apiKey), args.deps.envFileIO);
+      const applied = applyEnvEdits(
+        buildEnvKeyEdits(plan, key.apiKey),
+        args.deps.envFileIO,
+      );
       ui.out(
         ok(
           `${named(label)}wrote ${color.bold(plan.varName)} to ${color.brand(where)}${keyLabel(key)}.`,
@@ -2076,7 +2188,10 @@ async function writeIngestKeys(args: {
           `  Restart your dev server if it is running — it reads ${plan.varName} at startup.`,
         ),
       );
-      if (plan.ignore) {
+      // Reported from what the apply actually appended, never from the plan:
+      // a plan can want an entry the file turns out to list already, and a
+      // claim that .gitignore now covers this file has to be true.
+      if (applied.ignoreEntriesAdded.length > 0) {
         // Saying this is not optional. A file that was about to be committed
         // silently is not any more, and someone who does not know that will go
         // looking for why their env file stopped showing up in `git status`.
@@ -2154,6 +2269,85 @@ async function probeWrittenKey(
     probe: { kind: "ingestKey", key: keyWrite.probeKey },
     fetchImpl: deps.fetchImpl,
   });
+}
+
+/** One service's key, as the run left it, for `probeServiceKeys`. */
+export interface KeyProbeTarget {
+  /** Service name, and the key of the returned map. */
+  name: string;
+  write: KeyWriteOutcome | undefined;
+  /** Repo-relative env file holding the key, when there is one. */
+  where?: string;
+  /** Where a replacement key is minted, named in the stale-key note. */
+  mintUrl?: string;
+}
+
+export interface KeyProbeVerdict {
+  ok: true;
+}
+export interface KeyProbeRejection {
+  ok: false;
+  note: string;
+}
+
+/**
+ * Probe the ingest key each service actually carries, one probe per DISTINCT
+ * key, and attribute every verdict only to the services carrying that key.
+ *
+ * Both halves are the fix for the same defect. The wizard mints ONE key and
+ * writes it into every service it wired, but a service whose env file already
+ * held a key keeps that one untouched — and a leftover from an older install is
+ * exactly the key that fails. Probing "the first key found across the run"
+ * therefore tested a credential this run never wrote, and then broadcast that
+ * one rejection to every service, so a single stale line in a single .env made
+ * a nine service install report itself as nine broken services.
+ *
+ * Services with no key to probe are absent from the result: unknown is not a
+ * rejection, and the event wait is what decides those.
+ */
+export async function probeServiceKeys(
+  targets: KeyProbeTarget[],
+  probe: (key: string) => Promise<PreflightResult>,
+): Promise<Map<string, KeyProbeVerdict | KeyProbeRejection>> {
+  const seen = new Map<string, PreflightResult>();
+  const out = new Map<string, KeyProbeVerdict | KeyProbeRejection>();
+  for (const target of targets) {
+    const key = target.write?.probeKey;
+    if (!key) continue;
+    let result = seen.get(key);
+    if (!result) {
+      result = await probe(key);
+      seen.set(key, result);
+    }
+    out.set(
+      target.name,
+      result.ok
+        ? { ok: true }
+        : { ok: false, note: keyRejectionNote(target, result) },
+    );
+  }
+  return out;
+}
+
+/**
+ * Say whose key was rejected. A key this run wrote failing is a broken install;
+ * a key that was already in the file failing is a leftover pointing nowhere,
+ * and the two need completely different sentences.
+ */
+function keyRejectionNote(
+  target: KeyProbeTarget,
+  result: PreflightResult,
+): string {
+  const reason = preflightFailureReason(result);
+  if (target.write?.status !== "already-set") {
+    return `First-event wait skipped — ${reason}.`;
+  }
+  const varName = target.write.varName ?? "the ingest key";
+  const where = target.where ? ` in ${target.where}` : "";
+  const mint = target.mintUrl
+    ? ` Mint a replacement at ${target.mintUrl}.`
+    : "";
+  return `The ${varName} already set${where} was left as it was found, and Crumbtrail rejected it — ${reason}. This service will not report until that value is replaced.${mint}`;
 }
 
 function preflightFailureReason(result: PreflightResult): string {

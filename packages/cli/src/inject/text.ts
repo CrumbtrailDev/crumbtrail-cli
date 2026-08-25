@@ -307,3 +307,130 @@ export function wireFlutterMain(
 export function withTrailingNewline(text: string): string {
   return text.endsWith("\n") ? text : text + "\n";
 }
+
+// --- CORS allowedHeaders widening --------------------------------------------
+
+/**
+ * The three headers the browser SDK stamps on a cross-origin request once its
+ * origin is listed in `networkCorrelationAllowedOrigins`.
+ */
+export const CORRELATION_REQUEST_HEADERS = [
+  "x-crumbtrail-session-id",
+  "x-crumbtrail-request-id",
+  "traceparent",
+] as const;
+
+export interface CorsWidening {
+  /** The rewritten source. Equal to the input when `changed` is false. */
+  text: string;
+  /** True when an `allowedHeaders` / `allowHeaders` list was actually widened. */
+  changed: boolean;
+  /**
+   * Set when a CORS config was found but its header list is not a literal we
+   * can safely rewrite (a variable, a spread, a computed value). The caller
+   * prints the exact change instead of guessing at it.
+   */
+  needsManual: boolean;
+}
+
+/** Only files that actually pull in a CORS middleware are considered. */
+const CORS_IMPORT_RE =
+  /(?:from\s*["']cors["'])|(?:require\(\s*["']cors["']\s*\))|(?:from\s*["']hono\/cors["'])/;
+
+/** `allowedHeaders:` (Express `cors`) or `allowHeaders:` (Hono `cors`). */
+const ALLOW_HEADERS_KEY = String.raw`\ballow(?:ed)?Headers\s*:\s*`;
+
+const ARRAY_FORM = new RegExp(`(${ALLOW_HEADERS_KEY})\\[([^\\[\\]]*)\\]`, "g");
+const STRING_FORM = new RegExp(
+  `(${ALLOW_HEADERS_KEY})(["'])([^"'\\n]*)\\2`,
+  "g",
+);
+const ANY_FORM = new RegExp(ALLOW_HEADERS_KEY, "g");
+
+/** An array body made only of string literals, commas and whitespace. */
+const LITERAL_ARRAY_BODY_RE = /^\s*(?:(["'])[^"'\n]*\1\s*,\s*)*(?:(["'])[^"'\n]*\2\s*,?\s*)?$/;
+
+function quoteStyleOf(body: string): '"' | "'" {
+  return body.includes("'") && !body.includes('"') ? "'" : '"';
+}
+
+/**
+ * Widens an explicit CORS header allowlist to admit Crumbtrail's correlation
+ * headers.
+ *
+ * Turning on correlation makes every cross-origin request preflighted. A
+ * backend pinning `allowedHeaders: ["Content-Type", "Authorization"]` answers
+ * that preflight without the three names the browser is now sending, and the
+ * browser then blocks the application's own request. Wiring a backend and
+ * leaving its CORS config alone is therefore wiring a broken app, so the
+ * widening is part of the wiring rather than a note the user may or may not act
+ * on.
+ *
+ * Deliberately narrow. Only a literal list is rewritten: an array of string
+ * literals, or a single comma separated string. A config with no header list at
+ * all is left alone and is already correct — both middlewares then echo the
+ * browser's requested headers. Anything computed sets `needsManual` and is not
+ * touched, because a wrong guess here breaks CORS in a second, different way.
+ */
+export function widenCorsAllowedHeaders(text: string): CorsWidening {
+  if (!CORS_IMPORT_RE.test(text)) {
+    return { text, changed: false, needsManual: false };
+  }
+
+  let changed = false;
+  let handled = 0;
+
+  let out = text.replace(ARRAY_FORM, (match, key: string, body: string) => {
+    if (!LITERAL_ARRAY_BODY_RE.test(body)) return match;
+    handled++;
+    const present = new Set(
+      (body.match(/(["'])([^"'\n]*)\1/g) ?? []).map((literal) =>
+        literal.slice(1, -1).toLowerCase(),
+      ),
+    );
+    const missing = CORRELATION_REQUEST_HEADERS.filter(
+      (name) => !present.has(name),
+    );
+    if (missing.length === 0) return match;
+    changed = true;
+    const quote = quoteStyleOf(body);
+    const additions = missing
+      .map((name) => `${quote}${name}${quote}`)
+      .join(", ");
+    const trimmed = body.trim();
+    if (trimmed.length === 0) return `${key}[${additions}]`;
+    const separator = trimmed.endsWith(",") ? " " : ", ";
+    return `${key}[${body.replace(/\s+$/, "")}${separator}${additions}]`;
+  });
+
+  out = out.replace(STRING_FORM, (match, key: string, quote: string, body: string) => {
+    handled++;
+    const present = new Set(
+      body
+        .split(",")
+        .map((name) => name.trim().toLowerCase())
+        .filter(Boolean),
+    );
+    const missing = CORRELATION_REQUEST_HEADERS.filter(
+      (name) => !present.has(name),
+    );
+    if (missing.length === 0) return match;
+    changed = true;
+    const joined = [body.trim().replace(/,$/, ""), ...missing]
+      .filter(Boolean)
+      .join(",");
+    return `${key}${quote}${joined}${quote}`;
+  });
+
+  const total = (text.match(ANY_FORM) ?? []).length;
+  return { text: out, changed, needsManual: handled < total };
+}
+
+/** The exact lines a user must add when the config cannot be rewritten safely. */
+export function corsWideningGuidance(): string {
+  return [
+    "Add Crumbtrail's correlation headers to your CORS allowed headers, or cross origin requests from the browser will be blocked by the preflight:",
+    `  allowedHeaders: ["Content-Type", "Authorization", ${CORRELATION_REQUEST_HEADERS.map((n) => `"${n}"`).join(", ")}]`,
+    `  Hono: cors({ allowHeaders: [${CORRELATION_REQUEST_HEADERS.map((n) => `"${n}"`).join(", ")}] })`,
+  ].join("\n");
+}

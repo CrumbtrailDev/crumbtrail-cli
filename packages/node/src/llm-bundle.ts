@@ -8,6 +8,7 @@ import {
   redactInputValue,
   redactTokenLikeString,
   redactValue,
+  unescapeRedactionMarker,
   type BugEvent,
   type DbEngine,
   type EnvCampaign,
@@ -6370,7 +6371,7 @@ function redactUrlLikeString(value: string): string {
       parsed.username = "";
       parsed.password = "";
       redactSearchParams(parsed.searchParams);
-      return redactTokenLikeText(parsed.toString());
+      return redactTokenLikeText(unescapeRedactionMarker(parsed.toString()));
     } catch {
       return redactRelativeUrlLikeString(withNoHash);
     }
@@ -6387,7 +6388,7 @@ function redactRelativeUrlLikeString(value: string): string {
   const query = value.slice(queryIndex + 1);
   const params = new URLSearchParams(query);
   redactSearchParams(params);
-  const serialized = params.toString();
+  const serialized = unescapeRedactionMarker(params.toString());
   return redactTokenLikeText(`${base}${serialized ? `?${serialized}` : ""}`);
 }
 

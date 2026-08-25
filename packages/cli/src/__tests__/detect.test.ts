@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { detect, detectPackageManager, findNearbyProjectDirs, localFsReader } from "../detect";
+import {
+  detect,
+  detectPackageManager,
+  findNearbyProjectDirs,
+  isBuildOutputPath,
+  localFsReader,
+  parseNodeInvocation,
+} from "../detect";
 // memoryReader is test-only and deliberately absent from the public barrel.
 import { memoryReader } from "../testing";
 import { cleanup, makeTmpRepo } from "./helpers";
@@ -939,5 +946,92 @@ describe("no-recipe reasons name what was inspected", () => {
     const nearby = findNearbyProjectDirs(root, localFsReader(root));
     expect(nearby).toContain("apps/web");
     expect(nearby).toContain("apps/api");
+  });
+});
+
+// Defect class: injecting into build output is silent zero capture. `tsc` wipes
+// the edit and the dev command (`tsx watch src/index.ts`) never loads it, so the
+// run reports success and the app reports nothing.
+describe("build output is never an injection target", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    while (roots.length) cleanup(roots.pop()!);
+  });
+  const tmp = (files: Record<string, string>) => {
+    const r = makeTmpRepo(files);
+    roots.push(r);
+    return r;
+  };
+
+  const honoPkg = (extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      name: "api",
+      main: "dist/index.js",
+      dependencies: { hono: "^4.0.0" },
+      scripts: {
+        dev: "tsx watch src/index.ts",
+        build: "tsc",
+        start: "node dist/index.js",
+      },
+      ...extra,
+    });
+
+  it("wires the tsx-watched source entry, not the tsc output", () => {
+    const root = tmp({
+      "package.json": honoPkg(),
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { rootDir: "src", outDir: "dist" },
+      }),
+      "src/index.ts": "import { Hono } from 'hono'",
+      "dist/index.js": "// built",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBe("hono");
+    expect(r.entryFile).toBe(path.join(root, "src", "index.ts"));
+    expect(r.ambiguous).toBe(false);
+  });
+
+  it("parses a runner invocation with non-flag words before the file", () => {
+    expect(parseNodeInvocation("tsx watch src/index.ts")).toBe("src/index.ts");
+    expect(parseNodeInvocation("nodemon --exec ts-node src/server.ts")).toBe(
+      "src/server.ts",
+    );
+    expect(parseNodeInvocation("node --enable-source-maps src/index.mjs")).toBe(
+      "src/index.mjs",
+    );
+    // The build half of a chained script is not an entry.
+    expect(parseNodeInvocation("tsc && node dist/index.js")).toBeNull();
+    expect(parseNodeInvocation("vite build")).toBeNull();
+  });
+
+  it("falls back to the manual path when only build output exists", () => {
+    const root = tmp({
+      "package.json": honoPkg({ scripts: { start: "node dist/index.js" } }),
+      "dist/index.js": "// built",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBe("hono");
+    expect(r.entryFile).toBeNull();
+    expect(r.ambiguous).toBe(true);
+    expect(r.reasons.join("\n")).toMatch(/refused build output/);
+  });
+
+  it("treats a declared tsconfig outDir as build output even when unnamed", () => {
+    const root = tmp({
+      "package.json": JSON.stringify({
+        name: "api",
+        main: "lib/index.js",
+        dependencies: { hono: "^4.0.0" },
+      }),
+      "tsconfig.json": '{\n  // generated\n  "compilerOptions": { "outDir": "lib" }\n}',
+      "lib/index.js": "// built",
+    });
+    expect(detect(root).entryFile).toBeNull();
+    expect(isBuildOutputPath(root, path.join(root, "lib", "index.js"))).toBe(
+      true,
+    );
+    expect(isBuildOutputPath(root, path.join(root, "src", "index.ts"))).toBe(
+      false,
+    );
   });
 });

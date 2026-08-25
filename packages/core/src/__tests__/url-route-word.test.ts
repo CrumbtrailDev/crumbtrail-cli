@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { redactUrl } from "../redaction";
+import { REDACTED_VALUE, redactUrl } from "../redaction";
 
 /**
  * The preceder rule redacts whatever follows `auth`, `token`, `session` and
@@ -37,6 +37,75 @@ describe("path segments after a sensitive preceder", () => {
     expect(
       redactUrl("http://localhost:7461/api/auth/abcdefghijklmnopqrstuvwxyz").value,
     ).toMatch(/\[REDACTED\]|%5BREDACTED%5D/);
+  });
+
+  // A captured 400 read `POST http://127.0.0.1:57421/auth/[REDACTED]/token`.
+  // The hidden segment was the literal `v1`, so the issue title named no
+  // endpoint at all.
+  it("keeps an API version segment", () => {
+    expect(redactUrl("http://127.0.0.1:57421/auth/v1/token").value).toBe(
+      "http://127.0.0.1:57421/auth/v1/token",
+    );
+    for (const version of ["v1", "v2", "v10"]) {
+      expect(redactUrl(`https://a.test/api/auth/${version}/user`).value).toBe(
+        `https://a.test/api/auth/${version}/user`,
+      );
+    }
+    expect(redactUrl("https://a.test/api/auth/oauth2/authorize").value).toBe(
+      "https://a.test/api/auth/oauth2/authorize",
+    );
+  });
+
+  // The version carve-out must not generalise into "a word with digits in it".
+  it("still redacts a secret-shaped segment that merely mixes letters and digits", () => {
+    for (const url of [
+      "https://a.test/account/password/hunter2",
+      "https://a.test/oauth/client_secret/abc123",
+      "https://a.test/api/auth/v12345",
+      "https://a.test/api/auth/a1b2c3d4e5f6a7b8",
+      "https://a.test/api/session/3f2504e04f8911d3",
+    ]) {
+      expect(redactUrl(url).value).toContain(REDACTED_VALUE);
+    }
+  });
+});
+
+/**
+ * The marker is written for people to read. Serializers escape its brackets, so
+ * a stored URL used to read `…/auth/%5BREDACTED%5D/token` and every consumer
+ * rendered that literally, down to "Node runtime warning: %5BREDACTED%5D …".
+ */
+describe("the redaction marker survives URL serialization unescaped", () => {
+  it("writes the marker literally in a path segment", () => {
+    const value = redactUrl(
+      "https://api.test/reset/9f3c1a2b7d4e8a6b5c4d3e2f1a0b9c8d",
+    ).value;
+    expect(value).toContain(`/reset/${REDACTED_VALUE}`);
+    expect(value).not.toContain("%5B");
+  });
+
+  it("writes the marker literally in a query value", () => {
+    const value = redactUrl("https://api.test/search?q=widget&token=abc").value;
+    expect(value).toContain(`q=${REDACTED_VALUE}`);
+    expect(value).toContain(`token=${REDACTED_VALUE}`);
+    expect(value).not.toContain("%5B");
+  });
+
+  it("writes the marker literally in a relative URL", () => {
+    const value = redactUrl("/reset/9f3c1a2b7d4e8a6b5c4d3e2f1a0b9c8d?t=abc")
+      .value;
+    expect(value).toBe(`/reset/${REDACTED_VALUE}?t=${REDACTED_VALUE}`);
+  });
+
+  it("writes the marker literally in a scheme-relative URL", () => {
+    const value = redactUrl("//api.test/search?token=abc").value;
+    expect(value).toBe(`//api.test/search?token=${REDACTED_VALUE}`);
+  });
+
+  it("leaves ordinary percent-encoding alone", () => {
+    expect(redactUrl("https://api.test/search?q=a%20b&page=2").value).toContain(
+      "page=2",
+    );
   });
 });
 

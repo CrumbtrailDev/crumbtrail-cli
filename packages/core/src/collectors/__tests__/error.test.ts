@@ -73,7 +73,7 @@ describe("errorCollector", () => {
     expect(events[0].d.msg).toContain("[REDACTED]");
     expect(events[0].d.msg).not.toContain("hunter2");
     expect(events[0].d.file).toBe(
-      "https://app.example.test/reset?token=%5BREDACTED%5D",
+      "https://app.example.test/reset?token=[REDACTED]",
     );
     expect(events[0].d.stk).not.toContain("sk_fake_abcdefghijklmnopqrstuvwxyz");
     expect(events[0].d.redaction).toMatchObject({
