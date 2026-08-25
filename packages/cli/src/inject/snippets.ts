@@ -191,33 +191,47 @@ export function nodeInitSnippet(
 }
 
 /**
- * Guarded `.env` load, emitted with the Express middleware wiring.
+ * Guarded `.env` load, emitted at the very top of every backend-JS entry, above
+ * the capture init.
  *
- * The middleware options object (`{ endpoint, authToken: process.env.<VAR> }`)
- * is built while the entry module is evaluated. Nothing has loaded the project's
- * `.env` by then: `autoCapture` loads it itself, but it is reached through a
- * dynamic import that resolves in a later microtask, after every `app.use(...)`
- * line has already run. Without this the middleware carries no token,
- * `sendBackendEvent` omits the `X-Crumbtrail-Auth` header, and every
- * `backend.req.*` event is rejected — so crash capture works, the wizard reports
- * success, and frontend to backend linkage stays empty forever.
+ * Nothing has loaded the project's `.env` when an entry module starts
+ * evaluating. On a hosted platform the key is a real environment variable so
+ * every read works, which is exactly why this stays invisible until someone
+ * reproduces a bug on their laptop — where the key lives in `.env` and every
+ * read sees nothing. Capture is then silently off in the one place a person is
+ * actually looking for it.
+ *
+ * Two distinct reads depend on this. The Express middleware options object
+ * (`{ endpoint, authToken: process.env.<VAR> }`) is built while the entry module
+ * evaluates, so without this the middleware carries no token and every
+ * `backend.req.*` event is rejected. `autoCapture` loads `.env` itself, but only
+ * from the directory it is reached in and only after its dynamic import
+ * resolves — an app that loads its own env file later in the entry, or from a
+ * path of its own, still starts capture against an unset variable.
  *
  * Only fills the key in when it is absent, and Node's own loader never
  * overwrites a variable that is already set, so a real environment still wins.
  * `Reflect.get` rather than `process.loadEnvFile?.()` so the emitted line also
  * type checks in a TypeScript entry whose `@types/node` predates Node 20.12.
+ *
+ * `quote` matches the surrounding scaffold's Prettier config — Nest ships
+ * `singleQuote: true`, everything else takes Prettier's double-quote default.
  */
-export function expressEnvPreloadSnippet(keyEnvVar: string): string {
+export function envPreloadSnippet(
+  keyEnvVar: string,
+  quote: (value: string) => string = JSON.stringify,
+): string {
   return [
-    `// Crumbtrail — load the env file so ${keyEnvVar} is set before the`,
-    "// middleware below reads it (the middleware options are built as this",
-    "// file is evaluated). Try .env first because that is where the installer",
-    "// puts a server key; .env.local remains a fallback for an existing setup.",
+    `// Crumbtrail — load the env file so ${keyEnvVar} is set before anything`,
+    "// below reads it (capture init and, on Express, the middleware options are",
+    "// both built as this file is evaluated). Try .env first because that is",
+    "// where the installer puts a server key; .env.local remains a fallback for",
+    "// an existing setup.",
     `if (!process.env.${keyEnvVar}) {`,
-    '  for (const envFile of [".env", ".env.local"]) {',
+    `  for (const envFile of [${quote(".env")}, ${quote(".env.local")}]) {`,
     "    try {",
-    '      const loadEnvFile = Reflect.get(process, "loadEnvFile");',
-    '      if (typeof loadEnvFile === "function") loadEnvFile.call(process, envFile);',
+    `      const loadEnvFile = Reflect.get(process, ${quote("loadEnvFile")});`,
+    `      if (typeof loadEnvFile === ${quote("function")}) loadEnvFile.call(process, envFile);`,
     "    } catch {",
     "      // Missing file, or Node < 20.12: try the next one, then keep",
     "      // whatever the real environment already has.",

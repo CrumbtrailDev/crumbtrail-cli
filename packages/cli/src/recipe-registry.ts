@@ -39,6 +39,17 @@ export interface KeyRef {
    * app that captures nothing, with every printed step claiming success.
    */
   compileTime?: boolean;
+  /**
+   * The bundler substitutes this variable's value into the built bundle, so it
+   * must be present in the BUILD environment rather than the run one. Set for
+   * every client stack: Vite, Next, Astro and Expo all inline their public vars.
+   *
+   * Load-bearing for containerised frontends. A Docker build has its own
+   * environment, so a service variable reaches the bundler only through a
+   * declared `ARG` — and an image built without one carries no key while every
+   * step of the build reports success.
+   */
+  bundlerInlined?: true;
 }
 
 export interface RecipeMeta {
@@ -100,18 +111,22 @@ export interface RecipeMeta {
 const VITE_KEY: KeyRef = {
   envVar: "VITE_CRUMBTRAIL_KEY",
   expr: "import.meta.env.VITE_CRUMBTRAIL_KEY",
+  bundlerInlined: true,
 };
 const NEXT_KEY: KeyRef = {
   envVar: "NEXT_PUBLIC_CRUMBTRAIL_KEY",
   expr: "process.env.NEXT_PUBLIC_CRUMBTRAIL_KEY",
+  bundlerInlined: true,
 };
 const ASTRO_KEY: KeyRef = {
   envVar: "PUBLIC_CRUMBTRAIL_KEY",
   expr: "import.meta.env.PUBLIC_CRUMBTRAIL_KEY",
+  bundlerInlined: true,
 };
 const EXPO_KEY: KeyRef = {
   envVar: "EXPO_PUBLIC_CRUMBTRAIL_KEY",
   expr: "process.env.EXPO_PUBLIC_CRUMBTRAIL_KEY",
+  bundlerInlined: true,
 };
 const NODE_KEY: KeyRef = {
   envVar: "CRUMBTRAIL_KEY",

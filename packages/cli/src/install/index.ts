@@ -17,10 +17,7 @@
 //               first-class ingest target; flagged coming-soon.
 
 import { STACK_IDS, type Stack } from "crumbtrail-core";
-import {
-  expressEnvPreloadSnippet,
-  nodeInitSnippet,
-} from "../inject/snippets.js";
+import { envPreloadSnippet, nodeInitSnippet } from "../inject/snippets.js";
 
 export type InstallVariantKind = "js" | "otlp" | "infra";
 
@@ -509,7 +506,7 @@ function backendJsPrompt(
       "     middleware, or backend request spans (and frontend-to-backend",
       "     linkage) stay empty. The options object is built while this file is",
       "     evaluated, so load .env first or the middleware posts with no key:",
-      ...expressEnvPreloadSnippet(envVar)
+      ...envPreloadSnippet(envVar)
         .split("\n")
         .map((line) => `       ${line}`),
       "       import {",

@@ -155,12 +155,15 @@ CLI and the composite action never echo the key.
 
 ## What it writes
 
-Two kinds of change, in the package it's wiring:
+Three kinds of change, in the package it's wiring:
 
 - the SDK import and `Crumbtrail.init(...)` call in your entry file
 - for a Flutter app, the import plus an awaited `Crumbtrail.start(...)` as the
   first statement of `main()` (capture has to be running before the first frame)
 - your ingest key, in an env file, plus a `.gitignore` entry for that file
+- the same setup code in every **other process the package starts**, and the
+  build argument a **containerised frontend** needs — see
+  [Everything a deployed app needs](#everything-a-deployed-app-needs)
 
 Browser inits also carry a `networkCorrelationAllowedOrigins` list, filled in
 with the backend origins the repository names: the targets of the app's own dev
@@ -220,6 +223,46 @@ target endpoint, has a configured ingest key and service name, and enables
 remote configuration where the SDK supports it. When an SDK is present but
 the setup is incomplete, the wizard names what is missing and does not add a
 second initialization. It never edits libraries or configuration only packages.
+
+## Everything a deployed app needs
+
+An app is more than its entry file, and wiring only the entry leaves gaps that
+report success and capture nothing. The wizard closes three of them, and names
+each edit it makes.
+
+**Your key is read after your `.env` is loaded.** Every backend entry gets a
+short guarded loader above the setup code, so `CRUMBTRAIL_KEY` is set before
+anything reads it. Without it a key that lives in `.env` rather than in the real
+environment is missing at the moment it is needed, so capture is off on a laptop
+and on in production. That is the wrong way round: the laptop is where someone
+is reproducing the bug. The loader fills the variable in only when it is absent,
+so a real environment variable always wins.
+
+**Every process your package starts is wired, not just the one that serves
+HTTP.** The wizard reads your `package.json` scripts, and any other runnable
+file they start — a queue consumer, a scheduler, a batch worker — is wired too,
+each reporting under its own service name (`your-app` and `your-app-worker`).
+Those processes run unattended, which is exactly why their failures are worth
+capturing. Config files, tests and build scripts are left alone, and a file with
+uncommitted changes is reported rather than edited.
+
+**A containerised frontend gets its key declared as a build argument.** Vite,
+Next, Astro and Expo bake their public variables into the bundle when it is
+built, and a Docker build cannot see a variable the Dockerfile has not declared
+with `ARG`. A Dockerfile that lists every other `VITE_*` and not this one builds
+an image that can never carry a key, and nothing about the build fails to say
+so. The wizard adds the missing `ARG` (and its `ENV` mirror, if the siblings use
+one) next to those siblings, in the stage that runs the build. When the
+Dockerfile passes no build arguments at all, where the line belongs is a guess,
+so you get a warning naming the file instead of an edit. Pass the value at build
+time:
+
+```bash
+docker build --build-arg VITE_CRUMBTRAIL_KEY=<your-ingest-key> .
+```
+
+Your key still has to reach whatever builds your frontend. If that build runs
+somewhere other than the platform hosting your API, set the variable there too.
 
 ## If your frontend and backend are separate services
 

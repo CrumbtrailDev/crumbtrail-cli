@@ -31,6 +31,27 @@ export interface Plan {
    * prepends `content` as a block.
    */
   applyMode?: "prepend" | "rewrite";
+  /**
+   * Files this plan touches BESIDES `targetPath`, already resolved to their
+   * final bytes.
+   *
+   * The single-target shape assumes one app is one file, which stops being true
+   * as soon as a package starts a second process (a worker) or bakes its key in
+   * at build time (a Dockerfile ARG). Those edits are computed by the
+   * plan-builders, like every other edit, and carried here so the executor still
+   * applies the whole plan all-or-nothing.
+   *
+   * Deliberately full content rather than a prepend block: an extra target is
+   * read, gated and transformed while the plan is built, so the executor never
+   * has to re-derive what a second file should look like.
+   */
+  extraEdits?: Array<{
+    path: string;
+    mode: "create" | "update";
+    content: string;
+    /** One line for the wizard summary, e.g. "wired the queue worker". */
+    label: string;
+  }>;
   /** Non-fatal notes to surface to the user. */
   warnings: string[];
   /** fallback-ai: the ready-to-paste code snippet (reads the key from env). */
