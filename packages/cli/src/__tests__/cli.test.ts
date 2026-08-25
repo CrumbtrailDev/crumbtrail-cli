@@ -195,6 +195,11 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
     openBrowserFn: vi.fn(async () => true),
     ui,
     prompter: noopPrompter,
+    // Pinned so the endpoint default never depends on whether the machine
+    // running the suite happens to hold a `crumbtrail login`. Without this the
+    // deps fall through to the real `loadAuth`, and a developer logged into a
+    // local stack sees the hosted-default assertions fail while CI passes.
+    loadStoredAuth: () => undefined,
     // DISPLAY pinned so canUseBrowser's headless-Linux guard doesn't make
     // browser-open assertions platform-dependent (CI runners have no X).
     env: { CRUMBTRAIL_BASE_URL: "http://127.0.0.1:9999", DISPLAY: ":0" },
