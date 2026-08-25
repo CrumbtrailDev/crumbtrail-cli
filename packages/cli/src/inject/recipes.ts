@@ -21,7 +21,13 @@ import { isBackendRecipe } from "../backend-origins";
 import { isBuildOutputPath, type Recipe } from "../detect";
 import type { FileReader } from "../readers/types";
 import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
-import { inspectIntegration, type IntegrationStatus } from "./integration";
+import {
+  inspectIntegration,
+  reachableSourceFiles,
+  type IntegrationRequirement,
+  type IntegrationStatus,
+} from "./integration";
+import { amendSource, type AmendField } from "./amend";
 import { addDockerBuildArg, DOCKERFILE_CANDIDATES } from "./docker";
 import {
   deployManifestNaming,
@@ -331,15 +337,91 @@ const INTEGRATION_REQUIREMENT_COPY: Record<
   "remote-config": "remote configuration",
 };
 
+/**
+ * The concrete next action for a requirement the installer could not satisfy.
+ *
+ * Every branch here names a thing the reader can go and do. "Missing an app or
+ * service name" was true and useless: it did not say the file already declared
+ * one, did not say which variable the endpoint comes from, and left the run with
+ * no next step at all.
+ */
+function nextActionFor(
+  input: BuildPlanInput,
+  requirement: IntegrationRequirement,
+  status: IntegrationStatus,
+  amend: AmendReport | null,
+): string {
+  const blocked = amend?.blocked.find((b) => b.requirement === requirement);
+  const where = amend?.file
+    ? path.relative(input.cwd, amend.file) || amend.file
+    : "your entry file";
+  switch (requirement) {
+    case "sdk": {
+      const pkgs = RECIPE_REGISTRY[input.recipe].sdkPackages.join(", ");
+      return `Install ${pkgs} (the installer adds it for you on the next run once the entry is resolved).`;
+    }
+    case "entry":
+      return "No Crumbtrail entry point is reachable from this app's entry file — paste the snippet above into it.";
+    case "endpoint":
+      return blocked?.existingKey
+        ? `${where} already sets \`${blocked.existingKey}\`${blocked.existingValue ? ` to \`${blocked.existingValue}\`` : ""}, so it was left alone. Point that at ${input.endpoint} — if it reads an environment variable, set that variable to ${input.endpoint}.`
+        : `Set the init endpoint to ${input.endpoint} in ${where}.`;
+    case "ingest-key": {
+      const keyRef = keyRefFor(input);
+      if (!keyRef) {
+        return `${where} carries its ingest key as a literal — paste your key from the dashboard in place of ${KEY_PLACEHOLDER}.`;
+      }
+      return blocked?.existingKey
+        ? `${where} already sets \`${blocked.existingKey}\`${blocked.existingValue ? ` from \`${blocked.existingValue}\`` : ""}, so it was left alone. Make sure that resolves to your ingest key${keyRef.compileTime ? ` (supplied at build time)` : ` — normally ${keyRef.envVar} in your env file`}.`
+        : `Set ${keyRef.envVar} in your env file to the key from the dashboard.`;
+    }
+    case "service-name": {
+      // The literal at the init call itself, never a `service:` matched anywhere
+      // in the reachable graph — a backend that names a downstream `payments`
+      // service elsewhere in the same file is not the app's own name.
+      const atCallSite = /^["']([^"']+)["']$/.exec(
+        blocked?.existingValue ?? "",
+      );
+      const target = input.serviceName
+        ? `\`${input.serviceName}\``
+        : "an unnamed app";
+      if (atCallSite) {
+        return `This app already reports as \`${atCallSite[1]}\` (set in ${where}); this run targeted ${target}. Leaving your name in place — re-run and name the service \`${atCallSite[1]}\` so the dashboard and the code agree, or change \`service\` in ${where} yourself.`;
+      }
+      if (blocked?.existingKey) {
+        return `${where} already sets \`service\`${blocked.existingValue ? ` from \`${blocked.existingValue}\`` : ""}, so it was left alone. Make that resolve to ${target} — the dashboard lists this app under the name it sends.`;
+      }
+      if (status.existingServiceName) {
+        return `This app already reports as \`${status.existingServiceName}\`; this run targeted ${target}. Re-run and name the service \`${status.existingServiceName}\` so the dashboard and the code agree.`;
+      }
+      return input.serviceName
+        ? `Add \`service: ${JSON.stringify(input.serviceName)}\` to the init call in ${where}.`
+        : "Name this app in the init call so its sessions say where they came from.";
+    }
+    case "remote-config":
+      return blocked?.existingKey
+        ? `${where} already sets \`${blocked.existingKey}\` — set it to true so dashboard capture settings reach this app.`
+        : `Add \`remoteConfig: true\` to the init call in ${where} so dashboard capture settings reach it.`;
+  }
+}
+
 function incompletePlan(
   input: BuildPlanInput,
   status: IntegrationStatus,
+  amend: AmendReport | null = null,
 ): Plan {
-  const missing = status.missing
+  const unresolved = status.missing.filter(
+    (requirement) => !(amend?.added ?? []).includes(requirement),
+  );
+  const missing = unresolved
     .map((requirement) => INTEGRATION_REQUIREMENT_COPY[requirement])
     .join(", ");
   return fallbackPlan(input, incompleteSnippet(input), [
-    `Found an existing Crumbtrail integration, but it is incomplete for ${input.endpoint}. Missing ${missing}. Update that integration in place. The installer will not add another initialization.`,
+    `Found an existing Crumbtrail integration, but it is incomplete for ${input.endpoint}. Missing ${missing}. The installer will not add a second initialization beside your own.`,
+    ...unresolved.map(
+      (requirement) =>
+        `Next: ${nextActionFor(input, requirement, status, amend)}`,
+    ),
   ]);
 }
 
@@ -357,7 +439,134 @@ function existingIntegrationPlan(
     serviceName: input.serviceName,
     io,
   });
-  return status.complete ? skipPlan(input) : incompletePlan(input, status);
+  if (status.complete) return skipPlan(input);
+  return amendPlan(input, io, status) ?? incompletePlan(input, status);
+}
+
+/** What one attempted amend actually managed to do to one file. */
+interface AmendReport {
+  file: string;
+  added: IntegrationRequirement[];
+  /** The option names written, e.g. ["remoteConfig", "service"]. */
+  addedFields: string[];
+  blocked: NonNullable<ReturnType<typeof amendSource>>["blocked"];
+}
+
+/** Requirements an in-place source edit can never be the answer to. */
+const NOT_A_SOURCE_EDIT = new Set<IntegrationRequirement>(["sdk", "entry"]);
+
+/**
+ * Turn an incomplete existing integration into an edit of the customer's OWN
+ * init call, rather than a refusal.
+ *
+ * Returns null when no reachable file holds an options object this can reason
+ * about — the caller then prints the guidance it always did. When the object IS
+ * understood but every missing option is already set to something else, this
+ * returns the guidance plan too, except now each line names the exact next
+ * action instead of restating the gap.
+ *
+ * The ingest key is a value, never a literal: what gets added is the ENV
+ * EXPRESSION the recipe reads, and the key itself still goes to the env file
+ * through the normal path. A recipe with no env mechanism (angular, static)
+ * therefore has no key field to add at all.
+ */
+function amendPlan(
+  input: BuildPlanInput,
+  io: InjectIO,
+  status: IntegrationStatus,
+): Plan | null {
+  // Written in the same order the fresh snippets use, so an amended init and an
+  // injected one read identically in review.
+  const ORDER: IntegrationRequirement[] = [
+    "endpoint",
+    "ingest-key",
+    "remote-config",
+    "service-name",
+  ];
+  const wanted = ORDER.filter(
+    (r) => status.missing.includes(r) && !NOT_A_SOURCE_EDIT.has(r),
+  );
+  if (wanted.length === 0) return null;
+
+  const keyExpr = keyExprFor(input);
+  const fields: AmendField[] = [];
+  for (const requirement of wanted) {
+    if (requirement === "endpoint") {
+      fields.push({ requirement, value: JSON.stringify(input.endpoint) });
+    } else if (requirement === "ingest-key" && keyExpr) {
+      fields.push({ requirement, value: keyExpr });
+    } else if (requirement === "service-name" && input.serviceName?.trim()) {
+      const name = input.serviceName.trim();
+      fields.push({ requirement, value: (_callee, quote) => quote(name) });
+    } else if (requirement === "remote-config") {
+      fields.push({ requirement, value: "true" });
+    }
+  }
+  if (fields.length === 0) return null;
+
+  let report: AmendReport | null = null;
+  let amended: { file: string; text: string } | null = null;
+  for (const entry of reachableSourceFiles({
+    cwd: input.cwd,
+    recipe: input.recipe,
+    endpoint: input.endpoint,
+    entryFile: input.entryFile,
+    serviceName: input.serviceName,
+    io,
+  })) {
+    const outcome = amendSource(entry.text, fields);
+    if (!outcome) continue;
+    const candidate: AmendReport = {
+      file: entry.file,
+      added: outcome.added,
+      addedFields: outcome.addedFields,
+      blocked: outcome.blocked,
+    };
+    // The first file that can actually take an option wins. A file that only
+    // reports what is already set is kept as the explanation of last resort.
+    if (outcome.added.length > 0 && outcome.text) {
+      report = candidate;
+      amended = { file: entry.file, text: outcome.text };
+      break;
+    }
+    report ??= candidate;
+  }
+  if (!report) return null;
+  if (!amended) return incompletePlan(input, status, report);
+
+  const stillMissing = status.missing.filter((r) => !report.added.includes(r));
+  const rel = path.relative(input.cwd, amended.file) || amended.file;
+  const added = report.added
+    .map((r) => INTEGRATION_REQUIREMENT_COPY[r])
+    .join(", ");
+  const warnings = [
+    `Your own Crumbtrail initialization in ${rel} was missing ${added} — added ${report.addedFields.map((f) => `\`${f}\``).join(", ")} to it instead of starting a second one. Nothing else in that file changed.`,
+    ...stillMissing
+      .filter((r) => !NOT_A_SOURCE_EDIT.has(r))
+      .map((r) => `Next: ${nextActionFor(input, r, status, report)}`),
+  ];
+  const amendedFields = report.addedFields;
+
+  const git = io.gitStatus(input.cwd, amended.file);
+  if (git.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: amended.file,
+      content: amended.text,
+      applyMode: "rewrite",
+      amendedFields,
+      warnings,
+    };
+  }
+  return {
+    recipe: input.recipe,
+    kind: "amend-init",
+    targetPath: amended.file,
+    content: amended.text,
+    amendedFields,
+    warnings,
+  };
 }
 
 function createPlan(
@@ -1732,7 +1941,14 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
     plan.keyIsSourceLiteral = true;
     return plan;
   }
-  if (integration.found) return incompletePlan(input, integration);
+  // An incomplete integration the customer already wrote is a thing to FINISH,
+  // not a thing to refuse. Only when its init call cannot be parsed and extended
+  // with confidence does this fall back to the printed guidance.
+  if (integration.found) {
+    return (
+      amendPlan(input, io, integration) ?? incompletePlan(input, integration)
+    );
+  }
   switch (input.recipe) {
     case "tauri":
       return planTauri(input, io);

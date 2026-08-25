@@ -5,6 +5,7 @@ export type PlanKind =
   | "create" // write a brand-new file
   | "prepend" // strictly prepend into an existing file
   | "rewrite" // replace an existing file with fully transformed content (Express middleware wiring)
+  | "amend-init" // add the missing options to the customer's OWN init call, in place
   | "skip-already-wired" // project already references Crumbtrail; no-op
   | "needs-confirm-dirty" // target has uncommitted changes; needs --force / confirm
   | "fallback-ai" // detection/safety ambiguous; hand off to the AI-prompt path
@@ -31,6 +32,13 @@ export interface Plan {
    * prepends `content` as a block.
    */
   applyMode?: "prepend" | "rewrite";
+  /**
+   * `amend-init`: the option names added to the customer's existing init call,
+   * in the order they were written. The wizard prints these instead of "wired
+   * your entry file", because the honest description of the edit is "added
+   * `service` to the init you already had", not "set Crumbtrail up".
+   */
+  amendedFields?: string[];
   /**
    * Files this plan touches BESIDES `targetPath`, already resolved to their
    * final bytes.

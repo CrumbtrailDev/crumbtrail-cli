@@ -104,8 +104,138 @@ describe("inspectIntegration", () => {
 
     expect(plan.kind).toBe("fallback-ai");
     expect(plan.content).toBeNull();
-    expect(plan.warnings.join(" ")).toContain("will not add another initialization");
+    expect(plan.warnings.join(" ")).toContain(
+      "will not add a second initialization",
+    );
     expect(plan.warnings.join(" ")).toContain("the install endpoint");
+    // Guidance that does not end in something to do is where the install used
+    // to stop. Every unresolved requirement names its own next step.
+    expect(plan.warnings.join(" ")).toContain("Next:");
   });
 });
 
+describe("amending an integration the customer already has", () => {
+  const amendableFiles = (): Record<string, string> => ({
+    [p("package.json")]: JSON.stringify({
+      dependencies: { "crumbtrail-core": "0.37.0" },
+    }),
+    [p("node_modules", "crumbtrail-core", "package.json")]: "{}",
+    [p("src", "main.tsx")]: [
+      'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
+      "",
+      "Crumbtrail.init({",
+      "  ...PRESET_PASSIVE,",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "});",
+      "",
+      "console.log('app boot');",
+    ].join("\n"),
+    [p(".env.local")]: "VITE_CRUMBTRAIL_KEY=ctkey_test\n",
+  });
+
+  function amendPlanFor(files: Record<string, string>) {
+    return buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.tsx"),
+        serviceName: "web",
+        options: { force: true },
+      },
+      fakeInjectIO(files),
+    );
+  }
+
+  it("adds only the absent options and leaves every other byte alone", () => {
+    const files = amendableFiles();
+    const before = files[p("src", "main.tsx")];
+    const plan = amendPlanFor(files);
+
+    expect(plan.kind).toBe("amend-init");
+    expect(plan.targetPath).toBe(p("src", "main.tsx"));
+    expect(plan.content).toBe(
+      [
+        'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
+        "",
+        "Crumbtrail.init({",
+        "  ...PRESET_PASSIVE,",
+        `  httpEndpoint: "${ENDPOINT}",`,
+        "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+        "  remoteConfig: true,",
+        '  service: "web",',
+        "});",
+        "",
+        "console.log('app boot');",
+      ].join("\n"),
+    );
+    // Byte-identical outside the two inserted lines.
+    expect(
+      plan
+        .content!.split("\n")
+        .filter(
+          (line) =>
+            line !== "  remoteConfig: true," && line !== '  service: "web",',
+        )
+        .join("\n"),
+    ).toBe(before);
+  });
+
+  it("never rewrites an option the customer already set", () => {
+    const files = amendableFiles();
+    files[p("src", "main.tsx")] = files[p("src", "main.tsx")].replace(
+      `  httpEndpoint: "${ENDPOINT}",`,
+      '  httpEndpoint: "https://ingest.customer.internal",',
+    );
+    const plan = amendPlanFor(files);
+
+    expect(plan.content).toContain(
+      '  httpEndpoint: "https://ingest.customer.internal",',
+    );
+    expect(plan.content).not.toContain(ENDPOINT);
+    expect(plan.warnings.join(" ")).toContain("already sets `httpEndpoint`");
+  });
+
+  it("never writes an ingest key into the source", () => {
+    const files = amendableFiles();
+    files[p("src", "main.tsx")] = files[p("src", "main.tsx")].replace(
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,\n",
+      "",
+    );
+    const plan = amendPlanFor(files);
+
+    expect(plan.content).toContain(
+      "httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY",
+    );
+    expect(plan.content).not.toContain("ctkey_test");
+  });
+
+  it("names the app the source already declares rather than renaming it", () => {
+    const files = amendableFiles();
+    files[p("src", "main.tsx")] = files[p("src", "main.tsx")].replace(
+      "});",
+      '  remoteConfig: true,\n  service: "asiniq-admin",\n});',
+    );
+    const plan = amendPlanFor(files);
+
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.content).toBeNull();
+    expect(plan.warnings.join(" ")).toContain(
+      "already reports as `asiniq-admin`",
+    );
+    expect(plan.warnings.join(" ")).toContain("Leaving your name in place");
+  });
+
+  it("refuses to guess at an init it cannot enumerate", () => {
+    const files = amendableFiles();
+    files[p("src", "main.tsx")] = files[p("src", "main.tsx")].replace(
+      "  ...PRESET_PASSIVE,",
+      "  ...customerDefaults,",
+    );
+    const plan = amendPlanFor(files);
+
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.warnings.join(" ")).toContain("Next:");
+  });
+});

@@ -2994,6 +2994,23 @@ async function applyInjection(
     return { outcome: "wired", filesTouched, notes };
   }
 
+  if (plan.kind === "amend-init") {
+    announceExtras();
+    ui.out(
+      color.dim(
+        `  Completing the Crumbtrail setup you already have in ${plan.targetPath}…`,
+      ),
+    );
+    const res = deps.executePlan(plan);
+    filesTouched.push(...res.written);
+    ui.out(
+      ok(
+        `Added ${(plan.amendedFields ?? []).join(", ")} to the Crumbtrail init you already had in ${plan.targetPath}. Nothing else in that file changed.`,
+      ),
+    );
+    return { outcome: "wired", filesTouched, notes };
+  }
+
   // create / prepend
   announceExtras();
   if (plan.targetPath) {

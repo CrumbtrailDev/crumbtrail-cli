@@ -29,6 +29,18 @@ export interface IntegrationStatus {
   found: boolean;
   /** The concrete pieces that keep an existing integration from being complete. */
   missing: IntegrationRequirement[];
+  /**
+   * The app name the reachable source ALREADY declares, when it declares one
+   * that is not the name this run targets.
+   *
+   * `service-name` in `missing` means "this run's name is not in the source",
+   * which covers two very different situations: an integration that names no app
+   * at all (a field the installer can add), and one that names a different app
+   * (a value only the user may change). Without this the caller cannot tell them
+   * apart, and it reported "missing an app or service name" over a file whose
+   * next line said `service: "asiniq-admin"`.
+   */
+  existingServiceName?: string;
 }
 
 export const SOURCE_EXTENSIONS = [
@@ -99,15 +111,23 @@ function defaultEntryFiles(input: IntegrationCheckInput): string[] {
   return [];
 }
 
-/** Read the entry and the local modules it imports, bounded to avoid surprises. */
-function reachableSource(input: IntegrationCheckInput): string[] {
+/**
+ * Read the entry and the local modules it imports, bounded to avoid surprises.
+ *
+ * Paths are carried alongside the text because "which file holds the init call"
+ * is the first thing an in-place amend has to know, and joining the sources
+ * threw it away.
+ */
+export function reachableSourceFiles(
+  input: IntegrationCheckInput,
+): Array<{ file: string; text: string }> {
   const entries = input.entryFile
     ? [path.resolve(input.entryFile)]
     : defaultEntryFiles(input).filter(
         (file) => input.io.readFile(file) !== null,
       );
   if (entries.length === 0) return [];
-  const files: string[] = [];
+  const files: Array<{ file: string; text: string }> = [];
   const pending = [...entries];
   const visited = new Set<string>();
 
@@ -117,7 +137,7 @@ function reachableSource(input: IntegrationCheckInput): string[] {
     visited.add(file);
     const text = input.io.readFile(file);
     if (text === null) continue;
-    files.push(text);
+    files.push({ file, text });
     LOCAL_IMPORT.lastIndex = 0;
     for (const match of text.matchAll(LOCAL_IMPORT)) {
       const imported = sourceModulePath(input.io, file, match[1]);
@@ -236,6 +256,12 @@ function serviceConfigured(
   return new RegExp(`\\bservice\\s*:\\s*["']${escaped}["']`).test(source);
 }
 
+/** The app name a `service:` option already carries, if it carries a literal one. */
+function declaredServiceName(source: string): string | undefined {
+  const match = /\bservice\s*:\s*["']([^"']+)["']/.exec(source);
+  return match?.[1];
+}
+
 /** The literal a recipe with no env mechanism leaves in place of a real key. */
 const KEY_PLACEHOLDER_IN_SOURCE = /httpAuthToken\s*:\s*["'`]<[^"'`]*>["'`]/;
 
@@ -271,7 +297,9 @@ function remoteConfigRequired(recipe: Recipe): boolean {
 export function inspectIntegration(
   input: IntegrationCheckInput,
 ): IntegrationStatus {
-  const source = reachableSource(input).join("\n");
+  const source = reachableSourceFiles(input)
+    .map((entry) => entry.text)
+    .join("\n");
   const found = CRUMBTRAIL_REFERENCE.test(source);
   const missing: IntegrationRequirement[] = [];
 
@@ -279,8 +307,11 @@ export function inspectIntegration(
   if (source.length === 0 || !found) missing.push("entry");
   if (!endpointConfigured(input, source)) missing.push("endpoint");
   if (!keyConfigured(input, source)) missing.push("ingest-key");
-  if (!serviceConfigured(source, input.serviceName))
+  let existingServiceName: string | undefined;
+  if (!serviceConfigured(source, input.serviceName)) {
     missing.push("service-name");
+    existingServiceName = declaredServiceName(source);
+  }
   if (
     remoteConfigRequired(input.recipe) &&
     !/\bremoteConfig\s*:\s*true\b/.test(source)
@@ -288,5 +319,10 @@ export function inspectIntegration(
     missing.push("remote-config");
   }
 
-  return { complete: missing.length === 0, found, missing };
+  return {
+    complete: missing.length === 0,
+    found,
+    missing,
+    ...(existingServiceName ? { existingServiceName } : {}),
+  };
 }
