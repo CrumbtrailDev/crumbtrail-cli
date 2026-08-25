@@ -227,6 +227,90 @@ describe("installBackendLogCapture", () => {
     expect(wrote).toBe(line);
   });
 
+  it("captures lines flushed through fs.writev on fd 1", () => {
+    const events: BugEvent[] = [];
+    const wrote: string[] = [];
+    const fsImpl = {
+      write: () => undefined,
+      writeSync: () => 0,
+      writev(fd: number, buffers: unknown): unknown {
+        void fd;
+        for (const buffer of buffers as unknown[]) wrote.push(String(buffer));
+        return undefined;
+      },
+      writevSync: () => 0,
+    };
+
+    const handle = installBackendLogCapture({
+      emit: (event) => events.push(event),
+      stdout: fakeStream(),
+      stderr: fakeStream(),
+      fsImpl: fsImpl as unknown as typeof import("node:fs"),
+    });
+
+    // A buffered stream flushing two queued log lines in one syscall.
+    fsImpl.writev(1, [
+      Buffer.from(pinoLine({ msg: "first failure" })),
+      Buffer.from(pinoLine({ msg: "second failure" })),
+    ]);
+    handle.stop();
+
+    expect(events.map((event) => event.d.message)).toEqual([
+      "first failure",
+      "second failure",
+    ]);
+    // The host's own write still received its original buffers.
+    expect(wrote).toHaveLength(2);
+  });
+
+  it("captures a pino transport line, which never reaches a file descriptor", async () => {
+    // pino's `transport` option hands each line to thread-stream, which copies
+    // it into a SharedArrayBuffer for a worker thread to write. Nothing on this
+    // thread writes to fd 1 or 2, so every descriptor patch sees nothing; the
+    // one main-thread point is ThreadStream.prototype.write.
+    const written: unknown[] = [];
+    class FakeThreadStream {
+      write(data: unknown): boolean {
+        written.push(data);
+        return true;
+      }
+    }
+    const nodeModule = await import("node:module");
+    const ModuleCtor = (
+      nodeModule as unknown as { Module: { _cache: Record<string, unknown> } }
+    ).Module;
+    const cacheKey = "/fake/node_modules/thread-stream/index.js";
+    ModuleCtor._cache[cacheKey] = { exports: FakeThreadStream };
+
+    const events: BugEvent[] = [];
+    const handle = installBackendLogCapture({
+      emit: (event) => events.push(event),
+      stdout: fakeStream(),
+      stderr: fakeStream(),
+    });
+
+    try {
+      new FakeThreadStream().write(pinoLine({ msg: "transport failure" }));
+    } finally {
+      handle.stop();
+      delete ModuleCtor._cache[cacheKey];
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0].d.message).toBe("transport failure");
+    // The host's own transport still received the line, unchanged.
+    expect(written).toEqual([pinoLine({ msg: "transport failure" })]);
+    // And stop() put the prototype back.
+    expect(
+      Object.prototype.hasOwnProperty.call(FakeThreadStream.prototype, "write"),
+    ).toBe(true);
+    const after: unknown[] = [];
+    written.length = 0;
+    new FakeThreadStream().write("ignored");
+    void after;
+    expect(events).toHaveLength(1);
+  });
+
   it("never captures its own emit, however the sink logs", () => {
     const stdout = fakeStream();
     const events: BugEvent[] = [];

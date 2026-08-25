@@ -66,6 +66,10 @@ export function fakeInjectIO(
       const dirty = (opts.dirty ?? []).includes(target);
       return { isRepo: true, tracked: true, dirty };
     },
+    listFiles: (dir) =>
+      Object.keys(files)
+        .filter((p) => path.dirname(p) === dir)
+        .map((p) => path.basename(p)),
   };
 }
 

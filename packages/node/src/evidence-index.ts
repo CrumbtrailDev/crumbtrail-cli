@@ -2317,6 +2317,30 @@ function dropClassPrefix(
   return rest || detail;
 }
 
+/** The lowest status number that states, on its own, that something failed. */
+const HTTP_FAILURE_STATUS = 400;
+
+/**
+ * A status number an error-path finding is allowed to assert.
+ *
+ * Error middleware runs BEFORE the error handler writes the response, so the
+ * `res.statusCode` it can read at that instant is still the framework's default
+ * 200 while the caller is about to receive a 500. A success status observed
+ * there proves nothing about what was sent, and printing it mints a title that
+ * says "HTTP 200" over a fault — a status lie the reader has no way to catch.
+ *
+ * A failure status is only ever set deliberately, so it stands. Anything else on
+ * an error path is dropped, and the title falls back to saying "error" instead
+ * of naming a number it cannot support.
+ */
+function assertableFailureStatus(
+  status: number | undefined,
+): number | undefined {
+  return status !== undefined && status >= HTTP_FAILURE_STATUS
+    ? status
+    : undefined;
+}
+
 /** One backend request's span and identity, as the request events reported it. */
 interface BackendRequestSpan {
   requestId?: string;
@@ -2373,13 +2397,23 @@ function collectBackendRequestSpans(events: BugEvent[]): BackendRequestSpan[] {
     const span = open.get(key);
     if (!span) continue;
     span.end = event.t;
-    span.status =
-      span.status ??
+    const reported =
       finiteNumber(event.d.statusCode) ??
       (isRecord(event.d.error)
         ? finiteNumber(event.d.error.statusCode)
         : undefined);
-    open.delete(key);
+    if (kind === "backend.req.end") {
+      // The response is finished here, so what this event says is what the
+      // caller received. It overrides anything read earlier in the request.
+      span.status = reported ?? span.status;
+      open.delete(key);
+      continue;
+    }
+    // An error event is raised mid-request, before the status is written (see
+    // assertableFailureStatus), so a success status on it is not the span's
+    // outcome and is never adopted. The span deliberately stays OPEN so the end
+    // event can still close it with the status the caller actually got.
+    span.status = span.status ?? assertableFailureStatus(reported);
   }
   return spans;
 }
@@ -2397,12 +2431,70 @@ function backendRequestSpanAt(
   return found;
 }
 
+/** A backend error that names a fault: the loudest thing a session can carry. */
+const BACKEND_ERROR_SCORE = 90;
+
+/**
+ * A backend `console.error` that names no fault.
+ *
+ * Level with the browser `console_error` detector (58) on purpose: worth
+ * reading, never the answer.
+ */
+const BACKEND_CONSOLE_NOTICE_SCORE = 58;
+
+/** Words a line reaches for when it is reporting a fault rather than narrating. */
+const BACKEND_FAULT_TEXT =
+  /\b(error|exception|failed|failing|failure|fatal|crash(?:ed|ing)?|panic|unhandled|uncaught|rejected|timed out|timeout|refused|denied|unavailable|unreachable|corrupt\w*|cannot|can't|could not|couldn't|unable to|invalid|missing)\b/i;
+
+/**
+ * Whether a captured backend error names a fault, or is just a log line.
+ *
+ * `backend.req.error` and a real process crash are events: the framework or the
+ * runtime raised them because something went wrong, and they stay high on their
+ * own kind. A backend `console.error` is neither — it is a log CALL, and an
+ * application author reaches for the same call for a retried fetch, a recovered
+ * cache miss, and a genuine fault alike. Ranking every one of them at the top of
+ * a session hands the loudest finding to whichever log function somebody typed,
+ * so a handled, retried, recovered condition outranks the fault that actually
+ * broke the request.
+ *
+ * So a console line is tiered by what it says, the way the structured warn/error
+ * levels already are (see BACKEND_LOG_WARN_SCORE). It stays high when it carries
+ * the marks of a fault — an Error object, which the collector keeps the stack and
+ * real class of, or text that names one. A bare informational line drops to the
+ * console tier instead of being an automatic high.
+ */
+export function isFaultNamingBackendError(
+  event: BugEvent,
+  error: Record<string, unknown> | undefined,
+): boolean {
+  if (event.k !== "backend.uncaught") return true;
+  // uncaughtException / unhandledRejection: the runtime raised it, not an author.
+  if (safeText(event.d.source, 40) !== "console.error") return true;
+  if (!error) return false;
+  // The collector only carries a stack when an actual Error was logged; a
+  // console.error of loose strings never has one.
+  if (safeText(error.stack, 4000) !== undefined) return true;
+  const name = safeText(error.name, 80);
+  // "Error" is also the collector's fallback name for a plain string, so it
+  // proves nothing on its own; any other error class was a real thrown value.
+  if (name && name !== "Error" && /error|exception/i.test(name)) return true;
+  const message = safeText(error.message, 400);
+  return message !== undefined && BACKEND_FAULT_TEXT.test(message);
+}
+
 function addBackendErrorCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
 ): void {
   const spans = collectBackendRequestSpans(events);
+  // The finished span for a request, by id: an error event raised inside a
+  // request can read the status that request ended with instead of the default
+  // its own middleware saw.
+  const spanById = new Map<string, BackendRequestSpan>();
+  for (const span of spans)
+    if (span.requestId) spanById.set(span.requestId, span);
   // Backend errors are NOT summarized into the SessionIndex — scan raw events.
   // Shared dedupe namespace collapses a request that emits both backend.req.error
   // and backend.req.end into a single candidate (the higher score wins via dedupeDrafts).
@@ -2421,23 +2513,43 @@ function addBackendErrorCandidates(
     // middleware's own record of it supplies the missing where — including the
     // correlation id, which makes the crash and the request error dedupe into
     // one finding instead of arriving as two descriptions of one fault.
+    const eventRequestId = safeText(event.d.requestId, 120);
     const enclosing =
       event.k === "backend.uncaught"
         ? backendRequestSpanAt(spans, event.t)
-        : undefined;
-    const status =
-      finiteNumber(event.d.statusCode) ??
-      finiteNumber(error?.statusCode) ??
-      enclosing?.status;
-    const requestId = safeText(event.d.requestId, 120) ?? enclosing?.requestId;
+        : event.k === "backend.req.error" && eventRequestId
+          ? spanById.get(eventRequestId)
+          : undefined;
+    const reportedStatus = finiteNumber(event.d.statusCode);
+    const errorStatus = finiteNumber(error?.statusCode);
+    // An end event states the finished response, so it is read straight. An
+    // error event is read before the status was written, so every source it can
+    // offer is filtered through assertableFailureStatus and each is tried in
+    // turn: the error's own declared status, then the status the request
+    // actually finished with, then the middleware's pre-finalization reading.
+    // When none of them names a failure, the finding says "error" and asserts no
+    // number rather than claiming the default 200 the caller never received.
+    const status = isEnd
+      ? (reportedStatus ?? errorStatus ?? enclosing?.status)
+      : (assertableFailureStatus(errorStatus) ??
+        assertableFailureStatus(enclosing?.status) ??
+        assertableFailureStatus(reportedStatus));
+    const requestId = eventRequestId ?? enclosing?.requestId;
 
     let detector: string;
     let severity: CandidateDraft["severity"];
     let score: number;
+    let confidence: CandidateDraft["confidence"] = "high";
     if (isError) {
       detector = "backend_request_error";
-      severity = "high";
-      score = 90;
+      if (isFaultNamingBackendError(event, error)) {
+        severity = "high";
+        score = BACKEND_ERROR_SCORE;
+      } else {
+        severity = "medium";
+        score = BACKEND_CONSOLE_NOTICE_SCORE;
+        confidence = "medium";
+      }
     } else if ((status ?? 0) >= 500) {
       detector = "backend_http_error";
       severity = "high";
@@ -2472,7 +2584,7 @@ function addBackendErrorCandidates(
       }),
       severity,
       score,
-      confidence: "high",
+      confidence,
       anchor: removeUndefined({
         t: event.t,
         offsetMs:
@@ -6419,7 +6531,14 @@ function addBackendOnlyExchanges(
     entry.res = event;
     if (event.d.body !== undefined) entry.resBody = event.d.body;
     if (event.d.reqBody !== undefined) entry.body = event.d.reqBody;
-    entry.status = finiteNumber(event.d.statusCode);
+    const reported = finiteNumber(event.d.statusCode);
+    // Only the end event knows what the caller received. The error event is
+    // raised before the status is written (see assertableFailureStatus), so a
+    // 2xx on it would record this exchange as a success that never happened.
+    entry.status =
+      event.k === "backend.req.end"
+        ? reported
+        : (assertableFailureStatus(reported) ?? entry.status);
   }
 }
 
@@ -12248,14 +12367,31 @@ function codeFrameOf(entry: {
 function backendErrorFrame(error: Record<string, unknown> | undefined) {
   if (!error) return undefined;
   const frames = error.frames;
-  if (!Array.isArray(frames)) return undefined;
-  const innermost = frames[0];
-  if (!isRecord(innermost)) return undefined;
-  return codeFrameOf({
-    file: safeText(innermost.file, 300),
-    line: finiteNumber(innermost.line),
-    col: finiteNumber(innermost.column),
-  });
+  if (Array.isArray(frames)) {
+    const innermost = frames[0];
+    if (isRecord(innermost)) {
+      const framed = codeFrameOf({
+        file: safeText(innermost.file, 300),
+        line: finiteNumber(innermost.line),
+        col: finiteNumber(innermost.column),
+      });
+      if (framed) return framed;
+    }
+  }
+  // A console.error'd Error carries a raw stack but no structured frames, so
+  // the anchor pointed at nothing while the file:line sat in the string. Unlike
+  // structured frames, a raw stack is unfiltered — skip runtime and dependency
+  // lines so the frame is one the reader's own tree contains. Read raw, NOT
+  // through safeText: it collapses the newlines this split depends on.
+  const stack =
+    typeof error.stack === "string" ? error.stack.slice(0, 8000) : undefined;
+  if (!stack) return undefined;
+  for (const line of stack.split("\n").slice(1)) {
+    if (line.includes("node_modules") || line.includes("node:")) continue;
+    const match = STACK_FRAME_LOCATION.exec(line);
+    if (match) return safeText(match[1], 300);
+  }
+  return undefined;
 }
 
 // Normalizes an error message into a stable content signature for dedupe: lowercased, redaction

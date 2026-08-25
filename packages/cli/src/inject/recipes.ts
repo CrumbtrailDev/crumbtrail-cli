@@ -28,6 +28,7 @@ import { defaultInjectIO, type InjectIO } from "./io";
 import type { Plan } from "./types";
 import {
   corsElsewhereGuidance,
+  corsImportedElsewhereNote,
   corsWideningGuidance,
   detectExpressModuleStyle,
   prependIntoSource,
@@ -363,11 +364,22 @@ const CORS_WIDENED_WARNING =
  * a frontend entry has no CORS config to speak of, and the note would be noise.
  */
 function corsWarnings(
-  cors: { changed: boolean; needsManual: boolean; found: boolean },
+  cors: {
+    changed: boolean;
+    needsManual: boolean;
+    found: boolean;
+    importsCorsElsewhere?: boolean;
+  },
   recipe: Recipe,
 ): string[] {
   if (!cors.found) {
-    return isBackendRecipe(recipe) ? [corsElsewhereGuidance()] : [];
+    if (!isBackendRecipe(recipe)) return [];
+    // "No CORS middleware in this file" is a claim about code the wizard read.
+    // When the file imports one from a module it did not read, that claim is
+    // false and the framework snippets under it are noise.
+    return cors.importsCorsElsewhere
+      ? [corsImportedElsewhereNote()]
+      : [corsElsewhereGuidance()];
   }
   return [
     ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
@@ -1222,7 +1234,7 @@ function planExtraBackendEntries(
   const keyRef = keyRefFor(input);
   if (!keyRef) return { edits, warnings };
 
-  const { entries, truncated } = findExtraBackendEntries(
+  const { entries, unwired } = findExtraBackendEntries(
     input.cwd,
     io,
     input.entryFile,
@@ -1251,9 +1263,18 @@ function planExtraBackendEntries(
     });
   }
 
-  if (truncated > 0) {
+  if (unwired.length > 0) {
+    // Named, not counted. A count tells the user a hole exists without telling
+    // them where it is, so the only way to close it was to re-derive the whole
+    // scan by hand.
+    const named = unwired
+      .map(
+        (entry) =>
+          `${path.relative(input.cwd, entry.path)} (npm run ${entry.script})`,
+      )
+      .join(", ");
     warnings.push(
-      `This package starts more than ${MAX_EXTRA_ENTRIES} other processes; ${truncated} were left unwired. Wire the rest by copying the block from one that was.`,
+      `This package starts more than ${MAX_EXTRA_ENTRIES} other processes, so ${unwired.length === 1 ? "this one was" : "these were"} left unwired: ${named}. Wire ${unwired.length === 1 ? "it" : "them"} by copying the block from one that was.`,
     );
   }
   return { edits, warnings };
@@ -1341,10 +1362,15 @@ export function buildPlan(
   const plan = dispatchPlan(input, io);
   if (refused.warning) plan.warnings = [refused.warning, ...plan.warnings];
   // Stamp the env var the injected code reads its key from, so the wizard can
-  // print "set <VAR> in .env — get your key from the dashboard". Undefined for
-  // recipes that inject no key (tauri / otlp / angular) or when already wired.
+  // print "set <VAR> in .env — get your key from the dashboard". Undefined only
+  // for recipes that inject no key (tauri / otlp / angular).
+  //
+  // An already-wired project needs this MORE, not less: the code on disk still
+  // reads that variable. Withholding it made a re-run report the key as
+  // missing and unnamed ("Set your ingest key"), even though the env file next
+  // to the wiring already held it under a name the wizard knew.
   const keyRef = keyRefFor(input);
-  if (keyRef && plan.kind !== "skip-already-wired") {
+  if (keyRef) {
     plan.keyEnvVar = keyRef.envVar;
     if (keyRef.compileTime) plan.keyIsCompileTime = true;
   }

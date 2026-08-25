@@ -337,6 +337,14 @@ export interface CorsWidening {
    * file, which is the case that used to fail silently.
    */
   found: boolean;
+  /**
+   * Set when `found` is false but this file imports something whose module path
+   * or binding is named after CORS — `import { cors } from "./middleware/cors"`.
+   * The file almost certainly does have CORS, one hop away, so the wizard must
+   * not assert there is none. This is a name check on this file's own import
+   * lines, deliberately not an import graph walk.
+   */
+  importsCorsElsewhere: boolean;
 }
 
 /**
@@ -353,6 +361,29 @@ const CORS_IMPORT_RE = new RegExp(
     String.raw`import\(\s*["'](?:@fastify/cors|fastify-cors)["']\s*\)`,
   ].join("|"),
 );
+
+/**
+ * Any import or require line in THIS file that is named after CORS — a local
+ * module path (`./middleware/cors`), or a binding (`cors`, `corsMiddleware`,
+ * `applyCors`). It exists to stop the wizard asserting "no CORS middleware in
+ * this file" about a Hono entry whose first line is
+ * `import { cors } from "./middleware/cors"`. A false positive only softens a
+ * note, so the check is deliberately loose and deliberately local.
+ */
+const CORS_REFERENCE_RE = new RegExp(
+  [
+    String.raw`^\s*import\s[^;\n]*cors[^;\n]*$`,
+    String.raw`^\s*import\s[^;\n]*from\s*["'][^"'\n]*cors[^"'\n]*["']`,
+    String.raw`(?:require|import)\(\s*["'][^"'\n]*cors[^"'\n]*["']\s*\)`,
+    String.raw`^\s*(?:const|let|var)\s[^=\n]*cors[^=\n]*=\s*(?:await\s+)?(?:require|import)\(`,
+  ].join("|"),
+  "im",
+);
+
+/** True when this file mentions CORS on an import line but configures none. */
+export function referencesCorsElsewhere(text: string): boolean {
+  return CORS_REFERENCE_RE.test(text);
+}
 
 /** `allowedHeaders:` (Express `cors`) or `allowHeaders:` (Hono `cors`). */
 const ALLOW_HEADERS_KEY = String.raw`\ballow(?:ed)?Headers\s*:\s*`;
@@ -391,7 +422,13 @@ function quoteStyleOf(body: string): '"' | "'" {
  */
 export function widenCorsAllowedHeaders(text: string): CorsWidening {
   if (!CORS_IMPORT_RE.test(text)) {
-    return { text, changed: false, needsManual: false, found: false };
+    return {
+      text,
+      changed: false,
+      needsManual: false,
+      found: false,
+      importsCorsElsewhere: referencesCorsElsewhere(text),
+    };
   }
 
   let changed = false;
@@ -440,7 +477,13 @@ export function widenCorsAllowedHeaders(text: string): CorsWidening {
   });
 
   const total = (text.match(ANY_FORM) ?? []).length;
-  return { text: out, changed, needsManual: handled < total, found: true };
+  return {
+    text: out,
+    changed,
+    needsManual: handled < total,
+    found: true,
+    importsCorsElsewhere: false,
+  };
 }
 
 const HEADER_LIST = CORRELATION_REQUEST_HEADERS.map((n) => `"${n}"`).join(", ");
@@ -468,4 +511,14 @@ export function corsElsewhereGuidance(): string {
     `No CORS middleware in this file. If this service answers browser requests from another origin, whichever file configures its CORS must allow ${CORRELATION_REQUEST_HEADERS.join(", ")}, or the preflight blocks every cross origin request once correlation is on.`,
     corsWideningGuidance(),
   ].join("\n");
+}
+
+/**
+ * Said instead of the above when the file imports something named after CORS.
+ * The wizard could not read that other file, so it has no business claiming
+ * there is no CORS middleware, and no business printing three framework
+ * snippets for a config it has not seen. It names the headers and stops there.
+ */
+export function corsImportedElsewhereNote(): string {
+  return `This file configures no CORS itself but imports CORS from another module, which Crumbtrail did not read. If that config pins an allowed headers list, it needs ${CORRELATION_REQUEST_HEADERS.join(", ")} added, or the preflight blocks every cross origin request once correlation is on.`;
 }

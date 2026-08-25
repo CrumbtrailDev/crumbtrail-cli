@@ -437,5 +437,9 @@ export function githubInjectIO(reader: FileReader) {
     exists: (p: string) => reader.isFile(p) || reader.isDir(p),
     readFile: (p: string) => reader.readFile(p),
     gitStatus: () => ({ isRepo: true, tracked: true, dirty: false }),
+    // Lets the extra-process ranking see deploy manifests (railway*.json,
+    // Procfile, Dockerfile) in a GitHub-backed plan, exactly as on disk.
+    listFiles: (dir: string) =>
+      reader.readDir(dir).filter((name) => reader.isFile(`${dir}/${name}`)),
   };
 }

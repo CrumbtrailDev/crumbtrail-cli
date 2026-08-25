@@ -1,4 +1,5 @@
 import nodeFs from "node:fs";
+import nodeModule from "node:module";
 import type { BugEvent } from "crumbtrail-core";
 import { redactTokenLikeString, redactValue } from "crumbtrail-core";
 import { readRequestCorrelation } from "./request-context";
@@ -26,9 +27,15 @@ import { readRequestCorrelation } from "./request-context";
  * `process.stderr.write` (pino's default destination, winston's Console
  * transport, morgan) and `fs.write` / `fs.writeSync` on fd 1 and 2 (SonicBoom,
  * which `pino(pino.destination(1))` writes through and which never touches
- * `process.stdout`). Both are needed: a probe of pino 9 shows the default
+ * `process.stdout`), plus the `writev` forms a buffered stream flushes several
+ * lines through. All of them are needed: a probe of pino 9 shows the default
  * destination taking the first path and an explicit `pino.destination(1)` taking
  * the second.
+ *
+ * One pino option escapes every one of those, and `installTransportHook` below
+ * is why this file also watches `thread-stream`: with `transport` configured
+ * (pino-pretty, pino/file, pino-loki) the writing happens on a worker thread and
+ * no file descriptor on this thread is ever touched.
  *
  * Deliberately NOT `backend.uncaught` (that kind carries crash semantics — the
  * process is on its way down) and NOT `con` (that is the browser console plane).
@@ -211,8 +218,15 @@ export function buildBackendLogEvent(
   return event;
 }
 
-/** The two streams a log line can be written to. */
-type LogStream = "stdout" | "stderr";
+/**
+ * The write paths a log line can arrive on.
+ *
+ * `stdout` and `stderr` are the file descriptors. `transport` is pino's
+ * worker-thread lane: the line never reaches either descriptor on this thread,
+ * so it gets its own line buffer rather than interleaving its partial writes
+ * with the descriptors'.
+ */
+type LogStream = "stdout" | "stderr" | "transport";
 
 export interface BackendLogCaptureOptions {
   /** Sink for the `backend.log` events. Its own throws are swallowed. */
@@ -272,7 +286,7 @@ function hubFor(
 
   const hub: LogHub = {
     sinks: new Set(),
-    buffers: { stdout: "", stderr: "" },
+    buffers: { stdout: "", stderr: "", transport: "" },
     inspecting: false,
     restore: [],
   };
@@ -329,7 +343,12 @@ function hubFor(
 
   // fd 1 / fd 2 writes. This is the path pino takes when it is given an explicit
   // `pino.destination()` (SonicBoom), and it never touches `process.stdout`.
-  for (const method of ["write", "writeSync"] as const) {
+  //
+  // All four variants, not just `write`/`writeSync`: SonicBoom picks between the
+  // async and sync forms from its own options, and a stream flushing more than
+  // one buffered chunk at once goes out through `writev`/`writevSync` instead —
+  // the same log lines, on a method name this used to not be watching.
+  for (const method of ["write", "writeSync", "writev", "writevSync"] as const) {
     const original = fs[method] as unknown;
     if (typeof original !== "function") continue;
     const patched = function (this: unknown, ...args: unknown[]): unknown {
@@ -345,8 +364,104 @@ function hubFor(
     });
   }
 
+  installTransportHook(hub, observe);
+
   hubs.set(stdout as unknown as object, hub);
   return hub;
+}
+
+/** Marks a wrapper this module installed, so a second install does not stack. */
+const TRANSPORT_PATCH = Symbol.for("crumbtrail.threadStreamPatched");
+
+/**
+ * Watch pino's worker-thread transport lane.
+ *
+ * ============================================================================
+ * WHY THIS EXISTS
+ * ============================================================================
+ *
+ * Every descriptor-level patch above is defeated by one pino option. With
+ * `transport` set — `pino-pretty` in development, `pino/file`, `pino-roll`,
+ * `pino-loki`, any of them — pino stops writing to a descriptor on this thread
+ * altogether. It hands each line to `thread-stream`, which copies it into a
+ * SharedArrayBuffer and lets a worker thread do the writing. `process.stdout`,
+ * `fs.write` and every sibling see nothing, on any file descriptor, ever. A
+ * probe of pino 10 shows exactly that: the four descriptor paths capture the
+ * default, `sync` and `async` destinations, and capture zero lines under
+ * `transport`.
+ *
+ * The one point that stays on the main thread is `ThreadStream.prototype.write`
+ * — pino calls it with the finished NDJSON line before the worker exists in the
+ * picture. So that is where this listens. Reaching it means seeing the module
+ * as the host loads it, which is what the `Module.prototype.require` wrapper is
+ * for: pino requires `thread-stream` lazily, only when a transport is actually
+ * configured, so the module is usually not loaded yet when capture installs.
+ *
+ * Deliberately narrow. The wrapper forwards every other request untouched and
+ * only ever looks at one module id, the patch is idempotent across installs,
+ * and both the wrapper and the prototype patch are undone by `stop()`.
+ */
+function installTransportHook(
+  hub: LogHub,
+  observe: (stream: LogStream, chunk: unknown) => void,
+): void {
+  const ModuleCtor = (
+    nodeModule as unknown as { Module?: { prototype?: Record<string, unknown> } }
+  ).Module ?? (nodeModule as unknown as { prototype?: Record<string, unknown> });
+  const proto = ModuleCtor?.prototype;
+  if (!proto || typeof proto.require !== "function") return;
+
+  const patchExport = (exported: unknown): void => {
+    const streamProto = (
+      exported as { prototype?: Record<string, unknown> } | undefined
+    )?.prototype;
+    if (!streamProto) return;
+    const originalWrite = streamProto.write;
+    if (typeof originalWrite !== "function") return;
+    if ((originalWrite as unknown as Record<symbol, unknown>)[TRANSPORT_PATCH])
+      return;
+    const patchedWrite = function (this: unknown, ...args: unknown[]): unknown {
+      observe("transport", args[0]);
+      return (originalWrite as (...a: unknown[]) => unknown).apply(this, args);
+    };
+    (patchedWrite as unknown as Record<symbol, unknown>)[TRANSPORT_PATCH] = true;
+    streamProto.write = patchedWrite;
+    hub.restore.push(() => {
+      if (streamProto.write === patchedWrite) streamProto.write = originalWrite;
+    });
+  };
+
+  // Already loaded — a host that built its logger before capture installed.
+  const cache = (ModuleCtor as unknown as { _cache?: Record<string, unknown> })
+    ._cache;
+  if (cache) {
+    for (const key of Object.keys(cache)) {
+      if (!key.includes("thread-stream")) continue;
+      const entry = cache[key] as { exports?: unknown } | undefined;
+      try {
+        patchExport(entry?.exports);
+      } catch {
+        // A cache entry we cannot read is not worth a throw into the host.
+      }
+    }
+  }
+
+  const originalRequire = proto.require as (...a: unknown[]) => unknown;
+  const patchedRequire = function (this: unknown, ...args: unknown[]): unknown {
+    const exported = originalRequire.apply(this, args);
+    if (args[0] === "thread-stream") {
+      try {
+        patchExport(exported);
+      } catch {
+        // Never let capture break the host's module loading.
+      }
+    }
+    return exported;
+  };
+  proto.require = patchedRequire;
+  hub.restore.push(() => {
+    if (proto.require === patchedRequire) proto.require = originalRequire;
+  });
 }
 
 /**
@@ -425,6 +540,10 @@ export function installBackendLogCapture(
 
 function chunkToString(chunk: unknown): string {
   if (typeof chunk === "string") return chunk;
+  // `fs.writev` hands an array of buffers — several buffered log lines flushed
+  // in one syscall. Concatenating them is exactly right: the line splitter
+  // downstream reads the result the same way it reads one big write.
+  if (Array.isArray(chunk)) return chunk.map(chunkToString).join("");
   // A Buffer or a TypedArray, which is what SonicBoom and a piped stdout write.
   if (ArrayBuffer.isView(chunk)) {
     return Buffer.from(

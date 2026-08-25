@@ -326,6 +326,59 @@ describe("autoCapture", () => {
     );
   });
 
+  it("keeps the sentence the developer wrote alongside the Error's own message", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const consoleImpl = { error: vi.fn() };
+    const { fetchImpl, calls } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl,
+        fetchImpl,
+      }),
+    );
+
+    // The ordinary shape: a sentence naming what was attempted, then the Error.
+    consoleImpl.error("worker tick failed", new Error("keepa refused"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    const logged = eventsFrom(calls).find(
+      (e) => e.k === AUTO_CAPTURE_ERROR_EVENT && e.d.source === "console.error",
+    );
+    expect(logged).toBeDefined();
+    // The Error still supplies name/message/stack …
+    expect((logged!.d.error as { message: string }).message).toBe(
+      "keepa refused",
+    );
+    // … and the words the author chose are no longer dropped.
+    expect(logged!.d.message).toBe("worker tick failed");
+  });
+
+  it("records no message field when console.error was given only an Error", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const consoleImpl = { error: vi.fn() };
+    const { fetchImpl, calls } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl,
+        fetchImpl,
+      }),
+    );
+
+    consoleImpl.error(new Error("bare failure"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    const logged = eventsFrom(calls).find(
+      (e) => e.k === AUTO_CAPTURE_ERROR_EVENT && e.d.source === "console.error",
+    );
+    expect(logged!.d.message).toBeUndefined();
+  });
+
   it("onError surfaces a session-start failure (endpoint unreachable / bad cert)", async () => {
     const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
     const onError = vi.fn();

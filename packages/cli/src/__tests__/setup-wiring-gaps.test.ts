@@ -244,7 +244,7 @@ describe("the other processes the package starts", () => {
     expect(plan.extraEdits ?? []).toHaveLength(0);
   });
 
-  it("reports how many processes it left unwired rather than truncating silently", () => {
+  it("names the processes it left unwired rather than counting them", () => {
     const scripts: Record<string, string> = { start: "tsx src/index.ts" };
     const files: Record<string, string> = {
       [p("src", "index.ts")]: "startServer();\n",
@@ -264,7 +264,51 @@ describe("the other processes the package starts", () => {
       fakeInjectIO(files),
     );
     expect(plan.extraEdits).toHaveLength(4);
-    expect(plan.warnings.join(" ")).toContain("2 were left unwired");
+    const warned = plan.warnings.join(" ");
+    expect(warned).toContain("these were left unwired");
+    // Every unwired process is named with its file and the script that runs it,
+    // so the user can finish the job without re-deriving the scan.
+    const named = [4, 5].map((i) =>
+      warned.includes(`src/job${i}.ts (npm run job${i})`),
+    );
+    expect(named).toEqual([true, true]);
+  });
+
+  it("spends its slots on long running processes, not one shot scripts", () => {
+    const files: Record<string, string> = {
+      [p("package.json")]: PKG({
+        start: "tsx api/src/index.ts",
+        worker: "tsx api/src/worker.ts",
+        migrate: "tsx migrate.ts",
+        seed: "tsx seedSim.ts",
+        "stripe:bootstrap": "tsx stripeBootstrap.ts",
+        sim: "tsx sim/server.ts",
+      }),
+      [p("api", "src", "index.ts")]: "startServer();\n",
+      [p("api", "src", "worker.ts")]: "runQueue();\n",
+      [p("migrate.ts")]: "migrate();\n",
+      [p("seedSim.ts")]: "seed();\n",
+      [p("stripeBootstrap.ts")]: "bootstrap();\n",
+      [p("sim", "server.ts")]: "serve();\n",
+      [p("railway.worker.json")]: JSON.stringify({
+        deploy: { startCommand: "npm run worker" },
+      }),
+    };
+    const io = fakeInjectIO(files);
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("api", "src", "index.ts"),
+        serviceName: "marginary",
+      },
+      io,
+    );
+    const wired = (plan.extraEdits ?? []).map((e) => e.path);
+    expect(wired).toContain(p("api", "src", "worker.ts"));
+    // The one that lost its slot is a script that exits, not the worker.
+    expect(plan.warnings.join(" ")).not.toContain("worker.ts (npm run worker)");
   });
 
   it("finds nothing when the package declares no scripts", () => {

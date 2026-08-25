@@ -708,6 +708,12 @@ export interface WizardDeps {
   runPreflight: typeof runPreflight;
   /** Browser opener for the end-of-wizard dashboard hand-off (stub in tests). */
   openBrowserFn?: (url: string) => Promise<boolean>;
+  /**
+   * The saved login on this machine, which decides the endpoint prompt's
+   * default. Injectable so a test does not answer from the developer's own
+   * ~/.config/crumbtrail/auth.json.
+   */
+  loadStoredAuth?: typeof loadAuth;
   ui: Ui;
   prompter: Prompter;
   env: NodeJS.ProcessEnv;
@@ -733,6 +739,7 @@ export function defaultDeps(): WizardDeps {
     pollForServices,
     runPreflight,
     openBrowserFn: openBrowser,
+    loadStoredAuth: loadAuth,
     ui: consoleUi,
     prompter: stdinPrompter,
     env: process.env,
@@ -812,9 +819,17 @@ export function resolveWorkspaceDir(
  * user had chosen: the header printed the URL, nothing ever asked, and someone
  * setting up against a local stack only found out after the wizard had created
  * a project on the wrong deployment. So when nothing stated an endpoint —
- * no `--endpoint`, no CRUMBTRAIL_BASE_URL — the interactive run asks, with the
- * hosted default pre-filled so Enter still means "the hosted cloud".
- * `--yes` and non-interactive shells keep the default without a prompt.
+ * no `--endpoint`, no CRUMBTRAIL_BASE_URL — the interactive run asks, with a
+ * default pre-filled so Enter still means something sane.
+ *
+ * That default is the endpoint of a saved login when this machine has one. A
+ * run that had just done `crumbtrail login --endpoint http://127.0.0.1:19890`
+ * was offered the hosted cloud as the default, then printed "Using your saved
+ * Crumbtrail login for http://127.0.0.1:19890" two lines later, so pressing
+ * Enter wired the whole app to a deployment the run had no login for. The
+ * login this machine actually holds is the honest default; the hosted cloud is
+ * the default only when there is no login to speak for.
+ * `--yes` and non-interactive shells take the same default without a prompt.
  */
 export async function confirmEndpoint(
   parsed: ParsedArgs,
@@ -824,10 +839,19 @@ export async function confirmEndpoint(
   const stated =
     (parsed.endpoint && parsed.endpoint.trim()) ||
     (deps.env.CRUMBTRAIL_BASE_URL && deps.env.CRUMBTRAIL_BASE_URL.trim());
-  if (stated || parsed.yes || !deps.isTTY) return base;
+  if (stated) return base;
+  const savedEndpoint = (deps.loadStoredAuth ?? loadAuth)(
+    deps.env,
+  )?.endpoint?.trim();
+  const preferred = savedEndpoint
+    ? resolveEndpoint(savedEndpoint, deps.env)
+    : base;
+  if (parsed.yes || !deps.isTTY) return preferred;
   const answer = await deps.prompter.ask(
-    "Which Crumbtrail endpoint should this project send to?",
-    base,
+    preferred === base
+      ? "Which Crumbtrail endpoint should this project send to?"
+      : `Which Crumbtrail endpoint should this project send to? You are logged in to ${preferred}.`,
+    preferred,
   );
   return resolveEndpoint(answer, deps.env);
 }
@@ -844,12 +868,11 @@ export async function runWizard(
   const wizardStart = Date.now();
 
   for (const line of banner(readVersion(), TAGLINE)) ui.out(line);
+  // Printed once, and only once the endpoint is settled: printing the default
+  // first and the answer second showed two Endpoint lines to a run that was
+  // never asked anything, and the first of them was not where the run went.
+  base = await confirmEndpoint(parsed, deps, base);
   ui.out(color.dim(`  Endpoint  ${base}`));
-  const confirmed = await confirmEndpoint(parsed, deps, base);
-  if (confirmed !== base) {
-    base = confirmed;
-    ui.out(color.dim(`  Endpoint  ${base}`));
-  }
 
   // 1. Detect. A monorepo root forks to the batch installer, which scans every
   // service and wires the ones the user picks. Everything below this fork is the

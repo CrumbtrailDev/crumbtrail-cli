@@ -406,8 +406,9 @@ export async function autoCapture(
     live: HeadlessSession,
     error: unknown,
     source: AutoCaptureSource,
+    logMessage?: string,
   ): Promise<void> => {
-    const event = buildErrorEvent(error, source);
+    const event = buildErrorEvent(error, source, logMessage);
     // An error logged inside a browser correlated request belongs to that
     // browser's session, exactly like the request's own events — otherwise the
     // click and the sentence explaining it land in two sessions that share
@@ -444,13 +445,14 @@ export async function autoCapture(
     error: unknown,
     source: AutoCaptureSource,
     allowReestablish = false,
+    logMessage?: string,
   ): Promise<void> | undefined => {
     if (capturing) return undefined;
     try {
       if (session) {
         capturing = true;
         try {
-          return recordLive(session, error, source);
+          return recordLive(session, error, source, logMessage);
         } finally {
           capturing = false;
         }
@@ -462,7 +464,7 @@ export async function autoCapture(
       capturing = true;
       const pending = (async () => {
         const live = await ensureSession();
-        if (live) await recordLive(live, error, source);
+        if (live) await recordLive(live, error, source, logMessage);
       })();
       void pending.finally(() => {
         capturing = false;
@@ -479,6 +481,18 @@ export async function autoCapture(
   const originalError = originalConsoleError;
   const patchedError = (...args: unknown[]): void => {
     const errorArg = args.find((a) => a instanceof Error);
+    // The sentence the developer wrote, kept alongside the Error rather than
+    // instead of it. `console.error("worker tick failed", err)` used to arrive
+    // as nothing but the Error's own message, so the words the author chose —
+    // the ones they would search for, and the only part naming what was being
+    // attempted — were dropped on exactly the call shape that carries a stack.
+    const logMessage = errorArg
+      ? args
+          .filter((a) => !(a instanceof Error))
+          .map((a) => safeString(a))
+          .join(" ")
+          .trim()
+      : "";
     // The non-crash capture path opts into lazy re-establishment: if the session
     // went dark at boot (or later), this is what heals it — the next logged error
     // after the endpoint recovers re-starts the session and lands.
@@ -486,6 +500,7 @@ export async function autoCapture(
       errorArg ?? args.map((a) => String(a)).join(" "),
       "console.error",
       true,
+      logMessage || undefined,
     );
     originalError.apply(consoleRef, args as []);
   };
@@ -747,7 +762,11 @@ function generateSessionId(): string {
   return `auto_${Date.now().toString(36)}_${random}`;
 }
 
-function buildErrorEvent(error: unknown, source: AutoCaptureSource): BugEvent {
+function buildErrorEvent(
+  error: unknown,
+  source: AutoCaptureSource,
+  logMessage?: string,
+): BugEvent {
   const normalized = normalizeError(error);
   // The request being handled when this was raised, when there was one. A
   // `console.error` inside a handler is the same failure as the 500 the browser
@@ -760,6 +779,7 @@ function buildErrorEvent(error: unknown, source: AutoCaptureSource): BugEvent {
     d: {
       source,
       error: normalized,
+      ...(logMessage ? { message: bounded(logMessage, MAX_MESSAGE) } : {}),
       ...(correlation?.requestId ? { requestId: correlation.requestId } : {}),
     },
   };
