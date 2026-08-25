@@ -215,9 +215,7 @@ export function chooseEnvFile(
 ): string {
   const bundled =
     /^(VITE_|NEXT_PUBLIC_|PUBLIC_|EXPO_PUBLIC_|NUXT_PUBLIC_)/.test(varName);
-  const candidates = bundled
-    ? [".env.local", ".env"]
-    : [".env", ".env.local"];
+  const candidates = bundled ? [".env.local", ".env"] : [".env", ".env.local"];
   // Preserve a value already present in either candidate, even when the
   // loader-preferred file is the other one. Otherwise a repo with CRUMBTRAIL_KEY
   // in .env.local and an unrelated .env would receive a second live key.
@@ -280,8 +278,18 @@ export type EnvEdit = EnvWriteEdit | IgnoreEntryEdit;
 export type EnvKeyPlan =
   /** The recipe reads no key variable (OTLP guidance, or a manual fallback). */
   | { kind: "no-variable" }
-  /** Already pointed at a key. Nothing to mint, nothing to write. */
-  | { kind: "already-set"; file: string; varName: string }
+  /**
+   * Already pointed at a key. Nothing to mint, nothing to write — but the file
+   * still holds a live credential, so `ignore` carries the .gitignore entry it
+   * is missing. A key from an older install used to get no entry and no warning
+   * at all, which is a live key one `git add` away from being published.
+   */
+  | {
+      kind: "already-set";
+      file: string;
+      varName: string;
+      ignore: IgnoreEntryEdit | null;
+    }
   /** git follows this file, so a key written here would be committed. */
   | { kind: "refused-tracked"; file: string; varName: string }
   /** Ready to mint. `edits` is completed by {@link buildEnvKeyEdits}. */
@@ -327,9 +335,9 @@ export function planEnvKeyWrite(input: PlanEnvKeyInput): EnvKeyPlan {
   // A probe value only: upsertEnvVar reports a conflict for any existing
   // non-empty value regardless of what it is compared against, and this never
   // reaches disk.
-  const probe = upsertEnvVar(prior, varName, "probe");
-  if (probe.conflict) return { kind: "already-set", file, varName };
-
+  // Resolved before the already-set branch, not after it: whether this file is
+  // excluded from git is a fact about the file, not about whether THIS run put
+  // the key there.
   let ignore: IgnoreEntryEdit | null = null;
   if (!io.isIgnored(repoRoot, relToRepo)) {
     ignore = {
@@ -338,6 +346,9 @@ export function planEnvKeyWrite(input: PlanEnvKeyInput): EnvKeyPlan {
       entry: relToRepo,
     };
   }
+
+  const probe = upsertEnvVar(prior, varName, "probe");
+  if (probe.conflict) return { kind: "already-set", file, varName, ignore };
 
   return {
     kind: "ready",

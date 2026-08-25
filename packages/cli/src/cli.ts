@@ -378,6 +378,21 @@ function usage(): string {
     ),
     color.dim("shows you what it found, and wires the ones you pick."),
     "",
+    // Help used to say "browser" exactly once, in an unrelated login flag, so a
+    // reader came away certain this was a backend-only product and that the
+    // frontend half of their app was out of scope. It is not: browser capture
+    // is the primary frontend path, and help is where that has to be visible.
+    head("What it captures"),
+    `  ${color.bold("Browser".padEnd(9))}console, network, DOM and errors — Next.js, SvelteKit, Nuxt, Remix,`,
+    color.dim(
+      "           Astro, Angular, Vite SPA, Capacitor, React Native, Flutter, and",
+    ),
+    color.dim("           plain static pages (wired with a script tag)."),
+    `  ${color.bold("Server".padEnd(9))}requests, crashes, logs and SQL — Express, NestJS, Fastify, Hono,`,
+    color.dim(
+      "           a plain Node server, and Django/Flask/FastAPI/Go/Rails/.NET over OTLP.",
+    ),
+    "",
     head("Options"),
     flag("--yes, -y", "Skip confirmations (required with --project in CI)"),
     flag("--project <id>", "Attach to an existing project (skip creation)"),
@@ -756,9 +771,10 @@ function readPkgDeps(
   dir: string,
 ): { name?: string; dependencies?: unknown } | null {
   try {
-    return JSON.parse(
-      readFileSync(path.join(dir, "package.json"), "utf8"),
-    ) as { name?: string; dependencies?: unknown };
+    return JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as {
+      name?: string;
+      dependencies?: unknown;
+    };
   } catch {
     return null;
   }
@@ -1076,6 +1092,15 @@ export async function runWizard(
       // single-package run knows of no sibling services, so that is the whole
       // source here; the batch path adds the backends it is wiring alongside.
       backendOrigins: singleAppOrigins,
+      // Only the `static` recipe reads these: it emits a CDN module URL pinned
+      // to this CLI's release, and a key literal that has to say where the real
+      // value is minted.
+      sdkVersion: readVersion(),
+      mintUrl: appUrl(
+        appBaseFor(base, deps.env),
+        "/setup",
+        provisioned.projectId,
+      ),
       options: { force: parsed.yes },
     },
     defaultInjectIO,
@@ -1242,7 +1267,11 @@ export async function runWizard(
         plan.keyIsCompileTime,
         inject.outcome === "guidance" ||
           inject.outcome === "withheld" ||
-          inject.outcome === "declined",
+          inject.outcome === "declined" ||
+          // A page with no bundler carries its key as a literal, so nothing was
+          // written and the run really does have one step left.
+          plan.keyIsSourceLiteral === true,
+        plan.keyIsSourceLiteral === true,
       );
       return 0;
     }
@@ -1313,7 +1342,9 @@ export async function runWizard(
     plan.keyIsCompileTime,
     inject.outcome === "guidance" ||
       inject.outcome === "withheld" ||
-      inject.outcome === "declined",
+      inject.outcome === "declined" ||
+      plan.keyIsSourceLiteral === true,
+    plan.keyIsSourceLiteral === true,
   );
   return 0;
 }
@@ -1607,9 +1638,7 @@ export function importedSelectionWarnings(
     const importers = pkgs.filter(({ candidate: other, pkg: otherPkg }) => {
       if (other === candidate) return false;
       const deps = otherPkg?.dependencies;
-      return (
-        !!deps && typeof deps === "object" && name in (deps as object)
-      );
+      return !!deps && typeof deps === "object" && name in (deps as object);
     });
     if (importers.length === 0) continue;
     out.push(
@@ -1630,7 +1659,10 @@ export function importedSelectionWarnings(
 export function resolveSelection(
   parsed: ParsedArgs,
   candidates: ServiceCandidate[],
-): { indices: number[]; skipped?: ServiceCandidate[] } | { error: string } | null {
+):
+  | { indices: number[]; skipped?: ServiceCandidate[] }
+  | { error: string }
+  | null {
   if (parsed.only && parsed.only.length > 0) {
     const indices: number[] = [];
     for (const want of parsed.only) {
@@ -1891,6 +1923,8 @@ export async function runBatchWizard(
           // "No event yet" for every service while events were landing.
           serviceName: svc.serviceName,
           backendOrigins,
+          sdkVersion: readVersion(),
+          mintUrl: appUrl(appBaseFor(base, deps.env), "/setup", project.id),
           options: { force: parsed.yes },
         },
         defaultInjectIO,
@@ -2526,10 +2560,31 @@ async function writeIngestKeys(args: {
           `${named(label)}${color.bold(plan.varName)} is already set in ${color.brand(rel(args.repoRoot, plan.file))} — left as it is. Events from this app go wherever that key points, which is only ${color.bold(args.projectName)} if it was minted there.`,
         ),
       );
+      // The key in that file is live and the file is not excluded from git, so
+      // it is one `git add` away from being published — by a run that wrote
+      // nothing and would otherwise have said nothing. The entry is added here
+      // for exactly the same reason it is added next to a key this run wrote.
+      let ignoreNote: string | undefined;
+      if (plan.ignore) {
+        try {
+          const applied = applyEnvEdits([plan.ignore], args.deps.envFileIO);
+          if (applied.ignoreEntriesAdded.length > 0) {
+            ui.out(
+              color.dim(
+                `  Added ${rel(args.repoRoot, plan.file)} to .gitignore — it holds a live key and git was not excluding it.`,
+              ),
+            );
+          }
+        } catch (err) {
+          ignoreNote = `${rel(args.repoRoot, plan.file)} holds a live ingest key and is not in .gitignore, and Crumbtrail could not add it (${errMessage(err)}). Add it yourself before committing.`;
+          ui.out(alert(color.yellow(ignoreNote)));
+        }
+      }
       results.set(label, {
         status: "already-set",
         file: plan.file,
         varName: plan.varName,
+        ...(ignoreNote ? { note: ignoreNote } : {}),
         probeKey: readEnvVar(
           args.deps.envFileIO.readFile(plan.file) ?? "",
           plan.varName,
@@ -3013,6 +3068,8 @@ function printSummary(
   repoRoot?: string,
   keyIsCompileTime?: boolean,
   setupIncomplete = false,
+  /** The injected code holds the key as a literal placeholder (static pages). */
+  keyIsSourceLiteral = false,
 ): void {
   // User-facing links point at the app host (the SPA), not the API host.
   const appBase = appBaseFor(base);
@@ -3033,6 +3090,17 @@ function printSummary(
   ui.out("");
   ui.out(field("Project", color.bold(p.projectName)));
   ui.out(field("Service", color.bold(p.serviceName)));
+  // A page with no bundler has no variable to name, so the "Ingest key" line
+  // points at the file instead. Printing nothing here is what let a run finish
+  // silently with a placeholder where the credential goes.
+  if (!keyEnvVar && keyIsSourceLiteral) {
+    ui.out(
+      field(
+        "Ingest key",
+        `replace ${color.bold("<your-ingest-key>")} in the page ${color.dim(`(mint at ${appUrl(appBase, "/setup", p.projectId)})`)}`,
+      ),
+    );
+  }
   if (keyEnvVar) {
     // The one line that used to say the setup was not finished. It now reports
     // what happened to the key rather than handing the job back by default.

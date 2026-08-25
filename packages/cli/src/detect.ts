@@ -49,6 +49,10 @@ export type Recipe =
   | "fastify"
   | "react-native"
   | "node"
+  // A frontend with no framework dependency and no bundler: a hand-written
+  // index.html, or a built page served as files. Wired with a script tag rather
+  // than an import, because there is no module graph to prepend into.
+  | "static"
   // Single guidance-only recipe for non-JS backends that already speak OTLP
   // (Django/Flask/FastAPI/Go/Rails/.NET). Unlike every other recipe it carries a
   // VARIABLE detected `Stack` out of detection via `DetectResult.otlpStack`.
@@ -301,6 +305,51 @@ export function resolveViteEntry(
     rel = rel.replace(/^\.?\//, "");
     const full = path.join(cwd, rel);
     if (reader.isFile(full)) return full;
+  }
+  return null;
+}
+
+/**
+ * Where a page with no bundler keeps its HTML entry, most conventional first.
+ * Build output directories are listed too: finding one is not a place to inject
+ * (the next build erases it), but it IS the difference between "this is a
+ * frontend whose source lives elsewhere" and "there is nothing here at all".
+ */
+const STATIC_HTML_CANDIDATES = [
+  "index.html",
+  path.join("public", "index.html"),
+  path.join("src", "index.html"),
+  path.join("www", "index.html"),
+  path.join("site", "index.html"),
+  path.join("static", "index.html"),
+  path.join("dist", "index.html"),
+  path.join("build", "index.html"),
+  path.join("out", "index.html"),
+  path.join("public", "dist", "index.html"),
+];
+
+export interface StaticHtmlEntry {
+  /** Absolute path to the HTML file. */
+  file: string;
+  /** True when it sits in build output, so injecting there would be erased. */
+  buildOutput: boolean;
+}
+
+/**
+ * The HTML entry of a frontend that has no framework and no bundler.
+ *
+ * Deliberately separate from `resolveViteEntry`: that one resolves the JS module
+ * an index.html points at, which only exists once a bundler is in the picture. A
+ * plain page has no such module, and the file to wire IS the HTML.
+ */
+export function resolveStaticHtmlEntry(
+  cwd: string,
+  reader: FileReader = localFsReader(cwd),
+): StaticHtmlEntry | null {
+  for (const rel of STATIC_HTML_CANDIDATES) {
+    const full = path.join(cwd, rel);
+    if (!reader.isFile(full)) continue;
+    return { file: full, buildOutput: isBuildOutputPath(cwd, full, reader) };
   }
   return null;
 }
@@ -1227,6 +1276,32 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!hit) return null;
       reasons.push(hit.reason);
       return { entryFile: null, nextVersion: null, otlpStack: hit.stack };
+    },
+  ],
+  [
+    // Ordered dead last, after every framework matcher AND after the non-JS
+    // backend markers. An index.html next to a Django or Express project is that
+    // project's frontend, and the backend recipe is the more specific answer for
+    // the package; this matcher is for the case where the HTML is all there is.
+    //
+    // Filesystem-only: a static site is exactly the project that has no
+    // package.json, which is why it used to fall out of the ladder entirely and
+    // end the wizard on "No supported framework" with exit code 1.
+    "static",
+    ({ root, reasons, reader }) => {
+      const hit = resolveStaticHtmlEntry(root, reader);
+      if (!hit) return null;
+      const rel = path.relative(root, hit.file) || path.basename(hit.file);
+      if (hit.buildOutput) {
+        reasons.push(
+          `found ${rel}, but it is build output — the script tag has to go into the source that produces it`,
+        );
+        return { entryFile: null, nextVersion: null };
+      }
+      reasons.push(
+        `found ${rel} with no framework dependency — a static frontend, wired with a script tag`,
+      );
+      return { entryFile: hit.file, nextVersion: null };
     },
   ],
 ];

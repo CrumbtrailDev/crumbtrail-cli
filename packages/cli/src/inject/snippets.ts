@@ -4,6 +4,8 @@
 // `import.meta.env.VITE_CRUMBTRAIL_KEY`) and the wizard tells the user to set it
 // from the dashboard. This keeps the live credential out of committed source.
 
+import { SDK_VERSION_FLOORS } from "../recipe-registry";
+
 /**
  * Single-quoted string literal in Prettier's `singleQuote: true` style: wraps the
  * value in single quotes, escaping backslashes and single quotes. Used by the
@@ -542,5 +544,70 @@ export function tauriInitSnippet(): string {
     'import { TauriTransport } from "crumbtrail-core/tauri";',
     "",
     "Crumbtrail.init({ ...PRESET_PASSIVE, transportInstance: new TauriTransport() });",
+  ].join("\n");
+}
+
+/**
+ * Where a page with no bundler gets the SDK from.
+ *
+ * A bare `import "crumbtrail-core"` does not resolve in a browser, and a static
+ * page has no build step to rewrite it, so the one honest answer is a URL. The
+ * version is pinned rather than floating: an unpinned CDN URL hands every page
+ * whatever ships next, and nothing in the page says which SDK it is running.
+ *
+ * `version` is this CLI's own release, which moves in lockstep with the SDKs.
+ * A prerelease (or anything that is not an exact release) falls back to the
+ * published capability floor, so the emitted URL is always a version that exists
+ * on the registry.
+ */
+export function browserModuleUrl(version?: string | null): string {
+  // `0.0.0` is what an unreadable package.json yields, not a release anyone can
+  // fetch — treating it as one would emit a URL that 404s in the user's browser.
+  const trimmed = version?.trim();
+  const pinned =
+    trimmed && trimmed !== "0.0.0" && /^\d+\.\d+\.\d+$/.test(trimmed)
+      ? trimmed
+      : SDK_VERSION_FLOORS["crumbtrail-core"];
+  return `https://esm.sh/crumbtrail-core@${pinned}`;
+}
+
+/**
+ * Browser capture for a page with no framework and no bundler: one
+ * `<script type="module">` block, dropped into the HTML itself.
+ *
+ * This is the ONE snippet that carries the key as a literal. Every other client
+ * recipe reads a public env var that its bundler inlines at build time; a page
+ * served as files has neither, so there is no variable to read and no build to
+ * read it. The value emitted is a placeholder, never a live key — the wizard
+ * mints nothing for this recipe and points at the dashboard instead, so what
+ * lands in the file is a TODO rather than a credential.
+ */
+export function staticScriptTagSnippet(options: {
+  endpoint: string;
+  keyLiteral: string;
+  serviceName?: string | null;
+  backendOrigins?: readonly string[] | null;
+  sdkVersion?: string | null;
+  mintUrl?: string | null;
+}): string {
+  const { endpoint, keyLiteral, serviceName, backendOrigins } = options;
+  const mint = options.mintUrl
+    ? ` Get one at ${options.mintUrl}.`
+    : " Get one from your Crumbtrail dashboard.";
+  return [
+    "<!-- Crumbtrail — browser capture (console, network, DOM, errors). -->",
+    `<!-- Replace ${keyLiteral} with your ingest key.${mint} -->`,
+    '<script type="module">',
+    `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(options.sdkVersion))};`,
+    "",
+    "  Crumbtrail.init({",
+    "    ...PRESET_PASSIVE,",
+    `    httpEndpoint: ${JSON.stringify(endpoint)},`,
+    `    httpAuthToken: ${JSON.stringify(keyLiteral)},`,
+    remoteConfigLine("    "),
+    ...correlationOriginsLines(backendOrigins, "    ", JSON.stringify),
+    ...serviceLines(serviceName, "    ", JSON.stringify),
+    "  });",
+    "</script>",
   ].join("\n");
 }

@@ -36,6 +36,9 @@ import {
   corsImportedElsewhereNote,
   corsWideningGuidance,
   detectExpressModuleStyle,
+  findStaticMountDirs,
+  htmlReferencesCrumbtrail,
+  insertIntoHtmlHead,
   prependIntoSource,
   referencesCrumbtrail,
   servesHttp,
@@ -59,6 +62,7 @@ import {
   nodeInitSnippet,
   nuxtPluginSnippet,
   reactNativeInitSnippet,
+  staticScriptTagSnippet,
   tauriInitSnippet,
 } from "./snippets";
 
@@ -129,7 +133,8 @@ export function packageDirFromRepoRoot(
     if (patterns && patterns.length > 0) {
       const rel = path.relative(parent, target).replace(/\\/g, "/");
       if (rel && !rel.startsWith("..")) {
-        if (patterns.some((pattern) => patternMatches(pattern, rel))) return rel;
+        if (patterns.some((pattern) => patternMatches(pattern, rel)))
+          return rel;
       }
     }
     dir = parent;
@@ -176,21 +181,42 @@ export interface BuildPlanInput {
    * had none. Absent or empty keeps the honest empty field and its comment.
    */
   backendOrigins?: readonly string[] | null;
+  /**
+   * This CLI's own release, used to pin the CDN module URL the `static` recipe
+   * emits (SDK and CLI versions move in lockstep). Only that recipe reads it;
+   * every other one imports a bare specifier its bundler resolves.
+   */
+  sdkVersion?: string | null;
+  /**
+   * Where the user mints an ingest key, named inside the emitted static script
+   * tag. The `static` recipe is the only one whose key is a literal in the file,
+   * so it is the only one that has to say where the real value comes from.
+   */
+  mintUrl?: string | null;
   options?: BuildPlanOptions;
 }
 
 // --- shared plan constructors ------------------------------------------------
 
-function skipPlan(input: BuildPlanInput, warnings: string[] = []): Plan {
+function skipPlan(
+  input: BuildPlanInput,
+  warnings: string[] = [],
+  // A caller with something more specific to say replaces the generic line
+  // rather than printing both: "one step is left" directly under "the
+  // integration is complete" leaves the reader working out which is true.
+  options: { replaceDefaultWarning?: boolean } = {},
+): Plan {
   return {
     recipe: input.recipe,
     kind: "skip-already-wired",
     targetPath: null,
     content: null,
-    warnings: [
-      ...warnings,
-      "The Crumbtrail integration is complete for this endpoint and service. Nothing to inject.",
-    ],
+    warnings: options.replaceDefaultWarning
+      ? warnings
+      : [
+          ...warnings,
+          "The Crumbtrail integration is complete for this endpoint and service. Nothing to inject.",
+        ],
   };
 }
 
@@ -199,6 +225,21 @@ function fallbackPlan(
   snippet: string,
   warnings: string[],
 ): Plan {
+  // No agent prompt for a page with no bundler: buildAgentPrompt's JS output
+  // says `npm install crumbtrail-core` and reads a bundler env var, neither of
+  // which exists here. The script tag above IS the whole instruction, and a
+  // second set of steps that contradicts it is worse than none.
+  if (input.recipe === "static") {
+    return {
+      recipe: input.recipe,
+      kind: "fallback-ai",
+      targetPath: null,
+      content: null,
+      snippet,
+      warnings,
+      keyIsSourceLiteral: true,
+    };
+  }
   return {
     recipe: input.recipe,
     kind: "fallback-ai",
@@ -254,6 +295,8 @@ function incompleteSnippet(input: BuildPlanInput): string {
       );
     case "tauri":
       return tauriInitSnippet();
+    case "static":
+      return staticBlockFor(input);
     case "express":
     case "fastify":
     case "hono":
@@ -434,7 +477,8 @@ function corsWarnings(
     // Only withhold when we actually looked: a caller that passes no source
     // keeps the previous behaviour rather than going silent on evidence it
     // never had.
-    if (served && !servesHttp(served.entrySource, served.packageJson)) return [];
+    if (served && !servesHttp(served.entrySource, served.packageJson))
+      return [];
     // "No CORS middleware in this file" is a claim about code the wizard read.
     // When the file imports one from a module it did not read, that claim is
     // false and the framework snippets under it are noise.
@@ -953,6 +997,175 @@ function planAngular(input: BuildPlanInput, _io: InjectIO): Plan {
 }
 
 /**
+ * The script block a page with no bundler gets, filled for this run.
+ * Shared by the `static` recipe and by the Express pass that wires the frontend
+ * an API serves out of `express.static`, so both pages get identical wiring.
+ */
+function staticBlockFor(input: BuildPlanInput): string {
+  return staticScriptTagSnippet({
+    endpoint: input.endpoint,
+    keyLiteral: KEY_PLACEHOLDER,
+    serviceName: input.serviceName,
+    backendOrigins: input.backendOrigins,
+    sdkVersion: input.sdkVersion,
+    mintUrl: input.mintUrl,
+  });
+}
+
+/**
+ * A frontend with no framework and no bundler: a hand-written index.html, or a
+ * page served as files.
+ *
+ * The whole point of this recipe is that it ends somewhere. Before it existed
+ * this project matched nothing, and the wizard exited 1 on "No supported
+ * framework" — which is how a user with half an app in the browser concluded
+ * Crumbtrail had no browser capture at all. There IS a correct wiring for this
+ * page; it is a script tag, so that is what gets written.
+ *
+ * The key is a placeholder in the file rather than a live credential: a page
+ * served as files has no env mechanism, and minting a real key into a file the
+ * user is about to commit is the one outcome worse than an unfinished TODO.
+ */
+function planStatic(input: BuildPlanInput, io: InjectIO): Plan {
+  const block = staticBlockFor(input);
+  if (!input.entryFile) {
+    return fallbackPlan(input, block, [
+      "No HTML file to wire here (the page found was build output, or there is none). Paste the script tag below into the <head> of the page's SOURCE, so the next build keeps it.",
+    ]);
+  }
+  const target = input.entryFile;
+  const html = io.readFile(target);
+  if (html == null) {
+    return fallbackPlan(input, block, [
+      `Could not read ${target}; paste the script tag below into its <head>.`,
+    ]);
+  }
+  if (htmlReferencesCrumbtrail(html)) {
+    return skipPlan(input, [
+      `${path.relative(input.cwd, target) || target} already references Crumbtrail — left as it is.`,
+    ]);
+  }
+  const wired = insertIntoHtmlHead(html, block);
+  if (wired == null) {
+    return fallbackPlan(input, block, [
+      `${path.relative(input.cwd, target) || target} has no <head> or <body> to insert into; paste the script tag below into the page yourself.`,
+    ]);
+  }
+  const warnings = [
+    `The ingest key goes in the tag as a literal: a page with no bundler has no env var to read. Replace ${KEY_PLACEHOLDER} in ${path.relative(input.cwd, target) || target} before deploying.`,
+  ];
+  const status = io.gitStatus(input.cwd, target);
+  if (status.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: target,
+      content: wired,
+      applyMode: "rewrite",
+      keyIsSourceLiteral: true,
+      warnings: [
+        ...warnings,
+        `${target} has uncommitted changes — confirm (or re-run with force) before editing it.`,
+      ],
+    };
+  }
+  return {
+    recipe: input.recipe,
+    kind: "rewrite",
+    targetPath: target,
+    content: wired,
+    warnings,
+    keyIsSourceLiteral: true,
+  };
+}
+
+/**
+ * The frontend an Express app serves out of `express.static`.
+ *
+ * Detection stops at the backend dependency, so this app used to be wired for
+ * its API and left completely dark in the browser — with nothing printed saying
+ * a frontend had been seen and skipped. The served directory is read off the
+ * entry itself, and the page in it is wired with the same script tag a
+ * standalone static site gets.
+ *
+ * A page under build output is NOT edited: the next build erases it. That case
+ * gets a named next action instead — wire the source app that produces it.
+ */
+function planServedStaticFrontend(
+  input: BuildPlanInput,
+  io: InjectIO,
+  entrySource: string,
+): { edits: NonNullable<Plan["extraEdits"]>; warnings: string[] } {
+  const edits: NonNullable<Plan["extraEdits"]> = [];
+  const warnings: string[] = [];
+  const entryDir = path.dirname(input.entryFile ?? path.join(input.cwd, "x"));
+  const reader: FileReader = {
+    readFile: (p) => io.readFile(p),
+    isFile: (p) => io.exists(p),
+    isDir: (p) => io.exists(p),
+    readDir: () => [],
+    root: input.cwd,
+  };
+  for (const dir of findStaticMountDirs(entrySource)) {
+    const candidates = [
+      path.resolve(entryDir, dir),
+      path.resolve(input.cwd, dir),
+    ];
+    const indexPath = candidates
+      .map((base) => path.join(base, "index.html"))
+      .find((file) => io.readFile(file) !== null);
+    const shown = dir.replace(/^\.\//, "");
+    if (!indexPath) {
+      warnings.push(
+        `This server serves static files from ${shown}, but there is no index.html in it to wire, so the browser half of this app is not captured yet. Wire the app that produces those files (\`cd <that app> && npx crumbtrail\`).`,
+      );
+      continue;
+    }
+    if (isBuildOutputPath(input.cwd, indexPath, reader)) {
+      warnings.push(
+        `This server serves a built frontend from ${shown}. Crumbtrail did not edit it — the next build would erase the change. Wire that frontend's SOURCE instead (\`cd <frontend app> && npx crumbtrail\`), and it will be captured from the next build on.`,
+      );
+      continue;
+    }
+    const html = io.readFile(indexPath)!;
+    if (htmlReferencesCrumbtrail(html)) continue;
+    const wired = insertIntoHtmlHead(
+      html,
+      staticScriptTagSnippet({
+        endpoint: input.endpoint,
+        keyLiteral: KEY_PLACEHOLDER,
+        // The SAME service as the server, deliberately. This page is served by
+        // that process, from that origin — it is the browser half of one
+        // deployed app, not a second one. Inventing a `-web` name here would
+        // file every browser session under a service the wizard never
+        // provisioned, which is a label nothing in the dashboard can show.
+        serviceName: input.serviceName,
+        backendOrigins: input.backendOrigins,
+        sdkVersion: input.sdkVersion,
+        mintUrl: input.mintUrl,
+      }),
+    );
+    if (wired == null) {
+      warnings.push(
+        `${path.relative(input.cwd, indexPath) || indexPath} is served to browsers but has no <head> or <body> to insert into, so it was left alone.`,
+      );
+      continue;
+    }
+    const rel = path.relative(input.cwd, indexPath) || indexPath;
+    edits.push({
+      path: indexPath,
+      mode: "update",
+      content: wired,
+      label: `wired the static frontend served from ${shown}`,
+    });
+    warnings.push(
+      `Wired browser capture into ${rel}, the page this server serves. Replace ${KEY_PLACEHOLDER} in it with your ingest key — a page with no bundler has no env var to read.`,
+    );
+  }
+  return { edits, warnings };
+}
+
+/**
  * The two web hosts a Capacitor app can be wired through, and the only thing
  * that differs between them: how browser code is allowed to read an env var.
  */
@@ -1462,6 +1675,28 @@ export function buildPlan(
     }
     plan.warnings = [...plan.warnings, ...extra.warnings];
   }
+
+  // A backend that serves its own frontend is TWO halves of one app, and only
+  // one of them is answered by the recipe. This pass wires the other half — the
+  // page served out of `express.static` — or says why it could not, so the
+  // browser side is never silently dark.
+  if (
+    isBackendRecipe(input.recipe) &&
+    plan.kind !== "otlp-guidance" &&
+    input.entryFile
+  ) {
+    const entrySource = io.readFile(input.entryFile);
+    if (entrySource) {
+      const served = planServedStaticFrontend(input, io, entrySource);
+      if (served.edits.length > 0) {
+        plan.extraEdits = [...(plan.extraEdits ?? []), ...served.edits];
+        // The page this server serves now carries a placeholder key, so the run
+        // is not finished even when the server's own env key was written.
+        plan.keyIsSourceLiteral = true;
+      }
+      plan.warnings = [...plan.warnings, ...served.warnings];
+    }
+  }
   return plan;
 }
 
@@ -1478,6 +1713,25 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
     io,
   });
   if (integration.complete) return skipPlan(input);
+  // A wired static page whose ONLY gap is the key placeholder is not a broken
+  // integration — it is a finished edit with one step left that only the user
+  // can do. Handing back the whole snippet again told them to paste code their
+  // page already carries, and named an env var this recipe does not use.
+  if (
+    integration.found &&
+    input.recipe === "static" &&
+    integration.missing.every((piece) => piece === "ingest-key")
+  ) {
+    const plan = skipPlan(
+      input,
+      [
+        `This page is already wired. One step is left, and only you can do it: replace ${KEY_PLACEHOLDER} in ${input.entryFile ? path.relative(input.cwd, input.entryFile) || input.entryFile : "the page"} with your ingest key${input.mintUrl ? ` from ${input.mintUrl}` : ""}.`,
+      ],
+      { replaceDefaultWarning: true },
+    );
+    plan.keyIsSourceLiteral = true;
+    return plan;
+  }
   if (integration.found) return incompletePlan(input, integration);
   switch (input.recipe) {
     case "tauri":
@@ -1502,6 +1756,10 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
       return planAngular(input, io);
     case "vite-spa":
       return planVite(input, io);
+    case "static":
+      // A page with no bundler: the HTML itself is the entry, wired with a
+      // script tag rather than an import.
+      return planStatic(input, io);
     case "express":
       // Express additionally wires the request/error middleware pair so the
       // backend emits backend.req.* spans, not just crash capture.

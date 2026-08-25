@@ -146,9 +146,7 @@ describe("chooseEnvFile", () => {
       "/app/.env.local": "CRUMBTRAIL_KEY=ctkey_existing\n",
       "/app/.env": "OTHER=1\n",
     });
-    expect(chooseEnvFile("/app", "CRUMBTRAIL_KEY", io)).toBe(
-      "/app/.env.local",
-    );
+    expect(chooseEnvFile("/app", "CRUMBTRAIL_KEY", io)).toBe("/app/.env.local");
   });
 
   it("uses an existing .env rather than creating a second file", () => {
@@ -198,6 +196,39 @@ describe("planEnvKeyWrite", () => {
       io,
     });
     expect(plan.kind).toBe("already-set");
+  });
+
+  // A key from an older install is still a live key. The run writes nothing, but
+  // the file it found is one `git add` away from publishing that credential, so
+  // the missing .gitignore entry has to come back with the decision.
+  it("carries the missing .gitignore entry for an already configured file", () => {
+    const io = fakeIO({ "/repo/.env.local": `${VAR}=ctkey_theirs\n` });
+    const plan = planEnvKeyWrite({
+      appDir: ROOT,
+      repoRoot: ROOT,
+      varName: VAR,
+      io,
+    });
+    if (plan.kind !== "already-set")
+      throw new Error(`expected already-set, got ${plan.kind}`);
+    expect(plan.ignore?.entry).toBe(".env.local");
+    expect(plan.ignore?.path).toBe(path.join(ROOT, ".gitignore"));
+  });
+
+  it("carries no entry when the already configured file is ignored already", () => {
+    const io = fakeIO(
+      { "/repo/.env.local": `${VAR}=ctkey_theirs\n` },
+      { ignored: [".env.local"] },
+    );
+    const plan = planEnvKeyWrite({
+      appDir: ROOT,
+      repoRoot: ROOT,
+      varName: VAR,
+      io,
+    });
+    if (plan.kind !== "already-set")
+      throw new Error(`expected already-set, got ${plan.kind}`);
+    expect(plan.ignore).toBeNull();
   });
 
   it("adds a .gitignore entry when the env file is not excluded yet", () => {

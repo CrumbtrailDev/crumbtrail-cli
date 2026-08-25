@@ -72,4 +72,13 @@ export interface Plan {
    * step would report success for an app that captures nothing.
    */
   keyIsCompileTime?: boolean;
+  /**
+   * The injected code carries the key as a LITERAL placeholder, because this
+   * target has no env mechanism at all (a page with no bundler). There is
+   * nothing for the wizard to write and nothing for it to verify, so the run is
+   * not finished when the edit lands — someone still has to paste the key.
+   * Without this the summary printed "Setup complete" over a page that captures
+   * nothing.
+   */
+  keyIsSourceLiteral?: true;
 }

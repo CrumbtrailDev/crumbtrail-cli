@@ -469,7 +469,8 @@ const STRING_FORM = new RegExp(
 const ANY_FORM = new RegExp(ALLOW_HEADERS_KEY, "g");
 
 /** An array body made only of string literals, commas and whitespace. */
-const LITERAL_ARRAY_BODY_RE = /^\s*(?:(["'])[^"'\n]*\1\s*,\s*)*(?:(["'])[^"'\n]*\2\s*,?\s*)?$/;
+const LITERAL_ARRAY_BODY_RE =
+  /^\s*(?:(["'])[^"'\n]*\1\s*,\s*)*(?:(["'])[^"'\n]*\2\s*,?\s*)?$/;
 
 function quoteStyleOf(body: string): '"' | "'" {
   return body.includes("'") && !body.includes('"') ? "'" : '"';
@@ -530,24 +531,27 @@ export function widenCorsAllowedHeaders(text: string): CorsWidening {
     return `${key}[${body.replace(/\s+$/, "")}${separator}${additions}]`;
   });
 
-  out = out.replace(STRING_FORM, (match, key: string, quote: string, body: string) => {
-    handled++;
-    const present = new Set(
-      body
-        .split(",")
-        .map((name) => name.trim().toLowerCase())
-        .filter(Boolean),
-    );
-    const missing = CORRELATION_REQUEST_HEADERS.filter(
-      (name) => !present.has(name),
-    );
-    if (missing.length === 0) return match;
-    changed = true;
-    const joined = [body.trim().replace(/,$/, ""), ...missing]
-      .filter(Boolean)
-      .join(",");
-    return `${key}${quote}${joined}${quote}`;
-  });
+  out = out.replace(
+    STRING_FORM,
+    (match, key: string, quote: string, body: string) => {
+      handled++;
+      const present = new Set(
+        body
+          .split(",")
+          .map((name) => name.trim().toLowerCase())
+          .filter(Boolean),
+      );
+      const missing = CORRELATION_REQUEST_HEADERS.filter(
+        (name) => !present.has(name),
+      );
+      if (missing.length === 0) return match;
+      changed = true;
+      const joined = [body.trim().replace(/,$/, ""), ...missing]
+        .filter(Boolean)
+        .join(",");
+      return `${key}${quote}${joined}${quote}`;
+    },
+  );
 
   const total = (text.match(ANY_FORM) ?? []).length;
   return {
@@ -594,4 +598,92 @@ export function corsElsewhereGuidance(): string {
  */
 export function corsImportedElsewhereNote(): string {
   return `This file configures no CORS itself but imports CORS from another module, which Crumbtrail did not read. If that config pins an allowed headers list, it needs ${CORRELATION_REQUEST_HEADERS.join(", ")} added, or the preflight blocks every cross origin request once correlation is on.`;
+}
+
+// ── Static frontends ─────────────────────────────────────────────────────────
+
+/** Whether this HTML already carries a Crumbtrail script tag. */
+export function htmlReferencesCrumbtrail(html: string): boolean {
+  return /crumbtrail/i.test(html);
+}
+
+/**
+ * Put a block into an HTML document, as late in `<head>` as possible.
+ *
+ * Order matters more here than in a module graph: capture has to be installed
+ * before the page's own scripts run, or the errors it exists to record happen
+ * first and are gone. `</head>` is therefore the target, with `<body>` and then
+ * `</body>` as fallbacks for the many real pages that have neither a head nor a
+ * closing tag. A file with no HTML structure at all returns null rather than
+ * having a script tag guessed into it.
+ */
+export function insertIntoHtmlHead(html: string, block: string): string | null {
+  // Indent the block to match the tag it lands above, and insert at the START
+  // of that tag's line so the tag keeps its own indentation. Splicing at the tag
+  // itself left the first emitted line wearing the closing tag's whitespace and
+  // every later line wearing a different amount — a diff that reads as damage.
+  const spliceBefore = (at: number): string => {
+    const lineStart = html.lastIndexOf("\n", at - 1) + 1;
+    const lead = html.slice(lineStart, at);
+    const indent = /^[ \t]*$/.exec(lead)?.[0] ?? lead.match(/^[ \t]*/)![0];
+    const indented = block
+      .split("\n")
+      .map((line) => (line ? `${indent}${line}` : line))
+      .join("\n");
+    // A tag alone on its line takes the block on the lines above it. A tag with
+    // code before it on the same line — `<head><title>x</title></head>`, which is
+    // most hand-written pages — must be split instead, or the block lands
+    // OUTSIDE the element it was supposed to go inside.
+    if (/^[ \t]*$/.test(lead)) {
+      return `${html.slice(0, lineStart)}${indented}\n${html.slice(lineStart)}`;
+    }
+    return `${html.slice(0, at)}\n${indented}\n${indent}${html.slice(at)}`;
+  };
+  const closeHead = /<\/head\s*>/i.exec(html);
+  if (closeHead) return spliceBefore(closeHead.index);
+  const openBody = /<body\b[^>]*>/i.exec(html);
+  if (openBody) {
+    const at = openBody.index + openBody[0].length;
+    const indented = block
+      .split("\n")
+      .map((line) => (line ? `  ${line}` : line))
+      .join("\n");
+    return `${html.slice(0, at)}\n${indented}${html.slice(at)}`;
+  }
+  const closeBody = /<\/body\s*>/i.exec(html);
+  if (closeBody) return spliceBefore(closeBody.index);
+  return null;
+}
+
+/**
+ * Directories an Express app serves as static files.
+ *
+ * `express.static(...)` is how a Node service ships a frontend, and that
+ * frontend is half the app's evidence — it was the half the wizard was blind to,
+ * because detection stops at the backend dependency and never looks at what the
+ * backend serves.
+ *
+ * Deliberately literal-only. The argument is usually
+ * `path.join(__dirname, "public")` or `"public"`, and the LAST string literal in
+ * the call is the directory in both shapes. A call built from a variable yields
+ * nothing rather than a guess, and the caller says so instead of editing a file
+ * it inferred.
+ */
+export function findStaticMountDirs(source: string): string[] {
+  const dirs: string[] = [];
+  const callRes = [
+    /\bexpress\s*\.\s*static\s*\(([^)]*)\)/gi,
+    /\bserveStatic\s*\(([^)]*)\)/gi,
+  ];
+  for (const callRe of callRes) {
+    for (const match of source.matchAll(callRe)) {
+      const literals = [...match[1].matchAll(/["'`]([^"'`]*)["'`]/g)].map(
+        (m) => m[1],
+      );
+      const dir = literals[literals.length - 1];
+      if (!dir || /^https?:/i.test(dir)) continue;
+      if (!dirs.includes(dir)) dirs.push(dir);
+    }
+  }
+  return dirs;
 }

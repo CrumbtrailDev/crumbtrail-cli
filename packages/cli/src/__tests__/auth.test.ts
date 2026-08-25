@@ -300,6 +300,44 @@ describe("sign-in links land on the dashboard, not the API host", () => {
     await app.close();
   });
 
+  // Without this the browser hand-off was the ONE flow that ignored what the
+  // deployment had already said about itself: it derived the authorize URL from
+  // the API base, 404-probed it, and silently dropped to device code on every
+  // split-origin self-host that had not set CRUMBTRAIL_APP_URL.
+  it("uses the dashboard origin a previous login stored, with no env override", async () => {
+    const mint = "ctcli_" + "g".repeat(48);
+    const api = await startMockCloud({ mintToken: mint, signInPages: false });
+    const app = await startMockCloud({ mintToken: mint });
+    // A stale cached token for this endpoint: not accepted, so the run has to
+    // log in again — but it carries the dashboard origin from the login before.
+    saveAuth(
+      {
+        token: "ctcli_" + "z".repeat(48),
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        endpoint: api.baseUrl,
+        appBaseUrl: app.baseUrl,
+      },
+      env,
+    );
+    let openedUrl = "";
+    const openFn = (authorizeUrl: string): boolean => {
+      openedUrl = authorizeUrl;
+      const port = new URL(authorizeUrl).searchParams.get("port");
+      http.get(`http://127.0.0.1:${port}/callback?code=grant-123`);
+      return true;
+    };
+    const token = await ensureToken({
+      base: api.baseUrl,
+      ui: silentUi,
+      openFn,
+      env,
+    });
+    expect(token).toBe(mint);
+    expect(openedUrl.startsWith(`${app.baseUrl}/cli/authorize?`)).toBe(true);
+    await api.close();
+    await app.close();
+  });
+
   it("does not open a sign-in page that 404s — it falls back to the device flow", async () => {
     const mint = "ctcli_" + "d".repeat(48);
     const mock = await startMockCloud({ mintToken: mint, signInPages: false });

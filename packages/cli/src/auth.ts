@@ -431,7 +431,20 @@ export async function loginBrowser(opts: LoginOptions): Promise<TokenResponse> {
   // at the API host, which never serves the SPA, so the browser this flow opens
   // landed on a 404 in every deployment — hosted included — and the CLI then
   // sat waiting five minutes for an approval the user could not give.
-  const appBase = dashboardBase(opts.base, undefined, opts.env ?? process.env);
+  // Passing `undefined` for the reported origin here meant this flow was the one
+  // place that never consulted what the deployment had already said about
+  // itself. On a split-origin self-host without CRUMBTRAIL_APP_URL that made the
+  // authorize URL the API host every time, which 404s, so the browser hand-off
+  // bailed out and every login silently fell back to device code. A previous
+  // login stored that origin; use it.
+  const env = opts.env ?? process.env;
+  const stored = loadAuth(env);
+  const knownAppBase =
+    reportedAppBase(opts.base) ??
+    (stored && normalizeBase(stored.endpoint) === normalizeBase(opts.base)
+      ? stored.appBaseUrl
+      : undefined);
+  const appBase = dashboardBase(opts.base, knownAppBase, env);
   const authorizeUrl = `${appBase}/cli/authorize?port=${server.port}&challenge=${challenge}`;
   const missing = await signInPageMissing(authorizeUrl, opts.fetchImpl);
   if (missing) {
@@ -781,6 +794,10 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
       );
       return stored.token;
     }
+    // The credential is dead; the dashboard origin it was stored with is not.
+    // Clearing both meant the sign-in that follows had to guess the origin
+    // again, which on a split-origin self-host is the guess that 404s.
+    rememberAppBase(opts.base, stored.appBaseUrl);
     clearAuth(env);
     opts.ui.out(color.dim("Saved login expired. Signing in again."));
   } else if (
