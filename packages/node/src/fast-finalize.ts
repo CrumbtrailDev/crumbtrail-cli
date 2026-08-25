@@ -137,6 +137,13 @@ export function isHighSeverityEvent(event: BugEvent): boolean {
         finiteNumber(attributes?.["http.status_code"]);
       return (status ?? 0) >= 500;
     }
+    // A logged error is the ordinary shape of a backend failure: caught,
+    // written through pino/winston, answered with a status. Warn-level lines are
+    // NOT high severity, matching how console warnings are treated.
+    case "backend.log": {
+      const level = typeof d.level === "string" ? d.level : undefined;
+      return level === "error" || level === "fatal";
+    }
     case "backend.otel.log": {
       const severityNumber = finiteNumber(d.severityNumber);
       const severityText =

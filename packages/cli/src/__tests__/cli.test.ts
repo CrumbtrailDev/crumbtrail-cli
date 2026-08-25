@@ -1994,3 +1994,85 @@ describe("probeServiceKeys", () => {
     expect(verdicts.size).toBe(0);
   });
 });
+
+// A run that took the hosted default in silence looked exactly like one the
+// user had chosen. The endpoint is where every session, project and key ends
+// up, so an interactive run states it and lets the user change it; Enter keeps
+// the default, and anything that already stated an endpoint is not asked twice.
+describe("endpoint confirmation", () => {
+  function endpointDeps(over: Partial<WizardDeps>): WizardDeps {
+    return makeDeps({ steps: [] }, { env: { DISPLAY: ":0" }, ...over });
+  }
+
+  it("asks which endpoint an interactive run sends to, defaulting to the hosted cloud", async () => {
+    const asked: Array<[string, string | undefined]> = [];
+    const deps = endpointDeps({
+      prompter: {
+        ...noopPrompter,
+        ask: async (q, d) => {
+          asked.push([q, d]);
+          return d ?? "";
+        },
+      },
+    });
+    await runCli(["node", "cli"], deps);
+    const endpointAsk = asked.find(([q]) => q.includes("endpoint"));
+    expect(endpointAsk?.[1]).toBe("https://api.crumbtrail.ai");
+  });
+
+  it("sends to the endpoint the user typed instead of the default", async () => {
+    const { ui, lines } = captureUi();
+    const bases: string[] = [];
+    const ensureToken = vi.fn(async (opts: { base: string }) => {
+      bases.push(opts.base);
+      return "bl_cli_token";
+    });
+    const deps = endpointDeps({
+      ui,
+      ensureToken: ensureToken as unknown as WizardDeps["ensureToken"],
+      prompter: {
+        ...noopPrompter,
+        ask: async (q, d) =>
+          q.includes("endpoint") ? "http://127.0.0.1:19890" : (d ?? ""),
+      },
+    });
+    await runCli(["node", "cli"], deps);
+    expect(bases).toEqual(["http://127.0.0.1:19890"]);
+    expect(lines.join("\n")).toContain("http://127.0.0.1:19890");
+  });
+
+  it("does not ask when --endpoint already stated one", async () => {
+    let asked = 0;
+    const deps = endpointDeps({
+      prompter: {
+        ...noopPrompter,
+        ask: async (q, d) => {
+          if (q.includes("endpoint")) asked++;
+          return d ?? "";
+        },
+      },
+    });
+    await runCli(
+      ["node", "cli", "--endpoint", "http://127.0.0.1:19890"],
+      deps,
+    );
+    expect(asked).toBe(0);
+  });
+
+  it("does not ask in a non-interactive shell or under --yes", async () => {
+    let asked = 0;
+    const prompter = {
+      ...noopPrompter,
+      ask: async (q: string, d?: string) => {
+        if (q.includes("endpoint")) asked++;
+        return d ?? "";
+      },
+    };
+    await runCli(
+      ["node", "cli"],
+      makeDeps({ steps: [], isTTY: false }, { env: { DISPLAY: ":0" }, prompter }),
+    );
+    await runCli(["node", "cli", "--yes"], endpointDeps({ prompter }));
+    expect(asked).toBe(0);
+  });
+});

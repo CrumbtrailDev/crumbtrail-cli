@@ -1331,6 +1331,63 @@ describe("buildPlan — Express middleware wiring", () => {
     expectNoKeyLiteral(content);
   });
 
+  // The wizard turns correlation on in the frontend and edits the backend entry
+  // in the same run. When the backend's CORS config lives in another file there
+  // is nothing to widen, and saying nothing left the user with an app whose
+  // every cross-origin request is blocked by a preflight. Name the headers.
+  it("names the correlation headers when the entry has no CORS middleware", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.js")]: ESM_ENTRY,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+      },
+      io,
+    );
+    const warnings = (plan.warnings ?? []).join("\n");
+    expect(warnings).toContain("No CORS middleware in this file");
+    for (const header of [
+      "x-crumbtrail-session-id",
+      "x-crumbtrail-request-id",
+      "traceparent",
+    ]) {
+      expect(warnings).toContain(header);
+    }
+  });
+
+  it("says nothing about CORS when the entry already widens its own allowlist", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.js")]: [
+        'import express from "express";',
+        'import cors from "cors";',
+        "const app = express();",
+        'app.use(cors({ allowedHeaders: ["Content-Type"] }));',
+        'app.get("/", (req, res) => res.send("ok"));',
+        "app.listen(3000);",
+        "",
+      ].join("\n"),
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+      },
+      io,
+    );
+    const warnings = (plan.warnings ?? []).join("\n");
+    expect(warnings).not.toContain("No CORS middleware in this file");
+    expect(warnings).toContain("Widened the CORS allowed headers");
+    expect(plan.content ?? "").toContain('"traceparent"');
+  });
+
   // Regression (Alertbase PR #544): `job-server` and `user-billing-service` both
   // register a four argument error handler that always responds, immediately
   // above `app.listen`. Anchoring on listen put Crumbtrail's handler BELOW it,

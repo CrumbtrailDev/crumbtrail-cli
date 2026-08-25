@@ -14,6 +14,12 @@ import {
   installBackendWarningCapture,
   type BackendWarningCaptureHandle,
 } from "./backend-warnings";
+import {
+  installBackendLogCapture,
+  type BackendLogCaptureHandle,
+  type BackendLogCaptureOptions,
+  type BackendLogLevel,
+} from "./backend-logs";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -136,6 +142,27 @@ export interface AutoCaptureOptions {
    * Set false to leave the process untouched.
    */
   captureRuntimeWarnings?: boolean;
+  /**
+   * When true (default) record structured log lines the process writes —
+   * pino, winston, bunyan and anything else emitting NDJSON with a level — as
+   * `backend.log` events.
+   *
+   * This is the only path by which an ORDINARY backend failure reaches a
+   * session. A handled 503 is caught, logged with its stack, and answered; it
+   * never touches `console.error` and never crashes the process, so without
+   * this hook a server that logs through a logger captures nothing at all.
+   *
+   * Set false to leave `process.stdout`/`process.stderr` and `fs.write`
+   * untouched.
+   */
+  captureLogs?: boolean;
+  /** Lowest log level captured. Defaults to `warn`. */
+  logLevel?: BackendLogLevel;
+  /** Streams and `fs` the log capture patches (tests). Defaults to the process's. */
+  logStreams?: Pick<
+    BackendLogCaptureOptions,
+    "stdout" | "stderr" | "fsImpl" | "maxEvents"
+  >;
 }
 
 export interface AutoCaptureHandle {
@@ -472,6 +499,32 @@ export async function autoCapture(
     }
   }
 
+  // Structured log capture. The lane that carries an ordinary handled failure:
+  // the app logged the 503 and its stack through pino, kept serving, and no
+  // other hook here would ever have seen it. Emitted through the same session as
+  // everything else, and dropped rather than queued while the session is dark,
+  // matching db events and runtime warnings.
+  let logCapture: BackendLogCaptureHandle | undefined;
+  if (options.captureLogs !== false) {
+    try {
+      logCapture = installBackendLogCapture({
+        sessionId: stableSessionId,
+        minLevel: options.logLevel,
+        ...options.logStreams,
+        emit: (event) => {
+          if (stopped || !session) return;
+          void session
+            .record(event)
+            .catch((sendErr) =>
+              emitError(sendErr, { phase: "record", source: "console.error" }),
+            );
+        },
+      });
+    } catch (error) {
+      emitError(error, { phase: "record", source: "console.error" });
+    }
+  }
+
   // Zero-config DB capture. Installed AFTER the hooks so a driver patch can
   // never delay crash instrumentation, and best-effort in the same sense as the
   // rest of this module: a driver with an unexpected shape is reported, never
@@ -513,6 +566,7 @@ export async function autoCapture(
     proc.removeListener("uncaughtException", onUncaught);
     proc.removeListener("unhandledRejection", onUnhandled);
     warningCapture?.stop();
+    logCapture?.stop();
     dbInstrumentation?.restore();
     installed = false;
   };

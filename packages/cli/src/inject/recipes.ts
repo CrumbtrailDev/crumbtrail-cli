@@ -13,6 +13,7 @@
 import path from "node:path";
 import { buildAgentPrompt, buildOtlpSnippets } from "../install/index.js";
 import type { Stack } from "crumbtrail-core";
+import { isBackendRecipe } from "../backend-origins";
 import { isBuildOutputPath, type Recipe } from "../detect";
 import type { FileReader } from "../readers/types";
 import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
@@ -26,6 +27,7 @@ import {
 import { defaultInjectIO, type InjectIO } from "./io";
 import type { Plan } from "./types";
 import {
+  corsElsewhereGuidance,
   corsWideningGuidance,
   detectExpressModuleStyle,
   prependIntoSource,
@@ -306,11 +308,7 @@ function prependWithPreflight(
   // widening that list, wires an app the browser will refuse to talk to the
   // moment correlation is on. So the widening rides along with this edit.
   const cors = widenCorsAllowedHeaders(existing);
-  const corsWarnings = [
-    ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
-    ...(cors.needsManual ? [corsWideningGuidance()] : []),
-  ];
-  const allWarnings = [...warnings, ...corsWarnings];
+  const allWarnings = [...warnings, ...corsWarnings(cors, input.recipe)];
 
   const status = io.gitStatus(input.cwd, target);
   if (status.dirty && !input.options?.force) {
@@ -350,6 +348,28 @@ function prependWithPreflight(
  */
 const CORS_WIDENED_WARNING =
   "Widened the CORS allowed headers to admit x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent. Without this the browser blocks every cross origin request once correlation is on.";
+
+/**
+ * What this edit did — or could not do — about the file's CORS allowlist.
+ *
+ * The "could not do" cases matter as much as the rewrite: a computed header
+ * list, or a CORS config that lives in a different file, both end with the
+ * browser blocking the app's own requests, and the wizard is the only thing in
+ * the room that knows correlation was just switched on. Backend recipes only:
+ * a frontend entry has no CORS config to speak of, and the note would be noise.
+ */
+function corsWarnings(
+  cors: { changed: boolean; needsManual: boolean; found: boolean },
+  recipe: Recipe,
+): string[] {
+  if (!cors.found) {
+    return isBackendRecipe(recipe) ? [corsElsewhereGuidance()] : [];
+  }
+  return [
+    ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
+    ...(cors.needsManual ? [corsWideningGuidance()] : []),
+  ];
+}
 
 // --- idempotency (project-level) --------------------------------------------
 
@@ -747,8 +767,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
     `${envPreloadSnippet(keyEnvVar)}\n\n${block}\n\n${expressMiddlewareImportSnippet(style!)}`,
   );
   const warnings = [
-    ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
-    ...(cors.needsManual ? [corsWideningGuidance()] : []),
+    ...corsWarnings(cors, input.recipe),
     wired.errorAnchor === "existing-error-handler"
       ? "Wired Express request middleware (before routes) and error middleware above the app's existing error handler, so it is reached before that handler ends the response."
       : "Wired Express request middleware (before routes) and error middleware (after routes) for backend request capture.",

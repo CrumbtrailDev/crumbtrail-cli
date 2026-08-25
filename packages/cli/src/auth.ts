@@ -739,7 +739,11 @@ export async function ensureToken(opts: LoginOptions): Promise<string> {
       );
       opts.ui.out(
         color.dim(
-          `Using your saved Crumbtrail login (${describeIdentity(identity)}). Run \`crumbtrail logout\` to sign in as somebody else.`,
+          // Names the endpoint, because "your saved login" alone was not
+          // checkable: someone pointing at a local stack read it as proof the
+          // login belonged to that stack, when the only thing it proves is that
+          // a login exists for whatever base this run resolved.
+          `Using your saved Crumbtrail login for ${opts.base} (${describeIdentity(identity)}). Run \`crumbtrail logout\` to sign in as somebody else.`,
         ),
       );
       return stored.token;

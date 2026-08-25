@@ -467,6 +467,30 @@ Each of these fires on the stored data alone, so it works even when the applicat
 and each states the evidence it rests on (the columns compared, both user ids, the value chain) so
 a reader verifies rather than trusts.
 
+### Structured logs
+
+A real backend logs through pino, winston or bunyan, and a failure it expected is
+caught, logged with its stack, and answered with a status. It reaches no console
+and crashes nothing, so a capture surface that hooks only `console.error` and the
+crash handlers sees an empty session for the most ordinary failure there is.
+
+`autoCapture` and the Express middleware both watch the place every logger
+converges: the file descriptor. `process.stdout.write` / `process.stderr.write`
+covers pino's default destination, winston's Console transport and morgan;
+`fs.write` / `fs.writeSync` on fd 1 and 2 covers SonicBoom, which
+`pino(pino.destination(1))` writes through without ever touching
+`process.stdout`. Lines that parse as NDJSON carrying a level are recorded as
+`backend.log` events; everything else the process writes is ignored.
+
+Warn and above by default (`logLevel` moves the floor), the message, error and
+stack pass through the same redaction as any other captured text, only bounded
+scalar context fields ride along, and one install caps at 500 events so a log
+storm cannot flood a session. The host's own write always happens, unchanged.
+The `backend_log_error` detector surfaces an error or fatal line as a
+high-severity candidate carrying the logged stack, collapsed by content so an
+upstream outage logged once per request reads as one finding. Disable with
+`captureLogs: false`.
+
 ### Runtime warnings
 
 The Express middleware (like `autoCapture` before it) subscribes to `process.on("warning")` and

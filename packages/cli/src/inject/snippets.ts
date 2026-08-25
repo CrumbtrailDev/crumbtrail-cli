@@ -158,8 +158,9 @@ export function nuxtPluginSnippet(
 
 /**
  * Node server init. Uses crumbtrail-node's `autoCapture`, which installs
- * best-effort backend crash + console.error capture (uncaught exceptions,
- * unhandled rejections, console.error) around a headless ingest session. It is
+ * best-effort backend crash, console and structured log capture (uncaught
+ * exceptions, unhandled rejections, console.error, and pino/winston/bunyan
+ * lines at warn and above) around a headless ingest session. It is
  * dynamically imported so the block is valid whether the entry file is ESM,
  * CommonJS, or TypeScript, and it is a plain expression (no top-level await) so
  * it is safe to prepend at the very top of an entry file. The ingest key is read
@@ -175,8 +176,9 @@ export function nodeInitSnippet(
   serviceName?: string | null,
 ): string {
   return [
-    "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections, and",
-    "// console.error, and instruments whichever SQL driver this app already uses",
+    "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections,",
+    "// console.error and the warnings and errors your logger writes (pino,",
+    "// winston, bunyan), and instruments whichever SQL driver this app already uses",
     "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
     "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
     `// from ${keyExpr} — set it in your .env (get your key from the`,
@@ -319,8 +321,9 @@ export function nestInitSnippet(
   serviceName?: string | null,
 ): string {
   return [
-    "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections, and",
-    "// console.error, and instruments whichever SQL driver this app already uses",
+    "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections,",
+    "// console.error and the warnings and errors your logger writes (pino,",
+    "// winston, bunyan), and instruments whichever SQL driver this app already uses",
     "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
     "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
     `// from ${keyExpr} — set it in your .env (get your key from the`,

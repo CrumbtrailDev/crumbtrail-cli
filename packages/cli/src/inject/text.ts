@@ -331,11 +331,28 @@ export interface CorsWidening {
    * prints the exact change instead of guessing at it.
    */
   needsManual: boolean;
+  /**
+   * True when this file pulls in a CORS middleware at all. False means either
+   * the service is same-origin — nothing to do — or its CORS lives in another
+   * file, which is the case that used to fail silently.
+   */
+  found: boolean;
 }
 
-/** Only files that actually pull in a CORS middleware are considered. */
-const CORS_IMPORT_RE =
-  /(?:from\s*["']cors["'])|(?:require\(\s*["']cors["']\s*\))|(?:from\s*["']hono\/cors["'])/;
+/**
+ * Only files that actually pull in a CORS middleware are considered. All the
+ * middlewares the wizard's own backend recipes can be wired alongside are
+ * listed: Express (`cors`), Hono (`hono/cors`), Fastify (`@fastify/cors`) and
+ * Koa (`@koa/cors`). A middleware missing from this list means its app is
+ * wired for correlation and left with a header allowlist that blocks it.
+ */
+const CORS_IMPORT_RE = new RegExp(
+  [
+    String.raw`from\s*["'](?:cors|hono/cors|@fastify/cors|fastify-cors|@koa/cors|koa2-cors|koa-cors)["']`,
+    String.raw`require\(\s*["'](?:cors|hono/cors|@fastify/cors|fastify-cors|@koa/cors|koa2-cors|koa-cors)["']\s*\)`,
+    String.raw`import\(\s*["'](?:@fastify/cors|fastify-cors)["']\s*\)`,
+  ].join("|"),
+);
 
 /** `allowedHeaders:` (Express `cors`) or `allowHeaders:` (Hono `cors`). */
 const ALLOW_HEADERS_KEY = String.raw`\ballow(?:ed)?Headers\s*:\s*`;
@@ -374,7 +391,7 @@ function quoteStyleOf(body: string): '"' | "'" {
  */
 export function widenCorsAllowedHeaders(text: string): CorsWidening {
   if (!CORS_IMPORT_RE.test(text)) {
-    return { text, changed: false, needsManual: false };
+    return { text, changed: false, needsManual: false, found: false };
   }
 
   let changed = false;
@@ -423,14 +440,32 @@ export function widenCorsAllowedHeaders(text: string): CorsWidening {
   });
 
   const total = (text.match(ANY_FORM) ?? []).length;
-  return { text: out, changed, needsManual: handled < total };
+  return { text: out, changed, needsManual: handled < total, found: true };
 }
+
+const HEADER_LIST = CORRELATION_REQUEST_HEADERS.map((n) => `"${n}"`).join(", ");
 
 /** The exact lines a user must add when the config cannot be rewritten safely. */
 export function corsWideningGuidance(): string {
   return [
     "Add Crumbtrail's correlation headers to your CORS allowed headers, or cross origin requests from the browser will be blocked by the preflight:",
-    `  allowedHeaders: ["Content-Type", "Authorization", ${CORRELATION_REQUEST_HEADERS.map((n) => `"${n}"`).join(", ")}]`,
-    `  Hono: cors({ allowHeaders: [${CORRELATION_REQUEST_HEADERS.map((n) => `"${n}"`).join(", ")}] })`,
+    `  Express (cors): cors({ allowedHeaders: ["Content-Type", "Authorization", ${HEADER_LIST}] })`,
+    `  Hono: cors({ allowHeaders: [${HEADER_LIST}] })`,
+    `  Fastify (@fastify/cors): app.register(cors, { allowedHeaders: ["Content-Type", "Authorization", ${HEADER_LIST}] })`,
+  ].join("\n");
+}
+
+/**
+ * Said when a backend is wired and no CORS middleware was found in the file we
+ * edited. The wizard cannot see a CORS config that lives in another file, and
+ * saying nothing was the failure: the browser SDK starts stamping three headers
+ * on every cross origin call, and an allowlist that predates them answers the
+ * preflight without them, so the app's own requests get blocked. Naming the
+ * headers is what makes that recoverable in seconds instead of a bisect.
+ */
+export function corsElsewhereGuidance(): string {
+  return [
+    `No CORS middleware in this file. If this service answers browser requests from another origin, whichever file configures its CORS must allow ${CORRELATION_REQUEST_HEADERS.join(", ")}, or the preflight blocks every cross origin request once correlation is on.`,
+    corsWideningGuidance(),
   ].join("\n");
 }

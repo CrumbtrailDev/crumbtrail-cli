@@ -777,6 +777,82 @@ describe("autoCapture", () => {
     expect(body.metadata).not.toHaveProperty("service");
   });
 
+
+  // The Hono/pino case: a backend that logs through a logger and never crashes.
+  // Before structured log capture existed this session came out completely
+  // empty — the app's own statement of the cause was written to stdout and
+  // nothing was watching stdout.
+  it("captures a pino error line the app logged instead of throwing", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+    const written: string[] = [];
+    const stdout = {
+      write(chunk: unknown) {
+        written.push(String(chunk));
+        return true;
+      },
+    } as unknown as NodeJS.WriteStream;
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        logStreams: { stdout, stderr: stdout },
+      }),
+    );
+
+    const line = `${JSON.stringify({
+      level: 50,
+      time: 1_700_000_000_000,
+      pid: 1,
+      hostname: "api",
+      status: 503,
+      err: {
+        type: "UpstreamError",
+        message: "keepa product lookup failed",
+        stack:
+          "UpstreamError: keepa product lookup failed\\n    at fetchKeepaProduct (/app/src/services/keepa/fetchProduct.ts:68:11)",
+      },
+      msg: "request failed",
+    })}\n`;
+    stdout.write(line);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const logged = eventsFrom(calls).filter((ev) => ev.k === "backend.log");
+    expect(logged).toHaveLength(1);
+    expect(logged[0].d.level).toBe("error");
+    expect(
+      String((logged[0].d.error as { stack?: string }).stack),
+    ).toContain("fetchKeepaProduct");
+    // The application's own logging is delivered unchanged.
+    expect(written).toEqual([line]);
+  });
+
+  it("leaves the streams alone when log capture is switched off", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+    const stdout = { write: () => true } as unknown as NodeJS.WriteStream;
+    const originalWrite = stdout.write;
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        captureLogs: false,
+        logStreams: { stdout, stderr: stdout },
+      }),
+    );
+
+    expect(stdout.write).toBe(originalWrite);
+    stdout.write('{"level":50,"msg":"ignored"}\n');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(eventsFrom(calls).filter((ev) => ev.k === "backend.log")).toEqual([]);
+  });
+
   it("restores console.error and removes hooks on stop()", async () => {
     const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
     const originalError = vi.fn();

@@ -394,3 +394,19 @@ export type {
   BackendWarningCaptureOptions,
   RuntimeWarningLike,
 } from "./backend-warnings";
+
+// ── Structured backend log capture ───────────────────────────────────────────
+// Append-only block. Do not reorder the exports above.
+export {
+  BACKEND_LOG_EVENT,
+  BACKEND_LOG_LEVELS,
+  buildBackendLogEvent,
+  installBackendLogCapture,
+  parseStructuredLogLine,
+} from "./backend-logs";
+export type {
+  BackendLogCaptureHandle,
+  BackendLogCaptureOptions,
+  BackendLogLevel,
+  ParsedStructuredLog,
+} from "./backend-logs";

@@ -637,12 +637,39 @@ export function resolveWorkspaceDir(
 
 // ── Wizard ───────────────────────────────────────────────────────────────────
 
+/**
+ * The endpoint this run will send data to, confirmed out loud.
+ *
+ * A run that took the hosted default in silence looked identical to one the
+ * user had chosen: the header printed the URL, nothing ever asked, and someone
+ * setting up against a local stack only found out after the wizard had created
+ * a project on the wrong deployment. So when nothing stated an endpoint —
+ * no `--endpoint`, no CRUMBTRAIL_BASE_URL — the interactive run asks, with the
+ * hosted default pre-filled so Enter still means "the hosted cloud".
+ * `--yes` and non-interactive shells keep the default without a prompt.
+ */
+export async function confirmEndpoint(
+  parsed: ParsedArgs,
+  deps: WizardDeps,
+  base: string,
+): Promise<string> {
+  const stated =
+    (parsed.endpoint && parsed.endpoint.trim()) ||
+    (deps.env.CRUMBTRAIL_BASE_URL && deps.env.CRUMBTRAIL_BASE_URL.trim());
+  if (stated || parsed.yes || !deps.isTTY) return base;
+  const answer = await deps.prompter.ask(
+    "Which Crumbtrail endpoint should this project send to?",
+    base,
+  );
+  return resolveEndpoint(answer, deps.env);
+}
+
 export async function runWizard(
   parsed: ParsedArgs,
   deps: WizardDeps,
 ): Promise<number> {
   const { ui } = deps;
-  const base = resolveEndpoint(parsed.endpoint, deps.env);
+  let base = resolveEndpoint(parsed.endpoint, deps.env);
   // Captured at wizard entry: the real-event poll only accepts sessions started
   // at/after this instant, so a stale session from a prior run can't be
   // mistaken for "your first event" (verify.ts wizardStart filter).
@@ -650,6 +677,11 @@ export async function runWizard(
 
   for (const line of banner(readVersion(), TAGLINE)) ui.out(line);
   ui.out(color.dim(`  Endpoint  ${base}`));
+  const confirmed = await confirmEndpoint(parsed, deps, base);
+  if (confirmed !== base) {
+    base = confirmed;
+    ui.out(color.dim(`  Endpoint  ${base}`));
+  }
 
   // 1. Detect. A monorepo root forks to the batch installer, which scans every
   // service and wires the ones the user picks. Everything below this fork is the
@@ -1228,7 +1260,11 @@ export function correlationNotes(
   }
   if (backendCount > 0) {
     return [
-      "No backend origin could be read from this app's config, so networkCorrelationAllowedOrigins is empty and its calls to the backend will not join the same session. Add the API origin to that list in the injected init.",
+      // Never say "add the origin" without saying what the origin must then
+      // allow: the SDK starts stamping three headers on those calls, and a
+      // backend whose CORS allowlist predates them blocks the app's own
+      // requests at the preflight.
+      "No backend origin could be read from this app's config, so networkCorrelationAllowedOrigins is empty and its calls to the backend will not join the same session. Add the API origin to that list in the injected init, and add x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent to that backend's CORS allowed headers at the same time, or the browser blocks the preflight.",
     ];
   }
   return [];

@@ -439,6 +439,46 @@ describe("Crumbtrail Express-compatible middleware", () => {
     }
   });
 
+  it("records a structured log line the app wrote during a request", async () => {
+    const fetch = vi.fn().mockResolvedValue(okResponse());
+    const req = fakeRequest({
+      headers: {
+        "x-crumbtrail-session-id": "ses_logged",
+        "x-crumbtrail-request-id": "req_logged",
+      },
+    });
+    const res = new FakeResponse(503);
+    const stdout = { write: () => true } as unknown as NodeJS.WriteStream;
+
+    const middleware = createCrumbtrailExpressMiddleware({
+      fetch,
+      now: sequenceClock(1_700_000_000_000, 1_700_000_000_004),
+      logStreams: { stdout, stderr: stdout },
+    });
+    try {
+      middleware(req, res, vi.fn());
+      stdout.write(
+        `${JSON.stringify({
+          level: 50,
+          msg: "request failed",
+          err: { type: "UpstreamError", message: "provider refused" },
+        })}\n`,
+      );
+      await flushPromises();
+
+      const logged = fetch.mock.calls
+        .map((call) => JSON.parse(String(call[1]?.body)).events[0] as BugEvent)
+        .filter((event) => event.k === "backend.log");
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toMatchObject({
+        sessionId: "ses_logged",
+        d: { level: "error", message: "request failed" },
+      });
+    } finally {
+      middleware.crumbtrailLogCapture?.stop();
+    }
+  });
+
   it("drops a runtime warning observed before any session-bearing request", async () => {
     const fetch = vi.fn().mockResolvedValue(okResponse());
     const middleware = createCrumbtrailExpressMiddleware({ fetch });

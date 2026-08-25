@@ -172,7 +172,8 @@ export function buildBackendJsNote(stack: Stack): string {
     "// Backend (Hono / Node) — crumbtrail-node ships no framework middleware here,",
     "// so autoCapture is the whole wiring. Prepend it at the top of the server",
     "// entry file: it opens a headless session and records uncaught exceptions,",
-    "// unhandled rejections and console.error against it, with no per-event code.",
+    "// unhandled rejections, console.error, and the warnings and errors your",
+    "// logger writes (pino, winston, bunyan), with no per-event code.",
     "// Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY in the server environment.",
     ...configLines,
     'import("crumbtrail-node")',
@@ -485,8 +486,9 @@ function backendJsPrompt(
     ...nodeInitSnippet(endpoint, expr, serviceName)
       .split("\n")
       .map((line) => `       ${line}`),
-    "     autoCapture records uncaught exceptions, unhandled rejections and",
-    "     console.error against a headless session, and loads the app's .env",
+    "     autoCapture records uncaught exceptions, unhandled rejections,",
+    "     console.error, and the warnings and errors your logger writes (pino,",
+    "     winston, bunyan) against a headless session, and loads the app's .env",
     "     itself so the key above is set by the time it starts.",
   ];
   if (hasExplicitServiceName) {

@@ -600,9 +600,10 @@ describe("token reuse + logout", () => {
     );
 
     let opened = false;
+    const lines: string[] = [];
     const token = await ensureToken({
       base: mock.baseUrl,
-      ui: silentUi,
+      ui: { out: (l = "") => lines.push(l), err: () => {} },
       openFn: () => {
         opened = true;
         return true;
@@ -611,6 +612,9 @@ describe("token reuse + logout", () => {
     });
     expect(token).toBe(stored);
     expect(opened).toBe(false); // no re-auth
+    // "Using your saved login" alone was not checkable: someone pointing at a
+    // local stack read it as proof the login belonged to that stack.
+    expect(lines.join("\n")).toContain(`saved Crumbtrail login for ${mock.baseUrl}`);
     expect(mock.exchanges).toBe(0);
     await mock.close();
   });

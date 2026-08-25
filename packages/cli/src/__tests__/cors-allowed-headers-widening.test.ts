@@ -8,6 +8,7 @@
 import { describe, it, expect } from "vitest";
 import {
   CORRELATION_REQUEST_HEADERS,
+  corsElsewhereGuidance,
   corsWideningGuidance,
   widenCorsAllowedHeaders,
 } from "../inject/text";
@@ -110,5 +111,57 @@ describe("widenCorsAllowedHeaders", () => {
     }
     expect(guidance).toContain("allowedHeaders");
     expect(guidance).toContain("allowHeaders");
+    expect(guidance).toContain("@fastify/cors");
+  });
+
+  it("widens @fastify/cors, registered as a plugin", () => {
+    const source = [
+      'import cors from "@fastify/cors";',
+      'await app.register(cors, { origin: "http://localhost:5173", allowedHeaders: ["Content-Type"] });',
+    ].join("\n");
+
+    const result = widenCorsAllowedHeaders(source);
+
+    expect(result.found).toBe(true);
+    expect(result.changed).toBe(true);
+    for (const header of CORRELATION_REQUEST_HEADERS) {
+      expect(result.text).toContain(`"${header}"`);
+    }
+  });
+
+  it("widens @fastify/cors registered by dynamic import", () => {
+    const source = [
+      'app.register(import("@fastify/cors"), { allowedHeaders: ["Content-Type"] });',
+    ].join("\n");
+
+    const result = widenCorsAllowedHeaders(source);
+
+    expect(result.changed).toBe(true);
+    expect(result.text).toContain("traceparent");
+  });
+
+  it("widens @koa/cors", () => {
+    const source = [
+      'import cors from "@koa/cors";',
+      'app.use(cors({ allowHeaders: ["Content-Type"] }));',
+    ].join("\n");
+
+    expect(widenCorsAllowedHeaders(source).changed).toBe(true);
+  });
+
+  it("reports a file with no CORS middleware as not found", () => {
+    const result = widenCorsAllowedHeaders("const app = express();");
+
+    expect(result.found).toBe(false);
+    expect(result.changed).toBe(false);
+  });
+
+  it("names the headers when the CORS config lives in another file", () => {
+    const guidance = corsElsewhereGuidance();
+
+    for (const header of CORRELATION_REQUEST_HEADERS) {
+      expect(guidance).toContain(header);
+    }
+    expect(guidance).toContain("No CORS middleware in this file");
   });
 });

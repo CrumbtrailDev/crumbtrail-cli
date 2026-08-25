@@ -18,6 +18,12 @@ import {
   installBackendWarningCapture,
   type BackendWarningCaptureHandle,
 } from "./backend-warnings";
+import {
+  installBackendLogCapture,
+  type BackendLogCaptureHandle,
+  type BackendLogCaptureOptions,
+  type BackendLogLevel,
+} from "./backend-logs";
 
 export type {
   BackendIntakeWarning as CrumbtrailExpressWarning,
@@ -110,6 +116,22 @@ export interface CrumbtrailExpressOptions {
    * autoCapture path recorded them.
    */
   captureRuntimeWarnings?: boolean;
+  /**
+   * Capture structured log lines (pino, winston, bunyan) the process writes as
+   * `backend.log` events in the session the middleware most recently saw.
+   * Default on, and for the same reason as the warning capture above: a handled
+   * failure is logged and answered, never thrown and never printed to the
+   * console, so without this the middleware records the request's status code
+   * and nothing about why.
+   */
+  captureLogs?: boolean;
+  /** Lowest log level captured. Defaults to `warn`. */
+  logLevel?: BackendLogLevel;
+  /** Streams and `fs` the log capture patches (tests). Defaults to the process's. */
+  logStreams?: Pick<
+    BackendLogCaptureOptions,
+    "stdout" | "stderr" | "fsImpl" | "maxEvents"
+  >;
   /**
    * Whether to record the response body on `backend.req.end`.
    *
@@ -214,6 +236,8 @@ const WARNING_SESSION_FRESH_MS = 120_000;
 export interface CrumbtrailExpressMiddlewareWithHandle extends CrumbtrailExpressMiddleware {
   /** Present when runtime warning capture installed; `stop()` releases it. */
   crumbtrailWarningCapture?: BackendWarningCaptureHandle;
+  /** Present when structured log capture installed; `stop()` restores the writes. */
+  crumbtrailLogCapture?: BackendLogCaptureHandle;
 }
 
 export function createCrumbtrailExpressMiddleware(
@@ -271,6 +295,29 @@ export function createCrumbtrailExpressMiddleware(
       });
     } catch {
       // Warning capture is additive; its failure must not break the request path.
+    }
+  }
+
+  if (options.captureLogs !== false) {
+    try {
+      middleware.crumbtrailLogCapture = installBackendLogCapture({
+        minLevel: options.logLevel,
+        ...options.logStreams,
+        emit: (event) => {
+          const now = readNow(options);
+          const session =
+            lastSession && now - lastSession.atMs <= WARNING_SESSION_FRESH_MS
+              ? lastSession.sessionId
+              : undefined;
+          // Same rule as the warning capture: the intake path addresses an
+          // existing session, so a line with no live session is dropped rather
+          // than misfiled onto one that plausibly ended.
+          if (!session) return;
+          attemptSend({ ...event, sessionId: session }, options, session);
+        },
+      });
+    } catch {
+      // Log capture is additive; its failure must not break the request path.
     }
   }
 

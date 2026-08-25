@@ -896,6 +896,7 @@ export function buildEvidenceCandidates(
   attachDuplicateEffectFrames(events, drafts);
   addLocaleInputCandidates(index, drafts, exchanges);
   addRuntimeWarningCandidates(events, index, drafts);
+  addBackendLogErrorCandidates(events, index, drafts);
   addClickInterceptedCandidates(events, index, drafts);
   addDeclinedPaymentOrderedCandidates(events, index, drafts);
   addCheckoutCorrectnessCandidates(events, index, drafts);
@@ -9604,6 +9605,102 @@ function addRuntimeWarningCandidates(
       // Content signature, not the timestamp: a leak re-warns on every request
       // and has to read as one finding with a count, not as fifty findings.
       dedupeKey: `runtimewarning:${name}:${normalizeErrorSignature(event.d.message)}`,
+    });
+  }
+}
+
+// ─── backend_log_error ───────────────────────────────────────────────────────
+
+/**
+ * An error the backend logged and handled sits just under one that escaped: the
+ * process kept serving, so the reader is looking at a failure the application
+ * expected, but it is still the application naming its own fault with a stack.
+ * A fatal line means the app declared the process unusable, which reads at the
+ * same level as an uncaught error.
+ */
+const BACKEND_LOG_FATAL_SCORE = 88;
+const BACKEND_LOG_ERROR_SCORE = 82;
+const BACKEND_LOG_WARN_SCORE = 52;
+
+/** Field names a logger uses for the id that joins a log line to its request. */
+const LOG_REQUEST_ID_FIELDS = [
+  "reqId",
+  "requestId",
+  "request_id",
+  "traceId",
+  "trace_id",
+  "correlationId",
+  "x-request-id",
+];
+
+/**
+ * backend_log_error: the backend logged a failure through its logger.
+ *
+ * This is what an ordinary server does with a failure it expected — catch it,
+ * log it with the stack, answer the request with a status. It reaches no console
+ * and crashes nothing, so before `backend.log` existed the whole class was
+ * invisible: a session would carry the front end's 503 and no statement at all
+ * about why, and a diagnosis had nothing to work from but the status code.
+ */
+function addBackendLogErrorCandidates(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+): void {
+  for (const event of events) {
+    if (event.k !== "backend.log") continue;
+    const level = safeText(event.d.level, 20);
+    if (level !== "error" && level !== "fatal" && level !== "warn") continue;
+
+    const logged = isRecord(event.d.error) ? event.d.error : undefined;
+    const message = scrubText(event.d.message, 220);
+    const errorMessage = scrubText(logged?.message, 220);
+    // The logger's message names the operation ("request failed"); the error's
+    // names the cause ("upstream 429"). A title carrying both is the difference
+    // between a reader knowing something failed and knowing what did.
+    const headline =
+      message && errorMessage && errorMessage !== message
+        ? `${truncate(message, 90)} — ${truncate(errorMessage, 90)}`
+        : (message ?? errorMessage ?? "message unavailable");
+    const fields = isRecord(event.d.fields) ? event.d.fields : undefined;
+    const requestId = fields
+      ? safeText(
+          LOG_REQUEST_ID_FIELDS.map((name) => fields[name]).find(
+            (value) => typeof value === "string" || typeof value === "number",
+          ),
+          120,
+        )
+      : undefined;
+
+    drafts.push({
+      detector: "backend_log_error",
+      title: `Backend logged ${level}: ${headline}`,
+      severity: level === "warn" ? "medium" : "high",
+      score:
+        level === "fatal"
+          ? BACKEND_LOG_FATAL_SCORE
+          : level === "error"
+            ? BACKEND_LOG_ERROR_SCORE
+            : BACKEND_LOG_WARN_SCORE,
+      confidence: level === "warn" ? "medium" : "high",
+      anchor: removeUndefined({
+        t: event.t,
+        offsetMs: offsetForEvent(event) ?? offsetFromStart(event.t, index.start),
+        route: routeAt(index.navs ?? [], event.t),
+        requestId,
+        status: finiteNumber(fields?.status ?? fields?.statusCode),
+        errorCode: safeText(logged?.name, 120),
+        message: errorMessage ?? message,
+        source: "backend",
+        frame: codeFrameOf({
+          stk: typeof logged?.stack === "string" ? logged.stack : undefined,
+        }),
+      }),
+      // Content signature, not the timestamp: an upstream that is down is logged
+      // on every request and has to read as one finding, not as five hundred.
+      dedupeKey: `backendlog:${level}:${normalizeErrorSignature(
+        errorMessage ?? message,
+      )}`,
     });
   }
 }
