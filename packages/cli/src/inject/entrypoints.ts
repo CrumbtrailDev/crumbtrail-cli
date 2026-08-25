@@ -131,7 +131,7 @@ export interface ExtraEntriesResult {
  * `railway*.json` / `railway*.toml` (a monorepo commonly has
  * `railway.worker.json` beside `railway.json`), and the rest are fixed names.
  */
-const DEPLOY_CONFIG_RE =
+export const DEPLOY_CONFIG_RE =
   /^(railway.*\.(json|toml)|procfile|dockerfile|.*\.dockerfile|fly\.toml|render\.yaml|ecosystem\.config\.(js|cjs|json)|docker-compose(\..+)?\.ya?ml)$/i;
 
 /** Script names that start something and keep it running. */
@@ -152,6 +152,32 @@ const LONG_RUNNING_NAME_RE = /(worker|server|daemon|consumer|listener)/i;
  */
 const ONE_SHOT_NAME_RE =
   /(migrat|seed|bootstrap|backfill|codegen|provision|teardown|reset|fixture|scaffold)/i;
+
+/**
+ * The deploy manifest at the package root that names this entry file, or null.
+ *
+ * Said back to the user in the wired output ("worker.ts matched
+ * railway.worker.json"), because a wizard that names the manifest it read is a
+ * wizard that visibly looked, and the alternative — picking one of several
+ * runnable files with no stated reason — reads as a guess.
+ */
+export function deployManifestNaming(
+  cwd: string,
+  io: InjectIO,
+  entryPath: string,
+): string | null {
+  if (!io.listFiles) return null;
+  const rel = path.relative(cwd, entryPath).replace(/\\/g, "/").toLowerCase();
+  const base = path.basename(rel);
+  if (!base) return null;
+  for (const name of io.listFiles(cwd)) {
+    if (!DEPLOY_CONFIG_RE.test(name)) continue;
+    const text = io.readFile(path.join(cwd, name))?.toLowerCase();
+    if (!text) continue;
+    if (text.includes(rel) || text.includes(base)) return name;
+  }
+  return null;
+}
 
 function readDeployConfigText(cwd: string, io: InjectIO): string {
   if (!io.listFiles) return "";

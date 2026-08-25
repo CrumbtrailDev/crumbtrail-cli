@@ -11,7 +11,9 @@ import type {
   BugReport,
   CollectorCleanup,
   CollectorContext,
+  BugFlagOrigin,
   FlagBugOptions,
+  InternalFlagOptions,
 } from "./types";
 import {
   DEFAULT_CONFIG,
@@ -613,11 +615,19 @@ export class Crumbtrail {
   }
 
   async flagBug(options?: FlagBugOptions): Promise<{ bugId: string }> {
-    return this.flagBugFromSource(options, true);
+    // Provenance is the SDK's to state, never the caller's: anything reaching the public
+    // entry point is a person asking for a report, so the internal fields are stripped
+    // rather than trusted.
+    const { origin: _origin, autoReason: _autoReason, ...caller } = (options ??
+      {}) as InternalFlagOptions;
+    return this.flagBugFromSource(
+      options === undefined ? undefined : caller,
+      true,
+    );
   }
 
   private async flagBugFromSource(
-    options: FlagBugOptions | undefined,
+    options: InternalFlagOptions | undefined,
     isExplicitBeacon: boolean,
   ): Promise<{ bugId: string }> {
     if (isExplicitBeacon && !this.config.explicitBeacon)
@@ -643,14 +653,27 @@ export class Crumbtrail {
   }
 
   private async finalizeFlagBug(
-    options?: FlagBugOptions,
+    options?: InternalFlagOptions,
     finalizerOriginated = false,
   ): Promise<{ bugId: string }> {
     const bugId = this.createBugId();
     const windowMs = options?.windowMs ?? this.config.ringBufferMs;
     const flaggedAt = now();
+    const origin: BugFlagOrigin = options?.origin ?? "user";
+    // A note exists only when a person wrote one. An automatic capture used to borrow the
+    // note field for the detector's own sentence, which then went through `maskText` like
+    // user text — so a session with no flag button and nobody typing produced a report
+    // reading "a note was attached, and its text was masked before capture". Neither half
+    // was true. The detector's sentence rides in `reason` instead, unmasked because the
+    // SDK wrote it and it contains nothing a person entered.
     const note =
-      options?.note === undefined ? undefined : maskText(options.note);
+      origin === "user" && options?.note !== undefined
+        ? maskText(options.note)
+        : undefined;
+    const reason =
+      origin === "auto" && typeof options?.autoReason === "string"
+        ? options.autoReason
+        : undefined;
 
     // Resolved flag/config state at flag time. The session-start snapshot plus deltas answers
     // "what were the flags at t0"; only this answers "what were they at the moment this broke",
@@ -780,7 +803,12 @@ export class Crumbtrail {
       {
         t: flaggedAt,
         k: "bug.flag",
-        d: { bugId, note },
+        d: {
+          bugId,
+          origin,
+          ...(note !== undefined ? { note } : {}),
+          ...(reason !== undefined ? { reason } : {}),
+        },
       },
       { bypassAdmission: finalizerOriginated },
     );
@@ -1122,7 +1150,11 @@ export class Crumbtrail {
     const autoFlag = createAutoFlagController({
       debounceMs: this.config.autoFlagDebounceMs,
       maxPerSession: this.config.autoFlagMaxPerSession,
-      flag: (options) => this.flagBugFromSource(options, false),
+      flag: (request) =>
+        this.flagBugFromSource(
+          { tags: request.tags, origin: "auto", autoReason: request.reason },
+          false,
+        ),
       detectors: autoFlagDetectors,
     });
     const detach = this.bus.tap((event) => autoFlag.handleEvent(event));
@@ -1133,7 +1165,7 @@ export class Crumbtrail {
   }
 
   private triggerFlightRecorder(
-    options?: FlagBugOptions,
+    options?: InternalFlagOptions,
   ): Promise<{ bugId: string }> {
     this.flightRecorderState = "triggered";
     this.startSessionIfAllowed();
@@ -1164,7 +1196,7 @@ export class Crumbtrail {
   }
 
   private async finalizeFlightRecorder(
-    options?: FlagBugOptions,
+    options?: InternalFlagOptions,
   ): Promise<{ bugId: string }> {
     this.flightRecorderState = "finalizing";
     return this.finalizeFlagBug(options, true);

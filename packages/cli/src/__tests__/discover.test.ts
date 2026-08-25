@@ -275,6 +275,42 @@ describe("looksLikeLibrary", () => {
     expect(looksLikeLibrary("next", {})).toBe(false);
     expect(looksLikeLibrary(null, {})).toBe(false);
   });
+
+  it("counts a build-only dev script as a library, not a service", () => {
+    expect(looksLikeLibrary("node", { scripts: { dev: "tsc --watch" } })).toBe(
+      true,
+    );
+    expect(looksLikeLibrary("node", { scripts: { dev: "tsup --watch" } })).toBe(
+      true,
+    );
+    expect(
+      looksLikeLibrary("node", { scripts: { dev: "pnpm exec tsc -w" } }),
+    ).toBe(true);
+  });
+
+  it("clears the flag when the entry runs a process or a manifest deploys it", () => {
+    const pkg = { main: "dist/index.js" } as never;
+    expect(looksLikeLibrary("node", pkg)).toBe(true);
+    expect(
+      looksLikeLibrary("node", pkg, {
+        entrySource: "setInterval(() => tick(), 1000);",
+      }),
+    ).toBe(false);
+    expect(
+      looksLikeLibrary("node", pkg, {
+        entrySource: "server.listen(3000);",
+      }),
+    ).toBe(false);
+    expect(
+      looksLikeLibrary("node", pkg, {
+        deployManifests: '{ "deploy": { "startCommand": "node index.js" } }',
+      }),
+    ).toBe(false);
+    // A library body is still a library.
+    expect(
+      looksLikeLibrary("node", pkg, { entrySource: "export const x = 1;" }),
+    ).toBe(true);
+  });
 });
 
 // Defect class: a repo root whose services are plain sibling directories with

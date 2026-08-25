@@ -223,19 +223,39 @@ export function nodeInitSnippet(
  *
  * `quote` matches the surrounding scaffold's Prettier config — Nest ships
  * `singleQuote: true`, everything else takes Prettier's double-quote default.
+ *
+ * `packageRelPath` is this package's directory relative to the repository root,
+ * resolved when the block is written. A bare `.env` is read relative to the
+ * working directory, so in a monorepo it only ever finds the file when the
+ * process was started from inside the package. Starting it from the root —
+ * `node services/gateway/src/boot/main.js`, which is also what a root Dockerfile
+ * does — found nothing, and the user was told their key was missing when they
+ * had set it. Listing `services/gateway/.env` alongside `.env` makes both ways
+ * of starting the same process load the same file.
  */
 export function envPreloadSnippet(
   keyEnvVar: string,
   quote: (value: string) => string = JSON.stringify,
+  packageRelPath?: string | null,
 ): string {
+  const scoped = normalizeEnvPackageRelPath(packageRelPath);
+  const candidates = [".env", ".env.local"];
+  if (scoped) candidates.push(`${scoped}/.env`, `${scoped}/.env.local`);
   return [
     `// Crumbtrail — load the env file so ${keyEnvVar} is set before anything`,
     "// below reads it (capture init and, on Express, the middleware options are",
     "// both built as this file is evaluated). Try .env first because that is",
     "// where the installer puts a server key; .env.local remains a fallback for",
     "// an existing setup.",
+    ...(scoped
+      ? [
+          `// The ${scoped}/ entries are the same two files addressed from the`,
+          "// repository root, so starting this process from the root loads them",
+          "// too.",
+        ]
+      : []),
     `if (!process.env.${keyEnvVar}) {`,
-    `  for (const envFile of [${quote(".env")}, ${quote(".env.local")}]) {`,
+    `  for (const envFile of [${candidates.map((c) => quote(c)).join(", ")}]) {`,
     "    try {",
     `      const loadEnvFile = Reflect.get(process, ${quote("loadEnvFile")});`,
     `      if (typeof loadEnvFile === ${quote("function")}) loadEnvFile.call(process, envFile);`,
@@ -247,6 +267,29 @@ export function envPreloadSnippet(
     "  }",
     "}",
   ].join("\n");
+}
+
+/**
+ * The package directory as it is addressed from the repository root: forward
+ * slashes, no leading or trailing separator, and nothing that escapes the root.
+ *
+ * Returns null for the single package case (the package IS the root), where the
+ * bare `.env` already is the right and only path.
+ */
+function normalizeEnvPackageRelPath(
+  packageRelPath: string | null | undefined,
+): string | null {
+  if (!packageRelPath) return null;
+  const slashed = packageRelPath
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^\/+|\/+$/g, "");
+  if (!slashed || slashed === ".") return null;
+  // An entry above the root is not something this snippet can address from the
+  // root, and a path with a quote or newline in it has no business being
+  // emitted into source at all.
+  if (slashed.startsWith("..") || /["'\n\r]/.test(slashed)) return null;
+  return slashed;
 }
 
 /**

@@ -1415,6 +1415,53 @@ describe("batch installer (monorepo root)", () => {
     expect(badUi.lines.join("\n")).toContain("no such service");
   });
 
+  // Defect class: `--all` wired a shared library, so the app that imports it
+  // filed every session under the library's name and the real service reported
+  // nothing.
+  it("--all skips a library and names it, while --only still wires it", async () => {
+    const candidates = [
+      candidate({
+        relDir: "packages/shared",
+        recipe: "node",
+        flags: ["likely-library"],
+        defaultChecked: false,
+      }),
+      candidate({ relDir: "services/api", recipe: "express" }),
+    ];
+
+    const steps: string[] = [];
+    const deps = batchDeps(steps, candidates);
+    deps.isTTY = false;
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+    expect(
+      await runCli(["node", "cli", "--yes", "--project", "p1", "--all"], deps),
+    ).toBe(0);
+    expect(steps).toContain("provision:api");
+    expect(steps).not.toContain("provision:shared");
+    expect(lines.join("\n")).toContain("packages/shared: nothing runs this package");
+
+    // Named explicitly, it is still the user's call.
+    const onlySteps: string[] = [];
+    const only = batchDeps(onlySteps, candidates);
+    only.isTTY = false;
+    expect(
+      await runCli(
+        [
+          "node",
+          "cli",
+          "--yes",
+          "--project",
+          "p1",
+          "--only",
+          "packages/shared",
+        ],
+        only,
+      ),
+    ).toBe(0);
+    expect(onlySteps).toContain("provision:shared");
+  });
+
   it("bails when nothing in the repo can be wired", async () => {
     const steps: string[] = [];
     const deps = batchDeps(steps, [

@@ -1051,7 +1051,9 @@ export function buildEvidenceCandidates(
       schemaVersion: CANDIDATE_SCHEMA_VERSION,
       id,
       detector: draft.detector,
-      title: draft.title,
+      // The single funnel every minted title passes through, so no detector can put a
+      // one-occurrence id or an internal redaction marker into a permanent name.
+      title: sanitizeTitle(draft.title),
       severity: draft.severity,
       score: draft.score,
       confidence: draft.confidence,
@@ -13775,6 +13777,96 @@ function scrubText(value: unknown, maxLength: number): string | undefined {
   const text = safeText(value, 10_000);
   if (!text) return undefined;
   return truncate(redactTokenLikeText(redactUrlLikeText(text)), maxLength);
+}
+
+/**
+ * A typed redaction marker: `[REDACTED]`, or the capture policy's richer
+ * `[REDACTED:email:17]` form naming the class it removed and how long it was.
+ */
+const TYPED_REDACTION_MARKER = /\[redacted(?::([a-z_-]+))?(?::\d+)?\]/gi;
+
+/** An email address inside prose. */
+const EMAIL_IN_TEXT =
+  /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+
+/** A v4-shaped uuid. */
+const UUID_IN_TEXT =
+  /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+
+/** A run of hex long enough to be a digest, a chunk hash or a request id. */
+const LONG_HEX_IN_TEXT = /\b[0-9a-f]{12,}\b/gi;
+
+/**
+ * A prefixed opaque id — `ord_7885f1c8`, `cus_a91f`, `req_0f2c8d`. The prefix is a
+ * type name, the suffix is one occurrence, and only the prefix means anything to a
+ * reader.
+ */
+const PREFIXED_ID_IN_TEXT = /\b[a-z][a-z0-9]{1,9}_([a-z0-9]{6,})\b/gi;
+
+/**
+ * The suffix must carry a digit: that is what separates a generated id from an ordinary
+ * snake_case identifier, and `payment_declined` names a fault a title should keep.
+ */
+function dropPrefixedIds(source: string): string {
+  return source.replace(PREFIXED_ID_IN_TEXT, (match, suffix: string) =>
+    /\d/.test(suffix) ? REMOVED : match,
+  );
+}
+
+/**
+ * A headline stripped of everything that belongs to ONE occurrence rather than to the
+ * fault itself.
+ *
+ * A title is a permanent name. `Backend HTTP 500 from GET /varying: Checkout failed for
+ * order ord_7885f1c8 (user [REDACTED:email:17], flag "beta_pricing" enabled)` promoted
+ * one order's id and an internal marker — a thing the capture policy wrote for machines
+ * — into that name, so the next eight occurrences of the same fault each proposed a
+ * different name for it.
+ *
+ * Typed markers become the class word they named (`[REDACTED:email:17]` → `email`), which
+ * keeps the sentence readable where deleting it would leave "user ,". A bare `[REDACTED]`
+ * and every volatile token are dropped outright, then the punctuation the removal
+ * stranded is tidied so the result reads as a sentence rather than as wreckage.
+ */
+/**
+ * Where a volatile token stood. A private-use code point, so the tidy pass can tell
+ * punctuation stranded by a removal from punctuation the message's author wrote, and so
+ * nothing in an ordinary message can be mistaken for it.
+ */
+const REMOVED = "\uE000";
+
+/** A bracket group holding nothing but removals and the punctuation between them. */
+const EMPTIED_GROUP = /[([][\uE000\s,;]*[)\]]/g;
+
+function sanitizeTitle(title: string): string {
+  const stripped = dropPrefixedIds(
+    title
+      .replace(TYPED_REDACTION_MARKER, (_match, kind?: string) =>
+        kind ? kind.toLowerCase().replace(/[_-]+/g, " ") : REMOVED,
+      )
+      .replace(EMAIL_IN_TEXT, REMOVED)
+      .replace(UUID_IN_TEXT, REMOVED)
+      .replace(LONG_HEX_IN_TEXT, REMOVED),
+  );
+  if (!stripped.includes(REMOVED)) return title;
+
+  const tidied = stripped
+    // A bracket group left holding nothing but removals goes with them. Matched on the
+    // marker rather than on emptiness, so `Buffer() is deprecated` — where the empty
+    // parentheses ARE the message — keeps its own.
+    .replace(EMPTIED_GROUP, (group) => (group.includes(REMOVED) ? "" : group))
+    .split(REMOVED)
+    .join("")
+    .replace(/\s+([,;.)\]])/g, "$1")
+    .replace(/([([])\s+/g, "$1")
+    .replace(/,\s*(?=[,;)\]])/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[\s:,;-]+$/, "")
+    .trim();
+
+  // A title emptied by the strip says less than the one it replaced, so the original
+  // stands in that case — the same trade `titleElementLabel` already makes.
+  return tidied || title;
 }
 
 function redactUrl(value: unknown): string | undefined {

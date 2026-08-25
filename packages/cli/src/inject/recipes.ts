@@ -12,6 +12,10 @@
 
 import path from "node:path";
 import { buildAgentPrompt, buildOtlpSnippets } from "../install/index.js";
+import {
+  patternMatches,
+  workspacePatterns,
+} from "../install/workspace-package-manager.js";
 import type { Stack } from "crumbtrail-core";
 import { isBackendRecipe } from "../backend-origins";
 import { isBuildOutputPath, type Recipe } from "../detect";
@@ -20,6 +24,7 @@ import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
 import { inspectIntegration, type IntegrationStatus } from "./integration";
 import { addDockerBuildArg, DOCKERFILE_CANDIDATES } from "./docker";
 import {
+  deployManifestNaming,
   findExtraBackendEntries,
   MAX_EXTRA_ENTRIES,
   type ExtraEntry,
@@ -33,6 +38,7 @@ import {
   detectExpressModuleStyle,
   prependIntoSource,
   referencesCrumbtrail,
+  servesHttp,
   widenCorsAllowedHeaders,
   wireExpressMiddleware,
   wireFlutterMain,
@@ -89,6 +95,46 @@ function keyRefFor(input: BuildPlanInput): KeyRef | undefined {
 /** The code expression an injected snippet uses to read the key. */
 function keyExprFor(input: BuildPlanInput): string | undefined {
   return keyRefFor(input)?.expr;
+}
+
+/** How far up the tree the workspace root search walks before giving up. */
+const WORKSPACE_ROOT_MAX_DEPTH = 8;
+
+/**
+ * This package's directory as a workspace root addresses it, or null when the
+ * package is not a declared member of one.
+ *
+ * The injected env preload reads `.env` relative to the working directory, and
+ * in a monorepo the working directory is usually the root — `node
+ * services/gateway/src/boot/main.js` is the normal way to start one, and the
+ * only way a root Dockerfile can. Without this, that run found no env file and
+ * the SDK reported a missing key the user had already set.
+ *
+ * Membership is read from the root's own declaration (pnpm-workspace.yaml,
+ * package.json `workspaces`, lerna.json), never from a `.git` directory
+ * somewhere above: a standalone project that happens to sit inside another
+ * checkout is not a member of it, and giving it a path relative to that
+ * checkout's root would be wrong in exactly the way this fixes.
+ */
+export function packageDirFromRepoRoot(
+  cwd: string,
+  io: InjectIO,
+): string | null {
+  const target = path.resolve(cwd);
+  let dir = target;
+  for (let depth = 0; depth < WORKSPACE_ROOT_MAX_DEPTH; depth += 1) {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    const patterns = workspacePatterns(parent, { readFile: io.readFile });
+    if (patterns && patterns.length > 0) {
+      const rel = path.relative(parent, target).replace(/\\/g, "/");
+      if (rel && !rel.startsWith("..")) {
+        if (patterns.some((pattern) => patternMatches(pattern, rel))) return rel;
+      }
+    }
+    dir = parent;
+  }
+  return null;
 }
 
 export interface BuildPlanOptions {
@@ -313,7 +359,13 @@ function prependWithPreflight(
   // widening that list, wires an app the browser will refuse to talk to the
   // moment correlation is on. So the widening rides along with this edit.
   const cors = widenCorsAllowedHeaders(existing);
-  const allWarnings = [...warnings, ...corsWarnings(cors, input.recipe)];
+  const allWarnings = [
+    ...warnings,
+    ...corsWarnings(cors, input.recipe, {
+      entrySource: existing,
+      packageJson: io.readFile(path.join(input.cwd, "package.json")),
+    }),
+  ];
 
   const status = io.gitStatus(input.cwd, target);
   if (status.dirty && !input.options?.force) {
@@ -362,6 +414,10 @@ const CORS_WIDENED_WARNING =
  * browser blocking the app's own requests, and the wizard is the only thing in
  * the room that knows correlation was just switched on. Backend recipes only:
  * a frontend entry has no CORS config to speak of, and the note would be noise.
+ *
+ * And backend processes that answer HTTP only. A queue consumer or a bare
+ * `setInterval` worker has no preflight to block, so the guidance is fifteen
+ * lines about a thing that cannot happen to it.
  */
 function corsWarnings(
   cors: {
@@ -371,9 +427,14 @@ function corsWarnings(
     importsCorsElsewhere?: boolean;
   },
   recipe: Recipe,
+  served?: { entrySource?: string | null; packageJson?: string | null },
 ): string[] {
   if (!cors.found) {
     if (!isBackendRecipe(recipe)) return [];
+    // Only withhold when we actually looked: a caller that passes no source
+    // keeps the previous behaviour rather than going silent on evidence it
+    // never had.
+    if (served && !servesHttp(served.entrySource, served.packageJson)) return [];
     // "No CORS middleware in this file" is a claim about code the wizard read.
     // When the file imports one from a module it did not read, that claim is
     // false and the framework snippets under it are noise.
@@ -718,14 +779,25 @@ function planNode(input: BuildPlanInput, io: InjectIO): Plan {
       : nodeInitSnippet(input.endpoint, keyExpr, input.serviceName);
   // Preload first: the init below reads the key, and on a laptop the key is in
   // .env and nothing has loaded it yet.
-  const block = `${envPreloadSnippet(keyRef.envVar, quote)}\n\n${init}`;
+  const block = `${envPreloadSnippet(keyRef.envVar, quote, packageDirFromRepoRoot(input.cwd, io))}\n\n${init}`;
 
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the Node server entry — wire it manually.",
     ]);
   }
-  return prependWithPreflight(input, io, input.entryFile, block);
+  const manifest = deployManifestNaming(input.cwd, io, input.entryFile);
+  return prependWithPreflight(
+    input,
+    io,
+    input.entryFile,
+    block,
+    manifest
+      ? [
+          `${path.relative(input.cwd, input.entryFile)} is the entry ${manifest} starts, so that is the process this wiring covers.`,
+        ]
+      : [],
+  );
 }
 
 /**
@@ -749,6 +821,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   const keyRef = keyRefFor(input)!;
   const keyExpr = keyRef.expr;
   const keyEnvVar = keyRef.envVar;
+  const packageRel = packageDirFromRepoRoot(input.cwd, io);
   const block = nodeInitSnippet(endpoint, keyExpr, input.serviceName);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -777,7 +850,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   if (wired == null) {
     // Anchors not found: prepend autoCapture plus a TODO block with exact copy
     // and paste instructions, and surface the same guidance in wizard output.
-    const combined = `${envPreloadSnippet(keyEnvVar)}\n\n${block}\n\n${expressManualWiringSnippet(endpoint, keyExpr)}`;
+    const combined = `${envPreloadSnippet(keyEnvVar, JSON.stringify, packageRel)}\n\n${block}\n\n${expressManualWiringSnippet(endpoint, keyExpr)}`;
     return prependWithPreflight(input, io, target, combined, [
       "Express request middleware was NOT wired automatically (no `const app = express()` / `app.listen(...)` anchors found). Follow the TODO block added at the top of the entry: register createCrumbtrailExpressMiddleware before your routes and createCrumbtrailExpressErrorMiddleware after them, or backend request spans stay empty.",
     ]);
@@ -788,7 +861,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   const cors = widenCorsAllowedHeaders(wired.text);
   const content = prependIntoSource(
     cors.text,
-    `${envPreloadSnippet(keyEnvVar)}\n\n${block}\n\n${expressMiddlewareImportSnippet(style!)}`,
+    `${envPreloadSnippet(keyEnvVar, JSON.stringify, packageRel)}\n\n${block}\n\n${expressMiddlewareImportSnippet(style!)}`,
   );
   const warnings = [
     ...corsWarnings(cors, input.recipe),
@@ -1233,6 +1306,7 @@ function planExtraBackendEntries(
   const warnings: string[] = [];
   const keyRef = keyRefFor(input);
   if (!keyRef) return { edits, warnings };
+  const packageRel = packageDirFromRepoRoot(input.cwd, io);
 
   const { entries, unwired } = findExtraBackendEntries(
     input.cwd,
@@ -1254,7 +1328,7 @@ function planExtraBackendEntries(
     }
 
     const service = serviceNameForExtra(input.serviceName, entry);
-    const block = `${envPreloadSnippet(keyRef.envVar)}\n\n${nodeInitSnippet(input.endpoint, keyRef.expr, service)}`;
+    const block = `${envPreloadSnippet(keyRef.envVar, JSON.stringify, packageRel)}\n\n${nodeInitSnippet(input.endpoint, keyRef.expr, service)}`;
     edits.push({
       path: entry.path,
       mode: "update",

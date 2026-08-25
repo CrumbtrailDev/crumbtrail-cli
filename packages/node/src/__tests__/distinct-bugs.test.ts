@@ -381,6 +381,72 @@ describe("groupDistinctBugs — route-agnostic beacon collapse (CRUMB-94)", () =
 });
 
 describe("buildDistinctBugSignature", () => {
+  function bugFor(id: string, message: string) {
+    return groupDistinctBugs([
+      candidate({
+        id,
+        detector: "console_error",
+        title: message,
+        anchor: { t: 1000, message, route: "/checkout" },
+      }),
+    ])[0];
+  }
+
+  function signatureOf(id: string, message: string) {
+    return buildDistinctBugSignature(bugFor(id, message));
+  }
+
+  // Each pair is ONE fault parameterised twice, and each used to mint two signatures —
+  // so a recurring failure arrived as a list of singletons with nothing to count.
+  it.each([
+    [
+      "a quoted flag name",
+      "Unknown feature flag 'beta-checkout'",
+      "Unknown feature flag 'beta-payments'",
+    ],
+    [
+      "an email address",
+      "Cannot find user alice@example.com",
+      "Cannot find user bob@example.com",
+    ],
+    [
+      "a chunk hash",
+      "Failed to load module chunk-abcdefabcdef",
+      "Failed to load module chunk-fedcbafedcba",
+    ],
+    [
+      "a prefixed order id",
+      "Checkout failed for order ord_7885f1c8",
+      "Checkout failed for order ord_1a2b3c4d",
+    ],
+    [
+      "a uuid",
+      "Session 4f1c2b3a-1111-2222-3333-444455556666 expired",
+      "Session 9a8b7c6d-9999-8888-7777-666655554444 expired",
+    ],
+  ])("collapses two occurrences differing only by %s", (_label, a, b) => {
+    expect(signatureOf("cand_a", a)).toEqual(signatureOf("cand_b", b));
+  });
+
+  it("keeps genuinely different faults apart", () => {
+    // The status code survives the digit collapse on purpose: two statuses on one
+    // route are two failures with two fixes.
+    expect(signatureOf("cand_a", "HTTP 403 from POST /login")).not.toEqual(
+      signatureOf("cand_b", "HTTP 500 from POST /login"),
+    );
+    // A snake_case identifier is a fault's name, not a generated id, so it stands.
+    expect(signatureOf("cand_a", "Payment payment_declined")).not.toEqual(
+      signatureOf("cand_b", "Payment payment_disputed"),
+    );
+    expect(signatureOf("cand_a", "Cannot read total")).not.toEqual(
+      signatureOf("cand_b", "Cannot read subtotal"),
+    );
+    // A url's PATH is identity, so two endpoints stay two bugs.
+    expect(signatureOf("cand_a", "HTTP 404 from GET /v2/search")).not.toEqual(
+      signatureOf("cand_b", "HTTP 404 from GET /v2/orders"),
+    );
+  });
+
   it("normalizes numeric message values across sessions", () => {
     const invoiceA = groupDistinctBugs([
       candidate({

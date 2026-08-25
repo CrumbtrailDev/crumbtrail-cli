@@ -36,10 +36,10 @@ describe("errorDetector", () => {
     });
   });
 
-  it("carries the error message into the note and ignores non-errors", () => {
+  it("carries the error message into the reason and ignores non-errors", () => {
     const d = errorDetector();
     const s = d.inspect(evt("err", { msg: "kaboom" }));
-    expect(s?.note).toContain("kaboom");
+    expect(s?.reason).toContain("kaboom");
     expect(d.inspect(evt("clk", { el: { sig: "x" } }))).toBeNull();
     expect(d.inspect(evt("net.req", { id: 1, url: "/x" }))).toBeNull();
   });

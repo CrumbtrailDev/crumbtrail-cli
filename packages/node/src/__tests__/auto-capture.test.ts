@@ -1,6 +1,10 @@
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AUTO_CAPTURE_ERROR_EVENT, autoCapture } from "../auto-capture";
+import {
+  AUTO_CAPTURE_ERROR_EVENT,
+  autoCapture,
+  __resetAutoCaptureInstallForTests,
+} from "../auto-capture";
 import type { AutoCaptureHandle } from "../auto-capture";
 
 // A minimal stand-in for `process` the hooks attach to. It is a real
@@ -64,6 +68,7 @@ function track(handle: AutoCaptureHandle): AutoCaptureHandle {
 afterEach(() => {
   for (const handle of openHandles) handle.stop();
   openHandles = [];
+  __resetAutoCaptureInstallForTests();
 });
 
 describe("autoCapture", () => {
@@ -521,6 +526,12 @@ describe("autoCapture", () => {
     expect(originalError.mock.calls[0][0]).toContain(
       "[crumbtrail] the capture endpoint refused session start with HTTP 401: This project API key was not accepted.; nothing from this session will be captured",
     );
+    // A 401 usually means no key was loaded, not that the key is wrong, so the
+    // line names where the key comes from and which directory was in play.
+    expect(originalError.mock.calls[0][0]).toContain(
+      "The key is read from a .env file in the package directory",
+    );
+    expect(originalError.mock.calls[0][0]).toContain(process.cwd());
 
     // A later capture, after the backoff gate opens, is refused again — but the
     // same condition is still one console line. (The mirrored console.error
@@ -923,5 +934,47 @@ describe("autoCapture", () => {
     expect(consoleImpl.error).toBe(originalError);
     expect(proc.listenerCount("uncaughtException")).toBe(0);
     expect(proc.listenerCount("unhandledRejection")).toBe(0);
+  });
+});
+
+describe("autoCapture double install", () => {
+  const ENDPOINT_LOCAL = ENDPOINT;
+
+  async function install(service: string | undefined, error: () => void) {
+    const { fetchImpl } = makeFetch();
+    return track(
+      await autoCapture({
+        endpoint: ENDPOINT_LOCAL,
+        processImpl: makeFakeProcess({ env: {} }),
+        consoleImpl: { error } as unknown as Pick<Console, "error">,
+        fetchImpl,
+        ...(service ? { service } : {}),
+      }),
+    );
+  }
+
+  it("keeps the first capture and names both services when a second one differs", async () => {
+    const firstError = vi.fn();
+    const first = await install("api", firstError);
+
+    const secondError = vi.fn();
+    const second = await install("worker", secondError);
+
+    expect(secondError).toHaveBeenCalledTimes(1);
+    const line = String(secondError.mock.calls[0][0]);
+    expect(line).toContain('service "api"');
+    expect(line).toContain('service "worker"');
+    expect(line).toContain("one process captures under one service name");
+    // The handle stays inert: a second caller's stop() must not tear down a
+    // capture it does not own.
+    expect(second.sessionId).toBeUndefined();
+    expect(first.sessionId).toBeDefined();
+  });
+
+  it("stays silent for an ordinary repeat call under the same name", async () => {
+    await install("api", vi.fn());
+    const secondError = vi.fn();
+    await install("api", secondError);
+    expect(secondError).not.toHaveBeenCalled();
   });
 });

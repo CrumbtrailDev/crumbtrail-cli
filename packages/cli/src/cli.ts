@@ -751,6 +751,19 @@ export function defaultDeps(): WizardDeps {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/** name + dependencies of a package directory, for the import overlap check. */
+function readPkgDeps(
+  dir: string,
+): { name?: string; dependencies?: unknown } | null {
+  try {
+    return JSON.parse(
+      readFileSync(path.join(dir, "package.json"), "utf8"),
+    ) as { name?: string; dependencies?: unknown };
+  } catch {
+    return null;
+  }
+}
+
 function readPkgName(dir: string): string | null {
   try {
     const pkg = JSON.parse(
@@ -1560,13 +1573,64 @@ function toMultiSelectItems(candidates: ServiceCandidate[]): MultiSelectItem[] {
 }
 
 /**
+ * Why `--all` left a package alone, in the package's own terms.
+ *
+ * A library that gets wired is worse than one that is skipped: the app that
+ * imports it runs the library's capture first, and every session from that
+ * process is then filed under the library's name while the real service reports
+ * nothing at all. So `--all` means every service, not every directory — and the
+ * ones it passed over are named here rather than silently dropped.
+ */
+export function skippedByAllNote(c: ServiceCandidate): string {
+  return `${c.relDir}: nothing runs this package (no start or dev script, no bin, no server or worker entry, no deploy manifest), so it reads as a library and was left unwired. Wire it with --only ${c.relDir} if it really does run as a service.`;
+}
+
+/**
+ * Selected packages that one of the other selected packages imports.
+ *
+ * Two capture inits in one process is one capture: the first call wins and the
+ * second is ignored, so every session from that process is filed under whichever
+ * name loaded first. When a library and the app that imports it are both wired,
+ * that name is the library's, and the app the user cares about reports nothing.
+ * The wizard is the only thing in the room that can see both halves, so it says
+ * so instead of leaving a silent misfiling to be discovered in the dashboard.
+ */
+export function importedSelectionWarnings(
+  selected: readonly ServiceCandidate[],
+  readPkg: (dir: string) => { name?: string; dependencies?: unknown } | null,
+): string[] {
+  const pkgs = selected.map((c) => ({ candidate: c, pkg: readPkg(c.dir) }));
+  const out: string[] = [];
+  for (const { candidate, pkg } of pkgs) {
+    const name = pkg?.name;
+    if (!name) continue;
+    const importers = pkgs.filter(({ candidate: other, pkg: otherPkg }) => {
+      if (other === candidate) return false;
+      const deps = otherPkg?.dependencies;
+      return (
+        !!deps && typeof deps === "object" && name in (deps as object)
+      );
+    });
+    if (importers.length === 0) continue;
+    out.push(
+      `${candidate.relDir} is imported by ${importers.map((i) => i.candidate.relDir).join(", ")}, and both were wired. Capture starts once per process, so whichever loads first names the session, and it will be ${candidate.relDir}. Wire the app and leave ${candidate.relDir} out unless it runs as its own process.`,
+    );
+  }
+  return out;
+}
+
+/**
  * Resolve --only/--all into indices, or null when we should prompt.
  * Returns a string on a user error (unknown --only value).
+ *
+ * `--only` is explicit and always honoured; `--all` is a judgement call the user
+ * delegated, so it declines the packages that look like libraries and reports
+ * them in `skipped`.
  */
 export function resolveSelection(
   parsed: ParsedArgs,
   candidates: ServiceCandidate[],
-): { indices: number[] } | { error: string } | null {
+): { indices: number[]; skipped?: ServiceCandidate[] } | { error: string } | null {
   if (parsed.only && parsed.only.length > 0) {
     const indices: number[] = [];
     for (const want of parsed.only) {
@@ -1590,11 +1654,17 @@ export function resolveSelection(
     return { indices };
   }
   if (parsed.all) {
-    return {
-      indices: candidates
-        .map((c, i) => (c.selectable ? i : -1))
-        .filter((i) => i >= 0),
-    };
+    const indices: number[] = [];
+    const skipped: ServiceCandidate[] = [];
+    candidates.forEach((c, i) => {
+      if (!c.selectable) return;
+      if (c.flags.includes("likely-library")) {
+        skipped.push(c);
+        return;
+      }
+      indices.push(i);
+    });
+    return { indices, skipped };
   }
   return null;
 }
@@ -1658,6 +1728,9 @@ export async function runBatchWizard(
   let indices: number[];
   if (preset) {
     indices = preset.indices;
+    for (const c of preset.skipped ?? []) {
+      ui.out(alert(color.yellow(skippedByAllNote(c))));
+    }
   } else if (!deps.isTTY) {
     // No prompt available and no explicit selection: refuse rather than guess
     // which of someone's services should start reporting.
@@ -1689,6 +1762,9 @@ export async function runBatchWizard(
   if (selected.length === 0) {
     ui.out(alert(color.yellow("Nothing selected — no changes made.")));
     return 0;
+  }
+  for (const warning of importedSelectionWarnings(selected, readPkgDeps)) {
+    ui.out(alert(color.yellow(warning)));
   }
 
   // 3. Login (once for the whole batch).

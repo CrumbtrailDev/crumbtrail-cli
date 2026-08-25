@@ -722,12 +722,69 @@ function normalizeSignature(candidate: EvidenceCandidate): string {
 }
 
 function normalizeText(source: string): string {
-  return stripUrlQueries(source)
-    .toLowerCase()
-    .replace(/\[redacted\]/g, "")
+  return stripVolatileValues(stripUrlQueries(source).toLowerCase())
+    .replace(/\[redacted(?::[^\]]*)?\]/g, "")
     .replace(/\d+/g, "#")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * Stand-in for a stripped volatile value. A token rather than an empty string so two
+ * messages that differ in how MANY variable parts they carry stay distinct. Byte-identical
+ * to the cloud's `VOLATILE_PLACEHOLDER` so a signature computed here and one computed
+ * there describe the same thing.
+ */
+const VOLATILE_PLACEHOLDER = " ~ ";
+
+const UUID_IN_TEXT =
+  /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g;
+const LONG_HEX_IN_TEXT = /\b[0-9a-f]{12,}\b/g;
+const EMAIL_IN_TEXT = /\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/g;
+/**
+ * `ord_7885f1c8`, `cus_a91f22`: a type prefix plus one occurrence's opaque suffix. The
+ * suffix must carry a digit, which is what separates a generated id from an ordinary
+ * snake_case identifier (`payment_declined` names a fault and must survive).
+ */
+const PREFIXED_ID_IN_TEXT = /\b[a-z][a-z0-9]{1,9}_([a-z0-9]{6,})\b/g;
+
+function stripPrefixedIds(source: string): string {
+  return source.replace(PREFIXED_ID_IN_TEXT, (match, suffix: string) =>
+    /\d/.test(suffix) ? VOLATILE_PLACEHOLDER : match,
+  );
+}
+/** Anything inside matching quotes — a flag name, a column name, an interpolated value. */
+const QUOTED_VALUE_IN_TEXT = /(["'`])[^"'`]*\1/g;
+
+/**
+ * Removes the parts of a message that vary between occurrences of ONE fault, so eight
+ * occurrences mint one signature instead of eight.
+ *
+ * `Unknown feature flag 'beta-checkout'` and `Unknown feature flag 'beta-payments'` are
+ * the same fault parameterised twice; so are two `Cannot find user <address>` and two
+ * `Failed to load module chunk-<hash>`. Each pair used to mint its own bug, so a recurring
+ * failure arrived as a list of singletons and the recurrence view had nothing to count.
+ *
+ * The rules, their order, and the placeholder are the cloud's `normalizeIncidentText`, with
+ * ONE rule left out: the cloud replaces a whole absolute url, and here a url's PATH is
+ * identity — `/v2/search` and `/v2/orders` are two endpoints, and {@link stripUrlQueries}
+ * has already removed the part of a url that varies. Everything else matches rule for rule,
+ * because a signature the two layers compute differently is worse than either rule alone.
+ * The known consequence, which the cloud already accepts: quoted-value stripping merges
+ * `column "mode" does not exist` with `column "region" does not exist`. They are distinct
+ * faults with distinct fixes, and they will group. The trade is deliberate — the quoted
+ * value is a variable far more often than it is the fault's identity, and the two
+ * messages stay verbatim on the anchor and on every evidence ref.
+ *
+ * Input is expected already lowercased.
+ */
+function stripVolatileValues(source: string): string {
+  return stripPrefixedIds(
+    source
+      .replace(UUID_IN_TEXT, VOLATILE_PLACEHOLDER)
+      .replace(LONG_HEX_IN_TEXT, VOLATILE_PLACEHOLDER)
+      .replace(EMAIL_IN_TEXT, VOLATILE_PLACEHOLDER),
+  ).replace(QUOTED_VALUE_IN_TEXT, VOLATILE_PLACEHOLDER);
 }
 
 /**
@@ -811,13 +868,15 @@ function unshieldDigits(text: string): string {
  * HTTP status codes are the exception and survive intact. `HTTP 403 from POST
  * /login` and `HTTP 500 from POST /login` are different failures with different
  * fixes, and collapsing both to `http # from post /login` re-merged, at
- * identity time, exactly what the grouping layer works to keep apart.
+ * identity time, exactly what the grouping layer works to keep apart. This is the
+ * one deliberate divergence from the cloud's `normalizeIncidentText`, which replaces
+ * every number including a status code; everything {@link stripVolatileValues} removes
+ * matches the cloud rule for rule.
  */
 function normalizeRecurrenceText(source: string): string {
   return unshieldDigits(
-    stripUrlQueries(source)
-      .toLowerCase()
-      .replace(/\[redacted\]/g, "")
+    stripVolatileValues(stripUrlQueries(source).toLowerCase())
+      .replace(/\[redacted(?::[^\]]*)?\]/g, "")
       .replace(
         HTTP_STATUS_IN_TEXT,
         (_match, prefix: string, code: string) =>

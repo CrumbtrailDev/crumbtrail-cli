@@ -385,6 +385,79 @@ export function referencesCorsElsewhere(text: string): boolean {
   return CORS_REFERENCE_RE.test(text);
 }
 
+/** Server frameworks and runtimes whose presence means this process answers HTTP. */
+const HTTP_FRAMEWORKS = [
+  "express",
+  "fastify",
+  "hono",
+  "koa",
+  "restify",
+  "polka",
+  "connect",
+  "@hapi/hapi",
+  "@nestjs/core",
+  "@nestjs/platform-express",
+  "@nestjs/platform-fastify",
+  "apollo-server",
+  "@apollo/server",
+  "next",
+  "nuxt",
+] as const;
+
+const HTTP_MODULE_RE = new RegExp(
+  String.raw`(?:from\s*|require\s*\(\s*)["'](?:node:)?(?:http|https|http2|${HTTP_FRAMEWORKS.map(
+    (name) => name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&"),
+  ).join("|")})(?:/[\w./@-]*)?["']`,
+  "m",
+);
+
+/** `app.listen(...)`, `server.listen(...)`, `createServer(`, `Bun.serve(`, `Deno.serve(`. */
+const HTTP_LISTEN_RE =
+  /\.listen\s*\(|createServer\s*\(|\b(?:Bun|Deno)\.serve\s*\(|\bserve\s*\(\s*\{/;
+
+/**
+ * Whether this process answers HTTP at all.
+ *
+ * The CORS guidance below is fifteen lines with three framework snippets, and it
+ * is only ever actionable for a process that serves browser requests. A package
+ * that is a bare `setInterval` worker got the whole lecture, which reads as the
+ * wizard not having looked at the code.
+ *
+ * Two sources, because the entry alone is not always enough: the scanned entry's
+ * own imports and listen calls, and — for an entry that only calls a `bootstrap()`
+ * living in another file — the package's declared dependencies. Either one is
+ * enough; a worker package has neither.
+ */
+export function servesHttp(
+  entrySource: string | null | undefined,
+  packageJson?: string | null,
+): boolean {
+  if (entrySource) {
+    if (HTTP_MODULE_RE.test(entrySource)) return true;
+    if (HTTP_LISTEN_RE.test(entrySource)) return true;
+  }
+  if (packageJson) {
+    try {
+      const parsed = JSON.parse(packageJson) as Record<string, unknown>;
+      const deps = new Set<string>();
+      for (const field of [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+      ]) {
+        const value = parsed[field];
+        if (value && typeof value === "object") {
+          for (const name of Object.keys(value)) deps.add(name);
+        }
+      }
+      if (HTTP_FRAMEWORKS.some((name) => deps.has(name))) return true;
+    } catch {
+      // Unparseable package.json: fall through to the entry's own evidence.
+    }
+  }
+  return false;
+}
+
 /** `allowedHeaders:` (Express `cors`) or `allowHeaders:` (Hono `cors`). */
 const ALLOW_HEADERS_KEY = String.raw`\ballow(?:ed)?Headers\s*:\s*`;
 

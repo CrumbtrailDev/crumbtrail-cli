@@ -10,6 +10,7 @@ import {
   CORRELATION_REQUEST_HEADERS,
   corsElsewhereGuidance,
   corsWideningGuidance,
+  servesHttp,
   widenCorsAllowedHeaders,
 } from "../inject/text";
 
@@ -163,5 +164,34 @@ describe("widenCorsAllowedHeaders", () => {
       expect(guidance).toContain(header);
     }
     expect(guidance).toContain("No CORS middleware in this file");
+  });
+});
+
+// Defect class: a package that never answers HTTP got the whole fifteen line
+// CORS lecture with three framework snippets. There is no preflight to block on
+// a process nothing calls.
+describe("servesHttp", () => {
+  it("is false for a bare timer worker with no server dependency", () => {
+    expect(
+      servesHttp(
+        'setInterval(() => console.log("tick"), 5000);',
+        JSON.stringify({ name: "ticker", dependencies: { pg: "^8" } }),
+      ),
+    ).toBe(false);
+  });
+
+  it("is true for a listen call, a server import, or a framework dependency", () => {
+    expect(servesHttp("app.listen(3000);")).toBe(true);
+    expect(servesHttp('import http from "node:http";')).toBe(true);
+    expect(servesHttp('const Fastify = require("fastify");')).toBe(true);
+    expect(servesHttp('import { serve } from "hono/node-server";')).toBe(true);
+    // An entry that only calls a bootstrap living elsewhere: the package's own
+    // dependencies are the remaining evidence.
+    expect(
+      servesHttp(
+        "bootstrap();",
+        JSON.stringify({ dependencies: { "@nestjs/core": "^10" } }),
+      ),
+    ).toBe(true);
   });
 });

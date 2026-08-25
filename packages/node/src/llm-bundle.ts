@@ -1537,6 +1537,11 @@ const DEGRADED_TITLE_MARKER = "message unavailable";
  * untouched so the underlying evidence stays verbatim. Pure and deterministic: no flag events
  * (or no degraded titles) means the input is returned unchanged, and ties on distance to
  * `firstSeen` resolve to the earliest event in stream order.
+ *
+ * Only a flag a PERSON raised qualifies. An automatic capture states `origin: "auto"` and
+ * carries the detector's own sentence in `reason` rather than a note, so it can never reach
+ * here: promoting "Auto captured after request returned 500" to a title would state a
+ * mechanism where a title must state a fault.
  */
 function applyFlagNoteTitles(
   bugs: DistinctBug[],
@@ -1547,6 +1552,7 @@ function applyFlagNoteTitles(
   const flagNotes: Array<{ t: number; note: string }> = [];
   for (const event of events) {
     if (event.k !== "bug.flag") continue;
+    if (event.d?.origin !== "user") continue;
     const note = event.d?.note;
     if (typeof note !== "string" || note.trim().length === 0) continue;
     const t = finiteNumber(event.t);

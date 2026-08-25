@@ -9,14 +9,15 @@ import {
 } from "vitest";
 import { createAutoFlagController } from "../auto-flag";
 import { rageClickDetector, retryStormDetector } from "../signals";
-import type { BugEvent, FlagBugOptions } from "../types";
+import type { AutoFlagRequest } from "../auto-flag";
+import type { BugEvent } from "../types";
 
 function errEvent(msg: string, stk?: string): BugEvent {
   return { t: Date.now(), k: "err", d: { msg, stk } };
 }
 
 describe("createAutoFlagController", () => {
-  let flag: Mock<(options: FlagBugOptions) => Promise<unknown>>;
+  let flag: Mock<(request: AutoFlagRequest) => Promise<unknown>>;
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -48,7 +49,10 @@ describe("createAutoFlagController", () => {
     vi.advanceTimersByTime(1);
     expect(flag).toHaveBeenCalledTimes(1);
     expect(flag.mock.calls[0][0].tags).toContain("auto:error");
-    expect(flag.mock.calls[0][0].note).toContain("boom");
+    // An automatic capture never manufactures a note: nobody typed one. The
+    // detector's own sentence rides in `reason`.
+    expect("note" in flag.mock.calls[0][0]).toBe(false);
+    expect(flag.mock.calls[0][0].reason).toContain("boom");
   });
 
   it("coalesces an error burst into a single flag", () => {

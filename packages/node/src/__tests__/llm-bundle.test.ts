@@ -1929,7 +1929,12 @@ describe("llm bundle distinct-bug flag-note titles", () => {
     });
   }
 
-  function sessionEvents(flag?: { t: number; note: string }): BugEvent[] {
+  function sessionEvents(flag?: {
+    t: number;
+    note?: string;
+    reason?: string;
+    origin?: string;
+  }): BugEvent[] {
     const events: BugEvent[] = [
       {
         t: BASE,
@@ -1949,7 +1954,11 @@ describe("llm bundle distinct-bug flag-note titles", () => {
         t: flag.t,
         k: "bug.flag",
         offsetMs: flag.t - BASE,
-        d: { note: flag.note },
+        d: {
+          origin: flag.origin ?? "user",
+          ...(flag.note !== undefined ? { note: flag.note } : {}),
+          ...(flag.reason !== undefined ? { reason: flag.reason } : {}),
+        },
       });
     }
     return events.sort((a, b) => a.t - b.t);
@@ -1966,6 +1975,23 @@ describe("llm bundle distinct-bug flag-note titles", () => {
     };
     return await writeLlmBundle({ sessionDir: tmpDir, events, index, candidates });
   }
+
+  it("leaves a degraded title alone for an automatic capture", async () => {
+    // An auto capture has no note, and its `reason` is a mechanism sentence rather
+    // than a fault. Neither may become a bug's permanent name.
+    const bundle = await buildBundle(
+      sessionEvents({
+        t: BASE + 1005,
+        origin: "auto",
+        reason: "Auto captured after request returned 500",
+      }),
+      [degradedCandidate()],
+    );
+
+    expect(bundle.distinctBugs[0].title).toBe(
+      "Uncaught error: message unavailable",
+    );
+  });
 
   it("replaces a degraded title with the user's in-window flag note", async () => {
     const note = "Checkout dies with a 500 every time I hit Pay";

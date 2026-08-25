@@ -160,6 +160,59 @@ describe("wired Node app, running", () => {
     ]);
   });
 
+  it("finds the package's .env when the process is started from the monorepo root", () => {
+    // The normal way to start one service of a monorepo, and the only way a
+    // root Dockerfile can: cwd is the root, the env file is in the package.
+    dir = makeTmpRepo({
+      "package.json": JSON.stringify({
+        name: "root",
+        private: true,
+        workspaces: ["services/*"],
+      }),
+      "services/api/package.json": JSON.stringify({
+        name: "api",
+        scripts: { start: "node src/index.js" },
+      }),
+      "services/api/.env": "CRUMBTRAIL_KEY=ctkey_in_the_package\n",
+      "services/api/src/index.js": [
+        'console.log("started");',
+        "setTimeout(() => {}, 200);",
+        "",
+      ].join("\n"),
+      "node_modules/crumbtrail-node/package.json": JSON.stringify({
+        name: "crumbtrail-node",
+        version: "0.37.0",
+        main: "index.js",
+      }),
+      "node_modules/crumbtrail-node/index.js": STUB_SDK,
+    });
+    const pkgDir = path.join(dir, "services", "api");
+    const entry = path.join(pkgDir, "src", "index.js");
+    executePlan(
+      buildPlan({
+        cwd: pkgDir,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: entry,
+        serviceName: "api",
+        options: { force: true },
+      }),
+    );
+
+    for (const cwd of [dir, pkgDir]) {
+      execFileSync(process.execPath, [entry], {
+        cwd,
+        env: CLEAN_ENV,
+        stdio: "pipe",
+      });
+    }
+
+    expect(seen(dir)).toEqual([
+      { service: "api", authToken: "ctkey_in_the_package" },
+      { service: "api", authToken: "ctkey_in_the_package" },
+    ]);
+  });
+
   it("never overwrites a key that is already in the environment", () => {
     dir = makeApp();
     const entry = path.join(dir, "src", "index.js");

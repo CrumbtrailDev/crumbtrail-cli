@@ -82,7 +82,7 @@ interface RootPackageJson {
  * `packages/*` matches one segment, `packages/**` matches any depth, and a
  * pattern with no wildcard matches that exact directory.
  */
-function patternMatches(pattern: string, relPath: string): boolean {
+export function patternMatches(pattern: string, relPath: string): boolean {
   const clean = pattern.replace(/^\.\//, "").replace(/\/+$/, "");
   return segmentsMatch(clean.split("/"), relPath.split("/"));
 }
@@ -113,7 +113,10 @@ function segmentsMatch(patterns: string[], segments: string[]): boolean {
 }
 
 /** Read a root's declared member patterns, or null when it declares none. */
-function workspacePatterns(dir: string, reader: FileReader): string[] | null {
+export function workspacePatterns(
+  dir: string,
+  reader: Pick<FileReader, "readFile">,
+): string[] | null {
   const yaml = reader.readFile(path.join(dir, "pnpm-workspace.yaml"));
   if (yaml != null) return parsePnpmWorkspace(yaml);
   const pkg = readRootPackageJson(dir, reader);
@@ -175,7 +178,7 @@ export function parsePnpmWorkspace(text: string): string[] {
 
 function readRootPackageJson(
   dir: string,
-  reader: FileReader,
+  reader: Pick<FileReader, "readFile">,
 ): RootPackageJson | null {
   const text = reader.readFile(path.join(dir, "package.json"));
   if (text == null) return null;

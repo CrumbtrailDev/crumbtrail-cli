@@ -244,6 +244,25 @@ function sleep(ms: number): Promise<void> {
 let installed = false;
 
 /**
+ * The service the live capture was installed for.
+ *
+ * Two apps in one process — a worker imported into the API, an entry that calls
+ * `autoCapture` again under a second name — used to be indistinguishable from a
+ * duplicate call: the second name was dropped without a word, and every event the
+ * second app produced was filed under the first app's name for the life of the
+ * process. That is a wrong answer presented as a working install, so the conflict
+ * is now stated once and the first capture stands. The second caller still gets an
+ * inert handle, so its `stop()` cannot tear down a capture it does not own.
+ */
+let installedService: string | undefined;
+
+/** Test seam: forget the process-wide install so a suite can install again. */
+export function __resetAutoCaptureInstallForTests(): void {
+  installed = false;
+  installedService = undefined;
+}
+
+/**
  * Install best-effort backend crash + console.error capture and start a headless
  * ingest session. Returns a handle whose `stop()` restores every hook.
  *
@@ -257,9 +276,24 @@ export async function autoCapture(
   options: AutoCaptureOptions,
 ): Promise<AutoCaptureHandle> {
   if (installed) {
+    // Same name (or no name either time) is an ordinary double call — idempotent,
+    // and silent as it has always been. A DIFFERENT name is two apps, and saying
+    // nothing would file one app's events under the other app's name.
+    if (options.service !== installedService) {
+      const consoleForWarning = options.consoleImpl ?? console;
+      consoleForWarning.error(
+        `[crumbtrail] capture is already running for ${describeService(installedService)}, ` +
+          `so the later call for ${describeService(options.service)} was ignored: ` +
+          "one process captures under one service name. Run the second app in its own " +
+          "process, or give both calls the same service name.",
+      );
+    }
+    // Still an inert handle, never the live one: a second caller's `stop()` must not
+    // tear down a capture it does not own. The existing double-install contract.
     return { stop() {} };
   }
   installed = true;
+  installedService = options.service;
 
   const proc = options.processImpl ?? process;
   const consoleRef = options.consoleImpl ?? console;
@@ -714,9 +748,15 @@ export async function autoCapture(
     httpCapture?.stop();
     dbInstrumentation?.restore();
     installed = false;
+    installedService = undefined;
   };
 
   return { sessionId: session?.sessionId, stop };
+}
+
+/** A service name for a message, or the phrase for a call that named none. */
+function describeService(service: string | undefined): string {
+  return service ? `service "${service}"` : "an unnamed service";
 }
 
 /** Truthy for `1`/`true`/`yes`/`on` (case-insensitive); false for unset/empty. */
@@ -739,7 +779,21 @@ function refusalSentence(error: HeadlessRequestError, phase: string): string {
   return (
     `the capture endpoint refused ${refused} with HTTP ${error.status}` +
     `${error.serverMessage ? `: ${error.serverMessage}` : ""}` +
-    "; nothing from this session will be captured"
+    "; nothing from this session will be captured" +
+    (error.status === 401 ? ` ${missingKeyHint()}` : "")
+  );
+}
+
+/**
+ * A 401 reads as "your key is wrong", and the key is usually fine: the process was
+ * started from a directory the `.env` holding it is not in, so no key was ever loaded
+ * and none was sent. Naming the mechanism costs one sentence and saves the reader from
+ * rotating a working key.
+ */
+function missingKeyHint(): string {
+  return (
+    "The key is read from a .env file in the package directory, so check the working " +
+    `directory the process was started from (currently ${process.cwd()}).`
   );
 }
 
