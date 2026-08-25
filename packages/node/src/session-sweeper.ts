@@ -34,6 +34,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import type { BugEvent } from "crumbtrail-core";
 import { defaultSessionStore } from "./session-store";
 import type { SessionManager } from "./session";
 
@@ -46,6 +47,22 @@ export const DEFAULT_SWEEP_CHECKPOINT_MS = 60 * 60 * 1000;
 // events.ndjson (merge pass) moments before finalize's closing meta write, so
 // only a clearly-later events mtime counts as post-finalization activity.
 export const LATE_EVENTS_EPSILON_MS = 1000;
+
+/** Kind carrying a session's own statement about how it started and ended. */
+const SESSION_LIFECYCLE_EVENT = "session.lifecycle";
+
+/**
+ * The lifecycle reason an SDK writes when it saw the process being stopped.
+ * Its presence is what tells the sweeper the ending is already explained.
+ */
+const PROCESS_TERMINATED_ACTION = "process-terminated";
+
+/**
+ * Bytes of `events.ndjson` read to look for a termination record. The record is
+ * written as the process dies, so it is at the tail; reading the whole file
+ * would make the sweep cost scale with session size for one boolean.
+ */
+const TERMINATION_SCAN_BYTES = 64 * 1024;
 
 export interface SessionSweepOptions {
   sessions: SessionManager;
@@ -204,6 +221,16 @@ export async function sweepIdleSessions(
       continue;
     }
 
+    // An idle first finalization is, by definition, a session whose owner never
+    // said it was finished: `/api/session/end` finalizes on the spot, so nothing
+    // that ends cleanly ever reaches here. Say so in the evidence, before the
+    // finalize that turns it into a brief. A session that simply stops and is
+    // then graded as complete is how a container that was killed mid request
+    // comes back as a clean run with a missing half.
+    if (needsFinalize && idle) {
+      await recordUnterminatedSession(dir, now());
+    }
+
     try {
       await options.sessions.finalize(id, {
         refinalize: needsRefinalize,
@@ -224,6 +251,70 @@ export async function sweepIdleSessions(
   }
 
   return result;
+}
+
+/**
+ * Append the session's own statement that it stopped without one.
+ *
+ * `session.lifecycle` is used rather than a capture gap because this is not a
+ * dropped event, it is the shape of the ending: the bundle renders the kind as
+ * "session <action> reason <reason>" on the timeline, which is exactly the
+ * sentence a reader needs. Nothing is appended when the SDK already recorded a
+ * termination — a process that named its own signal has explained itself, and
+ * a second, vaguer statement on top would only muddy it.
+ *
+ * Best effort throughout: a session that cannot be annotated is still finalized.
+ */
+async function recordUnterminatedSession(
+  sessionDir: string,
+  now: number,
+): Promise<void> {
+  try {
+    if (hasTerminationRecord(sessionDir)) return;
+    const event: BugEvent = {
+      t: now,
+      k: SESSION_LIFECYCLE_EVENT,
+      d: {
+        action: "ended",
+        // Names the fact and not a guess at the cause. The process may have been
+        // killed, OOM-ed, lost its host or simply stopped emitting; what is
+        // known is that nothing ever said it was finished, and that a brief
+        // built from this session is reading an ending it did not witness.
+        reason: "no-terminal-signal",
+        finalizedBy: "idle-sweep",
+      },
+    };
+    await defaultSessionStore.appendEvents(sessionDir, [event]);
+  } catch {
+    // Annotating is not worth failing a sweep over.
+  }
+}
+
+/** Whether the tail of the session already carries a termination record. */
+function hasTerminationRecord(sessionDir: string): boolean {
+  const eventsPath = path.join(sessionDir, "events.ndjson");
+  let handle: number | undefined;
+  try {
+    const size = fs.statSync(eventsPath).size;
+    if (size === 0) return false;
+    const length = Math.min(size, TERMINATION_SCAN_BYTES);
+    const buffer = Buffer.alloc(length);
+    handle = fs.openSync(eventsPath, "r");
+    fs.readSync(handle, buffer, 0, length, size - length);
+    return buffer.toString("utf-8").includes(PROCESS_TERMINATED_ACTION);
+  } catch {
+    // No events file, or an unreadable one. Nothing has explained the ending,
+    // which is precisely the case the annotation exists for.
+    return false;
+  } finally {
+    if (handle !== undefined) {
+      try {
+        fs.closeSync(handle);
+      } catch {
+        // Nothing further to do about a descriptor that will not close.
+      }
+    }
+  }
 }
 
 export interface SessionSweeperHandle {

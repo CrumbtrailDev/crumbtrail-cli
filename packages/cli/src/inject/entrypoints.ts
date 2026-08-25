@@ -114,13 +114,129 @@ function readScripts(cwd: string, io: InjectIO): Record<string, string> | null {
 
 export interface ExtraEntriesResult {
   entries: ExtraEntry[];
-  /** How many matches were found beyond MAX_EXTRA_ENTRIES and left unwired. */
-  truncated: number;
+  /**
+   * The matches that did not fit in MAX_EXTRA_ENTRIES, lowest ranked first.
+   * Named rather than counted: "2 were left unwired" tells a user there is a
+   * hole without telling them where it is.
+   */
+  unwired: ExtraEntry[];
+}
+
+/**
+ * Deploy manifests at the package root. A process named in one of these is a
+ * process the platform keeps running, which is the single strongest signal
+ * available that it is not a one shot script.
+ *
+ * Matched by name because the wizard has no glob: Railway allows any
+ * `railway*.json` / `railway*.toml` (a monorepo commonly has
+ * `railway.worker.json` beside `railway.json`), and the rest are fixed names.
+ */
+export const DEPLOY_CONFIG_RE =
+  /^(railway.*\.(json|toml)|procfile|dockerfile|.*\.dockerfile|fly\.toml|render\.yaml|ecosystem\.config\.(js|cjs|json)|docker-compose(\..+)?\.ya?ml)$/i;
+
+/** Script names that start something and keep it running. */
+function isLongRunningScriptName(name: string): boolean {
+  const n = name.toLowerCase();
+  return ["start", "dev", "serve", "worker"].some(
+    (p) => n === p || n.startsWith(`${p}:`),
+  );
+}
+
+/** File and directory names that describe a process, not a task. */
+const LONG_RUNNING_NAME_RE = /(worker|server|daemon|consumer|listener)/i;
+
+/**
+ * One shot work: it runs, it finishes, and capture wrapped around it opens an
+ * ingest session for the length of a migration. These rank last, so a package
+ * with more runnable scripts than slots spends its slots on processes.
+ */
+const ONE_SHOT_NAME_RE =
+  /(migrat|seed|bootstrap|backfill|codegen|provision|teardown|reset|fixture|scaffold)/i;
+
+/**
+ * The deploy manifest at the package root that names this entry file, or null.
+ *
+ * Said back to the user in the wired output ("worker.ts matched
+ * railway.worker.json"), because a wizard that names the manifest it read is a
+ * wizard that visibly looked, and the alternative — picking one of several
+ * runnable files with no stated reason — reads as a guess.
+ */
+export function deployManifestNaming(
+  cwd: string,
+  io: InjectIO,
+  entryPath: string,
+): string | null {
+  if (!io.listFiles) return null;
+  const rel = path.relative(cwd, entryPath).replace(/\\/g, "/").toLowerCase();
+  const base = path.basename(rel);
+  if (!base) return null;
+  for (const name of io.listFiles(cwd)) {
+    if (!DEPLOY_CONFIG_RE.test(name)) continue;
+    const text = io.readFile(path.join(cwd, name))?.toLowerCase();
+    if (!text) continue;
+    if (text.includes(rel) || text.includes(base)) return name;
+  }
+  return null;
+}
+
+function readDeployConfigText(cwd: string, io: InjectIO): string {
+  if (!io.listFiles) return "";
+  const parts: string[] = [];
+  for (const name of io.listFiles(cwd)) {
+    if (!DEPLOY_CONFIG_RE.test(name)) continue;
+    const text = io.readFile(path.join(cwd, name));
+    if (text) parts.push(text);
+  }
+  return parts.join("\n").toLowerCase();
+}
+
+/**
+ * How likely this entry is to be a process that stays up. Higher wins a slot.
+ *
+ * The wizard can wire MAX_EXTRA_ENTRIES processes, and which ones it picks used
+ * to be alphabetical: a package with `migrate.ts`, `seedSim.ts`,
+ * `stripeBootstrap.ts`, `sim/server.ts` and a real `worker.ts` spent all four
+ * slots on scripts that exit, and left the always on worker reporting nothing.
+ */
+export function longRunningScore(
+  entry: ExtraEntry,
+  relPath: string,
+  deployConfigText: string,
+): number {
+  let score = 0;
+  const rel = relPath.replace(/\\/g, "/").toLowerCase();
+  const base = path.basename(rel);
+  const dir = path.dirname(rel);
+
+  if (deployConfigText) {
+    const named =
+      deployConfigText.includes(rel) ||
+      deployConfigText.includes(base) ||
+      new RegExp(String.raw`run\s+${escapeRe(entry.script.toLowerCase())}\b`).test(
+        deployConfigText,
+      );
+    if (named) score += 3;
+  }
+  if (isLongRunningScriptName(entry.script)) score += 2;
+  if (LONG_RUNNING_NAME_RE.test(base) || LONG_RUNNING_NAME_RE.test(dir)) {
+    score += 2;
+  }
+  if (ONE_SHOT_NAME_RE.test(base) || ONE_SHOT_NAME_RE.test(entry.script)) {
+    score -= 3;
+  }
+  if (/(^|\/)scripts\//.test(rel)) score -= 2;
+  return score;
+}
+
+function escapeRe(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
  * Every runnable file this package's scripts start, other than `mainEntry`.
- * Deterministic: results are sorted by path so a re-run plans the same edits.
+ *
+ * Deterministic: candidates are ranked by how likely they are to be a process
+ * that stays up, and ties break on path, so a re-run plans the same edits.
  */
 export function findExtraBackendEntries(
   cwd: string,
@@ -128,7 +244,7 @@ export function findExtraBackendEntries(
   mainEntry: string | null | undefined,
 ): ExtraEntriesResult {
   const scripts = readScripts(cwd, io);
-  if (!scripts) return { entries: [], truncated: 0 };
+  if (!scripts) return { entries: [], unwired: [] };
 
   const main = mainEntry ? path.resolve(mainEntry) : null;
   const found = new Map<string, ExtraEntry>();
@@ -160,11 +276,21 @@ export function findExtraBackendEntries(
     }
   }
 
-  const sorted = [...found.values()].sort((a, b) =>
-    a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
-  );
+  const deployConfigText = readDeployConfigText(cwd, io);
+  const scored = new Map<string, number>();
+  for (const entry of found.values()) {
+    scored.set(
+      entry.path,
+      longRunningScore(entry, path.relative(cwd, entry.path), deployConfigText),
+    );
+  }
+  const sorted = [...found.values()].sort((a, b) => {
+    const byScore = (scored.get(b.path) ?? 0) - (scored.get(a.path) ?? 0);
+    if (byScore !== 0) return byScore;
+    return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+  });
   return {
     entries: sorted.slice(0, MAX_EXTRA_ENTRIES),
-    truncated: Math.max(0, sorted.length - MAX_EXTRA_ENTRIES),
+    unwired: sorted.slice(MAX_EXTRA_ENTRIES),
   };
 }

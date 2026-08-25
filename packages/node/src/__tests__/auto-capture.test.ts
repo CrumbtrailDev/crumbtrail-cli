@@ -1,6 +1,10 @@
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AUTO_CAPTURE_ERROR_EVENT, autoCapture } from "../auto-capture";
+import {
+  AUTO_CAPTURE_ERROR_EVENT,
+  autoCapture,
+  __resetAutoCaptureInstallForTests,
+} from "../auto-capture";
 import type { AutoCaptureHandle } from "../auto-capture";
 
 // A minimal stand-in for `process` the hooks attach to. It is a real
@@ -64,6 +68,7 @@ function track(handle: AutoCaptureHandle): AutoCaptureHandle {
 afterEach(() => {
   for (const handle of openHandles) handle.stop();
   openHandles = [];
+  __resetAutoCaptureInstallForTests();
 });
 
 describe("autoCapture", () => {
@@ -326,6 +331,59 @@ describe("autoCapture", () => {
     );
   });
 
+  it("keeps the sentence the developer wrote alongside the Error's own message", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const consoleImpl = { error: vi.fn() };
+    const { fetchImpl, calls } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl,
+        fetchImpl,
+      }),
+    );
+
+    // The ordinary shape: a sentence naming what was attempted, then the Error.
+    consoleImpl.error("worker tick failed", new Error("keepa refused"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    const logged = eventsFrom(calls).find(
+      (e) => e.k === AUTO_CAPTURE_ERROR_EVENT && e.d.source === "console.error",
+    );
+    expect(logged).toBeDefined();
+    // The Error still supplies name/message/stack …
+    expect((logged!.d.error as { message: string }).message).toBe(
+      "keepa refused",
+    );
+    // … and the words the author chose are no longer dropped.
+    expect(logged!.d.message).toBe("worker tick failed");
+  });
+
+  it("records no message field when console.error was given only an Error", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const consoleImpl = { error: vi.fn() };
+    const { fetchImpl, calls } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl,
+        fetchImpl,
+      }),
+    );
+
+    consoleImpl.error(new Error("bare failure"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    const logged = eventsFrom(calls).find(
+      (e) => e.k === AUTO_CAPTURE_ERROR_EVENT && e.d.source === "console.error",
+    );
+    expect(logged!.d.message).toBeUndefined();
+  });
+
   it("onError surfaces a session-start failure (endpoint unreachable / bad cert)", async () => {
     const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
     const onError = vi.fn();
@@ -428,6 +486,10 @@ describe("autoCapture", () => {
         processImpl: proc,
         consoleImpl,
         fetchImpl,
+        // The DB report is a separate lane with its own contract (it always
+        // states when no driver was instrumented); this test is about ingest
+        // failures staying quiet.
+        instrumentDatabases: false,
       }),
     );
 
@@ -459,6 +521,7 @@ describe("autoCapture", () => {
         consoleImpl,
         fetchImpl,
         nowImpl: () => clock,
+        instrumentDatabases: false,
       }),
     );
 
@@ -468,6 +531,12 @@ describe("autoCapture", () => {
     expect(originalError.mock.calls[0][0]).toContain(
       "[crumbtrail] the capture endpoint refused session start with HTTP 401: This project API key was not accepted.; nothing from this session will be captured",
     );
+    // A 401 usually means no key was loaded, not that the key is wrong, so the
+    // line names where the key comes from and which directory was in play.
+    expect(originalError.mock.calls[0][0]).toContain(
+      "The key is read from a .env file in the package directory",
+    );
+    expect(originalError.mock.calls[0][0]).toContain(process.cwd());
 
     // A later capture, after the backoff gate opens, is refused again — but the
     // same condition is still one console line. (The mirrored console.error
@@ -777,6 +846,82 @@ describe("autoCapture", () => {
     expect(body.metadata).not.toHaveProperty("service");
   });
 
+
+  // The Hono/pino case: a backend that logs through a logger and never crashes.
+  // Before structured log capture existed this session came out completely
+  // empty — the app's own statement of the cause was written to stdout and
+  // nothing was watching stdout.
+  it("captures a pino error line the app logged instead of throwing", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+    const written: string[] = [];
+    const stdout = {
+      write(chunk: unknown) {
+        written.push(String(chunk));
+        return true;
+      },
+    } as unknown as NodeJS.WriteStream;
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        logStreams: { stdout, stderr: stdout },
+      }),
+    );
+
+    const line = `${JSON.stringify({
+      level: 50,
+      time: 1_700_000_000_000,
+      pid: 1,
+      hostname: "api",
+      status: 503,
+      err: {
+        type: "UpstreamError",
+        message: "keepa product lookup failed",
+        stack:
+          "UpstreamError: keepa product lookup failed\\n    at fetchKeepaProduct (/app/src/services/keepa/fetchProduct.ts:68:11)",
+      },
+      msg: "request failed",
+    })}\n`;
+    stdout.write(line);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const logged = eventsFrom(calls).filter((ev) => ev.k === "backend.log");
+    expect(logged).toHaveLength(1);
+    expect(logged[0].d.level).toBe("error");
+    expect(
+      String((logged[0].d.error as { stack?: string }).stack),
+    ).toContain("fetchKeepaProduct");
+    // The application's own logging is delivered unchanged.
+    expect(written).toEqual([line]);
+  });
+
+  it("leaves the streams alone when log capture is switched off", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+    const stdout = { write: () => true } as unknown as NodeJS.WriteStream;
+    const originalWrite = stdout.write;
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        captureLogs: false,
+        logStreams: { stdout, stderr: stdout },
+      }),
+    );
+
+    expect(stdout.write).toBe(originalWrite);
+    stdout.write('{"level":50,"msg":"ignored"}\n');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(eventsFrom(calls).filter((ev) => ev.k === "backend.log")).toEqual([]);
+  });
+
   it("restores console.error and removes hooks on stop()", async () => {
     const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
     const originalError = vi.fn();
@@ -794,5 +939,226 @@ describe("autoCapture", () => {
     expect(consoleImpl.error).toBe(originalError);
     expect(proc.listenerCount("uncaughtException")).toBe(0);
     expect(proc.listenerCount("unhandledRejection")).toBe(0);
+  });
+});
+
+describe("autoCapture double install", () => {
+  const ENDPOINT_LOCAL = ENDPOINT;
+
+  async function install(service: string | undefined, error: () => void) {
+    const { fetchImpl } = makeFetch();
+    return track(
+      await autoCapture({
+        endpoint: ENDPOINT_LOCAL,
+        processImpl: makeFakeProcess({ env: {} }),
+        consoleImpl: { error } as unknown as Pick<Console, "error">,
+        fetchImpl,
+        ...(service ? { service } : {}),
+      }),
+    );
+  }
+
+  it("keeps the first capture and names both services when a second one differs", async () => {
+    const firstError = vi.fn();
+    const first = await install("api", firstError);
+
+    const secondError = vi.fn();
+    const second = await install("worker", secondError);
+
+    expect(secondError).toHaveBeenCalledTimes(1);
+    const line = String(secondError.mock.calls[0][0]);
+    expect(line).toContain('service "api"');
+    expect(line).toContain('service "worker"');
+    expect(line).toContain("one process captures under one service name");
+    // The handle stays inert: a second caller's stop() must not tear down a
+    // capture it does not own.
+    expect(second.sessionId).toBeUndefined();
+    expect(first.sessionId).toBeDefined();
+  });
+
+  it("stays silent for an ordinary repeat call under the same name", async () => {
+    await install("api", vi.fn());
+    const secondError = vi.fn();
+    await install("api", secondError);
+    expect(secondError).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================================
+// COMPLETENESS: a capture outage must leave a mark
+// ============================================================================
+
+describe("autoCapture completeness ledger", () => {
+  it("holds evidence produced while the endpoint is down and delivers it when the endpoint returns", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    let clock = 1_000;
+    let reachable = false;
+    const calls: FetchCall[] = [];
+    const fetchImpl = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        if (!reachable) throw new TypeError("fetch failed");
+        calls.push({ url: String(url), init: init ?? {} });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    ) as unknown as typeof fetch;
+
+    const consoleImpl = { error: vi.fn() };
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl,
+        fetchImpl,
+        nowImpl: () => clock,
+        instrumentDatabases: false,
+        captureLogs: false,
+        captureRuntimeWarnings: false,
+        captureHttpRequests: false,
+        captureOutboundHttp: false,
+      }),
+    );
+
+    // The boot handshake failed, so nothing is live. An error raised now used to
+    // be discarded without a trace.
+    consoleImpl.error(new Error("db timeout during the outage"));
+    await Promise.resolve();
+    expect(calls).toHaveLength(0);
+
+    // The endpoint comes back and the backoff gate opens.
+    reachable = true;
+    clock += 60_000;
+    consoleImpl.error(new Error("later failure"));
+    await vi.waitFor(() => {
+      const kinds = eventsFrom(calls).map((e) => e.k);
+      expect(kinds.filter((k) => k === AUTO_CAPTURE_ERROR_EVENT)).toHaveLength(
+        2,
+      );
+    });
+
+    // Both errors landed, including the one raised while the endpoint was dark.
+    const messages = eventsFrom(calls)
+      .filter((e) => e.k === AUTO_CAPTURE_ERROR_EVENT)
+      .map((e) => (e.d.error as { message?: string } | undefined)?.message);
+    expect(messages).toContain("db timeout during the outage");
+    expect(messages).toContain("later failure");
+  });
+
+  it("records a capture gap for evidence that could not be held", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    let clock = 1_000;
+    let reachable = false;
+    const calls: FetchCall[] = [];
+    const fetchImpl = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        if (!reachable) throw new TypeError("fetch failed");
+        calls.push({ url: String(url), init: init ?? {} });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    ) as unknown as typeof fetch;
+
+    const consoleImpl = { error: vi.fn() };
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl,
+        fetchImpl,
+        nowImpl: () => clock,
+        // One held event; everything past it must be counted, not silently lost.
+        maxPendingEvents: 1,
+        instrumentDatabases: false,
+        captureLogs: false,
+        captureRuntimeWarnings: false,
+        captureHttpRequests: false,
+        captureOutboundHttp: false,
+      }),
+    );
+
+    for (let index = 0; index < 4; index += 1) {
+      consoleImpl.error(new Error(`failure ${index}`));
+      await Promise.resolve();
+    }
+
+    reachable = true;
+    clock += 60_000;
+    consoleImpl.error(new Error("recovered"));
+
+    await vi.waitFor(() => {
+      const gap = eventsFrom(calls).find((e) => e.k === "capture_gap");
+      expect(gap).toBeDefined();
+      // The count is the point: a brief that knows three events are missing is
+      // worth far more than one that quietly is missing them.
+      expect(gap?.d.droppedEventCount).toBeGreaterThanOrEqual(1);
+      expect(gap?.d.reason).toBe("delivery_failed");
+    });
+  });
+
+  it("records that the process was terminated by a signal", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    // `kill` is what the handler uses to re-raise the signal once it has
+    // recorded; the fake records the call instead of ending the test runner.
+    const kill = vi.fn();
+    (proc as unknown as { kill: unknown }).kill = kill;
+    (proc as unknown as { pid: number }).pid = 4321;
+    const { fetchImpl, calls } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        instrumentDatabases: false,
+        captureLogs: false,
+        captureRuntimeWarnings: false,
+        captureHttpRequests: false,
+        captureOutboundHttp: false,
+      }),
+    );
+
+    proc.emit("SIGTERM" as never);
+
+    await vi.waitFor(() => {
+      const lifecycle = eventsFrom(calls).find(
+        (e) => e.k === "session.lifecycle",
+      );
+      expect(lifecycle).toBeDefined();
+      expect(lifecycle?.d.action).toBe("process-terminated");
+      expect(lifecycle?.d.reason).toBe("SIGTERM");
+      expect(lifecycle?.d.pid).toBe(4321);
+    });
+
+    // Having recorded, the handler removes itself and re-raises, so the process
+    // still dies exactly as the operator asked.
+    await vi.waitFor(() => {
+      expect(kill).toHaveBeenCalledWith(4321, "SIGTERM");
+    });
+    expect(proc.listenerCount("SIGTERM" as never)).toBe(0);
+  });
+
+  it("names the session start metadata that identifies the process", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    (proc as unknown as { pid: number }).pid = 99;
+    (proc as unknown as { uptime: () => number }).uptime = () => 12.5;
+    (proc as unknown as { version: string }).version = "v24.0.0";
+    const { fetchImpl, calls } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        instrumentDatabases: false,
+      }),
+    );
+
+    const start = calls.find((c) => c.url.endsWith("/api/session/start"));
+    const body = JSON.parse(start?.init.body as string) as {
+      metadata?: { process?: Record<string, unknown> };
+    };
+    expect(body.metadata?.process?.pid).toBe(99);
+    expect(body.metadata?.process?.uptimeMs).toBe(12_500);
+    expect(body.metadata?.process?.node).toBe("v24.0.0");
   });
 });

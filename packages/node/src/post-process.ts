@@ -600,8 +600,12 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
       const applicationFailure = summarizeApplicationFailure(event);
       failedReqs.push({
         t: event.t,
-        m: req?.m || "",
-        url: req?.url || "",
+        // The response's own identity first, the paired request only as the
+        // fallback. The pair is not guaranteed: a request that started outside
+        // the retained window leaves its failing response standing alone, and
+        // reading only the pair recorded that failure as `{m:"", url:""}`.
+        m: safeMethod(event.d.method) ?? safeMethod(event.d.m) ?? req?.m ?? "",
+        url: safeUrl(event.d.url) ?? req?.url ?? "",
         st: typeof event.d.st === "number" ? event.d.st : 0,
         ...(typeof event.d.id === "string" || typeof event.d.id === "number"
           ? { id: event.d.id }
@@ -619,8 +623,8 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
       if (st !== undefined) {
         okReqs.push({
           t: event.t,
-          m: req?.m || "",
-          url: req?.url || "",
+          m: safeMethod(event.d.method) ?? safeMethod(event.d.m) ?? req?.m ?? "",
+          url: safeUrl(event.d.url) ?? req?.url ?? "",
           st,
           beforeErrorMs: 0,
           ...(typeof event.d.id === "string" || typeof event.d.id === "number"

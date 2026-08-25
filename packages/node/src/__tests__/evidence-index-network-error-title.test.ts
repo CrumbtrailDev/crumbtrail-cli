@@ -71,6 +71,73 @@ describe("candidate titles — no leaked placeholders", () => {
     expect(candidate?.title).not.toContain("undefined");
   });
 
+  // A failing response whose `net.req` did not survive the retained window used
+  // to be indexed as `{m:"", url:""}`, and every reader downstream — the agent
+  // brief's timeline, the cloud's representative, the diagnosis — was left with
+  // "request → 500" while the backend record for the same correlated request
+  // named the endpoint outright. The response carries its own identity now; the
+  // backend record is the fallback for a session captured before it did.
+  it("names the endpoint from the backend record when the frontend request is gone", () => {
+    const index = {
+      start: 900,
+      failedReqs: [{ t: 1000, m: "", url: "", st: 500, requestId: "corr-1" }],
+    };
+
+    const candidate = buildEvidenceCandidates(
+      [
+        { t: 1000, k: "net.res", d: { id: 7, st: 500, requestId: "corr-1" } },
+        {
+          t: 995,
+          k: "backend.req.error",
+          d: {
+            requestId: "corr-1",
+            method: "GET",
+            pathname: "/api/marginary/events",
+            statusCode: 500,
+            error: { name: "Error", message: "api exploded" },
+          },
+        },
+      ],
+      index,
+    ).find((c) => c.detector === "http_error");
+
+    expect(candidate?.title).toBe("HTTP 500 from GET /api/marginary/events");
+    expect(candidate?.anchor?.method).toBe("GET");
+    expect(candidate?.anchor?.url).toBe("/api/marginary/events");
+  });
+
+  it("prefers the frontend's own URL over the backend record", () => {
+    const index = {
+      start: 900,
+      failedReqs: [
+        {
+          t: 1000,
+          m: "GET",
+          url: "https://app.example/api/orders?limit=200",
+          st: 500,
+          requestId: "corr-2",
+        },
+      ],
+    };
+
+    const candidate = buildEvidenceCandidates(
+      [
+        { t: 1000, k: "net.res", d: { id: 7, st: 500, requestId: "corr-2" } },
+        {
+          t: 995,
+          k: "backend.req.start",
+          d: { requestId: "corr-2", method: "GET", pathname: "/orders" },
+        },
+      ],
+      index,
+    ).find((c) => c.detector === "http_error");
+
+    expect(candidate?.title).toBe(
+      "HTTP 500 from GET https://app.example/api/orders",
+    );
+    expect(candidate?.anchor?.url).toContain("limit=");
+  });
+
   it("names the missing URL on a slow_request rather than printing undefined", () => {
     const candidate = buildEvidenceCandidates(
       [{ t: 1000, k: "net.res", d: { id: "no-such-request", dur: 9_000 } }],

@@ -1389,6 +1389,32 @@ describe("postProcess", async () => {
     expect(index.failedReqs[0].st).toBe(500);
   });
 
+  it("indexes a failed response whose request did not survive the window", async () => {
+    // A request that started before the retained window leaves its failing
+    // response standing alone. Reading only the paired `net.req` recorded that
+    // failure as `{m:"", url:""}` — a timeline of "request → 500" lines naming
+    // no endpoint. The response carries its own method and url now, so the pair
+    // is a convenience rather than the only source of identity.
+    const events = [
+      {
+        t: 1100,
+        k: "net.res",
+        d: { id: "r1", method: "POST", url: "/api/data", st: 500, dur: 100 },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    );
+    await postProcess(tmpDir);
+    const index = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, "index.json"), "utf-8"),
+    );
+    expect(index.failedReqs).toHaveLength(1);
+    expect(index.failedReqs[0].m).toBe("POST");
+    expect(index.failedReqs[0].url).toBe("/api/data");
+  });
+
   it("carries the shared correlation id onto failed request and network error index entries", async () => {
     // The index entry is what the analyzer anchors a frontend candidate on. With
     // only the browser-local `id` on it, that anchor named a page counter that

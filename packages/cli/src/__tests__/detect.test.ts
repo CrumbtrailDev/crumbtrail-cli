@@ -6,7 +6,9 @@ import {
   detectPackageManager,
   findNearbyProjectDirs,
   isBuildOutputPath,
+  isProcessWrapperSource,
   localFsReader,
+  nodeEntryCandidatePaths,
   parseNodeInvocation,
 } from "../detect";
 // memoryReader is test-only and deliberately absent from the public barrel.
@@ -603,6 +605,33 @@ describe("detect", () => {
     expect(r.workspaces.map((w) => w.name)).toEqual(["site"]);
   });
 
+  it("expands nested workspace patterns and applies exclusions", () => {
+    const root = tmp({
+      "package.json": JSON.stringify({ name: "root" }),
+      "pnpm-workspace.yaml": [
+        "packages:",
+        "  - 'apps/*/*'",
+        "  - 'apps/**'",
+        "  - 'packages/**'",
+        "  - '!apps/legacy'",
+      ].join("\n"),
+      "apps/team/web/package.json": JSON.stringify({ name: "@team/web" }),
+      "apps/team/docs/package.json": JSON.stringify({ name: "@team/docs" }),
+      "apps/legacy/package.json": JSON.stringify({ name: "legacy" }),
+      "packages/group/api/package.json": JSON.stringify({ name: "@group/api" }),
+      "packages/top/package.json": JSON.stringify({ name: "top" }),
+      "unlisted/package.json": JSON.stringify({ name: "unlisted" }),
+    });
+
+    const r = detect(root);
+    expect(r.workspaces.map((w) => path.relative(root, w.dir)).sort()).toEqual([
+      "apps/team/docs",
+      "apps/team/web",
+      "packages/group/api",
+      "packages/top",
+    ]);
+  });
+
   it("is ambiguous with no recipe match", () => {
     const root = tmp({ "package.json": JSON.stringify({ name: "lib" }) });
     const r = detect(root);
@@ -860,7 +889,8 @@ describe("detect", () => {
 
   it("is ambiguous when lib/main.dart is missing", () => {
     const root = tmp({
-      "pubspec.yaml": "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+      "pubspec.yaml":
+        "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
     });
     const r = detect(root);
     expect(r.recipe).toBe("flutter");
@@ -882,7 +912,8 @@ describe("detect", () => {
     // A Flutter app whose repo also carries a package.json for tooling. The app
     // that ships to a phone is the one worth wiring.
     const root = tmp({
-      "pubspec.yaml": "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+      "pubspec.yaml":
+        "name: my_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
       "lib/main.dart": "void main() {\n  runApp(const MyApp());\n}\n",
       "package.json": JSON.stringify({ devDependencies: { vite: "5.0.0" } }),
       "index.html": '<script type="module" src="/src/main.ts"></script>',
@@ -907,9 +938,9 @@ describe("no-recipe reasons name what was inspected", () => {
     const root = tmp({});
     const r = detect(root);
     expect(r.recipe).toBeNull();
-    expect(r.reasons.some((x) => x.includes(root) && x.includes("no package.json"))).toBe(
-      true,
-    );
+    expect(
+      r.reasons.some((x) => x.includes(root) && x.includes("no package.json")),
+    ).toBe(true);
     expect(r.reasons).not.toContain("no recipe matched");
   });
 
@@ -1023,7 +1054,8 @@ describe("build output is never an injection target", () => {
         main: "lib/index.js",
         dependencies: { hono: "^4.0.0" },
       }),
-      "tsconfig.json": '{\n  // generated\n  "compilerOptions": { "outDir": "lib" }\n}',
+      "tsconfig.json":
+        '{\n  // generated\n  "compilerOptions": { "outDir": "lib" }\n}',
       "lib/index.js": "// built",
     });
     expect(detect(root).entryFile).toBeNull();
@@ -1033,5 +1065,197 @@ describe("build output is never an injection target", () => {
     expect(isBuildOutputPath(root, path.join(root, "src", "index.ts"))).toBe(
       false,
     );
+  });
+});
+
+describe("a process wrapper is never an injection target", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    while (roots.length) cleanup(roots.pop()!);
+  });
+
+  // The shape found in the wild: one shared script loads env and re-execs
+  // whatever it was handed, and every service in the repo starts through it.
+  const WRAPPER = [
+    'const { spawn } = require("node:child_process");',
+    "const args = process.argv.slice(2);",
+    'const child = spawn(args[0], args.slice(1), { stdio: "inherit" });',
+    'child.on("exit", (code) => process.exit(code ?? 0));',
+  ].join("\n");
+
+  /** A monorepo with the wrapper at the root and one service under it. */
+  const monorepo = (
+    scripts: Record<string, string>,
+    extra: Record<string, unknown>,
+    serviceFiles: Record<string, string>,
+  ) => {
+    const root = makeTmpRepo({
+      "shared/scripts/with-shared-env.js": WRAPPER,
+      "services/job-server/package.json": JSON.stringify({
+        name: "job-server",
+        dependencies: { hono: "^4.0.0" },
+        scripts,
+        ...extra,
+      }),
+      ...Object.fromEntries(
+        Object.entries(serviceFiles).map(([k, v]) => [
+          `services/job-server/${k}`,
+          v,
+        ]),
+      ),
+    });
+    roots.push(root);
+    return path.join(root, "services", "job-server");
+  };
+
+  it("recognises a spawn-from-argv wrapper and not an app that shells out", () => {
+    expect(isProcessWrapperSource(WRAPPER)).toBe(true);
+    expect(
+      isProcessWrapperSource(
+        'const { execFile } = require("child_process");\nexecFile("git", ["rev-parse"], cb);\nserver.listen(3000);',
+      ),
+    ).toBe(false);
+    // cluster.fork() is not child_process at all.
+    expect(
+      isProcessWrapperSource(
+        'const cluster = require("cluster");\ncluster.fork();\nconsole.log(process.argv);',
+      ),
+    ).toBe(false);
+  });
+
+  it("follows the wrapper's argv to the entry it launches", () => {
+    const dir = monorepo(
+      {
+        dev: "node ../../shared/scripts/with-shared-env.js node src/server.js",
+      },
+      {},
+      { "src/server.js": "const { Hono } = require('hono')" },
+    );
+    const r = detect(dir);
+    expect(r.entryFile).toBe(path.join(dir, "src", "server.js"));
+    expect(r.reasons.join("\n")).toMatch(/process wrapper/);
+  });
+
+  it("wires the package's own source entry when the command names only the wrapper", () => {
+    const dir = monorepo(
+      { dev: "node ../../shared/scripts/with-shared-env.js job-server" },
+      {},
+      { "src/index.js": "const { Hono } = require('hono')" },
+    );
+    expect(detect(dir).entryFile).toBe(path.join(dir, "src", "index.js"));
+  });
+
+  it("refuses the wrapper and says so when no real entry can be found", () => {
+    const dir = monorepo(
+      { dev: "node ../../shared/scripts/with-shared-env.js job-server" },
+      { main: "../../shared/scripts/with-shared-env.js" },
+      {},
+    );
+    const r = detect(dir);
+    expect(r.entryFile).toBeNull();
+    expect(r.ambiguous).toBe(true);
+    expect(r.reasons.join("\n")).toMatch(
+      /This entry is a process wrapper: .*spawns the real command/,
+    );
+  });
+});
+
+// Defect class: a project whose framework is already known from its dependencies
+// still punted to ~90 lines of manual instructions whenever package.json named
+// no entry at all — the shape of every Docker CMD app, Procfile app, monorepo
+// child package, and Express tutorial.
+describe("a known framework resolves its conventional entry without a manifest pointer", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    while (roots.length) cleanup(roots.pop()!);
+  });
+  const tmp = (files: Record<string, string>) => {
+    const r = makeTmpRepo(files);
+    roots.push(r);
+    return r;
+  };
+
+  const APP = [
+    'const express = require("express");',
+    "const app = express();",
+    "app.listen(3000);",
+  ].join("\n");
+  const barePkg = JSON.stringify({
+    name: "api",
+    version: "1.0.0",
+    dependencies: { express: "^4.19.2" },
+  });
+
+  it("wires src/server.js when package.json has no main and no scripts", () => {
+    const root = tmp({ "package.json": barePkg, "src/server.js": APP });
+    const r = detect(root);
+    expect(r.recipe).toBe("express");
+    expect(r.entryFile).toBe(path.join(root, "src", "server.js"));
+    expect(r.ambiguous).toBe(false);
+    expect(r.reasons.join("\n")).toMatch(/package.json names no entry/);
+  });
+
+  it("wires an entry beside package.json, the Docker CMD / Procfile shape", () => {
+    const root = tmp({ "package.json": barePkg, "app.js": APP });
+    expect(detect(root).entryFile).toBe(path.join(root, "app.js"));
+  });
+
+  it("prefers src/ over the package root when both exist", () => {
+    const root = tmp({
+      "package.json": barePkg,
+      "src/index.js": APP,
+      "index.js": APP,
+    });
+    expect(detect(root).entryFile).toBe(path.join(root, "src", "index.js"));
+  });
+
+  it("does not resurrect a process wrapper the resolver refuses", () => {
+    const wrapper = [
+      'const { spawn } = require("node:child_process");',
+      "const args = process.argv.slice(2);",
+      'spawn(args[0], args.slice(1), { stdio: "inherit" });',
+    ].join("\n");
+    const root = tmp({
+      "package.json": barePkg,
+      "src/index.js": wrapper,
+      "src/server.js": APP,
+    });
+    expect(detect(root).entryFile).toBe(path.join(root, "src", "server.js"));
+  });
+
+  it("does not resurrect build output the resolver refuses", () => {
+    const root = tmp({
+      "package.json": barePkg,
+      "tsconfig.json": JSON.stringify({ compilerOptions: { outDir: "dist" } }),
+      "dist/index.js": "// built",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBe("express");
+    expect(r.entryFile).toBeNull();
+    expect(r.ambiguous).toBe(true);
+    expect(r.reasons.join("\n")).toMatch(/no index\/main\/server\/app source/);
+  });
+
+  // The guard this fallback relaxes exists to stop the bare `node` matcher
+  // claiming any package.json that happens to sit beside a src/index.js. Only a
+  // matcher that already identified the framework may fall back.
+  it("still punts when no framework dependency identified the project", () => {
+    const root = tmp({
+      "package.json": JSON.stringify({ name: "lib", version: "1.0.0" }),
+      "src/index.js": "module.exports = {};",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBeNull();
+    expect(r.entryFile).toBeNull();
+  });
+
+  // The GitHub reader hydrates exactly this list before the resolver runs, and
+  // throws on any path the resolver reads that it did not fetch.
+  it("keeps the hydration manifest in step with what the resolver reads", () => {
+    const paths = nodeEntryCandidatePaths(barePkg);
+    expect(paths).toContain("src/server.js");
+    expect(paths).toContain("server.js");
+    expect(paths).toContain("app.js");
+    expect(paths.every((p) => !p.startsWith("./"))).toBe(true);
   });
 });

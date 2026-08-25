@@ -323,6 +323,21 @@ export const RECIPE_REGISTRY: Record<Recipe, RecipeMeta> = {
     kind: "inject",
     keyRef: EXPO_KEY,
   },
+  static: {
+    stack: "vite", // no "static" Stack id — vite is the generic frontend stack
+    reportedStack: "static",
+    // Nothing to install: a page with no bundler cannot resolve a bare
+    // specifier, so the injected script tag imports the SDK as an ES module from
+    // a CDN instead. An empty list also keeps the installer from spawning a
+    // package manager in a directory that may have no package.json at all.
+    sdkPackages: [],
+    serviceName: "web",
+    kind: "inject",
+    // No keyRef: a page served as files has no build step to inline an env var
+    // and no process env to read one from, so the key goes in the tag itself.
+    // The wizard therefore mints nothing and points at the dashboard instead of
+    // writing a live credential into a file the page could commit.
+  },
   node: {
     stack: "node",
     sdkPackages: ["crumbtrail-core", "crumbtrail-node"],

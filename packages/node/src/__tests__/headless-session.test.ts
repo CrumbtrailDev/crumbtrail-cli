@@ -4,7 +4,10 @@ import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createServer } from "../server";
-import { startHeadlessSession } from "../headless-session";
+import {
+  HeadlessTimeoutError,
+  startHeadlessSession,
+} from "../headless-session";
 
 describe("startHeadlessSession", () => {
   it("starts, records, and finalizes a no-browser session through the server API", async () => {
@@ -175,3 +178,46 @@ function findSessionDir(outputDir: string, sessionId: string): string {
   }
   throw new Error(`session not found: ${sessionId}`);
 }
+
+describe("headless session request deadline", () => {
+  it("abandons a request the endpoint accepts and never answers", async () => {
+    // A fetch that never settles is the shape of a wedged load balancer or a
+    // black-holed route. Without a deadline the caller waits forever, believes
+    // the session is live, and hands it every subsequent event.
+    const fetchImpl = vi.fn(
+      (_url: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          });
+        }),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      startHeadlessSession({
+        endpoint: "http://127.0.0.1:9899",
+        sessionId: "s_timeout",
+        fetchImpl,
+        timeoutMs: 20,
+      }),
+    ).rejects.toBeInstanceOf(HeadlessTimeoutError);
+  });
+
+  it("leaves a healthy request untimed", async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    ) as unknown as typeof fetch;
+
+    const session = await startHeadlessSession({
+      endpoint: "http://127.0.0.1:9899",
+      sessionId: "s_ok",
+      fetchImpl,
+      timeoutMs: 5_000,
+    });
+    await expect(
+      session.record({ t: 1, k: "backend.uncaught", d: {} }),
+    ).resolves.toBeUndefined();
+  });
+});

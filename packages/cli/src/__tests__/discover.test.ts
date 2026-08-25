@@ -223,6 +223,33 @@ describe("discoverServices", () => {
     expect(api[0].source).toBe("workspace");
   });
 
+  it("preserves scoped package names so a short selector cannot guess", () => {
+    repo = makeTmpRepo({
+      "package.json": pkg({ name: "shop", private: true }),
+      "pnpm-workspace.yaml": "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+      "apps/web/package.json": pkg({
+        name: "@acme/web",
+        dependencies: { vite: "^5.0.0" },
+      }),
+      "apps/web/index.html":
+        '<script type="module" src="/src/main.ts"></script>',
+      "apps/web/src/main.ts": "",
+      "packages/web/package.json": pkg({
+        name: "@other/web",
+        dependencies: { vite: "^5.0.0" },
+      }),
+      "packages/web/index.html":
+        '<script type="module" src="/src/main.ts"></script>',
+      "packages/web/src/main.ts": "",
+    });
+
+    const found = discoverServices(repo, detect(repo));
+    expect(found.map((candidate) => candidate.name)).toEqual([
+      "@acme/web",
+      "@other/web",
+    ]);
+  });
+
   it("does not report the root itself as a service", () => {
     repo = makeMonorepo();
     const found = discoverServices(repo, detect(repo));
@@ -274,6 +301,42 @@ describe("looksLikeLibrary", () => {
     expect(looksLikeLibrary("express", {})).toBe(false);
     expect(looksLikeLibrary("next", {})).toBe(false);
     expect(looksLikeLibrary(null, {})).toBe(false);
+  });
+
+  it("counts a build-only dev script as a library, not a service", () => {
+    expect(looksLikeLibrary("node", { scripts: { dev: "tsc --watch" } })).toBe(
+      true,
+    );
+    expect(looksLikeLibrary("node", { scripts: { dev: "tsup --watch" } })).toBe(
+      true,
+    );
+    expect(
+      looksLikeLibrary("node", { scripts: { dev: "pnpm exec tsc -w" } }),
+    ).toBe(true);
+  });
+
+  it("clears the flag when the entry runs a process or a manifest deploys it", () => {
+    const pkg = { main: "dist/index.js" } as never;
+    expect(looksLikeLibrary("node", pkg)).toBe(true);
+    expect(
+      looksLikeLibrary("node", pkg, {
+        entrySource: "setInterval(() => tick(), 1000);",
+      }),
+    ).toBe(false);
+    expect(
+      looksLikeLibrary("node", pkg, {
+        entrySource: "server.listen(3000);",
+      }),
+    ).toBe(false);
+    expect(
+      looksLikeLibrary("node", pkg, {
+        deployManifests: '{ "deploy": { "startCommand": "node index.js" } }',
+      }),
+    ).toBe(false);
+    // A library body is still a library.
+    expect(
+      looksLikeLibrary("node", pkg, { entrySource: "export const x = 1;" }),
+    ).toBe(true);
   });
 });
 

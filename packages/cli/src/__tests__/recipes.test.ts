@@ -1331,6 +1331,63 @@ describe("buildPlan — Express middleware wiring", () => {
     expectNoKeyLiteral(content);
   });
 
+  // The wizard turns correlation on in the frontend and edits the backend entry
+  // in the same run. When the backend's CORS config lives in another file there
+  // is nothing to widen, and saying nothing left the user with an app whose
+  // every cross-origin request is blocked by a preflight. Name the headers.
+  it("names the correlation headers when the entry has no CORS middleware", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.js")]: ESM_ENTRY,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+      },
+      io,
+    );
+    const warnings = (plan.warnings ?? []).join("\n");
+    expect(warnings).toContain("No CORS middleware in this file");
+    for (const header of [
+      "x-crumbtrail-session-id",
+      "x-crumbtrail-request-id",
+      "traceparent",
+    ]) {
+      expect(warnings).toContain(header);
+    }
+  });
+
+  it("says nothing about CORS when the entry already widens its own allowlist", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("server.js")]: [
+        'import express from "express";',
+        'import cors from "cors";',
+        "const app = express();",
+        'app.use(cors({ allowedHeaders: ["Content-Type"] }));',
+        'app.get("/", (req, res) => res.send("ok"));',
+        "app.listen(3000);",
+        "",
+      ].join("\n"),
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+      },
+      io,
+    );
+    const warnings = (plan.warnings ?? []).join("\n");
+    expect(warnings).not.toContain("No CORS middleware in this file");
+    expect(warnings).toContain("Widened the CORS allowed headers");
+    expect(plan.content ?? "").toContain('"traceparent"');
+  });
+
   // Regression (Alertbase PR #544): `job-server` and `user-billing-service` both
   // register a four argument error handler that always responds, immediately
   // above `app.listen`. Anchoring on listen put Crumbtrail's handler BELOW it,
@@ -1828,5 +1885,75 @@ describe("buildPlan refuses build output as an injection target", () => {
     );
     expect(plan.targetPath).toBe(p("src", "index.ts"));
     expect(plan.warnings.join("\n")).not.toMatch(/build output/);
+  });
+});
+
+// Defect class: advice aimed at a shape the package does not have. A bare timer
+// worker cannot be preflighted, and a wizard that lectures it about CORS reads
+// as one that did not look at the code.
+describe("buildPlan — advice is gated on what the package actually is", () => {
+  const worker = "setInterval(() => drainQueue(), 5000);\n";
+
+  it("says nothing about CORS for a package that never answers HTTP", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        name: "ticker",
+        scripts: { start: "node src/worker.js" },
+      }),
+      [p("src", "worker.js")]: worker,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "worker.js"),
+        serviceName: "ticker",
+      },
+      io,
+    );
+    expect(plan.warnings.join("\n")).not.toMatch(/CORS/i);
+  });
+
+  it("still warns a backend that does answer HTTP", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({ name: "api" }),
+      [p("src", "server.js")]: 'import http from "node:http";\nhttp.createServer(handler).listen(3000);\n',
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "server.js"),
+        serviceName: "api",
+      },
+      io,
+    );
+    expect(plan.warnings.join("\n")).toMatch(/CORS/i);
+  });
+
+  it("names the deploy manifest that starts the entry it wired", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        name: "ticker",
+        scripts: { start: "node src/worker.js" },
+      }),
+      [p("railway.worker.json")]: JSON.stringify({
+        deploy: { startCommand: "node src/worker.js" },
+      }),
+      [p("src", "worker.js")]: worker,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "worker.js"),
+        serviceName: "ticker",
+      },
+      io,
+    );
+    expect(plan.warnings.join("\n")).toContain("railway.worker.json");
   });
 });

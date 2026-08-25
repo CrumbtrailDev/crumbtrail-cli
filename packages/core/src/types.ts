@@ -541,6 +541,27 @@ export interface FlagBugOptions {
   voiceBlob?: Blob;
 }
 
+/**
+ * Who asked for a report. Stamped on every `bug.flag` event so a reader can tell a
+ * person filing a bug apart from a detector capturing one, without guessing from
+ * which optional fields happen to be present.
+ */
+export type BugFlagOrigin = "user" | "auto";
+
+/**
+ * The capture path's own view of {@link FlagBugOptions}: the same caller-supplied
+ * fields plus provenance only the SDK may set. Never exported to consumers, and
+ * stripped from anything arriving through the public `flagBug`.
+ */
+export interface InternalFlagOptions extends FlagBugOptions {
+  origin?: BugFlagOrigin;
+  /**
+   * SDK-authored sentence naming the detector that fired. Emitted as `reason`, never as
+   * `note` — a note is a person's words, and only a person's words are masked.
+   */
+  autoReason?: string;
+}
+
 /** Pseudonymous identifiers that let a captured artifact join to a support ticket. */
 export interface CrumbtrailIdentity {
   accountId?: string;

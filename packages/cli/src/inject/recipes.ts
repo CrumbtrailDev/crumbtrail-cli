@@ -12,13 +12,25 @@
 
 import path from "node:path";
 import { buildAgentPrompt, buildOtlpSnippets } from "../install/index.js";
+import {
+  patternMatches,
+  workspacePatterns,
+} from "../install/workspace-package-manager.js";
 import type { Stack } from "crumbtrail-core";
+import { isBackendRecipe } from "../backend-origins";
 import { isBuildOutputPath, type Recipe } from "../detect";
 import type { FileReader } from "../readers/types";
 import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
-import { inspectIntegration, type IntegrationStatus } from "./integration";
+import {
+  inspectIntegration,
+  reachableSourceFiles,
+  type IntegrationRequirement,
+  type IntegrationStatus,
+} from "./integration";
+import { amendSource, type AmendField } from "./amend";
 import { addDockerBuildArg, DOCKERFILE_CANDIDATES } from "./docker";
 import {
+  deployManifestNaming,
   findExtraBackendEntries,
   MAX_EXTRA_ENTRIES,
   type ExtraEntry,
@@ -26,10 +38,16 @@ import {
 import { defaultInjectIO, type InjectIO } from "./io";
 import type { Plan } from "./types";
 import {
+  corsElsewhereGuidance,
+  corsImportedElsewhereNote,
   corsWideningGuidance,
   detectExpressModuleStyle,
+  findStaticMountDirs,
+  htmlReferencesCrumbtrail,
+  insertIntoHtmlHead,
   prependIntoSource,
   referencesCrumbtrail,
+  servesHttp,
   widenCorsAllowedHeaders,
   wireExpressMiddleware,
   wireFlutterMain,
@@ -50,6 +68,7 @@ import {
   nodeInitSnippet,
   nuxtPluginSnippet,
   reactNativeInitSnippet,
+  staticScriptTagSnippet,
   tauriInitSnippet,
 } from "./snippets";
 
@@ -86,6 +105,47 @@ function keyRefFor(input: BuildPlanInput): KeyRef | undefined {
 /** The code expression an injected snippet uses to read the key. */
 function keyExprFor(input: BuildPlanInput): string | undefined {
   return keyRefFor(input)?.expr;
+}
+
+/** How far up the tree the workspace root search walks before giving up. */
+const WORKSPACE_ROOT_MAX_DEPTH = 8;
+
+/**
+ * This package's directory as a workspace root addresses it, or null when the
+ * package is not a declared member of one.
+ *
+ * The injected env preload reads `.env` relative to the working directory, and
+ * in a monorepo the working directory is usually the root — `node
+ * services/gateway/src/boot/main.js` is the normal way to start one, and the
+ * only way a root Dockerfile can. Without this, that run found no env file and
+ * the SDK reported a missing key the user had already set.
+ *
+ * Membership is read from the root's own declaration (pnpm-workspace.yaml,
+ * package.json `workspaces`, lerna.json), never from a `.git` directory
+ * somewhere above: a standalone project that happens to sit inside another
+ * checkout is not a member of it, and giving it a path relative to that
+ * checkout's root would be wrong in exactly the way this fixes.
+ */
+export function packageDirFromRepoRoot(
+  cwd: string,
+  io: InjectIO,
+): string | null {
+  const target = path.resolve(cwd);
+  let dir = target;
+  for (let depth = 0; depth < WORKSPACE_ROOT_MAX_DEPTH; depth += 1) {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    const patterns = workspacePatterns(parent, { readFile: io.readFile });
+    if (patterns && patterns.length > 0) {
+      const rel = path.relative(parent, target).replace(/\\/g, "/");
+      if (rel && !rel.startsWith("..")) {
+        if (patterns.some((pattern) => patternMatches(pattern, rel)))
+          return rel;
+      }
+    }
+    dir = parent;
+  }
+  return null;
 }
 
 export interface BuildPlanOptions {
@@ -127,21 +187,42 @@ export interface BuildPlanInput {
    * had none. Absent or empty keeps the honest empty field and its comment.
    */
   backendOrigins?: readonly string[] | null;
+  /**
+   * This CLI's own release, used to pin the CDN module URL the `static` recipe
+   * emits (SDK and CLI versions move in lockstep). Only that recipe reads it;
+   * every other one imports a bare specifier its bundler resolves.
+   */
+  sdkVersion?: string | null;
+  /**
+   * Where the user mints an ingest key, named inside the emitted static script
+   * tag. The `static` recipe is the only one whose key is a literal in the file,
+   * so it is the only one that has to say where the real value comes from.
+   */
+  mintUrl?: string | null;
   options?: BuildPlanOptions;
 }
 
 // --- shared plan constructors ------------------------------------------------
 
-function skipPlan(input: BuildPlanInput, warnings: string[] = []): Plan {
+function skipPlan(
+  input: BuildPlanInput,
+  warnings: string[] = [],
+  // A caller with something more specific to say replaces the generic line
+  // rather than printing both: "one step is left" directly under "the
+  // integration is complete" leaves the reader working out which is true.
+  options: { replaceDefaultWarning?: boolean } = {},
+): Plan {
   return {
     recipe: input.recipe,
     kind: "skip-already-wired",
     targetPath: null,
     content: null,
-    warnings: [
-      ...warnings,
-      "The Crumbtrail integration is complete for this endpoint and service. Nothing to inject.",
-    ],
+    warnings: options.replaceDefaultWarning
+      ? warnings
+      : [
+          ...warnings,
+          "The Crumbtrail integration is complete for this endpoint and service. Nothing to inject.",
+        ],
   };
 }
 
@@ -150,6 +231,21 @@ function fallbackPlan(
   snippet: string,
   warnings: string[],
 ): Plan {
+  // No agent prompt for a page with no bundler: buildAgentPrompt's JS output
+  // says `npm install crumbtrail-core` and reads a bundler env var, neither of
+  // which exists here. The script tag above IS the whole instruction, and a
+  // second set of steps that contradicts it is worse than none.
+  if (input.recipe === "static") {
+    return {
+      recipe: input.recipe,
+      kind: "fallback-ai",
+      targetPath: null,
+      content: null,
+      snippet,
+      warnings,
+      keyIsSourceLiteral: true,
+    };
+  }
   return {
     recipe: input.recipe,
     kind: "fallback-ai",
@@ -167,7 +263,11 @@ function fallbackPlan(
         endpoint: input.endpoint,
         apiKey: KEY_PLACEHOLDER,
       },
-      { keyEnv: keyRefFor(input), serviceName: input.serviceName },
+      {
+        keyEnv: keyRefFor(input),
+        serviceName: input.serviceName,
+        backendOrigins: input.backendOrigins,
+      },
     ),
     warnings,
   };
@@ -201,6 +301,8 @@ function incompleteSnippet(input: BuildPlanInput): string {
       );
     case "tauri":
       return tauriInitSnippet();
+    case "static":
+      return staticBlockFor(input);
     case "express":
     case "fastify":
     case "hono":
@@ -235,15 +337,91 @@ const INTEGRATION_REQUIREMENT_COPY: Record<
   "remote-config": "remote configuration",
 };
 
+/**
+ * The concrete next action for a requirement the installer could not satisfy.
+ *
+ * Every branch here names a thing the reader can go and do. "Missing an app or
+ * service name" was true and useless: it did not say the file already declared
+ * one, did not say which variable the endpoint comes from, and left the run with
+ * no next step at all.
+ */
+function nextActionFor(
+  input: BuildPlanInput,
+  requirement: IntegrationRequirement,
+  status: IntegrationStatus,
+  amend: AmendReport | null,
+): string {
+  const blocked = amend?.blocked.find((b) => b.requirement === requirement);
+  const where = amend?.file
+    ? path.relative(input.cwd, amend.file) || amend.file
+    : "your entry file";
+  switch (requirement) {
+    case "sdk": {
+      const pkgs = RECIPE_REGISTRY[input.recipe].sdkPackages.join(", ");
+      return `Install ${pkgs} (the installer adds it for you on the next run once the entry is resolved).`;
+    }
+    case "entry":
+      return "No Crumbtrail entry point is reachable from this app's entry file — paste the snippet above into it.";
+    case "endpoint":
+      return blocked?.existingKey
+        ? `${where} already sets \`${blocked.existingKey}\`${blocked.existingValue ? ` to \`${blocked.existingValue}\`` : ""}, so it was left alone. Point that at ${input.endpoint} — if it reads an environment variable, set that variable to ${input.endpoint}.`
+        : `Set the init endpoint to ${input.endpoint} in ${where}.`;
+    case "ingest-key": {
+      const keyRef = keyRefFor(input);
+      if (!keyRef) {
+        return `${where} carries its ingest key as a literal — paste your key from the dashboard in place of ${KEY_PLACEHOLDER}.`;
+      }
+      return blocked?.existingKey
+        ? `${where} already sets \`${blocked.existingKey}\`${blocked.existingValue ? ` from \`${blocked.existingValue}\`` : ""}, so it was left alone. Make sure that resolves to your ingest key${keyRef.compileTime ? ` (supplied at build time)` : ` — normally ${keyRef.envVar} in your env file`}.`
+        : `Set ${keyRef.envVar} in your env file to the key from the dashboard.`;
+    }
+    case "service-name": {
+      // The literal at the init call itself, never a `service:` matched anywhere
+      // in the reachable graph — a backend that names a downstream `payments`
+      // service elsewhere in the same file is not the app's own name.
+      const atCallSite = /^["']([^"']+)["']$/.exec(
+        blocked?.existingValue ?? "",
+      );
+      const target = input.serviceName
+        ? `\`${input.serviceName}\``
+        : "an unnamed app";
+      if (atCallSite) {
+        return `This app already reports as \`${atCallSite[1]}\` (set in ${where}); this run targeted ${target}. Leaving your name in place — re-run and name the service \`${atCallSite[1]}\` so the dashboard and the code agree, or change \`service\` in ${where} yourself.`;
+      }
+      if (blocked?.existingKey) {
+        return `${where} already sets \`service\`${blocked.existingValue ? ` from \`${blocked.existingValue}\`` : ""}, so it was left alone. Make that resolve to ${target} — the dashboard lists this app under the name it sends.`;
+      }
+      if (status.existingServiceName) {
+        return `This app already reports as \`${status.existingServiceName}\`; this run targeted ${target}. Re-run and name the service \`${status.existingServiceName}\` so the dashboard and the code agree.`;
+      }
+      return input.serviceName
+        ? `Add \`service: ${JSON.stringify(input.serviceName)}\` to the init call in ${where}.`
+        : "Name this app in the init call so its sessions say where they came from.";
+    }
+    case "remote-config":
+      return blocked?.existingKey
+        ? `${where} already sets \`${blocked.existingKey}\` — set it to true so dashboard capture settings reach this app.`
+        : `Add \`remoteConfig: true\` to the init call in ${where} so dashboard capture settings reach it.`;
+  }
+}
+
 function incompletePlan(
   input: BuildPlanInput,
   status: IntegrationStatus,
+  amend: AmendReport | null = null,
 ): Plan {
-  const missing = status.missing
+  const unresolved = status.missing.filter(
+    (requirement) => !(amend?.added ?? []).includes(requirement),
+  );
+  const missing = unresolved
     .map((requirement) => INTEGRATION_REQUIREMENT_COPY[requirement])
     .join(", ");
   return fallbackPlan(input, incompleteSnippet(input), [
-    `Found an existing Crumbtrail integration, but it is incomplete for ${input.endpoint}. Missing ${missing}. Update that integration in place. The installer will not add another initialization.`,
+    `Found an existing Crumbtrail integration, but it is incomplete for ${input.endpoint}. Missing ${missing}. The installer will not add a second initialization beside your own.`,
+    ...unresolved.map(
+      (requirement) =>
+        `Next: ${nextActionFor(input, requirement, status, amend)}`,
+    ),
   ]);
 }
 
@@ -261,7 +439,134 @@ function existingIntegrationPlan(
     serviceName: input.serviceName,
     io,
   });
-  return status.complete ? skipPlan(input) : incompletePlan(input, status);
+  if (status.complete) return skipPlan(input);
+  return amendPlan(input, io, status) ?? incompletePlan(input, status);
+}
+
+/** What one attempted amend actually managed to do to one file. */
+interface AmendReport {
+  file: string;
+  added: IntegrationRequirement[];
+  /** The option names written, e.g. ["remoteConfig", "service"]. */
+  addedFields: string[];
+  blocked: NonNullable<ReturnType<typeof amendSource>>["blocked"];
+}
+
+/** Requirements an in-place source edit can never be the answer to. */
+const NOT_A_SOURCE_EDIT = new Set<IntegrationRequirement>(["sdk", "entry"]);
+
+/**
+ * Turn an incomplete existing integration into an edit of the customer's OWN
+ * init call, rather than a refusal.
+ *
+ * Returns null when no reachable file holds an options object this can reason
+ * about — the caller then prints the guidance it always did. When the object IS
+ * understood but every missing option is already set to something else, this
+ * returns the guidance plan too, except now each line names the exact next
+ * action instead of restating the gap.
+ *
+ * The ingest key is a value, never a literal: what gets added is the ENV
+ * EXPRESSION the recipe reads, and the key itself still goes to the env file
+ * through the normal path. A recipe with no env mechanism (angular, static)
+ * therefore has no key field to add at all.
+ */
+function amendPlan(
+  input: BuildPlanInput,
+  io: InjectIO,
+  status: IntegrationStatus,
+): Plan | null {
+  // Written in the same order the fresh snippets use, so an amended init and an
+  // injected one read identically in review.
+  const ORDER: IntegrationRequirement[] = [
+    "endpoint",
+    "ingest-key",
+    "remote-config",
+    "service-name",
+  ];
+  const wanted = ORDER.filter(
+    (r) => status.missing.includes(r) && !NOT_A_SOURCE_EDIT.has(r),
+  );
+  if (wanted.length === 0) return null;
+
+  const keyExpr = keyExprFor(input);
+  const fields: AmendField[] = [];
+  for (const requirement of wanted) {
+    if (requirement === "endpoint") {
+      fields.push({ requirement, value: JSON.stringify(input.endpoint) });
+    } else if (requirement === "ingest-key" && keyExpr) {
+      fields.push({ requirement, value: keyExpr });
+    } else if (requirement === "service-name" && input.serviceName?.trim()) {
+      const name = input.serviceName.trim();
+      fields.push({ requirement, value: (_callee, quote) => quote(name) });
+    } else if (requirement === "remote-config") {
+      fields.push({ requirement, value: "true" });
+    }
+  }
+  if (fields.length === 0) return null;
+
+  let report: AmendReport | null = null;
+  let amended: { file: string; text: string } | null = null;
+  for (const entry of reachableSourceFiles({
+    cwd: input.cwd,
+    recipe: input.recipe,
+    endpoint: input.endpoint,
+    entryFile: input.entryFile,
+    serviceName: input.serviceName,
+    io,
+  })) {
+    const outcome = amendSource(entry.text, fields);
+    if (!outcome) continue;
+    const candidate: AmendReport = {
+      file: entry.file,
+      added: outcome.added,
+      addedFields: outcome.addedFields,
+      blocked: outcome.blocked,
+    };
+    // The first file that can actually take an option wins. A file that only
+    // reports what is already set is kept as the explanation of last resort.
+    if (outcome.added.length > 0 && outcome.text) {
+      report = candidate;
+      amended = { file: entry.file, text: outcome.text };
+      break;
+    }
+    report ??= candidate;
+  }
+  if (!report) return null;
+  if (!amended) return incompletePlan(input, status, report);
+
+  const stillMissing = status.missing.filter((r) => !report.added.includes(r));
+  const rel = path.relative(input.cwd, amended.file) || amended.file;
+  const added = report.added
+    .map((r) => INTEGRATION_REQUIREMENT_COPY[r])
+    .join(", ");
+  const warnings = [
+    `Your own Crumbtrail initialization in ${rel} was missing ${added} — added ${report.addedFields.map((f) => `\`${f}\``).join(", ")} to it instead of starting a second one. Nothing else in that file changed.`,
+    ...stillMissing
+      .filter((r) => !NOT_A_SOURCE_EDIT.has(r))
+      .map((r) => `Next: ${nextActionFor(input, r, status, report)}`),
+  ];
+  const amendedFields = report.addedFields;
+
+  const git = io.gitStatus(input.cwd, amended.file);
+  if (git.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: amended.file,
+      content: amended.text,
+      applyMode: "rewrite",
+      amendedFields,
+      warnings,
+    };
+  }
+  return {
+    recipe: input.recipe,
+    kind: "amend-init",
+    targetPath: amended.file,
+    content: amended.text,
+    amendedFields,
+    warnings,
+  };
 }
 
 function createPlan(
@@ -306,11 +611,13 @@ function prependWithPreflight(
   // widening that list, wires an app the browser will refuse to talk to the
   // moment correlation is on. So the widening rides along with this edit.
   const cors = widenCorsAllowedHeaders(existing);
-  const corsWarnings = [
-    ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
-    ...(cors.needsManual ? [corsWideningGuidance()] : []),
+  const allWarnings = [
+    ...warnings,
+    ...corsWarnings(cors, input.recipe, {
+      entrySource: existing,
+      packageJson: io.readFile(path.join(input.cwd, "package.json")),
+    }),
   ];
-  const allWarnings = [...warnings, ...corsWarnings];
 
   const status = io.gitStatus(input.cwd, target);
   if (status.dirty && !input.options?.force) {
@@ -350,6 +657,49 @@ function prependWithPreflight(
  */
 const CORS_WIDENED_WARNING =
   "Widened the CORS allowed headers to admit x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent. Without this the browser blocks every cross origin request once correlation is on.";
+
+/**
+ * What this edit did — or could not do — about the file's CORS allowlist.
+ *
+ * The "could not do" cases matter as much as the rewrite: a computed header
+ * list, or a CORS config that lives in a different file, both end with the
+ * browser blocking the app's own requests, and the wizard is the only thing in
+ * the room that knows correlation was just switched on. Backend recipes only:
+ * a frontend entry has no CORS config to speak of, and the note would be noise.
+ *
+ * And backend processes that answer HTTP only. A queue consumer or a bare
+ * `setInterval` worker has no preflight to block, so the guidance is fifteen
+ * lines about a thing that cannot happen to it.
+ */
+function corsWarnings(
+  cors: {
+    changed: boolean;
+    needsManual: boolean;
+    found: boolean;
+    importsCorsElsewhere?: boolean;
+  },
+  recipe: Recipe,
+  served?: { entrySource?: string | null; packageJson?: string | null },
+): string[] {
+  if (!cors.found) {
+    if (!isBackendRecipe(recipe)) return [];
+    // Only withhold when we actually looked: a caller that passes no source
+    // keeps the previous behaviour rather than going silent on evidence it
+    // never had.
+    if (served && !servesHttp(served.entrySource, served.packageJson))
+      return [];
+    // "No CORS middleware in this file" is a claim about code the wizard read.
+    // When the file imports one from a module it did not read, that claim is
+    // false and the framework snippets under it are noise.
+    return cors.importsCorsElsewhere
+      ? [corsImportedElsewhereNote()]
+      : [corsElsewhereGuidance()];
+  }
+  return [
+    ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
+    ...(cors.needsManual ? [corsWideningGuidance()] : []),
+  ];
+}
 
 // --- idempotency (project-level) --------------------------------------------
 
@@ -652,8 +1002,14 @@ function planVite(input: BuildPlanInput, io: InjectIO): Plan {
  * request/error middleware pair) the same self-contained `autoCapture` block (the only
  * prepend-safe server snippet — no `app` handle is available at the top of a
  * file). The block reads the key from process.env.CRUMBTRAIL_KEY, which the user
- * sets themselves (hands-off — the installer writes no key). Framework-specific
- * middleware wiring is left to `buildAgentPrompt`, which reads the registry stack.
+ * sets themselves (hands-off — the installer writes no key).
+ *
+ * This one block is enough for frontend to backend correlation on all four:
+ * `autoCapture` hooks `http.Server`, which is what every Node framework's
+ * listener ends up being, so a request carrying the browser's session and
+ * request ids is recorded whichever of them served it. That is deliberate —
+ * these recipes are byte-identical because there is nothing framework-specific
+ * left to wire, not because a middleware is missing.
  *
  * The one snippet divergence is Nest: its scaffold ships a `.prettierrc` with
  * `singleQuote: true`, so it gets the single-quoted `nestInitSnippet` to avoid
@@ -676,21 +1032,34 @@ function planNode(input: BuildPlanInput, io: InjectIO): Plan {
       : nodeInitSnippet(input.endpoint, keyExpr, input.serviceName);
   // Preload first: the init below reads the key, and on a laptop the key is in
   // .env and nothing has loaded it yet.
-  const block = `${envPreloadSnippet(keyRef.envVar, quote)}\n\n${init}`;
+  const block = `${envPreloadSnippet(keyRef.envVar, quote, packageDirFromRepoRoot(input.cwd, io))}\n\n${init}`;
 
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the Node server entry — wire it manually.",
     ]);
   }
-  return prependWithPreflight(input, io, input.entryFile, block);
+  const manifest = deployManifestNaming(input.cwd, io, input.entryFile);
+  return prependWithPreflight(
+    input,
+    io,
+    input.entryFile,
+    block,
+    manifest
+      ? [
+          `${path.relative(input.cwd, input.entryFile)} is the entry ${manifest} starts, so that is the process this wiring covers.`,
+        ]
+      : [],
+  );
 }
 
 /**
  * Express. Injects the same autoCapture block as the other backend-JS recipes,
- * AND wires the request + error middleware so backends emit backend.req.* spans
- * (autoCapture alone captures crashes and console.error only — with no request
- * middleware, frontend to backend linkage stays empty forever).
+ * AND wires the request + error middleware. autoCapture's `node:http` hook
+ * already records inbound requests on every framework, so linkage no longer
+ * depends on this wiring; the middleware is what adds the matched route and the
+ * error the handler threw, and it claims the request so the http hook stays
+ * silent rather than reporting it twice.
  *
  * When the entry matches the common shape (an `express` import, a
  * `const app = express()` line, an `app.listen(...)` line), the file is
@@ -705,6 +1074,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   const keyRef = keyRefFor(input)!;
   const keyExpr = keyRef.expr;
   const keyEnvVar = keyRef.envVar;
+  const packageRel = packageDirFromRepoRoot(input.cwd, io);
   const block = nodeInitSnippet(endpoint, keyExpr, input.serviceName);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -733,7 +1103,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   if (wired == null) {
     // Anchors not found: prepend autoCapture plus a TODO block with exact copy
     // and paste instructions, and surface the same guidance in wizard output.
-    const combined = `${envPreloadSnippet(keyEnvVar)}\n\n${block}\n\n${expressManualWiringSnippet(endpoint, keyExpr)}`;
+    const combined = `${envPreloadSnippet(keyEnvVar, JSON.stringify, packageRel)}\n\n${block}\n\n${expressManualWiringSnippet(endpoint, keyExpr)}`;
     return prependWithPreflight(input, io, target, combined, [
       "Express request middleware was NOT wired automatically (no `const app = express()` / `app.listen(...)` anchors found). Follow the TODO block added at the top of the entry: register createCrumbtrailExpressMiddleware before your routes and createCrumbtrailExpressErrorMiddleware after them, or backend request spans stay empty.",
     ]);
@@ -744,11 +1114,10 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   const cors = widenCorsAllowedHeaders(wired.text);
   const content = prependIntoSource(
     cors.text,
-    `${envPreloadSnippet(keyEnvVar)}\n\n${block}\n\n${expressMiddlewareImportSnippet(style!)}`,
+    `${envPreloadSnippet(keyEnvVar, JSON.stringify, packageRel)}\n\n${block}\n\n${expressMiddlewareImportSnippet(style!)}`,
   );
   const warnings = [
-    ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
-    ...(cors.needsManual ? [corsWideningGuidance()] : []),
+    ...corsWarnings(cors, input.recipe),
     wired.errorAnchor === "existing-error-handler"
       ? "Wired Express request middleware (before routes) and error middleware above the app's existing error handler, so it is reached before that handler ends the response."
       : "Wired Express request middleware (before routes) and error middleware (after routes) for backend request capture.",
@@ -834,6 +1203,175 @@ function planAngular(input: BuildPlanInput, _io: InjectIO): Plan {
   return fallbackPlan(input, block, [
     "Angular has no browser-safe env-var mechanism — add `crumbtrailKey: '<your-ingest-key>'` to src/environments/environment.ts (get your key from the dashboard), import `environment`, and prepend the snippet above bootstrapApplication in src/main.ts.",
   ]);
+}
+
+/**
+ * The script block a page with no bundler gets, filled for this run.
+ * Shared by the `static` recipe and by the Express pass that wires the frontend
+ * an API serves out of `express.static`, so both pages get identical wiring.
+ */
+function staticBlockFor(input: BuildPlanInput): string {
+  return staticScriptTagSnippet({
+    endpoint: input.endpoint,
+    keyLiteral: KEY_PLACEHOLDER,
+    serviceName: input.serviceName,
+    backendOrigins: input.backendOrigins,
+    sdkVersion: input.sdkVersion,
+    mintUrl: input.mintUrl,
+  });
+}
+
+/**
+ * A frontend with no framework and no bundler: a hand-written index.html, or a
+ * page served as files.
+ *
+ * The whole point of this recipe is that it ends somewhere. Before it existed
+ * this project matched nothing, and the wizard exited 1 on "No supported
+ * framework" — which is how a user with half an app in the browser concluded
+ * Crumbtrail had no browser capture at all. There IS a correct wiring for this
+ * page; it is a script tag, so that is what gets written.
+ *
+ * The key is a placeholder in the file rather than a live credential: a page
+ * served as files has no env mechanism, and minting a real key into a file the
+ * user is about to commit is the one outcome worse than an unfinished TODO.
+ */
+function planStatic(input: BuildPlanInput, io: InjectIO): Plan {
+  const block = staticBlockFor(input);
+  if (!input.entryFile) {
+    return fallbackPlan(input, block, [
+      "No HTML file to wire here (the page found was build output, or there is none). Paste the script tag below into the <head> of the page's SOURCE, so the next build keeps it.",
+    ]);
+  }
+  const target = input.entryFile;
+  const html = io.readFile(target);
+  if (html == null) {
+    return fallbackPlan(input, block, [
+      `Could not read ${target}; paste the script tag below into its <head>.`,
+    ]);
+  }
+  if (htmlReferencesCrumbtrail(html)) {
+    return skipPlan(input, [
+      `${path.relative(input.cwd, target) || target} already references Crumbtrail — left as it is.`,
+    ]);
+  }
+  const wired = insertIntoHtmlHead(html, block);
+  if (wired == null) {
+    return fallbackPlan(input, block, [
+      `${path.relative(input.cwd, target) || target} has no <head> or <body> to insert into; paste the script tag below into the page yourself.`,
+    ]);
+  }
+  const warnings = [
+    `The ingest key goes in the tag as a literal: a page with no bundler has no env var to read. Replace ${KEY_PLACEHOLDER} in ${path.relative(input.cwd, target) || target} before deploying.`,
+  ];
+  const status = io.gitStatus(input.cwd, target);
+  if (status.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: target,
+      content: wired,
+      applyMode: "rewrite",
+      keyIsSourceLiteral: true,
+      warnings: [
+        ...warnings,
+        `${target} has uncommitted changes — confirm (or re-run with force) before editing it.`,
+      ],
+    };
+  }
+  return {
+    recipe: input.recipe,
+    kind: "rewrite",
+    targetPath: target,
+    content: wired,
+    warnings,
+    keyIsSourceLiteral: true,
+  };
+}
+
+/**
+ * The frontend an Express app serves out of `express.static`.
+ *
+ * Detection stops at the backend dependency, so this app used to be wired for
+ * its API and left completely dark in the browser — with nothing printed saying
+ * a frontend had been seen and skipped. The served directory is read off the
+ * entry itself, and the page in it is wired with the same script tag a
+ * standalone static site gets.
+ *
+ * A page under build output is NOT edited: the next build erases it. That case
+ * gets a named next action instead — wire the source app that produces it.
+ */
+function planServedStaticFrontend(
+  input: BuildPlanInput,
+  io: InjectIO,
+  entrySource: string,
+): { edits: NonNullable<Plan["extraEdits"]>; warnings: string[] } {
+  const edits: NonNullable<Plan["extraEdits"]> = [];
+  const warnings: string[] = [];
+  const entryDir = path.dirname(input.entryFile ?? path.join(input.cwd, "x"));
+  const reader: FileReader = {
+    readFile: (p) => io.readFile(p),
+    isFile: (p) => io.exists(p),
+    isDir: (p) => io.exists(p),
+    readDir: () => [],
+    root: input.cwd,
+  };
+  for (const dir of findStaticMountDirs(entrySource)) {
+    const candidates = [
+      path.resolve(entryDir, dir),
+      path.resolve(input.cwd, dir),
+    ];
+    const indexPath = candidates
+      .map((base) => path.join(base, "index.html"))
+      .find((file) => io.readFile(file) !== null);
+    const shown = dir.replace(/^\.\//, "");
+    if (!indexPath) {
+      warnings.push(
+        `This server serves static files from ${shown}, but there is no index.html in it to wire, so the browser half of this app is not captured yet. Wire the app that produces those files (\`cd <that app> && npx crumbtrail\`).`,
+      );
+      continue;
+    }
+    if (isBuildOutputPath(input.cwd, indexPath, reader)) {
+      warnings.push(
+        `This server serves a built frontend from ${shown}. Crumbtrail did not edit it — the next build would erase the change. Wire that frontend's SOURCE instead (\`cd <frontend app> && npx crumbtrail\`), and it will be captured from the next build on.`,
+      );
+      continue;
+    }
+    const html = io.readFile(indexPath)!;
+    if (htmlReferencesCrumbtrail(html)) continue;
+    const wired = insertIntoHtmlHead(
+      html,
+      staticScriptTagSnippet({
+        endpoint: input.endpoint,
+        keyLiteral: KEY_PLACEHOLDER,
+        // The SAME service as the server, deliberately. This page is served by
+        // that process, from that origin — it is the browser half of one
+        // deployed app, not a second one. Inventing a `-web` name here would
+        // file every browser session under a service the wizard never
+        // provisioned, which is a label nothing in the dashboard can show.
+        serviceName: input.serviceName,
+        backendOrigins: input.backendOrigins,
+        sdkVersion: input.sdkVersion,
+        mintUrl: input.mintUrl,
+      }),
+    );
+    if (wired == null) {
+      warnings.push(
+        `${path.relative(input.cwd, indexPath) || indexPath} is served to browsers but has no <head> or <body> to insert into, so it was left alone.`,
+      );
+      continue;
+    }
+    const rel = path.relative(input.cwd, indexPath) || indexPath;
+    edits.push({
+      path: indexPath,
+      mode: "update",
+      content: wired,
+      label: `wired the static frontend served from ${shown}`,
+    });
+    warnings.push(
+      `Wired browser capture into ${rel}, the page this server serves. Replace ${KEY_PLACEHOLDER} in it with your ingest key — a page with no bundler has no env var to read.`,
+    );
+  }
+  return { edits, warnings };
 }
 
 /**
@@ -1190,8 +1728,9 @@ function planExtraBackendEntries(
   const warnings: string[] = [];
   const keyRef = keyRefFor(input);
   if (!keyRef) return { edits, warnings };
+  const packageRel = packageDirFromRepoRoot(input.cwd, io);
 
-  const { entries, truncated } = findExtraBackendEntries(
+  const { entries, unwired } = findExtraBackendEntries(
     input.cwd,
     io,
     input.entryFile,
@@ -1211,7 +1750,7 @@ function planExtraBackendEntries(
     }
 
     const service = serviceNameForExtra(input.serviceName, entry);
-    const block = `${envPreloadSnippet(keyRef.envVar)}\n\n${nodeInitSnippet(input.endpoint, keyRef.expr, service)}`;
+    const block = `${envPreloadSnippet(keyRef.envVar, JSON.stringify, packageRel)}\n\n${nodeInitSnippet(input.endpoint, keyRef.expr, service)}`;
     edits.push({
       path: entry.path,
       mode: "update",
@@ -1220,9 +1759,18 @@ function planExtraBackendEntries(
     });
   }
 
-  if (truncated > 0) {
+  if (unwired.length > 0) {
+    // Named, not counted. A count tells the user a hole exists without telling
+    // them where it is, so the only way to close it was to re-derive the whole
+    // scan by hand.
+    const named = unwired
+      .map(
+        (entry) =>
+          `${path.relative(input.cwd, entry.path)} (npm run ${entry.script})`,
+      )
+      .join(", ");
     warnings.push(
-      `This package starts more than ${MAX_EXTRA_ENTRIES} other processes; ${truncated} were left unwired. Wire the rest by copying the block from one that was.`,
+      `This package starts more than ${MAX_EXTRA_ENTRIES} other processes, so ${unwired.length === 1 ? "this one was" : "these were"} left unwired: ${named}. Wire ${unwired.length === 1 ? "it" : "them"} by copying the block from one that was.`,
     );
   }
   return { edits, warnings };
@@ -1310,10 +1858,15 @@ export function buildPlan(
   const plan = dispatchPlan(input, io);
   if (refused.warning) plan.warnings = [refused.warning, ...plan.warnings];
   // Stamp the env var the injected code reads its key from, so the wizard can
-  // print "set <VAR> in .env — get your key from the dashboard". Undefined for
-  // recipes that inject no key (tauri / otlp / angular) or when already wired.
+  // print "set <VAR> in .env — get your key from the dashboard". Undefined only
+  // for recipes that inject no key (tauri / otlp / angular).
+  //
+  // An already-wired project needs this MORE, not less: the code on disk still
+  // reads that variable. Withholding it made a re-run report the key as
+  // missing and unnamed ("Set your ingest key"), even though the env file next
+  // to the wiring already held it under a name the wizard knew.
   const keyRef = keyRefFor(input);
-  if (keyRef && plan.kind !== "skip-already-wired") {
+  if (keyRef) {
     plan.keyEnvVar = keyRef.envVar;
     if (keyRef.compileTime) plan.keyIsCompileTime = true;
   }
@@ -1331,6 +1884,28 @@ export function buildPlan(
     }
     plan.warnings = [...plan.warnings, ...extra.warnings];
   }
+
+  // A backend that serves its own frontend is TWO halves of one app, and only
+  // one of them is answered by the recipe. This pass wires the other half — the
+  // page served out of `express.static` — or says why it could not, so the
+  // browser side is never silently dark.
+  if (
+    isBackendRecipe(input.recipe) &&
+    plan.kind !== "otlp-guidance" &&
+    input.entryFile
+  ) {
+    const entrySource = io.readFile(input.entryFile);
+    if (entrySource) {
+      const served = planServedStaticFrontend(input, io, entrySource);
+      if (served.edits.length > 0) {
+        plan.extraEdits = [...(plan.extraEdits ?? []), ...served.edits];
+        // The page this server serves now carries a placeholder key, so the run
+        // is not finished even when the server's own env key was written.
+        plan.keyIsSourceLiteral = true;
+      }
+      plan.warnings = [...plan.warnings, ...served.warnings];
+    }
+  }
   return plan;
 }
 
@@ -1347,7 +1922,33 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
     io,
   });
   if (integration.complete) return skipPlan(input);
-  if (integration.found) return incompletePlan(input, integration);
+  // A wired static page whose ONLY gap is the key placeholder is not a broken
+  // integration — it is a finished edit with one step left that only the user
+  // can do. Handing back the whole snippet again told them to paste code their
+  // page already carries, and named an env var this recipe does not use.
+  if (
+    integration.found &&
+    input.recipe === "static" &&
+    integration.missing.every((piece) => piece === "ingest-key")
+  ) {
+    const plan = skipPlan(
+      input,
+      [
+        `This page is already wired. One step is left, and only you can do it: replace ${KEY_PLACEHOLDER} in ${input.entryFile ? path.relative(input.cwd, input.entryFile) || input.entryFile : "the page"} with your ingest key${input.mintUrl ? ` from ${input.mintUrl}` : ""}.`,
+      ],
+      { replaceDefaultWarning: true },
+    );
+    plan.keyIsSourceLiteral = true;
+    return plan;
+  }
+  // An incomplete integration the customer already wrote is a thing to FINISH,
+  // not a thing to refuse. Only when its init call cannot be parsed and extended
+  // with confidence does this fall back to the printed guidance.
+  if (integration.found) {
+    return (
+      amendPlan(input, io, integration) ?? incompletePlan(input, integration)
+    );
+  }
   switch (input.recipe) {
     case "tauri":
       return planTauri(input, io);
@@ -1371,6 +1972,10 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
       return planAngular(input, io);
     case "vite-spa":
       return planVite(input, io);
+    case "static":
+      // A page with no bundler: the HTML itself is the entry, wired with a
+      // script tag rather than an import.
+      return planStatic(input, io);
     case "express":
       // Express additionally wires the request/error middleware pair so the
       // backend emits backend.req.* spans, not just crash capture.

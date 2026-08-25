@@ -4,6 +4,8 @@
 // `import.meta.env.VITE_CRUMBTRAIL_KEY`) and the wizard tells the user to set it
 // from the dashboard. This keeps the live credential out of committed source.
 
+import { SDK_VERSION_FLOORS } from "../recipe-registry";
+
 /**
  * Single-quoted string literal in Prettier's `singleQuote: true` style: wraps the
  * value in single quotes, escaping backslashes and single quotes. Used by the
@@ -158,16 +160,19 @@ export function nuxtPluginSnippet(
 
 /**
  * Node server init. Uses crumbtrail-node's `autoCapture`, which installs
- * best-effort backend crash + console.error capture (uncaught exceptions,
- * unhandled rejections, console.error) around a headless ingest session. It is
- * dynamically imported so the block is valid whether the entry file is ESM,
- * CommonJS, or TypeScript, and it is a plain expression (no top-level await) so
- * it is safe to prepend at the very top of an entry file. The ingest key is read
- * from `keyExpr` (never inlined server-side) — one variable for the whole
- * project, with `service` naming which app in it this is. Express apps can
- * additionally add
- * `createCrumbtrailExpressMiddleware` for per-request capture (see
- * crumbtrail-node's README).
+ * best-effort backend crash, console and structured log capture (uncaught
+ * exceptions, unhandled rejections, console.error, and pino/winston/bunyan
+ * lines at warn and above) around a headless ingest session — AND inbound
+ * request capture, which hooks `http.Server` rather than any one framework, so
+ * hono, fastify, nest and a hand-written server all record the requests the
+ * browser correlated without another line of app code. It is dynamically
+ * imported so the block is valid whether the entry file is ESM, CommonJS, or
+ * TypeScript, and it is a plain expression (no top-level await) so it is safe to
+ * prepend at the very top of an entry file. The ingest key is read from
+ * `keyExpr` (never inlined server-side) — one variable for the whole project,
+ * with `service` naming which app in it this is. Express apps additionally get
+ * `createCrumbtrailExpressMiddleware`, which claims the request so it is
+ * recorded once, with its matched route.
  */
 export function nodeInitSnippet(
   endpoint: string,
@@ -175,10 +180,14 @@ export function nodeInitSnippet(
   serviceName?: string | null,
 ): string {
   return [
-    "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections, and",
-    "// console.error, and instruments whichever SQL driver this app already uses",
+    "// Crumbtrail — records every inbound HTTP request that arrives carrying the",
+    "// browser's correlation headers, so frontend sessions join the backend calls",
+    "// they made. Also auto-captures uncaught exceptions, unhandled rejections,",
+    "// console.error and the warnings and errors your logger writes (pino,",
+    "// winston, bunyan), and instruments whichever SQL driver this app already uses",
     "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
-    "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
+    "// Pass { captureHttpRequests: false } to leave node:http untouched, or",
+    "// { instrumentDatabases: false } to leave drivers untouched. Key is read",
     `// from ${keyExpr} — set it in your .env (get your key from the`,
     "// Crumbtrail dashboard).",
     'import("crumbtrail-node")',
@@ -216,19 +225,39 @@ export function nodeInitSnippet(
  *
  * `quote` matches the surrounding scaffold's Prettier config — Nest ships
  * `singleQuote: true`, everything else takes Prettier's double-quote default.
+ *
+ * `packageRelPath` is this package's directory relative to the repository root,
+ * resolved when the block is written. A bare `.env` is read relative to the
+ * working directory, so in a monorepo it only ever finds the file when the
+ * process was started from inside the package. Starting it from the root —
+ * `node services/gateway/src/boot/main.js`, which is also what a root Dockerfile
+ * does — found nothing, and the user was told their key was missing when they
+ * had set it. Listing `services/gateway/.env` alongside `.env` makes both ways
+ * of starting the same process load the same file.
  */
 export function envPreloadSnippet(
   keyEnvVar: string,
   quote: (value: string) => string = JSON.stringify,
+  packageRelPath?: string | null,
 ): string {
+  const scoped = normalizeEnvPackageRelPath(packageRelPath);
+  const candidates = [".env", ".env.local"];
+  if (scoped) candidates.push(`${scoped}/.env`, `${scoped}/.env.local`);
   return [
     `// Crumbtrail — load the env file so ${keyEnvVar} is set before anything`,
     "// below reads it (capture init and, on Express, the middleware options are",
     "// both built as this file is evaluated). Try .env first because that is",
     "// where the installer puts a server key; .env.local remains a fallback for",
     "// an existing setup.",
+    ...(scoped
+      ? [
+          `// The ${scoped}/ entries are the same two files addressed from the`,
+          "// repository root, so starting this process from the root loads them",
+          "// too.",
+        ]
+      : []),
     `if (!process.env.${keyEnvVar}) {`,
-    `  for (const envFile of [${quote(".env")}, ${quote(".env.local")}]) {`,
+    `  for (const envFile of [${candidates.map((c) => quote(c)).join(", ")}]) {`,
     "    try {",
     `      const loadEnvFile = Reflect.get(process, ${quote("loadEnvFile")});`,
     `      if (typeof loadEnvFile === ${quote("function")}) loadEnvFile.call(process, envFile);`,
@@ -240,6 +269,29 @@ export function envPreloadSnippet(
     "  }",
     "}",
   ].join("\n");
+}
+
+/**
+ * The package directory as it is addressed from the repository root: forward
+ * slashes, no leading or trailing separator, and nothing that escapes the root.
+ *
+ * Returns null for the single package case (the package IS the root), where the
+ * bare `.env` already is the right and only path.
+ */
+function normalizeEnvPackageRelPath(
+  packageRelPath: string | null | undefined,
+): string | null {
+  if (!packageRelPath) return null;
+  const slashed = packageRelPath
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^\/+|\/+$/g, "");
+  if (!slashed || slashed === ".") return null;
+  // An entry above the root is not something this snippet can address from the
+  // root, and a path with a quote or newline in it has no business being
+  // emitted into source at all.
+  if (slashed.startsWith("..") || /["'\n\r]/.test(slashed)) return null;
+  return slashed;
 }
 
 /**
@@ -319,10 +371,14 @@ export function nestInitSnippet(
   serviceName?: string | null,
 ): string {
   return [
-    "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections, and",
-    "// console.error, and instruments whichever SQL driver this app already uses",
+    "// Crumbtrail — records every inbound HTTP request that arrives carrying the",
+    "// browser's correlation headers, so frontend sessions join the backend calls",
+    "// they made. Also auto-captures uncaught exceptions, unhandled rejections,",
+    "// console.error and the warnings and errors your logger writes (pino,",
+    "// winston, bunyan), and instruments whichever SQL driver this app already uses",
     "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
-    "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
+    "// Pass { captureHttpRequests: false } to leave node:http untouched, or",
+    "// { instrumentDatabases: false } to leave drivers untouched. Key is read",
     `// from ${keyExpr} — set it in your .env (get your key from the`,
     "// Crumbtrail dashboard).",
     "import('crumbtrail-node')",
@@ -488,5 +544,70 @@ export function tauriInitSnippet(): string {
     'import { TauriTransport } from "crumbtrail-core/tauri";',
     "",
     "Crumbtrail.init({ ...PRESET_PASSIVE, transportInstance: new TauriTransport() });",
+  ].join("\n");
+}
+
+/**
+ * Where a page with no bundler gets the SDK from.
+ *
+ * A bare `import "crumbtrail-core"` does not resolve in a browser, and a static
+ * page has no build step to rewrite it, so the one honest answer is a URL. The
+ * version is pinned rather than floating: an unpinned CDN URL hands every page
+ * whatever ships next, and nothing in the page says which SDK it is running.
+ *
+ * `version` is this CLI's own release, which moves in lockstep with the SDKs.
+ * A prerelease (or anything that is not an exact release) falls back to the
+ * published capability floor, so the emitted URL is always a version that exists
+ * on the registry.
+ */
+export function browserModuleUrl(version?: string | null): string {
+  // `0.0.0` is what an unreadable package.json yields, not a release anyone can
+  // fetch — treating it as one would emit a URL that 404s in the user's browser.
+  const trimmed = version?.trim();
+  const pinned =
+    trimmed && trimmed !== "0.0.0" && /^\d+\.\d+\.\d+$/.test(trimmed)
+      ? trimmed
+      : SDK_VERSION_FLOORS["crumbtrail-core"];
+  return `https://esm.sh/crumbtrail-core@${pinned}`;
+}
+
+/**
+ * Browser capture for a page with no framework and no bundler: one
+ * `<script type="module">` block, dropped into the HTML itself.
+ *
+ * This is the ONE snippet that carries the key as a literal. Every other client
+ * recipe reads a public env var that its bundler inlines at build time; a page
+ * served as files has neither, so there is no variable to read and no build to
+ * read it. The value emitted is a placeholder, never a live key — the wizard
+ * mints nothing for this recipe and points at the dashboard instead, so what
+ * lands in the file is a TODO rather than a credential.
+ */
+export function staticScriptTagSnippet(options: {
+  endpoint: string;
+  keyLiteral: string;
+  serviceName?: string | null;
+  backendOrigins?: readonly string[] | null;
+  sdkVersion?: string | null;
+  mintUrl?: string | null;
+}): string {
+  const { endpoint, keyLiteral, serviceName, backendOrigins } = options;
+  const mint = options.mintUrl
+    ? ` Get one at ${options.mintUrl}.`
+    : " Get one from your Crumbtrail dashboard.";
+  return [
+    "<!-- Crumbtrail — browser capture (console, network, DOM, errors). -->",
+    `<!-- Replace ${keyLiteral} with your ingest key.${mint} -->`,
+    '<script type="module">',
+    `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(options.sdkVersion))};`,
+    "",
+    "  Crumbtrail.init({",
+    "    ...PRESET_PASSIVE,",
+    `    httpEndpoint: ${JSON.stringify(endpoint)},`,
+    `    httpAuthToken: ${JSON.stringify(keyLiteral)},`,
+    remoteConfigLine("    "),
+    ...correlationOriginsLines(backendOrigins, "    ", JSON.stringify),
+    ...serviceLines(serviceName, "    ", JSON.stringify),
+    "  });",
+    "</script>",
   ].join("\n");
 }

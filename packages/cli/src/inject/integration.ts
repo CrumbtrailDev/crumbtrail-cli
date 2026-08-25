@@ -29,6 +29,18 @@ export interface IntegrationStatus {
   found: boolean;
   /** The concrete pieces that keep an existing integration from being complete. */
   missing: IntegrationRequirement[];
+  /**
+   * The app name the reachable source ALREADY declares, when it declares one
+   * that is not the name this run targets.
+   *
+   * `service-name` in `missing` means "this run's name is not in the source",
+   * which covers two very different situations: an integration that names no app
+   * at all (a field the installer can add), and one that names a different app
+   * (a value only the user may change). Without this the caller cannot tell them
+   * apart, and it reported "missing an app or service name" over a file whose
+   * next line said `service: "asiniq-admin"`.
+   */
+  existingServiceName?: string;
 }
 
 export const SOURCE_EXTENSIONS = [
@@ -52,7 +64,8 @@ const CRUMBTRAIL_REFERENCE =
   /crumbtrail-core|crumbtrail-node|crumbtrail-react-native|crumbtrail-capacitor|crumbtrail_flutter/;
 export const LOCAL_IMPORT =
   /(?:from\s+|import\s*\(|import\s+|require\s*\()\s*["']([^"']+)["']/g;
-const ENDPOINT_ENV = /\b[A-Z][A-Z0-9_]*CRUMBTRAIL[A-Z0-9_]*ENDPOINT[A-Z0-9_]*\b/g;
+const ENDPOINT_ENV =
+  /\b[A-Z][A-Z0-9_]*CRUMBTRAIL[A-Z0-9_]*ENDPOINT[A-Z0-9_]*\b/g;
 
 function sourceModulePath(
   io: InjectIO,
@@ -66,7 +79,9 @@ function sourceModulePath(
     ...SOURCE_EXTENSIONS.map((ext) => `${base}${ext}`),
     ...SOURCE_EXTENSIONS.map((ext) => path.join(base, `index${ext}`)),
   ];
-  return candidates.find((candidate) => io.readFile(candidate) !== null) ?? null;
+  return (
+    candidates.find((candidate) => io.readFile(candidate) !== null) ?? null
+  );
 }
 
 function defaultEntryFiles(input: IntegrationCheckInput): string[] {
@@ -96,13 +111,23 @@ function defaultEntryFiles(input: IntegrationCheckInput): string[] {
   return [];
 }
 
-/** Read the entry and the local modules it imports, bounded to avoid surprises. */
-function reachableSource(input: IntegrationCheckInput): string[] {
+/**
+ * Read the entry and the local modules it imports, bounded to avoid surprises.
+ *
+ * Paths are carried alongside the text because "which file holds the init call"
+ * is the first thing an in-place amend has to know, and joining the sources
+ * threw it away.
+ */
+export function reachableSourceFiles(
+  input: IntegrationCheckInput,
+): Array<{ file: string; text: string }> {
   const entries = input.entryFile
     ? [path.resolve(input.entryFile)]
-    : defaultEntryFiles(input).filter((file) => input.io.readFile(file) !== null);
+    : defaultEntryFiles(input).filter(
+        (file) => input.io.readFile(file) !== null,
+      );
   if (entries.length === 0) return [];
-  const files: string[] = [];
+  const files: Array<{ file: string; text: string }> = [];
   const pending = [...entries];
   const visited = new Set<string>();
 
@@ -112,7 +137,7 @@ function reachableSource(input: IntegrationCheckInput): string[] {
     visited.add(file);
     const text = input.io.readFile(file);
     if (text === null) continue;
-    files.push(text);
+    files.push({ file, text });
     LOCAL_IMPORT.lastIndex = 0;
     for (const match of text.matchAll(LOCAL_IMPORT)) {
       const imported = sourceModulePath(input.io, file, match[1]);
@@ -142,14 +167,12 @@ function packageJson(input: IntegrationCheckInput): {
   }
 }
 
-function sdkPackageInstalled(
-  cwd: string,
-  io: InjectIO,
-  name: string,
-): boolean {
+function sdkPackageInstalled(cwd: string, io: InjectIO, name: string): boolean {
   let dir = path.resolve(cwd);
   for (;;) {
-    if (io.readFile(path.join(dir, "node_modules", name, "package.json")) !== null) {
+    if (
+      io.readFile(path.join(dir, "node_modules", name, "package.json")) !== null
+    ) {
       return true;
     }
     const parent = path.dirname(dir);
@@ -163,6 +186,12 @@ function sdkComplete(input: IntegrationCheckInput): boolean {
     const pubspec = input.io.readFile(path.join(input.cwd, "pubspec.yaml"));
     return pubspec != null && /^\s*crumbtrail_flutter\s*:/m.test(pubspec);
   }
+  // A recipe with no packages to add (otlp guidance, and a static page that
+  // loads the SDK from a CDN) is complete on this requirement by construction.
+  // Checked BEFORE package.json, because those are exactly the projects that may
+  // not have one — and demanding a manifest they never needed made every re-run
+  // report the wiring as incomplete.
+  if (RECIPE_REGISTRY[input.recipe].sdkPackages.length === 0) return true;
   const pkg = packageJson(input);
   if (!pkg) return false;
   const deps = { ...pkg.dependencies, ...pkg.devDependencies };
@@ -175,14 +204,15 @@ function normalizedEndpoint(value: string): string {
   return value.trim().replace(/\/+$/, "");
 }
 
-function envValue(
-  cwd: string,
-  io: InjectIO,
-  name: string,
-): string | undefined {
+function envValue(cwd: string, io: InjectIO, name: string): string | undefined {
   let dir = path.resolve(cwd);
   for (;;) {
-    for (const file of [".env.local", ".env", ".env.development.local", ".env.development"]) {
+    for (const file of [
+      ".env.local",
+      ".env",
+      ".env.development.local",
+      ".env.development",
+    ]) {
       const text = io.readFile(path.join(dir, file));
       const value = text == null ? undefined : readEnvVar(text, name);
       if (value !== undefined) return value;
@@ -207,28 +237,55 @@ function endpointConfigured(
   }
   ENDPOINT_ENV.lastIndex = 0;
   for (const match of source.matchAll(ENDPOINT_ENV)) {
-    if (normalizedEndpoint(envValue(input.cwd, input.io, match[0]) ?? "") === expected) {
+    if (
+      normalizedEndpoint(envValue(input.cwd, input.io, match[0]) ?? "") ===
+      expected
+    ) {
       return true;
     }
   }
   return false;
 }
 
-function serviceConfigured(source: string, serviceName: string | null | undefined): boolean {
+function serviceConfigured(
+  source: string,
+  serviceName: string | null | undefined,
+): boolean {
   if (!serviceName?.trim()) return false;
   const escaped = serviceName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`\\bservice\\s*:\\s*["']${escaped}["']`).test(source);
 }
 
+/** The app name a `service:` option already carries, if it carries a literal one. */
+function declaredServiceName(source: string): string | undefined {
+  const match = /\bservice\s*:\s*["']([^"']+)["']/.exec(source);
+  return match?.[1];
+}
+
+/** The literal a recipe with no env mechanism leaves in place of a real key. */
+const KEY_PLACEHOLDER_IN_SOURCE = /httpAuthToken\s*:\s*["'`]<[^"'`]*>["'`]/;
+
 function keyConfigured(input: IntegrationCheckInput, source: string): boolean {
   const keyRef = RECIPE_REGISTRY[input.recipe].keyRef;
-  if (!keyRef || !source.includes(keyRef.expr)) return false;
+  // No keyRef means this recipe has no env var to read (angular, static): the
+  // key lives in the source itself. Configured, then, is "someone replaced the
+  // placeholder" — anything else would report a page that is fully wired as
+  // incomplete forever, since there is no variable to go looking for.
+  if (!keyRef) {
+    return (
+      /\bhttpAuthToken\s*:/.test(source) &&
+      !KEY_PLACEHOLDER_IN_SOURCE.test(source)
+    );
+  }
+  if (!source.includes(keyRef.expr)) return false;
   if (keyRef.compileTime) return true;
   return envValue(input.cwd, input.io, keyRef.envVar) !== undefined;
 }
 
 function remoteConfigRequired(recipe: Recipe): boolean {
-  return !SERVER_RECIPES.has(recipe) && recipe !== "flutter" && recipe !== "tauri";
+  return (
+    !SERVER_RECIPES.has(recipe) && recipe !== "flutter" && recipe !== "tauri"
+  );
 }
 
 /**
@@ -237,8 +294,12 @@ function remoteConfigRequired(recipe: Recipe): boolean {
  * code, an exact endpoint, a configured key, a service name, and remote config
  * where that SDK supports it.
  */
-export function inspectIntegration(input: IntegrationCheckInput): IntegrationStatus {
-  const source = reachableSource(input).join("\n");
+export function inspectIntegration(
+  input: IntegrationCheckInput,
+): IntegrationStatus {
+  const source = reachableSourceFiles(input)
+    .map((entry) => entry.text)
+    .join("\n");
   const found = CRUMBTRAIL_REFERENCE.test(source);
   const missing: IntegrationRequirement[] = [];
 
@@ -246,10 +307,22 @@ export function inspectIntegration(input: IntegrationCheckInput): IntegrationSta
   if (source.length === 0 || !found) missing.push("entry");
   if (!endpointConfigured(input, source)) missing.push("endpoint");
   if (!keyConfigured(input, source)) missing.push("ingest-key");
-  if (!serviceConfigured(source, input.serviceName)) missing.push("service-name");
-  if (remoteConfigRequired(input.recipe) && !/\bremoteConfig\s*:\s*true\b/.test(source)) {
+  let existingServiceName: string | undefined;
+  if (!serviceConfigured(source, input.serviceName)) {
+    missing.push("service-name");
+    existingServiceName = declaredServiceName(source);
+  }
+  if (
+    remoteConfigRequired(input.recipe) &&
+    !/\bremoteConfig\s*:\s*true\b/.test(source)
+  ) {
     missing.push("remote-config");
   }
 
-  return { complete: missing.length === 0, found, missing };
+  return {
+    complete: missing.length === 0,
+    found,
+    missing,
+    ...(existingServiceName ? { existingServiceName } : {}),
+  };
 }

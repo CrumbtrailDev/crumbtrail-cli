@@ -80,7 +80,10 @@ describe("backend intake client", () => {
       {
         kind: "missing-session",
         message:
-          "Backend event was not sent because no usable session ID was available.",
+          "Backend event was not sent because no session ID was available. " +
+          "Nothing correlated it (no x-crumbtrail-session-id header) and this " +
+          "process has no capture session of its own. Install autoCapture, or " +
+          "check that its session handshake succeeded.",
         requestId: "req_without_session",
         eventKind: "backend.req.start",
       },

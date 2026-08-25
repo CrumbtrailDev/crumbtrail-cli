@@ -1,4 +1,4 @@
-import type { BugEvent } from "crumbtrail-core";
+import { buildCaptureGapEvent, type BugEvent } from "crumbtrail-core";
 import {
   HeadlessRequestError,
   startHeadlessSession,
@@ -6,6 +6,7 @@ import {
 } from "./headless-session";
 import {
   autoInstrumentDbClients,
+  autoInstrumentPatchedAnything,
   formatAutoInstrumentReport,
   type AutoInstrumentDriver,
   type AutoInstrumentReport,
@@ -14,6 +15,26 @@ import {
   installBackendWarningCapture,
   type BackendWarningCaptureHandle,
 } from "./backend-warnings";
+import {
+  installBackendLogCapture,
+  type BackendLogCaptureHandle,
+  type BackendLogCaptureOptions,
+  type BackendLogLevel,
+} from "./backend-logs";
+import {
+  installHttpRequestCapture,
+  installOutboundHttpCapture,
+  type HttpRequestCaptureHandle,
+  type HttpRequestCaptureOptions,
+  type OutboundHttpCaptureHandle,
+  type OutboundHttpCaptureOptions,
+} from "./http-server";
+import { sendBackendEvent } from "./backend-intake";
+import {
+  clearProcessSessionId,
+  setProcessSessionId,
+} from "./process-session";
+import { readRequestCorrelation } from "./request-context";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -136,6 +157,101 @@ export interface AutoCaptureOptions {
    * Set false to leave the process untouched.
    */
   captureRuntimeWarnings?: boolean;
+  /**
+   * When true (default) record structured log lines the process writes —
+   * pino, winston, bunyan and anything else emitting NDJSON with a level — as
+   * `backend.log` events.
+   *
+   * This is the only path by which an ORDINARY backend failure reaches a
+   * session. A handled 503 is caught, logged with its stack, and answered; it
+   * never touches `console.error` and never crashes the process, so without
+   * this hook a server that logs through a logger captures nothing at all.
+   *
+   * Set false to leave `process.stdout`/`process.stderr` and `fs.write`
+   * untouched.
+   */
+  captureLogs?: boolean;
+  /** Lowest log level captured. Defaults to `warn`. */
+  logLevel?: BackendLogLevel;
+  /** Streams and `fs` the log capture patches (tests). Defaults to the process's. */
+  logStreams?: Pick<
+    BackendLogCaptureOptions,
+    "stdout" | "stderr" | "fsImpl" | "maxEvents"
+  >;
+  /**
+   * When true (default) record inbound HTTP requests that arrive carrying the
+   * browser's correlation headers as `backend.req.start` / `backend.req.end`
+   * events in THAT browser's session.
+   *
+   * This is the only path by which frontend to backend correlation works at all
+   * on a stock install. It hooks `http.Server` rather than any one framework, so
+   * express, hono, fastify, nest and a hand-written `createServer` are all
+   * covered by the same code with no application change. A request that carries
+   * no session correlation is not recorded: there is nothing to join it to, and
+   * a server's health checks must not become egress.
+   *
+   * Set false to leave `node:http` untouched.
+   */
+  captureHttpRequests?: boolean;
+  /**
+   * Response body and header capture policy for the inbound requests above,
+   * identical in shape and default to the Express middleware's.
+   */
+  httpResponseCapture?: HttpRequestCaptureOptions["response"];
+  /** `node:http`/`node:https` the request capture patches (tests). */
+  httpModules?: Pick<
+    HttpRequestCaptureOptions,
+    "httpImpl" | "httpsImpl" | "maxRequests"
+  >;
+  /**
+   * When true (default) record the calls this process makes OUTWARD — every
+   * `fetch`, `http.request` and `https.request` — as `backend.http` events.
+   *
+   * This is the only path by which an infrastructure failure names itself. A
+   * DNS failure, an upstream timeout, a dead cache or a dependency 502 is what
+   * turned the inbound request into a 500, and without this the session holds
+   * the 500 and nothing that explains it.
+   *
+   * Set false to leave the outbound transports untouched.
+   */
+  captureOutboundHttp?: boolean;
+  /** Modules and clock the outbound capture patches (tests). */
+  outboundHttpModules?: Pick<
+    OutboundHttpCaptureOptions,
+    "httpImpl" | "httpsImpl" | "fetchHost" | "maxCalls"
+  >;
+  /**
+   * Ceiling on one ingest POST, in milliseconds. Defaults to the headless
+   * session's own default; pass 0 to disable. An endpoint that accepts the
+   * connection and never answers is otherwise indistinguishable from a healthy
+   * one, and every event handed to it waits forever.
+   */
+  requestTimeoutMs?: number;
+  /**
+   * How many events are held locally while the ingest session is dark, before
+   * further ones are counted as a gap instead. Defaults to
+   * {@link DEFAULT_MAX_PENDING_EVENTS}. Bounded on purpose: capture may never be
+   * the reason a host process runs out of memory.
+   */
+  maxPendingEvents?: number;
+  /**
+   * When true (default) record that the process was terminated by a signal
+   * (`SIGTERM`, `SIGINT`, `SIGHUP`, `SIGQUIT`) as a `session.lifecycle` event,
+   * then restore the default termination behaviour.
+   *
+   * A container that is killed mid request otherwise says nothing at all: the
+   * session simply stops, and it is later finalized as though it had ended
+   * normally. Recording the signal is what separates "the process was killed"
+   * from "nothing else happened".
+   *
+   * The listener never keeps the process alive: once the record has been
+   * bound-flushed, the handler removes itself and re-raises the signal so Node's
+   * default terminate-on-signal applies. When the host has its own handler for
+   * the signal, the host owns the shutdown and this only records.
+   *
+   * Set false to leave the signal handlers untouched.
+   */
+  captureProcessSignals?: boolean;
 }
 
 export interface AutoCaptureHandle {
@@ -163,6 +279,65 @@ const REESTABLISH_CAP_MS = 30_000;
 // window.
 const RETRY_AFTER_MAX_MS = 5 * 60_000;
 
+/**
+ * Events held locally while the ingest session is dark.
+ *
+ * Five hundred events is a few hundred kilobytes at the sizes this SDK emits,
+ * which is a price a host process can pay for a capture outage; unbounded is
+ * not. Everything past the cap is counted rather than kept, and the count is
+ * what the capture gap reports.
+ */
+export const DEFAULT_MAX_PENDING_EVENTS = 500;
+
+/** Events per POST when the held queue drains. Matches the intake's batch size. */
+const FLUSH_BATCH_SIZE = 64;
+
+/**
+ * Delivery attempts one held event gets before it is counted as lost.
+ *
+ * Without a ceiling, a permanently refused event (a revoked key, a payload the
+ * endpoint will never accept) would be requeued and retried for the life of the
+ * process, and would keep every event behind it from ever being sent.
+ */
+const MAX_PENDING_ATTEMPTS = 3;
+
+/**
+ * Grace given to the termination record before the signal is re-raised. A
+ * SIGTERM normally carries a grace period measured in seconds, so 400ms is
+ * comfortably inside it while still being a hard ceiling: a wedged endpoint can
+ * never turn a fast shutdown into a slow one.
+ */
+const TERMINATION_FLUSH_MS = 400;
+
+/** Signals that mean "this process is being stopped", not "this process failed". */
+const TERMINATION_SIGNALS = [
+  "SIGTERM",
+  "SIGINT",
+  "SIGHUP",
+  "SIGQUIT",
+] as const;
+
+/** Event kind carrying the process's own statement about how it ended. */
+export const AUTO_CAPTURE_LIFECYCLE_EVENT = "session.lifecycle";
+
+/** The completeness surface a dropped event belongs to, from its kind. */
+type CaptureGapSurface = "db_diff" | "backend_request" | "browser" | "queue";
+
+function gapSurfaceFor(kind: string): CaptureGapSurface {
+  if (kind.startsWith("db.")) return "db_diff";
+  if (kind.startsWith("backend.req")) return "backend_request";
+  // Everything else — a crash, a runtime warning, a log line, an outbound call —
+  // was lost in this SDK's own delivery queue, and that is what the reader needs
+  // to know about it.
+  return "queue";
+}
+
+/** One event waiting for a live session, with the attempts already spent on it. */
+interface PendingEvent {
+  event: BugEvent;
+  attempts: number;
+}
+
 /** Resolve after `ms`, without keeping the event loop alive for the timer. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -181,6 +356,25 @@ function sleep(ms: number): Promise<void> {
 let installed = false;
 
 /**
+ * The service the live capture was installed for.
+ *
+ * Two apps in one process — a worker imported into the API, an entry that calls
+ * `autoCapture` again under a second name — used to be indistinguishable from a
+ * duplicate call: the second name was dropped without a word, and every event the
+ * second app produced was filed under the first app's name for the life of the
+ * process. That is a wrong answer presented as a working install, so the conflict
+ * is now stated once and the first capture stands. The second caller still gets an
+ * inert handle, so its `stop()` cannot tear down a capture it does not own.
+ */
+let installedService: string | undefined;
+
+/** Test seam: forget the process-wide install so a suite can install again. */
+export function __resetAutoCaptureInstallForTests(): void {
+  installed = false;
+  installedService = undefined;
+}
+
+/**
  * Install best-effort backend crash + console.error capture and start a headless
  * ingest session. Returns a handle whose `stop()` restores every hook.
  *
@@ -194,9 +388,24 @@ export async function autoCapture(
   options: AutoCaptureOptions,
 ): Promise<AutoCaptureHandle> {
   if (installed) {
+    // Same name (or no name either time) is an ordinary double call — idempotent,
+    // and silent as it has always been. A DIFFERENT name is two apps, and saying
+    // nothing would file one app's events under the other app's name.
+    if (options.service !== installedService) {
+      const consoleForWarning = options.consoleImpl ?? console;
+      consoleForWarning.error(
+        `[crumbtrail] capture is already running for ${describeService(installedService)}, ` +
+          `so the later call for ${describeService(options.service)} was ignored: ` +
+          "one process captures under one service name. Run the second app in its own " +
+          "process, or give both calls the same service name.",
+      );
+    }
+    // Still an inert handle, never the live one: a second caller's `stop()` must not
+    // tear down a capture it does not own. The existing double-install contract.
     return { stop() {} };
   }
   installed = true;
+  installedService = options.service;
 
   const proc = options.processImpl ?? process;
   const consoleRef = options.consoleImpl ?? console;
@@ -277,6 +486,125 @@ export async function autoCapture(
   let establishing: Promise<HeadlessSession | undefined> | undefined;
   let stopped = false;
 
+  // ==========================================================================
+  // COMPLETENESS LEDGER
+  // ==========================================================================
+  //
+  // Every lane below — a crash, a runtime warning, a structured log line, a
+  // database diff, an outbound call — used to be DROPPED when the ingest
+  // session was dark, and dropped without a word. A capture endpoint that fails
+  // DNS, TLS or availability therefore produced a session that looked complete:
+  // the events that happened to be sent before the outage survived, the ones
+  // during it vanished, and nothing anywhere said which was which. A brief built
+  // on that grades the survivors as the whole story.
+  //
+  // Two things fix it, and both are needed. Evidence produced while the endpoint
+  // is unreachable is HELD, bounded, and delivered when the session comes back.
+  // Evidence that could not be held or could not be delivered is COUNTED, and
+  // the count is delivered as a `capture_gap` event — so a session that is
+  // missing evidence says so, in the evidence stream, where the reader is.
+  const maxPending = normalizePendingCap(options.maxPendingEvents);
+  const pendingEvents: PendingEvent[] = [];
+  const droppedBySurface = new Map<CaptureGapSurface, number>();
+  let draining = false;
+
+  /** Record that `count` events of this kind were lost and will not arrive. */
+  const noteDropped = (kind: string, count = 1): void => {
+    if (count <= 0) return;
+    const surface = gapSurfaceFor(kind);
+    droppedBySurface.set(surface, (droppedBySurface.get(surface) ?? 0) + count);
+  };
+
+  /** Hold an event for a session that is not live yet, or count it as lost. */
+  const holdEvent = (event: BugEvent, attempts = 0): void => {
+    if (stopped) return;
+    if (pendingEvents.length >= maxPending) {
+      noteDropped(event.k);
+      return;
+    }
+    pendingEvents.push({ event, attempts });
+  };
+
+  /**
+   * Drop the live session and arm the re-establish backoff.
+   *
+   * Called on a handshake failure AND on a delivery failure, because a session
+   * handle that cannot deliver is not a live session. Leaving it in place is
+   * what let a whole outage pass with the SDK still believing it was connected.
+   */
+  const armBackoff = (err: unknown): void => {
+    session = undefined;
+    consecutiveFailures += 1;
+    const backoff = Math.min(
+      REESTABLISH_BASE_MS * 2 ** (consecutiveFailures - 1),
+      REESTABLISH_CAP_MS,
+    );
+    const floor = Math.min(retryAfterMsOf(err) ?? 0, RETRY_AFTER_MAX_MS);
+    nextAttemptAt = now() + Math.max(backoff, floor);
+  };
+
+  /**
+   * Deliver the recorded gaps, newest counts included, and clear them only once
+   * the endpoint has accepted them. A gap that fails to send is still a gap.
+   */
+  const flushGaps = async (live: HeadlessSession): Promise<void> => {
+    if (droppedBySurface.size === 0) return;
+    const snapshot = [...droppedBySurface.entries()];
+    const events = snapshot.map(([surface, count]) =>
+      buildCaptureGapEvent({
+        surface,
+        reason: "delivery_failed",
+        droppedEventCount: count,
+        sessionId: stableSessionId,
+        t: now(),
+      }),
+    );
+    try {
+      await live.record(events);
+    } catch (err) {
+      emitError(err, { phase: "record", source: "console.error" });
+      armBackoff(err);
+      return;
+    }
+    // Subtract what was reported rather than clearing, so a drop that happened
+    // while this POST was in flight is not reported as already accounted for.
+    for (const [surface, count] of snapshot) {
+      const remaining = (droppedBySurface.get(surface) ?? 0) - count;
+      if (remaining > 0) droppedBySurface.set(surface, remaining);
+      else droppedBySurface.delete(surface);
+    }
+  };
+
+  /**
+   * Send everything held for this session, then the gap ledger. Re-entrant safe
+   * and never throws: a failure mid drain requeues the batch, arms the backoff
+   * and leaves the rest held for the next successful handshake.
+   */
+  const drainPending = async (live: HeadlessSession): Promise<void> => {
+    if (draining) return;
+    draining = true;
+    try {
+      while (!stopped && session === live && pendingEvents.length > 0) {
+        const batch = pendingEvents.splice(0, FLUSH_BATCH_SIZE);
+        try {
+          await live.record(batch.map((entry) => entry.event));
+        } catch (err) {
+          emitError(err, { phase: "record", source: "console.error" });
+          armBackoff(err);
+          for (const entry of batch) {
+            const attempts = entry.attempts + 1;
+            if (attempts >= MAX_PENDING_ATTEMPTS) noteDropped(entry.event.k);
+            else holdEvent(entry.event, attempts);
+          }
+          return;
+        }
+      }
+      if (!stopped && session === live) await flushGaps(live);
+    } finally {
+      draining = false;
+    }
+  };
+
   const startSession = (): Promise<HeadlessSession> =>
     startHeadlessSession({
       endpoint: options.endpoint,
@@ -286,8 +614,16 @@ export async function autoCapture(
         ...(options.service ? { service: options.service } : {}),
         ...options.metadata,
         capture: "auto",
+        // The cold start marker. A session that carries a pid and a boot time
+        // is a process that started; a later session under the same service with
+        // a different pid is a restart, and that is a fact a reader cannot infer
+        // from the events alone.
+        process: describeProcess(proc),
       },
       fetchImpl: options.fetchImpl,
+      ...(options.requestTimeoutMs !== undefined
+        ? { timeoutMs: options.requestTimeoutMs }
+        : {}),
     });
 
   // Lazily (re-)establish the ingest session, bounded by the backoff gate.
@@ -307,18 +643,21 @@ export async function autoCapture(
         const started = await startSession();
         if (stopped) return undefined;
         session = started;
+        // Announced only once the endpoint has acknowledged the session, so a
+        // request recorder falling back to it addresses a session that exists.
+        // This is what lets a backend with no browser in front of it record its
+        // requests instead of having every one of them refused for having no
+        // session id.
+        setProcessSessionId(stableSessionId);
         consecutiveFailures = 0;
         nextAttemptAt = 0;
+        // Everything the outage held now has somewhere to go, and so does the
+        // count of everything it could not hold. Deliberately not awaited: a
+        // caller recording one error must not wait on a backlog drain.
+        void drainPending(started);
         return session;
       } catch (err) {
-        session = undefined;
-        consecutiveFailures += 1;
-        const backoff = Math.min(
-          REESTABLISH_BASE_MS * 2 ** (consecutiveFailures - 1),
-          REESTABLISH_CAP_MS,
-        );
-        const floor = Math.min(retryAfterMsOf(err) ?? 0, RETRY_AFTER_MAX_MS);
-        nextAttemptAt = now() + Math.max(backoff, floor);
+        armBackoff(err);
         emitError(err, { phase: "session-start" });
         return undefined;
       } finally {
@@ -337,10 +676,45 @@ export async function autoCapture(
     live: HeadlessSession,
     error: unknown,
     source: AutoCaptureSource,
-  ): Promise<void> =>
-    live
-      .record(buildErrorEvent(error, source))
-      .catch((sendErr) => emitError(sendErr, { phase: "record", source }));
+    logMessage?: string,
+  ): Promise<void> => {
+    const event = buildErrorEvent(error, source, logMessage);
+    // An error logged inside a browser correlated request belongs to that
+    // browser's session, exactly like the request's own events — otherwise the
+    // click and the sentence explaining it land in two sessions that share
+    // nothing. Only the logged path is re-routed: a crash is the process's own
+    // ending, and its bounded exit flush goes through the live session.
+    const correlated =
+      source === "console.error" ? readRequestCorrelation()?.sessionId : undefined;
+    if (correlated && correlated !== live.sessionId) {
+      return sendBackendEvent({
+        event: { ...event, sessionId: correlated },
+        sessionId: correlated,
+        endpoint: options.endpoint,
+        ...(authToken ? { authToken } : {}),
+        ...(options.fetchImpl ? { fetch: options.fetchImpl } : {}),
+      })
+        .then((delivered) => {
+          // `sendBackendEvent` reports its own failures and resolves false
+          // rather than rejecting, so without this a refused correlated error
+          // was the one send in this module that could vanish with no trace at
+          // all — not even a gap.
+          if (!delivered) noteDropped(event.k);
+        })
+        .catch((sendErr) => {
+          noteDropped(event.k);
+          emitError(sendErr, { phase: "record", source });
+        });
+    }
+    return live.record(event).catch((sendErr) => {
+      // The event never landed. Hold it for the next live session and treat the
+      // handle as dead, so the next capture re-establishes instead of handing
+      // more evidence to an endpoint that is not answering.
+      holdEvent(event);
+      armBackoff(sendErr);
+      emitError(sendErr, { phase: "record", source });
+    });
+  };
 
   // Best-effort record. Returns the in-flight record promise (already
   // `.catch`-guarded so it never rejects) so a crash handler can bound-flush it;
@@ -355,30 +729,59 @@ export async function autoCapture(
     error: unknown,
     source: AutoCaptureSource,
     allowReestablish = false,
+    logMessage?: string,
   ): Promise<void> | undefined => {
-    if (capturing) return undefined;
+    if (capturing) {
+      // Re-entrant: this capture was raised by the capture path itself and must
+      // not recurse. The evidence is still gone, so it is counted rather than
+      // discarded in silence.
+      noteDropped(AUTO_CAPTURE_ERROR_EVENT);
+      return undefined;
+    }
     try {
       if (session) {
         capturing = true;
         try {
-          return recordLive(session, error, source);
+          return recordLive(session, error, source, logMessage);
         } finally {
           capturing = false;
         }
       }
-      if (!allowReestablish || stopped) return undefined;
-      // Dark session: re-establish (backoff-gated) then record. `capturing` stays
-      // held for the whole async attempt so a burst of captures does not each
-      // spawn their own handshake.
-      capturing = true;
-      const pending = (async () => {
+      if (stopped) return undefined;
+      if (!allowReestablish) {
+        // The crash path. It may not wait on a handshake, but the crash is the
+        // most valuable event in the session and losing it silently is the worst
+        // case of all: hold it so a later re-establish still delivers it, and
+        // count it if the process never gets one.
+        holdEvent(buildErrorEvent(error, source, logMessage));
+        return undefined;
+      }
+      // Dark session: re-establish (backoff-gated) then record.
+      //
+      // `capturing` is held only around the record itself, not across the whole
+      // async attempt. Holding it for the duration made every error raised while
+      // a handshake was in flight hit the re-entrancy guard and vanish — during
+      // an outage, which is exactly when errors arrive in bursts. Concurrent
+      // handshakes are already deduped by `ensureSession`'s own `establishing`.
+      return (async () => {
         const live = await ensureSession();
-        if (live) await recordLive(live, error, source);
+        if (!live) {
+          // The backoff gate is still closed, or the handshake failed again.
+          // The evidence is real either way, so it is held rather than dropped.
+          holdEvent(buildErrorEvent(error, source, logMessage));
+          return;
+        }
+        if (capturing) {
+          holdEvent(buildErrorEvent(error, source, logMessage));
+          return;
+        }
+        capturing = true;
+        try {
+          await recordLive(live, error, source, logMessage);
+        } finally {
+          capturing = false;
+        }
       })();
-      void pending.finally(() => {
-        capturing = false;
-      });
-      return pending;
     } catch {
       // Capture must never throw back into the host application.
       capturing = false;
@@ -386,10 +789,51 @@ export async function autoCapture(
     }
   };
 
+  /**
+   * The one way a non request lane (a runtime warning, a log line, a database
+   * diff) reaches the session.
+   *
+   * Every one of these used to read `if (!session) return`, which is where the
+   * silence came from: a database timeout raised during a Crumbtrail outage was
+   * discarded, and the session it belonged to was later graded complete. Now the
+   * event is held for the next live session, the dark session is nudged to
+   * re-establish behind its backoff gate, and anything that still cannot be kept
+   * is counted into the gap ledger.
+   */
+  const emitSessionEvent = (event: BugEvent): void => {
+    if (stopped) return;
+    const live = session;
+    if (!live) {
+      holdEvent(event);
+      // Self-heal for a backend that never calls console.error: these lanes are
+      // often the only ones producing evidence, so they must be able to trigger
+      // the re-establishment the console path triggers.
+      void ensureSession();
+      return;
+    }
+    void live.record(event).catch((sendErr) => {
+      holdEvent(event);
+      armBackoff(sendErr);
+      emitError(sendErr, { phase: "record", source: "console.error" });
+    });
+  };
+
   // Keep the exact original reference so stop() can restore it identically.
   const originalError = originalConsoleError;
   const patchedError = (...args: unknown[]): void => {
     const errorArg = args.find((a) => a instanceof Error);
+    // The sentence the developer wrote, kept alongside the Error rather than
+    // instead of it. `console.error("worker tick failed", err)` used to arrive
+    // as nothing but the Error's own message, so the words the author chose —
+    // the ones they would search for, and the only part naming what was being
+    // attempted — were dropped on exactly the call shape that carries a stack.
+    const logMessage = errorArg
+      ? args
+          .filter((a) => !(a instanceof Error))
+          .map((a) => safeString(a))
+          .join(" ")
+          .trim()
+      : "";
     // The non-crash capture path opts into lazy re-establishment: if the session
     // went dark at boot (or later), this is what heals it — the next logged error
     // after the endpoint recovers re-starts the session and lands.
@@ -397,6 +841,7 @@ export async function autoCapture(
       errorArg ?? args.map((a) => String(a)).join(" "),
       "console.error",
       true,
+      logMessage || undefined,
     );
     originalError.apply(consoleRef, args as []);
   };
@@ -447,6 +892,127 @@ export async function autoCapture(
   };
   proc.on("unhandledRejection", onUnhandled);
 
+  // ==========================================================================
+  // TERMINATION
+  // ==========================================================================
+  //
+  // A crash says something. A process that is STOPPED said nothing at all: only
+  // `uncaughtException` and `unhandledRejection` were hooked, so a container
+  // killed mid request — a deploy, a scale-in, an OOM-killed sibling, a failing
+  // liveness probe — simply stopped emitting, and the sweeper later finalized
+  // the session as though it had ended on its own terms. The evidence that DID
+  // land then reads as the complete story of a request that never finished.
+  //
+  // The signal is recorded as a `session.lifecycle` event, which the bundle
+  // renders on the timeline, and it carries the held and lost counts so the
+  // reader learns in one place both that the process was killed and how much
+  // evidence went with it.
+  //
+  // What this cannot see, and does not pretend to: `SIGKILL` and a kernel OOM
+  // kill deliver no signal to the process at all. Nothing in-process can record
+  // those. They surface instead as a session that stops without a termination
+  // record, which is exactly what the sweeper reports.
+  let terminating = false;
+  const signalHandlers = new Map<string, () => void>();
+
+  /** The gap ledger as events, without clearing it — the process is ending. */
+  const gapEventsSnapshot = (): BugEvent[] =>
+    [...droppedBySurface.entries()].map(([surface, count]) =>
+      buildCaptureGapEvent({
+        surface,
+        reason: "delivery_failed",
+        droppedEventCount: count,
+        sessionId: stableSessionId,
+        t: now(),
+      }),
+    );
+
+  const recordTermination = async (signal: string): Promise<void> => {
+    const live = session ?? (await ensureSession());
+    if (!live) return;
+    // Anything past one batch cannot be sent inside the grace period, and
+    // saying so is worth more than pretending it landed.
+    const batch = pendingEvents.splice(0, FLUSH_BATCH_SIZE);
+    for (const rest of pendingEvents.splice(0)) noteDropped(rest.event.k);
+    const lifecycle: BugEvent = {
+      t: now(),
+      k: AUTO_CAPTURE_LIFECYCLE_EVENT,
+      sessionId: stableSessionId,
+      d: {
+        action: "process-terminated",
+        reason: signal,
+        ...(options.service ? { service: options.service } : {}),
+        ...describeProcess(proc),
+        heldEvents: batch.length,
+        lostEvents: [...droppedBySurface.values()].reduce((a, b) => a + b, 0),
+      },
+    };
+    await live.record([
+      ...batch.map((entry) => entry.event),
+      lifecycle,
+      ...gapEventsSnapshot(),
+    ]);
+  };
+
+  /**
+   * Put the signal back the way it was and let it do what it was going to do.
+   *
+   * Installing a signal listener SUPPRESSES Node's default terminate-on-signal,
+   * so capture would otherwise keep alive a process the operator asked to stop —
+   * the one change to host behaviour that would be indefensible. Once the record
+   * has been bound-flushed the listener removes itself; if nothing else is
+   * listening the signal is re-raised, which both terminates the process and
+   * preserves its real exit code (143 for SIGTERM). When the host has its own
+   * handler, the host owns the shutdown and this only recorded it.
+   */
+  const releaseSignal = (signal: string): void => {
+    const handler = signalHandlers.get(signal);
+    if (handler) {
+      signalHandlers.delete(signal);
+      try {
+        proc.removeListener(signal as NodeJS.Signals, handler);
+      } catch {
+        // A process seam without removeListener still gets the record.
+      }
+    }
+    try {
+      if (proc.listenerCount?.(signal as NodeJS.Signals) > 0) return;
+      const kill = (proc as { kill?: (pid: number, sig: string) => void }).kill;
+      if (typeof kill === "function") kill.call(proc, proc.pid, signal);
+    } catch {
+      // Re-raising is best effort; never throw out of a shutdown path.
+    }
+  };
+
+  if (options.captureProcessSignals !== false) {
+    for (const signal of TERMINATION_SIGNALS) {
+      const handler = (): void => {
+        if (terminating) return;
+        terminating = true;
+        void (async () => {
+          try {
+            await Promise.race([
+              recordTermination(signal).catch((err) =>
+                emitError(err, { phase: "record" }),
+              ),
+              sleep(TERMINATION_FLUSH_MS),
+            ]);
+          } catch {
+            // A failed record must never prevent the process from stopping.
+          } finally {
+            releaseSignal(signal);
+          }
+        })();
+      };
+      try {
+        proc.on(signal, handler);
+        signalHandlers.set(signal, handler);
+      } catch {
+        // A platform (or a test seam) that refuses this signal is left alone.
+      }
+    }
+  }
+
   // Runtime warnings. Ref-counted inside `installBackendWarningCapture`, so two
   // captures in one process (or two test files) share a single process listener
   // rather than each adding one — the thing MaxListenersExceededWarning exists
@@ -458,13 +1024,151 @@ export async function autoCapture(
       warningCapture = installBackendWarningCapture({
         processImpl: proc,
         sessionId: stableSessionId,
+        emit: emitSessionEvent,
+      });
+    } catch (error) {
+      emitError(error, { phase: "record", source: "console.error" });
+    }
+  }
+
+  // Structured log capture. The lane that carries an ordinary handled failure:
+  // the app logged the 503 and its stack through pino, kept serving, and no
+  // other hook here would ever have seen it. Emitted through the same session as
+  // everything else, and dropped rather than queued while the session is dark,
+  // matching db events and runtime warnings.
+  let logCapture: BackendLogCaptureHandle | undefined;
+  if (options.captureLogs !== false) {
+    try {
+      logCapture = installBackendLogCapture({
+        sessionId: stableSessionId,
+        minLevel: options.logLevel,
+        ...options.logStreams,
         emit: (event) => {
-          if (stopped || !session) return;
-          void session
-            .record(event)
-            .catch((sendErr) =>
-              emitError(sendErr, { phase: "record", source: "console.error" }),
-            );
+          if (stopped) return;
+          // A line written inside a browser correlated request belongs to the
+          // BROWSER's session, exactly like the request events themselves —
+          // that is the whole point of the join. Filing it to the process
+          // session instead is what produced two issues, the click's and the
+          // log's, each reporting no counterpart. The log capture resolves the
+          // target and stamps it on the event; anything it did not correlate
+          // still rides the headless session as before.
+          const correlated =
+            typeof event.sessionId === "string" &&
+            event.sessionId &&
+            event.sessionId !== stableSessionId
+              ? event.sessionId
+              : undefined;
+          if (correlated) {
+            void sendBackendEvent({
+              event,
+              sessionId: correlated,
+              endpoint: options.endpoint,
+              ...(authToken ? { authToken } : {}),
+              ...(options.fetchImpl ? { fetch: options.fetchImpl } : {}),
+            })
+              .then((delivered) => {
+                if (!delivered) noteDropped(event.k);
+              })
+              .catch((sendErr) => {
+                noteDropped(event.k);
+                emitError(sendErr, { phase: "record", source: "console.error" });
+              });
+            return;
+          }
+          emitSessionEvent(event);
+        },
+      });
+    } catch (error) {
+      emitError(error, { phase: "record", source: "console.error" });
+    }
+  }
+
+  // Inbound request capture. The lane that carries the product's core promise:
+  // the browser stamped its session and request ids on the fetch, and until this
+  // existed nothing on a non-Express backend read them back, so every session
+  // came back with zero backend requests and nothing linked.
+  //
+  // These events do NOT ride the headless session. They belong to the BROWSER's
+  // session — that is the whole point of the join — so each is posted to the
+  // session id the request carried, through the same intake the Express
+  // middleware uses. A request without one is never emitted, so there is nothing
+  // here to misfile.
+  let httpCapture: HttpRequestCaptureHandle | undefined;
+  if (options.captureHttpRequests !== false) {
+    try {
+      httpCapture = installHttpRequestCapture({
+        ...options.httpModules,
+        now: options.nowImpl,
+        ...(options.httpResponseCapture
+          ? { response: options.httpResponseCapture }
+          : {}),
+        emit: (event) => {
+          if (stopped) return;
+          const target =
+            typeof event.sessionId === "string" ? event.sessionId : undefined;
+          if (!target) return;
+          void sendBackendEvent({
+            event,
+            sessionId: target,
+            endpoint: options.endpoint,
+            ...(authToken ? { authToken } : {}),
+            ...(options.fetchImpl ? { fetch: options.fetchImpl } : {}),
+          })
+            .then((delivered) => {
+              if (!delivered) noteDropped(event.k);
+            })
+            .catch((sendErr) => {
+              noteDropped(event.k);
+              emitError(sendErr, { phase: "record", source: "console.error" });
+            });
+        },
+      });
+    } catch (error) {
+      emitError(error, { phase: "record", source: "console.error" });
+    }
+  }
+
+  // Outbound call capture. The lane that carries INFRASTRUCTURE.
+  //
+  // Everything above records what arrived and what this process did with it.
+  // None of it records what this process ASKED OF ANYTHING ELSE, and that is
+  // where an infrastructure failure lives: the checkout 500 is captured, the
+  // pricing call that timed out and caused it is not. `backend.http` is already
+  // read by the pricing, declined-payment and downstream-timeout detectors and
+  // rendered by the bundle as the calls the server made outward; nothing had
+  // ever produced one.
+  //
+  // Like the inbound recorder, these events belong to whichever session the
+  // request was correlated to, falling back to the process session, so they are
+  // posted through the intake rather than the headless session. The capture
+  // endpoint itself is excluded: ingest travels over the same transports, and
+  // observing it would make every captured event produce another one.
+  let outboundCapture: OutboundHttpCaptureHandle | undefined;
+  if (options.captureOutboundHttp !== false) {
+    try {
+      outboundCapture = installOutboundHttpCapture({
+        ...options.outboundHttpModules,
+        now: options.nowImpl,
+        ignoreOrigins: [options.endpoint],
+        emit: (event) => {
+          if (stopped) return;
+          const target =
+            typeof event.sessionId === "string" ? event.sessionId : undefined;
+          if (!target) return;
+          void sendBackendEvent({
+            event,
+            sessionId: target,
+            endpoint: options.endpoint,
+            ...(authToken ? { authToken } : {}),
+            ...(options.fetchImpl ? { fetch: options.fetchImpl } : {}),
+          })
+            .then((delivered) => {
+              if (!delivered) noteDropped(event.k);
+            })
+            .catch((sendErr) => {
+              noteDropped(event.k);
+              emitError(sendErr, { phase: "record", source: "console.error" });
+            });
         },
       });
     } catch (error) {
@@ -482,19 +1186,18 @@ export async function autoCapture(
   if (options.instrumentDatabases !== false) {
     try {
       dbInstrumentation = autoInstrumentDbClients({
-        emit: (event) => {
-          if (stopped || !session) return;
-          void session
-            .record(event)
-            .catch((sendErr) =>
-              emitError(sendErr, { phase: "record", source: "console.error" }),
-            );
-        },
+        emit: emitSessionEvent,
         drivers: options.databaseDrivers,
         resolve: options.databaseResolve,
       });
       const line = formatAutoInstrumentReport(dbInstrumentation);
-      if (line && debug) originalConsoleError.call(consoleRef, line);
+      // The success line stays behind `debug`: a healthy install is quiet. The
+      // "nothing was instrumented" line does NOT, because that is the sentence
+      // that explains a session with no database evidence in it, and leaving it
+      // behind a flag is what made that outcome look like a working install.
+      if (line && (debug || !autoInstrumentPatchedAnything(dbInstrumentation))) {
+        originalConsoleError.call(consoleRef, line);
+      }
     } catch (error) {
       emitError(error, { phase: "record", source: "console.error" });
     }
@@ -507,17 +1210,65 @@ export async function autoCapture(
     // stop() short-circuits and an in-flight handshake resolves to a discarded
     // session instead of arming further retries.
     stopped = true;
+    clearProcessSessionId(stableSessionId);
     if (consoleRef.error === patchedError) {
       consoleRef.error = originalError as typeof consoleRef.error;
     }
     proc.removeListener("uncaughtException", onUncaught);
     proc.removeListener("unhandledRejection", onUnhandled);
+    for (const [signal, handler] of signalHandlers) {
+      try {
+        proc.removeListener(signal as NodeJS.Signals, handler);
+      } catch {
+        // Nothing to restore if the seam never accepted the listener.
+      }
+    }
+    signalHandlers.clear();
     warningCapture?.stop();
+    logCapture?.stop();
+    httpCapture?.stop();
+    outboundCapture?.stop();
     dbInstrumentation?.restore();
     installed = false;
+    installedService = undefined;
   };
 
   return { sessionId: session?.sessionId, stop };
+}
+
+/** Normalize the held-event cap, refusing a negative or non-finite value. */
+function normalizePendingCap(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value))
+    return DEFAULT_MAX_PENDING_EVENTS;
+  return Math.max(0, Math.floor(value));
+}
+
+/**
+ * The process's own identity, carried on the session start and on the
+ * termination record. `pid` plus `startedAt` is what makes a restart legible: a
+ * second session for the same service with a different pid is a new process, and
+ * no event in the stream says that on its own.
+ */
+function describeProcess(proc: NodeJS.Process): Record<string, unknown> {
+  const record: Record<string, unknown> = {};
+  try {
+    if (typeof proc.pid === "number") record.pid = proc.pid;
+    const uptime = typeof proc.uptime === "function" ? proc.uptime() : undefined;
+    if (typeof uptime === "number" && Number.isFinite(uptime)) {
+      record.uptimeMs = Math.round(uptime * 1000);
+      record.startedAt = Math.round(Date.now() - uptime * 1000);
+    }
+    if (typeof proc.version === "string") record.node = proc.version;
+    if (typeof proc.platform === "string") record.platform = proc.platform;
+  } catch {
+    // A process seam that answers none of this still gets a session.
+  }
+  return record;
+}
+
+/** A service name for a message, or the phrase for a call that named none. */
+function describeService(service: string | undefined): string {
+  return service ? `service "${service}"` : "an unnamed service";
 }
 
 /** Truthy for `1`/`true`/`yes`/`on` (case-insensitive); false for unset/empty. */
@@ -540,7 +1291,21 @@ function refusalSentence(error: HeadlessRequestError, phase: string): string {
   return (
     `the capture endpoint refused ${refused} with HTTP ${error.status}` +
     `${error.serverMessage ? `: ${error.serverMessage}` : ""}` +
-    "; nothing from this session will be captured"
+    "; nothing from this session will be captured" +
+    (error.status === 401 ? ` ${missingKeyHint()}` : "")
+  );
+}
+
+/**
+ * A 401 reads as "your key is wrong", and the key is usually fine: the process was
+ * started from a directory the `.env` holding it is not in, so no key was ever loaded
+ * and none was sent. Naming the mechanism costs one sentence and saves the reader from
+ * rotating a working key.
+ */
+function missingKeyHint(): string {
+  return (
+    "The key is read from a .env file in the package directory, so check the working " +
+    `directory the process was started from (currently ${process.cwd()}).`
   );
 }
 
@@ -563,14 +1328,25 @@ function generateSessionId(): string {
   return `auto_${Date.now().toString(36)}_${random}`;
 }
 
-function buildErrorEvent(error: unknown, source: AutoCaptureSource): BugEvent {
+function buildErrorEvent(
+  error: unknown,
+  source: AutoCaptureSource,
+  logMessage?: string,
+): BugEvent {
   const normalized = normalizeError(error);
+  // The request being handled when this was raised, when there was one. A
+  // `console.error` inside a handler is the same failure as the 500 the browser
+  // saw; without the request's id on it, the two are two issues that each
+  // report no counterpart found.
+  const correlation = readRequestCorrelation();
   return {
     t: Date.now(),
     k: AUTO_CAPTURE_ERROR_EVENT,
     d: {
       source,
       error: normalized,
+      ...(logMessage ? { message: bounded(logMessage, MAX_MESSAGE) } : {}),
+      ...(correlation?.requestId ? { requestId: correlation.requestId } : {}),
     },
   };
 }

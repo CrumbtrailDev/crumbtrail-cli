@@ -19,6 +19,7 @@ import {
   executePlan,
   findNearbyProjectDirs,
   localFsReader,
+  PROCESS_WRAPPER_REASON,
   type DetectResult,
   type PackageManager,
   type Plan,
@@ -32,6 +33,7 @@ import {
   fetchIdentity,
   loadAuth,
   openBrowser,
+  reportedAppBase,
 } from "./auth";
 import {
   exitCodeFor,
@@ -52,6 +54,7 @@ import {
   uniqueServiceNames,
   UpgradeRequiredError,
   type ProvisionResult,
+  type ServiceIdentity,
 } from "./provision";
 import {
   applyEnvEdits,
@@ -72,7 +75,7 @@ import { discoverServices, type ServiceCandidate } from "./discover";
 import { isBackendRecipe, resolveBackendOrigins } from "./backend-origins";
 import { otlpGuidePlan, renderOtlpGuide } from "./otlp-guide";
 import { RECIPE_REGISTRY, sdkInstallSpec } from "./recipe-registry";
-import { dashboardBase, resolveEndpoint } from "./net";
+import { APP_URL_ENV_VAR, dashboardBase, resolveEndpoint } from "./net";
 import {
   color,
   consoleUi,
@@ -118,6 +121,98 @@ function __dirnameCompat(): string {
   return process.cwd();
 }
 
+/** Order two dotted numeric versions. A prerelease suffix sorts below its release. */
+export function compareSdkVersions(a: string, b: string): number {
+  const parts = (v: string): number[] => {
+    const core = /^(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
+    if (!core) return [0, 0, 0, 0];
+    const prerelease = /^\d+\.\d+\.\d+-/.test(v.trim()) ? 0 : 1;
+    return [Number(core[1]), Number(core[2]), Number(core[3]), prerelease];
+  };
+  const left = parts(a);
+  const right = parts(b);
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return left[i] < right[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+/** A released x.y.z, or undefined for anything else (prerelease, unreadable). */
+function releaseVersion(version: string): string | undefined {
+  return /^\d+\.\d+\.\d+$/.test(version.trim()) ? version.trim() : undefined;
+}
+
+/**
+ * The install spec for one SDK package, floored at THIS CLI's own version.
+ *
+ * `SDK_VERSION_FLOORS` is a CAPABILITY floor — the oldest SDK the recipes still
+ * work against — and it is deliberately not raised for every release. That is
+ * the right rule for a resolver that takes the newest matching version, and the
+ * wrong one for pnpm 10+/11, whose release-age gate silently skips versions
+ * published in the last few days: a run of `crumbtrail` 0.37.0 asking for
+ * `>=0.31.0` resolved `crumbtrail-node` 0.36.0 hours after 0.37.0 shipped, and
+ * 0.36.0's backend log capture does not work. The SDKs and the CLI are released
+ * in lockstep, so the CLI's own version is a version that exists on the
+ * registry, and asking for it by name is what makes pnpm's gate step aside.
+ * The capability floor still wins when it is HIGHER (a CLI older than the
+ * recipes it carries cannot happen, but the max costs nothing).
+ */
+export function sdkInstallSpecForCli(
+  pkg: string,
+  cliVersion: string = readVersion(),
+): string {
+  const declared = sdkInstallSpec(pkg);
+  const capabilityFloor = declared.startsWith(`${pkg}@>=`)
+    ? declared.slice(pkg.length + 3)
+    : undefined;
+  // A prerelease CLI must not demand a prerelease SDK that was never published.
+  const ownVersion = releaseVersion(cliVersion);
+  if (!ownVersion) return declared;
+  if (!capabilityFloor) return `${pkg}@>=${ownVersion}`;
+  return compareSdkVersions(ownVersion, capabilityFloor) > 0
+    ? `${pkg}@>=${ownVersion}`
+    : declared;
+}
+
+/**
+ * The version of `pkg` as it actually sits on disk for an app at `cwd`, or
+ * undefined when it is not there. Walks up through parent `node_modules` because
+ * npm and yarn hoist, and a pnpm workspace links the dependency into the app's
+ * own `node_modules` while the store lives at the root.
+ *
+ * This is the only honest answer to "did the install work". A package manager's
+ * exit code is not: pnpm 10+/11 exits 1 with ERR_PNPM_IGNORED_BUILDS whenever
+ * ANY dependency in the tree has an unapproved build script (esbuild, sharp,
+ * prisma…), long after the packages it was asked to add are installed.
+ */
+export function resolvedSdkVersion(
+  cwd: string,
+  pkg: string,
+): string | undefined {
+  let dir = path.resolve(cwd);
+  for (;;) {
+    const manifest = path.join(
+      dir,
+      "node_modules",
+      ...pkg.split("/"),
+      "package.json",
+    );
+    try {
+      const parsed = JSON.parse(readFileSync(manifest, "utf8")) as {
+        version?: string;
+      };
+      if (typeof parsed.version === "string" && parsed.version.trim()) {
+        return parsed.version.trim();
+      }
+    } catch {
+      // not here — keep walking up
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
 export type Command =
@@ -159,6 +254,20 @@ export interface ParsedArgs {
   json: boolean;
   /** Non-flag/subcommand leftover — an unknown token triggers usage help. */
   unknown?: string;
+  /** A flag that needs a value was used without one. */
+  parseError?: string;
+}
+
+function flagValue(
+  args: string[],
+  index: number,
+  flag: string,
+): { value?: string; error?: string } {
+  const value = args[index + 1];
+  if (!value || value.startsWith("-")) {
+    return { error: `${flag} requires a value.` };
+  }
+  return { value };
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -198,13 +307,34 @@ export function parseArgs(argv: string[]): ParsedArgs {
         parsed.noWriteKey = true;
         break;
       case "--project":
-        parsed.project = args[++i];
+        {
+          const value = flagValue(args, i, a);
+          if (value.error) parsed.parseError ??= value.error;
+          else {
+            parsed.project = value.value;
+            i += 1;
+          }
+        }
         break;
       case "--endpoint":
-        parsed.endpoint = args[++i];
+        {
+          const value = flagValue(args, i, a);
+          if (value.error) parsed.parseError ??= value.error;
+          else {
+            parsed.endpoint = value.value;
+            i += 1;
+          }
+        }
         break;
       case "--key":
-        parsed.key = args[++i];
+        {
+          const value = flagValue(args, i, a);
+          if (value.error) parsed.parseError ??= value.error;
+          else {
+            parsed.key = value.value;
+            i += 1;
+          }
+        }
         break;
       case "--json":
         parsed.json = true;
@@ -213,22 +343,46 @@ export function parseArgs(argv: string[]): ParsedArgs {
         parsed.all = true;
         break;
       case "--only":
-        (parsed.only ??= []).push(args[++i]);
+        {
+          const value = flagValue(args, i, a);
+          if (value.error) parsed.parseError ??= value.error;
+          else {
+            (parsed.only ??= []).push(value.value as string);
+            i += 1;
+          }
+        }
         break;
       case "--workspace":
-        parsed.workspace = args[++i];
+        {
+          const value = flagValue(args, i, a);
+          if (value.error) parsed.parseError ??= value.error;
+          else {
+            parsed.workspace = value.value;
+            i += 1;
+          }
+        }
         break;
       default:
         if (a.startsWith("--project=")) {
-          parsed.project = a.slice("--project=".length);
+          const value = a.slice("--project=".length).trim();
+          if (value) parsed.project = value;
+          else parsed.parseError ??= "--project requires a value.";
         } else if (a.startsWith("--endpoint=")) {
-          parsed.endpoint = a.slice("--endpoint=".length);
+          const value = a.slice("--endpoint=".length).trim();
+          if (value) parsed.endpoint = value;
+          else parsed.parseError ??= "--endpoint requires a value.";
         } else if (a.startsWith("--key=")) {
-          parsed.key = a.slice("--key=".length);
+          const value = a.slice("--key=".length).trim();
+          if (value) parsed.key = value;
+          else parsed.parseError ??= "--key requires a value.";
         } else if (a.startsWith("--only=")) {
-          (parsed.only ??= []).push(a.slice("--only=".length));
+          const value = a.slice("--only=".length).trim();
+          if (value) (parsed.only ??= []).push(value);
+          else parsed.parseError ??= "--only requires a value.";
         } else if (a.startsWith("--workspace=")) {
-          parsed.workspace = a.slice("--workspace=".length);
+          const value = a.slice("--workspace=".length).trim();
+          if (value) parsed.workspace = value;
+          else parsed.parseError ??= "--workspace requires a value.";
         } else if (
           !commandSet &&
           (a === "login" || a === "logout" || a === "token" || a === "verify")
@@ -283,6 +437,21 @@ function usage(): string {
       "With more than one app, run it from the repo root: it scans every workspace and service,",
     ),
     color.dim("shows you what it found, and wires the ones you pick."),
+    "",
+    // Help used to say "browser" exactly once, in an unrelated login flag, so a
+    // reader came away certain this was a backend-only product and that the
+    // frontend half of their app was out of scope. It is not: browser capture
+    // is the primary frontend path, and help is where that has to be visible.
+    head("What it captures"),
+    `  ${color.bold("Browser".padEnd(9))}console, network, DOM and errors — Next.js, SvelteKit, Nuxt, Remix,`,
+    color.dim(
+      "           Astro, Angular, Vite SPA, Capacitor, React Native, Flutter, and",
+    ),
+    color.dim("           plain static pages (wired with a script tag)."),
+    `  ${color.bold("Server".padEnd(9))}requests, crashes, logs and SQL — Express, NestJS, Fastify, Hono,`,
+    color.dim(
+      "           a plain Node server, and Django/Flask/FastAPI/Go/Rails/.NET over OTLP.",
+    ),
     "",
     head("Options"),
     flag("--yes, -y", "Skip confirmations (required with --project in CI)"),
@@ -340,12 +509,55 @@ export interface InstallSdkInput {
   spawnFn?: (cmd: string, args: string[], cwd: string) => number;
   /** Injected fetch for the tarball-manifest fallback (tests); defaults to global. */
   fetchImpl?: typeof fetch;
+  /** Injected on-disk version reader (tests); defaults to `resolvedSdkVersion`. */
+  resolvedVersionFn?: (cwd: string, pkg: string) => string | undefined;
+  /** This CLI's own version (tests); defaults to its package.json. */
+  cliVersion?: string;
 }
 
 export interface InstallSdkResult {
   installed: boolean;
   packages: string[];
   note?: string;
+}
+
+/**
+ * A loud line when the SDK that landed is OLDER than the CLI that wired it.
+ *
+ * The CLI and the SDKs ship in lockstep, so anything below this CLI's version
+ * is a resolver that did not take what was asked for — in practice pnpm's
+ * `minimumReleaseAge` gate skipping a version published in the last few days.
+ * That is invisible in the install output (pnpm prints a quiet "0.37.0 is
+ * available" line), and the user's app then captures with an SDK whose
+ * behaviour does not match what setup just told them. Naming the cause and the
+ * exact command is the difference between a five-minute fix and a bug report.
+ */
+function staleSdkNote(
+  cwd: string,
+  packages: string[],
+  cliVersion: string,
+  cmd: string,
+  add: string,
+  resolveVersion: (cwd: string, pkg: string) => string | undefined,
+): string | undefined {
+  const own = releaseVersion(cliVersion);
+  if (!own) return undefined;
+  const stale: string[] = [];
+  for (const pkg of packages) {
+    const version = resolveVersion(cwd, pkg);
+    if (version && compareSdkVersions(version, own) < 0) {
+      stale.push(`${pkg}@${version}`);
+    }
+  }
+  if (stale.length === 0) return undefined;
+  const pinned = packages.map((pkg) => `${pkg}@${own}`).join(" ");
+  return (
+    `Your package manager installed ${stale.join(", ")}, older than this ` +
+    `CLI (${own}). The usual cause is a release-age setting that skips ` +
+    `recently published versions (pnpm's minimumReleaseAge, on by default in ` +
+    `pnpm 10 and 11). Older SDKs do not capture everything this setup ` +
+    `assumes, so pin them: \`${cmd} ${add} ${pinned}\`.`
+  );
 }
 
 function sdkPackagesFor(recipe: Recipe): string[] {
@@ -363,6 +575,79 @@ function pmInvocation(pm: PackageManager | null): { cmd: string; add: string } {
     default:
       return { cmd: "npm", add: "install" };
   }
+}
+
+// ── Repository identity ──────────────────────────────────────────────────────
+
+/**
+ * Read one value out of git, or nothing.
+ *
+ * Config reads only: neither query compares the working tree against the index,
+ * so neither makes git hash a file, so neither can run a repository's clean
+ * filter. Same property env-file.ts relies on, and the reason this is safe to
+ * run in a repository this process did not create. Machine level config is
+ * excluded so a surrounding hook cannot change the answer.
+ */
+function gitValue(cwd: string, args: string[]): string | null {
+  try {
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")),
+    );
+    env.GIT_CONFIG_GLOBAL = "/dev/null";
+    env.GIT_CONFIG_SYSTEM = "/dev/null";
+    const res = spawnSync("git", ["-c", "core.fsmonitor=false", ...args], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      env,
+    });
+    if (res.status !== 0 || typeof res.stdout !== "string") return null;
+    return res.stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A remote URL reduced to the repository it names, so the same repository
+ * reads the same however it was cloned: `git@github.com:acme/api.git`,
+ * `https://github.com/acme/api.git` and `ssh://git@github.com/acme/api` all
+ * become `github.com/acme/api`.
+ */
+export function normalizeRepoUrl(url: string): string {
+  let s = url.trim();
+  s = s.replace(/\.git$/i, "");
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  s = s.replace(/^[^@/]+@/, "");
+  // scp style `host:path`, but not `host:port/path`: rewriting a port would
+  // report one self hosted repository under two names depending on the URL the
+  // reader happened to clone with.
+  s = s.replace(/^([^/:]+):(?!\d+\/)/, "$1/");
+  s = s.replace(/\/+$/, "");
+  return s.toLowerCase();
+}
+
+/**
+ * Which repository, and which directory inside it, is being wired.
+ *
+ * A project holds one application per name, ignoring case, so `api` in this
+ * repository and `api` in another are one row to the cloud and their events
+ * arrive mixed. This is the identity that tells them apart, and it is sent with
+ * every create.
+ *
+ * The repository is taken from the origin remote and from nothing else. A
+ * directory basename would be a guess, and a wrong guess here reports two
+ * checkouts of one repository as two different repositories.
+ */
+export function serviceIdentity(appDir: string): ServiceIdentity {
+  const top = gitValue(appDir, ["rev-parse", "--show-toplevel"]);
+  const root = top ?? appDir;
+  const remote = gitValue(root, ["remote", "get-url", "origin"]);
+  const sourcePath = path.relative(root, appDir) || ".";
+  return {
+    sourcePath,
+    ...(remote ? { repo: normalizeRepoUrl(remote) } : {}),
+  };
 }
 
 function realSpawn(cmd: string, args: string[], cwd: string): number {
@@ -462,10 +747,12 @@ export async function installSdk(
   }
 
   const { cmd, add } = pmInvocation(input.packageManager);
-  // Pin the registry install to the CLI's version floors so a stale dist-tag
-  // can never leave a freshly wired service on an old SDK. The tarball fallback
-  // below keeps bare names (tarball URLs are resolved by name prefix).
-  const specs = packages.map(sdkInstallSpec);
+  // Pin the registry install to at least this CLI's own version, so neither a
+  // stale dist-tag nor a package manager's release-age gate can leave a freshly
+  // wired service on an older SDK. The tarball fallback below keeps bare names
+  // (tarball URLs are resolved by name prefix).
+  const cliVersion = input.cliVersion ?? readVersion();
+  const specs = packages.map((pkg) => sdkInstallSpecForCli(pkg, cliVersion));
   // Specs carry a `>=` range. Spawning below is shell-free so the raw argv is
   // correct, but the echoed line is something people copy into a shell, where
   // an unquoted `>` would redirect stdout into a file. Quote it for display.
@@ -473,9 +760,38 @@ export async function installSdk(
   input.ui.out(
     `  ${color.dim("Installing SDK:")} ${color.brand(`${cmd} ${add} ${shown}`)}`,
   );
+  const resolveVersion = input.resolvedVersionFn ?? resolvedSdkVersion;
   const code = run(cmd, [add, ...specs], input.cwd);
+  const versionNote = (): string | undefined =>
+    staleSdkNote(input.cwd, packages, cliVersion, cmd, add, resolveVersion);
   if (code === 0) {
-    return { installed: true, packages };
+    const note = versionNote();
+    return { installed: true, packages, ...(note ? { note } : {}) };
+  }
+
+  // A nonzero exit is not the same as "not installed". pnpm 10+/11 exits 1 with
+  // ERR_PNPM_IGNORED_BUILDS whenever ANY dependency in the tree has an
+  // unapproved build script — esbuild, sharp and prisma between them cover a
+  // large share of real repos — with the packages it was asked to add already
+  // on disk. Trusting the code alone made the wizard announce "crumbtrail-node
+  // is not installed", withhold the wiring, and send the user round a loop that
+  // could not end: running the add command by hand succeeds-with-warning in
+  // exactly the same way. Ask the disk instead.
+  const onDisk = packages.map((pkg) => resolveVersion(input.cwd, pkg));
+  if (onDisk.every((version) => version !== undefined)) {
+    const stale = versionNote();
+    const landed = packages.map((pkg, i) => `${pkg}@${onDisk[i]}`).join(", ");
+    const plural = packages.length > 1 ? "are" : "is";
+    return {
+      installed: true,
+      packages,
+      note:
+        `${cmd} exited nonzero but ${landed} ${plural} installed, so setup ` +
+        `continued. The message ${cmd} printed above is about your project, ` +
+        `not about Crumbtrail — pnpm exits nonzero for ignored build scripts ` +
+        `(ERR_PNPM_IGNORED_BUILDS) even when the add succeeded.` +
+        (stale ? ` ${stale}` : ""),
+    };
   }
 
   // Registry install failed — fall back to the deploy's packed tarballs,
@@ -540,6 +856,12 @@ export interface WizardDeps {
   runPreflight: typeof runPreflight;
   /** Browser opener for the end-of-wizard dashboard hand-off (stub in tests). */
   openBrowserFn?: (url: string) => Promise<boolean>;
+  /**
+   * The saved login on this machine, which decides the endpoint prompt's
+   * default. Injectable so a test does not answer from the developer's own
+   * ~/.config/crumbtrail/auth.json.
+   */
+  loadStoredAuth?: typeof loadAuth;
   ui: Ui;
   prompter: Prompter;
   env: NodeJS.ProcessEnv;
@@ -565,6 +887,7 @@ export function defaultDeps(): WizardDeps {
     pollForServices,
     runPreflight,
     openBrowserFn: openBrowser,
+    loadStoredAuth: loadAuth,
     ui: consoleUi,
     prompter: stdinPrompter,
     env: process.env,
@@ -575,6 +898,20 @@ export function defaultDeps(): WizardDeps {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/** name + dependencies of a package directory, for the import overlap check. */
+function readPkgDeps(
+  dir: string,
+): { name?: string; dependencies?: unknown } | null {
+  try {
+    return JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as {
+      name?: string;
+      dependencies?: unknown;
+    };
+  } catch {
+    return null;
+  }
+}
 
 function readPkgName(dir: string): string | null {
   try {
@@ -637,18 +974,66 @@ export function resolveWorkspaceDir(
 
 // ── Wizard ───────────────────────────────────────────────────────────────────
 
+/**
+ * The endpoint this run will send data to, confirmed out loud.
+ *
+ * A run that took the hosted default in silence looked identical to one the
+ * user had chosen: the header printed the URL, nothing ever asked, and someone
+ * setting up against a local stack only found out after the wizard had created
+ * a project on the wrong deployment. So when nothing stated an endpoint —
+ * no `--endpoint`, no CRUMBTRAIL_BASE_URL — the interactive run asks, with a
+ * default pre-filled so Enter still means something sane.
+ *
+ * That default is the endpoint of a saved login when this machine has one. A
+ * run that had just done `crumbtrail login --endpoint http://127.0.0.1:19890`
+ * was offered the hosted cloud as the default, then printed "Using your saved
+ * Crumbtrail login for http://127.0.0.1:19890" two lines later, so pressing
+ * Enter wired the whole app to a deployment the run had no login for. The
+ * login this machine actually holds is the honest default; the hosted cloud is
+ * the default only when there is no login to speak for.
+ * `--yes` and non-interactive shells take the same default without a prompt.
+ */
+export async function confirmEndpoint(
+  parsed: ParsedArgs,
+  deps: WizardDeps,
+  base: string,
+): Promise<string> {
+  const stated =
+    (parsed.endpoint && parsed.endpoint.trim()) ||
+    (deps.env.CRUMBTRAIL_BASE_URL && deps.env.CRUMBTRAIL_BASE_URL.trim());
+  if (stated) return base;
+  const savedEndpoint = (deps.loadStoredAuth ?? loadAuth)(
+    deps.env,
+  )?.endpoint?.trim();
+  const preferred = savedEndpoint
+    ? resolveEndpoint(savedEndpoint, deps.env)
+    : base;
+  if (parsed.yes || !deps.isTTY) return preferred;
+  const answer = await deps.prompter.ask(
+    preferred === base
+      ? "Which Crumbtrail endpoint should this project send to?"
+      : `Which Crumbtrail endpoint should this project send to? You are logged in to ${preferred}.`,
+    preferred,
+  );
+  return resolveEndpoint(answer, deps.env);
+}
+
 export async function runWizard(
   parsed: ParsedArgs,
   deps: WizardDeps,
 ): Promise<number> {
   const { ui } = deps;
-  const base = resolveEndpoint(parsed.endpoint, deps.env);
+  let base = resolveEndpoint(parsed.endpoint, deps.env);
   // Captured at wizard entry: the real-event poll only accepts sessions started
   // at/after this instant, so a stale session from a prior run can't be
   // mistaken for "your first event" (verify.ts wizardStart filter).
   const wizardStart = Date.now();
 
   for (const line of banner(readVersion(), TAGLINE)) ui.out(line);
+  // Printed once, and only once the endpoint is settled: printing the default
+  // first and the answer second showed two Endpoint lines to a run that was
+  // never asked anything, and the first of them was not where the run went.
+  base = await confirmEndpoint(parsed, deps, base);
   ui.out(color.dim(`  Endpoint  ${base}`));
 
   // 1. Detect. A monorepo root forks to the batch installer, which scans every
@@ -799,6 +1184,9 @@ export async function runWizard(
       projectId: parsed.project,
       defaultProjectName,
       defaultServiceName,
+      // Which repository this app is, so a project that already holds an
+      // application of the same name from somewhere else is not reused blind.
+      identity: serviceIdentity(cwd),
       identityLabel,
       fetchImpl: deps.fetchImpl,
     });
@@ -840,6 +1228,15 @@ export async function runWizard(
       // single-package run knows of no sibling services, so that is the whole
       // source here; the batch path adds the backends it is wiring alongside.
       backendOrigins: singleAppOrigins,
+      // Only the `static` recipe reads these: it emits a CDN module URL pinned
+      // to this CLI's release, and a key literal that has to say where the real
+      // value is minted.
+      sdkVersion: readVersion(),
+      mintUrl: appUrl(
+        appBaseFor(base, deps.env),
+        "/setup",
+        provisioned.projectId,
+      ),
       options: { force: parsed.yes },
     },
     defaultInjectIO,
@@ -851,7 +1248,10 @@ export async function runWizard(
   // after installSdk used to leave package.json changed, and the later env-key
   // write still happened after a "No". Review every local write first so a
   // decline really means hands-off.
-  const injectionDecision = await confirmInjection(plan, parsed, deps);
+  const injectionDecision = await confirmInjection(plan, parsed, deps, {
+    projectName: provisioned.projectName,
+    serviceName: provisioned.serviceName,
+  });
   const install: InstallSdkResult = injectionDecision.approved
     ? await deps.installSdk({
         cwd,
@@ -864,6 +1264,10 @@ export async function runWizard(
     : { installed: false, packages: [] };
   if (install.installed) {
     ui.out(ok(`Installed ${color.bold(install.packages.join(", "))}.`));
+    // An install can succeed and still be worth a word: a nonzero exit code the
+    // wizard looked past, or a version older than this CLI. Printing it only on
+    // failure hid both.
+    if (install.note) ui.out(alert(color.yellow(install.note)));
   } else if (install.note) {
     ui.out(alert(color.yellow(install.note)));
   }
@@ -919,9 +1323,12 @@ export async function runWizard(
   // 8. Next steps. With the key on disk the first-event wait is a real wait on
   // the app starting, rather than a wait on a manual step nobody was told to do.
   const notes: string[] = [];
-  if (!install.installed && install.note) notes.push(install.note);
+  if (provisioned.adoptionNote) notes.push(provisioned.adoptionNote);
+  if (install.note) notes.push(install.note);
   notes.push(...inject.notes);
-  notes.push(...correlationNotes(result.recipe, singleAppOrigins, 0));
+  notes.push(
+    ...correlationNotes(result.recipe, singleAppOrigins, 0, inject.outcome),
+  );
   if (keyWrite.note) notes.push(keyWrite.note);
 
   const keyReady =
@@ -950,6 +1357,9 @@ export async function runWizard(
     inject.outcome === "guidance" || inject.outcome === "declined";
 
   let sessionUrl: string | undefined;
+  // What this run can honestly say about capture. It starts as "no wait ran",
+  // and only the poll finding an event is allowed to move it to confirmed.
+  let capture: CaptureState = "unverified";
   if (parsed.skipVerify) {
     notes.push("Verification skipped (--skip-verify).");
   } else if (nothingWired) {
@@ -987,7 +1397,7 @@ export async function runWizard(
         ),
       );
       printEvidenceSourcesPointer(ui, base, provisioned.projectId);
-      printSummary(
+      const incomplete = printSummary(
         ui,
         base,
         provisioned,
@@ -1000,9 +1410,17 @@ export async function runWizard(
         plan.keyIsCompileTime,
         inject.outcome === "guidance" ||
           inject.outcome === "withheld" ||
-          inject.outcome === "declined",
+          inject.outcome === "declined" ||
+          // A page with no bundler carries its key as a literal, so nothing was
+          // written and the run really does have one step left.
+          plan.keyIsSourceLiteral === true,
+        plan.keyIsSourceLiteral === true,
+        // The endpoint refused the key on disk, so nothing this run wired can
+        // report until that value is replaced. The bar and the exit code both
+        // have to say so.
+        { capture: "none", keyRejected: true },
       );
-      return 0;
+      return incomplete ? 1 : 0;
     }
     const poll = await pollWithSigint(
       base,
@@ -1021,6 +1439,7 @@ export async function runWizard(
             provisioned.projectId,
           )
         : appUrl(appBase, "/issues", provisioned.projectId);
+      capture = "confirmed";
       ui.out(ok(color.bold("First real event received.")));
       ui.out(`  Watch it live: ${color.brand(sessionUrl)}`);
       if (canUseBrowser(parsed.noBrowser, deps.env)) {
@@ -1030,10 +1449,14 @@ export async function runWizard(
         }
       }
     } else if (poll.outcome === "cancelled") {
+      // The wait was cut short by the reader, so the run learned nothing about
+      // capture either way.
+      capture = "unverified";
       notes.push(
         "Stopped waiting for the first event — load your app any time.",
       );
     } else {
+      capture = "none";
       // Which step is still outstanding, rather than one sentence about the
       // dev server. Two outcomes reach this wait with nothing injected — a
       // fallback snippet the user was asked to paste, and a prepend they
@@ -1058,7 +1481,7 @@ export async function runWizard(
   }
 
   // 7. Summary.
-  printSummary(
+  const incomplete = printSummary(
     ui,
     base,
     provisioned,
@@ -1071,9 +1494,15 @@ export async function runWizard(
     plan.keyIsCompileTime,
     inject.outcome === "guidance" ||
       inject.outcome === "withheld" ||
-      inject.outcome === "declined",
+      inject.outcome === "declined" ||
+      plan.keyIsSourceLiteral === true,
+    plan.keyIsSourceLiteral === true,
+    { capture },
   );
-  return 0;
+  // The exit code follows the bar: a step still on the reader is a failure a
+  // script can act on, and a wired app that has simply not been started yet is
+  // not.
+  return incomplete ? 1 : 0;
 }
 
 /**
@@ -1085,19 +1514,54 @@ export async function runWizard(
  * that actually exist so it can't over-promise.
  */
 /**
- * The dashboard origin for `base`, preferring what the deployment reported when
- * this CLI logged in. Falls back to the hosted guess for a run with no stored
- * login (an env token in CI), which is where the guess is right anyway.
+ * What this deployment has said its dashboard origin is: anything it reported
+ * during this run first, then a saved login for the SAME endpoint.
+ *
+ * The token's source is deliberately not part of this. It used to be, by
+ * accident: only the login path recorded an appBaseUrl, so a run authenticated
+ * by CRUMBTRAIL_TOKEN fell through to the guess and finished by printing
+ * `Dashboard: http://127.0.0.1:19890/...` — the API port — which 404s on every
+ * split-origin deployment, local stacks included.
+ */
+function reportedAppBaseFor(
+  base: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const runReported = reportedAppBase(base);
+  if (runReported) return runReported;
+  const stored = loadAuth(env);
+  return stored && stored.endpoint === base ? stored.appBaseUrl : undefined;
+}
+
+/**
+ * The dashboard origin for `base`, preferring what the deployment reported.
+ * Falls back to the hosted guess, which is right for the hosted default and a
+ * guess everywhere else — see `dashboardGuessCaveat`.
  */
 function appBaseFor(
   base: string,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const stored = loadAuth(env);
-  return dashboardBase(
-    base,
-    stored && stored.endpoint === base ? stored.appBaseUrl : undefined,
-    env,
+  return dashboardBase(base, reportedAppBaseFor(base, env), env);
+}
+
+/**
+ * One line when the dashboard link is a GUESS rather than something the
+ * deployment reported, and the guess is the kind that 404s: a split-origin
+ * self-host or local stack. Silence would leave the user clicking a dead link
+ * with nothing naming the fix.
+ */
+function dashboardGuessCaveat(
+  base: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (env[APP_URL_ENV_VAR]?.trim()) return undefined;
+  if (reportedAppBaseFor(base, env)) return undefined;
+  if (appBaseFor(base, env) !== base) return undefined;
+  return (
+    `${base} did not report a dashboard origin, so the links above assume it ` +
+    `serves the dashboard itself. If they 404, set ${APP_URL_ENV_VAR} to your ` +
+    `dashboard origin (locally that is usually port 19892) and run this again.`
   );
 }
 
@@ -1170,6 +1634,14 @@ export interface ServiceOutcome {
   keyIsCompileTime?: boolean;
   /** True when the service has a key available for the configured variable. */
   keyReady?: boolean;
+  /**
+   * The key this service carries was presented to the endpoint and refused.
+   *
+   * Separate from `keyReady`, which only says a value reached the env file. A
+   * rejected key is a service that will not report a single event, so it must
+   * not wear the same tick, or sit in the same "wired" count, as one that will.
+   */
+  keyRejected?: boolean;
   filesTouched: string[];
   notes: string[];
   error?: string;
@@ -1201,8 +1673,15 @@ function candidateHint(c: ServiceCandidate): string {
       : `${stack} · guidance writes a setup file`;
   if (c.flags.includes("already-wired"))
     return `${stack} · complete for this endpoint, skipped`;
-  if (c.flags.includes("ambiguous"))
+  if (c.flags.includes("ambiguous")) {
+    // A wrapper refusal is not "entry unclear" — the entry was found and
+    // rejected for a reason the reader can act on, and saying so is what stops
+    // them from wiring the wrapper by hand afterwards.
+    if (c.detected.reasons.some((r) => r.startsWith(PROCESS_WRAPPER_REASON))) {
+      return `${stack} · starts through a shared process wrapper, so selecting shows the snippet for its real entry`;
+    }
     return `${stack} · entry unclear, selecting shows the setup guidance`;
+  }
   if (c.integration?.found && !c.integration.complete)
     return `${stack} · setup incomplete, selecting shows what is missing`;
   return `${stack} · selecting installs and wires it`;
@@ -1219,20 +1698,57 @@ export function correlationNotes(
   recipe: Recipe,
   origins: readonly string[],
   backendCount: number,
+  outcome: ServiceStatus = "wired",
 ): string[] {
   if (isBackendRecipe(recipe)) return [];
+  // The init these recipes write carries no networkCorrelationAllowedOrigins
+  // field at all, so any note here describes a setting the reader cannot find
+  // in their own code — and, worse, certifies a join that nothing performs.
+  if (NO_CORRELATION_FIELD_RECIPES.has(recipe)) return [];
+  // Nothing about correlation reached this repo. `withheld` touched no file,
+  // and an already-complete service was not re-read for origins this run, so
+  // whatever its init lists is not something this run may speak for.
+  if (
+    outcome === "withheld" ||
+    outcome === "failed" ||
+    outcome === "skipped-already-wired"
+  )
+    return [];
+  // The init exists only in the terminal: injection fell back to a snippet, or
+  // the edit was declined. The snippet DOES carry the computed origins, so the
+  // honest tense is future — what pasting it will turn on, not what is on.
+  const pending = outcome === "guidance" || outcome === "declined";
+  const cors =
+    "Each of those must allow x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent in its CORS allowed headers, or the browser blocks the preflight.";
   if (origins.length > 0) {
     return [
-      `Frontend to backend correlation enabled for ${origins.join(", ")}. Each of those must allow x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent in its CORS allowed headers, or the browser blocks the preflight. Calls to any other origin stay unjoined until you add it to networkCorrelationAllowedOrigins.`,
+      pending
+        ? `The snippet above sets frontend to backend correlation for ${origins.join(", ")}; it is not enabled until you paste it in. ${cors} Calls to any other origin stay unjoined until you add it to networkCorrelationAllowedOrigins.`
+        : `Frontend to backend correlation enabled for ${origins.join(", ")}. ${cors} Calls to any other origin stay unjoined until you add it to networkCorrelationAllowedOrigins.`,
     ];
   }
   if (backendCount > 0) {
+    // Never say "add the origin" without saying what the origin must then
+    // allow: the SDK starts stamping three headers on those calls, and a
+    // backend whose CORS allowlist predates them blocks the app's own
+    // requests at the preflight.
+    const where = pending ? "the snippet above" : "the injected init";
     return [
-      "No backend origin could be read from this app's config, so networkCorrelationAllowedOrigins is empty and its calls to the backend will not join the same session. Add the API origin to that list in the injected init.",
+      `No backend origin could be read from this app's config, so networkCorrelationAllowedOrigins is empty and its calls to the backend will not join the same session. Add the API origin to that list in ${where}, and add x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent to that backend's CORS allowed headers at the same time, or the browser blocks the preflight.`,
     ];
   }
   return [];
 }
+
+/**
+ * Recipes whose injected init has no `networkCorrelationAllowedOrigins` field.
+ *
+ * Tauri initialises with a `transportInstance` and nothing else; Flutter's Dart
+ * init carries no origin list either. Emitting a correlation note for them told
+ * the user a join was on, over a snippet that has no such setting anywhere in
+ * it.
+ */
+const NO_CORRELATION_FIELD_RECIPES = new Set<Recipe>(["tauri", "flutter"]);
 
 function toMultiSelectItems(candidates: ServiceCandidate[]): MultiSelectItem[] {
   return candidates.map((c) => ({
@@ -1244,13 +1760,65 @@ function toMultiSelectItems(candidates: ServiceCandidate[]): MultiSelectItem[] {
 }
 
 /**
+ * Why `--all` left a package alone, in the package's own terms.
+ *
+ * A library that gets wired is worse than one that is skipped: the app that
+ * imports it runs the library's capture first, and every session from that
+ * process is then filed under the library's name while the real service reports
+ * nothing at all. So `--all` means every service, not every directory — and the
+ * ones it passed over are named here rather than silently dropped.
+ */
+export function skippedByAllNote(c: ServiceCandidate): string {
+  return `${c.relDir}: nothing runs this package (no start or dev script, no bin, no server or worker entry, no deploy manifest), so it reads as a library and was left unwired. Wire it with --only ${c.relDir} if it really does run as a service.`;
+}
+
+/**
+ * Selected packages that one of the other selected packages imports.
+ *
+ * Two capture inits in one process is one capture: the first call wins and the
+ * second is ignored, so every session from that process is filed under whichever
+ * name loaded first. When a library and the app that imports it are both wired,
+ * that name is the library's, and the app the user cares about reports nothing.
+ * The wizard is the only thing in the room that can see both halves, so it says
+ * so instead of leaving a silent misfiling to be discovered in the dashboard.
+ */
+export function importedSelectionWarnings(
+  selected: readonly ServiceCandidate[],
+  readPkg: (dir: string) => { name?: string; dependencies?: unknown } | null,
+): string[] {
+  const pkgs = selected.map((c) => ({ candidate: c, pkg: readPkg(c.dir) }));
+  const out: string[] = [];
+  for (const { candidate, pkg } of pkgs) {
+    const name = pkg?.name;
+    if (!name) continue;
+    const importers = pkgs.filter(({ candidate: other, pkg: otherPkg }) => {
+      if (other === candidate) return false;
+      const deps = otherPkg?.dependencies;
+      return !!deps && typeof deps === "object" && name in (deps as object);
+    });
+    if (importers.length === 0) continue;
+    out.push(
+      `${candidate.relDir} is imported by ${importers.map((i) => i.candidate.relDir).join(", ")}, and both were wired. Capture starts once per process, so whichever loads first names the session, and it will be ${candidate.relDir}. Wire the app and leave ${candidate.relDir} out unless it runs as its own process.`,
+    );
+  }
+  return out;
+}
+
+/**
  * Resolve --only/--all into indices, or null when we should prompt.
  * Returns a string on a user error (unknown --only value).
+ *
+ * `--only` is explicit and always honoured; `--all` is a judgement call the user
+ * delegated, so it declines the packages that look like libraries and reports
+ * them in `skipped`.
  */
 export function resolveSelection(
   parsed: ParsedArgs,
   candidates: ServiceCandidate[],
-): { indices: number[] } | { error: string } | null {
+):
+  | { indices: number[]; skipped?: ServiceCandidate[] }
+  | { error: string }
+  | null {
   if (parsed.only && parsed.only.length > 0) {
     const indices: number[] = [];
     for (const want of parsed.only) {
@@ -1274,11 +1842,17 @@ export function resolveSelection(
     return { indices };
   }
   if (parsed.all) {
-    return {
-      indices: candidates
-        .map((c, i) => (c.selectable ? i : -1))
-        .filter((i) => i >= 0),
-    };
+    const indices: number[] = [];
+    const skipped: ServiceCandidate[] = [];
+    candidates.forEach((c, i) => {
+      if (!c.selectable) return;
+      if (c.flags.includes("likely-library")) {
+        skipped.push(c);
+        return;
+      }
+      indices.push(i);
+    });
+    return { indices, skipped };
   }
   return null;
 }
@@ -1342,6 +1916,9 @@ export async function runBatchWizard(
   let indices: number[];
   if (preset) {
     indices = preset.indices;
+    for (const c of preset.skipped ?? []) {
+      ui.out(alert(color.yellow(skippedByAllNote(c))));
+    }
   } else if (!deps.isTTY) {
     // No prompt available and no explicit selection: refuse rather than guess
     // which of someone's services should start reporting.
@@ -1371,8 +1948,36 @@ export async function runBatchWizard(
     .filter((c) => isBackendRecipe(c.recipe))
     .map((c) => ({ dir: c.dir, detected: c.detected }));
   if (selected.length === 0) {
-    ui.out(alert(color.yellow("Nothing selected — no changes made.")));
+    // "Nothing selected" covers two opposite situations, and the reader cannot
+    // tell them apart from the sentence: a rerun in a repository that is
+    // already wired opens the list with every box unchecked, which reads as
+    // "the CLI found nothing" when it means "there is nothing left to do".
+    const wireable = candidates.filter((c) => c.selectable);
+    const wired = wireable.filter((c) => c.flags.includes("already-wired"));
+    if (wireable.length > 0 && wired.length === wireable.length) {
+      ui.out(
+        ok(
+          `All ${wireable.length} application(s) here are already wired for ${base}. Nothing to do.`,
+        ),
+      );
+      for (const c of wired) ui.out(note(`${c.relDir}: already wired`));
+      // No project is resolved on this path (login has not run), so there is
+      // no project scoped dashboard link to offer.
+      return 0;
+    }
+    ui.out(
+      alert(
+        color.yellow(
+          wired.length > 0
+            ? `Nothing selected, so no changes were made. ${wired.length} of ${wireable.length} application(s) here are already wired for ${base}; the rest were left unchecked.`
+            : "Nothing selected, so no changes were made. Run it again and check the applications you want wired.",
+        ),
+      ),
+    );
     return 0;
+  }
+  for (const warning of importedSelectionWarnings(selected, readPkgDeps)) {
+    ui.out(alert(color.yellow(warning)));
   }
 
   // 3. Login (once for the whole batch).
@@ -1472,6 +2077,7 @@ export async function runBatchWizard(
         recipe,
         stack: c.detected.otlpStack,
         serviceName: name,
+        identity: serviceIdentity(c.dir),
         ui,
         identityLabel,
         fetchImpl: deps.fetchImpl,
@@ -1499,6 +2105,8 @@ export async function runBatchWizard(
           // "No event yet" for every service while events were landing.
           serviceName: svc.serviceName,
           backendOrigins,
+          sdkVersion: readVersion(),
+          mintUrl: appUrl(appBaseFor(base, deps.env), "/setup", project.id),
           options: { force: parsed.yes },
         },
         defaultInjectIO,
@@ -1507,7 +2115,10 @@ export async function runBatchWizard(
       // Ask about the complete local transaction before installing dependencies
       // or touching an env file. A decline of the entry-file edit must not
       // leave package.json or a live key behind.
-      const injectionDecision = await confirmInjection(plan, parsed, deps);
+      const injectionDecision = await confirmInjection(plan, parsed, deps, {
+        projectName: project.name,
+        serviceName: svc.serviceName,
+      });
       const install: InstallSdkResult = injectionDecision.approved
         ? await deps.installSdk({
             cwd: c.dir,
@@ -1521,6 +2132,7 @@ export async function runBatchWizard(
         : { installed: false, packages: [] };
       if (install.installed) {
         ui.out(ok(`Installed ${color.bold(install.packages.join(", "))}.`));
+        if (install.note) ui.out(color.yellow(`! ${install.note}`));
       } else if (install.note) {
         ui.out(color.yellow(`! ${install.note}`));
       }
@@ -1535,6 +2147,7 @@ export async function runBatchWizard(
         },
         dirtyDecision: injectionDecision.approved,
         warningsPrinted: true,
+        mintUrl: appUrl(appBaseFor(base, deps.env), "/setup", project.id),
       });
       outcomes.push({
         name: svc.serviceName,
@@ -1546,9 +2159,19 @@ export async function runBatchWizard(
         keyIsCompileTime: plan.keyIsCompileTime,
         filesTouched: applied.filesTouched,
         notes: [
-          ...(!install.installed && install.note ? [install.note] : []),
+          ...(install.note ? [install.note] : []),
+          // Which application row this service was filed under, when reusing an
+          // existing one could have been the wrong call.
+          ...(svc.adoptionNote ? [svc.adoptionNote] : []),
           ...applied.notes,
-          ...correlationNotes(recipe, backendOrigins, backendSiblings.length),
+          // The APPLIED status, not the plan's intent: a service whose wiring
+          // fell back to a snippet must not be told its correlation is live.
+          ...correlationNotes(
+            recipe,
+            backendOrigins,
+            backendSiblings.length,
+            applied.status,
+          ),
         ],
       });
     } catch (err) {
@@ -1641,7 +2264,13 @@ export async function runBatchWizard(
     );
     for (const o of cloudReporting) {
       const probe = keyProbes.get(o.name);
-      if (probe && !probe.ok) o.notes.push(probe.note);
+      if (probe && !probe.ok) {
+        o.notes.push(probe.note);
+        // Recorded on the outcome, not only in the notes block: the summary row
+        // is where a reader decides whether a service is done, and a tick there
+        // outranks a warning twenty lines below it.
+        o.keyRejected = true;
+      }
     }
     const waitable = cloudReporting.filter(
       (o) => keyProbes.get(o.name)?.ok !== false,
@@ -1713,7 +2342,7 @@ export async function runBatchWizard(
     printEvidenceSourcesPointer(ui, base, project.id);
   }
 
-  printBatchSummary(
+  const incomplete = printBatchSummary(
     ui,
     base,
     root,
@@ -1721,16 +2350,15 @@ export async function runBatchWizard(
     project.name,
     outcomes,
     batchNotes,
+    !parsed.skipVerify,
   );
 
-  const attempted = outcomes.filter(
-    (o) => o.status !== "skipped-already-wired",
-  );
-  const anyGood = outcomes.some(
-    (o) => o.status === "wired" || o.status === "guidance",
-  );
-  // Only a total wipeout is a failure: a partial batch still wired something.
-  return attempted.length > 0 && !anyGood ? 1 : 0;
+  // The exit code says the same thing the bar says. It used to report success
+  // for a batch that had just printed "Setup incomplete. 1 of 2 applications
+  // still need you", so a CI step that wires a repository passed while half of
+  // it reported nothing. Partial is not success here: the services that were
+  // not wired need a person, and a script is how that person finds out.
+  return incomplete ? 1 : 0;
 }
 
 /** Apply one service's plan; OTLP writes a guide file instead of injecting. */
@@ -1745,6 +2373,8 @@ async function applyBatchInjection(
     sdkInstall?: SdkInstallState;
     dirtyDecision?: boolean;
     warningsPrinted?: boolean;
+    /** Project scoped /setup URL, for the OTLP guide's key line. */
+    mintUrl?: string;
   },
 ): Promise<{
   status: ServiceStatus;
@@ -1763,6 +2393,9 @@ async function applyBatchInjection(
       endpoint: base,
       snippet: plan.snippet ?? "",
       agentPrompt: plan.agentPrompt ?? "",
+      // The snippet carries a placeholder, never a minted key, so the guide has
+      // to say where the real one comes from.
+      ...(ctx.mintUrl ? { mintUrl: ctx.mintUrl } : {}),
     });
     const res = deps.executePlan(otlpGuidePlan(candidate.dir, body));
     deps.ui.out(
@@ -1793,7 +2426,7 @@ async function applyBatchInjection(
   };
 }
 
-function printBatchSummary(
+export function printBatchSummary(
   ui: Ui,
   base: string,
   root: string,
@@ -1801,7 +2434,9 @@ function printBatchSummary(
   projectName: string,
   outcomes: ServiceOutcome[],
   batchNotes: string[] = [],
-): void {
+  /** False when no first-event wait ran (`--skip-verify`), so nothing was seen. */
+  verified = true,
+): boolean {
   const g = glyphs();
   const mark: Record<ServiceStatus, string> = {
     wired: chip(` ${g.tick} `, "success"),
@@ -1813,6 +2448,13 @@ function printBatchSummary(
     declined: chip(` ${g.cross} `, "warn"),
     failed: chip(` ${g.cross} `, "danger"),
   };
+  // A wired service whose key the endpoint refused reports nothing at all, so
+  // it does not get the success tick — it reads like the other rows that still
+  // need the user.
+  const markFor = (o: ServiceOutcome) =>
+    o.status === "wired" && o.keyRejected === true
+      ? chip(` ${g.warn} `, "warn")
+      : mark[o.status];
   const width = Math.max(...outcomes.map((o) => o.name.length), 4);
   // Absolute temp/monorepo paths make the summary unreadable; the user already
   // knows where their repo is.
@@ -1820,25 +2462,49 @@ function printBatchSummary(
 
   const ready = (o: ServiceOutcome) =>
     o.status === "skipped-already-wired" ||
-    (o.status === "wired" && o.keyReady === true);
+    (o.status === "wired" && o.keyReady === true && o.keyRejected !== true);
   const readyCount = outcomes.filter(ready).length;
   const wiredCount = outcomes.filter(
-    (o) => o.status === "wired" && o.keyReady === true,
+    (o) =>
+      o.status === "wired" && o.keyReady === true && o.keyRejected !== true,
   ).length;
   const needsKeyCount = outcomes.filter(
     (o) => o.status === "wired" && o.keyReady !== true,
   ).length;
+  const rejectedKeyCount = outcomes.filter(
+    (o) =>
+      o.status === "wired" && o.keyReady === true && o.keyRejected === true,
+  ).length;
+  // What the run can say about capture, on the same rule as the single package
+  // path: only services that could ever send a cloud event count, and only a
+  // session URL recorded by the poll is evidence one arrived.
+  const cloudReporting = outcomes.filter(
+    (o) =>
+      o.recipe !== "tauri" &&
+      (o.status === "wired" || o.status === "guidance"),
+  );
+  const reported = cloudReporting.filter((o) => o.sessionUrl);
+  const incomplete = readyCount !== outcomes.length;
   ui.out("");
   // The bar states the outcome only. The project name used to ride on the end
   // of this line, where a narrow terminal clipped it: a project called kartbug
   // was reported back as "kartbu".
   ui.out(
-    readyCount === outcomes.length
-      ? outcomeBar(`${g.tick}  Setup complete`)
-      : outcomeBar(
-          `${g.warn}  Setup incomplete. ${outcomes.length - readyCount} of ${outcomes.length} services still need you`,
+    incomplete
+      ? outcomeBar(
+          `${g.warn}  Setup incomplete. ${outcomes.length - readyCount} of ${outcomes.length} applications still need you`,
           "warn",
-        ),
+        )
+      : !verified || cloudReporting.length === 0
+        ? outcomeBar(`${g.warn}  Wiring complete. First event not verified.`, "warn")
+        : reported.length === cloudReporting.length
+          ? outcomeBar(`${g.tick}  Setup complete. First event received.`)
+          : reported.length === 0
+            ? outcomeBar(`${g.warn}  Wiring complete. No event captured yet.`, "warn")
+            : outcomeBar(
+                `${g.warn}  Wiring complete. ${reported.length} of ${cloudReporting.length} applications have reported an event.`,
+                "warn",
+              ),
   );
   ui.out("");
   ui.out(field("Project", color.bold(projectName)));
@@ -1852,17 +2518,21 @@ function printBatchSummary(
             ? color.yellow("not wired. You declined the edit")
             : o.status === "wired" && o.keyReady !== true
               ? color.yellow("needs ingest key")
-              : o.status === "guidance"
-                ? color.yellow("manual setup needed")
-                : o.status === "skipped-already-wired"
-                  ? color.dim("complete for this endpoint · skipped")
-                  : o.sessionUrl
-                    ? color.brand(o.sessionUrl)
-                    : o.filesTouched.length > 0
-                      ? color.dim(o.filesTouched.map(rel).join(", "))
-                      : "";
+              : o.status === "wired" && o.keyRejected === true
+                ? // Adjacent to the row, not only in the notes block: this
+                  // service is wired and still reports nothing.
+                  color.yellow("wired, but its ingest key was rejected")
+                : o.status === "guidance"
+                  ? color.yellow("manual setup needed")
+                  : o.status === "skipped-already-wired"
+                    ? color.dim("complete for this endpoint · skipped")
+                    : o.sessionUrl
+                      ? color.brand(o.sessionUrl)
+                      : o.filesTouched.length > 0
+                        ? color.dim(o.filesTouched.map(rel).join(", "))
+                        : "";
     ui.out(
-      `  ${mark[o.status]} ${o.name.padEnd(width)}  ${color.dim(o.relDir.padEnd(24))} ${detail}`,
+      `  ${markFor(o)} ${o.name.padEnd(width)}  ${color.dim(o.relDir.padEnd(24))} ${detail}`,
     );
   }
 
@@ -1871,6 +2541,10 @@ function printBatchSummary(
   const parts = [
     `${wiredCount} wired`,
     ...(needsKeyCount > 0 ? [`${needsKeyCount} need a key`] : []),
+    // Its own bucket. Folding it into "wired" certified a service the endpoint
+    // had just refused; folding it into "need a key" would be wrong too, since
+    // the key is present — it is the wrong one.
+    ...(rejectedKeyCount > 0 ? [`${rejectedKeyCount} key rejected`] : []),
     ...(count("guidance") > 0 ? [`${count("guidance")} guidance`] : []),
     ...(count("failed") > 0 ? [`${count("failed")} failed`] : []),
     // Counted apart from "skipped": nothing was wired and the user has a next
@@ -1891,9 +2565,11 @@ function printBatchSummary(
     ),
   );
 
+  const guessCaveat = dashboardGuessCaveat(base);
   const notes = [
     ...outcomes.flatMap((o) => o.notes.map((n) => `${o.name}: ${n}`)),
     ...batchNotes,
+    ...(guessCaveat ? [guessCaveat] : []),
   ];
   const projectAccessFailure = outcomes.some(
     (o) => o.errorKind === "project-access",
@@ -1918,6 +2594,7 @@ function printBatchSummary(
     for (const n of notes) ui.out(note(n));
   }
   ui.out("");
+  return incomplete;
 }
 
 /**
@@ -1950,13 +2627,25 @@ interface InjectionApplyOptions {
  *
  * The prompt deliberately names the whole transaction: entry file, dependency
  * manifests/lockfile, and env file/gitignore. A "No" therefore means all local
- * files stay byte-for-byte unchanged; cloud provisioning is already complete
- * and is reported separately by the summary.
+ * files stay byte-for-byte unchanged.
+ *
+ * It also names what is ALREADY in the dashboard. The project and the
+ * application are created before this question is reached, because the plan
+ * this prompt describes is built from the provisioned application name and the
+ * project scoped mint URL, so provisioning cannot simply be moved after the
+ * consent without building the plan twice against different names. Deleting
+ * them on a No would be worse: the CLI would be issuing destructive calls
+ * against a project it was merely pointed at, and a No is often "not in this
+ * checkout", not "undo everything". So the remaining honest option, and the
+ * smallest one, is to stop calling it a decision with no side effects and say
+ * what already exists. The summary then prints the same two names with a
+ * dashboard link.
  */
 async function confirmInjection(
   plan: Plan,
   parsed: ParsedArgs,
   deps: WizardDeps,
+  provisioned?: { projectName: string; serviceName: string },
 ): Promise<{ approved: boolean }> {
   for (const w of plan.warnings) deps.ui.out(color.dim(`  · ${w}`));
   if (plan.kind !== "needs-confirm-dirty") return { approved: true };
@@ -1974,6 +2663,15 @@ async function confirmInjection(
       : null,
     ...(plan.extraEdits ?? []).map((extra) => `edit ${extra.path}`),
   ].filter((item): item is string => item !== null);
+  // Said before the question, so it cannot be missed in the tail of a long
+  // prompt line.
+  if (provisioned) {
+    deps.ui.out(
+      color.dim(
+        `  Already created in your dashboard, whichever way you answer: project ${provisioned.projectName}, application ${provisioned.serviceName}. Answering No changes nothing locally and leaves those two in place.`,
+      ),
+    );
+  }
   const approved = await deps.prompter.confirm(
     `${writes.join(", ")}. Continue? No leaves all local files unchanged.`,
     false,
@@ -2098,10 +2796,31 @@ async function writeIngestKeys(args: {
           `${named(label)}${color.bold(plan.varName)} is already set in ${color.brand(rel(args.repoRoot, plan.file))} — left as it is. Events from this app go wherever that key points, which is only ${color.bold(args.projectName)} if it was minted there.`,
         ),
       );
+      // The key in that file is live and the file is not excluded from git, so
+      // it is one `git add` away from being published — by a run that wrote
+      // nothing and would otherwise have said nothing. The entry is added here
+      // for exactly the same reason it is added next to a key this run wrote.
+      let ignoreNote: string | undefined;
+      if (plan.ignore) {
+        try {
+          const applied = applyEnvEdits([plan.ignore], args.deps.envFileIO);
+          if (applied.ignoreEntriesAdded.length > 0) {
+            ui.out(
+              color.dim(
+                `  Added ${rel(args.repoRoot, plan.file)} to .gitignore — it holds a live key and git was not excluding it.`,
+              ),
+            );
+          }
+        } catch (err) {
+          ignoreNote = `${rel(args.repoRoot, plan.file)} holds a live ingest key and is not in .gitignore, and Crumbtrail could not add it (${errMessage(err)}). Add it yourself before committing.`;
+          ui.out(alert(color.yellow(ignoreNote)));
+        }
+      }
       results.set(label, {
         status: "already-set",
         file: plan.file,
         varName: plan.varName,
+        ...(ignoreNote ? { note: ignoreNote } : {}),
         probeKey: readEnvVar(
           args.deps.envFileIO.readFile(plan.file) ?? "",
           plan.varName,
@@ -2355,14 +3074,13 @@ function preflightFailureReason(result: PreflightResult): string {
  * file. The id is what that list is keyed by, and the last characters are what
  * a reader can match against the file in front of them.
  */
-function keyLabel(key: { apiKey: string; keyId?: string }): string {
-  // The tail leads because it is the half a reader can match: it is in the env
-  // file in front of them and in the dashboard's key list. The internal id
-  // appears nowhere either of those places shows, so printing it bare read as a
-  // third key that could not be found anywhere.
-  const tail = key.apiKey.slice(-6);
-  const id = key.keyId ? `, internal id ${key.keyId}` : "";
-  return color.dim(` (new key ending ${tail}${id})`);
+function keyLabel(key: { apiKey: string }): string {
+  // The tail, and only the tail: it is the half a reader can match, because it
+  // is in the env file in front of them and in the dashboard's key list. The
+  // id the API returns beside it is a database row id that neither of those
+  // places prints, so it was an identifier the reader could not look up
+  // anywhere, dressed as one they could.
+  return color.dim(` (new key ending ${key.apiKey.slice(-6)})`);
 }
 
 /** A path as the reader would type it, falling back to absolute off-tree. */
@@ -2422,6 +3140,23 @@ async function applyInjection(
     ui.out(
       color.yellow(`Left your code untouched — ${pkgs} is not installed.`),
     );
+    // The wiring is withheld, but the wiring is still the thing the user came
+    // for. Returning here skipped the snippet and the agent prompt the
+    // fallback-ai branch below prints, so the one run that most needed a
+    // paste-this ending was the only run that never showed one.
+    if (plan.snippet || plan.agentPrompt) {
+      ui.out(
+        color.dim(`Once ${pkgs} is installed, this is the wiring it needs:`),
+      );
+      if (plan.snippet) {
+        ui.out(color.dim("Paste this into your entry file:"));
+        ui.out(plan.snippet);
+      }
+      if (plan.agentPrompt) {
+        ui.out(color.dim("\nOr hand this to your coding agent:"));
+        ui.out(plan.agentPrompt);
+      }
+    }
     notes.push(
       `Skipped wiring ${plan.targetPath ?? "your entry file"}: install ${pkgs}, then run \`npx crumbtrail\` again.`,
     );
@@ -2494,6 +3229,23 @@ async function applyInjection(
     return { outcome: "wired", filesTouched, notes };
   }
 
+  if (plan.kind === "amend-init") {
+    announceExtras();
+    ui.out(
+      color.dim(
+        `  Completing the Crumbtrail setup you already have in ${plan.targetPath}…`,
+      ),
+    );
+    const res = deps.executePlan(plan);
+    filesTouched.push(...res.written);
+    ui.out(
+      ok(
+        `Added ${(plan.amendedFields ?? []).join(", ")} to the Crumbtrail init you already had in ${plan.targetPath}. Nothing else in that file changed.`,
+      ),
+    );
+    return { outcome: "wired", filesTouched, notes };
+  }
+
   // create / prepend
   announceExtras();
   if (plan.targetPath) {
@@ -2556,6 +3308,57 @@ async function pollServicesWithSigint(
   }
 }
 
+/**
+ * Whether this run saw the app report.
+ *
+ *   confirmed   the first event arrived while the wizard waited
+ *   none        the wizard waited and nothing arrived
+ *   unverified  no wait ran (`--skip-verify`, or a recipe that sends no cloud
+ *               event), so the run has no evidence either way
+ */
+export type CaptureState = "confirmed" | "none" | "unverified";
+
+/**
+ * The verdict the summary bar prints, and the exit code that goes with it.
+ *
+ * "Setup complete" used to be decided by the ingest key alone, so a run that
+ * printed "No event yet, start your app" three lines earlier still certified
+ * itself as done. The README's promise is a confirmed first event, so the bar
+ * now says which of the three things happened, and only a confirmed event is
+ * allowed to be called complete.
+ */
+export function summaryVerdict(input: {
+  stepsOutstanding: boolean;
+  capture: CaptureState;
+}): { line: string; tone: "success" | "warn"; incomplete: boolean } {
+  const g = glyphs();
+  if (input.stepsOutstanding) {
+    return {
+      line: `${g.warn}  Setup incomplete. One step remains.`,
+      tone: "warn",
+      incomplete: true,
+    };
+  }
+  if (input.capture === "confirmed") {
+    return {
+      line: `${g.tick}  Setup complete. First event received.`,
+      tone: "success",
+      incomplete: false,
+    };
+  }
+  // Wiring is done and the key is in place, so there is nothing left for the
+  // reader to fix. What is missing is the proof, and saying so is the
+  // difference between "we are done" and "we are done as far as we can see".
+  return {
+    line:
+      input.capture === "none"
+        ? `${g.warn}  Wiring complete. No event captured yet.`
+        : `${g.warn}  Wiring complete. First event not verified.`,
+    tone: "warn",
+    incomplete: false,
+  };
+}
+
 function printSummary(
   ui: Ui,
   base: string,
@@ -2568,10 +3371,12 @@ function printSummary(
   repoRoot?: string,
   keyIsCompileTime?: boolean,
   setupIncomplete = false,
-): void {
+  /** The injected code holds the key as a literal placeholder (static pages). */
+  keyIsSourceLiteral = false,
+  opts: { capture?: CaptureState; keyRejected?: boolean } = {},
+): boolean {
   // User-facing links point at the app host (the SPA), not the API host.
   const appBase = appBaseFor(base);
-  const g = glyphs();
   // A key the wizard could not write is a step the user still has to do, and
   // this bar was printing "Setup complete" directly above the line asking them
   // to do it.
@@ -2579,15 +3384,30 @@ function printSummary(
     keyEnvVar !== undefined &&
     keyWrite?.status !== "written" &&
     keyWrite?.status !== "already-set";
+  const verdict = summaryVerdict({
+    // A key the endpoint refused is a step too: the value on disk has to be
+    // replaced before anything reports.
+    stepsOutstanding:
+      keyOutstanding || setupIncomplete || opts.keyRejected === true,
+    capture: opts.capture ?? "unverified",
+  });
   ui.out("");
-  ui.out(
-    keyOutstanding || setupIncomplete
-      ? outcomeBar(`${g.warn}  Setup incomplete. One step remains.`, "warn")
-      : outcomeBar(`${g.tick}  Setup complete`),
-  );
+  ui.out(outcomeBar(verdict.line, verdict.tone));
   ui.out("");
   ui.out(field("Project", color.bold(p.projectName)));
-  ui.out(field("Service", color.bold(p.serviceName)));
+  // "Application" is the dashboard's word for this object.
+  ui.out(field("Application", color.bold(p.serviceName)));
+  // A page with no bundler has no variable to name, so the "Ingest key" line
+  // points at the file instead. Printing nothing here is what let a run finish
+  // silently with a placeholder where the credential goes.
+  if (!keyEnvVar && keyIsSourceLiteral) {
+    ui.out(
+      field(
+        "Ingest key",
+        `replace ${color.bold("<your-ingest-key>")} in the page ${color.dim(`(mint at ${appUrl(appBase, "/setup", p.projectId)})`)}`,
+      ),
+    );
+  }
   if (keyEnvVar) {
     // The one line that used to say the setup was not finished. It now reports
     // what happened to the key rather than handing the job back by default.
@@ -2633,11 +3453,16 @@ function printSummary(
   ui.out(
     field("Dashboard", color.brand(appUrl(appBase, "/issues", p.projectId))),
   );
-  if (notes.length > 0) {
+  const caveat = dashboardGuessCaveat(base);
+  const allNotes = caveat ? [...notes, caveat] : notes;
+  if (allNotes.length > 0) {
     ui.out("");
-    for (const n of notes) ui.out(note(n));
+    for (const n of allNotes) ui.out(note(n));
   }
   ui.out("");
+  // The caller turns this into the exit code, so a script reads the same
+  // verdict the person at the terminal just read.
+  return verdict.incomplete;
 }
 
 function errMessage(err: unknown): string {
@@ -2808,6 +3633,33 @@ function nodeTooOld(version: string): boolean {
   return false;
 }
 
+/**
+ * Words people type expecting a setup subcommand. The wizard is the bare
+ * command, so each of these has exactly one answer, and it is one line long.
+ */
+const WIZARD_ALIASES = new Set([
+  "setup",
+  "init",
+  "install",
+  "start",
+  "wizard",
+  "configure",
+  "config",
+  "onboard",
+  "add",
+  "connect",
+]);
+
+export function wizardAliasHint(arg: string): string | undefined {
+  const word = arg.trim().replace(/^-+/, "").toLowerCase();
+  if (!WIZARD_ALIASES.has(word)) return undefined;
+  return (
+    `There is no \`${word}\` subcommand — the setup wizard is just ` +
+    `\`crumbtrail\`, run inside the app you want to wire up. ` +
+    `Run it with no arguments (\`npx crumbtrail\`).`
+  );
+}
+
 export async function runCli(
   argv: string[],
   deps: WizardDeps = defaultDeps(),
@@ -2834,7 +3686,27 @@ export async function runCli(
     deps.ui.out(usage());
     return 0;
   }
+  if (parsed.parseError) {
+    // `--project --yes` used to set the project id to the literal "--yes" and
+    // carry on, and `--only` with nothing after it threw a TypeError out of the
+    // parser. Both are typos, and a typo deserves the usage text, not a wrong
+    // project or an internal stack trace.
+    deps.ui.err(`${parsed.parseError}\n`);
+    deps.ui.err(usage());
+    return 1;
+  }
   if (parsed.unknown) {
+    // A word someone reasonably expected to be a subcommand is not an unknown
+    // argument to them — it is the command they came to run. `crumbtrail setup`
+    // answering "Unknown argument: setup" plus thirty lines of help reads as a
+    // broken install, when the only thing wrong is that the wizard has no
+    // subcommand: it IS the bare command.
+    const hint = wizardAliasHint(parsed.unknown);
+    if (hint) {
+      deps.ui.err(hint);
+      deps.ui.err(color.dim("Run `crumbtrail --help` for everything else."));
+      return 1;
+    }
     deps.ui.err(`Unknown argument: ${parsed.unknown}\n`);
     deps.ui.err(usage());
     return 1;

@@ -1,12 +1,22 @@
-import type { BugEvent, FlagBugOptions } from "./types";
+import type { BugEvent } from "./types";
 import { errorDetector, type Signal, type SignalDetector } from "./signals";
+
+/**
+ * What the controller asks the capture path for. Deliberately NOT {@link FlagBugOptions}:
+ * an automatic capture has no note, because nobody wrote one. It carries the detector's
+ * own `reason` instead, and the capture path stamps the report `origin: "auto"`.
+ */
+export interface AutoFlagRequest {
+  tags: string[];
+  reason: string;
+}
 
 export interface AutoFlagOptions {
   /** Quiet period after the last new signal before the flag fires, so a cascade coalesces into one report. */
   debounceMs: number;
   /** Hard cap on auto-captured reports per session (shared across all detectors). */
   maxPerSession: number;
-  flag: (options: FlagBugOptions) => Promise<unknown>;
+  flag: (request: AutoFlagRequest) => Promise<unknown>;
   /**
    * Signal detectors that decide when to auto-flag. Defaults to error-only (`errorDetector`),
    * preserving the original reactive-on-error behavior. Pass behavioral detectors
@@ -24,7 +34,7 @@ export interface AutoFlagController {
  * Turns raised {@link Signal}s into automatic `flagBug` snapshots. Each signal key is flagged
  * once per session, and a burst of signals settles into a single report (the debounce doubles
  * as post-roll so the ring buffer snapshot includes the cascade's aftermath). The first signal
- * to open a debounce window owns the report's tag and note; the total report count is capped by
+ * to open a debounce window owns the report's tag and reason; the total report count is capped by
  * `maxPerSession` across every detector.
  */
 export function createAutoFlagController(
@@ -43,7 +53,7 @@ export function createAutoFlagController(
     pending = undefined;
     if (!signal) return;
     flaggedCount++;
-    options.flag({ tags: [signal.tag], note: signal.note }).catch(() => {});
+    options.flag({ tags: [signal.tag], reason: signal.reason }).catch(() => {});
   };
 
   return {

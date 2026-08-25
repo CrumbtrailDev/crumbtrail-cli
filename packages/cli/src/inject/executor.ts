@@ -177,7 +177,24 @@ export function materializePlan(plan: Plan, io: ExecutorIO): MaterializedPlan {
       ? plan.applyMode === "rewrite"
         ? "rewrite"
         : "prepend"
-      : plan.kind;
+      : // An amend carries the whole amended file, because that is the only
+        // shape in which "every other byte is unchanged" is checkable. It is
+        // written the same way a rewrite is.
+        plan.kind === "amend-init"
+        ? "rewrite"
+        : plan.kind;
+
+  if (effectiveKind === "rewrite" && plan.kind === "amend-init") {
+    // Verbatim, NOT withTrailingNewline: the whole promise of an amend is that
+    // the only bytes that changed are the ones it added, and a file that shipped
+    // without a final newline must still not gain one.
+    materialized.edits.push({
+      path: plan.targetPath,
+      mode: io.exists(plan.targetPath) ? "update" : "create",
+      content: plan.content,
+    });
+    return materialized;
+  }
 
   if (effectiveKind === "create") {
     if (io.exists(plan.targetPath)) {

@@ -24,16 +24,42 @@ export interface OtlpGuideInput {
   snippet: string;
   /** plan.agentPrompt — the ready-to-paste prompt for a coding agent. */
   agentPrompt: string;
+  /**
+   * Where the reader mints the key this guide's snippet only has a placeholder
+   * for (the project scoped /setup page). Omitted only when the caller has no
+   * project to point at.
+   */
+  mintUrl?: string;
+  /**
+   * The literal the snippet carries where the key goes, so the guide can name
+   * the exact string to replace.
+   */
+  keyPlaceholder?: string;
 }
 
 export function renderOtlpGuide(input: OtlpGuideInput): string {
+  // The guide used to open with "this service is already provisioned and has
+  // its own ingest key". Only the first half was ever true: planOtlp fills the
+  // snippet with a placeholder on purpose (it mints nothing, so a rerun leaves
+  // no unused live credentials behind), and there is no per service key at all
+  // because one key covers the whole project. A reader who believed the old
+  // sentence went looking for a secret that did not exist, and could not
+  // configure the exporter until they stopped believing it.
+  const placeholder = input.keyPlaceholder ?? "<your-ingest-key>";
+  const mint = input.mintUrl
+    ? `Mint one at ${input.mintUrl} and paste it in.`
+    : "Mint one on the Setup page of your Crumbtrail dashboard and paste it in.";
   return [
-    `# Crumbtrail — ${input.serviceName}`,
+    `# Crumbtrail: ${input.serviceName}`,
     "",
     `Detected stack: **${input.stack}**`,
     `Ingest endpoint: ${input.endpoint}`,
     "",
-    `This service is already provisioned in Crumbtrail and has its own ingest key.`,
+    `This application is provisioned in Crumbtrail. No ingest key was minted for`,
+    `it, so the snippet below carries \`${placeholder}\` where the key goes.`,
+    `${mint} One key covers the whole project, so the same value works for every`,
+    `application in it.`,
+    "",
     `There is no SDK to install: ${input.stack} speaks OpenTelemetry, so Crumbtrail`,
     `accepts its traces directly. Everything below is the one manual step.`,
     "",
@@ -51,9 +77,10 @@ export function renderOtlpGuide(input: OtlpGuideInput): string {
     "",
     "## Keep the key out of git",
     "",
-    "The ingest key above is a live credential. Move it into your secret store or",
-    "environment config and make sure this file (or wherever the key lands) is not",
-    "committed to a public repository.",
+    `Once you replace ${placeholder} with a real key, this file holds a live`,
+    "credential. Move it into your secret store or environment config and make",
+    "sure this file (or wherever the key lands) is not committed to a public",
+    "repository.",
     "",
   ].join("\n");
 }

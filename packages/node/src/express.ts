@@ -1,6 +1,17 @@
 import { buildCaptureGapEvent, type BugEvent } from "crumbtrail-core";
-import { captureDbCallsite } from "./db/callsite";
-import type { DbCallsite } from "./db/callsite";
+import {
+  attachResponseRecorder,
+  readResponseEvidence,
+  safeStatusCode,
+  type ResponseRecorder,
+} from "./backend-response";
+import { claimBackendRequest } from "./backend-request-claim";
+import { getProcessSessionId } from "./process-session";
+import {
+  getBackendRequestContext,
+  runInBackendRequestContext,
+  updateBackendRequestContext,
+} from "./request-context";
 import {
   CRUMBTRAIL_REQUEST_HEADER,
   buildBackendRequestEndEvent,
@@ -18,6 +29,12 @@ import {
   installBackendWarningCapture,
   type BackendWarningCaptureHandle,
 } from "./backend-warnings";
+import {
+  installBackendLogCapture,
+  type BackendLogCaptureHandle,
+  type BackendLogCaptureOptions,
+  type BackendLogLevel,
+} from "./backend-logs";
 
 export type {
   BackendIntakeWarning as CrumbtrailExpressWarning,
@@ -44,20 +61,6 @@ export interface CrumbtrailExpressResponse {
    */
   writableEnded?: boolean;
   once?: (event: "finish" | "close", listener: () => void) => unknown;
-}
-
-/**
- * The response members the recorder uses, kept off the public interface.
- *
- * Widening {@link CrumbtrailExpressResponse} with `write`/`end`/`getHeader`
- * would make it structurally incompatible with Express's own `Response`, so a
- * caller could no longer hand the middleware to `app.use`. These are read
- * through a narrow local view instead, each one checked at runtime before use.
- */
-interface ResponseInternals {
-  write?: (...args: never[]) => unknown;
-  end?: (...args: never[]) => unknown;
-  getHeader?: (name: string) => unknown;
 }
 
 export type CrumbtrailExpressMiddleware = (
@@ -111,6 +114,22 @@ export interface CrumbtrailExpressOptions {
    */
   captureRuntimeWarnings?: boolean;
   /**
+   * Capture structured log lines (pino, winston, bunyan) the process writes as
+   * `backend.log` events in the session the middleware most recently saw.
+   * Default on, and for the same reason as the warning capture above: a handled
+   * failure is logged and answered, never thrown and never printed to the
+   * console, so without this the middleware records the request's status code
+   * and nothing about why.
+   */
+  captureLogs?: boolean;
+  /** Lowest log level captured. Defaults to `warn`. */
+  logLevel?: BackendLogLevel;
+  /** Streams and `fs` the log capture patches (tests). Defaults to the process's. */
+  logStreams?: Pick<
+    BackendLogCaptureOptions,
+    "stdout" | "stderr" | "fsImpl" | "maxEvents"
+  >;
+  /**
    * Whether to record the response body on `backend.req.end`.
    *
    * `"error"` (default) captures it for 4xx and 5xx only, which is where the
@@ -149,47 +168,20 @@ export interface CrumbtrailExpressOptions {
   keepFields?: readonly string[];
 }
 
-/**
- * Headers that describe the response rather than authorize it.
- *
- * Allowlisted, never denylisted: a denylist is one forgotten vendor header away
- * from writing a credential to disk. `set-cookie` and `authorization` are absent
- * by construction, not by exclusion. Application headers that carry diagnostic
- * counters are the reason a caller can supply its own list.
- */
-const DEFAULT_RESPONSE_HEADER_ALLOWLIST = [
-  "content-type",
-  "content-length",
-  "content-encoding",
-  "cache-control",
-  "retry-after",
-  "location",
-  "x-request-id",
-] as const;
-
-const DEFAULT_RESPONSE_BODY_MAX_BYTES = 4096;
-
-/**
- * Content types worth reading as text. Anything else is bytes to a reader.
- *
- * Matched by family rather than by exact type: `+json` and `+xml` cover the
- * suffixed vocabularies (`application/problem+json` carries the sentence that
- * explains a 4xx, `application/ld+json`, `application/vnd.api+json`), and the
- * remaining names are the textual payloads a service actually answers with. A
- * type missing here is not redacted, it is dropped, so the cost of being too
- * narrow is a bundle holding a status code and nothing else.
- */
-const TEXTUAL_CONTENT_TYPE =
-  /^(application\/(json|.*\+json|xml|.*\+xml|x-www-form-urlencoded|x-ndjson|graphql|csv|yaml|x-yaml)|text\/)/i;
-
 /** Test seam for the content-type gate. Not part of the middleware's contract. */
-export function isCapturableContentTypeForTest(contentType: string): boolean {
-  return TEXTUAL_CONTENT_TYPE.test(contentType);
-}
+export { isCapturableContentTypeForTest } from "./backend-response";
 
 interface RequestState {
   startedAtMs: number;
   sessionId?: string;
+  /**
+   * True when `sessionId` is the process's own capture session rather than one
+   * a browser or a caller correlated. Kept so the request's later events resolve
+   * the same fallback instead of presenting it as an explicit option, and so a
+   * process-owned request never becomes the session a runtime warning or a log
+   * line is attributed to (`autoCapture` already records those itself).
+   */
+  sessionFromProcess?: boolean;
   requestId: string;
   /**
    * Set the moment the request's terminal event is built. `finish` and `close`
@@ -214,6 +206,8 @@ const WARNING_SESSION_FRESH_MS = 120_000;
 export interface CrumbtrailExpressMiddlewareWithHandle extends CrumbtrailExpressMiddleware {
   /** Present when runtime warning capture installed; `stop()` releases it. */
   crumbtrailWarningCapture?: BackendWarningCaptureHandle;
+  /** Present when structured log capture installed; `stop()` restores the writes. */
+  crumbtrailLogCapture?: BackendLogCaptureHandle;
 }
 
 export function createCrumbtrailExpressMiddleware(
@@ -223,6 +217,11 @@ export function createCrumbtrailExpressMiddleware(
 
   const middleware: CrumbtrailExpressMiddlewareWithHandle =
     function crumbtrailExpressMiddleware(req, res, next) {
+      // Take ownership before recording anything. `autoCapture` installs a
+      // `node:http` recorder in most processes, and it defers its own events
+      // until the response settles precisely so this claim can win: this
+      // middleware knows the matched route and the error the handler threw.
+      claimBackendRequest(req);
       const startedAtMs = readNow(options);
       const startEvent = buildBackendRequestStartEvent({
         ...readRequestInput(req, options),
@@ -231,14 +230,32 @@ export function createCrumbtrailExpressMiddleware(
       const state = stateFromEvent(startEvent, startedAtMs);
       requestStates.set(req, state);
       exposeRequestIdHeader(req, state);
-      if (state.sessionId) {
+      if (state.sessionId && !state.sessionFromProcess) {
         lastSession = { sessionId: state.sessionId, atMs: startedAtMs };
       }
 
       attemptSend(startEvent, options, state.sessionId);
       attachFinishListener(req, res, options, state);
 
-      next();
+      // The rest of the chain — every later middleware, the route handler, and
+      // everything they await — runs knowing which request it is inside, so a
+      // log line the handler writes carries THIS request's id rather than a
+      // second one the logger minted. The claim above means this middleware's
+      // ids are the ones the request's events carry, so they overwrite an http
+      // recorder's store rather than deferring to it.
+      const correlation = {
+        requestId: state.requestId,
+        sessionId: state.sessionId,
+        sessionIdSource: sessionIdSourceOf(startEvent) ?? "missing",
+      };
+      if (getBackendRequestContext()) {
+        updateBackendRequestContext(correlation);
+        next();
+        return;
+      }
+      runInBackendRequestContext(correlation, () => {
+        next();
+      });
     };
 
   if (options.captureRuntimeWarnings !== false) {
@@ -274,6 +291,38 @@ export function createCrumbtrailExpressMiddleware(
     }
   }
 
+  if (options.captureLogs !== false) {
+    try {
+      middleware.crumbtrailLogCapture = installBackendLogCapture({
+        minLevel: options.logLevel,
+        ...options.logStreams,
+        emit: (event) => {
+          const now = readNow(options);
+          // A line written INSIDE a request already resolved its own session
+          // and carries that request's id; the "most recent session" guess is
+          // only for lines written between requests. Preferring the guess here
+          // would refile a correlated line onto whichever session happened to
+          // be last, which on a server handling two users at once is the wrong
+          // one.
+          const session =
+            (typeof event.sessionId === "string" && event.sessionId
+              ? event.sessionId
+              : undefined) ??
+            (lastSession && now - lastSession.atMs <= WARNING_SESSION_FRESH_MS
+              ? lastSession.sessionId
+              : undefined);
+          // Same rule as the warning capture: the intake path addresses an
+          // existing session, so a line with no live session is dropped rather
+          // than misfiled onto one that plausibly ended.
+          if (!session) return;
+          attemptSend({ ...event, sessionId: session }, options, session);
+        },
+      });
+    } catch {
+      // Log capture is additive; its failure must not break the request path.
+    }
+  }
+
   return middleware;
 }
 
@@ -281,6 +330,9 @@ export function createCrumbtrailExpressErrorMiddleware(
   options: CrumbtrailExpressOptions = {},
 ): CrumbtrailExpressErrorMiddleware {
   return function crumbtrailExpressErrorMiddleware(error, req, res, next) {
+    // Also claims: an app that wired only the error middleware still owns its
+    // requests, and the http recorder must not report them a second time.
+    claimBackendRequest(req);
     const now = readNow(options);
     const existingState = requestStates.get(req);
     const state = existingState ?? createMinimalState(req, options, now);
@@ -382,168 +434,6 @@ function emitRequestGap(
   }
 }
 
-interface ResponseRecorder {
-  chunks: string[];
-  bytes: number;
-  truncated: boolean;
-  /**
-   * Where the application decided to fail, captured at the moment a 5xx body is
-   * first written.
-   *
-   * Callsites otherwise ride on `db.diff`, so a handler that catches its own
-   * error and returns a constant leaves no pointer anywhere: the bundle can
-   * only repeat the uninformative body the user already saw. The response
-   * write is the one place every failure passes through, whether or not it
-   * touched a database.
-   */
-  callsite?: DbCallsite;
-}
-
-/**
- * Buffers what the handler writes, up to the cap.
- *
- * `res.write`/`res.end` are wrapped rather than the stream piped, because a pipe
- * changes the response's own backpressure and a capture layer must not alter
- * what the user receives. Both wrappers return the original's return value
- * unchanged, and every failure inside them is swallowed: recording evidence can
- * never be the reason a response fails to send.
- */
-function attachResponseRecorder(
-  res: CrumbtrailExpressResponse,
-  options: CrumbtrailExpressOptions,
-): ResponseRecorder | undefined {
-  const mode = options.captureResponseBody ?? "error";
-  if (mode === "off") return undefined;
-  const sink = res as ResponseInternals;
-  if (typeof sink.write !== "function" || typeof sink.end !== "function")
-    return undefined;
-
-  const cap = responseBodyCap(options);
-  if (cap <= 0) return undefined;
-
-  const recorder: ResponseRecorder = { chunks: [], bytes: 0, truncated: false };
-  const captureFailureCallsite = (): void => {
-    if (recorder.callsite) return;
-    const status = safeStatusCode(res.statusCode);
-    if (status === undefined || status < 500) return;
-    recorder.callsite = captureDbCallsite(options.callsiteRoot);
-  };
-  const record = (chunk: unknown): void => {
-    captureFailureCallsite();
-    if (recorder.bytes >= cap) return;
-    let text: string | undefined;
-    if (typeof chunk === "string") text = chunk;
-    else if (chunk instanceof Uint8Array) text = Buffer.from(chunk).toString("utf8");
-    if (text === undefined || text === "") return;
-    const remaining = cap - recorder.bytes;
-    if (text.length > remaining) {
-      recorder.chunks.push(text.slice(0, remaining));
-      recorder.bytes = cap;
-      recorder.truncated = true;
-      return;
-    }
-    recorder.chunks.push(text);
-    recorder.bytes += text.length;
-  };
-
-  const originalWrite = sink.write.bind(res) as (...args: never[]) => unknown;
-  const originalEnd = sink.end.bind(res) as (...args: never[]) => unknown;
-  sink.write = (...args: never[]) => {
-    try {
-      record(args[0]);
-    } catch {
-      /* never break the response */
-    }
-    return originalWrite(...args);
-  };
-  sink.end = (...args: never[]) => {
-    try {
-      // A function first argument is the callback overload, not a body.
-      if (typeof args[0] !== "function") record(args[0]);
-    } catch {
-      /* never break the response */
-    }
-    return originalEnd(...args);
-  };
-
-  return recorder;
-}
-
-function readResponseEvidence(
-  res: CrumbtrailExpressResponse,
-  recorder: ResponseRecorder | undefined,
-  options: CrumbtrailExpressOptions,
-): {
-  responseBody?: string;
-  responseHeaders?: Record<string, string>;
-  responseBodyTruncated?: boolean;
-  responseCallsite?: DbCallsite;
-  keepFields?: readonly string[];
-} {
-  const mode = options.captureResponseBody ?? "error";
-  if (mode === "off") return {};
-
-  const headers = readAllowlistedHeaders(res, options);
-  const status = safeStatusCode(res.statusCode);
-  // "error" mode still records headers on a success: a content type that
-  // disagrees with what the caller parsed is itself the defect, and it costs
-  // nothing to keep.
-  if (mode === "error" && (status === undefined || status < 400))
-    return Object.keys(headers).length > 0 ? { responseHeaders: headers } : {};
-  if (!recorder || recorder.chunks.length === 0)
-    return {
-      ...(Object.keys(headers).length > 0 ? { responseHeaders: headers } : {}),
-      ...(recorder?.callsite ? { responseCallsite: recorder.callsite } : {}),
-    };
-
-  const contentType = headers["content-type"];
-  // A binary payload contributes nothing a reader can use and everything a
-  // capture budget cannot afford.
-  if (contentType && !TEXTUAL_CONTENT_TYPE.test(contentType))
-    return { responseHeaders: headers };
-
-  return {
-    ...(recorder.callsite ? { responseCallsite: recorder.callsite } : {}),
-    responseBody: recorder.chunks.join(""),
-    ...(options.keepFields && options.keepFields.length > 0
-      ? { keepFields: options.keepFields }
-      : {}),
-    ...(recorder.truncated ? { responseBodyTruncated: true } : {}),
-    ...(Object.keys(headers).length > 0 ? { responseHeaders: headers } : {}),
-  };
-}
-
-function readAllowlistedHeaders(
-  res: CrumbtrailExpressResponse,
-  options: CrumbtrailExpressOptions,
-): Record<string, string> {
-  const out: Record<string, string> = {};
-  const source = res as ResponseInternals;
-  const getHeader = source.getHeader;
-  if (typeof getHeader !== "function") return out;
-  const allowlist =
-    options.responseHeaderAllowlist ?? DEFAULT_RESPONSE_HEADER_ALLOWLIST;
-  for (const name of allowlist) {
-    let raw: unknown;
-    try {
-      raw = getHeader.call(res, name);
-    } catch {
-      continue;
-    }
-    if (raw === undefined || raw === null) continue;
-    const value = Array.isArray(raw) ? raw.join(", ") : String(raw);
-    if (value) out[name.toLowerCase()] = value.slice(0, 300);
-  }
-  return out;
-}
-
-function responseBodyCap(options: CrumbtrailExpressOptions): number {
-  const configured = options.responseBodyMaxBytes;
-  if (typeof configured !== "number" || !Number.isFinite(configured))
-    return DEFAULT_RESPONSE_BODY_MAX_BYTES;
-  return Math.max(0, Math.floor(configured));
-}
-
 function exposeRequestIdHeader(
   req: CrumbtrailExpressRequest,
   state: RequestState,
@@ -568,6 +458,14 @@ function createMinimalState(
   return stateFromEvent(event, now);
 }
 
+/** Where a built event's session id came from, per its own correlation record. */
+function sessionIdSourceOf(event: BugEvent): string | undefined {
+  const correlation = event.d.correlation;
+  if (correlation === null || typeof correlation !== "object") return undefined;
+  const source = (correlation as { sessionIdSource?: unknown }).sessionIdSource;
+  return typeof source === "string" ? source : undefined;
+}
+
 function stateFromEvent(event: BugEvent, startedAtMs: number): RequestState {
   const requestId =
     typeof event.d.requestId === "string" ? event.d.requestId : "unknown";
@@ -577,7 +475,17 @@ function stateFromEvent(event: BugEvent, startedAtMs: number): RequestState {
       : typeof event.d.sessionId === "string"
         ? event.d.sessionId
         : undefined;
-  return { startedAtMs, requestId, sessionId };
+  const correlation = event.d.correlation;
+  const sessionFromProcess =
+    correlation !== null &&
+    typeof correlation === "object" &&
+    (correlation as { sessionIdSource?: unknown }).sessionIdSource === "process";
+  return {
+    startedAtMs,
+    requestId,
+    sessionId,
+    ...(sessionFromProcess ? { sessionFromProcess: true } : {}),
+  };
 }
 
 function readRequestInput(
@@ -585,6 +493,14 @@ function readRequestInput(
   options: CrumbtrailExpressOptions,
   state?: RequestState,
 ) {
+  // A session the process owns is offered as the fallback, never as an explicit
+  // option: the correlation record has to keep saying that nothing joined this
+  // request to a browser.
+  const correlatedSessionId = state
+    ? state.sessionFromProcess
+      ? undefined
+      : state.sessionId
+    : resolveRequestValue(options.sessionId, req);
   return {
     method: req.method,
     url: req.url,
@@ -592,7 +508,12 @@ function readRequestInput(
     path: req.path,
     route: readRoute(req),
     headers: req.headers,
-    sessionId: state?.sessionId ?? resolveRequestValue(options.sessionId, req),
+    sessionId: correlatedSessionId,
+    // Pinned to what the request started with, so a capture stopped mid-request
+    // cannot strand its terminal event in a different session or none at all.
+    processSessionId: state?.sessionFromProcess
+      ? state.sessionId
+      : getProcessSessionId(),
     requestId: state?.requestId ?? resolveRequestValue(options.requestId, req),
     sessionStartedAt: resolveSessionStartedAt(options.sessionStartedAt, req),
     ...(state
@@ -639,10 +560,6 @@ function readNow(options: CrumbtrailExpressOptions): number {
   } catch {
     return Date.now();
   }
-}
-
-function safeStatusCode(statusCode: number | undefined): number | undefined {
-  return Number.isFinite(statusCode) ? statusCode : undefined;
 }
 
 function attemptSend(

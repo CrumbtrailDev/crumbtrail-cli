@@ -331,11 +331,132 @@ export interface CorsWidening {
    * prints the exact change instead of guessing at it.
    */
   needsManual: boolean;
+  /**
+   * True when this file pulls in a CORS middleware at all. False means either
+   * the service is same-origin — nothing to do — or its CORS lives in another
+   * file, which is the case that used to fail silently.
+   */
+  found: boolean;
+  /**
+   * Set when `found` is false but this file imports something whose module path
+   * or binding is named after CORS — `import { cors } from "./middleware/cors"`.
+   * The file almost certainly does have CORS, one hop away, so the wizard must
+   * not assert there is none. This is a name check on this file's own import
+   * lines, deliberately not an import graph walk.
+   */
+  importsCorsElsewhere: boolean;
 }
 
-/** Only files that actually pull in a CORS middleware are considered. */
-const CORS_IMPORT_RE =
-  /(?:from\s*["']cors["'])|(?:require\(\s*["']cors["']\s*\))|(?:from\s*["']hono\/cors["'])/;
+/**
+ * Only files that actually pull in a CORS middleware are considered. All the
+ * middlewares the wizard's own backend recipes can be wired alongside are
+ * listed: Express (`cors`), Hono (`hono/cors`), Fastify (`@fastify/cors`) and
+ * Koa (`@koa/cors`). A middleware missing from this list means its app is
+ * wired for correlation and left with a header allowlist that blocks it.
+ */
+const CORS_IMPORT_RE = new RegExp(
+  [
+    String.raw`from\s*["'](?:cors|hono/cors|@fastify/cors|fastify-cors|@koa/cors|koa2-cors|koa-cors)["']`,
+    String.raw`require\(\s*["'](?:cors|hono/cors|@fastify/cors|fastify-cors|@koa/cors|koa2-cors|koa-cors)["']\s*\)`,
+    String.raw`import\(\s*["'](?:@fastify/cors|fastify-cors)["']\s*\)`,
+  ].join("|"),
+);
+
+/**
+ * Any import or require line in THIS file that is named after CORS — a local
+ * module path (`./middleware/cors`), or a binding (`cors`, `corsMiddleware`,
+ * `applyCors`). It exists to stop the wizard asserting "no CORS middleware in
+ * this file" about a Hono entry whose first line is
+ * `import { cors } from "./middleware/cors"`. A false positive only softens a
+ * note, so the check is deliberately loose and deliberately local.
+ */
+const CORS_REFERENCE_RE = new RegExp(
+  [
+    String.raw`^\s*import\s[^;\n]*cors[^;\n]*$`,
+    String.raw`^\s*import\s[^;\n]*from\s*["'][^"'\n]*cors[^"'\n]*["']`,
+    String.raw`(?:require|import)\(\s*["'][^"'\n]*cors[^"'\n]*["']\s*\)`,
+    String.raw`^\s*(?:const|let|var)\s[^=\n]*cors[^=\n]*=\s*(?:await\s+)?(?:require|import)\(`,
+  ].join("|"),
+  "im",
+);
+
+/** True when this file mentions CORS on an import line but configures none. */
+export function referencesCorsElsewhere(text: string): boolean {
+  return CORS_REFERENCE_RE.test(text);
+}
+
+/** Server frameworks and runtimes whose presence means this process answers HTTP. */
+const HTTP_FRAMEWORKS = [
+  "express",
+  "fastify",
+  "hono",
+  "koa",
+  "restify",
+  "polka",
+  "connect",
+  "@hapi/hapi",
+  "@nestjs/core",
+  "@nestjs/platform-express",
+  "@nestjs/platform-fastify",
+  "apollo-server",
+  "@apollo/server",
+  "next",
+  "nuxt",
+] as const;
+
+const HTTP_MODULE_RE = new RegExp(
+  String.raw`(?:from\s*|require\s*\(\s*)["'](?:node:)?(?:http|https|http2|${HTTP_FRAMEWORKS.map(
+    (name) => name.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&"),
+  ).join("|")})(?:/[\w./@-]*)?["']`,
+  "m",
+);
+
+/** `app.listen(...)`, `server.listen(...)`, `createServer(`, `Bun.serve(`, `Deno.serve(`. */
+const HTTP_LISTEN_RE =
+  /\.listen\s*\(|createServer\s*\(|\b(?:Bun|Deno)\.serve\s*\(|\bserve\s*\(\s*\{/;
+
+/**
+ * Whether this process answers HTTP at all.
+ *
+ * The CORS guidance below is fifteen lines with three framework snippets, and it
+ * is only ever actionable for a process that serves browser requests. A package
+ * that is a bare `setInterval` worker got the whole lecture, which reads as the
+ * wizard not having looked at the code.
+ *
+ * Two sources, because the entry alone is not always enough: the scanned entry's
+ * own imports and listen calls, and — for an entry that only calls a `bootstrap()`
+ * living in another file — the package's declared dependencies. Either one is
+ * enough; a worker package has neither.
+ */
+export function servesHttp(
+  entrySource: string | null | undefined,
+  packageJson?: string | null,
+): boolean {
+  if (entrySource) {
+    if (HTTP_MODULE_RE.test(entrySource)) return true;
+    if (HTTP_LISTEN_RE.test(entrySource)) return true;
+  }
+  if (packageJson) {
+    try {
+      const parsed = JSON.parse(packageJson) as Record<string, unknown>;
+      const deps = new Set<string>();
+      for (const field of [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+      ]) {
+        const value = parsed[field];
+        if (value && typeof value === "object") {
+          for (const name of Object.keys(value)) deps.add(name);
+        }
+      }
+      if (HTTP_FRAMEWORKS.some((name) => deps.has(name))) return true;
+    } catch {
+      // Unparseable package.json: fall through to the entry's own evidence.
+    }
+  }
+  return false;
+}
 
 /** `allowedHeaders:` (Express `cors`) or `allowHeaders:` (Hono `cors`). */
 const ALLOW_HEADERS_KEY = String.raw`\ballow(?:ed)?Headers\s*:\s*`;
@@ -348,7 +469,8 @@ const STRING_FORM = new RegExp(
 const ANY_FORM = new RegExp(ALLOW_HEADERS_KEY, "g");
 
 /** An array body made only of string literals, commas and whitespace. */
-const LITERAL_ARRAY_BODY_RE = /^\s*(?:(["'])[^"'\n]*\1\s*,\s*)*(?:(["'])[^"'\n]*\2\s*,?\s*)?$/;
+const LITERAL_ARRAY_BODY_RE =
+  /^\s*(?:(["'])[^"'\n]*\1\s*,\s*)*(?:(["'])[^"'\n]*\2\s*,?\s*)?$/;
 
 function quoteStyleOf(body: string): '"' | "'" {
   return body.includes("'") && !body.includes('"') ? "'" : '"';
@@ -374,7 +496,13 @@ function quoteStyleOf(body: string): '"' | "'" {
  */
 export function widenCorsAllowedHeaders(text: string): CorsWidening {
   if (!CORS_IMPORT_RE.test(text)) {
-    return { text, changed: false, needsManual: false };
+    return {
+      text,
+      changed: false,
+      needsManual: false,
+      found: false,
+      importsCorsElsewhere: referencesCorsElsewhere(text),
+    };
   }
 
   let changed = false;
@@ -403,34 +531,159 @@ export function widenCorsAllowedHeaders(text: string): CorsWidening {
     return `${key}[${body.replace(/\s+$/, "")}${separator}${additions}]`;
   });
 
-  out = out.replace(STRING_FORM, (match, key: string, quote: string, body: string) => {
-    handled++;
-    const present = new Set(
-      body
-        .split(",")
-        .map((name) => name.trim().toLowerCase())
-        .filter(Boolean),
-    );
-    const missing = CORRELATION_REQUEST_HEADERS.filter(
-      (name) => !present.has(name),
-    );
-    if (missing.length === 0) return match;
-    changed = true;
-    const joined = [body.trim().replace(/,$/, ""), ...missing]
-      .filter(Boolean)
-      .join(",");
-    return `${key}${quote}${joined}${quote}`;
-  });
+  out = out.replace(
+    STRING_FORM,
+    (match, key: string, quote: string, body: string) => {
+      handled++;
+      const present = new Set(
+        body
+          .split(",")
+          .map((name) => name.trim().toLowerCase())
+          .filter(Boolean),
+      );
+      const missing = CORRELATION_REQUEST_HEADERS.filter(
+        (name) => !present.has(name),
+      );
+      if (missing.length === 0) return match;
+      changed = true;
+      const joined = [body.trim().replace(/,$/, ""), ...missing]
+        .filter(Boolean)
+        .join(",");
+      return `${key}${quote}${joined}${quote}`;
+    },
+  );
 
   const total = (text.match(ANY_FORM) ?? []).length;
-  return { text: out, changed, needsManual: handled < total };
+  return {
+    text: out,
+    changed,
+    needsManual: handled < total,
+    found: true,
+    importsCorsElsewhere: false,
+  };
 }
+
+const HEADER_LIST = CORRELATION_REQUEST_HEADERS.map((n) => `"${n}"`).join(", ");
 
 /** The exact lines a user must add when the config cannot be rewritten safely. */
 export function corsWideningGuidance(): string {
   return [
     "Add Crumbtrail's correlation headers to your CORS allowed headers, or cross origin requests from the browser will be blocked by the preflight:",
-    `  allowedHeaders: ["Content-Type", "Authorization", ${CORRELATION_REQUEST_HEADERS.map((n) => `"${n}"`).join(", ")}]`,
-    `  Hono: cors({ allowHeaders: [${CORRELATION_REQUEST_HEADERS.map((n) => `"${n}"`).join(", ")}] })`,
+    `  Express (cors): cors({ allowedHeaders: ["Content-Type", "Authorization", ${HEADER_LIST}] })`,
+    `  Hono: cors({ allowHeaders: [${HEADER_LIST}] })`,
+    `  Fastify (@fastify/cors): app.register(cors, { allowedHeaders: ["Content-Type", "Authorization", ${HEADER_LIST}] })`,
   ].join("\n");
+}
+
+/**
+ * Said when a backend is wired and no CORS middleware was found in the file we
+ * edited. The wizard cannot see a CORS config that lives in another file, and
+ * saying nothing was the failure: the browser SDK starts stamping three headers
+ * on every cross origin call, and an allowlist that predates them answers the
+ * preflight without them, so the app's own requests get blocked. Naming the
+ * headers is what makes that recoverable in seconds instead of a bisect.
+ */
+export function corsElsewhereGuidance(): string {
+  return [
+    `No CORS middleware in this file. If this service answers browser requests from another origin, whichever file configures its CORS must allow ${CORRELATION_REQUEST_HEADERS.join(", ")}, or the preflight blocks every cross origin request once correlation is on.`,
+    corsWideningGuidance(),
+  ].join("\n");
+}
+
+/**
+ * Said instead of the above when the file imports something named after CORS.
+ * The wizard could not read that other file, so it has no business claiming
+ * there is no CORS middleware, and no business printing three framework
+ * snippets for a config it has not seen. It names the headers and stops there.
+ */
+export function corsImportedElsewhereNote(): string {
+  return `This file configures no CORS itself but imports CORS from another module, which Crumbtrail did not read. If that config pins an allowed headers list, it needs ${CORRELATION_REQUEST_HEADERS.join(", ")} added, or the preflight blocks every cross origin request once correlation is on.`;
+}
+
+// ── Static frontends ─────────────────────────────────────────────────────────
+
+/** Whether this HTML already carries a Crumbtrail script tag. */
+export function htmlReferencesCrumbtrail(html: string): boolean {
+  return /crumbtrail/i.test(html);
+}
+
+/**
+ * Put a block into an HTML document, as late in `<head>` as possible.
+ *
+ * Order matters more here than in a module graph: capture has to be installed
+ * before the page's own scripts run, or the errors it exists to record happen
+ * first and are gone. `</head>` is therefore the target, with `<body>` and then
+ * `</body>` as fallbacks for the many real pages that have neither a head nor a
+ * closing tag. A file with no HTML structure at all returns null rather than
+ * having a script tag guessed into it.
+ */
+export function insertIntoHtmlHead(html: string, block: string): string | null {
+  // Indent the block to match the tag it lands above, and insert at the START
+  // of that tag's line so the tag keeps its own indentation. Splicing at the tag
+  // itself left the first emitted line wearing the closing tag's whitespace and
+  // every later line wearing a different amount — a diff that reads as damage.
+  const spliceBefore = (at: number): string => {
+    const lineStart = html.lastIndexOf("\n", at - 1) + 1;
+    const lead = html.slice(lineStart, at);
+    const indent = /^[ \t]*$/.exec(lead)?.[0] ?? lead.match(/^[ \t]*/)![0];
+    const indented = block
+      .split("\n")
+      .map((line) => (line ? `${indent}${line}` : line))
+      .join("\n");
+    // A tag alone on its line takes the block on the lines above it. A tag with
+    // code before it on the same line — `<head><title>x</title></head>`, which is
+    // most hand-written pages — must be split instead, or the block lands
+    // OUTSIDE the element it was supposed to go inside.
+    if (/^[ \t]*$/.test(lead)) {
+      return `${html.slice(0, lineStart)}${indented}\n${html.slice(lineStart)}`;
+    }
+    return `${html.slice(0, at)}\n${indented}\n${indent}${html.slice(at)}`;
+  };
+  const closeHead = /<\/head\s*>/i.exec(html);
+  if (closeHead) return spliceBefore(closeHead.index);
+  const openBody = /<body\b[^>]*>/i.exec(html);
+  if (openBody) {
+    const at = openBody.index + openBody[0].length;
+    const indented = block
+      .split("\n")
+      .map((line) => (line ? `  ${line}` : line))
+      .join("\n");
+    return `${html.slice(0, at)}\n${indented}${html.slice(at)}`;
+  }
+  const closeBody = /<\/body\s*>/i.exec(html);
+  if (closeBody) return spliceBefore(closeBody.index);
+  return null;
+}
+
+/**
+ * Directories an Express app serves as static files.
+ *
+ * `express.static(...)` is how a Node service ships a frontend, and that
+ * frontend is half the app's evidence — it was the half the wizard was blind to,
+ * because detection stops at the backend dependency and never looks at what the
+ * backend serves.
+ *
+ * Deliberately literal-only. The argument is usually
+ * `path.join(__dirname, "public")` or `"public"`, and the LAST string literal in
+ * the call is the directory in both shapes. A call built from a variable yields
+ * nothing rather than a guess, and the caller says so instead of editing a file
+ * it inferred.
+ */
+export function findStaticMountDirs(source: string): string[] {
+  const dirs: string[] = [];
+  const callRes = [
+    /\bexpress\s*\.\s*static\s*\(([^)]*)\)/gi,
+    /\bserveStatic\s*\(([^)]*)\)/gi,
+  ];
+  for (const callRe of callRes) {
+    for (const match of source.matchAll(callRe)) {
+      const literals = [...match[1].matchAll(/["'`]([^"'`]*)["'`]/g)].map(
+        (m) => m[1],
+      );
+      const dir = literals[literals.length - 1];
+      if (!dir || /^https?:/i.test(dir)) continue;
+      if (!dirs.includes(dir)) dirs.push(dir);
+    }
+  }
+  return dirs;
 }

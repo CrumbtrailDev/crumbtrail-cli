@@ -10,8 +10,14 @@ export interface Signal {
   tag: string;
   /** Dedup key — a given key auto-flags at most once per session. */
   key: string;
-  /** Human-readable note attached to the report. */
-  note: string;
+  /**
+   * SDK-authored sentence naming why the detector fired ("Auto captured after request
+   * returned 500"). It is NOT a note: a note is text a person typed, and putting this
+   * sentence in the report's note field made every automatic capture look like a user
+   * filed a bug report — with the sentence masked to asterisks on the way out, so the
+   * phantom report also claimed the person's words had been redacted.
+   */
+  reason: string;
 }
 
 /**
@@ -58,7 +64,7 @@ export function errorDetector(
       return {
         tag: "auto:error",
         key: `err:${errorSignature(event)}`,
-        note: msg
+        reason: msg
           ? `Auto-captured after error: ${msg}`
           : "Auto-captured after error",
       };
@@ -78,7 +84,7 @@ export function request5xxDetector(): SignalDetector {
       return {
         tag: "auto:request-5xx",
         key: `request-5xx:${requestId}:${status}`,
-        note: `Auto captured after request returned ${status}`,
+        reason: `Auto captured after request returned ${status}`,
       };
     },
   };
@@ -146,7 +152,7 @@ export function rageClickDetector(opts: RageClickOptions): SignalDetector {
         return {
           tag: "auto:rage-click",
           key: `rage:${key}`,
-          note: `Auto-captured after ${arr.length} rapid clicks on ${label}`,
+          reason: `Auto-captured after ${arr.length} rapid clicks on ${label}`,
         };
       }
       hits.set(key, arr);
@@ -193,7 +199,7 @@ export function retryStormDetector(opts: RetryStormOptions): SignalDetector {
   const tripped = (key: string, count: number): Signal => ({
     tag: "auto:retry-storm",
     key: `retry:${key}`,
-    note: `Auto-captured after ${count} rapid requests to ${key}`,
+    reason: `Auto-captured after ${count} rapid requests to ${key}`,
   });
 
   return {
@@ -279,7 +285,7 @@ export function slowResponseDetector(
         return {
           tag: "auto:slow-responses",
           key: "slow:session",
-          note: `Auto-captured after ${opts.count}+ responses slower than ${opts.thresholdMs}ms`,
+          reason: `Auto-captured after ${opts.count}+ responses slower than ${opts.thresholdMs}ms`,
         };
       }
       return null;
@@ -339,7 +345,7 @@ export function abandonedFlowDetector(
           return {
             tag: "auto:abandoned-flow",
             key: "abandoned:flow",
-            note: `Auto-captured after the page was hidden with ${count} unsubmitted input(s)`,
+            reason: `Auto-captured after the page was hidden with ${count} unsubmitted input(s)`,
           };
         }
         return null;

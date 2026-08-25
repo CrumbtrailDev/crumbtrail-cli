@@ -374,3 +374,79 @@ describe("startSessionSweeper", () => {
     }
   });
 });
+
+describe("sweepIdleSessions and an ending nobody stated", () => {
+  let tmpDir: string;
+  let sessions: SessionManager;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "crumbtrail-sweeper-end-"));
+    sessions = new SessionManager(tmpDir);
+  });
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function readEvents(sessionDir: string): Array<Record<string, unknown>> {
+    return fs
+      .readFileSync(path.join(sessionDir, "events.ndjson"), "utf-8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  }
+
+  it("states that a swept session stopped without ever saying it was finished", async () => {
+    await sessions.create("auto_killed", { app: "svc", capture: "auto" });
+    const dir = await sessions.getSessionDir("auto_killed");
+    const eventsPath = writeEvents(dir, [
+      { t: Date.now() - 3 * IDLE_MS, k: "backend.uncaught", d: {} },
+    ]);
+    backdate(path.join(dir, "meta.json"), 3 * IDLE_MS);
+    backdate(eventsPath, 3 * IDLE_MS);
+
+    await sweepIdleSessions({ sessions, outputDir: tmpDir, idleMs: IDLE_MS });
+
+    // Finalization moves the session directory, so read it back by id.
+    const finalDir = (await sessions.getExistingSessionDir(
+      "auto_killed",
+    )) as string;
+    const lifecycle = readEvents(finalDir).find(
+      (event) => event.k === "session.lifecycle",
+    );
+    expect(lifecycle).toBeDefined();
+    const d = lifecycle?.d as Record<string, unknown>;
+    // The container may have been killed, OOM-ed or lost its host. What is
+    // known is that nothing ever said the session was finished, and a brief
+    // built from it is reading an ending it did not witness.
+    expect(d.action).toBe("ended");
+    expect(d.reason).toBe("no-terminal-signal");
+    expect(d.finalizedBy).toBe("idle-sweep");
+  });
+
+  it("stays quiet when the process already named the signal that stopped it", async () => {
+    await sessions.create("auto_sigterm", { app: "svc", capture: "auto" });
+    const dir = await sessions.getSessionDir("auto_sigterm");
+    const eventsPath = writeEvents(dir, [
+      { t: Date.now() - 3 * IDLE_MS, k: "backend.uncaught", d: {} },
+      {
+        t: Date.now() - 3 * IDLE_MS,
+        k: "session.lifecycle",
+        d: { action: "process-terminated", reason: "SIGTERM" },
+      },
+    ]);
+    backdate(path.join(dir, "meta.json"), 3 * IDLE_MS);
+    backdate(eventsPath, 3 * IDLE_MS);
+
+    await sweepIdleSessions({ sessions, outputDir: tmpDir, idleMs: IDLE_MS });
+
+    const finalDir = (await sessions.getExistingSessionDir(
+      "auto_sigterm",
+    )) as string;
+    const lifecycles = readEvents(finalDir).filter(
+      (event) => event.k === "session.lifecycle",
+    );
+    // A process that explained itself is not contradicted by a vaguer sentence.
+    expect(lifecycles).toHaveLength(1);
+    expect((lifecycles[0].d as Record<string, unknown>).reason).toBe("SIGTERM");
+  });
+});

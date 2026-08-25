@@ -23,6 +23,7 @@ import {
   type IntegrationCheckInput,
   type IntegrationStatus,
 } from "./inject";
+import { DEPLOY_CONFIG_RE } from "./inject/entrypoints";
 import { OTLP_GUIDE_FILENAME } from "./otlp";
 import { inferServiceName } from "./provision";
 import { localFsReader } from "./readers/local-fs";
@@ -127,11 +128,69 @@ function injectIOFromReader(reader: FileReader): InjectIO {
 export function looksLikeLibrary(
   recipe: Recipe | null,
   pkg: { scripts?: Record<string, string>; bin?: unknown } | null,
+  evidence?: LibraryEvidence,
 ): boolean {
   if (recipe !== "node" || !pkg) return false;
   if (pkg.bin) return false;
   const scripts = pkg.scripts ?? {};
-  return !["start", "dev", "serve", "start:prod"].some((s) => scripts[s]);
+  if (
+    ["start", "dev", "serve", "start:prod"].some((name) =>
+      startsThePackage(scripts[name]),
+    )
+  ) {
+    return false;
+  }
+  // A process a deploy manifest names is a process the platform keeps running,
+  // whatever the scripts say.
+  if (evidence?.deployManifests?.trim()) return false;
+  if (runsAProcess(evidence?.entrySource)) return false;
+  return true;
+}
+
+/** What the caller could read about the package, beyond its package.json. */
+export interface LibraryEvidence {
+  /** The detected entry file's source, when one resolved. */
+  entrySource?: string | null;
+  /**
+   * Text of any deploy manifest at the package root that names this package's
+   * entry or start script. Empty or absent means nothing deploys it.
+   */
+  deployManifests?: string | null;
+}
+
+/**
+ * Build tools that produce artifacts and exit. A package whose only `dev` script
+ * is `tsc -w` is a library being rebuilt, not a service being run, and wiring
+ * capture into it opens a session for the length of a watch.
+ */
+const BUILD_ONLY_COMMAND_RE =
+  /^(tsc|tsup|tsdown|rollup|esbuild|swc|babel|unbuild|microbundle|preconstruct|api-extractor|rimraf|del-cli|copyfiles)\b/;
+
+/** True when this script command starts the package rather than building it. */
+function startsThePackage(command: string | undefined): boolean {
+  if (!command) return false;
+  // Strip the runner prefixes that wrap the real command.
+  const stripped = command
+    .trim()
+    .replace(
+      /^(?:npx|pnpm(?:\s+(?:run|exec|dlx))?|yarn(?:\s+run)?|npm\s+(?:run|exec)|bunx|cross-env(?:\s+\w+=\S+)*|dotenv\s+--\s*)\s+/,
+      "",
+    )
+    .trim();
+  return !BUILD_ONLY_COMMAND_RE.test(stripped);
+}
+
+/**
+ * Whether the entry file starts something that stays up: an HTTP server, a
+ * timer, a queue consumer, a worker thread. A module whose whole body is a set
+ * of exports runs only when something else imports it, and wiring capture into
+ * it files that importer's sessions under the library's name.
+ */
+const PROCESS_ENTRY_RE =
+  /\.listen\s*\(|createServer\s*\(|\b(?:Bun|Deno)\.serve\s*\(|setInterval\s*\(|new\s+Worker\s*\(|\.consume\s*\(|\.subscribe\s*\(|\.process\s*\(|\bcron\b|\bbootstrap\s*\(/;
+
+function runsAProcess(source: string | null | undefined): boolean {
+  return source != null && PROCESS_ENTRY_RE.test(source);
 }
 
 function readPkg(
@@ -148,6 +207,30 @@ function readPkg(
   } catch {
     return null;
   }
+}
+
+/**
+ * The two things beyond package.json that prove a package is run rather than
+ * imported: what its entry file actually does, and whether a deploy manifest at
+ * its root exists to start it.
+ */
+function libraryEvidence(
+  dir: string,
+  detected: DetectResult,
+  reader: FileReader,
+): LibraryEvidence {
+  const entrySource = detected.entryFile
+    ? reader.readFile(detected.entryFile)
+    : null;
+  const manifests: string[] = [];
+  for (const name of reader.readDir(dir)) {
+    if (!DEPLOY_CONFIG_RE.test(name)) continue;
+    const file = path.join(dir, name);
+    if (!reader.isFile(file)) continue;
+    const text = reader.readFile(file);
+    if (text) manifests.push(text);
+  }
+  return { entrySource, deployManifests: manifests.join("\n") };
 }
 
 function classify(
@@ -184,7 +267,9 @@ function classify(
 
   if (recipe == null) flags.push("no-recipe");
   if (isOtlp) flags.push("otlp");
-  if (looksLikeLibrary(recipe, pkg)) flags.push("likely-library");
+  if (looksLikeLibrary(recipe, pkg, libraryEvidence(dir, detected, reader))) {
+    flags.push("likely-library");
+  }
   if (detected.ambiguous && recipe != null) flags.push("ambiguous");
   if (wired) flags.push("already-wired");
 
@@ -202,7 +287,7 @@ function classify(
 
   return {
     dir,
-    name: pkg?.name?.split("/").pop() ?? fallbackName,
+    name: pkg?.name ?? fallbackName,
     relDir: path.relative(root, dir) || ".",
     source,
     detected,

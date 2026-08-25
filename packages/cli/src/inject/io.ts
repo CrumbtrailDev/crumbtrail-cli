@@ -5,7 +5,7 @@
 // NOTE: this module intentionally uses only node:fs, node:path and node:child_process
 // (git). No HTTP client and no network egress of any kind — networking is CP4's job.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
@@ -26,6 +26,12 @@ export interface InjectIO {
   readFile(p: string): string | null;
   /** git porcelain status for a single target path. */
   gitStatus(cwd: string, target: string): GitTargetStatus;
+  /**
+   * File names directly inside `dir`, or an empty list when it cannot be read.
+   * Optional: an in-memory fake that omits it only loses the deploy config
+   * signal used to rank one long running process above another.
+   */
+  listFiles?(dir: string): string[];
 }
 
 // Ask about the repo at `cwd`, never the one a surrounding git hook points at:
@@ -131,4 +137,13 @@ export const defaultInjectIO: InjectIO = {
     }
   },
   gitStatus: realGitStatus,
+  listFiles: (dir) => {
+    try {
+      return readdirSync(dir, { withFileTypes: true })
+        .filter((e) => e.isFile())
+        .map((e) => e.name);
+    } catch {
+      return [];
+    }
+  },
 };

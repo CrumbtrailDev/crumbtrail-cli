@@ -83,7 +83,28 @@ export const INDEXED_EVENT_KINDS: ReadonlySet<string> = new Set([
   "backend.uncaught",
   "backend.otel.span",
   "backend.log",
-  "backend.db.query",
+  // The runtime's own statement about the process, and the outbound calls it
+  // made. Both are read by evidence-index (`runtime_warning`, the payment and
+  // checkout boundary detectors) and both were reported back to the sender as
+  // unrecognized because they were never listed here.
+  "backend.warning",
+  "backend.http",
+  // Background work. Nodes in the causal graph and a section in the bundle.
+  "backend.job.start",
+  "backend.job.end",
+  "backend.job.error",
+  // Database plane. Every db detector reads these, and a session whose only
+  // evidence was a captured write was told nothing in it was indexable.
+  "db.diff",
+  "db.diff.bulk",
+  "db.read",
+  "db.read.bulk",
+  "db.error",
+  "db.statement",
+  // Browser gauges the layout, arithmetic and listener-leak detectors read.
+  "ui.num",
+  "ui.layout",
+  "ui.listeners",
   // Mobile and native (the wire contract's own kinds)
   "app-lifecycle",
   "native-crash",
@@ -94,8 +115,9 @@ export const INDEXED_EVENT_KINDS: ReadonlySet<string> = new Set([
   "media.video",
   "tx",
   "backend.otel.log",
-  // Capture bookkeeping
-  "capture.gap",
+  // Capture bookkeeping. The emitted kind is `capture_gap`
+  // (CAPTURE_GAP_EVENT_KIND); `capture.gap` was a spelling nothing ever sent.
+  "capture_gap",
 ]);
 
 export interface EventKindReport {

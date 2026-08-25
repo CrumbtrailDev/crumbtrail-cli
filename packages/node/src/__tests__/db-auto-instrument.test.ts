@@ -71,8 +71,13 @@ describe("autoInstrumentDbClients", () => {
     for (const result of report.results) {
       expect(result.status).toBe("not-installed");
     }
-    // Nothing patched ⇒ nothing claimed.
-    expect(formatAutoInstrumentReport(report)).toBe("");
+    // Nothing patched ⇒ nothing CLAIMED, and the silence is explained. An empty
+    // string here is what let an app with no supported driver install cleanly
+    // and then produce a session with no database evidence and no reason given.
+    const line = formatAutoInstrumentReport(report);
+    expect(line).toContain("no database driver was instrumented");
+    expect(line).toContain("carry no database evidence");
+    expect(line).not.toContain("database capture active");
   });
 
   it("restores the original factories", async () => {
@@ -202,5 +207,70 @@ describe("autoInstrumentDbClients", () => {
     const line = formatAutoInstrumentReport(report);
     expect(line).toContain("pg");
     expect(line).toContain("mysql2");
+  });
+});
+
+describe("autoInstrumentDbClients with postgres.js", () => {
+  /** The whole module export IS the factory, as in porsager/postgres. */
+  function fakePostgresModule() {
+    const created: unknown[] = [];
+    const factory = (_url: string) => {
+      const sql = ((..._args: unknown[]) => ({})) as Record<string, unknown> &
+        ((...a: unknown[]) => unknown);
+      created.push(sql);
+      return sql;
+    };
+    return { factory, created };
+  }
+
+  it("replaces the module export and wraps every pool the app creates", () => {
+    const { factory } = fakePostgresModule();
+    const registry: Record<string, unknown> = { postgres: factory };
+
+    const report = autoInstrumentDbClients({
+      emit: vi.fn(),
+      drivers: ["postgres"],
+      resolve: () => registry.postgres,
+      replaceModule: (specifier, value) => {
+        registry[specifier] = value;
+        return true;
+      },
+      hostIsEsm: () => false,
+    });
+
+    expect(report.results[0]?.status).toBe("patched");
+    // Two pools is the real shape of these apps: an application pool and a
+    // separate capture pool. Replacing the factory covers both.
+    const patched = registry.postgres as (url: string) => unknown;
+    const first = patched("postgres://a");
+    const second = patched("postgres://b");
+    expect(typeof first).toBe("function");
+    expect(typeof second).toBe("function");
+    expect(first).not.toBe(second);
+
+    report.restore();
+    expect(registry.postgres).toBe(factory);
+  });
+
+  it("refuses to claim capture it cannot deliver on an ESM host", () => {
+    const { factory } = fakePostgresModule();
+    const registry: Record<string, unknown> = { postgres: factory };
+
+    const report = autoInstrumentDbClients({
+      emit: vi.fn(),
+      drivers: ["postgres"],
+      resolve: () => registry.postgres,
+      replaceModule: (specifier, value) => {
+        registry[specifier] = value;
+        return true;
+      },
+      hostIsEsm: () => true,
+    });
+
+    expect(report.results[0]?.status).toBe("esm-unreachable");
+    const line = formatAutoInstrumentReport(report);
+    expect(line).toContain("no database driver was instrumented");
+    // The one thing that fixes it, in the place the reader is already looking.
+    expect(line).toContain("instrumentPostgresSql");
   });
 });

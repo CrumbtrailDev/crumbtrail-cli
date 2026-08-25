@@ -125,6 +125,11 @@ export {
   instrumentMssqlPool,
   instrumentMysqlClient,
   instrumentPgClient,
+  // Reachable from the package root on purpose: an ESM app loads postgres.js as
+  // a different module instance than the one auto instrumentation can patch, so
+  // the runtime tells those customers to call this themselves. A fix the message
+  // names has to be importable from where it tells them to import it.
+  instrumentPostgresSql,
   instrumentSqliteDatabase,
   resolveDbRequestContext,
   classifyStatement,
@@ -394,3 +399,65 @@ export type {
   BackendWarningCaptureOptions,
   RuntimeWarningLike,
 } from "./backend-warnings";
+
+// ── Structured backend log capture ───────────────────────────────────────────
+// Append-only block. Do not reorder the exports above.
+export {
+  BACKEND_LOG_EVENT,
+  BACKEND_LOG_LEVELS,
+  buildBackendLogEvent,
+  installBackendLogCapture,
+  parseStructuredLogLine,
+} from "./backend-logs";
+export type {
+  BackendLogCaptureHandle,
+  BackendLogCaptureOptions,
+  BackendLogLevel,
+  ParsedStructuredLog,
+} from "./backend-logs";
+
+// ── Inbound HTTP request capture ─────────────────────────────────────────────
+// Append-only block. Do not reorder the exports above.
+// The zero-config half of frontend to backend correlation: it patches
+// `http.Server` rather than any one framework, so express, hono, fastify, nest
+// and a plain `createServer` all record inbound requests carrying the browser's
+// correlation headers. `autoCapture` installs it, so a stock install needs none
+// of these symbols; they are exported for a host that wires capture by hand.
+export { installHttpRequestCapture } from "./http-server";
+export type {
+  HttpRequestCaptureHandle,
+  HttpRequestCaptureOptions,
+} from "./http-server";
+export {
+  claimBackendRequest,
+  isBackendRequestClaimed,
+} from "./backend-request-claim";
+// The session an uncorrelated backend request is filed to. `autoCapture` sets
+// this once its handshake succeeds; a host that runs its own headless session
+// and wires the middleware by hand announces it here so its request events land
+// somewhere too, instead of being refused for having no session.
+export {
+  setProcessSessionId,
+  clearProcessSessionId,
+  getProcessSessionId,
+} from "./process-session";
+export { isCapturableContentTypeForTest } from "./backend-response";
+export type {
+  BackendResponseCaptureOptions,
+  BackendResponseLike,
+} from "./backend-response";
+
+// ── Ambient request context ──────────────────────────────────────────────────
+// Append-only block. Do not reorder the exports above.
+// The request a piece of backend evidence was produced inside, carried on the
+// async path so a log line stamps the SAME request id as the request span that
+// provoked it. The request recorders establish it; a host instrumenting its own
+// background work (a queue consumer resuming a request's job) can establish one
+// too, so that work's evidence joins the request that queued it.
+export {
+  getBackendRequestContext,
+  readRequestCorrelation,
+  runInBackendRequestContext,
+  updateBackendRequestContext,
+} from "./request-context";
+export type { BackendRequestContext } from "./request-context";

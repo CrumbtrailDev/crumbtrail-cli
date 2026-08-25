@@ -158,6 +158,32 @@ describe("install-instructions snippets", () => {
     expect(p).not.toContain("bl_live_xyz");
   });
 
+  it("agent prompt carries the origins the caller already resolved", () => {
+    // The prompt hardcoded an empty list and then asked the agent to go and
+    // find the origins — while the CLI, in the same run, had already read them
+    // out of the repo and put them in every snippet it writes itself. The
+    // hand-off path was the one that threw that work away.
+    const p = buildAgentPrompt("react", keys, {
+      serviceName: "checkout-web",
+      backendOrigins: ["https://api.example.com", "http://localhost:4000"],
+    });
+    expect(p).toContain(
+      'networkCorrelationAllowedOrigins: ["https://api.example.com", "http://localhost:4000"],',
+    );
+    expect(p).toContain("Those origins were read from this app's own");
+    expect(p).toContain("x-crumbtrail-session-id");
+  });
+
+  it("agent prompt keeps the empty list and the fill-it-in instruction when none are known", () => {
+    // Never guessed: an origin the app does not call costs a preflight on a
+    // request that had none and sends trace context somewhere unwanted.
+    const p = buildAgentPrompt("react", keys, { backendOrigins: ["  "] });
+    expect(p).toContain("networkCorrelationAllowedOrigins: [],");
+    expect(p).toContain(
+      "Fill networkCorrelationAllowedOrigins with every backend origin this app",
+    );
+  });
+
   it("agent prompt requires a stable app name when none was supplied", () => {
     const p = buildAgentPrompt("react", keys, { serviceName: "  " });
     expect(p).toContain('service: "<your-app-name>",');

@@ -47,6 +47,7 @@
 //   cached at schedule time.
 
 import type { BugEvent } from "crumbtrail-core";
+import { isFaultNamingBackendError } from "./evidence-index";
 import type { SessionManager } from "./session";
 import { computeFinalizeNeed } from "./session-sweeper";
 
@@ -112,8 +113,16 @@ export function isHighSeverityEvent(event: BugEvent): boolean {
     case "rej":
     case "net.err":
     case "backend.req.error":
-    case "backend.uncaught":
       return true;
+    // A backend console.error is tiered by content in evidence-index: a bare
+    // informational line only ever produces a medium candidate, so racing a
+    // finalize for it would close the session over a finding that is never the
+    // answer. The same predicate keeps the two contracts in agreement.
+    case "backend.uncaught":
+      return isFaultNamingBackendError(
+        event,
+        isRecord(d.error) ? d.error : undefined,
+      );
     case "net.res": {
       const status = typeof d.st === "number" ? d.st : undefined;
       if (status === undefined) return false;
@@ -136,6 +145,13 @@ export function isHighSeverityEvent(event: BugEvent): boolean {
         finiteNumber(attributes?.["http.response.status_code"]) ??
         finiteNumber(attributes?.["http.status_code"]);
       return (status ?? 0) >= 500;
+    }
+    // A logged error is the ordinary shape of a backend failure: caught,
+    // written through pino/winston, answered with a status. Warn-level lines are
+    // NOT high severity, matching how console warnings are treated.
+    case "backend.log": {
+      const level = typeof d.level === "string" ? d.level : undefined;
+      return level === "error" || level === "fatal";
     }
     case "backend.otel.log": {
       const severityNumber = finiteNumber(d.severityNumber);

@@ -169,10 +169,13 @@ export function buildBackendJsNote(stack: Stack): string {
     ].join("\n");
   }
   return [
-    "// Backend (Hono / Node) — crumbtrail-node ships no framework middleware here,",
-    "// so autoCapture is the whole wiring. Prepend it at the top of the server",
-    "// entry file: it opens a headless session and records uncaught exceptions,",
-    "// unhandled rejections and console.error against it, with no per-event code.",
+    "// Backend (Hono / Node) — autoCapture is the whole wiring: it hooks",
+    "// http.Server, so inbound requests carrying the browser's correlation",
+    "// headers are recorded whichever framework serves them. Prepend it at the",
+    "// top of the server entry file: it opens a headless session and records",
+    "// those requests, uncaught exceptions, unhandled rejections, console.error,",
+    "// and the warnings and errors your logger writes (pino, winston, bunyan),",
+    "// with no per-event code.",
     "// Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY in the server environment.",
     ...configLines,
     'import("crumbtrail-node")',
@@ -333,6 +336,21 @@ export interface AgentPromptOptions {
    * replace it with a stable name before running the app.
    */
   serviceName?: string | null;
+  /**
+   * Backend origins this app calls, as the caller already resolved them.
+   *
+   * The prompt used to hardcode `networkCorrelationAllowedOrigins: []` and then
+   * ask the agent to go and find the origins — while the CLI, in the same run,
+   * had already read them out of the repo and put them in every snippet it
+   * writes itself. The hand-off path was the one that threw that work away, so
+   * an install done by pasting this prompt produced a frontend and a backend
+   * whose evidence never joined.
+   *
+   * Empty or absent keeps the empty list plus the instruction to fill it in:
+   * an origin is never guessed here, because listing one the app does not call
+   * sends trace context to a third party.
+   */
+  backendOrigins?: readonly string[] | null;
 }
 
 export function buildAgentPrompt(
@@ -383,6 +401,12 @@ export function buildAgentPrompt(
   }
 
   const { envVar, expr } = opts.keyEnv ?? keyEnvRef(stack);
+  // Never guessed, only passed through: an origin the app does not call costs a
+  // CORS preflight on a request that had none and sends trace context somewhere
+  // it was not wanted.
+  const knownOrigins = (opts.backendOrigins ?? []).filter(
+    (origin) => origin.trim().length > 0,
+  );
 
   if (backendJs)
     return backendJsPrompt(
@@ -423,18 +447,33 @@ export function buildAgentPrompt(
     // consent mode, session replay and live probes all stay at whatever this
     // call happens to say and the project's own settings never reach the app.
     "         remoteConfig: true,",
-    // Empty by default, and an empty list means only same origin calls carry the
-    // session, request and traceparent headers. A browser app calling an API on
-    // another host is the normal multi service shape, so without this field
-    // named here the hand-off produces an install whose frontend and backend
-    // evidence never joins, silently.
-    "         networkCorrelationAllowedOrigins: [],",
+    // Empty means only same origin calls carry the session, request and
+    // traceparent headers. A browser app calling an API on another host is the
+    // normal multi service shape, so without this field named here the hand-off
+    // produces an install whose frontend and backend evidence never joins,
+    // silently. Pre-filled when the caller already read the origins out of the
+    // repo — asking an agent to rediscover what the CLI just resolved is how
+    // the list came back empty.
+    `         networkCorrelationAllowedOrigins: [${knownOrigins.map((o) => JSON.stringify(o)).join(", ")}],`,
     "       });",
-    "     Fill networkCorrelationAllowedOrigins with every backend origin this app",
-    '     calls, for example "https://api.example.com", taking them from the app\'s',
-    "     own API base URL configuration. Cross origin requests are joined to the",
-    "     session only when their origin is listed. Do not add origins the app does",
-    "     not call.",
+    ...(knownOrigins.length > 0
+      ? [
+          "     Those origins were read from this app's own configuration. Keep them,",
+          "     and add any backend origin this app calls that is missing. Cross origin",
+          "     requests are joined to the session only when their origin is listed.",
+          "     Do not add origins the app does not call. Each origin listed must allow",
+          "     x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent in its",
+          "     CORS allowed headers, or the browser blocks the preflight.",
+        ]
+      : [
+          "     Fill networkCorrelationAllowedOrigins with every backend origin this app",
+          '     calls, for example "https://api.example.com", taking them from the app\'s',
+          "     own API base URL configuration. Cross origin requests are joined to the",
+          "     session only when their origin is listed. Do not add origins the app does",
+          "     not call. Each origin listed must allow x-crumbtrail-session-id,",
+          "     x-crumbtrail-request-id and traceparent in its CORS allowed headers, or",
+          "     the browser blocks the preflight.",
+        ]),
     ...(hasExplicitServiceName
       ? [
           "     Keep the service field exactly as written. It is how this app is",
@@ -485,9 +524,14 @@ function backendJsPrompt(
     ...nodeInitSnippet(endpoint, expr, serviceName)
       .split("\n")
       .map((line) => `       ${line}`),
-    "     autoCapture records uncaught exceptions, unhandled rejections and",
-    "     console.error against a headless session, and loads the app's .env",
-    "     itself so the key above is set by the time it starts.",
+    "     autoCapture hooks http.Server, so it records inbound HTTP requests.",
+    "     Requests carrying the browser's correlation headers land in the",
+    "     browser's own session; the rest land in this app's own session, so a",
+    "     backend-only service still reports. It also captures uncaught",
+    "     exceptions, unhandled rejections,",
+    "     console.error, and the warnings and errors your logger writes (pino,",
+    "     winston, bunyan). It loads the app's .env itself, so the key above is",
+    "     set by the time it starts.",
   ];
   if (hasExplicitServiceName) {
     lines.push(
@@ -503,9 +547,11 @@ function backendJsPrompt(
   if (stack === "express") {
     lines.push(
       "  3. This is an Express app — also register the request and error",
-      "     middleware, or backend request spans (and frontend-to-backend",
-      "     linkage) stay empty. The options object is built while this file is",
-      "     evaluated, so load .env first or the middleware posts with no key:",
+      "     middleware. The block above already records the request and joins it",
+      "     to the browser's session; the middleware adds the matched route and",
+      "     the errors your handlers throw. The options object is built while this",
+      "     file is evaluated, so load .env first or the middleware posts with no",
+      "     key:",
       ...envPreloadSnippet(envVar)
         .split("\n")
         .map((line) => `       ${line}`),
@@ -520,8 +566,11 @@ function backendJsPrompt(
     );
   } else {
     lines.push(
-      "  3. crumbtrail-node ships no framework middleware for this stack, so the",
-      "     block above is the whole wiring — add nothing else.",
+      "  3. The block above is the whole wiring for this stack — add nothing",
+      "     else. autoCapture hooks http.Server, so requests are recorded",
+      "     whichever framework serves them: joined to the browser's session",
+      "     when its correlation headers arrive, filed under this app's own",
+      "     session when they do not.",
       "  4. Change nothing else, then verify the build still passes.",
     );
   }

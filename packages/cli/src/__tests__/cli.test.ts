@@ -3,12 +3,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  compareSdkVersions,
   installSdk as realInstallSdk,
   isCliEntrypoint,
+  normalizeRepoUrl,
   parseArgs,
   probeServiceKeys,
   resolveWorkspaceDir,
   runCli,
+  sdkInstallSpecForCli,
+  wizardAliasHint,
   type WizardDeps,
 } from "../cli";
 import {
@@ -21,7 +25,7 @@ import { RECIPE_REGISTRY, sdkInstallSpec } from "../recipe-registry";
 import type { ServiceCandidate } from "../discover";
 import type { Prompter, Ui } from "../ui";
 import type { EnvFileIO } from "../env-file";
-import { saveAuth } from "../auth";
+import { clearReportedAppBases, rememberAppBase, saveAuth } from "../auth";
 
 function captureUi(): { ui: Ui; lines: string[] } {
   const lines: string[] = [];
@@ -119,7 +123,7 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
     }),
     ensureToken: vi.fn(async () => {
       h.steps.push("login");
-      return "bl_cli_token";
+      return "ctcli_token";
     }) as unknown as WizardDeps["ensureToken"],
     provisionFlow: vi.fn(async () => {
       h.steps.push("provision");
@@ -191,6 +195,11 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
     openBrowserFn: vi.fn(async () => true),
     ui,
     prompter: noopPrompter,
+    // Pinned so the endpoint default never depends on whether the machine
+    // running the suite happens to hold a `crumbtrail login`. Without this the
+    // deps fall through to the real `loadAuth`, and a developer logged into a
+    // local stack sees the hosted-default assertions fail while CI passes.
+    loadStoredAuth: () => undefined,
     // DISPLAY pinned so canUseBrowser's headless-Linux guard doesn't make
     // browser-open assertions platform-dependent (CI runners have no X).
     env: { CRUMBTRAIL_BASE_URL: "http://127.0.0.1:9999", DISPLAY: ":0" },
@@ -245,6 +254,76 @@ describe("wizard first-event wait — what is actually outstanding", () => {
     // `crumbtrail verify` answers the whole "is it me or is it you" ticket
     // category, and appeared in usage() and nowhere a stuck person would look.
     expect(lines.join("\n")).toContain("npx crumbtrail verify");
+  });
+});
+
+describe("normalizeRepoUrl", () => {
+  // The identity sent with every create. Two clones of one repository have to
+  // reduce to one string, or the CLI reports the same app as two.
+  it("reduces every clone form of one repository to the same name", () => {
+    for (const url of [
+      "git@github.com:acme/billing.git",
+      "https://github.com/acme/billing.git",
+      "https://github.com/acme/billing",
+      "ssh://git@github.com/acme/billing.git",
+      "GIT@GitHub.com:Acme/Billing",
+    ]) {
+      expect(normalizeRepoUrl(url)).toBe("github.com/acme/billing");
+    }
+  });
+
+  it("leaves a host it does not recognize alone rather than guessing", () => {
+    expect(normalizeRepoUrl("https://git.internal:7999/team/app.git")).toBe(
+      "git.internal:7999/team/app",
+    );
+  });
+});
+
+describe("the final verdict says whether anything was captured", () => {
+  // "Setup complete" used to be decided by the ingest key alone, so a run that
+  // had just printed "No event yet, start your app" still certified itself as
+  // done three lines later. The README's promise is a confirmed first event.
+  const timingOut = (ui: Ui) =>
+    makeDeps(
+      { steps: [] },
+      {
+        ui,
+        pollForRealEvent: vi.fn(async () => ({
+          outcome: "timeout" as const,
+        })) as unknown as WizardDeps["pollForRealEvent"],
+      },
+    );
+
+  it("will not call a run complete when no event ever arrived", async () => {
+    const { ui, lines } = captureUi();
+    const code = await runCli(["node", "cli"], timingOut(ui));
+    const out = lines.join("\n");
+    expect(out).not.toContain("Setup complete");
+    expect(out).toContain("Wiring complete. No event captured yet.");
+    // Nothing is outstanding for the reader to fix, so this is not a failure a
+    // script should act on: the app has simply not been started yet.
+    expect(code).toBe(0);
+  });
+
+  it("calls it complete once the event is in", async () => {
+    const { ui, lines } = captureUi();
+    const code = await runCli(["node", "cli"], makeDeps({ steps: [] }, { ui }));
+    expect(lines.join("\n")).toContain("Setup complete. First event received.");
+    expect(code).toBe(0);
+  });
+
+  it("claims nothing about capture when the wait was skipped", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(["node", "cli", "--skip-verify"], makeDeps({ steps: [] }, { ui }));
+    const out = lines.join("\n");
+    expect(out).toContain("Wiring complete. First event not verified.");
+    expect(out).not.toContain("Setup complete");
+  });
+
+  it("calls the object what the dashboard calls it", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(["node", "cli"], makeDeps({ steps: [] }, { ui }));
+    expect(lines.join("\n")).toMatch(/Application:\s+web/);
   });
 });
 
@@ -445,9 +524,13 @@ describe("wizard orchestration", () => {
     expect(out).toMatch(/wrote VITE_CRUMBTRAIL_KEY to/i);
     // Which key. Minting is additive on purpose, so after a second run the
     // project holds two live keys and the dashboard list cannot say which one
-    // is in this app's env file. The id and the tail can.
-    expect(out).toContain("key_test");
+    // is in this app's env file. The tail can, and it is the only half of the
+    // answer the reader can look up: the id the API returns beside it is a
+    // database row id that neither the env file nor the dashboard prints, so
+    // "internal id key_test" was an identifier with nowhere to match it.
     expect(out).toMatch(/ending est123/);
+    expect(out).not.toContain("internal id");
+    expect(out).not.toContain("key_test");
     // The key VALUE still never reaches the terminal. Scrollback, CI logs and
     // screen shares all outlive the run.
     expect(out).not.toMatch(/ctkey_|bgk_|bl_key_/);
@@ -715,10 +798,14 @@ describe("wizard orchestration", () => {
     );
 
     // The injection above it is still correct and worth keeping, so a failed
-    // env write reports rather than rolling the wiring back.
-    expect(code).toBe(0);
+    // env write reports rather than rolling the wiring back. The run is still
+    // unfinished though: without the key on disk the app reports nothing, the
+    // summary says "Setup incomplete", and the exit code has to agree with it
+    // or a script reads this run as a success.
+    expect(code).toBe(1);
     expect(steps).toContain("execute");
     const out = lines.join("\n");
+    expect(out).toContain("Setup incomplete");
     expect(out).toMatch(/could not write it/i);
     expect(out).not.toMatch(/ctkey_/);
   });
@@ -1011,7 +1098,9 @@ describe("batch installer (unlinked sibling services)", () => {
           ambiguous: true,
           recipe: null,
           entryFile: null,
-          reasons: ["looked in /app; package.json has no dependencies matching a recipe"],
+          reasons: [
+            "looked in /app; package.json has no dependencies matching a recipe",
+          ],
         });
       }),
       discoverServices: vi.fn(
@@ -1062,6 +1151,49 @@ describe("batch installer (unlinked sibling services)", () => {
     const code = await runCli(["node", "cli"], deps);
     expect(code).toBe(1);
     expect(lines.join("\n")).toContain("No supported framework in /app");
+  });
+});
+
+describe("batch installer: an empty selection has two opposite meanings", () => {
+  // A rerun in a repository that is fully wired opens the list with every box
+  // unchecked, because "already wired" is exactly what turns the default off.
+  // Pressing Enter then printed "Nothing selected, no changes made", which is
+  // the same sentence a reader gets when the CLI found nothing it could wire.
+  it("says the repository is already wired rather than that nothing was picked", async () => {
+    const steps: string[] = [];
+    const deps = batchDeps(steps, [
+      candidate({ relDir: "apps/web", flags: ["already-wired"], defaultChecked: false }),
+      candidate({
+        relDir: "services/api",
+        recipe: "express",
+        flags: ["already-wired"],
+        defaultChecked: false,
+      }),
+    ]);
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    const code = await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(code).toBe(0);
+    expect(out).toContain("already wired for");
+    expect(out).toContain("Nothing to do");
+    expect(out).not.toContain("Nothing selected");
+    // Nothing was provisioned to say it: the answer is known before login.
+    expect(steps).not.toContain("login");
+  });
+
+  it("still says nothing was picked when there was something to pick", async () => {
+    const steps: string[] = [];
+    const deps = batchDeps(steps, [
+      candidate({ relDir: "apps/web", defaultChecked: false }),
+    ]);
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+
+    const code = await runCli(["node", "cli"], deps);
+    expect(code).toBe(0);
+    expect(lines.join("\n")).toContain("Nothing selected");
   });
 });
 
@@ -1128,8 +1260,11 @@ describe("batch installer (monorepo root)", () => {
 
     const code = await runCli(["node", "cli"], deps);
 
-    // A partial batch is still a success — two of three services got wired.
-    expect(code).toBe(0);
+    // A partial batch is not a success. It prints "Setup incomplete. 1 of 3
+    // applications still need you", and a CI step that wires a repository has
+    // to be able to act on that: exit 0 here meant a pipeline went green with
+    // a service that reports nothing.
+    expect(code).toBe(1);
     // The service AFTER the failure still ran: the batch did not abort.
     expect(steps).toContain("provision:admin");
     expect(steps).toContain("execute:/app/apps/admin/src/main.ts");
@@ -1357,7 +1492,9 @@ describe("batch installer (monorepo root)", () => {
     }) as unknown as WizardDeps["executePlan"];
 
     const code = await runCli(["node", "cli"], deps);
-    expect(code).toBe(0);
+    // An OTLP service is never wired by this run: the guide file names a manual
+    // exporter step, so the batch reports itself incomplete and exits non zero.
+    expect(code).toBe(1);
     // otlp has no SDK packages — installSdk must early-return, not shell out.
     expect(spawnFn).not.toHaveBeenCalled();
     expect(written).toEqual(["/app/services/payments/CRUMBTRAIL-OTLP.md"]);
@@ -1408,6 +1545,53 @@ describe("batch installer (monorepo root)", () => {
     bad.ui = badUi.ui;
     expect(await runCli(["node", "cli", "--only", "nope"], bad)).toBe(1);
     expect(badUi.lines.join("\n")).toContain("no such service");
+  });
+
+  // Defect class: `--all` wired a shared library, so the app that imports it
+  // filed every session under the library's name and the real service reported
+  // nothing.
+  it("--all skips a library and names it, while --only still wires it", async () => {
+    const candidates = [
+      candidate({
+        relDir: "packages/shared",
+        recipe: "node",
+        flags: ["likely-library"],
+        defaultChecked: false,
+      }),
+      candidate({ relDir: "services/api", recipe: "express" }),
+    ];
+
+    const steps: string[] = [];
+    const deps = batchDeps(steps, candidates);
+    deps.isTTY = false;
+    const { ui, lines } = captureUi();
+    deps.ui = ui;
+    expect(
+      await runCli(["node", "cli", "--yes", "--project", "p1", "--all"], deps),
+    ).toBe(0);
+    expect(steps).toContain("provision:api");
+    expect(steps).not.toContain("provision:shared");
+    expect(lines.join("\n")).toContain("packages/shared: nothing runs this package");
+
+    // Named explicitly, it is still the user's call.
+    const onlySteps: string[] = [];
+    const only = batchDeps(onlySteps, candidates);
+    only.isTTY = false;
+    expect(
+      await runCli(
+        [
+          "node",
+          "cli",
+          "--yes",
+          "--project",
+          "p1",
+          "--only",
+          "packages/shared",
+        ],
+        only,
+      ),
+    ).toBe(0);
+    expect(onlySteps).toContain("provision:shared");
   });
 
   it("bails when nothing in the repo can be wired", async () => {
@@ -1481,7 +1665,10 @@ describe("wizard — OTLP backend (non-JS)", () => {
       },
     );
     const code = await runCli(["node", "cli"], deps);
-    expect(code).toBe(0);
+    // Guidance only: nothing was wired and the exporter step is still on the
+    // reader, which the summary bar has always said and the exit code now says
+    // too.
+    expect(code).toBe(1);
     // The empty SDK package list must NOT spawn a package manager.
     expect(spawnFn).not.toHaveBeenCalled();
     // The guidance path never calls the executor (it prints, touches nothing).
@@ -1602,7 +1789,7 @@ describe("non-TTY login fail-fast wiring (BUG-4)", () => {
         ensureToken: vi.fn(
           async (opts: { allowInteractiveLogin?: boolean }) => {
             seen = opts.allowInteractiveLogin;
-            return "bl_cli_token";
+            return "ctcli_token";
           },
         ) as unknown as WizardDeps["ensureToken"],
       },
@@ -1625,7 +1812,7 @@ describe("non-TTY login fail-fast wiring (BUG-4)", () => {
         ensureToken: vi.fn(
           async (opts: { allowInteractiveLogin?: boolean }) => {
             seen = opts.allowInteractiveLogin;
-            return "bl_cli_token";
+            return "ctcli_token";
           },
         ) as unknown as WizardDeps["ensureToken"],
       },
@@ -1726,7 +1913,9 @@ describe("wizard — dirty-file decline covers the complete local setup", () => 
       },
     );
     const code = await runCli(["node", "cli"], deps);
-    expect(code).toBe(0);
+    // Declining leaves the app unwired, which the summary calls "Setup
+    // incomplete". The exit code says the same.
+    expect(code).toBe(1);
     // The decline is asked before installSdk, so no local setup write runs.
     expect(steps).not.toContain("execute");
     expect(steps).not.toContain("install");
@@ -1739,6 +1928,12 @@ describe("wizard — dirty-file decline covers the complete local setup", () => 
     );
     expect(out).toMatch(/no ingest key was minted/i);
     expect(out).toMatch(/setup incomplete/i);
+    // The prompt said "No leaves all local files unchanged" and nothing else,
+    // while a project and an application had already been created in the
+    // reader's dashboard. The cloud half is not undone by a No, so the question
+    // has to name it before it is asked.
+    expect(out).toMatch(/already created in your dashboard/i);
+    expect(out).toMatch(/application web/i);
   });
 });
 
@@ -1813,11 +2008,13 @@ describe("installSdk — registry install is version pinned", () => {
       spawnFn,
     });
     expect(result.installed).toBe(true);
-    // Bare names would let a stale dist tag resolve to an old 0.2.x SDK; the
-    // floors from SDK_VERSION_FLOORS must be applied to every package.
+    // Bare names would let a stale dist tag resolve to an old 0.2.x SDK; a
+    // floor must be applied to every package.
     expect(calls[0]).toEqual([
       "install",
-      ...["crumbtrail-core", "crumbtrail-node"].map(sdkInstallSpec),
+      ...["crumbtrail-core", "crumbtrail-node"].map((pkg) =>
+        sdkInstallSpecForCli(pkg),
+      ),
     ]);
     // `>=`, not `^`: a caret on a 0.x version also caps at the next minor, which
     // would strand new installs on one minor line until the floor is bumped.
@@ -1826,6 +2023,220 @@ describe("installSdk — registry install is version pinned", () => {
     }
     // The result reports bare package names (used for notes + tarball fallback).
     expect(result.packages).toEqual(["crumbtrail-core", "crumbtrail-node"]);
+  });
+});
+
+describe("installSdk — a nonzero exit is not proof of a failed install", () => {
+  const uiSink: Ui = { out: () => {}, err: () => {} };
+
+  it("treats packages that are on disk as installed when the package manager exits nonzero", async () => {
+    // pnpm 10+/11 exits 1 with ERR_PNPM_IGNORED_BUILDS whenever any dependency
+    // has an unapproved build script (esbuild, sharp, prisma), long after the
+    // requested packages are installed.
+    const result = await realInstallSdk({
+      cwd: "/app",
+      packageManager: "pnpm",
+      recipe: "express",
+      base: "https://deploy.example",
+      ui: uiSink,
+      spawnFn: () => 1,
+      cliVersion: "0.37.0",
+      resolvedVersionFn: () => "0.37.0",
+    });
+    expect(result.installed).toBe(true);
+    expect(result.note).toContain("exited nonzero");
+    expect(result.note).toContain("ERR_PNPM_IGNORED_BUILDS");
+  });
+
+  it("still fails when the packages really are absent", async () => {
+    const fetchImpl = (async () =>
+      new Response("nope", { status: 404 })) as unknown as typeof fetch;
+    const result = await realInstallSdk({
+      cwd: "/app",
+      packageManager: "pnpm",
+      recipe: "express",
+      base: "https://deploy.example",
+      ui: uiSink,
+      spawnFn: () => 1,
+      fetchImpl,
+      cliVersion: "0.37.0",
+      resolvedVersionFn: () => undefined,
+    });
+    expect(result.installed).toBe(false);
+    expect(result.note).toContain("failed");
+  });
+
+  it("names release-age gating when the resolved SDK is older than the CLI", async () => {
+    const result = await realInstallSdk({
+      cwd: "/app",
+      packageManager: "pnpm",
+      recipe: "express",
+      base: "https://deploy.example",
+      ui: uiSink,
+      spawnFn: () => 0,
+      cliVersion: "0.37.0",
+      resolvedVersionFn: () => "0.36.0",
+    });
+    expect(result.installed).toBe(true);
+    expect(result.note).toContain("minimumReleaseAge");
+    // The exact way out, not just a diagnosis.
+    expect(result.note).toContain("pnpm add crumbtrail-core@0.37.0");
+  });
+
+  it("says nothing when the resolved SDK matches the CLI", async () => {
+    const result = await realInstallSdk({
+      cwd: "/app",
+      packageManager: "pnpm",
+      recipe: "express",
+      base: "https://deploy.example",
+      ui: uiSink,
+      spawnFn: () => 0,
+      cliVersion: "0.37.0",
+      resolvedVersionFn: () => "0.37.0",
+    });
+    expect(result).toEqual({
+      installed: true,
+      packages: ["crumbtrail-core", "crumbtrail-node"],
+    });
+  });
+});
+
+describe("SDK install floor follows the CLI's own version", () => {
+  it("asks for at least the CLI's version, so a release-age gate cannot skip it", () => {
+    expect(sdkInstallSpecForCli("crumbtrail-node", "0.37.0")).toBe(
+      "crumbtrail-node@>=0.37.0",
+    );
+  });
+
+  it("keeps the capability floor when the CLI is somehow older", () => {
+    expect(sdkInstallSpecForCli("crumbtrail-node", "0.1.0")).toBe(
+      sdkInstallSpec("crumbtrail-node"),
+    );
+  });
+
+  it("does not demand a prerelease SDK from a prerelease CLI", () => {
+    expect(sdkInstallSpecForCli("crumbtrail-node", "0.99.0-rc.1")).toBe(
+      sdkInstallSpec("crumbtrail-node"),
+    );
+  });
+
+  it("orders versions numerically, with a prerelease below its release", () => {
+    expect(compareSdkVersions("0.37.0", "0.36.0")).toBe(1);
+    expect(compareSdkVersions("0.9.0", "0.10.0")).toBe(-1);
+    expect(compareSdkVersions("0.37.0-rc.1", "0.37.0")).toBe(-1);
+    expect(compareSdkVersions("1.2.3", "1.2.3")).toBe(0);
+  });
+
+  it("floors every installer-managed package, never a bare name", () => {
+    for (const pkg of [
+      "crumbtrail-core",
+      "crumbtrail-node",
+      "crumbtrail-react-native",
+      "crumbtrail-capacitor",
+    ]) {
+      expect(sdkInstallSpecForCli(pkg)).toMatch(/@>=\d+\.\d+\.\d+$/);
+    }
+  });
+});
+
+describe("a withheld wiring still hands over the snippet", () => {
+  it("prints the paste-this snippet when the SDK install failed", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        installSdk: vi.fn(async () => ({
+          installed: false,
+          packages: ["crumbtrail-core"],
+          note: "SDK install via pnpm failed.",
+        })),
+        buildPlan: vi.fn(() => ({
+          recipe: "vite-spa",
+          kind: "fallback-ai" as const,
+          warnings: [],
+          keyEnvVar: "VITE_CRUMBTRAIL_KEY",
+          snippet:
+            "Crumbtrail.init({ key: import.meta.env.VITE_CRUMBTRAIL_KEY })",
+          agentPrompt: "Wire Crumbtrail into this app.",
+        })) as unknown as WizardDeps["buildPlan"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("is not installed");
+    // The compounding bail: this run returned before the branch that prints
+    // the snippet, so the user who most needed it was the one who never saw it.
+    expect(out).toContain("Crumbtrail.init({ key: import.meta.env");
+    expect(out).toContain("Wire Crumbtrail into this app.");
+  });
+});
+
+describe("dashboard link on a split-origin deployment", () => {
+  afterEach(() => clearReportedAppBases());
+
+  it("uses the origin the deployment reported, whatever the token source", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui });
+    // What the real ensureToken records from the deployment. The CLI token here
+    // comes from the environment, so nothing was ever written to auth.json.
+    rememberAppBase("http://127.0.0.1:9999", "http://127.0.0.1:19892");
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("http://127.0.0.1:19892/p/p1/issues");
+    expect(out).not.toContain("http://127.0.0.1:9999/p/p1/issues");
+  });
+
+  it("says the link is a guess when the deployment reported nothing", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui });
+    await runCli(["node", "cli"], deps);
+    expect(lines.join("\n")).toContain("CRUMBTRAIL_APP_URL");
+  });
+});
+
+describe("a word that is not a subcommand", () => {
+  it("answers `crumbtrail setup` with the one line that fixes it", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui });
+    const code = await runCli(["node", "cli", "setup"], deps);
+    expect(code).toBe(1);
+    const out = lines.join("\n");
+    expect(out).toContain("no `setup` subcommand");
+    expect(out).toContain("npx crumbtrail");
+    // Not thirty lines of help for a one-line problem.
+    expect(out).not.toContain("--skip-verify");
+  });
+
+  it("still shows usage for an argument nobody could mean", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui });
+    expect(await runCli(["node", "cli", "--frobnicate"], deps)).toBe(1);
+    expect(lines.join("\n")).toContain("Unknown argument");
+  });
+
+  it("refuses a flag whose value is another flag, instead of using it", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui });
+    // This used to set the project id to the literal "--yes" and carry on,
+    // wiring a typo's worth of telemetry into whatever project that named.
+    expect(await runCli(["node", "cli", "--project", "--yes"], deps)).toBe(1);
+    expect(lines.join("\n")).toContain("--project requires a value");
+  });
+
+  it("refuses a trailing flag with no value, instead of throwing", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui });
+    // `--only` with nothing after it reached .toLowerCase() on undefined and
+    // ended the run with an internal TypeError.
+    expect(await runCli(["node", "cli", "--only"], deps)).toBe(1);
+    expect(lines.join("\n")).toContain("--only requires a value");
+  });
+
+  it("recognizes the words people actually type", () => {
+    expect(wizardAliasHint("init")).toContain("no `init` subcommand");
+    expect(wizardAliasHint("Install")).toContain("no `install` subcommand");
+    expect(wizardAliasHint("verify")).toBeUndefined();
   });
 });
 
@@ -1839,7 +2250,7 @@ describe("crumbtrail token", () => {
       };
       saveAuth(
         {
-          token: "bl_cli_" + "z".repeat(48),
+          token: "ctcli_" + "z".repeat(48),
           expiresAt: "2099-01-01T00:00:00Z",
           endpoint: "https://cloud.example",
         },
@@ -1858,7 +2269,7 @@ describe("crumbtrail token", () => {
       const code = await runCli(["node", "cli", "token"], deps);
       expect(code).toBe(0);
       // Pipeable: the value and nothing else.
-      expect(out.join("\n").trim()).toBe("bl_cli_" + "z".repeat(48));
+      expect(out.join("\n").trim()).toBe("ctcli_" + "z".repeat(48));
       expect(err.join("\n")).toContain("CRUMBTRAIL_TOKEN");
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -1992,5 +2403,87 @@ describe("probeServiceKeys", () => {
       },
     );
     expect(verdicts.size).toBe(0);
+  });
+});
+
+// A run that took the hosted default in silence looked exactly like one the
+// user had chosen. The endpoint is where every session, project and key ends
+// up, so an interactive run states it and lets the user change it; Enter keeps
+// the default, and anything that already stated an endpoint is not asked twice.
+describe("endpoint confirmation", () => {
+  function endpointDeps(over: Partial<WizardDeps>): WizardDeps {
+    return makeDeps({ steps: [] }, { env: { DISPLAY: ":0" }, ...over });
+  }
+
+  it("asks which endpoint an interactive run sends to, defaulting to the hosted cloud", async () => {
+    const asked: Array<[string, string | undefined]> = [];
+    const deps = endpointDeps({
+      prompter: {
+        ...noopPrompter,
+        ask: async (q, d) => {
+          asked.push([q, d]);
+          return d ?? "";
+        },
+      },
+    });
+    await runCli(["node", "cli"], deps);
+    const endpointAsk = asked.find(([q]) => q.includes("endpoint"));
+    expect(endpointAsk?.[1]).toBe("https://api.crumbtrail.ai");
+  });
+
+  it("sends to the endpoint the user typed instead of the default", async () => {
+    const { ui, lines } = captureUi();
+    const bases: string[] = [];
+    const ensureToken = vi.fn(async (opts: { base: string }) => {
+      bases.push(opts.base);
+      return "ctcli_token";
+    });
+    const deps = endpointDeps({
+      ui,
+      ensureToken: ensureToken as unknown as WizardDeps["ensureToken"],
+      prompter: {
+        ...noopPrompter,
+        ask: async (q, d) =>
+          q.includes("endpoint") ? "http://127.0.0.1:19890" : (d ?? ""),
+      },
+    });
+    await runCli(["node", "cli"], deps);
+    expect(bases).toEqual(["http://127.0.0.1:19890"]);
+    expect(lines.join("\n")).toContain("http://127.0.0.1:19890");
+  });
+
+  it("does not ask when --endpoint already stated one", async () => {
+    let asked = 0;
+    const deps = endpointDeps({
+      prompter: {
+        ...noopPrompter,
+        ask: async (q, d) => {
+          if (q.includes("endpoint")) asked++;
+          return d ?? "";
+        },
+      },
+    });
+    await runCli(["node", "cli", "--endpoint", "http://127.0.0.1:19890"], deps);
+    expect(asked).toBe(0);
+  });
+
+  it("does not ask in a non-interactive shell or under --yes", async () => {
+    let asked = 0;
+    const prompter = {
+      ...noopPrompter,
+      ask: async (q: string, d?: string) => {
+        if (q.includes("endpoint")) asked++;
+        return d ?? "";
+      },
+    };
+    await runCli(
+      ["node", "cli"],
+      makeDeps(
+        { steps: [], isTTY: false },
+        { env: { DISPLAY: ":0" }, prompter },
+      ),
+    );
+    await runCli(["node", "cli", "--yes"], endpointDeps({ prompter }));
+    expect(asked).toBe(0);
   });
 });

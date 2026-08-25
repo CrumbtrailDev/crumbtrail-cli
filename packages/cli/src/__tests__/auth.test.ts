@@ -9,6 +9,8 @@ import {
   authFilePath,
   clearAuth,
   clearIdentityCache,
+  clearReportedAppBases,
+  reportedAppBase,
   describeIdentity,
   ensureToken,
   loadAuth,
@@ -62,7 +64,7 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 }
 
 async function startMockCloud(opts: MockOptions = {}): Promise<MockServer> {
-  const mintToken = opts.mintToken ?? "bl_cli_" + "a".repeat(48);
+  const mintToken = opts.mintToken ?? "ctcli_" + "a".repeat(48);
   let devicePolls = 0;
   let exchanges = 0;
   const server = http.createServer(async (req, res) => {
@@ -217,7 +219,7 @@ describe("openBrowser (async spawn-failure detection)", () => {
 
 describe("browser hand-off", () => {
   it("falls back to the device flow when the browser opener fails asynchronously", async () => {
-    const mint = "bl_cli_" + "g".repeat(48);
+    const mint = "ctcli_" + "g".repeat(48);
     const mock = await startMockCloud({ mintToken: mint });
     // Resolves false only after a tick — proving the caller awaits the opener
     // instead of deciding synchronously (the CP4 review bug: a sync `!failed`
@@ -239,7 +241,7 @@ describe("browser hand-off", () => {
   });
 
   it("exchanges a callback code for a token stored 0600", async () => {
-    const mint = "bl_cli_" + "b".repeat(48);
+    const mint = "ctcli_" + "b".repeat(48);
     const mock = await startMockCloud({ mintToken: mint });
     // openFn plays the browser: hit the localhost callback with a grant code.
     const openFn = (authorizeUrl: string): boolean => {
@@ -271,7 +273,7 @@ describe("browser hand-off", () => {
 
 describe("sign-in links land on the dashboard, not the API host", () => {
   it("opens /cli/authorize on the dashboard origin, not the API base", async () => {
-    const mint = "bl_cli_" + "c".repeat(48);
+    const mint = "ctcli_" + "c".repeat(48);
     // Two origins, the way the hosted deployment is split: api.* answers the
     // CLI, app.* serves the SPA that /cli/authorize lives in.
     const api = await startMockCloud({ mintToken: mint, signInPages: false });
@@ -298,8 +300,46 @@ describe("sign-in links land on the dashboard, not the API host", () => {
     await app.close();
   });
 
+  // Without this the browser hand-off was the ONE flow that ignored what the
+  // deployment had already said about itself: it derived the authorize URL from
+  // the API base, 404-probed it, and silently dropped to device code on every
+  // split-origin self-host that had not set CRUMBTRAIL_APP_URL.
+  it("uses the dashboard origin a previous login stored, with no env override", async () => {
+    const mint = "ctcli_" + "g".repeat(48);
+    const api = await startMockCloud({ mintToken: mint, signInPages: false });
+    const app = await startMockCloud({ mintToken: mint });
+    // A stale cached token for this endpoint: not accepted, so the run has to
+    // log in again — but it carries the dashboard origin from the login before.
+    saveAuth(
+      {
+        token: "ctcli_" + "z".repeat(48),
+        expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+        endpoint: api.baseUrl,
+        appBaseUrl: app.baseUrl,
+      },
+      env,
+    );
+    let openedUrl = "";
+    const openFn = (authorizeUrl: string): boolean => {
+      openedUrl = authorizeUrl;
+      const port = new URL(authorizeUrl).searchParams.get("port");
+      http.get(`http://127.0.0.1:${port}/callback?code=grant-123`);
+      return true;
+    };
+    const token = await ensureToken({
+      base: api.baseUrl,
+      ui: silentUi,
+      openFn,
+      env,
+    });
+    expect(token).toBe(mint);
+    expect(openedUrl.startsWith(`${app.baseUrl}/cli/authorize?`)).toBe(true);
+    await api.close();
+    await app.close();
+  });
+
   it("does not open a sign-in page that 404s — it falls back to the device flow", async () => {
-    const mint = "bl_cli_" + "d".repeat(48);
+    const mint = "ctcli_" + "d".repeat(48);
     const mock = await startMockCloud({ mintToken: mint, signInPages: false });
     let opened = false;
     const openFn = (): boolean => {
@@ -320,7 +360,7 @@ describe("sign-in links land on the dashboard, not the API host", () => {
   });
 
   it("warns, instead of going quiet, when the device page 404s", async () => {
-    const mint = "bl_cli_" + "e".repeat(48);
+    const mint = "ctcli_" + "e".repeat(48);
     const mock = await startMockCloud({ mintToken: mint, signInPages: false });
     const lines: string[] = [];
     const ui = { out: (l: string) => lines.push(l), err: () => {} };
@@ -339,7 +379,7 @@ describe("sign-in links land on the dashboard, not the API host", () => {
   });
 
   it("stores the resolved dashboard origin, so later links use it", async () => {
-    const mint = "bl_cli_" + "f".repeat(48);
+    const mint = "ctcli_" + "f".repeat(48);
     const mock = await startMockCloud({ mintToken: mint });
     const withOverride = { ...env, CRUMBTRAIL_APP_URL: "https://app.example" };
     await ensureToken({
@@ -373,7 +413,7 @@ describe("browser hand-off deadline", () => {
 
 describe("device flow", () => {
   it("polls through authorization_pending to a token", async () => {
-    const mint = "bl_cli_" + "c".repeat(48);
+    const mint = "ctcli_" + "c".repeat(48);
     const mock = await startMockCloud({
       devicePendingPolls: 2,
       mintToken: mint,
@@ -396,7 +436,7 @@ describe("device flow rate limiting", () => {
     // The exact shape that killed the previous hunt: the CLI spent the per-IP
     // auth budget on its own polls, and the FIRST answer after that was a 429 —
     // which used to abort the login while the code was still valid.
-    const mint = "bl_cli_" + "r".repeat(48);
+    const mint = "ctcli_" + "r".repeat(48);
     const mock = await startMockCloud({
       deviceRateLimitedPolls: 2,
       devicePendingPolls: 3, // 2 rate-limited + 1 pending, then the token
@@ -424,7 +464,7 @@ describe("device flow rate limiting", () => {
     // 6 polls against a budget of 2 per 100ms window cannot finish in under two
     // full windows. The real numbers (5 per minute against the cloud's 10) are
     // the same arithmetic: the CLI never spends more than half the budget.
-    const mint = "bl_cli_" + "b".repeat(48);
+    const mint = "ctcli_" + "b".repeat(48);
     const mock = await startMockCloud({
       devicePendingPolls: 5,
       mintToken: mint,
@@ -450,7 +490,7 @@ describe("device flow rate limiting", () => {
     // app host. Without this the wizard's closing "Dashboard: …" link pointed
     // at the API port, which answers {"error":"Not found"}.
     const mock = await startMockCloud({
-      mintToken: "bl_cli_" + "d".repeat(48),
+      mintToken: "ctcli_" + "d".repeat(48),
     });
     await ensureToken({
       base: mock.baseUrl,
@@ -466,7 +506,7 @@ describe("device flow rate limiting", () => {
 
 describe("naming the account that is being reused", () => {
   it("says whose login it is reusing", async () => {
-    const stored = "bl_cli_" + "s".repeat(48);
+    const stored = "ctcli_" + "s".repeat(48);
     const mock = await startMockCloud({
       validTokens: new Set([stored]),
       identity: {
@@ -502,9 +542,50 @@ describe("naming the account that is being reused", () => {
   });
 });
 
+describe("learning the dashboard origin without a login", () => {
+  it("remembers what /auth/me reports, for a run authenticated by CRUMBTRAIL_TOKEN", async () => {
+    const envToken = "ctcli_" + "u".repeat(48);
+    const mock = await startMockCloud({
+      validTokens: new Set([envToken]),
+      identity: {
+        userId: "usr_1",
+        tenantId: "ten_1",
+        appBaseUrl: "http://127.0.0.1:19892",
+      },
+    });
+    clearIdentityCache();
+    clearReportedAppBases();
+    await ensureToken({
+      base: mock.baseUrl,
+      ui: silentUi,
+      env: { ...env, CRUMBTRAIL_TOKEN: envToken },
+    });
+    // Nothing was written to auth.json (an env credential isn't ours to cache),
+    // so this in-run memory is the only thing standing between the user and a
+    // dashboard link pointed at the API port.
+    expect(loadAuth(env)).toBeUndefined();
+    expect(reportedAppBase(mock.baseUrl)).toBe("http://127.0.0.1:19892");
+    await mock.close();
+  });
+
+  it("reports nothing when the deployment says nothing", async () => {
+    const envToken = "ctcli_" + "v".repeat(48);
+    const mock = await startMockCloud({ validTokens: new Set([envToken]) });
+    clearIdentityCache();
+    clearReportedAppBases();
+    await ensureToken({
+      base: mock.baseUrl,
+      ui: silentUi,
+      env: { ...env, CRUMBTRAIL_TOKEN: envToken },
+    });
+    expect(reportedAppBase(mock.baseUrl)).toBeUndefined();
+    await mock.close();
+  });
+});
+
 describe("env token (CRUMBTRAIL_TOKEN)", () => {
   it("accepts a valid CRUMBTRAIL_TOKEN, skips the login flow, and never persists it", async () => {
-    const envToken = "bl_cli_" + "t".repeat(48);
+    const envToken = "ctcli_" + "t".repeat(48);
     const mock = await startMockCloud({ validTokens: new Set([envToken]) });
     let opened = false;
     const token = await ensureToken({
@@ -532,7 +613,7 @@ describe("env token (CRUMBTRAIL_TOKEN)", () => {
       ensureToken({
         base: mock.baseUrl,
         ui: silentUi,
-        env: { ...env, CRUMBTRAIL_TOKEN: "bl_cli_wrong" },
+        env: { ...env, CRUMBTRAIL_TOKEN: "ctcli_wrong" },
       }),
     ).rejects.toThrow(/CRUMBTRAIL_TOKEN.*rejected/i);
     // It never fell through to minting a token.
@@ -558,7 +639,7 @@ describe("non-TTY fail-fast", () => {
   });
 
   it("still honors a valid cached token in a non-TTY shell (no login needed)", async () => {
-    const stored = "bl_cli_" + "n".repeat(48);
+    const stored = "ctcli_" + "n".repeat(48);
     const mock = await startMockCloud({ validTokens: new Set([stored]) });
     saveAuth(
       {
@@ -583,7 +664,7 @@ describe("non-TTY fail-fast", () => {
 
 describe("token reuse + logout", () => {
   it("reuses a valid stored token without re-authenticating", async () => {
-    const stored = "bl_cli_" + "d".repeat(48);
+    const stored = "ctcli_" + "d".repeat(48);
     saveAuth(
       { token: stored, expiresAt: "2099-01-01T00:00:00Z", endpoint: "" },
       env,
@@ -600,9 +681,10 @@ describe("token reuse + logout", () => {
     );
 
     let opened = false;
+    const lines: string[] = [];
     const token = await ensureToken({
       base: mock.baseUrl,
-      ui: silentUi,
+      ui: { out: (l = "") => lines.push(l), err: () => {} },
       openFn: () => {
         opened = true;
         return true;
@@ -611,13 +693,18 @@ describe("token reuse + logout", () => {
     });
     expect(token).toBe(stored);
     expect(opened).toBe(false); // no re-auth
+    // "Using your saved login" alone was not checkable: someone pointing at a
+    // local stack read it as proof the login belonged to that stack.
+    expect(lines.join("\n")).toContain(
+      `saved Crumbtrail login for ${mock.baseUrl}`,
+    );
     expect(mock.exchanges).toBe(0);
     await mock.close();
   });
 
   it("does not reuse a saved login minted for a different endpoint", async () => {
-    const stored = "bl_cli_" + "x".repeat(48);
-    const mint = "bl_cli_" + "y".repeat(48);
+    const stored = "ctcli_" + "x".repeat(48);
+    const mint = "ctcli_" + "y".repeat(48);
     const mock = await startMockCloud({
       mintToken: mint,
       validTokens: new Set([stored, mint]),
@@ -648,8 +735,8 @@ describe("token reuse + logout", () => {
   });
 
   it("clears an invalid stored token and re-logs in", async () => {
-    const stale = "bl_cli_" + "e".repeat(48);
-    const fresh = "bl_cli_" + "f".repeat(48);
+    const stale = "ctcli_" + "e".repeat(48);
+    const fresh = "ctcli_" + "f".repeat(48);
     saveAuth(
       {
         token: stale,
@@ -681,7 +768,7 @@ describe("token reuse + logout", () => {
   });
 
   it("logout deletes the auth file", () => {
-    saveAuth({ token: "bl_cli_x", expiresAt: "x", endpoint: "x" }, env);
+    saveAuth({ token: "ctcli_x", expiresAt: "x", endpoint: "x" }, env);
     expect(loadAuth(env)).toBeDefined();
     expect(clearAuth(env)).toBe(true);
     expect(loadAuth(env)).toBeUndefined();
