@@ -98,9 +98,26 @@ function applyAllOrNothing(
     return written;
   } catch (err) {
     // Roll back in reverse so the repo is byte-identical to the pre-image.
+    //
+    // Every restore is attempted even when one of them throws. The write that
+    // failed is usually the one whose restore fails too (a read-only file, a
+    // full disk), and letting that abort the loop would strand every EARLIER
+    // file in its edited state — the exact half-applied repo this function
+    // exists to prevent. What cannot be restored is named in the error instead.
+    const stranded: string[] = [];
     for (const pre of preimages.reverse()) {
-      if (!pre.existed) io.remove(pre.path);
-      else if (pre.content != null) io.writeFile(pre.path, pre.content);
+      try {
+        if (!pre.existed) io.remove(pre.path);
+        else if (pre.content != null) io.writeFile(pre.path, pre.content);
+      } catch {
+        stranded.push(pre.path);
+      }
+    }
+    if (stranded.length > 0) {
+      throw new Error(
+        `${err instanceof Error ? err.message : String(err)} (could not restore: ${stranded.join(", ")})`,
+        { cause: err },
+      );
     }
     throw err;
   }
@@ -129,6 +146,18 @@ export function materializePlan(plan: Plan, io: ExecutorIO): MaterializedPlan {
     keyEnvVar: plan.keyEnvVar,
   };
 
+  // Extra targets first, and outside the guard below. "Already wired" is a
+  // statement about the entry file detection picked; a worker beside it can
+  // still be unwired, and a plan that skipped the entry must not silently drop
+  // the edit that fixes the process nobody is watching.
+  for (const extra of plan.extraEdits ?? []) {
+    materialized.edits.push({
+      path: extra.path,
+      mode: extra.mode,
+      content: withTrailingNewline(extra.content),
+    });
+  }
+
   if (
     plan.kind === "skip-already-wired" ||
     plan.kind === "fallback-ai" ||
@@ -152,7 +181,9 @@ export function materializePlan(plan: Plan, io: ExecutorIO): MaterializedPlan {
 
   if (effectiveKind === "create") {
     if (io.exists(plan.targetPath)) {
-      throw new Error(`refusing to overwrite existing file: ${plan.targetPath}`);
+      throw new Error(
+        `refusing to overwrite existing file: ${plan.targetPath}`,
+      );
     }
     materialized.edits.push({
       path: plan.targetPath,
@@ -191,22 +222,36 @@ export function executePlan(
   io: ExecutorIO = defaultExecutorIO,
   options: ExecuteOptions = {},
 ): ExecuteResult {
-  if (plan.kind === "skip-already-wired") {
+  const extraOnly = (message: string): ExecuteResult => {
+    // A plan that writes no entry edit can still carry extra edits (a worker, a
+    // Dockerfile ARG). Applying them here is what stops "already wired" from
+    // meaning "and the worker stays dark".
+    const written = applyAllOrNothing(
+      (plan.extraEdits ?? []).map((extra) => ({
+        path: extra.path,
+        mode: extra.mode,
+        content: withTrailingNewline(extra.content),
+      })),
+      io,
+    );
     return {
       kind: plan.kind,
-      written: [],
-      skipped: true,
-      message: "Complete for this endpoint. Skipped.",
+      written,
+      skipped: written.length === 0,
+      message:
+        written.length === 0
+          ? message
+          : `${message} Wrote ${written.length} file(s) beside it.`,
     };
+  };
+
+  if (plan.kind === "skip-already-wired") {
+    return extraOnly("Complete for this endpoint. Skipped.");
   }
   if (plan.kind === "fallback-ai") {
-    return {
-      kind: plan.kind,
-      written: [],
-      skipped: true,
-      message:
-        "Ambiguous — emitted snippet + AI prompt instead of editing files.",
-    };
+    return extraOnly(
+      "Ambiguous — emitted snippet + AI prompt instead of editing the entry.",
+    );
   }
   if (plan.kind === "otlp-guidance") {
     // Non-JS OTLP backend: never mutate the filesystem — the wizard prints the

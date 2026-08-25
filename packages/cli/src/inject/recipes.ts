@@ -16,10 +16,13 @@ import type { Stack } from "crumbtrail-core";
 import { isBuildOutputPath, type Recipe } from "../detect";
 import type { FileReader } from "../readers/types";
 import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
+import { inspectIntegration, type IntegrationStatus } from "./integration";
+import { addDockerBuildArg, DOCKERFILE_CANDIDATES } from "./docker";
 import {
-  inspectIntegration,
-  type IntegrationStatus,
-} from "./integration";
+  findExtraBackendEntries,
+  MAX_EXTRA_ENTRIES,
+  type ExtraEntry,
+} from "./entrypoints";
 import { defaultInjectIO, type InjectIO } from "./io";
 import type { Plan } from "./types";
 import {
@@ -35,8 +38,8 @@ import {
 import {
   capacitorInitSnippet,
   clientInitSnippet,
+  envPreloadSnippet,
   expressErrorMiddlewareSnippet,
-  expressEnvPreloadSnippet,
   expressManualWiringSnippet,
   expressMiddlewareImportSnippet,
   expressRequestMiddlewareSnippet,
@@ -658,11 +661,22 @@ function planVite(input: BuildPlanInput, io: InjectIO): Plan {
  * double-quoted `nodeInitSnippet` (Prettier's own default).
  */
 function planNode(input: BuildPlanInput, io: InjectIO): Plan {
-  const keyExpr = keyExprFor(input)!;
-  const block =
+  const keyRef = keyRefFor(input)!;
+  const keyExpr = keyRef.expr;
+  // Nest's scaffold ships `singleQuote: true`; every other backend-JS recipe
+  // takes Prettier's double-quote default. Both halves of the block have to
+  // agree with the file they land in, so the quote choice is made once here.
+  const quote =
+    input.recipe === "nestjs"
+      ? (value: string) => `'${value}'`
+      : JSON.stringify;
+  const init =
     input.recipe === "nestjs"
       ? nestInitSnippet(input.endpoint, keyExpr, input.serviceName)
       : nodeInitSnippet(input.endpoint, keyExpr, input.serviceName);
+  // Preload first: the init below reads the key, and on a laptop the key is in
+  // .env and nothing has loaded it yet.
+  const block = `${envPreloadSnippet(keyRef.envVar, quote)}\n\n${init}`;
 
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -719,7 +733,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   if (wired == null) {
     // Anchors not found: prepend autoCapture plus a TODO block with exact copy
     // and paste instructions, and surface the same guidance in wizard output.
-    const combined = `${block}\n\n${expressEnvPreloadSnippet(keyEnvVar)}\n\n${expressManualWiringSnippet(endpoint, keyExpr)}`;
+    const combined = `${envPreloadSnippet(keyEnvVar)}\n\n${block}\n\n${expressManualWiringSnippet(endpoint, keyExpr)}`;
     return prependWithPreflight(input, io, target, combined, [
       "Express request middleware was NOT wired automatically (no `const app = express()` / `app.listen(...)` anchors found). Follow the TODO block added at the top of the entry: register createCrumbtrailExpressMiddleware before your routes and createCrumbtrailExpressErrorMiddleware after them, or backend request spans stay empty.",
     ]);
@@ -730,7 +744,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
   const cors = widenCorsAllowedHeaders(wired.text);
   const content = prependIntoSource(
     cors.text,
-    `${block}\n\n${expressEnvPreloadSnippet(keyEnvVar)}\n\n${expressMiddlewareImportSnippet(style!)}`,
+    `${envPreloadSnippet(keyEnvVar)}\n\n${block}\n\n${expressMiddlewareImportSnippet(style!)}`,
   );
   const warnings = [
     ...(cors.changed ? [CORS_WIDENED_WARNING] : []),
@@ -1140,6 +1154,153 @@ function refuseBuildOutputEntry(
   };
 }
 
+/**
+ * The recipes whose apps run as Node processes, and so can start more than one
+ * of them from the same package.
+ */
+const BACKEND_JS_RECIPES = new Set<Recipe>([
+  "express",
+  "fastify",
+  "hono",
+  "nestjs",
+  "node",
+]);
+
+/**
+ * Wire every OTHER process this package starts — the worker, the consumer, the
+ * scheduler.
+ *
+ * Detection resolves the entry that serves HTTP, and stops there. The processes
+ * beside it run unattended, which is precisely why their failures are the ones
+ * worth capturing, and leaving them unwired means the wizard reports success
+ * over a service that reports nothing at all.
+ *
+ * Each one is gated on its own: already wired is left alone, dirty is left alone
+ * with a warning, and each reports under its own service name so a session says
+ * which process it came from rather than being filed under the API.
+ */
+function planExtraBackendEntries(
+  input: BuildPlanInput,
+  io: InjectIO,
+): {
+  edits: NonNullable<Plan["extraEdits"]>;
+  warnings: string[];
+} {
+  const edits: NonNullable<Plan["extraEdits"]> = [];
+  const warnings: string[] = [];
+  const keyRef = keyRefFor(input);
+  if (!keyRef) return { edits, warnings };
+
+  const { entries, truncated } = findExtraBackendEntries(
+    input.cwd,
+    io,
+    input.entryFile,
+  );
+  for (const entry of entries) {
+    const existing = io.readFile(entry.path);
+    if (existing == null) continue;
+    const rel = path.relative(input.cwd, entry.path);
+    if (referencesCrumbtrail(existing)) continue;
+
+    const status = io.gitStatus(input.cwd, entry.path);
+    if (status.dirty && !input.options?.force) {
+      warnings.push(
+        `${rel} is a second process this package starts (npm run ${entry.script}) and has uncommitted changes, so it was left unwired. Commit it and re-run, or re-run with force, or that process reports nothing.`,
+      );
+      continue;
+    }
+
+    const service = serviceNameForExtra(input.serviceName, entry);
+    const block = `${envPreloadSnippet(keyRef.envVar)}\n\n${nodeInitSnippet(input.endpoint, keyRef.expr, service)}`;
+    edits.push({
+      path: entry.path,
+      mode: "update",
+      content: prependIntoSource(existing, block),
+      label: `wired ${rel} (npm run ${entry.script}) as service ${service}`,
+    });
+  }
+
+  if (truncated > 0) {
+    warnings.push(
+      `This package starts more than ${MAX_EXTRA_ENTRIES} other processes; ${truncated} were left unwired. Wire the rest by copying the block from one that was.`,
+    );
+  }
+  return { edits, warnings };
+}
+
+/**
+ * `marginary` + `worker.ts` -> `marginary-worker`. Without a service name for
+ * the app there is nothing to qualify, so the suffix stands alone.
+ */
+function serviceNameForExtra(
+  serviceName: string | null | undefined,
+  entry: ExtraEntry,
+): string {
+  return serviceName
+    ? `${serviceName}-${entry.serviceSuffix}`
+    : entry.serviceSuffix;
+}
+
+/**
+ * Declare a bundler-inlined key as a Docker build arg.
+ *
+ * The frontend recipes bake their key into the bundle at build time, and a
+ * Docker build cannot see a variable the Dockerfile has not declared. A
+ * Dockerfile that lists every other `VITE_*` as an `ARG` and not this one builds
+ * an image that can never carry a key, with nothing failing to say so.
+ *
+ * Only edited when the file already passes build args of the same prefix: that
+ * is the project stating where such a line goes. Without them the shape is a
+ * guess, and the user gets a warning naming the file instead of an edit.
+ */
+function planDockerBuildArg(
+  input: BuildPlanInput,
+  io: InjectIO,
+): {
+  edits: NonNullable<Plan["extraEdits"]>;
+  warnings: string[];
+} {
+  const edits: NonNullable<Plan["extraEdits"]> = [];
+  const warnings: string[] = [];
+  const keyRef = keyRefFor(input);
+  if (!keyRef?.bundlerInlined) return { edits, warnings };
+
+  for (const candidate of DOCKERFILE_CANDIDATES) {
+    const target = path.join(input.cwd, candidate);
+    const existing = io.readFile(target);
+    if (existing == null) continue;
+
+    const result = addDockerBuildArg(existing, keyRef.envVar);
+    if (!result.changed) {
+      if (result.reason === "no-sibling-args") {
+        warnings.push(
+          `${candidate} builds this app in Docker but declares no build args, so ${keyRef.envVar} was not added to it. A bundler reads its key at build time, so add \`ARG ${keyRef.envVar}\` to the stage that runs the build (and pass it with --build-arg) or the image ships without a key.`,
+        );
+      }
+      return { edits, warnings };
+    }
+
+    const status = io.gitStatus(input.cwd, target);
+    if (status.dirty && !input.options?.force) {
+      warnings.push(
+        `${candidate} needs \`ARG ${keyRef.envVar}\` but has uncommitted changes, so it was left alone. Commit it and re-run, or re-run with force, or the built image carries no key.`,
+      );
+      return { edits, warnings };
+    }
+
+    edits.push({
+      path: target,
+      mode: "update",
+      content: result.text,
+      label: result.mirroredEnv
+        ? `declared ${keyRef.envVar} as a build arg in ${candidate} (with its ENV mirror)`
+        : `declared ${keyRef.envVar} as a build arg in ${candidate}`,
+    });
+    return { edits, warnings };
+  }
+  return { edits, warnings };
+}
+
 export function buildPlan(
   input: BuildPlanInput,
   io: InjectIO = defaultInjectIO,
@@ -1155,6 +1316,20 @@ export function buildPlan(
   if (keyRef && plan.kind !== "skip-already-wired") {
     plan.keyEnvVar = keyRef.envVar;
     if (keyRef.compileTime) plan.keyIsCompileTime = true;
+  }
+
+  // Everything above wires ONE file. These two passes cover what a deployed app
+  // needs beyond it: the other processes it starts, and the build that bakes in
+  // its key. Both run even when the entry itself was skipped or handed off,
+  // because neither is answered by whatever happened to the entry.
+  if (plan.kind !== "otlp-guidance") {
+    const extra = BACKEND_JS_RECIPES.has(input.recipe)
+      ? planExtraBackendEntries(input, io)
+      : planDockerBuildArg(input, io);
+    if (extra.edits.length > 0) {
+      plan.extraEdits = [...(plan.extraEdits ?? []), ...extra.edits];
+    }
+    plan.warnings = [...plan.warnings, ...extra.warnings];
   }
   return plan;
 }

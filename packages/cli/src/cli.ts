@@ -121,13 +121,7 @@ function __dirnameCompat(): string {
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
 export type Command =
-  | "wizard"
-  | "login"
-  | "logout"
-  | "token"
-  | "verify"
-  | "help"
-  | "version";
+  "wizard" | "login" | "logout" | "token" | "verify" | "help" | "version";
 
 export interface ParsedArgs {
   command: Command;
@@ -237,10 +231,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
           parsed.workspace = a.slice("--workspace=".length);
         } else if (
           !commandSet &&
-          (a === "login" ||
-            a === "logout" ||
-            a === "token" ||
-            a === "verify")
+          (a === "login" || a === "logout" || a === "token" || a === "verify")
         ) {
           parsed.command = a;
           commandSet = true;
@@ -715,9 +706,7 @@ export async function runWizard(
         ),
       );
     } else {
-      ui.err(
-        color.red(`No supported framework in ${result.cwd}.`),
-      );
+      ui.err(color.red(`No supported framework in ${result.cwd}.`));
     }
     for (const r of result.reasons) ui.err(color.dim(`  · ${r}`));
     for (const n of result.notes) ui.err(color.dim(`  · ${n}`));
@@ -1522,7 +1511,8 @@ export async function runBatchWizard(
       const install: InstallSdkResult = injectionDecision.approved
         ? await deps.installSdk({
             cwd: c.dir,
-            packageManager: c.detected.packageManager ?? ctx.root.packageManager,
+            packageManager:
+              c.detected.packageManager ?? ctx.root.packageManager,
             recipe,
             base,
             ui,
@@ -1982,6 +1972,7 @@ async function confirmInjection(
     plan.keyEnvVar && !plan.keyIsCompileTime
       ? `write ${plan.keyEnvVar} to the app env file and update .gitignore`
       : null,
+    ...(plan.extraEdits ?? []).map((extra) => `edit ${extra.path}`),
   ].filter((item): item is string => item !== null);
   const approved = await deps.prompter.confirm(
     `${writes.join(", ")}. Continue? No leaves all local files unchanged.`,
@@ -2395,7 +2386,28 @@ async function applyInjection(
     for (const w of plan.warnings) ui.out(color.dim(`  · ${w}`));
   }
 
+  // Files the plan touches BESIDES the entry — a second process this package
+  // starts, or the Docker build arg the bundler needs. They are applied even on
+  // the branches that leave the entry alone, because neither question is
+  // answered by the entry already being wired or being too ambiguous to edit.
+  const announceExtras = () => {
+    for (const extra of plan.extraEdits ?? []) {
+      ui.out(color.dim(`  · ${extra.label}`));
+    }
+  };
+
   if (plan.kind === "skip-already-wired") {
+    announceExtras();
+    const res = deps.executePlan(plan);
+    filesTouched.push(...res.written);
+    if (res.written.length > 0) {
+      ui.out(
+        ok(
+          `Your entry file was already wired — wired ${res.written.join(", ")} beside it.`,
+        ),
+      );
+      return { outcome: "wired", filesTouched, notes };
+    }
     ui.out(ok("Complete for this endpoint. Leaving your code untouched."));
     return { outcome: "skipped-already-wired", filesTouched, notes };
   }
@@ -2417,7 +2429,13 @@ async function applyInjection(
   }
 
   if (plan.kind === "fallback-ai") {
-    ui.out(color.yellow("Couldn't safely edit your code automatically."));
+    announceExtras();
+    const extras = deps.executePlan(plan);
+    filesTouched.push(...extras.written);
+    if (extras.written.length > 0) {
+      ui.out(ok(`Wired ${extras.written.join(", ")}.`));
+    }
+    ui.out(color.yellow("Couldn't safely edit your entry file automatically."));
     if (plan.snippet) {
       ui.out(color.dim("Paste this into your entry file:"));
       ui.out(plan.snippet);
@@ -2469,6 +2487,7 @@ async function applyInjection(
       );
       return { outcome: "declined", filesTouched, notes };
     }
+    announceExtras();
     const res = deps.executePlan(plan, undefined, { confirmDirty: true });
     filesTouched.push(...res.written);
     ui.out(ok(describeWrites(res)));
@@ -2476,6 +2495,7 @@ async function applyInjection(
   }
 
   // create / prepend
+  announceExtras();
   if (plan.targetPath) {
     ui.out(
       color.dim(

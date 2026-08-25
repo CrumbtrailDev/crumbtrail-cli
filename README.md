@@ -54,6 +54,12 @@ setup code for you. For Express backends it wires both crash capture and the
 request and error middleware, so backend request spans link up with frontend
 sessions out of the box.
 
+It wires the whole deployment, not just the entry file: every other process your
+package starts gets its own capture under its own service name, your `.env` is
+loaded before the key is read so capture is on when you reproduce a bug locally,
+and a containerised frontend gets its key declared as a Docker build argument.
+See [what it writes](packages/cli#everything-a-deployed-app-needs).
+
 If nothing arrives after you start your app, run:
 
 ```bash
