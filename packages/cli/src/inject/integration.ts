@@ -31,7 +31,7 @@ export interface IntegrationStatus {
   missing: IntegrationRequirement[];
 }
 
-const SOURCE_EXTENSIONS = [
+export const SOURCE_EXTENSIONS = [
   ".js",
   ".jsx",
   ".ts",
@@ -50,7 +50,7 @@ const SERVER_RECIPES = new Set<Recipe>([
 
 const CRUMBTRAIL_REFERENCE =
   /crumbtrail-core|crumbtrail-node|crumbtrail-react-native|crumbtrail-capacitor|crumbtrail_flutter/;
-const LOCAL_IMPORT =
+export const LOCAL_IMPORT =
   /(?:from\s+|import\s*\(|import\s+|require\s*\()\s*["']([^"']+)["']/g;
 const ENDPOINT_ENV = /\b[A-Z][A-Z0-9_]*CRUMBTRAIL[A-Z0-9_]*ENDPOINT[A-Z0-9_]*\b/g;
 

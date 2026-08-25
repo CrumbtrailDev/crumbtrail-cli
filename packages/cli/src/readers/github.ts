@@ -15,6 +15,8 @@
 // client, which keeps the package free of an HTTP dependency and keeps the
 // egress policy with the cloud service that owns credentials.
 
+import path from "node:path";
+import { LOCAL_IMPORT, SOURCE_EXTENSIONS } from "../inject/integration";
 import type { FileReader } from "./types";
 
 /** Thrown when detection reads a path hydration did not prefetch. */
@@ -332,6 +334,64 @@ export async function hydrateGithubReader(
     isDir: (dir) => snap.dirs.has(norm(dir)),
     readDir: (dir) => [...(snap.children.get(norm(dir)) ?? [])],
   };
+}
+
+/**
+ * Prefetch an entry file and every local module reachable from it.
+ *
+ * Plan building inspects an existing integration by walking the entry file's
+ * relative imports (see reachableSource in inject/integration.ts). That walk
+ * reads synchronously, so on this reader every import target must be hydrated
+ * before the plan is built or the read throws UnhydratedPathError. The tree is
+ * fully listed at hydration time, so import specifiers resolve against
+ * `isFile` without any probe reads; only the resolved files cost a fetch.
+ *
+ * Bounded to the same 64-file ceiling as the inspection walk it feeds.
+ */
+export async function prefetchImportClosure(
+  reader: HydratedGithubReader,
+  entryFiles: (string | null | undefined)[],
+): Promise<void> {
+  const seeds = entryFiles.filter(
+    (p): p is string => typeof p === "string" && p.length > 0,
+  );
+  if (seeds.length === 0) return;
+  await reader.prefetch(seeds);
+
+  const pending = seeds.map((p) => path.posix.resolve("/", p));
+  const visited = new Set<string>();
+  let read = 0;
+  while (pending.length > 0 && read < 64) {
+    const file = pending.pop()!;
+    if (visited.has(file)) continue;
+    visited.add(file);
+    let text: string | null;
+    try {
+      text = reader.readFile(file);
+    } catch {
+      continue; // fetch skipped or failed for this path; drop the subtree
+    }
+    if (text === null) continue;
+    read += 1;
+
+    const targets: string[] = [];
+    for (const match of text.matchAll(LOCAL_IMPORT)) {
+      const specifier = match[1];
+      if (!specifier.startsWith(".")) continue;
+      const base = path.posix.resolve(path.posix.dirname(file), specifier);
+      const candidates = [
+        base,
+        ...SOURCE_EXTENSIONS.map((ext) => `${base}${ext}`),
+        ...SOURCE_EXTENSIONS.map((ext) => path.posix.join(base, `index${ext}`)),
+      ];
+      const hit = candidates.find((candidate) => reader.isFile(candidate));
+      if (hit && !visited.has(hit) && !targets.includes(hit)) targets.push(hit);
+    }
+    if (targets.length > 0) {
+      await reader.prefetch(targets);
+      pending.push(...targets);
+    }
+  }
 }
 
 /**
