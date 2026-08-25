@@ -131,6 +131,73 @@ describe("classifyStructuredValue", () => {
     });
   });
 
+  /**
+   * `{"msg":"Invalid login credentials"}` was stored as a shape placeholder, so
+   * a session could report that a sign-in failed but never why.
+   */
+  describe("server messages under a message-shaped name", () => {
+    it.each([
+      ["msg", "Invalid login credentials"],
+      ["message", "Invalid login credentials"],
+      ["error", "Email or password is incorrect"],
+      ["detail", "Not enough stock to fulfil this order"],
+      ["reason", "The upstream service did not respond in time"],
+      ["errorMessage", "Something went wrong, please try again"],
+    ])("keeps %s", (name, value) => {
+      expect(classifyStructuredValue(value, name)).toEqual({ action: "keep" });
+    });
+
+    it("keeps a small number inside the sentence", () => {
+      expect(
+        classifyStructuredValue("Request failed with status 400", "message"),
+      ).toEqual({ action: "keep" });
+    });
+
+    it("still redacts personal data in the same position", () => {
+      expect(
+        classifyStructuredValue("No account for omar@example.com", "message"),
+      ).toMatchObject({ action: "redact", reason: "email_value" });
+      expect(
+        classifyStructuredValue("Card 4242 4242 4242 4242 declined", "message"),
+      ).toMatchObject({ action: "redact", reason: "luhn_value" });
+      expect(
+        classifyStructuredValue("Call us on 415 555 0134", "message"),
+      ).toMatchObject({ action: "redact", reason: "free_text_value" });
+      expect(
+        classifyStructuredValue("Born 1984 in Lisbon", "message"),
+      ).toMatchObject({ action: "redact", reason: "free_text_value" });
+    });
+
+    it("does not extend the carve-out past message-shaped names", () => {
+      for (const name of ["customerName", "note", "comment", "bio", "street"]) {
+        expect(
+          classifyStructuredValue("Invalid login credentials", name),
+        ).toMatchObject({ action: "redact", reason: "free_text_value" });
+      }
+      expect(
+        classifyStructuredValue("Invalid login credentials"),
+      ).toMatchObject({ action: "redact", reason: "free_text_value" });
+    });
+
+    it("redacts long free text even under a message name", () => {
+      expect(
+        classifyStructuredValue("word ".repeat(40).trim(), "message"),
+      ).toMatchObject({ action: "redact", reason: "free_text_value" });
+    });
+
+    it("redacts a value that is not a plain sentence", () => {
+      for (const value of [
+        "user=omar; session=abc",
+        "at Object.<anonymous> (/srv/app/index.js:12:5)",
+        "https://api.test/callback?code=abc",
+      ]) {
+        expect(classifyStructuredValue(value, "message")).toMatchObject({
+          action: "redact",
+        });
+      }
+    });
+  });
+
   it("redacts email-shaped values", () => {
     expect(classifyStructuredValue("omar@example.com")).toMatchObject({
       action: "redact",
@@ -857,7 +924,7 @@ describe("query parameters answer to the same keep list", () => {
   it("redacts every undeclared word value by default", () => {
     setRedactionKeepFields([]);
     expect(redactUrl("/api/search?q=widget&productId=1").value).toBe(
-      "/api/search?q=%5BREDACTED%5D&productId=1",
+      "/api/search?q=[REDACTED]&productId=1",
     );
   });
 
@@ -871,7 +938,7 @@ describe("query parameters answer to the same keep list", () => {
   it("still redacts a number under a sensitive parameter name", () => {
     setRedactionKeepFields([]);
     expect(redactUrl("/api/search?token=1&page=1").value).toBe(
-      "/api/search?token=%5BREDACTED%5D&page=1",
+      "/api/search?token=[REDACTED]&page=1",
     );
   });
 
@@ -886,13 +953,13 @@ describe("query parameters answer to the same keep list", () => {
     setRedactionKeepFields(["q"]);
     const value = redactUrl("/api/search?q=widget&sessionKey=abc").value;
     expect(value).toContain("q=widget");
-    expect(value).toContain("sessionKey=%5BREDACTED%5D");
+    expect(value).toContain("sessionKey=[REDACTED]");
   });
 
   it("still redacts a sensitive value inside a kept parameter", () => {
     setRedactionKeepFields(["q"]);
     expect(redactUrl("/api/search?q=someone%40example.com").value).toBe(
-      "/api/search?q=%5BREDACTED%5D",
+      "/api/search?q=[REDACTED]",
     );
   });
 

@@ -2,7 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { execFileSync } from "node:child_process";
-import { redactTokenLikeString, redactUrl } from "crumbtrail-core";
+import {
+  redactTokenLikeString,
+  redactUrl,
+  unescapeRedactionMarker,
+} from "crumbtrail-core";
 import {
   summarizeRedaction,
   summarizeVitals,
@@ -1999,9 +2003,11 @@ function redactUrlLikeText(value: string): string {
             parsed.searchParams.append(key, entry === "" ? "" : "[REDACTED]");
         }
         parsed.hash = "";
-        const redacted = match.startsWith("http")
-          ? parsed.toString()
-          : `${parsed.pathname}${parsed.search}`;
+        const redacted = unescapeRedactionMarker(
+          match.startsWith("http")
+            ? parsed.toString()
+            : `${parsed.pathname}${parsed.search}`,
+        );
         return redactTokenLikeString(redacted, "diagnostic.url").value;
       } catch {
         return redactTokenLikeString(

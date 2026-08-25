@@ -10,6 +10,31 @@ export type BrowserRedactionPolicy =
 export const REDACTED_VALUE = "[REDACTED]";
 export const REDACTED_STORAGE_KEY = "[REDACTED_KEY]";
 
+/**
+ * The marker's own brackets, percent-encoded by a URL or form serializer.
+ *
+ * `URLSearchParams.toString()` and `encodeURIComponent` both escape `[` and `]`,
+ * so a redacted URL was stored as `…/auth/%5BREDACTED%5D/token` and every
+ * consumer downstream rendered that literally — issue titles, runtime warnings,
+ * error text. The marker is meant to be read by people, so it is written back
+ * unescaped after serialization. Nothing else about the encoded string changes:
+ * only this exact sequence is decoded, and only where the marker is the value
+ * this module just substituted.
+ */
+const ENCODED_REDACTED_VALUE_RE = /%5BREDACTED%5D/gi;
+
+/**
+ * Restore `[REDACTED]` in an already percent-encoded URL or query string.
+ *
+ * Exported because the capture server rebuilds URLs of its own — post-process
+ * diagnostics and the LLM bundle both re-serialize through `URLSearchParams` —
+ * and a marker that is literal in one artifact and escaped in another is worse
+ * than either, since the two no longer compare equal.
+ */
+export function unescapeRedactionMarker(serialized: string): string {
+  return serialized.replace(ENCODED_REDACTED_VALUE_RE, REDACTED_VALUE);
+}
+
 export type RedactionAction = "redacted" | "dropped" | "summarized";
 
 export interface RedactionField {
@@ -529,7 +554,7 @@ function redactQueryString(
     }
   }
 
-  const serialized = params.toString();
+  const serialized = unescapeRedactionMarker(params.toString());
   const metadata = metadataFromFields(fields);
 
   return {
@@ -708,7 +733,7 @@ function redactUrlPath(
     if (subResult.metadata) fields.push(...subResult.metadata.fields);
     return subResult.value === decoded
       ? part
-      : encodeURIComponent(subResult.value);
+      : unescapeRedactionMarker(encodeURIComponent(subResult.value));
   });
   const metadata = metadataFromFields(fields);
   return { value: output.join("/"), ...(metadata ? { metadata } : {}) };
@@ -724,11 +749,23 @@ function redactUrlPath(
  * in the capture reported its own pathname as a secret.
  *
  * Deliberately narrow, because it weakens a security control: only short,
- * all-lowercase alphabetic words with no digits, no separators and no
- * mixed case survive. Anything with entropy — a token, a hash, an id, a JWT, a
- * base64 fragment, a uuid — fails at least one of those and is still redacted.
+ * all-lowercase words survive, with no separators and no mixed case. Anything
+ * with entropy — a token, a hash, an id, a JWT, a base64 fragment, a uuid —
+ * fails at least one of those and is still redacted.
+ *
+ * Digits are admitted in exactly two shapes, both API vocabulary rather than
+ * entropy: an API version segment (`v1`, `v2`, `v10`) and the named protocol
+ * words below. Rejecting them cost real evidence — a captured 400 read
+ * `POST http://127.0.0.1:57421/auth/[REDACTED]/token`, where the hidden segment
+ * was the literal `v1`, so the title named no endpoint at all.
+ *
+ * Enumerated rather than generalised to "a word with a trailing digit", because
+ * that wider rule keeps `hunter2` after `password` and `abc123` after
+ * `client_secret` — the exact segments this control exists to catch. Longer
+ * digit runs, mixed case, separators, hex, base64 and uuids all still redact.
  */
-const PLAIN_ROUTE_WORD_RE = /^[a-z]{2,16}$/;
+const PLAIN_ROUTE_WORD_RE = /^(?:[a-z]{2,16}|v[0-9]{1,3})$/;
+const PLAIN_ROUTE_PROTOCOL_WORDS = new Set(["oauth1", "oauth2", "saml2"]);
 
 /**
  * The sensitive preceders that hold a credential in the very next segment.
@@ -757,7 +794,8 @@ const CREDENTIAL_PATH_PRECEDERS = new Set([
 function isPlainRouteWord(previous: string, component: string): boolean {
   return (
     !CREDENTIAL_PATH_PRECEDERS.has(previous) &&
-    PLAIN_ROUTE_WORD_RE.test(component)
+    (PLAIN_ROUTE_WORD_RE.test(component) ||
+      PLAIN_ROUTE_PROTOCOL_WORDS.has(component))
   );
 }
 
@@ -2053,6 +2091,81 @@ export function computeRedactedShape(value: unknown): RedactedValueShape {
 }
 
 /**
+ * Field names whose value is the server's own account of what happened.
+ *
+ * A response body that says `{"msg":"Invalid login credentials"}` was stored as
+ * `{"$redacted":"[REDACTED]","len":25,"charset":"mixed","hash8":"…"}`, so a
+ * session could report that a sign-in failed but never why — the one sentence a
+ * reader needed was the one thing removed. These names are not personal-data
+ * names: the personal ones (`email`, `phone`, `address`, `dob`, and every deny
+ * token) are rejected far earlier in {@link classifyStructuredValue} and never
+ * reach this carve-out.
+ *
+ * `title` is included because a title is a label; it is the loosest entry here
+ * and the shape test below is what keeps it honest.
+ */
+const MESSAGE_FIELD_NAMES = new Set([
+  "detail",
+  "details",
+  "error",
+  "errordescription",
+  "errormessage",
+  "errors",
+  "errortext",
+  "hint",
+  "message",
+  "messages",
+  "msg",
+  "reason",
+  "statusmessage",
+  "statustext",
+  "title",
+]);
+
+/** A sentence, not a document. Anything longer is free text and still goes. */
+const PLAIN_MESSAGE_MAX_LENGTH = 120;
+
+/**
+ * Letters, digits and ordinary sentence punctuation only. No `@`, no `/`, no
+ * `\`, no `=`, no `<`, so an address, a URL, a path, a header or a serialized
+ * credential cannot satisfy it even under a message-shaped name.
+ */
+const PLAIN_MESSAGE_CHARS_RE = /^[A-Za-z][A-Za-z0-9 .,;:!?'"()%$+-]*$/;
+
+/** A word, or a small number like an HTTP status or a retry delay. */
+function isPlainMessageWord(word: string): boolean {
+  if (/[A-Za-z]/.test(word)) return true;
+  return /^\d{1,3}[.,;:!?)%]?$/.test(word);
+}
+
+/**
+ * Is this short free text the server explaining itself, rather than something a
+ * person's data ended up in?
+ *
+ * Reached only at the very bottom of {@link classifyStructuredValue}, so every
+ * validated personal and credential pattern — email, JWT, Luhn card run, IBAN,
+ * token-like string, high-entropy string — has already been tested and failed,
+ * and every deny-listed field name has already been rejected. What is left to
+ * exclude here is the shape of personal data that no validator catches: digit
+ * runs (a phone number, an SSN, an account number) and anything long enough to
+ * be a user-authored note rather than a sentence of prose.
+ */
+function isPlainMessageValue(value: string, keyName?: string): boolean {
+  if (!keyName) return false;
+  if (!MESSAGE_FIELD_NAMES.has(compactFieldName(keyName))) return false;
+  const text = value.trim();
+  if (text.length === 0 || text.length > PLAIN_MESSAGE_MAX_LENGTH) return false;
+  if (!PLAIN_MESSAGE_CHARS_RE.test(text)) return false;
+  // Four consecutive digits is the smallest run that could be a year of birth,
+  // a card fragment, a postcode or the tail of a phone number. Three is a
+  // status code or a count.
+  if (/\d{4}/.test(text)) return false;
+  const words = text.split(/\s+/);
+  if (words.length < 2) return false;
+  return words.every(isPlainMessageWord);
+}
+
+/**
  * Per-value classifier for structured (v2) network-body redaction. Deny-biased:
  * only numbers, booleans, nulls, and short enum-like strings that match no
  * redact rule survive verbatim.
@@ -2128,6 +2241,7 @@ export function classifyStructuredValue(
     return { action: "redact", reason: "iban_value" };
   if (ENUM_LIKE_RE.test(value)) return { action: "keep" };
   if (kept) return { action: "keep" };
+  if (isPlainMessageValue(value, keyName)) return { action: "keep" };
   return { action: "redact", reason: "free_text_value" };
 }
 

@@ -1211,7 +1211,7 @@ describe("llm bundle", () => {
       ]),
     );
     expect(markdown).toContain(
-      "performance res; https://cdn.example.test/auth_[REDACTED]/app.js?token=%5BREDACTED%5D; 34 ms",
+      "performance res; https://cdn.example.test/auth_[REDACTED]/app.js?token=[REDACTED]; 34 ms",
     );
     expect(serialized).not.toContain(secret);
     expect(serialized).not.toContain(embeddedSecret);

@@ -32,7 +32,7 @@ describe("browser redaction policy", () => {
     );
 
     expect(result.value).toBe(
-      `https://example.com/reset/${encodeURIComponent(REDACTED_VALUE)}?token=%5BREDACTED%5D&page=2`,
+      `https://example.com/reset/${REDACTED_VALUE}?token=${REDACTED_VALUE}&page=2`,
     );
     expect(result.metadata?.fields.map((field) => field.reason)).toEqual(
       expect.arrayContaining([
@@ -49,7 +49,7 @@ describe("browser redaction policy", () => {
       "  //alice:shortpass@example.com/reset?token=abc#secret",
     );
 
-    expect(result.value).toBe("  //example.com/reset?token=%5BREDACTED%5D");
+    expect(result.value).toBe(`  //example.com/reset?token=${REDACTED_VALUE}`);
     expect(result.metadata?.fields.map((field) => field.reason)).toEqual(
       expect.arrayContaining([
         "url_credentials",
@@ -65,7 +65,7 @@ describe("browser redaction policy", () => {
     );
 
     expect(result.value).toBe(
-      "  https://example.com/reset?token=%5BREDACTED%5D",
+      `  https://example.com/reset?token=${REDACTED_VALUE}`,
     );
     expect(JSON.stringify(result)).not.toContain("alice");
     expect(JSON.stringify(result)).not.toContain("shortpass");

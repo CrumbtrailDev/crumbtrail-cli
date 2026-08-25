@@ -481,7 +481,7 @@ describe("Crumbtrail Express-compatible middleware", () => {
     );
 
     expect(start.d.url).toBe(
-      `/api/search?q=${encodeURIComponent(REDACTED_VALUE)}&access_token=${encodeURIComponent(REDACTED_VALUE)}`,
+      `/api/search?q=${REDACTED_VALUE}&access_token=${REDACTED_VALUE}`,
     );
     expect(start.d.redaction).toMatchObject({
       policy: BROWSER_REDACTION_POLICY,

@@ -69,6 +69,7 @@ import {
   type PollServicesResult,
 } from "./verify";
 import { discoverServices, type ServiceCandidate } from "./discover";
+import { isBackendRecipe, resolveBackendOrigins } from "./backend-origins";
 import { otlpGuidePlan, renderOtlpGuide } from "./otlp-guide";
 import { RECIPE_REGISTRY, sdkInstallSpec } from "./recipe-registry";
 import { dashboardBase, resolveEndpoint } from "./net";
@@ -830,6 +831,7 @@ export async function runWizard(
   // "skip-already-wired" — self-cancelling injection on a fresh setup. So the
   // plan is computed against the pre-install repo; only executePlan (below,
   // after install) mutates files, keeping injection the LAST repo-mutating step.
+  const singleAppOrigins = resolveBackendOrigins(cwd, localFsReader(cwd));
   const plan = deps.buildPlan(
     {
       cwd,
@@ -844,6 +846,11 @@ export async function runWizard(
       // wizard creates a named service and then wires code that reports under
       // no app at all.
       serviceName: provisioned.serviceName,
+      // Correlation is off unless the emitted init names the origins this app
+      // calls, so read them out of the app's own dev proxy and env config. A
+      // single-package run knows of no sibling services, so that is the whole
+      // source here; the batch path adds the backends it is wiring alongside.
+      backendOrigins: singleAppOrigins,
       options: { force: parsed.yes },
     },
     defaultInjectIO,
@@ -925,6 +932,7 @@ export async function runWizard(
   const notes: string[] = [];
   if (!install.installed && install.note) notes.push(install.note);
   notes.push(...inject.notes);
+  notes.push(...correlationNotes(result.recipe, singleAppOrigins, 0));
   if (keyWrite.note) notes.push(keyWrite.note);
 
   const keyReady =
@@ -1211,6 +1219,32 @@ function candidateHint(c: ServiceCandidate): string {
   return `${stack} · selecting installs and wires it`;
 }
 
+/**
+ * What the run did about frontend to backend correlation, in the service's own
+ * notes. Silence here is what made this the longest lived gap in setup: the
+ * emitted list is the only thing that turns the shared_request_id join on, and
+ * a wizard that never mentions it leaves the user with two unrelated piles of
+ * evidence and no reason to suspect a setting.
+ */
+export function correlationNotes(
+  recipe: Recipe,
+  origins: readonly string[],
+  backendCount: number,
+): string[] {
+  if (isBackendRecipe(recipe)) return [];
+  if (origins.length > 0) {
+    return [
+      `Frontend to backend correlation enabled for ${origins.join(", ")}. Each of those must allow x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent in its CORS allowed headers, or the browser blocks the preflight. Calls to any other origin stay unjoined until you add it to networkCorrelationAllowedOrigins.`,
+    ];
+  }
+  if (backendCount > 0) {
+    return [
+      "No backend origin could be read from this app's config, so networkCorrelationAllowedOrigins is empty and its calls to the backend will not join the same session. Add the API origin to that list in the injected init.",
+    ];
+  }
+  return [];
+}
+
 function toMultiSelectItems(candidates: ServiceCandidate[]): MultiSelectItem[] {
   return candidates.map((c) => ({
     label: c.relDir,
@@ -1340,6 +1374,13 @@ export async function runBatchWizard(
     );
   }
   const selected = indices.map((i) => candidates[i]);
+  // The backend halves of this run. A browser app whose init does not name them
+  // stamps no correlation headers on its calls to them, so the frontend and
+  // backend evidence for one click never joins — which is the whole point of
+  // wiring both in a single pass.
+  const backendSiblings = selected
+    .filter((c) => isBackendRecipe(c.recipe))
+    .map((c) => ({ dir: c.dir, detected: c.detected }));
   if (selected.length === 0) {
     ui.out(alert(color.yellow("Nothing selected — no changes made.")));
     return 0;
@@ -1427,6 +1468,13 @@ export async function runBatchWizard(
       continue;
     }
 
+    // What this app declares for itself, plus the dev origins of the backends
+    // being wired beside it. Empty for a backend (it is the thing being called)
+    // and for a lone frontend whose repo names no backend origin anywhere.
+    const backendOrigins = isBackendRecipe(recipe)
+      ? []
+      : resolveBackendOrigins(c.dir, localFsReader(c.dir), backendSiblings);
+
     try {
       const svc = await deps.provisionService({
         base,
@@ -1461,6 +1509,7 @@ export async function runBatchWizard(
           // verify below polls the provisioned service ids, so it would report
           // "No event yet" for every service while events were landing.
           serviceName: svc.serviceName,
+          backendOrigins,
           options: { force: parsed.yes },
         },
         defaultInjectIO,
@@ -1509,6 +1558,7 @@ export async function runBatchWizard(
         notes: [
           ...(!install.installed && install.note ? [install.note] : []),
           ...applied.notes,
+          ...correlationNotes(recipe, backendOrigins, backendSiblings.length),
         ],
       });
     } catch (err) {

@@ -112,6 +112,18 @@ export interface BuildPlanInput {
    * root can pass nothing and stay unlabelled.
    */
   serviceName?: string | null;
+  /**
+   * Backend origins this app calls, emitted as
+   * `networkCorrelationAllowedOrigins` in the browser init.
+   *
+   * The SDK stamps its correlation headers on same origin calls plus these, and
+   * nowhere else, so an empty list is a frontend whose evidence never joins its
+   * backend. The caller resolves them from the repository (see
+   * ../backend-origins) rather than the recipe guessing a framework default:
+   * an origin the app does not call costs a CORS preflight on a request that
+   * had none. Absent or empty keeps the honest empty field and its comment.
+   */
+  backendOrigins?: readonly string[] | null;
   options?: BuildPlanOptions;
 }
 
@@ -162,7 +174,12 @@ function incompleteSnippet(input: BuildPlanInput): string {
   const keyExpr = keyExprFor(input) ?? "environment.crumbtrailKey";
   switch (input.recipe) {
     case "capacitor":
-      return capacitorInitSnippet(input.endpoint, keyExpr, input.serviceName);
+      return capacitorInitSnippet(
+        input.endpoint,
+        keyExpr,
+        input.serviceName,
+        input.backendOrigins,
+      );
     case "flutter":
       return [
         FLUTTER_IMPORT_LINE,
@@ -172,7 +189,13 @@ function incompleteSnippet(input: BuildPlanInput): string {
     case "nestjs":
       return nestInitSnippet(input.endpoint, keyExpr, input.serviceName);
     case "react-native":
-      return reactNativeInitSnippet(input.endpoint, keyExpr, input.serviceName);
+      return reactNativeInitSnippet(
+        input.endpoint,
+        keyExpr,
+        input.serviceName,
+        false,
+        input.backendOrigins,
+      );
     case "tauri":
       return tauriInitSnippet();
     case "express":
@@ -181,9 +204,19 @@ function incompleteSnippet(input: BuildPlanInput): string {
     case "node":
       return nodeInitSnippet(input.endpoint, keyExpr, input.serviceName);
     case "nuxt":
-      return nuxtPluginSnippet(input.endpoint, keyExpr, input.serviceName);
+      return nuxtPluginSnippet(
+        input.endpoint,
+        keyExpr,
+        input.serviceName,
+        input.backendOrigins,
+      );
     default:
-      return clientInitSnippet(input.endpoint, keyExpr, input.serviceName);
+      return clientInitSnippet(
+        input.endpoint,
+        keyExpr,
+        input.serviceName,
+        input.backendOrigins,
+      );
   }
 }
 
@@ -463,6 +496,7 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   // Prefer `src/` when the app uses a src directory.
   const usesSrc =
@@ -549,6 +583,7 @@ function planSvelteKit(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   if (io.exists(target)) {
     return prependWithPreflight(input, io, target, block);
@@ -577,6 +612,7 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   if (io.exists(target)) {
     const existing = io.readFile(target);
@@ -597,6 +633,7 @@ function planVite(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -736,6 +773,7 @@ function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -756,6 +794,7 @@ function planAstro(input: BuildPlanInput, _io: InjectIO): Plan {
     input.endpoint,
     keyExprFor(input)!,
     input.serviceName,
+    input.backendOrigins,
   );
   return fallbackPlan(input, block, [
     "Astro has no single client entry — add this snippet inside a client-side <script> in a shared layout (e.g. src/layouts/*.astro) so it runs on every page.",
@@ -776,6 +815,7 @@ function planAngular(input: BuildPlanInput, _io: InjectIO): Plan {
     input.endpoint,
     "environment.crumbtrailKey",
     input.serviceName,
+    input.backendOrigins,
   );
   return fallbackPlan(input, block, [
     "Angular has no browser-safe env-var mechanism — add `crumbtrailKey: '<your-ingest-key>'` to src/environments/environment.ts (get your key from the dashboard), import `environment`, and prepend the snippet above bootstrapApplication in src/main.ts.",
@@ -823,6 +863,7 @@ function planCapacitor(input: BuildPlanInput, io: InjectIO): Plan {
     input.endpoint,
     keyExpr,
     input.serviceName,
+    input.backendOrigins,
   );
 
   // Native plugins are optional peers, so the SDK degrades rather than failing
@@ -972,6 +1013,7 @@ function planReactNative(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     hasAsyncStorage,
+    input.backendOrigins,
   );
   const warnings = hasAsyncStorage
     ? []

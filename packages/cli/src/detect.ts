@@ -1148,13 +1148,25 @@ export function detect(
   const otlpStack: Stack | null = match.otlpStack;
 
   let ambiguous = false;
-  if (isMonorepo) {
+  // A root package that is ITSELF a runnable app — a Hono/Express API whose dev
+  // script points at a source entry, with the frontend as the only declared
+  // workspace — is the common "root API + nested web app" layout. Blanking its
+  // match because a workspace file exists made the root invisible to the batch
+  // scan, so full stack capture was unreachable from setup on that layout. The
+  // proof required is the resolved entry: a root that only carries framework
+  // deps for tooling never resolves one, and stays ambiguous exactly as before.
+  const rootIsOwnApp = isMonorepo && recipe != null && match.entryFile != null;
+  if (isMonorepo && !rootIsOwnApp) {
     // A workspace root can carry framework deps too, but there is no single app
     // to wire — force the caller to pick a workspace. Don't guess an entry.
     ambiguous = true;
     entryFile = null;
     reasons.push(
       `monorepo root with ${workspaces!.length} workspace package(s); pick a workspace to wire`,
+    );
+  } else if (rootIsOwnApp) {
+    reasons.push(
+      `monorepo root with ${workspaces!.length} workspace package(s); the root package is itself a runnable ${recipe} service, so it is wireable alongside them`,
     );
   } else if (!recipe) {
     ambiguous = true;

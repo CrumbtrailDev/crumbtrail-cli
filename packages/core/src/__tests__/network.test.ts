@@ -287,7 +287,7 @@ describe("networkCollector — fetch", () => {
     const req = events.find((e) => e.k === "net.req");
     const res = events.find((e) => e.k === "net.res");
     expect(req!.d.url).toBe(
-      `https://api.example.com/bad-json?token=${encodeURIComponent("[REDACTED]")}`,
+      "https://api.example.com/bad-json?token=[REDACTED]",
     );
     expect(res!.d.body).toBeUndefined();
     expect(res!.d.bodySummary).toMatchObject({

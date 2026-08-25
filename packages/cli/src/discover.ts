@@ -234,6 +234,27 @@ export function discoverServices(
 
   const byDir = new Map<string, ServiceCandidate>();
 
+  // The root package itself, when it is a runnable app rather than a workspace
+  // shell. `detect` proves that (a matched recipe AND a resolved entry, which is
+  // what clears `ambiguous` on a monorepo root), so a plain turborepo/pnpm root
+  // whose package.json only holds tooling still contributes no row. Without this
+  // the "root API + nested frontend" layout offered the frontend alone, and the
+  // backend half of every session was unreachable from setup.
+  const rootDir = path.resolve(root);
+  if (rootResult.recipe != null && !rootResult.ambiguous) {
+    byDir.set(
+      rootDir,
+      classify(
+        root,
+        rootDir,
+        "workspace",
+        path.basename(rootDir),
+        reader,
+        deps,
+      ),
+    );
+  }
+
   for (const ws of rootResult.workspaces) {
     const dir = path.resolve(ws.dir);
     if (byDir.has(dir)) continue;

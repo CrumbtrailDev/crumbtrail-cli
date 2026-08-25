@@ -26,7 +26,9 @@ Running `npx crumbtrail` walks the full path in one pass:
 5. **Verifies** the wiring end to end, then waits for your first real event.
 
 In a monorepo, run it from the repo root: it scans every workspace and service,
-shows you what it found, and wires the ones you pick.
+shows you what it found, and wires the ones you pick. The root package is in
+that list when it is itself a runnable app, which is the common layout of an API
+at the repo root with the web app as a workspace under it.
 
 ## Usage
 
@@ -160,9 +162,12 @@ Two kinds of change, in the package it's wiring:
   first statement of `main()` (capture has to be running before the first frame)
 - your ingest key, in an env file, plus a `.gitignore` entry for that file
 
-Browser inits also carry an empty `networkCorrelationAllowedOrigins` list with a
-comment saying what belongs in it. Fill it in when your API is on another origin,
-or frontend and backend evidence never join. See
+Browser inits also carry a `networkCorrelationAllowedOrigins` list, filled in
+with the backend origins the repository names: the targets of the app's own dev
+server proxy, absolute API base URLs in its env files, and the local origins of
+backend services being wired in the same run. The wizard prints which origins it
+enabled. When the repository names none it emits the list empty, with a comment
+saying what belongs in it, and you fill it in yourself. See
 [If your frontend and backend are separate services](#if-your-frontend-and-backend-are-separate-services).
 
 It writes none of it when the SDK could not be installed. An import for a package
@@ -218,10 +223,11 @@ second initialization. It never edits libraries or configuration only packages.
 
 ## If your frontend and backend are separate services
 
-The injected browser init carries one field you have to fill in yourself:
+The injected browser init carries one field that decides whether the two halves
+ever join:
 
 ```ts
-networkCorrelationAllowedOrigins: [],
+networkCorrelationAllowedOrigins: ["http://127.0.0.1:19870"],
 ```
 
 Crumbtrail joins a session to its backend requests by stamping
@@ -239,9 +245,15 @@ networkCorrelationAllowedOrigins: [
 
 Leave it empty and both halves still capture, but they never join: the session
 holds the failing click and the backend holds the failing request, with nothing
-connecting the two. The wizard does not guess the origins, because stamping an
-origin your app did not name would send trace context to a third party API and
-add a CORS preflight to calls that had none.
+connecting the two.
+
+The wizard fills the list from what your repository already states — a dev
+server proxy target, an absolute API base URL in the app's env file, or the
+local origin of a backend service it is wiring in the same run — and names those
+origins in its summary. It never guesses beyond that, because stamping an origin
+your app did not name would send trace context to a third party API and add a
+CORS preflight to calls that had none. Anything the repository does not say, you
+add here yourself.
 
 Two things to check on the backend side: its CORS
 `Access-Control-Allow-Headers` has to cover `x-crumbtrail-session-id`,

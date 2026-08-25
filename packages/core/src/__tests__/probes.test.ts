@@ -309,8 +309,11 @@ describe("failure discipline", () => {
     expect(result.ok).toBe(false);
     expect(result.error).toBeDefined();
     expect(result.error).not.toContain("s3cr3tvalue0987654321");
-    // `redactUrl` rebuilds the query through URLSearchParams, so the marker arrives percent encoded.
-    expect(result.error).toContain(encodeURIComponent(REDACTED_VALUE));
+    // `redactUrl` rebuilds the query through URLSearchParams, which escapes the
+    // marker's brackets; the write side decodes them back so the stored text is
+    // readable rather than `%5BREDACTED%5D`.
+    expect(result.error).toContain(REDACTED_VALUE);
+    expect(result.error).not.toContain(encodeURIComponent(REDACTED_VALUE));
   });
 
   it("reports a source the host did not supply as unavailable, not as an empty table", async () => {
