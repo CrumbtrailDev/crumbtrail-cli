@@ -467,6 +467,28 @@ Each of these fires on the stored data alone, so it works even when the applicat
 and each states the evidence it rests on (the columns compared, both user ids, the value chain) so
 a reader verifies rather than trusts.
 
+### Inbound requests, on any framework
+
+The browser SDK stamps `x-crumbtrail-session-id`, `x-crumbtrail-request-id` and
+`traceparent` on the calls it makes. Something on the backend has to read them
+back, or the session holds one side of every call and joins nothing.
+
+`autoCapture` does that with no application code and no framework module. It
+hooks `http.Server`, which is what express, `@hono/node-server`, fastify, both
+Nest adapters and a hand-written `createServer` all end up being, and records
+each correlated request as `backend.req.start` and `backend.req.end` in the
+browser's own session. Status, duration, allowlisted response headers and the
+response body follow the same policy as the Express middleware, under the same
+redaction. A request that carries no session id is not recorded: there is
+nothing to join it to, and a health check must not become egress. A response the
+peer cut short leaves a `capture_gap` rather than disappearing.
+
+The Express middleware still earns its place: it knows the matched route and the
+error a handler threw, neither of which is visible at the socket. When both are
+installed the middleware claims the request and the `http.Server` hook stays
+silent, so a request is recorded once. Disable the hook with
+`captureHttpRequests: false`.
+
 ### Structured logs
 
 A real backend logs through pino, winston or bunyan, and a failure it expected is

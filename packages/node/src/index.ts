@@ -410,3 +410,25 @@ export type {
   BackendLogLevel,
   ParsedStructuredLog,
 } from "./backend-logs";
+
+// ── Inbound HTTP request capture ─────────────────────────────────────────────
+// Append-only block. Do not reorder the exports above.
+// The zero-config half of frontend to backend correlation: it patches
+// `http.Server` rather than any one framework, so express, hono, fastify, nest
+// and a plain `createServer` all record inbound requests carrying the browser's
+// correlation headers. `autoCapture` installs it, so a stock install needs none
+// of these symbols; they are exported for a host that wires capture by hand.
+export { installHttpRequestCapture } from "./http-server";
+export type {
+  HttpRequestCaptureHandle,
+  HttpRequestCaptureOptions,
+} from "./http-server";
+export {
+  claimBackendRequest,
+  isBackendRequestClaimed,
+} from "./backend-request-claim";
+export { isCapturableContentTypeForTest } from "./backend-response";
+export type {
+  BackendResponseCaptureOptions,
+  BackendResponseLike,
+} from "./backend-response";

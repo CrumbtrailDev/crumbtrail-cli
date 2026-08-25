@@ -20,6 +20,12 @@ import {
   type BackendLogCaptureOptions,
   type BackendLogLevel,
 } from "./backend-logs";
+import {
+  installHttpRequestCapture,
+  type HttpRequestCaptureHandle,
+  type HttpRequestCaptureOptions,
+} from "./http-server";
+import { sendBackendEvent } from "./backend-intake";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -162,6 +168,31 @@ export interface AutoCaptureOptions {
   logStreams?: Pick<
     BackendLogCaptureOptions,
     "stdout" | "stderr" | "fsImpl" | "maxEvents"
+  >;
+  /**
+   * When true (default) record inbound HTTP requests that arrive carrying the
+   * browser's correlation headers as `backend.req.start` / `backend.req.end`
+   * events in THAT browser's session.
+   *
+   * This is the only path by which frontend to backend correlation works at all
+   * on a stock install. It hooks `http.Server` rather than any one framework, so
+   * express, hono, fastify, nest and a hand-written `createServer` are all
+   * covered by the same code with no application change. A request that carries
+   * no session correlation is not recorded: there is nothing to join it to, and
+   * a server's health checks must not become egress.
+   *
+   * Set false to leave `node:http` untouched.
+   */
+  captureHttpRequests?: boolean;
+  /**
+   * Response body and header capture policy for the inbound requests above,
+   * identical in shape and default to the Express middleware's.
+   */
+  httpResponseCapture?: HttpRequestCaptureOptions["response"];
+  /** `node:http`/`node:https` the request capture patches (tests). */
+  httpModules?: Pick<
+    HttpRequestCaptureOptions,
+    "httpImpl" | "httpsImpl" | "maxRequests"
   >;
 }
 
@@ -525,6 +556,46 @@ export async function autoCapture(
     }
   }
 
+  // Inbound request capture. The lane that carries the product's core promise:
+  // the browser stamped its session and request ids on the fetch, and until this
+  // existed nothing on a non-Express backend read them back, so every session
+  // came back with zero backend requests and nothing linked.
+  //
+  // These events do NOT ride the headless session. They belong to the BROWSER's
+  // session — that is the whole point of the join — so each is posted to the
+  // session id the request carried, through the same intake the Express
+  // middleware uses. A request without one is never emitted, so there is nothing
+  // here to misfile.
+  let httpCapture: HttpRequestCaptureHandle | undefined;
+  if (options.captureHttpRequests !== false) {
+    try {
+      httpCapture = installHttpRequestCapture({
+        ...options.httpModules,
+        now: options.nowImpl,
+        ...(options.httpResponseCapture
+          ? { response: options.httpResponseCapture }
+          : {}),
+        emit: (event) => {
+          if (stopped) return;
+          const target =
+            typeof event.sessionId === "string" ? event.sessionId : undefined;
+          if (!target) return;
+          void sendBackendEvent({
+            event,
+            sessionId: target,
+            endpoint: options.endpoint,
+            ...(authToken ? { authToken } : {}),
+            ...(options.fetchImpl ? { fetch: options.fetchImpl } : {}),
+          }).catch((sendErr) =>
+            emitError(sendErr, { phase: "record", source: "console.error" }),
+          );
+        },
+      });
+    } catch (error) {
+      emitError(error, { phase: "record", source: "console.error" });
+    }
+  }
+
   // Zero-config DB capture. Installed AFTER the hooks so a driver patch can
   // never delay crash instrumentation, and best-effort in the same sense as the
   // rest of this module: a driver with an unexpected shape is reported, never
@@ -567,6 +638,7 @@ export async function autoCapture(
     proc.removeListener("unhandledRejection", onUnhandled);
     warningCapture?.stop();
     logCapture?.stop();
+    httpCapture?.stop();
     dbInstrumentation?.restore();
     installed = false;
   };

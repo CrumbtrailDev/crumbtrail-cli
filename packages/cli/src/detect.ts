@@ -368,18 +368,79 @@ const JS_FILE_RE = /\.[cm]?[jt]sx?$/;
  * detection to `main` (a build artifact) instead of the source entry.
  */
 export function parseNodeInvocation(script: string): string | null {
+  return parseNodeInvocationChain(script)[0] ?? null;
+}
+
+/**
+ * Every script/module path in a `start`-style command, in the order written.
+ *
+ * A command names more than one file whenever the first one is a wrapper:
+ * `node scripts/with-shared-env.js node src/server.js` runs the wrapper, and
+ * the wrapper runs the app. `parseNodeInvocation` answers "what does this
+ * command execute", which is the wrapper; the rest of the chain is what the
+ * wrapper goes on to execute, and it is the only in-repo evidence of the real
+ * entry's path.
+ */
+export function parseNodeInvocationChain(script: string): string[] {
   // Only the first command in a chain runs the app; `&& tsc` is not an entry.
   const head = script.split(/&&|\|\||[;|&]/)[0];
   const tokens = head.trim().split(/\s+/).filter(Boolean);
   const runnerAt = tokens.findIndex((t) =>
     NODE_RUNNERS.has(t.replace(/^.*\//, "")),
   );
-  if (runnerAt < 0) return null;
+  if (runnerAt < 0) return [];
+  const files: string[] = [];
   for (const token of tokens.slice(runnerAt + 1)) {
     if (token.startsWith("-")) continue;
-    if (JS_FILE_RE.test(token)) return token;
+    if (JS_FILE_RE.test(token)) files.push(token);
   }
-  return null;
+  return files;
+}
+
+const CHILD_PROCESS_IMPORT_RE = /["'](?:node:)?child_process["']/;
+const SPAWN_CALL_RE = /\b(?:spawn|spawnSync|fork|execFile|execFileSync)\s*\(/g;
+
+/**
+ * Is this file a process wrapper rather than the app?
+ *
+ * A wrapper's whole job is to set something up — env vars, a tunnel, a shared
+ * config — and then `spawn` the real command it was handed on `process.argv`.
+ * It is a legal, common monorepo shape and a catastrophic injection target:
+ * capture initialises in the wrapper process, which exits or idles while the
+ * app runs uninstrumented in the child. Worse, a wrapper is shared, so wiring
+ * it once names every service that invokes it with ONE service name — the
+ * evidence of four apps filed under whichever of them the wizard happened to
+ * be looking at.
+ *
+ * Recognised as a class, from the two things every wrapper does together:
+ * pulling a command out of `process.argv` and handing it to a child_process
+ * spawn. An app that merely shells out matches neither half on its own.
+ */
+export function isProcessWrapperSource(text: string): boolean {
+  if (!CHILD_PROCESS_IMPORT_RE.test(text)) return false;
+  if (!/process\.argv\b/.test(text)) return false;
+  // Names bound to argv, so `spawn(args[0], …)` counts as argv-derived just as
+  // `spawn(process.argv[2], …)` does.
+  const argvNames = ["process.argv"];
+  for (const m of text.matchAll(
+    /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*process\.argv\b/g,
+  )) {
+    argvNames.push(m[1]);
+  }
+  for (const call of text.matchAll(SPAWN_CALL_RE)) {
+    const args = text.slice(
+      call.index + call[0].length,
+      call.index + call[0].length + 200,
+    );
+    if (argvNames.some((name) => args.includes(name))) return true;
+  }
+  return false;
+}
+
+/** Read `candidate` and decide whether it is a spawn wrapper. */
+function isProcessWrapperPath(candidate: string, reader: FileReader): boolean {
+  const text = safeRead(candidate, reader);
+  return text ? isProcessWrapperSource(text) : false;
 }
 
 /** Directory names that only ever hold compiler/bundler output. */
@@ -476,51 +537,161 @@ const ENTRY_SCRIPT_KEYS = [
  * null sends the caller to the manual-snippet fallback, which is honest, where
  * returning `dist/index.js` looks like success and captures nothing.
  */
+/**
+ * Stable opening of the reason a wrapper refusal writes, so a caller can pick
+ * that one line out of the detection trail and put it in front of the user
+ * without matching on prose.
+ */
+export const PROCESS_WRAPPER_REASON = "This entry is a process wrapper:";
+
+const CONVENTIONAL_ENTRY_BASENAMES = ["index", "main", "server", "app"];
+const CONVENTIONAL_ENTRY_EXTENSIONS = [
+  ".ts",
+  ".mts",
+  ".cts",
+  ".js",
+  ".mjs",
+  ".cjs",
+];
+
+/**
+ * Every path `resolveNodeEntry` may READ for one package, relative to its dir.
+ *
+ * Entry resolution stopped being existence-only when it began refusing process
+ * wrappers: deciding whether a candidate spawns its app means reading it. A
+ * remote reader (the GitHub connect path) hydrates a fixed manifest up front
+ * and throws on any unhydrated read, so the manifest and the resolver have to
+ * agree on this list — which is why it lives here, beside the resolver, rather
+ * than being restated in `readers/github.ts`.
+ *
+ * Over-broad on purpose: hydration filters these against the repository tree,
+ * so a path that does not exist costs nothing.
+ */
+export function nodeEntryCandidatePaths(
+  packageJsonText: string | null,
+  tsconfigTexts: readonly string[] = [],
+): string[] {
+  let pkg: PackageJson | null = null;
+  if (packageJsonText) {
+    try {
+      pkg = JSON.parse(packageJsonText) as PackageJson;
+    } catch {
+      pkg = null;
+    }
+  }
+  const out: string[] = [];
+  const scripts = pkg?.scripts ?? {};
+  for (const key of ENTRY_SCRIPT_KEYS) {
+    const script = scripts[key];
+    if (typeof script === "string")
+      out.push(...parseNodeInvocationChain(script));
+  }
+  for (const value of [
+    pkg?.main,
+    pkg?.module,
+    typeof pkg?.bin === "string" ? pkg.bin : Object.values(pkg?.bin ?? {})[0],
+  ]) {
+    if (typeof value === "string") out.push(value);
+  }
+  const rootDirs: string[] = [];
+  for (const text of tsconfigTexts) {
+    const m = text.match(/"rootDir"\s*:\s*"([^"]+)"/);
+    if (m) rootDirs.push(m[1]);
+  }
+  for (const dir of [...rootDirs, "src"]) {
+    for (const base of CONVENTIONAL_ENTRY_BASENAMES) {
+      for (const ext of CONVENTIONAL_ENTRY_EXTENSIONS) {
+        out.push(`${dir}/${base}${ext}`);
+      }
+    }
+  }
+  return [...new Set(out)];
+}
+
 function resolveNodeEntry(
   cwd: string,
   pkg: PackageJson,
   reader: FileReader,
   reasons?: string[],
 ): string | null {
-  const candidates: string[] = [];
+  // `delegates` are the later file tokens of the same command — what a wrapper
+  // goes on to run. Empty for manifest fields, which name one file and nothing
+  // about what it launches.
+  const candidates: { file: string; delegates: string[] }[] = [];
   const scripts = pkg.scripts ?? {};
   for (const key of ENTRY_SCRIPT_KEYS) {
     const script = scripts[key];
     if (typeof script !== "string") continue;
-    const fromScript = parseNodeInvocation(script);
-    if (fromScript) candidates.push(fromScript);
+    const chain = parseNodeInvocationChain(script);
+    if (chain.length > 0)
+      candidates.push({ file: chain[0], delegates: chain.slice(1) });
   }
-  if (typeof pkg.main === "string") candidates.push(pkg.main);
-  if (typeof pkg.module === "string") candidates.push(pkg.module);
-  if (typeof pkg.bin === "string") candidates.push(pkg.bin);
+  const fromManifest = (value: unknown) => {
+    if (typeof value === "string")
+      candidates.push({ file: value, delegates: [] });
+  };
+  fromManifest(pkg.main);
+  fromManifest(pkg.module);
+  if (typeof pkg.bin === "string") fromManifest(pkg.bin);
   else if (pkg.bin && typeof pkg.bin === "object") {
-    const first = Object.values(pkg.bin)[0];
-    if (first) candidates.push(first);
+    fromManifest(Object.values(pkg.bin)[0]);
   }
   const rejected: string[] = [];
-  for (const c of candidates) {
-    const full = path.join(cwd, c);
-    if (!reader.isFile(full)) continue;
+  const wrappers: string[] = [];
+  /** A usable source entry, or null when the path is output/wrapper/absent. */
+  const usable = (relPath: string): string | null => {
+    const full = path.join(cwd, relPath);
+    if (!reader.isFile(full)) return null;
     if (isBuildOutputPath(cwd, full, reader)) {
-      if (!rejected.includes(c)) rejected.push(c);
-      continue;
+      if (!rejected.includes(relPath)) rejected.push(relPath);
+      return null;
+    }
+    if (isProcessWrapperPath(full, reader)) {
+      if (!wrappers.includes(relPath)) wrappers.push(relPath);
+      return null;
     }
     return full;
-  }
-  if (rejected.length === 0) return null;
-
-  // Every declared entry was build output. Only now — never as a general
-  // widening of the `node` matcher — look for the conventional source entry
-  // under the tsconfig `rootDir`, so a TypeScript service whose only manifest
-  // pointer is `dist/` still gets wired where the source lives.
-  for (const dir of [...tsconfigPaths(cwd, reader, "rootDir"), "src"]) {
-    for (const base of ["index", "main", "server", "app"]) {
-      for (const ext of [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]) {
-        const full = path.join(cwd, dir, base + ext);
-        if (reader.isFile(full) && !isBuildOutputPath(cwd, full, reader)) {
+  };
+  for (const c of candidates) {
+    const direct = usable(c.file);
+    if (direct) return direct;
+    // The command named a wrapper. The command usually also names what the
+    // wrapper runs, and that is the entry the app actually boots from.
+    if (wrappers.includes(c.file)) {
+      for (const delegate of c.delegates) {
+        const real = usable(delegate);
+        if (real) {
           if (reasons) {
             reasons.push(
-              `package.json pointed at build output (${rejected.join(", ")}); wiring the source entry instead`,
+              `${c.file} is a process wrapper that spawns the real command; wiring ${delegate}, the entry it launches`,
+            );
+          }
+          return real;
+        }
+      }
+    }
+  }
+  if (rejected.length === 0 && wrappers.length === 0) return null;
+
+  // Every declared entry was build output or a process wrapper. Only now —
+  // never as a general widening of the `node` matcher — look for the
+  // conventional source entry under the tsconfig `rootDir`, so a TypeScript
+  // service whose only manifest pointer is `dist/`, or whose only start script
+  // goes through a shared wrapper, still gets wired where the source lives.
+  for (const dir of [...tsconfigPaths(cwd, reader, "rootDir"), "src"]) {
+    for (const base of CONVENTIONAL_ENTRY_BASENAMES) {
+      for (const ext of CONVENTIONAL_ENTRY_EXTENSIONS) {
+        const full = path.join(cwd, dir, base + ext);
+        if (
+          reader.isFile(full) &&
+          !isBuildOutputPath(cwd, full, reader) &&
+          !isProcessWrapperPath(full, reader)
+        ) {
+          if (reasons) {
+            reasons.push(
+              rejected.length > 0
+                ? `package.json pointed at build output (${rejected.join(", ")}); wiring the source entry instead`
+                : `package.json start command runs a process wrapper (${wrappers.join(", ")}) that spawns the real app; wiring this package's own source entry instead`,
             );
           }
           return full;
@@ -529,9 +700,20 @@ function resolveNodeEntry(
     }
   }
   if (reasons) {
-    reasons.push(
-      `refused build output as an injection target (${rejected.join(", ")}) — a build would erase the edit and the dev command never loads it`,
-    );
+    if (rejected.length > 0) {
+      reasons.push(
+        `refused build output as an injection target (${rejected.join(", ")}) — a build would erase the edit and the dev command never loads it`,
+      );
+    }
+    if (wrappers.length > 0) {
+      // Said in full, because the honest outcome here is a manual snippet and
+      // the reader needs to know where to paste it. A wrapper is shared, so
+      // wiring it would have installed capture in a process that is not the
+      // app and filed every service that uses the wrapper under one name.
+      reasons.push(
+        `${PROCESS_WRAPPER_REASON} ${wrappers.join(", ")} spawns the real command rather than being it. Wiring it would instrument the wrapper process, not this app, and every service that runs the same wrapper would report under one name. Wire the real entry it launches instead`,
+      );
+    }
   }
   return null;
 }

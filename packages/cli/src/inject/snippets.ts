@@ -160,15 +160,17 @@ export function nuxtPluginSnippet(
  * Node server init. Uses crumbtrail-node's `autoCapture`, which installs
  * best-effort backend crash, console and structured log capture (uncaught
  * exceptions, unhandled rejections, console.error, and pino/winston/bunyan
- * lines at warn and above) around a headless ingest session. It is
- * dynamically imported so the block is valid whether the entry file is ESM,
- * CommonJS, or TypeScript, and it is a plain expression (no top-level await) so
- * it is safe to prepend at the very top of an entry file. The ingest key is read
- * from `keyExpr` (never inlined server-side) — one variable for the whole
- * project, with `service` naming which app in it this is. Express apps can
- * additionally add
- * `createCrumbtrailExpressMiddleware` for per-request capture (see
- * crumbtrail-node's README).
+ * lines at warn and above) around a headless ingest session — AND inbound
+ * request capture, which hooks `http.Server` rather than any one framework, so
+ * hono, fastify, nest and a hand-written server all record the requests the
+ * browser correlated without another line of app code. It is dynamically
+ * imported so the block is valid whether the entry file is ESM, CommonJS, or
+ * TypeScript, and it is a plain expression (no top-level await) so it is safe to
+ * prepend at the very top of an entry file. The ingest key is read from
+ * `keyExpr` (never inlined server-side) — one variable for the whole project,
+ * with `service` naming which app in it this is. Express apps additionally get
+ * `createCrumbtrailExpressMiddleware`, which claims the request so it is
+ * recorded once, with its matched route.
  */
 export function nodeInitSnippet(
   endpoint: string,
@@ -176,11 +178,14 @@ export function nodeInitSnippet(
   serviceName?: string | null,
 ): string {
   return [
-    "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections,",
+    "// Crumbtrail — records every inbound HTTP request that arrives carrying the",
+    "// browser's correlation headers, so frontend sessions join the backend calls",
+    "// they made. Also auto-captures uncaught exceptions, unhandled rejections,",
     "// console.error and the warnings and errors your logger writes (pino,",
     "// winston, bunyan), and instruments whichever SQL driver this app already uses",
     "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
-    "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
+    "// Pass { captureHttpRequests: false } to leave node:http untouched, or",
+    "// { instrumentDatabases: false } to leave drivers untouched. Key is read",
     `// from ${keyExpr} — set it in your .env (get your key from the`,
     "// Crumbtrail dashboard).",
     'import("crumbtrail-node")',
@@ -321,11 +326,14 @@ export function nestInitSnippet(
   serviceName?: string | null,
 ): string {
   return [
-    "// Crumbtrail — auto-captures uncaught exceptions, unhandled rejections,",
+    "// Crumbtrail — records every inbound HTTP request that arrives carrying the",
+    "// browser's correlation headers, so frontend sessions join the backend calls",
+    "// they made. Also auto-captures uncaught exceptions, unhandled rejections,",
     "// console.error and the warnings and errors your logger writes (pino,",
     "// winston, bunyan), and instruments whichever SQL driver this app already uses",
     "// (pg, mysql2, better-sqlite3, mssql) so row level changes are captured too.",
-    "// Pass { instrumentDatabases: false } to leave drivers untouched. Key is read",
+    "// Pass { captureHttpRequests: false } to leave node:http untouched, or",
+    "// { instrumentDatabases: false } to leave drivers untouched. Key is read",
     `// from ${keyExpr} — set it in your .env (get your key from the`,
     "// Crumbtrail dashboard).",
     "import('crumbtrail-node')",

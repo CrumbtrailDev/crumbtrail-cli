@@ -8,14 +8,16 @@
 //   1. One recursive git-trees call gives every path in the repo, which is
 //      enough to answer isFile / isDir / readDir for the whole tree.
 //   2. File CONTENT is fetched only for an enumerable manifest of paths that
-//      detection is known to read. Two rounds, because workspace globs are not
-//      known until the root package.json has been read.
+//      detection is known to read. Three rounds, because workspace globs are
+//      not known until the root package.json has been read, and each package's
+//      entry candidates are not known until ITS package.json has been read.
 //
 // This module performs no network I/O itself. The caller injects a fetch-like
 // client, which keeps the package free of an HTTP dependency and keeps the
 // egress policy with the cloud service that owns credentials.
 
 import path from "node:path";
+import { nodeEntryCandidatePaths } from "../detect";
 import { LOCAL_IMPORT, SOURCE_EXTENSIONS } from "../inject/integration";
 import type { FileReader } from "./types";
 
@@ -72,6 +74,13 @@ const DIR_MANIFEST = [
   "pnpm-lock.yaml",
   "yarn.lock",
   "bun.lock",
+];
+
+/** The subset of DIR_MANIFEST that entry resolution reads for rootDir/outDir. */
+const TSCONFIG_FILES = [
+  "tsconfig.json",
+  "tsconfig.build.json",
+  "tsconfig.app.json",
 ];
 
 // Injection targets that a recipe may prepend into. They are not returned by
@@ -310,6 +319,27 @@ export async function hydrateGithubReader(
     for (const file of DIR_MANIFEST) memberPaths.push(`${dir}/${file}`);
   }
   if (memberPaths.length) await fetchInto(snap, source, memberPaths);
+
+  // Round three: each package's Node entry candidates. Entry resolution reads
+  // these — it refuses a candidate that is a process wrapper, and that verdict
+  // is in the file's text — so a manifest that stopped at package.json left the
+  // resolver faulting on an unhydrated path. Bounded: candidates come from the
+  // manifest that round two just fetched, and `fetchInto` drops every path the
+  // tree says does not exist.
+  const entryPaths: string[] = [];
+  for (const dir of [ROOT, ...dirs]) {
+    const at = (file: string) =>
+      norm(dir === ROOT ? `/${file}` : `${dir}/${file}`);
+    const pkgText = snap.contents.get(at("package.json")) ?? null;
+    if (pkgText == null) continue;
+    const tsconfigTexts = TSCONFIG_FILES.map((f) =>
+      snap.contents.get(at(f)),
+    ).filter((t): t is string => typeof t === "string");
+    for (const rel of nodeEntryCandidatePaths(pkgText, tsconfigTexts)) {
+      entryPaths.push(norm(dir === ROOT ? `/${rel}` : `${dir}/${rel}`));
+    }
+  }
+  if (entryPaths.length) await fetchInto(snap, source, entryPaths);
 
   return {
     root: ROOT,

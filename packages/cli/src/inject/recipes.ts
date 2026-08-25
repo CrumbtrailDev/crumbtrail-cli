@@ -169,7 +169,11 @@ function fallbackPlan(
         endpoint: input.endpoint,
         apiKey: KEY_PLACEHOLDER,
       },
-      { keyEnv: keyRefFor(input), serviceName: input.serviceName },
+      {
+        keyEnv: keyRefFor(input),
+        serviceName: input.serviceName,
+        backendOrigins: input.backendOrigins,
+      },
     ),
     warnings,
   };
@@ -672,8 +676,14 @@ function planVite(input: BuildPlanInput, io: InjectIO): Plan {
  * request/error middleware pair) the same self-contained `autoCapture` block (the only
  * prepend-safe server snippet — no `app` handle is available at the top of a
  * file). The block reads the key from process.env.CRUMBTRAIL_KEY, which the user
- * sets themselves (hands-off — the installer writes no key). Framework-specific
- * middleware wiring is left to `buildAgentPrompt`, which reads the registry stack.
+ * sets themselves (hands-off — the installer writes no key).
+ *
+ * This one block is enough for frontend to backend correlation on all four:
+ * `autoCapture` hooks `http.Server`, which is what every Node framework's
+ * listener ends up being, so a request carrying the browser's session and
+ * request ids is recorded whichever of them served it. That is deliberate —
+ * these recipes are byte-identical because there is nothing framework-specific
+ * left to wire, not because a middleware is missing.
  *
  * The one snippet divergence is Nest: its scaffold ships a `.prettierrc` with
  * `singleQuote: true`, so it gets the single-quoted `nestInitSnippet` to avoid
@@ -708,9 +718,11 @@ function planNode(input: BuildPlanInput, io: InjectIO): Plan {
 
 /**
  * Express. Injects the same autoCapture block as the other backend-JS recipes,
- * AND wires the request + error middleware so backends emit backend.req.* spans
- * (autoCapture alone captures crashes and console.error only — with no request
- * middleware, frontend to backend linkage stays empty forever).
+ * AND wires the request + error middleware. autoCapture's `node:http` hook
+ * already records inbound requests on every framework, so linkage no longer
+ * depends on this wiring; the middleware is what adds the matched route and the
+ * error the handler threw, and it claims the request so the http hook stays
+ * silent rather than reporting it twice.
  *
  * When the entry matches the common shape (an `express` import, a
  * `const app = express()` line, an `app.listen(...)` line), the file is

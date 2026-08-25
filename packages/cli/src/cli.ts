@@ -19,6 +19,7 @@ import {
   executePlan,
   findNearbyProjectDirs,
   localFsReader,
+  PROCESS_WRAPPER_REASON,
   type DetectResult,
   type PackageManager,
   type Plan,
@@ -953,7 +954,9 @@ export async function runWizard(
   const notes: string[] = [];
   if (!install.installed && install.note) notes.push(install.note);
   notes.push(...inject.notes);
-  notes.push(...correlationNotes(result.recipe, singleAppOrigins, 0));
+  notes.push(
+    ...correlationNotes(result.recipe, singleAppOrigins, 0, inject.outcome),
+  );
   if (keyWrite.note) notes.push(keyWrite.note);
 
   const keyReady =
@@ -1202,6 +1205,14 @@ export interface ServiceOutcome {
   keyIsCompileTime?: boolean;
   /** True when the service has a key available for the configured variable. */
   keyReady?: boolean;
+  /**
+   * The key this service carries was presented to the endpoint and refused.
+   *
+   * Separate from `keyReady`, which only says a value reached the env file. A
+   * rejected key is a service that will not report a single event, so it must
+   * not wear the same tick, or sit in the same "wired" count, as one that will.
+   */
+  keyRejected?: boolean;
   filesTouched: string[];
   notes: string[];
   error?: string;
@@ -1233,8 +1244,15 @@ function candidateHint(c: ServiceCandidate): string {
       : `${stack} · guidance writes a setup file`;
   if (c.flags.includes("already-wired"))
     return `${stack} · complete for this endpoint, skipped`;
-  if (c.flags.includes("ambiguous"))
+  if (c.flags.includes("ambiguous")) {
+    // A wrapper refusal is not "entry unclear" — the entry was found and
+    // rejected for a reason the reader can act on, and saying so is what stops
+    // them from wiring the wrapper by hand afterwards.
+    if (c.detected.reasons.some((r) => r.startsWith(PROCESS_WRAPPER_REASON))) {
+      return `${stack} · starts through a shared process wrapper, so selecting shows the snippet for its real entry`;
+    }
     return `${stack} · entry unclear, selecting shows the setup guidance`;
+  }
   if (c.integration?.found && !c.integration.complete)
     return `${stack} · setup incomplete, selecting shows what is missing`;
   return `${stack} · selecting installs and wires it`;
@@ -1251,24 +1269,57 @@ export function correlationNotes(
   recipe: Recipe,
   origins: readonly string[],
   backendCount: number,
+  outcome: ServiceStatus = "wired",
 ): string[] {
   if (isBackendRecipe(recipe)) return [];
+  // The init these recipes write carries no networkCorrelationAllowedOrigins
+  // field at all, so any note here describes a setting the reader cannot find
+  // in their own code — and, worse, certifies a join that nothing performs.
+  if (NO_CORRELATION_FIELD_RECIPES.has(recipe)) return [];
+  // Nothing about correlation reached this repo. `withheld` touched no file,
+  // and an already-complete service was not re-read for origins this run, so
+  // whatever its init lists is not something this run may speak for.
+  if (
+    outcome === "withheld" ||
+    outcome === "failed" ||
+    outcome === "skipped-already-wired"
+  )
+    return [];
+  // The init exists only in the terminal: injection fell back to a snippet, or
+  // the edit was declined. The snippet DOES carry the computed origins, so the
+  // honest tense is future — what pasting it will turn on, not what is on.
+  const pending = outcome === "guidance" || outcome === "declined";
+  const cors =
+    "Each of those must allow x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent in its CORS allowed headers, or the browser blocks the preflight.";
   if (origins.length > 0) {
     return [
-      `Frontend to backend correlation enabled for ${origins.join(", ")}. Each of those must allow x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent in its CORS allowed headers, or the browser blocks the preflight. Calls to any other origin stay unjoined until you add it to networkCorrelationAllowedOrigins.`,
+      pending
+        ? `The snippet above sets frontend to backend correlation for ${origins.join(", ")}; it is not enabled until you paste it in. ${cors} Calls to any other origin stay unjoined until you add it to networkCorrelationAllowedOrigins.`
+        : `Frontend to backend correlation enabled for ${origins.join(", ")}. ${cors} Calls to any other origin stay unjoined until you add it to networkCorrelationAllowedOrigins.`,
     ];
   }
   if (backendCount > 0) {
+    // Never say "add the origin" without saying what the origin must then
+    // allow: the SDK starts stamping three headers on those calls, and a
+    // backend whose CORS allowlist predates them blocks the app's own
+    // requests at the preflight.
+    const where = pending ? "the snippet above" : "the injected init";
     return [
-      // Never say "add the origin" without saying what the origin must then
-      // allow: the SDK starts stamping three headers on those calls, and a
-      // backend whose CORS allowlist predates them blocks the app's own
-      // requests at the preflight.
-      "No backend origin could be read from this app's config, so networkCorrelationAllowedOrigins is empty and its calls to the backend will not join the same session. Add the API origin to that list in the injected init, and add x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent to that backend's CORS allowed headers at the same time, or the browser blocks the preflight.",
+      `No backend origin could be read from this app's config, so networkCorrelationAllowedOrigins is empty and its calls to the backend will not join the same session. Add the API origin to that list in ${where}, and add x-crumbtrail-session-id, x-crumbtrail-request-id and traceparent to that backend's CORS allowed headers at the same time, or the browser blocks the preflight.`,
     ];
   }
   return [];
 }
+
+/**
+ * Recipes whose injected init has no `networkCorrelationAllowedOrigins` field.
+ *
+ * Tauri initialises with a `transportInstance` and nothing else; Flutter's Dart
+ * init carries no origin list either. Emitting a correlation note for them told
+ * the user a join was on, over a snippet that has no such setting anywhere in
+ * it.
+ */
+const NO_CORRELATION_FIELD_RECIPES = new Set<Recipe>(["tauri", "flutter"]);
 
 function toMultiSelectItems(candidates: ServiceCandidate[]): MultiSelectItem[] {
   return candidates.map((c) => ({
@@ -1584,7 +1635,14 @@ export async function runBatchWizard(
         notes: [
           ...(!install.installed && install.note ? [install.note] : []),
           ...applied.notes,
-          ...correlationNotes(recipe, backendOrigins, backendSiblings.length),
+          // The APPLIED status, not the plan's intent: a service whose wiring
+          // fell back to a snippet must not be told its correlation is live.
+          ...correlationNotes(
+            recipe,
+            backendOrigins,
+            backendSiblings.length,
+            applied.status,
+          ),
         ],
       });
     } catch (err) {
@@ -1677,7 +1735,13 @@ export async function runBatchWizard(
     );
     for (const o of cloudReporting) {
       const probe = keyProbes.get(o.name);
-      if (probe && !probe.ok) o.notes.push(probe.note);
+      if (probe && !probe.ok) {
+        o.notes.push(probe.note);
+        // Recorded on the outcome, not only in the notes block: the summary row
+        // is where a reader decides whether a service is done, and a tick there
+        // outranks a warning twenty lines below it.
+        o.keyRejected = true;
+      }
     }
     const waitable = cloudReporting.filter(
       (o) => keyProbes.get(o.name)?.ok !== false,
@@ -1829,7 +1893,7 @@ async function applyBatchInjection(
   };
 }
 
-function printBatchSummary(
+export function printBatchSummary(
   ui: Ui,
   base: string,
   root: string,
@@ -1849,6 +1913,13 @@ function printBatchSummary(
     declined: chip(` ${g.cross} `, "warn"),
     failed: chip(` ${g.cross} `, "danger"),
   };
+  // A wired service whose key the endpoint refused reports nothing at all, so
+  // it does not get the success tick — it reads like the other rows that still
+  // need the user.
+  const markFor = (o: ServiceOutcome) =>
+    o.status === "wired" && o.keyRejected === true
+      ? chip(` ${g.warn} `, "warn")
+      : mark[o.status];
   const width = Math.max(...outcomes.map((o) => o.name.length), 4);
   // Absolute temp/monorepo paths make the summary unreadable; the user already
   // knows where their repo is.
@@ -1856,13 +1927,18 @@ function printBatchSummary(
 
   const ready = (o: ServiceOutcome) =>
     o.status === "skipped-already-wired" ||
-    (o.status === "wired" && o.keyReady === true);
+    (o.status === "wired" && o.keyReady === true && o.keyRejected !== true);
   const readyCount = outcomes.filter(ready).length;
   const wiredCount = outcomes.filter(
-    (o) => o.status === "wired" && o.keyReady === true,
+    (o) =>
+      o.status === "wired" && o.keyReady === true && o.keyRejected !== true,
   ).length;
   const needsKeyCount = outcomes.filter(
     (o) => o.status === "wired" && o.keyReady !== true,
+  ).length;
+  const rejectedKeyCount = outcomes.filter(
+    (o) =>
+      o.status === "wired" && o.keyReady === true && o.keyRejected === true,
   ).length;
   ui.out("");
   // The bar states the outcome only. The project name used to ride on the end
@@ -1888,17 +1964,21 @@ function printBatchSummary(
             ? color.yellow("not wired. You declined the edit")
             : o.status === "wired" && o.keyReady !== true
               ? color.yellow("needs ingest key")
-              : o.status === "guidance"
-                ? color.yellow("manual setup needed")
-                : o.status === "skipped-already-wired"
-                  ? color.dim("complete for this endpoint · skipped")
-                  : o.sessionUrl
-                    ? color.brand(o.sessionUrl)
-                    : o.filesTouched.length > 0
-                      ? color.dim(o.filesTouched.map(rel).join(", "))
-                      : "";
+              : o.status === "wired" && o.keyRejected === true
+                ? // Adjacent to the row, not only in the notes block: this
+                  // service is wired and still reports nothing.
+                  color.yellow("wired, but its ingest key was rejected")
+                : o.status === "guidance"
+                  ? color.yellow("manual setup needed")
+                  : o.status === "skipped-already-wired"
+                    ? color.dim("complete for this endpoint · skipped")
+                    : o.sessionUrl
+                      ? color.brand(o.sessionUrl)
+                      : o.filesTouched.length > 0
+                        ? color.dim(o.filesTouched.map(rel).join(", "))
+                        : "";
     ui.out(
-      `  ${mark[o.status]} ${o.name.padEnd(width)}  ${color.dim(o.relDir.padEnd(24))} ${detail}`,
+      `  ${markFor(o)} ${o.name.padEnd(width)}  ${color.dim(o.relDir.padEnd(24))} ${detail}`,
     );
   }
 
@@ -1907,6 +1987,10 @@ function printBatchSummary(
   const parts = [
     `${wiredCount} wired`,
     ...(needsKeyCount > 0 ? [`${needsKeyCount} need a key`] : []),
+    // Its own bucket. Folding it into "wired" certified a service the endpoint
+    // had just refused; folding it into "need a key" would be wrong too, since
+    // the key is present — it is the wrong one.
+    ...(rejectedKeyCount > 0 ? [`${rejectedKeyCount} key rejected`] : []),
     ...(count("guidance") > 0 ? [`${count("guidance")} guidance`] : []),
     ...(count("failed") > 0 ? [`${count("failed")} failed`] : []),
     // Counted apart from "skipped": nothing was wired and the user has a next
