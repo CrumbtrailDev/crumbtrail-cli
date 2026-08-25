@@ -555,6 +555,16 @@ const CONVENTIONAL_ENTRY_EXTENSIONS = [
 ];
 
 /**
+ * Where a conventional entry is looked for, most specific first: any tsconfig
+ * `rootDir`, then `src/`, then the package root (a Docker/Procfile app often
+ * keeps `server.js` beside its `package.json`). Shared by the resolver and by
+ * `nodeEntryCandidatePaths` so the two cannot drift.
+ */
+const conventionalEntryDirs = (rootDirs: readonly string[]): string[] => [
+  ...new Set([...rootDirs, "src", "."]),
+];
+
+/**
  * Every path `resolveNodeEntry` may READ for one package, relative to its dir.
  *
  * Entry resolution stopped being existence-only when it began refusing process
@@ -598,21 +608,31 @@ export function nodeEntryCandidatePaths(
     const m = text.match(/"rootDir"\s*:\s*"([^"]+)"/);
     if (m) rootDirs.push(m[1]);
   }
-  for (const dir of [...rootDirs, "src"]) {
+  for (const dir of conventionalEntryDirs(rootDirs)) {
     for (const base of CONVENTIONAL_ENTRY_BASENAMES) {
       for (const ext of CONVENTIONAL_ENTRY_EXTENSIONS) {
-        out.push(`${dir}/${base}${ext}`);
+        out.push(dir === "." ? `${base}${ext}` : `${dir}/${base}${ext}`);
       }
     }
   }
   return [...new Set(out)];
 }
 
+/**
+ * `frameworkDetected` says a matcher above the generic `node` fallback already
+ * identified the project from a dependency (express, hono, fastify). That is
+ * what licenses the conventional-filename search below when the manifest
+ * declared no entry at all: the project is known to be a server, so finding
+ * `src/server.js` is resolution, not guessing. The bare `node` matcher passes
+ * false and keeps punting, because there the conventional search would BE the
+ * match and would claim any package.json with a `src/index.js` next to it.
+ */
 function resolveNodeEntry(
   cwd: string,
   pkg: PackageJson,
   reader: FileReader,
   reasons?: string[],
+  frameworkDetected = false,
 ): string | null {
   // `delegates` are the later file tokens of the same command — what a wrapper
   // goes on to run. Empty for manifest fields, which name one file and nothing
@@ -671,14 +691,19 @@ function resolveNodeEntry(
       }
     }
   }
-  if (rejected.length === 0 && wrappers.length === 0) return null;
+  if (rejected.length === 0 && wrappers.length === 0 && !frameworkDetected)
+    return null;
 
-  // Every declared entry was build output or a process wrapper. Only now —
-  // never as a general widening of the `node` matcher — look for the
-  // conventional source entry under the tsconfig `rootDir`, so a TypeScript
-  // service whose only manifest pointer is `dist/`, or whose only start script
-  // goes through a shared wrapper, still gets wired where the source lives.
-  for (const dir of [...tsconfigPaths(cwd, reader, "rootDir"), "src"]) {
+  // Either every declared entry was build output or a process wrapper, or the
+  // framework is already known from a dependency and the manifest points
+  // nowhere usable. Only in those cases — never as a general widening of the
+  // `node` matcher — look for the conventional source entry, so a TypeScript
+  // service whose only manifest pointer is `dist/`, one whose only start script
+  // goes through a shared wrapper, and an Express app with neither `main` nor
+  // `scripts` all get wired where the source lives.
+  for (const dir of conventionalEntryDirs(
+    tsconfigPaths(cwd, reader, "rootDir"),
+  )) {
     for (const base of CONVENTIONAL_ENTRY_BASENAMES) {
       for (const ext of CONVENTIONAL_ENTRY_EXTENSIONS) {
         const full = path.join(cwd, dir, base + ext);
@@ -688,10 +713,15 @@ function resolveNodeEntry(
           !isProcessWrapperPath(full, reader)
         ) {
           if (reasons) {
+            const rel = path.relative(cwd, full) || path.basename(full);
             reasons.push(
               rejected.length > 0
                 ? `package.json pointed at build output (${rejected.join(", ")}); wiring the source entry instead`
-                : `package.json start command runs a process wrapper (${wrappers.join(", ")}) that spawns the real app; wiring this package's own source entry instead`,
+                : wrappers.length > 0
+                  ? `package.json start command runs a process wrapper (${wrappers.join(", ")}) that spawns the real app; wiring this package's own source entry instead`
+                  : candidates.length === 0
+                    ? `package.json names no entry (no \`main\`, no start script); wiring ${rel}, the conventional entry for this framework`
+                    : `package.json names no entry that exists; wiring ${rel}, the conventional entry for this framework`,
             );
           }
           return full;
@@ -712,6 +742,11 @@ function resolveNodeEntry(
       // app and filed every service that uses the wrapper under one name.
       reasons.push(
         `${PROCESS_WRAPPER_REASON} ${wrappers.join(", ")} spawns the real command rather than being it. Wiring it would instrument the wrapper process, not this app, and every service that runs the same wrapper would report under one name. Wire the real entry it launches instead`,
+      );
+    }
+    if (rejected.length === 0 && wrappers.length === 0 && frameworkDetected) {
+      reasons.push(
+        "package.json names no entry, and no index/main/server/app source file exists in the package root or src/",
       );
     }
   }
@@ -1107,7 +1142,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!("express" in deps) || !pkg) return null;
       reasons.push("found `express` dependency");
       return {
-        entryFile: resolveNodeEntry(root, pkg, reader, reasons),
+        entryFile: resolveNodeEntry(root, pkg, reader, reasons, true),
         nextVersion: null,
       };
     },
@@ -1118,7 +1153,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!("hono" in deps) || !pkg) return null;
       reasons.push("found `hono` dependency");
       return {
-        entryFile: resolveNodeEntry(root, pkg, reader, reasons),
+        entryFile: resolveNodeEntry(root, pkg, reader, reasons, true),
         nextVersion: null,
       };
     },
@@ -1129,7 +1164,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!("fastify" in deps) || !pkg) return null;
       reasons.push("found `fastify` dependency");
       return {
-        entryFile: resolveNodeEntry(root, pkg, reader, reasons),
+        entryFile: resolveNodeEntry(root, pkg, reader, reasons, true),
         nextVersion: null,
       };
     },

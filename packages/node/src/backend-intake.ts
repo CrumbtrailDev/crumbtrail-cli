@@ -165,8 +165,15 @@ export async function sendBackendEvent(
   if (!sessionId) {
     reportWarning(options.onWarning, {
       kind: "missing-session",
+      // Names both halves of the cause, because either one alone is fixable:
+      // the request carried no correlation, AND the process has no session of
+      // its own to fall back to. The old sentence said only that an id was
+      // missing, which left the reader with nothing to act on.
       message:
-        "Backend event was not sent because no usable session ID was available.",
+        "Backend event was not sent because no session ID was available. " +
+        "Nothing correlated it (no x-crumbtrail-session-id header) and this " +
+        "process has no capture session of its own. Install autoCapture, or " +
+        "check that its session handshake succeeded.",
       requestId,
       eventKind,
     });

@@ -6,6 +6,7 @@ import {
   type ResponseRecorder,
 } from "./backend-response";
 import { claimBackendRequest } from "./backend-request-claim";
+import { getProcessSessionId } from "./process-session";
 import {
   CRUMBTRAIL_REQUEST_HEADER,
   buildBackendRequestEndEvent,
@@ -168,6 +169,14 @@ export { isCapturableContentTypeForTest } from "./backend-response";
 interface RequestState {
   startedAtMs: number;
   sessionId?: string;
+  /**
+   * True when `sessionId` is the process's own capture session rather than one
+   * a browser or a caller correlated. Kept so the request's later events resolve
+   * the same fallback instead of presenting it as an explicit option, and so a
+   * process-owned request never becomes the session a runtime warning or a log
+   * line is attributed to (`autoCapture` already records those itself).
+   */
+  sessionFromProcess?: boolean;
   requestId: string;
   /**
    * Set the moment the request's terminal event is built. `finish` and `close`
@@ -216,7 +225,7 @@ export function createCrumbtrailExpressMiddleware(
       const state = stateFromEvent(startEvent, startedAtMs);
       requestStates.set(req, state);
       exposeRequestIdHeader(req, state);
-      if (state.sessionId) {
+      if (state.sessionId && !state.sessionFromProcess) {
         lastSession = { sessionId: state.sessionId, atMs: startedAtMs };
       }
 
@@ -426,7 +435,17 @@ function stateFromEvent(event: BugEvent, startedAtMs: number): RequestState {
       : typeof event.d.sessionId === "string"
         ? event.d.sessionId
         : undefined;
-  return { startedAtMs, requestId, sessionId };
+  const correlation = event.d.correlation;
+  const sessionFromProcess =
+    correlation !== null &&
+    typeof correlation === "object" &&
+    (correlation as { sessionIdSource?: unknown }).sessionIdSource === "process";
+  return {
+    startedAtMs,
+    requestId,
+    sessionId,
+    ...(sessionFromProcess ? { sessionFromProcess: true } : {}),
+  };
 }
 
 function readRequestInput(
@@ -434,6 +453,14 @@ function readRequestInput(
   options: CrumbtrailExpressOptions,
   state?: RequestState,
 ) {
+  // A session the process owns is offered as the fallback, never as an explicit
+  // option: the correlation record has to keep saying that nothing joined this
+  // request to a browser.
+  const correlatedSessionId = state
+    ? state.sessionFromProcess
+      ? undefined
+      : state.sessionId
+    : resolveRequestValue(options.sessionId, req);
   return {
     method: req.method,
     url: req.url,
@@ -441,7 +468,12 @@ function readRequestInput(
     path: req.path,
     route: readRoute(req),
     headers: req.headers,
-    sessionId: state?.sessionId ?? resolveRequestValue(options.sessionId, req),
+    sessionId: correlatedSessionId,
+    // Pinned to what the request started with, so a capture stopped mid-request
+    // cannot strand its terminal event in a different session or none at all.
+    processSessionId: state?.sessionFromProcess
+      ? state.sessionId
+      : getProcessSessionId(),
     requestId: state?.requestId ?? resolveRequestValue(options.requestId, req),
     sessionStartedAt: resolveSessionStartedAt(options.sessionStartedAt, req),
     ...(state

@@ -15,6 +15,7 @@ import {
   type ResponseRecorder,
 } from "./backend-response";
 import { isBackendRequestClaimed } from "./backend-request-claim";
+import { getProcessSessionId } from "./process-session";
 
 /**
  * Inbound HTTP request capture for every Node backend, with no application code.
@@ -47,11 +48,14 @@ import { isBackendRequestClaimed } from "./backend-request-claim";
  *   real start timestamp, so the session's ordering is unaffected; holding it is
  *   what lets a framework-aware recorder (the Express middleware) claim the
  *   request in between and take ownership, instead of both recording it.
- * - **A request with no session correlation emits nothing.** The intake
- *   addresses an existing session; an event with no session id has nowhere to
- *   land (`sendBackendEvent` refuses it), and a server's health checks and
- *   probes must not become egress. This matches what the Express middleware
- *   already does in practice.
+ * - **A request with no session at all emits nothing.** The intake addresses an
+ *   existing session; an event with no session id has nowhere to land
+ *   (`sendBackendEvent` refuses it). When `autoCapture` has established the
+ *   process's own session, an uncorrelated request is filed there instead of
+ *   being dropped — a backend with no browser in front of it is the ordinary
+ *   case, not an unusable one — and the event records
+ *   `sessionIdSource: "process"` so nothing downstream reads it as a join.
+ *   With no process session either, the request is still skipped.
  * - **The host's behaviour is never altered.** Every hook is wrapped in a
  *   try/catch, the original `emit` is always called with its original arguments
  *   and its return value, and a throwing sink is swallowed.
@@ -188,17 +192,26 @@ export function installHttpRequestCapture(
     // handler that mutates `req.headers` cannot change what was correlated. It
     // is only SENT once the response settles, which is what leaves room for a
     // framework-aware recorder to claim the request.
+    // Read per request: `autoCapture` establishes the process session
+    // asynchronously, so a server that started first still picks it up.
+    const processSessionId = getProcessSessionId();
     const startEvent = buildBackendRequestStartEvent({
       method: req.method,
       url: req.url,
       headers: req.headers,
+      processSessionId,
       now: startedAtMs,
     });
 
-    // No session id means the intake has nowhere to put this. Skip before
-    // wrapping the response, so an uncorrelated request costs the host nothing.
+    // No session at all — neither correlated nor process-owned — means the
+    // intake has nowhere to put this. Skip before wrapping the response, so
+    // such a request costs the host nothing.
     if (typeof startEvent.sessionId !== "string" || !startEvent.sessionId)
       return;
+    // The end event has to resolve to the same session the start event did, and
+    // to say so the same way: handing it the process id as `sessionId` would
+    // record it as an explicit option and hide that nothing correlated it.
+    const usedProcessSession = sessionIdSourceOf(startEvent) === "process";
 
     captured += 1;
     const recorder = attachResponseRecorder(res, responseOptions);
@@ -246,7 +259,9 @@ export function installHttpRequestCapture(
         method: request.method,
         url: request.url,
         headers: request.headers,
-        sessionId: startEvent.sessionId,
+        ...(usedProcessSession
+          ? { processSessionId }
+          : { sessionId: startEvent.sessionId }),
         requestId:
           typeof startEvent.d.requestId === "string"
             ? startEvent.d.requestId
@@ -291,6 +306,14 @@ export function installHttpRequestCapture(
       hubs.delete(anchor);
     },
   };
+}
+
+/** Where a built event's session id came from, per its own correlation record. */
+function sessionIdSourceOf(event: BugEvent): string | undefined {
+  const correlation = event.d.correlation;
+  if (correlation === null || typeof correlation !== "object") return undefined;
+  const source = (correlation as { sessionIdSource?: unknown }).sessionIdSource;
+  return typeof source === "string" ? source : undefined;
 }
 
 function safeEmit(emit: (event: BugEvent) => void, event: BugEvent): void {

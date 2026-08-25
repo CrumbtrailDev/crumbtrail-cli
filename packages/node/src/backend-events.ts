@@ -40,10 +40,17 @@ export type BackendCorrelationStatus =
   | "missing-session"
   | "missing-request-id"
   | "generated-request-id"
-  | "missing-session-and-request-id";
+  | "missing-session-and-request-id"
+  /**
+   * No browser correlated this request, so it was filed to the process's own
+   * capture session. Distinct from `missing-session` (which means the event had
+   * nowhere to land at all) and from `linked` (which claims a join that did not
+   * happen).
+   */
+  | "process-session";
 
 export type BackendCorrelationSource =
-  "option" | "header" | "traceparent" | "generated" | "missing";
+  "option" | "header" | "traceparent" | "generated" | "process" | "missing";
 
 export interface BackendRequestEventInput {
   method?: string;
@@ -54,6 +61,13 @@ export interface BackendRequestEventInput {
   headers?: BackendRequestHeaders;
   sessionId?: string;
   requestId?: string;
+  /**
+   * The process's own capture session, used only when neither an explicit
+   * `sessionId` nor a correlation header supplies one. Lets a backend with no
+   * browser in front of it record its requests instead of having them refused
+   * by the intake for having no session.
+   */
+  processSessionId?: string;
   sessionStartedAt?: number | Date;
   now?: number;
   /** Optional best-effort sink for completeness gaps discovered while resolving correlation. */
@@ -479,16 +493,25 @@ function resolveCorrelation(input: BackendRequestEventInput): Correlation {
   const optionSessionId = normalizeId(input.sessionId);
   const optionRequestId = normalizeId(input.requestId);
 
-  const sessionId = optionSessionId ?? normalizeId(headerSessionId);
+  // What a caller or a browser correlated, before any process-level fallback.
+  const correlatedSessionId = optionSessionId ?? normalizeId(headerSessionId);
+  // The fallback is consulted only when nothing correlated the request, so a
+  // browser-correlated request still lands in the browser's session.
+  const processSessionId = correlatedSessionId
+    ? undefined
+    : normalizeId(input.processSessionId);
+  const sessionId = correlatedSessionId ?? processSessionId;
   const crumbtrailRequestId = optionRequestId ?? normalizeId(headerRequestId);
   const rawRequestId = crumbtrailRequestId ?? traceparent?.traceId;
   const requestId = rawRequestId ?? generateBackendRequestId();
 
   const sessionIdSource: BackendCorrelationSource = optionSessionId
     ? "option"
-    : headerSessionId && sessionId
+    : headerSessionId && correlatedSessionId
       ? "header"
-      : "missing";
+      : processSessionId
+        ? "process"
+        : "missing";
   const requestIdSource: BackendCorrelationSource = optionRequestId
     ? "option"
     : headerRequestId && rawRequestId
@@ -498,12 +521,18 @@ function resolveCorrelation(input: BackendRequestEventInput): Correlation {
         : "generated";
 
   let status: BackendCorrelationStatus;
-  if (sessionId && rawRequestId) status = "linked";
+  // A request the process claimed is never "linked": nothing joined it to a
+  // browser, and saying otherwise would invent a correlation downstream.
+  if (processSessionId) status = "process-session";
+  else if (sessionId && rawRequestId) status = "linked";
   else if (sessionId && !rawRequestId) status = "generated-request-id";
   else if (!sessionId && rawRequestId) status = "missing-session";
   else status = "missing-session-and-request-id";
 
-  if (traceparent && !sessionId) {
+  // Judged on what the request itself carried: a traceparent whose session
+  // header was stripped is still a correlation gap, whatever session the event
+  // was finally filed to.
+  if (traceparent && !correlatedSessionId) {
     emitCorrelationGap(input, {
       reason:
         !headerSessionId && !headerRequestId

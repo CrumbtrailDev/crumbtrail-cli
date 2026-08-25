@@ -26,6 +26,10 @@ import {
   type HttpRequestCaptureOptions,
 } from "./http-server";
 import { sendBackendEvent } from "./backend-intake";
+import {
+  clearProcessSessionId,
+  setProcessSessionId,
+} from "./process-session";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -365,6 +369,12 @@ export async function autoCapture(
         const started = await startSession();
         if (stopped) return undefined;
         session = started;
+        // Announced only once the endpoint has acknowledged the session, so a
+        // request recorder falling back to it addresses a session that exists.
+        // This is what lets a backend with no browser in front of it record its
+        // requests instead of having every one of them refused for having no
+        // session id.
+        setProcessSessionId(stableSessionId);
         consecutiveFailures = 0;
         nextAttemptAt = 0;
         return session;
@@ -631,6 +641,7 @@ export async function autoCapture(
     // stop() short-circuits and an in-flight handshake resolves to a discarded
     // session instead of arming further retries.
     stopped = true;
+    clearProcessSessionId(stableSessionId);
     if (consoleRef.error === patchedError) {
       consoleRef.error = originalError as typeof consoleRef.error;
     }

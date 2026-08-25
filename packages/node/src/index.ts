@@ -427,6 +427,15 @@ export {
   claimBackendRequest,
   isBackendRequestClaimed,
 } from "./backend-request-claim";
+// The session an uncorrelated backend request is filed to. `autoCapture` sets
+// this once its handshake succeeds; a host that runs its own headless session
+// and wires the middleware by hand announces it here so its request events land
+// somewhere too, instead of being refused for having no session.
+export {
+  setProcessSessionId,
+  clearProcessSessionId,
+  getProcessSessionId,
+} from "./process-session";
 export { isCapturableContentTypeForTest } from "./backend-response";
 export type {
   BackendResponseCaptureOptions,

@@ -13,7 +13,9 @@ import {
 import {
   flushBackendEvents,
   resetBackendIntakeQueueForTest,
+  sendBackendEvent,
 } from "../backend-intake";
+import { installHttpRequestCapture } from "../http-server";
 
 /**
  * The regression this file exists for: a wizard install on any framework other
@@ -227,16 +229,75 @@ describe("inbound request capture on a stock autoCapture install", () => {
     });
   });
 
-  it("emits nothing for a request with no correlation headers", async () => {
+  it("files a request with no correlation headers to the process's own session", async () => {
     const { posts, fetchImpl } = fakeIngest();
     await startCapture(fetchImpl);
+
+    const server = createServer((_req, res) => {
+      res.statusCode = 500;
+      res.end("boom");
+    });
+    servers.push(server);
+    const port = await listen(server);
+
+    await fetch(`http://127.0.0.1:${port}/api/orders/12345`).then((r) =>
+      r.text(),
+    );
+    await flushBackendEvents();
+
+    const start = eventsOfKind(posts, "backend.req.start");
+    const end = eventsOfKind(posts, "backend.req.end");
+    expect(start).toHaveLength(1);
+    expect(end).toHaveLength(1);
+
+    // The process session autoCapture established, not the browser's — nothing
+    // correlated this request, and the correlation record says so rather than
+    // claiming a join.
+    const processSession = capture?.sessionId;
+    expect(typeof processSession).toBe("string");
+    expect(start[0].sessionId).toBe(processSession);
+    expect(end[0].sessionId).toBe(processSession);
+    expect(end[0].d.pathname).toBe("/api/orders/12345");
+    expect(end[0].d.statusCode).toBe(500);
+    for (const event of [...start, ...end]) {
+      expect(event.d.correlation).toMatchObject({
+        status: "process-session",
+        sessionIdSource: "process",
+      });
+    }
+    expect(requestPostSessions(posts)).toEqual(
+      requestPostSessions(posts).map(() => processSession),
+    );
+  });
+
+  it("still emits nothing for an uncorrelated request when no process session exists", async () => {
+    const { posts, fetchImpl } = fakeIngest();
+    // Capture installed, then stopped: the http patch is gone and so is the
+    // process session, so an uncorrelated request has nowhere to land.
+    await startCapture(fetchImpl);
+    const handle = capture;
+    capture = undefined;
 
     const server = createServer((_req, res) => res.end("ok"));
     servers.push(server);
     const port = await listen(server);
 
+    const install = installHttpRequestCapture({
+      emit: (event) => {
+        void sendBackendEvent({
+          event,
+          sessionId:
+            typeof event.sessionId === "string" ? event.sessionId : undefined,
+          endpoint: ENDPOINT,
+          fetch: fetchImpl as never,
+        });
+      },
+    });
+    handle?.stop();
+
     await fetch(`http://127.0.0.1:${port}/healthz`).then((r) => r.text());
     await flushBackendEvents();
+    install.stop();
 
     expect(eventsOfKind(posts, "backend.req.")).toHaveLength(0);
   });
@@ -285,6 +346,71 @@ describe("inbound request capture on a stock autoCapture install", () => {
     expect(end[0].sessionId).toBe(SESSION);
     expect(end[0].d.route).toBe("/orders");
     expect(end[0].d.statusCode).toBe(200);
+  });
+
+  it("records the wizard's express middleware on a backend with no browser", async () => {
+    // S7-2: two real 500s on a wizard-wired express API produced only
+    // "no usable session ID was available" on stderr. The middleware knew the
+    // matched route and the thrown error and dropped both, while the route-less
+    // crash event survived — the product's promise inverted.
+    const { posts, fetchImpl } = fakeIngest();
+    await startCapture(fetchImpl);
+
+    const app = express();
+    app.use(
+      createCrumbtrailExpressMiddleware({
+        endpoint: ENDPOINT,
+        authToken: "ctkey_test",
+        fetch: fetchImpl as never,
+        captureLogs: false,
+        captureRuntimeWarnings: false,
+      }),
+    );
+    app.get("/api/orders/:id", () => {
+      throw new Error("orders lookup failed");
+    });
+    app.use(
+      createCrumbtrailExpressErrorMiddleware({
+        endpoint: ENDPOINT,
+        authToken: "ctkey_test",
+        fetch: fetchImpl as never,
+      }),
+    );
+
+    const server = app.listen(0, "127.0.0.1") as unknown as Server;
+    servers.push(server);
+    await new Promise((resolve) => server.once("listening", resolve));
+    const port = (server.address() as AddressInfo).port;
+
+    // No correlation headers: there is no browser in this picture at all.
+    const response = await fetch(`http://127.0.0.1:${port}/api/orders/12345`);
+    expect(response.status).toBe(500);
+    await response.text();
+    await flushBackendEvents();
+
+    const processSession = capture?.sessionId;
+    const start = eventsOfKind(posts, "backend.req.start");
+    const end = eventsOfKind(posts, "backend.req.end");
+    const errors = eventsOfKind(posts, "backend.req.error");
+
+    // Exactly one recorder reported: the middleware's claim still keeps the
+    // http capture from reporting the same request a second time.
+    expect(start).toHaveLength(1);
+    expect(end).toHaveLength(1);
+    expect(errors).toHaveLength(1);
+
+    expect(end[0].sessionId).toBe(processSession);
+    expect(end[0].d.route).toBe("/api/orders/:id");
+    expect(end[0].d.statusCode).toBe(500);
+    expect(errors[0].sessionId).toBe(processSession);
+    expect(errors[0].d.route).toBe("/api/orders/:id");
+    expect(end[0].d.correlation).toMatchObject({
+      status: "process-session",
+      sessionIdSource: "process",
+    });
+    // Both events belong to one request, so a reader joins them.
+    expect(end[0].d.requestId).toBe(start[0].d.requestId);
+    expect(errors[0].d.requestId).toBe(start[0].d.requestId);
   });
 
   it("leaves node:http untouched when the capture is stopped", async () => {

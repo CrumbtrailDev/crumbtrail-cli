@@ -8,6 +8,7 @@ import {
   isBuildOutputPath,
   isProcessWrapperSource,
   localFsReader,
+  nodeEntryCandidatePaths,
   parseNodeInvocation,
 } from "../detect";
 // memoryReader is test-only and deliberately absent from the public barrel.
@@ -1129,5 +1130,105 @@ describe("a process wrapper is never an injection target", () => {
     expect(r.reasons.join("\n")).toMatch(
       /This entry is a process wrapper: .*spawns the real command/,
     );
+  });
+});
+
+// Defect class: a project whose framework is already known from its dependencies
+// still punted to ~90 lines of manual instructions whenever package.json named
+// no entry at all — the shape of every Docker CMD app, Procfile app, monorepo
+// child package, and Express tutorial.
+describe("a known framework resolves its conventional entry without a manifest pointer", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    while (roots.length) cleanup(roots.pop()!);
+  });
+  const tmp = (files: Record<string, string>) => {
+    const r = makeTmpRepo(files);
+    roots.push(r);
+    return r;
+  };
+
+  const APP = [
+    'const express = require("express");',
+    "const app = express();",
+    "app.listen(3000);",
+  ].join("\n");
+  const barePkg = JSON.stringify({
+    name: "api",
+    version: "1.0.0",
+    dependencies: { express: "^4.19.2" },
+  });
+
+  it("wires src/server.js when package.json has no main and no scripts", () => {
+    const root = tmp({ "package.json": barePkg, "src/server.js": APP });
+    const r = detect(root);
+    expect(r.recipe).toBe("express");
+    expect(r.entryFile).toBe(path.join(root, "src", "server.js"));
+    expect(r.ambiguous).toBe(false);
+    expect(r.reasons.join("\n")).toMatch(/package.json names no entry/);
+  });
+
+  it("wires an entry beside package.json, the Docker CMD / Procfile shape", () => {
+    const root = tmp({ "package.json": barePkg, "app.js": APP });
+    expect(detect(root).entryFile).toBe(path.join(root, "app.js"));
+  });
+
+  it("prefers src/ over the package root when both exist", () => {
+    const root = tmp({
+      "package.json": barePkg,
+      "src/index.js": APP,
+      "index.js": APP,
+    });
+    expect(detect(root).entryFile).toBe(path.join(root, "src", "index.js"));
+  });
+
+  it("does not resurrect a process wrapper the resolver refuses", () => {
+    const wrapper = [
+      'const { spawn } = require("node:child_process");',
+      "const args = process.argv.slice(2);",
+      'spawn(args[0], args.slice(1), { stdio: "inherit" });',
+    ].join("\n");
+    const root = tmp({
+      "package.json": barePkg,
+      "src/index.js": wrapper,
+      "src/server.js": APP,
+    });
+    expect(detect(root).entryFile).toBe(path.join(root, "src", "server.js"));
+  });
+
+  it("does not resurrect build output the resolver refuses", () => {
+    const root = tmp({
+      "package.json": barePkg,
+      "tsconfig.json": JSON.stringify({ compilerOptions: { outDir: "dist" } }),
+      "dist/index.js": "// built",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBe("express");
+    expect(r.entryFile).toBeNull();
+    expect(r.ambiguous).toBe(true);
+    expect(r.reasons.join("\n")).toMatch(/no index\/main\/server\/app source/);
+  });
+
+  // The guard this fallback relaxes exists to stop the bare `node` matcher
+  // claiming any package.json that happens to sit beside a src/index.js. Only a
+  // matcher that already identified the framework may fall back.
+  it("still punts when no framework dependency identified the project", () => {
+    const root = tmp({
+      "package.json": JSON.stringify({ name: "lib", version: "1.0.0" }),
+      "src/index.js": "module.exports = {};",
+    });
+    const r = detect(root);
+    expect(r.recipe).toBeNull();
+    expect(r.entryFile).toBeNull();
+  });
+
+  // The GitHub reader hydrates exactly this list before the resolver runs, and
+  // throws on any path the resolver reads that it did not fetch.
+  it("keeps the hydration manifest in step with what the resolver reads", () => {
+    const paths = nodeEntryCandidatePaths(barePkg);
+    expect(paths).toContain("src/server.js");
+    expect(paths).toContain("server.js");
+    expect(paths).toContain("app.js");
+    expect(paths.every((p) => !p.startsWith("./"))).toBe(true);
   });
 });

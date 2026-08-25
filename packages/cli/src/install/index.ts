@@ -524,9 +524,11 @@ function backendJsPrompt(
     ...nodeInitSnippet(endpoint, expr, serviceName)
       .split("\n")
       .map((line) => `       ${line}`),
-    "     autoCapture hooks http.Server, so it records inbound HTTP requests",
-    "     carrying the browser's correlation headers — those events land in the",
-    "     browser's own session — plus uncaught exceptions, unhandled rejections,",
+    "     autoCapture hooks http.Server, so it records inbound HTTP requests.",
+    "     Requests carrying the browser's correlation headers land in the",
+    "     browser's own session; the rest land in this app's own session, so a",
+    "     backend-only service still reports. It also captures uncaught",
+    "     exceptions, unhandled rejections,",
     "     console.error, and the warnings and errors your logger writes (pino,",
     "     winston, bunyan). It loads the app's .env itself, so the key above is",
     "     set by the time it starts.",
@@ -565,8 +567,10 @@ function backendJsPrompt(
   } else {
     lines.push(
       "  3. The block above is the whole wiring for this stack — add nothing",
-      "     else. autoCapture hooks http.Server, so requests are recorded and",
-      "     joined to the browser's session whichever framework serves them.",
+      "     else. autoCapture hooks http.Server, so requests are recorded",
+      "     whichever framework serves them: joined to the browser's session",
+      "     when its correlation headers arrive, filed under this app's own",
+      "     session when they do not.",
       "  4. Change nothing else, then verify the build still passes.",
     );
   }

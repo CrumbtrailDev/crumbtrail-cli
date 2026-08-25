@@ -479,9 +479,16 @@ Nest adapters and a hand-written `createServer` all end up being, and records
 each correlated request as `backend.req.start` and `backend.req.end` in the
 browser's own session. Status, duration, allowlisted response headers and the
 response body follow the same policy as the Express middleware, under the same
-redaction. A request that carries no session id is not recorded: there is
-nothing to join it to, and a health check must not become egress. A response the
-peer cut short leaves a `capture_gap` rather than disappearing.
+redaction.
+
+A backend with no browser in front of it records its requests too. When a
+request carries no session id, the recorders file it under the session
+`autoCapture` opened for this process, and the event says
+`correlation.sessionIdSource: "process"` so nothing reads it as a join that did
+not happen. Only a request with no session of any kind available, which means
+`autoCapture` is not installed or its handshake has not succeeded, goes
+unrecorded. A response the peer cut short leaves a `capture_gap` rather than
+disappearing.
 
 The Express middleware still earns its place: it knows the matched route and the
 error a handler threw, neither of which is visible at the socket. When both are
