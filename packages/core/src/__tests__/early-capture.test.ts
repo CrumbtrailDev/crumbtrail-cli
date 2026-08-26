@@ -46,6 +46,12 @@ function headersOf(mock: ReturnType<typeof vi.fn>, callIndex = 0): Headers {
   return new Headers();
 }
 
+function dispatchResourceError(target: Element): void {
+  const event = new Event("error");
+  Object.defineProperty(event, "target", { value: target });
+  window.dispatchEvent(event);
+}
+
 /** Lets the floating response-body clone read settle. */
 async function settleBodies(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
@@ -505,6 +511,68 @@ describe("Crumbtrail.init session adoption", () => {
     expect(readEarlyCapture()?.entries).toHaveLength(0);
     expect(readEarlyCapture()?.deferred).toBe(true);
     await logger.stop();
+  });
+
+  it("hands a page-load subresource failure from early capture to init", async () => {
+    const sent: BugEvent[] = [];
+    const clientTransport = transport();
+    clientTransport.sendEvents.mockImplementation(async (events) => {
+      sent.push(...events);
+    });
+
+    installEarlyCapture();
+    const script = document.createElement("script");
+    script.src = "/vendor/before-init.js";
+    dispatchResourceError(script);
+
+    const logger = Crumbtrail.init({
+      transportInstance: clientTransport,
+      sessionPersistence: "memory",
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1000,
+    });
+
+    const laterScript = document.createElement("script");
+    laterScript.src = "/vendor/after-init.js";
+    dispatchResourceError(laterScript);
+    await logger.stop();
+
+    const failures = sent.filter((event) => event.k === "net.err");
+    expect(failures).toHaveLength(2);
+    expect(failures.map((event) => event.d.url)).toEqual([
+      "http://localhost:3000/vendor/before-init.js",
+      "http://localhost:3000/vendor/after-init.js",
+    ]);
+  });
+
+  it("hands an early resource failure to the errors collector when network capture is off", async () => {
+    const sent: BugEvent[] = [];
+    const clientTransport = transport();
+    clientTransport.sendEvents.mockImplementation(async (events) => {
+      sent.push(...events);
+    });
+
+    installEarlyCapture();
+    const stylesheet = document.createElement("link");
+    stylesheet.href = "/styles/before-init.css";
+    dispatchResourceError(stylesheet);
+
+    const logger = Crumbtrail.init({
+      transportInstance: clientTransport,
+      sessionPersistence: "memory",
+      network: false,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1000,
+    });
+    await logger.stop();
+
+    const failures = sent.filter((event) => event.k === "net.err");
+    expect(failures).toHaveLength(1);
+    expect(failures[0].d).toMatchObject({
+      transport: "resource",
+      element: "link",
+      url: "http://localhost:3000/styles/before-init.css",
+    });
   });
 });
 

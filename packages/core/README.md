@@ -85,25 +85,30 @@ of the visit. A page that was already closed and then becomes visible again
 starts a new session. Set `endOnPageHide: false` only when your application
 owns session boundaries and will call `stop()` itself.
 
-### Catching the requests that beat init
+### Capturing page-load failures before init
 
-`init()` usually runs from an async import, so the fetches that render the
-first screen can finish before the network patch exists. Those requests leave
-no `net.req` and, more importantly, no correlation header, so their backend and
-database events cannot be joined to the session later.
+For page-load fetches, XHRs, and browser-managed subresource failures, this
+import is required when `init()` can run after the page starts loading. The
+normal entry still captures events after `init()`, but it cannot recover events
+that happened before its chunk evaluated. Without this import, those early
+events are not captured.
 
-Add one side-effect import above everything else in your entry file:
+Add this side-effect import as the first line of your entry file, above every
+other import:
 
 ```ts
 import "crumbtrail-core/early";
 ```
 
-It patches `fetch` and `XMLHttpRequest` synchronously, stamps the same
-correlation headers the SDK stamps on same origin requests, and parks bounded
-metadata (at most 50 requests, 2 MB of body text) until `init()` drains it
-through the normal redaction pipeline. `init()` adopts the session id it minted,
-so the early requests, the live session, and the backend events all match. If
-`init()` never runs within 60 seconds, the queue is dropped and recording stops.
+It patches `fetch` and `XMLHttpRequest` synchronously, listens for
+capture-phase subresource errors, stamps the same correlation headers the SDK
+stamps on same-origin requests, and parks bounded records in one queue. The
+queue holds at most 50 entries, 2 MB of request and response body text, 32 KB
+per request or response body, and 4 KB of URL text per resource failure. These
+fixed limits apply before configuration is known. The early queue keeps body
+text only in page memory and `init()` drains it through the normal redaction
+pipeline before emission. If `init()` never runs within 60 seconds, the queue
+and early resource listener are dropped and the patches become pass-throughs.
 
 ### Presets
 
