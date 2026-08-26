@@ -970,6 +970,7 @@ export function buildEvidenceCandidates(
   // its ranking, and these read evidence the pipeline already captured but no
   // rule had ever looked at.
   const exchanges = collectRequestExchanges(events);
+  addWriteReadDivergenceCandidates(index, drafts, exchanges);
   addFilterContradictionCandidates(index, drafts, exchanges);
   addResultRowLossCandidates(events, index, drafts, exchanges);
   addUnownedReadCandidates(index, drafts, exchanges);
@@ -7519,6 +7520,191 @@ function soleQuantityOf(value: unknown): number | undefined {
 function isRedactedValue(value: unknown): boolean {
   if (typeof value === "string") return value.trim() === "[REDACTED]";
   return isRedactedPlaceholder(value);
+}
+
+const WRITE_READ_DIVERGENCE_SCORE = 84;
+const MAX_WRITE_READ_DIVERGENCE_CANDIDATES = 20;
+
+function isComparableScalar(value: unknown): boolean {
+  return (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  );
+}
+
+/** A shared id-like scalar is the only identity anchor accepted by this detector. */
+function isWriteReadIdentityField(name: string): boolean {
+  return isIdLikeField(name) || /^uuid$/i.test(name) || /(?:Uuid|UUID)$/.test(name);
+}
+
+function redactedField(event: BugEvent, field: string): boolean {
+  const redaction = event.d.redaction;
+  if (!isRecord(redaction) || !Array.isArray(redaction.fields)) return false;
+  return redaction.fields.some((entry) => {
+    if (!isRecord(entry)) return false;
+    const path = safeText(entry.path, 400);
+    return (
+      path === "body" ||
+      path?.endsWith(`.${field}`) === true ||
+      path?.endsWith(`[${field}]`) === true
+    );
+  });
+}
+
+function renderComparedScalar(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string") {
+    return JSON.stringify(truncate(redactTokenLikeString(value, "network.body").value, 180));
+  }
+  return String(value);
+}
+
+function isPrefixTruncation(written: string, read: string): boolean {
+  if (read.length >= written.length || read.length === 0) return false;
+  return (
+    written.startsWith(read) ||
+    (read.endsWith("\uFFFD") && written.startsWith(read.slice(0, -1)))
+  );
+}
+
+/**
+ * Finds a successful write/read pair using only structured payload identity.
+ * It refuses route, content-type and value-only guesses, ignores fields added
+ * by the server, and treats redacted or capture-truncated values as unknown.
+ */
+function addWriteReadDivergenceCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const ordered = [...exchanges.values()].sort(
+    (a, b) =>
+      (a.res?.t ?? Number.POSITIVE_INFINITY) -
+        (b.res?.t ?? Number.POSITIVE_INFINITY) ||
+      a.requestId.localeCompare(b.requestId),
+  );
+  let emitted = 0;
+
+  for (const write of ordered) {
+    if (emitted >= MAX_WRITE_READ_DIVERGENCE_CANDIDATES) return;
+    if (write.res === undefined || !isSuccessStatus(write.status)) continue;
+    const written = parseStructuredBody(write.body);
+    if (written === undefined) continue;
+    const writtenScopes = collectObjectScopes(written);
+
+    for (const read of ordered) {
+      if (emitted >= MAX_WRITE_READ_DIVERGENCE_CANDIDATES) return;
+      if (
+        read.requestId === write.requestId ||
+        read.res === undefined ||
+        read.res.t <= write.res.t ||
+        !isSuccessStatus(read.status) ||
+        (isRecord(read.resBodyMeta) && read.resBodyMeta.truncated === true)
+      )
+        continue;
+      const response =
+        parseStructuredBody(read.resBody) ??
+        responsePayload(read.resBody, read.resBodyMeta);
+      if (response === undefined) continue;
+      const responseScopes = collectObjectScopes(response);
+
+      for (const writtenScope of writtenScopes) {
+        const identities = Object.entries(writtenScope).filter(
+          ([name, value]) =>
+            isWriteReadIdentityField(name) &&
+            isComparableScalar(value) &&
+            !isRedactedValue(value) &&
+            !redactedField(write.req, name),
+        );
+        if (identities.length === 0) continue;
+        const matches = responseScopes.filter((scope) =>
+          identities.some(
+            ([name, value]) =>
+              isComparableScalar(scope[name]) &&
+              !isRedactedValue(scope[name]) &&
+              !redactedField(read.res!, name) &&
+              scope[name] === value,
+          ),
+        );
+        // Repeated identities are ambiguous, so do not choose a record by position.
+        if (matches.length !== 1) continue;
+        const readScope = matches[0];
+
+        for (const [field, writtenValue] of Object.entries(writtenScope)) {
+          if (
+            !isComparableScalar(writtenValue) ||
+            isRedactedValue(writtenValue) ||
+            redactedField(write.req, field)
+          )
+            continue;
+          if (!(field in readScope)) {
+            if (redactedField(read.res, field)) continue;
+            drafts.push({
+              detector: "write_read_divergence",
+              title: `Write/read divergence on ${field}: wrote ${renderComparedScalar(writtenValue)}, but the later response omitted the field`,
+              severity: "high",
+              score: WRITE_READ_DIVERGENCE_SCORE,
+              confidence: "high",
+              anchor: removeUndefined({
+                t: read.res.t,
+                offsetMs:
+                  offsetForEvent(read.res) ?? offsetFromStart(read.res.t, index.start),
+                route: routeAt(index.navs ?? [], read.res.t),
+                requestId: read.requestId,
+                method: read.method,
+                url: redactUrl(read.url),
+                status: read.status,
+                message: `A successful write supplied ${field}=${renderComparedScalar(writtenValue)}; a later successful response contained the same identity object but omitted that field`,
+              }),
+              dedupeKey: `writeread:${write.requestId}:${read.requestId}:${field}:missing`,
+            });
+            emitted += 1;
+            continue;
+          }
+          const readValue = readScope[field];
+          if (
+            !isComparableScalar(readValue) ||
+            isRedactedValue(readValue) ||
+            redactedField(read.res, field) ||
+            readValue === writtenValue
+          )
+            continue;
+          const writtenText = renderComparedScalar(writtenValue);
+          const readText = renderComparedScalar(readValue);
+          const truncated =
+            typeof writtenValue === "string" &&
+            typeof readValue === "string" &&
+            isPrefixTruncation(writtenValue, readValue);
+          drafts.push({
+            detector: "write_read_divergence",
+            title: truncated
+              ? `Read-back truncation on ${field}: wrote ${writtenText}, but the later response returned the prefix ${readText}`
+              : `Write/read divergence on ${field}: wrote ${writtenText}, but the later response returned ${readText}`,
+            severity: "high",
+            score: WRITE_READ_DIVERGENCE_SCORE,
+            confidence: "high",
+            anchor: removeUndefined({
+              t: read.res.t,
+              offsetMs:
+                offsetForEvent(read.res) ?? offsetFromStart(read.res.t, index.start),
+              route: routeAt(index.navs ?? [], read.res.t),
+              requestId: read.requestId,
+              method: read.method,
+              url: redactUrl(read.url),
+              status: read.status,
+              message: truncated
+                ? `A successful write supplied ${field}=${writtenText}; a later successful response returned ${readText}, a shorter prefix with a replacement character, consistent with byte truncation`
+                : `A successful write supplied ${field}=${writtenText}; a later successful response returned ${readText}`,
+            }),
+            dedupeKey: `writeread:${write.requestId}:${read.requestId}:${field}`,
+          });
+          emitted += 1;
+        }
+      }
+    }
+  }
 }
 
 // ─── filter_contradiction ────────────────────────────────────────────────────
