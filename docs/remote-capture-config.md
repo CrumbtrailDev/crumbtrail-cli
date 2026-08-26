@@ -125,9 +125,41 @@ ignored — the nested object is the only place they are read.
 { "collectors": { "keystrokes": false, "clipboard": false, "campaign": true } }
 ```
 
-A collector turned off by a policy stops producing events from the point the collector is next
-set up. Live start and stop mid-session lands in a later release; until then, a switch flipped
-mid-session takes effect on the next session.
+### When a switch takes effect
+
+A switch flipped mid-session is applied on the poll that carries it, not on the next session.
+
+**Off is always live.** The collector is torn down on that poll: listeners removed, patched
+globals restored, timers cleared. Events already buffered are kept — the switch says what to
+capture from here, not what to forget.
+
+**On is live for every collector but one.**
+
+| Collector | Off mid-session | On mid-session |
+| --- | --- | --- |
+| `console`, `errors`, `interactions`, `keystrokes`, `scroll`, `visibility`, `clipboard`, `cookies`, `storage`, `network`, `heartbeat`, `uiNumbers`, `listeners`, `eventSource`, `webSocket`, `workers`, `environment` | live | live |
+| `performance` | live | next page load |
+| `campaign`, `domSnapshot` | no collector, see below | no collector, see below |
+
+`performance` observes with `buffered: true`, which is what lets it report the navigation and
+paint entries that fired before the SDK initialised. A second instance mid-session would replay
+the whole load timeline the first one already reported, and its final vitals — `inp`, `cls.score`,
+`lcp.final` — were emitted when the first one was torn down. The config value is applied either
+way, so the next page load starts it.
+
+`campaign` and `domSnapshot` are settings rather than collectors. `domSnapshot` is read when a bug
+is flagged, so a change is already live. `campaign` is read by the environment snapshot, which a
+session emits once, so a change reaches the next session's snapshot.
+
+A collector switch is idempotent: a policy answering `console: true` on every poll installs one
+collector, not one per poll.
+
+Turning `environment` off also closes the environment lane for the rest of the session — no
+`setEnv` deltas and no flag snapshot — because a session carrying no `env` event must not carry
+env data under another name. Turning it back on emits a fresh snapshot and reopens the lane.
+
+A collector started mid-session is built from the config as it stands after the poll, so a
+throttle or limit changed on the same poll is the one it runs with.
 
 ## Reference: network limits
 
@@ -159,8 +191,10 @@ Top-level, settable, each a finite number `>= 0`:
 `storageValueMaxLength`, `stateMaxBytes`, `domSnapshotMaxBytes`, `ringBufferMs`,
 `ringBufferMaxEvents`.
 
-`ringBufferMs` and `ringBufferMaxEvents` change the configured values; the live ring buffer keeps
-the size it was constructed with until the next session.
+`ringBufferMs` and `ringBufferMaxEvents` move the live ring buffer on the poll that carries them.
+Lowering either evicts oldest-first at once, so a policy asking for less retention gets it
+immediately rather than as the buffer next fills. Raising either only lifts the ceiling and drops
+nothing.
 
 ## Reference: probes
 
@@ -190,5 +224,7 @@ field.
 document, then confirm the direction: a tighten-only field with a looser value than the app's
 `init()` is applied as a no-op by design.
 
-**A collector switch has no effect until reload.** Expected in this release. See
-[Reference: collector switches](#reference-collector-switches).
+**A collector switch has no effect until reload.** Two cases are by design: turning `performance`
+on, and changing `campaign`. Everything else applies on the poll — check the switch is inside the
+nested `collectors` object rather than at the top level, where it is ignored. See
+[When a switch takes effect](#when-a-switch-takes-effect).
