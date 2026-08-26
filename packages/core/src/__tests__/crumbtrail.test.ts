@@ -4,6 +4,7 @@ import {
   CRUMBTRAIL_REQUEST_HEADER,
   CRUMBTRAIL_REQUEST_ID_MAX_LENGTH,
   CRUMBTRAIL_SESSION_HEADER,
+  CRUMBTRAIL_SDK_VERSION,
   DEFAULT_CONFIG,
 } from "../index";
 
@@ -698,6 +699,47 @@ describe("Crumbtrail", () => {
     const body = JSON.parse(startCalls[0][1].body);
     expect(body.metadata).toHaveProperty("url");
     expect(body.metadata).toHaveProperty("ua");
+
+    await logger.stop();
+  });
+
+  it("startSession payload includes application and SDK identities", async () => {
+    document.head.innerHTML =
+      '<meta name="app-build" content="build-2026.08.26">';
+    const mockTransport = makeMockTransport();
+    const logger = Crumbtrail.init({
+      transportInstance: mockTransport as any,
+      network: false,
+      release: "release-2026.08.26",
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1000,
+    });
+
+    await new Promise((r) => setTimeout(r, 0));
+    const metadata = mockTransport.startSession.mock.calls[0][1];
+    expect(metadata.release).toBe("release-2026.08.26");
+    expect(metadata.build).toBe("build-2026.08.26");
+    expect(metadata.sdkVersion).toBe(CRUMBTRAIL_SDK_VERSION);
+
+    document.head.innerHTML = "";
+    await logger.stop();
+  });
+
+  it("omits unknown application identity from startSession", async () => {
+    document.head.innerHTML = "";
+    const mockTransport = makeMockTransport();
+    const logger = Crumbtrail.init({
+      transportInstance: mockTransport as any,
+      network: false,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1000,
+    });
+
+    await new Promise((r) => setTimeout(r, 0));
+    const metadata = mockTransport.startSession.mock.calls[0][1];
+    expect(metadata).not.toHaveProperty("release");
+    expect(metadata).not.toHaveProperty("build");
+    expect(metadata.sdkVersion).toBe(CRUMBTRAIL_SDK_VERSION);
 
     await logger.stop();
   });

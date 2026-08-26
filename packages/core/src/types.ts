@@ -761,6 +761,8 @@ export interface CrumbtrailConfig {
    * the session simply carries no app label.
    */
   service?: string;
+  /** Application release identifier. Absent means the application release is unknown. */
+  release?: string;
   /** Config poll cadence when `remoteConfig` is on. */
   configPollIntervalMs: number;
 

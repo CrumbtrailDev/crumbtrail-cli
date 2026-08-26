@@ -31,6 +31,7 @@ Crumbtrail.init({
   httpEndpoint: "https://api.crumbtrail.ai",
   httpAuthToken: process.env.CRUMBTRAIL_KEY,
   remoteConfig: true,
+  release: "2026.08.26",
   // Backend origins this app calls. Leave it out only if your API is served
   // from the same origin as the page. See below.
   networkCorrelationAllowedOrigins: ["https://api.example.com"],
@@ -38,6 +39,32 @@ Crumbtrail.init({
 ```
 
 That's the whole integration — capture runs in the background from there.
+
+### Release identity
+
+Pass the application's release identifier as `release` when you have one:
+
+```ts
+Crumbtrail.init({
+  httpEndpoint: "https://api.crumbtrail.ai",
+  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,
+  release: import.meta.env.VITE_APP_VERSION,
+});
+```
+
+The SDK also reads common public `*_APP_VERSION` and `*_APP_BUILD` values from
+`import.meta.env` or `process.env` when a bundler exposes them. When the page
+declares `<meta name="app-build" content="...">`, that value is recorded as
+`build`. An explicit `release` wins over an inferred release. These are
+application values, not the SDK version.
+
+The session-start envelope and the session replay `replay.json` manifest carry
+`release` and `build` when known, plus the distinct `sdkVersion` that wrote
+them. Unknown application identity is omitted rather than guessed. Identity is
+resolved once at `init()` and remains the identity of that loaded page for its
+whole session, including SPA navigations. This records the stale shell's build
+so a later mismatch detector can compare it with a server-declared build. The
+SDK does not implement that detector here.
 
 ### Joining a backend on another origin
 
