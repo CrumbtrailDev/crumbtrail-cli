@@ -134,27 +134,11 @@ const TRACKER_BEACON_CORRELATION_MS = 2_000;
 // first-party 4xx (70) while staying above pure-noise signals, so it is reordered, not hidden.
 const TRACKER_BEACON_SCORE = 15;
 
-// Ceiling score applied to a 4xx the application deliberately returned. Sits below a first-party
-// console warning (50) so a real defect that only warns still outranks a whole session of expected
-// rejections, and above tracker-beacon noise (15) because an expected rejection is at least
-// first-party behavior worth reading. Demoted, never dropped: "login 401s for every user" has to
-// stay findable.
-const HANDLED_CLIENT_ERROR_SCORE = 30;
-
-// An authentication challenge. Answering one is how the protocol works — an unauthenticated
-// visitor polling /api/me gets a 401 on every page load — so it needs no body evidence to count
-// as deliberate. Deliberately excludes 408/429: a timeout or a throttle is a real operational
-// signal, and only a structured body demotes those.
-const UNAUTHENTICATED_STATUS = 401;
-
-// A refusal, which is only routine when the session shows an authentication flow around it.
-// See {@link isHandledClientError}.
-const FORBIDDEN_STATUS = 403;
-
-// Keys whose presence in a JSON response body proves a handler chose this outcome and named it,
-// rather than something failing its way into a 4xx. `type` + `title` covers RFC 9457 problem
-// details. A bare `message` is not enough: unhandled framework errors serialize that way too.
-const STRUCTURED_ERROR_KEYS = ["error", "errors", "code"] as const;
+// A client-error consequence is bounded by the same post-anchor window readers receive for a
+// normal candidate. This is intentionally a consequence window, not a status/path allowlist.
+const CLIENT_ERROR_CONSEQUENCE_WINDOW_MS = 45_000;
+const CLIENT_ERROR_RETRY_WINDOW_MS = 10_000;
+const CLIENT_ERROR_LOOKBACK_WINDOW_MS = 15_000;
 
 // Fetch-level rejection detectors that carry no url of their own, so they must be correlated to a
 // nearby blocked beacon request to be recognised as beacon noise.
@@ -980,9 +964,9 @@ export function buildEvidenceCandidates(
   addStreamDesyncCandidates(events, index, drafts, exchanges);
   addJobOutcomeCandidates(events, index, drafts);
 
-  // Demote the 4xx responses the application returned deliberately (auth challenges, structured
-  // error bodies) before dedupe so their grouped keys collapse. Ranking-only, like the beacon pass.
-  demoteHandledClientErrors(drafts, events);
+  // Remove 4xx responses whose captured consequences are clean before dedupe. They remain in the
+  // raw event stream, but cannot mint a candidate or a canonical issue.
+  removeConsumedClientErrors(drafts, events);
 
   // Downrank known third-party analytics/ads beacon failures before dedupe/ranking so a blocked
   // tracker beacon cannot outrank (or drown) a genuine first-party failure. Ranking-only in spirit:
@@ -2846,46 +2830,33 @@ function gradeDbErrorLinkage(
 }
 
 /**
- * Response bodies by browser network id, so a failed request can be judged
- * against what the server actually said.
+ * Failed requests that had no captured consequence, keyed by browser network id.
+ * Shared by the filtering pass and by error-moment collection: a client error
+ * that the app consumed is not an error a nearby database write should be graded
+ * against.
  */
-function responseBodyByRequestId(events: BugEvent[]): Map<string, unknown> {
-  const out = new Map<string, unknown>();
-  for (const event of events) {
-    if (event.k !== "net.res") continue;
-    const id = requestIdForEvent(event);
-    if (id !== undefined) out.set(id, event.d.body);
-  }
-  // Backend-only exchanges, keyed by the shared correlation id. Added second and
-  // without overwriting: when the browser saw the same response its view wins.
-  for (const event of events) {
-    if (event.k !== "backend.req.end" && event.k !== "backend.req.error")
-      continue;
-    if (event.d.body === undefined) continue;
-    const id = safeText(event.d.requestId, 200);
-    if (id !== undefined && !out.has(id)) out.set(id, event.d.body);
-  }
-  return out;
-}
-
-/**
- * Failed requests that are a deliberate application outcome, keyed by browser
- * network id. Shared by the demotion pass and by error-moment collection: a 4xx
- * the app chose to return is not an error a nearby database write should be
- * graded against.
- */
-function handledClientErrorRequestIds(
+function consumedClientErrorRequestIds(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
 ): Set<string> {
-  const bodies = responseBodyByRequestId(events);
-  const handled = new Set<string>();
+  const consumed = new Set<string>();
   for (const failed of index.failedReqs ?? []) {
     const id = requestIdForValue(failed);
     if (id === undefined) continue;
-    if (isHandledClientError(failed.st, bodies.get(id))) handled.add(id);
+    if (
+      isConsumedClientError(
+        {
+          t: failed.t,
+          status: failed.st,
+          method: failed.m,
+          url: failed.url,
+        },
+        events,
+      )
+    )
+      consumed.add(id);
   }
-  return handled;
+  return consumed;
 }
 
 function collectErrorMoments(
@@ -2893,7 +2864,7 @@ function collectErrorMoments(
   index: EvidenceIndexInput["index"],
 ): ErrorMoment[] {
   const moments: ErrorMoment[] = [];
-  const handled = handledClientErrorRequestIds(events, index);
+  const consumed = consumedClientErrorRequestIds(events, index);
 
   for (const event of events) {
     if (
@@ -2901,9 +2872,19 @@ function collectErrorMoments(
       finiteNumber(event.d.st) !== undefined &&
       (finiteNumber(event.d.st) ?? 0) >= 400
     ) {
-      // A 4xx the application chose to return is an outcome, not a fault, so a
+      // A 4xx with no captured consequence is an outcome, not a fault, so a
       // write that happens to sit beside it is not thereby suspicious.
-      if (isHandledClientError(finiteNumber(event.d.st), event.d.body))
+      if (
+        isConsumedClientError(
+          {
+            t: event.t,
+            status: finiteNumber(event.d.st),
+            method: safeText(event.d.m, 20) ?? safeText(event.d.method, 20),
+            url: safeText(event.d.url, 400),
+          },
+          events,
+        )
+      )
         continue;
       moments.push({ t: event.t, requestId: safeText(event.d.requestId, 120) });
     } else if (event.k === "err" || event.k === "rej") {
@@ -2945,7 +2926,7 @@ function collectErrorMoments(
 
   for (const failed of index.failedReqs ?? []) {
     const id = requestIdForValue(failed);
-    if (id !== undefined && handled.has(id)) continue;
+    if (id !== undefined && consumed.has(id)) continue;
     moments.push({ t: failed.t });
   }
   for (const entry of index.networkErrors ?? []) moments.push({ t: entry.t });
@@ -12595,154 +12576,198 @@ function normalizeErrorSignature(value: unknown): string {
     .trim();
 }
 
-/**
- * Reduces the score/severity of candidates that are (or correlate to) a blocked third-party
- * analytics/ads beacon. Two paths, both conservative:
- *  - Direct: a candidate whose own failing request targets a denylisted tracker host (network_error /
- *    http_error carry the url or request id).
- *  - Correlated: a bare fetch-level rejection (no url of its own) fired within
- *    {@link TRACKER_BEACON_CORRELATION_MS} of a blocked beacon request.
- * Candidates with unknown or first-party targets are left untouched.
- */
-/**
- * True when `body` is a JSON object naming its own failure — the signature of a
- * handler that returned this status on purpose.
- *
- * Parses rather than pattern-matches: a redacted or truncated body, an HTML
- * error page and a framework stack trace all fail to parse, and every one of
- * those is a case where we must NOT claim the outcome was deliberate.
- */
-function bodyNamesItsOwnError(body: unknown): boolean {
-  if (typeof body !== "string") return false;
-  const trimmed = body.trim();
-  if (!trimmed.startsWith("{")) return false;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    return false;
-  }
-  if (!isRecord(parsed)) return false;
-  if (STRUCTURED_ERROR_KEYS.some((key) => parsed[key] !== undefined))
-    return true;
-  // RFC 9457 problem details: the pair is the proof, since `title` alone is a
-  // common field on perfectly ordinary payloads.
-  return parsed.type !== undefined && parsed.title !== undefined;
+/** Context used to judge a client-error response by its captured consequences. */
+interface ClientErrorContext {
+  t: number;
+  status?: number;
+  method?: string;
+  url?: string;
 }
 
-/**
- * Whether a status/body pair is a 4xx the application chose to return.
- *
- * Conservative on purpose. The cost of a false positive here is a real defect
- * demoted out of sight, so an unexplained 4xx — a 404 with no body, a 409 whose
- * body never reached the capture — is left at full weight.
- */
-function isHandledClientError(
-  status: number | undefined,
-  body: unknown,
-  sessionSawAuthChallenge = true,
+function isClientErrorStatus(status: number | undefined): boolean {
+  return status !== undefined && status >= 400 && status <= 499;
+}
+
+function eventMethod(event: BugEvent): string | undefined {
+  return (
+    safeText(event.d.m, 20) ??
+    safeText(event.d.method, 20) ??
+    safeText(event.d.httpMethod, 20)
+  )?.toUpperCase();
+}
+
+function eventTarget(event: BugEvent): string | undefined {
+  return (
+    redactUrl(event.d.url) ??
+    redactUrl(event.d.pathname) ??
+    redactUrl(event.d.route)
+  );
+}
+
+function sameOperation(
+  context: ClientErrorContext,
+  event: BugEvent,
 ): boolean {
-  if (status === undefined || status < 400 || status > 499) return false;
-  if (status === UNAUTHENTICATED_STATUS) return true;
-  // A 403 is only "handled" when the session actually contains an authentication
-  // flow. Without one, the caller was authenticated the whole way and the server
-  // still refused: that is an authorization defect — a permission computed
-  // against the wrong object, a role check reading a stale claim — and demoting
-  // it as a routine challenge is how those disappear from a bundle entirely.
-  if (status === FORBIDDEN_STATUS) return sessionSawAuthChallenge;
-  return bodyNamesItsOwnError(body);
+  const method = context.method?.toUpperCase();
+  const target = context.url;
+  return (
+    method !== undefined &&
+    target !== undefined &&
+    eventMethod(event) === method &&
+    eventTarget(event) === target
+  );
 }
 
-/**
- * Whether the session contains a real authentication challenge.
- *
- * A 401 on either plane is the signal. Its presence makes a sibling 403 an
- * expected part of a sign-in or token-refresh flow; its absence makes a 403 a
- * refusal handed to a caller who never had anything to prove.
- */
-function sessionHasAuthChallenge(events: BugEvent[]): boolean {
-  for (const event of events) {
-    if (event.k === "net.res" && finiteNumber(event.d.st) === UNAUTHENTICATED_STATUS)
-      return true;
-    if (
-      event.k === "backend.req.end" &&
-      finiteNumber(event.d.statusCode) === UNAUTHENTICATED_STATUS
-    )
-      return true;
+function isFailureSurfaceEvent(event: BugEvent): boolean {
+  if (
+    event.k === "err" ||
+    event.k === "rej" ||
+    event.k === "net.err" ||
+    event.k === "backend.req.error" ||
+    event.k === "backend.uncaught" ||
+    event.k === "native-crash"
+  )
+    return true;
+  if (event.k === "con") {
+    return safeText(event.d.lv, 20)?.toLowerCase().startsWith("err") ?? false;
+  }
+  if (event.k === "net.res") {
+    return (finiteNumber(event.d.st) ?? 0) >= 500;
+  }
+  if (event.k === "backend.req.end") {
+    return (finiteNumber(event.d.statusCode) ?? 0) >= 500;
+  }
+  if (event.k === "backend.otel.span") {
+    return (
+      event.d.statusCode === "ERROR" ||
+      (otelHttpStatus(event.d.attributes) ?? 0) >= 500
+    );
+  }
+  if (event.k === "backend.otel.log") {
+    const severityNumber = finiteNumber(event.d.severityNumber);
+    const severityText = safeText(event.d.severityText, 40)?.toUpperCase();
+    return (
+      (severityNumber !== undefined && severityNumber >= 17) ||
+      severityText === "ERROR" ||
+      severityText === "FATAL"
+    );
   }
   return false;
 }
 
 /**
- * Demotes and groups the 4xx responses an application returned deliberately.
+ * A 4xx is consumed when the captured consequence is clean. The rule is
+ * deliberately status-agnostic inside 4xx: no route, body, endpoint, or
+ * application name can make a response routine.
  *
- * Ranking-only, in the same spirit as {@link downrankTrackerBeacons}: severity,
- * confidence, score and the dedupe key change so these sort beneath real
- * defects and collapse by route, but no candidate is removed.
+ * Required negative evidence:
+ * - no later surfaced failure or server failure in the candidate window
+ * - no repeat of the same operation, which is the observable retry signal
  *
- * Runs over both planes. The frontend view carries the response body, which is
- * the evidence; the backend `backend.req.end` event carries only a status code,
- * so a backend 4xx is demoted either on its own auth-challenge status or by
- * sharing a correlation id with a frontend response already judged handled.
- * Without that join one expected rejection keeps producing two rows.
+ * The capture has no source-level branch event, so treating a completed
+ * response with no adverse consequence as consumed is the only generic
+ * decision available. A session that ends immediately after it is still not
+ * evidence that a person saw a defect.
  */
-function demoteHandledClientErrors(
+function isConsumedClientError(
+  context: ClientErrorContext,
+  events: BugEvent[],
+): boolean {
+  if (!isClientErrorStatus(context.status)) return false;
+  const end = context.t + CLIENT_ERROR_CONSEQUENCE_WINDOW_MS;
+  for (const event of events) {
+    if (event.t < context.t || event.t > end) continue;
+    if (isFailureSurfaceEvent(event)) return false;
+    if (
+      event.t > context.t &&
+      event.t <= context.t + CLIENT_ERROR_RETRY_WINDOW_MS &&
+      (event.k === "net.req" || event.k === "backend.req.start") &&
+      sameOperation(context, event)
+    )
+      return false;
+  }
+  return true;
+}
+
+function isClientErrorDraft(draft: CandidateDraft): boolean {
+  return (
+    (draft.detector === "http_error" ||
+      draft.detector === "backend_http_client_error") &&
+    isClientErrorStatus(draft.anchor.status)
+  );
+}
+
+function sameClientErrorOperation(
+  left: CandidateDraft,
+  right: CandidateDraft,
+): boolean {
+  return (
+    left.anchor.method !== undefined &&
+    left.anchor.method === right.anchor.method &&
+    (left.anchor.url ?? left.anchor.route) !== undefined &&
+    (left.anchor.url ?? left.anchor.route) ===
+      (right.anchor.url ?? right.anchor.route)
+  );
+}
+
+function isWithinClientErrorWindow(t: number, anchor: number): boolean {
+  return (
+    t >= anchor - CLIENT_ERROR_LOOKBACK_WINDOW_MS &&
+    t <= anchor + CLIENT_ERROR_CONSEQUENCE_WINDOW_MS
+  );
+}
+
+/**
+ * Remove consumed client errors before dedupe so they cannot mint a candidate
+ * or a canonical issue. A non-client detector in the same consequence window
+ * is treated as a consequence and keeps the 4xx visible. This is conservative:
+ * a separate detector may be unrelated, but hiding a 4xx after the session has
+ * already shown a failure is the more damaging error.
+ */
+function removeConsumedClientErrors(
   drafts: CandidateDraft[],
   events: BugEvent[],
 ): void {
-  // Shared correlation ids (net.res `d.requestId`, not the browser-local `d.id`)
-  // whose frontend response was judged handled.
-  const handledSharedIds = new Set<string>();
-  const sawAuthChallenge = sessionHasAuthChallenge(events);
-  const bodyByBrowserId = responseBodyByRequestId(events);
-  const sharedIdByBrowserId = new Map<string, string>();
-  for (const event of events) {
-    if (event.k !== "net.res") continue;
-    const browserId = requestIdForEvent(event);
-    if (browserId === undefined) continue;
-    const sharedId = safeText(event.d.requestId, 120);
-    if (sharedId) sharedIdByBrowserId.set(browserId, sharedId);
-  }
-
-  const demote = (draft: CandidateDraft, groupKey: string): void => {
-    draft.severity = "low";
-    draft.confidence = "low";
-    draft.score = Math.min(draft.score, HANDLED_CLIENT_ERROR_SCORE);
-    draft.dedupeKey = groupKey;
-  };
-
+  const kept: CandidateDraft[] = [];
   for (const draft of drafts) {
-    if (draft.detector !== "http_error") continue;
-    const browserId = draft.anchor.requestId;
-    const body = browserId ? bodyByBrowserId.get(browserId) : undefined;
-    if (!isHandledClientError(draft.anchor.status, body, sawAuthChallenge))
+    if (!isClientErrorDraft(draft)) {
+      kept.push(draft);
       continue;
-    if (browserId) {
-      const sharedId = sharedIdByBrowserId.get(browserId);
-      if (sharedId) handledSharedIds.add(sharedId);
     }
-    // Group by what the outcome IS — method, target, status — dropping the
-    // per-attempt request id that kept four identical rejections apart.
-    demote(
-      draft,
-      `handled4xx:${draft.anchor.method ?? ""}:${draft.anchor.url ?? ""}:${draft.anchor.status ?? ""}`,
-    );
-  }
 
-  for (const draft of drafts) {
-    if (draft.detector !== "backend_http_client_error") continue;
-    const sharedId = draft.anchor.requestId;
-    const status = draft.anchor.status ?? 0;
-    const handled =
-      status === UNAUTHENTICATED_STATUS ||
-      (status === FORBIDDEN_STATUS && sawAuthChallenge) ||
-      (sharedId !== undefined && handledSharedIds.has(sharedId));
-    if (!handled) continue;
-    demote(
-      draft,
-      `handled4xx:backend:${draft.anchor.method ?? ""}:${draft.anchor.route ?? ""}:${draft.anchor.status ?? ""}`,
+    const context: ClientErrorContext = {
+      t: draft.anchor.t,
+      status: draft.anchor.status,
+      method: draft.anchor.method,
+      url: draft.anchor.url ?? draft.anchor.route,
+    };
+    const otherDetectorFired = drafts.some(
+      (other) =>
+        other !== draft &&
+        !isClientErrorDraft(other) &&
+        isWithinClientErrorWindow(other.anchor.t, draft.anchor.t),
     );
+    const operationRetried = drafts.some(
+      (other) =>
+        other !== draft &&
+        isClientErrorDraft(other) &&
+        sameClientErrorOperation(draft, other) &&
+        Math.abs(other.anchor.t - draft.anchor.t) <=
+          CLIENT_ERROR_RETRY_WINDOW_MS,
+    );
+    if (
+      isConsumedClientError(context, events) &&
+      !otherDetectorFired &&
+      !operationRetried
+    )
+      continue;
+
+    // Preserve one counted finding for an operation that had a consequence. The
+    // request id distinguishes attempts for evidence, not separate defects.
+    draft.dedupeKey = `client4xx:${draft.detector}:${draft.anchor.method ?? ""}:${draft.anchor.url ?? draft.anchor.route ?? ""}:${draft.anchor.status ?? ""}`;
+    kept.push(draft);
   }
+  drafts.splice(0, drafts.length, ...kept);
 }
 
 // ─── acknowledged_write_never_landed ─────────────────────────────────────────
