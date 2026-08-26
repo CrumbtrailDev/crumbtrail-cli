@@ -264,6 +264,25 @@ const REMOTE_COLLECTOR_KEYS = [
 type RemoteCollectorKey = (typeof REMOTE_COLLECTOR_KEYS)[number];
 
 /**
+ * Collectors a switch can stop mid-session but cannot start again.
+ *
+ * Every collector in {@link COLLECTOR_MAP} tears down on demand, so OFF is always live. Starting
+ * again is the narrower claim, and one collector cannot make it:
+ *
+ * - `performance` observes with `buffered: true`, which is load bearing for the navigation and
+ *   paint entries that fired before init. A second instance therefore replays the whole load
+ *   timeline the first one already emitted, and its vitals finalizers (`inp`, `cls.score`,
+ *   `lcp.final`) ran at teardown, so a restart would rest a second, partial set of final scores
+ *   over the real ones. Turning it back on waits for the next page load, where those readings
+ *   are true again.
+ *
+ * A key in this set still stops immediately; only the ON edge is deferred.
+ */
+export const OFF_ONLY_COLLECTORS: ReadonlySet<string> = new Set([
+  "performance",
+]);
+
+/**
  * The local values a remote policy is allowed to tighten but never loosen, snapshotted at
  * `init()`. Held separately from the live config because the live config is what a poll writes
  * to: comparing a second poll against an already-tightened value would let a sequence of polls
@@ -334,10 +353,20 @@ export class Crumbtrail {
   private config: CrumbtrailConfig;
   private readonly localCaptureFloor: LocalCaptureFloor;
   /**
-   * Collector switches the last poll changed. Phase 2 reads this to start and stop collectors
-   * mid-session; phase 1 only records it, so a switch takes effect on the next session.
+   * Collector switches the last poll changed. Read by
+   * {@link Crumbtrail.applyRemoteCollectorChanges} to start and stop collectors mid-session.
    */
   private remoteCollectorChanges: RemoteCollectorKey[] = [];
+  /**
+   * Teardown for each {@link COLLECTOR_MAP} collector currently installed, keyed by its config
+   * name. Held apart from `cleanups` — which is one flat list torn down only at `stop()` —
+   * because a policy switch has to reach exactly one collector's teardown and leave the rest
+   * running. Presence in this map is also what makes a start idempotent: a collector already in
+   * it is never installed a second time.
+   */
+  private collectorTeardowns = new Map<string, CollectorCleanup>();
+  /** The context handed to collectors at init, kept so a later start hands over the same one. */
+  private collectorContext?: CollectorContext;
   private sessionId: string;
   private widgetCleanup?: () => void;
   private stateProviders = new Map<string, () => unknown>();
@@ -678,14 +707,14 @@ export class Crumbtrail {
       whenCaptureAdmitted: (settle) => instance.whenCaptureAdmitted(settle),
     };
 
+    instance.collectorContext = collectorContext;
+
     instance.configureAutoFlagController();
     instance.startSessionIfAllowed();
     instance.emitSamplingGapIfNeeded();
 
-    for (const [key, collector] of Object.entries(COLLECTOR_MAP)) {
-      if (config[key as keyof CrumbtrailConfig]) {
-        instance.cleanups.push(collector(bus, config, collectorContext));
-      }
+    for (const key of Object.keys(COLLECTOR_MAP)) {
+      if (config[key as keyof CrumbtrailConfig]) instance.installCollector(key);
     }
 
     // Mount widget if enabled
@@ -1060,6 +1089,8 @@ export class Crumbtrail {
   private applyRemoteConfig(settings: Record<string, unknown>): void {
     const oldSampleRate = this.config.captureSampleRate;
     const oldBaselineSampleRate = this.config.baselineSampleRate;
+    const oldRingBufferMs = this.config.ringBufferMs;
+    const oldRingBufferMaxEvents = this.config.ringBufferMaxEvents;
     let shouldReconfigureAutoFlag = false;
 
     for (const key of REMOTE_CONFIG_KEYS) {
@@ -1083,6 +1114,7 @@ export class Crumbtrail {
       this.config,
       settings,
     );
+    this.applyRemoteCollectorChanges();
     applyRemoteNetworkLimits(this.config, settings, this.localCaptureFloor);
     applyRemoteRedaction(this.config, settings, this.localCaptureFloor);
 
@@ -1105,6 +1137,22 @@ export class Crumbtrail {
     )
       this.replayMasking = settings.replayMasking;
 
+    // Ring buffer retention is the window a flagged bug is cut from, so a policy that lowers it
+    // has to reach the live buffer rather than the next session's. `setBounds` evicts on the
+    // spot, which is the point: the events a shrink drops are the ones the policy just said are
+    // no longer worth holding. The bus cap tracks `ringBufferMaxEvents` the same way it does at
+    // init, so a paused bus and the buffer behind it agree on one ceiling.
+    if (
+      oldRingBufferMs !== this.config.ringBufferMs ||
+      oldRingBufferMaxEvents !== this.config.ringBufferMaxEvents
+    ) {
+      this.ringBuffer.setBounds({
+        maxMs: this.config.ringBufferMs,
+        maxEvents: this.config.ringBufferMaxEvents,
+      });
+      this.bus.setMaxBufferedEvents(this.config.ringBufferMaxEvents);
+    }
+
     if (
       oldSampleRate !== this.config.captureSampleRate ||
       oldBaselineSampleRate !== this.config.baselineSampleRate
@@ -1122,6 +1170,80 @@ export class Crumbtrail {
       this.canCapture()
     )
       void this.flag({ tags: ["config:trigger"] });
+  }
+
+  /**
+   * Install one {@link COLLECTOR_MAP} collector and keep its teardown.
+   *
+   * Idempotent: a collector already installed is left alone rather than patched a second time.
+   * That is what keeps a policy that flips a switch on every poll — or an integrator toggling by
+   * hand — from stacking listeners, prototype patches and timers one copy per poll.
+   *
+   * Install failures are not caught here: at init a collector that cannot install is the same
+   * error it has always been. The mid-session caller guards its own call, because a poll must
+   * not take the session down over one collector.
+   */
+  private installCollector(key: string): void {
+    if (this.collectorTeardowns.has(key)) return;
+    const collector = COLLECTOR_MAP[key];
+    const context = this.collectorContext;
+    if (!collector || !context) return;
+    this.collectorTeardowns.set(
+      key,
+      collector(this.bus, this.config, context),
+    );
+  }
+
+  /**
+   * Stop one collector and drop its teardown. Already-buffered events are untouched: the switch
+   * says what to capture from here, not what to forget.
+   */
+  private teardownCollector(key: string): void {
+    const teardown = this.collectorTeardowns.get(key);
+    if (!teardown) return;
+    // Deleted before the call so a teardown that throws still leaves the collector gone from
+    // the registry; otherwise `stop()` would run the same failing teardown a second time.
+    this.collectorTeardowns.delete(key);
+    try {
+      teardown();
+    } catch {
+      // One collector failing to tear down must not take the rest of the poll with it, the same
+      // reasoning the shutdown loop runs on.
+    }
+  }
+
+  /**
+   * Start and stop collectors for the switches the last poll moved.
+   *
+   * OFF is live for every collector. ON is live for every collector outside
+   * {@link OFF_ONLY_COLLECTORS} and deferred to the next page load for the ones in it — see that
+   * set for which and why. `campaign` and `domSnapshot` have no collector of their own:
+   * `domSnapshot` is read when a bug is flagged and so is already live, while `campaign` is
+   * read by the environment snapshot, which a session emits once.
+   */
+  private applyRemoteCollectorChanges(): void {
+    // Read, not drained: the field stays the record of what the last poll moved, which is what
+    // `applyRemoteCollectorSwitches` rewrites on every poll anyway.
+    const changed = this.remoteCollectorChanges;
+    if (changed.length === 0 || this.stopped) return;
+    for (const key of changed) {
+      if (!(key in COLLECTOR_MAP)) continue;
+      if (this.config[key] === true) {
+        if (OFF_ONLY_COLLECTORS.has(key)) continue;
+        try {
+          this.installCollector(key);
+        } catch {
+          // A collector that refuses to start mid-session leaves the session as it was.
+        }
+        continue;
+      }
+      this.teardownCollector(key);
+      // The environment collector's own teardown has nothing to undo — its work is one snapshot
+      // at install. The lane it opens is `envEmitted`, which is what lets `setEnv` rest deltas
+      // and a flag rest its snapshot, so clearing that here is what actually turns env capture
+      // off. A later ON re-installs, re-emits the snapshot and sets it again.
+      if (key === "environment") this.envEmitted = false;
+    }
   }
 
   /**
@@ -1957,6 +2079,14 @@ export class Crumbtrail {
         // unguarded loop made all of that hostage to any collector's teardown.
       }
     }
+    // Registry collectors live in their own map so a policy switch can reach exactly one of
+    // them. At shutdown they are the same list, torn down after `cleanups` to keep the order
+    // init installed them in — the performance collector's finalizers still emit from here, so
+    // the severity tap and the flush below must both still be in place.
+    // `teardownCollector` guards each call, for the reason the loop above states, and removes
+    // the key as it goes, so a second stop() cannot run any of them twice.
+    for (const key of [...this.collectorTeardowns.keys()])
+      this.teardownCollector(key);
     // Every cleanup has now run, so the list holds nothing but closures over
     // collector state that the teardown just released. Dropped alongside the
     // ring buffer and the state providers below, and dropped here so a second
@@ -2357,10 +2487,9 @@ function readLocalCaptureFloor(config: CrumbtrailConfig): LocalCaptureFloor {
 /**
  * Apply the collector on/off switches a policy carries, and report which ones changed.
  *
- * Every collector switch routes through here so phase 2 has one place to hook the live
- * start/stop from: the returned keys are exactly the collectors whose effective value moved on
- * this poll. In phase 1 the config value is updated and nothing is started or stopped, so a
- * change takes effect when the collector is next set up.
+ * Every collector switch routes through here so the live start/stop has one place to hook from:
+ * the returned keys are exactly the collectors whose effective value moved on this poll, and
+ * {@link Crumbtrail.applyRemoteCollectorChanges} turns them into teardowns and installs.
  */
 function applyRemoteCollectorSwitches(
   config: CrumbtrailConfig,
