@@ -56,11 +56,88 @@ function redactErrorPayload(
   return d;
 }
 
+const RESOURCE_URL_PROPERTIES: Record<string, readonly string[]> = {
+  script: ["src"],
+  link: ["href"],
+  img: ["currentSrc", "src"],
+  iframe: ["src"],
+  frame: ["src"],
+  audio: ["currentSrc", "src"],
+  video: ["currentSrc", "src"],
+  source: ["src"],
+  track: ["src"],
+  object: ["data"],
+  embed: ["src"],
+  input: ["src"],
+};
+
+interface ResourceFailure {
+  element: string;
+  url: string;
+}
+
+function resourceFailureForTarget(
+  target: EventTarget | null,
+): ResourceFailure | undefined {
+  if (!target || typeof target !== "object") return undefined;
+
+  const element = target as Element & Record<string, unknown>;
+  const tagName =
+    typeof element.tagName === "string" ? element.tagName.toLowerCase() : "";
+  const properties = RESOURCE_URL_PROPERTIES[tagName];
+  if (!properties) return undefined;
+
+  for (const property of properties) {
+    const value = element[property];
+    if (typeof value !== "string" || value.length === 0) continue;
+    try {
+      return {
+        element: tagName,
+        url: new URL(value, document.baseURI).href,
+      };
+    } catch {
+      return { element: tagName, url: value };
+    }
+  }
+
+  const getAttribute = element.getAttribute;
+  if (typeof getAttribute === "function") {
+    for (const attribute of properties) {
+      const value = getAttribute.call(element, attribute);
+      if (!value) continue;
+      try {
+        return {
+          element: tagName,
+          url: new URL(value, document.baseURI).href,
+        };
+      } catch {
+        return { element: tagName, url: value };
+      }
+    }
+  }
+
+  return undefined;
+}
+
 export function errorCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
 ): CollectorCleanup {
   const onError = (event: ErrorEvent) => {
+    const resource = resourceFailureForTarget(event.target);
+    if (resource) {
+      const url = redactUrl(resource.url, "url");
+      const d: Record<string, unknown> = {
+        transport: "resource",
+        element: resource.element,
+        url: url.value,
+        loading: document.readyState === "loading",
+      };
+      attachRedactionMetadata(d, url.metadata);
+      bus.emit({ t: now(), k: "net.err", d });
+      return;
+    }
+
     bus.emit({
       t: now(),
       k: "err",
@@ -146,7 +223,9 @@ export function errorCollector(
     typeof document.addEventListener === "function";
 
   if (windowEvents) {
-    window.addEventListener("error", onError);
+    // Resource errors do not bubble. Capture phase is required to observe the
+    // element target while keeping ordinary window runtime errors on `err`.
+    window.addEventListener("error", onError, true);
     window.addEventListener("unhandledrejection", onRejection);
   }
   if (documentEvents) {
@@ -155,7 +234,7 @@ export function errorCollector(
 
   return () => {
     if (windowEvents) {
-      window.removeEventListener("error", onError);
+      window.removeEventListener("error", onError, true);
       window.removeEventListener("unhandledrejection", onRejection);
     }
     if (documentEvents) {

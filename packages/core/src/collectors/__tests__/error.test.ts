@@ -56,6 +56,43 @@ describe("errorCollector", () => {
     expect(events[0].d.stk).toBeDefined();
   });
 
+  it("captures non-bubbling subresource failures as resource network errors", () => {
+    const image = document.createElement("img");
+    image.src = "/vendor.js?token=secret";
+    image.alt = "inline content must not be captured";
+    document.body.append(image);
+
+    image.dispatchEvent(new Event("error"));
+    bus.flush();
+
+    expect(events).toHaveLength(1);
+    expect(events[0].k).toBe("net.err");
+    expect(events[0].d).toMatchObject({
+      transport: "resource",
+      element: "img",
+      url: "http://localhost:3000/vendor.js?token=[REDACTED]",
+      loading: expect.any(Boolean),
+    });
+    expect(JSON.stringify(events[0])).not.toContain("inline content");
+    expect(events[0].d.redaction).toMatchObject({
+      policy: "crumbtrail.browser-redaction.v1",
+    });
+  });
+
+  it("does not classify runtime errors as resource failures", () => {
+    window.dispatchEvent(
+      new ErrorEvent("error", {
+        message: "runtime failure",
+        error: new Error("runtime failure"),
+      }),
+    );
+    bus.flush();
+
+    expect(events).toHaveLength(1);
+    expect(events[0].k).toBe("err");
+    expect(events[0].d.transport).toBeUndefined();
+  });
+
   it("redacts sensitive window error details by default", () => {
     const error = new Error("password=hunter2");
     error.stack =
