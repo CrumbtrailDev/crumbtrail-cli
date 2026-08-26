@@ -81,7 +81,7 @@ describe("backend event contract helpers", () => {
         requestId: "req_456",
         method: "GET",
         pathname: "/api/widgets",
-        url: `/api/widgets?token=${REDACTED_VALUE}`,
+        url: "/api/widgets?token=[REDACTED;len=6;charset=alpha]",
         correlation: {
           status: "linked",
           sessionIdSource: "header",
@@ -192,7 +192,8 @@ describe("backend event contract helpers", () => {
     });
 
     expect(event.d.url).toBe(
-      `/api/search?q=${REDACTED_VALUE}&access_token=${REDACTED_VALUE}&empty=`,
+      "/api/search?q=[REDACTED;len=7;charset=alpha]" +
+        "&access_token=[REDACTED;len=12;charset=mixed]&empty=",
     );
     expect(event.d.pathname).toBe("/api/search");
     expect(event.d.redaction).toMatchObject({

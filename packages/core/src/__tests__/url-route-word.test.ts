@@ -86,20 +86,24 @@ describe("the redaction marker survives URL serialization unescaped", () => {
 
   it("writes the marker literally in a query value", () => {
     const value = redactUrl("https://api.test/search?q=widget&token=abc").value;
-    expect(value).toContain(`q=${REDACTED_VALUE}`);
-    expect(value).toContain(`token=${REDACTED_VALUE}`);
+    expect(value).toContain("q=[REDACTED;len=6;charset=alpha]");
+    expect(value).toContain("token=[REDACTED;len=3;charset=alpha]");
     expect(value).not.toContain("%5B");
   });
 
   it("writes the marker literally in a relative URL", () => {
     const value = redactUrl("/reset/9f3c1a2b7d4e8a6b5c4d3e2f1a0b9c8d?t=abc")
       .value;
-    expect(value).toBe(`/reset/${REDACTED_VALUE}?t=${REDACTED_VALUE}`);
+    expect(value).toBe(
+      `/reset/${REDACTED_VALUE}?t=[REDACTED;len=3;charset=alpha]`,
+    );
   });
 
   it("writes the marker literally in a scheme-relative URL", () => {
     const value = redactUrl("//api.test/search?token=abc").value;
-    expect(value).toBe(`//api.test/search?token=${REDACTED_VALUE}`);
+    expect(value).toBe(
+      "//api.test/search?token=[REDACTED;len=3;charset=alpha]",
+    );
   });
 
   it("leaves ordinary percent-encoding alone", () => {

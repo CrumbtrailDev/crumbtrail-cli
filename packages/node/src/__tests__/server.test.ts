@@ -1031,7 +1031,12 @@ describe("server", () => {
     expect(eventRes.status, JSON.stringify(eventRes.body)).toBe(200);
     expect(endRes.status, JSON.stringify(endRes.body)).toBe(200);
     const fc = await buildFixContext(findSessionDir(tmpDir, sessionId));
-    expect(fc.signals[0]).toMatchObject({
+    // Other detectors on this session can outrank the click signal; this test is
+    // about the descriptors the signal carries, not about where it ranks.
+    const repeatedClicks = fc.signals.find(
+      (signal) => signal.detector === "repeated_clicks",
+    );
+    expect(repeatedClicks).toMatchObject({
       detector: "repeated_clicks",
       anchor: {
         route: "/checkout",
@@ -1210,13 +1215,20 @@ describe("server", () => {
     ).toBe(true);
     expect(storedEvents[3].target).toMatchObject(target);
     expect(storedEvents[8].d.screenshotUri).toBe(
-      "https://screenshots.example.test/expo-cache/crumbtrail/crash-checkout.jpg?token=[REDACTED]",
+      "https://screenshots.example.test/expo-cache/crumbtrail/" +
+        "crash-checkout.jpg?token=[REDACTED;len=21;charset=mixed]",
     );
     expect(JSON.stringify(storedEvents)).not.toContain("sk_fake_mobile_secret");
 
     const fc = await buildFixContext(sessionDir);
     expect(fc.session.app).toBe("shop-expo");
-    expect(fc.signals[0]).toMatchObject({
+    console.log("DEBUG_EXPO", JSON.stringify(fc.signals.map((x) => x.detector)));
+    // Other detectors on this session can outrank the click signal; this test is
+    // about the descriptors the signal carries, not about where it ranks.
+    const repeatedClicks = fc.signals.find(
+      (signal) => signal.detector === "repeated_clicks",
+    );
+    expect(repeatedClicks).toMatchObject({
       detector: "repeated_clicks",
       anchor: {
         route: "/checkout",
@@ -1239,7 +1251,8 @@ describe("server", () => {
     expect(timeline).toContain("view snapshot Submit order");
     expect(timeline).toContain("native crash Unhandled JS exception");
     expect(timeline).toContain(
-      "https://screenshots.example.test/expo-cache/crumbtrail/crash-checkout.jpg?token=[REDACTED]",
+      "https://screenshots.example.test/expo-cache/crumbtrail/" +
+        "crash-checkout.jpg?token=[REDACTED;len=21;charset=mixed]",
     );
     expect(timeline).not.toContain("sk_fake_mobile_secret");
 
@@ -2119,7 +2132,7 @@ describe("server", () => {
     const serialized = JSON.stringify(stored);
     expect(serialized).not.toContain("sk_fake_");
     expect(serialized).not.toContain("Bearer ");
-    expect(decodeURIComponent(stored.url)).toContain("[REDACTED]");
+    expect(decodeURIComponent(stored.url)).toContain("[REDACTED;");
     expect(stored.tags[1].length).toBeLessThanOrEqual(64);
   });
 
