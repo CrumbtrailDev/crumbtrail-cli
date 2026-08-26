@@ -101,6 +101,8 @@ export const INDEXED_EVENT_KINDS: ReadonlySet<string> = new Set([
   "db.read.bulk",
   "db.error",
   "db.statement",
+  // Rendered validation errors the page showed the user.
+  "ui.error",
   // Browser gauges the layout, arithmetic and listener-leak detectors read.
   "ui.num",
   "ui.layout",
