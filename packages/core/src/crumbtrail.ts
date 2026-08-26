@@ -173,6 +173,30 @@ const MAX_REMOTE_PROBES = 4;
  */
 const MAX_REMOTE_PROBE_ENTRIES = 64;
 
+/**
+ * Entries accepted in a remote string list (`network.excludeUrls`, `redaction.denyFields`).
+ * A longer list is refused whole: these are matched against every request and every field name,
+ * so an unbounded list is per-event work an unauthenticated response body chose for us.
+ */
+const MAX_REMOTE_STRING_LIST_ENTRIES = 256;
+
+/**
+ * Throttles and size limits a remote policy sets outright. No tighten-only rule applies: each one
+ * only decides how much of an event stream is kept, so raising it costs the host application
+ * bandwidth rather than privacy, and the values are already bounded by their own collectors.
+ */
+const REMOTE_THROTTLE_KEYS = [
+  "keystrokeThrottleMs",
+  "scrollThrottleMs",
+  "clipboardMaxLength",
+  "cookieValueMaxLength",
+  "storageValueMaxLength",
+  "stateMaxBytes",
+  "domSnapshotMaxBytes",
+  "ringBufferMs",
+  "ringBufferMaxEvents",
+] as const satisfies ReadonlyArray<keyof CrumbtrailConfig>;
+
 const REMOTE_CONFIG_KEYS = [
   "captureSampleRate",
   "baselineSampleRate",
@@ -202,7 +226,56 @@ const REMOTE_CONFIG_KEYS = [
   "slowRequestWindowMs",
   "abandonedFlowWindowMs",
   "abandonedFlowMinInputs",
+  ...REMOTE_THROTTLE_KEYS,
 ] as const satisfies ReadonlyArray<keyof CrumbtrailConfig>;
+
+/**
+ * Collector switches a remote policy may turn on or off.
+ *
+ * Read from a nested `collectors` object rather than the top level, so a field named after a
+ * collector elsewhere in the response envelope cannot silently turn a collector off.
+ *
+ * `video`, `audio` and `widget` are deliberately absent: media capture and the on-screen widget
+ * are the host application's decision, not a policy dial.
+ */
+const REMOTE_COLLECTOR_KEYS = [
+  "console",
+  "network",
+  "interactions",
+  "keystrokes",
+  "scroll",
+  "visibility",
+  "clipboard",
+  "errors",
+  "performance",
+  "cookies",
+  "storage",
+  "heartbeat",
+  "uiNumbers",
+  "listeners",
+  "eventSource",
+  "webSocket",
+  "workers",
+  "environment",
+  "campaign",
+  "domSnapshot",
+] as const satisfies ReadonlyArray<keyof CrumbtrailConfig>;
+
+type RemoteCollectorKey = (typeof REMOTE_COLLECTOR_KEYS)[number];
+
+/**
+ * The local values a remote policy is allowed to tighten but never loosen, snapshotted at
+ * `init()`. Held separately from the live config because the live config is what a poll writes
+ * to: comparing a second poll against an already-tightened value would let a sequence of polls
+ * ratchet a limit back up one step at a time.
+ */
+interface LocalCaptureFloor {
+  networkMaxBodySize: number;
+  networkExcludeUrls: readonly string[];
+  networkCaptureHeaders: boolean;
+  redactionMode: "structured" | "full";
+  redactionDenyFields: readonly string[];
+}
 
 /**
  * Minimum spacing between severity-triggered flushes. An error storm must not
@@ -259,6 +332,12 @@ export class Crumbtrail {
   private ringBuffer: RingBuffer;
   private cleanups: CollectorCleanup[] = [];
   private config: CrumbtrailConfig;
+  private readonly localCaptureFloor: LocalCaptureFloor;
+  /**
+   * Collector switches the last poll changed. Phase 2 reads this to start and stop collectors
+   * mid-session; phase 1 only records it, so a switch takes effect on the next session.
+   */
+  private remoteCollectorChanges: RemoteCollectorKey[] = [];
   private sessionId: string;
   private widgetCleanup?: () => void;
   private stateProviders = new Map<string, () => unknown>();
@@ -340,6 +419,7 @@ export class Crumbtrail {
     sessionStore?: SessionStore,
   ) {
     this.config = config;
+    this.localCaptureFloor = readLocalCaptureFloor(config);
     this.bus = bus;
     this.transport = transport;
     this.ringBuffer = ringBuffer;
@@ -999,6 +1079,12 @@ export class Crumbtrail {
     applyRemoteSampling(this.config, settings);
     applyRemoteTailDuration(this.config, settings);
     applyRemoteConsentMode(this.config, settings);
+    this.remoteCollectorChanges = applyRemoteCollectorSwitches(
+      this.config,
+      settings,
+    );
+    applyRemoteNetworkLimits(this.config, settings, this.localCaptureFloor);
+    applyRemoteRedaction(this.config, settings, this.localCaptureFloor);
 
     if (typeof settings.killSwitch === "boolean") {
       const changed = this.killSwitch !== settings.killSwitch;
@@ -2258,6 +2344,112 @@ function applyRemoteMaskingMode(
   if (masking?.maskAllInputs === true) config.maskAllInputs = true;
 }
 
+function readLocalCaptureFloor(config: CrumbtrailConfig): LocalCaptureFloor {
+  return {
+    networkMaxBodySize: config.networkMaxBodySize,
+    networkExcludeUrls: [...config.networkExcludeUrls],
+    networkCaptureHeaders: config.networkCaptureHeaders,
+    redactionMode: config.redaction?.mode ?? "structured",
+    redactionDenyFields: [...(config.redaction?.denyFields ?? [])],
+  };
+}
+
+/**
+ * Apply the collector on/off switches a policy carries, and report which ones changed.
+ *
+ * Every collector switch routes through here so phase 2 has one place to hook the live
+ * start/stop from: the returned keys are exactly the collectors whose effective value moved on
+ * this poll. In phase 1 the config value is updated and nothing is started or stopped, so a
+ * change takes effect when the collector is next set up.
+ */
+function applyRemoteCollectorSwitches(
+  config: CrumbtrailConfig,
+  settings: Record<string, unknown>,
+): RemoteCollectorKey[] {
+  const collectors = asRecord(settings.collectors);
+  if (!collectors) return [];
+  const changed: RemoteCollectorKey[] = [];
+  for (const key of REMOTE_COLLECTOR_KEYS) {
+    const value = collectors[key];
+    if (typeof value !== "boolean" || config[key] === value) continue;
+    Object.assign(config, { [key]: value });
+    changed.push(key);
+  }
+  return changed;
+}
+
+/**
+ * Apply the network capture limits a policy carries. Every one of them tightens only:
+ *
+ * - `maxBodySize` may lower the local ceiling, never raise it. A remote policy cannot make an
+ *   application store more of a request body than its own init block agreed to.
+ * - `excludeUrls` are added to the local list. Remote cannot drop a local exclusion, which is
+ *   how an application keeps its own endpoints out of capture regardless of policy.
+ * - `captureHeaders` may only turn header capture off. The config field is a single boolean
+ *   rather than a header allowlist, so "intersect with local" is the boolean AND of the two.
+ */
+function applyRemoteNetworkLimits(
+  config: CrumbtrailConfig,
+  settings: Record<string, unknown>,
+  floor: LocalCaptureFloor,
+): void {
+  const network = asRecord(settings.network);
+  const maxBodySize =
+    readDuration(network?.maxBodySize) ??
+    readDuration(settings.networkMaxBodySize);
+  if (maxBodySize !== undefined)
+    config.networkMaxBodySize = Math.min(maxBodySize, floor.networkMaxBodySize);
+
+  const excludeUrls =
+    readStringList(network?.excludeUrls) ??
+    readStringList(settings.networkExcludeUrls);
+  if (excludeUrls !== undefined)
+    config.networkExcludeUrls = [
+      ...new Set([...floor.networkExcludeUrls, ...excludeUrls]),
+    ];
+
+  const captureHeaders =
+    typeof network?.captureHeaders === "boolean"
+      ? network.captureHeaders
+      : typeof settings.networkCaptureHeaders === "boolean"
+        ? settings.networkCaptureHeaders
+        : undefined;
+  if (captureHeaders !== undefined)
+    config.networkCaptureHeaders =
+      floor.networkCaptureHeaders && captureHeaders;
+}
+
+/**
+ * Apply the redaction policy a policy carries, tighten-only in the same way as
+ * {@link applyRemoteMaskingMode}:
+ *
+ * - `denyFields` are added to the local deny list; a local entry can never be removed.
+ * - `mode` may move `"structured"` to `"full"`, never back. Local `"full"` stays `"full"`.
+ * - `captureInputValues` may only be turned off.
+ * - `keepFields` are ignored outright. A keep exempts a field from the deny rules, so honouring
+ *   one from a remote policy would be a response body widening what an application captures.
+ */
+function applyRemoteRedaction(
+  config: CrumbtrailConfig,
+  settings: Record<string, unknown>,
+  floor: LocalCaptureFloor,
+): void {
+  const redaction = asRecord(settings.redaction);
+  if (!redaction) return;
+
+  const denyFields = readStringList(redaction.denyFields);
+  const mode = readString(redaction.mode);
+  const captureInputValues = redaction.captureInputValues;
+  const next = { ...config.redaction };
+
+  if (denyFields !== undefined)
+    next.denyFields = [...new Set([...floor.redactionDenyFields, ...denyFields])];
+  if (mode === "full" || floor.redactionMode === "full") next.mode = "full";
+  if (captureInputValues === false) next.captureInputValues = false;
+
+  config.redaction = next;
+}
+
 function applyRemoteSampling(
   config: CrumbtrailConfig,
   settings: Record<string, unknown>,
@@ -2399,6 +2591,18 @@ function readString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+/**
+ * A list of non-empty strings, or nothing. One non-string entry refuses the whole field rather
+ * than salvaging the strings around it: a half-read exclusion list is a list that captures more
+ * than the policy asked for.
+ */
+function readStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  if (value.length > MAX_REMOTE_STRING_LIST_ENTRIES) return undefined;
+  if (value.some((entry) => typeof entry !== "string")) return undefined;
+  return (value as string[]).map((entry) => entry.trim()).filter(Boolean);
+}
+
 function readDuration(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? value
@@ -2480,6 +2684,7 @@ function hasRecognizedRemotePolicy(settings: Record<string, unknown>): boolean {
   if (typeof settings.respectGpc === "boolean") return true;
   if (hasRecognizedRemoteMasking(settings)) return true;
   if (hasRecognizedRemoteSampling(settings)) return true;
+  if (hasRecognizedRemoteCaptureSettings(settings)) return true;
   // `probes` is deliberately not one of these. Recognizing a policy is what sets
   // `remotePolicyReady`, which is what unblocks capture, so a response carrying nothing but a
   // probe request must not be able to grant itself the readiness its own results then ride on.
@@ -2511,6 +2716,46 @@ function hasRecognizedRemoteMasking(
       ].includes(mode.toLowerCase())) ||
     masking?.maskAllText === true ||
     masking?.maskAllInputs === true
+  );
+}
+
+/**
+ * Collector switches, network limits, redaction and the plain throttles. Recognized the same way
+ * as the older policy fields: a response carrying one of them is a policy, so it opens the
+ * capture gate rather than leaving the client waiting for the fallback timer.
+ */
+function hasRecognizedRemoteCaptureSettings(
+  settings: Record<string, unknown>,
+): boolean {
+  const collectors = asRecord(settings.collectors);
+  if (
+    collectors &&
+    REMOTE_COLLECTOR_KEYS.some((key) => typeof collectors[key] === "boolean")
+  )
+    return true;
+
+  const network = asRecord(settings.network);
+  if (
+    readDuration(network?.maxBodySize) !== undefined ||
+    readDuration(settings.networkMaxBodySize) !== undefined ||
+    readStringList(network?.excludeUrls) !== undefined ||
+    readStringList(settings.networkExcludeUrls) !== undefined ||
+    typeof network?.captureHeaders === "boolean" ||
+    typeof settings.networkCaptureHeaders === "boolean"
+  )
+    return true;
+
+  const redaction = asRecord(settings.redaction);
+  if (
+    redaction &&
+    (readStringList(redaction.denyFields) !== undefined ||
+      readString(redaction.mode) !== undefined ||
+      typeof redaction.captureInputValues === "boolean")
+  )
+    return true;
+
+  return REMOTE_THROTTLE_KEYS.some(
+    (key) => isRemoteConfigValue(key, settings[key]) === true,
   );
 }
 
