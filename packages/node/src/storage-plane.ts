@@ -667,6 +667,7 @@ async function buildManifest(
       basis: "heuristic" as const,
       baseScore: candidate.score,
       score: candidate.score,
+      recovery: candidate.recovery,
       anchor: candidate.anchor,
       evidenceWindow: candidate.evidenceWindow,
     })),

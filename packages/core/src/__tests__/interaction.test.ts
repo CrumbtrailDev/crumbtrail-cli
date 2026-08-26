@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventBus } from "../event-bus";
 import type { BugEvent, CrumbtrailConfig } from "../types";
 import { DEFAULT_CONFIG } from "../types";
-import { REDACTED_VALUE } from "../redaction";
 import { maskText } from "../masking";
 import { interactionCollector } from "../collectors/interaction";
 
@@ -150,7 +149,7 @@ describe("interactionCollector redaction", () => {
     );
     expect(initNav?.d).toMatchObject({
       from: "",
-      to: `http://localhost:3000/start?token=${REDACTED_VALUE}`,
+      to: "http://localhost:3000/start?token=[REDACTED;len=6;charset=alpha]",
       toOrigin: "http://localhost:3000",
       frame: expect.objectContaining({
         top: true,
@@ -171,8 +170,8 @@ describe("interactionCollector redaction", () => {
       (event) => event.k === "nav" && event.d.tr === "push",
     );
     expect(pushNav?.d).toMatchObject({
-      from: `http://localhost:3000/start?token=${REDACTED_VALUE}`,
-      to: `http://localhost:3000/checkout?session=${REDACTED_VALUE}`,
+      from: "http://localhost:3000/start?token=[REDACTED;len=6;charset=alpha]",
+      to: "http://localhost:3000/checkout?session=[REDACTED;len=6;charset=alpha]",
       fromOrigin: "http://localhost:3000",
       toOrigin: "http://localhost:3000",
     });
@@ -233,5 +232,4 @@ describe("interactionCollector redaction", () => {
 
     cleanup();
   });
-
 });

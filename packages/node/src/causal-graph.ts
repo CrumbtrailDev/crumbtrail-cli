@@ -1026,6 +1026,8 @@ function nodeKindsForDetector(detector: string): Set<CausalNodeKind> {
     // incident thread - the same failure already paid for by click_target_intercepted.
     case "stale_value_rendered":
     case "displayed_field_mismatch":
+    case "unowned_read":
+    case "write_read_divergence":
       return new Set(["net.res", "net.req"]);
     case "console_error":
       return new Set(["console.error"]);

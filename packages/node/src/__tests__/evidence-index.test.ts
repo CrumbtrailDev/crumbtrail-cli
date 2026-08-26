@@ -217,7 +217,7 @@ describe("evidence-index mixed page evidence artifacts", () => {
     );
     expect(repeatedClick).toMatchObject({
       detector: "repeated_clicks",
-      title: "Repeated clicks on Submit order",
+      title: "Repeated clicks on Submit order had no recorded consequence",
       anchor: {
         route: "/checkout",
         elementLabel: "Submit order",
@@ -599,7 +599,13 @@ describe("evidence-index mixed page evidence artifacts", () => {
       t: 10_000 + index * 10,
       k: "clk",
       offsetMs: index * 10,
-      d: { el: { tag: "BUTTON", txt: `Button ${Math.floor(index / 3)}` } },
+      d: {
+        el: {
+          tag: "BUTTON",
+          sig: `button-${Math.floor(index / 3)}`,
+          txt: `Button ${Math.floor(index / 3)}`,
+        },
+      },
     }));
 
     const candidates = await writeEvidenceIndex({

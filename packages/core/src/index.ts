@@ -1,4 +1,9 @@
 export { Crumbtrail, PROBE_RESULT_EVENT_KIND } from "./crumbtrail";
+export {
+  CRUMBTRAIL_SDK_VERSION,
+  readApplicationReleaseIdentity,
+} from "./release-identity";
+export type { ApplicationReleaseIdentity } from "./release-identity";
 // Exported for `crumbtrail-node`, which reads the same provider flag shapes out
 // of captured `env` events. One rule for what counts as a `{ value, variant }`
 // wrapper, in one place: a second copy had already diverged on non-string
@@ -97,6 +102,7 @@ export {
   DB_STATEMENT_EVENT_KIND,
   CAPTURE_GAP_EVENT_KIND,
   UI_NUM_EVENT_KIND,
+  UI_ERROR_EVENT_KIND,
   UI_LISTENERS_EVENT_KIND,
   UI_LAYOUT_EVENT_KIND,
   DEFAULT_CONFIG,
@@ -129,6 +135,7 @@ export {
   retryStormDetector,
   slowResponseDetector,
   abandonedFlowDetector,
+  renderedErrorDetector,
 } from "./signals";
 export type {
   Signal,

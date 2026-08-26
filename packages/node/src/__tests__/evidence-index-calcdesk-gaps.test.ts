@@ -230,39 +230,32 @@ describe("backend findings name the path, not the route pattern", () => {
   });
 });
 
-describe("403 is a finding unless the session shows an authentication flow (CD-30)", () => {
+describe("client errors are silent when their session consequence is clean", () => {
   const forbidden: BugEvent[] = [
     beReq(1200, "r1", "GET", "/api/reports/1/link/7", 403, "/:id/link/:target"),
   ];
 
-  it("keeps a 403 at full weight when nothing in the session challenged the caller", () => {
+  it("does not special-case a bare 403 into a finding", () => {
     const found = all(forbidden).filter(
       (c) => c.detector === "backend_http_client_error",
     );
-    expect(found).toHaveLength(1);
-    expect(found[0].severity).toBe("medium");
-    expect(found[0].confidence).toBe("high");
+    expect(found).toHaveLength(0);
   });
 
-  it("demotes the same 403 when the session also carries a 401", () => {
-    const events = [
-      beReq(1100, "r0", "GET", "/api/me", 401),
-      ...forbidden,
-    ];
+  it("does not raise sibling client errors just because one also occurred", () => {
+    const events = [beReq(1100, "r0", "GET", "/api/me", 401), ...forbidden];
     const found = all(events).filter(
       (c) =>
         c.detector === "backend_http_client_error" && c.anchor.status === 403,
     );
-    expect(found).toHaveLength(1);
-    expect(found[0].severity).toBe("low");
+    expect(found).toHaveLength(0);
   });
 
-  it("still demotes a bare 401 on its own", () => {
+  it("does not mint a backend issue for a bare 401", () => {
     const events = [beReq(1200, "r1", "GET", "/api/me", 401)];
     const found = all(events).filter(
       (c) => c.detector === "backend_http_client_error",
     );
-    expect(found).toHaveLength(1);
-    expect(found[0].severity).toBe("low");
+    expect(found).toHaveLength(0);
   });
 });

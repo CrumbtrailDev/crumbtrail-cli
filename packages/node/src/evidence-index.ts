@@ -13,10 +13,12 @@ import { redactedNetworkBodySnippet } from "./network-body";
 import { sanitizeSelector } from "./sanitize-selector";
 import {
   attributeCandidates,
+  CAUSAL_MAP_WINDOW_MS,
   namesFailureOnGenericPlane,
 } from "./causal-graph";
 import { defaultSessionStore } from "./session-store";
 import type {
+  CandidateAttribution,
   CausalConfidence,
   CausalGraph,
   ContentionLoss,
@@ -27,6 +29,7 @@ import {
   resolveFrame,
   type SourceMap,
 } from "./source-map";
+import { normalizeUrl } from "./route-normalization";
 
 export const CANDIDATE_SCHEMA_VERSION = 1 as const;
 
@@ -59,6 +62,21 @@ export type SupportGrade =
   | "unattached"
   | "attached"
   | "corroborated";
+
+/**
+ * What a failing operation's later session evidence establishes.
+ *
+ * `unknown` is intentionally different from `not_recovered`: a session that
+ * ends at the failure has not observed enough of the future to make an
+ * absence claim.
+ */
+export type FailureRecovery =
+  | { status: "recovered"; afterMs: number }
+  | { status: "not_recovered" }
+  | {
+      status: "unknown";
+      reason: "session_ended" | "operation_not_identified";
+    };
 
 const MAX_EVIDENCE_CANDIDATES = 200;
 
@@ -134,27 +152,10 @@ const TRACKER_BEACON_CORRELATION_MS = 2_000;
 // first-party 4xx (70) while staying above pure-noise signals, so it is reordered, not hidden.
 const TRACKER_BEACON_SCORE = 15;
 
-// Ceiling score applied to a 4xx the application deliberately returned. Sits below a first-party
-// console warning (50) so a real defect that only warns still outranks a whole session of expected
-// rejections, and above tracker-beacon noise (15) because an expected rejection is at least
-// first-party behavior worth reading. Demoted, never dropped: "login 401s for every user" has to
-// stay findable.
-const HANDLED_CLIENT_ERROR_SCORE = 30;
-
-// An authentication challenge. Answering one is how the protocol works — an unauthenticated
-// visitor polling /api/me gets a 401 on every page load — so it needs no body evidence to count
-// as deliberate. Deliberately excludes 408/429: a timeout or a throttle is a real operational
-// signal, and only a structured body demotes those.
-const UNAUTHENTICATED_STATUS = 401;
-
-// A refusal, which is only routine when the session shows an authentication flow around it.
-// See {@link isHandledClientError}.
-const FORBIDDEN_STATUS = 403;
-
-// Keys whose presence in a JSON response body proves a handler chose this outcome and named it,
-// rather than something failing its way into a 4xx. `type` + `title` covers RFC 9457 problem
-// details. A bare `message` is not enough: unhandled framework errors serialize that way too.
-const STRUCTURED_ERROR_KEYS = ["error", "errors", "code"] as const;
+// A client-error consequence is bounded by the same post-anchor window readers receive for a
+// normal candidate. This is intentionally a consequence window, not a status/path allowlist.
+const CLIENT_ERROR_CONSEQUENCE_WINDOW_MS = 45_000;
+const CLIENT_ERROR_RETRY_WINDOW_MS = 10_000;
 
 // Fetch-level rejection detectors that carry no url of their own, so they must be correlated to a
 // nearby blocked beacon request to be recognised as beacon noise.
@@ -176,6 +177,11 @@ export interface EvidenceIndexInput {
     start?: number;
     end?: number;
     dur?: number;
+    /** Pseudonymous caller identity declared by the session, when available. */
+    identity?: {
+      userId?: string;
+      accountId?: string;
+    };
     failedReqs?: Array<{
       t: number;
       m?: string;
@@ -263,6 +269,8 @@ export interface EvidenceCandidate {
   severity: "critical" | "high" | "medium" | "low";
   score: number;
   confidence: "high" | "medium" | "low";
+  /** Whether a later equivalent operation succeeded. */
+  recovery?: FailureRecovery;
   /**
    * How many drafts collapsed into this candidate, set only when more than one
    * did. Four rejected sign-in attempts and one are the same defect but not the
@@ -339,6 +347,8 @@ export interface EvidenceCandidate {
      * which is what tells a reader which file to open.
      */
     componentStack?: string;
+    /** Existing element signature from d.el, when the capture supplied one. */
+    elementSignature?: string;
     target?: TargetDescriptor;
   };
   /**
@@ -406,6 +416,17 @@ interface RequestInfo {
   url?: string;
   route?: string;
 }
+
+interface OperationObservation {
+  t: number;
+  requestId?: string;
+  method?: string;
+  url?: string;
+  key?: string;
+}
+
+const RECOVERED_FAILURE_SCORE_CEILING = 40;
+const FAILURE_RECOVERY_MATCH_WINDOW_MS = 2_000;
 
 // Every artifact here goes through the SessionStore seam rather than fs directly:
 // these are finalize-time cold-plane files, and an embedder that decorates the
@@ -697,11 +718,18 @@ export function buildEvidenceCandidates(
   index = withNavigationContext(events, index);
   const requestById = collectRequests(events);
   const backendTargets = collectBackendRequestTargets(events);
-  const responseIds = new Set<string>();
+  const outcomeIds = new Set<string>();
   const drafts: CandidateDraft[] = [];
 
   for (const event of events) {
-    if (event.k === "net.res") responseIds.add(String(event.d.id ?? ""));
+    if (event.k === "net.res" || event.k === "net.err") {
+      const id = networkRequestId(event.d.id);
+      if (id) outcomeIds.add(id);
+    }
+  }
+  for (const entry of index.networkErrors ?? []) {
+    const id = networkRequestId(entry.id);
+    if (id) outcomeIds.add(id);
   }
 
   for (const failed of index.failedReqs ?? []) {
@@ -892,9 +920,9 @@ export function buildEvidenceCandidates(
     });
   }
 
-  addRepeatedClickCandidates(events, index, drafts);
+  addRepeatedClickCandidates(events, index, drafts, causalGraph);
   addSlowRequestCandidates(events, index, requestById, drafts);
-  addPendingRequestCandidates(index, requestById, responseIds, drafts);
+  addPendingRequestCandidates(index, requestById, outcomeIds, drafts);
   addResponseRaceCandidates(events, index, requestById, drafts);
   addIneffectiveSubmitCandidates(events, index, drafts);
   addMediaDegradationCandidates(events, index, drafts);
@@ -942,8 +970,10 @@ export function buildEvidenceCandidates(
   // its ranking, and these read evidence the pipeline already captured but no
   // rule had ever looked at.
   const exchanges = collectRequestExchanges(events);
-  addFilterContradictionCandidates(events, index, drafts, exchanges);
+  addWriteReadDivergenceCandidates(index, drafts, exchanges);
+  addFilterContradictionCandidates(index, drafts, exchanges);
   addResultRowLossCandidates(events, index, drafts, exchanges);
+  addUnownedReadCandidates(index, drafts, exchanges);
   addSharedStateBleedCandidates(events, index, drafts, exchanges);
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
   addBatchImportCandidates(events, index, drafts, exchanges);
@@ -980,9 +1010,19 @@ export function buildEvidenceCandidates(
   addStreamDesyncCandidates(events, index, drafts, exchanges);
   addJobOutcomeCandidates(events, index, drafts);
 
-  // Demote the 4xx responses the application returned deliberately (auth challenges, structured
-  // error bodies) before dedupe so their grouped keys collapse. Ranking-only, like the beacon pass.
-  demoteHandledClientErrors(drafts, events);
+  // Recovery is a property of the observed operation, not of one detector. Match every
+  // failure-shaped candidate to the operation it names, so HTTP, transport, backend, and
+  // future request failure detectors all receive the same three-state result.
+  attachFailureRecovery(drafts, events, index, requestById);
+
+  // Remove 4xx responses whose captured consequences are clean before dedupe. They remain in the
+  // raw event stream, but cannot mint a candidate or a canonical issue.
+  removeConsumedClientErrors(
+    drafts,
+    events,
+    causalGraph,
+    causalAttributionForDrafts(drafts, causalGraph),
+  );
 
   // Downrank known third-party analytics/ads beacon failures before dedupe/ranking so a blocked
   // tracker beacon cannot outrank (or drown) a genuine first-party failure. Ranking-only in spirit:
@@ -1058,6 +1098,7 @@ export function buildEvidenceCandidates(
       severity: draft.severity,
       score: draft.score,
       confidence: draft.confidence,
+      ...(draft.recovery !== undefined ? { recovery: draft.recovery } : {}),
       // Emitted unconditionally, unlike the optional causal fields below: "not-assessed" is a real
       // answer and omitting it would leave a reader unable to tell an ungraded candidate from one
       // this SDK never graded. DERIVED here and nowhere else — no draft carries a `support`.
@@ -1232,54 +1273,63 @@ function threadWeight(
   );
 }
 
+function causalAttributionForDrafts(
+  drafts: CandidateDraft[],
+  causalGraph?: CausalGraph,
+): Map<string, CandidateAttribution> | undefined {
+  if (!causalGraph || causalGraph.nodes.length === 0) return undefined;
+  const detectorByKey = new Map<string, string>();
+  for (const draft of drafts)
+    detectorByKey.set(draft.dedupeKey, draft.detector);
+  return attributeCandidates(
+    causalGraph,
+    drafts.map((draft) => ({
+      id: draft.dedupeKey,
+      anchor: {
+        t: draft.anchor.t,
+        requestId: draft.anchor.requestId,
+        route: draft.anchor.route,
+        source: draft.anchor.source,
+        table: draft.anchor.table,
+        method: draft.anchor.method,
+        url: draft.anchor.url,
+      },
+    })),
+    (id) => detectorByKey.get(id),
+  );
+}
+
+function applyCausalAttribution(
+  ordered: CandidateDraft[],
+  attribution: Map<string, CandidateAttribution> | undefined,
+): void {
+  if (!attribution) return;
+  for (const draft of ordered) {
+    const attr = attribution.get(draft.dedupeKey);
+    if (!attr) continue;
+    draft.causalRole = attr.causalRole;
+    if (attr.rootCauseId !== undefined) draft.rootCauseId = attr.rootCauseId;
+    if (attr.causes !== undefined) draft.causes = attr.causes;
+    if (attr.attributionConfidence !== undefined)
+      draft.attributionConfidence = attr.attributionConfidence;
+    // Copied field by field like everything above it, so a new attribution
+    // field is inert until it is listed HERE. That is why these two lines
+    // exist: without them the contention record is born invisible and the
+    // product still cannot say why a candidate is isolated.
+    if (attr.isolationCause !== undefined)
+      draft.isolationCause = attr.isolationCause;
+    if (attr.contention !== undefined) draft.contention = attr.contention;
+  }
+}
+
 function applyCausalRerank(
   ordered: CandidateDraft[],
   causalGraph?: CausalGraph,
 ): void {
-  if (causalGraph && causalGraph.nodes.length > 0) {
-    const detectorByKey = new Map<string, string>();
-    for (const draft of ordered)
-      detectorByKey.set(draft.dedupeKey, draft.detector);
-
-    const attribution = attributeCandidates(
-      causalGraph,
-      ordered.map((draft) => ({
-        id: draft.dedupeKey,
-        anchor: {
-          t: draft.anchor.t,
-          requestId: draft.anchor.requestId,
-          route: draft.anchor.route,
-          // Plane-identifying fields, forwarded verbatim so `attributeCandidates` can DERIVE a
-          // detector's node family from the evidence it anchored on instead of looking the
-          // detector's name up in a table that has to be remembered. See `derivedNodeKinds`.
-          // Nothing new is computed here and nothing is re-derived: these are the same values the
-          // detector wrote when it pushed its draft.
-          source: draft.anchor.source,
-          table: draft.anchor.table,
-          method: draft.anchor.method,
-          url: draft.anchor.url,
-        },
-      })),
-      (id) => detectorByKey.get(id),
-    );
-
-    for (const draft of ordered) {
-      const attr = attribution.get(draft.dedupeKey);
-      if (!attr) continue;
-      draft.causalRole = attr.causalRole;
-      if (attr.rootCauseId !== undefined) draft.rootCauseId = attr.rootCauseId;
-      if (attr.causes !== undefined) draft.causes = attr.causes;
-      if (attr.attributionConfidence !== undefined)
-        draft.attributionConfidence = attr.attributionConfidence;
-      // Copied field by field like everything above it, so a new attribution
-      // field is inert until it is listed HERE. That is why these two lines
-      // exist: without them the contention record is born invisible and the
-      // product still cannot say why a candidate is isolated.
-      if (attr.isolationCause !== undefined)
-        draft.isolationCause = attr.isolationCause;
-      if (attr.contention !== undefined) draft.contention = attr.contention;
-    }
-  }
+  applyCausalAttribution(
+    ordered,
+    causalAttributionForDrafts(ordered, causalGraph),
+  );
 
   const byKey = new Map<string, CandidateDraft>(
     ordered.map((draft) => [draft.dedupeKey, draft]),
@@ -1455,53 +1505,245 @@ function applyCausalRerank(
   else ordered.sort(byRank);
 }
 
+const REPEATED_CLICK_COUNT = 3;
+const REPEATED_CLICK_WINDOW_MS = 3_000;
+const REPEATED_CLICK_QUIET_WINDOW_MS = 3_000;
+
+interface ClickTargetIdentity {
+  key: string;
+  signature?: string;
+}
+
+/**
+ * The stable identity already captured for an interaction. `d.el.sig` is the
+ * key written to signatures.json. A structural path is the next safest
+ * legacy value. Native target descriptors use only their stable identity
+ * fields, never bounds or a generated id.
+ */
+function clickTargetIdentity(event: BugEvent): ClickTargetIdentity | undefined {
+  const el = isRecord(event.d.el) ? event.d.el : undefined;
+  const signature = safeText(el?.sig, 400);
+  if (signature) return { key: `sig:${signature}`, signature };
+
+  const elementPath = safeText(el?.path, 400);
+  if (elementPath) return { key: `path:${elementPath}` };
+
+  const target = targetForEvent(event);
+  if (!target) return undefined;
+
+  const identityFields = ["testID", "accessibilityId", "ancestryHash"] as const;
+  const identity = identityFields
+    .map((field) => [field, safeText(target[field], 240)] as const)
+    .filter(([, value]) => value !== undefined);
+  if (identity.length === 0) return undefined;
+
+  return { key: `target:${JSON.stringify(identity)}` };
+}
+
+/**
+ * Evidence that means the repeated activation was not dead. This is
+ * intentionally broader than the detector's headline: an absence-based
+ * signal should yield to any recorded indication that the page or its state
+ * moved, even when that indication has its own detector.
+ */
+function isRepeatedClickConsequenceKind(event: BugEvent): boolean {
+  return (
+    event.k === "nav" ||
+    event.k === "navigation" ||
+    event.k === "net.req" ||
+    event.k === "net.res" ||
+    event.k === "net.err" ||
+    event.k === "net.sse" ||
+    event.k === "net.ws" ||
+    event.k === "inp" ||
+    event.k === "view-snapshot" ||
+    event.k === "snap" ||
+    event.k.startsWith("dom.") ||
+    event.k.startsWith("state.") ||
+    event.k.startsWith("ui.") ||
+    event.k.startsWith("db.") ||
+    event.k.startsWith("backend.req.") ||
+    event.k === "backend.http" ||
+    event.k === "con" ||
+    event.k === "err" ||
+    event.k === "rej" ||
+    event.k === "probe.error"
+  );
+}
+
+function graphRequestIdMatches(
+  nodeRequestId: string | undefined,
+  eventRequestId: string | undefined,
+  graph: CausalGraph,
+): boolean {
+  if (!nodeRequestId || !eventRequestId) return false;
+  return (
+    nodeRequestId === eventRequestId ||
+    graph.requestIdAliases?.[eventRequestId] === nodeRequestId
+  );
+}
+
+function requestNodeForEvent(
+  event: BugEvent,
+  graph: CausalGraph,
+): { id: string; requestId?: string } | undefined {
+  const requestId = requestIdForEvent(event);
+  const browserId = networkRequestId(event.d.id);
+  return graph.nodes.find(
+    (node) =>
+      node.kind === "net.req" &&
+      (node.t === event.t ||
+        graphRequestIdMatches(node.requestId, requestId, graph) ||
+        (browserId !== undefined && node.id.endsWith(`:b=${browserId}`))),
+  );
+}
+
+function requestIdsInitiatedByClicks(
+  clicks: BugEvent[],
+  graph: CausalGraph | undefined,
+): Set<string> | undefined {
+  if (!graph || graph.nodes.length === 0) return undefined;
+  const clickNodeIds = new Set(
+    graph.nodes
+      .filter(
+        (node) =>
+          node.kind === "user.click" &&
+          clicks.some((click) => click.t === node.t),
+      )
+      .map((node) => node.id),
+  );
+  if (clickNodeIds.size === 0) return new Set();
+
+  const requestNodeIds = new Set(
+    graph.edges
+      .filter(
+        (edge) =>
+          edge.kind === "interaction" && clickNodeIds.has(edge.from),
+      )
+      .map((edge) => edge.to),
+  );
+  const initiatedIds = new Set<string>();
+  for (const node of graph.nodes) {
+    if (!requestNodeIds.has(node.id)) continue;
+    initiatedIds.add(node.id);
+    if (node.requestId) initiatedIds.add(node.requestId);
+  }
+  return initiatedIds;
+}
+
+function isRepeatedClickConsequence(
+  event: BugEvent,
+  firstClickT: number,
+  lastClickT: number,
+  quietUntil: number,
+  initiatedRequestIds: Set<string> | undefined,
+  graph: CausalGraph | undefined,
+): boolean {
+  if (event.t < firstClickT || event.t > quietUntil) return false;
+  if (!isRepeatedClickConsequenceKind(event)) return false;
+
+  if (event.k === "net.req" || event.k === "net.res" || event.k === "net.err") {
+    if (initiatedRequestIds === undefined) return true;
+    const requestId = requestIdForEvent(event);
+    if (requestId && initiatedRequestIds.has(requestId)) return true;
+    const requestNode = requestNodeForEvent(event, graph!);
+    return requestNode !== undefined && initiatedRequestIds.has(requestNode.id);
+  }
+
+  if (event.k.startsWith("db.") || event.k.startsWith("backend.req.")) {
+    if (initiatedRequestIds === undefined) return true;
+    const requestId = safeText(event.d.requestId, 120);
+    return requestId !== undefined && initiatedRequestIds.has(requestId);
+  }
+
+  // DOM, state, UI and runtime signals have no stable cross-plane request id.
+  // Their position after the target's activations is the available evidence.
+  return event.t > lastClickT || event.k === "nav" || event.k === "navigation";
+}
+
 function addRepeatedClickCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
+  causalGraph?: CausalGraph,
 ): void {
-  const clicksByLabel = new Map<string, BugEvent[]>();
+  const clicksByTarget = new Map<
+    string,
+    { identity: ClickTargetIdentity; clicks: BugEvent[] }
+  >();
   for (const event of events) {
     if (event.k !== "clk") continue;
-    const label = elementLabel(event) ?? "unknown element";
-    const clicks = clicksByLabel.get(label) ?? [];
-    clicks.push(event);
-    clicksByLabel.set(label, clicks);
+    const identity = clickTargetIdentity(event);
+    if (!identity) continue;
+    const entry = clicksByTarget.get(identity.key) ?? { identity, clicks: [] };
+    entry.clicks.push(event);
+    clicksByTarget.set(identity.key, entry);
   }
 
-  for (const [label, clicks] of clicksByLabel) {
+  for (const { identity, clicks } of clicksByTarget.values()) {
     clicks.sort((a, b) => a.t - b.t);
     let start = 0;
     let end = 0;
     while (start < clicks.length) {
       const first = clicks[start];
-      while (end < clicks.length && clicks[end].t - first.t <= 3_000) end++;
+      while (
+        end < clicks.length &&
+        clicks[end].t - first.t <= REPEATED_CLICK_WINDOW_MS
+      )
+        end++;
       const groupLength = end - start;
-      if (groupLength < 3) {
+      if (groupLength < REPEATED_CLICK_COUNT) {
         start++;
         if (end < start) end = start;
         continue;
       }
+
+      const last = clicks[end - 1];
+      const quietUntil = last.t + REPEATED_CLICK_QUIET_WINDOW_MS;
+      const initiatedRequestIds = requestIdsInitiatedByClicks(
+        clicks.slice(start, end),
+        causalGraph,
+      );
+      const hasConsequence = events.some((event) =>
+        isRepeatedClickConsequence(
+          event,
+          first.t,
+          last.t,
+          quietUntil,
+          initiatedRequestIds,
+          causalGraph,
+        ),
+      );
+      if (hasConsequence) {
+        start = end;
+        continue;
+      }
+
+      const label = elementLabel(first);
       drafts.push({
         detector: "repeated_clicks",
-        title: `Repeated clicks on ${titleElementLabel(first)}`,
-        severity: "medium",
-        score: 55 + Math.min(10, groupLength),
-        confidence: "medium",
+        title: `Repeated clicks on ${titleElementLabel(first)} had no recorded consequence`,
+        severity: "low",
+        score: 45,
+        confidence: "low",
         anchor: removeUndefined({
           t: first.t,
           offsetMs:
             offsetForEvent(first) ?? offsetFromStart(first.t, index.start),
           route: routeAt(index.navs ?? [], first.t),
+          elementSignature: scrubText(identity.signature, 240),
           target: targetForEvent(first),
           elementLabel: scrubText(label, 160),
-          message: `${groupLength} clicks within 3s`,
+          message:
+            `${groupLength} clicks within ${REPEATED_CLICK_WINDOW_MS / 1000}s; ` +
+            `no navigation, request, DOM, or recorded state consequence within ` +
+            `${REPEATED_CLICK_QUIET_WINDOW_MS / 1000}s of the last click`,
         }),
         // The group spans from the first click to the last; the anchor names the first. Without
         // this the finding reads as having ended at its own start, and thread ranking treats a
         // sequence the user was still performing as something they had moved past.
-        lastT: clicks[end - 1].t,
-        dedupeKey: `repeat:${label}:${first.t}`,
+        lastT: last.t,
+        dedupeKey: `repeat:${identity.key}:${first.t}`,
       });
       start = end;
     }
@@ -1551,12 +1793,14 @@ function addSlowRequestCandidates(
 function addPendingRequestCandidates(
   index: EvidenceIndexInput["index"],
   requests: Map<string, RequestInfo>,
-  responseIds: Set<string>,
+  outcomeIds: Set<string>,
   drafts: CandidateDraft[],
 ): void {
   const sessionEnd = finiteNumber(index.end) ?? 0;
   for (const req of requests.values()) {
-    if (responseIds.has(req.id)) continue;
+    // A request with a net.err settled without an HTTP response. It is not pending, and emitting
+    // this candidate beside network_error turns one failed operation into two misleading signals.
+    if (outcomeIds.has(req.id)) continue;
     drafts.push({
       detector: "pending_request",
       title:
@@ -1579,6 +1823,252 @@ function addPendingRequestCandidates(
       dedupeKey: `pending:${req.id}`,
     });
   }
+}
+
+function attachFailureRecovery(
+  drafts: CandidateDraft[],
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  requests: Map<string, RequestInfo>,
+): void {
+  const failures = collectFailureOperations(events, index, requests);
+  const successes = collectSuccessfulOperations(events, index, requests);
+  const sessionEnd = sessionEndOf(events, index);
+
+  for (const draft of drafts) {
+    const failure = failureForDraft(draft, failures);
+    if (!failure) continue;
+    const key = operationKey(failure.method, failure.url);
+    if (!key) {
+      draft.recovery = {
+        status: "unknown",
+        reason: "operation_not_identified",
+      };
+      continue;
+    }
+
+    const recovered = successes
+      .filter((success) => success.key === key && success.t > failure.t)
+      .sort((a, b) => a.t - b.t)[0];
+    if (recovered) {
+      draft.recovery = {
+        status: "recovered",
+        afterMs: Math.max(0, Math.round(recovered.t - failure.t)),
+      };
+      // A failure that demonstrably recovered is still evidence, but should not outrank an
+      // operation that remained broken. This applies to every failure detector using this helper.
+      draft.severity = lowerSeverity(draft.severity);
+      draft.score = Math.min(draft.score, RECOVERED_FAILURE_SCORE_CEILING);
+    } else if (sessionEnd !== undefined && sessionEnd > failure.t) {
+      draft.recovery = { status: "not_recovered" };
+    } else {
+      draft.recovery = { status: "unknown", reason: "session_ended" };
+    }
+  }
+}
+
+function collectFailureOperations(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  requests: Map<string, RequestInfo>,
+): OperationObservation[] {
+  const failures: OperationObservation[] = [];
+  const add = (observation: OperationObservation): void => {
+    failures.push({
+      ...observation,
+      key: operationKey(observation.method, observation.url),
+    });
+  };
+
+  for (const event of events) {
+    if (event.k === "net.err") {
+      const request = requests.get(networkRequestId(event.d.id) ?? "");
+      add({
+        t: event.t,
+        requestId: requestIdForEvent(event),
+        method:
+          safeText(event.d.method, 20) ??
+          safeText(event.d.m, 20) ??
+          request?.method,
+        url: safeText(event.d.url, 400) ?? request?.url,
+      });
+      continue;
+    }
+    if (event.k !== "net.res") continue;
+    const status = finiteNumber(event.d.st);
+    if (status === undefined || status < 400) continue;
+    const request = requests.get(networkRequestId(event.d.id) ?? "");
+    add({
+      t: event.t,
+      requestId: requestIdForEvent(event),
+      method:
+        safeText(event.d.method, 20) ??
+        safeText(event.d.m, 20) ??
+        request?.method,
+      url: safeText(event.d.url, 400) ?? request?.url,
+    });
+  }
+
+  // Index entries survive event truncation, so they are also authoritative failure observations.
+  for (const failed of index.failedReqs ?? []) {
+    add({
+      t: failed.t,
+      requestId: requestIdForValue(failed),
+      method: failed.m,
+      url: failed.url,
+    });
+  }
+  for (const entry of index.networkErrors ?? []) {
+    add({
+      t: entry.t,
+      requestId: requestIdForValue(entry),
+      method: entry.method ?? entry.m,
+      url: entry.url,
+    });
+  }
+
+  const backendSpans = collectBackendRequestSpans(events);
+  for (const event of events) {
+    if (
+      event.k !== "backend.req.error" &&
+      event.k !== "backend.req.end" &&
+      event.k !== "backend.uncaught"
+    )
+      continue;
+    const requestId = safeText(event.d.requestId, 120);
+    const span = requestId
+      ? backendSpans.find((candidate) => candidate.requestId === requestId)
+      : backendRequestSpanAt(backendSpans, event.t);
+    const status =
+      finiteNumber(event.d.statusCode) ??
+      (isRecord(event.d.error)
+        ? finiteNumber(event.d.error.statusCode)
+        : undefined) ??
+      span?.status;
+    if (event.k === "backend.req.end" && (status ?? 0) < 400) continue;
+    if (event.k === "backend.uncaught" && span === undefined) continue;
+    const url =
+      safeText(event.d.pathname, 400) ??
+      safeText(event.d.route, 400) ??
+      span?.pathname ??
+      span?.route;
+    add({
+      t: event.t,
+      requestId: requestId ?? span?.requestId,
+      method: safeText(event.d.method, 20) ?? span?.method,
+      url,
+    });
+  }
+
+  return failures;
+}
+
+function collectSuccessfulOperations(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  requests: Map<string, RequestInfo>,
+): OperationObservation[] {
+  const successes: OperationObservation[] = [];
+  const failedRequestIds = new Set(
+    (index.failedReqs ?? [])
+      .map((failed) => requestIdForValue(failed))
+      .filter((id): id is string => id !== undefined),
+  );
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const status = finiteNumber(event.d.st);
+    if (status === undefined || status < 200 || status >= 300) continue;
+    const requestId = requestIdForEvent(event);
+    const request = requests.get(networkRequestId(event.d.id) ?? "");
+    const method =
+      safeText(event.d.method, 20) ?? safeText(event.d.m, 20) ?? request?.method;
+    const url = safeText(event.d.url, 400) ?? request?.url;
+    const key = operationKey(method, url);
+    if (
+      (requestId !== undefined && failedRequestIds.has(requestId)) ||
+      (index.failedReqs ?? []).some(
+        (failed) =>
+          failed.t === event.t &&
+          failed.st === status &&
+          operationKey(failed.m, failed.url) === key,
+      )
+    )
+      continue;
+    if (key) successes.push({ t: event.t, method, url, key });
+  }
+
+  // Backend-only sessions have no net.res event. A completed successful backend request is still
+  // an equivalent operation, using the same method and concrete path fields as the failure.
+  for (const span of collectBackendRequestSpans(events)) {
+    if (span.status === undefined || span.status < 200 || span.status >= 300)
+      continue;
+    const url = span.pathname ?? span.route;
+    const key = operationKey(span.method, url);
+    if (key)
+      successes.push({
+        t: span.end,
+        requestId: span.requestId,
+        method: span.method,
+        url,
+        key,
+      });
+  }
+  return successes;
+}
+
+function failureForDraft(
+  draft: CandidateDraft,
+  failures: OperationObservation[],
+): OperationObservation | undefined {
+  const requestId = draft.anchor.requestId;
+  if (requestId) {
+    const sameRequest = failures
+      .filter(
+        (failure) =>
+          failure.requestId === requestId &&
+          Math.abs(failure.t - draft.anchor.t) <= FAILURE_RECOVERY_MATCH_WINDOW_MS,
+      )
+      .sort(
+        (a, b) =>
+          Math.abs(a.t - draft.anchor.t) - Math.abs(b.t - draft.anchor.t),
+      )[0];
+    if (sameRequest) return sameRequest;
+  }
+
+  const key = operationKey(draft.anchor.method, draft.anchor.url);
+  if (!key) return undefined;
+  return failures.find(
+    (failure) => failure.key === key && failure.t === draft.anchor.t,
+  );
+}
+
+function operationKey(method: unknown, url: unknown): string | undefined {
+  const normalizedMethod = safeText(method, 20)?.toUpperCase();
+  const textUrl = safeText(url, 2_000);
+  if (!normalizedMethod || !textUrl) return undefined;
+  return `${normalizedMethod} ${normalizeUrl(textUrl)}`;
+}
+
+function sessionEndOf(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+): number | undefined {
+  const indexedEnd = finiteNumber(index.end);
+  if (indexedEnd !== undefined) return indexedEnd;
+  return events.reduce<number | undefined>(
+    (latest, event) =>
+      latest === undefined || event.t > latest ? event.t : latest,
+    undefined,
+  );
+}
+
+function lowerSeverity(
+  severity: CandidateDraft["severity"],
+): CandidateDraft["severity"] {
+  if (severity === "critical") return "high";
+  if (severity === "high") return "medium";
+  if (severity === "medium") return "low";
+  return "low";
 }
 
 /**
@@ -2846,46 +3336,33 @@ function gradeDbErrorLinkage(
 }
 
 /**
- * Response bodies by browser network id, so a failed request can be judged
- * against what the server actually said.
+ * Failed requests that had no captured consequence, keyed by browser network id.
+ * Shared by the filtering pass and by error-moment collection: a client error
+ * that the app consumed is not an error a nearby database write should be graded
+ * against.
  */
-function responseBodyByRequestId(events: BugEvent[]): Map<string, unknown> {
-  const out = new Map<string, unknown>();
-  for (const event of events) {
-    if (event.k !== "net.res") continue;
-    const id = requestIdForEvent(event);
-    if (id !== undefined) out.set(id, event.d.body);
-  }
-  // Backend-only exchanges, keyed by the shared correlation id. Added second and
-  // without overwriting: when the browser saw the same response its view wins.
-  for (const event of events) {
-    if (event.k !== "backend.req.end" && event.k !== "backend.req.error")
-      continue;
-    if (event.d.body === undefined) continue;
-    const id = safeText(event.d.requestId, 200);
-    if (id !== undefined && !out.has(id)) out.set(id, event.d.body);
-  }
-  return out;
-}
-
-/**
- * Failed requests that are a deliberate application outcome, keyed by browser
- * network id. Shared by the demotion pass and by error-moment collection: a 4xx
- * the app chose to return is not an error a nearby database write should be
- * graded against.
- */
-function handledClientErrorRequestIds(
+function consumedClientErrorRequestIds(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
 ): Set<string> {
-  const bodies = responseBodyByRequestId(events);
-  const handled = new Set<string>();
+  const consumed = new Set<string>();
   for (const failed of index.failedReqs ?? []) {
     const id = requestIdForValue(failed);
     if (id === undefined) continue;
-    if (isHandledClientError(failed.st, bodies.get(id))) handled.add(id);
+    if (
+      isConsumedClientError(
+        {
+          t: failed.t,
+          status: failed.st,
+          method: failed.m,
+          url: failed.url,
+        },
+        events,
+      )
+    )
+      consumed.add(id);
   }
-  return handled;
+  return consumed;
 }
 
 function collectErrorMoments(
@@ -2893,7 +3370,7 @@ function collectErrorMoments(
   index: EvidenceIndexInput["index"],
 ): ErrorMoment[] {
   const moments: ErrorMoment[] = [];
-  const handled = handledClientErrorRequestIds(events, index);
+  const consumed = consumedClientErrorRequestIds(events, index);
 
   for (const event of events) {
     if (
@@ -2901,9 +3378,19 @@ function collectErrorMoments(
       finiteNumber(event.d.st) !== undefined &&
       (finiteNumber(event.d.st) ?? 0) >= 400
     ) {
-      // A 4xx the application chose to return is an outcome, not a fault, so a
+      // A 4xx with no captured consequence is an outcome, not a fault, so a
       // write that happens to sit beside it is not thereby suspicious.
-      if (isHandledClientError(finiteNumber(event.d.st), event.d.body))
+      if (
+        isConsumedClientError(
+          {
+            t: event.t,
+            status: finiteNumber(event.d.st),
+            method: safeText(event.d.m, 20) ?? safeText(event.d.method, 20),
+            url: safeText(event.d.url, 400),
+          },
+          events,
+        )
+      )
         continue;
       moments.push({ t: event.t, requestId: safeText(event.d.requestId, 120) });
     } else if (event.k === "err" || event.k === "rej") {
@@ -2945,7 +3432,7 @@ function collectErrorMoments(
 
   for (const failed of index.failedReqs ?? []) {
     const id = requestIdForValue(failed);
-    if (id !== undefined && handled.has(id)) continue;
+    if (id !== undefined && consumed.has(id)) continue;
     moments.push({ t: failed.t });
   }
   for (const entry of index.networkErrors ?? []) moments.push({ t: entry.t });
@@ -5432,99 +5919,184 @@ function addOrphanedReferenceCandidates(
 }
 
 /**
- * lost_update: a read-modify-write raced itself and one writer's change vanished.
+ * lost_update: one request read a row, another request wrote it, and the first
+ * request later wrote the row back from the earlier read.
  *
- * The signature is exact and does not need to know anything about the app: two
- * UPDATEs land on the same table and primary key, and the later one's BEFORE
- * image still shows the value the earlier one had already replaced. Both writes
- * succeeded, both rows are individually valid, and the final row silently holds
- * one increment instead of two. Nothing else in the pipeline names it — the
- * generic `db_mutation` surfacing says only "a row changed", which is exactly
- * as true of the correct outcome.
+ * This is intentionally an event-order detector. A `db.diff` before-image is
+ * the database state when the UPDATE ran, not the value the application read
+ * before an await, so comparing before/after images cannot establish the
+ * read-modify-write shape. The successful SELECT statement and request ids can.
  *
- * This is the one detector here that deliberately crosses request boundaries:
- * a lost update is *made of* two concurrent requests, so a per-request rule can
- * never see it. Requiring a stale before-image is what keeps that safe — two
- * unrelated sequential updates chain correctly and stay silent.
- *
- * Needs `captureBefore: true`; without before images there is nothing to
- * compare and the rule cannot fire at all.
+ * It requires both requests' database events in the same analyzed event
+ * stream. A reader's session cannot discover a concurrent writer whose only
+ * evidence is in another user's session. It also reports the weaker observable
+ * shape: the events do not expose the value held in the application's local
+ * variable, so they cannot prove that the later write was derived from a stale
+ * value.
  */
+interface LostUpdateRead {
+  event: BugEvent;
+  requestId: string;
+  table: string;
+  keyColumns: string[];
+}
+
+function selectKeyColumns(shape: string): string[] | undefined {
+  const where = /\bwhere\b([\s\S]*)/i.exec(shape)?.[1];
+  if (!where || /\b(?:or|union|select|join)\b/i.test(where)) return undefined;
+
+  const predicates = where.split(/\band\b/i);
+  const columns: string[] = [];
+  for (const rawPredicate of predicates) {
+    const predicate = rawPredicate
+      .replace(
+        /\b(?:group\s+by|order\s+by|limit|offset|for\s+update)\b[\s\S]*$/i,
+        "",
+      )
+      .replace(/[()]/g, "")
+      .trim();
+    const match = /^(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)\s*=\s*\?(?:::[A-Za-z_]\w*)?$/i.exec(
+      predicate,
+    );
+    if (!match) return undefined;
+    const column = match[1].toLowerCase();
+    if (columns.includes(column)) return undefined;
+    columns.push(column);
+  }
+  return columns.length > 0 ? columns : undefined;
+}
+
+function updateValueForColumn(
+  event: BugEvent,
+  column: string,
+): string | undefined {
+  const pk = isRecord(event.d.pk) ? event.d.pk : undefined;
+  const after = isRecord(event.d.after) ? event.d.after : undefined;
+  const before = isRecord(event.d.before) ? event.d.before : undefined;
+  const afterEntry = after
+    ? Object.entries(after).find(([name]) => name.toLowerCase() === column)
+    : undefined;
+  const beforeEntry = before
+    ? Object.entries(before).find(([name]) => name.toLowerCase() === column)
+    : undefined;
+  const afterValue = afterEntry ? keyValueOf(afterEntry[1]) : undefined;
+  const beforeValue = beforeEntry ? keyValueOf(beforeEntry[1]) : undefined;
+  const pkEntry = pk
+    ? Object.entries(pk).find(([name]) => name.toLowerCase() === column)
+    : undefined;
+  const pkValue = pkEntry ? keyValueOf(pkEntry[1]) : undefined;
+  if (
+    pkValue !== undefined &&
+    ((afterValue !== undefined && afterValue !== pkValue) ||
+      (beforeValue !== undefined && beforeValue !== pkValue))
+  )
+    return undefined;
+  if (pkValue !== undefined) return pkValue;
+  if (
+    afterValue !== undefined &&
+    beforeValue !== undefined &&
+    afterValue !== beforeValue
+  )
+    return undefined;
+  return afterValue ?? beforeValue;
+}
+
+function lostUpdateRowKey(
+  event: BugEvent,
+  table: string,
+  keyColumns: string[],
+): string | undefined {
+  const values = keyColumns.map((column) =>
+    updateValueForColumn(event, column),
+  );
+  if (values.some((value) => value === undefined)) return undefined;
+  return `${bareTableName(table).toLowerCase()}\u0000${keyColumns
+    .map((column, index) => `${column}=${values[index]}`)
+    .join(",")}`;
+}
+
 function addLostUpdateCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
 ): void {
-  // table + pk → the update diffs against that row, in capture order.
-  const byRow = new Map<string, BugEvent[]>();
+  const reads: LostUpdateRead[] = [];
+  const updates: Array<{ event: BugEvent; requestId: string; table: string }> = [];
   for (const event of events) {
-    if (event.k !== "db.diff") continue;
-    if (safeText(event.d.op, 20) !== "update") continue;
-    if (!isRecord(event.d.before) || !isRecord(event.d.after)) continue;
-    const table = safeText(event.d.table, 200);
-    const pk = pkEntriesOf(event);
-    if (!table || pk.length === 0) continue;
-    const key = `${table}\u0000${pk.map(([c, v]) => `${c}=${v}`).join(",")}`;
-    const list = byRow.get(key) ?? [];
-    list.push(event);
-    byRow.set(key, list);
-  }
-
-  for (const [key, updates] of byRow) {
-    if (updates.length < 2) continue;
-    const ordered = [...updates].sort((a, b) => a.t - b.t);
-    for (let i = 1; i < ordered.length; i += 1) {
-      const earlier = ordered[i - 1];
-      const later = ordered[i];
-      // Two writes from the same request are a sequence the app wrote on
-      // purpose, not a race.
-      const earlierRequest = safeText(earlier.d.requestId, 120);
-      const laterRequest = safeText(later.d.requestId, 120);
-      if (earlierRequest && laterRequest && earlierRequest === laterRequest)
-        continue;
-
-      const earlierAfter = earlier.d.after as Record<string, unknown>;
-      const laterBefore = later.d.before as Record<string, unknown>;
-      const laterAfter = later.d.after as Record<string, unknown>;
-      for (const [column, wrote] of Object.entries(earlierAfter)) {
-        if (isIdentityOrClockField(column)) continue;
-        if (!Object.hasOwn(laterBefore, column)) continue;
-        const sawBefore = laterBefore[column];
-        // The later writer read a value the earlier writer had already
-        // replaced, so its own write was computed from stale state.
-        if (sameScalar(sawBefore, wrote)) continue;
-        const earlierBefore = earlier.d.before as Record<string, unknown>;
-        if (!sameScalar(sawBefore, earlierBefore[column])) continue;
-        // ...and both writers, from that one read, computed the SAME new value.
-        // That coincidence is the read-modify-write fingerprint: two increments
-        // of 1 both produced 2, so the row holds 2 where it should hold 3. When
-        // the two writes disagree the rule stays silent, because an absolute
-        // `SET qty = n` from a stale read is indistinguishable from a correct
-        // one and guessing would put a false claim above the plane dump.
-        if (!sameScalar(laterAfter[column], wrote)) continue;
-
-        const label = scrubText(bareTableName(key.split("\u0000")[0]), 100) ?? "table";
-        drafts.push({
-          detector: "lost_update",
-          title: `Lost update: a second writer overwrote ${label}.${column} from a stale read`,
-          severity: "high",
-          score: DB_INVARIANT_SCORE,
-          confidence: "high",
-          anchor: removeUndefined({
-            t: later.t,
-            offsetMs:
-              offsetForEvent(later) ?? offsetFromStart(later.t, index.start),
-            route: routeAt(index.navs ?? [], later.t),
-            requestId: laterRequest,
-            message: `${label}.${column}: one writer set ${formatScalar(wrote)}, a concurrent writer had already read ${formatScalar(sawBefore)} and wrote ${formatScalar(laterAfter[column])}`,
-            source: normalizeDbEngine(later.d.engine),
-          }),
-          dedupeKey: `lostupdate:${key}:${column}`,
-        });
-        break; // One claim per row pair; the first stale column carries it.
+    if (
+      event.k === "db.statement" &&
+      safeText(event.d.op, 20)?.toLowerCase() === "select"
+    ) {
+      const requestId = safeText(event.d.requestId, 120);
+      const table = safeText(event.d.table, 200);
+      const shape = safeText(event.d.shape, 500);
+      const keyColumns = shape ? selectKeyColumns(shape) : undefined;
+      if (requestId && table && keyColumns) {
+        reads.push({ event, requestId, table, keyColumns });
       }
     }
+    if (
+      event.k !== "db.diff" ||
+      safeText(event.d.op, 20)?.toLowerCase() !== "update"
+    )
+      continue;
+    const requestId = safeText(event.d.requestId, 120);
+    const table = safeText(event.d.table, 200);
+    if (requestId && table) updates.push({ event, requestId, table });
   }
+
+  const emitted = new Set<string>();
+  for (const read of reads) {
+    const ownWrites = updates.filter(
+      (update) =>
+        update.requestId === read.requestId &&
+        sameTable(update.table, read.table) &&
+        update.event.t > read.event.t,
+    );
+    for (const own of ownWrites) {
+      const ownRow = lostUpdateRowKey(own.event, read.table, read.keyColumns);
+      if (!ownRow) continue;
+      const interleaved = updates.filter(
+        (update) =>
+          update.requestId !== read.requestId &&
+          sameTable(update.table, read.table) &&
+          update.event.t > read.event.t &&
+          update.event.t < own.event.t &&
+          lostUpdateRowKey(update.event, read.table, read.keyColumns) === ownRow,
+      );
+      if (interleaved.length === 0 || emitted.has(`${read.requestId}:${ownRow}`))
+        continue;
+      emitted.add(`${read.requestId}:${ownRow}`);
+      const tableLabel = scrubText(bareTableName(read.table), 100) ?? "table";
+      const otherRequests = [
+        ...new Set(interleaved.map((update) => update.requestId)),
+      ];
+      drafts.push({
+        detector: "lost_update",
+        title: `Possible lost update: ${tableLabel} was written between a read and its later write`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "medium",
+        anchor: removeUndefined({
+          t: own.event.t,
+          offsetMs:
+            offsetForEvent(own.event) ?? offsetFromStart(own.event.t, index.start),
+          route: routeAt(index.navs ?? [], own.event.t),
+          requestId: read.requestId,
+          message:
+            `Request ${read.requestId} selected ${tableLabel} by ${read.keyColumns.join(", ")} at +${Math.round(offsetFromStart(read.event.t, index.start) ?? 0)} ms, ` +
+            `request${otherRequests.length === 1 ? "" : "s"} ${otherRequests.join(", ")} wrote the same row before it later wrote again. ` +
+            `The captured ordering is consistent with a read-modify-write using stale state, but the value held between the SELECT and UPDATE is not captured, so this is a possible rather than proven lost update.`,
+          source: normalizeDbEngine(own.event.d.engine),
+        }),
+        dedupeKey: `lostupdate:${read.requestId}:${ownRow}`,
+      });
+    }
+  }
+}
+
+function sameTable(left: string, right: string): boolean {
+  return bareTableName(left).toLowerCase() === bareTableName(right).toLowerCase();
 }
 
 /**
@@ -6874,7 +7446,13 @@ function responseCollection(
   bodyMeta?: unknown,
 ): BodyCollection | undefined {
   const view = responseBodyView(body, bodyMeta);
-  if (!view || view.data === undefined) return undefined;
+  return view ? responseCollectionFromView(view) : undefined;
+}
+
+function responseCollectionFromView(
+  view: ResponseBodyView,
+): BodyCollection | undefined {
+  if (view.data === undefined) return undefined;
   const payload = view.data;
 
   if (Array.isArray(payload)) {
@@ -6944,76 +7522,206 @@ function isRedactedValue(value: unknown): boolean {
   return isRedactedPlaceholder(value);
 }
 
+const WRITE_READ_DIVERGENCE_SCORE = 84;
+const MAX_WRITE_READ_DIVERGENCE_CANDIDATES = 20;
+
+function isComparableScalar(value: unknown): boolean {
+  return (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  );
+}
+
+/** A shared id-like scalar is the only identity anchor accepted by this detector. */
+function isWriteReadIdentityField(name: string): boolean {
+  return isIdLikeField(name) || /^uuid$/i.test(name) || /(?:Uuid|UUID)$/.test(name);
+}
+
+function redactedField(event: BugEvent, field: string): boolean {
+  const redaction = event.d.redaction;
+  if (!isRecord(redaction) || !Array.isArray(redaction.fields)) return false;
+  return redaction.fields.some((entry) => {
+    if (!isRecord(entry)) return false;
+    const path = safeText(entry.path, 400);
+    return (
+      path === "body" ||
+      path?.endsWith(`.${field}`) === true ||
+      path?.endsWith(`[${field}]`) === true
+    );
+  });
+}
+
+function renderComparedScalar(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string") {
+    return JSON.stringify(truncate(redactTokenLikeString(value, "network.body").value, 180));
+  }
+  return String(value);
+}
+
+function isPrefixTruncation(written: string, read: string): boolean {
+  if (read.length >= written.length || read.length === 0) return false;
+  return (
+    written.startsWith(read) ||
+    (read.endsWith("\uFFFD") && written.startsWith(read.slice(0, -1)))
+  );
+}
+
+/**
+ * Finds a successful write/read pair using only structured payload identity.
+ * It refuses route, content-type and value-only guesses, ignores fields added
+ * by the server, and treats redacted or capture-truncated values as unknown.
+ */
+function addWriteReadDivergenceCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const ordered = [...exchanges.values()].sort(
+    (a, b) =>
+      (a.res?.t ?? Number.POSITIVE_INFINITY) -
+        (b.res?.t ?? Number.POSITIVE_INFINITY) ||
+      a.requestId.localeCompare(b.requestId),
+  );
+  let emitted = 0;
+
+  for (const write of ordered) {
+    if (emitted >= MAX_WRITE_READ_DIVERGENCE_CANDIDATES) return;
+    if (write.res === undefined || !isSuccessStatus(write.status)) continue;
+    const written = parseStructuredBody(write.body);
+    if (written === undefined) continue;
+    const writtenScopes = collectObjectScopes(written);
+
+    for (const read of ordered) {
+      if (emitted >= MAX_WRITE_READ_DIVERGENCE_CANDIDATES) return;
+      if (
+        read.requestId === write.requestId ||
+        read.res === undefined ||
+        read.res.t <= write.res.t ||
+        !isSuccessStatus(read.status) ||
+        (isRecord(read.resBodyMeta) && read.resBodyMeta.truncated === true)
+      )
+        continue;
+      const response =
+        parseStructuredBody(read.resBody) ??
+        responsePayload(read.resBody, read.resBodyMeta);
+      if (response === undefined) continue;
+      const responseScopes = collectObjectScopes(response);
+
+      for (const writtenScope of writtenScopes) {
+        const identities = Object.entries(writtenScope).filter(
+          ([name, value]) =>
+            isWriteReadIdentityField(name) &&
+            isComparableScalar(value) &&
+            !isRedactedValue(value) &&
+            !redactedField(write.req, name),
+        );
+        if (identities.length === 0) continue;
+        const matches = responseScopes.filter((scope) =>
+          identities.some(
+            ([name, value]) =>
+              isComparableScalar(scope[name]) &&
+              !isRedactedValue(scope[name]) &&
+              !redactedField(read.res!, name) &&
+              scope[name] === value,
+          ),
+        );
+        // Repeated identities are ambiguous, so do not choose a record by position.
+        if (matches.length !== 1) continue;
+        const readScope = matches[0];
+
+        for (const [field, writtenValue] of Object.entries(writtenScope)) {
+          if (
+            !isComparableScalar(writtenValue) ||
+            isRedactedValue(writtenValue) ||
+            redactedField(write.req, field)
+          )
+            continue;
+          if (!(field in readScope)) {
+            if (redactedField(read.res, field)) continue;
+            drafts.push({
+              detector: "write_read_divergence",
+              title: `Write/read divergence on ${field}: wrote ${renderComparedScalar(writtenValue)}, but the later response omitted the field`,
+              severity: "high",
+              score: WRITE_READ_DIVERGENCE_SCORE,
+              confidence: "high",
+              anchor: removeUndefined({
+                t: read.res.t,
+                offsetMs:
+                  offsetForEvent(read.res) ?? offsetFromStart(read.res.t, index.start),
+                route: routeAt(index.navs ?? [], read.res.t),
+                requestId: read.requestId,
+                method: read.method,
+                url: redactUrl(read.url),
+                status: read.status,
+                message: `A successful write supplied ${field}=${renderComparedScalar(writtenValue)}; a later successful response contained the same identity object but omitted that field`,
+              }),
+              dedupeKey: `writeread:${write.requestId}:${read.requestId}:${field}:missing`,
+            });
+            emitted += 1;
+            continue;
+          }
+          const readValue = readScope[field];
+          if (
+            !isComparableScalar(readValue) ||
+            isRedactedValue(readValue) ||
+            redactedField(read.res, field) ||
+            readValue === writtenValue
+          )
+            continue;
+          const writtenText = renderComparedScalar(writtenValue);
+          const readText = renderComparedScalar(readValue);
+          const truncated =
+            typeof writtenValue === "string" &&
+            typeof readValue === "string" &&
+            isPrefixTruncation(writtenValue, readValue);
+          drafts.push({
+            detector: "write_read_divergence",
+            title: truncated
+              ? `Read-back truncation on ${field}: wrote ${writtenText}, but the later response returned the prefix ${readText}`
+              : `Write/read divergence on ${field}: wrote ${writtenText}, but the later response returned ${readText}`,
+            severity: "high",
+            score: WRITE_READ_DIVERGENCE_SCORE,
+            confidence: "high",
+            anchor: removeUndefined({
+              t: read.res.t,
+              offsetMs:
+                offsetForEvent(read.res) ?? offsetFromStart(read.res.t, index.start),
+              route: routeAt(index.navs ?? [], read.res.t),
+              requestId: read.requestId,
+              method: read.method,
+              url: redactUrl(read.url),
+              status: read.status,
+              message: truncated
+                ? `A successful write supplied ${field}=${writtenText}; a later successful response returned ${readText}, a shorter prefix with a replacement character, consistent with byte truncation`
+                : `A successful write supplied ${field}=${writtenText}; a later successful response returned ${readText}`,
+            }),
+            dedupeKey: `writeread:${write.requestId}:${read.requestId}:${field}`,
+          });
+          emitted += 1;
+        }
+      }
+    }
+  }
+}
+
 // ─── filter_contradiction ────────────────────────────────────────────────────
 
-/** How many contradicted filters one session may carry. */
+/** How many response constraints one session may carry. */
 const MAX_FILTER_CONTRADICTION_CANDIDATES = 5;
 
 /**
- * A response that contradicts its request's own filter, or a request whose rows
- * never reached the response, is a hard contradiction between two things the
- * capture recorded — one tier under the database invariants (90), because the
- * join rests on a name match rather than on two images of one row, and above the
- * runtime errors (82) because nothing here errored at all.
+ * A response that contradicts its own echoed constraint is a hard contradiction
+ * between two values in one successful response. It sits below database
+ * invariants (90) and above runtime errors (82), since no request or response
+ * failed and the claim needs no second event or application schema.
  */
 const FILTER_CONTRADICTION_SCORE = 84;
 
-/**
- * Query parameters that carry free text. `?q=desk` is a search term the server
- * is free to interpret, not a declaration that every row will have `q = "desk"`.
- */
-const FREE_TEXT_QUERY_PARAMS = new Set([
-  "q",
-  "query",
-  "search",
-  "searchterm",
-  "term",
-  "keyword",
-  "keywords",
-  "text",
-  "s",
-  "filter",
-  "filters",
-]);
-
-/**
- * Parameters that page, sort or shape a response rather than filter it. Matched
- * on the whole normalized name, so a column genuinely called `order` in a table
- * is unaffected — this is about the parameter, not the column.
- */
-const NON_FILTER_QUERY_PARAMS = new Set([
-  "limit",
-  "offset",
-  "page",
-  "pagesize",
-  "perpage",
-  "cursor",
-  "sort",
-  "sortby",
-  "order",
-  "orderby",
-  "direction",
-  "fields",
-  "select",
-  "include",
-  "expand",
-  "format",
-  "callback",
-  "locale",
-  "lang",
-  "token",
-  "key",
-  "apikey",
-  "signature",
-  "nonce",
-]);
-
-/**
- * Word segments that make a parameter a range bound. `maxPrice=200` says rows
- * are ≤ 200, not that every row costs exactly 200, so an equality reading of it
- * would fire on every correct response.
- */
-const RANGE_PARAM_WORDS = new Set([
+const NO_CONSTRAINT_SENTINELS = new Set(["*", "all", "any"]);
+const DEFERRED_CONSTRAINT_WORDS = new Set([
   "min",
   "max",
   "from",
@@ -7030,254 +7738,216 @@ const RANGE_PARAM_WORDS = new Set([
   "gte",
   "range",
   "between",
+  "limit",
+  "offset",
+  "page",
+  "pagesize",
+  "perpage",
+  "cursor",
+  "sort",
+  "sortby",
+  "order",
+  "orderby",
+  "direction",
+  "count",
+  "total",
 ]);
 
-const TRUE_TOKENS = new Set(["true", "1", "yes", "y", "on"]);
-const FALSE_TOKENS = new Set(["false", "0", "no", "n", "off"]);
-
-/**
- * The one name family this detector reads across a rename: a boolean
- * availability filter against the stock column the row actually carries.
- * `?inStock=true` returning a row whose `inventory` is 0 is the canonical shape
- * of the defect, and the two names never match textually. Deliberately narrow —
- * a boolean parameter and a count column, nothing else — because every entry
- * here is an assumption about someone else's schema.
- */
-const AVAILABILITY_PARAM_NAMES = new Set([
-  "instock",
-  "instockonly",
-  "available",
-  "isavailable",
-  "hasstock",
-  "instocked",
-]);
-const AVAILABILITY_ROW_FIELDS = new Set([
-  "instock",
-  "available",
-  "isavailable",
-  "inventory",
-  "stock",
-  "stockcount",
-  "stocklevel",
-  "quantityavailable",
-  "availablequantity",
-]);
-
-interface DeclaredFilter {
-  /** Parameter name as written in the query string. */
-  name: string;
-  /** Normalized name used for matching a row field. */
-  key: string;
-  /** Accepted values; more than one when the query repeats or comma-lists it. */
-  values: string[];
-  /** True when every accepted value reads as a boolean. */
-  boolean: boolean;
+function isDeferredConstraintName(name: string): boolean {
+  return columnWords(name).some((word) => DEFERRED_CONSTRAINT_WORDS.has(word));
 }
 
-/**
- * The equality-ish filters a request declared in its own query string.
- *
- * Deny-biased at every step: a free-text parameter, a paging parameter, a range
- * bound, an empty value and a redacted value all contribute nothing, because the
- * whole claim rests on the request having stated something the response can
- * contradict.
- */
-function declaredFilters(url: string | undefined): DeclaredFilter[] {
-  const parsed = parseCapturedUrl(url);
-  if (!parsed) return [];
-  const byKey = new Map<string, DeclaredFilter>();
-  for (const [rawName, rawValue] of parsed.searchParams) {
-    const name = safeText(rawName, 80);
-    if (!name) continue;
-    const key = normalizeFieldName(name);
-    if (FREE_TEXT_QUERY_PARAMS.has(key)) continue;
-    if (NON_FILTER_QUERY_PARAMS.has(key)) continue;
-    if (columnWords(name).some((word) => RANGE_PARAM_WORDS.has(word))) continue;
-    const value = safeText(rawValue, 200);
-    if (!value || isRedactedValue(value)) continue;
-    // A repeated or comma-listed parameter is a set: a row matching any member
-    // satisfies it, so only a row matching none is a contradiction.
-    const values = value.includes(",")
-      ? value
-          .split(",")
-          .map((part) => part.trim())
-          .filter(Boolean)
-      : [value];
-    if (values.length === 0) continue;
-    const existing = byKey.get(key);
-    if (existing) existing.values.push(...values);
-    else
-      byKey.set(key, {
-        name,
-        key,
-        values,
-        boolean: false,
-      });
-  }
-  for (const filter of byKey.values()) {
-    filter.boolean = filter.values.every((value) => {
-      const token = value.trim().toLowerCase();
-      return TRUE_TOKENS.has(token) || FALSE_TOKENS.has(token);
-    });
-  }
-  return [...byKey.values()];
-}
-
-/** The row field a declared filter is about, when the row carries one. */
-function rowFieldForFilter(
-  filter: DeclaredFilter,
-  row: Record<string, unknown>,
-): { field: string; value: unknown } | undefined {
-  const direct = Object.entries(row).find(
-    ([name]) => normalizeFieldName(name) === filter.key,
+function isComparableConstraintScalar(value: unknown): boolean {
+  return (
+    (typeof value === "string" &&
+      value.length > 0 &&
+      !NO_CONSTRAINT_SENTINELS.has(value) &&
+      !isRedactedValue(value)) ||
+    typeof value === "boolean" ||
+    finiteNumber(value) !== undefined
   );
-  if (direct) return { field: direct[0], value: direct[1] };
-  if (!filter.boolean || !AVAILABILITY_PARAM_NAMES.has(filter.key))
-    return undefined;
-  const availability = Object.entries(row).find(([name]) =>
-    AVAILABILITY_ROW_FIELDS.has(normalizeFieldName(name)),
-  );
-  return availability
-    ? { field: availability[0], value: availability[1] }
-    : undefined;
-}
-
-/** Truthiness of a stored value read as an availability flag. */
-function availabilityTruth(value: unknown): boolean | undefined {
-  if (typeof value === "boolean") return value;
-  const numeric = finiteNumber(value);
-  if (numeric !== undefined) return numeric > 0;
-  if (typeof value === "string") {
-    const token = value.trim().toLowerCase();
-    if (TRUE_TOKENS.has(token)) return true;
-    if (FALSE_TOKENS.has(token)) return false;
-    const parsed = toFiniteNumber(token);
-    if (parsed !== undefined) return parsed > 0;
-  }
-  if (value === null) return false;
-  return undefined;
 }
 
 /**
- * Whether a read row contradicts a filter the request declared, and how.
- * Returns the sentence for the candidate's detail, or undefined when the row
- * satisfies the filter or cannot be compared against it.
+ * Collects objects that could echo constraints, excluding the selected result
+ * collection and everything inside its rows. This keeps a returned row from
+ * being mistaken for the response constraint object.
  */
-function filterContradictionOf(
-  filter: DeclaredFilter,
-  field: string,
+function collectConstraintObjects(
   value: unknown,
-): string | undefined {
-  if (value === undefined || isRedactedValue(value)) return undefined;
-  if (typeof value === "object" && value !== null) return undefined;
-
-  if (filter.boolean) {
-    const wanted = TRUE_TOKENS.has(filter.values[0].trim().toLowerCase());
-    const actual = availabilityTruth(value);
-    if (actual === undefined || actual === wanted) return undefined;
-    return `the request declared \`${filter.name}=${filter.values[0]}\` and the row read back carries \`${field}\`=${formatScalar(value)}`;
+  collectionItems: unknown[],
+  out: Record<string, unknown>[] = [],
+  depth = 0,
+): Record<string, unknown>[] {
+  if (depth > MAX_BODY_SCOPE_DEPTH) return out;
+  if (Array.isArray(value)) {
+    if (value === collectionItems) return out;
+    for (const item of value)
+      collectConstraintObjects(item, collectionItems, out, depth + 1);
+    return out;
   }
+  if (!isRecord(value) || isRedactedPlaceholder(value)) return out;
+  out.push(value);
+  for (const inner of Object.values(value)) {
+    if (isRecord(inner) || Array.isArray(inner))
+      collectConstraintObjects(inner, collectionItems, out, depth + 1);
+  }
+  return out;
+}
 
-  const actual = String(value).trim().toLowerCase();
-  const accepted = filter.values.map((entry) => entry.trim().toLowerCase());
-  if (accepted.includes(actual)) return undefined;
-  // A comma-listed value may also have been stored verbatim.
-  if (accepted.length > 1 && actual === filter.values.join(",").toLowerCase())
-    return undefined;
-  return `the request declared \`${filter.name}=${filter.values.join(",")}\` and the row read back carries \`${field}\`=${formatScalar(value)}`;
+interface ResponseConstraint {
+  name: string;
+  declared: string | number | boolean;
 }
 
 /**
- * filter_contradiction: a 2xx response was built from rows that defy the
- * request's own query string.
+ * Finds exactly one object that can be the response constraint echo. A key must
+ * exist with the same spelling on every captured row, and the value must be a
+ * non-empty, non-sentinel scalar. Multiple plausible echo objects are
+ * ambiguous and produce no claim.
+ */
+function responseConstraints(
+  payload: unknown,
+  collection: BodyCollection,
+): ResponseConstraint[] | undefined {
+  if (collection.items.length === 0) return undefined;
+  const rows = collection.items.map((item) =>
+    isRecord(item) && !isRedactedPlaceholder(item) ? item : undefined,
+  );
+  if (rows.some((row) => row === undefined)) return undefined;
+  const first = rows[0];
+  if (!first) return undefined;
+
+  const commonNames = new Set(Object.keys(first));
+  for (const row of rows.slice(1)) {
+    if (!row) return undefined;
+    for (const name of commonNames)
+      if (!Object.prototype.hasOwnProperty.call(row, name))
+        commonNames.delete(name);
+  }
+  if (commonNames.size === 0) return undefined;
+
+  const candidates = collectConstraintObjects(payload, collection.items)
+    .map((scope) =>
+      Object.entries(scope).filter(
+        ([name, value]) =>
+          commonNames.has(name) &&
+          !isDeferredConstraintName(name) &&
+          isComparableConstraintScalar(value),
+      ),
+    )
+    .filter((entries) => entries.length > 0);
+  if (candidates.length !== 1) return undefined;
+  return candidates[0].map(([name, declared]) => ({
+    name,
+    declared: declared as string | number | boolean,
+  }));
+}
+
+/**
+ * Returns true for a proven mismatch, false for equality, and undefined when
+ * deciding would require case folding or type coercion.
+ */
+function responseScalarContradiction(
+  declared: string | number | boolean,
+  actual: unknown,
+): boolean | undefined {
+  if (typeof declared !== typeof actual) return undefined;
+  if (declared === actual) return false;
+  if (
+    typeof declared === "string" &&
+    typeof actual === "string" &&
+    declared.toLowerCase() === actual.toLowerCase()
+  )
+    return undefined;
+  return true;
+}
+
+/**
+ * filter_contradiction: a successful response echoes a scalar constraint and
+ * includes a returned item with the same field set to a different scalar.
  *
- * `GET /products?category=audio` answering with a row whose `category` is
- * `desk` is a contradiction with no second reading: the request declared the
- * constraint, the server acknowledged with a 200, and the row it read says
- * otherwise. Nothing else in the pipeline sees it — the request is fine, the
- * response is fine, the query is fast, and the page renders exactly the wrong
- * products without a single error.
- *
- * The join is the request's own correlation id, so the rows compared are the
- * rows THAT request read, not rows that happened to be read nearby.
+ * The response body is the complete evidence. The detector deliberately does
+ * not inspect query parameters, database rows, field aliases, ranges, counts,
+ * or ordering, because each would add an application-specific assumption.
  */
 function addFilterContradictionCandidates(
-  events: BugEvent[],
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
   exchanges: Map<string, RequestExchange>,
 ): void {
-  const readsByRequest = new Map<string, BugEvent[]>();
-  for (const event of events) {
-    if (event.k !== "db.read") continue;
-    if (!isRecord(event.d.row)) continue;
-    const id = correlationIdOf(event);
-    if (!id) continue;
-    const list = readsByRequest.get(id) ?? [];
-    list.push(event);
-    readsByRequest.set(id, list);
-  }
-  if (readsByRequest.size === 0) return;
-
-  const byFilter = new Map<string, CandidateDraft>();
+  const byConstraint = new Map<string, CandidateDraft>();
   for (const exchange of exchanges.values()) {
-    if (!isSuccessStatus(exchange.status)) continue;
-    const reads = readsByRequest.get(exchange.requestId);
-    if (!reads || reads.length === 0) continue;
-    const filters = declaredFilters(exchange.url);
-    if (filters.length === 0) continue;
+    if (!isSuccessStatus(exchange.status) || !exchange.res) continue;
+    const view = responseBodyView(exchange.resBody, exchange.resBodyMeta);
+    if (!view) continue;
+    const collection = responseCollectionFromView(view);
+    if (!collection) continue;
+    const constraints = responseConstraints(view.data, collection);
+    if (!constraints) continue;
 
-    for (const filter of filters) {
-      for (const read of reads) {
-        const row = read.d.row as Record<string, unknown>;
-        const match = rowFieldForFilter(filter, row);
-        if (!match) continue;
-        const contradiction = filterContradictionOf(
-          filter,
-          match.field,
-          match.value,
-        );
-        if (!contradiction) continue;
+    for (const constraint of constraints) {
+      for (const item of collection.items) {
+        if (!isRecord(item) || isRedactedPlaceholder(item)) continue;
+        const actual = item[constraint.name];
+        if (isRedactedValue(actual)) continue;
+        if (actual !== null && typeof actual === "object") continue;
+        if (
+          typeof actual !== "string" &&
+          typeof actual !== "number" &&
+          typeof actual !== "boolean" &&
+          actual !== null
+        )
+          continue;
+        if (responseScalarContradiction(constraint.declared, actual) !== true)
+          continue;
 
         const path = capturedUrlPath(exchange.url) ?? exchange.requestId;
-        const dedupeKey = `filtercontradiction:${path}:${filter.key}`;
-        if (byFilter.has(dedupeKey)) break;
-        const table =
-          scrubText(bareTableName(safeText(read.d.table, 200) ?? ""), 100) ??
-          "the table";
-        byFilter.set(dedupeKey, {
+        const dedupeKey = "filtercontradiction:" + path + ":" + constraint.name;
+        if (byConstraint.has(dedupeKey)) break;
+        byConstraint.set(dedupeKey, {
           detector: "filter_contradiction",
-          title: `Response rows contradict the request's own filter \`${filter.name}\``,
+          title:
+            "Response rows contradict an echoed constraint " + constraint.name,
           severity: "high",
           score: FILTER_CONTRADICTION_SCORE,
           confidence: "high",
           anchor: removeUndefined({
-            t: read.t,
+            t: exchange.res.t,
             offsetMs:
-              offsetForEvent(read) ?? offsetFromStart(read.t, index.start),
-            route: routeAt(index.navs ?? [], read.t),
+              offsetForEvent(exchange.res) ??
+              offsetFromStart(exchange.res.t, index.start),
+            route: routeAt(index.navs ?? [], exchange.res.t),
             requestId: exchange.requestId,
             method: exchange.method,
             url: redactUrl(exchange.url),
             status: exchange.status,
             message: scrubText(
-              `${contradiction} (read from ${table} inside this request). The response was a ${exchange.status}, so nothing downstream had reason to doubt it.`,
+              "The response declared constraint " +
+                constraint.name +
+                "=" +
+                formatScalar(constraint.declared) +
+                ", but a returned item carries " +
+                constraint.name +
+                "=" +
+                formatScalar(actual) +
+                ".",
               220,
             ),
-            comparedColumns: [match.field],
-            source: normalizeDbEngine(read.d.engine),
+            comparedColumns: [constraint.name],
           }),
           dedupeKey,
         });
-        break; // One claim per declared filter.
+        break;
       }
     }
   }
 
-  const emitted = [...byFilter.values()]
-    .sort((a, b) => a.anchor.t - b.anchor.t)
-    .slice(0, MAX_FILTER_CONTRADICTION_CANDIDATES);
-  drafts.push(...emitted);
+  drafts.push(
+    ...[...byConstraint.values()]
+      .sort((a, b) => a.anchor.t - b.anchor.t)
+      .slice(0, MAX_FILTER_CONTRADICTION_CANDIDATES),
+  );
 }
 
 // ─── result_row_loss ─────────────────────────────────────────────────────────
@@ -7437,6 +8107,102 @@ function addResultRowLossCandidates(
       .sort((a, b) => a.anchor.t - b.anchor.t)
       .slice(0, MAX_RESULT_ROW_LOSS_CANDIDATES),
   );
+}
+
+// ─── unowned_read ────────────────────────────────────────────────────────────
+
+/**
+ * A successful response carried a non-empty record with an owner-shaped field
+ * that did not identify the caller. This is deliberately narrower than a
+ * general cross-user classifier: the caller identity must already be declared
+ * on the session, and the response must expose the relationship that was
+ * checked. A response without that shape is not enough to call catalogue data
+ * a privacy defect.
+ */
+function addUnownedReadCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const identity = index.identity;
+  if (!identity) return;
+
+  const ownerField = /^(user|owner|customer|account)(?:_id|Id)$/i;
+  const identityValue = (value: unknown): string | undefined => {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    }
+    return typeof value === "number" && Number.isFinite(value)
+      ? String(value)
+      : undefined;
+  };
+  const callerForField = (field: string): string | undefined => {
+    const family = field.replace(/(?:_id|Id)$/i, "").toLowerCase();
+    if (family === "user") return identityValue(identity.userId);
+    if (family === "account") return identityValue(identity.accountId);
+    if (family === "customer")
+      return identityValue(identity.accountId ?? identity.userId);
+    return identityValue(identity.userId ?? identity.accountId);
+  };
+
+  for (const exchange of exchanges.values()) {
+    if (!exchange.res || !isSuccessStatus(exchange.status)) continue;
+    const payload = responsePayload(exchange.resBody, exchange.resBodyMeta);
+    if (payload === undefined) continue;
+
+    let finding: { field: string; value: string | undefined } | undefined;
+    for (const scope of collectObjectScopes(payload)) {
+      for (const [field, rawValue] of Object.entries(scope)) {
+        if (!ownerField.test(field)) continue;
+        if (
+          Object.entries(scope).every(
+            ([key, value]) =>
+              key === field || value === null || value === undefined,
+          )
+        )
+          continue;
+        const caller = callerForField(field);
+        if (caller === undefined) continue;
+        const returned = identityValue(rawValue);
+        if (returned !== caller) {
+          finding = { field, value: returned };
+          break;
+        }
+      }
+      if (finding) break;
+    }
+    if (!finding) continue;
+
+    const returned = finding.value === undefined ? "null" : finding.value;
+    const identityText =
+      identityValue(identity.userId) ??
+      identityValue(identity.accountId) ??
+      "unknown";
+    const url = exchange.url;
+    const path = capturedUrlPath(url) ?? "the request";
+    drafts.push({
+      detector: "unowned_read",
+      title:
+        "Read returned user-scoped state without a relationship to this identity",
+      severity: "critical",
+      score: 98,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs:
+          offsetForEvent(exchange.res) ??
+          offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(url),
+        status: exchange.status,
+        message: `An authenticated session for identity ${scrubText(identityText, 120)} received non-empty state from ${path} with ${finding.field}=${scrubText(returned, 120)}, but that owner value does not match the identity that asked. This is a user-scoped read with no relationship behind it and should be escalated as a possible privacy incident.`,
+      }),
+      dedupeKey: `unowned:${url ?? exchange.requestId}:${finding.field}:${returned}`,
+    });
+  }
 }
 
 // ─── shared_state_bleed ──────────────────────────────────────────────────────
@@ -12595,154 +13361,310 @@ function normalizeErrorSignature(value: unknown): string {
     .trim();
 }
 
-/**
- * Reduces the score/severity of candidates that are (or correlate to) a blocked third-party
- * analytics/ads beacon. Two paths, both conservative:
- *  - Direct: a candidate whose own failing request targets a denylisted tracker host (network_error /
- *    http_error carry the url or request id).
- *  - Correlated: a bare fetch-level rejection (no url of its own) fired within
- *    {@link TRACKER_BEACON_CORRELATION_MS} of a blocked beacon request.
- * Candidates with unknown or first-party targets are left untouched.
- */
-/**
- * True when `body` is a JSON object naming its own failure — the signature of a
- * handler that returned this status on purpose.
- *
- * Parses rather than pattern-matches: a redacted or truncated body, an HTML
- * error page and a framework stack trace all fail to parse, and every one of
- * those is a case where we must NOT claim the outcome was deliberate.
- */
-function bodyNamesItsOwnError(body: unknown): boolean {
-  if (typeof body !== "string") return false;
-  const trimmed = body.trim();
-  if (!trimmed.startsWith("{")) return false;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    return false;
-  }
-  if (!isRecord(parsed)) return false;
-  if (STRUCTURED_ERROR_KEYS.some((key) => parsed[key] !== undefined))
-    return true;
-  // RFC 9457 problem details: the pair is the proof, since `title` alone is a
-  // common field on perfectly ordinary payloads.
-  return parsed.type !== undefined && parsed.title !== undefined;
+/** Context used to judge a client-error response by its captured consequences. */
+interface ClientErrorContext {
+  t: number;
+  requestId?: string;
+  status?: number;
+  method?: string;
+  url?: string;
 }
 
-/**
- * Whether a status/body pair is a 4xx the application chose to return.
- *
- * Conservative on purpose. The cost of a false positive here is a real defect
- * demoted out of sight, so an unexplained 4xx — a 404 with no body, a 409 whose
- * body never reached the capture — is left at full weight.
- */
-function isHandledClientError(
-  status: number | undefined,
-  body: unknown,
-  sessionSawAuthChallenge = true,
+function isClientErrorStatus(status: number | undefined): boolean {
+  return status !== undefined && status >= 400 && status <= 499;
+}
+
+function eventMethod(event: BugEvent): string | undefined {
+  return (
+    safeText(event.d.m, 20) ??
+    safeText(event.d.method, 20) ??
+    safeText(event.d.httpMethod, 20)
+  )?.toUpperCase();
+}
+
+function eventTarget(event: BugEvent): string | undefined {
+  return (
+    redactUrl(event.d.url) ??
+    redactUrl(event.d.pathname) ??
+    redactUrl(event.d.route)
+  );
+}
+
+function sameOperation(
+  context: ClientErrorContext,
+  event: BugEvent,
 ): boolean {
-  if (status === undefined || status < 400 || status > 499) return false;
-  if (status === UNAUTHENTICATED_STATUS) return true;
-  // A 403 is only "handled" when the session actually contains an authentication
-  // flow. Without one, the caller was authenticated the whole way and the server
-  // still refused: that is an authorization defect — a permission computed
-  // against the wrong object, a role check reading a stale claim — and demoting
-  // it as a routine challenge is how those disappear from a bundle entirely.
-  if (status === FORBIDDEN_STATUS) return sessionSawAuthChallenge;
-  return bodyNamesItsOwnError(body);
+  const method = context.method?.toUpperCase();
+  const target = context.url;
+  return (
+    method !== undefined &&
+    target !== undefined &&
+    eventMethod(event) === method &&
+    eventTarget(event) === target
+  );
 }
 
-/**
- * Whether the session contains a real authentication challenge.
- *
- * A 401 on either plane is the signal. Its presence makes a sibling 403 an
- * expected part of a sign-in or token-refresh flow; its absence makes a 403 a
- * refusal handed to a caller who never had anything to prove.
- */
-function sessionHasAuthChallenge(events: BugEvent[]): boolean {
-  for (const event of events) {
-    if (event.k === "net.res" && finiteNumber(event.d.st) === UNAUTHENTICATED_STATUS)
-      return true;
-    if (
-      event.k === "backend.req.end" &&
-      finiteNumber(event.d.statusCode) === UNAUTHENTICATED_STATUS
-    )
-      return true;
+function sameRequestId(
+  left: string | undefined,
+  right: string | undefined,
+  graph?: CausalGraph,
+): boolean {
+  if (!left || !right) return false;
+  return (
+    left === right ||
+    graph?.requestIdAliases?.[left] === right ||
+    graph?.requestIdAliases?.[right] === left
+  );
+}
+
+function causalNodeKindForEvent(event: BugEvent): string | undefined {
+  if (event.k === "err" || event.k === "rej") return "frontend.error";
+  if (event.k === "con") {
+    return safeText(event.d.lv, 20)?.toLowerCase().startsWith("err")
+      ? "console.error"
+      : undefined;
+  }
+  if (event.k === "backend.req.error" || event.k === "backend.uncaught")
+    return "backend.error";
+  if (event.k === "backend.req.start" || event.k === "backend.req.end")
+    return "backend.req";
+  if (event.k === "backend.otel.span") return "otel.span";
+  if (event.k === "backend.otel.log") return "otel.log";
+  if (event.k === "net.res") return "net.res";
+  return undefined;
+}
+
+function eventNodeForCausalGraph(
+  event: BugEvent,
+  graph: CausalGraph,
+): { id: string; requestId?: string } | undefined {
+  const kind = causalNodeKindForEvent(event);
+  if (!kind) return undefined;
+  const requestId = requestIdForEvent(event);
+  return graph.nodes.find(
+    (node) =>
+      node.kind === kind &&
+      (node.t === event.t ||
+        sameRequestId(node.requestId, requestId, graph)),
+  );
+}
+
+function hasCausalPath(
+  graph: CausalGraph,
+  from: string,
+  to: string,
+): boolean {
+  if (from === to) return true;
+  const outgoing = new Map<string, string[]>();
+  for (const edge of graph.edges) {
+    const targets = outgoing.get(edge.from) ?? [];
+    targets.push(edge.to);
+    outgoing.set(edge.from, targets);
+  }
+  const pending = [from];
+  const visited = new Set([from]);
+  while (pending.length > 0) {
+    const current = pending.shift()!;
+    for (const next of outgoing.get(current) ?? []) {
+      if (next === to) return true;
+      if (visited.has(next)) continue;
+      visited.add(next);
+      pending.push(next);
+    }
+  }
+  return false;
+}
+
+function eventIsCausalClientErrorConsequence(
+  context: ClientErrorContext,
+  event: BugEvent,
+  causalGraph?: CausalGraph,
+): boolean {
+  if (!isFailureSurfaceEvent(event)) return false;
+  if (sameRequestId(context.requestId, requestIdForEvent(event), causalGraph))
+    return true;
+  if (causalGraph) {
+    const source = causalGraph.nodes.find(
+      (node) =>
+        node.kind === "net.res" &&
+        node.t === context.t &&
+        sameRequestId(node.requestId, context.requestId, causalGraph),
+    );
+    const target = eventNodeForCausalGraph(event, causalGraph);
+    return source !== undefined && target !== undefined
+      ? hasCausalPath(causalGraph, source.id, target.id)
+      : false;
+  }
+  // Legacy callers do not pass the graph. Keep close surfaced errors
+  // compatible, but do not reuse the 45-second candidate window.
+  return event.t >= context.t && event.t - context.t <= CAUSAL_MAP_WINDOW_MS;
+}
+
+function isFailureSurfaceEvent(event: BugEvent): boolean {
+  if (
+    event.k === "err" ||
+    event.k === "rej" ||
+    event.k === "net.err" ||
+    event.k === "backend.req.error" ||
+    event.k === "backend.uncaught" ||
+    event.k === "native-crash"
+  )
+    return true;
+  if (event.k === "con") {
+    return safeText(event.d.lv, 20)?.toLowerCase().startsWith("err") ?? false;
+  }
+  if (event.k === "net.res") {
+    return (finiteNumber(event.d.st) ?? 0) >= 500;
+  }
+  if (event.k === "backend.req.end") {
+    return (finiteNumber(event.d.statusCode) ?? 0) >= 500;
+  }
+  if (event.k === "backend.otel.span") {
+    return (
+      event.d.statusCode === "ERROR" ||
+      (otelHttpStatus(event.d.attributes) ?? 0) >= 500
+    );
+  }
+  if (event.k === "backend.otel.log") {
+    const severityNumber = finiteNumber(event.d.severityNumber);
+    const severityText = safeText(event.d.severityText, 40)?.toUpperCase();
+    return (
+      (severityNumber !== undefined && severityNumber >= 17) ||
+      severityText === "ERROR" ||
+      severityText === "FATAL"
+    );
   }
   return false;
 }
 
 /**
- * Demotes and groups the 4xx responses an application returned deliberately.
+ * A 4xx is consumed when the captured consequence is clean. The rule is
+ * deliberately status-agnostic inside 4xx: no route, body, endpoint, or
+ * application name can make a response routine.
  *
- * Ranking-only, in the same spirit as {@link downrankTrackerBeacons}: severity,
- * confidence, score and the dedupe key change so these sort beneath real
- * defects and collapse by route, but no candidate is removed.
+ * Required negative evidence:
+ * - no later surfaced failure or server failure in the candidate window
+ * - no repeat of the same operation, which is the observable retry signal
  *
- * Runs over both planes. The frontend view carries the response body, which is
- * the evidence; the backend `backend.req.end` event carries only a status code,
- * so a backend 4xx is demoted either on its own auth-challenge status or by
- * sharing a correlation id with a frontend response already judged handled.
- * Without that join one expected rejection keeps producing two rows.
+ * The capture has no source-level branch event, so treating a completed
+ * response with no adverse consequence as consumed is the only generic
+ * decision available. A session that ends immediately after it is still not
+ * evidence that a person saw a defect.
  */
-function demoteHandledClientErrors(
+function isConsumedClientError(
+  context: ClientErrorContext,
+  events: BugEvent[],
+  causalGraph?: CausalGraph,
+): boolean {
+  if (!isClientErrorStatus(context.status)) return false;
+  const end = context.t + CLIENT_ERROR_CONSEQUENCE_WINDOW_MS;
+  for (const event of events) {
+    if (event.t < context.t || event.t > end) continue;
+    if (eventIsCausalClientErrorConsequence(context, event, causalGraph))
+      return false;
+    if (
+      event.t > context.t &&
+      event.t <= context.t + CLIENT_ERROR_RETRY_WINDOW_MS &&
+      (event.k === "net.req" || event.k === "backend.req.start") &&
+      sameOperation(context, event)
+    )
+      return false;
+  }
+  return true;
+}
+
+function isClientErrorDraft(draft: CandidateDraft): boolean {
+  return (
+    (draft.detector === "http_error" ||
+      draft.detector === "backend_http_client_error") &&
+    isClientErrorStatus(draft.anchor.status)
+  );
+}
+
+function sameClientErrorOperation(
+  left: CandidateDraft,
+  right: CandidateDraft,
+): boolean {
+  return (
+    left.anchor.method !== undefined &&
+    left.anchor.method === right.anchor.method &&
+    (left.anchor.url ?? left.anchor.route) !== undefined &&
+    (left.anchor.url ?? left.anchor.route) ===
+      (right.anchor.url ?? right.anchor.route)
+  );
+}
+
+function draftsAreCausallyRelated(
+  left: CandidateDraft,
+  right: CandidateDraft,
+  attribution: Map<string, CandidateAttribution> | undefined,
+  causalGraph?: CausalGraph,
+): boolean {
+  if (sameRequestId(left.anchor.requestId, right.anchor.requestId, causalGraph))
+    return true;
+  const leftAttr = attribution?.get(left.dedupeKey);
+  const rightAttr = attribution?.get(right.dedupeKey);
+  return (
+    leftAttr?.rootCauseId === right.dedupeKey ||
+    rightAttr?.rootCauseId === left.dedupeKey ||
+    leftAttr?.causes?.includes(right.dedupeKey) === true ||
+    rightAttr?.causes?.includes(left.dedupeKey) === true
+  );
+}
+
+/**
+ * Remove consumed client errors before dedupe so they cannot mint a candidate
+ * or a canonical issue. A different detector keeps the 4xx only when it shares
+ * the failed request or a causal graph thread, never because its anchor happens
+ * to fall inside the reader's evidence window.
+ */
+function removeConsumedClientErrors(
   drafts: CandidateDraft[],
   events: BugEvent[],
+  causalGraph?: CausalGraph,
+  attribution?: Map<string, CandidateAttribution>,
 ): void {
-  // Shared correlation ids (net.res `d.requestId`, not the browser-local `d.id`)
-  // whose frontend response was judged handled.
-  const handledSharedIds = new Set<string>();
-  const sawAuthChallenge = sessionHasAuthChallenge(events);
-  const bodyByBrowserId = responseBodyByRequestId(events);
-  const sharedIdByBrowserId = new Map<string, string>();
-  for (const event of events) {
-    if (event.k !== "net.res") continue;
-    const browserId = requestIdForEvent(event);
-    if (browserId === undefined) continue;
-    const sharedId = safeText(event.d.requestId, 120);
-    if (sharedId) sharedIdByBrowserId.set(browserId, sharedId);
-  }
-
-  const demote = (draft: CandidateDraft, groupKey: string): void => {
-    draft.severity = "low";
-    draft.confidence = "low";
-    draft.score = Math.min(draft.score, HANDLED_CLIENT_ERROR_SCORE);
-    draft.dedupeKey = groupKey;
-  };
-
+  const kept: CandidateDraft[] = [];
   for (const draft of drafts) {
-    if (draft.detector !== "http_error") continue;
-    const browserId = draft.anchor.requestId;
-    const body = browserId ? bodyByBrowserId.get(browserId) : undefined;
-    if (!isHandledClientError(draft.anchor.status, body, sawAuthChallenge))
+    if (!isClientErrorDraft(draft)) {
+      kept.push(draft);
       continue;
-    if (browserId) {
-      const sharedId = sharedIdByBrowserId.get(browserId);
-      if (sharedId) handledSharedIds.add(sharedId);
     }
-    // Group by what the outcome IS — method, target, status — dropping the
-    // per-attempt request id that kept four identical rejections apart.
-    demote(
-      draft,
-      `handled4xx:${draft.anchor.method ?? ""}:${draft.anchor.url ?? ""}:${draft.anchor.status ?? ""}`,
-    );
-  }
 
-  for (const draft of drafts) {
-    if (draft.detector !== "backend_http_client_error") continue;
-    const sharedId = draft.anchor.requestId;
-    const status = draft.anchor.status ?? 0;
-    const handled =
-      status === UNAUTHENTICATED_STATUS ||
-      (status === FORBIDDEN_STATUS && sawAuthChallenge) ||
-      (sharedId !== undefined && handledSharedIds.has(sharedId));
-    if (!handled) continue;
-    demote(
-      draft,
-      `handled4xx:backend:${draft.anchor.method ?? ""}:${draft.anchor.route ?? ""}:${draft.anchor.status ?? ""}`,
+    const context: ClientErrorContext = {
+      t: draft.anchor.t,
+      requestId: draft.anchor.requestId,
+      status: draft.anchor.status,
+      method: draft.anchor.method,
+      url: draft.anchor.url ?? draft.anchor.route,
+    };
+    const otherDetectorFired = drafts.some(
+      (other) =>
+        other !== draft &&
+        !isClientErrorDraft(other) &&
+        draftsAreCausallyRelated(draft, other, attribution, causalGraph),
     );
+    const operationRetried = drafts.some(
+      (other) =>
+        other !== draft &&
+        isClientErrorDraft(other) &&
+        sameClientErrorOperation(draft, other) &&
+        Math.abs(other.anchor.t - draft.anchor.t) <=
+          CLIENT_ERROR_RETRY_WINDOW_MS,
+    );
+    if (
+      isConsumedClientError(context, events, causalGraph) &&
+      !otherDetectorFired &&
+      !operationRetried
+    )
+      continue;
+
+    // Preserve one counted finding for an operation that had a consequence. The
+    // request id distinguishes attempts for evidence, not separate defects.
+    draft.dedupeKey = `client4xx:${draft.detector}:${draft.anchor.method ?? ""}:${draft.anchor.url ?? draft.anchor.route ?? ""}:${draft.anchor.status ?? ""}`;
+    kept.push(draft);
   }
+  drafts.splice(0, drafts.length, ...kept);
 }
 
 // ─── acknowledged_write_never_landed ─────────────────────────────────────────
@@ -13165,6 +14087,17 @@ function renderCandidatesMarkdown(
         lines.push(`* Error code: ${candidate.anchor.errorCode}`);
       if (candidate.anchor.message)
         lines.push(`* Message: ${candidate.anchor.message}`);
+      if (candidate.recovery) {
+        lines.push(
+          `* Recovery: ${
+            candidate.recovery.status === "recovered"
+              ? `recovered ${candidate.recovery.afterMs} ms later`
+              : candidate.recovery.status === "not_recovered"
+                ? "not recovered in the observed session"
+                : `unknown (${candidate.recovery.reason.replaceAll("_", " ")})`
+          }`,
+        );
+      }
       // The file and line is the shortest path from "something broke" to an open
       // editor, and it was reaching candidates.jsonl but not the markdown this
       // file tells every reader to start from.
@@ -13172,6 +14105,8 @@ function renderCandidatesMarkdown(
         lines.push(`* Source: ${candidate.anchor.frame}`);
       if (candidate.anchor.elementLabel)
         lines.push(`* Element: ${candidate.anchor.elementLabel}`);
+      if (candidate.anchor.elementSignature)
+        lines.push(`* Element signature: ${candidate.anchor.elementSignature}`);
       // Causal structure (CP4): additive per-candidate lines from the CP3 re-rank fields.
       if (candidate.causalRole)
         lines.push(`* Causal role: ${candidate.causalRole}`);
@@ -13406,6 +14341,17 @@ function renderWindowMarkdown(
     "",
     `- Candidate: ${candidate.title}`,
     `- Detector: ${candidate.detector}`,
+    ...(candidate.recovery
+      ? [
+          `- Recovery: ${
+            candidate.recovery.status === "recovered"
+              ? `recovered ${candidate.recovery.afterMs} ms later`
+              : candidate.recovery.status === "not_recovered"
+                ? "not recovered in the observed session"
+                : `unknown (${candidate.recovery.reason.replaceAll("_", " ")})`
+          }`,
+        ]
+      : []),
     `- Anchor: ${formatOffset(candidate.anchor.offsetMs, candidate.anchor.t)}`,
     `- Window: ${formatOffset(offsetFromStart(candidate.evidenceWindow.start, index.start), candidate.evidenceWindow.start)} to ${formatOffset(offsetFromStart(candidate.evidenceWindow.end, index.start), candidate.evidenceWindow.end)}`,
     "",

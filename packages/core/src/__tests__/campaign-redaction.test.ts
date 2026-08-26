@@ -161,7 +161,7 @@ describe("redactQueryString is unchanged by the campaign allowance", () => {
     const result = redactUrl("https://x.test/?utm_source=a");
     const value = new URL(result.value).searchParams.get("utm_source");
 
-    expect(value).toBe(REDACTED_VALUE);
+    expect(value).toBe("[REDACTED;len=1;charset=alpha]");
     expect(result.metadata?.fields).toEqual([
       {
         path: "url.query.utm_source",
@@ -176,6 +176,7 @@ describe("redactQueryString is unchanged by the campaign allowance", () => {
     const params = new URL(redactUrl(`https://x.test/?${search}`).value)
       .searchParams;
 
-    for (const name of ALLOWED) expect(params.get(name)).toBe(REDACTED_VALUE);
+    for (const name of ALLOWED)
+      expect(params.get(name)).toBe("[REDACTED;len=10;charset=alpha]");
   });
 });

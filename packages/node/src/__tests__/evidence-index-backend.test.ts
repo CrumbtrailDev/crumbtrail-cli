@@ -55,7 +55,7 @@ describe("buildEvidenceCandidates — backend errors", () => {
     expect(cand!.anchor.status).toBe(500);
   });
 
-  it("surfaces a backend.req.end 4xx as a medium-severity client error (score 66)", () => {
+  it("does not surface a clean backend.req.end 4xx", () => {
     const events: BugEvent[] = [
       {
         t: 3000,
@@ -73,10 +73,7 @@ describe("buildEvidenceCandidates — backend errors", () => {
     const cand = candidates.find(
       (c) => c.detector === "backend_http_client_error",
     );
-    expect(cand).toBeDefined();
-    expect(cand!.severity).toBe("medium");
-    expect(cand!.score).toBe(66);
-    expect(cand!.anchor.status).toBe(409);
+    expect(cand).toBeUndefined();
   });
 
   it("does not surface a backend.req.end below 400", () => {
@@ -319,13 +316,13 @@ describe("buildEvidenceCandidates — backend crash titles", () => {
             requestId: "req-2",
             method: "GET",
             pathname: "/v2/search?q=shoes",
-            statusCode: 404,
+            statusCode: 500,
           },
         },
       ],
       { start: 1000 },
     );
-    expect(cand.title).toBe("Backend HTTP 404 from GET /v2/search");
+    expect(cand.title).toBe("Backend HTTP 500 from GET /v2/search");
     expect(cand.anchor.url).toContain("/v2/search?q=");
   });
 

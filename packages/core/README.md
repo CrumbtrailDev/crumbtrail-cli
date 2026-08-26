@@ -31,6 +31,7 @@ Crumbtrail.init({
   httpEndpoint: "https://api.crumbtrail.ai",
   httpAuthToken: process.env.CRUMBTRAIL_KEY,
   remoteConfig: true,
+  release: "2026.08.26",
   // Backend origins this app calls. Leave it out only if your API is served
   // from the same origin as the page. See below.
   networkCorrelationAllowedOrigins: ["https://api.example.com"],
@@ -38,6 +39,33 @@ Crumbtrail.init({
 ```
 
 That's the whole integration — capture runs in the background from there.
+
+### Release identity
+
+Pass the application's release identifier as `release` when you have one:
+
+```ts
+Crumbtrail.init({
+  httpEndpoint: "https://api.crumbtrail.ai",
+  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,
+  remoteConfig: true,
+  release: import.meta.env.VITE_APP_VERSION,
+});
+```
+
+The SDK also reads common public `*_APP_VERSION` and `*_APP_BUILD` values from
+`import.meta.env` or `process.env` when a bundler exposes them. When the page
+declares `<meta name="app-build" content="...">`, that value is recorded as
+`build`. An explicit `release` wins over an inferred release. These are
+application values, not the SDK version.
+
+The session-start envelope and the session replay `replay.json` manifest carry
+`release` and `build` when known, plus the distinct `sdkVersion` that wrote
+them. Unknown application identity is omitted rather than guessed. Identity is
+resolved once at `init()` and remains the identity of that loaded page for its
+whole session, including SPA navigations. This records the stale shell's build
+so a later mismatch detector can compare it with a server-declared build. The
+SDK does not implement that detector here.
 
 ### Joining a backend on another origin
 
@@ -85,25 +113,30 @@ of the visit. A page that was already closed and then becomes visible again
 starts a new session. Set `endOnPageHide: false` only when your application
 owns session boundaries and will call `stop()` itself.
 
-### Catching the requests that beat init
+### Capturing page-load failures before init
 
-`init()` usually runs from an async import, so the fetches that render the
-first screen can finish before the network patch exists. Those requests leave
-no `net.req` and, more importantly, no correlation header, so their backend and
-database events cannot be joined to the session later.
+For page-load fetches, XHRs, and browser-managed subresource failures, this
+import is required when `init()` can run after the page starts loading. The
+normal entry still captures events after `init()`, but it cannot recover events
+that happened before its chunk evaluated. Without this import, those early
+events are not captured.
 
-Add one side-effect import above everything else in your entry file:
+Add this side-effect import as the first line of your entry file, above every
+other import:
 
 ```ts
 import "crumbtrail-core/early";
 ```
 
-It patches `fetch` and `XMLHttpRequest` synchronously, stamps the same
-correlation headers the SDK stamps on same origin requests, and parks bounded
-metadata (at most 50 requests, 2 MB of body text) until `init()` drains it
-through the normal redaction pipeline. `init()` adopts the session id it minted,
-so the early requests, the live session, and the backend events all match. If
-`init()` never runs within 60 seconds, the queue is dropped and recording stops.
+It patches `fetch` and `XMLHttpRequest` synchronously, listens for
+capture-phase subresource errors, stamps the same correlation headers the SDK
+stamps on same-origin requests, and parks bounded records in one queue. The
+queue holds at most 50 entries, 2 MB of request and response body text, 32 KB
+per request or response body, and 4 KB of URL text per resource failure. These
+fixed limits apply before configuration is known. The early queue keeps body
+text only in page memory and `init()` drains it through the normal redaction
+pipeline before emission. If `init()` never runs within 60 seconds, the queue
+and early resource listener are dropped and the patches become pass-throughs.
 
 ### Presets
 
@@ -112,6 +145,27 @@ so the early requests, the live session, and the backend events all match. If
 | `PRESET_PASSIVE` | Capture continuously and auto-flag on errors and signals. The default. |
 | `PRESET_LIGHT`   | Leaner capture, less overhead.                                         |
 | `PRESET_FULL`    | Everything, for a heavy debugging session.                             |
+
+### Automatic capture triggers
+
+The automatic triggers are `autoFlagOnError`,
+`autoFlagOnUncaughtError`, `autoFlagOnUnhandledRejection`,
+`autoFlagOnRequest5xx`, `autoFlagOnRenderedError`, and the configured signal
+triggers `autoFlagOnRageClick`, `autoFlagOnRetryStorm`,
+`autoFlagOnSlowResponse`, and `autoFlagOnAbandonedFlow`.
+`autoFlagDebounceMs` coalesces a burst and
+`autoFlagMaxPerSession` caps automatic reports across all triggers.
+
+`autoFlagOnRenderedError` is enabled by default. It watches browser-standard
+signals: `role="alert"` or `role="alertdialog"` entering the document,
+`aria-invalid="true"` appearing on a control, and native `invalid` events. A
+same-turn state that clears before the mutation batch settles is ignored.
+
+This trigger does not guess from CSS classes, test IDs, or error copy. It cannot
+cover plain error elements with none of these accessibility or browser
+validation signals, nor can it infer an error from `aria-describedby`,
+`aria-errormessage`, `:user-invalid`, or application-specific state that is not
+exposed through these standards.
 
 ### Flagging a bug yourself
 
@@ -326,6 +380,16 @@ The `errors` collector now listens for `securitypolicyviolation` and emits
 report-only policy distinguishable from an enforced one, since a report-only
 policy blocks nothing. The `sample` a browser may attach is a fragment of the
 page's own script or style text and is never read.
+
+### Subresource load failures (`net.err`)
+
+The `errors` collector also listens in the capture phase for browser-managed
+subresource failures. These use `net.err` with `transport: "resource"`, so they
+remain distinct from fetch and XHR failures (`transport: "fetch"` or `"xhr"`).
+The payload carries the lower-case element type, its resolved `url`, and
+`loading`, which is true while the document is still loading. URLs use the same
+redaction policy as every other captured URL, and the element's inline content
+is never read.
 
 ### Streaming responses
 

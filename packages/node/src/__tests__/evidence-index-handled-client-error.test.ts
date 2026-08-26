@@ -1,27 +1,15 @@
 import { describe, it, expect } from "vitest";
 import type { BugEvent } from "crumbtrail-core";
 import { buildEvidenceCandidates } from "../evidence-index";
+import { buildCausalGraph } from "../causal-graph";
 
-// A 4xx the application deliberately returned is a protocol outcome, not a
-// defect. Before this pass every status >= 400 became a medium/high-confidence
-// candidate scoring 70, so a live session that signed in with bad credentials
-// four times and rejected one expired coupon buried its only real defect (a
-// console.warn naming a wrong persisted order total) under twelve rows of
-// expected auth traffic.
-//
-// The rule graded here: an auth challenge (401/403), or any 4xx whose body is a
-// structured error object, is demoted to low/low and grouped by route+status.
-// Everything else — an unexplained 404, any 5xx — is untouched.
-
-/** A failed request plus the net.res carrying its body, as post-process emits them. */
+/** A failed response plus the failed-request index entry post-process emits. */
 function failure(opts: {
   t: number;
-  browserId: string;
+  id: string;
   method: string;
   url: string;
   status: number;
-  body?: string;
-  /** Shared correlation id linking this to a backend request. */
   requestId?: string;
 }): { event: BugEvent; failedReq: Record<string, unknown> } {
   return {
@@ -29,9 +17,8 @@ function failure(opts: {
       t: opts.t,
       k: "net.res",
       d: {
-        id: opts.browserId,
+        id: opts.id,
         st: opts.status,
-        ...(opts.body !== undefined ? { body: opts.body } : {}),
         ...(opts.requestId !== undefined ? { requestId: opts.requestId } : {}),
       },
     },
@@ -40,9 +27,7 @@ function failure(opts: {
       m: opts.method,
       url: opts.url,
       st: opts.status,
-      id: opts.browserId,
-      // post-process carries the exchange's correlation id onto the index entry
-      // alongside the browser-local id; see `correlationIdOf` in post-process.ts.
+      id: opts.id,
       ...(opts.requestId !== undefined ? { requestId: opts.requestId } : {}),
     },
   };
@@ -50,263 +35,179 @@ function failure(opts: {
 
 function build(
   failures: Array<ReturnType<typeof failure>>,
-  extra: { events?: BugEvent[]; start?: number } = {},
+  events: BugEvent[] = [],
+  withGraph = false,
 ) {
-  const events = [
-    ...failures.map((f) => f.event),
-    ...(extra.events ?? []),
-  ].sort((a, b) => a.t - b.t);
-  return buildEvidenceCandidates(events, {
-    start: extra.start ?? 900,
-    failedReqs: failures.map((f) => f.failedReq) as never,
-  });
+  const allEvents = [...failures.map((entry) => entry.event), ...events].sort(
+    (a, b) => a.t - b.t,
+  );
+  return buildEvidenceCandidates(
+    allEvents,
+    {
+      start: 900,
+      failedReqs: failures.map((entry) => entry.failedReq) as never,
+    },
+    withGraph ? buildCausalGraph({ events: allEvents }) : undefined,
+  );
 }
 
-describe("buildEvidenceCandidates — handled client errors", () => {
-  it("demotes and groups four invalid-credential 401s into one low signal", () => {
-    const candidates = build([
-      failure({
-        t: 1000,
-        browserId: "b1",
-        method: "POST",
-        url: "/api/login",
-        status: 401,
-        body: '{"error":"invalid_credentials"}',
-      }),
-      failure({
-        t: 2000,
-        browserId: "b2",
-        method: "POST",
-        url: "/api/login",
-        status: 401,
-        body: '{"error":"invalid_credentials"}',
-      }),
-      failure({
-        t: 3000,
-        browserId: "b3",
-        method: "POST",
-        url: "/api/login",
-        status: 401,
-        body: '{"error":"invalid_credentials"}',
-      }),
-      failure({
-        t: 4000,
-        browserId: "b4",
-        method: "POST",
-        url: "/api/login",
-        status: 401,
-        body: '{"error":"invalid_credentials"}',
-      }),
-    ]);
-
-    const http = candidates.filter((c) => c.detector === "http_error");
-    expect(http).toHaveLength(1);
-    expect(http[0].severity).toBe("low");
-    expect(http[0].confidence).toBe("low");
-    expect(http[0].score).toBeLessThanOrEqual(30);
-    // The count survives the collapse: four attempts is materially different
-    // from one, and dropping it would hide a credential-stuffing pattern.
-    expect(http[0].occurrences).toBe(4);
-    // Grouping keeps the earliest anchor so the window opens at the first hit.
-    expect(http[0].anchor.t).toBe(1000);
-  });
-
-  it("demotes an auth challenge that carries no body at all", () => {
-    // GET /api/me returning 401 for a logged-out visitor is the app working.
-    const candidates = build([
-      failure({
-        t: 1000,
-        browserId: "b1",
-        method: "GET",
-        url: "/api/me",
-        status: 401,
-      }),
-    ]);
-
-    const http = candidates.find((c) => c.detector === "http_error");
-    expect(http?.severity).toBe("low");
-    expect(http?.confidence).toBe("low");
-  });
-
-  it("demotes a 400 whose body is a structured error object", () => {
-    const candidates = build([
-      failure({
-        t: 1000,
-        browserId: "b1",
-        method: "POST",
-        url: "/api/checkout",
-        status: 400,
-        body: '{"error":"expired_coupon"}',
-      }),
-    ]);
-
-    const http = candidates.find((c) => c.detector === "http_error");
-    expect(http?.severity).toBe("low");
-    expect(http?.score).toBeLessThanOrEqual(30);
-  });
-
-  it("leaves an unexplained 404 at full severity", () => {
-    // No structured body and not an auth challenge: this may well be a routing
-    // bug, so nothing here licenses calling it expected.
-    const candidates = build([
-      failure({
-        t: 1000,
-        browserId: "b1",
-        method: "GET",
-        url: "/api/jobs",
-        status: 404,
-      }),
-    ]);
-
-    const http = candidates.find((c) => c.detector === "http_error");
-    expect(http?.severity).toBe("medium");
-    expect(http?.score).toBe(70);
-  });
-
-  it("leaves a 500 with a structured body at full severity", () => {
-    // A handler that formats its own crash is still a crash.
-    const candidates = build([
-      failure({
-        t: 1000,
-        browserId: "b1",
-        method: "POST",
-        url: "/api/checkout",
-        status: 500,
-        body: '{"error":"internal"}',
-      }),
-    ]);
-
-    const http = candidates.find((c) => c.detector === "http_error");
-    expect(http?.severity).toBe("high");
-    expect(http?.score).toBe(90);
-  });
-
-  it("ranks a first-party console warning above every handled 4xx", () => {
-    // The regression this whole pass exists for: the real defect was a
-    // console.warn at rank 29 of 29, under twelve expected auth rows.
+describe("buildEvidenceCandidates — consumed client errors", () => {
+  it("does not raise a client error that has no captured consequence", () => {
     const candidates = build(
       [
         failure({
           t: 1000,
-          browserId: "b1",
-          method: "POST",
-          url: "/api/login",
+          id: "r1",
+          method: "GET",
+          url: "/resource",
           status: 401,
-          body: '{"error":"invalid_credentials"}',
-        }),
-        failure({
-          t: 2000,
-          browserId: "b2",
-          method: "POST",
-          url: "/api/checkout",
-          status: 400,
-          body: '{"error":"expired_coupon"}',
         }),
       ],
-      {
-        events: [
-          {
-            t: 3000,
-            k: "con",
-            d: {
-              lv: "warn",
-              args: [
-                "Total mismatch — persisted 107104¢ but server computed 91400¢",
-              ],
-            },
-          },
-        ],
-      },
+      [
+        // The application continued its normal page flow after consuming the
+        // completed response. No error or retry followed it.
+        { t: 1100, k: "net.req", d: { id: "r2", m: "GET", url: "/catalog" } },
+        { t: 1200, k: "net.res", d: { id: "r2", st: 200 } },
+      ],
     );
 
-    expect(candidates[0].detector).toBe("console_warning");
-    const rank = (detector: string) =>
-      candidates.findIndex((c) => c.detector === detector);
-    expect(rank("console_warning")).toBeLessThan(rank("http_error"));
+    expect(candidates.filter((c) => c.detector === "http_error")).toHaveLength(
+      0,
+    );
   });
 
-  it("demotes a backend 4xx that shares a demoted request id", () => {
-    // The same outcome observed on the backend plane must not survive at
-    // medium after the frontend view of it was demoted, or one expected
-    // rejection still produces two rows.
+  it("does not keep a client error for an unrelated candidate in the consequence window", () => {
     const candidates = build(
       [
         failure({
-          t: 2000,
-          browserId: "b1",
-          method: "POST",
-          url: "/api/checkout",
-          status: 400,
-          body: '{"error":"expired_coupon"}',
-          requestId: "shared-req-1",
+          t: 1000,
+          id: "r1",
+          method: "GET",
+          url: "/api/me",
+          status: 401,
         }),
       ],
-      {
-        events: [
-          {
-            t: 2000,
-            k: "backend.req.end",
-            d: {
-              requestId: "shared-req-1",
-              method: "POST",
-              route: "/",
-              statusCode: 400,
-            },
-          },
-        ],
-      },
-    );
-
-    const backend = candidates.find(
-      (c) => c.detector === "backend_http_client_error",
-    );
-    expect(backend?.severity).toBe("low");
-    expect(backend?.score).toBeLessThanOrEqual(30);
-  });
-
-  it("demotes a backend auth challenge on its own evidence", () => {
-    const candidates = build([], {
-      events: [
+      [
+        // This is a separate database request, close enough to trigger the old
+        // session-wide consequence test but unrelated to /api/me.
         {
           t: 2000,
-          k: "backend.req.end",
-          d: {
-            requestId: "shared-req-2",
-            method: "POST",
-            route: "/login",
-            statusCode: 401,
-          },
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 1 },
+        },
+        {
+          t: 2100,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 2 },
+        },
+        {
+          t: 2200,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 3 },
+        },
+        {
+          t: 2300,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 4 },
+        },
+        {
+          t: 2400,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 5 },
+        },
+        {
+          t: 2500,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 6 },
+        },
+        {
+          t: 2600,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 7 },
+        },
+        {
+          t: 2700,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 8 },
         },
       ],
-    });
-
-    const backend = candidates.find(
-      (c) => c.detector === "backend_http_client_error",
+      true,
     );
-    expect(backend?.severity).toBe("low");
-    expect(backend?.confidence).toBe("low");
+
+    expect(
+      candidates.find((c) => c.detector === "n_plus_one_query"),
+    ).toBeDefined();
+    expect(candidates.filter((c) => c.detector === "http_error")).toHaveLength(
+      0,
+    );
   });
 
-  it("leaves an unexplained backend 4xx at medium", () => {
-    const candidates = build([], {
-      events: [
+  it("keeps a client error followed by a surfaced failure", () => {
+    const candidates = build(
+      [
+        failure({
+          t: 1000,
+          id: "r1",
+          method: "POST",
+          url: "/checkout",
+          status: 401,
+        }),
+      ],
+      [
         {
-          t: 2000,
-          k: "backend.req.end",
-          d: {
-            requestId: "shared-req-3",
-            method: "GET",
-            route: "/reports/:id",
-            statusCode: 409,
-          },
+          t: 1100,
+          k: "con",
+          d: { lv: "err", args: ["checkout could not continue"] },
         },
       ],
+    );
+
+    const http = candidates.find((c) => c.detector === "http_error");
+    expect(http).toMatchObject({ severity: "medium", score: 70 });
+  });
+
+  it("always raises a 5xx, even when the client continues normally", () => {
+    const candidates = build([
+      failure({
+        t: 1000,
+        id: "r1",
+        method: "POST",
+        url: "/checkout",
+        status: 500,
+      }),
+    ]);
+
+    expect(candidates.find((c) => c.detector === "http_error")).toMatchObject({
+      severity: "high",
+      score: 90,
+    });
+  });
+
+  it("keeps a retry of the same client-error operation visible", () => {
+    const first = failure({
+      t: 1000,
+      id: "r1",
+      method: "POST",
+      url: "/checkout",
+      status: 409,
+    });
+    const second = failure({
+      t: 2000,
+      id: "r2",
+      method: "POST",
+      url: "/checkout",
+      status: 409,
     });
 
-    const backend = candidates.find(
-      (c) => c.detector === "backend_http_client_error",
+    const candidates = build([first, second], [
+      { t: 1500, k: "net.req", d: { id: "r2", m: "POST", url: "/checkout" } },
+    ]);
+
+    expect(candidates.filter((c) => c.detector === "http_error")).toHaveLength(
+      1,
     );
-    expect(backend?.severity).toBe("medium");
-    expect(backend?.score).toBe(66);
+    expect(
+      candidates.find((c) => c.detector === "http_error")?.occurrences,
+    ).toBe(2);
   });
 });

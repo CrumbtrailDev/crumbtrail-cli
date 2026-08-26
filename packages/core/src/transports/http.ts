@@ -385,6 +385,20 @@ export class HttpTransport implements CrumbtrailTransport {
     return JSON.stringify({ sessionId: this.sessionId, events });
   }
 
+  /**
+   * `sendBeacon` cannot set headers. The ingest key is already public in a
+   * browser bundle, so the two eligible unload routes accept it in this JSON
+   * envelope instead. Keep it out of ordinary fetch bodies and never put it in
+   * the URL, where proxies and access logs would retain it.
+   */
+  private beaconBody(body: string): string {
+    if (!this.authToken) return body;
+    return JSON.stringify({
+      ...(JSON.parse(body) as Record<string, unknown>),
+      ingestKey: this.authToken,
+    });
+  }
+
   private async postEvents(events: BugEvent[]): Promise<void> {
     const body = this.eventsBody(events);
     const init: RequestInit = {
@@ -400,21 +414,9 @@ export class HttpTransport implements CrumbtrailTransport {
       response = await fetch(`${this.endpoint}/api/events`, init);
     } catch {
       // During teardown fetch can be torn down mid-flight; sendBeacon is queued
-      // by the browser and survives unload. sessionId is already in the body.
-      //
-      // A beacon cannot carry a request header, so on an authenticated project
-      // it would post the final batch — the one holding the failure that made
-      // the user leave — without the ingest key, be refused server side, and
-      // return `true` for "queued" anyway. That is a phantom delivery, so the
-      // loss is reported instead of dressed up as success.
+      // by the browser and survives unload. It carries the public ingest key in
+      // the JSON body because a beacon cannot carry a request header.
       this.warnUnreachable("captured events");
-      if (this.authToken) {
-        this.warnOnce(
-          "beacon-auth",
-          "the page unloaded mid-flush and the unload path cannot carry the ingest key, so the final batch was not delivered",
-        );
-        throw new EventDeliveryError(0, events.length);
-      }
       // The return value matters. A page that logs in a tight loop exhausts the
       // browser's in-flight request budget, every fetch rejects, and the beacon
       // queue is full too — so `sendBeacon` answers false and the batch is
@@ -424,7 +426,9 @@ export class HttpTransport implements CrumbtrailTransport {
         typeof navigator !== "undefined" &&
         typeof navigator.sendBeacon === "function"
       ) {
-        const blob = new Blob([body], { type: "application/json" });
+        const blob = new Blob([this.beaconBody(body)], {
+          type: "application/json",
+        });
         if (navigator.sendBeacon(`${this.endpoint}/api/events`, blob)) return;
       }
       throw new EventDeliveryError(0, events.length);
@@ -585,12 +589,8 @@ export class HttpTransport implements CrumbtrailTransport {
     let response: Response | undefined;
     try {
       // `keepalive` is what makes this survive an unload. A plain fetch is
-      // cancelled the moment the document goes away, and the sendBeacon
-      // fallback that used to cover that cannot carry `X-Crumbtrail-Auth`, so
-      // on an authenticated project nothing closed the session at all — it sat
-      // unreadable until the idle sweeper reached it, half an hour later. A
-      // keepalive fetch keeps the headers and is well inside the 64KB cap this
-      // body (a session id) uses a few dozen bytes of.
+      // cancelled the moment the document goes away. This fetch keeps the
+      // header and is well inside the 64KB cap this body uses.
       response = await fetch(`${this.endpoint}/api/session/end`, {
         method: "POST",
         headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
@@ -598,21 +598,16 @@ export class HttpTransport implements CrumbtrailTransport {
         keepalive: true,
       });
     } catch {
-      // Only reached when keepalive itself is unavailable or refused (an old
-      // engine, or a body over the cap — not this one). A beacon carries no
-      // header, so an authenticated project cannot deliver this either.
-      if (this.authToken) {
-        this.warnOnce(
-          "beacon-auth-end",
-          "the page unloaded before the session could be closed and the unload path cannot carry the ingest key",
-        );
-        return;
-      }
+      // Only reached when keepalive itself is unavailable or refused. A beacon
+      // carries the public ingest key in the JSON body because it cannot carry
+      // a request header.
       if (
         typeof navigator !== "undefined" &&
         typeof navigator.sendBeacon === "function"
       ) {
-        const blob = new Blob([body], { type: "application/json" });
+        const blob = new Blob([this.beaconBody(body)], {
+          type: "application/json",
+        });
         navigator.sendBeacon(`${this.endpoint}/api/session/end`, blob);
       }
       return;

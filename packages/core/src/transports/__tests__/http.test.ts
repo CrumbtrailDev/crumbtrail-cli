@@ -92,9 +92,8 @@ describe("HttpTransport", () => {
     expect(call[1].keepalive).toBeUndefined();
   });
 
-  // A beacon carries no headers, so it can only be a real delivery path where
-  // the ingest endpoint needs no credential. The authenticated case reports the
-  // loss instead — see http-refusals.test.ts.
+  // The authenticated beacon contract is covered in http-refusals.test.ts.
+  // This case verifies the same JSON and content type for a local endpoint.
   it("falls back to sendBeacon on sendEvents fetch failure", async () => {
     const transport = new HttpTransport(endpoint);
     await transport.startSession("ses_test", {});
@@ -181,7 +180,7 @@ describe("HttpTransport", () => {
     await transport.endSession("ses_test");
 
     // keepalive is what lets this survive an unload while still carrying the
-    // ingest key, which the sendBeacon fallback could never do.
+    // ingest key. The beacon fallback carries it in the JSON body.
     expect(fetch).toHaveBeenCalledWith(`${endpoint}/api/session/end`, {
       method: "POST",
       headers: {

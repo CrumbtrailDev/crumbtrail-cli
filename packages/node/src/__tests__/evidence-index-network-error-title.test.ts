@@ -59,15 +59,15 @@ describe("candidate titles — no leaked placeholders", () => {
   it("names the missing URL on an http_error rather than printing undefined", () => {
     const index = {
       start: 900,
-      failedReqs: [{ t: 1000, st: 401, id: "req-1" }],
+      failedReqs: [{ t: 1000, st: 500, id: "req-1" }],
     };
 
     const candidate = buildEvidenceCandidates(
-      [{ t: 1000, k: "net.res", d: { id: "req-1", st: 401 } }],
+      [{ t: 1000, k: "net.res", d: { id: "req-1", st: 500 } }],
       index,
     ).find((c) => c.detector === "http_error");
 
-    expect(candidate?.title).toBe("HTTP 401 from request unknown URL");
+    expect(candidate?.title).toBe("HTTP 500 from request unknown URL");
     expect(candidate?.title).not.toContain("undefined");
   });
 
@@ -153,7 +153,11 @@ describe("candidate titles — no leaked placeholders", () => {
       t,
       k: "clk" as const,
       d: {
-        target: { label: "sk-ABCD1234ABCD1234ABCD1234", role: "button" },
+        el: { sig: "masked-target" },
+        target: {
+          label: "sk-ABCD1234ABCD1234ABCD1234",
+          role: "button",
+        },
       },
     }));
 
@@ -161,20 +165,24 @@ describe("candidate titles — no leaked placeholders", () => {
       (c) => c.detector === "repeated_clicks",
     );
 
-    expect(candidate?.title).toBe("Repeated clicks on a button");
+    expect(candidate?.title).toBe(
+      "Repeated clicks on a button had no recorded consequence",
+    );
   });
 
   it("falls back to a plain phrase when a click has no usable identity", () => {
     const clicks = [1000, 1500, 2000].map((t) => ({
       t,
       k: "clk" as const,
-      d: {},
+      d: { el: { sig: "unlabeled-target" } },
     }));
 
     const candidate = buildEvidenceCandidates(clicks, { start: 900 }).find(
       (c) => c.detector === "repeated_clicks",
     );
 
-    expect(candidate?.title).toBe("Repeated clicks on an unlabeled element");
+    expect(candidate?.title).toBe(
+      "Repeated clicks on an unlabeled element had no recorded consequence",
+    );
   });
 });

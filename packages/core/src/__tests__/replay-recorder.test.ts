@@ -103,7 +103,28 @@ describe("ReplayRecorder", () => {
     ]);
     const chunk = await chunkAt(uploads, "replay-000000.json.gz");
     expect(chunk.e[0]?.[0]).toBe(ReplayEventTag.Snapshot);
-    expect(latestManifest(uploads).chunks[0]?.checkout).toBe(true);
+    const manifest = latestManifest(uploads);
+    expect(manifest.chunks[0]?.checkout).toBe(true);
+    expect(manifest).not.toHaveProperty("release");
+    expect(manifest).not.toHaveProperty("build");
+    expect(manifest).not.toHaveProperty("sdkVersion");
+    await recorder.stop();
+  });
+
+  it("carries application and SDK identities in the manifest", async () => {
+    const { recorder, uploads } = makeRecorder({
+      release: "release-2026.08.26",
+      build: "build-2026.08.26",
+      sdkVersion: "0.39.0",
+    });
+    recorder.start();
+    await recorder.flush();
+
+    expect(latestManifest(uploads)).toMatchObject({
+      release: "release-2026.08.26",
+      build: "build-2026.08.26",
+      sdkVersion: "0.39.0",
+    });
     await recorder.stop();
   });
 

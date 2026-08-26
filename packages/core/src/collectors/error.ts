@@ -8,6 +8,9 @@ import {
   type PayloadSummary,
   type RedactionMetadata,
 } from "../redaction";
+import { drainEarlyCapture } from "../early-capture";
+import { resourceFailureForTarget } from "../resource-failure";
+import { emitResourceFailure } from "../resource-failure-event";
 
 function bodyPlaceholder(summary: PayloadSummary | undefined): string {
   return summary ? `[${summary.action}:${summary.reason}]` : "[REDACTED]";
@@ -61,6 +64,15 @@ export function errorCollector(
   config: CrumbtrailConfig,
 ): CollectorCleanup {
   const onError = (event: ErrorEvent) => {
+    const resource = resourceFailureForTarget(event.target);
+    if (resource) {
+      emitResourceFailure(bus, {
+        ...resource,
+        loading: document.readyState === "loading",
+      });
+      return;
+    }
+
     bus.emit({
       t: now(),
       k: "err",
@@ -146,16 +158,33 @@ export function errorCollector(
     typeof document.addEventListener === "function";
 
   if (windowEvents) {
-    window.addEventListener("error", onError);
+    // Resource errors do not bubble. Capture phase is required to observe the
+    // element target while keeping ordinary window runtime errors on `err`.
+    window.addEventListener("error", onError, true);
     window.addEventListener("unhandledrejection", onRejection);
   }
   if (documentEvents) {
     document.addEventListener("securitypolicyviolation", onCspViolation);
   }
 
+  // The network collector owns the shared queue when it is enabled. When it is
+  // disabled, this collector is the sole owner of queued resource failures.
+  // The collector map invokes errors before network, but only one branch can
+  // drain because both collectors use the same config toggle.
+  if (config.network !== true) {
+    for (const record of drainEarlyCapture()) {
+      if (record.kind !== "resource-error") continue;
+      try {
+        emitResourceFailure(bus, record);
+      } catch {
+        // A malformed early record never costs the rest of the queue.
+      }
+    }
+  }
+
   return () => {
     if (windowEvents) {
-      window.removeEventListener("error", onError);
+      window.removeEventListener("error", onError, true);
       window.removeEventListener("unhandledrejection", onRejection);
     }
     if (documentEvents) {
