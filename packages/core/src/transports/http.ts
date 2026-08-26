@@ -192,6 +192,22 @@ export class HttpTransport implements CrumbtrailTransport {
    * refresh recovers.
    */
   private startRefusedStatus = 0;
+  /**
+   * Settles when the in-flight `/api/session/start` has been answered.
+   *
+   * The server creates the sessions row inside that request, so anything sent
+   * before it lands names a session the server has never heard of and is
+   * answered `404 Session not found` — the console line an integrator reads as
+   * "capture is broken" while the session is in fact starting normally. The
+   * flush interval is not a guarantee: a burst that fills the batch buffer
+   * flushes immediately, and on a real network the start round trip is the
+   * slower of the two. Every send therefore waits for this first.
+   *
+   * Never rejects. A refused start is remembered by `startRefusedStatus` and
+   * answered locally by `standingRefusal`, which is the caller's signal to
+   * record the gap; a rejection here would turn that into an unhandled one.
+   */
+  private sessionReady: Promise<void> = Promise.resolve();
   /** Epoch ms until which the server has asked us to stop sending. */
   private shedUntil = 0;
   /** The server's reason for the active shed, for the gap the caller records. */
@@ -280,6 +296,7 @@ export class HttpTransport implements CrumbtrailTransport {
 
   async sendEvents(events: BugEvent[]): Promise<void> {
     if (events.length === 0) return;
+    await this.sessionReady;
     const standing = this.standingRefusal(events.length);
     if (standing) throw standing;
     await this.deliverAll(this.splitToBudget(events));
@@ -453,6 +470,7 @@ export class HttpTransport implements CrumbtrailTransport {
     blob: Blob,
     metadata?: Record<string, unknown>,
   ): Promise<void> {
+    await this.sessionReady;
     const headers = this.withAuthHeaders({
       "Content-Type": "application/octet-stream",
       "X-Session-Id": this.sessionId,
@@ -476,6 +494,19 @@ export class HttpTransport implements CrumbtrailTransport {
     metadata: Record<string, unknown>,
   ): Promise<void> {
     this.sessionId = sessionId;
+    const attempt = this.postSessionStart(sessionId, metadata);
+    // Held before awaiting, so a send racing this very call still waits.
+    this.sessionReady = attempt.then(
+      () => {},
+      () => {},
+    );
+    return attempt;
+  }
+
+  private async postSessionStart(
+    sessionId: string,
+    metadata: Record<string, unknown>,
+  ): Promise<void> {
     let response: Response;
     try {
       response = await fetch(`${this.endpoint}/api/session/start`, {
@@ -512,6 +543,7 @@ export class HttpTransport implements CrumbtrailTransport {
     events: BugEvent[],
     voiceBlob?: Blob,
   ): Promise<void> {
+    await this.sessionReady;
     const response = await fetch(`${this.endpoint}/api/bug/flag`, {
       method: "POST",
       headers: this.withAuthHeaders({ "Content-Type": "application/json" }),

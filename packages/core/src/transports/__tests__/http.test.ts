@@ -348,3 +348,69 @@ describe("HttpTransport", () => {
     });
   });
 });
+
+describe("HttpTransport session start ordering", () => {
+  const endpoint = "http://localhost:9898";
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("holds events until the session start has been answered", async () => {
+    const calls: string[] = [];
+    let releaseStart: (() => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        calls.push(String(url));
+        if (String(url).endsWith("/api/session/start")) {
+          await new Promise<void>((resolve) => {
+            releaseStart = resolve;
+          });
+        }
+        return new Response('{"ok":true}');
+      }),
+    );
+    const transport = new HttpTransport(endpoint, { authToken: "t" });
+
+    // The caller does not await the start, which is what a page burst does.
+    const start = transport.startSession("ses_race", {});
+    const send = transport.sendEvents([{ t: 1, k: "con", d: {} }]);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(calls).toEqual([`${endpoint}/api/session/start`]);
+
+    releaseStart?.();
+    await start;
+    await send;
+
+    expect(calls).toEqual([
+      `${endpoint}/api/session/start`,
+      `${endpoint}/api/events`,
+    ]);
+  });
+
+  it("refuses events locally when the start it waited for was refused", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        String(url).endsWith("/api/session/start")
+          ? new Response('{"error":"upgrade required"}', { status: 402 })
+          : new Response('{"ok":true}'),
+      ),
+    );
+    const transport = new HttpTransport(endpoint, { authToken: "t" });
+
+    const start = transport.startSession("ses_refused", {});
+    const send = transport.sendEvents([{ t: 1, k: "con", d: {} }]);
+
+    await expect(start).rejects.toThrow();
+    await expect(send).rejects.toBeInstanceOf(EventDeliveryError);
+    expect(
+      (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls.map(
+        (call) => call[0],
+      ),
+    ).toEqual([`${endpoint}/api/session/start`]);
+  });
+});
