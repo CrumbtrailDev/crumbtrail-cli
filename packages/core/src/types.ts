@@ -231,6 +231,13 @@ export interface CaptureGapEventData {
     /** Events were dropped from the pending batch because the bus buffer hit its cap. */
     | "buffer_overflow"
     /**
+     * A capture policy lowered the ring buffer's retention mid-session and the
+     * shrink evicted events that were already held. The window a later report
+     * is cut from is shorter than the session that led to it, and this is what
+     * says so rather than letting the evidence go quietly.
+     */
+    | "retention_reduced"
+    /**
      * Reasons authored by the hosted capture edge rather than by an SDK.
      *
      * The edge writes `k:"capture_gap"` events of its own when it sheds or

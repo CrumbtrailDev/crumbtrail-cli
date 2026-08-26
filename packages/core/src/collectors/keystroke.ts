@@ -43,7 +43,6 @@ export function keystrokeCollector(
 ): CollectorCleanup {
   let lastKeystrokeTs = 0;
   let lastKeyupTs = 0;
-  const throttleMs = config.keystrokeThrottleMs;
 
   function getModifiers(e: KeyboardEvent): string | undefined {
     let mod = "";
@@ -135,6 +134,9 @@ export function keystrokeCollector(
   function emitKeyEvent(e: KeyboardEvent, dir: "dn" | "up"): void {
     const t = now();
 
+    // Read per event rather than snapshotted at install: a remote policy sets the throttle
+    // mid-session and the running collector is the one it has to reach.
+    const throttleMs = config.keystrokeThrottleMs;
     if (dir === "up" && throttleMs > 0 && t - lastKeyupTs < throttleMs) {
       return;
     }

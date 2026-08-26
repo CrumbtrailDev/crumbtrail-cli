@@ -1173,7 +1173,9 @@ describe("networkCollector — fetch failures", () => {
   });
 
   it("carries correlation IDs on net.err when header injection is enabled", async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    globalThis.fetch = vi
+      .fn()
+      .mockRejectedValue(new TypeError("Failed to fetch"));
     const { events, bus, cleanup, sessionId } = collect({
       networkCorrelationHeaders: true,
     });
@@ -1193,7 +1195,9 @@ describe("networkCollector — fetch failures", () => {
   });
 
   it("redacts sensitive query params in the net.err url", async () => {
-    globalThis.fetch = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    globalThis.fetch = vi
+      .fn()
+      .mockRejectedValue(new TypeError("Failed to fetch"));
     const { events, bus, cleanup } = collect();
 
     await expect(
@@ -1205,5 +1209,43 @@ describe("networkCollector — fetch failures", () => {
     expect(String(err!.d.url)).not.toContain("supersecret");
 
     cleanup();
+  });
+});
+
+describe("network collector cleanup", () => {
+  it("restores XHR even when the fetch restore throws", () => {
+    const originalFetch = globalThis.fetch;
+    const originalOpen = XMLHttpRequest.prototype.open;
+    const originalSend = XMLHttpRequest.prototype.send;
+    const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+    const { cleanup } = collect();
+    expect(XMLHttpRequest.prototype.open).not.toBe(originalOpen);
+
+    // A host that froze `fetch` after the collector patched it. Sequentially,
+    // this throw skipped every restore after it and left XHR patched with no
+    // teardown left to remove it.
+    const patchedFetch = globalThis.fetch;
+    Object.defineProperty(globalThis, "fetch", {
+      value: patchedFetch,
+      writable: false,
+      configurable: true,
+    });
+
+    // The failure is reported rather than swallowed: the caller poisons the
+    // collector on it, which is what stops a second copy being installed.
+    expect(() => cleanup()).toThrow(/could not fully restore/);
+
+    expect(XMLHttpRequest.prototype.open).toBe(originalOpen);
+    expect(XMLHttpRequest.prototype.send).toBe(originalSend);
+    expect(XMLHttpRequest.prototype.setRequestHeader).toBe(
+      originalSetRequestHeader,
+    );
+
+    Object.defineProperty(globalThis, "fetch", {
+      value: originalFetch,
+      writable: true,
+      configurable: true,
+    });
   });
 });
