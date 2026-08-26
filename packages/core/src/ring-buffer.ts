@@ -1,4 +1,4 @@
-import type { BugEvent } from './types';
+import type { BugEvent } from "./types";
 
 export class RingBuffer {
   private events: BugEvent[] = [];
@@ -25,7 +25,10 @@ export class RingBuffer {
   }
 
   snapshot(windowMs?: number): BugEvent[] {
-    const now = this.events.length > 0 ? this.events[this.events.length - 1].t : Date.now();
+    const now =
+      this.events.length > 0
+        ? this.events[this.events.length - 1].t
+        : Date.now();
     const cutoff = now - (windowMs ?? this.maxMs);
     return this.events.filter((e) => e.t >= cutoff);
   }
@@ -35,7 +38,8 @@ export class RingBuffer {
   }
 
   /**
-   * Move the live bounds without rebuilding the buffer.
+   * Move the live bounds without rebuilding the buffer, and report how many events the move
+   * evicted so the caller can account for the evidence it cost.
    *
    * A remote capture policy sets `ringBufferMs` / `ringBufferMaxEvents` mid-session, and a
    * buffer that only reads its bounds at construction would honour that on the next page load
@@ -43,14 +47,16 @@ export class RingBuffer {
    * so a policy asking for less retention gets less retention at once rather than after the
    * next push; loosening only raises the ceiling and drops nothing.
    *
-   * A non-finite or negative value is ignored rather than coerced: bounds arrive from an
-   * unauthenticated response body, and a `NaN` cutoff would silently evict the whole buffer.
+   * A bound that is not a whole number, or is below its own minimum, is ignored rather than
+   * coerced. The rules match the ones the remote boundary applies — a whole millisecond count
+   * for `maxMs`, at least one event for `maxEvents` — so the buffer and the bus that caps the
+   * same events can never end up on different ceilings.
    */
-  setBounds(bounds: { maxMs?: number; maxEvents?: number }): void {
+  setBounds(bounds: { maxMs?: number; maxEvents?: number }): number {
     let changed = false;
     if (
       typeof bounds.maxMs === "number" &&
-      Number.isFinite(bounds.maxMs) &&
+      Number.isInteger(bounds.maxMs) &&
       bounds.maxMs >= 0 &&
       bounds.maxMs !== this.maxMs
     ) {
@@ -59,18 +65,20 @@ export class RingBuffer {
     }
     if (
       typeof bounds.maxEvents === "number" &&
-      Number.isFinite(bounds.maxEvents) &&
-      bounds.maxEvents >= 0 &&
+      Number.isInteger(bounds.maxEvents) &&
+      bounds.maxEvents >= 1 &&
       bounds.maxEvents !== this.maxEvents
     ) {
       this.maxEvents = bounds.maxEvents;
       changed = true;
     }
-    if (!changed || this.events.length === 0) return;
+    if (!changed || this.events.length === 0) return 0;
+    const before = this.events.length;
     // Evict against the newest event rather than the wall clock, matching `push`: the buffer's
     // notion of "now" is the last event it saw, so a shrink applies the same cutoff a push
     // arriving at that instant would have applied.
     this.evict(this.events[this.events.length - 1].t);
+    return before - this.events.length;
   }
 
   get size(): number {

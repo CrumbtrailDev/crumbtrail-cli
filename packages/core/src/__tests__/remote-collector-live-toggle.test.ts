@@ -56,7 +56,10 @@ type Internals = {
   collectorTeardowns: Map<string, () => void>;
   envEmitted: boolean;
   applyRemoteConfig: (settings: Record<string, unknown>) => void;
-  bus: { tap: (fn: (event: BugEvent) => void) => () => void };
+  bus: {
+    tap: (fn: (event: BugEvent) => void) => () => void;
+    flush: () => void;
+  };
 };
 
 function start(overrides: Record<string, unknown> = {}) {
@@ -117,10 +120,11 @@ describe("collector switches applied to a live session", () => {
     await logger.stop();
   });
 
-  it("starts a collector that was off at init", async () => {
-    const { logger, internals, kinds } = start({ console: false });
+  it("restarts a collector an earlier poll turned off", async () => {
+    const { logger, internals, kinds } = start({ console: true });
 
-    console.log("before");
+    internals.applyRemoteConfig({ collectors: { console: false } });
+    console.log("while off");
     expect(kinds("con")).toHaveLength(0);
 
     internals.applyRemoteConfig({ collectors: { console: true } });
@@ -130,8 +134,22 @@ describe("collector switches applied to a live session", () => {
     await logger.stop();
   });
 
-  it("installs a started collector against the config as it stands now", async () => {
-    const { logger, internals, kinds } = start({ scroll: false });
+  it("never starts a collector the application left off at init", async () => {
+    const { logger, internals, kinds } = start({ console: false });
+
+    internals.applyRemoteConfig({ collectors: { console: true } });
+
+    console.log("after");
+    expect(kinds("con")).toHaveLength(0);
+    expect(internals.config.console).toBe(false);
+    expect(internals.collectorTeardowns.has("console")).toBe(false);
+    await logger.stop();
+  });
+
+  it("installs a restarted collector against the config as it stands now", async () => {
+    const { logger, internals, kinds } = start({ scroll: true });
+
+    internals.applyRemoteConfig({ collectors: { scroll: false } });
 
     // The throttle and the switch arrive on the same poll. A collector built
     // from the init config would run at 0ms and emit on every scroll event.
@@ -197,26 +215,28 @@ describe("collector switches applied to a live session", () => {
   });
 
   it("ignores switches for settings that have no collector of their own", async () => {
-    const { logger, internals } = start({ domSnapshot: false, campaign: false });
+    const { logger, internals } = start({ domSnapshot: true, campaign: true });
 
     internals.applyRemoteConfig({
-      collectors: { domSnapshot: true, campaign: true },
+      collectors: { domSnapshot: false, campaign: false },
     });
 
     // Both are read by other code — `domSnapshot` when a bug is flagged,
     // `campaign` by the environment snapshot — so the config value is the whole
-    // of the change and nothing is installed.
-    expect(internals.config.domSnapshot).toBe(true);
-    expect(internals.config.campaign).toBe(true);
+    // of the change and there is nothing to tear down.
+    expect(internals.config.domSnapshot).toBe(false);
+    expect(internals.config.campaign).toBe(false);
     expect(internals.collectorTeardowns.has("domSnapshot")).toBe(false);
     expect(internals.collectorTeardowns.has("campaign")).toBe(false);
     await logger.stop();
   });
 
   it("does nothing once the session has stopped", async () => {
-    const { logger, internals } = start({ console: false });
+    const { logger, internals } = start({ console: true });
     await logger.stop();
+    expect(internals.collectorTeardowns.size).toBe(0);
 
+    internals.applyRemoteConfig({ collectors: { console: false } });
     internals.applyRemoteConfig({ collectors: { console: true } });
 
     expect(internals.collectorTeardowns.size).toBe(0);
@@ -241,8 +261,9 @@ describe("collectors that stop live but start only on the next page load", () =>
   });
 
   it("defers turning the performance collector back on to the next page load", async () => {
-    const { logger, internals } = start({ performance: false });
+    const { logger, internals } = start({ performance: true });
 
+    internals.applyRemoteConfig({ collectors: { performance: false } });
     internals.applyRemoteConfig({ collectors: { performance: true } });
 
     // The config carries the policy, so the next page load installs it. This
@@ -260,7 +281,10 @@ describe("ring buffer bounds applied to a live session", () => {
     const ringBuffer = (logger as unknown as { ringBuffer: { size: number } })
       .ringBuffer;
 
-    internals.applyRemoteConfig({ ringBufferMs: 30_000, ringBufferMaxEvents: 7 });
+    internals.applyRemoteConfig({
+      ringBufferMs: 30_000,
+      ringBufferMaxEvents: 7,
+    });
 
     const bounds = ringBuffer as unknown as {
       maxMs: number;
@@ -268,6 +292,62 @@ describe("ring buffer bounds applied to a live session", () => {
     };
     expect(bounds.maxMs).toBe(30_000);
     expect(bounds.maxEvents).toBe(7);
+    await logger.stop();
+  });
+
+  it("records a capture gap counting the events a shrink evicted", async () => {
+    const { logger, internals, kinds } = start({
+      console: true,
+      ringBufferMaxEvents: 5_000,
+    });
+    const ringBuffer = (logger as unknown as { ringBuffer: { size: number } })
+      .ringBuffer;
+    for (let i = 0; i < 6; i += 1) console.log(`event ${i}`);
+    internals.bus.flush();
+    expect(ringBuffer.size).toBe(6);
+
+    internals.applyRemoteConfig({ ringBufferMaxEvents: 2 });
+    expect(ringBuffer.size).toBe(2);
+
+    // Evidence never leaves in silence: the shrink was asked for, the loss it
+    // cost is still the difference between the session and the report cut from
+    // it, so the session says how many events went.
+    const gaps = kinds("capture_gap");
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0].d).toMatchObject({
+      reason: "retention_reduced",
+      droppedEventCount: 4,
+    });
+    await logger.stop();
+  });
+
+  it("records no gap when a shrink evicts nothing", async () => {
+    const { logger, internals, kinds } = start({
+      console: true,
+      ringBufferMaxEvents: 5_000,
+    });
+    console.log("one");
+    internals.bus.flush();
+
+    internals.applyRemoteConfig({ ringBufferMaxEvents: 100 });
+
+    expect(kinds("capture_gap")).toHaveLength(0);
+    await logger.stop();
+  });
+
+  it("keeps the bus cap and the buffer cap on one ceiling", async () => {
+    const { logger, internals } = start({ ringBufferMaxEvents: 5_000 });
+    const bus = (logger as unknown as { bus: { maxBufferedEvents: number } })
+      .bus;
+
+    // `setMaxBufferedEvents` refuses anything at or below zero, so a bound the
+    // buffer took and the bus refused would leave the two disagreeing.
+    internals.applyRemoteConfig({ ringBufferMaxEvents: 0 });
+    expect(bus.maxBufferedEvents).toBe(5_000);
+    expect(internals.config.ringBufferMaxEvents).toBe(5_000);
+
+    internals.applyRemoteConfig({ ringBufferMaxEvents: 12 });
+    expect(bus.maxBufferedEvents).toBe(12);
     await logger.stop();
   });
 });

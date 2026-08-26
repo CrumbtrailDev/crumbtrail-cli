@@ -66,20 +66,20 @@ cannot ratchet a limit back up one step at a time.
 
 ## Reference: kill switch and consent
 
-| Field | Type | Direction | Effect |
-| --- | --- | --- | --- |
-| `killSwitch` | boolean | settable | `true` clears the ring buffer, aborts the flight recorder and stops capture. |
-| `consentMode` / `consent.mode` | `"implicit"` \| `"required"` | settable | Explicit consent blocks all buffering until `consent(true)`. |
-| `respectGpc` | boolean | settable | Treat Global Privacy Control as required consent. |
+| Field                          | Type                         | Direction | Effect                                                                       |
+| ------------------------------ | ---------------------------- | --------- | ---------------------------------------------------------------------------- |
+| `killSwitch`                   | boolean                      | settable  | `true` clears the ring buffer, aborts the flight recorder and stops capture. |
+| `consentMode` / `consent.mode` | `"implicit"` \| `"required"` | settable  | Explicit consent blocks all buffering until `consent(true)`.                 |
+| `respectGpc`                   | boolean                      | settable  | Treat Global Privacy Control as required consent.                            |
 
 ## Reference: sampling and flight recorder
 
-| Field | Type | Direction | Effect |
-| --- | --- | --- | --- |
-| `sampling.captureSampleRate` (aliases `captureRate`, `rate`, top-level `captureSampleRate`, `captureRate`, `sampleRate`) | number 0–1 | settable | Session sampling rate for capture candidates. |
-| `sampling.baselineSampleRate` (aliases `baselineRate`, top-level `baselineSampleRate`, `baselineRate`) | number 0–1 | settable | Trigger-free baseline session rate. |
-| `flightRecorder` | boolean | settable | Arm the flight recorder. |
-| `flightRecorderTailMs` / `tailDurationMs` / `tailMs` / `triggers.tailSeconds` | number | settable | Tail kept after a trigger. `tailSeconds` is seconds; the rest are ms. |
+| Field                                                                                                                    | Type       | Direction | Effect                                                                |
+| ------------------------------------------------------------------------------------------------------------------------ | ---------- | --------- | --------------------------------------------------------------------- |
+| `sampling.captureSampleRate` (aliases `captureRate`, `rate`, top-level `captureSampleRate`, `captureRate`, `sampleRate`) | number 0–1 | settable  | Session sampling rate for capture candidates.                         |
+| `sampling.baselineSampleRate` (aliases `baselineRate`, top-level `baselineSampleRate`, `baselineRate`)                   | number 0–1 | settable  | Trigger-free baseline session rate.                                   |
+| `flightRecorder`                                                                                                         | boolean    | settable  | Arm the flight recorder.                                              |
+| `flightRecorderTailMs` / `tailDurationMs` / `tailMs` / `triggers.tailSeconds`                                            | number     | settable  | Tail kept after a trigger. `tailSeconds` is seconds; the rest are ms. |
 
 ## Reference: auto-flag triggers
 
@@ -103,17 +103,22 @@ asks the client to flag a bug on this poll.
 
 ## Reference: masking and replay
 
-| Field | Type | Direction | Effect |
-| --- | --- | --- | --- |
+| Field                                               | Type                                                                                                                                           | Direction    | Effect                                            |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------ | ------------------------------------------------- |
 | `masking.mode` / `maskingMode` / `masking` (string) | `"all"`, `"full"`, `"mask_all"`, `"strict"`, `"masked"`, `"text"`, `"text_only"`, `"inputs"`, `"inputs_only"`, `"none"`, `"off"`, `"unmasked"` | tighten-only | The unmasking values are accepted and do nothing. |
-| `masking.maskAllText`, `masking.maskAllInputs` | boolean | tighten-only | Only `true` is honoured. |
-| `replayEnabled` | boolean | settable | Session replay recording. |
-| `replayMasking` | `"inputs_masked"` \| `"text_masked"` | settable | Replay masking level. |
+| `masking.maskAllText`, `masking.maskAllInputs`      | boolean                                                                                                                                        | tighten-only | Only `true` is honoured.                          |
+| `replayEnabled`                                     | boolean                                                                                                                                        | settable     | Session replay recording.                         |
+| `replayMasking`                                     | `"inputs_masked"` \| `"text_masked"`                                                                                                           | settable     | Replay masking level.                             |
 
 ## Reference: collector switches
 
-Under `collectors`, each a boolean. A collector switch at the top level of the response is
-ignored — the nested object is the only place they are read.
+Under `collectors`, each a boolean, tighten-only. A collector switch at the top level of the
+response is ignored — the nested object is the only place they are read.
+
+`false` always applies. `true` applies only to a collector the app passed as `true` to `init()`,
+which makes it a restore of something an earlier poll switched off. `true` for a collector the app
+left off is a silent no-op: a policy cannot start capturing keystrokes, clipboard or cookies for
+an app that never asked to.
 
 `console`, `network`, `interactions`, `keystrokes`, `scroll`, `visibility`, `clipboard`,
 `errors`, `performance`, `cookies`, `storage`, `heartbeat`, `uiNumbers`, `listeners`,
@@ -122,7 +127,7 @@ ignored — the nested object is the only place they are read.
 `video`, `audio` and `widget` are not remotely settable.
 
 ```json
-{ "collectors": { "keystrokes": false, "clipboard": false, "campaign": true } }
+{ "collectors": { "keystrokes": false, "clipboard": false } }
 ```
 
 ### When a switch takes effect
@@ -133,13 +138,14 @@ A switch flipped mid-session is applied on the poll that carries it, not on the 
 globals restored, timers cleared. Events already buffered are kept — the switch says what to
 capture from here, not what to forget.
 
-**On is live for every collector but one.**
+**A restore is live for every collector but one.** "Restore" is the only kind of `true` that does
+anything, per the rule above.
 
-| Collector | Off mid-session | On mid-session |
-| --- | --- | --- |
-| `console`, `errors`, `interactions`, `keystrokes`, `scroll`, `visibility`, `clipboard`, `cookies`, `storage`, `network`, `heartbeat`, `uiNumbers`, `listeners`, `eventSource`, `webSocket`, `workers`, `environment` | live | live |
-| `performance` | live | next page load |
-| `campaign`, `domSnapshot` | no collector, see below | no collector, see below |
+| Collector                                                                                                                                                                                                            | Off mid-session         | Restored mid-session    |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------- | ----------------------- |
+| `console`, `errors`, `interactions`, `keystrokes`, `scroll`, `visibility`, `clipboard`, `cookies`, `storage`, `network`, `heartbeat`, `uiNumbers`, `listeners`, `eventSource`, `webSocket`, `workers`, `environment` | live                    | live                    |
+| `performance`                                                                                                                                                                                                        | live                    | next page load          |
+| `campaign`, `domSnapshot`                                                                                                                                                                                            | no collector, see below | no collector, see below |
 
 `performance` observes with `buffered: true`, which is what lets it report the navigation and
 paint entries that fired before the SDK initialised. A second instance mid-session would replay
@@ -163,11 +169,11 @@ throttle or limit changed on the same poll is the one it runs with.
 
 ## Reference: network limits
 
-| Field | Type | Direction | Effect |
-| --- | --- | --- | --- |
-| `network.maxBodySize` / `networkMaxBodySize` | number `>= 0` | tighten-only | Applied as `min(remote, local)`. A value above the local ceiling leaves the local one in place. |
-| `network.excludeUrls` / `networkExcludeUrls` | string[] | additive | Remote entries are added to the local list. A local exclusion can never be removed, and `[]` clears nothing. |
-| `network.captureHeaders` / `networkCaptureHeaders` | boolean | tighten-only | Applied as `local && remote`. Only `false` changes anything. |
+| Field                                              | Type          | Direction    | Effect                                                                                                       |
+| -------------------------------------------------- | ------------- | ------------ | ------------------------------------------------------------------------------------------------------------ |
+| `network.maxBodySize` / `networkMaxBodySize`       | number `>= 0` | tighten-only | Applied as `min(remote, local)`. A value above the local ceiling leaves the local one in place.              |
+| `network.excludeUrls` / `networkExcludeUrls`       | string[]      | additive     | Remote entries are added to the local list. A local exclusion can never be removed, and `[]` clears nothing. |
+| `network.captureHeaders` / `networkCaptureHeaders` | boolean       | tighten-only | Applied as `local && remote`. Only `false` changes anything.                                                 |
 
 A list carrying a non-string entry is refused whole. A list longer than 256 entries is refused
 whole.
@@ -176,25 +182,46 @@ whole.
 
 Under `redaction`:
 
-| Field | Type | Direction | Effect |
-| --- | --- | --- | --- |
-| `denyFields` | string[] | additive | Union with the local deny list. Local entries always survive. |
-| `mode` | `"structured"` \| `"full"` | tighten-only | `"structured"` → `"full"` is honoured. `"full"` → `"structured"` is ignored. |
-| `captureInputValues` | boolean | tighten-only | Only `false` is honoured. |
-| `keepFields` | string[] | ignored | A keep exempts a field from the deny rules, so it would widen capture. Local `keepFields` are untouched. |
+| Field                | Type                       | Direction    | Effect                                                                                                   |
+| -------------------- | -------------------------- | ------------ | -------------------------------------------------------------------------------------------------------- |
+| `denyFields`         | string[]                   | additive     | Union with the local deny list. Local entries always survive.                                            |
+| `mode`               | `"structured"` \| `"full"` | tighten-only | `"structured"` → `"full"` is honoured. `"full"` → `"structured"` is ignored.                             |
+| `captureInputValues` | boolean                    | tighten-only | Only `false` is honoured.                                                                                |
+| `keepFields`         | string[]                   | ignored      | A keep exempts a field from the deny rules, so it would widen capture. Local `keepFields` are untouched. |
 
-## Reference: throttles and size limits
+## Reference: throttles
 
-Top-level, settable, each a finite number `>= 0`:
+Top-level, settable, each a finite number `>= 0`: `keystrokeThrottleMs`, `scrollThrottleMs`.
 
-`keystrokeThrottleMs`, `scrollThrottleMs`, `clipboardMaxLength`, `cookieValueMaxLength`,
-`storageValueMaxLength`, `stateMaxBytes`, `domSnapshotMaxBytes`, `ringBufferMs`,
-`ringBufferMaxEvents`.
+A throttle decides how often a running collector emits, not what it puts in an event, so both
+directions are allowed.
 
-`ringBufferMs` and `ringBufferMaxEvents` move the live ring buffer on the poll that carries them.
-Lowering either evicts oldest-first at once, so a policy asking for less retention gets it
-immediately rather than as the buffer next fills. Raising either only lifts the ceiling and drops
-nothing.
+## Reference: size caps
+
+Top-level, tighten-only, each a finite number `>= 0`, applied as `min(remote, init)`:
+`clipboardMaxLength`, `storageValueMaxLength`, `stateMaxBytes`, `domSnapshotMaxBytes`.
+
+Each one bounds how much of a captured value rests inside an event, so raising it would put more
+of the user's data in the payload than `init()` agreed to. A value above the local one leaves the
+local one in place.
+
+## Reference: ring buffer
+
+Top-level, tighten-only against the `init()` values, applied as `min(remote, init)`:
+
+| Field                 | Accepted               | Effect                                              |
+| --------------------- | ---------------------- | --------------------------------------------------- |
+| `ringBufferMs`        | whole number `>= 1000` | Retention window of the live buffer.                |
+| `ringBufferMaxEvents` | whole number `>= 1`    | Event ceiling of the live buffer and the event bus. |
+
+Anything else — `0`, `0.5`, a negative, `NaN`, `Infinity` — is ignored outright rather than
+coerced, and leaves the bound where it was.
+
+Both move the live ring buffer on the poll that carries them. Lowering either evicts oldest-first
+at once, so a policy asking for less retention gets it immediately rather than as the buffer next
+fills. When that eviction drops events the buffer was already holding, the session records a
+`capture_gap` with `reason: "retention_reduced"` and a `droppedEventCount`, so the shortened
+window is visible to whoever reads the report cut from it.
 
 ## Reference: probes
 
@@ -224,7 +251,11 @@ field.
 document, then confirm the direction: a tighten-only field with a looser value than the app's
 `init()` is applied as a no-op by design.
 
-**A collector switch has no effect until reload.** Two cases are by design: turning `performance`
-on, and changing `campaign`. Everything else applies on the poll — check the switch is inside the
-nested `collectors` object rather than at the top level, where it is ignored. See
+**A collector switch has no effect at all.** `true` for a collector the app left off at `init()`
+is a no-op by design — turn it on in the app's init block, then the poll can switch it off and
+back on. Also check the switch is inside the nested `collectors` object rather than at the top
+level, where it is ignored.
+
+**A collector switch has no effect until reload.** Two cases are by design: restoring
+`performance`, and changing `campaign`. Everything else applies on the poll. See
 [When a switch takes effect](#when-a-switch-takes-effect).

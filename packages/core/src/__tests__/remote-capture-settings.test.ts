@@ -50,6 +50,30 @@ const QUIET = {
   sessionPersistence: "memory",
 } as const;
 
+/** Every collector switch a policy may move. Media and the widget are deliberately absent. */
+const ALL_COLLECTORS = [
+  "console",
+  "network",
+  "interactions",
+  "keystrokes",
+  "scroll",
+  "visibility",
+  "clipboard",
+  "errors",
+  "performance",
+  "cookies",
+  "storage",
+  "heartbeat",
+  "uiNumbers",
+  "listeners",
+  "eventSource",
+  "webSocket",
+  "workers",
+  "environment",
+  "campaign",
+  "domSnapshot",
+] as const;
+
 type Internals = {
   config: CrumbtrailConfig;
   remoteCollectorChanges: string[];
@@ -72,18 +96,18 @@ afterEach(() => {
 
 describe("remote collector switches", () => {
   it("turns collectors on and off and reports which ones moved", async () => {
-    const { logger, internals } = start({ console: true, campaign: false });
+    const { logger, internals } = start({ console: true, campaign: true });
 
     internals.applyRemoteConfig({
       collectors: {
         console: false,
-        campaign: true,
+        campaign: false,
         network: false, // already false locally
       },
     });
 
     expect(internals.config.console).toBe(false);
-    expect(internals.config.campaign).toBe(true);
+    expect(internals.config.campaign).toBe(false);
     // Only the switches whose effective value changed are reported, which is
     // what phase 2 starts and stops mid-session.
     expect(internals.remoteCollectorChanges.sort()).toEqual([
@@ -94,7 +118,11 @@ describe("remote collector switches", () => {
   });
 
   it("covers every collector switch except media and the widget", async () => {
+    const allOn = Object.fromEntries(
+      ALL_COLLECTORS.map((key) => [key, true]),
+    ) as Record<string, boolean>;
     const { logger, internals } = start({
+      ...allOn,
       video: true,
       audio: true,
       widget: true,
@@ -102,37 +130,53 @@ describe("remote collector switches", () => {
 
     internals.applyRemoteConfig({
       collectors: {
-        console: true,
-        network: true,
-        interactions: true,
-        keystrokes: true,
-        scroll: true,
-        visibility: true,
-        clipboard: true,
-        errors: true,
-        performance: true,
-        cookies: true,
-        storage: true,
-        heartbeat: true,
-        uiNumbers: true,
-        listeners: true,
-        eventSource: true,
-        webSocket: true,
-        workers: true,
-        environment: true,
-        campaign: true,
-        domSnapshot: true,
+        ...Object.fromEntries(ALL_COLLECTORS.map((key) => [key, false])),
         video: false,
         audio: false,
         widget: false,
       },
     });
 
-    expect(internals.remoteCollectorChanges).toHaveLength(20);
+    expect(internals.remoteCollectorChanges).toHaveLength(
+      ALL_COLLECTORS.length,
+    );
     expect(internals.remoteCollectorChanges).not.toContain("video");
     expect(internals.config.video).toBe(true);
     expect(internals.config.audio).toBe(true);
     expect(internals.config.widget).toBe(true);
+    await logger.stop();
+  });
+
+  it("refuses to switch on a collector the application left off at init", async () => {
+    // The poll is unauthenticated, so `true` is only ever a restore of something a
+    // previous poll switched off. A collector the init block never turned on is
+    // capture the application never agreed to, and a response body cannot grant it.
+    const { logger, internals } = start({
+      keystrokes: false,
+      clipboard: false,
+    });
+
+    internals.applyRemoteConfig({
+      collectors: { keystrokes: true, clipboard: true },
+    });
+
+    expect(internals.config.keystrokes).toBe(false);
+    expect(internals.config.clipboard).toBe(false);
+    expect(internals.remoteCollectorChanges).toEqual([]);
+    await logger.stop();
+  });
+
+  it("switches a collector back on after an earlier poll switched it off", async () => {
+    const { logger, internals } = start({ console: true });
+
+    internals.applyRemoteConfig({ collectors: { console: false } });
+    expect(internals.config.console).toBe(false);
+
+    // Read against the init value, not the live one, so an off/on cycle is a
+    // restore rather than a step on a ratchet.
+    internals.applyRemoteConfig({ collectors: { console: true } });
+    expect(internals.config.console).toBe(true);
+    expect(internals.remoteCollectorChanges).toEqual(["console"]);
     await logger.stop();
   });
 
@@ -285,36 +329,82 @@ describe("remote redaction policy", () => {
 });
 
 describe("remote throttles and size limits", () => {
-  it("sets each throttle outright", async () => {
-    const { logger, internals } = start();
+  it("sets each throttle outright, in both directions", async () => {
+    const { logger, internals } = start({
+      keystrokeThrottleMs: 500,
+      scrollThrottleMs: 500,
+    });
 
+    // A throttle decides how often a running collector emits, not what it puts
+    // in an event, so neither direction widens capture.
     internals.applyRemoteConfig({
       keystrokeThrottleMs: 250,
       scrollThrottleMs: 1_000,
-      clipboardMaxLength: 100,
-      cookieValueMaxLength: 120,
-      storageValueMaxLength: 140,
-      stateMaxBytes: 4_096,
-      domSnapshotMaxBytes: 8_192,
-      ringBufferMs: 120_000,
-      ringBufferMaxEvents: 5_000,
     });
 
     expect(internals.config).toMatchObject({
       keystrokeThrottleMs: 250,
       scrollThrottleMs: 1_000,
-      clipboardMaxLength: 100,
-      cookieValueMaxLength: 120,
-      storageValueMaxLength: 140,
-      stateMaxBytes: 4_096,
-      domSnapshotMaxBytes: 8_192,
-      ringBufferMs: 120_000,
-      ringBufferMaxEvents: 5_000,
     });
     await logger.stop();
   });
 
-  it("refuses a throttle that is not a finite non-negative number", async () => {
+  it("lowers each size cap but never raises one", async () => {
+    const { logger, internals } = start({
+      clipboardMaxLength: 500,
+      storageValueMaxLength: 500,
+      stateMaxBytes: 32_768,
+      domSnapshotMaxBytes: 262_144,
+    });
+
+    internals.applyRemoteConfig({
+      clipboardMaxLength: 100,
+      storageValueMaxLength: 140,
+      stateMaxBytes: 4_096,
+      domSnapshotMaxBytes: 8_192,
+    });
+    expect(internals.config).toMatchObject({
+      clipboardMaxLength: 100,
+      storageValueMaxLength: 140,
+      stateMaxBytes: 4_096,
+      domSnapshotMaxBytes: 8_192,
+    });
+
+    // Each one bounds how much of a captured value rests in an event, so raising
+    // it puts more of the user's data in the payload than init agreed to. Read
+    // against the init value, so successive polls cannot ratchet a cap back up.
+    internals.applyRemoteConfig({
+      clipboardMaxLength: 50_000,
+      storageValueMaxLength: 50_000,
+      stateMaxBytes: 1_000_000,
+      domSnapshotMaxBytes: 10_000_000,
+    });
+    expect(internals.config).toMatchObject({
+      clipboardMaxLength: 500,
+      storageValueMaxLength: 500,
+      stateMaxBytes: 32_768,
+      domSnapshotMaxBytes: 262_144,
+    });
+    await logger.stop();
+  });
+
+  it("does not read a cookie value cap from a policy", async () => {
+    const { logger, internals } = start();
+
+    // Nothing in the SDK reads `cookieValueMaxLength`, so it is not a remote
+    // dial: honouring one would answer a dashboard setting that changes nothing.
+    internals.applyRemoteConfig({
+      cookieValueMaxLength: 1,
+      killSwitch: false,
+    });
+
+    expect(internals.config.cookieValueMaxLength).toBe(
+      DEFAULT_CONFIG.cookieValueMaxLength,
+    );
+    await logger.stop();
+  });
+
+  it("refuses a throttle or cap that is not a finite non-negative number", async () => {
     const { logger, internals } = start();
 
     internals.applyRemoteConfig({
@@ -327,6 +417,60 @@ describe("remote throttles and size limits", () => {
       scrollThrottleMs: DEFAULT_CONFIG.scrollThrottleMs,
       clipboardMaxLength: DEFAULT_CONFIG.clipboardMaxLength,
       stateMaxBytes: DEFAULT_CONFIG.stateMaxBytes,
+    });
+    await logger.stop();
+  });
+});
+
+describe("remote ring buffer bounds", () => {
+  it("lowers retention but never raises it", async () => {
+    const { logger, internals } = start({
+      ringBufferMs: 300_000,
+      ringBufferMaxEvents: 5_000,
+    });
+
+    internals.applyRemoteConfig({
+      ringBufferMs: 120_000,
+      ringBufferMaxEvents: 1_000,
+    });
+    expect(internals.config).toMatchObject({
+      ringBufferMs: 120_000,
+      ringBufferMaxEvents: 1_000,
+    });
+
+    // The cap is the memory the application budgeted for. A policy may spend
+    // less of it and never more, read against the init value each time.
+    internals.applyRemoteConfig({
+      ringBufferMs: 3_600_000,
+      ringBufferMaxEvents: 9_000_000_000_000_000,
+    });
+    expect(internals.config).toMatchObject({
+      ringBufferMs: 300_000,
+      ringBufferMaxEvents: 5_000,
+    });
+    await logger.stop();
+  });
+
+  it("refuses a bound that is not a usable count or window", async () => {
+    const { logger, internals } = start({
+      ringBufferMs: 300_000,
+      ringBufferMaxEvents: 5_000,
+    });
+
+    for (const settings of [
+      { ringBufferMaxEvents: 0 },
+      { ringBufferMaxEvents: 0.5 },
+      { ringBufferMaxEvents: -1 },
+      { ringBufferMaxEvents: Number.NaN },
+      { ringBufferMs: 999 },
+      { ringBufferMs: 1_500.5 },
+      { ringBufferMs: Number.POSITIVE_INFINITY },
+    ])
+      internals.applyRemoteConfig({ ...settings, killSwitch: false });
+
+    expect(internals.config).toMatchObject({
+      ringBufferMs: 300_000,
+      ringBufferMaxEvents: 5_000,
     });
     await logger.stop();
   });
@@ -412,8 +556,7 @@ describe("policy recognition", () => {
 
     await vi.waitFor(() => {
       expect(
-        (logger as unknown as { remotePolicyReady: boolean })
-          .remotePolicyReady,
+        (logger as unknown as { remotePolicyReady: boolean }).remotePolicyReady,
       ).toBe(true);
     });
     expect(internals.config.console).toBe(false);
