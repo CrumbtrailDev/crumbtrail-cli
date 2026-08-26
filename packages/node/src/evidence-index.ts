@@ -27,6 +27,7 @@ import {
   resolveFrame,
   type SourceMap,
 } from "./source-map";
+import { normalizeUrl } from "./route-normalization";
 
 export const CANDIDATE_SCHEMA_VERSION = 1 as const;
 
@@ -59,6 +60,21 @@ export type SupportGrade =
   | "unattached"
   | "attached"
   | "corroborated";
+
+/**
+ * What a failing operation's later session evidence establishes.
+ *
+ * `unknown` is intentionally different from `not_recovered`: a session that
+ * ends at the failure has not observed enough of the future to make an
+ * absence claim.
+ */
+export type FailureRecovery =
+  | { status: "recovered"; afterMs: number }
+  | { status: "not_recovered" }
+  | {
+      status: "unknown";
+      reason: "session_ended" | "operation_not_identified";
+    };
 
 const MAX_EVIDENCE_CANDIDATES = 200;
 
@@ -263,6 +279,8 @@ export interface EvidenceCandidate {
   severity: "critical" | "high" | "medium" | "low";
   score: number;
   confidence: "high" | "medium" | "low";
+  /** Whether a later equivalent operation succeeded. */
+  recovery?: FailureRecovery;
   /**
    * How many drafts collapsed into this candidate, set only when more than one
    * did. Four rejected sign-in attempts and one are the same defect but not the
@@ -406,6 +424,17 @@ interface RequestInfo {
   url?: string;
   route?: string;
 }
+
+interface OperationObservation {
+  t: number;
+  requestId?: string;
+  method?: string;
+  url?: string;
+  key?: string;
+}
+
+const RECOVERED_FAILURE_SCORE_CEILING = 40;
+const FAILURE_RECOVERY_MATCH_WINDOW_MS = 2_000;
 
 // Every artifact here goes through the SessionStore seam rather than fs directly:
 // these are finalize-time cold-plane files, and an embedder that decorates the
@@ -697,11 +726,18 @@ export function buildEvidenceCandidates(
   index = withNavigationContext(events, index);
   const requestById = collectRequests(events);
   const backendTargets = collectBackendRequestTargets(events);
-  const responseIds = new Set<string>();
+  const outcomeIds = new Set<string>();
   const drafts: CandidateDraft[] = [];
 
   for (const event of events) {
-    if (event.k === "net.res") responseIds.add(String(event.d.id ?? ""));
+    if (event.k === "net.res" || event.k === "net.err") {
+      const id = networkRequestId(event.d.id);
+      if (id) outcomeIds.add(id);
+    }
+  }
+  for (const entry of index.networkErrors ?? []) {
+    const id = networkRequestId(entry.id);
+    if (id) outcomeIds.add(id);
   }
 
   for (const failed of index.failedReqs ?? []) {
@@ -894,7 +930,7 @@ export function buildEvidenceCandidates(
 
   addRepeatedClickCandidates(events, index, drafts);
   addSlowRequestCandidates(events, index, requestById, drafts);
-  addPendingRequestCandidates(index, requestById, responseIds, drafts);
+  addPendingRequestCandidates(index, requestById, outcomeIds, drafts);
   addResponseRaceCandidates(events, index, requestById, drafts);
   addIneffectiveSubmitCandidates(events, index, drafts);
   addMediaDegradationCandidates(events, index, drafts);
@@ -980,6 +1016,11 @@ export function buildEvidenceCandidates(
   addStreamDesyncCandidates(events, index, drafts, exchanges);
   addJobOutcomeCandidates(events, index, drafts);
 
+  // Recovery is a property of the observed operation, not of one detector. Match every
+  // failure-shaped candidate to the operation it names, so HTTP, transport, backend, and
+  // future request failure detectors all receive the same three-state result.
+  attachFailureRecovery(drafts, events, index, requestById);
+
   // Demote the 4xx responses the application returned deliberately (auth challenges, structured
   // error bodies) before dedupe so their grouped keys collapse. Ranking-only, like the beacon pass.
   demoteHandledClientErrors(drafts, events);
@@ -1058,6 +1099,7 @@ export function buildEvidenceCandidates(
       severity: draft.severity,
       score: draft.score,
       confidence: draft.confidence,
+      ...(draft.recovery !== undefined ? { recovery: draft.recovery } : {}),
       // Emitted unconditionally, unlike the optional causal fields below: "not-assessed" is a real
       // answer and omitting it would leave a reader unable to tell an ungraded candidate from one
       // this SDK never graded. DERIVED here and nowhere else — no draft carries a `support`.
@@ -1551,12 +1593,14 @@ function addSlowRequestCandidates(
 function addPendingRequestCandidates(
   index: EvidenceIndexInput["index"],
   requests: Map<string, RequestInfo>,
-  responseIds: Set<string>,
+  outcomeIds: Set<string>,
   drafts: CandidateDraft[],
 ): void {
   const sessionEnd = finiteNumber(index.end) ?? 0;
   for (const req of requests.values()) {
-    if (responseIds.has(req.id)) continue;
+    // A request with a net.err settled without an HTTP response. It is not pending, and emitting
+    // this candidate beside network_error turns one failed operation into two misleading signals.
+    if (outcomeIds.has(req.id)) continue;
     drafts.push({
       detector: "pending_request",
       title:
@@ -1579,6 +1623,252 @@ function addPendingRequestCandidates(
       dedupeKey: `pending:${req.id}`,
     });
   }
+}
+
+function attachFailureRecovery(
+  drafts: CandidateDraft[],
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  requests: Map<string, RequestInfo>,
+): void {
+  const failures = collectFailureOperations(events, index, requests);
+  const successes = collectSuccessfulOperations(events, index, requests);
+  const sessionEnd = sessionEndOf(events, index);
+
+  for (const draft of drafts) {
+    const failure = failureForDraft(draft, failures);
+    if (!failure) continue;
+    const key = operationKey(failure.method, failure.url);
+    if (!key) {
+      draft.recovery = {
+        status: "unknown",
+        reason: "operation_not_identified",
+      };
+      continue;
+    }
+
+    const recovered = successes
+      .filter((success) => success.key === key && success.t > failure.t)
+      .sort((a, b) => a.t - b.t)[0];
+    if (recovered) {
+      draft.recovery = {
+        status: "recovered",
+        afterMs: Math.max(0, Math.round(recovered.t - failure.t)),
+      };
+      // A failure that demonstrably recovered is still evidence, but should not outrank an
+      // operation that remained broken. This applies to every failure detector using this helper.
+      draft.severity = lowerSeverity(draft.severity);
+      draft.score = Math.min(draft.score, RECOVERED_FAILURE_SCORE_CEILING);
+    } else if (sessionEnd !== undefined && sessionEnd > failure.t) {
+      draft.recovery = { status: "not_recovered" };
+    } else {
+      draft.recovery = { status: "unknown", reason: "session_ended" };
+    }
+  }
+}
+
+function collectFailureOperations(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  requests: Map<string, RequestInfo>,
+): OperationObservation[] {
+  const failures: OperationObservation[] = [];
+  const add = (observation: OperationObservation): void => {
+    failures.push({
+      ...observation,
+      key: operationKey(observation.method, observation.url),
+    });
+  };
+
+  for (const event of events) {
+    if (event.k === "net.err") {
+      const request = requests.get(networkRequestId(event.d.id) ?? "");
+      add({
+        t: event.t,
+        requestId: requestIdForEvent(event),
+        method:
+          safeText(event.d.method, 20) ??
+          safeText(event.d.m, 20) ??
+          request?.method,
+        url: safeText(event.d.url, 400) ?? request?.url,
+      });
+      continue;
+    }
+    if (event.k !== "net.res") continue;
+    const status = finiteNumber(event.d.st);
+    if (status === undefined || status < 400) continue;
+    const request = requests.get(networkRequestId(event.d.id) ?? "");
+    add({
+      t: event.t,
+      requestId: requestIdForEvent(event),
+      method:
+        safeText(event.d.method, 20) ??
+        safeText(event.d.m, 20) ??
+        request?.method,
+      url: safeText(event.d.url, 400) ?? request?.url,
+    });
+  }
+
+  // Index entries survive event truncation, so they are also authoritative failure observations.
+  for (const failed of index.failedReqs ?? []) {
+    add({
+      t: failed.t,
+      requestId: requestIdForValue(failed),
+      method: failed.m,
+      url: failed.url,
+    });
+  }
+  for (const entry of index.networkErrors ?? []) {
+    add({
+      t: entry.t,
+      requestId: requestIdForValue(entry),
+      method: entry.method ?? entry.m,
+      url: entry.url,
+    });
+  }
+
+  const backendSpans = collectBackendRequestSpans(events);
+  for (const event of events) {
+    if (
+      event.k !== "backend.req.error" &&
+      event.k !== "backend.req.end" &&
+      event.k !== "backend.uncaught"
+    )
+      continue;
+    const requestId = safeText(event.d.requestId, 120);
+    const span = requestId
+      ? backendSpans.find((candidate) => candidate.requestId === requestId)
+      : backendRequestSpanAt(backendSpans, event.t);
+    const status =
+      finiteNumber(event.d.statusCode) ??
+      (isRecord(event.d.error)
+        ? finiteNumber(event.d.error.statusCode)
+        : undefined) ??
+      span?.status;
+    if (event.k === "backend.req.end" && (status ?? 0) < 400) continue;
+    if (event.k === "backend.uncaught" && span === undefined) continue;
+    const url =
+      safeText(event.d.pathname, 400) ??
+      safeText(event.d.route, 400) ??
+      span?.pathname ??
+      span?.route;
+    add({
+      t: event.t,
+      requestId: requestId ?? span?.requestId,
+      method: safeText(event.d.method, 20) ?? span?.method,
+      url,
+    });
+  }
+
+  return failures;
+}
+
+function collectSuccessfulOperations(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+  requests: Map<string, RequestInfo>,
+): OperationObservation[] {
+  const successes: OperationObservation[] = [];
+  const failedRequestIds = new Set(
+    (index.failedReqs ?? [])
+      .map((failed) => requestIdForValue(failed))
+      .filter((id): id is string => id !== undefined),
+  );
+  for (const event of events) {
+    if (event.k !== "net.res") continue;
+    const status = finiteNumber(event.d.st);
+    if (status === undefined || status < 200 || status >= 300) continue;
+    const requestId = requestIdForEvent(event);
+    const request = requests.get(networkRequestId(event.d.id) ?? "");
+    const method =
+      safeText(event.d.method, 20) ?? safeText(event.d.m, 20) ?? request?.method;
+    const url = safeText(event.d.url, 400) ?? request?.url;
+    const key = operationKey(method, url);
+    if (
+      (requestId !== undefined && failedRequestIds.has(requestId)) ||
+      (index.failedReqs ?? []).some(
+        (failed) =>
+          failed.t === event.t &&
+          failed.st === status &&
+          operationKey(failed.m, failed.url) === key,
+      )
+    )
+      continue;
+    if (key) successes.push({ t: event.t, method, url, key });
+  }
+
+  // Backend-only sessions have no net.res event. A completed successful backend request is still
+  // an equivalent operation, using the same method and concrete path fields as the failure.
+  for (const span of collectBackendRequestSpans(events)) {
+    if (span.status === undefined || span.status < 200 || span.status >= 300)
+      continue;
+    const url = span.pathname ?? span.route;
+    const key = operationKey(span.method, url);
+    if (key)
+      successes.push({
+        t: span.end,
+        requestId: span.requestId,
+        method: span.method,
+        url,
+        key,
+      });
+  }
+  return successes;
+}
+
+function failureForDraft(
+  draft: CandidateDraft,
+  failures: OperationObservation[],
+): OperationObservation | undefined {
+  const requestId = draft.anchor.requestId;
+  if (requestId) {
+    const sameRequest = failures
+      .filter(
+        (failure) =>
+          failure.requestId === requestId &&
+          Math.abs(failure.t - draft.anchor.t) <= FAILURE_RECOVERY_MATCH_WINDOW_MS,
+      )
+      .sort(
+        (a, b) =>
+          Math.abs(a.t - draft.anchor.t) - Math.abs(b.t - draft.anchor.t),
+      )[0];
+    if (sameRequest) return sameRequest;
+  }
+
+  const key = operationKey(draft.anchor.method, draft.anchor.url);
+  if (!key) return undefined;
+  return failures.find(
+    (failure) => failure.key === key && failure.t === draft.anchor.t,
+  );
+}
+
+function operationKey(method: unknown, url: unknown): string | undefined {
+  const normalizedMethod = safeText(method, 20)?.toUpperCase();
+  const textUrl = safeText(url, 2_000);
+  if (!normalizedMethod || !textUrl) return undefined;
+  return `${normalizedMethod} ${normalizeUrl(textUrl)}`;
+}
+
+function sessionEndOf(
+  events: BugEvent[],
+  index: EvidenceIndexInput["index"],
+): number | undefined {
+  const indexedEnd = finiteNumber(index.end);
+  if (indexedEnd !== undefined) return indexedEnd;
+  return events.reduce<number | undefined>(
+    (latest, event) =>
+      latest === undefined || event.t > latest ? event.t : latest,
+    undefined,
+  );
+}
+
+function lowerSeverity(
+  severity: CandidateDraft["severity"],
+): CandidateDraft["severity"] {
+  if (severity === "critical") return "high";
+  if (severity === "high") return "medium";
+  if (severity === "medium") return "low";
+  return "low";
 }
 
 /**
@@ -13165,6 +13455,17 @@ function renderCandidatesMarkdown(
         lines.push(`* Error code: ${candidate.anchor.errorCode}`);
       if (candidate.anchor.message)
         lines.push(`* Message: ${candidate.anchor.message}`);
+      if (candidate.recovery) {
+        lines.push(
+          `* Recovery: ${
+            candidate.recovery.status === "recovered"
+              ? `recovered ${candidate.recovery.afterMs} ms later`
+              : candidate.recovery.status === "not_recovered"
+                ? "not recovered in the observed session"
+                : `unknown (${candidate.recovery.reason.replaceAll("_", " ")})`
+          }`,
+        );
+      }
       // The file and line is the shortest path from "something broke" to an open
       // editor, and it was reaching candidates.jsonl but not the markdown this
       // file tells every reader to start from.
@@ -13406,6 +13707,17 @@ function renderWindowMarkdown(
     "",
     `- Candidate: ${candidate.title}`,
     `- Detector: ${candidate.detector}`,
+    ...(candidate.recovery
+      ? [
+          `- Recovery: ${
+            candidate.recovery.status === "recovered"
+              ? `recovered ${candidate.recovery.afterMs} ms later`
+              : candidate.recovery.status === "not_recovered"
+                ? "not recovered in the observed session"
+                : `unknown (${candidate.recovery.reason.replaceAll("_", " ")})`
+          }`,
+        ]
+      : []),
     `- Anchor: ${formatOffset(candidate.anchor.offsetMs, candidate.anchor.t)}`,
     `- Window: ${formatOffset(offsetFromStart(candidate.evidenceWindow.start, index.start), candidate.evidenceWindow.start)} to ${formatOffset(offsetFromStart(candidate.evidenceWindow.end, index.start), candidate.evidenceWindow.end)}`,
     "",

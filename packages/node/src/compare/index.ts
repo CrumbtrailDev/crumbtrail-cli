@@ -17,6 +17,7 @@ import {
 } from "./types";
 import { divergencesToEvidence } from "./evidence-map";
 import { defaultSessionStore } from "../session-store";
+import { normalizeUrl } from "../route-normalization";
 
 export class CompareError extends Error {
   constructor(message: string) {
@@ -258,18 +259,6 @@ function eventTime(event: BugEvent): number {
     : Number.isFinite(event.t)
       ? event.t
       : 0;
-}
-
-function normalizeUrl(url: string): string {
-  try {
-    const parsed = new URL(url, "http://crumbtrail.local");
-    return parsed.pathname
-      .split("/")
-      .map((segment) => (/^\d{2,}$/.test(segment) ? "<id>" : segment))
-      .join("/");
-  } catch {
-    return url;
-  }
 }
 
 function stableStringify(value: unknown): string {
