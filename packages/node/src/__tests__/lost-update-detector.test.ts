@@ -1,19 +1,48 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { BugEvent } from "crumbtrail-core";
 import { buildEvidenceCandidates } from "../evidence-index";
+
+const TABLE = "product_rating_cache";
+const SHAPE =
+  "SELECT product_id, rating_avg, rating_count FROM product_rating_cache WHERE product_id = ?";
+
+function select(t: number, requestId: string): BugEvent {
+  return {
+    t,
+    k: "db.statement",
+    d: {
+      engine: "postgres",
+      op: "select",
+      table: TABLE,
+      shape: SHAPE,
+      rowCount: 1,
+      seq: 2,
+      requestId,
+    },
+  } as unknown as BugEvent;
+}
 
 function update(
   t: number,
   requestId: string,
-  before: Record<string, unknown>,
-  after: Record<string, unknown>,
-  table = "carts",
-  pk: Record<string, unknown> = { id: 1 },
+  after: Record<string, unknown> = {
+    product_id: 8,
+    rating_avg: 3,
+    rating_count: 1,
+  },
+  pk: Record<string, unknown> | null = null,
 ): BugEvent {
   return {
     t,
     k: "db.diff",
-    d: { engine: "postgres", op: "update", table, pk, before, after, requestId },
+    d: {
+      engine: "postgres",
+      op: "update",
+      table: TABLE,
+      pk,
+      after,
+      requestId,
+    },
   } as unknown as BugEvent;
 }
 
@@ -24,64 +53,61 @@ function detectors(events: BugEvent[]): string[] {
 }
 
 describe("lost_update", () => {
-  it("names a read-modify-write that raced itself across two requests", () => {
-    // Both writers read qty 1. The second wrote 2 from that stale read, so the
-    // first writer's increment is gone and the row holds 2 instead of 3.
+  it("fires for a read-modify-write interleaved with another request's write", () => {
     const found = detectors([
-      update(10, "req-a", { qty: 1 }, { qty: 2 }),
-      update(20, "req-b", { qty: 1 }, { qty: 2 }),
+      select(10, "req-reader"),
+      update(20, "req-other"),
+      update(30, "req-reader"),
     ]);
+
     expect(found).toContain("lost_update");
   });
 
-  it("stays silent when the second writer read what the first wrote", () => {
-    const found = detectors([
-      update(10, "req-a", { qty: 1 }, { qty: 2 }),
-      update(20, "req-b", { qty: 2 }, { qty: 3 }),
-    ]);
+  it("does not fire for two sequential updates with no read-before", () => {
+    const found = detectors([update(10, "req-a"), update(20, "req-b")]);
+
     expect(found).not.toContain("lost_update");
   });
 
-  it("stays silent on two writes from one request", () => {
-    // A handler that updates the same row twice wrote a sequence on purpose.
-    const found = detectors([
-      update(10, "req-a", { qty: 1 }, { qty: 2 }),
-      update(20, "req-a", { qty: 1 }, { qty: 2 }),
-    ]);
+  it("does not fire when the reader has no other writer between its read and write", () => {
+    const found = detectors([select(10, "req-reader"), update(20, "req-reader")]);
+
     expect(found).not.toContain("lost_update");
   });
 
-  it("stays silent on writes to different rows", () => {
+  it("does not join updates for different keyed rows", () => {
     const found = detectors([
-      update(10, "req-a", { qty: 1 }, { qty: 2 }, "carts", { id: 1 }),
-      update(20, "req-b", { qty: 1 }, { qty: 2 }, "carts", { id: 2 }),
+      select(10, "req-reader"),
+      update(20, "req-other", {
+        product_id: 9,
+        rating_avg: 4,
+        rating_count: 2,
+      }),
+      update(30, "req-reader"),
     ]);
+
     expect(found).not.toContain("lost_update");
   });
 
-  it("stays silent when the two writers disagree on the new value", () => {
-    // Stale read, but the writes differ, so an absolute `SET qty = n` cannot be
-    // told apart from a lost increment. Ambiguity stays quiet.
+  it("does not infer a row from a table-only SELECT", () => {
     const found = detectors([
-      update(10, "req-a", { qty: 1 }, { qty: 5 }),
-      update(20, "req-b", { qty: 1 }, { qty: 9 }),
+      {
+        t: 10,
+        k: "db.statement",
+        d: {
+          engine: "postgres",
+          op: "select",
+          table: TABLE,
+          shape: "SELECT * FROM product_rating_cache",
+          rowCount: 1,
+          seq: 2,
+          requestId: "req-reader",
+        },
+      } as unknown as BugEvent,
+      update(20, "req-other"),
+      update(30, "req-reader"),
     ]);
-    expect(found).not.toContain("lost_update");
-  });
 
-  it("ignores identity and clock columns, which are supposed to differ", () => {
-    const found = detectors([
-      update(10, "req-a", { updated_at: 100 }, { updated_at: 200 }),
-      update(20, "req-b", { updated_at: 100 }, { updated_at: 300 }),
-    ]);
     expect(found).not.toContain("lost_update");
-  });
-
-  it("cannot fire without before images", () => {
-    const noBefore = [
-      { t: 10, k: "db.diff", d: { op: "update", table: "carts", pk: { id: 1 }, after: { qty: 2 }, requestId: "a" } },
-      { t: 20, k: "db.diff", d: { op: "update", table: "carts", pk: { id: 1 }, after: { qty: 2 }, requestId: "b" } },
-    ] as unknown as BugEvent[];
-    expect(detectors(noBefore)).not.toContain("lost_update");
   });
 });
