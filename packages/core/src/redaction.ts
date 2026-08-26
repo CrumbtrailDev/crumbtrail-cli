@@ -2111,13 +2111,18 @@ function fnv1a32Hex(value: string): string {
 }
 
 const NUMERIC_SHAPE_RE = /^[+-]?[\d.,\s]+$/;
+const MAX_REDACTED_SHAPE_SEPARATORS = 32;
 
 function redactedShapeSeparators(
   text: string,
 ): RedactedShapeSeparator[] | undefined {
   if (!NUMERIC_SHAPE_RE.test(text) || !/\d/.test(text)) return undefined;
   const separators: RedactedShapeSeparator[] = [];
-  for (let index = 0; index < text.length; index += 1) {
+  for (
+    let index = 0;
+    index < text.length && separators.length < MAX_REDACTED_SHAPE_SEPARATORS;
+    index += 1
+  ) {
     const char = text[index];
     if (char === "." || char === "," || char === " ")
       separators.push({ index, char });
