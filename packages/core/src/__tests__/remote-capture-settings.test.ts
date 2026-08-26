@@ -13,6 +13,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Crumbtrail } from "../crumbtrail";
 import { DEFAULT_CONFIG, type CrumbtrailConfig } from "../types";
+import {
+  REDACTED_VALUE,
+  getCaptureInputValues,
+  redactInputValue,
+  setCaptureInputValues,
+} from "../redaction";
 
 function makeTransport() {
   return {
@@ -92,6 +98,9 @@ function start(overrides: Record<string, unknown> = {}) {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  // Module-level flag: left as one test set it, the next file to import
+  // `redaction.ts` inherits it.
+  setCaptureInputValues(true);
 });
 
 describe("remote collector switches", () => {
@@ -304,6 +313,9 @@ describe("remote redaction policy", () => {
       redaction: { captureInputValues: true },
     });
     expect(off.internals.config.redaction?.captureInputValues).toBe(false);
+    // The config field is not the enforcement point, so a poll that failed to
+    // reach the module flag would leave the opt-out on paper only.
+    expect(getCaptureInputValues()).toBe(false);
     await off.logger.stop();
 
     const on = start({ redaction: { captureInputValues: true } });
@@ -311,7 +323,27 @@ describe("remote redaction policy", () => {
       redaction: { captureInputValues: false },
     });
     expect(on.internals.config.redaction?.captureInputValues).toBe(false);
+    expect(getCaptureInputValues()).toBe(false);
     await on.logger.stop();
+  });
+
+  it("redacts input values from the poll onward, not from the next reload", async () => {
+    const { logger, internals } = start({
+      redaction: { captureInputValues: true },
+    });
+    expect(redactInputValue("blue", { name: "colour" }).value).toBe("blue");
+
+    internals.applyRemoteConfig({
+      redaction: { captureInputValues: false },
+    });
+
+    // `redactInputValue` is reached from paths that never see a config object,
+    // so it reads the module flag. This is the assertion the config write was
+    // standing in for.
+    expect(redactInputValue("blue", { name: "colour" }).value).toBe(
+      REDACTED_VALUE,
+    );
+    await logger.stop();
   });
 
   it("ignores remote keep fields", async () => {

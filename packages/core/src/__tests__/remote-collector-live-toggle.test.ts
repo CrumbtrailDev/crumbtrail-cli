@@ -10,9 +10,11 @@
 // stands now, and repeating a switch never stacks a second copy of a collector
 // on the page.
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Crumbtrail, OFF_ONLY_COLLECTORS } from "../crumbtrail";
 import type { BugEvent, CrumbtrailConfig } from "../types";
+import { UI_NUM_EVENT_KIND } from "../types";
+import { UI_NUM_SETTLE_MS } from "../collectors/ui-numbers";
 
 function makeTransport() {
   return {
@@ -54,6 +56,7 @@ const QUIET = {
 type Internals = {
   config: CrumbtrailConfig;
   collectorTeardowns: Map<string, () => void>;
+  poisonedCollectors: Set<string>;
   envEmitted: boolean;
   applyRemoteConfig: (settings: Record<string, unknown>) => void;
   bus: {
@@ -348,6 +351,216 @@ describe("ring buffer bounds applied to a live session", () => {
 
     internals.applyRemoteConfig({ ringBufferMaxEvents: 12 });
     expect(bus.maxBufferedEvents).toBe(12);
+    await logger.stop();
+  });
+});
+
+// A throttle or a size cap changed by a poll used to be written to the config
+// and read by nobody: each collector snapshotted its value at install, so the
+// new number reached the next page load rather than the session the policy was
+// answering about. These pin the live read.
+describe("throttles and size caps applied to collectors already running", () => {
+  it("throttles keystrokes at the value the poll carried", async () => {
+    const { logger, internals, kinds } = start({
+      keystrokes: true,
+      keystrokeThrottleMs: 0,
+    });
+
+    document.dispatchEvent(new KeyboardEvent("keyup", { key: "a" }));
+    document.dispatchEvent(new KeyboardEvent("keyup", { key: "b" }));
+    expect(kinds("key")).toHaveLength(2);
+
+    internals.applyRemoteConfig({ keystrokeThrottleMs: 100_000 });
+
+    document.dispatchEvent(new KeyboardEvent("keyup", { key: "c" }));
+    expect(kinds("key")).toHaveLength(2);
+    await logger.stop();
+  });
+
+  it("throttles scrolls at the value the poll carried", async () => {
+    const { logger, internals, kinds } = start({
+      scroll: true,
+      scrollThrottleMs: 0,
+    });
+
+    document.dispatchEvent(new Event("scroll"));
+    document.dispatchEvent(new Event("scroll"));
+    expect(kinds("scr")).toHaveLength(2);
+
+    internals.applyRemoteConfig({ scrollThrottleMs: 100_000 });
+
+    document.dispatchEvent(new Event("scroll"));
+    expect(kinds("scr")).toHaveLength(2);
+    await logger.stop();
+  });
+
+  it("caps clipboard text at the length the poll carried", async () => {
+    const { logger, internals, kinds } = start({
+      clipboard: true,
+      clipboardMaxLength: 500,
+    });
+
+    internals.applyRemoteConfig({ clipboardMaxLength: 10 });
+
+    const paste = new Event("paste", { bubbles: true });
+    Object.defineProperty(paste, "clipboardData", {
+      value: { getData: () => "x".repeat(100) },
+    });
+    document.body.dispatchEvent(paste);
+
+    const events = kinds("clip");
+    expect(events).toHaveLength(1);
+    expect(String(events[0].d.txt)).toHaveLength(10);
+    await logger.stop();
+  });
+
+  it("caps storage values at the length the poll carried", async () => {
+    const { logger, internals, kinds } = start({ storage: true });
+
+    internals.applyRemoteConfig({ storageValueMaxLength: 10 });
+    localStorage.setItem("greeting", "x".repeat(100));
+
+    const writes = kinds("stor").filter((event) => event.d.op === "set");
+    expect(writes).toHaveLength(1);
+    // A stored value is redacted whole, so the cap shows in the summary the
+    // event carries rather than in the length of what it kept.
+    expect(writes[0].d.newValSummary).toMatchObject({
+      reason: "storage_value_too_large",
+      originalLength: 100,
+      limit: 10,
+    });
+
+    localStorage.removeItem("greeting");
+    await logger.stop();
+  });
+});
+
+// A poll replaces `config.redaction` with a new object rather than mutating the
+// one that is there, so a collector holding the array it found at install keeps
+// scanning against a deny list the policy has already moved on from.
+describe("deny fields applied to a running ui.num collector", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    document.body.innerHTML = "";
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+    vi.useRealTimers();
+  });
+
+  const realSetTimeout = setTimeout;
+
+  async function settle(internals: Internals): Promise<void> {
+    for (let round = 0; round < 2; round += 1) {
+      await new Promise((resolve) => realSetTimeout(resolve, 5));
+      vi.advanceTimersByTime(UI_NUM_SETTLE_MS);
+    }
+    internals.bus.flush();
+  }
+
+  function labels(events: BugEvent[]): string[] {
+    return events.flatMap((event) =>
+      ((event.d.items ?? []) as Array<{ label: string }>).map(
+        (item) => item.label,
+      ),
+    );
+  }
+
+  it("stops emitting a denied label without reinstalling the collector", async () => {
+    document.body.innerHTML = `
+      <dl class="totals">
+        <dt>Subtotal</dt><dd>$199.00</dd>
+        <dt>Invoice ref</dt><dd>4021</dd>
+      </dl>`;
+
+    const { logger, internals, kinds } = start({ uiNumbers: true });
+    await settle(internals);
+    expect(labels(kinds(UI_NUM_EVENT_KIND))).toContain("Invoice ref");
+    const installed = internals.collectorTeardowns.get("uiNumbers");
+
+    internals.applyRemoteConfig({
+      redaction: { denyFields: ["invoice ref"] },
+    });
+
+    // Change the region so the collector re-scans and re-emits it.
+    document.querySelector("dd")!.textContent = "$249.00";
+    const before = kinds(UI_NUM_EVENT_KIND).length;
+    await settle(internals);
+
+    const emitted = kinds(UI_NUM_EVENT_KIND).slice(before);
+    expect(emitted.length).toBeGreaterThan(0);
+    expect(labels(emitted)).not.toContain("Invoice ref");
+    // Same collector throughout: the deny list reached it, it was not restarted.
+    expect(internals.collectorTeardowns.get("uiNumbers")).toBe(installed);
+    await logger.stop();
+  });
+
+  it("honours a deny field that arrives on the poll that starts the collector", async () => {
+    document.body.innerHTML = `
+      <dl class="totals">
+        <dt>Subtotal</dt><dd>$199.00</dd>
+        <dt>Invoice ref</dt><dd>4021</dd>
+      </dl>`;
+
+    const { logger, internals, kinds } = start({ uiNumbers: true });
+    internals.applyRemoteConfig({ collectors: { uiNumbers: false } });
+
+    // Redaction is applied before the collector switches, so the collector this
+    // poll starts scans against the deny list this poll carried.
+    internals.applyRemoteConfig({
+      redaction: { denyFields: ["invoice ref"] },
+      collectors: { uiNumbers: true },
+    });
+    const before = kinds(UI_NUM_EVENT_KIND).length;
+    await settle(internals);
+
+    expect(labels(kinds(UI_NUM_EVENT_KIND).slice(before))).not.toContain(
+      "Invoice ref",
+    );
+    await logger.stop();
+  });
+});
+
+// A cleanup that throws part way leaves some of its patches in place and some
+// restored, and nothing outside it can tell which. Installing over that stacks
+// a second wrapper on whatever survived.
+describe("a collector whose teardown throws", () => {
+  it("is refused for the rest of the session", async () => {
+    const { logger, internals, kinds } = start({ scroll: true });
+    const real = internals.collectorTeardowns.get("scroll")!;
+    internals.collectorTeardowns.set("scroll", () => {
+      real();
+      throw new Error("half restored");
+    });
+
+    internals.applyRemoteConfig({ collectors: { scroll: false } });
+    expect(internals.poisonedCollectors.has("scroll")).toBe(true);
+
+    internals.applyRemoteConfig({ collectors: { scroll: true } });
+
+    expect(internals.collectorTeardowns.has("scroll")).toBe(false);
+    document.dispatchEvent(new Event("scroll"));
+    expect(kinds("scr")).toHaveLength(0);
+    await logger.stop();
+  });
+
+  it("leaves the rest of the session capturing", async () => {
+    const { logger, internals, kinds } = start({
+      scroll: true,
+      console: true,
+    });
+    const real = internals.collectorTeardowns.get("scroll")!;
+    internals.collectorTeardowns.set("scroll", () => {
+      real();
+      throw new Error("half restored");
+    });
+
+    internals.applyRemoteConfig({ collectors: { scroll: false } });
+
+    console.log("still here");
+    expect(kinds("con")).toHaveLength(1);
+    expect(internals.poisonedCollectors.has("console")).toBe(false);
     await logger.stop();
   });
 });

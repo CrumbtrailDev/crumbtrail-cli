@@ -782,7 +782,9 @@ function wrapFetch(
     // caused - the timeline would report the effects before the cause.
     const responseTime = now();
 
-    const resMetadata: Array<RedactionMetadata | undefined> = [urlResult.metadata];
+    const resMetadata: Array<RedactionMetadata | undefined> = [
+      urlResult.metadata,
+    ];
     // The response names its own request. `net.res` used to carry `id` alone, so
     // every reader had to find the paired `net.req` to learn WHICH request
     // failed - and the pair is not guaranteed to survive: a request that started
@@ -1736,9 +1738,10 @@ export function networkCollector(
     let restored = true;
 
     if (shouldPatchFetch) {
-      restored = step(() => {
-        globalThis.fetch = originalFetch;
-      }) && restored;
+      restored =
+        step(() => {
+          globalThis.fetch = originalFetch;
+        }) && restored;
     }
 
     if (shouldPatchXHR && originalXHRMethods) {

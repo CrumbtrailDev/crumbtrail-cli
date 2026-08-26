@@ -561,7 +561,9 @@ export function storageCollector(
         Storage.prototype.clear = origProtoClear;
       }),
       // Restore instance methods to their original bound functions
-      step(() => restoreStorageMethod(localStorage, "setItem", origLocalSetItem)),
+      step(() =>
+        restoreStorageMethod(localStorage, "setItem", origLocalSetItem),
+      ),
       step(() =>
         restoreStorageMethod(localStorage, "removeItem", origLocalRemoveItem),
       ),

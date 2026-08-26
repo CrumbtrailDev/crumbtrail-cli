@@ -167,6 +167,11 @@ env data under another name. Turning it back on emits a fresh snapshot and reope
 A collector started mid-session is built from the config as it stands after the poll, so a
 throttle or limit changed on the same poll is the one it runs with.
 
+A collector that fails to shut down cleanly is not started again for the rest of the session. A
+teardown that throws part way leaves some of its patches removed and some still in place, and
+starting a second copy over the half that survived would capture every event twice. The switch
+is still applied to the config, so the next page load starts the collector normally.
+
 ## Reference: network limits
 
 | Field                                              | Type          | Direction    | Effect                                                                                                       |
@@ -189,12 +194,19 @@ Under `redaction`:
 | `captureInputValues` | boolean                    | tighten-only | Only `false` is honoured.                                                                                |
 | `keepFields`         | string[]                   | ignored      | A keep exempts a field from the deny rules, so it would widen capture. Local `keepFields` are untouched. |
 
+All three are live on the poll that carries them. A new deny field applies to the next event any
+running collector emits, including the `ui.num` scanner, and `captureInputValues: false` stops
+input values being recorded from that poll rather than from the next page load.
+
 ## Reference: throttles
 
 Top-level, settable, each a finite number `>= 0`: `keystrokeThrottleMs`, `scrollThrottleMs`.
 
 A throttle decides how often a running collector emits, not what it puts in an event, so both
 directions are allowed.
+
+Live on the poll that carries it. The keystroke and scroll collectors read their throttle per
+event, so a change reaches the collector already running rather than the next page load.
 
 ## Reference: size caps
 
@@ -204,6 +216,9 @@ Top-level, tighten-only, each a finite number `>= 0`, applied as `min(remote, in
 Each one bounds how much of a captured value rests inside an event, so raising it would put more
 of the user's data in the payload than `init()` agreed to. A value above the local one leaves the
 local one in place.
+
+Live on the poll that carries it. The clipboard and storage collectors read their cap per event,
+so a lowered cap bounds the next event rather than the next page load's.
 
 ## Reference: ring buffer
 
