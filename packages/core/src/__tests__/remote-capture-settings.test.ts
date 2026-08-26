@@ -420,4 +420,20 @@ describe("policy recognition", () => {
     expect(internals.config.keystrokeThrottleMs).toBe(50);
     await logger.stop();
   });
+
+  it("tolerates a schemaVersion without requiring one", async () => {
+    const { logger, internals } = start();
+
+    internals.applyRemoteConfig({
+      schemaVersion: 2,
+      collectors: { console: false },
+    });
+    expect(internals.config.console).toBe(false);
+
+    // Nothing reads it, and it is not a policy field in its own right.
+    expect(
+      (internals.config as unknown as Record<string, unknown>).schemaVersion,
+    ).toBeUndefined();
+    await logger.stop();
+  });
 });
