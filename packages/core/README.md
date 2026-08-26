@@ -327,6 +327,16 @@ report-only policy distinguishable from an enforced one, since a report-only
 policy blocks nothing. The `sample` a browser may attach is a fragment of the
 page's own script or style text and is never read.
 
+### Subresource load failures (`net.err`)
+
+The `errors` collector also listens in the capture phase for browser-managed
+subresource failures. These use `net.err` with `transport: "resource"`, so they
+remain distinct from fetch and XHR failures (`transport: "fetch"` or `"xhr"`).
+The payload carries the lower-case element type, its resolved `url`, and
+`loading`, which is true while the document is still loading. URLs use the same
+redaction policy as every other captured URL, and the element's inline content
+is never read.
+
 ### Streaming responses
 
 `Response.text()` resolves when the stream closes, which for a streaming response
