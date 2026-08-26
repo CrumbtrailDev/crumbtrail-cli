@@ -5801,99 +5801,184 @@ function addOrphanedReferenceCandidates(
 }
 
 /**
- * lost_update: a read-modify-write raced itself and one writer's change vanished.
+ * lost_update: one request read a row, another request wrote it, and the first
+ * request later wrote the row back from the earlier read.
  *
- * The signature is exact and does not need to know anything about the app: two
- * UPDATEs land on the same table and primary key, and the later one's BEFORE
- * image still shows the value the earlier one had already replaced. Both writes
- * succeeded, both rows are individually valid, and the final row silently holds
- * one increment instead of two. Nothing else in the pipeline names it — the
- * generic `db_mutation` surfacing says only "a row changed", which is exactly
- * as true of the correct outcome.
+ * This is intentionally an event-order detector. A `db.diff` before-image is
+ * the database state when the UPDATE ran, not the value the application read
+ * before an await, so comparing before/after images cannot establish the
+ * read-modify-write shape. The successful SELECT statement and request ids can.
  *
- * This is the one detector here that deliberately crosses request boundaries:
- * a lost update is *made of* two concurrent requests, so a per-request rule can
- * never see it. Requiring a stale before-image is what keeps that safe — two
- * unrelated sequential updates chain correctly and stay silent.
- *
- * Needs `captureBefore: true`; without before images there is nothing to
- * compare and the rule cannot fire at all.
+ * It requires both requests' database events in the same analyzed event
+ * stream. A reader's session cannot discover a concurrent writer whose only
+ * evidence is in another user's session. It also reports the weaker observable
+ * shape: the events do not expose the value held in the application's local
+ * variable, so they cannot prove that the later write was derived from a stale
+ * value.
  */
+interface LostUpdateRead {
+  event: BugEvent;
+  requestId: string;
+  table: string;
+  keyColumns: string[];
+}
+
+function selectKeyColumns(shape: string): string[] | undefined {
+  const where = /\bwhere\b([\s\S]*)/i.exec(shape)?.[1];
+  if (!where || /\b(?:or|union|select|join)\b/i.test(where)) return undefined;
+
+  const predicates = where.split(/\band\b/i);
+  const columns: string[] = [];
+  for (const rawPredicate of predicates) {
+    const predicate = rawPredicate
+      .replace(
+        /\b(?:group\s+by|order\s+by|limit|offset|for\s+update)\b[\s\S]*$/i,
+        "",
+      )
+      .replace(/[()]/g, "")
+      .trim();
+    const match = /^(?:[A-Za-z_]\w*\.)?([A-Za-z_]\w*)\s*=\s*\?(?:::[A-Za-z_]\w*)?$/i.exec(
+      predicate,
+    );
+    if (!match) return undefined;
+    const column = match[1].toLowerCase();
+    if (columns.includes(column)) return undefined;
+    columns.push(column);
+  }
+  return columns.length > 0 ? columns : undefined;
+}
+
+function updateValueForColumn(
+  event: BugEvent,
+  column: string,
+): string | undefined {
+  const pk = isRecord(event.d.pk) ? event.d.pk : undefined;
+  const after = isRecord(event.d.after) ? event.d.after : undefined;
+  const before = isRecord(event.d.before) ? event.d.before : undefined;
+  const afterEntry = after
+    ? Object.entries(after).find(([name]) => name.toLowerCase() === column)
+    : undefined;
+  const beforeEntry = before
+    ? Object.entries(before).find(([name]) => name.toLowerCase() === column)
+    : undefined;
+  const afterValue = afterEntry ? keyValueOf(afterEntry[1]) : undefined;
+  const beforeValue = beforeEntry ? keyValueOf(beforeEntry[1]) : undefined;
+  const pkEntry = pk
+    ? Object.entries(pk).find(([name]) => name.toLowerCase() === column)
+    : undefined;
+  const pkValue = pkEntry ? keyValueOf(pkEntry[1]) : undefined;
+  if (
+    pkValue !== undefined &&
+    ((afterValue !== undefined && afterValue !== pkValue) ||
+      (beforeValue !== undefined && beforeValue !== pkValue))
+  )
+    return undefined;
+  if (pkValue !== undefined) return pkValue;
+  if (
+    afterValue !== undefined &&
+    beforeValue !== undefined &&
+    afterValue !== beforeValue
+  )
+    return undefined;
+  return afterValue ?? beforeValue;
+}
+
+function lostUpdateRowKey(
+  event: BugEvent,
+  table: string,
+  keyColumns: string[],
+): string | undefined {
+  const values = keyColumns.map((column) =>
+    updateValueForColumn(event, column),
+  );
+  if (values.some((value) => value === undefined)) return undefined;
+  return `${bareTableName(table).toLowerCase()}\u0000${keyColumns
+    .map((column, index) => `${column}=${values[index]}`)
+    .join(",")}`;
+}
+
 function addLostUpdateCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
 ): void {
-  // table + pk → the update diffs against that row, in capture order.
-  const byRow = new Map<string, BugEvent[]>();
+  const reads: LostUpdateRead[] = [];
+  const updates: Array<{ event: BugEvent; requestId: string; table: string }> = [];
   for (const event of events) {
-    if (event.k !== "db.diff") continue;
-    if (safeText(event.d.op, 20) !== "update") continue;
-    if (!isRecord(event.d.before) || !isRecord(event.d.after)) continue;
-    const table = safeText(event.d.table, 200);
-    const pk = pkEntriesOf(event);
-    if (!table || pk.length === 0) continue;
-    const key = `${table}\u0000${pk.map(([c, v]) => `${c}=${v}`).join(",")}`;
-    const list = byRow.get(key) ?? [];
-    list.push(event);
-    byRow.set(key, list);
-  }
-
-  for (const [key, updates] of byRow) {
-    if (updates.length < 2) continue;
-    const ordered = [...updates].sort((a, b) => a.t - b.t);
-    for (let i = 1; i < ordered.length; i += 1) {
-      const earlier = ordered[i - 1];
-      const later = ordered[i];
-      // Two writes from the same request are a sequence the app wrote on
-      // purpose, not a race.
-      const earlierRequest = safeText(earlier.d.requestId, 120);
-      const laterRequest = safeText(later.d.requestId, 120);
-      if (earlierRequest && laterRequest && earlierRequest === laterRequest)
-        continue;
-
-      const earlierAfter = earlier.d.after as Record<string, unknown>;
-      const laterBefore = later.d.before as Record<string, unknown>;
-      const laterAfter = later.d.after as Record<string, unknown>;
-      for (const [column, wrote] of Object.entries(earlierAfter)) {
-        if (isIdentityOrClockField(column)) continue;
-        if (!Object.hasOwn(laterBefore, column)) continue;
-        const sawBefore = laterBefore[column];
-        // The later writer read a value the earlier writer had already
-        // replaced, so its own write was computed from stale state.
-        if (sameScalar(sawBefore, wrote)) continue;
-        const earlierBefore = earlier.d.before as Record<string, unknown>;
-        if (!sameScalar(sawBefore, earlierBefore[column])) continue;
-        // ...and both writers, from that one read, computed the SAME new value.
-        // That coincidence is the read-modify-write fingerprint: two increments
-        // of 1 both produced 2, so the row holds 2 where it should hold 3. When
-        // the two writes disagree the rule stays silent, because an absolute
-        // `SET qty = n` from a stale read is indistinguishable from a correct
-        // one and guessing would put a false claim above the plane dump.
-        if (!sameScalar(laterAfter[column], wrote)) continue;
-
-        const label = scrubText(bareTableName(key.split("\u0000")[0]), 100) ?? "table";
-        drafts.push({
-          detector: "lost_update",
-          title: `Lost update: a second writer overwrote ${label}.${column} from a stale read`,
-          severity: "high",
-          score: DB_INVARIANT_SCORE,
-          confidence: "high",
-          anchor: removeUndefined({
-            t: later.t,
-            offsetMs:
-              offsetForEvent(later) ?? offsetFromStart(later.t, index.start),
-            route: routeAt(index.navs ?? [], later.t),
-            requestId: laterRequest,
-            message: `${label}.${column}: one writer set ${formatScalar(wrote)}, a concurrent writer had already read ${formatScalar(sawBefore)} and wrote ${formatScalar(laterAfter[column])}`,
-            source: normalizeDbEngine(later.d.engine),
-          }),
-          dedupeKey: `lostupdate:${key}:${column}`,
-        });
-        break; // One claim per row pair; the first stale column carries it.
+    if (
+      event.k === "db.statement" &&
+      safeText(event.d.op, 20)?.toLowerCase() === "select"
+    ) {
+      const requestId = safeText(event.d.requestId, 120);
+      const table = safeText(event.d.table, 200);
+      const shape = safeText(event.d.shape, 500);
+      const keyColumns = shape ? selectKeyColumns(shape) : undefined;
+      if (requestId && table && keyColumns) {
+        reads.push({ event, requestId, table, keyColumns });
       }
     }
+    if (
+      event.k !== "db.diff" ||
+      safeText(event.d.op, 20)?.toLowerCase() !== "update"
+    )
+      continue;
+    const requestId = safeText(event.d.requestId, 120);
+    const table = safeText(event.d.table, 200);
+    if (requestId && table) updates.push({ event, requestId, table });
   }
+
+  const emitted = new Set<string>();
+  for (const read of reads) {
+    const ownWrites = updates.filter(
+      (update) =>
+        update.requestId === read.requestId &&
+        sameTable(update.table, read.table) &&
+        update.event.t > read.event.t,
+    );
+    for (const own of ownWrites) {
+      const ownRow = lostUpdateRowKey(own.event, read.table, read.keyColumns);
+      if (!ownRow) continue;
+      const interleaved = updates.filter(
+        (update) =>
+          update.requestId !== read.requestId &&
+          sameTable(update.table, read.table) &&
+          update.event.t > read.event.t &&
+          update.event.t < own.event.t &&
+          lostUpdateRowKey(update.event, read.table, read.keyColumns) === ownRow,
+      );
+      if (interleaved.length === 0 || emitted.has(`${read.requestId}:${ownRow}`))
+        continue;
+      emitted.add(`${read.requestId}:${ownRow}`);
+      const tableLabel = scrubText(bareTableName(read.table), 100) ?? "table";
+      const otherRequests = [
+        ...new Set(interleaved.map((update) => update.requestId)),
+      ];
+      drafts.push({
+        detector: "lost_update",
+        title: `Possible lost update: ${tableLabel} was written between a read and its later write`,
+        severity: "high",
+        score: DB_INVARIANT_SCORE,
+        confidence: "medium",
+        anchor: removeUndefined({
+          t: own.event.t,
+          offsetMs:
+            offsetForEvent(own.event) ?? offsetFromStart(own.event.t, index.start),
+          route: routeAt(index.navs ?? [], own.event.t),
+          requestId: read.requestId,
+          message:
+            `Request ${read.requestId} selected ${tableLabel} by ${read.keyColumns.join(", ")} at +${Math.round(offsetFromStart(read.event.t, index.start) ?? 0)} ms, ` +
+            `request${otherRequests.length === 1 ? "" : "s"} ${otherRequests.join(", ")} wrote the same row before it later wrote again. ` +
+            `The captured ordering is consistent with a read-modify-write using stale state, but the value held between the SELECT and UPDATE is not captured, so this is a possible rather than proven lost update.`,
+          source: normalizeDbEngine(own.event.d.engine),
+        }),
+        dedupeKey: `lostupdate:${read.requestId}:${ownRow}`,
+      });
+    }
+  }
+}
+
+function sameTable(left: string, right: string): boolean {
+  return bareTableName(left).toLowerCase() === bareTableName(right).toLowerCase();
 }
 
 /**
