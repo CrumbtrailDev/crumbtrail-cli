@@ -49,6 +49,12 @@ import {
 export interface ReplayRecorderOptions {
   sessionId: string;
   masking: ReplayMasking;
+  /** Application release identity, when known at session start. */
+  release?: string;
+  /** Application build identity, when known at session start. */
+  build?: string;
+  /** Crumbtrail SDK version that wrote this recording. */
+  sdkVersion?: string;
   /** Upload one stored object. Rejecting counts the chunk as never delivered. */
   send: (name: string, body: Blob) => Promise<void>;
   doc?: Document;
@@ -98,9 +104,12 @@ export function replaySupported(): boolean {
 
 export class ReplayRecorder {
   private readonly options: Required<
-    Omit<ReplayRecorderOptions, "doc" | "win" | "now" | "send">
+    Omit<
+      ReplayRecorderOptions,
+      "doc" | "win" | "now" | "send" | "release" | "build" | "sdkVersion"
+    >
   > &
-    Pick<ReplayRecorderOptions, "send">;
+    Pick<ReplayRecorderOptions, "send" | "release" | "build" | "sdkVersion">;
   private readonly doc: Document;
   private readonly win: Window;
   private readonly now: () => number;
@@ -136,6 +145,9 @@ export class ReplayRecorder {
     this.options = {
       sessionId: options.sessionId,
       masking: options.masking,
+      release: options.release,
+      build: options.build,
+      sdkVersion: options.sdkVersion,
       send: options.send,
       chunkMs: options.chunkMs ?? DEFAULT_CHUNK_MS,
       checkoutMs: options.checkoutMs ?? DEFAULT_CHECKOUT_MS,
@@ -276,6 +288,11 @@ export class ReplayRecorder {
         schemaVersion: REPLAY_SCHEMA_VERSION,
         format: REPLAY_FORMAT,
         sessionId: this.options.sessionId,
+        ...(this.options.release ? { release: this.options.release } : {}),
+        ...(this.options.build ? { build: this.options.build } : {}),
+        ...(this.options.sdkVersion
+          ? { sdkVersion: this.options.sdkVersion }
+          : {}),
         startedAt: this.startedAt,
         durationMs: Math.max(0, this.lastEventAbsoluteMs),
         masking: this.options.masking,
