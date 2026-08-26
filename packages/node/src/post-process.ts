@@ -265,6 +265,11 @@ interface SessionIndex {
   end: number;
   dur: number;
   evts: number;
+  /** Pseudonymous caller identity declared by the session, when available. */
+  identity?: {
+    userId?: string;
+    accountId?: string;
+  };
   errs: Array<{
     t: number;
     msg: string;
@@ -695,6 +700,7 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
   const redaction = summarizeRedaction(mergedEvents);
   const vitals = summarizeVitals(mergedEvents);
   const pageProbeSummary = finalizePageProbeSummary(pageProbe);
+  const sessionIdentity = readMetaIdentity(sessionDir);
 
   const start = mergedEvents[0].t;
   const end = mergedEvents[mergedEvents.length - 1].t;
@@ -728,6 +734,7 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
     end,
     dur: end - start,
     evts: mergedEvents.length,
+    ...(sessionIdentity === undefined ? {} : { identity: sessionIdentity }),
     errs,
     failedReqs,
     ...(precedingReqs.length > 0 ? { precedingReqs } : {}),
@@ -2046,17 +2053,45 @@ async function readMetaStart(
   }
 }
 
+function readMetaIdentity(
+  sessionDir: string,
+): SessionIndex["identity"] | undefined {
+  try {
+    const raw = fs.readFileSync(path.join(sessionDir, "meta.json"), "utf-8");
+    const meta: unknown = JSON.parse(raw);
+    if (!isRecord(meta)) return undefined;
+    const userId =
+      typeof meta.userId === "string" && meta.userId.trim()
+        ? meta.userId.trim()
+        : undefined;
+    const accountId =
+      typeof meta.accountId === "string" && meta.accountId.trim()
+        ? meta.accountId.trim()
+        : undefined;
+    return userId === undefined && accountId === undefined
+      ? undefined
+      : {
+          ...(userId !== undefined ? { userId } : {}),
+          ...(accountId !== undefined ? { accountId } : {}),
+        };
+  } catch {
+    return undefined;
+  }
+}
+
 async function writeEmptyIndex(
   sessionDir: string,
   audio?: PostProcessAudioSummary,
   truncation?: CaptureTruncationSummary,
 ): Promise<SessionIndex> {
+  const sessionIdentity = readMetaIdentity(sessionDir);
   const index: SessionIndex = {
     id: path.basename(sessionDir),
     start: 0,
     end: 0,
     dur: 0,
     evts: 0,
+    ...(sessionIdentity === undefined ? {} : { identity: sessionIdentity }),
     errs: [],
     failedReqs: [],
     navs: [],

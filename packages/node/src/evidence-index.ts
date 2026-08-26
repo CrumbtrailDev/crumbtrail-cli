@@ -176,6 +176,11 @@ export interface EvidenceIndexInput {
     start?: number;
     end?: number;
     dur?: number;
+    /** Pseudonymous caller identity declared by the session, when available. */
+    identity?: {
+      userId?: string;
+      accountId?: string;
+    };
     failedReqs?: Array<{
       t: number;
       m?: string;
@@ -966,6 +971,7 @@ export function buildEvidenceCandidates(
   const exchanges = collectRequestExchanges(events);
   addFilterContradictionCandidates(index, drafts, exchanges);
   addResultRowLossCandidates(events, index, drafts, exchanges);
+  addUnownedReadCandidates(index, drafts, exchanges);
   addSharedStateBleedCandidates(events, index, drafts, exchanges);
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
   addBatchImportCandidates(events, index, drafts, exchanges);
@@ -7804,6 +7810,102 @@ function addResultRowLossCandidates(
       .sort((a, b) => a.anchor.t - b.anchor.t)
       .slice(0, MAX_RESULT_ROW_LOSS_CANDIDATES),
   );
+}
+
+// ─── unowned_read ────────────────────────────────────────────────────────────
+
+/**
+ * A successful response carried a non-empty record with an owner-shaped field
+ * that did not identify the caller. This is deliberately narrower than a
+ * general cross-user classifier: the caller identity must already be declared
+ * on the session, and the response must expose the relationship that was
+ * checked. A response without that shape is not enough to call catalogue data
+ * a privacy defect.
+ */
+function addUnownedReadCandidates(
+  index: EvidenceIndexInput["index"],
+  drafts: CandidateDraft[],
+  exchanges: Map<string, RequestExchange>,
+): void {
+  const identity = index.identity;
+  if (!identity) return;
+
+  const ownerField = /^(user|owner|customer|account)(?:_id|Id)$/i;
+  const identityValue = (value: unknown): string | undefined => {
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    }
+    return typeof value === "number" && Number.isFinite(value)
+      ? String(value)
+      : undefined;
+  };
+  const callerForField = (field: string): string | undefined => {
+    const family = field.replace(/(?:_id|Id)$/i, "").toLowerCase();
+    if (family === "user") return identityValue(identity.userId);
+    if (family === "account") return identityValue(identity.accountId);
+    if (family === "customer")
+      return identityValue(identity.accountId ?? identity.userId);
+    return identityValue(identity.userId ?? identity.accountId);
+  };
+
+  for (const exchange of exchanges.values()) {
+    if (!exchange.res || !isSuccessStatus(exchange.status)) continue;
+    const payload = responsePayload(exchange.resBody, exchange.resBodyMeta);
+    if (payload === undefined) continue;
+
+    let finding: { field: string; value: string | undefined } | undefined;
+    for (const scope of collectObjectScopes(payload)) {
+      for (const [field, rawValue] of Object.entries(scope)) {
+        if (!ownerField.test(field)) continue;
+        if (
+          Object.entries(scope).every(
+            ([key, value]) =>
+              key === field || value === null || value === undefined,
+          )
+        )
+          continue;
+        const caller = callerForField(field);
+        if (caller === undefined) continue;
+        const returned = identityValue(rawValue);
+        if (returned !== caller) {
+          finding = { field, value: returned };
+          break;
+        }
+      }
+      if (finding) break;
+    }
+    if (!finding) continue;
+
+    const returned = finding.value === undefined ? "null" : finding.value;
+    const identityText =
+      identityValue(identity.userId) ??
+      identityValue(identity.accountId) ??
+      "unknown";
+    const url = exchange.url;
+    const path = capturedUrlPath(url) ?? "the request";
+    drafts.push({
+      detector: "unowned_read",
+      title:
+        "Read returned user-scoped state without a relationship to this identity",
+      severity: "critical",
+      score: 98,
+      confidence: "high",
+      anchor: removeUndefined({
+        t: exchange.res.t,
+        offsetMs:
+          offsetForEvent(exchange.res) ??
+          offsetFromStart(exchange.res.t, index.start),
+        route: routeAt(index.navs ?? [], exchange.res.t),
+        requestId: exchange.requestId,
+        method: exchange.method,
+        url: redactUrl(url),
+        status: exchange.status,
+        message: `An authenticated session for identity ${scrubText(identityText, 120)} received non-empty state from ${path} with ${finding.field}=${scrubText(returned, 120)}, but that owner value does not match the identity that asked. This is a user-scoped read with no relationship behind it and should be escalated as a possible privacy incident.`,
+      }),
+      dedupeKey: `unowned:${url ?? exchange.requestId}:${finding.field}:${returned}`,
+    });
+  }
 }
 
 // ─── shared_state_bleed ──────────────────────────────────────────────────────
