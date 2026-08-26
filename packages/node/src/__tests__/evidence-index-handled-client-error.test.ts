@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { BugEvent } from "crumbtrail-core";
 import { buildEvidenceCandidates } from "../evidence-index";
+import { buildCausalGraph } from "../causal-graph";
 
 /** A failed response plus the failed-request index entry post-process emits. */
 function failure(opts: {
@@ -35,15 +36,18 @@ function failure(opts: {
 function build(
   failures: Array<ReturnType<typeof failure>>,
   events: BugEvent[] = [],
+  withGraph = false,
 ) {
+  const allEvents = [...failures.map((entry) => entry.event), ...events].sort(
+    (a, b) => a.t - b.t,
+  );
   return buildEvidenceCandidates(
-    [...failures.map((entry) => entry.event), ...events].sort(
-      (a, b) => a.t - b.t,
-    ),
+    allEvents,
     {
       start: 900,
       failedReqs: failures.map((entry) => entry.failedReq) as never,
     },
+    withGraph ? buildCausalGraph({ events: allEvents }) : undefined,
   );
 }
 
@@ -67,6 +71,72 @@ describe("buildEvidenceCandidates — consumed client errors", () => {
       ],
     );
 
+    expect(candidates.filter((c) => c.detector === "http_error")).toHaveLength(
+      0,
+    );
+  });
+
+  it("does not keep a client error for an unrelated candidate in the consequence window", () => {
+    const candidates = build(
+      [
+        failure({
+          t: 1000,
+          id: "r1",
+          method: "GET",
+          url: "/api/me",
+          status: 401,
+        }),
+      ],
+      [
+        // This is a separate database request, close enough to trigger the old
+        // session-wide consequence test but unrelated to /api/me.
+        {
+          t: 2000,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 1 },
+        },
+        {
+          t: 2100,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 2 },
+        },
+        {
+          t: 2200,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 3 },
+        },
+        {
+          t: 2300,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 4 },
+        },
+        {
+          t: 2400,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 5 },
+        },
+        {
+          t: 2500,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 6 },
+        },
+        {
+          t: 2600,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 7 },
+        },
+        {
+          t: 2700,
+          k: "db.read",
+          d: { requestId: "reviews", table: "reviews", stmt: 8 },
+        },
+      ],
+      true,
+    );
+
+    expect(
+      candidates.find((c) => c.detector === "n_plus_one_query"),
+    ).toBeDefined();
     expect(candidates.filter((c) => c.detector === "http_error")).toHaveLength(
       0,
     );
