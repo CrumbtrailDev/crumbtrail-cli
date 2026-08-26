@@ -1,4 +1,9 @@
 export { Crumbtrail, PROBE_RESULT_EVENT_KIND } from "./crumbtrail";
+export {
+  CRUMBTRAIL_SDK_VERSION,
+  readApplicationReleaseIdentity,
+} from "./release-identity";
+export type { ApplicationReleaseIdentity } from "./release-identity";
 // Exported for `crumbtrail-node`, which reads the same provider flag shapes out
 // of captured `env` events. One rule for what counts as a `{ value, variant }`
 // wrapper, in one place: a second copy had already diverged on non-string

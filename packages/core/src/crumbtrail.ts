@@ -91,6 +91,11 @@ import {
 } from "./redaction";
 import { buildCaptureGapEvent } from "./capture-gap";
 import { renderedErrorCollector } from "./collectors/rendered-error";
+import {
+  CRUMBTRAIL_SDK_VERSION,
+  readApplicationReleaseIdentity,
+  type ApplicationReleaseIdentity,
+} from "./release-identity";
 
 /** Cap on delivery-failure gap records per session. */
 const MAX_DELIVERY_GAP_EVENTS = 3;
@@ -305,6 +310,7 @@ export class Crumbtrail {
   private sessionMetadataWrite: Promise<void> = Promise.resolve();
   private stopped = false;
   private identity: CrumbtrailIdentity = {};
+  private applicationRelease: ApplicationReleaseIdentity;
   private sessionStore?: SessionStore;
   private lifecycleTimer?: ReturnType<typeof setTimeout>;
   private lifecycleClosePromise?: Promise<void>;
@@ -330,6 +336,7 @@ export class Crumbtrail {
     transport: CrumbtrailTransport,
     ringBuffer: RingBuffer,
     sessionId: string,
+    applicationRelease: ApplicationReleaseIdentity,
     sessionStore?: SessionStore,
   ) {
     this.config = config;
@@ -337,6 +344,7 @@ export class Crumbtrail {
     this.transport = transport;
     this.ringBuffer = ringBuffer;
     this.sessionId = sessionId;
+    this.applicationRelease = applicationRelease;
     this.sessionStore = sessionStore;
     this.remotePolicyReady = !remoteConfigProjectKey(config);
     const gpcSuppressed = Boolean(
@@ -363,6 +371,7 @@ export class Crumbtrail {
       maskAllText: true,
       maskAllInputs: true,
     };
+    const applicationRelease = readApplicationReleaseIdentity(config.release);
 
     // Before any collector can emit: the URL and masking paths read this list
     // from module scope rather than from config, because they are reached from
@@ -391,6 +400,7 @@ export class Crumbtrail {
         INERT_TRANSPORT,
         new RingBuffer(config.ringBufferMs, config.ringBufferMaxEvents),
         config.sessionId ?? generateSessionId(),
+        applicationRelease,
       );
     }
 
@@ -436,6 +446,7 @@ export class Crumbtrail {
       transport,
       ringBuffer,
       sessionId,
+      applicationRelease,
       sessionStore,
     );
 
@@ -1290,6 +1301,8 @@ export class Crumbtrail {
           url: currentPageUrl(),
           ua: typeof navigator !== "undefined" ? navigator.userAgent : "",
           ...(this.config.service ? { service: this.config.service } : {}),
+          ...this.applicationRelease,
+          sdkVersion: CRUMBTRAIL_SDK_VERSION,
           ...this.identity,
         })
         .catch(() => {});
@@ -1485,6 +1498,8 @@ export class Crumbtrail {
       this.replay = new ReplayRecorder({
         sessionId: this.sessionId,
         masking: this.replayMasking,
+        ...this.applicationRelease,
+        sdkVersion: CRUMBTRAIL_SDK_VERSION,
         send: (name, body) => this.transport.sendBlob(name, body),
       });
       this.replay.start();

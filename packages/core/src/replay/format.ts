@@ -66,6 +66,12 @@ export interface ReplayManifest {
   schemaVersion: number;
   format: typeof REPLAY_FORMAT;
   sessionId: string;
+  /** Application release identity, when the host application declared one. */
+  release?: string;
+  /** Application build identity, when a public build convention exposed one. */
+  build?: string;
+  /** The Crumbtrail SDK version that wrote this manifest. */
+  sdkVersion?: string;
   startedAt: number;
   durationMs: number;
   masking: ReplayMasking;
