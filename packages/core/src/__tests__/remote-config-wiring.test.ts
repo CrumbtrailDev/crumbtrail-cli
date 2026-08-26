@@ -126,7 +126,7 @@ describe("remote capture config wiring", () => {
     await logger.stop();
   });
 
-  it("does not poll, and does not wait for a policy, when remote config is off", async () => {
+  it("polls without being asked, because the project settings page is the control", async () => {
     const fetch = stubFetch();
     const logger = Crumbtrail.init({
       ...QUIET,
@@ -135,8 +135,24 @@ describe("remote capture config wiring", () => {
       httpAuthToken: "ctkey_live",
     });
 
+    // No remoteConfig in this init. A team that switches session replay on in
+    // the dashboard and changes nothing in their app must still get a replay.
+    expect(pollUrl(fetch)?.pathname).toBe("/api/capture-config");
+    await logger.stop();
+  });
+
+  it("does not poll, and does not wait for a policy, when remote config is turned off", async () => {
+    const fetch = stubFetch();
+    const logger = Crumbtrail.init({
+      ...QUIET,
+      transportInstance: makeTransport(),
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      remoteConfig: false,
+    });
+
     expect(pollUrl(fetch)).toBeUndefined();
-    // A client that never asked for a remote policy must not be held closed
+    // A client that opted out of a remote policy must not be held closed
     // waiting for one that can never arrive.
     expect(
       (logger as unknown as { remotePolicyReady: boolean }).remotePolicyReady,
