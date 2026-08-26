@@ -30,10 +30,7 @@ import {
   type OutboundHttpCaptureOptions,
 } from "./http-server";
 import { sendBackendEvent } from "./backend-intake";
-import {
-  clearProcessSessionId,
-  setProcessSessionId,
-} from "./process-session";
+import { clearProcessSessionId, setProcessSessionId } from "./process-session";
 import { readRequestCorrelation } from "./request-context";
 
 /**
@@ -54,9 +51,10 @@ export const AUTO_CAPTURE_ERROR_EVENT = "backend.uncaught";
 
 /** Hooks a crash/console capture handler can surface an error from. */
 export type AutoCaptureSource =
-  | "uncaughtException"
-  | "unhandledRejection"
-  | "console.error";
+  "uncaughtException" | "unhandledRejection" | "console.error";
+
+/** The two process events whose hook suppresses Node's terminate-on-crash. */
+export type CrashEvent = Exclude<AutoCaptureSource, "console.error">;
 
 /**
  * Stage of the ingest pipeline that failed. `session-start` is the initial
@@ -104,9 +102,17 @@ export interface AutoCaptureOptions {
   processImpl?: NodeJS.Process;
   /**
    * Called after a best-effort record on an unrecoverable crash
-   * (`uncaughtException` / `unhandledRejection`) IN PLACE of `process.exit`.
-   * Tests inject this to assert crash semantics are preserved without killing
-   * the runner. Defaults to `process.exit`.
+   * (`uncaughtException` / `unhandledRejection`) IN PLACE of everything this
+   * would otherwise do about the process. Setting it is the host stating its
+   * own crash semantics, and it is then honoured unconditionally.
+   *
+   * Unset is NOT "always exit". Capture only ends a process Node itself would
+   * have ended: a host with its own crash listener keeps the process it chose
+   * to keep. Passing `() => {}` to stop capture killing a recovering service is
+   * therefore no longer necessary, and a host that already does so is correct
+   * and unaffected.
+   *
+   * Tests inject it to assert crash semantics without killing the runner.
    */
   onCrashExit?: (code: number) => void;
   /**
@@ -310,12 +316,7 @@ const MAX_PENDING_ATTEMPTS = 3;
 const TERMINATION_FLUSH_MS = 400;
 
 /** Signals that mean "this process is being stopped", not "this process failed". */
-const TERMINATION_SIGNALS = [
-  "SIGTERM",
-  "SIGINT",
-  "SIGHUP",
-  "SIGQUIT",
-] as const;
+const TERMINATION_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"] as const;
 
 /** Event kind carrying the process's own statement about how it ended. */
 export const AUTO_CAPTURE_LIFECYCLE_EVENT = "session.lifecycle";
@@ -685,7 +686,9 @@ export async function autoCapture(
     // nothing. Only the logged path is re-routed: a crash is the process's own
     // ending, and its bounded exit flush goes through the live session.
     const correlated =
-      source === "console.error" ? readRequestCorrelation()?.sessionId : undefined;
+      source === "console.error"
+        ? readRequestCorrelation()?.sessionId
+        : undefined;
     if (correlated && correlated !== live.sessionId) {
       return sendBackendEvent({
         event: { ...event, sessionId: correlated },
@@ -847,48 +850,85 @@ export async function autoCapture(
   };
   consoleRef.error = patchedError as typeof consoleRef.error;
 
-  const exit = (code: number): void => {
-    const exiter = options.onCrashExit ?? ((c: number) => proc.exit(c));
-    exiter(code);
-  };
-
   // Crash-path re-entrancy guard: a second crash raised WHILE we are flushing the
   // first must not recurse, restart the flush, or double-exit — the process is
-  // already on its way down.
+  // already on its way down. It reopens when the crash is handed back to a host
+  // that handles its own, because there the process carries on and the next
+  // crash is a new one to record rather than a repeat of this one.
   let crashing = false;
 
+  /**
+   * Whether the HOST is listening for this crash event, ignoring our own hook.
+   *
+   * Installing an `uncaughtException` / `unhandledRejection` listener suppresses
+   * Node's default terminate-on-crash, so capture inherits the decision about
+   * whether the process lives. A host that registered its own handler already
+   * made that decision: it keeps the process alive on purpose and recovers —
+   * a Temporal worker rebuilding a crashed Playwright browser pool is exactly
+   * that shape. Exiting underneath it turns a recoverable fault into an outage
+   * caused entirely by being observed, which is the one change to host
+   * behaviour that is never ours to make.
+   *
+   * Our listener stays installed either way. Unlike a signal, a deferred crash
+   * does not end the process, so removing the hook the way `releaseSignal` does
+   * would silently stop capturing every crash after the first.
+   */
+  const hostHandlesCrash = (event: CrashEvent): boolean => {
+    try {
+      // Compared as opaque references: the point is listener IDENTITY, and the
+      // declared signatures of the two crash events do not unify.
+      const ours: unknown[] = [onUncaught, onUnhandled];
+      const listeners: unknown[] = proc.listeners?.(event) ?? [];
+      return listeners.some((l) => !ours.includes(l));
+    } catch {
+      // A process seam without `listeners` cannot prove the host handles it.
+      return false;
+    }
+  };
+
   // Bounded crash flush: on an unrecoverable crash we give the error event's
-  // in-flight fetch a chance to land, but never let it hang the exit. We race the
-  // record promise against a hard ~150ms ceiling, then exit(1) regardless — a
-  // stalled network, a throwing record, or a rejecting record can never keep the
-  // process alive. Because an installed uncaughtException/unhandledRejection
-  // listener suppresses Node's default terminate-on-crash, the process stays up
-  // just long enough for this flush before we re-assert the non-zero exit.
-  const flushThenExit = async (
+  // in-flight fetch a chance to land, but never let it hang the process. We race
+  // the record promise against a hard ~150ms ceiling — a stalled network, a
+  // throwing record, or a rejecting record can never keep the process alive.
+  //
+  // What happens after the flush is the host's call, not ours:
+  //
+  //  - An explicit `onCrashExit` is the host stating its own crash semantics,
+  //    so it is called and nothing else happens.
+  //  - A host with no crash listener of its own gets Node's own behaviour back,
+  //    which our hook suppressed: exit(1).
+  //  - A host that handles its own crashes keeps the process it chose to keep.
+  const flushThenRelease = async (
     error: unknown,
-    source: AutoCaptureSource,
+    event: CrashEvent,
   ): Promise<void> => {
     if (crashing) return;
     crashing = true;
     try {
-      const recordPromise = record(error, source);
+      const recordPromise = record(error, event);
       if (recordPromise) {
         await Promise.race([recordPromise, sleep(CRASH_FLUSH_MS)]);
       }
     } catch {
-      // A throwing/rejecting flush must never prevent the exit below.
+      // A throwing/rejecting flush must never prevent the release below.
     } finally {
-      exit(1);
+      if (options.onCrashExit) {
+        options.onCrashExit(1);
+      } else if (!hostHandlesCrash(event)) {
+        proc.exit(1);
+      } else {
+        crashing = false;
+      }
     }
   };
 
   const onUncaught = (error: unknown): void => {
-    void flushThenExit(error, "uncaughtException");
+    void flushThenRelease(error, "uncaughtException");
   };
   proc.on("uncaughtException", onUncaught);
 
   const onUnhandled = (reason: unknown): void => {
-    void flushThenExit(reason, "unhandledRejection");
+    void flushThenRelease(reason, "unhandledRejection");
   };
   proc.on("unhandledRejection", onUnhandled);
 
@@ -1071,7 +1111,10 @@ export async function autoCapture(
               })
               .catch((sendErr) => {
                 noteDropped(event.k);
-                emitError(sendErr, { phase: "record", source: "console.error" });
+                emitError(sendErr, {
+                  phase: "record",
+                  source: "console.error",
+                });
               });
             return;
           }
@@ -1195,7 +1238,10 @@ export async function autoCapture(
       // "nothing was instrumented" line does NOT, because that is the sentence
       // that explains a session with no database evidence in it, and leaving it
       // behind a flag is what made that outcome look like a working install.
-      if (line && (debug || !autoInstrumentPatchedAnything(dbInstrumentation))) {
+      if (
+        line &&
+        (debug || !autoInstrumentPatchedAnything(dbInstrumentation))
+      ) {
         originalConsoleError.call(consoleRef, line);
       }
     } catch (error) {
@@ -1253,7 +1299,8 @@ function describeProcess(proc: NodeJS.Process): Record<string, unknown> {
   const record: Record<string, unknown> = {};
   try {
     if (typeof proc.pid === "number") record.pid = proc.pid;
-    const uptime = typeof proc.uptime === "function" ? proc.uptime() : undefined;
+    const uptime =
+      typeof proc.uptime === "function" ? proc.uptime() : undefined;
     if (typeof uptime === "number" && Number.isFinite(uptime)) {
       record.uptimeMs = Math.round(uptime * 1000);
       record.startedAt = Math.round(Date.now() - uptime * 1000);
