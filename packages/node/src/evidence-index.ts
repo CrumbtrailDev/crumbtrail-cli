@@ -13,10 +13,12 @@ import { redactedNetworkBodySnippet } from "./network-body";
 import { sanitizeSelector } from "./sanitize-selector";
 import {
   attributeCandidates,
+  CAUSAL_MAP_WINDOW_MS,
   namesFailureOnGenericPlane,
 } from "./causal-graph";
 import { defaultSessionStore } from "./session-store";
 import type {
+  CandidateAttribution,
   CausalConfidence,
   CausalGraph,
   ContentionLoss,
@@ -154,7 +156,6 @@ const TRACKER_BEACON_SCORE = 15;
 // normal candidate. This is intentionally a consequence window, not a status/path allowlist.
 const CLIENT_ERROR_CONSEQUENCE_WINDOW_MS = 45_000;
 const CLIENT_ERROR_RETRY_WINDOW_MS = 10_000;
-const CLIENT_ERROR_LOOKBACK_WINDOW_MS = 15_000;
 
 // Fetch-level rejection detectors that carry no url of their own, so they must be correlated to a
 // nearby blocked beacon request to be recognised as beacon noise.
@@ -914,7 +915,7 @@ export function buildEvidenceCandidates(
     });
   }
 
-  addRepeatedClickCandidates(events, index, drafts);
+  addRepeatedClickCandidates(events, index, drafts, causalGraph);
   addSlowRequestCandidates(events, index, requestById, drafts);
   addPendingRequestCandidates(index, requestById, outcomeIds, drafts);
   addResponseRaceCandidates(events, index, requestById, drafts);
@@ -1009,7 +1010,12 @@ export function buildEvidenceCandidates(
 
   // Remove 4xx responses whose captured consequences are clean before dedupe. They remain in the
   // raw event stream, but cannot mint a candidate or a canonical issue.
-  removeConsumedClientErrors(drafts, events);
+  removeConsumedClientErrors(
+    drafts,
+    events,
+    causalGraph,
+    causalAttributionForDrafts(drafts, causalGraph),
+  );
 
   // Downrank known third-party analytics/ads beacon failures before dedupe/ranking so a blocked
   // tracker beacon cannot outrank (or drown) a genuine first-party failure. Ranking-only in spirit:
@@ -1260,54 +1266,63 @@ function threadWeight(
   );
 }
 
+function causalAttributionForDrafts(
+  drafts: CandidateDraft[],
+  causalGraph?: CausalGraph,
+): Map<string, CandidateAttribution> | undefined {
+  if (!causalGraph || causalGraph.nodes.length === 0) return undefined;
+  const detectorByKey = new Map<string, string>();
+  for (const draft of drafts)
+    detectorByKey.set(draft.dedupeKey, draft.detector);
+  return attributeCandidates(
+    causalGraph,
+    drafts.map((draft) => ({
+      id: draft.dedupeKey,
+      anchor: {
+        t: draft.anchor.t,
+        requestId: draft.anchor.requestId,
+        route: draft.anchor.route,
+        source: draft.anchor.source,
+        table: draft.anchor.table,
+        method: draft.anchor.method,
+        url: draft.anchor.url,
+      },
+    })),
+    (id) => detectorByKey.get(id),
+  );
+}
+
+function applyCausalAttribution(
+  ordered: CandidateDraft[],
+  attribution: Map<string, CandidateAttribution> | undefined,
+): void {
+  if (!attribution) return;
+  for (const draft of ordered) {
+    const attr = attribution.get(draft.dedupeKey);
+    if (!attr) continue;
+    draft.causalRole = attr.causalRole;
+    if (attr.rootCauseId !== undefined) draft.rootCauseId = attr.rootCauseId;
+    if (attr.causes !== undefined) draft.causes = attr.causes;
+    if (attr.attributionConfidence !== undefined)
+      draft.attributionConfidence = attr.attributionConfidence;
+    // Copied field by field like everything above it, so a new attribution
+    // field is inert until it is listed HERE. That is why these two lines
+    // exist: without them the contention record is born invisible and the
+    // product still cannot say why a candidate is isolated.
+    if (attr.isolationCause !== undefined)
+      draft.isolationCause = attr.isolationCause;
+    if (attr.contention !== undefined) draft.contention = attr.contention;
+  }
+}
+
 function applyCausalRerank(
   ordered: CandidateDraft[],
   causalGraph?: CausalGraph,
 ): void {
-  if (causalGraph && causalGraph.nodes.length > 0) {
-    const detectorByKey = new Map<string, string>();
-    for (const draft of ordered)
-      detectorByKey.set(draft.dedupeKey, draft.detector);
-
-    const attribution = attributeCandidates(
-      causalGraph,
-      ordered.map((draft) => ({
-        id: draft.dedupeKey,
-        anchor: {
-          t: draft.anchor.t,
-          requestId: draft.anchor.requestId,
-          route: draft.anchor.route,
-          // Plane-identifying fields, forwarded verbatim so `attributeCandidates` can DERIVE a
-          // detector's node family from the evidence it anchored on instead of looking the
-          // detector's name up in a table that has to be remembered. See `derivedNodeKinds`.
-          // Nothing new is computed here and nothing is re-derived: these are the same values the
-          // detector wrote when it pushed its draft.
-          source: draft.anchor.source,
-          table: draft.anchor.table,
-          method: draft.anchor.method,
-          url: draft.anchor.url,
-        },
-      })),
-      (id) => detectorByKey.get(id),
-    );
-
-    for (const draft of ordered) {
-      const attr = attribution.get(draft.dedupeKey);
-      if (!attr) continue;
-      draft.causalRole = attr.causalRole;
-      if (attr.rootCauseId !== undefined) draft.rootCauseId = attr.rootCauseId;
-      if (attr.causes !== undefined) draft.causes = attr.causes;
-      if (attr.attributionConfidence !== undefined)
-        draft.attributionConfidence = attr.attributionConfidence;
-      // Copied field by field like everything above it, so a new attribution
-      // field is inert until it is listed HERE. That is why these two lines
-      // exist: without them the contention record is born invisible and the
-      // product still cannot say why a candidate is isolated.
-      if (attr.isolationCause !== undefined)
-        draft.isolationCause = attr.isolationCause;
-      if (attr.contention !== undefined) draft.contention = attr.contention;
-    }
-  }
+  applyCausalAttribution(
+    ordered,
+    causalAttributionForDrafts(ordered, causalGraph),
+  );
 
   const byKey = new Map<string, CandidateDraft>(
     ordered.map((draft) => [draft.dedupeKey, draft]),
@@ -1524,7 +1539,7 @@ function clickTargetIdentity(event: BugEvent): ClickTargetIdentity | undefined {
  * signal should yield to any recorded indication that the page or its state
  * moved, even when that indication has its own detector.
  */
-function isRepeatedClickConsequence(event: BugEvent): boolean {
+function isRepeatedClickConsequenceKind(event: BugEvent): boolean {
   return (
     event.k === "nav" ||
     event.k === "navigation" ||
@@ -1549,10 +1564,101 @@ function isRepeatedClickConsequence(event: BugEvent): boolean {
   );
 }
 
+function graphRequestIdMatches(
+  nodeRequestId: string | undefined,
+  eventRequestId: string | undefined,
+  graph: CausalGraph,
+): boolean {
+  if (!nodeRequestId || !eventRequestId) return false;
+  return (
+    nodeRequestId === eventRequestId ||
+    graph.requestIdAliases?.[eventRequestId] === nodeRequestId
+  );
+}
+
+function requestNodeForEvent(
+  event: BugEvent,
+  graph: CausalGraph,
+): { id: string; requestId?: string } | undefined {
+  const requestId = requestIdForEvent(event);
+  const browserId = networkRequestId(event.d.id);
+  return graph.nodes.find(
+    (node) =>
+      node.kind === "net.req" &&
+      (node.t === event.t ||
+        graphRequestIdMatches(node.requestId, requestId, graph) ||
+        (browserId !== undefined && node.id.endsWith(`:b=${browserId}`))),
+  );
+}
+
+function requestIdsInitiatedByClicks(
+  clicks: BugEvent[],
+  graph: CausalGraph | undefined,
+): Set<string> | undefined {
+  if (!graph || graph.nodes.length === 0) return undefined;
+  const clickNodeIds = new Set(
+    graph.nodes
+      .filter(
+        (node) =>
+          node.kind === "user.click" &&
+          clicks.some((click) => click.t === node.t),
+      )
+      .map((node) => node.id),
+  );
+  if (clickNodeIds.size === 0) return new Set();
+
+  const requestNodeIds = new Set(
+    graph.edges
+      .filter(
+        (edge) =>
+          edge.kind === "interaction" && clickNodeIds.has(edge.from),
+      )
+      .map((edge) => edge.to),
+  );
+  const initiatedIds = new Set<string>();
+  for (const node of graph.nodes) {
+    if (!requestNodeIds.has(node.id)) continue;
+    initiatedIds.add(node.id);
+    if (node.requestId) initiatedIds.add(node.requestId);
+  }
+  return initiatedIds;
+}
+
+function isRepeatedClickConsequence(
+  event: BugEvent,
+  firstClickT: number,
+  lastClickT: number,
+  quietUntil: number,
+  initiatedRequestIds: Set<string> | undefined,
+  graph: CausalGraph | undefined,
+): boolean {
+  if (event.t < firstClickT || event.t > quietUntil) return false;
+  if (!isRepeatedClickConsequenceKind(event)) return false;
+
+  if (event.k === "net.req" || event.k === "net.res" || event.k === "net.err") {
+    if (initiatedRequestIds === undefined) return true;
+    const requestId = requestIdForEvent(event);
+    if (requestId && initiatedRequestIds.has(requestId)) return true;
+    const requestNode = requestNodeForEvent(event, graph!);
+    return requestNode !== undefined && initiatedRequestIds.has(requestNode.id);
+  }
+
+  if (event.k.startsWith("db.") || event.k.startsWith("backend.req.")) {
+    if (initiatedRequestIds === undefined) return true;
+    const requestId = safeText(event.d.requestId, 120);
+    return requestId !== undefined && initiatedRequestIds.has(requestId);
+  }
+
+  // DOM, state, UI and runtime signals have no stable cross-plane request id.
+  // Their position after the target's activations is the available evidence.
+  return event.t > lastClickT || event.k === "nav" || event.k === "navigation";
+}
+
 function addRepeatedClickCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
+  causalGraph?: CausalGraph,
 ): void {
   const clicksByTarget = new Map<
     string,
@@ -1569,10 +1675,6 @@ function addRepeatedClickCandidates(
 
   for (const { identity, clicks } of clicksByTarget.values()) {
     clicks.sort((a, b) => a.t - b.t);
-    const consequenceTimes = events
-      .filter(isRepeatedClickConsequence)
-      .map((event) => event.t)
-      .sort((a, b) => a - b);
     let start = 0;
     let end = 0;
     while (start < clicks.length) {
@@ -1591,10 +1693,19 @@ function addRepeatedClickCandidates(
 
       const last = clicks[end - 1];
       const quietUntil = last.t + REPEATED_CLICK_QUIET_WINDOW_MS;
-      const hasConsequence = hasActivityWithin(
-        consequenceTimes,
-        first.t,
-        quietUntil - first.t,
+      const initiatedRequestIds = requestIdsInitiatedByClicks(
+        clicks.slice(start, end),
+        causalGraph,
+      );
+      const hasConsequence = events.some((event) =>
+        isRepeatedClickConsequence(
+          event,
+          first.t,
+          last.t,
+          quietUntil,
+          initiatedRequestIds,
+          causalGraph,
+        ),
       );
       if (hasConsequence) {
         start = end;
@@ -12880,6 +12991,7 @@ function normalizeErrorSignature(value: unknown): string {
 /** Context used to judge a client-error response by its captured consequences. */
 interface ClientErrorContext {
   t: number;
+  requestId?: string;
   status?: number;
   method?: string;
   url?: string;
@@ -12917,6 +13029,102 @@ function sameOperation(
     eventMethod(event) === method &&
     eventTarget(event) === target
   );
+}
+
+function sameRequestId(
+  left: string | undefined,
+  right: string | undefined,
+  graph?: CausalGraph,
+): boolean {
+  if (!left || !right) return false;
+  return (
+    left === right ||
+    graph?.requestIdAliases?.[left] === right ||
+    graph?.requestIdAliases?.[right] === left
+  );
+}
+
+function causalNodeKindForEvent(event: BugEvent): string | undefined {
+  if (event.k === "err" || event.k === "rej") return "frontend.error";
+  if (event.k === "con") {
+    return safeText(event.d.lv, 20)?.toLowerCase().startsWith("err")
+      ? "console.error"
+      : undefined;
+  }
+  if (event.k === "backend.req.error" || event.k === "backend.uncaught")
+    return "backend.error";
+  if (event.k === "backend.req.start" || event.k === "backend.req.end")
+    return "backend.req";
+  if (event.k === "backend.otel.span") return "otel.span";
+  if (event.k === "backend.otel.log") return "otel.log";
+  if (event.k === "net.res") return "net.res";
+  return undefined;
+}
+
+function eventNodeForCausalGraph(
+  event: BugEvent,
+  graph: CausalGraph,
+): { id: string; requestId?: string } | undefined {
+  const kind = causalNodeKindForEvent(event);
+  if (!kind) return undefined;
+  const requestId = requestIdForEvent(event);
+  return graph.nodes.find(
+    (node) =>
+      node.kind === kind &&
+      (node.t === event.t ||
+        sameRequestId(node.requestId, requestId, graph)),
+  );
+}
+
+function hasCausalPath(
+  graph: CausalGraph,
+  from: string,
+  to: string,
+): boolean {
+  if (from === to) return true;
+  const outgoing = new Map<string, string[]>();
+  for (const edge of graph.edges) {
+    const targets = outgoing.get(edge.from) ?? [];
+    targets.push(edge.to);
+    outgoing.set(edge.from, targets);
+  }
+  const pending = [from];
+  const visited = new Set([from]);
+  while (pending.length > 0) {
+    const current = pending.shift()!;
+    for (const next of outgoing.get(current) ?? []) {
+      if (next === to) return true;
+      if (visited.has(next)) continue;
+      visited.add(next);
+      pending.push(next);
+    }
+  }
+  return false;
+}
+
+function eventIsCausalClientErrorConsequence(
+  context: ClientErrorContext,
+  event: BugEvent,
+  causalGraph?: CausalGraph,
+): boolean {
+  if (!isFailureSurfaceEvent(event)) return false;
+  if (sameRequestId(context.requestId, requestIdForEvent(event), causalGraph))
+    return true;
+  if (causalGraph) {
+    const source = causalGraph.nodes.find(
+      (node) =>
+        node.kind === "net.res" &&
+        node.t === context.t &&
+        sameRequestId(node.requestId, context.requestId, causalGraph),
+    );
+    const target = eventNodeForCausalGraph(event, causalGraph);
+    return source !== undefined && target !== undefined
+      ? hasCausalPath(causalGraph, source.id, target.id)
+      : false;
+  }
+  // Legacy callers do not pass the graph. Keep close surfaced errors
+  // compatible, but do not reuse the 45-second candidate window.
+  return event.t >= context.t && event.t - context.t <= CAUSAL_MAP_WINDOW_MS;
 }
 
 function isFailureSurfaceEvent(event: BugEvent): boolean {
@@ -12973,12 +13181,14 @@ function isFailureSurfaceEvent(event: BugEvent): boolean {
 function isConsumedClientError(
   context: ClientErrorContext,
   events: BugEvent[],
+  causalGraph?: CausalGraph,
 ): boolean {
   if (!isClientErrorStatus(context.status)) return false;
   const end = context.t + CLIENT_ERROR_CONSEQUENCE_WINDOW_MS;
   for (const event of events) {
     if (event.t < context.t || event.t > end) continue;
-    if (isFailureSurfaceEvent(event)) return false;
+    if (eventIsCausalClientErrorConsequence(context, event, causalGraph))
+      return false;
     if (
       event.t > context.t &&
       event.t <= context.t + CLIENT_ERROR_RETRY_WINDOW_MS &&
@@ -13011,23 +13221,35 @@ function sameClientErrorOperation(
   );
 }
 
-function isWithinClientErrorWindow(t: number, anchor: number): boolean {
+function draftsAreCausallyRelated(
+  left: CandidateDraft,
+  right: CandidateDraft,
+  attribution: Map<string, CandidateAttribution> | undefined,
+  causalGraph?: CausalGraph,
+): boolean {
+  if (sameRequestId(left.anchor.requestId, right.anchor.requestId, causalGraph))
+    return true;
+  const leftAttr = attribution?.get(left.dedupeKey);
+  const rightAttr = attribution?.get(right.dedupeKey);
   return (
-    t >= anchor - CLIENT_ERROR_LOOKBACK_WINDOW_MS &&
-    t <= anchor + CLIENT_ERROR_CONSEQUENCE_WINDOW_MS
+    leftAttr?.rootCauseId === right.dedupeKey ||
+    rightAttr?.rootCauseId === left.dedupeKey ||
+    leftAttr?.causes?.includes(right.dedupeKey) === true ||
+    rightAttr?.causes?.includes(left.dedupeKey) === true
   );
 }
 
 /**
  * Remove consumed client errors before dedupe so they cannot mint a candidate
- * or a canonical issue. A non-client detector in the same consequence window
- * is treated as a consequence and keeps the 4xx visible. This is conservative:
- * a separate detector may be unrelated, but hiding a 4xx after the session has
- * already shown a failure is the more damaging error.
+ * or a canonical issue. A different detector keeps the 4xx only when it shares
+ * the failed request or a causal graph thread, never because its anchor happens
+ * to fall inside the reader's evidence window.
  */
 function removeConsumedClientErrors(
   drafts: CandidateDraft[],
   events: BugEvent[],
+  causalGraph?: CausalGraph,
+  attribution?: Map<string, CandidateAttribution>,
 ): void {
   const kept: CandidateDraft[] = [];
   for (const draft of drafts) {
@@ -13038,6 +13260,7 @@ function removeConsumedClientErrors(
 
     const context: ClientErrorContext = {
       t: draft.anchor.t,
+      requestId: draft.anchor.requestId,
       status: draft.anchor.status,
       method: draft.anchor.method,
       url: draft.anchor.url ?? draft.anchor.route,
@@ -13046,7 +13269,7 @@ function removeConsumedClientErrors(
       (other) =>
         other !== draft &&
         !isClientErrorDraft(other) &&
-        isWithinClientErrorWindow(other.anchor.t, draft.anchor.t),
+        draftsAreCausallyRelated(draft, other, attribution, causalGraph),
     );
     const operationRetried = drafts.some(
       (other) =>
@@ -13057,7 +13280,7 @@ function removeConsumedClientErrors(
           CLIENT_ERROR_RETRY_WINDOW_MS,
     );
     if (
-      isConsumedClientError(context, events) &&
+      isConsumedClientError(context, events, causalGraph) &&
       !otherDetectorFired &&
       !operationRetried
     )
