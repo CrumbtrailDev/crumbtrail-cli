@@ -857,7 +857,11 @@ describe("server", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ ok: true, processed: true, degraded: true });
+    expect(res.body).toMatchObject({
+      ok: true,
+      processed: true,
+      degraded: true,
+    });
     const warnings = (
       res.body as { postProcess: { warnings?: Array<{ code: string }> } }
     ).postProcess.warnings;
@@ -1222,14 +1226,11 @@ describe("server", () => {
 
     const fc = await buildFixContext(sessionDir);
     expect(fc.session.app).toBe("shop-expo");
-    console.log("DEBUG_EXPO", JSON.stringify(fc.signals.map((x) => x.detector)));
-    // Other detectors on this session can outrank the click signal; this test is
-    // about the descriptors the signal carries, not about where it ranks.
-    const repeatedClicks = fc.signals.find(
-      (signal) => signal.detector === "repeated_clicks",
-    );
-    expect(repeatedClicks).toMatchObject({
-      detector: "repeated_clicks",
+    // The repeated taps here do have a consequence (the crash), so the
+    // consequence-aware click rule stands down and the submit rule leads. What
+    // this test cares about is that the native descriptors survive either way.
+    expect(fc.signals[0]).toMatchObject({
+      detector: "ineffective_submit",
       anchor: {
         route: "/checkout",
         target: {
@@ -1270,7 +1271,7 @@ describe("server", () => {
         (row) =>
           row.type === "event" &&
           row.k === "native-crash" &&
-          String(row.text).includes("token=[REDACTED]"),
+          String(row.text).includes("token=[REDACTED;"),
       ),
     ).toBe(true);
     expect(JSON.stringify(searchRows)).not.toContain("sk_fake_mobile_secret");

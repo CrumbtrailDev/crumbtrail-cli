@@ -76,6 +76,10 @@ export const INDEXED_EVENT_KINDS: ReadonlySet<string> = new Set([
   "probe.error",
   "bug.flag",
   "mark",
+  // A validation error the app drew on screen. Emitted by the browser SDK's
+  // rendered-error collector, so it has to be indexable or the sender is told
+  // the evidence it just captured is unrecognized.
+  "ui.error",
   // Backend and OpenTelemetry
   "backend.req.start",
   "backend.req.end",

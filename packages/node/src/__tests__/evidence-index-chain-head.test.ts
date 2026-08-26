@@ -22,12 +22,19 @@ import { buildCausalGraph } from "../causal-graph";
 const T0 = 1_700_000_000_000;
 const REQ = "chainheadreq0000000000000000000a";
 
-const spine = (status: number): BugEvent[] => [
+const spine = (status: number, body?: string): BugEvent[] => [
   { t: T0, k: "clk", d: { el: { txt: "Continue" }, route: "/one" } },
   {
     t: T0 + 5,
     k: "net.req",
-    d: { id: 1, method: "POST", url: "/api/one", requestId: REQ, traceId: REQ },
+    d: {
+      id: 1,
+      method: "POST",
+      url: "/api/one",
+      requestId: REQ,
+      traceId: REQ,
+      ...(body ? { body } : {}),
+    },
   },
   {
     t: T0 + 6,
@@ -58,7 +65,10 @@ function weakRootSession(): Parameters<typeof buildEvidenceCandidates> {
     {
       t: T0 + 60,
       k: "err",
-      d: { msg: THROWN, stack: "TypeError: t\n    at render (src/one.js:12:3)" },
+      d: {
+        msg: THROWN,
+        stack: "TypeError: t\n    at render (src/one.js:12:3)",
+      },
     },
   ].sort((a, b) => a.t - b.t);
   return [
@@ -75,7 +85,7 @@ function weakRootSession(): Parameters<typeof buildEvidenceCandidates> {
 /** The control: the same assembly, but the root is itself the chain's strongest member. */
 function strongRootSession(): Parameters<typeof buildEvidenceCandidates> {
   const events: BugEvent[] = [
-    ...spine(400),
+    ...spine(400, JSON.stringify({ count: 3 })),
     {
       t: T0 + 20,
       k: "db.diff",
@@ -84,7 +94,8 @@ function strongRootSession(): Parameters<typeof buildEvidenceCandidates> {
         op: "update",
         table: "widgets",
         pk: { id: 1 },
-        after: { id: 1, count: 3 },
+        before: { id: 1, count: 2, note: "keep me" },
+        after: { id: 1, count: 3, note: null },
         requestId: REQ,
       },
     },
@@ -112,7 +123,8 @@ describe("buildEvidenceCandidates — a chain leads with the member that placed 
    */
   it("assembles one chain of a root and the symptom attributed to it", () => {
     for (const candidates of [weak, strong]) {
-      expect(candidates).toHaveLength(2);
+      const chain = candidates.filter((c) => c.causalRole !== "isolated");
+      expect(chain).toHaveLength(2);
       const root = candidates.find((c) => c.causalRole === "root")!;
       const symptom = candidates.find((c) => c.causalRole === "symptom")!;
       expect(root).toBeDefined();

@@ -6421,12 +6421,25 @@ function redactRelativeUrlLikeString(value: string): string {
   return redactTokenLikeText(`${base}${serialized ? `?${serialized}` : ""}`);
 }
 
+/**
+ * A query value the capture side already replaced with a shape-carrying marker.
+ * Collapsing it to the bare marker here would drop the shape the browser paid to
+ * compute, and would leave the same URL reading differently in the bundle than
+ * in the request index built from the same event.
+ */
+const REDACTED_QUERY_SHAPE_RE =
+  /^\[REDACTED;len=\d{1,7};charset=(?:alpha|num|alnum|mixed)(?:;separators=[^\]]*)?\]$/;
+
 function redactSearchParams(params: URLSearchParams): void {
   for (const key of Array.from(params.keys())) {
     const values = params.getAll(key);
     params.delete(key);
     for (const value of values) {
-      params.append(key, value === "" ? "" : REDACTED_VALUE);
+      if (value === "" || REDACTED_QUERY_SHAPE_RE.test(value)) {
+        params.append(key, value);
+        continue;
+      }
+      params.append(key, REDACTED_VALUE);
     }
   }
 }

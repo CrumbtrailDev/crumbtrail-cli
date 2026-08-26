@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventBus } from "../event-bus";
 import type { BugEvent, CrumbtrailConfig } from "../types";
 import { DEFAULT_CONFIG } from "../types";
-import { REDACTED_VALUE } from "../redaction";
 import { maskText } from "../masking";
 import { interactionCollector } from "../collectors/interaction";
 
@@ -233,5 +232,4 @@ describe("interactionCollector redaction", () => {
 
     cleanup();
   });
-
 });

@@ -3,7 +3,6 @@ import type { BugEvent } from "crumbtrail-core";
 import {
   BROWSER_REDACTION_POLICY,
   CAPTURE_GAP_EVENT_KIND,
-  REDACTED_VALUE,
 } from "crumbtrail-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
