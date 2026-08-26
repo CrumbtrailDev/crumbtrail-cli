@@ -70,11 +70,14 @@ lifetime while nothing lands. Stop capture, say so once on the platform's log,
 and do not post a session's worth of events into a 404.
 
 An unload-time beacon (`navigator.sendBeacon` and its equivalents) carries no
-request headers, so it cannot carry the ingest key. On an authenticated project it
-is not a delivery path: its `true` means "queued", the server refuses it for
-missing credentials, and reporting that as delivery is how the final batch — the
-one holding the failure that made the user leave — disappears from a session that
-reports itself complete. Record the loss instead.
+request headers. For `/api/events` and `/api/session/end`, the browser SDK puts
+the public ingest key in the JSON envelope as `ingestKey`, using a Blob whose
+content type is `application/json`. The cloud resolves that value through the
+same tenant, project, revocation and rate limit checks as the header path, then
+removes it before forwarding the payload. It is not accepted on any other route,
+and it is not put in a query string, where access logs and proxy logs would
+retain it. A beacon's `true` still means only "queued", so a false return records
+the loss instead.
 
 ## Event envelope
 

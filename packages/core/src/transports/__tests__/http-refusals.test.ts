@@ -195,12 +195,12 @@ describe("endSession", () => {
   });
 });
 
-describe("the sendBeacon unload path cannot carry the ingest key", () => {
+describe("the authenticated sendBeacon unload path", () => {
   function offline(): void {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("unloading")));
   }
 
-  it("reports the loss rather than posting the final batch unauthenticated", async () => {
+  it("queues the final batch with the ingest key in the JSON body", async () => {
     vi.stubGlobal("fetch", routed({}));
     const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
     await transport.startSession("ses_test", {});
@@ -213,13 +213,41 @@ describe("the sendBeacon unload path cannot carry the ingest key", () => {
     });
     offline();
 
-    const error = await transport
-      .sendEvents([{ t: 1, k: "err", d: { msg: "the failure that made them leave" } }])
-      .catch((caught) => caught as EventDeliveryError);
+    const events = [{ t: 1, k: "err", d: { msg: "unload" } }];
+    await expect(transport.sendEvents(events)).resolves.toBeUndefined();
 
-    expect(error).toBeInstanceOf(EventDeliveryError);
-    expect((error as EventDeliveryError).status).toBe(0);
-    expect(sendBeacon).not.toHaveBeenCalled();
+    expect(sendBeacon).toHaveBeenCalledOnce();
+    const beacon = sendBeacon.mock.calls[0][1] as Blob;
+    expect(beacon.type).toBe("application/json");
+    expect(JSON.parse(await beacon.text())).toEqual({
+      sessionId: "ses_test",
+      events,
+      ingestKey: "ctkey_x",
+    });
+  });
+
+  it("queues session close with the ingest key in the JSON body", async () => {
+    vi.stubGlobal("fetch", routed({}));
+    const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
+    await transport.startSession("ses_test", {});
+
+    const sendBeacon = vi.fn().mockReturnValue(true);
+    Object.defineProperty(navigator, "sendBeacon", {
+      value: sendBeacon,
+      writable: true,
+      configurable: true,
+    });
+    offline();
+
+    await expect(transport.endSession("ses_test")).resolves.toBeUndefined();
+
+    expect(sendBeacon).toHaveBeenCalledOnce();
+    const beacon = sendBeacon.mock.calls[0][1] as Blob;
+    expect(beacon.type).toBe("application/json");
+    expect(JSON.parse(await beacon.text())).toEqual({
+      sessionId: "ses_test",
+      ingestKey: "ctkey_x",
+    });
   });
 
   it("still beacons for an unauthenticated endpoint, where it is a real delivery path", async () => {
