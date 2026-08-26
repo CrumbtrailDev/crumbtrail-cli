@@ -728,14 +728,22 @@ export interface CrumbtrailConfig {
    * arrive on that poll and nowhere else. The kill switch, the capture budgets,
    * row value redaction and the refusal of replay writes are enforced at ingest
    * too, so those hold whatever the client is running, and the poll only lets a
-   * client stop buffering sooner. Off by default because the poll is fail
-   * closed — capture waits for the first policy response — so a client
-   * pointed at something that does not serve the config route must not be
-   * switched into waiting for one. Every install path the installer writes
-   * sets it, because every one of those points at Crumbtrail.
+   * client stop buffering sooner. On by default, because the project's settings
+   * page is where a team expects to control capture, and a client that does not
+   * poll leaves every one of those settings saved and unreachable — a replay
+   * switched on in the dashboard silently records nothing.
    *
    * Needs `httpAuthToken`: the poll authenticates with the project ingest key
-   * the client already carries, so nothing is configured twice.
+   * the client already carries, so nothing is configured twice. A client with
+   * no key does not poll whatever this says, so defaulting it on never points
+   * an unconfigured client at a config route.
+   *
+   * The poll is fail closed — capture waits for the first policy response —
+   * but the wait is bounded by `REMOTE_POLICY_TIMEOUT_MS`, after which capture
+   * falls back to this local config and declares a `policy_unavailable` gap.
+   * A client keyed against something that does not serve the config route
+   * therefore loses that bounded wait on first load, not its capture. Set this
+   * to `false` to skip the poll entirely and run on local config alone.
    */
   remoteConfig: boolean;
   /**
@@ -944,7 +952,7 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   baselineSampleRate: 0,
   flightRecorder: false,
   flightRecorderTailMs: 60_000,
-  remoteConfig: false,
+  remoteConfig: true,
   configPollIntervalMs: 60_000,
 
   heartbeat: true,

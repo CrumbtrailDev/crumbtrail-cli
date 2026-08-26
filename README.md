@@ -151,11 +151,13 @@ Crumbtrail.init({
 });
 ```
 
-`remoteConfig: true` is what lets the project's capture settings reach the app.
-Without it the SDK never asks Crumbtrail for them, so the auto flag triggers,
-sampling, consent mode, masking, session replay and live probes all stay at
-whatever this call says. The kill switch and the capture budgets are enforced at
-ingest as well, so those hold either way. The installer writes it for you.
+`remoteConfig` is what lets the project's capture settings reach the app, and it
+is on by default. The SDK polls Crumbtrail for them, so the auto flag triggers,
+sampling, consent mode, masking, session replay and live probes are taken from
+the project rather than from this call. Set it to `false` and the SDK never
+asks, leaving all of those at whatever this call says. The poll needs an ingest
+key, so a client without one does not poll either way, and the kill switch and
+the capture budgets are enforced at ingest, so those hold whatever you run.
 
 ## Failure archetype skills
 

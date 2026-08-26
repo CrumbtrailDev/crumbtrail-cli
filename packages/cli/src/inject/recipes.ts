@@ -400,8 +400,8 @@ function nextActionFor(
     }
     case "remote-config":
       return blocked?.existingKey
-        ? `${where} already sets \`${blocked.existingKey}\` — set it to true so dashboard capture settings reach this app.`
-        : `Add \`remoteConfig: true\` to the init call in ${where} so dashboard capture settings reach it.`;
+        ? `${where} sets \`${blocked.existingKey}\` to false — remove it or set it to true so dashboard capture settings reach this app.`
+        : `${where} sets \`remoteConfig: false\`, so dashboard capture settings never reach this app. Remove that line to take them.`;
   }
 }
 

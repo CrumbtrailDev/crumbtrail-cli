@@ -128,9 +128,10 @@ const DEFAULT_CONFIG_POLL_INTERVAL_MS = 60_000;
  * How long capture waits for the remote capture policy before falling back to
  * the local config.
  *
- * `remoteConfig: true` is what the CLI installer writes into every generated
- * init block, and until the policy lands `canTransport()` is false, so the
- * whole session is refused at admission. Without a bound, a blocked config
+ * `remoteConfig` is on by default and every generated init block carries a key,
+ * so this bound applies to ordinary installs rather than to an opt in few. Until
+ * the policy lands `canTransport()` is false, so the whole session is refused at
+ * admission. Without a bound, a blocked config
  * route, an offline first load, or an endpoint that answers with no policy at
  * all means a session that captures nothing, forever, and cannot even say so —
  * the gap record needs `canTransport()` too. The wait is bounded instead, and
@@ -2066,11 +2067,11 @@ function normalizeInterval(intervalMs: number | undefined): number {
  * The key this client's capture config poll authenticates with, or `undefined`
  * when it does not poll at all.
  *
- * Both halves are required and neither is asked for twice: `remoteConfig` is
- * the opt in the installer writes, and the poll authenticates with the ingest
- * key the client already carries. A client with no key has no project to ask
- * about, so it stays unpolicied rather than waiting forever on a poll that
- * could never be answered.
+ * Both halves are required and neither is asked for twice: `remoteConfig` is on
+ * unless the caller turns it off, and the poll authenticates with the ingest key
+ * the client already carries. The key is what makes the default safe. A client
+ * with no key has no project to ask about, so it stays unpolicied rather than
+ * waiting forever on a poll that could never be answered.
  */
 function remoteConfigProjectKey(config: CrumbtrailConfig): string | undefined {
   return config.remoteConfig && config.httpAuthToken
