@@ -153,7 +153,11 @@ describe("candidate titles — no leaked placeholders", () => {
       t,
       k: "clk" as const,
       d: {
-        target: { label: "sk-ABCD1234ABCD1234ABCD1234", role: "button" },
+        el: { sig: "masked-target" },
+        target: {
+          label: "sk-ABCD1234ABCD1234ABCD1234",
+          role: "button",
+        },
       },
     }));
 
@@ -161,20 +165,24 @@ describe("candidate titles — no leaked placeholders", () => {
       (c) => c.detector === "repeated_clicks",
     );
 
-    expect(candidate?.title).toBe("Repeated clicks on a button");
+    expect(candidate?.title).toBe(
+      "Repeated clicks on a button had no recorded consequence",
+    );
   });
 
   it("falls back to a plain phrase when a click has no usable identity", () => {
     const clicks = [1000, 1500, 2000].map((t) => ({
       t,
       k: "clk" as const,
-      d: {},
+      d: { el: { sig: "unlabeled-target" } },
     }));
 
     const candidate = buildEvidenceCandidates(clicks, { start: 900 }).find(
       (c) => c.detector === "repeated_clicks",
     );
 
-    expect(candidate?.title).toBe("Repeated clicks on an unlabeled element");
+    expect(candidate?.title).toBe(
+      "Repeated clicks on an unlabeled element had no recorded consequence",
+    );
   });
 });
