@@ -131,8 +131,8 @@ same-turn state that clears before the mutation batch settles is ignored.
 This trigger does not guess from CSS classes, test IDs, or error copy. It cannot
 cover plain error elements with none of these accessibility or browser
 validation signals, nor can it infer an error from `aria-describedby`,
-`:user-invalid`, or application-specific state that is not exposed through
-these standards.
+`aria-errormessage`, `:user-invalid`, or application-specific state that is not
+exposed through these standards.
 
 ### Flagging a bug yourself
 

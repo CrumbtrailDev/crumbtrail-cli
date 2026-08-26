@@ -169,7 +169,8 @@ abandoned flows. `autoFlagDebounceMs` coalesces bursts and
 `role="alertdialog"` entering the document, `aria-invalid="true"` appearing on
 a control, and native `invalid` events. It does not guess from CSS classes,
 test IDs, or copy, so plain error elements without these standards signals are
-outside its coverage.
+outside its coverage. It does not infer errors from `aria-describedby`,
+`aria-errormessage`, `:user-invalid`, or application-specific state.
 
 ## Failure archetype skills
 
