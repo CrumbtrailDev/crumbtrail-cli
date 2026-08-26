@@ -166,6 +166,9 @@ export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
  */
 export const UI_NUM_EVENT_KIND = "ui.num" as const;
 
+/** Canonical event kind for a browser-standard rendered validation error (`k:'ui.error'`). */
+export const UI_ERROR_EVENT_KIND = "ui.error" as const;
+
 /**
  * Canonical event kind for the live event-listener gauge (`k:'ui.listeners'`).
  * Payload: `{ total, byType: [[type, count], …], churnByType: [[type,
@@ -819,6 +822,8 @@ export interface CrumbtrailConfig {
    * `autoFlagMaxPerSession` caps the total, so an outage cannot flood.
    */
   autoFlagOnRequest5xx: boolean;
+  /** Enable automatic capture when a browser-standard rendered validation error appears. */
+  autoFlagOnRenderedError: boolean;
   /** Allow app code and the widget to call `flag()` as an explicit beacon. */
   explicitBeacon: boolean;
   /** Keep the server side pull policy available to heartbeat integrations. */
@@ -982,6 +987,7 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   autoFlagOnUncaughtError: true,
   autoFlagOnUnhandledRejection: true,
   autoFlagOnRequest5xx: true,
+  autoFlagOnRenderedError: true,
   explicitBeacon: true,
   serverSidePull: false,
   autoFlagDebounceMs: 2000,

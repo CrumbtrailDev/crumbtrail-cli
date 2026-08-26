@@ -1,4 +1,5 @@
 import type { BugEvent } from "./types";
+import { UI_ERROR_EVENT_KIND } from "./types";
 import { hashString } from "./signature";
 
 /**
@@ -85,6 +86,21 @@ export function request5xxDetector(): SignalDetector {
         tag: "auto:request-5xx",
         key: `request-5xx:${requestId}:${status}`,
         reason: `Auto captured after request returned ${status}`,
+      };
+    },
+  };
+}
+
+/** React to a browser-standard validation failure rendered into the document. */
+export function renderedErrorDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== UI_ERROR_EVENT_KIND) return null;
+      const id = typeof event.d.id === "number" ? event.d.id : "unknown";
+      return {
+        tag: "auto:rendered-error",
+        key: `rendered-error:${id}`,
+        reason: "Auto captured after rendered error state appeared",
       };
     },
   };

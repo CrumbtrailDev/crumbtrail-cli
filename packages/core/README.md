@@ -145,6 +145,27 @@ and early resource listener are dropped and the patches become pass-throughs.
 | `PRESET_LIGHT`   | Leaner capture, less overhead.                                         |
 | `PRESET_FULL`    | Everything, for a heavy debugging session.                             |
 
+### Automatic capture triggers
+
+The automatic triggers are `autoFlagOnError`,
+`autoFlagOnUncaughtError`, `autoFlagOnUnhandledRejection`,
+`autoFlagOnRequest5xx`, `autoFlagOnRenderedError`, and the configured signal
+triggers `autoFlagOnRageClick`, `autoFlagOnRetryStorm`,
+`autoFlagOnSlowResponse`, and `autoFlagOnAbandonedFlow`.
+`autoFlagDebounceMs` coalesces a burst and
+`autoFlagMaxPerSession` caps automatic reports across all triggers.
+
+`autoFlagOnRenderedError` is enabled by default. It watches browser-standard
+signals: `role="alert"` or `role="alertdialog"` entering the document,
+`aria-invalid="true"` appearing on a control, and native `invalid` events. A
+same-turn state that clears before the mutation batch settles is ignored.
+
+This trigger does not guess from CSS classes, test IDs, or error copy. It cannot
+cover plain error elements with none of these accessibility or browser
+validation signals, nor can it infer an error from `aria-describedby`,
+`aria-errormessage`, `:user-invalid`, or application-specific state that is not
+exposed through these standards.
+
 ### Flagging a bug yourself
 
 `init()` returns the instance, so you can mark moments explicitly:

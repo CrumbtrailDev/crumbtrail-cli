@@ -102,6 +102,7 @@ export {
   DB_STATEMENT_EVENT_KIND,
   CAPTURE_GAP_EVENT_KIND,
   UI_NUM_EVENT_KIND,
+  UI_ERROR_EVENT_KIND,
   UI_LISTENERS_EVENT_KIND,
   UI_LAYOUT_EVENT_KIND,
   DEFAULT_CONFIG,
@@ -134,6 +135,7 @@ export {
   retryStormDetector,
   slowResponseDetector,
   abandonedFlowDetector,
+  renderedErrorDetector,
 } from "./signals";
 export type {
   Signal,
