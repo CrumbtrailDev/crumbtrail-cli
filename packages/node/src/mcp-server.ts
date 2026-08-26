@@ -3792,6 +3792,9 @@ export class McpServer {
           basis: "heuristic",
           baseScore: numberField(candidate.score),
           score: numberField(candidate.score),
+          recovery: isRecord(candidate.recovery)
+            ? candidate.recovery
+            : undefined,
           anchor: isRecord(candidate.anchor) ? candidate.anchor : undefined,
           evidenceWindow: isRecord(candidate.evidenceWindow)
             ? candidate.evidenceWindow

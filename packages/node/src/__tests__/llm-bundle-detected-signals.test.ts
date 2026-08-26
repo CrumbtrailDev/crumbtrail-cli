@@ -29,14 +29,21 @@ function clickEvent(overrides: Record<string, unknown> = {}): BugEvent {
   } as unknown as BugEvent;
 }
 
-function bundleFor(events: BugEvent[]) {
+function bundleFor(
+  events: BugEvent[],
+  index: Record<string, unknown> = {
+    id: "s1",
+    start: 1_000,
+    end: 6_000,
+    dur: 5_000,
+  },
+) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-bundle-signals-"));
   scratch.push(dir);
   fs.writeFileSync(
     path.join(dir, "meta.json"),
     JSON.stringify({ id: "s1", app: "test", env: "local" }),
   );
-  const index = { id: "s1", start: 1_000, end: 6_000, dur: 5_000 };
   return buildLlmBundle({
     sessionDir: dir,
     events,
@@ -74,6 +81,51 @@ describe("detected signals reach the rendered bundle", () => {
     expect(markdown).toContain("not a verdict");
     // Absence of a signal must not read as absence of a defect.
     expect(markdown).toContain("no evidence either way");
+  });
+
+  it("renders a failure's recovery state and delay", () => {
+    const events = [
+      {
+        t: 1_100,
+        k: "net.err",
+        d: {
+          id: "r1",
+          method: "GET",
+          url: "/api/cart",
+          msg: "Failed to fetch",
+        },
+      },
+      {
+        t: 1_200,
+        k: "net.req",
+        d: { id: "r2", method: "GET", url: "/api/cart" },
+      },
+      {
+        t: 1_325,
+        k: "net.res",
+        d: { id: "r2", st: 200, method: "GET", url: "/api/cart" },
+      },
+    ] as BugEvent[];
+    const markdown = renderLlmMarkdown(
+      bundleFor(events, {
+        id: "s1",
+        start: 1_000,
+        end: 2_000,
+        dur: 1_000,
+        networkErrors: [
+          {
+            t: 1_100,
+            id: "r1",
+            method: "GET",
+            url: "/api/cart",
+            msg: "Failed to fetch",
+          },
+        ],
+      }),
+    );
+
+    expect(markdown).toContain("| Recovery |");
+    expect(markdown).toContain("recovered (+225 ms)");
   });
 
   it("omits the section entirely when nothing was detected", () => {

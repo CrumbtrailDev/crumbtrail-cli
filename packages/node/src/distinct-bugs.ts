@@ -1,6 +1,10 @@
 import { hashString } from "crumbtrail-core";
 import type { BugEvent, TargetDescriptor } from "crumbtrail-core";
-import type { EvidenceCandidate, SupportGrade } from "./evidence-index";
+import type {
+  EvidenceCandidate,
+  FailureRecovery,
+  SupportGrade,
+} from "./evidence-index";
 import type { IsolationCause } from "./causal-graph";
 import { redactedNetworkBodySnippet } from "./network-body";
 
@@ -82,6 +86,8 @@ export interface DistinctBug {
      * for once.
      */
     support?: SupportGrade;
+    /** Whether the failing operation recovered later in the observed session. */
+    recovery?: FailureRecovery;
     /**
      * WHY the representative could not be attached, carried from the representative candidate for
      * exactly the reasons `support` above is — and only ever set when `support` is `unattached`,
@@ -586,6 +592,7 @@ function buildBug(
       requestId: representative.anchor.requestId,
       frame: representative.anchor.frame,
       support: representative.support,
+      recovery: representative.recovery,
       // Gated on the grade the row actually renders, not on `causalRole`: `support` is optional
       // for read-back from an artifact written before it existed, and a row reading
       // `not-assessed` beside a reason for isolation would contradict itself in two adjacent

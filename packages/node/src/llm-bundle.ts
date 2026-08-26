@@ -5852,6 +5852,9 @@ function renderDetectedSignalsSection(
   // the paragraph that teaches it can never disagree about whether the measurement exists.
   const baseRateCells = shown.map((bug) => detectorBaseRateCell(bug, prevalence));
   const baseRateMeasured = baseRateCells.some((cell) => cell !== "");
+  const recoveryMeasured = shown.some(
+    (bug) => bug.representative.recovery !== undefined,
+  );
   const lines = [
     "## Detected Signals",
     "",
@@ -5867,6 +5870,14 @@ function renderDetectedSignalsSection(
       + "and it is not ranked any lower for it — and `not-assessed` means no causal attribution ran, "
       + "so the question was never asked.",
     "",
+    ...(recoveryMeasured
+      ? [
+          "`Recovery` is evidence about the failing operation after the signal: `recovered` includes "
+            + "the delay to the first equivalent success, `not recovered` means the session continued "
+            + "without one, and `unknown` means the session ended before either conclusion was possible.",
+          "",
+        ]
+      : []),
     // The grade stays whole — three states, no variants — and the reason sits BESIDE it. All three
     // causes mean the same thing for how far to trust a headline, which is why they must not fork
     // the grade; but they mean very different things for what to do next, which is why a reader
@@ -5924,6 +5935,7 @@ function renderDetectedSignalsSection(
         "Severity",
         "Detector",
         "Support",
+        ...(recoveryMeasured ? ["Recovery"] : []),
         "Why unattached",
         ...(baseRateMeasured ? ["Base rate"] : []),
         "Finding",
@@ -5939,6 +5951,17 @@ function renderDetectedSignalsSection(
         // reads the same way to the reader as a session nothing was attributed for: nobody told
         // them. It must never silently render as if the signal had been placed.
         bug.representative.support ?? "not-assessed",
+        ...(recoveryMeasured
+          ? [
+              bug.representative.recovery === undefined
+                ? ""
+                : bug.representative.recovery.status === "recovered"
+                  ? `recovered (+${bug.representative.recovery.afterMs} ms)`
+                  : bug.representative.recovery.status === "not_recovered"
+                    ? "not recovered"
+                    : `unknown (${bug.representative.recovery.reason.replaceAll("_", " ")})`,
+            ]
+          : []),
         // Empty on every row where the question does not arise — which is most of them. Absence
         // renders as nothing rather than as a placeholder word: `none` or `n/a` in this cell would
         // read as an assertion about a row that was never isolated at all.
