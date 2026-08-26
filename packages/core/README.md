@@ -88,10 +88,10 @@ owns session boundaries and will call `stop()` itself.
 ### Capturing page-load failures before init
 
 For page-load fetches, XHRs, and browser-managed subresource failures, this
-import is required. `init()` usually runs from an async import, so the
-application's first requests and failed scripts, stylesheets, and images can
-happen before the main SDK chunk exists. Without this import, those events are
-not captured.
+import is required when `init()` can run after the page starts loading. The
+normal entry still captures events after `init()`, but it cannot recover events
+that happened before its chunk evaluated. Without this import, those early
+events are not captured.
 
 Add this side-effect import as the first line of your entry file, above every
 other import:
@@ -103,12 +103,12 @@ import "crumbtrail-core/early";
 It patches `fetch` and `XMLHttpRequest` synchronously, listens for
 capture-phase subresource errors, stamps the same correlation headers the SDK
 stamps on same-origin requests, and parks bounded records in one queue. The
-queue holds at most 50 entries, 2 MB of request and response body text, and 4
-KB of URL text per resource failure. `init()` drains it through the normal
-redaction pipeline and adopts the early session id, so early failures, the live
-session, and backend events all match. If `init()` never runs within 60 seconds,
-the queue and early resource listener are dropped and the patches become
-pass-throughs.
+queue holds at most 50 entries, 2 MB of request and response body text, 32 KB
+per request or response body, and 4 KB of URL text per resource failure. These
+fixed limits apply before configuration is known. The early queue keeps body
+text only in page memory and `init()` drains it through the normal redaction
+pipeline before emission. If `init()` never runs within 60 seconds, the queue
+and early resource listener are dropped and the patches become pass-throughs.
 
 ### Presets
 

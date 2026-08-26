@@ -36,7 +36,7 @@ import {
   drainEarlyCapture,
   type EarlyRequestRecord,
 } from "../early-capture";
-import { emitEarlyResourceFailure } from "./error";
+import { emitResourceFailure } from "../resource-failure-event";
 import { now, readStructuredBody } from "../utils";
 import { captureCallStack } from "../call-stack";
 
@@ -1617,7 +1617,7 @@ function drainEarlyRequests(
     if (isEarlyResourceError(record)) {
       if (!config.errors) return;
       try {
-        emitEarlyResourceFailure(bus, record);
+        emitResourceFailure(bus, record);
       } catch {
         // One malformed record never costs the rest of the queue.
       }

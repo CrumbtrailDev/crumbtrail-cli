@@ -800,7 +800,7 @@ function patchResourceErrors(state: EarlyCaptureState): void {
         element: resource.element,
         loading:
           typeof document !== "undefined" && document.readyState === "loading",
-      });
+      } as EarlyRequestRecord);
     } catch {
       // Capture must never change the page's error behavior.
     }
@@ -836,6 +836,9 @@ export function installEarlyCapture(): EarlyCapture | undefined {
       drain(sink?: LateRecordSink) {
         this.deferred = true;
         this._sink = typeof sink === "function" ? sink : undefined;
+        // The live error collector is installed after this call. Removing the
+        // early listener before exposing the drained records makes a resource
+        // failure belong to exactly one side of the handoff.
         removeResourceErrorListener(this);
         if (this._timer !== undefined) {
           clearTimeout(this._timer);

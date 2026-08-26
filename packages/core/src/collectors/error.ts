@@ -8,11 +8,9 @@ import {
   type PayloadSummary,
   type RedactionMetadata,
 } from "../redaction";
-import {
-  drainEarlyCapture,
-  type EarlyRequestRecord,
-} from "../early-capture";
+import { drainEarlyCapture } from "../early-capture";
 import { resourceFailureForTarget } from "../resource-failure";
+import { emitResourceFailure } from "../resource-failure-event";
 
 function bodyPlaceholder(summary: PayloadSummary | undefined): string {
   return summary ? `[${summary.action}:${summary.reason}]` : "[REDACTED]";
@@ -61,21 +59,6 @@ function redactErrorPayload(
   return d;
 }
 
-export function emitEarlyResourceFailure(
-  bus: EventBus,
-  record: Pick<EarlyRequestRecord, "element" | "url" | "loading">,
-): void {
-  const url = redactUrl(record.url, "url");
-  const d: Record<string, unknown> = {
-    transport: "resource",
-    element: record.element,
-    url: url.value,
-    loading: record.loading,
-  };
-  attachRedactionMetadata(d, url.metadata);
-  bus.emit({ t: now(), k: "net.err", d });
-}
-
 export function errorCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
@@ -83,7 +66,7 @@ export function errorCollector(
   const onError = (event: ErrorEvent) => {
     const resource = resourceFailureForTarget(event.target);
     if (resource) {
-      emitEarlyResourceFailure(bus, {
+      emitResourceFailure(bus, {
         ...resource,
         loading: document.readyState === "loading",
       });
@@ -184,13 +167,15 @@ export function errorCollector(
     document.addEventListener("securitypolicyviolation", onCspViolation);
   }
 
-  // The network collector drains the shared queue when it is enabled. When it
-  // is not, the errors collector owns the queued resource records instead.
+  // The network collector owns the shared queue when it is enabled. When it is
+  // disabled, this collector is the sole owner of queued resource failures.
+  // The collector map invokes errors before network, but only one branch can
+  // drain because both collectors use the same config toggle.
   if (config.network !== true) {
     for (const record of drainEarlyCapture()) {
       if (record.kind !== "resource-error") continue;
       try {
-        emitEarlyResourceFailure(bus, record);
+        emitResourceFailure(bus, record);
       } catch {
         // A malformed early record never costs the rest of the queue.
       }
