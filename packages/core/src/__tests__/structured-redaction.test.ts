@@ -333,6 +333,15 @@ describe("computeRedactedShape", () => {
   ])("classifies charset of %s as %s", (value, charset) => {
     expect(computeRedactedShape(value).charset).toBe(charset);
   });
+
+  it("reports numeric separator positions without carrying numeric content", () => {
+    expect(computeRedactedShape("0,29")).toMatchObject({
+      len: 4,
+      charset: "mixed",
+      separators: [{ index: 1, char: "," }],
+    });
+    expect(JSON.stringify(computeRedactedShape("0,29"))).not.toContain("029");
+  });
 });
 
 /* ------------------------------------------------------------------ */
@@ -377,6 +386,27 @@ describe("redactNetworkTextBody structured mode", () => {
     // Non-recoverable: the raw secrets never appear in the output.
     expect(result.body).not.toContain("hunter2secret");
     expect(result.body).not.toContain("4242424242424242");
+  });
+
+  it("includes numeric separator positions in body placeholders", () => {
+    const result = redactNetworkTextBody(
+      JSON.stringify({ raw: "1.234,56" }),
+      jsonOpts,
+    );
+    const parsed = JSON.parse(result.body!) as {
+      raw: Record<string, unknown>;
+    };
+
+    expect(parsed.raw).toMatchObject({
+      $redacted: "[REDACTED]",
+      len: 8,
+      charset: "mixed",
+      separators: [
+        { index: 1, char: "." },
+        { index: 5, char: "," },
+      ],
+    });
+    expect(result.body).not.toContain("1.234,56");
   });
 
   it("preserves structure through nested objects and arrays", () => {
@@ -921,10 +951,62 @@ describe("keepFields vs the built-in deny rules", () => {
 describe("query parameters answer to the same keep list", () => {
   afterEach(() => setRedactionKeepFields([]));
 
+  it("distinguishes absent, empty, and present-but-redacted parameters", () => {
+    setRedactionKeepFields([]);
+
+    const absent = new URL(
+      redactUrl("/api/search?page=1").value,
+      "https://app.test",
+    ).searchParams;
+    const empty = new URL(redactUrl("/api/search?q=").value, "https://app.test")
+      .searchParams;
+    const redacted = new URL(
+      redactUrl("/api/search?q=widget").value,
+      "https://app.test",
+    ).searchParams;
+
+    expect(absent.has("q")).toBe(false);
+    expect(empty.get("q")).toBe("");
+    expect(redacted.get("q")).toBe("[REDACTED;len=6;charset=alpha]");
+  });
+
+  it("keeps numeric scale in a redacted query value", () => {
+    setRedactionKeepFields([]);
+
+    const value = new URL(
+      redactUrl("/api/search?maxPrice=0%2C29").value,
+      "https://app.test",
+    ).searchParams.get("maxPrice");
+
+    expect(value).toBe("[REDACTED;len=4;charset=mixed;separators=1.comma]");
+    expect(value).not.toContain("0,29");
+  });
+
+  it("preserves multiple numeric separator positions in a query marker", () => {
+    setRedactionKeepFields([]);
+    const value = new URL(
+      redactUrl("/api/search?amount=1.234%2C56").value,
+      "https://app.test",
+    ).searchParams.get("amount");
+
+    expect(value).toBe(
+      "[REDACTED;len=8;charset=mixed;separators=1.dot,5.comma]",
+    );
+    expect(
+      redactUrl(`/api/search?amount=${encodeURIComponent(value!)}`).value,
+    ).toContain("separators=1.dot,5.comma");
+  });
+
+  it("preserves query shape markers across a second redaction pass", () => {
+    setRedactionKeepFields([]);
+    const once = redactUrl("/api/search?q=0.29").value;
+    expect(redactUrl(once).value).toBe(once);
+  });
+
   it("redacts every undeclared word value by default", () => {
     setRedactionKeepFields([]);
     expect(redactUrl("/api/search?q=widget&productId=1").value).toBe(
-      "/api/search?q=[REDACTED]&productId=1",
+      "/api/search?q=[REDACTED;len=6;charset=alpha]&productId=1",
     );
   });
 
@@ -938,7 +1020,7 @@ describe("query parameters answer to the same keep list", () => {
   it("still redacts a number under a sensitive parameter name", () => {
     setRedactionKeepFields([]);
     expect(redactUrl("/api/search?token=1&page=1").value).toBe(
-      "/api/search?token=[REDACTED]&page=1",
+      "/api/search?token=[REDACTED;len=1;charset=num]&page=1",
     );
   });
 
@@ -953,13 +1035,13 @@ describe("query parameters answer to the same keep list", () => {
     setRedactionKeepFields(["q"]);
     const value = redactUrl("/api/search?q=widget&sessionKey=abc").value;
     expect(value).toContain("q=widget");
-    expect(value).toContain("sessionKey=[REDACTED]");
+    expect(value).toContain("sessionKey=[REDACTED;len=3;charset=alpha]");
   });
 
   it("still redacts a sensitive value inside a kept parameter", () => {
     setRedactionKeepFields(["q"]);
     expect(redactUrl("/api/search?q=someone%40example.com").value).toBe(
-      "/api/search?q=[REDACTED]",
+      "/api/search?q=[REDACTED;len=19;charset=mixed]",
     );
   });
 

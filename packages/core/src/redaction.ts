@@ -18,13 +18,14 @@ export const REDACTED_STORAGE_KEY = "[REDACTED_KEY]";
  * consumer downstream rendered that literally — issue titles, runtime warnings,
  * error text. The marker is meant to be read by people, so it is written back
  * unescaped after serialization. Nothing else about the encoded string changes:
- * only this exact sequence is decoded, and only where the marker is the value
- * this module just substituted.
+ * only markers this module just substituted are decoded.
  */
 const ENCODED_REDACTED_VALUE_RE = /%5BREDACTED%5D/gi;
+const ENCODED_REDACTED_SHAPE_RE =
+  /%5BREDACTED%3Blen%3D\d{1,7}%3Bcharset%3D(?:alpha|num|alnum|mixed)(?:%3Bseparators%3D[0-9a-z.,_%-]+)?%5D/gi;
 
 /**
- * Restore `[REDACTED]` in an already percent-encoded URL or query string.
+ * Restore a redaction marker in an already percent-encoded URL or query string.
  *
  * Exported because the capture server rebuilds URLs of its own — post-process
  * diagnostics and the LLM bundle both re-serialize through `URLSearchParams` —
@@ -32,7 +33,18 @@ const ENCODED_REDACTED_VALUE_RE = /%5BREDACTED%5D/gi;
  * than either, since the two no longer compare equal.
  */
 export function unescapeRedactionMarker(serialized: string): string {
-  return serialized.replace(ENCODED_REDACTED_VALUE_RE, REDACTED_VALUE);
+  const withShapes = serialized.replace(
+    ENCODED_REDACTED_SHAPE_RE,
+    (encoded) => {
+      try {
+        const decoded = decodeURIComponent(encoded);
+        return isRedactedQueryShape(decoded) ? decoded : encoded;
+      } catch {
+        return encoded;
+      }
+    },
+  );
+  return withShapes.replace(ENCODED_REDACTED_VALUE_RE, REDACTED_VALUE);
 }
 
 export type RedactionAction = "redacted" | "dropped" | "summarized";
@@ -518,13 +530,17 @@ function redactQueryString(
     const safeKey = sanitizeKeyName(key);
     params.delete(key);
     // A query parameter is a field with a name, so it answers to the same
-    // application-declared keep list as a JSON key. `?q=[REDACTED]` on a search
-    // defect erases the one input that explains it. Values still go through the
+    // application-declared keep list as a JSON key. A bare `?q=[REDACTED]` on a
+    // search defect erases the one input that explains it. Values still go through the
     // classifier, so only a value that survives every check is kept.
     const kept = isStructuredKeepName(key, keepFields);
     for (const value of values) {
       if (value === "") {
         params.append(safeKey, "");
+      } else if (value === REDACTED_VALUE || isRedactedQueryShape(value)) {
+        // Preserve a marker from an earlier redaction pass. A legacy marker has
+        // no shape to recover, while a shape marker must not describe itself.
+        params.append(safeKey, value);
       } else if (isHarmlessQueryValue(key, value)) {
         // Pagination, sorting and paging cursors made of plain numbers. The
         // keep list is application declared and empty by default, so
@@ -544,7 +560,7 @@ function redactQueryString(
       ) {
         params.append(safeKey, value);
       } else {
-        params.append(safeKey, REDACTED_VALUE);
+        params.append(safeKey, redactedQueryValue(value));
         fields.push({
           path: `${path}.query.${safeKey}`,
           reason: "url_query_value",
@@ -561,6 +577,33 @@ function redactQueryString(
     value: serialized ? `?${serialized}` : "",
     ...(metadata ? { metadata } : {}),
   };
+}
+
+const REDACTED_QUERY_SHAPE_RE =
+  /^\[REDACTED;len=(\d{1,7});charset=(alpha|num|alnum|mixed)(?:;separators=((?:\d{1,7}\.(?:dot|comma|space))(?:,\d{1,7}\.(?:dot|comma|space))*))?\]$/;
+
+function isRedactedQueryShape(value: string): boolean {
+  const match = REDACTED_QUERY_SHAPE_RE.exec(value);
+  if (!match) return false;
+  const length = Number(match[1]);
+  if (match[3] === undefined) return true;
+  return match[3].split(",").every((separator) => {
+    const index = Number(separator.split(".", 1)[0]);
+    return Number.isInteger(index) && index >= 0 && index < length;
+  });
+}
+
+function redactedQueryValue(value: string): string {
+  const shape = computeRedactedShape(value);
+  const separators = shape.separators
+    ?.map(({ index, char }) => {
+      const name = char === "." ? "dot" : char === "," ? "comma" : "space";
+      return `${index}.${name}`;
+    })
+    .join(",");
+  return `[REDACTED;len=${shape.len};charset=${shape.charset}${
+    separators ? `;separators=${separators}` : ""
+  }]`;
 }
 
 /**
@@ -1798,6 +1841,11 @@ export type StructuredRedactionMode = "structured" | "full";
 
 export type RedactedShapeCharset = "alpha" | "num" | "alnum" | "mixed";
 
+export type RedactedShapeSeparator = {
+  index: number;
+  char: "." | "," | " ";
+};
+
 /**
  * Non-recoverable shape metadata attached to every v2-redacted value.
  * `hash8` is salted with a per-session random salt (equality tests work within
@@ -1808,6 +1856,8 @@ export type RedactedShapeCharset = "alpha" | "num" | "alnum" | "mixed";
 export interface RedactedValueShape {
   len: number;
   charset: RedactedShapeCharset;
+  /** Decimal, grouping, or whitespace separators in numeric-looking text. */
+  separators?: RedactedShapeSeparator[];
   hash8?: string;
   /**
    * Session-salted fingerprint of the lowercase value. Present only when case
@@ -2060,10 +2110,26 @@ function fnv1a32Hex(value: string): string {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
+const NUMERIC_SHAPE_RE = /^[+-]?[\d.,\s]+$/;
+
+function redactedShapeSeparators(
+  text: string,
+): RedactedShapeSeparator[] | undefined {
+  if (!NUMERIC_SHAPE_RE.test(text) || !/\d/.test(text)) return undefined;
+  const separators: RedactedShapeSeparator[] = [];
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (char === "." || char === "," || char === " ")
+      separators.push({ index, char });
+  }
+  return separators.length > 0 ? separators : undefined;
+}
+
 /**
- * Shape metadata for a redacted value — length, charset class, and a salted
- * one-way hash. The hash is omitted for low-entropy values whose candidate
- * space is trivially enumerable (numeric with len < 12, or any len < 6).
+ * Shape metadata for a redacted value — length, charset class, numeric separator
+ * positions, and a salted one-way hash. The hash is omitted for low-entropy
+ * values whose candidate space is trivially enumerable (numeric with len < 12,
+ * or any len < 6).
  */
 export function computeRedactedShape(value: unknown): RedactedValueShape {
   const text =
@@ -2075,7 +2141,12 @@ export function computeRedactedShape(value: unknown): RedactedValueShape {
       : /^[A-Za-z0-9]+$/.test(text)
         ? "alnum"
         : "mixed";
-  const shape: RedactedValueShape = { len: text.length, charset };
+  const separators = redactedShapeSeparators(text);
+  const shape: RedactedValueShape = {
+    len: text.length,
+    charset,
+    ...(separators ? { separators } : {}),
+  };
   const smallCandidateSpace =
     text.length < 6 || (charset === "num" && text.length < 12);
   if (!smallCandidateSpace) {
@@ -2309,6 +2380,7 @@ function redactedShapePlaceholder(value: unknown): Record<string, unknown> {
     len: shape.len,
     charset: shape.charset,
   };
+  if (shape.separators !== undefined) placeholder.separators = shape.separators;
   if (shape.hash8 !== undefined) placeholder.hash8 = shape.hash8;
   if (shape.casefoldHash8 !== undefined)
     placeholder.casefoldHash8 = shape.casefoldHash8;
@@ -2319,6 +2391,7 @@ const PLACEHOLDER_KEYS = new Set([
   "$redacted",
   "len",
   "charset",
+  "separators",
   "hash8",
   "casefoldHash8",
 ]);
@@ -2337,9 +2410,9 @@ const HASH8_RE = /^[0-9a-f]{8}$/;
  * join against describe the first placeholder rather than the original value.
  *
  * The check is exact rather than structural on purpose. Every key must be one
- * of the five this module emits, `$redacted` must be the literal marker, `len`
- * a finite number, and the hashes 8 hex digits. Nothing that shape can carry a
- * secret, so treating it as already-redacted grants a caller nothing.
+ * of the shape fields this module emits, `$redacted` must be the literal marker,
+ * `len` a finite number, and the hashes 8 hex digits. Nothing that shape can
+ * carry a secret, so treating it as already-redacted grants a caller nothing.
  */
 function isRedactedPlaceholder(value: unknown): boolean {
   if (value === null || typeof value !== "object" || Array.isArray(value))
@@ -2356,6 +2429,35 @@ function isRedactedPlaceholder(value: unknown): boolean {
     if (typeof entry !== "string") return false;
     if (key === "charset") {
       if (!CHARSET_RE.test(entry) || entry.length > 16) return false;
+      continue;
+    }
+    if (key === "separators") {
+      if (!Array.isArray(entry) || entry.length > 32) return false;
+      for (const separator of entry) {
+        if (
+          separator === null ||
+          typeof separator !== "object" ||
+          Array.isArray(separator)
+        )
+          return false;
+        const separatorRecord = separator as Record<string, unknown>;
+        const separatorIndex = separatorRecord.index;
+        const separatorChar = separatorRecord.char;
+        if (
+          Object.keys(separatorRecord).some(
+            (separatorKey) => !["index", "char"].includes(separatorKey),
+          ) ||
+          typeof separatorIndex !== "number" ||
+          !Number.isInteger(separatorIndex) ||
+          separatorIndex < 0 ||
+          (typeof record.len === "number" &&
+            separatorIndex >= record.len) ||
+          (separatorChar !== "." &&
+            separatorChar !== "," &&
+            separatorChar !== " ")
+        )
+          return false;
+      }
       continue;
     }
     if (!HASH8_RE.test(entry)) return false;
