@@ -59,15 +59,15 @@ describe("candidate titles — no leaked placeholders", () => {
   it("names the missing URL on an http_error rather than printing undefined", () => {
     const index = {
       start: 900,
-      failedReqs: [{ t: 1000, st: 401, id: "req-1" }],
+      failedReqs: [{ t: 1000, st: 500, id: "req-1" }],
     };
 
     const candidate = buildEvidenceCandidates(
-      [{ t: 1000, k: "net.res", d: { id: "req-1", st: 401 } }],
+      [{ t: 1000, k: "net.res", d: { id: "req-1", st: 500 } }],
       index,
     ).find((c) => c.detector === "http_error");
 
-    expect(candidate?.title).toBe("HTTP 401 from request unknown URL");
+    expect(candidate?.title).toBe("HTTP 500 from request unknown URL");
     expect(candidate?.title).not.toContain("undefined");
   });
 

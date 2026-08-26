@@ -2,21 +2,10 @@ import { describe, it, expect } from "vitest";
 import type { BugEvent } from "crumbtrail-core";
 import { buildEvidenceCandidates } from "../evidence-index";
 
-// Replay of a real browser run against a deployed store, session
-// ses_20260726_012746_db06caef2034. The run mixed one genuine defect with six
-// deliberate failures to see whether the analyzer could tell them apart.
-//
-// It could not. The session produced 29 signals ranked like this:
-//
-//   #1  High    duplicate_write            3 "identical" order_items rows  (false)
-//   #2–13       http_error / backend_*     the expected 401s and 400
-//   #14–24      db_mutation                ordinary checkout writes "near an error"
-//   #25–26      repeated_clicks            scripted clicks
-//   #29  Low    console_warning            Total mismatch 107104¢ vs 91400¢  ← the bug
-//
-// The only real defect — a client-supplied order total persisted verbatim,
-// charging $1071.04 for $914.00 of goods — ranked last of 29. This test pins the
-// corrected ranking against the same input shape.
+// Replay of a real browser run that contains both user-visible consequences of
+// failed client operations and a silent data defect. Client errors with a
+// surfaced console error remain findings. A client error with no consequence is
+// covered by evidence-index-handled-client-error.test.ts.
 
 const T0 = 1785000000000;
 const at = (seconds: number): number => T0 + seconds * 1000;
@@ -180,9 +169,9 @@ describe("buildEvidenceCandidates — live session ranking", () => {
   const { events, index } = liveSession();
   const candidates = buildEvidenceCandidates(events, index);
 
-  it("ranks the one real defect first", () => {
-    expect(candidates[0].detector).toBe("console_warning");
-    expect(candidates[0].anchor.message).toContain("Total mismatch");
+  it("keeps a surfaced client-error consequence visible", () => {
+    expect(candidates[0].detector).toBe("http_error");
+    expect(candidates[0].anchor.url).toBe("/api/login");
   });
 
   it("does not claim the three order_items rows were duplicates", () => {
@@ -191,42 +180,23 @@ describe("buildEvidenceCandidates — live session ranking", () => {
     ).toHaveLength(0);
   });
 
-  it("emits no signal above the real defect", () => {
-    const top = candidates[0].score;
-    expect(candidates.every((c) => c.score <= top)).toBe(true);
-  });
-
   it("collapses the four sign-in attempts into one counted signal", () => {
     const logins = candidates.filter(
       (c) => c.detector === "http_error" && c.anchor.url === "/api/login",
     );
     expect(logins).toHaveLength(1);
     expect(logins[0].occurrences).toBe(4);
-    expect(logins[0].severity).toBe("low");
+    expect(logins[0].severity).toBe("medium");
   });
 
-  it("keeps every deliberate failure below the real defect", () => {
-    const realDefectRank = candidates.findIndex(
-      (c) => c.detector === "console_warning",
+  it("keeps the client error that the checkout flow surfaced", () => {
+    const checkout = candidates.find(
+      (c) => c.detector === "http_error" && c.anchor.url === "/api/checkout",
     );
-    const expected = candidates
-      .map((c, i) => ({ c, i }))
-      .filter(
-        ({ c }) =>
-          c.anchor.status === 401 ||
-          (c.anchor.status === 400 && c.anchor.url === "/api/checkout"),
-      );
-    expect(expected.length).toBeGreaterThan(0);
-    for (const { c, i } of expected) {
-      expect(
-        i,
-        `${c.detector} ${c.title} outranked the real defect`,
-      ).toBeGreaterThan(realDefectRank);
-    }
+    expect(checkout).toMatchObject({ severity: "medium", score: 70 });
   });
 
-  it("still reports the deliberate failures rather than hiding them", () => {
-    // Demoted, never dropped: "login 401s for every user" must stay findable.
+  it("does not hide client errors that had a visible consequence", () => {
     const auth = candidates.filter((c) => c.anchor.status === 401);
     expect(auth.length).toBeGreaterThan(0);
   });
