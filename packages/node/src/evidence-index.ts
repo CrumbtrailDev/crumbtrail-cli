@@ -942,7 +942,7 @@ export function buildEvidenceCandidates(
   // its ranking, and these read evidence the pipeline already captured but no
   // rule had ever looked at.
   const exchanges = collectRequestExchanges(events);
-  addFilterContradictionCandidates(events, index, drafts, exchanges);
+  addFilterContradictionCandidates(index, drafts, exchanges);
   addResultRowLossCandidates(events, index, drafts, exchanges);
   addSharedStateBleedCandidates(events, index, drafts, exchanges);
   addAcknowledgedWriteLostCandidates(events, index, drafts, exchanges);
@@ -6874,7 +6874,13 @@ function responseCollection(
   bodyMeta?: unknown,
 ): BodyCollection | undefined {
   const view = responseBodyView(body, bodyMeta);
-  if (!view || view.data === undefined) return undefined;
+  return view ? responseCollectionFromView(view) : undefined;
+}
+
+function responseCollectionFromView(
+  view: ResponseBodyView,
+): BodyCollection | undefined {
+  if (view.data === undefined) return undefined;
   const payload = view.data;
 
   if (Array.isArray(payload)) {
@@ -6946,74 +6952,19 @@ function isRedactedValue(value: unknown): boolean {
 
 // ─── filter_contradiction ────────────────────────────────────────────────────
 
-/** How many contradicted filters one session may carry. */
+/** How many response constraints one session may carry. */
 const MAX_FILTER_CONTRADICTION_CANDIDATES = 5;
 
 /**
- * A response that contradicts its request's own filter, or a request whose rows
- * never reached the response, is a hard contradiction between two things the
- * capture recorded — one tier under the database invariants (90), because the
- * join rests on a name match rather than on two images of one row, and above the
- * runtime errors (82) because nothing here errored at all.
+ * A response that contradicts its own echoed constraint is a hard contradiction
+ * between two values in one successful response. It sits below database
+ * invariants (90) and above runtime errors (82), since no request or response
+ * failed and the claim needs no second event or application schema.
  */
 const FILTER_CONTRADICTION_SCORE = 84;
 
-/**
- * Query parameters that carry free text. `?q=desk` is a search term the server
- * is free to interpret, not a declaration that every row will have `q = "desk"`.
- */
-const FREE_TEXT_QUERY_PARAMS = new Set([
-  "q",
-  "query",
-  "search",
-  "searchterm",
-  "term",
-  "keyword",
-  "keywords",
-  "text",
-  "s",
-  "filter",
-  "filters",
-]);
-
-/**
- * Parameters that page, sort or shape a response rather than filter it. Matched
- * on the whole normalized name, so a column genuinely called `order` in a table
- * is unaffected — this is about the parameter, not the column.
- */
-const NON_FILTER_QUERY_PARAMS = new Set([
-  "limit",
-  "offset",
-  "page",
-  "pagesize",
-  "perpage",
-  "cursor",
-  "sort",
-  "sortby",
-  "order",
-  "orderby",
-  "direction",
-  "fields",
-  "select",
-  "include",
-  "expand",
-  "format",
-  "callback",
-  "locale",
-  "lang",
-  "token",
-  "key",
-  "apikey",
-  "signature",
-  "nonce",
-]);
-
-/**
- * Word segments that make a parameter a range bound. `maxPrice=200` says rows
- * are ≤ 200, not that every row costs exactly 200, so an equality reading of it
- * would fire on every correct response.
- */
-const RANGE_PARAM_WORDS = new Set([
+const NO_CONSTRAINT_SENTINELS = new Set(["*", "all", "any"]);
+const DEFERRED_CONSTRAINT_WORDS = new Set([
   "min",
   "max",
   "from",
@@ -7030,254 +6981,216 @@ const RANGE_PARAM_WORDS = new Set([
   "gte",
   "range",
   "between",
+  "limit",
+  "offset",
+  "page",
+  "pagesize",
+  "perpage",
+  "cursor",
+  "sort",
+  "sortby",
+  "order",
+  "orderby",
+  "direction",
+  "count",
+  "total",
 ]);
 
-const TRUE_TOKENS = new Set(["true", "1", "yes", "y", "on"]);
-const FALSE_TOKENS = new Set(["false", "0", "no", "n", "off"]);
-
-/**
- * The one name family this detector reads across a rename: a boolean
- * availability filter against the stock column the row actually carries.
- * `?inStock=true` returning a row whose `inventory` is 0 is the canonical shape
- * of the defect, and the two names never match textually. Deliberately narrow —
- * a boolean parameter and a count column, nothing else — because every entry
- * here is an assumption about someone else's schema.
- */
-const AVAILABILITY_PARAM_NAMES = new Set([
-  "instock",
-  "instockonly",
-  "available",
-  "isavailable",
-  "hasstock",
-  "instocked",
-]);
-const AVAILABILITY_ROW_FIELDS = new Set([
-  "instock",
-  "available",
-  "isavailable",
-  "inventory",
-  "stock",
-  "stockcount",
-  "stocklevel",
-  "quantityavailable",
-  "availablequantity",
-]);
-
-interface DeclaredFilter {
-  /** Parameter name as written in the query string. */
-  name: string;
-  /** Normalized name used for matching a row field. */
-  key: string;
-  /** Accepted values; more than one when the query repeats or comma-lists it. */
-  values: string[];
-  /** True when every accepted value reads as a boolean. */
-  boolean: boolean;
+function isDeferredConstraintName(name: string): boolean {
+  return columnWords(name).some((word) => DEFERRED_CONSTRAINT_WORDS.has(word));
 }
 
-/**
- * The equality-ish filters a request declared in its own query string.
- *
- * Deny-biased at every step: a free-text parameter, a paging parameter, a range
- * bound, an empty value and a redacted value all contribute nothing, because the
- * whole claim rests on the request having stated something the response can
- * contradict.
- */
-function declaredFilters(url: string | undefined): DeclaredFilter[] {
-  const parsed = parseCapturedUrl(url);
-  if (!parsed) return [];
-  const byKey = new Map<string, DeclaredFilter>();
-  for (const [rawName, rawValue] of parsed.searchParams) {
-    const name = safeText(rawName, 80);
-    if (!name) continue;
-    const key = normalizeFieldName(name);
-    if (FREE_TEXT_QUERY_PARAMS.has(key)) continue;
-    if (NON_FILTER_QUERY_PARAMS.has(key)) continue;
-    if (columnWords(name).some((word) => RANGE_PARAM_WORDS.has(word))) continue;
-    const value = safeText(rawValue, 200);
-    if (!value || isRedactedValue(value)) continue;
-    // A repeated or comma-listed parameter is a set: a row matching any member
-    // satisfies it, so only a row matching none is a contradiction.
-    const values = value.includes(",")
-      ? value
-          .split(",")
-          .map((part) => part.trim())
-          .filter(Boolean)
-      : [value];
-    if (values.length === 0) continue;
-    const existing = byKey.get(key);
-    if (existing) existing.values.push(...values);
-    else
-      byKey.set(key, {
-        name,
-        key,
-        values,
-        boolean: false,
-      });
-  }
-  for (const filter of byKey.values()) {
-    filter.boolean = filter.values.every((value) => {
-      const token = value.trim().toLowerCase();
-      return TRUE_TOKENS.has(token) || FALSE_TOKENS.has(token);
-    });
-  }
-  return [...byKey.values()];
-}
-
-/** The row field a declared filter is about, when the row carries one. */
-function rowFieldForFilter(
-  filter: DeclaredFilter,
-  row: Record<string, unknown>,
-): { field: string; value: unknown } | undefined {
-  const direct = Object.entries(row).find(
-    ([name]) => normalizeFieldName(name) === filter.key,
+function isComparableConstraintScalar(value: unknown): boolean {
+  return (
+    (typeof value === "string" &&
+      value.length > 0 &&
+      !NO_CONSTRAINT_SENTINELS.has(value) &&
+      !isRedactedValue(value)) ||
+    typeof value === "boolean" ||
+    finiteNumber(value) !== undefined
   );
-  if (direct) return { field: direct[0], value: direct[1] };
-  if (!filter.boolean || !AVAILABILITY_PARAM_NAMES.has(filter.key))
-    return undefined;
-  const availability = Object.entries(row).find(([name]) =>
-    AVAILABILITY_ROW_FIELDS.has(normalizeFieldName(name)),
-  );
-  return availability
-    ? { field: availability[0], value: availability[1] }
-    : undefined;
-}
-
-/** Truthiness of a stored value read as an availability flag. */
-function availabilityTruth(value: unknown): boolean | undefined {
-  if (typeof value === "boolean") return value;
-  const numeric = finiteNumber(value);
-  if (numeric !== undefined) return numeric > 0;
-  if (typeof value === "string") {
-    const token = value.trim().toLowerCase();
-    if (TRUE_TOKENS.has(token)) return true;
-    if (FALSE_TOKENS.has(token)) return false;
-    const parsed = toFiniteNumber(token);
-    if (parsed !== undefined) return parsed > 0;
-  }
-  if (value === null) return false;
-  return undefined;
 }
 
 /**
- * Whether a read row contradicts a filter the request declared, and how.
- * Returns the sentence for the candidate's detail, or undefined when the row
- * satisfies the filter or cannot be compared against it.
+ * Collects objects that could echo constraints, excluding the selected result
+ * collection and everything inside its rows. This keeps a returned row from
+ * being mistaken for the response constraint object.
  */
-function filterContradictionOf(
-  filter: DeclaredFilter,
-  field: string,
+function collectConstraintObjects(
   value: unknown,
-): string | undefined {
-  if (value === undefined || isRedactedValue(value)) return undefined;
-  if (typeof value === "object" && value !== null) return undefined;
-
-  if (filter.boolean) {
-    const wanted = TRUE_TOKENS.has(filter.values[0].trim().toLowerCase());
-    const actual = availabilityTruth(value);
-    if (actual === undefined || actual === wanted) return undefined;
-    return `the request declared \`${filter.name}=${filter.values[0]}\` and the row read back carries \`${field}\`=${formatScalar(value)}`;
+  collectionItems: unknown[],
+  out: Record<string, unknown>[] = [],
+  depth = 0,
+): Record<string, unknown>[] {
+  if (depth > MAX_BODY_SCOPE_DEPTH) return out;
+  if (Array.isArray(value)) {
+    if (value === collectionItems) return out;
+    for (const item of value)
+      collectConstraintObjects(item, collectionItems, out, depth + 1);
+    return out;
   }
+  if (!isRecord(value) || isRedactedPlaceholder(value)) return out;
+  out.push(value);
+  for (const inner of Object.values(value)) {
+    if (isRecord(inner) || Array.isArray(inner))
+      collectConstraintObjects(inner, collectionItems, out, depth + 1);
+  }
+  return out;
+}
 
-  const actual = String(value).trim().toLowerCase();
-  const accepted = filter.values.map((entry) => entry.trim().toLowerCase());
-  if (accepted.includes(actual)) return undefined;
-  // A comma-listed value may also have been stored verbatim.
-  if (accepted.length > 1 && actual === filter.values.join(",").toLowerCase())
-    return undefined;
-  return `the request declared \`${filter.name}=${filter.values.join(",")}\` and the row read back carries \`${field}\`=${formatScalar(value)}`;
+interface ResponseConstraint {
+  name: string;
+  declared: string | number | boolean;
 }
 
 /**
- * filter_contradiction: a 2xx response was built from rows that defy the
- * request's own query string.
+ * Finds exactly one object that can be the response constraint echo. A key must
+ * exist with the same spelling on every captured row, and the value must be a
+ * non-empty, non-sentinel scalar. Multiple plausible echo objects are
+ * ambiguous and produce no claim.
+ */
+function responseConstraints(
+  payload: unknown,
+  collection: BodyCollection,
+): ResponseConstraint[] | undefined {
+  if (collection.items.length === 0) return undefined;
+  const rows = collection.items.map((item) =>
+    isRecord(item) && !isRedactedPlaceholder(item) ? item : undefined,
+  );
+  if (rows.some((row) => row === undefined)) return undefined;
+  const first = rows[0];
+  if (!first) return undefined;
+
+  const commonNames = new Set(Object.keys(first));
+  for (const row of rows.slice(1)) {
+    if (!row) return undefined;
+    for (const name of commonNames)
+      if (!Object.prototype.hasOwnProperty.call(row, name))
+        commonNames.delete(name);
+  }
+  if (commonNames.size === 0) return undefined;
+
+  const candidates = collectConstraintObjects(payload, collection.items)
+    .map((scope) =>
+      Object.entries(scope).filter(
+        ([name, value]) =>
+          commonNames.has(name) &&
+          !isDeferredConstraintName(name) &&
+          isComparableConstraintScalar(value),
+      ),
+    )
+    .filter((entries) => entries.length > 0);
+  if (candidates.length !== 1) return undefined;
+  return candidates[0].map(([name, declared]) => ({
+    name,
+    declared: declared as string | number | boolean,
+  }));
+}
+
+/**
+ * Returns true for a proven mismatch, false for equality, and undefined when
+ * deciding would require case folding or type coercion.
+ */
+function responseScalarContradiction(
+  declared: string | number | boolean,
+  actual: unknown,
+): boolean | undefined {
+  if (typeof declared !== typeof actual) return undefined;
+  if (declared === actual) return false;
+  if (
+    typeof declared === "string" &&
+    typeof actual === "string" &&
+    declared.toLowerCase() === actual.toLowerCase()
+  )
+    return undefined;
+  return true;
+}
+
+/**
+ * filter_contradiction: a successful response echoes a scalar constraint and
+ * includes a returned item with the same field set to a different scalar.
  *
- * `GET /products?category=audio` answering with a row whose `category` is
- * `desk` is a contradiction with no second reading: the request declared the
- * constraint, the server acknowledged with a 200, and the row it read says
- * otherwise. Nothing else in the pipeline sees it — the request is fine, the
- * response is fine, the query is fast, and the page renders exactly the wrong
- * products without a single error.
- *
- * The join is the request's own correlation id, so the rows compared are the
- * rows THAT request read, not rows that happened to be read nearby.
+ * The response body is the complete evidence. The detector deliberately does
+ * not inspect query parameters, database rows, field aliases, ranges, counts,
+ * or ordering, because each would add an application-specific assumption.
  */
 function addFilterContradictionCandidates(
-  events: BugEvent[],
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
   exchanges: Map<string, RequestExchange>,
 ): void {
-  const readsByRequest = new Map<string, BugEvent[]>();
-  for (const event of events) {
-    if (event.k !== "db.read") continue;
-    if (!isRecord(event.d.row)) continue;
-    const id = correlationIdOf(event);
-    if (!id) continue;
-    const list = readsByRequest.get(id) ?? [];
-    list.push(event);
-    readsByRequest.set(id, list);
-  }
-  if (readsByRequest.size === 0) return;
-
-  const byFilter = new Map<string, CandidateDraft>();
+  const byConstraint = new Map<string, CandidateDraft>();
   for (const exchange of exchanges.values()) {
-    if (!isSuccessStatus(exchange.status)) continue;
-    const reads = readsByRequest.get(exchange.requestId);
-    if (!reads || reads.length === 0) continue;
-    const filters = declaredFilters(exchange.url);
-    if (filters.length === 0) continue;
+    if (!isSuccessStatus(exchange.status) || !exchange.res) continue;
+    const view = responseBodyView(exchange.resBody, exchange.resBodyMeta);
+    if (!view) continue;
+    const collection = responseCollectionFromView(view);
+    if (!collection) continue;
+    const constraints = responseConstraints(view.data, collection);
+    if (!constraints) continue;
 
-    for (const filter of filters) {
-      for (const read of reads) {
-        const row = read.d.row as Record<string, unknown>;
-        const match = rowFieldForFilter(filter, row);
-        if (!match) continue;
-        const contradiction = filterContradictionOf(
-          filter,
-          match.field,
-          match.value,
-        );
-        if (!contradiction) continue;
+    for (const constraint of constraints) {
+      for (const item of collection.items) {
+        if (!isRecord(item) || isRedactedPlaceholder(item)) continue;
+        const actual = item[constraint.name];
+        if (isRedactedValue(actual)) continue;
+        if (actual !== null && typeof actual === "object") continue;
+        if (
+          typeof actual !== "string" &&
+          typeof actual !== "number" &&
+          typeof actual !== "boolean" &&
+          actual !== null
+        )
+          continue;
+        if (responseScalarContradiction(constraint.declared, actual) !== true)
+          continue;
 
         const path = capturedUrlPath(exchange.url) ?? exchange.requestId;
-        const dedupeKey = `filtercontradiction:${path}:${filter.key}`;
-        if (byFilter.has(dedupeKey)) break;
-        const table =
-          scrubText(bareTableName(safeText(read.d.table, 200) ?? ""), 100) ??
-          "the table";
-        byFilter.set(dedupeKey, {
+        const dedupeKey = "filtercontradiction:" + path + ":" + constraint.name;
+        if (byConstraint.has(dedupeKey)) break;
+        byConstraint.set(dedupeKey, {
           detector: "filter_contradiction",
-          title: `Response rows contradict the request's own filter \`${filter.name}\``,
+          title:
+            "Response rows contradict an echoed constraint " + constraint.name,
           severity: "high",
           score: FILTER_CONTRADICTION_SCORE,
           confidence: "high",
           anchor: removeUndefined({
-            t: read.t,
+            t: exchange.res.t,
             offsetMs:
-              offsetForEvent(read) ?? offsetFromStart(read.t, index.start),
-            route: routeAt(index.navs ?? [], read.t),
+              offsetForEvent(exchange.res) ??
+              offsetFromStart(exchange.res.t, index.start),
+            route: routeAt(index.navs ?? [], exchange.res.t),
             requestId: exchange.requestId,
             method: exchange.method,
             url: redactUrl(exchange.url),
             status: exchange.status,
             message: scrubText(
-              `${contradiction} (read from ${table} inside this request). The response was a ${exchange.status}, so nothing downstream had reason to doubt it.`,
+              "The response declared constraint " +
+                constraint.name +
+                "=" +
+                formatScalar(constraint.declared) +
+                ", but a returned item carries " +
+                constraint.name +
+                "=" +
+                formatScalar(actual) +
+                ".",
               220,
             ),
-            comparedColumns: [match.field],
-            source: normalizeDbEngine(read.d.engine),
+            comparedColumns: [constraint.name],
           }),
           dedupeKey,
         });
-        break; // One claim per declared filter.
+        break;
       }
     }
   }
 
-  const emitted = [...byFilter.values()]
-    .sort((a, b) => a.anchor.t - b.anchor.t)
-    .slice(0, MAX_FILTER_CONTRADICTION_CANDIDATES);
-  drafts.push(...emitted);
+  drafts.push(
+    ...[...byConstraint.values()]
+      .sort((a, b) => a.anchor.t - b.anchor.t)
+      .slice(0, MAX_FILTER_CONTRADICTION_CANDIDATES),
+  );
 }
 
 // ─── result_row_loss ─────────────────────────────────────────────────────────
