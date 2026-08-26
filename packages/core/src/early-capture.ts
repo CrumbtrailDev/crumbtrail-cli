@@ -9,6 +9,7 @@ import { createWebSessionStore } from "./session-store";
 import { DEFAULT_CONFIG } from "./types";
 import { generateSessionId, readStructuredBody } from "./utils";
 import { captureCallStack } from "./call-stack";
+import { resourceFailureForTarget } from "./resource-failure";
 
 /**
  * First-fetch capture, installed before the SDK exists.
@@ -42,6 +43,8 @@ export const EARLY_MAX_ENTRIES = 50;
 export const EARLY_MAX_BYTES = 2_097_152;
 /** Per-body ceiling, matching the response-summary ceiling in the network collector. */
 export const EARLY_MAX_BODY_BYTES = 32_768;
+/** Maximum URL text held for one early resource failure. */
+export const EARLY_MAX_RESOURCE_URL_BYTES = 4_096;
 /** Recording window when `Crumbtrail.init()` never runs. */
 export const EARLY_IDLE_TIMEOUT_MS = 60_000;
 
@@ -75,6 +78,10 @@ export interface EarlyRequestRecord {
    * producer wired to a channel with no arrivals.
    */
   stk?: string;
+  /** Present only for a browser-managed resource failure, not a request record. */
+  kind?: "resource-error";
+  element?: string;
+  loading?: boolean;
 }
 
 export interface EarlyCapture {
@@ -118,6 +125,7 @@ interface EarlyCaptureState extends EarlyCapture {
   _xhrSend?: XMLHttpRequest["send"];
   _wrappedXhrOpen?: XMLHttpRequest["open"];
   _wrappedXhrSend?: XMLHttpRequest["send"];
+  _resourceErrorListener?: (event: Event) => void;
 }
 
 interface PreparedRequest {
@@ -760,6 +768,52 @@ function patchXhr(state: EarlyCaptureState): void {
   state._wrappedXhrSend = prototype.send;
 }
 
+function removeResourceErrorListener(state: EarlyCaptureState): void {
+  const listener = state._resourceErrorListener;
+  if (!listener) return;
+  try {
+    window.removeEventListener("error", listener, true);
+  } catch {
+    // Teardown is best effort by design.
+  }
+  state._resourceErrorListener = undefined;
+}
+
+function patchResourceErrors(state: EarlyCaptureState): void {
+  if (
+    typeof window === "undefined" ||
+    typeof window.addEventListener !== "function"
+  ) {
+    return;
+  }
+
+  const listener = (event: Event): void => {
+    if (!recording(state)) return;
+    try {
+      const resource = resourceFailureForTarget(event.target);
+      if (!resource || byteLength(resource.url) > EARLY_MAX_RESOURCE_URL_BYTES)
+        return;
+      pushRecord(state, {
+        kind: "resource-error",
+        t: Date.now(),
+        url: resource.url,
+        element: resource.element,
+        loading:
+          typeof document !== "undefined" && document.readyState === "loading",
+      });
+    } catch {
+      // Capture must never change the page's error behavior.
+    }
+  };
+
+  try {
+    window.addEventListener("error", listener, true);
+    state._resourceErrorListener = listener;
+  } catch {
+    // A host with an unusual event target simply has no early resource capture.
+  }
+}
+
 /**
  * Installs the patches and the queue. Idempotent: a second import (or a second
  * bundled copy) finds the existing queue on the global and returns it
@@ -782,6 +836,7 @@ export function installEarlyCapture(): EarlyCapture | undefined {
       drain(sink?: LateRecordSink) {
         this.deferred = true;
         this._sink = typeof sink === "function" ? sink : undefined;
+        removeResourceErrorListener(this);
         if (this._timer !== undefined) {
           clearTimeout(this._timer);
           this._timer = undefined;
@@ -805,6 +860,7 @@ export function installEarlyCapture(): EarlyCapture | undefined {
       },
       stop() {
         this.stopped = true;
+        removeResourceErrorListener(this);
         this._sink = undefined;
         this.entries = [];
         this._awaitingBody = undefined;
@@ -826,6 +882,7 @@ export function installEarlyCapture(): EarlyCapture | undefined {
 
     patchFetch(state);
     patchXhr(state);
+    patchResourceErrors(state);
 
     // No init inside the window means no SDK is coming: drop what was recorded
     // rather than holding page memory for a session that will never exist. The

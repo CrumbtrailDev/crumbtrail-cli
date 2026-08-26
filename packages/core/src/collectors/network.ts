@@ -36,6 +36,7 @@ import {
   drainEarlyCapture,
   type EarlyRequestRecord,
 } from "../early-capture";
+import { emitEarlyResourceFailure } from "./error";
 import { now, readStructuredBody } from "../utils";
 import { captureCallStack } from "../call-stack";
 
@@ -1599,6 +1600,10 @@ function emitEarlyRecord(
   bus.emit({ t: settledAt, k: "net.res", d: resData });
 }
 
+function isEarlyResourceError(record: EarlyRequestRecord): boolean {
+  return record.kind === "resource-error";
+}
+
 /**
  * Drains the `crumbtrail-core/early` queue into the bus and defers the early
  * patch permanently. A no-op when the early module was never imported.
@@ -1609,6 +1614,15 @@ function drainEarlyRequests(
   context?: CollectorContext,
 ): void {
   const emit = (record: EarlyRequestRecord) => {
+    if (isEarlyResourceError(record)) {
+      if (!config.errors) return;
+      try {
+        emitEarlyResourceFailure(bus, record);
+      } catch {
+        // One malformed record never costs the rest of the queue.
+      }
+      return;
+    }
     if (shouldExclude(record.url, config)) return;
     try {
       emitEarlyRecord(bus, config, record);

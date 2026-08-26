@@ -8,6 +8,11 @@ import {
   type PayloadSummary,
   type RedactionMetadata,
 } from "../redaction";
+import {
+  drainEarlyCapture,
+  type EarlyRequestRecord,
+} from "../early-capture";
+import { resourceFailureForTarget } from "../resource-failure";
 
 function bodyPlaceholder(summary: PayloadSummary | undefined): string {
   return summary ? `[${summary.action}:${summary.reason}]` : "[REDACTED]";
@@ -56,67 +61,19 @@ function redactErrorPayload(
   return d;
 }
 
-const RESOURCE_URL_PROPERTIES: Record<string, readonly string[]> = {
-  script: ["src"],
-  link: ["href"],
-  img: ["currentSrc", "src"],
-  iframe: ["src"],
-  frame: ["src"],
-  audio: ["currentSrc", "src"],
-  video: ["currentSrc", "src"],
-  source: ["src"],
-  track: ["src"],
-  object: ["data"],
-  embed: ["src"],
-  input: ["src"],
-};
-
-interface ResourceFailure {
-  element: string;
-  url: string;
-}
-
-function resourceFailureForTarget(
-  target: EventTarget | null,
-): ResourceFailure | undefined {
-  if (!target || typeof target !== "object") return undefined;
-
-  const element = target as Element & Record<string, unknown>;
-  const tagName =
-    typeof element.tagName === "string" ? element.tagName.toLowerCase() : "";
-  const properties = RESOURCE_URL_PROPERTIES[tagName];
-  if (!properties) return undefined;
-
-  for (const property of properties) {
-    const value = element[property];
-    if (typeof value !== "string" || value.length === 0) continue;
-    try {
-      return {
-        element: tagName,
-        url: new URL(value, document.baseURI).href,
-      };
-    } catch {
-      return { element: tagName, url: value };
-    }
-  }
-
-  const getAttribute = element.getAttribute;
-  if (typeof getAttribute === "function") {
-    for (const attribute of properties) {
-      const value = getAttribute.call(element, attribute);
-      if (!value) continue;
-      try {
-        return {
-          element: tagName,
-          url: new URL(value, document.baseURI).href,
-        };
-      } catch {
-        return { element: tagName, url: value };
-      }
-    }
-  }
-
-  return undefined;
+export function emitEarlyResourceFailure(
+  bus: EventBus,
+  record: Pick<EarlyRequestRecord, "element" | "url" | "loading">,
+): void {
+  const url = redactUrl(record.url, "url");
+  const d: Record<string, unknown> = {
+    transport: "resource",
+    element: record.element,
+    url: url.value,
+    loading: record.loading,
+  };
+  attachRedactionMetadata(d, url.metadata);
+  bus.emit({ t: now(), k: "net.err", d });
 }
 
 export function errorCollector(
@@ -126,15 +83,10 @@ export function errorCollector(
   const onError = (event: ErrorEvent) => {
     const resource = resourceFailureForTarget(event.target);
     if (resource) {
-      const url = redactUrl(resource.url, "url");
-      const d: Record<string, unknown> = {
-        transport: "resource",
-        element: resource.element,
-        url: url.value,
+      emitEarlyResourceFailure(bus, {
+        ...resource,
         loading: document.readyState === "loading",
-      };
-      attachRedactionMetadata(d, url.metadata);
-      bus.emit({ t: now(), k: "net.err", d });
+      });
       return;
     }
 
@@ -230,6 +182,19 @@ export function errorCollector(
   }
   if (documentEvents) {
     document.addEventListener("securitypolicyviolation", onCspViolation);
+  }
+
+  // The network collector drains the shared queue when it is enabled. When it
+  // is not, the errors collector owns the queued resource records instead.
+  if (config.network !== true) {
+    for (const record of drainEarlyCapture()) {
+      if (record.kind !== "resource-error") continue;
+      try {
+        emitEarlyResourceFailure(bus, record);
+      } catch {
+        // A malformed early record never costs the rest of the queue.
+      }
+    }
   }
 
   return () => {
