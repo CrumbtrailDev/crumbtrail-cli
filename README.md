@@ -159,6 +159,18 @@ asks, leaving all of those at whatever this call says. The poll needs an ingest
 key, so a client without one does not poll either way, and the kill switch and
 the capture budgets are enforced at ingest, so those hold whatever you run.
 
+Automatic capture can be triggered by errors, uncaught errors, unhandled
+rejections, HTTP 5xx responses, rendered browser-standard error states, and
+configured signals such as rage clicks, retry storms, slow responses, or
+abandoned flows. `autoFlagDebounceMs` coalesces bursts and
+`autoFlagMaxPerSession` caps automatic reports across all triggers.
+
+`autoFlagOnRenderedError` is enabled by default. It covers `role="alert"` and
+`role="alertdialog"` entering the document, `aria-invalid="true"` appearing on
+a control, and native `invalid` events. It does not guess from CSS classes,
+test IDs, or copy, so plain error elements without these standards signals are
+outside its coverage.
+
 ## Failure archetype skills
 
 [`plugins/crumbtrail-skills`](plugins/crumbtrail-skills) packages twelve failure archetypes as
