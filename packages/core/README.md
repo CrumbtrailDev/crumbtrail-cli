@@ -48,6 +48,7 @@ Pass the application's release identifier as `release` when you have one:
 Crumbtrail.init({
   httpEndpoint: "https://api.crumbtrail.ai",
   httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,
+  remoteConfig: true,
   release: import.meta.env.VITE_APP_VERSION,
 });
 ```
