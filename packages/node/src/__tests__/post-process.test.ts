@@ -3156,9 +3156,9 @@ describe("evidence detector coverage and determinism", () => {
   it("covers deterministic detectors and stable output across repeated post-processing", async () => {
     const events = [
       { t: 0, k: "nav", d: { to: "/start" } },
-      { t: 100, k: "clk", d: { el: { txt: "Retry" } } },
-      { t: 200, k: "clk", d: { el: { txt: "Retry" } } },
-      { t: 300, k: "clk", d: { el: { txt: "Retry" } } },
+      { t: 10_000, k: "clk", d: { el: { sig: "retry-button", txt: "Retry" } } },
+      { t: 10_100, k: "clk", d: { el: { sig: "retry-button", txt: "Retry" } } },
+      { t: 10_200, k: "clk", d: { el: { sig: "retry-button", txt: "Retry" } } },
       { t: 500, k: "net.req", d: { id: "slow", m: "GET", url: "/slow" } },
       { t: 6_000, k: "net.res", d: { id: "slow", st: 200, dur: 5_500 } },
       {

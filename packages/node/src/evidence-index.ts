@@ -339,6 +339,8 @@ export interface EvidenceCandidate {
      * which is what tells a reader which file to open.
      */
     componentStack?: string;
+    /** Existing element signature from d.el, when the capture supplied one. */
+    elementSignature?: string;
     target?: TargetDescriptor;
   };
   /**
@@ -1455,53 +1457,149 @@ function applyCausalRerank(
   else ordered.sort(byRank);
 }
 
+const REPEATED_CLICK_COUNT = 3;
+const REPEATED_CLICK_WINDOW_MS = 3_000;
+const REPEATED_CLICK_QUIET_WINDOW_MS = 3_000;
+
+interface ClickTargetIdentity {
+  key: string;
+  signature?: string;
+}
+
+/**
+ * The stable identity already captured for an interaction. `d.el.sig` is the
+ * key written to signatures.json. A structural path is the next safest
+ * legacy value. Native target descriptors use only their stable identity
+ * fields, never bounds or a generated id.
+ */
+function clickTargetIdentity(event: BugEvent): ClickTargetIdentity | undefined {
+  const el = isRecord(event.d.el) ? event.d.el : undefined;
+  const signature = safeText(el?.sig, 400);
+  if (signature) return { key: `sig:${signature}`, signature };
+
+  const elementPath = safeText(el?.path, 400);
+  if (elementPath) return { key: `path:${elementPath}` };
+
+  const target = targetForEvent(event);
+  if (!target) return undefined;
+
+  const identityFields = ["testID", "accessibilityId", "ancestryHash"] as const;
+  const identity = identityFields
+    .map((field) => [field, safeText(target[field], 240)] as const)
+    .filter(([, value]) => value !== undefined);
+  if (identity.length === 0) return undefined;
+
+  return { key: `target:${JSON.stringify(identity)}` };
+}
+
+/**
+ * Evidence that means the repeated activation was not dead. This is
+ * intentionally broader than the detector's headline: an absence-based
+ * signal should yield to any recorded indication that the page or its state
+ * moved, even when that indication has its own detector.
+ */
+function isRepeatedClickConsequence(event: BugEvent): boolean {
+  return (
+    event.k === "nav" ||
+    event.k === "navigation" ||
+    event.k === "net.req" ||
+    event.k === "net.res" ||
+    event.k === "net.err" ||
+    event.k === "net.sse" ||
+    event.k === "net.ws" ||
+    event.k === "inp" ||
+    event.k === "view-snapshot" ||
+    event.k === "snap" ||
+    event.k.startsWith("dom.") ||
+    event.k.startsWith("state.") ||
+    event.k.startsWith("ui.") ||
+    event.k.startsWith("db.") ||
+    event.k.startsWith("backend.req.") ||
+    event.k === "backend.http" ||
+    event.k === "con" ||
+    event.k === "err" ||
+    event.k === "rej" ||
+    event.k === "probe.error"
+  );
+}
+
 function addRepeatedClickCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
   drafts: CandidateDraft[],
 ): void {
-  const clicksByLabel = new Map<string, BugEvent[]>();
+  const clicksByTarget = new Map<
+    string,
+    { identity: ClickTargetIdentity; clicks: BugEvent[] }
+  >();
   for (const event of events) {
     if (event.k !== "clk") continue;
-    const label = elementLabel(event) ?? "unknown element";
-    const clicks = clicksByLabel.get(label) ?? [];
-    clicks.push(event);
-    clicksByLabel.set(label, clicks);
+    const identity = clickTargetIdentity(event);
+    if (!identity) continue;
+    const entry = clicksByTarget.get(identity.key) ?? { identity, clicks: [] };
+    entry.clicks.push(event);
+    clicksByTarget.set(identity.key, entry);
   }
 
-  for (const [label, clicks] of clicksByLabel) {
+  for (const { identity, clicks } of clicksByTarget.values()) {
     clicks.sort((a, b) => a.t - b.t);
+    const consequenceTimes = events
+      .filter(isRepeatedClickConsequence)
+      .map((event) => event.t)
+      .sort((a, b) => a - b);
     let start = 0;
     let end = 0;
     while (start < clicks.length) {
       const first = clicks[start];
-      while (end < clicks.length && clicks[end].t - first.t <= 3_000) end++;
+      while (
+        end < clicks.length &&
+        clicks[end].t - first.t <= REPEATED_CLICK_WINDOW_MS
+      )
+        end++;
       const groupLength = end - start;
-      if (groupLength < 3) {
+      if (groupLength < REPEATED_CLICK_COUNT) {
         start++;
         if (end < start) end = start;
         continue;
       }
+
+      const last = clicks[end - 1];
+      const quietUntil = last.t + REPEATED_CLICK_QUIET_WINDOW_MS;
+      const hasConsequence = hasActivityWithin(
+        consequenceTimes,
+        first.t,
+        quietUntil - first.t,
+      );
+      if (hasConsequence) {
+        start = end;
+        continue;
+      }
+
+      const label = elementLabel(first);
       drafts.push({
         detector: "repeated_clicks",
-        title: `Repeated clicks on ${titleElementLabel(first)}`,
-        severity: "medium",
-        score: 55 + Math.min(10, groupLength),
-        confidence: "medium",
+        title: `Repeated clicks on ${titleElementLabel(first)} had no recorded consequence`,
+        severity: "low",
+        score: 45,
+        confidence: "low",
         anchor: removeUndefined({
           t: first.t,
           offsetMs:
             offsetForEvent(first) ?? offsetFromStart(first.t, index.start),
           route: routeAt(index.navs ?? [], first.t),
+          elementSignature: scrubText(identity.signature, 240),
           target: targetForEvent(first),
           elementLabel: scrubText(label, 160),
-          message: `${groupLength} clicks within 3s`,
+          message:
+            `${groupLength} clicks within ${REPEATED_CLICK_WINDOW_MS / 1000}s; ` +
+            `no navigation, request, DOM, or recorded state consequence within ` +
+            `${REPEATED_CLICK_QUIET_WINDOW_MS / 1000}s of the last click`,
         }),
         // The group spans from the first click to the last; the anchor names the first. Without
         // this the finding reads as having ended at its own start, and thread ranking treats a
         // sequence the user was still performing as something they had moved past.
-        lastT: clicks[end - 1].t,
-        dedupeKey: `repeat:${label}:${first.t}`,
+        lastT: last.t,
+        dedupeKey: `repeat:${identity.key}:${first.t}`,
       });
       start = end;
     }
@@ -13172,6 +13270,8 @@ function renderCandidatesMarkdown(
         lines.push(`* Source: ${candidate.anchor.frame}`);
       if (candidate.anchor.elementLabel)
         lines.push(`* Element: ${candidate.anchor.elementLabel}`);
+      if (candidate.anchor.elementSignature)
+        lines.push(`* Element signature: ${candidate.anchor.elementSignature}`);
       // Causal structure (CP4): additive per-candidate lines from the CP3 re-rank fields.
       if (candidate.causalRole)
         lines.push(`* Causal role: ${candidate.causalRole}`);
