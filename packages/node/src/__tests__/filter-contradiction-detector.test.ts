@@ -3,38 +3,16 @@ import type { BugEvent } from "crumbtrail-core";
 import { buildEvidenceCandidates } from "../evidence-index";
 import {
   jsonResponse,
+  legacyJsonResponse,
   request as netRequest,
 } from "./fixtures/net-res";
 
 function request(
   t: number,
-  url: string,
+  url = "/api/catalog",
   requestId = "req-a",
-  method = "GET",
 ): BugEvent {
-  return netRequest(t, requestId, method, url);
-}
-
-/**
- * This detector reads the request's query string and the rows the request read;
- * the response only has to be a 2xx. A body-free `net.res` is the minimal case,
- * and `respondsWith` below pins that a real emitted body changes nothing.
- */
-function response(t: number, requestId = "req-a", st = 200): BugEvent {
-  return { t, k: "net.res", d: { requestId, st, dur: 12 } } as BugEvent;
-}
-
-function read(
-  t: number,
-  row: Record<string, unknown>,
-  requestId = "req-a",
-  table = "products",
-): BugEvent {
-  return {
-    t,
-    k: "db.read",
-    d: { engine: "postgres", table, pk: { id: row.id ?? 1 }, row, requestId },
-  } as unknown as BugEvent;
+  return netRequest(t, requestId, "GET", url);
 }
 
 function detectors(events: BugEvent[]): string[] {
@@ -43,140 +21,183 @@ function detectors(events: BugEvent[]): string[] {
   );
 }
 
+function response(
+  t: number,
+  payload: unknown,
+  requestId = "req-a",
+  status = 200,
+): BugEvent {
+  return jsonResponse(t, requestId, payload, { status });
+}
+
 describe("filter_contradiction", () => {
-  it("names a row that defies the equality filter the request declared", () => {
+  it("fires when returned rows contradict an echoed scalar constraint", () => {
     const found = detectors([
-      request(10, "/api/products?category=audio"),
-      read(20, { id: 1, category: "audio" }),
-      read(21, { id: 2, category: "desk" }),
-      response(30),
+      request(10),
+      response(20, {
+        filters: { category: "audio" },
+        results: [
+          { id: 1, category: "audio" },
+          { id: 2, category: "desk" },
+        ],
+      }),
     ]);
     expect(found).toContain("filter_contradiction");
   });
 
-  it("states the contradiction in the title", () => {
+  it("names the constraint, declared value, and violating value", () => {
     const candidate = buildEvidenceCandidates(
       [
-        request(10, "/api/products?category=audio"),
-        read(21, { id: 2, category: "desk" }),
-        response(30),
+        request(10, "/api/catalog"),
+        response(20, {
+          filters: { category: "audio" },
+          results: [{ id: 2, category: "desk" }],
+        }),
       ],
       { start: 0 },
     ).find((entry) => entry.detector === "filter_contradiction");
+
     expect(candidate?.title).toBe(
-      "Response rows contradict the request's own filter `category`",
+      "Response rows contradict an echoed constraint category",
     );
     expect(candidate?.severity).toBe("high");
-    expect(candidate?.anchor.comparedColumns).toEqual(["category"]);
+    expect(candidate?.confidence).toBe("high");
+    expect(candidate?.anchor.t).toBe(20);
+    expect(candidate?.anchor.message).toContain("category=audio");
+    expect(candidate?.anchor.message).toContain("category=desk");
+    expect(candidate?.anchor.status).toBe(200);
   });
 
-  it("is unaffected by a real emitted response body and summary", () => {
+  it("works with a top-level response collection and legacy body text", () => {
     const found = detectors([
-      request(10, "/api/products?category=audio"),
-      read(21, { id: 2, category: "desk" }),
-      jsonResponse(30, "req-a", [{ id: 2, category: "desk" }]),
+      request(10),
+      legacyJsonResponse(20, "req-a", {
+        applied: { status: "ready" },
+        data: [{ id: 1, status: "failed" }],
+      }),
     ]);
     expect(found).toContain("filter_contradiction");
   });
 
-  it("reads a boolean availability filter against the stock column", () => {
+  it("compares boolean scalar constraints without coercion", () => {
     const found = detectors([
-      request(10, "/api/products?inStock=true"),
-      read(20, { id: 7, inventory: 0 }),
-      response(30),
+      request(10),
+      response(20, {
+        appliedConstraints: { active: true },
+        items: [{ id: 1, active: false }],
+      }),
     ]);
     expect(found).toContain("filter_contradiction");
   });
 
-  it("stays silent when every read row satisfies the filter", () => {
+  it("stays silent when an echoed key is absent from the returned items", () => {
     const found = detectors([
-      request(10, "/api/products?category=audio"),
-      read(20, { id: 1, category: "audio" }),
-      read(21, { id: 2, category: "audio" }),
-      response(30),
+      request(10),
+      response(20, {
+        filters: { category: "audio" },
+        items: [{ id: 1, name: "speaker" }],
+      }),
     ]);
     expect(found).not.toContain("filter_contradiction");
   });
 
-  it("accepts any member of a repeated or comma-listed filter", () => {
+  it.each([
+    ["null", null],
+    ["empty", ""],
+    ["wildcard sentinel", "*"],
+    ["all sentinel", "all"],
+  ])("stays silent for a %s echoed value", (_label, value) => {
     const found = detectors([
-      request(10, "/api/products?category=audio,video"),
-      read(20, { id: 1, category: "video" }),
-      response(30),
+      request(10),
+      response(20, {
+        filters: { category: value },
+        items: [{ id: 1, category: "desk" }],
+      }),
     ]);
     expect(found).not.toContain("filter_contradiction");
   });
 
-  it("ignores free-text search parameters", () => {
-    // `q` is a term the server interprets, not a promise every row equals it.
+  it("stays silent when either compared value was redacted", () => {
+    const echoedRedaction = detectors([
+      request(10),
+      response(20, {
+        filters: { category: "[REDACTED]" },
+        items: [{ id: 1, category: "desk" }],
+      }),
+    ]);
+    const rowRedaction = detectors([
+      request(10),
+      response(20, {
+        filters: { category: "audio" },
+        items: [{ id: 1, category: "[REDACTED]" }],
+      }),
+    ]);
+
+    expect(echoedRedaction).not.toContain("filter_contradiction");
+    expect(rowRedaction).not.toContain("filter_contradiction");
+  });
+
+  it("stays silent when comparison would need case or type normalization", () => {
+    const caseOnly = detectors([
+      request(10),
+      response(20, {
+        filters: { category: "audio" },
+        items: [{ id: 1, category: "AUDIO" }],
+      }),
+    ]);
+    const typeOnly = detectors([
+      request(10),
+      response(20, {
+        filters: { code: "1" },
+        items: [{ id: 1, code: 1 }],
+      }),
+    ]);
+
+    expect(caseOnly).not.toContain("filter_contradiction");
+    expect(typeOnly).not.toContain("filter_contradiction");
+  });
+
+  it("stays silent for deferred range, paging, and ordering semantics", () => {
     const found = detectors([
-      request(10, "/api/products?q=audio"),
-      read(20, { id: 1, q: "desk" }),
-      response(30),
+      request(10),
+      response(20, {
+        filters: {
+          maxPrice: 800000,
+          limit: 20,
+          sort: "price_asc",
+        },
+        items: [{ id: 1, maxPrice: 400000, limit: 45, sort: "price_desc" }],
+      }),
+    ]);
+
+    expect(found).not.toContain("filter_contradiction");
+  });
+
+  it("stays silent for a failed response", () => {
+    const found = detectors([
+      request(10),
+      response(
+        20,
+        {
+          filters: { category: "audio" },
+          items: [{ id: 1, category: "desk" }],
+        },
+        "req-a",
+        500,
+      ),
     ]);
     expect(found).not.toContain("filter_contradiction");
   });
 
-  it("ignores range bounds", () => {
+  it("stays silent when more than one constraint object is plausible", () => {
     const found = detectors([
-      request(10, "/api/products?maxPrice=200"),
-      read(20, { id: 1, maxPrice: 40 }),
-      response(30),
+      request(10),
+      response(20, {
+        filters: { category: "audio" },
+        applied: { category: "audio" },
+        items: [{ id: 1, category: "desk" }],
+      }),
     ]);
     expect(found).not.toContain("filter_contradiction");
-  });
-
-  it("ignores paging and sorting parameters", () => {
-    const found = detectors([
-      request(10, "/api/products?sort=name&limit=20"),
-      read(20, { id: 1, sort: "price", limit: 3 }),
-      response(30),
-    ]);
-    expect(found).not.toContain("filter_contradiction");
-  });
-
-  it("stays silent when the row value was redacted away", () => {
-    const found = detectors([
-      request(10, "/api/products?category=audio"),
-      read(20, { id: 1, category: "[REDACTED]" }),
-      response(30),
-    ]);
-    expect(found).not.toContain("filter_contradiction");
-  });
-
-  it("stays silent when the response was not a 2xx", () => {
-    // A failed request's rows prove nothing about what the filter should return.
-    const found = detectors([
-      request(10, "/api/products?category=audio"),
-      read(20, { id: 1, category: "desk" }),
-      response(30, "req-a", 500),
-    ]);
-    expect(found).not.toContain("filter_contradiction");
-  });
-
-  it("only compares rows read by the request that declared the filter", () => {
-    const found = detectors([
-      request(10, "/api/products?category=audio", "req-a"),
-      response(30, "req-a"),
-      // A different request read the contradicting row.
-      read(40, { id: 2, category: "desk" }, "req-b"),
-      request(35, "/api/other", "req-b"),
-      response(45, "req-b"),
-    ]);
-    expect(found).not.toContain("filter_contradiction");
-  });
-
-  it("reports one candidate per declared filter, not per row", () => {
-    const candidates = buildEvidenceCandidates(
-      [
-        request(10, "/api/products?category=audio"),
-        read(20, { id: 1, category: "desk" }),
-        read(21, { id: 2, category: "lamp" }),
-        read(22, { id: 3, category: "rug" }),
-        response(30),
-      ],
-      { start: 0 },
-    ).filter((entry) => entry.detector === "filter_contradiction");
-    expect(candidates).toHaveLength(1);
   });
 });
