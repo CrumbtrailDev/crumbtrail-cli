@@ -175,6 +175,9 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
         serviceName: input.serviceName,
       };
     }) as unknown as WizardDeps["provisionService"],
+    setSessionReplay: vi.fn(async (_b, _t, _p, enabled: boolean) => {
+      h.steps.push(`replay:${enabled ? "on" : "off"}`);
+    }) as unknown as WizardDeps["setSessionReplay"],
     pollForServices: vi.fn(async (opts: { serviceIds: string[] }) => {
       h.steps.push("poll");
       return {
@@ -486,6 +489,96 @@ describe("resolveWorkspaceDir (--workspace validation)", () => {
       io(["/repo/services/rails"], []),
     );
     expect("error" in res && res.error).toMatch(/no package\.json/);
+  });
+});
+
+// Session replay is the one capture setting a team cannot discover by using
+// the product: a session without a recording renders as an explanation, not as
+// a missing player. Setup is where it gets asked, and these pin what setup is
+// allowed to decide on the asker's behalf — which is nothing.
+describe("session replay at setup", () => {
+  it("turns replay on when the person says yes, and says so", async () => {
+    const steps: string[] = [];
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps },
+      { ui, prompter: { ...noopPrompter, confirm: async () => true } },
+    );
+
+    expect(await runCli(["node", "cli"], deps)).toBe(0);
+    expect(steps).toContain("replay:on");
+    expect(lines.join("\n")).toContain("Session replay is on");
+  });
+
+  it("writes nothing when the person says no, because off is already the state", async () => {
+    const steps: string[] = [];
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps },
+      { ui, prompter: { ...noopPrompter, confirm: async () => false } },
+    );
+
+    expect(await runCli(["node", "cli"], deps)).toBe(0);
+    // A "no" that patched the project would silently switch replay OFF for a
+    // project that already records, which is not what the question asked.
+    expect(steps).not.toContain("replay:off");
+    expect(steps).not.toContain("replay:on");
+    expect(lines.join("\n")).toContain("capture settings");
+  });
+
+  it("never asks, and never writes, without a person at the terminal", async () => {
+    const steps: string[] = [];
+    const confirm = vi.fn(async () => true);
+    const { ui } = captureUi();
+    const deps = makeDeps(
+      { steps, isTTY: false },
+      { ui, prompter: { ...noopPrompter, confirm } },
+    );
+
+    // Whatever else a headless run decides, it does not decide this.
+    await runCli(["node", "cli"], deps);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(steps.filter((s) => s.startsWith("replay:"))).toEqual([]);
+  });
+
+  it("carries out --replay and --no-replay without asking", async () => {
+    for (const [flag, step] of [
+      ["--replay", "replay:on"],
+      ["--no-replay", "replay:off"],
+    ] as const) {
+      const steps: string[] = [];
+      const confirm = vi.fn(async () => true);
+      const { ui } = captureUi();
+      const deps = makeDeps(
+        { steps },
+        { ui, prompter: { ...noopPrompter, confirm } },
+      );
+
+      expect(await runCli(["node", "cli", flag], deps)).toBe(0);
+      expect(confirm).not.toHaveBeenCalled();
+      expect(steps).toContain(step);
+    }
+  });
+
+  it("reports a refused setting instead of failing the run that already wired the app", async () => {
+    const steps: string[] = [];
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps },
+      {
+        ui,
+        prompter: { ...noopPrompter, confirm: async () => true },
+        setSessionReplay: (async () => {
+          throw new Error("you do not manage this project");
+        }) as unknown as WizardDeps["setSessionReplay"],
+      },
+    );
+
+    // The app is wired. A setting that would not take is a note, not a failure.
+    expect(await runCli(["node", "cli"], deps)).toBe(0);
+    const out = lines.join("\n");
+    expect(out).toContain("left unchanged");
+    expect(out).toContain("you do not manage this project");
   });
 });
 

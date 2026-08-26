@@ -51,6 +51,7 @@ import {
   provisionService,
   ProjectAccessError,
   resolveProject,
+  setSessionReplay,
   uniqueServiceNames,
   UpgradeRequiredError,
   type ProvisionResult,
@@ -246,6 +247,13 @@ export interface ParsedArgs {
    */
   workspace?: string;
   /**
+   * Turn session replay on (`--replay`) or off (`--no-replay`) for the project
+   * without being asked. Unset means ask on a TTY and leave replay alone
+   * otherwise, because recording a customer's end users is not a default a
+   * non-interactive run should pick on their behalf.
+   */
+  replay?: boolean;
+  /**
    * `verify` only: the ingest key to probe with (else $CRUMBTRAIL_KEY, else the
    * cached login token). The primary CI credential for a pre-deploy check.
    */
@@ -302,6 +310,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
         break;
       case "--skip-verify":
         parsed.skipVerify = true;
+        break;
+      case "--replay":
+        parsed.replay = true;
+        break;
+      case "--no-replay":
+        parsed.replay = false;
         break;
       case "--no-write-key":
         parsed.noWriteKey = true;
@@ -467,6 +481,8 @@ function usage(): string {
     flag("--skip-verify", "Don't wait for the first event"),
     flag("--no-write-key", "Don't mint or write an ingest key; print the"),
     `  ${" ".repeat(26)} variable to set instead`,
+    flag("--replay, --no-replay", "Record session replay for this project, or"),
+    `  ${" ".repeat(26)} don't — else you are asked once`,
     flag(
       "--endpoint <url>",
       "Cloud endpoint (else $CRUMBTRAIL_BASE_URL, else default)",
@@ -851,6 +867,7 @@ export interface WizardDeps {
   discoverServices: typeof discoverServices;
   resolveProject: typeof resolveProject;
   provisionService: typeof provisionService;
+  setSessionReplay: typeof setSessionReplay;
   pollForServices: typeof pollForServices;
   /** Synthetic preflight for `verify` (stub in tests). */
   runPreflight: typeof runPreflight;
@@ -884,6 +901,7 @@ export function defaultDeps(): WizardDeps {
     discoverServices,
     resolveProject,
     provisionService,
+    setSessionReplay,
     pollForServices,
     runPreflight,
     openBrowserFn: openBrowser,
@@ -1333,6 +1351,23 @@ export async function runWizard(
 
   const keyReady =
     keyWrite.status === "written" || keyWrite.status === "already-set";
+
+  // Only once this app can actually report. Offering to record replays for a
+  // run that wired nothing is a question about a feature the asker cannot yet
+  // reach, and the setup that failed is the thing they need to hear about.
+  if (keyReady) {
+    notes.push(
+      await offerSessionReplay({
+        base,
+        token,
+        projectId: provisioned.projectId,
+        parsed,
+        deps,
+        identityLabel,
+      }),
+    );
+  }
+
   const setKeyHint = keyReady
     ? "Start your app"
     : plan.keyIsCompileTime
@@ -2224,6 +2259,23 @@ export async function runBatchWizard(
     outcome.keyReady =
       write?.status === "written" || write?.status === "already-set";
   }
+  // One question for the project, not one per service: replay is a project
+  // setting, and asking it five times in a monorepo is five ways to say the
+  // same yes. Skipped entirely when nothing reports to the cloud, because a
+  // run with no reporting service has a more urgent thing to say.
+  if (cloudReporting.some((o) => o.keyReady)) {
+    batchNotes.push(
+      await offerSessionReplay({
+        base,
+        token,
+        projectId: project.id,
+        parsed,
+        deps,
+        identityLabel,
+      }),
+    );
+  }
+
   if (parsed.skipVerify) {
     // One note for the run, not one per service — the same line repeated N
     // times is noise, not information.
@@ -2950,6 +3002,76 @@ async function writeIngestKey(args: {
     targets: [{ label: "", appDir: args.appDir, varName: args.varName }],
   });
   return results.get("") ?? { status: "no-variable" };
+}
+
+/**
+ * Ask once, at setup, whether this project should record session replay.
+ *
+ * Replay is the only capture setting whose absence is invisible from the
+ * product: a session without a recording renders as an explanation, not as a
+ * missing feature, so a team that never opened the settings page waits for a
+ * player that was never going to arrive. Asking here puts the question in
+ * front of the person who owns the project on the one run where they are
+ * already answering questions about it.
+ *
+ * It is never assumed. Replay records what a customer's own end users see, so
+ * an unattended run leaves it alone and says where the switch lives; only a
+ * person at a TTY, or an explicit `--replay` / `--no-replay`, decides it.
+ * A failure here is reported and never fatal: the app is wired either way, and
+ * the setting is one click away in the dashboard.
+ */
+async function offerSessionReplay(args: {
+  base: string;
+  token: string;
+  projectId: string;
+  parsed: ParsedArgs;
+  deps: WizardDeps;
+  identityLabel: string;
+}): Promise<string> {
+  const { base, token, projectId, parsed, deps, identityLabel } = args;
+  // A link a person clicks, so it points at the dashboard rather than the
+  // ingest host the SDK talks to.
+  const settingsUrl = appUrl(
+    appBaseFor(base, deps.env),
+    "/settings/capture",
+    projectId,
+  );
+
+  const asked =
+    parsed.replay ??
+    (parsed.yes || !deps.isTTY
+      ? undefined
+      : await deps.prompter.confirm(
+          "Record session replay for this project? It replays what your end users saw, and you can change it later in capture settings.",
+          false,
+        ));
+
+  // Declining writes nothing. Replay is already off unless someone turned it
+  // on, so the only thing a "no" could change is a project that already
+  // records — and silently switching that off is not what a person answering a
+  // question about this app meant. `--no-replay` is different: that is an
+  // instruction about the project, so it is carried out.
+  if (asked !== true && parsed.replay === undefined) {
+    return `Session replay is off unless this project already records it. Change it in capture settings: ${settingsUrl}`;
+  }
+
+  const enabled = asked === true;
+  try {
+    await deps.setSessionReplay(
+      base,
+      token,
+      projectId,
+      enabled,
+      deps.fetchImpl,
+      identityLabel,
+    );
+  } catch (err) {
+    return `Session replay was left unchanged: ${errMessage(err)}. Set it in capture settings: ${settingsUrl}`;
+  }
+
+  return enabled
+    ? "Session replay is on. New sessions from this app will be watchable once it has sent one."
+    : `Session replay is off. Turn it on in capture settings: ${settingsUrl}`;
 }
 
 function skippedKeyWrite(

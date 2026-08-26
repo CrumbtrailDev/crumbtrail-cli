@@ -300,6 +300,39 @@ export async function createIngestKey(
   }
 }
 
+/**
+ * Turn session replay on or off for a project.
+ *
+ * Replay is the one capture setting a team cannot discover by using the
+ * product: a session with no recording renders as an explanation rather than a
+ * player, so nobody who has not read the settings page knows the switch exists.
+ * Setup is where the question can be asked once, of the person who owns the
+ * decision, before anyone waits on a replay that was never recorded.
+ *
+ * A partial patch on purpose. The route merges each field over the project's
+ * current settings, so this changes replay and nothing a customer has already
+ * chosen elsewhere.
+ */
+export async function setSessionReplay(
+  base: string,
+  token: string,
+  projectId: string,
+  enabled: boolean,
+  fetchImpl?: typeof fetch,
+  identityLabel?: string,
+): Promise<void> {
+  try {
+    await requestJson(`${base}/api/projects/${projectId}/capture-settings`, {
+      method: "PATCH",
+      token,
+      body: { replayEnabled: enabled },
+      fetchImpl,
+    });
+  } catch (err) {
+    throw explainWrongAccount(err, projectId, identityLabel);
+  }
+}
+
 // ── Orchestrated flow ────────────────────────────────────────────────────────
 
 export interface ProvisionInput {
