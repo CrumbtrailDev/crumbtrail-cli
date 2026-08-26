@@ -1719,19 +1719,51 @@ export function networkCollector(
       })),
   );
 
+  // Each restore runs on its own. This cleanup undoes several independent patches, and a host
+  // that has since frozen one of them — a non-writable `globalThis.fetch`, a sealed XHR
+  // prototype — throws on assignment. Sequentially, that first throw skipped every restore after
+  // it, leaving the rest of the collector patched in with no teardown left to remove it.
+  const step = (restore: () => void): boolean => {
+    try {
+      restore();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   return () => {
+    let restored = true;
+
     if (shouldPatchFetch) {
-      globalThis.fetch = originalFetch;
+      restored = step(() => {
+        globalThis.fetch = originalFetch;
+      }) && restored;
     }
 
     if (shouldPatchXHR && originalXHRMethods) {
-      xhrPrototype.open = originalXHRMethods.origOpen;
-      xhrPrototype.send = originalXHRMethods.origSend;
-      xhrPrototype.setRequestHeader = originalXHRMethods.origSetRequestHeader;
+      const methods = originalXHRMethods;
+      restored =
+        step(() => {
+          xhrPrototype.open = methods.origOpen;
+        }) && restored;
+      restored =
+        step(() => {
+          xhrPrototype.send = methods.origSend;
+        }) && restored;
+      restored =
+        step(() => {
+          xhrPrototype.setRequestHeader = methods.origSetRequestHeader;
+        }) && restored;
     }
 
-    unregisterPendingProvider?.();
-    pending.clear();
-    clearDedupMap();
+    restored = step(() => unregisterPendingProvider?.()) && restored;
+    restored = step(() => pending.clear()) && restored;
+    restored = step(() => clearDedupMap()) && restored;
+
+    // Reported, not swallowed: the caller's teardown handler is what stops a half-restored
+    // collector from being installed over a second time.
+    if (!restored)
+      throw new Error("network collector could not fully restore its patches");
   };
 }

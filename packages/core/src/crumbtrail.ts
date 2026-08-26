@@ -391,6 +391,16 @@ export class Crumbtrail {
    * it is never installed a second time.
    */
   private collectorTeardowns = new Map<string, CollectorCleanup>();
+  /**
+   * Collectors whose teardown threw, for the rest of the session.
+   *
+   * A teardown that throws part way leaves its patches half-installed — some globals restored,
+   * some still wrapped — and nothing here can tell which. Installing that collector again would
+   * wrap the survivors a second time, so every request it sees is captured twice and the
+   * original is buried one layer deeper. Refusing the re-install keeps the session on the half
+   * that is still running rather than stacking a second copy on top of it.
+   */
+  private poisonedCollectors = new Set<string>();
   /** The context handed to collectors at init, kept so a later start hands over the same one. */
   private collectorContext?: CollectorContext;
   private sessionId: string;
@@ -1245,12 +1255,16 @@ export class Crumbtrail {
    * That is what keeps a policy that flips a switch on every poll — or an integrator toggling by
    * hand — from stacking listeners, prototype patches and timers one copy per poll.
    *
+   * A collector whose teardown once threw is refused outright for the rest of the session — see
+   * {@link Crumbtrail.poisonedCollectors}.
+   *
    * Install failures are not caught here: at init a collector that cannot install is the same
    * error it has always been. The mid-session caller guards its own call, because a poll must
    * not take the session down over one collector.
    */
   private installCollector(key: string): void {
     if (this.collectorTeardowns.has(key)) return;
+    if (this.poisonedCollectors.has(key)) return;
     const collector = COLLECTOR_MAP[key];
     const context = this.collectorContext;
     if (!collector || !context) return;
@@ -1271,7 +1285,10 @@ export class Crumbtrail {
       teardown();
     } catch {
       // One collector failing to tear down must not take the rest of the poll with it, the same
-      // reasoning the shutdown loop runs on.
+      // reasoning the shutdown loop runs on. The throw is still recorded: the collector is now
+      // in an unknown state, so a later ON switch must not install a second copy over the half
+      // that survived. See `poisonedCollectors`.
+      this.poisonedCollectors.add(key);
     }
   }
 
@@ -2679,6 +2696,11 @@ function applyRemoteNetworkLimits(
  * - `captureInputValues` may only be turned off.
  * - `keepFields` are ignored outright. A keep exempts a field from the deny rules, so honouring
  *   one from a remote policy would be a response body widening what an application captures.
+ *
+ * `captureInputValues` is enforced by a module-level flag in `redaction.ts`, because the input
+ * redaction path is reached from places that never see a config object. Writing the config field
+ * alone would leave the flag at its init value and the tighten would be a silent no-op, so the
+ * flag is re-synced here from the value the config now holds.
  */
 function applyRemoteRedaction(
   config: CrumbtrailConfig,
@@ -2701,6 +2723,7 @@ function applyRemoteRedaction(
   if (captureInputValues === false) next.captureInputValues = false;
 
   config.redaction = next;
+  setCaptureInputValues(next.captureInputValues);
 }
 
 function applyRemoteSampling(
