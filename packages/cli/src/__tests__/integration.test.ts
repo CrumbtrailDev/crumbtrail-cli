@@ -71,12 +71,9 @@ describe("inspectIntegration", () => {
 
     expect(status.complete).toBe(false);
     expect(status.found).toBe(true);
-    expect(status.missing).toEqual([
-      "endpoint",
-      "ingest-key",
-      "service-name",
-      "remote-config",
-    ]);
+    // No "remote-config": that helper never says `remoteConfig: false`, and the
+    // default is on, so the project's settings already reach it.
+    expect(status.missing).toEqual(["endpoint", "ingest-key", "service-name"]);
   });
 
   it("routes an incomplete reachable integration to guidance instead of a second init", () => {
@@ -148,6 +145,8 @@ describe("amending an integration the customer already has", () => {
     );
   }
 
+  // `remoteConfig` is absent from these files and stays absent: it defaults to
+  // on, so writing it would be a line that changes nothing.
   it("adds only the absent options and leaves every other byte alone", () => {
     const files = amendableFiles();
     const before = files[p("src", "main.tsx")];
@@ -163,21 +162,17 @@ describe("amending an integration the customer already has", () => {
         "  ...PRESET_PASSIVE,",
         `  httpEndpoint: "${ENDPOINT}",`,
         "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
-        "  remoteConfig: true,",
         '  service: "web",',
         "});",
         "",
         "console.log('app boot');",
       ].join("\n"),
     );
-    // Byte-identical outside the two inserted lines.
+    // Byte-identical outside the inserted line.
     expect(
       plan
         .content!.split("\n")
-        .filter(
-          (line) =>
-            line !== "  remoteConfig: true," && line !== '  service: "web",',
-        )
+        .filter((line) => line !== '  service: "web",')
         .join("\n"),
     ).toBe(before);
   });

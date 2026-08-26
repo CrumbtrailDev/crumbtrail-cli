@@ -312,9 +312,12 @@ export function inspectIntegration(
     missing.push("service-name");
     existingServiceName = declaredServiceName(source);
   }
+  // Absent is fine: `remoteConfig` defaults to on, so an init that never
+  // mentions it already takes its capture settings from the project. Only an
+  // explicit opt out cuts the dashboard off from this app.
   if (
     remoteConfigRequired(input.recipe) &&
-    !/\bremoteConfig\s*:\s*true\b/.test(source)
+    /\bremoteConfig\s*:\s*false\b/.test(source)
   ) {
     missing.push("remote-config");
   }
