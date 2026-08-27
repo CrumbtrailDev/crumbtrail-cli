@@ -210,6 +210,69 @@ describe("buildEvidenceCandidates — console warnings", () => {
   });
 });
 
+describe("buildEvidenceCandidates — Crumbtrail's own console output", () => {
+  // The SDK reports its own degraded states through the console. Promoting one
+  // into a candidate files a finding against the customer's app for a fault in
+  // the recorder, and it happens precisely when the session is thinnest,
+  // because the same fault is what stopped the evidence from being recorded.
+  it("does not surface an SDK warning as a console_warning candidate", () => {
+    const events: BugEvent[] = [
+      {
+        t: 1000,
+        k: "con",
+        d: {
+          lv: "warn",
+          msg: "[crumbtrail] the capture endpoint refused events with HTTP 404: Session not found",
+        },
+      },
+    ];
+    const candidates = buildEvidenceCandidates(events, { start: 1000 });
+    expect(
+      candidates.find((c) => c.detector === "console_warning"),
+    ).toBeUndefined();
+  });
+
+  it("suppresses a hyphenated package prefix too", () => {
+    const events: BugEvent[] = [
+      {
+        t: 1000,
+        k: "con",
+        d: { lv: "warn", msg: "[crumbtrail-cloud] tenant over cap" },
+      },
+    ];
+    const candidates = buildEvidenceCandidates(events, { start: 1000 });
+    expect(
+      candidates.find((c) => c.detector === "console_warning"),
+    ).toBeUndefined();
+  });
+
+  it("does not surface an SDK console error as a console_error candidate", () => {
+    const candidates = buildEvidenceCandidates([], {
+      start: 1000,
+      consoleErrors: [
+        { t: 1000, msg: "[crumbtrail] capture failed to initialize" },
+      ],
+    });
+    expect(
+      candidates.find((c) => c.detector === "console_error"),
+    ).toBeUndefined();
+  });
+
+  it("still surfaces an application warning that merely mentions crumbtrail", () => {
+    const events: BugEvent[] = [
+      {
+        t: 1000,
+        k: "con",
+        d: { lv: "warn", msg: "failed to load crumbtrail config for checkout" },
+      },
+    ];
+    const candidates = buildEvidenceCandidates(events, { start: 1000 });
+    expect(
+      candidates.find((c) => c.detector === "console_warning"),
+    ).toBeDefined();
+  });
+});
+
 describe("buildEvidenceCandidates — backend crash titles", () => {
   function uncaught(t: number, error: Record<string, unknown>): BugEvent {
     return { t, k: "backend.uncaught", d: { error } };

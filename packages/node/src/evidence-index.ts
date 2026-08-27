@@ -822,6 +822,7 @@ export function buildEvidenceCandidates(
   }
 
   for (const entry of index.consoleErrors ?? []) {
+    if (isCrumbtrailSelfDiagnostic(entry.msg)) continue;
     drafts.push({
       detector: "console_error",
       title: `Console error: ${scrubText(entry.msg, 100) ?? "message unavailable"}`,
@@ -2665,6 +2666,26 @@ function spanCodeFrame(d: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+/**
+ * Crumbtrail's own console diagnostics, which are never a defect in the host
+ * application.
+ *
+ * The SDK reports its own degraded states through the console — a refused
+ * event batch, a CORS preflight that stripped the correlation headers, capture
+ * disabled by Global Privacy Control — and every one of those lines is
+ * prefixed with the package name. The console detectors scan raw console
+ * output, so without this they turn Crumbtrail's own "capture is not working"
+ * warning into a finding filed against the customer's app, at the exact moment
+ * the session has the least evidence to explain it. Suppress them here rather
+ * than at capture time: the events stay in the timeline, where they are the
+ * true explanation for a thin bundle, and only their promotion to a candidate
+ * signal is withheld.
+ */
+function isCrumbtrailSelfDiagnostic(message: string | undefined): boolean {
+  if (!message) return false;
+  return /^\s*\[crumbtrail(?:-[a-z0-9-]+)?\]/i.test(message);
+}
+
 function addConsoleWarningCandidates(
   events: BugEvent[],
   index: EvidenceIndexInput["index"],
@@ -2675,6 +2696,7 @@ function addConsoleWarningCandidates(
   for (const event of events) {
     if (event.k !== "con") continue;
     if (!safeText(event.d.lv, 20)?.toLowerCase().startsWith("warn")) continue;
+    if (isCrumbtrailSelfDiagnostic(consoleMessage(event.d))) continue;
     const message = scrubText(consoleMessage(event.d), 220);
     drafts.push({
       detector: "console_warning",
