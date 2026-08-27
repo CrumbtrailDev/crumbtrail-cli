@@ -667,6 +667,64 @@ export async function autoCapture(
     return establishing;
   };
 
+  /**
+   * The one way a non request lane (a runtime warning, a log line, a database
+   * diff) reaches the session.
+   *
+   * Every one of these used to read `if (!session) return`, which is where the
+   * silence came from: a database timeout raised during a Crumbtrail outage was
+   * discarded, and the session it belonged to was later graded complete. Now the
+   * event is held for the next live session, the dark session is nudged to
+   * re-establish behind its backoff gate, and anything that still cannot be kept
+   * is counted into the gap ledger.
+   */
+  const emitSessionEvent = (event: BugEvent): void => {
+    if (stopped) return;
+    const live = session;
+    if (!live) {
+      holdEvent(event);
+      // Self-heal for a backend that never calls console.error: these lanes are
+      // often the only ones producing evidence, so they must be able to trigger
+      // the re-establishment the console path triggers.
+      void ensureSession();
+      return;
+    }
+    void live.record(event).catch((sendErr) => {
+      holdEvent(event);
+      armBackoff(sendErr);
+      emitError(sendErr, { phase: "record", source: "console.error" });
+    });
+  };
+
+  // Zero-config DB capture. Installed BEFORE the initial handshake, and so
+  // before this function first yields, because the patch works by replacing the
+  // driver's exported factories: a pool the host builds at module load — the
+  // ordinary shape of a Node service — already exists by the time an await here
+  // resumes, and a factory swapped after that wraps nothing. Best-effort in the
+  // same sense as the rest of this module: a driver with an unexpected shape is
+  // reported, never fatal. Events ride the same headless session as everything
+  // else, and one emitted before the session is live is held for it, not dropped.
+  let dbInstrumentation: AutoInstrumentReport | undefined;
+  if (options.instrumentDatabases !== false) {
+    try {
+      dbInstrumentation = autoInstrumentDbClients({
+        emit: emitSessionEvent,
+        drivers: options.databaseDrivers,
+        resolve: options.databaseResolve,
+      });
+      const line = formatAutoInstrumentReport(dbInstrumentation);
+      // The success line stays behind `debug`: a healthy install is quiet. The
+      // "nothing was instrumented" line does NOT, because that is the sentence
+      // that explains a session with no database evidence in it, and leaving it
+      // behind a flag is what made that outcome look like a working install.
+      if (line && (debug || !autoInstrumentPatchedAnything(dbInstrumentation))) {
+        originalConsoleError.call(consoleRef, line);
+      }
+    } catch (error) {
+      emitError(error, { phase: "record", source: "console.error" });
+    }
+  }
+
   // Boot: attempt the initial handshake. On failure the hooks still install so
   // the host's crash semantics stay intact and a later capture can self-heal.
   await ensureSession();
@@ -787,35 +845,6 @@ export async function autoCapture(
       capturing = false;
       return undefined;
     }
-  };
-
-  /**
-   * The one way a non request lane (a runtime warning, a log line, a database
-   * diff) reaches the session.
-   *
-   * Every one of these used to read `if (!session) return`, which is where the
-   * silence came from: a database timeout raised during a Crumbtrail outage was
-   * discarded, and the session it belonged to was later graded complete. Now the
-   * event is held for the next live session, the dark session is nudged to
-   * re-establish behind its backoff gate, and anything that still cannot be kept
-   * is counted into the gap ledger.
-   */
-  const emitSessionEvent = (event: BugEvent): void => {
-    if (stopped) return;
-    const live = session;
-    if (!live) {
-      holdEvent(event);
-      // Self-heal for a backend that never calls console.error: these lanes are
-      // often the only ones producing evidence, so they must be able to trigger
-      // the re-establishment the console path triggers.
-      void ensureSession();
-      return;
-    }
-    void live.record(event).catch((sendErr) => {
-      holdEvent(event);
-      armBackoff(sendErr);
-      emitError(sendErr, { phase: "record", source: "console.error" });
-    });
   };
 
   // Keep the exact original reference so stop() can restore it identically.
@@ -1176,32 +1205,6 @@ export async function autoCapture(
     }
   }
 
-  // Zero-config DB capture. Installed AFTER the hooks so a driver patch can
-  // never delay crash instrumentation, and best-effort in the same sense as the
-  // rest of this module: a driver with an unexpected shape is reported, never
-  // fatal. Events ride the same headless session as everything else; when the
-  // session is dark the emit is dropped rather than queued, matching how a
-  // captured error behaves.
-  let dbInstrumentation: AutoInstrumentReport | undefined;
-  if (options.instrumentDatabases !== false) {
-    try {
-      dbInstrumentation = autoInstrumentDbClients({
-        emit: emitSessionEvent,
-        drivers: options.databaseDrivers,
-        resolve: options.databaseResolve,
-      });
-      const line = formatAutoInstrumentReport(dbInstrumentation);
-      // The success line stays behind `debug`: a healthy install is quiet. The
-      // "nothing was instrumented" line does NOT, because that is the sentence
-      // that explains a session with no database evidence in it, and leaving it
-      // behind a flag is what made that outcome look like a working install.
-      if (line && (debug || !autoInstrumentPatchedAnything(dbInstrumentation))) {
-        originalConsoleError.call(consoleRef, line);
-      }
-    } catch (error) {
-      emitError(error, { phase: "record", source: "console.error" });
-    }
-  }
 
   const stop = (): void => {
     if (stopped) return;
