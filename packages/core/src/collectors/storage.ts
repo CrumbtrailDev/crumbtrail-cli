@@ -165,7 +165,9 @@ export function storageCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
 ): CollectorCleanup {
-  const maxLen = config.storageValueMaxLength;
+  // Read per emit rather than snapshotted at install: a remote policy lowers this cap
+  // mid-session and the running collector is the one it has to reach.
+  const maxLen = (): number => config.storageValueMaxLength;
   const excludeKeys = new Set(config.storageExcludeKeys);
 
   const cookieSnap = redactCookieMap(
@@ -176,12 +178,12 @@ export function storageCollector(
   const localStorageSnap = redactStorageSnapshot(
     dumpStorage(localStorage, excludeKeys),
     "localStorage",
-    maxLen,
+    maxLen(),
   );
   const sessionStorageSnap = redactStorageSnapshot(
     dumpStorage(sessionStorage, excludeKeys),
     "sessionStorage",
-    maxLen,
+    maxLen(),
   );
 
   // --- Emit initial snap ---
@@ -280,7 +282,7 @@ export function storageCollector(
         "oldVal",
         redactStoredValue(storage.getItem(key), {
           key,
-          maxLength: maxLen,
+          maxLength: maxLen(),
           path: `${type}.${keyResult.value}.oldVal`,
         }),
       );
@@ -289,7 +291,7 @@ export function storageCollector(
         "newVal",
         redactStoredValue(value, {
           key,
-          maxLength: maxLen,
+          maxLength: maxLen(),
           path: `${type}.${keyResult.value}.newVal`,
         }),
       );
@@ -335,7 +337,7 @@ export function storageCollector(
         "oldVal",
         redactStoredValue(storage.getItem(key), {
           key,
-          maxLength: maxLen,
+          maxLength: maxLen(),
           path: `${type}.${keyResult.value}.oldVal`,
         }),
       );
@@ -482,7 +484,7 @@ export function storageCollector(
         "oldVal",
         redactStoredValue(event.oldValue, {
           key: event.key,
-          maxLength: maxLen,
+          maxLength: maxLen(),
           path: `${type}.${keyResult.value}.oldVal`,
         }),
       );
@@ -504,7 +506,7 @@ export function storageCollector(
         "oldVal",
         redactStoredValue(event.oldValue, {
           key: event.key,
-          maxLength: maxLen,
+          maxLength: maxLen(),
           path: `${type}.${keyResult.value}.oldVal`,
         }),
       );
@@ -513,7 +515,7 @@ export function storageCollector(
         "newVal",
         redactStoredValue(event.newValue, {
           key: event.key,
-          maxLength: maxLen,
+          maxLength: maxLen(),
           path: `${type}.${keyResult.value}.newVal`,
         }),
       );
@@ -534,19 +536,57 @@ export function storageCollector(
   window.addEventListener("storage", storageHandler);
 
   // --- Cleanup ---
+  // Each restore runs on its own. This cleanup undoes nine independent patches, and a host that
+  // has since frozen one of them throws on assignment. Sequentially, that first throw skipped
+  // every restore after it, leaving the rest of the collector patched in with no teardown left
+  // to remove it.
+  const step = (restore: () => void): boolean => {
+    try {
+      restore();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   return () => {
-    Storage.prototype.setItem = origProtoSetItem;
-    Storage.prototype.removeItem = origProtoRemoveItem;
-    Storage.prototype.clear = origProtoClear;
+    const results = [
+      step(() => {
+        Storage.prototype.setItem = origProtoSetItem;
+      }),
+      step(() => {
+        Storage.prototype.removeItem = origProtoRemoveItem;
+      }),
+      step(() => {
+        Storage.prototype.clear = origProtoClear;
+      }),
+      // Restore instance methods to their original bound functions
+      step(() =>
+        restoreStorageMethod(localStorage, "setItem", origLocalSetItem),
+      ),
+      step(() =>
+        restoreStorageMethod(localStorage, "removeItem", origLocalRemoveItem),
+      ),
+      step(() => restoreStorageMethod(localStorage, "clear", origLocalClear)),
+      step(() =>
+        restoreStorageMethod(sessionStorage, "setItem", origSessionSetItem),
+      ),
+      step(() =>
+        restoreStorageMethod(
+          sessionStorage,
+          "removeItem",
+          origSessionRemoveItem,
+        ),
+      ),
+      step(() =>
+        restoreStorageMethod(sessionStorage, "clear", origSessionClear),
+      ),
+      step(() => window.removeEventListener("storage", storageHandler)),
+    ];
 
-    // Restore instance methods to their original bound functions
-    restoreStorageMethod(localStorage, "setItem", origLocalSetItem);
-    restoreStorageMethod(localStorage, "removeItem", origLocalRemoveItem);
-    restoreStorageMethod(localStorage, "clear", origLocalClear);
-    restoreStorageMethod(sessionStorage, "setItem", origSessionSetItem);
-    restoreStorageMethod(sessionStorage, "removeItem", origSessionRemoveItem);
-    restoreStorageMethod(sessionStorage, "clear", origSessionClear);
-
-    window.removeEventListener("storage", storageHandler);
+    // Reported, not swallowed: the caller's teardown handler is what stops a half-restored
+    // collector from being installed over a second time.
+    if (results.some((ok) => !ok))
+      throw new Error("storage collector could not fully restore its patches");
   };
 }

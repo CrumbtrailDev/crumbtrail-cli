@@ -12,9 +12,10 @@ export function clipboardCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
 ): CollectorCleanup {
-  const maxLen = config.clipboardMaxLength;
-
   const handler = (event: Event) => {
+    // Read per event rather than snapshotted at install: a remote policy lowers this cap
+    // mid-session and the running collector is the one it has to reach.
+    const maxLen = config.clipboardMaxLength;
     const type = event.type as "copy" | "cut" | "paste";
     const target = resolveTarget(event);
     if (target && isBlocked(target)) return;

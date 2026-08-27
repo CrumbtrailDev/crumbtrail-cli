@@ -663,7 +663,9 @@ export function uiNumbersCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
 ): CollectorCleanup {
-  const denyFields = config.redaction?.denyFields;
+  // A getter rather than the array: a remote poll replaces `config.redaction` with a new object,
+  // so a snapshot taken here would keep scanning against the deny list the session started with.
+  const denyFields = (): string[] | undefined => config.redaction?.denyFields;
   if (
     typeof document === "undefined" ||
     typeof MutationObserver === "undefined"
@@ -693,7 +695,7 @@ export function uiNumbersCollector(
 
 function startUiNumbersCollector(
   bus: EventBus,
-  denyFields?: string[],
+  denyFields: () => string[] | undefined,
 ): CollectorCleanup {
   let disabled = false;
   let layoutPending = true;
@@ -758,7 +760,7 @@ function startUiNumbersCollector(
       const locale = readLocale();
       const scan = scanUiNumbers(
         document.body,
-        denyFields,
+        denyFields(),
         UI_NUM_MAX_SCAN_ELEMENTS,
         locale.lang,
       );

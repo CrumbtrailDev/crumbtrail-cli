@@ -173,6 +173,47 @@ const MAX_REMOTE_PROBES = 4;
  */
 const MAX_REMOTE_PROBE_ENTRIES = 64;
 
+/**
+ * Entries accepted in a remote string list (`network.excludeUrls`, `redaction.denyFields`).
+ * A longer list is refused whole: these are matched against every request and every field name,
+ * so an unbounded list is per-event work an unauthenticated response body chose for us.
+ */
+const MAX_REMOTE_STRING_LIST_ENTRIES = 256;
+
+/**
+ * Throttles a remote policy sets outright. Each one only decides how often an already-running
+ * collector emits, so neither direction changes what kind of data the application agreed to
+ * capture: a lower value is more of the same events, a higher one is fewer.
+ */
+const REMOTE_THROTTLE_KEYS = [
+  "keystrokeThrottleMs",
+  "scrollThrottleMs",
+] as const satisfies ReadonlyArray<keyof CrumbtrailConfig>;
+
+/**
+ * Size caps a remote policy may lower and never raise, applied as `min(remote, init)` in the
+ * same way as `networkMaxBodySize`.
+ *
+ * Each one bounds how much of a value rests inside an event — clipboard text, a storage value, a
+ * serialized state blob, a DOM snapshot. Raising one puts more of the user's own data in the
+ * payload than the init block agreed to, which is the definition of loosening, so the poll may
+ * only cut them down.
+ */
+const REMOTE_SIZE_LIMIT_KEYS = [
+  "clipboardMaxLength",
+  "storageValueMaxLength",
+  "stateMaxBytes",
+  "domSnapshotMaxBytes",
+] as const satisfies ReadonlyArray<keyof CrumbtrailConfig>;
+
+type RemoteSizeLimitKey = (typeof REMOTE_SIZE_LIMIT_KEYS)[number];
+
+/**
+ * Floor on `ringBufferMs` a remote policy may ask for. Retention below a second is not a
+ * recording window, it is an empty buffer with a flagged bug cut from nothing.
+ */
+const MIN_REMOTE_RING_BUFFER_MS = 1_000;
+
 const REMOTE_CONFIG_KEYS = [
   "captureSampleRate",
   "baselineSampleRate",
@@ -202,7 +243,84 @@ const REMOTE_CONFIG_KEYS = [
   "slowRequestWindowMs",
   "abandonedFlowWindowMs",
   "abandonedFlowMinInputs",
+  ...REMOTE_THROTTLE_KEYS,
 ] as const satisfies ReadonlyArray<keyof CrumbtrailConfig>;
+
+/**
+ * Collector switches a remote policy may turn on or off.
+ *
+ * Read from a nested `collectors` object rather than the top level, so a field named after a
+ * collector elsewhere in the response envelope cannot silently turn a collector off.
+ *
+ * `video`, `audio` and `widget` are deliberately absent: media capture and the on-screen widget
+ * are the host application's decision, not a policy dial.
+ */
+const REMOTE_COLLECTOR_KEYS = [
+  "console",
+  "network",
+  "interactions",
+  "keystrokes",
+  "scroll",
+  "visibility",
+  "clipboard",
+  "errors",
+  "performance",
+  "cookies",
+  "storage",
+  "heartbeat",
+  "uiNumbers",
+  "listeners",
+  "eventSource",
+  "webSocket",
+  "workers",
+  "environment",
+  "campaign",
+  "domSnapshot",
+] as const satisfies ReadonlyArray<keyof CrumbtrailConfig>;
+
+type RemoteCollectorKey = (typeof REMOTE_COLLECTOR_KEYS)[number];
+
+/**
+ * Collectors a switch can stop mid-session but cannot start again.
+ *
+ * Every collector in {@link COLLECTOR_MAP} tears down on demand, so OFF is always live. Starting
+ * again is the narrower claim, and one collector cannot make it:
+ *
+ * - `performance` observes with `buffered: true`, which is what reports the navigation and
+ *   paint entries that fired before init. A second instance therefore replays the whole load
+ *   timeline the first one already emitted, and its vitals finalizers (`inp`, `cls.score`,
+ *   `lcp.final`) ran at teardown, so a restart would rest a second, partial set of final scores
+ *   over the real ones. Turning it back on waits for the next page load, where those readings
+ *   are true again.
+ *
+ * A key in this set still stops immediately; only the ON edge is deferred.
+ */
+export const OFF_ONLY_COLLECTORS: ReadonlySet<string> = new Set([
+  "performance",
+]);
+
+/**
+ * The local values a remote policy is allowed to tighten but never loosen, snapshotted at
+ * `init()`. Held separately from the live config because the live config is what a poll writes
+ * to: comparing a second poll against an already-tightened value would let a sequence of polls
+ * ratchet a limit back up one step at a time.
+ */
+interface LocalCaptureFloor {
+  networkMaxBodySize: number;
+  networkExcludeUrls: readonly string[];
+  networkCaptureHeaders: boolean;
+  redactionMode: "structured" | "full";
+  redactionDenyFields: readonly string[];
+  sizeLimits: Readonly<Record<RemoteSizeLimitKey, number>>;
+  ringBufferMs: number;
+  ringBufferMaxEvents: number;
+  /**
+   * Each collector's switch as `init()` left it. A collector the application never turned on is
+   * data it never agreed to capture, so a poll may only switch one off, or switch one back on
+   * that an earlier poll switched off.
+   */
+  collectors: Readonly<Record<RemoteCollectorKey, boolean>>;
+}
 
 /**
  * Minimum spacing between severity-triggered flushes. An error storm must not
@@ -259,6 +377,32 @@ export class Crumbtrail {
   private ringBuffer: RingBuffer;
   private cleanups: CollectorCleanup[] = [];
   private config: CrumbtrailConfig;
+  private readonly localCaptureFloor: LocalCaptureFloor;
+  /**
+   * Collector switches the last poll changed. Read by
+   * {@link Crumbtrail.applyRemoteCollectorChanges} to start and stop collectors mid-session.
+   */
+  private remoteCollectorChanges: RemoteCollectorKey[] = [];
+  /**
+   * Teardown for each {@link COLLECTOR_MAP} collector currently installed, keyed by its config
+   * name. Held apart from `cleanups` — which is one flat list torn down only at `stop()` —
+   * because a policy switch has to reach exactly one collector's teardown and leave the rest
+   * running. Presence in this map is also what makes a start idempotent: a collector already in
+   * it is never installed a second time.
+   */
+  private collectorTeardowns = new Map<string, CollectorCleanup>();
+  /**
+   * Collectors whose teardown threw, for the rest of the session.
+   *
+   * A teardown that throws part way leaves its patches half-installed — some globals restored,
+   * some still wrapped — and nothing here can tell which. Installing that collector again would
+   * wrap the survivors a second time, so every request it sees is captured twice and the
+   * original is buried one layer deeper. Refusing the re-install keeps the session on the half
+   * that is still running rather than stacking a second copy on top of it.
+   */
+  private poisonedCollectors = new Set<string>();
+  /** The context handed to collectors at init, kept so a later start hands over the same one. */
+  private collectorContext?: CollectorContext;
   private sessionId: string;
   private widgetCleanup?: () => void;
   private stateProviders = new Map<string, () => unknown>();
@@ -340,6 +484,7 @@ export class Crumbtrail {
     sessionStore?: SessionStore,
   ) {
     this.config = config;
+    this.localCaptureFloor = readLocalCaptureFloor(config);
     this.bus = bus;
     this.transport = transport;
     this.ringBuffer = ringBuffer;
@@ -551,8 +696,7 @@ export class Crumbtrail {
       };
       const onVisibilityChange = () => {
         if (document.visibilityState === "hidden") {
-          if (config.endOnPageHide !== false)
-            instance.scheduleLifecycleClose();
+          if (config.endOnPageHide !== false) instance.scheduleLifecycleClose();
           return;
         }
         cancelLifecycleTimer();
@@ -574,10 +718,7 @@ export class Crumbtrail {
           typeof document !== "undefined" &&
           typeof document.removeEventListener === "function"
         ) {
-          document.removeEventListener(
-            "visibilitychange",
-            onVisibilityChange,
-          );
+          document.removeEventListener("visibilitychange", onVisibilityChange);
         }
       });
     }
@@ -598,14 +739,14 @@ export class Crumbtrail {
       whenCaptureAdmitted: (settle) => instance.whenCaptureAdmitted(settle),
     };
 
+    instance.collectorContext = collectorContext;
+
     instance.configureAutoFlagController();
     instance.startSessionIfAllowed();
     instance.emitSamplingGapIfNeeded();
 
-    for (const [key, collector] of Object.entries(COLLECTOR_MAP)) {
-      if (config[key as keyof CrumbtrailConfig]) {
-        instance.cleanups.push(collector(bus, config, collectorContext));
-      }
+    for (const key of Object.keys(COLLECTOR_MAP)) {
+      if (config[key as keyof CrumbtrailConfig]) instance.installCollector(key);
     }
 
     // Mount widget if enabled
@@ -633,8 +774,11 @@ export class Crumbtrail {
     // Provenance is the SDK's to state, never the caller's: anything reaching the public
     // entry point is a person asking for a report, so the internal fields are stripped
     // rather than trusted.
-    const { origin: _origin, autoReason: _autoReason, ...caller } = (options ??
-      {}) as InternalFlagOptions;
+    const {
+      origin: _origin,
+      autoReason: _autoReason,
+      ...caller
+    } = (options ?? {}) as InternalFlagOptions;
     return this.flagBugFromSource(
       options === undefined ? undefined : caller,
       true,
@@ -999,6 +1143,17 @@ export class Crumbtrail {
     applyRemoteSampling(this.config, settings);
     applyRemoteTailDuration(this.config, settings);
     applyRemoteConsentMode(this.config, settings);
+    // Limits before switches: a collector started on this poll reads the config at install, so
+    // the values it runs with have to be the ones the poll just carried.
+    applyRemoteNetworkLimits(this.config, settings, this.localCaptureFloor);
+    applyRemoteRedaction(this.config, settings, this.localCaptureFloor);
+    applyRemoteSizeLimits(this.config, settings, this.localCaptureFloor);
+    this.remoteCollectorChanges = applyRemoteCollectorSwitches(
+      this.config,
+      settings,
+      this.localCaptureFloor,
+    );
+    this.applyRemoteCollectorChanges();
 
     if (typeof settings.killSwitch === "boolean") {
       const changed = this.killSwitch !== settings.killSwitch;
@@ -1019,6 +1174,8 @@ export class Crumbtrail {
     )
       this.replayMasking = settings.replayMasking;
 
+    this.applyRemoteRingBufferBounds(settings);
+
     if (
       oldSampleRate !== this.config.captureSampleRate ||
       oldBaselineSampleRate !== this.config.baselineSampleRate
@@ -1036,6 +1193,137 @@ export class Crumbtrail {
       this.canCapture()
     )
       void this.flag({ tags: ["config:trigger"] });
+  }
+
+  /**
+   * Apply the ring buffer bounds a policy carries.
+   *
+   * Tighten-only against the init values: retention is memory the application budgeted for, so a
+   * policy may ask for less of it and never for more. Both bounds are validated here rather than
+   * left to the buffer, because `RingBuffer` and `EventBus` hold two ceilings on the same events
+   * and a value only one of them accepts leaves the pair disagreeing. An invalid value is
+   * refused, not coerced.
+   *
+   * Retention is the window a flagged bug is cut from, so a lowered bound has to reach the live
+   * buffer rather than the next session's: `setBounds` evicts on the spot, which is the point.
+   * The events it drops are gone from the report that would have carried them, so the eviction
+   * rests a `capture_gap` counting them — the same account a bus overflow gives.
+   */
+  private applyRemoteRingBufferBounds(settings: Record<string, unknown>): void {
+    const floor = this.localCaptureFloor;
+    const oldMs = this.config.ringBufferMs;
+    const oldMaxEvents = this.config.ringBufferMaxEvents;
+
+    const maxMs = readRemoteRingBufferMs(settings.ringBufferMs);
+    if (maxMs !== undefined)
+      this.config.ringBufferMs = Math.min(maxMs, floor.ringBufferMs);
+    const maxEvents = readRemoteRingBufferMaxEvents(
+      settings.ringBufferMaxEvents,
+    );
+    if (maxEvents !== undefined)
+      this.config.ringBufferMaxEvents = Math.min(
+        maxEvents,
+        floor.ringBufferMaxEvents,
+      );
+
+    if (
+      oldMs === this.config.ringBufferMs &&
+      oldMaxEvents === this.config.ringBufferMaxEvents
+    )
+      return;
+
+    const evicted = this.ringBuffer.setBounds({
+      maxMs: this.config.ringBufferMs,
+      maxEvents: this.config.ringBufferMaxEvents,
+    });
+    this.bus.setMaxBufferedEvents(this.config.ringBufferMaxEvents);
+    if (evicted === 0) return;
+    this.bus.emit(
+      buildCaptureGapEvent({
+        surface: "browser",
+        reason: "retention_reduced",
+        droppedEventCount: evicted,
+        sessionId: this.sessionId,
+      }),
+    );
+  }
+
+  /**
+   * Install one {@link COLLECTOR_MAP} collector and keep its teardown.
+   *
+   * Idempotent: a collector already installed is left alone rather than patched a second time.
+   * That is what keeps a policy that flips a switch on every poll — or an integrator toggling by
+   * hand — from stacking listeners, prototype patches and timers one copy per poll.
+   *
+   * A collector whose teardown once threw is refused outright for the rest of the session — see
+   * {@link Crumbtrail.poisonedCollectors}.
+   *
+   * Install failures are not caught here: at init a collector that cannot install is the same
+   * error it has always been. The mid-session caller guards its own call, because a poll must
+   * not take the session down over one collector.
+   */
+  private installCollector(key: string): void {
+    if (this.collectorTeardowns.has(key)) return;
+    if (this.poisonedCollectors.has(key)) return;
+    const collector = COLLECTOR_MAP[key];
+    const context = this.collectorContext;
+    if (!collector || !context) return;
+    this.collectorTeardowns.set(key, collector(this.bus, this.config, context));
+  }
+
+  /**
+   * Stop one collector and drop its teardown. Already-buffered events are untouched: the switch
+   * says what to capture from here, not what to forget.
+   */
+  private teardownCollector(key: string): void {
+    const teardown = this.collectorTeardowns.get(key);
+    if (!teardown) return;
+    // Deleted before the call so a teardown that throws still leaves the collector gone from
+    // the registry; otherwise `stop()` would run the same failing teardown a second time.
+    this.collectorTeardowns.delete(key);
+    try {
+      teardown();
+    } catch {
+      // One collector failing to tear down must not take the rest of the poll with it, the same
+      // reasoning the shutdown loop runs on. The throw is still recorded: the collector is now
+      // in an unknown state, so a later ON switch must not install a second copy over the half
+      // that survived. See `poisonedCollectors`.
+      this.poisonedCollectors.add(key);
+    }
+  }
+
+  /**
+   * Start and stop collectors for the switches the last poll moved.
+   *
+   * OFF is live for every collector. ON is live for every collector outside
+   * {@link OFF_ONLY_COLLECTORS} and deferred to the next page load for the ones in it — see that
+   * set for which and why. `campaign` and `domSnapshot` have no collector of their own:
+   * `domSnapshot` is read when a bug is flagged and so is already live, while `campaign` is
+   * read by the environment snapshot, which a session emits once.
+   */
+  private applyRemoteCollectorChanges(): void {
+    // Read, not drained: the field stays the record of what the last poll moved, which is what
+    // `applyRemoteCollectorSwitches` rewrites on every poll anyway.
+    const changed = this.remoteCollectorChanges;
+    if (changed.length === 0 || this.stopped) return;
+    for (const key of changed) {
+      if (!(key in COLLECTOR_MAP)) continue;
+      if (this.config[key] === true) {
+        if (OFF_ONLY_COLLECTORS.has(key)) continue;
+        try {
+          this.installCollector(key);
+        } catch {
+          // A collector that refuses to start mid-session leaves the session as it was.
+        }
+        continue;
+      }
+      this.teardownCollector(key);
+      // The environment collector's own teardown has nothing to undo — its work is one snapshot
+      // at install. The lane it opens is `envEmitted`, which is what lets `setEnv` rest deltas
+      // and a flag rest its snapshot, so clearing that here is what actually turns env capture
+      // off. A later ON re-installs, re-emits the snapshot and sets it again.
+      if (key === "environment") this.envEmitted = false;
+    }
   }
 
   /**
@@ -1343,11 +1631,7 @@ export class Crumbtrail {
    * the server cannot finalize an incomplete log.
    */
   private closeForLifecycle(immediateEnd: boolean): Promise<void> {
-    if (
-      this.stopped ||
-      this.lifecycleSuspended ||
-      this.lifecycleClosePromise
-    ) {
+    if (this.stopped || this.lifecycleSuspended || this.lifecycleClosePromise) {
       if (immediateEnd) this.startLifecycleEnd();
       return this.lifecycleClosePromise ?? Promise.resolve();
     }
@@ -1412,7 +1696,8 @@ export class Crumbtrail {
     if (this.stopped || !this.lifecycleSuspended) return undefined;
 
     this.sessionId = generateSessionId();
-    if (this.sessionStore) writePersistedSession(this.sessionStore, this.sessionId);
+    if (this.sessionStore)
+      writePersistedSession(this.sessionStore, this.sessionId);
     this.sessionStarted = false;
     this.lifecycleSuspended = false;
     this.sessionMetadataWrite = Promise.resolve();
@@ -1549,7 +1834,8 @@ export class Crumbtrail {
     });
     // Queued rather than emitted during teardown, and sent directly in stop().
     // Emitting both ways would duplicate the record.
-    if (this.stopped || this.lifecycleClosing) this.deferredDeliveryGaps.push(gap);
+    if (this.stopped || this.lifecycleClosing)
+      this.deferredDeliveryGaps.push(gap);
     else this.bus.emit(gap);
   }
 
@@ -1871,6 +2157,14 @@ export class Crumbtrail {
         // unguarded loop made all of that hostage to any collector's teardown.
       }
     }
+    // Registry collectors live in their own map so a policy switch can reach exactly one of
+    // them. At shutdown they are the same list, torn down after `cleanups` to keep the order
+    // init installed them in — the performance collector's finalizers still emit from here, so
+    // the severity tap and the flush below must both still be in place.
+    // `teardownCollector` guards each call, for the reason the loop above states, and removes
+    // the key as it goes, so a second stop() cannot run any of them twice.
+    for (const key of [...this.collectorTeardowns.keys()])
+      this.teardownCollector(key);
     // Every cleanup has now run, so the list holds nothing but closures over
     // collector state that the teardown just released. Dropped alongside the
     // ring buffer and the state providers below, and dropped here so a second
@@ -2258,6 +2552,180 @@ function applyRemoteMaskingMode(
   if (masking?.maskAllInputs === true) config.maskAllInputs = true;
 }
 
+function readLocalCaptureFloor(config: CrumbtrailConfig): LocalCaptureFloor {
+  const sizeLimits = {} as Record<RemoteSizeLimitKey, number>;
+  for (const key of REMOTE_SIZE_LIMIT_KEYS) sizeLimits[key] = config[key];
+  const collectors = {} as Record<RemoteCollectorKey, boolean>;
+  for (const key of REMOTE_COLLECTOR_KEYS)
+    collectors[key] = config[key] === true;
+  return {
+    networkMaxBodySize: config.networkMaxBodySize,
+    networkExcludeUrls: [...config.networkExcludeUrls],
+    networkCaptureHeaders: config.networkCaptureHeaders,
+    redactionMode: config.redaction?.mode ?? "structured",
+    redactionDenyFields: [...(config.redaction?.denyFields ?? [])],
+    sizeLimits,
+    ringBufferMs: config.ringBufferMs,
+    ringBufferMaxEvents: config.ringBufferMaxEvents,
+    collectors,
+  };
+}
+
+/**
+ * Apply the collector on/off switches a policy carries, and report which ones changed.
+ *
+ * Tighten-only, like every other field the poll can move. `false` always applies. `true` applies
+ * only to a collector the application itself turned on at `init()`, which makes it a restore of
+ * something an earlier poll switched off rather than a new capture surface. A `true` for a
+ * collector the application left off — keystrokes, clipboard, cookies — is a no-op: an
+ * unauthenticated response body must not be able to start capturing data the host never asked
+ * for.
+ *
+ * Every collector switch routes through here so the live start/stop has one place to hook from:
+ * the returned keys are exactly the collectors whose effective value moved on this poll, and
+ * {@link Crumbtrail.applyRemoteCollectorChanges} turns them into teardowns and installs.
+ */
+function applyRemoteCollectorSwitches(
+  config: CrumbtrailConfig,
+  settings: Record<string, unknown>,
+  floor: LocalCaptureFloor,
+): RemoteCollectorKey[] {
+  const collectors = asRecord(settings.collectors);
+  if (!collectors) return [];
+  const changed: RemoteCollectorKey[] = [];
+  for (const key of REMOTE_COLLECTOR_KEYS) {
+    const value = collectors[key];
+    if (typeof value !== "boolean" || config[key] === value) continue;
+    if (value && !floor.collectors[key]) continue;
+    Object.assign(config, { [key]: value });
+    changed.push(key);
+  }
+  return changed;
+}
+
+/**
+ * Apply the size caps a policy carries, each as `min(remote, init)`. A value above the init one
+ * leaves the init one standing, and the comparison is always against the init value so a
+ * sequence of polls cannot walk a cap back up one step at a time.
+ */
+function applyRemoteSizeLimits(
+  config: CrumbtrailConfig,
+  settings: Record<string, unknown>,
+  floor: LocalCaptureFloor,
+): void {
+  for (const key of REMOTE_SIZE_LIMIT_KEYS) {
+    const value = readDuration(settings[key]);
+    if (value === undefined) continue;
+    Object.assign(config, { [key]: Math.min(value, floor.sizeLimits[key]) });
+  }
+}
+
+/**
+ * The remote `ringBufferMs`, validated. A retention window is a whole number of milliseconds at
+ * or above {@link MIN_REMOTE_RING_BUFFER_MS}; anything else is refused rather than coerced.
+ */
+function readRemoteRingBufferMs(value: unknown): number | undefined {
+  return typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= MIN_REMOTE_RING_BUFFER_MS
+    ? value
+    : undefined;
+}
+
+/**
+ * The remote `ringBufferMaxEvents`, validated.
+ *
+ * A count of events is an integer of at least one: `0` is a buffer that holds nothing, `0.5` is
+ * not a count, and `9e15` is not a cap. {@link EventBus.setMaxBufferedEvents} already refuses
+ * anything at or below zero, so a value only the buffer accepted would leave the bus and the
+ * buffer holding different ceilings on the same events.
+ */
+function readRemoteRingBufferMaxEvents(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1
+    ? value
+    : undefined;
+}
+
+/**
+ * Apply the network capture limits a policy carries. Every one of them tightens only:
+ *
+ * - `maxBodySize` may lower the local ceiling, never raise it. A remote policy cannot make an
+ *   application store more of a request body than its own init block agreed to.
+ * - `excludeUrls` are added to the local list. Remote cannot drop a local exclusion, which is
+ *   how an application keeps its own endpoints out of capture regardless of policy.
+ * - `captureHeaders` may only turn header capture off. The config field is a single boolean
+ *   rather than a header allowlist, so "intersect with local" is the boolean AND of the two.
+ */
+function applyRemoteNetworkLimits(
+  config: CrumbtrailConfig,
+  settings: Record<string, unknown>,
+  floor: LocalCaptureFloor,
+): void {
+  const network = asRecord(settings.network);
+  const maxBodySize =
+    readDuration(network?.maxBodySize) ??
+    readDuration(settings.networkMaxBodySize);
+  if (maxBodySize !== undefined)
+    config.networkMaxBodySize = Math.min(maxBodySize, floor.networkMaxBodySize);
+
+  const excludeUrls =
+    readStringList(network?.excludeUrls) ??
+    readStringList(settings.networkExcludeUrls);
+  if (excludeUrls !== undefined)
+    config.networkExcludeUrls = [
+      ...new Set([...floor.networkExcludeUrls, ...excludeUrls]),
+    ];
+
+  const captureHeaders =
+    typeof network?.captureHeaders === "boolean"
+      ? network.captureHeaders
+      : typeof settings.networkCaptureHeaders === "boolean"
+        ? settings.networkCaptureHeaders
+        : undefined;
+  if (captureHeaders !== undefined)
+    config.networkCaptureHeaders =
+      floor.networkCaptureHeaders && captureHeaders;
+}
+
+/**
+ * Apply the redaction policy a policy carries, tighten-only in the same way as
+ * {@link applyRemoteMaskingMode}:
+ *
+ * - `denyFields` are added to the local deny list; a local entry can never be removed.
+ * - `mode` may move `"structured"` to `"full"`, never back. Local `"full"` stays `"full"`.
+ * - `captureInputValues` may only be turned off.
+ * - `keepFields` are ignored outright. A keep exempts a field from the deny rules, so honouring
+ *   one from a remote policy would be a response body widening what an application captures.
+ *
+ * `captureInputValues` is enforced by a module-level flag in `redaction.ts`, because the input
+ * redaction path is reached from places that never see a config object. Writing the config field
+ * alone would leave the flag at its init value and the tighten would be a silent no-op, so the
+ * flag is re-synced here from the value the config now holds.
+ */
+function applyRemoteRedaction(
+  config: CrumbtrailConfig,
+  settings: Record<string, unknown>,
+  floor: LocalCaptureFloor,
+): void {
+  const redaction = asRecord(settings.redaction);
+  if (!redaction) return;
+
+  const denyFields = readStringList(redaction.denyFields);
+  const mode = readString(redaction.mode);
+  const captureInputValues = redaction.captureInputValues;
+  const next = { ...config.redaction };
+
+  if (denyFields !== undefined)
+    next.denyFields = [
+      ...new Set([...floor.redactionDenyFields, ...denyFields]),
+    ];
+  if (mode === "full" || floor.redactionMode === "full") next.mode = "full";
+  if (captureInputValues === false) next.captureInputValues = false;
+
+  config.redaction = next;
+  setCaptureInputValues(next.captureInputValues);
+}
+
 function applyRemoteSampling(
   config: CrumbtrailConfig,
   settings: Record<string, unknown>,
@@ -2399,6 +2867,18 @@ function readString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+/**
+ * A list of non-empty strings, or nothing. One non-string entry refuses the whole field rather
+ * than salvaging the strings around it: a half-read exclusion list is a list that captures more
+ * than the policy asked for.
+ */
+function readStringList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  if (value.length > MAX_REMOTE_STRING_LIST_ENTRIES) return undefined;
+  if (value.some((entry) => typeof entry !== "string")) return undefined;
+  return (value as string[]).map((entry) => entry.trim()).filter(Boolean);
+}
+
 function readDuration(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? value
@@ -2480,6 +2960,7 @@ function hasRecognizedRemotePolicy(settings: Record<string, unknown>): boolean {
   if (typeof settings.respectGpc === "boolean") return true;
   if (hasRecognizedRemoteMasking(settings)) return true;
   if (hasRecognizedRemoteSampling(settings)) return true;
+  if (hasRecognizedRemoteCaptureSettings(settings)) return true;
   // `probes` is deliberately not one of these. Recognizing a policy is what sets
   // `remotePolicyReady`, which is what unblocks capture, so a response carrying nothing but a
   // probe request must not be able to grant itself the readiness its own results then ride on.
@@ -2511,6 +2992,61 @@ function hasRecognizedRemoteMasking(
       ].includes(mode.toLowerCase())) ||
     masking?.maskAllText === true ||
     masking?.maskAllInputs === true
+  );
+}
+
+/**
+ * Collector switches, network limits, redaction and the plain throttles. Recognized the same way
+ * as the older policy fields: a response carrying one of them is a policy, so it opens the
+ * capture gate rather than leaving the client waiting for the fallback timer.
+ */
+function hasRecognizedRemoteCaptureSettings(
+  settings: Record<string, unknown>,
+): boolean {
+  const collectors = asRecord(settings.collectors);
+  if (
+    collectors &&
+    REMOTE_COLLECTOR_KEYS.some((key) => typeof collectors[key] === "boolean")
+  )
+    return true;
+
+  const network = asRecord(settings.network);
+  if (
+    readDuration(network?.maxBodySize) !== undefined ||
+    readDuration(settings.networkMaxBodySize) !== undefined ||
+    readStringList(network?.excludeUrls) !== undefined ||
+    readStringList(settings.networkExcludeUrls) !== undefined ||
+    typeof network?.captureHeaders === "boolean" ||
+    typeof settings.networkCaptureHeaders === "boolean"
+  )
+    return true;
+
+  const redaction = asRecord(settings.redaction);
+  if (
+    redaction &&
+    (readStringList(redaction.denyFields) !== undefined ||
+      readString(redaction.mode) !== undefined ||
+      typeof redaction.captureInputValues === "boolean")
+  )
+    return true;
+
+  if (
+    REMOTE_THROTTLE_KEYS.some(
+      (key) => isRemoteConfigValue(key, settings[key]) === true,
+    )
+  )
+    return true;
+
+  if (
+    REMOTE_SIZE_LIMIT_KEYS.some(
+      (key) => readDuration(settings[key]) !== undefined,
+    )
+  )
+    return true;
+
+  return (
+    readRemoteRingBufferMs(settings.ringBufferMs) !== undefined ||
+    readRemoteRingBufferMaxEvents(settings.ringBufferMaxEvents) !== undefined
   );
 }
 

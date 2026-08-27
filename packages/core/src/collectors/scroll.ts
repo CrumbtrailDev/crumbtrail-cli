@@ -6,7 +6,6 @@ export function scrollCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
 ): CollectorCleanup {
-  const throttleMs = config.scrollThrottleMs;
   const lastEmit = new Map<string, number>();
   const lastPos = new Map<string, [number, number]>();
 
@@ -39,7 +38,9 @@ export function scrollCollector(
 
     const t = now();
     const lastTime = lastEmit.get(el) ?? 0;
-    if (t - lastTime < throttleMs) return;
+    // Read per event rather than snapshotted at install: a remote policy sets the throttle
+    // mid-session and the running collector is the one it has to reach.
+    if (t - lastTime < config.scrollThrottleMs) return;
 
     const prev = lastPos.get(el);
     const dir = prev ? getDirection(prev, pos) : "dn";

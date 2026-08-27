@@ -266,6 +266,137 @@ describe("autoCapture", () => {
     expect(events.some((e) => e.d.source === "unhandledRejection")).toBe(true);
   });
 
+  // --------------------------------------------------------------------------
+  // Never end a process Node itself would not have ended.
+  //
+  // Hooking uncaughtException/unhandledRejection suppresses Node's default
+  // terminate-on-crash, which hands capture a decision that belongs to the host.
+  // A service with its own crash handler keeps the process alive on purpose and
+  // recovers; exiting underneath it turns a recoverable fault into an outage
+  // caused by being observed.
+  // --------------------------------------------------------------------------
+
+  it("a host with no crash listener still gets Node's exit(1)", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl } = makeFetch();
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+      }),
+    );
+
+    proc.emit("uncaughtException", new Error("boom"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(proc.exit).toHaveBeenCalledWith(1);
+  });
+
+  it("a host that handles its own uncaughtException keeps its process", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+    // The shape this exists for: a worker that recovers from a crashed child
+    // (a Playwright browser pool, a Temporal activity) rather than dying.
+    const hostRecovered = vi.fn();
+    proc.on("uncaughtException", hostRecovered);
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+      }),
+    );
+
+    proc.emit("uncaughtException", new Error("recoverable"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(hostRecovered).toHaveBeenCalledTimes(1);
+    expect(proc.exit).not.toHaveBeenCalled();
+    // Deferring is not declining to capture: the crash is still recorded.
+    const events = eventsFrom(calls);
+    expect(events.some((e) => e.d.source === "uncaughtException")).toBe(true);
+  });
+
+  it("a host that handles its own unhandledRejection keeps its process", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl } = makeFetch();
+    proc.on("unhandledRejection", vi.fn());
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+      }),
+    );
+
+    proc.emit("unhandledRejection", new Error("rejected"), Promise.resolve());
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(proc.exit).not.toHaveBeenCalled();
+  });
+
+  it("a deferred crash leaves the next one capturable", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+    proc.on("uncaughtException", vi.fn());
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+      }),
+    );
+
+    // The re-entrancy guard exists for a process on its way down. A process the
+    // host kept alive is not on its way down, so a later crash is a NEW crash
+    // and latching the guard shut would silently stop capturing after the first.
+    proc.emit("uncaughtException", new Error("first"));
+    await new Promise((r) => setTimeout(r, 0));
+    proc.emit("uncaughtException", new Error("second"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    const messages = eventsFrom(calls)
+      .filter((e) => e.d.source === "uncaughtException")
+      .map((e) => (e.d.error as { message: string }).message);
+    expect(messages).toContain("first");
+    expect(messages).toContain("second");
+    expect(proc.exit).not.toHaveBeenCalled();
+  });
+
+  it("an explicit onCrashExit wins over the host's own listener", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl } = makeFetch();
+    const onCrashExit = vi.fn();
+    proc.on("uncaughtException", vi.fn());
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        onCrashExit,
+      }),
+    );
+
+    proc.emit("uncaughtException", new Error("boom"));
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Setting it is the host stating its crash semantics outright, so it is
+    // honoured rather than second-guessed against the listener list.
+    expect(onCrashExit).toHaveBeenCalledWith(1);
+    expect(proc.exit).not.toHaveBeenCalled();
+  });
+
   it("double-install guard: a second call is inert and does not re-patch", async () => {
     const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
     const consoleImpl = { error: vi.fn() };
@@ -847,7 +978,6 @@ describe("autoCapture", () => {
     expect(body.metadata).not.toHaveProperty("service");
   });
 
-
   // The Hono/pino case: a backend that logs through a logger and never crashes.
   // Before structured log capture existed this session came out completely
   // empty — the app's own statement of the cause was written to stdout and
@@ -893,9 +1023,9 @@ describe("autoCapture", () => {
     const logged = eventsFrom(calls).filter((ev) => ev.k === "backend.log");
     expect(logged).toHaveLength(1);
     expect(logged[0].d.level).toBe("error");
-    expect(
-      String((logged[0].d.error as { stack?: string }).stack),
-    ).toContain("fetchKeepaProduct");
+    expect(String((logged[0].d.error as { stack?: string }).stack)).toContain(
+      "fetchKeepaProduct",
+    );
     // The application's own logging is delivered unchanged.
     expect(written).toEqual([line]);
   });
@@ -920,7 +1050,9 @@ describe("autoCapture", () => {
     expect(stdout.write).toBe(originalWrite);
     stdout.write('{"level":50,"msg":"ignored"}\n');
     await new Promise((resolve) => setImmediate(resolve));
-    expect(eventsFrom(calls).filter((ev) => ev.k === "backend.log")).toEqual([]);
+    expect(eventsFrom(calls).filter((ev) => ev.k === "backend.log")).toEqual(
+      [],
+    );
   });
 
   it("restores console.error and removes hooks on stop()", async () => {
