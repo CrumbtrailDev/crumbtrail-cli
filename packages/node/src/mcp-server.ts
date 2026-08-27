@@ -1034,7 +1034,7 @@ const TOOLS = [
   {
     name: "recordClientNote",
     description:
-      "Write down something durable you learned about this client so the next agent does not rediscover it: a gotcha, a constraint, an environment fact, a preference, or a fix that was tried and rejected. These are what recallIssueContext returns as cautions. Writes only to Crumbtrail's own memory, never to the user's app, tickets or external systems. The note id is DERIVED from scope, kind and slug, so writing the same note twice AMENDS the first one and never creates a second row: pick a stable slug. Three refusals are normal and each means something specific. 409 near_match: a note that already says roughly this exists — read the candidates and either amend one of them, or, if yours really is distinct, resend with confirmDistinct AND distinctBecause saying why (the flag alone is refused, on purpose). 409 cap_reached: the active note cap is full; archive one in the dashboard first. Notes REFUSE at their cap rather than evicting, because evicting a warning is the exact failure this exists to prevent. 503 guard_unavailable: the near-match guard could not run, so the create was refused rather than let through unguarded. A rejected_solution note additionally requires subjectMemoryId and flips that memory row out of future precedent results. Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
+      "Write down something durable you learned about this client so the next agent does not rediscover it: a gotcha, a constraint, an environment fact, a preference, or a fix that was tried and rejected. These are what recallIssueContext returns as cautions. Writes only to Crumbtrail's own memory, never to the user's app, tickets or external systems. The note id is DERIVED from scope, kind and slug, so writing the same note twice AMENDS the first one and never creates a second row: pick a stable slug. Three refusals are normal and each means something specific. 409 near_match: a note that already says roughly this exists — read the candidates and either amend one of them, or, if yours really is distinct, resend with confirmDistinct AND distinctBecause saying why (the flag alone is refused, on purpose). 409 cap_reached: the active note cap is full; archive one in the dashboard first. Notes REFUSE at their cap rather than evicting, because evicting a warning is the exact failure this exists to prevent. 503 guard_unavailable: the near-match guard could not run, so the create was refused rather than let through unguarded. A rejected_solution note additionally requires subjectMemoryId and flips that memory row out of future precedent results. That row must belong to the same project as the note, so one further refusal applies to this kind alone. 404 subject_memory_missing: the id is unknown, or it sits outside this note's project. Requires a cloud deployment with an agent token (CRUMBTRAIL_CLOUD_URL + CRUMBTRAIL_CLOUD_TOKEN); returns a gap when unconfigured.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1080,7 +1080,10 @@ const TOOLS = [
         subjectMemoryId: {
           type: "string",
           description:
-            "Required for kind 'rejected_solution': the memory row whose fix is being rejected. It is flipped out of future precedent results in the same transaction as this note.",
+            "Required for kind 'rejected_solution': the memory row whose fix is being rejected. It is flipped out of future precedent results in the same transaction as this note. " +
+            "The row must belong to the same project as the note. A general scope note carries no project and may flip any row in the tenant. " +
+            "A 404 subject_memory_missing answers both an id that does not exist and an id in another project, deliberately the same answer for both, so the error cannot be used to find out which rows exist in projects you cannot see. " +
+            "On that 404, check the project the note and the memory row belong to rather than reporting a product bug.",
         },
         axisLocation: {
           type: "string",
