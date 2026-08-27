@@ -271,6 +271,6 @@ describe("autoInstrumentDbClients with postgres.js", () => {
     const line = formatAutoInstrumentReport(report);
     expect(line).toContain("no database driver was instrumented");
     // The one thing that fixes it, in the place the reader is already looking.
-    expect(line).toContain("instrumentPostgresSql");
+    expect(line).toContain("instrumentDatabaseClient");
   });
 });

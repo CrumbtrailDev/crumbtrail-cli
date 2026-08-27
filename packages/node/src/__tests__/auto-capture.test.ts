@@ -5,6 +5,7 @@ import {
   autoCapture,
   __resetAutoCaptureInstallForTests,
 } from "../auto-capture";
+import { runInBackendRequestContext } from "../request-context";
 import type { AutoCaptureHandle } from "../auto-capture";
 
 // A minimal stand-in for `process` the hooks attach to. It is a real
@@ -1292,5 +1293,61 @@ describe("autoCapture completeness ledger", () => {
     expect(body.metadata?.process?.pid).toBe(99);
     expect(body.metadata?.process?.uptimeMs).toBe(12_500);
     expect(body.metadata?.process?.node).toBe("v24.0.0");
+  });
+  // The regression this pins: DB instrumentation used to be installed after the
+  // initial handshake, so the driver factories were only replaced once a network
+  // round trip had finished. A host that builds its pool at module load — the
+  // ordinary shape of a Node service — had already built it, and the swapped
+  // factory wrapped nothing. Creating the pool here without awaiting autoCapture
+  // reproduces that timing exactly.
+  it("patches DB drivers before it first yields, so a pool built at import time is wrapped", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+    const executed: string[] = [];
+    class Client {
+      async query(text: unknown): Promise<{ rows: unknown[]; rowCount: number }> {
+        executed.push(String(text));
+        return { rows: [{ id: 1, total: 10 }], rowCount: 1 };
+      }
+    }
+    class Pool extends Client {}
+    const pgModule: Record<string, unknown> = { Client, Pool };
+
+    const pending = autoCapture({
+      endpoint: ENDPOINT,
+      service: "svc",
+      processImpl: proc,
+      consoleImpl: { error: vi.fn() } as unknown as Console,
+      fetchImpl,
+      onCrashExit: () => {},
+      databaseDrivers: ["pg"],
+      databaseResolve: (specifier: string) => {
+        if (specifier === "pg") return pgModule;
+        const error = new Error(`Cannot find module '${specifier}'`);
+        (error as NodeJS.ErrnoException).code = "MODULE_NOT_FOUND";
+        throw error;
+      },
+    });
+
+    // The host's own module graph is still evaluating: the handshake has not
+    // resolved, and this is the only chance the patch gets.
+    const PatchedPool = pgModule.Pool as new () => {
+      query(text: string): Promise<unknown>;
+    };
+    const pool = new PatchedPool();
+
+    track(await pending);
+    // Statements carry evidence only inside a request scope, which is what a
+    // recorder establishes for a real request.
+    await runInBackendRequestContext(
+      { requestId: "req_1", sessionId: "sess_1", sessionIdSource: "header" },
+      () => pool.query("UPDATE carts SET total = 10 WHERE id = 1"),
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    // The host's statement still ran, and it carried evidence with it.
+    expect(executed.some((sql) => sql.includes("UPDATE carts"))).toBe(true);
+    const kinds = eventsFrom(calls).map((e) => e.k);
+    expect(kinds.some((k) => k.startsWith("db"))).toBe(true);
   });
 });

@@ -122,6 +122,12 @@ export {
   buildDbDiffEvent,
   buildDbReadBulkEvent,
   buildDbReadEvent,
+  // The explicit path for a client automatic instrumentation cannot reach: one
+  // the host already built, or a driver in an ESM graph the factory patch does
+  // not see. Routes to the running capture, in any call order.
+  instrumentDatabaseClient,
+  type InstrumentableDriver,
+  type InstrumentDatabaseClientOptions,
   instrumentMssqlPool,
   instrumentMysqlClient,
   instrumentPgClient,

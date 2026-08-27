@@ -15,6 +15,11 @@ export {
 } from "./auto-instrument";
 export { captureDbCallsite, type DbCallsite } from "./callsite";
 export {
+  instrumentDatabaseClient,
+  type InstrumentableDriver,
+  type InstrumentDatabaseClientOptions,
+} from "./instrument-client";
+export {
   DEFAULT_SENSITIVE_DB_COLUMNS,
   buildSensitiveColumnSet,
   redactColumns,
