@@ -106,8 +106,8 @@ export interface RecipeMeta {
 
 // Framework public-env references. Vite-based client stacks (SvelteKit, Nuxt,
 // Remix/RR7, Astro, vite-spa) read `import.meta.env`; Next uses `process.env`
-// with its NEXT_PUBLIC_ prefix; Expo/React Native uses EXPO_PUBLIC_. Backend-JS
-// reads a plain server var.
+// with its NEXT_PUBLIC_ prefix; CRA uses `process.env` with REACT_APP_;
+// Expo/React Native uses EXPO_PUBLIC_. Backend-JS reads a plain server var.
 const VITE_KEY: KeyRef = {
   envVar: "VITE_CRUMBTRAIL_KEY",
   expr: "import.meta.env.VITE_CRUMBTRAIL_KEY",
@@ -121,6 +121,14 @@ const NEXT_KEY: KeyRef = {
 const ASTRO_KEY: KeyRef = {
   envVar: "PUBLIC_CRUMBTRAIL_KEY",
   expr: "import.meta.env.PUBLIC_CRUMBTRAIL_KEY",
+  bundlerInlined: true,
+};
+// Create React App / craco. Webpack's DefinePlugin substitutes REACT_APP_*
+// vars into the bundle at build time, and only that prefix — an unprefixed name
+// is silently dropped, leaving a wired app that captures nothing.
+const CRA_KEY: KeyRef = {
+  envVar: "REACT_APP_CRUMBTRAIL_KEY",
+  expr: "process.env.REACT_APP_CRUMBTRAIL_KEY",
   bundlerInlined: true,
 };
 const EXPO_KEY: KeyRef = {
@@ -287,6 +295,13 @@ export const RECIPE_REGISTRY: Record<Recipe, RecipeMeta> = {
     serviceName: "web",
     kind: "inject",
     keyRef: VITE_KEY,
+  },
+  cra: {
+    stack: "react",
+    sdkPackages: ["crumbtrail-core"],
+    serviceName: "web",
+    kind: "inject",
+    keyRef: CRA_KEY,
   },
   nestjs: {
     stack: "node", // no "nestjs" Stack id — node is the backend-JS stack
