@@ -824,6 +824,46 @@ function stripUrlQueries(source: string): string {
 }
 
 /**
+ * Replaces every value-like segment of a URL path inside a text with `:id`,
+ * using {@link isValueLikeRouteSegment} — the same rule
+ * {@link normalizeRecurrenceRoute} applies to the `route` field.
+ *
+ * A backend log line names its endpoint in the MESSAGE, and often carries no
+ * route at all, so a resource id inside that path was the only thing telling
+ * two occurrences of one fault apart. `SP-API throttled (429)
+ * /products/fees/v0/items/B07VBB6HTX/feesEstimate` and the same line for
+ * `B0GK35JP5Q` minted two issues, because digit-run collapse alone leaves
+ * `b#vbb#htx` next to `b#gk#jp#q`. Templating the path first makes both
+ * `/products/fees/:id/items/:id/feesestimate`, which is one bug.
+ *
+ * The origin is left alone: a host is not a path, and its segments are not
+ * resource ids.
+ *
+ * This is the second deliberate divergence from the cloud's
+ * `normalizeIncidentText`, after the HTTP status exception. The cloud replaces
+ * an absolute url wholesale; here a path is identity, so it is templated rather
+ * than removed. The point of using the route rule verbatim is that one endpoint
+ * keys the same whether it reached identity as a route or inside a message.
+ *
+ * A version segment (`v0`, `v2`) is value-like under that shared rule and
+ * collapses with everything else. That is not new behaviour introduced here:
+ * {@link normalizeRecurrenceRoute} has always merged two versions of one
+ * endpoint, and applying a second, narrower rule to the same path in a
+ * different field would mean one endpoint keying two ways.
+ */
+function templateUrlPaths(source: string): string {
+  return source.replace(URL_LIKE_TOKEN, (token) => {
+    const origin = /^https?:\/\/[^/]*/i.exec(token)?.[0] ?? "";
+    const path = token.slice(origin.length);
+    const templated = path
+      .split("/")
+      .map((segment) => (isValueLikeRouteSegment(segment) ? ":id" : segment))
+      .join("/");
+    return `${origin}${templated}`;
+  });
+}
+
+/**
  * An HTTP status code named in the text, together with the phrasing that makes
  * it a status code rather than a quantity: `HTTP 403`, `HTTP/1.1 500`,
  * `status 404`, `status code 502`, `code: 401`, `returned 503`,
@@ -882,7 +922,7 @@ function unshieldDigits(text: string): string {
  */
 function normalizeRecurrenceText(source: string): string {
   return unshieldDigits(
-    stripVolatileValues(stripUrlQueries(source).toLowerCase())
+    stripVolatileValues(templateUrlPaths(stripUrlQueries(source)).toLowerCase())
       .replace(/\[redacted(?::[^\]]*)?\]/g, "")
       .replace(
         HTTP_STATUS_IN_TEXT,
