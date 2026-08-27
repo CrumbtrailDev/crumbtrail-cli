@@ -709,6 +709,13 @@ export async function autoCapture(
     try {
       dbInstrumentation = autoInstrumentDbClients({
         emit: emitSessionEvent,
+        // The bridge to the request the statement ran inside. Without it every
+        // wrapped driver reads an undefined request id and hands the statement
+        // straight back to the host, so a correctly patched pool still produced
+        // no evidence — the instrumentation was installed and inert. Resolved
+        // per statement, because the scope is AsyncLocalStorage state that only
+        // exists once a request is in flight.
+        getRequestId: () => readRequestCorrelation()?.requestId,
         drivers: options.databaseDrivers,
         resolve: options.databaseResolve,
       });
