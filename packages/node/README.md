@@ -367,6 +367,38 @@ sourced); `captureReads: true` opts into capped `db.read` row capture. The event
 `primary_window.db_diffs` in the fix-context bundle, and feed session db differencing across
 all engines. Per-engine wiring examples: `docs/integrations/databases.md`.
 
+### Which clients get instrumented
+
+`autoCapture` instruments for you: it replaces the exported factories of every driver above
+that the app actually depends on (`instrumentDatabases: false` opts out). Because it works by
+replacing a factory, it covers the clients created after it runs — the patch is applied before
+`autoCapture` first yields, so a pool built while the app's own modules are still loading is
+covered, provided `autoCapture` was called first.
+
+Two cases fall outside that, and both are reported by name at startup rather than left to look
+like a working install:
+
+- a client the host already holds when capture starts
+- postgres.js loaded as an ES module, where the copy the app imported is not the copy the
+  CommonJS patch replaced (reported as `esm-unreachable`)
+
+For both, instrument it yourself. The call routes to the running capture and its request scope,
+and is safe in any order relative to `autoCapture`:
+
+```ts
+import { instrumentDatabaseClient } from "crumbtrail-node";
+
+export const sql = instrumentDatabaseClient(postgres(process.env.DATABASE_URL));
+```
+
+The driver is detected from the client's shape; pass `{ driver: "postgres" }` if a wrapper makes
+that ambiguous. An unrecognised client is returned untouched rather than wrapped as the wrong
+driver.
+
+Statements record evidence only inside a request scope, since `requestId` is what puts a write in
+the same evidence window as the request that issued it. Work outside any request — a cron tick, a
+queue worker — is not captured by this.
+
 ### Callsites: which line issued the write
 
 `captureCallsite: true` adds `callsite` to every `db.diff`: the innermost host frame plus the

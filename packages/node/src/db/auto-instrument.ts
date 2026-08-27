@@ -410,7 +410,7 @@ function patchPostgresJs(
       status: "esm-unreachable",
       detail:
         "the app loads postgres.js as an ES module, a separate copy from the " +
-        "one wrapped here; call instrumentPostgresSql(sql) on your pool",
+        "one wrapped here; call instrumentDatabaseClient(sql) on your client",
     };
   }
   return { driver: "postgres", status: "patched" };

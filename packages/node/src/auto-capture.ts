@@ -4,6 +4,7 @@ import {
   startHeadlessSession,
   type HeadlessSession,
 } from "./headless-session";
+import { clearActiveDbSink, setActiveDbSink } from "./db/active-sink";
 import {
   autoInstrumentDbClients,
   autoInstrumentPatchedAnything,
@@ -704,6 +705,16 @@ export async function autoCapture(
   // same sense as the rest of this module: a driver with an unexpected shape is
   // reported, never fatal. Events ride the same headless session as everything
   // else, and one emitted before the session is live is held for it, not dropped.
+  // Published before the factory patch, and independently of it: a host that
+  // instruments a client itself — because it already built one, or because its
+  // driver lives in an ESM graph the patch cannot reach — routes through this
+  // same sink and request scope.
+  const dbSink = {
+    emit: emitSessionEvent,
+    getRequestId: () => readRequestCorrelation()?.requestId,
+  };
+  setActiveDbSink(dbSink);
+
   let dbInstrumentation: AutoInstrumentReport | undefined;
   if (options.instrumentDatabases !== false) {
     try {
@@ -715,7 +726,7 @@ export async function autoCapture(
         // no evidence — the instrumentation was installed and inert. Resolved
         // per statement, because the scope is AsyncLocalStorage state that only
         // exists once a request is in flight.
-        getRequestId: () => readRequestCorrelation()?.requestId,
+        getRequestId: dbSink.getRequestId,
         drivers: options.databaseDrivers,
         resolve: options.databaseResolve,
       });
@@ -1238,6 +1249,7 @@ export async function autoCapture(
     logCapture?.stop();
     httpCapture?.stop();
     outboundCapture?.stop();
+    clearActiveDbSink(dbSink);
     dbInstrumentation?.restore();
     installed = false;
     installedService = undefined;
