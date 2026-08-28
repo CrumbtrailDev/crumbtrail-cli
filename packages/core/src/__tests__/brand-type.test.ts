@@ -8,11 +8,11 @@ const REPO = path.resolve(__dirname, "../../../..");
 /**
  * Every surface in this repository that renders type outside a page the design
  * system styles. Each one used to name its own system stack; a literal here is
- * how that comes back.
+ * how that comes back. crumbtrail-node left this list when it became backend
+ * capture only and stopped serving any HTML.
  */
 const SURFACES = [
   "packages/core/src/widget/styles.ts",
-  "packages/node/src/server.ts",
   "packages/cli/src/auth.ts",
 ];
 
