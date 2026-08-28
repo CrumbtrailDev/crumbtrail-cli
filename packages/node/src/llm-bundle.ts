@@ -742,6 +742,8 @@ export interface LlmBundleDbRead {
    * boolean grouping produces a perfectly correct-looking row from a perfectly successful query.
    */
   shape?: string;
+  /** Where the application issued this SELECT, when opted-in capture found an application frame. */
+  callsite?: LlmBundleDbCallsite;
   requestId?: string;
 }
 
@@ -789,6 +791,8 @@ export interface LlmBundleDbError {
   shape: string;
   code: string | null;
   errorName: string;
+  /** Where the application issued this statement, when capture found an application frame. */
+  callsite?: LlmBundleDbCallsite;
   requestId?: string;
 }
 
@@ -3030,6 +3034,7 @@ function buildDatabaseReads(
         // id as a long opaque token and redacts it, which collapses every read
         // into one bucket and makes per-request fan-out uncountable. `db.diff`
         // has always used the correlation-aware path; reads are the same field.
+        callsite: normalizeDbCallsite(event.d.callsite),
         requestId: safeCorrelationId(event.d.requestId, 200),
       }) as LlmBundleDbRead,
     );
@@ -3094,6 +3099,7 @@ function buildDatabaseErrors(
         // correlation-style identifier rather than through the prose-shaped path.
         code: safeCorrelationId(event.d.code, 64) ?? null,
         errorName: safeText(event.d.errorName, 120) ?? "UnknownError",
+        callsite: normalizeDbCallsite(event.d.callsite),
         requestId: safeCorrelationId(event.d.requestId, 200),
       }) as LlmBundleDbError,
     );

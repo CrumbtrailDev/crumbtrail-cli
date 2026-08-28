@@ -16,6 +16,7 @@ import {
   isRecord,
   pkKey,
   type InstrumentDbClientOptions,
+  type ReadCallsitesByRequest,
 } from "./instrument-shared";
 
 /**
@@ -480,6 +481,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
   const readStatementsByRequest = new Map<string, number>();
+  const readCallsitesByRequest: ReadCallsitesByRequest = new Map();
 
   // `request` is the RAW mssql request that already has the host's inputs bound; `recordedInputs` are
   // the same inputs captured for replay onto fresh requests. Fresh requests always come from the RAW
@@ -530,7 +532,9 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
             rowCount: rowCountFromResult(result, rows.length),
             options,
             emittedReadRowsByRequest,
+            readCallsitesByRequest,
             readStatementsByRequest,
+            statement: sql,
           });
         } catch (error) {
           emitGap(options, { reason: "capture_exception", error });

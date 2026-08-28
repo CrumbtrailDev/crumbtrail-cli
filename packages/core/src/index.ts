@@ -63,6 +63,7 @@ export type {
   BugReport,
   CollectorCleanup,
   CollectorContext,
+  DbCallsite,
   DbDiffEventData,
   DbDiffBulkEventData,
   DbDiffOp,

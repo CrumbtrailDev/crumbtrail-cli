@@ -10,7 +10,11 @@ import {
   type DbStatementOp,
   normalizeStatementShape,
 } from "crumbtrail-core";
-import { captureDbCallsite } from "./callsite";
+import {
+  appFramesFromStack,
+  captureDbCallsite,
+  type DbCallsite,
+} from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import { buildDbDiffEvent } from "./diff-event";
 import { buildDbErrorEvent } from "./error-event";
@@ -31,6 +35,27 @@ import {
 export const DEFAULT_MAX_ROWS_PER_STATEMENT = 100;
 export const DEFAULT_MAX_READ_ROWS_PER_STATEMENT = 25;
 export const DEFAULT_MAX_READ_ROWS_PER_REQUEST = 100;
+/**
+ * Maximum distinct statement shapes that capture a stack in one request.
+ *
+ * The budget is per REQUEST and per PROCESS, not per instrumented client. A cap
+ * held in a map owned by `instrumentPgClient` is multiplied by however many
+ * clients an application instruments — a pool wrapper per tenant, a read replica
+ * beside a primary — and a bound that a caller can multiply by construction is
+ * not a bound. Both lanes draw on the same budget for the same reason: a refused
+ * statement is rare in a healthy process and continuous in a broken one, which
+ * is exactly when nothing should be capturing an unbounded number of stacks.
+ */
+export const DEFAULT_MAX_CALLSITES_PER_REQUEST = 8;
+
+/**
+ * How many requests keep a callsite budget before the oldest is dropped.
+ *
+ * The map is keyed by request id, and request ids are unbounded over a process's
+ * life. Every per-request map beside this one has the same shape and the same
+ * hole; this one is bounded because it holds objects rather than counters.
+ */
+const MAX_TRACKED_CALLSITE_REQUESTS = 256;
 
 /**
  * Options accepted by every `instrument*` adapter. Every field is engine-agnostic; the Postgres
@@ -57,9 +82,10 @@ export interface InstrumentDbClientOptions {
   /** Extra sensitive column names dropped on top of the defaults. */
   redactColumns?: readonly string[];
   /**
-   * Capture the host application callsite (file, line) that issued each write and
-   * ride it along on the `db.diff`. Off by default: this costs one stack capture
-   * per mutating query. Set `callsiteRoot` to make the path repo-relative.
+   * Capture the host application callsite (file, line) that issued database work and ride it on
+   * the event. Refused statements always capture one; successful reads capture only when this is
+   * enabled. Writes and reads are otherwise off by default. Set `callsiteRoot` to make the path
+   * repo-relative.
    */
   captureCallsite?: boolean;
   callsiteRoot?: string;
@@ -226,6 +252,106 @@ export function normalizeReadCap(
   if (value === undefined) return fallback;
   if (!Number.isFinite(value)) return fallback;
   return Math.max(0, Math.floor(value));
+}
+
+export type ReadCallsitesByRequest = Map<
+  string,
+  Map<string, DbCallsite | undefined>
+>;
+
+/**
+ * The thrown error's own origin, which survives an async rejection where the
+ * catch site does not.
+ *
+ * Two refusals are deliberate. A stack this SDK did not produce is not evidence
+ * of where the statement was issued — `error.stack` is an ordinary writable
+ * property and a driver, a wrapper, or user code may set it to anything — so a
+ * stack that yields no frame is reported as no callsite rather than trusted
+ * further. And there is no fallback to the catch site: the catch sits inside
+ * this instrumentation or inside the driver, so capturing it would publish a
+ * location that is confidently not the one a reader wants. Absent is the honest
+ * answer, and `code-locations` already refuses a guess by name.
+ */
+function captureDbErrorCallsite(
+  error: unknown,
+  root: string | undefined,
+): DbCallsite | undefined {
+  const stack =
+    error instanceof Error
+      ? error.stack
+      : isRecord(error) && typeof error.stack === "string"
+        ? error.stack
+        : undefined;
+  if (typeof stack !== "string" || stack.length === 0) return undefined;
+  return appFramesFromStack(stack, root ?? process.cwd(), 1)[0];
+}
+
+/**
+ * One callsite budget for the whole process, shared by every instrumented
+ * client and by both the refused-statement and successful-read lanes.
+ */
+const callsiteBudget: ReadCallsitesByRequest = new Map();
+
+/** True while this request still has room for another distinct statement shape. */
+function claimCallsiteBudget(requestId: string, shape: string | undefined) {
+  let byShape = callsiteBudget.get(requestId);
+  if (!byShape) {
+    if (callsiteBudget.size >= MAX_TRACKED_CALLSITE_REQUESTS) {
+      // Insertion-ordered, so the first key is the oldest request tracked.
+      const oldest = callsiteBudget.keys().next();
+      if (!oldest.done) callsiteBudget.delete(oldest.value);
+    }
+    byShape = new Map();
+    callsiteBudget.set(requestId, byShape);
+  }
+  const key = shape ?? "";
+  return {
+    seen: byShape.has(key),
+    cached: byShape.get(key),
+    full: byShape.size >= DEFAULT_MAX_CALLSITES_PER_REQUEST,
+    remember(callsite: DbCallsite | undefined) {
+      byShape.set(key, callsite);
+      return callsite;
+    },
+  };
+}
+
+/** Test seam: the budget is process-wide, so a suite must be able to clear it. */
+export function resetCallsiteBudgetForTests(): void {
+  callsiteBudget.clear();
+}
+
+/** Captures once per normalized statement shape and caches an absent application frame too. */
+function readCallsiteFor(
+  options: InstrumentDbClientOptions,
+  requestId: string,
+  shape: string | undefined,
+  _readCallsitesByRequest: ReadCallsitesByRequest,
+): DbCallsite | undefined {
+  if (!options.captureCallsite) return undefined;
+  const slot = claimCallsiteBudget(requestId, shape);
+  if (slot.seen) return slot.cached;
+  if (slot.full) return undefined;
+  return slot.remember(captureDbCallsite(options.callsiteRoot));
+}
+
+/**
+ * A refused statement's callsite, drawn from the same per-request budget.
+ *
+ * Uncapped, this captures a stack on every refusal — and a process refusing one
+ * statement is usually a process refusing all of them, so the lane that most
+ * needs a bound is the one that had none.
+ */
+function errorCallsiteFor(
+  options: InstrumentDbClientOptions,
+  requestId: string,
+  shape: string | undefined,
+  error: unknown,
+): DbCallsite | undefined {
+  const slot = claimCallsiteBudget(requestId, shape);
+  if (slot.seen) return slot.cached;
+  if (slot.full) return undefined;
+  return slot.remember(captureDbErrorCallsite(error, options.callsiteRoot));
 }
 
 function buildDbDiffBulkEvent(input: {
@@ -416,7 +542,8 @@ export function emitImagelessDbDiff(input: {
 }
 
 /**
- * Records that a host statement was attempted and RAISED, then hands the error straight back.
+ * Records that a host statement was attempted and RAISED, captures its application callsite when
+ * the stack provides one, then hands the error straight back.
  *
  * This is the engine-agnostic seam every adapter uses, and it exists because the capture
  * vocabulary could otherwise only describe statements that succeeded: the host `query` rejected,
@@ -452,6 +579,12 @@ export function emitDbErrorEvent(input: {
         statement: input.statement,
         error: input.error,
         requestId: input.requestId,
+        callsite: errorCallsiteFor(
+          options,
+          input.requestId,
+          normalizeStatementShape(input.statement),
+          input.error,
+        ),
         sessionId: options.sessionId,
         now: options.now?.(),
         sessionStartedAt: options.sessionStartedAt,
@@ -530,7 +663,8 @@ export function nextStatementSeq(
 /**
  * Emits capped, redacted `db.read` events for a SELECT's rows plus a `db.read.bulk` summary when
  * more rows exist than were emitted. Honors both the per-statement cap and the per-request budget
- * tracked in `emittedReadRowsByRequest`.
+ * tracked in `emittedReadRowsByRequest`. When opted in, one callsite is reused for each normalized
+ * statement shape, with at most eight distinct shapes captured per request.
  */
 export function emitDbReadEvents(input: {
   engine: DbEngine;
@@ -540,6 +674,8 @@ export function emitDbReadEvents(input: {
   rowCount: number;
   options: InstrumentDbClientOptions;
   emittedReadRowsByRequest: Map<string, number>;
+  /** Per-request callsite cache, keyed by normalized statement shape. */
+  readCallsitesByRequest: ReadCallsitesByRequest;
   /**
    * Per-request SELECT counter, shared with the caller so every statement in a
    * request gets a distinct ordinal. Rows are emitted one event each, so this
@@ -593,6 +729,15 @@ export function emitDbReadEvents(input: {
   const emitRows = rows.slice(0, emittedRows);
   const samplePks: Array<Record<string, unknown>> = [];
   const sensitive = buildSensitiveColumnSet(options.redactColumns);
+  const callsite =
+    emitRows.length > 0
+      ? readCallsiteFor(
+          options,
+          requestId,
+          shape,
+          input.readCallsitesByRequest,
+        )
+      : undefined;
 
   for (const row of emitRows) {
     const pk = extractPk(row, table, options.pkColumns);
@@ -610,6 +755,7 @@ export function emitDbReadEvents(input: {
           ...(stmt !== undefined ? { stmt } : {}),
           ...(shape !== undefined ? { shape } : {}),
           queryShape: input.queryShape,
+          callsite,
           sessionId: options.sessionId,
           redactColumns: options.redactColumns,
           now: options.now?.(),

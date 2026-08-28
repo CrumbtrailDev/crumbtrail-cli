@@ -6,6 +6,7 @@ import {
   type DbErrorEventData,
   type DbErrorOp,
 } from "crumbtrail-core";
+import type { DbCallsite } from "./callsite";
 
 export interface BuildDbErrorEventInput {
   engine: DbEngine;
@@ -17,6 +18,8 @@ export interface BuildDbErrorEventInput {
   /** The error the driver raised. Only its `code` and class name are read. */
   error: unknown;
   requestId: string;
+  /** Application callsite captured while the refused statement was being emitted. */
+  callsite?: DbCallsite;
   sessionId?: string;
   now?: number;
   sessionStartedAt?: number | Date;
@@ -85,6 +88,7 @@ export function buildDbErrorEvent(input: BuildDbErrorEventInput): BugEvent {
     code: captureDbErrorCode(input.error),
     errorName: captureDbErrorName(input.error),
     requestId: input.requestId,
+    ...(input.callsite !== undefined ? { callsite: input.callsite } : {}),
     t: now,
   };
 

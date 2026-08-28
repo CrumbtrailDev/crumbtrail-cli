@@ -7,6 +7,7 @@ import {
   type DbReadBulkEventData,
   type DbReadEventData,
 } from "crumbtrail-core";
+import type { DbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import { boundColumnRow } from "./diff-event";
 
@@ -17,6 +18,8 @@ export interface BuildDbReadEventInput {
   pk: Record<string, unknown> | null;
   row: Record<string, unknown>;
   requestId: string;
+  /** Application callsite that issued the SELECT, when callsite capture is enabled. */
+  callsite?: DbCallsite;
   /** 1-based ordinal of the SELECT within this request. */
   stmt?: number;
   /** Already-normalized shape of the SELECT that produced this row. Never raw statement text. */
@@ -63,6 +66,7 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
     pk: boundedPk,
     row: boundedRow,
     requestId: input.requestId,
+    ...(input.callsite !== undefined ? { callsite: input.callsite } : {}),
   };
   if (Number.isInteger(input.stmt) && (input.stmt as number) > 0)
     d.stmt = input.stmt;

@@ -17,6 +17,7 @@ import {
   normalizeMaxRowsPerStatement,
   pkKey,
   type InstrumentDbClientOptions,
+  type ReadCallsitesByRequest,
 } from "./instrument-shared";
 
 /**
@@ -156,6 +157,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
   const readStatementsByRequest = new Map<string, number>();
+  const readCallsitesByRequest: ReadCallsitesByRequest = new Map();
 
   const resolveRequestId = (): string | undefined =>
     options.requestId ?? options.getRequestId?.();
@@ -386,6 +388,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     realStmt: DuckTypedSqliteStatement,
     parsedRead: ParsedRead,
     args: unknown[],
+    statement: string,
   ): unknown => {
     // The host read runs exactly once; its result is returned unchanged.
     const result = realStmt.all(...args);
@@ -407,7 +410,9 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
         rowCount: rows.length,
         options,
         emittedReadRowsByRequest,
+        readCallsitesByRequest,
         readStatementsByRequest,
+        statement,
       });
     } catch (error) {
       emitGap(options, { reason: "capture_exception", error });
@@ -419,6 +424,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     stmt: DuckTypedSqliteStatement,
     parsed: ParsedMutation | undefined,
     parsedRead: ParsedRead | undefined,
+    statement: string,
   ): DuckTypedSqliteStatement =>
     new Proxy(stmt, {
       get(target, prop, _receiver) {
@@ -427,7 +433,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
         }
         if (prop === "all" && parsedRead && options.captureReads) {
           return (...args: unknown[]) =>
-            instrumentedAll(target, parsedRead, args);
+            instrumentedAll(target, parsedRead, args, statement);
         }
         // `target` (not `receiver`) as the `this` binding: accessor properties (e.g. node:sqlite's
         // native `sourceSQL` getter) must run against the real statement, not this Proxy.
@@ -470,7 +476,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
             return realStmt;
           }
           if (!parsed && !parsedRead) return realStmt;
-          return wrapStatement(realStmt, parsed, parsedRead);
+          return wrapStatement(realStmt, parsed, parsedRead, sql);
         };
       }
       // `target` (not `receiver`) as the `this` binding: accessor properties (e.g. node:sqlite's
