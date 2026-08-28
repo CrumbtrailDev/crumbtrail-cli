@@ -141,6 +141,11 @@ describe("buildFixContext", async () => {
       "schemaVersion",
       "session",
       "signals",
+      // A plane emits `<plane>_total` beside itself only when it assembled
+      // something, so an array a response budget emptied still says in place
+      // how much it is hiding, and an array that genuinely held nothing stays
+      // bare.
+      "signals_total",
     ]);
     expect(Object.keys(fc.primary_window).sort()).toEqual([
       "backend",
@@ -153,6 +158,10 @@ describe("buildFixContext", async () => {
       "db_reads",
       "db_statements",
       "failed_requests",
+      // This session captured a failed request, so the plane says how many it
+      // assembled. The db planes below it captured nothing and stay bare, which
+      // is the difference a reader needs when a budget empties one of them.
+      "failed_requests_total",
       "frontend",
       "preceding_requests",
     ]);
@@ -1252,6 +1261,56 @@ describe("getFixContext (MCP tool)", () => {
     expect(contract.primary_window.db_reads).toEqual([]);
     expect(contract.environment).toBeNull();
     expect(contract.signals[0].detector).toBe("backend_http_error");
+  });
+
+  it("keeps a budget-emptied plane distinguishable from one that held nothing", async () => {
+    // CT-P03. The dropReport at the END of the response is the exact accounting
+    // and stays the authority, but a model reads top-down: it meets
+    // `"signals": []` and concludes the session had no signals long before it
+    // reaches the correction. The total sits beside the array so the trim is
+    // unmissable where it happened, and a plane that really captured nothing
+    // still has no total at all.
+    const call = async (args: Record<string, unknown>) => {
+      const res = await server.handleMessage({
+        jsonrpc: "2.0",
+        id: 9,
+        method: "tools/call",
+        params: { name: "getFixContext", arguments: { sessionId: SESSION_ID, ...args } },
+      });
+      const result = (res!.result as any);
+      expect(result.isError).toBeUndefined();
+      return JSON.parse(result.content[0].text);
+    };
+
+    const full = await call({});
+    expect(full.signals.length).toBeGreaterThan(0);
+    expect(full.signals_total).toBe(full.signals.length);
+    expect(full.dropReport).toBeUndefined();
+
+    const trimmed = await call({ maxTokens: 400 });
+    expect(trimmed.signals).toEqual([]);
+    expect(trimmed.signals_total).toBe(full.signals_total);
+
+    // The drop report still reconciles: what is shown plus what it says was
+    // dropped is what the bundle assembled, per plane.
+    const droppedFor = (plane: string) =>
+      trimmed.dropReport.planes.find((entry: any) => entry.plane === plane)
+        ?.droppedCount ?? 0;
+    expect(droppedFor("signals")).toBe(
+      trimmed.signals_total - trimmed.signals.length,
+    );
+    expect(droppedFor("primary_window.failed_requests")).toBe(
+      trimmed.primary_window.failed_requests_total -
+        trimmed.primary_window.failed_requests.length,
+    );
+    expect(trimmed.dropReport.droppedCount).toBeGreaterThan(0);
+
+    // A plane the session never filled reads the same way trimmed or not: an
+    // empty array with no total beside it.
+    for (const plane of ["db_diffs", "db_reads", "db_errors", "db_statements"]) {
+      expect(trimmed.primary_window[plane]).toEqual([]);
+      expect(trimmed.primary_window).not.toHaveProperty(`${plane}_total`);
+    }
   });
 
   it("returns an MCP error for an unknown session", async () => {
