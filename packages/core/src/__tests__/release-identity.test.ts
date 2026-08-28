@@ -67,3 +67,44 @@ describe("readApplicationReleaseIdentity", () => {
     expect(readApplicationReleaseIdentity()).toEqual({});
   });
 });
+
+describe("the entry script as a last-resort build identity", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("names the hashed entry file when nothing else declares a build", () => {
+    // Measured on a deployed app: the session held the build the SERVER served
+    // and nothing about the build the BROWSER was running, because the app
+    // published its build through a bundler define rather than an env var or a
+    // meta tag. A hashed file name needs no convention at all.
+    document.body.innerHTML =
+      '<script src="/assets/index-rtA-Jdei.js"></script>';
+    expect(readApplicationReleaseIdentity().build).toBe("index-rtA-Jdei.js");
+  });
+
+  it("loses to any declared identity", () => {
+    document.head.innerHTML =
+      '<meta name="app-build" content="declared-build" />';
+    document.body.innerHTML =
+      '<script src="/assets/index-rtA-Jdei.js"></script>';
+    expect(readApplicationReleaseIdentity().build).toBe("declared-build");
+  });
+
+  it("ignores a cross-origin script, which is somebody else's build", () => {
+    document.body.innerHTML =
+      '<script src="https://cdn.example.test/vendor-abc123.js"></script>';
+    expect(readApplicationReleaseIdentity().build).toBeUndefined();
+  });
+
+  it("takes the file name only, never the path or the query", () => {
+    document.body.innerHTML =
+      '<script src="/static/build/17/app-9f2c1b.js?cache=bust"></script>';
+    expect(readApplicationReleaseIdentity().build).toBe("app-9f2c1b.js");
+  });
+
+  it("reports nothing when the document has no script with a source", () => {
+    document.body.innerHTML = "<script>console.log(1)</script>";
+    expect(readApplicationReleaseIdentity().build).toBeUndefined();
+  });
+});
