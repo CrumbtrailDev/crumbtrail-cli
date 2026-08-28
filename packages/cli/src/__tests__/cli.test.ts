@@ -213,7 +213,16 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
     env: { CRUMBTRAIL_BASE_URL: "http://127.0.0.1:9999", DISPLAY: ":0" },
     cwd: "/app",
     isTTY: h.isTTY ?? true,
-    fetchImpl: undefined,
+    // Every wizard run makes one unstubbed call of its own: `fetchIdentity`
+    // (GET <base>/auth/me), which takes `deps.fetchImpl` and nothing else. With
+    // this left undefined it reached the real network. Most tests survived that
+    // only because the pinned CRUMBTRAIL_BASE_URL above refuses instantly on
+    // localhost; the endpoint-confirmation tests, which must clear that variable
+    // to test the unstated case, resolved the hosted default and hung against
+    // the live API until vitest's 5s timeout killed them in CI.
+    fetchImpl: (async () => {
+      throw new Error("network disabled in tests");
+    }) as unknown as typeof fetch,
   };
   return { ...base, ...over };
 }
