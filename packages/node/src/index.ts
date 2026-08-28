@@ -1,123 +1,5 @@
-/** @stability stable — public SDK export surface (contract review, wargames/wargames/03-contract-decisions.md). */
-export { createServer } from "./server";
-export type { ServerConfig } from "./server";
-export {
-  DISTINCT_BUGS_SCHEMA_VERSION,
-  groupDistinctBugs,
-  buildDistinctBugSignature,
-  computeDistinctBugSignatures,
-  groupDistinctBugRecurrences,
-} from "./distinct-bugs";
-export type {
-  DistinctBug,
-  DistinctBugSeverity,
-  DistinctBugEvidenceRef,
-  DistinctBugRecurrence,
-  DistinctBugRecurrenceInput,
-  DistinctBugRecurrenceOccurrence,
-} from "./distinct-bugs";
-export {
-  FilesystemSessionStore,
-  defaultSessionStore,
-  setSessionStore,
-  resetSessionStore,
-  getSessionStore,
-} from "./session-store";
-// The keep half of the capture policy. A host that embeds this package rather
-// than running the CLI sets it the same way `serve --keep-field` does.
-export {
-  setStorageKeepFields,
-  getStorageKeepFields,
-} from "./storage-plane";
-// The full SessionStore surface must be exported, not just the interface: an
-// embedder implementing or decorating it (for example the hosted cloud's
-// EncryptedSessionStore) needs these parameter/return types to type its methods.
-export type {
-  SessionStore,
-  AppendEventsOptions,
-  AppendEventsResult,
-  ArtifactStat,
-  ResolveSessionScope,
-  SessionPartition,
-} from "./session-store";
-export {
-  FilesystemMcpReadStore,
-  RemoteMcpReadStore,
-  selectMcpReadStore,
-} from "./mcp-read-store";
-export type { McpReadStore } from "./mcp-read-store";
-export { SessionManager } from "./session";
-export type { SessionFinalizationResult, SessionListItem } from "./session";
-export {
-  sweepIdleSessions,
-  startSessionSweeper,
-  DEFAULT_SWEEP_IDLE_MS,
-  DEFAULT_SWEEP_INTERVAL_MS,
-  DEFAULT_SWEEP_CHECKPOINT_MS,
-} from "./session-sweeper";
-export type {
-  SessionSweepOptions,
-  SessionSweepResult,
-  SessionSweeperHandle,
-} from "./session-sweeper";
-export {
-  createFastFinalizeScheduler,
-  isHighSeverityEvent,
-  startFastFinalizer,
-} from "./fast-finalize";
-export type {
-  FastFinalizeHandle,
-  FastFinalizeOutcome,
-  FastFinalizeScheduler,
-  FastFinalizeSchedulerOptions,
-  FastFinalizerOptions,
-} from "./fast-finalize";
-export { buildSessionSummary } from "./session-summary";
-export type {
-  SessionSummary,
-  SessionFileFlags,
-  Severity,
-} from "./session-summary";
-export { BugQueueManager } from "./bug-queue";
-export type { BugReport as ServerBugReport, BugQueueConfig } from "./bug-queue";
-export { McpServer } from "./mcp-server";
-export type { McpServerConfig } from "./mcp-server";
-// The credential pair a hosted embedder passes per caller through
-// `McpServerConfig.cloudCredentials`. Exported because a hosted dispatcher has
-// to name the type to build one; the resolver itself stays internal.
-export type { CloudCredentials } from "./cloud-auth";
-export {
-  buildFixContext,
-  FixContextError,
-  FIX_CONTEXT_SCHEMA_VERSION,
-} from "./fix-context";
-export type {
-  FixContext,
-  FixContextSession,
-  FixContextReproHint,
-  FixContextPrimaryWindow,
-  FixContextDbDiff,
-  FixContextDbRead,
-  BuildFixContextOptions,
-} from "./fix-context";
-export {
-  extractOpinionCodePointers,
-  buildCallsitePointer,
-  parseGitHubRepo,
-  type CallsiteLike,
-  type RepoBinding,
-} from "./code-pointers";
-export {
-  buildCodeLocations,
-  parseFrame,
-  MAX_CODE_LOCATIONS,
-  MAX_CALLER_FRAMES,
-  type CodeFrame,
-  type CodeLocation,
-  type CodeLocationVia,
-} from "./code-locations";
 export { captureDbCallsite, type DbCallsite } from "./db/callsite";
-export type { CodePointer, CodePointerResolution } from "./code-pointers";
+
 export {
   buildDbDiffEvent,
   buildDbReadBulkEvent,
@@ -145,6 +27,7 @@ export {
   parseRead,
   DEFAULT_SENSITIVE_DB_COLUMNS,
 } from "./db";
+
 export type {
   BuildDbDiffEventInput,
   BuildDbReadBulkEventInput,
@@ -164,6 +47,7 @@ export type {
   InstrumentPgClientOptions,
   StatementClassification,
 } from "./db";
+
 export {
   buildBackendRequestStartEvent,
   buildBackendRequestEndEvent,
@@ -173,6 +57,7 @@ export {
   buildBackendJobErrorEvent,
   resolveBackendRequestCorrelation,
 } from "./backend-events";
+
 export type {
   BackendRequestEventInput,
   BackendRequestEndEventInput,
@@ -183,52 +68,12 @@ export type {
   BackendJobEndEventInput,
   BackendJobErrorEventInput,
 } from "./backend-events";
-export { buildLlmBundle, writeLlmBundle } from "./llm-bundle";
-export type {
-  LlmBundle,
-  LlmBundleCompleteness,
-  LlmBundleDetectorPrevalence,
-  SessionIndexLike,
-  WriteLlmBundleInput,
-} from "./llm-bundle";
-export {
-  deriveCorpusRoot,
-  measureDetectorPrevalence,
-  MIN_PRIOR_SESSIONS_FOR_PREVALENCE,
-  MAX_SCANNED_PRIOR_SESSIONS,
-} from "./detector-prevalence";
-export type {
-  DetectorPrevalence,
-  MeasureDetectorPrevalenceOptions,
-} from "./detector-prevalence";
-export {
-  postProcess,
-  reanalyzeSession,
-  type PostProcessOptions,
-  type ReanalyzeSessionResult,
-} from "./post-process";
-export { inspectSession, formatInspection, InspectError } from "./inspect";
-export type {
-  SessionInspection,
-  SessionInspectionArtifact,
-  InspectSessionOptions,
-} from "./inspect";
-export { readPackageVersion } from "./version";
-export {
-  PROVIDER_IDS,
-  PROVIDER_RECIPES,
-  getProviderRecipe,
-  isProviderId,
-  renderProviderCliOutput,
-  renderProviderConfig,
-  renderProviderDoc,
-  renderProviderReadme,
-} from "./provider-recipes";
-export type { ProviderId, ProviderRecipe } from "./provider-recipes";
+
 export {
   createCrumbtrailExpressErrorMiddleware,
   createCrumbtrailExpressMiddleware,
 } from "./express";
+
 // Capture is fire-and-forget, so a process that exits right after its last
 // request — a job, a CLI, a serverless invocation — needs a way to wait for the
 // tail. `backendIntakeQueueStats` is for a health endpoint or a smoke test.
@@ -236,14 +81,17 @@ export {
   backendIntakeQueueStats,
   flushBackendEvents,
 } from "./backend-intake";
+
 export {
   HeadlessRequestError,
   startHeadlessSession,
 } from "./headless-session";
+
 export type {
   HeadlessSession,
   HeadlessSessionOptions,
 } from "./headless-session";
+
 export type {
   CrumbtrailExpressErrorMiddleware,
   CrumbtrailExpressErrorNext,
@@ -256,111 +104,11 @@ export type {
   CrumbtrailExpressWarning,
   CrumbtrailExpressWarningKind,
 } from "./express";
-export {
-  compareSessions,
-  CompareError,
-  SESSION_COMPARE_SCHEMA_VERSION,
-} from "./compare";
-export {
-  comparisonTitle,
-  formatComparisonSummary,
-  renderCompareReport,
-  sessionRefLabel,
-} from "./compare/report";
-export {
-  buildRegressionContext,
-  REGRESSION_CONTEXT_SCHEMA_VERSION,
-} from "./compare/regression-context";
-export type {
-  CompareOptions,
-  ComparisonConfidence,
-  ComparisonVerdict,
-  Divergence,
-  EnvChannelDelta,
-  EnvDiff,
-  EnvValueChange,
-  SessionComparison,
-} from "./compare";
-export type { RegressionContext } from "./compare/regression-context";
-export type {
-  EvidenceSourceDescriptor,
-  EvidenceJoinKey,
-} from "crumbtrail-core";
-export {
-  REPLAY_RESULT_SCHEMA_VERSION,
-  buildReplayResult,
-  parseReplayResult,
-  writeReplayResult,
-} from "./replay/result";
-export type {
-  ReplayDivergence,
-  ReplayResult,
-  ReplayStepResult,
-  StepResolution,
-} from "./replay/result";
-
-// Replay adapters: the `Reproducer` seam, its policy, and the two adapters.
-// `defaultReproducerFactory` is the production default, so `allowReproduction`
-// is a live switch rather than an inert argument.
-export { buildReplayFlow, flowCarriesSecret } from "./replay/flow";
-export {
-  DEFAULT_REPLAY_MAX_STEPS,
-  DEFAULT_REPLAY_STEP_TIMEOUT_MS,
-  defaultReplayPolicy,
-  describeRefusal,
-  evaluateReplayPolicy,
-  replayPolicyFromEnv,
-  resolveReplayPolicy,
-} from "./replay/policy";
-export { NoopReproducer } from "./replay/noop";
-export {
-  PlaywrightReproducer,
-  loadPlaywrightDriver,
-} from "./replay/playwright";
-export {
-  defaultReproducerFactory,
-  runReproduction,
-} from "./replay/factory";
-export type {
-  BuildReplayFlowInput,
-  ReplayFlowEvent,
-} from "./replay/flow";
-export type {
-  ReplayPolicy,
-  ReplayRequestOptions,
-  ReplayTargetAllowlistEntry,
-} from "./replay/policy";
-export type {
-  PlaywrightDriver,
-  PlaywrightLoader,
-  PlaywrightReproducerOptions,
-  ReplayBrowser,
-  ReplayBrowserContext,
-  ReplayBrowserType,
-  ReplayLocator,
-  ReplayPage,
-} from "./replay/playwright";
-export type {
-  ReproducerContext,
-  ReproducerFactory,
-  ReproductionRequest,
-} from "./replay/factory";
-export type {
-  ReplayAction,
-  ReplayDecision,
-  ReplayFlow,
-  ReplayMode,
-  ReplayRefusal,
-  ReplayRefusalCode,
-  ReplayStep,
-  ReplayValueSource,
-  Reproducer,
-  ReproductionOutcome,
-} from "./replay/types";
 
 // ── CP1: auto-capture (crash + console.error) ────────────────────────────────
 // Append-only block. Do not reorder the exports above.
 export { autoCapture, AUTO_CAPTURE_ERROR_EVENT } from "./auto-capture";
+
 export type {
   AutoCaptureErrorContext,
   AutoCaptureErrorPhase,
@@ -368,21 +116,6 @@ export type {
   AutoCaptureOptions,
   AutoCaptureSource,
 } from "./auto-capture";
-
-// ── CP4: OTLP/HTTP protobuf decoders ─────────────────────────────────────────
-// Append-only block. Exported so the cloud edge (packages/cloud) can decode
-// `application/x-protobuf` OTLP bodies at ingest and forward the JSON wire shape
-// to the inner server, at parity with the local receiver's readOtlpBody.
-export {
-  decodeOtlpTraceProtobuf,
-  decodeOtlpLogsProtobuf,
-} from "./otel-protobuf";
-export type {
-  OtlpTraceRequest,
-  OtlpLogsRequest,
-  OtlpResourceSpans,
-  OtlpResourceLogs,
-} from "./otel-adapter";
 
 // ── Node contract capability marker ──────────────────────────────────────────
 // Append-only block. Do not reorder the exports above.
@@ -400,6 +133,7 @@ export {
   buildBackendWarningEvent,
   installBackendWarningCapture,
 } from "./backend-warnings";
+
 export type {
   BackendWarningCaptureHandle,
   BackendWarningCaptureOptions,
@@ -415,6 +149,7 @@ export {
   installBackendLogCapture,
   parseStructuredLogLine,
 } from "./backend-logs";
+
 export type {
   BackendLogCaptureHandle,
   BackendLogCaptureOptions,
@@ -430,14 +165,17 @@ export type {
 // correlation headers. `autoCapture` installs it, so a stock install needs none
 // of these symbols; they are exported for a host that wires capture by hand.
 export { installHttpRequestCapture } from "./http-server";
+
 export type {
   HttpRequestCaptureHandle,
   HttpRequestCaptureOptions,
 } from "./http-server";
+
 export {
   claimBackendRequest,
   isBackendRequestClaimed,
 } from "./backend-request-claim";
+
 // The session an uncorrelated backend request is filed to. `autoCapture` sets
 // this once its handshake succeeds; a host that runs its own headless session
 // and wires the middleware by hand announces it here so its request events land
@@ -447,7 +185,9 @@ export {
   clearProcessSessionId,
   getProcessSessionId,
 } from "./process-session";
+
 export { isCapturableContentTypeForTest } from "./backend-response";
+
 export type {
   BackendResponseCaptureOptions,
   BackendResponseLike,
@@ -466,4 +206,5 @@ export {
   runInBackendRequestContext,
   updateBackendRequestContext,
 } from "./request-context";
+
 export type { BackendRequestContext } from "./request-context";
