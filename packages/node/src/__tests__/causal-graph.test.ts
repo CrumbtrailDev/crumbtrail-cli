@@ -292,14 +292,22 @@ describe("buildCausalGraph — interaction edge banding", () => {
     options: { navBetween?: boolean } = {},
   ): CausalEdge | undefined {
     const events: BugEvent[] = [
-      { t: 900, k: "nav", d: { from: "", to: "https://app.test/checkout", tr: "init" } },
+      {
+        t: 900,
+        k: "nav",
+        d: { from: "", to: "https://app.test/checkout", tr: "init" },
+      },
       { t: 1000, k: "clk", d: { tag: "BUTTON", txt: "Pay" } },
       ...(options.navBetween
         ? [
             {
               t: 1000 + Math.floor(deltaMs / 2),
               k: "nav",
-              d: { from: "https://app.test/checkout", to: "https://app.test/receipt", tr: "push" },
+              d: {
+                from: "https://app.test/checkout",
+                to: "https://app.test/receipt",
+                tr: "push",
+              },
             } as BugEvent,
           ]
         : []),
@@ -324,7 +332,9 @@ describe("buildCausalGraph — interaction edge banding", () => {
   });
 
   it("medium at 300ms when a navigation intervened (context mismatch downgrades)", () => {
-    expect(interactionConf(300, { navBetween: true })?.confidence).toBe("medium");
+    expect(interactionConf(300, { navBetween: true })?.confidence).toBe(
+      "medium",
+    );
   });
 
   it("none at 2500ms (outside window)", () => {
@@ -342,7 +352,15 @@ describe("buildCausalGraph — interaction edge banding", () => {
   it("labels browser nodes with the navigation path and leaves backend nodes without one", () => {
     const graph = buildCausalGraph({
       events: [
-        { t: 900, k: "nav", d: { from: "", to: "https://app.test/checkout?token=abc", tr: "init" } },
+        {
+          t: 900,
+          k: "nav",
+          d: {
+            from: "",
+            to: "https://app.test/checkout?token=abc",
+            tr: "init",
+          },
+        },
         { t: 1000, k: "clk", d: { tag: "BUTTON" } },
         {
           t: 1100,
@@ -487,5 +505,92 @@ describe("buildCausalGraph — determinism", () => {
     const snapshot = JSON.stringify(events);
     buildCausalGraph({ events });
     expect(JSON.stringify(events)).toBe(snapshot);
+  });
+});
+
+describe("buildCausalGraph — path redaction is by token shape, not length", () => {
+  function nodeOfKind(graph: CausalGraph, kind: CausalNodeKind) {
+    const node = graph.nodes.find((n) => n.kind === kind);
+    if (!node) throw new Error(`no ${kind} node`);
+    return node;
+  }
+
+  it("keeps ordinary long directory names in route, sig and brief", () => {
+    const graph = buildCausalGraph({
+      events: [
+        {
+          t: 100,
+          k: "backend.otel.span",
+          d: { name: "/notification-service/payment-processing/dispatch" },
+        },
+        {
+          t: 200,
+          k: "net.req",
+          d: {
+            id: "n1",
+            m: "GET",
+            url: "https://api.test/notification-service/payment-processing",
+          },
+        },
+      ] as BugEvent[],
+    });
+
+    const span = nodeOfKind(graph, "otel.span");
+    expect(span.route).toBe(
+      "/notification-service/payment-processing/dispatch",
+    );
+    expect(span.brief).not.toContain("[REDACTED]");
+
+    const req = nodeOfKind(graph, "net.req");
+    expect(req.sig).toContain("notification-service");
+    expect(req.sig).toContain("payment-processing");
+    expect(req.brief).not.toContain("[REDACTED]");
+  });
+
+  it("still redacts identifier-shaped segments", () => {
+    const graph = buildCausalGraph({
+      events: [
+        {
+          t: 100,
+          k: "net.req",
+          d: {
+            id: "n1",
+            m: "GET",
+            url: "https://api.test/orders/3f2b1c9d4e5a6b7c8d9e0f1a2b3c4d5e/items",
+          },
+        },
+        {
+          t: 200,
+          k: "backend.otel.span",
+          d: {
+            name: "/tenants/a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d/sync",
+          },
+        },
+      ] as BugEvent[],
+    });
+
+    expect(nodeOfKind(graph, "net.req").sig).toContain("[REDACTED]");
+    expect(nodeOfKind(graph, "net.req").sig).not.toContain(
+      "3f2b1c9d4e5a6b7c8d9e0f1a2b3c4d5e",
+    );
+    expect(nodeOfKind(graph, "otel.span").route).toBe(
+      "/tenants/[REDACTED]/sync",
+    );
+  });
+
+  it("keeps a build-hash filename, which is the code pointer", () => {
+    const graph = buildCausalGraph({
+      events: [
+        {
+          t: 100,
+          k: "backend.otel.span",
+          d: { name: "/assets/index-a1b2c3d4e5f6a7b8.js" },
+        },
+      ] as BugEvent[],
+    });
+
+    expect(nodeOfKind(graph, "otel.span").route).toBe(
+      "/assets/index-a1b2c3d4e5f6a7b8.js",
+    );
   });
 });

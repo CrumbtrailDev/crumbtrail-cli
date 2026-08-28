@@ -3,6 +3,7 @@ import {
   redactUrl,
   type BugEvent,
 } from "crumbtrail-core";
+import { redactPathTokens } from "./redact-path";
 
 /**
  * Causal graph module. Pure, deterministic assembly of a typed node/edge graph from the event
@@ -114,21 +115,15 @@ function confidence2(deltaMs: number): "high" | "medium" {
 // --- REDACTION HELPERS (local reimplementations of post-process semantics) --------------------
 // The post-process safeUrl/safePath/safeDiagnosticString/safeString helpers are non-exported, so
 // small local equivalents are used here. They must NEVER let a raw URL/body/input value through.
+// The path-segment rule itself is NOT reimplemented: it is imported from `./redact-path`, shared
+// with post-process.ts. The copy that used to live here kept the pre-fix length rule and erased
+// ordinary directory names (`notification-service`) from node routes and briefs.
 
 function safeString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   if (trimmed.length === 0) return undefined;
   return trimmed.slice(0, 120);
-}
-
-function redactPathTokens(value: string): string {
-  return value
-    .split("/")
-    .map((segment) =>
-      /^[A-Za-z0-9_-]{16,}$/.test(segment) ? "[REDACTED]" : segment,
-    )
-    .join("/");
 }
 
 function safeUrl(value: unknown): string | undefined {
