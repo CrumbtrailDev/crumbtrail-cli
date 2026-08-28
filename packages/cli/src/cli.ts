@@ -459,9 +459,11 @@ function usage(): string {
     head("What it captures"),
     `  ${color.bold("Browser".padEnd(9))}console, network, DOM and errors — Next.js, SvelteKit, Nuxt, Remix,`,
     color.dim(
-      "           Astro, Angular, Vite SPA, Capacitor, React Native, Flutter, and",
+      "           Astro, Angular, Vite SPA, Create React App, Capacitor, React",
     ),
-    color.dim("           plain static pages (wired with a script tag)."),
+    color.dim(
+      "           Native, Flutter, and plain static pages (script tag).",
+    ),
     `  ${color.bold("Server".padEnd(9))}requests, crashes, logs and SQL — Express, NestJS, Fastify, Hono,`,
     color.dim(
       "           a plain Node server, and Django/Flask/FastAPI/Go/Rails/.NET over OTLP.",
@@ -1133,11 +1135,11 @@ export async function runWizard(
         ui.err(color.dim("  cd <project folder> && npx crumbtrail"));
       }
       ui.err(
-        "Supported: Next.js, SvelteKit, Nuxt, Remix, Astro, Angular, Vite SPA, NestJS, Express, Hono, Fastify, a Node server, or a non-JS backend that speaks OpenTelemetry (Django, Flask, FastAPI, Go, Rails, .NET).",
+        "Supported: Next.js, SvelteKit, Nuxt, Remix, Astro, Angular, Vite SPA, Create React App, NestJS, Express, Hono, Fastify, a Node server, or a non-JS backend that speaks OpenTelemetry (Django, Flask, FastAPI, Go, Rails, .NET).",
       );
-      // No recipe is not the same as no route. Create React App, plain webpack,
-      // Vue CLI and Electron all capture correctly once init runs; only the
-      // automatic wiring is missing. Ending on the supported list alone read as
+      // No recipe is not the same as no route. Plain webpack, Vue CLI and
+      // Electron all capture correctly once init runs; only the automatic
+      // wiring is missing. Ending on the supported list alone read as
       // "your app is not supported", which for a React app also contradicts
       // what the site says.
       ui.err("");
@@ -1937,7 +1939,7 @@ export async function runBatchWizard(
       ui.err(note(`${c.relDir} — ${candidateHint(c)}`));
     }
     ui.err(
-      "Supported: Next.js, SvelteKit, Nuxt, Remix, Astro, Angular, Vite SPA, NestJS, Express, Hono, Fastify, a Node server, or a non-JS backend that speaks OpenTelemetry (Django, Flask, FastAPI, Go, Rails, .NET).",
+      "Supported: Next.js, SvelteKit, Nuxt, Remix, Astro, Angular, Vite SPA, Create React App, NestJS, Express, Hono, Fastify, a Node server, or a non-JS backend that speaks OpenTelemetry (Django, Flask, FastAPI, Go, Rails, .NET).",
     );
     return 1;
   }

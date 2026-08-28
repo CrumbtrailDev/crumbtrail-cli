@@ -997,6 +997,27 @@ function planVite(input: BuildPlanInput, io: InjectIO): Plan {
 }
 
 /**
+ * Create React App, including craco / react-app-rewired. Byte-identical to the
+ * Vite plan apart from the entry it prepends into and the key expression the
+ * registry supplies (`process.env.REACT_APP_*` rather than `import.meta.env`):
+ * both are client bundles whose module graph starts at one file.
+ */
+function planCra(input: BuildPlanInput, io: InjectIO): Plan {
+  const block = clientInitSnippet(
+    input.endpoint,
+    keyExprFor(input)!,
+    input.serviceName,
+    input.backendOrigins,
+  );
+  if (!input.entryFile) {
+    return fallbackPlan(input, block, [
+      "Could not resolve src/index.{tsx,jsx,ts,js} — wire it manually.",
+    ]);
+  }
+  return prependWithPreflight(input, io, input.entryFile, block);
+}
+
+/**
  * Shared backend-JS plan builder. Hono, Fastify, Nest, and the generic Node
  * recipe inject (Express has its own builder, planExpress, which also wires the
  * request/error middleware pair) the same self-contained `autoCapture` block (the only
@@ -1972,6 +1993,8 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
       return planAngular(input, io);
     case "vite-spa":
       return planVite(input, io);
+    case "cra":
+      return planCra(input, io);
     case "static":
       // A page with no bundler: the HTML itself is the entry, wired with a
       // script tag rather than an import.
