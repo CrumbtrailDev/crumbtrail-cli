@@ -157,6 +157,8 @@ export type {
   ContextCompleteness,
   Escalation,
   EvidenceGap,
+  RetrievalDeferReason,
+  RetrievalQualityReport,
   RankedBundle,
   AssembleBundleInput,
 } from "./fusion";

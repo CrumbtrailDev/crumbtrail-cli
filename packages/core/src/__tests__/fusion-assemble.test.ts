@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { assembleBundle } from "../fusion";
-import type { Symptom } from "../fusion";
+import type { RetrievalQualityReport, Symptom } from "../fusion";
 import type { EvidenceItem, IntentSignal } from "../evidence";
 
 function item(overrides: Partial<EvidenceItem> = {}): EvidenceItem {
@@ -60,5 +60,49 @@ describe("assembleBundle", () => {
     const bundle = assembleBundle({ symptom, evidence: [], intent: [], gaps });
 
     expect(bundle.gaps).toEqual(gaps);
+  });
+
+  it("omits retrieval entirely when no retrieval report is supplied", () => {
+    const bundle = assembleBundle({
+      symptom: { title: "checkout fails" },
+      evidence: [],
+      intent: [],
+    });
+
+    expect("retrieval" in bundle).toBe(false);
+  });
+
+  it("passes a supplied retrieval report through unchanged", () => {
+    const retrieval: RetrievalQualityReport = {
+      enabled: true,
+      candidateLanes: ["network", "db"],
+      strategy: "deterministic_prefilter",
+      selected: [
+        {
+          sourceId: "datadog",
+          lanes: ["network"],
+          joinKeys: ["time", "url"],
+          rationale: "source lanes and available join keys match the incident",
+        },
+      ],
+      deferred: [
+        {
+          sourceId: "linear",
+          lanes: ["tickets"],
+          reason: "lane_not_relevant",
+          rationale: "no candidate lane overlaps this source",
+        },
+      ],
+      plannerFree: true,
+    };
+
+    const bundle = assembleBundle({
+      symptom: { title: "checkout fails" },
+      evidence: [],
+      intent: [],
+      retrieval,
+    });
+
+    expect(bundle.retrieval).toEqual(retrieval);
   });
 });
