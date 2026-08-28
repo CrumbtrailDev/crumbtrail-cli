@@ -524,7 +524,7 @@ const TOOLS = [
   {
     name: "listDistinctBugs",
     description:
-      'List the DISTINCT bugs a session hit, grouped deterministically from detector signals within a session. A signal that recurs across page URLs (for example a blocked third-party analytics beacon rejection) collapses into one bug carrying occurrenceCount and affectedUrls. With mode:"cross-session", scans finalized sessions and returns recurrence rollups by stable bug signature. Use getBug for one session bug, or getRecurrence(signature) for one recurrence.',
+      'List the DISTINCT bugs a session hit, grouped deterministically from detector signals within a session. A signal that recurs across page URLs (for example a blocked third-party analytics beacon rejection) collapses into one bug carrying occurrenceCount and affectedUrls. With mode:"cross-session", scans finalized sessions and returns recurrence rollups by stable bug signature, excluding Crumbtrail\'s own doctor probe sessions and reporting how many were held back as doctorProbesSkipped. Use getBug for one session bug, or getRecurrence(signature) for one recurrence.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -548,7 +548,7 @@ const TOOLS = [
   {
     name: "getRecurrence",
     description:
-      'Get a cross-session recurrence rollup by signature from listDistinctBugs({mode:"cross-session"}). Returns first_seen/last_seen, session_count, release_span, app/tenant labels, and per-session occurrences.',
+      'Get a cross-session recurrence rollup by signature from listDistinctBugs({mode:"cross-session"}). Returns first_seen/last_seen, session_count, release_span, per-session occurrences, and label rollups: apps is {known, unknown} where unknown counts sessions that recorded no app name, and tenants is present only when a session carried one. Crumbtrail\'s own doctor probe sessions are excluded.',
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -2760,20 +2760,29 @@ export class McpServer {
 
   private async toolListDistinctBugs(args: Record<string, unknown>) {
     if (args.mode === "cross-session") {
-      const { rollups, unavailable } = await this.recurrenceRollups(args);
+      const { rollups, doctorProbesSkipped, unavailable } =
+        await this.recurrenceRollups(args);
       // Nothing read and a reason why: an error, not an empty account.
       if (unavailable && rollups.length === 0)
         return errorResult(listingFailureMessage(unavailable));
       const compact = rollups.map((rollup) => this.compactRecurrence(rollup));
-      // A partial read still answers, and still says it is partial.
-      return unavailable
-        ? textResult({
-            recurrences: compact,
-            unavailable: {
-              ...unavailable,
-              detail: listingFailureMessage(unavailable),
-            },
-          })
+      // A partial read still answers, and still says it is partial. Sessions
+      // held back are named too: a shorter list with no reason reads as fewer
+      // bugs.
+      return unavailable || doctorProbesSkipped > 0
+        ? textResult(
+            removeUndefined({
+              recurrences: compact,
+              doctorProbesSkipped:
+                doctorProbesSkipped > 0 ? doctorProbesSkipped : undefined,
+              unavailable: unavailable
+                ? {
+                    ...unavailable,
+                    detail: listingFailureMessage(unavailable),
+                  }
+                : undefined,
+            }),
+          )
         : textResult(compact);
     }
 
@@ -2868,11 +2877,15 @@ export class McpServer {
 
   private async recurrenceRollups(args: Record<string, unknown>): Promise<{
     rollups: DistinctBugRecurrence[];
+    doctorProbesSkipped: number;
     unavailable?: McpSessionListingFailure;
   }> {
-    const { inputs, unavailable } = await this.recurrenceInputs(args);
+    const { inputs, doctorProbesSkipped, unavailable } =
+      await this.recurrenceInputs(args);
     const rollups = groupDistinctBugRecurrences(inputs);
-    return unavailable ? { rollups, unavailable } : { rollups };
+    return unavailable
+      ? { rollups, doctorProbesSkipped, unavailable }
+      : { rollups, doctorProbesSkipped };
   }
 
   /**
@@ -2887,17 +2900,30 @@ export class McpServer {
    */
   private async recurrenceInputs(args: Record<string, unknown>): Promise<{
     inputs: DistinctBugRecurrenceInput[];
+    doctorProbesSkipped: number;
     unavailable?: McpSessionListingFailure;
   }> {
     const inputs: DistinctBugRecurrenceInput[] = [];
     const listing = await this.store.listSessions();
+    let doctorProbesSkipped = 0;
     for (const { id, dir } of listing.sessions) {
+      // The one funnel both cross-session tools read through, so the doctor
+      // probe exclusion lands once instead of per tool. Crumbtrail's own
+      // synthetic failures are not the customer's recurring bugs.
+      if (isDoctorProbeSessionId(id)) {
+        doctorProbesSkipped += 1;
+        continue;
+      }
       const meta = (await this.readJsonRecordAsync(dir, "meta.json")) ?? {};
       if (typeof args.app === "string" && meta.app !== args.app) continue;
       if (typeof args.tenant === "string" && meta.tenant !== args.tenant)
         continue;
       const sessionId =
         stringField(meta.id) ?? stringField(meta.sessionId) ?? id;
+      if (sessionId !== id && isDoctorProbeSessionId(sessionId)) {
+        doctorProbesSkipped += 1;
+        continue;
+      }
       const session = {
         sessionId,
         dir,
@@ -2912,8 +2938,8 @@ export class McpServer {
       }
     }
     return listing.unavailable
-      ? { inputs, unavailable: listing.unavailable }
-      : { inputs };
+      ? { inputs, doctorProbesSkipped, unavailable: listing.unavailable }
+      : { inputs, doctorProbesSkipped };
   }
 
   private distinctBugOrder(
@@ -3045,6 +3071,12 @@ export class McpServer {
         const found = (await store.listSessions()).find(
           (session) => session.id === sessionId,
         );
+        // The store no longer lists doctor probes, so say which of the two
+        // this is rather than reporting Crumbtrail's own probe as missing.
+        if (!found && isDoctorProbeSessionId(sessionId))
+          return errorResult(
+            `Session ${sessionId} is a Crumbtrail doctor probe, not captured application evidence. Doctor probes are excluded from issue memory. Use crumbtrail doctor to inspect probe results.`,
+          );
         if (!found) return errorResult(`${SESSION_UNREADABLE} Session id: ${sessionId}.`);
         profile = await sessionIssueProfile(found.dir, store);
         excludeSessionId = sessionId;

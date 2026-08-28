@@ -1,5 +1,6 @@
 import path from "node:path";
 import { buildDistinctBugSignature, type DistinctBug } from "./distinct-bugs";
+import { isDoctorProbeSessionId } from "./doctor-probes";
 import {
   defaultSessionStore,
   normalizePartitionSegment,
@@ -335,13 +336,22 @@ function scopedSessionsRoot(
 
 /** Build a RecallStore rooted at `outputDir` from the shared storage readers.
  *  Identical to the store McpServer.recallStore() constructs, so the MCP tool
- *  and the inner /api/solve-context endpoint locate against the same data. */
+ *  and the inner /api/solve-context endpoint locate against the same data.
+ *
+ *  Crumbtrail's own doctor probes are excluded HERE, at the store boundary,
+ *  rather than in each caller. A probe is a synthetic failure this product
+ *  injects to prove capture works; returning one as a precedent or a located
+ *  incident is the product answering a customer's question with its own health
+ *  check. `getLatestIssue` filtered them and recall did not, which is exactly
+ *  the split a per-caller guard produces — the next reader of this seam gets
+ *  the exclusion without knowing it exists. */
 export function buildRecallStore(outputDir: string): RecallStore {
   return {
-    listSessions: (scope) => {
+    listSessions: async (scope) => {
       const root = scopedSessionsRoot(outputDir, scope);
-      if (root === undefined) return Promise.resolve([]);
-      return defaultSessionStore.listSessions(root);
+      if (root === undefined) return [];
+      const sessions = await defaultSessionStore.listSessions(root);
+      return sessions.filter((session) => !isDoctorProbeSessionId(session.id));
     },
     readJsonRecord: (dir, name) => readSessionJsonRecord(dir, name),
     readDistinctBugs: (dir) => readSessionDistinctBugs(dir),

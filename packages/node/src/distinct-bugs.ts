@@ -152,6 +152,22 @@ export interface DistinctBugRecurrenceOccurrence {
   dir?: string;
 }
 
+/**
+ * A label rollup that distinguishes "no sessions carried this label" from
+ * "sessions carried it and we do not know the value".
+ *
+ * A bare `string[]` cannot: a session finalized without `meta.app` contributed
+ * nothing to the list and left no marker, so `apps: []` answered "which apps
+ * does this affect" with "none" when the true answer was "one, unnamed". A
+ * person reading a dashboard sees a blank; an agent reading JSON sees zero.
+ */
+export interface DistinctBugRecurrenceLabels {
+  /** Distinct label values, sorted. */
+  known: string[];
+  /** Sessions in this recurrence whose label was not recorded. */
+  unknown: number;
+}
+
 export interface DistinctBugRecurrence {
   signature: string;
   title: string;
@@ -160,8 +176,13 @@ export interface DistinctBugRecurrence {
   last_seen: number;
   session_count: number;
   release_span?: { first: string; last: string; label: string };
-  apps: string[];
-  tenants: string[];
+  apps: DistinctBugRecurrenceLabels;
+  /**
+   * Omitted entirely when no session in the recurrence carried a tenant, which
+   * is every self-hosted single-tenant store. `tenants: []` there was a claim
+   * about a dimension that does not exist in that deployment.
+   */
+  tenants?: DistinctBugRecurrenceLabels;
   occurrences: DistinctBugRecurrenceOccurrence[];
 }
 
@@ -471,8 +492,10 @@ export function groupDistinctBugRecurrences(
         ),
         session_count: uniqueSessions.size,
         release_span: releaseSpan,
-        apps: uniqueSorted(ordered.map((occurrence) => occurrence.app)),
-        tenants: uniqueSorted(ordered.map((occurrence) => occurrence.tenant)),
+        apps: labelCoverage(ordered, (occurrence) => occurrence.app),
+        tenants: presentOrUndefined(
+          labelCoverage(ordered, (occurrence) => occurrence.tenant),
+        ),
         occurrences: ordered,
       }) as DistinctBugRecurrence,
     );
@@ -974,6 +997,41 @@ function buildReleaseSpan(
   const first = unique[0];
   const last = unique[unique.length - 1];
   return { first, last, label: first === last ? first : `${first}->${last}` };
+}
+
+/**
+ * Roll one session-level label up across a recurrence's occurrences, counting
+ * the sessions that never recorded it instead of silently dropping them.
+ *
+ * Counted per SESSION, not per occurrence: two grouped bugs from the same
+ * unnamed session are one unknown app, matching `session_count`.
+ */
+function labelCoverage(
+  occurrences: DistinctBugRecurrenceOccurrence[],
+  pick: (occurrence: DistinctBugRecurrenceOccurrence) => string | undefined,
+): DistinctBugRecurrenceLabels {
+  const bySession = new Map<string, string | undefined>();
+  for (const occurrence of occurrences) {
+    const value = pick(occurrence);
+    const existing = bySession.get(occurrence.sessionId);
+    bySession.set(
+      occurrence.sessionId,
+      existing && existing.length > 0 ? existing : value,
+    );
+  }
+  const values = [...bySession.values()];
+  return {
+    known: uniqueSorted(values),
+    unknown: values.filter((value) => !value || value.length === 0).length,
+  };
+}
+
+/** `undefined` when the dimension is absent from every session, so
+ *  `removeUndefined` drops the key rather than shipping an empty claim. */
+function presentOrUndefined(
+  labels: DistinctBugRecurrenceLabels,
+): DistinctBugRecurrenceLabels | undefined {
+  return labels.known.length > 0 ? labels : undefined;
 }
 
 function uniqueSorted(values: Array<string | undefined>): string[] {
