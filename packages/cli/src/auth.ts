@@ -20,6 +20,7 @@ import path from "node:path";
 import {
   APP_URL_ENV_VAR,
   ApiError,
+  DEFAULT_ENDPOINT,
   dashboardBase,
   normalizeBase,
   requestJson,
@@ -424,6 +425,56 @@ const sleep = (ms: number): Promise<void> =>
  * setups where the redirect can't reach localhost). Throws so the caller can
  * fall back to the device flow if the browser can't be opened.
  */
+/** Where the dashboard origin in use came from, so a failure can name it. */
+export type AppBaseSource =
+  /** CRUMBTRAIL_APP_URL — the user pinned it. */
+  | "override"
+  /** The deployment told us, via /auth/me, a stored login, or a device start. */
+  | "reported"
+  /** Nothing told us: derived from the API endpoint. */
+  | "endpoint";
+
+/**
+ * The dashboard origin for `base` and where it came from.
+ *
+ * "reported" is the only source that means the deployment has actually spoken.
+ * Everything else is a guess or a user override, and the two failure messages
+ * they need are different ones.
+ */
+export function resolveAppBase(
+  base: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { appBase: string; source: AppBaseSource } {
+  if (env[APP_URL_ENV_VAR]?.trim()) {
+    return { appBase: dashboardBase(base, undefined, env), source: "override" };
+  }
+  const stored = loadAuth(env);
+  const known =
+    reportedAppBase(base) ??
+    (stored && normalizeBase(stored.endpoint) === normalizeBase(base)
+      ? stored.appBaseUrl
+      : undefined);
+  return {
+    appBase: dashboardBase(base, known, env),
+    source: known ? "reported" : "endpoint",
+  };
+}
+
+/**
+ * True when the dashboard origin for `base` is known rather than guessed.
+ *
+ * The hosted default counts: `api.crumbtrail.ai` → `app.crumbtrail.ai` is a
+ * rewrite this CLI ships, not a guess. Every other endpoint with nothing
+ * reported is a guess, and on a split-origin self-host it is the wrong one.
+ */
+function dashboardOriginKnown(
+  base: string,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (resolveAppBase(base, env).source !== "endpoint") return true;
+  return normalizeBase(base) === DEFAULT_ENDPOINT;
+}
+
 export async function loginBrowser(opts: LoginOptions): Promise<TokenResponse> {
   const { verifier, challenge } = pkcePair();
   const server = await startCallbackServer();
@@ -436,17 +487,12 @@ export async function loginBrowser(opts: LoginOptions): Promise<TokenResponse> {
   // itself. On a split-origin self-host without CRUMBTRAIL_APP_URL that made the
   // authorize URL the API host every time, which 404s, so the browser hand-off
   // bailed out and every login silently fell back to device code. A previous
-  // login stored that origin; use it.
+  // login stored that origin, and `login` asks the deployment for it before
+  // getting here; use whichever spoke.
   const env = opts.env ?? process.env;
-  const stored = loadAuth(env);
-  const knownAppBase =
-    reportedAppBase(opts.base) ??
-    (stored && normalizeBase(stored.endpoint) === normalizeBase(opts.base)
-      ? stored.appBaseUrl
-      : undefined);
-  const appBase = dashboardBase(opts.base, knownAppBase, env);
+  const { appBase, source } = resolveAppBase(opts.base, env);
   const authorizeUrl = `${appBase}/cli/authorize?port=${server.port}&challenge=${challenge}`;
-  const missing = await signInPageMissing(authorizeUrl, opts.fetchImpl);
+  const missing = await signInPageMissing(authorizeUrl, opts.fetchImpl, source);
   if (missing) {
     // Opening a 404 and then waiting on it is the worst of both. Bail out so
     // the device flow gets its turn: that one is told the dashboard origin by
@@ -491,7 +537,21 @@ export async function loginBrowser(opts: LoginOptions): Promise<TokenResponse> {
   });
   try {
     const code = await Promise.race([server.waitForCode, pastedCode, deadline]);
-    return await exchangeCode(opts.base, { code, verifier }, opts.fetchImpl);
+    const minted = await exchangeCode(
+      opts.base,
+      { code, verifier },
+      opts.fetchImpl,
+    );
+    // Carry the origin this hand-off actually used, so it lands in auth.json
+    // and the next run does not have to ask again. A guess derived from the
+    // endpoint is NOT carried: storing it would launder it into something the
+    // deployment appears to have reported.
+    const resolved = minted.appBaseUrl
+      ? dashboardBase(opts.base, minted.appBaseUrl, env)
+      : source === "endpoint"
+        ? undefined
+        : appBase;
+    return resolved ? { ...minted, appBaseUrl: resolved } : minted;
   } finally {
     if (deadlineTimer) clearTimeout(deadlineTimer);
     stdin.cancel();
@@ -560,22 +620,70 @@ async function awaitPollSlot(args: {
  * wait out the `Retry-After` the server sent and carry on polling — failing the
  * login instead is how `crumbtrail login` used to kill its own approval.
  */
-export async function loginDevice(opts: LoginOptions): Promise<TokenResponse> {
+/** A device authorization that has been started but not yet polled. */
+export interface StartedDevice {
+  device: DeviceStart;
+  /** When the code was minted — its lifetime runs from here, not from first poll. */
+  startedAt: number;
+  /** The dashboard origin, resolved from `verificationUri` (CRUMBTRAIL_APP_URL wins). */
+  appBaseUrl: string;
+  /** Where `appBaseUrl` came from, for the message shown if it 404s. */
+  appBaseSource: AppBaseSource;
+}
+
+/**
+ * Start a device authorization, and remember the dashboard origin it reveals.
+ *
+ * This is the ONLY unauthenticated call that makes a deployment say where its
+ * dashboard lives, which is why the browser hand-off asks for it first: without
+ * it, a self-host's first login had no source for the origin at all, printed a
+ * 404 authorize URL, and degraded to device code while blaming an env var the
+ * user never needed to set.
+ */
+export async function startDevice(opts: LoginOptions): Promise<StartedDevice> {
+  const env = opts.env ?? process.env;
   const device = await requestJson<DeviceStart>(`${opts.base}/api/cli/device`, {
     method: "POST",
     body: {},
     fetchImpl: opts.fetchImpl,
   });
+  const startedAt = Date.now();
+  const reported = appOriginOf(device.verificationUri);
+  rememberAppBase(opts.base, reported);
   // The dashboard origin, resolved ONCE here and reused for every link this
   // login and the wizard after it will print. `verificationUri` is a dashboard
   // route, so the origin serving it IS the app host — but CRUMBTRAIL_APP_URL
   // outranks it, because a deployment whose PUBLIC_BASE_URL points at its own
   // API host reports an origin that serves no dashboard at all.
-  const appBaseUrl = dashboardBase(
-    opts.base,
-    appOriginOf(device.verificationUri),
-    opts.env ?? process.env,
-  );
+  const appBaseUrl = dashboardBase(opts.base, reported, env);
+  const appBaseSource: AppBaseSource = env[APP_URL_ENV_VAR]?.trim()
+    ? "override"
+    : reported
+      ? "reported"
+      : "endpoint";
+  return { device, startedAt, appBaseUrl, appBaseSource };
+}
+
+/** Below this, a pre-started code has too little life left to be worth reusing. */
+const DEVICE_REUSE_FLOOR_MS = 60_000;
+
+export async function loginDevice(
+  opts: LoginOptions,
+  preStarted?: StartedDevice,
+): Promise<TokenResponse> {
+  // A code started before the browser hand-off is reused only while it has
+  // real life left — the hand-off can burn its whole five-minute deadline
+  // first, and resuming a dead code would fail the login instantly.
+  const reusable =
+    preStarted &&
+    preStarted.startedAt +
+      Math.max(1, preStarted.device.expiresIn) * 1000 -
+      Date.now() >
+      DEVICE_REUSE_FLOOR_MS
+      ? preStarted
+      : undefined;
+  const started = reusable ?? (await startDevice(opts));
+  const { device, appBaseUrl, appBaseSource } = started;
   const activateUrl = signInUrl(appBaseUrl, device.verificationUri);
 
   opts.ui.out("");
@@ -584,7 +692,11 @@ export async function loginDevice(opts: LoginOptions): Promise<TokenResponse> {
   opts.ui.out(
     `and enter the code:  ${color.bold(color.brandLift(device.userCode))}`,
   );
-  const missing = await signInPageMissing(activateUrl, opts.fetchImpl);
+  const missing = await signInPageMissing(
+    activateUrl,
+    opts.fetchImpl,
+    appBaseSource,
+  );
   if (missing) {
     // Never leave someone staring at a link that cannot work. Naming the lever
     // is the difference between a stuck login and a fixed one.
@@ -595,7 +707,7 @@ export async function loginDevice(opts: LoginOptions): Promise<TokenResponse> {
   const intervalMs = opts.pollIntervalMs ?? Math.max(1, device.interval) * 1000;
   const windowMs = opts.pollWindowMs ?? POLL_WINDOW_MS;
   const budget = opts.pollBudget ?? DEVICE_POLL_BUDGET;
-  const deadline = Date.now() + Math.max(1, device.expiresIn) * 1000;
+  const deadline = started.startedAt + Math.max(1, device.expiresIn) * 1000;
   const spent: number[] = [];
   let warnedRateLimited = false;
 
@@ -694,6 +806,7 @@ export function signInUrl(appBase: string, uriOrPath: string): string {
 export async function signInPageMissing(
   url: string,
   fetchImpl?: typeof fetch,
+  source: AppBaseSource = "endpoint",
 ): Promise<string | undefined> {
   let status: number;
   try {
@@ -705,6 +818,25 @@ export async function signInPageMissing(
   }
   if (status !== 404) return undefined;
   const origin = appOriginOf(url) ?? url;
+  // Name the lever that is actually wrong. Telling somebody to set
+  // CRUMBTRAIL_APP_URL when they already have it set, or when the CLI simply
+  // never asked the deployment where its dashboard is, sends them to fix the
+  // one thing that was not the cause.
+  if (source === "override") {
+    return (
+      `${url} returns 404 — ${APP_URL_ENV_VAR} points at ${origin}, which is ` +
+      `not serving Crumbtrail's dashboard. Point it at your dashboard URL and ` +
+      `run \`crumbtrail login\` again.`
+    );
+  }
+  if (source === "reported") {
+    return (
+      `${url} returns 404 — this deployment reports ${origin} as its ` +
+      `dashboard, and that origin is not serving one. Fix its PUBLIC_BASE_URL, ` +
+      `or set ${APP_URL_ENV_VAR} to your dashboard URL and run ` +
+      `\`crumbtrail login\` again.`
+    );
+  }
   return (
     `${url} returns 404 — ${origin} is not serving Crumbtrail's dashboard. ` +
     `Set ${APP_URL_ENV_VAR} to your dashboard URL and run \`crumbtrail login\` again.`
@@ -714,23 +846,34 @@ export async function signInPageMissing(
 /** Pick the login flow: browser hand-off when viable, else device fallback. */
 export async function login(opts: LoginOptions): Promise<TokenResponse> {
   const env = opts.env ?? process.env;
-  if (canUseBrowser(opts.noBrowser ?? false, env)) {
-    try {
-      return await loginBrowser(opts);
-    } catch (err) {
-      // Say WHY. "Unavailable" alone sent people looking at their browser when
-      // the real cause was a dashboard origin that serves no sign-in page.
-      const why =
-        err instanceof Error && err.message ? ` (${err.message})` : "";
-      opts.ui.out(
-        color.dim(
-          `Browser hand-off unavailable${why} — falling back to device code.`,
-        ),
-      );
-      return loginDevice(opts);
-    }
+  if (!canUseBrowser(opts.noBrowser ?? false, env)) return loginDevice(opts);
+
+  // Ask the deployment where its dashboard is BEFORE deciding a browser
+  // hand-off is impossible. `POST /api/cli/device` is unauthenticated and its
+  // `verificationUri` is a dashboard route, so it is the one thing that can
+  // answer that question before a token exists. Without this, a self-hosted or
+  // split-origin stack had no source for the origin on a first login, built the
+  // authorize URL on the API host, got a 404, and fell back to device code —
+  // which then printed the correct origin two lines later.
+  let started: StartedDevice | undefined;
+  if (!dashboardOriginKnown(opts.base, env)) {
+    // A deployment that will not start a device authorization cannot answer
+    // this; the hand-off still gets its turn with the endpoint-derived guess.
+    started = await startDevice(opts).catch(() => undefined);
   }
-  return loginDevice(opts);
+  try {
+    return await loginBrowser(opts);
+  } catch (err) {
+    // Say WHY. "Unavailable" alone sent people looking at their browser when
+    // the real cause was a dashboard origin that serves no sign-in page.
+    const why = err instanceof Error && err.message ? ` (${err.message})` : "";
+    opts.ui.out(
+      color.dim(
+        `Browser hand-off unavailable${why} — falling back to device code.`,
+      ),
+    );
+    return loginDevice(opts, started);
+  }
 }
 
 /**
