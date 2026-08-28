@@ -3,13 +3,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  autoCapture,
   createCrumbtrailExpressErrorMiddleware,
   createCrumbtrailExpressMiddleware,
-  createServer,
-  McpServer,
-  SessionManager,
+  installHttpRequestCapture,
+  instrumentDatabaseClient,
 } from "../index";
-import { parseArgs } from "../cli";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const packageRoot = path.resolve(__dirname, "../..");
@@ -31,17 +30,15 @@ function readPackageJson(): {
 }
 
 describe("package runtime boundary", () => {
-  it("declares the built local server binary as the package runtime entrypoint", () => {
+  it("ships a library and no executable", () => {
     const packageJson = readPackageJson();
 
     expect(packageJson.name).toBe("crumbtrail-node");
     expect(packageJson.type).toBe("module");
-    // `crumbtrail` is reserved for the packages/cli setup wizard bin — this
-    // package only exposes the server runtime under `crumbtrail-server` to
-    // avoid a bin collision when both packages are installed together.
-    expect(packageJson.bin).toEqual({
-      "crumbtrail-server": "./dist/cli.cjs",
-    });
+    // The `crumbtrail-server` binary and the analysis it drove moved to the
+    // cloud. Nothing here is meant to be run; this package is imported by the
+    // customer's own process and nothing else.
+    expect(packageJson.bin).toBeUndefined();
     expect(packageJson.main).toBe("./dist/index.cjs");
     expect(packageJson.module).toBe("./dist/index.js");
     expect(packageJson.types).toBe("./dist/index.d.ts");
@@ -53,38 +50,40 @@ describe("package runtime boundary", () => {
     expect(packageJson.files).toContain("dist");
   });
 
-  it("build config emits both the public API and CLI entrypoints", () => {
+  it("builds one dual-format library entry", () => {
     const tsupConfig = fs.readFileSync(
       path.join(packageRoot, "tsup.config.ts"),
       "utf8",
     );
 
-    // Two builds, not one, and the split is deliberate: an ESM build of the
-    // CLI inlines core's import.meta and breaks under require, so the
-    // executable ships CJS only while the library entry stays dual.
-    expect(tsupConfig).toContain('entry: ["src/cli.ts"]');
-    expect(tsupConfig).toContain('format: ["cjs"]');
     expect(tsupConfig).toContain('entry: ["src/index.ts"]');
     expect(tsupConfig).toContain('format: ["esm", "cjs"]');
     expect(tsupConfig).toContain("dts: true");
+    // No second build: there is no CLI entry left to special-case.
+    expect(tsupConfig).not.toContain("src/cli.ts");
   });
 
-  it("exports the runtime primitives consumed by self-host integrations", () => {
-    expect(typeof createServer).toBe("function");
-    expect(typeof SessionManager).toBe("function");
-    expect(typeof McpServer).toBe("function");
+  it("exports the capture primitives the setup wizard injects", () => {
+    expect(typeof autoCapture).toBe("function");
     expect(typeof createCrumbtrailExpressMiddleware).toBe("function");
     expect(typeof createCrumbtrailExpressErrorMiddleware).toBe("function");
+    expect(typeof installHttpRequestCapture).toBe("function");
+    expect(typeof instrumentDatabaseClient).toBe("function");
   });
 
-  it("keeps CLI defaults suitable for local self-host startup", () => {
-    const parsed = parseArgs([]);
+  it("exports nothing that analyses a session", async () => {
+    const api = await import("../index");
+    const analysis = [
+      "createServer",
+      "McpServer",
+      "SessionManager",
+      "postProcess",
+      "computeDistinctBugSignatures",
+      "buildLlmBundle",
+    ];
 
-    expect(parsed.host).toBe("127.0.0.1");
-    expect(parsed.port).toBe(9898);
-    expect(parsed.output).toContain(path.join(".crumbtrail", "sessions"));
-    expect(parsed.allowedOrigins).toEqual([]);
-    expect(parsed.mcp).toBe(false);
-    expect(parsed.ai).toBe(false);
+    for (const name of analysis) {
+      expect(name in api).toBe(false);
+    }
   });
 });
