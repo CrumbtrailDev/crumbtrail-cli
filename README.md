@@ -10,13 +10,13 @@ them require it.
 
 ## Packages
 
-| Package | Description |
-| --- | --- |
-| [`crumbtrail`](packages/cli) | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. Also the detection and injection-planning library the hosted product imports, with install recipes and agent prompts on the `/install` subpath. |
-| [`crumbtrail-core`](packages/core) | Framework-agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. React bindings on the `/react` subpath, Tauri bindings on `/tauri`. |
-| [`crumbtrail-node`](packages/node) | Node.js server: session store, backend capture, the local dashboard. |
-| [`crumbtrail-react-native`](packages/react-native) | React Native and Expo bindings. Its own package because its native peer dependencies must not reach a web bundle. |
-| [`crumbtrail-capacitor`](packages/capacitor) | Capacitor and Ionic bindings: adds device, app lifecycle, connectivity and deep link context to the web capture already running in the WebView. |
+| Package                                            | Description                                                                                                                                                                                                               |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`crumbtrail`](packages/cli)                       | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. Also the detection and injection-planning library the hosted product imports, with install recipes and agent prompts on the `/install` subpath. |
+| [`crumbtrail-core`](packages/core)                 | Framework-agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. React bindings on the `/react` subpath, Tauri bindings on `/tauri`.                                                  |
+| [`crumbtrail-node`](packages/node)                 | Node.js server: session store, backend capture, the local dashboard.                                                                                                                                                      |
+| [`crumbtrail-react-native`](packages/react-native) | React Native and Expo bindings. Its own package because its native peer dependencies must not reach a web bundle.                                                                                                         |
+| [`crumbtrail-capacitor`](packages/capacitor)       | Capacitor and Ionic bindings: adds device, app lifecycle, connectivity and deep link context to the web capture already running in the WebView.                                                                           |
 
 All five publish at one shared version. A given release is the same number
 everywhere, so there is no question of which versions go together.
@@ -33,12 +33,12 @@ single home on its own platform's registry. Two of them are built and tested
 here but not released yet, so the status column is the one to read first: the
 setup wizard will not wire an app against a package it cannot resolve.
 
-| SDK | Registry | Status |
-| --- | --- | --- |
-| [`Crumbtrail` (Swift)](packages/swift) | Swift Package Manager. Native iOS, macOS, tvOS and watchOS. No dependencies. | Consumable by Git URL |
-| [`tauri-plugin-crumbtrail`](packages/tauri/rust) | crates.io. The Rust half of Tauri support; its JavaScript half is `crumbtrail-core/tauri`. | Published |
-| [`ai.crumbtrail:crumbtrail-android`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies. | Not published yet |
-| [`crumbtrail_flutter`](packages/flutter) | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment. | Not published yet |
+| SDK                                                   | Registry                                                                                   | Status                |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------ | --------------------- |
+| [`Crumbtrail` (Swift)](packages/swift)                | Swift Package Manager. Native iOS, macOS, tvOS and watchOS. No dependencies.               | Consumable by Git URL |
+| [`tauri-plugin-crumbtrail`](packages/tauri/rust)      | crates.io. The Rust half of Tauri support; its JavaScript half is `crumbtrail-core/tauri`. | Published             |
+| [`ai.crumbtrail:crumbtrail-android`](packages/kotlin) | Maven Central. Native Android in Kotlin. No transitive dependencies.                       | Not published yet     |
+| [`crumbtrail_flutter`](packages/flutter)              | pub.dev. Both of Flutter's error surfaces, app lifecycle, navigation and environment.      | Not published yet     |
 
 ## Quick start
 
@@ -59,6 +59,13 @@ package starts gets its own capture under its own service name, your `.env` is
 loaded before the key is read so capture is on when you reproduce a bug locally,
 and a containerised frontend gets its key declared as a Docker build argument.
 See [what it writes](packages/cli#everything-a-deployed-app-needs).
+
+What it writes is deliberately narrower than the SDK's own defaults. Cookie,
+keystroke and clipboard capture are written off in every browser init, backend
+capture is wrapped in a check on the ingest key so an unconfigured service is
+left untouched, and the Express middleware is written with response body capture
+off. Each one is a visible line in your own source, so turning it on is a one
+word edit. See [what it turns off](packages/cli#what-it-turns-off).
 
 If nothing arrives after you start your app, run:
 
@@ -103,7 +110,13 @@ is the right answer only if that is where you captured them:
   "mcpServers": {
     "crumbtrail": {
       "command": "npx",
-      "args": ["-y", "--package", "crumbtrail-node", "crumbtrail-server", "--mcp"],
+      "args": [
+        "-y",
+        "--package",
+        "crumbtrail-node",
+        "crumbtrail-server",
+        "--mcp"
+      ],
       "env": {
         "CRUMBTRAIL_CLOUD_URL": "https://your-crumbtrail-host",
         "CRUMBTRAIL_CLOUD_TOKEN": "<the ctagt_ token>"

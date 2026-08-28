@@ -173,6 +173,37 @@ enabled. When the repository names none it emits the list empty, with a comment
 saying what belongs in it, and you fill it in yourself. See
 [If your frontend and backend are separate services](#if-your-frontend-and-backend-are-separate-services).
 
+### What it turns off
+
+The SDK's own defaults capture more than a first install should, and
+`PRESET_PASSIVE` does not change that: it sets two auto flag booleans and turns
+nothing off. An init that names no collectors therefore ships cookie values,
+every keystroke and every clipboard read on the first deploy. The wizard writes
+three opt outs into every browser init instead, where you can see them and
+change them:
+
+```js
+cookies: false,
+keystrokes: false,
+clipboard: false,
+```
+
+Set one to `true` when your privacy notice covers it. Everything else stays on.
+Console, network, clicks, storage, errors and performance are what a bug is
+read from, and an install that captured none of them would report success and
+tell you nothing.
+
+Backends get two more. `autoCapture` is wrapped in a check on the ingest key,
+because it hooks uncaught exceptions and patches your SQL driver before its
+first handshake, so a service that was never given a key would otherwise pay all
+of that and capture nothing. On Express, both middleware are written with
+`captureResponseBody: "off"`, because a 4xx body is an auth or validation
+payload belonging to your own user, and the request middleware also gets
+`captureLogs: false` and `captureRuntimeWarnings: false`, because `autoCapture`
+already captures both in the same process and the middleware would only patch
+stdout a second time. Set `captureResponseBody` to `"error"` or `"all"` when you
+want the response text that explains a failure.
+
 It writes none of it when the SDK could not be installed. An import for a package
 that is not there does not degrade, it fails the build, so a failed install ends
 with your repository untouched and a note saying what to install.
