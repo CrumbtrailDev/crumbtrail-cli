@@ -444,6 +444,23 @@ describe("server", () => {
       ).toBe(true);
     }
 
+    // Written and readable are one decision, not two. A recording this server
+    // accepted and then refuses to serve is a session the dashboard shows as
+    // "no replay was recorded" while the bytes sit on disk.
+    const addr = server.address() as { port: number };
+    for (const [name, contentType] of [
+      ["replay.json", "application/json; charset=utf-8"],
+      ["replay-000000.json.gz", "application/gzip"],
+    ] as const) {
+      const read = await fetch(
+        `http://localhost:${addr.port}/sessions/ses_replay/${name}`,
+        { headers: authHeaders },
+      );
+      expect(read.status).toBe(200);
+      expect(read.headers.get("content-type")).toBe(contentType);
+      expect(await read.text()).toBe("chunk");
+    }
+
     // Matched by an anchored pattern with an exact digit count, because the
     // name becomes a filesystem path. A shorter run of digits, a suffix, or a
     // different extension is not a replay chunk.

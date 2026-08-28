@@ -161,6 +161,7 @@ const MIME_TYPES: Record<string, string> = {
   ".ndjson": "application/x-ndjson",
   ".md": "text/markdown",
   ".zst": "application/zstd",
+  ".gz": "application/gzip",
   ".webm": "video/webm",
   ".png": "image/png",
   ".svg": "image/svg+xml",
@@ -756,7 +757,14 @@ async function serveSessionArtifact(
     "audio.webm",
   ]);
   const windowsMatch = artifactName.match(/^windows\/(cand_\d{4}\.md)$/);
-  if (!allowed.has(artifactName) && !windowsMatch) {
+  // The replay family is written through /api/blob and read back here, so the
+  // two lists have to agree: a name this server accepts on write and refuses on
+  // read is a recording that exists on disk and can never be played.
+  if (
+    !allowed.has(artifactName) &&
+    !windowsMatch &&
+    !isReplayArtifactName(artifactName)
+  ) {
     jsonError(res, 404, "Not found", "not_found", false);
     return;
   }
