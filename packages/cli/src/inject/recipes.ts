@@ -534,18 +534,58 @@ function amendPlan(
   if (!report) return null;
   if (!amended) return incompletePlan(input, status, report);
 
+  // The fresh-injection path prepends a guarded env file load above the init it
+  // writes, so the key it just put in `.env` is set before that init reads it.
+  // The amend path used to skip it, which made the amended service the one case
+  // where the wizard wrote a key the service never read, and every line after
+  // it reported a finished setup. Same snippet, same quoting, same workspace
+  // relative paths as the fresh path, so the two files read alike in review.
+  const keyRef = keyRefFor(input);
+  const preloadEnvVar =
+    keyRef &&
+    !keyRef.compileTime &&
+    // A bundler-inlined variable is substituted at build time by a build that
+    // reads `.env` itself, so there is no runtime read to get ahead of.
+    !keyRef.bundlerInlined &&
+    amended.text.includes(`process.env.${keyRef.envVar}`) &&
+    // Already loads one, by its own hand or by an earlier run of this.
+    !/loadEnvFile|dotenv/.test(amended.text)
+      ? keyRef.envVar
+      : undefined;
+  if (preloadEnvVar) {
+    const quote =
+      input.recipe === "nestjs"
+        ? (value: string) => `'${value}'`
+        : JSON.stringify;
+    amended.text = prependIntoSource(
+      amended.text,
+      envPreloadSnippet(
+        preloadEnvVar,
+        quote,
+        packageDirFromRepoRoot(input.cwd, io),
+      ),
+    );
+  }
+
   const stillMissing = status.missing.filter((r) => !report.added.includes(r));
   const rel = path.relative(input.cwd, amended.file) || amended.file;
   const added = report.added
     .map((r) => INTEGRATION_REQUIREMENT_COPY[r])
     .join(", ");
+  const fieldList = report.addedFields.map((f) => `\`${f}\``).join(", ");
   const warnings = [
-    `Your own Crumbtrail initialization in ${rel} was missing ${added} — added ${report.addedFields.map((f) => `\`${f}\``).join(", ")} to it instead of starting a second one. Nothing else in that file changed.`,
+    // Both edits, named. The old line said "nothing else in that file changed"
+    // beside a single edit, and stayed put once a second one was prepended
+    // above the init, so it described a file the wizard no longer produced.
+    preloadEnvVar
+      ? `Your own Crumbtrail initialization in ${rel} was missing ${added}. Crumbtrail added ${fieldList} to it instead of starting a second one, and prepended a guarded env file load above it so ${preloadEnvVar} is set before that init reads it. Nothing else in that file changed.`
+      : `Your own Crumbtrail initialization in ${rel} was missing ${added}. Crumbtrail added ${fieldList} to it instead of starting a second one. Nothing else in that file changed.`,
     ...stillMissing
       .filter((r) => !NOT_A_SOURCE_EDIT.has(r))
       .map((r) => `Next: ${nextActionFor(input, r, status, report)}`),
   ];
   const amendedFields = report.addedFields;
+  const preload = preloadEnvVar ? ({ envPreloadAdded: true } as const) : {};
 
   const git = io.gitStatus(input.cwd, amended.file);
   if (git.dirty && !input.options?.force) {
@@ -556,6 +596,7 @@ function amendPlan(
       content: amended.text,
       applyMode: "rewrite",
       amendedFields,
+      ...preload,
       warnings,
     };
   }
@@ -565,6 +606,7 @@ function amendPlan(
     targetPath: amended.file,
     content: amended.text,
     amendedFields,
+    ...preload,
     warnings,
   };
 }
@@ -1761,6 +1803,11 @@ function planExtraBackendEntries(
       // table has no such row, and the reader who goes looking for the name
       // this line just gave them finds nothing there.
       label: `wired ${rel} (npm run ${entry.script}) to report as ${service}, a new application that appears once that process first runs`,
+      // What the same line may say once the caller HAS registered the name: the
+      // row exists, so a reader sent looking for it finds it. Swapped in by the
+      // caller and only after the registration returns, never here — this pass
+      // cannot know whether one happened.
+      registeredLabel: `wired ${rel} (npm run ${entry.script}) as application ${service}`,
       // Carried so the caller can register the name up front instead. Wiring
       // alone only decides what the sessions are labelled; the Applications
       // table is what the project has declared.

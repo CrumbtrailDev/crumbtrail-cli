@@ -139,6 +139,10 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
       h.steps.push("mint-key");
       return { apiKey: "ctkey_test123", keyId: "key_test" };
     }) as unknown as WizardDeps["createIngestKey"],
+    mintAgentToken: vi.fn(async () => {
+      h.steps.push("mint-agent-token");
+      return { secret: "ctagt_test123", expiresAt: "2030-01-01T00:00:00.000Z" };
+    }) as unknown as WizardDeps["mintAgentToken"],
     envFileIO: fakeEnvIO(),
     installSdk: vi.fn(async () => {
       h.steps.push("install");
@@ -2728,6 +2732,250 @@ describe("the amend path does not promise the app reads the env file", () => {
     expect(out).toContain("loads no env file itself");
     // The old line asserted the app read the file this run had just written.
     expect(out).not.toContain("it reads CRUMBTRAIL_KEY at startup");
+  });
+
+  it("names the prepended env load instead of claiming only the init changed", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        buildPlan: vi.fn(() => ({
+          recipe: "express",
+          kind: "amend-init" as const,
+          targetPath: "/app/server/src/crumbtrail.js",
+          content:
+            "if (!process.env.CRUMBTRAIL_KEY) { process.loadEnvFile('.env'); }\nautoCapture({ authToken: process.env.CRUMBTRAIL_KEY });\n",
+          amendedFields: ["authToken"],
+          envPreloadAdded: true as const,
+          keyEnvVar: "CRUMBTRAIL_KEY",
+          warnings: [],
+        })) as unknown as WizardDeps["buildPlan"],
+        executePlan: vi.fn(() => ({
+          kind: "update" as const,
+          written: ["/app/server/src/crumbtrail.js"],
+          skipped: false,
+          message: "Wrote 1 file(s).",
+        })) as unknown as WizardDeps["executePlan"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("a guarded env file load above it");
+    // The condition existed only because the load was missing. It is not.
+    expect(out).not.toContain("loads no env file itself");
+  });
+});
+
+describe("the wizard connects the coding agent", () => {
+  // The biggest hole the setup review found: five runs, and not one of them
+  // said "MCP", "agent token" or `ctagt_`. The product is sold as evidence
+  // delivered to a coding agent, and the wizard finished at a dashboard link
+  // with the agent half left for a person to do by hand.
+
+  it("mints a token and writes the MCP server into the detected agent config", async () => {
+    const { ui, lines } = captureUi();
+    const envIO = fakeEnvIO({ "/app/.mcp.json": "{}" });
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: envIO });
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+
+    expect(out).toContain("Connect your coding agent");
+    expect(out).toContain("Claude Code");
+    const written = JSON.parse(envIO.files.get("/app/.mcp.json")!);
+    expect(written.mcpServers.crumbtrail).toEqual({
+      type: "http",
+      url: "http://127.0.0.1:9999/mcp",
+      headers: { Authorization: "Bearer ctagt_test123" },
+    });
+    // The summary is where a reader decides whether the run finished, so the
+    // connection has to be on it rather than only in the scrollback.
+    expect(out).toContain("Agent:");
+    expect(out).toContain("MCP server written to .mcp.json");
+  });
+
+  it("keeps the live token out of git", async () => {
+    const { ui } = captureUi();
+    const envIO = fakeEnvIO({ "/app/.mcp.json": "{}" });
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: envIO });
+    await runCli(["node", "cli"], deps);
+    expect(envIO.files.get("/app/.gitignore")).toContain(".mcp.json");
+    expect(envIO.files.get("/app/.gitignore")).toContain(
+      "holds a live agent token",
+    );
+  });
+
+  it("refuses a config file git already tracks, and says why", async () => {
+    const { ui, lines } = captureUi();
+    const envIO = fakeEnvIO(
+      { "/app/.mcp.json": "{}" },
+      { tracked: [".mcp.json"] },
+    );
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: envIO });
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("tracked by git");
+    // Nothing minted, so nothing to leak: a token with nowhere safe to live is
+    // a token that must not exist.
+    expect(deps.mintAgentToken).not.toHaveBeenCalled();
+    expect(envIO.files.get("/app/.mcp.json")).toBe("{}");
+  });
+
+  it("prints the outstanding step and the link when there is no agent to write to", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: fakeEnvIO() });
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    // Unconditional: a run that cannot wire the agent still may not end silent.
+    expect(out).toContain("Mint an agent token at");
+    expect(out).toContain("/setup/keys");
+    expect(out).toContain("<the ctagt_ token>");
+    expect(deps.mintAgentToken).not.toHaveBeenCalled();
+  });
+
+  it("declines cleanly on --no-agent and still names the manual step", async () => {
+    const { ui, lines } = captureUi();
+    const envIO = fakeEnvIO({ "/app/.mcp.json": "{}" });
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: envIO });
+    await runCli(["node", "cli", "--no-agent"], deps);
+    const out = lines.join("\n");
+    expect(deps.mintAgentToken).not.toHaveBeenCalled();
+    expect(envIO.files.get("/app/.mcp.json")).toBe("{}");
+    expect(out).toContain("--no-agent");
+    expect(out).toContain("Mint an agent token at");
+  });
+
+  it("leaves a crumbtrail server the reader already configured alone", async () => {
+    const { ui, lines } = captureUi();
+    const envIO = fakeEnvIO({
+      "/app/.mcp.json": JSON.stringify({
+        mcpServers: { crumbtrail: { command: "crumbtrail-server" } },
+      }),
+    });
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: envIO });
+    await runCli(["node", "cli"], deps);
+    expect(deps.mintAgentToken).not.toHaveBeenCalled();
+    expect(lines.join("\n")).toContain("Left it as it is");
+  });
+
+  it("writes nothing to a repository whose local edits were declined", async () => {
+    const { ui, lines } = captureUi();
+    const envIO = fakeEnvIO({ "/app/.mcp.json": "{}" });
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        envFileIO: envIO,
+        // A dirty entry file the reader refuses to have edited. A decline has
+        // to mean the repository is left alone, agent config included.
+        buildPlan: vi.fn(() => ({
+          recipe: "vite-spa",
+          kind: "needs-confirm-dirty" as const,
+          targetPath: "/app/src/main.ts",
+          content: "// init",
+          keyEnvVar: "VITE_CRUMBTRAIL_KEY",
+          warnings: [],
+        })) as unknown as WizardDeps["buildPlan"],
+        prompter: { ...noopPrompter, confirm: async () => false },
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    expect(deps.mintAgentToken).not.toHaveBeenCalled();
+    expect(envIO.files.get("/app/.mcp.json")).toBe("{}");
+    expect(lines.join("\n")).toContain("Mint an agent token at");
+  });
+});
+
+describe("an extra entrypoint is registered before it ever runs", () => {
+  // Ingest upserts a service row on first sight of a name, so the row appears
+  // either way. Only the up front POST carries repo and directory identity,
+  // though, so two repositories with a worker called `api` collapse onto one
+  // row without it.
+  const planWithExtra = () =>
+    ({
+      recipe: "express",
+      kind: "prepend" as const,
+      targetPath: "/app/src/index.ts",
+      content: "// init",
+      keyEnvVar: "CRUMBTRAIL_KEY",
+      warnings: [],
+      extraEdits: [
+        {
+          path: "/app/src/seed.js",
+          mode: "update" as const,
+          content: 'autoCapture({ service: "web-seed" });\n',
+          label:
+            "wired src/seed.js (npm run seed) to report as web-seed, a new application that appears once that process first runs",
+          registeredLabel:
+            "wired src/seed.js (npm run seed) as application web-seed",
+          serviceName: "web-seed",
+        },
+      ],
+    }) as unknown as Plan;
+
+  it("provisions the extra service with this repository's identity", async () => {
+    const { ui, lines } = captureUi();
+    const plan = planWithExtra();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        buildPlan: vi.fn(() => plan) as unknown as WizardDeps["buildPlan"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    const call = (
+      deps.provisionService as unknown as {
+        mock: { calls: Array<[{ serviceName: string; identity?: unknown }]> };
+      }
+    ).mock.calls.find(([arg]) => arg.serviceName === "web-seed");
+    expect(call).toBeDefined();
+    expect(call![0].identity).toBeDefined();
+    // The claim is only allowed once the row exists.
+    expect(lines.join("\n")).toContain(
+      "wired src/seed.js (npm run seed) as application web-seed",
+    );
+  });
+
+  it("keeps the weaker claim when the registration fails", async () => {
+    const { ui, lines } = captureUi();
+    const plan = planWithExtra();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        buildPlan: vi.fn(() => plan) as unknown as WizardDeps["buildPlan"],
+        provisionService: vi.fn(async () => {
+          throw new Error("nope");
+        }) as unknown as WizardDeps["provisionService"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("appears once that process first runs");
+    expect(out).not.toContain("as application web-seed");
+  });
+
+  it("follows the cloud when it de-dups the name it was asked for", async () => {
+    const { ui, lines } = captureUi();
+    const plan = planWithExtra();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        buildPlan: vi.fn(() => plan) as unknown as WizardDeps["buildPlan"],
+        provisionService: vi.fn(async (input: { serviceName: string }) => ({
+          serviceId: "svc-1",
+          serviceName:
+            input.serviceName === "web-seed" ? "web-seed-2" : input.serviceName,
+        })) as unknown as WizardDeps["provisionService"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    // The injected init has to report under the row that now exists, or the
+    // registration and the wiring name two different applications.
+    expect(plan.extraEdits![0].content).toContain('service: "web-seed-2"');
+    expect(lines.join("\n")).toContain("as application web-seed-2");
   });
 });
 
