@@ -115,35 +115,6 @@ async function readJsonFile(filePath) {
   return JSON.parse(await fs.readFile(filePath, "utf8"));
 }
 
-// Finalized sessions are moved into the V2 partition layout ({tenant}/{app}/{date}/{id}), so the
-// session directory is no longer at the flat outputDir/id path. Walk the tree for a directory named
-// `sessionId` that contains meta.json.
-async function findSessionDir(outputDir, sessionId) {
-  const stack = [outputDir];
-  while (stack.length > 0) {
-    const currentDir = stack.pop();
-    let entries;
-    try {
-      entries = await fs.readdir(currentDir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const candidate = path.join(currentDir, entry.name);
-      const hasMeta = await fs
-        .access(path.join(candidate, "meta.json"))
-        .then(() => true)
-        .catch(() => false);
-      if (entry.name === sessionId && hasMeta) return candidate;
-      if (!hasMeta) stack.push(candidate);
-    }
-  }
-  throw new Error(
-    `finalized session ${sessionId} not found under ${outputDir}`,
-  );
-}
-
 async function assertPackageMetadata() {
   recordPhase("package-metadata", "start");
   const [corePkg, nodePkg] = await Promise.all([
@@ -157,8 +128,8 @@ async function assertPackageMetadata() {
     throw new Error("crumbtrail-core package files must include dist");
   if (nodePkg.name !== "crumbtrail-node")
     throw new Error("packages/node package name mismatch");
-  if (nodePkg.bin?.["crumbtrail-server"] !== "./dist/cli.cjs")
-    throw new Error("crumbtrail-node bin must expose ./dist/cli.cjs");
+  if (nodePkg.bin)
+    throw new Error("crumbtrail-node must ship no executable");
   if (!nodePkg.files?.includes("dist"))
     throw new Error("crumbtrail-node package files must include dist");
   // core is ALSO inlined into node's build (tsup noExternal), so node's runtime never imports this
@@ -220,8 +191,8 @@ async function assertPackedNodeDependency(
       `packed crumbtrail-node must rewrite crumbtrail-core workspace dependency to ${expectedCoreRange}, got ${packedPkg.dependencies?.["crumbtrail-core"] ?? "missing"}`,
     );
   }
-  if (packedPkg.bin?.["crumbtrail-server"] !== "./dist/cli.cjs")
-    throw new Error("packed crumbtrail-node bin must expose ./dist/cli.cjs");
+  if (packedPkg.bin)
+    throw new Error("packed crumbtrail-node must ship no executable");
   if (!packedPkg.files?.includes("dist"))
     throw new Error("packed crumbtrail-node package files must include dist");
   recordPhase("packed-manifest", "pass", `crumbtrail-core=${expectedCoreRange}`);
@@ -334,315 +305,60 @@ async function assertInstalledPackageMetadata(
   recordPhase("installed-package-metadata", "pass");
 }
 
-async function resolveInstalledBin(tempProjectDir) {
-  recordPhase("binary-resolution", "start");
-  const binName =
-    process.platform === "win32"
-      ? "crumbtrail-server.cmd"
-      : "crumbtrail-server";
-  const binPath = path.join(tempProjectDir, "node_modules", ".bin", binName);
-  await fs.access(binPath);
-  recordPhase(
-    "binary-resolution",
-    "pass",
-    `bin=${path.relative(tempProjectDir, binPath)}`,
-  );
-  return binPath;
-}
+/**
+ * The runtime proof, now that there is no binary to start: install the packed
+ * tarballs, point `autoCapture` at a stub intake in the same process, throw,
+ * and require the event to arrive. This is what a customer's process actually
+ * does with this package.
+ */
+async function assertInstalledCapture(tempProjectDir) {
+  const probe = path.join(tempProjectDir, "capture-probe.mjs");
+  await fs.writeFile(
+    probe,
+    `import http from "node:http";
+import { autoCapture } from "crumbtrail-node";
 
-async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
-  const text = await response.text();
-  let body;
-  try {
-    body = JSON.parse(text);
-  } catch {
+const received = [];
+const server = http.createServer((req, res) => {
+  let body = "";
+  req.on("data", (chunk) => (body += chunk));
+  req.on("end", () => {
+    received.push({ url: req.url, body });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ sessionId: "fresh-install-probe" }));
+  });
+});
+await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+const endpoint = "http://127.0.0.1:" + server.address().port;
+
+const handle = await autoCapture({
+  endpoint,
+  authToken: "verify-fresh-install",
+  service: "fresh-install-probe",
+  loadEnv: false,
+});
+
+console.error("fresh install probe failure");
+await new Promise((resolve) => setTimeout(resolve, 1000));
+handle.stop();
+server.close();
+
+if (received.length === 0) {
+  console.log("CAPTURE_PROBE_FAIL nothing reached the stub intake");
+  process.exit(1);
+}
+console.log("CAPTURE_PROBE_OK requests=" + received.length);
+`,
+  );
+  const output = await runCommand("capture-proof", process.execPath, [probe], {
+    cwd: tempProjectDir,
+  });
+  const combined = `${output.stdout}${output.stderr}`;
+  if (!combined.includes("CAPTURE_PROBE_OK")) {
     throw new Error(
-      `Expected JSON from ${url}, got ${response.status}: ${text.slice(0, 200)}`,
+      `capture probe did not confirm delivery: ${boundedTail(combined)}`,
     );
   }
-  return { response, body };
-}
-
-async function postJson(baseUrl, urlPath, body) {
-  return fetchJson(`${baseUrl}${urlPath}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Crumbtrail-Auth": authToken,
-    },
-    body: JSON.stringify(body),
-  });
-}
-
-async function waitForHealth(healthUrl, child, output) {
-  recordPhase("health-readiness", "start", `url=${healthUrl}`);
-  const startedAt = Date.now();
-  let lastError;
-
-  while (Date.now() - startedAt < timeoutMs) {
-    if (child.exitCode !== null) {
-      throw new Error(
-        `server exited before readiness with code ${child.exitCode}`,
-      );
-    }
-
-    try {
-      const { response, body } = await fetchJson(healthUrl, {
-        headers: { "X-Crumbtrail-Auth": authToken },
-      });
-      if (response.ok && body?.ok === true && body?.status === "ready") {
-        recordPhase(
-          "health-readiness",
-          "pass",
-          `service=${body.service} version=${body.version}`,
-        );
-        return body;
-      }
-      lastError = new Error(
-        `health returned ${response.status} status=${body?.status ?? "unknown"}`,
-      );
-    } catch (err) {
-      lastError = err;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-
-  throw new Error(
-    `timed out waiting for readiness: ${lastError?.message ?? "no response"}\nstdout=${boundedTail(output.stdout)}\nstderr=${boundedTail(output.stderr)}`,
-  );
-}
-
-function assertHealthyPayload(body, outputDir, staticDir, port) {
-  if (body?.service !== "crumbtrail-node")
-    throw new Error("health payload missing service");
-  if (body?.config?.port !== port)
-    throw new Error("health payload port mismatch");
-  if (body?.config?.outputDir !== outputDir)
-    throw new Error("health payload outputDir mismatch");
-  if (body?.config?.staticDir !== staticDir)
-    throw new Error("health payload staticDir mismatch");
-  if (body?.config?.authEnabled !== true)
-    throw new Error("health payload did not report auth enabled");
-  if (body?.config?.allowedOriginCount !== 1)
-    throw new Error("health payload did not report allowed-origin count");
-  if (body?.checks?.outputDir?.writable !== true)
-    throw new Error("health payload did not report writable outputDir");
-  const serialized = JSON.stringify(body);
-  if (serialized.includes(authToken) || serialized.includes(allowedOrigin)) {
-    throw new Error("health payload leaked sensitive config values");
-  }
-}
-
-async function assertSelfHostArtifacts(baseUrl, outputDir) {
-  recordPhase("self-host-artifact-proof", "start");
-  const sessionId = "fresh_install_failed_request";
-  const start = await postJson(baseUrl, "/api/session/start", {
-    sessionId,
-    metadata: {
-      app: "fresh-install-verifier",
-      rootUrl: "http://127.0.0.1/local-app",
-    },
-  });
-  if (!start.response.ok || start.body?.ok !== true)
-    throw new Error(`session start failed: ${start.response.status}`);
-
-  const events = [
-    { t: 1_000, k: "nav", d: { from: "", to: "/checkout", tr: "init" } },
-    {
-      t: 1_050,
-      k: "net.req",
-      d: { id: "req-500", m: "POST", url: "https://api.example.test/checkout" },
-    },
-    {
-      t: 1_090,
-      k: "net.res",
-      d: { id: "req-500", st: 500, ok: false, dur: 40 },
-    },
-    {
-      t: 1_100,
-      k: "err",
-      d: {
-        msg: "Checkout failed after POST /checkout",
-        file: "app.js",
-        line: 10,
-      },
-    },
-    {
-      t: 1_150,
-      k: "ui.num",
-      d: {
-        region: "dl.totals",
-        items: [
-          { label: "Subtotal", value: 199, unit: "$" },
-          { label: "Tax (8.25%)", value: 16.42, unit: "$" },
-          { label: "Total", value: 199, unit: "$" },
-        ],
-      },
-    },
-  ];
-  const eventWrite = await postJson(baseUrl, "/api/events", {
-    sessionId,
-    events,
-  });
-  if (!eventWrite.response.ok || eventWrite.body?.ok !== true)
-    throw new Error(`event write failed: ${eventWrite.response.status}`);
-
-  const end = await postJson(baseUrl, "/api/session/end", { sessionId });
-  if (!end.response.ok || end.body?.ok !== true)
-    throw new Error(`session end failed: ${end.response.status}`);
-
-  // The session is finalized into the V2 partition layout, not the flat outputDir/id path.
-  const sessionDir = await findSessionDir(outputDir, sessionId);
-  const requiredFiles = [
-    "meta.json",
-    "events.ndjson",
-    "index.json",
-    "CANDIDATES.md",
-    "timeline.md",
-    "search.jsonl",
-  ];
-  for (const artifact of requiredFiles) {
-    const artifactPath = path.join(sessionDir, artifact);
-    const stat = await fs.stat(artifactPath);
-    if (!stat.isFile() || stat.size === 0)
-      throw new Error(`artifact ${artifact} was empty or missing`);
-  }
-
-  const index = await readJsonFile(path.join(sessionDir, "index.json"));
-  if (
-    !Array.isArray(index.failedReqs) ||
-    index.failedReqs.length !== 1 ||
-    index.failedReqs[0].st !== 500
-  ) {
-    throw new Error("index.json did not capture the failed request");
-  }
-  const candidates = await fs.readFile(
-    path.join(sessionDir, "CANDIDATES.md"),
-    "utf8",
-  );
-  if (!candidates.includes("HTTP 500"))
-    throw new Error("CANDIDATES.md did not describe the failed request");
-  const candidateRows = (await fs.readFile(
-    path.join(sessionDir, "candidates.jsonl"),
-    "utf8",
-  ))
-    .trim()
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
-  if (
-    !candidateRows.some(
-      (candidate) => candidate.detector === "ui_arithmetic_mismatch",
-    )
-  ) {
-    throw new Error(
-      "installed crumbtrail-node did not derive the ui_arithmetic_mismatch signal",
-    );
-  }
-
-  const list = await fetchJson(`${baseUrl}/api/sessions`, {
-    headers: { "X-Crumbtrail-Auth": authToken },
-  });
-  if (
-    !list.response.ok ||
-    !Array.isArray(list.body) ||
-    !list.body.some((entry) => entry.id === sessionId)
-  ) {
-    throw new Error(
-      "/api/sessions did not expose the finalized session summary",
-    );
-  }
-
-  recordPhase(
-    "self-host-artifact-proof",
-    "pass",
-    `session=${sessionId} artifacts=${requiredFiles.length}`,
-  );
-}
-
-async function startInstalledServer(
-  binPath,
-  tempProjectDir,
-  outputDir,
-  staticDir,
-  port,
-) {
-  recordPhase("binary-startup", "start", `port=${port}`);
-  const output = { stdout: "", stderr: "" };
-  const child = spawn(
-    binPath,
-    [
-      "--host",
-      "127.0.0.1",
-      "--port",
-      String(port),
-      "--output",
-      outputDir,
-      "--static",
-      staticDir,
-      "--allow-origin",
-      allowedOrigin,
-      "--auth-token",
-      authToken,
-    ],
-    {
-      cwd: tempProjectDir,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, NO_COLOR: "1" },
-    },
-  );
-
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk) => {
-    output.stdout = boundedTail(output.stdout + chunk);
-  });
-  child.stderr.on("data", (chunk) => {
-    output.stderr = boundedTail(output.stderr + chunk);
-  });
-
-  const healthUrl = `http://127.0.0.1:${port}/health`;
-  const baseUrl = `http://127.0.0.1:${port}`;
-  try {
-    const healthBody = await waitForHealth(healthUrl, child, output);
-    assertHealthyPayload(healthBody, outputDir, staticDir, port);
-    if (!output.stdout.includes("Allowed browser origins: 1 configured")) {
-      throw new Error(
-        "startup diagnostics did not report allowed-origin count",
-      );
-    }
-    if (
-      !output.stdout.includes("Auth token protection enabled for /api/* routes")
-    ) {
-      throw new Error(
-        "startup diagnostics did not report auth-token protection",
-      );
-    }
-    if (
-      output.stdout.includes(authToken) ||
-      output.stderr.includes(authToken)
-    ) {
-      throw new Error("startup diagnostics leaked auth token content");
-    }
-    recordPhase("binary-startup", "pass");
-    return { child, output, baseUrl };
-  } catch (err) {
-    await shutdownServer(child);
-    fail("binary-startup", err, output);
-  }
-}
-
-async function shutdownServer(child) {
-  recordPhase("shutdown", "start");
-  if (child.exitCode === null) child.kill("SIGTERM");
-  await Promise.race([
-    new Promise((resolve) => child.once("exit", resolve)),
-    new Promise((resolve) => setTimeout(resolve, 1_000)),
-  ]);
-  if (child.exitCode === null) child.kill("SIGKILL");
-  recordPhase("shutdown", "pass", `exitCode=${child.exitCode ?? "killed"}`);
 }
 
 async function main() {
@@ -655,16 +371,9 @@ async function main() {
     const packDir = path.join(tmpRoot, "packed");
     const tempProjectDir = path.join(tmpRoot, "project");
     const cliProjectDir = path.join(tmpRoot, "packed-cli-project");
-    const staticDir = path.join(tmpRoot, "static");
-    const outputDir = path.join(tmpRoot, "sessions");
     await fs.mkdir(packDir, { recursive: true });
     await fs.mkdir(tempProjectDir, { recursive: true });
     await fs.mkdir(cliProjectDir, { recursive: true });
-    await fs.mkdir(staticDir, { recursive: true });
-    await fs.writeFile(
-      path.join(staticDir, "index.html"),
-      "<!doctype html><title>Crumbtrail fresh install</title><h1>fresh install ok</h1>",
-    );
 
     await assertPackageMetadata();
     const corePackage = await readJsonFile(path.join(coreRoot, "package.json"));
@@ -702,26 +411,13 @@ async function main() {
     await installTempProject(tempProjectDir, coreTarball, nodeTarball);
     await assertInstalledPackageMetadata(tempProjectDir, expectedCoreVersion);
 
-    const binPath = await resolveInstalledBin(tempProjectDir);
-    const port = await getFreePort();
-    const started = await startInstalledServer(
-      binPath,
-      tempProjectDir,
-      outputDir,
-      staticDir,
-      port,
-    );
-    child = started.child;
-    await assertSelfHostArtifacts(started.baseUrl, outputDir);
-    await shutdownServer(child);
-    child = undefined;
+    await assertInstalledCapture(tempProjectDir);
 
     recordPhase("complete", "pass", `project=${tempProjectDir}`);
     console.log(
-      "CRUMBTRAIL_FRESH_INSTALL_PASS phases=package-metadata,package-build,package-pack,packed-cli-install-specs,temp-install,installed-package-metadata,binary-resolution,binary-startup,health-readiness,self-host-artifact-proof,shutdown",
+      "CRUMBTRAIL_FRESH_INSTALL_PASS phases=package-metadata,package-build,package-pack,packed-cli-install-specs,temp-install,installed-package-metadata,capture-proof",
     );
   } catch (err) {
-    if (child) await shutdownServer(child).catch(() => undefined);
     fail("unexpected", err);
   } finally {
     if (tmpRoot)
