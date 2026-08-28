@@ -95,6 +95,81 @@ export interface RedactionResult<T> {
   value: T;
   metadata?: RedactionMetadata;
   summary?: PayloadSummary;
+  /** See {@link CredentialPresence}. Set by {@link redactHeaders} only. */
+  credentials?: CredentialPresence;
+}
+
+/**
+ * Whether a request carried credentials, without carrying them.
+ *
+ * Redaction removes an `authorization` header and a `cookie` header along with
+ * their values, which is right — and it also removes the only evidence that
+ * they existed. Downstream, a 401 the client asked for (an app checking whether
+ * anyone is signed in, on every page load) and a 401 that means authentication
+ * is broken become the same record. One is the product's designed behaviour and
+ * the other is a defect, and nothing can tell them apart.
+ *
+ * These two booleans are computed where the sensitive names are already
+ * identified, and carry no value, no prefix and no length. Presence only.
+ */
+export interface CredentialPresence {
+  /** An `authorization` or `proxy-authorization` header was present, non-empty. */
+  authorization: boolean;
+  /** A `cookie` header was present carrying a cookie whose NAME looks like a
+   *  session identifier. The name is matched, never the value. */
+  sessionCookie: boolean;
+}
+
+/**
+ * Cookie names that identify a session. Deliberately name-only: the value is
+ * the secret and is never inspected, and a name is not a credential.
+ */
+const SESSION_COOKIE_NAME =
+  /^(.*[-_.])?(sess|session|sessionid|sid|connect\.sid|jsessionid|phpsessid|asp\.net_sessionid|auth|authtoken|token|jwt|access[-_]?token|refresh[-_]?token|remember[-_]?me)([-_.].*)?$/i;
+
+/**
+ * Whether these headers carried credentials.
+ *
+ * Exported separately because it must run even when header CAPTURE is off:
+ * storing no headers is a policy about values, and presence is not a value.
+ * A deployment that captures no headers still needs to tell a signed-out
+ * handshake from broken authentication.
+ */
+export function credentialPresence(
+  headers: Record<string, string> | undefined,
+): CredentialPresence {
+  const presence: CredentialPresence = {
+    authorization: false,
+    sessionCookie: false,
+  };
+  if (!headers) return presence;
+  for (const name in headers) {
+    if (!Object.prototype.hasOwnProperty.call(headers, name)) continue;
+    const value = headers[name];
+    const raw = typeof value === "string" ? value : String(value ?? "");
+    if (raw.trim() === "") continue;
+    const normalized = name.trim().toLowerCase();
+    if (normalized === "authorization" || normalized === "proxy-authorization") {
+      presence.authorization = true;
+    } else if (normalized === "cookie") {
+      // Names only. The value after the first `=` is never read.
+      if (cookieNames(raw).some((n) => SESSION_COOKIE_NAME.test(n))) {
+        presence.sessionCookie = true;
+      }
+    }
+  }
+  return presence;
+}
+
+/** Cookie NAMES from a raw Cookie header. Values are discarded unread. */
+function cookieNames(header: string): string[] {
+  const names: string[] = [];
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    const name = (eq >= 0 ? part.slice(0, eq) : part).trim();
+    if (name !== "") names.push(name);
+  }
+  return names;
 }
 
 export interface BodyRedactionResult {
@@ -1255,6 +1330,9 @@ export function redactHeaders(
   const output: Record<string, string> = Object.create(null);
   const fields: RedactionField[] = [];
   let processed = 0;
+  // Presence only — no value, no prefix, no length. Computed from the headers
+  // as given, before any of them are replaced.
+  const credentials = credentialPresence(headers);
 
   for (const originalName in headers) {
     if (!Object.prototype.hasOwnProperty.call(headers, originalName)) continue;
@@ -1317,7 +1395,11 @@ export function redactHeaders(
 
   const metadata = metadataFromFields(fields);
 
-  return { value: output, ...(metadata ? { metadata } : {}) };
+  return {
+    value: output,
+    ...(metadata ? { metadata } : {}),
+    credentials,
+  };
 }
 
 function headerValueLooksUrlLike(value: string): boolean {
