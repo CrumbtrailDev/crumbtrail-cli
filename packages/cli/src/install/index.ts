@@ -189,15 +189,14 @@ export function buildBackendJsNote(stack: Stack): string {
 }
 
 /**
- * Single source of truth for what Crumbtrail's OTLP/HTTP receiver accepts. Both
- * `buildOtlpSnippets` (the wizard guidance) and the collector recipes in
- * `packages/node/src/provider-recipes.json` must agree with these facts — a
- * consistency test asserts the two never drift (compression, endpoint path
- * suffix, auth header names).
+ * Single source of truth for what Crumbtrail's OTLP/HTTP receiver accepts.
+ * `buildOtlpSnippets` (the wizard guidance) is asserted against these facts, so
+ * compression, endpoint path suffix and auth header names cannot drift apart.
  *
  * Nothing here is invented: the paths, protocols, auth headers, and session
- * attribute all match the live ingest routes served by packages/node/src/server.ts
- * and by the hosted Crumbtrail cloud.
+ * attribute all match the live ingest routes the hosted Crumbtrail cloud
+ * serves. The collector recipes that used to be cross-checked here left with
+ * `crumbtrail-node`'s server.
  */
 export interface OtlpCapabilityFacts {
   /** Signal paths the receiver serves; exporters append these to the endpoint. */

@@ -24,27 +24,12 @@ routes the span into the right session and enables the session-level join too.
 ## Run it
 
 ```bash
-pnpm verify:full-stack-otel
-```
-
-This builds `crumbtrail-core` + `crumbtrail-node`, boots an in-process Crumbtrail server and the
-OTel demo backend, performs one instrumented fetch, finalizes the session, and asserts:
-
-- `net.req`/`net.res` and the ingested `backend.otel.span` share the trace id,
-- `index.json` → `fullStackRequests.summary.linked >= 1` with front-end & back-end `500`,
-- the back-end correlation provenance is `otlp-trace-id` (not a Crumbtrail header),
-- the 32-hex trace id survives into `llm.md` (it is a correlation key, not a secret, so it is
-  exempt from token redaction),
-- MCP `getLinkedRequestContext` reports `status: "linked"`.
-
-A bounded JSON summary is printed on success.
-
-## Standalone backend
-
-```bash
-node examples/full-stack-otel/server.mjs --port 4000 --endpoint http://localhost:9898 --session-id <id>
+node examples/full-stack-otel/server.mjs --port 4000 --endpoint https://your-crumbtrail-host --session-id <id>
 # GET http://localhost:4000/api/demo-bug  → exports a correlated OTLP error span
 ```
+
+The browser `net.req` / `net.res` and the ingested `backend.otel.span` share the trace id, and
+the backend correlation provenance is `otlp-trace-id` rather than a Crumbtrail header.
 
 > The OTLP payload is hand-built (no `@opentelemetry/*` dependency) so the example stays lean
 > and runnable with just `node`; it is byte-for-byte what a real exporter would POST.

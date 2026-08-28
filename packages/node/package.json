@@ -1,6 +1,6 @@
 {
   "name": "crumbtrail-node",
-  "version": "0.44.0",
+  "version": "0.44.1",
   "description": "Backend capture for Crumbtrail: crash and log capture, Express middleware, node:http request capture and database instrumentation. See https://crumbtrail.ai",
   "license": "MIT",
   "repository": {
@@ -14,18 +14,13 @@
     "bug-reporting",
     "ai-agents",
     "coding-agent",
-    "session-replay",
     "observability",
     "developer-tools",
-    "mcp",
-    "model-context-protocol",
     "express",
     "middleware",
-    "server",
-    "self-hosted",
+    "database",
     "opentelemetry"
   ],
-  "mcpName": "io.github.CrumbtrailDev/crumbtrail",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -60,11 +55,6 @@
   "dependencies": {
     "crumbtrail-core": "workspace:^",
     "node-sql-parser": "^5.4.0"
-  },
-  "peerDependenciesMeta": {
-    "playwright": {
-      "optional": true
-    }
   },
   "devDependencies": {
     "@hono/node-server": "^2.1.1",

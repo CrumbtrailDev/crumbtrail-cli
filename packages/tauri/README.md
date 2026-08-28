@@ -104,15 +104,6 @@ Sessions are stored at:
 
 On macOS: `~/Library/Application Support/<bundle-id>/crumbtrail-sessions/`
 
-## MCP compatibility
-
-The MCP server from `crumbtrail-node` reads session directories directly. Point
-it at the same output path to use MCP tools with Tauri-captured sessions:
-
-```bash
-crumbtrail-server --output ~/Library/Application\ Support/<bundle-id>/crumbtrail-sessions
-```
-
 ## Requirements
 
 - Tauri v2
