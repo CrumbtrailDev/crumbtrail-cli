@@ -845,8 +845,12 @@ describe("evidence lanes are decided by the detector's name", () => {
     const [span] = groupDistinctBugs([laneBug("otel_span_error", "req-span")]);
     expect(span.backendEvidence.length).toBe(1);
 
-    const [db] = groupDistinctBugs([laneBug("otel_db_activity", "req-otel-db")]);
-    expect(db.dbDiffs?.map((ref) => ref.detector)).toEqual(["otel_db_activity"]);
+    const [db] = groupDistinctBugs([
+      laneBug("otel_db_activity", "req-otel-db"),
+    ]);
+    expect(db.dbDiffs?.map((ref) => ref.detector)).toEqual([
+      "otel_db_activity",
+    ]);
     expect(db.frontendEvidence).toEqual([]);
   });
 
@@ -1022,5 +1026,80 @@ describe("recurrence label rollups", () => {
     const [rollup] = groupDistinctBugRecurrences([two, alsoTwo]);
     expect(rollup.session_count).toBe(1);
     expect(rollup.apps).toEqual({ known: [], unknown: 1 });
+  });
+});
+
+describe("a resource id inside a message is data, not identity", () => {
+  function throttled(asin: string) {
+    const message = `Backend logged warn: SP-API throttled (429) /products/fees/v0/items/${asin}/feesEstimate`;
+    return {
+      title: message,
+      representative: {
+        detector: "backend_log_warn",
+        title: message,
+        message,
+        route: "",
+        severity: "medium",
+      },
+    } as never;
+  }
+
+  it("gives two occurrences of one throttled endpoint one signature", () => {
+    expect(buildDistinctBugSignature(throttled("B07VBB6HTX"))).toBe(
+      buildDistinctBugSignature(throttled("B0GK35JP5Q")),
+    );
+  });
+
+  it("keeps two different endpoints apart", () => {
+    const other =
+      "Backend logged warn: SP-API throttled (429) /orders/v0/orders/B07VBB6HTX/items";
+    expect(buildDistinctBugSignature(throttled("B07VBB6HTX"))).not.toBe(
+      buildDistinctBugSignature({
+        title: other,
+        representative: {
+          detector: "backend_log_warn",
+          title: other,
+          message: other,
+          route: "",
+          severity: "medium",
+        },
+      } as never),
+    );
+  });
+
+  it("keeps two statuses on one endpoint apart", () => {
+    const throttleMessage =
+      "Backend logged warn: SP-API status 429 /products/fees/v0/items/B07VBB6HTX/feesEstimate";
+    const serverMessage =
+      "Backend logged warn: SP-API status 500 /products/fees/v0/items/B0GK35JP5Q/feesEstimate";
+    const sig = (message: string) =>
+      buildDistinctBugSignature({
+        title: message,
+        representative: {
+          detector: "backend_log_warn",
+          title: message,
+          message,
+          route: "",
+          severity: "medium",
+        },
+      } as never);
+    expect(sig(throttleMessage)).not.toBe(sig(serverMessage));
+  });
+
+  it("leaves a host untouched, so two hosts stay apart", () => {
+    const sig = (host: string) => {
+      const message = `HTTP 500 from GET https://${host}/v2/orders`;
+      return buildDistinctBugSignature({
+        title: message,
+        representative: {
+          detector: "http_error",
+          title: message,
+          message,
+          route: "",
+          severity: "medium",
+        },
+      } as never);
+    };
+    expect(sig("eu1.example.com")).not.toBe(sig("us2.example.com"));
   });
 });

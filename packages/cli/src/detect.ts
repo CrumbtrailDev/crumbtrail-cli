@@ -38,6 +38,12 @@ export type Recipe =
   | "astro"
   | "angular"
   | "vite-spa"
+  // Create React App, including projects driven through craco or
+  // react-app-rewired. Webpack rather than Vite, so it reads its public env
+  // vars from `process.env` behind a REACT_APP_ prefix and never resolves an
+  // entry out of index.html — the HTML in `public/` is a template, and the
+  // module graph starts at `src/index.*`.
+  | "cra"
   // Capacitor / Ionic. A shell recipe like `tauri`: the app is a web build
   // running in a native WebView, so it wires the SAME web capture as its
   // underlying frontend recipe and adds the native-side context on top.
@@ -862,6 +868,34 @@ export function resolveAngularEntry(
 }
 
 /**
+ * Resolve the Create React App injection entry — `src/index.{tsx,jsx,ts,js}`,
+ * most conventional first. First existing file wins; null when none exist
+ * (→ ambiguous).
+ *
+ * Deliberately NOT resolved out of `public/index.html` the way a Vite entry is.
+ * CRA's HTML is a build template with no module script tag in it: webpack
+ * injects the bundle at build time, so the tag the Vite resolver looks for does
+ * not exist in the source, and the file it would point at would be a build
+ * artifact rather than something to edit.
+ */
+export function resolveCraEntry(
+  cwd: string,
+  reader: FileReader = localFsReader(cwd),
+): string | null {
+  const candidates = [
+    path.join("src", "index.tsx"),
+    path.join("src", "index.jsx"),
+    path.join("src", "index.ts"),
+    path.join("src", "index.js"),
+  ];
+  for (const c of candidates) {
+    const full = path.join(cwd, c);
+    if (reader.isFile(full)) return full;
+  }
+  return null;
+}
+
+/**
  * Resolve the Flutter injection entry — deterministically `lib/main.dart`. Null
  * when absent (→ ambiguous). Flutter's own tooling creates it and every template
  * keeps it there, so a project without one is not a shape we should guess at.
@@ -1162,6 +1196,25 @@ const RECIPE_MATCHERS: ReadonlyArray<
         reasons.push("found angular.json");
       const entryFile = resolveAngularEntry(root, reader);
       if (!entryFile) reasons.push("could not resolve src/main.ts");
+      return { entryFile, nextVersion: null };
+    },
+  ],
+  [
+    // Ordered before vite-spa. A CRA project carries no `vite` dep so the two
+    // cannot both match today, but a project mid-migration carries both, and
+    // the react-scripts build is the one still producing the bundle that ships.
+    // craco and react-app-rewired are counted as CRA: both wrap react-scripts
+    // rather than replacing it, and some templates carry the wrapper in
+    // `dependencies` with react-scripts left to the wrapper's own peer range.
+    "cra",
+    ({ root, deps, reasons, reader }) => {
+      const marker = ["react-scripts", "@craco/craco", "react-app-rewired"].find(
+        (d) => d in deps,
+      );
+      if (!marker) return null;
+      reasons.push(`found \`${marker}\` dependency`);
+      const entryFile = resolveCraEntry(root, reader);
+      if (!entryFile) reasons.push("could not resolve src/index.{tsx,jsx,ts,js}");
       return { entryFile, nextVersion: null };
     },
   ],
@@ -1485,6 +1538,7 @@ export function detect(
       recipe === "remix" ||
       recipe === "angular" ||
       recipe === "vite-spa" ||
+      recipe === "cra" ||
       recipe === "nestjs" ||
       recipe === "express" ||
       recipe === "hono" ||
