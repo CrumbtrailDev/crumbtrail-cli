@@ -1755,7 +1755,16 @@ function planExtraBackendEntries(
       path: entry.path,
       mode: "update",
       content: prependIntoSource(existing, block),
-      label: `wired ${rel} (npm run ${entry.script}) as service ${service}`,
+      // Not "as service X": this pass edits code, it does not create the
+      // application. Until the caller registers the name, or the process itself
+      // first reports and ingest registers it, the dashboard's Applications
+      // table has no such row, and the reader who goes looking for the name
+      // this line just gave them finds nothing there.
+      label: `wired ${rel} (npm run ${entry.script}) to report as ${service}, a new application that appears once that process first runs`,
+      // Carried so the caller can register the name up front instead. Wiring
+      // alone only decides what the sessions are labelled; the Applications
+      // table is what the project has declared.
+      serviceName: service,
     });
   }
 
