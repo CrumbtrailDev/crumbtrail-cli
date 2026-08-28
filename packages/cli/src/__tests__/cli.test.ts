@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   compareSdkVersions,
+  envLoadCaveat,
   installSdk as realInstallSdk,
   isCliEntrypoint,
   normalizeRepoUrl,
@@ -138,6 +139,10 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
       h.steps.push("mint-key");
       return { apiKey: "ctkey_test123", keyId: "key_test" };
     }) as unknown as WizardDeps["createIngestKey"],
+    mintAgentToken: vi.fn(async () => {
+      h.steps.push("mint-agent-token");
+      return { secret: "ctagt_test123", expiresAt: "2030-01-01T00:00:00.000Z" };
+    }) as unknown as WizardDeps["mintAgentToken"],
     envFileIO: fakeEnvIO(),
     installSdk: vi.fn(async () => {
       h.steps.push("install");
@@ -317,7 +322,10 @@ describe("the final verdict says whether anything was captured", () => {
 
   it("claims nothing about capture when the wait was skipped", async () => {
     const { ui, lines } = captureUi();
-    await runCli(["node", "cli", "--skip-verify"], makeDeps({ steps: [] }, { ui }));
+    await runCli(
+      ["node", "cli", "--skip-verify"],
+      makeDeps({ steps: [] }, { ui }),
+    );
     const out = lines.join("\n");
     expect(out).toContain("Wiring complete. First event not verified.");
     expect(out).not.toContain("Setup complete");
@@ -327,6 +335,75 @@ describe("the final verdict says whether anything was captured", () => {
     const { ui, lines } = captureUi();
     await runCli(["node", "cli"], makeDeps({ steps: [] }, { ui }));
     expect(lines.join("\n")).toMatch(/Application:\s+web/);
+  });
+});
+
+// ── What an empty wait is allowed to claim ───────────────────────────────────
+//
+// The wait used to end by asserting a cause it never checked ("your key was
+// already set, so your events are going elsewhere"), including on a wait whose
+// every read of the sessions feed had failed. A failed read is not an absence.
+
+describe("the empty wait reports what it observed", () => {
+  const timingOutWith = (
+    ui: Ui,
+    poll: Record<string, unknown>,
+    over: Partial<WizardDeps> = {},
+  ) =>
+    makeDeps(
+      { steps: [] },
+      {
+        ui,
+        pollForRealEvent: vi.fn(
+          async () => poll,
+        ) as unknown as WizardDeps["pollForRealEvent"],
+        ...over,
+      },
+    );
+
+  it("does not render an unreadable sessions feed as an absence", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(
+      ["node", "cli"],
+      timingOutWith(ui, { outcome: "timedout", reason: "reads-failed" }),
+    );
+    const out = lines.join("\n");
+    expect(out).toContain("could not read the sessions feed");
+    expect(out).not.toContain("No event captured yet");
+    expect(out).toContain("Wiring complete. First event not verified.");
+  });
+
+  it("says no session started rather than blaming the key that was already set", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(
+      ["node", "cli"],
+      timingOutWith(
+        ui,
+        { outcome: "timedout", reason: "no-new-activity" },
+        {
+          // A key already on disk is the case whose note used to assert that
+          // events were going to another project.
+          envFileIO: fakeEnvIO({
+            "/app/.env": "VITE_CRUMBTRAIL_KEY=ctkey_existing\n",
+          }),
+        },
+      ),
+    );
+    const out = lines.join("\n");
+    expect(out).toContain("No new session started");
+    // The key is still worth checking, but as a check, not as the diagnosis.
+    expect(out).not.toContain(
+      "was already set, and Crumbtrail left it alone. If that key",
+    );
+  });
+
+  it("says the project has nothing in it when that is what it saw", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(
+      ["node", "cli"],
+      timingOutWith(ui, { outcome: "timedout", reason: "no-sessions" }),
+    );
+    expect(lines.join("\n")).toContain("no sessions at all");
   });
 });
 
@@ -1255,7 +1332,11 @@ describe("batch installer: an empty selection has two opposite meanings", () => 
   it("says the repository is already wired rather than that nothing was picked", async () => {
     const steps: string[] = [];
     const deps = batchDeps(steps, [
-      candidate({ relDir: "apps/web", flags: ["already-wired"], defaultChecked: false }),
+      candidate({
+        relDir: "apps/web",
+        flags: ["already-wired"],
+        defaultChecked: false,
+      }),
       candidate({
         relDir: "services/api",
         recipe: "express",
@@ -1664,7 +1745,9 @@ describe("batch installer (monorepo root)", () => {
     ).toBe(0);
     expect(steps).toContain("provision:api");
     expect(steps).not.toContain("provision:shared");
-    expect(lines.join("\n")).toContain("packages/shared: nothing runs this package");
+    expect(lines.join("\n")).toContain(
+      "packages/shared: nothing runs this package",
+    );
 
     // Named explicitly, it is still the user's call.
     const onlySteps: string[] = [];
@@ -2578,5 +2661,346 @@ describe("endpoint confirmation", () => {
     );
     await runCli(["node", "cli", "--yes"], endpointDeps({ prompter }));
     expect(asked).toBe(0);
+  });
+});
+
+// ── Amending an integration the customer already has ─────────────────────────
+//
+// The fresh injection path prepends a guarded `.env` load above the init it
+// writes. The amend path edits the customer's own init and adds no loader, so
+// telling that user "restart it, it reads the key at startup" is a claim the
+// shipped code does not support.
+
+describe("envLoadCaveat", () => {
+  it("states the condition when the amended file loads no env file", () => {
+    const caveat = envLoadCaveat({
+      keyEnvVar: "CRUMBTRAIL_KEY",
+      content: "autoCapture({ authToken: process.env.CRUMBTRAIL_KEY });\n",
+    });
+    expect(caveat).toContain("loads no env file itself");
+    expect(caveat).toContain("--env-file");
+  });
+
+  it("says nothing when the file already loads one", () => {
+    expect(
+      envLoadCaveat({
+        keyEnvVar: "CRUMBTRAIL_KEY",
+        content:
+          'require("dotenv").config();\nautoCapture({ authToken: process.env.CRUMBTRAIL_KEY });\n',
+      }),
+    ).toBeUndefined();
+  });
+
+  it("says nothing for a bundler-inlined key, which no runtime read depends on", () => {
+    expect(
+      envLoadCaveat({
+        keyEnvVar: "VITE_CRUMBTRAIL_KEY",
+        content:
+          "Crumbtrail.init({ httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY });",
+      }),
+    ).toBeUndefined();
+  });
+});
+
+describe("the amend path does not promise the app reads the env file", () => {
+  it("prints the condition beside the amend it just made", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        buildPlan: vi.fn(() => ({
+          recipe: "express",
+          kind: "amend-init" as const,
+          targetPath: "/app/server/src/crumbtrail.js",
+          content:
+            "autoCapture({ endpoint: 'http://x', authToken: process.env.CRUMBTRAIL_KEY });\n",
+          amendedFields: ["authToken"],
+          keyEnvVar: "CRUMBTRAIL_KEY",
+          warnings: [],
+        })) as unknown as WizardDeps["buildPlan"],
+        executePlan: vi.fn(() => ({
+          kind: "update" as const,
+          written: ["/app/server/src/crumbtrail.js"],
+          skipped: false,
+          message: "Wrote 1 file(s).",
+        })) as unknown as WizardDeps["executePlan"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("loads no env file itself");
+    // The old line asserted the app read the file this run had just written.
+    expect(out).not.toContain("it reads CRUMBTRAIL_KEY at startup");
+  });
+
+  it("names the prepended env load instead of claiming only the init changed", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        buildPlan: vi.fn(() => ({
+          recipe: "express",
+          kind: "amend-init" as const,
+          targetPath: "/app/server/src/crumbtrail.js",
+          content:
+            "if (!process.env.CRUMBTRAIL_KEY) { process.loadEnvFile('.env'); }\nautoCapture({ authToken: process.env.CRUMBTRAIL_KEY });\n",
+          amendedFields: ["authToken"],
+          envPreloadAdded: true as const,
+          keyEnvVar: "CRUMBTRAIL_KEY",
+          warnings: [],
+        })) as unknown as WizardDeps["buildPlan"],
+        executePlan: vi.fn(() => ({
+          kind: "update" as const,
+          written: ["/app/server/src/crumbtrail.js"],
+          skipped: false,
+          message: "Wrote 1 file(s).",
+        })) as unknown as WizardDeps["executePlan"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("a guarded env file load above it");
+    // The condition existed only because the load was missing. It is not.
+    expect(out).not.toContain("loads no env file itself");
+  });
+});
+
+describe("the wizard connects the coding agent", () => {
+  // The biggest hole the setup review found: five runs, and not one of them
+  // said "MCP", "agent token" or `ctagt_`. The product is sold as evidence
+  // delivered to a coding agent, and the wizard finished at a dashboard link
+  // with the agent half left for a person to do by hand.
+
+  it("mints a token and writes the MCP server into the detected agent config", async () => {
+    const { ui, lines } = captureUi();
+    const envIO = fakeEnvIO({ "/app/.mcp.json": "{}" });
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: envIO });
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+
+    expect(out).toContain("Connect your coding agent");
+    expect(out).toContain("Claude Code");
+    const written = JSON.parse(envIO.files.get("/app/.mcp.json")!);
+    expect(written.mcpServers.crumbtrail).toEqual({
+      type: "http",
+      url: "http://127.0.0.1:9999/mcp",
+      headers: { Authorization: "Bearer ctagt_test123" },
+    });
+    // The summary is where a reader decides whether the run finished, so the
+    // connection has to be on it rather than only in the scrollback.
+    expect(out).toContain("Agent:");
+    expect(out).toContain("MCP server written to .mcp.json");
+  });
+
+  it("keeps the live token out of git", async () => {
+    const { ui } = captureUi();
+    const envIO = fakeEnvIO({ "/app/.mcp.json": "{}" });
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: envIO });
+    await runCli(["node", "cli"], deps);
+    expect(envIO.files.get("/app/.gitignore")).toContain(".mcp.json");
+    expect(envIO.files.get("/app/.gitignore")).toContain(
+      "holds a live agent token",
+    );
+  });
+
+  it("refuses a config file git already tracks, and says why", async () => {
+    const { ui, lines } = captureUi();
+    const envIO = fakeEnvIO(
+      { "/app/.mcp.json": "{}" },
+      { tracked: [".mcp.json"] },
+    );
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: envIO });
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("tracked by git");
+    // Nothing minted, so nothing to leak: a token with nowhere safe to live is
+    // a token that must not exist.
+    expect(deps.mintAgentToken).not.toHaveBeenCalled();
+    expect(envIO.files.get("/app/.mcp.json")).toBe("{}");
+  });
+
+  it("prints the outstanding step and the link when there is no agent to write to", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: fakeEnvIO() });
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    // Unconditional: a run that cannot wire the agent still may not end silent.
+    expect(out).toContain("Mint an agent token at");
+    expect(out).toContain("/setup/keys");
+    expect(out).toContain("<the ctagt_ token>");
+    expect(deps.mintAgentToken).not.toHaveBeenCalled();
+  });
+
+  it("declines cleanly on --no-agent and still names the manual step", async () => {
+    const { ui, lines } = captureUi();
+    const envIO = fakeEnvIO({ "/app/.mcp.json": "{}" });
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: envIO });
+    await runCli(["node", "cli", "--no-agent"], deps);
+    const out = lines.join("\n");
+    expect(deps.mintAgentToken).not.toHaveBeenCalled();
+    expect(envIO.files.get("/app/.mcp.json")).toBe("{}");
+    expect(out).toContain("--no-agent");
+    expect(out).toContain("Mint an agent token at");
+  });
+
+  it("leaves a crumbtrail server the reader already configured alone", async () => {
+    const { ui, lines } = captureUi();
+    const envIO = fakeEnvIO({
+      "/app/.mcp.json": JSON.stringify({
+        mcpServers: { crumbtrail: { command: "crumbtrail-server" } },
+      }),
+    });
+    const deps = makeDeps({ steps: [] }, { ui, envFileIO: envIO });
+    await runCli(["node", "cli"], deps);
+    expect(deps.mintAgentToken).not.toHaveBeenCalled();
+    expect(lines.join("\n")).toContain("Left it as it is");
+  });
+
+  it("writes nothing to a repository whose local edits were declined", async () => {
+    const { ui, lines } = captureUi();
+    const envIO = fakeEnvIO({ "/app/.mcp.json": "{}" });
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        envFileIO: envIO,
+        // A dirty entry file the reader refuses to have edited. A decline has
+        // to mean the repository is left alone, agent config included.
+        buildPlan: vi.fn(() => ({
+          recipe: "vite-spa",
+          kind: "needs-confirm-dirty" as const,
+          targetPath: "/app/src/main.ts",
+          content: "// init",
+          keyEnvVar: "VITE_CRUMBTRAIL_KEY",
+          warnings: [],
+        })) as unknown as WizardDeps["buildPlan"],
+        prompter: { ...noopPrompter, confirm: async () => false },
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    expect(deps.mintAgentToken).not.toHaveBeenCalled();
+    expect(envIO.files.get("/app/.mcp.json")).toBe("{}");
+    expect(lines.join("\n")).toContain("Mint an agent token at");
+  });
+});
+
+describe("an extra entrypoint is registered before it ever runs", () => {
+  // Ingest upserts a service row on first sight of a name, so the row appears
+  // either way. Only the up front POST carries repo and directory identity,
+  // though, so two repositories with a worker called `api` collapse onto one
+  // row without it.
+  const planWithExtra = () =>
+    ({
+      recipe: "express",
+      kind: "prepend" as const,
+      targetPath: "/app/src/index.ts",
+      content: "// init",
+      keyEnvVar: "CRUMBTRAIL_KEY",
+      warnings: [],
+      extraEdits: [
+        {
+          path: "/app/src/seed.js",
+          mode: "update" as const,
+          content: 'autoCapture({ service: "web-seed" });\n',
+          label:
+            "wired src/seed.js (npm run seed) to report as web-seed, a new application that appears once that process first runs",
+          registeredLabel:
+            "wired src/seed.js (npm run seed) as application web-seed",
+          serviceName: "web-seed",
+        },
+      ],
+    }) as unknown as Plan;
+
+  it("provisions the extra service with this repository's identity", async () => {
+    const { ui, lines } = captureUi();
+    const plan = planWithExtra();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        buildPlan: vi.fn(() => plan) as unknown as WizardDeps["buildPlan"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    const call = (
+      deps.provisionService as unknown as {
+        mock: { calls: Array<[{ serviceName: string; identity?: unknown }]> };
+      }
+    ).mock.calls.find(([arg]) => arg.serviceName === "web-seed");
+    expect(call).toBeDefined();
+    expect(call![0].identity).toBeDefined();
+    // The claim is only allowed once the row exists.
+    expect(lines.join("\n")).toContain(
+      "wired src/seed.js (npm run seed) as application web-seed",
+    );
+  });
+
+  it("keeps the weaker claim when the registration fails", async () => {
+    const { ui, lines } = captureUi();
+    const plan = planWithExtra();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        buildPlan: vi.fn(() => plan) as unknown as WizardDeps["buildPlan"],
+        provisionService: vi.fn(async () => {
+          throw new Error("nope");
+        }) as unknown as WizardDeps["provisionService"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("appears once that process first runs");
+    expect(out).not.toContain("as application web-seed");
+  });
+
+  it("follows the cloud when it de-dups the name it was asked for", async () => {
+    const { ui, lines } = captureUi();
+    const plan = planWithExtra();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        buildPlan: vi.fn(() => plan) as unknown as WizardDeps["buildPlan"],
+        provisionService: vi.fn(async (input: { serviceName: string }) => ({
+          serviceId: "svc-1",
+          serviceName:
+            input.serviceName === "web-seed" ? "web-seed-2" : input.serviceName,
+        })) as unknown as WizardDeps["provisionService"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    // The injected init has to report under the row that now exists, or the
+    // registration and the wiring name two different applications.
+    expect(plan.extraEdits![0].content).toContain('service: "web-seed-2"');
+    expect(lines.join("\n")).toContain("as application web-seed-2");
+  });
+});
+
+describe("wizard copy", () => {
+  it("uses the right article for the detected stack", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(
+      ["node", "cli"],
+      makeDeps(
+        { steps: [] },
+        {
+          ui,
+          detect: vi.fn(() =>
+            detectResult({ recipe: "express" }),
+          ) as unknown as WizardDeps["detect"],
+        },
+      ),
+    );
+    expect(lines.join("\n")).toContain("Detected an express project.");
+  });
+
+  it('never prints the unfinished "(s)" plural or a bare String(n) count', async () => {
+    const { ui, lines } = captureUi();
+    await runCli(["node", "cli"], makeDeps({ steps: [] }, { ui }));
+    const out = lines.join("\n");
+    expect(out).not.toMatch(/\(s\)|\(es\)/);
   });
 });

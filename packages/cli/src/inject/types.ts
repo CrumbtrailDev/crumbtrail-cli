@@ -40,6 +40,15 @@ export interface Plan {
    */
   amendedFields?: string[];
   /**
+   * `amend-init`: a guarded env file load was prepended above the customer's
+   * own init, so the key this run wrote is genuinely read at startup.
+   *
+   * Set only when the amended file really does read `process.env` and loads no
+   * env file of its own. The wizard's "nothing else in that file changed" line
+   * has to name the second edit when there is one.
+   */
+  envPreloadAdded?: true;
+  /**
    * Files this plan touches BESIDES `targetPath`, already resolved to their
    * final bytes.
    *
@@ -59,6 +68,23 @@ export interface Plan {
     content: string;
     /** One line for the wizard summary, e.g. "wired the queue worker". */
     label: string;
+    /**
+     * The service this file's injected init reports under, when that is a NEW
+     * application rather than the one the run provisioned.
+     *
+     * Set only by the extra-backend-entry pass, which gives each additional
+     * process its own name so a session says which process it came from. The
+     * caller has to register that name as an application: the Applications
+     * table is the register of what a project has declared, and a name it has
+     * never seen has nothing for its first sessions to land under.
+     */
+    serviceName?: string;
+    /**
+     * The label to print INSTEAD of `label` once `serviceName` has actually
+     * been registered as an application. Only the caller knows that, so only
+     * the caller may swap it in.
+     */
+    registeredLabel?: string;
   }>;
   /** Non-fatal notes to surface to the user. */
   warnings: string[];

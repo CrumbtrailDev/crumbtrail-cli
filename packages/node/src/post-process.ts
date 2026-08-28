@@ -26,6 +26,7 @@ import {
 } from "./storage-plane";
 import { buildCausalGraph, type CausalGraph } from "./causal-graph";
 import { defaultSessionStore } from "./session-store";
+import { redactPathTokens } from "./redact-path";
 
 interface BugEvent {
   t: number;
@@ -1704,16 +1705,6 @@ function safePath(value: unknown): string | undefined {
   );
 }
 
-function redactPathTokens(value: string): string {
-  return value
-    .split("/")
-    .map((segment) => {
-      if (/^[A-Za-z0-9_-]{16,}$/.test(segment)) return "[REDACTED]";
-      return segment;
-    })
-    .join("/");
-}
-
 function safeAlreadyRedactedString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
@@ -1981,13 +1972,16 @@ function safeDiagnosticString(value: unknown): string | undefined {
  * 200 character cap: the frame that names the failing file is routinely past
  * that cut, and truncating it away is exactly the loss this field exists to
  * prevent. URL redaction preserves paths, so `app-4f2a.js:812:17` survives.
+ *
+ * Path segments get the same shape rule as the structured `file` field, so the
+ * two fields can never disagree about the same path.
  */
 function safeStackString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   if (trimmed.length === 0) return undefined;
-  return redactUrlLikeText(
-    redactTokenLikeString(trimmed, "diagnostic").value,
+  return redactPathTokens(
+    redactUrlLikeText(redactTokenLikeString(trimmed, "diagnostic").value),
   ).slice(0, 2000);
 }
 

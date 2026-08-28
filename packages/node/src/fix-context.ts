@@ -69,14 +69,21 @@ export interface FixContextReproHint {
   offsetMs?: number;
 }
 
+/**
+ * Every evidence array here carries a `<field>_total` beside it when the bundle
+ * assembled anything for that field. See {@link planeTotal} for why the count
+ * sits next to the array rather than only in a response-level summary.
+ */
 export interface FixContextPrimaryWindow {
   frontend: {
     window: { start: number; end: number; windowId: string } | null;
     anchor: EvidenceCandidate["anchor"] | null;
     requests: LlmBundleFrontendRequestEvidenceSummary[];
+    requests_total?: number;
   };
   backend: {
     requests: LlmBundleBackendRequestEvidenceSummary[];
+    requests_total?: number;
   };
   /**
    * Requests that SUCCEEDED just before the first error, with their bodies.
@@ -89,6 +96,7 @@ export interface FixContextPrimaryWindow {
    * Empty when the session recorded no error to anchor on.
    */
   preceding_requests: LlmBundlePrecedingRequestSummary[];
+  preceding_requests_total?: number;
   /**
    * Failed browser requests from the finalized evidence bundle. These carry
    * redacted request and response bodies when capture recorded them, so the
@@ -96,16 +104,19 @@ export interface FixContextPrimaryWindow {
    * windows.
    */
   failed_requests?: LlmBundleFailedRequestSummary[];
+  failed_requests_total?: number;
   /**
    * Database row diffs correlated to the primary window (CP5 DB diffing). Empty when the session
    * captured no `db.diff` events in the window. Consumers MUST treat `[]` as "no DB evidence".
    */
   db_diffs: FixContextDbDiff[];
+  db_diffs_total?: number;
   /**
    * Database rows read in the primary window (`db.read`, pre-state capture). Empty when read
    * capture is disabled or no reads matched the primary request/window.
    */
   db_reads: FixContextDbRead[];
+  db_reads_total?: number;
   /**
    * Statements attempted in the primary window that the database REFUSED (`db.error`). Empty when
    * every statement the window issued succeeded.
@@ -117,6 +128,7 @@ export interface FixContextPrimaryWindow {
    * was fine"; read it as "no statement in this window was observed to raise".
    */
   db_errors: FixContextDbError[];
+  db_errors_total?: number;
   /**
    * Statements the primary window issued that the database ACCEPTED (`db.statement`).
    *
@@ -128,11 +140,13 @@ export interface FixContextPrimaryWindow {
    * queries".
    */
   db_statements: FixContextDbStatement[];
+  db_statements_total?: number;
   /**
    * OTel DB span activity in the primary window. These are statements/operations only, never
    * before/after row diffs.
    */
   db_activity: FixContextDbActivity[];
+  db_activity_total?: number;
 }
 
 /** One downstream symptom of the primary root cause, resolved from `signals`. */
@@ -215,6 +229,12 @@ export interface FixContext {
   schemaVersion: typeof FIX_CONTEXT_SCHEMA_VERSION;
   session: FixContextSession;
   signals: FixContextSignal[];
+  /**
+   * How many signals the bundle assembled, present whenever that is at least
+   * one. See {@link planeTotal}: `signals: []` beside `signals_total: 143` is a
+   * response that was trimmed to a token budget, not a session with no signals.
+   */
+  signals_total?: number;
   primary_window: FixContextPrimaryWindow;
   /**
    * Account/environment state snapshot. Defaults to `null`; CP3 (environment capture)
@@ -334,6 +354,7 @@ export function buildFixContextFromArtifacts(
   ranked: EvidenceCandidate[],
   extras: { opinion?: Record<string, unknown> } = {},
 ): FixContext {
+  const signals = ranked.map(toSignal);
   const session = buildSession(sessionDir, index, bundle);
   const primaryWindow = buildPrimaryWindow(ranked, bundle, resolveAnchorRequestId(index));
   const reproHint = buildReproHint(ranked);
@@ -348,7 +369,8 @@ export function buildFixContextFromArtifacts(
   return {
     schemaVersion: FIX_CONTEXT_SCHEMA_VERSION,
     session,
-    signals: ranked.map(toSignal),
+    signals,
+    ...planeTotal("signals", signals),
     primary_window: primaryWindow,
     environment,
     causal_chain: causal.chain,
@@ -362,6 +384,27 @@ export function buildFixContextFromArtifacts(
         }
       : {}),
   };
+}
+
+/**
+ * `{ <field>_total: n }` when the plane assembled anything, `{}` when it did
+ * not, so the count is emitted beside the array it counts.
+ *
+ * An array emptied by a response budget is the one thing a reader cannot see.
+ * getFixContext's `maxTokens` trims these arrays from the bottom and reports
+ * exactly what it took in a `dropReport` at the END of the document, so a model
+ * reading top-down meets `"signals": []` and concludes the session had no
+ * signals hundreds of lines before it reaches the correction. `[]` next to
+ * `signals_total: 143` cannot be read that way, and `[]` with no total beside
+ * it is a plane that genuinely held nothing. This adds no second truncation
+ * mechanism: the count is what the bundle built, and `dropReport` remains the
+ * per-plane accounting of what a budget removed.
+ */
+function planeTotal(
+  field: string,
+  items: readonly unknown[],
+): Record<string, number> {
+  return items.length > 0 ? { [`${field}_total`]: items.length } : {};
 }
 
 function toSignal(candidate: EvidenceCandidate): FixContextSignal {
@@ -575,22 +618,41 @@ function buildPrimaryWindow(
     return false;
   });
 
+  const frontendRequests = matched.map((entry) => entry.frontend);
+  const backendRequests = matched.map((entry) => entry.backend);
+  const precedingRequests = bundle?.browserEvidence?.precedingRequests ?? [];
+  const failedRequests = selectPrimaryFailedRequests(bundle, top);
+  const dbDiffs = selectPrimaryWindowDbDiffs(bundle, window, topRequestId, matched);
+  const dbReads = selectPrimaryWindowDbReads(bundle, window, topRequestId, matched);
+  const dbErrors = selectPrimaryWindowDbErrors(bundle, window, topRequestId, matched);
+  const dbStatements = selectPrimaryWindowDbStatements(bundle, window, topRequestId, matched);
+  const dbActivity = selectPrimaryWindowDbActivity(bundle, window, topRequestId, matched);
+
   return {
     frontend: {
       window,
       anchor: top?.anchor ?? null,
-      requests: matched.map((entry) => entry.frontend),
+      requests: frontendRequests,
+      ...planeTotal("requests", frontendRequests),
     },
     backend: {
-      requests: matched.map((entry) => entry.backend),
+      requests: backendRequests,
+      ...planeTotal("requests", backendRequests),
     },
-    preceding_requests: bundle?.browserEvidence?.precedingRequests ?? [],
-    failed_requests: selectPrimaryFailedRequests(bundle, top),
-    db_diffs: selectPrimaryWindowDbDiffs(bundle, window, topRequestId, matched),
-    db_reads: selectPrimaryWindowDbReads(bundle, window, topRequestId, matched),
-    db_errors: selectPrimaryWindowDbErrors(bundle, window, topRequestId, matched),
-    db_statements: selectPrimaryWindowDbStatements(bundle, window, topRequestId, matched),
-    db_activity: selectPrimaryWindowDbActivity(bundle, window, topRequestId, matched),
+    preceding_requests: precedingRequests,
+    ...planeTotal("preceding_requests", precedingRequests),
+    failed_requests: failedRequests,
+    ...planeTotal("failed_requests", failedRequests),
+    db_diffs: dbDiffs,
+    ...planeTotal("db_diffs", dbDiffs),
+    db_reads: dbReads,
+    ...planeTotal("db_reads", dbReads),
+    db_errors: dbErrors,
+    ...planeTotal("db_errors", dbErrors),
+    db_statements: dbStatements,
+    ...planeTotal("db_statements", dbStatements),
+    db_activity: dbActivity,
+    ...planeTotal("db_activity", dbActivity),
   };
 }
 

@@ -140,3 +140,24 @@ describe("normalizePartitionSegment", () => {
     }
   });
 });
+
+/**
+ * The doctor probe exclusion belongs to the STORE, not to each tool that reads
+ * it. `getLatestIssue` filtered probes and recall did not, so the health check
+ * Crumbtrail recommends running seeded the issue memory it sells. Pinning it
+ * here means a new recall caller inherits the exclusion instead of having to
+ * remember it.
+ */
+describe("buildRecallStore — doctor probe exclusion", () => {
+  it("never lists a doctor probe session, scoped or unscoped", async () => {
+    writeSession("tenant-a", "shop", "sess-a-shop");
+    writeSession("tenant-a", "shop", "ses_probe_http");
+    writeSession("tenant-a", "shop", "ses_otlp_probe_traces");
+
+    expect(await idsFor()).toEqual(["sess-a-shop"]);
+    expect(await idsFor({ tenantId: "tenant-a" })).toEqual(["sess-a-shop"]);
+    expect(await idsFor({ tenantId: "tenant-a", projectId: "shop" })).toEqual([
+      "sess-a-shop",
+    ]);
+  });
+});

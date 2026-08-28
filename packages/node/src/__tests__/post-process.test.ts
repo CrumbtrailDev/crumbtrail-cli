@@ -2461,6 +2461,99 @@ describe("postProcess", async () => {
     expect(index.errs[0].stk).toContain("api-9c1.js:44:9");
   });
 
+  it("keeps ordinary long path segments and redacts id-shaped ones identically in file and stack", async () => {
+    const keptPath =
+      "/srv/app/packages/notification-service/src/payment-processing/send.ts";
+    const idPath =
+      "/srv/app/tenants/550e8400-e29b-41d4-a716-446655440000/src/send.ts";
+    const events = [
+      {
+        t: 1000,
+        k: "err",
+        d: {
+          msg: "TypeError: x is undefined",
+          file: keptPath,
+          line: 41,
+          col: 9,
+          stk: `TypeError: x is undefined\n    at send (${keptPath}:41:9)`,
+        },
+      },
+      {
+        t: 1100,
+        k: "err",
+        d: {
+          msg: "TypeError: y is undefined",
+          file: idPath,
+          line: 12,
+          col: 3,
+          stk: `TypeError: y is undefined\n    at send (${idPath}:12:3)`,
+        },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    );
+    await postProcess(tmpDir);
+    const index = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, "index.json"), "utf-8"),
+    );
+
+    // An ordinary directory name is not a secret, and the dashboard needs it to
+    // find the failing source file.
+    expect(index.errs[0].file).toBe(keptPath);
+    expect(index.errs[0].stk).toContain(`${keptPath}:41:9`);
+
+    // A UUID segment is an identifier: it goes in both fields, never one.
+    const redactedPath =
+      "/srv/app/tenants/[REDACTED]/src/send.ts";
+    expect(index.errs[1].file).toBe(redactedPath);
+    expect(index.errs[1].stk).toContain(`${redactedPath}:12:3`);
+    expect(index.errs[1].stk).not.toContain("550e8400");
+  });
+
+  it("keeps a build-hash file name and redacts a token-shaped path segment", async () => {
+    const hashedBundle =
+      "https://app.example.test/assets/index-a1b2c3d4e5f6g7h8.js";
+    const tokenPath = "/api/missing-request/supersecret-token-1234567890abcdef";
+    const events = [
+      {
+        t: 1000,
+        k: "err",
+        d: {
+          msg: "TypeError: x is undefined",
+          file: hashedBundle,
+          line: 812,
+          col: 17,
+          stk: `TypeError: x is undefined\n    at r (${hashedBundle}:812:17)`,
+        },
+      },
+      {
+        t: 1100,
+        k: "err",
+        d: {
+          msg: "TypeError: y is undefined",
+          file: tokenPath,
+          stk: `TypeError: y is undefined\n    at load (${tokenPath}:3:1)`,
+        },
+      },
+    ];
+    fs.writeFileSync(
+      path.join(tmpDir, "events.ndjson"),
+      events.map((e) => JSON.stringify(e)).join("\n") + "\n",
+    );
+    await postProcess(tmpDir);
+    const index = JSON.parse(
+      fs.readFileSync(path.join(tmpDir, "index.json"), "utf-8"),
+    );
+
+    expect(index.errs[0].file).toBe(hashedBundle);
+    expect(index.errs[0].stk).toContain("index-a1b2c3d4e5f6g7h8.js:812:17");
+
+    expect(index.errs[1].file).toBe("/api/missing-request/[REDACTED]");
+    expect(index.errs[1].stk).not.toContain("1234567890abcdef");
+  });
+
   it("handles empty events file", async () => {
     fs.writeFileSync(path.join(tmpDir, "events.ndjson"), "");
     await postProcess(tmpDir);

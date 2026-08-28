@@ -9,10 +9,14 @@ import {
 } from "../poll";
 import {
   firstRealSession,
+  risenIngestActivity,
+  hasNewEvents,
   hasRealSession,
+  isArrival,
   isRealNewSession,
   pollForRealEvent,
   realSessionsByService,
+  sessionActivity,
   CLI_CHECK_PREFIX,
   POLL_SKEW_TOLERANCE_MS,
   type SessionRow,
@@ -29,12 +33,38 @@ const instantSleep = async (
   _signal?: AbortSignal,
 ): Promise<void> => {};
 
+/**
+ * `/api/stats` body for a project whose applications have reported nothing new.
+ * The poll reads it alongside the sessions feed, so every fixture has to answer
+ * it, or a stats read would consume the next staged sessions page.
+ */
+function statsBody(
+  services: Array<{
+    id?: string | null;
+    lastEventAt?: string | null;
+    sessionsWithEvents?: number;
+    sessionsTotal?: number;
+  }> = [],
+): unknown {
+  return { ingest: { services } };
+}
+
+function isStats(url: string): boolean {
+  return url.includes("/api/stats");
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return {
+    status,
+    text: async () => JSON.stringify(body),
+  } as unknown as Response;
+}
+
 function fakeFetch(body: unknown, status = 200): typeof fetch {
-  return (async () =>
-    ({
-      status,
-      text: async () => JSON.stringify(body),
-    }) as unknown as Response) as unknown as typeof fetch;
+  return (async (url: string) =>
+    isStats(String(url))
+      ? jsonResponse(statsBody())
+      : jsonResponse(body, status)) as unknown as typeof fetch;
 }
 
 /**
@@ -45,24 +75,20 @@ function fakeFetch(body: unknown, status = 200): typeof fetch {
  */
 function stagedFetch(pages: SessionRow[][]): typeof fetch {
   let call = 0;
-  return (async () => {
+  return (async (url: string) => {
+    if (isStats(String(url))) return jsonResponse(statsBody());
     const sessions = pages[Math.min(call++, pages.length - 1)];
-    return {
-      status: 200,
-      text: async () => JSON.stringify({ sessions }),
-    } as unknown as Response;
+    return jsonResponse({ sessions });
   }) as unknown as typeof fetch;
 }
 
 /** A fetch that throws on the first call (baseline read fails) then serves a page. */
 function baselineFailsThenServes(body: unknown): typeof fetch {
   let call = 0;
-  return (async () => {
+  return (async (url: string) => {
+    if (isStats(String(url))) return jsonResponse(statsBody());
     if (call++ === 0) throw new Error("baseline read boom");
-    return {
-      status: 200,
-      text: async () => JSON.stringify(body),
-    } as unknown as Response;
+    return jsonResponse(body);
   }) as unknown as typeof fetch;
 }
 
@@ -238,12 +264,11 @@ describe("pollForRealEvent", () => {
     const controller = new AbortController();
     controller.abort();
     let fetchCalls = 0;
-    const fetchImpl: typeof fetch = (async () => {
+    const fetchImpl: typeof fetch = (async (url: string) => {
       fetchCalls += 1;
-      return {
-        status: 200,
-        text: async () => JSON.stringify({ sessions: [] }),
-      } as unknown as Response;
+      return isStats(String(url))
+        ? jsonResponse(statsBody())
+        : jsonResponse({ sessions: [] });
     }) as unknown as typeof fetch;
 
     const outcome = await pollForRealEvent({
@@ -262,14 +287,11 @@ describe("pollForRealEvent", () => {
   });
 
   it("returns 'timedout' once the backoff budget is exhausted with no real session", async () => {
-    let fetchCalls = 0;
-    const fetchImpl: typeof fetch = (async () => {
-      fetchCalls += 1;
-      return {
-        status: 200,
-        text: async () =>
-          JSON.stringify({ sessions: [{ id: `${CLI_CHECK_PREFIX}only` }] }),
-      } as unknown as Response;
+    let sessionsReads = 0;
+    const fetchImpl: typeof fetch = (async (url: string) => {
+      if (isStats(String(url))) return jsonResponse(statsBody());
+      sessionsReads += 1;
+      return jsonResponse({ sessions: [{ id: `${CLI_CHECK_PREFIX}only` }] });
     }) as unknown as typeof fetch;
 
     const outcome = await pollForRealEvent({
@@ -282,9 +304,15 @@ describe("pollForRealEvent", () => {
       fetchImpl,
     });
 
-    expect(outcome).toEqual({ outcome: "timedout" });
+    // Sessions existed and none of them moved, which is a different fact from
+    // "this project has nothing in it" and from "the feed could not be read".
+    expect(outcome).toMatchObject({
+      outcome: "timedout",
+      reason: "no-new-activity",
+      baselineSessionCount: 1,
+    });
     // 1 baseline snapshot + two 1ms poll attempts reaching the 2ms budget.
-    expect(fetchCalls).toBe(3);
+    expect(sessionsReads).toBe(3);
   });
 
   it("returns 'found' with the real session's id once one appears", async () => {
@@ -327,7 +355,10 @@ describe("pollForRealEvent", () => {
     });
     // The only real session predates the wizard → never "found".
     // (Now enforced by the identity baseline: prior-run is in the snapshot.)
-    expect(outcome).toEqual({ outcome: "timedout" });
+    expect(outcome).toMatchObject({
+      outcome: "timedout",
+      reason: "no-new-activity",
+    });
   });
 });
 
@@ -518,6 +549,278 @@ describe("pollForRealEvent — skew hardening", () => {
         ],
       }),
     });
-    expect(outcome).toEqual({ outcome: "timedout" });
+    expect(outcome).toMatchObject({ outcome: "timedout" });
+  });
+});
+
+// ── Arrival on an already-open session ───────────────────────────────────────
+//
+// The backend SDK keeps ONE long-lived auto session per process. An app that is
+// already running when the wait opens therefore produces no NEW session id
+// however much traffic it takes, and a poll that only watched ids reported
+// "no event captured" while three sessions with events sat in the feed.
+
+describe("hasNewEvents", () => {
+  const baseline = (rows: SessionRow[]) => ({
+    baselineIds: new Set(rows.map((r) => r.id)),
+    baselineActivity: new Map(rows.map((r) => [r.id, sessionActivity(r)])),
+  });
+
+  it("is true when a baseline session's event count rises", () => {
+    const guard = baseline([{ id: "s1", eventCount: 4, hasEvents: true }]);
+    expect(
+      hasNewEvents({ id: "s1", eventCount: 9, hasEvents: true }, guard),
+    ).toBe(true);
+  });
+
+  it("is true when a quiet baseline session gains its first event", () => {
+    const guard = baseline([{ id: "s1", hasEvents: false }]);
+    expect(hasNewEvents({ id: "s1", hasEvents: true }, guard)).toBe(true);
+  });
+
+  it("is false when nothing about the session moved", () => {
+    const guard = baseline([{ id: "s1", eventCount: 4, hasEvents: true }]);
+    expect(
+      hasNewEvents({ id: "s1", eventCount: 4, hasEvents: true }, guard),
+    ).toBe(false);
+  });
+
+  it("is false without a baseline, so the degraded path cannot invent arrivals", () => {
+    expect(hasNewEvents({ id: "s1", eventCount: 4 }, {})).toBe(false);
+  });
+
+  it("never counts the synthetic marker as an arrival", () => {
+    const id = `${CLI_CHECK_PREFIX}abc`;
+    const guard = baseline([{ id, eventCount: 0 }]);
+    expect(isArrival({ id, eventCount: 5 }, undefined, guard)).toBe(false);
+  });
+});
+
+describe("pollForRealEvent — events on an existing session", () => {
+  const fastConfig: IngestPollConfig = {
+    initialDelayMs: 1,
+    maxDelayMs: 1,
+    timeoutMs: 2,
+  };
+
+  it("finds the arrival when an already-open session captures events, with no new session id", async () => {
+    const outcome = await pollForRealEvent({
+      base: "http://example.invalid",
+      token: "tok",
+      projectId: "p1",
+      ui: silentUi,
+      wizardStart: 2_000_000,
+      config: fastConfig,
+      sleepFn: instantSleep,
+      // Same id throughout: the app was already running, so its auto session
+      // predates the wait and its startedAt predates wizardStart too.
+      fetchImpl: stagedFetch([
+        [
+          {
+            id: "auto-session",
+            startedAt: new Date(1_000_000).toISOString(),
+            hasEvents: false,
+            eventCount: 0,
+          },
+        ],
+        [
+          {
+            id: "auto-session",
+            startedAt: new Date(1_000_000).toISOString(),
+            hasEvents: true,
+            eventCount: 3,
+          },
+        ],
+      ]),
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: "found",
+      sessionId: "auto-session",
+    });
+  });
+
+  it("reports 'no-sessions' when the project never had one", async () => {
+    const outcome = await pollForRealEvent({
+      base: "http://example.invalid",
+      token: "tok",
+      projectId: "p1",
+      ui: silentUi,
+      config: fastConfig,
+      sleepFn: instantSleep,
+      fetchImpl: fakeFetch({ sessions: [] }),
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: "timedout",
+      reason: "no-sessions",
+      baselineSessionCount: 0,
+    });
+  });
+
+  it("reports 'reads-failed' when every read of the feed failed, rather than an absence", async () => {
+    const fetchImpl: typeof fetch = (async () => {
+      throw new Error("network down");
+    }) as unknown as typeof fetch;
+
+    const outcome = await pollForRealEvent({
+      base: "http://example.invalid",
+      token: "tok",
+      projectId: "p1",
+      ui: silentUi,
+      config: fastConfig,
+      sleepFn: instantSleep,
+      fetchImpl,
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: "timedout",
+      reason: "reads-failed",
+    });
+    expect(outcome.baselineSessionCount).toBeUndefined();
+  });
+});
+
+// ── The already-running app ──────────────────────────────────────────────────
+//
+// The reviewed failure: an instrumented app took a request every 15 seconds for
+// the whole five minute wait, and the wizard reported "No event captured yet".
+// The backend SDK keeps ONE session per process, so no id was new; and a
+// session that is still open publishes no event count, because its index.json
+// does not exist until the session is processed. `/api/stats` keeps the
+// counters the ingest path stamps as events land, and they are what moves.
+
+describe("risenIngestActivity", () => {
+  const at = (iso: string) => Date.parse(iso);
+
+  it("reports the application whose last event moved", () => {
+    const before = new Map([
+      [
+        "svc-api",
+        {
+          lastEventMs: at("2026-08-28T00:17:44Z"),
+          sessionsWithEvents: 1,
+          sessionsTotal: 1,
+        },
+      ],
+    ]);
+    const now = new Map([
+      [
+        "svc-api",
+        {
+          lastEventMs: at("2026-08-28T00:18:15Z"),
+          sessionsWithEvents: 1,
+          sessionsTotal: 1,
+        },
+      ],
+    ]);
+    expect(risenIngestActivity(before, now)).toBe("svc-api");
+  });
+
+  it("says nothing when the counters stand still", () => {
+    const same = new Map([
+      [
+        "svc-api",
+        {
+          lastEventMs: at("2026-08-28T00:17:44Z"),
+          sessionsWithEvents: 1,
+          sessionsTotal: 1,
+        },
+      ],
+    ]);
+    expect(risenIngestActivity(same, new Map(same))).toBeUndefined();
+  });
+
+  it("says nothing without a baseline, so a first read cannot look like a rise", () => {
+    const now = new Map([
+      ["svc-api", { lastEventMs: 1, sessionsWithEvents: 3, sessionsTotal: 3 }],
+    ]);
+    expect(risenIngestActivity(undefined, now)).toBeUndefined();
+  });
+
+  it("ignores a newly listed application that has captured nothing", () => {
+    const now = new Map([
+      ["svc-new", { sessionsWithEvents: 0, sessionsTotal: 1 }],
+    ]);
+    expect(risenIngestActivity(new Map(), now)).toBeUndefined();
+  });
+});
+
+describe("pollForRealEvent — the app was already running", () => {
+  const fastConfig: IngestPollConfig = {
+    initialDelayMs: 1,
+    maxDelayMs: 1,
+    timeoutMs: 2,
+  };
+
+  /** Sessions never change; `/api/stats` reports a later lastEventAt each read. */
+  function alreadyRunningFetch(lastEventAts: string[]): typeof fetch {
+    const openSession = [
+      {
+        id: "auto_already_open",
+        serviceId: "svc-api",
+        startedAt: "2026-08-28T00:10:00.000Z",
+        hasEvents: true,
+      },
+    ];
+    let statsRead = 0;
+    return (async (url: string) => {
+      if (String(url).includes("/api/stats")) {
+        const lastEventAt =
+          lastEventAts[Math.min(statsRead++, lastEventAts.length - 1)];
+        return jsonResponse({
+          ingest: {
+            services: [
+              {
+                id: "svc-api",
+                lastEventAt,
+                sessionsWithEvents: 1,
+                sessionsTotal: 1,
+              },
+            ],
+          },
+        });
+      }
+      return jsonResponse({ sessions: openSession });
+    }) as unknown as typeof fetch;
+  }
+
+  it("finds the arrival when only the ingest counters move", async () => {
+    const outcome = await pollForRealEvent({
+      base: "http://example.invalid",
+      token: "tok",
+      projectId: "p1",
+      ui: silentUi,
+      wizardStart: Date.parse("2026-08-28T00:15:00.000Z"),
+      config: fastConfig,
+      sleepFn: instantSleep,
+      fetchImpl: alreadyRunningFetch([
+        "2026-08-28T00:17:44.295Z",
+        "2026-08-28T00:18:15.541Z",
+      ]),
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: "found",
+      sessionId: "auto_already_open",
+    });
+  });
+
+  it("still times out when the app is quiet, so a stale counter is not an arrival", async () => {
+    const outcome = await pollForRealEvent({
+      base: "http://example.invalid",
+      token: "tok",
+      projectId: "p1",
+      ui: silentUi,
+      wizardStart: Date.parse("2026-08-28T00:15:00.000Z"),
+      config: fastConfig,
+      sleepFn: instantSleep,
+      fetchImpl: alreadyRunningFetch(["2026-08-28T00:17:44.295Z"]),
+    });
+
+    expect(outcome).toMatchObject({
+      outcome: "timedout",
+      reason: "no-new-activity",
+    });
   });
 });

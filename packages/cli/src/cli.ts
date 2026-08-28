@@ -63,6 +63,7 @@ import {
   defaultEnvFileIO,
   planEnvKeyWrite,
   readEnvVar,
+  type EnvEdit,
   type EnvFileIO,
   type EnvKeyPlan,
 } from "./env-file";
@@ -76,7 +77,21 @@ import { discoverServices, type ServiceCandidate } from "./discover";
 import { isBackendRecipe, resolveBackendOrigins } from "./backend-origins";
 import { otlpGuidePlan, renderOtlpGuide } from "./otlp-guide";
 import { RECIPE_REGISTRY, sdkInstallSpec } from "./recipe-registry";
-import { APP_URL_ENV_VAR, dashboardBase, resolveEndpoint } from "./net";
+import { runPackageManager } from "./install/run-package-manager";
+import {
+  APP_URL_ENV_VAR,
+  dashboardBase,
+  requestJson,
+  resolveEndpoint,
+} from "./net";
+import {
+  AGENT_TOKEN_PLACEHOLDER,
+  detectAgentConfigs,
+  hostedMcpServer,
+  mergeMcpConfig,
+  MCP_SERVER_NAME,
+  type AgentConfigTarget,
+} from "./agent-mcp";
 import {
   color,
   consoleUi,
@@ -101,7 +116,31 @@ import {
 } from "./theme";
 
 /** How many numbered steps the single-package wizard shows. */
-const TOTAL_STEPS = 6;
+const TOTAL_STEPS = 7;
+
+/**
+ * A count as a reader expects to see it: grouped thousands, never a bare
+ * `String(n)`. Four figure counts do occur in a large monorepo scan.
+ */
+function num(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
+/**
+ * "1 package" / "2 packages", from ONE string with a placeholder rather than
+ * the "package(s)" form, which reads as a template nobody finished.
+ */
+function count(n: number, singular: string, plural = `${singular}s`): string {
+  return `${num(n)} ${n === 1 ? singular : plural}`;
+}
+
+/**
+ * The article for a recipe id ("a next project", "an express project"). Recipe
+ * ids are ASCII identifiers, so the initial letter decides it.
+ */
+function articleFor(word: string): string {
+  return /^[aeiou]/i.test(word) ? "an" : "a";
+}
 
 // ── Version ──────────────────────────────────────────────────────────────────
 
@@ -231,6 +270,12 @@ export interface ParsedArgs {
    * own env UI, where a key on a developer's disk is the wrong artifact.
    */
   noWriteKey: boolean;
+  /**
+   * Do not mint an agent token and do not touch the coding agent's MCP
+   * configuration — print what would have been written instead. For anyone
+   * whose agent configuration is generated, shared, or governed elsewhere.
+   */
+  noAgent: boolean;
   endpoint?: string;
   /**
    * Monorepo root only: wire exactly these services (repeatable `--only`,
@@ -286,6 +331,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     noBrowser: false,
     skipVerify: false,
     noWriteKey: false,
+    noAgent: false,
     all: false,
     json: false,
   };
@@ -319,6 +365,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
         break;
       case "--no-write-key":
         parsed.noWriteKey = true;
+        break;
+      case "--no-agent":
+        parsed.noAgent = true;
         break;
       case "--project":
         {
@@ -444,7 +493,7 @@ function usage(): string {
     ),
     cmd(
       "crumbtrail verify",
-      "Preflight an endpoint + key (DNS, TLS, auth) — PASS/FAIL",
+      "Preflight an endpoint + key (DNS, TLS, auth): PASS/FAIL",
     ),
     "",
     color.dim(
@@ -478,13 +527,15 @@ function usage(): string {
       "--workspace <dir>",
       "Target one package dir (relative to cwd) instead of",
     ),
-    `  ${" ".repeat(26)} the repo root — wires just that package`,
-    flag("--no-browser", "Use the device-code login flow"),
+    `  ${" ".repeat(26)} the repo root. Wires just that package`,
+    flag("--no-browser", "Sign in with a code instead of a browser"),
     flag("--skip-verify", "Don't wait for the first event"),
     flag("--no-write-key", "Don't mint or write an ingest key; print the"),
     `  ${" ".repeat(26)} variable to set instead`,
+    flag("--no-agent", "Don't mint an agent token or write MCP config;"),
+    `  ${" ".repeat(26)} print the configuration instead`,
     flag("--replay, --no-replay", "Record session replay for this project, or"),
-    `  ${" ".repeat(26)} don't — else you are asked once`,
+    `  ${" ".repeat(26)} don't. Else you are asked once`,
     flag(
       "--endpoint <url>",
       "Cloud endpoint (else $CRUMBTRAIL_BASE_URL, else default)",
@@ -493,7 +544,7 @@ function usage(): string {
     flag("--version, -v", "Print the version"),
     "",
     head("verify options"),
-    color.dim("  Pre-deploy check — point it at any environment."),
+    color.dim("  Check any environment before you deploy to it."),
     flag(
       "--endpoint <url>",
       "Endpoint to probe (else $CRUMBTRAIL_BASE_URL, else default)",
@@ -503,10 +554,7 @@ function usage(): string {
       "Ingest key to probe with (else $CRUMBTRAIL_KEY, else cached login)",
     ),
     flag("--project <id>", "Project id for the auth GET fallback (no key)"),
-    flag(
-      "--json",
-      "Emit a machine-readable result (exit 0 = pass, non-0 = fail)",
-    ),
+    flag("--json", "Emit JSON instead of the table (exit 0 = pass, else fail)"),
     "",
     head("Appearance"),
     color.dim(
@@ -669,9 +717,7 @@ export function serviceIdentity(appDir: string): ServiceIdentity {
 }
 
 function realSpawn(cmd: string, args: string[], cwd: string): number {
-  const res = spawnSync(cmd, args, { cwd, stdio: "inherit" });
-  if (res.error) return 1;
-  return res.status ?? 1;
+  return runPackageManager(cmd, args, cwd);
 }
 
 /**
@@ -806,7 +852,7 @@ export async function installSdk(
       note:
         `${cmd} exited nonzero but ${landed} ${plural} installed, so setup ` +
         `continued. The message ${cmd} printed above is about your project, ` +
-        `not about Crumbtrail — pnpm exits nonzero for ignored build scripts ` +
+        `not about Crumbtrail: pnpm exits nonzero for ignored build scripts ` +
         `(ERR_PNPM_IGNORED_BUILDS) even when the add succeeded.` +
         (stale ? ` ${stale}` : ""),
     };
@@ -823,7 +869,7 @@ export async function installSdk(
   if (tarballs.length === packages.length) {
     input.ui.out(
       color.dim(
-        `Registry unavailable — installing from ${input.base}/install tarballs…`,
+        `Registry unavailable. Installing from ${input.base}/install tarballs…`,
       ),
     );
     const fallbackCode = run(cmd, [add, ...tarballs], input.cwd);
@@ -859,6 +905,8 @@ export interface WizardDeps {
   ensureToken: typeof ensureToken;
   provisionFlow: typeof provisionFlow;
   createIngestKey: typeof createIngestKey;
+  /** Mints the hosted-agent token the MCP configuration carries. */
+  mintAgentToken: typeof mintAgentToken;
   /** Filesystem + git boundary for the env key write (faked in tests). */
   envFileIO: EnvFileIO;
   installSdk: (input: InstallSdkInput) => Promise<InstallSdkResult>;
@@ -895,6 +943,7 @@ export function defaultDeps(): WizardDeps {
     ensureToken,
     provisionFlow,
     createIngestKey,
+    mintAgentToken,
     envFileIO: defaultEnvFileIO,
     installSdk,
     buildPlan,
@@ -1160,7 +1209,11 @@ export async function runWizard(
     }
     return 1;
   }
-  ui.out(ok(`Detected a ${color.bold(color.brand(result.recipe))} project.`));
+  ui.out(
+    ok(
+      `Detected ${articleFor(result.recipe)} ${color.bold(color.brand(result.recipe))} project.`,
+    ),
+  );
   for (const n of result.notes) ui.out(note(n));
 
   // 2. Login (reuse a cached token when possible).
@@ -1261,6 +1314,21 @@ export async function runWizard(
     },
     defaultInjectIO,
   );
+
+  // 4b. Register the other processes this package starts as applications of
+  // their own, before anything edits their files. Read-only against the repo,
+  // and the only call that can tell the cloud which repository these names
+  // belong to.
+  await registerExtraServices({
+    plan,
+    base,
+    token,
+    projectId: provisioned.projectId,
+    recipe: result.recipe,
+    appDir: cwd,
+    identityLabel,
+    deps,
+  });
 
   // 5. Install the SDK (repo-mutating: adds deps to package.json).
   ui.out(step(4, TOTAL_STEPS, "Install the SDK"));
@@ -1393,6 +1461,26 @@ export async function runWizard(
   const awaitingManualWiring =
     inject.outcome === "guidance" || inject.outcome === "declined";
 
+  // 8b. Connect the coding agent. This is the step the wizard used to leave
+  // out entirely: it wired capture, printed a dashboard link and stopped, so
+  // the agent the evidence exists for was never told where to read it. It runs
+  // before the event wait so the connection is in place by the time the first
+  // session lands.
+  ui.out(step(6, TOTAL_STEPS, "Connect your coding agent"));
+  const agent = await connectCodingAgent({
+    base,
+    token,
+    projectId: provisioned.projectId,
+    projectName: provisioned.projectName,
+    repoRoot: cwd,
+    // A run that wired nothing has nothing for an agent to read, and a decline
+    // of the local edits has to mean the repository is left alone.
+    mayWrite: !nothingWired,
+    parsed,
+    deps,
+  });
+  notes.push(...agent.notes);
+
   let sessionUrl: string | undefined;
   // What this run can honestly say about capture. It starts as "no wait ran",
   // and only the poll finding an event is allowed to move it to confirmed.
@@ -1410,7 +1498,7 @@ export async function runWizard(
       "Tauri stores events locally through its Rust plugin; it does not send a cloud event for this wizard to wait for. Complete the Rust plugin and permission steps above, then inspect the local session store.",
     );
   } else {
-    ui.out(step(6, TOTAL_STEPS, "Catch your first event"));
+    ui.out(step(7, TOTAL_STEPS, "Catch your first event"));
     ui.out(
       color.dim(
         keyReady
@@ -1455,7 +1543,7 @@ export async function runWizard(
         // The endpoint refused the key on disk, so nothing this run wired can
         // report until that value is replaced. The bar and the exit code both
         // have to say so.
-        { capture: "none", keyRejected: true },
+        { capture: "none", keyRejected: true, agent },
       );
       return incomplete ? 1 : 0;
     }
@@ -1490,24 +1578,33 @@ export async function runWizard(
       // capture either way.
       capture = "unverified";
       notes.push(
-        "Stopped waiting for the first event — load your app any time.",
+        "Stopped waiting for the first event. Load your app any time.",
       );
     } else {
-      capture = "none";
+      // A wait whose every read failed observed nothing, so it cannot report an
+      // absence. "unverified" is the honest bar for it; "none" would print
+      // "No event captured yet" off a read that never happened.
+      capture = poll.reason === "reads-failed" ? "unverified" : "none";
       // Which step is still outstanding, rather than one sentence about the
-      // dev server. Two outcomes reach this wait with nothing injected — a
+      // dev server. Two outcomes reach this wait with nothing injected: a
       // fallback snippet the user was asked to paste, and a prepend they
-      // declined — and telling those users to restart their app sends them
-      // looking for a fault in a step they never completed.
+      // declined. Telling those users to restart their app sends them looking
+      // for a fault in a step they never completed.
       notes.push(
         !keyReady
-          ? `No event yet — ${setKeyHint.toLowerCase()} and start your app.`
+          ? `No event yet. ${setKeyHint} and start your app.`
           : awaitingManualWiring
-            ? "No event yet — the snippet above still has to go into your entry file. Paste it, then start your app."
-            : keyWrite.status === "already-set"
-              ? `No event yet — ${plan.keyEnvVar ?? "the ingest key"} was already set, and Crumbtrail left it alone. If that key was not minted in ${provisioned.projectName}, events are going wherever it points instead.`
-              : "No event yet — start your app, or restart it if it was already running when the key was written, then load a page.",
+            ? "No event yet. The snippet above still has to go into your entry file. Paste it, then start your app."
+            : waitObservation(poll, plan.keyEnvVar),
       );
+      // The key on disk was not written by this run, so it may point at another
+      // project. Offered as the thing to check, never as the cause: nothing in
+      // this run verified where that key was minted.
+      if (keyWrite.status === "already-set") {
+        notes.push(
+          `${plan.keyEnvVar ?? "The ingest key"} was already set and Crumbtrail left it alone. If it was not minted in ${provisioned.projectName}, events are going wherever it points instead.`,
+        );
+      }
       notes.push(
         `Check the connection itself with \`npx crumbtrail verify\`: it resolves the host, opens TLS, and sends one authenticated test event, so it separates a problem here from a problem on your side.`,
       );
@@ -1534,7 +1631,7 @@ export async function runWizard(
       inject.outcome === "declined" ||
       plan.keyIsSourceLiteral === true,
     plan.keyIsSourceLiteral === true,
-    { capture },
+    { capture, agent },
   );
   // The exit code follows the bar: a step still on the reader is a failure a
   // script can act on, and a wired app that has simply not been started yet is
@@ -1636,7 +1733,7 @@ function printEvidenceSourcesPointer(
   );
   ui.out(
     color.dim(
-      "  you already run — Sentry, CloudWatch, Splunk, Datadog, PostHog, Cloudflare —",
+      "  you already run: Sentry, CloudWatch, Splunk, Datadog, PostHog, Cloudflare,",
     ),
   );
   ui.out(
@@ -1928,15 +2025,15 @@ export async function runBatchWizard(
   ui.out(
     ok(
       ctx.includeUnlinkedApps
-        ? `Repo root — found ${color.bold(String(candidates.length))} service(s), ${color.bold(color.brand(String(selectableCount)))} wireable.`
-        : `Monorepo — found ${color.bold(String(candidates.length))} package(s), ${color.bold(color.brand(String(selectableCount)))} wireable.`,
+        ? `Repo root. Found ${color.bold(count(candidates.length, "service"))}, ${color.bold(color.brand(num(selectableCount)))} wireable.`
+        : `Monorepo. Found ${color.bold(count(candidates.length, "package"))}, ${color.bold(color.brand(num(selectableCount)))} wireable.`,
     ),
   );
   if (selectableCount === 0) {
     ui.err("");
     ui.err(color.red(`Nothing in ${root} can be wired.`));
     for (const c of candidates) {
-      ui.err(note(`${c.relDir} — ${candidateHint(c)}`));
+      ui.err(note(`${c.relDir}: ${candidateHint(c)}`));
     }
     ui.err(
       "Supported: Next.js, SvelteKit, Nuxt, Remix, Astro, Angular, Vite SPA, Create React App, NestJS, Express, Hono, Fastify, a Node server, or a non-JS backend that speaks OpenTelemetry (Django, Flask, FastAPI, Go, Rails, .NET).",
@@ -1994,7 +2091,7 @@ export async function runBatchWizard(
     if (wireable.length > 0 && wired.length === wireable.length) {
       ui.out(
         ok(
-          `All ${wireable.length} application(s) here are already wired for ${base}. Nothing to do.`,
+          `All ${count(wireable.length, "application")} here are already wired for ${base}. Nothing to do.`,
         ),
       );
       for (const c of wired) ui.out(note(`${c.relDir}: already wired`));
@@ -2006,7 +2103,7 @@ export async function runBatchWizard(
       alert(
         color.yellow(
           wired.length > 0
-            ? `Nothing selected, so no changes were made. ${wired.length} of ${wireable.length} application(s) here are already wired for ${base}; the rest were left unchecked.`
+            ? `Nothing selected, so no changes were made. ${num(wired.length)} of ${count(wireable.length, "application")} here are already wired for ${base}. The rest were left unchecked.`
             : "Nothing selected, so no changes were made. Run it again and check the applications you want wired.",
         ),
       ),
@@ -2082,7 +2179,7 @@ export async function runBatchWizard(
     const name = serviceNames[i];
     ui.out("");
     ui.out(
-      `  ${color.brand(glyphs().pointer)} ${color.brand(`${i + 1}/${selected.length}`)}  ${color.bold(c.relDir)}${color.dim(` — ${stackLabel(c)}`)}`,
+      `  ${color.brand(glyphs().pointer)} ${color.brand(`${i + 1}/${selected.length}`)}  ${color.bold(c.relDir)}${color.dim(`: ${stackLabel(c)}`)}`,
     );
 
     if (c.flags.includes("already-wired")) {
@@ -2148,6 +2245,20 @@ export async function runBatchWizard(
         },
         defaultInjectIO,
       );
+
+      // Same as the single-package path: the other processes this package
+      // starts become applications now, so their rows carry this repository's
+      // identity instead of being minted from a bare name at ingest.
+      await registerExtraServices({
+        plan,
+        base,
+        token,
+        projectId: project.id,
+        recipe,
+        appDir: c.dir,
+        identityLabel,
+        deps,
+      });
 
       // Ask about the complete local transaction before installing dependencies
       // or touching an env file. A decline of the entry-file edit must not
@@ -2369,8 +2480,8 @@ export async function runBatchWizard(
           if (!o.sessionUrl)
             o.notes.push(
               o.status === "guidance"
-                ? "No event yet — this service was not wired for you. Add the snippet printed for it above, then start it."
-                : "No event yet — start this service.",
+                ? "No event yet. This service was not wired for you. Add the snippet printed for it above, then start it."
+                : "No event yet. Start this service.",
             );
         }
       }
@@ -2396,6 +2507,22 @@ export async function runBatchWizard(
     printEvidenceSourcesPointer(ui, base, project.id);
   }
 
+  // One agent connection for the repository, not one per service. The token is
+  // project scoped and the MCP configuration lives at the repository root, so
+  // wiring nine services still means one server entry.
+  ui.out("");
+  const agent = await connectCodingAgent({
+    base,
+    token,
+    projectId: project.id,
+    projectName: project.name,
+    repoRoot: root,
+    mayWrite: reporting.length > 0,
+    parsed,
+    deps,
+  });
+  batchNotes.push(...agent.notes);
+
   const incomplete = printBatchSummary(
     ui,
     base,
@@ -2405,6 +2532,7 @@ export async function runBatchWizard(
     outcomes,
     batchNotes,
     !parsed.skipVerify,
+    agent,
   );
 
   // The exit code says the same thing the bar says. It used to report success
@@ -2454,7 +2582,7 @@ async function applyBatchInjection(
     const res = deps.executePlan(otlpGuidePlan(candidate.dir, body));
     deps.ui.out(
       ok(
-        `Speaks OpenTelemetry — no SDK needed. Wrote ${color.brand(res.written.join(", "))}.`,
+        `Speaks OpenTelemetry, so no SDK is needed. Wrote ${color.brand(res.written.join(", "))}.`,
       ),
     );
     return {
@@ -2490,6 +2618,8 @@ export function printBatchSummary(
   batchNotes: string[] = [],
   /** False when no first-event wait ran (`--skip-verify`), so nothing was seen. */
   verified = true,
+  /** What the agent-connection step did, when one ran. */
+  agent?: AgentConnection,
 ): boolean {
   const g = glyphs();
   const mark: Record<ServiceStatus, string> = {
@@ -2534,8 +2664,7 @@ export function printBatchSummary(
   // session URL recorded by the poll is evidence one arrived.
   const cloudReporting = outcomes.filter(
     (o) =>
-      o.recipe !== "tauri" &&
-      (o.status === "wired" || o.status === "guidance"),
+      o.recipe !== "tauri" && (o.status === "wired" || o.status === "guidance"),
   );
   const reported = cloudReporting.filter((o) => o.sessionUrl);
   const incomplete = readyCount !== outcomes.length;
@@ -2550,11 +2679,17 @@ export function printBatchSummary(
           "warn",
         )
       : !verified || cloudReporting.length === 0
-        ? outcomeBar(`${g.warn}  Wiring complete. First event not verified.`, "warn")
+        ? outcomeBar(
+            `${g.warn}  Wiring complete. First event not verified.`,
+            "warn",
+          )
         : reported.length === cloudReporting.length
           ? outcomeBar(`${g.tick}  Setup complete. First event received.`)
           : reported.length === 0
-            ? outcomeBar(`${g.warn}  Wiring complete. No event captured yet.`, "warn")
+            ? outcomeBar(
+                `${g.warn}  Wiring complete. No event captured yet.`,
+                "warn",
+              )
             : outcomeBar(
                 `${g.warn}  Wiring complete. ${reported.length} of ${cloudReporting.length} applications have reported an event.`,
                 "warn",
@@ -2612,6 +2747,16 @@ export function printBatchSummary(
   ];
   ui.out("");
   ui.out(`  ${color.dim(parts.join(caps().unicode ? " · " : " | "))}`);
+  if (agent) {
+    ui.out(
+      field(
+        "Agent",
+        agent.status === "connected"
+          ? color.brand(agent.line)
+          : color.yellow(agent.line),
+      ),
+    );
+  }
   ui.out(
     field(
       "Dashboard",
@@ -2847,7 +2992,7 @@ async function writeIngestKeys(args: {
           // inspected — an ingest key cannot be resolved to its project
           // without a read credential — so the one way a second project's key
           // becomes visible is saying which project this run wired.
-          `${named(label)}${color.bold(plan.varName)} is already set in ${color.brand(rel(args.repoRoot, plan.file))} — left as it is. Events from this app go wherever that key points, which is only ${color.bold(args.projectName)} if it was minted there.`,
+          `${named(label)}${color.bold(plan.varName)} is already set in ${color.brand(rel(args.repoRoot, plan.file))}, so Crumbtrail left it as it is. Events from this app go wherever that key points, which is only ${color.bold(args.projectName)} if it was minted there.`,
         ),
       );
       // The key in that file is live and the file is not excluded from git, so
@@ -2861,7 +3006,7 @@ async function writeIngestKeys(args: {
           if (applied.ignoreEntriesAdded.length > 0) {
             ui.out(
               color.dim(
-                `  Added ${rel(args.repoRoot, plan.file)} to .gitignore — it holds a live key and git was not excluding it.`,
+                `  Added ${rel(args.repoRoot, plan.file)} to .gitignore. It holds a live key and git was not excluding it.`,
               ),
             );
           }
@@ -2947,9 +3092,14 @@ async function writeIngestKeys(args: {
       // downstream can tell that apart from an app nobody has opened, which is
       // how "I set the key and nothing arrives" became the commonest question
       // about this wizard.
+      //
+      // What this cannot claim is that the service reads that file. Plenty of
+      // Node services load no env file at all, and telling one of those users
+      // that a restart is enough sends them to the wrong place first. Say what
+      // was written, and name the condition the value depends on.
       ui.out(
         color.dim(
-          `  Restart your dev server if it is running — it reads ${plan.varName} at startup.`,
+          `  Restart your dev server if it is running so it picks up ${plan.varName}. It has to load ${where}, or have ${plan.varName} set in its environment.`,
         ),
       );
       // Reported from what the apply actually appended, never from the plan:
@@ -2960,9 +3110,7 @@ async function writeIngestKeys(args: {
         // silently is not any more, and someone who does not know that will go
         // looking for why their env file stopped showing up in `git status`.
         ui.out(
-          color.dim(
-            `  Added ${where} to .gitignore — it holds a live key now.`,
-          ),
+          color.dim(`  Added ${where} to .gitignore. It holds a live key now.`),
         );
       }
       results.set(label, {
@@ -3004,6 +3152,378 @@ async function writeIngestKey(args: {
     targets: [{ label: "", appDir: args.appDir, varName: args.varName }],
   });
   return results.get("") ?? { status: "no-variable" };
+}
+
+/**
+ * Register every extra entrypoint this plan wires as an application of its own,
+ * before the process it wired ever runs.
+ *
+ * Ingest does upsert a service row on first sight of a declared name, so the
+ * row appears eventually either way. It appears WRONG, though: the ingest
+ * upsert matches on the name alone, while this POST also carries the repository
+ * and directory the app lives in. Two repositories whose workers are both
+ * called `api` collapse onto one row under the first rule and stay apart under
+ * this one, and only the up front call can tell the cloud which repository a
+ * name belongs to.
+ *
+ * A failure here is never fatal. The wiring is correct regardless, the row will
+ * still be minted at ingest, and the only thing lost is the identity — so the
+ * label reverts to the one that promises nothing.
+ */
+async function registerExtraServices(args: {
+  plan: Plan;
+  base: string;
+  token: string;
+  projectId: string;
+  recipe: Recipe;
+  /** The package directory, which is the identity these rows are filed under. */
+  appDir: string;
+  identityLabel: string;
+  deps: WizardDeps;
+}): Promise<void> {
+  for (const extra of args.plan.extraEdits ?? []) {
+    if (!extra.serviceName) continue;
+    try {
+      const svc = await args.deps.provisionService({
+        base: args.base,
+        token: args.token,
+        projectId: args.projectId,
+        recipe: args.recipe,
+        serviceName: extra.serviceName,
+        identity: serviceIdentity(args.appDir),
+        identityLabel: args.identityLabel,
+        ui: args.deps.ui,
+        fetchImpl: args.deps.fetchImpl,
+      });
+      // The cloud may de-dup the name. The injected init has to report under
+      // the row that now exists rather than the one that was asked for, or the
+      // registration and the wiring name two different applications.
+      const asked = extra.serviceName;
+      if (svc.serviceName !== asked) {
+        extra.content = extra.content
+          .split(`service: ${JSON.stringify(asked)}`)
+          .join(`service: ${JSON.stringify(svc.serviceName)}`);
+        extra.serviceName = svc.serviceName;
+      }
+      // Only now: the application is in the register, so the line may say so.
+      // The label ends with the name it was built from, so the tail is the
+      // only part a rename touches.
+      if (extra.registeredLabel) {
+        extra.label = extra.registeredLabel.endsWith(asked)
+          ? extra.registeredLabel.slice(0, -asked.length) + svc.serviceName
+          : extra.registeredLabel;
+      }
+    } catch (err) {
+      args.deps.ui.out(
+        color.dim(
+          `  Could not register ${extra.serviceName} up front (${errMessage(err)}); it will be created when that process first reports.`,
+        ),
+      );
+    }
+  }
+}
+
+// ── Connect the coding agent ─────────────────────────────────────────────────
+
+/**
+ * Mint a hosted-agent token for one project.
+ *
+ * The same route the dashboard's Settings and Setup pages post to
+ * (`/api/agent-tokens`), which accepts the CLI's own `ctcli_` bearer, so the
+ * wizard needs nothing the dashboard has and no route of its own. Scoped to
+ * this project alone: a token that reaches every project in an organization is
+ * an organization-administrator decision, not a side effect of wiring one app.
+ */
+export async function mintAgentToken(args: {
+  base: string;
+  token: string;
+  projectId: string;
+  name: string;
+  fetchImpl?: typeof fetch;
+}): Promise<{ secret: string; expiresAt?: string }> {
+  const res = await requestJson<{ secret?: string; expiresAt?: string }>(
+    `${args.base}/api/agent-tokens`,
+    {
+      method: "POST",
+      token: args.token,
+      body: {
+        name: args.name,
+        projectIds: [args.projectId],
+        expiresInDays: 90,
+      },
+      fetchImpl: args.fetchImpl,
+    },
+  );
+  if (typeof res.secret !== "string" || res.secret.length === 0) {
+    throw new Error("The server minted an agent token but returned no secret.");
+  }
+  return {
+    secret: res.secret,
+    ...(typeof res.expiresAt === "string" && res.expiresAt
+      ? { expiresAt: res.expiresAt }
+      : {}),
+  };
+}
+
+/** What the agent-connection step did, as the summary has to state it. */
+export interface AgentConnection {
+  status:
+    "connected" | "already-configured" | "no-target" | "declined" | "failed";
+  /** Repo-relative configuration files this run wrote. */
+  files: string[];
+  /** The summary's "Coding agent" value. */
+  line: string;
+  /** Outstanding steps, printed in the summary's notes block. */
+  notes: string[];
+}
+
+/**
+ * Connect this repository's coding agent to the project that was just
+ * provisioned.
+ *
+ * The wizard used to end at a dashboard link. Everything after that — open
+ * Settings, mint an agent token, copy JSON, find the agent's configuration file,
+ * paste — was on the reader, so the product that exists to hand evidence to a
+ * coding agent shipped a setup command that never mentioned one. VISION.md is
+ * explicit that a pipeline requiring a human click was designed wrong.
+ *
+ * Two rules bound it, and both are the ingest key's rules:
+ *
+ *   1. Nothing is minted until there is a file to put it in. A secret echoed to
+ *      a terminal is a secret in a scrollback buffer and a CI log, so the path
+ *      that cannot write prints the placeholder configuration and the link.
+ *   2. A file git already tracks is never written to, and a file git does not
+ *      ignore gets an ignore entry in the same atomic apply as the token.
+ */
+async function connectCodingAgent(args: {
+  base: string;
+  token: string;
+  projectId: string;
+  projectName: string;
+  /** The git work tree, which owns both the agent config and the .gitignore. */
+  repoRoot: string;
+  /** False when this run wired nothing, so it may not write to the repo. */
+  mayWrite: boolean;
+  parsed: ParsedArgs;
+  deps: WizardDeps;
+}): Promise<AgentConnection> {
+  const { deps, repoRoot } = args;
+  const { ui } = deps;
+  const io = deps.envFileIO;
+  const cloudUrl = args.base;
+  const tokensUrl = appUrl(
+    appBaseFor(args.base, deps.env),
+    "/setup/keys",
+    args.projectId,
+  );
+  const targets = detectAgentConfigs(repoRoot, io);
+  // The configuration a reader can act on without a credential in it. Printed,
+  // never written, on every path that does not mint.
+  const printable = () =>
+    JSON.stringify(
+      {
+        mcpServers: {
+          [MCP_SERVER_NAME]: hostedMcpServer(cloudUrl, AGENT_TOKEN_PLACEHOLDER),
+        },
+      },
+      null,
+      2,
+    );
+  const handOff = (reason: string): string =>
+    `${reason} Mint an agent token at ${tokensUrl} and add the MCP server above to your coding agent. Until that is done, nothing reads the evidence this run wired.`;
+
+  if (args.parsed.noAgent) {
+    ui.out(color.dim("  Skipped (--no-agent). This is the configuration:"));
+    ui.out(printable());
+    return {
+      status: "declined",
+      files: [],
+      line: "not connected (--no-agent)",
+      notes: [handOff("No agent token was minted (--no-agent).")],
+    };
+  }
+  if (!args.mayWrite) {
+    ui.out(color.dim("  Nothing was wired, so no agent token was minted."));
+    return {
+      status: "declined",
+      files: [],
+      line: "not connected",
+      notes: [
+        handOff(
+          "No agent token was minted, because this run wired nothing for an agent to read.",
+        ),
+      ],
+    };
+  }
+  if (targets.length === 0) {
+    ui.out(
+      color.yellow(
+        "No coding agent configuration found in this repository, so nothing was written.",
+      ),
+    );
+    ui.out(color.dim("  Add this to your agent:"));
+    ui.out(printable());
+    return {
+      status: "no-target",
+      files: [],
+      line: "no agent configuration found in this repository",
+      notes: [
+        handOff(
+          "Crumbtrail found no .mcp.json, .cursor/ or .vscode/ to write an MCP server into.",
+        ),
+      ],
+    };
+  }
+
+  // 1. Decide every target before minting, so a run with nowhere to put a
+  // token leaves no live token behind.
+  const writable: AgentConfigTarget[] = [];
+  const notes: string[] = [];
+  const alreadyThere: AgentConfigTarget[] = [];
+  for (const target of targets) {
+    if (io.isTracked(repoRoot, target.relPath)) {
+      ui.out(
+        alert(
+          `${color.brand(target.relPath)} is tracked by git, so Crumbtrail will not write an agent token into it.`,
+        ),
+      );
+      notes.push(
+        `${target.relPath} is committed to git, so no agent token was written there. Add the MCP server yourself, with a token from ${tokensUrl}.`,
+      );
+      continue;
+    }
+    const merged = mergeMcpConfig(
+      io.readFile(target.file),
+      target.configKey,
+      // A probe only. The shape decides "already configured" and "unreadable";
+      // the value never reaches disk.
+      hostedMcpServer(cloudUrl, AGENT_TOKEN_PLACEHOLDER),
+    );
+    if (merged.status === "already-configured") {
+      alreadyThere.push(target);
+      ui.out(
+        ok(
+          `${color.bold(target.agent)} already has a ${color.bold(MCP_SERVER_NAME)} MCP server in ${color.brand(target.relPath)}. Left it as it is.`,
+        ),
+      );
+      continue;
+    }
+    if (merged.status === "unreadable") {
+      ui.out(
+        alert(
+          `Could not read ${color.brand(target.relPath)}: ${merged.reason}. Left it untouched.`,
+        ),
+      );
+      notes.push(
+        `${target.relPath} could not be read (${merged.reason}), so the Crumbtrail MCP server was not added to it. Add it yourself, with a token from ${tokensUrl}.`,
+      );
+      continue;
+    }
+    writable.push(target);
+  }
+
+  if (writable.length === 0) {
+    if (alreadyThere.length > 0) {
+      return {
+        status: "already-configured",
+        files: [],
+        line: `already configured in ${alreadyThere.map((t) => t.relPath).join(", ")}`,
+        notes,
+      };
+    }
+    ui.out(color.dim("  Add this to your agent:"));
+    ui.out(printable());
+    return { status: "failed", files: [], line: "not connected", notes };
+  }
+
+  // 2. One token for the run, named so the dashboard's token list says which
+  // machine and project it came from.
+  let minted: { secret: string; expiresAt?: string };
+  try {
+    minted = await deps.mintAgentToken({
+      base: args.base,
+      token: args.token,
+      projectId: args.projectId,
+      name: `${args.projectName} (crumbtrail CLI)`,
+      fetchImpl: deps.fetchImpl,
+    });
+  } catch (err) {
+    ui.out(color.yellow(`Could not mint an agent token: ${errMessage(err)}.`));
+    ui.out(color.dim("  Add this to your agent:"));
+    ui.out(printable());
+    return {
+      status: "failed",
+      files: [],
+      line: "not connected",
+      notes: [
+        ...notes,
+        handOff(`Could not mint an agent token (${errMessage(err)}).`),
+      ],
+    };
+  }
+
+  // 3. Write. Each file applies all-or-nothing on its own.
+  const written: string[] = [];
+  const server = hostedMcpServer(cloudUrl, minted.secret);
+  for (const target of writable) {
+    const merged = mergeMcpConfig(
+      io.readFile(target.file),
+      target.configKey,
+      server,
+    );
+    if (merged.status !== "write") continue;
+    const edits: EnvEdit[] = [
+      {
+        kind: "write",
+        path: target.file,
+        mode: io.exists(target.file) ? "update" : "create",
+        content: merged.content,
+      },
+    ];
+    if (!io.isIgnored(repoRoot, target.relPath)) {
+      edits.push({
+        kind: "ignore-entry",
+        path: path.join(repoRoot, ".gitignore"),
+        entry: target.relPath,
+        reason: "holds a live agent token",
+      });
+    }
+    try {
+      const applied = applyEnvEdits(edits, io);
+      written.push(target.relPath);
+      ui.out(
+        ok(
+          `Connected ${color.bold(target.agent)}: wrote the ${color.bold(MCP_SERVER_NAME)} MCP server to ${color.brand(target.relPath)}.`,
+        ),
+      );
+      if (applied.ignoreEntriesAdded.length > 0) {
+        ui.out(
+          color.dim(
+            `  Added ${target.relPath} to .gitignore. It holds a live agent token now.`,
+          ),
+        );
+      }
+    } catch (err) {
+      notes.push(
+        `Minted an agent token but could not write ${target.relPath} (${errMessage(err)}). Add the MCP server yourself, with a token from ${tokensUrl}.`,
+      );
+    }
+  }
+
+  if (written.length === 0) {
+    return { status: "failed", files: [], line: "not connected", notes };
+  }
+  ui.out(
+    color.dim(
+      `  Restart ${written.length === 1 ? "your agent" : "your agents"} so the new MCP server is picked up. It reads ${args.projectName} and nothing else.`,
+    ),
+  );
+  return {
+    status: "connected",
+    files: written,
+    line: `${MCP_SERVER_NAME} MCP server written to ${written.join(", ")}`,
+    notes,
+  };
 }
 
 /**
@@ -3174,14 +3694,14 @@ function keyRejectionNote(
 ): string {
   const reason = preflightFailureReason(result);
   if (target.write?.status !== "already-set") {
-    return `First-event wait skipped — ${reason}.`;
+    return `First-event wait skipped: ${reason}.`;
   }
   const varName = target.write.varName ?? "the ingest key";
   const where = target.where ? ` in ${target.where}` : "";
   const mint = target.mintUrl
     ? ` Mint a replacement at ${target.mintUrl}.`
     : "";
-  return `The ${varName} already set${where} was left as it was found, and Crumbtrail rejected it — ${reason}. This service will not report until that value is replaced.${mint}`;
+  return `The ${varName} already set${where} was left as it was found, and Crumbtrail rejected it: ${reason}. This service will not report until that value is replaced.${mint}`;
 }
 
 function preflightFailureReason(result: PreflightResult): string {
@@ -3245,7 +3765,7 @@ async function applyInjection(
     if (res.written.length > 0) {
       ui.out(
         ok(
-          `Your entry file was already wired — wired ${res.written.join(", ")} beside it.`,
+          `Your entry file was already wired, so Crumbtrail wired ${res.written.join(", ")} beside it.`,
         ),
       );
       return { outcome: "wired", filesTouched, notes };
@@ -3261,9 +3781,7 @@ async function applyInjection(
   // no SDK packages, so `installSdk` reports a skip rather than a failure.
   if (sdkInstall && !sdkInstall.installed && sdkInstall.packages.length > 0) {
     const pkgs = sdkInstall.packages.join(", ");
-    ui.out(
-      color.yellow(`Left your code untouched — ${pkgs} is not installed.`),
-    );
+    ui.out(color.yellow(`Left your code untouched. ${pkgs} is not installed.`));
     // The wiring is withheld, but the wiring is still the thing the user came
     // for. Returning here skipped the snippet and the agent prompt the
     // fallback-ai branch below prints, so the one run that most needed a
@@ -3312,7 +3830,7 @@ async function applyInjection(
     // OpenTelemetry. Print the OTLP setup guidance + agent prompt; touch nothing.
     ui.out(
       ok(
-        "Detected a non-JS backend that already speaks OpenTelemetry — no SDK needed.",
+        "Detected a non-JS backend that already speaks OpenTelemetry, so no SDK is needed.",
       ),
     );
     ui.out(color.dim("Point your existing OTLP exporter at Crumbtrail:"));
@@ -3322,7 +3840,7 @@ async function applyInjection(
       ui.out(plan.agentPrompt);
     }
     notes.push(
-      "OTLP backend — printed OpenTelemetry setup guidance; no files were changed.",
+      "OTLP backend. Printed OpenTelemetry setup guidance. No files were changed.",
     );
     return { outcome: "guidance", filesTouched, notes };
   }
@@ -3333,7 +3851,7 @@ async function applyInjection(
       : parsed.yes
         ? true
         : await deps.prompter.confirm(
-            `${plan.targetPath} has uncommitted changes — edit it and apply the complete local setup anyway?`,
+            `${plan.targetPath} has uncommitted changes. Edit it and apply the complete local setup anyway?`,
             false,
           );
     if (!approved) {
@@ -3342,7 +3860,7 @@ async function applyInjection(
       );
       if (plan.content) ui.out(plan.content);
       notes.push(
-        `Skipped editing ${plan.targetPath} (uncommitted changes) — paste the snippet above into it manually.`,
+        `Skipped editing ${plan.targetPath} (uncommitted changes). Paste the snippet above into it manually.`,
       );
       return { outcome: "declined", filesTouched, notes };
     }
@@ -3364,9 +3882,18 @@ async function applyInjection(
     filesTouched.push(...res.written);
     ui.out(
       ok(
-        `Added ${(plan.amendedFields ?? []).join(", ")} to the Crumbtrail init you already had in ${plan.targetPath}. Nothing else in that file changed.`,
+        // Both edits, when there are two. This line used to promise that
+        // nothing else in the file changed while a guarded env file load was
+        // being prepended above the init, which is the one change the reader
+        // most needs to know about: it is what makes the key this run wrote
+        // actually reach the service.
+        plan.envPreloadAdded
+          ? `Added ${(plan.amendedFields ?? []).join(", ")} to the Crumbtrail init you already had in ${plan.targetPath}, and a guarded env file load above it so the key is set before that init reads it. Nothing else in that file changed.`
+          : `Added ${(plan.amendedFields ?? []).join(", ")} to the Crumbtrail init you already had in ${plan.targetPath}. Nothing else in that file changed.`,
       ),
     );
+    const caveat = envLoadCaveat(plan);
+    if (caveat) ui.out(color.dim(`  ${caveat}`));
     return { outcome: "wired", filesTouched, notes };
   }
 
@@ -3388,7 +3915,58 @@ async function applyInjection(
 /** Name the files a write touched — "Wrote 2 file(s)." is nobody's payoff. */
 function describeWrites(res: { written: string[]; message: string }): string {
   if (res.written.length === 0) return res.message;
-  return `Crumbtrail wired in — wrote ${res.written.join(", ")}.`;
+  return `Crumbtrail wired in. Wrote ${res.written.join(", ")}.`;
+}
+
+/**
+ * Says nothing when the amended file loads an env file, and states the
+ * condition when it does not.
+ *
+ * The fresh injection path prepends a guarded `.env` load above the init it
+ * writes, so the key in the env file is genuinely read at startup. An amend
+ * edits the customer's own init and adds no such loader, so a service that
+ * loads no env file still starts with the variable unset. Telling that user a
+ * restart is all it takes is a claim the shipped code does not support.
+ */
+export function envLoadCaveat(plan: {
+  content?: string | null;
+  keyEnvVar?: string;
+}): string | undefined {
+  const envVar = plan.keyEnvVar;
+  const source = plan.content;
+  if (!envVar || !source) return undefined;
+  // Only a runtime `process.env` read depends on the file being loaded. A
+  // bundler-inlined key (`import.meta.env.VITE_…`) is substituted at build time
+  // by a build that reads `.env` itself.
+  if (!source.includes(`process.env.${envVar}`)) return undefined;
+  if (/loadEnvFile|dotenv/.test(source)) return undefined;
+  return `That file reads process.env.${envVar} and loads no env file itself, so ${envVar} has to be in the service's environment. Start it with \`node --env-file=.env\`, or load the file the key was written to.`;
+}
+
+/**
+ * What the wait actually saw, for a wait that ended with nothing.
+ *
+ * The old note asserted a cause the run never checked ("your key was already
+ * set, so your events are going elsewhere"). It has to report the observation
+ * instead, including the one where the observation itself failed: a sessions
+ * feed the CLI could not read says nothing about whether events arrived, and
+ * printing that as an absence is the same defect in the other direction.
+ */
+function waitObservation(
+  poll: PollRealEventResult,
+  keyEnvVar?: string,
+): string {
+  const restart = `If your app was already running, restart it so it picks up ${keyEnvVar ?? "the ingest key"}, then load a page.`;
+  switch (poll.reason) {
+    case "reads-failed":
+      return "No event confirmed: Crumbtrail could not read the sessions feed while it waited, so it did not observe whether anything arrived. Check your dashboard.";
+    case "no-sessions":
+      return `No event yet. This project has no sessions at all, so nothing has reported in. Start your app and load a page. ${restart}`;
+    case "no-new-activity":
+      return `No event yet. No new session started and no application reported an event while Crumbtrail waited. ${restart}`;
+    default:
+      return `No event yet. Start your app and load a page. ${restart}`;
+  }
 }
 
 /** Poll for the first real event, aborting cleanly on Ctrl-C. */
@@ -3497,7 +4075,12 @@ function printSummary(
   setupIncomplete = false,
   /** The injected code holds the key as a literal placeholder (static pages). */
   keyIsSourceLiteral = false,
-  opts: { capture?: CaptureState; keyRejected?: boolean } = {},
+  opts: {
+    capture?: CaptureState;
+    keyRejected?: boolean;
+    /** What the agent-connection step did, so the summary can state it. */
+    agent?: AgentConnection;
+  } = {},
 ): boolean {
   // User-facing links point at the app host (the SPA), not the API host.
   const appBase = appBaseFor(base);
@@ -3573,6 +4156,19 @@ function printSummary(
   }
   if (sessionUrl) {
     ui.out(field("Session", color.brand(sessionUrl)));
+  }
+  // Named on the bar's own list, not only in a note: connecting the agent is
+  // what the whole run is for, and a reader who does not see it here has no
+  // way to tell a connected run from the silent one this used to be.
+  if (opts.agent) {
+    ui.out(
+      field(
+        "Agent",
+        opts.agent.status === "connected"
+          ? color.brand(opts.agent.line)
+          : color.yellow(opts.agent.line),
+      ),
+    );
   }
   ui.out(
     field("Dashboard", color.brand(appUrl(appBase, "/issues", p.projectId))),
@@ -3778,7 +4374,7 @@ export function wizardAliasHint(arg: string): string | undefined {
   const word = arg.trim().replace(/^-+/, "").toLowerCase();
   if (!WIZARD_ALIASES.has(word)) return undefined;
   return (
-    `There is no \`${word}\` subcommand — the setup wizard is just ` +
+    `There is no \`${word}\` subcommand. The setup wizard is just ` +
     `\`crumbtrail\`, run inside the app you want to wire up. ` +
     `Run it with no arguments (\`npx crumbtrail\`).`
   );
@@ -3862,7 +4458,7 @@ export async function runCli(
     );
     deps.ui.err(
       color.dim(
-        "Setting up for the first time? Run `npx crumbtrail` in an interactive terminal — it creates the project for you. In CI, take the id from an existing project's dashboard URL and set CRUMBTRAIL_TOKEN as well.",
+        "Setting up for the first time? Run `npx crumbtrail` in an interactive terminal and it creates the project for you. In CI, take the id from an existing project's dashboard URL and set CRUMBTRAIL_TOKEN as well.",
       ),
     );
     deps.ui.err("");

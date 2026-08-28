@@ -235,15 +235,26 @@ export function chooseEnvFile(
   return path.join(appDir, bundled ? ".env.local" : ".env");
 }
 
-/** Add one path to a .gitignore's text, if it is not already listed verbatim. */
-export function appendIgnoreEntry(content: string, entry: string): string {
+/**
+ * Add one path to a .gitignore's text, if it is not already listed verbatim.
+ *
+ * `reason` becomes the comment above the entry. It is a parameter because an
+ * env file is no longer the only credential-bearing file this wizard writes:
+ * the agent's MCP configuration holds a live agent token, and a .gitignore line
+ * telling its reader that file holds an ingest key would be false.
+ */
+export function appendIgnoreEntry(
+  content: string,
+  entry: string,
+  reason = "holds a live ingest key",
+): string {
   const listed = content
     .split("\n")
     .some((line) => line.trim().replace(/^\/+/, "") === entry);
   if (listed) return content;
   const needsNewline = content.length > 0 && !content.endsWith("\n");
   const lead = content.length > 0 ? `${needsNewline ? "\n" : ""}` : "";
-  return `${content}${lead}\n# Added by crumbtrail: holds a live ingest key\n${entry}\n`;
+  return `${content}${lead}\n# Added by crumbtrail: ${reason}\n${entry}\n`;
 }
 
 // ── Decision + edits ─────────────────────────────────────────────────────────
@@ -271,6 +282,8 @@ export interface IgnoreEntryEdit {
   kind: "ignore-entry";
   path: string;
   entry: string;
+  /** The comment written above the entry, when the default is not true. */
+  reason?: string;
 }
 
 export type EnvEdit = EnvWriteEdit | IgnoreEntryEdit;
@@ -416,7 +429,7 @@ export function applyEnvEdits(
       if (edit.kind === "ignore-entry") {
         // Re-read here, not at plan time: an earlier edit in this same apply
         // may have already appended another service's entry to this file.
-        content = appendIgnoreEntry(prior ?? "", edit.entry);
+        content = appendIgnoreEntry(prior ?? "", edit.entry, edit.reason);
         // Already listed — by a rule this run added, or by one that was
         // already there. Writing an identical file would report an addition
         // that did not happen.

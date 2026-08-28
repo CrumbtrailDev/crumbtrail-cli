@@ -123,6 +123,30 @@ describe("the other processes the package starts", () => {
     expect(edit.content).toContain("if (!process.env.CRUMBTRAIL_KEY) {");
   });
 
+  it("carries the new service name and does not claim it already exists", () => {
+    // The wizard prints this label; the dashboard's Applications table is the
+    // register of what the project has declared. Wiring a file declares
+    // nothing, so the line may not report a service the reader cannot go and
+    // find, and the name has to travel as data so the caller can register it.
+    const io = fakeInjectIO(workerFiles);
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "marginary",
+      },
+      io,
+    );
+    const [edit] = plan.extraEdits!;
+    expect(edit.serviceName).toBe("marginary-worker");
+    expect(edit.content).toContain(`service: "${edit.serviceName}"`);
+    expect(edit.label).not.toContain("as service marginary-worker");
+    expect(edit.label).toContain("marginary-worker");
+    expect(edit.label).toContain("appears once that process first runs");
+  });
+
   it("labels the service by directory when the file name is generic", () => {
     expect(serviceSuffixFor("/proj/src/worker.ts")).toBe("worker");
     expect(serviceSuffixFor("/proj/queue/index.ts")).toBe("queue");

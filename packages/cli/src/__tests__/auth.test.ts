@@ -45,6 +45,11 @@ interface MockOptions {
    * its dashboard — the shape that 404ed every sign-in link the CLI printed.
    */
   signInPages?: boolean;
+  /**
+   * A separate dashboard origin, the split-origin self-host shape: this server
+   * serves the API only, and `verificationUri` points somewhere else entirely.
+   */
+  appOrigin?: string;
 }
 
 interface MockServer {
@@ -123,7 +128,7 @@ async function startMockCloud(opts: MockOptions = {}): Promise<MockServer> {
       return send(201, {
         deviceCode: "dev-code-xyz",
         userCode: "ABCD-1234",
-        verificationUri: `${server.baseUrlRef}/cli/activate`,
+        verificationUri: `${opts.appOrigin ?? server.baseUrlRef}/cli/activate`,
         expiresIn: 300,
         interval: 1,
       });
@@ -152,6 +157,32 @@ async function startMockCloud(opts: MockOptions = {}): Promise<MockServer> {
     get devicePolls() {
       return devicePolls;
     },
+    close: () =>
+      new Promise<void>((resolve, reject) =>
+        server.close((e) => (e ? reject(e) : resolve())),
+      ),
+  };
+}
+
+/** A dashboard-only origin: serves the SPA sign-in routes, nothing else. */
+async function startMockDashboard(): Promise<{
+  baseUrl: string;
+  close(): Promise<void>;
+}> {
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    if (url.pathname === "/cli/authorize" || url.pathname === "/cli/activate") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      return res.end("<!doctype html><title>Crumbtrail</title>");
+    }
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  const port = addr && typeof addr === "object" ? addr.port : 0;
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
     close: () =>
       new Promise<void>((resolve, reject) =>
         server.close((e) => (e ? reject(e) : resolve())),
@@ -390,6 +421,74 @@ describe("sign-in links land on the dashboard, not the API host", () => {
       pollIntervalMs: 5,
     });
     expect(loadAuth(withOverride)?.appBaseUrl).toBe("https://app.example");
+    await mock.close();
+  });
+});
+
+describe("split-origin self-host, first login", () => {
+  it("resolves the dashboard origin from the deployment and still uses the browser", async () => {
+    // The reported shape: a custom --endpoint whose dashboard is a different
+    // port, with no stored token and no CRUMBTRAIL_APP_URL. The origin is
+    // knowable — the unauthenticated device-start endpoint reports it — so the
+    // hand-off must ask instead of guessing the API host, 404ing, and telling
+    // the user to set an env var the product did not need.
+    const mint = "ctcli_" + "h".repeat(48);
+    const dash = await startMockDashboard();
+    const mock = await startMockCloud({
+      mintToken: mint,
+      signInPages: false, // the API host serves no SPA, like every real split stack
+      appOrigin: dash.baseUrl,
+    });
+    clearReportedAppBases();
+    let openedUrl = "";
+    const openFn = (authorizeUrl: string): boolean => {
+      openedUrl = authorizeUrl;
+      const port = new URL(authorizeUrl).searchParams.get("port");
+      http.get(`http://127.0.0.1:${port}/callback?code=grant-split`);
+      return true;
+    };
+    const lines: string[] = [];
+    const token = await ensureToken({
+      base: mock.baseUrl,
+      ui: { out: (l = "") => lines.push(l), err: () => {} },
+      openFn,
+      env,
+      pollIntervalMs: 5,
+    });
+    expect(token).toBe(mint);
+    expect(openedUrl.startsWith(`${dash.baseUrl}/cli/authorize?`)).toBe(true);
+    // The browser hand-off completed: nothing was polled as a device code, and
+    // nothing told the user the hand-off was unavailable.
+    expect(mock.devicePolls).toBe(0);
+    expect(mock.exchanges).toBe(1);
+    expect(lines.join("\n")).not.toMatch(/Browser hand-off unavailable/);
+    // And the origin is on disk, so the next run does not have to ask.
+    expect(loadAuth(env)?.appBaseUrl).toBe(dash.baseUrl);
+    await mock.close();
+    await dash.close();
+  });
+
+  it("blames the deployment, not CRUMBTRAIL_APP_URL, when the reported origin 404s", async () => {
+    // A stack whose PUBLIC_BASE_URL points at its own API host: the origin was
+    // reported, it just does not serve a dashboard. Telling somebody to set an
+    // env var as if they had misconfigured one names the wrong lever.
+    const mint = "ctcli_" + "i".repeat(48);
+    const mock = await startMockCloud({
+      mintToken: mint,
+      signInPages: false,
+    });
+    clearReportedAppBases();
+    const lines: string[] = [];
+    await ensureToken({
+      base: mock.baseUrl,
+      ui: { out: (l = "") => lines.push(l), err: () => {} },
+      noBrowser: true,
+      env,
+      pollIntervalMs: 5,
+    });
+    const out = lines.join("\n");
+    expect(out).toMatch(/this deployment reports .* as its dashboard/);
+    expect(out).toMatch(/PUBLIC_BASE_URL/);
     await mock.close();
   });
 });

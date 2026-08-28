@@ -397,8 +397,10 @@ describe("MCP Server", () => {
       route?: string;
       release?: string;
       build?: string;
-      app?: string;
-      tenant?: string;
+      /** `null` writes a session with no app name at all. */
+      app?: string | null;
+      /** `null` writes a session with no tenant, the self-hosted shape. */
+      tenant?: string | null;
       bugId?: string;
       start?: number;
     } = {},
@@ -408,8 +410,8 @@ describe("MCP Server", () => {
     const meta = {
       id: sessionId,
       start: options.start ?? 1_800_000_000_000,
-      app: options.app ?? "billing",
-      tenant: options.tenant ?? "acme",
+      app: options.app === null ? undefined : (options.app ?? "billing"),
+      tenant: options.tenant === null ? undefined : (options.tenant ?? "acme"),
       release: options.release,
       build: options.build,
     };
@@ -508,8 +510,8 @@ describe("MCP Server", () => {
     expect(recurrences[0]).toMatchObject({
       session_count: 3,
       release_span: { first: "R181", last: "R182", label: "R181->R182" },
-      apps: ["billing"],
-      tenants: ["acme"],
+      apps: { known: ["billing"], unknown: 0 },
+      tenants: { known: ["acme"], unknown: 0 },
     });
     expect(
       recurrences[0].occurrences
@@ -579,6 +581,171 @@ describe("MCP Server", () => {
     const recurrence = JSON.parse((res!.result as any).content[0].text);
     expect(recurrence.signature).toBe(signatures.current);
     expect(recurrence.session_count).toBe(1);
+  });
+
+  // CT-P03: a session that recorded no app name is an UNKNOWN app, not zero
+  // apps. `apps: []` answered "which apps does this affect" with "none".
+  it("recurrence rollups count a session with no app name as unknown, not absent", async () => {
+    createSessionWithDistinctBug("sess-noapp-a", {
+      app: null,
+      tenant: null,
+      message: "Invoice 123 ranked 3 instead of 1",
+    });
+    createSessionWithDistinctBug("sess-noapp-b", {
+      app: null,
+      tenant: null,
+      message: "Invoice 456 ranked 3 instead of 1",
+    });
+
+    const res = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 570,
+      method: "tools/call",
+      params: {
+        name: "listDistinctBugs",
+        arguments: { mode: "cross-session" },
+      },
+    });
+    const [rollup] = JSON.parse((res!.result as any).content[0].text);
+
+    expect(rollup.session_count).toBe(2);
+    expect(rollup.apps).toEqual({ known: [], unknown: 2 });
+    // Tenants are not a concept in a self-hosted single-tenant store, so the
+    // key is absent rather than an empty claim about a real dimension.
+    expect(rollup).not.toHaveProperty("tenants");
+
+    const one = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 571,
+      method: "tools/call",
+      params: {
+        name: "getRecurrence",
+        arguments: { signature: rollup.signature },
+      },
+    });
+    const recurrence = JSON.parse((one!.result as any).content[0].text);
+    expect(recurrence.apps).toEqual({ known: [], unknown: 2 });
+    expect(recurrence).not.toHaveProperty("tenants");
+  });
+
+  it("recurrence rollups keep named apps beside the unknown count", async () => {
+    createSessionWithDistinctBug("sess-mixapp-a", {
+      message: "Invoice 123 ranked 3 instead of 1",
+    });
+    createSessionWithDistinctBug("sess-mixapp-b", {
+      app: null,
+      message: "Invoice 456 ranked 3 instead of 1",
+    });
+
+    const res = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 572,
+      method: "tools/call",
+      params: {
+        name: "listDistinctBugs",
+        arguments: { mode: "cross-session" },
+      },
+    });
+    const [rollup] = JSON.parse((res!.result as any).content[0].text);
+    expect(rollup.apps).toEqual({ known: ["billing"], unknown: 1 });
+    expect(rollup.tenants).toEqual({ known: ["acme"], unknown: 0 });
+  });
+
+  // Crumbtrail's own doctor probes are not customer evidence. getLatestIssue
+  // already filtered them; the cross-session tools did not.
+  it("listDistinctBugs and getRecurrence exclude doctor probe sessions and say so", async () => {
+    createSessionWithDistinctBug("sess-real-probe-mix", {
+      message: "Invoice 123 ranked 3 instead of 1",
+    });
+    createSessionWithDistinctBug("ses_probe_synthetic", {
+      title: "Backend HTTP 500 from GET /__crumbtrail/probe",
+      message: "crumbtrail-server doctor synthetic failure",
+      route: "/__crumbtrail/probe",
+      bugId: "bug_probe",
+    });
+    createSessionWithDistinctBug("ses_otlp_probe_synthetic", {
+      title: "Backend HTTP 500 from GET /__crumbtrail/probe",
+      message: "crumbtrail-server doctor synthetic failure",
+      route: "/__crumbtrail/probe",
+      bugId: "bug_probe_otlp",
+    });
+
+    const res = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 573,
+      method: "tools/call",
+      params: {
+        name: "listDistinctBugs",
+        arguments: { mode: "cross-session" },
+      },
+    });
+    const payload = JSON.parse((res!.result as any).content[0].text);
+
+    expect(payload.doctorProbesSkipped).toBe(2);
+    expect(payload.recurrences).toHaveLength(1);
+    expect(payload.recurrences[0].occurrences).toHaveLength(1);
+    expect(payload.recurrences[0].occurrences[0].sessionId).toBe(
+      "sess-real-probe-mix",
+    );
+
+    const one = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 574,
+      method: "tools/call",
+      params: {
+        name: "getRecurrence",
+        arguments: { signature: payload.recurrences[0].signature },
+      },
+    });
+    const recurrence = JSON.parse((one!.result as any).content[0].text);
+    expect(
+      recurrence.occurrences.map((o: any) => o.sessionId),
+    ).toEqual(["sess-real-probe-mix"]);
+  });
+
+  it("recallIssueContext never returns a doctor probe as a precedent", async () => {
+    createSessionWithDistinctBug("sess-recall-real", {
+      message: "Invoice 123 ranked 3 instead of 1",
+    });
+    createSessionWithDistinctBug("ses_probe_recall", {
+      title: "Backend HTTP 500 from GET /__crumbtrail/probe",
+      message: "crumbtrail-server doctor synthetic failure",
+      route: "/__crumbtrail/probe",
+      bugId: "bug_probe_recall",
+    });
+
+    const res = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 575,
+      method: "tools/call",
+      params: {
+        name: "recallIssueContext",
+        arguments: {
+          text: "crumbtrail-server doctor synthetic failure probe 500",
+          include: ["precedents"],
+        },
+      },
+    });
+    const payload = JSON.parse((res!.result as any).content[0].text);
+    expect(
+      payload.precedents.results.map((match: any) => match.sessionId),
+    ).not.toContain("ses_probe_recall");
+
+    // Asking for the probe by id is answered as a probe, not as a missing
+    // session: a failed read never renders as an empty state.
+    const byId = await server.handleMessage({
+      jsonrpc: "2.0",
+      id: 576,
+      method: "tools/call",
+      params: {
+        name: "recallIssueContext",
+        arguments: {
+          sessionId: "ses_probe_recall",
+          include: ["precedents"],
+        },
+      },
+    });
+    expect(JSON.stringify(byId!.result)).toContain("doctor probe");
   });
 
   it("getBug returns the full correlated evidence for one distinct bug", async () => {

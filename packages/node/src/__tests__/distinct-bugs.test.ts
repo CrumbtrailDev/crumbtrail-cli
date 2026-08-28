@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 import type { BugEvent } from "crumbtrail-core";
-import { buildDistinctBugSignature, groupDistinctBugs } from "../distinct-bugs";
+import {
+  buildDistinctBugSignature,
+  groupDistinctBugRecurrences,
+  groupDistinctBugs,
+  type DistinctBug,
+  type DistinctBugRecurrenceInput,
+} from "../distinct-bugs";
 import { computeDistinctBugSignatures } from "../index";
 import type { EvidenceCandidate } from "../evidence-index";
 
@@ -951,6 +957,75 @@ describe("a query string is data, not identity", () => {
         searchFailure("req-3", "https://api.example.com/v2/orders", 1200),
       ]).length,
     ).toBe(2);
+  });
+});
+
+/**
+ * CT-P03 at the rollup layer: a session that recorded no app name contributed
+ * nothing to `apps` and left no marker, so the rollup answered "which apps does
+ * this affect" with `[]` — "none" — when the true answer was "unknown".
+ */
+describe("recurrence label rollups", () => {
+  function input(
+    sessionId: string,
+    session: Partial<DistinctBugRecurrenceInput["session"]> = {},
+  ): DistinctBugRecurrenceInput {
+    const bug = {
+      schemaVersion: 1,
+      bugId: `bug_${sessionId}`,
+      title: "Wrong invoice rank",
+      severity: "high",
+      firstSeen: 100,
+      lastSeen: 200,
+      window: { start: 100, end: 200 },
+      representative: {
+        title: "Wrong invoice rank",
+        detector: "db_mutation",
+        severity: "high",
+        message: "Invoice ranked 3 instead of 1",
+        route: "/jobs/invoice-digest",
+      },
+      frontendEvidence: [],
+      backendEvidence: [],
+      candidateIds: [],
+    } as unknown as DistinctBug;
+    return { bug, session: { sessionId, ...session } };
+  }
+
+  it("counts sessions with no app name as unknown instead of dropping them", () => {
+    const [rollup] = groupDistinctBugRecurrences([
+      input("s1", { app: "billing" }),
+      input("s2"),
+      input("s3"),
+    ]);
+    expect(rollup.session_count).toBe(3);
+    expect(rollup.apps).toEqual({ known: ["billing"], unknown: 2 });
+  });
+
+  it("omits tenants entirely when no session carried one", () => {
+    const [rollup] = groupDistinctBugRecurrences([
+      input("s1", { app: "billing" }),
+      input("s2", { app: "billing" }),
+    ]);
+    expect(rollup.tenants).toBeUndefined();
+    expect(Object.keys(rollup)).not.toContain("tenants");
+  });
+
+  it("reports tenants with their own unknown count once any session has one", () => {
+    const [rollup] = groupDistinctBugRecurrences([
+      input("s1", { app: "billing", tenant: "acme" }),
+      input("s2", { app: "billing" }),
+    ]);
+    expect(rollup.tenants).toEqual({ known: ["acme"], unknown: 1 });
+  });
+
+  it("counts unknown per session, not per occurrence", () => {
+    const two = input("s1");
+    const alsoTwo = input("s1");
+    alsoTwo.bug = { ...alsoTwo.bug, bugId: "bug_s1_second" };
+    const [rollup] = groupDistinctBugRecurrences([two, alsoTwo]);
+    expect(rollup.session_count).toBe(1);
+    expect(rollup.apps).toEqual({ known: [], unknown: 1 });
   });
 });
 

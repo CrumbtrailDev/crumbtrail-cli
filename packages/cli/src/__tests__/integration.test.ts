@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import path from "node:path";
 import { inspectIntegration } from "../inject/integration";
 import { buildPlan } from "../inject/recipes";
+import { envLoadCaveat } from "../cli";
 import { fakeInjectIO } from "./helpers";
 
 const CWD = "/proj";
@@ -232,5 +233,123 @@ describe("amending an integration the customer already has", () => {
 
     expect(plan.kind).toBe("fallback-ai");
     expect(plan.warnings.join(" ")).toContain("Next:");
+  });
+});
+
+describe("an amended service reads the key the wizard just wrote", () => {
+  // The fresh-injection path prepends a guarded env file load above the init it
+  // writes, so the key in `.env` is set before anything reads it. The amend
+  // path skipped it, which made the amended service the one case where the
+  // wizard wrote a key the service never read while every line after reported
+  // a finished setup.
+  function nodeFiles(over: Record<string, string> = {}) {
+    return {
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-node": "0.41.0" },
+      }),
+      [p("node_modules", "crumbtrail-node", "package.json")]: "{}",
+      [p("src", "index.js")]: [
+        'import { autoCapture } from "crumbtrail-node";',
+        "",
+        "autoCapture({",
+        `  endpoint: "${ENDPOINT}",`,
+        "  authToken: process.env.CRUMBTRAIL_KEY,",
+        "});",
+        "",
+        "console.log('server boot');",
+      ].join("\n"),
+      ...over,
+    };
+  }
+
+  const nodeAmendPlan = (files: Record<string, string>) =>
+    buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.js"),
+        serviceName: "api",
+        options: { force: true },
+      },
+      fakeInjectIO(files),
+    );
+
+  it("prepends the same guarded env load the fresh path writes", () => {
+    const plan = nodeAmendPlan(nodeFiles());
+
+    expect(plan.kind).toBe("amend-init");
+    expect(plan.content).toContain("loadEnvFile");
+    expect(plan.content).toContain("Crumbtrail");
+    expect(plan.envPreloadAdded).toBe(true);
+    // The customer's own init is still theirs, with the one option added.
+    expect(plan.content).toContain('service: "api"');
+    expect(plan.content).toContain("console.log('server boot')");
+    // The load has to come first, or the init reads the variable before
+    // anything set it.
+    expect(plan.content!.indexOf("loadEnvFile")).toBeLessThan(
+      plan.content!.indexOf("autoCapture({"),
+    );
+  });
+
+  it("names the second edit rather than promising nothing else changed", () => {
+    const plan = nodeAmendPlan(nodeFiles());
+    const warning = plan.warnings.join(" ");
+    expect(warning).toContain("prepended a guarded env file load");
+    expect(warning).toContain("CRUMBTRAIL_KEY");
+  });
+
+  it("silences the caveat that existed only because this was missing", () => {
+    // envLoadCaveat self-suppresses for a file that loads an env file. With
+    // the prepend in place there is no condition left to state, so the line
+    // has to go quiet on its own.
+    const plan = nodeAmendPlan(nodeFiles());
+    expect(
+      envLoadCaveat({ content: plan.content, keyEnvVar: plan.keyEnvVar }),
+    ).toBeUndefined();
+  });
+
+  it("adds no second loader to a file that already loads one", () => {
+    const files = nodeFiles();
+    files[p("src", "index.js")] = files[p("src", "index.js")].replace(
+      'import { autoCapture } from "crumbtrail-node";',
+      'import "dotenv/config";\nimport { autoCapture } from "crumbtrail-node";',
+    );
+    const plan = nodeAmendPlan(files);
+    expect(plan.kind).toBe("amend-init");
+    expect(plan.content).not.toContain("loadEnvFile");
+    expect(plan.envPreloadAdded).toBeUndefined();
+    expect(plan.warnings.join(" ")).not.toContain("prepended a guarded");
+  });
+
+  it("leaves a bundler-inlined key alone, which no runtime read depends on", () => {
+    // A Vite key is substituted at build time by a build that reads `.env`
+    // itself, so there is no runtime read for a loader to get ahead of.
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.tsx"),
+        serviceName: "web",
+        options: { force: true },
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({
+          dependencies: { "crumbtrail-core": "0.41.0" },
+        }),
+        [p("node_modules", "crumbtrail-core", "package.json")]: "{}",
+        [p("src", "main.tsx")]: [
+          'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
+          "Crumbtrail.init({",
+          "  ...PRESET_PASSIVE,",
+          `  httpEndpoint: "${ENDPOINT}",`,
+          "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+          "});",
+        ].join("\n"),
+      }),
+    );
+    expect(plan.kind).toBe("amend-init");
+    expect(plan.content).not.toContain("loadEnvFile");
   });
 });
