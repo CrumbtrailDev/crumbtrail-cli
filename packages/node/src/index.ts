@@ -208,3 +208,15 @@ export {
 } from "./request-context";
 
 export type { BackendRequestContext } from "./request-context";
+
+// Capture-side utilities the pipeline tests reach for directly. They were
+// internal while those tests lived beside them; now that the tests live with
+// the analysis in the cloud repository, the boundary has to name them.
+export { parseStackFrame } from "./db/callsite";
+export { buildDbErrorEvent, captureDbErrorCode } from "./db/error-event";
+export {
+  DEFAULT_MAX_CALLSITES_PER_REQUEST,
+  resetCallsiteBudgetForTests,
+} from "./db/instrument-shared";
+export { parseLimitOffset } from "./db/sql";
+export { HeadlessTimeoutError } from "./headless-session";
