@@ -4472,7 +4472,7 @@ export async function runCli(
 // Auto-run only when invoked directly as the bin (not when imported in tests).
 // npm installs POSIX bins as a symlink NAMED AFTER THE BIN KEY (`crumbtrail`, not
 // `cli.cjs`) and Node does not realpath process.argv[1], so the check must match
-// the bin name too — mirrors packages/node/src/cli.ts's isCliEntrypoint.
+// the bin name too.
 export function isCliEntrypoint(argv1: string | undefined): boolean {
   if (!argv1) return false;
   return ["cli.ts", "cli.js", "cli.cjs", "cli.mjs", "crumbtrail"].includes(

@@ -1,8 +1,11 @@
 {
   "mcpServers": {
     "crumbtrail": {
-      "command": "npx",
-      "args": ["-p", "crumbtrail-node", "crumbtrail-server", "serve", "--mcp"]
+      "type": "http",
+      "url": "${CRUMBTRAIL_CLOUD_URL}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CRUMBTRAIL_AGENT_TOKEN}"
+      }
     }
   }
 }

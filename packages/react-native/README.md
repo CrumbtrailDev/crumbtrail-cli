@@ -110,14 +110,14 @@ into one signature. Install the peer with `npx expo install
 @react-native-async-storage/async-storage`, or the injected import will not
 resolve.
 
-### Manual setup (self-host)
+### Manual setup
 
 ```ts
 import { createReactNativeCrumbtrail } from "crumbtrail-react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 createReactNativeCrumbtrail({
-  config: { httpEndpoint: "http://127.0.0.1:9898" }, // local crumbtrail-server
+  config: { httpEndpoint: "https://your-crumbtrail-host" },
   asyncStorage: AsyncStorage, // optional — enables session persistence
 });
 ```
@@ -203,15 +203,8 @@ default in the React Native preset — there is no DOM to instrument.
 
 ## Verify
 
-Point the same `crumbtrail-server doctor` used for the browser/node SDK at
-your self-host server after reproducing an issue in the app:
-
-```bash
-crumbtrail-server doctor --port 9898
-```
-
-On the cloud path, the wizard itself polls for the first real event after
-setup (skip with `--skip-verify`).
+After reproducing an issue in the app, check that the session arrived. The
+wizard polls for the first real event after setup (skip with `--skip-verify`).
 
 ## Requirements
 

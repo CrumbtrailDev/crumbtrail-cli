@@ -231,16 +231,6 @@ What a keep does and does not do:
 - On a **form input** it is matched against the field's `name`, and a
   `password`, `email` or `tel` input is never kept whatever it is called.
 
-The capture server takes the same list, so a name kept in a `db.diff` row is
-also kept in the request body and query string that produced it:
-
-```bash
-crumbtrail-server serve --keep-field body,q,postalCode
-```
-
-`CRUMBTRAIL_KEEP_FIELDS` sets it from the environment; flags add to it rather
-than replacing it. The active list is printed at boot, because it is the one
-setting that makes the server store more than it did before.
 
 ## Production capture
 
@@ -262,9 +252,7 @@ defects.
 
 To record none of it, set `redaction: { captureInputValues: false }`. Every input
 becomes `[REDACTED]` whatever the field is called, and `keepFields` cannot bring one
-back. Operators can enforce the same thing at the capture server with
-`crumbtrail-server serve --no-input-values` or `CRUMBTRAIL_CAPTURE_INPUT_VALUES=0`,
-which overrides whatever the application asked for — the switch only ever removes.
+back.
 
 Remote capture policy can only add masking. Clear text or values are captured
 only when `data-crumbtrail-unmask` is added to that individual safe element.
@@ -638,7 +626,7 @@ Without those three steps every Crumbtrail `invoke` fails.
 | Package                                                                            | Use it for                                                 |
 | ---------------------------------------------------------------------------------- | ---------------------------------------------------------- |
 | [`crumbtrail`](https://www.npmjs.com/package/crumbtrail)                           | The `npx crumbtrail` setup wizard                          |
-| [`crumbtrail-node`](https://www.npmjs.com/package/crumbtrail-node)                 | Self-hosted server, Express middleware, MCP evidence tools |
+| [`crumbtrail-node`](https://www.npmjs.com/package/crumbtrail-node)                 | Backend capture: Express, `node:http` and database         |
 | [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native) | React Native and Expo bindings                             |
 
 The React error boundary and state-capture hook, and the Tauri desktop

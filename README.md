@@ -101,39 +101,12 @@ dashboard under Settings, Projects and keys, Agent access:
 }
 ```
 
-To run the server locally instead, pass the same cloud credentials through the
-environment. Without them the server reads the sessions on your own disk, which
-is the right answer only if that is where you captured them:
-
-```json
-{
-  "mcpServers": {
-    "crumbtrail": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "--package",
-        "crumbtrail-node",
-        "crumbtrail-server",
-        "--mcp"
-      ],
-      "env": {
-        "CRUMBTRAIL_CLOUD_URL": "https://your-crumbtrail-host",
-        "CRUMBTRAIL_CLOUD_TOKEN": "<the ctagt_ token>"
-      }
-    }
-  }
-}
-```
-
 Use progressive disclosure to keep context focused: start with
 `getLatestIssue` for the newest failure, or `listSessions` to select a
 recording. For a chosen session, use `getFixContext` for a ranked summary or
 follow `getSessionManifest` to `getEvidence` and then `getWindow` only when
 the evidence needs more detail. Use `getRegressionContext` only when comparing
-two recordings across releases, and only against a local output directory: it
-reads this machine's disk, so a server configured against a cloud tenant does
-not offer it. When you know roughly when a failure happened
+two recordings across releases. When you know roughly when a failure happened
 but not what went wrong, `getWindowCorrelation` reports which event kinds and
 numeric fields differ between that window and the quiet stretch before it, with
 no detector involved; treat each row as a lead to confirm with `getWindow`, not

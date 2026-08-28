@@ -2,7 +2,7 @@
 
 Claude Code plugin that connects the Crumbtrail MCP server: complete recorded browser sessions — clicks, requests, backend spans, and the exact database rows that changed — served to Claude as one ranked fix bundle, plus a cross-release regression witness for escaped regressions that fired no error.
 
-Requires `crumbtrail-node` (installed on demand via `npx`) and recorded sessions under `~/.crumbtrail/sessions`. See https://github.com/CrumbtrailDev/crumbtrail-cli for SDK setup.
+Crumbtrail's MCP server is hosted. Set `CRUMBTRAIL_CLOUD_URL` to your Crumbtrail host and `CRUMBTRAIL_AGENT_TOKEN` to an agent token (`ctagt_...`) minted in Settings, and this plugin connects to it. `npx crumbtrail` mints the token and writes the same configuration for you. See https://github.com/CrumbtrailDev/crumbtrail-cli for SDK setup.
 
 Ask Claude: "list my Crumbtrail sessions", "get the fix context for session <id>", or "compare session A and B for a regression".
 

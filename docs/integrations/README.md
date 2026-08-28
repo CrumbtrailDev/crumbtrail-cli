@@ -11,5 +11,11 @@ Sessionless spans and logs are accepted. Crumbtrail auto-creates time-window ses
 | Datadog | [datadog.md](./datadog.md) |
 | Sentry via OpenTelemetry | [sentry.md](./sentry.md) |
 | Grafana Alloy | [grafana-alloy.md](./grafana-alloy.md) |
+| Honeycomb | [honeycomb.md](./honeycomb.md) |
+| OpenTelemetry Collector | [otel-collector.md](./otel-collector.md) |
 | Splunk Observability Cloud | [splunk.md](./splunk.md) |
 | Database row diffing (Postgres, MySQL, MSSQL, SQLite) | [databases.md](./databases.md) |
+
+These recipes were generated from provider recipes that shipped in
+`crumbtrail-node`. That package is backend capture only now, so they are
+maintained by hand — edit the file you mean to change.
