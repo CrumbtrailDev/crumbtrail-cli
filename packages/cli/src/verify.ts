@@ -1,5 +1,7 @@
 // Verification (plans/cli-setup-wizard-design.md §4):
-//   Real-event poll — poll GET /api/sessions for a NON-synthetic session, using
+//   Real-event poll — poll GET /api/sessions for a NON-synthetic session that
+//   either did not exist when the wait opened or has captured something since,
+//   using
 //   poll.ts's ported backoff. Cancellable via AbortSignal (Ctrl-C). The installer
 //   is hands-off (it mints no key), so the earlier synthetic-ingest check is gone:
 //   there is no key to push a marker session with. An event only arrives once the
@@ -27,6 +29,34 @@ export interface SessionRow {
   serviceId?: string | null;
   /** ISO timestamp the cloud reports for when the session started. */
   startedAt?: string | null;
+  /** Cloud flag: true once this session has captured at least one event. */
+  hasEvents?: boolean;
+  /** Events the session index counted, when the index was readable. */
+  eventCount?: number;
+}
+
+/**
+ * How much a session had captured at one point in time.
+ *
+ * The backend SDK keeps ONE long lived auto session per process, so an app that
+ * is already running when the wait opens produces no new session id however
+ * much traffic it takes. Its existing session's counters are the only thing
+ * that moves, which is why the poll snapshots them and not just the ids.
+ */
+export interface SessionActivity {
+  hasEvents: boolean;
+  eventCount: number;
+}
+
+/** The comparable activity of one row. A missing/unreadable index reads as 0. */
+export function sessionActivity(s: SessionRow): SessionActivity {
+  return {
+    hasEvents: s.hasEvents === true,
+    eventCount:
+      typeof s.eventCount === "number" && Number.isFinite(s.eventCount)
+        ? s.eventCount
+        : 0,
+  };
 }
 
 /**
@@ -54,6 +84,12 @@ export interface RealSessionGuard {
    * baseline was captured, so the timestamp fallback is used instead.
    */
   baselineIds?: ReadonlySet<string>;
+  /**
+   * What each already-existing session had captured when the window opened,
+   * keyed by session id. A row whose event count rose above this, or whose
+   * `hasEvents` flipped on, is an arrival even though its id is not new.
+   */
+  baselineActivity?: ReadonlyMap<string, SessionActivity>;
   /**
    * Lower-bound tolerance (ms) for the timestamp fallback. Defaults to 0 so
    * pure callers keep the exact `startedAt >= wizardStart` cliff; the poll loop
@@ -86,18 +122,51 @@ export function isRealNewSession(
 }
 
 /**
+ * Did an already-existing session capture something new since the baseline?
+ *
+ * This is the half of "an event arrived" that identity alone cannot see. False
+ * without a baseline (nothing to compare against) and false for a session that
+ * did not exist yet, which {@link isRealNewSession} already covers.
+ */
+export function hasNewEvents(s: SessionRow, guard?: RealSessionGuard): boolean {
+  const before = guard?.baselineActivity?.get(s.id);
+  if (!before) return false;
+  const now = sessionActivity(s);
+  if (now.eventCount > before.eventCount) return true;
+  return now.hasEvents && !before.hasEvents;
+}
+
+/**
+ * Did this row carry an event into the window — either as a session that did
+ * not exist before, or as one that did and has captured more since?
+ *
+ * Waiting only for a new session id told a customer whose app was already
+ * running that setup had failed, while their events were landing on the session
+ * that process opened at boot.
+ */
+export function isArrival(
+  s: SessionRow,
+  wizardStart?: number,
+  guard?: RealSessionGuard,
+): boolean {
+  if (s.id.startsWith(CLI_CHECK_PREFIX)) return false;
+  return isRealNewSession(s, wizardStart, guard) || hasNewEvents(s, guard);
+}
+
+/**
  * The first genuinely-new NON-synthetic session, if any — powers the deep link.
- * "New" is decided by {@link isRealNewSession}: the identity baseline when the
- * caller captured one (skew-proof), else a bounded-tolerance `startedAt` vs
- * `wizardStart` check. With neither baseline nor `wizardStart` the filter is
- * skipped (legacy callers / unit fixtures without timestamps).
+ * "Arrived" is decided by {@link isArrival}: a session id absent from the
+ * baseline, or a baseline session whose captured events rose. Without a
+ * baseline it falls back to a bounded-tolerance `startedAt` vs `wizardStart`
+ * check, and with neither the filter is skipped (legacy callers / unit fixtures
+ * without timestamps).
  */
 export function firstRealSession(
   sessions: SessionRow[],
   wizardStart?: number,
   guard?: RealSessionGuard,
 ): SessionRow | undefined {
-  return sessions.find((s) => isRealNewSession(s, wizardStart, guard));
+  return sessions.find((s) => isArrival(s, wizardStart, guard));
 }
 
 /** True once a genuinely-new non-synthetic session exists in the page. */
@@ -111,10 +180,171 @@ export function hasRealSession(
 
 export type RealEventOutcome = "found" | "timedout" | "cancelled";
 
+/**
+ * What the wait actually observed when it ended empty.
+ *
+ * A wait that learned nothing and a wait that watched a quiet project are
+ * different facts, and the note the wizard prints has to be able to tell them
+ * apart instead of asserting a cause it never checked.
+ */
+export type PollTimeoutReason =
+  /** Every read of the sessions feed failed, so nothing was observed at all. */
+  | "reads-failed"
+  /** The project has no sessions, so nothing has ever reported in. */
+  | "no-sessions"
+  /** Sessions exist; none was created and none captured anything new. */
+  | "no-new-activity";
+
 export interface PollRealEventResult {
   outcome: RealEventOutcome;
   /** Set when outcome is "found" — the session behind the first real event. */
   sessionId?: string;
+  /** Set only when outcome is "timedout" — what the wait actually saw. */
+  reason?: PollTimeoutReason;
+  /** Sessions the project already had when the wait opened, when it was read. */
+  baselineSessionCount?: number;
+}
+
+/**
+ * One application's ingest counters, as `/api/stats` reports them.
+ *
+ * The sessions feed cannot answer "are events arriving" for a session that is
+ * still open: its index.json does not exist until the session is processed, so
+ * every live row comes back with no event count at all. `/api/stats` keeps the
+ * counters the ingest path stamps as events land, which is the only read that
+ * moves while an already-running app keeps reporting into the session it opened
+ * at boot.
+ */
+export interface IngestActivity {
+  /** Ms epoch of the service's last accepted event, when it has had one. */
+  lastEventMs?: number;
+  /** Sessions of this service that carried at least one event. */
+  sessionsWithEvents: number;
+  sessionsTotal: number;
+}
+
+/** Shape of the slice of `/api/stats` this module reads. */
+interface StatsResponse {
+  ingest?: {
+    services?: Array<{
+      id?: string | null;
+      name?: string | null;
+      lastEventAt?: string | null;
+      sessionsWithEvents?: number;
+      sessionsTotal?: number;
+    }>;
+  };
+}
+
+/**
+ * Key one stats row. A session sent on a PROJECT scoped key carries no service
+ * id, and the cloud reports that row with `id: null`, so falling back to the
+ * name (then to a constant) keeps those rows comparable across polls instead of
+ * colliding with every other unattributed row.
+ */
+function activityKey(row: {
+  id?: string | null;
+  name?: string | null;
+}): string {
+  return row.id ?? row.name ?? "unattributed";
+}
+
+export async function fetchIngestActivity(
+  base: string,
+  token: string,
+  projectId: string,
+  fetchImpl?: typeof fetch,
+): Promise<Map<string, IngestActivity>> {
+  const res = await requestJson<StatsResponse>(
+    `${base}/api/stats?projectId=${encodeURIComponent(projectId)}`,
+    { token, fetchImpl },
+  );
+  const out = new Map<string, IngestActivity>();
+  for (const row of res.ingest?.services ?? []) {
+    const parsed = row.lastEventAt ? Date.parse(row.lastEventAt) : NaN;
+    out.set(activityKey(row), {
+      ...(Number.isFinite(parsed) ? { lastEventMs: parsed } : {}),
+      sessionsWithEvents: row.sessionsWithEvents ?? 0,
+      sessionsTotal: row.sessionsTotal ?? 0,
+    });
+  }
+  return out;
+}
+
+/**
+ * Which application (if any) reported something new since the baseline.
+ *
+ * Returns the key from {@link activityKey}, so the caller can attribute the
+ * arrival to a service. Undefined without a baseline: a poll that never read
+ * the counters before the user acted cannot tell a rise from a starting value.
+ */
+export function risenIngestActivityKeys(
+  before: ReadonlyMap<string, IngestActivity> | undefined,
+  now: ReadonlyMap<string, IngestActivity>,
+): string[] {
+  if (!before) return [];
+  const risen: string[] = [];
+  for (const [key, after] of now) {
+    const prior = before.get(key);
+    if (!prior) {
+      // An application the project did not have before. It counts only once it
+      // has actually captured something.
+      if (after.sessionsWithEvents > 0 || after.lastEventMs !== undefined) {
+        risen.push(key);
+      }
+      continue;
+    }
+    if (
+      (after.lastEventMs !== undefined &&
+        after.lastEventMs > (prior.lastEventMs ?? 0)) ||
+      after.sessionsWithEvents > prior.sessionsWithEvents ||
+      after.sessionsTotal > prior.sessionsTotal
+    ) {
+      risen.push(key);
+    }
+  }
+  return risen;
+}
+
+/** The first application to report something new, if any. */
+export function risenIngestActivity(
+  before: ReadonlyMap<string, IngestActivity> | undefined,
+  now: ReadonlyMap<string, IngestActivity>,
+): string | undefined {
+  return risenIngestActivityKeys(before, now)[0];
+}
+
+/** The pre-wait snapshot both polls anchor "what is new" against. */
+interface Baseline {
+  ids: Set<string>;
+  activity: Map<string, SessionActivity>;
+  /** Per-application ingest counters, absent when `/api/stats` could not be read. */
+  ingest?: Map<string, IngestActivity>;
+}
+
+function snapshotBaseline(
+  sessions: SessionRow[],
+  ingest?: Map<string, IngestActivity>,
+): Baseline {
+  return {
+    ids: new Set(sessions.map((s) => s.id)),
+    activity: new Map(sessions.map((s) => [s.id, sessionActivity(s)])),
+    ...(ingest ? { ingest } : {}),
+  };
+}
+
+/** Best session to deep link to for an arrival the counters reported. */
+function sessionForActivityKey(
+  sessions: SessionRow[],
+  key: string,
+): string | undefined {
+  const attributed = sessions.find(
+    (s) => s.serviceId === key && !s.id.startsWith(CLI_CHECK_PREFIX),
+  );
+  const any = sessions.find((s) => !s.id.startsWith(CLI_CHECK_PREFIX));
+  // The feed is newest first, so the first match is the session the arrival
+  // most likely landed in.
+  return (attributed ?? any)?.id;
 }
 
 export interface PollRealEventOptions {
@@ -188,36 +418,51 @@ export async function pollForRealEvent(
     "Waiting for the first real event… (Ctrl-C to skip)",
   );
 
-  // Anchor "what's new" in the cloud's own id namespace BEFORE the user acts:
-  // snapshot the sessions that already exist. Any session absent from this
-  // baseline is genuinely new — a skew-proof signal that beats comparing the
-  // cloud's `startedAt` against our local wall clock (the two clocks drift
-  // independently). If the snapshot read fails we degrade to the bounded-skew
+  // Anchor "what's new" BEFORE the user acts: snapshot both the session ids
+  // that already exist and what each of them has captured so far. Any session
+  // absent from this baseline is genuinely new — a skew-proof signal that beats
+  // comparing the cloud's `startedAt` against our local wall clock (the two
+  // clocks drift independently) — and any baseline session whose counters rise
+  // is the same arrival from an app that was already running when we started
+  // waiting. If the snapshot read fails we degrade to the bounded-skew
   // timestamp check. Skip the snapshot entirely if we were already cancelled,
   // so an aborted poll does zero network work.
   if (opts.signal?.aborted) {
     spinner.stop();
     return { outcome: "cancelled" };
   }
-  let baselineIds: Set<string> | undefined;
+  let baseline: Baseline | undefined;
   try {
-    const existing = await fetchSessions(
-      opts.base,
-      opts.token,
-      opts.projectId,
-      opts.fetchImpl,
-    );
-    baselineIds = new Set(existing.map((s) => s.id));
+    // Both reads, taken together: the session ids that already exist, and the
+    // ingest counters for the applications that already report. A stats read
+    // that fails leaves the counters out and the poll falls back to identity
+    // alone, rather than losing the whole baseline.
+    const [sessions, ingest] = await Promise.all([
+      fetchSessions(opts.base, opts.token, opts.projectId, opts.fetchImpl),
+      fetchIngestActivity(
+        opts.base,
+        opts.token,
+        opts.projectId,
+        opts.fetchImpl,
+      ).catch(() => undefined),
+    ]);
+    baseline = snapshotBaseline(sessions, ingest);
   } catch {
-    baselineIds = undefined;
+    baseline = undefined;
   }
   const guard: RealSessionGuard = {
-    baselineIds,
+    baselineIds: baseline?.ids,
+    baselineActivity: baseline?.activity,
     skewToleranceMs: POLL_SKEW_TOLERANCE_MS,
   };
 
   let state = initialIngestPollState();
   let sessionId: string | undefined;
+  // What the wait is allowed to claim afterwards. Only reads that succeeded
+  // count as observation: a poll that never got an answer knows nothing about
+  // whether events arrived, and must not report that as "no events".
+  let readsSucceeded = baseline !== undefined;
+  let lastSeenSessionCount = baseline?.ids.size;
   while (state.status === "waiting") {
     const delay = nextPollDelayMs(state, config);
     // Elapsed comes from the (pure) state machine, so the ticker is exact for
@@ -238,9 +483,30 @@ export async function pollForRealEvent(
         opts.projectId,
         opts.fetchImpl,
       );
+      readsSucceeded = true;
+      lastSeenSessionCount = sessions.length;
       const real = firstRealSession(sessions, opts.wizardStart, guard);
       found = real !== undefined;
       if (real) sessionId = real.id;
+      if (!found && baseline?.ingest) {
+        // Nothing new in the feed. That is the case an app which was already
+        // running produces: it keeps reporting into the session it opened at
+        // boot, so no id is new and no row's counters are published while the
+        // session is still open. The ingest counters are.
+        const risen = risenIngestActivity(
+          baseline.ingest,
+          await fetchIngestActivity(
+            opts.base,
+            opts.token,
+            opts.projectId,
+            opts.fetchImpl,
+          ),
+        );
+        if (risen) {
+          found = true;
+          sessionId = sessionForActivityKey(sessions, risen);
+        }
+      }
     } catch {
       // A transient read failure just means "not yet" — keep polling.
       found = false;
@@ -248,9 +514,17 @@ export async function pollForRealEvent(
     state = recordPollAttempt(state, found, delay, config);
   }
   spinner.stop();
-  return state.status === "found"
-    ? { outcome: "found", sessionId }
-    : { outcome: "timedout" };
+  if (state.status === "found") return { outcome: "found", sessionId };
+  const reason: PollTimeoutReason = !readsSucceeded
+    ? "reads-failed"
+    : (lastSeenSessionCount ?? 0) === 0
+      ? "no-sessions"
+      : "no-new-activity";
+  return {
+    outcome: "timedout",
+    reason,
+    ...(baseline ? { baselineSessionCount: baseline.ids.size } : {}),
+  };
 }
 
 // ── Batch verification (multi-service installer) ─────────────────────────────
@@ -263,8 +537,8 @@ export async function pollForRealEvent(
 
 /**
  * Map each service to the first real session it produced. Pure — shares the
- * exact "genuinely new session" test with {@link firstRealSession} (synthetic
- * prefix, identity baseline / bounded-skew `startedAt`), plus a skip for rows
+ * exact arrival test with {@link firstRealSession} (synthetic prefix, identity
+ * baseline, rising event counts / bounded-skew `startedAt`), plus a skip for rows
  * the cloud didn't attribute to a service. Pass a {@link RealSessionGuard} to
  * opt into the skew-proof identity baseline; without one the behavior is the
  * legacy timestamp check.
@@ -280,7 +554,7 @@ export function realSessionsByService(
   // i.e. the event the user just caused, not whatever happened most recently.
   for (const s of [...sessions].reverse()) {
     if (!s.serviceId || found.has(s.serviceId)) continue;
-    if (!isRealNewSession(s, wizardStart, guard)) continue;
+    if (!isArrival(s, wizardStart, guard)) continue;
     found.set(s.serviceId, s.id);
   }
   return found;
@@ -329,27 +603,32 @@ export async function pollForServices(
   );
 
   // The same skew-proof anchor the single-service poll takes: snapshot the ids
-  // that already exist BEFORE the user starts anything, so "new" is decided in
-  // the cloud's own id namespace rather than by comparing its `startedAt`
+  // and per-session counters that already exist BEFORE the user starts
+  // anything, so "new" is decided in the cloud's own id namespace and against
+  // its own counters rather than by comparing its `startedAt`
   // against our local wall clock. Without it this poll fell back to a strict
   // `startedAt >= wizardStart` with zero tolerance and rejected genuine first
   // events, leaving every service reported as "No event yet" while the
   // dashboard showed the sessions. A failed snapshot degrades to the bounded
   // skew check rather than to that cliff.
-  let baselineIds: Set<string> | undefined;
+  let batchBaseline: Baseline | undefined;
   try {
-    const existing = await fetchSessions(
-      opts.base,
-      opts.token,
-      opts.projectId,
-      opts.fetchImpl,
-    );
-    baselineIds = new Set(existing.map((s) => s.id));
+    const [sessions, ingest] = await Promise.all([
+      fetchSessions(opts.base, opts.token, opts.projectId, opts.fetchImpl),
+      fetchIngestActivity(
+        opts.base,
+        opts.token,
+        opts.projectId,
+        opts.fetchImpl,
+      ).catch(() => undefined),
+    ]);
+    batchBaseline = snapshotBaseline(sessions, ingest);
   } catch {
-    baselineIds = undefined;
+    batchBaseline = undefined;
   }
   const guard: RealSessionGuard = {
-    baselineIds,
+    baselineIds: batchBaseline?.ids,
+    baselineActivity: batchBaseline?.activity,
     skewToleranceMs: POLL_SKEW_TOLERANCE_MS,
   };
 
@@ -372,11 +651,25 @@ export async function pollForServices(
         opts.projectId,
         opts.fetchImpl,
       );
-      for (const [serviceId, sessionId] of realSessionsByService(
-        sessions,
-        opts.wizardStart,
-        guard,
-      )) {
+      const arrivals = realSessionsByService(sessions, opts.wizardStart, guard);
+      if (batchBaseline?.ingest) {
+        // The services whose ingest counters moved but whose session was
+        // already open, so nothing in the feed changed for them.
+        for (const key of risenIngestActivityKeys(
+          batchBaseline.ingest,
+          await fetchIngestActivity(
+            opts.base,
+            opts.token,
+            opts.projectId,
+            opts.fetchImpl,
+          ),
+        )) {
+          if (arrivals.has(key)) continue;
+          const sessionId = sessionForActivityKey(sessions, key);
+          if (sessionId) arrivals.set(key, sessionId);
+        }
+      }
+      for (const [serviceId, sessionId] of arrivals) {
         if (!wanted.has(serviceId) || found.has(serviceId)) continue;
         found.set(serviceId, sessionId);
         // Clear the live line before printing, or the next repaint lands on

@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   compareSdkVersions,
+  envLoadCaveat,
   installSdk as realInstallSdk,
   isCliEntrypoint,
   normalizeRepoUrl,
@@ -317,7 +318,10 @@ describe("the final verdict says whether anything was captured", () => {
 
   it("claims nothing about capture when the wait was skipped", async () => {
     const { ui, lines } = captureUi();
-    await runCli(["node", "cli", "--skip-verify"], makeDeps({ steps: [] }, { ui }));
+    await runCli(
+      ["node", "cli", "--skip-verify"],
+      makeDeps({ steps: [] }, { ui }),
+    );
     const out = lines.join("\n");
     expect(out).toContain("Wiring complete. First event not verified.");
     expect(out).not.toContain("Setup complete");
@@ -327,6 +331,75 @@ describe("the final verdict says whether anything was captured", () => {
     const { ui, lines } = captureUi();
     await runCli(["node", "cli"], makeDeps({ steps: [] }, { ui }));
     expect(lines.join("\n")).toMatch(/Application:\s+web/);
+  });
+});
+
+// ── What an empty wait is allowed to claim ───────────────────────────────────
+//
+// The wait used to end by asserting a cause it never checked ("your key was
+// already set, so your events are going elsewhere"), including on a wait whose
+// every read of the sessions feed had failed. A failed read is not an absence.
+
+describe("the empty wait reports what it observed", () => {
+  const timingOutWith = (
+    ui: Ui,
+    poll: Record<string, unknown>,
+    over: Partial<WizardDeps> = {},
+  ) =>
+    makeDeps(
+      { steps: [] },
+      {
+        ui,
+        pollForRealEvent: vi.fn(
+          async () => poll,
+        ) as unknown as WizardDeps["pollForRealEvent"],
+        ...over,
+      },
+    );
+
+  it("does not render an unreadable sessions feed as an absence", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(
+      ["node", "cli"],
+      timingOutWith(ui, { outcome: "timedout", reason: "reads-failed" }),
+    );
+    const out = lines.join("\n");
+    expect(out).toContain("could not read the sessions feed");
+    expect(out).not.toContain("No event captured yet");
+    expect(out).toContain("Wiring complete. First event not verified.");
+  });
+
+  it("says no session started rather than blaming the key that was already set", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(
+      ["node", "cli"],
+      timingOutWith(
+        ui,
+        { outcome: "timedout", reason: "no-new-activity" },
+        {
+          // A key already on disk is the case whose note used to assert that
+          // events were going to another project.
+          envFileIO: fakeEnvIO({
+            "/app/.env": "VITE_CRUMBTRAIL_KEY=ctkey_existing\n",
+          }),
+        },
+      ),
+    );
+    const out = lines.join("\n");
+    expect(out).toContain("No new session started");
+    // The key is still worth checking, but as a check, not as the diagnosis.
+    expect(out).not.toContain(
+      "was already set, and Crumbtrail left it alone. If that key",
+    );
+  });
+
+  it("says the project has nothing in it when that is what it saw", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(
+      ["node", "cli"],
+      timingOutWith(ui, { outcome: "timedout", reason: "no-sessions" }),
+    );
+    expect(lines.join("\n")).toContain("no sessions at all");
   });
 });
 
@@ -1255,7 +1328,11 @@ describe("batch installer: an empty selection has two opposite meanings", () => 
   it("says the repository is already wired rather than that nothing was picked", async () => {
     const steps: string[] = [];
     const deps = batchDeps(steps, [
-      candidate({ relDir: "apps/web", flags: ["already-wired"], defaultChecked: false }),
+      candidate({
+        relDir: "apps/web",
+        flags: ["already-wired"],
+        defaultChecked: false,
+      }),
       candidate({
         relDir: "services/api",
         recipe: "express",
@@ -1664,7 +1741,9 @@ describe("batch installer (monorepo root)", () => {
     ).toBe(0);
     expect(steps).toContain("provision:api");
     expect(steps).not.toContain("provision:shared");
-    expect(lines.join("\n")).toContain("packages/shared: nothing runs this package");
+    expect(lines.join("\n")).toContain(
+      "packages/shared: nothing runs this package",
+    );
 
     // Named explicitly, it is still the user's call.
     const onlySteps: string[] = [];
@@ -2578,5 +2657,102 @@ describe("endpoint confirmation", () => {
     );
     await runCli(["node", "cli", "--yes"], endpointDeps({ prompter }));
     expect(asked).toBe(0);
+  });
+});
+
+// ── Amending an integration the customer already has ─────────────────────────
+//
+// The fresh injection path prepends a guarded `.env` load above the init it
+// writes. The amend path edits the customer's own init and adds no loader, so
+// telling that user "restart it, it reads the key at startup" is a claim the
+// shipped code does not support.
+
+describe("envLoadCaveat", () => {
+  it("states the condition when the amended file loads no env file", () => {
+    const caveat = envLoadCaveat({
+      keyEnvVar: "CRUMBTRAIL_KEY",
+      content: "autoCapture({ authToken: process.env.CRUMBTRAIL_KEY });\n",
+    });
+    expect(caveat).toContain("loads no env file itself");
+    expect(caveat).toContain("--env-file");
+  });
+
+  it("says nothing when the file already loads one", () => {
+    expect(
+      envLoadCaveat({
+        keyEnvVar: "CRUMBTRAIL_KEY",
+        content:
+          'require("dotenv").config();\nautoCapture({ authToken: process.env.CRUMBTRAIL_KEY });\n',
+      }),
+    ).toBeUndefined();
+  });
+
+  it("says nothing for a bundler-inlined key, which no runtime read depends on", () => {
+    expect(
+      envLoadCaveat({
+        keyEnvVar: "VITE_CRUMBTRAIL_KEY",
+        content:
+          "Crumbtrail.init({ httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY });",
+      }),
+    ).toBeUndefined();
+  });
+});
+
+describe("the amend path does not promise the app reads the env file", () => {
+  it("prints the condition beside the amend it just made", async () => {
+    const { ui, lines } = captureUi();
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        buildPlan: vi.fn(() => ({
+          recipe: "express",
+          kind: "amend-init" as const,
+          targetPath: "/app/server/src/crumbtrail.js",
+          content:
+            "autoCapture({ endpoint: 'http://x', authToken: process.env.CRUMBTRAIL_KEY });\n",
+          amendedFields: ["authToken"],
+          keyEnvVar: "CRUMBTRAIL_KEY",
+          warnings: [],
+        })) as unknown as WizardDeps["buildPlan"],
+        executePlan: vi.fn(() => ({
+          kind: "update" as const,
+          written: ["/app/server/src/crumbtrail.js"],
+          skipped: false,
+          message: "Wrote 1 file(s).",
+        })) as unknown as WizardDeps["executePlan"],
+      },
+    );
+    await runCli(["node", "cli"], deps);
+    const out = lines.join("\n");
+    expect(out).toContain("loads no env file itself");
+    // The old line asserted the app read the file this run had just written.
+    expect(out).not.toContain("it reads CRUMBTRAIL_KEY at startup");
+  });
+});
+
+describe("wizard copy", () => {
+  it("uses the right article for the detected stack", async () => {
+    const { ui, lines } = captureUi();
+    await runCli(
+      ["node", "cli"],
+      makeDeps(
+        { steps: [] },
+        {
+          ui,
+          detect: vi.fn(() =>
+            detectResult({ recipe: "express" }),
+          ) as unknown as WizardDeps["detect"],
+        },
+      ),
+    );
+    expect(lines.join("\n")).toContain("Detected an express project.");
+  });
+
+  it('never prints the unfinished "(s)" plural or a bare String(n) count', async () => {
+    const { ui, lines } = captureUi();
+    await runCli(["node", "cli"], makeDeps({ steps: [] }, { ui }));
+    const out = lines.join("\n");
+    expect(out).not.toMatch(/\(s\)|\(es\)/);
   });
 });

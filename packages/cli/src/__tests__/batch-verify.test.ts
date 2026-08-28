@@ -67,12 +67,18 @@ describe("realSessionsByService", () => {
 describe("pollForServices", () => {
   const noSleep = async () => {};
 
-  /** A fetch that returns a different sessions page on each successive call. */
+  /**
+   * A fetch that returns a different sessions page on each successive call.
+   * `/api/stats` is answered separately: the poll reads it alongside the feed,
+   * and letting it consume a staged page would reorder the fixture.
+   */
   function stagedFetch(pages: SessionRow[][]): typeof fetch {
     let call = 0;
-    return (async () => {
-      const sessions = pages[Math.min(call++, pages.length - 1)];
-      return new Response(JSON.stringify({ sessions }), {
+    return (async (url: string) => {
+      const body = String(url).includes("/api/stats")
+        ? { ingest: { services: [] } }
+        : { sessions: pages[Math.min(call++, pages.length - 1)] };
+      return new Response(JSON.stringify(body), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
