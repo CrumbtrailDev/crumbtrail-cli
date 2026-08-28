@@ -105,6 +105,61 @@ describe("instrumentPgClient read capture", () => {
     expect(JSON.stringify(events)).not.toContain(
       "tok_secret_value_should_vanish",
     );
+    expect((events[0].d as Record<string, unknown>).callsite).toBeUndefined();
+  });
+
+  it("captures one callsite per read shape when captureCallsite is enabled", async () => {
+    const client = fakePgClient(rows(1));
+    const events: BugEvent[] = [];
+    const db = instrumentPgClient(client, {
+      requestId: "req-read-callsite",
+      captureReads: true,
+      captureCallsite: true,
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
+    });
+
+    await db.query("SELECT * FROM invoice_rankings WHERE tenant_id = $1", [
+      "acme",
+    ]);
+    await db.query("SELECT * FROM invoice_rankings WHERE tenant_id = $1", [
+      "beta",
+    ]);
+
+    const reads = events.filter((event) => event.k === DB_READ_EVENT_KIND);
+    expect(reads).toHaveLength(2);
+    expect((reads[0].d as Record<string, unknown>).callsite).toMatchObject({
+      file: expect.stringContaining("db-read.test.ts"),
+      line: expect.any(Number),
+    });
+    expect((reads[1].d as Record<string, unknown>).callsite).toEqual(
+      (reads[0].d as Record<string, unknown>).callsite,
+    );
+  });
+
+  it("caps successful-read callsite captures at eight shapes per request", async () => {
+    const client = fakePgClient(rows(1));
+    const events: BugEvent[] = [];
+    const db = instrumentPgClient(client, {
+      requestId: "req-read-callsite-cap",
+      captureReads: true,
+      captureCallsite: true,
+      emit: (event) => {
+        if (notStatement(event)) events.push(event);
+      },
+    });
+
+    for (let index = 0; index < 9; index += 1) {
+      await db.query(`SELECT * FROM table_${index} WHERE id = $1`, [index]);
+    }
+
+    const reads = events.filter((event) => event.k === DB_READ_EVENT_KIND);
+    expect(reads).toHaveLength(9);
+    for (const read of reads.slice(0, 8)) {
+      expect((read.d as Record<string, unknown>).callsite).toBeDefined();
+    }
+    expect((reads[8].d as Record<string, unknown>).callsite).toBeUndefined();
   });
 
   it("emits db.read.bulk instead of flooding a session for large reads", async () => {

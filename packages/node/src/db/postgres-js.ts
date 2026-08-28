@@ -60,6 +60,7 @@ import {
   isRecord,
   nextStatementSeq,
   type InstrumentDbClientOptions,
+  type ReadCallsitesByRequest,
 } from "./instrument-shared";
 
 const ENGINE = "postgres" as const;
@@ -97,6 +98,7 @@ export type DuckTypedPostgresSql = ((...args: unknown[]) => unknown) & {
 /** Per-request ordinals, shared across every query issued through one `sql`. */
 interface RequestCounters {
   emittedReadRowsByRequest: Map<string, number>;
+  readCallsitesByRequest: ReadCallsitesByRequest;
   readStatementsByRequest: Map<string, number>;
   statementsByRequest: Map<string, number>;
 }
@@ -104,6 +106,7 @@ interface RequestCounters {
 function newCounters(): RequestCounters {
   return {
     emittedReadRowsByRequest: new Map(),
+    readCallsitesByRequest: new Map(),
     readStatementsByRequest: new Map(),
     statementsByRequest: new Map(),
   };
@@ -526,6 +529,7 @@ function recordSuccess(input: {
       rowCount: rowCount ?? rows.length,
       options,
       emittedReadRowsByRequest: counters.emittedReadRowsByRequest,
+      readCallsitesByRequest: counters.readCallsitesByRequest,
       readStatementsByRequest: counters.readStatementsByRequest,
       queryShape: parseLimitOffset(statement, query.args as unknown),
       statement,

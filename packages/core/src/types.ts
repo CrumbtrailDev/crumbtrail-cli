@@ -291,6 +291,15 @@ export type DbDiffOp = "insert" | "update" | "delete";
  */
 export type DbEngine = "postgres" | "mysql" | "mssql" | "sqlite";
 
+/** Runtime-derived application location attached to database evidence when a host frame exists. */
+export interface DbCallsite {
+  file: string;
+  line?: number;
+  column?: number;
+  fn?: string;
+  stack?: DbCallsite[];
+}
+
 /**
  * Type-specific payload (`d`) of a `k:'db.diff'` event: the row(s) that changed for one
  * mutating statement, correlated to the request that caused them via `requestId` (which equals
@@ -318,6 +327,8 @@ export interface DbDiffEventData {
   rowCount?: number;
   /** Correlation id; equals the active request's traceId so it lands in the same evidence window. */
   requestId: string;
+  /** Application callsite that issued the statement, when capture found an application frame. */
+  callsite?: DbCallsite;
   /** Redaction metadata for any column-level values dropped/masked before rest. */
   redaction?: unknown;
 }
@@ -348,6 +359,8 @@ export interface DbReadEventData {
   pk: Record<string, unknown> | null;
   row: Record<string, unknown>;
   requestId: string;
+  /** Application callsite that issued the SELECT, when callsite capture is enabled. */
+  callsite?: DbCallsite;
   /**
    * 1-based ordinal of the SELECT statement within this request.
    *
@@ -417,6 +430,8 @@ export interface DbErrorEventData {
   /** Error class name only, never the message. */
   errorName: string;
   requestId: string;
+  /** Application callsite that issued the refused statement, when a host frame exists. */
+  callsite?: DbCallsite;
   t: number;
 }
 

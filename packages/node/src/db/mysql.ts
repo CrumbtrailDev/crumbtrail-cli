@@ -13,6 +13,7 @@ import {
   normalizeMaxRowsPerStatement,
   pkKey,
   type InstrumentDbClientOptions,
+  type ReadCallsitesByRequest,
 } from "./instrument-shared";
 import {
   classifyStatement,
@@ -145,6 +146,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
   const readStatementsByRequest = new Map<string, number>();
+  const readCallsitesByRequest: ReadCallsitesByRequest = new Map();
   // Every instrumented statement, not only the SELECTs whose rows were captured: this is what
   // gives a statement that returned nothing an ordinal, and so a place in the request's order.
   const statementsByRequest = new Map<string, number>();
@@ -417,6 +419,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
               rowCount: rows.length,
               options,
               emittedReadRowsByRequest,
+              readCallsitesByRequest,
               readStatementsByRequest,
               statement: sql,
             });

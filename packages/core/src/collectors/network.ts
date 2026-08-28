@@ -7,6 +7,7 @@ import type {
 } from "../types";
 import {
   attachRedactionMetadata,
+  credentialPresence,
   redactHeaders,
   redactNetworkTextBody,
   redactUrl,
@@ -679,6 +680,12 @@ function wrapFetch(
       reqData.hdrs = headersResult.value;
       reqMetadata.push(headersResult.metadata);
     }
+    // Recorded whether or not headers are captured, because presence is not a
+    // value. Without it a 401 the client ASKED for — an app checking on load
+    // whether anyone is signed in — is indistinguishable from a 401 that means
+    // authentication is broken, and the designed one is the most recurring
+    // "issue" this product reports.
+    reqData.creds = credentialPresence(fetchArgs.requestHeaders);
 
     const requestBody = extractRequestBody(input, init);
     if (requestBody.body !== undefined) {

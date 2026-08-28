@@ -19,6 +19,7 @@ import {
   nextStatementSeq,
   pkKey,
   type InstrumentDbClientOptions,
+  type ReadCallsitesByRequest,
 } from "./instrument-shared";
 
 export { parseMutation, parseRead } from "./sql";
@@ -61,6 +62,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
   const readStatementsByRequest = new Map<string, number>();
+  const readCallsitesByRequest: ReadCallsitesByRequest = new Map();
   // Every instrumented statement, not only the SELECTs whose rows were captured: this is what
   // gives a statement that returned nothing an ordinal, and so a place in the request's order.
   const statementsByRequest = new Map<string, number>();
@@ -147,6 +149,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
             rowCount,
             options,
             emittedReadRowsByRequest,
+            readCallsitesByRequest,
             readStatementsByRequest,
             queryShape: parseLimitOffset(text, params),
             statement: text,

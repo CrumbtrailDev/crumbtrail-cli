@@ -312,6 +312,15 @@ interface SessionIndex {
     code?: string;
     message?: string;
     phase?: string;
+    /**
+     * Whether the REQUEST carried credentials. Presence only, never a value.
+     *
+     * A 401 the client asked for — an app checking on load whether anyone is
+     * signed in — and a 401 that means authentication is broken are the same
+     * status on the same route. Without this they are the same record, and the
+     * designed one is the most recurring "issue" the product reports.
+     */
+    creds?: CredentialPresenceRecord;
   }>;
   /**
    * Requests that SUCCEEDED shortly before the first error-class event.
@@ -541,7 +550,10 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
   const consoleErrors: ConsoleErrorIndexEntry[] = [];
   const navs: SessionIndex["navs"] = [];
   const stats: Record<string, number> = {};
-  const netReqs = new Map<string, { m: string; url: string }>();
+  const netReqs = new Map<
+    string,
+    { m: string; url: string; creds?: CredentialPresenceRecord }
+  >();
   // Every successful response, unfiltered. Narrowed to the pre-error window
   // after the loop, because the first error is only known once it has run.
   const okReqs: NonNullable<SessionIndex["precedingReqs"]> = [];
@@ -598,6 +610,11 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
       netReqs.set(String(event.d.id), {
         m: String(event.d.m || event.d.method || ""),
         url: safeUrl(event.d.url) ?? "",
+        // Only the request carries headers, so this is the only place the
+        // presence can be read before the failing response is paired to it.
+        ...(isCredentialPresence(event.d.creds)
+          ? { creds: event.d.creds }
+          : {}),
       });
     }
 
@@ -617,6 +634,9 @@ async function analyzeSession(input: AnalyzeSessionInput): Promise<void> {
           ? { id: event.d.id }
           : {}),
         ...correlationIdFields(event),
+        // From the REQUEST, which is where the headers were. A response event
+        // never carries them, so the paired request is the only source.
+        ...(isCredentialPresence(req?.creds) ? { creds: req.creds } : {}),
         ...(applicationFailure ?? { reason: "http_status" }),
       });
     }
@@ -999,6 +1019,24 @@ function isCountableNetworkFailure(event: BugEvent): boolean {
  * `net.err` of one exchange together, so an index entry derived from any of them
  * carries the same key the backend saw.
  */
+/** Presence of credentials on a request. Never their values. */
+type CredentialPresenceRecord = {
+  authorization: boolean;
+  sessionCookie: boolean;
+};
+
+/** The SDK writes this on every captured request; older sessions have none. */
+function isCredentialPresence(
+  value: unknown,
+): value is CredentialPresenceRecord {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as CredentialPresenceRecord).authorization === "boolean" &&
+    typeof (value as CredentialPresenceRecord).sessionCookie === "boolean"
+  );
+}
+
 function correlationIdFields(event: BugEvent): { requestId?: string } {
   const requestId = safeString(event.d.requestId);
   return requestId === undefined ? {} : { requestId };

@@ -416,6 +416,7 @@ describe("delivery: the statement reaches the reader", () => {
     const db = instrumentPgClient(pgReturning([{ id: 1, tier: "gold" }]), {
       requestId: "rq-1",
       captureReads: true,
+      captureCallsite: true,
       emit: (event) => captured.push(event),
       now: () => 1250,
       sessionStartedAt: 1000,
@@ -431,5 +432,9 @@ describe("delivery: the statement reaches the reader", () => {
     expect(bundle.databaseReads[0].shape).toBe(
       "SELECT id, tier FROM accounts WHERE tier = ?",
     );
+    expect(bundle.databaseReads[0].callsite).toMatchObject({
+      file: expect.stringContaining("db-successful-statement.test.ts"),
+      line: expect.any(Number),
+    });
   });
 });

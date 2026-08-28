@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { BugEvent } from "crumbtrail-core";
 import {
   instrumentMysqlClient,
@@ -18,6 +18,10 @@ import {
   type DuckTypedPgClient,
 } from "../db";
 import { buildDbErrorEvent, captureDbErrorCode } from "../db/error-event";
+import {
+  DEFAULT_MAX_CALLSITES_PER_REQUEST,
+  resetCallsiteBudgetForTests,
+} from "../db/instrument-shared";
 import { postProcess } from "../post-process";
 import { buildFixContextFromArtifacts } from "../fix-context";
 import type { LlmBundle } from "../llm-bundle";
@@ -59,7 +63,88 @@ function tempDir(): string {
   return dir;
 }
 
+describe("the callsite budget is a bound a caller cannot multiply", () => {
+  /**
+   * The budget lives in the module, not in the wrapper, so these share process
+   * state and every case clears it first.
+   */
+  beforeEach(() => resetCallsiteBudgetForTests());
+  afterEach(() => resetCallsiteBudgetForTests());
+
+  function raisingClient(): DuckTypedPgClient {
+    return {
+      query() {
+        return Promise.reject(new DriverError("refused", "42P01"));
+      },
+    };
+  }
+
+  it("stops capturing past the per-request bound however many shapes fail", async () => {
+    const events: BugEvent[] = [];
+    const db = instrumentPgClient(raisingClient(), {
+      requestId: "req-bound",
+      emit: (e) => events.push(e),
+    });
+    for (let i = 0; i < DEFAULT_MAX_CALLSITES_PER_REQUEST + 3; i += 1) {
+      await expect(db.query(`SELECT ${i} FROM missing_${i}`)).rejects.toThrow();
+    }
+    const errors = events.filter((event) => event.k === "db.error");
+    const withCallsite = errors.filter(
+      (event) => (event.d as Record<string, unknown>).callsite !== undefined,
+    );
+    expect(errors.length).toBe(DEFAULT_MAX_CALLSITES_PER_REQUEST + 3);
+    expect(withCallsite.length).toBe(DEFAULT_MAX_CALLSITES_PER_REQUEST);
+  });
+
+  it("holds one budget across two instrumented clients on the same request", async () => {
+    const events: BugEvent[] = [];
+    const emit = (e: BugEvent) => events.push(e);
+    const first = instrumentPgClient(raisingClient(), {
+      requestId: "req-shared",
+      emit,
+    });
+    const second = instrumentPgClient(raisingClient(), {
+      requestId: "req-shared",
+      emit,
+    });
+    for (let i = 0; i < DEFAULT_MAX_CALLSITES_PER_REQUEST; i += 1) {
+      await expect(first.query(`SELECT ${i} FROM a_${i}`)).rejects.toThrow();
+    }
+    await expect(second.query("SELECT 1 FROM b_1")).rejects.toThrow();
+
+    const withCallsite = events
+      .filter((event) => event.k === "db.error")
+      .filter(
+        (event) => (event.d as Record<string, unknown>).callsite !== undefined,
+      );
+    expect(withCallsite.length).toBe(DEFAULT_MAX_CALLSITES_PER_REQUEST);
+  });
+
+  it("reports no callsite rather than the catch site when the stack names no application frame", async () => {
+    const error = new DriverError("refused", "42P01");
+    error.stack = "Error: refused\n    at internal/process/task_queues:95:5";
+    const events: BugEvent[] = [];
+    const client: DuckTypedPgClient = {
+      query() {
+        return Promise.reject(error);
+      },
+    };
+    const db = instrumentPgClient(client, {
+      requestId: "req-no-frame",
+      emit: (e) => events.push(e),
+    });
+    await expect(db.query("SELECT 1 FROM nowhere")).rejects.toThrow();
+
+    const failure = events.find((event) => event.k === "db.error");
+    expect(failure).toBeDefined();
+    expect(
+      (failure?.d as Record<string, unknown>).callsite,
+    ).toBeUndefined();
+  });
+});
+
 describe("capture: a raised statement is recorded", () => {
+  beforeEach(() => resetCallsiteBudgetForTests());
   it("records a failed mutation with engine, op, table, shape, code and requestId", async () => {
     const events: BugEvent[] = [];
     const db = instrumentPgClient(
@@ -84,6 +169,12 @@ describe("capture: a raised statement is recorded", () => {
     expect(String((errors[0].d as Record<string, unknown>).shape)).toContain(
       "ledger",
     );
+    expect(
+      (errors[0].d as Record<string, unknown>).callsite,
+    ).toMatchObject({
+      file: expect.stringContaining("db-failed-statement.test.ts"),
+      line: expect.any(Number),
+    });
   });
 
   it("records a failed READ even though read capture is off by default", async () => {
@@ -212,6 +303,23 @@ describe("leak surface: only a code, a class name and a literal-free shape trave
     expect(shape).toContain("INSERT INTO people");
   });
 
+  it("carries a captured callsite when one is available", () => {
+    const event = buildDbErrorEvent({
+      engine: "postgres",
+      op: "select",
+      table: "accounts",
+      statement: "SELECT * FROM accounts",
+      error: new DriverError("nope", "42P01"),
+      requestId: "req-callsite",
+      callsite: { file: "server/src/routes/accounts.ts", line: 24 },
+    });
+
+    expect((event.d as Record<string, unknown>).callsite).toEqual({
+      file: "server/src/routes/accounts.ts",
+      line: 24,
+    });
+  });
+
   it("normalizes literals out of the shape while keeping the structure", () => {
     const event = buildDbErrorEvent({
       engine: "postgres",
@@ -277,6 +385,7 @@ describe("delivery: the record reaches the reader", () => {
       shape: "INSERT INTO ledger (user_id, delta) VALUES (?, ?)",
       code: "23505",
       errorName: "error",
+      callsite: { file: "server/src/routes/accounts.ts", line: 24 },
       requestId: "rq-1",
       t: 1250,
     },
@@ -289,7 +398,11 @@ describe("delivery: the record reaches the reader", () => {
     expect(markdown).toContain("23505");
     expect(markdown).toContain("ledger");
     expect(bundle.databaseErrors).toHaveLength(1);
-    expect(bundle.databaseErrors?.[0]).toMatchObject({ table: "ledger", code: "23505" });
+    expect(bundle.databaseErrors?.[0]).toMatchObject({
+      table: "ledger",
+      code: "23505",
+      callsite: { file: "server/src/routes/accounts.ts", line: 24 },
+    });
   });
 
   it("renders the failed statement BEFORE the rows that did change", async () => {
