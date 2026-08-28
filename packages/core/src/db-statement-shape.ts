@@ -19,9 +19,25 @@ import { redactTokenLikeString } from "./redaction";
 const MAX_STATEMENT_SHAPE_LENGTH = 400;
 const PLACEHOLDER = "?";
 
-/** Strips SQL comments so a value hidden in a comment cannot ride along as "structure". */
+/**
+ * Strips SQL comments so a value hidden in a comment cannot ride along as "structure".
+ *
+ * Three spellings, not two. `--` and block comments are the portable pair; `#` to end of line is
+ * MySQL and MariaDB, and omitting it let a whole comment through verbatim — `SELECT x FROM t #
+ * alice@example.com` normalized to itself, address included, in a value that this file's contract
+ * says holds keywords, identifiers and placeholders and nothing else.
+ *
+ * `#` is also a Postgres operator, so the rule excludes the two-character forms `#>`, `#>>` and
+ * `#-` that appear in jsonb path expressions. A BARE `#` is genuinely ambiguous — MySQL comment or
+ * Postgres bitwise XOR — and it is resolved the way the rest of this file resolves ambiguity: by
+ * discarding. The cost of reading an XOR as a comment is a shorter shape; the cost of reading a
+ * comment as an operator is a customer's data in evidence.
+ */
 function stripComments(sql: string): string {
-  return sql.replace(/--[^\n]*/g, " ").replace(/\/\*[\s\S]*?\*\//g, " ");
+  return sql
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/#(?![>-])[^\n]*/g, " ");
 }
 
 /**
