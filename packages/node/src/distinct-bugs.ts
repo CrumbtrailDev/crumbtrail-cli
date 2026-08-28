@@ -418,33 +418,6 @@ export function buildDistinctBugSignature(
  * a bug. Consumers can use `legacy` to match rows created before route and
  * message normalization was tightened.
  */
-/**
- * Whether the route a failure fired on is part of what that failure IS.
- *
- * For an HTTP failure it is: the same status on two endpoints is two problems.
- * For a database statement it is not. A refused statement is the same refused
- * statement whichever page provoked it, and which page that was depends on
- * where the shopper happened to click — so keying identity on it splits one
- * defect into as many issues as there are entry points.
- *
- * It is worse than a split, because the route is OPTIONAL. Measured on a live
- * project: one refused SELECT produced two issues with byte identical titles and
- * the same detector, seventeen minutes apart, because one capture's
- * representative carried a route and the other carried none at all. A field
- * that may or may not be present cannot be allowed to fork identity on nothing
- * the failure did.
- *
- * `ROUTE_AGNOSTIC_DETECTORS` already names this idea for within-session
- * clustering — "failures that share one root cause regardless of which page they
- * fired on" — and the recurrence signature simply never consulted it. The db
- * plane joins it by construction rather than by a list, because a statement
- * failure is defined by its statement.
- */
-function routeIsIdentityBearing(detector: string): boolean {
-  if (ROUTE_AGNOSTIC_DETECTORS.has(detector.toLowerCase())) return false;
-  return detectorPlane(detector) !== "db";
-}
-
 export function computeDistinctBugSignatures(
   bug: Pick<DistinctBug, "title" | "representative">,
 ): { current: string; legacy: string } {
@@ -452,15 +425,8 @@ export function computeDistinctBugSignatures(
   const route = bug.representative?.route ?? "";
   const message =
     bug.representative?.message ?? bug.representative?.title ?? bug.title;
-  // The legacy spelling is deliberately untouched: it exists to match aliases
-  // written before normalization was tightened, and both spellings are
-  // registered as aliases of the same incident, so a signature that moves here
-  // still resolves through the one that did not.
-  const identityRoute = routeIsIdentityBearing(detector)
-    ? normalizeRecurrenceRoute(route)
-    : "";
   return {
-    current: `bugsig2:${hashString(`${detector}|${normalizeRecurrenceText(message)}|${identityRoute}`)}`,
+    current: `bugsig2:${hashString(`${detector}|${normalizeRecurrenceText(message)}|${normalizeRecurrenceRoute(route)}`)}`,
     legacy: `bugsig:${hashString(`${detector}|${normalizeLegacyRecurrenceText(message)}|${normalizeLegacyRecurrenceText(route)}`)}`,
   };
 }
