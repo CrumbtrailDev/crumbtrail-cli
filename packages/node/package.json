@@ -1,6 +1,6 @@
 {
   "name": "crumbtrail-node",
-  "version": "0.43.0",
+  "version": "0.44.0",
   "description": "Backend capture for Crumbtrail: crash and log capture, Express middleware, node:http request capture and database instrumentation. See https://crumbtrail.ai",
   "license": "MIT",
   "repository": {
