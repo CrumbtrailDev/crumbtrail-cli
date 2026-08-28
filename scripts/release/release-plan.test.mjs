@@ -43,8 +43,8 @@ describe("release package selection", () => {
   });
 
   it("never selects private packages even when their files change", () => {
-    const privateHarness = pkg("crumbtrail-topology-harness", { privatePackage: true });
-    expect(selectReleasePackages({ packages: [privateHarness], changedFiles: ["packages/topology-harness/src/index.ts"] })).toEqual([]);
+    const privateFixture = pkg("crumbtrail-private-fixture", { privatePackage: true });
+    expect(selectReleasePackages({ packages: [privateFixture], changedFiles: ["packages/private-fixture/src/index.ts"] })).toEqual([]);
   });
 
   it("does not treat noExternal examples in comments as bundled dependencies", () => {
