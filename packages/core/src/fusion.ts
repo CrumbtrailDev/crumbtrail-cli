@@ -1,4 +1,5 @@
 import type { EvidenceItem, EvidenceLane, IntentSignal } from "./evidence";
+import type { EvidenceJoinKey } from "./evidence-source";
 import { tokenize } from "./tokenize";
 
 /**
@@ -166,6 +167,57 @@ export interface EvidenceGap {
   kind?: "source-unavailable";
 }
 
+/**
+ * Why a source was not queried in a selective retrieval pass. `lane_not_relevant`
+ * means the source's lanes do not intersect the incident's candidate lanes,
+ * `source_unavailable` means the connector has failed often enough to be treated
+ * as down, and `missing_join_key` means nothing in the incident could key a query
+ * against it.
+ */
+export type RetrievalDeferReason =
+  | "lane_not_relevant"
+  | "source_unavailable"
+  | "missing_join_key";
+
+/**
+ * What a selective retrieval pass decided before any adapter was queried: which
+ * lanes the incident made candidates, which sources were queried, and which were
+ * deferred with a reason.
+ *
+ * Reporting only. It explains a fan out that already happened and never gates
+ * bundle emission, exactly like {@link ContextCompleteness}.
+ *
+ * `lanes` is typed as {@link EvidenceLane} rather than widened to `string`: the
+ * producing prefilter carries `EvidenceLane[]` end to end, so the narrow type is
+ * the honest one. The cloud's local copy of this shape declares `string[]`, which
+ * is a widening with no deliberate reason recorded behind it.
+ */
+export interface RetrievalQualityReport {
+  /** Always true: the report exists only when selective retrieval ran. */
+  enabled: true;
+  /** Lanes the incident made worth querying at all. */
+  candidateLanes: EvidenceLane[];
+  /** The only strategy shipped: a pure, deterministic, spend-free prefilter. */
+  strategy: "deterministic_prefilter";
+  /** Sources that were queried. */
+  selected: Array<{
+    sourceId: string;
+    lanes: EvidenceLane[];
+    /** Join keys the incident could actually supply for this source. */
+    joinKeys: EvidenceJoinKey[];
+    rationale: string;
+  }>;
+  /** Sources that were skipped, each with a typed reason and prose rationale. */
+  deferred: Array<{
+    sourceId: string;
+    lanes: EvidenceLane[];
+    reason: RetrievalDeferReason;
+    rationale: string;
+  }>;
+  /** True means the deterministic result is final and no paid planner is useful. */
+  plannerFree: boolean;
+}
+
 export interface RankedBundle {
   schemaVersion: typeof FUSION_SCHEMA_VERSION;
   symptom: Symptom;
@@ -180,6 +232,13 @@ export interface RankedBundle {
   escalation: Escalation;
   /** Where the incident was located, when a locate ran. Absent otherwise. */
   located?: Located;
+  /**
+   * What a selective retrieval pass decided, when one ran. Advisory: it explains
+   * which sources were queried and never gates the bundle. A bundle assembled by
+   * the unconditional fan out over every configured source omits the field
+   * entirely rather than reporting an empty pass.
+   */
+  retrieval?: RetrievalQualityReport;
 }
 
 export interface AssembleBundleInput {
@@ -191,6 +250,11 @@ export interface AssembleBundleInput {
    *  onto the bundle as {@link RankedBundle.located} and folded into
    *  completeness. Omit for explicit baseline/current comparison bundles. */
   located?: Located;
+  /** The selective retrieval decision, when one ran. Passed through onto the
+   *  bundle as {@link RankedBundle.retrieval} and used for nothing else — it
+   *  does not feed ranking, hypotheses, or completeness. Omit for the
+   *  unconditional fan out. */
+  retrieval?: RetrievalQualityReport;
 }
 
 /**
@@ -234,6 +298,7 @@ export function assembleBundle(input: AssembleBundleInput): RankedBundle {
     contextCompleteness,
     escalation,
     ...(located ? { located } : {}),
+    ...(input.retrieval ? { retrieval: input.retrieval } : {}),
   };
 }
 
