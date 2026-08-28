@@ -35,6 +35,37 @@ function remoteConfigLine(indent: string): string {
 }
 
 /**
+ * The three browser collectors that record the PERSON rather than the app.
+ *
+ * `DEFAULT_CONFIG` has all three on, and `PRESET_PASSIVE` turns nothing off (it
+ * sets two auto flag booleans and nothing else), so an init that names none of
+ * them ships cookie values, every keystroke and every clipboard read on the
+ * first deploy. That is the shape a customer discovers in production and rips
+ * the SDK out over, and it is not what the reader of the emitted init thinks
+ * they agreed to.
+ *
+ * So they are emitted, off, where the person who ran the installer can see
+ * them. The rest of the browser plane stays on: console, network, clicks,
+ * storage, errors and performance are the evidence a bug is actually read
+ * from, and turning those off would leave an install that captures nothing.
+ * Consent mode is deliberately left alone for the same reason: `"required"`
+ * captures nothing at all until the app calls `Crumbtrail.consent(true)`, and
+ * an install that silently records nothing is the worse failure.
+ */
+function privateCollectorLines(indent: string): string[] {
+  return [
+    `${indent}// Off by default: these record the person rather than the app. Cookies`,
+    `${indent}// carry session tokens, the clipboard carries whatever was copied from`,
+    `${indent}// another app, and keystrokes are every key a visitor types. Set one to`,
+    `${indent}// true when your privacy notice covers it. Console, network, clicks,`,
+    `${indent}// storage and errors stay on, which is what a bug is read from.`,
+    `${indent}cookies: false,`,
+    `${indent}keystrokes: false,`,
+    `${indent}clipboard: false,`,
+  ];
+}
+
+/**
  * The lines that decide whether a frontend session ever joins its backend.
  *
  * `networkCorrelationAllowedOrigins` defaults to empty, and an empty list means
@@ -96,6 +127,26 @@ function serviceLines(
   return serviceName ? [`${indent}service: ${quote(serviceName)},`] : [];
 }
 
+/**
+ * The opening of the "only with a key" guard around a backend init.
+ *
+ * `autoCapture` installs its `uncaughtException` and `unhandledRejection`
+ * hooks, patches `node:http`, and wraps whichever SQL driver the app uses
+ * BEFORE its first handshake, and it does all of that whether or not a key was
+ * ever set. So a service that has not been given one still pays the
+ * instrumentation and still changes its own crash path, in exchange for
+ * capturing nothing. Guarding on the key is what makes an unconfigured service
+ * genuinely untouched.
+ */
+function keyGuardOpen(keyExpr: string, indent: string): string[] {
+  return [
+    `${indent}// Only with a key: autoCapture hooks uncaught exceptions and patches your`,
+    `${indent}// SQL driver as soon as it runs, so an unconfigured service should not`,
+    `${indent}// reach it at all.`,
+    `${indent}if (${keyExpr}) {`,
+  ];
+}
+
 /** The same name as a trailing argument in a single-line options object. */
 function serviceArg(
   serviceName: string | null | undefined,
@@ -125,6 +176,7 @@ export function clientInitSnippet(
     `  httpEndpoint: ${JSON.stringify(endpoint)},`,
     `  httpAuthToken: ${keyExpr},`,
     remoteConfigLine("  "),
+    ...privateCollectorLines("  "),
     ...correlationOriginsLines(backendOrigins, "  ", JSON.stringify),
     ...serviceLines(serviceName, "  ", JSON.stringify),
     "});",
@@ -151,6 +203,7 @@ export function nuxtPluginSnippet(
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
     remoteConfigLine("    "),
+    ...privateCollectorLines("    "),
     ...correlationOriginsLines(backendOrigins, "    ", JSON.stringify),
     ...serviceLines(serviceName, "    ", JSON.stringify),
     "  });",
@@ -190,12 +243,14 @@ export function nodeInitSnippet(
     "// { instrumentDatabases: false } to leave drivers untouched. Key is read",
     `// from ${keyExpr} — set it in your .env (get your key from the`,
     "// Crumbtrail dashboard).",
-    'import("crumbtrail-node")',
+    ...keyGuardOpen(keyExpr, ""),
+    '  import("crumbtrail-node")',
     // The token is passed rather than left to the SDK's own default so the
     // snippet reads the framework's variable rather than whatever the SDK
     // happens to fall back to.
-    `  .then(({ autoCapture }) => autoCapture({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr}${serviceArg(serviceName, JSON.stringify)} }))`,
-    "  .catch(() => {});",
+    `    .then(({ autoCapture }) => autoCapture({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr}${serviceArg(serviceName, JSON.stringify)} }))`,
+    "    .catch(() => {});",
+    "}",
   ].join("\n");
 }
 
@@ -295,6 +350,30 @@ function normalizeEnvPackageRelPath(
 }
 
 /**
+ * The options that keep the Express middleware from capturing more than the
+ * install asked for.
+ *
+ * `createCrumbtrailExpressMiddleware` is a SEPARATE installer from
+ * `autoCapture`, with its own defaults, and the express recipe injects both
+ * into the same process. Left unnamed it records 4xx and 5xx response bodies
+ * (`captureResponseBody` defaults to `"error"`), and it patches stdout, stderr
+ * and `fs.write` a second time for log and runtime warning capture that
+ * `autoCapture` is already doing in the same process.
+ *
+ * So the bodies are off, because a 4xx body is an auth or validation payload
+ * belonging to the customer's own user, and the duplicate log patching is off,
+ * which costs nothing: the same lines still arrive through `autoCapture`. Set
+ * `captureResponseBody` to `"error"` or `"all"` to get the response text back.
+ *
+ * The error middleware installs no log capture of its own, so it is given the
+ * body setting only rather than two options that would do nothing.
+ */
+const EXPRESS_REQUEST_OPTIONS =
+  'captureResponseBody: "off", captureLogs: false, captureRuntimeWarnings: false';
+
+const EXPRESS_ERROR_OPTIONS = 'captureResponseBody: "off"';
+
+/**
  * Import line for the Express middleware pair, matched to the entry file's
  * module style (detected from how `express` itself is imported). ESM entries get
  * a static `import`; CommonJS entries get a `require` destructure.
@@ -316,7 +395,7 @@ export function expressRequestMiddlewareSnippet(
   endpoint: string,
   keyExpr: string,
 ): string {
-  return `${appVar}.use(createCrumbtrailExpressMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr} }));`;
+  return `if (${keyExpr}) ${appVar}.use(createCrumbtrailExpressMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr}, ${EXPRESS_REQUEST_OPTIONS} }));`;
 }
 
 /**
@@ -328,7 +407,7 @@ export function expressErrorMiddlewareSnippet(
   endpoint: string,
   keyExpr: string,
 ): string {
-  return `${appVar}.use(createCrumbtrailExpressErrorMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr} }));`;
+  return `if (${keyExpr}) ${appVar}.use(createCrumbtrailExpressErrorMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr}, ${EXPRESS_ERROR_OPTIONS} }));`;
 }
 
 /**
@@ -348,10 +427,10 @@ export function expressManualWiringSnippet(
     '//   import { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } from "crumbtrail-node";',
     "//",
     "//   // right after `const app = express()`, before your routes:",
-    `//   app.use(createCrumbtrailExpressMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr} }));`,
+    `//   if (${keyExpr}) app.use(createCrumbtrailExpressMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr}, ${EXPRESS_REQUEST_OPTIONS} }));`,
     "//",
     "//   // after your routes, right before `app.listen(...)`:",
-    `//   app.use(createCrumbtrailExpressErrorMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr} }));`,
+    `//   if (${keyExpr}) app.use(createCrumbtrailExpressErrorMiddleware({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr}, ${EXPRESS_ERROR_OPTIONS} }));`,
   ].join("\n");
 }
 
@@ -381,9 +460,11 @@ export function nestInitSnippet(
     "// { instrumentDatabases: false } to leave drivers untouched. Key is read",
     `// from ${keyExpr} — set it in your .env (get your key from the`,
     "// Crumbtrail dashboard).",
-    "import('crumbtrail-node')",
-    `  .then(({ autoCapture }) => autoCapture({ endpoint: ${singleQuoted(endpoint)}, authToken: ${keyExpr}${serviceArg(serviceName, singleQuoted)} }))`,
-    "  .catch(() => {});",
+    ...keyGuardOpen(keyExpr, ""),
+    "  import('crumbtrail-node')",
+    `    .then(({ autoCapture }) => autoCapture({ endpoint: ${singleQuoted(endpoint)}, authToken: ${keyExpr}${serviceArg(serviceName, singleQuoted)} }))`,
+    "    .catch(() => {});",
+    "}",
   ].join("\n");
 }
 
@@ -471,6 +552,7 @@ export function capacitorInitSnippet(
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${keyExpr},`,
     remoteConfigLine("    "),
+    ...privateCollectorLines("    "),
     ...correlationOriginsLines(backendOrigins, "    ", JSON.stringify),
     ...serviceLines(serviceName, "    ", JSON.stringify),
     "  },",
@@ -543,7 +625,11 @@ export function tauriInitSnippet(): string {
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
     'import { TauriTransport } from "crumbtrail-core/tauri";',
     "",
-    "Crumbtrail.init({ ...PRESET_PASSIVE, transportInstance: new TauriTransport() });",
+    "Crumbtrail.init({",
+    "  ...PRESET_PASSIVE,",
+    ...privateCollectorLines("  "),
+    "  transportInstance: new TauriTransport(),",
+    "});",
   ].join("\n");
 }
 
@@ -605,6 +691,7 @@ export function staticScriptTagSnippet(options: {
     `    httpEndpoint: ${JSON.stringify(endpoint)},`,
     `    httpAuthToken: ${JSON.stringify(keyLiteral)},`,
     remoteConfigLine("    "),
+    ...privateCollectorLines("    "),
     ...correlationOriginsLines(backendOrigins, "    ", JSON.stringify),
     ...serviceLines(serviceName, "    ", JSON.stringify),
     "  });",
