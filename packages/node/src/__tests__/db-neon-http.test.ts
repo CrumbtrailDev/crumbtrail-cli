@@ -85,11 +85,7 @@ describe("instrumentNeonHttpQuery", () => {
     });
     const queryOptions = { fullResults: false };
 
-    await sql.query!(
-      "select * from carts where id = $1",
-      [7],
-      queryOptions,
-    );
+    await sql.query!("select * from carts where id = $1", [7], queryOptions);
 
     expect(query).toHaveBeenCalledWith(
       "select * from carts where id = $1",
@@ -116,24 +112,37 @@ describe("instrumentNeonHttpQuery", () => {
     );
   });
 
-  it("leaves composed template fragments untouched", () => {
+  it("leaves composed template fragments untouched and marks mutating gaps", () => {
     const raw = makeNeon();
+    const events: BugEvent[] = [];
     const sql = instrumentNeonHttpQuery(raw, {
       requestId: "req_1",
-      emit: vi.fn(),
+      emit: (event) => events.push(event),
     });
-    const fragment = { queryData: { query: "where id = $1" } };
+    const fragment = { queryData: { query: "set total_cents = $1" } };
 
-    void sql(tag(["select * from carts ", ""]), fragment);
+    void sql(tag(["update carts ", ""]), fragment);
 
-    expect(raw.executed[0]).toBe("select * from carts $1");
+    expect(raw.executed[0]).toBe("update carts $1");
+    expect(events.find((event) => event.k === "capture_gap")?.d).toMatchObject({
+      reason: "unparsed_sql",
+      detail: "UPDATE",
+    });
   });
 });
 
 describe("Neon HTTP auto instrumentation", () => {
   it("wraps query functions returned by the neon factory", async () => {
     const raw = makeNeon();
-    const mod: Record<string, unknown> = { neon: () => raw };
+    class Pool {
+      async query(text: string) {
+        return {
+          rows: /update/i.test(text) ? [{ id: 7, total_cents: 500 }] : [],
+          rowCount: 1,
+        };
+      }
+    }
+    const mod: Record<string, unknown> = { neon: () => raw, Pool };
     const events: BugEvent[] = [];
 
     const report = autoInstrumentDbClients({
@@ -145,10 +154,14 @@ describe("Neon HTTP auto instrumentation", () => {
 
     expect(report.results[0]?.status).toBe("patched");
     const neon = mod.neon as () => FakeNeonQuery;
-    await neon().query("update carts set total_cents = $1 where id = $2", [
-      500,
-      7,
-    ]);
-    expect(events.some((event) => event.k === "db.diff")).toBe(true);
+    await neon().query(
+      "update carts set total_cents = $1 where id = $2",
+      [500, 7],
+    );
+    const WrappedPool = mod.Pool as new () => Pool;
+    await new WrappedPool().query(
+      "update carts set total_cents = 500 where id = 7",
+    );
+    expect(events.filter((event) => event.k === "db.diff")).toHaveLength(2);
   });
 });

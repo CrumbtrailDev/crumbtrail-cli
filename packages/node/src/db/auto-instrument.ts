@@ -61,8 +61,10 @@ export const AUTO_INSTRUMENT_DRIVERS = [
 
 export type AutoInstrumentDriver = (typeof AUTO_INSTRUMENT_DRIVERS)[number];
 
-export interface AutoInstrumentDbOptions
-  extends Omit<InstrumentDbClientOptions, "emit"> {
+export interface AutoInstrumentDbOptions extends Omit<
+  InstrumentDbClientOptions,
+  "emit"
+> {
   /** Sink for emitted `db.diff` / `db.read` events. */
   emit: (event: BugEvent) => void;
   /**
@@ -280,6 +282,20 @@ function patchDriver(
         restorations,
       ),
     );
+    for (const key of ["Client", "Pool"]) {
+      statuses.push(
+        patchFactory(
+          root,
+          key,
+          (instance) =>
+            instrumentPgClient(
+              instance as Parameters<typeof instrumentPgClient>[0],
+              options,
+            ),
+          restorations,
+        ),
+      );
+    }
   } else if (driver === "@planetscale/database") {
     for (const key of ["connect", "Client"]) {
       statuses.push(
@@ -316,13 +332,7 @@ function patchDriver(
       };
     }
   } else if (driver === "postgres") {
-    return patchPostgresJs(
-      moduleExports,
-      mod,
-      options,
-      restorations,
-      context,
-    );
+    return patchPostgresJs(moduleExports, mod, options, restorations, context);
   } else if (driver === "mssql") {
     statuses.push(
       patchFactory(
@@ -376,7 +386,11 @@ function patchPostgresJs(
     const status = patchFactory(mod, "default", wrap, restorations);
     return status === "patched" || status === "already-patched"
       ? { driver: "postgres", status }
-      : { driver: "postgres", status, detail: "default export is not writable" };
+      : {
+          driver: "postgres",
+          status,
+          detail: "default export is not writable",
+        };
   }
 
   if (typeof moduleExports !== "function") {

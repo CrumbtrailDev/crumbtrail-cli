@@ -51,14 +51,17 @@ function toCompatResult(result: DuckTypedPlanetScaleResult): CompatResult {
 }
 
 function fromCompatResult(result: unknown): DuckTypedPlanetScaleResult {
-  return (result as CompatResult)[HOST_RESULT] ?? (result as DuckTypedPlanetScaleResult);
+  return (
+    (result as CompatResult)[HOST_RESULT] ??
+    (result as DuckTypedPlanetScaleResult)
+  );
 }
 
 function isInstrumented(value: unknown): boolean {
   return Boolean(
     value &&
-      typeof value === "object" &&
-      (value as Record<symbol, unknown>)[INSTRUMENTED] === true,
+    typeof value === "object" &&
+    (value as Record<symbol, unknown>)[INSTRUMENTED] === true,
   );
 }
 
@@ -138,7 +141,9 @@ export function instrumentPlanetScaleClient<T>(
       if (prop === "connection") {
         return (...args: unknown[]) => {
           const connection = (
-            value.connection as (...values: unknown[]) => DuckTypedPlanetScaleConnection
+            value.connection as (
+              ...values: unknown[]
+            ) => DuckTypedPlanetScaleConnection
           ).apply(client, args);
           return wrapConnection(connection, options);
         };

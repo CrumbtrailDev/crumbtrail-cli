@@ -13,10 +13,7 @@
  * and starting capture afterwards works, and is the ordinary shape.
  */
 
-import {
-  emitActiveDbEvent,
-  readActiveDbRequestId,
-} from "./active-sink";
+import { emitActiveDbEvent, readActiveDbRequestId } from "./active-sink";
 import type { InstrumentDbClientOptions } from "./instrument-shared";
 import { instrumentPgClient } from "./pg";
 import { instrumentPostgresSql } from "./postgres-js";
@@ -36,8 +33,9 @@ export type InstrumentableDriver =
   | "better-sqlite3"
   | "mssql";
 
-export interface InstrumentDatabaseClientOptions
-  extends Partial<Omit<InstrumentDbClientOptions, "emit">> {
+export interface InstrumentDatabaseClientOptions extends Partial<
+  Omit<InstrumentDbClientOptions, "emit">
+> {
   /**
    * Which driver `client` came from. Detected from the client's shape when
    * absent; pass it explicitly if a wrapper or a proxy makes that ambiguous.

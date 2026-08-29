@@ -2,6 +2,7 @@ import {
   classifyStatement,
   ensureReturning,
   leadingSqlKeyword,
+  looksLikePotentialWrite,
   parseLimitOffset,
   type ParsedMutation,
   type ParsedRead,
@@ -98,7 +99,8 @@ function rewrittenTemplateArgs(
 }
 
 function resultRows(result: unknown): Array<Record<string, unknown>> {
-  const rows = isRecord(result) && Array.isArray(result.rows) ? result.rows : result;
+  const rows =
+    isRecord(result) && Array.isArray(result.rows) ? result.rows : result;
   return Array.isArray(rows) ? rows.filter(isRecord) : [];
 }
 
@@ -113,7 +115,10 @@ function resultRowCount(result: unknown): number | null {
   return Array.isArray(result) ? result.length : null;
 }
 
-function preserveQueryMetadata(source: unknown, target: Promise<unknown>): void {
+function preserveQueryMetadata(
+  source: unknown,
+  target: Promise<unknown>,
+): void {
   if (!source || (typeof source !== "object" && typeof source !== "function")) {
     return;
   }
@@ -147,7 +152,8 @@ function runCaptured(
     }
     parsed =
       classification.kind === "mutation" ? classification.mutation : undefined;
-    parsedRead = classification.kind === "read" ? classification.read : undefined;
+    parsedRead =
+      classification.kind === "read" ? classification.read : undefined;
     requestId = options.requestId ?? options.getRequestId?.();
   } catch (error) {
     emitGap(options, { reason: "capture_exception", error });
@@ -265,7 +271,25 @@ export function instrumentNeonHttpQuery<T>(
   return new Proxy(sql, {
     apply(target, thisArg, args) {
       const text = plannedTextFor(args);
-      if (!text) return Reflect.apply(target, thisArg, args);
+      if (!text) {
+        try {
+          const staticText = isTaggedTemplateCall(args)
+            ? (args[0] as readonly string[]).join(" ")
+            : "";
+          if (
+            looksLikePotentialWrite(staticText) &&
+            (options.requestId ?? options.getRequestId?.())
+          ) {
+            emitGap(options, {
+              reason: "unparsed_sql",
+              detail: leadingSqlKeyword(staticText),
+            });
+          }
+        } catch {
+          // Capture cannot decide whether Neon constructs the host query.
+        }
+        return Reflect.apply(target, thisArg, args);
+      }
       return runCaptured(
         text,
         (statement) =>
@@ -301,10 +325,9 @@ export function instrumentNeonHttpQuery<T>(
             next[0] = (tx: DuckTypedNeonHttpQuery) =>
               fn(instrumentNeonHttpQuery(tx, options));
           }
-          return (target.transaction as (...values: unknown[]) => unknown).apply(
-            target,
-            next,
-          );
+          return (
+            target.transaction as (...values: unknown[]) => unknown
+          ).apply(target, next);
         };
       }
       const value = Reflect.get(target, prop, receiver);

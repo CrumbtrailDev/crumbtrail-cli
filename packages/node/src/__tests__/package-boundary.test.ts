@@ -8,6 +8,8 @@ import {
   createCrumbtrailExpressMiddleware,
   installHttpRequestCapture,
   instrumentDatabaseClient,
+  instrumentNeonHttpQuery,
+  instrumentPlanetScaleClient,
 } from "../index";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -69,6 +71,8 @@ describe("package runtime boundary", () => {
     expect(typeof createCrumbtrailExpressErrorMiddleware).toBe("function");
     expect(typeof installHttpRequestCapture).toBe("function");
     expect(typeof instrumentDatabaseClient).toBe("function");
+    expect(typeof instrumentNeonHttpQuery).toBe("function");
+    expect(typeof instrumentPlanetScaleClient).toBe("function");
   });
 
   it("exports nothing that analyses a session", async () => {

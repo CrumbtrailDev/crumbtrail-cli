@@ -85,10 +85,7 @@ describe("instrumentPlanetScaleClient", () => {
       emit: (event) => events.push(event),
     });
 
-    await wrapped.connection().execute(
-      "delete from carts where id = ?",
-      [7],
-    );
+    await wrapped.connection().execute("delete from carts where id = ?", [7]);
 
     expect(client.connection).toHaveBeenCalledOnce();
     expect(events.find((event) => event.k === "db.diff")?.d).toMatchObject({

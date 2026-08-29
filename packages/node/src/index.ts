@@ -83,15 +83,9 @@ export {
 // Capture is fire-and-forget, so a process that exits right after its last
 // request — a job, a CLI, a serverless invocation — needs a way to wait for the
 // tail. `backendIntakeQueueStats` is for a health endpoint or a smoke test.
-export {
-  backendIntakeQueueStats,
-  flushBackendEvents,
-} from "./backend-intake";
+export { backendIntakeQueueStats, flushBackendEvents } from "./backend-intake";
 
-export {
-  HeadlessRequestError,
-  startHeadlessSession,
-} from "./headless-session";
+export { HeadlessRequestError, startHeadlessSession } from "./headless-session";
 
 export type {
   HeadlessSession,
