@@ -43,7 +43,9 @@ describe("instrumentIoredisClient", () => {
         hit: true,
       },
     });
-    expect(events[0]?.d.value).not.toBe("private profile text");
+    expect(events[0]?.d.value).toEqual(
+      expect.objectContaining({ $redacted: "[REDACTED]" }),
+    );
     expect(events[1]?.d).toMatchObject({
       key: "user:*:missing",
       hit: false,
@@ -71,7 +73,9 @@ describe("instrumentIoredisClient", () => {
         ttlMs: 60_000,
       },
     });
-    expect(events[0]?.d.value).not.toBe("customer address");
+    expect(events[0]?.d.value).toEqual(
+      expect.objectContaining({ $redacted: "[REDACTED]" }),
+    );
   });
 
   it("captures delete outcomes and never fails the host when capture throws", async () => {

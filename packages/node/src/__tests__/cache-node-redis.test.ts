@@ -45,7 +45,9 @@ describe("instrumentNodeRedisClient", () => {
         hit: true,
       },
     });
-    expect(events[0]?.d.value).not.toBe("personal profile text");
+    expect(events[0]?.d.value).toEqual(
+      expect.objectContaining({ $redacted: "[REDACTED]" }),
+    );
   });
 
   it("captures object and setEx TTL forms", async () => {
