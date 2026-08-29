@@ -43,6 +43,12 @@ export {
   type DuckTypedMongoClient,
 } from "./mongo";
 export {
+  instrumentPrismaClient,
+  type DuckTypedPrismaClient,
+  type DuckTypedPrismaExtension,
+  type DuckTypedPrismaQueryInput,
+} from "./prisma";
+export {
   instrumentPgClient,
   parseMutation,
   parseRead,

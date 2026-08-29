@@ -1350,4 +1350,60 @@ describe("autoCapture completeness ledger", () => {
     const kinds = eventsFrom(calls).map((e) => e.k);
     expect(kinds.some((k) => k.startsWith("db"))).toBe(true);
   });
+
+  it("patches cache drivers before it first yields and correlates their operations", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
+    const { fetchImpl, calls } = makeFetch();
+    const redisModule = {
+      createClient() {
+        return {
+          async get(_key: string) {
+            return "cached value";
+          },
+        };
+      },
+    } as Record<string, unknown>;
+
+    const pending = autoCapture({
+      endpoint: ENDPOINT,
+      service: "svc",
+      processImpl: proc,
+      consoleImpl: { error: vi.fn() } as unknown as Console,
+      fetchImpl,
+      onCrashExit: () => {},
+      instrumentDatabases: false,
+      cacheDrivers: ["redis"],
+      cacheResolve: (specifier: string) => {
+        if (specifier === "redis") return redisModule;
+        throw new Error(`Cannot find module '${specifier}'`);
+      },
+    });
+
+    const createClient = redisModule.createClient as () => {
+      get(key: string): Promise<string>;
+    };
+    const client = createClient();
+
+    track(await pending);
+    await runInBackendRequestContext(
+      {
+        requestId: "req_cache",
+        sessionId: "sess_1",
+        sessionIdSource: "header",
+      },
+      () => client.get("user:12345:profile"),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(eventsFrom(calls)).toContainEqual(
+      expect.objectContaining({
+        k: "cache",
+        d: expect.objectContaining({
+          requestId: "req_cache",
+          key: "user:*:profile",
+          hit: true,
+        }),
+      }),
+    );
+  });
 });

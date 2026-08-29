@@ -38,6 +38,7 @@ import { instrumentSqliteDatabase } from "./sqlite";
 import { instrumentMssqlPool } from "./mssql";
 import { instrumentPostgresSql } from "./postgres-js";
 import { enableMongoCommandMonitoring, instrumentMongoClient } from "./mongo";
+import { instrumentPrismaClient } from "./prisma";
 import type { InstrumentDbClientOptions } from "./instrument-shared";
 
 /** Marks an already-wrapped factory so a second install is a no-op. */
@@ -45,6 +46,7 @@ const PATCHED = Symbol.for("crumbtrail.db.autoInstrumented");
 
 /** Drivers this module knows how to wrap, in the order they are attempted. */
 export const AUTO_INSTRUMENT_DRIVERS = [
+  "@prisma/client",
   "pg",
   // porsager/postgres. Attempted before mysql2 for the same reason `pg` is
   // first: a Postgres app is the common case, and the two Postgres drivers are
@@ -258,6 +260,19 @@ function patchDriver(
         ),
       );
     }
+  } else if (driver === "@prisma/client") {
+    statuses.push(
+      patchFactory(
+        root,
+        "PrismaClient",
+        (instance) =>
+          instrumentPrismaClient(
+            instance as Parameters<typeof instrumentPrismaClient>[0],
+            options,
+          ),
+        restorations,
+      ),
+    );
   } else if (driver === "mysql2" || driver === "mysql2/promise") {
     for (const key of ["createConnection", "createPool"]) {
       statuses.push(
