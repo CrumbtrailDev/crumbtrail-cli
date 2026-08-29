@@ -146,6 +146,12 @@ export const DB_READ_BULK_EVENT_KIND = "db.read.bulk" as const;
  */
 export const DB_ERROR_EVENT_KIND = "db.error" as const;
 
+/** Canonical event kind for a completed database pool checkout (`k:'db.pool.wait'`). */
+export const DB_POOL_WAIT_EVENT_KIND = "db.pool.wait" as const;
+
+/** Canonical event kind for a database pool checkout timeout (`k:'db.pool.timeout'`). */
+export const DB_POOL_TIMEOUT_EVENT_KIND = "db.pool.timeout" as const;
+
 /**
  * Canonical event kind for a database statement that was ATTEMPTED and SUCCEEDED (`k:'db.statement'`).
  *
@@ -407,6 +413,17 @@ export interface DbReadBulkEventData {
 /** Operation a `db.error` event records. Wider than `DbDiffOp`: a read can raise too. */
 export type DbErrorOp = "select" | "insert" | "update" | "delete" | "other";
 
+/** Stable, driver-independent reason a database statement failed. */
+export type DbErrorCategory =
+  | "deadlock"
+  | "unique_constraint"
+  | "foreign_key_constraint"
+  | "check_constraint"
+  | "constraint_violation"
+  | "serialization_failure"
+  | "connection_loss"
+  | "unknown";
+
 /**
  * Type-specific payload (`d`) of a `k:'db.error'` event: one statement that the host issued and
  * the database refused.
@@ -427,11 +444,35 @@ export interface DbErrorEventData {
   shape: string;
   /** The database's own error code, when the driver reported one. Never a message. */
   code: string | null;
+  /** Stable classification derived only from driver codes. */
+  category: DbErrorCategory;
   /** Error class name only, never the message. */
   errorName: string;
   requestId: string;
   /** Application callsite that issued the refused statement, when a host frame exists. */
   callsite?: DbCallsite;
+  t: number;
+}
+
+/** Type-specific payload (`d`) of a completed pool checkout. */
+export interface DbPoolWaitEventData {
+  engine: DbEngine;
+  /** Milliseconds spent waiting for the driver to provide a connection. */
+  waitMs: number;
+  requestId: string;
+  t: number;
+}
+
+/** Type-specific payload (`d`) of a pool checkout that timed out. */
+export interface DbPoolTimeoutEventData {
+  engine: DbEngine;
+  /** Milliseconds elapsed before the driver rejected the checkout. */
+  waitMs: number;
+  /** Driver code only, never an error message. */
+  code: string | null;
+  /** Error class name only, never an error message. */
+  errorName: string;
+  requestId: string;
   t: number;
 }
 

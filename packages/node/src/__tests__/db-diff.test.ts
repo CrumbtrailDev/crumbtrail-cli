@@ -356,8 +356,8 @@ describe("instrumentPgClient", () => {
     ]);
     client.release();
 
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
+    const diff = events.find((event) => event.k === DB_DIFF_EVENT_KIND);
+    expect(diff).toMatchObject({
       k: DB_DIFF_EVENT_KIND,
       d: { requestId: "req-pool", table: "orders", op: "update" },
     });
@@ -407,8 +407,8 @@ describe("instrumentPgClient", () => {
       });
     });
 
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
+    const diff = events.find((event) => event.k === DB_DIFF_EVENT_KIND);
+    expect(diff).toMatchObject({
       k: DB_DIFF_EVENT_KIND,
       d: { requestId: "req-callback-pool", table: "orders", op: "update" },
     });
@@ -441,8 +441,8 @@ describe("instrumentPgClient", () => {
       11,
     ]);
 
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
+    const diff = events.find((event) => event.k === DB_DIFF_EVENT_KIND);
+    expect(diff).toMatchObject({
       k: DB_DIFF_EVENT_KIND,
       d: { requestId: "req-pool-query", table: "orders", op: "update" },
     });
@@ -491,8 +491,8 @@ describe("instrumentPgClient", () => {
     });
 
     expect(callbackClient).toBe(acquired);
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
+    const gap = events.find((event) => event.k === CAPTURE_GAP_EVENT_KIND);
+    expect(gap).toMatchObject({
       k: CAPTURE_GAP_EVENT_KIND,
       d: { reason: "uninstrumented_client" },
     });

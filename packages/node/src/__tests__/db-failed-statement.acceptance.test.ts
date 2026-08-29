@@ -22,6 +22,7 @@
 import { describe, expect, it } from "vitest";
 import { CAPTURE_GAP_EVENT_KIND, type BugEvent } from "crumbtrail-core";
 import { instrumentPgClient } from "../db";
+import { classifyDbError } from "../db/error-event";
 
 class PgError extends Error {
   code: string;
@@ -45,19 +46,30 @@ function rejectingPgClient(error: Error) {
 describe("a database statement that RAISED is recorded, not silently dropped", () => {
   it("emits a record naming the attempted statement and the error when the host INSERT rejects", async () => {
     const events: BugEvent[] = [];
-    const db = instrumentPgClient(rejectingPgClient(new PgError("duplicate key value violates unique constraint", "23505")), {
-      requestId: "req-failed-insert",
-      sessionId: "ses-acceptance",
-      emit: (event) => events.push(event),
-    });
+    const db = instrumentPgClient(
+      rejectingPgClient(
+        new PgError("duplicate key value violates unique constraint", "23505"),
+      ),
+      {
+        requestId: "req-failed-insert",
+        sessionId: "ses-acceptance",
+        emit: (event) => events.push(event),
+      },
+    );
 
     // The host error must still reach the caller, unchanged. Capture never swallows it.
     await expect(
-      db.query("INSERT INTO points_ledger (user_id, delta) VALUES ($1, $2)", [7, 100]),
+      db.query(
+        "INSERT INTO points_ledger (user_id, delta) VALUES ($1, $2)",
+        [7, 100],
+      ),
     ).rejects.toMatchObject({ code: "23505" });
 
     // SOMETHING must describe the attempt. Today: nothing is emitted at all.
-    expect(events.length, "a raised statement emitted no event whatsoever").toBeGreaterThan(0);
+    expect(
+      events.length,
+      "a raised statement emitted no event whatsoever",
+    ).toBeGreaterThan(0);
 
     const described = events.filter((event) => {
       const text = JSON.stringify(event);
@@ -68,6 +80,7 @@ describe("a database statement that RAISED is recorded, not silently dropped", (
       described.length,
       "no emitted event names both the table that was written and the error the database returned",
     ).toBeGreaterThan(0);
+    expect(described[0]?.d.category).toBe("unique_constraint");
 
     // It must not be reported as a capture gap. `capture_exception` means OUR instrumentation
     // threw — a different fact with a different owner. Reusing it here would tell the reader
@@ -83,9 +96,10 @@ describe("a database statement that RAISED is recorded, not silently dropped", (
     // (`captureErrorName` returns only an error class name) is the one to keep.
     for (const event of described) {
       const text = JSON.stringify(event);
-      expect(text, "a bind value leaked into the failed-statement record").not.toContain(
-        "duplicate key value violates unique constraint",
-      );
+      expect(
+        text,
+        "a bind value leaked into the failed-statement record",
+      ).not.toContain("duplicate key value violates unique constraint");
     }
   });
 
@@ -94,7 +108,9 @@ describe("a database statement that RAISED is recorded, not silently dropped", (
     const client = {
       query(text: string, _params?: unknown[]) {
         if (/^\s*select/i.test(text))
-          return Promise.reject(new PgError('column "reward_tier" does not exist', "42703"));
+          return Promise.reject(
+            new PgError('column "reward_tier" does not exist', "42703"),
+          );
         return Promise.resolve({ rows: [], rowCount: 0 });
       },
     };
@@ -105,7 +121,9 @@ describe("a database statement that RAISED is recorded, not silently dropped", (
       emit: (event) => events.push(event),
     });
 
-    await expect(db.query("SELECT reward_tier FROM accounts WHERE id = $1", [7])).rejects.toMatchObject({
+    await expect(
+      db.query("SELECT reward_tier FROM accounts WHERE id = $1", [7]),
+    ).rejects.toMatchObject({
       code: "42703",
     });
 
@@ -117,5 +135,48 @@ describe("a database statement that RAISED is recorded, not silently dropped", (
       described.length,
       "a SELECT that raised left no record naming the table and the error",
     ).toBeGreaterThan(0);
+  });
+});
+
+describe("database error classification uses driver codes only", () => {
+  it.each([
+    ["postgres", { code: "40P01" }, "deadlock"],
+    ["postgres", { code: "23505" }, "unique_constraint"],
+    ["postgres", { code: "23503" }, "foreign_key_constraint"],
+    ["postgres", { code: "23514" }, "check_constraint"],
+    ["postgres", { code: "40001" }, "serialization_failure"],
+    ["postgres", { code: "08006" }, "connection_loss"],
+    ["mysql", { errno: 1213, code: "ER_LOCK_DEADLOCK" }, "deadlock"],
+    ["mysql", { errno: 1062, code: "ER_DUP_ENTRY" }, "unique_constraint"],
+    ["mysql", { errno: 1452 }, "foreign_key_constraint"],
+    ["mysql", { errno: 3819 }, "check_constraint"],
+    ["mysql", { sqlState: "40001" }, "serialization_failure"],
+    ["mysql", { errno: 2013 }, "connection_loss"],
+    [
+      "sqlite",
+      { errcode: 2067, code: "ERR_SQLITE_ERROR" },
+      "unique_constraint",
+    ],
+    [
+      "sqlite",
+      { errcode: 787, code: "ERR_SQLITE_ERROR" },
+      "foreign_key_constraint",
+    ],
+    ["sqlite", { errcode: 275, code: "ERR_SQLITE_ERROR" }, "check_constraint"],
+    ["mssql", { number: 1205, code: "EREQUEST" }, "deadlock"],
+    ["mssql", { number: 2627, code: "EREQUEST" }, "unique_constraint"],
+    ["mssql", { number: 547, code: "EREQUEST" }, "constraint_violation"],
+    ["mssql", { number: 3960, code: "EREQUEST" }, "serialization_failure"],
+    ["mssql", { code: "ECONNCLOSED" }, "connection_loss"],
+  ] as const)("classifies %s %#", (engine, error, expected) => {
+    expect(classifyDbError(engine, error)).toBe(expected);
+  });
+
+  it("returns unknown instead of classifying localized message text", () => {
+    expect(
+      classifyDbError("postgres", {
+        message: "duplicate key deadlock connection lost user secret",
+      }),
+    ).toBe("unknown");
   });
 });

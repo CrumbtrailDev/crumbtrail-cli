@@ -10,6 +10,9 @@ import {
   type DbReadEventData,
 } from "crumbtrail-core";
 import { instrumentSqliteDatabase } from "../db/sqlite";
+import { autoInstrumentDbClients } from "../db/auto-instrument";
+import * as nodeSqlite from "node:sqlite";
+import { createRequire } from "node:module";
 
 const DB_READ_EVENT_KIND = "db.read";
 const DB_READ_BULK_EVENT_KIND = "db.read.bulk";
@@ -71,6 +74,100 @@ function fakeSqliteDatabase(config: FakeConfig = {}) {
 }
 
 const diffData = (event: BugEvent) => event.d as unknown as DbDiffEventData;
+
+describe("node:sqlite", () => {
+  it("auto-instruments the built-in DatabaseSync constructor through Node's resolver", () => {
+    const require = createRequire(import.meta.url);
+    const builtIn = require("node:sqlite") as typeof nodeSqlite;
+    const original = builtIn.DatabaseSync;
+    const events: BugEvent[] = [];
+    const report = autoInstrumentDbClients({
+      drivers: ["node:sqlite"],
+      requestId: "req-node-sqlite-auto",
+      hostIsEsm: () => false,
+      emit: (event) => events.push(event),
+    });
+
+    try {
+      expect(report.results).toEqual([
+        { driver: "node:sqlite", status: "patched" },
+      ]);
+      const current = require("node:sqlite") as typeof nodeSqlite;
+      const db = new current.DatabaseSync(":memory:");
+      db.exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)");
+      db.prepare("INSERT INTO items (name) VALUES (?)").run("Ada");
+      db.close();
+
+      expect(events.some((event) => event.k === DB_DIFF_EVENT_KIND)).toBe(true);
+    } finally {
+      report.restore();
+    }
+    expect((require("node:sqlite") as typeof nodeSqlite).DatabaseSync).toBe(
+      original,
+    );
+  });
+
+  it("reports the built-in ESM DatabaseSync binding as unreachable", () => {
+    const report = autoInstrumentDbClients({
+      drivers: ["node:sqlite"],
+      hostIsEsm: () => true,
+      emit: () => undefined,
+    });
+
+    expect(report.results[0]).toMatchObject({
+      driver: "node:sqlite",
+      status: "esm-unreachable",
+    });
+    expect(report.results[0]?.detail).toContain("instrumentSqliteDatabase");
+    report.restore();
+  });
+
+  it("handles node:sqlite positional, named, get, and extended error-code shapes", () => {
+    const raw = new nodeSqlite.DatabaseSync(":memory:");
+    raw.exec(
+      "PRAGMA foreign_keys = ON; " +
+        "CREATE TABLE parents (id INTEGER PRIMARY KEY); " +
+        "CREATE TABLE items (" +
+        "id INTEGER PRIMARY KEY, name TEXT UNIQUE, parent_id INTEGER REFERENCES parents(id), " +
+        "quantity INTEGER CHECK(quantity > 0))",
+    );
+    const events: BugEvent[] = [];
+    const db = instrumentSqliteDatabase(raw, {
+      requestId: "req-node-sqlite-shapes",
+      captureReads: true,
+      emit: (event) => events.push(event),
+    });
+
+    db.prepare("INSERT INTO items (name, quantity) VALUES (?, ?)").run(
+      "positional",
+      1,
+    );
+    db.prepare(
+      "INSERT INTO items (name, quantity) VALUES (:name, :quantity)",
+    ).run({ name: "named", quantity: 2 });
+    expect(
+      db.prepare("SELECT * FROM items WHERE name = ?").get("named"),
+    ).toMatchObject({ name: "named", quantity: 2 });
+
+    expect(() =>
+      db
+        .prepare("INSERT INTO items (name, quantity) VALUES (?, ?)")
+        .run("named", 3),
+    ).toThrow();
+
+    const error = events.find((event) => event.k === "db.error");
+    expect(error?.d).toMatchObject({
+      engine: "sqlite",
+      code: "2067",
+      category: "unique_constraint",
+      requestId: "req-node-sqlite-shapes",
+    });
+    expect(JSON.stringify(error)).not.toContain("UNIQUE constraint failed");
+    expect(db.prepare("SELECT * FROM items ORDER BY id").all()).toHaveLength(2);
+    expect(events.some((event) => event.k === DB_READ_EVENT_KIND)).toBe(true);
+    raw.close();
+  });
+});
 
 describe("instrumentSqliteDatabase — INSERT", () => {
   it("records an INSERT as a db.diff with an after-image looked up by lastInsertRowid (synchronously)", () => {

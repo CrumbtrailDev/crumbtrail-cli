@@ -407,7 +407,11 @@ describe("instrumentMssqlPool trigger 334 fallback", () => {
     // The injected statement ran once and the error propagated — no fallback re-run.
     expect(call).toBe(1);
     expect(pool.queries).toHaveLength(1);
-    expect(events).toHaveLength(0);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      k: "db.error",
+      d: { engine: "mssql", category: "unique_constraint" },
+    });
   });
 });
 
@@ -593,7 +597,11 @@ describe("instrumentMssqlPool compile-class re-run allowlist", () => {
     // Exactly one execution — a numbered runtime error is never re-run.
     expect(call).toBe(1);
     expect(pool.queries).toHaveLength(1);
-    expect(events).toHaveLength(0);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      k: "db.error",
+      d: { engine: "mssql", category: "constraint_violation" },
+    });
   });
 });
 

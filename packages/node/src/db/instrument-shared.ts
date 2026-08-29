@@ -20,6 +20,11 @@ import { buildDbDiffEvent } from "./diff-event";
 import { buildDbErrorEvent } from "./error-event";
 import { buildDbReadBulkEvent, buildDbReadEvent } from "./read-event";
 import {
+  buildDbPoolTimeoutEvent,
+  buildDbPoolWaitEvent,
+  isPoolCheckoutTimeout,
+} from "./pool-event";
+import {
   buildDbStatementEvent,
   DB_STATEMENT_SHAPE_LABEL,
 } from "./statement-event";
@@ -99,6 +104,73 @@ export interface InstrumentDbClientOptions {
   maxReadRowsPerRequest?: number;
   now?: () => number;
   sessionStartedAt?: number | Date;
+}
+
+export interface PoolCheckoutCapture {
+  acquired(): void;
+  failed(error: unknown): void;
+}
+
+/** Starts a redaction-safe timer around one driver pool checkout. */
+export function beginPoolCheckout(
+  engine: DbEngine,
+  options: InstrumentDbClientOptions,
+): PoolCheckoutCapture {
+  let requestId: string | undefined;
+  try {
+    requestId = options.requestId ?? options.getRequestId?.();
+  } catch {
+    requestId = undefined;
+  }
+  const safeNow = (): number => {
+    try {
+      const value = options.now?.() ?? Date.now();
+      return Number.isFinite(value) ? value : Date.now();
+    } catch {
+      return Date.now();
+    }
+  };
+  const startedAt = safeNow();
+  let settled = false;
+  const elapsed = (): { now: number; waitMs: number } => {
+    const now = safeNow();
+    return { now, waitMs: Math.max(0, now - startedAt) };
+  };
+  return {
+    acquired() {
+      if (settled) return;
+      settled = true;
+      if (!requestId) return;
+      const timing = elapsed();
+      emitDbEvent(
+        options,
+        buildDbPoolWaitEvent({
+          engine,
+          requestId,
+          ...timing,
+          sessionId: options.sessionId,
+          sessionStartedAt: options.sessionStartedAt,
+        }),
+      );
+    },
+    failed(error: unknown) {
+      if (settled) return;
+      settled = true;
+      if (!requestId || !isPoolCheckoutTimeout(engine, error)) return;
+      const timing = elapsed();
+      emitDbEvent(
+        options,
+        buildDbPoolTimeoutEvent({
+          engine,
+          requestId,
+          error,
+          ...timing,
+          sessionId: options.sessionId,
+          sessionStartedAt: options.sessionStartedAt,
+        }),
+      );
+    },
+  };
 }
 
 export interface EmitGapInput {
@@ -731,12 +803,7 @@ export function emitDbReadEvents(input: {
   const sensitive = buildSensitiveColumnSet(options.redactColumns);
   const callsite =
     emitRows.length > 0
-      ? readCallsiteFor(
-          options,
-          requestId,
-          shape,
-          input.readCallsitesByRequest,
-        )
+      ? readCallsiteFor(options, requestId, shape, input.readCallsitesByRequest)
       : undefined;
 
   for (const row of emitRows) {

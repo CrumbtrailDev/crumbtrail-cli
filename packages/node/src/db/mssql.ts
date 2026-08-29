@@ -8,8 +8,10 @@ import {
   type ParsedRead,
 } from "./sql";
 import {
+  beginPoolCheckout,
   emitGap,
   emitDbDiffEvents,
+  emitDbErrorEvent,
   emitDbReadEvents,
   emitImagelessDbDiff,
   extractPk,
@@ -43,6 +45,7 @@ export interface DuckTypedMssqlRequest {
 export interface DuckTypedMssqlPool {
   request(): DuckTypedMssqlRequest;
   query?(text: unknown, ...rest: unknown[]): Promise<DuckTypedMssqlResult>;
+  acquire?(requester: unknown, callback?: unknown): unknown;
 }
 
 const ENGINE = "mssql" as const;
@@ -706,8 +709,41 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
           };
         }
         if (prop === "query") {
-          return (text: unknown) =>
-            runInstrumentedQuery(target, recordedInputs, text);
+          return async (text: unknown) => {
+            try {
+              return await runInstrumentedQuery(target, recordedInputs, text);
+            } catch (error) {
+              if (typeof text === "string") {
+                let requestId: string | undefined;
+                try {
+                  requestId = options.requestId ?? options.getRequestId?.();
+                } catch {
+                  requestId = undefined;
+                }
+                if (requestId) {
+                  const classification = classifyStatement(text);
+                  const mutation =
+                    classification.kind === "mutation"
+                      ? classification.mutation
+                      : undefined;
+                  const read =
+                    classification.kind === "read"
+                      ? classification.read
+                      : undefined;
+                  emitDbErrorEvent({
+                    engine: ENGINE,
+                    op: mutation?.op ?? (read ? "select" : "other"),
+                    table: mutation?.table ?? read?.table ?? null,
+                    statement: text,
+                    requestId,
+                    error,
+                    options,
+                  });
+                }
+              }
+              throw error;
+            }
+          };
         }
         const value = Reflect.get(target, prop, receiver);
         return typeof value === "function" ? value.bind(target) : value;
@@ -715,6 +751,56 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     });
     return proxy;
   };
+
+  const rawAcquire = pool.acquire;
+  const wrappedAcquire =
+    typeof rawAcquire === "function"
+      ? (requester: unknown, callback?: unknown): unknown => {
+          const checkout = beginPoolCheckout(ENGINE, options);
+          if (typeof callback === "function") {
+            return (rawAcquire as (...args: unknown[]) => unknown).call(
+              pool,
+              requester,
+              (error: unknown, connection: unknown) => {
+                if (error || connection == null) checkout.failed(error);
+                else checkout.acquired();
+                return callback(error, connection);
+              },
+            );
+          }
+          const result = (rawAcquire as (...args: unknown[]) => unknown).call(
+            pool,
+            requester,
+          );
+          if (
+            !result ||
+            typeof (result as Promise<unknown>).then !== "function"
+          ) {
+            checkout.acquired();
+            return result;
+          }
+          return (result as Promise<unknown>).then(
+            (connection) => {
+              checkout.acquired();
+              return connection;
+            },
+            (error) => {
+              checkout.failed(error);
+              throw error;
+            },
+          );
+        }
+      : undefined;
+
+  // Requests hold the raw ConnectionPool as their parent and call acquire on
+  // it directly, so the pool method itself must carry the timer.
+  if (wrappedAcquire) {
+    try {
+      pool.acquire = wrappedAcquire;
+    } catch {
+      // Explicit calls through the returned Proxy remain covered.
+    }
+  }
 
   return new Proxy(pool, {
     get(target, prop, receiver) {
@@ -741,6 +827,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
           );
         };
       }
+      if (prop === "acquire" && wrappedAcquire) return wrappedAcquire;
       const value = Reflect.get(target, prop, receiver);
       return typeof value === "function" ? value.bind(target) : value;
     },

@@ -1,5 +1,6 @@
 import { buildDbDiffEvent } from "./diff-event";
 import {
+  beginPoolCheckout,
   emitGap,
   emitDbEvent,
   emitDbDiffEvents,
@@ -33,6 +34,7 @@ import {
 export interface DuckTypedMysqlClient {
   query(sql: unknown, values?: unknown): Promise<unknown>;
   execute?(sql: unknown, values?: unknown): Promise<unknown>;
+  getConnection?(callback?: unknown): unknown;
 }
 
 /** The mysql2 result-set header duck shape for a mutation (INSERT/UPDATE/DELETE). */
@@ -526,11 +528,62 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
 
   const wrappedQuery = makeInstrumented(rawQuery);
   const wrappedExecute = rawExecute ? makeInstrumented(rawExecute) : undefined;
+  const rawGetConnection = client.getConnection;
+  const wrappedGetConnection =
+    typeof rawGetConnection === "function"
+      ? (...args: unknown[]): unknown => {
+          const checkout = beginPoolCheckout(ENGINE, options);
+          const callback = args[0];
+          if (typeof callback === "function") {
+            return (rawGetConnection as (...values: unknown[]) => unknown).call(
+              client,
+              (error: unknown, connection: unknown) => {
+                if (error || connection == null) checkout.failed(error);
+                else checkout.acquired();
+                return callback(error, connection);
+              },
+            );
+          }
+          const result = (
+            rawGetConnection as (...values: unknown[]) => unknown
+          ).apply(client, args);
+          if (
+            !result ||
+            typeof (result as Promise<unknown>).then !== "function"
+          ) {
+            checkout.acquired();
+            return result;
+          }
+          return (result as Promise<unknown>).then(
+            (connection) => {
+              checkout.acquired();
+              return connection;
+            },
+            (error) => {
+              checkout.failed(error);
+              throw error;
+            },
+          );
+        }
+      : undefined;
+
+  // mysql2 Pool.query() checks out through `this.getConnection()`. Patching the
+  // pool method covers those implicit waits as well as explicit checkouts.
+  if (wrappedGetConnection) {
+    try {
+      client.getConnection = wrappedGetConnection;
+    } catch {
+      // Explicit calls through the returned Proxy remain covered.
+    }
+  }
 
   return new Proxy(client, {
     get(target, prop, receiver) {
       if (prop === "query") return wrappedQuery;
       if (prop === "execute" && wrappedExecute) return wrappedExecute;
+      if (prop === "getConnection" && wrappedGetConnection) {
+        return wrappedGetConnection;
+      }
       const value = Reflect.get(target, prop, receiver);
       return typeof value === "function" ? value.bind(target) : value;
     },
