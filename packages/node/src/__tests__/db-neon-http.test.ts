@@ -48,6 +48,7 @@ describe("instrumentNeonHttpQuery", () => {
     const raw = makeNeon();
     const sql = instrumentNeonHttpQuery(raw, {
       requestId: "req_1",
+      captureBefore: true,
       emit: (event) => events.push(event),
     });
 
@@ -61,6 +62,7 @@ describe("instrumentNeonHttpQuery", () => {
     await expect(result).resolves.toEqual([
       { id: 7, total_cents: 500, password: "drop-me" },
     ]);
+    expect(raw.executed).toHaveLength(1);
     expect(raw.executed[0]).toMatch(/RETURNING \*$/i);
 
     const diff = events.find((event) => event.k === "db.diff");
