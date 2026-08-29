@@ -281,6 +281,17 @@ describe("instrumentPrismaClient", () => {
     ).resolves.toBe(result);
   });
 
+  it("returns the same extension instead of double instrumenting a client", () => {
+    const base = makePrismaClient();
+    const options = { requestId: "req_once", emit: vi.fn() };
+    const first = instrumentPrismaClient(base, options);
+    const second = instrumentPrismaClient(base, options);
+    const third = instrumentPrismaClient(first, options);
+
+    expect(second).toBe(first);
+    expect(third).toBe(first);
+  });
+
   it("rethrows the host's own raw query error object", async () => {
     const { client } = setup();
     const failure = Object.assign(new Error("database failed"), {

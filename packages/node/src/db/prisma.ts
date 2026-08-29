@@ -18,7 +18,7 @@ import {
 } from "./instrument-shared";
 
 const ENGINE = "prisma" as const;
-const instrumentedClients = new WeakSet<object>();
+const instrumentedClients = new WeakMap<object, object>();
 
 export interface DuckTypedPrismaQueryInput {
   model?: unknown;
@@ -78,7 +78,9 @@ export function instrumentPrismaClient<T extends DuckTypedPrismaClient>(
   client: T,
   options: InstrumentDbClientOptions,
 ): T {
-  if (!isObjectLike(client) || instrumentedClients.has(client)) return client;
+  if (!isObjectLike(client)) return client;
+  const existing = instrumentedClients.get(client);
+  if (existing) return existing as T;
 
   const counters: RequestCounters = {
     emittedReadRowsByRequest: new Map(),
@@ -96,7 +98,8 @@ export function instrumentPrismaClient<T extends DuckTypedPrismaClient>(
       },
     });
     if (!isObjectLike(extended)) return client;
-    instrumentedClients.add(extended);
+    instrumentedClients.set(client, extended);
+    instrumentedClients.set(extended, extended);
     return extended as T;
   } catch (error) {
     emitGap(options, { reason: "uninstrumented_client", error });
@@ -422,7 +425,7 @@ function resultRowCount(
 }
 
 function hasSelection(args: unknown): boolean {
-  return isRecord(args) && isRecord(args.select);
+  return isRecord(args) && (isRecord(args.select) || isRecord(args.omit));
 }
 
 function returnsAllColumns(statement: string): boolean {
