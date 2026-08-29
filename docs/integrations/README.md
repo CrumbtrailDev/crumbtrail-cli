@@ -14,7 +14,7 @@ Sessionless spans and logs are accepted. Crumbtrail auto-creates time-window ses
 | Honeycomb | [honeycomb.md](./honeycomb.md) |
 | OpenTelemetry Collector | [otel-collector.md](./otel-collector.md) |
 | Splunk Observability Cloud | [splunk.md](./splunk.md) |
-| Database row diffing (Postgres, MySQL, MSSQL, SQLite) | [databases.md](./databases.md) |
+| Capture database changes | [databases.md](./databases.md) |
 
 These recipes were generated from provider recipes that shipped in
 `crumbtrail-node`. That package is backend capture only now, so they are

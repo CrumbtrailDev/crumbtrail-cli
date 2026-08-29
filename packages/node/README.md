@@ -38,7 +38,7 @@ installed package. Passing output names each phase it cleared.
 
 ## Database diffing
 
-Four engine shims wrap a duck-typed driver object the host injects (no driver dependency is
+Database adapters wrap a duck-typed driver object the host injects (no driver dependency is
 ever imported) so INSERT/UPDATE/DELETE statements executed inside a request scope record a
 `k:'db.diff'` event (`{ engine, op, table, pk, after, before?, requestId }`):
 
@@ -49,7 +49,11 @@ ever imported) so INSERT/UPDATE/DELETE statements executed inside a request scop
 | mssql    | `instrumentMssqlPool(pool, options)`     | injects `OUTPUT INSERTED.*` / `DELETED.*` (rows stripped from the host result) |
 | sqlite   | `instrumentSqliteDatabase(db, options)`  | post-`SELECT` by `lastInsertRowid` / pk (fully synchronous)                    |
 
-All four take the same `InstrumentDbClientOptions` and share the same guarantees: the host
+Neon HTTP uses `instrumentNeonHttpQuery(query, options)` and appends `RETURNING *` for
+after-images. PlanetScale uses `instrumentPlanetScaleClient(client, options)` and applies the
+MySQL re-read strategy to its HTTP `execute()` results. `autoCapture` detects both packages.
+
+All adapters take the same `InstrumentDbClientOptions` and share the same guarantees: the host
 query never fails and never runs twice because of instrumentation — parse/correlation/capture/
 emit failures degrade to "no diff emitted", and statements the shim cannot confidently handle
 (multi-statement batches, comment-wedged SQL on mssql, multi-row MySQL inserts) fall back to an
@@ -347,7 +351,8 @@ The package exports backend capture primitives:
 - `createCrumbtrailExpressMiddleware` / `createCrumbtrailExpressErrorMiddleware`
 - `installHttpRequestCapture`, `installBackendLogCapture`, `installBackendWarningCapture`
 - `instrumentPgClient`, `instrumentMysqlClient`, `instrumentMssqlPool`,
-  `instrumentSqliteDatabase`, `instrumentPostgresSql`, `instrumentDatabaseClient`
+  `instrumentSqliteDatabase`, `instrumentPostgresSql`, `instrumentNeonHttpQuery`,
+  `instrumentPlanetScaleClient`, `instrumentDatabaseClient`
 - `startHeadlessSession` for job runs with no browser
 - `flushBackendEvents` and `backendIntakeQueueStats` for processes that exit early
 

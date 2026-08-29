@@ -1,4 +1,4 @@
-# Database row diffing (Postgres, MySQL, MSSQL, SQLite)
+# Capture database changes
 
 Crumbtrail records the rows a request actually changed as `k:'db.diff'` events — op, table,
 primary key, after-image, optional before-image — correlated to the request's trace id so they
@@ -6,7 +6,8 @@ land in the same evidence window as the frontend and backend events of the reque
 the write, and feed session db differencing.
 
 Every shim is duck-typed: you inject your own driver object and `crumbtrail-node` never imports
-`pg`, `mysql2`, `mssql`, or a sqlite driver. All four take the same options
+`pg`, `postgres`, `@neondatabase/serverless`, `@planetscale/database`, `mysql2`,
+`mssql`, or a sqlite driver. All adapters take the same options
 (`InstrumentDbClientOptions`), and instrumentation can never fail or double-run your query —
 anything the shim cannot capture degrades to fewer events, never a broken statement.
 
@@ -41,6 +42,53 @@ const db = instrumentPgClient(pool, {
 ```
 
 After-images come from an appended `RETURNING *` (skipped when your statement already has one).
+
+## Neon HTTP (`@neondatabase/serverless`)
+
+`autoCapture` instruments query functions returned by `neon()` automatically. To wrap an
+existing query function, identify the driver because its callable shape is also used by
+postgres.js:
+
+```ts
+import { neon } from "@neondatabase/serverless";
+import { instrumentDatabaseClient } from "crumbtrail-node";
+
+const db = instrumentDatabaseClient(neon(process.env.DATABASE_URL), {
+  driver: "neon-http",
+});
+```
+
+Both tagged templates and `query(text, params, options)` are captured. Mutation after-images come
+from an appended `RETURNING *`. Composed template fragments run untouched because their final SQL
+cannot be reconstructed safely, and mutating fragments emit an `unparsed_sql` gap.
+
+Neon HTTP does not provide an interactive transaction around a query. The adapter therefore omits
+before-images instead of issuing a separate non-atomic fetch and presenting it as the state changed
+by the mutation. `captureBefore` has no effect for this adapter.
+
+Neon's WebSocket `Pool` and `Client` implement the `pg` query contract. `autoCapture` routes them
+through the existing pg adapter. Use `instrumentPgClient` when wrapping an existing pool manually;
+they do not need another adapter.
+
+## PlanetScale (`@planetscale/database`)
+
+`autoCapture` instruments both `connect()` and connections returned by `new Client().connection()`.
+To wrap an existing connection:
+
+```ts
+import { connect } from "@planetscale/database";
+import { instrumentDatabaseClient } from "crumbtrail-node";
+
+const db = instrumentDatabaseClient(connect(config), {
+  driver: "planetscale",
+});
+```
+
+PlanetScale returns MySQL result metadata over HTTP. Inserts are re-read by `insertId` when it
+identifies one row. UPDATE and DELETE statements with a usable WHERE clause are selected before
+the mutation, and updates are selected again by primary key. Missing or ambiguous images produce
+an image-less `db.diff` with the driver's `rowsAffected` count. The original `execute()` result is
+returned unchanged.
 
 ## MySQL (`mysql2/promise` Connection or Pool)
 

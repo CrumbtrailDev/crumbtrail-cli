@@ -39,6 +39,8 @@ import { instrumentSqliteDatabase } from "./sqlite";
 import { instrumentMssqlPool, instrumentMssqlTransaction } from "./mssql";
 import { instrumentPostgresSql } from "./postgres-js";
 import { enableMongoCommandMonitoring, instrumentMongoClient } from "./mongo";
+import { instrumentNeonHttpQuery } from "./neon-http";
+import { instrumentPlanetScaleClient } from "./planetscale";
 import { instrumentPrismaClient } from "./prisma";
 import type { InstrumentDbClientOptions } from "./instrument-shared";
 
@@ -53,6 +55,8 @@ export const AUTO_INSTRUMENT_DRIVERS = [
   // first: a Postgres app is the common case, and the two Postgres drivers are
   // mutually exclusive in practice.
   "postgres",
+  "@neondatabase/serverless",
+  "@planetscale/database",
   "mysql2",
   "mysql2/promise",
   "better-sqlite3",
@@ -292,6 +296,40 @@ function patchDriver(
               instance as Parameters<typeof instrumentMysqlClient>[0],
               options,
             ),
+          restorations,
+        ),
+      );
+    }
+  } else if (driver === "@neondatabase/serverless") {
+    statuses.push(
+      patchFactory(
+        root,
+        "neon",
+        (instance) => instrumentNeonHttpQuery(instance, options),
+        restorations,
+      ),
+    );
+    for (const key of ["Client", "Pool"]) {
+      statuses.push(
+        patchFactory(
+          root,
+          key,
+          (instance) =>
+            instrumentPgClient(
+              instance as Parameters<typeof instrumentPgClient>[0],
+              options,
+            ),
+          restorations,
+        ),
+      );
+    }
+  } else if (driver === "@planetscale/database") {
+    for (const key of ["connect", "Client"]) {
+      statuses.push(
+        patchFactory(
+          root,
+          key,
+          (instance) => instrumentPlanetScaleClient(instance, options),
           restorations,
         ),
       );
