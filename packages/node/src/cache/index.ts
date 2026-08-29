@@ -11,3 +11,13 @@ export {
   type DuckTypedCacheClient,
   type InstrumentCacheClientOptions,
 } from "./instrument";
+export {
+  AUTO_INSTRUMENT_CACHE_DRIVERS,
+  autoInstrumentCacheClients,
+  autoInstrumentCachePatchedAnything,
+  formatAutoInstrumentCacheReport,
+  type AutoInstrumentCacheDriver,
+  type AutoInstrumentCacheDriverResult,
+  type AutoInstrumentCacheOptions,
+  type AutoInstrumentCacheReport,
+} from "./auto-instrument";

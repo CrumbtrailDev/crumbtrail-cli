@@ -85,7 +85,11 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
             requestId,
             ...(capture.hit ? { hit: capture.hit(value) } : {}),
             ...(capture.ttlMs !== undefined ? { ttlMs: capture.ttlMs } : {}),
-            ...(capture.resultValue ? { value } : capture.value !== undefined ? { value: capture.value } : {}),
+            ...(capture.resultValue
+              ? { value }
+              : capture.value !== undefined
+                ? { value: capture.value }
+                : {}),
           });
           return value;
         });
