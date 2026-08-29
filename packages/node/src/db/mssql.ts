@@ -1,4 +1,4 @@
-import type { DbDiffOp } from "crumbtrail-core";
+import type { DbConnectionIdentity, DbDiffOp } from "crumbtrail-core";
 import {
   classifyStatement,
   leadingSqlKeyword,
@@ -12,9 +12,15 @@ import {
   emitDbDiffEvents,
   emitDbReadEvents,
   emitImagelessDbDiff,
+  extractDbConnectionIdentity,
+  finishDbTransaction,
   extractPk,
   isRecord,
   pkKey,
+  startDbQueryTimer,
+  startDbTransaction,
+  type DbStatementContext,
+  type DbTransactionContext,
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
@@ -43,6 +49,12 @@ export interface DuckTypedMssqlRequest {
 export interface DuckTypedMssqlPool {
   request(): DuckTypedMssqlRequest;
   query?(text: unknown, ...rest: unknown[]): Promise<DuckTypedMssqlResult>;
+}
+
+export interface DuckTypedMssqlTransaction extends DuckTypedMssqlPool {
+  begin(...args: unknown[]): Promise<unknown>;
+  commit(...args: unknown[]): Promise<unknown>;
+  rollback(...args: unknown[]): Promise<unknown>;
 }
 
 const ENGINE = "mssql" as const;
@@ -478,10 +490,31 @@ function replayInputs(
 export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
   pool: T,
   options: InstrumentDbClientOptions,
+  instrumentationContext: {
+    connection?: DbConnectionIdentity;
+    getTransaction?: () => DbTransactionContext | undefined;
+  } = {},
 ): T {
   const emittedReadRowsByRequest = new Map<string, number>();
   const readStatementsByRequest = new Map<string, number>();
   const readCallsitesByRequest: ReadCallsitesByRequest = new Map();
+  const connection =
+    instrumentationContext.connection ??
+    extractDbConnectionIdentity(ENGINE, pool);
+  const statementContext = (durationMs: number): DbStatementContext => ({
+    connection,
+    durationMs,
+    transactionId: instrumentationContext.getTransaction?.()?.id,
+  });
+
+  const timedQuery = async (
+    request: DuckTypedMssqlRequest,
+    sql: unknown,
+  ): Promise<{ result: DuckTypedMssqlResult; durationMs: number }> => {
+    const elapsed = startDbQueryTimer(options);
+    const result = await request.query(sql);
+    return { result, durationMs: elapsed() };
+  };
 
   // `request` is the RAW mssql request that already has the host's inputs bound; `recordedInputs` are
   // the same inputs captured for replay onto fresh requests. Fresh requests always come from the RAW
@@ -520,7 +553,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
 
     // Non-mutation (read) path.
     if (!parsed) {
-      const result = await request.query(sql);
+      const { result, durationMs } = await timedQuery(request, sql);
       if (options.captureReads && parsedRead) {
         try {
           const rows = recordsetRows(result);
@@ -535,6 +568,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
             readCallsitesByRequest,
             readStatementsByRequest,
             statement: sql,
+            context: statementContext(durationMs),
           });
         } catch (error) {
           emitGap(options, { reason: "capture_exception", error });
@@ -551,7 +585,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     // whenever we deliberately decline to edit the SQL (safety gate, no injection point).
     const runOriginalWithImagelessDiff =
       async (): Promise<DuckTypedMssqlResult> => {
-        const result = await request.query(sql);
+        const { result, durationMs } = await timedQuery(request, sql);
         try {
           const rowCount = rowCountFromResult(result, 0);
           if (rowCount > 0) {
@@ -562,6 +596,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
               requestId: reqId,
               rowCount,
               options,
+              context: statementContext(durationMs),
             });
           }
         } catch (error) {
@@ -634,13 +669,17 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     // re-run — those fail at compile time before any rows change, so re-running the ORIGINAL on a fresh
     // request is safe and guarantees single application. Any other error propagates as-is.
     let result: DuckTypedMssqlResult;
+    let durationMs: number;
     try {
-      result = await request.query(injectedText);
+      const timed = await timedQuery(request, injectedText);
+      result = timed.result;
+      durationMs = timed.durationMs;
     } catch (err) {
       if (!isSafeCompileRerunError(err)) throw err;
       const fresh = pool.request();
       replayInputs(fresh, recordedInputs);
-      const fallbackResult = await fresh.query(sql);
+      const fallback = await timedQuery(fresh, sql);
+      const fallbackResult = fallback.result;
       try {
         const rowCount = rowCountFromResult(fallbackResult, 0);
         if (rowCount > 0) {
@@ -651,6 +690,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
             requestId: reqId,
             rowCount,
             options,
+            context: statementContext(fallback.durationMs),
           });
         }
       } catch (error) {
@@ -673,6 +713,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
           beforeByPk,
           rowCount,
           options,
+          context: statementContext(durationMs),
         });
       } else if (rowCount > 0) {
         // Mutation ran but produced no imageable OUTPUT rows: still record the write.
@@ -683,6 +724,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
           requestId: reqId,
           rowCount,
           options,
+          context: statementContext(durationMs),
         });
       }
     } catch (error) {
@@ -739,6 +781,60 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
             text,
             ...rest,
           );
+        };
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+export function instrumentMssqlTransaction<T extends DuckTypedMssqlTransaction>(
+  transactionObject: T,
+  options: InstrumentDbClientOptions,
+): T {
+  const connection = extractDbConnectionIdentity(ENGINE, transactionObject);
+  let transaction: DbTransactionContext | undefined;
+  const instrumentedRequests = instrumentMssqlPool(transactionObject, options, {
+    connection,
+    getTransaction: () => transaction,
+  });
+
+  return new Proxy(transactionObject, {
+    get(target, prop, receiver) {
+      if (prop === "request")
+        return instrumentedRequests.request.bind(instrumentedRequests);
+      if (prop === "begin" || prop === "commit" || prop === "rollback") {
+        const method = Reflect.get(target, prop, receiver);
+        if (typeof method !== "function") return method;
+        return async (...args: unknown[]) => {
+          const result = await (
+            method as (...values: unknown[]) => Promise<unknown>
+          ).apply(target, args);
+          let requestId: string | undefined;
+          try {
+            requestId = options.requestId ?? options.getRequestId?.();
+          } catch (error) {
+            emitGap(options, { reason: "capture_exception", error });
+          }
+          if (prop === "begin") {
+            transaction = startDbTransaction({
+              engine: ENGINE,
+              requestId,
+              connection,
+              options,
+            });
+          } else if (transaction) {
+            finishDbTransaction({
+              engine: ENGINE,
+              transaction,
+              outcome: prop === "commit" ? "commit" : "rollback",
+              requestId,
+              options,
+            });
+            transaction = undefined;
+          }
+          return result;
         };
       }
       const value = Reflect.get(target, prop, receiver);

@@ -14,10 +14,16 @@ import {
   emitDbErrorEvent,
   emitDbReadEvents,
   emitDbStatementEvent,
+  extractDbConnectionIdentity,
+  finishDbTransaction,
   extractPk,
   isRecord,
   nextStatementSeq,
   pkKey,
+  startDbQueryTimer,
+  startDbTransaction,
+  classifyDbTransactionCommand,
+  type DbTransactionContext,
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
@@ -66,12 +72,80 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
   // Every instrumented statement, not only the SELECTs whose rows were captured: this is what
   // gives a statement that returned nothing an ordinal, and so a place in the request's order.
   const statementsByRequest = new Map<string, number>();
+  const connection = extractDbConnectionIdentity(ENGINE, client);
+  let transaction: DbTransactionContext | undefined;
 
   const wrappedQuery = async (
     text: unknown,
     params?: unknown,
   ): Promise<DuckTypedPgQueryResult> => {
     if (typeof text !== "string") return client.query(text, params);
+
+    const transactionCommand = classifyDbTransactionCommand(text);
+    if (transactionCommand) {
+      let requestId: string | undefined;
+      try {
+        requestId = options.requestId ?? options.getRequestId?.();
+      } catch (error) {
+        emitGap(options, { reason: "capture_exception", error });
+      }
+      const elapsed = startDbQueryTimer(options);
+      let result: DuckTypedPgQueryResult;
+      try {
+        result = await client.query(text, params);
+      } catch (error) {
+        if (requestId) {
+          emitDbErrorEvent({
+            engine: ENGINE,
+            op: "other",
+            table: null,
+            statement: text,
+            requestId,
+            error,
+            options,
+            context: { connection, transactionId: transaction?.id },
+          });
+        }
+        throw error;
+      }
+      const durationMs = elapsed();
+      const activeBefore = transaction;
+      if (transactionCommand === "begin") {
+        transaction = startDbTransaction({
+          engine: ENGINE,
+          requestId,
+          connection,
+          options,
+        });
+      } else if (transaction) {
+        finishDbTransaction({
+          engine: ENGINE,
+          transaction,
+          outcome: transactionCommand,
+          requestId,
+          options,
+        });
+        transaction = undefined;
+      }
+      if (requestId) {
+        emitDbStatementEvent({
+          engine: ENGINE,
+          op: "other",
+          table: null,
+          statement: text,
+          rowCount: resultRowCount(result),
+          seq: nextStatementSeq(statementsByRequest, requestId),
+          requestId,
+          options,
+          context: {
+            connection,
+            durationMs,
+            transactionId: (transaction ?? activeBefore)?.id,
+          },
+        });
+      }
+      return result;
+    }
 
     // Parse/correlation resolution is diff-capture work: if it throws, fall through to the host
     // query untouched. Instrumentation must never decide whether the host's query runs.
@@ -105,6 +179,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       // NOT behind `captureReads`: that flag caps row IMAGES, and a failure record carries no
       // rows. Gating it there would leave a failed SELECT invisible on every default install.
       let result: DuckTypedPgQueryResult;
+      const elapsed = startDbQueryTimer(options);
       try {
         result = await client.query(text, params);
       } catch (error) {
@@ -116,9 +191,11 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           requestId,
           error,
           options,
+          context: { connection, transactionId: transaction?.id },
         });
         throw error;
       }
+      const durationMs = elapsed();
       // Record what the statement ASKED, whatever it returned. Rows describe what the database
       // held; only the shape describes what was requested of it, and a SELECT that matched nothing
       // emits no row at all — so without this the operation is not merely thin, it is absent.
@@ -132,6 +209,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         seq: nextStatementSeq(statementsByRequest, requestId),
         requestId,
         options,
+        context: { connection, durationMs, transactionId: transaction?.id },
       });
       if (options.captureReads && parsedRead) {
         try {
@@ -153,6 +231,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
             readStatementsByRequest,
             queryShape: parseLimitOffset(text, params),
             statement: text,
+            context: { connection, durationMs, transactionId: transaction?.id },
           });
         } catch (error) {
           emitGap(options, { reason: "capture_exception", error });
@@ -198,7 +277,9 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       // this path is correct and says two different things — our RETURNING rewrite failed, AND
       // their statement failed — and they have different owners.
       try {
+        const elapsed = startDbQueryTimer(options);
         const uninstrumented = await client.query(text, paramArray);
+        const durationMs = elapsed();
         emitDbStatementEvent({
           engine: ENGINE,
           op: parsed.op,
@@ -208,6 +289,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           seq: nextStatementSeq(statementsByRequest, requestId),
           requestId,
           options,
+          context: { connection, durationMs, transactionId: transaction?.id },
         });
         return uninstrumented;
       } catch (queryError) {
@@ -219,6 +301,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           requestId,
           error: queryError,
           options,
+          context: { connection, transactionId: transaction?.id },
         });
         throw queryError;
       }
@@ -228,6 +311,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
     // We now also RECORD the failure on the way past: a mutation that raised is the decisive
     // observable in exactly the incidents where nothing else explains the response.
     let result: DuckTypedPgQueryResult;
+    const elapsed = startDbQueryTimer(options);
     try {
       result = await client.query(instrumentedText, paramArray);
     } catch (error) {
@@ -241,9 +325,11 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         requestId,
         error,
         options,
+        context: { connection, transactionId: transaction?.id },
       });
       throw error;
     }
+    const durationMs = elapsed();
 
     // The statement ran. Record what it asked before deciding what it changed: a mutation whose
     // WHERE matched no row changes nothing and so appears in no diff, which is the same silence a
@@ -259,6 +345,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       seq: nextStatementSeq(statementsByRequest, requestId),
       requestId,
       options,
+      context: { connection, durationMs, transactionId: transaction?.id },
     });
 
     // Diff capture/emit is best-effort: a parse/build/emit failure here degrades to "no diff
@@ -278,6 +365,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         beforeByPk,
         rowCount,
         options,
+        context: { connection, durationMs, transactionId: transaction?.id },
       });
     } catch (error) {
       emitGap(options, { reason: "capture_exception", error });

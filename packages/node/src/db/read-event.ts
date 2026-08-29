@@ -3,6 +3,7 @@ import {
   DB_READ_EVENT_KIND,
   mergeRedactionMetadata,
   type BugEvent,
+  type DbConnectionIdentity,
   type DbEngine,
   type DbReadBulkEventData,
   type DbReadEventData,
@@ -14,10 +15,13 @@ import { boundColumnRow } from "./diff-event";
 export interface BuildDbReadEventInput {
   /** Engine that produced the read. Defaults to `"postgres"` for back-compat. */
   engine?: DbEngine;
+  connection?: DbConnectionIdentity;
   table: string;
   pk: Record<string, unknown> | null;
   row: Record<string, unknown>;
   requestId: string;
+  durationMs?: number;
+  transactionId?: string;
   /** Application callsite that issued the SELECT, when callsite capture is enabled. */
   callsite?: DbCallsite;
   /** 1-based ordinal of the SELECT within this request. */
@@ -62,10 +66,13 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
 
   const d: DbReadEventData = {
     engine: input.engine ?? "postgres",
+    ...(input.connection ? { connection: input.connection } : {}),
     table: input.table,
     pk: boundedPk,
     row: boundedRow,
     requestId: input.requestId,
+    durationMs: normalizeDuration(input.durationMs),
+    ...(input.transactionId ? { transactionId: input.transactionId } : {}),
     ...(input.callsite !== undefined ? { callsite: input.callsite } : {}),
   };
   if (Number.isInteger(input.stmt) && (input.stmt as number) > 0)
@@ -94,6 +101,12 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
   const startedAt = normalizeStartedAt(input.sessionStartedAt);
   if (startedAt !== undefined) event.offsetMs = Math.max(0, now - startedAt);
   return event;
+}
+
+function normalizeDuration(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.round(value * 1000) / 1000)
+    : 0;
 }
 
 export function buildDbReadBulkEvent(

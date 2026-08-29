@@ -2,6 +2,7 @@ import {
   DB_DIFF_EVENT_KIND,
   mergeRedactionMetadata,
   type BugEvent,
+  type DbConnectionIdentity,
   type DbDiffEventData,
   type DbDiffOp,
   type DbEngine,
@@ -12,6 +13,7 @@ import { buildSensitiveColumnSet, redactColumns } from "./columns";
 export interface BuildDbDiffEventInput {
   /** Engine that produced the mutation. Defaults to `"postgres"` for back-compat. */
   engine?: DbEngine;
+  connection?: DbConnectionIdentity;
   op: DbDiffOp;
   table: string;
   /** Primary-key column→value map, or `null` when it could not be resolved. */
@@ -24,6 +26,8 @@ export interface BuildDbDiffEventInput {
   rowCount?: number;
   /** Correlation id; MUST equal the active request's traceId/requestId. */
   requestId: string;
+  durationMs?: number;
+  transactionId?: string;
   sessionId?: string;
   /** Extra sensitive column names to drop, on top of {@link DEFAULT_SENSITIVE_DB_COLUMNS}. */
   redactColumns?: readonly string[];
@@ -94,10 +98,13 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
 
   const d: DbDiffEventData = {
     engine: input.engine ?? "postgres",
+    ...(input.connection ? { connection: input.connection } : {}),
     op: input.op,
     table: input.table,
     pk: boundedPk,
     requestId: input.requestId,
+    durationMs: normalizeDuration(input.durationMs),
+    ...(input.transactionId ? { transactionId: input.transactionId } : {}),
     ...(boundedAfter !== undefined ? { after: boundedAfter } : {}),
     ...(boundedBefore !== undefined ? { before: boundedBefore } : {}),
     ...(input.rowCount !== undefined ? { rowCount: input.rowCount } : {}),
@@ -124,6 +131,12 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
   if (startedAt !== undefined) event.offsetMs = Math.max(0, now - startedAt);
 
   return event;
+}
+
+function normalizeDuration(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.round(value * 1000) / 1000)
+    : 0;
 }
 
 function normalizeStartedAt(

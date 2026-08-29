@@ -12,10 +12,16 @@ import {
   emitDbDiffEvents,
   emitDbReadEvents,
   emitImagelessDbDiff,
+  extractDbConnectionIdentity,
+  finishDbTransaction,
   extractPk,
   isRecord,
   normalizeMaxRowsPerStatement,
   pkKey,
+  startDbQueryTimer,
+  startDbTransaction,
+  type DbStatementContext,
+  type DbTransactionContext,
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
@@ -158,6 +164,8 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
   const emittedReadRowsByRequest = new Map<string, number>();
   const readStatementsByRequest = new Map<string, number>();
   const readCallsitesByRequest: ReadCallsitesByRequest = new Map();
+  const connection = extractDbConnectionIdentity(ENGINE, db);
+  let transaction: DbTransactionContext | undefined;
 
   const resolveRequestId = (): string | undefined =>
     options.requestId ?? options.getRequestId?.();
@@ -169,7 +177,13 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     requestId: string,
   ): unknown => {
     // The host mutation. Its own errors propagate normally — we never swallow the caller's query.
+    const elapsed = startDbQueryTimer(options);
     const info = realStmt.run(...args);
+    const context: DbStatementContext = {
+      connection,
+      durationMs: elapsed(),
+      transactionId: transaction?.id,
+    };
     try {
       const changes = toChangeCount(info);
       const rowid = validRowid(info);
@@ -193,6 +207,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
             rows: [afterRow],
             rowCount: 1,
             options,
+            context,
           });
           return info;
         }
@@ -206,6 +221,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           requestId,
           rowCount: changes,
           options,
+          context,
         });
       }
     } catch (error) {
@@ -250,7 +266,13 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     }
 
     // The host mutation. Errors propagate normally.
+    const elapsed = startDbQueryTimer(options);
     const info = realStmt.run(...args);
+    const context: DbStatementContext = {
+      connection,
+      durationMs: elapsed(),
+      transactionId: transaction?.id,
+    };
 
     try {
       const changes = toChangeCount(info);
@@ -280,6 +302,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
             beforeByPk,
             rowCount: changes,
             options,
+            context,
           });
           return info;
         }
@@ -293,6 +316,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           requestId,
           rowCount: changes,
           options,
+          context,
         });
       }
     } catch (error) {
@@ -324,7 +348,13 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     }
 
     // The host mutation. Errors propagate normally.
+    const elapsed = startDbQueryTimer(options);
     const info = realStmt.run(...args);
+    const context: DbStatementContext = {
+      connection,
+      durationMs: elapsed(),
+      transactionId: transaction?.id,
+    };
 
     try {
       const changes = toChangeCount(info);
@@ -337,6 +367,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           rows: beforeRows,
           rowCount: changes,
           options,
+          context,
         });
         return info;
       }
@@ -348,6 +379,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           requestId,
           rowCount: changes,
           options,
+          context,
         });
       }
     } catch (error) {
@@ -391,7 +423,13 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     statement: string,
   ): unknown => {
     // The host read runs exactly once; its result is returned unchanged.
+    const elapsed = startDbQueryTimer(options);
     const result = realStmt.all(...args);
+    const context: DbStatementContext = {
+      connection,
+      durationMs: elapsed(),
+      transactionId: transaction?.id,
+    };
     let requestId: string | undefined;
     try {
       requestId = resolveRequestId();
@@ -413,6 +451,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
         readCallsitesByRequest,
         readStatementsByRequest,
         statement,
+        context,
       });
     } catch (error) {
       emitGap(options, { reason: "capture_exception", error });
@@ -442,8 +481,73 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
       },
     });
 
+  const wrapTransactionFunction = (fn: (...args: unknown[]) => unknown) =>
+    new Proxy(fn, {
+      apply(target, thisArg, args) {
+        // better-sqlite3 implements a nested transaction wrapper with a savepoint. Keep the outer
+        // transaction id and let its eventual outcome speak for the whole transaction.
+        if (transaction) return Reflect.apply(target, thisArg, args);
+        let requestId: string | undefined;
+        try {
+          requestId = resolveRequestId();
+        } catch (error) {
+          emitGap(options, { reason: "capture_exception", error });
+        }
+        const active = startDbTransaction({
+          engine: ENGINE,
+          requestId,
+          connection,
+          options,
+        });
+        const previous = transaction;
+        transaction = active;
+        try {
+          const result = Reflect.apply(target, thisArg, args);
+          finishDbTransaction({
+            engine: ENGINE,
+            transaction: active,
+            outcome: "commit",
+            requestId,
+            options,
+          });
+          return result;
+        } catch (error) {
+          finishDbTransaction({
+            engine: ENGINE,
+            transaction: active,
+            outcome: "rollback",
+            requestId,
+            options,
+          });
+          throw error;
+        } finally {
+          transaction = previous;
+        }
+      },
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" &&
+          (prop === "deferred" || prop === "immediate" || prop === "exclusive")
+          ? wrapTransactionFunction(value as (...args: unknown[]) => unknown)
+          : value;
+      },
+    });
+
   return new Proxy(db, {
     get(target, prop, _receiver) {
+      if (prop === "transaction") {
+        const factory = Reflect.get(target, prop, target);
+        if (typeof factory !== "function") return factory;
+        return (...args: unknown[]) => {
+          const fn = (factory as (...values: unknown[]) => unknown).apply(
+            target,
+            args,
+          );
+          return typeof fn === "function"
+            ? wrapTransactionFunction(fn as (...values: unknown[]) => unknown)
+            : fn;
+        };
+      }
       if (prop === "prepare") {
         return (...prepareArgs: unknown[]): DuckTypedSqliteStatement => {
           // The host prepare runs and its errors propagate; parsing is separate best-effort work.
