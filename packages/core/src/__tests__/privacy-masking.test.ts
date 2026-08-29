@@ -117,6 +117,11 @@ describe("production privacy masking", () => {
         table: "customers",
         pk: { id: 42 },
         after: { name: "Database private value", email: "db@example.test" },
+        connection: {
+          host: "private-db.internal",
+          database: "tenant_private",
+          role: "replica",
+        },
       },
     });
     logger.addEvent({
@@ -170,6 +175,8 @@ describe("production privacy masking", () => {
       '"id":42',
       "bulk@example.test",
       "Bulk database private value",
+      "private-db.internal",
+      "tenant_private",
       "blocked-input",
       "URL-private-value-123",
       "private-fragment",
@@ -188,6 +195,11 @@ describe("production privacy masking", () => {
       email: "***************",
     });
     expect(dbDiff?.d.pk).toEqual({ id: "[REDACTED]" });
+    expect(dbDiff?.d.connection).toEqual({
+      host: "*******************",
+      database: "**************",
+      role: "replica",
+    });
     const dbDiffBulk = events.find((event) => event.k === "db.diff.bulk");
     expect(dbDiffBulk?.d.samplePks).toEqual([
       { id: "[REDACTED]", email: "*****************" },

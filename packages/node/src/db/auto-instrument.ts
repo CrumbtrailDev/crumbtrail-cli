@@ -35,7 +35,7 @@ import type { BugEvent } from "crumbtrail-core";
 import { instrumentPgClient } from "./pg";
 import { instrumentMysqlClient } from "./mysql";
 import { instrumentSqliteDatabase } from "./sqlite";
-import { instrumentMssqlPool } from "./mssql";
+import { instrumentMssqlPool, instrumentMssqlTransaction } from "./mssql";
 import { instrumentPostgresSql } from "./postgres-js";
 import { enableMongoCommandMonitoring, instrumentMongoClient } from "./mongo";
 import { instrumentPrismaClient } from "./prisma";
@@ -327,6 +327,18 @@ function patchDriver(
         restorations,
       ),
     );
+    statuses.push(
+      patchFactory(
+        root,
+        "Transaction",
+        (instance) =>
+          instrumentMssqlTransaction(
+            instance as Parameters<typeof instrumentMssqlTransaction>[0],
+            options,
+          ),
+        restorations,
+      ),
+    );
   } else if (driver === "mongodb") {
     statuses.push(
       patchFactory(
@@ -338,7 +350,7 @@ function patchDriver(
             options,
           ),
         restorations,
-        enableMongoCommandMonitoring,
+        enableMongoCommandMonitoring
       ),
     );
   }

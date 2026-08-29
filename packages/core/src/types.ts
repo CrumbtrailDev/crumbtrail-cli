@@ -156,6 +156,9 @@ export const DB_ERROR_EVENT_KIND = "db.error" as const;
  */
 export const DB_STATEMENT_EVENT_KIND = "db.statement" as const;
 
+/** Canonical lifecycle event for one database transaction (`k:'db.transaction'`). */
+export const DB_TRANSACTION_EVENT_KIND = "db.transaction" as const;
+
 /** Canonical event kind for a bounded record of evidence the capture path could not collect. */
 export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
 
@@ -306,6 +309,23 @@ export type DbBeforeImageStatus =
         | "prisma_upsert_branch_unknown";
     };
 
+/** Configuration-derived database endpoint identity. Credentials are never retained. */
+export interface DbConnectionIdentity {
+  host?: string;
+  database?: string;
+  role?: "primary" | "replica";
+}
+
+export type DbTransactionOutcome = "open" | "commit" | "rollback";
+
+export interface DbTransactionEventData {
+  engine: DbEngine;
+  transactionId: string;
+  outcome: DbTransactionOutcome;
+  requestId?: string;
+  connection?: DbConnectionIdentity;
+}
+
 /** Runtime-derived application location attached to database evidence when a host frame exists. */
 export interface DbCallsite {
   file: string;
@@ -326,6 +346,7 @@ export interface DbCallsite {
  */
 export interface DbDiffEventData {
   engine: DbEngine;
+  connection?: DbConnectionIdentity;
   op: DbDiffOp;
   table: string;
   /** Primary-key column→value map identifying the affected row, or `null` when unresolved. */
@@ -344,6 +365,10 @@ export interface DbDiffEventData {
   rowCount?: number;
   /** Correlation id; equals the active request's traceId so it lands in the same evidence window. */
   requestId: string;
+  /** Host statement execution time, excluding Crumbtrail's image capture queries. */
+  durationMs: number;
+  /** Present when the statement ran inside an observed transaction. */
+  transactionId?: string;
   /** Application callsite that issued the statement, when capture found an application frame. */
   callsite?: DbCallsite;
   /** Redaction metadata for any column-level values dropped/masked before rest. */
@@ -372,10 +397,15 @@ export interface DbDiffBulkEventData {
  */
 export interface DbReadEventData {
   engine: DbEngine;
+  connection?: DbConnectionIdentity;
   table: string;
   pk: Record<string, unknown> | null;
   row: Record<string, unknown>;
   requestId: string;
+  /** Host statement execution time. */
+  durationMs: number;
+  /** Present when the statement ran inside an observed transaction. */
+  transactionId?: string;
   /** Application callsite that issued the SELECT, when callsite capture is enabled. */
   callsite?: DbCallsite;
   /**
@@ -438,6 +468,7 @@ export type DbErrorOp =
  */
 export interface DbErrorEventData {
   engine: DbEngine;
+  connection?: DbConnectionIdentity;
   op: DbErrorOp;
   /** Table the statement addressed, or `null` when the statement did not parse to one. */
   table: string | null;
@@ -448,6 +479,8 @@ export interface DbErrorEventData {
   /** Error class name only, never the message. */
   errorName: string;
   requestId: string;
+  /** Present when the refused statement ran inside an observed transaction. */
+  transactionId?: string;
   /** Application callsite that issued the refused statement, when a host frame exists. */
   callsite?: DbCallsite;
   t: number;
@@ -473,6 +506,7 @@ export type DbStatementOp = DbErrorOp;
  */
 export interface DbStatementEventData {
   engine: DbEngine;
+  connection?: DbConnectionIdentity;
   op: DbStatementOp;
   /** Table the statement addressed, or `null` when the statement did not parse to one. */
   table: string | null;
@@ -487,6 +521,8 @@ export interface DbStatementEventData {
   /** 1-based ordinal of this statement within its request, so execution order survives. */
   seq: number;
   requestId: string;
+  /** Present when the statement ran inside an observed transaction. */
+  transactionId?: string;
   t: number;
 }
 

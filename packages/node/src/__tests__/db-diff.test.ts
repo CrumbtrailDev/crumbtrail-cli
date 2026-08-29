@@ -46,6 +46,7 @@ describe("buildDbDiffEvent", () => {
       pk: { id: 42 },
       after: { id: 42, total: 100 },
       requestId: "trace-xyz",
+      durationMs: 12.3456,
       sessionId: "ses_1",
       now: 1_700_000_000_500,
       sessionStartedAt: 1_700_000_000_000,
@@ -61,6 +62,7 @@ describe("buildDbDiffEvent", () => {
       op: "insert",
       table: "orders",
       requestId: "trace-xyz",
+      durationMs: 12.346,
     });
     expect(d.pk).toEqual({ id: 42 });
     expect(d.after).toEqual({ id: 42, total: 100 });
@@ -145,6 +147,72 @@ describe("instrumentPgClient", () => {
     expect(d.requestId).toBe("req-1");
     // The shim appends RETURNING * so it can read the after-image.
     expect(client.calls[0].text).toMatch(/returning \*/i);
+  });
+
+  it("records host query duration and credential-free connection identity", async () => {
+    const client = Object.assign(
+      fakePgClient(() => ({ rows: [{ id: 1 }], rowCount: 1 })),
+      {
+        connectionParameters: {
+          connectionString:
+            "postgres://private-user:private-password@replica.db.internal:5432/app_db",
+          target_session_attrs: "read-only",
+        },
+      },
+    );
+    const events: BugEvent[] = [];
+    const ticks = [10, 22.5];
+    const db = instrumentPgClient(client, {
+      requestId: "req-duration",
+      durationNow: () => ticks.shift() ?? 22.5,
+      emit: (event) => events.push(event),
+    });
+
+    await db.query("INSERT INTO orders DEFAULT VALUES");
+
+    const diff = events.find((event) => event.k === DB_DIFF_EVENT_KIND)!;
+    expect(diff.d).toMatchObject({
+      durationMs: 12.5,
+      connection: {
+        host: "replica.db.internal",
+        database: "app_db",
+        role: "replica",
+      },
+    });
+    expect(JSON.stringify(diff)).not.toContain("private-user");
+    expect(JSON.stringify(diff)).not.toContain("private-password");
+  });
+
+  it("tracks explicit transaction commit without treating savepoint rollback as a full rollback", async () => {
+    const client = fakePgClient((text) =>
+      /^update/i.test(text)
+        ? { rows: [{ id: 3, status: "done" }], rowCount: 1 }
+        : { rows: [], rowCount: 0 },
+    );
+    const events: BugEvent[] = [];
+    const db = instrumentPgClient(client, {
+      requestId: "req-tx",
+      emit: (event) => events.push(event),
+    });
+
+    await db.query("BEGIN");
+    await db.query("SAVEPOINT retry");
+    await db.query("ROLLBACK TO SAVEPOINT retry");
+    await db.query("UPDATE orders SET status = 'done' WHERE id = 3");
+    await db.query("COMMIT");
+    await db.query("BEGIN");
+    await db.query("ROLLBACK");
+
+    const lifecycle = events.filter((event) => event.k === "db.transaction");
+    expect(lifecycle.map((event) => event.d.outcome)).toEqual([
+      "open",
+      "commit",
+      "open",
+      "rollback",
+    ]);
+    expect(lifecycle[1].d.transactionId).toBe(lifecycle[0].d.transactionId);
+    const diff = events.find((event) => event.k === "db.diff")!;
+    expect(diff.d.transactionId).toBe(lifecycle[0].d.transactionId);
   });
 
   it("records a DELETE with the removed row as the before-image and no after", async () => {

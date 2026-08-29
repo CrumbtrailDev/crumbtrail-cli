@@ -21,6 +21,7 @@ describe("db.diff event kind", () => {
       pk: { id: 7 },
       after: { id: 7, name: "Ada" },
       requestId: "trace-abc",
+      durationMs: 12.5,
     };
     const event: BugEvent = {
       t: 1,
@@ -40,6 +41,7 @@ describe("db.diff event kind", () => {
       pk: { id: 1 },
       after: { id: 1 },
       requestId: "trace-1",
+      durationMs: 1,
     }));
     expect(events.map((d) => d.engine)).toEqual(engines);
   });
@@ -52,6 +54,7 @@ describe("db.diff event kind", () => {
       pk: null,
       rowCount: 12,
       requestId: "trace-abc",
+      durationMs: 3,
     };
     expect(d.pk).toBeNull();
     expect(d.rowCount).toBe(12);

@@ -3115,7 +3115,10 @@ function redactDatabaseEventValues(
     type !== "db.diff" &&
     type !== "db.read" &&
     type !== "db.diff.bulk" &&
-    type !== "db.read.bulk"
+    type !== "db.read.bulk" &&
+    type !== "db.statement" &&
+    type !== "db.error" &&
+    type !== "db.transaction"
   )
     return data;
   const output = { ...data };
@@ -3129,6 +3132,22 @@ function redactDatabaseEventValues(
     "values",
   ]) {
     if (key in output) output[key] = maskDatabaseValue(output[key]);
+  }
+  if ("connection" in output) {
+    const connection = asRecord(output.connection);
+    output.connection = connection
+      ? {
+          ...(connection.host !== undefined
+            ? { host: maskDatabaseValue(connection.host) }
+            : {}),
+          ...(connection.database !== undefined
+            ? { database: maskDatabaseValue(connection.database) }
+            : {}),
+          ...(connection.role === "primary" || connection.role === "replica"
+            ? { role: connection.role }
+            : {}),
+        }
+      : maskDatabaseValue(output.connection);
   }
   return output;
 }

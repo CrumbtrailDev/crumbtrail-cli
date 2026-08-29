@@ -66,6 +66,13 @@ function fakeSqliteDatabase(config: FakeConfig = {}) {
       statements.push(stmt);
       return stmt;
     },
+    transaction(fn: (...args: unknown[]) => unknown) {
+      const direct = (...args: unknown[]) => fn(...args);
+      direct.deferred = (...args: unknown[]) => fn(...args);
+      direct.immediate = (...args: unknown[]) => fn(...args);
+      direct.exclusive = (...args: unknown[]) => fn(...args);
+      return direct;
+    },
   };
   return db;
 }
@@ -647,5 +654,74 @@ describe("instrumentSqliteDatabase — never-fail guarantees", () => {
 
     const stmt = db.prepare({ toString: () => "weird" } as unknown as string);
     expect(stmt).toBe(fake.statements[fake.statements.length - 1]);
+  });
+
+  it("tracks transaction() and all three better-sqlite3 transaction modes", () => {
+    const fake = Object.assign(
+      fakeSqliteDatabase({
+        run: () => ({ changes: 1, lastInsertRowid: 7 }),
+        get: () => ({ id: 7, name: "Ada" }),
+      }),
+      { name: "/private/customer/path/catalog.sqlite" },
+    );
+    const ticks = [1, 4, 10, 14, 20, 25, 30, 36];
+    const events: BugEvent[] = [];
+    const db = instrumentSqliteDatabase(fake, {
+      requestId: "req-tx",
+      durationNow: () => ticks.shift() ?? 36,
+      emit: (event) => events.push(event),
+    });
+    const insert = db.transaction(() =>
+      db.prepare("INSERT INTO orders (name) VALUES (?)").run("Ada"),
+    );
+
+    insert();
+    insert.deferred();
+    insert.immediate();
+    insert.exclusive();
+
+    const lifecycle = events.filter((event) => event.k === "db.transaction");
+    expect(lifecycle.map((event) => event.d.outcome)).toEqual([
+      "open",
+      "commit",
+      "open",
+      "commit",
+      "open",
+      "commit",
+      "open",
+      "commit",
+    ]);
+    const diffs = events.filter((event) => event.k === "db.diff");
+    expect(diffs.map((event) => event.d.durationMs)).toEqual([3, 4, 5, 6]);
+    expect(diffs.map((event) => event.d.connection)).toEqual(
+      Array(4).fill({ host: "local", database: "catalog.sqlite" }),
+    );
+    expect(diffs.map((event) => event.d.transactionId)).toEqual([
+      lifecycle[0].d.transactionId,
+      lifecycle[2].d.transactionId,
+      lifecycle[4].d.transactionId,
+      lifecycle[6].d.transactionId,
+    ]);
+    expect(JSON.stringify(events)).not.toContain("/private/customer/path");
+  });
+
+  it("records a rolled-back better-sqlite3 transaction", () => {
+    const fake = fakeSqliteDatabase();
+    const events: BugEvent[] = [];
+    const db = instrumentSqliteDatabase(fake, {
+      requestId: "req-rollback",
+      emit: (event) => events.push(event),
+    });
+    const failure = new Error("abort");
+    const tx = db.transaction(() => {
+      throw failure;
+    });
+
+    expect(() => tx()).toThrow(failure);
+    expect(
+      events
+        .filter((event) => event.k === "db.transaction")
+        .map((event) => event.d.outcome),
+    ).toEqual(["open", "rollback"]);
   });
 });
