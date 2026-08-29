@@ -102,6 +102,41 @@ Fully synchronous — events are emitted before `run()` returns. Inserts are re-
 `lastInsertRowid`; UPDATE/DELETE images come from pre/post SELECTs by WHERE and primary key.
 `WITHOUT ROWID` tables and multi-row statements degrade to image-less diffs.
 
+`autoCapture` patches both the `better-sqlite3` default constructor and the CommonJS built-in
+`node:sqlite` `DatabaseSync` constructor. Node does not allow replacing an ESM named import of a
+built-in constructor. Apps that use `import { DatabaseSync } from "node:sqlite"` receive an
+`esm-unreachable` startup report and must pass the database to `instrumentSqliteDatabase()`.
+Positional binds, named-object binds, and the `run()` / `all()` / `get()` statement methods keep
+their native call shapes.
+
+## Failed statement classification
+
+A refused statement emits `k:'db.error'` with its normalized statement shape, driver code, and a
+stable `category`. Categories are `deadlock`, `unique_constraint`, `foreign_key_constraint`,
+`check_constraint`, `constraint_violation`, `serialization_failure`, `connection_loss`, and
+`unknown`.
+
+Classification reads Postgres SQLSTATE, MySQL errno and SQLSTATE, SQLite result codes, or SQL
+Server error numbers. It does not read error messages. SQL Server error 547 is
+`constraint_violation` because its number does not distinguish a foreign key from a check
+constraint. Missing or unrecognized codes are `unknown`. Error messages and bind values are not
+included in the event.
+
+## Pool pressure
+
+Completed checkouts emit `k:'db.pool.wait'` with `engine`, `waitMs`, and `requestId` for:
+
+- `pg` Pool `connect()`
+- `mysql2` Pool `getConnection()`
+- `mssql` ConnectionPool `acquire()`
+- postgres.js `reserve()`
+
+An `mssql` checkout rejected with the driver's `ETIMEOUT` code emits
+`k:'db.pool.timeout'`. The event includes elapsed wait time, the code, and the error class name,
+but not the error message. pg, mysql2, and postgres.js do not expose a stable code that uniquely
+identifies pool checkout timeout, so Crumbtrail records their completed waits but does not guess a
+timeout from message text.
+
 ## Capture completeness (gap records)
 
 Instrumentation never throws into your query, but when it cannot capture something on the

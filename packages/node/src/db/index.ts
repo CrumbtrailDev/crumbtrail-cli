@@ -27,6 +27,11 @@ export {
 export { buildDbDiffEvent, type BuildDbDiffEventInput } from "./diff-event";
 export { buildDbTransactionEvent } from "./transaction-event";
 export {
+  buildDbPoolWaitEvent,
+  buildDbPoolTimeoutEvent,
+  isPoolCheckoutTimeout,
+} from "./pool-event";
+export {
   buildDbReadBulkEvent,
   buildDbReadEvent,
   type BuildDbReadBulkEventInput,

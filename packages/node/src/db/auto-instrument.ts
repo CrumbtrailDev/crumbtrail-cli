@@ -32,6 +32,7 @@
  */
 
 import type { BugEvent } from "crumbtrail-core";
+import { createRequire } from "node:module";
 import { instrumentPgClient } from "./pg";
 import { instrumentMysqlClient } from "./mysql";
 import { instrumentSqliteDatabase } from "./sqlite";
@@ -55,6 +56,7 @@ export const AUTO_INSTRUMENT_DRIVERS = [
   "mysql2",
   "mysql2/promise",
   "better-sqlite3",
+  "node:sqlite",
   "mssql",
   "mongodb",
 ] as const;
@@ -218,6 +220,12 @@ function defaultResolve(specifier: string): unknown {
   return require(specifier);
 }
 
+/** Resolve a built-in without esbuild's ESM dynamic-require shim. */
+function defaultResolveBuiltinSqlite(): unknown {
+  const requireFromHost = createRequire(`${process.cwd()}/package.json`);
+  return requireFromHost("node:sqlite");
+}
+
 /** Per-driver patch plans. Each returns the statuses it produced. */
 /** Seams patchDriver needs that are not per-statement instrumentation options. */
 interface PatchContext {
@@ -311,6 +319,29 @@ function patchDriver(
         status: "unsupported-shape",
         detail: "no callable default export",
       };
+    }
+  } else if (driver === "node:sqlite") {
+    statuses.push(
+      patchFactory(
+        root,
+        "DatabaseSync",
+        (instance) =>
+          instrumentSqliteDatabase(
+            instance as Parameters<typeof instrumentSqliteDatabase>[0],
+            options,
+          ),
+        restorations,
+      ),
+    );
+    if (statuses[0] === "patched") {
+      if (context.hostIsEsm()) {
+        return {
+          driver: "node:sqlite",
+          status: "esm-unreachable",
+          detail:
+            "the app imports node:sqlite as an ES module, whose DatabaseSync binding cannot be replaced; call instrumentSqliteDatabase(db) on your database",
+        };
+      }
     }
   } else if (driver === "postgres") {
     return patchPostgresJs(moduleExports, mod, options, restorations, context);
@@ -515,12 +546,18 @@ export function autoInstrumentDbClients(
 ): AutoInstrumentReport {
   const {
     drivers = AUTO_INSTRUMENT_DRIVERS,
-    resolve = defaultResolve,
+    resolve: customResolve,
     replaceModule = defaultReplaceModule,
     hostIsEsm = defaultHostIsEsm,
     onReport,
     ...instrumentOptions
   } = options;
+  const resolve = customResolve ?? defaultResolve;
+  // A caller-supplied resolver remains the seam for every driver. Production
+  // uses createRequire for node:sqlite because bundled ESM cannot call the
+  // generic dynamic require shim even though the built-in is present.
+  const resolveBuiltinSqlite =
+    customResolve ?? (() => defaultResolveBuiltinSqlite());
 
   const context: PatchContext = { replaceModule, hostIsEsm };
   const restorations: Restoration[] = [];
@@ -529,7 +566,10 @@ export function autoInstrumentDbClients(
   for (const driver of drivers) {
     let moduleExports: unknown;
     try {
-      moduleExports = resolve(driver);
+      moduleExports =
+        driver === "node:sqlite"
+          ? resolveBuiltinSqlite(driver)
+          : resolve(driver);
     } catch (error) {
       // The overwhelmingly common case: the app does not use this driver. That
       // is not a problem and must not read like one.

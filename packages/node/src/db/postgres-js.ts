@@ -53,6 +53,7 @@ import {
   type ParsedRead,
 } from "./sql";
 import {
+  beginPoolCheckout,
   emitGap,
   emitDbDiffEvents,
   emitDbErrorEvent,
@@ -336,24 +337,34 @@ function wrapReserve(
   if (typeof original !== "function") return original;
   const originalFn = original as (...args: unknown[]) => unknown;
   return function (this: unknown, ...args: unknown[]): unknown {
+    const checkout = beginPoolCheckout(ENGINE, options);
     const result = originalFn.apply(sql, args);
-    if (!result || typeof (result as Promise<unknown>).then !== "function")
+    if (!result || typeof (result as Promise<unknown>).then !== "function") {
+      checkout.acquired();
       return result;
-    return (result as Promise<unknown>).then((reserved) => {
-      try {
-        if (typeof reserved === "function" && !isInstrumented(reserved)) {
-          return wrapSql(reserved as DuckTypedPostgresSql, options, counters, {
-            connection:
-              extractDbConnectionIdentity(ENGINE, reserved) ??
-              context.connection,
-            transaction: context.transaction,
-          });
+    }
+    return (result as Promise<unknown>).then(
+      (reserved) => {
+        checkout.acquired();
+        try {
+          if (typeof reserved === "function" && !isInstrumented(reserved)) {
+            return wrapSql(reserved as DuckTypedPostgresSql, options, counters, {
+              connection:
+                extractDbConnectionIdentity(ENGINE, reserved) ??
+                context.connection,
+              transaction: context.transaction,
+            });
+          }
+        } catch (error) {
+          emitGap(options, { reason: "uninstrumented_client", error });
         }
-      } catch (error) {
-        emitGap(options, { reason: "uninstrumented_client", error });
-      }
-      return reserved;
-    });
+        return reserved;
+      },
+      (error) => {
+        checkout.failed(error);
+        throw error;
+      },
+    );
   };
 }
 

@@ -1,5 +1,6 @@
 import { buildDbDiffEvent } from "./diff-event";
 import {
+  beginPoolCheckout,
   emitGap,
   emitDbEvent,
   emitDbDiffEvents,
@@ -40,6 +41,7 @@ import {
 export interface DuckTypedMysqlClient {
   query(sql: unknown, values?: unknown): Promise<unknown>;
   execute?(sql: unknown, values?: unknown): Promise<unknown>;
+  getConnection?(callback?: unknown): unknown;
   beginTransaction?(): Promise<unknown>;
   commit?(): Promise<unknown>;
   rollback?(): Promise<unknown>;
@@ -636,48 +638,67 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
 
   const wrappedQuery = makeInstrumented(rawQuery);
   const wrappedExecute = rawExecute ? makeInstrumented(rawExecute) : undefined;
+  const rawGetConnection = client.getConnection;
+  const wrappedGetConnection =
+    typeof rawGetConnection === "function"
+      ? (...args: unknown[]): unknown => {
+          const checkout = beginPoolCheckout(ENGINE, options);
+          const callback = args[0];
+          if (typeof callback === "function") {
+            return (rawGetConnection as (...values: unknown[]) => unknown).call(
+              client,
+              (error: unknown, connection: unknown) => {
+                if (error || connection == null) {
+                  checkout.failed(error);
+                  return callback(error, connection);
+                }
+                checkout.acquired();
+                return callback(
+                  error,
+                  instrumentAcquiredMysqlClient(connection, options),
+                );
+              },
+            );
+          }
+          const result = (
+            rawGetConnection as (...values: unknown[]) => unknown
+          ).apply(client, args);
+          if (
+            !result ||
+            typeof (result as Promise<unknown>).then !== "function"
+          ) {
+            checkout.acquired();
+            return result;
+          }
+          return (result as Promise<unknown>).then(
+            (connection) => {
+              checkout.acquired();
+              return instrumentAcquiredMysqlClient(connection, options);
+            },
+            (error) => {
+              checkout.failed(error);
+              throw error;
+            },
+          );
+        }
+      : undefined;
+
+  // mysql2 Pool.query() checks out through `this.getConnection()`. Patching the
+  // pool method covers those implicit waits as well as explicit checkouts.
+  if (wrappedGetConnection) {
+    try {
+      client.getConnection = wrappedGetConnection;
+    } catch {
+      // Explicit calls through the returned Proxy remain covered.
+    }
+  }
 
   return new Proxy(client, {
     get(target, prop, receiver) {
       if (prop === "query") return wrappedQuery;
       if (prop === "execute" && wrappedExecute) return wrappedExecute;
-      if (prop === "getConnection") {
-        const method = Reflect.get(target, prop, receiver);
-        if (typeof method !== "function") return method;
-        return (...args: unknown[]) => {
-          const callbackIndex = args.findIndex(
-            (arg) => typeof arg === "function",
-          );
-          if (callbackIndex >= 0) {
-            const callback = args[callbackIndex] as (
-              ...values: unknown[]
-            ) => unknown;
-            const next = [...args];
-            next[callbackIndex] = (error: unknown, acquired: unknown) =>
-              callback(
-                error,
-                error || !acquired
-                  ? acquired
-                  : instrumentAcquiredMysqlClient(acquired, options),
-              );
-            return (method as (...values: unknown[]) => unknown).apply(
-              target,
-              next,
-            );
-          }
-          const result = (method as (...values: unknown[]) => unknown).apply(
-            target,
-            args,
-          );
-          if (
-            !result ||
-            typeof (result as Promise<unknown>).then !== "function"
-          )
-            return result;
-          return (result as Promise<unknown>).then((acquired) =>
-            instrumentAcquiredMysqlClient(acquired, options),
-          );
-        };
+      if (prop === "getConnection" && wrappedGetConnection) {
+        return wrappedGetConnection;
       }
       if (
         prop === "beginTransaction" ||

@@ -10,6 +10,7 @@ import {
 import {
   emitGap,
   emitDbDiffEvents,
+  emitDbErrorEvent,
   emitDbReadEvents,
   emitImagelessDbDiff,
   extractDbConnectionIdentity,
@@ -35,7 +36,6 @@ export interface DuckTypedSqliteStatement {
   run(...params: unknown[]): unknown;
   all(...params: unknown[]): unknown;
   get(...params: unknown[]): unknown;
-  [key: string]: unknown;
 }
 
 export interface DuckTypedSqliteRunResult {
@@ -46,7 +46,6 @@ export interface DuckTypedSqliteRunResult {
 /** Minimal duck-typed view of a better-sqlite3 / `node:sqlite` database: `prepare(sql)` → statement. */
 export interface DuckTypedSqliteDatabase {
   prepare(sql: unknown, ...rest: unknown[]): DuckTypedSqliteStatement;
-  [key: string]: unknown;
 }
 
 const ENGINE = "sqlite" as const;
@@ -392,6 +391,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     realStmt: DuckTypedSqliteStatement,
     parsed: ParsedMutation,
     args: unknown[],
+    statement: string,
   ): unknown => {
     // Correlation resolution is diff-capture work; if it throws or is absent, run the host mutation
     // untouched. Instrumentation must never decide whether — or how — the host's query runs.
@@ -404,42 +404,76 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     }
     if (!requestId) return realStmt.run(...args);
 
-    switch (parsed.op) {
-      case "insert":
-        return handleInsert(realStmt, parsed, args, requestId);
-      case "update":
-        return handleUpdate(realStmt, parsed, args, requestId);
-      case "delete":
-        return handleDelete(realStmt, parsed, args, requestId);
-      default:
-        return realStmt.run(...args);
+    try {
+      switch (parsed.op) {
+        case "insert":
+          return handleInsert(realStmt, parsed, args, requestId);
+        case "update":
+          return handleUpdate(realStmt, parsed, args, requestId);
+        case "delete":
+          return handleDelete(realStmt, parsed, args, requestId);
+        default:
+          return realStmt.run(...args);
+      }
+    } catch (error) {
+      emitDbErrorEvent({
+        engine: ENGINE,
+        op: parsed.op,
+        table: parsed.table,
+        statement,
+        requestId,
+        error,
+        options,
+      });
+      throw error;
     }
   };
 
-  const instrumentedAll = (
+  const instrumentedRead = (
     realStmt: DuckTypedSqliteStatement,
     parsedRead: ParsedRead,
     args: unknown[],
     statement: string,
+    method: "all" | "get",
   ): unknown => {
-    // The host read runs exactly once; its result is returned unchanged.
-    const elapsed = startDbQueryTimer(options);
-    const result = realStmt.all(...args);
-    const context: DbStatementContext = {
-      connection,
-      durationMs: elapsed(),
-      transactionId: transaction?.id,
-    };
     let requestId: string | undefined;
     try {
       requestId = resolveRequestId();
     } catch (error) {
       emitGap(options, { reason: "capture_exception", error });
-      return result;
+      return realStmt[method](...args);
     }
-    if (!requestId) return result;
+    // The host read runs exactly once; its result is returned unchanged.
+    const elapsed = startDbQueryTimer(options);
+    let result: unknown;
     try {
-      const rows = (Array.isArray(result) ? result : []).filter(isRecord);
+      result = realStmt[method](...args);
+    } catch (error) {
+      if (requestId) {
+        emitDbErrorEvent({
+          engine: ENGINE,
+          op: "select",
+          table: parsedRead.table,
+          statement,
+          requestId,
+          error,
+          options,
+        });
+      }
+      throw error;
+    }
+    const context: DbStatementContext = {
+      connection,
+      durationMs: elapsed(),
+      transactionId: transaction?.id,
+    };
+    // Preserve the existing read-capture boundary: `.all()` emits row evidence;
+    // `.get()` is wrapped only so a refused SELECT is no longer invisible.
+    if (!requestId || !options.captureReads || method === "get") return result;
+    try {
+      const rows = (
+        Array.isArray(result) ? result : isRecord(result) ? [result] : []
+      ).filter(isRecord);
       emitDbReadEvents({
         engine: ENGINE,
         table: parsedRead.table,
@@ -468,11 +502,12 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     new Proxy(stmt, {
       get(target, prop, _receiver) {
         if (prop === "run" && parsed) {
-          return (...args: unknown[]) => instrumentedRun(target, parsed, args);
-        }
-        if (prop === "all" && parsedRead && options.captureReads) {
           return (...args: unknown[]) =>
-            instrumentedAll(target, parsedRead, args, statement);
+            instrumentedRun(target, parsed, args, statement);
+        }
+        if ((prop === "all" || prop === "get") && parsedRead) {
+          return (...args: unknown[]) =>
+            instrumentedRead(target, parsedRead, args, statement, prop);
         }
         // `target` (not `receiver`) as the `this` binding: accessor properties (e.g. node:sqlite's
         // native `sourceSQL` getter) must run against the real statement, not this Proxy.
@@ -551,10 +586,32 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
       if (prop === "prepare") {
         return (...prepareArgs: unknown[]): DuckTypedSqliteStatement => {
           // The host prepare runs and its errors propagate; parsing is separate best-effort work.
-          const realStmt = target.prepare(
-            ...(prepareArgs as [unknown, ...unknown[]]),
-          );
           const sql = prepareArgs[0];
+          let realStmt: DuckTypedSqliteStatement;
+          try {
+            realStmt = target.prepare(
+              ...(prepareArgs as [unknown, ...unknown[]]),
+            );
+          } catch (error) {
+            let requestId: string | undefined;
+            try {
+              requestId = resolveRequestId();
+            } catch {
+              requestId = undefined;
+            }
+            if (requestId && typeof sql === "string") {
+              emitDbErrorEvent({
+                engine: ENGINE,
+                op: "other",
+                table: null,
+                statement: sql,
+                requestId,
+                error,
+                options,
+              });
+            }
+            throw error;
+          }
           if (typeof sql !== "string") return realStmt;
           let parsed: ParsedMutation | undefined;
           let parsedRead: ParsedRead | undefined;

@@ -9,6 +9,7 @@ import {
   type ParsedRead,
 } from "./sql";
 import {
+  beginPoolCheckout,
   emitGap,
   emitDbDiffEvents,
   emitDbErrorEvent,
@@ -374,13 +375,11 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
     return result;
   };
 
-  return new Proxy(client, {
-    get(target, prop, receiver) {
-      if (prop === "query") return wrappedQuery;
-      if (prop === "connect") {
-        const connect = Reflect.get(target, prop, receiver);
-        if (typeof connect !== "function") return connect;
-        return (...args: unknown[]) => {
+  const rawConnect = (client as unknown as { connect?: unknown }).connect;
+  const connectWithCapture = (instrumentAcquired: boolean) =>
+    typeof rawConnect === "function"
+      ? (...args: unknown[]): unknown => {
+          const checkout = beginPoolCheckout(ENGINE, options);
           const callback = args[0];
           if (typeof callback === "function") {
             const wrappedCallback = (
@@ -388,25 +387,66 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
               acquired: unknown,
               release: unknown,
             ) => {
-              if (error || acquired == null) {
-                return callback(error, acquired, release);
-              }
+              if (error || acquired == null) checkout.failed(error);
+              else checkout.acquired();
               return callback(
                 error,
-                instrumentAcquiredClient(acquired, options),
+                error || acquired == null || !instrumentAcquired
+                  ? acquired
+                  : instrumentAcquiredClient(acquired, options),
                 release,
               );
             };
-            return (connect as (...values: unknown[]) => unknown).apply(
-              target,
+            return (rawConnect as (...values: unknown[]) => unknown).apply(
+              client,
               [wrappedCallback],
             );
           }
+          const result = (
+            rawConnect as (...values: unknown[]) => unknown
+          ).apply(client, args);
+          if (
+            !result ||
+            typeof (result as Promise<unknown>).then !== "function"
+          ) {
+            checkout.acquired();
+            return instrumentAcquired
+              ? instrumentAcquiredClient(result, options)
+              : result;
+          }
+          return (result as Promise<unknown>).then(
+            (acquired) => {
+              checkout.acquired();
+              return instrumentAcquired
+                ? instrumentAcquiredClient(acquired, options)
+                : acquired;
+            },
+            (error) => {
+              checkout.failed(error);
+              throw error;
+            },
+          );
+        }
+      : undefined;
+  const wrappedConnect = connectWithCapture(true);
+  const internalConnect = connectWithCapture(false);
 
-          return Promise.resolve(
-            (connect as (...values: unknown[]) => unknown).apply(target, args),
-          ).then((acquired) => instrumentAcquiredClient(acquired, options));
-        };
+  // pg Pool.query() calls `this.connect()` internally. Install the wrapper on
+  // the pool itself so pressure is visible for both direct pool queries and
+  // explicit checkouts, not only calls made through this Proxy.
+  if (internalConnect) {
+    try {
+      (client as unknown as { connect: unknown }).connect = internalConnect;
+    } catch {
+      // The Proxy still covers explicit `instrumented.connect()` calls.
+    }
+  }
+
+  return new Proxy(client, {
+    get(target, prop, receiver) {
+      if (prop === "query") return wrappedQuery;
+      if (prop === "connect") {
+        return wrappedConnect ?? Reflect.get(target, prop, receiver);
       }
       const value = Reflect.get(target, prop, receiver);
       return typeof value === "function" ? value.bind(target) : value;
