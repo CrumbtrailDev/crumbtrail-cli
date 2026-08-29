@@ -1,5 +1,12 @@
 import { buildCaptureGapEvent, type BugEvent } from "crumbtrail-core";
 import {
+  autoInstrumentCacheClients,
+  autoInstrumentCachePatchedAnything,
+  formatAutoInstrumentCacheReport,
+  type AutoInstrumentCacheDriver,
+  type AutoInstrumentCacheReport,
+} from "./cache/auto-instrument";
+import {
   HeadlessRequestError,
   startHeadlessSession,
   type HeadlessSession,
@@ -155,6 +162,15 @@ export interface AutoCaptureOptions {
   databaseDrivers?: readonly AutoInstrumentDriver[];
   /** Module resolver seam for auto-instrumentation (tests). */
   databaseResolve?: (specifier: string) => unknown;
+  /**
+   * When true (default) wrap ioredis and node-redis clients created after startup so request-scoped
+   * cache reads, writes, and invalidations emit `cache` evidence.
+   */
+  instrumentCaches?: boolean;
+  /** Restrict cache auto-instrumentation to specific drivers. Absent means both known drivers. */
+  cacheDrivers?: readonly AutoInstrumentCacheDriver[];
+  /** Module resolver seam for cache auto-instrumentation (tests). */
+  cacheResolve?: (specifier: string) => unknown;
   /**
    * When true (default) record Node runtime warnings (`process.on("warning")`)
    * as `backend.warning` events. This is the only path by which a
@@ -747,6 +763,29 @@ export async function autoCapture(
     }
   }
 
+  let cacheInstrumentation: AutoInstrumentCacheReport | undefined;
+  if (options.instrumentCaches !== false) {
+    try {
+      cacheInstrumentation = autoInstrumentCacheClients({
+        emit: emitSessionEvent,
+        // Cache and database evidence read the same AsyncLocalStorage request scope, so their
+        // requestId joins without a second correlation scheme.
+        getRequestId: dbSink.getRequestId,
+        drivers: options.cacheDrivers,
+        resolve: options.cacheResolve,
+      });
+      const line = formatAutoInstrumentCacheReport(cacheInstrumentation);
+      if (
+        line &&
+        (debug || !autoInstrumentCachePatchedAnything(cacheInstrumentation))
+      ) {
+        originalConsoleError.call(consoleRef, line);
+      }
+    } catch (error) {
+      emitError(error, { phase: "record", source: "console.error" });
+    }
+  }
+
   // Boot: attempt the initial handshake. On failure the hooks still install so
   // the host's crash semantics stay intact and a later capture can self-heal.
   await ensureSession();
@@ -1296,6 +1335,7 @@ export async function autoCapture(
     outboundCapture?.stop();
     clearActiveDbSink(dbSink);
     dbInstrumentation?.restore();
+    cacheInstrumentation?.restore();
     installed = false;
     installedService = undefined;
   };

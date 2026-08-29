@@ -37,8 +37,10 @@ import { instrumentMysqlClient } from "./mysql";
 import { instrumentSqliteDatabase } from "./sqlite";
 import { instrumentMssqlPool } from "./mssql";
 import { instrumentPostgresSql } from "./postgres-js";
+import { enableMongoCommandMonitoring, instrumentMongoClient } from "./mongo";
 import { instrumentNeonHttpQuery } from "./neon-http";
 import { instrumentPlanetScaleClient } from "./planetscale";
+import { instrumentPrismaClient } from "./prisma";
 import type { InstrumentDbClientOptions } from "./instrument-shared";
 
 /** Marks an already-wrapped factory so a second install is a no-op. */
@@ -46,6 +48,7 @@ const PATCHED = Symbol.for("crumbtrail.db.autoInstrumented");
 
 /** Drivers this module knows how to wrap, in the order they are attempted. */
 export const AUTO_INSTRUMENT_DRIVERS = [
+  "@prisma/client",
   "pg",
   // porsager/postgres. Attempted before mysql2 for the same reason `pg` is
   // first: a Postgres app is the common case, and the two Postgres drivers are
@@ -57,6 +60,7 @@ export const AUTO_INSTRUMENT_DRIVERS = [
   "mysql2/promise",
   "better-sqlite3",
   "mssql",
+  "mongodb",
 ] as const;
 
 export type AutoInstrumentDriver = (typeof AUTO_INSTRUMENT_DRIVERS)[number];
@@ -155,6 +159,7 @@ function patchFactory(
   key: string,
   wrap: (instance: unknown) => unknown,
   restorations: Restoration[],
+  prepareArgs?: (args: readonly unknown[]) => unknown[],
 ): "patched" | "already-patched" | "unsupported-shape" {
   const original = target[key];
   if (isPatched(original)) return "already-patched";
@@ -163,17 +168,18 @@ function patchFactory(
   const originalFn = original as (...args: unknown[]) => unknown;
 
   function Patched(this: unknown, ...args: unknown[]): unknown {
+    const callArgs = prepareArgs ? prepareArgs(args) : args;
     // `new pg.Pool()` — construct, then wrap the instance.
     if (new.target) {
       const instance = Reflect.construct(
         originalFn,
-        args,
+        callArgs,
         new.target === Patched ? originalFn : new.target,
       );
       return wrap(instance);
     }
     // `mysql.createPool()` — plain call.
-    const result = originalFn.apply(this, args);
+    const result = originalFn.apply(this, callArgs);
     // A factory that returns a promise (mysql2/promise) resolves to the client.
     if (result && typeof (result as Promise<unknown>).then === "function") {
       return (result as Promise<unknown>).then(wrap);
@@ -258,6 +264,19 @@ function patchDriver(
         ),
       );
     }
+  } else if (driver === "@prisma/client") {
+    statuses.push(
+      patchFactory(
+        root,
+        "PrismaClient",
+        (instance) =>
+          instrumentPrismaClient(
+            instance as Parameters<typeof instrumentPrismaClient>[0],
+            options,
+          ),
+        restorations,
+      ),
+    );
   } else if (driver === "mysql2" || driver === "mysql2/promise") {
     for (const key of ["createConnection", "createPool"]) {
       statuses.push(
@@ -344,6 +363,20 @@ function patchDriver(
             options,
           ),
         restorations,
+      ),
+    );
+  } else if (driver === "mongodb") {
+    statuses.push(
+      patchFactory(
+        root,
+        "MongoClient",
+        (instance) =>
+          instrumentMongoClient(
+            instance as Parameters<typeof instrumentMongoClient>[0],
+            options,
+          ),
+        restorations,
+        enableMongoCommandMonitoring,
       ),
     );
   }

@@ -46,6 +46,19 @@ export {
   type DuckTypedPlanetScaleResult,
 } from "./planetscale";
 export {
+  enableMongoCommandMonitoring,
+  instrumentMongoClient,
+  MONGO_DOCUMENT_BOUNDS,
+  MONGO_IMAGE_UNAVAILABLE,
+  type DuckTypedMongoClient,
+} from "./mongo";
+export {
+  instrumentPrismaClient,
+  type DuckTypedPrismaClient,
+  type DuckTypedPrismaExtension,
+  type DuckTypedPrismaQueryInput,
+} from "./prisma";
+export {
   instrumentPgClient,
   parseMutation,
   parseRead,
