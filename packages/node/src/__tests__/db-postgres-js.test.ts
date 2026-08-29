@@ -20,7 +20,9 @@ interface FakeSql {
   (...args: unknown[]): FakeQuery;
   unsafe: (text: string, params?: unknown[]) => FakeQuery;
   begin: (fn: (tx: FakeSql) => unknown) => unknown;
+  savepoint: (fn: (tx: FakeSql) => unknown) => unknown;
   reserve: () => Promise<FakeSql>;
+  options?: Record<string, unknown>;
   /** Every query the fake driver was asked to build, newest last. */
   built: FakeQuery[];
 }
@@ -50,9 +52,9 @@ function makeSql(): FakeSql {
     return build([...strings], args.slice(1));
   }) as FakeSql;
   sql.built = built;
-  sql.unsafe = (text: string, params: unknown[] = []) =>
-    build([text], params);
-  sql.begin = (fn) => fn(makeSql());
+  sql.unsafe = (text: string, params: unknown[] = []) => build([text], params);
+  sql.begin = async (fn) => fn(makeSql());
+  sql.savepoint = async (fn) => fn(makeSql());
   sql.reserve = async () => makeSql();
   return sql;
 }
@@ -103,8 +105,7 @@ describe("instrumentPostgresSql", () => {
     expect(query.strings[query.strings.length - 1]).toBe(" RETURNING *");
 
     settle(query, [{ id: 7, total_cents: 500 }], {
-      string:
-        "update carts set total_cents = $1 where id = $2 RETURNING *",
+      string: "update carts set total_cents = $1 where id = $2 RETURNING *",
     });
     await query.settled;
 
@@ -170,7 +171,7 @@ describe("instrumentPostgresSql", () => {
     const sql = instrumentPostgresSql(raw, options(events));
 
     let inner!: FakeQuery;
-    (sql as unknown as FakeSql).begin((tx) => {
+    const committed = (sql as unknown as FakeSql).begin((tx) => {
       inner = tx(
         tag(["delete from sessions where id = ", ""]),
         "abc",
@@ -182,10 +183,95 @@ describe("instrumentPostgresSql", () => {
       string: "delete from sessions where id = $1 RETURNING *",
     });
     await inner.settled;
+    await committed;
 
     const diff = events.find((e) => e.k === "db.diff");
     expect(diff?.d.op).toBe("delete");
     expect(diff?.d.table).toBe("sessions");
+    const lifecycle = events.filter((event) => event.k === "db.transaction");
+    expect(lifecycle.map((event) => event.d.outcome)).toEqual([
+      "open",
+      "commit",
+    ]);
+    expect(diff?.d.transactionId).toBe(lifecycle[0].d.transactionId);
+  });
+
+  it("records rollback when sql.begin rejects", async () => {
+    const events: BugEvent[] = [];
+    const raw = makeSql();
+    const sql = instrumentPostgresSql(raw, options(events));
+    const failure = new Error("abort");
+
+    await expect(
+      (sql as unknown as FakeSql).begin(() => {
+        throw failure;
+      }),
+    ).rejects.toBe(failure);
+
+    const lifecycle = events.filter((event) => event.k === "db.transaction");
+    expect(lifecycle.map((event) => event.d.outcome)).toEqual([
+      "open",
+      "rollback",
+    ]);
+  });
+
+  it("keeps postgres.js savepoint statements on the outer transaction", async () => {
+    const events: BugEvent[] = [];
+    const raw = makeSql();
+    const sql = instrumentPostgresSql(raw, options(events));
+
+    await (sql as unknown as FakeSql).begin(async (tx) => {
+      await tx.savepoint(async (scoped) => {
+        const query = scoped(
+          tag(["update carts set total_cents = 0 where id = 7"]),
+        );
+        settle(query, [{ id: 7, total_cents: 0 }], {
+          string: "update carts set total_cents = 0 where id = 7 RETURNING *",
+        });
+        await query.settled;
+      });
+    });
+
+    const lifecycle = events.filter((event) => event.k === "db.transaction");
+    expect(lifecycle.map((event) => event.d.outcome)).toEqual([
+      "open",
+      "commit",
+    ]);
+    expect(events.find((event) => event.k === "db.diff")?.d.transactionId).toBe(
+      lifecycle[0].d.transactionId,
+    );
+  });
+
+  it("records duration and connection identity from postgres.js options", async () => {
+    const events: BugEvent[] = [];
+    const raw = makeSql();
+    raw.options = {
+      host: ["replica.pg.internal"],
+      database: "catalog",
+      target_session_attrs: "read-only",
+      password: "must-not-leak",
+    };
+    const ticks = [5, 14];
+    const sql = instrumentPostgresSql(
+      raw,
+      options(events, {
+        captureReads: true,
+        durationNow: () => ticks.shift() ?? 14,
+      }),
+    );
+
+    const query = sql(tag(["select * from products"])) as FakeQuery;
+    settle(query, [{ id: 1 }], { string: "select * from products" });
+    await query.settled;
+
+    const statement = events.find((event) => event.k === "db.statement")!;
+    expect(statement.d.connection).toEqual({
+      host: "replica.pg.internal",
+      database: "catalog",
+      role: "replica",
+    });
+    expect(JSON.stringify(statement)).not.toContain("must-not-leak");
+    expect(events.find((event) => event.k === "db.read")?.d.durationMs).toBe(9);
   });
 
   it("records reads through sql.unsafe when captureReads is on", async () => {

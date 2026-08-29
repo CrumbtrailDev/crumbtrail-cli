@@ -651,4 +651,52 @@ describe("instrumentMysqlClient safety", () => {
     expect(insert?.method).toBe("execute");
     expect(select?.method).toBe("query");
   });
+
+  it("tracks mysql2 transaction outcome, duration, and connection identity", async () => {
+    const base = fakeMysqlClient((sql) =>
+      /^insert/i.test(sql)
+        ? [{ affectedRows: 1, insertId: 4 }, undefined]
+        : [[{ id: 4, name: "Ada" }], []],
+    );
+    const client = Object.assign(base, {
+      config: {
+        connectionConfig: {
+          host: "mysql-primary.internal",
+          database: "orders",
+          password: "must-not-leak",
+        },
+      },
+      beginTransaction: async () => undefined,
+      commit: async () => undefined,
+      rollback: async () => undefined,
+    });
+    const ticks = [20, 27.25];
+    const events: BugEvent[] = [];
+    const db = instrumentMysqlClient(client, {
+      requestId: "req-tx",
+      durationNow: () => ticks.shift() ?? 27.25,
+      emit: (event) => events.push(event),
+    });
+
+    await db.beginTransaction();
+    await db.query("INSERT INTO orders (name) VALUES (?)", ["Ada"]);
+    await db.commit();
+    await db.beginTransaction();
+    await db.rollback();
+
+    const lifecycle = events.filter((event) => event.k === "db.transaction");
+    expect(lifecycle.map((event) => event.d.outcome)).toEqual([
+      "open",
+      "commit",
+      "open",
+      "rollback",
+    ]);
+    const diff = events.find((event) => event.k === "db.diff")!;
+    expect(diff.d).toMatchObject({
+      durationMs: 7.25,
+      transactionId: lifecycle[0].d.transactionId,
+      connection: { host: "mysql-primary.internal", database: "orders" },
+    });
+    expect(JSON.stringify(events)).not.toContain("must-not-leak");
+  });
 });
