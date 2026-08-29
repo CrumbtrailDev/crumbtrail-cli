@@ -2,6 +2,7 @@ import {
   DB_DIFF_EVENT_KIND,
   mergeRedactionMetadata,
   type BugEvent,
+  type DbBeforeImageStatus,
   type DbDiffEventData,
   type DbDiffOp,
   type DbEngine,
@@ -20,6 +21,8 @@ export interface BuildDbDiffEventInput {
   after?: Record<string, unknown>;
   /** Pre-image of the affected row (deletes, or updates with before-capture enabled). */
   before?: Record<string, unknown>;
+  /** Explicit completeness state when a full before-image could not be captured. */
+  beforeImageStatus?: DbBeforeImageStatus;
   /** Set only on image-less statement-level fallback events (pk `null`, no after/before). */
   rowCount?: number;
   /** Correlation id; MUST equal the active request's traceId/requestId. */
@@ -100,6 +103,9 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     requestId: input.requestId,
     ...(boundedAfter !== undefined ? { after: boundedAfter } : {}),
     ...(boundedBefore !== undefined ? { before: boundedBefore } : {}),
+    ...(input.beforeImageStatus !== undefined
+      ? { beforeImageStatus: input.beforeImageStatus }
+      : {}),
     ...(input.rowCount !== undefined ? { rowCount: input.rowCount } : {}),
     // Not redacted: a callsite is the host's own source path and line, which is
     // the one thing in the event that is definitionally not user data.

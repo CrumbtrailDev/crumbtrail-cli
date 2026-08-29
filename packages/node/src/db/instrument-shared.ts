@@ -3,6 +3,7 @@ import {
   DB_DIFF_BULK_EVENT_KIND,
   type BugEvent,
   type CaptureGapEventData,
+  type DbBeforeImageStatus,
   type DbDiffBulkEventData,
   type DbDiffOp,
   type DbEngine,
@@ -418,12 +419,23 @@ export function emitDbDiffEvents(input: {
   rows: Array<Record<string, unknown>>;
   /** Pre-image lookup by pk for updates with before-capture enabled. */
   beforeByPk?: Map<string, Record<string, unknown>>;
+  /** Explicit completeness state when a full before-image could not be captured. */
+  beforeImageStatus?: DbBeforeImageStatus;
   /** Total rows the statement changed (may exceed `rows.length` when the driver reports more). */
   rowCount: number;
   options: InstrumentDbClientOptions;
 }): void {
-  const { engine, op, table, requestId, rows, beforeByPk, rowCount, options } =
-    input;
+  const {
+    engine,
+    op,
+    table,
+    requestId,
+    rows,
+    beforeByPk,
+    beforeImageStatus,
+    rowCount,
+    options,
+  } = input;
   const maxRows = normalizeMaxRowsPerStatement(options.maxRowsPerStatement);
   const emittedRows = Math.min(rows.length, maxRows);
   const emitRows = rows.slice(0, emittedRows);
@@ -447,6 +459,7 @@ export function emitDbDiffEvents(input: {
         : undefined,
       now: options.now?.(),
       sessionStartedAt: options.sessionStartedAt,
+      beforeImageStatus,
       ...(op === "delete"
         ? { before: row }
         : { after: row, before: beforeByPk?.get(pkKey(pk)) }),
@@ -495,9 +508,12 @@ export function emitImagelessDbDiff(input: {
   table: string;
   requestId: string;
   rowCount: number;
+  /** Explicit completeness state when a full before-image could not be captured. */
+  beforeImageStatus?: DbBeforeImageStatus;
   options: InstrumentDbClientOptions;
 }): void {
-  const { engine, op, table, requestId, rowCount, options } = input;
+  const { engine, op, table, requestId, rowCount, beforeImageStatus, options } =
+    input;
   if (
     !emitDbEvent(
       options,
@@ -507,6 +523,7 @@ export function emitImagelessDbDiff(input: {
         table,
         pk: null,
         rowCount,
+        beforeImageStatus,
         requestId,
         sessionId: options.sessionId,
         redactColumns: options.redactColumns,

@@ -36,6 +36,12 @@ export {
   type DuckTypedPostgresSql,
 } from "./postgres-js";
 export {
+  instrumentPrismaClient,
+  type DuckTypedPrismaClient,
+  type DuckTypedPrismaExtension,
+  type DuckTypedPrismaQueryInput,
+} from "./prisma";
+export {
   instrumentPgClient,
   parseMutation,
   parseRead,
