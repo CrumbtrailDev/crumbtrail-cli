@@ -1,6 +1,29 @@
 export { captureDbCallsite, type DbCallsite } from "./db/callsite";
 
 export {
+  CACHE_EVENT_KIND,
+  AUTO_INSTRUMENT_CACHE_DRIVERS,
+  autoInstrumentCacheClients,
+  autoInstrumentCachePatchedAnything,
+  buildCacheEvent,
+  formatAutoInstrumentCacheReport,
+  instrumentIoredisClient,
+  instrumentNodeRedisClient,
+} from "./cache";
+
+export type {
+  BuildCacheEventInput,
+  AutoInstrumentCacheDriver,
+  AutoInstrumentCacheDriverResult,
+  AutoInstrumentCacheOptions,
+  AutoInstrumentCacheReport,
+  CacheDriver,
+  CacheEventData,
+  DuckTypedCacheClient,
+  InstrumentCacheClientOptions,
+} from "./cache";
+
+export {
   buildDbDiffEvent,
   buildDbReadBulkEvent,
   buildDbReadEvent,

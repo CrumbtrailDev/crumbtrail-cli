@@ -285,14 +285,29 @@ export interface CaptureGapEventData {
 }
 
 /** Mutating operation a `db.diff` event records. */
-export type DbDiffOp = "insert" | "update" | "delete";
+export type DbDiffOp = "insert" | "update" | "delete" | "upsert";
 
 /**
  * Database engine that produced a `db.diff` / `db.read` event. Downstream consumers (evidence
  * index, fix-context, comparator) treat every engine identically — the engine tag exists so
  * agents and humans know which dialect the captured statement ran against.
  */
-export type DbEngine = "postgres" | "mysql" | "mssql" | "sqlite";
+export type DbEngine = "postgres" | "mysql" | "mssql" | "sqlite" | "prisma";
+
+/** Why a Prisma mutation could not carry a complete pre-mutation row image. */
+export type DbBeforeImageStatus =
+  | {
+      status: "partial";
+      reason: "prisma_result_selection" | "prisma_raw_result_selection";
+    }
+  | {
+      status: "unavailable";
+      reason:
+        | "prisma_extension_no_transaction_context"
+        | "prisma_bulk_result_no_row_images"
+        | "prisma_raw_result_no_row_images"
+        | "prisma_upsert_branch_unknown";
+    };
 
 /** Configuration-derived database endpoint identity. Credentials are never retained. */
 export interface DbConnectionIdentity {
@@ -340,6 +355,8 @@ export interface DbDiffEventData {
   after?: Record<string, unknown>;
   /** Pre-image of the affected row; only captured behind the before-capture flag (and for deletes). */
   before?: Record<string, unknown>;
+  /** Explicit completeness state when Prisma could not supply a full before-image. */
+  beforeImageStatus?: DbBeforeImageStatus;
   /**
    * Present only on an image-less statement-level fallback event where per-row images were
    * unobtainable (e.g. a MySQL multi-row insert). Such events carry `pk: null` and no
@@ -435,7 +452,8 @@ export interface DbReadBulkEventData {
 }
 
 /** Operation a `db.error` event records. Wider than `DbDiffOp`: a read can raise too. */
-export type DbErrorOp = "select" | "insert" | "update" | "delete" | "other";
+export type DbErrorOp =
+  "select" | "insert" | "update" | "delete" | "upsert" | "other";
 
 /**
  * Type-specific payload (`d`) of a `k:'db.error'` event: one statement that the host issued and

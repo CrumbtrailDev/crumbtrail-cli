@@ -69,6 +69,7 @@ export type {
   DbDiffBulkEventData,
   DbDiffOp,
   DbEngine,
+  DbBeforeImageStatus,
   DbReadBulkEventData,
   DbReadEventData,
   DbErrorEventData,

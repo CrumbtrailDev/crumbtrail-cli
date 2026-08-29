@@ -10,7 +10,7 @@ import {
 } from "crumbtrail-core";
 import type { DbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
-import { boundColumnRow } from "./diff-event";
+import { boundColumnRow, type DbValueBounds } from "./diff-event";
 
 export interface BuildDbReadEventInput {
   /** Engine that produced the read. Defaults to `"postgres"` for back-compat. */
@@ -34,6 +34,8 @@ export interface BuildDbReadEventInput {
   redactColumns?: readonly string[];
   now?: number;
   sessionStartedAt?: number | Date;
+  /** Optional nested-value bounds applied after redaction. */
+  valueBounds?: DbValueBounds;
 }
 
 export interface BuildDbReadBulkEventInput {
@@ -59,10 +61,12 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
     ? redactColumns(input.pk, sensitive, "db.read.pk")
     : { value: null as Record<string, unknown> | null, metadata: undefined };
 
-  const boundedRow = boundColumnRow(row.value) ?? {};
+  const boundedRow = boundColumnRow(row.value, input.valueBounds) ?? {};
   const boundedPk =
-    boundColumnRow((pk.value as Record<string, unknown> | null) ?? undefined) ??
-    null;
+    boundColumnRow(
+      (pk.value as Record<string, unknown> | null) ?? undefined,
+      input.valueBounds,
+    ) ?? null;
 
   const d: DbReadEventData = {
     engine: input.engine ?? "postgres",
