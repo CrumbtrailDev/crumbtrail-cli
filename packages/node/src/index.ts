@@ -34,6 +34,7 @@ export {
   type InstrumentableDriver,
   type InstrumentDatabaseClientOptions,
   instrumentMssqlPool,
+  instrumentMssqlTransaction,
   instrumentMysqlClient,
   instrumentNeonHttpQuery,
   instrumentPlanetScaleClient,

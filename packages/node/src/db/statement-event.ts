@@ -2,6 +2,7 @@ import {
   DB_STATEMENT_EVENT_KIND,
   normalizeStatementShape,
   type BugEvent,
+  type DbConnectionIdentity,
   type DbEngine,
   type DbStatementEventData,
   type DbStatementOp,
@@ -12,6 +13,7 @@ export const DB_STATEMENT_SHAPE_LABEL = "db.statement.shape";
 
 export interface BuildDbStatementEventInput {
   engine: DbEngine;
+  connection?: DbConnectionIdentity;
   op: DbStatementOp;
   /** Table the statement addressed, or `null` when it did not parse to one. */
   table: string | null;
@@ -22,6 +24,7 @@ export interface BuildDbStatementEventInput {
   /** 1-based ordinal of this statement within its request. */
   seq: number;
   requestId: string;
+  transactionId?: string;
   sessionId?: string;
   now?: number;
   sessionStartedAt?: number | Date;
@@ -50,6 +53,7 @@ export function buildDbStatementEvent(
 
   const d: DbStatementEventData = {
     engine: input.engine,
+    ...(input.connection ? { connection: input.connection } : {}),
     op: input.op,
     table: input.table,
     shape: normalizeStatementShape(input.statement, DB_STATEMENT_SHAPE_LABEL),
@@ -59,6 +63,7 @@ export function buildDbStatementEvent(
         : null,
     seq: input.seq,
     requestId: input.requestId,
+    ...(input.transactionId ? { transactionId: input.transactionId } : {}),
     t: now,
   };
 

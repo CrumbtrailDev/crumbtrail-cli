@@ -6,11 +6,13 @@ import {
   type DbBeforeImageStatus,
   type DbDiffBulkEventData,
   type DbDiffOp,
+  type DbConnectionIdentity,
   type DbEngine,
   type DbErrorOp,
   type DbStatementOp,
   normalizeStatementShape,
 } from "crumbtrail-core";
+import { randomUUID } from "node:crypto";
 import {
   appFramesFromStack,
   captureDbCallsite,
@@ -21,9 +23,15 @@ import { buildDbDiffEvent, type DbValueBounds } from "./diff-event";
 import { buildDbErrorEvent } from "./error-event";
 import { buildDbReadBulkEvent, buildDbReadEvent } from "./read-event";
 import {
+  buildDbPoolTimeoutEvent,
+  buildDbPoolWaitEvent,
+  isPoolCheckoutTimeout,
+} from "./pool-event";
+import {
   buildDbStatementEvent,
   DB_STATEMENT_SHAPE_LABEL,
 } from "./statement-event";
+import { buildDbTransactionEvent } from "./transaction-event";
 
 /**
  * Engine-agnostic emission pipeline shared by every DB adapter. All functions here are synchronous
@@ -99,7 +107,292 @@ export interface InstrumentDbClientOptions {
   /** Maximum per-row `db.read` events to emit for one request scope. */
   maxReadRowsPerRequest?: number;
   now?: () => number;
+  /** Monotonic clock seam used only for statement duration measurement. */
+  durationNow?: () => number;
   sessionStartedAt?: number | Date;
+}
+
+export interface PoolCheckoutCapture {
+  acquired(): void;
+  failed(error: unknown): void;
+}
+
+/** Starts a redaction-safe timer around one driver pool checkout. */
+export function beginPoolCheckout(
+  engine: DbEngine,
+  options: InstrumentDbClientOptions,
+): PoolCheckoutCapture {
+  let requestId: string | undefined;
+  try {
+    requestId = options.requestId ?? options.getRequestId?.();
+  } catch {
+    requestId = undefined;
+  }
+  const safeNow = (): number => {
+    try {
+      const value = options.now?.() ?? Date.now();
+      return Number.isFinite(value) ? value : Date.now();
+    } catch {
+      return Date.now();
+    }
+  };
+  const startedAt = safeNow();
+  let settled = false;
+  const elapsed = (): { now: number; waitMs: number } => {
+    const now = safeNow();
+    return { now, waitMs: Math.max(0, now - startedAt) };
+  };
+  return {
+    acquired() {
+      if (settled) return;
+      settled = true;
+      if (!requestId) return;
+      const timing = elapsed();
+      emitDbEvent(
+        options,
+        buildDbPoolWaitEvent({
+          engine,
+          requestId,
+          ...timing,
+          sessionId: options.sessionId,
+          sessionStartedAt: options.sessionStartedAt,
+        }),
+      );
+    },
+    failed(error: unknown) {
+      if (settled) return;
+      settled = true;
+      if (!requestId || !isPoolCheckoutTimeout(engine, error)) return;
+      const timing = elapsed();
+      emitDbEvent(
+        options,
+        buildDbPoolTimeoutEvent({
+          engine,
+          requestId,
+          error,
+          ...timing,
+          sessionId: options.sessionId,
+          sessionStartedAt: options.sessionStartedAt,
+        }),
+      );
+    },
+  };
+}
+
+export interface DbStatementContext {
+  connection?: DbConnectionIdentity;
+  durationMs?: number;
+  transactionId?: string;
+}
+
+export function startDbQueryTimer(
+  options: InstrumentDbClientOptions,
+): () => number {
+  const clock = options.durationNow ?? (() => performance.now());
+  let startedAt: number;
+  try {
+    startedAt = clock();
+  } catch {
+    startedAt = performance.now();
+  }
+  return () => {
+    try {
+      const elapsed = clock() - startedAt;
+      return Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0;
+    } catch {
+      return 0;
+    }
+  };
+}
+
+export function extractDbConnectionIdentity(
+  engine: DbEngine,
+  client: unknown,
+): DbConnectionIdentity | undefined {
+  try {
+    const root =
+      isRecord(client) || typeof client === "function"
+        ? (client as Record<string, unknown>)
+        : undefined;
+    if (!root) return undefined;
+    if (engine === "sqlite") {
+      const database = safeIdentityPart(root.name, true);
+      return database ? { host: "local", database } : { host: "local" };
+    }
+
+    const direct = firstRecord(
+      engine === "postgres" ? root.connectionParameters : undefined,
+      root.options,
+      root.config,
+      isRecord(root.parent) ? root.parent.config : undefined,
+    );
+    const config = firstRecord(direct?.connectionConfig, direct) ?? {};
+    const fromUrl = connectionStringIdentity(
+      firstString(config.connectionString, config.url),
+    );
+    const host =
+      safeIdentityPart(
+        firstString(config.host, config.server) ??
+          firstStringArray(config.host),
+      ) ?? fromUrl?.host;
+    const database =
+      safeIdentityPart(firstString(config.database, config.db)) ??
+      fromUrl?.database;
+    const role = connectionRole(config);
+    if (!host && !database && !role) return undefined;
+    return {
+      ...(host ? { host } : {}),
+      ...(database ? { database } : {}),
+      ...(role ? { role } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function firstRecord(
+  ...values: unknown[]
+): Record<string, unknown> | undefined {
+  return values.find(isRecord) as Record<string, unknown> | undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string");
+}
+
+function firstStringArray(value: unknown): string | undefined {
+  return Array.isArray(value)
+    ? value.find((entry): entry is string => typeof entry === "string")
+    : undefined;
+}
+
+function safeIdentityPart(
+  value: unknown,
+  basename = false,
+): string | undefined {
+  if (typeof value !== "string") return undefined;
+  let text = value.trim();
+  if (!text || text.length > 512 || /[\u0000-\u001f\u007f]/.test(text))
+    return undefined;
+  if (basename) text = text.split(/[\\/]/).filter(Boolean).at(-1) ?? text;
+  return text;
+}
+
+function connectionStringIdentity(
+  value: string | undefined,
+): DbConnectionIdentity | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = new URL(value);
+    const host = safeIdentityPart(parsed.hostname);
+    const database = safeIdentityPart(parsed.pathname.replace(/^\/+/, ""));
+    return host || database
+      ? { ...(host ? { host } : {}), ...(database ? { database } : {}) }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function connectionRole(
+  config: Record<string, unknown>,
+): DbConnectionIdentity["role"] | undefined {
+  if (config.readOnlyIntent === true) return "replica";
+  const target = firstString(
+    config.target_session_attrs,
+    config.targetSessionAttrs,
+  )?.toLowerCase();
+  if (target === "read-only" || target === "readonly") return "replica";
+  if (target === "read-write" || target === "readwrite") return "primary";
+  return undefined;
+}
+
+export interface DbTransactionContext {
+  id: string;
+  connection?: DbConnectionIdentity;
+}
+
+export type DbTransactionCommand = "begin" | "commit" | "rollback";
+
+export function classifyDbTransactionCommand(
+  statement: string,
+): DbTransactionCommand | undefined {
+  const normalized = statement
+    .replace(/^\s*(?:--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/\s*)*/g, "")
+    .trim()
+    .replace(/;+\s*$/, "")
+    .toLowerCase();
+  if (
+    /^(?:begin(?:\s+(?:work|transaction))?|start\s+transaction)(?:\s+.*)?$/.test(
+      normalized,
+    )
+  )
+    return "begin";
+  if (/^(?:commit|end)(?:\s+(?:work|transaction))?$/.test(normalized))
+    return "commit";
+  // `ROLLBACK TO [SAVEPOINT]` only rewinds the savepoint and must not close the outer transaction.
+  if (/^rollback(?:\s+(?:work|transaction))?$/.test(normalized))
+    return "rollback";
+  return undefined;
+}
+
+export function startDbTransaction(input: {
+  engine: DbEngine;
+  requestId?: string;
+  connection?: DbConnectionIdentity;
+  options: InstrumentDbClientOptions;
+}): DbTransactionContext {
+  let id: string;
+  try {
+    id = `dbtx_${randomUUID()}`;
+  } catch {
+    id = `dbtx_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  }
+  const transaction = { id, connection: input.connection };
+  try {
+    emitDbEvent(
+      input.options,
+      buildDbTransactionEvent({
+        engine: input.engine,
+        transactionId: transaction.id,
+        outcome: "open",
+        requestId: input.requestId,
+        connection: input.connection,
+        sessionId: input.options.sessionId,
+        now: input.options.now?.(),
+        sessionStartedAt: input.options.sessionStartedAt,
+      }),
+    );
+  } catch {
+    // Transaction observation may never decide whether the host transaction starts.
+  }
+  return transaction;
+}
+
+export function finishDbTransaction(input: {
+  engine: DbEngine;
+  transaction: DbTransactionContext;
+  outcome: "commit" | "rollback";
+  requestId?: string;
+  options: InstrumentDbClientOptions;
+}): void {
+  try {
+    emitDbEvent(
+      input.options,
+      buildDbTransactionEvent({
+        engine: input.engine,
+        transactionId: input.transaction.id,
+        outcome: input.outcome,
+        requestId: input.requestId,
+        connection: input.transaction.connection,
+        sessionId: input.options.sessionId,
+        now: input.options.now?.(),
+        sessionStartedAt: input.options.sessionStartedAt,
+      }),
+    );
+  } catch {
+    // Transaction observation may never decide what the host call returns.
+  }
 }
 
 export interface EmitGapInput {
@@ -424,6 +717,7 @@ export function emitDbDiffEvents(input: {
   /** Total rows the statement changed (may exceed `rows.length` when the driver reports more). */
   rowCount: number;
   options: InstrumentDbClientOptions;
+  context?: DbStatementContext;
   valueBounds?: DbValueBounds;
 }): void {
   const {
@@ -449,10 +743,13 @@ export function emitDbDiffEvents(input: {
     if (samplePks.length < 3 && samplePk) samplePks.push(samplePk);
     const event = buildDbDiffEvent({
       engine,
+      connection: input.context?.connection,
       op,
       table,
       pk,
       requestId,
+      durationMs: input.context?.durationMs,
+      transactionId: input.context?.transactionId,
       sessionId: options.sessionId,
       redactColumns: options.redactColumns,
       callsite: options.captureCallsite
@@ -513,6 +810,7 @@ export function emitImagelessDbDiff(input: {
   /** Explicit completeness state when a full before-image could not be captured. */
   beforeImageStatus?: DbBeforeImageStatus;
   options: InstrumentDbClientOptions;
+  context?: DbStatementContext;
 }): void {
   const { engine, op, table, requestId, rowCount, beforeImageStatus, options } =
     input;
@@ -521,12 +819,15 @@ export function emitImagelessDbDiff(input: {
       options,
       buildDbDiffEvent({
         engine,
+        connection: input.context?.connection,
         op,
         table,
         pk: null,
         rowCount,
         beforeImageStatus,
         requestId,
+        durationMs: input.context?.durationMs,
+        transactionId: input.context?.transactionId,
         sessionId: options.sessionId,
         redactColumns: options.redactColumns,
         callsite: options.captureCallsite
@@ -586,6 +887,7 @@ export function emitDbErrorEvent(input: {
   requestId: string;
   error: unknown;
   options: InstrumentDbClientOptions;
+  context?: DbStatementContext;
 }): void {
   const { options } = input;
   try {
@@ -593,11 +895,13 @@ export function emitDbErrorEvent(input: {
       options,
       buildDbErrorEvent({
         engine: input.engine,
+        connection: input.context?.connection,
         op: input.op,
         table: input.table,
         statement: input.statement,
         error: input.error,
         requestId: input.requestId,
+        transactionId: input.context?.transactionId,
         callsite: errorCallsiteFor(
           options,
           input.requestId,
@@ -640,6 +944,7 @@ export function emitDbStatementEvent(input: {
   seq: number;
   requestId: string;
   options: InstrumentDbClientOptions;
+  context?: DbStatementContext;
 }): void {
   const { options } = input;
   try {
@@ -647,12 +952,14 @@ export function emitDbStatementEvent(input: {
       options,
       buildDbStatementEvent({
         engine: input.engine,
+        connection: input.context?.connection,
         op: input.op,
         table: input.table,
         statement: input.statement,
         rowCount: input.rowCount,
         seq: input.seq,
         requestId: input.requestId,
+        transactionId: input.context?.transactionId,
         sessionId: options.sessionId,
         now: options.now?.(),
         sessionStartedAt: options.sessionStartedAt,
@@ -711,6 +1018,7 @@ export function emitDbReadEvents(input: {
    * than per row so the cost is paid once.
    */
   statement?: string;
+  context?: DbStatementContext;
   valueBounds?: DbValueBounds;
 }): void {
   const { engine, table, requestId, rows, rowCount, options } = input;
@@ -763,10 +1071,13 @@ export function emitDbReadEvents(input: {
         options,
         buildDbReadEvent({
           engine,
+          connection: input.context?.connection,
           table,
           pk,
           row,
           requestId,
+          durationMs: input.context?.durationMs,
+          transactionId: input.context?.transactionId,
           ...(stmt !== undefined ? { stmt } : {}),
           ...(shape !== undefined ? { shape } : {}),
           queryShape: input.queryShape,

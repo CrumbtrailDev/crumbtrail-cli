@@ -66,6 +66,11 @@ sourced); `captureReads: true` opts into capped `db.read` row capture. The event
 session db differencing across all engines. Per-engine wiring
 examples: [`docs/integrations/databases.md`](../../docs/integrations/databases.md).
 
+Refused statements emit `db.error` with a driver-code-derived category and no error message or
+bind values. Pool checkouts emit `db.pool.wait` with their wait duration. `mssql` also emits the
+distinct `db.pool.timeout` event when acquisition fails with `ETIMEOUT`; the other drivers do not
+provide a stable pool-timeout code, so their error prose is never guessed.
+
 ### Which clients get instrumented
 
 `autoCapture` instruments for you: it replaces the exported factories of every driver above
@@ -74,12 +79,17 @@ replacing a factory, it covers the clients created after it runs — the patch i
 `autoCapture` first yields, so a pool built while the app's own modules are still loading is
 covered, provided `autoCapture` was called first.
 
+SQLite auto-instrumentation covers `better-sqlite3` and the CommonJS `node:sqlite`
+`DatabaseSync` constructor.
+
 Two cases fall outside that, and both are reported by name at startup rather than left to look
 like a working install:
 
 - a client the host already holds when capture starts
 - postgres.js loaded as an ES module, where the copy the app imported is not the copy the
   CommonJS patch replaced (reported as `esm-unreachable`)
+- `node:sqlite` loaded through an ESM named import, whose built-in `DatabaseSync` binding Node does
+  not allow the SDK to replace (reported as `esm-unreachable`)
 
 For both, instrument it yourself. The call routes to the running capture and its request scope,
 and is safe in any order relative to `autoCapture`:

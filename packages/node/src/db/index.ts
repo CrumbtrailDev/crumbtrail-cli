@@ -25,6 +25,12 @@ export {
   redactColumns,
 } from "./columns";
 export { buildDbDiffEvent, type BuildDbDiffEventInput } from "./diff-event";
+export { buildDbTransactionEvent } from "./transaction-event";
+export {
+  buildDbPoolWaitEvent,
+  buildDbPoolTimeoutEvent,
+  isPoolCheckoutTimeout,
+} from "./pool-event";
 export {
   buildDbReadBulkEvent,
   buildDbReadEvent,
@@ -80,9 +86,11 @@ export {
 } from "./mysql";
 export {
   instrumentMssqlPool,
+  instrumentMssqlTransaction,
   type DuckTypedMssqlPool,
   type DuckTypedMssqlRequest,
   type DuckTypedMssqlResult,
+  type DuckTypedMssqlTransaction,
 } from "./mssql";
 export {
   instrumentSqliteDatabase,
