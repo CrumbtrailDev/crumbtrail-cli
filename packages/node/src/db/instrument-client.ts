@@ -23,11 +23,15 @@ import { instrumentPostgresSql } from "./postgres-js";
 import { instrumentMysqlClient } from "./mysql";
 import { instrumentSqliteDatabase } from "./sqlite";
 import { instrumentMssqlPool } from "./mssql";
+import { instrumentNeonHttpQuery } from "./neon-http";
+import { instrumentPlanetScaleClient } from "./planetscale";
 
 /** Drivers the explicit path can wrap. `postgres` is porsager/postgres. */
 export type InstrumentableDriver =
   | "pg"
   | "postgres"
+  | "neon-http"
+  | "planetscale"
   | "mysql2"
   | "better-sqlite3"
   | "mssql";
@@ -52,6 +56,7 @@ function detectDriver(client: unknown): InstrumentableDriver | undefined {
   if (typeof client === "function") return "postgres";
   if (typeof client !== "object" || client === null) return undefined;
   const c = client as Record<string, unknown>;
+  if (typeof c.connection === "function") return "planetscale";
   // better-sqlite3: synchronous prepare/exec, no query().
   if (typeof c.prepare === "function" && typeof c.query !== "function") {
     return "better-sqlite3";
@@ -63,6 +68,7 @@ function detectDriver(client: unknown): InstrumentableDriver | undefined {
     if (typeof c.escapeId === "function") return "mysql2";
     return "pg";
   }
+  if (typeof c.execute === "function") return "planetscale";
   return undefined;
 }
 
@@ -97,6 +103,10 @@ export function instrumentDatabaseClient<T>(
         ) as T;
       case "postgres":
         return instrumentPostgresSql(client, instrumentOptions) as T;
+      case "neon-http":
+        return instrumentNeonHttpQuery(client, instrumentOptions) as T;
+      case "planetscale":
+        return instrumentPlanetScaleClient(client, instrumentOptions) as T;
       case "mysql2":
         return instrumentMysqlClient(
           client as Parameters<typeof instrumentMysqlClient>[0],

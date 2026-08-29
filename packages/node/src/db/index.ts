@@ -36,6 +36,16 @@ export {
   type DuckTypedPostgresSql,
 } from "./postgres-js";
 export {
+  instrumentNeonHttpQuery,
+  type DuckTypedNeonHttpQuery,
+} from "./neon-http";
+export {
+  instrumentPlanetScaleClient,
+  type DuckTypedPlanetScaleClient,
+  type DuckTypedPlanetScaleConnection,
+  type DuckTypedPlanetScaleResult,
+} from "./planetscale";
+export {
   instrumentPgClient,
   parseMutation,
   parseRead,
