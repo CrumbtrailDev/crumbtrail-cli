@@ -8,11 +8,18 @@ import {
   emitDbReadEvents,
   emitDbStatementEvent,
   emitImagelessDbDiff,
+  extractDbConnectionIdentity,
+  finishDbTransaction,
   extractPk,
   isRecord,
   nextStatementSeq,
   normalizeMaxRowsPerStatement,
   pkKey,
+  startDbQueryTimer,
+  startDbTransaction,
+  classifyDbTransactionCommand,
+  type DbStatementContext,
+  type DbTransactionContext,
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
@@ -35,6 +42,9 @@ export interface DuckTypedMysqlClient {
   query(sql: unknown, values?: unknown): Promise<unknown>;
   execute?(sql: unknown, values?: unknown): Promise<unknown>;
   getConnection?(callback?: unknown): unknown;
+  beginTransaction?(): Promise<unknown>;
+  commit?(): Promise<unknown>;
+  rollback?(): Promise<unknown>;
 }
 
 /** The mysql2 result-set header duck shape for a mutation (INSERT/UPDATE/DELETE). */
@@ -152,6 +162,8 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
   // Every instrumented statement, not only the SELECTs whose rows were captured: this is what
   // gives a statement that returned nothing an ordinal, and so a place in the request's order.
   const statementsByRequest = new Map<string, number>();
+  const connection = extractDbConnectionIdentity(ENGINE, client);
+  let transaction: DbTransactionContext | undefined;
   const rawQuery = client.query.bind(client) as MysqlMethod;
   const rawExecute =
     typeof (client as { execute?: unknown }).execute === "function"
@@ -175,6 +187,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
     parsed: ParsedMutation,
     result: unknown,
     requestId: string,
+    context: DbStatementContext,
   ): Promise<void> => {
     const header = mutationHeader(resultPayload(result));
     if (!header || header.affectedRows <= 0) return;
@@ -203,6 +216,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           rows,
           rowCount: header.affectedRows,
           options,
+          context,
         });
         return;
       }
@@ -215,6 +229,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
       requestId,
       rowCount: header.affectedRows,
       options,
+      context,
     });
   };
 
@@ -223,6 +238,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
     result: unknown,
     requestId: string,
     preRows: Array<Record<string, unknown>> | undefined,
+    context: DbStatementContext,
   ): Promise<void> => {
     const header = mutationHeader(resultPayload(result));
     const affected = header ? header.affectedRows : 0;
@@ -259,6 +275,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
         beforeByPk: options.captureBefore ? beforeByPk : undefined,
         rowCount: affected,
         options,
+        context,
       });
 
       // Rows that matched a pre-image but vanished from the post-SELECT (e.g. the pk itself changed
@@ -288,6 +305,9 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
               pk,
               before,
               requestId,
+              durationMs: context.durationMs,
+              transactionId: context.transactionId,
+              connection: context.connection,
               sessionId: options.sessionId,
               redactColumns: options.redactColumns,
               now: options.now?.(),
@@ -307,6 +327,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
       requestId,
       rowCount: affected,
       options,
+      context,
     });
   };
 
@@ -315,6 +336,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
     result: unknown,
     requestId: string,
     preRows: Array<Record<string, unknown>> | undefined,
+    context: DbStatementContext,
   ): Promise<void> => {
     const header = mutationHeader(resultPayload(result));
     const affected = header ? header.affectedRows : 0;
@@ -330,6 +352,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
         rows: preRows,
         rowCount: affected,
         options,
+        context,
       });
       return;
     }
@@ -341,6 +364,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
       requestId,
       rowCount: affected,
       options,
+      context,
     });
   };
 
@@ -348,6 +372,55 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
     (run: MysqlMethod): MysqlMethod =>
     async (sql: unknown, values?: unknown): Promise<unknown> => {
       if (typeof sql !== "string") return run(sql, values);
+
+      const transactionCommand = classifyDbTransactionCommand(sql);
+      if (transactionCommand) {
+        let requestId: string | undefined;
+        try {
+          requestId = options.requestId ?? options.getRequestId?.();
+        } catch (error) {
+          emitGap(options, { reason: "capture_exception", error });
+        }
+        const elapsed = startDbQueryTimer(options);
+        const result = await run(sql, values);
+        const durationMs = elapsed();
+        const activeBefore = transaction;
+        if (transactionCommand === "begin") {
+          transaction = startDbTransaction({
+            engine: ENGINE,
+            requestId,
+            connection,
+            options,
+          });
+        } else if (transaction) {
+          finishDbTransaction({
+            engine: ENGINE,
+            transaction,
+            outcome: transactionCommand,
+            requestId,
+            options,
+          });
+          transaction = undefined;
+        }
+        if (requestId) {
+          emitDbStatementEvent({
+            engine: ENGINE,
+            op: "other",
+            table: null,
+            statement: sql,
+            rowCount: resultRowCount(result),
+            seq: nextStatementSeq(statementsByRequest, requestId),
+            requestId,
+            options,
+            context: {
+              connection,
+              durationMs,
+              transactionId: (transaction ?? activeBefore)?.id,
+            },
+          });
+        }
+        return result;
+      }
 
       // Parse/correlation resolution is diff-capture work: if it throws, fall through to the host
       // statement untouched. Instrumentation must never decide whether the host's query runs.
@@ -382,6 +455,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
         // A statement that RAISES is recorded and its error rethrown untouched. Deliberately not
         // behind `captureReads`: that flag caps row IMAGES, and a failure record carries no rows.
         let result: unknown;
+        const elapsed = startDbQueryTimer(options);
         try {
           result = await run(sql, values);
         } catch (error) {
@@ -393,9 +467,15 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
             requestId,
             error,
             options,
+            context: { connection, transactionId: transaction?.id },
           });
           throw error;
         }
+        const context = {
+          connection,
+          durationMs: elapsed(),
+          transactionId: transaction?.id,
+        };
         // Record what the statement ASKED, whatever it returned. Outside `captureReads` on
         // purpose: that flag caps row IMAGES and this record carries none, and a SELECT that
         // matched nothing emits no row event at all.
@@ -408,6 +488,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           seq: nextStatementSeq(statementsByRequest, requestId),
           requestId,
           options,
+          context,
         });
         if (options.captureReads && parsedRead) {
           try {
@@ -424,6 +505,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
               readCallsitesByRequest,
               readStatementsByRequest,
               statement: sql,
+              context,
             });
           } catch (error) {
             emitGap(options, { reason: "capture_exception", error });
@@ -435,6 +517,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
       // INSERT: run first (no pre-image needed), then re-read the after-image by insertId.
       if (parsed.op === "insert") {
         let result: unknown;
+        const elapsed = startDbQueryTimer(options);
         try {
           result = await run(sql, values);
         } catch (error) {
@@ -446,9 +529,15 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
             requestId,
             error,
             options,
+            context: { connection, transactionId: transaction?.id },
           });
           throw error;
         }
+        const context = {
+          connection,
+          durationMs: elapsed(),
+          transactionId: transaction?.id,
+        };
         emitDbStatementEvent({
           engine: ENGINE,
           op: parsed.op,
@@ -458,9 +547,10 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           seq: nextStatementSeq(statementsByRequest, requestId),
           requestId,
           options,
+          context,
         });
         try {
-          await captureInsert(parsed, result, requestId);
+          await captureInsert(parsed, result, requestId, context);
         } catch (error) {
           emitGap(options, { reason: "capture_exception", error });
         }
@@ -488,6 +578,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
       }
 
       let result: unknown;
+      const elapsed = startDbQueryTimer(options);
       try {
         result = await run(sql, values);
       } catch (error) {
@@ -499,9 +590,15 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           requestId,
           error,
           options,
+          context: { connection, transactionId: transaction?.id },
         });
         throw error;
       }
+      const context = {
+        connection,
+        durationMs: elapsed(),
+        transactionId: transaction?.id,
+      };
       // A mutation whose WHERE matched nothing changes no row and so appears in no diff — the
       // same silence a mutation that never ran would leave. The statement record separates them.
       emitDbStatementEvent({
@@ -513,12 +610,25 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
         seq: nextStatementSeq(statementsByRequest, requestId),
         requestId,
         options,
+        context,
       });
       try {
         if (parsedMutation.op === "update") {
-          await captureUpdate(parsedMutation, result, requestId, preRows);
+          await captureUpdate(
+            parsedMutation,
+            result,
+            requestId,
+            preRows,
+            context,
+          );
         } else {
-          await captureDelete(parsedMutation, result, requestId, preRows);
+          await captureDelete(
+            parsedMutation,
+            result,
+            requestId,
+            preRows,
+            context,
+          );
         }
       } catch (error) {
         emitGap(options, { reason: "capture_exception", error });
@@ -538,9 +648,15 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
             return (rawGetConnection as (...values: unknown[]) => unknown).call(
               client,
               (error: unknown, connection: unknown) => {
-                if (error || connection == null) checkout.failed(error);
-                else checkout.acquired();
-                return callback(error, connection);
+                if (error || connection == null) {
+                  checkout.failed(error);
+                  return callback(error, connection);
+                }
+                checkout.acquired();
+                return callback(
+                  error,
+                  instrumentAcquiredMysqlClient(connection, options),
+                );
               },
             );
           }
@@ -557,7 +673,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           return (result as Promise<unknown>).then(
             (connection) => {
               checkout.acquired();
-              return connection;
+              return instrumentAcquiredMysqlClient(connection, options);
             },
             (error) => {
               checkout.failed(error);
@@ -584,8 +700,62 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
       if (prop === "getConnection" && wrappedGetConnection) {
         return wrappedGetConnection;
       }
+      if (
+        prop === "beginTransaction" ||
+        prop === "commit" ||
+        prop === "rollback"
+      ) {
+        const method = Reflect.get(target, prop, receiver);
+        if (typeof method !== "function") return method;
+        return async (...args: unknown[]) => {
+          let requestId: string | undefined;
+          try {
+            requestId = options.requestId ?? options.getRequestId?.();
+          } catch (error) {
+            emitGap(options, { reason: "capture_exception", error });
+          }
+          const result = await (
+            method as (...values: unknown[]) => unknown
+          ).apply(target, args);
+          if (prop === "beginTransaction") {
+            transaction = startDbTransaction({
+              engine: ENGINE,
+              requestId,
+              connection,
+              options,
+            });
+          } else if (transaction) {
+            finishDbTransaction({
+              engine: ENGINE,
+              transaction,
+              outcome: prop === "commit" ? "commit" : "rollback",
+              requestId,
+              options,
+            });
+            transaction = undefined;
+          }
+          return result;
+        };
+      }
       const value = Reflect.get(target, prop, receiver);
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+function instrumentAcquiredMysqlClient(
+  acquired: unknown,
+  options: InstrumentDbClientOptions,
+): unknown {
+  try {
+    if (
+      !acquired ||
+      typeof (acquired as { query?: unknown }).query !== "function"
+    )
+      throw new TypeError("Pool connection cannot be instrumented");
+    return instrumentMysqlClient(acquired as DuckTypedMysqlClient, options);
+  } catch (error) {
+    emitGap(options, { reason: "uninstrumented_client", error });
+    return acquired;
+  }
 }

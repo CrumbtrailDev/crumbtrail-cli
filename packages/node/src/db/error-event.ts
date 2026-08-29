@@ -2,6 +2,7 @@ import {
   DB_ERROR_EVENT_KIND,
   normalizeStatementShape,
   type BugEvent,
+  type DbConnectionIdentity,
   type DbEngine,
   type DbErrorCategory,
   type DbErrorEventData,
@@ -11,6 +12,7 @@ import type { DbCallsite } from "./callsite";
 
 export interface BuildDbErrorEventInput {
   engine: DbEngine;
+  connection?: DbConnectionIdentity;
   op: DbErrorOp;
   /** Table the statement addressed, or `null` when it did not parse to one. */
   table: string | null;
@@ -19,6 +21,7 @@ export interface BuildDbErrorEventInput {
   /** The error the driver raised. Only stable code fields and its class name are read. */
   error: unknown;
   requestId: string;
+  transactionId?: string;
   /** Application callsite captured while the refused statement was being emitted. */
   callsite?: DbCallsite;
   sessionId?: string;
@@ -233,6 +236,7 @@ export function buildDbErrorEvent(input: BuildDbErrorEventInput): BugEvent {
 
   const d: DbErrorEventData = {
     engine: input.engine,
+    ...(input.connection ? { connection: input.connection } : {}),
     op: input.op,
     table: input.table,
     shape: normalizeStatementShape(input.statement),
@@ -240,6 +244,7 @@ export function buildDbErrorEvent(input: BuildDbErrorEventInput): BugEvent {
     category: classifyDbError(input.engine, input.error),
     errorName: captureDbErrorName(input.error),
     requestId: input.requestId,
+    ...(input.transactionId ? { transactionId: input.transactionId } : {}),
     ...(input.callsite !== undefined ? { callsite: input.callsite } : {}),
     t: now,
   };

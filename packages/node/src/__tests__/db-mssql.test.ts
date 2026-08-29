@@ -10,7 +10,11 @@ import {
   type DbDiffEventData,
   type DbReadEventData,
 } from "crumbtrail-core";
-import { instrumentMssqlPool, type DuckTypedMssqlResult } from "../db/mssql";
+import {
+  instrumentMssqlPool,
+  instrumentMssqlTransaction,
+  type DuckTypedMssqlResult,
+} from "../db/mssql";
 
 type QueryHandler = (
   text: string,
@@ -870,5 +874,62 @@ describe("instrumentMssqlPool pool.query direct form", () => {
     );
     expect(result.recordset).toBeUndefined();
     expect(diffEvents(events)[0].after).toEqual({ id: 1, name: "Ada" });
+  });
+});
+
+describe("instrumentMssqlTransaction", () => {
+  it("tracks transaction outcome, duration, and read-only connection identity", async () => {
+    const pool = fakeMssqlPool(() => ({
+      recordset: [{ id: 1, status: "done" }],
+      rowsAffected: [1],
+    }));
+    const raw = {
+      parent: {
+        config: {
+          server: "sql-replica.internal",
+          database: "warehouse",
+          readOnlyIntent: true,
+          password: "must-not-leak",
+        },
+      },
+      request: () => pool.request(),
+      begin: async () => undefined,
+      commit: async () => undefined,
+      rollback: async () => undefined,
+    };
+    const ticks = [100, 112];
+    const events: BugEvent[] = [];
+    const transaction = instrumentMssqlTransaction(raw, {
+      requestId: "req-tx",
+      durationNow: () => ticks.shift() ?? 112,
+      emit: (event) => events.push(event),
+    });
+
+    await transaction.begin();
+    await transaction
+      .request()
+      .query("UPDATE orders SET status = 'done' WHERE id = 1");
+    await transaction.commit();
+    await transaction.begin();
+    await transaction.rollback();
+
+    const lifecycle = events.filter((event) => event.k === "db.transaction");
+    expect(lifecycle.map((event) => event.d.outcome)).toEqual([
+      "open",
+      "commit",
+      "open",
+      "rollback",
+    ]);
+    const diff = events.find((event) => event.k === "db.diff")!;
+    expect(diff.d).toMatchObject({
+      durationMs: 12,
+      transactionId: lifecycle[0].d.transactionId,
+      connection: {
+        host: "sql-replica.internal",
+        database: "warehouse",
+        role: "replica",
+      },
+    });
+    expect(JSON.stringify(events)).not.toContain("must-not-leak");
   });
 });

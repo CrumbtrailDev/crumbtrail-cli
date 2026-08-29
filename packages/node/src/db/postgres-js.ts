@@ -44,6 +44,7 @@
  * - `capture_gap` when a mutation was seen and no diff could be built.
  */
 
+import type { DbConnectionIdentity } from "crumbtrail-core";
 import {
   classifyStatement,
   leadingSqlKeyword,
@@ -58,8 +59,13 @@ import {
   emitDbErrorEvent,
   emitDbReadEvents,
   emitDbStatementEvent,
+  extractDbConnectionIdentity,
+  finishDbTransaction,
   isRecord,
   nextStatementSeq,
+  startDbQueryTimer,
+  startDbTransaction,
+  type DbTransactionContext,
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
@@ -93,6 +99,7 @@ interface DuckTypedPostgresQuery {
 export type DuckTypedPostgresSql = ((...args: unknown[]) => unknown) & {
   unsafe?: unknown;
   begin?: unknown;
+  savepoint?: unknown;
   reserve?: unknown;
 };
 
@@ -132,13 +139,21 @@ export function instrumentPostgresSql<T>(
   options: InstrumentDbClientOptions,
 ): T {
   if (typeof sql !== "function" || isInstrumented(sql)) return sql;
-  return wrapSql(sql as DuckTypedPostgresSql, options, newCounters()) as T;
+  return wrapSql(sql as DuckTypedPostgresSql, options, newCounters(), {
+    connection: extractDbConnectionIdentity(ENGINE, sql),
+  }) as T;
+}
+
+interface SqlContext {
+  connection?: DbConnectionIdentity;
+  transaction?: DbTransactionContext;
 }
 
 function wrapSql(
   sql: DuckTypedPostgresSql,
   options: InstrumentDbClientOptions,
   counters: RequestCounters,
+  context: SqlContext,
 ): DuckTypedPostgresSql {
   const proxy = new Proxy(sql, {
     apply(target, thisArg, args) {
@@ -148,7 +163,7 @@ function wrapSql(
         // identifier and `sql(obj)` a helper; both are values inside some other
         // statement, and neither runs on its own.
         if (isTaggedTemplateCall(args)) {
-          observe(query, plannedTextFor(args), options, counters);
+          observe(query, plannedTextFor(args), options, counters, context);
         }
       } catch {
         // Capture may never decide whether the host's query is built.
@@ -157,9 +172,14 @@ function wrapSql(
     },
     get(target, prop, receiver) {
       if (prop === INSTRUMENTED) return true;
-      if (prop === "unsafe") return wrapUnsafe(target, options, counters);
-      if (prop === "begin") return wrapBegin(target, options, counters);
-      if (prop === "reserve") return wrapReserve(target, options, counters);
+      if (prop === "unsafe")
+        return wrapUnsafe(target, options, counters, context);
+      if (prop === "begin")
+        return wrapBegin(target, options, counters, context);
+      if (prop === "savepoint")
+        return wrapSavepoint(target, options, counters, context);
+      if (prop === "reserve")
+        return wrapReserve(target, options, counters, context);
       const value = Reflect.get(target, prop, receiver);
       return typeof value === "function" ? value.bind(target) : value;
     },
@@ -167,11 +187,43 @@ function wrapSql(
   return proxy;
 }
 
+/** A postgres.js savepoint stays inside the outer transaction and keeps its transaction id. */
+function wrapSavepoint(
+  sql: DuckTypedPostgresSql,
+  options: InstrumentDbClientOptions,
+  counters: RequestCounters,
+  context: SqlContext,
+): unknown {
+  const original = sql.savepoint;
+  if (typeof original !== "function") return original;
+  const originalFn = original as (...args: unknown[]) => unknown;
+  return function (this: unknown, ...args: unknown[]): unknown {
+    const index = args.findIndex((arg) => typeof arg === "function");
+    if (index < 0) return originalFn.apply(sql, args);
+    const fn = args[index] as (...values: unknown[]) => unknown;
+    const next = [...args];
+    next[index] = (...values: unknown[]): unknown => {
+      const scoped = values[0];
+      if (typeof scoped === "function" && !isInstrumented(scoped)) {
+        values[0] = wrapSql(
+          scoped as DuckTypedPostgresSql,
+          options,
+          counters,
+          context,
+        );
+      }
+      return fn(...values);
+    };
+    return originalFn.apply(sql, next);
+  };
+}
+
 /** `sql.unsafe(text, params)` — the exact text is known before it runs. */
 function wrapUnsafe(
   sql: DuckTypedPostgresSql,
   options: InstrumentDbClientOptions,
   counters: RequestCounters,
+  context: SqlContext,
 ): unknown {
   const original = sql.unsafe;
   if (typeof original !== "function") return original;
@@ -180,7 +232,7 @@ function wrapUnsafe(
     const query = originalFn.apply(sql, args);
     try {
       const text = typeof args[0] === "string" ? args[0] : undefined;
-      if (text) observe(query, text, options, counters);
+      if (text) observe(query, text, options, counters, context);
     } catch {
       // Same contract: never fail the host's statement.
     }
@@ -198,6 +250,7 @@ function wrapBegin(
   sql: DuckTypedPostgresSql,
   options: InstrumentDbClientOptions,
   counters: RequestCounters,
+  context: SqlContext,
 ): unknown {
   const original = sql.begin;
   if (typeof original !== "function") return original;
@@ -206,19 +259,70 @@ function wrapBegin(
     const index = args.findIndex((arg) => typeof arg === "function");
     if (index < 0) return originalFn.apply(sql, args);
     const fn = args[index] as (...values: unknown[]) => unknown;
+    let requestId: string | undefined;
+    try {
+      requestId = options.requestId ?? options.getRequestId?.();
+    } catch (error) {
+      emitGap(options, { reason: "capture_exception", error });
+    }
+    const transaction = startDbTransaction({
+      engine: ENGINE,
+      requestId,
+      connection: context.connection,
+      options,
+    });
     const wrapped = (...values: unknown[]): unknown => {
       const scoped = values[0];
       if (typeof scoped === "function" && !isInstrumented(scoped)) {
         // The transaction's statements share the outer counters on purpose: a
         // request's statement ordinals must stay one sequence whether or not a
         // transaction was opened partway through it.
-        values[0] = wrapSql(scoped as DuckTypedPostgresSql, options, counters);
+        values[0] = wrapSql(scoped as DuckTypedPostgresSql, options, counters, {
+          connection: context.connection,
+          transaction,
+        });
       }
       return fn(...values);
     };
     const next = [...args];
     next[index] = wrapped;
-    return originalFn.apply(sql, next);
+    let result: unknown;
+    try {
+      result = originalFn.apply(sql, next);
+    } catch (error) {
+      finishDbTransaction({
+        engine: ENGINE,
+        transaction,
+        outcome: "rollback",
+        requestId,
+        options,
+      });
+      throw error;
+    }
+    if (!result || typeof (result as Promise<unknown>).then !== "function")
+      return result;
+    return (result as Promise<unknown>).then(
+      (value) => {
+        finishDbTransaction({
+          engine: ENGINE,
+          transaction,
+          outcome: "commit",
+          requestId,
+          options,
+        });
+        return value;
+      },
+      (error) => {
+        finishDbTransaction({
+          engine: ENGINE,
+          transaction,
+          outcome: "rollback",
+          requestId,
+          options,
+        });
+        throw error;
+      },
+    );
   };
 }
 
@@ -227,6 +331,7 @@ function wrapReserve(
   sql: DuckTypedPostgresSql,
   options: InstrumentDbClientOptions,
   counters: RequestCounters,
+  context: SqlContext,
 ): unknown {
   const original = sql.reserve;
   if (typeof original !== "function") return original;
@@ -243,7 +348,12 @@ function wrapReserve(
         checkout.acquired();
         try {
           if (typeof reserved === "function" && !isInstrumented(reserved)) {
-            return wrapSql(reserved as DuckTypedPostgresSql, options, counters);
+            return wrapSql(reserved as DuckTypedPostgresSql, options, counters, {
+              connection:
+                extractDbConnectionIdentity(ENGINE, reserved) ??
+                context.connection,
+              transaction: context.transaction,
+            });
           }
         } catch (error) {
           emitGap(options, { reason: "uninstrumented_client", error });
@@ -319,6 +429,7 @@ function observe(
   plannedText: string | undefined,
   options: InstrumentDbClientOptions,
   counters: RequestCounters,
+  context: SqlContext,
 ): void {
   const q = query as DuckTypedPostgresQuery | undefined;
   if (!q || typeof q.resolve !== "function" || typeof q.reject !== "function")
@@ -328,6 +439,7 @@ function observe(
   // No request scope means nothing to correlate the statement to, exactly as in
   // every other adapter.
   if (!requestId) return;
+  const elapsed = startDbQueryTimer(options);
 
   let parsed: ParsedMutation | undefined;
   let parsedRead: ParsedRead | undefined;
@@ -389,6 +501,7 @@ function observe(
           requestId,
           options,
           counters,
+          context: { ...context, durationMs: elapsed() },
         });
       } catch (error) {
         emitGap(options, { reason: "capture_exception", error });
@@ -409,6 +522,10 @@ function observe(
           requestId,
           error: reason,
           options,
+          context: {
+            connection: context.connection,
+            transactionId: context.transaction?.id,
+          },
         });
       } catch (error) {
         emitGap(options, { reason: "capture_exception", error });
@@ -500,6 +617,7 @@ function recordSuccess(input: {
   requestId: string;
   options: InstrumentDbClientOptions;
   counters: RequestCounters;
+  context: SqlContext & { durationMs: number };
 }): void {
   const { query, result, parsed, parsedRead, requestId, options, counters } =
     input;
@@ -518,6 +636,11 @@ function recordSuccess(input: {
     seq: nextStatementSeq(counters.statementsByRequest, requestId),
     requestId,
     options,
+    context: {
+      connection: input.context.connection,
+      durationMs: input.context.durationMs,
+      transactionId: input.context.transaction?.id,
+    },
   });
 
   if (parsed) {
@@ -534,6 +657,11 @@ function recordSuccess(input: {
       rows,
       rowCount: rowCount ?? rows.length,
       options,
+      context: {
+        connection: input.context.connection,
+        durationMs: input.context.durationMs,
+        transactionId: input.context.transaction?.id,
+      },
     });
     return;
   }
@@ -551,6 +679,11 @@ function recordSuccess(input: {
       readStatementsByRequest: counters.readStatementsByRequest,
       queryShape: parseLimitOffset(statement, query.args as unknown),
       statement,
+      context: {
+        connection: input.context.connection,
+        durationMs: input.context.durationMs,
+        transactionId: input.context.transaction?.id,
+      },
     });
   }
 }
