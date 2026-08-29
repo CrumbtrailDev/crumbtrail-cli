@@ -17,7 +17,7 @@ import {
   type DbCallsite,
 } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
-import { buildDbDiffEvent } from "./diff-event";
+import { buildDbDiffEvent, type DbValueBounds } from "./diff-event";
 import { buildDbErrorEvent } from "./error-event";
 import { buildDbReadBulkEvent, buildDbReadEvent } from "./read-event";
 import {
@@ -424,6 +424,7 @@ export function emitDbDiffEvents(input: {
   /** Total rows the statement changed (may exceed `rows.length` when the driver reports more). */
   rowCount: number;
   options: InstrumentDbClientOptions;
+  valueBounds?: DbValueBounds;
 }): void {
   const {
     engine,
@@ -459,6 +460,7 @@ export function emitDbDiffEvents(input: {
         : undefined,
       now: options.now?.(),
       sessionStartedAt: options.sessionStartedAt,
+      valueBounds: input.valueBounds,
       beforeImageStatus,
       ...(op === "delete"
         ? { before: row }
@@ -709,6 +711,7 @@ export function emitDbReadEvents(input: {
    * than per row so the cost is paid once.
    */
   statement?: string;
+  valueBounds?: DbValueBounds;
 }): void {
   const { engine, table, requestId, rows, rowCount, options } = input;
   let shape: string | undefined;
@@ -748,12 +751,7 @@ export function emitDbReadEvents(input: {
   const sensitive = buildSensitiveColumnSet(options.redactColumns);
   const callsite =
     emitRows.length > 0
-      ? readCallsiteFor(
-          options,
-          requestId,
-          shape,
-          input.readCallsitesByRequest,
-        )
+      ? readCallsiteFor(options, requestId, shape, input.readCallsitesByRequest)
       : undefined;
 
   for (const row of emitRows) {
@@ -777,6 +775,7 @@ export function emitDbReadEvents(input: {
           redactColumns: options.redactColumns,
           now: options.now?.(),
           sessionStartedAt: options.sessionStartedAt,
+          valueBounds: input.valueBounds,
         }),
       )
     ) {

@@ -37,6 +37,7 @@ import { instrumentMysqlClient } from "./mysql";
 import { instrumentSqliteDatabase } from "./sqlite";
 import { instrumentMssqlPool } from "./mssql";
 import { instrumentPostgresSql } from "./postgres-js";
+import { enableMongoCommandMonitoring, instrumentMongoClient } from "./mongo";
 import { instrumentPrismaClient } from "./prisma";
 import type { InstrumentDbClientOptions } from "./instrument-shared";
 
@@ -55,12 +56,15 @@ export const AUTO_INSTRUMENT_DRIVERS = [
   "mysql2/promise",
   "better-sqlite3",
   "mssql",
+  "mongodb",
 ] as const;
 
 export type AutoInstrumentDriver = (typeof AUTO_INSTRUMENT_DRIVERS)[number];
 
-export interface AutoInstrumentDbOptions
-  extends Omit<InstrumentDbClientOptions, "emit"> {
+export interface AutoInstrumentDbOptions extends Omit<
+  InstrumentDbClientOptions,
+  "emit"
+> {
   /** Sink for emitted `db.diff` / `db.read` events. */
   emit: (event: BugEvent) => void;
   /**
@@ -151,6 +155,7 @@ function patchFactory(
   key: string,
   wrap: (instance: unknown) => unknown,
   restorations: Restoration[],
+  prepareArgs?: (args: readonly unknown[]) => unknown[],
 ): "patched" | "already-patched" | "unsupported-shape" {
   const original = target[key];
   if (isPatched(original)) return "already-patched";
@@ -159,17 +164,18 @@ function patchFactory(
   const originalFn = original as (...args: unknown[]) => unknown;
 
   function Patched(this: unknown, ...args: unknown[]): unknown {
+    const callArgs = prepareArgs ? prepareArgs(args) : args;
     // `new pg.Pool()` — construct, then wrap the instance.
     if (new.target) {
       const instance = Reflect.construct(
         originalFn,
-        args,
+        callArgs,
         new.target === Patched ? originalFn : new.target,
       );
       return wrap(instance);
     }
     // `mysql.createPool()` — plain call.
-    const result = originalFn.apply(this, args);
+    const result = originalFn.apply(this, callArgs);
     // A factory that returns a promise (mysql2/promise) resolves to the client.
     if (result && typeof (result as Promise<unknown>).then === "function") {
       return (result as Promise<unknown>).then(wrap);
@@ -307,13 +313,7 @@ function patchDriver(
       };
     }
   } else if (driver === "postgres") {
-    return patchPostgresJs(
-      moduleExports,
-      mod,
-      options,
-      restorations,
-      context,
-    );
+    return patchPostgresJs(moduleExports, mod, options, restorations, context);
   } else if (driver === "mssql") {
     statuses.push(
       patchFactory(
@@ -325,6 +325,20 @@ function patchDriver(
             options,
           ),
         restorations,
+      ),
+    );
+  } else if (driver === "mongodb") {
+    statuses.push(
+      patchFactory(
+        root,
+        "MongoClient",
+        (instance) =>
+          instrumentMongoClient(
+            instance as Parameters<typeof instrumentMongoClient>[0],
+            options,
+          ),
+        restorations,
+        enableMongoCommandMonitoring,
       ),
     );
   }
@@ -367,7 +381,11 @@ function patchPostgresJs(
     const status = patchFactory(mod, "default", wrap, restorations);
     return status === "patched" || status === "already-patched"
       ? { driver: "postgres", status }
-      : { driver: "postgres", status, detail: "default export is not writable" };
+      : {
+          driver: "postgres",
+          status,
+          detail: "default export is not writable",
+        };
   }
 
   if (typeof moduleExports !== "function") {
