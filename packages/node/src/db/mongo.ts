@@ -1,5 +1,5 @@
 import type { DbDiffOp, DbEngine, DbStatementOp } from "crumbtrail-core";
-import { buildDbDiffEvent } from "./diff-event";
+import { boundColumnRow, buildDbDiffEvent } from "./diff-event";
 import {
   emitDbDiffEvents,
   emitDbErrorEvent,
@@ -28,6 +28,10 @@ export const MONGO_IMAGE_UNAVAILABLE = {
     "findAndModify returned the pre-image selected by returnDocument",
   returnedAfter:
     "findAndModify returned the post-image selected by returnDocument",
+  projectedBefore:
+    "findAndModify projection returned only part of the pre-image",
+  projectedAfter:
+    "findAndModify projection returned only part of the post-image",
 } as const;
 
 export interface DuckTypedMongoClient {
@@ -129,7 +133,7 @@ export function instrumentMongoClient<T extends DuckTypedMongoClient>(
         if (!started) return;
         emitDbErrorEvent({
           engine: ENGINE,
-          op: statementOp(started.commandName),
+          op: statementOp(started.commandName, started.command),
           table: started.table,
           statement: mongoStatement(started.commandName),
           requestId: started.requestId,
@@ -158,7 +162,7 @@ function handleSucceeded(
   const rowCount = mongoRowCount(commandName, command, reply);
   emitDbStatementEvent({
     engine: ENGINE,
-    op: statementOp(commandName),
+    op: statementOp(commandName, command),
     table,
     statement: mongoStatement(commandName),
     rowCount,
@@ -169,7 +173,7 @@ function handleSucceeded(
 
   if (!table) return;
   if (commandName === "insert") {
-    const documents = arrayRecords(command.documents);
+    const documents = arrayRecords(command.documents).map(boundMongoDocument);
     if (documents.length > 0) {
       emitDbDiffEvents({
         engine: ENGINE,
@@ -206,7 +210,7 @@ function handleSucceeded(
   }
 
   if (options.captureReads && isReadCommand(commandName)) {
-    const rows = cursorBatch(reply);
+    const rows = cursorBatch(reply).map(boundMongoDocument);
     if (rows.length === 0) return;
     emitDbReadEvents({
       engine: ENGINE,
@@ -271,11 +275,14 @@ function emitFindAndModify(
   requestId: string,
   options: InstrumentDbClientOptions,
 ): void {
-  const row = isRecord(reply.value) ? reply.value : undefined;
+  const row = isRecord(reply.value)
+    ? boundMongoDocument(reply.value)
+    : undefined;
   const pk =
     row && "_id" in row ? { _id: row._id } : pkFromFilter(command.query);
   const isDelete = command.remove === true;
   const returnsAfter = command.new === true;
+  const projected = isRecord(command.fields);
   const changed = numeric(reply.lastErrorObject, "n") ?? (row ? 1 : 0);
   if (changed <= 0) return;
 
@@ -300,11 +307,27 @@ function emitFindAndModify(
                 },
           }
         : isDelete
-          ? {}
+          ? projected
+            ? {
+                imageUnavailable: {
+                  before: MONGO_IMAGE_UNAVAILABLE.projectedBefore,
+                },
+              }
+            : {}
           : {
               imageUnavailable: returnsAfter
-                ? { before: MONGO_IMAGE_UNAVAILABLE.returnedAfter }
-                : { after: MONGO_IMAGE_UNAVAILABLE.returnedBefore },
+                ? {
+                    before: MONGO_IMAGE_UNAVAILABLE.returnedAfter,
+                    ...(projected
+                      ? { after: MONGO_IMAGE_UNAVAILABLE.projectedAfter }
+                      : {}),
+                  }
+                : {
+                    after: MONGO_IMAGE_UNAVAILABLE.returnedBefore,
+                    ...(projected
+                      ? { before: MONGO_IMAGE_UNAVAILABLE.projectedBefore }
+                      : {}),
+                  },
             }),
       sessionId: options.sessionId,
       redactColumns: options.redactColumns,
@@ -367,8 +390,13 @@ function isReadCommand(commandName: string): boolean {
   );
 }
 
-function statementOp(commandName: string): DbStatementOp {
+function statementOp(
+  commandName: string,
+  command?: Record<string, unknown>,
+): DbStatementOp {
   if (commandName === "insert") return "insert";
+  if (commandName === "findandmodify" && command?.remove === true)
+    return "delete";
   if (commandName === "update" || commandName === "findandmodify")
     return "update";
   if (commandName === "delete") return "delete";
@@ -402,6 +430,12 @@ function numeric(value: unknown, key: string): number | undefined {
 
 function arrayRecords(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.filter(isRecord) : [];
+}
+
+function boundMongoDocument(
+  document: Record<string, unknown>,
+): Record<string, unknown> {
+  return boundColumnRow(document, MONGO_DOCUMENT_BOUNDS) ?? {};
 }
 
 function normalizedCommandName(value: unknown): string | undefined {

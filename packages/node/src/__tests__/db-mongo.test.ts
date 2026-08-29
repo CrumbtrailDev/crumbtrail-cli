@@ -248,6 +248,34 @@ describe("instrumentMongoClient", () => {
     });
   });
 
+  it("marks a projected findAndModify result as a partial image", () => {
+    const { client, events } = capture();
+    client.succeed(
+      61,
+      "findAndModify",
+      {
+        findAndModify: "accounts",
+        query: { _id: "acct-1" },
+        update: { $set: { status: "ready" } },
+        fields: { status: 1 },
+        new: false,
+      },
+      {
+        ok: 1,
+        lastErrorObject: { n: 1, updatedExisting: true },
+        value: { _id: "acct-1", status: "new" },
+      },
+    );
+
+    expect(eventsOf(events, "db.diff")[0]?.d).toMatchObject({
+      before: { _id: "acct-1", status: "new" },
+      imageUnavailable: {
+        before: MONGO_IMAGE_UNAVAILABLE.projectedBefore,
+        after: MONGO_IMAGE_UNAVAILABLE.returnedBefore,
+      },
+    });
+  });
+
   it("maps findOneAndDelete to a before-only delete diff", () => {
     const { client, events } = capture();
     client.succeed(
