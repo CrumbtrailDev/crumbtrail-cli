@@ -2,6 +2,7 @@ import {
   DB_DIFF_EVENT_KIND,
   mergeRedactionMetadata,
   type BugEvent,
+  type DbBeforeImageStatus,
   type DbDiffEventData,
   type DbDiffOp,
   type DbEngine,
@@ -20,6 +21,10 @@ export interface BuildDbDiffEventInput {
   after?: Record<string, unknown>;
   /** Pre-image of the affected row (deletes, or updates with before-capture enabled). */
   before?: Record<string, unknown>;
+  /** Missing row images, with static reasons that cannot be confused with user data. */
+  imageUnavailable?: Partial<Record<"before" | "after", string>>;
+  /** Explicit completeness state when a full before-image could not be captured. */
+  beforeImageStatus?: DbBeforeImageStatus;
   /** Set only on image-less statement-level fallback events (pk `null`, no after/before). */
   rowCount?: number;
   /** Correlation id; MUST equal the active request's traceId/requestId. */
@@ -31,6 +36,8 @@ export interface BuildDbDiffEventInput {
   callsite?: DbCallsite;
   now?: number;
   sessionStartedAt?: number | Date;
+  /** Optional nested-value bounds applied after redaction. */
+  valueBounds?: DbValueBounds;
 }
 
 /**
@@ -40,31 +47,73 @@ export interface BuildDbDiffEventInput {
  */
 export const MAX_DB_VALUE_LENGTH = 8 * 1024;
 
+export interface DbValueBounds {
+  /** Maximum nested object or array depth. The row itself is depth zero. */
+  maxDepth?: number;
+  /** Maximum keys or items retained from any one object or array. */
+  maxContainerEntries?: number;
+}
+
+const DEPTH_TRUNCATION_MARKER = "…[truncated: maximum document depth]";
+const SIZE_TRUNCATION_MARKER = "…[truncated: container size limit]";
+
 function boundStringValue(value: string, max = MAX_DB_VALUE_LENGTH): string {
   if (value.length <= max) return value;
   return `${value.slice(0, max)}…[truncated ${value.length} chars]`;
 }
 
 /** Recursively truncates oversized string values inside a column image (handles nested JSONB). */
-export function boundColumnValue(value: unknown): unknown {
+export function boundColumnValue(
+  value: unknown,
+  bounds: DbValueBounds = {},
+  depth = 0,
+): unknown {
   if (typeof value === "string") return boundStringValue(value);
-  if (Array.isArray(value)) return value.map(boundColumnValue);
+  const maxDepth = normalizeBound(bounds.maxDepth);
+  const maxEntries = normalizeBound(bounds.maxContainerEntries);
+  if ((Array.isArray(value) || isObject(value)) && depth >= maxDepth) {
+    return DEPTH_TRUNCATION_MARKER;
+  }
+  if (Array.isArray(value)) {
+    const retained = value
+      .slice(0, maxEntries)
+      .map((inner) => boundColumnValue(inner, bounds, depth + 1));
+    if (value.length > retained.length) retained.push(SIZE_TRUNCATION_MARKER);
+    return retained;
+  }
   if (value !== null && typeof value === "object") {
     const out: Record<string, unknown> = {};
-    for (const [key, inner] of Object.entries(
-      value as Record<string, unknown>,
-    )) {
-      out[key] = boundColumnValue(inner);
+    const entries = Object.entries(value as Record<string, unknown>);
+    for (const [key, inner] of entries.slice(0, maxEntries)) {
+      out[key] = boundColumnValue(inner, bounds, depth + 1);
+    }
+    if (entries.length > maxEntries) {
+      let markerKey = "__crumbtrail_truncated__";
+      while (markerKey in out) markerKey += "_";
+      out[markerKey] = SIZE_TRUNCATION_MARKER;
     }
     return out;
   }
   return value;
 }
 
+function normalizeBound(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value))
+    return Number.MAX_SAFE_INTEGER;
+  return Math.max(0, Math.floor(value));
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object";
+}
+
 export function boundColumnRow(
   row: Record<string, unknown> | undefined,
+  bounds?: DbValueBounds,
 ): Record<string, unknown> | undefined {
-  return row ? (boundColumnValue(row) as Record<string, unknown>) : undefined;
+  return row
+    ? (boundColumnValue(row, bounds) as Record<string, unknown>)
+    : undefined;
 }
 
 /**
@@ -86,11 +135,13 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     : { value: null as Record<string, unknown> | null, metadata: undefined };
 
   // Bound oversized column values AFTER redaction so a huge TEXT/JSONB cell can't rest in full.
-  const boundedAfter = boundColumnRow(after.value);
-  const boundedBefore = boundColumnRow(before.value);
+  const boundedAfter = boundColumnRow(after.value, input.valueBounds);
+  const boundedBefore = boundColumnRow(before.value, input.valueBounds);
   const boundedPk =
-    boundColumnRow((pk.value as Record<string, unknown> | null) ?? undefined) ??
-    null;
+    boundColumnRow(
+      (pk.value as Record<string, unknown> | null) ?? undefined,
+      input.valueBounds,
+    ) ?? null;
 
   const d: DbDiffEventData = {
     engine: input.engine ?? "postgres",
@@ -100,6 +151,12 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     requestId: input.requestId,
     ...(boundedAfter !== undefined ? { after: boundedAfter } : {}),
     ...(boundedBefore !== undefined ? { before: boundedBefore } : {}),
+    ...(input.imageUnavailable !== undefined
+      ? { imageUnavailable: input.imageUnavailable }
+      : {}),
+    ...(input.beforeImageStatus !== undefined
+      ? { beforeImageStatus: input.beforeImageStatus }
+      : {}),
     ...(input.rowCount !== undefined ? { rowCount: input.rowCount } : {}),
     // Not redacted: a callsite is the host's own source path and line, which is
     // the one thing in the event that is definitionally not user data.
