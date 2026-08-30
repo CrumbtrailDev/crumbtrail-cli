@@ -135,6 +135,8 @@ packages/kotlin/.gradle/
 
 # Agent worktrees. Local only — never a gitlink in a commit.
 .worktrees/
+worktrees/
+.claude/worktrees/
 
 # Deep Build plan and decision log. Local only, matches the main repo.
 .deep-build/
