@@ -262,6 +262,8 @@ export interface ParsedArgs {
   command: Command;
   yes: boolean;
   project?: string;
+  /** `--service <name>`: name the application this app reports as. */
+  service?: string;
   noBrowser: boolean;
   skipVerify: boolean;
   /**
@@ -379,6 +381,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
           }
         }
         break;
+      case "--service":
+        {
+          const value = flagValue(args, i, a);
+          if (value.error) parsed.parseError ??= value.error;
+          else {
+            parsed.service = value.value;
+            i += 1;
+          }
+        }
+        break;
       case "--endpoint":
         {
           const value = flagValue(args, i, a);
@@ -430,6 +442,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
           const value = a.slice("--project=".length).trim();
           if (value) parsed.project = value;
           else parsed.parseError ??= "--project requires a value.";
+        } else if (a.startsWith("--service=")) {
+          const value = a.slice("--service=".length).trim();
+          if (value) parsed.service = value;
+          else parsed.parseError ??= "--service requires a value.";
         } else if (a.startsWith("--endpoint=")) {
           const value = a.slice("--endpoint=".length).trim();
           if (value) parsed.endpoint = value;
@@ -521,6 +537,7 @@ function usage(): string {
     head("Options"),
     flag("--yes, -y", "Skip confirmations (required with --project in CI)"),
     flag("--project <id>", "Attach to an existing project (skip creation)"),
+    flag("--service <name>", "Name the application this app reports as"),
     flag("--only <name>", "Monorepo: wire only this service (repeatable)"),
     flag("--all", "Monorepo: wire every service it can, no prompt"),
     flag(
@@ -1277,6 +1294,7 @@ export async function runWizard(
       projectId: parsed.project,
       defaultProjectName,
       defaultServiceName,
+      serviceName: parsed.service,
       // Which repository this app is, so a project that already holds an
       // application of the same name from somewhere else is not reused blind.
       identity: serviceIdentity(cwd),

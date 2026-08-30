@@ -355,6 +355,8 @@ export interface ProvisionInput {
   /** Inferred defaults (from detection / package.json / git). */
   defaultProjectName: string;
   defaultServiceName: string;
+  /** Explicit `--service <name>` target. Unset preserves the prompt/default path. */
+  serviceName?: string;
   /** Which repository and directory this app lives in. */
   identity?: ServiceIdentity;
   /** Who the token belongs to, for the wrong-account message. */
@@ -499,6 +501,8 @@ export interface ProvisionServiceInput {
   serviceName: string;
   /** Which repository and directory this app lives in, sent with the create. */
   identity?: ServiceIdentity;
+  /** Named targets must not adopt a verified different repository. */
+  rejectOtherSource?: boolean;
   ui: Ui;
   fetchImpl?: typeof fetch;
 }
@@ -544,6 +548,15 @@ export async function provisionService(input: ProvisionServiceInput): Promise<{
     );
   } catch (err) {
     throw explainWrongAccount(err, input.projectId, input.identityLabel);
+  }
+  if (
+    input.rejectOtherSource &&
+    service.adopted &&
+    service.adoptionMatch === "other-source"
+  ) {
+    throw new Error(
+      `The application named ${input.serviceName} belongs to a different repository or directory. Choose a different --service name.`,
+    );
   }
   // "Application" is what the dashboard calls this object. The CLI used to call
   // it a service here and then link the reader to a page that has no such word
@@ -706,8 +719,8 @@ export async function provisionFlow(
 ): Promise<ProvisionResult> {
   const project = await resolveProject(input);
 
-  let serviceName = input.defaultServiceName;
-  if (!input.assumeYes) {
+  let serviceName = input.serviceName?.trim() || input.defaultServiceName;
+  if (!input.serviceName && !input.assumeYes) {
     serviceName = await input.prompter.ask(
       "Service name",
       input.defaultServiceName,
@@ -721,6 +734,7 @@ export async function provisionFlow(
     recipe: input.recipe,
     stack: input.stack,
     serviceName,
+    rejectOtherSource: Boolean(input.serviceName),
     ui: input.ui,
     ...(input.identity ? { identity: input.identity } : {}),
     ...(input.identityLabel ? { identityLabel: input.identityLabel } : {}),
