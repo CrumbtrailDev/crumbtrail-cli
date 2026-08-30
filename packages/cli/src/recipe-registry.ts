@@ -237,12 +237,68 @@ export function sdkInstallSpec(pkg: string): string {
  * future recipe missing an entry fails typecheck — preserve that safety net.
  */
 export const RECIPE_REGISTRY: Record<Recipe, RecipeMeta> = {
+  "aws-lambda": {
+    stack: "node",
+    reportedStack: "aws-lambda",
+    sdkPackages: ["crumbtrail-core", "crumbtrail-node"],
+    serviceName: "function",
+    kind: "inject",
+  },
+  "vercel-functions": {
+    stack: "node",
+    reportedStack: "vercel-functions",
+    sdkPackages: ["crumbtrail-core", "crumbtrail-node"],
+    serviceName: "function",
+    kind: "inject",
+  },
+  "vercel-edge-functions": {
+    stack: "hono",
+    reportedStack: "vercel-edge-functions",
+    sdkPackages: ["crumbtrail-core"],
+    serviceName: "function",
+    kind: "inject",
+  },
+  "vercel-functions-ambiguous": {
+    stack: "node",
+    reportedStack: "vercel-functions",
+    sdkPackages: ["crumbtrail-core", "crumbtrail-node"],
+    serviceName: "function",
+    kind: "inject",
+  },
+  "netlify-functions": {
+    stack: "node",
+    reportedStack: "netlify-functions",
+    sdkPackages: ["crumbtrail-core", "crumbtrail-node"],
+    serviceName: "function",
+    kind: "inject",
+  },
+  "netlify-edge-functions": {
+    stack: "hono",
+    reportedStack: "netlify-edge-functions",
+    sdkPackages: ["crumbtrail-core"],
+    serviceName: "function",
+    kind: "inject",
+  },
+  "netlify-functions-ambiguous": {
+    stack: "node",
+    reportedStack: "netlify-functions",
+    sdkPackages: ["crumbtrail-core", "crumbtrail-node"],
+    serviceName: "function",
+    kind: "inject",
+  },
   "cloudflare-workers": {
     stack: "hono",
     reportedStack: "cloudflare-workers",
-    sdkPackages: [],
+    sdkPackages: ["crumbtrail-core"],
     serviceName: "worker",
-    kind: "otlp",
+    kind: "inject",
+  },
+  "deno-deploy": {
+    stack: "hono",
+    reportedStack: "deno-deploy",
+    sdkPackages: ["crumbtrail-core"],
+    serviceName: "function",
+    kind: "inject",
   },
   tauri: {
     stack: "vite", // no "tauri" Stack id — Tauri frontends are typically vite

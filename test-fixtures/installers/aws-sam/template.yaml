@@ -1,0 +1,7 @@
+Transform: AWS::Serverless-2016-10-31
+Resources:
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handler.handler
+      Runtime: nodejs20.x

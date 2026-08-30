@@ -51,7 +51,15 @@ export type Recipe =
   // Flutter. The one recipe with no JavaScript anywhere in it: the project is a
   // pubspec, the SDK is a pub package, and the entry is Dart.
   | "flutter"
+  | "aws-lambda"
+  | "vercel-functions"
+  | "vercel-edge-functions"
+  | "vercel-functions-ambiguous"
+  | "netlify-functions"
+  | "netlify-edge-functions"
+  | "netlify-functions-ambiguous"
   | "cloudflare-workers"
+  | "deno-deploy"
   | "nestjs"
   | "express"
   | "hono"
@@ -1027,6 +1035,305 @@ function hasDenoMarker(root: string, reader: FileReader): boolean {
   );
 }
 
+const SERVERLESS_SOURCE_EXTENSIONS = new Set([
+  ".js",
+  ".jsx",
+  ".ts",
+  ".tsx",
+  ".mjs",
+  ".cjs",
+  ".mts",
+  ".cts",
+]);
+
+const DENO_CONFIG_FILES = ["deno.json", "deno.jsonc"] as const;
+const AWS_SERVERLESS_CONFIG_FILES = [
+  "serverless.yml",
+  "serverless.yaml",
+  "serverless.ts",
+] as const;
+const AWS_SAM_TEMPLATE_FILES = [
+  "template.yml",
+  "template.yaml",
+  "template.json",
+] as const;
+const VERCEL_CONFIG_FILES = ["vercel.json"] as const;
+const NETLIFY_CONFIG_FILES = ["netlify.toml"] as const;
+
+/** Fixed config files whose contents serverless detection may inspect. */
+export const SERVERLESS_DETECTION_CONFIG_FILES = [
+  ...DENO_CONFIG_FILES,
+  ...AWS_SERVERLESS_CONFIG_FILES,
+  ...AWS_SAM_TEMPLATE_FILES,
+  ...VERCEL_CONFIG_FILES,
+  ...NETLIFY_CONFIG_FILES,
+] as const;
+
+const DENO_DEFAULT_ENTRY_FILES = [
+  "main.ts",
+  "main.js",
+  "mod.ts",
+  "mod.js",
+  "server.ts",
+  "server.js",
+  "index.ts",
+  "index.js",
+] as const;
+
+function sourceFilesIn(
+  root: string,
+  relativeDir: string,
+  reader: FileReader,
+): string[] {
+  const dir = path.join(root, relativeDir);
+  if (!reader.isDir(dir)) return [];
+  const files: string[] = [];
+  const visit = (current: string, depth: number): void => {
+    if (depth > 2 || files.length >= 32) return;
+    for (const entry of reader.readDir(current)) {
+      const full = path.join(current, entry);
+      if (reader.isDir(full)) visit(full, depth + 1);
+      else if (SERVERLESS_SOURCE_EXTENSIONS.has(path.extname(entry)))
+        files.push(full);
+    }
+  };
+  visit(dir, 0);
+  return files.sort();
+}
+
+function denoConfiguredEntries(configText: string): string[] {
+  return [
+    ...configText.matchAll(/(?:^|[\s"'])([\w./-]+\.(?:[cm]?[jt]sx?))\b/g),
+  ].map((match) => match[1]);
+}
+
+/** Existing source files whose contents serverless detection may inspect. */
+export function serverlessDetectionSourceFiles(
+  root: string,
+  reader: FileReader,
+): string[] {
+  const hasDenoConfig = DENO_CONFIG_FILES.some((file) =>
+    reader.isFile(path.join(root, file)),
+  );
+  const denoEntries = DENO_CONFIG_FILES.flatMap((file) =>
+    denoConfiguredEntries(safeRead(path.join(root, file), reader) ?? ""),
+  );
+  const candidates = [
+    ...(hasDenoConfig
+      ? [
+          ...DENO_DEFAULT_ENTRY_FILES.map((file) => path.join(root, file)),
+          ...denoEntries.map((file) => path.join(root, file)),
+          ...sourceFilesIn(root, "src", reader),
+        ]
+      : []),
+    ...sourceFilesIn(root, "api", reader),
+    ...sourceFilesIn(root, path.join("netlify", "functions"), reader),
+    ...sourceFilesIn(root, path.join("netlify", "edge-functions"), reader),
+  ];
+  return [...new Set(candidates)].filter((file) => reader.isFile(file)).sort();
+}
+
+function firstDenoServeEntry(
+  root: string,
+  configText: string,
+  reader: FileReader,
+): string | null {
+  const candidates = [
+    ...DENO_DEFAULT_ENTRY_FILES,
+    ...denoConfiguredEntries(configText),
+    ...sourceFilesIn(root, "src", reader).map((file) =>
+      path.relative(root, file),
+    ),
+  ];
+  for (const candidate of candidates) {
+    const full = path.join(root, candidate);
+    const text = safeRead(full, reader);
+    if (text != null && /\bDeno\s*\.\s*serve\s*\(/.test(text)) return full;
+  }
+  return null;
+}
+
+function awsServerlessConfig(
+  root: string,
+  reader: FileReader,
+): { file: string; evidence: string } | null {
+  for (const file of AWS_SERVERLESS_CONFIG_FILES) {
+    const text = safeRead(path.join(root, file), reader);
+    if (text == null) continue;
+    const yamlAws =
+      /^\s*provider\s*:\s*aws\s*(?:#.*)?$/im.test(text) ||
+      /^\s*provider\s*:\s*(?:#.*)?\n(?:^[ \t]+.*\n)*?^[ \t]+name\s*:\s*aws\s*(?:#.*)?$/im.test(
+        text,
+      );
+    const tsAws =
+      /\bprovider\s*:\s*["']aws["']/.test(text) ||
+      /\bprovider\s*:\s*\{[\s\S]{0,500}?\bname\s*:\s*["']aws["']/.test(text);
+    if (yamlAws || tsAws) return { file, evidence: "AWS provider" };
+  }
+  return null;
+}
+
+function awsSamTemplate(
+  root: string,
+  reader: FileReader,
+): { file: string; evidence: string } | null {
+  for (const file of AWS_SAM_TEMPLATE_FILES) {
+    const text = safeRead(path.join(root, file), reader);
+    if (text == null) continue;
+    if (
+      /AWS::Serverless::/.test(text) ||
+      /AWS::Serverless-2016-10-31/.test(text)
+    ) {
+      return { file, evidence: "AWS SAM transform or resource" };
+    }
+  }
+  return null;
+}
+
+type ServerlessRuntime = "node" | "edge" | "ambiguous";
+
+function decisiveRuntime(
+  node: string[],
+  edge: string[],
+  hasUnknown = false,
+): ServerlessRuntime {
+  if (hasUnknown) return "ambiguous";
+  if (node.length > 0 && edge.length === 0) return "node";
+  if (edge.length > 0 && node.length === 0) return "edge";
+  return "ambiguous";
+}
+
+function vercelEvidence(
+  root: string,
+  deps: Record<string, string>,
+  reader: FileReader,
+): {
+  runtime: ServerlessRuntime;
+  reasons: string[];
+  strength: "strong" | "weak";
+} | null {
+  const configText = safeRead(path.join(root, VERCEL_CONFIG_FILES[0]), reader);
+  const apiFiles = sourceFilesIn(root, "api", reader);
+  const dependency = Object.keys(deps).find((name) =>
+    name.startsWith("@vercel/"),
+  );
+  if (configText == null && !dependency && apiFiles.length === 0) return null;
+
+  const reasons: string[] = [];
+  const node: string[] = [];
+  const edge: string[] = [];
+  let hasUnknownRuntime = false;
+  if (configText != null) {
+    reasons.push("found vercel.json");
+    for (const match of configText.matchAll(/"runtime"\s*:\s*"([^"]+)"/g)) {
+      const runtime = match[1];
+      if (/^nodejs|@vercel\/node/i.test(runtime))
+        node.push(`vercel.json runtime ${runtime}`);
+      else if (/edge/i.test(runtime))
+        edge.push(`vercel.json runtime ${runtime}`);
+    }
+    try {
+      const parsed = JSON.parse(configText) as {
+        functions?: Record<string, { runtime?: unknown }>;
+      };
+      hasUnknownRuntime = Object.values(parsed.functions ?? {}).some(
+        (value) =>
+          !value ||
+          typeof value !== "object" ||
+          typeof value.runtime !== "string" ||
+          !(
+            /^nodejs|@vercel\/node/i.test(value.runtime) ||
+            /edge/i.test(value.runtime)
+          ),
+      );
+    } catch {
+      // Invalid JSON is marker evidence only. Runtime must come from a
+      // dependency or source, otherwise the result remains ambiguous.
+      hasUnknownRuntime = node.length === 0 && edge.length === 0;
+    }
+  }
+  if (dependency) reasons.push(`found \`${dependency}\` dependency`);
+  if ("@vercel/node" in deps) node.push("`@vercel/node` dependency");
+  if ("@vercel/edge" in deps) edge.push("`@vercel/edge` dependency");
+  if (apiFiles.length > 0)
+    reasons.push(
+      `found conventional Vercel function ${path.relative(root, apiFiles[0])}`,
+    );
+  for (const file of apiFiles) {
+    const source = safeRead(file, reader) ?? "";
+    if (
+      /from\s+["']@vercel\/node["']/.test(source) ||
+      /\bVercel(?:Request|Response)\b/.test(source)
+    )
+      node.push(`${path.relative(root, file)} uses Vercel Node types`);
+    if (
+      /\bruntime\s*(?::|=)\s*["'](?:experimental-)?edge["']/.test(source) ||
+      /from\s+["']@vercel\/edge["']/.test(source)
+    )
+      edge.push(`${path.relative(root, file)} declares the edge runtime`);
+  }
+  reasons.push(...node, ...edge);
+  return {
+    runtime: decisiveRuntime(node, edge, hasUnknownRuntime),
+    reasons,
+    strength: configText != null || dependency ? "strong" : "weak",
+  };
+}
+
+function netlifyEvidence(
+  root: string,
+  deps: Record<string, string>,
+  reader: FileReader,
+): { runtime: ServerlessRuntime; reasons: string[] } | null {
+  const configText = safeRead(path.join(root, NETLIFY_CONFIG_FILES[0]), reader);
+  const nodeFiles = sourceFilesIn(
+    root,
+    path.join("netlify", "functions"),
+    reader,
+  );
+  const edgeFiles = sourceFilesIn(
+    root,
+    path.join("netlify", "edge-functions"),
+    reader,
+  );
+  const dependency = Object.keys(deps).find((name) =>
+    name.startsWith("@netlify/"),
+  );
+  if (
+    configText == null &&
+    !dependency &&
+    nodeFiles.length === 0 &&
+    edgeFiles.length === 0
+  )
+    return null;
+
+  const reasons: string[] = [];
+  const node: string[] = [];
+  const edge: string[] = [];
+  if (configText != null) {
+    reasons.push("found netlify.toml");
+    if (/^\s*\[functions\]\s*$/m.test(configText))
+      node.push("netlify.toml [functions] configuration");
+    if (/^\s*\[\[?edge_functions\]?\]\s*$/m.test(configText))
+      edge.push("netlify.toml edge_functions configuration");
+  }
+  if (dependency) reasons.push(`found \`${dependency}\` dependency`);
+  if ("@netlify/functions" in deps)
+    node.push("`@netlify/functions` dependency");
+  if ("@netlify/edge-functions" in deps)
+    edge.push("`@netlify/edge-functions` dependency");
+  if (nodeFiles.length > 0)
+    node.push(
+      `conventional Node function ${path.relative(root, nodeFiles[0])}`,
+    );
+  if (edgeFiles.length > 0)
+    edge.push(
+      `conventional edge function ${path.relative(root, edgeFiles[0])}`,
+    );
+  reasons.push(...node, ...edge);
+  return { runtime: decisiveRuntime(node, edge), reasons };
+}
+
 /** True when any Docker/Compose marker file is present at root. */
 function hasDockerMarker(root: string, reader: FileReader): boolean {
   return DOCKER_MARKER_FILES.some((f) => reader.isFile(path.join(root, f)));
@@ -1137,6 +1444,108 @@ const RECIPE_MATCHERS: ReadonlyArray<
     },
   ],
   [
+    "deno-deploy",
+    ({ root, reasons, reader }) => {
+      const marker = DENO_CONFIG_FILES.find((name) =>
+        reader.isFile(path.join(root, name)),
+      );
+      if (!marker) return null;
+      const configText = safeRead(path.join(root, marker), reader) ?? "";
+      const entryFile = firstDenoServeEntry(root, configText, reader);
+      if (!entryFile) return null;
+      reasons.push(
+        `found ${marker} and ${path.relative(root, entryFile)} with Deno.serve`,
+      );
+      return { entryFile, nextVersion: null };
+    },
+  ],
+  [
+    "aws-lambda",
+    ({ root, reasons, reader }) => {
+      const framework = awsServerlessConfig(root, reader);
+      const sam = awsSamTemplate(root, reader);
+      const match = framework ?? sam;
+      if (!match) return null;
+      reasons.push(`found ${match.file} with ${match.evidence}`);
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
+    "vercel-functions",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = vercelEvidence(root, deps, reader);
+      if (
+        !evidence ||
+        evidence.strength !== "strong" ||
+        evidence.runtime !== "node"
+      )
+        return null;
+      reasons.push(...evidence.reasons);
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
+    "vercel-edge-functions",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = vercelEvidence(root, deps, reader);
+      if (
+        !evidence ||
+        evidence.strength !== "strong" ||
+        evidence.runtime !== "edge"
+      )
+        return null;
+      reasons.push(...evidence.reasons);
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
+    "vercel-functions-ambiguous",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = vercelEvidence(root, deps, reader);
+      if (
+        !evidence ||
+        evidence.strength !== "strong" ||
+        evidence.runtime !== "ambiguous"
+      )
+        return null;
+      reasons.push(...evidence.reasons);
+      reasons.push(
+        "Vercel runtime is ambiguous; choose the Node or edge adapter for each function",
+      );
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
+    "netlify-functions",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = netlifyEvidence(root, deps, reader);
+      if (!evidence || evidence.runtime !== "node") return null;
+      reasons.push(...evidence.reasons);
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
+    "netlify-edge-functions",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = netlifyEvidence(root, deps, reader);
+      if (!evidence || evidence.runtime !== "edge") return null;
+      reasons.push(...evidence.reasons);
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
+    "netlify-functions-ambiguous",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = netlifyEvidence(root, deps, reader);
+      if (!evidence || evidence.runtime !== "ambiguous") return null;
+      reasons.push(...evidence.reasons);
+      reasons.push(
+        "Netlify runtime is ambiguous; choose the Node or edge adapter for each function",
+      );
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
     "next",
     ({ deps, reasons }) => {
       if (!("next" in deps)) return null;
@@ -1220,13 +1629,16 @@ const RECIPE_MATCHERS: ReadonlyArray<
     // `dependencies` with react-scripts left to the wrapper's own peer range.
     "cra",
     ({ root, deps, reasons, reader }) => {
-      const marker = ["react-scripts", "@craco/craco", "react-app-rewired"].find(
-        (d) => d in deps,
-      );
+      const marker = [
+        "react-scripts",
+        "@craco/craco",
+        "react-app-rewired",
+      ].find((d) => d in deps);
       if (!marker) return null;
       reasons.push(`found \`${marker}\` dependency`);
       const entryFile = resolveCraEntry(root, reader);
-      if (!entryFile) reasons.push("could not resolve src/index.{tsx,jsx,ts,js}");
+      if (!entryFile)
+        reasons.push("could not resolve src/index.{tsx,jsx,ts,js}");
       return { entryFile, nextVersion: null };
     },
   ],
@@ -1302,6 +1714,51 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!entryFile)
         reasons.push("could not resolve an App/_layout/index entry");
       return { entryFile, nextVersion: null };
+    },
+  ],
+  [
+    "vercel-functions",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = vercelEvidence(root, deps, reader);
+      if (
+        !evidence ||
+        evidence.strength !== "weak" ||
+        evidence.runtime !== "node"
+      )
+        return null;
+      reasons.push(...evidence.reasons);
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
+    "vercel-edge-functions",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = vercelEvidence(root, deps, reader);
+      if (
+        !evidence ||
+        evidence.strength !== "weak" ||
+        evidence.runtime !== "edge"
+      )
+        return null;
+      reasons.push(...evidence.reasons);
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
+    "vercel-functions-ambiguous",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = vercelEvidence(root, deps, reader);
+      if (
+        !evidence ||
+        evidence.strength !== "weak" ||
+        evidence.runtime !== "ambiguous"
+      )
+        return null;
+      reasons.push(...evidence.reasons);
+      reasons.push(
+        "Vercel runtime is ambiguous; choose the Node or edge adapter for each function",
+      );
+      return { entryFile: null, nextVersion: null };
     },
   ],
   [
@@ -1545,6 +2002,11 @@ export function detect(
     } else {
       reasons.push(describeNoRecipe(root, packageJsonPath, pkg, deps));
     }
+  } else if (
+    recipe === "vercel-functions-ambiguous" ||
+    recipe === "netlify-functions-ambiguous"
+  ) {
+    ambiguous = true;
   } else if (
     (recipe === "tauri" ||
       recipe === "remix" ||

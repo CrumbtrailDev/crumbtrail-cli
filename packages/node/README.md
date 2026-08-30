@@ -13,6 +13,8 @@ the artifacts it produces are read by the hosted Crumbtrail product.
 npm install crumbtrail-node
 ```
 
+Requires Node.js 22.15 or later.
+
 Or let the setup wizard install and wire everything for you:
 
 ```bash
@@ -35,6 +37,14 @@ pnpm verify:fresh-install
 The verifier builds and packs `crumbtrail-core` and `crumbtrail-node`, installs the packed
 tarballs into a temporary npm project, and captures a deliberate failure through the
 installed package. Passing output names each phase it cleared.
+
+## Serverless Node handlers
+
+This package exports `withCrumbtrailAwsLambda`, `withCrumbtrailVercel`, and
+`withCrumbtrailNetlify` for async HTTP handlers. Each wrapper requires an
+`endpoint` or custom `transport`. For exact platform examples, lifecycle
+behavior, options, and limitations, see
+[Capture serverless HTTP functions](../../docs/integrations/serverless-functions.md).
 
 ## Database diffing
 

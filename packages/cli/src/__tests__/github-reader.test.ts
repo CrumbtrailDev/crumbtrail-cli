@@ -293,10 +293,7 @@ describe("hydrateGithubReader", () => {
     files["packages/late/src/main.tsx"] = "render()";
     const { src } = source(files, dirs);
     const reader = await hydrateGithubReader(src, {
-      extraPaths: [
-        "/packages/late/package.json",
-        "/packages/late/index.html",
-      ],
+      extraPaths: ["/packages/late/package.json", "/packages/late/index.html"],
     });
     expect(reader.readFile("/packages/late/src/main.tsx")).toBe("render()");
   });
@@ -329,6 +326,42 @@ describe("hydrateGithubReader", () => {
         alreadyWired: () => false,
       }),
     ).not.toThrow();
+  });
+
+  it("hydrates every serverless config and source candidate detection reads", async () => {
+    const files = {
+      "deno.json": '{"tasks":{"start":"deno run src/deploy.ts"}}',
+      "deno.jsonc": "{}",
+      "serverless.yml": "provider: gcp",
+      "serverless.yaml": "provider: gcp",
+      "serverless.ts": 'export default { provider: "gcp" }',
+      "template.yml": "Resources: {}",
+      "template.yaml": "Resources: {}",
+      "template.json": '{"Resources":{}}',
+      "vercel.json": "{}",
+      "netlify.toml": "",
+      "main.ts": "console.log('main')",
+      "src/deploy.ts": "Deno.serve(() => new Response('ok'))",
+      "api/hello.ts": "export default () => new Response('ok')",
+      "netlify/functions/hello.ts": "export const handler = async () => ({})",
+      "netlify/edge-functions/hello.ts":
+        "export default () => new Response('ok')",
+    };
+    const { src } = source(files, [
+      "src",
+      "api",
+      "netlify",
+      "netlify/functions",
+      "netlify/edge-functions",
+    ]);
+
+    const reader = await hydrateGithubReader(src);
+
+    // Goes red when detection adds a serverless config variant or source scan
+    // without adding the same reachable content to GitHub hydration.
+    for (const [file, content] of Object.entries(files)) {
+      expect(reader.readFile(`/${file}`), file).toBe(content);
+    }
   });
 
   it("keeps hydration to three rounds and skips absent manifests", async () => {

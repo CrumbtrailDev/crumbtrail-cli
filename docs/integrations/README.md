@@ -8,6 +8,7 @@ Sessionless spans and logs are accepted. Crumbtrail auto-creates time-window ses
 | Source | Recipe |
 |---|---|
 | OpenTelemetry SDK | [opentelemetry.md](./opentelemetry.md) |
+| Serverless HTTP functions | [serverless-functions.md](./serverless-functions.md) |
 | Datadog | [datadog.md](./datadog.md) |
 | Sentry via OpenTelemetry | [sentry.md](./sentry.md) |
 | Grafana Alloy | [grafana-alloy.md](./grafana-alloy.md) |

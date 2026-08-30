@@ -27,11 +27,16 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { packLocal } from "./pack-local.mjs";
 import { createIngestRecorder } from "./lib/stub-ingest.mjs";
 import { seedAuthCache, startStubCloud } from "./lib/stub-cloud.mjs";
-import { getRecipe, recipeNames } from "./lib/installer-recipes.mjs";
+import {
+  getRecipe,
+  groupNames,
+  recipeNames,
+} from "./lib/installer-recipes.mjs";
 import { loadAndCapture } from "./lib/browser-load.mjs";
 import { startCorsProxy } from "./lib/cors-proxy.mjs";
 
@@ -47,10 +52,16 @@ function phase(status, name, detail = "") {
 }
 
 function parseArgs(argv) {
-  const args = { recipe: undefined, keep: false, mode: "inproc" };
+  const args = {
+    recipe: undefined,
+    group: undefined,
+    keep: false,
+    mode: "inproc",
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--recipe") args.recipe = argv[++i];
+    else if (a === "--group") args.group = argv[++i];
     else if (a === "--keep") args.keep = true;
     else if (a === "--mode") args.mode = argv[++i];
     else {
@@ -62,6 +73,16 @@ function parseArgs(argv) {
     console.error(
       `--recipe must be one of: ${recipeNames().join(", ")} (got ${args.recipe})`,
     );
+    process.exit(2);
+  }
+  if (args.group && !groupNames().includes(args.group)) {
+    console.error(
+      `--group must be one of: ${groupNames().join(", ")} (got ${args.group})`,
+    );
+    process.exit(2);
+  }
+  if (args.recipe && args.group) {
+    console.error("--recipe and --group are mutually exclusive");
     process.exit(2);
   }
   if (!["inproc", "binary"].includes(args.mode)) {
@@ -157,6 +178,118 @@ async function readFileSafe(p) {
     return await fs.readFile(p, "utf8");
   } catch {
     return null;
+  }
+}
+
+const SERVERLESS_SNAPSHOT_CANDIDATES = {
+  platformConfig: [
+    "serverless.yml",
+    "serverless.yaml",
+    "serverless.ts",
+    "template.yml",
+    "template.yaml",
+    "template.json",
+    "vercel.json",
+    "netlify.toml",
+    "wrangler.toml",
+    "wrangler.json",
+    "wrangler.jsonc",
+    "deno.json",
+    "deno.jsonc",
+  ],
+  dependencyManifest: [
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "deno.json",
+    "deno.jsonc",
+    "deno.lock",
+  ],
+  environment: [".env", ".env.local", ".env.development", ".env.production"],
+  agentConfig: [
+    ".mcp.json",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".cursor/mcp.json",
+    ".vscode/mcp.json",
+    ".claude/settings.json",
+  ],
+};
+
+const SERVERLESS_SOURCE_EXTENSIONS = new Set([
+  ".js",
+  ".jsx",
+  ".ts",
+  ".tsx",
+  ".mjs",
+  ".cjs",
+  ".mts",
+  ".cts",
+]);
+
+async function listFiles(root, dir = root) {
+  const files = [];
+  for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...(await listFiles(root, full)));
+    else if (entry.isFile()) files.push(path.relative(root, full));
+  }
+  return files.sort();
+}
+
+function sha256(content) {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+/** Hash every byte, plus named category candidates that may currently be absent. */
+async function snapshotServerlessFixture(appDir) {
+  const files = await listFiles(appDir);
+  const hashes = {};
+  for (const rel of files) {
+    hashes[rel] = sha256(await fs.readFile(path.join(appDir, rel)));
+  }
+  const categories = {
+    source: Object.fromEntries(
+      files
+        .filter((rel) => SERVERLESS_SOURCE_EXTENSIONS.has(path.extname(rel)))
+        .map((rel) => [rel, hashes[rel]]),
+    ),
+  };
+  for (const [category, candidates] of Object.entries(
+    SERVERLESS_SNAPSHOT_CANDIDATES,
+  )) {
+    categories[category] = Object.fromEntries(
+      candidates.map((rel) => [rel, hashes[rel] ?? null]),
+    );
+  }
+  return { hashes, categories };
+}
+
+function changedSnapshotPaths(before, after) {
+  const paths = new Set([
+    ...Object.keys(before.hashes),
+    ...Object.keys(after.hashes),
+  ]);
+  return [...paths]
+    .filter((rel) => before.hashes[rel] !== after.hashes[rel])
+    .sort();
+}
+
+function assertSnapshotEqual(before, after, label) {
+  const changed = changedSnapshotPaths(before, after);
+  if (changed.length > 0) {
+    throw new Error(
+      `${label} mutated guided fixture file(s): ${changed.join(", ")}`,
+    );
+  }
+  for (const category of Object.keys(before.categories)) {
+    if (
+      JSON.stringify(before.categories[category]) !==
+      JSON.stringify(after.categories[category])
+    ) {
+      throw new Error(`${label} changed ${category} snapshot bytes`);
+    }
   }
 }
 
@@ -799,7 +932,8 @@ function backendReqState(ingest) {
     if (!Array.isArray(events)) continue;
     if (
       !events.some(
-        (ev) => ev && typeof ev.k === "string" && ev.k.startsWith("backend.req."),
+        (ev) =>
+          ev && typeof ev.k === "string" && ev.k.startsWith("backend.req."),
       )
     ) {
       continue;
@@ -1079,6 +1213,310 @@ async function runRecipeGuidance({ name, tmpRoot }) {
   return { name, ok: true };
 }
 
+function assertServerlessPlan(name, recipe, plan) {
+  if (plan.kind !== recipe.expectedPlanKind) {
+    throw new Error(
+      `expected plan kind '${recipe.expectedPlanKind}', buildPlan produced '${plan.kind}'`,
+    );
+  }
+  if (plan.targetPath !== null || plan.content !== null) {
+    throw new Error(
+      `serverless guidance must not target a file (targetPath=${plan.targetPath}, content!=null=${plan.content !== null})`,
+    );
+  }
+  if ((plan.sdkPackages ?? []).length !== 0) {
+    throw new Error(
+      `serverless guidance requested automatic SDK installation: ${plan.sdkPackages.join(", ")}`,
+    );
+  }
+  if (plan.keyEnvVar !== undefined) {
+    throw new Error(
+      `serverless guidance requested an automatic ${plan.keyEnvVar} env write`,
+    );
+  }
+
+  const snippet = plan.snippet ?? "";
+  for (const needle of recipe.guidanceMustContain) {
+    if (!snippet.includes(needle)) {
+      throw new Error(
+        `guidance snippet missing '${needle}'\n--- snippet ---\n${snippet}`,
+      );
+    }
+  }
+  const adapterImports = {
+    node: /import .* from "crumbtrail-node";/,
+    fetch: /import .* from "(?:npm:)?crumbtrail-core\/serverless";/,
+  };
+  for (const family of recipe.expectedAdapterFamilies) {
+    if (!adapterImports[family]?.test(snippet)) {
+      throw new Error(
+        `${name} guidance is missing the ${family} adapter import`,
+      );
+    }
+  }
+  if (!plan.agentPrompt?.includes(snippet)) {
+    throw new Error("serverless agent prompt does not carry the copyable plan");
+  }
+}
+
+function normalizeServerlessWizardOutput(output) {
+  return output.replaceAll(/127\.0\.0\.1:\d+/g, "127.0.0.1:PORT");
+}
+
+async function runServerlessWizardPass({
+  name,
+  recipe,
+  appDir,
+  tmpRoot,
+  packed,
+  pass,
+}) {
+  const xdgDir = path.join(tmpRoot, name, `xdg-${pass}`);
+  await fs.mkdir(xdgDir, { recursive: true });
+  const ingest = createIngestRecorder();
+  const stub = await startStubCloud({
+    ingest,
+    tarballsDir: path.dirname(packed.manifestPath),
+  });
+  seedAuthCache(xdgDir, { base: stub.baseUrl, token: "ctcli_seeded_token" });
+
+  try {
+    const distCli = await import(
+      pathToFileURL(path.join(cliDist, "cli.js")).href
+    );
+    const realDeps = distCli.defaultDeps();
+    const { ui, lines } = captureUi();
+    let detectCalls = 0;
+    let buildPlanCalls = 0;
+    let executePlanCalls = 0;
+    let installSdkCalls = 0;
+    let pollCalls = 0;
+    const deps = {
+      ...realDeps,
+      cwd: appDir,
+      isTTY: false,
+      ui,
+      prompter: noopPrompter,
+      env: {
+        ...process.env,
+        XDG_CONFIG_HOME: xdgDir,
+        HOME: xdgDir,
+        CRUMBTRAIL_BASE_URL: stub.baseUrl,
+        NO_COLOR: "1",
+      },
+      detect: (...args) => {
+        detectCalls += 1;
+        return realDeps.detect(...args);
+      },
+      buildPlan: (...args) => {
+        buildPlanCalls += 1;
+        const plan = realDeps.buildPlan(...args);
+        assertServerlessPlan(name, recipe, plan);
+        return plan;
+      },
+      executePlan: (...args) => {
+        executePlanCalls += 1;
+        const applied = realDeps.executePlan(...args);
+        if (!applied.skipped || applied.written.length > 0) {
+          throw new Error(
+            `wizard executePlan wrote ${applied.written.join(", ") || "unexpected state"}`,
+          );
+        }
+        return applied;
+      },
+      installSdk: async (input) => {
+        installSdkCalls += 1;
+        if (!Array.isArray(input.packagesOverride)) {
+          throw new Error(
+            "serverless plan omitted its explicit empty package list",
+          );
+        }
+        const installed = await realDeps.installSdk(input);
+        if (installed.installed || installed.packages.length > 0) {
+          throw new Error(
+            `serverless wizard attempted automatic SDK installation: ${installed.packages.join(", ")}`,
+          );
+        }
+        return installed;
+      },
+      openBrowserFn: async () => false,
+      pollForRealEvent: async () => {
+        pollCalls += 1;
+        throw new Error("serverless guidance must not poll for a first event");
+      },
+      mintAgentToken: async () => {
+        throw new Error("serverless guidance must not mint an agent token");
+      },
+    };
+    const parsed = {
+      command: "wizard",
+      yes: true,
+      project: stub.projectId,
+      noBrowser: true,
+      skipVerify: false,
+      endpoint: stub.baseUrl,
+    };
+
+    const code = await distCli.runWizard(parsed, deps);
+    const output = lines.join("\n");
+    if (code !== 1) {
+      throw new Error(
+        `guided wizard exited ${code}; expected 1 for incomplete manual setup\n${output.slice(-1600)}`,
+      );
+    }
+    if (
+      detectCalls !== 1 ||
+      buildPlanCalls !== 1 ||
+      executePlanCalls !== 1 ||
+      installSdkCalls !== 1
+    ) {
+      throw new Error(
+        `wizard path counts were detect=${detectCalls} buildPlan=${buildPlanCalls} executePlan=${executePlanCalls} installSdk=${installSdkCalls}`,
+      );
+    }
+    if (pollCalls !== 0) {
+      throw new Error("guided wizard polled for a hosted event");
+    }
+
+    const requiredSummary = [
+      "Detected a serverless runtime. Apply one setup plan below.",
+      "Serverless setup guidance was printed. No source, config, dependency, or env files were changed.",
+      "No ingest key was minted because the serverless setup plan made no local changes.",
+      "Setup incomplete. One step remains.",
+      "Nothing is wired yet, so there is no first event to wait for.",
+    ];
+    for (const needle of requiredSummary) {
+      if (!output.includes(needle)) {
+        throw new Error(
+          `wizard summary missing '${needle}'\n--- output ---\n${output}`,
+        );
+      }
+    }
+    if (!/Agent:\s+not connected/.test(output)) {
+      throw new Error(
+        `wizard summary did not state that the coding agent remains unconnected\n--- output ---\n${output}`,
+      );
+    }
+    const falseClaims = [
+      /\bWired /,
+      /\b(?:setup|wiring|delivery|capture) (?:is )?(?:complete|verified|successful)\b/i,
+      /\bfirst (?:real )?event (?:received|verified)\b/i,
+      /\b(?:successfully delivered|automatically wired|automatic wiring)\b/i,
+    ];
+    for (const claim of falseClaims) {
+      if (claim.test(output)) {
+        throw new Error(
+          `guided wizard made a false outcome claim '${claim.source}'\n--- output ---\n${output}`,
+        );
+      }
+    }
+    if (/\/sessions\//.test(output)) {
+      throw new Error(
+        "guided wizard printed a session URL without a hosted run",
+      );
+    }
+    return normalizeServerlessWizardOutput(output);
+  } finally {
+    await stub.stop();
+  }
+}
+
+/** Built-artifact lifecycle runner for the ten CP4 serverless fixtures. */
+async function runRecipeServerlessGuidance({ name, packed, tmpRoot }) {
+  const recipe = getRecipe(name);
+  const appDir = path.join(tmpRoot, name, "app");
+  await fs.mkdir(appDir, { recursive: true });
+  await fs.cp(recipe.fixtureDir, appDir, {
+    recursive: true,
+    filter: (src) => !src.includes(`${path.sep}node_modules${path.sep}`),
+  });
+  const baseline = await snapshotServerlessFixture(appDir);
+  phase(
+    "PASS",
+    `${name}:snapshot`,
+    `files=${Object.keys(baseline.hashes).length} source=${Object.keys(baseline.categories.source).length} platform=${Object.values(baseline.categories.platformConfig).filter(Boolean).length} manifests=${Object.values(baseline.categories.dependencyManifest).filter(Boolean).length} env=${Object.values(baseline.categories.environment).filter(Boolean).length} agent=${Object.values(baseline.categories.agentConfig).filter(Boolean).length}`,
+  );
+
+  const distCli = await import(
+    pathToFileURL(path.join(cliDist, "cli.js")).href
+  );
+  const realDeps = distCli.defaultDeps();
+  let firstPlan;
+  for (let pass = 1; pass <= 2; pass += 1) {
+    const detected = realDeps.detect(appDir);
+    if (detected.recipe !== recipe.recipe) {
+      throw new Error(
+        `detect() returned '${detected.recipe}', expected '${recipe.recipe}'`,
+      );
+    }
+    const expectsAmbiguous = recipe.recipe.endsWith("-ambiguous");
+    if (Boolean(detected.ambiguous) !== expectsAmbiguous) {
+      throw new Error(
+        `detect() ambiguous=${Boolean(detected.ambiguous)}, expected ${expectsAmbiguous}`,
+      );
+    }
+    const plan = realDeps.buildPlan({
+      cwd: appDir,
+      recipe: detected.recipe,
+      endpoint: "https://app.crumbtrail.example",
+      apiKey: "bl_serverless_guidance_key",
+      entryFile: detected.entryFile,
+      nextVersion: detected.nextVersion,
+      stack: detected.otlpStack ?? undefined,
+      options: { force: true },
+    });
+    assertServerlessPlan(name, recipe, plan);
+    const serialized = JSON.stringify(plan);
+    if (firstPlan !== undefined && firstPlan !== serialized) {
+      throw new Error("second buildPlan result was not deterministic");
+    }
+    firstPlan = serialized;
+    const applied = realDeps.executePlan(plan);
+    if (!applied.skipped || applied.written.length > 0) {
+      throw new Error(
+        `guided executePlan pass ${pass} wrote ${applied.written.join(", ") || "unexpected state"}`,
+      );
+    }
+    assertSnapshotEqual(
+      baseline,
+      await snapshotServerlessFixture(appDir),
+      `executePlan pass ${pass}`,
+    );
+    phase(
+      "PASS",
+      `${name}:plan:${pass}`,
+      `recipe=${detected.recipe} adapters=${recipe.expectedAdapterFamilies.join("+")} nonmutating`,
+    );
+  }
+
+  const wizardOutputs = [];
+  for (let pass = 1; pass <= 2; pass += 1) {
+    wizardOutputs.push(
+      await runServerlessWizardPass({
+        name,
+        recipe,
+        appDir,
+        tmpRoot,
+        packed,
+        pass,
+      }),
+    );
+    assertSnapshotEqual(
+      baseline,
+      await snapshotServerlessFixture(appDir),
+      `wizard pass ${pass}`,
+    );
+    phase("PASS", `${name}:wizard:${pass}`, "guided not wired or verified");
+  }
+  if (wizardOutputs[0] !== wizardOutputs[1]) {
+    throw new Error(
+      "second wizard guidance and summary were not deterministic",
+    );
+  }
+
+  return { name, ok: true };
+}
+
 /**
  * Plan-only recipe runner (CP3). Some recipes are NON-RUNNABLE by design: they
  * assert on the shape of the wizard's Plan without any npm ci / build / server
@@ -1301,7 +1739,11 @@ async function runRecipeTypecheck({ name, packed, tmpRoot }) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const names = args.recipe ? [args.recipe] : recipeNames();
+  const names = args.recipe
+    ? [args.recipe]
+    : args.group
+      ? recipeNames(args.group)
+      : recipeNames();
   let tmpRoot;
   const results = [];
 
@@ -1317,17 +1759,19 @@ async function main() {
     for (const name of names) {
       try {
         const selected = getRecipe(name);
-        const runner = selected.guidanceOnly
-          ? runRecipeGuidance
-          : selected.planOnly
-            ? runRecipePlanOnly
-            : selected.typecheckCap
-              ? runRecipeTypecheck
-              : selected.browserLoad
-                ? runRecipeBrowser
-                : args.mode === "binary"
-                  ? runRecipeBinary
-                  : runRecipeInproc;
+        const runner = selected.serverlessGuidance
+          ? runRecipeServerlessGuidance
+          : selected.guidanceOnly
+            ? runRecipeGuidance
+            : selected.planOnly
+              ? runRecipePlanOnly
+              : selected.typecheckCap
+                ? runRecipeTypecheck
+                : selected.browserLoad
+                  ? runRecipeBrowser
+                  : args.mode === "binary"
+                    ? runRecipeBinary
+                    : runRecipeInproc;
         results.push(await runner({ name, packed, tmpRoot }));
         phase("PASS", `recipe:${name}`);
       } catch (err) {
@@ -1347,7 +1791,12 @@ async function main() {
   }
 
   // PASS/FAIL matrix.
-  console.log("\nInstaller matrix (mode=" + args.mode + "):");
+  console.log(
+    "\nInstaller matrix (mode=" +
+      args.mode +
+      (args.group ? ` group=${args.group}` : "") +
+      "):",
+  );
   for (const r of results) {
     console.log(
       `  ${r.ok ? "PASS" : "FAIL"}  ${r.name}${r.ok ? "" : `  — ${r.error}`}`,

@@ -8,11 +8,14 @@ export default defineConfig({
   // `crumbtrail-core/react` and `crumbtrail-core/tauri` subpaths. They are
   // separate entries so that importing the core SDK never pulls React or the
   // Tauri IPC bridge into a bundle that has no use for them.
+  // `src/serverless` stays separate so edge runtimes do not initialize the
+  // browser collectors exported by the main entry.
   entry: [
     'src/index.ts',
     'src/early.ts',
     'src/react/index.ts',
     'src/tauri/index.ts',
+    'src/serverless/index.ts',
   ],
   format: ['esm', 'cjs'],
   // Optional peers: never bundled, so a consumer that imports only the core

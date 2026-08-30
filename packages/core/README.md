@@ -19,6 +19,22 @@ Or let the wizard install and wire it for you:
 npx crumbtrail
 ```
 
+## Serverless Fetch handlers
+
+Fetch runtimes import `withCrumbtrailFetch` from the `/serverless` subpath:
+
+```ts
+import { withCrumbtrailFetch } from "crumbtrail-core/serverless";
+
+export const handler = withCrumbtrailFetch(async () => new Response("ok"), {
+  endpoint: "https://your-crumbtrail-host",
+});
+```
+
+The endpoint is required unless you provide a custom transport. For runtime
+bindings, lifecycle hooks, options, data bounds, and platform examples, see
+[Capture serverless HTTP functions](../../docs/integrations/serverless-functions.md).
+
 ## Setup
 
 Call `Crumbtrail.init()` once, at your app's entry point:
@@ -231,7 +247,6 @@ What a keep does and does not do:
 - Your own `denyFields` entry still wins over your keep for the same name.
 - On a **form input** it is matched against the field's `name`, and a
   `password`, `email` or `tel` input is never kept whatever it is called.
-
 
 ## Production capture
 
@@ -624,11 +639,11 @@ Without those three steps every Crumbtrail `invoke` fails.
 
 ## Related packages
 
-| Package                                                                            | Use it for                                                 |
-| ---------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| [`crumbtrail`](https://www.npmjs.com/package/crumbtrail)                           | The `npx crumbtrail` setup wizard                          |
-| [`crumbtrail-node`](https://www.npmjs.com/package/crumbtrail-node)                 | Backend capture: Express, `node:http` and database         |
-| [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native) | React Native and Expo bindings                             |
+| Package                                                                            | Use it for                                         |
+| ---------------------------------------------------------------------------------- | -------------------------------------------------- |
+| [`crumbtrail`](https://www.npmjs.com/package/crumbtrail)                           | The `npx crumbtrail` setup wizard                  |
+| [`crumbtrail-node`](https://www.npmjs.com/package/crumbtrail-node)                 | Backend capture: Express, `node:http` and database |
+| [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native) | React Native and Expo bindings                     |
 
 The React error boundary and state-capture hook, and the Tauri desktop
 transport, are subpaths of this package rather than packages of their own — see

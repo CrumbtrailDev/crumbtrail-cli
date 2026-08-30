@@ -244,3 +244,30 @@ export {
 } from "./db/instrument-shared";
 export { parseLimitOffset } from "./db/sql";
 export { HeadlessTimeoutError } from "./headless-session";
+
+export {
+  withCrumbtrailAwsLambda,
+  withCrumbtrailNetlify,
+  withCrumbtrailVercel,
+} from "./serverless";
+
+export type {
+  AwsApiGatewayV1Event,
+  AwsApiGatewayV2Event,
+  AwsCompatibleHttpEvent,
+  AwsLambdaAsyncHandler,
+  AwsLambdaContext,
+  AwsLambdaHostHandler,
+  AwsLambdaHttpEvent,
+  AwsLambdaHttpEventBase,
+  AwsLambdaRequestContext,
+  NetlifyAsyncHandler,
+  NetlifyFunctionContext,
+  NetlifyFunctionEvent,
+  NetlifyHostHandler,
+  NodeServerlessAdapterOptions,
+  VercelNodeAsyncHandler,
+  VercelNodeHostHandler,
+  VercelNodeRequest,
+  VercelNodeResponse,
+} from "./serverless";

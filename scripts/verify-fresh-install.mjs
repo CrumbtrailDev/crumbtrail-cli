@@ -3,6 +3,7 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import http from "node:http";
+import { builtinModules } from "node:module";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -128,8 +129,7 @@ async function assertPackageMetadata() {
     throw new Error("crumbtrail-core package files must include dist");
   if (nodePkg.name !== "crumbtrail-node")
     throw new Error("packages/node package name mismatch");
-  if (nodePkg.bin)
-    throw new Error("crumbtrail-node must ship no executable");
+  if (nodePkg.bin) throw new Error("crumbtrail-node must ship no executable");
   if (!nodePkg.files?.includes("dist"))
     throw new Error("crumbtrail-node package files must include dist");
   // core is ALSO inlined into node's build (tsup noExternal), so node's runtime never imports this
@@ -195,10 +195,18 @@ async function assertPackedNodeDependency(
     throw new Error("packed crumbtrail-node must ship no executable");
   if (!packedPkg.files?.includes("dist"))
     throw new Error("packed crumbtrail-node package files must include dist");
-  recordPhase("packed-manifest", "pass", `crumbtrail-core=${expectedCoreRange}`);
+  recordPhase(
+    "packed-manifest",
+    "pass",
+    `crumbtrail-core=${expectedCoreRange}`,
+  );
 }
 
-async function assertPackedCliInstallSpecs(cliTarball, tempProjectDir, expectedSpecs) {
+async function assertPackedCliInstallSpecs(
+  cliTarball,
+  tempProjectDir,
+  expectedSpecs,
+) {
   recordPhase("packed-cli-install-specs", "start");
   await fs.writeFile(
     path.join(tempProjectDir, "package.json"),
@@ -224,19 +232,31 @@ async function assertPackedCliInstallSpecs(cliTarball, tempProjectDir, expectedS
   // the expected floor to the current workspace version is what made this check
   // go stale on every release; a floor is allowed to lag behind latest.
   if (emittedSpecs.length !== expectedSpecs.length) {
-    throw new Error(`packed crumbtrail emitted ${emittedSpecs.length} install specs, expected ${expectedSpecs.length}`);
+    throw new Error(
+      `packed crumbtrail emitted ${emittedSpecs.length} install specs, expected ${expectedSpecs.length}`,
+    );
   }
   for (const [index, { pkg, maxVersion }] of expectedSpecs.entries()) {
     const emitted = emittedSpecs[index];
-    const match = new RegExp(`^${pkg}@>=(\\d+\\.\\d+\\.\\d+)$`).exec(emitted ?? "");
+    const match = new RegExp(`^${pkg}@>=(\\d+\\.\\d+\\.\\d+)$`).exec(
+      emitted ?? "",
+    );
     if (!match) {
-      throw new Error(`packed crumbtrail emitted install spec ${JSON.stringify(emitted)}, expected ${pkg}@>=<floor>`);
+      throw new Error(
+        `packed crumbtrail emitted install spec ${JSON.stringify(emitted)}, expected ${pkg}@>=<floor>`,
+      );
     }
     if (compareVersions(match[1], maxVersion) > 0) {
-      throw new Error(`packed crumbtrail floor ${emitted} is ahead of the workspace version ${maxVersion}`);
+      throw new Error(
+        `packed crumbtrail floor ${emitted} is ahead of the workspace version ${maxVersion}`,
+      );
     }
   }
-  recordPhase("packed-cli-install-specs", "pass", `specs=${emittedSpecs.join(",")}`);
+  recordPhase(
+    "packed-cli-install-specs",
+    "pass",
+    `specs=${emittedSpecs.join(",")}`,
+  );
 }
 
 async function installTempProject(tempProjectDir, coreTarball, nodeTarball) {
@@ -303,6 +323,257 @@ async function assertInstalledPackageMetadata(
     throw new Error("installed crumbtrail-core package metadata mismatch");
   }
   recordPhase("installed-package-metadata", "pass");
+}
+
+async function assertInstalledServerlessDeclarations(tempProjectDir) {
+  recordPhase("serverless-declarations", "start");
+  const corePackageRoot = path.join(
+    tempProjectDir,
+    "node_modules",
+    "crumbtrail-core",
+  );
+  const nodePackageRoot = path.join(
+    tempProjectDir,
+    "node_modules",
+    "crumbtrail-node",
+  );
+  const [corePackage, nodePackage] = await Promise.all([
+    readJsonFile(path.join(corePackageRoot, "package.json")),
+    readJsonFile(path.join(nodePackageRoot, "package.json")),
+  ]);
+  const coreExport = corePackage.exports?.["./serverless"];
+  if (
+    coreExport?.types !== "./dist/serverless/index.d.ts" ||
+    coreExport?.import !== "./dist/serverless/index.js" ||
+    coreExport?.require !== "./dist/serverless/index.cjs"
+  ) {
+    throw new Error(
+      "packed crumbtrail-core must expose serverless types, ESM, and CJS entrypoints",
+    );
+  }
+  if (nodePackage.exports?.["."]?.types !== "./dist/index.d.ts") {
+    throw new Error("packed crumbtrail-node must expose its main declarations");
+  }
+
+  const coreDeclaration = await fs.readFile(
+    path.join(corePackageRoot, coreExport.types),
+    "utf8",
+  );
+  const nodeDeclaration = await fs.readFile(
+    path.join(nodePackageRoot, nodePackage.exports["."].types),
+    "utf8",
+  );
+  const requiredCoreDeclarations = [
+    "withCrumbtrailFetch",
+    "FetchAsyncHandler",
+    "FetchHostHandler",
+    "FetchServerlessAdapterOptions",
+    "FetchWaitUntil",
+    "ServerlessInvocationTransport",
+    "ServerlessTransportConfig",
+    "startHeadlessSession",
+    "HeadlessSession",
+    "HeadlessSessionOptions",
+  ];
+  const requiredNodeDeclarations = [
+    "withCrumbtrailAwsLambda",
+    "withCrumbtrailVercel",
+    "withCrumbtrailNetlify",
+    "AwsLambdaAsyncHandler",
+    "AwsLambdaHostHandler",
+    "AwsLambdaHttpEvent",
+    "VercelNodeAsyncHandler",
+    "VercelNodeHostHandler",
+    "NetlifyAsyncHandler",
+    "NetlifyHostHandler",
+    "NodeServerlessAdapterOptions",
+    "startHeadlessSession",
+    "HeadlessSession",
+    "HeadlessSessionOptions",
+    "HeadlessRequestError",
+    "HeadlessTimeoutError",
+  ];
+
+  for (const name of requiredCoreDeclarations) {
+    if (!coreDeclaration.includes(name)) {
+      throw new Error(
+        `packed crumbtrail-core serverless declarations omit ${name}`,
+      );
+    }
+  }
+  for (const name of requiredNodeDeclarations) {
+    if (!nodeDeclaration.includes(name)) {
+      throw new Error(`packed crumbtrail-node declarations omit ${name}`);
+    }
+  }
+  recordPhase(
+    "serverless-declarations",
+    "pass",
+    `core=${requiredCoreDeclarations.length} node=${requiredNodeDeclarations.length}`,
+  );
+}
+
+async function assertInstalledServerlessImports(tempProjectDir) {
+  const runtimeExports = [
+    "withCrumbtrailFetch",
+    "withCrumbtrailAwsLambda",
+    "withCrumbtrailVercel",
+    "withCrumbtrailNetlify",
+  ];
+  const compatibilityExports = [
+    "startHeadlessSession",
+    "HeadlessRequestError",
+    "HeadlessTimeoutError",
+  ];
+  const coreExports = ["withCrumbtrailFetch", ...compatibilityExports];
+  const nodeExports = [
+    "withCrumbtrailAwsLambda",
+    "withCrumbtrailVercel",
+    "withCrumbtrailNetlify",
+    ...compatibilityExports,
+  ];
+
+  const esmProbe = `
+import * as core from "crumbtrail-core/serverless";
+import * as node from "crumbtrail-node";
+for (const name of ${JSON.stringify(coreExports)}) {
+  if (typeof core[name] !== "function") throw new Error("missing core ESM export " + name);
+}
+for (const name of ${JSON.stringify(nodeExports)}) {
+  if (typeof node[name] !== "function") throw new Error("missing node ESM export " + name);
+}
+console.log("SERVERLESS_ESM_IMPORTS_OK");
+`;
+  const cjsProbe = `
+const core = require("crumbtrail-core/serverless");
+const node = require("crumbtrail-node");
+for (const name of ${JSON.stringify(coreExports)}) {
+  if (typeof core[name] !== "function") throw new Error("missing core CJS export " + name);
+}
+for (const name of ${JSON.stringify(nodeExports)}) {
+  if (typeof node[name] !== "function") throw new Error("missing node CJS export " + name);
+}
+console.log("SERVERLESS_CJS_IMPORTS_OK");
+`;
+
+  const [esmOutput, cjsOutput] = await Promise.all([
+    runCommand(
+      "serverless-esm-imports",
+      process.execPath,
+      ["--input-type=module", "--eval", esmProbe],
+      { cwd: tempProjectDir },
+    ),
+    runCommand(
+      "serverless-cjs-imports",
+      process.execPath,
+      ["--input-type=commonjs", "--eval", cjsProbe],
+      { cwd: tempProjectDir },
+    ),
+  ]);
+  if (!esmOutput.stdout.includes("SERVERLESS_ESM_IMPORTS_OK")) {
+    throw new Error("serverless ESM import probe did not reach its assertion");
+  }
+  if (!cjsOutput.stdout.includes("SERVERLESS_CJS_IMPORTS_OK")) {
+    throw new Error("serverless CJS import probe did not reach its assertion");
+  }
+  recordPhase(
+    "serverless-imports",
+    "pass",
+    `runtime=${runtimeExports.length} compatibility=${compatibilityExports.length} formats=2`,
+  );
+}
+
+function importedSpecifiers(source) {
+  const specifiers = new Set();
+  const patterns = [
+    /\bfrom\s*["']([^"']+)["']/g,
+    /\bimport\s*\(\s*["']([^"']+)["']/g,
+    /\brequire\s*\(\s*["']([^"']+)["']/g,
+    /\bimport\s*["']([^"']+)["']/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) specifiers.add(match[1]);
+  }
+  return [...specifiers];
+}
+
+async function collectRuntimeGraph(entryPaths, packageRoot) {
+  const pending = [...entryPaths];
+  const sources = new Map();
+  while (pending.length > 0) {
+    const filePath = pending.pop();
+    if (!filePath || sources.has(filePath)) continue;
+    const source = await fs.readFile(filePath, "utf8");
+    sources.set(filePath, source);
+    for (const specifier of importedSpecifiers(source)) {
+      if (!specifier.startsWith(".")) continue;
+      const dependencyPath = path.resolve(path.dirname(filePath), specifier);
+      const relativePath = path.relative(packageRoot, dependencyPath);
+      if (relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+        throw new Error(
+          `crumbtrail-core serverless runtime imports outside its package: ${specifier}`,
+        );
+      }
+      pending.push(dependencyPath);
+    }
+  }
+  return sources;
+}
+
+async function assertInstalledServerlessRuntimeBoundary(tempProjectDir) {
+  recordPhase("serverless-runtime-boundary", "start");
+  const packageRoot = path.join(
+    tempProjectDir,
+    "node_modules",
+    "crumbtrail-core",
+  );
+  const packageJson = await readJsonFile(
+    path.join(packageRoot, "package.json"),
+  );
+  if (packageJson.dependencies?.["crumbtrail-node"] !== undefined) {
+    throw new Error(
+      "packed crumbtrail-core must not depend on crumbtrail-node",
+    );
+  }
+  const serverlessExport = packageJson.exports?.["./serverless"];
+  const graph = await collectRuntimeGraph(
+    [
+      path.join(packageRoot, serverlessExport.import),
+      path.join(packageRoot, serverlessExport.require),
+    ],
+    packageRoot,
+  );
+  const builtins = new Set(
+    builtinModules.map((name) => name.replace(/^node:/, "")),
+  );
+  for (const [filePath, source] of graph) {
+    if (/AsyncLocalStorage|node:http|\bBuffer\b|\bprocess\./.test(source)) {
+      throw new Error(
+        `crumbtrail-core serverless runtime uses a Node runtime API in ${path.relative(packageRoot, filePath)}`,
+      );
+    }
+    for (const specifier of importedSpecifiers(source)) {
+      const normalized = specifier.replace(/^node:/, "");
+      if (builtins.has(normalized)) {
+        throw new Error(
+          `crumbtrail-core serverless runtime imports Node builtin ${specifier} from ${path.relative(packageRoot, filePath)}`,
+        );
+      }
+      if (
+        specifier === "crumbtrail-node" ||
+        specifier.startsWith("crumbtrail-node/")
+      ) {
+        throw new Error(
+          `crumbtrail-core serverless runtime imports ${specifier} from ${path.relative(packageRoot, filePath)}`,
+        );
+      }
+    }
+  }
+  recordPhase(
+    "serverless-runtime-boundary",
+    "pass",
+    `reachableFiles=${graph.size}`,
+  );
 }
 
 /**
@@ -411,11 +682,15 @@ async function main() {
     await installTempProject(tempProjectDir, coreTarball, nodeTarball);
     await assertInstalledPackageMetadata(tempProjectDir, expectedCoreVersion);
 
+    await assertInstalledServerlessDeclarations(tempProjectDir);
+    await assertInstalledServerlessImports(tempProjectDir);
+    await assertInstalledServerlessRuntimeBoundary(tempProjectDir);
+
     await assertInstalledCapture(tempProjectDir);
 
     recordPhase("complete", "pass", `project=${tempProjectDir}`);
     console.log(
-      "CRUMBTRAIL_FRESH_INSTALL_PASS phases=package-metadata,package-build,package-pack,packed-cli-install-specs,temp-install,installed-package-metadata,capture-proof",
+      "CRUMBTRAIL_FRESH_INSTALL_PASS phases=package-metadata,package-build,package-pack,packed-cli-install-specs,temp-install,installed-package-metadata,serverless-declarations,serverless-imports,serverless-runtime-boundary,capture-proof",
     );
   } catch (err) {
     fail("unexpected", err);

@@ -1,0 +1,9 @@
+{
+  "name": "cloudflare-hono",
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

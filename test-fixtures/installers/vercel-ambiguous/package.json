@@ -1,0 +1,6 @@
+{
+  "name": "vercel-ambiguous",
+  "dependencies": {
+    "@vercel/functions": "^2.0.0"
+  }
+}

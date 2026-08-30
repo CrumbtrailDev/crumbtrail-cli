@@ -544,7 +544,183 @@ INSTALLER_RECIPES["tauri"] = {
   ],
 };
 
-// ── Fixture provenance ───────────────────────────────────────────────────────
+// ── CP5: serverless guidance lifecycle harness ──────────────────────────────
+// CP5 serverless fixtures run through the built CLI's complete guidance path
+// twice. The assertions stay declarative: classification, planning, and
+// execution still use the product artifact rather than duplicating its logic.
+const serverlessGuidance = ({
+  fixture,
+  recipe,
+  adapterFamilies,
+  mustContain,
+}) => ({
+  group: "serverless",
+  serverlessGuidance: true,
+  recipe,
+  fixtureDir: path.join(fixturesRoot, fixture),
+  expectedPlanKind: "serverless-guidance",
+  expectedAdapterFamilies: adapterFamilies,
+  guidanceMustContain: [
+    ...mustContain,
+    "Request and response bodies are excluded by default.",
+  ],
+  buildCmd: null,
+  runCmd: null,
+  portSlot: null,
+});
+
+INSTALLER_RECIPES["aws-serverless"] = serverlessGuidance({
+  fixture: "aws-serverless",
+  recipe: "aws-lambda",
+  adapterFamilies: ["node"],
+  mustContain: [
+    'import { withCrumbtrailAwsLambda } from "crumbtrail-node";',
+    "withCrumbtrailAwsLambda(",
+    "process.env.CRUMBTRAIL_BASE_URL",
+    "process.env.CRUMBTRAIL_KEY",
+    "await Crumbtrail delivery",
+    "Callback handlers and non HTTP triggers are unsupported.",
+  ],
+});
+
+INSTALLER_RECIPES["aws-sam"] = serverlessGuidance({
+  fixture: "aws-sam",
+  recipe: "aws-lambda",
+  adapterFamilies: ["node"],
+  mustContain: [
+    'import { withCrumbtrailAwsLambda } from "crumbtrail-node";',
+    "withCrumbtrailAwsLambda(",
+    "process.env.CRUMBTRAIL_BASE_URL",
+    "process.env.CRUMBTRAIL_KEY",
+    "await Crumbtrail delivery",
+    "Callback handlers and non HTTP triggers are unsupported.",
+  ],
+});
+
+INSTALLER_RECIPES["vercel-node"] = serverlessGuidance({
+  fixture: "vercel-node",
+  recipe: "vercel-functions",
+  adapterFamilies: ["node"],
+  mustContain: [
+    'import { withCrumbtrailVercel } from "crumbtrail-node";',
+    "withCrumbtrailVercel(",
+    "process.env.CRUMBTRAIL_BASE_URL",
+    "process.env.CRUMBTRAIL_KEY",
+    "await Crumbtrail delivery",
+  ],
+});
+
+INSTALLER_RECIPES["vercel-edge"] = serverlessGuidance({
+  fixture: "vercel-edge",
+  recipe: "vercel-edge-functions",
+  adapterFamilies: ["fetch"],
+  mustContain: [
+    'import { withCrumbtrailFetch } from "crumbtrail-core/serverless";',
+    "withCrumbtrailFetch(",
+    "process.env.CRUMBTRAIL_BASE_URL",
+    "process.env.CRUMBTRAIL_KEY",
+    "waitUntil from @vercel/functions",
+    "Without a platform lifecycle callback",
+  ],
+});
+
+INSTALLER_RECIPES["vercel-ambiguous"] = serverlessGuidance({
+  fixture: "vercel-ambiguous",
+  recipe: "vercel-functions-ambiguous",
+  adapterFamilies: ["node", "fetch"],
+  mustContain: [
+    "Vercel runtime evidence is ambiguous.",
+    "Option 1: Node runtime",
+    "Option 2: edge runtime",
+    'import { withCrumbtrailVercel } from "crumbtrail-node";',
+    "withCrumbtrailVercel(",
+    'import { withCrumbtrailFetch } from "crumbtrail-core/serverless";',
+    "withCrumbtrailFetch(",
+    "process.env.CRUMBTRAIL_BASE_URL",
+    "process.env.CRUMBTRAIL_KEY",
+    "waitUntil from @vercel/functions",
+    "Without a platform lifecycle callback",
+  ],
+});
+
+INSTALLER_RECIPES["netlify-node"] = serverlessGuidance({
+  fixture: "netlify-node",
+  recipe: "netlify-functions",
+  adapterFamilies: ["node"],
+  mustContain: [
+    'import { withCrumbtrailNetlify } from "crumbtrail-node";',
+    "withCrumbtrailNetlify(",
+    "process.env.CRUMBTRAIL_BASE_URL",
+    "process.env.CRUMBTRAIL_KEY",
+    "await Crumbtrail delivery",
+  ],
+});
+
+INSTALLER_RECIPES["netlify-edge"] = serverlessGuidance({
+  fixture: "netlify-edge",
+  recipe: "netlify-edge-functions",
+  adapterFamilies: ["fetch"],
+  mustContain: [
+    'import { withCrumbtrailFetch } from "crumbtrail-core/serverless";',
+    "withCrumbtrailFetch(",
+    'Netlify.env.get("CRUMBTRAIL_BASE_URL")',
+    'Netlify.env.get("CRUMBTRAIL_KEY")',
+    "context.waitUntil",
+    "Without a platform lifecycle callback",
+  ],
+});
+
+INSTALLER_RECIPES["netlify-ambiguous"] = serverlessGuidance({
+  fixture: "netlify-ambiguous",
+  recipe: "netlify-functions-ambiguous",
+  adapterFamilies: ["node", "fetch"],
+  mustContain: [
+    "Netlify runtime evidence is ambiguous.",
+    "Option 1: Node runtime",
+    "Option 2: edge runtime",
+    'import { withCrumbtrailNetlify } from "crumbtrail-node";',
+    "withCrumbtrailNetlify(",
+    'import { withCrumbtrailFetch } from "crumbtrail-core/serverless";',
+    "withCrumbtrailFetch(",
+    "process.env.CRUMBTRAIL_BASE_URL",
+    "process.env.CRUMBTRAIL_KEY",
+    'Netlify.env.get("CRUMBTRAIL_BASE_URL")',
+    'Netlify.env.get("CRUMBTRAIL_KEY")',
+    "context.waitUntil",
+    "Without a platform lifecycle callback",
+  ],
+});
+
+INSTALLER_RECIPES["cloudflare-hono"] = serverlessGuidance({
+  fixture: "cloudflare-hono",
+  recipe: "cloudflare-workers",
+  adapterFamilies: ["fetch"],
+  mustContain: [
+    'import { withCrumbtrailFetch } from "crumbtrail-core/serverless";',
+    "withCrumbtrailFetch(",
+    "env.CRUMBTRAIL_BASE_URL",
+    "env.CRUMBTRAIL_KEY",
+    "ctx.waitUntil",
+    "Without a platform lifecycle callback",
+    "Do not install crumbtrail-node in a Worker.",
+  ],
+});
+
+INSTALLER_RECIPES["deno-deploy"] = serverlessGuidance({
+  fixture: "deno-deploy",
+  recipe: "deno-deploy",
+  adapterFamilies: ["fetch"],
+  mustContain: [
+    'import { withCrumbtrailFetch } from "npm:crumbtrail-core/serverless";',
+    "withCrumbtrailFetch(",
+    'Deno.env.get("CRUMBTRAIL_BASE_URL")',
+    'Deno.env.get("CRUMBTRAIL_KEY")',
+    "supplies no lifecycle callback",
+    "awaits delivery before returning",
+  ],
+});
+
+// ── Fixture provenance ───────────────────────────────────────────────
 // The exact generator each committed fixture was scaffolded from, kept in ONE
 // place and attached as `.provenance` to each row below. Consumed by
 // scripts/refresh-installer-fixtures.mjs to re-scaffold + diff for upstream
@@ -647,8 +823,20 @@ for (const [name, prov] of Object.entries(FIXTURE_PROVENANCE)) {
 }
 
 /** Recipes selectable via --recipe / iterated by the orchestrator. */
-export function recipeNames() {
-  return Object.keys(INSTALLER_RECIPES);
+export function recipeNames(group) {
+  return Object.entries(INSTALLER_RECIPES)
+    .filter(([, recipe]) => group === undefined || recipe.group === group)
+    .map(([name]) => name);
+}
+
+export function groupNames() {
+  return [
+    ...new Set(
+      Object.values(INSTALLER_RECIPES)
+        .map((recipe) => recipe.group)
+        .filter(Boolean),
+    ),
+  ];
 }
 
 export function getRecipe(name) {

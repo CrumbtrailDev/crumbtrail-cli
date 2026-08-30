@@ -1405,6 +1405,7 @@ export async function runWizard(
   const sdkInstallFailed = !install.installed && install.packages.length > 0;
   const keyWrite =
     !sdkInstallFailed &&
+    plan.kind !== "serverless-guidance" &&
     inject.outcome !== "withheld" &&
     inject.outcome !== "declined"
       ? await writeIngestKey({
@@ -1424,7 +1425,9 @@ export async function runWizard(
         })
       : skippedKeyWrite(
           plan.keyEnvVar,
-          inject.outcome === "declined"
+          plan.kind === "serverless-guidance"
+            ? "No ingest key was minted because the serverless setup plan made no local changes."
+            : inject.outcome === "declined"
             ? "No ingest key was minted because the local wiring changes were declined."
             : "No ingest key was minted because the SDK was not installed and the app was not wired.",
         );
@@ -1473,7 +1476,10 @@ export async function runWizard(
   // Nothing was installed and nothing was wired, so no event can arrive. Waiting
   // for one would spend the user's time on a countdown with a foregone answer,
   // and end on "no event yet" as though they had done something wrong.
-  const nothingWired = sdkInstallFailed || inject.outcome === "declined";
+  const nothingWired =
+    sdkInstallFailed ||
+    inject.outcome === "declined" ||
+    plan.kind === "serverless-guidance";
   const cloudEventUnavailable = result.recipe === "tauri";
   // Nothing reached the user's entry file: the plan fell back to a snippet
   // they were asked to paste, or they declined the prepend. The key is on
@@ -1510,7 +1516,9 @@ export async function runWizard(
     notes.push("Verification skipped (--skip-verify).");
   } else if (nothingWired) {
     notes.push(
-      inject.outcome === "declined"
+      plan.kind === "serverless-guidance"
+        ? "Nothing is wired yet, so there is no first event to wait for. Apply one setup plan above, then run `npx crumbtrail` again."
+        : inject.outcome === "declined"
         ? "Nothing was changed, so there is no first event to wait for. Add the snippet above when you are ready, then run `npx crumbtrail` again."
         : "Nothing is wired yet, so there is no first event to wait for. Install the SDK, then run `npx crumbtrail` again.",
     );
@@ -1771,7 +1779,7 @@ function printEvidenceSourcesPointer(
 
 export type ServiceStatus =
   | "wired" // files written
-  | "guidance" // OTLP guide written, or the AI-fallback snippet printed
+  | "guidance" // a guide was written, or nonmutating setup guidance was printed
   | "skipped-already-wired" // pre-existing wiring; no service minted
   | "withheld" // SDK install failed, so wiring was deliberately not applied
   | "declined" // target had uncommitted changes and the edit was declined
@@ -1797,6 +1805,8 @@ export interface ServiceOutcome {
    * not wear the same tick, or sit in the same "wired" count, as one that will.
    */
   keyRejected?: boolean;
+  /** Exact setup guidance was printed and this run made no local file changes. */
+  nonmutatingGuidance?: true;
   filesTouched: string[];
   notes: string[];
   error?: string;
@@ -1810,6 +1820,18 @@ function stackLabel(c: ServiceCandidate): string {
   if (c.recipe === "otlp") return c.detected.otlpStack ?? "otlp";
   return c.recipe;
 }
+
+const SERVERLESS_GUIDANCE_RECIPES = new Set<Recipe>([
+  "aws-lambda",
+  "vercel-functions",
+  "vercel-edge-functions",
+  "vercel-functions-ambiguous",
+  "netlify-functions",
+  "netlify-edge-functions",
+  "netlify-functions-ambiguous",
+  "cloudflare-workers",
+  "deno-deploy",
+]);
 
 /** The trailing hint that explains why a row is unchecked (or unselectable). */
 function candidateHint(c: ServiceCandidate): string {
@@ -1826,6 +1848,10 @@ function candidateHint(c: ServiceCandidate): string {
     return c.flags.includes("already-wired")
       ? `${stack} · guide exists, skipped`
       : `${stack} · guidance writes a setup file`;
+  if (c.recipe && SERVERLESS_GUIDANCE_RECIPES.has(c.recipe))
+    return c.flags.includes("ambiguous")
+      ? `${stack} · runtime unclear, selecting shows exact Node and edge setup choices`
+      : `${stack} · selecting shows exact setup guidance and changes no local files`;
   if (c.flags.includes("already-wired"))
     return `${stack} · complete for this endpoint, skipped`;
   if (c.flags.includes("ambiguous")) {
@@ -1903,7 +1929,11 @@ export function correlationNotes(
  * the user a join was on, over a snippet that has no such setting anywhere in
  * it.
  */
-const NO_CORRELATION_FIELD_RECIPES = new Set<Recipe>(["tauri", "flutter"]);
+const NO_CORRELATION_FIELD_RECIPES = new Set<Recipe>([
+  "tauri",
+  "flutter",
+  ...SERVERLESS_GUIDANCE_RECIPES,
+]);
 
 function toMultiSelectItems(candidates: ServiceCandidate[]): MultiSelectItem[] {
   return candidates.map((c) => ({
@@ -2324,6 +2354,9 @@ export async function runBatchWizard(
         relDir: c.relDir,
         recipe,
         status: applied.status,
+        ...(plan.kind === "serverless-guidance"
+          ? { nonmutatingGuidance: true as const }
+          : {}),
         serviceId: svc.serviceId,
         keyEnvVar: plan.keyEnvVar,
         keyIsCompileTime: plan.keyIsCompileTime,
@@ -2367,7 +2400,9 @@ export async function runBatchWizard(
   const reporting = outcomes.filter(
     (o) => o.status === "wired" || o.status === "guidance",
   );
-  const cloudReporting = reporting.filter((o) => o.recipe !== "tauri");
+  const cloudReporting = reporting.filter(
+    (o) => o.recipe !== "tauri" && !o.nonmutatingGuidance,
+  );
   const batchNotes: string[] = [];
 
   // 6. The ingest key: one for the project, written into every wired service's
@@ -2380,11 +2415,13 @@ export async function runBatchWizard(
     projectName: project.name,
     identityLabel,
     repoRoot: root,
-    targets: reporting.map((o) => ({
-      label: o.name,
-      appDir: path.resolve(root, o.relDir),
-      varName: o.keyIsCompileTime ? undefined : o.keyEnvVar,
-    })),
+    targets: reporting
+      .filter((o) => !o.nonmutatingGuidance)
+      .map((o) => ({
+        label: o.name,
+        appDir: path.resolve(root, o.relDir),
+        varName: o.keyIsCompileTime ? undefined : o.keyEnvVar,
+      })),
     parsed,
     deps,
   });
@@ -2539,7 +2576,7 @@ export async function runBatchWizard(
     projectId: project.id,
     projectName: project.name,
     repoRoot: root,
-    mayWrite: reporting.length > 0,
+    mayWrite: reporting.some((o) => !o.nonmutatingGuidance),
     parsed,
     deps,
   });
@@ -2686,7 +2723,9 @@ export function printBatchSummary(
   // session URL recorded by the poll is evidence one arrived.
   const cloudReporting = outcomes.filter(
     (o) =>
-      o.recipe !== "tauri" && (o.status === "wired" || o.status === "guidance"),
+      o.recipe !== "tauri" &&
+      !o.nonmutatingGuidance &&
+      (o.status === "wired" || o.status === "guidance"),
   );
   const reported = cloudReporting.filter((o) => o.sessionUrl);
   const incomplete = readyCount !== outcomes.length;
@@ -3844,6 +3883,24 @@ async function applyInjection(
       ui.out(plan.agentPrompt);
     }
     notes.push("Injection fell back to a manual snippet / AI prompt.");
+    return { outcome: "guidance", filesTouched, notes };
+  }
+
+  if (plan.kind === "serverless-guidance") {
+    deps.executePlan(plan);
+    ui.out(
+      color.yellow(
+        "Detected a serverless runtime. Apply one setup plan below.",
+      ),
+    );
+    if (plan.snippet) ui.out(plan.snippet);
+    if (plan.agentPrompt) {
+      ui.out(color.dim("\nOr hand this exact task to your coding agent:"));
+      ui.out(plan.agentPrompt);
+    }
+    notes.push(
+      "Serverless setup guidance was printed. No source, config, dependency, or env files were changed.",
+    );
     return { outcome: "guidance", filesTouched, notes };
   }
 

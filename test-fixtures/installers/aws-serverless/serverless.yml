@@ -1,0 +1,7 @@
+service: orders
+provider:
+  name: aws
+  runtime: nodejs20.x
+functions:
+  api:
+    handler: src/handler.handler

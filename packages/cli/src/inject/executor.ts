@@ -161,6 +161,7 @@ export function materializePlan(plan: Plan, io: ExecutorIO): MaterializedPlan {
   if (
     plan.kind === "skip-already-wired" ||
     plan.kind === "fallback-ai" ||
+    plan.kind === "serverless-guidance" ||
     plan.kind === "otlp-guidance" ||
     !plan.targetPath ||
     plan.content == null ||
@@ -269,6 +270,14 @@ export function executePlan(
     return extraOnly(
       "Ambiguous — emitted snippet + AI prompt instead of editing the entry.",
     );
+  }
+  if (plan.kind === "serverless-guidance") {
+    return {
+      kind: plan.kind,
+      written: [],
+      skipped: true,
+      message: "Printed serverless setup guidance. No files were changed.",
+    };
   }
   if (plan.kind === "otlp-guidance") {
     // Non-JS OTLP backend: never mutate the filesystem — the wizard prints the

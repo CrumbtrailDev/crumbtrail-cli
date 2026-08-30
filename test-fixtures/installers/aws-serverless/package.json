@@ -1,0 +1,6 @@
+{
+  "name": "aws-serverless",
+  "dependencies": {
+    "serverless": "^4.0.0"
+  }
+}

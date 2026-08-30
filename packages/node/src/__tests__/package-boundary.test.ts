@@ -10,6 +10,9 @@ import {
   instrumentDatabaseClient,
   instrumentNeonHttpQuery,
   instrumentPlanetScaleClient,
+  withCrumbtrailAwsLambda,
+  withCrumbtrailNetlify,
+  withCrumbtrailVercel,
 } from "../index";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -73,6 +76,9 @@ describe("package runtime boundary", () => {
     expect(typeof instrumentDatabaseClient).toBe("function");
     expect(typeof instrumentNeonHttpQuery).toBe("function");
     expect(typeof instrumentPlanetScaleClient).toBe("function");
+    expect(typeof withCrumbtrailAwsLambda).toBe("function");
+    expect(typeof withCrumbtrailVercel).toBe("function");
+    expect(typeof withCrumbtrailNetlify).toBe("function");
   });
 
   it("exports nothing that analyses a session", async () => {
