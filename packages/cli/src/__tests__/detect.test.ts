@@ -1068,6 +1068,38 @@ describe("build output is never an injection target", () => {
   });
 });
 
+describe("Cloudflare Workers runtime detection", () => {
+  const roots: string[] = [];
+  afterEach(() => {
+    while (roots.length) cleanup(roots.pop()!);
+  });
+
+  it("routes a Hono Worker away from the Node Hono recipe", () => {
+    const root = makeTmpRepo({
+      "package.json": JSON.stringify({
+        name: "edge-api",
+        dependencies: { hono: "^4.0.0" },
+        devDependencies: { wrangler: "^4.0.0" },
+      }),
+      "wrangler.jsonc": JSON.stringify({
+        name: "edge-api",
+        main: "src/index.ts",
+        compatibility_date: "2026-08-01",
+      }),
+      "src/index.ts":
+        "import { Hono } from 'hono';\nexport default new Hono();\n",
+    });
+    roots.push(root);
+
+    const result = detect(root);
+
+    expect(result.recipe).toBe("cloudflare-workers");
+    expect(result.entryFile).toBeNull();
+    expect(result.ambiguous).toBe(false);
+    expect(result.reasons.join("\n")).toContain("wrangler.jsonc");
+  });
+});
+
 describe("a process wrapper is never an injection target", () => {
   const roots: string[] = [];
   afterEach(() => {

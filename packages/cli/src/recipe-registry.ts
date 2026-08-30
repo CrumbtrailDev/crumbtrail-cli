@@ -10,6 +10,27 @@
 import type { Stack } from "crumbtrail-core";
 import type { Recipe } from "./detect";
 
+const PYTHON_OTLP_INSTRUMENTATION: Partial<Record<Stack, string>> = {
+  django: "opentelemetry-instrumentation-django",
+  fastapi: "opentelemetry-instrumentation-fastapi",
+  flask: "opentelemetry-instrumentation-flask",
+};
+
+export function pythonOtelPackages(
+  stack: Stack | null | undefined,
+  hasCelery = false,
+): string[] {
+  const framework = stack ? PYTHON_OTLP_INSTRUMENTATION[stack] : undefined;
+  if (!framework) return [];
+  return [
+    "python-dotenv",
+    "opentelemetry-distro",
+    "opentelemetry-exporter-otlp-proto-http",
+    framework,
+    ...(hasCelery ? ["opentelemetry-instrumentation-celery"] : []),
+  ];
+}
+
 /**
  * Discriminator for how a recipe is applied. Every JS recipe injects a snippet;
  * `otlp` is the guidance-only path (CP5) — it mutates nothing and emits OTLP
@@ -216,6 +237,13 @@ export function sdkInstallSpec(pkg: string): string {
  * future recipe missing an entry fails typecheck — preserve that safety net.
  */
 export const RECIPE_REGISTRY: Record<Recipe, RecipeMeta> = {
+  "cloudflare-workers": {
+    stack: "hono",
+    reportedStack: "cloudflare-workers",
+    sdkPackages: [],
+    serviceName: "worker",
+    kind: "otlp",
+  },
   tauri: {
     stack: "vite", // no "tauri" Stack id — Tauri frontends are typically vite
     // TauriTransport ships as the crumbtrail-core/tauri subpath, so there is no

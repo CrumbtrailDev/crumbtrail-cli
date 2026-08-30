@@ -1267,6 +1267,182 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
     expect(plan.agentPrompt).toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
     expect(plan.agentPrompt).not.toContain("PRESET_PASSIVE");
   });
+
+  it("wires a requirements and Procfile FastAPI service with zero code instrumentation", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "otlp",
+        endpoint: ENDPOINT,
+        stack: "fastapi",
+        serviceName: "orders-api",
+      },
+      fakeInjectIO({
+        [p("requirements.txt")]: "fastapi\ngunicorn\n",
+        [p("Procfile")]: "web: gunicorn app:app\n",
+      }),
+    );
+
+    expect(plan.kind).toBe("rewrite");
+    expect(plan.targetPath).toBe(p("Procfile"));
+    expect(plan.content).toContain(
+      "python crumbtrail_otel.py gunicorn app:app",
+    );
+    expect(plan.keyEnvVar).toBe("CRUMBTRAIL_KEY");
+    expect(plan.extraEdits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: p("requirements.txt"),
+          mode: "update",
+          content: expect.stringContaining("opentelemetry-distro"),
+        }),
+        expect.objectContaining({
+          path: p("crumbtrail_otel.py"),
+          mode: "create",
+          content: expect.stringContaining("load_dotenv(override=False)"),
+        }),
+      ]),
+    );
+    const requirements = plan.extraEdits?.find(
+      (edit) => edit.path === p("requirements.txt"),
+    )?.content;
+    const helper = plan.extraEdits?.find(
+      (edit) => edit.path === p("crumbtrail_otel.py"),
+    )?.content;
+    expect(requirements).toContain("python-dotenv");
+    expect(requirements).toContain("opentelemetry-exporter-otlp-proto-http");
+    expect(requirements).toContain("opentelemetry-instrumentation-fastapi");
+    expect(helper).toContain(
+      `os.environ.setdefault("OTEL_EXPORTER_OTLP_ENDPOINT", "${ENDPOINT}")`,
+    );
+    expect(helper).toContain('f"X-Crumbtrail-Auth={key}"');
+    expect(helper).toContain('os.execvp("opentelemetry-instrument"');
+  });
+
+  it("adds Celery instrumentation when the Python service declares Celery", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "otlp",
+        endpoint: ENDPOINT,
+        stack: "django",
+      },
+      fakeInjectIO({
+        [p("requirements.txt")]: "Django\ncelery\n",
+        [p("Procfile")]:
+          "web: gunicorn config.wsgi\nworker: celery -A config worker\n",
+      }),
+    );
+
+    expect(plan.content).toContain("web: ");
+    expect(plan.content).toContain("worker: ");
+    expect(plan.content?.match(/python crumbtrail_otel\.py/g)).toHaveLength(2);
+    expect(plan.extraEdits?.[0]?.content).toContain(
+      "opentelemetry-instrumentation-django",
+    );
+    expect(plan.extraEdits?.[0]?.content).toContain(
+      "opentelemetry-instrumentation-celery",
+    );
+  });
+
+  it("does not rewrite an already configured Python service", () => {
+    const first = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "otlp",
+        endpoint: ENDPOINT,
+        stack: "fastapi",
+        serviceName: "orders-api",
+      },
+      fakeInjectIO({
+        [p("requirements.txt")]: "fastapi\n",
+        [p("Procfile")]: "web: gunicorn app:app\n",
+      }),
+    );
+    const generated = Object.fromEntries(
+      (first.extraEdits ?? []).map((edit) => [edit.path, edit.content]),
+    );
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "otlp",
+        endpoint: ENDPOINT,
+        stack: "fastapi",
+        serviceName: "orders-api",
+      },
+      fakeInjectIO({
+        ...generated,
+        [p("Procfile")]: first.content as string,
+      }),
+    );
+
+    expect(plan.kind).toBe("skip-already-wired");
+    expect(plan.extraEdits).toBeUndefined();
+  });
+
+  it("requires confirmation when either Python deployment file is dirty", () => {
+    const files = {
+      [p("requirements.txt")]: "Flask\n",
+      [p("Procfile")]: "web: gunicorn app:app\n",
+    };
+    for (const dirty of [p("requirements.txt"), p("Procfile")]) {
+      const plan = buildPlan(
+        {
+          cwd: CWD,
+          recipe: "otlp",
+          endpoint: ENDPOINT,
+          stack: "flask",
+        },
+        fakeInjectIO(files, { dirty: [dirty] }),
+      );
+      expect(plan.kind).toBe("needs-confirm-dirty");
+      expect(plan.applyMode).toBe("rewrite");
+    }
+  });
+});
+
+describe("buildPlan — Cloudflare Workers native OTLP export", () => {
+  it("uses Workers observability instead of the Node SDK", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "cloudflare-workers",
+        endpoint: ENDPOINT,
+        serviceName: "edge-api",
+      },
+      fakeInjectIO({}),
+    );
+
+    expect(plan.kind).toBe("otlp-guidance");
+    expect(plan.targetPath).toBeNull();
+    expect(plan.content).toBeNull();
+    expect(plan.snippet).toContain(`${ENDPOINT}/v1/traces`);
+    expect(plan.snippet).toContain(`${ENDPOINT}/v1/logs`);
+    expect(plan.snippet).toContain("X-Crumbtrail-Auth");
+    expect(plan.snippet).toContain("crumbtrail-traces");
+    expect(plan.snippet).toContain("crumbtrail-logs");
+    expect(plan.snippet).toContain("wrangler.jsonc");
+    expect(plan.snippet).not.toContain("crumbtrail-node");
+    expect(plan.warnings.join("\n")).toContain("Workers Paid");
+    expect(plan.warnings.join("\n")).toContain("metrics");
+    expect(plan.keyEnvVar).toBeUndefined();
+  });
+
+  it("prints TOML configuration for a wrangler.toml project", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "cloudflare-workers",
+        endpoint: ENDPOINT,
+      },
+      fakeInjectIO({ [p("wrangler.toml")]: 'name = "edge-api"\n' }),
+    );
+
+    expect(plan.snippet).toContain("Then add this to wrangler.toml");
+    expect(plan.snippet).toContain("[observability.traces]");
+    expect(plan.snippet).toContain('destinations = ["crumbtrail-traces"]');
+    expect(plan.snippet).not.toContain('"observability":');
+  });
 });
 
 describe("buildPlan — Express middleware wiring", () => {
@@ -1918,7 +2094,8 @@ describe("buildPlan — advice is gated on what the package actually is", () => 
   it("still warns a backend that does answer HTTP", () => {
     const io = fakeInjectIO({
       [p("package.json")]: JSON.stringify({ name: "api" }),
-      [p("src", "server.js")]: 'import http from "node:http";\nhttp.createServer(handler).listen(3000);\n',
+      [p("src", "server.js")]:
+        'import http from "node:http";\nhttp.createServer(handler).listen(3000);\n',
     });
     const plan = buildPlan(
       {

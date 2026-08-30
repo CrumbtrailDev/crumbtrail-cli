@@ -86,6 +86,8 @@ export interface Plan {
      */
     registeredLabel?: string;
   }>;
+  /** Non-JavaScript packages this plan selected for the installer. */
+  sdkPackages?: string[];
   /** Non-fatal notes to surface to the user. */
   warnings: string[];
   /** fallback-ai: the ready-to-paste code snippet (reads the key from env). */

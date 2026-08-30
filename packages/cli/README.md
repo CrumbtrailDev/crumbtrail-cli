@@ -21,8 +21,9 @@ Running `npx crumbtrail` walks the full path in one pass:
 3. **Provisions** a project and service, mints the project's ingest key, and
    writes it into your app's env file — see "What it writes" for the rules that
    write follows, and `--no-write-key` to opt out.
-4. **Installs** the right SDK package and **injects** the setup code into your entry
-   file. This is the only step that writes to your repo, and it always runs last.
+4. **Installs** the right SDK or instrumentation packages and **injects** the
+   setup into your application. This is the only step that writes to your repo,
+   and it always runs last.
 5. **Verifies** the wiring end to end, then waits for your first real event.
 
 In a monorepo, run it from the repo root: it scans every workspace and service,
@@ -155,11 +156,14 @@ CLI and the composite action never echo the key.
 
 ## What it writes
 
-Three kinds of change, in the package it's wiring:
+Depending on the detected stack, it makes these local changes:
 
 - the SDK import and `Crumbtrail.init(...)` call in your entry file
 - for a Flutter app, the import plus an awaited `Crumbtrail.start(...)` as the
   first statement of `main()` (capture has to be running before the first frame)
+- for a Django, FastAPI, or Flask app with `requirements.txt` and a `Procfile`,
+  the Python OpenTelemetry packages, a `crumbtrail_otel.py` launch helper, and
+  wrapped `web` and `worker` commands
 - your ingest key, in an env file, plus a `.gitignore` entry for that file
 - the same setup code in every **other process the package starts**, and the
   build argument a **containerised frontend** needs — see
@@ -212,11 +216,22 @@ Flutter is in that state right now: `crumbtrail_flutter` is not on pub.dev yet,
 so a Flutter app is detected and reported but not wired. See
 [`packages/flutter`](../flutter) for depending on it from source in the meantime.
 
+Python automatic setup applies when the service has both `requirements.txt` and
+`Procfile`. It installs `python-dotenv`, the OpenTelemetry distro, HTTP OTLP
+exporter, and the detected Django, FastAPI, or Flask instrumentation. It also
+instruments Celery workers when `celery` is declared. The generated launch
+helper loads `.env` without replacing real environment variables, configures
+authenticated trace export, then starts the original command through
+`opentelemetry-instrument`. Metrics and logs remain off. Other Python layouts
+keep the non-mutating OTLP guide because the wizard cannot safely infer their
+dependency manager and production start command.
+
 The injected code reads the key from a framework-appropriate environment
 variable — `NEXT_PUBLIC_CRUMBTRAIL_KEY` (Next), `VITE_CRUMBTRAIL_KEY` (Vite /
 SvelteKit / Nuxt / Remix), `PUBLIC_CRUMBTRAIL_KEY` (Astro),
 `EXPO_PUBLIC_CRUMBTRAIL_KEY` (Expo / React Native), or `CRUMBTRAIL_KEY` (Node
-backends) — and the wizard mints the key and sets that variable for you.
+and automatically configured Python backends) — and the wizard mints the key
+and sets that variable for you.
 
 Writing a live credential to disk follows four rules, and the wizard tells you
 which one applied:
