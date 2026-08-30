@@ -8,12 +8,23 @@ export interface ElementSignature {
 /** Attribute names that uniquely identify an element, in priority order. */
 const STABLE_ID_ATTRS = ['data-bug-id', 'data-testid', 'data-test', 'id'];
 
+/**
+ * The value is quoted because a path is read back as a CSS selector, and a bare
+ * value is only legal CSS when it happens to be an identifier. Real test ids
+ * routinely are not: `cart/item`, `checkout.pay` and `2fa-submit` all make
+ * `querySelectorAll` throw, which took out every consumer that fed the path to
+ * a selector engine rather than only the odd one.
+ */
 function stableAttr(el: Element): string | undefined {
   for (const attr of STABLE_ID_ATTRS) {
     const value = el.getAttribute?.(attr);
-    if (value) return `${attr}=${value}`;
+    if (value) return `${attr}="${escapeAttrValue(value)}"`;
   }
   return undefined;
+}
+
+function escapeAttrValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
 function segment(el: Element): string {

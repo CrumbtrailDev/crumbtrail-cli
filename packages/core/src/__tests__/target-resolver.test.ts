@@ -17,8 +17,8 @@ describe("TargetDescriptorResolver", () => {
 
     expect(webTargetDescriptorResolver.resolve(element)).toEqual({
       componentName: "button",
-      ancestryHash: signature.hashString("button[data-bug-id=save]"),
-      selector: "button[data-bug-id=save]",
+      ancestryHash: signature.hashString('button[data-bug-id="save"]'),
+      selector: 'button[data-bug-id="save"]',
     });
   });
 

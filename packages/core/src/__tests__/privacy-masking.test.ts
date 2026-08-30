@@ -2,7 +2,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Crumbtrail } from "../crumbtrail";
-import { buildMaskedDomSnapshot } from "../masking";
+import { buildMaskedDomSnapshot, maskElementDescriptor } from "../masking";
+import { computeElementPath } from "../signature";
 import { DEFAULT_CONFIG } from "../types";
 
 function makeTransport() {
@@ -343,5 +344,40 @@ describe("buildMaskedDomSnapshot and data-crumbtrail-block", () => {
     );
 
     expect(html).toContain("<p>");
+  });
+});
+
+describe("structural path redaction", () => {
+  beforeEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  const masking = { ...DEFAULT_CONFIG, maskAllText: true as const };
+
+  it("redacts a PII-shaped id even though the path quotes it", () => {
+    // The path writes `[id="user-a@b.com"]`. The classifier reads the value,
+    // not the quotes, so the quotes come off before the shape is judged.
+    document.body.innerHTML = '<button id="user-alice@example.com">go</button>';
+    const el = document.querySelector("button") as HTMLElement;
+    const masked = maskElementDescriptor(
+      el,
+      { path: computeElementPath(el) },
+      masking,
+    );
+
+    expect(masked.path).not.toContain("alice@example.com");
+    expect(masked.path).toBe('button[id="[REDACTED]"]');
+  });
+
+  it("leaves an ordinary id alone, quotes intact", () => {
+    document.body.innerHTML = '<button data-testid="cart/item">go</button>';
+    const el = document.querySelector("button") as HTMLElement;
+    const masked = maskElementDescriptor(
+      el,
+      { path: computeElementPath(el) },
+      masking,
+    );
+
+    expect(masked.path).toBe('button[data-testid="cart/item"]');
   });
 });
