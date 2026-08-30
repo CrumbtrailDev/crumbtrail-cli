@@ -130,7 +130,7 @@ export { createAutoFlagController } from "./auto-flag";
 export type { AutoFlagOptions, AutoFlagController } from "./auto-flag";
 export {
   errorDetector,
-  request5xxDetector,
+  requestFailureDetector,
   errorSignature,
   rageClickDetector,
   retryStormDetector,
@@ -142,6 +142,7 @@ export type {
   Signal,
   SignalDetector,
   ErrorDetectorOptions,
+  RequestFailureOptions,
   RageClickOptions,
   RetryStormOptions,
   SlowResponseOptions,

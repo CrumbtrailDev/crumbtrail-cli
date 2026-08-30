@@ -73,13 +73,25 @@ export function errorDetector(
   };
 }
 
-/** React immediately to an instrumented server error response. */
-export function request5xxDetector(): SignalDetector {
+export interface RequestFailureOptions {
+  /**
+   * Lowest response status treated as a failure. 500 in ordinary capture, where a 4xx is
+   * usually the application saying no rather than breaking. The flight recorder lowers it to
+   * 400: it is already holding the buffer, so a single rejected request is worth closing a
+   * window on, and waiting for a pattern only loses the first one.
+   */
+  minStatus: number;
+}
+
+/** React immediately to an instrumented failing response. */
+export function requestFailureDetector(
+  opts: RequestFailureOptions,
+): SignalDetector {
   return {
     inspect(event) {
       if (event.k !== "net.res" || typeof event.d.st !== "number")
         return null;
-      if (event.d.st < 500) return null;
+      if (event.d.st < opts.minStatus) return null;
       const status = event.d.st;
       const requestId = typeof event.d.id === "number" ? event.d.id : "unknown";
       return {
