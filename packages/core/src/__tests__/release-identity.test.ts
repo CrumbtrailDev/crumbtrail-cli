@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import ts from "typescript";
 import { readApplicationReleaseIdentity } from "../release-identity";
 
 const ENV_KEYS = [
@@ -39,6 +42,27 @@ function clearIdentityEnvironment(): void {
 }
 
 describe("readApplicationReleaseIdentity", () => {
+  it("keeps the package entry parseable for classic Webpack bundles", () => {
+    const source = readFileSync(
+      path.resolve(process.cwd(), "src/release-identity.ts"),
+      "utf8",
+    );
+    const compiled = ts.transpileModule(source, {
+      compilerOptions: {
+        module: ts.ModuleKind.CommonJS,
+        resolveJsonModule: true,
+        target: ts.ScriptTarget.ES2022,
+      },
+      reportDiagnostics: true,
+    });
+    expect(
+      compiled.diagnostics?.filter(
+        (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error,
+      ) ?? [],
+    ).toEqual([]);
+    expect(() => new Function(compiled.outputText)).not.toThrow();
+  });
+
   it("prefers the explicit release and reads the generic app-build meta tag", () => {
     clearIdentityEnvironment();
     document.head.innerHTML =

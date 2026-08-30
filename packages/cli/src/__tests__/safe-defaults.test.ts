@@ -9,6 +9,10 @@
 // assertions are for.
 
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import ts from "typescript";
 import {
   capacitorInitSnippet,
   clientInitSnippet,
@@ -76,6 +80,45 @@ describe("backend capture only runs with a key", () => {
     expect(nestInitSnippet(ENDPOINT, SERVER_KEY, "api")).toContain(
       `if (${SERVER_KEY}) {`,
     );
+  });
+
+  it("binds the guarded key before the async autoCapture import", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "crumbtrail-node-snippet-"));
+    try {
+      const source = nodeInitSnippet(ENDPOINT, SERVER_KEY, "api");
+      writeFileSync(path.join(root, "index.ts"), source);
+      writeFileSync(
+        path.join(root, "types.d.ts"),
+        [
+          "declare const process: { env: Record<string, string | undefined> }",
+          'declare module "crumbtrail-node" {',
+          "  export function autoCapture(options: { endpoint: string; authToken: string; service?: string }): void",
+          "}",
+        ].join("\n"),
+      );
+      const program = ts.createProgram(
+        [path.join(root, "index.ts"), path.join(root, "types.d.ts")],
+        {
+          exactOptionalPropertyTypes: true,
+          module: ts.ModuleKind.ESNext,
+          moduleResolution: ts.ModuleResolutionKind.Bundler,
+          noEmit: true,
+          skipLibCheck: true,
+          strict: true,
+          target: ts.ScriptTarget.ES2022,
+          types: [],
+        },
+      );
+      const errors = ts
+        .getPreEmitDiagnostics(program)
+        .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error);
+      expect(errors.map((diagnostic) => diagnostic.messageText)).toEqual([]);
+      expect(source).toContain(
+        "authToken: __crumbtrailKey, service: \"api\"",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("guards both Express middleware", () => {
