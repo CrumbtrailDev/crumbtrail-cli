@@ -41,6 +41,10 @@ import {
 import {
   errorDetector,
   requestFailureDetector,
+  caughtErrorDetector,
+  responseBodyErrorDetector,
+  streamFailureDetector,
+  workerErrorDetector,
   rageClickDetector,
   retryStormDetector,
   slowResponseDetector,
@@ -227,6 +231,10 @@ const REMOTE_CONFIG_KEYS = [
   "autoFlagOnUnhandledRejection",
   "autoFlagOnRequest5xx",
   "autoFlagOnRenderedError",
+  "autoFlagOnCaughtError",
+  "autoFlagOnResponseBodyError",
+  "autoFlagOnStreamFailure",
+  "autoFlagOnWorkerError",
   "explicitBeacon",
   "serverSidePull",
   "autoFlagOnSignals",
@@ -1447,6 +1455,16 @@ export class Crumbtrail {
       autoFlagDetectors.push(renderedErrorDetector());
       renderedErrorCleanup = renderedErrorCollector(this.bus);
     }
+    // Reactive, not behavioral: each of these reads a failure the application already had, so they
+    // sit outside the `autoFlagOnSignals` group the way the error and request triggers do.
+    if (this.config.autoFlagOnCaughtError)
+      autoFlagDetectors.push(caughtErrorDetector());
+    if (this.config.autoFlagOnResponseBodyError)
+      autoFlagDetectors.push(responseBodyErrorDetector());
+    if (this.config.autoFlagOnStreamFailure)
+      autoFlagDetectors.push(streamFailureDetector());
+    if (this.config.autoFlagOnWorkerError)
+      autoFlagDetectors.push(workerErrorDetector());
     if (this.config.autoFlagOnSignals || this.config.flightRecorder) {
       if (this.config.autoFlagOnRageClick)
         autoFlagDetectors.push(
@@ -2832,8 +2850,26 @@ function applyRemoteTriggerSwitches(
       uncaughtError === true || unhandledRejection === true,
     );
   }
+  const caughtError = triggerSwitch(
+    triggers.caughtError ?? triggers.caughtErrors ?? triggers.onCaughtError,
+  );
+  const responseBodyError = triggerSwitch(
+    triggers.responseBodyError ??
+      triggers.responseBodyErrors ??
+      triggers.onResponseBodyError,
+  );
+  const streamFailure = triggerSwitch(
+    triggers.streamFailure ?? triggers.streamFailures ?? triggers.onStreamFailure,
+  );
+  const workerError = triggerSwitch(
+    triggers.workerError ?? triggers.workerErrors ?? triggers.onWorkerError,
+  );
   assign("autoFlagOnRequest5xx", request5xx);
   assign("autoFlagOnRenderedError", renderedError);
+  assign("autoFlagOnCaughtError", caughtError);
+  assign("autoFlagOnResponseBodyError", responseBodyError);
+  assign("autoFlagOnStreamFailure", streamFailure);
+  assign("autoFlagOnWorkerError", workerError);
   assign("explicitBeacon", explicitBeacon);
   assign("serverSidePull", serverSidePull);
   if (maskAll === true) {
@@ -2943,6 +2979,10 @@ function isRemoteConfigValue(
     key === "autoFlagOnUnhandledRejection" ||
     key === "autoFlagOnRequest5xx" ||
     key === "autoFlagOnRenderedError" ||
+    key === "autoFlagOnCaughtError" ||
+    key === "autoFlagOnResponseBodyError" ||
+    key === "autoFlagOnStreamFailure" ||
+    key === "autoFlagOnWorkerError" ||
     key === "explicitBeacon" ||
     key === "serverSidePull" ||
     key === "autoFlagOnSignals" ||
@@ -2962,6 +3002,10 @@ function isTriggerConfigKey(key: (typeof REMOTE_CONFIG_KEYS)[number]): boolean {
     key === "flightRecorder" ||
     key === "autoFlagOnError" ||
     key === "autoFlagOnRenderedError" ||
+    key === "autoFlagOnCaughtError" ||
+    key === "autoFlagOnResponseBodyError" ||
+    key === "autoFlagOnStreamFailure" ||
+    key === "autoFlagOnWorkerError" ||
     key === "autoFlagOnSignals" ||
     key === "autoFlagOnRageClick" ||
     key === "autoFlagOnRetryStorm" ||
