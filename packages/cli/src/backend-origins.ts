@@ -82,6 +82,56 @@ const ENTRY_PORT_RES = [
   /\bPORT\b[^\n]{0,80}?(?:\?\?|\|\|)\s*(\d{2,5})\b/,
 ];
 
+/**
+ * Resolve a validated ternary fallback whose value is derived from PORT.
+ * Taint is deliberately local and declaration based: a cache port ternary in
+ * the same entry cannot become the HTTP origin merely because it is nearby.
+ */
+function validatedPortFallback(source: string): number | null {
+  const tainted = new Set<string>();
+  const declarations: Array<{ name: string; expression: string }> = [];
+  for (const line of source.split(/\r?\n/)) {
+    const match = line.match(
+      /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(.+)$/,
+    );
+    if (!match) continue;
+    declarations.push({ name: match[1], expression: match[2] });
+  }
+  for (let pass = 0; pass < declarations.length; pass++) {
+    let changed = false;
+    for (const declaration of declarations) {
+      if (tainted.has(declaration.name)) continue;
+      const fromPort = /(?:process\.)?env(?:\[["']PORT["']\]|\.PORT)\b/.test(
+        declaration.expression,
+      );
+      const fromTainted = [...tainted].some((name) =>
+        new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(
+          declaration.expression,
+        ),
+      );
+      if (!fromPort && !fromTainted) continue;
+      tainted.add(declaration.name);
+      changed = true;
+    }
+    if (!changed) break;
+  }
+  for (const declaration of declarations) {
+    if (declaration.name.toLowerCase() !== "port") continue;
+    const match = declaration.expression.match(/\?\s*([^:\n]+):\s*(\d{2,5})\b/);
+    if (!match) continue;
+    if (
+      [...tainted].some((name) =>
+        new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(
+          `${declaration.expression.slice(0, match.index)} ${match[1]}`,
+        ),
+      )
+    ) {
+      return Number(match[2]);
+    }
+  }
+  return null;
+}
+
 function safeRead(file: string, reader: FileReader): string | null {
   if (!reader.isFile(file)) return null;
   try {
@@ -153,6 +203,8 @@ export function resolveServicePort(
       const match = entry.match(re);
       if (match) return Number(match[1]);
     }
+    const fallback = validatedPortFallback(entry);
+    if (fallback != null) return fallback;
   }
   return null;
 }

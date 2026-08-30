@@ -563,6 +563,129 @@ export function widenCorsAllowedHeaders(text: string): CorsWidening {
   };
 }
 
+/** A literal header array in a hand-written CORS middleware module. */
+const CUSTOM_HEADER_ARRAY_RE =
+  /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*HEADERS[\w$]*)\s*=\s*\[([^\]]*)\]/gi;
+
+/**
+ * Widen a hand-written CORS middleware after the import resolver has proved
+ * that this is the module the server installs.
+ *
+ * This intentionally does not run on arbitrary source. The module must emit
+ * `Access-Control-Allow-Headers`, and the chosen literal must be an allowlist
+ * owned by the application. Standard safelists are excluded because changing
+ * their meaning would make the code lie about the protocol definition.
+ */
+export function widenCustomCorsAllowedHeaders(text: string): CorsWidening {
+  const regular = widenCorsAllowedHeaders(text);
+  if (regular.found) return regular;
+  if (!/Access-Control-Allow-Headers/i.test(text)) {
+    return regular;
+  }
+
+  const declarations = new Map<string, string>();
+  for (const match of text.matchAll(
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\n]+)/g,
+  )) {
+    declarations.set(match[1], match[2]);
+  }
+  const referenced = new Set<string>();
+  for (const match of text.matchAll(/Access-Control-Allow-Headers/gi)) {
+    const context = text.slice(match.index, match.index + 240);
+    for (const identifier of context.match(/[A-Za-z_$][\w$]*/g) ?? []) {
+      if (declarations.has(identifier)) referenced.add(identifier);
+    }
+  }
+  for (let pass = 0; pass < declarations.size; pass++) {
+    let changed = false;
+    for (const name of [...referenced]) {
+      const expression = declarations.get(name);
+      if (!expression) continue;
+      for (const identifier of expression.match(/[A-Za-z_$][\w$]*/g) ?? []) {
+        if (!declarations.has(identifier) || referenced.has(identifier)) continue;
+        referenced.add(identifier);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+
+  const candidates: Array<{
+    start: number;
+    end: number;
+    full: string;
+    name: string;
+    body: string;
+    score: number;
+  }> = [];
+  for (const match of text.matchAll(CUSTOM_HEADER_ARRAY_RE)) {
+    const name = match[1] ?? "";
+    if (/SAFE(?:LIST|LISTED)/i.test(name)) continue;
+    const body = match[2] ?? "";
+    const score = /CONFIGUR/i.test(name)
+      ? 3
+      : /ALLOW(?:ED)?/i.test(name)
+        ? 2
+        : /CORS/i.test(name)
+          ? 1
+          : 0;
+    if (score === 0 || match.index == null || !referenced.has(name)) continue;
+    candidates.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      full: match[0],
+      name,
+      body,
+      score,
+    });
+  }
+  candidates.sort((a, b) => b.score - a.score || a.start - b.start);
+  const selected = candidates[0];
+  if (!selected || !LITERAL_ARRAY_BODY_RE.test(selected.body)) {
+    return {
+      text,
+      changed: false,
+      needsManual: true,
+      found: true,
+      importsCorsElsewhere: false,
+    };
+  }
+
+  const present = new Set(
+    (selected.body.match(/(["'])([^"'\n]*)\1/g) ?? []).map((literal) =>
+      literal.slice(1, -1).toLowerCase(),
+    ),
+  );
+  const missing = CORRELATION_REQUEST_HEADERS.filter(
+    (name) => !present.has(name),
+  );
+  if (missing.length === 0) {
+    return {
+      text,
+      changed: false,
+      needsManual: false,
+      found: true,
+      importsCorsElsewhere: false,
+    };
+  }
+
+  const quote = quoteStyleOf(selected.body);
+  const additions = missing.map((name) => `${quote}${name}${quote}`).join(", ");
+  const trimmed = selected.body.trim();
+  const separator = trimmed.length === 0 ? "" : trimmed.endsWith(",") ? " " : ", ";
+  const replacement = selected.full.replace(
+    `[${selected.body}]`,
+    `[${selected.body.replace(/\s+$/, "")}${separator}${additions}]`,
+  );
+  return {
+    text: `${text.slice(0, selected.start)}${replacement}${text.slice(selected.end)}`,
+    changed: true,
+    needsManual: false,
+    found: true,
+    importsCorsElsewhere: false,
+  };
+}
+
 const HEADER_LIST = CORRELATION_REQUEST_HEADERS.map((n) => `"${n}"`).join(", ");
 
 /** The exact lines a user must add when the config cannot be rewritten safely. */

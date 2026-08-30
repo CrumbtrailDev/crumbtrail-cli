@@ -179,4 +179,51 @@ describe("CORS that lives one import away is not reported as absent", () => {
     ).warnings.join("\n");
     expect(warnings).toContain("No CORS middleware in this file");
   });
+
+  it("follows a local CORS import and widens a custom header allowlist", () => {
+    const entry = [
+      'import { Hono } from "hono";',
+      'import { corsOptions } from "./config/cors-options.js";',
+      'import { corsMiddleware } from "./middleware/cors.js";',
+      "const app = new Hono();",
+      'app.use("*", corsMiddleware());',
+      "export default app;",
+    ].join("\n");
+    const cors = [
+      'const SAFELISTED_HEADERS = ["Accept", "Content-Type"]',
+      'const CONFIGURED_RESPONSE_HEADERS = ["X-Frame-Options"]',
+      'const CONFIGURED_HEADERS = ["Authorization", "X-Idempotency-Key"]',
+      'const ALLOW_HEADERS = [...SAFELISTED_HEADERS, ...CONFIGURED_HEADERS]',
+      'headers["Access-Control-Allow-Headers"] = ALLOW_HEADERS.join(", ")',
+    ].join("\n");
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: "https://ingest.example.com",
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({ name: "api" }),
+        [p("src", "index.ts")]: entry,
+        [p("src", "config", "cors-options.ts")]:
+          'export const corsOptions = { origin: "*" }',
+        [p("src", "middleware", "cors.ts")]: cors,
+      }),
+    );
+
+    const edit = plan.extraEdits?.find((item) =>
+      item.path.endsWith("middleware/cors.ts"),
+    );
+    expect(edit?.content).toContain('"X-Idempotency-Key", "x-crumbtrail-session-id"');
+    expect(edit?.content).toContain('"x-crumbtrail-request-id"');
+    expect(edit?.content).toContain('"traceparent"');
+    expect(edit?.content).not.toContain('SAFELISTED_HEADERS = ["Accept", "Content-Type",');
+    expect(edit?.content).toContain(
+      'CONFIGURED_RESPONSE_HEADERS = ["X-Frame-Options"]',
+    );
+    expect(plan.warnings.join("\n")).toContain("Widened the CORS allowed headers");
+    expect(plan.warnings.join("\n")).not.toContain("imports CORS from another module");
+  });
 });

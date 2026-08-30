@@ -49,6 +49,7 @@ import {
   referencesCrumbtrail,
   servesHttp,
   widenCorsAllowedHeaders,
+  widenCustomCorsAllowedHeaders,
   wireExpressMiddleware,
   wireFlutterMain,
   withTrailingNewline,
@@ -1926,6 +1927,121 @@ function planDockerBuildArg(
   return { edits, warnings };
 }
 
+const LOCAL_CORS_IMPORT_RE =
+  /\bimport\s+([^;\n]*?)\s+from\s+["'](\.[^"']+)["']/g;
+
+/** Resolve a local source import, including TS source imported with a JS suffix. */
+function resolveLocalSourceImport(
+  entryFile: string,
+  specifier: string,
+  cwd: string,
+  io: InjectIO,
+): string | null {
+  const base = path.resolve(path.dirname(entryFile), specifier);
+  const ext = path.extname(base);
+  const withoutExt = ext ? base.slice(0, -ext.length) : base;
+  const candidates = [
+    base,
+    ...(ext === ".js" || ext === ".mjs" || ext === ".cjs"
+      ? [
+          `${withoutExt}.ts`,
+          `${withoutExt}.mts`,
+          `${withoutExt}.cts`,
+          `${withoutExt}.tsx`,
+        ]
+      : []),
+    ...(!ext
+      ? [
+          `${base}.ts`,
+          `${base}.tsx`,
+          `${base}.js`,
+          `${base}.mjs`,
+          path.join(base, "index.ts"),
+          path.join(base, "index.js"),
+        ]
+      : []),
+  ];
+  for (const candidate of candidates) {
+    const rel = path.relative(cwd, candidate);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) continue;
+    if (io.readFile(candidate) != null) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Follow one local import from the server entry to the CORS module it installs.
+ * One hop is deliberate: it covers extracted middleware without turning setup
+ * into a general module graph rewriter.
+ */
+function planImportedCorsModule(
+  input: BuildPlanInput,
+  io: InjectIO,
+): {
+  edits: NonNullable<Plan["extraEdits"]>;
+  warnings: string[];
+  resolved: boolean;
+} {
+  const edits: NonNullable<Plan["extraEdits"]> = [];
+  const warnings: string[] = [];
+  if (!isBackendRecipe(input.recipe) || !input.entryFile) {
+    return { edits, warnings, resolved: false };
+  }
+  const entry = io.readFile(input.entryFile);
+  if (!entry) return { edits, warnings, resolved: false };
+
+  for (const match of entry.matchAll(LOCAL_CORS_IMPORT_RE)) {
+    const bindings = match[1] ?? "";
+    const specifier = match[2] ?? "";
+    if (!/cors/i.test(`${bindings} ${specifier}`)) continue;
+    const importedNames = (bindings.match(/[A-Za-z_$][\w$]*/g) ?? []).filter(
+      (name) => !["import", "type", "as"].includes(name),
+    );
+    const installed = importedNames.some((name) =>
+      new RegExp(
+        String.raw`\.(?:use|register)\s*\([\s\S]{0,200}?\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\b`,
+      ).test(entry.slice((match.index ?? 0) + match[0].length)),
+    );
+    if (!installed) continue;
+    const target = resolveLocalSourceImport(
+      input.entryFile,
+      specifier,
+      input.cwd,
+      io,
+    );
+    if (!target) continue;
+    const source = io.readFile(target);
+    if (source == null) continue;
+    const widened = widenCustomCorsAllowedHeaders(source);
+    if (!widened.found) continue;
+    if (widened.needsManual) {
+      warnings.push(
+        `${path.relative(input.cwd, target)} configures CORS with a computed header allowlist. ${corsWideningGuidance()}`,
+      );
+      return { edits, warnings, resolved: false };
+    }
+    if (!widened.changed) {
+      return { edits, warnings, resolved: widened.found };
+    }
+    const status = io.gitStatus(input.cwd, target);
+    if (status.dirty && !input.options?.force) {
+      warnings.push(
+        `${path.relative(input.cwd, target)} needs the Crumbtrail correlation headers but has uncommitted changes, so it was left alone. Commit it and re-run, or re-run with force.`,
+      );
+      return { edits, warnings, resolved: false };
+    }
+    edits.push({
+      path: target,
+      mode: "update",
+      content: widened.text,
+      label: `widened the CORS allowed headers in ${path.relative(input.cwd, target)}`,
+    });
+    warnings.push(CORS_WIDENED_WARNING);
+    return { edits, warnings, resolved: true };
+  }
+  return { edits, warnings, resolved: false };
+}
+
 export function buildPlan(
   input: BuildPlanInput,
   io: InjectIO = defaultInjectIO,
@@ -1947,6 +2063,22 @@ export function buildPlan(
     plan.keyEnvVar = keyRef.envVar;
     if (keyRef.compileTime) plan.keyIsCompileTime = true;
   }
+
+  // A server entry commonly imports its CORS middleware from a focused module.
+  // Follow that one local edge and make correlation safe in the same plan.
+  const importedCors = planImportedCorsModule(input, io);
+  if (importedCors.edits.length > 0) {
+    plan.extraEdits = [...(plan.extraEdits ?? []), ...importedCors.edits];
+  }
+  if (importedCors.resolved) {
+    plan.warnings = plan.warnings.filter(
+      (warning) =>
+        !warning.startsWith(
+          "This file configures no CORS itself but imports CORS from another module",
+        ),
+    );
+  }
+  plan.warnings = [...plan.warnings, ...importedCors.warnings];
 
   // Everything above wires ONE file. These two passes cover what a deployed app
   // needs beyond it: the other processes it starts, and the build that bakes in

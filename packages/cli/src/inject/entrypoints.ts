@@ -137,13 +137,24 @@ export const DEPLOY_CONFIG_RE =
 /** Script names that start something and keep it running. */
 function isLongRunningScriptName(name: string): boolean {
   const n = name.toLowerCase();
-  return ["start", "dev", "serve", "worker"].some(
+  return [
+    "start",
+    "dev",
+    "serve",
+    "worker",
+    "queue",
+    "consumer",
+    "scheduler",
+    "cron",
+    "listener",
+  ].some(
     (p) => n === p || n.startsWith(`${p}:`),
   );
 }
 
 /** File and directory names that describe a process, not a task. */
-const LONG_RUNNING_NAME_RE = /(worker|server|daemon|consumer|listener)/i;
+const LONG_RUNNING_NAME_RE =
+  /(worker|server|daemon|consumer|listener|queue|scheduler|cron)/i;
 
 /**
  * One shot work: it runs, it finishes, and capture wrapped around it opens an
@@ -289,8 +300,13 @@ export function findExtraBackendEntries(
     if (byScore !== 0) return byScore;
     return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
   });
+  // A negative score is affirmative evidence that this is a task which exits,
+  // not a process the deployment keeps alive. Ranking those entries last was
+  // insufficient when a package had fewer candidates than the edit cap: every
+  // migration, seed and maintenance probe still received server capture.
+  const longRunning = sorted.filter((entry) => (scored.get(entry.path) ?? 0) > 0);
   return {
-    entries: sorted.slice(0, MAX_EXTRA_ENTRIES),
-    unwired: sorted.slice(MAX_EXTRA_ENTRIES),
+    entries: longRunning.slice(0, MAX_EXTRA_ENTRIES),
+    unwired: longRunning.slice(MAX_EXTRA_ENTRIES),
   };
 }

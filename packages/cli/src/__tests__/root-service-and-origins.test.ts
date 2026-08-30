@@ -186,6 +186,30 @@ describe("backend origin resolution", () => {
     expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(8123);
   });
 
+  it("reads the fallback from a validated PORT ternary", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "const raw = (process.env.PORT ?? '').trim()",
+        "const parsed = Number.parseInt(raw, 10)",
+        "const port = Number.isInteger(parsed) ? parsed : 8765",
+        "serve({ fetch: app.fetch, port })",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(8765);
+  });
+
+  it("does not mistake an unrelated cache port ternary for the HTTP port", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "const cachePort = tls ? 6380 : 6379",
+        "serve({ fetch: app.fetch, port: process.env.PORT })",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBeNull();
+  });
+
   it("returns nothing rather than a framework default when the repo is silent", () => {
     repo = makeTmpRepo({
       "package.json": pkg({

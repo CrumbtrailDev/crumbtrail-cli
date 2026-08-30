@@ -274,8 +274,8 @@ describe("the other processes the package starts", () => {
       [p("src", "index.ts")]: "startServer();\n",
     };
     for (let i = 0; i < 6; i++) {
-      scripts[`job${i}`] = `tsx src/job${i}.ts`;
-      files[p("src", `job${i}.ts`)] = "run();\n";
+      scripts[`worker:${i}`] = `tsx src/worker${i}.ts`;
+      files[p("src", `worker${i}.ts`)] = "runForever();\n";
     }
     files[p("package.json")] = PKG(scripts);
     const plan = buildPlan(
@@ -293,7 +293,7 @@ describe("the other processes the package starts", () => {
     // Every unwired process is named with its file and the script that runs it,
     // so the user can finish the job without re-deriving the scan.
     const named = [4, 5].map((i) =>
-      warned.includes(`src/job${i}.ts (npm run job${i})`),
+      warned.includes(`src/worker${i}.ts (npm run worker:${i})`),
     );
     expect(named).toEqual([true, true]);
   });
@@ -333,6 +333,62 @@ describe("the other processes the package starts", () => {
     expect(wired).toContain(p("api", "src", "worker.ts"));
     // The one that lost its slot is a script that exits, not the worker.
     expect(plan.warnings.join(" ")).not.toContain("worker.ts (npm run worker)");
+  });
+
+  it("does not wire one shot maintenance scripts beside a real server", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: PKG({
+        start: "tsx src/index.ts",
+        migrate: "tsx src/scripts/migrate.ts",
+        seed: "tsx src/scripts/seed.ts",
+        "suppliers:probe": "tsx src/scripts/probeSuppliers.ts",
+        "rivals:harvest": "tsx src/scripts/harvestRivals.ts",
+      }),
+      [p("src", "index.ts")]: "startServer();\n",
+      [p("src", "scripts", "migrate.ts")]: "migrate();\n",
+      [p("src", "scripts", "seed.ts")]: "seed();\n",
+      [p("src", "scripts", "probeSuppliers.ts")]: "probe();\n",
+      [p("src", "scripts", "harvestRivals.ts")]: "harvest();\n",
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      io,
+    );
+
+    expect(plan.extraEdits ?? []).toEqual([]);
+    expect(plan.warnings.join(" ")).not.toContain("left unwired");
+  });
+
+  it("does not wire a neutral reindex task but keeps a queue under scripts", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: PKG({
+        start: "tsx src/index.ts",
+        "jobs:reindex": "tsx src/tasks/reindex.ts",
+        queue: "tsx scripts/queue.ts",
+      }),
+      [p("src", "index.ts")]: "startServer();\n",
+      [p("src", "tasks", "reindex.ts")]: "reindex();\n",
+      [p("scripts", "queue.ts")]: "consumeForever();\n",
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      io,
+    );
+
+    const paths = (plan.extraEdits ?? []).map((edit) => edit.path);
+    expect(paths).toEqual([p("scripts", "queue.ts")]);
   });
 
   it("finds nothing when the package declares no scripts", () => {
