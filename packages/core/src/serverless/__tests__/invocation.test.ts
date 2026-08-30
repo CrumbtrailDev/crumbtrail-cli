@@ -298,13 +298,13 @@ describe("runServerlessInvocation", () => {
     const captured = event.d.error as Record<string, unknown>;
     expect(event.d.status).toBe("error");
     expect(typeof event.d.durationMs).toBe("number");
-    expect(String(captured.name)).toHaveLength(
+    expect(String(captured.name).length).toBeLessThanOrEqual(
       SERVERLESS_LIMITS.errorNameLength,
     );
-    expect(String(captured.message)).toHaveLength(
+    expect(String(captured.message).length).toBeLessThanOrEqual(
       SERVERLESS_LIMITS.errorMessageLength,
     );
-    expect(String(captured.code)).toHaveLength(
+    expect(String(captured.code).length).toBeLessThanOrEqual(
       SERVERLESS_LIMITS.errorCodeLength,
     );
     expect(captured).not.toHaveProperty("stack");
@@ -391,7 +391,9 @@ describe("runServerlessInvocation", () => {
     expect(String(event.d.method).length).toBeLessThanOrEqual(
       SERVERLESS_LIMITS.methodLength,
     );
-    expect(String(event.d.route)).toHaveLength(SERVERLESS_LIMITS.routeLength);
+    expect(String(event.d.route).length).toBeLessThanOrEqual(
+      SERVERLESS_LIMITS.routeLength,
+    );
     expect(event.d).not.toHaveProperty("statusCode");
     const capturedMetadata = event.d.metadata as Record<string, unknown>;
     expect(Object.keys(capturedMetadata)).toHaveLength(
@@ -409,6 +411,36 @@ describe("runServerlessInvocation", () => {
     expect(serialized).not.toContain("nested-body-secret");
     expect(serialized).not.toContain("ignored request body");
     expect(serialized).not.toContain("ignored handler response");
+  });
+
+  it("redacts secrets from routes, metadata, and errors", async () => {
+    const { events, transport } = collectingTransport();
+    const jwt =
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturevalue";
+
+    await expect(
+      runServerlessInvocation(
+        {
+          transport,
+          route: `/reset/${jwt}?token=short-secret-value`,
+          metadata: {
+            authorization: `Bearer ${jwt}`,
+            note: `see https://example.test/callback?api_key=short-secret-value`,
+          },
+        },
+        () => {
+          throw new Error(
+            `request failed for ${jwt} at https://example.test/fail?token=short-secret-value`,
+          );
+        },
+      ),
+    ).rejects.toBeInstanceOf(Error);
+
+    const serialized = JSON.stringify(events);
+    expect(serialized).not.toContain(jwt);
+    expect(serialized).not.toContain("short-secret-value");
+    expect(serialized).not.toContain("Bearer");
+    expect(serialized).toContain("[REDACTED]");
   });
 
   it("adopts valid Crumbtrail headers and W3C trace context", async () => {

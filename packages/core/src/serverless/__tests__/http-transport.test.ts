@@ -87,13 +87,21 @@ describe("createServerlessHttpTransport", () => {
     });
 
     transport.startSession({ sessionId: "ses_timeout" });
-    await expect(transport.flush()).rejects.toMatchObject({
+    const rejection = transport.flush();
+    await expect(rejection).rejects.toMatchObject({
       failures: [
         {
           phase: "session-start",
           error: expect.any(HeadlessTimeoutError),
         },
       ],
+    });
+    await rejection.catch((error: unknown) => {
+      const failure = (error as { failures?: Array<{ error?: unknown }> })
+        .failures?.[0]?.error;
+      expect(String(failure)).toContain(
+        "Crumbtrail serverless request timed out",
+      );
     });
   });
 
@@ -158,16 +166,37 @@ describe("createServerlessHttpTransport", () => {
   });
 
   it("preserves direct headless request errors", async () => {
-    await expect(
-      startHeadlessSession({
-        endpoint: "https://capture.example",
-        sessionId: "ses_refused",
-        fetchImpl: vi.fn(async () =>
-          Promise.resolve(
-            new Response('{"error":"revoked key"}', { status: 401 }),
-          ),
+    const rejection = startHeadlessSession({
+      endpoint: "https://capture.example",
+      sessionId: "ses_refused",
+      fetchImpl: vi.fn(async () =>
+        Promise.resolve(
+          new Response('{"error":"revoked key"}', { status: 401 }),
         ),
+      ),
+    });
+    await expect(rejection).rejects.toBeInstanceOf(HeadlessRequestError);
+    await expect(rejection).rejects.toThrow(
+      "Crumbtrail headless session request failed: revoked key",
+    );
+  });
+
+  it("preserves the headless timeout error message", async () => {
+    const rejection = startHeadlessSession({
+      endpoint: "https://capture.example",
+      sessionId: "ses_timeout",
+      timeoutMs: 5,
+      fetchImpl: vi.fn((_url, init) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(init.signal?.reason),
+          );
+        });
       }),
-    ).rejects.toBeInstanceOf(HeadlessRequestError);
+    });
+
+    await expect(rejection).rejects.toThrow(
+      "Crumbtrail headless session request timed out after 5ms",
+    );
   });
 });

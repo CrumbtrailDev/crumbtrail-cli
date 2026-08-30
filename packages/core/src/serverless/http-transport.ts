@@ -26,9 +26,9 @@ export class ServerlessConfigurationError extends Error {
 export class HeadlessTimeoutError extends Error {
   readonly timeoutMs: number;
 
-  constructor(timeoutMs: number) {
+  constructor(timeoutMs: number, requestSubject = "headless session") {
     super(
-      `Crumbtrail serverless request timed out after ${timeoutMs}ms; ` +
+      `Crumbtrail ${requestSubject} request timed out after ${timeoutMs}ms; ` +
         "the capture endpoint accepted the connection and did not answer",
     );
     this.name = "HeadlessTimeoutError";
@@ -59,9 +59,7 @@ export { HeadlessRequestError as ServerlessHttpRequestError };
 export { HeadlessTimeoutError as ServerlessHttpTimeoutError };
 
 export type ServerlessHttpOperationPhase =
-  | "session-start"
-  | "capture"
-  | "session-end";
+  "session-start" | "capture" | "session-end";
 
 export interface ServerlessHttpOperationFailure {
   phase: ServerlessHttpOperationPhase;
@@ -94,10 +92,14 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
   private readonly headers: Record<string, string>;
   private readonly fetcher: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly requestSubject: string;
   private readonly operations: QueuedOperation[] = [];
   private flushTail: Promise<void> = Promise.resolve();
 
-  constructor(options: ServerlessHttpTransportOptions) {
+  constructor(
+    options: ServerlessHttpTransportOptions,
+    requestSubject = "serverless",
+  ) {
     const endpoint = options.endpoint?.trim().replace(/\/+$/, "");
     if (!endpoint) {
       throw new ServerlessConfigurationError(
@@ -108,6 +110,7 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
     this.headers = buildHeaders(options.authToken);
     this.fetcher = options.fetchImpl ?? fetch;
     this.timeoutMs = normalizeTimeout(options.requestTimeoutMs);
+    this.requestSubject = requestSubject;
   }
 
   startSession(session: ServerlessInvocationSession): void {
@@ -173,6 +176,7 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
           this.headers,
           operation.body,
           this.timeoutMs,
+          this.requestSubject,
         );
       } catch (error) {
         failures.push({ phase: operation.phase, error });
@@ -208,14 +212,17 @@ export interface HeadlessSession {
 export async function startHeadlessSession(
   options: HeadlessSessionOptions,
 ): Promise<HeadlessSession> {
-  const transport = createServerlessHttpTransport({
-    endpoint: options.endpoint,
-    ...(options.authToken ? { authToken: options.authToken } : {}),
-    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
-    ...(options.timeoutMs !== undefined
-      ? { requestTimeoutMs: options.timeoutMs }
-      : {}),
-  });
+  const transport = new ServerlessHttpTransport(
+    {
+      endpoint: options.endpoint,
+      ...(options.authToken ? { authToken: options.authToken } : {}),
+      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      ...(options.timeoutMs !== undefined
+        ? { requestTimeoutMs: options.timeoutMs }
+        : {}),
+    },
+    "headless session",
+  );
   transport.startSession({
     sessionId: options.sessionId,
     metadata: { ...options.metadata, source: "headless" },
@@ -300,6 +307,7 @@ async function postJson(
   headers: Record<string, string>,
   body: string,
   timeoutMs: number,
+  requestSubject: string,
 ): Promise<Record<string, unknown>> {
   const deadline = timeoutMs > 0 ? startDeadline(timeoutMs) : undefined;
   let response: Response;
@@ -313,7 +321,8 @@ async function postJson(
     });
     text = await response.text();
   } catch (error) {
-    if (deadline?.expired) throw new HeadlessTimeoutError(timeoutMs);
+    if (deadline?.expired)
+      throw new HeadlessTimeoutError(timeoutMs, requestSubject);
     throw error;
   } finally {
     deadline?.cancel();
@@ -327,7 +336,7 @@ async function postJson(
         : undefined;
     const message = serverMessage ?? `HTTP ${response.status}`;
     throw new HeadlessRequestError(
-      `Crumbtrail serverless request failed: ${message}`,
+      `Crumbtrail ${requestSubject} request failed: ${message}`,
       response.status,
       parseRetryAfter(response.headers.get("retry-after")),
       serverMessage,

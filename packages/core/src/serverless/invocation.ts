@@ -8,6 +8,12 @@ import {
   type W3CTraceContext,
 } from "../correlation";
 import type { BugEvent } from "../types";
+import {
+  redactTokenLikeString,
+  redactUrl,
+  redactUrlsInText,
+  redactValue,
+} from "../redaction";
 import { generateSessionId } from "../utils";
 import {
   ServerlessConfigurationError,
@@ -429,7 +435,7 @@ function sanitizeMethod(method: string | undefined): string | undefined {
 function sanitizeRoute(route: string | undefined): string | undefined {
   const trimmed = route?.trim();
   if (!trimmed) return undefined;
-  const safe = stripControlCharacters(trimmed);
+  const safe = stripControlCharacters(redactUrl(trimmed, "route").value);
   return safe ? safe.slice(0, SERVERLESS_LIMITS.routeLength) : undefined;
 }
 
@@ -445,8 +451,9 @@ function sanitizeMetadata(
 ): Record<string, ServerlessMetadataValue> | undefined {
   if (!metadata) return undefined;
   const result: Record<string, ServerlessMetadataValue> = {};
+  const redacted = redactValue(metadata, "serverless.metadata").value;
 
-  for (const [rawKey, rawValue] of Object.entries(metadata)) {
+  for (const [rawKey, rawValue] of Object.entries(redacted)) {
     const key = sanitizeMetadataKey(rawKey);
     if (!key || isBodyMetadataKey(key)) continue;
     const value = sanitizeMetadataValue(rawValue);
@@ -529,7 +536,12 @@ function sanitizeErrorFields(
 }
 
 function boundedText(value: string, maxLength: number): string {
-  return stripControlCharacters(value).slice(0, maxLength);
+  const withoutUrlSecrets = redactUrlsInText(value, "serverless.error").value;
+  const withoutTokens = redactTokenLikeString(
+    withoutUrlSecrets,
+    "serverless.error",
+  ).value;
+  return stripControlCharacters(withoutTokens).slice(0, maxLength);
 }
 
 function containsControlCharacters(value: string): boolean {
@@ -593,12 +605,7 @@ async function safeFlush(
   } catch (error) {
     if (error instanceof ServerlessHttpFlushError) {
       for (const failure of error.failures) {
-        reportDeliveryError(
-          options,
-          failure.error,
-          failure.phase,
-          sessionId,
-        );
+        reportDeliveryError(options, failure.error, failure.phase, sessionId);
       }
       return;
     }

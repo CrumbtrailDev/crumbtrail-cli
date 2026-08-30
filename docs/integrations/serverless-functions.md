@@ -333,6 +333,10 @@ Numbers must be finite. Error names are limited to 120 characters, messages to
 Request and response bodies are excluded by default, including metadata fields
 named as bodies.
 
+Routes, metadata strings, and error fields pass through the shared credential
+and URL redaction policy before delivery. Correlation headers identify related
+capture only. They do not grant access or authorize a request.
+
 These wrappers do not claim full traces, logs, database evidence, or payload
 capture. Add those sources separately when the application needs them.
 
