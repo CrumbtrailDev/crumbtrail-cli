@@ -6,7 +6,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import path from "node:path";
 import { detect } from "../detect";
-import { RECIPE_REGISTRY } from "../recipe-registry";
+import {
+  RECIPE_REGISTRY,
+  SOURCE_KEY_PLACEHOLDER,
+} from "../recipe-registry";
 import { cleanup, makeTmpRepo } from "./helpers";
 
 describe("recipe matcher parity", () => {
@@ -19,6 +22,13 @@ describe("recipe matcher parity", () => {
     roots.push(r);
     return r;
   };
+
+  it("publishes the static literal key delivery contract", () => {
+    expect(RECIPE_REGISTRY.static.literalKey).toEqual({
+      delivery: "inlined",
+      placeholder: SOURCE_KEY_PLACEHOLDER,
+    });
+  });
 
   it("next: matches on the `next` dep, most-specific-first", () => {
     const root = tmp({

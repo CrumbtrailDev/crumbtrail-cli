@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import path from "node:path";
-import { inspectIntegration } from "../inject/integration";
+import {
+  inspectIntegration,
+  reachableSourceFiles,
+} from "../inject/integration";
 import { buildPlan } from "../inject/recipes";
 import { envLoadCaveat } from "../cli";
 import { fakeInjectIO } from "./helpers";
@@ -30,6 +33,46 @@ function completeBrowserFiles(): Record<string, string> {
 }
 
 describe("inspectIntegration", () => {
+  it.each([
+    ["./worker.mjs", "worker.mts"],
+    ["./worker.cjs", "worker.cts"],
+  ])("maps emitted import %s back to source %s", (specifier, sourceFile) => {
+    const files = {
+      [p("src", "index.ts")]: `import ${JSON.stringify(specifier)}`,
+      [p("src", sourceFile)]: "export const worker = true",
+    };
+    const reachable = reachableSourceFiles({
+      cwd: CWD,
+      recipe: "node",
+      endpoint: ENDPOINT,
+      entryFile: p("src", "index.ts"),
+      io: fakeInjectIO(files),
+    });
+    expect(reachable.map((entry) => entry.file)).toContain(
+      p("src", sourceFile),
+    );
+  });
+
+  it("prefers TypeScript source over emitted JavaScript from a TypeScript importer", () => {
+    const reachable = reachableSourceFiles({
+      cwd: CWD,
+      recipe: "node",
+      endpoint: ENDPOINT,
+      entryFile: p("src", "index.ts"),
+      io: fakeInjectIO({
+        [p("src", "index.ts")]: 'import "./worker.js"',
+        [p("src", "worker.js")]: "generated()",
+        [p("src", "worker.ts")]: "source()",
+      }),
+    });
+    expect(reachable.map((entry) => entry.file)).toContain(
+      p("src", "worker.ts"),
+    );
+    expect(reachable.map((entry) => entry.file)).not.toContain(
+      p("src", "worker.js"),
+    );
+  });
+
   it("requires complete endpoint, key, service and remote configuration evidence", () => {
     const status = inspectIntegration({
       cwd: CWD,

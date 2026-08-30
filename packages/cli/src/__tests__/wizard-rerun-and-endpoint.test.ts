@@ -82,9 +82,9 @@ describe("the endpoint prompt defaults to the login this machine holds", () => {
 
   it("takes the same default without a prompt under --yes", async () => {
     const { deps, asked } = endpointDeps({ saved: LOCAL });
-    expect(await confirmEndpoint({ yes: true } as ParsedArgs, deps, HOSTED)).toBe(
-      LOCAL,
-    );
+    expect(
+      await confirmEndpoint({ yes: true } as ParsedArgs, deps, HOSTED),
+    ).toBe(LOCAL);
     expect(asked).toEqual([]);
   });
 
@@ -178,5 +178,313 @@ describe("CORS that lives one import away is not reported as absent", () => {
       ].join("\n"),
     ).warnings.join("\n");
     expect(warnings).toContain("No CORS middleware in this file");
+  });
+
+  it("does not treat registration in a dead branch as installed CORS", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: "https://ingest.example.com",
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({ name: "api" }),
+        [p("src", "index.ts")]: [
+          'import { testCors } from "./test-cors";',
+          "if (false) app.use(testCors())",
+          "app.fire()",
+        ].join("\n"),
+        [p("src", "test-cors.ts")]: [
+          'const ALLOWED_HEADERS = ["Authorization"]',
+          "export function testCors() {",
+          '  return { "Access-Control-Allow-Headers": ALLOWED_HEADERS.join(", ") }',
+          "}",
+        ].join("\n"),
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path.endsWith("test-cors.ts")))
+      .toBeFalsy();
+  });
+
+  it("does not treat an unresolved conditional policy as installed", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: "https://ingest.example.com",
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({ name: "api" }),
+        [p("src", "index.ts")]: [
+          'import { testCors } from "./test-cors";',
+          'if (process.env.NODE_ENV === "test") app.use(testCors())',
+          "serve({ fetch: app.fetch })",
+        ].join("\n"),
+        [p("src", "test-cors.ts")]: [
+          'const ALLOWED_HEADERS = ["Authorization"]',
+          "export function testCors() {",
+          '  return { "Access-Control-Allow-Headers": ALLOWED_HEADERS.join(", ") }',
+          "}",
+        ].join("\n"),
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path.endsWith("test-cors.ts")))
+      .toBeFalsy();
+  });
+
+  it("keeps dynamic import bindings lexical to their executed scope", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: "https://ingest.example.com",
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({ name: "api" }),
+        [p("src", "index.ts")]: [
+          'import { createApp } from "./production";',
+          "async function unused() {",
+          '  const { createApp } = await import("./test")',
+          "  return createApp()",
+          "}",
+          "createApp()",
+        ].join("\n"),
+        [p("src", "production.ts")]: [
+          'import { prodCors } from "./prod-cors";',
+          "export function createApp() {",
+          "  app.use(prodCors())",
+          "  return app",
+          "}",
+        ].join("\n"),
+        [p("src", "test.ts")]: [
+          'import { testCors } from "./test-cors";',
+          "export function createApp() { app.use(testCors()); return app }",
+        ].join("\n"),
+        [p("src", "prod-cors.ts")]: [
+          'const ALLOWED_HEADERS = ["Authorization"]',
+          "export function prodCors() {",
+          '  return { "Access-Control-Allow-Headers": ALLOWED_HEADERS.join(", ") }',
+          "}",
+        ].join("\n"),
+        [p("src", "test-cors.ts")]: [
+          'const ALLOWED_HEADERS = ["X-Test"]',
+          "export function testCors() {",
+          '  return { "Access-Control-Allow-Headers": ALLOWED_HEADERS.join(", ") }',
+          "}",
+        ].join("\n"),
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path.endsWith("prod-cors.ts")))
+      .toBe(true);
+    expect(plan.extraEdits?.some((edit) => edit.path.endsWith("test-cors.ts")))
+      .toBeFalsy();
+  });
+
+  it("does not resolve an imported CORS binding shadowed by a parameter", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: "https://ingest.example.com",
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({ name: "api" }),
+        [p("src", "index.ts")]: [
+          'import { cors } from "./policy";',
+          "function configure(cors) { app.use(cors()) }",
+          "configure(noop)",
+          "serve({ fetch: app.fetch })",
+        ].join("\n"),
+        [p("src", "policy.ts")]: [
+          'const ALLOWED_HEADERS = ["Authorization"]',
+          "export function cors() {",
+          '  return { "Access-Control-Allow-Headers": ALLOWED_HEADERS.join(", ") }',
+          "}",
+        ].join("\n"),
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path.endsWith("policy.ts")))
+      .toBeFalsy();
+  });
+
+  it("does not execute a local factory name shadowed by a parameter", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: "https://ingest.example.com",
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({ name: "api" }),
+        [p("src", "index.ts")]: [
+          'import cors from "./policy";',
+          "function configure() { app.use(cors()) }",
+          "function main(configure) { configure() }",
+          "main(noop)",
+          "serve({ fetch: app.fetch })",
+        ].join("\n"),
+        [p("src", "policy.ts")]: [
+          'const ALLOWED_HEADERS = ["Authorization"]',
+          "export default function cors() {",
+          '  return { "Access-Control-Allow-Headers": ALLOWED_HEADERS.join(", ") }',
+          "}",
+        ].join("\n"),
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path.endsWith("policy.ts")))
+      .toBeFalsy();
+  });
+
+  it("follows a called block local factory", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: "https://ingest.example.com",
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({ name: "api" }),
+        [p("src", "index.ts")]: [
+          'import cors from "./policy";',
+          "function main() {",
+          "  const configure = () => app.use(cors())",
+          "  configure()",
+          "}",
+          "main()",
+          "serve({ fetch: app.fetch })",
+        ].join("\n"),
+        [p("src", "policy.ts")]: [
+          'const ALLOWED_HEADERS = ["Authorization"]',
+          "export default function cors() {",
+          '  return { "Access-Control-Allow-Headers": ALLOWED_HEADERS.join(", ") }',
+          "}",
+        ].join("\n"),
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path.endsWith("policy.ts")))
+      .toBe(true);
+  });
+
+  it("does not follow a block factory before its declaration executes", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: "https://ingest.example.com",
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({ name: "api" }),
+        [p("src", "index.ts")]: [
+          'import cors from "./policy";',
+          "function main() {",
+          "  configure()",
+          "  const configure = () => app.use(cors())",
+          "}",
+          "main()",
+          "serve({ fetch: app.fetch })",
+        ].join("\n"),
+        [p("src", "policy.ts")]: [
+          'const ALLOWED_HEADERS = ["Authorization"]',
+          "export default function cors() {",
+          '  return { "Access-Control-Allow-Headers": ALLOWED_HEADERS.join(", ") }',
+          "}",
+        ].join("\n"),
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path.endsWith("policy.ts")))
+      .toBeFalsy();
+  });
+
+  it("follows a local CORS import and widens a custom header allowlist", () => {
+    const entry = [
+      'import { createApp } from "./app.js";',
+      "createApp();",
+    ].join("\n");
+    const app = [
+      'import { Hono } from "hono";',
+      'import { corsOptions } from "./config/cors-options.js";',
+      "import {",
+      "  corsMiddleware,",
+      '} from "./middleware/cors.js";',
+      "const app = new Hono();",
+      'app.use("*", corsMiddleware());',
+      "export default app;",
+    ].join("\n");
+    const cors = [
+      'function unrelated() { const CONFIGURED_HEADERS = ["X-Unrelated"] }',
+      'const SAFELISTED_HEADERS = ["Accept", "Content-Type"]',
+      'const CONFIGURED_RESPONSE_HEADERS = ["X-Frame-Options"]',
+      'const INTERNAL_HEADERS = ["X-Internal"]',
+      'const CONFIGURED_HEADERS = ["Authorization", "X-Idempotency-Key"]',
+      "const ALLOW_HEADERS = [...SAFELISTED_HEADERS, ...CONFIGURED_HEADERS]",
+      "export function internalPolicy(headers) {",
+      '  headers["Access-Control-Allow-Headers"] = INTERNAL_HEADERS.join(", ")',
+      "}",
+      "export function corsMiddleware() {",
+      "  return async (_context, next) => {",
+      '    headers["Access-Control-Allow-Headers"] = ALLOW_HEADERS.join(", ")',
+      "    await next()",
+      "  }",
+      "}",
+    ].join("\n");
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "hono",
+        endpoint: "https://ingest.example.com",
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({ name: "api" }),
+        [p("src", "index.ts")]: entry,
+        [p("src", "app.ts")]: app,
+        [p("src", "config", "cors-options.ts")]:
+          'export const corsOptions = { origin: "*" }',
+        [p("src", "middleware", "cors.ts")]: cors,
+      }),
+    );
+
+    const edit = plan.extraEdits?.find((item) =>
+      item.path.endsWith("middleware/cors.ts"),
+    );
+    expect(edit?.content).toContain(
+      '"X-Idempotency-Key", "x-crumbtrail-session-id"',
+    );
+    expect(edit?.content).toContain('"x-crumbtrail-request-id"');
+    expect(edit?.content).toContain('"traceparent"');
+    expect(edit?.content).not.toContain(
+      'SAFELISTED_HEADERS = ["Accept", "Content-Type",',
+    );
+    expect(edit?.content).toContain(
+      'CONFIGURED_RESPONSE_HEADERS = ["X-Frame-Options"]',
+    );
+    expect(edit?.content).toContain('INTERNAL_HEADERS = ["X-Internal"]');
+    expect(edit?.content).toContain(
+      'unrelated() { const CONFIGURED_HEADERS = ["X-Unrelated"] }',
+    );
+    expect(plan.warnings.join("\n")).toContain(
+      "Widened the CORS allowed headers",
+    );
+    expect(plan.warnings.join("\n")).not.toContain(
+      "imports CORS from another module",
+    );
+    expect(plan.warnings.join("\n")).not.toContain(
+      "No CORS middleware in this file",
+    );
   });
 });

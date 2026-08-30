@@ -97,7 +97,7 @@ describe("the other processes the package starts", () => {
       build: "tsc -p tsconfig.json",
     }),
     [p("src", "index.ts")]: "startServer();\n",
-    [p("src", "worker.ts")]: "runQueue();\n",
+    [p("src", "worker.ts")]: "setInterval(() => runQueue(), 1000);\n",
   };
 
   it("wires the worker as its own service", () => {
@@ -118,7 +118,7 @@ describe("the other processes the package starts", () => {
     expect(edit.mode).toBe("update");
     expect(edit.content).toContain('service: "marginary-worker"');
     // The worker's own body survives; this is a prepend, not a replacement.
-    expect(edit.content).toContain("runQueue();");
+    expect(edit.content).toContain("runQueue()");
     // And it gets the same env preload the entry gets.
     expect(edit.content).toContain("if (!process.env.CRUMBTRAIL_KEY) {");
   });
@@ -274,8 +274,9 @@ describe("the other processes the package starts", () => {
       [p("src", "index.ts")]: "startServer();\n",
     };
     for (let i = 0; i < 6; i++) {
-      scripts[`job${i}`] = `tsx src/job${i}.ts`;
-      files[p("src", `job${i}.ts`)] = "run();\n";
+      scripts[`worker:${i}`] = `tsx src/worker${i}.ts`;
+      files[p("src", `worker${i}.ts`)] =
+        "setInterval(() => runForever(), 1000);\n";
     }
     files[p("package.json")] = PKG(scripts);
     const plan = buildPlan(
@@ -293,7 +294,7 @@ describe("the other processes the package starts", () => {
     // Every unwired process is named with its file and the script that runs it,
     // so the user can finish the job without re-deriving the scan.
     const named = [4, 5].map((i) =>
-      warned.includes(`src/job${i}.ts (npm run job${i})`),
+      warned.includes(`src/worker${i}.ts (npm run worker:${i})`),
     );
     expect(named).toEqual([true, true]);
   });
@@ -309,7 +310,7 @@ describe("the other processes the package starts", () => {
         sim: "tsx sim/server.ts",
       }),
       [p("api", "src", "index.ts")]: "startServer();\n",
-      [p("api", "src", "worker.ts")]: "runQueue();\n",
+      [p("api", "src", "worker.ts")]: "setInterval(() => runQueue(), 1000);\n",
       [p("migrate.ts")]: "migrate();\n",
       [p("seedSim.ts")]: "seed();\n",
       [p("stripeBootstrap.ts")]: "bootstrap();\n",
@@ -335,6 +336,194 @@ describe("the other processes the package starts", () => {
     expect(plan.warnings.join(" ")).not.toContain("worker.ts (npm run worker)");
   });
 
+  it.each([
+    ["railway.worker.json", JSON.stringify({ deploy: { startCommand: "pnpm worker" } })],
+    [
+      "docker-compose.yaml",
+      "services:\n  worker:\n    command:\n      - npm\n      - run\n      - worker\n",
+    ],
+    [
+      "docker-compose.prod.yml",
+      "services:\n  worker:\n    command: [pnpm, worker]\n",
+    ],
+    [
+      "docker-compose.shell.yml",
+      'services:\n  worker:\n    command: ["sh", "-c", "pnpm worker"]\n',
+    ],
+    [
+      "Dockerfile",
+      'CMD ["sh", "-c", "exec pnpm worker"]\n',
+    ],
+  ])("accepts structured deployment command proof in %s", (manifest, body) => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: PKG({
+          start: "tsx src/index.ts",
+          worker: "tsx src/worker.ts",
+        }),
+        [p("src", "index.ts")]: "app.listen(3000)",
+        [p("src", "worker.ts")]: "runQueueOnce()",
+        [p(manifest)]: body,
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path === p("src", "worker.ts")))
+      .toBe(true);
+  });
+
+  it("does not treat a mentioned package manager as command proof", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: PKG({
+          start: "tsx src/index.ts",
+          worker: "tsx src/worker.ts",
+        }),
+        [p("src", "index.ts")]: "app.listen(3000)",
+        [p("src", "worker.ts")]: "runQueueOnce()",
+        [p("docker-compose.yaml")]:
+          "services:\n  worker:\n    command: [echo, pnpm, worker]\n",
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path === p("src", "worker.ts")))
+      .toBeFalsy();
+  });
+
+  it("does not wire one shot maintenance scripts beside a real server", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: PKG({
+        start: "tsx src/index.ts",
+        migrate: "tsx src/scripts/migrate.ts",
+        seed: "tsx src/scripts/seed.ts",
+        "suppliers:probe": "tsx src/scripts/probeSuppliers.ts",
+        "rivals:harvest": "tsx src/scripts/harvestRivals.ts",
+      }),
+      [p("src", "index.ts")]: "startServer();\n",
+      [p("src", "scripts", "migrate.ts")]: "migrate();\n",
+      [p("src", "scripts", "seed.ts")]: "seed();\n",
+      [p("src", "scripts", "probeSuppliers.ts")]: "probe();\n",
+      [p("src", "scripts", "harvestRivals.ts")]: "harvest();\n",
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      io,
+    );
+
+    expect(plan.extraEdits ?? []).toEqual([]);
+    expect(plan.warnings.join(" ")).not.toContain("left unwired");
+  });
+
+  it("does not wire a neutral reindex task but keeps a queue under scripts", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: PKG({
+        start: "tsx src/index.ts",
+        "jobs:reindex": "tsx src/tasks/reindex.ts",
+        queue: "tsx scripts/queue.ts",
+      }),
+      [p("src", "index.ts")]: "startServer();\n",
+      [p("src", "tasks", "reindex.ts")]: "reindex();\n",
+      [p("scripts", "queue.ts")]:
+        "setInterval(() => consumeForever(), 1000);\n",
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      io,
+    );
+
+    const paths = (plan.extraEdits ?? []).map((edit) => edit.path);
+    expect(paths).toEqual([p("scripts", "queue.ts")]);
+  });
+
+  it("distinguishes queue administration from a generic cron process", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: PKG({
+        start: "tsx src/index.ts",
+        "queue:drain": "tsx src/queue/drain.ts",
+        cron: "tsx scripts/run.ts",
+      }),
+      [p("src", "index.ts")]: "startServer();\n",
+      [p("src", "queue", "drain.ts")]: "drainAndExit();\n",
+      [p("scripts", "run.ts")]: "setInterval(() => scheduleForever(), 1000);\n",
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      io,
+    );
+
+    expect((plan.extraEdits ?? []).map((edit) => edit.path)).toEqual([
+      p("scripts", "run.ts"),
+    ]);
+  });
+
+  it("uses runtime evidence instead of process names", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: PKG({
+        start: "tsx src/index.ts",
+        "queue:peek": "tsx tools/peek.ts",
+        events: "tsx scripts/run.ts",
+      }),
+      [p("src", "index.ts")]: "startServer();\n",
+      [p("tools", "peek.ts")]: "peekAndExit();\n",
+      [p("scripts", "run.ts")]: "setInterval(() => consume(), 1000);\n",
+    });
+    const result = findExtraBackendEntries(CWD, io, p("src", "index.ts"));
+    expect(result.entries.map((entry) => entry.path)).toEqual([
+      p("scripts", "run.ts"),
+    ]);
+  });
+
+  it("ignores Docker build commands and lifecycle words in dead source", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: PKG({
+        start: "tsx src/index.ts",
+        migrate: "tsx tools/migrate.ts",
+        docs: "tsx tools/docs.ts",
+      }),
+      [p("src", "index.ts")]: "startServer();\n",
+      [p("tools", "migrate.ts")]: "migrateAndExit();\n",
+      [p("tools", "docs.ts")]: [
+        "// setInterval(() => generate(), 1000)",
+        "function unused() { createServer() }",
+        "generateAndExit()",
+      ].join("\n"),
+      [p("Dockerfile")]:
+        "RUN npm run migrate\nCOPY tools/docs.ts /app/docs.ts\n",
+    });
+    expect(
+      findExtraBackendEntries(CWD, io, p("src", "index.ts")).entries,
+    ).toEqual([]);
+  });
+
   it("finds nothing when the package declares no scripts", () => {
     const io = fakeInjectIO({ [p("package.json")]: "{}" });
     expect(
@@ -346,7 +535,7 @@ describe("the other processes the package starts", () => {
     const io = fakeInjectIO({
       [p("package.json")]: PKG({ worker: "tsx src/worker.ts" }),
       [p("src", "main.tsx")]: "render();\n",
-      [p("src", "worker.ts")]: "runQueue();\n",
+      [p("src", "worker.ts")]: "setInterval(() => runQueue(), 1000);\n",
     });
     const plan = buildPlan(
       {
@@ -513,12 +702,14 @@ describe("extra edits go through the executor's all-or-nothing write", () => {
     const { io: exec, files } = memExecutorIO(
       {
         [p("src", "index.ts")]: "startServer();\n",
-        [p("src", "worker.ts")]: "runQueue();\n",
+        [p("src", "worker.ts")]: "setInterval(() => runQueue(), 1000);\n",
       },
       p("src", "index.ts"),
     );
     expect(() => executePlan(plan, exec)).toThrow();
-    expect(files[p("src", "worker.ts")]).toBe("runQueue();\n");
+    expect(files[p("src", "worker.ts")]).toBe(
+      "setInterval(() => runQueue(), 1000);\n",
+    );
     expect(files[p("src", "index.ts")]).toBe("startServer();\n");
   });
 
@@ -529,7 +720,7 @@ describe("extra edits go through the executor's all-or-nothing write", () => {
         worker: "tsx src/worker.ts",
       }),
       [p("src", "index.ts")]: "startServer();\n",
-      [p("src", "worker.ts")]: "runQueue();\n",
+      [p("src", "worker.ts")]: "setInterval(() => runQueue(), 1000);\n",
     });
     const plan = buildPlan(
       {
@@ -542,7 +733,7 @@ describe("extra edits go through the executor's all-or-nothing write", () => {
     );
     const { io: exec } = memExecutorIO({
       [p("src", "index.ts")]: "startServer();\n",
-      [p("src", "worker.ts")]: "runQueue();\n",
+      [p("src", "worker.ts")]: "setInterval(() => runQueue(), 1000);\n",
     });
     const materialized = materializePlan(plan, exec);
     expect(materialized.edits.map((e) => e.path).sort()).toEqual(

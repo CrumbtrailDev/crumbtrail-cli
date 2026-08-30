@@ -370,6 +370,76 @@ describe("backend intake client", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("retries the exact session-start race until the browser session exists", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(sessionNotFoundResponse())
+      .mockResolvedValueOnce(sessionNotFoundResponse())
+      .mockResolvedValue(okJsonResponse());
+    const sleeps: number[] = [];
+    const warnings: BackendIntakeWarning[] = [];
+
+    await expect(
+      sendBackendEvent({
+        event: baseEvent,
+        fetch,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+        onWarning: (warning) => warnings.push(warning),
+      }),
+    ).resolves.toBe(true);
+
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(sleeps).toEqual([500, 1_000]);
+    expect(warnings).toEqual([]);
+  });
+
+  it("bounds an unresolved session-start race without duplicating delivery", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetch = vi.fn().mockResolvedValue(sessionNotFoundResponse());
+      const warnings: BackendIntakeWarning[] = [];
+      const delivery = sendBackendEvent({
+        event: baseEvent,
+        fetch,
+        onWarning: (warning) => warnings.push(warning),
+      });
+
+      await vi.runAllTimersAsync();
+      await expect(delivery).resolves.toBe(false);
+
+      expect(fetch).toHaveBeenCalledTimes(3);
+      expect(fetch.mock.calls.map((call) => call[1]?.body)).toEqual([
+        JSON.stringify({ sessionId: "ses_event", events: [baseEvent] }),
+        JSON.stringify({ sessionId: "ses_event", events: [baseEvent] }),
+        JSON.stringify({ sessionId: "ses_event", events: [baseEvent] }),
+      ]);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatchObject({
+        kind: "http-error",
+        status: 404,
+        attempts: 3,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps unrelated 404 responses terminal", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: vi.fn().mockResolvedValue({ error: "Project not found" }),
+    });
+
+    await expect(
+      sendBackendEvent({ event: baseEvent, fetch, sleep: async () => {} }),
+    ).resolves.toBe(false);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it("swallows warning callback failures to keep host responses safe", async () => {
     const fetch = vi.fn().mockRejectedValue(new Error("network failed"));
 
@@ -391,5 +461,13 @@ function okJsonResponse() {
     ok: true,
     status: 200,
     text: vi.fn().mockResolvedValue('{"ok":true}'),
+  };
+}
+
+function sessionNotFoundResponse() {
+  return {
+    ok: false,
+    status: 404,
+    json: vi.fn().mockResolvedValue({ error: "Session not found" }),
   };
 }

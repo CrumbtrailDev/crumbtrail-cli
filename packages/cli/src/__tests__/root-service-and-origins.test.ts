@@ -165,7 +165,9 @@ describe("backend origin resolution", () => {
   });
 
   it("takes a sibling backend's declared PORT, both loopback spellings", () => {
-    repo = makeRootApiRepo({ ".env": "PORT=19870\nDATABASE_URL=postgres://x\n" });
+    repo = makeRootApiRepo({
+      ".env": "PORT=19870\nDATABASE_URL=postgres://x\n",
+    });
     expect(resolveServicePort(repo, null, localFsReader(repo))).toBe(19870);
 
     const frontend = path.join(repo, "frontend");
@@ -186,6 +188,205 @@ describe("backend origin resolution", () => {
     expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(8123);
   });
 
+  it("reads the fallback from a validated PORT ternary", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "function resolvePort() {",
+        "  const raw = (process.env.PORT ?? '').trim()",
+        "  const parsed = Number.parseInt(raw, 10)",
+        "  return Number.isInteger(parsed) ? parsed : 8765",
+        "}",
+        "serve({ fetch: app.fetch, port: resolvePort() })",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(8765);
+  });
+
+  it("follows a listener port variable to its validated resolver", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "function resolvePort() {",
+        "  const raw = (process.env.PORT ?? '').trim()",
+        "  const parsed = Number.parseInt(raw, 10)",
+        "  return Number.isInteger(parsed) ? parsed : 8765",
+        "}",
+        "if (!process.env.VITEST) {",
+        "  const port = resolvePort()",
+        "  serve({ fetch: app.fetch, port })",
+        "}",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(8765);
+  });
+
+  it("follows asinIQ's validated resolver through its listener alias", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "export function resolvePort(env = process.env) {",
+        "  const raw = (env.PORT ?? '').trim()",
+        "  const parsed = Number.parseInt(raw, 10)",
+        "  return /^[+-]?\\d+$/.test(raw) && Number.isInteger(parsed) && parsed > 0 ? parsed : 8765",
+        "}",
+        "if (!process.env.VITEST) {",
+        "  const port = resolvePort()",
+        "  const server = serve({ fetch: createApp().fetch, port }, (info) => log(info))",
+        "}",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(8765);
+  });
+
+  it("does not read a listener inside an uncalled function", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "function resolvePort() {",
+        "  const raw = process.env.PORT",
+        "  const parsed = Number(raw)",
+        "  return Number.isInteger(parsed) ? parsed : 8765",
+        "}",
+        "function unused() {",
+        "  const port = resolvePort()",
+        "  serve({ fetch: app.fetch, port })",
+        "}",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBeNull();
+  });
+
+  it("does not mistake an unrelated cache port ternary for the HTTP port", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "const cachePort = tls ? 6380 : 6379",
+        "serve({ fetch: app.fetch, port: process.env.PORT })",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBeNull();
+  });
+
+  it("keeps PORT derivation inside the function that declares it", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "function resolveCachePort() {",
+        "  const raw = process.env.REDIS_PORT",
+        "  const parsed = Number(raw)",
+        "  return Number.isInteger(parsed) ? parsed : 6379",
+        "}",
+        "function resolveHttpPort() {",
+        "  const raw = process.env.PORT",
+        "  const parsed = Number(raw)",
+        "  return Number.isInteger(parsed) ? parsed : 8765",
+        "}",
+        "serve({ fetch: app.fetch, port: resolveHttpPort() })",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(8765);
+  });
+
+  it("ignores identical locals outside the named HTTP port resolver", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "function resolvePort() {",
+        "  const raw = process.env.PORT",
+        "  const parsed = Number(raw)",
+        "  return Number.isInteger(parsed) ? parsed : 8765",
+        "}",
+        "class Cache {",
+        "  resolve() {",
+        "    const raw = process.env.REDIS_PORT",
+        "    const parsed = Number(raw)",
+        "    return Number.isInteger(parsed) ? parsed : 6379",
+        "  }",
+        "}",
+        "serve({ fetch: app.fetch, port: resolvePort() })",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(8765);
+  });
+
+  it("ignores a PORT resolver that does not feed the server", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "function legacyPort() {",
+        "  const raw = process.env.PORT",
+        "  const parsed = Number(raw)",
+        "  return Number.isInteger(parsed) ? parsed : 4321",
+        "}",
+        "serve({ fetch: app.fetch, port: process.env.PORT })",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBeNull();
+  });
+
+  it("refuses conflicting listener ports", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": "metrics.listen(9090)\npublicApp.listen(8765)\n",
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBeNull();
+  });
+
+  it("uses local env precedence over the base env", () => {
+    repo = makeRootApiRepo({
+      ".env": "PORT=3000\n",
+      ".env.local": "PORT=4000\n",
+      "api/src/index.ts": "app.listen(process.env.PORT)\n",
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(4000);
+  });
+
+  it("refuses an active env port that conflicts with a direct listener", () => {
+    repo = makeRootApiRepo({
+      ".env.local": "PORT=3000\n",
+      "api/src/index.ts": "app.listen(4000)\n",
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBeNull();
+  });
+
+  it("uses the example port only when no active env file declares one", () => {
+    repo = makeRootApiRepo({
+      ".env.local": "PORT=4000\n",
+      ".env.example": "PORT=3000\n",
+      "api/src/index.ts": "app.listen(process.env.PORT)\n",
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(4000);
+  });
+
+  it("prefers the executable listener over the example file", () => {
+    repo = makeRootApiRepo({
+      ".env.example": "PORT=3000\n",
+      "api/src/index.ts": "app.listen(4000)\n",
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(4000);
+  });
+
+  it("refuses a direct listener that conflicts with a resolver listener", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "function resolvePort() {",
+        "  const raw = process.env.PORT",
+        "  const parsed = Number(raw)",
+        "  return Number.isInteger(parsed) ? parsed : 8765",
+        "}",
+        "metrics.listen(9090)",
+        "serve({ fetch: app.fetch, port: resolvePort() })",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBeNull();
+  });
+
   it("returns nothing rather than a framework default when the repo is silent", () => {
     repo = makeTmpRepo({
       "package.json": pkg({
@@ -196,7 +397,11 @@ describe("backend origin resolution", () => {
       "index.js": "require('express')().listen(process.env.PORT)",
     });
     expect(
-      resolveServicePort(repo, path.join(repo, "index.js"), localFsReader(repo)),
+      resolveServicePort(
+        repo,
+        path.join(repo, "index.js"),
+        localFsReader(repo),
+      ),
     ).toBeNull();
     expect(resolveBackendOrigins(repo, localFsReader(repo))).toEqual([]);
   });

@@ -16,6 +16,7 @@
     "clean": "pnpm -r clean",
     "pack:local": "node scripts/pack-local.mjs",
     "verify:installers": "node scripts/verify-installers.mjs",
+    "verify:packed-cloud-parity": "pnpm --filter crumbtrail build && node scripts/verify-packed-cloud-parity.mjs",
     "verify:fresh-install": "node scripts/verify-fresh-install.mjs",
     "verify:sdk-version-floors": "node scripts/verify-sdk-version-floors.mjs",
     "refresh:installer-fixtures": "node scripts/refresh-installer-fixtures.mjs",

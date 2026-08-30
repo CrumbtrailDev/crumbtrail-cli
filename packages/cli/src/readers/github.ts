@@ -8,7 +8,7 @@
 //   1. One recursive git-trees call gives every path in the repo, which is
 //      enough to answer isFile / isDir / readDir for the whole tree.
 //   2. File CONTENT is fetched only for an enumerable manifest of paths that
-//      detection is known to read. Three rounds, because workspace globs are
+//      detection is known to read. Four rounds, because workspace globs are
 //      not known until the root package.json has been read, and each package's
 //      entry candidates are not known until ITS package.json has been read.
 //
@@ -17,7 +17,8 @@
 // egress policy with the cloud service that owns credentials.
 
 import path from "node:path";
-import { nodeEntryCandidatePaths } from "../detect";
+import { detect, nodeEntryCandidatePaths } from "../detect";
+import { DEPLOY_CONFIG_RE } from "../inject/entrypoints";
 import { LOCAL_IMPORT, SOURCE_EXTENSIONS } from "../inject/integration";
 import type { FileReader } from "./types";
 
@@ -70,6 +71,7 @@ const DIR_MANIFEST = [
   "pyproject.toml",
   "requirements.txt",
   "Gemfile",
+  "pubspec.yaml",
   "package-lock.json",
   "pnpm-lock.yaml",
   "yarn.lock",
@@ -88,12 +90,17 @@ const TSCONFIG_FILES = [
 // tried at the package root and under src/, matching the plan builders' own
 // baseDir handling.
 const TARGET_CANDIDATES = [
-  "instrumentation-client.ts",
-  "pages/_app.tsx",
-  "pages/_app.jsx",
-  "app/layout.tsx",
-  "app/layout.jsx",
-].flatMap((p) => [p, `src/${p}`]);
+  ...SOURCE_EXTENSIONS.flatMap((ext) => [
+    `instrumentation-client${ext}`,
+    `src/instrumentation-client${ext}`,
+  ]),
+  ...SOURCE_EXTENSIONS.map((ext) => `src/hooks.client${ext}`),
+  ...SOURCE_EXTENSIONS.map((ext) => `plugins/crumbtrail.client${ext}`),
+  ...SOURCE_EXTENSIONS.map((ext) => `app/plugins/crumbtrail.client${ext}`),
+  ...["pages/_app.tsx", "pages/_app.jsx", "app/layout.tsx", "app/layout.jsx"].flatMap(
+    (candidate) => [candidate, `src/${candidate}`],
+  ),
+];
 
 /** Normalise to a POSIX absolute path rooted at "/". */
 function norm(p: string): string {
@@ -118,6 +125,7 @@ interface Snapshot {
   dirs: Set<string>;
   children: Map<string, Set<string>>;
   contents: Map<string, string | null>;
+  unavailable: Set<string>;
   truncated: boolean;
 }
 
@@ -127,6 +135,7 @@ function emptySnapshot(): Snapshot {
     dirs: new Set([ROOT]),
     children: new Map(),
     contents: new Map(),
+    unavailable: new Set(),
     truncated: false,
   };
 }
@@ -247,7 +256,14 @@ async function fetchInto(
       // Never request a path the tree says is absent: that is a wasted round
       // trip per candidate, and detection probes far more paths than exist.
       if (!snap.files.has(p)) return [p, null] as const;
-      return [p, await source.readFile(p.slice(1))] as const;
+      try {
+        const body = await source.readFile(p.slice(1));
+        if (body === null) snap.unavailable.add(p);
+        return [p, body] as const;
+      } catch {
+        snap.unavailable.add(p);
+        return [p, null] as const;
+      }
     }),
   );
   for (const [p, body] of results) snap.contents.set(p, body);
@@ -269,6 +285,8 @@ export interface HydrateOptions {
  */
 export interface HydratedGithubReader extends FileReader {
   prefetch(paths: (string | null | undefined)[]): Promise<void>;
+  /** Existing blobs whose contents could not be acquired. */
+  unavailablePaths(): readonly string[];
 }
 
 /**
@@ -313,10 +331,22 @@ export async function hydrateGithubReader(
   // the conventional dirs discover.ts scans for non-JS services.
   const dirs = new Set<string>(scanDirs(snap));
   for (const glob of globs) for (const d of expandGlob(snap, glob)) dirs.add(d);
+  for (const extraPath of options.extraPaths ?? []) {
+    const full = norm(extraPath);
+    const dir = parentOf(full);
+    if (
+      dir !== ROOT &&
+      snap.dirs.has(dir) &&
+      DIR_MANIFEST.includes(path.posix.basename(full))
+    )
+      dirs.add(dir);
+  }
 
   const memberPaths: string[] = [];
   for (const dir of dirs) {
     for (const file of DIR_MANIFEST) memberPaths.push(`${dir}/${file}`);
+    for (const file of TARGET_CANDIDATES)
+      memberPaths.push(`${dir}/${file}`);
   }
   if (memberPaths.length) await fetchInto(snap, source, memberPaths);
 
@@ -341,7 +371,37 @@ export async function hydrateGithubReader(
   }
   if (entryPaths.length) await fetchInto(snap, source, entryPaths);
 
-  return {
+  const snapshotReader: FileReader = {
+    root: ROOT,
+    readFile(file) {
+      const p = norm(file);
+      if (!snap.contents.has(p)) {
+        if (!snap.files.has(p)) return null;
+        throw new UnhydratedPathError(p);
+      }
+      return snap.contents.get(p) ?? null;
+    },
+    isFile: (file) => snap.files.has(norm(file)),
+    isDir: (dir) => snap.dirs.has(norm(dir)),
+    readDir: (dir) => [...(snap.children.get(norm(dir)) ?? [])],
+  };
+
+  // Round four: entries resolved from hydrated manifests and deploy files read
+  // by discovery's library evidence. A Vite entry is the important dependent
+  // case: its path exists only inside index.html, so no fixed candidate list
+  // can hydrate it without duplicating the detector.
+  const discoveryPaths: string[] = [];
+  for (const dir of [ROOT, ...dirs]) {
+    const detected = detect(dir, snapshotReader);
+    if (detected.entryFile) discoveryPaths.push(detected.entryFile);
+    for (const name of snapshotReader.readDir(dir)) {
+      if (DEPLOY_CONFIG_RE.test(name))
+        discoveryPaths.push(path.join(dir, name));
+    }
+  }
+  if (discoveryPaths.length) await fetchInto(snap, source, discoveryPaths);
+
+  const reader: HydratedGithubReader = {
     root: ROOT,
     async prefetch(paths) {
       await fetchInto(
@@ -350,6 +410,7 @@ export async function hydrateGithubReader(
         paths.filter((p): p is string => typeof p === "string" && p.length > 0),
       );
     },
+    unavailablePaths: () => [...snap.unavailable].sort(),
     readFile(file) {
       const p = norm(file);
       if (!snap.contents.has(p)) {
@@ -364,6 +425,14 @@ export async function hydrateGithubReader(
     isDir: (dir) => snap.dirs.has(norm(dir)),
     readDir: (dir) => [...(snap.children.get(norm(dir)) ?? [])],
   };
+  const closureSeeds = [
+    ...discoveryPaths,
+    ...[ROOT, ...dirs].flatMap((dir) =>
+      TARGET_CANDIDATES.map((candidate) => path.join(dir, candidate)),
+    ),
+  ].filter((candidate) => snap.files.has(norm(candidate)));
+  await prefetchImportClosure(reader, closureSeeds);
+  return reader;
 }
 
 /**
@@ -376,7 +445,7 @@ export async function hydrateGithubReader(
  * fully listed at hydration time, so import specifiers resolve against
  * `isFile` without any probe reads; only the resolved files cost a fetch.
  *
- * Bounded to the same 64-file ceiling as the inspection walk it feeds.
+ * Bounded to the same 256-file ceiling as the inspection walk it feeds.
  */
 export async function prefetchImportClosure(
   reader: HydratedGithubReader,
@@ -391,7 +460,7 @@ export async function prefetchImportClosure(
   const pending = seeds.map((p) => path.posix.resolve("/", p));
   const visited = new Set<string>();
   let read = 0;
-  while (pending.length > 0 && read < 64) {
+  while (pending.length > 0 && read < 256) {
     const file = pending.pop()!;
     if (visited.has(file)) continue;
     visited.add(file);
@@ -409,8 +478,39 @@ export async function prefetchImportClosure(
       const specifier = match[1];
       if (!specifier.startsWith(".")) continue;
       const base = path.posix.resolve(path.posix.dirname(file), specifier);
+      const ext = path.posix.extname(base);
+      const sourceBase = ext ? base.slice(0, -ext.length) : base;
+      const importingExt = path.posix.extname(file);
+      const emittedSourceExtensions =
+        ext === ".mjs"
+          ? [".mts"]
+          : ext === ".cjs"
+            ? [".cts"]
+            : ext === ".js"
+              ? [".ts", ".tsx"]
+              : [];
+      if ([".ts", ".tsx", ".mts", ".cts"].includes(importingExt)) {
+        const sourceMatches = emittedSourceExtensions
+          .map((sourceExt) => `${sourceBase}${sourceExt}`)
+          .filter((candidate) => reader.isFile(candidate));
+        if (sourceMatches.length === 1) {
+          const [hit] = sourceMatches;
+          if (!visited.has(hit) && !targets.includes(hit)) targets.push(hit);
+          continue;
+        }
+        if (sourceMatches.length > 1) {
+          for (const hit of sourceMatches)
+            if (!visited.has(hit) && !targets.includes(hit)) targets.push(hit);
+          continue;
+        }
+      }
       const candidates = [
         base,
+        ...(ext === ".js" || ext === ".mjs" || ext === ".cjs"
+          ? SOURCE_EXTENSIONS.map((sourceExt) =>
+              `${sourceBase}${sourceExt}`,
+            )
+          : []),
         ...SOURCE_EXTENSIONS.map((ext) => `${base}${ext}`),
         ...SOURCE_EXTENSIONS.map((ext) => path.posix.join(base, `index${ext}`)),
       ];

@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   hydrateGithubReader,
   githubInjectIO,
+  prefetchImportClosure,
   UnhydratedPathError,
   type GithubRepoSource,
   type GithubTreeEntry,
@@ -176,6 +177,158 @@ describe("hydrateGithubReader", () => {
     expect(r.readFile("/services/billing/Gemfile")).toContain("source");
     expect(r.readFile("/apps/web/index.html")).toBe("<html></html>");
     expect(r.readFile("/packages/ui/package.json")).toBe('{"name":"ui"}');
+  });
+
+  it("hydrates a Vite entry resolved from index.html for discovery evidence", async () => {
+    const { src } = source(
+      {
+        "package.json": JSON.stringify({ workspaces: ["apps/web"] }),
+        "apps/web/package.json": JSON.stringify({
+          name: "web",
+          devDependencies: { vite: "^7.0.0" },
+        }),
+        "apps/web/index.html":
+          '<script type="module" src="/src/main.tsx"></script>',
+        "apps/web/src/main.tsx": "createRoot(document.body).render(<App />)",
+      },
+      ["apps", "apps/web", "apps/web/src"],
+    );
+    const reader = await hydrateGithubReader(src);
+    expect(reader.readFile("/apps/web/src/main.tsx")).toContain("createRoot");
+    expect(() =>
+      discoverServices("/", detect("/", reader), reader, {
+        alreadyWired: () => false,
+      }),
+    ).not.toThrow();
+  });
+
+  it("hydrates default recipe entries in workspace members", async () => {
+    const { src } = source(
+      {
+        "package.json": JSON.stringify({ workspaces: ["website"] }),
+        "website/package.json": JSON.stringify({
+          dependencies: { next: "^15.0.0" },
+        }),
+        "website/instrumentation-client.js":
+          'import { consent } from "./src/consent.js"; register(consent)',
+        "website/src/consent.js": "export const consent = true",
+      },
+      ["website", "website/src"],
+    );
+    const reader = await hydrateGithubReader(src);
+    expect(reader.readFile("/website/instrumentation-client.js")).toContain(
+      "register",
+    );
+    expect(reader.readFile("/website/src/consent.js")).toContain("consent");
+  });
+
+  it("records an unreadable hydrated file as unavailable", async () => {
+    const { src } = source(
+      {
+        "package.json": JSON.stringify({ workspaces: ["broken"] }),
+        "broken/package.json": JSON.stringify({
+          scripts: { start: "node index.js" },
+        }),
+        "broken/index.js": "listen()",
+      },
+      ["broken"],
+    );
+    const read = src.readFile.bind(src);
+    src.readFile = async (file) => {
+      if (file === "broken/index.js") throw new Error("read failed");
+      return read(file);
+    };
+    const reader = await hydrateGithubReader(src);
+    expect(reader.readFile("/broken/index.js")).toBeNull();
+    expect(reader.unavailablePaths()).toEqual(["/broken/index.js"]);
+  });
+
+  it("prefetches emitted extension imports through the full inspection bound", async () => {
+    const files: Record<string, string> = {
+      "package.json": "{}",
+    };
+    const count = 80;
+    for (let index = 0; index < count; index++) {
+      files[`src/file${index}.ts`] =
+        index === count - 1
+          ? "export const done = true"
+          : `import "./file${index + 1}.js"`;
+    }
+    const { src } = source(files, ["src"]);
+    const reader = await hydrateGithubReader(src);
+    await prefetchImportClosure(reader, ["/src/file0.ts"]);
+    expect(reader.readFile(`/src/file${count - 1}.ts`)).toContain("done");
+  });
+
+  it("hydrates every ambiguous emitted source before refusing resolution", async () => {
+    const { src } = source(
+      {
+        "package.json": "{}",
+        "src/index.ts": 'import "./view.js"',
+        "src/view.ts": "export const view = 1",
+        "src/view.tsx": "export const view = <main />",
+      },
+      ["src"],
+    );
+    const reader = await hydrateGithubReader(src);
+    await prefetchImportClosure(reader, ["/src/index.ts"]);
+    expect(reader.readFile("/src/view.ts")).toContain("view");
+    expect(reader.readFile("/src/view.tsx")).toContain("view");
+  });
+
+  it("hydrates dependent entries for caller-provided service manifests", async () => {
+    const files: Record<string, string> = { "package.json": "{}" };
+    const dirs: string[] = ["packages"];
+    for (let index = 0; index < 205; index++) {
+      const dir = `packages/pad${String(index).padStart(3, "0")}`;
+      dirs.push(dir);
+      files[`${dir}/README.md`] = "padding";
+    }
+    dirs.push("packages/late", "packages/late/src");
+    files["packages/late/package.json"] = JSON.stringify({
+      dependencies: { vite: "^7.0.0" },
+    });
+    files["packages/late/index.html"] =
+      '<script type="module" src="/src/main.tsx"></script>';
+    files["packages/late/src/main.tsx"] = "render()";
+    const { src } = source(files, dirs);
+    const reader = await hydrateGithubReader(src, {
+      extraPaths: [
+        "/packages/late/package.json",
+        "/packages/late/index.html",
+      ],
+    });
+    expect(reader.readFile("/packages/late/src/main.tsx")).toBe("render()");
+  });
+
+  it("hydrates every deploy manifest read by discovery evidence", async () => {
+    const { src } = source(
+      {
+        "package.json": JSON.stringify({ workspaces: ["services/api"] }),
+        "railway.worker.toml": 'startCommand = "node root-worker.js"',
+        "services/api/package.json": JSON.stringify({
+          name: "api",
+          dependencies: { hono: "^4.0.0" },
+          scripts: { start: "tsx src/index.ts" },
+        }),
+        "services/api/src/index.ts": "Bun.serve({ fetch: app.fetch })",
+        "services/api/Dockerfile": '["node", "src/index.ts"]',
+        "services/api/docker-compose.prod.yaml":
+          "services:\n  api:\n    command: [node, src/index.ts]\n",
+      },
+      ["services", "services/api", "services/api/src"],
+    );
+    const reader = await hydrateGithubReader(src);
+    expect(reader.readFile("/railway.worker.toml")).toContain("startCommand");
+    expect(reader.readFile("/services/api/Dockerfile")).toContain("src/index");
+    expect(reader.readFile("/services/api/docker-compose.prod.yaml")).toContain(
+      "command",
+    );
+    expect(() =>
+      discoverServices("/", detect("/", reader), reader, {
+        alreadyWired: () => false,
+      }),
+    ).not.toThrow();
   });
 
   it("keeps hydration to three rounds and skips absent manifests", async () => {

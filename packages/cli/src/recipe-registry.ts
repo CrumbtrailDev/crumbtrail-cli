@@ -73,6 +73,9 @@ export interface KeyRef {
   bundlerInlined?: true;
 }
 
+/** Exact marker used when a public source file must carry the ingest key. */
+export const SOURCE_KEY_PLACEHOLDER = "<your-ingest-key>";
+
 export interface RecipeMeta {
   /**
    * design-system Stack id passed to buildAgentPrompt() (attribution) and the
@@ -123,6 +126,11 @@ export interface RecipeMeta {
    * it points the user at `environment.ts` instead).
    */
   keyRef?: KeyRef;
+  /**
+   * Public source literal the hosted installer may replace with the minted
+   * project key. The unique placeholder keeps replacement proof based.
+   */
+  literalKey?: { delivery: "inlined"; placeholder: string };
 }
 
 // Framework public-env references. Vite-based client stacks (SvelteKit, Nuxt,
@@ -376,10 +384,14 @@ export const RECIPE_REGISTRY: Record<Recipe, RecipeMeta> = {
     sdkPackages: [],
     serviceName: "web",
     kind: "inject",
+    literalKey: {
+      delivery: "inlined",
+      placeholder: SOURCE_KEY_PLACEHOLDER,
+    },
     // No keyRef: a page served as files has no build step to inline an env var
     // and no process env to read one from, so the key goes in the tag itself.
-    // The wizard therefore mints nothing and points at the dashboard instead of
-    // writing a live credential into a file the page could commit.
+    // Hosted setup replaces the unique placeholder with the minted project key;
+    // local setup leaves the explicit replacement step in its summary.
   },
   node: {
     stack: "node",

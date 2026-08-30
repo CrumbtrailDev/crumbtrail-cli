@@ -81,6 +81,9 @@ function makeApp(): string {
       "setTimeout(() => {}, 200);",
       "",
     ].join("\n"),
+    "railway.worker.json": JSON.stringify({
+      deploy: { startCommand: "npm run worker" },
+    }),
     "node_modules/crumbtrail-node/package.json": JSON.stringify({
       name: "crumbtrail-node",
       version: "0.37.0",
