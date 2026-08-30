@@ -53,6 +53,11 @@
       "import": "./dist/tauri/index.js",
       "require": "./dist/tauri/index.cjs"
     },
+    "./serverless": {
+      "types": "./dist/serverless/index.d.ts",
+      "import": "./dist/serverless/index.js",
+      "require": "./dist/serverless/index.cjs"
+    },
     "./package.json": "./package.json"
   },
   "files": [
