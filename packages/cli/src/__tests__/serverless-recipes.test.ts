@@ -121,6 +121,57 @@ describe("serverless runtime precedence", () => {
   });
 
   it.each([
+    [
+      "Hono",
+      {
+        "package.json": JSON.stringify({
+          dependencies: { hono: "4" },
+          scripts: { start: "tsx api/index.ts" },
+        }),
+        "api/index.ts": "export default { fetch() {} }",
+      },
+      "hono",
+    ],
+    [
+      "Express",
+      {
+        "package.json": JSON.stringify({
+          dependencies: { express: "5" },
+          scripts: { start: "tsx api/index.ts" },
+        }),
+        "api/index.ts": "app.listen(3000)",
+      },
+      "express",
+    ],
+  ] as const)(
+    "keeps explicit %s evidence ahead of an unowned api directory",
+    (_label, files, recipe) => {
+      const root = makeTmpRepo(files);
+      roots.push(root);
+
+      // Goes red when the conventional api directory returns to the strong
+      // platform tier and overrides an explicit supported framework.
+      expect(detect(root).recipe).toBe(recipe);
+    },
+  );
+
+  it("keeps vercel.json ahead of an explicit framework", () => {
+    const root = makeTmpRepo({
+      "package.json": JSON.stringify({
+        dependencies: { hono: "4" },
+        scripts: { start: "tsx api/index.ts" },
+      }),
+      "vercel.json": '{"functions":{"api/index.ts":{"runtime":"nodejs20.x"}}}',
+      "api/index.ts": "export default { fetch() {} }",
+    });
+    roots.push(root);
+
+    // Goes red if the strong platform tier is moved behind frameworks while
+    // weakening the conventional directory hint.
+    expect(detect(root).recipe).toBe("vercel-functions");
+  });
+
+  it.each([
     ["vercel-ambiguous", "vercel-functions-ambiguous"],
     ["netlify-ambiguous", "netlify-functions-ambiguous"],
   ])("keeps %s as a guided runtime choice", (name, recipe) => {

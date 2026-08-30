@@ -1046,6 +1046,40 @@ const SERVERLESS_SOURCE_EXTENSIONS = new Set([
   ".cts",
 ]);
 
+const DENO_CONFIG_FILES = ["deno.json", "deno.jsonc"] as const;
+const AWS_SERVERLESS_CONFIG_FILES = [
+  "serverless.yml",
+  "serverless.yaml",
+  "serverless.ts",
+] as const;
+const AWS_SAM_TEMPLATE_FILES = [
+  "template.yml",
+  "template.yaml",
+  "template.json",
+] as const;
+const VERCEL_CONFIG_FILES = ["vercel.json"] as const;
+const NETLIFY_CONFIG_FILES = ["netlify.toml"] as const;
+
+/** Fixed config files whose contents serverless detection may inspect. */
+export const SERVERLESS_DETECTION_CONFIG_FILES = [
+  ...DENO_CONFIG_FILES,
+  ...AWS_SERVERLESS_CONFIG_FILES,
+  ...AWS_SAM_TEMPLATE_FILES,
+  ...VERCEL_CONFIG_FILES,
+  ...NETLIFY_CONFIG_FILES,
+] as const;
+
+const DENO_DEFAULT_ENTRY_FILES = [
+  "main.ts",
+  "main.js",
+  "mod.ts",
+  "mod.js",
+  "server.ts",
+  "server.js",
+  "index.ts",
+  "index.js",
+] as const;
+
 function sourceFilesIn(
   root: string,
   relativeDir: string,
@@ -1067,24 +1101,46 @@ function sourceFilesIn(
   return files.sort();
 }
 
+function denoConfiguredEntries(configText: string): string[] {
+  return [
+    ...configText.matchAll(/(?:^|[\s"'])([\w./-]+\.(?:[cm]?[jt]sx?))\b/g),
+  ].map((match) => match[1]);
+}
+
+/** Existing source files whose contents serverless detection may inspect. */
+export function serverlessDetectionSourceFiles(
+  root: string,
+  reader: FileReader,
+): string[] {
+  const hasDenoConfig = DENO_CONFIG_FILES.some((file) =>
+    reader.isFile(path.join(root, file)),
+  );
+  const denoEntries = DENO_CONFIG_FILES.flatMap((file) =>
+    denoConfiguredEntries(safeRead(path.join(root, file), reader) ?? ""),
+  );
+  const candidates = [
+    ...(hasDenoConfig
+      ? [
+          ...DENO_DEFAULT_ENTRY_FILES.map((file) => path.join(root, file)),
+          ...denoEntries.map((file) => path.join(root, file)),
+          ...sourceFilesIn(root, "src", reader),
+        ]
+      : []),
+    ...sourceFilesIn(root, "api", reader),
+    ...sourceFilesIn(root, path.join("netlify", "functions"), reader),
+    ...sourceFilesIn(root, path.join("netlify", "edge-functions"), reader),
+  ];
+  return [...new Set(candidates)].filter((file) => reader.isFile(file)).sort();
+}
+
 function firstDenoServeEntry(
   root: string,
   configText: string,
   reader: FileReader,
 ): string | null {
-  const configuredEntries = [
-    ...configText.matchAll(/(?:^|[\s"'])([\w./-]+\.(?:[cm]?[jt]sx?))\b/g),
-  ].map((match) => match[1]);
   const candidates = [
-    "main.ts",
-    "main.js",
-    "mod.ts",
-    "mod.js",
-    "server.ts",
-    "server.js",
-    "index.ts",
-    "index.js",
-    ...configuredEntries,
+    ...DENO_DEFAULT_ENTRY_FILES,
+    ...denoConfiguredEntries(configText),
     ...sourceFilesIn(root, "src", reader).map((file) =>
       path.relative(root, file),
     ),
@@ -1101,7 +1157,7 @@ function awsServerlessConfig(
   root: string,
   reader: FileReader,
 ): { file: string; evidence: string } | null {
-  for (const file of ["serverless.yml", "serverless.yaml", "serverless.ts"]) {
+  for (const file of AWS_SERVERLESS_CONFIG_FILES) {
     const text = safeRead(path.join(root, file), reader);
     if (text == null) continue;
     const yamlAws =
@@ -1121,7 +1177,7 @@ function awsSamTemplate(
   root: string,
   reader: FileReader,
 ): { file: string; evidence: string } | null {
-  for (const file of ["template.yml", "template.yaml", "template.json"]) {
+  for (const file of AWS_SAM_TEMPLATE_FILES) {
     const text = safeRead(path.join(root, file), reader);
     if (text == null) continue;
     if (
@@ -1151,8 +1207,12 @@ function vercelEvidence(
   root: string,
   deps: Record<string, string>,
   reader: FileReader,
-): { runtime: ServerlessRuntime; reasons: string[] } | null {
-  const configText = safeRead(path.join(root, "vercel.json"), reader);
+): {
+  runtime: ServerlessRuntime;
+  reasons: string[];
+  strength: "strong" | "weak";
+} | null {
+  const configText = safeRead(path.join(root, VERCEL_CONFIG_FILES[0]), reader);
   const apiFiles = sourceFilesIn(root, "api", reader);
   const dependency = Object.keys(deps).find((name) =>
     name.startsWith("@vercel/"),
@@ -1181,8 +1241,10 @@ function vercelEvidence(
           !value ||
           typeof value !== "object" ||
           typeof value.runtime !== "string" ||
-          !(/^nodejs|@vercel\/node/i.test(value.runtime) ||
-            /edge/i.test(value.runtime)),
+          !(
+            /^nodejs|@vercel\/node/i.test(value.runtime) ||
+            /edge/i.test(value.runtime)
+          ),
       );
     } catch {
       // Invalid JSON is marker evidence only. Runtime must come from a
@@ -1214,6 +1276,7 @@ function vercelEvidence(
   return {
     runtime: decisiveRuntime(node, edge, hasUnknownRuntime),
     reasons,
+    strength: configText != null || dependency ? "strong" : "weak",
   };
 }
 
@@ -1222,7 +1285,7 @@ function netlifyEvidence(
   deps: Record<string, string>,
   reader: FileReader,
 ): { runtime: ServerlessRuntime; reasons: string[] } | null {
-  const configText = safeRead(path.join(root, "netlify.toml"), reader);
+  const configText = safeRead(path.join(root, NETLIFY_CONFIG_FILES[0]), reader);
   const nodeFiles = sourceFilesIn(
     root,
     path.join("netlify", "functions"),
@@ -1383,7 +1446,7 @@ const RECIPE_MATCHERS: ReadonlyArray<
   [
     "deno-deploy",
     ({ root, reasons, reader }) => {
-      const marker = ["deno.json", "deno.jsonc"].find((name) =>
+      const marker = DENO_CONFIG_FILES.find((name) =>
         reader.isFile(path.join(root, name)),
       );
       if (!marker) return null;
@@ -1411,7 +1474,12 @@ const RECIPE_MATCHERS: ReadonlyArray<
     "vercel-functions",
     ({ root, deps, reasons, reader }) => {
       const evidence = vercelEvidence(root, deps, reader);
-      if (!evidence || evidence.runtime !== "node") return null;
+      if (
+        !evidence ||
+        evidence.strength !== "strong" ||
+        evidence.runtime !== "node"
+      )
+        return null;
       reasons.push(...evidence.reasons);
       return { entryFile: null, nextVersion: null };
     },
@@ -1420,7 +1488,12 @@ const RECIPE_MATCHERS: ReadonlyArray<
     "vercel-edge-functions",
     ({ root, deps, reasons, reader }) => {
       const evidence = vercelEvidence(root, deps, reader);
-      if (!evidence || evidence.runtime !== "edge") return null;
+      if (
+        !evidence ||
+        evidence.strength !== "strong" ||
+        evidence.runtime !== "edge"
+      )
+        return null;
       reasons.push(...evidence.reasons);
       return { entryFile: null, nextVersion: null };
     },
@@ -1429,7 +1502,12 @@ const RECIPE_MATCHERS: ReadonlyArray<
     "vercel-functions-ambiguous",
     ({ root, deps, reasons, reader }) => {
       const evidence = vercelEvidence(root, deps, reader);
-      if (!evidence || evidence.runtime !== "ambiguous") return null;
+      if (
+        !evidence ||
+        evidence.strength !== "strong" ||
+        evidence.runtime !== "ambiguous"
+      )
+        return null;
       reasons.push(...evidence.reasons);
       reasons.push(
         "Vercel runtime is ambiguous; choose the Node or edge adapter for each function",
@@ -1551,13 +1629,16 @@ const RECIPE_MATCHERS: ReadonlyArray<
     // `dependencies` with react-scripts left to the wrapper's own peer range.
     "cra",
     ({ root, deps, reasons, reader }) => {
-      const marker = ["react-scripts", "@craco/craco", "react-app-rewired"].find(
-        (d) => d in deps,
-      );
+      const marker = [
+        "react-scripts",
+        "@craco/craco",
+        "react-app-rewired",
+      ].find((d) => d in deps);
       if (!marker) return null;
       reasons.push(`found \`${marker}\` dependency`);
       const entryFile = resolveCraEntry(root, reader);
-      if (!entryFile) reasons.push("could not resolve src/index.{tsx,jsx,ts,js}");
+      if (!entryFile)
+        reasons.push("could not resolve src/index.{tsx,jsx,ts,js}");
       return { entryFile, nextVersion: null };
     },
   ],
@@ -1633,6 +1714,51 @@ const RECIPE_MATCHERS: ReadonlyArray<
       if (!entryFile)
         reasons.push("could not resolve an App/_layout/index entry");
       return { entryFile, nextVersion: null };
+    },
+  ],
+  [
+    "vercel-functions",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = vercelEvidence(root, deps, reader);
+      if (
+        !evidence ||
+        evidence.strength !== "weak" ||
+        evidence.runtime !== "node"
+      )
+        return null;
+      reasons.push(...evidence.reasons);
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
+    "vercel-edge-functions",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = vercelEvidence(root, deps, reader);
+      if (
+        !evidence ||
+        evidence.strength !== "weak" ||
+        evidence.runtime !== "edge"
+      )
+        return null;
+      reasons.push(...evidence.reasons);
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
+  [
+    "vercel-functions-ambiguous",
+    ({ root, deps, reasons, reader }) => {
+      const evidence = vercelEvidence(root, deps, reader);
+      if (
+        !evidence ||
+        evidence.strength !== "weak" ||
+        evidence.runtime !== "ambiguous"
+      )
+        return null;
+      reasons.push(...evidence.reasons);
+      reasons.push(
+        "Vercel runtime is ambiguous; choose the Node or edge adapter for each function",
+      );
+      return { entryFile: null, nextVersion: null };
     },
   ],
   [

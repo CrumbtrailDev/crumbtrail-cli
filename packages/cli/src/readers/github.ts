@@ -17,7 +17,12 @@
 // egress policy with the cloud service that owns credentials.
 
 import path from "node:path";
-import { detect, nodeEntryCandidatePaths } from "../detect";
+import {
+  detect,
+  nodeEntryCandidatePaths,
+  SERVERLESS_DETECTION_CONFIG_FILES,
+  serverlessDetectionSourceFiles,
+} from "../detect";
 import { DEPLOY_CONFIG_RE } from "../inject/entrypoints";
 import { LOCAL_IMPORT, SOURCE_EXTENSIONS } from "../inject/integration";
 import type { FileReader } from "./types";
@@ -76,6 +81,7 @@ const DIR_MANIFEST = [
   "pnpm-lock.yaml",
   "yarn.lock",
   "bun.lock",
+  ...SERVERLESS_DETECTION_CONFIG_FILES,
 ];
 
 /** The subset of DIR_MANIFEST that entry resolution reads for rootDir/outDir. */
@@ -97,9 +103,12 @@ const TARGET_CANDIDATES = [
   ...SOURCE_EXTENSIONS.map((ext) => `src/hooks.client${ext}`),
   ...SOURCE_EXTENSIONS.map((ext) => `plugins/crumbtrail.client${ext}`),
   ...SOURCE_EXTENSIONS.map((ext) => `app/plugins/crumbtrail.client${ext}`),
-  ...["pages/_app.tsx", "pages/_app.jsx", "app/layout.tsx", "app/layout.jsx"].flatMap(
-    (candidate) => [candidate, `src/${candidate}`],
-  ),
+  ...[
+    "pages/_app.tsx",
+    "pages/_app.jsx",
+    "app/layout.tsx",
+    "app/layout.jsx",
+  ].flatMap((candidate) => [candidate, `src/${candidate}`]),
 ];
 
 /** Normalise to a POSIX absolute path rooted at "/". */
@@ -345,31 +354,9 @@ export async function hydrateGithubReader(
   const memberPaths: string[] = [];
   for (const dir of dirs) {
     for (const file of DIR_MANIFEST) memberPaths.push(`${dir}/${file}`);
-    for (const file of TARGET_CANDIDATES)
-      memberPaths.push(`${dir}/${file}`);
+    for (const file of TARGET_CANDIDATES) memberPaths.push(`${dir}/${file}`);
   }
   if (memberPaths.length) await fetchInto(snap, source, memberPaths);
-
-  // Round three: each package's Node entry candidates. Entry resolution reads
-  // these — it refuses a candidate that is a process wrapper, and that verdict
-  // is in the file's text — so a manifest that stopped at package.json left the
-  // resolver faulting on an unhydrated path. Bounded: candidates come from the
-  // manifest that round two just fetched, and `fetchInto` drops every path the
-  // tree says does not exist.
-  const entryPaths: string[] = [];
-  for (const dir of [ROOT, ...dirs]) {
-    const at = (file: string) =>
-      norm(dir === ROOT ? `/${file}` : `${dir}/${file}`);
-    const pkgText = snap.contents.get(at("package.json")) ?? null;
-    if (pkgText == null) continue;
-    const tsconfigTexts = TSCONFIG_FILES.map((f) =>
-      snap.contents.get(at(f)),
-    ).filter((t): t is string => typeof t === "string");
-    for (const rel of nodeEntryCandidatePaths(pkgText, tsconfigTexts)) {
-      entryPaths.push(norm(dir === ROOT ? `/${rel}` : `${dir}/${rel}`));
-    }
-  }
-  if (entryPaths.length) await fetchInto(snap, source, entryPaths);
 
   const snapshotReader: FileReader = {
     root: ROOT,
@@ -385,6 +372,28 @@ export async function hydrateGithubReader(
     isDir: (dir) => snap.dirs.has(norm(dir)),
     readDir: (dir) => [...(snap.children.get(norm(dir)) ?? [])],
   };
+
+  // Round three: each package's Node entry candidates. Entry resolution reads
+  // these — it refuses a candidate that is a process wrapper, and that verdict
+  // is in the file's text — so a manifest that stopped at package.json left the
+  // resolver faulting on an unhydrated path. Bounded: candidates come from the
+  // manifest that round two just fetched, and `fetchInto` drops every path the
+  // tree says does not exist.
+  const entryPaths: string[] = [];
+  for (const dir of [ROOT, ...dirs]) {
+    entryPaths.push(...serverlessDetectionSourceFiles(dir, snapshotReader));
+    const at = (file: string) =>
+      norm(dir === ROOT ? `/${file}` : `${dir}/${file}`);
+    const pkgText = snap.contents.get(at("package.json")) ?? null;
+    if (pkgText == null) continue;
+    const tsconfigTexts = TSCONFIG_FILES.map((f) =>
+      snap.contents.get(at(f)),
+    ).filter((t): t is string => typeof t === "string");
+    for (const rel of nodeEntryCandidatePaths(pkgText, tsconfigTexts)) {
+      entryPaths.push(norm(dir === ROOT ? `/${rel}` : `${dir}/${rel}`));
+    }
+  }
+  if (entryPaths.length) await fetchInto(snap, source, entryPaths);
 
   // Round four: entries resolved from hydrated manifests and deploy files read
   // by discovery's library evidence. A Vite entry is the important dependent
@@ -507,9 +516,7 @@ export async function prefetchImportClosure(
       const candidates = [
         base,
         ...(ext === ".js" || ext === ".mjs" || ext === ".cjs"
-          ? SOURCE_EXTENSIONS.map((sourceExt) =>
-              `${sourceBase}${sourceExt}`,
-            )
+          ? SOURCE_EXTENSIONS.map((sourceExt) => `${sourceBase}${sourceExt}`)
           : []),
         ...SOURCE_EXTENSIONS.map((ext) => `${base}${ext}`),
         ...SOURCE_EXTENSIONS.map((ext) => path.posix.join(base, `index${ext}`)),
