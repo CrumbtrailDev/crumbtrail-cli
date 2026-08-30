@@ -43,6 +43,12 @@ describe("createAutoFlagController", () => {
     });
   }
 
+  function fixedDetector(key: string, tag: string) {
+    return {
+      inspect: () => ({ key, tag, reason: `${tag} fired` }),
+    };
+  }
+
   it("flags once after the debounce window for an error event", () => {
     const c = controller();
     c.handleEvent(errEvent("boom", "Error: boom\n  at a.js:1"));
@@ -119,6 +125,57 @@ describe("createAutoFlagController", () => {
     c.dispose();
     vi.advanceTimersByTime(2000);
     expect(flag).not.toHaveBeenCalled();
+  });
+
+  describe("shadow detectors", () => {
+    it("counts a distinct signal without opening a capture", () => {
+      const c = createAutoFlagController({
+        debounceMs: 10,
+        maxPerSession: 1,
+        flag,
+        detectors: [],
+        shadowDetectors: [fixedDetector("candidate:one", "auto:candidate")],
+      });
+
+      c.handleEvent(errEvent("one"));
+      c.handleEvent(errEvent("duplicate"));
+      vi.advanceTimersByTime(10);
+
+      expect(flag).not.toHaveBeenCalled();
+      expect(c.shadowCounts()).toEqual({ "auto:candidate": 1 });
+    });
+
+    it("does not spend the capture cap", async () => {
+      const c = createAutoFlagController({
+        debounceMs: 10,
+        maxPerSession: 1,
+        flag,
+        detectors: [fixedDetector("capture:one", "auto:real")],
+        shadowDetectors: [fixedDetector("candidate:one", "auto:candidate")],
+      });
+
+      c.handleEvent(errEvent("shadow and real"));
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(c.shadowCounts()).toEqual({ "auto:candidate": 1 });
+      expect(flag).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps session totals when a capture window ends", () => {
+      const c = createAutoFlagController({
+        debounceMs: 10,
+        maxPerSession: 1,
+        flag,
+        detectors: [],
+        shadowDetectors: [fixedDetector("candidate:one", "auto:candidate")],
+      });
+
+      c.handleEvent(errEvent("first window"));
+      c.endWindow();
+      c.handleEvent(errEvent("second window"));
+
+      expect(c.shadowCounts()).toEqual({ "auto:candidate": 2 });
+    });
   });
 
   describe("behavioral detectors (precognitive capture)", () => {
