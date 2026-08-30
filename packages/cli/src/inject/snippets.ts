@@ -684,7 +684,7 @@ export function staticScriptTagSnippet(options: {
     : " Get one from your Crumbtrail dashboard.";
   return [
     "<!-- Crumbtrail — browser capture (console, network, DOM, errors). -->",
-    `<!-- Replace ${keyLiteral} with your ingest key.${mint} -->`,
+    `<!-- httpAuthToken must contain this project's ingest key.${mint} -->`,
     '<script type="module">',
     `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(options.sdkVersion))};`,
     "",

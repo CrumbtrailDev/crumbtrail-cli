@@ -21,7 +21,11 @@ import type { Stack } from "crumbtrail-core";
 import { isBackendRecipe } from "../backend-origins";
 import { isBuildOutputPath, type Recipe } from "../detect";
 import type { FileReader } from "../readers/types";
-import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
+import {
+  RECIPE_REGISTRY,
+  SOURCE_KEY_PLACEHOLDER,
+  type KeyRef,
+} from "../recipe-registry";
 import {
   inspectIntegration,
   reachableSourceFiles,
@@ -80,7 +84,7 @@ import {
  * installer never mints a key. The user replaces it with the key they mint in
  * the dashboard. Never written to a file — only shown in copyable instructions.
  */
-const KEY_PLACEHOLDER = "<your-ingest-key>";
+const KEY_PLACEHOLDER = SOURCE_KEY_PLACEHOLDER;
 
 /**
  * How this app reads its key: the recipe's own reference, unchanged. One ingest
@@ -1943,7 +1947,7 @@ function planDockerBuildArg(
 
 /**
  * Find CORS configuration in the server's bounded reachable source graph.
- * The same graph powers integration completeness and stops at 64 local files,
+ * The same graph powers integration completeness and stops at 256 local files,
  * so extracted app factories and middleware modules are covered without a
  * repository-wide crawl or path-name guessing.
  */
@@ -1963,6 +1967,85 @@ function parseCorsProgram(source: string): any | null {
     }
   }
   return null;
+}
+
+function branchContainsLifecycleCall(node: any): boolean {
+  let found = false;
+  const visit = (candidate: any): void => {
+    if (!candidate || typeof candidate !== "object" || found) return;
+    if (
+      candidate !== node &&
+      /^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+        candidate.type ?? "",
+      )
+    )
+      return;
+    if (candidate.type === "CallExpression") {
+      const callee = candidate.callee;
+      if (
+        (callee.type === "Identifier" && callee.name === "serve") ||
+        (callee.type === "MemberExpression" &&
+          !callee.computed &&
+          (callee.property.name === "listen" ||
+            (callee.property.name === "serve" &&
+              callee.object.type === "Identifier" &&
+              (callee.object.name === "Bun" || callee.object.name === "Deno"))))
+      ) {
+        found = true;
+        return;
+      }
+    }
+    for (const value of Object.values(candidate)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value);
+    }
+  };
+  visit(node);
+  return found;
+}
+
+function provenConditionalBranch(node: any): any | null {
+  if (node.test?.type === "BooleanLiteral")
+    return node.test.value ? node.consequent : node.alternate;
+  const branches = [node.consequent, node.alternate].filter(
+    (branch) => branch && branchContainsLifecycleCall(branch),
+  );
+  return branches.length === 1 ? branches[0] : null;
+}
+
+function boundIdentifierNames(node: any): string[] {
+  if (!node) return [];
+  if (node.type === "Identifier") return [node.name];
+  if (node.type === "AssignmentPattern") return boundIdentifierNames(node.left);
+  if (node.type === "RestElement") return boundIdentifierNames(node.argument);
+  if (node.type === "ObjectPattern")
+    return node.properties.flatMap((property: any) =>
+      boundIdentifierNames(
+        property.type === "RestElement" ? property.argument : property.value,
+      ),
+    );
+  if (node.type === "ArrayPattern")
+    return node.elements.flatMap(boundIdentifierNames);
+  return [];
+}
+
+function statementBindingNames(statement: any): string[] {
+  const declaration =
+    statement?.type === "ExportNamedDeclaration" ||
+    statement?.type === "ExportDefaultDeclaration"
+      ? statement.declaration
+      : statement;
+  if (declaration?.type === "VariableDeclaration")
+    return declaration.declarations.flatMap((item: any) =>
+      boundIdentifierNames(item.id),
+    );
+  if (
+    declaration?.type === "FunctionDeclaration" ||
+    declaration?.type === "ClassDeclaration"
+  )
+    return declaration.id ? [declaration.id.name] : [];
+  return [];
 }
 
 function installedCorsImports(
@@ -2029,21 +2112,34 @@ function installedCorsImports(
     imported: string;
     local: string;
   }> = [];
-  const factories = new Map<string, any>();
+  const factories = new Map<string, { body: any; params: any[] }>();
   for (const statement of program.body as any[]) {
-    if (statement.type === "FunctionDeclaration" && statement.id)
-      factories.set(statement.id.name, statement.body);
-    if (statement.type === "VariableDeclaration")
-      for (const declaration of statement.declarations)
+    const declaration =
+      statement.type === "ExportNamedDeclaration"
+        ? statement.declaration
+        : statement;
+    if (declaration?.type === "FunctionDeclaration" && declaration.id)
+      factories.set(declaration.id.name, {
+        body: declaration.body,
+        params: declaration.params,
+      });
+    if (declaration?.type === "VariableDeclaration")
+      for (const item of declaration.declarations)
         if (
-          declaration.id.type === "Identifier" &&
-          (declaration.init?.type === "ArrowFunctionExpression" ||
-            declaration.init?.type === "FunctionExpression")
+          item.id.type === "Identifier" &&
+          (item.init?.type === "ArrowFunctionExpression" ||
+            item.init?.type === "FunctionExpression")
         )
-          factories.set(declaration.id.name, declaration.init.body);
+          factories.set(item.id.name, {
+            body: item.init.body,
+            params: item.init.params,
+          });
   }
-  const visitedFactories = new Set<string>();
-  const inspectRegistration = (node: any): void => {
+  const visitedFactories = new Set<{ body: any; params: any[] }>();
+  const inspectRegistration = (
+    node: any,
+    shadowed: ReadonlySet<string>,
+  ): void => {
     if (node.type === "CallExpression") {
       const callee = node.callee;
       const registration =
@@ -2057,14 +2153,18 @@ function installedCorsImports(
           const expression =
             argument.type === "CallExpression" ? argument.callee : argument;
           if (expression.type === "Identifier") {
-            const binding = bindings.get(expression.name);
+            const binding = shadowed.has(expression.name)
+              ? undefined
+              : bindings.get(expression.name);
             if (binding) installed.push(binding);
           } else if (
             expression.type === "MemberExpression" &&
             !expression.computed &&
             expression.object.type === "Identifier"
           ) {
-            const binding = bindings.get(expression.object.name);
+            const binding = shadowed.has(expression.object.name)
+              ? undefined
+              : bindings.get(expression.object.name);
             if (binding?.imported === "*")
               installed.push({
                 ...binding,
@@ -2075,17 +2175,106 @@ function installedCorsImports(
       }
     }
   };
-  const inspectExecuted = (node: any): void => {
+  const inspectExecuted = (
+    node: any,
+    shadowed: ReadonlySet<string> = new Set(),
+    localFactories: ReadonlyMap<string, { body: any; params: any[] }> =
+      new Map(),
+  ): void => {
     if (!node || typeof node !== "object") return;
-    inspectRegistration(node);
-    if (
-      node.type === "CallExpression" &&
-      node.callee.type === "Identifier" &&
-      factories.has(node.callee.name) &&
-      !visitedFactories.has(node.callee.name)
-    ) {
-      visitedFactories.add(node.callee.name);
-      inspectExecuted(factories.get(node.callee.name));
+    if (node.type === "BlockStatement" || node.type === "Program") {
+      const blockShadowed = new Set(shadowed);
+      const blockFactories = new Map(localFactories);
+      if (node.type === "BlockStatement") {
+        for (const statement of node.body as any[]) {
+          for (const name of statementBindingNames(statement))
+            blockShadowed.add(name);
+          const declaration =
+            statement.type === "ExportNamedDeclaration" ||
+            statement.type === "ExportDefaultDeclaration"
+              ? statement.declaration
+              : statement;
+          if (declaration?.type === "FunctionDeclaration" && declaration.id)
+            blockFactories.set(declaration.id.name, {
+              body: declaration.body,
+              params: declaration.params,
+            });
+        }
+      }
+      for (const statement of node.body as any[]) {
+        const declaration =
+          statement.type === "ExportNamedDeclaration" ||
+          statement.type === "ExportDefaultDeclaration"
+            ? statement.declaration
+            : statement;
+        if (declaration?.type === "VariableDeclaration")
+          for (const item of declaration.declarations)
+            if (
+              item.id.type === "Identifier" &&
+              (item.init?.type === "ArrowFunctionExpression" ||
+                item.init?.type === "FunctionExpression")
+            )
+              blockFactories.set(item.id.name, {
+                body: item.init.body,
+                params: item.init.params,
+              });
+        if (
+          statement.type === "FunctionDeclaration" ||
+          ((statement.type === "ExportNamedDeclaration" ||
+            statement.type === "ExportDefaultDeclaration") &&
+            statement.declaration?.type === "FunctionDeclaration")
+        )
+          continue;
+        inspectExecuted(statement, blockShadowed, blockFactories);
+      }
+      return;
+    }
+    if (node.type === "IfStatement") {
+      inspectExecuted(
+        provenConditionalBranch(node),
+        new Set(shadowed),
+        localFactories,
+      );
+      return;
+    }
+    if (node.type === "ConditionalExpression") {
+      inspectExecuted(
+        node.test?.type === "BooleanLiteral"
+          ? node.test.value
+            ? node.consequent
+            : node.alternate
+          : null,
+        new Set(shadowed),
+        localFactories,
+      );
+      return;
+    }
+    if (node.type === "LogicalExpression") {
+      if (node.left?.type !== "BooleanLiteral") return;
+      inspectExecuted(node.left, shadowed, localFactories);
+      if (
+        (node.operator === "&&" && node.left.value) ||
+        (node.operator === "||" && !node.left.value)
+      )
+        inspectExecuted(node.right, shadowed, localFactories);
+      return;
+    }
+    inspectRegistration(node, shadowed);
+    const calledFactory =
+      node.type === "CallExpression" && node.callee.type === "Identifier"
+        ? (localFactories.get(node.callee.name) ??
+          (!shadowed.has(node.callee.name)
+            ? factories.get(node.callee.name)
+            : undefined))
+        : undefined;
+    if (calledFactory && !visitedFactories.has(calledFactory)) {
+      visitedFactories.add(calledFactory);
+      const factory = calledFactory;
+      const factoryShadowed = new Set(shadowed);
+      for (const parameter of factory.params)
+        for (const name of boundIdentifierNames(parameter))
+          factoryShadowed.add(name);
+      inspectExecuted(factory.body, factoryShadowed, new Map());
     }
     for (const value of Object.values(node)) {
       if (Array.isArray(value))
@@ -2095,7 +2284,7 @@ function installedCorsImports(
               child?.type ?? "",
             )
           )
-            inspectExecuted(child);
+            inspectExecuted(child, shadowed, localFactories);
         });
       else if (
         value &&
@@ -2105,22 +2294,19 @@ function installedCorsImports(
           (value as any).type,
         )
       )
-        inspectExecuted(value);
+        inspectExecuted(value, shadowed, localFactories);
     }
   };
-  for (const statement of program.body as any[]) {
-    if (statement.type !== "ExpressionStatement") continue;
-    const expression =
-      statement.expression.type === "AwaitExpression"
-        ? statement.expression.argument
-        : statement.expression;
-    inspectExecuted(expression);
-  }
+  inspectExecuted(program);
   for (const name of executedFactories) {
     const factory = factories.get(name);
-    if (factory && !visitedFactories.has(name)) {
-      visitedFactories.add(name);
-      inspectExecuted(factory);
+    if (factory && !visitedFactories.has(factory)) {
+      visitedFactories.add(factory);
+      const factoryShadowed = new Set<string>();
+      for (const parameter of factory.params)
+        for (const name of boundIdentifierNames(parameter))
+          factoryShadowed.add(name);
+      inspectExecuted(factory.body, factoryShadowed);
     }
   }
   return installed;
@@ -2145,30 +2331,143 @@ function calledLocalImports(
       });
     }
   }
-  const called: Array<{ specifier: string; imported: string }> = [];
-  const factories = new Map<string, any>();
-  for (const statement of program.body as any[]) {
-    if (statement.type === "FunctionDeclaration" && statement.id)
-      factories.set(statement.id.name, statement.body);
+  const dynamicImports = (
+    statement: any,
+  ): Array<[string, { specifier: string; imported: string }]> => {
+    const found: Array<
+      [string, { specifier: string; imported: string }]
+    > = [];
     if (statement.type === "VariableDeclaration")
-      for (const declaration of statement.declarations)
+      for (const declaration of statement.declarations) {
+        const awaited =
+          declaration.init?.type === "AwaitExpression"
+            ? declaration.init.argument
+            : declaration.init;
         if (
-          declaration.id.type === "Identifier" &&
-          (declaration.init?.type === "ArrowFunctionExpression" ||
-            declaration.init?.type === "FunctionExpression")
+          awaited?.type !== "CallExpression" ||
+          awaited.callee.type !== "Import" ||
+          awaited.arguments[0]?.type !== "StringLiteral" ||
+          declaration.id.type !== "ObjectPattern"
         )
-          factories.set(declaration.id.name, declaration.init.body);
+          continue;
+        for (const property of declaration.id.properties) {
+          if (
+            property.type !== "ObjectProperty" ||
+            property.value.type !== "Identifier"
+          )
+            continue;
+          found.push([
+            property.value.name,
+            {
+              specifier: awaited.arguments[0].value,
+              imported: property.key.name ?? property.key.value,
+            },
+          ]);
+        }
+      }
+    return found;
+  };
+  const called: Array<{ specifier: string; imported: string }> = [];
+  const factories = new Map<string, { body: any; params: any[] }>();
+  for (const statement of program.body as any[]) {
+    const declaration =
+      statement.type === "ExportNamedDeclaration"
+        ? statement.declaration
+        : statement;
+    if (declaration?.type === "FunctionDeclaration" && declaration.id)
+      factories.set(declaration.id.name, {
+        body: declaration.body,
+        params: declaration.params,
+      });
+    if (declaration?.type === "VariableDeclaration")
+      for (const item of declaration.declarations)
+        if (
+          item.id.type === "Identifier" &&
+          (item.init?.type === "ArrowFunctionExpression" ||
+            item.init?.type === "FunctionExpression")
+        )
+          factories.set(item.id.name, {
+            body: item.init.body,
+            params: item.init.params,
+          });
   }
   const visited = new Set<string>();
-  const inspect = (node: any): void => {
+  const inspect = (
+    node: any,
+    scope: Map<string, { specifier: string; imported: string }> = imports,
+    shadowedFactories: ReadonlySet<string> = new Set(),
+  ): void => {
     if (!node || typeof node !== "object") return;
+    if (node.type === "BlockStatement" || node.type === "Program") {
+      const blockScope = new Map(scope);
+      const blockFactoryShadows = new Set(shadowedFactories);
+      if (node.type === "BlockStatement")
+        for (const statement of node.body as any[])
+          for (const name of statementBindingNames(statement))
+            if (factories.has(name)) blockFactoryShadows.add(name);
+      for (const statement of node.body as any[])
+        for (const name of statementBindingNames(statement))
+          blockScope.delete(name);
+      for (const statement of node.body as any[]) {
+        if (
+          statement.type === "FunctionDeclaration" ||
+          ((statement.type === "ExportNamedDeclaration" ||
+            statement.type === "ExportDefaultDeclaration") &&
+            statement.declaration?.type === "FunctionDeclaration")
+        )
+          continue;
+        for (const [local, binding] of dynamicImports(statement))
+          blockScope.set(local, binding);
+        inspect(statement, blockScope, blockFactoryShadows);
+      }
+      return;
+    }
+    if (node.type === "IfStatement") {
+      inspect(
+        provenConditionalBranch(node),
+        new Map(scope),
+        new Set(shadowedFactories),
+      );
+      return;
+    }
+    if (node.type === "ConditionalExpression") {
+      inspect(
+        node.test?.type === "BooleanLiteral"
+          ? node.test.value
+            ? node.consequent
+            : node.alternate
+          : null,
+        new Map(scope),
+        new Set(shadowedFactories),
+      );
+      return;
+    }
+    if (node.type === "LogicalExpression") {
+      if (node.left?.type !== "BooleanLiteral") return;
+      inspect(node.left, scope, shadowedFactories);
+      if (
+        (node.operator === "&&" && node.left.value) ||
+        (node.operator === "||" && !node.left.value)
+      )
+        inspect(node.right, scope, shadowedFactories);
+      return;
+    }
     if (node.type === "CallExpression" && node.callee.type === "Identifier") {
-      const imported = imports.get(node.callee.name);
+      const imported = scope.get(node.callee.name);
       if (imported) called.push(imported);
-      const factory = factories.get(node.callee.name);
+      const factory = shadowedFactories.has(node.callee.name)
+        ? undefined
+        : factories.get(node.callee.name);
       if (factory && !visited.has(node.callee.name)) {
         visited.add(node.callee.name);
-        inspect(factory);
+        const factoryScope = new Map(scope);
+        const factoryShadows = new Set(shadowedFactories);
+        for (const parameter of factory.params)
+          for (const name of boundIdentifierNames(parameter)) {
+            factoryScope.delete(name);
+            if (factories.has(name)) factoryShadows.add(name);
+          }
+        inspect(factory.body, factoryScope, factoryShadows);
       }
     }
     for (const value of Object.values(node)) {
@@ -2179,7 +2478,7 @@ function calledLocalImports(
               child?.type ?? "",
             )
           )
-            inspect(child);
+            inspect(child, scope, shadowedFactories);
         });
       else if (
         value &&
@@ -2189,20 +2488,22 @@ function calledLocalImports(
           (value as any).type,
         )
       )
-        inspect(value);
+        inspect(value, scope, shadowedFactories);
     }
   };
-  for (const statement of program.body as any[]) {
-    if (statement.type !== "ExpressionStatement") continue;
-    const expression =
-      statement.expression.type === "AwaitExpression"
-        ? statement.expression.argument
-        : statement.expression;
-    inspect(expression);
-  }
+  inspect(program);
   for (const name of executedFactories) {
     const factory = factories.get(name);
-    if (factory && !visited.has(name)) inspect(factory);
+    if (factory && !visited.has(name)) {
+      const factoryScope = new Map(imports);
+      const factoryShadows = new Set<string>();
+      for (const parameter of factory.params)
+        for (const name of boundIdentifierNames(parameter)) {
+          factoryScope.delete(name);
+          if (factories.has(name)) factoryShadows.add(name);
+        }
+      inspect(factory.body, factoryScope, factoryShadows);
+    }
   }
   return called;
 }

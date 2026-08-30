@@ -259,12 +259,22 @@ function deploymentStartsScript(
         (token) => token.replace(/^["']|["']$/g, ""),
       );
     else return false;
-    return tokens.some(
-      (token, index) =>
-        /^(?:npm|pnpm|yarn|bun)$/i.test(token) &&
-        tokens[index + 1]?.toLowerCase() === "run" &&
-        tokens[index + 2] === entry.script,
-    );
+    if (
+      /^(?:sh|bash|zsh)$/i.test(tokens[0] ?? "") &&
+      tokens[1] === "-c" &&
+      typeof tokens[2] === "string"
+    )
+      return starts(tokens[2]);
+    if (tokens[0] === "exec") return starts(tokens.slice(1));
+    const token = tokens[0];
+    if (!/^(?:npm|pnpm|yarn|bun)$/i.test(token ?? "")) return false;
+    const next = tokens[1];
+      if (
+        next === entry.script &&
+        (!/^npm$/i.test(token) || entry.script === "start")
+      )
+        return true;
+    return next?.toLowerCase() === "run" && tokens[2] === entry.script;
   };
   for (const name of io.listFiles(cwd)) {
     const raw = io.readFile(path.join(cwd, name));
@@ -304,21 +314,40 @@ function deploymentStartsScript(
       )
         return true;
     } else if (/^docker-compose(?:\..+)?\.ya?ml$/i.test(name)) {
-      if (
-        raw.split(/\r?\n/).some((line) => {
-          const value = line.match(
-            /^\s*(?:command|entrypoint)\s*:\s*(.+)$/i,
-          )?.[1];
-          if (!value) return false;
-          if (!value.trim().startsWith("[")) return starts(value);
+      const lines = raw.split(/\r?\n/);
+      for (let index = 0; index < lines.length; index++) {
+        const field = /^(\s*)(?:command|entrypoint)\s*:\s*(.*)$/i.exec(
+          lines[index],
+        );
+        if (!field) continue;
+        const value = field[2];
+        if (value) {
+          if (!value.trim().startsWith("[") && starts(value)) return true;
           try {
-            return starts(JSON.parse(value.replace(/'/g, '"')));
+            if (starts(JSON.parse(value.replace(/'/g, '"')))) return true;
           } catch {
-            return false;
+            const trimmed = value.trim();
+            if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+              const sequence = trimmed
+                .slice(1, -1)
+                .split(",")
+                .map((item) => item.trim().replace(/^["']|["']$/g, ""))
+                .filter(Boolean);
+              if (starts(sequence)) return true;
+            }
           }
-        })
-      )
-        return true;
+        }
+        const indent = field[1].length;
+        const sequence: string[] = [];
+        for (let next = index + 1; next < lines.length; next++) {
+          const item = /^(\s*)-\s*["']?([^"'\s]+)["']?\s*$/.exec(
+            lines[next],
+          );
+          if (!item || item[1].length <= indent) break;
+          sequence.push(item[2]);
+        }
+        if (sequence.length > 0 && starts(sequence)) return true;
+      }
     }
   }
   return false;

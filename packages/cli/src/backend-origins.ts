@@ -37,8 +37,13 @@ export function isBackendRecipe(recipe: Recipe | null | undefined): boolean {
   return recipe != null && BACKEND_RECIPES.has(recipe);
 }
 
-/** Env files an app's own configuration is read from, most specific first. */
-const ENV_FILES = [".env", ".env.local", ".env.development", ".env.example"];
+/** Env files that may declare an app's local port. */
+const ENV_FILES = [
+  ".env.development.local",
+  ".env.local",
+  ".env.development",
+  ".env",
+];
 
 /** Dev-server / proxy configs that name a backend target outright. */
 const PROXY_CONFIG_FILES = [
@@ -70,9 +75,6 @@ const PROXY_TARGET_RE =
 
 /** `VITE_API_ORIGIN`, `NEXT_PUBLIC_API_URL`, `PUBLIC_BACKEND_BASE_URL`, … */
 const API_BASE_VAR_RE = /^[A-Z0-9_]*(?:API|BACKEND|SERVER)[A-Z0-9_]*$/;
-
-/** A port a service declares for itself, in an env file or its entry source. */
-const ENV_PORT_RE = /^\s*(?:export\s+)?PORT\s*=\s*["']?(\d{2,5})["']?\s*$/m;
 
 function parseProgram(source: string): any | null {
   for (const jsx of [false, true]) {
@@ -146,6 +148,43 @@ function directServerPort(source: string): number | null {
   return found.size === 1 ? [...found][0] : found.size > 1 ? Number.NaN : null;
 }
 
+function directLiteralServerPort(source: string): number | null {
+  const program = parseProgram(source);
+  if (!program) return null;
+  const found = new Set<number>();
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "CallExpression") {
+      if (
+        node.callee.type === "MemberExpression" &&
+        !node.callee.computed &&
+        node.callee.property.name === "listen" &&
+        node.arguments[0]?.type === "NumericLiteral"
+      )
+        found.add(Number(node.arguments[0].value));
+      if (node.callee.type === "Identifier" && node.callee.name === "serve") {
+        const object = node.arguments.find(
+          (argument: any) => argument.type === "ObjectExpression",
+        );
+        const port = object?.properties.find(
+          (property: any) =>
+            property.type === "ObjectProperty" &&
+            (property.key.name ?? property.key.value) === "port",
+        );
+        if (port?.value?.type === "NumericLiteral")
+          found.add(Number(port.value.value));
+      }
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value);
+    }
+  };
+  visit(program);
+  return found.size === 1 ? [...found][0] : found.size > 1 ? Number.NaN : null;
+}
+
 /**
  * Resolve a validated ternary fallback whose value is derived from PORT.
  * Taint is deliberately local and declaration based: a cache port ternary in
@@ -159,8 +198,25 @@ function validatedPortFallback(source: string): number | null {
     if (statement.type === "FunctionDeclaration" && statement.id)
       resolvers.set(statement.id.name, statement);
   const selected = new Set<any>();
-  const visit = (node: any): void => {
+  const visit = (
+    node: any,
+    declarations: ReadonlyMap<string, any> = new Map(),
+  ): void => {
     if (!node || typeof node !== "object") return;
+    if (node.type === "Program" || node.type === "BlockStatement") {
+      const blockDeclarations = new Map(declarations);
+      for (const statement of node.body as any[]) {
+        if (statement.type === "VariableDeclaration")
+          for (const declaration of statement.declarations)
+            if (declaration.id?.type === "Identifier" && declaration.init)
+              blockDeclarations.set(declaration.id.name, declaration.init);
+        if (statement.type !== "FunctionDeclaration")
+          visit(statement, blockDeclarations);
+      }
+      return;
+    }
+    if (/^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(node.type))
+      return;
     if (node.type === "CallExpression") {
       const linked: any[] = [];
       if (
@@ -181,19 +237,31 @@ function validatedPortFallback(source: string): number | null {
         );
         if (port) linked.push(port.value);
       }
-      for (const expression of linked)
-        if (
-          expression.type === "CallExpression" &&
-          expression.callee.type === "Identifier"
+      for (const expression of linked) {
+        let resolved = expression;
+        const seen = new Set<string>();
+        while (
+          resolved?.type === "Identifier" &&
+          declarations.has(resolved.name) &&
+          !seen.has(resolved.name)
         ) {
-          const resolver = resolvers.get(expression.callee.name);
+          seen.add(resolved.name);
+          resolved = declarations.get(resolved.name);
+        }
+        if (
+          resolved?.type === "CallExpression" &&
+          resolved.callee.type === "Identifier"
+        ) {
+          const resolver = resolvers.get(resolved.callee.name);
           if (resolver) selected.add(resolver);
         }
+      }
     }
     for (const value of Object.values(node)) {
-      if (Array.isArray(value)) value.forEach(visit);
+      if (Array.isArray(value))
+        value.forEach((item) => visit(item, declarations));
       else if (value && typeof value === "object" && "type" in value)
-        visit(value);
+        visit(value, declarations);
     }
   };
   visit(program);
@@ -316,21 +384,54 @@ export function resolveServicePort(
   entryFile: string | null | undefined,
   reader: FileReader,
 ): number | null {
+  const portsIn = (text: string): Set<number> =>
+    new Set(
+      [...text.matchAll(/^\s*(?:export\s+)?PORT\s*=\s*["']?(\d{2,5})["']?\s*$/gm)].map(
+        (match) => Number(match[1]),
+      ),
+    );
+  let activeEnvPort: number | null = null;
   for (const file of ENV_FILES) {
     const text = safeRead(path.join(dir, file), reader);
-    const match = text?.match(ENV_PORT_RE);
-    if (match) return Number(match[1]);
+    if (!text) continue;
+    const ports = portsIn(text);
+    if (ports.size === 1) {
+      activeEnvPort = [...ports][0];
+      break;
+    }
+    if (ports.size > 1) return null;
   }
   const entry = entryFile ? safeRead(entryFile, reader) : null;
   if (entry) {
+    const literal = directLiteralServerPort(entry);
     const direct = directServerPort(entry);
     const fallback = validatedPortFallback(entry);
-    if (Number.isNaN(direct) || Number.isNaN(fallback)) return null;
+    if (
+      Number.isNaN(literal) ||
+      Number.isNaN(direct) ||
+      Number.isNaN(fallback)
+    )
+      return null;
+    if (literal != null) {
+      if (activeEnvPort != null && activeEnvPort !== literal) return null;
+      const sourceValues = new Set(
+        [direct, fallback].filter((value): value is number => value != null),
+      );
+      return sourceValues.size === 1 ? literal : null;
+    }
+    if (activeEnvPort != null) return activeEnvPort;
     const values = new Set(
       [direct, fallback].filter((value): value is number => value != null),
     );
     if (values.size === 1) return [...values][0];
     if (values.size > 1) return null;
+  }
+  if (activeEnvPort != null) return activeEnvPort;
+  const example = safeRead(path.join(dir, ".env.example"), reader);
+  if (example) {
+    const ports = portsIn(example);
+    if (ports.size === 1) return [...ports][0];
+    if (ports.size > 1) return null;
   }
   return null;
 }

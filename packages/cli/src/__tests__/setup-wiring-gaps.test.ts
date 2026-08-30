@@ -336,6 +336,71 @@ describe("the other processes the package starts", () => {
     expect(plan.warnings.join(" ")).not.toContain("worker.ts (npm run worker)");
   });
 
+  it.each([
+    ["railway.worker.json", JSON.stringify({ deploy: { startCommand: "pnpm worker" } })],
+    [
+      "docker-compose.yaml",
+      "services:\n  worker:\n    command:\n      - npm\n      - run\n      - worker\n",
+    ],
+    [
+      "docker-compose.prod.yml",
+      "services:\n  worker:\n    command: [pnpm, worker]\n",
+    ],
+    [
+      "docker-compose.shell.yml",
+      'services:\n  worker:\n    command: ["sh", "-c", "pnpm worker"]\n',
+    ],
+    [
+      "Dockerfile",
+      'CMD ["sh", "-c", "exec pnpm worker"]\n',
+    ],
+  ])("accepts structured deployment command proof in %s", (manifest, body) => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: PKG({
+          start: "tsx src/index.ts",
+          worker: "tsx src/worker.ts",
+        }),
+        [p("src", "index.ts")]: "app.listen(3000)",
+        [p("src", "worker.ts")]: "runQueueOnce()",
+        [p(manifest)]: body,
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path === p("src", "worker.ts")))
+      .toBe(true);
+  });
+
+  it("does not treat a mentioned package manager as command proof", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.ts"),
+        serviceName: "api",
+      },
+      fakeInjectIO({
+        [p("package.json")]: PKG({
+          start: "tsx src/index.ts",
+          worker: "tsx src/worker.ts",
+        }),
+        [p("src", "index.ts")]: "app.listen(3000)",
+        [p("src", "worker.ts")]: "runQueueOnce()",
+        [p("docker-compose.yaml")]:
+          "services:\n  worker:\n    command: [echo, pnpm, worker]\n",
+      }),
+    );
+    expect(plan.extraEdits?.some((edit) => edit.path === p("src", "worker.ts")))
+      .toBeFalsy();
+  });
+
   it("does not wire one shot maintenance scripts beside a real server", () => {
     const io = fakeInjectIO({
       [p("package.json")]: PKG({

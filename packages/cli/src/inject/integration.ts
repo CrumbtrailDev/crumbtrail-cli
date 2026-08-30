@@ -156,7 +156,7 @@ export function reachableSourceFiles(
   const pending = [...entries];
   const visited = new Set<string>();
 
-  while (pending.length > 0 && files.length < 64) {
+  while (pending.length > 0 && files.length < 256) {
     const file = pending.pop()!;
     if (visited.has(file)) continue;
     visited.add(file);

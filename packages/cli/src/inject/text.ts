@@ -2,6 +2,8 @@
 // function takes source text and returns source text, so the bulk of the recipe
 // tests can assert behavior without touching disk.
 
+import { parse } from "@babel/parser";
+
 const BOM = "﻿";
 
 /** A source-directive prologue line, e.g. `"use client";` or `'use strict'`. */
@@ -567,6 +569,240 @@ export function widenCorsAllowedHeaders(text: string): CorsWidening {
 const CUSTOM_HEADER_ARRAY_RE =
   /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*HEADERS[\w$]*)\s*=\s*\[([^\]]*)\]/gi;
 
+function parseCustomCorsProgram(source: string): any | null {
+  for (const jsx of [false, true]) {
+    try {
+      return parse(source, {
+        sourceType: "unambiguous",
+        plugins: [
+          "typescript",
+          ...(jsx ? (["jsx"] as const) : []),
+          "decorators-legacy",
+        ],
+      }).program;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function objectPropertyName(node: any): string | null {
+  if (!node || node.computed) return null;
+  if (node.key?.type === "StringLiteral") return node.key.value;
+  if (node.key?.type === "Identifier") return node.key.name;
+  return null;
+}
+
+function serializedHeaderRootIdentifier(node: any): string | null {
+  if (!node) return null;
+  if (
+    node.type === "TSAsExpression" ||
+    node.type === "TSSatisfiesExpression" ||
+    node.type === "TSNonNullExpression" ||
+    node.type === "ParenthesizedExpression"
+  )
+    return serializedHeaderRootIdentifier(node.expression);
+  if (
+    node.type === "CallExpression" &&
+    node.callee?.type === "MemberExpression" &&
+    !node.callee.computed &&
+    node.callee.property?.name === "join" &&
+    node.callee.object?.type === "Identifier"
+  )
+    return node.callee.object.name;
+  return null;
+}
+
+function visitReturnedHeaderPolicy(
+  body: any,
+  visit: (candidate: any) => void,
+): void {
+  const resolved = new Set<any>();
+  const trace = (node: any, declarations: ReadonlyMap<string, any>): void => {
+    if (!node || typeof node !== "object") return;
+    visit(node);
+    if (
+      node.type === "Identifier" &&
+      declarations.has(node.name) &&
+      !resolved.has(declarations.get(node.name))
+    ) {
+      const declaration = declarations.get(node.name);
+      resolved.add(declaration);
+      trace(declaration, declarations);
+    }
+    if (
+      node.type === "ArrowFunctionExpression" ||
+      node.type === "FunctionExpression"
+    ) {
+      visitReturnedHeaderPolicy(node.body, visit);
+      return;
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value))
+        value.forEach((item) => trace(item, declarations));
+      else if (value && typeof value === "object" && "type" in value)
+        trace(value, declarations);
+    }
+  };
+  const findReturns = (
+    node: any,
+    declarations: ReadonlyMap<string, any>,
+  ): void => {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "BlockStatement") {
+      const blockDeclarations = new Map(declarations);
+      for (const statement of node.body as any[]) {
+        if (statement.type === "VariableDeclaration")
+          for (const declaration of statement.declarations)
+            if (declaration.id?.type === "Identifier")
+              blockDeclarations.set(declaration.id.name, declaration.init);
+        findReturns(statement, blockDeclarations);
+      }
+      return;
+    }
+    if (node.type === "ReturnStatement") {
+      trace(node.argument, declarations);
+      return;
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value))
+        value.forEach((item) => {
+          if (
+            !/^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+              item?.type ?? "",
+            )
+          )
+            findReturns(item, declarations);
+        });
+      else if (
+        value &&
+        typeof value === "object" &&
+        "type" in value &&
+        !/^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+          (value as any).type,
+        )
+      )
+        findReturns(value, declarations);
+    }
+  };
+  findReturns(body, new Map());
+}
+
+/**
+ * Widen the final Set-backed allowlist that the installed middleware emits.
+ * This covers composed policies without guessing which spread input is the
+ * application-owned list. Both the emitted binding and the Set argument must
+ * be unique, otherwise the caller receives manual guidance.
+ */
+function widenFinalSetHeaderAllowlist(
+  text: string,
+  installedBinding: string,
+): CorsWidening | null {
+  const program = parseCustomCorsProgram(text);
+  if (!program) return null;
+
+  const installed = program.body
+    .map((statement: any) =>
+      statement.type === "ExportNamedDeclaration" ||
+      statement.type === "ExportDefaultDeclaration"
+        ? statement.declaration
+        : statement,
+    )
+    .filter(
+      (statement: any) =>
+        statement?.type === "FunctionDeclaration" &&
+        statement.id?.name === installedBinding,
+    );
+  if (installed.length !== 1) return null;
+
+  const emittedRoots = new Set<string>();
+  let policyCount = 0;
+  visitReturnedHeaderPolicy(installed[0].body, (node) => {
+    if (
+      node.type !== "ObjectProperty" ||
+      objectPropertyName(node)?.toLowerCase() !==
+        "access-control-allow-headers"
+    )
+      return;
+    policyCount++;
+    const root = serializedHeaderRootIdentifier(node.value);
+    if (root) emittedRoots.add(root);
+  });
+  if (policyCount !== 1 || emittedRoots.size !== 1) return null;
+
+  const [emittedRoot] = emittedRoots;
+  const declarations: any[] = [];
+  for (const statement of program.body as any[]) {
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations) {
+      if (
+        declaration.id?.type === "Identifier" &&
+        declaration.id.name === emittedRoot
+      )
+        declarations.push(declaration);
+    }
+  }
+  if (declarations.length !== 1) return null;
+
+  const init = declarations[0].init;
+  if (
+    init?.type !== "CallExpression" ||
+    init.arguments.length !== 0 ||
+    init.callee?.type !== "MemberExpression" ||
+    init.callee.computed ||
+    init.callee.property?.name !== "sort" ||
+    init.callee.object?.type !== "ArrayExpression" ||
+    init.callee.object.elements.length !== 1
+  )
+    return null;
+  const spread = init.callee.object.elements[0];
+  const set = spread?.type === "SpreadElement" ? spread.argument : null;
+  if (
+    set?.type !== "NewExpression" ||
+    set.callee?.type !== "Identifier" ||
+    set.callee.name !== "Set" ||
+    set.arguments?.length !== 1 ||
+    set.arguments[0]?.type !== "ArrayExpression"
+  )
+    return null;
+
+  const target = set.arguments[0];
+  if (typeof target.start !== "number" || typeof target.end !== "number")
+    return null;
+  const body = text.slice(target.start + 1, target.end - 1);
+  const present = new Set(
+    target.elements
+      .filter((item: any) => item?.type === "StringLiteral")
+      .map((item: any) => item.value.toLowerCase()),
+  );
+  const missing = CORRELATION_REQUEST_HEADERS.filter(
+    (name) => !present.has(name),
+  );
+  if (missing.length === 0) {
+    return {
+      text,
+      changed: false,
+      needsManual: false,
+      found: true,
+      importsCorsElsewhere: false,
+    };
+  }
+
+  const quote = quoteStyleOf(body);
+  const additions = missing.map((name) => `${quote}${name}${quote}`).join(", ");
+  const trimmed = body.trim();
+  const separator =
+    trimmed.length === 0 ? "" : trimmed.endsWith(",") ? " " : ", ";
+  return {
+    text: `${text.slice(0, target.end - 1)}${separator}${additions}${text.slice(target.end - 1)}`,
+    changed: true,
+    needsManual: false,
+    found: true,
+    importsCorsElsewhere: false,
+  };
+}
+
 /**
  * Widen a hand-written CORS middleware after the import resolver has proved
  * that this is the module the server installs.
@@ -584,6 +820,11 @@ export function widenCustomCorsAllowedHeaders(
   if (regular?.found) return regular;
   if (!installedBinding && !/Access-Control-Allow-Headers/i.test(text)) {
     return regular!;
+  }
+
+  if (installedBinding) {
+    const finalSet = widenFinalSetHeaderAllowlist(text, installedBinding);
+    if (finalSet) return finalSet;
   }
 
   const braceDepth: number[] = [];
@@ -615,7 +856,7 @@ export function widenCustomCorsAllowedHeaders(
       "\\$&",
     );
     const declaration = new RegExp(
-      `\\b(?:export\\s+)?(?:async\\s+)?function\\s+${escapedBinding}\\s*\\([^)]*\\)\\s*\\{`,
+      `\\b(?:export\\s+)?(?:async\\s+)?function\\s+${escapedBinding}\\s*\\([^)]*\\)\\s*(?::[^\\{]+)?\\{`,
     ).exec(text);
     if (declaration?.index == null) {
       return {
