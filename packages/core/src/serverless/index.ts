@@ -18,3 +18,10 @@ export type {
   ServerlessInvocationTransport,
   ServerlessMetadataValue,
 } from "./invocation";
+export { withCrumbtrailFetch } from "./fetch";
+export type {
+  FetchAsyncHandler,
+  FetchHostHandler,
+  FetchServerlessAdapterOptions,
+  FetchWaitUntil,
+} from "./fetch";
