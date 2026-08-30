@@ -58,11 +58,44 @@ export class HeadlessRequestError extends Error {
 export { HeadlessRequestError as ServerlessHttpRequestError };
 export { HeadlessTimeoutError as ServerlessHttpTimeoutError };
 
+export type ServerlessHttpOperationPhase =
+  | "session-start"
+  | "capture"
+  | "session-end";
+
+export interface ServerlessHttpOperationFailure {
+  phase: ServerlessHttpOperationPhase;
+  error: unknown;
+}
+
+export class ServerlessHttpFlushError extends Error {
+  readonly failures: readonly ServerlessHttpOperationFailure[];
+
+  constructor(failures: readonly ServerlessHttpOperationFailure[]) {
+    super(
+      `Crumbtrail serverless delivery failed during ${failures
+        .map((failure) => failure.phase)
+        .join(", ")}`,
+      { cause: failures[0]?.error },
+    );
+    this.name = "ServerlessHttpFlushError";
+    this.failures = failures;
+  }
+}
+
+interface QueuedOperation {
+  phase: ServerlessHttpOperationPhase;
+  path: string;
+  body: string;
+}
+
 export class ServerlessHttpTransport implements ServerlessInvocationTransport {
   private readonly endpoint: string;
   private readonly headers: Record<string, string>;
   private readonly fetcher: typeof fetch;
   private readonly timeoutMs: number;
+  private readonly operations: QueuedOperation[] = [];
+  private flushTail: Promise<void> = Promise.resolve();
 
   constructor(options: ServerlessHttpTransportOptions) {
     const endpoint = options.endpoint?.trim().replace(/\/+$/, "");
@@ -77,49 +110,77 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
     this.timeoutMs = normalizeTimeout(options.requestTimeoutMs);
   }
 
-  async startSession(session: ServerlessInvocationSession): Promise<void> {
-    await this.post("/api/session/start", {
+  startSession(session: ServerlessInvocationSession): void {
+    this.enqueue("session-start", "/api/session/start", {
       sessionId: session.sessionId,
       ...(session.metadata ? { metadata: session.metadata } : {}),
     });
   }
 
-  async capture(event: ServerlessInvocationEvent): Promise<void> {
-    await this.captureBatch([event]);
+  capture(event: ServerlessInvocationEvent): void {
+    this.captureBatch([event]);
   }
 
-  async captureBatch(
+  captureBatch(
     events: readonly BugEvent[],
     sessionId = events[0]?.sessionId,
-  ): Promise<void> {
+  ): void {
     if (!sessionId) {
       throw new ServerlessConfigurationError(
         "Crumbtrail serverless events require a session ID",
       );
     }
-    await this.post("/api/events", { sessionId, events });
+    this.enqueue("capture", "/api/events", {
+      sessionId,
+      events: [...events],
+    });
   }
 
-  async endSession(sessionId: string): Promise<void> {
-    await this.endSessionWithResult(sessionId);
+  endSession(sessionId: string): void {
+    this.enqueue("session-end", "/api/session/end", { sessionId });
   }
 
-  async endSessionWithResult(
-    sessionId: string,
-  ): Promise<Record<string, unknown>> {
-    return this.post("/api/session/end", { sessionId });
-  }
-
-  flush(): void {}
-
-  private post(path: string, body: unknown): Promise<Record<string, unknown>> {
-    return postJson(
-      this.fetcher,
-      `${this.endpoint}${path}`,
-      this.headers,
-      body,
-      this.timeoutMs,
+  flush(): Promise<Record<string, unknown>> {
+    const operations = this.operations.splice(0);
+    const run = this.flushTail.then(() => this.flushOperations(operations));
+    this.flushTail = run.then(
+      () => undefined,
+      () => undefined,
     );
+    return run;
+  }
+
+  private enqueue(
+    phase: ServerlessHttpOperationPhase,
+    path: string,
+    body: unknown,
+  ): void {
+    this.operations.push({ phase, path, body: JSON.stringify(body) });
+  }
+
+  private async flushOperations(
+    operations: readonly QueuedOperation[],
+  ): Promise<Record<string, unknown>> {
+    let lastResponse: Record<string, unknown> = {};
+    const failures: ServerlessHttpOperationFailure[] = [];
+
+    for (const operation of operations) {
+      if (failures.some((failure) => failure.phase === "session-start")) break;
+      try {
+        lastResponse = await postJson(
+          this.fetcher,
+          `${this.endpoint}${operation.path}`,
+          this.headers,
+          operation.body,
+          this.timeoutMs,
+        );
+      } catch (error) {
+        failures.push({ phase: operation.phase, error });
+      }
+    }
+
+    if (failures.length > 0) throw new ServerlessHttpFlushError(failures);
+    return lastResponse;
   }
 }
 
@@ -155,23 +216,39 @@ export async function startHeadlessSession(
       ? { requestTimeoutMs: options.timeoutMs }
       : {}),
   });
-  await transport.startSession({
+  transport.startSession({
     sessionId: options.sessionId,
     metadata: { ...options.metadata, source: "headless" },
   });
+  await flushHeadlessTransport(transport);
 
   return {
     sessionId: options.sessionId,
     async record(events) {
-      await transport.captureBatch(
+      transport.captureBatch(
         Array.isArray(events) ? events : [events],
         options.sessionId,
       );
+      await flushHeadlessTransport(transport);
     },
-    end() {
-      return transport.endSessionWithResult(options.sessionId);
+    async end() {
+      transport.endSession(options.sessionId);
+      return flushHeadlessTransport(transport);
     },
   };
+}
+
+async function flushHeadlessTransport(
+  transport: ServerlessHttpTransport,
+): Promise<Record<string, unknown>> {
+  try {
+    return await transport.flush();
+  } catch (error) {
+    if (error instanceof ServerlessHttpFlushError && error.failures[0]) {
+      throw error.failures[0].error;
+    }
+    throw error;
+  }
 }
 
 function normalizeTimeout(value: number | undefined): number {
@@ -221,7 +298,7 @@ async function postJson(
   fetcher: typeof fetch,
   url: string,
   headers: Record<string, string>,
-  body: unknown,
+  body: string,
   timeoutMs: number,
 ): Promise<Record<string, unknown>> {
   const deadline = timeoutMs > 0 ? startDeadline(timeoutMs) : undefined;
@@ -231,7 +308,7 @@ async function postJson(
     response = await fetcher(url, {
       method: "POST",
       headers,
-      body: JSON.stringify(body),
+      body,
       ...(deadline ? { signal: deadline.signal } : {}),
     });
     text = await response.text();

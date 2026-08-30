@@ -80,6 +80,113 @@ describe("withCrumbtrailFetch", () => {
     }
   });
 
+  it("defers every endpoint request until the waitUntil cleanup runs", async () => {
+    const calls: Array<{
+      url: string;
+      body: Record<string, unknown>;
+    }> = [];
+    const scheduled: Promise<void>[] = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      calls.push({
+        url: String(input),
+        body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+      });
+      return new Response("{}", { status: 200 });
+    };
+    const response = new Response("host response", { status: 202 });
+
+    await expect(
+      withCrumbtrailFetch(() => response, {
+        endpoint: "https://capture.example",
+        fetchImpl,
+        waitUntil(promise) {
+          scheduled.push(promise);
+        },
+      })(new Request("https://worker.example/deferred")),
+    ).resolves.toBe(response);
+
+    expect(scheduled).toHaveLength(1);
+    expect(calls).toEqual([]);
+
+    await expect(scheduled[0]).resolves.toBeUndefined();
+    expect(calls.map((call) => call.url)).toEqual([
+      "https://capture.example/api/session/start",
+      "https://capture.example/api/events",
+      "https://capture.example/api/events",
+      "https://capture.example/api/session/end",
+    ]);
+    expect(
+      calls.slice(1, 3).map((call) => {
+        const events = call.body.events as ServerlessInvocationEvent[];
+        return events[0]?.k;
+      }),
+    ).toEqual([
+      SERVERLESS_INVOCATION_START_EVENT,
+      SERVERLESS_INVOCATION_SUCCESS_EVENT,
+    ]);
+  });
+
+  it("contains deferred endpoint failures with their operation phases", async () => {
+    const calls: string[] = [];
+    const scheduled: Promise<void>[] = [];
+    const onError = vi.fn();
+    const fetchImpl: typeof fetch = async (input) => {
+      const url = String(input);
+      calls.push(url);
+      return url.endsWith("/api/session/start")
+        ? new Response("{}", { status: 200 })
+        : new Response('{"error":"intake refused"}', { status: 503 });
+    };
+    const response = new Response("host response");
+
+    await expect(
+      withCrumbtrailFetch(() => response, {
+        endpoint: "https://capture.example",
+        fetchImpl,
+        onError,
+        waitUntil(promise) {
+          scheduled.push(promise);
+        },
+      })(new Request("https://worker.example/deferred-failure")),
+    ).resolves.toBe(response);
+    expect(calls).toEqual([]);
+
+    await expect(scheduled[0]).resolves.toBeUndefined();
+    expect(onError.mock.calls.map((call) => call[1].phase)).toEqual([
+      "capture",
+      "capture",
+      "session-end",
+    ]);
+  });
+
+  it("awaits the complete endpoint queue when waitUntil is absent", async () => {
+    let releaseRequests!: () => void;
+    const requestGate = new Promise<void>((resolve) => {
+      releaseRequests = resolve;
+    });
+    const calls: string[] = [];
+    const fetchImpl: typeof fetch = async (input) => {
+      calls.push(String(input));
+      await requestGate;
+      return new Response("{}", { status: 200 });
+    };
+    const response = new Response("awaited response");
+    let invocationSettled = false;
+
+    const invocation = withCrumbtrailFetch(() => response, {
+      endpoint: "https://capture.example",
+      fetchImpl,
+    })(new Request("https://worker.example/awaited-endpoint")).finally(() => {
+      invocationSettled = true;
+    });
+
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    expect(invocationSettled).toBe(false);
+    releaseRequests();
+    await expect(invocation).resolves.toBe(response);
+    expect(calls).toHaveLength(4);
+  });
+
   it("reuses a linked session without starting or ending it", async () => {
     const calls: string[] = [];
     const fetchImpl: typeof fetch = async (input) => {
@@ -216,12 +323,13 @@ describe("withCrumbtrailFetch", () => {
     const first = handler(new Request("https://worker.example/first"));
     const second = handler(new Request("https://worker.example/second"));
     await vi.waitFor(() => expect(gates.size).toBe(2));
-    expect(new Set(starts).size).toBe(2);
+    expect(starts).toEqual([]);
     gates.get("/second")?.();
     await second;
     gates.get("/first")?.();
     await first;
 
+    expect(new Set(starts).size).toBe(2);
     expect(new Set(ends)).toEqual(new Set(starts));
   });
 

@@ -11,6 +11,8 @@ import type { BugEvent } from "../types";
 import { generateSessionId } from "../utils";
 import {
   ServerlessConfigurationError,
+  ServerlessHttpFlushError,
+  ServerlessHttpTransport,
   createServerlessHttpTransport,
   type ServerlessHttpTransportOptions,
 } from "./http-transport";
@@ -89,7 +91,7 @@ export interface ServerlessInvocationTransport {
   startSession(session: ServerlessInvocationSession): void | Promise<unknown>;
   capture(event: ServerlessInvocationEvent): void | Promise<void>;
   endSession(sessionId: string): void | Promise<unknown>;
-  flush?(): void | Promise<void>;
+  flush?(): void | Promise<unknown>;
 }
 
 export interface ServerlessInvocationSession {
@@ -589,6 +591,17 @@ async function safeFlush(
   try {
     await transport.flush?.();
   } catch (error) {
+    if (error instanceof ServerlessHttpFlushError) {
+      for (const failure of error.failures) {
+        reportDeliveryError(
+          options,
+          failure.error,
+          failure.phase,
+          sessionId,
+        );
+      }
+      return;
+    }
     reportDeliveryError(options, error, "flush", sessionId);
   }
 }
@@ -625,6 +638,14 @@ async function finishDelivery(
   options: ServerlessInvocationOptions,
 ): Promise<void> {
   const cleanup = async (): Promise<void> => {
+    if (transport instanceof ServerlessHttpTransport) {
+      if (correlation.ownsSession) {
+        await safeEndSession(transport, correlation.sessionId, options);
+      }
+      await safeFlush(transport, options, correlation.sessionId);
+      return;
+    }
+
     await safeFlush(transport, options, correlation.sessionId);
     if (correlation.ownsSession) {
       await safeEndSession(transport, correlation.sessionId, options);
@@ -636,7 +657,7 @@ async function finishDelivery(
     return;
   }
 
-  const cleanupPromise = cleanup();
+  const cleanupPromise = deferCleanup(cleanup);
   try {
     options.deferCleanup(cleanupPromise);
   } catch (error) {
@@ -648,6 +669,12 @@ async function finishDelivery(
     );
     await cleanupPromise;
   }
+}
+
+function deferCleanup(cleanup: () => Promise<void>): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  }).then(cleanup);
 }
 
 function resolveTransport(options: ServerlessInvocationOptions): {

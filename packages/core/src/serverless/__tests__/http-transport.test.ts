@@ -39,12 +39,15 @@ describe("createServerlessHttpTransport", () => {
       fetchImpl,
     });
 
-    await transport.startSession({
+    transport.startSession({
       sessionId: "ses_owned",
       metadata: { service: "checkout" },
     });
-    await transport.capture(event("ses_owned"));
-    await transport.endSession("ses_owned");
+    transport.capture(event("ses_owned"));
+    transport.endSession("ses_owned");
+
+    expect(calls).toEqual([]);
+    await transport.flush();
 
     expect(calls.map(({ url }) => url)).toEqual([
       "https://capture.example/api/session/start",
@@ -83,9 +86,15 @@ describe("createServerlessHttpTransport", () => {
       }),
     });
 
-    await expect(
-      transport.startSession({ sessionId: "ses_timeout" }),
-    ).rejects.toBeInstanceOf(HeadlessTimeoutError);
+    transport.startSession({ sessionId: "ses_timeout" });
+    await expect(transport.flush()).rejects.toMatchObject({
+      failures: [
+        {
+          phase: "session-start",
+          error: expect.any(HeadlessTimeoutError),
+        },
+      ],
+    });
   });
 
   it("rejects non successful intake responses with their status", async () => {
@@ -98,11 +107,18 @@ describe("createServerlessHttpTransport", () => {
       ),
     });
 
-    const rejection = transport.startSession({ sessionId: "ses_refused" });
-    await expect(rejection).rejects.toBeInstanceOf(HeadlessRequestError);
+    transport.startSession({ sessionId: "ses_refused" });
+    const rejection = transport.flush();
     await expect(rejection).rejects.toMatchObject({
-      status: 401,
-      serverMessage: "revoked key",
+      failures: [
+        {
+          phase: "session-start",
+          error: expect.objectContaining({
+            status: 401,
+            serverMessage: "revoked key",
+          }),
+        },
+      ],
     });
   });
 
@@ -118,8 +134,15 @@ describe("createServerlessHttpTransport", () => {
       metadata: { service: "worker" },
       fetchImpl,
     });
+    expect(bodies).toEqual([
+      {
+        sessionId: "ses_headless",
+        metadata: { service: "worker", source: "headless" },
+      },
+    ]);
 
     await session.record({ t: 1, k: "test", d: {} });
+    expect(bodies).toHaveLength(2);
     await expect(session.end()).resolves.toEqual({ closed: true });
     expect(bodies).toEqual([
       {
@@ -132,5 +155,19 @@ describe("createServerlessHttpTransport", () => {
       },
       { sessionId: "ses_headless" },
     ]);
+  });
+
+  it("preserves direct headless request errors", async () => {
+    await expect(
+      startHeadlessSession({
+        endpoint: "https://capture.example",
+        sessionId: "ses_refused",
+        fetchImpl: vi.fn(async () =>
+          Promise.resolve(
+            new Response('{"error":"revoked key"}', { status: 401 }),
+          ),
+        ),
+      }),
+    ).rejects.toBeInstanceOf(HeadlessRequestError);
   });
 });
