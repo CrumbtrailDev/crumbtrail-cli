@@ -862,6 +862,16 @@ export interface CrumbtrailConfig {
   autoFlagOnStreamFailure: boolean;
   /** Enable automatic capture when a Web Worker throws. */
   autoFlagOnWorkerError: boolean;
+  /**
+   * Enable automatic capture when a rendered numeric value is missing or non-finite. Defaults to
+   * false while shadow mode measures the detector's firing rate in real sessions.
+   */
+  autoFlagOnWrongNumber: boolean;
+  /**
+   * Enable automatic capture when a script or stylesheet reports zero transfer and zero duration.
+   * Defaults to false while shadow mode measures the detector's firing rate in real sessions.
+   */
+  autoFlagOnResourceLoadFailure: boolean;
   /** Allow app code and the widget to call `flag()` as an explicit beacon. */
   explicitBeacon: boolean;
   /** Keep the server side pull policy available to heartbeat integrations. */
@@ -1030,6 +1040,8 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   autoFlagOnResponseBodyError: true,
   autoFlagOnStreamFailure: true,
   autoFlagOnWorkerError: true,
+  autoFlagOnWrongNumber: false,
+  autoFlagOnResourceLoadFailure: false,
   explicitBeacon: true,
   serverSidePull: false,
   autoFlagDebounceMs: 2000,

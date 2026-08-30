@@ -135,6 +135,8 @@ export {
   responseBodyErrorDetector,
   streamFailureDetector,
   workerErrorDetector,
+  wrongNumberDetector,
+  resourceLoadFailureDetector,
   errorSignature,
   rageClickDetector,
   retryStormDetector,

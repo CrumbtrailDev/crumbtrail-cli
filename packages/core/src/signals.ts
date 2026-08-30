@@ -1,5 +1,5 @@
 import type { BugEvent } from "./types";
-import { UI_ERROR_EVENT_KIND } from "./types";
+import { UI_ERROR_EVENT_KIND, UI_NUM_EVENT_KIND } from "./types";
 import { hashString } from "./signature";
 
 /**
@@ -89,8 +89,7 @@ export function requestFailureDetector(
 ): SignalDetector {
   return {
     inspect(event) {
-      if (event.k !== "net.res" || typeof event.d.st !== "number")
-        return null;
+      if (event.k !== "net.res" || typeof event.d.st !== "number") return null;
       if (event.d.st < opts.minStatus) return null;
       const status = event.d.st;
       const requestId = typeof event.d.id === "number" ? event.d.id : "unknown";
@@ -392,7 +391,8 @@ const FOREIGN_FRAME_RE =
   /(?:\/|^)(?:node_modules|bower_components)\/|(?:^|[/\\])crumbtrail[^/\\]*\.(?:js|mjs|cjs)|\bchrome-extension:|\bmoz-extension:|\bsafari-extension:/i;
 
 /** A frame with no location at all — `at <anonymous>`, `at Object.<anonymous>`, a bare native line. */
-const LOCATIONLESS_FRAME_RE = /\((?:<anonymous>|native)\)|^\s*at\s*<anonymous>/i;
+const LOCATIONLESS_FRAME_RE =
+  /\((?:<anonymous>|native)\)|^\s*at\s*<anonymous>/i;
 
 /**
  * The first stack frame that names a file, or `undefined` when the stack names none.
@@ -550,11 +550,13 @@ export function streamFailureDetector(): SignalDetector {
       // `net.sse` has no close code, so an SSE close is indistinguishable from an ordinary
       // teardown and is deliberately not a signal. Only a socket can say it ended early.
       if (event.k === "net.ws" && op === "close") {
-        const code = typeof event.d.code === "number" ? event.d.code : undefined;
+        const code =
+          typeof event.d.code === "number" ? event.d.code : undefined;
         const clean =
           typeof event.d.clean === "boolean" ? event.d.clean : undefined;
         const early =
-          clean === false || (code !== undefined && !CLEAN_CLOSE_CODES.has(code));
+          clean === false ||
+          (code !== undefined && !CLEAN_CLOSE_CODES.has(code));
         if (!early) return null;
         return {
           tag: "auto:stream-failure",
@@ -582,7 +584,8 @@ export function workerErrorDetector(): SignalDetector {
     inspect(event) {
       if (event.k !== "worker.msg") return null;
       if (event.d.op !== "error") return null;
-      const script = typeof event.d.script === "string" ? event.d.script : "a worker";
+      const script =
+        typeof event.d.script === "string" ? event.d.script : "a worker";
       const msg = typeof event.d.msg === "string" ? event.d.msg : undefined;
       const id = typeof event.d.id === "number" ? event.d.id : "unknown";
       return {
@@ -591,6 +594,71 @@ export function workerErrorDetector(): SignalDetector {
         reason: msg
           ? `Auto-captured after ${script} threw: ${msg}`
           : `Auto-captured after ${script} threw`,
+      };
+    },
+  };
+}
+
+/**
+ * Reactive detector for a number the page rendered but a person cannot use.
+ *
+ * The UI-number collector is meant to emit parsed finite numbers, so a missing or non-finite value
+ * means the displayed figure reached capture in a broken state without throwing. Negative values
+ * deliberately stay silent because balances, adjustments, temperatures and many other valid
+ * figures can be negative. What this gets wrong: a malformed producer can create this event even
+ * when the actual screen was correct, and the event cannot distinguish that instrumentation defect
+ * from a broken rendered value.
+ */
+export function wrongNumberDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== UI_NUM_EVENT_KIND) return null;
+      const region =
+        typeof event.d.region === "string" ? event.d.region : "unknown region";
+      const items = Array.isArray(event.d.items) ? event.d.items : [];
+      for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        const record = item as Record<string, unknown>;
+        if (typeof record.value === "number" && Number.isFinite(record.value))
+          continue;
+        const label =
+          typeof record.label === "string" ? record.label : "unlabeled value";
+        return {
+          tag: "auto:wrong-number",
+          key: `wrong-number:${hashString(`${region}|${label}`)}`,
+          reason: `Auto-captured after ${label} in ${region} rendered an invalid number`,
+        };
+      }
+      return null;
+    },
+  };
+}
+
+/**
+ * Reactive detector for a script or stylesheet whose resource timing shows no load at all.
+ *
+ * The performance collector records no response status or decoded body size, so zero transferred
+ * bytes alone cannot separate a failed request from a legitimate cache hit. This deliberately
+ * narrows the rule to script and link entries that report both zero transfer and zero duration.
+ * What it gets wrong: a cache hit rounded to zero duration has the same recorded shape and will
+ * fire, while a failed load with measurable duration will stay silent until the collector carries
+ * an explicit failure field.
+ */
+export function resourceLoadFailureDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "perf" || event.d.metric !== "res") return null;
+      const initiator =
+        typeof event.d.initiatorType === "string" ? event.d.initiatorType : "";
+      if (initiator !== "script" && initiator !== "link") return null;
+      if (event.d.transferSize !== 0 || event.d.duration !== 0) return null;
+      const name =
+        typeof event.d.name === "string" ? event.d.name : "unknown resource";
+      const kind = initiator === "script" ? "script" : "stylesheet";
+      return {
+        tag: "auto:resource-load-failure",
+        key: `resource-load:${hashString(`${initiator}|${name}`)}`,
+        reason: `Auto-captured after the ${kind} ${name} loaded no data`,
       };
     },
   };
