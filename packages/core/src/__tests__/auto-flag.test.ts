@@ -8,7 +8,11 @@ import {
   type Mock,
 } from "vitest";
 import { createAutoFlagController } from "../auto-flag";
-import { rageClickDetector, retryStormDetector } from "../signals";
+import {
+  rageClickDetector,
+  retryStormDetector,
+  slowResponseDetector,
+} from "../signals";
 import type { AutoFlagRequest } from "../auto-flag";
 import type { BugEvent } from "../types";
 
@@ -17,11 +21,11 @@ function errEvent(msg: string, stk?: string): BugEvent {
 }
 
 describe("createAutoFlagController", () => {
-  let flag: Mock<(request: AutoFlagRequest) => Promise<unknown>>;
+  let flag: Mock<(request: AutoFlagRequest) => Promise<boolean>>;
 
   beforeEach(() => {
     vi.useFakeTimers();
-    flag = vi.fn().mockResolvedValue(undefined);
+    flag = vi.fn().mockResolvedValue(true);
   });
 
   afterEach(() => {
@@ -160,6 +164,85 @@ describe("createAutoFlagController", () => {
       });
       vi.advanceTimersByTime(2000);
       expect(flag).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("the cap counts captures, not attempts", () => {
+    it("does not spend the cap on a flag the capture path declined", async () => {
+      // A session that cannot capture — consent withdrawn, sampled out, kill switch on —
+      // used to silence its own controller after `maxPerSession` no-ops, so nothing was
+      // captured once those conditions lifted.
+      flag.mockResolvedValue(false);
+      const c = createAutoFlagController({
+        debounceMs: 10,
+        maxPerSession: 1,
+        flag,
+        detectors: [rageClickDetector({ threshold: 2, windowMs: 1000 })],
+      });
+      const el = { sig: "btn" };
+      c.handleEvent({ t: 0, k: "clk", d: { el } });
+      c.handleEvent({ t: 100, k: "clk", d: { el } });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(flag).toHaveBeenCalledTimes(1);
+
+      flag.mockResolvedValue(true);
+      c.endWindow();
+      c.handleEvent({ t: 2000, k: "clk", d: { el } });
+      c.handleEvent({ t: 2100, k: "clk", d: { el } });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(flag).toHaveBeenCalledTimes(2);
+    });
+
+    it("still stops at the cap once that many captures landed", async () => {
+      const c = createAutoFlagController({
+        debounceMs: 10,
+        maxPerSession: 1,
+        flag,
+        detectors: [rageClickDetector({ threshold: 2, windowMs: 1000 })],
+      });
+      const el = { sig: "btn" };
+      c.handleEvent({ t: 0, k: "clk", d: { el } });
+      c.handleEvent({ t: 100, k: "clk", d: { el } });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(flag).toHaveBeenCalledTimes(1);
+
+      c.endWindow();
+      c.handleEvent({ t: 2000, k: "clk", d: { el } });
+      c.handleEvent({ t: 2100, k: "clk", d: { el } });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(flag).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("dedup is per window, not per instance", () => {
+    it("flags a repeat of a fixed-key signal after the window ends", async () => {
+      const c = createAutoFlagController({
+        debounceMs: 10,
+        maxPerSession: 10,
+        flag,
+        detectors: [
+          slowResponseDetector({ thresholdMs: 100, count: 1, windowMs: 5000 }),
+        ],
+      });
+      const slow = (t: number): BugEvent => ({
+        t,
+        k: "net.res",
+        d: { id: t, st: 200, dur: 500 },
+      });
+
+      c.handleEvent(slow(0));
+      await vi.advanceTimersByTimeAsync(10);
+      expect(flag).toHaveBeenCalledTimes(1);
+
+      // Same key, same instance, second episode. Without endWindow this is swallowed forever.
+      c.handleEvent(slow(20_000));
+      await vi.advanceTimersByTimeAsync(10);
+      expect(flag).toHaveBeenCalledTimes(1);
+
+      c.endWindow();
+      c.handleEvent(slow(40_000));
+      await vi.advanceTimersByTimeAsync(10);
+      expect(flag).toHaveBeenCalledTimes(2);
     });
   });
 });

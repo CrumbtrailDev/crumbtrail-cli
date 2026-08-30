@@ -23,7 +23,10 @@ import {
 } from "./types";
 import { createCrumbtrailRequestHeaders } from "./correlation";
 import { readEarlySessionId } from "./early-capture";
-import { createAutoFlagController } from "./auto-flag";
+import {
+  createAutoFlagController,
+  type AutoFlagController,
+} from "./auto-flag";
 import {
   ReplayRecorder,
   replaySupported,
@@ -37,7 +40,7 @@ import {
 } from "./probes";
 import {
   errorDetector,
-  request5xxDetector,
+  requestFailureDetector,
   rageClickDetector,
   retryStormDetector,
   slowResponseDetector,
@@ -371,6 +374,18 @@ function writePersistedSession(store: SessionStore, id: string): void {
   store.write({ id, lastActivity: now() });
 }
 
+/**
+ * The result of a flag request. `flagBug` hands the caller only `bugId`, because a person
+ * asking for a report gets an identifier either way. The auto flag controller needs
+ * `captured`: its per-session cap counts reports that exist, and a request the capture path
+ * declined — consent withdrawn, sampled out, kill switch on, a flight recorder window already
+ * finalizing — must not spend one.
+ */
+interface FlagOutcome {
+  bugId: string;
+  captured: boolean;
+}
+
 export class Crumbtrail {
   private bus: EventBus;
   private transport: CrumbtrailTransport;
@@ -410,11 +425,12 @@ export class Crumbtrail {
   private declaredConfig: Record<string, unknown> = {};
   private envEmitted = false;
   private autoFlagCleanup?: () => void;
+  private autoFlag?: AutoFlagController;
   private configPollingCleanup?: () => void;
   private configPollGeneration = 0;
   private flightRecorderTimer?: ReturnType<typeof setTimeout>;
-  private flightRecorderFinalization?: Promise<{ bugId: string }>;
-  private flightRecorderTailResolver?: (result: { bugId: string }) => void;
+  private flightRecorderFinalization?: Promise<FlagOutcome>;
+  private flightRecorderTailResolver?: (result: FlagOutcome) => void;
   private flightRecorderState: FlightRecorderState = "armed";
   private consentGranted: boolean;
   private explicitConsent?: boolean;
@@ -779,19 +795,20 @@ export class Crumbtrail {
       autoReason: _autoReason,
       ...caller
     } = (options ?? {}) as InternalFlagOptions;
-    return this.flagBugFromSource(
+    const { bugId } = await this.flagBugFromSource(
       options === undefined ? undefined : caller,
       true,
     );
+    return { bugId };
   }
 
   private async flagBugFromSource(
     options: InternalFlagOptions | undefined,
     isExplicitBeacon: boolean,
-  ): Promise<{ bugId: string }> {
+  ): Promise<FlagOutcome> {
     if (isExplicitBeacon && !this.config.explicitBeacon)
-      return { bugId: this.createBugId() };
-    if (!this.canCapture()) return { bugId: this.createBugId() };
+      return { bugId: this.createBugId(), captured: false };
+    if (!this.canCapture()) return { bugId: this.createBugId(), captured: false };
 
     if (this.config.flightRecorder) {
       if (this.flightRecorderFinalization)
@@ -800,7 +817,7 @@ export class Crumbtrail {
       if (this.flightRecorderState === "buffering")
         return this.triggerFlightRecorder(options);
       if (this.flightRecorderState === "finalizing")
-        return { bugId: this.createBugId() };
+        return { bugId: this.createBugId(), captured: false };
     }
 
     return this.finalizeFlagBug(options);
@@ -814,7 +831,7 @@ export class Crumbtrail {
   private async finalizeFlagBug(
     options?: InternalFlagOptions,
     finalizerOriginated = false,
-  ): Promise<{ bugId: string }> {
+  ): Promise<FlagOutcome> {
     const bugId = this.createBugId();
     const windowMs = options?.windowMs ?? this.config.ringBufferMs;
     const flaggedAt = now();
@@ -1015,7 +1032,7 @@ export class Crumbtrail {
     // Send to server
     await this.transport.sendBugReport(report, events, options?.voiceBlob);
 
-    return { bugId };
+    return { bugId, captured: true };
   }
 
   consent(granted: boolean): void {
@@ -1413,8 +1430,19 @@ export class Crumbtrail {
           unhandledRejection: this.config.autoFlagOnUnhandledRejection,
         }),
       );
+    // Under the flight recorder a single failing response is enough to close a window: the
+    // buffer already holds everything that led to it, so waiting for a second one only loses
+    // the first. That used to be arranged by forcing the retry storm detector's fail threshold
+    // to 1, which made lone-4xx capture a side effect of a DIFFERENT switch: a customer turning
+    // "retry storm" off in the dashboard silently lost every 4xx capture too, with nothing on
+    // the screen saying so. It is the request-status trigger's job, so it lives here and the
+    // retry storm detector keeps the threshold the customer configured.
     if (this.config.autoFlagOnRequest5xx)
-      autoFlagDetectors.push(request5xxDetector());
+      autoFlagDetectors.push(
+        requestFailureDetector({
+          minStatus: this.config.flightRecorder ? 400 : 500,
+        }),
+      );
     if (this.config.autoFlagOnRenderedError || this.config.flightRecorder) {
       autoFlagDetectors.push(renderedErrorDetector());
       renderedErrorCleanup = renderedErrorCollector(this.bus);
@@ -1432,9 +1460,7 @@ export class Crumbtrail {
           retryStormDetector({
             threshold: this.config.retryStormThreshold,
             windowMs: this.config.retryStormWindowMs,
-            failThreshold: this.config.flightRecorder
-              ? 1
-              : this.config.retryStormFailThreshold,
+            failThreshold: this.config.retryStormFailThreshold,
           }),
         );
       if (this.config.autoFlagOnSlowResponse)
@@ -1462,20 +1488,22 @@ export class Crumbtrail {
         this.flagBugFromSource(
           { tags: request.tags, origin: "auto", autoReason: request.reason },
           false,
-        ),
+        ).then((outcome) => outcome.captured),
       detectors: autoFlagDetectors,
     });
+    this.autoFlag = autoFlag;
     const detach = this.bus.tap((event) => autoFlag.handleEvent(event));
     this.autoFlagCleanup = () => {
       detach();
       autoFlag.dispose();
       renderedErrorCleanup?.();
+      if (this.autoFlag === autoFlag) this.autoFlag = undefined;
     };
   }
 
   private triggerFlightRecorder(
     options?: InternalFlagOptions,
-  ): Promise<{ bugId: string }> {
+  ): Promise<FlagOutcome> {
     this.flightRecorderState = "triggered";
     this.startSessionIfAllowed();
     // Move every pre-trigger event from the bus batch into the flight recorder before tailing.
@@ -1495,7 +1523,7 @@ export class Crumbtrail {
           this.flightRecorderTimer = undefined;
           this.flightRecorderTailResolver = undefined;
           if (!this.canCapture()) {
-            resolve({ bugId: this.createBugId() });
+            resolve({ bugId: this.createBugId(), captured: false });
             return;
           }
           this.finalizeFlightRecorder(options).then(resolve, reject);
@@ -1506,14 +1534,14 @@ export class Crumbtrail {
 
   private async finalizeFlightRecorder(
     options?: InternalFlagOptions,
-  ): Promise<{ bugId: string }> {
+  ): Promise<FlagOutcome> {
     this.flightRecorderState = "finalizing";
     return this.finalizeFlagBug(options, true);
   }
 
   private trackFlightRecorderFinalization(
-    finalization: Promise<{ bugId: string }>,
-  ): Promise<{ bugId: string }> {
+    finalization: Promise<FlagOutcome>,
+  ): Promise<FlagOutcome> {
     this.flightRecorderFinalization = finalization;
     const complete = () => {
       this.flightRecorderTimer = undefined;
@@ -1526,6 +1554,10 @@ export class Crumbtrail {
       // produce a report. The ring buffer is cleared because the next window
       // starts here, not because there will not be one.
       this.ringBuffer.clear();
+      // The signal keys go with it. Dedup is per window, so a session that hits the same
+      // fixed-key signal again — a second slow response episode, a second abandoned flow —
+      // opens a second window instead of being swallowed by the first one's memory.
+      this.autoFlag?.endWindow();
       this.flightRecorderState = this.canCapture() ? "buffering" : "armed";
     };
     void finalization.then(complete, complete);
@@ -1537,7 +1569,7 @@ export class Crumbtrail {
     this.flightRecorderTimer = undefined;
     const settle = this.flightRecorderTailResolver;
     this.flightRecorderTailResolver = undefined;
-    if (settle) settle({ bugId: this.createBugId() });
+    if (settle) settle({ bugId: this.createBugId(), captured: false });
     if (!this.flightRecorderFinalization) this.updateFlightRecorderState();
   }
 
