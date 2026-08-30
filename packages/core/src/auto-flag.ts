@@ -28,6 +28,11 @@ export interface AutoFlagOptions {
    * (rage-click, retry-storm, …) to capture silent failures before an error throws.
    */
   detectors?: SignalDetector[];
+  /**
+   * Detectors that are measured without opening a capture. Their distinct per-window signals are
+   * counted by tag and exposed through {@link AutoFlagController.shadowCounts}.
+   */
+  shadowDetectors?: SignalDetector[];
 }
 
 export interface AutoFlagController {
@@ -42,6 +47,13 @@ export interface AutoFlagController {
    * could never open a window again, however long the session ran.
    */
   endWindow(): void;
+  /**
+   * Returns session-long shadow signal totals by tag. Counts are distinct signals, not raw events:
+   * shadow detectors share the per-window `seen` dedup used by capture detectors. `endWindow()`
+   * clears that dedup set but deliberately does not clear these totals, so a later captured window
+   * can carry the session total.
+   */
+  shadowCounts(): Record<string, number>;
   dispose(): void;
 }
 
@@ -56,6 +68,8 @@ export function createAutoFlagController(
   options: AutoFlagOptions,
 ): AutoFlagController {
   const detectors = options.detectors ?? [errorDetector()];
+  const shadowDetectors = options.shadowDetectors ?? [];
+  const shadowCounts: Record<string, number> = {};
   let seen = new Set<string>();
   /** Reports the capture path confirmed. */
   let flaggedCount = 0;
@@ -95,6 +109,15 @@ export function createAutoFlagController(
   return {
     handleEvent(event: BugEvent): void {
       if (disposed) return;
+
+      for (const detector of shadowDetectors) {
+        const signal = detector.inspect(event);
+        if (!signal) continue;
+        if (seen.has(signal.key)) continue;
+        seen.add(signal.key);
+        shadowCounts[signal.tag] = (shadowCounts[signal.tag] ?? 0) + 1;
+      }
+
       if (atCap()) return;
 
       for (const detector of detectors) {
@@ -110,6 +133,9 @@ export function createAutoFlagController(
     },
     endWindow(): void {
       seen = new Set<string>();
+    },
+    shadowCounts(): Record<string, number> {
+      return { ...shadowCounts };
     },
     dispose(): void {
       disposed = true;

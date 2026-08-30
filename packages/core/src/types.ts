@@ -108,6 +108,8 @@ export interface BugReport {
   accountId?: string;
   userId?: string;
   tags?: string[];
+  /** Session-long distinct shadow detector signals, grouped by detector tag. */
+  shadowSignalCounts?: Record<string, number>;
   summary: {
     errorCount: number;
     failedRequestCount: number;
@@ -871,6 +873,8 @@ export interface CrumbtrailConfig {
   autoFlagDebounceMs: number;
   // Hard cap on auto-captured reports per session (shared across every auto-flag detector).
   autoFlagMaxPerSession: number;
+  /** Measure behavioral detector signals without letting them open captures. */
+  autoFlagShadowMode: boolean;
 
   // Precognitive auto-flag: snapshot the ring buffer on behavioral leading indicators of a silent
   // failure (rage-clicks, retry storms) — before an error throws, or when none ever does. Opt-in.
@@ -1034,6 +1038,7 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   serverSidePull: false,
   autoFlagDebounceMs: 2000,
   autoFlagMaxPerSession: 10,
+  autoFlagShadowMode: false,
 
   autoFlagOnSignals: false,
   autoFlagOnRageClick: true,

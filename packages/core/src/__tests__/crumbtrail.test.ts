@@ -106,6 +106,7 @@ describe("Crumbtrail", () => {
     expect(DEFAULT_CONFIG.autoFlagOnRequest5xx).toBe(true);
     expect(DEFAULT_CONFIG.autoFlagDebounceMs).toBeGreaterThan(0);
     expect(DEFAULT_CONFIG.autoFlagMaxPerSession).toBeGreaterThan(0);
+    expect(DEFAULT_CONFIG.autoFlagShadowMode).toBe(false);
   });
 
   it("mark() emits mark event without throwing", async () => {
@@ -200,7 +201,7 @@ describe("Crumbtrail", () => {
     expect(mockTransport.endSession).toHaveBeenCalledTimes(1);
   });
 
-  it("autoFlagOnSignals auto-captures a rage-click cluster (no error thrown)", async () => {
+  it("keeps existing auto-capture behavior when shadow mode is off", async () => {
     vi.useFakeTimers();
     const mockTransport = {
       sendEvents: vi.fn().mockResolvedValue(undefined),
@@ -212,6 +213,7 @@ describe("Crumbtrail", () => {
     const logger = Crumbtrail.init({
       transportInstance: mockTransport as any,
       autoFlagOnSignals: true,
+      autoFlagShadowMode: false,
       rageClickThreshold: 4,
       rageClickWindowMs: 1500,
       autoFlagDebounceMs: 2000,
@@ -228,6 +230,70 @@ describe("Crumbtrail", () => {
     expect(mockTransport.sendBugReport).toHaveBeenCalledTimes(1);
     const report = mockTransport.sendBugReport.mock.calls[0][0];
     expect(report.tags).toContain("auto:rage-click");
+    expect(report).not.toHaveProperty("shadowSignalCounts");
+
+    vi.useRealTimers();
+    await logger.stop();
+  });
+
+  it("attaches shadow counts to a report captured by a real trigger", async () => {
+    vi.useFakeTimers();
+    const mockTransport = makeMockTransport();
+    const logger = Crumbtrail.init({
+      transportInstance: mockTransport as any,
+      autoFlagOnError: true,
+      autoFlagShadowMode: true,
+      rageClickThreshold: 4,
+      rageClickWindowMs: 1500,
+      autoFlagDebounceMs: 10,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1000,
+    });
+
+    const el = { sig: "btn-checkout" };
+    for (let i = 0; i < 4; i++) {
+      logger.addEvent({ type: "clk", data: { el } });
+    }
+    await vi.advanceTimersByTimeAsync(10);
+    expect(mockTransport.sendBugReport).not.toHaveBeenCalled();
+
+    logger.addEvent({
+      type: "err",
+      data: { msg: "boom", stk: "Error: boom\n  at app.js:1" },
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(mockTransport.sendBugReport).toHaveBeenCalledTimes(1);
+    const report = mockTransport.sendBugReport.mock.calls[0][0];
+    expect(report.tags).toContain("auto:error");
+    expect(report.shadowSignalCounts).toEqual({ "auto:rage-click": 1 });
+
+    vi.useRealTimers();
+    await logger.stop();
+  });
+
+  it("omits shadow counts when no shadow detector fired", async () => {
+    vi.useFakeTimers();
+    const mockTransport = makeMockTransport();
+    const logger = Crumbtrail.init({
+      transportInstance: mockTransport as any,
+      autoFlagOnError: true,
+      autoFlagShadowMode: true,
+      autoFlagDebounceMs: 10,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1000,
+    });
+
+    logger.addEvent({
+      type: "err",
+      data: { msg: "boom", stk: "Error: boom\n  at app.js:1" },
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(mockTransport.sendBugReport).toHaveBeenCalledTimes(1);
+    expect(mockTransport.sendBugReport.mock.calls[0][0]).not.toHaveProperty(
+      "shadowSignalCounts",
+    );
 
     vi.useRealTimers();
     await logger.stop();
