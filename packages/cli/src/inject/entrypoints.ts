@@ -247,6 +247,342 @@ function deploymentStartsScript(
   entry: ExtraEntry,
 ): boolean {
   if (!io.listFiles) return false;
+
+  type JsonObject = Record<string, unknown>;
+  type Pattern = { base: string; value: string };
+  type TsBuildConfig = {
+    rootDir: string | null;
+    outDir: string | null;
+    noEmit: boolean;
+    emitDeclarationOnly: boolean;
+    allowJs: boolean;
+    files: string[] | null;
+    include: Pattern[] | null;
+    exclude: Pattern[] | null;
+  };
+  type TsBuildInvocation = {
+    configPath: string;
+    overrides: Partial<
+      Pick<
+        TsBuildConfig,
+        "rootDir" | "outDir" | "noEmit" | "emitDeclarationOnly"
+      >
+    >;
+  };
+
+  const parseJsonc = (text: string): JsonObject | null => {
+    let clean = "";
+    let inString = false;
+    let escaped = false;
+    for (let index = 0; index < text.length; index++) {
+      const char = text[index];
+      const next = text[index + 1];
+      if (inString) {
+        clean += char;
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        clean += char;
+      } else if (char === "/" && next === "/") {
+        index += 2;
+        while (index < text.length && text[index] !== "\n") index++;
+        clean += "\n";
+      } else if (char === "/" && next === "*") {
+        index += 2;
+        while (
+          index < text.length - 1 &&
+          !(text[index] === "*" && text[index + 1] === "/")
+        )
+          index++;
+        index++;
+      } else {
+        clean += char;
+      }
+    }
+    try {
+      const parsed: unknown = JSON.parse(clean.replace(/,\s*([}\]])/g, "$1"));
+      return typeof parsed === "object" && parsed !== null
+        ? (parsed as JsonObject)
+        : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const stringArray = (value: unknown): string[] | null =>
+    Array.isArray(value) && value.every((item) => typeof item === "string")
+      ? value
+      : null;
+
+  const readTsBuildConfig = (
+    configPath: string,
+    seen = new Set<string>(),
+  ): TsBuildConfig | null => {
+    const absolute = path.resolve(configPath);
+    if (seen.has(absolute)) return null;
+    seen.add(absolute);
+    const raw = io.readFile(absolute);
+    if (!raw) return null;
+    const parsed = parseJsonc(raw);
+    if (!parsed) return null;
+    const configDir = path.dirname(absolute);
+    let inherited: TsBuildConfig | null = null;
+    if (typeof parsed.extends === "string" && parsed.extends.startsWith(".")) {
+      const resolved = path.resolve(configDir, parsed.extends);
+      inherited = readTsBuildConfig(
+        path.extname(resolved) ? resolved : `${resolved}.json`,
+        seen,
+      );
+      if (!inherited) return null;
+    } else if (parsed.extends != null) {
+      return null;
+    }
+    const compilerOptions =
+      typeof parsed.compilerOptions === "object" &&
+      parsed.compilerOptions !== null
+        ? (parsed.compilerOptions as JsonObject)
+        : {};
+    const optionPath = (
+      name: string,
+      fallback: string | null,
+    ): string | null =>
+      typeof compilerOptions[name] === "string"
+        ? path.resolve(configDir, compilerOptions[name])
+        : fallback;
+    const ownFiles = stringArray(parsed.files);
+    const ownInclude = stringArray(parsed.include);
+    const ownExclude = stringArray(parsed.exclude);
+    return {
+      rootDir: optionPath("rootDir", inherited?.rootDir ?? null),
+      outDir: optionPath("outDir", inherited?.outDir ?? null),
+      noEmit:
+        typeof compilerOptions.noEmit === "boolean"
+          ? compilerOptions.noEmit
+          : (inherited?.noEmit ?? false),
+      emitDeclarationOnly:
+        typeof compilerOptions.emitDeclarationOnly === "boolean"
+          ? compilerOptions.emitDeclarationOnly
+          : (inherited?.emitDeclarationOnly ?? false),
+      allowJs:
+        typeof compilerOptions.allowJs === "boolean"
+          ? compilerOptions.allowJs
+          : (inherited?.allowJs ?? false),
+      files:
+        ownFiles?.map((file) => path.resolve(configDir, file)) ??
+        inherited?.files ??
+        null,
+      include:
+        ownInclude?.map((value) => ({ base: configDir, value })) ??
+        inherited?.include ??
+        null,
+      exclude:
+        ownExclude?.map((value) => ({ base: configDir, value })) ??
+        inherited?.exclude ??
+        null,
+    };
+  };
+
+  const globMatches = (filePath: string, pattern: Pattern): boolean => {
+    const relative = path.relative(pattern.base, filePath).replace(/\\/g, "/");
+    if (relative.startsWith("../") || path.isAbsolute(relative)) return false;
+    let source = pattern.value.replace(/\\/g, "/").replace(/^\.\//, "");
+    if (!/[?*]/.test(source) && path.extname(source) === "") {
+      source = `${source.replace(/\/$/, "")}/**/*`;
+    }
+    let regex = "";
+    for (let index = 0; index < source.length; index++) {
+      const char = source[index];
+      if (char === "*" && source[index + 1] === "*") {
+        if (source[index + 2] === "/") {
+          regex += "(?:.*/)?";
+          index += 2;
+        } else {
+          regex += ".*";
+          index++;
+        }
+      } else if (char === "*") regex += "[^/]*";
+      else if (char === "?") regex += "[^/]";
+      else regex += char.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+    return new RegExp(`^${regex}$`).test(relative);
+  };
+
+  const configEmits = (config: TsBuildConfig, sourcePath: string): boolean => {
+    if (
+      config.noEmit ||
+      config.emitDeclarationOnly ||
+      !config.rootDir ||
+      !config.outDir
+    )
+      return false;
+    if (/\.[cm]?js$/i.test(sourcePath) && !config.allowJs) return false;
+    if (config.files?.some((file) => path.resolve(file) === sourcePath))
+      return true;
+    if (config.files && !config.include) return false;
+    const included = config.include
+      ? config.include.some((pattern) => globMatches(sourcePath, pattern))
+      : sourcePath.startsWith(`${config.rootDir}${path.sep}`);
+    if (!included) return false;
+    return !(config.exclude ?? []).some((pattern) =>
+      globMatches(sourcePath, pattern),
+    );
+  };
+
+  const tscInvocation = (args: string): TsBuildInvocation | null => {
+    const tokens = (args.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map(
+      (token) => token.replace(/^["']|["']$/g, ""),
+    );
+    let project = "tsconfig.json";
+    const overrides: TsBuildInvocation["overrides"] = {};
+    const booleanOverride = (index: number): [boolean, number] => {
+      const next = tokens[index + 1]?.toLowerCase();
+      return next === "true" || next === "false"
+        ? [next === "true", index + 1]
+        : [true, index];
+    };
+    for (let index = 0; index < tokens.length; index++) {
+      const token = tokens[index];
+      const lower = token.toLowerCase();
+      const valueAfter = (name: string): string | null | undefined => {
+        if (lower === name.toLowerCase()) return tokens[++index] ?? null;
+        return undefined;
+      };
+      const shortProject = valueAfter("-p");
+      const projectValue =
+        shortProject === undefined ? valueAfter("--project") : shortProject;
+      if (projectValue !== undefined) {
+        if (projectValue === null) return null;
+        project = projectValue;
+        continue;
+      }
+      const rootDir = valueAfter("--rootDir");
+      if (rootDir !== undefined) {
+        if (rootDir === null) return null;
+        overrides.rootDir = path.resolve(cwd, rootDir);
+        continue;
+      }
+      const outDir = valueAfter("--outDir");
+      if (outDir !== undefined) {
+        if (outDir === null) return null;
+        overrides.outDir = path.resolve(cwd, outDir);
+        continue;
+      }
+      if (lower === "--noemit") {
+        const [value, consumed] = booleanOverride(index);
+        overrides.noEmit = value;
+        index = consumed;
+        continue;
+      }
+      if (lower === "--emitdeclarationonly") {
+        const [value, consumed] = booleanOverride(index);
+        overrides.emitDeclarationOnly = value;
+        index = consumed;
+        continue;
+      }
+      // An unmodelled argument can change which files TypeScript emits or
+      // where it writes them. Refuse the mapping instead of silently trusting
+      // compiler settings that are not effective for this invocation.
+      return null;
+    }
+    return { configPath: path.resolve(cwd, project), overrides };
+  };
+
+  const buildConfigPaths = (): TsBuildInvocation[] => {
+    const scripts = readScripts(cwd, io);
+    if (!scripts?.build) return [];
+    const pending = ["build"];
+    const visited = new Set<string>();
+    const configs = new Map<string, TsBuildInvocation>();
+    while (pending.length > 0) {
+      const name = pending.pop()!;
+      if (visited.has(name)) continue;
+      visited.add(name);
+      const script = scripts[name];
+      if (!script) continue;
+      for (const match of script.matchAll(
+        /(?:^|[;&|]\s*|&&\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?([\w:.-]+)/g,
+      )) {
+        if (scripts[match[1]]) pending.push(match[1]);
+      }
+      for (const match of script.matchAll(
+        /(?:^|\s)(?:npx\s+)?tsc(?:\s|$)([^;&|]*)/g,
+      )) {
+        const invocation = tscInvocation(match[1] ?? "");
+        if (!invocation) continue;
+        configs.set(
+          JSON.stringify([invocation.configPath, invocation.overrides]),
+          invocation,
+        );
+      }
+    }
+    return [...configs.values()];
+  };
+
+  const runtimeProgram = (tokens: string[]): string | null => {
+    const runtime = tokens[0]?.toLowerCase();
+    if (!runtime || !/^(?:node|tsx|ts-node|bun|deno)$/.test(runtime)) {
+      return null;
+    }
+    const consumesNext = new Set([
+      "-r",
+      "--require",
+      "--import",
+      "--loader",
+      "--experimental-loader",
+    ]);
+    for (let index = 1; index < tokens.length; index++) {
+      const token = tokens[index];
+      if (token === "--") return tokens[index + 1] ?? null;
+      if (consumesNext.has(token)) {
+        index++;
+        continue;
+      }
+      if (token.startsWith("-")) continue;
+      if (runtime === "tsx" && token === "watch") continue;
+      return token;
+    }
+    return null;
+  };
+
+  const commandNamesEntry = (tokens: string[]): boolean => {
+    const commandPath = runtimeProgram(tokens);
+    if (!commandPath || !RUNNABLE_EXTENSIONS.has(path.extname(commandPath)))
+      return false;
+
+    const commanded = path.resolve(cwd, commandPath);
+    if (commanded === path.resolve(entry.path)) return true;
+
+    const sourceExt = path.extname(entry.path).toLowerCase();
+    const emittedExt =
+      sourceExt === ".mts"
+        ? ".mjs"
+        : sourceExt === ".cts"
+          ? ".cjs"
+          : sourceExt === ".ts" || sourceExt === ".tsx"
+            ? ".js"
+            : sourceExt;
+    const sourcePath = path.resolve(entry.path);
+    for (const invocation of buildConfigPaths()) {
+      const declared = readTsBuildConfig(invocation.configPath);
+      if (!declared) continue;
+      const config = { ...declared, ...invocation.overrides };
+      if (!configEmits(config, sourcePath)) continue;
+      const sourceRel = path.relative(config.rootDir!, sourcePath);
+      if (
+        sourceRel === "" ||
+        sourceRel.startsWith("..") ||
+        path.isAbsolute(sourceRel)
+      )
+        continue;
+      const emittedRel = `${sourceRel.slice(0, -sourceExt.length)}${emittedExt}`;
+      if (path.resolve(config.outDir!, emittedRel) === commanded) return true;
+    }
+    return false;
+  };
   const starts = (command: unknown): boolean => {
     let tokens: string[];
     if (
@@ -267,13 +603,15 @@ function deploymentStartsScript(
       return starts(tokens[2]);
     if (tokens[0] === "exec") return starts(tokens.slice(1));
     const token = tokens[0];
-    if (!/^(?:npm|pnpm|yarn|bun)$/i.test(token ?? "")) return false;
+    if (!/^(?:npm|pnpm|yarn|bun)$/i.test(token ?? "")) {
+      return commandNamesEntry(tokens);
+    }
     const next = tokens[1];
-      if (
-        next === entry.script &&
-        (!/^npm$/i.test(token) || entry.script === "start")
-      )
-        return true;
+    if (
+      next === entry.script &&
+      (!/^npm$/i.test(token) || entry.script === "start")
+    )
+      return true;
     return next?.toLowerCase() === "run" && tokens[2] === entry.script;
   };
   for (const name of io.listFiles(cwd)) {
@@ -340,9 +678,7 @@ function deploymentStartsScript(
         const indent = field[1].length;
         const sequence: string[] = [];
         for (let next = index + 1; next < lines.length; next++) {
-          const item = /^(\s*)-\s*["']?([^"'\s]+)["']?\s*$/.exec(
-            lines[next],
-          );
+          const item = /^(\s*)-\s*["']?([^"'\s]+)["']?\s*$/.exec(lines[next]);
           if (!item || item[1].length <= indent) break;
           sequence.push(item[2]);
         }
