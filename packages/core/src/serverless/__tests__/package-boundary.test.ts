@@ -1,9 +1,9 @@
 import fs from "node:fs";
-import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { buildCorePackage } from "./build-package.js";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const packageRoot = path.resolve(testDir, "../../..");
@@ -12,10 +12,7 @@ const cjsPath = path.join(packageRoot, "dist/serverless/index.cjs");
 const declarationPath = path.join(packageRoot, "dist/serverless/index.d.ts");
 
 beforeAll(() => {
-  execFileSync("pnpm", ["run", "build"], {
-    cwd: packageRoot,
-    stdio: "pipe",
-  });
+  buildCorePackage(packageRoot);
 });
 
 describe("crumbtrail-core/serverless package boundary", () => {
@@ -43,6 +40,12 @@ describe("crumbtrail-core/serverless package boundary", () => {
     expect(fs.readFileSync(declarationPath, "utf8")).toContain(
       "runServerlessInvocation",
     );
+    expect(fs.readFileSync(declarationPath, "utf8")).toContain(
+      "createServerlessHttpTransport",
+    );
+    expect(fs.readFileSync(declarationPath, "utf8")).toContain(
+      "ServerlessTransportConfig",
+    );
 
     const esm = (await import(
       `${pathToFileURL(esmPath).href}?boundary=${Date.now()}`
@@ -53,6 +56,10 @@ describe("crumbtrail-core/serverless package boundary", () => {
     >;
     expect(typeof esm.runServerlessInvocation).toBe("function");
     expect(typeof cjs.runServerlessInvocation).toBe("function");
+    expect(typeof esm.createServerlessHttpTransport).toBe("function");
+    expect(typeof cjs.createServerlessHttpTransport).toBe("function");
+    expect(typeof esm.withCrumbtrailFetch).toBe("function");
+    expect(typeof cjs.withCrumbtrailFetch).toBe("function");
   });
 
   it("imports without Node builtins or browser collector initialization", async () => {

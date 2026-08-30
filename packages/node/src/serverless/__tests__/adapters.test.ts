@@ -25,9 +25,11 @@ function deferred<T = void>(): Deferred<T> {
 function recordingTransport(flush?: () => void | Promise<void>) {
   const events: ServerlessInvocationEvent[] = [];
   const transport: ServerlessInvocationTransport = {
+    startSession: vi.fn(),
     capture(event) {
       events.push(event);
     },
+    endSession: vi.fn(),
     flush,
   };
   return { events, transport };
@@ -38,6 +40,43 @@ function terminalEvents(events: readonly ServerlessInvocationEvent[]) {
 }
 
 describe("Node serverless adapters", () => {
+  it("uses endpoint only configuration for AWS, Vercel, and Netlify lifecycles", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      calls.push({ url: String(input), init });
+      return new Response("{}", { status: 200 });
+    };
+    const options = {
+      endpoint: "https://capture.example",
+      authToken: "ingest-key",
+      service: "orders-api",
+      fetchImpl,
+    };
+
+    await withCrumbtrailAwsLambda(async () => ({ statusCode: 201 }), options)(
+      { httpMethod: "POST", path: "/lambda" },
+      {},
+    );
+    await withCrumbtrailVercel(async () => "vercel", options)(
+      { method: "GET", url: "/vercel" },
+      { statusCode: 202 },
+    );
+    await withCrumbtrailNetlify(async () => ({ statusCode: 203 }), options)(
+      { httpMethod: "PATCH", path: "/netlify" },
+      {},
+    );
+
+    expect(
+      calls.filter((call) => call.url.endsWith("/api/session/start")),
+    ).toHaveLength(3);
+    expect(
+      calls.filter((call) => call.url.endsWith("/api/events")),
+    ).toHaveLength(6);
+    expect(
+      calls.filter((call) => call.url.endsWith("/api/session/end")),
+    ).toHaveLength(3);
+  });
+
   it("normalizes API Gateway v1, v2, and compatible HTTP events", async () => {
     const v1 = recordingTransport();
     const v1Result = { statusCode: 201, body: "v1" };

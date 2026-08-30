@@ -19,7 +19,7 @@ export function withCrumbtrailNetlify<
     const callbackSupplied = arguments.length > 2;
     return runServerlessInvocation(
       {
-        transport: options.transport,
+        ...options,
         headers: event.headers,
         method: event.httpMethod,
         route: event.path,

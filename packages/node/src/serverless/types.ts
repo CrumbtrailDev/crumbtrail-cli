@@ -1,13 +1,18 @@
 import type {
+  ServerlessDeliveryErrorContext,
   ServerlessInvocationHeaders,
-  ServerlessInvocationTransport,
+  ServerlessTransportConfig,
 } from "crumbtrail-core/serverless";
 
-export interface NodeServerlessAdapterOptions {
-  transport: ServerlessInvocationTransport;
+interface NodeServerlessAdapterCommonOptions {
   metadata?: Readonly<Record<string, unknown>>;
+  service?: string;
+  onError?: (error: unknown, context: ServerlessDeliveryErrorContext) => void;
   now?: () => number;
 }
+
+export type NodeServerlessAdapterOptions = NodeServerlessAdapterCommonOptions &
+  ServerlessTransportConfig;
 
 export interface AwsLambdaHttpEventBase {
   headers?: ServerlessInvocationHeaders;

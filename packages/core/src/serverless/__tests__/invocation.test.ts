@@ -14,13 +14,27 @@ const TRACEPARENT = `00-${TRACE_ID}-00f067aa0ba902b7-01`;
 
 function collectingTransport() {
   const events: ServerlessInvocationEvent[] = [];
+  const started: string[] = [];
+  const ended: string[] = [];
+  const order: string[] = [];
   const transport: ServerlessInvocationTransport = {
+    startSession(session) {
+      started.push(session.sessionId);
+      order.push(`session:start:${session.sessionId}`);
+    },
     capture(event) {
       events.push(event);
+      order.push(event.k);
     },
-    flush: vi.fn().mockResolvedValue(undefined),
+    flush: vi.fn(() => {
+      order.push("flush");
+    }),
+    endSession(sessionId) {
+      ended.push(sessionId);
+      order.push(`session:end:${sessionId}`);
+    },
   };
-  return { events, transport };
+  return { ended, events, order, started, transport };
 }
 
 function eventOf(
@@ -33,6 +47,69 @@ function eventOf(
 }
 
 describe("runServerlessInvocation", () => {
+  it("owns a fresh session and brackets lifecycle events when no session header arrives", async () => {
+    const { ended, events, order, started, transport } = collectingTransport();
+
+    await expect(
+      runServerlessInvocation({ transport }, () => "host result"),
+    ).resolves.toBe("host result");
+
+    expect(started).toHaveLength(1);
+    expect(started[0]).toMatch(/^ses_/);
+    expect(events.map((event) => event.sessionId)).toEqual([
+      started[0],
+      started[0],
+    ]);
+    expect(ended).toEqual(started);
+    expect(order).toEqual([
+      `session:start:${started[0]}`,
+      SERVERLESS_INVOCATION_START_EVENT,
+      SERVERLESS_INVOCATION_SUCCESS_EVENT,
+      "flush",
+      `session:end:${started[0]}`,
+    ]);
+    expect(events[0].d.correlation).toMatchObject({
+      status: "missing-session-and-request-id",
+      sessionIdSource: "generated",
+      requestIdSource: "generated",
+    });
+  });
+
+  it("gives overlapping unlinked invocations different owned sessions", async () => {
+    const { ended, events, started, transport } = collectingTransport();
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+
+    const first = runServerlessInvocation({ transport }, async () => {
+      await firstGate;
+      return "first";
+    });
+    const second = runServerlessInvocation({ transport }, async () => {
+      await secondGate;
+      return "second";
+    });
+    await vi.waitFor(() => expect(started).toHaveLength(2));
+    expect(new Set(started).size).toBe(2);
+
+    releaseSecond();
+    await second;
+    releaseFirst();
+    await first;
+
+    expect(new Set(ended)).toEqual(new Set(started));
+    for (const sessionId of started) {
+      expect(
+        events.filter((event) => event.sessionId === sessionId),
+      ).toHaveLength(2);
+    }
+  });
+
   it("captures one cold successful invocation and preserves its return value", async () => {
     const { events, transport } = collectingTransport();
     const times = [100, 125];
@@ -236,13 +313,15 @@ describe("runServerlessInvocation", () => {
   it("contains capture and flush rejection on a successful handler", async () => {
     const handler = vi.fn().mockResolvedValue("host result");
     const transport: ServerlessInvocationTransport = {
+      startSession: vi.fn(),
       capture: vi.fn().mockRejectedValue(new Error("capture failed")),
+      endSession: vi.fn(),
       flush: vi.fn().mockRejectedValue(new Error("flush failed")),
     };
 
-    await expect(runServerlessInvocation({ transport }, handler)).resolves.toBe(
-      "host result",
-    );
+    await expect(
+      runServerlessInvocation({ transport, onError: vi.fn() }, handler),
+    ).resolves.toBe("host result");
     expect(handler).toHaveBeenCalledOnce();
     expect(transport.capture).toHaveBeenCalledTimes(2);
     expect(transport.flush).toHaveBeenCalledOnce();
@@ -256,12 +335,14 @@ describe("runServerlessInvocation", () => {
       },
     });
     const transport: ServerlessInvocationTransport = {
+      startSession: vi.fn(),
       capture: vi.fn(),
+      endSession: vi.fn(),
       flush: vi.fn().mockRejectedValue(new Error("flush failed")),
     };
 
     await expect(
-      runServerlessInvocation({ transport }, () => {
+      runServerlessInvocation({ transport, onError: vi.fn() }, () => {
         throw original;
       }),
     ).rejects.toBe(original);
@@ -273,7 +354,9 @@ describe("runServerlessInvocation", () => {
     const metadata = {
       body: "request-body-secret",
       requestBody: "request-body-secret",
+      request_body_json: "request-body-secret",
       responseBody: "response-body-secret",
+      responseBodyText: "response-body-secret",
       nested: { body: "nested-body-secret" },
       ...Object.fromEntries(
         Array.from(
@@ -329,7 +412,7 @@ describe("runServerlessInvocation", () => {
   });
 
   it("adopts valid Crumbtrail headers and W3C trace context", async () => {
-    const { events, transport } = collectingTransport();
+    const { ended, events, started, transport } = collectingTransport();
 
     await runServerlessInvocation(
       {
@@ -358,6 +441,8 @@ describe("runServerlessInvocation", () => {
         },
       },
     });
+    expect(started).toEqual([]);
+    expect(ended).toEqual([]);
   });
 
   it("replaces invalid or oversized correlation and adopts a valid traceparent fallback", async () => {
@@ -378,11 +463,11 @@ describe("runServerlessInvocation", () => {
       () => undefined,
     );
     const fallback = eventOf(first.events, SERVERLESS_INVOCATION_START_EVENT);
-    expect(fallback.sessionId).toBeUndefined();
+    expect(fallback.sessionId).toMatch(/^ses_/);
     expect(fallback.d.requestId).toBe(TRACE_ID);
     expect(fallback.d.correlation).toMatchObject({
       status: "missing-session",
-      sessionIdSource: "missing",
+      sessionIdSource: "generated",
       requestIdSource: "traceparent",
       traceId: TRACE_ID,
     });
@@ -400,11 +485,11 @@ describe("runServerlessInvocation", () => {
       () => undefined,
     );
     const generated = eventOf(second.events, SERVERLESS_INVOCATION_START_EVENT);
-    expect(generated.sessionId).toBeUndefined();
+    expect(generated.sessionId).toMatch(/^ses_/);
     expect(generated.d.requestId).toMatch(/^[0-9a-f]{32}$/);
     expect(generated.d.correlation).toEqual({
       status: "missing-session-and-request-id",
-      sessionIdSource: "missing",
+      sessionIdSource: "generated",
       requestIdSource: "generated",
     });
   });

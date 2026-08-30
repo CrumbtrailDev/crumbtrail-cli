@@ -21,7 +21,7 @@ export function withCrumbtrailAwsLambda<
 
     return runServerlessInvocation(
       {
-        transport: options.transport,
+        ...options,
         headers: event.headers,
         method: request.method,
         route: request.route,

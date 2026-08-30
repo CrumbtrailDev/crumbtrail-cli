@@ -1,17 +1,25 @@
 import {
   runServerlessInvocation,
-  type ServerlessInvocationTransport,
+  type ServerlessDeliveryErrorContext,
+  type ServerlessTransportConfig,
 } from "./invocation";
 
 export type FetchWaitUntil = (promise: Promise<void>) => void;
 
-export interface FetchServerlessAdapterOptions {
-  transport: ServerlessInvocationTransport;
+interface FetchServerlessAdapterCommonOptions {
   waitUntil?: FetchWaitUntil;
+  metadata?: Readonly<Record<string, unknown>>;
+  service?: string;
+  onError?: (error: unknown, context: ServerlessDeliveryErrorContext) => void;
   now?: () => number;
 }
 
-export type FetchHostHandler = (request: Request) => Response | Promise<Response>;
+export type FetchServerlessAdapterOptions =
+  FetchServerlessAdapterCommonOptions & ServerlessTransportConfig;
+
+export type FetchHostHandler = (
+  request: Request,
+) => Response | Promise<Response>;
 export type FetchAsyncHandler = (request: Request) => Promise<Response>;
 
 export function withCrumbtrailFetch(
@@ -19,13 +27,18 @@ export function withCrumbtrailFetch(
   options: FetchServerlessAdapterOptions,
 ): FetchAsyncHandler {
   return async function crumbtrailFetchHandler(request) {
+    const { waitUntil, ...invocationOptions } = options;
     return runServerlessInvocation(
       {
-        transport: transportWithScheduledFlush(options),
+        ...invocationOptions,
         headers: request.headers,
         method: request.method,
         route: readPathname(request.url),
-        metadata: { requestAborted: request.signal.aborted },
+        metadata: {
+          ...options.metadata,
+          requestAborted: request.signal.aborted,
+        },
+        deferCleanup: waitUntil,
         now: options.now,
       },
       async (context) => {
@@ -34,27 +47,6 @@ export function withCrumbtrailFetch(
         return response;
       },
     );
-  };
-}
-
-function transportWithScheduledFlush(
-  options: FetchServerlessAdapterOptions,
-): ServerlessInvocationTransport {
-  if (!options.waitUntil) return options.transport;
-
-  return {
-    capture(event) {
-      return options.transport.capture(event);
-    },
-    flush() {
-      const containedFlush = Promise.resolve()
-        .then(() => options.transport.flush?.())
-        .then(
-          () => undefined,
-          () => undefined,
-        );
-      options.waitUntil?.(containedFlush);
-    },
   };
 }
 

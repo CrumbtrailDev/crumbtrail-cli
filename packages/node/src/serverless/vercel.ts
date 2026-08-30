@@ -20,7 +20,7 @@ export function withCrumbtrailVercel<
     const callbackSupplied = arguments.length > 2;
     return runServerlessInvocation(
       {
-        transport: options.transport,
+        ...options,
         headers: request.headers,
         method: request.method,
         route: pathFromUrl(request.url),

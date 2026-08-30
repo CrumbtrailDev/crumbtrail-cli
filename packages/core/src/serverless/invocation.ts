@@ -8,6 +8,12 @@ import {
   type W3CTraceContext,
 } from "../correlation";
 import type { BugEvent } from "../types";
+import { generateSessionId } from "../utils";
+import {
+  ServerlessConfigurationError,
+  createServerlessHttpTransport,
+  type ServerlessHttpTransportOptions,
+} from "./http-transport";
 
 export const SERVERLESS_INVOCATION_START_EVENT =
   "serverless.invocation.start" as const;
@@ -50,7 +56,7 @@ export interface ServerlessInvocationCorrelation {
     | "missing-session"
     | "generated-request-id"
     | "missing-session-and-request-id";
-  sessionIdSource: "header" | "missing";
+  sessionIdSource: "header" | "generated";
   requestIdSource: "header" | "traceparent" | "generated";
   traceId?: string;
   spanId?: string;
@@ -59,7 +65,7 @@ export interface ServerlessInvocationCorrelation {
 
 export interface ServerlessInvocationPayload extends Record<string, unknown> {
   requestId: string;
-  sessionId?: string;
+  sessionId: string;
   correlation: ServerlessInvocationCorrelation;
   status: ServerlessInvocationStatus;
   durationMs: number;
@@ -80,23 +86,58 @@ export interface ServerlessInvocationEvent extends BugEvent {
 }
 
 export interface ServerlessInvocationTransport {
+  startSession(session: ServerlessInvocationSession): void | Promise<unknown>;
   capture(event: ServerlessInvocationEvent): void | Promise<void>;
+  endSession(sessionId: string): void | Promise<unknown>;
   flush?(): void | Promise<void>;
 }
 
-export interface ServerlessInvocationOptions {
-  transport: ServerlessInvocationTransport;
+export interface ServerlessInvocationSession {
+  sessionId: string;
+  metadata?: Readonly<Record<string, ServerlessMetadataValue>>;
+}
+
+export type ServerlessTransportConfig =
+  | {
+      transport: ServerlessInvocationTransport;
+      endpoint?: never;
+      authToken?: never;
+      fetchImpl?: never;
+      requestTimeoutMs?: never;
+    }
+  | ({ transport?: never } & ServerlessHttpTransportOptions);
+
+export type ServerlessDeliveryErrorPhase =
+  | "configuration"
+  | "session-start"
+  | "capture"
+  | "flush"
+  | "session-end"
+  | "cleanup-schedule";
+
+export interface ServerlessDeliveryErrorContext {
+  phase: ServerlessDeliveryErrorPhase;
+  sessionId: string;
+}
+
+interface ServerlessInvocationBaseOptions {
   headers?: ServerlessInvocationHeaders;
   method?: string;
   route?: string;
   metadata?: Readonly<Record<string, unknown>>;
+  service?: string;
+  onError?: (error: unknown, context: ServerlessDeliveryErrorContext) => void;
+  deferCleanup?: (promise: Promise<void>) => void;
   now?: () => number;
 }
+
+export type ServerlessInvocationOptions = ServerlessInvocationBaseOptions &
+  ServerlessTransportConfig;
 
 export interface ServerlessInvocationContext {
   readonly correlation: Readonly<{
     requestId: string;
-    sessionId?: string;
+    sessionId: string;
     traceId?: string;
     spanId?: string;
     flags?: number;
@@ -111,7 +152,8 @@ export type ServerlessInvocationHandler<T> = (
 
 interface ResolvedCorrelation {
   requestId: string;
-  sessionId?: string;
+  sessionId: string;
+  ownsSession: boolean;
   details: ServerlessInvocationCorrelation;
 }
 
@@ -128,60 +170,107 @@ export async function runServerlessInvocation<T>(
   const correlation = resolveIncomingCorrelation(options.headers);
   const method = sanitizeMethod(options.method);
   const metadata = sanitizeMetadata(options.metadata);
+  const service = sanitizeMetadataValue(options.service);
   const state: InvocationState = {
     route: sanitizeRoute(options.route),
   };
   const context = createContext(correlation, state);
+  const resolvedTransport = resolveTransport(options);
+  let deliveryReady = resolvedTransport.transport !== undefined;
 
-  await safeCapture(
-    options.transport,
-    buildEvent({
-      kind: SERVERLESS_INVOCATION_START_EVENT,
-      lifecycleStatus: "started",
-      at: startedAt,
-      durationMs: 0,
-      correlation,
-      method,
-      state,
-      metadata,
-    }),
-  );
+  if (resolvedTransport.error) {
+    reportDeliveryError(
+      options,
+      resolvedTransport.error,
+      "configuration",
+      correlation.sessionId,
+    );
+  }
+
+  if (deliveryReady && correlation.ownsSession) {
+    deliveryReady = await safeStartSession(
+      resolvedTransport.transport as ServerlessInvocationTransport,
+      {
+        sessionId: correlation.sessionId,
+        metadata: {
+          ...metadata,
+          ...(typeof service === "string" ? { service } : {}),
+          source: "serverless",
+        },
+      },
+      options,
+    );
+  }
+
+  if (deliveryReady) {
+    await safeCapture(
+      resolvedTransport.transport as ServerlessInvocationTransport,
+      buildEvent({
+        kind: SERVERLESS_INVOCATION_START_EVENT,
+        lifecycleStatus: "started",
+        at: startedAt,
+        durationMs: 0,
+        correlation,
+        method,
+        state,
+        metadata,
+      }),
+      options,
+      correlation.sessionId,
+    );
+  }
 
   try {
     const result = await handler(context);
     const endedAt = readNow(options.now);
-    await safeCapture(
-      options.transport,
-      buildEvent({
-        kind: SERVERLESS_INVOCATION_SUCCESS_EVENT,
-        lifecycleStatus: "success",
-        at: endedAt,
-        durationMs: boundedDuration(endedAt - startedAt),
+    if (deliveryReady) {
+      await safeCapture(
+        resolvedTransport.transport as ServerlessInvocationTransport,
+        buildEvent({
+          kind: SERVERLESS_INVOCATION_SUCCESS_EVENT,
+          lifecycleStatus: "success",
+          at: endedAt,
+          durationMs: boundedDuration(endedAt - startedAt),
+          correlation,
+          method,
+          state,
+          metadata,
+        }),
+        options,
+        correlation.sessionId,
+      );
+      await finishDelivery(
+        resolvedTransport.transport as ServerlessInvocationTransport,
         correlation,
-        method,
-        state,
-        metadata,
-      }),
-    );
-    await safeFlush(options.transport);
+        options,
+      );
+    }
     return result;
   } catch (error) {
     const endedAt = readNow(options.now);
-    await safeCapture(
-      options.transport,
-      buildEvent({
-        kind: SERVERLESS_INVOCATION_ERROR_EVENT,
-        lifecycleStatus: "error",
-        at: endedAt,
-        durationMs: boundedDuration(endedAt - startedAt),
+    if (deliveryReady) {
+      await safeCapture(
+        resolvedTransport.transport as ServerlessInvocationTransport,
+        buildEvent({
+          kind: SERVERLESS_INVOCATION_ERROR_EVENT,
+          lifecycleStatus: "error",
+          at: endedAt,
+          durationMs: boundedDuration(endedAt - startedAt),
+          correlation,
+          method,
+          state,
+          metadata,
+          error: sanitizeError(error),
+        }),
+        options,
+        correlation.sessionId,
+      );
+      await finishDelivery(
+        resolvedTransport.transport as ServerlessInvocationTransport,
         correlation,
-        method,
-        state,
-        metadata,
-        error: sanitizeError(error),
-      }),
-    );
-    await safeFlush(options.transport);
+        options,
+      );
+    }
     throw error;
   }
 }
@@ -192,7 +281,7 @@ function createContext(
 ): ServerlessInvocationContext {
   const publicCorrelation = Object.freeze({
     requestId: correlation.requestId,
-    ...(correlation.sessionId ? { sessionId: correlation.sessionId } : {}),
+    sessionId: correlation.sessionId,
     ...(correlation.details.traceId
       ? { traceId: correlation.details.traceId }
       : {}),
@@ -228,9 +317,7 @@ function buildEvent(input: {
 }): ServerlessInvocationEvent {
   const payload: ServerlessInvocationPayload = {
     requestId: input.correlation.requestId,
-    ...(input.correlation.sessionId
-      ? { sessionId: input.correlation.sessionId }
-      : {}),
+    sessionId: input.correlation.sessionId,
     correlation: { ...input.correlation.details },
     status: input.lifecycleStatus,
     durationMs: input.durationMs,
@@ -247,16 +334,14 @@ function buildEvent(input: {
     t: input.at,
     k: input.kind,
     d: payload,
-    ...(input.correlation.sessionId
-      ? { sessionId: input.correlation.sessionId }
-      : {}),
+    sessionId: input.correlation.sessionId,
   };
 }
 
 function resolveIncomingCorrelation(
   headers: ServerlessInvocationHeaders | undefined,
 ): ResolvedCorrelation {
-  const sessionId = normalizeId(
+  const incomingSessionId = normalizeId(
     readHeader(headers, CRUMBTRAIL_SESSION_HEADER_LOWER),
     SERVERLESS_LIMITS.sessionIdLength,
   );
@@ -267,13 +352,15 @@ function resolveIncomingCorrelation(
   const trace = parseTraceparent(readHeader(headers, W3C_TRACEPARENT_HEADER));
   const incomingRequestId = headerRequestId ?? trace?.traceId;
   const requestId = incomingRequestId ?? generateTraceId();
+  const sessionId = incomingSessionId ?? generateSessionId();
 
   return {
     requestId,
-    ...(sessionId ? { sessionId } : {}),
+    sessionId,
+    ownsSession: incomingSessionId === undefined,
     details: {
-      status: correlationStatus(sessionId, incomingRequestId),
-      sessionIdSource: sessionId ? "header" : "missing",
+      status: correlationStatus(incomingSessionId, incomingRequestId),
+      sessionIdSource: incomingSessionId ? "header" : "generated",
       requestIdSource: headerRequestId
         ? "header"
         : trace
@@ -378,8 +465,8 @@ function isBodyMetadataKey(key: string): boolean {
   const normalized = key.toLowerCase().replace(/[^a-z]/g, "");
   return (
     normalized === "body" ||
-    normalized === "requestbody" ||
-    normalized === "responsebody"
+    normalized.startsWith("requestbody") ||
+    normalized.startsWith("responsebody")
   );
 }
 
@@ -484,20 +571,158 @@ function boundedDuration(durationMs: number): number {
 async function safeCapture(
   transport: ServerlessInvocationTransport,
   event: ServerlessInvocationEvent,
+  options: ServerlessInvocationOptions,
+  sessionId: string,
 ): Promise<void> {
   try {
     await transport.capture(event);
-  } catch {
-    // Capture observes the host invocation and cannot change its result.
+  } catch (error) {
+    reportDeliveryError(options, error, "capture", sessionId);
   }
 }
 
 async function safeFlush(
   transport: ServerlessInvocationTransport,
+  options: ServerlessInvocationOptions,
+  sessionId: string,
 ): Promise<void> {
   try {
     await transport.flush?.();
+  } catch (error) {
+    reportDeliveryError(options, error, "flush", sessionId);
+  }
+}
+
+async function safeStartSession(
+  transport: ServerlessInvocationTransport,
+  session: ServerlessInvocationSession,
+  options: ServerlessInvocationOptions,
+): Promise<boolean> {
+  try {
+    await transport.startSession(session);
+    return true;
+  } catch (error) {
+    reportDeliveryError(options, error, "session-start", session.sessionId);
+    return false;
+  }
+}
+
+async function safeEndSession(
+  transport: ServerlessInvocationTransport,
+  sessionId: string,
+  options: ServerlessInvocationOptions,
+): Promise<void> {
+  try {
+    await transport.endSession(sessionId);
+  } catch (error) {
+    reportDeliveryError(options, error, "session-end", sessionId);
+  }
+}
+
+async function finishDelivery(
+  transport: ServerlessInvocationTransport,
+  correlation: ResolvedCorrelation,
+  options: ServerlessInvocationOptions,
+): Promise<void> {
+  const cleanup = async (): Promise<void> => {
+    await safeFlush(transport, options, correlation.sessionId);
+    if (correlation.ownsSession) {
+      await safeEndSession(transport, correlation.sessionId, options);
+    }
+  };
+
+  if (!options.deferCleanup) {
+    await cleanup();
+    return;
+  }
+
+  const cleanupPromise = cleanup();
+  try {
+    options.deferCleanup(cleanupPromise);
+  } catch (error) {
+    reportDeliveryError(
+      options,
+      error,
+      "cleanup-schedule",
+      correlation.sessionId,
+    );
+    await cleanupPromise;
+  }
+}
+
+function resolveTransport(options: ServerlessInvocationOptions): {
+  transport?: ServerlessInvocationTransport;
+  error?: ServerlessConfigurationError;
+} {
+  try {
+    if (options.transport !== undefined && options.endpoint !== undefined) {
+      return {
+        error: new ServerlessConfigurationError(
+          "Crumbtrail serverless setup accepts transport or endpoint, not both",
+        ),
+      };
+    }
+    if (isTransport(options.transport)) return { transport: options.transport };
+    if (options.transport !== undefined) {
+      return {
+        error: new ServerlessConfigurationError(
+          "Crumbtrail serverless transport must implement startSession, capture, and endSession",
+        ),
+      };
+    }
+    if (typeof options.endpoint !== "string" || !options.endpoint.trim()) {
+      return {
+        error: new ServerlessConfigurationError(
+          "Crumbtrail serverless setup requires either transport or endpoint",
+        ),
+      };
+    }
+    return {
+      transport: createServerlessHttpTransport({
+        endpoint: options.endpoint,
+        ...(options.authToken ? { authToken: options.authToken } : {}),
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+        ...(options.requestTimeoutMs !== undefined
+          ? { requestTimeoutMs: options.requestTimeoutMs }
+          : {}),
+      }),
+    };
+  } catch (error) {
+    return {
+      error:
+        error instanceof ServerlessConfigurationError
+          ? error
+          : new ServerlessConfigurationError(
+              "Crumbtrail serverless delivery configuration could not be initialized",
+            ),
+    };
+  }
+}
+
+function isTransport(value: unknown): value is ServerlessInvocationTransport {
+  if (!isRecord(value)) return false;
+  return (
+    typeof value.startSession === "function" &&
+    typeof value.capture === "function" &&
+    typeof value.endSession === "function"
+  );
+}
+
+function reportDeliveryError(
+  options: ServerlessInvocationOptions,
+  error: unknown,
+  phase: ServerlessDeliveryErrorPhase,
+  sessionId: string,
+): void {
+  try {
+    if (options.onError) {
+      options.onError(error, { phase, sessionId });
+      return;
+    }
+    if (typeof console !== "undefined" && typeof console.error === "function") {
+      console.error(`[crumbtrail] serverless ${phase} failed`, error);
+    }
   } catch {
-    // Cleanup is best effort and cannot replace a return value or thrown error.
+    // Delivery diagnostics cannot change the host invocation.
   }
 }
