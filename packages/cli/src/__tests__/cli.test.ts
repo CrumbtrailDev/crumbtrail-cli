@@ -996,6 +996,7 @@ describe("installSdk — tarball fallback (registry unavailable)", () => {
   it("installs the Python packages selected by an automatic OTLP plan", async () => {
     const calls: { cmd: string; args: string[] }[] = [];
     const packages = [
+      "python-dotenv",
       "opentelemetry-distro",
       "opentelemetry-exporter-otlp-proto-http",
       "opentelemetry-instrumentation-fastapi",

@@ -23,6 +23,7 @@ export function pythonOtelPackages(
   const framework = stack ? PYTHON_OTLP_INSTRUMENTATION[stack] : undefined;
   if (!framework) return [];
   return [
+    "python-dotenv",
     "opentelemetry-distro",
     "opentelemetry-exporter-otlp-proto-http",
     framework,

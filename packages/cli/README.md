@@ -162,7 +162,8 @@ Depending on the detected stack, it makes these local changes:
 - for a Flutter app, the import plus an awaited `Crumbtrail.start(...)` as the
   first statement of `main()` (capture has to be running before the first frame)
 - for a Django, FastAPI, or Flask app with `requirements.txt` and a `Procfile`,
-  the Python OpenTelemetry packages plus wrapped `web` and `worker` commands
+  the Python OpenTelemetry packages, a `crumbtrail_otel.py` launch helper, and
+  wrapped `web` and `worker` commands
 - your ingest key, in an env file, plus a `.gitignore` entry for that file
 - the same setup code in every **other process the package starts**, and the
   build argument a **containerised frontend** needs — see
@@ -216,12 +217,14 @@ so a Flutter app is detected and reported but not wired. See
 [`packages/flutter`](../flutter) for depending on it from source in the meantime.
 
 Python automatic setup applies when the service has both `requirements.txt` and
-`Procfile`. It installs the OpenTelemetry distro, HTTP OTLP exporter, and the
-detected Django, FastAPI, or Flask instrumentation. It also instruments Celery
-workers when `celery` is declared. The generated commands export traces to
-Crumbtrail and leave metrics and logs off. Other Python layouts keep the
-non-mutating OTLP guide because the wizard cannot safely infer their dependency
-manager and production start command.
+`Procfile`. It installs `python-dotenv`, the OpenTelemetry distro, HTTP OTLP
+exporter, and the detected Django, FastAPI, or Flask instrumentation. It also
+instruments Celery workers when `celery` is declared. The generated launch
+helper loads `.env` without replacing real environment variables, configures
+authenticated trace export, then starts the original command through
+`opentelemetry-instrument`. Metrics and logs remain off. Other Python layouts
+keep the non-mutating OTLP guide because the wizard cannot safely infer their
+dependency manager and production start command.
 
 The injected code reads the key from a framework-appropriate environment
 variable — `NEXT_PUBLIC_CRUMBTRAIL_KEY` (Next), `VITE_CRUMBTRAIL_KEY` (Vite /

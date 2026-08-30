@@ -1285,26 +1285,38 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
 
     expect(plan.kind).toBe("rewrite");
     expect(plan.targetPath).toBe(p("Procfile"));
-    expect(plan.content).toContain("OTEL_SERVICE_NAME='orders-api'");
-    expect(plan.content).toContain(`OTEL_EXPORTER_OTLP_ENDPOINT='${ENDPOINT}'`);
     expect(plan.content).toContain(
-      'OTEL_EXPORTER_OTLP_HEADERS="X-Crumbtrail-Auth=${CRUMBTRAIL_KEY}"',
+      "python crumbtrail_otel.py gunicorn app:app",
     );
-    expect(plan.content).toContain("opentelemetry-instrument gunicorn app:app");
     expect(plan.keyEnvVar).toBe("CRUMBTRAIL_KEY");
-    expect(plan.extraEdits).toEqual([
-      expect.objectContaining({
-        path: p("requirements.txt"),
-        mode: "update",
-        content: expect.stringContaining("opentelemetry-distro"),
-      }),
-    ]);
-    expect(plan.extraEdits?.[0]?.content).toContain(
-      "opentelemetry-exporter-otlp-proto-http",
+    expect(plan.extraEdits).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: p("requirements.txt"),
+          mode: "update",
+          content: expect.stringContaining("opentelemetry-distro"),
+        }),
+        expect.objectContaining({
+          path: p("crumbtrail_otel.py"),
+          mode: "create",
+          content: expect.stringContaining("load_dotenv(override=False)"),
+        }),
+      ]),
     );
-    expect(plan.extraEdits?.[0]?.content).toContain(
-      "opentelemetry-instrumentation-fastapi",
+    const requirements = plan.extraEdits?.find(
+      (edit) => edit.path === p("requirements.txt"),
+    )?.content;
+    const helper = plan.extraEdits?.find(
+      (edit) => edit.path === p("crumbtrail_otel.py"),
+    )?.content;
+    expect(requirements).toContain("python-dotenv");
+    expect(requirements).toContain("opentelemetry-exporter-otlp-proto-http");
+    expect(requirements).toContain("opentelemetry-instrumentation-fastapi");
+    expect(helper).toContain(
+      `os.environ.setdefault("OTEL_EXPORTER_OTLP_ENDPOINT", "${ENDPOINT}")`,
     );
+    expect(helper).toContain('f"X-Crumbtrail-Auth={key}"');
+    expect(helper).toContain('os.execvp("opentelemetry-instrument"');
   });
 
   it("adds Celery instrumentation when the Python service declares Celery", () => {
@@ -1324,7 +1336,7 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
 
     expect(plan.content).toContain("web: ");
     expect(plan.content).toContain("worker: ");
-    expect(plan.content?.match(/opentelemetry-instrument/g)).toHaveLength(2);
+    expect(plan.content?.match(/python crumbtrail_otel\.py/g)).toHaveLength(2);
     expect(plan.extraEdits?.[0]?.content).toContain(
       "opentelemetry-instrumentation-django",
     );
@@ -1334,17 +1346,22 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
   });
 
   it("does not rewrite an already configured Python service", () => {
-    const command = [
-      "web:",
-      "OTEL_SERVICE_NAME='orders-api'",
-      `OTEL_EXPORTER_OTLP_ENDPOINT='${ENDPOINT}'`,
-      "OTEL_EXPORTER_OTLP_PROTOCOL='http/protobuf'",
-      'OTEL_EXPORTER_OTLP_HEADERS="X-Crumbtrail-Auth=${CRUMBTRAIL_KEY}"',
-      "OTEL_TRACES_EXPORTER='otlp'",
-      "OTEL_METRICS_EXPORTER='none'",
-      "OTEL_LOGS_EXPORTER='none'",
-      "opentelemetry-instrument gunicorn app:app",
-    ].join(" ");
+    const first = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "otlp",
+        endpoint: ENDPOINT,
+        stack: "fastapi",
+        serviceName: "orders-api",
+      },
+      fakeInjectIO({
+        [p("requirements.txt")]: "fastapi\n",
+        [p("Procfile")]: "web: gunicorn app:app\n",
+      }),
+    );
+    const generated = Object.fromEntries(
+      (first.extraEdits ?? []).map((edit) => [edit.path, edit.content]),
+    );
     const plan = buildPlan(
       {
         cwd: CWD,
@@ -1354,14 +1371,8 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
         serviceName: "orders-api",
       },
       fakeInjectIO({
-        [p("requirements.txt")]: [
-          "fastapi",
-          "opentelemetry-distro",
-          "opentelemetry-exporter-otlp-proto-http",
-          "opentelemetry-instrumentation-fastapi",
-          "",
-        ].join("\n"),
-        [p("Procfile")]: `${command}\n`,
+        ...generated,
+        [p("Procfile")]: first.content as string,
       }),
     );
 
