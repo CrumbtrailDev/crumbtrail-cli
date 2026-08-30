@@ -13,8 +13,8 @@ them require it.
 | Package                                            | Description                                                                                                                                                                                                               |
 | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`crumbtrail`](packages/cli)                       | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. Also the detection and injection-planning library the hosted product imports, with install recipes and agent prompts on the `/install` subpath. |
-| [`crumbtrail-core`](packages/core)                 | Framework-agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. React bindings on the `/react` subpath, Tauri bindings on `/tauri`.                                                  |
-| [`crumbtrail-node`](packages/node)                 | Node.js server: session store, backend capture, the local dashboard.                                                                                                                                                      |
+| [`crumbtrail-core`](packages/core)                 | Framework agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. React bindings on `/react`, Tauri bindings on `/tauri`, and Fetch serverless bindings on `/serverless`.              |
+| [`crumbtrail-node`](packages/node)                 | Node.js backend capture with AWS Lambda, Vercel Node, and Netlify Node serverless adapters.                                                                                                                               |
 | [`crumbtrail-react-native`](packages/react-native) | React Native and Expo bindings. Its own package because its native peer dependencies must not reach a web bundle.                                                                                                         |
 | [`crumbtrail-capacitor`](packages/capacitor)       | Capacitor and Ionic bindings: adds device, app lifecycle, connectivity and deep link context to the web capture already running in the WebView.                                                                           |
 
@@ -45,6 +45,11 @@ setup wizard will not wire an app against a package it cannot resolve.
 ```bash
 npx crumbtrail
 ```
+
+For serverless HTTP functions, select the adapter for the function runtime in
+[Capture serverless HTTP functions](docs/integrations/serverless-functions.md).
+The wizard prints a guided plan for these runtimes and does not change the
+project.
 
 Needs Node 22.15 or newer. On an older Node the wizard stops and says so
 before it reads or writes anything in your repo.

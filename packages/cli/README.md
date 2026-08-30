@@ -31,6 +31,12 @@ shows you what it found, and wires the ones you pick. The root package is in
 that list when it is itself a runnable app, which is the common layout of an API
 at the repo root with the web app as a workspace under it.
 
+Serverless HTTP functions use guided setup because the runtime and export shape
+must be chosen per function. The wizard prints a copyable plan, requests no
+ingest key, installs no packages, changes no files, and does not wait for
+traffic. Choose the adapter in
+[Capture serverless HTTP functions](../../docs/integrations/serverless-functions.md).
+
 ## Usage
 
 ```
