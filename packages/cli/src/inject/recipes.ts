@@ -1716,6 +1716,70 @@ function planOtlp(input: BuildPlanInput): Plan {
   };
 }
 
+function planCloudflareWorkers(input: BuildPlanInput, io: InjectIO): Plan {
+  const endpoint = input.endpoint.replace(/\/$/, "");
+  const usesToml = io.exists(path.join(input.cwd, "wrangler.toml"));
+  const config = usesToml
+    ? [
+        "Then add this to wrangler.toml and redeploy:",
+        "[observability.traces]",
+        "enabled = true",
+        'destinations = ["crumbtrail-traces"]',
+        "persist = false",
+        "",
+        "[observability.logs]",
+        "enabled = true",
+        'destinations = ["crumbtrail-logs"]',
+        "persist = false",
+      ]
+    : [
+        "Then add this to wrangler.jsonc and redeploy:",
+        "{",
+        '  "observability": {',
+        '    "traces": {',
+        '      "enabled": true,',
+        '      "destinations": ["crumbtrail-traces"],',
+        '      "persist": false',
+        "    },",
+        '    "logs": {',
+        '      "enabled": true,',
+        '      "destinations": ["crumbtrail-logs"],',
+        '      "persist": false',
+        "    }",
+        "  }",
+        "}",
+      ];
+  const snippet = [
+    "Cloudflare dashboard > Workers Observability > Destinations:",
+    `1. Add a traces destination named crumbtrail-traces with endpoint ${endpoint}/v1/traces.`,
+    `2. Add a logs destination named crumbtrail-logs with endpoint ${endpoint}/v1/logs.`,
+    `3. Add the custom header X-Crumbtrail-Auth: ${KEY_PLACEHOLDER} to both destinations.`,
+    "",
+    ...config,
+    "",
+    `Keep the Worker name stable${input.serviceName ? ` and use ${input.serviceName} as the Crumbtrail application name` : " so Cloudflare's service.name stays attributable"}.`,
+  ].join("\n");
+
+  return {
+    recipe: input.recipe,
+    kind: "otlp-guidance",
+    targetPath: null,
+    content: null,
+    snippet,
+    agentPrompt: [
+      "Configure this Cloudflare Worker to export its native OpenTelemetry traces and logs to Crumbtrail.",
+      "Do not install crumbtrail-node. The Workers runtime does not use node:http.",
+      "Follow this exact setup:",
+      snippet,
+      "Verify the Worker deploys, then send a request and confirm the destination reports a successful delivery.",
+    ].join("\n"),
+    warnings: [
+      "Cloudflare OpenTelemetry export requires a Workers Paid plan or contract.",
+      "Cloudflare Workers does not export metrics through OpenTelemetry yet. This setup covers traces and logs.",
+    ],
+  };
+}
+
 // --- dispatcher --------------------------------------------------------------
 
 /**
@@ -2027,6 +2091,8 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
     );
   }
   switch (input.recipe) {
+    case "cloudflare-workers":
+      return planCloudflareWorkers(input, io);
     case "tauri":
       return planTauri(input, io);
     case "capacitor":

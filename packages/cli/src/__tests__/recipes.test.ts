@@ -1269,6 +1269,50 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
   });
 });
 
+describe("buildPlan — Cloudflare Workers native OTLP export", () => {
+  it("uses Workers observability instead of the Node SDK", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "cloudflare-workers",
+        endpoint: ENDPOINT,
+        serviceName: "edge-api",
+      },
+      fakeInjectIO({}),
+    );
+
+    expect(plan.kind).toBe("otlp-guidance");
+    expect(plan.targetPath).toBeNull();
+    expect(plan.content).toBeNull();
+    expect(plan.snippet).toContain(`${ENDPOINT}/v1/traces`);
+    expect(plan.snippet).toContain(`${ENDPOINT}/v1/logs`);
+    expect(plan.snippet).toContain("X-Crumbtrail-Auth");
+    expect(plan.snippet).toContain("crumbtrail-traces");
+    expect(plan.snippet).toContain("crumbtrail-logs");
+    expect(plan.snippet).toContain("wrangler.jsonc");
+    expect(plan.snippet).not.toContain("crumbtrail-node");
+    expect(plan.warnings.join("\n")).toContain("Workers Paid");
+    expect(plan.warnings.join("\n")).toContain("metrics");
+    expect(plan.keyEnvVar).toBeUndefined();
+  });
+
+  it("prints TOML configuration for a wrangler.toml project", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "cloudflare-workers",
+        endpoint: ENDPOINT,
+      },
+      fakeInjectIO({ [p("wrangler.toml")]: 'name = "edge-api"\n' }),
+    );
+
+    expect(plan.snippet).toContain("Then add this to wrangler.toml");
+    expect(plan.snippet).toContain("[observability.traces]");
+    expect(plan.snippet).toContain('destinations = ["crumbtrail-traces"]');
+    expect(plan.snippet).not.toContain('"observability":');
+  });
+});
+
 describe("buildPlan — Express middleware wiring", () => {
   const ESM_ENTRY = [
     'import express from "express";',

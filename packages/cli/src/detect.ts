@@ -51,6 +51,7 @@ export type Recipe =
   // Flutter. The one recipe with no JavaScript anywhere in it: the project is a
   // pubspec, the SDK is a pub package, and the entry is Dart.
   | "flutter"
+  | "cloudflare-workers"
   | "nestjs"
   | "express"
   | "hono"
@@ -1060,6 +1061,17 @@ interface RecipeMatch {
 const RECIPE_MATCHERS: ReadonlyArray<
   readonly [Recipe, (ctx: MatchContext) => Omit<RecipeMatch, "recipe"> | null]
 > = [
+  [
+    "cloudflare-workers",
+    ({ root, reasons, reader }) => {
+      const config = ["wrangler.jsonc", "wrangler.json", "wrangler.toml"].find(
+        (name) => reader.isFile(path.join(root, name)),
+      );
+      if (!config) return null;
+      reasons.push(`found ${config} (Cloudflare Workers)`);
+      return { entryFile: null, nextVersion: null };
+    },
+  ],
   [
     // Ordered FIRST, ahead of every frontend-framework matcher. A Tauri app's
     // frontend framework is incidental — a Tauri+Vite or Tauri+SvelteKit app
