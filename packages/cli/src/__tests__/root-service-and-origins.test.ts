@@ -221,6 +221,24 @@ describe("backend origin resolution", () => {
     expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(8765);
   });
 
+  it("follows asinIQ's validated resolver through its listener alias", () => {
+    repo = makeRootApiRepo({
+      "api/src/index.ts": [
+        "export function resolvePort(env = process.env) {",
+        "  const raw = (env.PORT ?? '').trim()",
+        "  const parsed = Number.parseInt(raw, 10)",
+        "  return /^[+-]?\\d+$/.test(raw) && Number.isInteger(parsed) && parsed > 0 ? parsed : 8765",
+        "}",
+        "if (!process.env.VITEST) {",
+        "  const port = resolvePort()",
+        "  const server = serve({ fetch: createApp().fetch, port }, (info) => log(info))",
+        "}",
+      ].join("\n"),
+    });
+    const entry = path.join(repo, "api", "src", "index.ts");
+    expect(resolveServicePort(repo, entry, localFsReader(repo))).toBe(8765);
+  });
+
   it("does not read a listener inside an uncalled function", () => {
     repo = makeRootApiRepo({
       "api/src/index.ts": [

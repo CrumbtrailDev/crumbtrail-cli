@@ -194,9 +194,15 @@ function validatedPortFallback(source: string): number | null {
   const program = parseProgram(source);
   if (!program) return null;
   const resolvers = new Map<string, any>();
-  for (const statement of program.body as any[])
-    if (statement.type === "FunctionDeclaration" && statement.id)
-      resolvers.set(statement.id.name, statement);
+  for (const statement of program.body as any[]) {
+    const declaration =
+      statement.type === "ExportNamedDeclaration" ||
+      statement.type === "ExportDefaultDeclaration"
+        ? statement.declaration
+        : statement;
+    if (declaration?.type === "FunctionDeclaration" && declaration.id)
+      resolvers.set(declaration.id.name, declaration);
+  }
   const selected = new Set<any>();
   const visit = (
     node: any,
