@@ -131,6 +131,10 @@ export type { AutoFlagOptions, AutoFlagController } from "./auto-flag";
 export {
   errorDetector,
   requestFailureDetector,
+  caughtErrorDetector,
+  responseBodyErrorDetector,
+  streamFailureDetector,
+  workerErrorDetector,
   errorSignature,
   rageClickDetector,
   retryStormDetector,

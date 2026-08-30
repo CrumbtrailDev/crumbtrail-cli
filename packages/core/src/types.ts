@@ -846,6 +846,22 @@ export interface CrumbtrailConfig {
   autoFlagOnRequest5xx: boolean;
   /** Enable automatic capture when a browser-standard rendered validation error appears. */
   autoFlagOnRenderedError: boolean;
+  /**
+   * Enable automatic capture when the application logs a caught error.
+   *
+   * The widest of the reactive triggers and the only one that reads console output. A failure the
+   * application handled itself reaches no other detector, so without this a well built application
+   * can fail all day and capture nothing. Narrowed to error-level console events carrying a stack
+   * whose first located frame is application code, which excludes framework warnings, dependency
+   * chatter and the SDK's own output. See `caughtErrorDetector`.
+   */
+  autoFlagOnCaughtError: boolean;
+  /** Enable automatic capture when a 2xx or 3xx response body reports an application failure. */
+  autoFlagOnResponseBodyError: boolean;
+  /** Enable automatic capture when a WebSocket or server-sent stream errors or ends early. */
+  autoFlagOnStreamFailure: boolean;
+  /** Enable automatic capture when a Web Worker throws. */
+  autoFlagOnWorkerError: boolean;
   /** Allow app code and the widget to call `flag()` as an explicit beacon. */
   explicitBeacon: boolean;
   /** Keep the server side pull policy available to heartbeat integrations. */
@@ -1010,6 +1026,10 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   autoFlagOnUnhandledRejection: true,
   autoFlagOnRequest5xx: true,
   autoFlagOnRenderedError: true,
+  autoFlagOnCaughtError: true,
+  autoFlagOnResponseBodyError: true,
+  autoFlagOnStreamFailure: true,
+  autoFlagOnWorkerError: true,
   explicitBeacon: true,
   serverSidePull: false,
   autoFlagDebounceMs: 2000,

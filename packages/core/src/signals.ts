@@ -382,3 +382,216 @@ export function abandonedFlowDetector(
     },
   };
 }
+
+/**
+ * Frames that belong to somebody else. A caught error is only worth a report when the throw site
+ * is the application's own code: a library logging at error level for a condition it has already
+ * handled is not a defect in the page, and the SDK's own output is not a defect at all.
+ */
+const FOREIGN_FRAME_RE =
+  /(?:\/|^)(?:node_modules|bower_components)\/|(?:^|[/\\])crumbtrail[^/\\]*\.(?:js|mjs|cjs)|\bchrome-extension:|\bmoz-extension:|\bsafari-extension:/i;
+
+/** A frame with no location at all — `at <anonymous>`, `at Object.<anonymous>`, a bare native line. */
+const LOCATIONLESS_FRAME_RE = /\((?:<anonymous>|native)\)|^\s*at\s*<anonymous>/i;
+
+/**
+ * The first stack frame that names a file, or `undefined` when the stack names none.
+ *
+ * The console collector captures the stack relative to the application's own `console.error` call
+ * rather than to the collector standing in front of it, so frame one is genuinely the caller.
+ */
+function firstLocatedFrame(stack: string): string | undefined {
+  for (const line of stack.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.startsWith("at ")) continue;
+    if (LOCATIONLESS_FRAME_RE.test(trimmed)) continue;
+    return trimmed;
+  }
+  return undefined;
+}
+
+/**
+ * Reactive detector for a failure the application handled itself.
+ *
+ * This is the largest blind spot in capture, and the only one that needed a decision rather than a
+ * function. A mature application catches nearly everything — a `try/catch`, a `.catch()`, its own
+ * error boundary — and a handled failure reaches no `window.onerror`, no `unhandledrejection`, and
+ * no other detector. The only trace it leaves is the `console.error` the developer wrote by hand.
+ *
+ * Reading that widens capture from "something escaped" to "something was written down", so the rule
+ * is deliberately narrow. It fires only on an error-level console event that carries a stack whose
+ * first located frame is application code. A React development warning, a third party deprecation
+ * notice, and the SDK's own output all fail one of those three tests. What it still gets wrong: an
+ * application that logs a handled, expected condition at error level with a real stack files a
+ * report, and nothing in the event distinguishes that from a genuine caught failure. The debounce,
+ * the per-window dedup and the per-session cap bound the cost, and the trigger is switchable.
+ */
+export function caughtErrorDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "con") return null;
+      if (event.d.lv !== "err") return null;
+      const stack = typeof event.d.stk === "string" ? event.d.stk : "";
+      if (!stack) return null;
+      const frame = firstLocatedFrame(stack);
+      if (!frame || FOREIGN_FRAME_RE.test(frame)) return null;
+
+      const args = Array.isArray(event.d.args) ? event.d.args : [];
+      const msg = args.find((a): a is string => typeof a === "string" && !!a);
+      return {
+        tag: "auto:caught-error",
+        key: `caught:${hashString(`${msg ?? ""}|${frame}`)}`,
+        reason: msg
+          ? `Auto-captured after the application logged a caught error: ${msg}`
+          : "Auto-captured after the application logged a caught error",
+      };
+    },
+  };
+}
+
+/**
+ * Reactive detector for a failing response that arrived as a 200.
+ *
+ * Both network detectors read `d.st` and nothing else, so a transport-level success carrying an
+ * application-level failure was a success to every one of them. GraphQL is the common case — every
+ * operation shares one URL and one status code, and the failure lives in an `errors` array — but a
+ * REST body with an explicit `ok: false` is the same shape. The redaction policy keeps JSON keys
+ * and short enum-like values, so both survive into `d.body` whatever it did to the free text
+ * around them.
+ *
+ * Only an explicit failure counts. A field merely NAMED `error` holding null, an empty array, or
+ * `false` is a body reporting success in a schema that has an error slot, which most do.
+ */
+/** The only three keys `readBodyFailure` can match on. Used to skip the parse for everything else. */
+const FAILURE_KEY_RE = /"(?:errors|ok|success)"\s*:/;
+
+export function responseBodyErrorDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "net.res") return null;
+      // A 4xx or 5xx already belongs to `requestFailureDetector`; flagging it here would raise a
+      // second signal for one response and spend a second entry in the dedup set.
+      const status = typeof event.d.st === "number" ? event.d.st : 0;
+      if (status >= 400) return null;
+      const body = typeof event.d.body === "string" ? event.d.body : "";
+      // Cheap reject before the parse. Every successful JSON response on the page passes through
+      // here, and `JSON.parse` on all of them to find the few that carry a failure is a cost paid
+      // on the hot path for nothing. A body with none of these three keys cannot match below.
+      if (!body || !FAILURE_KEY_RE.test(body)) return null;
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        return null;
+      }
+      const failure = readBodyFailure(parsed);
+      if (!failure) return null;
+
+      const requestId = typeof event.d.id === "number" ? event.d.id : "unknown";
+      return {
+        tag: "auto:response-body-error",
+        key: `body-error:${requestId}:${failure}`,
+        reason: `Auto-captured after a ${status} response carried ${failure}`,
+      };
+    },
+  };
+}
+
+/** Batched GraphQL responses are an array of results; a failure in any one of them counts. */
+function readBodyFailure(parsed: unknown): string | undefined {
+  if (Array.isArray(parsed)) {
+    for (const entry of parsed) {
+      const found = readBodyFailure(entry);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const record = parsed as Record<string, unknown>;
+  const errors = record.errors;
+  if (Array.isArray(errors) && errors.length > 0)
+    return errors.length === 1 ? "1 error" : `${errors.length} errors`;
+  if (record.ok === false) return "ok: false";
+  if (record.success === false) return "success: false";
+  return undefined;
+}
+
+/** Close codes that end a socket the way it was meant to end. Anything else ended it early. */
+const CLEAN_CLOSE_CODES = new Set([1000, 1001, 1005]);
+
+/**
+ * Reactive detector for a socket or server-sent stream that failed.
+ *
+ * Both transports report their lifecycle in full and no detector read either kind, so an
+ * application whose state arrives over a socket had almost no network coverage: its requests are
+ * not `fetch` calls, so retry storms, slow responses and failing statuses all describe traffic it
+ * does not generate. A socket erroring or closing mid-conversation is that application's equivalent
+ * of a 500, and it is the event that leaves the page showing a stale price or an order that never
+ * advanced.
+ *
+ * A clean close is not a failure — most sockets end that way on navigation.
+ */
+export function streamFailureDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "net.ws" && event.k !== "net.sse") return null;
+      const op = typeof event.d.op === "string" ? event.d.op : "";
+      const url = typeof event.d.url === "string" ? event.d.url : "unknown";
+      const kind = event.k === "net.ws" ? "socket" : "stream";
+
+      if (op === "error") {
+        return {
+          tag: "auto:stream-failure",
+          key: `stream:${event.k}:error:${url}`,
+          reason: `Auto-captured after the ${kind} to ${url} errored`,
+        };
+      }
+      // `net.sse` has no close code, so an SSE close is indistinguishable from an ordinary
+      // teardown and is deliberately not a signal. Only a socket can say it ended early.
+      if (event.k === "net.ws" && op === "close") {
+        const code = typeof event.d.code === "number" ? event.d.code : undefined;
+        const clean =
+          typeof event.d.clean === "boolean" ? event.d.clean : undefined;
+        const early =
+          clean === false || (code !== undefined && !CLEAN_CLOSE_CODES.has(code));
+        if (!early) return null;
+        return {
+          tag: "auto:stream-failure",
+          key: `stream:close:${url}:${code ?? "unknown"}`,
+          reason: `Auto-captured after the socket to ${url} closed early${
+            code !== undefined ? ` with code ${code}` : ""
+          }`,
+        };
+      }
+      return null;
+    },
+  };
+}
+
+/**
+ * Reactive detector for a Web Worker that threw.
+ *
+ * The worker collector's own comment says the page's error handlers never see these, so this event
+ * is the only record a worker crash leaves anywhere — and nothing read it. An application that
+ * moved its parsing, its crypto or its sync loop off the main thread could lose all of it and every
+ * detector would report a healthy session.
+ */
+export function workerErrorDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "worker.msg") return null;
+      if (event.d.op !== "error") return null;
+      const script = typeof event.d.script === "string" ? event.d.script : "a worker";
+      const msg = typeof event.d.msg === "string" ? event.d.msg : undefined;
+      const id = typeof event.d.id === "number" ? event.d.id : "unknown";
+      return {
+        tag: "auto:worker-error",
+        key: `worker:${id}:${hashString(`${script}|${msg ?? ""}`)}`,
+        reason: msg
+          ? `Auto-captured after ${script} threw: ${msg}`
+          : `Auto-captured after ${script} threw`,
+      };
+    },
+  };
+}
