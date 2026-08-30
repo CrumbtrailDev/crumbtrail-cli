@@ -260,6 +260,15 @@ function deploymentStartsScript(
     include: Pattern[] | null;
     exclude: Pattern[] | null;
   };
+  type TsBuildInvocation = {
+    configPath: string;
+    overrides: Partial<
+      Pick<
+        TsBuildConfig,
+        "rootDir" | "outDir" | "noEmit" | "emitDeclarationOnly"
+      >
+    >;
+  };
 
   const parseJsonc = (text: string): JsonObject | null => {
     let clean = "";
@@ -423,12 +432,71 @@ function deploymentStartsScript(
     );
   };
 
-  const buildConfigPaths = (): string[] => {
+  const tscInvocation = (args: string): TsBuildInvocation | null => {
+    const tokens = (args.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map(
+      (token) => token.replace(/^["']|["']$/g, ""),
+    );
+    let project = "tsconfig.json";
+    const overrides: TsBuildInvocation["overrides"] = {};
+    const booleanOverride = (index: number): [boolean, number] => {
+      const next = tokens[index + 1]?.toLowerCase();
+      return next === "true" || next === "false"
+        ? [next === "true", index + 1]
+        : [true, index];
+    };
+    for (let index = 0; index < tokens.length; index++) {
+      const token = tokens[index];
+      const lower = token.toLowerCase();
+      const valueAfter = (name: string): string | null | undefined => {
+        if (lower === name.toLowerCase()) return tokens[++index] ?? null;
+        return undefined;
+      };
+      const shortProject = valueAfter("-p");
+      const projectValue =
+        shortProject === undefined ? valueAfter("--project") : shortProject;
+      if (projectValue !== undefined) {
+        if (projectValue === null) return null;
+        project = projectValue;
+        continue;
+      }
+      const rootDir = valueAfter("--rootDir");
+      if (rootDir !== undefined) {
+        if (rootDir === null) return null;
+        overrides.rootDir = path.resolve(cwd, rootDir);
+        continue;
+      }
+      const outDir = valueAfter("--outDir");
+      if (outDir !== undefined) {
+        if (outDir === null) return null;
+        overrides.outDir = path.resolve(cwd, outDir);
+        continue;
+      }
+      if (lower === "--noemit") {
+        const [value, consumed] = booleanOverride(index);
+        overrides.noEmit = value;
+        index = consumed;
+        continue;
+      }
+      if (lower === "--emitdeclarationonly") {
+        const [value, consumed] = booleanOverride(index);
+        overrides.emitDeclarationOnly = value;
+        index = consumed;
+        continue;
+      }
+      // An unmodelled argument can change which files TypeScript emits or
+      // where it writes them. Refuse the mapping instead of silently trusting
+      // compiler settings that are not effective for this invocation.
+      return null;
+    }
+    return { configPath: path.resolve(cwd, project), overrides };
+  };
+
+  const buildConfigPaths = (): TsBuildInvocation[] => {
     const scripts = readScripts(cwd, io);
     if (!scripts?.build) return [];
     const pending = ["build"];
     const visited = new Set<string>();
-    const configs = new Set<string>();
+    const configs = new Map<string, TsBuildInvocation>();
     while (pending.length > 0) {
       const name = pending.pop()!;
       if (visited.has(name)) continue;
@@ -443,14 +511,15 @@ function deploymentStartsScript(
       for (const match of script.matchAll(
         /(?:^|\s)(?:npx\s+)?tsc(?:\s|$)([^;&|]*)/g,
       )) {
-        const args = match[1] ?? "";
-        const project = /(?:^|\s)(?:-p|--project)(?:\s+|=)([^\s]+)/.exec(
-          args,
-        )?.[1];
-        configs.add(path.resolve(cwd, project ?? "tsconfig.json"));
+        const invocation = tscInvocation(match[1] ?? "");
+        if (!invocation) continue;
+        configs.set(
+          JSON.stringify([invocation.configPath, invocation.overrides]),
+          invocation,
+        );
       }
     }
-    return [...configs];
+    return [...configs.values()];
   };
 
   const runtimeProgram = (tokens: string[]): string | null => {
@@ -497,9 +566,11 @@ function deploymentStartsScript(
             ? ".js"
             : sourceExt;
     const sourcePath = path.resolve(entry.path);
-    for (const configPath of buildConfigPaths()) {
-      const config = readTsBuildConfig(configPath);
-      if (!config || !configEmits(config, sourcePath)) continue;
+    for (const invocation of buildConfigPaths()) {
+      const declared = readTsBuildConfig(invocation.configPath);
+      if (!declared) continue;
+      const config = { ...declared, ...invocation.overrides };
+      if (!configEmits(config, sourcePath)) continue;
       const sourceRel = path.relative(config.rootDir!, sourcePath);
       if (
         sourceRel === "" ||

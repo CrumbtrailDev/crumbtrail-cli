@@ -483,6 +483,81 @@ describe("the other processes the package starts", () => {
       },
     ],
     [
+      "a command line noEmit override",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.json --noEmit",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { rootDir: ".", outDir: "dist" },
+            include: ["api/src/**/*.ts"],
+          },
+        },
+      },
+    ],
+    [
+      "a command line emitDeclarationOnly override",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.json --emitDeclarationOnly",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { rootDir: ".", outDir: "dist" },
+            include: ["api/src/**/*.ts"],
+          },
+        },
+      },
+    ],
+    [
+      "a command line outDir override",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.json --outDir build",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { rootDir: ".", outDir: "dist" },
+            include: ["api/src/**/*.ts"],
+          },
+        },
+      },
+    ],
+    [
+      "a command line rootDir override",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.json --rootDir api",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { rootDir: ".", outDir: "dist" },
+            include: ["api/src/**/*.ts"],
+          },
+        },
+      },
+    ],
+    [
+      "an unsupported command line output override",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.json --outFile dist/api/src/worker.js",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { rootDir: ".", outDir: "dist" },
+            include: ["api/src/**/*.ts"],
+          },
+        },
+      },
+    ],
+    [
       "an inferred rootDir whose emitted path is ambiguous",
       {
         scripts: {
@@ -574,6 +649,72 @@ describe("the other processes the package starts", () => {
         (edit) => edit.path === p("api", "src", "worker.ts"),
       ),
     ).toBeFalsy();
+  });
+
+  it("maps compiled output through explicit rootDir and outDir command overrides", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("api", "src", "index.ts"),
+        serviceName: "marginary",
+      },
+      fakeInjectIO({
+        [p("package.json")]: PKG({
+          build: "tsc -p tsconfig.json --rootDir api --outDir dist/api",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        }),
+        [p("tsconfig.json")]: JSON.stringify({
+          compilerOptions: { rootDir: ".", outDir: "build" },
+          include: ["api/src/**/*.ts"],
+        }),
+        [p("api", "src", "index.ts")]: "app.listen(3000)",
+        [p("api", "src", "worker.ts")]: "await runQueueOnce()",
+        [p("railway.worker.json")]: JSON.stringify({
+          deploy: { startCommand: "node dist/api/src/worker.js" },
+        }),
+      }),
+    );
+
+    expect(
+      plan.extraEdits?.some(
+        (edit) => edit.path === p("api", "src", "worker.ts"),
+      ),
+    ).toBe(true);
+  });
+
+  it("applies an explicit false command line boolean override", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("api", "src", "index.ts"),
+        serviceName: "marginary",
+      },
+      fakeInjectIO({
+        [p("package.json")]: PKG({
+          build: "tsc -p tsconfig.json --noEmit false",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        }),
+        [p("tsconfig.json")]: JSON.stringify({
+          compilerOptions: { rootDir: ".", outDir: "dist", noEmit: true },
+          include: ["api/src/**/*.ts"],
+        }),
+        [p("api", "src", "index.ts")]: "app.listen(3000)",
+        [p("api", "src", "worker.ts")]: "await runQueueOnce()",
+        [p("railway.worker.json")]: JSON.stringify({
+          deploy: { startCommand: "node dist/api/src/worker.js" },
+        }),
+      }),
+    );
+
+    expect(
+      plan.extraEdits?.some(
+        (edit) => edit.path === p("api", "src", "worker.ts"),
+      ),
+    ).toBe(true);
   });
 
   it.each([
