@@ -77,6 +77,8 @@ export interface SendBackendEventOptions {
  */
 export const DEFAULT_BACKEND_INTAKE_RETRIES = 2;
 export const DEFAULT_BACKEND_INTAKE_RETRY_DELAY_MS = 25;
+/** Delay for the exact race where a correlated request beats session start. */
+export const SESSION_START_RACE_RETRY_DELAY_MS = 500;
 
 /**
  * Simultaneous POSTs to the intake. The transport, not the intake, is the limit:
@@ -356,7 +358,7 @@ async function deliver(
       });
       return false;
     }
-    await target.sleep(target.retryDelayMs * attempt);
+    await target.sleep((outcome.retryDelayMs ?? target.retryDelayMs) * attempt);
   }
 
   return false;
@@ -365,6 +367,7 @@ async function deliver(
 interface DeliveryOutcome {
   ok: boolean;
   retryable: boolean;
+  retryDelayMs?: number;
   warning: Omit<BackendIntakeWarning, "attempts">;
 }
 
@@ -393,11 +396,17 @@ async function attemptDelivery(
       // operator guessing at a cause the response body was holding, and the
       // browser SDK had already taught the console line to carry it.
       const reason = await readRefusalReason(response);
+      const sessionStartRace =
+        status === 404 && reason?.trim() === "Session not found";
       return {
         ok: false,
-        // A status is the endpoint's own answer about this payload, so sending
-        // the identical body again cannot change the verdict.
-        retryable: false,
+        // Every endpoint refusal is terminal except the exact session-start
+        // race. A separate browser handshake is creating that row, so this
+        // event becomes valid once the handshake lands.
+        retryable: sessionStartRace,
+        ...(sessionStartRace
+          ? { retryDelayMs: SESSION_START_RACE_RETRY_DELAY_MS }
+          : {}),
         warning: {
           kind: "http-error",
           message:
