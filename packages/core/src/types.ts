@@ -873,8 +873,17 @@ export interface CrumbtrailConfig {
   autoFlagDebounceMs: number;
   // Hard cap on auto-captured reports per session (shared across every auto-flag detector).
   autoFlagMaxPerSession: number;
-  /** Measure behavioral detector signals without letting them open captures. */
-  autoFlagShadowMode: boolean;
+  /**
+   * Trigger names whose detector is measured instead of allowed to capture. A shadow detector
+   * still runs and still raises its signal; the signal is counted by tag and reported on the next
+   * report the session captures for another reason, and it never opens a capture of its own.
+   *
+   * Per detector on purpose. Measuring one new candidate must not blind the triggers that already
+   * work, so this is a list rather than a mode. Names match the dashboard's own trigger vocabulary
+   * (`rageClick`, `wrongNumber`, …), except the uncaught error and unhandled rejection pair, which
+   * one detector serves under the single name `error`.
+   */
+  autoFlagShadowTriggers: string[];
 
   // Precognitive auto-flag: snapshot the ring buffer on behavioral leading indicators of a silent
   // failure (rage-clicks, retry storms) — before an error throws, or when none ever does. Opt-in.
@@ -1038,7 +1047,7 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   serverSidePull: false,
   autoFlagDebounceMs: 2000,
   autoFlagMaxPerSession: 10,
-  autoFlagShadowMode: false,
+  autoFlagShadowTriggers: [],
 
   autoFlagOnSignals: false,
   autoFlagOnRageClick: true,

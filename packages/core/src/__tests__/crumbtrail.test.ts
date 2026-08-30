@@ -106,7 +106,7 @@ describe("Crumbtrail", () => {
     expect(DEFAULT_CONFIG.autoFlagOnRequest5xx).toBe(true);
     expect(DEFAULT_CONFIG.autoFlagDebounceMs).toBeGreaterThan(0);
     expect(DEFAULT_CONFIG.autoFlagMaxPerSession).toBeGreaterThan(0);
-    expect(DEFAULT_CONFIG.autoFlagShadowMode).toBe(false);
+    expect(DEFAULT_CONFIG.autoFlagShadowTriggers).toEqual([]);
   });
 
   it("mark() emits mark event without throwing", async () => {
@@ -213,7 +213,7 @@ describe("Crumbtrail", () => {
     const logger = Crumbtrail.init({
       transportInstance: mockTransport as any,
       autoFlagOnSignals: true,
-      autoFlagShadowMode: false,
+      autoFlagShadowTriggers: [],
       rageClickThreshold: 4,
       rageClickWindowMs: 1500,
       autoFlagDebounceMs: 2000,
@@ -242,7 +242,8 @@ describe("Crumbtrail", () => {
     const logger = Crumbtrail.init({
       transportInstance: mockTransport as any,
       autoFlagOnError: true,
-      autoFlagShadowMode: true,
+      autoFlagOnSignals: true,
+      autoFlagShadowTriggers: ["rageClick"],
       rageClickThreshold: 4,
       rageClickWindowMs: 1500,
       autoFlagDebounceMs: 10,
@@ -272,13 +273,58 @@ describe("Crumbtrail", () => {
     await logger.stop();
   });
 
+  it("shadows one trigger while the rest keep capturing", async () => {
+    // The reason shadow is a list and not a mode. A single switch routed the whole behavioral
+    // group into shadow, so measuring one candidate silenced rage click, retry storm, slow
+    // response and abandoned flow at the same time. Here rage click is measured and retry storm
+    // must still open a capture of its own.
+    vi.useFakeTimers();
+    const mockTransport = makeMockTransport();
+    const logger = Crumbtrail.init({
+      transportInstance: mockTransport as any,
+      autoFlagOnSignals: true,
+      autoFlagShadowTriggers: ["rageClick"],
+      rageClickThreshold: 4,
+      rageClickWindowMs: 1500,
+      retryStormThreshold: 3,
+      retryStormWindowMs: 5000,
+      autoFlagDebounceMs: 10,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1000,
+    });
+
+    const el = { sig: "btn-checkout" };
+    for (let i = 0; i < 4; i++) {
+      logger.addEvent({ type: "clk", data: { el } });
+    }
+    await vi.advanceTimersByTimeAsync(10);
+    expect(mockTransport.sendBugReport).not.toHaveBeenCalled();
+
+    for (let i = 0; i < 3; i++) {
+      logger.addEvent({
+        type: "net.req",
+        data: { url: "https://api.example.com/orders", method: "POST" },
+      });
+    }
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(mockTransport.sendBugReport).toHaveBeenCalledTimes(1);
+    const report = mockTransport.sendBugReport.mock.calls[0][0];
+    expect(report.tags).toContain("auto:retry-storm");
+    expect(report.shadowSignalCounts).toEqual({ "auto:rage-click": 1 });
+
+    vi.useRealTimers();
+    await logger.stop();
+  });
+
   it("omits shadow counts when no shadow detector fired", async () => {
     vi.useFakeTimers();
     const mockTransport = makeMockTransport();
     const logger = Crumbtrail.init({
       transportInstance: mockTransport as any,
       autoFlagOnError: true,
-      autoFlagShadowMode: true,
+      autoFlagOnSignals: true,
+      autoFlagShadowTriggers: ["rageClick"],
       autoFlagDebounceMs: 10,
       flushIntervalMs: 100_000,
       flushBufferSize: 1000,
