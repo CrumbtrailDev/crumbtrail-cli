@@ -13,6 +13,7 @@
 // is a process it starts.
 
 import path from "node:path";
+import { parse } from "@babel/parser";
 import { isBuildOutputPath } from "../detect";
 import type { InjectIO } from "./io";
 
@@ -24,6 +25,8 @@ export interface ExtraEntry {
   serviceSuffix: string;
   /** The package.json script that named it, for the wizard's summary line. */
   script: string;
+  /** Why setup did not edit this runnable entry. */
+  unwiredReason?: "no-lifecycle-proof" | "edit-limit";
 }
 
 /**
@@ -137,13 +140,22 @@ export const DEPLOY_CONFIG_RE =
 /** Script names that start something and keep it running. */
 function isLongRunningScriptName(name: string): boolean {
   const n = name.toLowerCase();
-  return ["start", "dev", "serve", "worker"].some(
-    (p) => n === p || n.startsWith(`${p}:`),
-  );
+  return [
+    "start",
+    "dev",
+    "serve",
+    "worker",
+    "queue",
+    "consumer",
+    "scheduler",
+    "cron",
+    "listener",
+  ].some((p) => n === p || n.startsWith(`${p}:`));
 }
 
 /** File and directory names that describe a process, not a task. */
-const LONG_RUNNING_NAME_RE = /(worker|server|daemon|consumer|listener)/i;
+const LONG_RUNNING_NAME_RE =
+  /(worker|server|daemon|consumer|listener|queue|scheduler|cron)/i;
 
 /**
  * One shot work: it runs, it finishes, and capture wrapped around it opens an
@@ -151,7 +163,7 @@ const LONG_RUNNING_NAME_RE = /(worker|server|daemon|consumer|listener)/i;
  * with more runnable scripts than slots spends its slots on processes.
  */
 const ONE_SHOT_NAME_RE =
-  /(migrat|seed|bootstrap|backfill|codegen|provision|teardown|reset|fixture|scaffold)/i;
+  /(migrat|seed|bootstrap|backfill|codegen|provision|teardown|reset|fixture|scaffold|drain|reindex|repair|vacuum|prune|cleanup)/i;
 
 /**
  * The deploy manifest at the package root that names this entry file, or null.
@@ -212,20 +224,171 @@ export function longRunningScore(
     const named =
       deployConfigText.includes(rel) ||
       deployConfigText.includes(base) ||
-      new RegExp(String.raw`run\s+${escapeRe(entry.script.toLowerCase())}\b`).test(
-        deployConfigText,
-      );
+      new RegExp(
+        String.raw`run\s+${escapeRe(entry.script.toLowerCase())}\b`,
+      ).test(deployConfigText);
     if (named) score += 3;
   }
-  if (isLongRunningScriptName(entry.script)) score += 2;
+  if (isLongRunningScriptName(entry.script)) score += 3;
   if (LONG_RUNNING_NAME_RE.test(base) || LONG_RUNNING_NAME_RE.test(dir)) {
     score += 2;
   }
   if (ONE_SHOT_NAME_RE.test(base) || ONE_SHOT_NAME_RE.test(entry.script)) {
-    score -= 3;
+    score -= 5;
   }
   if (/(^|\/)scripts\//.test(rel)) score -= 2;
   return score;
+}
+
+/** A deployment command that explicitly starts this package script. */
+function deploymentStartsScript(
+  cwd: string,
+  io: InjectIO,
+  entry: ExtraEntry,
+): boolean {
+  if (!io.listFiles) return false;
+  const starts = (command: unknown): boolean => {
+    let tokens: string[];
+    if (
+      Array.isArray(command) &&
+      command.every((item) => typeof item === "string")
+    )
+      tokens = command;
+    else if (typeof command === "string")
+      tokens = (command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map(
+        (token) => token.replace(/^["']|["']$/g, ""),
+      );
+    else return false;
+    if (
+      /^(?:sh|bash|zsh)$/i.test(tokens[0] ?? "") &&
+      tokens[1] === "-c" &&
+      typeof tokens[2] === "string"
+    )
+      return starts(tokens[2]);
+    if (tokens[0] === "exec") return starts(tokens.slice(1));
+    const token = tokens[0];
+    if (!/^(?:npm|pnpm|yarn|bun)$/i.test(token ?? "")) return false;
+    const next = tokens[1];
+      if (
+        next === entry.script &&
+        (!/^npm$/i.test(token) || entry.script === "start")
+      )
+        return true;
+    return next?.toLowerCase() === "run" && tokens[2] === entry.script;
+  };
+  for (const name of io.listFiles(cwd)) {
+    const raw = io.readFile(path.join(cwd, name));
+    if (!raw) continue;
+    if (/^railway.*\.json$/i.test(name)) {
+      try {
+        const parsed = JSON.parse(raw) as {
+          deploy?: { startCommand?: unknown };
+        };
+        if (
+          typeof parsed.deploy?.startCommand === "string" &&
+          starts(parsed.deploy.startCommand)
+        )
+          return true;
+      } catch {
+        continue;
+      }
+    } else if (/^railway.*\.toml$/i.test(name)) {
+      if (starts(raw.match(/^\s*startCommand\s*=\s*["']([^"']+)["']/m)?.[1]))
+        return true;
+    } else if (/^procfile$/i.test(name)) {
+      if (
+        raw.split(/\r?\n/).some((line) => starts(line.replace(/^[^:]+:/, "")))
+      )
+        return true;
+    } else if (/^(dockerfile|.*\.dockerfile)$/i.test(name)) {
+      if (
+        raw.split(/\r?\n/).some((line) => {
+          const value = line.trim().match(/^(?:CMD|ENTRYPOINT)\s+(.+)$/i)?.[1];
+          if (!value) return false;
+          try {
+            return starts(JSON.parse(value));
+          } catch {
+            return starts(value);
+          }
+        })
+      )
+        return true;
+    } else if (/^docker-compose(?:\..+)?\.ya?ml$/i.test(name)) {
+      const lines = raw.split(/\r?\n/);
+      for (let index = 0; index < lines.length; index++) {
+        const field = /^(\s*)(?:command|entrypoint)\s*:\s*(.*)$/i.exec(
+          lines[index],
+        );
+        if (!field) continue;
+        const value = field[2];
+        if (value) {
+          if (!value.trim().startsWith("[") && starts(value)) return true;
+          try {
+            if (starts(JSON.parse(value.replace(/'/g, '"')))) return true;
+          } catch {
+            const trimmed = value.trim();
+            if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+              const sequence = trimmed
+                .slice(1, -1)
+                .split(",")
+                .map((item) => item.trim().replace(/^["']|["']$/g, ""))
+                .filter(Boolean);
+              if (starts(sequence)) return true;
+            }
+          }
+        }
+        const indent = field[1].length;
+        const sequence: string[] = [];
+        for (let next = index + 1; next < lines.length; next++) {
+          const item = /^(\s*)-\s*["']?([^"'\s]+)["']?\s*$/.exec(
+            lines[next],
+          );
+          if (!item || item[1].length <= indent) break;
+          sequence.push(item[2]);
+        }
+        if (sequence.length > 0 && starts(sequence)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Only executable top-level calls count as source lifecycle evidence. */
+function hasTopLevelPersistentRuntime(source: string): boolean {
+  let program;
+  try {
+    program = parse(source, {
+      sourceType: "unambiguous",
+      plugins: ["typescript", "topLevelAwait", "decorators-legacy"],
+    }).program;
+  } catch {
+    try {
+      program = parse(source, {
+        sourceType: "unambiguous",
+        plugins: ["typescript", "jsx", "topLevelAwait", "decorators-legacy"],
+      }).program;
+    } catch {
+      return false;
+    }
+  }
+  return program.body.some((statement: any) => {
+    if (statement.type === "WhileStatement")
+      return statement.test.type === "BooleanLiteral" && statement.test.value;
+    if (statement.type !== "ExpressionStatement") return false;
+    let expression = statement.expression;
+    if (expression.type === "AwaitExpression") expression = expression.argument;
+    if (expression.type !== "CallExpression") return false;
+    const callee = expression.callee;
+    if (callee.type === "Identifier")
+      return callee.name === "setInterval" || callee.name === "serve";
+    if (callee.type !== "MemberExpression" || callee.computed) return false;
+    if (callee.property.name === "listen") return true;
+    return (
+      callee.property.name === "serve" &&
+      callee.object.type === "Identifier" &&
+      (callee.object.name === "Bun" || callee.object.name === "Deno")
+    );
+  });
 }
 
 function escapeRe(text: string): string {
@@ -289,8 +452,24 @@ export function findExtraBackendEntries(
     if (byScore !== 0) return byScore;
     return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
   });
+  // Names rank proven processes; they do not prove lifecycle. Admission needs
+  // a deployment manifest or a runtime construct which keeps the process alive.
+  const longRunning = sorted.filter((entry) => {
+    if (deploymentStartsScript(cwd, io, entry)) return true;
+    return hasTopLevelPersistentRuntime(io.readFile(entry.path) ?? "");
+  });
   return {
-    entries: sorted.slice(0, MAX_EXTRA_ENTRIES),
-    unwired: sorted.slice(MAX_EXTRA_ENTRIES),
+    entries: longRunning.slice(0, MAX_EXTRA_ENTRIES),
+    unwired: [
+      ...longRunning
+        .slice(MAX_EXTRA_ENTRIES)
+        .map((entry) => ({ ...entry, unwiredReason: "edit-limit" as const })),
+      ...sorted
+        .filter((entry) => !longRunning.includes(entry))
+        .map((entry) => ({
+          ...entry,
+          unwiredReason: "no-lifecycle-proof" as const,
+        })),
+    ],
   };
 }

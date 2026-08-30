@@ -245,11 +245,12 @@ export function nodeInitSnippet(
     `// from ${keyExpr} — set it in your .env (get your key from the`,
     "// Crumbtrail dashboard).",
     ...keyGuardOpen(keyExpr, ""),
+    `  const __crumbtrailKey = ${keyExpr};`,
     '  import("crumbtrail-node")',
     // The token is passed rather than left to the SDK's own default so the
     // snippet reads the framework's variable rather than whatever the SDK
     // happens to fall back to.
-    `    .then(({ autoCapture }) => autoCapture({ endpoint: ${JSON.stringify(endpoint)}, authToken: ${keyExpr}${serviceArg(serviceName, JSON.stringify)} }))`,
+    `    .then(({ autoCapture }) => autoCapture({ endpoint: ${JSON.stringify(endpoint)}, authToken: __crumbtrailKey${serviceArg(serviceName, JSON.stringify)} }))`,
     "    .catch(() => {});",
     "}",
   ].join("\n");
@@ -463,8 +464,9 @@ export function nestInitSnippet(
     `// from ${keyExpr} — set it in your .env (get your key from the`,
     "// Crumbtrail dashboard).",
     ...keyGuardOpen(keyExpr, ""),
+    `  const __crumbtrailKey = ${keyExpr};`,
     "  import('crumbtrail-node')",
-    `    .then(({ autoCapture }) => autoCapture({ endpoint: ${singleQuoted(endpoint)}, authToken: ${keyExpr}${serviceArg(serviceName, singleQuoted)} }))`,
+    `    .then(({ autoCapture }) => autoCapture({ endpoint: ${singleQuoted(endpoint)}, authToken: __crumbtrailKey${serviceArg(serviceName, singleQuoted)} }))`,
     "    .catch(() => {});",
     "}",
   ].join("\n");
@@ -684,7 +686,7 @@ export function staticScriptTagSnippet(options: {
     : " Get one from your Crumbtrail dashboard.";
   return [
     "<!-- Crumbtrail — browser capture (console, network, DOM, errors). -->",
-    `<!-- Replace ${keyLiteral} with your ingest key.${mint} -->`,
+    `<!-- httpAuthToken must contain this project's ingest key.${mint} -->`,
     '<script type="module">',
     `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(options.sdkVersion))};`,
     "",

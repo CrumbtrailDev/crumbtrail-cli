@@ -15,6 +15,7 @@
 // request that had none and sends trace context somewhere it was not wanted.
 
 import path from "node:path";
+import { parse } from "@babel/parser";
 import type { DetectResult, Recipe } from "./detect";
 import type { FileReader } from "./readers/types";
 
@@ -36,8 +37,13 @@ export function isBackendRecipe(recipe: Recipe | null | undefined): boolean {
   return recipe != null && BACKEND_RECIPES.has(recipe);
 }
 
-/** Env files an app's own configuration is read from, most specific first. */
-const ENV_FILES = [".env", ".env.local", ".env.development", ".env.example"];
+/** Env files that may declare an app's local port. */
+const ENV_FILES = [
+  ".env.development.local",
+  ".env.local",
+  ".env.development",
+  ".env",
+];
 
 /** Dev-server / proxy configs that name a backend target outright. */
 const PROXY_CONFIG_FILES = [
@@ -70,17 +76,256 @@ const PROXY_TARGET_RE =
 /** `VITE_API_ORIGIN`, `NEXT_PUBLIC_API_URL`, `PUBLIC_BACKEND_BASE_URL`, … */
 const API_BASE_VAR_RE = /^[A-Z0-9_]*(?:API|BACKEND|SERVER)[A-Z0-9_]*$/;
 
-/** A port a service declares for itself, in an env file or its entry source. */
-const ENV_PORT_RE = /^\s*(?:export\s+)?PORT\s*=\s*["']?(\d{2,5})["']?\s*$/m;
+function parseProgram(source: string): any | null {
+  for (const jsx of [false, true]) {
+    try {
+      return parse(source, {
+        sourceType: "unambiguous",
+        plugins: [
+          "typescript",
+          ...(jsx ? (["jsx"] as const) : []),
+          "decorators-legacy",
+        ],
+      }).program;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
 
-const ENTRY_PORT_RES = [
-  // `port: 3000`, `PORT = 3000`
-  /\bport\s*[:=]\s*(\d{2,5})\b/i,
-  // `app.listen(3000`, `serve({ ... }, 3000`
-  /\.listen\(\s*(\d{2,5})\b/,
-  // `process.env.PORT ?? 3000`, `env.PORT || 3000`
-  /\bPORT\b[^\n]{0,80}?(?:\?\?|\|\|)\s*(\d{2,5})\b/,
-];
+function directServerPort(source: string): number | null {
+  const program = parseProgram(source);
+  if (!program) return null;
+  const found = new Set<number>();
+  const literalFallback = (expression: any): number | null => {
+    if (expression?.type === "NumericLiteral") return Number(expression.value);
+    if (
+      expression?.type === "LogicalExpression" &&
+      (expression.operator === "??" || expression.operator === "||") &&
+      /(?:process\.)?env\.PORT/.test(
+        source.slice(expression.left.start, expression.left.end),
+      ) &&
+      expression.right.type === "NumericLiteral"
+    )
+      return Number(expression.right.value);
+    return null;
+  };
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "CallExpression") {
+      if (
+        node.callee.type === "MemberExpression" &&
+        !node.callee.computed &&
+        node.callee.property.name === "listen" &&
+        node.arguments[0]
+      ) {
+        const value = literalFallback(node.arguments[0]);
+        if (value != null) found.add(value);
+      }
+      if (node.callee.type === "Identifier" && node.callee.name === "serve") {
+        const object = node.arguments.find(
+          (argument: any) => argument.type === "ObjectExpression",
+        );
+        const port = object?.properties.find(
+          (property: any) =>
+            property.type === "ObjectProperty" &&
+            (property.key.name ?? property.key.value) === "port",
+        );
+        if (port?.value) {
+          const value = literalFallback(port.value);
+          if (value != null) found.add(value);
+        }
+      }
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value);
+    }
+  };
+  visit(program);
+  return found.size === 1 ? [...found][0] : found.size > 1 ? Number.NaN : null;
+}
+
+function directLiteralServerPort(source: string): number | null {
+  const program = parseProgram(source);
+  if (!program) return null;
+  const found = new Set<number>();
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "CallExpression") {
+      if (
+        node.callee.type === "MemberExpression" &&
+        !node.callee.computed &&
+        node.callee.property.name === "listen" &&
+        node.arguments[0]?.type === "NumericLiteral"
+      )
+        found.add(Number(node.arguments[0].value));
+      if (node.callee.type === "Identifier" && node.callee.name === "serve") {
+        const object = node.arguments.find(
+          (argument: any) => argument.type === "ObjectExpression",
+        );
+        const port = object?.properties.find(
+          (property: any) =>
+            property.type === "ObjectProperty" &&
+            (property.key.name ?? property.key.value) === "port",
+        );
+        if (port?.value?.type === "NumericLiteral")
+          found.add(Number(port.value.value));
+      }
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value);
+    }
+  };
+  visit(program);
+  return found.size === 1 ? [...found][0] : found.size > 1 ? Number.NaN : null;
+}
+
+/**
+ * Resolve a validated ternary fallback whose value is derived from PORT.
+ * Taint is deliberately local and declaration based: a cache port ternary in
+ * the same entry cannot become the HTTP origin merely because it is nearby.
+ */
+function validatedPortFallback(source: string): number | null {
+  const program = parseProgram(source);
+  if (!program) return null;
+  const resolvers = new Map<string, any>();
+  for (const statement of program.body as any[]) {
+    const declaration =
+      statement.type === "ExportNamedDeclaration" ||
+      statement.type === "ExportDefaultDeclaration"
+        ? statement.declaration
+        : statement;
+    if (declaration?.type === "FunctionDeclaration" && declaration.id)
+      resolvers.set(declaration.id.name, declaration);
+  }
+  const selected = new Set<any>();
+  const visit = (
+    node: any,
+    declarations: ReadonlyMap<string, any> = new Map(),
+  ): void => {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "Program" || node.type === "BlockStatement") {
+      const blockDeclarations = new Map(declarations);
+      for (const statement of node.body as any[]) {
+        if (statement.type === "VariableDeclaration")
+          for (const declaration of statement.declarations)
+            if (declaration.id?.type === "Identifier" && declaration.init)
+              blockDeclarations.set(declaration.id.name, declaration.init);
+        if (statement.type !== "FunctionDeclaration")
+          visit(statement, blockDeclarations);
+      }
+      return;
+    }
+    if (/^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(node.type))
+      return;
+    if (node.type === "CallExpression") {
+      const linked: any[] = [];
+      if (
+        node.callee.type === "MemberExpression" &&
+        !node.callee.computed &&
+        node.callee.property.name === "listen" &&
+        node.arguments[0]
+      )
+        linked.push(node.arguments[0]);
+      if (node.callee.type === "Identifier" && node.callee.name === "serve") {
+        const object = node.arguments.find(
+          (argument: any) => argument.type === "ObjectExpression",
+        );
+        const port = object?.properties.find(
+          (property: any) =>
+            property.type === "ObjectProperty" &&
+            (property.key.name ?? property.key.value) === "port",
+        );
+        if (port) linked.push(port.value);
+      }
+      for (const expression of linked) {
+        let resolved = expression;
+        const seen = new Set<string>();
+        while (
+          resolved?.type === "Identifier" &&
+          declarations.has(resolved.name) &&
+          !seen.has(resolved.name)
+        ) {
+          seen.add(resolved.name);
+          resolved = declarations.get(resolved.name);
+        }
+        if (
+          resolved?.type === "CallExpression" &&
+          resolved.callee.type === "Identifier"
+        ) {
+          const resolver = resolvers.get(resolved.callee.name);
+          if (resolver) selected.add(resolver);
+        }
+      }
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value))
+        value.forEach((item) => visit(item, declarations));
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value, declarations);
+    }
+  };
+  visit(program);
+  const values = new Set<number>();
+  for (const resolver of selected) {
+    const declarations = new Map<string, any>();
+    let decision: any;
+    for (const statement of resolver.body.body) {
+      if (statement.type === "VariableDeclaration") {
+        for (const declaration of statement.declarations)
+          if (declaration.id.type === "Identifier" && declaration.init)
+            declarations.set(declaration.id.name, declaration.init);
+      } else if (
+        statement.type === "ReturnStatement" &&
+        statement.argument?.type === "ConditionalExpression"
+      )
+        decision = statement.argument;
+    }
+    if (!decision || decision.alternate.type !== "NumericLiteral") continue;
+    const tainted = new Set<string>();
+    const mentionsPort = (node: any): boolean => {
+      if (
+        /^(?:process\.)?env(?:\.PORT|\[.*PORT.*\])$/.test(
+          source.slice(node.start, node.end),
+        )
+      )
+        return true;
+      if (node.type === "Identifier" && tainted.has(node.name)) return true;
+      return Object.values(node).some((value) =>
+        Array.isArray(value)
+          ? value.some(mentionsPort)
+          : Boolean(
+              value &&
+              typeof value === "object" &&
+              "type" in value &&
+              mentionsPort(value),
+            ),
+      );
+    };
+    for (let pass = 0; pass < declarations.size; pass++) {
+      let changed = false;
+      for (const [name, expression] of declarations) {
+        if (!tainted.has(name) && mentionsPort(expression)) {
+          tainted.add(name);
+          changed = true;
+        }
+      }
+      if (!changed) break;
+    }
+    if (mentionsPort(decision.test) || mentionsPort(decision.consequent))
+      values.add(Number(decision.alternate.value));
+  }
+  return values.size === 1
+    ? [...values][0]
+    : values.size > 1
+      ? Number.NaN
+      : null;
+}
 
 function safeRead(file: string, reader: FileReader): string | null {
   if (!reader.isFile(file)) return null;
@@ -122,7 +367,10 @@ function envPairs(text: string): [string, string][] {
     if (!line || line.startsWith("#")) continue;
     const eq = line.indexOf("=");
     if (eq <= 0) continue;
-    const key = line.slice(0, eq).replace(/^export\s+/, "").trim();
+    const key = line
+      .slice(0, eq)
+      .replace(/^export\s+/, "")
+      .trim();
     const value = line
       .slice(eq + 1)
       .trim()
@@ -142,17 +390,54 @@ export function resolveServicePort(
   entryFile: string | null | undefined,
   reader: FileReader,
 ): number | null {
+  const portsIn = (text: string): Set<number> =>
+    new Set(
+      [...text.matchAll(/^\s*(?:export\s+)?PORT\s*=\s*["']?(\d{2,5})["']?\s*$/gm)].map(
+        (match) => Number(match[1]),
+      ),
+    );
+  let activeEnvPort: number | null = null;
   for (const file of ENV_FILES) {
     const text = safeRead(path.join(dir, file), reader);
-    const match = text?.match(ENV_PORT_RE);
-    if (match) return Number(match[1]);
+    if (!text) continue;
+    const ports = portsIn(text);
+    if (ports.size === 1) {
+      activeEnvPort = [...ports][0];
+      break;
+    }
+    if (ports.size > 1) return null;
   }
   const entry = entryFile ? safeRead(entryFile, reader) : null;
   if (entry) {
-    for (const re of ENTRY_PORT_RES) {
-      const match = entry.match(re);
-      if (match) return Number(match[1]);
+    const literal = directLiteralServerPort(entry);
+    const direct = directServerPort(entry);
+    const fallback = validatedPortFallback(entry);
+    if (
+      Number.isNaN(literal) ||
+      Number.isNaN(direct) ||
+      Number.isNaN(fallback)
+    )
+      return null;
+    if (literal != null) {
+      if (activeEnvPort != null && activeEnvPort !== literal) return null;
+      const sourceValues = new Set(
+        [direct, fallback].filter((value): value is number => value != null),
+      );
+      return sourceValues.size === 1 ? literal : null;
     }
+    if (activeEnvPort != null) return activeEnvPort;
+    const values = new Set(
+      [direct, fallback].filter((value): value is number => value != null),
+    );
+    if (values.size === 1) return [...values][0];
+    if (values.size > 1) return null;
+  }
+  if (activeEnvPort != null) return activeEnvPort;
+  const example = safeRead(path.join(dir, ".env.example"), reader);
+  if (example) {
+    const ports = portsIn(example);
+    if (ports.size === 1) return [...ports][0];
+    if (ports.size > 1) return null;
   }
   return null;
 }

@@ -50,6 +50,8 @@ export const SOURCE_EXTENSIONS = [
   ".tsx",
   ".mjs",
   ".cjs",
+  ".mts",
+  ".cts",
 ] as const;
 
 const SERVER_RECIPES = new Set<Recipe>([
@@ -67,15 +69,38 @@ export const LOCAL_IMPORT =
 const ENDPOINT_ENV =
   /\b[A-Z][A-Z0-9_]*CRUMBTRAIL[A-Z0-9_]*ENDPOINT[A-Z0-9_]*\b/g;
 
-function sourceModulePath(
+export function sourceModulePath(
   io: InjectIO,
   importingFile: string,
   specifier: string,
 ): string | null {
   if (!specifier.startsWith(".")) return null;
   const base = path.resolve(path.dirname(importingFile), specifier);
+  const ext = path.extname(base);
+  const sourceBase = ext ? base.slice(0, -ext.length) : base;
+  const importingExt = path.extname(importingFile);
+  const emittedSourceExtensions =
+    ext === ".mjs"
+      ? [".mts"]
+      : ext === ".cjs"
+        ? [".cts"]
+        : ext === ".js"
+          ? [".ts", ".tsx"]
+          : [];
+  if ([".ts", ".tsx", ".mts", ".cts"].includes(importingExt)) {
+    const sourceMatches = emittedSourceExtensions
+      .map((sourceExt) => `${sourceBase}${sourceExt}`)
+      .filter((candidate) => io.readFile(candidate) !== null);
+    if (sourceMatches.length === 1) return sourceMatches[0];
+    if (sourceMatches.length > 1) return null;
+  }
   const candidates = [
     base,
+    // TypeScript ESM source imports its eventual `.js` output. Following only
+    // the literal path made every such local edge disappear during setup.
+    ...(ext === ".js" || ext === ".mjs" || ext === ".cjs"
+      ? SOURCE_EXTENSIONS.map((sourceExt) => `${sourceBase}${sourceExt}`)
+      : []),
     ...SOURCE_EXTENSIONS.map((ext) => `${base}${ext}`),
     ...SOURCE_EXTENSIONS.map((ext) => path.join(base, `index${ext}`)),
   ];
@@ -131,7 +156,7 @@ export function reachableSourceFiles(
   const pending = [...entries];
   const visited = new Set<string>();
 
-  while (pending.length > 0 && files.length < 64) {
+  while (pending.length > 0 && files.length < 256) {
     const file = pending.pop()!;
     if (visited.has(file)) continue;
     visited.add(file);

@@ -131,6 +131,7 @@ describe("buildPlan — static", () => {
     expect(plan.content).toContain('<script type="module">');
     expect(plan.content).toContain("https://esm.sh/crumbtrail-core@1.2.3");
     expect(plan.content).toContain(`httpAuthToken: "${KEY_PLACEHOLDER}"`);
+    expect(plan.content?.split(KEY_PLACEHOLDER)).toHaveLength(2);
     expect(plan.content).toContain('service: "web"');
     // No env var: the wizard must not offer to write a key into a file the page
     // would never read.

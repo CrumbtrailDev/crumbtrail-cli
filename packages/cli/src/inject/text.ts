@@ -2,6 +2,8 @@
 // function takes source text and returns source text, so the bulk of the recipe
 // tests can assert behavior without touching disk.
 
+import { parse } from "@babel/parser";
+
 const BOM = "﻿";
 
 /** A source-directive prologue line, e.g. `"use client";` or `'use strict'`. */
@@ -558,6 +560,465 @@ export function widenCorsAllowedHeaders(text: string): CorsWidening {
     text: out,
     changed,
     needsManual: handled < total,
+    found: true,
+    importsCorsElsewhere: false,
+  };
+}
+
+/** A literal header array in a hand-written CORS middleware module. */
+const CUSTOM_HEADER_ARRAY_RE =
+  /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*HEADERS[\w$]*)\s*=\s*\[([^\]]*)\]/gi;
+
+function parseCustomCorsProgram(source: string): any | null {
+  for (const jsx of [false, true]) {
+    try {
+      return parse(source, {
+        sourceType: "unambiguous",
+        plugins: [
+          "typescript",
+          ...(jsx ? (["jsx"] as const) : []),
+          "decorators-legacy",
+        ],
+      }).program;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function objectPropertyName(node: any): string | null {
+  if (!node || node.computed) return null;
+  if (node.key?.type === "StringLiteral") return node.key.value;
+  if (node.key?.type === "Identifier") return node.key.name;
+  return null;
+}
+
+function serializedHeaderRootIdentifier(node: any): string | null {
+  if (!node) return null;
+  if (
+    node.type === "TSAsExpression" ||
+    node.type === "TSSatisfiesExpression" ||
+    node.type === "TSNonNullExpression" ||
+    node.type === "ParenthesizedExpression"
+  )
+    return serializedHeaderRootIdentifier(node.expression);
+  if (
+    node.type === "CallExpression" &&
+    node.callee?.type === "MemberExpression" &&
+    !node.callee.computed &&
+    node.callee.property?.name === "join" &&
+    node.callee.object?.type === "Identifier"
+  )
+    return node.callee.object.name;
+  return null;
+}
+
+function visitReturnedHeaderPolicy(
+  body: any,
+  visit: (candidate: any) => void,
+): void {
+  const resolved = new Set<any>();
+  const trace = (node: any, declarations: ReadonlyMap<string, any>): void => {
+    if (!node || typeof node !== "object") return;
+    visit(node);
+    if (
+      node.type === "Identifier" &&
+      declarations.has(node.name) &&
+      !resolved.has(declarations.get(node.name))
+    ) {
+      const declaration = declarations.get(node.name);
+      resolved.add(declaration);
+      trace(declaration, declarations);
+    }
+    if (
+      node.type === "ArrowFunctionExpression" ||
+      node.type === "FunctionExpression"
+    ) {
+      visitReturnedHeaderPolicy(node.body, visit);
+      return;
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value))
+        value.forEach((item) => trace(item, declarations));
+      else if (value && typeof value === "object" && "type" in value)
+        trace(value, declarations);
+    }
+  };
+  const findReturns = (
+    node: any,
+    declarations: ReadonlyMap<string, any>,
+  ): void => {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "BlockStatement") {
+      const blockDeclarations = new Map(declarations);
+      for (const statement of node.body as any[]) {
+        if (statement.type === "VariableDeclaration")
+          for (const declaration of statement.declarations)
+            if (declaration.id?.type === "Identifier")
+              blockDeclarations.set(declaration.id.name, declaration.init);
+        findReturns(statement, blockDeclarations);
+      }
+      return;
+    }
+    if (node.type === "ReturnStatement") {
+      trace(node.argument, declarations);
+      return;
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value))
+        value.forEach((item) => {
+          if (
+            !/^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+              item?.type ?? "",
+            )
+          )
+            findReturns(item, declarations);
+        });
+      else if (
+        value &&
+        typeof value === "object" &&
+        "type" in value &&
+        !/^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+          (value as any).type,
+        )
+      )
+        findReturns(value, declarations);
+    }
+  };
+  findReturns(body, new Map());
+}
+
+/**
+ * Widen the final Set-backed allowlist that the installed middleware emits.
+ * This covers composed policies without guessing which spread input is the
+ * application-owned list. Both the emitted binding and the Set argument must
+ * be unique, otherwise the caller receives manual guidance.
+ */
+function widenFinalSetHeaderAllowlist(
+  text: string,
+  installedBinding: string,
+): CorsWidening | null {
+  const program = parseCustomCorsProgram(text);
+  if (!program) return null;
+
+  const installed = program.body
+    .map((statement: any) =>
+      statement.type === "ExportNamedDeclaration" ||
+      statement.type === "ExportDefaultDeclaration"
+        ? statement.declaration
+        : statement,
+    )
+    .filter(
+      (statement: any) =>
+        statement?.type === "FunctionDeclaration" &&
+        statement.id?.name === installedBinding,
+    );
+  if (installed.length !== 1) return null;
+
+  const emittedRoots = new Set<string>();
+  let policyCount = 0;
+  visitReturnedHeaderPolicy(installed[0].body, (node) => {
+    if (
+      node.type !== "ObjectProperty" ||
+      objectPropertyName(node)?.toLowerCase() !==
+        "access-control-allow-headers"
+    )
+      return;
+    policyCount++;
+    const root = serializedHeaderRootIdentifier(node.value);
+    if (root) emittedRoots.add(root);
+  });
+  if (policyCount !== 1 || emittedRoots.size !== 1) return null;
+
+  const [emittedRoot] = emittedRoots;
+  const declarations: any[] = [];
+  for (const statement of program.body as any[]) {
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations) {
+      if (
+        declaration.id?.type === "Identifier" &&
+        declaration.id.name === emittedRoot
+      )
+        declarations.push(declaration);
+    }
+  }
+  if (declarations.length !== 1) return null;
+
+  const init = declarations[0].init;
+  if (
+    init?.type !== "CallExpression" ||
+    init.arguments.length !== 0 ||
+    init.callee?.type !== "MemberExpression" ||
+    init.callee.computed ||
+    init.callee.property?.name !== "sort" ||
+    init.callee.object?.type !== "ArrayExpression" ||
+    init.callee.object.elements.length !== 1
+  )
+    return null;
+  const spread = init.callee.object.elements[0];
+  const set = spread?.type === "SpreadElement" ? spread.argument : null;
+  if (
+    set?.type !== "NewExpression" ||
+    set.callee?.type !== "Identifier" ||
+    set.callee.name !== "Set" ||
+    set.arguments?.length !== 1 ||
+    set.arguments[0]?.type !== "ArrayExpression"
+  )
+    return null;
+
+  const target = set.arguments[0];
+  if (typeof target.start !== "number" || typeof target.end !== "number")
+    return null;
+  const body = text.slice(target.start + 1, target.end - 1);
+  const present = new Set(
+    target.elements
+      .filter((item: any) => item?.type === "StringLiteral")
+      .map((item: any) => item.value.toLowerCase()),
+  );
+  const missing = CORRELATION_REQUEST_HEADERS.filter(
+    (name) => !present.has(name),
+  );
+  if (missing.length === 0) {
+    return {
+      text,
+      changed: false,
+      needsManual: false,
+      found: true,
+      importsCorsElsewhere: false,
+    };
+  }
+
+  const quote = quoteStyleOf(body);
+  const additions = missing.map((name) => `${quote}${name}${quote}`).join(", ");
+  const trimmed = body.trim();
+  const separator =
+    trimmed.length === 0 ? "" : trimmed.endsWith(",") ? " " : ", ";
+  return {
+    text: `${text.slice(0, target.end - 1)}${separator}${additions}${text.slice(target.end - 1)}`,
+    changed: true,
+    needsManual: false,
+    found: true,
+    importsCorsElsewhere: false,
+  };
+}
+
+/**
+ * Widen a hand-written CORS middleware after the import resolver has proved
+ * that this is the module the server installs.
+ *
+ * This intentionally does not run on arbitrary source. The module must emit
+ * `Access-Control-Allow-Headers`, and the chosen literal must be an allowlist
+ * owned by the application. Standard safelists are excluded because changing
+ * their meaning would make the code lie about the protocol definition.
+ */
+export function widenCustomCorsAllowedHeaders(
+  text: string,
+  installedBinding?: string,
+): CorsWidening {
+  const regular = installedBinding ? null : widenCorsAllowedHeaders(text);
+  if (regular?.found) return regular;
+  if (!installedBinding && !/Access-Control-Allow-Headers/i.test(text)) {
+    return regular!;
+  }
+
+  if (installedBinding) {
+    const finalSet = widenFinalSetHeaderAllowlist(text, installedBinding);
+    if (finalSet) return finalSet;
+  }
+
+  const braceDepth: number[] = [];
+  let depth = 0;
+  let stringQuote: string | null = null;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    braceDepth[i] = depth;
+    const char = text[i];
+    if (stringQuote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === stringQuote) stringQuote = null;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      stringQuote = char;
+      continue;
+    }
+    if (char === "{") depth++;
+    else if (char === "}") depth = Math.max(0, depth - 1);
+  }
+
+  let policyStart = 0;
+  let policyEnd = text.length;
+  if (installedBinding) {
+    const escapedBinding = installedBinding.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&",
+    );
+    const declaration = new RegExp(
+      `\\b(?:export\\s+)?(?:async\\s+)?function\\s+${escapedBinding}\\s*\\([^)]*\\)\\s*(?::[^\\{]+)?\\{`,
+    ).exec(text);
+    if (declaration?.index == null) {
+      return {
+        text,
+        changed: false,
+        needsManual: true,
+        found: true,
+        importsCorsElsewhere: false,
+      };
+    }
+    const open = declaration.index + declaration[0].lastIndexOf("{");
+    const functionDepth = braceDepth[open] + 1;
+    let close = open + 1;
+    while (close < text.length && braceDepth[close] >= functionDepth) close++;
+    policyStart = open + 1;
+    policyEnd = close;
+    const scoped = widenCorsAllowedHeaders(text.slice(policyStart, policyEnd));
+    if (scoped.found) {
+      return {
+        ...scoped,
+        text: `${text.slice(0, policyStart)}${scoped.text}${text.slice(policyEnd)}`,
+      };
+    }
+    if (
+      !/Access-Control-Allow-Headers/i.test(text.slice(policyStart, policyEnd))
+    ) {
+      return {
+        text,
+        changed: false,
+        needsManual: true,
+        found: true,
+        importsCorsElsewhere: false,
+      };
+    }
+  }
+
+  const declarations = new Map<string, string>();
+  for (const match of text.matchAll(
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\n]+)/g,
+  )) {
+    if (match.index == null || braceDepth[match.index] !== 0) continue;
+    declarations.set(match[1], match[2]);
+  }
+  const referenced = new Set<string>();
+  for (const match of text.matchAll(/Access-Control-Allow-Headers/gi)) {
+    if (
+      match.index == null ||
+      match.index < policyStart ||
+      match.index >= policyEnd
+    )
+      continue;
+    const context = text.slice(
+      match.index,
+      Math.min(match.index + 240, policyEnd),
+    );
+    for (const identifier of context.match(/[A-Za-z_$][\w$]*/g) ?? []) {
+      if (declarations.has(identifier)) referenced.add(identifier);
+    }
+  }
+  for (let pass = 0; pass < declarations.size; pass++) {
+    let changed = false;
+    for (const name of [...referenced]) {
+      const expression = declarations.get(name);
+      if (!expression) continue;
+      for (const identifier of expression.match(/[A-Za-z_$][\w$]*/g) ?? []) {
+        if (!declarations.has(identifier) || referenced.has(identifier))
+          continue;
+        referenced.add(identifier);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+
+  const candidates: Array<{
+    start: number;
+    end: number;
+    full: string;
+    name: string;
+    body: string;
+    score: number;
+  }> = [];
+  for (const match of text.matchAll(CUSTOM_HEADER_ARRAY_RE)) {
+    const name = match[1] ?? "";
+    if (/SAFE(?:LIST|LISTED)/i.test(name)) continue;
+    const body = match[2] ?? "";
+    const score = /CONFIGUR/i.test(name)
+      ? 3
+      : /ALLOW(?:ED)?/i.test(name)
+        ? 2
+        : /CORS/i.test(name)
+          ? 1
+          : 0;
+    if (
+      score === 0 ||
+      match.index == null ||
+      braceDepth[match.index] !== 0 ||
+      !referenced.has(name) ||
+      !LITERAL_ARRAY_BODY_RE.test(body)
+    )
+      continue;
+    candidates.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      full: match[0],
+      name,
+      body,
+      score,
+    });
+  }
+  if (candidates.length > 1) {
+    return {
+      text,
+      changed: false,
+      needsManual: true,
+      found: true,
+      importsCorsElsewhere: false,
+    };
+  }
+  candidates.sort((a, b) => b.score - a.score || a.start - b.start);
+  const selected = candidates[0];
+  if (!selected) {
+    return {
+      text,
+      changed: false,
+      needsManual: true,
+      found: true,
+      importsCorsElsewhere: false,
+    };
+  }
+
+  const present = new Set(
+    (selected.body.match(/(["'])([^"'\n]*)\1/g) ?? []).map((literal) =>
+      literal.slice(1, -1).toLowerCase(),
+    ),
+  );
+  const missing = CORRELATION_REQUEST_HEADERS.filter(
+    (name) => !present.has(name),
+  );
+  if (missing.length === 0) {
+    return {
+      text,
+      changed: false,
+      needsManual: false,
+      found: true,
+      importsCorsElsewhere: false,
+    };
+  }
+
+  const quote = quoteStyleOf(selected.body);
+  const additions = missing.map((name) => `${quote}${name}${quote}`).join(", ");
+  const trimmed = selected.body.trim();
+  const separator =
+    trimmed.length === 0 ? "" : trimmed.endsWith(",") ? " " : ", ";
+  const replacement = selected.full.replace(
+    `[${selected.body}]`,
+    `[${selected.body.replace(/\s+$/, "")}${separator}${additions}]`,
+  );
+  return {
+    text: `${text.slice(0, selected.start)}${replacement}${text.slice(selected.end)}`,
+    changed: true,
+    needsManual: false,
     found: true,
     importsCorsElsewhere: false,
   };

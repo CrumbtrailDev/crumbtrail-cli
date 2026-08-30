@@ -51,26 +51,11 @@ export function readApplicationReleaseIdentity(
 
 function readRuntimeValue(keys: readonly string[]): string | undefined {
   for (const key of keys) {
-    const importMetaValue = readImportMetaEnv(key);
-    const cleanImportMetaValue = cleanIdentity(importMetaValue);
-    if (cleanImportMetaValue) return cleanImportMetaValue;
-
     const processValue = readProcessEnv(key);
     const cleanProcessValue = cleanIdentity(processValue);
     if (cleanProcessValue) return cleanProcessValue;
   }
   return undefined;
-}
-
-function readImportMetaEnv(key: string): unknown {
-  try {
-    const meta = import.meta as ImportMeta & {
-      env?: Record<string, unknown>;
-    };
-    return meta.env?.[key];
-  } catch {
-    return undefined;
-  }
 }
 
 function readProcessEnv(key: string): unknown {

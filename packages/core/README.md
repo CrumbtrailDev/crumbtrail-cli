@@ -54,10 +54,11 @@ Crumbtrail.init({
 ```
 
 The SDK also reads common public `*_APP_VERSION` and `*_APP_BUILD` values from
-`import.meta.env` or `process.env` when a bundler exposes them. When the page
-declares `<meta name="app-build" content="...">`, that value is recorded as
-`build`. An explicit `release` wins over an inferred release. These are
-application values, not the SDK version.
+`process.env` when a bundler exposes them. Vite applications should pass their
+`import.meta.env` release explicitly as shown above. When the page declares
+`<meta name="app-build" content="...">`, that value is recorded as `build`.
+An explicit `release` wins over an inferred release. These are application
+values, not the SDK version.
 
 The session-start envelope and the session replay `replay.json` manifest carry
 `release` and `build` when known, plus the distinct `sdkVersion` that wrote
