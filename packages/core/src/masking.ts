@@ -151,12 +151,32 @@ const IDENTIFIER_DESCRIPTOR_FIELDS = new Set(["id", "cls", "class", "name"]);
 const PATH_DESCRIPTOR_FIELDS = new Set(["path", "selector", "xpath"]);
 const PATH_ATTRIBUTE_SEGMENT_RE = /\[([\w:.-]+)=([^\]]*)\]/g;
 
+/**
+ * The classifier reads the value, not the syntax around it. A path writes its
+ * attribute values quoted, so the quotes come off before the shape is judged
+ * and go back on after — otherwise `[id="a@b.com"]` is a string the email rule
+ * never matches and the address ships in clear.
+ */
 function sanitizePathFragment(value: string): string {
   return value.replace(
     PATH_ATTRIBUTE_SEGMENT_RE,
     (match, name: string, attributeValue: string) => {
-      const safe = sanitizeIdentifierFragment(attributeValue);
-      return safe === attributeValue ? match : `[${name}=${safe}]`;
+      const quote = attributeValue.length >= 2 &&
+        (attributeValue.startsWith('"') || attributeValue.startsWith("'")) &&
+        attributeValue.endsWith(attributeValue[0])
+        ? attributeValue[0]
+        : undefined;
+      const inner =
+        quote === undefined
+          ? attributeValue
+          : attributeValue
+              .slice(1, -1)
+              .replace(/\\(["'\\])/g, '$1');
+      const safe = sanitizeIdentifierFragment(inner);
+      if (safe === inner) return match;
+      return quote === undefined
+        ? `[${name}=${safe}]`
+        : `[${name}=${quote}${safe}${quote}]`;
     },
   );
 }

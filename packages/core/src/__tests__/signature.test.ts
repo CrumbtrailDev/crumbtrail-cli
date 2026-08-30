@@ -33,7 +33,25 @@ describe('signature', () => {
     document.body.innerHTML = '<main><section><button data-bug-id="save-btn">Save</button></section></main>';
     const el = document.querySelector('button')!;
     const { path } = computeElementSignature(el);
-    expect(path).toBe('button[data-bug-id=save-btn]');
+    expect(path).toBe('button[data-bug-id="save-btn"]');
+  });
+
+  it('quotes the value so a real test id is a legal selector', () => {
+    // Bare values are legal CSS only when they happen to be identifiers.
+    // querySelectorAll throws on every one of these unquoted.
+    for (const id of ['cart/item', 'checkout.pay', '2fa-submit']) {
+      document.body.innerHTML = `<button data-testid="${id}">go</button>`;
+      const el = document.querySelector('button')!;
+      const { path } = computeElementSignature(el);
+      expect(path).toBe(`button[data-testid="${id}"]`);
+      expect(document.querySelectorAll(path)).toHaveLength(1);
+    }
+  });
+
+  it('escapes a value carrying a quote or a backslash', () => {
+    document.body.innerHTML = '<button id=\'say"hi\'>go</button>';
+    const el = document.querySelector('button')!;
+    expect(computeElementPath(el)).toBe('button[id="say\\"hi"]');
   });
 
   it('disambiguates same-tag siblings by nth-of-type', () => {
@@ -57,6 +75,6 @@ describe('describeElement signature integration', () => {
     document.body.innerHTML = '<button data-bug-id="save">Save</button>';
     const desc = describeElement(document.querySelector('button')!);
     expect(desc.sig).toBeTypeOf('string');
-    expect(desc.path).toBe('button[data-bug-id=save]');
+    expect(desc.path).toBe('button[data-bug-id="save"]');
   });
 });
