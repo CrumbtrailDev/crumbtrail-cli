@@ -576,22 +576,101 @@ const CUSTOM_HEADER_ARRAY_RE =
  * owned by the application. Standard safelists are excluded because changing
  * their meaning would make the code lie about the protocol definition.
  */
-export function widenCustomCorsAllowedHeaders(text: string): CorsWidening {
-  const regular = widenCorsAllowedHeaders(text);
-  if (regular.found) return regular;
-  if (!/Access-Control-Allow-Headers/i.test(text)) {
-    return regular;
+export function widenCustomCorsAllowedHeaders(
+  text: string,
+  installedBinding?: string,
+): CorsWidening {
+  const regular = installedBinding ? null : widenCorsAllowedHeaders(text);
+  if (regular?.found) return regular;
+  if (!installedBinding && !/Access-Control-Allow-Headers/i.test(text)) {
+    return regular!;
+  }
+
+  const braceDepth: number[] = [];
+  let depth = 0;
+  let stringQuote: string | null = null;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    braceDepth[i] = depth;
+    const char = text[i];
+    if (stringQuote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === stringQuote) stringQuote = null;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      stringQuote = char;
+      continue;
+    }
+    if (char === "{") depth++;
+    else if (char === "}") depth = Math.max(0, depth - 1);
+  }
+
+  let policyStart = 0;
+  let policyEnd = text.length;
+  if (installedBinding) {
+    const escapedBinding = installedBinding.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&",
+    );
+    const declaration = new RegExp(
+      `\\b(?:export\\s+)?(?:async\\s+)?function\\s+${escapedBinding}\\s*\\([^)]*\\)\\s*\\{`,
+    ).exec(text);
+    if (declaration?.index == null) {
+      return {
+        text,
+        changed: false,
+        needsManual: true,
+        found: true,
+        importsCorsElsewhere: false,
+      };
+    }
+    const open = declaration.index + declaration[0].lastIndexOf("{");
+    const functionDepth = braceDepth[open] + 1;
+    let close = open + 1;
+    while (close < text.length && braceDepth[close] >= functionDepth) close++;
+    policyStart = open + 1;
+    policyEnd = close;
+    const scoped = widenCorsAllowedHeaders(text.slice(policyStart, policyEnd));
+    if (scoped.found) {
+      return {
+        ...scoped,
+        text: `${text.slice(0, policyStart)}${scoped.text}${text.slice(policyEnd)}`,
+      };
+    }
+    if (
+      !/Access-Control-Allow-Headers/i.test(text.slice(policyStart, policyEnd))
+    ) {
+      return {
+        text,
+        changed: false,
+        needsManual: true,
+        found: true,
+        importsCorsElsewhere: false,
+      };
+    }
   }
 
   const declarations = new Map<string, string>();
   for (const match of text.matchAll(
     /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\n]+)/g,
   )) {
+    if (match.index == null || braceDepth[match.index] !== 0) continue;
     declarations.set(match[1], match[2]);
   }
   const referenced = new Set<string>();
   for (const match of text.matchAll(/Access-Control-Allow-Headers/gi)) {
-    const context = text.slice(match.index, match.index + 240);
+    if (
+      match.index == null ||
+      match.index < policyStart ||
+      match.index >= policyEnd
+    )
+      continue;
+    const context = text.slice(
+      match.index,
+      Math.min(match.index + 240, policyEnd),
+    );
     for (const identifier of context.match(/[A-Za-z_$][\w$]*/g) ?? []) {
       if (declarations.has(identifier)) referenced.add(identifier);
     }
@@ -602,7 +681,8 @@ export function widenCustomCorsAllowedHeaders(text: string): CorsWidening {
       const expression = declarations.get(name);
       if (!expression) continue;
       for (const identifier of expression.match(/[A-Za-z_$][\w$]*/g) ?? []) {
-        if (!declarations.has(identifier) || referenced.has(identifier)) continue;
+        if (!declarations.has(identifier) || referenced.has(identifier))
+          continue;
         referenced.add(identifier);
         changed = true;
       }
@@ -629,7 +709,14 @@ export function widenCustomCorsAllowedHeaders(text: string): CorsWidening {
         : /CORS/i.test(name)
           ? 1
           : 0;
-    if (score === 0 || match.index == null || !referenced.has(name)) continue;
+    if (
+      score === 0 ||
+      match.index == null ||
+      braceDepth[match.index] !== 0 ||
+      !referenced.has(name) ||
+      !LITERAL_ARRAY_BODY_RE.test(body)
+    )
+      continue;
     candidates.push({
       start: match.index,
       end: match.index + match[0].length,
@@ -639,9 +726,18 @@ export function widenCustomCorsAllowedHeaders(text: string): CorsWidening {
       score,
     });
   }
+  if (candidates.length > 1) {
+    return {
+      text,
+      changed: false,
+      needsManual: true,
+      found: true,
+      importsCorsElsewhere: false,
+    };
+  }
   candidates.sort((a, b) => b.score - a.score || a.start - b.start);
   const selected = candidates[0];
-  if (!selected || !LITERAL_ARRAY_BODY_RE.test(selected.body)) {
+  if (!selected) {
     return {
       text,
       changed: false,
@@ -672,7 +768,8 @@ export function widenCustomCorsAllowedHeaders(text: string): CorsWidening {
   const quote = quoteStyleOf(selected.body);
   const additions = missing.map((name) => `${quote}${name}${quote}`).join(", ");
   const trimmed = selected.body.trim();
-  const separator = trimmed.length === 0 ? "" : trimmed.endsWith(",") ? " " : ", ";
+  const separator =
+    trimmed.length === 0 ? "" : trimmed.endsWith(",") ? " " : ", ";
   const replacement = selected.full.replace(
     `[${selected.body}]`,
     `[${selected.body.replace(/\s+$/, "")}${separator}${additions}]`,

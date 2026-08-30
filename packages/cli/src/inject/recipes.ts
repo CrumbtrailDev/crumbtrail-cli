@@ -11,6 +11,7 @@
 // buildAgentPrompt(...) from ../install.
 
 import path from "node:path";
+import { parse } from "@babel/parser";
 import { buildAgentPrompt, buildOtlpSnippets } from "../install/index.js";
 import {
   patternMatches,
@@ -24,6 +25,7 @@ import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
 import {
   inspectIntegration,
   reachableSourceFiles,
+  sourceModulePath,
   type IntegrationRequirement,
   type IntegrationStatus,
 } from "./integration";
@@ -1841,15 +1843,27 @@ function planExtraBackendEntries(
     // Named, not counted. A count tells the user a hole exists without telling
     // them where it is, so the only way to close it was to re-derive the whole
     // scan by hand.
-    const named = unwired
-      .map(
-        (entry) =>
-          `${path.relative(input.cwd, entry.path)} (npm run ${entry.script})`,
-      )
-      .join(", ");
-    warnings.push(
-      `This package starts more than ${MAX_EXTRA_ENTRIES} other processes, so ${unwired.length === 1 ? "this one was" : "these were"} left unwired: ${named}. Wire ${unwired.length === 1 ? "it" : "them"} by copying the block from one that was.`,
+    const unproven = unwired.filter(
+      (entry) => entry.unwiredReason === "no-lifecycle-proof",
     );
+    const limited = unwired.filter(
+      (entry) => entry.unwiredReason === "edit-limit",
+    );
+    const nameEntries = (entries: typeof unwired) =>
+      entries
+        .map(
+          (entry) =>
+            `${path.relative(input.cwd, entry.path)} (npm run ${entry.script})`,
+        )
+        .join(", ");
+    if (unproven.length > 0)
+      warnings.push(
+        `Crumbtrail left these runnable entries unwired because their source and deployment files do not prove they stay running: ${nameEntries(unproven)}. If any is a service or worker, add the same capture block explicitly.`,
+      );
+    if (limited.length > 0)
+      warnings.push(
+        `This package starts more than ${MAX_EXTRA_ENTRIES} other processes, so these were left unwired: ${nameEntries(limited)}. Wire them by copying the block from one that was.`,
+      );
   }
   return { edits, warnings };
 }
@@ -1927,53 +1941,342 @@ function planDockerBuildArg(
   return { edits, warnings };
 }
 
-const LOCAL_CORS_IMPORT_RE =
-  /\bimport\s+([^;\n]*?)\s+from\s+["'](\.[^"']+)["']/g;
-
-/** Resolve a local source import, including TS source imported with a JS suffix. */
-function resolveLocalSourceImport(
-  entryFile: string,
-  specifier: string,
-  cwd: string,
-  io: InjectIO,
-): string | null {
-  const base = path.resolve(path.dirname(entryFile), specifier);
-  const ext = path.extname(base);
-  const withoutExt = ext ? base.slice(0, -ext.length) : base;
-  const candidates = [
-    base,
-    ...(ext === ".js" || ext === ".mjs" || ext === ".cjs"
-      ? [
-          `${withoutExt}.ts`,
-          `${withoutExt}.mts`,
-          `${withoutExt}.cts`,
-          `${withoutExt}.tsx`,
-        ]
-      : []),
-    ...(!ext
-      ? [
-          `${base}.ts`,
-          `${base}.tsx`,
-          `${base}.js`,
-          `${base}.mjs`,
-          path.join(base, "index.ts"),
-          path.join(base, "index.js"),
-        ]
-      : []),
-  ];
-  for (const candidate of candidates) {
-    const rel = path.relative(cwd, candidate);
-    if (rel.startsWith("..") || path.isAbsolute(rel)) continue;
-    if (io.readFile(candidate) != null) return candidate;
+/**
+ * Find CORS configuration in the server's bounded reachable source graph.
+ * The same graph powers integration completeness and stops at 64 local files,
+ * so extracted app factories and middleware modules are covered without a
+ * repository-wide crawl or path-name guessing.
+ */
+function parseCorsProgram(source: string): any | null {
+  for (const jsx of [false, true]) {
+    try {
+      return parse(source, {
+        sourceType: "unambiguous",
+        plugins: [
+          "typescript",
+          ...(jsx ? (["jsx"] as const) : []),
+          "decorators-legacy",
+        ],
+      }).program;
+    } catch {
+      continue;
+    }
   }
   return null;
 }
 
-/**
- * Follow one local import from the server entry to the CORS module it installs.
- * One hop is deliberate: it covers extracted middleware without turning setup
- * into a general module graph rewriter.
- */
+function installedCorsImports(
+  source: string,
+  executedFactories: ReadonlySet<string> = new Set(),
+): Array<{ specifier: string; imported: string; local: string }> {
+  const program = parseCorsProgram(source);
+  if (!program) return [];
+  const bindings = new Map<
+    string,
+    { specifier: string; imported: string; local: string }
+  >();
+  for (const statement of program.body as any[]) {
+    if (statement.type === "ImportDeclaration") {
+      const specifier = statement.source.value;
+      for (const item of statement.specifiers) {
+        const local = item.local.name;
+        const imported =
+          item.type === "ImportDefaultSpecifier"
+            ? "default"
+            : item.type === "ImportNamespaceSpecifier"
+              ? "*"
+              : (item.imported.name ?? item.imported.value);
+        bindings.set(local, { specifier, imported, local });
+      }
+    }
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations) {
+      const call = declaration.init;
+      if (
+        call?.type !== "CallExpression" ||
+        call.callee.type !== "Identifier" ||
+        call.callee.name !== "require" ||
+        call.arguments[0]?.type !== "StringLiteral"
+      )
+        continue;
+      const specifier = call.arguments[0].value;
+      if (declaration.id.type === "Identifier") {
+        const local = declaration.id.name;
+        bindings.set(local, {
+          specifier,
+          imported: "default",
+          local,
+        });
+      } else if (declaration.id.type === "ObjectPattern") {
+        for (const property of declaration.id.properties) {
+          if (
+            property.type !== "ObjectProperty" ||
+            property.value.type !== "Identifier"
+          )
+            continue;
+          const local = property.value.name;
+          bindings.set(local, {
+            specifier,
+            imported: property.key.name ?? property.key.value,
+            local,
+          });
+        }
+      }
+    }
+  }
+  const installed: Array<{
+    specifier: string;
+    imported: string;
+    local: string;
+  }> = [];
+  const factories = new Map<string, any>();
+  for (const statement of program.body as any[]) {
+    if (statement.type === "FunctionDeclaration" && statement.id)
+      factories.set(statement.id.name, statement.body);
+    if (statement.type === "VariableDeclaration")
+      for (const declaration of statement.declarations)
+        if (
+          declaration.id.type === "Identifier" &&
+          (declaration.init?.type === "ArrowFunctionExpression" ||
+            declaration.init?.type === "FunctionExpression")
+        )
+          factories.set(declaration.id.name, declaration.init.body);
+  }
+  const visitedFactories = new Set<string>();
+  const inspectRegistration = (node: any): void => {
+    if (node.type === "CallExpression") {
+      const callee = node.callee;
+      const registration =
+        (callee.type === "MemberExpression" &&
+          !callee.computed &&
+          (callee.property.name === "use" ||
+            callee.property.name === "register")) ||
+        (callee.type === "Identifier" && callee.name === "enableCors");
+      if (registration) {
+        for (const argument of node.arguments as any[]) {
+          const expression =
+            argument.type === "CallExpression" ? argument.callee : argument;
+          if (expression.type === "Identifier") {
+            const binding = bindings.get(expression.name);
+            if (binding) installed.push(binding);
+          } else if (
+            expression.type === "MemberExpression" &&
+            !expression.computed &&
+            expression.object.type === "Identifier"
+          ) {
+            const binding = bindings.get(expression.object.name);
+            if (binding?.imported === "*")
+              installed.push({
+                ...binding,
+                imported: expression.property.name,
+              });
+          }
+        }
+      }
+    }
+  };
+  const inspectExecuted = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    inspectRegistration(node);
+    if (
+      node.type === "CallExpression" &&
+      node.callee.type === "Identifier" &&
+      factories.has(node.callee.name) &&
+      !visitedFactories.has(node.callee.name)
+    ) {
+      visitedFactories.add(node.callee.name);
+      inspectExecuted(factories.get(node.callee.name));
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value))
+        value.forEach((child) => {
+          if (
+            !/^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+              child?.type ?? "",
+            )
+          )
+            inspectExecuted(child);
+        });
+      else if (
+        value &&
+        typeof value === "object" &&
+        "type" in value &&
+        !/^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+          (value as any).type,
+        )
+      )
+        inspectExecuted(value);
+    }
+  };
+  for (const statement of program.body as any[]) {
+    if (statement.type !== "ExpressionStatement") continue;
+    const expression =
+      statement.expression.type === "AwaitExpression"
+        ? statement.expression.argument
+        : statement.expression;
+    inspectExecuted(expression);
+  }
+  for (const name of executedFactories) {
+    const factory = factories.get(name);
+    if (factory && !visitedFactories.has(name)) {
+      visitedFactories.add(name);
+      inspectExecuted(factory);
+    }
+  }
+  return installed;
+}
+
+function calledLocalImports(
+  source: string,
+  executedFactories: ReadonlySet<string> = new Set(),
+): Array<{ specifier: string; imported: string }> {
+  const program = parseCorsProgram(source);
+  if (!program) return [];
+  const imports = new Map<string, { specifier: string; imported: string }>();
+  for (const statement of program.body as any[]) {
+    if (statement.type !== "ImportDeclaration") continue;
+    for (const item of statement.specifiers) {
+      imports.set(item.local.name, {
+        specifier: statement.source.value,
+        imported:
+          item.type === "ImportDefaultSpecifier"
+            ? "default"
+            : (item.imported?.name ?? item.imported?.value ?? "*"),
+      });
+    }
+  }
+  const called: Array<{ specifier: string; imported: string }> = [];
+  const factories = new Map<string, any>();
+  for (const statement of program.body as any[]) {
+    if (statement.type === "FunctionDeclaration" && statement.id)
+      factories.set(statement.id.name, statement.body);
+    if (statement.type === "VariableDeclaration")
+      for (const declaration of statement.declarations)
+        if (
+          declaration.id.type === "Identifier" &&
+          (declaration.init?.type === "ArrowFunctionExpression" ||
+            declaration.init?.type === "FunctionExpression")
+        )
+          factories.set(declaration.id.name, declaration.init.body);
+  }
+  const visited = new Set<string>();
+  const inspect = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "CallExpression" && node.callee.type === "Identifier") {
+      const imported = imports.get(node.callee.name);
+      if (imported) called.push(imported);
+      const factory = factories.get(node.callee.name);
+      if (factory && !visited.has(node.callee.name)) {
+        visited.add(node.callee.name);
+        inspect(factory);
+      }
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value))
+        value.forEach((child) => {
+          if (
+            !/^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+              child?.type ?? "",
+            )
+          )
+            inspect(child);
+        });
+      else if (
+        value &&
+        typeof value === "object" &&
+        "type" in value &&
+        !/^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+          (value as any).type,
+        )
+      )
+        inspect(value);
+    }
+  };
+  for (const statement of program.body as any[]) {
+    if (statement.type !== "ExpressionStatement") continue;
+    const expression =
+      statement.expression.type === "AwaitExpression"
+        ? statement.expression.argument
+        : statement.expression;
+    inspect(expression);
+  }
+  for (const name of executedFactories) {
+    const factory = factories.get(name);
+    if (factory && !visited.has(name)) inspect(factory);
+  }
+  return called;
+}
+
+function resolveInstalledExport(source: string, imported: string): string {
+  if (imported !== "default") return imported;
+  const program = parseCorsProgram(source);
+  if (!program) return "__unresolved_default_export__";
+  for (const statement of program.body as any[]) {
+    if (statement.type === "ExportDefaultDeclaration") {
+      if (statement.declaration.type === "Identifier")
+        return statement.declaration.name;
+      if (statement.declaration.type === "FunctionDeclaration")
+        return statement.declaration.id?.name ?? "__anonymous_default_export__";
+    }
+    if (
+      statement.type === "ExpressionStatement" &&
+      statement.expression.type === "AssignmentExpression" &&
+      statement.expression.left.type === "MemberExpression" &&
+      statement.expression.left.object.name === "module" &&
+      statement.expression.left.property.name === "exports" &&
+      statement.expression.right.type === "Identifier"
+    )
+      return statement.expression.right.name;
+    if (
+      statement.type === "ExpressionStatement" &&
+      statement.expression.type === "AssignmentExpression" &&
+      statement.expression.left.type === "MemberExpression" &&
+      statement.expression.left.object.name === "module" &&
+      statement.expression.left.property.name === "exports" &&
+      (statement.expression.right.type === "FunctionExpression" ||
+        statement.expression.right.type === "ArrowFunctionExpression")
+    )
+      return "__anonymous_commonjs_export__";
+  }
+  return "__unresolved_default_export__";
+}
+
+function exportHasCorsEvidence(source: string, binding: string): boolean {
+  const program = parseCorsProgram(source);
+  if (!program) return false;
+  let body = "";
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    if (
+      (node.type === "FunctionDeclaration" && node.id?.name === binding) ||
+      (node.type === "VariableDeclarator" && node.id?.name === binding)
+    )
+      body = source.slice(node.start, node.end);
+    if (
+      binding === "__anonymous_default_export__" &&
+      node.type === "ExportDefaultDeclaration"
+    )
+      body = source.slice(node.declaration.start, node.declaration.end);
+    if (
+      binding === "__anonymous_commonjs_export__" &&
+      node.type === "AssignmentExpression" &&
+      node.left?.type === "MemberExpression" &&
+      node.left.object?.name === "module" &&
+      node.left.property?.name === "exports"
+    )
+      body = source.slice(node.right.start, node.right.end);
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value);
+    }
+  };
+  visit(program);
+  return /Access-Control-Allow-Headers|\ballowedHeaders\b|\ballowHeaders\b|\bcors\s*\(/i.test(
+    body,
+  );
+}
+
 function planImportedCorsModule(
   input: BuildPlanInput,
   io: InjectIO,
@@ -1987,48 +2290,113 @@ function planImportedCorsModule(
   if (!isBackendRecipe(input.recipe) || !input.entryFile) {
     return { edits, warnings, resolved: false };
   }
-  const entry = io.readFile(input.entryFile);
-  if (!entry) return { edits, warnings, resolved: false };
-
-  for (const match of entry.matchAll(LOCAL_CORS_IMPORT_RE)) {
-    const bindings = match[1] ?? "";
-    const specifier = match[2] ?? "";
-    if (!/cors/i.test(`${bindings} ${specifier}`)) continue;
-    const importedNames = (bindings.match(/[A-Za-z_$][\w$]*/g) ?? []).filter(
-      (name) => !["import", "type", "as"].includes(name),
-    );
-    const installed = importedNames.some((name) =>
-      new RegExp(
-        String.raw`\.(?:use|register)\s*\([\s\S]{0,200}?\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\b`,
-      ).test(entry.slice((match.index ?? 0) + match[0].length)),
-    );
-    if (!installed) continue;
-    const target = resolveLocalSourceImport(
-      input.entryFile,
-      specifier,
-      input.cwd,
-      io,
-    );
-    if (!target) continue;
-    const source = io.readFile(target);
-    if (source == null) continue;
-    const widened = widenCustomCorsAllowedHeaders(source);
+  let resolved = false;
+  const reachable = reachableSourceFiles({
+    cwd: input.cwd,
+    recipe: input.recipe,
+    endpoint: input.endpoint,
+    entryFile: input.entryFile,
+    serviceName: input.serviceName,
+    io,
+  });
+  const reachableByPath = new Map(
+    reachable.map((entry) => [path.resolve(entry.file), entry]),
+  );
+  const candidates: Array<{
+    target: string;
+    source: string;
+    installedBinding?: string;
+  }> = [];
+  const executedByFile = new Map<string, Set<string>>();
+  for (let pass = 0; pass < reachable.length; pass++) {
+    let changed = false;
+    for (const consumer of reachable) {
+      for (const called of calledLocalImports(
+        consumer.text,
+        executedByFile.get(path.resolve(consumer.file)),
+      )) {
+        if (!called.specifier.startsWith(".")) continue;
+        const target = sourceModulePath(io, consumer.file, called.specifier);
+        if (!target) continue;
+        const module = reachableByPath.get(path.resolve(target));
+        if (!module) continue;
+        const names =
+          executedByFile.get(path.resolve(target)) ?? new Set<string>();
+        const name = resolveInstalledExport(module.text, called.imported);
+        const before = names.size;
+        names.add(name);
+        if (names.size !== before) changed = true;
+        executedByFile.set(path.resolve(target), names);
+      }
+    }
+    if (!changed) break;
+  }
+  for (const consumer of reachable) {
+    for (const binding of installedCorsImports(
+      consumer.text,
+      executedByFile.get(path.resolve(consumer.file)),
+    )) {
+      if (binding.specifier.startsWith(".")) {
+        const target = sourceModulePath(io, consumer.file, binding.specifier);
+        if (!target) continue;
+        const module = reachableByPath.get(path.resolve(target));
+        if (!module) continue;
+        const installedBinding =
+          binding.imported === "*"
+            ? "__unresolved_namespace_export__"
+            : resolveInstalledExport(module.text, binding.imported);
+        if (!exportHasCorsEvidence(module.text, installedBinding)) continue;
+        candidates.push({
+          target: module.file,
+          source: module.text,
+          installedBinding,
+        });
+      } else if (/cors/i.test(binding.specifier)) {
+        candidates.push({ target: consumer.file, source: consumer.text });
+      }
+    }
+  }
+  const bindingsByTarget = new Map<string, Set<string>>();
+  for (const candidate of candidates) {
+    const target = path.resolve(candidate.target);
+    const bindings = bindingsByTarget.get(target) ?? new Set<string>();
+    bindings.add(candidate.installedBinding ?? "");
+    bindingsByTarget.set(target, bindings);
+  }
+  const visited = new Set<string>();
+  for (const { target, source, installedBinding } of candidates) {
+    if ((bindingsByTarget.get(path.resolve(target))?.size ?? 0) > 1) {
+      if (!visited.has(path.resolve(target))) {
+        warnings.push(
+          `${path.relative(input.cwd, target)} exports multiple installed CORS policies, so Crumbtrail left them unchanged. ${corsWideningGuidance()}`,
+        );
+        visited.add(path.resolve(target));
+      }
+      continue;
+    }
+    const candidateKey = `${path.resolve(target)}\0${installedBinding ?? ""}`;
+    if (visited.has(candidateKey)) continue;
+    visited.add(candidateKey);
+    const widened = installedBinding
+      ? widenCustomCorsAllowedHeaders(source, installedBinding)
+      : widenCorsAllowedHeaders(source);
     if (!widened.found) continue;
     if (widened.needsManual) {
       warnings.push(
         `${path.relative(input.cwd, target)} configures CORS with a computed header allowlist. ${corsWideningGuidance()}`,
       );
-      return { edits, warnings, resolved: false };
+      continue;
     }
     if (!widened.changed) {
-      return { edits, warnings, resolved: widened.found };
+      resolved = true;
+      continue;
     }
     const status = io.gitStatus(input.cwd, target);
     if (status.dirty && !input.options?.force) {
       warnings.push(
         `${path.relative(input.cwd, target)} needs the Crumbtrail correlation headers but has uncommitted changes, so it was left alone. Commit it and re-run, or re-run with force.`,
       );
-      return { edits, warnings, resolved: false };
+      continue;
     }
     edits.push({
       path: target,
@@ -2036,10 +2404,10 @@ function planImportedCorsModule(
       content: widened.text,
       label: `widened the CORS allowed headers in ${path.relative(input.cwd, target)}`,
     });
-    warnings.push(CORS_WIDENED_WARNING);
-    return { edits, warnings, resolved: true };
+    resolved = true;
   }
-  return { edits, warnings, resolved: false };
+  if (edits.length > 0) warnings.push(CORS_WIDENED_WARNING);
+  return { edits, warnings, resolved };
 }
 
 export function buildPlan(
@@ -2073,6 +2441,7 @@ export function buildPlan(
   if (importedCors.resolved) {
     plan.warnings = plan.warnings.filter(
       (warning) =>
+        !warning.startsWith("No CORS middleware in this file") &&
         !warning.startsWith(
           "This file configures no CORS itself but imports CORS from another module",
         ),

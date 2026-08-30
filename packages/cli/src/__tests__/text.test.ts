@@ -4,8 +4,26 @@ import {
   prependIntoSource,
   prologueEnd,
   referencesCrumbtrail,
+  widenCustomCorsAllowedHeaders,
   wireFlutterMain,
 } from "../inject/text";
+
+describe("custom CORS policy widening", () => {
+  it("refuses an installed function with multiple literal header policies", () => {
+    const source = [
+      'const FIRST_HEADERS = ["Authorization"]',
+      'const SECOND_HEADERS = ["Content-Type"]',
+      "export function corsMiddleware() {",
+      '  first["Access-Control-Allow-Headers"] = FIRST_HEADERS.join(", ")',
+      '  second["Access-Control-Allow-Headers"] = SECOND_HEADERS.join(", ")',
+      "}",
+    ].join("\n");
+    const result = widenCustomCorsAllowedHeaders(source, "corsMiddleware");
+    expect(result.changed).toBe(false);
+    expect(result.needsManual).toBe(true);
+    expect(result.text).toBe(source);
+  });
+});
 
 const BLOCK =
   'import { Crumbtrail } from "crumbtrail-core";\nCrumbtrail.init({});';
@@ -90,7 +108,8 @@ describe("analyzeSource / referencesCrumbtrail", () => {
   });
 });
 
-const IMPORT_LINE = "import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';";
+const IMPORT_LINE =
+  "import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';";
 const INIT_LINES = [
   "await Crumbtrail.start(const CrumbtrailConfig(",
   "  endpoint: 'https://ingest.example.com',",
@@ -116,9 +135,7 @@ describe("wireFlutterMain", () => {
     expect(out).toContain(IMPORT_LINE);
     // Capture must be running before the first frame, or the errors thrown
     // during startup — the ones hardest to reproduce — are simply not seen.
-    expect(out.indexOf("Crumbtrail.start")).toBeLessThan(
-      out.indexOf("runApp"),
-    );
+    expect(out.indexOf("Crumbtrail.start")).toBeLessThan(out.indexOf("runApp"));
     expect(out.indexOf(IMPORT_LINE)).toBeLessThan(out.indexOf("main()"));
   });
 
@@ -204,11 +221,14 @@ describe("wireFlutterMain", () => {
   });
 
   it("declines a file with no main at all", () => {
-    expect(wireFlutterMain("class Foo {}\n", IMPORT_LINE, INIT_LINES)).toBeNull();
+    expect(
+      wireFlutterMain("class Foo {}\n", IMPORT_LINE, INIT_LINES),
+    ).toBeNull();
   });
 
   it("preserves CRLF line endings", () => {
-    const src = "import 'package:flutter/material.dart';\r\nvoid main() {\r\n  runApp(const MyApp());\r\n}\r\n";
+    const src =
+      "import 'package:flutter/material.dart';\r\nvoid main() {\r\n  runApp(const MyApp());\r\n}\r\n";
     const out = wireFlutterMain(src, IMPORT_LINE, INIT_LINES)!;
     expect(out).toContain("\r\n");
     expect(out.replace(/\r\n/g, "")).not.toContain("\n");

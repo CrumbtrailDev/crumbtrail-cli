@@ -15,6 +15,7 @@
 // request that had none and sends trace context somewhere it was not wanted.
 
 import path from "node:path";
+import { parse } from "@babel/parser";
 import type { DetectResult, Recipe } from "./detect";
 import type { FileReader } from "./readers/types";
 
@@ -73,14 +74,77 @@ const API_BASE_VAR_RE = /^[A-Z0-9_]*(?:API|BACKEND|SERVER)[A-Z0-9_]*$/;
 /** A port a service declares for itself, in an env file or its entry source. */
 const ENV_PORT_RE = /^\s*(?:export\s+)?PORT\s*=\s*["']?(\d{2,5})["']?\s*$/m;
 
-const ENTRY_PORT_RES = [
-  // `port: 3000`, `PORT = 3000`
-  /\bport\s*[:=]\s*(\d{2,5})\b/i,
-  // `app.listen(3000`, `serve({ ... }, 3000`
-  /\.listen\(\s*(\d{2,5})\b/,
-  // `process.env.PORT ?? 3000`, `env.PORT || 3000`
-  /\bPORT\b[^\n]{0,80}?(?:\?\?|\|\|)\s*(\d{2,5})\b/,
-];
+function parseProgram(source: string): any | null {
+  for (const jsx of [false, true]) {
+    try {
+      return parse(source, {
+        sourceType: "unambiguous",
+        plugins: [
+          "typescript",
+          ...(jsx ? (["jsx"] as const) : []),
+          "decorators-legacy",
+        ],
+      }).program;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function directServerPort(source: string): number | null {
+  const program = parseProgram(source);
+  if (!program) return null;
+  const found = new Set<number>();
+  const literalFallback = (expression: any): number | null => {
+    if (expression?.type === "NumericLiteral") return Number(expression.value);
+    if (
+      expression?.type === "LogicalExpression" &&
+      (expression.operator === "??" || expression.operator === "||") &&
+      /(?:process\.)?env\.PORT/.test(
+        source.slice(expression.left.start, expression.left.end),
+      ) &&
+      expression.right.type === "NumericLiteral"
+    )
+      return Number(expression.right.value);
+    return null;
+  };
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "CallExpression") {
+      if (
+        node.callee.type === "MemberExpression" &&
+        !node.callee.computed &&
+        node.callee.property.name === "listen" &&
+        node.arguments[0]
+      ) {
+        const value = literalFallback(node.arguments[0]);
+        if (value != null) found.add(value);
+      }
+      if (node.callee.type === "Identifier" && node.callee.name === "serve") {
+        const object = node.arguments.find(
+          (argument: any) => argument.type === "ObjectExpression",
+        );
+        const port = object?.properties.find(
+          (property: any) =>
+            property.type === "ObjectProperty" &&
+            (property.key.name ?? property.key.value) === "port",
+        );
+        if (port?.value) {
+          const value = literalFallback(port.value);
+          if (value != null) found.add(value);
+        }
+      }
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value);
+    }
+  };
+  visit(program);
+  return found.size === 1 ? [...found][0] : found.size > 1 ? Number.NaN : null;
+}
 
 /**
  * Resolve a validated ternary fallback whose value is derived from PORT.
@@ -88,48 +152,105 @@ const ENTRY_PORT_RES = [
  * the same entry cannot become the HTTP origin merely because it is nearby.
  */
 function validatedPortFallback(source: string): number | null {
-  const tainted = new Set<string>();
-  const declarations: Array<{ name: string; expression: string }> = [];
-  for (const line of source.split(/\r?\n/)) {
-    const match = line.match(
-      /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(.+)$/,
-    );
-    if (!match) continue;
-    declarations.push({ name: match[1], expression: match[2] });
-  }
-  for (let pass = 0; pass < declarations.length; pass++) {
-    let changed = false;
-    for (const declaration of declarations) {
-      if (tainted.has(declaration.name)) continue;
-      const fromPort = /(?:process\.)?env(?:\[["']PORT["']\]|\.PORT)\b/.test(
-        declaration.expression,
-      );
-      const fromTainted = [...tainted].some((name) =>
-        new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(
-          declaration.expression,
-        ),
-      );
-      if (!fromPort && !fromTainted) continue;
-      tainted.add(declaration.name);
-      changed = true;
-    }
-    if (!changed) break;
-  }
-  for (const declaration of declarations) {
-    if (declaration.name.toLowerCase() !== "port") continue;
-    const match = declaration.expression.match(/\?\s*([^:\n]+):\s*(\d{2,5})\b/);
-    if (!match) continue;
-    if (
-      [...tainted].some((name) =>
-        new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(
-          `${declaration.expression.slice(0, match.index)} ${match[1]}`,
-        ),
+  const program = parseProgram(source);
+  if (!program) return null;
+  const resolvers = new Map<string, any>();
+  for (const statement of program.body as any[])
+    if (statement.type === "FunctionDeclaration" && statement.id)
+      resolvers.set(statement.id.name, statement);
+  const selected = new Set<any>();
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    if (node.type === "CallExpression") {
+      const linked: any[] = [];
+      if (
+        node.callee.type === "MemberExpression" &&
+        !node.callee.computed &&
+        node.callee.property.name === "listen" &&
+        node.arguments[0]
       )
-    ) {
-      return Number(match[2]);
+        linked.push(node.arguments[0]);
+      if (node.callee.type === "Identifier" && node.callee.name === "serve") {
+        const object = node.arguments.find(
+          (argument: any) => argument.type === "ObjectExpression",
+        );
+        const port = object?.properties.find(
+          (property: any) =>
+            property.type === "ObjectProperty" &&
+            (property.key.name ?? property.key.value) === "port",
+        );
+        if (port) linked.push(port.value);
+      }
+      for (const expression of linked)
+        if (
+          expression.type === "CallExpression" &&
+          expression.callee.type === "Identifier"
+        ) {
+          const resolver = resolvers.get(expression.callee.name);
+          if (resolver) selected.add(resolver);
+        }
     }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value);
+    }
+  };
+  visit(program);
+  const values = new Set<number>();
+  for (const resolver of selected) {
+    const declarations = new Map<string, any>();
+    let decision: any;
+    for (const statement of resolver.body.body) {
+      if (statement.type === "VariableDeclaration") {
+        for (const declaration of statement.declarations)
+          if (declaration.id.type === "Identifier" && declaration.init)
+            declarations.set(declaration.id.name, declaration.init);
+      } else if (
+        statement.type === "ReturnStatement" &&
+        statement.argument?.type === "ConditionalExpression"
+      )
+        decision = statement.argument;
+    }
+    if (!decision || decision.alternate.type !== "NumericLiteral") continue;
+    const tainted = new Set<string>();
+    const mentionsPort = (node: any): boolean => {
+      if (
+        /^(?:process\.)?env(?:\.PORT|\[.*PORT.*\])$/.test(
+          source.slice(node.start, node.end),
+        )
+      )
+        return true;
+      if (node.type === "Identifier" && tainted.has(node.name)) return true;
+      return Object.values(node).some((value) =>
+        Array.isArray(value)
+          ? value.some(mentionsPort)
+          : Boolean(
+              value &&
+              typeof value === "object" &&
+              "type" in value &&
+              mentionsPort(value),
+            ),
+      );
+    };
+    for (let pass = 0; pass < declarations.size; pass++) {
+      let changed = false;
+      for (const [name, expression] of declarations) {
+        if (!tainted.has(name) && mentionsPort(expression)) {
+          tainted.add(name);
+          changed = true;
+        }
+      }
+      if (!changed) break;
+    }
+    if (mentionsPort(decision.test) || mentionsPort(decision.consequent))
+      values.add(Number(decision.alternate.value));
   }
-  return null;
+  return values.size === 1
+    ? [...values][0]
+    : values.size > 1
+      ? Number.NaN
+      : null;
 }
 
 function safeRead(file: string, reader: FileReader): string | null {
@@ -172,7 +293,10 @@ function envPairs(text: string): [string, string][] {
     if (!line || line.startsWith("#")) continue;
     const eq = line.indexOf("=");
     if (eq <= 0) continue;
-    const key = line.slice(0, eq).replace(/^export\s+/, "").trim();
+    const key = line
+      .slice(0, eq)
+      .replace(/^export\s+/, "")
+      .trim();
     const value = line
       .slice(eq + 1)
       .trim()
@@ -199,12 +323,14 @@ export function resolveServicePort(
   }
   const entry = entryFile ? safeRead(entryFile, reader) : null;
   if (entry) {
-    for (const re of ENTRY_PORT_RES) {
-      const match = entry.match(re);
-      if (match) return Number(match[1]);
-    }
+    const direct = directServerPort(entry);
     const fallback = validatedPortFallback(entry);
-    if (fallback != null) return fallback;
+    if (Number.isNaN(direct) || Number.isNaN(fallback)) return null;
+    const values = new Set(
+      [direct, fallback].filter((value): value is number => value != null),
+    );
+    if (values.size === 1) return [...values][0];
+    if (values.size > 1) return null;
   }
   return null;
 }
