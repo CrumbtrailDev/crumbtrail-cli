@@ -244,7 +244,7 @@ const REMOTE_CONFIG_KEYS = [
   "autoFlagOnAbandonedFlow",
   "autoFlagDebounceMs",
   "autoFlagMaxPerSession",
-  "autoFlagShadowMode",
+  "autoFlagShadowTriggers",
   "rageClickThreshold",
   "rageClickWindowMs",
   "retryStormThreshold",
@@ -1159,7 +1159,7 @@ export class Crumbtrail {
     for (const key of REMOTE_CONFIG_KEYS) {
       const value = settings[key];
       if (!isRemoteConfigValue(key, value)) continue;
-      if (this.config[key] !== value) {
+      if (!sameConfigValue(this.config[key], value)) {
         Object.assign(this.config, { [key]: value });
         shouldReconfigureAutoFlag ||= isTriggerConfigKey(key);
       }
@@ -1436,9 +1436,22 @@ export class Crumbtrail {
 
     const autoFlagDetectors: SignalDetector[] = [];
     const shadowAutoFlagDetectors: SignalDetector[] = [];
+    // Shadow is per detector, not a mode. A single switch that routed the whole behavioral group
+    // into shadow meant turning measurement on stopped rage click, retry storm, slow response and
+    // abandoned flow from capturing at all — the opposite of what measuring one new candidate is
+    // for, and unusable on a project that depends on the triggers it would have silenced.
+    const shadowed = new Set(this.config.autoFlagShadowTriggers);
+    const register = (trigger: string, detector: SignalDetector): void => {
+      (shadowed.has(trigger) ? shadowAutoFlagDetectors : autoFlagDetectors).push(
+        detector,
+      );
+    };
     let renderedErrorCleanup: CollectorCleanup | undefined;
     if (this.config.autoFlagOnError || this.config.flightRecorder)
-      autoFlagDetectors.push(
+      // One detector serves both the uncaught error and unhandled rejection triggers, so it
+      // shadows under one name; shadowing `error` measures both.
+      register(
+        "error",
         errorDetector({
           uncaughtError: this.config.autoFlagOnUncaughtError,
           unhandledRejection: this.config.autoFlagOnUnhandledRejection,
@@ -1452,42 +1465,38 @@ export class Crumbtrail {
     // the screen saying so. It is the request-status trigger's job, so it lives here and the
     // retry storm detector keeps the threshold the customer configured.
     if (this.config.autoFlagOnRequest5xx)
-      autoFlagDetectors.push(
+      register(
+        "request5xx",
         requestFailureDetector({
           minStatus: this.config.flightRecorder ? 400 : 500,
         }),
       );
     if (this.config.autoFlagOnRenderedError || this.config.flightRecorder) {
-      autoFlagDetectors.push(renderedErrorDetector());
+      register("renderedError", renderedErrorDetector());
       renderedErrorCleanup = renderedErrorCollector(this.bus);
     }
     // Reactive, not behavioral: each of these reads a failure the application already had, so they
     // sit outside the `autoFlagOnSignals` group the way the error and request triggers do.
     if (this.config.autoFlagOnCaughtError)
-      autoFlagDetectors.push(caughtErrorDetector());
+      register("caughtError", caughtErrorDetector());
     if (this.config.autoFlagOnResponseBodyError)
-      autoFlagDetectors.push(responseBodyErrorDetector());
+      register("responseBodyError", responseBodyErrorDetector());
     if (this.config.autoFlagOnStreamFailure)
-      autoFlagDetectors.push(streamFailureDetector());
+      register("streamFailure", streamFailureDetector());
     if (this.config.autoFlagOnWorkerError)
-      autoFlagDetectors.push(workerErrorDetector());
-    if (
-      this.config.autoFlagOnSignals ||
-      this.config.flightRecorder ||
-      this.config.autoFlagShadowMode
-    ) {
-      const behavioralDetectors = this.config.autoFlagShadowMode
-        ? shadowAutoFlagDetectors
-        : autoFlagDetectors;
+      register("workerError", workerErrorDetector());
+    if (this.config.autoFlagOnSignals || this.config.flightRecorder) {
       if (this.config.autoFlagOnRageClick)
-        behavioralDetectors.push(
+        register(
+          "rageClick",
           rageClickDetector({
             threshold: this.config.rageClickThreshold,
             windowMs: this.config.rageClickWindowMs,
           }),
         );
       if (this.config.autoFlagOnRetryStorm)
-        behavioralDetectors.push(
+        register(
+          "retryStorm",
           retryStormDetector({
             threshold: this.config.retryStormThreshold,
             windowMs: this.config.retryStormWindowMs,
@@ -1495,7 +1504,8 @@ export class Crumbtrail {
           }),
         );
       if (this.config.autoFlagOnSlowResponse)
-        behavioralDetectors.push(
+        register(
+          "slowResponse",
           slowResponseDetector({
             thresholdMs: this.config.slowRequestMs,
             count: this.config.slowRequestCount,
@@ -1503,7 +1513,8 @@ export class Crumbtrail {
           }),
         );
       if (this.config.autoFlagOnAbandonedFlow)
-        behavioralDetectors.push(
+        register(
+          "abandonedFlow",
           abandonedFlowDetector({
             windowMs: this.config.abandonedFlowWindowMs,
             minInputs: this.config.abandonedFlowMinInputs,
@@ -2986,10 +2997,24 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return isRecord(value) ? value : undefined;
 }
 
+/**
+ * Reference equality is wrong for the one array valued remote key: a poll returning the same
+ * list is a new array every time, so `!==` would rebuild the auto flag controller on every poll.
+ */
+function sameConfigValue(current: unknown, next: unknown): boolean {
+  if (Array.isArray(current) && Array.isArray(next))
+    return (
+      current.length === next.length && current.every((v, i) => v === next[i])
+    );
+  return current === next;
+}
+
 function isRemoteConfigValue(
   key: (typeof REMOTE_CONFIG_KEYS)[number],
   value: unknown,
-): value is boolean | number {
+): value is boolean | number | string[] {
+  if (key === "autoFlagShadowTriggers")
+    return Array.isArray(value) && value.every((v) => typeof v === "string");
   if (
     key === "flightRecorder" ||
     key === "autoFlagOnError" ||
@@ -3001,7 +3026,6 @@ function isRemoteConfigValue(
     key === "autoFlagOnResponseBodyError" ||
     key === "autoFlagOnStreamFailure" ||
     key === "autoFlagOnWorkerError" ||
-    key === "autoFlagShadowMode" ||
     key === "explicitBeacon" ||
     key === "serverSidePull" ||
     key === "autoFlagOnSignals" ||
@@ -3018,6 +3042,7 @@ function isRemoteConfigValue(
 
 function isTriggerConfigKey(key: (typeof REMOTE_CONFIG_KEYS)[number]): boolean {
   return (
+    key === "autoFlagShadowTriggers" ||
     key === "flightRecorder" ||
     key === "autoFlagOnError" ||
     key === "autoFlagOnRenderedError" ||
@@ -3025,7 +3050,6 @@ function isTriggerConfigKey(key: (typeof REMOTE_CONFIG_KEYS)[number]): boolean {
     key === "autoFlagOnResponseBodyError" ||
     key === "autoFlagOnStreamFailure" ||
     key === "autoFlagOnWorkerError" ||
-    key === "autoFlagShadowMode" ||
     key === "autoFlagOnSignals" ||
     key === "autoFlagOnRageClick" ||
     key === "autoFlagOnRetryStorm" ||
