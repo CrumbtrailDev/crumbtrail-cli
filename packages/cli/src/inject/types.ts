@@ -9,6 +9,7 @@ export type PlanKind =
   | "skip-already-wired" // project already references Crumbtrail; no-op
   | "needs-confirm-dirty" // target has uncommitted changes; needs --force / confirm
   | "fallback-ai" // detection/safety ambiguous; hand off to the AI-prompt path
+  | "serverless-guidance" // exact serverless adapter guide; write nothing
   | "otlp-guidance"; // non-JS backend: emit OTLP setup guidance, write nothing
 
 /**
@@ -90,9 +91,9 @@ export interface Plan {
   sdkPackages?: string[];
   /** Non-fatal notes to surface to the user. */
   warnings: string[];
-  /** fallback-ai: the ready-to-paste code snippet (reads the key from env). */
+  /** Guidance: the ready-to-paste code snippet (reads the key from env). */
   snippet?: string;
-  /** fallback-ai: the `buildAgentPrompt` output for a coding agent. */
+  /** Guidance: the exact task description for a coding agent. */
   agentPrompt?: string;
   /**
    * The env var the injected code reads the ingest key from (e.g.

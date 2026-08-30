@@ -1859,6 +1859,209 @@ function planOtlp(input: BuildPlanInput, io: InjectIO): Plan {
   };
 }
 
+function serviceOption(input: BuildPlanInput, indent = "  "): string[] {
+  return input.serviceName
+    ? [`${indent}service: ${JSON.stringify(input.serviceName)},`]
+    : [];
+}
+
+function serverlessGuidancePlan(
+  input: BuildPlanInput,
+  snippet: string,
+  warnings: string[] = [],
+): Plan {
+  return {
+    recipe: input.recipe,
+    kind: "serverless-guidance",
+    targetPath: null,
+    content: null,
+    snippet,
+    agentPrompt: [
+      "Apply this serverless setup plan to one function whose runtime and export shape are proven by configuration or source:",
+      "",
+      snippet,
+      "",
+      "Keep the existing handler behavior and export name.",
+      "Do not edit another function. Build the changed function and send one real request before reporting the result.",
+    ].join("\n"),
+    // Guidance is deliberately nonmutating. The copyable plan tells the reader
+    // which package to install after choosing the proven function shape.
+    sdkPackages: [],
+    warnings,
+  };
+}
+
+function nodeLifecycle(platform: string): string[] {
+  return [
+    `${platform} Node handlers await Crumbtrail delivery before the handler promise settles.`,
+    "Request and response bodies are excluded by default.",
+  ];
+}
+
+function fetchLifecycle(platform: string, waitUntil: string): string[] {
+  return [
+    `${platform} Fetch handlers pass delivery to ${waitUntil}. Without a platform lifecycle callback, withCrumbtrailFetch awaits delivery before returning.`,
+    "Request and response bodies are excluded by default.",
+  ];
+}
+
+function awsLambdaGuidance(input: BuildPlanInput): string {
+  return [
+    "Install the Node adapters:",
+    "npm install crumbtrail-core crumbtrail-node",
+    "npm install --save-dev @types/aws-lambda",
+    "",
+    "Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY in the Lambda environment.",
+    "",
+    'import { withCrumbtrailAwsLambda } from "crumbtrail-node";',
+    'import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2, Context } from "aws-lambda";',
+    "",
+    "const handleRequest = async (",
+    "  event: APIGatewayProxyEventV2,",
+    "  _context: Context,",
+    "): Promise<APIGatewayProxyResultV2> => ({",
+    "  statusCode: 200,",
+    "  body: JSON.stringify({ path: event.rawPath }),",
+    "});",
+    "",
+    "export const handler = withCrumbtrailAwsLambda(handleRequest, {",
+    "  endpoint: process.env.CRUMBTRAIL_BASE_URL!,",
+    "  authToken: process.env.CRUMBTRAIL_KEY!,",
+    ...serviceOption(input),
+    "});",
+    "",
+    ...nodeLifecycle("AWS Lambda"),
+    "Callback handlers and non HTTP triggers are unsupported.",
+  ].join("\n");
+}
+
+function vercelNodeGuidance(input: BuildPlanInput): string {
+  return [
+    "Choose this plan only for a Vercel Node function.",
+    "npm install crumbtrail-core crumbtrail-node @vercel/node",
+    "",
+    "Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY in Vercel project environment variables.",
+    "",
+    'import { withCrumbtrailVercel } from "crumbtrail-node";',
+    'import type { VercelRequest, VercelResponse } from "@vercel/node";',
+    "",
+    "const handleRequest = async (request: VercelRequest, response: VercelResponse) => {",
+    "  response.status(200).json({ path: request.url });",
+    "};",
+    "",
+    "export default withCrumbtrailVercel(handleRequest, {",
+    "  endpoint: process.env.CRUMBTRAIL_BASE_URL!,",
+    "  authToken: process.env.CRUMBTRAIL_KEY!,",
+    ...serviceOption(input),
+    "});",
+    "",
+    ...nodeLifecycle("Vercel"),
+  ].join("\n");
+}
+
+function vercelEdgeGuidance(input: BuildPlanInput): string {
+  return [
+    "Choose this plan only for a Vercel function that declares runtime edge.",
+    "npm install crumbtrail-core @vercel/functions",
+    "",
+    "Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY in Vercel project environment variables.",
+    "",
+    'import { withCrumbtrailFetch } from "crumbtrail-core/serverless";',
+    'import { waitUntil } from "@vercel/functions";',
+    "",
+    'export const config = { runtime: "edge" };',
+    "",
+    "const handleRequest = async (request: Request) =>",
+    "  Response.json({ path: new URL(request.url).pathname });",
+    "",
+    "export default function handler(request: Request): Promise<Response> {",
+    "  return withCrumbtrailFetch(handleRequest, {",
+    "    endpoint: process.env.CRUMBTRAIL_BASE_URL!,",
+    "    authToken: process.env.CRUMBTRAIL_KEY!,",
+    "    waitUntil,",
+    ...serviceOption(input, "    "),
+    "  })(request);",
+    "}",
+    "",
+    ...fetchLifecycle("Vercel", "waitUntil from @vercel/functions"),
+  ].join("\n");
+}
+
+function netlifyNodeGuidance(input: BuildPlanInput): string {
+  return [
+    "Choose this plan only for a Netlify Node function.",
+    "npm install crumbtrail-core crumbtrail-node @netlify/functions",
+    "",
+    "Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY with the Netlify Functions scope.",
+    "",
+    'import { withCrumbtrailNetlify } from "crumbtrail-node";',
+    'import type { HandlerContext, HandlerEvent } from "@netlify/functions";',
+    "",
+    "const handleRequest = async (event: HandlerEvent, _context: HandlerContext) => ({",
+    "  statusCode: 200,",
+    "  body: JSON.stringify({ path: event.path }),",
+    "});",
+    "",
+    "export const handler = withCrumbtrailNetlify(handleRequest, {",
+    "  endpoint: process.env.CRUMBTRAIL_BASE_URL!,",
+    "  authToken: process.env.CRUMBTRAIL_KEY!,",
+    ...serviceOption(input),
+    "});",
+    "",
+    ...nodeLifecycle("Netlify"),
+  ].join("\n");
+}
+
+function netlifyEdgeGuidance(input: BuildPlanInput): string {
+  return [
+    "Choose this plan only for a Netlify Edge Function.",
+    "npm install crumbtrail-core @netlify/edge-functions",
+    "",
+    "Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY with the Netlify Functions scope.",
+    "",
+    'import { withCrumbtrailFetch } from "crumbtrail-core/serverless";',
+    'import type { Context } from "@netlify/edge-functions";',
+    "",
+    "const handleRequest = async (request: Request, _context: Context) =>",
+    "  Response.json({ path: new URL(request.url).pathname });",
+    "",
+    "export default function handler(request: Request, context: Context): Promise<Response> {",
+    "  return withCrumbtrailFetch((request) => handleRequest(request, context), {",
+    '    endpoint: Netlify.env.get("CRUMBTRAIL_BASE_URL")!,',
+    '    authToken: Netlify.env.get("CRUMBTRAIL_KEY")!,',
+    "    waitUntil: context.waitUntil.bind(context),",
+    ...serviceOption(input, "    "),
+    "  })(request);",
+    "}",
+    "",
+    ...fetchLifecycle("Netlify", "context.waitUntil"),
+  ].join("\n");
+}
+
+function denoDeployGuidance(input: BuildPlanInput): string {
+  return [
+    "Add the package with a Deno npm specifier and keep the existing Deno.serve handler behavior.",
+    "deno add npm:crumbtrail-core",
+    "",
+    'import { withCrumbtrailFetch } from "npm:crumbtrail-core/serverless";',
+    "",
+    "const handleRequest = async (request: Request) =>",
+    "  Response.json({ path: new URL(request.url).pathname });",
+    "",
+    "Deno.serve(",
+    "  withCrumbtrailFetch(handleRequest, {",
+    '    endpoint: Deno.env.get("CRUMBTRAIL_BASE_URL")!,',
+    '    authToken: Deno.env.get("CRUMBTRAIL_KEY")!,',
+    ...serviceOption(input, "    "),
+    "  }),",
+    ");",
+    "",
+    "Set CRUMBTRAIL_BASE_URL and CRUMBTRAIL_KEY in Deno Deploy. Local runs also need environment read permission.",
+    "Deno Deploy supplies no lifecycle callback here, so the Fetch adapter awaits delivery before returning.",
+    "Request and response bodies are excluded by default.",
+  ].join("\n");
+}
+
 function planCloudflareWorkers(input: BuildPlanInput, io: InjectIO): Plan {
   const endpoint = input.endpoint.replace(/\/$/, "");
   const usesToml = io.exists(path.join(input.cwd, "wrangler.toml"));
@@ -1892,7 +2095,7 @@ function planCloudflareWorkers(input: BuildPlanInput, io: InjectIO): Plan {
         "  }",
         "}",
       ];
-  const snippet = [
+  const nativeOtel = [
     "Cloudflare dashboard > Workers Observability > Destinations:",
     `1. Add a traces destination named crumbtrail-traces with endpoint ${endpoint}/v1/traces.`,
     `2. Add a logs destination named crumbtrail-logs with endpoint ${endpoint}/v1/logs.`,
@@ -1903,24 +2106,48 @@ function planCloudflareWorkers(input: BuildPlanInput, io: InjectIO): Plan {
     `Keep the Worker name stable${input.serviceName ? ` and use ${input.serviceName} as the Crumbtrail application name` : " so Cloudflare's service.name stays attributable"}.`,
   ].join("\n");
 
-  return {
-    recipe: input.recipe,
-    kind: "otlp-guidance",
-    targetPath: null,
-    content: null,
-    snippet,
-    agentPrompt: [
-      "Configure this Cloudflare Worker to export its native OpenTelemetry traces and logs to Crumbtrail.",
-      "Do not install crumbtrail-node. The Workers runtime does not use node:http.",
-      "Follow this exact setup:",
-      snippet,
-      "Verify the Worker deploys, then send a request and confirm the destination reports a successful delivery.",
-    ].join("\n"),
-    warnings: [
-      "Cloudflare OpenTelemetry export requires a Workers Paid plan or contract.",
-      "Cloudflare Workers does not export metrics through OpenTelemetry yet. This setup covers traces and logs.",
-    ],
-  };
+  const snippet = [
+    "Install the Fetch adapter:",
+    "npm install crumbtrail-core",
+    "",
+    "Add CRUMBTRAIL_BASE_URL as a Worker variable and CRUMBTRAIL_KEY as a Worker secret.",
+    "",
+    'import { withCrumbtrailFetch } from "crumbtrail-core/serverless";',
+    "",
+    "interface Env {",
+    "  CRUMBTRAIL_BASE_URL: string;",
+    "  CRUMBTRAIL_KEY: string;",
+    "}",
+    "",
+    "interface WorkerContext {",
+    "  waitUntil(promise: Promise<unknown>): void;",
+    "}",
+    "",
+    "const handleRequest = async (request: Request, _env: Env, _ctx: WorkerContext) =>",
+    "  Response.json({ path: new URL(request.url).pathname });",
+    "",
+    "export default {",
+    "  fetch(request: Request, env: Env, ctx: WorkerContext): Promise<Response> {",
+    "    return withCrumbtrailFetch((request) => handleRequest(request, env, ctx), {",
+    "      endpoint: env.CRUMBTRAIL_BASE_URL,",
+    "      authToken: env.CRUMBTRAIL_KEY,",
+    "      waitUntil: ctx.waitUntil.bind(ctx),",
+    ...serviceOption(input, "      "),
+    "    })(request);",
+    "  },",
+    "};",
+    "",
+    ...fetchLifecycle("Cloudflare Workers", "ctx.waitUntil"),
+    "Do not install crumbtrail-node in a Worker.",
+    "",
+    "Optional complementary native traces and logs:",
+    nativeOtel,
+  ].join("\n");
+
+  return serverlessGuidancePlan(input, snippet, [
+    "Cloudflare OpenTelemetry export requires a Workers Paid plan or contract.",
+    "Cloudflare native OpenTelemetry covers traces and logs. It does not export metrics.",
+  ]);
 }
 
 // --- dispatcher --------------------------------------------------------------
@@ -2919,6 +3146,7 @@ export function buildPlan(
   input = refused.input;
   const plan = dispatchPlan(input, io);
   if (refused.warning) plan.warnings = [refused.warning, ...plan.warnings];
+  if (plan.kind === "serverless-guidance") return plan;
   // Stamp the env var the injected code reads its key from, so the wizard can
   // print "set <VAR> in .env — get your key from the dashboard". Undefined only
   // for recipes that inject no key (tauri / otlp / angular).
@@ -2989,6 +3217,50 @@ export function buildPlan(
 }
 
 function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
+  switch (input.recipe) {
+    case "aws-lambda":
+      return serverlessGuidancePlan(input, awsLambdaGuidance(input));
+    case "vercel-functions":
+      return serverlessGuidancePlan(input, vercelNodeGuidance(input));
+    case "vercel-edge-functions":
+      return serverlessGuidancePlan(input, vercelEdgeGuidance(input));
+    case "vercel-functions-ambiguous":
+      return serverlessGuidancePlan(
+        input,
+        [
+          "Vercel runtime evidence is ambiguous. Inspect the function config and source, then apply exactly one option.",
+          "",
+          "Option 1: Node runtime",
+          vercelNodeGuidance(input),
+          "",
+          "Option 2: edge runtime",
+          vercelEdgeGuidance(input),
+        ].join("\n"),
+      );
+    case "netlify-functions":
+      return serverlessGuidancePlan(input, netlifyNodeGuidance(input));
+    case "netlify-edge-functions":
+      return serverlessGuidancePlan(input, netlifyEdgeGuidance(input));
+    case "netlify-functions-ambiguous":
+      return serverlessGuidancePlan(
+        input,
+        [
+          "Netlify runtime evidence is ambiguous. Inspect the function directory and source, then apply exactly one option.",
+          "",
+          "Option 1: Node runtime",
+          netlifyNodeGuidance(input),
+          "",
+          "Option 2: edge runtime",
+          netlifyEdgeGuidance(input),
+        ].join("\n"),
+      );
+    case "cloudflare-workers":
+      return planCloudflareWorkers(input, io);
+    case "deno-deploy":
+      return serverlessGuidancePlan(input, denoDeployGuidance(input));
+    default:
+      break;
+  }
   // Dependency presence is not enough. Only a complete integration for this
   // endpoint and service may skip the write. An incomplete reachable setup is
   // handed back as guidance so the existing initializer is repaired in place.
@@ -3029,8 +3301,6 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
     );
   }
   switch (input.recipe) {
-    case "cloudflare-workers":
-      return planCloudflareWorkers(input, io);
     case "tauri":
       return planTauri(input, io);
     case "capacitor":

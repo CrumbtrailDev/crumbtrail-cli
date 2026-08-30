@@ -1,0 +1,6 @@
+[functions]
+directory = "netlify/functions"
+
+[[edge_functions]]
+function = "edge"
+path = "/edge"

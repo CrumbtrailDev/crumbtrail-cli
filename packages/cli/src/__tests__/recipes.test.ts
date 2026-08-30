@@ -1401,8 +1401,8 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
   });
 });
 
-describe("buildPlan — Cloudflare Workers native OTLP export", () => {
-  it("uses Workers observability instead of the Node SDK", () => {
+describe("buildPlan — Cloudflare Workers Fetch and native OTLP guidance", () => {
+  it("uses the Fetch adapter and keeps Workers observability guidance", () => {
     const plan = buildPlan(
       {
         cwd: CWD,
@@ -1413,7 +1413,7 @@ describe("buildPlan — Cloudflare Workers native OTLP export", () => {
       fakeInjectIO({}),
     );
 
-    expect(plan.kind).toBe("otlp-guidance");
+    expect(plan.kind).toBe("serverless-guidance");
     expect(plan.targetPath).toBeNull();
     expect(plan.content).toBeNull();
     expect(plan.snippet).toContain(`${ENDPOINT}/v1/traces`);
@@ -1422,10 +1422,14 @@ describe("buildPlan — Cloudflare Workers native OTLP export", () => {
     expect(plan.snippet).toContain("crumbtrail-traces");
     expect(plan.snippet).toContain("crumbtrail-logs");
     expect(plan.snippet).toContain("wrangler.jsonc");
-    expect(plan.snippet).not.toContain("crumbtrail-node");
+    expect(plan.snippet).toContain("withCrumbtrailFetch");
+    expect(plan.snippet).toContain("env.CRUMBTRAIL_BASE_URL");
+    expect(plan.snippet).toContain("ctx.waitUntil");
+    expect(plan.snippet).not.toContain('from "crumbtrail-node"');
     expect(plan.warnings.join("\n")).toContain("Workers Paid");
     expect(plan.warnings.join("\n")).toContain("metrics");
     expect(plan.keyEnvVar).toBeUndefined();
+    expect(plan.sdkPackages).toEqual([]);
   });
 
   it("prints TOML configuration for a wrangler.toml project", () => {

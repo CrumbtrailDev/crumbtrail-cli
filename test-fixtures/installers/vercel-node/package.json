@@ -1,0 +1,7 @@
+{
+  "name": "vercel-node",
+  "main": "api/hello.ts",
+  "dependencies": {
+    "@vercel/node": "^5.0.0"
+  }
+}

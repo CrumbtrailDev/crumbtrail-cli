@@ -1,0 +1,6 @@
+{
+  "name": "netlify-edge",
+  "dependencies": {
+    "@netlify/edge-functions": "^2.0.0"
+  }
+}

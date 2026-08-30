@@ -1,0 +1,6 @@
+{
+  "name": "netlify-node",
+  "dependencies": {
+    "@netlify/functions": "^4.0.0"
+  }
+}
