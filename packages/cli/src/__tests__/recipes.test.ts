@@ -1267,6 +1267,127 @@ describe("buildPlan — otlp guidance (non-JS backends)", () => {
     expect(plan.agentPrompt).toContain("OTEL_EXPORTER_OTLP_ENDPOINT");
     expect(plan.agentPrompt).not.toContain("PRESET_PASSIVE");
   });
+
+  it("wires a requirements and Procfile FastAPI service with zero code instrumentation", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "otlp",
+        endpoint: ENDPOINT,
+        stack: "fastapi",
+        serviceName: "orders-api",
+      },
+      fakeInjectIO({
+        [p("requirements.txt")]: "fastapi\ngunicorn\n",
+        [p("Procfile")]: "web: gunicorn app:app\n",
+      }),
+    );
+
+    expect(plan.kind).toBe("rewrite");
+    expect(plan.targetPath).toBe(p("Procfile"));
+    expect(plan.content).toContain("OTEL_SERVICE_NAME='orders-api'");
+    expect(plan.content).toContain(`OTEL_EXPORTER_OTLP_ENDPOINT='${ENDPOINT}'`);
+    expect(plan.content).toContain(
+      'OTEL_EXPORTER_OTLP_HEADERS="X-Crumbtrail-Auth=${CRUMBTRAIL_KEY}"',
+    );
+    expect(plan.content).toContain("opentelemetry-instrument gunicorn app:app");
+    expect(plan.keyEnvVar).toBe("CRUMBTRAIL_KEY");
+    expect(plan.extraEdits).toEqual([
+      expect.objectContaining({
+        path: p("requirements.txt"),
+        mode: "update",
+        content: expect.stringContaining("opentelemetry-distro"),
+      }),
+    ]);
+    expect(plan.extraEdits?.[0]?.content).toContain(
+      "opentelemetry-exporter-otlp-proto-http",
+    );
+    expect(plan.extraEdits?.[0]?.content).toContain(
+      "opentelemetry-instrumentation-fastapi",
+    );
+  });
+
+  it("adds Celery instrumentation when the Python service declares Celery", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "otlp",
+        endpoint: ENDPOINT,
+        stack: "django",
+      },
+      fakeInjectIO({
+        [p("requirements.txt")]: "Django\ncelery\n",
+        [p("Procfile")]:
+          "web: gunicorn config.wsgi\nworker: celery -A config worker\n",
+      }),
+    );
+
+    expect(plan.content).toContain("web: ");
+    expect(plan.content).toContain("worker: ");
+    expect(plan.content?.match(/opentelemetry-instrument/g)).toHaveLength(2);
+    expect(plan.extraEdits?.[0]?.content).toContain(
+      "opentelemetry-instrumentation-django",
+    );
+    expect(plan.extraEdits?.[0]?.content).toContain(
+      "opentelemetry-instrumentation-celery",
+    );
+  });
+
+  it("does not rewrite an already configured Python service", () => {
+    const command = [
+      "web:",
+      "OTEL_SERVICE_NAME='orders-api'",
+      `OTEL_EXPORTER_OTLP_ENDPOINT='${ENDPOINT}'`,
+      "OTEL_EXPORTER_OTLP_PROTOCOL='http/protobuf'",
+      'OTEL_EXPORTER_OTLP_HEADERS="X-Crumbtrail-Auth=${CRUMBTRAIL_KEY}"',
+      "OTEL_TRACES_EXPORTER='otlp'",
+      "OTEL_METRICS_EXPORTER='none'",
+      "OTEL_LOGS_EXPORTER='none'",
+      "opentelemetry-instrument gunicorn app:app",
+    ].join(" ");
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "otlp",
+        endpoint: ENDPOINT,
+        stack: "fastapi",
+        serviceName: "orders-api",
+      },
+      fakeInjectIO({
+        [p("requirements.txt")]: [
+          "fastapi",
+          "opentelemetry-distro",
+          "opentelemetry-exporter-otlp-proto-http",
+          "opentelemetry-instrumentation-fastapi",
+          "",
+        ].join("\n"),
+        [p("Procfile")]: `${command}\n`,
+      }),
+    );
+
+    expect(plan.kind).toBe("skip-already-wired");
+    expect(plan.extraEdits).toBeUndefined();
+  });
+
+  it("requires confirmation when either Python deployment file is dirty", () => {
+    const files = {
+      [p("requirements.txt")]: "Flask\n",
+      [p("Procfile")]: "web: gunicorn app:app\n",
+    };
+    for (const dirty of [p("requirements.txt"), p("Procfile")]) {
+      const plan = buildPlan(
+        {
+          cwd: CWD,
+          recipe: "otlp",
+          endpoint: ENDPOINT,
+          stack: "flask",
+        },
+        fakeInjectIO(files, { dirty: [dirty] }),
+      );
+      expect(plan.kind).toBe("needs-confirm-dirty");
+      expect(plan.applyMode).toBe("rewrite");
+    }
+  });
 });
 
 describe("buildPlan — Cloudflare Workers native OTLP export", () => {
@@ -1962,7 +2083,8 @@ describe("buildPlan — advice is gated on what the package actually is", () => 
   it("still warns a backend that does answer HTTP", () => {
     const io = fakeInjectIO({
       [p("package.json")]: JSON.stringify({ name: "api" }),
-      [p("src", "server.js")]: 'import http from "node:http";\nhttp.createServer(handler).listen(3000);\n',
+      [p("src", "server.js")]:
+        'import http from "node:http";\nhttp.createServer(handler).listen(3000);\n',
     });
     const plan = buildPlan(
       {

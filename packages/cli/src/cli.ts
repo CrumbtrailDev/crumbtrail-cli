@@ -569,6 +569,8 @@ export interface InstallSdkInput {
   cwd: string;
   packageManager: PackageManager | null;
   recipe: Recipe;
+  /** Packages selected dynamically by the injection plan. */
+  packagesOverride?: string[];
   base: string;
   ui: Ui;
   /** Injected runner (tests); returns the child exit code. */
@@ -767,7 +769,7 @@ async function discoverTarballUrls(
 export async function installSdk(
   input: InstallSdkInput,
 ): Promise<InstallSdkResult> {
-  const packages = sdkPackagesFor(input.recipe);
+  const packages = input.packagesOverride ?? sdkPackagesFor(input.recipe);
   // Empty package list (the `otlp` guidance recipe): there is no SDK to add —
   // skip the install entirely. Never spawn a bare `<pm> add`/`npm install` with
   // no args, which would install ALL deps. Early-return a skipped result.
@@ -776,6 +778,24 @@ export async function installSdk(
   }
   const run = input.spawnFn ?? realSpawn;
   const meta = RECIPE_REGISTRY[input.recipe];
+
+  if (input.recipe === "otlp" && input.packagesOverride) {
+    input.ui.out(
+      `  ${color.dim("Installing Python instrumentation:")} ${color.brand(`python -m pip install ${packages.join(" ")}`)}`,
+    );
+    const code = run(
+      "python",
+      ["-m", "pip", "install", ...packages],
+      input.cwd,
+    );
+    return code === 0
+      ? { installed: true, packages }
+      : {
+          installed: false,
+          packages,
+          note: `\`python -m pip install ${packages.join(" ")}\` failed. Activate the service's Python environment and run the command again.`,
+        };
+  }
 
   // A package that is not on its registry cannot be added, and saying so is the
   // whole job here. Attempting it produces a failure whose real cause — the
@@ -1345,6 +1365,7 @@ export async function runWizard(
         cwd,
         packageManager: result.packageManager,
         recipe: result.recipe,
+        packagesOverride: plan.sdkPackages,
         base,
         ui,
         fetchImpl: deps.fetchImpl,
@@ -2273,6 +2294,7 @@ export async function runBatchWizard(
             packageManager:
               c.detected.packageManager ?? ctx.root.packageManager,
             recipe,
+            packagesOverride: plan.sdkPackages,
             base,
             ui,
             fetchImpl: deps.fetchImpl,
@@ -2851,7 +2873,7 @@ async function confirmInjection(
   if (RECIPE_REGISTRY[plan.recipe].sdkUnpublished) return { approved: true };
   if (parsed.yes) return { approved: true };
 
-  const packages = sdkPackagesFor(plan.recipe);
+  const packages = plan.sdkPackages ?? sdkPackagesFor(plan.recipe);
   const writes = [
     plan.targetPath ? `edit ${plan.targetPath}` : null,
     packages.length > 0

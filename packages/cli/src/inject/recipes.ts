@@ -20,7 +20,11 @@ import type { Stack } from "crumbtrail-core";
 import { isBackendRecipe } from "../backend-origins";
 import { isBuildOutputPath, type Recipe } from "../detect";
 import type { FileReader } from "../readers/types";
-import { RECIPE_REGISTRY, type KeyRef } from "../recipe-registry";
+import {
+  pythonOtelPackages,
+  RECIPE_REGISTRY,
+  type KeyRef,
+} from "../recipe-registry";
 import {
   inspectIntegration,
   reachableSourceFiles,
@@ -1670,14 +1674,131 @@ function planTauri(input: BuildPlanInput, io: InjectIO): Plan {
   ]);
 }
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function appendPythonRequirements(
+  source: string,
+  stack: Stack,
+): { content: string; packages: string[] } | null {
+  const packages = pythonOtelPackages(
+    stack,
+    /(^|\n)\s*celery(?:\s|[=<>!~])/i.test(`\n${source}`),
+  );
+  if (packages.length === 0) return null;
+  const declared = new Set(
+    source
+      .split(/\r?\n/)
+      .map((line) =>
+        line
+          .trim()
+          .match(/^([A-Za-z0-9_.-]+)/)?.[1]
+          ?.toLowerCase(),
+      )
+      .filter((name): name is string => Boolean(name)),
+  );
+  const missing = packages.filter((pkg) => !declared.has(pkg));
+  return {
+    content:
+      missing.length === 0
+        ? source
+        : `${source.replace(/\s*$/, "")}\n${missing.join("\n")}\n`,
+    packages,
+  };
+}
+
+function planPythonOtlp(input: BuildPlanInput, io: InjectIO): Plan | null {
+  const stack = input.stack;
+  if (!stack || pythonOtelPackages(stack).length === 0) return null;
+  const requirementsPath = path.join(input.cwd, "requirements.txt");
+  const procfilePath = path.join(input.cwd, "Procfile");
+  const requirements = io.readFile(requirementsPath);
+  const procfile = io.readFile(procfilePath);
+  if (requirements == null || procfile == null) return null;
+
+  const dependencyEdit = appendPythonRequirements(requirements, stack);
+  if (!dependencyEdit) return null;
+  const serviceName = input.serviceName?.trim() || "backend";
+  const prefix = [
+    `OTEL_SERVICE_NAME=${shellSingleQuote(serviceName)}`,
+    `OTEL_EXPORTER_OTLP_ENDPOINT=${shellSingleQuote(input.endpoint.replace(/\/$/, ""))}`,
+    "OTEL_EXPORTER_OTLP_PROTOCOL='http/protobuf'",
+    'OTEL_EXPORTER_OTLP_HEADERS="X-Crumbtrail-Auth=${CRUMBTRAIL_KEY}"',
+    "OTEL_TRACES_EXPORTER='otlp'",
+    "OTEL_METRICS_EXPORTER='none'",
+    "OTEL_LOGS_EXPORTER='none'",
+  ].join(" ");
+  let processes = 0;
+  let configured = 0;
+  let wrapped = 0;
+  const procfileContent = procfile.replace(
+    /^(web|worker):\s+(.+)$/gm,
+    (line, process: string, command: string) => {
+      processes += 1;
+      if (
+        command.includes("opentelemetry-instrument") &&
+        command.includes(
+          `OTEL_EXPORTER_OTLP_ENDPOINT=${shellSingleQuote(input.endpoint.replace(/\/$/, ""))}`,
+        ) &&
+        command.includes("X-Crumbtrail-Auth=${CRUMBTRAIL_KEY}")
+      ) {
+        configured += 1;
+        return line;
+      }
+      if (/OTEL_EXPORTER_OTLP_|CRUMBTRAIL_KEY/.test(command)) return line;
+      wrapped += 1;
+      const launch = /\bopentelemetry-instrument\b/.test(command)
+        ? command
+        : `opentelemetry-instrument ${command}`;
+      return `${process}: ${prefix} ${launch}`;
+    },
+  );
+  if (
+    processes > 0 &&
+    configured === processes &&
+    dependencyEdit.content === requirements
+  ) {
+    const plan = skipPlan(input);
+    plan.keyEnvVar = "CRUMBTRAIL_KEY";
+    return plan;
+  }
+  if (wrapped === 0) return null;
+
+  const dirty = [procfilePath, requirementsPath].some(
+    (target) => io.gitStatus(input.cwd, target).dirty,
+  );
+  return {
+    recipe: input.recipe,
+    kind: dirty ? "needs-confirm-dirty" : "rewrite",
+    targetPath: procfilePath,
+    content: procfileContent,
+    ...(dirty ? { applyMode: "rewrite" as const } : {}),
+    extraEdits: [
+      {
+        path: requirementsPath,
+        mode: "update",
+        content: dependencyEdit.content,
+        label: `added ${dependencyEdit.packages.join(", ")} to requirements.txt`,
+      },
+    ],
+    sdkPackages: dependencyEdit.packages,
+    keyEnvVar: "CRUMBTRAIL_KEY",
+    warnings: [
+      "Crumbtrail will add Python OpenTelemetry dependencies and wrap the Procfile web and worker commands with zero code instrumentation.",
+      "Python automatic instrumentation currently exports traces. Metrics and logs remain off.",
+    ],
+  };
+}
+
 /**
- * OTLP guidance path (non-JS backends). This recipe NEVER mutates the
- * filesystem: it returns a guidance-only plan (`targetPath`/`content` null)
- * carrying the OTLP setup snippet + the no-SDK agent prompt, keyed to the
- * DETECTED backend Stack (input.stack), not the registry placeholder. An
- * intentional, honest path — not the fallback-ai apology.
+ * OTLP setup for non-JS backends. Python requirements plus Procfile projects
+ * get a deterministic zero-code edit; every other shape keeps the guidance
+ * path because its dependency and launch configuration cannot be inferred.
  */
-function planOtlp(input: BuildPlanInput): Plan {
+function planOtlp(input: BuildPlanInput, io: InjectIO): Plan {
+  const automaticPython = planPythonOtlp(input, io);
+  if (automaticPython) return automaticPython;
   const stack: Stack = input.stack ?? RECIPE_REGISTRY[input.recipe].stack;
   // Hands-off: the guidance carries a placeholder the user replaces with the key
   // they mint in the dashboard, never a live minted key.
@@ -2133,8 +2254,7 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
       // prompt differentiates framework middleware via the registry stack.
       return planNode(input, io);
     case "otlp":
-      // Guidance-only, non-mutating path for non-JS OTLP backends.
-      return planOtlp(input);
+      return planOtlp(input, io);
     default: {
       const exhaustive: never = input.recipe;
       throw new Error(`Unknown recipe: ${String(exhaustive)}`);

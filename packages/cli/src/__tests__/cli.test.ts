@@ -993,6 +993,32 @@ describe("wizard orchestration", () => {
 describe("installSdk — tarball fallback (registry unavailable)", () => {
   const uiSink: Ui = { out: () => {}, err: () => {} };
 
+  it("installs the Python packages selected by an automatic OTLP plan", async () => {
+    const calls: { cmd: string; args: string[] }[] = [];
+    const packages = [
+      "opentelemetry-distro",
+      "opentelemetry-exporter-otlp-proto-http",
+      "opentelemetry-instrumentation-fastapi",
+    ];
+    const result = await realInstallSdk({
+      cwd: "/app",
+      packageManager: null,
+      recipe: "otlp",
+      packagesOverride: packages,
+      base: "https://deploy.example",
+      ui: uiSink,
+      spawnFn: (cmd, args) => {
+        calls.push({ cmd, args });
+        return 0;
+      },
+    });
+
+    expect(result).toEqual({ installed: true, packages });
+    expect(calls).toEqual([
+      { cmd: "python", args: ["-m", "pip", "install", ...packages] },
+    ]);
+  });
+
   it("refuses to add a package that is not on its registry, and says why", async () => {
     const calls: { cmd: string; args: string[] }[] = [];
     const result = await realInstallSdk({

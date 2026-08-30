@@ -10,6 +10,26 @@
 import type { Stack } from "crumbtrail-core";
 import type { Recipe } from "./detect";
 
+const PYTHON_OTLP_INSTRUMENTATION: Partial<Record<Stack, string>> = {
+  django: "opentelemetry-instrumentation-django",
+  fastapi: "opentelemetry-instrumentation-fastapi",
+  flask: "opentelemetry-instrumentation-flask",
+};
+
+export function pythonOtelPackages(
+  stack: Stack | null | undefined,
+  hasCelery = false,
+): string[] {
+  const framework = stack ? PYTHON_OTLP_INSTRUMENTATION[stack] : undefined;
+  if (!framework) return [];
+  return [
+    "opentelemetry-distro",
+    "opentelemetry-exporter-otlp-proto-http",
+    framework,
+    ...(hasCelery ? ["opentelemetry-instrumentation-celery"] : []),
+  ];
+}
+
 /**
  * Discriminator for how a recipe is applied. Every JS recipe injects a snippet;
  * `otlp` is the guidance-only path (CP5) — it mutates nothing and emits OTLP
