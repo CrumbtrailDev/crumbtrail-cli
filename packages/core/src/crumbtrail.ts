@@ -244,6 +244,7 @@ const REMOTE_CONFIG_KEYS = [
   "autoFlagOnAbandonedFlow",
   "autoFlagDebounceMs",
   "autoFlagMaxPerSession",
+  "autoFlagShadowMode",
   "rageClickThreshold",
   "rageClickWindowMs",
   "retryStormThreshold",
@@ -1015,6 +1016,7 @@ export class Crumbtrail {
     }
     const durationMs =
       events.length >= 2 ? events[events.length - 1].t - events[0].t : 0;
+    const shadowSignalCounts = this.autoFlag?.shadowCounts();
 
     const report: BugReport = {
       bugId,
@@ -1027,6 +1029,9 @@ export class Crumbtrail {
       userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
       ...this.identity,
       tags: options?.tags,
+      ...(shadowSignalCounts && Object.keys(shadowSignalCounts).length > 0
+        ? { shadowSignalCounts }
+        : {}),
       summary: {
         errorCount,
         failedRequestCount,
@@ -1430,6 +1435,7 @@ export class Crumbtrail {
     this.autoFlagCleanup = undefined;
 
     const autoFlagDetectors: SignalDetector[] = [];
+    const shadowAutoFlagDetectors: SignalDetector[] = [];
     let renderedErrorCleanup: CollectorCleanup | undefined;
     if (this.config.autoFlagOnError || this.config.flightRecorder)
       autoFlagDetectors.push(
@@ -1465,16 +1471,23 @@ export class Crumbtrail {
       autoFlagDetectors.push(streamFailureDetector());
     if (this.config.autoFlagOnWorkerError)
       autoFlagDetectors.push(workerErrorDetector());
-    if (this.config.autoFlagOnSignals || this.config.flightRecorder) {
+    if (
+      this.config.autoFlagOnSignals ||
+      this.config.flightRecorder ||
+      this.config.autoFlagShadowMode
+    ) {
+      const behavioralDetectors = this.config.autoFlagShadowMode
+        ? shadowAutoFlagDetectors
+        : autoFlagDetectors;
       if (this.config.autoFlagOnRageClick)
-        autoFlagDetectors.push(
+        behavioralDetectors.push(
           rageClickDetector({
             threshold: this.config.rageClickThreshold,
             windowMs: this.config.rageClickWindowMs,
           }),
         );
       if (this.config.autoFlagOnRetryStorm)
-        autoFlagDetectors.push(
+        behavioralDetectors.push(
           retryStormDetector({
             threshold: this.config.retryStormThreshold,
             windowMs: this.config.retryStormWindowMs,
@@ -1482,7 +1495,7 @@ export class Crumbtrail {
           }),
         );
       if (this.config.autoFlagOnSlowResponse)
-        autoFlagDetectors.push(
+        behavioralDetectors.push(
           slowResponseDetector({
             thresholdMs: this.config.slowRequestMs,
             count: this.config.slowRequestCount,
@@ -1490,14 +1503,18 @@ export class Crumbtrail {
           }),
         );
       if (this.config.autoFlagOnAbandonedFlow)
-        autoFlagDetectors.push(
+        behavioralDetectors.push(
           abandonedFlowDetector({
             windowMs: this.config.abandonedFlowWindowMs,
             minInputs: this.config.abandonedFlowMinInputs,
           }),
         );
     }
-    if (autoFlagDetectors.length === 0) return;
+    if (
+      autoFlagDetectors.length === 0 &&
+      shadowAutoFlagDetectors.length === 0
+    )
+      return;
 
     const autoFlag = createAutoFlagController({
       debounceMs: this.config.autoFlagDebounceMs,
@@ -1508,6 +1525,7 @@ export class Crumbtrail {
           false,
         ).then((outcome) => outcome.captured),
       detectors: autoFlagDetectors,
+      shadowDetectors: shadowAutoFlagDetectors,
     });
     this.autoFlag = autoFlag;
     const detach = this.bus.tap((event) => autoFlag.handleEvent(event));
@@ -2983,6 +3001,7 @@ function isRemoteConfigValue(
     key === "autoFlagOnResponseBodyError" ||
     key === "autoFlagOnStreamFailure" ||
     key === "autoFlagOnWorkerError" ||
+    key === "autoFlagShadowMode" ||
     key === "explicitBeacon" ||
     key === "serverSidePull" ||
     key === "autoFlagOnSignals" ||
@@ -3006,6 +3025,7 @@ function isTriggerConfigKey(key: (typeof REMOTE_CONFIG_KEYS)[number]): boolean {
     key === "autoFlagOnResponseBodyError" ||
     key === "autoFlagOnStreamFailure" ||
     key === "autoFlagOnWorkerError" ||
+    key === "autoFlagShadowMode" ||
     key === "autoFlagOnSignals" ||
     key === "autoFlagOnRageClick" ||
     key === "autoFlagOnRetryStorm" ||
