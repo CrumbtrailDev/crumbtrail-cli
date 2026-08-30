@@ -337,7 +337,10 @@ describe("the other processes the package starts", () => {
   });
 
   it.each([
-    ["railway.worker.json", JSON.stringify({ deploy: { startCommand: "pnpm worker" } })],
+    [
+      "railway.worker.json",
+      JSON.stringify({ deploy: { startCommand: "pnpm worker" } }),
+    ],
     [
       "docker-compose.yaml",
       "services:\n  worker:\n    command:\n      - npm\n      - run\n      - worker\n",
@@ -350,10 +353,7 @@ describe("the other processes the package starts", () => {
       "docker-compose.shell.yml",
       'services:\n  worker:\n    command: ["sh", "-c", "pnpm worker"]\n',
     ],
-    [
-      "Dockerfile",
-      'CMD ["sh", "-c", "exec pnpm worker"]\n',
-    ],
+    ["Dockerfile", 'CMD ["sh", "-c", "exec pnpm worker"]\n'],
   ])("accepts structured deployment command proof in %s", (manifest, body) => {
     const plan = buildPlan(
       {
@@ -373,8 +373,9 @@ describe("the other processes the package starts", () => {
         [p(manifest)]: body,
       }),
     );
-    expect(plan.extraEdits?.some((edit) => edit.path === p("src", "worker.ts")))
-      .toBe(true);
+    expect(
+      plan.extraEdits?.some((edit) => edit.path === p("src", "worker.ts")),
+    ).toBe(true);
   });
 
   it("maps a sibling Railway compiled entry through the package tsconfig", () => {
@@ -390,9 +391,17 @@ describe("the other processes the package starts", () => {
         [p("package.json")]: PKG({
           dev: "tsx watch api/src/index.ts",
           "dev:worker": "tsx watch api/src/worker.ts",
+          build: "pnpm build:api",
+          "build:api": "tsc -p tsconfig.build.json",
         }),
         [p("tsconfig.json")]: JSON.stringify({
           compilerOptions: { rootDir: ".", outDir: "dist" },
+          include: ["api/src/**/*.ts", "api/test/**/*.ts"],
+        }),
+        [p("tsconfig.build.json")]: JSON.stringify({
+          extends: "./tsconfig.json",
+          include: ["api/src/**/*.ts"],
+          exclude: ["api/test"],
         }),
         [p("api", "src", "index.ts")]: "app.listen(3000)",
         [p("api", "src", "worker.ts")]: "await runQueueOnce()",
@@ -402,8 +411,11 @@ describe("the other processes the package starts", () => {
       }),
     );
 
-    expect(plan.extraEdits?.some((edit) => edit.path === p("api", "src", "worker.ts")))
-      .toBe(true);
+    expect(
+      plan.extraEdits?.some(
+        (edit) => edit.path === p("api", "src", "worker.ts"),
+      ),
+    ).toBe(true);
   });
 
   it("does not guess a source entry from an unproven compiled Railway path", () => {
@@ -428,8 +440,216 @@ describe("the other processes the package starts", () => {
       }),
     );
 
-    expect(plan.extraEdits?.some((edit) => edit.path === p("api", "src", "worker.ts")))
-      .toBeFalsy();
+    expect(
+      plan.extraEdits?.some(
+        (edit) => edit.path === p("api", "src", "worker.ts"),
+      ),
+    ).toBeFalsy();
+  });
+
+  it.each([
+    [
+      "a tsconfig the build script does not use",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.production.json",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { rootDir: ".", outDir: "dist" },
+            include: ["api/src/**/*.ts"],
+          },
+          "tsconfig.production.json": {
+            compilerOptions: { rootDir: ".", outDir: "build" },
+            include: ["api/src/**/*.ts"],
+          },
+        },
+      },
+    ],
+    [
+      "noEmit",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.json",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { rootDir: ".", outDir: "dist", noEmit: true },
+            include: ["api/src/**/*.ts"],
+          },
+        },
+      },
+    ],
+    [
+      "an inferred rootDir whose emitted path is ambiguous",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.json",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { outDir: "dist" },
+            include: ["api/src/**/*.ts"],
+          },
+        },
+      },
+    ],
+    [
+      "an include list that omits the candidate",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.json",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { rootDir: ".", outDir: "dist" },
+            include: ["api/src/index.ts"],
+          },
+        },
+      },
+    ],
+    [
+      "an exclude list that removes the candidate",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.json",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { rootDir: ".", outDir: "dist" },
+            include: ["api/src/**/*.ts"],
+            exclude: ["api/src/worker.ts"],
+          },
+        },
+      },
+    ],
+    [
+      "a files list that omits the candidate",
+      {
+        scripts: {
+          build: "tsc -p tsconfig.json",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        },
+        configs: {
+          "tsconfig.json": {
+            compilerOptions: { rootDir: ".", outDir: "dist" },
+            files: ["api/src/index.ts"],
+          },
+        },
+      },
+    ],
+  ])("does not map compiled output from %s", (_reason, fixture) => {
+    const configs = Object.fromEntries(
+      Object.entries(fixture.configs).map(([name, config]) => [
+        p(name),
+        JSON.stringify(config),
+      ]),
+    );
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("api", "src", "index.ts"),
+        serviceName: "marginary",
+      },
+      fakeInjectIO({
+        [p("package.json")]: PKG(fixture.scripts),
+        ...configs,
+        [p("api", "src", "index.ts")]: "app.listen(3000)",
+        [p("api", "src", "worker.ts")]: "await runQueueOnce()",
+        [p("railway.worker.json")]: JSON.stringify({
+          deploy: { startCommand: "node dist/api/src/worker.js" },
+        }),
+      }),
+    );
+
+    expect(
+      plan.extraEdits?.some(
+        (edit) => edit.path === p("api", "src", "worker.ts"),
+      ),
+    ).toBeFalsy();
+  });
+
+  it.each([
+    "node -r dist/api/src/worker.js dist/api/src/index.js",
+    "node --require dist/api/src/worker.js dist/api/src/index.js",
+    "node --import dist/api/src/worker.js dist/api/src/index.js",
+  ])(
+    "does not mistake a Node preload operand for the program: %s",
+    (command) => {
+      const plan = buildPlan(
+        {
+          cwd: CWD,
+          recipe: "node",
+          endpoint: ENDPOINT,
+          entryFile: p("api", "src", "index.ts"),
+          serviceName: "marginary",
+        },
+        fakeInjectIO({
+          [p("package.json")]: PKG({
+            build: "tsc -p tsconfig.json",
+            "dev:worker": "tsx watch api/src/worker.ts",
+          }),
+          [p("tsconfig.json")]: JSON.stringify({
+            compilerOptions: { rootDir: ".", outDir: "dist" },
+            include: ["api/src/**/*.ts"],
+          }),
+          [p("api", "src", "index.ts")]: "app.listen(3000)",
+          [p("api", "src", "worker.ts")]: "await runQueueOnce()",
+          [p("railway.worker.json")]: JSON.stringify({
+            deploy: { startCommand: command },
+          }),
+        }),
+      );
+
+      expect(
+        plan.extraEdits?.some(
+          (edit) => edit.path === p("api", "src", "worker.ts"),
+        ),
+      ).toBeFalsy();
+    },
+  );
+
+  it("selects the program after Node preload operands", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("api", "src", "index.ts"),
+        serviceName: "marginary",
+      },
+      fakeInjectIO({
+        [p("package.json")]: PKG({
+          build: "tsc -p tsconfig.json",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        }),
+        [p("tsconfig.json")]: JSON.stringify({
+          compilerOptions: { rootDir: ".", outDir: "dist" },
+          include: ["api/src/**/*.ts"],
+        }),
+        [p("api", "src", "index.ts")]: "app.listen(3000)",
+        [p("api", "src", "worker.ts")]: "await runQueueOnce()",
+        [p("railway.worker.json")]: JSON.stringify({
+          deploy: {
+            startCommand:
+              "node --require dist/register.js --import dist/instrument.mjs dist/api/src/worker.js",
+          },
+        }),
+      }),
+    );
+
+    expect(
+      plan.extraEdits?.some(
+        (edit) => edit.path === p("api", "src", "worker.ts"),
+      ),
+    ).toBe(true);
   });
 
   it("does not treat a mentioned package manager as command proof", () => {
@@ -452,8 +672,9 @@ describe("the other processes the package starts", () => {
           "services:\n  worker:\n    command: [echo, pnpm, worker]\n",
       }),
     );
-    expect(plan.extraEdits?.some((edit) => edit.path === p("src", "worker.ts")))
-      .toBeFalsy();
+    expect(
+      plan.extraEdits?.some((edit) => edit.path === p("src", "worker.ts")),
+    ).toBeFalsy();
   });
 
   it("does not wire one shot maintenance scripts beside a real server", () => {
