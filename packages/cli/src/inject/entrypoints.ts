@@ -247,6 +247,55 @@ function deploymentStartsScript(
   entry: ExtraEntry,
 ): boolean {
   if (!io.listFiles) return false;
+  const commandNamesEntry = (tokens: string[]): boolean => {
+    const runtime = tokens[0]?.toLowerCase();
+    if (!runtime || !/^(?:node|tsx|ts-node|bun|deno)$/.test(runtime)) {
+      return false;
+    }
+    const commandPath = tokens
+      .slice(1)
+      .find(
+        (token) =>
+          !token.startsWith("-") && RUNNABLE_EXTENSIONS.has(path.extname(token)),
+      );
+    if (!commandPath) return false;
+
+    const commanded = path.resolve(cwd, commandPath);
+    if (commanded === path.resolve(entry.path)) return true;
+
+    const sourceExt = path.extname(entry.path).toLowerCase();
+    const emittedExt =
+      sourceExt === ".mts"
+        ? ".mjs"
+        : sourceExt === ".cts"
+          ? ".cjs"
+          : sourceExt === ".ts" || sourceExt === ".tsx"
+            ? ".js"
+            : sourceExt;
+    for (const configName of [
+      "tsconfig.json",
+      "tsconfig.build.json",
+      "tsconfig.app.json",
+    ]) {
+      const config = io.readFile(path.join(cwd, configName));
+      if (!config) continue;
+      const outDir = config.match(/"outDir"\s*:\s*"([^"]+)"/)?.[1];
+      if (!outDir) continue;
+      const rootDir =
+        config.match(/"rootDir"\s*:\s*"([^"]+)"/)?.[1] ?? ".";
+      const sourceRoot = path.resolve(cwd, rootDir);
+      const sourceRel = path.relative(sourceRoot, path.resolve(entry.path));
+      if (
+        sourceRel === "" ||
+        sourceRel.startsWith("..") ||
+        path.isAbsolute(sourceRel)
+      )
+        continue;
+      const emittedRel = `${sourceRel.slice(0, -sourceExt.length)}${emittedExt}`;
+      if (path.resolve(cwd, outDir, emittedRel) === commanded) return true;
+    }
+    return false;
+  };
   const starts = (command: unknown): boolean => {
     let tokens: string[];
     if (
@@ -267,7 +316,9 @@ function deploymentStartsScript(
       return starts(tokens[2]);
     if (tokens[0] === "exec") return starts(tokens.slice(1));
     const token = tokens[0];
-    if (!/^(?:npm|pnpm|yarn|bun)$/i.test(token ?? "")) return false;
+    if (!/^(?:npm|pnpm|yarn|bun)$/i.test(token ?? "")) {
+      return commandNamesEntry(tokens);
+    }
     const next = tokens[1];
       if (
         next === entry.script &&

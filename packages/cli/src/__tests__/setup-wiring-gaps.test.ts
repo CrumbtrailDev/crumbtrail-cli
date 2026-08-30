@@ -377,6 +377,61 @@ describe("the other processes the package starts", () => {
       .toBe(true);
   });
 
+  it("maps a sibling Railway compiled entry through the package tsconfig", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("api", "src", "index.ts"),
+        serviceName: "marginary",
+      },
+      fakeInjectIO({
+        [p("package.json")]: PKG({
+          dev: "tsx watch api/src/index.ts",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        }),
+        [p("tsconfig.json")]: JSON.stringify({
+          compilerOptions: { rootDir: ".", outDir: "dist" },
+        }),
+        [p("api", "src", "index.ts")]: "app.listen(3000)",
+        [p("api", "src", "worker.ts")]: "await runQueueOnce()",
+        [p("railway.worker.json")]: JSON.stringify({
+          deploy: { startCommand: "node dist/api/src/worker.js" },
+        }),
+      }),
+    );
+
+    expect(plan.extraEdits?.some((edit) => edit.path === p("api", "src", "worker.ts")))
+      .toBe(true);
+  });
+
+  it("does not guess a source entry from an unproven compiled Railway path", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "node",
+        endpoint: ENDPOINT,
+        entryFile: p("api", "src", "index.ts"),
+        serviceName: "marginary",
+      },
+      fakeInjectIO({
+        [p("package.json")]: PKG({
+          dev: "tsx watch api/src/index.ts",
+          "dev:worker": "tsx watch api/src/worker.ts",
+        }),
+        [p("api", "src", "index.ts")]: "app.listen(3000)",
+        [p("api", "src", "worker.ts")]: "await runQueueOnce()",
+        [p("railway.worker.json")]: JSON.stringify({
+          deploy: { startCommand: "node dist/api/src/worker.js" },
+        }),
+      }),
+    );
+
+    expect(plan.extraEdits?.some((edit) => edit.path === p("api", "src", "worker.ts")))
+      .toBeFalsy();
+  });
+
   it("does not treat a mentioned package manager as command proof", () => {
     const plan = buildPlan(
       {
