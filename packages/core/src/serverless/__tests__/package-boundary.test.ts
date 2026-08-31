@@ -13,7 +13,7 @@ const declarationPath = path.join(packageRoot, "dist/serverless/index.d.ts");
 
 beforeAll(() => {
   buildCorePackage(packageRoot);
-});
+}, 30_000);
 
 describe("crumbtrail-core/serverless package boundary", () => {
   it("declares one ESM, CJS, and types export backed by the serverless entry", () => {

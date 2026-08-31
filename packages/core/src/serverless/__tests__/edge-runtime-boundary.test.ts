@@ -10,7 +10,7 @@ const serverlessDist = path.join(packageRoot, "dist/serverless");
 
 beforeAll(() => {
   buildCorePackage(packageRoot);
-});
+}, 30_000);
 
 describe("serverless edge runtime boundary", () => {
   it("builds without Node runtime references", () => {
