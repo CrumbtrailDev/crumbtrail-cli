@@ -11,9 +11,15 @@ const esmPath = path.join(packageRoot, "dist/serverless/index.js");
 const cjsPath = path.join(packageRoot, "dist/serverless/index.cjs");
 const declarationPath = path.join(packageRoot, "dist/serverless/index.d.ts");
 
+// The hook builds the package, and `buildCorePackage` waits up to 60 seconds for
+// another worker to finish building it first. Vitest's default hook timeout is 10
+// seconds, so the helper's own budget could never be spent: on a loaded runner the
+// hook was killed long before the build or the wait completed, and the release
+// workflow failed on it rather than on anything about the code being released.
+// The bound here is the helper's lock deadline plus room for the build it guards.
 beforeAll(() => {
   buildCorePackage(packageRoot);
-});
+}, 120_000);
 
 describe("crumbtrail-core/serverless package boundary", () => {
   it("declares one ESM, CJS, and types export backed by the serverless entry", () => {

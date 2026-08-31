@@ -8,9 +8,15 @@ const testDir = path.dirname(fileURLToPath(import.meta.url));
 const packageRoot = path.resolve(testDir, "../../..");
 const serverlessDist = path.join(packageRoot, "dist/serverless");
 
+// The hook builds the package, and `buildCorePackage` waits up to 60 seconds for
+// another worker to finish building it first. Vitest's default hook timeout is 10
+// seconds, so the helper's own budget could never be spent: on a loaded runner the
+// hook was killed long before the build or the wait completed, and the release
+// workflow failed on it rather than on anything about the code being released.
+// The bound here is the helper's lock deadline plus room for the build it guards.
 beforeAll(() => {
   buildCorePackage(packageRoot);
-});
+}, 120_000);
 
 describe("serverless edge runtime boundary", () => {
   it("builds without Node runtime references", () => {
