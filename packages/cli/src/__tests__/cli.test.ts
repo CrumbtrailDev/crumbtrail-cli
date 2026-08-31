@@ -2649,9 +2649,15 @@ describe("endpoint confirmation", () => {
     return makeDeps({ steps: [] }, { env: { DISPLAY: ":0" }, ...over });
   }
 
-  it("asks which endpoint an interactive run sends to, defaulting to the hosted cloud", async () => {
+  // The prompt is for the one case that can go wrong: this machine holds a login
+  // for a different deployment than the run would otherwise use. A first run
+  // holds no login, is asked nothing, and is told the endpoint instead.
+  it("asks which endpoint to send to when a saved login points elsewhere", async () => {
     const asked: Array<[string, string | undefined]> = [];
     const deps = endpointDeps({
+      loadStoredAuth: (() => ({
+        endpoint: "http://127.0.0.1:19890",
+      })) as unknown as WizardDeps["loadStoredAuth"],
       prompter: {
         ...noopPrompter,
         ask: async (q, d) => {
@@ -2662,7 +2668,26 @@ describe("endpoint confirmation", () => {
     });
     await runCli(["node", "cli"], deps);
     const endpointAsk = asked.find(([q]) => q.includes("endpoint"));
-    expect(endpointAsk?.[1]).toBe("https://api.crumbtrail.ai");
+    expect(endpointAsk?.[1]).toBe("http://127.0.0.1:19890");
+  });
+
+  it("asks nothing and states the endpoint on a first run", async () => {
+    const { ui, lines } = captureUi();
+    const asked: string[] = [];
+    const deps = endpointDeps({
+      ui,
+      prompter: {
+        ...noopPrompter,
+        ask: async (q, d) => {
+          asked.push(q);
+          return d ?? "";
+        },
+      },
+    });
+    await runCli(["node", "cli"], deps);
+    expect(asked.filter((q) => q.includes("endpoint"))).toEqual([]);
+    expect(lines.join("\n")).toContain("Endpoint  https://api.crumbtrail.ai");
+    expect(lines.join("\n")).toContain("Re-run with --endpoint");
   });
 
   it("sends to the endpoint the user typed instead of the default", async () => {
@@ -2675,6 +2700,10 @@ describe("endpoint confirmation", () => {
     const deps = endpointDeps({
       ui,
       ensureToken: ensureToken as unknown as WizardDeps["ensureToken"],
+      // A saved login elsewhere is what raises the prompt this test answers.
+      loadStoredAuth: (() => ({
+        endpoint: "http://127.0.0.1:19891",
+      })) as unknown as WizardDeps["loadStoredAuth"],
       prompter: {
         ...noopPrompter,
         ask: async (q, d) =>
