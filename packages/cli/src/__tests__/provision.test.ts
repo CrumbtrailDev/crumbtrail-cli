@@ -10,6 +10,7 @@ import {
   inferServiceName,
   listProjects,
   provisionService,
+  provisionFlow,
   resolveProject,
   ProjectAccessError,
   UpgradeRequiredError,
@@ -476,6 +477,38 @@ describe("service identity: two repositories that both call an app api", () => {
     });
   });
 
+  it("rejects a named target from another repository", async () => {
+    const ui = { out: () => {}, err: () => {} };
+    const fetchImpl = vi.fn(async (_url: unknown, init?: unknown) => {
+      const method = ((init as { method?: string })?.method ?? "GET").toUpperCase();
+      if (method === "POST") {
+        return jsonResponse(409, {
+          error: "This project already has a service named api.",
+          code: "service_name_taken",
+        });
+      }
+      return jsonResponse(200, {
+        services: [{ id: "svc_1", name: "api", repo: "github.com/acme/orders" }],
+      });
+    }) as unknown as typeof fetch;
+
+    await expect(
+      provisionService({
+        base: "https://cloud.example",
+        token: "ctcli_x",
+        projectId: "prj_1",
+        recipe: "express",
+        serviceName: "api",
+        identity: { repo: "github.com/acme/billing", sourcePath: "." },
+        rejectOtherSource: true,
+        ui,
+        fetchImpl,
+      }),
+    ).rejects.toThrow(
+      "belongs to a different repository or directory. Choose a different --service name.",
+    );
+  });
+
   it("keeps re-adoption of the same repository quiet", async () => {
     const fetchImpl = vi.fn(async (_url: unknown, init?: unknown) => {
       const method = ((init as { method?: string })?.method ?? "GET").toUpperCase();
@@ -516,6 +549,39 @@ describe("provisionService output", () => {
     const lines: string[] = [];
     return { lines, ui: { out: (l = "") => lines.push(l), err: () => {} } };
   };
+
+  it("uses an explicit service name without prompting", async () => {
+    const asked: string[] = [];
+    const ui = { out: () => {}, err: () => {} };
+    const fetchImpl = vi.fn(async (_url: unknown, init?: unknown) => {
+      const method = ((init as { method?: string })?.method ?? "GET").toUpperCase();
+      return method === "GET"
+        ? jsonResponse(200, { projects: [{ id: "prj_1", name: "checkout" }] })
+        : jsonResponse(201, { id: "svc_1", name: "checkout-web" });
+    }) as unknown as typeof fetch;
+
+    const result = await provisionFlow({
+      base: "https://cloud.example",
+      token: "ctcli_x",
+      projectId: "prj_1",
+      recipe: "vite-spa",
+      ui,
+      prompter: {
+        ask: async (question: string) => {
+          asked.push(question);
+          return "wrong";
+        },
+      } as never,
+      assumeYes: false,
+      defaultProjectName: "checkout",
+      defaultServiceName: "web",
+      serviceName: "checkout-web",
+      fetchImpl,
+    });
+
+    expect(result.serviceName).toBe("checkout-web");
+    expect(asked).toEqual([]);
+  });
 
   it("calls the object an application, the way the dashboard does", async () => {
     const { ui, lines } = capture();

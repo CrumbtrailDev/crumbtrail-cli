@@ -445,6 +445,8 @@ describe("parseArgs", () => {
       "cli",
       "--yes",
       "--project=proj_1",
+      "--service",
+      "api",
       "--no-browser",
       "--skip-verify",
       "--endpoint",
@@ -454,10 +456,21 @@ describe("parseArgs", () => {
       command: "wizard",
       yes: true,
       project: "proj_1",
+      service: "api",
       noBrowser: true,
       skipVerify: true,
       endpoint: "https://x",
     });
+  });
+
+  it("parses --service in both --k v and --k=v forms", () => {
+    expect(parseArgs(["node", "cli", "--service", "api"]).service).toBe(
+      "api",
+    );
+    expect(
+      parseArgs(["node", "cli", "--service=packages-api"]).service,
+    ).toBe("packages-api");
+    expect(parseArgs(["node", "cli"]).service).toBeUndefined();
   });
 
   it("parses --workspace in both --k v and --k=v forms", () => {
@@ -1969,6 +1982,15 @@ describe("wizard — detection-quality notes (CP6)", () => {
 });
 
 describe("non-TTY guard", () => {
+  it("requires a value for --service", () => {
+    expect(parseArgs(["node", "cli", "--service"]).parseError).toBe(
+      "--service requires a value.",
+    );
+    expect(parseArgs(["node", "cli", "--service="]).parseError).toBe(
+      "--service requires a value.",
+    );
+  });
+
   it("refuses without --yes AND --project", async () => {
     const steps: string[] = [];
     const { ui, lines } = captureUi();
