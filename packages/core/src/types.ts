@@ -1133,7 +1133,12 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   captureRawErrors: false,
 
   transport: "auto",
-  httpEndpoint: "http://localhost:9898",
+  // No default endpoint. This used to be `http://localhost:9898`, the port the
+  // local capture server listened on, and that server is no longer published.
+  // A default that cannot work sends a caller's events into a closed port and
+  // reports nothing, so the honest default is none: `init` says what is missing
+  // and captures nothing rather than pretending to.
+  httpEndpoint: "",
   httpAuthToken: "",
   flushIntervalMs: 5000,
   flushBufferSize: 100,

@@ -1,22 +1,24 @@
 # Crumbtrail
 
-Crumbtrail captures the context a coding agent needs to actually fix a bug —
-the session, the signals, and the evidence around a failure — and hands it over
-in a form an agent can act on.
+Crumbtrail captures the context a coding agent needs to actually fix a bug. It
+records the session, the signals, and the evidence around a failure, then hands
+all of it to the agent in a form it can act on.
 
-This repository holds the open-source SDKs and CLI. The hosted Crumbtrail cloud
-is a separate, closed-source service; these packages talk to it, but none of
-them require it.
+This repository holds the open source SDKs and CLI. They record what happened in
+your app and send it to a Crumbtrail endpoint, which is where your agent later
+reads it from. The endpoint and the cloud behind it are a separate, closed
+source service, so running these packages means pointing them at a Crumbtrail
+project with an ingest key.
 
 ## Packages
 
-| Package                                            | Description                                                                                                                                                                                                               |
-| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`crumbtrail`](packages/cli)                       | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. Also the detection and injection-planning library the hosted product imports, with install recipes and agent prompts on the `/install` subpath. |
-| [`crumbtrail-core`](packages/core)                 | Framework agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. React bindings on `/react`, Tauri bindings on `/tauri`, and Fetch serverless bindings on `/serverless`.              |
-| [`crumbtrail-node`](packages/node)                 | Node.js backend capture with AWS Lambda, Vercel Node, and Netlify Node serverless adapters.                                                                                                                               |
-| [`crumbtrail-react-native`](packages/react-native) | React Native and Expo bindings. Its own package because its native peer dependencies must not reach a web bundle.                                                                                                         |
-| [`crumbtrail-capacitor`](packages/capacitor)       | Capacitor and Ionic bindings: adds device, app lifecycle, connectivity and deep link context to the web capture already running in the WebView.                                                                           |
+| Package                                            | Description                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`crumbtrail`](packages/cli)                       | CLI. `npx crumbtrail` walks you through installing and wiring up the SDK. Also the detection and injection-planning library the hosted product imports, with install recipes and agent prompts on the `/install` subpath.                                                                                                                                                        |
+| [`crumbtrail-core`](packages/core)                 | Framework agnostic capture engine: collectors, redaction, signals, evidence fusion. No dependencies. React bindings on `/react`, Tauri bindings on `/tauri`, and Fetch serverless bindings on `/serverless`.                                                                                                                                                                     |
+| [`crumbtrail-node`](packages/node)                 | Node.js backend capture: crash and log capture, Express middleware, `node:http` request capture, and database and cache instrumentation, with AWS Lambda, Vercel Node and Netlify Node serverless adapters. It is a library and nothing else: it publishes no executable, and the MCP server your agent reads through belongs to the hosted product rather than to this package. |
+| [`crumbtrail-react-native`](packages/react-native) | React Native and Expo bindings. Its own package because its native peer dependencies must not reach a web bundle.                                                                                                                                                                                                                                                                |
+| [`crumbtrail-capacitor`](packages/capacitor)       | Capacitor and Ionic bindings: adds device, app lifecycle, connectivity and deep link context to the web capture already running in the WebView.                                                                                                                                                                                                                                  |
 
 All five publish at one shared version. A given release is the same number
 everywhere, so there is no question of which versions go together.
@@ -45,6 +47,10 @@ setup wizard will not wire an app against a package it cannot resolve.
 ```bash
 npx crumbtrail
 ```
+
+The wizard signs you in on the way through, because the key it writes belongs to
+a project. A new account starts a 14 day trial at full Team capability and takes
+no card, so you can record a real session before deciding anything.
 
 For serverless HTTP functions, select the adapter for the function runtime in
 [Capture serverless HTTP functions](docs/integrations/serverless-functions.md).
@@ -174,10 +180,10 @@ or rule it out. Install instructions and the shape every skill follows are in
 
 Runnable end-to-end examples live in [`examples/`](examples):
 
-- [`basic`](examples/basic) — the smallest possible browser setup.
-- [`full-stack-express`](examples/full-stack-express) — browser + Express server, correlated.
-- [`full-stack-otel`](examples/full-stack-otel) — the same, exporting over OTLP.
-- [`headless-job`](examples/headless-job) — capture inside a background job, no browser.
+- [`basic`](examples/basic): the smallest browser setup there is.
+- [`full-stack-express`](examples/full-stack-express): a browser and an Express server, correlated.
+- [`full-stack-otel`](examples/full-stack-otel): the same pair, exporting over OTLP.
+- [`headless-job`](examples/headless-job): capture inside a background job, with no browser.
 
 ## Development
 
