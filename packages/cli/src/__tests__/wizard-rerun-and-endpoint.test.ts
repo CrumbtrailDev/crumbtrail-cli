@@ -61,11 +61,23 @@ describe("the endpoint prompt defaults to the login this machine holds", () => {
     expect(asked[0].question).toContain(`You are logged in to ${LOCAL}`);
   });
 
-  it("still offers the hosted cloud when there is no saved login", async () => {
+  // A first run holds no login, so there is nothing to disambiguate and nothing
+  // the person could answer better than the default. Asking anyway opened the
+  // product on an infrastructure question fifteen seconds after "set it up in
+  // one command". The endpoint is still stated by the wizard, with the flag that
+  // changes it, before anything is created.
+  it("takes the hosted cloud without asking when there is no saved login", async () => {
     const { deps, asked } = endpointDeps({});
     expect(await confirmEndpoint(NO_ARGS, deps, HOSTED)).toBe(HOSTED);
-    expect(asked[0].def).toBe(HOSTED);
-    expect(asked[0].question).not.toContain("logged in to");
+    expect(asked).toEqual([]);
+  });
+
+  // The prompt survives where it earns its keep: a saved login for a different
+  // deployment is the case that wired an app to the wrong one.
+  it("asks when the saved login points somewhere else", async () => {
+    const { deps, asked } = endpointDeps({ saved: LOCAL });
+    await confirmEndpoint(NO_ARGS, deps, HOSTED);
+    expect(asked).toHaveLength(1);
   });
 
   it("keeps a stated endpoint, whatever the saved login says", async () => {

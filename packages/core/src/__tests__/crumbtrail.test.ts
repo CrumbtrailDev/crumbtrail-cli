@@ -8,6 +8,10 @@ import {
   DEFAULT_CONFIG,
 } from "../index";
 
+// `httpEndpoint` has no default: one that could not work was worse than none.
+// Tests about what init sends therefore have to say where it sends it.
+const TEST_ENDPOINT = "https://example.test";
+
 describe("Crumbtrail", () => {
   beforeEach(() => {
     vi.stubGlobal(
@@ -529,6 +533,10 @@ describe("Crumbtrail", () => {
 
   it("calls transport startSession on init", async () => {
     const logger = Crumbtrail.init({
+      // Explicit since `httpEndpoint` has no default: a caller that names no
+      // endpoint gets an inert instance that posts nothing, which is the
+      // subject of missing-endpoint.test.ts rather than of this one.
+      httpEndpoint: TEST_ENDPOINT,
       network: false,
       flushIntervalMs: 100_000,
       flushBufferSize: 1000,
@@ -686,6 +694,7 @@ describe("Crumbtrail", () => {
 
   it("startSession payload includes url and ua", async () => {
     const logger = Crumbtrail.init({
+      httpEndpoint: TEST_ENDPOINT,
       network: false,
       flushIntervalMs: 100_000,
       flushBufferSize: 1000,

@@ -589,6 +589,28 @@ export class Crumbtrail {
         : undefined) ??
       generateSessionId();
     if (sessionStore) writePersistedSession(sessionStore, sessionId);
+
+    // Nowhere to send: same inert shape as the non-browser guard above, and for
+    // the same reason. A capture SDK that throws inside a host app's module
+    // scope takes the page with it, so a missing endpoint reports itself and
+    // stops rather than raising. It sits after the session id is resolved so an
+    // inert instance still answers with the session a previous launch persisted:
+    // isomorphic and cross launch correlation code reads that id whether or not
+    // capture is on. A caller supplying its own transport is exempt, having
+    // already said where events go.
+    if (!config.transportInstance && config.httpEndpoint.trim() === "") {
+      reportMissingEndpoint();
+      return new Crumbtrail(
+        config,
+        new EventBus(),
+        INERT_TRANSPORT,
+        new RingBuffer(config.ringBufferMs, config.ringBufferMaxEvents),
+        sessionId,
+        applicationRelease,
+        sessionStore,
+      );
+    }
+
     const bus = new EventBus();
     const ringBuffer = new RingBuffer(
       config.ringBufferMs,
@@ -2386,6 +2408,38 @@ function warnGpcSuppressedCapture(): void {
   } catch {
     // Diagnostics never break the host page.
   }
+}
+
+/**
+ * No endpoint configured, so there is nowhere to send anything.
+ *
+ * `httpEndpoint` used to default to `http://localhost:9898`, the local capture
+ * server's port. That server is no longer published, so the default became a
+ * closed port: capture ran, every send failed, and the only symptom was a
+ * project that stayed empty. Reported once, loudly, at the moment init runs,
+ * because the alternative is finding out a day later.
+ *
+ * This is an error rather than a warning: nothing is captured at all, which is
+ * a misconfiguration and not a condition the caller might have chosen.
+ */
+let endpointWarned = false;
+function reportMissingEndpoint(): void {
+  if (endpointWarned) return;
+  endpointWarned = true;
+  try {
+    if (typeof console !== "undefined" && typeof console.error === "function") {
+      console.error(
+        "[crumbtrail] no httpEndpoint was configured, so nothing is being captured. Pass httpEndpoint (your Crumbtrail endpoint) and httpAuthToken (your ingest key) to Crumbtrail.init, or run npx crumbtrail to write them for you.",
+      );
+    }
+  } catch {
+    // Diagnostics never break the host page.
+  }
+}
+
+/** Test seam: the report is once per page, and a suite is one page. */
+export function __resetMissingEndpointReportForTests(): void {
+  endpointWarned = false;
 }
 
 /** Test seam: the warning is once per page, and a suite is one page. */

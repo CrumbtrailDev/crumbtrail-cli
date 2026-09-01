@@ -1098,6 +1098,19 @@ export function resolveWorkspaceDir(
  * login this machine actually holds is the honest default; the hosted cloud is
  * the default only when there is no login to speak for.
  * `--yes` and non-interactive shells take the same default without a prompt.
+ *
+ * It is asked only when there is something to get wrong, which is when this
+ * machine holds a login for a DIFFERENT endpoint than the one this run would
+ * otherwise use. That is the case the incident above describes and the only one
+ * where the answer is not already known.
+ *
+ * A first run holds no login, so the old prompt asked a stranger to choose
+ * between the hosted cloud and nothing, fifteen seconds after they read "set it
+ * up in one command", with no basis for answering. It cannot be deferred past
+ * sign in either, because sign in happens against an endpoint. So it is
+ * defaulted and stated instead: `runWizard` prints the endpoint it settled on
+ * with the flag that changes it, before anything is created, which keeps the
+ * protection the prompt existed for without opening on a question.
  */
 export async function confirmEndpoint(
   parsed: ParsedArgs,
@@ -1115,10 +1128,11 @@ export async function confirmEndpoint(
     ? resolveEndpoint(savedEndpoint, deps.env)
     : base;
   if (parsed.yes || !deps.isTTY) return preferred;
+  // Nothing to disambiguate: no saved login, or one for the endpoint this run
+  // was already going to use. Take it and let runWizard state it.
+  if (preferred === base) return preferred;
   const answer = await deps.prompter.ask(
-    preferred === base
-      ? "Which Crumbtrail endpoint should this project send to?"
-      : `Which Crumbtrail endpoint should this project send to? You are logged in to ${preferred}.`,
+    `Which Crumbtrail endpoint should this project send to? You are logged in to ${preferred}.`,
     preferred,
   );
   return resolveEndpoint(answer, deps.env);
@@ -1139,8 +1153,14 @@ export async function runWizard(
   // Printed once, and only once the endpoint is settled: printing the default
   // first and the answer second showed two Endpoint lines to a run that was
   // never asked anything, and the first of them was not where the run went.
+  const askedEndpoint = base;
   base = await confirmEndpoint(parsed, deps, base);
   ui.out(color.dim(`  Endpoint  ${base}`));
+  // Said before anything is created, which is step 3, so a run pointed at the
+  // wrong deployment is caught while nothing has been made yet. This replaces
+  // the opening prompt for the common case; see confirmEndpoint.
+  if (base === askedEndpoint && !parsed.endpoint && deps.isTTY)
+    ui.out(color.dim(`  Somewhere else? Re-run with --endpoint <url>`));
 
   // 1. Detect. A monorepo root forks to the batch installer, which scans every
   // service and wires the ones the user picks. Everything below this fork is the

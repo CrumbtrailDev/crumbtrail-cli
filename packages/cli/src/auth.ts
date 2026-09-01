@@ -28,6 +28,25 @@ import {
 import { color, readStdinLine, type Ui } from "./ui";
 import { ok } from "./theme";
 
+/**
+ * What signing in costs, said where it is being asked for.
+ *
+ * Both sign-in paths print this, and it is deliberately adjacent to the link or
+ * the code rather than above them: a person meets this screen about fifteen
+ * seconds into their first run, and until now it asked them to create an
+ * account without saying what that costs. The answer is nothing for fourteen
+ * days and no card, which is the fact that decides whether they continue, and
+ * it was published on the pricing page and absent from the one screen where it
+ * decides the outcome.
+ *
+ * The trial length and the no card fact come from the pricing page copy
+ * (`landing/web/lib/copy/pricing.ts` in the product repository). No price and no
+ * plan name is repeated here on purpose: a number in two places goes stale in
+ * one of them, and this file is not the place that would be noticed.
+ */
+const TRIAL_LINE =
+  "No account yet? Signing in creates one, starts a 14 day trial, and takes no card.";
+
 // ── PKCE ─────────────────────────────────────────────────────────────────────
 
 export interface PkcePair {
@@ -508,6 +527,7 @@ export async function loginBrowser(opts: LoginOptions): Promise<TokenResponse> {
   }
   opts.ui.out(`Opened your browser to authorize the CLI:`);
   opts.ui.out(`  ${color.brand(authorizeUrl)}`);
+  opts.ui.out(color.dim(TRIAL_LINE));
   opts.ui.out(
     color.dim(`Waiting for approval… (or paste the code shown in the browser)`),
   );
@@ -692,6 +712,7 @@ export async function loginDevice(
   opts.ui.out(
     `and enter the code:  ${color.bold(color.brandLift(device.userCode))}`,
   );
+  opts.ui.out(color.dim(TRIAL_LINE));
   const missing = await signInPageMissing(
     activateUrl,
     opts.fetchImpl,
