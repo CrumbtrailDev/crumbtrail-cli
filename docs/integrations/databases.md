@@ -43,6 +43,24 @@ const db = instrumentPgClient(pool, {
 
 After-images come from an appended `RETURNING *` (skipped when your statement already has one).
 
+Before-images come from one extra `SELECT` on your own connection, built from the statement's
+`WHERE` clause. Two properties bound it:
+
+- It is bound in full or it is not issued. The clause is lifted out of a larger statement, so its
+  `$n` placeholders are renumbered from `$1` and the matching values are supplied. A clause whose
+  placeholders are not all covered by the call's parameters produces no probe.
+- It cannot cost you a write. Inside a transaction, any statement that errors aborts the whole
+  transaction, so the probe is wrapped in a savepoint that is rolled back to if it throws for any
+  reason. Postgres itself reports whether a transaction is open, so this holds even when the
+  transaction was opened through a path the shim never saw.
+
+When the probe yields no image, the `db.diff` event carries
+`beforeImageStatus: { status: "unavailable", reason }` with one of `before_probe_failed` (issued,
+and the database rejected it), `before_probe_unbindable` (not issued, could not be bound), or
+`before_probe_unguarded` (not issued, the savepoint guard could not be established). A missing
+`beforeImageStatus` means no before-image was asked for, which is a different thing from one that
+was attempted and failed.
+
 ## Neon HTTP (`@neondatabase/serverless`)
 
 `autoCapture` instruments query functions returned by `neon()` automatically. To wrap an

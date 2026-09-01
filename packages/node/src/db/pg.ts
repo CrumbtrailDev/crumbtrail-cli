@@ -1,3 +1,4 @@
+import type { DbBeforeImageStatus } from "crumbtrail-core";
 import {
   classifyStatement,
   ensureReturning,
@@ -5,6 +6,7 @@ import {
   parseLimitOffset,
   parseMutation,
   parseRead,
+  rebindNumberedPlaceholders,
   type ParsedMutation,
   type ParsedRead,
 } from "./sql";
@@ -60,8 +62,10 @@ const ENGINE = "postgres" as const;
  * so mutations issued through acquired clients retain the same instrumentation and pool lifecycle.
  *
  * Limitations: trigger/cascade side effects and rows changed by other tables are not captured; the
- * pre-image SELECT for `captureBefore` reuses the statement's WHERE clause + params, so it supports
- * single-table UPDATEs (not CTEs, joins, or sub-selects).
+ * pre-image SELECT for `captureBefore` reuses the statement's WHERE clause, so it supports
+ * single-table UPDATEs (not CTEs, joins, or sub-selects). That probe is bound in full or not
+ * issued, and is guarded by a savepoint whenever a transaction is open, so it can never cost the
+ * host its write. When it yields nothing, the `db.diff` event says why in `beforeImageStatus`.
  */
 export function instrumentPgClient<T extends DuckTypedPgClient>(
   client: T,
@@ -74,6 +78,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
   // gives a statement that returned nothing an ordinal, and so a place in the request's order.
   const statementsByRequest = new Map<string, number>();
   const connection = extractDbConnectionIdentity(ENGINE, client);
+  const poolTarget = looksLikePgPool(client);
   let transaction: DbTransactionContext | undefined;
 
   const wrappedQuery = async (
@@ -243,26 +248,30 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
 
     const paramArray = Array.isArray(params) ? params : undefined;
 
-    // Pre-image capture is strictly best-effort: a failing SELECT (bad WHERE, permissions, etc.)
-    // must NOT abort a mutation that would otherwise succeed. On failure we skip the before-image.
+    // Pre-image capture is strictly best-effort: a failing probe (bad WHERE, permissions, etc.)
+    // must NOT abort a mutation that would otherwise succeed, and must not leave the reader unable
+    // to tell a probe that failed from a before-image nobody asked for.
     let beforeByPk: Map<string, Record<string, unknown>> | undefined;
+    let beforeImageStatus: DbBeforeImageStatus | undefined;
     if (options.captureBefore && parsed.op === "update" && parsed.whereClause) {
       try {
-        const pre = await client.query(
-          `SELECT * FROM ${parsed.table} ${parsed.whereClause}`,
+        const outcome = await captureBeforeImage(
+          client,
+          parsed,
+          parsed.whereClause,
           paramArray,
+          options,
+          poolTarget,
         );
-        beforeByPk = new Map();
-        for (const row of pre.rows ?? []) {
-          if (!isRecord(row)) continue;
-          beforeByPk.set(
-            pkKey(extractPk(row, parsed.table, options.pkColumns)),
-            row,
-          );
-        }
+        beforeByPk = outcome.beforeByPk;
+        beforeImageStatus = outcome.status;
       } catch (error) {
         emitGap(options, { reason: "capture_exception", error });
         beforeByPk = undefined;
+        beforeImageStatus = {
+          status: "unavailable",
+          reason: "before_probe_failed",
+        };
       }
     }
 
@@ -364,6 +373,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         requestId,
         rows,
         beforeByPk,
+        beforeImageStatus,
         rowCount,
         options,
         context: { connection, durationMs, transactionId: transaction?.id },
@@ -452,6 +462,147 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+/**
+ * Fixed savepoint name for the before-image probe. Never derived from the host statement: a name
+ * built from caller-controlled text would be an injection point on the host's own connection.
+ */
+const BEFORE_PROBE_SAVEPOINT = "crumbtrail_before_image_probe";
+
+/** Outcome of one before-image attempt: the images it recovered, or why there are none. */
+interface BeforeImageOutcome {
+  beforeByPk?: Map<string, Record<string, unknown>>;
+  status?: DbBeforeImageStatus;
+}
+
+/**
+ * Reads the rows an UPDATE is about to change, on the host's own connection, without being able to
+ * damage what the host is doing.
+ *
+ * Three rules, in order:
+ *
+ * 1. The probe is issued only if it can be bound completely. A clause lifted out of the host
+ *    statement keeps that statement's placeholder numbering, so it is rewritten to stand alone;
+ *    a clause that cannot be rewritten is not issued at all.
+ * 2. The probe is wrapped in a savepoint whenever there is a transaction to protect. Inside
+ *    `BEGIN`, any statement that errors aborts the whole transaction and the host's write is lost,
+ *    so the guard has to cover failures nobody predicted, not only the ones we can name. A
+ *    savepoint does that: it is taken before the probe runs and rolled back to on any throw.
+ *    Postgres itself answers whether a transaction is open — `SAVEPOINT` outside one raises 25P01
+ *    and leaves the session usable — which is more reliable than tracking `BEGIN` statements the
+ *    shim happens to have seen, since a driver or ORM can open one through a path it never saw.
+ * 3. Every way of ending without images sets a status, so the reader is told the before-image was
+ *    attempted and failed rather than being left to read silence as a disabled feature.
+ */
+async function captureBeforeImage(
+  client: DuckTypedPgClient,
+  parsed: ParsedMutation,
+  whereClause: string,
+  paramArray: unknown[] | undefined,
+  options: InstrumentPgClientOptions,
+  poolTarget: boolean,
+): Promise<BeforeImageOutcome> {
+  const rebound = rebindNumberedPlaceholders(whereClause, paramArray);
+  if (!rebound) {
+    emitGap(options, {
+      reason: "capture_exception",
+      detail: "before_probe_unbindable",
+    });
+    return {
+      status: { status: "unavailable", reason: "before_probe_unbindable" },
+    };
+  }
+
+  let guarded = false;
+  // A pool hands out a fresh connection per query, so the host's statement cannot be in a
+  // transaction this probe could reach — and a savepoint here would land on a third connection,
+  // protecting nothing while costing a checkout the pool-pressure stream would then report as
+  // real. Transactional code holds a checked-out client, which arrives here as a client.
+  if (!poolTarget) {
+    try {
+      await client.query(`SAVEPOINT ${BEFORE_PROBE_SAVEPOINT}`);
+      guarded = true;
+    } catch (error) {
+      if (!isNoActiveTransaction(error)) {
+        // We cannot promise the probe is harmless, so we do not run it.
+        emitGap(options, { reason: "capture_exception", error });
+        return {
+          status: { status: "unavailable", reason: "before_probe_unguarded" },
+        };
+      }
+      // Postgres reported no open transaction, so a probe failure is isolated to the probe.
+    }
+  }
+
+  let pre: DuckTypedPgQueryResult;
+  try {
+    pre = await client.query(
+      `SELECT * FROM ${parsed.table} ${rebound.text}`,
+      rebound.params,
+    );
+  } catch (error) {
+    emitGap(options, { reason: "capture_exception", error });
+    if (guarded) await rollbackToProbeSavepoint(client, options);
+    return { status: { status: "unavailable", reason: "before_probe_failed" } };
+  }
+  if (guarded) await releaseProbeSavepoint(client, options);
+
+  const beforeByPk = new Map<string, Record<string, unknown>>();
+  for (const row of pre.rows ?? []) {
+    if (!isRecord(row)) continue;
+    beforeByPk.set(pkKey(extractPk(row, parsed.table, options.pkColumns)), row);
+  }
+  return { beforeByPk };
+}
+
+/**
+ * A `pg` Pool, told apart from a Client or a checked-out PoolClient by the counters only a pool
+ * keeps. Duck-typed like every other read of the injected driver: `pg` is never imported here.
+ */
+function looksLikePgPool(client: unknown): boolean {
+  const target = client as Record<string, unknown> | null | undefined;
+  return (
+    typeof target?.totalCount === "number" &&
+    typeof target?.idleCount === "number" &&
+    typeof target?.waitingCount === "number"
+  );
+}
+
+/** Postgres raises 25P01 for SAVEPOINT outside a transaction block; the session stays usable. */
+function isNoActiveTransaction(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  if (code === "25P01") return true;
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /can only be used in transaction blocks/i.test(message);
+}
+
+/** Undoes a failed probe. Never throws: the host mutation still has to be allowed to run. */
+async function rollbackToProbeSavepoint(
+  client: DuckTypedPgClient,
+  options: InstrumentPgClientOptions,
+): Promise<void> {
+  try {
+    await client.query(`ROLLBACK TO SAVEPOINT ${BEFORE_PROBE_SAVEPOINT}`);
+  } catch (error) {
+    // The transaction is already unrecoverable, so there is nothing left to protect. Recording it
+    // is the whole value: it names the probe as the reason the host's write did not land.
+    emitGap(options, { reason: "capture_exception", error });
+    return;
+  }
+  await releaseProbeSavepoint(client, options);
+}
+
+/** Drops the guard once it is no longer needed. Never throws. */
+async function releaseProbeSavepoint(
+  client: DuckTypedPgClient,
+  options: InstrumentPgClientOptions,
+): Promise<void> {
+  try {
+    await client.query(`RELEASE SAVEPOINT ${BEFORE_PROBE_SAVEPOINT}`);
+  } catch (error) {
+    emitGap(options, { reason: "capture_exception", error });
+  }
 }
 
 /** Rows the driver reported, preferring its own count over the length of the rows it returned. */

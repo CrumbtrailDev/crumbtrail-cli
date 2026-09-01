@@ -312,7 +312,23 @@ export type DbBeforeImageStatus =
         | "prisma_extension_no_transaction_context"
         | "prisma_bulk_result_no_row_images"
         | "prisma_raw_result_no_row_images"
-        | "prisma_upsert_branch_unknown";
+        | "prisma_upsert_branch_unknown"
+        /**
+         * The before-image probe was built and issued, and the database rejected it. The reader
+         * needs this separated from a before-image that was never asked for: the same empty
+         * `before` field otherwise reads as capture being switched off.
+         */
+        | "before_probe_failed"
+        /**
+         * No probe was issued because it could not have been bound completely — a lifted clause
+         * whose placeholders are not all covered by the statement's parameters.
+         */
+        | "before_probe_unbindable"
+        /**
+         * No probe was issued because the guard that keeps a failing probe from damaging the
+         * host's transaction could not be established.
+         */
+        | "before_probe_unguarded";
     };
 
 /** Configuration-derived database endpoint identity. Credentials are never retained. */

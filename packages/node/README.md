@@ -71,7 +71,10 @@ image-less `db.diff` (`pk: null`, `rowCount`) so the write stays visible to diff
 Sensitive columns are dropped before any event rests (`DEFAULT_SENSITIVE_DB_COLUMNS` =
 `password`, `token`, `secret`, `api_key`, `ssn`; extend with `redactColumns`).
 `captureBefore: true` also records UPDATE pre-images (and is how MySQL/SQLite before-images are
-sourced); `captureReads: true` opts into capped `db.read` row capture. The events correlate by
+sourced) via one extra `SELECT` that is bound in full or not issued, and that is savepoint-guarded
+on Postgres so it can never abort the transaction it is observing; when it yields no image the
+`db.diff` carries `beforeImageStatus` saying why. `captureReads: true` opts into capped `db.read`
+row capture. The events correlate by
 `requestId` (= the request's trace id), so they land in the same evidence window and feed
 session db differencing across all engines. Per-engine wiring
 examples: [`docs/integrations/databases.md`](../../docs/integrations/databases.md).
