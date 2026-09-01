@@ -12,6 +12,10 @@ const esmPath = path.join(packageRoot, "dist/index.js");
 const cjsPath = path.join(packageRoot, "dist/index.cjs");
 const declarationPath = path.join(packageRoot, "dist/index.d.ts");
 
+// This hook builds two packages before it can assert anything. Vitest's default
+// hook timeout is 10 seconds, which a loaded CI runner cannot meet, so the
+// release workflow failed here rather than on anything about the code being
+// released. The core copy of this test was given the same budget in #129.
 beforeAll(() => {
   execFileSync("pnpm", ["run", "build"], {
     cwd: coreRoot,
@@ -21,7 +25,7 @@ beforeAll(() => {
     cwd: packageRoot,
     stdio: "pipe",
   });
-});
+}, 120_000);
 
 describe("crumbtrail-node serverless package boundary", () => {
   it("exposes all adapters from built ESM, CJS, and declarations", async () => {
