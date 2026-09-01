@@ -261,8 +261,14 @@ describe("instrumentPgClient", () => {
     expect(d.op).toBe("update");
     expect(d.before).toEqual({ id: 3, status: "pending" });
     expect(d.after).toEqual({ id: 3, status: "shipped" });
-    // A pre-image SELECT ran before the mutation.
-    expect(client.calls[0].text).toMatch(/^select \* from orders/i);
+    // A pre-image SELECT ran before the mutation, inside its savepoint guard. Placeholder
+    // renumbering and the guard itself are bound in `db-before-image-probe.test.ts`.
+    expect(client.calls.map((call) => call.text)).toEqual([
+      "SAVEPOINT crumbtrail_before_image_probe",
+      "SELECT * FROM orders WHERE id = $1",
+      "RELEASE SAVEPOINT crumbtrail_before_image_probe",
+      "UPDATE orders SET status = $1 WHERE id = $2 RETURNING *",
+    ]);
   });
 
   it("does not emit or alter non-mutating SELECT statements", async () => {

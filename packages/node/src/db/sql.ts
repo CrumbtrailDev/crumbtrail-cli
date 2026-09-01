@@ -460,6 +460,18 @@ function skipSqlRegion(sql: string, index: number): number | undefined {
     const end = sql.indexOf("]", index + 1);
     return end === -1 ? sql.length : end + 1;
   }
+  // Dollar-quoted body (`$$…$$`, `$tag$…$tag$`). A tag never starts with a digit, so this can
+  // never swallow a `$1` bind placeholder.
+  if (character === "$") {
+    const tag =
+      /^\$[A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*\$|^\$\$/.exec(
+        sql.slice(index),
+      );
+    if (tag) {
+      const end = sql.indexOf(tag[0], index + tag[0].length);
+      return end === -1 ? sql.length : end + tag[0].length;
+    }
+  }
   return undefined;
 }
 
@@ -509,4 +521,79 @@ export function countPlaceholders(sqlFragment: string): number {
     if (character === "?") count += 1;
   }
   return count;
+}
+
+/** A probe statement rewritten so every placeholder it references is bound by `params`. */
+export interface ReboundClause {
+  /** The clause text with its `$n` placeholders renumbered from `$1`, gap-free. */
+  text: string;
+  /** The values for those placeholders, in their new order. */
+  params: unknown[];
+}
+
+/**
+ * Rewrites a Postgres clause lifted out of a host statement so it can stand as a statement of its
+ * own, and returns the exact values its placeholders need.
+ *
+ * A clause lifted verbatim keeps the host statement's numbering. `WHERE id = $2` taken out of an
+ * `UPDATE … SET balance = balance + $1 … WHERE id = $2` references `$2` and nothing else, so
+ * Postgres refuses to plan it however the values are supplied: bind two and `$1` is supplied but
+ * never referenced, bind one and `$2` is missing. Renumbering by first appearance — `$2` becomes
+ * `$1` — and taking the matching values makes the clause self-contained.
+ *
+ * Returns `undefined` when the clause cannot be bound completely, which is the caller's signal not
+ * to issue it: a placeholder past the end of `params`, or placeholders with no `params` array at
+ * all. Repeated placeholders collapse onto one new number and bind once. Placeholders inside
+ * subqueries are renumbered like any other, because the scan covers the whole clause text.
+ */
+export function rebindNumberedPlaceholders(
+  clause: string,
+  params: readonly unknown[] | undefined,
+): ReboundClause | undefined {
+  const spans: Array<{ start: number; end: number; original: number }> = [];
+  let index = 0;
+  while (index < clause.length) {
+    const skipped = skipSqlRegion(clause, index);
+    if (skipped !== undefined && skipped > index) {
+      index = skipped;
+      continue;
+    }
+    if (clause[index] === "$") {
+      const digits = /^\$(\d+)/.exec(clause.slice(index));
+      if (digits) {
+        spans.push({
+          start: index,
+          end: index + digits[0].length,
+          original: Number(digits[1]),
+        });
+        index += digits[0].length;
+        continue;
+      }
+    }
+    index += 1;
+  }
+
+  if (spans.length === 0) return { text: clause, params: [] };
+  if (!Array.isArray(params)) return undefined;
+
+  const renumbered = new Map<number, number>();
+  const bound: unknown[] = [];
+  for (const span of spans) {
+    if (renumbered.has(span.original)) continue;
+    // Postgres numbers parameters from $1, so $n is params[n - 1]. A reference past the end of the
+    // array is unbindable, and guessing a value would silently change which rows the probe reads.
+    if (span.original < 1 || span.original > params.length) return undefined;
+    renumbered.set(span.original, bound.length + 1);
+    bound.push(params[span.original - 1]);
+  }
+
+  let text = "";
+  let cursor = 0;
+  for (const span of spans) {
+    text += clause.slice(cursor, span.start);
+    text += `$${renumbered.get(span.original)}`;
+    cursor = span.end;
+  }
+  text += clause.slice(cursor);
+  return { text, params: bound };
 }
