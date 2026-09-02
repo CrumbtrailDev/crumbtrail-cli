@@ -19,6 +19,7 @@ import { getProcessSessionId } from "./process-session";
 import {
   readRequestCorrelation,
   runInBackendRequestContext,
+  extractBackendTraceContext,
   updateBackendRequestContext,
   type BackendRequestContext,
 } from "./request-context";
@@ -234,6 +235,7 @@ export function installHttpRequestCapture(
           ? startEvent.sessionId
           : undefined,
       sessionIdSource: sessionIdSourceOf(startEvent),
+      ...extractBackendTraceContext(req.headers),
     });
 
     // No session at all — neither correlated nor process-owned — means the

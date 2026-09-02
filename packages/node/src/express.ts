@@ -9,6 +9,7 @@ import { claimBackendRequest } from "./backend-request-claim";
 import { getProcessSessionId } from "./process-session";
 import {
   getBackendRequestContext,
+  extractBackendTraceContext,
   runInBackendRequestContext,
   updateBackendRequestContext,
 } from "./request-context";
@@ -247,6 +248,7 @@ export function createCrumbtrailExpressMiddleware(
         requestId: state.requestId,
         sessionId: state.sessionId,
         sessionIdSource: sessionIdSourceOf(startEvent) ?? "missing",
+        ...extractBackendTraceContext(req.headers),
       };
       if (getBackendRequestContext()) {
         updateBackendRequestContext(correlation);
