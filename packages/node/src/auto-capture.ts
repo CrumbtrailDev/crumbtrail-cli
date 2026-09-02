@@ -166,6 +166,12 @@ export interface AutoCaptureOptions {
   instrumentDatabases?: boolean;
   /** Restrict auto-instrumentation to specific drivers. Absent ⇒ all known ones. */
   databaseDrivers?: readonly AutoInstrumentDriver[];
+  /** Capture capped, redacted SELECT rows as `db.read` evidence. Defaults to false. */
+  captureDatabaseReads?: boolean;
+  /** Capture UPDATE pre-images as `db.diff` evidence. Defaults to false. */
+  captureDatabaseBeforeImages?: boolean;
+  /** Capture bounded host callsites on database evidence. Defaults to false. */
+  captureDatabaseCallsites?: boolean;
   /** Module resolver seam for auto-instrumentation (tests). */
   databaseResolve?: (specifier: string) => unknown;
   /**
@@ -820,6 +826,9 @@ export async function autoCapture(
         // per statement, because the scope is AsyncLocalStorage state that only
         // exists once a request is in flight.
         getRequestId: dbSink.getRequestId,
+        captureReads: options.captureDatabaseReads ?? false,
+        captureBefore: options.captureDatabaseBeforeImages ?? false,
+        captureCallsite: options.captureDatabaseCallsites ?? false,
         drivers: options.databaseDrivers,
         resolve: options.databaseResolve,
       });
