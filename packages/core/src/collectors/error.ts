@@ -23,11 +23,13 @@ function bodyPlaceholder(summary: PayloadSummary | undefined): string {
 function redactText(
   value: string | undefined,
   path: string,
+  maxLength?: number,
 ): { value?: string; metadata?: RedactionMetadata } {
   if (value == null) return {};
   const result = redactNetworkTextBody(value, {
     contentType: "text/plain",
     path,
+    ...(maxLength !== undefined ? { maxLength } : {}),
   });
   return {
     value: result.body ?? bodyPlaceholder(result.bodySummary),
@@ -38,16 +40,32 @@ function redactText(
 function redactErrorPayload(
   payload: Record<string, unknown>,
   config: CrumbtrailConfig,
+  limits?: { msg?: number; stk?: number; source?: number },
 ): Record<string, unknown> {
-  if (config.captureRawErrors) return payload;
+  if (config.captureRawErrors) {
+    if (limits?.msg !== undefined && typeof payload.msg === "string")
+      payload.msg = boundedString(payload.msg, limits.msg);
+    if (limits?.stk !== undefined && typeof payload.stk === "string")
+      payload.stk = boundedString(payload.stk, limits.stk);
+    if (limits?.source !== undefined && typeof payload.source === "string")
+      payload.source = boundedString(payload.source, limits.source);
+    return payload;
+  }
 
   const msg = redactText(
     typeof payload.msg === "string" ? payload.msg : undefined,
     "msg",
+    limits?.msg,
   );
   const stk = redactText(
     typeof payload.stk === "string" ? payload.stk : undefined,
     "stk",
+    limits?.stk,
+  );
+  const source = redactText(
+    typeof payload.source === "string" ? payload.source : undefined,
+    "source",
+    limits?.source,
   );
   const file =
     typeof payload.file === "string"
@@ -57,9 +75,16 @@ function redactErrorPayload(
     ...payload,
     ...(msg.value !== undefined ? { msg: msg.value } : {}),
     ...(stk.value !== undefined ? { stk: stk.value } : {}),
+    ...(source.value !== undefined ? { source: source.value } : {}),
     ...(file ? { file: file.value } : {}),
   };
-  attachRedactionMetadata(d, msg.metadata, stk.metadata, file?.metadata);
+  attachRedactionMetadata(
+    d,
+    msg.metadata,
+    stk.metadata,
+    source.metadata,
+    file?.metadata,
+  );
   return d;
 }
 
@@ -80,9 +105,8 @@ function readErrorString(error: unknown, field: "message" | "stack"): string | u
   if (!error || (typeof error !== "object" && typeof error !== "function"))
     return undefined;
   try {
-    return boundedString((error as Record<string, unknown>)[field], field === "stack"
-      ? RECORDED_ERROR_STACK_MAX_LENGTH
-      : RECORDED_ERROR_MESSAGE_MAX_LENGTH);
+    const value = (error as Record<string, unknown>)[field];
+    return typeof value === "string" ? value : undefined;
   } catch {
     return undefined;
   }
@@ -93,7 +117,8 @@ function describeRecordedError(error: unknown): string {
   if (message !== undefined && message !== "") return message;
   try {
     const serialized = safeStringify(error);
-    if (serialized !== undefined) return serialized.slice(0, RECORDED_ERROR_MESSAGE_MAX_LENGTH);
+    if (serialized !== undefined)
+      return serialized.slice(0, RECORDED_ERROR_MESSAGE_MAX_LENGTH);
   } catch {
     // Host supplied toString/valueOf can throw. The event still carries its handled state.
   }
@@ -110,15 +135,28 @@ export function buildRecordedErrorData(
   options: RecordErrorOptions | undefined,
   config: CrumbtrailConfig,
 ): Record<string, unknown> {
-  const source = boundedString(options?.source, RECORDED_ERROR_SOURCE_MAX_LENGTH) ?? "manual";
+  let optionSource: unknown;
+  let fatal = false;
+  try {
+    optionSource = options?.source;
+    fatal = options?.fatal === true;
+  } catch {
+    // A caller supplied options object can have hostile getters. Use safe defaults.
+  }
+  const source = boundedString(optionSource, RECORDED_ERROR_SOURCE_MAX_LENGTH) ?? "manual";
+  const stack = readErrorString(error, "stack");
   const payload: Record<string, unknown> = {
     msg: describeRecordedError(error),
-    stk: readErrorString(error, "stack"),
-    fatal: options?.fatal === true,
+    fatal,
     source,
     handled: true,
+    ...(stack !== undefined ? { stk: stack } : {}),
   };
-  return redactErrorPayload(payload, config);
+  return redactErrorPayload(payload, config, {
+    msg: RECORDED_ERROR_MESSAGE_MAX_LENGTH,
+    stk: RECORDED_ERROR_STACK_MAX_LENGTH,
+    source: RECORDED_ERROR_SOURCE_MAX_LENGTH,
+  });
 }
 
 export function errorCollector(
