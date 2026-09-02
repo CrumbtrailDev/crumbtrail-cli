@@ -149,7 +149,9 @@ await autoCapture({
 Values and keys are redacted using the shared capture policy. A rejected promise emits one `cache`
 event with `outcome: "failure"`, a bounded redacted error message, and its error class, then
 rethrows the original error. A `multi()` transaction or `pipeline()` emits one summary when
-`exec()` resolves or rejects. The summary includes a bounded command count and operation list.
+`exec()` or ioredis `execBuffer()` resolves or rejects. The summary includes a bounded command
+count and operation list. An ioredis `WATCH` abort that resolves `exec()` to `null` is reported as
+`outcome: "aborted"` and the `null` result is returned unchanged.
 
 Unsupported Redis commands are passed through without per-command evidence. Batch summaries do not
 capture command arguments or results. Redis work outside a request scope is not emitted because it

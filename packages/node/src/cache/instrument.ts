@@ -24,6 +24,7 @@ const BATCH_INSTRUMENTED = Symbol.for("crumbtrail.cache.batch.instrumented");
 
 const MAX_BATCH_OPERATIONS = 100;
 const MAX_BATCH_KEYS = 50;
+const MAX_BATCH_FAILURES = 100;
 
 interface OperationCapture {
   op: string;
@@ -40,6 +41,11 @@ interface BatchCapture {
   operationCount: number;
   operations: string[];
   keys: unknown[];
+}
+
+interface BatchCommand {
+  operation: string;
+  args: readonly unknown[];
 }
 
 export function instrumentIoredisClient<T extends DuckTypedCacheClient>(
@@ -82,6 +88,7 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
             driver,
             operationName === "multi" ? "transaction" : "pipeline",
             options,
+            constructorBatchCommands(args),
           );
         };
         wrappers.set(property, wrapped);
@@ -184,10 +191,12 @@ function wrapBatchResult(
   driver: CacheDriver,
   mode: BatchCapture["mode"],
   options: InstrumentCacheClientOptions,
+  initialCommands: readonly BatchCommand[] = [],
 ): unknown {
   if (isThenable(result)) {
     return result.then(
-      (batch: unknown) => wrapBatch(batch, driver, mode, options),
+      (batch: unknown) =>
+        wrapBatch(batch, driver, mode, options, initialCommands),
       (error: unknown) => {
         const requestId = resolveRequestId(options);
         if (requestId) {
@@ -205,7 +214,7 @@ function wrapBatchResult(
       },
     );
   }
-  return wrapBatch(result, driver, mode, options);
+  return wrapBatch(result, driver, mode, options, initialCommands);
 }
 
 function wrapBatch(
@@ -213,6 +222,7 @@ function wrapBatch(
   driver: CacheDriver,
   mode: BatchCapture["mode"],
   options: InstrumentCacheClientOptions,
+  initialCommands: readonly BatchCommand[] = [],
 ): unknown {
   if (!value || (typeof value !== "object" && typeof value !== "function")) {
     return value;
@@ -225,6 +235,9 @@ function wrapBatch(
     operations: [],
     keys: [],
   };
+  for (const command of initialCommands) {
+    recordBatchOperation(capture, command.operation, command.args);
+  }
   const wrappers = new Map<PropertyKey, unknown>();
   let proxy: DuckTypedCacheClient;
   proxy = new Proxy(target, {
@@ -243,14 +256,18 @@ function wrapBatch(
           if (!requestId || !isThenable(execution)) return execution;
           return execution.then(
             (resolved: unknown) => {
-              const failureCount = batchFailureCount(driver, resolved);
+              const inspection = inspectBatchResult(driver, resolved);
               emitSafely(options, {
                 driver,
                 op: capture.mode,
                 keys: capture.keys,
                 requestId,
-                ...(failureCount > 0 ? { outcome: "failure" as const } : {}),
-                summary: batchSummary(capture, failureCount),
+                ...(inspection.aborted
+                  ? { outcome: "aborted" as const }
+                  : inspection.failureCount > 0
+                    ? { outcome: "failure" as const }
+                    : {}),
+                summary: batchSummary(capture, inspection),
               });
               return resolved;
             },
@@ -299,6 +316,37 @@ function recordBatchOperation(
   }
 }
 
+function constructorBatchCommands(args: readonly unknown[]): BatchCommand[] {
+  const supplied = args[0];
+  if (!Array.isArray(supplied) || supplied.length === 0) return [];
+  const commands =
+    Array.isArray(supplied[0]) || isRecord(supplied[0]) ? supplied : [supplied];
+  const parsed: BatchCommand[] = [];
+  for (const command of commands) {
+    if (Array.isArray(command)) {
+      const [name, ...commandArgs] = command;
+      if (typeof name === "string") {
+        parsed.push({ operation: normalizeMethod(name), args: commandArgs });
+      }
+      continue;
+    }
+    if (!isRecord(command)) continue;
+    const name = command.name ?? command.command;
+    const commandArgs = command.args;
+    if (typeof name === "string" && Array.isArray(commandArgs)) {
+      parsed.push({
+        operation: normalizeMethod(name),
+        args: commandArgs,
+      });
+    }
+  }
+  return parsed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function batchKeysForOperation(
   operation: string,
   args: readonly unknown[],
@@ -310,25 +358,45 @@ function batchKeysForOperation(
   return describeOperation(operation, args)?.keys ?? [];
 }
 
-function batchFailureCount(driver: CacheDriver, result: unknown): number {
-  if (driver !== "ioredis" || !Array.isArray(result)) return 0;
-  let failures = 0;
-  for (const tuple of result.slice(0, MAX_BATCH_OPERATIONS)) {
-    if (Array.isArray(tuple) && tuple.length > 0 && tuple[0] != null) {
-      failures += 1;
-    }
+function inspectBatchResult(
+  driver: CacheDriver,
+  result: unknown,
+): { failureCount: number; failureCountTruncated: boolean; aborted: boolean } {
+  if (driver !== "ioredis") {
+    return { failureCount: 0, failureCountTruncated: false, aborted: false };
   }
-  return failures;
+  if (result === null) {
+    return { failureCount: 0, failureCountTruncated: false, aborted: true };
+  }
+  if (!Array.isArray(result)) {
+    return { failureCount: 0, failureCountTruncated: false, aborted: false };
+  }
+  let failureCount = 0;
+  let failureCountTruncated = false;
+  // Scan every tuple to detect failures after the reporting cap. Only the
+  // count is bounded, never the inspection needed to classify the batch.
+  for (const tuple of result) {
+    if (!Array.isArray(tuple) || tuple.length === 0 || tuple[0] == null) {
+      continue;
+    }
+    if (failureCount < MAX_BATCH_FAILURES) failureCount += 1;
+    else failureCountTruncated = true;
+  }
+  return { failureCount, failureCountTruncated, aborted: false };
 }
 
 function batchSummary(
   capture: BatchCapture,
-  failureCount = 0,
+  result: Pick<
+    ReturnType<typeof inspectBatchResult>,
+    "failureCount" | "failureCountTruncated"
+  > = { failureCount: 0, failureCountTruncated: false },
 ): CacheOperationSummary {
   return {
     operationCount: capture.operationCount,
     operations: [...capture.operations],
-    ...(failureCount > 0 ? { failureCount } : {}),
+    ...(result.failureCount > 0 ? { failureCount: result.failureCount } : {}),
+    ...(result.failureCountTruncated ? { failureCountTruncated: true } : {}),
     ...(capture.operations.length < capture.operationCount
       ? { truncated: true }
       : {}),

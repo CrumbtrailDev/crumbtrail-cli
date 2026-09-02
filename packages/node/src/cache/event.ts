@@ -18,7 +18,7 @@ export interface CacheEventData {
   key: string | string[];
   requestId: string;
   /** Present on rejected commands so readers can distinguish a failed cache call from a miss. */
-  outcome?: "success" | "failure";
+  outcome?: "success" | "failure" | "aborted";
   hit?: boolean;
   ttlMs?: number;
   value?: unknown;
@@ -36,6 +36,8 @@ export interface CacheOperationSummary {
   operations: string[];
   /** Number of per-command ioredis tuple failures, capped before emission. */
   failureCount?: number;
+  /** Whether the failure count reached its reporting cap. */
+  failureCountTruncated?: boolean;
   truncated?: boolean;
 }
 
@@ -47,7 +49,7 @@ export interface BuildCacheEventInput {
   hit?: boolean;
   ttlMs?: number;
   value?: unknown;
-  outcome?: "success" | "failure";
+  outcome?: "success" | "failure" | "aborted";
   error?: unknown;
   summary?: CacheOperationSummary;
   sessionId?: string;
@@ -138,6 +140,7 @@ function normalizeSummary(
           ),
         }
       : {}),
+    ...(summary.failureCountTruncated ? { failureCountTruncated: true } : {}),
     ...(summary.truncated || operations.length < summary.operationCount
       ? { truncated: true }
       : {}),

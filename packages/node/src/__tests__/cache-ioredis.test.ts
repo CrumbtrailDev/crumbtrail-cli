@@ -183,4 +183,112 @@ describe("instrumentIoredisClient", () => {
     expect(events[0]?.d).not.toHaveProperty("value");
     expect(JSON.stringify(events)).not.toContain('"data":[1,2,3]');
   });
+
+  it("scans every ioredis tuple while capping the reported failure count", async () => {
+    const events: BugEvent[] = [];
+    const tuples: unknown[] = Array.from({ length: 150 }, (_, index) =>
+      index < 100 || index === 149
+        ? [new Error(`command ${index} failed`), null]
+        : [null, "ok"],
+    );
+    const client = instrumentIoredisClient(
+      {
+        pipeline() {
+          const batch = {
+            exec: async () => tuples,
+          };
+          return batch;
+        },
+      },
+      { emit: (event) => events.push(event), requestId: "req_ioredis_cap" },
+    );
+
+    await client.pipeline().exec();
+
+    expect(events[0]?.d).toMatchObject({
+      outcome: "failure",
+      summary: {
+        failureCount: 100,
+        failureCountTruncated: true,
+      },
+    });
+  });
+
+  it("reports an ioredis WATCH abort when EXEC resolves null", async () => {
+    const events: BugEvent[] = [];
+    const client = instrumentIoredisClient(
+      {
+        multi(_commands?: unknown[]) {
+          const batch = {
+            exec: async () => null,
+          };
+          return batch;
+        },
+      },
+      { emit: (event) => events.push(event), requestId: "req_ioredis_abort" },
+    );
+
+    const result = await client.multi([["set", "cart:123", "private"]]).exec();
+
+    expect(result).toBeNull();
+    expect(events[0]?.d).toMatchObject({
+      outcome: "aborted",
+      summary: {
+        operationCount: 1,
+        operations: ["set"],
+      },
+    });
+  });
+
+  it("summarizes constructor supplied pipeline and multi commands without raw arguments", async () => {
+    const events: BugEvent[] = [];
+    const client = instrumentIoredisClient(
+      {
+        pipeline(_commands?: unknown[]) {
+          return { exec: async () => [] };
+        },
+        multi(_commands?: unknown[]) {
+          return { exec: async () => [] };
+        },
+      },
+      {
+        emit: (event) => events.push(event),
+        requestId: "req_ioredis_constructor",
+      },
+    );
+
+    await client
+      .pipeline([
+        ["set", "cart:123", "private value"],
+        ["get", "cart:123"],
+        ["addCommand", ["set", "secret:key", "private value"]],
+      ])
+      .exec();
+    await client
+      .multi([
+        { command: "hset", args: ["profile:123", "password", "private value"] },
+        {
+          name: "sendCommand",
+          args: [{ args: ["secret:key", "private value"] }],
+        },
+      ])
+      .exec();
+
+    expect(events[0]?.d).toMatchObject({
+      key: ["cart:*", "cart:*"],
+      summary: {
+        operationCount: 3,
+        operations: ["set", "get", "addcommand"],
+      },
+    });
+    expect(events[1]?.d).toMatchObject({
+      key: "profile:*",
+      summary: {
+        operationCount: 2,
+        operations: ["hset", "sendcommand"],
+      },
+    });
+    expect(JSON.stringify(events)).not.toContain("private value");
+    expect(JSON.stringify(events)).not.toContain("secret:key");
+  });
 });
