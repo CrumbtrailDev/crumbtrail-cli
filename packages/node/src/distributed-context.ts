@@ -51,7 +51,8 @@ const TOKEN_KEYS = new Set([
   "expiresAt",
 ]);
 const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const TRACE_STATE_KEY_RE = /^[a-z][a-z0-9_*\/-]{0,255}$/;
+const TRACE_STATE_KEY_RE =
+  /^(?:[a-z][a-z0-9_-]{0,255}|[a-z0-9][a-z0-9_-]{0,240}@[a-z][a-z0-9_-]{0,13})$/;
 const TRACE_STATE_VALUE_RE = /^[\x20-\x2b\x2d-\x7e]*$/;
 
 /**
@@ -123,6 +124,11 @@ export function captureToken(
   if (!parent) return undefined;
   const enqueuedAt = readNow(options.now ?? Date.now);
   const expiresAt = resolveExpiry(options, enqueuedAt);
+  if (
+    (options.expiresAt !== undefined || options.ttlMs !== undefined) &&
+    expiresAt === undefined
+  )
+    return undefined;
   if (expiresAt !== undefined && expiresAt <= enqueuedAt) return undefined;
   return validateCrumbtrailContextToken(
     {

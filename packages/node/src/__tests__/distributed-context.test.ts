@@ -85,6 +85,12 @@ describe("distributed context", () => {
         1_500,
       ),
     ).toBeUndefined();
+    expect(
+      validateCrumbtrailContextToken(token({ tracestate: "x/y=value" }), 1_500),
+    ).toBeUndefined();
+    expect(
+      validateCrumbtrailContextToken(token({ tracestate: "x*=value" }), 1_500),
+    ).toBeUndefined();
   });
 
   it("captures the active context and creates a child span across awaits", async () => {
@@ -146,6 +152,15 @@ describe("distributed context", () => {
       withCausalContext(token({ expiresAt: 10 }), handler, { now: 10 }),
     ).rejects.toThrow("Invalid or expired");
     expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("does not create an unbounded token for an invalid lifetime", async () => {
+    await runInBackendRequestContext({ traceparent: TRACEPARENT }, async () => {
+      expect(captureToken({ now: 1_000, ttlMs: Number.NaN })).toBeUndefined();
+      expect(
+        captureToken({ now: 1_000, expiresAt: Number.POSITIVE_INFINITY }),
+      ).toBeUndefined();
+    });
   });
 });
 
