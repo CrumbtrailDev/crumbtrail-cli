@@ -206,6 +206,7 @@ describe("storageCollector", () => {
       key: "key1",
       oldVal: REDACTED_VALUE,
       newVal: REDACTED_VALUE,
+      outcome: "success",
     });
 
     cleanup();
@@ -231,6 +232,7 @@ describe("storageCollector", () => {
       op: "del",
       key: "del",
       oldVal: REDACTED_VALUE,
+      outcome: "success",
     });
 
     cleanup();
@@ -253,7 +255,95 @@ describe("storageCollector", () => {
       (e) => e.k === "stor" && e.d.op === "clear",
     );
     expect(storEvents).toHaveLength(1);
-    expect(storEvents[0].d).toMatchObject({ type: "local", op: "clear" });
+    expect(storEvents[0].d).toMatchObject({
+      type: "local",
+      op: "clear",
+      outcome: "success",
+    });
+
+    cleanup();
+  });
+
+  it("records a rejected setItem after the failure and rethrows the original error", () => {
+    const quotaError = new DOMException("storage quota exceeded", "QuotaExceededError");
+    Object.defineProperty(localStorage, "setItem", {
+      value: vi.fn(() => {
+        throw quotaError;
+      }),
+      writable: true,
+      configurable: true,
+    });
+    const cleanup = storageCollector(
+      bus,
+      makeConfig({ captureIdb: false, captureCacheApi: false }),
+    );
+    bus.flush();
+    events.length = 0;
+
+    let thrown: unknown;
+    try {
+      localStorage.setItem("checkoutDraft", "customer secret");
+    } catch (error) {
+      thrown = error;
+    }
+    bus.flush();
+
+    expect(thrown).toBe(quotaError);
+    const event = events.find((entry) => entry.k === "stor");
+    expect(event?.d).toMatchObject({
+      type: "local",
+      op: "set",
+      key: "checkoutDraft",
+      outcome: "failure",
+      errorName: "QuotaExceededError",
+      newVal: REDACTED_VALUE,
+    });
+    expect(JSON.stringify(event)).not.toContain("customer secret");
+
+    cleanup();
+  });
+
+  it("records rejected removeItem and clear mutations with bounded error names", () => {
+    localStorage.setItem("draft", "value");
+    const removeError = new Error("remove failed with a secret");
+    Object.defineProperty(localStorage, "removeItem", {
+      value: vi.fn(() => {
+        throw removeError;
+      }),
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(localStorage, "clear", {
+      value: vi.fn(() => {
+        throw { name: "X".repeat(500), message: "clear secret" };
+      }),
+      writable: true,
+      configurable: true,
+    });
+    const cleanup = storageCollector(
+      bus,
+      makeConfig({ captureIdb: false, captureCacheApi: false }),
+    );
+    bus.flush();
+    events.length = 0;
+
+    expect(() => localStorage.removeItem("draft")).toThrow(removeError);
+    expect(() => localStorage.clear()).toThrow();
+    bus.flush();
+
+    const failures = events.filter(
+      (entry) => entry.k === "stor" && entry.d.outcome === "failure",
+    );
+    expect(failures).toHaveLength(2);
+    expect(failures[0].d).toMatchObject({
+      op: "del",
+      errorName: "Error",
+    });
+    expect(failures[1].d).toMatchObject({
+      op: "clear",
+      errorName: "X".repeat(100),
+    });
+    expect(JSON.stringify(failures)).not.toContain("clear secret");
 
     cleanup();
   });

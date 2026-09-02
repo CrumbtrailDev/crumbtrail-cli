@@ -1,6 +1,10 @@
 import type { EventBus } from "../event-bus";
-import type { CrumbtrailConfig, CollectorCleanup } from "../types";
-import { now } from "../utils";
+import type {
+  CrumbtrailConfig,
+  CollectorCleanup,
+  RecordErrorOptions,
+} from "../types";
+import { now, safeStringify } from "../utils";
 import {
   attachRedactionMetadata,
   redactNetworkTextBody,
@@ -57,6 +61,64 @@ function redactErrorPayload(
   };
   attachRedactionMetadata(d, msg.metadata, stk.metadata, file?.metadata);
   return d;
+}
+
+const RECORDED_ERROR_MESSAGE_MAX_LENGTH = 2_000;
+const RECORDED_ERROR_STACK_MAX_LENGTH = 8_000;
+const RECORDED_ERROR_SOURCE_MAX_LENGTH = 200;
+
+function boundedString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  try {
+    return value.slice(0, maxLength);
+  } catch {
+    return undefined;
+  }
+}
+
+function readErrorString(error: unknown, field: "message" | "stack"): string | undefined {
+  if (!error || (typeof error !== "object" && typeof error !== "function"))
+    return undefined;
+  try {
+    return boundedString((error as Record<string, unknown>)[field], field === "stack"
+      ? RECORDED_ERROR_STACK_MAX_LENGTH
+      : RECORDED_ERROR_MESSAGE_MAX_LENGTH);
+  } catch {
+    return undefined;
+  }
+}
+
+function describeRecordedError(error: unknown): string {
+  const message = readErrorString(error, "message");
+  if (message !== undefined && message !== "") return message;
+  try {
+    const serialized = safeStringify(error);
+    if (serialized !== undefined) return serialized.slice(0, RECORDED_ERROR_MESSAGE_MAX_LENGTH);
+  } catch {
+    // Host supplied toString/valueOf can throw. The event still carries its handled state.
+  }
+  try {
+    return String(error).slice(0, RECORDED_ERROR_MESSAGE_MAX_LENGTH);
+  } catch {
+    return "Unknown error";
+  }
+}
+
+/** Build the browser wire event for an application error that host code handled. */
+export function buildRecordedErrorData(
+  error: unknown,
+  options: RecordErrorOptions | undefined,
+  config: CrumbtrailConfig,
+): Record<string, unknown> {
+  const source = boundedString(options?.source, RECORDED_ERROR_SOURCE_MAX_LENGTH) ?? "manual";
+  const payload: Record<string, unknown> = {
+    msg: describeRecordedError(error),
+    stk: readErrorString(error, "stack"),
+    fatal: options?.fatal === true,
+    source,
+    handled: true,
+  };
+  return redactErrorPayload(payload, config);
 }
 
 export function errorCollector(

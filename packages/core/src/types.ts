@@ -677,6 +677,14 @@ export interface FlagBugOptions {
   voiceBlob?: Blob;
 }
 
+/** Options for recording an application error that was caught by host code. */
+export interface RecordErrorOptions {
+  /** Whether the application treated this error as fatal. Defaults to false. */
+  fatal?: boolean;
+  /** Bounded application supplied source label. Defaults to `manual`. */
+  source?: string;
+}
+
 /**
  * Who asked for a report. Stamped on every `bug.flag` event so a reader can tell a
  * person filing a bug apart from a detector capturing one, without guessing from
@@ -957,6 +965,20 @@ export interface CrumbtrailConfig {
   autoFlagOnRequest5xx: boolean;
   /** Enable automatic capture when a browser-standard rendered validation error appears. */
   autoFlagOnRenderedError: boolean;
+  /** Enable automatic capture when the application logs a caught error. */
+  autoFlagOnCaughtError: boolean;
+  /** Enable automatic capture when a success status carries an application failure body. */
+  autoFlagOnResponseBodyError: boolean;
+  /** Enable automatic capture when a WebSocket or server-sent stream fails. */
+  autoFlagOnStreamFailure: boolean;
+  /** Enable automatic capture when a Web Worker throws. */
+  autoFlagOnWorkerError: boolean;
+  /** Enable automatic capture when a rendered numeric value is missing or non-finite. */
+  autoFlagOnWrongNumber: boolean;
+  /** Enable automatic capture when a script or stylesheet reports zero transfer and duration. */
+  autoFlagOnResourceLoadFailure: boolean;
+  /** Enable automatic capture when a Web Storage mutation is rejected by the browser. */
+  autoFlagOnStorageFailure: boolean;
   /** Allow app code and the widget to call `flag()` as an explicit beacon. */
   explicitBeacon: boolean;
   /** Keep the server side pull policy available to heartbeat integrations. */
@@ -1121,6 +1143,14 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   autoFlagOnUnhandledRejection: true,
   autoFlagOnRequest5xx: true,
   autoFlagOnRenderedError: true,
+  autoFlagOnCaughtError: true,
+  autoFlagOnResponseBodyError: true,
+  autoFlagOnStreamFailure: true,
+  autoFlagOnWorkerError: true,
+  // These noisy heuristics stay off while shadow mode measures their real firing rates.
+  autoFlagOnWrongNumber: false,
+  autoFlagOnResourceLoadFailure: false,
+  autoFlagOnStorageFailure: false,
   explicitBeacon: true,
   serverSidePull: false,
   autoFlagDebounceMs: 2000,

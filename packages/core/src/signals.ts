@@ -1,5 +1,5 @@
 import type { BugEvent } from "./types";
-import { UI_ERROR_EVENT_KIND } from "./types";
+import { UI_ERROR_EVENT_KIND, UI_NUM_EVENT_KIND } from "./types";
 import { hashString } from "./signature";
 
 /**
@@ -57,6 +57,10 @@ export function errorDetector(
     inspect(event) {
       if (
         (event.k !== "err" && event.k !== "rej") ||
+        // `recordError()` is the explicit handled-error API. Its event is still
+        // useful evidence, but it must not be mistaken for an uncaught error and
+        // auto-flagged a second time by the baseline detector.
+        (event.k === "err" && event.d.handled === true) ||
         (event.k === "err" && options.uncaughtError === false) ||
         (event.k === "rej" && options.unhandledRejection === false)
       )
@@ -379,6 +383,232 @@ export function abandonedFlowDetector(
         return null;
       }
       return null;
+    },
+  };
+}
+
+/**
+ * Frames that belong to somebody else. A caught error is only worth a report when the throw site
+ * is the application's own code: a library logging at error level for a condition it has already
+ * handled is not a defect in the page, and the SDK's own output is not a defect at all.
+ */
+const FOREIGN_FRAME_RE =
+  /(?:\/|^)(?:node_modules|bower_components)\/|(?:^|[/\\])crumbtrail[^/\\]*\.(?:js|mjs|cjs)|\bchrome-extension:|\bmoz-extension:|\bsafari-extension:/i;
+
+/** A frame with no location at all — `at <anonymous>`, `at Object.<anonymous>`, a bare native line. */
+const LOCATIONLESS_FRAME_RE = /\((?:<anonymous>|native)\)|^\s*at\s*<anonymous>/i;
+
+/**
+ * The first stack frame that names a file, or `undefined` when the stack names none.
+ *
+ * The console collector captures the stack relative to the application's own `console.error` call
+ * rather than to the collector standing in front of it, so frame one is genuinely the caller.
+ */
+function firstLocatedFrame(stack: string): string | undefined {
+  for (const line of stack.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.startsWith("at ")) continue;
+    if (LOCATIONLESS_FRAME_RE.test(trimmed)) continue;
+    return trimmed;
+  }
+  return undefined;
+}
+
+/** Reactive detector for a failure the application handled itself. */
+export function caughtErrorDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "con" || event.d.lv !== "err") return null;
+      const stack = typeof event.d.stk === "string" ? event.d.stk : "";
+      if (!stack) return null;
+      const frame = firstLocatedFrame(stack);
+      if (!frame || FOREIGN_FRAME_RE.test(frame)) return null;
+
+      const args = Array.isArray(event.d.args) ? event.d.args : [];
+      const msg = args.find((a): a is string => typeof a === "string" && !!a);
+      return {
+        tag: "auto:caught-error",
+        key: `caught:${hashString(`${msg ?? ""}|${frame}`)}`,
+        reason: msg
+          ? `Auto-captured after the application logged a caught error: ${msg}`
+          : "Auto-captured after the application logged a caught error",
+      };
+    },
+  };
+}
+
+/** The only three keys `readBodyFailure` can match on. */
+const FAILURE_KEY_RE = /"(?:errors|ok|success)"\s*:/;
+
+/** Reactive detector for a failing response that arrived with a success status. */
+export function responseBodyErrorDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "net.res") return null;
+      // A 4xx or 5xx already belongs to requestFailureDetector. Raising a
+      // second signal for one response spends a second dedup entry.
+      const status = typeof event.d.st === "number" ? event.d.st : 0;
+      if (status >= 400) return null;
+      const body = typeof event.d.body === "string" ? event.d.body : "";
+      if (!body || !FAILURE_KEY_RE.test(body)) return null;
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        return null;
+      }
+      const failure = readBodyFailure(parsed);
+      if (!failure) return null;
+
+      const requestId = typeof event.d.id === "number" ? event.d.id : "unknown";
+      return {
+        tag: "auto:response-body-error",
+        key: `body-error:${requestId}:${failure}`,
+        reason: `Auto-captured after a ${status} response carried ${failure}`,
+      };
+    },
+  };
+}
+
+/** Batched GraphQL responses are an array of results; a failure in any one counts. */
+function readBodyFailure(parsed: unknown): string | undefined {
+  if (Array.isArray(parsed)) {
+    for (const entry of parsed) {
+      const found = readBodyFailure(entry);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const record = parsed as Record<string, unknown>;
+  const errors = record.errors;
+  if (Array.isArray(errors) && errors.length > 0)
+    return errors.length === 1 ? "1 error" : `${errors.length} errors`;
+  if (record.ok === false) return "ok: false";
+  if (record.success === false) return "success: false";
+  return undefined;
+}
+
+/** Close codes that end a socket the way it was meant to end. */
+const CLEAN_CLOSE_CODES = new Set([1000, 1001, 1005]);
+
+/** Reactive detector for a socket or server-sent stream that failed. */
+export function streamFailureDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "net.ws" && event.k !== "net.sse") return null;
+      const op = typeof event.d.op === "string" ? event.d.op : "";
+      const url = typeof event.d.url === "string" ? event.d.url : "unknown";
+      const kind = event.k === "net.ws" ? "socket" : "stream";
+
+      if (op === "error") {
+        return {
+          tag: "auto:stream-failure",
+          key: `stream:${event.k}:error:${url}`,
+          reason: `Auto-captured after the ${kind} to ${url} errored`,
+        };
+      }
+      // SSE close carries no close code, so it is indistinguishable from an
+      // ordinary teardown. Only a socket can say that it ended early.
+      if (event.k !== "net.ws" || op !== "close") return null;
+      const code = typeof event.d.code === "number" ? event.d.code : undefined;
+      const clean = typeof event.d.clean === "boolean" ? event.d.clean : undefined;
+      const early =
+        clean === false || (code !== undefined && !CLEAN_CLOSE_CODES.has(code));
+      if (!early) return null;
+      return {
+        tag: "auto:stream-failure",
+        key: `stream:close:${url}:${code ?? "unknown"}`,
+        reason: `Auto-captured after the socket to ${url} closed early${
+          code !== undefined ? ` with code ${code}` : ""
+        }`,
+      };
+    },
+  };
+}
+
+/** Reactive detector for a Web Worker that threw. */
+export function workerErrorDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "worker.msg" || event.d.op !== "error") return null;
+      const script = typeof event.d.script === "string" ? event.d.script : "a worker";
+      const msg = typeof event.d.msg === "string" ? event.d.msg : undefined;
+      const id = typeof event.d.id === "number" ? event.d.id : "unknown";
+      return {
+        tag: "auto:worker-error",
+        key: `worker:${id}:${hashString(`${script}|${msg ?? ""}`)}`,
+        reason: msg
+          ? `Auto-captured after ${script} threw: ${msg}`
+          : `Auto-captured after ${script} threw`,
+      };
+    },
+  };
+}
+
+/** Reactive detector for a rendered value that is missing or non-finite. */
+export function wrongNumberDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== UI_NUM_EVENT_KIND) return null;
+      const region =
+        typeof event.d.region === "string" ? event.d.region : "unknown region";
+      const items = Array.isArray(event.d.items) ? event.d.items : [];
+      for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        const record = item as Record<string, unknown>;
+        if (typeof record.value === "number" && Number.isFinite(record.value))
+          continue;
+        const label =
+          typeof record.label === "string" ? record.label : "unlabeled value";
+        return {
+          tag: "auto:wrong-number",
+          key: `wrong-number:${hashString(`${region}|${label}`)}`,
+          reason: `Auto-captured after ${label} in ${region} rendered an invalid number`,
+        };
+      }
+      return null;
+    },
+  };
+}
+
+/** Reactive detector for a script or stylesheet resource that loaded no data. */
+export function resourceLoadFailureDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "perf" || event.d.metric !== "res") return null;
+      const initiator =
+        typeof event.d.initiatorType === "string" ? event.d.initiatorType : "";
+      if (initiator !== "script" && initiator !== "link") return null;
+      if (event.d.transferSize !== 0 || event.d.duration !== 0) return null;
+      const name =
+        typeof event.d.name === "string" ? event.d.name : "unknown resource";
+      const kind = initiator === "script" ? "script" : "stylesheet";
+      return {
+        tag: "auto:resource-load-failure",
+        key: `resource-load:${hashString(`${initiator}|${name}`)}`,
+        reason: `Auto-captured after the ${kind} ${name} loaded no data`,
+      };
+    },
+  };
+}
+
+/** Reactive detector for a storage mutation that the browser rejected. */
+export function storageFailureDetector(): SignalDetector {
+  return {
+    inspect(event) {
+      if (event.k !== "stor" || event.d.outcome !== "failure") return null;
+      const type = event.d.type === "session" ? "sessionStorage" : "localStorage";
+      const op = typeof event.d.op === "string" ? event.d.op : "mutation";
+      const errorName =
+        typeof event.d.errorName === "string" ? event.d.errorName : "Error";
+      const key = typeof event.d.key === "string" ? event.d.key : "storage";
+      return {
+        tag: "auto:storage-failure",
+        key: `storage-failure:${type}:${op}:${key}:${errorName}`,
+        reason: `Auto-captured after ${type} ${op} failed with ${errorName}`,
+      };
     },
   };
 }
