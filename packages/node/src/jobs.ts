@@ -16,7 +16,7 @@ import {
   type CrumbtrailContextToken,
 } from "./distributed-context";
 import { startHeadlessSession, type HeadlessSession } from "./headless-session";
-import type { BugEvent } from "crumbtrail-core";
+import { redactTokenLikeString, type BugEvent } from "crumbtrail-core";
 
 export const DEFAULT_JOB_CLEANUP_TIMEOUT_MS = 500;
 export const DEFAULT_JOB_LINK_TIMEOUT_MS = 500;
@@ -90,14 +90,15 @@ export async function withCrumbtrailJob<T>(
     );
   }
 
-  const name = options.name;
+  const name = safeJobField(options.name, "name") || "unnamed";
+  const queue = options.queue
+    ? safeJobField(options.queue, "queue") || undefined
+    : undefined;
+  const jobId = options.jobId
+    ? safeJobField(options.jobId, "jobId") || undefined
+    : undefined;
   const attempt = normalizeAttempt(options.attempt);
-  const childSessionId = generateJobSessionId(
-    name,
-    options.queue,
-    options.jobId,
-    now,
-  );
+  const childSessionId = generateJobSessionId(name, queue, jobId, now);
   const parentSessionId = validatedParent?.sessionId;
   const parentRequestId = validatedParent?.requestId;
   const sink = options.sink ?? getActiveBackendEventSink();
@@ -113,8 +114,8 @@ export async function withCrumbtrailJob<T>(
           metadata: {
             ...(options.metadata ?? {}),
             job: name,
-            ...(options.queue ? { queue: options.queue } : {}),
-            ...(options.jobId ? { jobId: options.jobId } : {}),
+            ...(queue ? { queue } : {}),
+            ...(jobId ? { jobId } : {}),
             attempt,
           },
         }),
@@ -130,8 +131,8 @@ export async function withCrumbtrailJob<T>(
           metadata: {
             ...(options.metadata ?? {}),
             job: name,
-            ...(options.queue ? { queue: options.queue } : {}),
-            ...(options.jobId ? { jobId: options.jobId } : {}),
+            ...(queue ? { queue } : {}),
+            ...(jobId ? { jobId } : {}),
             attempt,
           },
         }),
@@ -164,9 +165,9 @@ export async function withCrumbtrailJob<T>(
       matchedOn: {
         ...(parentRequestId ? { requestId: parentRequestId } : {}),
         traceparent: validatedParent?.traceparent,
-        ...(options.queue ? { queue: options.queue } : {}),
+        ...(queue ? { queue } : {}),
         name,
-        ...(options.jobId ? { jobId: options.jobId } : {}),
+        ...(jobId ? { jobId } : {}),
       },
       anchorHint: `job:${name}`,
     };
@@ -198,8 +199,8 @@ export async function withCrumbtrailJob<T>(
   );
   const jobContext: CrumbtrailJobContext = {
     name,
-    ...(options.queue ? { queue: options.queue } : {}),
-    ...(options.jobId ? { jobId: options.jobId } : {}),
+    ...(queue ? { queue } : {}),
+    ...(jobId ? { jobId } : {}),
     attempt,
     sessionId: effectiveChildSessionId,
     ...(childToken.requestId ? { requestId: childToken.requestId } : {}),
@@ -227,8 +228,8 @@ export async function withCrumbtrailJob<T>(
     await record(
       buildBackendJobStartEvent({
         name,
-        ...(options.queue ? { queue: options.queue } : {}),
-        ...(options.jobId ? { jobId: options.jobId } : {}),
+        ...(queue ? { queue } : {}),
+        ...(jobId ? { jobId } : {}),
         attempt,
         sessionId: effectiveChildSessionId,
         ...(childToken.requestId ? { requestId: childToken.requestId } : {}),
@@ -254,8 +255,8 @@ export async function withCrumbtrailJob<T>(
     const terminal = succeeded
       ? buildBackendJobEndEvent({
           name,
-          ...(options.queue ? { queue: options.queue } : {}),
-          ...(options.jobId ? { jobId: options.jobId } : {}),
+          ...(queue ? { queue } : {}),
+          ...(jobId ? { jobId } : {}),
           attempt,
           sessionId: effectiveChildSessionId,
           ...(childToken.requestId ? { requestId: childToken.requestId } : {}),
@@ -264,8 +265,8 @@ export async function withCrumbtrailJob<T>(
         })
       : buildBackendJobErrorEvent({
           name,
-          ...(options.queue ? { queue: options.queue } : {}),
-          ...(options.jobId ? { jobId: options.jobId } : {}),
+          ...(queue ? { queue } : {}),
+          ...(jobId ? { jobId } : {}),
           attempt,
           sessionId: effectiveChildSessionId,
           ...(childToken.requestId ? { requestId: childToken.requestId } : {}),
@@ -429,6 +430,16 @@ function reportLoss(
   } catch {
     // Capture diagnostics cannot replace the host's job semantics either.
   }
+}
+
+function safeJobField(value: string, path: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return redactTokenLikeString(trimmed, `job.${path}`, {
+    skipGenericShapePatterns: true,
+  })
+    .value.replace(/[\u0000-\u001f\u007f]/g, "")
+    .slice(0, 256);
 }
 
 function normalizeAttempt(value: number | undefined): number {
