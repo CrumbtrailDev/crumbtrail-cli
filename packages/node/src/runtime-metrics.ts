@@ -353,7 +353,22 @@ export function installRuntimeMetrics(
   const clearIntervalImpl: (timer: unknown) => void =
     options.clearIntervalImpl ??
     ((timer) => clearInterval(timer as NodeJS.Timeout));
-  const timer = setIntervalImpl(sample, sampleIntervalMs);
+  let timer: unknown;
+  try {
+    timer = setIntervalImpl(sample, sampleIntervalMs);
+  } catch (error) {
+    try {
+      eventLoopDelay?.disable();
+    } catch {
+      // Teardown is best effort for restricted runtimes.
+    }
+    try {
+      eventLoopDelay?.reset();
+    } catch {
+      // Teardown is best effort for restricted runtimes.
+    }
+    throw error;
+  }
   try {
     (timer as { unref?: () => void }).unref?.();
   } catch {

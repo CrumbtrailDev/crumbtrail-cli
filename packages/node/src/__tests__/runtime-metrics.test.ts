@@ -198,6 +198,25 @@ describe("Node runtime metrics", () => {
     handle.stop();
   });
 
+  it("tears down the monitor when interval creation fails", () => {
+    const monitor = makeMonitor();
+
+    expect(() =>
+      installRuntimeMetrics({
+        emit: () => {},
+        eventLoopDelayImpl: () => monitor,
+        readFile: makeReader({}),
+        setIntervalImpl: () => {
+          throw new Error("timer unavailable");
+        },
+      }),
+    ).toThrow("timer unavailable");
+
+    expect(monitor.enable).toHaveBeenCalledOnce();
+    expect(monitor.disable).toHaveBeenCalledOnce();
+    expect(monitor.reset).toHaveBeenCalledOnce();
+  });
+
   it("bounds arbitrary low level markers and ignores non numeric fields", () => {
     const event = buildNodeRuntimeEvent(
       {
