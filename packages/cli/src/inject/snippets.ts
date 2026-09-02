@@ -629,6 +629,7 @@ export function flutterInitSnippet(
  */
 export function tauriInitSnippet(): string {
   return [
+    'import "crumbtrail-core/early";',
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
     'import { TauriTransport } from "crumbtrail-core/tauri";',
     "",

@@ -76,6 +76,7 @@ describe("early browser capture", () => {
       ["client", clientInitSnippet(ENDPOINT, CLIENT_KEY, "web")],
       ["nuxt", nuxtPluginSnippet(ENDPOINT, CLIENT_KEY, "web")],
       ["capacitor", capacitorInitSnippet(ENDPOINT, CLIENT_KEY, "app")],
+      ["tauri", tauriInitSnippet()],
       [
         "static",
         staticScriptTagSnippet({ endpoint: ENDPOINT, keyLiteral: "ctkey_TODO" }),
@@ -89,6 +90,13 @@ describe("early browser capture", () => {
   it("does not add the browser-only early module to React Native", () => {
     expect(reactNativeInitSnippet(ENDPOINT, CLIENT_KEY, "app")).not.toContain(
       "crumbtrail-core/early",
+    );
+  });
+
+  it("starts Tauri early capture before its main SDK import", () => {
+    const snippet = tauriInitSnippet();
+    expect(snippet.indexOf('import "crumbtrail-core/early";')).toBeLessThan(
+      snippet.indexOf('import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";'),
     );
   });
 });
