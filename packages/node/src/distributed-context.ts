@@ -163,7 +163,6 @@ export async function withCausalContext<T>(
   if (!parent) throw new TypeError("Invalid Crumbtrail traceparent");
 
   const context: BackendRequestContext = {
-    ...(getBackendRequestContext() ?? {}),
     ...(validated.sessionId ? { sessionId: validated.sessionId } : {}),
     ...(validated.requestId
       ? { requestId: validated.requestId }

@@ -143,9 +143,11 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
     this.enqueue("session-end", "/api/session/end", { sessionId });
   }
 
-  flush(): Promise<Record<string, unknown>> {
+  flush(signal?: AbortSignal): Promise<Record<string, unknown>> {
     const operations = this.operations.splice(0);
-    const run = this.flushTail.then(() => this.flushOperations(operations));
+    const run = this.flushTail.then(() =>
+      this.flushOperations(operations, signal),
+    );
     this.flushTail = run.then(
       () => undefined,
       () => undefined,
@@ -163,6 +165,7 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
 
   private async flushOperations(
     operations: readonly QueuedOperation[],
+    signal?: AbortSignal,
   ): Promise<Record<string, unknown>> {
     let lastResponse: Record<string, unknown> = {};
     const failures: ServerlessHttpOperationFailure[] = [];
@@ -177,6 +180,7 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
           operation.body,
           this.timeoutMs,
           this.requestSubject,
+          signal,
         );
       } catch (error) {
         failures.push({ phase: operation.phase, error });
@@ -201,12 +205,13 @@ export interface HeadlessSessionOptions {
   authToken?: string;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export interface HeadlessSession {
   sessionId: string;
-  record(events: BugEvent | BugEvent[]): Promise<void>;
-  end(): Promise<Record<string, unknown>>;
+  record(events: BugEvent | BugEvent[], signal?: AbortSignal): Promise<void>;
+  end(signal?: AbortSignal): Promise<Record<string, unknown>>;
 }
 
 export async function startHeadlessSession(
@@ -227,29 +232,30 @@ export async function startHeadlessSession(
     sessionId: options.sessionId,
     metadata: { ...options.metadata, source: "headless" },
   });
-  await flushHeadlessTransport(transport);
+  await flushHeadlessTransport(transport, options.signal);
 
   return {
     sessionId: options.sessionId,
-    async record(events) {
+    async record(events, signal) {
       transport.captureBatch(
         Array.isArray(events) ? events : [events],
         options.sessionId,
       );
-      await flushHeadlessTransport(transport);
+      await flushHeadlessTransport(transport, signal);
     },
-    async end() {
+    async end(signal) {
       transport.endSession(options.sessionId);
-      return flushHeadlessTransport(transport);
+      return flushHeadlessTransport(transport, signal);
     },
   };
 }
 
 async function flushHeadlessTransport(
   transport: ServerlessHttpTransport,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   try {
-    return await transport.flush();
+    return await transport.flush(signal);
   } catch (error) {
     if (error instanceof ServerlessHttpFlushError && error.failures[0]) {
       throw error.failures[0].error;
@@ -270,26 +276,45 @@ interface Deadline {
   cancel(): void;
 }
 
-function startDeadline(ms: number): Deadline | undefined {
+function startDeadline(
+  ms: number,
+  parentSignal?: AbortSignal,
+): Deadline | undefined {
   const Controller = globalThis.AbortController;
   if (typeof Controller !== "function") return undefined;
   const controller = new Controller();
   let expired = false;
-  const timer = setTimeout(() => {
-    expired = true;
+  const abortFromParent = (): void => {
     try {
-      controller.abort();
+      controller.abort(parentSignal?.reason);
     } catch {
-      // A runtime that refuses abort still gets the underlying Fetch behavior.
+      controller.abort();
     }
-  }, ms);
+  };
+  if (parentSignal) {
+    if (parentSignal.aborted) abortFromParent();
+    else
+      parentSignal.addEventListener("abort", abortFromParent, { once: true });
+  }
+  const timer =
+    ms > 0
+      ? setTimeout(() => {
+          expired = true;
+          try {
+            controller.abort();
+          } catch {
+            // A runtime that refuses abort still gets the underlying Fetch behavior.
+          }
+        }, ms)
+      : undefined;
   return {
     signal: controller.signal,
     get expired() {
       return expired;
     },
     cancel() {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
+      parentSignal?.removeEventListener("abort", abortFromParent);
     },
   };
 }
@@ -308,8 +333,10 @@ async function postJson(
   body: string,
   timeoutMs: number,
   requestSubject: string,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
-  const deadline = timeoutMs > 0 ? startDeadline(timeoutMs) : undefined;
+  const deadline =
+    timeoutMs > 0 || signal ? startDeadline(timeoutMs, signal) : undefined;
   let response: Response;
   let text: string;
   try {

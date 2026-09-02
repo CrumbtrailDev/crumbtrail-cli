@@ -5,31 +5,40 @@ export interface BackendEventSink {
   /** The session this sink owns, when it has one. */
   readonly sessionId?: string;
   /** Deliver one or more events. Delivery failures are capture failures. */
-  record(events: BugEvent | readonly BugEvent[]): Promise<void>;
+  record(
+    events: BugEvent | readonly BugEvent[],
+    signal?: AbortSignal,
+  ): Promise<void>;
   /** Drain transport buffers without ending the session. */
-  flush?(): Promise<void>;
+  flush?(signal?: AbortSignal): Promise<void>;
   /** End a child session owned by this sink. */
-  end?(): Promise<void>;
+  end?(signal?: AbortSignal): Promise<void>;
   /** Create a separately addressable session for one job execution. */
-  startChildSession?(input: {
-    sessionId: string;
-    metadata?: Record<string, unknown>;
-  }): Promise<BackendEventSink>;
+  startChildSession?(
+    input: {
+      sessionId: string;
+      metadata?: Record<string, unknown>;
+    },
+    signal?: AbortSignal,
+  ): Promise<BackendEventSink>;
   /** Write a durable causal edge between two sessions. */
-  linkSessions?(input: {
-    fromSessionId: string;
-    toSessionId: string;
-    relation: "caused" | "continues" | "retries" | "fans_out_to";
-    method:
-      | "threaded_id"
-      | "trace_context"
-      | "inferred_row"
-      | "inferred_identity"
-      | "operator";
-    confidence: number;
-    matchedOn?: Record<string, unknown>;
-    anchorHint?: string;
-  }): Promise<void>;
+  linkSessions?(
+    input: {
+      fromSessionId: string;
+      toSessionId: string;
+      relation: "caused" | "continues" | "retries" | "fans_out_to";
+      method:
+        | "threaded_id"
+        | "trace_context"
+        | "inferred_row"
+        | "inferred_identity"
+        | "operator";
+      confidence: number;
+      matchedOn?: Record<string, unknown>;
+      anchorHint?: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<void>;
 }
 
 let activeSink: BackendEventSink | undefined;

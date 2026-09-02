@@ -108,35 +108,41 @@ export async function withCrumbtrailJob<T>(
   let started = false;
   try {
     if (sink?.startChildSession) {
-      child = await bounded(
-        sink.startChildSession({
-          sessionId: childSessionId,
-          metadata: {
-            ...(options.metadata ?? {}),
-            job: name,
-            ...(queue ? { queue } : {}),
-            ...(jobId ? { jobId } : {}),
-            attempt,
-          },
-        }),
+      child = await boundedOperation(
         options.cleanupTimeoutMs ?? DEFAULT_JOB_CLEANUP_TIMEOUT_MS,
+        (signal) =>
+          sink.startChildSession!(
+            {
+              sessionId: childSessionId,
+              metadata: {
+                ...(options.metadata ?? {}),
+                job: name,
+                ...(queue ? { queue } : {}),
+                ...(jobId ? { jobId } : {}),
+                attempt,
+              },
+            },
+            signal,
+          ),
       );
     } else if (options.endpoint) {
-      childHeadless = await bounded(
-        startHeadlessSession({
-          endpoint: options.endpoint,
-          sessionId: childSessionId,
-          authToken: options.authToken,
-          fetchImpl: options.fetchImpl,
-          metadata: {
-            ...(options.metadata ?? {}),
-            job: name,
-            ...(queue ? { queue } : {}),
-            ...(jobId ? { jobId } : {}),
-            attempt,
-          },
-        }),
+      childHeadless = await boundedOperation(
         options.cleanupTimeoutMs ?? DEFAULT_JOB_CLEANUP_TIMEOUT_MS,
+        (signal) =>
+          startHeadlessSession({
+            endpoint: options.endpoint!,
+            sessionId: childSessionId,
+            authToken: options.authToken,
+            fetchImpl: options.fetchImpl,
+            signal,
+            metadata: {
+              ...(options.metadata ?? {}),
+              job: name,
+              ...(queue ? { queue } : {}),
+              ...(jobId ? { jobId } : {}),
+              attempt,
+            },
+          }),
       );
       child = headlessSink(childHeadless);
     } else if (sink) {
@@ -145,8 +151,8 @@ export async function withCrumbtrailJob<T>(
       // event payload addressed to its child session.
       child = {
         sessionId: childSessionId,
-        record: async (events) => sink.record(events),
-        flush: sink.flush,
+        record: (events, signal) => sink.record(events, signal),
+        flush: (signal) => sink.flush?.(signal) ?? Promise.resolve(),
       };
     }
   } catch (error) {
@@ -173,18 +179,23 @@ export async function withCrumbtrailJob<T>(
     };
     try {
       if (sink?.linkSessions) {
-        await bounded(
-          sink.linkSessions(linkInput),
+        await boundedOperation(
           options.linkTimeoutMs ?? DEFAULT_JOB_LINK_TIMEOUT_MS,
+          (signal) => sink.linkSessions!(linkInput, signal),
         );
       } else if (options.endpoint) {
-        await postSessionLink({
-          endpoint: options.endpoint,
-          authToken: options.authToken,
-          fetchImpl: options.fetchImpl,
-          input: linkInput,
-          timeoutMs: options.linkTimeoutMs ?? DEFAULT_JOB_LINK_TIMEOUT_MS,
-        });
+        await boundedOperation(
+          options.linkTimeoutMs ?? DEFAULT_JOB_LINK_TIMEOUT_MS,
+          (signal) =>
+            postSessionLink({
+              endpoint: options.endpoint!,
+              authToken: options.authToken,
+              fetchImpl: options.fetchImpl,
+              input: linkInput,
+              timeoutMs: options.linkTimeoutMs ?? DEFAULT_JOB_LINK_TIMEOUT_MS,
+              signal,
+            }),
+        );
       }
     } catch (error) {
       reportLoss(options, error, "session-link");
@@ -214,9 +225,9 @@ export async function withCrumbtrailJob<T>(
   ): Promise<void> => {
     if (!child) return;
     try {
-      await bounded(
-        child.record(event),
+      await boundedOperation(
         options.cleanupTimeoutMs ?? DEFAULT_JOB_CLEANUP_TIMEOUT_MS,
+        (signal) => child!.record(event, signal),
       );
     } catch (error) {
       reportLoss(options, error, phase);
@@ -329,33 +340,57 @@ function childTokenFor(
 function headlessSink(session: HeadlessSession): BackendEventSink {
   return {
     sessionId: session.sessionId,
-    record: async (events) =>
+    record: (events, signal) =>
       session.record(
         Array.isArray(events)
           ? ([...events] as BugEvent[])
           : (events as BugEvent),
+        signal,
       ),
-    end: async () => {
-      await session.end();
+    end: async (signal) => {
+      await session.end(signal);
     },
   };
 }
 
-async function bounded<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+async function boundedOperation<T>(
+  timeoutMs: number,
+  operation: (signal?: AbortSignal) => Promise<T>,
+): Promise<T> {
   const timeout = normalizeTimeout(timeoutMs);
-  if (timeout === 0) return await promise;
+  if (timeout === 0) return await operation();
+  const controller = new AbortController();
+  let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const operationPromise = operation(controller.signal);
   try {
     return await Promise.race([
-      promise,
+      operationPromise,
       new Promise<T>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error("Crumbtrail job capture operation timed out")),
-          timeout,
-        );
+        timer = setTimeout(() => {
+          timedOut = true;
+          try {
+            controller.abort();
+          } catch {
+            // The operation still receives the timed out result below.
+          }
+          reject(new Error("Crumbtrail job capture operation timed out"));
+        }, timeout);
         timer.unref?.();
       }),
     ]);
+  } catch (error) {
+    if (!timedOut) {
+      try {
+        controller.abort();
+      } catch {
+        // The operation has already settled or failed.
+      }
+    }
+    // Promise.race observes this promise, but retain an explicit rejection
+    // handler for transports that settle after the timeout cancellation.
+    void operationPromise.catch(() => undefined);
+    throw error;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -367,18 +402,21 @@ async function boundedCleanup(
   options: CrumbtrailJobOptions,
 ): Promise<void> {
   if (!child) return;
-  let phase: "flush" | "session-end" = "flush";
   try {
-    await bounded(
-      (async () => {
-        await child.flush?.();
-        phase = "session-end";
-        await child.end?.();
-      })(),
+    await boundedOperation(
       timeoutMs,
+      (signal) => child.flush?.(signal) ?? Promise.resolve(),
     );
   } catch (error) {
-    reportLoss(options, error, phase);
+    reportLoss(options, error, "flush");
+  }
+  try {
+    await boundedOperation(
+      timeoutMs,
+      (signal) => child.end?.(signal) ?? Promise.resolve(),
+    );
+  } catch (error) {
+    reportLoss(options, error, "session-end");
   }
 }
 
@@ -388,11 +426,24 @@ export async function postSessionLink(input: {
   fetchImpl?: typeof fetch;
   input: Parameters<NonNullable<BackendEventSink["linkSessions"]>>[0];
   timeoutMs: number;
+  signal?: AbortSignal;
 }): Promise<void> {
   const fetcher = input.fetchImpl ?? globalThis.fetch;
   if (typeof fetcher !== "function")
     throw new Error("No fetch implementation for session link");
   const controller = new AbortController();
+  const abortFromParent = (): void => {
+    try {
+      controller.abort(input.signal?.reason);
+    } catch {
+      controller.abort();
+    }
+  };
+  if (input.signal) {
+    if (input.signal.aborted) abortFromParent();
+    else
+      input.signal.addEventListener("abort", abortFromParent, { once: true });
+  }
   const timeoutMs = normalizeTimeout(input.timeoutMs);
   const timer =
     timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
@@ -408,7 +459,7 @@ export async function postSessionLink(input: {
         method: "POST",
         headers,
         body: JSON.stringify(input.input),
-        ...(timer ? { signal: controller.signal } : {}),
+        signal: controller.signal,
       },
     );
     if (!response.ok)
@@ -417,6 +468,7 @@ export async function postSessionLink(input: {
       );
   } finally {
     if (timer) clearTimeout(timer);
+    input.signal?.removeEventListener("abort", abortFromParent);
   }
 }
 

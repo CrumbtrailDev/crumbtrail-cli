@@ -730,7 +730,7 @@ export async function autoCapture(
   // endpoint and credentials, while failures remain capture loss.
   const backendEventSink: BackendEventSink = {
     sessionId: stableSessionId,
-    async record(events) {
+    async record(events, signal) {
       const live = session ?? (await ensureSession());
       const batch = Array.isArray(events) ? [...events] : [events];
       if (!live) {
@@ -738,19 +738,20 @@ export async function autoCapture(
         return;
       }
       try {
-        await live.record(batch);
+        await live.record(batch, signal);
       } catch (error) {
         for (const event of batch) holdEvent(event);
         armBackoff(error);
         emitError(error, { phase: "record", source: "console.error" });
       }
     },
-    async flush() {
+    async flush(signal) {
       const live = session;
       if (live) await drainPending(live);
+      if (signal?.aborted) return;
       await flushBackendEvents();
     },
-    async startChildSession(input) {
+    async startChildSession(input, signal) {
       const child = await startHeadlessSession({
         endpoint: options.endpoint,
         sessionId: input.sessionId,
@@ -760,27 +761,30 @@ export async function autoCapture(
         ...(options.requestTimeoutMs !== undefined
           ? { timeoutMs: options.requestTimeoutMs }
           : {}),
+        signal,
       });
       return {
         sessionId: child.sessionId,
-        record: (events) =>
+        record: (events, childSignal) =>
           child.record(
             Array.isArray(events)
               ? ([...events] as BugEvent[])
               : (events as BugEvent),
+            childSignal,
           ),
-        end: async () => {
-          await child.end();
+        end: async (childSignal) => {
+          await child.end(childSignal);
         },
       };
     },
-    async linkSessions(input) {
+    async linkSessions(input, signal) {
       await postSessionLink({
         endpoint: options.endpoint,
         authToken,
         fetchImpl: options.fetchImpl,
         input,
         timeoutMs: options.requestTimeoutMs ?? 500,
+        signal,
       });
     },
   };

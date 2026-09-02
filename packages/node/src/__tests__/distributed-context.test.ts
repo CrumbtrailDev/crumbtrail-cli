@@ -154,6 +154,35 @@ describe("distributed context", () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
+  it("does not inherit unrelated ambient session or trace state", async () => {
+    const contextToken = token({ sessionId: undefined, tracestate: undefined });
+    await runInBackendRequestContext(
+      {
+        sessionId: "ambient_session",
+        sessionIdSource: "process",
+        requestId: "ambient_request",
+        traceparent: TRACEPARENT,
+        tracestate: "ambient=value",
+      },
+      async () => {
+        const seen = await withCausalContext(
+          contextToken,
+          () => getBackendRequestContext(),
+          { now: 1_500 },
+        );
+        expect(seen).toMatchObject({
+          requestId: "request_parent",
+          traceparent: expect.stringMatching(
+            new RegExp(`^00-${TRACE_ID}-[0-9a-f]{16}-01$`),
+          ),
+        });
+        expect(seen?.sessionId).toBeUndefined();
+        expect(seen?.sessionIdSource).toBeUndefined();
+        expect(seen?.tracestate).toBeUndefined();
+      },
+    );
+  });
+
   it("does not create an unbounded token for an invalid lifetime", async () => {
     await runInBackendRequestContext({ traceparent: TRACEPARENT }, async () => {
       expect(captureToken({ now: 1_000, ttlMs: Number.NaN })).toBeUndefined();
@@ -245,6 +274,127 @@ describe("withCrumbtrailJob", () => {
       harness.childEvents.filter((event) => event.k === "backend.job.error"),
     ).toHaveLength(0);
     expect(harness.losses).toEqual([]);
+  });
+
+  it("cancels timed out child setup and linking before running the handler", async () => {
+    const setupLosses: string[] = [];
+    let setupAborted = false;
+    const setupSink: BackendEventSink = {
+      sessionId: "session_parent",
+      record: async () => undefined,
+      startChildSession: async (_input, signal) => {
+        return await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => {
+              setupAborted = true;
+              reject(new Error("child setup cancelled"));
+            },
+            { once: true },
+          );
+        });
+      },
+    };
+    await expect(
+      withCrumbtrailJob(
+        {
+          name: "record-payment",
+          context: token(),
+          sink: setupSink,
+          cleanupTimeoutMs: 5,
+          onCaptureLoss: (_error, phase) => setupLosses.push(phase),
+        },
+        () => "setup fallback",
+      ),
+    ).resolves.toBe("setup fallback");
+    expect(setupAborted).toBe(true);
+    expect(setupLosses).toContain("session-start");
+
+    const order: string[] = [];
+    let linkAborted = false;
+    const child: BackendEventSink = {
+      sessionId: "job_child",
+      record: async () => undefined,
+      end: async () => undefined,
+    };
+    const linkSink: BackendEventSink = {
+      sessionId: "session_parent",
+      record: async () => undefined,
+      startChildSession: async () => child,
+      linkSessions: async (_input, signal) => {
+        await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => {
+              linkAborted = true;
+              order.push("link-aborted");
+              reject(new Error("link cancelled"));
+            },
+            { once: true },
+          );
+        });
+      },
+    };
+    await withCrumbtrailJob(
+      {
+        name: "record-payment",
+        context: token(),
+        sink: linkSink,
+        linkTimeoutMs: 5,
+        now: () => 1_500,
+        onCaptureLoss: (_error, phase) => {
+          if (phase === "session-link") order.push("link-loss");
+        },
+      },
+      () => {
+        order.push("handler");
+      },
+    );
+    expect(linkAborted).toBe(true);
+    expect(order).toEqual(["link-aborted", "link-loss", "handler"]);
+  });
+
+  it("attempts session end independently when flush does not settle", async () => {
+    let flushAborted = false;
+    let ended = false;
+    const child: BackendEventSink = {
+      sessionId: "job_child",
+      record: async () => undefined,
+      flush: async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener(
+            "abort",
+            () => {
+              flushAborted = true;
+              resolve();
+            },
+            { once: true },
+          );
+        });
+        await new Promise<void>(() => undefined);
+      },
+      end: async () => {
+        ended = true;
+      },
+    };
+    const losses: string[] = [];
+    await withCrumbtrailJob(
+      {
+        name: "record-payment",
+        context: token(),
+        sink: {
+          sessionId: "session_parent",
+          record: async () => undefined,
+          startChildSession: async () => child,
+        },
+        cleanupTimeoutMs: 5,
+        onCaptureLoss: (_error, phase) => losses.push(phase),
+      },
+      () => "ok",
+    );
+    expect(flushAborted).toBe(true);
+    expect(ended).toBe(true);
+    expect(losses).toContain("flush");
   });
 
   it("preserves the original business error when link, terminal, or cleanup capture fails", async () => {
