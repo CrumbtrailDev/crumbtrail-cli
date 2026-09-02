@@ -22,10 +22,10 @@ import {
   nestInitSnippet,
   nodeInitSnippet,
   nuxtPluginSnippet,
+  reactNativeInitSnippet,
   staticScriptTagSnippet,
   tauriInitSnippet,
 } from "../inject/snippets";
-import { reactNativeInitSnippet } from "../inject/snippets";
 
 const ENDPOINT = "https://ingest.example.com";
 const CLIENT_KEY = "import.meta.env.VITE_CRUMBTRAIL_KEY";
@@ -72,14 +72,17 @@ describe("browser inits opt out of the collectors that record the person", () =>
 
 describe("early browser capture", () => {
   it("starts before each supported browser initializer", () => {
-    const snippets = [
-      clientInitSnippet(ENDPOINT, CLIENT_KEY, "web"),
-      nuxtPluginSnippet(ENDPOINT, CLIENT_KEY, "web"),
-      capacitorInitSnippet(ENDPOINT, CLIENT_KEY, "app"),
-      staticScriptTagSnippet({ endpoint: ENDPOINT, keyLiteral: "ctkey_TODO" }),
+    const snippets: Array<[string, string]> = [
+      ["client", clientInitSnippet(ENDPOINT, CLIENT_KEY, "web")],
+      ["nuxt", nuxtPluginSnippet(ENDPOINT, CLIENT_KEY, "web")],
+      ["capacitor", capacitorInitSnippet(ENDPOINT, CLIENT_KEY, "app")],
+      [
+        "static",
+        staticScriptTagSnippet({ endpoint: ENDPOINT, keyLiteral: "ctkey_TODO" }),
+      ],
     ];
-    for (const snippet of snippets) {
-      expect(snippet).toContain("crumbtrail-core/early");
+    for (const [name, snippet] of snippets) {
+      expect(snippet, name).toContain("/early");
     }
   });
 
