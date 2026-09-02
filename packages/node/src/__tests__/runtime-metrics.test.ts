@@ -206,6 +206,7 @@ describe("Node runtime metrics", () => {
         processStartMarker: " marker with spaces and ! ".repeat(20),
         // Keep this cast to exercise the runtime boundary against JavaScript callers.
         unexpected: "discarded",
+        unexpectedNumber: 123,
       } as never,
       { sessionId: "ses", now: 10 },
     );

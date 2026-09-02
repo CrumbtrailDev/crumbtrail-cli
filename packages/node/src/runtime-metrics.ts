@@ -120,6 +120,26 @@ const CGROUP_CPU_V2_PATH = "/sys/fs/cgroup/cpu.max";
 const CGROUP_CPU_V1_QUOTA_PATH = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us";
 const CGROUP_CPU_V1_PERIOD_PATH = "/sys/fs/cgroup/cpu/cpu.cfs_period_us";
 
+const RUNTIME_SAMPLE_FIELDS = new Set<keyof NodeRuntimeSample>([
+  "rssBytes",
+  "heapUsedBytes",
+  "heapLimitBytes",
+  "externalBytes",
+  "cpuUserDeltaMicros",
+  "cpuSystemDeltaMicros",
+  "cpuTotalDeltaMicros",
+  "cpuIntervalMs",
+  "cpuUtilization",
+  "eventLoopUtilization",
+  "eventLoopDelayP95Ms",
+  "eventLoopDelayMaxMs",
+  "uptimeMs",
+  "processStartMarker",
+  "processStartedAt",
+  "memoryLimitBytes",
+  "cpuQuotaCores",
+]);
+
 const defaultReadFile: RuntimeMetricsReadFile = (path, options) =>
   readFileAsync(path, options);
 
@@ -490,6 +510,7 @@ function delta(current?: number, previous?: number): number | undefined {
 function boundedSample(sample: NodeRuntimeSample): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(sample)) {
+    if (!RUNTIME_SAMPLE_FIELDS.has(key as keyof NodeRuntimeSample)) continue;
     if (typeof value === "number") {
       const normalized =
         key === "cpuUtilization" || key === "eventLoopUtilization"
