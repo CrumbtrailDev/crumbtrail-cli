@@ -270,6 +270,29 @@ export type {
 
 export type { BackendEventSink } from "./backend-event-sink";
 
+// ── Optional queue adapters ─────────────────────────────────────────────────
+// These adapters are duck typed so BullMQ remains an application dependency.
+export {
+  extractBullMqContext,
+  injectBullMqContext,
+  stripBullMqContext,
+  withCrumbtrailBullMqProducer,
+  withCrumbtrailBullMqProcessor,
+  wrapBullMqProducer,
+  wrapBullMqProcessor,
+} from "./queue/bullmq";
+
+export type {
+  BullMqBulkJobInput,
+  BullMqContextOptions,
+  BullMqJobLike,
+  BullMqProcessor,
+  BullMqProcessorHandler,
+  BullMqProcessorOptions,
+  BullMqProducerOptions,
+  BullMqQueueLike,
+} from "./queue/bullmq";
+
 // Capture-side utilities the pipeline tests reach for directly. They were
 // internal while those tests lived beside them; now that the tests live with
 // the analysis in the cloud repository, the boundary has to name them.
