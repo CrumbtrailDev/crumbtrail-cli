@@ -129,7 +129,13 @@ describe("buildPlan — static", () => {
     expect(plan.kind).toBe("rewrite");
     expect(plan.targetPath).toBe(p("index.html"));
     expect(plan.content).toContain('<script type="module">');
+    expect(plan.content).toContain(
+      'import "https://esm.sh/crumbtrail-core@1.2.3/early";',
+    );
     expect(plan.content).toContain("https://esm.sh/crumbtrail-core@1.2.3");
+    expect(plan.content?.indexOf("@1.2.3/early")).toBeLessThan(
+      plan.content?.indexOf("@1.2.3\";") ?? Infinity,
+    );
     expect(plan.content).toContain(`httpAuthToken: "${KEY_PLACEHOLDER}"`);
     expect(plan.content?.split(KEY_PLACEHOLDER)).toHaveLength(2);
     expect(plan.content).toContain('service: "web"');

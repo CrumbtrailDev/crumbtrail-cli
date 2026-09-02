@@ -25,6 +25,7 @@ import {
   staticScriptTagSnippet,
   tauriInitSnippet,
 } from "../inject/snippets";
+import { reactNativeInitSnippet } from "../inject/snippets";
 
 const ENDPOINT = "https://ingest.example.com";
 const CLIENT_KEY = "import.meta.env.VITE_CRUMBTRAIL_KEY";
@@ -67,6 +68,26 @@ describe("browser inits opt out of the collectors that record the person", () =>
       expect(snippet).not.toContain("errors: false");
     });
   }
+});
+
+describe("early browser capture", () => {
+  it("starts before each supported browser initializer", () => {
+    const snippets = [
+      clientInitSnippet(ENDPOINT, CLIENT_KEY, "web"),
+      nuxtPluginSnippet(ENDPOINT, CLIENT_KEY, "web"),
+      capacitorInitSnippet(ENDPOINT, CLIENT_KEY, "app"),
+      staticScriptTagSnippet({ endpoint: ENDPOINT, keyLiteral: "ctkey_TODO" }),
+    ];
+    for (const snippet of snippets) {
+      expect(snippet).toContain("crumbtrail-core/early");
+    }
+  });
+
+  it("does not add the browser-only early module to React Native", () => {
+    expect(reactNativeInitSnippet(ENDPOINT, CLIENT_KEY, "app")).not.toContain(
+      "crumbtrail-core/early",
+    );
+  });
 });
 
 describe("backend capture only runs with a key", () => {

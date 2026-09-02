@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import path from "node:path";
 import { buildPlan, supportsInstrumentationClient } from "../inject/recipes";
+import { prependIntoSource } from "../inject/text";
 import { fakeInjectIO } from "./helpers";
 
 const CWD = "/proj";
@@ -101,6 +102,27 @@ describe("buildPlan — Next.js", () => {
     expect(plan.content).toContain('from "crumbtrail-core"');
     // Nothing is planned at the path the old code would have created.
     expect(plan.targetPath).not.toBe(p("src", "instrumentation-client.ts"));
+  });
+
+  it("keeps a use client directive first and starts early capture before init", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("instrumentation-client.ts")]:
+        '"use client";\nexport const register = () => {};\n',
+    });
+    const plan = buildPlan(
+      { cwd: CWD, recipe: "next", endpoint: ENDPOINT, nextVersion: "15.5.12" },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    const materialized = prependIntoSource(
+      '"use client";\nexport const register = () => {};\n',
+      plan.content!,
+    );
+    expect(materialized.startsWith('"use client";')).toBe(true);
+    expect(materialized.indexOf('import "crumbtrail-core/early";')).toBeLessThan(
+      materialized.indexOf('import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";'),
+    );
   });
 
   it("prefers the instrumentation-client Next actually loads and reports the other as untouched", () => {
@@ -405,6 +427,7 @@ describe("buildPlan — SvelteKit / Nuxt", () => {
     expect(plan.kind).toBe("create");
     expect(plan.targetPath).toBe(p("plugins", "crumbtrail.client.ts"));
     expect(plan.content).toContain("defineNuxtPlugin");
+    expect(plan.content).toContain('import "crumbtrail-core/early";');
     expect(plan.content).toContain(
       "httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY",
     );
@@ -606,6 +629,7 @@ describe("buildPlan — Capacitor", () => {
     );
     expect(plan.kind).toBe("prepend");
     expect(plan.content).toContain("createCapacitorCrumbtrailAsync");
+    expect(plan.content).toContain('import "crumbtrail-core/early";');
     expect(plan.content).toContain(`httpEndpoint: "${ENDPOINT}"`);
     expect(plan.content).toContain(
       "httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY",
@@ -1037,6 +1061,7 @@ describe("buildPlan — Remix", () => {
     );
     expectNoKeyLiteral(plan.content);
     expect(plan.content).toContain('from "crumbtrail-core"');
+    expect(plan.content).toContain('import "crumbtrail-core/early";');
     expect(plan.keyEnvVar).toBe("VITE_CRUMBTRAIL_KEY");
   });
 
@@ -1095,6 +1120,7 @@ describe("buildPlan — Astro", () => {
     );
     expectNoKeyLiteral(plan.snippet);
     expect(plan.snippet).toContain('from "crumbtrail-core"');
+    expect(plan.snippet).toContain('import "crumbtrail-core/early";');
     expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
     expect(plan.warnings.join(" ")).toMatch(/layout/i);
     expect(plan.keyEnvVar).toBe("PUBLIC_CRUMBTRAIL_KEY");
@@ -1122,6 +1148,7 @@ describe("buildPlan — Angular", () => {
     expect(plan.kind).toBe("fallback-ai");
     // The snippet reads the key from environment.ts, not an env var or literal.
     expect(plan.snippet).toContain("httpAuthToken: environment.crumbtrailKey");
+    expect(plan.snippet).toContain('import "crumbtrail-core/early";');
     expectNoKeyLiteral(plan.snippet);
     expect(plan.warnings.join(" ")).toMatch(/environment\.ts/i);
     // No browser-safe env var → no keyEnvVar guidance.

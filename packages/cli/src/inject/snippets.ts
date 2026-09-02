@@ -169,6 +169,7 @@ export function clientInitSnippet(
   backendOrigins?: readonly string[] | null,
 ): string {
   return [
+    'import "crumbtrail-core/early";',
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
     "",
     "Crumbtrail.init({",
@@ -195,6 +196,7 @@ export function nuxtPluginSnippet(
   backendOrigins?: readonly string[] | null,
 ): string {
   return [
+    'import "crumbtrail-core/early";',
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
     "",
     "export default defineNuxtPlugin(() => {",
@@ -549,6 +551,7 @@ export function capacitorInitSnippet(
   backendOrigins?: readonly string[] | null,
 ): string {
   return [
+    'import "crumbtrail-core/early";',
     'import { createCapacitorCrumbtrailAsync } from "crumbtrail-capacitor";',
     "",
     "createCapacitorCrumbtrailAsync({",
@@ -661,6 +664,11 @@ export function browserModuleUrl(version?: string | null): string {
   return `https://esm.sh/crumbtrail-core@${pinned}`;
 }
 
+/** The side-effect entry must evaluate before the main browser SDK module. */
+export function browserEarlyModuleUrl(version?: string | null): string {
+  return `${browserModuleUrl(version)}/early`;
+}
+
 /**
  * Browser capture for a page with no framework and no bundler: one
  * `<script type="module">` block, dropped into the HTML itself.
@@ -688,6 +696,7 @@ export function staticScriptTagSnippet(options: {
     "<!-- Crumbtrail — browser capture (console, network, DOM, errors). -->",
     `<!-- httpAuthToken must contain this project's ingest key.${mint} -->`,
     '<script type="module">',
+    `  import ${JSON.stringify(browserEarlyModuleUrl(options.sdkVersion))};`,
     `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(options.sdkVersion))};`,
     "",
     "  Crumbtrail.init({",
