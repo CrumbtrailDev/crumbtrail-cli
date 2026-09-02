@@ -46,6 +46,10 @@ import {
   type BackendEventSink,
 } from "./backend-event-sink";
 import { postSessionLink } from "./jobs";
+import {
+  installRuntimeMetrics,
+  type RuntimeMetricsHandle,
+} from "./runtime-metrics";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -213,6 +217,14 @@ export interface AutoCaptureOptions {
     BackendLogCaptureOptions,
     "stdout" | "stderr" | "fsImpl" | "maxEvents"
   >;
+  /**
+   * When true (default) sample bounded Node process health metrics every
+   * `runtimeMetricIntervalMs`. Samples include memory, CPU, event-loop health,
+   * process uptime, and readable container limits when available.
+   */
+  runtimeMetrics?: boolean;
+  /** Runtime health sample cadence. Values below 10 seconds use 10 seconds. */
+  runtimeMetricIntervalMs?: number;
   /**
    * When true (default) record inbound HTTP requests that arrive carrying the
    * browser's correlation headers as `backend.req.start` / `backend.req.end`
@@ -871,6 +883,25 @@ export async function autoCapture(
     }
   }
 
+  // Runtime health sampling is a fixed numeric evidence lane. It uses the same
+  // bounded session sink as warnings, logs, and database evidence, so samples
+  // held during an outage and samples shed by the pending-event cap are included
+  // in the existing capture-gap accounting.
+  let runtimeMetrics: RuntimeMetricsHandle | undefined;
+  if (options.runtimeMetrics !== false) {
+    try {
+      runtimeMetrics = installRuntimeMetrics({
+        emit: emitSessionEvent,
+        sessionId: stableSessionId,
+        now,
+        intervalMs: options.runtimeMetricIntervalMs,
+        processImpl: proc,
+      });
+    } catch (error) {
+      emitError(error, { phase: "record", source: "console.error" });
+    }
+  }
+
   // Boot: attempt the initial handshake. On failure the hooks still install so
   // the host's crash semantics stay intact and a later capture can self-heal.
   await ensureSession();
@@ -1417,6 +1448,7 @@ export async function autoCapture(
     clearActiveBackendEventSink(backendEventSink);
     warningCapture?.stop();
     logCapture?.stop();
+    runtimeMetrics?.stop();
     httpCapture?.stop();
     outboundCapture?.stop();
     clearActiveDbSink(dbSink);
