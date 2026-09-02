@@ -265,6 +265,7 @@ export function installRuntimeMetrics(
       const memory = readMemoryUsage(proc);
       const heapLimitBytes = readHeapLimit(options.heapLimitImpl);
       const eventLoopDelayValues = readEventLoopDelay(eventLoopDelay);
+      const sampleUptimeMs = uptimeMsForSample(proc);
       const event = buildNodeRuntimeEvent(
         {
           ...(memory?.rss !== undefined ? { rssBytes: memory.rss } : {}),
@@ -300,9 +301,7 @@ export function installRuntimeMetrics(
           ...(eventLoopDelayValues?.maxMs !== undefined
             ? { eventLoopDelayMaxMs: eventLoopDelayValues.maxMs }
             : {}),
-          ...(uptimeMsForSample(proc) !== undefined
-            ? { uptimeMs: uptimeMsForSample(proc) }
-            : {}),
+          ...(sampleUptimeMs !== undefined ? { uptimeMs: sampleUptimeMs } : {}),
           processStartMarker,
           ...(processStartedAt !== undefined ? { processStartedAt } : {}),
           ...(limits?.memoryLimitBytes !== undefined
@@ -314,11 +313,14 @@ export function installRuntimeMetrics(
         },
         { sessionId: options.sessionId, now: now() },
       );
-      options.emit(event);
       try {
-        eventLoopDelay?.reset();
-      } catch {
-        // Histogram reset is best effort and never affects the host.
+        options.emit(event);
+      } finally {
+        try {
+          eventLoopDelay?.reset();
+        } catch {
+          // Histogram reset is best effort and never affects the host.
+        }
       }
     } catch {
       // Runtime introspection must never affect the application process.

@@ -156,11 +156,15 @@ export {
 export type {
   NodeRuntimeSample,
   RuntimeContainerLimits,
+  RuntimeCpuUsage,
   RuntimeEventLoopDelayMonitor,
   RuntimeEventLoopUtilization,
   RuntimeMetricsHandle,
   RuntimeMetricsOptions,
   RuntimeMetricsReadFile,
+  RuntimeMemoryUsage,
+  RuntimePerformance,
+  RuntimeProcess,
 } from "./runtime-metrics";
 
 // ── Node contract capability marker ──────────────────────────────────────────

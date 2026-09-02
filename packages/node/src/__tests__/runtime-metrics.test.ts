@@ -194,8 +194,8 @@ describe("Node runtime metrics", () => {
       },
       clearIntervalImpl: () => {},
     });
-    handle.stop();
     expect(() => timer.callback()).not.toThrow();
+    handle.stop();
   });
 
   it("bounds arbitrary low level markers and ignores non numeric fields", () => {
