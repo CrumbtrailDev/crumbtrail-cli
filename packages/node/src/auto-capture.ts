@@ -37,9 +37,15 @@ import {
   type OutboundHttpCaptureHandle,
   type OutboundHttpCaptureOptions,
 } from "./http-server";
-import { sendBackendEvent } from "./backend-intake";
+import { flushBackendEvents, sendBackendEvent } from "./backend-intake";
 import { clearProcessSessionId, setProcessSessionId } from "./process-session";
 import { readRequestCorrelation } from "./request-context";
+import {
+  clearActiveBackendEventSink,
+  setActiveBackendEventSink,
+  type BackendEventSink,
+} from "./backend-event-sink";
+import { postSessionLink } from "./jobs";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -280,6 +286,10 @@ export interface AutoCaptureOptions {
 export interface AutoCaptureHandle {
   /** The started session id, when the session start succeeded. */
   sessionId?: string;
+  /** Record background job evidence through this running capture. */
+  record?(event: BugEvent | readonly BugEvent[]): Promise<void>;
+  /** Flush background job evidence without ending the process session. */
+  flush?(): Promise<void>;
   /** Restore the original console.error and remove the process hooks. */
   stop(): void;
 }
@@ -713,6 +723,67 @@ export async function autoCapture(
       emitError(sendErr, { phase: "record", source: "console.error" });
     });
   };
+
+  // Generic queue helpers use this narrow sink rather than reaching into the
+  // auto-capture closure. Child sessions and links share this process's
+  // endpoint and credentials, while failures remain capture loss.
+  const backendEventSink: BackendEventSink = {
+    sessionId: stableSessionId,
+    async record(events) {
+      const live = session ?? (await ensureSession());
+      const batch = Array.isArray(events) ? [...events] : [events];
+      if (!live) {
+        for (const event of batch) holdEvent(event);
+        return;
+      }
+      try {
+        await live.record(batch);
+      } catch (error) {
+        for (const event of batch) holdEvent(event);
+        armBackoff(error);
+        emitError(error, { phase: "record", source: "console.error" });
+      }
+    },
+    async flush() {
+      const live = session;
+      if (live) await drainPending(live);
+      await flushBackendEvents();
+    },
+    async startChildSession(input) {
+      const child = await startHeadlessSession({
+        endpoint: options.endpoint,
+        sessionId: input.sessionId,
+        authToken,
+        fetchImpl: options.fetchImpl,
+        metadata: input.metadata,
+        ...(options.requestTimeoutMs !== undefined
+          ? { timeoutMs: options.requestTimeoutMs }
+          : {}),
+      });
+      return {
+        sessionId: child.sessionId,
+        record: (events) =>
+          child.record(
+            Array.isArray(events)
+              ? ([...events] as BugEvent[])
+              : (events as BugEvent),
+          ),
+        end: async () => {
+          await child.end();
+        },
+      };
+    },
+    async linkSessions(input) {
+      await postSessionLink({
+        endpoint: options.endpoint,
+        authToken,
+        fetchImpl: options.fetchImpl,
+        input,
+        timeoutMs: options.requestTimeoutMs ?? 500,
+      });
+    },
+  };
+  setActiveBackendEventSink(backendEventSink);
 
   // Zero-config DB capture. Installed BEFORE the initial handshake, and so
   // before this function first yields, because the patch works by replacing the
@@ -1329,6 +1400,7 @@ export async function autoCapture(
       }
     }
     signalHandlers.clear();
+    clearActiveBackendEventSink(backendEventSink);
     warningCapture?.stop();
     logCapture?.stop();
     httpCapture?.stop();
@@ -1340,7 +1412,12 @@ export async function autoCapture(
     installedService = undefined;
   };
 
-  return { sessionId: session?.sessionId, stop };
+  return {
+    sessionId: session?.sessionId,
+    record: (events) => backendEventSink.record(events),
+    flush: () => backendEventSink.flush?.() ?? Promise.resolve(),
+    stop,
+  };
 }
 
 /** Normalize the held-event cap, refusing a negative or non-finite value. */
