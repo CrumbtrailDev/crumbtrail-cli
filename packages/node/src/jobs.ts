@@ -389,11 +389,10 @@ export async function postSessionLink(input: {
   if (typeof fetcher !== "function")
     throw new Error("No fetch implementation for session link");
   const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    normalizeTimeout(input.timeoutMs),
-  );
-  timer.unref?.();
+  const timeoutMs = normalizeTimeout(input.timeoutMs);
+  const timer =
+    timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+  timer?.unref?.();
   try {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
@@ -405,7 +404,7 @@ export async function postSessionLink(input: {
         method: "POST",
         headers,
         body: JSON.stringify(input.input),
-        signal: controller.signal,
+        ...(timer ? { signal: controller.signal } : {}),
       },
     );
     if (!response.ok)
@@ -413,7 +412,7 @@ export async function postSessionLink(input: {
         `Crumbtrail session link failed with HTTP ${response.status}`,
       );
   } finally {
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
   }
 }
 
