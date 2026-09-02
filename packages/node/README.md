@@ -152,6 +152,9 @@ rethrows the original error. A `multi()` transaction or `pipeline()` emits one s
 `exec()` or ioredis `execBuffer()` resolves or rejects. The summary includes a bounded command
 count and operation list. An ioredis `WATCH` abort that resolves `exec()` to `null` is reported as
 `outcome: "aborted"` and the `null` result is returned unchanged.
+For ioredis `multi({ pipeline: false })`, per-command `QUEUED` replies are returned unchanged and
+only the root `exec()` emits the aggregate transaction outcome. Inline nested transaction tuples
+are inspected for failure counts without copying command results.
 
 Unsupported Redis commands are passed through without per-command evidence. Batch summaries do not
 capture command arguments or results. Redis work outside a request scope is not emitted because it

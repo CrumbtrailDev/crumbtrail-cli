@@ -291,4 +291,85 @@ describe("instrumentIoredisClient", () => {
     expect(JSON.stringify(events)).not.toContain("private value");
     expect(JSON.stringify(events)).not.toContain("secret:key");
   });
+
+  it("keeps ioredis pipeline:false QUEUED replies out of command evidence", async () => {
+    const events: BugEvent[] = [];
+    const queued = Promise.resolve("QUEUED");
+    const tuples: unknown[] = [
+      [null, "OK"],
+      [new Error("private transaction failure"), null],
+    ];
+    const client = instrumentIoredisClient(
+      {
+        multi(options?: unknown) {
+          expect(options).toEqual({ pipeline: false });
+          const batch = {
+            set(_key: string, _value: string) {
+              return queued;
+            },
+            get(_key: string) {
+              return queued;
+            },
+            exec: async () => tuples,
+          };
+          return batch;
+        },
+      },
+      { emit: (event) => events.push(event), requestId: "req_ioredis_queued" },
+    );
+
+    const transaction = client.multi({ pipeline: false });
+    await expect(transaction.set("cart:123", "private value")).resolves.toBe(
+      "QUEUED",
+    );
+    await expect(transaction.get("cart:123")).resolves.toBe("QUEUED");
+    expect(events).toHaveLength(0);
+
+    const result = await transaction.exec();
+    expect(result).toBe(tuples);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.d).toMatchObject({
+      op: "transaction",
+      outcome: "failure",
+      summary: {
+        operationCount: 2,
+        operations: ["set", "get"],
+        failureCount: 1,
+      },
+    });
+    expect(JSON.stringify(events)).not.toContain("private value");
+    expect(JSON.stringify(events)).not.toContain("private transaction failure");
+  });
+
+  it("inspects nested ioredis transaction tuples without copying results", async () => {
+    const events: BugEvent[] = [];
+    const nestedTuples: unknown[] = [
+      [
+        null,
+        [
+          [null, "OK"],
+          [new Error("nested private failure"), "private result"],
+        ],
+      ],
+      [null, "outer OK"],
+    ];
+    const client = instrumentIoredisClient(
+      {
+        pipeline() {
+          return { exec: async () => nestedTuples };
+        },
+      },
+      { emit: (event) => events.push(event), requestId: "req_ioredis_nested" },
+    );
+
+    const result = await client.pipeline().exec();
+
+    expect(result).toBe(nestedTuples);
+    expect(events[0]?.d).toMatchObject({
+      outcome: "failure",
+      summary: { failureCount: 1 },
+    });
+    expect(JSON.stringify(events)).not.toContain("private result");
+    expect(JSON.stringify(events)).not.toContain("nested private failure");
+  });
 });

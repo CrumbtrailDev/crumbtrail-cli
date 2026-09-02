@@ -38,6 +38,8 @@ interface OperationCapture {
 
 interface BatchCapture {
   mode: "pipeline" | "transaction";
+  /** ioredis sends each command separately and resolves it to QUEUED. */
+  queuedTransaction: boolean;
   operationCount: number;
   operations: string[];
   keys: unknown[];
@@ -89,6 +91,7 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
             operationName === "multi" ? "transaction" : "pipeline",
             options,
             constructorBatchCommands(args),
+            isQueuedIoredisTransaction(driver, operationName, args),
           );
         };
         wrappers.set(property, wrapped);
@@ -192,11 +195,19 @@ function wrapBatchResult(
   mode: BatchCapture["mode"],
   options: InstrumentCacheClientOptions,
   initialCommands: readonly BatchCommand[] = [],
+  queuedTransaction = false,
 ): unknown {
   if (isThenable(result)) {
     return result.then(
       (batch: unknown) =>
-        wrapBatch(batch, driver, mode, options, initialCommands),
+        wrapBatch(
+          batch,
+          driver,
+          mode,
+          options,
+          initialCommands,
+          queuedTransaction,
+        ),
       (error: unknown) => {
         const requestId = resolveRequestId(options);
         if (requestId) {
@@ -214,7 +225,14 @@ function wrapBatchResult(
       },
     );
   }
-  return wrapBatch(result, driver, mode, options, initialCommands);
+  return wrapBatch(
+    result,
+    driver,
+    mode,
+    options,
+    initialCommands,
+    queuedTransaction,
+  );
 }
 
 function wrapBatch(
@@ -223,6 +241,7 @@ function wrapBatch(
   mode: BatchCapture["mode"],
   options: InstrumentCacheClientOptions,
   initialCommands: readonly BatchCommand[] = [],
+  queuedTransaction = false,
 ): unknown {
   if (!value || (typeof value !== "object" && typeof value !== "function")) {
     return value;
@@ -231,6 +250,7 @@ function wrapBatch(
   if (isBatchInstrumented(target)) return target;
   const capture: BatchCapture = {
     mode,
+    queuedTransaction,
     operationCount: 0,
     operations: [],
     keys: [],
@@ -291,6 +311,12 @@ function wrapBatch(
       const wrapped = (...args: unknown[]) => {
         const commandResult = Reflect.apply(original, batchTarget, args);
         recordBatchOperation(capture, operationName, args);
+        // With multi({ pipeline: false }), ioredis resolves every queued
+        // command to "QUEUED". Keep that promise and its result untouched,
+        // but defer evidence emission to the aggregate exec() call below.
+        if (capture.queuedTransaction && isThenable(commandResult)) {
+          return commandResult;
+        }
         return commandResult === batchTarget ? proxy : commandResult;
       };
       wrappers.set(property, wrapped);
@@ -343,6 +369,20 @@ function constructorBatchCommands(args: readonly unknown[]): BatchCommand[] {
   return parsed;
 }
 
+function isQueuedIoredisTransaction(
+  driver: CacheDriver,
+  operation: string,
+  args: readonly unknown[],
+): boolean {
+  if (driver !== "ioredis" || operation !== "multi") return false;
+  const options = args[0];
+  return (
+    isRecord(options) &&
+    Object.prototype.hasOwnProperty.call(options, "pipeline") &&
+    options.pipeline === false
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -373,16 +413,42 @@ function inspectBatchResult(
   }
   let failureCount = 0;
   let failureCountTruncated = false;
+  const seen = new WeakSet<object>();
   // Scan every tuple to detect failures after the reporting cap. Only the
-  // count is bounded, never the inspection needed to classify the batch.
-  for (const tuple of result) {
-    if (!Array.isArray(tuple) || tuple.length === 0 || tuple[0] == null) {
-      continue;
+  // count is bounded, never the inspection needed to classify the batch. The
+  // value side of a tuple can itself contain inline transaction tuples.
+  const pending: unknown[][] = [result];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    for (const entry of current) {
+      if (!Array.isArray(entry)) continue;
+      if (isIoredisResultTuple(entry)) {
+        if (entry[0] != null) {
+          if (failureCount < MAX_BATCH_FAILURES) failureCount += 1;
+          else failureCountTruncated = true;
+        }
+        if (Array.isArray(entry[1])) pending.push(entry[1]);
+      } else {
+        pending.push(entry);
+      }
     }
-    if (failureCount < MAX_BATCH_FAILURES) failureCount += 1;
-    else failureCountTruncated = true;
   }
   return { failureCount, failureCountTruncated, aborted: false };
+}
+
+function isIoredisResultTuple(value: readonly unknown[]): boolean {
+  if (value.length < 2) return false;
+  const first = value[0];
+  if (first === null || first === undefined || first instanceof Error) {
+    return true;
+  }
+  return (
+    isRecord(first) &&
+    typeof first.message === "string" &&
+    (first.name === undefined || typeof first.name === "string")
+  );
 }
 
 function batchSummary(
