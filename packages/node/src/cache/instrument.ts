@@ -434,7 +434,7 @@ function describeOperation(
     return {
       op,
       keys: [args[0]],
-      hit: (result) => typeof result === "number" && result > 0,
+      hit: changedOutcome,
       ...(seconds !== undefined ? { ttlMs: seconds * 1_000 } : {}),
     };
   }
@@ -442,7 +442,7 @@ function describeOperation(
     return {
       op,
       keys: [args[0]],
-      hit: (result) => typeof result === "number" && result > 0,
+      hit: changedOutcome,
     };
   }
   if (op === "ttl") {
@@ -458,6 +458,10 @@ function describeOperation(
     };
   }
   return undefined;
+}
+
+function changedOutcome(result: unknown): boolean {
+  return result === true || (typeof result === "number" && result > 0);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
