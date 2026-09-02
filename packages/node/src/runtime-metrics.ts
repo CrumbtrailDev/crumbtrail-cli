@@ -15,6 +15,9 @@ export const DEFAULT_RUNTIME_METRIC_INTERVAL_MS = 30_000;
 /** The sampler never runs more frequently than this. */
 export const MIN_RUNTIME_METRIC_INTERVAL_MS = 10_000;
 
+/** Node's maximum supported timer delay before it wraps to a near-immediate timer. */
+export const MAX_RUNTIME_METRIC_INTERVAL_MS = 2_147_483_647;
+
 /** Keep a sample small enough that it cannot crowd out incident evidence. */
 export const MAX_RUNTIME_SAMPLE_BYTES = 4_096;
 
@@ -177,7 +180,10 @@ export async function readRuntimeContainerLimits(
 export function normalizeRuntimeMetricIntervalMs(value?: number): number {
   if (value === undefined || !Number.isFinite(value))
     return DEFAULT_RUNTIME_METRIC_INTERVAL_MS;
-  return Math.max(MIN_RUNTIME_METRIC_INTERVAL_MS, Math.round(value));
+  return Math.min(
+    MAX_RUNTIME_METRIC_INTERVAL_MS,
+    Math.max(MIN_RUNTIME_METRIC_INTERVAL_MS, Math.round(value)),
+  );
 }
 
 /** Build a bounded event from a sample for tests and low-level consumers. */

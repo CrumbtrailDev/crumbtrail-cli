@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BACKEND_RUNTIME_EVENT,
   DEFAULT_RUNTIME_METRIC_INTERVAL_MS,
+  MAX_RUNTIME_METRIC_INTERVAL_MS,
   MIN_RUNTIME_METRIC_INTERVAL_MS,
   buildNodeRuntimeEvent,
   installRuntimeMetrics,
@@ -47,6 +48,31 @@ describe("Node runtime metrics", () => {
     expect(normalizeRuntimeMetricIntervalMs(1_000)).toBe(10_000);
     expect(normalizeRuntimeMetricIntervalMs(Number.NaN)).toBe(30_000);
     expect(normalizeRuntimeMetricIntervalMs(10_001.4)).toBe(10_001);
+    expect(
+      normalizeRuntimeMetricIntervalMs(MAX_RUNTIME_METRIC_INTERVAL_MS),
+    ).toBe(MAX_RUNTIME_METRIC_INTERVAL_MS);
+    expect(
+      normalizeRuntimeMetricIntervalMs(MAX_RUNTIME_METRIC_INTERVAL_MS + 1),
+    ).toBe(MAX_RUNTIME_METRIC_INTERVAL_MS);
+  });
+
+  it("passes the maximum safe delay to the timer and clamps larger values", () => {
+    const delays: number[] = [];
+    const timer = { unref: vi.fn() };
+    const handle = installRuntimeMetrics({
+      emit: () => {},
+      readFile: makeReader({}),
+      intervalMs: MAX_RUNTIME_METRIC_INTERVAL_MS + 1,
+      setIntervalImpl: (_callback, delay) => {
+        delays.push(delay);
+        return timer;
+      },
+      clearIntervalImpl: () => {},
+    });
+    handle.stop();
+
+    expect(delays).toEqual([MAX_RUNTIME_METRIC_INTERVAL_MS]);
+    expect(timer.unref).toHaveBeenCalledOnce();
   });
 
   it("emits bounded memory, CPU, event loop, uptime, marker, and cgroup fields", async () => {
