@@ -17,6 +17,36 @@ function fakeNodeRedis(values: Record<string, string> = {}) {
       const list = Array.isArray(keys) ? keys : [keys];
       return list.filter((key) => key in values).length;
     },
+    async hGet(_key: string, _field: string) {
+      return "hash value";
+    },
+    async hMGet(_key: string, _fields: string[]) {
+      return ["hash value", null];
+    },
+    async hSet(_key: string, _field: string, _value: string) {
+      return 1;
+    },
+    async hDel(_key: string, _field: string) {
+      return 1;
+    },
+    async getDel(_key: string) {
+      return "deleted value";
+    },
+    async incr(_key: string) {
+      return 2;
+    },
+    async decr(_key: string) {
+      return 1;
+    },
+    async expire(_key: string, _seconds: number) {
+      return 1;
+    },
+    async persist(_key: string) {
+      return 1;
+    },
+    async ttl(_key: string) {
+      return 30;
+    },
   };
 }
 
@@ -101,4 +131,146 @@ describe("instrumentNodeRedisClient", () => {
     });
     await expect(sinkFailure.set("safe:key", "value")).resolves.toBe("OK");
   });
+
+  it("captures hash, atomic, counter, and expiry operations", async () => {
+    const events: BugEvent[] = [];
+    const client = instrumentNodeRedisClient(fakeNodeRedis(), {
+      emit: (event) => events.push(event),
+      requestId: "req_redis_operations",
+    });
+
+    await client.hGet("profile:123", "displayName");
+    await client.hMGet("profile:123", ["displayName", "timezone"]);
+    await client.hSet("profile:123", "displayName", "Private Name");
+    await client.hDel("profile:123", "displayName");
+    await client.getDel("session:123");
+    await client.incr("counter:123");
+    await client.decr("counter:123");
+    await client.expire("profile:123", 60);
+    await client.persist("profile:123");
+    await client.ttl("profile:123");
+
+    expect(events.map((event) => event.d.op)).toEqual([
+      "hget",
+      "hmget",
+      "hset",
+      "hdel",
+      "getdel",
+      "incr",
+      "decr",
+      "expire",
+      "persist",
+      "ttl",
+    ]);
+    expect(events[0]?.d).toMatchObject({
+      key: "profile:*",
+      hit: true,
+    });
+    expect(events[1]?.d).toMatchObject({
+      key: "profile:*",
+      hit: true,
+    });
+    expect(events[4]?.d).toMatchObject({ key: "session:*", hit: true });
+    expect(events[7]?.d).toMatchObject({
+      key: "profile:*",
+      hit: true,
+      ttlMs: 60_000,
+    });
+    expect(events[9]?.d).toMatchObject({
+      key: "profile:*",
+      hit: true,
+      ttlMs: 30_000,
+      value: 30,
+    });
+  });
+
+  it("records a bounded pipeline summary and preserves a rejected command", async () => {
+    const events: BugEvent[] = [];
+    const client = instrumentNodeRedisClient(
+      {
+        ...fakeNodeRedis(),
+        multi() {
+          const batch = {
+            get(_key: string) {
+              return batch;
+            },
+            hSet(_key: string, _field: string, _value: string) {
+              return batch;
+            },
+            exec: async () => ["cached value", 1],
+          };
+          return batch;
+        },
+        pipeline() {
+          const batch = {
+            get(_key: string) {
+              return batch;
+            },
+            exec: async () => ["cached value"],
+          };
+          return batch;
+        },
+      },
+      {
+        emit: (event) => events.push(event),
+        requestId: "req_redis_pipeline",
+      },
+    );
+
+    const batch = client.multi();
+    await batch.get("cart:123").hSet("cart:123", "sku", "private sku").exec();
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        k: "cache",
+        d: expect.objectContaining({
+          op: "transaction",
+          summary: {
+            operationCount: 2,
+            operations: ["get", "hset"],
+          },
+        }),
+      }),
+    );
+    await client.pipeline().get("cart:456").exec();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        k: "cache",
+        d: expect.objectContaining({
+          op: "pipeline",
+          summary: {
+            operationCount: 1,
+            operations: ["get"],
+          },
+        }),
+      }),
+    );
+
+    const failingClient = instrumentNodeRedisClient(
+      {
+        ...fakeNodeRedis(),
+        async get(_key: string) {
+          throw failure;
+        },
+      },
+      {
+        emit: (event) => events.push(event),
+        requestId: "req_redis_failure",
+      },
+    );
+    await expect(failingClient.get("cache:123")).rejects.toBe(failure);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        k: "cache",
+        d: expect.objectContaining({
+          op: "get",
+          outcome: "failure",
+          errorName: "Error",
+          error: "cache backend token=[REDACTED]",
+        }),
+      }),
+    );
+  });
 });
+
+const failure = new Error("cache backend token=secret");

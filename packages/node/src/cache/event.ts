@@ -16,11 +16,24 @@ export interface CacheEventData {
   op: string;
   key: string | string[];
   requestId: string;
+  /** Present on rejected commands so readers can distinguish a failed cache call from a miss. */
+  outcome?: "success" | "failure";
   hit?: boolean;
   ttlMs?: number;
   value?: unknown;
   valueSummary?: PayloadSummary;
+  /** Error class and bounded, redacted message for a rejected cache command. */
+  errorName?: string;
+  error?: string;
+  /** Bounded command summary for a Redis pipeline or transaction. */
+  summary?: CacheOperationSummary;
   redaction?: RedactionMetadata;
+}
+
+export interface CacheOperationSummary {
+  operationCount: number;
+  operations: string[];
+  truncated?: boolean;
 }
 
 export interface BuildCacheEventInput {
@@ -31,12 +44,18 @@ export interface BuildCacheEventInput {
   hit?: boolean;
   ttlMs?: number;
   value?: unknown;
+  outcome?: "success" | "failure";
+  error?: unknown;
+  summary?: CacheOperationSummary;
   sessionId?: string;
   now?: number;
   sessionStartedAt?: number | Date;
 }
 
 const MAX_CACHE_VALUE_LENGTH = 8 * 1024;
+const MAX_CACHE_ERROR_LENGTH = 512;
+const MAX_SUMMARY_OPERATIONS = 50;
+const MAX_SUMMARY_OPERATION_LENGTH = 64;
 
 export function buildCacheEvent(input: BuildCacheEventInput): BugEvent {
   const now = Number.isFinite(input.now)
@@ -47,6 +66,10 @@ export function buildCacheEvent(input: BuildCacheEventInput): BugEvent {
   );
   const redactedValue =
     input.value === undefined ? undefined : redactCacheValue(input.value);
+  const redaction = mergeRedactionMetadata(
+    ...redactedKeys.map((result) => result.metadata),
+    redactedValue?.metadata,
+  );
   const d: CacheEventData = {
     driver: input.driver,
     op: input.op,
@@ -55,6 +78,7 @@ export function buildCacheEvent(input: BuildCacheEventInput): BugEvent {
         ? redactedKeys[0].value
         : redactedKeys.map((result) => result.value),
     requestId: input.requestId,
+    ...(input.outcome !== undefined ? { outcome: input.outcome } : {}),
     ...(input.hit !== undefined ? { hit: input.hit } : {}),
     ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}),
     ...(redactedValue?.value !== undefined
@@ -62,11 +86,19 @@ export function buildCacheEvent(input: BuildCacheEventInput): BugEvent {
       : {}),
     ...(redactedValue?.summary ? { valueSummary: redactedValue.summary } : {}),
   };
-  const redaction = mergeRedactionMetadata(
-    ...redactedKeys.map((result) => result.metadata),
-    redactedValue?.metadata,
-  );
-  if (redaction) d.redaction = redaction;
+  if (input.summary) d.summary = normalizeSummary(input.summary);
+  if (input.error !== undefined) {
+    const error = redactCacheError(input.error);
+    d.errorName = error.name;
+    if (error.message !== undefined) d.error = error.message;
+    if (error.metadata) {
+      d.redaction = mergeRedactionMetadata(
+        ...(redaction ? [redaction] : []),
+        error.metadata,
+      );
+    }
+  }
+  if (redaction && !d.redaction) d.redaction = redaction;
 
   const event: BugEvent = {
     t: now,
@@ -77,6 +109,73 @@ export function buildCacheEvent(input: BuildCacheEventInput): BugEvent {
   const startedAt = normalizeStartedAt(input.sessionStartedAt);
   if (startedAt !== undefined) event.offsetMs = Math.max(0, now - startedAt);
   return event;
+}
+
+function normalizeSummary(
+  summary: CacheOperationSummary,
+): CacheOperationSummary {
+  const operations = summary.operations
+    .slice(0, MAX_SUMMARY_OPERATIONS)
+    .map((operation) =>
+      String(operation).slice(0, MAX_SUMMARY_OPERATION_LENGTH),
+    );
+  return {
+    operationCount: Number.isFinite(summary.operationCount)
+      ? Math.max(0, Math.trunc(summary.operationCount))
+      : operations.length,
+    operations,
+    ...(summary.truncated || operations.length < summary.operationCount
+      ? { truncated: true }
+      : {}),
+  };
+}
+
+function redactCacheError(error: unknown): {
+  name: string;
+  message?: string;
+  metadata?: RedactionMetadata;
+} {
+  const name = captureCacheErrorName(error);
+  let message: string | undefined;
+  try {
+    if (error instanceof Error) message = error.message;
+    else if (typeof error === "string") message = error;
+    else if (error && typeof error === "object") {
+      const candidate = (error as Record<string, unknown>).message;
+      if (typeof candidate === "string") message = candidate;
+    }
+  } catch {
+    message = undefined;
+  }
+  if (!message) return { name };
+  const result = redactNetworkTextBody(message, {
+    contentType: "text/plain",
+    maxLength: MAX_CACHE_ERROR_LENGTH,
+    path: "cache.error",
+  });
+  return {
+    name,
+    ...(result.body !== undefined ? { message: result.body } : {}),
+    ...(result.metadata ? { metadata: result.metadata } : {}),
+  };
+}
+
+function captureCacheErrorName(error: unknown): string {
+  try {
+    if (error instanceof Error && error.name) return error.name.slice(0, 120);
+    if (
+      error &&
+      typeof error === "object" &&
+      typeof (error as Record<string, unknown>).name === "string"
+    ) {
+      return (
+        ((error as Record<string, unknown>).name as string) || "Error"
+      ).slice(0, 120);
+    }
+  } catch {
+    // Error inspection must never affect the host rejection.
+  }
+  return typeof error === "string" ? "Error" : "UnknownError";
 }
 
 function redactCacheValue(value: unknown): {

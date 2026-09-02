@@ -3,6 +3,7 @@ import {
   buildCacheEvent,
   type BuildCacheEventInput,
   type CacheDriver,
+  type CacheOperationSummary,
 } from "./event";
 
 export interface DuckTypedCacheClient {
@@ -19,6 +20,10 @@ export interface InstrumentCacheClientOptions {
 }
 
 const INSTRUMENTED = Symbol.for("crumbtrail.cache.instrumented");
+const BATCH_INSTRUMENTED = Symbol.for("crumbtrail.cache.batch.instrumented");
+
+const MAX_BATCH_OPERATIONS = 100;
+const MAX_BATCH_KEYS = 50;
 
 interface OperationCapture {
   op: string;
@@ -27,6 +32,14 @@ interface OperationCapture {
   ttlMs?: number;
   hit?: (result: unknown) => boolean;
   resultValue?: boolean;
+  ttlMsFromResult?: (result: unknown) => number | undefined;
+}
+
+interface BatchCapture {
+  mode: "pipeline" | "transaction";
+  operationCount: number;
+  operations: string[];
+  keys: unknown[];
 }
 
 export function instrumentIoredisClient<T extends DuckTypedCacheClient>(
@@ -61,6 +74,19 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
       }
       if (wrappers.has(property)) return wrappers.get(property);
       const operationName = normalizeMethod(property);
+      if (operationName === "multi" || operationName === "pipeline") {
+        const wrapped = (...args: unknown[]) => {
+          const result = Reflect.apply(original, target, args);
+          return wrapBatchResult(
+            result,
+            driver,
+            operationName === "multi" ? "transaction" : "pipeline",
+            options,
+          );
+        };
+        wrappers.set(property, wrapped);
+        return wrapped;
+      }
       if (!SUPPORTED_OPERATIONS.has(operationName)) {
         const bound = original.bind(target);
         wrappers.set(property, bound);
@@ -77,22 +103,35 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
           return result;
         }
         if (!requestId || !capture || !isThenable(result)) return result;
-        return result.then((value: unknown) => {
-          emitSafely(options, {
-            driver,
-            op: capture.op,
-            keys: capture.keys,
-            requestId,
-            ...(capture.hit ? { hit: capture.hit(value) } : {}),
-            ...(capture.ttlMs !== undefined ? { ttlMs: capture.ttlMs } : {}),
-            ...(capture.resultValue
-              ? { value }
-              : capture.value !== undefined
-                ? { value: capture.value }
-                : {}),
-          });
-          return value;
-        });
+        return result.then(
+          (value: unknown) => {
+            emitSafely(options, {
+              driver,
+              op: capture.op,
+              keys: capture.keys,
+              requestId,
+              ...(capture.hit ? { hit: capture.hit(value) } : {}),
+              ...ttlInput(capture, value),
+              ...(capture.resultValue
+                ? { value }
+                : capture.value !== undefined
+                  ? { value: capture.value }
+                  : {}),
+            });
+            return value;
+          },
+          (error: unknown) => {
+            emitSafely(options, {
+              driver,
+              op: capture.op,
+              keys: capture.keys,
+              requestId,
+              outcome: "failure",
+              error,
+            });
+            throw error;
+          },
+        );
       };
       wrappers.set(property, wrapped);
       return wrapped;
@@ -110,10 +149,178 @@ const SUPPORTED_OPERATIONS = new Set([
   "psetex",
   "del",
   "unlink",
+  "hget",
+  "hmget",
+  "hset",
+  "hdel",
+  "getdel",
+  "incr",
+  "decr",
+  "expire",
+  "persist",
+  "ttl",
 ]);
+
+const BATCH_EXECUTION_OPERATIONS = new Set(["exec", "execaspipeline"]);
 
 function normalizeMethod(method: string): string {
   return method.replace(/_/g, "").toLowerCase();
+}
+
+function ttlInput(
+  capture: OperationCapture,
+  result: unknown,
+): { ttlMs?: number } {
+  const ttlMs = capture.ttlMsFromResult?.(result) ?? capture.ttlMs;
+  return ttlMs !== undefined ? { ttlMs } : {};
+}
+
+function wrapBatchResult(
+  result: unknown,
+  driver: CacheDriver,
+  mode: BatchCapture["mode"],
+  options: InstrumentCacheClientOptions,
+): unknown {
+  if (isThenable(result)) {
+    return result.then(
+      (batch: unknown) => wrapBatch(batch, driver, mode, options),
+      (error: unknown) => {
+        const requestId = resolveRequestId(options);
+        if (requestId) {
+          emitSafely(options, {
+            driver,
+            op: mode,
+            keys: [],
+            requestId,
+            outcome: "failure",
+            error,
+            summary: emptyBatchSummary(),
+          });
+        }
+        throw error;
+      },
+    );
+  }
+  return wrapBatch(result, driver, mode, options);
+}
+
+function wrapBatch(
+  value: unknown,
+  driver: CacheDriver,
+  mode: BatchCapture["mode"],
+  options: InstrumentCacheClientOptions,
+): unknown {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) {
+    return value;
+  }
+  const target = value as DuckTypedCacheClient;
+  if (isBatchInstrumented(target)) return target;
+  const capture: BatchCapture = {
+    mode,
+    operationCount: 0,
+    operations: [],
+    keys: [],
+  };
+  const wrappers = new Map<PropertyKey, unknown>();
+  let proxy: DuckTypedCacheClient;
+  proxy = new Proxy(target, {
+    get(batchTarget, property, receiver) {
+      if (property === BATCH_INSTRUMENTED) return true;
+      const original = Reflect.get(batchTarget, property, receiver);
+      if (typeof property !== "string" || typeof original !== "function") {
+        return original;
+      }
+      if (wrappers.has(property)) return wrappers.get(property);
+      const operationName = normalizeMethod(property);
+      if (BATCH_EXECUTION_OPERATIONS.has(operationName)) {
+        const wrapped = (...args: unknown[]) => {
+          const execution = Reflect.apply(original, batchTarget, args);
+          const requestId = resolveRequestId(options);
+          if (!requestId || !isThenable(execution)) return execution;
+          return execution.then(
+            (resolved: unknown) => {
+              emitSafely(options, {
+                driver,
+                op: capture.mode,
+                keys: capture.keys,
+                requestId,
+                summary: batchSummary(capture),
+              });
+              return resolved;
+            },
+            (error: unknown) => {
+              emitSafely(options, {
+                driver,
+                op: capture.mode,
+                keys: capture.keys,
+                requestId,
+                outcome: "failure",
+                error,
+                summary: batchSummary(capture),
+              });
+              throw error;
+            },
+          );
+        };
+        wrappers.set(property, wrapped);
+        return wrapped;
+      }
+      const wrapped = (...args: unknown[]) => {
+        const commandResult = Reflect.apply(original, batchTarget, args);
+        recordBatchOperation(capture, operationName, args);
+        return commandResult === batchTarget ? proxy : commandResult;
+      };
+      wrappers.set(property, wrapped);
+      return wrapped;
+    },
+  });
+  return proxy;
+}
+
+function recordBatchOperation(
+  capture: BatchCapture,
+  operation: string,
+  args: readonly unknown[],
+): void {
+  capture.operationCount += 1;
+  if (capture.operations.length < MAX_BATCH_OPERATIONS) {
+    capture.operations.push(operation.slice(0, 64));
+  }
+  if (capture.keys.length < MAX_BATCH_KEYS && args.length > 0) {
+    capture.keys.push(args[0]);
+  }
+}
+
+function batchSummary(capture: BatchCapture): CacheOperationSummary {
+  return {
+    operationCount: capture.operationCount,
+    operations: [...capture.operations],
+    ...(capture.operations.length < capture.operationCount
+      ? { truncated: true }
+      : {}),
+  };
+}
+
+function emptyBatchSummary(): CacheOperationSummary {
+  return { operationCount: 0, operations: [] };
+}
+
+function resolveRequestId(
+  options: InstrumentCacheClientOptions,
+): string | undefined {
+  try {
+    return options.requestId ?? options.getRequestId?.();
+  } catch {
+    return undefined;
+  }
+}
+
+function isBatchInstrumented(value: DuckTypedCacheClient): boolean {
+  try {
+    return value[BATCH_INSTRUMENTED as unknown as string] === true;
+  } catch {
+    return false;
+  }
 }
 
 function describeOperation(
@@ -169,7 +376,92 @@ function describeOperation(
       hit: (result) => typeof result === "number" && result > 0,
     };
   }
+  if (op === "hget") {
+    return {
+      op,
+      keys: [args[0]],
+      hit: (result) => result !== null && result !== undefined,
+      resultValue: true,
+    };
+  }
+  if (op === "hmget") {
+    return {
+      op,
+      keys: [args[0]],
+      hit: (result) =>
+        Array.isArray(result) &&
+        result.some((entry) => entry !== null && entry !== undefined),
+      resultValue: true,
+    };
+  }
+  if (op === "hset") {
+    const value =
+      args.length === 2 && isRecord(args[1])
+        ? args[1]
+        : args.length === 3
+          ? args[2]
+          : args.slice(1, 33);
+    return {
+      op,
+      keys: [args[0]],
+      value,
+    };
+  }
+  if (op === "hdel") {
+    return {
+      op,
+      keys: [args[0]],
+      hit: (result) => typeof result === "number" && result > 0,
+    };
+  }
+  if (op === "getdel") {
+    return {
+      op,
+      keys: [args[0]],
+      hit: (result) => result !== null && result !== undefined,
+      resultValue: true,
+    };
+  }
+  if (op === "incr" || op === "decr") {
+    return {
+      op,
+      keys: [args[0]],
+      resultValue: true,
+    };
+  }
+  if (op === "expire") {
+    const seconds = finiteNonNegative(args[1]);
+    return {
+      op,
+      keys: [args[0]],
+      hit: (result) => typeof result === "number" && result > 0,
+      ...(seconds !== undefined ? { ttlMs: seconds * 1_000 } : {}),
+    };
+  }
+  if (op === "persist") {
+    return {
+      op,
+      keys: [args[0]],
+      hit: (result) => typeof result === "number" && result > 0,
+    };
+  }
+  if (op === "ttl") {
+    return {
+      op,
+      keys: [args[0]],
+      hit: (result) => typeof result === "number" && result >= -1,
+      resultValue: true,
+      ttlMsFromResult: (result) =>
+        typeof result === "number" && Number.isFinite(result) && result >= 0
+          ? result * 1_000
+          : undefined,
+    };
+  }
   return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function ttlFromSetArgs(args: readonly unknown[]): number | undefined {

@@ -121,6 +121,40 @@ Statements record evidence only inside a request scope, since `requestId` is wha
 the same evidence window as the request that issued it. Work outside any request — a cron tick, a
 queue worker — is not captured by this.
 
+`autoCapture` keeps the higher cost database evidence disabled unless you opt in. These options
+apply only to the automatic driver wrappers and all default to `false`:
+
+```ts
+await autoCapture({
+  endpoint: process.env.CRUMBTRAIL_ENDPOINT!,
+  captureDatabaseReads: true,
+  captureDatabaseBeforeImages: true,
+  captureDatabaseCallsites: true,
+});
+```
+
+`captureDatabaseReads` maps to the explicit adapters' `captureReads` option,
+`captureDatabaseBeforeImages` maps to `captureBefore`, and `captureDatabaseCallsites` maps to
+`captureCallsite`. The explicit `instrument*` APIs keep their existing option names and defaults.
+
+### Redis evidence
+
+`autoCapture` and the explicit Redis adapters capture these operations inside a request scope:
+
+- reads and hash reads: `get`, `getbuffer`, `getex`, `mget`, `hget`, `hmget`, `getdel`
+- writes and hash writes: `set`, `setex`, `psetex`, `hset`
+- invalidation and counters: `del`, `unlink`, `hdel`, `incr`, `decr`
+- expiry: `expire`, `persist`, `ttl`
+
+Values and keys are redacted using the shared capture policy. A rejected promise emits one `cache`
+event with `outcome: "failure"`, a bounded redacted error message, and its error class, then
+rethrows the original error. A `multi()` transaction or `pipeline()` emits one summary when
+`exec()` resolves or rejects. The summary includes a bounded command count and operation list.
+
+Unsupported Redis commands are passed through without per-command evidence. Batch summaries do not
+capture command arguments or results. Redis work outside a request scope is not emitted because it
+cannot be joined to a user session.
+
 ### Callsites: which line issued the write
 
 `captureCallsite: true` adds `callsite` to every `db.diff`: the innermost host frame plus the
