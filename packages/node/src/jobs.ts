@@ -213,7 +213,10 @@ export async function withCrumbtrailJob<T>(
   ): Promise<void> => {
     if (!child) return;
     try {
-      await child.record(event);
+      await bounded(
+        child.record(event),
+        options.cleanupTimeoutMs ?? DEFAULT_JOB_CLEANUP_TIMEOUT_MS,
+      );
     } catch (error) {
       reportLoss(options, error, phase);
     }
