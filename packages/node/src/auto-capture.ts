@@ -400,6 +400,7 @@ let installedService: string | undefined;
 export function __resetAutoCaptureInstallForTests(): void {
   installed = false;
   installedService = undefined;
+  clearActiveBackendEventSink();
 }
 
 /**
