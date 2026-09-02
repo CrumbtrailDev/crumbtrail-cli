@@ -101,4 +101,86 @@ describe("instrumentIoredisClient", () => {
     await expect(client.get("public:key")).resolves.toBeNull();
     expect(emit).not.toHaveBeenCalled();
   });
+
+  it("preserves ioredis exec tuples and reports bounded per-command failures", async () => {
+    const events: BugEvent[] = [];
+    const commandFailure = new Error("private cache failure token=secret");
+    const tuples: unknown[] = [
+      [null, "private value"],
+      [commandFailure, null],
+    ];
+    const client = instrumentIoredisClient(
+      {
+        pipeline() {
+          const batch = {
+            get(_key: string) {
+              return batch;
+            },
+            set(_key: string, _value: string) {
+              return batch;
+            },
+            exec: async () => tuples,
+          };
+          return batch;
+        },
+      },
+      { emit: (event) => events.push(event), requestId: "req_ioredis_exec" },
+    );
+
+    const result = await client
+      .pipeline()
+      .get("cart:123")
+      .set("cart:123", "secret")
+      .exec();
+
+    expect(result).toBe(tuples);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        k: "cache",
+        d: expect.objectContaining({
+          op: "pipeline",
+          outcome: "failure",
+          summary: {
+            operationCount: 2,
+            operations: ["get", "set"],
+            failureCount: 1,
+          },
+        }),
+      }),
+    );
+    expect(JSON.stringify(events)).not.toContain("private value");
+    expect(JSON.stringify(events)).not.toContain("private cache failure");
+  });
+
+  it("summarizes ioredis execBuffer without reading command results", async () => {
+    const events: BugEvent[] = [];
+    const tuples: unknown[] = [[null, Buffer.from([1, 2, 3])]];
+    const client = instrumentIoredisClient(
+      {
+        pipeline() {
+          const batch = {
+            getBuffer(_key: string) {
+              return batch;
+            },
+            execBuffer: async () => tuples,
+          };
+          return batch;
+        },
+      },
+      { emit: (event) => events.push(event), requestId: "req_ioredis_buffer" },
+    );
+
+    const result = await client.pipeline().getBuffer("blob:123").execBuffer();
+
+    expect(result).toBe(tuples);
+    expect(events[0]?.d).toMatchObject({
+      op: "pipeline",
+      summary: {
+        operationCount: 1,
+        operations: ["getbuffer"],
+      },
+    });
+    expect(events[0]?.d).not.toHaveProperty("value");
+    expect(JSON.stringify(events)).not.toContain('"data":[1,2,3]');
+  });
 });

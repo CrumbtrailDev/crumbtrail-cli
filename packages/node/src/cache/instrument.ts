@@ -161,7 +161,11 @@ const SUPPORTED_OPERATIONS = new Set([
   "ttl",
 ]);
 
-const BATCH_EXECUTION_OPERATIONS = new Set(["exec", "execaspipeline"]);
+const BATCH_EXECUTION_OPERATIONS = new Set([
+  "exec",
+  "execaspipeline",
+  "execbuffer",
+]);
 
 function normalizeMethod(method: string): string {
   return method.replace(/_/g, "").toLowerCase();
@@ -239,12 +243,14 @@ function wrapBatch(
           if (!requestId || !isThenable(execution)) return execution;
           return execution.then(
             (resolved: unknown) => {
+              const failureCount = batchFailureCount(driver, resolved);
               emitSafely(options, {
                 driver,
                 op: capture.mode,
                 keys: capture.keys,
                 requestId,
-                summary: batchSummary(capture),
+                ...(failureCount > 0 ? { outcome: "failure" as const } : {}),
+                summary: batchSummary(capture, failureCount),
               });
               return resolved;
             },
@@ -286,15 +292,43 @@ function recordBatchOperation(
   if (capture.operations.length < MAX_BATCH_OPERATIONS) {
     capture.operations.push(operation.slice(0, 64));
   }
-  if (capture.keys.length < MAX_BATCH_KEYS && args.length > 0) {
-    capture.keys.push(args[0]);
+  const shaped = batchKeysForOperation(operation, args);
+  for (const key of shaped) {
+    if (capture.keys.length >= MAX_BATCH_KEYS) break;
+    capture.keys.push(key);
   }
 }
 
-function batchSummary(capture: BatchCapture): CacheOperationSummary {
+function batchKeysForOperation(
+  operation: string,
+  args: readonly unknown[],
+): readonly unknown[] {
+  // Generic methods such as addCommand/sendCommand carry command arguments in
+  // objects or arrays. Only the same allowlisted shapes used by direct capture
+  // may contribute keys, so generic batch commands remain operation-only.
+  if (!SUPPORTED_OPERATIONS.has(operation)) return [];
+  return describeOperation(operation, args)?.keys ?? [];
+}
+
+function batchFailureCount(driver: CacheDriver, result: unknown): number {
+  if (driver !== "ioredis" || !Array.isArray(result)) return 0;
+  let failures = 0;
+  for (const tuple of result.slice(0, MAX_BATCH_OPERATIONS)) {
+    if (Array.isArray(tuple) && tuple.length > 0 && tuple[0] != null) {
+      failures += 1;
+    }
+  }
+  return failures;
+}
+
+function batchSummary(
+  capture: BatchCapture,
+  failureCount = 0,
+): CacheOperationSummary {
   return {
     operationCount: capture.operationCount,
     operations: [...capture.operations],
+    ...(failureCount > 0 ? { failureCount } : {}),
     ...(capture.operations.length < capture.operationCount
       ? { truncated: true }
       : {}),
@@ -381,7 +415,6 @@ function describeOperation(
       op,
       keys: [args[0]],
       hit: (result) => result !== null && result !== undefined,
-      resultValue: true,
     };
   }
   if (op === "hmget") {
@@ -391,20 +424,15 @@ function describeOperation(
       hit: (result) =>
         Array.isArray(result) &&
         result.some((entry) => entry !== null && entry !== undefined),
-      resultValue: true,
     };
   }
   if (op === "hset") {
-    const value =
-      args.length === 2 && isRecord(args[1])
-        ? args[1]
-        : args.length === 3
-          ? args[2]
-          : args.slice(1, 33);
+    // Hash field names carry the redaction signal for their values. The cache
+    // event has no field-aware value schema, so omit hash values entirely rather
+    // than risk exposing a password field or serializing a Buffer as raw bytes.
     return {
       op,
       keys: [args[0]],
-      value,
     };
   }
   if (op === "hdel") {
@@ -462,10 +490,6 @@ function describeOperation(
 
 function changedOutcome(result: unknown): boolean {
   return result === true || (typeof result === "number" && result > 0);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function ttlFromSetArgs(args: readonly unknown[]): number | undefined {

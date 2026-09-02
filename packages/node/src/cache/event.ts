@@ -1,4 +1,5 @@
 import {
+  BROWSER_REDACTION_POLICY,
   mergeRedactionMetadata,
   redactNetworkTextBody,
   redactProbeStorageKey,
@@ -33,6 +34,8 @@ export interface CacheEventData {
 export interface CacheOperationSummary {
   operationCount: number;
   operations: string[];
+  /** Number of per-command ioredis tuple failures, capped before emission. */
+  failureCount?: number;
   truncated?: boolean;
 }
 
@@ -56,6 +59,7 @@ const MAX_CACHE_VALUE_LENGTH = 8 * 1024;
 const MAX_CACHE_ERROR_LENGTH = 512;
 const MAX_SUMMARY_OPERATIONS = 50;
 const MAX_SUMMARY_OPERATION_LENGTH = 64;
+const MAX_SUMMARY_FAILURES = 100;
 
 export function buildCacheEvent(input: BuildCacheEventInput): BugEvent {
   const now = Number.isFinite(input.now)
@@ -124,6 +128,16 @@ function normalizeSummary(
       ? Math.max(0, Math.trunc(summary.operationCount))
       : operations.length,
     operations,
+    ...(typeof summary.failureCount === "number" &&
+    Number.isFinite(summary.failureCount) &&
+    summary.failureCount > 0
+      ? {
+          failureCount: Math.min(
+            MAX_SUMMARY_FAILURES,
+            Math.trunc(summary.failureCount),
+          ),
+        }
+      : {}),
     ...(summary.truncated || operations.length < summary.operationCount
       ? { truncated: true }
       : {}),
@@ -183,6 +197,28 @@ function redactCacheValue(value: unknown): {
   summary?: PayloadSummary;
   metadata?: RedactionMetadata;
 } {
+  if (containsBinary(value)) {
+    const summary: PayloadSummary = {
+      kind: "binary",
+      action: "summarized",
+      reason: "binary_cache_value",
+      originalLength: binaryLength(value),
+    };
+    return {
+      summary,
+      metadata: {
+        policy: BROWSER_REDACTION_POLICY,
+        fields: [
+          {
+            path: "cache",
+            reason: "binary_cache_value",
+            action: "summarized",
+          },
+        ],
+        summaries: [summary],
+      },
+    };
+  }
   let serialized: string;
   try {
     serialized = JSON.stringify({ value });
@@ -214,6 +250,46 @@ function redactCacheValue(value: unknown): {
       ...(result.metadata ? { metadata: result.metadata } : {}),
     };
   }
+}
+
+const MAX_BINARY_SCAN_DEPTH = 32;
+const MAX_BINARY_SCAN_ENTRIES = 256;
+
+/** Returns true for byte containers, including Buffer and nested byte values. */
+function containsBinary(
+  value: unknown,
+  seen = new WeakSet<object>(),
+  depth = 0,
+  scanned = { count: 0 },
+): boolean {
+  if (binaryLength(value) !== undefined) return true;
+  if (value === null || typeof value !== "object") return false;
+  if (depth >= MAX_BINARY_SCAN_DEPTH) return true;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  let entries: unknown[];
+  try {
+    entries = Array.isArray(value)
+      ? value
+      : Object.values(value as Record<string, unknown>);
+  } catch {
+    return true;
+  }
+  if (scanned.count + entries.length > MAX_BINARY_SCAN_ENTRIES) return true;
+  scanned.count += entries.length;
+  return entries.some((entry) =>
+    containsBinary(entry, seen, depth + 1, scanned),
+  );
+}
+
+function binaryLength(value: unknown): number | undefined {
+  try {
+    if (value instanceof ArrayBuffer) return value.byteLength;
+    if (ArrayBuffer.isView(value)) return value.byteLength;
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 function normalizeStartedAt(startedAt: number | Date | undefined) {

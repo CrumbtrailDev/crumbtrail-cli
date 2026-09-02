@@ -184,6 +184,43 @@ describe("instrumentNodeRedisClient", () => {
     });
   });
 
+  it("omits hash values and summarizes binary values without serializing bytes", async () => {
+    const events: BugEvent[] = [];
+    const binary = Buffer.from([17, 34, 51, 68]);
+    const client = instrumentNodeRedisClient(
+      {
+        async hGet(_key: string, _field: string) {
+          return binary;
+        },
+        async hMGet(_key: string, _fields: string[]) {
+          return [binary, null];
+        },
+        async hSet(_key: string, _field: string, _value: Buffer) {
+          return 1;
+        },
+        async getBuffer(_key: string) {
+          return binary;
+        },
+      },
+      { emit: (event) => events.push(event), requestId: "req_binary" },
+    );
+
+    await client.hGet("profile:123", "password");
+    await client.hMGet("profile:123", ["password"]);
+    await client.hSet("profile:123", "password", binary);
+    await client.getBuffer("blob:123");
+
+    expect(events.slice(0, 3).every((event) => !("value" in event.d))).toBe(
+      true,
+    );
+    expect(events[3]?.d).not.toHaveProperty("value");
+    expect(events[3]?.d.valueSummary).toMatchObject({
+      kind: "binary",
+      action: "summarized",
+    });
+    expect(JSON.stringify(events)).not.toContain('"data":[17,34,51,68]');
+  });
+
   it("records a bounded pipeline summary and preserves a rejected command", async () => {
     const events: BugEvent[] = [];
     const client = instrumentNodeRedisClient(
@@ -204,6 +241,9 @@ describe("instrumentNodeRedisClient", () => {
         pipeline() {
           const batch = {
             get(_key: string) {
+              return batch;
+            },
+            addCommand(_command: string, _args: unknown[]) {
               return batch;
             },
             exec: async () => ["cached value"],
@@ -241,6 +281,24 @@ describe("instrumentNodeRedisClient", () => {
           summary: {
             operationCount: 1,
             operations: ["get"],
+          },
+        }),
+      }),
+    );
+
+    await client
+      .pipeline()
+      .addCommand("set", ["cart:789", "private value"])
+      .exec();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        k: "cache",
+        d: expect.objectContaining({
+          op: "pipeline",
+          key: [],
+          summary: {
+            operationCount: 1,
+            operations: ["addcommand"],
           },
         }),
       }),
