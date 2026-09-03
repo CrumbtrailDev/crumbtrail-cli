@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE,
   AWS_CRUMBTRAIL_ENVELOPE_FIELD,
+  MAX_AWS_EVENTBRIDGE_REQUEST_BYTES,
   extractCrumbtrailEventBridgeContext,
   extractCrumbtrailSchedulerContext,
   extractCrumbtrailSnsRecord,
@@ -186,10 +187,10 @@ describe("AWS event carriers", () => {
     ).toMatchObject({ sessionId: "session_parent" });
   });
 
-  it("reports size loss only when an EventBridge entry cannot fit its service limit", () => {
+  it("reports size loss only when a single EventBridge request cannot fit", () => {
     const losses: string[] = [];
     const entry = {
-      Detail: JSON.stringify({ payload: "x".repeat(256 * 1024) }),
+      Detail: JSON.stringify({ payload: "x".repeat(1024 * 1024) }),
     };
     const carried = injectCrumbtrailEventBridgeEntry(entry, {
       context: token(),
@@ -197,6 +198,75 @@ describe("AWS event carriers", () => {
     });
     expect(carried).toEqual(entry);
     expect(losses.some((loss) => loss.startsWith("size:"))).toBe(true);
+  });
+
+  it("retains context on a valid 300 KiB EventBridge entry", () => {
+    const entry = {
+      Source: "payments",
+      DetailType: "created",
+      Resources: ["arn:aws:events:ca-central-1:123:event/payments"],
+      Time: "2026-09-03T00:00:00Z",
+      Detail: JSON.stringify({ payload: "x".repeat(300 * 1024) }),
+    };
+    const carried = injectCrumbtrailEventBridgeEntry(entry, {
+      context: token(),
+    });
+    const detail = JSON.parse(carried.Detail as string);
+    expect(detail.payload).toHaveLength(300 * 1024);
+    expect(extractCrumbtrailEventBridgeContext({ detail })).toBeDefined();
+  });
+
+  it("enforces the aggregate EventBridge request limit using entry fields", async () => {
+    const calls: unknown[] = [];
+    const losses: string[] = [];
+    const client = {
+      putEvents(input: unknown) {
+        calls.push(input);
+        return input;
+      },
+    };
+    const wrapped = withCrumbtrailAwsEventBridgeProducer(client, {
+      context: token(),
+      onCaptureLoss: (error, phase) => losses.push(`${phase}:${String(error)}`),
+    });
+    const underLimitEntries = [
+      {
+        Source: "payments",
+        DetailType: "created",
+        Detail: JSON.stringify({ payload: "x".repeat(500_000) }),
+      },
+      {
+        Source: "payments",
+        DetailType: "created",
+        Detail: JSON.stringify({ payload: "x".repeat(500_000) }),
+      },
+    ];
+    await wrapped.putEvents?.({ Entries: underLimitEntries });
+    const underLimit = calls[0] as { Entries: Array<{ Detail: string }> };
+    expect(JSON.parse(underLimit.Entries[0].Detail)).toHaveProperty(
+      "__crumbtrail",
+    );
+    expect(JSON.parse(underLimit.Entries[1].Detail)).toHaveProperty(
+      "__crumbtrail",
+    );
+
+    const overLimitEntries = [
+      {
+        Source: "payments",
+        DetailType: "created",
+        Detail: JSON.stringify({ payload: "x".repeat(525_000) }),
+      },
+      {
+        Source: "payments",
+        DetailType: "created",
+        Detail: JSON.stringify({ payload: "x".repeat(525_000) }),
+      },
+    ];
+    await wrapped.putEvents?.({ Entries: overLimitEntries });
+    const overLimit = calls[1] as { Entries: Array<{ Detail: string }> };
+    expect(overLimit.Entries).toEqual(overLimitEntries);
+    expect(losses.some((loss) => loss.startsWith("size:"))).toBe(true);
+    expect(MAX_AWS_EVENTBRIDGE_REQUEST_BYTES).toBe(1024 * 1024);
   });
 
   it("does not strip a user field that merely resembles context", () => {

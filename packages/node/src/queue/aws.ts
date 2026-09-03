@@ -19,9 +19,7 @@ export const AWS_CRUMBTRAIL_PAYLOAD_FIELD = "__crumbtrailPayload";
 /** Marker that distinguishes an adapter envelope from user fields. */
 export const AWS_CRUMBTRAIL_ENVELOPE_FIELD = "__crumbtrailEnvelope";
 export const MAX_AWS_CONTEXT_VALUE_LENGTH = 2_048;
-/** EventBridge limits one PutEvents entry to 256 KiB. */
-export const MAX_AWS_EVENTBRIDGE_ENTRY_BYTES = 256 * 1024;
-/** EventBridge limits one PutEvents request to 1 MiB. */
+/** EventBridge PutEvents requires the summed entry size to be below 1 MiB. */
 export const MAX_AWS_EVENTBRIDGE_REQUEST_BYTES = 1024 * 1024;
 /** EventBridge Scheduler limits Target.Input to 256 KiB. */
 export const MAX_AWS_SCHEDULER_INPUT_BYTES = 256 * 1024;
@@ -269,11 +267,11 @@ export function injectCrumbtrailEventBridgeEntry<
   if (!token || typeof input.Detail !== "string") return cloneValue(input);
   const detail = injectJsonCarrier(input.Detail, token, options);
   const candidate = { ...cloneValue(input), Detail: detail } as T;
-  if (eventBridgeEntryBytes(candidate) > MAX_AWS_EVENTBRIDGE_ENTRY_BYTES) {
+  if (eventBridgeEntryBytes(candidate) >= MAX_AWS_EVENTBRIDGE_REQUEST_BYTES) {
     reportCaptureLoss(
       options,
       "size",
-      "EventBridge entry exceeds the 256 KiB service limit with Crumbtrail context",
+      "EventBridge entry exceeds the 1 MiB PutEvents request limit with Crumbtrail context",
     );
     return cloneValue(input);
   }
@@ -666,8 +664,7 @@ function wrapEventBridgePutEvents(
         )
       : entry,
   );
-  const candidate = { ...cloned, Entries: carriedEntries };
-  if (jsonBytes(candidate) > MAX_AWS_EVENTBRIDGE_REQUEST_BYTES) {
+  if (eventBridgeRequestBytes(carriedEntries) >= MAX_AWS_EVENTBRIDGE_REQUEST_BYTES) {
     reportCaptureLoss(
       options,
       "size",
@@ -901,11 +898,28 @@ function isOneShotSchedule(expression: string): boolean {
 }
 
 function eventBridgeEntryBytes(entry: AwsEventBridgeEntry): number {
-  try {
-    return utf8Bytes(JSON.stringify(entry));
-  } catch {
-    return Number.POSITIVE_INFINITY;
+  let size = 0;
+  if (entry.Time !== undefined && entry.Time !== null) size += 14;
+  size += utf8BytesIfString(entry.Source);
+  size += utf8BytesIfString(entry.DetailType);
+  size += utf8BytesIfString(entry.Detail);
+  if (Array.isArray(entry.Resources)) {
+    for (const resource of entry.Resources) size += utf8BytesIfString(resource);
   }
+  return size;
+}
+
+function eventBridgeRequestBytes(entries: readonly unknown[]): number {
+  let size = 0;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") return Number.POSITIVE_INFINITY;
+    size += eventBridgeEntryBytes(entry as AwsEventBridgeEntry);
+  }
+  return size;
+}
+
+function utf8BytesIfString(value: unknown): number {
+  return typeof value === "string" ? utf8Bytes(value) : 0;
 }
 
 function utf8Bytes(value: string): number {
@@ -953,19 +967,10 @@ function readNow(now: number | (() => number) | undefined): number {
 }
 
 function parseJson(value: string): unknown {
-  if (utf8Bytes(value) > MAX_AWS_EVENTBRIDGE_ENTRY_BYTES) return undefined;
   try {
     return JSON.parse(value);
   } catch {
     return undefined;
-  }
-}
-
-function jsonBytes(value: unknown): number {
-  try {
-    return utf8Bytes(JSON.stringify(value));
-  } catch {
-    return Number.POSITIVE_INFINITY;
   }
 }
 

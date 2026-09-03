@@ -102,9 +102,10 @@ fields, and existing attributes. EventBridge `putEvents` uses a namespaced field
 `Detail`. Scheduler `createSchedule` and `updateSchedule` use the same field in `Target.Input`
 only for `at(...)` one shot schedules. Recurring `rate(...)` and `cron(...)` schedules never
 carry a request token. The SQS and SNS context attribute is bounded to 2,048 characters.
-EventBridge entries and Scheduler inputs keep application JSON intact and add only the bounded
-context carrier. Entries and inputs are checked against their 256 KiB service limit, and
-EventBridge batches are checked against the 1 MiB request limit.
+EventBridge entries keep application JSON intact and add only the bounded context carrier. The
+`PutEvents` request size is the sum of the `UTF-8` byte lengths of each entry's `Source`,
+`DetailType`, `Detail`, and `Resources` values, plus 14 bytes when `Time` is present. The total
+must be below 1 MiB. Scheduler inputs are checked against their 256 KiB service limit.
 
 The processor wrappers are `withCrumbtrailAwsSqsProcessor`,
 `withCrumbtrailAwsSqsBatchProcessor`, `withCrumbtrailAwsSnsProcessor`,
