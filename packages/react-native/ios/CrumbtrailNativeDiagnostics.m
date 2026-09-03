@@ -22,6 +22,7 @@ static NSArray<NSDictionary *> *CTInFlightDiagnosticsEvents;
   dispatch_source_t _watchdog;
   uint64_t _lastHeartbeat;
   BOOL _watchdogPending;
+  BOOL _foreground;
   BOOL _enabled;
   BOOL _collectorsStarted;
   NSMutableArray *_observerTokens;
@@ -134,6 +135,7 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
         return;
       }
       NSArray *raw = [[self defaults] arrayForKey:CTNativeDiagnosticsPendingKey] ?: @[];
+      raw = [raw subarrayWithRange:NSMakeRange(0, MIN(raw.count, CTNativeDiagnosticsMaxEvents))];
       if (raw.count == 0) {
         resolve([self emptyDiagnosticsBatch]);
         return;
@@ -251,6 +253,13 @@ RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
   for (NSDictionary *entry in notifications) {
     id token = [center addObserverForName:entry[@"name"] object:nil queue:[NSOperationQueue mainQueue]
                     usingBlock:^(__unused NSNotification *notification) {
+      CrumbtrailNativeDiagnostics *strongSelf = weakSelf;
+      if (!strongSelf) return;
+      if (![entry[@"state"] isEqualToString:@"memory-warning"]) {
+        strongSelf->_lastHeartbeat = mach_absolute_time();
+        strongSelf->_watchdogPending = NO;
+        strongSelf->_foreground = [entry[@"state"] isEqualToString:@"active"];
+      }
       [weakSelf appendPendingKind:@"app-lifecycle" data:@{
         @"state": entry[@"state"], @"source": @"uiapplication"
       }];
@@ -261,6 +270,10 @@ RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
 
 - (void)startWatchdog {
   _lastHeartbeat = mach_absolute_time();
+  dispatch_async(dispatch_get_main_queue(), ^{
+    self->_lastHeartbeat = mach_absolute_time();
+    self->_foreground = UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+  });
   _watchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
   if (!_watchdog) return;
@@ -270,7 +283,7 @@ RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
   dispatch_source_set_event_handler(_watchdog, ^{
     CrumbtrailNativeDiagnostics *strongSelf = weakSelf;
     if (!strongSelf) return;
-    if (!strongSelf->_enabled) return;
+    if (!strongSelf->_enabled || !strongSelf->_foreground) return;
     uint64_t now = mach_absolute_time();
     mach_timebase_info_data_t info;
     mach_timebase_info(&info);
@@ -309,7 +322,8 @@ RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
     NSUserDefaults *defaults = [self defaults];
     NSMutableArray *events = [[defaults arrayForKey:CTNativeDiagnosticsPendingKey] mutableCopy] ?: [NSMutableArray array];
     NSArray *previous = [events copy];
-    while (events.count >= CTNativeDiagnosticsMaxEvents) [events removeObjectAtIndex:0];
+    NSUInteger protected = CTInFlightDiagnosticsEvents.count;
+    while (events.count >= CTNativeDiagnosticsMaxEvents + protected) [events removeObjectAtIndex:protected];
     [events addObject:@{ @"kind": kind, @"data": [self boundedData:data] }];
     BOOL committed = NO;
     for (NSUInteger attempt = 0; attempt < CTNativeDiagnosticsMaxPersistenceAttempts; attempt++) {

@@ -274,38 +274,45 @@ class Crumbtrail with WidgetsBindingObserver {
     );
 
     if (diagnosticsEnabled) {
-      try {
-        final batch = await _nativeDiagnosticsPlatform.drainDiagnostics();
-        if (!_nativeDiagnosticsIsCurrent(generation)) return;
-        for (final event in batch.events) {
-          final kind = switch (event.kind) {
-            'native-hang' => CrumbtrailEventKind.nativeHang,
-            'native-crash' => CrumbtrailEventKind.nativeCrash,
-            'app-lifecycle' => CrumbtrailEventKind.appLifecycle,
-            _ => null,
-          };
-          if (kind == null ||
-              (kind == CrumbtrailEventKind.nativeHang &&
-                  !_validNativeHang(event.data))) {
-            return;
+      nativeDrain:
+      {
+        try {
+          final batch = await _nativeDiagnosticsPlatform.drainDiagnostics();
+          if (!_nativeDiagnosticsIsCurrent(generation)) return;
+          for (final event in batch.events) {
+            final kind = switch (event.kind) {
+              'native-hang' => CrumbtrailEventKind.nativeHang,
+              'native-crash' => CrumbtrailEventKind.nativeCrash,
+              'app-lifecycle' => CrumbtrailEventKind.appLifecycle,
+              _ => null,
+            };
+            if (kind == null ||
+                (kind == CrumbtrailEventKind.nativeHang &&
+                    !_validNativeHang(event.data))) {
+              _nativeDiagnosticsStarted = false;
+              break nativeDrain;
+            }
+            if (!_nativeDiagnosticsIsCurrent(generation)) return;
+            if (!addEvent(kind, event.data)) {
+              _nativeDiagnosticsStarted = false;
+              break nativeDrain;
+            }
           }
-          if (!_nativeDiagnosticsIsCurrent(generation) ||
-              !addEvent(kind, event.data)) {
-            return;
+          if (batch.events.isNotEmpty && batch.token.isNotEmpty) {
+            final acknowledged = await _nativeDiagnosticsPlatform
+                .acknowledgeDiagnostics(batch.token);
+            if (!_nativeDiagnosticsIsCurrent(generation)) return;
+            if (!acknowledged) _nativeDiagnosticsStarted = false;
           }
+        } on Object {
+          _nativeDiagnosticsStarted = false;
+          // A diagnostics failure is an unavailable capability, not an app error.
         }
-        if (batch.events.isNotEmpty && batch.token.isNotEmpty) {
-          final acknowledged = await _nativeDiagnosticsPlatform
-              .acknowledgeDiagnostics(batch.token);
-          if (!_nativeDiagnosticsIsCurrent(generation) || !acknowledged) return;
-        }
-      } on Object {
-        // A diagnostics failure is an unavailable capability, not an app error.
       }
     }
 
     if (!_nativeDiagnosticsIsCurrent(generation)) return;
-    if (config.collectors.nativeWatchdog) {
+    if (config.collectors.nativeWatchdog && _nativeWatchdog == null) {
       final watchdog = CrumbtrailDartEventLoopWatchdog(
         handoff: _nativeWatchdogHandoff,
         debuggerAttached: _nativeDebuggerAttached,

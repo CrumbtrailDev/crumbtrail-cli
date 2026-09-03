@@ -57,6 +57,7 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     private var watchdogTimer: DispatchSourceTimer?
     private var lastHeartbeat = DispatchTime.now().uptimeNanoseconds
     private var watchdogPending = false
+    private var foreground = false
     private var enabled = false
     private var collectorsStarted = false
 
@@ -124,6 +125,11 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         for (name, state) in notifications {
             observerTokens.append(
                 center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    if state != "memory-warning" {
+                        self?.lastHeartbeat = DispatchTime.now().uptimeNanoseconds
+                        self?.watchdogPending = false
+                        self?.foreground = state == "active"
+                    }
                     self?.appendPending(
                         kind: "app-lifecycle",
                         data: ["state": state, "source": "uiapplication"]
@@ -158,6 +164,10 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func startWatchdog() {
+        DispatchQueue.main.async { [weak self] in
+            self?.lastHeartbeat = DispatchTime.now().uptimeNanoseconds
+            self?.foreground = UIApplication.shared.applicationState == .active
+        }
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(
             deadline: .now() + .milliseconds(1_000),
@@ -165,7 +175,7 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         )
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            guard self.enabled else { return }
+            guard self.enabled && self.foreground else { return }
             let now = DispatchTime.now().uptimeNanoseconds
             let elapsed = Int64((now - self.lastHeartbeat) / 1_000_000)
             if elapsed > Self.hangThresholdMilliseconds,
@@ -207,8 +217,9 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         if let token = Self.inFlightToken, let events = Self.inFlightEvents {
             return ["token": token, "events": events.compactMap { self.responseEvent($0) }]
         }
-        guard let raw = defaults.array(forKey: Self.pendingKey) as? [[String: Any]],
-              !raw.isEmpty else { return ["token": "", "events": []] }
+        guard let stored = defaults.array(forKey: Self.pendingKey) as? [[String: Any]],
+              !stored.isEmpty else { return ["token": "", "events": []] }
+        let raw = Array(stored.prefix(Self.maxPendingEvents))
         let token = UUID().uuidString
         Self.inFlightToken = token
         Self.inFlightEvents = raw
@@ -262,7 +273,8 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         guard enabled else { return }
         var events = (defaults.array(forKey: Self.pendingKey) as? [[String: Any]]) ?? []
         let previous = events
-        while events.count >= Self.maxPendingEvents { events.removeFirst() }
+        let protected = Self.inFlightEvents?.count ?? 0
+        while events.count >= Self.maxPendingEvents + protected { events.remove(at: protected) }
         events.append(["kind": kind, "data": data.reduce(into: [String: Any]()) { result, item in
             guard item.key.count <= 64 else { return }
             if let text = item.value as? String {

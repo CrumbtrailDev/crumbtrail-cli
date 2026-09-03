@@ -220,6 +220,8 @@ Native batches are acknowledged only when core capture policy admits their event
 Rejected batches remain local and retry while the bridge is active. `addEvent()`
 returns `true` for local admission, not server delivery. Watchdogs rearm after a
 healthy heartbeat and observe background state even when `appState` events are off.
+Native watchdogs suspend while the application is inactive. Pending native batches
+reserve up to 32 records until acknowledgment, plus a bounded tail of 32 newer records.
 
 The JavaScript watchdog defaults to a five second threshold and one second
 checks. It pauses when `AppState` is not active, and is disabled in development

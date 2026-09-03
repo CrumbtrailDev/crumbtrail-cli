@@ -38,6 +38,7 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var lastHeartbeat = SystemClock.elapsedRealtime()
     @Volatile private var watchdogPending = false
+    @Volatile private var foreground = false
     @Volatile private var enabled = false
     private var collectorsStarted = false
 
@@ -161,8 +162,17 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private fun installLifecycleCollector() {
         val app = application ?: return
         val callbacks = object : Application.ActivityLifecycleCallbacks {
-            override fun onActivityResumed(activity: Activity) = appendLifecycle("resumed")
-            override fun onActivityPaused(activity: Activity) = appendLifecycle("paused")
+            override fun onActivityResumed(activity: Activity) {
+                lastHeartbeat = SystemClock.elapsedRealtime()
+                watchdogPending = false
+                foreground = true
+                appendLifecycle("resumed")
+            }
+            override fun onActivityPaused(activity: Activity) {
+                foreground = false
+                watchdogPending = false
+                appendLifecycle("paused")
+            }
             override fun onActivityStarted(activity: Activity) = appendLifecycle("foreground")
             override fun onActivityStopped(activity: Activity) = appendLifecycle("background")
             override fun onActivityCreated(activity: Activity, state: android.os.Bundle?) = Unit
@@ -249,7 +259,8 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 "status" to info.status,
             )
         }
-        while (pending.length() >= MAX_PENDING_EVENTS) pending.remove(0)
+        val protected = inFlightItems?.size ?: 0
+        while (pending.length() >= MAX_PENDING_EVENTS + protected) pending.remove(protected)
         pending.put(JSONObject().put("kind", kind).put("data", JSONObject(data)))
     }
 
@@ -266,10 +277,14 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     private fun startWatchdog() {
+        val process = android.app.ActivityManager.RunningAppProcessInfo()
+        android.app.ActivityManager.getMyMemoryState(process)
+        foreground = process.importance == android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
+        lastHeartbeat = SystemClock.elapsedRealtime()
         val handler = mainHandler
         watchdogTask = watchdogExecutor.scheduleAtFixedRate({
             val now = SystemClock.elapsedRealtime()
-            if (now - lastHeartbeat > HANG_THRESHOLD_MS && !watchdogPending && !Debug.isDebuggerConnected()) {
+            if (foreground && now - lastHeartbeat > HANG_THRESHOLD_MS && !watchdogPending && !Debug.isDebuggerConnected()) {
                 watchdogPending = true
                 appendPending(
                     "native-hang",
@@ -282,7 +297,7 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     ),
                 )
             }
-runCatching { handler.post {
+            runCatching { handler.post {
                 lastHeartbeat = SystemClock.elapsedRealtime()
                 watchdogPending = false
             } }
@@ -302,7 +317,7 @@ runCatching { handler.post {
         val items = parsePending(raw) ?: return@synchronized emptyDrain()
         if (items.isEmpty()) return@synchronized emptyDrain()
         val token = UUID.randomUUID().toString()
-        val serialized = items.map { it.toString() }
+        val serialized = items.take(MAX_PENDING_EVENTS).map { it.toString() }
         inFlightToken = token
         inFlightItems = serialized
         drainResponse(token, serialized)
@@ -364,7 +379,8 @@ runCatching { handler.post {
                 if (!enabled) return@synchronized
                 val prefs = preferences()
                 val current = JSONArray(pendingRetryValue ?: prefs.getString(PENDING_KEY, "[]"))
-                while (current.length() >= MAX_PENDING_EVENTS) current.remove(0)
+                val protected = inFlightItems?.size ?: 0
+                while (current.length() >= MAX_PENDING_EVENTS + protected) current.remove(protected)
                 val json = JSONObject().put("kind", kind).put("data", JSONObject(data))
                 current.put(json)
                 commitPending(prefs, current.toString())

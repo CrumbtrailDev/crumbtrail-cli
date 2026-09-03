@@ -165,6 +165,10 @@ watchdog pauses when the app is not resumed and while a debugger is attached.
 Lifecycle observation remains active when `collectors.appLifecycle` is false,
 without recording lifecycle events. A healthy heartbeat rearms the watchdog
 after a recovered stall.
+Native watchdogs also suspend while the application is inactive. Pending native
+batches reserve up to 32 records until acknowledgment, plus 32 newer records.
+A failed native drain does not disable the Dart watchdog. Call
+`startNativeDiagnostics()` again to retry a failed native drain or acknowledgment.
 
 The ingest key is write only by design. It cannot read sessions back, so
 shipping it in an app binary exposes nothing. Reading data needs a separate

@@ -95,6 +95,27 @@ class ConfigurableNativeDiagnostics
   Future<bool> acknowledgeDiagnostics(String token) async => false;
 }
 
+class FailingNativeDiagnostics extends FakeNativeDiagnostics {
+  FailingNativeDiagnostics(this.failure);
+  final String failure;
+  int drains = 0;
+
+  @override
+  Future<CrumbtrailNativeDiagnosticBatch> drainDiagnostics() async {
+    drains++;
+    if (failure == 'throw') throw StateError('drain failed');
+    return CrumbtrailNativeDiagnosticBatch(token: 'pending', events: [
+      CrumbtrailNativeDiagnosticEvent(
+        kind: failure == 'invalid' ? 'unknown' : 'native-crash',
+        data: const {'msg': 'crash'},
+      ),
+    ]);
+  }
+
+  @override
+  Future<bool> acknowledgeDiagnostics(String token) async => false;
+}
+
 class DelayedNativeDiagnostics implements CrumbtrailNativeDiagnosticsPlatform {
   final Completer<void> capabilityGate = Completer<void>();
   bool capabilityRead = false;
@@ -131,10 +152,47 @@ class RecordingTransport implements CrumbtrailTransport {
 }
 
 void main() {
-  test('watchdog lifecycle handling does not emit disabled lifecycle events', () async {
+  for (final failure in ['throw', 'invalid', 'ack']) {
+    test('native $failure failure preserves independent watchdog and retry',
+        () async {
+      final platform = FailingNativeDiagnostics(failure);
+      final handoff = MemoryCrumbtrailDartHangHandoff();
+      await handoff.deliver(const {
+        'source': 'dart',
+        'thresholdMs': 5000,
+        'observedDurationMs': 6000,
+        'recovered': false,
+        'previousLaunch': true,
+      }, (_) => false);
+      final transport = RecordingTransport();
+      final logger = Crumbtrail(
+        config: const CrumbtrailConfig(endpoint: 'https://ingest.example.com'),
+        transport: transport,
+        nativeDiagnosticsPlatform: platform,
+        nativeWatchdogHandoff: handoff,
+        startTimer: false,
+      );
+      await logger.startNativeDiagnostics();
+      await Future<void>.delayed(Duration.zero);
+      await logger.flush();
+      expect(
+          transport.batches
+              .expand((batch) => batch)
+              .where((event) => event.kind == 'native-hang'),
+          hasLength(1));
+      await logger.startNativeDiagnostics();
+      expect(platform.drains, 2);
+      await logger.stop();
+    });
+  }
+  test('watchdog lifecycle handling does not emit disabled lifecycle events',
+      () async {
     final transport = RecordingTransport();
     final logger = Crumbtrail(
-      config: const CrumbtrailConfig(endpoint: 'https://ingest.example.com', collectors: CrumbtrailCollectors(appLifecycle: false, nativeWatchdog: true)),
+      config: const CrumbtrailConfig(
+          endpoint: 'https://ingest.example.com',
+          collectors:
+              CrumbtrailCollectors(appLifecycle: false, nativeWatchdog: true)),
       transport: transport,
       nativeDiagnosticsPlatform: FakeNativeDiagnostics(),
       startTimer: false,
@@ -143,7 +201,11 @@ void main() {
     logger.didChangeAppLifecycleState(AppLifecycleState.paused);
     logger.didChangeAppLifecycleState(AppLifecycleState.resumed);
     await logger.flush();
-    expect(transport.batches.expand((batch) => batch).where((event) => event.kind == 'app-lifecycle'), isEmpty);
+    expect(
+        transport.batches
+            .expand((batch) => batch)
+            .where((event) => event.kind == 'app-lifecycle'),
+        isEmpty);
     await logger.stop();
   });
   test('native bridge drains shared events and reports capability state',
