@@ -6,6 +6,8 @@ import type {
 
 interface NodeServerlessAdapterCommonOptions {
   metadata?: Readonly<Record<string, unknown>>;
+  /** Explicit dotted/indexed metadata paths retained as bounded diagnostics. */
+  diagnosticFields?: readonly string[];
   service?: string;
   onError?: (error: unknown, context: ServerlessDeliveryErrorContext) => void;
   now?: () => number;

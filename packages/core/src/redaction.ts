@@ -233,6 +233,11 @@ export interface StructuredFieldPolicy {
 
 export type DiagnosticScalar = string | number | boolean | null;
 
+export type DiagnosticFieldsValue =
+  | DiagnosticScalar
+  | DiagnosticFieldsValue[]
+  | { [key: string]: DiagnosticFieldsValue };
+
 /** The maximum number of explicitly selected diagnostic leaves in one event. */
 export const DIAGNOSTIC_FIELD_MAX_ENTRIES = 16;
 
@@ -2520,7 +2525,12 @@ function isDiagnosticReservedKey(key: string): boolean {
   const compact = compactFieldName(key);
   return (
     DIAGNOSTIC_RESERVED_KEYS.has(key.toLowerCase()) ||
-    DIAGNOSTIC_RESERVED_KEYS.has(compact)
+    DIAGNOSTIC_RESERVED_KEYS.has(compact) ||
+    compact.startsWith("raw") ||
+    compact.includes("body") ||
+    compact.includes("header") ||
+    compact.includes("stack") ||
+    compact.includes("local")
   );
 }
 
@@ -2585,13 +2595,18 @@ function readOwnDiagnosticValue(
   value: object,
   key: string,
 ): { found: true; value: unknown } | { found: false } {
-  const descriptor = Object.getOwnPropertyDescriptor(value, key);
-  // Accessors can execute arbitrary code and are not stable telemetry input.
-  // Only own, enumerable data properties are eligible.
-  if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    // Accessors can execute arbitrary code and are not stable telemetry input.
+    // Only own, enumerable data properties are eligible.
+    if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+      return { found: false };
+    }
+    return { found: true, value: descriptor.value };
+  } catch {
+    // A revoked or hostile proxy is not a reason to break the host's capture.
     return { found: false };
   }
-  return { found: true, value: descriptor.value };
 }
 
 function diagnosticLeafValue(
@@ -2606,8 +2621,38 @@ function diagnosticLeafValue(
     return undefined;
   }
 
+  if (
+    typeof value === "string" &&
+    value.length > DIAGNOSTIC_FIELD_MAX_STRING_LENGTH
+  ) {
+    fields.push({
+      path,
+      reason: "diagnostic_value_too_large",
+      action: "redacted",
+    });
+    return undefined;
+  }
+
+  let candidate = value;
+  if (typeof value === "string") {
+    const urlResult = redactUrlsInText(value, path);
+    candidate = urlResult.value;
+    if (urlResult.metadata) fields.push(...urlResult.metadata.fields);
+    if (
+      typeof candidate === "string" &&
+      candidate.length > DIAGNOSTIC_FIELD_MAX_STRING_LENGTH
+    ) {
+      fields.push({
+        path,
+        reason: "diagnostic_value_too_large",
+        action: "redacted",
+      });
+      return undefined;
+    }
+  }
+
   const classification = classifyStructuredValue(
-    value,
+    candidate,
     keyName,
     denyFields ? [...denyFields] : undefined,
     undefined,
@@ -2624,22 +2669,13 @@ function diagnosticLeafValue(
     return undefined;
   }
 
-  if (typeof value === "string" && value.length > DIAGNOSTIC_FIELD_MAX_STRING_LENGTH) {
-    fields.push({
-      path,
-      reason: "diagnostic_value_too_large",
-      action: "redacted",
-    });
-    return undefined;
-  }
-
   if (
-    value === null ||
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
+    candidate === null ||
+    typeof candidate === "string" ||
+    typeof candidate === "number" ||
+    typeof candidate === "boolean"
   ) {
-    return value;
+    return candidate;
   }
 
   fields.push({ path, reason: "diagnostic_non_scalar", action: "redacted" });
@@ -2737,7 +2773,7 @@ function collectDiagnosticFields(
 export function redactDiagnosticFields(
   value: unknown,
   options: DiagnosticFieldRedactionOptions,
-): RedactionResult<unknown> {
+): RedactionResult<DiagnosticFieldsValue> {
   const fields: RedactionField[] = [];
   const root = compileDiagnosticFieldPaths(
     options.diagnosticFields,
@@ -2753,7 +2789,7 @@ export function redactDiagnosticFields(
     new WeakSet<object>(),
   );
   return {
-    value: output ?? safeDiagnosticObject(),
+    value: (output ?? safeDiagnosticObject()) as DiagnosticFieldsValue,
     ...(fields.length > 0
       ? {
           metadata: {

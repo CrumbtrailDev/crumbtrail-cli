@@ -413,6 +413,39 @@ describe("runServerlessInvocation", () => {
     expect(serialized).not.toContain("ignored handler response");
   });
 
+  it("selects nested diagnostic metadata without making body or secret paths eligible", async () => {
+    const { events, transport } = collectingTransport();
+
+    await runServerlessInvocation(
+      {
+        transport,
+        metadata: {
+          request: { status: "failed" },
+          attempts: [{ code: "E_TIMEOUT" }],
+          headers: { "content-type": "application/json" },
+          payload: { body: "must not retain" },
+          credentials: { token: "must not retain" },
+        },
+        diagnosticFields: [
+          "request.status",
+          "attempts[0].code",
+          "headers.content-type",
+          "payload.body",
+          "credentials.token",
+        ],
+      },
+      () => "ok",
+    );
+
+    const event = eventOf(events, SERVERLESS_INVOCATION_SUCCESS_EVENT);
+    expect(event.d.metadata).toEqual({
+      "attempts[0].code": "E_TIMEOUT",
+      "request.status": "failed",
+    });
+    expect(JSON.stringify(events)).not.toContain("content-type");
+    expect(JSON.stringify(events)).not.toContain("must not retain");
+  });
+
   it("redacts secrets from routes, metadata, and errors", async () => {
     const { events, transport } = collectingTransport();
     const jwt =

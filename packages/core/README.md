@@ -274,6 +274,35 @@ What a keep does and does not do:
 - On a **form input** it is matched against the field's `name`, and a
   `password`, `email` or `tel` input is never kept whatever it is called.
 
+### Selecting small support diagnostics
+
+Use `redaction.diagnosticFields` when the application needs a small set of
+declared flag or runtime-config values in an environment event. The paths are
+relative to each map passed to `setEnv`, use exact property names and numeric
+array indexes, and select at most 16 scalar values:
+
+```ts
+const logger = Crumbtrail.init({
+  redaction: {
+    diagnosticFields: ["checkout.status", "attempts[0].code"],
+  },
+});
+
+logger.setEnv({
+  flags: {
+    checkout: { status: "failed" },
+    attempts: [{ code: "E_TIMEOUT", customerEmail: "person@example.com" }],
+  },
+});
+```
+
+Only the selected paths are considered. Values must be scalar and no longer
+than 256 characters. Sensitive names, email, token, card, password, and other
+secret patterns still win. Wildcards, inherited properties, accessors, cycles,
+prototype-like keys, bodies, headers, stacks, locals, and non-scalars are not
+retained. Omitting `diagnosticFields` preserves the existing environment
+redaction behavior. `keepFields` and `redaction.mode` do not widen this list.
+
 ## Production capture
 
 Page text, keystrokes, clipboard content, DOM snapshots, and database row values

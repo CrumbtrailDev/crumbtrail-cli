@@ -60,6 +60,13 @@ describe("redactDiagnosticFields", () => {
       enumerable: true,
       value: { polluted: "must not survive" },
     });
+    Object.assign(value, {
+      bodyText: "must not survive",
+      httpHeaders: { contentType: "must not survive" },
+      localState: { value: "must not survive" },
+      rawData: "must not survive",
+      stackTrace: "must not survive",
+    });
     let getterReads = 0;
     Object.defineProperty(value, "getter", {
       enumerable: true,
@@ -77,6 +84,11 @@ describe("redactDiagnosticFields", () => {
         "safe.*",
         "__proto__.polluted",
         "constructor.prototype.polluted",
+        "bodyText",
+        "httpHeaders.contentType",
+        "localState.value",
+        "rawData",
+        "stackTrace",
       ],
     });
 
@@ -105,17 +117,26 @@ describe("redactDiagnosticFields", () => {
     const result = redactDiagnosticFields(
       {
         safe: "upstream failed",
+        url: "https://example.test/callback?token=short-secret",
         email: "person@example.com",
         neutral: `Bearer ${JWT}`,
         cardish: "4111111111111111",
         password: "hunter2",
       },
       {
-        diagnosticFields: ["safe", "email", "neutral", "cardish", "password"],
+        diagnosticFields: [
+          "safe",
+          "url",
+          "email",
+          "neutral",
+          "cardish",
+          "password",
+        ],
       },
     );
 
-    expect(result.value).toEqual({ safe: "upstream failed" });
+    expect(result.value).toMatchObject({ safe: "upstream failed" });
+    expect(JSON.stringify(result.value)).not.toContain("short-secret");
     expect(result.metadata?.fields).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ path: "diagnosticFields.neutral" }),

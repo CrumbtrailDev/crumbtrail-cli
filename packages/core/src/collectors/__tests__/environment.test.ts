@@ -126,6 +126,62 @@ describe("buildEnvSnapshot redaction", () => {
     // Redaction evidence is attached.
     expect(snap.redaction).toBeDefined();
   });
+
+  it("uses diagnosticFields as a strict path allowlist for declared env maps", () => {
+    const snap = buildEnvSnapshot(
+      {
+        checkout: {
+          status: "failed",
+          message: "upstream failed",
+          ignored: "not selected",
+        },
+        attempts: [{ code: "E_TIMEOUT", secret: "do not retain" }],
+      },
+      { region: "eu", ignored: true },
+      {
+        diagnosticFields: ["checkout.status", "attempts[0].code", "region"],
+      },
+    );
+
+    expect(snap.flags).toEqual({
+      attempts: [{ code: "E_TIMEOUT" }],
+      checkout: { status: "failed" },
+    });
+    expect(snap.config).toEqual({ region: "eu" });
+    expect(JSON.stringify(snap)).not.toContain("not selected");
+  });
+
+  it("does not let keepFields or full body mode widen diagnostic env paths", () => {
+    const localBus = new EventBus();
+    const events: BugEvent[] = [];
+    localBus.subscribe((batch) => events.push(...batch));
+    const cleanup = environmentCollector(
+      localBus,
+      {
+        ...DEFAULT_CONFIG,
+        redaction: {
+          mode: "full",
+          keepFields: ["keptButUnselected"],
+          diagnosticFields: ["selected"],
+        },
+      },
+      ctx({
+        getDeclaredEnv: () => ({
+          flags: {
+            selected: "upstream failed",
+            keptButUnselected: "do not retain",
+          },
+        }),
+      }),
+    );
+    localBus.flush();
+    cleanup();
+    localBus.stop();
+
+    const snap = events[0].d as unknown as EnvSnapshot;
+    expect(snap.flags).toEqual({ selected: "upstream failed" });
+    expect(snap.flags).not.toHaveProperty("keptButUnselected");
+  });
 });
 
 describe("buildEnvDelta", () => {
