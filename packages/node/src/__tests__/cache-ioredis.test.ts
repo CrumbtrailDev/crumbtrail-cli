@@ -292,9 +292,8 @@ describe("instrumentIoredisClient", () => {
     expect(JSON.stringify(events)).not.toContain("secret:key");
   });
 
-  it("keeps ioredis pipeline:false QUEUED replies out of command evidence", async () => {
+  it("keeps root ioredis pipeline:false QUEUED replies out of command evidence", async () => {
     const events: BugEvent[] = [];
-    const queued = Promise.resolve("QUEUED");
     const tuples: unknown[] = [
       [null, "OK"],
       [new Error("private transaction failure"), null],
@@ -303,29 +302,27 @@ describe("instrumentIoredisClient", () => {
       {
         multi(options?: unknown) {
           expect(options).toEqual({ pipeline: false });
-          const batch = {
-            set(_key: string, _value: string) {
-              return queued;
-            },
-            get(_key: string) {
-              return queued;
-            },
-            exec: async () => tuples,
-          };
-          return batch;
+          return Promise.resolve("OK");
         },
+        set(_key: string, _value: string) {
+          return Promise.resolve("QUEUED");
+        },
+        get(_key: string) {
+          return Promise.resolve("QUEUED");
+        },
+        exec: async () => tuples,
       },
       { emit: (event) => events.push(event), requestId: "req_ioredis_queued" },
     );
 
-    const transaction = client.multi({ pipeline: false });
-    await expect(transaction.set("cart:123", "private value")).resolves.toBe(
+    await expect(client.multi({ pipeline: false })).resolves.toBe("OK");
+    await expect(client.set("cart:123", "private value")).resolves.toBe(
       "QUEUED",
     );
-    await expect(transaction.get("cart:123")).resolves.toBe("QUEUED");
+    await expect(client.get("cart:123")).resolves.toBe("QUEUED");
     expect(events).toHaveLength(0);
 
-    const result = await transaction.exec();
+    const result = await client.exec();
     expect(result).toBe(tuples);
     expect(events).toHaveLength(1);
     expect(events[0]?.d).toMatchObject({
@@ -339,6 +336,154 @@ describe("instrumentIoredisClient", () => {
     });
     expect(JSON.stringify(events)).not.toContain("private value");
     expect(JSON.stringify(events)).not.toContain("private transaction failure");
+
+    await expect(client.get("cart:after-transaction")).resolves.toBe("QUEUED");
+    expect(events[1]?.d).toMatchObject({ op: "get", hit: true });
+  });
+
+  it("clears root ioredis pipeline:false state after multi rejection", async () => {
+    const events: BugEvent[] = [];
+    const startFailure = new Error("MULTI failure token=multi-secret");
+    const client = instrumentIoredisClient(
+      {
+        multi(_options?: unknown) {
+          return Promise.reject(startFailure);
+        },
+        get(_key: string) {
+          return Promise.resolve("public value");
+        },
+      },
+      {
+        emit: (event) => events.push(event),
+        requestId: "req_ioredis_start_error",
+      },
+    );
+
+    await expect(client.multi({ pipeline: false })).rejects.toBe(startFailure);
+    await expect(client.get("cart:123")).resolves.toBe("public value");
+
+    expect(events).toHaveLength(2);
+    expect(events[0]?.d).toMatchObject({
+      op: "transaction",
+      outcome: "failure",
+    });
+    expect(events[1]?.d).toMatchObject({ op: "get", hit: true });
+    expect(JSON.stringify(events)).not.toContain("multi-secret");
+  });
+
+  it("clears root ioredis pipeline:false state after exec rejection", async () => {
+    const events: BugEvent[] = [];
+    const execFailure = new Error("EXEC failure token=exec-secret");
+    const client = instrumentIoredisClient(
+      {
+        multi(_options?: unknown) {
+          return Promise.resolve("OK");
+        },
+        set(_key: string, _value: string) {
+          return Promise.resolve("QUEUED");
+        },
+        exec() {
+          return Promise.reject(execFailure);
+        },
+        get(_key: string) {
+          return Promise.resolve("public value");
+        },
+      },
+      {
+        emit: (event) => events.push(event),
+        requestId: "req_ioredis_exec_error",
+      },
+    );
+
+    await client.multi({ pipeline: false });
+    await expect(client.set("cart:123", "private value")).resolves.toBe(
+      "QUEUED",
+    );
+    await expect(client.exec()).rejects.toBe(execFailure);
+    await expect(client.get("cart:123")).resolves.toBe("public value");
+
+    expect(events).toHaveLength(2);
+    expect(events[0]?.d).toMatchObject({
+      op: "transaction",
+      outcome: "failure",
+      summary: { operationCount: 1, operations: ["set"] },
+    });
+    expect(events[1]?.d).toMatchObject({ op: "get", hit: true });
+    expect(JSON.stringify(events)).not.toContain("exec-secret");
+  });
+
+  it("clears root ioredis pipeline:false state after an exec abort", async () => {
+    const events: BugEvent[] = [];
+    const client = instrumentIoredisClient(
+      {
+        multi(_options?: unknown) {
+          return Promise.resolve("OK");
+        },
+        get(_key: string) {
+          return Promise.resolve("QUEUED");
+        },
+        exec() {
+          return Promise.resolve(null);
+        },
+      },
+      {
+        emit: (event) => events.push(event),
+        requestId: "req_ioredis_abort_cleanup",
+      },
+    );
+
+    await client.multi({ pipeline: false });
+    await expect(client.get("cart:123")).resolves.toBe("QUEUED");
+    await expect(client.exec()).resolves.toBeNull();
+    await expect(client.get("cart:after-abort")).resolves.toBe("QUEUED");
+
+    expect(events).toHaveLength(2);
+    expect(events[0]?.d).toMatchObject({
+      op: "transaction",
+      outcome: "aborted",
+      summary: { operationCount: 1, operations: ["get"] },
+    });
+    expect(events[1]?.d).toMatchObject({ op: "get", hit: true });
+  });
+
+  it("emits the aggregate outcome from root ioredis execBuffer", async () => {
+    const events: BugEvent[] = [];
+    const tuples: unknown[] = [
+      [new Error("buffer failure token=buffer-secret"), null],
+    ];
+    const client = instrumentIoredisClient(
+      {
+        multi(_options?: unknown) {
+          return Promise.resolve("OK");
+        },
+        getBuffer(_key: string) {
+          return Promise.resolve("QUEUED");
+        },
+        execBuffer() {
+          return Promise.resolve(tuples);
+        },
+      },
+      {
+        emit: (event) => events.push(event),
+        requestId: "req_ioredis_exec_buffer",
+      },
+    );
+
+    await client.multi({ pipeline: false });
+    await expect(client.getBuffer("blob:123")).resolves.toBe("QUEUED");
+    const result = await client.execBuffer();
+
+    expect(result).toBe(tuples);
+    expect(events[0]?.d).toMatchObject({
+      op: "transaction",
+      outcome: "failure",
+      summary: {
+        operationCount: 1,
+        operations: ["getbuffer"],
+        failureCount: 1,
+      },
+    });
+    expect(JSON.stringify(events)).not.toContain("buffer-secret");
   });
 
   it("inspects nested ioredis transaction tuples without copying results", async () => {

@@ -73,6 +73,7 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
     return client;
   }
   const wrappers = new Map<PropertyKey, unknown>();
+  let queuedTransaction: BatchCapture | undefined;
   return new Proxy(client, {
     get(target, property, receiver) {
       if (property === INSTRUMENTED) return true;
@@ -84,6 +85,28 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
       const operationName = normalizeMethod(property);
       if (operationName === "multi" || operationName === "pipeline") {
         const wrapped = (...args: unknown[]) => {
+          if (
+            driver === "ioredis" &&
+            operationName === "multi" &&
+            isQueuedIoredisTransaction(driver, operationName, args)
+          ) {
+            queuedTransaction = undefined;
+            let result: unknown;
+            try {
+              result = Reflect.apply(original, target, args);
+            } catch (error) {
+              emitQueuedTransactionFailure(driver, options, error);
+              throw error;
+            }
+            return wrapQueuedTransactionStart(
+              result,
+              driver,
+              options,
+              (capture) => {
+                queuedTransaction = capture;
+              },
+            );
+          }
           const result = Reflect.apply(original, target, args);
           return wrapBatchResult(
             result,
@@ -91,18 +114,52 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
             operationName === "multi" ? "transaction" : "pipeline",
             options,
             constructorBatchCommands(args),
-            isQueuedIoredisTransaction(driver, operationName, args),
           );
         };
         wrappers.set(property, wrapped);
         return wrapped;
       }
       if (!SUPPORTED_OPERATIONS.has(operationName)) {
-        const bound = original.bind(target);
-        wrappers.set(property, bound);
-        return bound;
+        const wrapped = (...args: unknown[]) => {
+          const transaction = queuedTransaction;
+          if (transaction) {
+            if (BATCH_EXECUTION_OPERATIONS.has(operationName)) {
+              let execution: unknown;
+              try {
+                execution = Reflect.apply(original, target, args);
+              } catch (error) {
+                queuedTransaction = undefined;
+                emitQueuedTransactionFailure(driver, options, error);
+                throw error;
+              }
+              return wrapQueuedTransactionExecution(
+                execution,
+                driver,
+                options,
+                transaction,
+                () => {
+                  if (queuedTransaction === transaction) {
+                    queuedTransaction = undefined;
+                  }
+                },
+              );
+            }
+            const commandResult = Reflect.apply(original, target, args);
+            recordBatchOperation(transaction, operationName, args);
+            return commandResult;
+          }
+          return Reflect.apply(original, target, args);
+        };
+        wrappers.set(property, wrapped);
+        return wrapped;
       }
       const wrapped = (...args: unknown[]) => {
+        const transaction = queuedTransaction;
+        if (transaction) {
+          const commandResult = Reflect.apply(original, target, args);
+          recordBatchOperation(transaction, operationName, args);
+          return commandResult;
+        }
         const result = Reflect.apply(original, target, args);
         let requestId: string | undefined;
         let capture: OperationCapture | undefined;
@@ -233,6 +290,98 @@ function wrapBatchResult(
     initialCommands,
     queuedTransaction,
   );
+}
+
+function wrapQueuedTransactionStart(
+  result: unknown,
+  driver: CacheDriver,
+  options: InstrumentCacheClientOptions,
+  activate: (capture: BatchCapture) => void,
+): unknown {
+  const capture: BatchCapture = {
+    mode: "transaction",
+    queuedTransaction: true,
+    operationCount: 0,
+    operations: [],
+    keys: [],
+  };
+  if (!isThenable(result)) {
+    if (result === "OK") activate(capture);
+    return result;
+  }
+  return result.then(
+    (resolved: unknown) => {
+      if (resolved === "OK") activate(capture);
+      return resolved;
+    },
+    (error: unknown) => {
+      emitQueuedTransactionFailure(driver, options, error);
+      throw error;
+    },
+  );
+}
+
+function wrapQueuedTransactionExecution(
+  result: unknown,
+  driver: CacheDriver,
+  options: InstrumentCacheClientOptions,
+  capture: BatchCapture,
+  clear: () => void,
+): unknown {
+  const requestId = resolveRequestId(options);
+  const complete = (resolved: unknown): unknown => {
+    clear();
+    if (!requestId) return resolved;
+    const inspection = inspectBatchResult(driver, resolved);
+    emitSafely(options, {
+      driver,
+      op: capture.mode,
+      keys: capture.keys,
+      requestId,
+      ...(inspection.aborted
+        ? { outcome: "aborted" as const }
+        : inspection.failureCount > 0
+          ? { outcome: "failure" as const }
+          : {}),
+      summary: batchSummary(capture, inspection),
+    });
+    return resolved;
+  };
+  const fail = (error: unknown): never => {
+    clear();
+    if (requestId) {
+      emitSafely(options, {
+        driver,
+        op: capture.mode,
+        keys: capture.keys,
+        requestId,
+        outcome: "failure",
+        error,
+        summary: batchSummary(capture),
+      });
+    }
+    throw error;
+  };
+  if (isThenable(result)) return result.then(complete, fail);
+  return complete(result);
+}
+
+function emitQueuedTransactionFailure(
+  driver: CacheDriver,
+  options: InstrumentCacheClientOptions,
+  error: unknown,
+): void {
+  const requestId = resolveRequestId(options);
+  if (!requestId) return;
+  emitSafely(options, {
+    driver,
+    op: "transaction",
+    keys: [],
+    requestId,
+    outcome: "failure",
+    error,
+    summary: emptyBatchSummary(),
+  });
 }
 
 function wrapBatch(
