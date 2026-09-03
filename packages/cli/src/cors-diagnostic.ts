@@ -1,12 +1,10 @@
-import { CORRELATION_REQUEST_HEADERS } from "./inject/text";
-
 export const CORS_DIAGNOSTIC_TIMEOUT_MS = 5_000;
 export const CORS_REQUEST_METHOD = "POST";
 export const CORS_REQUIRED_HEADERS = [
-  ...CORRELATION_REQUEST_HEADERS,
-  "authorization",
+  "content-type",
   "x-crumbtrail-auth",
 ] as const;
+export const CORS_REQUEST_CREDENTIALS: RequestCredentials = "same-origin";
 
 export type CorsDiagnosticStatus = "pass" | "fail" | "unknown" | "not-applicable";
 export type CorsNetworkCategory =
@@ -40,7 +38,7 @@ export interface CorsDiagnosticOptions {
 }
 
 const nextStep =
-  "Configure the endpoint's CORS middleware to allow this origin, POST, and the listed headers. Do not use a wildcard for credentialed requests.";
+  "Configure the endpoint's CORS middleware to allow this origin, POST, and the listed headers.";
 
 function statusClass(status: number): string {
   return `${Math.floor(status / 100)}xx`;
@@ -100,6 +98,7 @@ export async function diagnoseCors(
     const response = await (opts.fetchImpl ?? fetch)(opts.endpoint, {
       method: "OPTIONS",
       redirect: "manual",
+      credentials: CORS_REQUEST_CREDENTIALS,
       signal: controller.signal,
       headers: {
         Origin: opts.origin,
@@ -122,14 +121,18 @@ export async function diagnoseCors(
       };
     }
     const allowedOrigin = response.headers.get("access-control-allow-origin");
-    const allowsOrigin = allowedOrigin === opts.origin;
+    const credentialed = CORS_REQUEST_CREDENTIALS === "include";
+    const allowsOrigin =
+      allowedOrigin === opts.origin || (allowedOrigin === "*" && !credentialed);
     const methods = headerValues(response, "access-control-allow-methods");
     const headers = headerValues(response, "access-control-allow-headers");
-    const credentialed = response.headers.get("access-control-allow-credentials")?.toLowerCase() === "true";
+    const allowsCredentials =
+      !credentialed ||
+      response.headers.get("access-control-allow-credentials")?.toLowerCase() === "true";
     const missingHeaders = CORS_REQUIRED_HEADERS.filter((header) => !headers.includes(header));
     const missingMethod = methods.includes(CORS_REQUEST_METHOD.toLowerCase()) ? undefined : CORS_REQUEST_METHOD;
     const validStatus = response.status >= 200 && response.status < 300;
-    if (validStatus && allowsOrigin && credentialed && !missingMethod && missingHeaders.length === 0) {
+    if (validStatus && allowsOrigin && allowsCredentials && !missingMethod && missingHeaders.length === 0) {
       return {
         status: "pass", endpoint: opts.endpoint, origin: opts.origin, category: "http",
         responseStatus: response.status, missingHeaders: [],
@@ -138,8 +141,8 @@ export async function diagnoseCors(
     }
     const failures = [
       !validStatus ? `response ${statusClass(response.status)} (HTTP ${response.status})` : "",
-      !allowsOrigin ? `origin ${opts.origin} is not explicitly allowed` : "",
-      !credentialed ? "credentialed requests are not allowed" : "",
+      !allowsOrigin ? `origin ${opts.origin} is not allowed` : "",
+      !allowsCredentials ? "credentialed requests are not allowed" : "",
       missingMethod ? `missing allowed method ${missingMethod}` : "",
       missingHeaders.length ? `missing allowed headers ${missingHeaders.join(", ")}` : "",
     ].filter(Boolean);
