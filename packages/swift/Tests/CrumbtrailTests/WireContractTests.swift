@@ -158,6 +158,20 @@ final class WireContractTests: XCTestCase {
         )
     }
 
+    func testNativeHangEvent() throws {
+        try assertMatches(
+            event(.nativeHang, [
+                "source": "main-thread",
+                "thresholdMs": 5000,
+                "observedDurationMs": 7420,
+                "recovered": false,
+                "previousLaunch": true,
+                "stk": "CrumbtrailDemo.CheckoutViewController.submit()\nCrumbtrailDemo.CheckoutViewController.tap()",
+            ]),
+            fixture: "native-hang"
+        )
+    }
+
     func testViewSnapshotEvent() throws {
         try assertMatches(
             event(.viewSnapshot, [

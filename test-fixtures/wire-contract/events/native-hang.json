@@ -1,0 +1,19 @@
+{
+  "t": 1754000000000,
+  "k": "native-hang",
+  "d": {
+    "source": "main-thread",
+    "thresholdMs": 5000,
+    "observedDurationMs": 7420,
+    "recovered": false,
+    "previousLaunch": true,
+    "stk": "CrumbtrailDemo.CheckoutViewController.submit()\nCrumbtrailDemo.CheckoutViewController.tap()"
+  },
+  "schemaVersion": 1,
+  "platform": "ios",
+  "sdk": {
+    "name": "crumbtrail-fixture",
+    "version": "0.0.0-fixture"
+  },
+  "capabilities": ["app-lifecycle", "device-info"]
+}

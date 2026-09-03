@@ -97,6 +97,7 @@ public enum CrumbtrailEventKind: Equatable, Sendable {
     case navigationIntent
     case appLifecycle
     case nativeCrash
+    case nativeHang
     case viewSnapshot
     case other(String)
 
@@ -112,6 +113,7 @@ public enum CrumbtrailEventKind: Equatable, Sendable {
         case .navigationIntent: return "nav-intent"
         case .appLifecycle: return "app-lifecycle"
         case .nativeCrash: return "native-crash"
+        case .nativeHang: return "native-hang"
         case .viewSnapshot: return "view-snapshot"
         case .other(let raw): return raw
         }

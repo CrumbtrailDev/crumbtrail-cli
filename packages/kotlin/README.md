@@ -63,6 +63,7 @@ in an app.
 | Event | Source |
 | --- | --- |
 | `native-crash` | An uncaught exception, delivered on the next launch |
+| `native-hang` | Shared wire contract for future watchdog observations. This package does not emit it yet |
 | `err` | Errors you report with `recordError` |
 | `net` | HTTP requests you report with `recordRequest` |
 | `app-lifecycle` | Foreground and background transitions |

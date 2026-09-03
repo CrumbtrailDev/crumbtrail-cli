@@ -223,6 +223,25 @@ class WireContractTest {
     )
 
     @Test
+    fun `native hang event`() = assertMatchesFixture(
+        event(
+            CrumbtrailEventKind.NATIVE_HANG,
+            JsonValue.of(
+                "source" to JsonValue.Str("main-thread"),
+                "thresholdMs" to JsonValue.Num(5000),
+                "observedDurationMs" to JsonValue.Num(7420),
+                "recovered" to JsonValue.Bool(false),
+                "previousLaunch" to JsonValue.Bool(true),
+                "stk" to JsonValue.Str(
+                    "CrumbtrailDemo.CheckoutViewController.submit()\n" +
+                        "CrumbtrailDemo.CheckoutViewController.tap()"
+                ),
+            ),
+        ),
+        "native-hang",
+    )
+
+    @Test
     fun `view snapshot event`() = assertMatchesFixture(
         event(
             CrumbtrailEventKind.VIEW_SNAPSHOT,

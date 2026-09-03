@@ -6,6 +6,7 @@ export const CRUMBTRAIL_EVENT_KINDS = {
   navigation: "navigation",
   appLifecycle: "app-lifecycle",
   nativeCrash: "native-crash",
+  nativeHang: "native-hang",
   viewSnapshot: "view-snapshot",
 } as const;
 
@@ -93,6 +94,80 @@ export interface BugEvent {
   sessionId?: string;
   /** Milliseconds elapsed from the active recording session's canonical startedAt timestamp. */
   offsetMs?: number;
+}
+
+/** The runtime that detected a native hang. */
+export type NativeHangSource = "main-thread" | "js" | "dart";
+
+/**
+ * Type-specific payload (`d`) of a `k:'native-hang'` event.
+ *
+ * The required fields are deliberately scalar and bounded. `previousLaunch`
+ * distinguishes a hang imported from a prior process launch from one observed
+ * while the process was still alive. `stk` reuses the existing native crash
+ * stack spelling and is optional because a watchdog may not be able to obtain
+ * a safe stack at the point it notices the stall.
+ */
+export interface NativeHangEventData {
+  source: NativeHangSource;
+  thresholdMs: number;
+  observedDurationMs: number;
+  recovered: boolean;
+  previousLaunch: boolean;
+  /** Optional bounded stack in the existing `stk` event shape. */
+  stk?: string;
+}
+
+/** Maximum duration accepted for native hang timing fields. */
+export const NATIVE_HANG_MAX_DURATION_MS = 86_400_000 as const;
+
+/** Maximum characters accepted for an optional native hang stack. */
+export const NATIVE_HANG_MAX_STACK_CHARS = 8_192 as const;
+
+/** Maximum newline-delimited frames accepted for an optional native hang stack. */
+export const NATIVE_HANG_MAX_STACK_FRAMES = 64 as const;
+
+/** Canonical event kind for a native hang (`k:'native-hang'`). */
+export const NATIVE_HANG_EVENT_KIND = "native-hang" as const;
+
+/**
+ * Runtime validation for native hang payloads received from a native bridge.
+ * Unknown keys are ignored so a newer SDK can add fields without making an
+ * older core reject the event. Required fields and bounds stay closed.
+ */
+export function isNativeHangEventData(
+  value: unknown,
+): value is NativeHangEventData {
+  if (!isRecord(value)) return false;
+  if (
+    value.source !== "main-thread" &&
+    value.source !== "js" &&
+    value.source !== "dart"
+  ) {
+    return false;
+  }
+  if (!isNativeHangDuration(value.thresholdMs)) return false;
+  if (!isNativeHangDuration(value.observedDurationMs)) return false;
+  if (typeof value.recovered !== "boolean") return false;
+  if (typeof value.previousLaunch !== "boolean") return false;
+  if (value.stk === undefined) return true;
+  if (typeof value.stk !== "string") return false;
+  if (value.stk.length === 0) return false;
+  if (value.stk.length > NATIVE_HANG_MAX_STACK_CHARS) return false;
+  return value.stk.split("\n").length <= NATIVE_HANG_MAX_STACK_FRAMES;
+}
+
+function isNativeHangDuration(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= NATIVE_HANG_MAX_DURATION_MS
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export interface BugReport {

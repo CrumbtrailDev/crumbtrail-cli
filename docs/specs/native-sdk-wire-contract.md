@@ -121,6 +121,7 @@ outside this list gets no cross platform treatment on the ingest side.
 | `nav-intent` | A navigation the user asked for | `action`, `source` |
 | `app-lifecycle` | Foreground/background transitions | `state`, `source`, `kind` |
 | `native-crash` | A native crash captured on next launch | `msg`, `stk`, `signal`, `thread`, `at`, `source` |
+| `native-hang` | A bounded watchdog or previous-launch hang observation | `source`, `thresholdMs`, `observedDurationMs`, `recovered`, `previousLaunch`, `stk` |
 | `view-snapshot` | A view tree snapshot | `nodes`, `w`, `h` |
 
 `err` carries `fatal: true` only for a failure that actually terminated the
@@ -131,6 +132,22 @@ envelope `t` is the relaunch, not the crash. `at` carries the Unix milliseconds
 the crash was actually recorded, and `source` names where it came from
 (`previous-launch`). Both are optional: an SDK that cannot know the crash time
 omits `at` rather than reporting the relaunch as the crash.
+
+`native-hang` is the shared contract for platform watchdogs and previous-launch
+hang imports. Its required payload is:
+
+| Key                  | Type    | Bounds                                                            | Meaning                                                          |
+| -------------------- | ------- | ----------------------------------------------------------------- | ---------------------------------------------------------------- |
+| `source`             | string  | `main-thread`, `js` or `dart`                                     | Runtime that detected the stall                                  |
+| `thresholdMs`        | integer | `0..86400000`                                                     | Watchdog threshold that was crossed                              |
+| `observedDurationMs` | integer | `0..86400000`                                                     | Duration observed by the detector                                |
+| `recovered`          | boolean | —                                                                 | Whether the stalled runtime resumed before the event was emitted |
+| `previousLaunch`     | boolean | —                                                                 | Whether the event was imported from an earlier process launch    |
+| `stk`                | string  | optional, at most 8192 characters and 64 newline separated frames | Existing bounded stack spelling, when a safe stack is available  |
+
+The event is additive and does not change the meaning of `app-lifecycle`.
+Memory pressure and process termination remain `app-lifecycle` observations.
+This contract does not claim that any current native SDK emits `native-hang`.
 
 `err` also allows `componentStk`, the framework component path a render crash
 happened inside. It is emitted by the React and React Native error boundaries

@@ -192,6 +192,21 @@ void main() {
     );
   });
 
+  test('native hang event', () {
+    expectMatchesFixture(
+      event(CrumbtrailEventKind.nativeHang, {
+        'source': 'main-thread',
+        'thresholdMs': 5000,
+        'observedDurationMs': 7420,
+        'recovered': false,
+        'previousLaunch': true,
+        'stk': 'CrumbtrailDemo.CheckoutViewController.submit()\n'
+            'CrumbtrailDemo.CheckoutViewController.tap()',
+      }),
+      'native-hang',
+    );
+  });
+
   test('view snapshot event', () {
     expectMatchesFixture(
       event(CrumbtrailEventKind.viewSnapshot, {
