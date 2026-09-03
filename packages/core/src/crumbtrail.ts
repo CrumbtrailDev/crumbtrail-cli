@@ -105,6 +105,12 @@ import {
   type ApplicationReleaseIdentity,
 } from "./release-identity";
 import { renderedErrorCollector } from "./collectors/rendered-error";
+import {
+  generateReportScreenshotArtifactName,
+  isReportScreenshotArtifactName,
+  prepareReportScreenshot,
+  type CaptureScreenshotOptions,
+} from "./screenshot";
 
 /** Cap on delivery-failure gap records per session. */
 const MAX_DELIVERY_GAP_EVENTS = 3;
@@ -257,6 +263,7 @@ const REMOTE_CONFIG_KEYS = [
   "baselineSampleRate",
   "flightRecorder",
   "flightRecorderTailMs",
+  "reportScreenshotsEnabled",
   "autoFlagOnError",
   "autoFlagOnUncaughtError",
   "autoFlagOnUnhandledRejection",
@@ -386,6 +393,13 @@ const SEVERITY_FLUSH_MIN_INTERVAL_MS = 1000;
 const PAGE_HIDDEN_END_DELAY_MS = 0;
 
 /**
+ * A nonpersisted pagehide cannot keep a browser alive for an arbitrary upload. Give already
+ * admitted sends a short chance to finish, then leave the session open for the server's TTL
+ * rather than ending it ahead of evidence that may still be on the wire.
+ */
+export const PAGEHIDE_PENDING_SEND_TIMEOUT_MS = 5_000;
+
+/**
  * Transport that drops every call. Backs the inert instance returned when
  * `init()` runs outside a browser, guaranteeing no socket is opened during SSR
  * or a build step.
@@ -464,6 +478,8 @@ export class Crumbtrail {
   private storageFailureSyncs = new Set<() => void>();
   private sessionId: string;
   private widgetCleanup?: () => void;
+  /** Names uploaded by this live session and therefore eligible for association. */
+  private visualArtifactNames = new Set<string>();
   private stateProviders = new Map<string, () => unknown>();
   private declaredFlags: Record<string, unknown> = {};
   private declaredConfig: Record<string, unknown> = {};
@@ -512,6 +528,10 @@ export class Crumbtrail {
    */
   private pendingSends = new Set<Promise<void>>();
   private sessionMetadataWrite: Promise<void> = Promise.resolve();
+  /** Resolves true only when the current session's start request was admitted. */
+  private sessionAdmission: Promise<boolean> = Promise.resolve(true);
+  /** Refuses new explicit screenshot uploads once direct shutdown starts. */
+  private screenshotClosing = false;
   private stopped = false;
   private stopPromise?: Promise<{ sessionId: string }>;
   private identity: CrumbtrailIdentity = {};
@@ -519,6 +539,12 @@ export class Crumbtrail {
   private sessionStore?: SessionStore;
   private lifecycleTimer?: ReturnType<typeof setTimeout>;
   private lifecycleClosePromise?: Promise<void>;
+  private lifecycleCloseState?: {
+    immediateEnd: boolean;
+    deadline?: number;
+    escalationPromise?: Promise<void>;
+    escalate?: () => void;
+  };
   private lifecycleClosing = false;
   private lifecycleSuspended = false;
   private lifecycleEndPromise?: Promise<void>;
@@ -769,9 +795,8 @@ export class Crumbtrail {
           bus.flush();
           return;
         }
-        // Start the keepalive end request before the unload task can be
-        // discarded. The orderly path used for a page that is merely hidden
-        // can await its event sends; a real navigation or tab close cannot.
+        // Defer the keepalive end request until already admitted sends settle. A real navigation
+        // may terminate this task first, in which case the server's session TTL finalizes it.
         void instance.closeForLifecycle(true);
       };
       const onPageShow = (event: Event & { persisted?: boolean }) => {
@@ -873,6 +898,57 @@ export class Crumbtrail {
     return { bugId };
   }
 
+  /**
+   * Upload one user supplied PNG artifact for the active session.
+   *
+   * This method accepts an already available Blob or an application owned
+   * canvas. It never requests display media and never captures on its own.
+   * The generated name is the only path the caller can associate with a bug.
+   */
+  async captureScreenshot(
+    source: Blob | HTMLCanvasElement,
+    options?: CaptureScreenshotOptions,
+  ): Promise<{ artifactName: string }> {
+    if (!this.sessionStarted || !this.canTransport() || this.screenshotClosing)
+      throw new Error("captureScreenshot requires an active session");
+    if (!this.config.reportScreenshotsEnabled)
+      throw new Error("captureScreenshot is not enabled by the project policy");
+
+    // Bind the complete operation to the session that admitted it. Register the pending promise
+    // before the first await so stop() and lifecycle rollover cannot finalize the session while
+    // this upload is still in flight.
+    const capturedSessionId = this.sessionId;
+    const upload = (async () => {
+      const admitted = await this.sessionAdmission;
+      if (!admitted || !this.isScreenshotSessionActive(capturedSessionId))
+        throw new Error("captureScreenshot requires an active session");
+
+      const blob = await prepareReportScreenshot(source, options);
+      if (!this.isScreenshotSessionActive(capturedSessionId))
+        throw new Error("captureScreenshot requires an active session");
+      const artifactName = generateReportScreenshotArtifactName();
+      await this.transport.sendBlob(
+        artifactName,
+        blob,
+        undefined,
+        capturedSessionId,
+      );
+      // A custom transport may not enforce the optional session binding itself. Never make an
+      // artifact eligible for association after the SDK observes a rollover or shutdown.
+      if (!this.isScreenshotSessionActive(capturedSessionId))
+        throw new Error("captureScreenshot requires an active session");
+      this.visualArtifactNames.add(artifactName);
+      return { artifactName };
+    })();
+    const pending = upload.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.pendingSends.add(pending);
+    void pending.then(() => this.pendingSends.delete(pending));
+    return upload;
+  }
+
   private async flagBugFromSource(
     options: InternalFlagOptions | undefined,
     isExplicitBeacon: boolean,
@@ -921,6 +997,12 @@ export class Crumbtrail {
     const reason =
       origin === "auto" && typeof options?.autoReason === "string"
         ? options.autoReason
+        : undefined;
+    const visualArtifactName =
+      typeof options?.visualArtifactName === "string" &&
+      isReportScreenshotArtifactName(options.visualArtifactName) &&
+      this.visualArtifactNames.has(options.visualArtifactName)
+        ? options.visualArtifactName
         : undefined;
 
     // Resolved flag/config state at flag time. The session-start snapshot plus deltas answers
@@ -1060,6 +1142,7 @@ export class Crumbtrail {
           origin,
           ...(note !== undefined ? { note } : {}),
           ...(reason !== undefined ? { reason } : {}),
+          ...(visualArtifactName !== undefined ? { visualArtifactName } : {}),
         },
       },
       { bypassAdmission: finalizerOriginated },
@@ -1700,30 +1783,50 @@ export class Crumbtrail {
   }
 
   private startSessionWithCurrentIdentity(): void {
-    this.sessionMetadataWrite = this.sendSessionMetadata();
+    const sessionId = this.sessionId;
+    const attempt = this.sendSessionMetadata(sessionId);
+    this.sessionAdmission = attempt.then(
+      () => this.sessionId === sessionId,
+      () => false,
+    );
+    this.sessionMetadataWrite = attempt.catch(() => {});
   }
 
   private refreshSessionIdentity(): void {
-    this.sessionMetadataWrite = this.sessionMetadataWrite.then(() =>
-      this.sendSessionMetadata(),
-    );
+    this.sessionMetadataWrite = this.sessionMetadataWrite.then(() => {
+      const sessionId = this.sessionId;
+      const attempt = this.sendSessionMetadata(sessionId);
+      this.sessionAdmission = attempt.then(
+        () => this.sessionId === sessionId,
+        () => false,
+      );
+      return attempt.catch(() => {});
+    });
   }
 
-  private sendSessionMetadata(): Promise<void> {
+  private sendSessionMetadata(sessionId: string): Promise<void> {
     try {
-      return this.transport
-        .startSession(this.sessionId, {
+      return Promise.resolve(
+        this.transport.startSession(sessionId, {
           url: currentPageUrl(),
           ua: typeof navigator !== "undefined" ? navigator.userAgent : "",
           ...(this.config.service ? { service: this.config.service } : {}),
           ...this.applicationRelease,
           sdkVersion: CRUMBTRAIL_SDK_VERSION,
           ...this.identity,
-        })
-        .catch(() => {});
+        }),
+      );
     } catch {
-      return Promise.resolve();
+      return Promise.reject(new Error("session start failed"));
     }
+  }
+
+  private isScreenshotSessionActive(sessionId: string): boolean {
+    return (
+      this.sessionStarted &&
+      this.sessionId === sessionId &&
+      this.canTransport()
+    );
   }
 
   /** Schedule a close for a page that remains hidden after lifecycle events settle. */
@@ -1758,10 +1861,26 @@ export class Crumbtrail {
    * the server cannot finalize an incomplete log.
    */
   private closeForLifecycle(immediateEnd: boolean): Promise<void> {
-    if (this.stopped || this.lifecycleSuspended || this.lifecycleClosePromise) {
-      if (immediateEnd) this.startLifecycleEnd();
+    if (this.stopped || this.lifecycleSuspended) {
       return this.lifecycleClosePromise ?? Promise.resolve();
     }
+    if (this.lifecycleClosePromise) {
+      if (immediateEnd) this.escalateLifecycleClose();
+      return this.lifecycleClosePromise;
+    }
+
+    const closeState: NonNullable<typeof this.lifecycleCloseState> = {
+      immediateEnd,
+      ...(immediateEnd
+        ? { deadline: Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS }
+        : {}),
+    };
+    if (!immediateEnd) {
+      closeState.escalationPromise = new Promise<void>((resolve) => {
+        closeState.escalate = resolve;
+      });
+    }
+    this.lifecycleCloseState = closeState;
 
     this.lifecycleClosePromise = (async () => {
       // Flush while transport admission is still open. Setting the lifecycle
@@ -1769,26 +1888,64 @@ export class Crumbtrail {
       this.bus.flush();
       this.lifecycleClosing = true;
       try {
-        if (immediateEnd) this.startLifecycleEnd();
-        await this.sessionMetadataWrite;
-        await Promise.allSettled([...this.pendingSends]);
+        const admissionSettled = await this.waitForLifecyclePhase(
+          [this.sessionMetadataWrite, this.sessionAdmission],
+          closeState,
+        );
+        if (!admissionSettled) {
+          this.abandonLifecycleSends();
+          this.lifecycleSuspended = true;
+          this.sessionStarted = false;
+          return;
+        }
+        const pendingSettled = await this.waitForLifecycleSends(closeState);
+        if (!pendingSettled) {
+          this.lifecycleSuspended = true;
+          this.sessionStarted = false;
+          return;
+        }
 
         const replay = this.replay;
         this.replay = undefined;
-        try {
-          await replay?.stop().catch(() => {});
-        } catch {
-          // A page leaving the foreground must not keep the host application
-          // alive because replay teardown failed.
+        const replaySettled = replay
+          ? await this.waitForLifecycleOperation(
+              Promise.resolve()
+                .then(() => replay.stop())
+                .catch(() => {}),
+              closeState,
+            )
+          : true;
+        if (!replaySettled) {
+          this.lifecycleSuspended = true;
+          this.sessionStarted = false;
+          return;
         }
 
         if (this.deferredDeliveryGaps.length > 0) {
           const deferred = this.deferredDeliveryGaps;
           this.deferredDeliveryGaps = [];
-          await this.transport.sendEvents(deferred).catch(() => {});
+          const deferredSettled = await this.waitForLifecycleOperation(
+            Promise.resolve()
+              .then(() => this.transport.sendEvents(deferred))
+              .catch(() => {}),
+            closeState,
+          );
+          if (!deferredSettled) {
+            this.lifecycleSuspended = true;
+            this.sessionStarted = false;
+            return;
+          }
         }
-        if (!immediateEnd) this.startLifecycleEnd();
-        await this.lifecycleEndPromise;
+        this.startLifecycleEnd();
+        const lifecycleEndSettled = await this.waitForLifecycleEnd(closeState);
+        if (!lifecycleEndSettled) {
+          this.sessionStarted = false;
+          this.lifecycleSuspended = true;
+          return;
+        }
+        // The lifecycle end finalized this session. Mark it closed before releasing the
+        // lifecycle promise so a later explicit stop cannot end the same session again.
+        this.sessionStarted = false;
         this.lifecycleSuspended = true;
       } finally {
         this.lifecycleClosing = false;
@@ -1796,8 +1953,115 @@ export class Crumbtrail {
     })().finally(() => {
       this.lifecycleClosePromise = undefined;
       this.lifecycleEndPromise = undefined;
+      this.lifecycleCloseState = undefined;
     });
     return this.lifecycleClosePromise;
+  }
+
+  /**
+   * Wait for in-flight delivery before finalizing a session. Ordinary hidden-page suspension can
+   * wait without a deadline. A nonpersisted pagehide gets a bounded wait because the page may be
+   * torn down at any moment, and a late end request is worse than letting the server TTL reclaim
+   * a session whose last upload did not finish.
+   */
+  private async waitForLifecycleSends(
+    closeState: NonNullable<typeof this.lifecycleCloseState>,
+  ): Promise<boolean> {
+    const pending = [...this.pendingSends];
+    if (pending.length === 0) return true;
+    const settled = Promise.allSettled(pending).then(() => true);
+    const completed = await this.waitForLifecyclePhase(
+      pending,
+      closeState,
+      settled,
+    );
+    if (!completed) this.abandonLifecycleSends(pending);
+    return completed;
+  }
+
+  /**
+   * Wait for one lifecycle phase under its close deadline. An ordinary hidden-page close waits
+   * indefinitely until an explicit stop or nonpersisted pagehide escalates it to the bounded path.
+   */
+  private async waitForLifecyclePhase(
+    promises: readonly Promise<unknown>[],
+    closeState: NonNullable<typeof this.lifecycleCloseState>,
+    settled = Promise.allSettled(promises).then(() => true),
+  ): Promise<boolean> {
+    if (promises.length === 0) return true;
+    if (!closeState.immediateEnd) {
+      const escalated = closeState.escalationPromise?.then(() => false);
+      if (escalated) {
+        const completed = await Promise.race([settled, escalated]);
+        if (completed) return true;
+      } else {
+        await settled;
+        return true;
+      }
+    }
+    return this.waitUntilLifecycleDeadline(settled, closeState.deadline);
+  }
+
+  /** Wait for lifecycle end, applying a deadline once an explicit close is requested. */
+  private async waitForLifecycleEnd(
+    closeState: NonNullable<typeof this.lifecycleCloseState>,
+  ): Promise<boolean> {
+    if (!this.lifecycleEndPromise) return true;
+    return this.waitForLifecycleOperation(this.lifecycleEndPromise, closeState);
+  }
+
+  private async waitForLifecycleOperation(
+    operation: Promise<unknown>,
+    closeState: NonNullable<typeof this.lifecycleCloseState>,
+  ): Promise<boolean> {
+    const settled = operation.then(
+      () => true,
+      () => true,
+    );
+    if (!closeState.immediateEnd) {
+      const escalated = closeState.escalationPromise?.then(() => false);
+      if (escalated) {
+        const completed = await Promise.race([settled, escalated]);
+        if (completed) return true;
+      } else {
+        await settled;
+        return true;
+      }
+    }
+    return this.waitUntilLifecycleDeadline(settled, closeState.deadline);
+  }
+
+  private async waitUntilLifecycleDeadline(
+    settled: Promise<boolean>,
+    deadline = Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
+  ): Promise<boolean> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const completed = await Promise.race([
+      settled,
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), remaining);
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    return completed;
+  }
+
+  private abandonLifecycleSends(
+    pending = [...this.pendingSends],
+  ): void {
+    // Do not let a transport that never settles keep a later explicit stop() hostage. The page
+    // is already closing and the server can finalize this still-open session by TTL.
+    for (const send of pending) this.pendingSends.delete(send);
+  }
+
+  private escalateLifecycleClose(): void {
+    const closeState = this.lifecycleCloseState;
+    if (!closeState || closeState.immediateEnd) return;
+    closeState.immediateEnd = true;
+    closeState.deadline = Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS;
+    closeState.escalate?.();
   }
 
   /** Start the unload safe close without waiting for async teardown work. */
@@ -1825,8 +2089,10 @@ export class Crumbtrail {
     this.sessionId = generateSessionId();
     if (this.sessionStore)
       writePersistedSession(this.sessionStore, this.sessionId);
+    this.visualArtifactNames.clear();
     this.sessionStarted = false;
     this.lifecycleSuspended = false;
+    this.sessionAdmission = Promise.resolve(false);
     this.sessionMetadataWrite = Promise.resolve();
     this.startSessionIfAllowed();
     return this.sessionMetadataWrite;
@@ -1907,12 +2173,29 @@ export class Crumbtrail {
       replaySupported();
     if (shouldRecord) {
       if (this.replay) return;
+      const replaySessionId = this.sessionId;
       this.replay = new ReplayRecorder({
-        sessionId: this.sessionId,
+        sessionId: replaySessionId,
         masking: this.replayMasking,
         ...this.applicationRelease,
         sdkVersion: CRUMBTRAIL_SDK_VERSION,
-        send: (name, body) => this.transport.sendBlob(name, body),
+        send: (name, body) => {
+          const sendBlob = this.transport.sendBlob as (
+            name: string,
+            blob: Blob,
+            metadata?: Record<string, unknown>,
+            sessionId?: string,
+            allowPreviousSession?: boolean,
+          ) => Promise<void>;
+          return sendBlob.call(
+            this.transport,
+            name,
+            body,
+            undefined,
+            replaySessionId,
+            true,
+          );
+        },
       });
       this.replay.start();
       return;
@@ -2219,6 +2502,7 @@ export class Crumbtrail {
 
   stop(): Promise<{ sessionId: string }> {
     if (this.stopPromise) return this.stopPromise;
+    this.screenshotClosing = true;
     this.stopPromise = this.stopInternal();
     return this.stopPromise;
   }
@@ -2238,11 +2522,29 @@ export class Crumbtrail {
     };
 
     this.cancelLifecycleTimer();
+    const stopState: NonNullable<typeof this.lifecycleCloseState> = {
+      immediateEnd: true,
+      deadline: Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
+    };
     if (this.lifecycleClosePromise) {
       try {
+        this.escalateLifecycleClose();
         await this.lifecycleClosePromise;
       } catch (error) {
         recordStopFailure(teardownFailures, "lifecycle.close", error);
+      }
+    } else if (this.sessionStarted && !this.lifecycleSuspended) {
+      const admissionSettled = await this.waitUntilLifecycleDeadline(
+        Promise.allSettled([
+          this.sessionMetadataWrite,
+          this.sessionAdmission,
+        ]).then(() => true),
+        stopState.deadline,
+      );
+      if (!admissionSettled) {
+        this.abandonLifecycleSends();
+        this.lifecycleSuspended = true;
+        this.sessionStarted = false;
       }
     }
     // A session ending while the remote policy is still outstanding takes the
@@ -2271,8 +2573,9 @@ export class Crumbtrail {
     // failing in, and it uploads through `transport.sendBlob` against a session
     // the server still has open — so it has to land before `endSession()`
     // finalizes the log below. Awaiting it inline is what makes that ordering
-    // real; `updateReplayState()` may only detach the same call because a
-    // config poll must not block on an upload.
+    // real while the deadline keeps a stuck recorder from holding shutdown;
+    // `updateReplayState()` may only detach the same call because a config
+    // poll must not block on an upload.
     //
     // And it runs while the session is still live, on the same side of the flag
     // as the collector loop. The recorder reaches the transport directly rather
@@ -2289,10 +2592,21 @@ export class Crumbtrail {
     const replay = this.replay;
     this.replay = undefined;
     if (replay) {
-      try {
-        await replay.stop();
-      } catch (error) {
-        recordStopFailure(teardownFailures, "replay", error);
+      const replaySettled = await this.waitUntilLifecycleDeadline(
+        Promise.resolve()
+          .then(() => replay.stop())
+          .then(
+            () => true,
+            (error: unknown) => {
+              recordStopFailure(teardownFailures, "replay", error);
+              return true;
+            },
+          ),
+        stopState.deadline,
+      );
+      if (!replaySettled) {
+        this.lifecycleSuspended = true;
+        this.sessionStarted = false;
       }
     }
     // These three run BEFORE the collector loop and are teardown in exactly the
@@ -2346,7 +2660,12 @@ export class Crumbtrail {
     if (this.sessionStarted) {
       // bus.stop() just flushed the final batch into the transport; every
       // in-flight POST must land before end-of-session finalizes the log.
-      await Promise.allSettled([...this.pendingSends]);
+      const pendingSettled = await this.waitForLifecycleSends(stopState);
+      if (!pendingSettled) {
+        this.lifecycleSuspended = true;
+        this.sessionStarted = false;
+      }
+      if (!this.sessionStarted) return { sessionId: this.sessionId };
       // A refusal discovered on the final flush has no bus left to ride. The
       // closing record carries whatever the capped per-batch records could not,
       // so the session states its true loss rather than the first few batches
@@ -2367,12 +2686,40 @@ export class Crumbtrail {
       if (this.deferredDeliveryGaps.length > 0) {
         const deferred = this.deferredDeliveryGaps;
         this.deferredDeliveryGaps = [];
-        await this.transport.sendEvents(deferred).catch(() => {});
+        const deferredSettled = await this.waitUntilLifecycleDeadline(
+          Promise.resolve()
+            .then(() => this.transport.sendEvents(deferred))
+            .then(
+              () => true,
+              () => true,
+            ),
+          stopState.deadline,
+        );
+        if (!deferredSettled) {
+          this.lifecycleSuspended = true;
+          this.sessionStarted = false;
+          return { sessionId: this.sessionId };
+        }
       }
+      const sessionId = this.sessionId;
       try {
-        await this.transport.endSession(this.sessionId);
-      } catch (error) {
-        recordStopFailure(teardownFailures, "transport.endSession", error);
+        const endSettled = await this.waitUntilLifecycleDeadline(
+          Promise.resolve()
+            .then(() => this.transport.endSession(sessionId))
+            .then(
+              () => true,
+              (error: unknown) => {
+                recordStopFailure(teardownFailures, "transport.endSession", error);
+                return true;
+              },
+            ),
+          stopState.deadline,
+        );
+        if (!endSettled) this.lifecycleSuspended = true;
+      } finally {
+        // The request may still be in flight after the local deadline. Never retry it from a
+        // later stop call, which would finalize the same session twice.
+        this.sessionStarted = false;
       }
     }
     if (teardownFailures.length > 0) throw buildStopFailure(teardownFailures);
@@ -3156,6 +3503,7 @@ function isRemoteConfigValue(
 ): value is boolean | number {
   if (
     key === "flightRecorder" ||
+    key === "reportScreenshotsEnabled" ||
     key === "autoFlagOnError" ||
     key === "autoFlagOnUncaughtError" ||
     key === "autoFlagOnUnhandledRejection" ||
@@ -3267,6 +3615,7 @@ function hasRecognizedRemoteMasking(
 function hasRecognizedRemoteCaptureSettings(
   settings: Record<string, unknown>,
 ): boolean {
+  if (typeof settings.reportScreenshotsEnabled === "boolean") return true;
   const collectors = asRecord(settings.collectors);
   if (
     collectors &&

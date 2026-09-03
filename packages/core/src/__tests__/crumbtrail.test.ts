@@ -1079,6 +1079,40 @@ describe("Crumbtrail", () => {
       await logger.stop();
     });
 
+    it("keeps a delayed replay upload bound to the visit that recorded it", async () => {
+      const mockTransport = makeMockTransport();
+      const logger = Crumbtrail.init({
+        transportInstance: mockTransport as any,
+        flushIntervalMs: 100_000,
+      });
+      const oldSessionId = logger.getSessionId();
+      (logger as any).replayEnabled = true;
+      (logger as any).updateReplayState();
+      const delayedReplaySend = (logger as any).replay.options.send as (
+        name: string,
+        body: Blob,
+      ) => Promise<void>;
+
+      // This is the state reached when a BFCache close deadline expires while compression is
+      // still pending, then pageshow resumes the document under a fresh visit.
+      (logger as any).replay = undefined;
+      (logger as any).lifecycleSuspended = true;
+      (logger as any).sessionStarted = false;
+      await (logger as any).resumeFromLifecycle();
+      expect(logger.getSessionId()).not.toBe(oldSessionId);
+
+      await delayedReplaySend("replay-000000.json.gz", new Blob(["late"]));
+
+      expect(mockTransport.sendBlob).toHaveBeenCalledWith(
+        "replay-000000.json.gz",
+        expect.any(Blob),
+        undefined,
+        oldSessionId,
+        true,
+      );
+      await logger.stop();
+    });
+
     it("ends a session when a page stays hidden and starts a new visit when it returns", async () => {
       const mockTransport = makeMockTransport();
       const logger = Crumbtrail.init({

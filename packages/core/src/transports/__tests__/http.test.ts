@@ -214,6 +214,23 @@ describe("HttpTransport", () => {
     expect(call[1].headers["X-Crumbtrail-Auth"]).toBe("test-token");
   });
 
+  it("uses an image Blob MIME type for typed artifact uploads", async () => {
+    await transport.startSession("ses_test", {});
+    const blob = new Blob(["png bytes"], { type: "image/png" });
+
+    await transport.sendBlob(
+      "report-screenshot-0123456789abcdef0123456789abcdef.png",
+      blob,
+    );
+
+    const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.find((c) =>
+      c[0].includes("/api/blob/"),
+    )!;
+    expect(call[1].headers["Content-Type"]).toBe("image/png");
+    expect(call[1].headers).not.toHaveProperty("X-Metadata");
+    expect(call[1].keepalive).toBeUndefined();
+  });
+
   it("sends a bug report without a voice blob using a single request", async () => {
     const report = makeReport();
     const events = [{ t: 1000, k: "con", d: { lv: "log", args: ['"hi"'] } }];
@@ -388,6 +405,102 @@ describe("HttpTransport session start ordering", () => {
       `${endpoint}/api/session/start`,
       `${endpoint}/api/events`,
     ]);
+  });
+
+  it("does not relabel a waiting event batch after a session rollover", async () => {
+    let releaseFirstStart: (() => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (
+          String(url).endsWith("/api/session/start") &&
+          JSON.parse(String(init?.body)).sessionId === "ses_old"
+        ) {
+          await new Promise<void>((resolve) => {
+            releaseFirstStart = resolve;
+          });
+        }
+        return new Response('{"ok":true}');
+      }),
+    );
+    const transport = new HttpTransport(endpoint, { authToken: "t" });
+
+    const firstStart = transport.startSession("ses_old", {});
+    const delayedBatch = transport.sendEvents([{ t: 1, k: "con", d: {} }]);
+    await Promise.resolve();
+    await transport.startSession("ses_new", {});
+    releaseFirstStart?.();
+    await firstStart;
+    await delayedBatch;
+
+    const eventCalls = (fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([url]) => String(url).endsWith("/api/events"),
+    );
+    expect(eventCalls).toHaveLength(0);
+  });
+
+  it("uploads delayed replay to its admitted old session after rollover", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response('{"ok":true}')),
+    );
+    const transport = new HttpTransport(endpoint, { authToken: "t" });
+    await transport.startSession("ses_old", {});
+    await transport.startSession("ses_new", {});
+
+    await transport.sendBlob(
+      "replay-000000.json.gz",
+      new Blob(["late"]),
+      undefined,
+      "ses_old",
+      true,
+    );
+
+    const blobCall = (fetch as ReturnType<typeof vi.fn>).mock.calls.find(
+      ([url]) => String(url).endsWith("/api/blob/replay-000000.json.gz"),
+    );
+    expect(blobCall?.[1]?.headers).toMatchObject({
+      "X-Session-Id": "ses_old",
+    });
+  });
+
+  it("rejects delayed replay for refused or finalized old sessions", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (
+          String(url).endsWith("/api/session/start") &&
+          JSON.parse(String(init?.body)).sessionId === "ses_refused"
+        ) {
+          return new Response('{"error":"refused"}', { status: 402 });
+        }
+        return new Response('{"ok":true}');
+      }),
+    );
+    const transport = new HttpTransport(endpoint, { authToken: "t" });
+    await expect(transport.startSession("ses_refused", {})).rejects.toThrow();
+    await transport.startSession("ses_old", {});
+    await transport.startSession("ses_new", {});
+
+    await expect(
+      transport.sendBlob(
+        "replay.json",
+        new Blob(["late"]),
+        undefined,
+        "ses_refused",
+        true,
+      ),
+    ).rejects.toMatchObject({ status: 402 });
+    await transport.endSession("ses_old");
+    await expect(
+      transport.sendBlob(
+        "replay.json",
+        new Blob(["late"]),
+        undefined,
+        "ses_old",
+        true,
+      ),
+    ).rejects.toMatchObject({ status: 0 });
   });
 
   it("refuses events locally when the start it waited for was refused", async () => {

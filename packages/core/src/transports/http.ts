@@ -181,33 +181,15 @@ export class HttpTransport implements CrumbtrailTransport {
   private sessionId = "";
   private authToken?: string;
   private endpoint: string;
-  /**
-   * Status of a refused `/api/session/start`, or 0 when the session is live.
-   *
-   * A refused start leaves no session row, so every subsequent `/api/events`
-   * post is answered 404 — including the capture gaps about the failure. The
-   * transport refuses locally instead: the caller records the same gap it would
-   * have recorded, at once, and the page stops spending bandwidth on a session
-   * the server never opened. Cleared by a start that succeeds, so an identity
-   * refresh recovers.
-   */
-  private startRefusedStatus = 0;
-  /**
-   * Settles when the in-flight `/api/session/start` has been answered.
-   *
-   * The server creates the sessions row inside that request, so anything sent
-   * before it lands names a session the server has never heard of and is
-   * answered `404 Session not found` — the console line an integrator reads as
-   * "capture is broken" while the session is in fact starting normally. The
-   * flush interval is not a guarantee: a burst that fills the batch buffer
-   * flushes immediately, and on a real network the start round trip is the
-   * slower of the two. Every send therefore waits for this first.
-   *
-   * Never rejects. A refused start is remembered by `startRefusedStatus` and
-   * answered locally by `standingRefusal`, which is the caller's signal to
-   * record the gap; a rejection here would turn that into an unhandled one.
-   */
-  private sessionReady: Promise<void> = Promise.resolve();
+  private sessions = new Map<
+    string,
+    {
+      ready: Promise<void>;
+      admitted: boolean;
+      refusedStatus: number;
+      finalized: boolean;
+    }
+  >();
   /** Epoch ms until which the server has asked us to stop sending. */
   private shedUntil = 0;
   /** The server's reason for the active shed, for the gap the caller records. */
@@ -280,9 +262,12 @@ export class HttpTransport implements CrumbtrailTransport {
   }
 
   /** The refusal already known before a batch is even serialized, if any. */
-  private standingRefusal(eventCount: number): EventDeliveryError | undefined {
-    if (this.startRefusedStatus > 0) {
-      return new EventDeliveryError(this.startRefusedStatus, eventCount);
+  private standingRefusal(
+    eventCount: number,
+    refusedStatus = 0,
+  ): EventDeliveryError | undefined {
+    if (refusedStatus > 0) {
+      return new EventDeliveryError(refusedStatus, eventCount);
     }
     if (this.shedUntil > Date.now()) {
       return new CaptureShedError(
@@ -296,10 +281,20 @@ export class HttpTransport implements CrumbtrailTransport {
 
   async sendEvents(events: BugEvent[]): Promise<void> {
     if (events.length === 0) return;
-    await this.sessionReady;
-    const standing = this.standingRefusal(events.length);
+    const sessionId = this.sessionId;
+    const session = this.sessions.get(sessionId);
+    await session?.ready;
+    // A lifecycle rollover can replace both identity and admission while this batch waits. The
+    // events belong to the visit active at invocation, so never relabel them as part of the new
+    // visit. The old session is already closing and owns its final flush.
+    if (sessionId !== this.sessionId) return;
+    const standing = this.standingRefusal(
+      events.length,
+      session?.refusedStatus,
+    );
     if (standing) throw standing;
-    await this.deliverAll(this.splitToBudget(events));
+    if (!session?.admitted || session.finalized) return;
+    await this.deliverAll(this.splitToBudget(events, sessionId), 0, sessionId);
   }
 
   /**
@@ -311,15 +306,18 @@ export class HttpTransport implements CrumbtrailTransport {
    * still returned — it is refused by the server rather than dropped silently
    * here, so the loss is recorded with a status.
    */
-  private splitToBudget(events: BugEvent[]): BugEvent[][] {
+  private splitToBudget(events: BugEvent[], sessionId: string): BugEvent[][] {
     if (events.length <= 1) return [events];
-    if (utf8ByteLength(this.eventsBody(events)) <= MAX_EVENTS_BODY_BYTES) {
+    if (
+      utf8ByteLength(this.eventsBody(events, sessionId)) <=
+      MAX_EVENTS_BODY_BYTES
+    ) {
       return [events];
     }
     const mid = Math.ceil(events.length / 2);
     return [
-      ...this.splitToBudget(events.slice(0, mid)),
-      ...this.splitToBudget(events.slice(mid)),
+      ...this.splitToBudget(events.slice(0, mid), sessionId),
+      ...this.splitToBudget(events.slice(mid), sessionId),
     ];
   }
 
@@ -333,12 +331,14 @@ export class HttpTransport implements CrumbtrailTransport {
   private async deliverAll(
     chunks: BugEvent[][],
     depth = 0,
+    sessionId = this.sessionId,
   ): Promise<void> {
     let first: EventDeliveryError | undefined;
     let lost = 0;
     for (const chunk of chunks) {
+      if (sessionId !== this.sessionId) return;
       try {
-        await this.deliverChunk(chunk, depth);
+        await this.deliverChunk(chunk, depth, sessionId);
       } catch (error) {
         const failure =
           error instanceof EventDeliveryError
@@ -363,9 +363,13 @@ export class HttpTransport implements CrumbtrailTransport {
    * usually acceptable. Dropping the whole batch instead threw away every event
    * that would have fit alongside the one oversized payload.
    */
-  private async deliverChunk(events: BugEvent[], depth: number): Promise<void> {
+  private async deliverChunk(
+    events: BugEvent[],
+    depth: number,
+    sessionId: string,
+  ): Promise<void> {
     try {
-      await this.postEvents(events);
+      await this.postEvents(events, sessionId);
     } catch (error) {
       const oversized =
         error instanceof EventDeliveryError &&
@@ -377,12 +381,13 @@ export class HttpTransport implements CrumbtrailTransport {
       await this.deliverAll(
         [events.slice(0, mid), events.slice(mid)],
         depth + 1,
+        sessionId,
       );
     }
   }
 
-  private eventsBody(events: BugEvent[]): string {
-    return JSON.stringify({ sessionId: this.sessionId, events });
+  private eventsBody(events: BugEvent[], sessionId = this.sessionId): string {
+    return JSON.stringify({ sessionId, events });
   }
 
   /**
@@ -399,8 +404,12 @@ export class HttpTransport implements CrumbtrailTransport {
     });
   }
 
-  private async postEvents(events: BugEvent[]): Promise<void> {
-    const body = this.eventsBody(events);
+  private async postEvents(
+    events: BugEvent[],
+    sessionId: string,
+  ): Promise<void> {
+    if (sessionId !== this.sessionId) return;
+    const body = this.eventsBody(events, sessionId);
     const init: RequestInit = {
       method: "POST",
       headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
@@ -473,11 +482,27 @@ export class HttpTransport implements CrumbtrailTransport {
     name: string,
     blob: Blob,
     metadata?: Record<string, unknown>,
+    sessionIdOverride?: string,
+    allowPreviousSession = false,
   ): Promise<void> {
-    await this.sessionReady;
+    const sessionId = sessionIdOverride ?? this.sessionId;
+    const session = this.sessions.get(sessionId);
+    await session?.ready;
+    // Explicit identity is used by screenshots and replay work that can finish after a lifecycle
+    // rollover. An admitted old session remains a valid upload target until it is finalized.
+    if (
+      !session?.admitted ||
+      session.finalized ||
+      (sessionIdOverride !== undefined &&
+        sessionId !== this.sessionId &&
+        !allowPreviousSession)
+    )
+      throw new BlobDeliveryError(name, session?.refusedStatus ?? 0);
     const headers = this.withAuthHeaders({
-      "Content-Type": "application/octet-stream",
-      "X-Session-Id": this.sessionId,
+      // Image artifact routes validate the declared type against their generated
+      // name. Keep the historical binary fallback for blobs without a type.
+      "Content-Type": blob.type || "application/octet-stream",
+      "X-Session-Id": sessionId,
     });
     if (metadata) {
       headers["X-Metadata"] = JSON.stringify(metadata);
@@ -498,9 +523,16 @@ export class HttpTransport implements CrumbtrailTransport {
     metadata: Record<string, unknown>,
   ): Promise<void> {
     this.sessionId = sessionId;
-    const attempt = this.postSessionStart(sessionId, metadata);
+    const session = {
+      ready: Promise.resolve(),
+      admitted: false,
+      refusedStatus: 0,
+      finalized: false,
+    };
+    this.sessions.set(sessionId, session);
+    const attempt = this.postSessionStart(sessionId, metadata, session);
     // Held before awaiting, so a send racing this very call still waits.
-    this.sessionReady = attempt.then(
+    session.ready = attempt.then(
       () => {},
       () => {},
     );
@@ -510,6 +542,10 @@ export class HttpTransport implements CrumbtrailTransport {
   private async postSessionStart(
     sessionId: string,
     metadata: Record<string, unknown>,
+    session: {
+      admitted: boolean;
+      refusedStatus: number;
+    },
   ): Promise<void> {
     let response: Response;
     try {
@@ -526,14 +562,14 @@ export class HttpTransport implements CrumbtrailTransport {
       throw new SessionDeliveryError("start", 0);
     }
     if (response.ok) {
-      this.startRefusedStatus = 0;
+      session.admitted = true;
       return;
     }
     // 402, 409, 429 and 401 all land here, and every one of them means the
     // server holds no session under this id. Recording that is the difference
     // between a session that reports itself healthy for its whole lifetime
     // while nothing lands, and one that says so on the first batch.
-    this.startRefusedStatus = response.status;
+    session.refusedStatus = response.status;
     const reason = await readRefusalMessage(response);
     this.warnOnce(
       `session-start:${response.status}`,
@@ -547,7 +583,7 @@ export class HttpTransport implements CrumbtrailTransport {
     events: BugEvent[],
     voiceBlob?: Blob,
   ): Promise<void> {
-    await this.sessionReady;
+    await this.sessions.get(this.sessionId)?.ready;
     const response = await fetch(`${this.endpoint}/api/bug/flag`, {
       method: "POST",
       headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
@@ -585,6 +621,8 @@ export class HttpTransport implements CrumbtrailTransport {
   }
 
   async endSession(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (session) session.finalized = true;
     const body = JSON.stringify({ sessionId });
     let response: Response | undefined;
     try {

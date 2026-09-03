@@ -104,6 +104,17 @@ afterEach(() => {
 });
 
 describe("remote collector switches", () => {
+  it("applies the report screenshot gate from remote project settings", async () => {
+    const { logger, internals } = start();
+
+    expect(internals.config.reportScreenshotsEnabled).toBe(false);
+    internals.applyRemoteConfig({ reportScreenshotsEnabled: true });
+    expect(internals.config.reportScreenshotsEnabled).toBe(true);
+    internals.applyRemoteConfig({ reportScreenshotsEnabled: false });
+    expect(internals.config.reportScreenshotsEnabled).toBe(false);
+    await logger.stop();
+  });
+
   it("turns collectors on and off and reports which ones moved", async () => {
     const { logger, internals } = start({ console: true, campaign: true });
 

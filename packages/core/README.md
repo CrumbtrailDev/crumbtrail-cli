@@ -225,8 +225,31 @@ try {
 }
 ```
 
-Also on the instance: `addEvent`, `recordError`, `registerStateProvider`, `setEnv`,
-`createRequestHeaders`, `pause`, `resume`, `stop`, `getSessionId`.
+Also on the instance: `addEvent`, `recordError`, `registerStateProvider`,
+`setEnv`, `captureScreenshot`, `createRequestHeaders`, `pause`, `resume`,
+`stop`, `getSessionId`.
+
+### Attach a report screenshot
+
+Capture an application owned PNG only after the user has chosen the image or
+the application has rendered the canvas. The SDK does not request display media
+or capture images automatically:
+
+```ts
+const image = await crumbtrail.captureScreenshot(canvas);
+
+await crumbtrail.flagBug({
+  note: "The total is wrong",
+  visualArtifactName: image.artifactName,
+});
+```
+
+`captureScreenshot` accepts a PNG `Blob` with `type: "image/png"` or an
+`HTMLCanvasElement`. Canvas output is encoded as PNG. The generated artifact
+name is the only name accepted for a later association. The image is limited
+to 5 MiB and 4096 pixels on either edge. The project administrator must enable
+report screenshots before the Cloud endpoint accepts the upload. The client
+also keeps this API disabled until the remote project policy enables it.
 
 `createRequestHeaders()` is for a transport Crumbtrail does not patch, such as a
 WebSocket frame, a server action, or a queue message. It returns the session
@@ -354,8 +377,8 @@ discarded by `identify`.
 `remoteConfig` is what makes the project's capture settings reach the
 running app, and it is on by default. With it on, the SDK polls `/api/capture-config` on `httpEndpoint`
 using the ingest key it already holds, and the auto flag triggers, flight
-recorder tail, baseline sampling, consent mode, masking mode, session replay and
-live probes are taken from the project rather than from this call. Those reach
+recorder tail, baseline sampling, consent mode, masking mode, report screenshots,
+session replay and live probes are taken from the project rather than from this call. Those reach
 an app on that poll and on no other path. The kill switch, the per project
 capture budgets, row value redaction and the refusal of a replay write from a
 project that has not opted in are enforced at ingest as well, so they take

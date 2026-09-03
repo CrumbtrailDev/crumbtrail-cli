@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { Crumbtrail } from "../crumbtrail";
+import {
+  Crumbtrail,
+  PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
+} from "../crumbtrail";
 import type { BugEvent } from "../types";
 
 /**
@@ -164,5 +167,36 @@ describe("session replay teardown fits into the stop() sequence", () => {
     // about — is asserted in the suite above.
     await expect(pending).resolves.toMatchObject({ bugId: expect.any(String) });
     expect(transport.transport.endSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("abandons lifecycle finalization when replay teardown never settles", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    const logger = init(transport);
+    const replayStop = vi.fn(
+      async () => new Promise<void>(() => {}),
+    );
+    (logger as any).replay = { stop: replayStop };
+
+    window.dispatchEvent(new Event("pagehide"));
+    const lifecycleClose = (logger as any).lifecycleClosePromise as
+      | Promise<void>
+      | undefined;
+    expect(lifecycleClose).toBeDefined();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(replayStop).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
+    await expect(lifecycleClose).resolves.toBeUndefined();
+    expect(transport.transport.endSession).not.toHaveBeenCalled();
+
+    await expect(logger.stop()).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    await expect(logger.stop()).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(replayStop).toHaveBeenCalledOnce();
+    expect(transport.transport.endSession).not.toHaveBeenCalled();
+    vi.useRealTimers();
   });
 });

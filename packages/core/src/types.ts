@@ -774,6 +774,8 @@ export interface FlagBugOptions {
   windowMs?: number;
   tags?: string[];
   voiceBlob?: Blob;
+  /** Artifact name returned by a successful captureScreenshot() call. */
+  visualArtifactName?: string;
 }
 
 /** Options for recording an application error that was caught by host code. */
@@ -1016,6 +1018,8 @@ export interface CrumbtrailConfig {
   release?: string;
   /** Config poll cadence when `remoteConfig` is on. */
   configPollIntervalMs: number;
+  /** Whether the remote project policy has enabled report screenshot uploads. */
+  reportScreenshotsEnabled: boolean;
 
   // Heartbeat
   heartbeat: boolean;
@@ -1223,6 +1227,7 @@ export const DEFAULT_CONFIG: CrumbtrailConfig = {
   flightRecorderTailMs: 60_000,
   remoteConfig: true,
   configPollIntervalMs: 60_000,
+  reportScreenshotsEnabled: false,
 
   heartbeat: true,
 
@@ -1366,6 +1371,7 @@ export interface CrumbtrailTransport {
     name: string,
     blob: Blob,
     metadata?: Record<string, unknown>,
+    sessionId?: string,
   ): Promise<void>;
   startSession(
     sessionId: string,
