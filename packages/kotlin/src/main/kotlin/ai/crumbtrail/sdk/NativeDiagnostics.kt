@@ -163,20 +163,22 @@ class CrumbtrailMainThreadWatchdog(
 
         val current = now()
         synchronized(lock) {
-            val elapsed = (current - lastHeartbeatAt).coerceAtLeast(0)
-            if (elapsed >= thresholdMs && pendingAt == null && handoff.read() == null) {
-                val at = current
-                runCatching {
-                    handoff.write(
-                        CrumbtrailPendingHang(
-                            thresholdMs = thresholdMs,
-                            observedDurationMs = elapsed.coerceAtMost(MAX_NATIVE_HANG_DURATION_MS),
-                            stack = boundedDiagnosticText(captureStack()),
-                            at = at,
-                            startedAt = lastHeartbeatAt,
+            if (running && generation == token) {
+                val elapsed = (current - lastHeartbeatAt).coerceAtLeast(0)
+                if (elapsed >= thresholdMs && pendingAt == null && handoff.read() == null) {
+                    val at = current
+                    runCatching {
+                        handoff.write(
+                            CrumbtrailPendingHang(
+                                thresholdMs = thresholdMs,
+                                observedDurationMs = elapsed.coerceAtMost(MAX_NATIVE_HANG_DURATION_MS),
+                                stack = boundedDiagnosticText(captureStack()),
+                                at = at,
+                                startedAt = lastHeartbeatAt,
+                            )
                         )
-                    )
-                    pendingAt = at
+                        pendingAt = at
+                    }
                 }
             }
         }

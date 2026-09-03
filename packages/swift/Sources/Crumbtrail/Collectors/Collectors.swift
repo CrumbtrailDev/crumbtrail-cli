@@ -129,7 +129,7 @@ extension Crumbtrail {
     /// mid-flight, and only this track separates the two.
     private func installLifecycleCollector() {
         let pendingHangStore = UserDefaultsPendingHangStore()
-        if config.collectors.nativeDiagnostics {
+        if config.collectors.nativeDiagnostics || config.collectors.nativeWatchdog {
             drainPendingHang(pendingHangStore, onHang: recordNativeHang)
         }
         let watchdog: CrumbtrailMainThreadWatchdog? = config.collectors.nativeWatchdog
