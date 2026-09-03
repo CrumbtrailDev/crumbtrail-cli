@@ -210,6 +210,12 @@ The package's standard `android/` and `ios/` directories are discovered by the
 React Native CLI autolinker, so no separate native dependency or manual module
 registration is required.
 
+If you provide `watchdogHandoff`, its `deliver` and `drain` methods are the
+serialized lifecycle boundary. Each method must keep the event durable until
+the acceptance callback returns `true`, compare the stored value before
+clearing it, and return `false` on any failed step. The SDK waits for in-flight
+handoff work during collector cleanup.
+
 The JavaScript watchdog defaults to a five second threshold and one second
 checks. It pauses when `AppState` is not active, and is disabled in development
 mode or when a remote debugger is detected. Pass

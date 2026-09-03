@@ -32,9 +32,9 @@ private final class CrumbtrailFlutterExceptionRegistry {
 
     func handle(_ exception: NSException) {
         lock.lock()
-        let active = plugins.allObjects
+        let active = plugins.allObjects.first
         lock.unlock()
-        for plugin in active { plugin.recordUncaughtException(exception) }
+        active?.recordUncaughtException(exception)
     }
 }
 
@@ -50,6 +50,7 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     private static let maxPendingEvents = 32
     private static let maxTextCharacters = 8_192
     private static let hangThresholdMilliseconds: Int64 = 5_000
+    private static let maxPersistenceAttempts = 3
 
     private let defaults: UserDefaults
     private var observerTokens: [NSObjectProtocol] = []
@@ -82,6 +83,8 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
             result(nil)
         case "drainDiagnostics":
             result(drainDiagnostics())
+        case "acknowledgeDiagnostics":
+            result(acknowledgeDiagnostics(call.arguments as? String ?? ""))
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -101,7 +104,7 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func setEnabled(_ value: Bool) {
-        if value { startCollectors() } else { stopCollectors(clearPending: true) }
+        if value { startCollectors() } else { stopCollectors() }
     }
 
     private func startCollectors() {
@@ -131,7 +134,7 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         startWatchdog()
     }
 
-    private func stopCollectors(clearPending: Bool) {
+    private func stopCollectors() {
         enabled = false
         watchdogTimer?.cancel()
         watchdogTimer = nil
@@ -140,11 +143,6 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         if collectorsStarted { CrumbtrailFlutterExceptionRegistry.shared.remove(self) }
         collectorsStarted = false
         watchdogPending = false
-        if clearPending {
-            Self.pendingEventsLock.lock()
-            defaults.removeObject(forKey: Self.pendingKey)
-            Self.pendingEventsLock.unlock()
-        }
     }
 
     fileprivate func recordUncaughtException(_ exception: NSException) {
@@ -201,17 +199,60 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         #endif
     }
 
-    private func drainDiagnostics() -> [[String: Any]] {
+    private func drainDiagnostics() -> [String: Any] {
         Self.pendingEventsLock.lock()
         defer { Self.pendingEventsLock.unlock() }
-        guard enabled, let raw = defaults.array(forKey: Self.pendingKey) else { return [] }
-        defaults.removeObject(forKey: Self.pendingKey)
-        return raw.compactMap { value in
-            guard let item = value as? [String: Any],
-                  let kind = item["kind"] as? String,
-                  let data = item["data"] as? [String: Any] else { return nil }
-            return ["kind": kind, "data": data]
+        guard enabled else { return ["token": "", "events": []] }
+        if let token = Self.inFlightToken, let events = Self.inFlightEvents {
+            return ["token": token, "events": events.compactMap { self.responseEvent($0) }]
         }
+        guard let raw = defaults.array(forKey: Self.pendingKey) as? [[String: Any]],
+              !raw.isEmpty else { return ["token": "", "events": []] }
+        let token = UUID().uuidString
+        Self.inFlightToken = token
+        Self.inFlightEvents = raw
+        let events = raw.compactMap { responseEvent($0) }
+        guard events.count == raw.count else {
+            Self.inFlightToken = nil
+            Self.inFlightEvents = nil
+            return ["token": "", "events": []]
+        }
+        return ["token": token, "events": events]
+    }
+
+    private func acknowledgeDiagnostics(_ token: String) -> Bool {
+        Self.pendingEventsLock.lock()
+        defer { Self.pendingEventsLock.unlock() }
+        guard !token.isEmpty, token == Self.inFlightToken,
+              let snapshot = Self.inFlightEvents,
+              let current = defaults.array(forKey: Self.pendingKey) as? [[String: Any]],
+              current.count >= snapshot.count else { return false }
+        for index in snapshot.indices where !NSDictionary(dictionary: current[index]).isEqual(to: NSDictionary(dictionary: snapshot[index])) {
+            return false
+        }
+        let remaining = Array(current.dropFirst(snapshot.count))
+        var committed = false
+        for _ in 0..<Self.maxPersistenceAttempts {
+            if remaining.isEmpty { defaults.removeObject(forKey: Self.pendingKey) }
+            else { defaults.set(remaining, forKey: Self.pendingKey) }
+            if defaults.synchronize() {
+                committed = true
+                break
+            }
+        }
+        guard committed else {
+            defaults.set(current, forKey: Self.pendingKey)
+            return false
+        }
+        Self.inFlightToken = nil
+        Self.inFlightEvents = nil
+        return true
+    }
+
+    private func responseEvent(_ value: [String: Any]) -> [String: Any]? {
+        guard let kind = value["kind"] as? String,
+              let data = value["data"] as? [String: Any] else { return nil }
+        return ["kind": kind, "data": data]
     }
 
     private func appendPending(kind: String, data: [String: Any]) {
@@ -219,6 +260,7 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         defer { Self.pendingEventsLock.unlock() }
         guard enabled else { return }
         var events = (defaults.array(forKey: Self.pendingKey) as? [[String: Any]]) ?? []
+        let previous = events
         while events.count >= Self.maxPendingEvents { events.removeFirst() }
         events.append(["kind": kind, "data": data.reduce(into: [String: Any]()) { result, item in
             guard item.key.count <= 64 else { return }
@@ -228,7 +270,12 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
                 result[item.key] = item.value
             }
         }])
-        defaults.set(events, forKey: Self.pendingKey)
+        for _ in 0..<Self.maxPersistenceAttempts {
+            defaults.set(events, forKey: Self.pendingKey)
+            if defaults.synchronize() { return }
+        }
+        if previous.isEmpty { defaults.removeObject(forKey: Self.pendingKey) }
+        else { defaults.set(previous, forKey: Self.pendingKey) }
     }
 
     private func bounded(_ value: String) -> String {
@@ -236,8 +283,10 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     deinit {
-        stopCollectors(clearPending: false)
+        stopCollectors()
     }
 
     private static let pendingEventsLock = NSLock()
+    private static var inFlightToken: String?
+    private static var inFlightEvents: [[String: Any]]?
 }

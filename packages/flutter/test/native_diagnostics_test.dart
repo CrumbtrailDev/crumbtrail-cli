@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -6,6 +8,7 @@ class FakeNativeDiagnostics implements CrumbtrailNativeDiagnosticsPlatform {
   FakeNativeDiagnostics({this.events = const []});
 
   final List<CrumbtrailNativeDiagnosticEvent> events;
+  bool acknowledged = false;
 
   @override
   Future<CrumbtrailNativeCapabilities> getCapabilities() async =>
@@ -33,8 +36,15 @@ class FakeNativeDiagnostics implements CrumbtrailNativeDiagnosticsPlatform {
       );
 
   @override
-  Future<List<CrumbtrailNativeDiagnosticEvent>> drainDiagnostics() async =>
-      events;
+  Future<CrumbtrailNativeDiagnosticBatch> drainDiagnostics() async =>
+      CrumbtrailNativeDiagnosticBatch(
+          token: events.isEmpty ? '' : 'fake', events: events);
+
+  @override
+  Future<bool> acknowledgeDiagnostics(String token) async {
+    acknowledged = token == 'fake';
+    return acknowledged;
+  }
 }
 
 class ConfigurableNativeDiagnostics
@@ -75,10 +85,32 @@ class ConfigurableNativeDiagnostics
       );
 
   @override
-  Future<List<CrumbtrailNativeDiagnosticEvent>> drainDiagnostics() async {
+  Future<CrumbtrailNativeDiagnosticBatch> drainDiagnostics() async {
     drained = true;
-    return const [];
+    return const CrumbtrailNativeDiagnosticBatch(token: '', events: []);
   }
+
+  @override
+  Future<bool> acknowledgeDiagnostics(String token) async => false;
+}
+
+class DelayedNativeDiagnostics implements CrumbtrailNativeDiagnosticsPlatform {
+  final Completer<void> capabilityGate = Completer<void>();
+  bool capabilityRead = false;
+
+  @override
+  Future<CrumbtrailNativeCapabilities> getCapabilities() async {
+    await capabilityGate.future;
+    capabilityRead = true;
+    return CrumbtrailNativeCapabilities.absent;
+  }
+
+  @override
+  Future<CrumbtrailNativeDiagnosticBatch> drainDiagnostics() async =>
+      const CrumbtrailNativeDiagnosticBatch(token: '', events: []);
+
+  @override
+  Future<bool> acknowledgeDiagnostics(String token) async => false;
 }
 
 class RecordingTransport implements CrumbtrailTransport {
@@ -152,7 +184,10 @@ void main() {
         checkInterval: const Duration(seconds: 1),
         now: () => DateTime.fromMillisecondsSinceEpoch(nowMs),
         suppressInDebug: false,
-        onHang: events.add,
+        onHang: (data) {
+          events.add(data);
+          return true;
+        },
       );
       watchdog.start();
 
@@ -173,7 +208,10 @@ void main() {
     fakeAsync((async) {
       final events = <Map<String, Object?>>[];
       final watchdog = CrumbtrailDartEventLoopWatchdog(
-        onHang: events.add,
+        onHang: (data) {
+          events.add(data);
+          return true;
+        },
         // Flutter's test runtime is debug mode. This verifies that the default
         // does not report development timer pauses as production hangs.
       );
@@ -194,7 +232,10 @@ void main() {
         monotonicNow: () => Duration(milliseconds: nowMs),
         debuggerAttached: () => debuggerAttached,
         suppressInDebug: false,
-        onHang: events.add,
+        onHang: (data) {
+          events.add(data);
+          return true;
+        },
       );
 
       watchdog.start();
@@ -210,26 +251,30 @@ void main() {
     });
   });
 
-  test('previous Dart handoff is bounded and imported once', () {
+  test('previous Dart handoff is bounded and imported once', () async {
     final handoff = MemoryCrumbtrailDartHangHandoff();
-    handoff.write(const {
+    await handoff.deliver(const {
       'source': 'dart',
       'thresholdMs': 5000,
       'observedDurationMs': 7000,
       'recovered': true,
       'previousLaunch': false,
-    });
+    }, (_) => false);
     final seen = <Map<String, Object?>>[];
     final watchdog = CrumbtrailDartEventLoopWatchdog(
       handoff: handoff,
       suppressInDebug: true,
-      onHang: seen.add,
+      onHang: (data) {
+        seen.add(data);
+        return true;
+      },
     );
 
     watchdog.start();
+    await Future<void>.delayed(Duration.zero);
     expect(seen.single['previousLaunch'], true);
-    expect(handoff.read(), isNull);
-    watchdog.stop();
+    await expectLater(handoff.drain((_) => false), completion(isFalse));
+    await watchdog.stop();
   });
 
   test('disabled native diagnostics configures the plugin off', () async {
@@ -280,9 +325,109 @@ void main() {
       'previousLaunch': false,
     };
 
-    await handoff.writeAndWait(older);
-    await handoff.writeAndWait(newer);
-    await handoff.clearIfCurrent(older);
-    expect(handoff.read(), newer);
+    await handoff.deliver(older, (_) => false);
+    await handoff.deliver(newer, (_) => true);
+    await expectLater(handoff.drain((_) => true), completion(isFalse));
+  });
+
+  test('watchdog stop waits for an in-flight host acceptance', () async {
+    final handoff = MemoryCrumbtrailDartHangHandoff();
+    await handoff.deliver(const {
+      'source': 'dart',
+      'thresholdMs': 5000,
+      'observedDurationMs': 7000,
+      'recovered': true,
+      'previousLaunch': false,
+    }, (_) => false);
+    final acceptance = Completer<bool>();
+    var callbackStarted = false;
+    final watchdog = CrumbtrailDartEventLoopWatchdog(
+      handoff: handoff,
+      onHang: (_) {
+        callbackStarted = true;
+        return acceptance.future;
+      },
+    );
+
+    watchdog.start();
+    await Future<void>.delayed(Duration.zero);
+    expect(callbackStarted, isTrue);
+    var stopped = false;
+    final stopping = watchdog.stop().then((_) => stopped = true);
+    await Future<void>.delayed(Duration.zero);
+    expect(stopped, isFalse);
+    acceptance.complete(false);
+    await stopping;
+    expect(stopped, isTrue);
+    await expectLater(handoff.drain((_) => false), completion(isFalse));
+  });
+
+  test('native diagnostics startup cannot resume after stop', () async {
+    final transport = RecordingTransport();
+    final native = DelayedNativeDiagnostics();
+    final logger = Crumbtrail(
+      config: const CrumbtrailConfig(
+        endpoint: 'https://ingest.example.com',
+        flushBatchSize: 100,
+        collectors: CrumbtrailCollectors(
+          environment: false,
+          nativeDiagnostics: true,
+          nativeWatchdog: true,
+        ),
+      ),
+      transport: transport,
+      nativeDiagnosticsPlatform: native,
+      startTimer: false,
+    );
+
+    final starting = logger.startNativeDiagnostics();
+    await Future<void>.delayed(Duration.zero);
+    final stopping = logger.stop();
+    await Future<void>.delayed(Duration.zero);
+    expect(native.capabilityRead, isFalse);
+    native.capabilityGate.complete();
+    await starting;
+    await stopping;
+    expect(native.capabilityRead, isTrue);
+    expect(
+      transport.batches.expand((batch) => batch),
+      isNot(contains(predicate<CrumbtrailEvent>(
+          (event) => event.data['kind'] == 'native-capabilities'))),
+    );
+  });
+
+  test('serializes custom handoff acceptance before the next durable write',
+      () async {
+    final handoff = MemoryCrumbtrailDartHangHandoff();
+    final order = <String>[];
+    const older = <String, Object?>{
+      'source': 'dart',
+      'thresholdMs': 5000,
+      'observedDurationMs': 6000,
+      'recovered': true,
+      'previousLaunch': false,
+    };
+    const newer = <String, Object?>{
+      'source': 'dart',
+      'thresholdMs': 5000,
+      'observedDurationMs': 7000,
+      'recovered': true,
+      'previousLaunch': false,
+    };
+
+    final first = handoff.deliver(older, (_) async {
+      order.add('older');
+      await Future<void>.delayed(Duration.zero);
+      return false;
+    });
+    final second = handoff.deliver(newer, (_) {
+      order.add('newer');
+      return true;
+    });
+
+    expect(await first, isFalse);
+    expect(await second, isTrue);
+    expect(order, <String>['older', 'newer']);
+    await expectLater(handoff.drain((_) => true), completion(isFalse));
   });
 }

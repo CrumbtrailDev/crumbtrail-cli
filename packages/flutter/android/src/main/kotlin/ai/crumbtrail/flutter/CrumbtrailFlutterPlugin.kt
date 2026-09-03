@@ -17,6 +17,9 @@ import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.Collections
+import java.util.UUID
+import java.util.WeakHashMap
 
 /**
  * Optional Android half of the Flutter diagnostics channel.
@@ -37,8 +40,6 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     @Volatile private var watchdogPending = false
     @Volatile private var enabled = false
     private var collectorsStarted = false
-    private var previousHandler: Thread.UncaughtExceptionHandler? = null
-    private var installedHandler: Thread.UncaughtExceptionHandler? = null
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         context = binding.applicationContext
@@ -50,7 +51,7 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
-        stopCollectors(clearPending = false)
+        stopCollectors()
         watchdogExecutor.shutdownNow()
     }
 
@@ -63,13 +64,15 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     result.success(null)
                 }
                 "drainDiagnostics" -> result.success(drainDiagnostics())
+                "acknowledgeDiagnostics" ->
+                    result.success(acknowledgeDiagnostics(call.arguments as? String ?: ""))
                 else -> result.notImplemented()
             }
         } catch (_: Exception) {
             // The channel is an optional capture plane. An unavailable response
             // is safer than surfacing a plugin exception to Dart.
             if (call.method == "getCapabilities") result.success(absentCapabilities())
-            else if (call.method == "drainDiagnostics") result.success(emptyList<Map<String, Any?>>())
+            else if (call.method == "drainDiagnostics") result.success(emptyDrain())
             else result.notImplemented()
         }
     }
@@ -95,7 +98,7 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     )
 
     private fun setEnabled(value: Boolean) {
-        if (value) startCollectors() else stopCollectors(clearPending = true)
+        if (value) startCollectors() else stopCollectors()
     }
 
     private fun startCollectors() {
@@ -104,54 +107,55 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             enabled = true
             collectorsStarted = true
         }
-        installCrashHandler()
+        registerCrashHandler()
         installLifecycleCollector()
         collectPreviousProcessExit()
         startWatchdog()
     }
 
-    private fun stopCollectors(clearPending: Boolean) {
+    private fun stopCollectors() {
         enabled = false
         watchdogTask?.cancel(true)
         watchdogTask = null
         activityCallbacks?.let { application?.unregisterActivityLifecycleCallbacks(it) }
         activityCallbacks = null
-        if (installedHandler != null && Thread.getDefaultUncaughtExceptionHandler() === installedHandler) {
-            Thread.setDefaultUncaughtExceptionHandler(previousHandler)
-        }
-        installedHandler = null
-        previousHandler = null
         synchronized(PENDING_LOCK) {
+            ACTIVE_MODULES.remove(this)
+            if (ACTIVE_MODULES.isEmpty() &&
+                Thread.getDefaultUncaughtExceptionHandler() === SHARED_EXCEPTION_HANDLER
+            ) {
+                Thread.setDefaultUncaughtExceptionHandler(previousProcessHandler)
+            }
+            if (ACTIVE_MODULES.isEmpty()) previousProcessHandler = null
             collectorsStarted = false
             watchdogPending = false
-            if (clearPending) {
-                preferences().edit()
-                    .remove(PENDING_KEY)
-                    .remove(LAST_PROCESS_EXIT_TIMESTAMP_KEY)
-                    .commit()
+        }
+    }
+
+    private fun registerCrashHandler() {
+        synchronized(PENDING_LOCK) {
+            ACTIVE_MODULES.add(this)
+            val current = Thread.getDefaultUncaughtExceptionHandler()
+            if (current !== SHARED_EXCEPTION_HANDLER) {
+                previousProcessHandler = current
+                Thread.setDefaultUncaughtExceptionHandler(SHARED_EXCEPTION_HANDLER)
             }
         }
     }
 
-    private fun installCrashHandler() {
-        previousHandler = Thread.getDefaultUncaughtExceptionHandler()
-        val handler = Thread.UncaughtExceptionHandler { thread, throwable ->
-            if (!enabled) return@UncaughtExceptionHandler
-            runCatching {
-                appendPending(
-                    "native-crash",
-                    mapOf(
-                        "msg" to bounded(throwable.message ?: throwable.toString()),
-                        "stk" to bounded(throwable.stackTraceToString()),
-                        "source" to "previous-launch",
-                        "thread" to bounded(thread.name),
-                    ),
-                )
-            }
-            previousHandler?.uncaughtException(thread, throwable)
+    private fun recordUncaughtException(thread: Thread, throwable: Throwable) {
+        if (!enabled) return
+        runCatching {
+            appendPending(
+                "native-crash",
+                mapOf(
+                    "msg" to bounded(throwable.message ?: throwable.toString()),
+                    "stk" to bounded(throwable.stackTraceToString()),
+                    "source" to "previous-launch",
+                    "thread" to bounded(thread.name),
+                ),
+            )
         }
-        installedHandler = handler
-        Thread.setDefaultUncaughtExceptionHandler(handler)
     }
 
     private fun installLifecycleCollector() {
@@ -185,18 +189,29 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 val prefs = preferences()
                 val lastSeen = prefs.getLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, 0L)
                 var newest = lastSeen
-                val pending = JSONArray(prefs.getString(PENDING_KEY, "[]"))
-                manager.getHistoricalProcessExitReasons(context.packageName, 0, 4)
+                val pending = JSONArray(
+                    pendingRetryValue ?: prefs.getString(PENDING_KEY, "[]"),
+                )
+                val exits = manager.getHistoricalProcessExitReasons(
+                    context.packageName,
+                    0,
+                    MAX_PROCESS_EXIT_ENTRIES,
+                )
                     .filter { it.timestamp > lastSeen }
-                    .forEach { info ->
-                        newest = maxOf(newest, info.timestamp)
-                        appendProcessExit(pending, info)
-                    }
+                    .sortedWith(compareBy(
+                        { it.timestamp },
+                        { it.reason },
+                        { it.importance },
+                        { it.status },
+                        { it.description ?: "" },
+                    ))
+                    .take(MAX_PROCESS_EXIT_ENTRIES)
+                exits.forEach { info ->
+                    newest = maxOf(newest, info.timestamp)
+                    appendProcessExit(pending, info)
+                }
                 if (newest > lastSeen) {
-                    val committed = prefs.edit()
-                        .putString(PENDING_KEY, pending.toString())
-                        .putLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, newest)
-                        .commit()
+                    val committed = commitProcessExit(prefs, pending.toString(), newest)
                     if (!committed) return@synchronized
                 }
             }
@@ -271,36 +286,119 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }, CHECK_INTERVAL_MS, CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS)
     }
 
-    private fun drainDiagnostics(): List<Map<String, Any?>> {
-        return synchronized(PENDING_LOCK) {
-            if (!enabled) return@synchronized emptyList()
-            val prefs = preferences()
-            val raw = prefs.getString(PENDING_KEY, null) ?: return@synchronized emptyList()
-            val events = runCatching { JSONArray(raw) }.getOrNull()
-                ?: return@synchronized emptyList()
-            val result = (0 until events.length()).mapNotNull { index ->
-                val item = events.optJSONObject(index) ?: return@mapNotNull null
-                val kind = item.optString("kind")
-                val data = item.optJSONObject("data") ?: return@mapNotNull null
-                mapOf("kind" to kind, "data" to jsonMap(data))
-            }
-            prefs.edit().remove(PENDING_KEY).commit()
-            result
+    private fun drainDiagnostics(): Map<String, Any> = synchronized(PENDING_LOCK) {
+        if (!enabled) return@synchronized emptyDrain()
+        val existingToken = inFlightToken
+        val existingItems = inFlightItems
+        if (existingToken != null && existingItems != null) {
+            return@synchronized drainResponse(existingToken, existingItems)
         }
+        val prefs = preferences()
+        val raw = pendingRetryValue ?: prefs.getString(PENDING_KEY, null)
+            ?: return@synchronized emptyDrain()
+        val items = parsePending(raw) ?: return@synchronized emptyDrain()
+        if (items.isEmpty()) return@synchronized emptyDrain()
+        val token = UUID.randomUUID().toString()
+        val serialized = items.map { it.toString() }
+        inFlightToken = token
+        inFlightItems = serialized
+        drainResponse(token, serialized)
     }
+
+    private fun acknowledgeDiagnostics(token: String): Boolean = synchronized(PENDING_LOCK) {
+        if (token.isEmpty() || token != inFlightToken) return@synchronized false
+        val snapshot = inFlightItems ?: return@synchronized false
+        val prefs = preferences()
+        val raw = pendingRetryValue ?: prefs.getString(PENDING_KEY, null)
+            ?: return@synchronized false
+        val current = parsePending(raw) ?: return@synchronized false
+        if (current.size < snapshot.size ||
+            current.take(snapshot.size).map { it.toString() } != snapshot
+        ) return@synchronized false
+
+        val remaining = JSONArray()
+        current.drop(snapshot.size).forEach { remaining.put(it) }
+        repeat(MAX_COMMIT_ATTEMPTS) {
+            val committed = runCatching {
+                if (remaining.length() == 0) prefs.edit().remove(PENDING_KEY).commit()
+                else prefs.edit().putString(PENDING_KEY, remaining.toString()).commit()
+            }.getOrDefault(false)
+            if (committed) {
+                pendingRetryValue = null
+                inFlightToken = null
+                inFlightItems = null
+                return@synchronized true
+            }
+        }
+        pendingRetryValue = raw
+        false
+    }
+
+    private fun parsePending(raw: String): List<JSONObject>? = runCatching {
+        val events = JSONArray(raw)
+        (0 until events.length()).map { index ->
+            val item = events.optJSONObject(index) ?: error("invalid diagnostic event")
+            if (item.optString("kind").isEmpty() || item.optJSONObject("data") == null) {
+                error("invalid diagnostic event")
+            }
+            item
+        }
+    }.getOrNull()
+
+    private fun drainResponse(token: String, items: List<String>): Map<String, Any> = mapOf(
+        "token" to token,
+        "events" to items.map { raw ->
+            val item = JSONObject(raw)
+            mapOf("kind" to item.getString("kind"), "data" to jsonMap(item.getJSONObject("data")))
+        },
+    )
+
+    private fun emptyDrain(): Map<String, Any> = mapOf("token" to "", "events" to emptyList<Map<String, Any?>>())
 
     private fun appendPending(kind: String, data: Map<String, Any?>) {
         runCatching {
             synchronized(PENDING_LOCK) {
                 if (!enabled) return@synchronized
                 val prefs = preferences()
-                val current = JSONArray(prefs.getString(PENDING_KEY, "[]"))
+                val current = JSONArray(pendingRetryValue ?: prefs.getString(PENDING_KEY, "[]"))
                 while (current.length() >= MAX_PENDING_EVENTS) current.remove(0)
                 val json = JSONObject().put("kind", kind).put("data", JSONObject(data))
                 current.put(json)
-                prefs.edit().putString(PENDING_KEY, current.toString()).commit()
+                commitPending(prefs, current.toString())
             }
         }
+    }
+
+    private fun commitPending(prefs: android.content.SharedPreferences, value: String): Boolean {
+        repeat(MAX_COMMIT_ATTEMPTS) {
+            if (runCatching { prefs.edit().putString(PENDING_KEY, value).commit() }
+                    .getOrDefault(false)) {
+                pendingRetryValue = null
+                return true
+            }
+        }
+        pendingRetryValue = value
+        return false
+    }
+
+    private fun commitProcessExit(
+        prefs: android.content.SharedPreferences,
+        value: String,
+        timestamp: Long,
+    ): Boolean {
+        repeat(MAX_COMMIT_ATTEMPTS) {
+            if (runCatching {
+                    prefs.edit()
+                        .putString(PENDING_KEY, value)
+                        .putLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, timestamp)
+                        .commit()
+                }.getOrDefault(false)) {
+                pendingRetryValue = null
+                return true
+            }
+        }
+        pendingRetryValue = value
+        return false
     }
 
     private fun preferences() = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
@@ -322,6 +420,21 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
 
         private val PENDING_LOCK = Any()
+        private val ACTIVE_MODULES = Collections.newSetFromMap(
+            WeakHashMap<CrumbtrailFlutterPlugin, Boolean>(),
+        )
+        private var previousProcessHandler: Thread.UncaughtExceptionHandler? = null
+        private val SHARED_EXCEPTION_HANDLER = Thread.UncaughtExceptionHandler { thread, throwable ->
+            val modules: List<CrumbtrailFlutterPlugin>
+            val previous: Thread.UncaughtExceptionHandler?
+            synchronized(PENDING_LOCK) {
+                modules = ACTIVE_MODULES.toList()
+                previous = previousProcessHandler
+            }
+            modules.firstOrNull()?.recordUncaughtException(thread, throwable)
+            previous?.uncaughtException(thread, throwable)
+        }
+        private const val MAX_COMMIT_ATTEMPTS = 3
         private const val CHANNEL = "ai.crumbtrail/native_diagnostics"
         private const val PREFERENCES = "ai.crumbtrail.flutter"
         private const val PENDING_KEY = "native-diagnostics"
@@ -331,5 +444,9 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         private const val HANG_THRESHOLD_MS = 5_000L
         private const val CHECK_INTERVAL_MS = 1_000L
         private const val MAX_DURATION_MS = 86_400_000L
+        private const val MAX_PROCESS_EXIT_ENTRIES = 8
+        private var inFlightToken: String? = null
+        private var inFlightItems: List<String>? = null
+        private var pendingRetryValue: String? = null
     }
 }

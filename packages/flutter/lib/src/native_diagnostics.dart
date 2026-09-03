@@ -17,6 +17,14 @@ class CrumbtrailNativeDiagnosticEvent {
   final Map<String, Object?> data;
 }
 
+class CrumbtrailNativeDiagnosticBatch {
+  const CrumbtrailNativeDiagnosticBatch(
+      {required this.token, required this.events});
+
+  final String token;
+  final List<CrumbtrailNativeDiagnosticEvent> events;
+}
+
 class CrumbtrailNativeCapabilityDetail {
   const CrumbtrailNativeCapabilityDetail({
     required this.supported,
@@ -102,12 +110,14 @@ CrumbtrailNativeCapabilityDetail _withEnabled(
 abstract interface class CrumbtrailNativeDiagnosticsPlatform {
   Future<CrumbtrailNativeCapabilities> getCapabilities();
 
-  Future<List<CrumbtrailNativeDiagnosticEvent>> drainDiagnostics();
+  Future<CrumbtrailNativeDiagnosticBatch> drainDiagnostics();
+
+  Future<bool> acknowledgeDiagnostics(String token);
 }
 
 /// Optional configuration seam for platform plugins that own native
-/// collectors. Keeping it separate preserves compatibility with custom bridge
-/// implementations that only support capability reads and drains.
+/// collectors. The diagnostics platform still owns the required drain and
+/// acknowledgment contract.
 abstract interface class CrumbtrailNativeDiagnosticsConfigurable {
   Future<void> setEnabled(bool enabled);
 }
@@ -145,66 +155,111 @@ class MethodChannelCrumbtrailNativeDiagnostics
   }
 
   @override
-  Future<List<CrumbtrailNativeDiagnosticEvent>> drainDiagnostics() async {
+  Future<CrumbtrailNativeDiagnosticBatch> drainDiagnostics() async {
     try {
       final raw = await _channel.invokeMethod<Object?>('drainDiagnostics');
-      if (raw is! List) return const [];
-      return raw
-          .map(_parseEvent)
-          .whereType<CrumbtrailNativeDiagnosticEvent>()
-          .toList();
+      if (raw is! Map || raw['token'] is! String || raw['events'] is! List) {
+        return const CrumbtrailNativeDiagnosticBatch(token: '', events: []);
+      }
+      final parsed = (raw['events'] as List).map(_parseEvent).toList();
+      if (parsed.any((event) => event == null)) {
+        return const CrumbtrailNativeDiagnosticBatch(token: '', events: []);
+      }
+      final events =
+          parsed.whereType<CrumbtrailNativeDiagnosticEvent>().toList();
+      final token = raw['token'] as String;
+      if (events.isNotEmpty && token.isEmpty) {
+        return const CrumbtrailNativeDiagnosticBatch(token: '', events: []);
+      }
+      return CrumbtrailNativeDiagnosticBatch(token: token, events: events);
     } on Object {
-      return const [];
+      return const CrumbtrailNativeDiagnosticBatch(token: '', events: []);
+    }
+  }
+
+  @override
+  Future<bool> acknowledgeDiagnostics(String token) async {
+    if (token.isEmpty) return false;
+    try {
+      return await _channel.invokeMethod<bool>(
+              'acknowledgeDiagnostics', token) ==
+          true;
+    } on Object {
+      return false;
     }
   }
 }
 
-/// A synchronous bounded handoff for a Dart watchdog observation.
+typedef CrumbtrailHangAcceptance = FutureOr<bool> Function(
+    Map<String, Object?> event);
+
+/// The complete durable handoff lifecycle. A custom implementation must
+/// serialize each primitive so its durable write, host acceptance callback, and
+/// compare-and-clear cannot be reordered by another operation.
 abstract interface class CrumbtrailDartHangHandoff {
-  Map<String, Object?>? read();
+  Future<bool> deliver(
+      Map<String, Object?> event, CrumbtrailHangAcceptance accept);
 
-  void write(Map<String, Object?> event);
-
-  void clear();
+  Future<bool> drain(CrumbtrailHangAcceptance accept);
 }
 
-/// Async persistence operations used when a platform write can outlive the
-/// current Dart callback. The synchronous methods remain the compatibility
-/// seam for in-memory and existing custom handoffs.
-abstract interface class CrumbtrailAsyncDartHangHandoff {
-  Future<void> writeAndWait(Map<String, Object?> event);
-
-  Future<void> clearIfCurrent(Map<String, Object?> event);
+Future<bool> _safeAccept(
+    CrumbtrailHangAcceptance accept, Map<String, Object?> event) async {
+  try {
+    return await accept(event) == true;
+  } on Object {
+    return false;
+  }
 }
 
-class MemoryCrumbtrailDartHangHandoff
-    implements CrumbtrailDartHangHandoff, CrumbtrailAsyncDartHangHandoff {
+class MemoryCrumbtrailDartHangHandoff implements CrumbtrailDartHangHandoff {
   Map<String, Object?>? _pending;
+  Future<void> _tail = Future<void>.value();
 
   @override
-  Map<String, Object?>? read() => _pending == null ? null : {..._pending!};
-
-  @override
-  void write(Map<String, Object?> event) {
-    _pending = _boundedEvent(event);
+  Future<bool> deliver(
+      Map<String, Object?> event, CrumbtrailHangAcceptance accept) {
+    return _enqueue(() async {
+      final durable = _boundedEvent(event);
+      _pending = durable;
+      if (!await _safeAccept(accept, durable)) return false;
+      if (_pending == null || !_sameHangData(_pending!, durable)) return false;
+      _pending = null;
+      return true;
+    });
   }
 
   @override
-  void clear() {
-    _pending = null;
+  Future<bool> drain(CrumbtrailHangAcceptance accept) {
+    return _enqueue(() async {
+      final durable = _pending;
+      if (durable == null) {
+        return false;
+      }
+      if (!await _safeAccept(accept, {
+        ...durable,
+        'recovered': false,
+        'previousLaunch': true,
+      })) {
+        return false;
+      }
+      if (_pending == null || !_sameHangData(_pending!, durable)) {
+        return false;
+      }
+      _pending = null;
+      return true;
+    });
   }
 
-  @override
-  Future<void> writeAndWait(Map<String, Object?> event) async => write(event);
-
-  @override
-  Future<void> clearIfCurrent(Map<String, Object?> event) async {
-    if (_pending != null && _sameHangData(_pending!, event)) clear();
+  Future<bool> _enqueue(Future<bool> Function() operation) {
+    final next =
+        _tail.then<bool>((_) => operation(), onError: (_) => operation());
+    _tail = next.then<void>((_) {}, onError: (_) {});
+    return next;
   }
 }
 
-class SharedPreferencesDartHangHandoff
-    implements CrumbtrailDartHangHandoff, CrumbtrailAsyncDartHangHandoff {
+class SharedPreferencesDartHangHandoff implements CrumbtrailDartHangHandoff {
   SharedPreferencesDartHangHandoff(
     this.preferences, {
     this.key = 'crumbtrail.dart.native-hang',
@@ -215,48 +270,67 @@ class SharedPreferencesDartHangHandoff
   Future<void> _pendingOperation = Future<void>.value();
 
   @override
-  Map<String, Object?>? read() {
-    final raw = preferences.getString(key);
-    if (raw == null || raw.isEmpty) return null;
+  Future<bool> deliver(
+      Map<String, Object?> event, CrumbtrailHangAcceptance accept) {
+    return _enqueue(() async {
+      final durable = _boundedEvent(event);
+      final encoded = jsonEncode(durable);
+      if (!await preferences.setString(key, encoded)) return false;
+      if (!await _safeAccept(accept, durable)) return false;
+      return _clearIfCurrent(encoded);
+    });
+  }
+
+  @override
+  Future<bool> drain(CrumbtrailHangAcceptance accept) {
+    return _enqueue(() async {
+      final raw = preferences.getString(key);
+      if (raw == null || raw.isEmpty) {
+        return false;
+      }
+      final value = _safeParseHang(raw);
+      if (value == null) {
+        return false;
+      }
+      if (!await _safeAccept(accept, {
+        ...value,
+        'recovered': false,
+        'previousLaunch': true,
+      })) {
+        return false;
+      }
+      if (preferences.getString(key) != raw) {
+        return false;
+      }
+      return preferences.remove(key);
+    });
+  }
+
+  Future<bool> _enqueue(Future<bool> Function() operation) {
+    final next = _pendingOperation.then<bool>(
+      (_) => operation(),
+      onError: (_) => operation(),
+    );
+    _pendingOperation = next.then<void>((_) {}, onError: (_) {});
+    return next;
+  }
+
+  Future<bool> _clearIfCurrent(String expected) async {
+    if (preferences.getString(key) != expected) return false;
+    try {
+      return await preferences.remove(key);
+    } on Object {
+      return false;
+    }
+  }
+
+  Map<String, Object?>? _safeParseHang(String raw) {
     try {
       final value = jsonDecode(raw);
       return value is Map ? _parseHangData(value) : null;
     } on Object {
       return null;
     }
-  }
-
-  @override
-  void write(Map<String, Object?> event) {
-    unawaited(writeAndWait(event).catchError((_) {}));
-  }
-
-  @override
-  Future<void> writeAndWait(Map<String, Object?> event) => _enqueue(() async {
-        await preferences.setString(key, jsonEncode(_boundedEvent(event)));
-      });
-
-  @override
-  void clear() {
-    unawaited(_enqueue(() async {
-      await preferences.remove(key);
-    }).catchError((_) {}));
-  }
-
-  @override
-  Future<void> clearIfCurrent(Map<String, Object?> event) => _enqueue(() async {
-        final current = preferences.getString(key);
-        if (current != jsonEncode(_boundedEvent(event))) return;
-        await preferences.remove(key);
-      });
-
-  Future<void> _enqueue(Future<void> Function() operation) {
-    final next = _pendingOperation.then<void>(
-      (_) => operation(),
-      onError: (_) => operation(),
-    );
-    _pendingOperation = next.then<void>((_) {}, onError: (_) {});
-    return next;
   }
 }
 
@@ -274,7 +348,7 @@ class CrumbtrailDartEventLoopWatchdog {
   })  : _now = now,
         _debuggerAttached = debuggerAttached ?? (() => false);
 
-  final void Function(Map<String, Object?> data) onHang;
+  final CrumbtrailHangAcceptance onHang;
   final CrumbtrailDartHangHandoff? handoff;
   final Duration threshold;
   final Duration checkInterval;
@@ -290,20 +364,20 @@ class CrumbtrailDartEventLoopWatchdog {
   bool _foreground = true;
   bool _reportedForBlock = false;
   bool _stopped = false;
+  final Set<Future<void>> _inFlight = <Future<void>>{};
 
   /// Starts the watchdog and imports one bounded prior-launch handoff.
   void start({bool foreground = true}) {
     if (_stopped) return;
     _foreground = foreground;
     _lastTick = _clockNow();
-    final pending = _safeRead();
-    if (pending != null && _isValidHangData(pending)) {
-      _safeEmit({
-        ...pending,
-        'recovered': false,
-        'previousLaunch': true,
-      });
-      _safeClearIfCurrent(pending);
+    final currentHandoff = handoff;
+    if (currentHandoff != null) {
+      _track(currentHandoff.drain((event) => _accept({
+            ...event,
+            'recovered': false,
+            'previousLaunch': true,
+          })));
     }
     _timer?.cancel();
     final interval = checkInterval <= Duration.zero
@@ -326,11 +400,15 @@ class CrumbtrailDartEventLoopWatchdog {
     _lastTick = _clockNow();
   }
 
-  void stop() {
-    if (_stopped) return;
+  Future<void> stop() async {
+    if (_stopped) {
+      await Future.wait(_inFlight);
+      return;
+    }
     _stopped = true;
     _timer?.cancel();
     _timer = null;
+    await Future.wait(_inFlight);
   }
 
   bool get _isSuppressed {
@@ -361,46 +439,20 @@ class CrumbtrailDartEventLoopWatchdog {
       'recovered': true,
       'previousLaunch': false,
     });
-    unawaited(_persistAndEmit(data));
+    _track(_persistAndEmit(data));
   }
 
-  Future<void> _persistAndEmit(Map<String, Object?> data) async {
-    var persisted = false;
+  Future<bool> _persistAndEmit(Map<String, Object?> data) async {
     final currentHandoff = handoff;
-    if (currentHandoff is CrumbtrailAsyncDartHangHandoff) {
-      try {
-        await (currentHandoff as CrumbtrailAsyncDartHangHandoff)
-            .writeAndWait(data);
-        persisted = true;
-      } on Object {
-        // A storage failure must not suppress an in-memory observation.
-      }
-    } else if (_tryWrite(data)) {
-      persisted = true;
+    if (currentHandoff == null) {
+      return _accept(data);
     }
-    _safeEmit(data);
-    if (!persisted || currentHandoff == null) return;
-    if (currentHandoff is CrumbtrailAsyncDartHangHandoff) {
-      try {
-        await (currentHandoff as CrumbtrailAsyncDartHangHandoff)
-            .clearIfCurrent(data);
-      } on Object {
-        // A failed clear leaves the handoff for the next launch.
-      }
-    } else {
-      _safeClear();
+    try {
+      return await currentHandoff.deliver(data, _accept);
+    } on Object {
+      // A storage failure is isolated from the host.
+      return false;
     }
-  }
-
-  void _safeClearIfCurrent(Map<String, Object?> expected) {
-    final currentHandoff = handoff;
-    if (currentHandoff is CrumbtrailAsyncDartHangHandoff) {
-      unawaited((currentHandoff as CrumbtrailAsyncDartHangHandoff)
-          .clearIfCurrent(expected)
-          .catchError((_) {}));
-      return;
-    }
-    if (_sameHangData(_safeRead(), expected)) _safeClear();
   }
 
   Duration _clockNow() {
@@ -413,39 +465,20 @@ class CrumbtrailDartEventLoopWatchdog {
     return _monotonicClock.elapsed;
   }
 
-  Map<String, Object?>? _safeRead() {
+  Future<bool> _accept(Map<String, Object?> data) async {
+    if (_stopped) return false;
     try {
-      return handoff?.read();
+      final accepted = await onHang(data) == true;
+      return !_stopped && accepted;
     } on Object {
-      return null;
-    }
-  }
-
-  bool _tryWrite(Map<String, Object?> data) {
-    try {
-      if (handoff == null) return false;
-      handoff!.write(data);
-      return true;
-    } on Object {
-      // A storage failure is capture loss, never a host failure.
       return false;
     }
   }
 
-  void _safeClear() {
-    try {
-      handoff?.clear();
-    } on Object {
-      // Best effort only.
-    }
-  }
-
-  void _safeEmit(Map<String, Object?> data) {
-    try {
-      onHang(data);
-    } on Object {
-      // A logger teardown race must not escape the watchdog callback.
-    }
+  void _track(Future<bool> operation) {
+    final pending = operation.then<void>((_) {}, onError: (_) {});
+    _inFlight.add(pending);
+    unawaited(pending.whenComplete(() => _inFlight.remove(pending)));
   }
 }
 

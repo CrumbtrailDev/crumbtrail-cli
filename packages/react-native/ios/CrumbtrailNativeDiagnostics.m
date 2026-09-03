@@ -7,6 +7,7 @@ static NSString * const CTNativeDiagnosticsPendingKey = @"native-diagnostics";
 static NSString * const CTNativeDiagnosticsSuite = @"ai.crumbtrail.react-native";
 static NSUInteger const CTNativeDiagnosticsMaxEvents = 32;
 static NSUInteger const CTNativeDiagnosticsMaxText = 8192;
+static NSUInteger const CTNativeDiagnosticsMaxPersistenceAttempts = 3;
 static NSTimeInterval const CTNativeDiagnosticsHangThreshold = 5.0;
 
 @class CrumbtrailNativeDiagnostics;
@@ -14,6 +15,8 @@ static NSHashTable<CrumbtrailNativeDiagnostics *> *CTActiveNativeDiagnostics;
 static NSUncaughtExceptionHandler *CTPreviousExceptionHandler;
 static NSLock *CTExceptionHandlerLock;
 static NSLock *CTPendingEventsLock;
+static NSString *CTInFlightDiagnosticsToken;
+static NSArray<NSDictionary *> *CTInFlightDiagnosticsEvents;
 
 @interface CrumbtrailNativeDiagnostics : NSObject <RCTBridgeModule> {
   dispatch_source_t _watchdog;
@@ -25,7 +28,9 @@ static NSLock *CTPendingEventsLock;
 }
 - (void)appendPendingKind:(NSString *)kind data:(NSDictionary *)data;
 - (void)startCollectors;
-- (void)stopCollectors:(BOOL)clearPending;
+- (void)stopCollectors;
+- (NSDictionary *)responseEvent:(id)value;
+- (NSDictionary *)emptyDiagnosticsBatch;
 @end
 
 static void CTNativeDiagnosticsUncaughtException(NSException *exception) {
@@ -35,7 +40,8 @@ static void CTNativeDiagnosticsUncaughtException(NSException *exception) {
   modules = CTActiveNativeDiagnostics.allObjects;
   previous = CTPreviousExceptionHandler;
   [CTExceptionHandlerLock unlock];
-  for (CrumbtrailNativeDiagnostics *module in modules) {
+  CrumbtrailNativeDiagnostics *module = modules.firstObject;
+  if (module) {
     [module appendPendingKind:@"native-crash" data:@{
       @"msg": exception.reason ?: exception.name ?: @"uncaught exception",
       @"stk": [[exception callStackSymbols] componentsJoinedByString:@"\n"],
@@ -102,27 +108,102 @@ RCT_EXPORT_METHOD(getCapabilities:(RCTPromiseResolveBlock)resolve
 
 RCT_EXPORT_METHOD(setEnabled:(BOOL)enabled) {
   if (enabled) [self startCollectors];
-  else [self stopCollectors:YES];
+  else [self stopCollectors];
 }
 
 RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject) {
   @try {
-    NSArray *events = [self pendingEventsAndClear];
-    NSMutableArray *result = [NSMutableArray arrayWithCapacity:events.count];
-    for (id value in events) {
-      if (![value isKindOfClass:[NSDictionary class]]) continue;
-      NSDictionary *item = (NSDictionary *)value;
-      NSString *kind = item[@"kind"];
-      NSDictionary *data = item[@"data"];
-      if (![kind isKindOfClass:[NSString class]] ||
-          ![data isKindOfClass:[NSDictionary class]]) continue;
-      [result addObject:@{ @"kind": kind, @"data": [self boundedData:data] }];
+    [CTPendingEventsLock lock];
+    @try {
+      if (!_enabled) {
+        resolve([self emptyDiagnosticsBatch]);
+        return;
+      }
+      if (CTInFlightDiagnosticsToken && CTInFlightDiagnosticsEvents) {
+        NSMutableArray *events = [NSMutableArray arrayWithCapacity:CTInFlightDiagnosticsEvents.count];
+        for (NSDictionary *value in CTInFlightDiagnosticsEvents) {
+          NSDictionary *event = [self responseEvent:value];
+          if (!event) {
+            resolve([self emptyDiagnosticsBatch]);
+            return;
+          }
+          [events addObject:event];
+        }
+        resolve(@{ @"token": CTInFlightDiagnosticsToken, @"events": events });
+        return;
+      }
+      NSArray *raw = [[self defaults] arrayForKey:CTNativeDiagnosticsPendingKey] ?: @[];
+      if (raw.count == 0) {
+        resolve([self emptyDiagnosticsBatch]);
+        return;
+      }
+      NSMutableArray *events = [NSMutableArray arrayWithCapacity:raw.count];
+      for (id value in raw) {
+        NSDictionary *event = [self responseEvent:value];
+        if (!event) {
+          resolve([self emptyDiagnosticsBatch]);
+          return;
+        }
+        [events addObject:event];
+      }
+      CTInFlightDiagnosticsToken = [NSUUID UUID].UUIDString;
+      CTInFlightDiagnosticsEvents = [raw copy];
+      resolve(@{ @"token": CTInFlightDiagnosticsToken, @"events": events });
+    } @finally {
+      [CTPendingEventsLock unlock];
     }
-    resolve(result);
   } @catch (__unused NSException *exception) {
-    resolve(@[]);
+    resolve([self emptyDiagnosticsBatch]);
   }
+}
+
+RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+  BOOL accepted = NO;
+  [CTPendingEventsLock lock];
+  @try {
+    if (token.length > 0 && [token isEqualToString:CTInFlightDiagnosticsToken]) {
+      NSArray *snapshot = CTInFlightDiagnosticsEvents;
+      NSArray *current = [[self defaults] arrayForKey:CTNativeDiagnosticsPendingKey];
+      if (snapshot && current.count >= snapshot.count) {
+        accepted = YES;
+        for (NSUInteger index = 0; index < snapshot.count; index++) {
+          if (![current[index] isEqual:snapshot[index]]) {
+            accepted = NO;
+            break;
+          }
+        }
+        if (accepted) {
+          NSArray *remaining = [current subarrayWithRange:NSMakeRange(snapshot.count, current.count - snapshot.count)];
+          NSUserDefaults *defaults = [self defaults];
+          BOOL committed = NO;
+          for (NSUInteger attempt = 0; attempt < CTNativeDiagnosticsMaxPersistenceAttempts; attempt++) {
+            if (remaining.count == 0) [defaults removeObjectForKey:CTNativeDiagnosticsPendingKey];
+            else [defaults setObject:remaining forKey:CTNativeDiagnosticsPendingKey];
+            if ([defaults synchronize]) {
+              committed = YES;
+              break;
+            }
+          }
+          if (!committed) {
+            [defaults setObject:current forKey:CTNativeDiagnosticsPendingKey];
+            accepted = NO;
+          }
+        }
+      }
+    }
+    if (accepted) {
+      CTInFlightDiagnosticsToken = nil;
+      CTInFlightDiagnosticsEvents = nil;
+    }
+  } @catch (__unused NSException *exception) {
+    accepted = NO;
+  } @finally {
+    [CTPendingEventsLock unlock];
+  }
+  resolve(@(accepted));
 }
 
 - (NSDictionary<NSString *, NSNumber *> *)capability {
@@ -142,7 +223,7 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
   [self startWatchdog];
 }
 
-- (void)stopCollectors:(BOOL)clearPending {
+- (void)stopCollectors {
   _enabled = NO;
   if (_watchdog) {
     dispatch_source_cancel(_watchdog);
@@ -155,12 +236,6 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
   if (_collectorsStarted) CTUnregisterNativeDiagnostics(self);
   _collectorsStarted = NO;
   _watchdogPending = NO;
-  if (clearPending) {
-    [CTPendingEventsLock lock];
-    NSUserDefaults *defaults = [self defaults];
-    [defaults removeObjectForKey:CTNativeDiagnosticsPendingKey];
-    [CTPendingEventsLock unlock];
-  }
 }
 
 - (void)installLifecycleCollector {
@@ -232,10 +307,21 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
     }
     NSUserDefaults *defaults = [self defaults];
     NSMutableArray *events = [[defaults arrayForKey:CTNativeDiagnosticsPendingKey] mutableCopy] ?: [NSMutableArray array];
+    NSArray *previous = [events copy];
     while (events.count >= CTNativeDiagnosticsMaxEvents) [events removeObjectAtIndex:0];
     [events addObject:@{ @"kind": kind, @"data": [self boundedData:data] }];
-    [defaults setObject:events forKey:CTNativeDiagnosticsPendingKey];
-    [defaults synchronize];
+    BOOL committed = NO;
+    for (NSUInteger attempt = 0; attempt < CTNativeDiagnosticsMaxPersistenceAttempts; attempt++) {
+      [defaults setObject:events forKey:CTNativeDiagnosticsPendingKey];
+      if ([defaults synchronize]) {
+        committed = YES;
+        break;
+      }
+    }
+    if (!committed) {
+      if (previous.count == 0) [defaults removeObjectForKey:CTNativeDiagnosticsPendingKey];
+      else [defaults setObject:previous forKey:CTNativeDiagnosticsPendingKey];
+    }
   } @catch (__unused NSException *exception) {
     // A diagnostics write is best effort and never a host failure.
   } @finally {
@@ -243,17 +329,17 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
   }
 }
 
-- (NSArray *)pendingEventsAndClear {
-  [CTPendingEventsLock lock];
-  @try {
-    if (!_enabled) return @[];
-    NSUserDefaults *defaults = [self defaults];
-    NSArray *events = [defaults arrayForKey:CTNativeDiagnosticsPendingKey] ?: @[];
-    [defaults removeObjectForKey:CTNativeDiagnosticsPendingKey];
-    return events;
-  } @finally {
-    [CTPendingEventsLock unlock];
-  }
+- (NSDictionary *)responseEvent:(id)value {
+  if (![value isKindOfClass:[NSDictionary class]]) return nil;
+  NSDictionary *item = (NSDictionary *)value;
+  NSString *kind = item[@"kind"];
+  NSDictionary *data = item[@"data"];
+  if (![kind isKindOfClass:[NSString class]] || ![data isKindOfClass:[NSDictionary class]]) return nil;
+  return @{ @"kind": kind, @"data": [self boundedData:data] };
+}
+
+- (NSDictionary *)emptyDiagnosticsBatch {
+  return @{ @"token": @"", @"events": @[] };
 }
 
 - (NSDictionary *)boundedData:(NSDictionary *)data {
@@ -272,7 +358,7 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
 }
 
 - (void)dealloc {
-  [self stopCollectors:NO];
+  [self stopCollectors];
 }
 
 @end

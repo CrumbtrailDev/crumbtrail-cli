@@ -20,6 +20,9 @@ import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.Collections
+import java.util.UUID
+import java.util.WeakHashMap
 
 /**
  * Optional native diagnostics module for React Native. It only owns bounded
@@ -40,8 +43,6 @@ class CrumbtrailNativeDiagnosticsModule(
     @Volatile private var watchdogPending = false
     @Volatile private var enabled = false
     private var collectorsStarted = false
-    private var previousHandler: Thread.UncaughtExceptionHandler? = null
-    private var installedHandler: Thread.UncaughtExceptionHandler? = null
     private var activityCallbacks: Application.ActivityLifecycleCallbacks? = null
 
     override fun getName(): String = MODULE_NAME
@@ -53,7 +54,7 @@ class CrumbtrailNativeDiagnosticsModule(
 
     @ReactMethod
     fun setEnabled(value: Boolean) {
-        if (value) startCollectors() else stopCollectors(clearPending = true)
+        if (value) startCollectors() else stopCollectors()
     }
 
     @ReactMethod
@@ -61,8 +62,13 @@ class CrumbtrailNativeDiagnosticsModule(
         try {
             promise.resolve(drainPending())
         } catch (_: Exception) {
-            promise.resolve(Arguments.createArray())
+            promise.resolve(emptyDrain())
         }
+    }
+
+    @ReactMethod
+    fun acknowledgeDiagnostics(token: String, promise: Promise) {
+        promise.resolve(acknowledgePending(token))
     }
 
     private fun startCollectors() {
@@ -71,49 +77,101 @@ class CrumbtrailNativeDiagnosticsModule(
             enabled = true
             collectorsStarted = true
         }
-        installCrashHandler()
+        registerCrashHandler()
         installLifecycleCollector()
         collectPreviousProcessExit()
         startWatchdog()
     }
 
-    private fun stopCollectors(clearPending: Boolean) {
+    private fun stopCollectors() {
         enabled = false
         watchdogTask?.cancel(true)
         watchdogTask = null
         activityCallbacks?.let { application?.unregisterActivityLifecycleCallbacks(it) }
         activityCallbacks = null
-        if (installedHandler != null && Thread.getDefaultUncaughtExceptionHandler() === installedHandler) {
-            Thread.setDefaultUncaughtExceptionHandler(previousHandler)
-        }
-        installedHandler = null
-        previousHandler = null
         synchronized(PENDING_LOCK) {
+            ACTIVE_MODULES.remove(this)
+            if (ACTIVE_MODULES.isEmpty() &&
+                Thread.getDefaultUncaughtExceptionHandler() === SHARED_EXCEPTION_HANDLER
+            ) {
+                Thread.setDefaultUncaughtExceptionHandler(previousProcessHandler)
+            }
+            if (ACTIVE_MODULES.isEmpty()) previousProcessHandler = null
             collectorsStarted = false
             watchdogPending = false
-            if (clearPending) {
-                preferences.edit()
-                    .remove(PENDING_KEY)
-                    .remove(LAST_PROCESS_EXIT_TIMESTAMP_KEY)
-                    .commit()
-            }
         }
     }
 
-    private fun drainPending(): WritableArray = synchronized(PENDING_LOCK) {
+    private fun drainPending(): Map<String, Any> = synchronized(PENDING_LOCK) {
+        if (!enabled) return@synchronized emptyDrain()
+        val existingToken = inFlightToken
+        val existingItems = inFlightItems
+        if (existingToken != null && existingItems != null) {
+            return@synchronized drainResponse(existingToken, existingItems)
+        }
+        val raw = pendingRetryValue ?: preferences.getString(PENDING_KEY, null)
+            ?: return@synchronized emptyDrain()
+        val items = parsePending(raw) ?: return@synchronized emptyDrain()
+        if (items.isEmpty()) return@synchronized emptyDrain()
+        val token = UUID.randomUUID().toString()
+        val serialized = items.map { it.toString() }
+        inFlightToken = token
+        inFlightItems = serialized
+        drainResponse(token, serialized)
+    }
+
+    private fun acknowledgePending(token: String): Boolean = synchronized(PENDING_LOCK) {
+        if (token.isEmpty() || token != inFlightToken) return@synchronized false
+        val snapshot = inFlightItems ?: return@synchronized false
+        val raw = pendingRetryValue ?: preferences.getString(PENDING_KEY, null)
+            ?: return@synchronized false
+        val current = parsePending(raw) ?: return@synchronized false
+        if (current.size < snapshot.size ||
+            current.take(snapshot.size).map { it.toString() } != snapshot
+        ) return@synchronized false
+
+        val remaining = JSONArray()
+        current.drop(snapshot.size).forEach { remaining.put(it) }
+        repeat(MAX_COMMIT_ATTEMPTS) {
+            val committed = runCatching {
+                if (remaining.length() == 0) {
+                    preferences.edit().remove(PENDING_KEY).commit()
+                } else {
+                    preferences.edit().putString(PENDING_KEY, remaining.toString()).commit()
+                }
+            }.getOrDefault(false)
+            if (committed) {
+                pendingRetryValue = null
+                inFlightToken = null
+                inFlightItems = null
+                return@synchronized true
+            }
+        }
+        pendingRetryValue = raw
+        false
+    }
+
+    private fun parsePending(raw: String): List<JSONObject>? = runCatching {
+        val events = JSONArray(raw)
+        (0 until events.length()).map { index ->
+            val item = events.optJSONObject(index) ?: error("invalid diagnostic event")
+            if (item.optString("kind").isEmpty() || item.optJSONObject("data") == null) {
+                error("invalid diagnostic event")
+            }
+            item
+        }
+    }.getOrNull()
+
+    private fun drainResponse(token: String, items: List<String>): Map<String, Any> {
         val output = Arguments.createArray()
-        if (!enabled) return@synchronized output
-        val raw = preferences.getString(PENDING_KEY, null) ?: return@synchronized output
-        val events = runCatching { JSONArray(raw) }.getOrNull() ?: return@synchronized output
-        for (index in 0 until events.length()) {
-            val item = events.optJSONObject(index) ?: continue
-            val data = item.optJSONObject("data") ?: continue
+        items.forEach { raw ->
+            val item = JSONObject(raw)
+            val data = item.getJSONObject("data")
             val map = Arguments.createMap()
-            map.putString("kind", item.optString("kind"))
+            map.putString("kind", item.getString("kind"))
             val dataMap = Arguments.createMap()
             data.keys().forEach { key ->
-                val value = data.opt(key)
-                when (value) {
+                when (val value = data.opt(key)) {
                     is String -> dataMap.putString(key, value)
                     is Boolean -> dataMap.putBoolean(key, value)
                     is Int -> dataMap.putInt(key, value)
@@ -125,9 +183,13 @@ class CrumbtrailNativeDiagnosticsModule(
             map.putMap("data", dataMap)
             output.pushMap(map)
         }
-        preferences.edit().remove(PENDING_KEY).commit()
-        output
+        return mapOf("token" to token, "events" to output)
     }
+
+    private fun emptyDrain(): Map<String, Any> = mapOf(
+        "token" to "",
+        "events" to Arguments.createArray(),
+    )
 
     private fun capabilities(): Map<String, Any> = mapOf(
         "nativeDiagnostics" to capability(),
@@ -142,20 +204,25 @@ class CrumbtrailNativeDiagnosticsModule(
         "observed" to false,
     )
 
-    private fun installCrashHandler() {
-        previousHandler = Thread.getDefaultUncaughtExceptionHandler()
-        val handler = Thread.UncaughtExceptionHandler { thread, throwable ->
-            if (!enabled) return@UncaughtExceptionHandler
-            appendPending("native-crash", mapOf(
-                "msg" to bounded(throwable.message ?: throwable.toString()),
-                "stk" to bounded(throwable.stackTraceToString()),
-                "source" to "previous-launch",
-                "thread" to bounded(thread.name),
-            ))
-            previousHandler?.uncaughtException(thread, throwable)
+    private fun registerCrashHandler() {
+        synchronized(PENDING_LOCK) {
+            ACTIVE_MODULES.add(this)
+            val current = Thread.getDefaultUncaughtExceptionHandler()
+            if (current !== SHARED_EXCEPTION_HANDLER) {
+                previousProcessHandler = current
+                Thread.setDefaultUncaughtExceptionHandler(SHARED_EXCEPTION_HANDLER)
+            }
         }
-        installedHandler = handler
-        Thread.setDefaultUncaughtExceptionHandler(handler)
+    }
+
+    private fun recordUncaughtException(thread: Thread, throwable: Throwable) {
+        if (!enabled) return
+        appendPending("native-crash", mapOf(
+            "msg" to bounded(throwable.message ?: throwable.toString()),
+            "stk" to bounded(throwable.stackTraceToString()),
+            "source" to "previous-launch",
+            "thread" to bounded(thread.name),
+        ))
     }
 
     private fun installLifecycleCollector() {
@@ -186,18 +253,29 @@ class CrumbtrailNativeDiagnosticsModule(
                 if (!enabled) return@synchronized
                 val lastSeen = preferences.getLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, 0L)
                 var newest = lastSeen
-                val pending = JSONArray(preferences.getString(PENDING_KEY, "[]"))
-                manager.getHistoricalProcessExitReasons(reactContext.packageName, 0, 4)
+                val pending = JSONArray(
+                    pendingRetryValue ?: preferences.getString(PENDING_KEY, "[]"),
+                )
+                val exits = manager.getHistoricalProcessExitReasons(
+                    reactContext.packageName,
+                    0,
+                    MAX_PROCESS_EXIT_ENTRIES,
+                )
                     .filter { it.timestamp > lastSeen }
-                    .forEach { info ->
-                        newest = maxOf(newest, info.timestamp)
-                        appendProcessExit(pending, info)
-                    }
+                    .sortedWith(compareBy(
+                        { it.timestamp },
+                        { it.reason },
+                        { it.importance },
+                        { it.status },
+                        { it.description ?: "" },
+                    ))
+                    .take(MAX_PROCESS_EXIT_ENTRIES)
+                exits.forEach { info ->
+                    newest = maxOf(newest, info.timestamp)
+                    appendProcessExit(pending, info)
+                }
                 if (newest > lastSeen) {
-                    val committed = preferences.edit()
-                        .putString(PENDING_KEY, pending.toString())
-                        .putLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, newest)
-                        .commit()
+                    val committed = commitProcessExit(pending.toString(), newest)
                     if (!committed) return@synchronized
                 }
             }
@@ -275,18 +353,46 @@ class CrumbtrailNativeDiagnosticsModule(
         runCatching {
             synchronized(PENDING_LOCK) {
                 if (!enabled) return@synchronized
-                val current = JSONArray(preferences.getString(PENDING_KEY, "[]"))
+                val current = JSONArray(pendingRetryValue ?: preferences.getString(PENDING_KEY, "[]"))
                 while (current.length() >= MAX_PENDING_EVENTS) current.remove(0)
                 current.put(JSONObject().put("kind", kind).put("data", JSONObject(data)))
-                preferences.edit().putString(PENDING_KEY, current.toString()).commit()
+                commitPending(current.toString())
             }
         }
+    }
+
+    private fun commitPending(value: String): Boolean {
+        repeat(MAX_COMMIT_ATTEMPTS) {
+            if (runCatching { preferences.edit().putString(PENDING_KEY, value).commit() }
+                    .getOrDefault(false)) {
+                pendingRetryValue = null
+                return true
+            }
+        }
+        pendingRetryValue = value
+        return false
+    }
+
+    private fun commitProcessExit(value: String, timestamp: Long): Boolean {
+        repeat(MAX_COMMIT_ATTEMPTS) {
+            if (runCatching {
+                    preferences.edit()
+                        .putString(PENDING_KEY, value)
+                        .putLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, timestamp)
+                        .commit()
+                }.getOrDefault(false)) {
+                pendingRetryValue = null
+                return true
+            }
+        }
+        pendingRetryValue = value
+        return false
     }
 
     private fun bounded(value: String): String = value.take(MAX_TEXT)
 
     override fun onCatalystInstanceDestroy() {
-        stopCollectors(clearPending = false)
+        stopCollectors()
         executor.shutdownNow()
         super.onCatalystInstanceDestroy()
     }
@@ -294,6 +400,24 @@ class CrumbtrailNativeDiagnosticsModule(
     companion object {
         const val MODULE_NAME = "CrumbtrailNativeDiagnostics"
         private val PENDING_LOCK = Any()
+        private val ACTIVE_MODULES = Collections.newSetFromMap(
+            WeakHashMap<CrumbtrailNativeDiagnosticsModule, Boolean>(),
+        )
+        private var previousProcessHandler: Thread.UncaughtExceptionHandler? = null
+        private val SHARED_EXCEPTION_HANDLER = Thread.UncaughtExceptionHandler { thread, throwable ->
+            val modules: List<CrumbtrailNativeDiagnosticsModule>
+            val previous: Thread.UncaughtExceptionHandler?
+            synchronized(PENDING_LOCK) {
+                modules = ACTIVE_MODULES.toList()
+                previous = previousProcessHandler
+            }
+            modules.firstOrNull()?.recordUncaughtException(thread, throwable)
+            previous?.uncaughtException(thread, throwable)
+        }
+        private var inFlightToken: String? = null
+        private var inFlightItems: List<String>? = null
+        private var pendingRetryValue: String? = null
+        private const val MAX_COMMIT_ATTEMPTS = 3
         private const val PREFERENCES = "ai.crumbtrail.react-native"
         private const val PENDING_KEY = "native-diagnostics"
         private const val LAST_PROCESS_EXIT_TIMESTAMP_KEY = "native-diagnostics.last-process-exit"
@@ -302,5 +426,6 @@ class CrumbtrailNativeDiagnosticsModule(
         private const val HANG_THRESHOLD_MS = 5_000L
         private const val CHECK_INTERVAL_MS = 1_000L
         private const val MAX_DURATION_MS = 86_400_000L
+        private const val MAX_PROCESS_EXIT_ENTRIES = 8
     }
 }

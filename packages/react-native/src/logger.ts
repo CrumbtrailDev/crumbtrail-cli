@@ -145,7 +145,7 @@ function wrapStopWithCollectorCleanup(
   logger.stop = async () => {
     if (!cleaned) {
       cleaned = true;
-      collectors.cleanup();
+      await collectors.cleanup();
     }
     return stop();
   };

@@ -38,7 +38,10 @@ export interface ReactNativeNativeCapabilities {
 
 export interface ReactNativeNativeDiagnosticsModule {
   getCapabilities?: () => Promise<unknown> | unknown;
-  drainDiagnostics?: () => Promise<unknown> | unknown;
+  /** Returns one durable batch. Native retains it until this is acknowledged. */
+  drainDiagnostics: () => Promise<unknown> | unknown;
+  /** Clears exactly the batch returned by the matching drain. */
+  acknowledgeDiagnostics: (token: string) => Promise<boolean> | boolean;
   setEnabled?: (enabled: boolean) => Promise<void> | void;
 }
 
@@ -49,7 +52,7 @@ export interface ReactNativeNativeDiagnosticsOptions {
 }
 
 export interface ReactNativeNativeDiagnosticsController {
-  cleanup(): void;
+  cleanup(): Promise<void>;
   modulePresent: boolean;
 }
 
@@ -78,11 +81,11 @@ export function startReactNativeNativeDiagnostics(
 
   if (!nativeModule) {
     emitCapabilityEvent(logger, capabilities, EMPTY_CAPABILITIES);
-    return { cleanup() {}, modulePresent: false };
+    return { cleanup: async () => {}, modulePresent: false };
   }
 
   let active = true;
-  void drainNativeDiagnostics(
+  const startup = drainNativeDiagnostics(
     logger,
     capabilities,
     nativeModule,
@@ -94,13 +97,12 @@ export function startReactNativeNativeDiagnostics(
 
   return {
     modulePresent: true,
-    cleanup() {
+    async cleanup() {
       active = false;
+      await startup;
       if (typeof nativeModule.setEnabled === "function") {
         try {
-          void Promise.resolve(nativeModule.setEnabled(false)).catch(() => {
-            // Native teardown is best effort and must not escape logger.stop().
-          });
+          await nativeModule.setEnabled(false);
         } catch {
           // A synchronous teardown failure is also isolated from the host.
         }
@@ -130,20 +132,38 @@ export function startReactNativeNativeDiagnostics(
       shouldEnable ? reported : disabledCapabilities(reported),
     );
 
-    if (!shouldEnable || typeof module.drainDiagnostics !== "function") return;
+    if (!shouldEnable) return;
     const raw = await module.drainDiagnostics();
-    if (!active || !Array.isArray(raw)) return;
-    for (const candidate of raw) {
-      const event = normalizeNativeDiagnostic(candidate);
-      if (!event) continue;
-      target.addEvent({
-        type: event.kind,
-        data: event.data,
-        platform: "react-native",
-        sdk: { name: "crumbtrail-react-native" },
-        capabilities: sdkCapabilities.capabilities,
-      });
+    const batch = normalizeNativeDiagnosticBatch(raw);
+    if (!active || !batch) return;
+    for (const event of batch.events) {
+      if (!active || !emitNativeDiagnostic(target, sdkCapabilities, event)) return;
     }
+    if (!batch.events.length || !active) return;
+    try {
+      if (await module.acknowledgeDiagnostics(batch.token) !== true) return;
+    } catch {
+      // The native batch remains durable until an explicit acknowledgement.
+    }
+  }
+}
+
+function emitNativeDiagnostic(
+  logger: Crumbtrail,
+  capabilities: ReactNativeCapabilities,
+  event: ReactNativeNativeDiagnosticEvent,
+): boolean {
+  try {
+    logger.addEvent({
+      type: event.kind,
+      data: event.data,
+      platform: "react-native",
+      sdk: { name: "crumbtrail-react-native" },
+      capabilities: capabilities.capabilities,
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -166,55 +186,123 @@ export function createReactNativeWatchdogHandoff(
     return result;
   };
   return {
-    read() {
+    deliver(event, accept) {
       return enqueue(async () => {
-        const raw = await storage.getItem(key);
-        if (!raw) return undefined;
-        const parsed: unknown = JSON.parse(raw);
-        return isNativeHangEventData(parsed) ? parsed : undefined;
-      }).catch(() => undefined);
-    },
-    write(event) {
-      return enqueue(async () => {
-        await storage.setItem(key, JSON.stringify(event));
+        const durable = boundedHang(event);
+        try {
+          await storage.setItem(key, JSON.stringify(durable));
+        } catch {
+          return false;
+        }
+        if (!(await safeAccept(accept, durable))) return false;
+        return clearStorageIfCurrent(storage, key, JSON.stringify(durable));
       });
     },
-    clear(expected) {
+    drain(accept) {
       return enqueue(async () => {
-        if (expected) {
-          const raw = await storage.getItem(key);
-          if (raw !== JSON.stringify(expected)) return;
+        const raw = await storage.getItem(key);
+        if (!raw) return false;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          return false;
         }
-        // AsyncStorageLike intentionally has no removeItem in the public peer
-        // contract. Writing an empty value is compatible with the narrow seam.
-        await storage.setItem(key, "");
-      }).catch(() => undefined);
+        if (!isNativeHangEventData(parsed)) return false;
+        const durable = boundedHang(parsed);
+        if (!(await safeAccept(accept, { ...durable, previousLaunch: true, recovered: false }))) {
+          return false;
+        }
+        return clearStorageIfCurrent(storage, key, raw);
+      });
     },
   };
 }
 
 export interface ReactNativeWatchdogHandoff {
-  read():
-    Promise<NativeHangEventData | undefined> | NativeHangEventData | undefined;
-  write(event: NativeHangEventData): Promise<void> | void;
-  /** Clear only if the current handoff still contains `expected`. */
-  clear(expected?: NativeHangEventData): Promise<void> | void;
+  /** Serialize durable write, host acceptance, and compare-and-clear. */
+  deliver(
+    event: NativeHangEventData,
+    accept: (event: NativeHangEventData) => Promise<boolean> | boolean,
+  ): Promise<boolean>;
+  /** Serialize previous-launch read, host acceptance, and compare-and-clear. */
+  drain(
+    accept: (event: NativeHangEventData) => Promise<boolean> | boolean,
+  ): Promise<boolean>;
 }
 
 class MemoryReactNativeWatchdogHandoff implements ReactNativeWatchdogHandoff {
   private pending: NativeHangEventData | undefined;
+  private tail = Promise.resolve();
 
-  read(): NativeHangEventData | undefined {
-    return this.pending;
+  deliver(
+    event: NativeHangEventData,
+    accept: (event: NativeHangEventData) => Promise<boolean> | boolean,
+  ): Promise<boolean> {
+    return this.enqueue(async () => {
+      const durable = boundedHang(event);
+      this.pending = durable;
+      if (!(await safeAccept(accept, durable))) return false;
+      if (!sameHang(this.pending, durable)) return false;
+      this.pending = undefined;
+      return true;
+    });
   }
 
-  write(event: NativeHangEventData): void {
-    this.pending = event;
+  drain(
+    accept: (event: NativeHangEventData) => Promise<boolean> | boolean,
+  ): Promise<boolean> {
+    return this.enqueue(async () => {
+      const durable = this.pending;
+      if (!durable) return false;
+      const previous = { ...durable, previousLaunch: true, recovered: false };
+      if (!(await safeAccept(accept, previous))) return false;
+      if (!sameHang(this.pending, durable)) return false;
+      this.pending = undefined;
+      return true;
+    });
   }
 
-  clear(expected?: NativeHangEventData): void {
-    if (expected && !sameHang(this.pending, expected)) return;
-    this.pending = undefined;
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(operation, operation);
+    this.tail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+}
+
+function boundedHang(event: NativeHangEventData): NativeHangEventData {
+  return {
+    source: event.source,
+    thresholdMs: event.thresholdMs,
+    observedDurationMs: event.observedDurationMs,
+    recovered: event.recovered,
+    previousLaunch: event.previousLaunch,
+    ...(event.stk ? { stk: event.stk.slice(0, 8192) } : {}),
+  };
+}
+
+async function safeAccept(
+  accept: (event: NativeHangEventData) => Promise<boolean> | boolean,
+  event: NativeHangEventData,
+): Promise<boolean> {
+  try {
+    return (await accept(event)) === true;
+  } catch {
+    return false;
+  }
+}
+
+async function clearStorageIfCurrent(
+  storage: AsyncStorageLike,
+  key: string,
+  expectedRaw: string,
+): Promise<boolean> {
+  try {
+    if ((await storage.getItem(key)) !== expectedRaw) return false;
+    await storage.setItem(key, "");
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -288,6 +376,22 @@ function emitCapabilityEvent(
   });
 }
 
+function normalizeNativeDiagnosticBatch(
+  value: unknown,
+): { token: string; events: ReactNativeNativeDiagnosticEvent[] } | undefined {
+  const record = asRecord(value);
+  if (!record || typeof record.token !== "string" || !Array.isArray(record.events)) {
+    return undefined;
+  }
+  const events = record.events.map(normalizeNativeDiagnostic);
+  if (events.some((event) => !event)) return undefined;
+  if (events.length > 0 && record.token.length === 0) return undefined;
+  return {
+    token: record.token,
+    events: events as ReactNativeNativeDiagnosticEvent[],
+  };
+}
+
 function normalizeNativeDiagnostic(
   value: unknown,
 ): ReactNativeNativeDiagnosticEvent | undefined {
@@ -343,7 +447,12 @@ function resolveNativeDiagnosticsModule(
 function isNativeDiagnosticsModule(
   value: unknown,
 ): value is ReactNativeNativeDiagnosticsModule {
-  return asRecord(value) !== undefined;
+  const record = asRecord(value);
+  return (
+    record !== undefined &&
+    typeof record.drainDiagnostics === "function" &&
+    typeof record.acknowledgeDiagnostics === "function"
+  );
 }
 
 function safeRequireOptionalModule(packageName: string): unknown {

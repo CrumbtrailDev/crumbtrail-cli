@@ -61,6 +61,12 @@ after `CrumbtrailCollectors.nativeDiagnostics` is enabled. When disabled, an
 available plugin reports `supported: true, enabled: false` and drains no pending
 native data.
 
+Custom `nativeWatchdogHandoff` implementations must serialize their `deliver`
+and `drain` methods. Keep each event durable until the acceptance callback
+returns `true`, compare the stored value before clearing it, and return `false`
+when any step fails. `Crumbtrail.stop()` waits for in-flight handoff work before
+tearing down the native diagnostics platform.
+
 `service` names which app in the project this is. One ingest key covers a whole
 project, so without it every app in that project arrives as an anonymous
 sender.

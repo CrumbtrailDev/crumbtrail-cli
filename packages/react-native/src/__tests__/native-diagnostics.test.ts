@@ -76,25 +76,27 @@ describe("React Native native diagnostics bridge", () => {
             nativeCrash: { supported: true, enabled: true, observed: false },
             appLifecycle: { supported: true, enabled: true, observed: true },
           }),
-          drainDiagnostics: async () => [
-            {
-              kind: "native-hang",
-              data: {
-                source: "main-thread",
-                thresholdMs: 5000,
-                observedDurationMs: 7420,
-                recovered: false,
-                previousLaunch: true,
-                stk: "Checkout.submit()",
+          drainDiagnostics: async () => ({
+            token: "batch-1",
+            events: [
+              {
+                kind: "native-hang",
+                data: {
+                  source: "main-thread",
+                  thresholdMs: 5000,
+                  observedDurationMs: 7420,
+                  recovered: false,
+                  previousLaunch: true,
+                  stk: "Checkout.submit()",
+                },
               },
-            },
-            {
-              kind: "native-crash",
-              data: { msg: "boom", source: "previous-launch" },
-            },
-            { kind: "unknown", data: {} },
-            { kind: "native-hang", data: { source: "main-thread" } },
-          ],
+              {
+                kind: "native-crash",
+                data: { msg: "boom", source: "previous-launch" },
+              },
+            ],
+          }),
+          acknowledgeDiagnostics: vi.fn(async () => true),
         },
       },
     );
@@ -114,7 +116,7 @@ describe("React Native native diagnostics bridge", () => {
       expect.objectContaining({ type: "unknown" }),
     );
 
-    controller.cleanup();
+    await controller.cleanup();
   });
 
   it("keeps a supported native module disabled without draining it", async () => {
@@ -140,6 +142,7 @@ describe("React Native native diagnostics bridge", () => {
             appLifecycle: { supported: true, enabled: true, observed: false },
           }),
           drainDiagnostics,
+          acknowledgeDiagnostics: vi.fn(async () => true),
         },
         enabled: false,
       },
@@ -163,8 +166,30 @@ describe("React Native native diagnostics bridge", () => {
         },
       }),
     );
-    controller.cleanup();
+    await controller.cleanup();
     expect(setEnabled).toHaveBeenLastCalledWith(false);
+  });
+
+  it("retains a native batch when the host acknowledgment fails", async () => {
+    const target = logger();
+    const acknowledgeDiagnostics = vi.fn(async () => false);
+    const drainDiagnostics = vi.fn(async () => ({
+      token: "batch-retry",
+      events: [{ kind: "native-crash", data: { msg: "retry" } }],
+    }));
+    const controller = startReactNativeNativeDiagnostics(
+      target as any,
+      capabilities,
+      { module: { drainDiagnostics, acknowledgeDiagnostics } },
+    );
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(drainDiagnostics).toHaveBeenCalledOnce();
+    expect(acknowledgeDiagnostics).toHaveBeenCalledWith("batch-retry");
+    expect(target.addEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "native-crash" }),
+    );
+    await controller.cleanup();
   });
 
   it("keeps the AsyncStorage handoff bounded and non-throwing", async () => {
@@ -184,10 +209,8 @@ describe("React Native native diagnostics bridge", () => {
       previousLaunch: false,
     };
 
-    await handoff.write(event);
-    await expect(handoff.read()).resolves.toEqual(event);
-    await handoff.clear();
-    await expect(handoff.read()).resolves.toBeUndefined();
+    await expect(handoff.deliver(event, () => true)).resolves.toBe(true);
+    await expect(handoff.drain(() => true)).resolves.toBe(false);
   });
 
   it("does not clear a handoff when persistence fails", async () => {
@@ -199,14 +222,15 @@ describe("React Native native diagnostics bridge", () => {
     };
     const handoff = createReactNativeWatchdogHandoff(storage);
     await expect(
-      handoff.write({
+      handoff.deliver({
         source: "js",
         thresholdMs: 5000,
         observedDurationMs: 6000,
         recovered: true,
         previousLaunch: false,
-      }),
-    ).rejects.toThrow("storage unavailable");
+      }, () => true),
+    ).resolves.toBe(false);
+    expect(storage.setItem).toHaveBeenCalled();
   });
 
   it("does not let clearing an older event erase a newer pending event", async () => {
@@ -227,10 +251,42 @@ describe("React Native native diagnostics bridge", () => {
     };
     const newer = { ...older, observedDurationMs: 7000 };
 
-    await handoff.write(older);
-    await handoff.write(newer);
-    await handoff.clear(older);
+    await expect(handoff.deliver(older, () => false)).resolves.toBe(false);
+    await expect(handoff.deliver(newer, () => true)).resolves.toBe(true);
+    await expect(handoff.drain(() => true)).resolves.toBe(false);
+  });
 
-    await expect(handoff.read()).resolves.toEqual(newer);
+  it("keeps concurrent custom handoff operations serialized", async () => {
+    const values = new Map<string, string>();
+    const order: string[] = [];
+    const storage = {
+      getItem: vi.fn(async (key: string) => values.get(key) ?? null),
+      setItem: vi.fn(async (key: string, value: string) => {
+        values.set(key, value);
+      }),
+    };
+    const handoff = createReactNativeWatchdogHandoff(storage);
+    const older = {
+      source: "js" as const,
+      thresholdMs: 5000,
+      observedDurationMs: 6000,
+      recovered: true,
+      previousLaunch: false,
+    };
+    const newer = { ...older, observedDurationMs: 7000 };
+
+    const first = handoff.deliver(older, async () => {
+      order.push("accept-older");
+      return false;
+    });
+    const second = handoff.deliver(newer, async () => {
+      order.push("accept-newer");
+      return true;
+    });
+
+    await expect(first).resolves.toBe(false);
+    await expect(second).resolves.toBe(true);
+    expect(order).toEqual(["accept-older", "accept-newer"]);
+    await expect(handoff.drain(() => true)).resolves.toBe(false);
   });
 });

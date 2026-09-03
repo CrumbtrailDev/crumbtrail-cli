@@ -22,7 +22,7 @@ export interface ReactNativeJsWatchdogOptions {
 }
 
 export interface ReactNativeJsWatchdogController {
-  cleanup(): void;
+  cleanup(): Promise<void>;
   pause(): void;
   resume(): void;
 }
@@ -70,17 +70,14 @@ export function startReactNativeJsWatchdog(
   let reportedForBlock = false;
   let stopped = false;
   let timerId: ReturnType<typeof setInterval> | undefined;
+  const inFlight = new Set<Promise<void>>();
 
-  const pending = safeCall(() => options.handoff?.read());
-  void Promise.resolve(pending).then(async (event) => {
-    if (!event || stopped || !isNativeHangEventData(event)) return;
-    emit(logger, options.capabilities, {
-      ...event,
-      previousLaunch: true,
-      recovered: false,
-    });
-    await clearHandoff(options.handoff, event);
-  });
+  if (options.handoff) {
+    track(options.handoff.drain((event) => {
+      if (stopped || !isNativeHangEventData(event)) return false;
+      return emit(logger, options.capabilities, event);
+    }));
+  }
 
   const onState = (state: string) => {
     if (state === "active") resume();
@@ -106,21 +103,18 @@ export function startReactNativeJsWatchdog(
       recovered: true,
       previousLaunch: false,
     };
-    void persistAndEmit(event);
+    track(persistAndEmit(event));
   }
 
   async function persistAndEmit(event: NativeHangEventData): Promise<void> {
-    let persisted = false;
     if (options.handoff) {
-      try {
-        await options.handoff.write(event);
-        persisted = true;
-      } catch {
-        // A storage failure must not suppress an in-memory observation.
-      }
+      await options.handoff.deliver(event, (durable) => {
+        if (stopped) return false;
+        return emit(logger, options.capabilities, durable);
+      }).catch(() => false);
+      return;
     }
-    emit(logger, options.capabilities, event);
-    if (persisted) await clearHandoff(options.handoff, event);
+    if (!stopped) emit(logger, options.capabilities, event);
   }
 
   function pause(): void {
@@ -135,11 +129,21 @@ export function startReactNativeJsWatchdog(
     lastTickAt = now();
   }
 
-  function cleanup(): void {
-    if (stopped) return;
+  async function cleanup(): Promise<void> {
+    if (stopped) {
+      await Promise.all(inFlight);
+      return;
+    }
     stopped = true;
     if (timerId !== undefined) clearTimer(timerId);
     toCleanup(subscription)();
+    await Promise.all(inFlight);
+  }
+
+  function track(operation: Promise<boolean> | Promise<void>): void {
+    const pending = Promise.resolve(operation).then(() => undefined, () => undefined);
+    inFlight.add(pending);
+    void pending.finally(() => inFlight.delete(pending));
   }
 
   // Keep checking while suppressed so a debugger attached at startup can be
@@ -153,14 +157,19 @@ function emit(
   logger: Crumbtrail,
   capabilities: ReactNativeCapabilities,
   data: NativeHangEventData,
-): void {
-  logger.addEvent({
-    type: NATIVE_HANG_EVENT_KIND,
-    data: { ...data },
-    platform: "react-native",
-    sdk: { name: "crumbtrail-react-native" },
-    capabilities: capabilities.capabilities,
-  });
+): boolean {
+  try {
+    logger.addEvent({
+      type: NATIVE_HANG_EVENT_KIND,
+      data: { ...data },
+      platform: "react-native",
+      sdk: { name: "crumbtrail-react-native" },
+      capabilities: capabilities.capabilities,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function clampDuration(value: number): number {
@@ -184,18 +193,6 @@ function monotonicNow(
   return Date.now();
 }
 
-async function clearHandoff(
-  handoff: ReactNativeWatchdogHandoff | undefined,
-  expected: NativeHangEventData,
-): Promise<void> {
-  if (!handoff) return;
-  try {
-    await handoff.clear(expected);
-  } catch {
-    // A failed clear leaves the handoff for the next launch.
-  }
-}
-
 function isDebuggerAttached(
   globalObject: typeof globalThis & Record<string, unknown>,
 ): boolean {
@@ -211,12 +208,4 @@ function toCleanup(
 ): () => void {
   if (typeof subscription === "function") return subscription;
   return subscription?.remove ? () => subscription.remove?.() : () => {};
-}
-
-function safeCall<T>(call: () => T): T | undefined {
-  try {
-    return call();
-  } catch {
-    return undefined;
-  }
 }

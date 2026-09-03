@@ -101,7 +101,7 @@ export interface StartReactNativeCollectorsOptions extends ReactNativeCollectorR
 }
 
 export interface ReactNativeCollectorController {
-  cleanup(): void;
+  cleanup(): Promise<void>;
   replayLite?: ReactNativeReplayLiteController;
   nativeDiagnostics?: ReactNativeNativeDiagnosticsController;
   jsWatchdog?: ReactNativeJsWatchdogController;
@@ -119,7 +119,7 @@ const DEFAULT_COLLECTORS: Record<ReactNativeCollectorName, boolean> = {
   jsWatchdog: true,
 };
 
-type Cleanup = () => void;
+type Cleanup = () => void | Promise<void>;
 
 export function startReactNativeCollectors(
   logger: Crumbtrail,
@@ -205,10 +205,12 @@ export function startReactNativeCollectors(
     : undefined;
 
   return {
-    cleanup() {
-      jsWatchdog?.cleanup();
-      nativeDiagnostics?.cleanup();
-      for (const stop of cleanup.splice(0).reverse()) stop();
+    async cleanup() {
+      const jsCleanup = jsWatchdog?.cleanup();
+      const nativeDiagnosticsCleanup = nativeDiagnostics?.cleanup();
+      for (const stop of cleanup.splice(0).reverse()) await stop();
+      await jsCleanup;
+      await nativeDiagnosticsCleanup;
     },
     replayLite,
     nativeDiagnostics,
