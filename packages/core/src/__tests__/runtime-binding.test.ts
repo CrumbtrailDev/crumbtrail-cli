@@ -121,6 +121,28 @@ describe("runtime binding client", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps a zero Retry After from retrying on every fast poll", async () => {
+    let now = NOW;
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(
+        response({ code: "rate_limited" }, 429, { "Retry-After": "0" }),
+      )
+      .mockResolvedValueOnce(response(binding(NOW + 86_400_000), 201));
+    const client = createRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => now,
+    });
+
+    await expect(client.getBinding()).resolves.toBeUndefined();
+    await expect(client.getBinding()).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    now += 1_001;
+    await expect(client.getBinding()).resolves.toBeTruthy();
+  });
+
   it("falls back after failed registration and isolates projects", async () => {
     const failed = vi.fn().mockResolvedValue(response({ ok: false }, 503));
     const clientA = createRuntimeBindingClient({

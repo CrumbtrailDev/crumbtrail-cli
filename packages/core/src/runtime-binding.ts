@@ -26,6 +26,9 @@ export const RUNTIME_BINDING_ROTATE_AHEAD_MS = 60 * 60 * 1000;
 /** Do not let a server supplied retry delay park capture forever. */
 const RUNTIME_BINDING_MAX_RETRY_MS = 5 * 60 * 1000;
 
+/** Avoid a zero second hint turning a fast config poll into a registration loop. */
+const RUNTIME_BINDING_MIN_RETRY_MS = 1_000;
+
 /** Back off transient registration failures even when the server gives no hint. */
 const RUNTIME_BINDING_DEFAULT_RETRY_MS = 30 * 1000;
 
@@ -167,9 +170,12 @@ export class RuntimeBindingClient {
       : undefined;
     this.retryAfter =
       this.now() +
-      Math.min(
-        hinted ?? RUNTIME_BINDING_DEFAULT_RETRY_MS,
-        RUNTIME_BINDING_MAX_RETRY_MS,
+      Math.max(
+        RUNTIME_BINDING_MIN_RETRY_MS,
+        Math.min(
+          hinted ?? RUNTIME_BINDING_DEFAULT_RETRY_MS,
+          RUNTIME_BINDING_MAX_RETRY_MS,
+        ),
       );
   }
 
