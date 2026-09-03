@@ -17,6 +17,7 @@
 //      caller falls back to the existing guidance. A wrong edit to someone's
 //      entry file is far worse than a printed snippet.
 
+import { parse } from "@babel/parser";
 import type { IntegrationRequirement } from "./integration";
 import type { CrumbtrailConfig } from "crumbtrail-core";
 import type {
@@ -299,6 +300,183 @@ export function maskLiterals(text: string): string | null {
   }
   if (templateStack.length > 0) return null;
   return out.join("");
+}
+
+type ModuleSpecifierMatcher = (specifier: string) => boolean;
+
+const STATIC_IMPORT_REFERENCE = /\bimport\s+(?:"([^"]*)"|'([^']*)')/g;
+const DYNAMIC_IMPORT_REFERENCE =
+  /\bimport\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/g;
+const BARE_REQUIRE_REFERENCE = /\brequire\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/g;
+
+function executableModuleKeyword(
+  mask: string,
+  match: RegExpMatchArray,
+  keyword: "import" | "require",
+): boolean {
+  const matchAt = match.index ?? -1;
+  const keywordAt = matchAt < 0 ? -1 : matchAt + match[0].indexOf(keyword);
+  if (keywordAt < 0) return false;
+  if (mask.slice(keywordAt, keywordAt + keyword.length) !== keyword)
+    return false;
+  // A member call is not the module loader. This matters for both browser
+  // `window.import(...)` text and `loader.require(...)` wrappers, which the
+  // installer cannot treat as an early side-effect import.
+  const previous = mask[keywordAt - 1] ?? "";
+  if (previous === "." || previous === "?" || /[A-Za-z0-9_$]/.test(previous))
+    return false;
+  return true;
+}
+
+function firstModuleSpecifier(match: RegExpMatchArray): string | null {
+  return match[1] ?? match[2] ?? null;
+}
+
+function parseModuleProgram(text: string): any | null {
+  for (const plugins of [
+    ["typescript", "jsx", "decorators-legacy"],
+    ["typescript", "decorators-legacy"],
+    ["jsx", "decorators-legacy"],
+  ]) {
+    try {
+      return parse(text, {
+        sourceType: "unambiguous",
+        plugins: plugins as any,
+        allowAwaitOutsideFunction: true,
+        allowReturnOutsideFunction: true,
+      }).program;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+function stringLiteralValue(node: any): string | null {
+  if (node?.type === "StringLiteral" || node?.type === "Literal")
+    return typeof node.value === "string" ? node.value : null;
+  return null;
+}
+
+function astHasModuleReference(
+  program: any,
+  matches: ModuleSpecifierMatcher,
+  allowExports: boolean,
+): boolean {
+  let found = false;
+  const visit = (node: any): void => {
+    if (found || !node || typeof node !== "object") return;
+    if (
+      node.type === "ImportDeclaration" &&
+      node.importKind !== "type" &&
+      matches(stringLiteralValue(node.source) ?? "")
+    ) {
+      found = true;
+      return;
+    }
+    if (
+      allowExports &&
+      (node.type === "ExportNamedDeclaration" ||
+        node.type === "ExportAllDeclaration") &&
+      node.exportKind !== "type" &&
+      node.source &&
+      matches(stringLiteralValue(node.source) ?? "")
+    ) {
+      found = true;
+      return;
+    }
+    if (node.type === "ImportExpression") {
+      if (matches(stringLiteralValue(node.source) ?? "")) found = true;
+      if (found) return;
+    }
+    if (node.type === "CallExpression") {
+      const isBareLoader =
+        node.callee?.type === "Import" ||
+        (node.callee?.type === "Identifier" && node.callee.name === "require");
+      if (
+        isBareLoader &&
+        matches(stringLiteralValue(node.arguments?.[0]) ?? "")
+      ) {
+        found = true;
+        return;
+      }
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value);
+      if (found) return;
+    }
+  };
+  visit(program);
+  return found;
+}
+
+function maskedModuleReference(
+  text: string,
+  matches: ModuleSpecifierMatcher,
+): boolean {
+  const mask = maskLiterals(text);
+  if (mask === null) return false;
+  const patterns: Array<{
+    pattern: RegExp;
+    keyword: "import" | "require";
+  }> = [
+    { pattern: STATIC_IMPORT_REFERENCE, keyword: "import" },
+    { pattern: DYNAMIC_IMPORT_REFERENCE, keyword: "import" },
+    { pattern: BARE_REQUIRE_REFERENCE, keyword: "require" },
+  ];
+  for (const { pattern, keyword } of patterns) {
+    pattern.lastIndex = 0;
+    for (const candidate of text.matchAll(pattern)) {
+      if (
+        executableModuleKeyword(mask, candidate, keyword) &&
+        matches(firstModuleSpecifier(candidate) ?? "")
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Find a package module reference in executable source. The source spelling
+ * remains available for the module specifier. Parsed source is preferred, and
+ * the mask fallback proves the loader keyword is not in a comment, string, or
+ * regex literal.
+ */
+export function hasExecutableModuleReference(
+  text: string,
+  matches: ModuleSpecifierMatcher,
+  options: { allowExports?: boolean } = {},
+): boolean {
+  const program = parseModuleProgram(text);
+  return program
+    ? astHasModuleReference(program, matches, options.allowExports ?? true)
+    : maskedModuleReference(text, matches);
+}
+
+function isCrumbtrailModuleSpecifier(specifier: string): boolean {
+  return (
+    /^(?:crumbtrail-core|crumbtrail-node|crumbtrail-react-native|crumbtrail-capacitor)(?:\/|$)/.test(
+      specifier,
+    ) || /^package:crumbtrail_flutter(?:\/|$)/.test(specifier)
+  );
+}
+
+/** True when source executes an import/require of one of Crumbtrail's packages. */
+export function hasExecutableCrumbtrailReference(text: string): boolean {
+  return hasExecutableModuleReference(text, isCrumbtrailModuleSpecifier);
+}
+
+/** True when source executes the early browser side-effect module. */
+export function hasExecutableEarlyBrowserImport(text: string): boolean {
+  return hasExecutableModuleReference(
+    text,
+    (specifier) => specifier === "crumbtrail-core/early",
+    { allowExports: false },
+  );
 }
 
 /** Offset of the `}` matching the `{` at `open`, or -1. Runs over the mask. */

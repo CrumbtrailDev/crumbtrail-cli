@@ -35,7 +35,11 @@ import {
   type IntegrationRequirement,
   type IntegrationStatus,
 } from "./integration";
-import { amendSource, maskLiterals, type AmendField } from "./amend";
+import {
+  amendSource,
+  hasExecutableEarlyBrowserImport,
+  type AmendField,
+} from "./amend";
 import { addDockerBuildArg, DOCKERFILE_CANDIDATES } from "./docker";
 import {
   deployManifestNaming,
@@ -549,33 +553,6 @@ const EARLY_BROWSER_RECIPES = new Set<Recipe>([
   "capacitor",
   "tauri",
 ]);
-
-const EARLY_BROWSER_IMPORT =
-  /\b(?:import|require)\s*(?:\(\s*)?["']crumbtrail-core\/early["']/g;
-
-/**
- * Detect the early side-effect import in executable source only. The raw
- * spelling is useful for preserving the customer's quote and import form, but
- * it also matches comments and strings. `maskLiterals` keeps code positions
- * stable while blanking those non-executable regions, so only a real import or
- * require keyword can satisfy an idempotent rerun.
- */
-function hasExecutableEarlyBrowserImport(source: string): boolean {
-  const mask = maskLiterals(source);
-  if (mask === null) return false;
-  EARLY_BROWSER_IMPORT.lastIndex = 0;
-  for (const match of source.matchAll(EARLY_BROWSER_IMPORT)) {
-    if (match.index === undefined) continue;
-    const keyword = /^(?:import|require)/.exec(match[0])?.[0];
-    if (
-      keyword &&
-      mask.slice(match.index, match.index + keyword.length) === keyword
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
 
 function hasEarlyBrowserMarker(
   input: BuildPlanInput,

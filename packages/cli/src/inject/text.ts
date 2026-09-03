@@ -3,6 +3,7 @@
 // tests can assert behavior without touching disk.
 
 import { parse } from "@babel/parser";
+import { hasExecutableCrumbtrailReference } from "./amend";
 
 const BOM = "﻿";
 
@@ -67,9 +68,7 @@ export function prologueEnd(lines: string[]): number {
  * name would not match the JS pattern.
  */
 export function referencesCrumbtrail(text: string): boolean {
-  return /crumbtrail-core|crumbtrail-node|crumbtrail-react-native|crumbtrail-capacitor|crumbtrail_flutter/.test(
-    text,
-  );
+  return hasExecutableCrumbtrailReference(text);
 }
 
 /**

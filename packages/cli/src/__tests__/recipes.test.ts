@@ -401,6 +401,69 @@ describe("buildPlan — idempotency", () => {
     expect(plan.content).toBe('import "crumbtrail-core/early";');
   });
 
+  it.each([
+    ["window.import", 'window.import("crumbtrail-core/early")', "prepend"],
+    ["loader.require", 'loader.require("crumbtrail-core/early")', "prepend"],
+    [
+      "a dynamic import",
+      'import("crumbtrail-core/early")',
+      "skip-already-wired",
+    ],
+    [
+      "a bare require",
+      'require("crumbtrail-core/early")',
+      "skip-already-wired",
+    ],
+    [
+      "a static import",
+      'import "crumbtrail-core/early";',
+      "skip-already-wired",
+    ],
+    [
+      "an export",
+      'export { default } from "crumbtrail-core/early";',
+      "prepend",
+    ],
+  ] as const)(
+    "accepts only a bare executable early marker in %s",
+    (_kind, marker, expected) => {
+      const source = [
+        marker,
+        'import { Crumbtrail } from "crumbtrail-core";',
+        "Crumbtrail.init({",
+        `  httpEndpoint: "${ENDPOINT}",`,
+        "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+        "  remoteConfig: true,",
+        '  service: "web",',
+        "});",
+        "",
+      ].join("\n");
+      const io = fakeInjectIO({
+        [p("package.json")]: JSON.stringify({
+          dependencies: { "crumbtrail-core": "0.49.0" },
+        }),
+        [installed("crumbtrail-core")]: JSON.stringify({
+          name: "crumbtrail-core",
+          version: "0.49.0",
+        }),
+        [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+        [p("src", "main.ts")]: source,
+      });
+      const plan = buildPlan(
+        {
+          cwd: CWD,
+          recipe: "vite-spa",
+          endpoint: ENDPOINT,
+          entryFile: p("src", "main.ts"),
+          serviceName: "web",
+          sdkVersion: "0.49.0",
+        },
+        io,
+      );
+      expect(plan.kind).toBe(expected);
+    },
+  );
+
   it("returns an upgrade action instead of skipping a framework integration on an older SDK", () => {
     const source = [
       'import { Crumbtrail } from "crumbtrail-core";',

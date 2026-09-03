@@ -7,7 +7,11 @@ import {
 } from "../recipe-registry";
 import type { Recipe } from "../detect";
 import type { InjectIO } from "./io";
-import { findCallSites, maskLiterals } from "./amend";
+import {
+  findCallSites,
+  hasExecutableCrumbtrailReference,
+  maskLiterals,
+} from "./amend";
 
 /** The evidence a complete integration must leave in the target package. */
 export type IntegrationRequirement =
@@ -90,8 +94,7 @@ const SERVER_RECIPES = new Set<Recipe>([
   "node",
 ]);
 
-const CRUMBTRAIL_REFERENCE =
-  /crumbtrail-core|crumbtrail-node|crumbtrail-react-native|crumbtrail-capacitor|crumbtrail_flutter/;
+const CRUMBTRAIL_REFERENCE = hasExecutableCrumbtrailReference;
 export const LOCAL_IMPORT =
   /(?:from\s+|import\s*\(|import\s+|require\s*\()\s*["']([^"']+)["']/g;
 const ENDPOINT_ENV =
@@ -599,7 +602,7 @@ export function inspectIntegration(
   const existingEnvVars = harvestEnvNames(input);
   const keyEnvVarsSeen = existingEnvVars.filter(isKeyEnvName);
   const endpointEnvVarsSeen = existingEnvVars.filter(isEndpointEnvName);
-  const found = CRUMBTRAIL_REFERENCE.test(source);
+  const found = CRUMBTRAIL_REFERENCE(source);
   const missing: IntegrationRequirement[] = [];
 
   const shortOfSdk = missingSdkPackages(input);

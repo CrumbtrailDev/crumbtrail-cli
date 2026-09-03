@@ -112,6 +112,30 @@ describe("inspectIntegration", () => {
     });
   });
 
+  it("does not find a Crumbtrail integration in comments or unrelated strings", () => {
+    const status = inspectIntegration({
+      cwd: CWD,
+      recipe: "vite-spa",
+      endpoint: ENDPOINT,
+      entryFile: p("src", "main.tsx"),
+      serviceName: "web",
+      io: fakeInjectIO({
+        [p("package.json")]: JSON.stringify({
+          dependencies: { "crumbtrail-core": "0.49.0" },
+        }),
+        [p("node_modules", "crumbtrail-core", "package.json")]: "{}",
+        [p("src", "main.tsx")]: [
+          '// import { Crumbtrail } from "crumbtrail-core";',
+          'const config = { package: "crumbtrail-core" };',
+          'const message = "require(\\"crumbtrail-node\\")";',
+        ].join("\n"),
+      }),
+    });
+
+    expect(status.found).toBe(false);
+    expect(status.missing).toContain("entry");
+  });
+
   it("harvests customer env names from source and setup files without reading config values", () => {
     const files = {
       [p("src", "main.tsx")]: "export const app = true;",
