@@ -142,7 +142,7 @@ describe("instrumentMongoClient", () => {
     expect(diff?.d).not.toHaveProperty("after");
   });
 
-  it("passes race evidence through single entity update, delete, and findAndModify diffs", () => {
+  it("suppresses race evidence when command monitoring cannot prove transaction outcome", () => {
     const { client, events } = capture({
       raceEvidence: {
         enabled: true,
@@ -182,12 +182,40 @@ describe("instrumentMongoClient", () => {
 
     expect(eventsOf(events, "db.diff")).toHaveLength(3);
     expect(
-      eventsOf(events, "db.diff").map((event) => event.d.raceEvidence),
-    ).toEqual([
-      { entityHash: "e".repeat(64) },
-      { entityHash: "e".repeat(64) },
-      { entityHash: "e".repeat(64) },
-    ]);
+      eventsOf(events, "db.diff").every(
+        (event) => event.d.raceEvidence === undefined,
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps successful and failed transaction work free of race evidence", () => {
+    const { client, events } = capture({
+      raceEvidence: {
+        enabled: true,
+        resolve: () => ({ entityHash: "e".repeat(64) }),
+      },
+    });
+    client.succeed(
+      24,
+      "update",
+      {
+        update: "accounts",
+        updates: [{ q: { _id: "acct-commit" }, u: { $set: { ok: true } } }],
+      },
+      { ok: 1, n: 1 },
+    );
+    client.fail(
+      25,
+      "update",
+      {
+        update: "accounts",
+        updates: [{ q: { _id: "acct-rollback" }, u: { $set: { ok: true } } }],
+      },
+      { name: "MongoServerError", code: 112 },
+    );
+
+    expect(eventsOf(events, "db.diff")).toHaveLength(1);
+    expect(eventsOf(events, "db.diff")[0]?.d.raceEvidence).toBeUndefined();
   });
 
   it("maps bulk update and delete commands to aggregate partial diffs", () => {

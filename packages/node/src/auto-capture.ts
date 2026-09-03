@@ -11,7 +11,13 @@ import {
   startHeadlessSession,
   type HeadlessSession,
 } from "./headless-session";
-import { clearActiveDbSink, setActiveDbSink } from "./db/active-sink";
+import {
+  clearActiveDbSink,
+  emitActiveDbEvent,
+  readActiveDbRaceEvidence,
+  readActiveDbRequestId,
+  setActiveDbSink,
+} from "./db/active-sink";
 import {
   autoInstrumentDbClients,
   autoInstrumentPatchedAnything,
@@ -850,20 +856,20 @@ export async function autoCapture(
   if (options.instrumentDatabases !== false) {
     try {
       dbInstrumentation = autoInstrumentDbClients({
-        emit: emitSessionEvent,
+        emit: emitActiveDbEvent,
         // The bridge to the request the statement ran inside. Without it every
         // wrapped driver reads an undefined request id and hands the statement
         // straight back to the host, so a correctly patched pool still produced
         // no evidence — the instrumentation was installed and inert. Resolved
         // per statement, because the scope is AsyncLocalStorage state that only
         // exists once a request is in flight.
-        getRequestId: dbSink.getRequestId,
+        getRequestId: readActiveDbRequestId,
         captureReads: options.captureDatabaseReads ?? false,
         captureBefore: options.captureDatabaseBeforeImages ?? false,
         captureCallsite: options.captureDatabaseCallsites ?? false,
         drivers: options.databaseDrivers,
         resolve: options.databaseResolve,
-        raceEvidence,
+        getRaceEvidence: readActiveDbRaceEvidence,
       });
       const line = formatAutoInstrumentReport(dbInstrumentation);
       // The success line stays behind `debug`: a healthy install is quiet. The
@@ -885,13 +891,13 @@ export async function autoCapture(
   if (options.instrumentCaches !== false) {
     try {
       cacheInstrumentation = autoInstrumentCacheClients({
-        emit: emitSessionEvent,
+        emit: emitActiveDbEvent,
         // Cache and database evidence read the same AsyncLocalStorage request scope, so their
         // requestId joins without a second correlation scheme.
-        getRequestId: dbSink.getRequestId,
+        getRequestId: readActiveDbRequestId,
         drivers: options.cacheDrivers,
         resolve: options.cacheResolve,
-        raceEvidence,
+        getRaceEvidence: readActiveDbRaceEvidence,
       });
       const line = formatAutoInstrumentCacheReport(cacheInstrumentation);
       if (

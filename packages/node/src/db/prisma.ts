@@ -13,6 +13,7 @@ import {
   emitImagelessDbDiff,
   isRecord,
   nextStatementSeq,
+  suppressRaceEvidence,
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
@@ -81,6 +82,9 @@ export function instrumentPrismaClient<T extends DuckTypedPrismaClient>(
   if (!isObjectLike(client)) return client;
   const existing = instrumentedClients.get(client);
   if (existing) return existing as T;
+  // Prisma query extensions do not expose transaction commit or rollback outcome.
+  // Keep diffs useful, but never present them as committed race evidence.
+  const captureOptions = suppressRaceEvidence(options);
 
   const counters: RequestCounters = {
     emittedReadRowsByRequest: new Map(),
@@ -94,7 +98,7 @@ export function instrumentPrismaClient<T extends DuckTypedPrismaClient>(
       name: "crumbtrail-database-capture",
       query: {
         $allOperations: (input) =>
-          observePrismaOperation(input, options, counters),
+          observePrismaOperation(input, captureOptions, counters),
       },
     });
     if (!isObjectLike(extended)) return client;
@@ -228,6 +232,7 @@ function captureModelResult(input: {
       requestId: input.requestId,
       rows,
       rowCount,
+      bulk: mutation.bulk,
       beforeImageStatus: modelBeforeImageStatus(
         input.operation,
         input.args,

@@ -1,4 +1,4 @@
-import type { DbDiffOp, DbEngine, DbStatementOp } from "crumbtrail-core";
+import type { DbDiffOp, DbStatementOp } from "crumbtrail-core";
 import { boundColumnRow, buildDbDiffEvent } from "./diff-event";
 import {
   emitDbDiffEvents,
@@ -8,12 +8,12 @@ import {
   emitDbStatementEvent,
   isRecord,
   nextStatementSeq,
+  suppressRaceEvidence,
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
-import { readInstrumentRaceEvidence } from "../race-evidence";
 
-const ENGINE = "mongodb" as DbEngine;
+const ENGINE = "mongodb" as const;
 const INSTRUMENTED_CLIENTS = new WeakSet<object>();
 
 export const MONGO_DOCUMENT_BOUNDS = {
@@ -77,6 +77,9 @@ export function instrumentMongoClient<T extends DuckTypedMongoClient>(
 ): T {
   if (!client || typeof client !== "object" || INSTRUMENTED_CLIENTS.has(client))
     return client;
+  // Command monitoring does not expose transaction commit or rollback outcome.
+  // Keep database diffs, but never present them as committed race evidence.
+  const captureOptions = suppressRaceEvidence(options);
 
   const pending = new Map<string, PendingCommand>();
   const counters: MongoCounters = {
@@ -94,7 +97,8 @@ export function instrumentMongoClient<T extends DuckTypedMongoClient>(
           event && isRecord(event.command) ? event.command : undefined;
         const commandName = normalizedCommandName(event?.commandName);
         const key = commandKey(event?.requestId);
-        const requestId = options.requestId ?? options.getRequestId?.();
+        const requestId =
+          captureOptions.requestId ?? captureOptions.getRequestId?.();
         if (!command || !commandName || !key || !requestId) return;
         pending.set(key, {
           commandName,
@@ -117,7 +121,7 @@ export function instrumentMongoClient<T extends DuckTypedMongoClient>(
         handleSucceeded(
           started,
           isRecord(event?.reply) ? event.reply : {},
-          options,
+          captureOptions,
           counters,
         );
       } catch {
@@ -139,7 +143,7 @@ export function instrumentMongoClient<T extends DuckTypedMongoClient>(
           statement: mongoStatement(started.commandName),
           requestId: started.requestId,
           error: event?.failure ?? event,
-          options,
+          options: captureOptions,
         });
       } catch {
         // Command observation must never affect the host operation.
@@ -254,8 +258,6 @@ function emitPartialMutation(
       rowCount,
       requestId,
       primaryKeyColumns: ["_id"],
-      raceEvidence:
-        rowCount === 1 ? readInstrumentRaceEvidence(options) : undefined,
       imageUnavailable:
         commandName === "update"
           ? {
@@ -300,8 +302,6 @@ function emitFindAndModify(
       pk,
       requestId,
       primaryKeyColumns: ["_id"],
-      raceEvidence:
-        changed === 1 ? readInstrumentRaceEvidence(options) : undefined,
       ...(row && (isDelete || !returnsAfter) ? { before: row } : {}),
       ...(row && !isDelete && returnsAfter ? { after: row } : {}),
       ...(!row
