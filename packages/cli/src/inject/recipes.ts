@@ -2165,7 +2165,7 @@ function planServedStaticFrontend(
           label: `added early browser capture to ${path.relative(input.cwd, indexPath) || indexPath}`,
         });
         if (upgrade.kind === "needs-confirm-dirty") needsConfirmDirty = true;
-      } else {
+      } else if (upgrade.kind !== "skip-already-wired") {
         unresolved = true;
       }
       continue;

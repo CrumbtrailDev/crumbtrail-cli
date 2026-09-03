@@ -554,7 +554,10 @@ function hazardsFor(
     }
   }
 
-  if (envNames.some((name) => isKeyEnvName(name) && name !== keyRef?.envVar)) {
+  if (
+    keyRef &&
+    envNames.some((name) => isKeyEnvName(name) && name !== keyRef.envVar)
+  ) {
     hazards.add("other-key-channel");
   }
   return [...hazards];

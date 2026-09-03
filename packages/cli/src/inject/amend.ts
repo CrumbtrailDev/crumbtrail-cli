@@ -555,7 +555,7 @@ function topLevelAwaitedEarlyImportPositions(program: any): number[] {
       statement.expression?.type === "AwaitExpression" &&
       earlyImportArgument(statement.expression.argument)
     ) {
-      positions.push(statement.start ?? 0);
+      positions.push(statement.expression.start ?? 0);
       continue;
     }
     if (statement.type !== "VariableDeclaration") continue;
@@ -564,7 +564,7 @@ function topLevelAwaitedEarlyImportPositions(program: any): number[] {
         declaration.init?.type === "AwaitExpression" &&
         earlyImportArgument(declaration.init.argument)
       ) {
-        positions.push(statement.start ?? 0);
+        positions.push(declaration.init.start ?? 0);
       }
     }
   }
@@ -578,13 +578,13 @@ function topLevelEarlyRequirePositions(program: any): number[] {
       statement.type === "ExpressionStatement" &&
       bareEarlyRequire(statement.expression)
     ) {
-      positions.push(statement.start ?? 0);
+      positions.push(statement.expression.start ?? 0);
       continue;
     }
     if (statement.type !== "VariableDeclaration") continue;
     for (const declaration of statement.declarations ?? []) {
       if (bareEarlyRequire(declaration.init))
-        positions.push(statement.start ?? 0);
+        positions.push(declaration.init.start ?? 0);
     }
   }
   return positions;
@@ -633,14 +633,31 @@ function topLevelInitPositions(program: any): number[] {
 export function hasExecutableEarlyBrowserImport(text: string): boolean {
   const program = parseModuleProgram(text);
   if (program) {
+    const dependencies = (program.body ?? []).filter(
+      (statement: any) =>
+        [
+          "ImportDeclaration",
+          "ExportNamedDeclaration",
+          "ExportAllDeclaration",
+        ].includes(statement.type) &&
+        statement.importKind !== "type" &&
+        statement.exportKind !== "type" &&
+        statement.source &&
+        stringLiteralValue(statement.source) !== "crumbtrail-core" &&
+        stringLiteralValue(statement.source) !== "crumbtrail-core/early",
+    );
     const staticSideEffect = (program.body ?? []).some(
       (statement: any) =>
         statement.type === "ImportDeclaration" &&
         statement.importKind !== "type" &&
         (statement.specifiers?.length ?? 0) === 0 &&
-        stringLiteralValue(statement.source) === "crumbtrail-core/early",
+        stringLiteralValue(statement.source) === "crumbtrail-core/early" &&
+        dependencies.every(
+          (dependency: any) => statement.start < dependency.start,
+        ),
     );
     if (staticSideEffect) return true;
+    if (dependencies.length > 0) return false;
     const awaited = topLevelAwaitedEarlyImportPositions(program);
     const requires = topLevelEarlyRequirePositions(program);
     const ordered = [...awaited, ...requires];
@@ -651,28 +668,6 @@ export function hasExecutableEarlyBrowserImport(text: string): boolean {
     );
   }
 
-  const mask = maskLiterals(text);
-  if (mask === null) return false;
-  STATIC_IMPORT_REFERENCE.lastIndex = 0;
-  for (const candidate of text.matchAll(STATIC_IMPORT_REFERENCE)) {
-    if (
-      executableModuleKeyword(mask, candidate, "import") &&
-      firstModuleSpecifier(candidate) === "crumbtrail-core/early"
-    )
-      return true;
-  }
-  const initPositions = [
-    ...mask.matchAll(/\bCrumbtrail\s*\.\s*init\s*\(/g),
-  ].map((match) => match.index ?? Number.POSITIVE_INFINITY);
-  const awaited = /\bawait\s+import\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/g;
-  for (const candidate of text.matchAll(awaited)) {
-    if (
-      executableModuleKeyword(mask, candidate, "import") &&
-      firstModuleSpecifier(candidate) === "crumbtrail-core/early" &&
-      initPositions.every((position) => (candidate.index ?? 0) < position)
-    )
-      return true;
-  }
   return false;
 }
 

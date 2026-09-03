@@ -891,6 +891,49 @@ describe("buildPlan — the frontend an Express app serves", () => {
     expect(plan.warnings.join(" ")).toContain("public/index.html");
   });
 
+  it("keeps a fully wired Express and static page rerun complete", () => {
+    const server = [
+      'import express from "express";',
+      'import { Crumbtrail } from "crumbtrail-core";',
+      'import { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } from "crumbtrail-node";',
+      `Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: process.env.CRUMBTRAIL_KEY, service: "api" });`,
+      "const app = express();",
+      `app.use(createCrumbtrailExpressMiddleware({ endpoint: "${ENDPOINT}", authToken: process.env.CRUMBTRAIL_KEY }));`,
+      'app.use(express.static("public"));',
+      "app.use(createCrumbtrailExpressErrorMiddleware());",
+      "app.listen(3000);",
+    ].join("\n");
+    const page = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        `<script type="module">import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0"; Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "api" });</script>`,
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+        serviceName: "api",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({
+        [p("package.json")]: JSON.stringify({
+          dependencies: { express: "^4", "crumbtrail-node": "0.49.0" },
+        }),
+        [p("node_modules", "crumbtrail-node", "package.json")]: "{}",
+        [p(".env")]: "CRUMBTRAIL_KEY=customer-key\n",
+        [p("node_modules", "crumbtrail-core", "package.json")]: "{}",
+        [p("server.js")]: server,
+        [p("public", "index.html")]: page,
+      }),
+    );
+    expect(plan.kind, JSON.stringify(plan)).toBe("skip-already-wired");
+    expect(plan.extraEdits ?? []).toEqual([]);
+  });
+
   it("retains a dirty unwired served page behind one confirmation", () => {
     const wiredServer = [
       'import express from "express";',

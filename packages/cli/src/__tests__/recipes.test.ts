@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import path from "node:path";
 import { buildPlan, supportsInstrumentationClient } from "../inject/recipes";
 import { prependIntoSource } from "../inject/text";
+import { hasExecutableEarlyBrowserImport } from "../inject/amend";
 import { fakeInjectIO } from "./helpers";
 
 const CWD = "/proj";
@@ -321,6 +322,22 @@ describe("buildPlan — Next.js", () => {
 });
 
 describe("buildPlan — idempotency", () => {
+  it.each([
+    ['import "./telemetry"; import "crumbtrail-core/early";', false],
+    ['import "crumbtrail-core/early"; import "./telemetry";', true],
+    ['import "./telemetry"; await import("crumbtrail-core/early");', false],
+    ['await import("crumbtrail-core/early"); import "./telemetry";', false],
+    [
+      'const init = Crumbtrail.init({}), early = await import("crumbtrail-core/early");',
+      false,
+    ],
+    [
+      'const early = await import("crumbtrail-core/early"), init = Crumbtrail.init({});',
+      true,
+    ],
+  ])("proves dependency and expression ordering for %s", (source, expected) => {
+    expect(hasExecutableEarlyBrowserImport(source)).toBe(expected);
+  });
   it("retrofits early capture into a complete framework integration", () => {
     const source = [
       'import { Crumbtrail } from "crumbtrail-core";',
