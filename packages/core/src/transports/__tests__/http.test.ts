@@ -50,6 +50,7 @@ describe("HttpTransport", () => {
         sessionId: "ses_test",
         metadata: { app: "myapp" },
       }),
+      signal: expect.any(AbortSignal),
     });
   });
 

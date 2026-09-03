@@ -558,16 +558,16 @@ describe("deny fields applied to a running ui.num collector", () => {
     document.body.innerHTML = `
       <dl class="totals">
         <dt>Subtotal</dt><dd>$199.00</dd>
-        <dt>Invoice ref</dt><dd>4021</dd>
+        <dt>Handling</dt><dd>$4.00</dd>
       </dl>`;
 
     const { logger, internals, kinds } = start({ uiNumbers: true });
     await settle(internals);
-    expect(labels(kinds(UI_NUM_EVENT_KIND))).toContain("Invoice ref");
+    expect(labels(kinds(UI_NUM_EVENT_KIND))).toContain("Handling");
     const installed = internals.collectorTeardowns.get("uiNumbers");
 
     internals.applyRemoteConfig({
-      redaction: { denyFields: ["invoice ref"] },
+      redaction: { denyFields: ["handling"] },
     });
 
     // Change the region so the collector re-scans and re-emits it.
@@ -577,7 +577,7 @@ describe("deny fields applied to a running ui.num collector", () => {
 
     const emitted = kinds(UI_NUM_EVENT_KIND).slice(before);
     expect(emitted.length).toBeGreaterThan(0);
-    expect(labels(emitted)).not.toContain("Invoice ref");
+    expect(labels(emitted)).not.toContain("Handling");
     // Same collector throughout: the deny list reached it, it was not restarted.
     expect(internals.collectorTeardowns.get("uiNumbers")).toBe(installed);
     await logger.stop();

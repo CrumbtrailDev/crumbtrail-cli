@@ -255,16 +255,22 @@ describe("per kind fixture conformance", () => {
   interface FixtureCase {
     /** The `k` short code the fixture carries, which is not always its file name. */
     kind: string;
+    platform?: BugEvent["platform"];
     data: Record<string, unknown>;
     target?: TargetDescriptor;
   }
 
-  const fixtureEvent = ({ kind, data, target }: FixtureCase): BugEvent => ({
+  const fixtureEvent = ({
+    kind,
+    data,
+    target,
+    platform = "ios",
+  }: FixtureCase): BugEvent => ({
     t: FIXTURE_TIMESTAMP,
     k: kind,
     d: data,
     schemaVersion: 1,
-    platform: "ios",
+    platform,
     sdk: FIXTURE_SDK,
     capabilities: FIXTURE_CAPABILITIES,
     ...(target ? { target } : {}),
@@ -329,6 +335,28 @@ describe("per kind fixture conformance", () => {
         recovered: false,
         previousLaunch: true,
         stk: "CrumbtrailDemo.CheckoutViewController.submit()\nCrumbtrailDemo.CheckoutViewController.tap()",
+      },
+    },
+    "native-hang-dart": {
+      kind: "native-hang",
+      platform: "flutter",
+      data: {
+        source: "dart",
+        thresholdMs: 5000,
+        observedDurationMs: 7420,
+        recovered: true,
+        previousLaunch: false,
+      },
+    },
+    "native-hang-js": {
+      kind: "native-hang",
+      platform: "react-native",
+      data: {
+        source: "js",
+        thresholdMs: 5000,
+        observedDurationMs: 7420,
+        recovered: true,
+        previousLaunch: false,
       },
     },
     "nav-intent": {
@@ -414,10 +442,9 @@ describe("per kind fixture conformance", () => {
     // the envelope's two omission rules are inert across the whole corpus:
     // every fixture carries capabilities, and the one target present names an
     // element.
-    expect(
-      canonicalJson(event),
-      `core event does not match ${where}`,
-    ).toBe(expected);
+    expect(canonicalJson(event), `core event does not match ${where}`).toBe(
+      expected,
+    );
 
     // Then through the shared encoder the other suites' writers mirror, so a
     // future omission rule that changed one of these fixtures fails here too.
