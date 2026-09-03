@@ -538,6 +538,15 @@ function earlyImportArgument(node: any): boolean {
   return stringLiteralValue(argument) === "crumbtrail-core/early";
 }
 
+function bareEarlyRequire(node: any): boolean {
+  return (
+    node?.type === "CallExpression" &&
+    node.callee?.type === "Identifier" &&
+    node.callee.name === "require" &&
+    stringLiteralValue(node.arguments?.[0]) === "crumbtrail-core/early"
+  );
+}
+
 function topLevelAwaitedEarlyImportPositions(program: any): number[] {
   const positions: number[] = [];
   for (const statement of program.body ?? []) {
@@ -557,6 +566,25 @@ function topLevelAwaitedEarlyImportPositions(program: any): number[] {
       ) {
         positions.push(statement.start ?? 0);
       }
+    }
+  }
+  return positions;
+}
+
+function topLevelEarlyRequirePositions(program: any): number[] {
+  const positions: number[] = [];
+  for (const statement of program.body ?? []) {
+    if (
+      statement.type === "ExpressionStatement" &&
+      bareEarlyRequire(statement.expression)
+    ) {
+      positions.push(statement.start ?? 0);
+      continue;
+    }
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations ?? []) {
+      if (bareEarlyRequire(declaration.init))
+        positions.push(statement.start ?? 0);
     }
   }
   return positions;
@@ -614,9 +642,11 @@ export function hasExecutableEarlyBrowserImport(text: string): boolean {
     );
     if (staticSideEffect) return true;
     const awaited = topLevelAwaitedEarlyImportPositions(program);
-    if (awaited.length === 0) return false;
+    const requires = topLevelEarlyRequirePositions(program);
+    const ordered = [...awaited, ...requires];
+    if (ordered.length === 0) return false;
     const initPositions = topLevelInitPositions(program);
-    return awaited.some((position) =>
+    return ordered.some((position) =>
       initPositions.every((initPosition) => position < initPosition),
     );
   }

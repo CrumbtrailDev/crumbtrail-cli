@@ -34,6 +34,7 @@ import {
   type IntegrationHazard,
   type IntegrationRequirement,
   type IntegrationStatus,
+  SOURCE_EXTENSIONS,
 } from "./integration";
 import {
   amendSource,
@@ -560,15 +561,7 @@ function hasEarlyBrowserMarker(
   boundaryFile?: string | null,
 ): boolean {
   if (!EARLY_BROWSER_RECIPES.has(input.recipe)) return true;
-  const reachable = reachableSourceFiles({
-    cwd: input.cwd,
-    recipe: input.recipe,
-    endpoint: input.endpoint,
-    entryFile: input.entryFile,
-    serviceName: input.serviceName,
-    io,
-  });
-  const boundary = boundaryFile ?? input.entryFile ?? reachable[0]?.file;
+  const boundary = boundaryFile ?? browserEntryBoundary(input, io);
   const source = boundary ? io.readFile(boundary) : null;
   return source !== null && source !== undefined
     ? hasExecutableEarlyBrowserImport(source)
@@ -582,6 +575,45 @@ function browserEntryBoundary(
 ): string | null {
   if (input.entryFile) return path.resolve(input.entryFile);
   if (!EARLY_BROWSER_RECIPES.has(input.recipe)) return null;
+  if (input.recipe === "next") {
+    const usesSrc =
+      io.exists(path.join(input.cwd, "src", "app")) ||
+      io.exists(path.join(input.cwd, "src", "pages"));
+    const baseDir = usesSrc ? path.join(input.cwd, "src") : input.cwd;
+    const effectiveVersion =
+      installedNextVersion(input.cwd, io) ?? input.nextVersion;
+    if (supportsInstrumentationClient(effectiveVersion))
+      return findInstrumentationClient(io, input.cwd, baseDir).loaded;
+    const pagesApp = SOURCE_EXTENSIONS.map((ext) =>
+      path.join(baseDir, "pages", `_app${ext}`),
+    ).find((file) => io.exists(file));
+    if (pagesApp) return pagesApp;
+    const appLayout = SOURCE_EXTENSIONS.map((ext) =>
+      path.join(baseDir, "app", `layout${ext}`),
+    ).find((file) => io.exists(file));
+    if (appLayout) return appLayout;
+  }
+  if (input.recipe === "nuxt") {
+    const major = installedNuxtMajor(input.cwd, io);
+    const baseDir =
+      major != null
+        ? major >= 4
+          ? path.join(input.cwd, "app")
+          : input.cwd
+        : io.exists(path.join(input.cwd, "app"))
+          ? path.join(input.cwd, "app")
+          : input.cwd;
+    const plugin = SOURCE_EXTENSIONS.map((ext) =>
+      path.join(baseDir, "plugins", `crumbtrail.client${ext}`),
+    ).find((file) => io.exists(file));
+    if (plugin) return plugin;
+  }
+  if (input.recipe === "sveltekit") {
+    const hook = SOURCE_EXTENSIONS.map((ext) =>
+      path.join(input.cwd, "src", `hooks.client${ext}`),
+    ).find((file) => io.exists(file));
+    if (hook) return hook;
+  }
   return (
     reachableSourceFiles({
       cwd: input.cwd,

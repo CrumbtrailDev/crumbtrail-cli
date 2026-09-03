@@ -463,7 +463,7 @@ describe("buildPlan — idempotency", () => {
     [
       "a bare require",
       'require("crumbtrail-core/early")',
-      "prepend",
+      "skip-already-wired",
     ],
     [
       "a static import",
