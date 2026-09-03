@@ -54,6 +54,22 @@ private class MarkerStore(private var timestamp: Long? = null) : CrumbtrailProce
 
 class MainThreadWatchdogTest {
     @Test
+    fun `authorization redaction removes schemes and credentials idempotently`() {
+        for (key in listOf("Authorization", "authorization", "PROXY-AUTHORIZATION")) {
+            for (scheme in listOf("Bearer", "bEaReR", "Basic", "BASIC")) {
+                for (spacing in listOf(" ", "\t", "  ")) {
+                    val input = "$key$spacing:$spacing$scheme${spacing}abc123==; request failed"
+                    val expected = "$key$spacing:$spacing[REDACTED]; request failed"
+                    assertEquals(expected, redactedDiagnosticText(input))
+                    assertEquals(expected, redactedDiagnosticText(expected))
+                }
+            }
+        }
+        val ordinary = "Request failed with HTTP 401 at Checkout.submit()"
+        assertEquals(ordinary, redactedDiagnosticText(ordinary))
+    }
+
+    @Test
     fun `native collectors require explicit opt in`() {
         assertFalse(CrumbtrailCollectors().nativeWatchdog)
         assertFalse(CrumbtrailCollectors().nativeDiagnostics)

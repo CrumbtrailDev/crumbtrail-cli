@@ -9,6 +9,10 @@ import java.util.concurrent.TimeUnit
 const val MAX_DIAGNOSTIC_STACK_CHARS = 8_192
 const val MAX_DIAGNOSTIC_STACK_FRAMES = 64
 
+private val diagnosticAuthorizationPattern = Regex(
+    """(?i)(\b(?:proxy-)?authorization\b[ \t]*[:=][ \t]*)(?:bearer|basic)[ \t]+[^\s,;]+""",
+)
+
 private val diagnosticCredentialPattern = Regex(
     """(?i)(\b(?:authorization|cookie|set-cookie|proxy-authorization|www-authenticate|x[-_]?api[-_]?key|x[-_]?auth[-_]?token|x[-_]?csrf[-_]?token|access[-_]?token|refresh[-_]?token|client[-_]?secret|api[-_]?key|auth[-_]?(?:token|key)|token|secret|password|passwd|credential|signature|bearer)\b\s*(?:[:=]\s*|\s+))([^\s,;]+)""",
 )
@@ -21,7 +25,9 @@ fun boundedDiagnosticText(value: String?, maxChars: Int = MAX_DIAGNOSTIC_STACK_C
 
 /** Remove credential-shaped values from diagnostic text before it leaves the device. */
 fun redactedDiagnosticText(value: String?, maxChars: Int = MAX_DIAGNOSTIC_STACK_CHARS): String? =
-    boundedDiagnosticText(value, maxChars)?.replace(diagnosticCredentialPattern) {
+    boundedDiagnosticText(value, maxChars)?.replace(diagnosticAuthorizationPattern) {
+        "${it.groupValues[1]}[REDACTED]"
+    }?.replace(diagnosticCredentialPattern) {
         "${it.groupValues[1]}[REDACTED]"
     }
 

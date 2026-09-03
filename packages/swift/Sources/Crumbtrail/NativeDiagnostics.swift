@@ -12,6 +12,10 @@ public let crumbtrailMaxNativeHangDurationMilliseconds: Int64 = 86_400_000
 public let crumbtrailMaxMetricKitDiagnostics = 32
 public let crumbtrailMaxMetricKitPayloads = 32
 
+private let crumbtrailDiagnosticAuthorizationPattern = try! NSRegularExpression(
+    pattern: #"(?i)(\b(?:proxy-)?authorization\b[ \t]*[:=][ \t]*)(?:bearer|basic)[ \t]+[^\s,;]+"#
+)
+
 private let crumbtrailDiagnosticCredentialPattern = try! NSRegularExpression(
     pattern: #"(?i)(\b(?:authorization|cookie|set-cookie|proxy-authorization|www-authenticate|x[-_]?api[-_]?key|x[-_]?auth[-_]?token|x[-_]?csrf[-_]?token|access[-_]?token|refresh[-_]?token|client[-_]?secret|api[-_]?key|auth[-_]?(?:token|key)|token|secret|password|passwd|credential|signature|bearer)\b\s*(?:[:=]\s*|\s+))([^\s,;]+)"#
 )
@@ -32,9 +36,14 @@ public func crumbtrailRedactedDiagnosticText(
 ) -> String? {
     guard let bounded = crumbtrailBoundedDiagnosticText(value, maxCharacters: maxCharacters)
     else { return nil }
-    let range = NSRange(bounded.startIndex..<bounded.endIndex, in: bounded)
-    return crumbtrailDiagnosticCredentialPattern.stringByReplacingMatches(
+    let authorizationRedacted = crumbtrailDiagnosticAuthorizationPattern.stringByReplacingMatches(
         in: bounded,
+        range: NSRange(bounded.startIndex..<bounded.endIndex, in: bounded),
+        withTemplate: "$1[REDACTED]"
+    )
+    let range = NSRange(authorizationRedacted.startIndex..<authorizationRedacted.endIndex, in: authorizationRedacted)
+    return crumbtrailDiagnosticCredentialPattern.stringByReplacingMatches(
+        in: authorizationRedacted,
         range: range,
         withTemplate: "$1[REDACTED]"
     )

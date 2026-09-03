@@ -57,6 +57,21 @@ private final class FakeMetricKitSource: CrumbtrailMetricKitSource {
 }
 
 final class NativeDiagnosticsTests: XCTestCase {
+    func testAuthorizationRedactionRemovesSchemesAndCredentialsIdempotently() {
+        for key in ["Authorization", "authorization", "PROXY-AUTHORIZATION"] {
+            for scheme in ["Bearer", "bEaReR", "Basic", "BASIC"] {
+                for spacing in [" ", "\t", "  "] {
+                    let input = "\(key)\(spacing):\(spacing)\(scheme)\(spacing)abc123==; request failed"
+                    let expected = "\(key)\(spacing):\(spacing)[REDACTED]; request failed"
+                    XCTAssertEqual(expected, crumbtrailRedactedDiagnosticText(input))
+                    XCTAssertEqual(expected, crumbtrailRedactedDiagnosticText(expected))
+                }
+            }
+        }
+        let ordinary = "Request failed with HTTP 401 at Checkout.submit()"
+        XCTAssertEqual(ordinary, crumbtrailRedactedDiagnosticText(ordinary))
+    }
+
     func testNativeCollectorsRequireExplicitOptIn() {
         XCTAssertFalse(CrumbtrailCollectors.standard.nativeWatchdog)
         XCTAssertFalse(CrumbtrailCollectors.standard.nativeDiagnostics)
