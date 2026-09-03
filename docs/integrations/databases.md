@@ -59,10 +59,10 @@ returns opaque identifiers exactly 64 characters long. It must include `entityHa
 characters are letters, numbers, underscore, and hyphen. The callback can throw safely, and invalid
 output omits only the race object.
 
-Race evidence is omitted from bulk and image less diffs, reads that return more than one row,
-multi key cache operations, and database work observed inside a transaction. Existing primary key,
-cache key, row, value, and redaction capture remains unchanged. Do not use any of those raw or
-redacted values as a cross session join key.
+Race evidence is omitted from bulk and image less diffs without a resolvable entity, reads that
+return more than one row, multi key cache operations, and database work observed inside a
+transaction. Existing primary key, cache key, row, value, and redaction capture remains unchanged.
+Do not use any of those raw or redacted values as a cross session join key.
 
 ## Postgres (`pg` Client or Pool)
 

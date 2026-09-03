@@ -55,12 +55,37 @@ describe("race evidence contract", () => {
     expect(JSON.stringify(first)).not.toContain(credential);
     expect(
       resolver({
+        surface: "db.read",
+        operation: "read",
+        table: "customers",
+        primaryKey: { id: 42 },
+      })?.entityHash,
+    ).not.toBe(first?.entityHash);
+    expect(
+      resolver({
         surface: "cache",
         operation: "get",
         cacheKey: "orders:42",
         resourceSubject: "order:42",
       })?.entityHash,
     ).not.toBe(first?.entityHash);
+    const cacheEvidence = buildCacheEvent({
+      driver: "redis",
+      op: "get",
+      keys: ["orders:42"],
+      requestId: "req-cache-hmac",
+      raceEvidence: {
+        enabled: true,
+        resourceSubject: "order:42",
+        resolve: resolver,
+      },
+    });
+    expect(JSON.stringify(cacheEvidence.d.raceEvidence)).not.toContain(
+      "orders:42",
+    );
+    expect(JSON.stringify(cacheEvidence.d.raceEvidence)).not.toContain(
+      "[REDACTED_KEY]",
+    );
   });
 
   it("refuses weak credentials and malformed opaque output", () => {

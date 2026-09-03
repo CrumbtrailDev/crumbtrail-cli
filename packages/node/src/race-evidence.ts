@@ -93,13 +93,18 @@ export function createHmacRaceEvidenceResolver(
   return (input) => {
     try {
       const entitySource =
-        input.surface === "cache" ? input.cacheKey : input.primaryKey;
+        input.surface === "cache"
+          ? input.cacheKey
+          : { table: input.table, primaryKey: input.primaryKey };
       if (entitySource === undefined || entitySource === null) return undefined;
       if (
         input.surface !== "cache" &&
         typeof entitySource === "object" &&
         !Array.isArray(entitySource) &&
-        Object.keys(entitySource).length === 0
+        (!input.table ||
+          !input.primaryKey ||
+          Array.isArray(input.primaryKey) ||
+          Object.keys(input.primaryKey).length === 0)
       ) {
         return undefined;
       }

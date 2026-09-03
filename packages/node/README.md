@@ -111,10 +111,10 @@ same application resource. The configured version field produces `versionHash` o
 `beforeVersionHash` and `afterVersionHash` on diffs, and no version identifier when the field is
 missing.
 
-Bulk database statements, image less diffs, multi key cache calls, and database work inside an
-observed transaction do not receive race evidence. Existing row, key, value, and redaction capture
-is unchanged. A resolver or HMAC failure omits only `raceEvidence` and never changes the host
-operation.
+Bulk database statements, image less diffs without a resolvable entity, multi key cache calls, and
+database work inside an observed transaction do not receive race evidence. Existing row, key,
+value, and redaction capture is unchanged. A resolver or HMAC failure omits only `raceEvidence`
+and never changes the host operation.
 
 If the instrumentation path has no strong ingest credential, supply already opaque 64 character
 identifiers through an explicit operation option or resolver. The SDK accepts letters, numbers,
