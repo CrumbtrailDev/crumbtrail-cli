@@ -1265,8 +1265,13 @@ export class Crumbtrail {
       const generation = ++this.configPollGeneration;
       try {
         let binding: RuntimeBinding | undefined;
-        if (options.runtimeBinding)
+        if (
+          options.runtimeBinding?.matchesOrigin(options.endpoint) &&
+          !stopped &&
+          generation === this.configPollGeneration
+        )
           binding = await options.runtimeBinding.getBinding();
+        if (stopped || generation !== this.configPollGeneration) return;
         // `no-store`: the config route answers with `Cache-Control: private, max-age=60` and the
         // default poll interval is exactly that, so an HTTP cache hit would replay the previous
         // body. A replayed body re-runs whatever probe it asked for and rests a second copy of the

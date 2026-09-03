@@ -394,12 +394,14 @@ else only for a self hosted config service.
 When an ingest key is present, the SDK also registers one runtime identity with
 `POST /api/runtime/register` on the ingest host. Cloud returns an opaque
 `instanceId`, a short lived bearer proof, and `expiresAt`. The SDK keeps these
-values in memory for the current tab and sends them only as top level session
-start fields and as bearer authentication for config polling. It rotates the
-proof before expiry and falls back to the untargeted poll when registration is
-unavailable or rate limited. Registration is bounded and does not block capture
-indefinitely. Endpoint based serverless wrappers reuse one binding across warm
-invocations for the same endpoint and project, with a bounded idle cache.
+values in memory and sends them only as top level session start fields. A config
+poll also uses the identity and bearer proof only when its resolved origin
+matches the ingest host. A different-origin `configEndpoint` stays on the
+legacy untargeted poll. It rotates the proof before expiry and falls back to the
+untargeted poll when registration is unavailable or rate limited. Registration
+is bounded and does not block capture indefinitely. Endpoint based serverless
+wrappers reuse one binding across warm invocations for the same endpoint and
+project, with a bounded idle cache.
 
 Set `flightRecorder: true` to buffer locally until an error, signal, widget
 action, or `flag()` triggers capture. The recorder adds the configured tail

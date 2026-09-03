@@ -13,6 +13,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Crumbtrail } from "../crumbtrail";
+import type { RuntimeBindingClient } from "../runtime-binding";
 
 function makeTransport() {
   return {
@@ -63,6 +64,19 @@ function stubFetch() {
   return fetch;
 }
 
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T | PromiseLike<T>): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
 /** The config poll, if one was made. */
 function pollUrl(fetch: ReturnType<typeof stubFetch>): URL | undefined {
   const call = fetch.mock.calls.find((args) =>
@@ -75,6 +89,7 @@ function pollUrl(fetch: ReturnType<typeof stubFetch>): URL | undefined {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -123,6 +138,109 @@ describe("remote capture config wiring", () => {
     });
 
     expect(pollUrl(fetch)?.origin).toBe("https://policy.example.test");
+    await logger.stop();
+  });
+
+  it("uses legacy untargeted polling for a config endpoint on another origin", async () => {
+    const runtime = {
+      instanceId: "ri_runtime_cross_origin",
+      instanceProof: `proof_cross_origin_${"x".repeat(40)}`,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    };
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchImpl = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(input), init });
+        if (String(input).includes("/api/runtime/register"))
+          return new Response(JSON.stringify(runtime), { status: 201 });
+        return new Response(JSON.stringify({ killSwitch: false }), {
+          status: 200,
+        });
+      },
+    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(fetchImpl);
+
+    const logger = Crumbtrail.init({
+      ...QUIET,
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      configEndpoint: "https://policy.example.test/api/capture-config",
+      remoteConfig: true,
+    });
+
+    await vi.waitFor(() =>
+      expect(
+        calls.some((call) =>
+          call.url.startsWith("https://policy.example.test/"),
+        ),
+      ).toBe(true),
+    );
+    await vi.waitFor(() =>
+      expect(
+        calls.some((call) => call.url.endsWith("/api/session/start")),
+      ).toBe(true),
+    );
+    const poll = calls.find((call) =>
+      call.url.startsWith("https://policy.example.test/"),
+    );
+    const start = calls.find((call) => call.url.endsWith("/api/session/start"));
+    const startBody = JSON.parse(String(start?.init?.body)) as Record<
+      string,
+      unknown
+    >;
+    expect(startBody).toMatchObject({
+      instanceId: runtime.instanceId,
+      instanceProof: runtime.instanceProof,
+    });
+    expect(
+      new URL(poll?.url ?? "https://invalid").searchParams.get("instanceId"),
+    ).toBe(null);
+    expect(poll?.init).not.toHaveProperty("headers");
+    await logger.stop();
+  });
+
+  it("does not start a config request after polling is stopped during binding lookup", async () => {
+    const fetch = stubFetch();
+    const binding = deferred<{
+      instanceId: string;
+      instanceProof: string;
+      expiresAt: string;
+    }>();
+    const runtimeBinding = {
+      matchesOrigin: vi.fn(() => true),
+      getBinding: vi.fn(() => binding.promise),
+    } as unknown as RuntimeBindingClient;
+    const logger = Crumbtrail.init({
+      ...QUIET,
+      transportInstance: makeTransport(),
+      httpEndpoint: "https://api.crumbtrail.test",
+      httpAuthToken: "ctkey_live",
+      remoteConfig: false,
+    });
+    const stop = logger.startConfigPolling({
+      endpoint: "https://api.crumbtrail.test/api/capture-config",
+      projectKey: "ctkey_live",
+      intervalMs: 100_000,
+      runtimeBinding,
+    });
+
+    await vi.waitFor(() =>
+      expect(runtimeBinding.getBinding).toHaveBeenCalled(),
+    );
+    stop();
+    binding.resolve({
+      instanceId: "ri_runtime_stopped",
+      instanceProof: `proof_stopped_${"x".repeat(40)}`,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(
+      fetch.mock.calls.some((call) =>
+        String(call[0]).includes("/api/capture-config"),
+      ),
+    ).toBe(false);
     await logger.stop();
   });
 
