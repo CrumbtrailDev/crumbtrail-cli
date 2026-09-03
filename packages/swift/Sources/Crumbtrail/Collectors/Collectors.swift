@@ -90,7 +90,7 @@ extension Crumbtrail {
         )
     }
 
-    private func recordNativeHang(_ hang: CrumbtrailNativeHang) {
+    private func recordNativeHang(_ hang: CrumbtrailNativeHang) -> Bool {
         addEvent(
             kind: .nativeHang,
             data: .object(compacting: [
@@ -135,7 +135,7 @@ extension Crumbtrail {
             ? CrumbtrailMainThreadWatchdog(
                 scheduler: CrumbtrailDispatchWatchdogScheduler(),
                 handoff: pendingHangStore,
-                onHang: { [weak self] hang in self?.recordNativeHang(hang) },
+                onHang: { [weak self] hang in self?.recordNativeHang(hang) ?? false },
                 isDebuggerAttached: CrumbtrailDebugger.isAttached
             )
             : nil
@@ -237,7 +237,7 @@ private extension Crumbtrail {
         let source = CrumbtrailSystemMetricKitSource()
         let collector = CrumbtrailMetricKitCollector(
             source: source,
-            emitHang: { [weak self] hang in self?.recordNativeHang(hang) },
+            emitHang: { [weak self] hang in _ = self?.recordNativeHang(hang) },
             emitCrash: { [weak self] crash in self?.recordNativeCrash(crash) }
         )
         collector.start()

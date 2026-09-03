@@ -92,7 +92,8 @@ interface CrumbtrailWatchdogScheduler {
 class CrumbtrailMainThreadWatchdog(
     private val scheduler: CrumbtrailWatchdogScheduler,
     private val handoff: CrumbtrailPendingHangStore,
-    private val onHang: (CrumbtrailNativeHang) -> Unit,
+    /** Returns true only when the host accepted the event into its logger. */
+    private val onHang: (CrumbtrailNativeHang) -> Boolean,
     /** Monotonic milliseconds used only for elapsed-time calculations. */
     private val now: () -> Long = { System.nanoTime() / 1_000_000L },
     /** Wall-clock milliseconds used only for persisted event timestamps. */
@@ -234,9 +235,10 @@ class CrumbtrailMainThreadWatchdog(
             }
             lastHeartbeatAt = current
             if (observation != null) {
+                val recoveredObservation = observation
                 scheduler.postToBackground {
-                    runCatching { handoff.clear() }
-                    runCatching { onHang(observation) }
+                    val accepted = runCatching { onHang(recoveredObservation) }.getOrDefault(false)
+                    if (accepted) runCatching { handoff.clear() }
                 }
             }
         }
@@ -300,14 +302,18 @@ class CrumbtrailMainThreadWatchdog(
     }
 }
 
-/** Import a pending hang from the previous launch exactly once. */
+/**
+ * Import a pending hang from the previous launch exactly once.
+ *
+ * The sink acknowledges that the event was accepted. A rejected event keeps
+ * its durable handoff so a later launch can retry it.
+ */
 fun drainPendingHang(
     handoff: CrumbtrailPendingHangStore,
-    onHang: (CrumbtrailNativeHang) -> Unit,
-) {
-    val pending = runCatching { handoff.read() }.getOrNull() ?: return
-    runCatching { handoff.clear() }
-    runCatching {
+    onHang: (CrumbtrailNativeHang) -> Boolean,
+): Boolean {
+    val pending = runCatching { handoff.read() }.getOrNull() ?: return false
+    val accepted = runCatching {
         onHang(
             CrumbtrailNativeHang(
                 thresholdMs = pending.thresholdMs.coerceIn(0, CrumbtrailMainThreadWatchdog.MAX_NATIVE_HANG_DURATION_MS),
@@ -317,7 +323,9 @@ fun drainPendingHang(
                 stack = boundedDiagnosticText(pending.stack),
             )
         )
-    }
+    }.getOrDefault(false)
+    if (accepted) runCatching { handoff.clear() }
+    return accepted
 }
 
 /** Shared app-lifecycle process-exit observation. */

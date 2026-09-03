@@ -75,6 +75,9 @@ when the debugger detaches. A missed heartbeat is written to a bounded file in
 Application Support and emitted when the main thread recovers. If the process
 never recovers, the next launch emits `native-hang` with `previousLaunch: true`
 and `recovered: false`. Stacks are limited to 64 frames and 8,192 characters.
+The handoff is cleared only after the logger accepts the event. Atomic
+replacement temporary files are isolated in a bounded Application Support
+directory and stale files are removed during later store access.
 
 On iOS 14 and newer, MetricKit diagnostics are imported through the optional
 framework. Hang diagnostics are emitted as `native-hang` and crash diagnostics

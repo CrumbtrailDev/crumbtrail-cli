@@ -96,7 +96,10 @@ debugger is attached. It automatically resumes polling when the debugger
 detaches. A missed heartbeat is written to `SharedPreferences` and emitted when
 the main thread recovers. If the process never recovers, the next launch emits
 `native-hang` with `previousLaunch: true` and `recovered: false`. Stacks are
-limited to 64 frames and 8,192 characters.
+limited to 64 frames and 8,192 characters. A previous launch handoff is read
+and recorded on the watchdog executor. It is cleared only after the event is
+accepted by the logger, so stopping the logger or rejecting the event leaves it
+for the next launch.
 
 On Android API 30 and newer the SDK also reads `ApplicationExitInfo` for the
 most recent ANR, crash, native crash, or low memory exit. These observations are

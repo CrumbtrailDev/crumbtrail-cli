@@ -260,8 +260,8 @@ fun readAndroidDeviceInfo(context: Context): CrumbtrailDeviceInfo {
  * Start capture for an Android app.
  *
  * Call from `Application.onCreate`. Starting there rather than in an Activity is
- * what lets the crash handler pick up a crash from the previous launch before
- * anything else has a chance to fail.
+ * what lets the crash handler and background hang importer begin before the app
+ * enters its first screen without doing a hang handoff commit on the main thread.
  */
 fun startCrumbtrail(
     application: Application,
@@ -278,7 +278,7 @@ fun startCrumbtrail(
     }
     val pendingHangs = SharedPreferencesPendingHangStore(application)
     if (config.collectors.nativeDiagnostics || config.collectors.nativeWatchdog) {
-        runCatching { drainPendingHang(pendingHangs, logger) }
+        schedulePendingHangDrain(pendingHangs, logger)
     }
     if (config.collectors.nativeDiagnostics) {
         runCatching { installProcessExitCollector(application, logger) }
@@ -292,26 +292,36 @@ fun startCrumbtrail(
     return logger
 }
 
-private fun drainPendingHang(
+private fun schedulePendingHangDrain(
     handoff: SharedPreferencesPendingHangStore,
     logger: Crumbtrail,
 ) {
-    ai.crumbtrail.sdk.drainPendingHang(handoff) { hang -> logger.recordNativeHang(hang) }
+    val scheduler = CrumbtrailExecutorWatchdogScheduler { }
+    scheduler.postToBackground {
+        runCatching {
+            ai.crumbtrail.sdk.drainPendingHang(handoff) { hang -> logger.recordNativeHang(hang) }
+        }
+        scheduler.shutdown()
+    }
+    logger.registerCleanup {
+        scheduler.drain()
+        scheduler.shutdown()
+    }
 }
 
-private fun Crumbtrail.recordNativeHang(hang: ai.crumbtrail.sdk.CrumbtrailNativeHang) {
-    addEvent(
-        CrumbtrailEventKind.NATIVE_HANG,
-        JsonValue.of(
-            "source" to JsonValue.Str("main-thread"),
-            "thresholdMs" to JsonValue.Num(hang.thresholdMs),
-            "observedDurationMs" to JsonValue.Num(hang.observedDurationMs),
-            "recovered" to JsonValue.Bool(hang.recovered),
-            "previousLaunch" to JsonValue.Bool(hang.previousLaunch),
-            "stk" to JsonValue.str(hang.stack),
-        ),
-    )
-}
+private fun Crumbtrail.recordNativeHang(
+    hang: ai.crumbtrail.sdk.CrumbtrailNativeHang,
+): Boolean = addEvent(
+    CrumbtrailEventKind.NATIVE_HANG,
+    JsonValue.of(
+        "source" to JsonValue.Str("main-thread"),
+        "thresholdMs" to JsonValue.Num(hang.thresholdMs),
+        "observedDurationMs" to JsonValue.Num(hang.observedDurationMs),
+        "recovered" to JsonValue.Bool(hang.recovered),
+        "previousLaunch" to JsonValue.Bool(hang.previousLaunch),
+        "stk" to JsonValue.str(hang.stack),
+    ),
+)
 
 private fun createWatchdog(
     application: Application,

@@ -116,10 +116,12 @@ public extension CrumbtrailWatchdogScheduler {
 /// Foreground only watchdog state machine. The platform adapter supplies the
 /// timer, main queue and debugger state, which keeps this behavior testable on
 /// macOS without UIKit or a simulator.
+/// The hang sink returns true only when the event was accepted into the host
+/// logger. The durable handoff is cleared only after that acknowledgement.
 public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
     private let scheduler: CrumbtrailWatchdogScheduler
     private let handoff: CrumbtrailPendingHangStore
-    private let onHang: (CrumbtrailNativeHang) -> Void
+    private let onHang: (CrumbtrailNativeHang) -> Bool
     private let now: () -> Int64
     private let wallNow: () -> Int64
     private let isDebuggerAttached: () -> Bool
@@ -139,7 +141,7 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
     public init(
         scheduler: CrumbtrailWatchdogScheduler,
         handoff: CrumbtrailPendingHangStore,
-        onHang: @escaping (CrumbtrailNativeHang) -> Void,
+        onHang: @escaping (CrumbtrailNativeHang) -> Bool,
         /// Monotonic milliseconds used only for elapsed-time calculations.
         now: @escaping () -> Int64 = {
             Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
@@ -290,8 +292,7 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
         lastHeartbeatAt = current
         if let observation {
             scheduler.postToBackground {
-                self.handoff.clear()
-                self.onHang(observation)
+                if self.onHang(observation) { self.handoff.clear() }
             }
         }
         lock.unlock()
@@ -362,13 +363,14 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
     }
 }
 
+/// Imports one previous-launch hang and clears it only after the sink accepts it.
+@discardableResult
 public func drainPendingHang(
     _ handoff: CrumbtrailPendingHangStore,
-    onHang: (CrumbtrailNativeHang) -> Void
-) {
-    guard let pending = handoff.read() else { return }
-    handoff.clear()
-    onHang(
+    onHang: (CrumbtrailNativeHang) -> Bool
+) -> Bool {
+    guard let pending = handoff.read() else { return false }
+    let accepted = onHang(
         CrumbtrailNativeHang(
             thresholdMs: min(
                 max(0, pending.thresholdMs), crumbtrailMaxNativeHangDurationMilliseconds
@@ -381,14 +383,20 @@ public func drainPendingHang(
             stack: crumbtrailBoundedDiagnosticText(pending.stack)
         )
     )
+    if accepted { handoff.clear() }
+    return accepted
 }
 
 /// Durable hang handoff in Application Support, alongside the crash handoff.
 /// A bounded JSON file with atomic replacement survives process termination
-/// without using UserDefaults as a second persistence mechanism.
+/// without using UserDefaults as a second persistence mechanism. Replacement
+/// files live in a dedicated directory so cleanup never scans the whole support
+/// directory.
 public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStore {
     private static let fileName = "crumbtrail-pending-hang.json"
+    private static let temporaryDirectoryName = "crumbtrail-pending-hang-tmp"
     private static let temporaryFileSuffix = ".tmp"
+    private static let temporaryFileMarker = ".replacement-"
     private static let temporaryFileLifetime: TimeInterval = 24 * 60 * 60
     private static let maximumTemporaryFilesToInspect = 32
     private static let maximumTemporaryFilesToRemove = 8
@@ -418,11 +426,15 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
         else { return }
 
         cleanupTemporaryFiles()
-        let temporaryName = "." + fileURL.lastPathComponent + "." + UUID().uuidString + ".tmp"
-        let temporaryURL = fileURL.deletingLastPathComponent().appendingPathComponent(temporaryName)
+        let temporaryDirectory = temporaryDirectoryURL(for: fileURL)
+        let temporaryName = fileURL.lastPathComponent
+            + Self.temporaryFileMarker
+            + UUID().uuidString
+            + Self.temporaryFileSuffix
+        let temporaryURL = temporaryDirectory.appendingPathComponent(temporaryName)
         do {
             try fileManager.createDirectory(
-                at: fileURL.deletingLastPathComponent(),
+                at: temporaryDirectory,
                 withIntermediateDirectories: true
             )
             try data.write(to: temporaryURL, options: .atomic)
@@ -463,34 +475,40 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
     /// required before deletion and both inspection and removal are bounded.
     private func cleanupTemporaryFiles(now: Date = Date()) {
         guard let fileURL else { return }
-        let directory = fileURL.deletingLastPathComponent()
-        let prefix = "." + fileURL.lastPathComponent + "."
-        guard let entries = try? fileManager.contentsOfDirectory(
+        let directory = temporaryDirectoryURL(for: fileURL)
+        let prefix = fileURL.lastPathComponent + Self.temporaryFileMarker
+        guard let entries = fileManager.enumerator(
             at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: []
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [],
+            errorHandler: { _, _ in true }
         ) else { return }
 
-        let candidates = entries
-            .filter {
-                let name = $0.lastPathComponent
-                return name.hasPrefix(prefix) && name.hasSuffix(Self.temporaryFileSuffix)
-            }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-            .prefix(Self.maximumTemporaryFilesToInspect)
         let cutoff = now.addingTimeInterval(-Self.temporaryFileLifetime)
+        var inspected = 0
         var removed = 0
-        for entry in candidates {
-            guard removed < Self.maximumTemporaryFilesToRemove,
+        while inspected < Self.maximumTemporaryFilesToInspect,
+              let entry = entries.nextObject() as? URL {
+            inspected += 1
+            let name = entry.lastPathComponent
+            guard name.hasPrefix(prefix), name.hasSuffix(Self.temporaryFileSuffix),
                   let values = try? entry.resourceValues(
                       forKeys: [.contentModificationDateKey, .isRegularFileKey]
                   ),
                   values.isRegularFile == true,
                   let modified = values.contentModificationDate,
-                  modified < cutoff
+                  modified < cutoff,
+                  removed < Self.maximumTemporaryFilesToRemove
             else { continue }
             if (try? fileManager.removeItem(at: entry)) != nil { removed += 1 }
         }
+    }
+
+    private func temporaryDirectoryURL(for fileURL: URL) -> URL {
+        fileURL.deletingLastPathComponent().appendingPathComponent(
+            Self.temporaryDirectoryName,
+            isDirectory: true
+        )
     }
 }
 

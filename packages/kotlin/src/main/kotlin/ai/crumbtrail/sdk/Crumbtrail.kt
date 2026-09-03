@@ -149,6 +149,7 @@ class Crumbtrail(
     private val queue = CrumbtrailEventQueue(config.queueCapacity)
     private val gapLock = Any()
     private val _gaps = mutableListOf<CrumbtrailCaptureGap>()
+    private val lifecycleLock = Any()
     private var stopped = false
     private val cleanups = mutableListOf<() -> Unit>()
 
@@ -190,22 +191,30 @@ class Crumbtrail(
     fun addEvent(kind: CrumbtrailEventKind, data: JsonValue, target: CrumbtrailTarget? = null) =
         addEvent(kind.wireValue, data, target)
 
-    fun addEvent(kind: String, data: JsonValue, target: CrumbtrailTarget? = null) {
-        if (stopped) return
-        queue.append(
-            CrumbtrailEvent(
-                timestamp = clock(),
-                kind = kind,
-                data = data,
-                platform = platform,
-                sdk = CrumbtrailSdk.descriptor,
-                capabilities = capabilities,
-                target = target,
-            )
-        )
+    fun addEvent(kind: String, data: JsonValue, target: CrumbtrailTarget? = null): Boolean {
+        val accepted = synchronized(lifecycleLock) {
+            if (stopped) {
+                false
+            } else {
+                queue.append(
+                    CrumbtrailEvent(
+                        timestamp = clock(),
+                        kind = kind,
+                        data = data,
+                        platform = platform,
+                        sdk = CrumbtrailSdk.descriptor,
+                        capabilities = capabilities,
+                        target = target,
+                    )
+                )
+                true
+            }
+        }
+        if (!accepted) return false
         // Touch the session so a resumed one does not expire mid-use.
         store.write(PersistedSession(sessionId, clock()))
         if (queue.size >= config.flushBatchSize) flush()
+        return true
     }
 
     /** Record a caught error. `fatal` stays false: the process survived. */
@@ -280,8 +289,10 @@ class Crumbtrail(
     }
 
     fun stop() {
-        if (stopped) return
-        stopped = true
+        synchronized(lifecycleLock) {
+            if (stopped) return
+            stopped = true
+        }
         cleanups.asReversed().forEach { runCatching(it) }
         cleanups.clear()
         // Waited on, unlike an ordinary flush: a caller that stops the SDK is

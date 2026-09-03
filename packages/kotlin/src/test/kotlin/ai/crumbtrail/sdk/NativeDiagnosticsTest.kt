@@ -62,7 +62,7 @@ class MainThreadWatchdogTest {
         val watchdog = CrumbtrailMainThreadWatchdog(
             scheduler = scheduler,
             handoff = handoff,
-            onHang = {},
+            onHang = { true },
             now = { now },
             wallNow = { wallNow },
             captureStack = { "main frame" },
@@ -124,7 +124,7 @@ class MainThreadWatchdogTest {
         val watchdog = CrumbtrailMainThreadWatchdog(
             scheduler = scheduler,
             handoff = handoff,
-            onHang = {},
+            onHang = { true },
             now = { now },
         )
 
@@ -143,6 +143,44 @@ class MainThreadWatchdogTest {
     }
 
     @Test
+    fun `retains handoff when hang callback does not accept`() {
+        val scheduler = FakeWatchdogScheduler()
+        val handoff = MemoryPendingHangStore()
+        var now = 0L
+        val watchdog = CrumbtrailMainThreadWatchdog(
+            scheduler = scheduler,
+            handoff = handoff,
+            onHang = { false },
+            now = { now },
+        )
+
+        watchdog.start()
+        scheduler.runMain()
+        now = 5_000
+        scheduler.runNextScheduled()
+        now = 5_100
+        scheduler.runMain()
+        scheduler.runBackground()
+
+        assertNotNull(handoff.read())
+    }
+
+    @Test
+    fun `retains previous launch handoff when import is rejected`() {
+        val store = MemoryPendingHangStore(
+            CrumbtrailPendingHang(
+                thresholdMs = 5_000,
+                observedDurationMs = 8_000,
+                stack = "old stack",
+                at = 1,
+            )
+        )
+
+        assertFalse(drainPendingHang(store) { false })
+        assertNotNull(store.read())
+    }
+
+    @Test
     fun `pause suppresses checks and debugger suppresses start`() {
         val pausedScheduler = FakeWatchdogScheduler()
         val pausedStore = MemoryPendingHangStore()
@@ -150,7 +188,7 @@ class MainThreadWatchdogTest {
         val paused = CrumbtrailMainThreadWatchdog(
             scheduler = pausedScheduler,
             handoff = pausedStore,
-            onHang = {},
+            onHang = { true },
             now = { pausedNow },
         )
         paused.start()
@@ -165,7 +203,7 @@ class MainThreadWatchdogTest {
         val debug = CrumbtrailMainThreadWatchdog(
             scheduler = debugScheduler,
             handoff = MemoryPendingHangStore(),
-            onHang = {},
+            onHang = { true },
             isDebuggerAttached = { attached },
         )
         debug.start()
@@ -180,7 +218,7 @@ class MainThreadWatchdogTest {
         val attachedWatchdog = CrumbtrailMainThreadWatchdog(
             scheduler = attachedScheduler,
             handoff = MemoryPendingHangStore(),
-            onHang = {},
+            onHang = { true },
             isDebuggerAttached = { dynamicallyAttached },
         )
         attachedWatchdog.start()
@@ -199,7 +237,7 @@ class MainThreadWatchdogTest {
         racedWatchdog = CrumbtrailMainThreadWatchdog(
             scheduler = racedScheduler,
             handoff = MemoryPendingHangStore(),
-            onHang = {},
+            onHang = { true },
             isDebuggerAttached = {
                 if (pauseDuringPoll) {
                     pauseDuringPoll = false
