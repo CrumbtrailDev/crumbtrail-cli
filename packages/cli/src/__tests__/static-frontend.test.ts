@@ -850,6 +850,49 @@ describe("buildPlan — the frontend an Express app serves", () => {
     expect(plan.warnings.join(" ")).toContain("public/index.html");
   });
 
+  it("does not overwrite a dirty unwired served page", () => {
+    const wiredServer = [
+      'import express from "express";',
+      'import { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } from "crumbtrail-node";',
+      "const app = express();",
+      `app.use(createCrumbtrailExpressMiddleware({ endpoint: "${ENDPOINT}", authToken: process.env.CRUMBTRAIL_KEY, remoteConfig: true, service: "api" }));`,
+      'app.use(express.static("public"));',
+      "app.use(createCrumbtrailExpressErrorMiddleware());",
+      "app.listen(3000);",
+      "",
+    ].join("\n");
+    const indexPath = p("public", "index.html");
+    const io = fakeInjectIO(
+      {
+        [p("package.json")]: JSON.stringify({
+          dependencies: { express: "^4", "crumbtrail-node": "0.49.0" },
+        }),
+        [p("node_modules", "crumbtrail-node", "package.json")]: "{}",
+        [p("server.js")]: wiredServer,
+        [indexPath]: PAGE,
+      },
+      { dirty: [indexPath] },
+    );
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+        serviceName: "api",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+
+    expect(
+      (plan.extraEdits ?? []).some((edit) => edit.path === indexPath),
+    ).toBe(false);
+    expect(plan.warnings.join(" ")).toMatch(
+      /public\/index\.html.*uncommitted changes.*left it alone/i,
+    );
+  });
+
   it("refuses build output and names the next action instead", () => {
     const io = fakeInjectIO({
       [p("package.json")]: JSON.stringify({ dependencies: { express: "^4" } }),

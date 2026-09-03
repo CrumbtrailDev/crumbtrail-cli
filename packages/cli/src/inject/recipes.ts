@@ -2158,6 +2158,14 @@ function planServedStaticFrontend(
       continue;
     }
     const rel = path.relative(input.cwd, indexPath) || indexPath;
+    const status = io.gitStatus(input.cwd, indexPath);
+    if (status.dirty && !input.options?.force) {
+      warnings.push(
+        `${rel} is served to browsers but has uncommitted changes, so Crumbtrail left it alone. Confirm the edit or re-run with force to wire browser capture.`,
+      );
+      unresolved = true;
+      continue;
+    }
     edits.push({
       path: indexPath,
       mode: "update",
