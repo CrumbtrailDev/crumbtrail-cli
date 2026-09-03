@@ -31,6 +31,7 @@ import {
   inspectIntegration,
   reachableSourceFiles,
   sourceModulePath,
+  type IntegrationHazard,
   type IntegrationRequirement,
   type IntegrationStatus,
 } from "./integration";
@@ -43,7 +44,7 @@ import {
   type ExtraEntry,
 } from "./entrypoints";
 import { defaultInjectIO, type InjectIO } from "./io";
-import type { Plan } from "./types";
+import type { Plan, PlanIntegration } from "./types";
 import {
   corsElsewhereGuidance,
   corsImportedElsewhereNote,
@@ -379,11 +380,15 @@ function nextActionFor(
       if (!keyRef) {
         return `${where} carries its ingest key as a literal — paste your key from the dashboard in place of ${KEY_PLACEHOLDER}.`;
       }
+      const envVar = status.keyEnvVarsSeen[0] ?? keyRef.envVar;
       return blocked?.existingKey
-        ? `${where} already sets \`${blocked.existingKey}\`${blocked.existingValue ? ` from \`${blocked.existingValue}\`` : ""}, so it was left alone. Make sure that resolves to your ingest key${keyRef.compileTime ? ` (supplied at build time)` : ` — normally ${keyRef.envVar} in your env file`}.`
-        : `Set ${keyRef.envVar} in your env file to the key from the dashboard.`;
+        ? `${where} already sets \`${blocked.existingKey}\`${blocked.existingValue ? ` from \`${blocked.existingValue}\`` : ""}, so it was left alone. Make sure that resolves to your ingest key${keyRef.compileTime ? ` (supplied at build time)` : ` — normally ${envVar} in your env file`}.`
+        : `Set ${envVar} in your env file to the key from the dashboard.`;
     }
     case "service-name": {
+      if (blocked?.reason === "unsupported-here") {
+        return "This entry point does not support `service`. Name the process with `autoCapture({ service })` at startup.";
+      }
       // The literal at the init call itself, never a `service:` matched anywhere
       // in the reachable graph — a backend that names a downstream `payments`
       // service elsewhere in the same file is not the app's own name.
@@ -411,6 +416,89 @@ function nextActionFor(
         ? `${where} sets \`${blocked.existingKey}\` to false — remove it or set it to true so dashboard capture settings reach this app.`
         : `${where} sets \`remoteConfig: false\`, so dashboard capture settings never reach this app. Remove that line to take them.`;
   }
+}
+
+function hazardInstructionFor(
+  input: BuildPlanInput,
+  hazard: IntegrationHazard,
+  status: IntegrationStatus,
+  file: string | null,
+): string {
+  const where = file
+    ? path.relative(input.cwd, file) || file
+    : "the existing integration";
+  switch (hazard) {
+    case "guarded-init":
+      return `${where} reaches its Crumbtrail initialization conditionally or inside a function. Verify the startup path and repair it manually before running setup again.`;
+    case "transport-instance":
+      return `${where} passes transportInstance to Crumbtrail.init. Choose and repair one transport configuration manually before running setup again.`;
+    case "other-key-channel": {
+      const vars = status.keyEnvVarsSeen.length
+        ? status.keyEnvVarsSeen.join(", ")
+        : (keyRefFor(input)?.envVar ?? "the existing key variable");
+      return `${where} uses a Crumbtrail key channel other than the expected one. Keep the customer's existing key channel (${vars}) and align the init manually before running setup again.`;
+    }
+    case "unsupported-option":
+      return `${where} uses an option that this Crumbtrail entry point does not support. Name the process with autoCapture({ service }) at startup before running setup again.`;
+  }
+}
+
+function integrationInstructions(
+  input: BuildPlanInput,
+  status: IntegrationStatus,
+  amend: AmendReport | null,
+  file: string | null,
+): string[] {
+  const instructions = status.hazards.map((hazard) =>
+    hazardInstructionFor(input, hazard, status, file),
+  );
+  const blocked = new Set(
+    (amend?.blocked ?? []).map((entry) => entry.requirement),
+  );
+  for (const entry of amend?.blocked ?? []) {
+    instructions.push(
+      `Next: ${nextActionFor(input, entry.requirement, status, amend)}`,
+    );
+  }
+  for (const requirement of status.missing) {
+    if (blocked.has(requirement)) continue;
+    instructions.push(
+      `Next: ${nextActionFor(input, requirement, status, amend)}`,
+    );
+  }
+  return instructions;
+}
+
+function needsHandsPlan(
+  input: BuildPlanInput,
+  status: IntegrationStatus,
+  file: string | null,
+  amend: AmendReport | null = null,
+): Plan {
+  const instructions = integrationInstructions(input, status, amend, file);
+  const fileLabel = file
+    ? path.relative(input.cwd, file) || file
+    : "the existing integration";
+  return {
+    recipe: input.recipe,
+    kind: "needs-hands",
+    targetPath: file,
+    content: null,
+    keyEnvVar: status.keyEnvVarsSeen[0] ?? keyRefFor(input)?.envVar,
+    warnings: [
+      `Found an existing Crumbtrail integration in ${fileLabel}, but it is not safe to amend automatically. No source files were changed.`,
+    ],
+    integration: {
+      found: status.found,
+      amended: false,
+      missing: [...status.missing],
+      blocked: [...(amend?.blocked ?? [])],
+      hazards: [...status.hazards],
+      existingEnvVars: [...status.existingEnvVars],
+      file,
+      instructions,
+    },
+  };
 }
 
 function incompletePlan(
@@ -483,6 +571,21 @@ function amendPlan(
   io: InjectIO,
   status: IntegrationStatus,
 ): Plan | null {
+  const reachable = reachableSourceFiles({
+    cwd: input.cwd,
+    recipe: input.recipe,
+    endpoint: input.endpoint,
+    entryFile: input.entryFile,
+    serviceName: input.serviceName,
+    io,
+  });
+  const existingFile =
+    reachable.find((entry) => referencesCrumbtrail(entry.text))?.file ??
+    input.entryFile ??
+    null;
+  if (status.hazards.length > 0) {
+    return needsHandsPlan(input, status, existingFile);
+  }
   // Written in the same order the fresh snippets use, so an amended init and an
   // injected one read identically in review.
   const ORDER: IntegrationRequirement[] = [
@@ -514,14 +617,7 @@ function amendPlan(
 
   let report: AmendReport | null = null;
   let amended: { file: string; text: string } | null = null;
-  for (const entry of reachableSourceFiles({
-    cwd: input.cwd,
-    recipe: input.recipe,
-    endpoint: input.endpoint,
-    entryFile: input.entryFile,
-    serviceName: input.serviceName,
-    io,
-  })) {
+  for (const entry of reachable) {
     const outcome = amendSource(entry.text, fields);
     if (!outcome) continue;
     const candidate: AmendReport = {
@@ -530,6 +626,9 @@ function amendPlan(
       addedFields: outcome.addedFields,
       blocked: outcome.blocked,
     };
+    if (outcome.blocked.length > 0) {
+      return needsHandsPlan(input, status, entry.file, candidate);
+    }
     // The first file that can actually take an option wins. A file that only
     // reports what is already set is kept as the explanation of last resort.
     if (outcome.added.length > 0 && outcome.text) {
@@ -594,6 +693,19 @@ function amendPlan(
   ];
   const amendedFields = report.addedFields;
   const preload = preloadEnvVar ? ({ envPreloadAdded: true } as const) : {};
+  const integration: PlanIntegration = {
+    found: true,
+    amended: true,
+    amendedFields,
+    missing: stillMissing,
+    blocked: [],
+    hazards: [],
+    existingEnvVars: [...status.existingEnvVars],
+    file: amended.file,
+    instructions: stillMissing.map(
+      (r) => `Next: ${nextActionFor(input, r, status, report)}`,
+    ),
+  };
 
   const git = io.gitStatus(input.cwd, amended.file);
   if (git.dirty && !input.options?.force) {
@@ -604,6 +716,7 @@ function amendPlan(
       content: amended.text,
       applyMode: "rewrite",
       amendedFields,
+      integration,
       ...preload,
       warnings,
     };
@@ -614,6 +727,7 @@ function amendPlan(
     targetPath: amended.file,
     content: amended.text,
     amendedFields,
+    integration,
     ...preload,
     warnings,
   };
@@ -2605,8 +2719,10 @@ function installedCorsImports(
   const inspectExecuted = (
     node: any,
     shadowed: ReadonlySet<string> = new Set(),
-    localFactories: ReadonlyMap<string, { body: any; params: any[] }> =
-      new Map(),
+    localFactories: ReadonlyMap<
+      string,
+      { body: any; params: any[] }
+    > = new Map(),
   ): void => {
     if (!node || typeof node !== "object") return;
     if (node.type === "BlockStatement" || node.type === "Program") {
@@ -2761,9 +2877,7 @@ function calledLocalImports(
   const dynamicImports = (
     statement: any,
   ): Array<[string, { specifier: string; imported: string }]> => {
-    const found: Array<
-      [string, { specifier: string; imported: string }]
-    > = [];
+    const found: Array<[string, { specifier: string; imported: string }]> = [];
     if (statement.type === "VariableDeclaration")
       for (const declaration of statement.declarations) {
         const awaited =
@@ -3157,7 +3271,7 @@ export function buildPlan(
   // to the wiring already held it under a name the wizard knew.
   const keyRef = keyRefFor(input);
   if (keyRef) {
-    plan.keyEnvVar = keyRef.envVar;
+    if (plan.keyEnvVar === undefined) plan.keyEnvVar = keyRef.envVar;
     if (keyRef.compileTime) plan.keyIsCompileTime = true;
   }
 

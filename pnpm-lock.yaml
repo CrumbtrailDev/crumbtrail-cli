@@ -94,6 +94,9 @@ importers:
       crumbtrail-core:
         specifier: workspace:^
         version: link:../core
+      crumbtrail-node:
+        specifier: workspace:^
+        version: link:../node
 
   packages/core:
     devDependencies:

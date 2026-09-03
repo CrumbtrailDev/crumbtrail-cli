@@ -1,0 +1,5 @@
+services:
+  api:
+    environment:
+      CRUMBTRAIL_ENDPOINT: ${CRUMBTRAIL_ENDPOINT}
+      CRUMBTRAIL_API_KEY: ${CRUMBTRAIL_API_KEY}

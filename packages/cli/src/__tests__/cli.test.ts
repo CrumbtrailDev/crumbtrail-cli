@@ -464,12 +464,10 @@ describe("parseArgs", () => {
   });
 
   it("parses --service in both --k v and --k=v forms", () => {
-    expect(parseArgs(["node", "cli", "--service", "api"]).service).toBe(
-      "api",
+    expect(parseArgs(["node", "cli", "--service", "api"]).service).toBe("api");
+    expect(parseArgs(["node", "cli", "--service=packages-api"]).service).toBe(
+      "packages-api",
     );
-    expect(
-      parseArgs(["node", "cli", "--service=packages-api"]).service,
-    ).toBe("packages-api");
     expect(parseArgs(["node", "cli"]).service).toBeUndefined();
   });
 
@@ -2851,6 +2849,67 @@ describe("the amend path does not promise the app reads the env file", () => {
     expect(out).toContain("a guarded env file load above it");
     // The condition existed only because the load was missing. It is not.
     expect(out).not.toContain("loads no env file itself");
+  });
+});
+
+describe("the needs-hands wizard result", () => {
+  it("prints the existing file, evidence and manual steps without Setup complete", async () => {
+    const { ui, lines } = captureUi();
+    const executePlan = vi.fn(() => {
+      throw new Error("needs-hands must not reach the executor");
+    }) as unknown as WizardDeps["executePlan"];
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        ui,
+        executePlan,
+        buildPlan: vi.fn(() => ({
+          recipe: "vite-spa",
+          kind: "needs-hands" as const,
+          targetPath: "/app/src/lib/crumbtrail.js",
+          content: null,
+          keyEnvVar: "VITE_CRUMBTRAIL_API_KEY",
+          warnings: [
+            "Found an existing Crumbtrail integration in src/lib/crumbtrail.js, but it is not safe to amend automatically. No source files were changed.",
+          ],
+          integration: {
+            found: true,
+            amended: false,
+            missing: ["ingest-key" as const],
+            blocked: [],
+            hazards: ["other-key-channel" as const],
+            existingEnvVars: [
+              "VITE_CRUMBTRAIL_ENDPOINT",
+              "VITE_CRUMBTRAIL_API_KEY",
+            ],
+            file: "/app/src/lib/crumbtrail.js",
+            instructions: [
+              "Keep the customer's existing key channel (VITE_CRUMBTRAIL_API_KEY) and align the init manually before running setup again.",
+              "Next: Set VITE_CRUMBTRAIL_API_KEY in your env file to the key from the dashboard.",
+            ],
+          },
+        })) as unknown as WizardDeps["buildPlan"],
+      },
+    );
+
+    const code = await runCli(
+      ["node", "cli", "--no-agent", "--skip-verify"],
+      deps,
+    );
+    const out = lines.join("\n");
+    expect(code).toBe(1);
+    expect(executePlan).not.toHaveBeenCalled();
+    expect(out).toContain(
+      "Found an existing Crumbtrail integration and refused to amend it automatically.",
+    );
+    expect(out).toContain("File: /app/src/lib/crumbtrail.js");
+    expect(out).toContain(
+      "Already there: the existing initialization was left unchanged.",
+    );
+    expect(out).toContain("VITE_CRUMBTRAIL_API_KEY");
+    expect(out).toContain("Instructions:");
+    expect(out).toContain("Setup incomplete.");
+    expect(out).not.toContain("Setup complete");
   });
 });
 

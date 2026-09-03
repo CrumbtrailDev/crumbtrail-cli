@@ -65,6 +65,7 @@ export interface MaterializedPlan {
   }>;
   warnings: string[];
   keyEnvVar?: string;
+  integration?: Plan["integration"];
 }
 
 interface PreImage {
@@ -144,7 +145,26 @@ export function materializePlan(plan: Plan, io: ExecutorIO): MaterializedPlan {
     // Copied, not aliased: a cloud caller mutating this must not reach the Plan.
     warnings: [...plan.warnings],
     keyEnvVar: plan.keyEnvVar,
+    ...(plan.integration
+      ? {
+          integration: {
+            ...plan.integration,
+            ...(plan.integration.amendedFields
+              ? { amendedFields: [...plan.integration.amendedFields] }
+              : {}),
+            missing: [...plan.integration.missing],
+            blocked: plan.integration.blocked.map((blocked) => ({
+              ...blocked,
+            })),
+            hazards: [...plan.integration.hazards],
+            existingEnvVars: [...plan.integration.existingEnvVars],
+            instructions: [...plan.integration.instructions],
+          },
+        }
+      : {}),
   };
+
+  if (plan.kind === "needs-hands") return materialized;
 
   // Extra targets first, and outside the guard below. "Already wired" is a
   // statement about the entry file detection picked; a worker beside it can
@@ -270,6 +290,15 @@ export function executePlan(
     return extraOnly(
       "Ambiguous — emitted snippet + AI prompt instead of editing the entry.",
     );
+  }
+  if (plan.kind === "needs-hands") {
+    return {
+      kind: plan.kind,
+      written: [],
+      skipped: true,
+      message:
+        "Refused to amend the existing integration automatically. No files were changed.",
+    };
   }
   if (plan.kind === "serverless-guidance") {
     return {

@@ -1,16 +1,33 @@
+import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import path from "node:path";
 import {
+  harvestEnvNames,
   inspectIntegration,
   reachableSourceFiles,
 } from "../inject/integration";
 import { buildPlan } from "../inject/recipes";
+import { materializePlan } from "../inject/executor";
 import { envLoadCaveat } from "../cli";
 import { fakeInjectIO } from "./helpers";
 
 const CWD = "/proj";
 const ENDPOINT = "https://ingest.example.com";
 const p = (...parts: string[]) => path.join(CWD, ...parts);
+const FIXTURES = path.resolve(__dirname, "../../../../test-fixtures/cli-1");
+
+function fixtureFiles(root: string): Record<string, string> {
+  const files: Record<string, string> = {};
+  const visit = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) visit(file);
+      else files[file] = readFileSync(file, "utf8");
+    }
+  };
+  visit(root);
+  return files;
+}
 
 function completeBrowserFiles(): Record<string, string> {
   return {
@@ -83,7 +100,209 @@ describe("inspectIntegration", () => {
       io: fakeInjectIO(completeBrowserFiles()),
     });
 
-    expect(status).toEqual({ complete: true, found: true, missing: [] });
+    expect(status).toEqual({
+      complete: true,
+      found: true,
+      missing: [],
+      hazards: [],
+      existingEnvVars: ["VITE_CRUMBTRAIL_KEY"],
+      keyEnvVarsSeen: ["VITE_CRUMBTRAIL_KEY"],
+      endpointEnvVarsSeen: [],
+    });
+  });
+
+  it("harvests customer env names from source and setup files without reading config values", () => {
+    const files = {
+      [p("src", "main.tsx")]: "export const app = true;",
+      [p(".env.example")]:
+        "VITE_CRUMBTRAIL_ENDPOINT=https://customer.example.com\nVITE_CRUMBTRAIL_API_KEY=secret-value\n",
+      [p(".env.production")]: "CRUMBTRAIL_PRODUCTION_KEY=production-secret\n",
+      [p("docker-compose.dokploy.yml")]:
+        "environment:\n  VITE_CRUMBTRAIL_API_KEY: ${VITE_CRUMBTRAIL_API_KEY}\n",
+      [p("Dockerfile")]: "ARG VITE_CRUMBTRAIL_ENDPOINT\n",
+      [p("fly.toml")]: "CRUMBTRAIL_TOKEN=not-read\n",
+      [p("render.yaml")]: "CRUMBTRAIL_ENDPOINT: https://render.example.com\n",
+      [p("vercel.json")]: '{"CRUMBTRAIL_API_KEY":"not-read"}',
+      [p("netlify.toml")]: "CRUMBTRAIL_KEY = 'not-read'\n",
+      [p("README.md")]: "Set CRUMBTRAIL_README_TOKEN before starting.\n",
+    };
+
+    expect(
+      harvestEnvNames({
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.tsx"),
+        io: fakeInjectIO(files),
+      }),
+    ).toEqual([
+      "VITE_CRUMBTRAIL_ENDPOINT",
+      "VITE_CRUMBTRAIL_API_KEY",
+      "CRUMBTRAIL_PRODUCTION_KEY",
+      "CRUMBTRAIL_README_TOKEN",
+      "CRUMBTRAIL_TOKEN",
+      "CRUMBTRAIL_KEY",
+      "CRUMBTRAIL_ENDPOINT",
+      "CRUMBTRAIL_API_KEY",
+    ]);
+  });
+
+  it("reports every uncertainty in an env gated transport integration", () => {
+    const files = {
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.47.0" },
+      }),
+      [p("node_modules", "crumbtrail-core", "package.json")]: "{}",
+      [p("src", "main.tsx")]:
+        'import { initCrumbtrail } from "./lib/crumbtrail.js";\ninitCrumbtrail();\n',
+      [p("src", "lib", "crumbtrail.js")]: [
+        "const ENDPOINT = import.meta.env.VITE_CRUMBTRAIL_ENDPOINT;",
+        "const API_KEY = import.meta.env.VITE_CRUMBTRAIL_API_KEY || undefined;",
+        "let logger = null;",
+        "export async function initCrumbtrail() {",
+        "  if (logger || !ENDPOINT) return logger;",
+        '  try {\n    const { Crumbtrail, HttpTransport } = await import("crumbtrail-core");',
+        "    logger = Crumbtrail.init({",
+        "      transportInstance: new HttpTransport(ENDPOINT, { authToken: API_KEY }),",
+        "      httpEndpoint: ENDPOINT,",
+        "      httpAuthToken: API_KEY,",
+        "      widget: false,",
+        "    });",
+        "  } catch (err) {",
+        "    console.error(err);",
+        "  }",
+        "  return logger;",
+        "}",
+      ].join("\n"),
+      [p(".env.example")]:
+        "VITE_CRUMBTRAIL_ENDPOINT=https://customer.example.com\nVITE_CRUMBTRAIL_API_KEY=customer-secret\n",
+    };
+    const input = {
+      cwd: CWD,
+      recipe: "vite-spa" as const,
+      endpoint: ENDPOINT,
+      entryFile: p("src", "main.tsx"),
+      serviceName: "web",
+      io: fakeInjectIO(files),
+    };
+    const status = inspectIntegration(input);
+    expect(status.hazards).toEqual([
+      "guarded-init",
+      "transport-instance",
+      "other-key-channel",
+    ]);
+    expect(status.keyEnvVarsSeen).toEqual(["VITE_CRUMBTRAIL_API_KEY"]);
+    expect(status.endpointEnvVarsSeen).toEqual(["VITE_CRUMBTRAIL_ENDPOINT"]);
+
+    const plan = buildPlan(
+      { ...input, options: { force: true } },
+      fakeInjectIO(files),
+    );
+    expect(plan.kind).toBe("needs-hands");
+    expect(plan.content).toBeNull();
+    expect(plan.integration?.existingEnvVars).toEqual([
+      "VITE_CRUMBTRAIL_ENDPOINT",
+      "VITE_CRUMBTRAIL_API_KEY",
+    ]);
+    expect(plan.integration?.file).toBe(p("src", "lib", "crumbtrail.js"));
+    expect(plan.integration?.instructions.join(" ")).toContain(
+      "transportInstance",
+    );
+  });
+
+  it("refuses both sides of the taskflow shaped monorepo without source edits", () => {
+    const clientRoot = path.join(FIXTURES, "taskflow-client");
+    const serverRoot = path.join(FIXTURES, "taskflow-server");
+    const files = {
+      ...fixtureFiles(clientRoot),
+      ...fixtureFiles(serverRoot),
+    };
+    const clientPlan = buildPlan(
+      {
+        cwd: clientRoot,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: path.join(clientRoot, "src", "main.tsx"),
+        serviceName: "web",
+        options: { force: true },
+      },
+      fakeInjectIO(files),
+    );
+    const serverPlan = buildPlan(
+      {
+        cwd: serverRoot,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: path.join(serverRoot, "src", "index.js"),
+        serviceName: "api",
+        options: { force: true },
+      },
+      fakeInjectIO(files),
+    );
+
+    expect(clientPlan.kind).toBe("needs-hands");
+    expect(serverPlan.kind).toBe("needs-hands");
+    expect(clientPlan.content).toBeNull();
+    expect(serverPlan.content).toBeNull();
+    expect(clientPlan.integration?.existingEnvVars).toEqual([
+      "VITE_CRUMBTRAIL_ENDPOINT",
+      "VITE_CRUMBTRAIL_API_KEY",
+    ]);
+    expect(serverPlan.integration?.existingEnvVars).toEqual([
+      "CRUMBTRAIL_ENDPOINT",
+      "CRUMBTRAIL_API_KEY",
+    ]);
+    const materialized = materializePlan(clientPlan, {
+      exists: () => true,
+      readFile: () => null,
+      writeFile: () => {},
+      mkdirp: () => {},
+      remove: () => {},
+    });
+    expect(materialized.edits).toEqual([]);
+    expect(materialized.integration).toEqual(clientPlan.integration);
+  });
+
+  it("refuses an Express middleware service option and gives the autoCapture path", () => {
+    const source = [
+      'import { createCrumbtrailExpressMiddleware } from "crumbtrail-node";',
+      "const ENDPOINT = process.env.CRUMBTRAIL_ENDPOINT;",
+      "createCrumbtrailExpressMiddleware({",
+      "  endpoint: ENDPOINT,",
+      "  authToken: process.env.CRUMBTRAIL_KEY,",
+      "});",
+    ].join("\n");
+    const files = {
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-node": "0.47.0" },
+      }),
+      [p("node_modules", "crumbtrail-node", "package.json")]: "{}",
+      [p("src", "index.js")]: source,
+      [p(".env")]:
+        "CRUMBTRAIL_ENDPOINT=https://ingest.example.com\nCRUMBTRAIL_KEY=customer-key\n",
+    };
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "index.js"),
+        serviceName: "api",
+        options: { force: true },
+      },
+      fakeInjectIO(files),
+    );
+
+    expect(plan.kind).toBe("needs-hands");
+    expect(plan.content).toBeNull();
+    expect(plan.integration?.blocked).toContainEqual({
+      requirement: "service-name",
+      reason: "unsupported-here",
+    });
+    expect(plan.integration?.instructions.join(" ")).toContain(
+      "autoCapture({ service })",
+    );
+    expect(plan.integration?.instructions.join(" ")).not.toContain("service:");
   });
 
   it("does not call a local only helper complete", () => {
@@ -198,6 +417,13 @@ describe("amending an integration the customer already has", () => {
 
     expect(plan.kind).toBe("amend-init");
     expect(plan.targetPath).toBe(p("src", "main.tsx"));
+    expect(plan.integration).toMatchObject({
+      found: true,
+      amended: true,
+      amendedFields: ["service"],
+      existingEnvVars: ["VITE_CRUMBTRAIL_KEY"],
+      file: p("src", "main.tsx"),
+    });
     expect(plan.content).toBe(
       [
         'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
@@ -221,7 +447,7 @@ describe("amending an integration the customer already has", () => {
     ).toBe(before);
   });
 
-  it("never rewrites an option the customer already set", () => {
+  it("refuses a partial amend when an existing option disagrees", () => {
     const files = amendableFiles();
     files[p("src", "main.tsx")] = files[p("src", "main.tsx")].replace(
       `  httpEndpoint: "${ENDPOINT}",`,
@@ -229,11 +455,19 @@ describe("amending an integration the customer already has", () => {
     );
     const plan = amendPlanFor(files);
 
-    expect(plan.content).toContain(
-      '  httpEndpoint: "https://ingest.customer.internal",',
+    expect(plan.kind).toBe("needs-hands");
+    expect(plan.content).toBeNull();
+    expect(plan.integration?.blocked).toEqual([
+      {
+        requirement: "endpoint",
+        existingKey: "httpEndpoint",
+        existingValue: '"https://ingest.customer.internal"',
+        reason: "already-set",
+      },
+    ]);
+    expect(plan.integration?.instructions.join(" ")).toContain(
+      "already sets `httpEndpoint`",
     );
-    expect(plan.content).not.toContain(ENDPOINT);
-    expect(plan.warnings.join(" ")).toContain("already sets `httpEndpoint`");
   });
 
   it("never writes an ingest key into the source", () => {
@@ -258,12 +492,14 @@ describe("amending an integration the customer already has", () => {
     );
     const plan = amendPlanFor(files);
 
-    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.kind).toBe("needs-hands");
     expect(plan.content).toBeNull();
-    expect(plan.warnings.join(" ")).toContain(
+    expect(plan.integration?.instructions.join(" ")).toContain(
       "already reports as `asiniq-admin`",
     );
-    expect(plan.warnings.join(" ")).toContain("Leaving your name in place");
+    expect(plan.integration?.instructions.join(" ")).toContain(
+      "Leaving your name in place",
+    );
   });
 
   it("refuses to guess at an init it cannot enumerate", () => {
@@ -274,8 +510,10 @@ describe("amending an integration the customer already has", () => {
     );
     const plan = amendPlanFor(files);
 
-    expect(plan.kind).toBe("fallback-ai");
-    expect(plan.warnings.join(" ")).toContain("Next:");
+    expect(plan.kind).toBe("needs-hands");
+    expect(plan.content).toBeNull();
+    expect(plan.integration?.blocked[0]?.reason).toBe("unparsable");
+    expect(plan.integration?.instructions.join(" ")).toContain("Next:");
   });
 });
 

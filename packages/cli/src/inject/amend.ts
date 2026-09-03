@@ -18,12 +18,17 @@
 //      entry file is far worse than a printed snippet.
 
 import type { IntegrationRequirement } from "./integration";
+import type { CrumbtrailConfig } from "crumbtrail-core";
+import type {
+  AutoCaptureOptions,
+  CrumbtrailExpressOptions,
+} from "crumbtrail-node";
 
 /** How many call sites one amend may touch, so a pathological file can't run away. */
 const MAX_CALL_SITES = 4;
 
 /** The init-like calls whose options object this module knows how to extend. */
-const AMENDABLE_CALLEES = [
+export const AMENDABLE_CALLEES = [
   "Crumbtrail.init",
   "autoCapture",
   "createCrumbtrailExpressMiddleware",
@@ -39,10 +44,24 @@ export type AmendableCallee = (typeof AMENDABLE_CALLEES)[number];
  * point takes the shorter server shape. Split by callee rather than by recipe
  * because one Express entry legitimately contains both.
  */
-const FIELD_NAMES: Record<
-  AmendableCallee,
-  Partial<Record<IntegrationRequirement, string>>
-> = {
+type StringKeyOf<T> = Extract<keyof T, string>;
+
+interface FieldNames {
+  "Crumbtrail.init": Partial<
+    Record<IntegrationRequirement, StringKeyOf<CrumbtrailConfig>>
+  >;
+  autoCapture: Partial<
+    Record<IntegrationRequirement, StringKeyOf<AutoCaptureOptions>>
+  >;
+  createCrumbtrailExpressMiddleware: Partial<
+    Record<IntegrationRequirement, StringKeyOf<CrumbtrailExpressOptions>>
+  >;
+  createCrumbtrailExpressErrorMiddleware: Partial<
+    Record<IntegrationRequirement, StringKeyOf<CrumbtrailExpressOptions>>
+  >;
+}
+
+export const FIELD_NAMES: FieldNames = {
   "Crumbtrail.init": {
     endpoint: "httpEndpoint",
     "ingest-key": "httpAuthToken",
@@ -57,12 +76,10 @@ const FIELD_NAMES: Record<
   createCrumbtrailExpressMiddleware: {
     endpoint: "endpoint",
     "ingest-key": "authToken",
-    "service-name": "service",
   },
   createCrumbtrailExpressErrorMiddleware: {
     endpoint: "endpoint",
     "ingest-key": "authToken",
-    "service-name": "service",
   },
 };
 
@@ -408,6 +425,15 @@ export interface AmendField {
     string | ((callee: AmendableCallee, quote: CallSite["quote"]) => string);
 }
 
+export interface AmendBlocked {
+  requirement: IntegrationRequirement;
+  /** The option name that already exists, when that is the reason. */
+  existingKey?: string;
+  /** The exact source of that option's value, so guidance can quote it. */
+  existingValue?: string;
+  reason: "already-set" | "unsupported-here" | "unparsable";
+}
+
 export interface AmendOutcome {
   /** The full amended file text. Absent when nothing could be added. */
   text?: string;
@@ -416,14 +442,7 @@ export interface AmendOutcome {
   /** The option NAMES written, e.g. ["remoteConfig", "service"]. */
   addedFields: string[];
   /** Requirements this file could not satisfy, each with the reason why. */
-  blocked: Array<{
-    requirement: IntegrationRequirement;
-    /** The option name that already exists, when that is the reason. */
-    existingKey?: string;
-    /** The exact source of that option's value, so guidance can quote it. */
-    existingValue?: string;
-    reason: "already-set" | "unsupported-here" | "unparsable";
-  }>;
+  blocked: AmendBlocked[];
 }
 
 /**
@@ -441,6 +460,14 @@ export function amendSource(
 ): AmendOutcome | null {
   const sites = findCallSites(text);
   if (sites.length === 0) return null;
+  if (
+    sites.some(
+      (site) =>
+        site.callee === "Crumbtrail.init" && site.keys.has("transportInstance"),
+    )
+  ) {
+    return { added: [], addedFields: [], blocked: [] };
+  }
 
   const added = new Set<IntegrationRequirement>();
   const addedFields = new Set<string>();
@@ -461,6 +488,16 @@ export function amendSource(
         continue;
       }
       if (site.keys.has(name)) {
+        const existingValue = site.keys.get(name)?.trim();
+        const requestedValue =
+          typeof field.value === "string" ? field.value.trim() : undefined;
+        if (
+          requestedValue !== undefined &&
+          existingValue !== undefined &&
+          existingValue === requestedValue
+        ) {
+          continue;
+        }
         blocked.set(field.requirement, {
           requirement: field.requirement,
           existingKey: name,
@@ -519,6 +556,13 @@ export function amendSource(
 
   // A key that some call sites accepted and others already had is satisfied.
   for (const requirement of added) blocked.delete(requirement);
+  if (blocked.size > 0) {
+    return {
+      added: [...added],
+      addedFields: [...addedFields],
+      blocked: [...blocked.values()],
+    };
+  }
   return {
     text: out,
     added: [...added],
