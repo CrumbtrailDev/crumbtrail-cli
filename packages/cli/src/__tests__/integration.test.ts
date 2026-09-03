@@ -10,11 +10,50 @@ import { buildPlan } from "../inject/recipes";
 import { materializePlan } from "../inject/executor";
 import { envLoadCaveat } from "../cli";
 import { fakeInjectIO } from "./helpers";
+import {
+  hasExecutableCrumbtrailReference,
+  executableModuleSpecifiers,
+} from "../inject/amend";
 
 const CWD = "/proj";
 const ENDPOINT = "https://ingest.example.com";
 const p = (...parts: string[]) => path.join(CWD, ...parts);
 const FIXTURES = path.resolve(__dirname, "../../../../test-fixtures/cli-1");
+
+it("recognizes runtime TypeScript import assignments and follows local closure", () => {
+  const entry = 'import setup = require("./setup"); setup();';
+  const setup =
+    'import ct = require("crumbtrail-node"); ct.autoCapture({ endpoint: "https://ingest.example.com", authToken: process.env.CRUMBTRAIL_KEY, service: "api" });';
+  expect(hasExecutableCrumbtrailReference(setup)).toBe(true);
+  expect(executableModuleSpecifiers(entry)).toEqual(["./setup"]);
+  expect(
+    executableModuleSpecifiers('import type ct = require("crumbtrail-node");'),
+  ).toEqual([]);
+  expect(
+    hasExecutableCrumbtrailReference(
+      'import type ct = require("crumbtrail-node");',
+    ),
+  ).toBe(false);
+  const status = inspectIntegration({
+    cwd: CWD,
+    recipe: "express",
+    endpoint: ENDPOINT,
+    entryFile: p("src/index.ts"),
+    serviceName: "api",
+    io: fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-node": "0.49.0" },
+      }),
+      [p("node_modules/crumbtrail-node/package.json")]: "{}",
+      [p("node_modules/crumbtrail-core/package.json")]: "{}",
+      [p("src/index.ts")]: entry,
+      [p("src/setup.ts")]: setup,
+      [p(".env")]: "CRUMBTRAIL_KEY=customer-key\n",
+    }),
+  });
+  expect(status.found).toBe(true);
+  expect(status.missing).not.toContain("entry");
+});
 
 function fixtureFiles(root: string): Record<string, string> {
   const files: Record<string, string> = {};

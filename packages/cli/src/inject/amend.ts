@@ -373,6 +373,16 @@ function astHasModuleReference(
   let found = false;
   const visit = (node: any): void => {
     if (found || !node || typeof node !== "object") return;
+    if (node.type === "TSImportEqualsDeclaration") {
+      if (
+        node.importKind !== "type" &&
+        node.moduleReference?.type === "TSExternalModuleReference"
+      )
+        found = matches(
+          stringLiteralValue(node.moduleReference.expression) ?? "",
+        );
+      return;
+    }
     if (
       node.type === "ImportDeclaration" &&
       node.importKind !== "type" &&
@@ -441,6 +451,14 @@ export function executableModuleSpecifiers(
     };
     const visit = (node: any): void => {
       if (!node || typeof node !== "object") return;
+      if (node.type === "TSImportEqualsDeclaration") {
+        if (
+          node.importKind !== "type" &&
+          node.moduleReference?.type === "TSExternalModuleReference"
+        )
+          add(node.moduleReference.expression);
+        return;
+      }
       if (node.type === "ImportDeclaration" && node.importKind !== "type") {
         add(node.source);
       }
