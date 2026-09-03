@@ -194,6 +194,7 @@ RN-specific collectors, each capability-gated and independently toggleable via
 - `appState` — foreground/background/terminate transitions
 - `environment` — platform, dimensions, device/OS/app version
 - `navigation` — route changes (requires `@react-navigation/native`)
+- `native-hang` is a shared wire contract for future watchdog observations. This package does not emit it yet.
 - `replayLite` — periodic serialized view-tree snapshot + touch overlay
   (crash screenshot requires `react-native-view-shot`)
 

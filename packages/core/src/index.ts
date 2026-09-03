@@ -82,6 +82,8 @@ export type {
   DbTransactionEventData,
   DbTransactionOutcome,
   CaptureGapEventData,
+  NativeHangEventData,
+  NativeHangSource,
   EnvCampaign,
   EnvConnection,
   EnvDeclaration,
@@ -103,6 +105,10 @@ export {
 export {
   CRUMBTRAIL_EVENT_KINDS,
   CRUMBTRAIL_SCHEMA_VERSION,
+  NATIVE_HANG_EVENT_KIND,
+  NATIVE_HANG_MAX_DURATION_MS,
+  NATIVE_HANG_MAX_STACK_CHARS,
+  NATIVE_HANG_MAX_STACK_FRAMES,
   DB_DIFF_BULK_EVENT_KIND,
   DB_DIFF_EVENT_KIND,
   DB_READ_BULK_EVENT_KIND,
@@ -122,6 +128,7 @@ export {
   PRESET_LIGHT,
   PRESET_PASSIVE,
 } from "./types";
+export { isNativeHangEventData } from "./types";
 export {
   computeElementSignature,
   computeElementPath,

@@ -1,3 +1,6 @@
+export { NATIVE_HANG_EVENT_KIND } from "crumbtrail-core";
+export type { NativeHangEventData, NativeHangSource } from "crumbtrail-core";
+
 export {
   detectReactNativeCapabilities,
   REACT_NATIVE_CAPABILITY_BITS,

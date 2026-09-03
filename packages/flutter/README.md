@@ -118,6 +118,7 @@ try {
 | Framework errors | `FlutterError.onError` — a failed build, layout or paint |
 | Async errors | `PlatformDispatcher.onError` — where an unawaited Future's failure lands |
 | App lifecycle | `WidgetsBindingObserver`, including the flush on backgrounding |
+| Native hang | Shared wire contract for future watchdog observations. This package does not emit it yet |
 | Screen changes | `CrumbtrailNavigatorObserver` |
 | Environment | OS, OS version, locale and Dart version, from `dart:io` |
 | Requests | `recordRequest`, redacted |

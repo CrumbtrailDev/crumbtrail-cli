@@ -76,6 +76,7 @@ enum class CrumbtrailEventKind(val wireValue: String) {
     NAVIGATION_INTENT("nav-intent"),
     APP_LIFECYCLE("app-lifecycle"),
     NATIVE_CRASH("native-crash"),
+    NATIVE_HANG("native-hang"),
     VIEW_SNAPSHOT("view-snapshot"),
 }
 

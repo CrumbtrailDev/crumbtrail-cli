@@ -26,6 +26,7 @@ enum CrumbtrailEventKind {
   navigationIntent('nav-intent'),
   appLifecycle('app-lifecycle'),
   nativeCrash('native-crash'),
+  nativeHang('native-hang'),
   viewSnapshot('view-snapshot');
 
   const CrumbtrailEventKind(this.wireValue);

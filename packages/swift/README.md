@@ -48,6 +48,7 @@ agent key in an app.
 | Event | Source |
 | --- | --- |
 | `native-crash` | An uncaught exception from the **previous** launch |
+| `native-hang` | Shared wire contract for future watchdog observations. This package does not emit it yet |
 | `err` | Errors you report with `recordError` |
 | `net` | HTTP requests, when the URLProtocol is registered (see below) |
 | `app-lifecycle` | Foreground, background, terminate, and memory warnings |

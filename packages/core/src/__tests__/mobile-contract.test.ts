@@ -56,4 +56,23 @@ describe("mobile-compatible event contract", () => {
     expect(event.target?.testID).toBe("checkout-submit");
     expect(event.target?.accessibilityId).toBe("checkout.submit");
   });
+
+  it("types the shared native hang payload without changing old envelopes", () => {
+    const event: BugEvent = {
+      platform: "react-native",
+      sdk: { name: "crumbtrail-react-native", version: "0.47.0" },
+      t: 1100,
+      k: CRUMBTRAIL_EVENT_KINDS.nativeHang,
+      d: {
+        source: "js",
+        thresholdMs: 2000,
+        observedDurationMs: 2300,
+        recovered: true,
+        previousLaunch: false,
+      },
+    };
+
+    expect(event.k).toBe("native-hang");
+    expect(event.d.source).toBe("js");
+  });
 });

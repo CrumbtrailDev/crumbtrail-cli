@@ -633,6 +633,11 @@ React 18 or newer. For React Native and Expo, use
 [`crumbtrail-react-native`](https://www.npmjs.com/package/crumbtrail-react-native)
 instead: its peer dependencies are native and must not reach a web bundle.
 
+The shared native SDK wire contract also defines `native-hang` for a bounded
+watchdog or previous launch hang observation. `crumbtrail-core` does not emit
+this event. Platform SDKs can adopt the contract when their collectors support
+it. Memory pressure and process termination remain `app-lifecycle` events.
+
 ## Tauri
 
 The Tauri v2 transport lives on the `crumbtrail-core/tauri` subpath. It replaces

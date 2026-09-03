@@ -320,6 +320,17 @@ describe("per kind fixture conformance", () => {
         source: "previous-launch",
       },
     },
+    "native-hang": {
+      kind: "native-hang",
+      data: {
+        source: "main-thread",
+        thresholdMs: 5000,
+        observedDurationMs: 7420,
+        recovered: false,
+        previousLaunch: true,
+        stk: "CrumbtrailDemo.CheckoutViewController.submit()\nCrumbtrailDemo.CheckoutViewController.tap()",
+      },
+    },
     "nav-intent": {
       kind: "nav-intent",
       data: { action: "back", source: "hardware-back" },
