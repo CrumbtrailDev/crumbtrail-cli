@@ -622,6 +622,34 @@ function topLevelInitPositions(program: any): number[] {
   return positions;
 }
 
+function topLevelRuntimeDependencyPositions(program: any): number[] {
+  const positions: number[] = [];
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    if (
+      /^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+        node.type ?? "",
+      )
+    )
+      return;
+    const dependency =
+      node.type === "ImportExpression" ||
+      (node.type === "CallExpression" &&
+        (node.callee?.type === "Import" ||
+          (node.callee?.type === "Identifier" &&
+            node.callee.name === "require")));
+    if (dependency && !earlyImportArgument(node) && !bareEarlyRequire(node))
+      positions.push(node.start ?? 0);
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value);
+    }
+  };
+  for (const statement of program.body ?? []) visit(statement);
+  return positions;
+}
+
 /**
  * True when the early module is proven to run before browser initialization.
  *
@@ -662,7 +690,10 @@ export function hasExecutableEarlyBrowserImport(text: string): boolean {
     const requires = topLevelEarlyRequirePositions(program);
     const ordered = [...awaited, ...requires];
     if (ordered.length === 0) return false;
-    const initPositions = topLevelInitPositions(program);
+    const initPositions = [
+      ...topLevelInitPositions(program),
+      ...topLevelRuntimeDependencyPositions(program),
+    ];
     return ordered.some((position) =>
       initPositions.every((initPosition) => position < initPosition),
     );

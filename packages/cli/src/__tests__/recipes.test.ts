@@ -323,6 +323,18 @@ describe("buildPlan — Next.js", () => {
 
 describe("buildPlan — idempotency", () => {
   it.each([
+    [
+      'await import("./telemetry"); await import("crumbtrail-core/early");',
+      false,
+    ],
+    [
+      'await import("crumbtrail-core/early"); await import("./telemetry");',
+      true,
+    ],
+    ['require("./telemetry"); require("crumbtrail-core/early");', false],
+    ['require("crumbtrail-core/early"); require("./telemetry");', true],
+    ['import("./telemetry"); await import("crumbtrail-core/early");', false],
+    ['await import("crumbtrail-core/early"); import("./telemetry");', true],
     ['import "./telemetry"; import "crumbtrail-core/early";', false],
     ['import "crumbtrail-core/early"; import "./telemetry";', true],
     ['import "./telemetry"; await import("crumbtrail-core/early");', false],
