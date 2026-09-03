@@ -200,6 +200,14 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
         stages: [],
       };
     }) as unknown as WizardDeps["runPreflight"],
+    runCorsDiagnostic: vi.fn(async () => ({
+      status: "not-applicable",
+      endpoint: "https://api.crumbtrail.ai",
+      category: "not-applicable",
+      missingHeaders: [],
+      reason: "not applicable",
+      nextStep: "none",
+    })) as unknown as WizardDeps["runCorsDiagnostic"],
     openBrowserFn: vi.fn(async () => true),
     ui,
     prompter: noopPrompter,

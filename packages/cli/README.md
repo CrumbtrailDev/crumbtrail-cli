@@ -44,6 +44,7 @@ crumbtrail [options]        Run the setup wizard (detect → login → wire → 
 crumbtrail login           Log in and cache a token, nothing else
 crumbtrail logout          Delete the cached token
 crumbtrail verify          Preflight an endpoint + key (DNS, TLS, auth) — PASS/FAIL
+crumbtrail doctor          Check browser CORS without changing your project
 ```
 
 | Option              | Description                                                    |
@@ -116,6 +117,23 @@ crumbtrail verify --endpoint "$CRUMBTRAIL_BASE_URL" --key "$CRUMBTRAIL_KEY" --js
 ```
 
 ### Pre-deploy CI gate
+
+## Diagnose browser CORS
+
+`crumbtrail doctor` makes one bounded `OPTIONS` request. It sends the browser
+origin and requested header names only. It never sends an ingest key, changes
+your CORS configuration, or makes setup fail.
+
+```bash
+crumbtrail doctor --endpoint https://capture.example.com/api/session/start \
+  --origin https://app.example.com
+```
+
+It checks an explicit matching origin, `POST`, and the Crumbtrail correlation
+and authorization headers. A redirect, timeout, DNS, TLS, network, or opaque
+response is reported as unknown rather than success. Without `--origin`, it
+uses `CRUMBTRAIL_APP_ORIGIN`; if neither is configured, it tells you that the
+origin cannot be verified. Non browser projects are not applicable.
 
 Run `verify` in your deploy pipeline to **confirm prod ingest works before you
 ship, instead of deploy-and-pray**. Because a broken config (wrong key, wrong
