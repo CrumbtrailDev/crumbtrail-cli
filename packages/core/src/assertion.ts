@@ -102,6 +102,8 @@ const SAFE_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$/;
 const CORRELATION_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 const SECRET_PREFIX_RE =
   /^(?:sk|pk)_(?:live|test)_|^(?:ghp|gho|ghu|ghs|ghr)_|^github_pat_|^xox[abprs]-|^bearer[: _-]/i;
+const SENSITIVE_VALUE_RE =
+  /(?:^|[_:./-])(secret|token|password|passwd|authorization|cookie|bearer|credential|credentials|api[_-]?key|access[_-]?token|refresh[_-]?token|private[_-]?key)(?:$|[_:./-])/i;
 
 type AssertionSnapshot = {
   name: unknown;
@@ -189,7 +191,7 @@ export function isSafeApplicationAssertionValue(
     !SAFE_VALUE_RE.test(value)
   )
     return false;
-  if (SECRET_PREFIX_RE.test(value)) return false;
+  if (SECRET_PREFIX_RE.test(value) || SENSITIVE_VALUE_RE.test(value)) return false;
   return classifyStructuredValue(value).action === "keep";
 }
 

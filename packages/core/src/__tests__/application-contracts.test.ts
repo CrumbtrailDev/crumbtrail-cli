@@ -135,12 +135,32 @@ describe("application response contracts", () => {
         expected: "invalid_expected",
       },
       {
+        response: { data: { status: "token_123" } },
+        fact: {
+          name: "status",
+          operator: "equals",
+          expected: "ok",
+          path: "data.status",
+        },
+        expected: "invalid_actual",
+      },
+      {
         response: { data: { value: 1 } },
         fact: {
           name: "proto",
           operator: "equals",
           expected: 1,
           path: "data.__proto__.value",
+        },
+        expected: "invalid_path",
+      },
+      {
+        response: { data: { privateToken: "abc123" } },
+        fact: {
+          name: "private_token",
+          operator: "equals",
+          expected: "abc123",
+          path: "data.privateToken",
         },
         expected: "invalid_path",
       },

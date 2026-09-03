@@ -44,6 +44,16 @@ const RESPONSE_SENSITIVE_PATH_PARTS = new Set([
   "passwd",
   "secret",
   "token",
+  "apikey",
+  "accesskey",
+  "accesstoken",
+  "refreshtoken",
+  "credential",
+  "credentials",
+  "bearer",
+  "jwt",
+  "privatekey",
+  "privatetoken",
 ]);
 const EXPECTATION_KIND_RE = /^[A-Za-z][A-Za-z0-9_.:-]{0,23}$/;
 const EXPECTATION_KINDS = ["update", "external", "queue", "work"] as const;
