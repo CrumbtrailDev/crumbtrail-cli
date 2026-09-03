@@ -9,6 +9,7 @@ import {
 } from "crumbtrail-core";
 import {
   buildRaceEvidence,
+  readRaceServiceCompatibility,
   isRaceEligibleCacheOperation,
   type RaceEvidenceOptions,
   type SealedRaceEvidence,
@@ -19,6 +20,7 @@ export const CACHE_EVENT_KIND = "cache" as const;
 export type CacheDriver = "ioredis" | "redis";
 
 export interface CacheEventData {
+  serviceCompatibility?: "compatible" | "incompatible" | "unknown";
   driver: CacheDriver;
   op: string;
   key: string | string[];
@@ -119,7 +121,10 @@ export function buildCacheEvent(input: BuildCacheEventInput): BugEvent {
       operation: input.op,
       cacheKey: input.keys[0],
     });
-    if (raceEvidence) d.raceEvidence = raceEvidence;
+    if (raceEvidence) {
+      d.raceEvidence = raceEvidence;
+      d.serviceCompatibility = readRaceServiceCompatibility(input.raceEvidence);
+    }
   }
 
   const event: BugEvent = {

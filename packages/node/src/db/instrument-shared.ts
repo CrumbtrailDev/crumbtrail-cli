@@ -209,6 +209,7 @@ export function beginPoolCheckout(
 }
 
 export interface DbStatementContext {
+  observedAutocommit?: boolean;
   connection?: DbConnectionIdentity;
   durationMs?: number;
   transactionId?: string;
@@ -844,6 +845,7 @@ export function emitDbDiffEvents(input: {
           : undefined,
       primaryKeyColumns: options.pkColumns?.[table] ?? ["id"],
       raceEvidenceCapability: "transaction-outcome",
+      observedAutocommit: input.context?.observedAutocommit,
       ...(op === "delete"
         ? { before: row }
         : { after: row, before: beforeByPk?.get(pkKey(pk)) }),

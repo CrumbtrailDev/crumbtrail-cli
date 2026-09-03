@@ -13,6 +13,7 @@ import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import { boundColumnRow, type DbValueBounds } from "./diff-event";
 import {
   buildRaceEvidence,
+  readRaceServiceCompatibility,
   isRaceEvidenceInputEligible,
   readOptimisticVersion,
   type RaceEvidenceOptions,
@@ -130,7 +131,10 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
       resourceSubject: input.raceEvidence?.resourceSubject,
       currentVersion: readOptimisticVersion(input.row, versionField),
     });
-    if (raceEvidence) d.raceEvidence = raceEvidence;
+    if (raceEvidence) {
+      d.raceEvidence = raceEvidence;
+      d.serviceCompatibility = readRaceServiceCompatibility(input.raceEvidence);
+    }
   }
   const redaction = mergeRedactionMetadata(row.metadata, pk.metadata);
   if (redaction) d.redaction = redaction;

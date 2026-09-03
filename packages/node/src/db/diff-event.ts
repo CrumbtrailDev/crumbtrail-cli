@@ -12,6 +12,7 @@ import type { DbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import {
   buildRaceEvidence,
+  readRaceServiceCompatibility,
   isRaceEvidenceInputEligible,
   readOptimisticVersion,
   type RaceEvidenceOptions,
@@ -58,6 +59,8 @@ export interface BuildDbDiffEventInput {
    * PlanetScale uses the same `mysql` tag as transactional MySQL clients.
    */
   raceEvidenceCapability?: "transaction-outcome";
+  /** Driver observed no active transaction immediately after this successful mutation. */
+  observedAutocommit?: boolean;
 }
 
 /**
@@ -209,7 +212,12 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
       beforeVersion: readOptimisticVersion(input.before, versionField),
       afterVersion: readOptimisticVersion(input.after, versionField),
     });
-    if (raceEvidence) d.raceEvidence = raceEvidence;
+    if (raceEvidence) {
+      d.raceEvidence = raceEvidence;
+      d.serviceCompatibility = readRaceServiceCompatibility(input.raceEvidence);
+      d.transactionOutcome =
+        input.observedAutocommit === true ? "committed" : "unknown";
+    }
   }
 
   const redaction = mergeRedactionMetadata(

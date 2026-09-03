@@ -1,12 +1,18 @@
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import type {
   BugEvent,
   DbDiffEventData,
   DbReadEventData,
 } from "crumbtrail-core";
-import { buildCacheEvent, instrumentIoredisClient } from "../cache";
+import {
+  buildCacheEvent,
+  instrumentIoredisClient,
+  instrumentNodeRedisClient,
+} from "../cache";
+import { instrumentSqliteDatabase } from "../db/sqlite";
 import { buildDbDiffEvent, buildDbReadEvent, instrumentPgClient } from "../db";
 import { emitDbDiffEvents } from "../db/instrument-shared";
 import {
@@ -30,6 +36,194 @@ function fakePgClient(rows: Array<Record<string, unknown>>) {
 }
 
 describe("race evidence contract", () => {
+  it("emits declared compatibility and observed commits from real SQLite, but not preexisting transactions", () => {
+    const raw = new DatabaseSync(":memory:");
+    raw.exec(
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, version INTEGER); INSERT INTO orders VALUES (1, 1)",
+    );
+    const events: BugEvent[] = [];
+    const db = instrumentSqliteDatabase(raw, {
+      requestId: "req-proof",
+      captureReads: true,
+      captureBefore: true,
+      emit: (event) => events.push(event),
+      raceEvidence: {
+        enabled: true,
+        serviceCompatibility: "compatible",
+        optimisticVersionField: "version",
+        resolve: createHmacRaceEvidenceResolver(
+          "0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
+      },
+    });
+    try {
+      db.prepare("SELECT * FROM orders WHERE id = ?").all(1);
+      db.prepare("UPDATE orders SET version = ? WHERE id = ?").run(2, 1);
+      const read = events.find((event) => event.k === "db.read")!;
+      const diff = events.find((event) => event.k === "db.diff")!;
+      expect(read.d.serviceCompatibility).toBe("compatible");
+      expect(diff.d).toMatchObject({
+        serviceCompatibility: "compatible",
+        transactionOutcome: "committed",
+      });
+      expect(diff.d.raceEvidence).toMatchObject({
+        entityHash: (read.d.raceEvidence as Record<string, unknown>).entityHash,
+        beforeVersionHash: (read.d.raceEvidence as Record<string, unknown>)
+          .versionHash,
+      });
+      events.length = 0;
+      raw.exec("BEGIN");
+      db.prepare("UPDATE orders SET version = ? WHERE id = ?").run(3, 1);
+      expect(
+        events.find((event) => event.k === "db.diff")?.d.transactionOutcome,
+      ).toBe("unknown");
+      raw.exec("ROLLBACK");
+      events.length = 0;
+      expect(() =>
+        db.prepare("INSERT INTO orders (id, version) VALUES (?, ?)").run(1, 4),
+      ).toThrow();
+      expect(
+        events.some((event) => event.d.transactionOutcome === "committed"),
+      ).toBe(false);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it.each([undefined, "incompatible", "compatible"] as const)(
+    "keeps the %s declaration explicit and requires an observed commit",
+    (serviceCompatibility) => {
+      const base = {
+        table: "orders",
+        pk: { id: 1 },
+        requestId: "req-proof",
+        raceEvidenceCapability: "transaction-outcome" as const,
+        raceEvidence: {
+          enabled: true,
+          serviceCompatibility,
+          identifiers: { entityHash: opaque("e") },
+        },
+      };
+      expect(
+        buildDbReadEvent({ ...base, row: { id: 1 } }).d.serviceCompatibility,
+      ).toBe(serviceCompatibility ?? "unknown");
+      expect(
+        buildDbDiffEvent({ ...base, op: "update", after: { id: 1 } }).d
+          .transactionOutcome,
+      ).toBe("unknown");
+      expect(
+        buildDbDiffEvent({
+          ...base,
+          op: "update",
+          after: { id: 1 },
+          observedAutocommit: true,
+        }).d.transactionOutcome,
+      ).toBe("committed");
+      expect(
+        buildDbDiffEvent({
+          ...base,
+          op: "update",
+          after: { id: 1 },
+          observedAutocommit: true,
+          transactionId: "tx",
+        }).d.transactionOutcome,
+      ).toBeUndefined();
+    },
+  );
+
+  it("does not change a pending SET GET into a successful write when options mutate", async () => {
+    const events: BugEvent[] = [];
+    let finish!: (value: unknown) => void;
+    const cache = instrumentNodeRedisClient(
+      {
+        set(..._args: unknown[]) {
+          return new Promise((resolve) => {
+            finish = resolve;
+          });
+        },
+      },
+      { requestId: "req-proof", emit: (event) => events.push(event) },
+    );
+    const options: { GET?: boolean } = { GET: true };
+    const pending = cache.set("key", "value", options);
+    delete options.GET;
+    finish("OK");
+    await pending;
+    expect(events.at(-1)?.d.outcome).toBeUndefined();
+  });
+
+  it.each(["ioredis", "redis"])(
+    "records only acknowledged %s set mutations",
+    async (driver) => {
+      const events: BugEvent[] = [];
+      let result: unknown = "OK";
+      const error = new Error("rejected");
+      const raw = {
+        async set(..._args: unknown[]) {
+          if (result === error) throw error;
+          return result;
+        },
+        async setex(..._args: unknown[]) {
+          return result;
+        },
+        async psetex(..._args: unknown[]) {
+          return result;
+        },
+      };
+      const wrap =
+        driver === "redis"
+          ? instrumentNodeRedisClient
+          : instrumentIoredisClient;
+      const cache = wrap(raw, {
+        requestId: "req-proof",
+        emit: (event) => events.push(event),
+        raceEvidence: {
+          enabled: true,
+          serviceCompatibility: "compatible",
+          resolve: () => ({
+            entityHash: opaque("e"),
+            versionHash: opaque("v"),
+          }),
+        },
+      });
+      await expect(cache.set("key", "value")).resolves.toBe("OK");
+      expect(events.at(-1)?.d).toMatchObject({
+        outcome: "success",
+        serviceCompatibility: "compatible",
+      });
+      for (const options of [
+        ["NX"],
+        [{ NX: true }],
+        ["EX", 10],
+        [{ PX: 1000 }],
+      ]) {
+        await cache.set("key", "value", ...options);
+        expect(events.at(-1)?.d.outcome).toBe("success");
+      }
+      for (const options of [
+        ["GET"],
+        ["NX", "GET"],
+        [{ GET: true }],
+        [{ future: true }],
+      ]) {
+        await cache.set("key", "value", ...options);
+        expect(events.at(-1)?.d.outcome).toBeUndefined();
+      }
+      for (const ambiguous of [null, undefined, "QUEUED", 1, true]) {
+        result = ambiguous;
+        await cache.set("key", "value", "NX");
+        expect(events.at(-1)?.d.outcome).toBeUndefined();
+      }
+      result = "OK";
+      await cache.setex("key", 10, "value");
+      expect(events.at(-1)?.d.outcome).toBe("success");
+      await cache.psetex("key", 10, "value");
+      expect(events.at(-1)?.d.outcome).toBe("success");
+      result = error;
+      await expect(cache.set("key", "value")).rejects.toBe(error);
+      expect(events.at(-1)?.d.outcome).toBe("failure");
+    },
+  );
   it("derives deterministic domain separated identifiers without exposing the credential", () => {
     const credential = "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef";
     const resolver = createHmacRaceEvidenceResolver(credential)!;

@@ -339,6 +339,29 @@ same application resource. The configured version field produces `versionHash` o
 `beforeVersionHash` and `afterVersionHash` on diffs, and no version identifier when the field is
 missing.
 
+Set `raceEvidence.serviceCompatibility` to `"compatible"` only when your application declares
+that participating services use the same entity and version semantics. It also accepts
+`"incompatible"` and `"unknown"`, defaults to `"unknown"`, and is emitted beside sealed evidence.
+Unknown or incompatible observations cannot establish a cross session race.
+
+Eligible SQLite mutations emit `transactionOutcome: "committed"` only when the driver's
+`isTransaction` or `inTransaction` flag explicitly reports no active transaction immediately after
+the successful synchronous mutation. Missing flags, active transactions, and other database
+adapters remain unknown. Direct diff builders additionally require `observedAutocommit: true`
+from their producer. Do not infer this from a missing transaction ID or a resolved query promise.
+
+Redis `set`, `setex`, and `psetex` emit `outcome: "success"` only for an `"OK"` acknowledgment.
+Conditional sets returning null, `SET GET`, unsupported option shapes, and ambiguous replies do
+not emit success. Rejections remain failures. Pipeline and transaction summaries do not become
+per key race proof.
+
+To join database and cache evidence, supply a per operation resolver that maps both surfaces to
+the same opaque entity, resource, and version identifiers. The built in HMAC resolver deliberately
+separates database and cache entity domains and does not extract cache versions. A shared
+`resourceSubject` alone does not make those events joinable. Verify captured events contain the
+matching sealed identifiers, explicit compatibility, committed database outcome, and successful
+cache acknowledgment before expecting a cross session finding.
+
 Bulk database statements, image less diffs without a resolvable entity, multi key cache calls, and
 database work inside an observed transaction do not receive race evidence. Prisma, MongoDB, and
 PlanetScale adapters omit race evidence for all operations because their hooks do not expose

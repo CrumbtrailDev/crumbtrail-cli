@@ -47,10 +47,23 @@ export interface DuckTypedSqliteRunResult {
 
 /** Minimal duck-typed view of a better-sqlite3 / `node:sqlite` database: `prepare(sql)` → statement. */
 export interface DuckTypedSqliteDatabase {
+  readonly isTransaction?: boolean;
+  readonly inTransaction?: boolean;
   prepare(sql: unknown, ...rest: unknown[]): DuckTypedSqliteStatement;
 }
 
 const ENGINE = "sqlite" as const;
+
+function observedSqliteAutocommit(db: DuckTypedSqliteDatabase): boolean {
+  try {
+    const states = [db.isTransaction, db.inTransaction].filter(
+      (value) => value !== undefined,
+    );
+    return states.length > 0 && states.every((value) => value === false);
+  } catch {
+    return false;
+  }
+}
 
 type ResolvedParams =
   | { kind: "named"; value: Record<string, unknown> }
@@ -181,6 +194,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     const elapsed = startDbQueryTimer(operationOptions);
     const info = realStmt.run(...args);
     const context: DbStatementContext = {
+      observedAutocommit: observedSqliteAutocommit(db),
       connection,
       durationMs: elapsed(),
       transactionId: transaction?.id,
@@ -273,6 +287,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     const elapsed = startDbQueryTimer(operationOptions);
     const info = realStmt.run(...args);
     const context: DbStatementContext = {
+      observedAutocommit: observedSqliteAutocommit(db),
       connection,
       durationMs: elapsed(),
       transactionId: transaction?.id,
@@ -358,6 +373,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     const elapsed = startDbQueryTimer(operationOptions);
     const info = realStmt.run(...args);
     const context: DbStatementContext = {
+      observedAutocommit: observedSqliteAutocommit(db),
       connection,
       durationMs: elapsed(),
       transactionId: transaction?.id,
