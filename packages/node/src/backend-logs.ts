@@ -1,7 +1,11 @@
 import nodeFs from "node:fs";
 import nodeModule from "node:module";
 import type { BugEvent } from "crumbtrail-core";
-import { redactTokenLikeString, redactValue } from "crumbtrail-core";
+import {
+  redactDiagnosticFields,
+  redactTokenLikeString,
+  redactValue,
+} from "crumbtrail-core";
 import { readRequestCorrelation } from "./request-context";
 
 /**
@@ -114,8 +118,13 @@ export interface ParsedStructuredLog {
   /** The logger's own name (`name` in pino/bunyan), when it set one. */
   logger?: string;
   error?: { name?: string; message?: string; stack?: string };
-  /** The line's remaining scalar context fields, bounded. */
+  /** The line's remaining context fields, selected and bounded when configured. */
   fields?: Record<string, unknown>;
+}
+
+export interface StructuredLogParseOptions {
+  /** Explicit paths selected from the structured log record. */
+  diagnosticFields?: readonly string[];
 }
 
 /**
@@ -130,6 +139,7 @@ export interface ParsedStructuredLog {
  */
 export function parseStructuredLogLine(
   line: string,
+  options?: StructuredLogParseOptions,
 ): ParsedStructuredLog | undefined {
   const trimmed = line.trim();
   // Cheap gate first: the overwhelming majority of written lines are not JSON
@@ -159,7 +169,7 @@ export function parseStructuredLogLine(
   const logger = firstString(record.name);
   if (logger) parsed.logger = logger;
   if (error) parsed.error = error;
-  const fields = contextFields(record);
+  const fields = contextFields(record, options?.diagnosticFields);
   if (fields) parsed.fields = fields;
   return parsed;
 }
@@ -181,11 +191,22 @@ export function buildBackendLogEvent(
      * a browser correlated the call — never a second id minted here.
      */
     requestId?: string;
+    /** Explicit paths selected from parsed log context fields. */
+    diagnosticFields?: readonly string[];
   } = {},
 ): BugEvent {
   const now = Number.isFinite(context.now)
     ? Math.round(context.now as number)
     : Date.now();
+
+  const selectedFields =
+    parsed.fields && context.diagnosticFields !== undefined
+      ? redactDiagnosticFields(parsed.fields, {
+          diagnosticFields: context.diagnosticFields,
+          denyFields: [...IGNORED_FIELDS],
+          path: "backend.log.fields",
+        }).value
+      : parsed.fields;
 
   const event: BugEvent = {
     t: now,
@@ -208,7 +229,7 @@ export function buildBackendLogEvent(
         : null,
       ...(parsed.logger ? { logger: parsed.logger } : {}),
       ...(context.requestId ? { requestId: context.requestId } : {}),
-      ...(parsed.fields ? { fields: parsed.fields } : {}),
+      ...(isRecord(selectedFields) ? { fields: selectedFields } : {}),
     },
   };
   if (context.sessionId) event.sessionId = context.sessionId;
@@ -247,6 +268,8 @@ export interface BackendLogCaptureOptions {
   now?: () => number;
   /** Per-install event ceiling. Defaults to 500. */
   maxEvents?: number;
+  /** Explicit paths selected from each structured log record. */
+  diagnosticFields?: readonly string[];
 }
 
 export interface BackendLogCaptureHandle {
@@ -267,7 +290,7 @@ export interface BackendLogCaptureHandle {
  * stops.
  */
 interface LogHub {
-  sinks: Set<(parsed: ParsedStructuredLog) => void>;
+  sinks: Set<(line: string) => void>;
   buffers: Record<LogStream, string>;
   /** Held across the inspection of one write: no recursion, no double count. */
   inspecting: boolean;
@@ -306,9 +329,7 @@ function hubFor(
         hub.buffers[stream] = "";
       for (const line of lines) {
         if (!line) continue;
-        const parsed = parseStructuredLogLine(line);
-        if (!parsed) continue;
-        for (const sink of [...hub.sinks]) sink(parsed);
+        for (const sink of [...hub.sinks]) sink(line);
       }
     } catch {
       // Capture must never throw back into the host application.
@@ -487,7 +508,11 @@ export function installBackendLogCapture(
   let emitted = 0;
   let stopped = false;
 
-  const sink = (parsed: ParsedStructuredLog): void => {
+  const sink = (line: string): void => {
+    const parsed = parseStructuredLogLine(line, {
+      diagnosticFields: options.diagnosticFields,
+    });
+    if (!parsed) return;
     if (stopped || emitted >= budget) return;
     if (LEVEL_RANK[parsed.level] < floor) return;
     emitted += 1;
@@ -507,6 +532,9 @@ export function installBackendLogCapture(
           now: options.now?.(),
           ...(correlation?.requestId
             ? { requestId: correlation.requestId }
+            : {}),
+          ...(options.diagnosticFields
+            ? { diagnosticFields: options.diagnosticFields }
             : {}),
         }),
       );
@@ -666,7 +694,19 @@ function boundedStack(value: unknown): string | undefined {
  */
 function contextFields(
   record: Record<string, unknown>,
+  diagnosticFields?: readonly string[],
 ): Record<string, unknown> | undefined {
+  if (diagnosticFields !== undefined) {
+    const selected = redactDiagnosticFields(record, {
+      diagnosticFields,
+      denyFields: [...IGNORED_FIELDS],
+      path: "backend.log.fields",
+    }).value;
+    return isRecord(selected) && Object.keys(selected).length > 0
+      ? selected
+      : undefined;
+  }
+
   const fields: Record<string, unknown> = {};
   let count = 0;
   for (const [key, value] of Object.entries(record)) {

@@ -3,6 +3,7 @@ import {
   SERVERLESS_INVOCATION_START_EVENT,
   SERVERLESS_INVOCATION_SUCCESS_EVENT,
   withCrumbtrailFetch,
+  type FetchServerlessAdapterOptions,
   type ServerlessInvocationEvent,
   type ServerlessInvocationTransport,
 } from "../index";
@@ -25,6 +26,18 @@ function collectingTransport(
 }
 
 describe("withCrumbtrailFetch", () => {
+  it("accepts diagnosticFields in the public Fetch adapter options type", () => {
+    const options: FetchServerlessAdapterOptions = {
+      endpoint: "https://capture.example",
+      diagnosticFields: ["checkout.status", "attempts[0].code"],
+    };
+
+    expect(options.diagnosticFields).toEqual([
+      "checkout.status",
+      "attempts[0].code",
+    ]);
+  });
+
   it("requires exactly one delivery configuration in TypeScript", () => {
     // @ts-expect-error An endpoint or custom transport is required.
     const missing = withCrumbtrailFetch(() => new Response(), {});

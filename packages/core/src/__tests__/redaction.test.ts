@@ -828,6 +828,79 @@ describe("redactUrlsInText — URL query secrets inside free text", () => {
     expect(redactTokenLikeString(`?token=${SHORT}`).value).toContain(SHORT);
   });
 
+  it("scrubs embedded relative and query-only URLs", () => {
+    const result = redactUrlsInText(
+      `href=/callback?token=${SHORT} and callback?code=1234 and ?account=5678`,
+      "message",
+      { allowOnlyHttpSchemes: true, allowRelativeUrlsInText: true },
+    );
+
+    expect(result.value).toContain("href=/callback?token=[REDACTED");
+    expect(result.value).toContain("callback?code=[REDACTED");
+    expect(result.value).toContain("?account=[REDACTED");
+    expect(result.value).not.toContain(SHORT);
+    expect(result.value).not.toContain("code=1234");
+    expect(result.value).not.toContain("account=5678");
+  });
+
+  it("rejects Unicode IDN and path components before URL normalization", () => {
+    for (const url of [
+      "https://раypal.example/checkout",
+      "https://example.test/платеж",
+      "https://example.test/%D0%BF%D0%BB%D0%B0%D1%82%D0%B5%D0%B6",
+    ]) {
+      const result = redactUrl(url);
+      expect(result.value).toBe(REDACTED_VALUE);
+      expect(result.metadata?.fields).toContainEqual(
+        expect.objectContaining({
+          reason: "non_ascii_url_component",
+          action: "dropped",
+        }),
+      );
+    }
+  });
+
+  it("preserves ordinary colon labels when redacting URL-like text", () => {
+    const value = "Error:failed. Status: pending. Version:1.2.3. Build:2.4.0.";
+    const result = redactUrlsInText(value);
+    expect(result.value).toBe(value);
+    expect(result.metadata).toBeUndefined();
+  });
+
+  it("rejects opaque standard and unknown schemes without requiring URL punctuation", () => {
+    for (const value of [
+      "ftp:private-file",
+      "ftp:private-file.",
+      "ssh:private-host",
+      "ssh:private-host!",
+      "custom:secret",
+      "custom:secret.",
+      "myapp:abc-def",
+      "myapp:abc-def,",
+    ]) {
+      const result = redactUrlsInText(value, "message", {
+        allowOnlyHttpSchemes: true,
+      });
+      expect(result.value).toBe(REDACTED_VALUE);
+      expect(result.metadata?.fields).toContainEqual(
+        expect.objectContaining({
+          reason: "unsafe_url_scheme",
+          action: "redacted",
+        }),
+      );
+
+      const whole = redactUrl(value, "message", {
+        allowOnlyHttpSchemes: true,
+      });
+      expect(whole.value).toContain(REDACTED_VALUE);
+
+      const embedded = redactUrlsInText(`see ${value} now`, "message", {
+        allowOnlyHttpSchemes: true,
+      });
+      expect(embedded.value).toBe(REDACTED_VALUE);
+    }
+  });
+
   it("leaves free text without a URL untouched (no metadata)", () => {
     const result = redactUrlsInText("plain text, nothing to see here");
     expect(result.value).toBe("plain text, nothing to see here");
@@ -872,6 +945,22 @@ describe("redactValue", () => {
     expect(result.metadata?.fields.map((f) => f.path)).toEqual(
       expect.arrayContaining(["value.user.password"]),
     );
+  });
+
+  it("redacts Unicode-confusable sensitive keys", () => {
+    const result = redactValue({
+      раssword: "hunter2",
+      сardNumber: "4111111111111111",
+      safe: "ok",
+    });
+
+    expect(result.value).toEqual({
+      раssword: REDACTED_VALUE,
+      сardNumber: REDACTED_VALUE,
+      safe: "ok",
+    });
+    expect(JSON.stringify(result.value)).not.toContain("hunter2");
+    expect(JSON.stringify(result.value)).not.toContain("4111111111111111");
   });
 
   it("redacts token-like values inside array elements", () => {

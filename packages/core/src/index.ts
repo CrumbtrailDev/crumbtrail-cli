@@ -102,6 +102,7 @@ export {
   buildEnvSnapshot,
   buildEnvDelta,
 } from "./collectors/environment";
+export type { EnvSnapshotOptions } from "./collectors/environment";
 export {
   CRUMBTRAIL_EVENT_KINDS,
   CRUMBTRAIL_SCHEMA_VERSION,

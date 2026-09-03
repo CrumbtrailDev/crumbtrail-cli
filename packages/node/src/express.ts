@@ -125,6 +125,8 @@ export interface CrumbtrailExpressOptions {
   captureLogs?: boolean;
   /** Lowest log level captured. Defaults to `warn`. */
   logLevel?: BackendLogLevel;
+  /** Explicit dotted/indexed paths selected from structured log context. */
+  diagnosticFields?: readonly string[];
   /** Streams and `fs` the log capture patches (tests). Defaults to the process's. */
   logStreams?: Pick<
     BackendLogCaptureOptions,
@@ -297,6 +299,7 @@ export function createCrumbtrailExpressMiddleware(
     try {
       middleware.crumbtrailLogCapture = installBackendLogCapture({
         minLevel: options.logLevel,
+        diagnosticFields: options.diagnosticFields,
         ...options.logStreams,
         emit: (event) => {
           const now = readNow(options);

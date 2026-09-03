@@ -10,6 +10,7 @@ import {
 import type { BugEvent } from "../types";
 import {
   redactTokenLikeString,
+  redactDiagnosticFields,
   redactUrl,
   redactUrlsInText,
   redactValue,
@@ -133,6 +134,8 @@ interface ServerlessInvocationBaseOptions {
   method?: string;
   route?: string;
   metadata?: Readonly<Record<string, unknown>>;
+  /** Explicit diagnostic paths selected from `metadata`; omitted means the existing policy. */
+  diagnosticFields?: readonly string[];
   service?: string;
   onError?: (error: unknown, context: ServerlessDeliveryErrorContext) => void;
   deferCleanup?: (promise: Promise<void>) => void;
@@ -177,7 +180,7 @@ export async function runServerlessInvocation<T>(
   const startedAt = readNow(options.now);
   const correlation = resolveIncomingCorrelation(options.headers);
   const method = sanitizeMethod(options.method);
-  const metadata = sanitizeMetadata(options.metadata);
+  const metadata = sanitizeMetadata(options.metadata, options.diagnosticFields);
   const service = sanitizeMetadataValue(options.service);
   const state: InvocationState = {
     route: sanitizeRoute(options.route),
@@ -448,12 +451,23 @@ function sanitizeStatusCode(statusCode: number | undefined) {
 
 function sanitizeMetadata(
   metadata: Readonly<Record<string, unknown>> | undefined,
+  diagnosticFields?: readonly string[],
 ): Record<string, ServerlessMetadataValue> | undefined {
   if (!metadata) return undefined;
   const result: Record<string, ServerlessMetadataValue> = {};
-  const redacted = redactValue(metadata, "serverless.metadata").value;
+  const redacted =
+    diagnosticFields !== undefined
+      ? redactDiagnosticFields(metadata, {
+          diagnosticFields,
+          path: "serverless.metadata",
+        }).value
+      : redactValue(metadata, "serverless.metadata").value;
+  const entries =
+    diagnosticFields !== undefined
+      ? flattenDiagnosticMetadata(redacted)
+      : Object.entries(redacted as Record<string, unknown>);
 
-  for (const [rawKey, rawValue] of Object.entries(redacted)) {
+  for (const [rawKey, rawValue] of entries) {
     const key = sanitizeMetadataKey(rawKey);
     if (!key || isBodyMetadataKey(key)) continue;
     const value = sanitizeMetadataValue(rawValue);
@@ -463,6 +477,44 @@ function sanitizeMetadata(
   }
 
   return Object.keys(result).length > 0 ? result : undefined;
+}
+
+function flattenDiagnosticMetadata(
+  value: unknown,
+  prefix = "",
+  entries: Array<[string, unknown]> = [],
+): Array<[string, unknown]> {
+  if (entries.length >= SERVERLESS_LIMITS.metadataEntries) return entries;
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    if (prefix) entries.push([prefix, value]);
+    return entries;
+  }
+  if (value === undefined || value === null || typeof value !== "object")
+    return entries;
+
+  if (Array.isArray(value)) {
+    for (const key of Object.keys(value)) {
+      const index = Number(key);
+      flattenDiagnosticMetadata(value[index], `${prefix}[${index}]`, entries);
+      if (entries.length >= SERVERLESS_LIMITS.metadataEntries) break;
+    }
+    return entries;
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    flattenDiagnosticMetadata(
+      child,
+      prefix ? `${prefix}.${key}` : key,
+      entries,
+    );
+    if (entries.length >= SERVERLESS_LIMITS.metadataEntries) break;
+  }
+  return entries;
 }
 
 function sanitizeMetadataKey(key: string): string | undefined {
