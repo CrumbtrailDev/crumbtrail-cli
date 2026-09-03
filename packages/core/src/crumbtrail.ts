@@ -2452,6 +2452,15 @@ export class Crumbtrail {
     };
 
     this.cancelLifecycleTimer();
+    const stopState: NonNullable<typeof this.lifecycleCloseState> | undefined =
+      this.lifecycleClosePromise ||
+      !this.sessionStarted ||
+      this.lifecycleSuspended
+        ? undefined
+        : {
+            immediateEnd: true,
+            deadline: Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
+          };
     if (this.lifecycleClosePromise) {
       try {
         this.escalateLifecycleClose();
@@ -2459,12 +2468,13 @@ export class Crumbtrail {
       } catch (error) {
         recordStopFailure(teardownFailures, "lifecycle.close", error);
       }
-    } else if (this.sessionStarted && !this.lifecycleSuspended) {
+    } else if (stopState) {
       const admissionSettled = await this.waitUntilLifecycleDeadline(
         Promise.allSettled([
           this.sessionMetadataWrite,
           this.sessionAdmission,
         ]).then(() => true),
+        stopState.deadline,
       );
       if (!admissionSettled) {
         this.abandonLifecycleSends();
@@ -2573,7 +2583,14 @@ export class Crumbtrail {
     if (this.sessionStarted) {
       // bus.stop() just flushed the final batch into the transport; every
       // in-flight POST must land before end-of-session finalizes the log.
-      await Promise.allSettled([...this.pendingSends]);
+      const pendingSettled = stopState
+        ? await this.waitForLifecycleSends(stopState)
+        : (await Promise.allSettled([...this.pendingSends]), true);
+      if (!pendingSettled) {
+        this.lifecycleSuspended = true;
+        this.sessionStarted = false;
+      }
+      if (!this.sessionStarted) return { sessionId: this.sessionId };
       // A refusal discovered on the final flush has no bus left to ride. The
       // closing record carries whatever the capped per-batch records could not,
       // so the session states its true loss rather than the first few batches

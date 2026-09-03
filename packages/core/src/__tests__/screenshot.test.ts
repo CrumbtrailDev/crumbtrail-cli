@@ -517,6 +517,70 @@ describe("report screenshot API", () => {
     expect(transport.endSession).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
+
+  it("bounds explicit stop while a screenshot upload never settles", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    transport.sendBlob.mockImplementationOnce(
+      async () => new Promise<void>(() => {}),
+    );
+    const logger = init(transport);
+    const capture = logger.captureScreenshot(imageBlob(png()));
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(transport.sendBlob).toHaveBeenCalledOnce();
+
+    const stopping = logger.stop();
+    await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
+
+    await expect(stopping).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(transport.endSession).not.toHaveBeenCalled();
+    void capture.catch(() => {});
+    vi.useRealTimers();
+  });
+
+  it("waits for a hidden pending upload when stop races its lifecycle timer", async () => {
+    const order: string[] = [];
+    const transport = makeTransport();
+    let finishUpload!: () => void;
+    const uploadFinished = new Promise<void>((resolve) => {
+      finishUpload = resolve;
+    });
+    transport.sendBlob.mockImplementationOnce(async () => {
+      order.push("blob-start");
+      await uploadFinished;
+      order.push("blob-done");
+    });
+    transport.endSession.mockImplementationOnce(async () => {
+      order.push("endSession");
+    });
+    const logger = init(transport);
+    const capture = logger.captureScreenshot(imageBlob(png()));
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(order).toEqual(["blob-start"]);
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    const stopping = logger.stop();
+    expect(order).toEqual(["blob-start"]);
+
+    finishUpload();
+    await expect(capture).resolves.toMatchObject({
+      artifactName: expect.stringMatching(/\.png$/),
+    });
+    await expect(stopping).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(order).toEqual(["blob-start", "blob-done", "endSession"]);
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+  });
 });
 
 function initConfig() {
