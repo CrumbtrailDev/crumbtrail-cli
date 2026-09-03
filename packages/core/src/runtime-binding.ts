@@ -36,6 +36,11 @@ export interface RuntimeBindingHandle {
   readonly [runtimeBindingHandleBrand]: "RuntimeBindingHandle";
 }
 
+export interface RuntimeBindingConfigResponse {
+  readonly response: Response;
+  readonly targeted: boolean;
+}
+
 /** Rotate well before the one day proof lifetime ends. */
 export const RUNTIME_BINDING_ROTATE_AHEAD_MS = 60 * 60 * 1000;
 
@@ -255,6 +260,31 @@ export class RuntimeBindingClient {
   matchesScope(endpoint: string, projectKey?: string): boolean {
     return this.endpoint === endpoint.trim().replace(/\/+$/, "") &&
       this.projectKey === (projectKey?.trim() ?? "");
+  }
+
+  async fetchConfig(
+    endpoint: string,
+  ): Promise<RuntimeBindingConfigResponse | undefined> {
+    const fetcher = this.fetcher;
+    if (!fetcher) return undefined;
+
+    const targetedOrigin = this.matchesOrigin(endpoint);
+    const binding = targetedOrigin ? await this.getBinding() : undefined;
+    const url = new URL(
+      endpoint,
+      this.endpoint ||
+        (typeof location !== "undefined" ? location.href : "http://localhost/"),
+    );
+    if (binding) url.searchParams.set("instanceId", binding.instanceId);
+    const response = await fetcher(url.toString(), {
+      method: "GET",
+      cache: "no-store",
+      ...(binding
+        ? { headers: { Authorization: `Bearer ${binding.instanceProof}` } }
+        : {}),
+    });
+    if (response.status === 401 && binding) this.invalidate();
+    return { response, targeted: binding !== undefined };
   }
 
   /** Clear the private proof and prevent late registration responses being adopted. */
@@ -647,6 +677,14 @@ export function retireRuntimeBindingHandle(
   if (!client) return Promise.resolve();
   client.stop();
   return client.getRetirement();
+}
+
+export function fetchRuntimeBindingConfig(
+  handle: RuntimeBindingHandle,
+  endpoint: string,
+): Promise<RuntimeBindingConfigResponse | undefined> {
+  return resolveRuntimeBindingClient(handle)?.fetchConfig(endpoint) ??
+    Promise.resolve(undefined);
 }
 
 /**

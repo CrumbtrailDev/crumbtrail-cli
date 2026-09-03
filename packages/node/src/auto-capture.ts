@@ -6,7 +6,9 @@ import {
 } from "crumbtrail-core";
 import {
   createRuntimeBindingHandle,
+  fetchRuntimeBindingConfig,
   retireRuntimeBindingHandle,
+  type RuntimeBindingHandle,
 } from "crumbtrail-core/serverless";
 import {
   autoInstrumentCacheClients,
@@ -478,7 +480,6 @@ function configPollUrl(
   endpoint: string,
   configEndpoint: string | undefined,
   projectKey: string,
-  instanceId: string | undefined,
 ): string | undefined {
   const target =
     configEndpoint?.trim() ||
@@ -486,7 +487,6 @@ function configPollUrl(
   try {
     const url = new URL(target, endpoint);
     url.searchParams.set("projectKey", projectKey);
-    if (instanceId) url.searchParams.set("instanceId", instanceId);
     return url.toString();
   } catch {
     return undefined;
@@ -581,7 +581,7 @@ function startNodeCpuProfilePolling(options: {
   projectKey: string;
   intervalMs?: number;
   fetchImpl?: typeof fetch;
-  runtimeBinding: RuntimeBindingClient;
+  runtimeBinding: RuntimeBindingHandle;
   executor: CpuProfileProbeExecutor;
   emit: (event: BugEvent) => void;
   now: () => number;
@@ -594,41 +594,39 @@ function startNodeCpuProfilePolling(options: {
   const intervalMs = normalizeConfigPollInterval(options.intervalMs);
   let stopped = false;
   let polling = false;
+  let activeProbeAbort: AbortController | undefined;
 
   const poll = async (): Promise<void> => {
     if (stopped || polling) return;
     polling = true;
     try {
-      const binding = await options.runtimeBinding.getBinding();
       if (stopped) return;
       const url = configPollUrl(
         options.endpoint,
         options.configEndpoint,
         options.projectKey,
-        binding?.instanceId,
       );
       if (!url) return;
-      const response = await fetcher(url, {
-        method: "GET",
-        cache: "no-store",
-        ...(binding
-          ? { headers: { Authorization: `Bearer ${binding.instanceProof}` } }
-          : {}),
-      });
+      const config = await fetchRuntimeBindingConfig(
+        options.runtimeBinding,
+        url,
+      );
+      if (!config) return;
+      const { response, targeted } = config;
       if (stopped) return;
-      if (!response.ok) {
-        if (response.status === 401 && binding)
-          options.runtimeBinding.invalidate();
-        return;
-      }
+      if (!response.ok) return;
       const payload: unknown = await response.json();
       if (stopped || captureKilled(payload) || !cpuProfileRequested(payload))
         return;
 
+      const probeAbort = new AbortController();
+      activeProbeAbort = probeAbort;
       const result = await runProbe("runtime.cpu_profile", {
-        getCpuProfile: options.executor,
-        runtimeTargeted: binding !== undefined,
+        getCpuProfile: (signal) =>
+          runCpuProfileWithAbort(options.executor, signal, probeAbort.signal),
+        runtimeTargeted: targeted,
       });
+      if (activeProbeAbort === probeAbort) activeProbeAbort = undefined;
       if (stopped) return;
       let timestamp: number;
       try {
@@ -645,6 +643,7 @@ function startNodeCpuProfilePolling(options: {
     } catch {
       // A config or profiler failure must never affect the host process.
     } finally {
+      activeProbeAbort = undefined;
       polling = false;
     }
   };
@@ -656,7 +655,32 @@ function startNodeCpuProfilePolling(options: {
     if (stopped) return;
     stopped = true;
     clearInterval(timer);
+    try {
+      activeProbeAbort?.abort();
+    } catch {
+      // A host supplied AbortController must not break capture teardown.
+    }
   };
+}
+
+async function runCpuProfileWithAbort(
+  executor: CpuProfileProbeExecutor,
+  probeSignal: AbortSignal,
+  stopSignal: AbortSignal,
+): Promise<Awaited<ReturnType<CpuProfileProbeExecutor>>> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (probeSignal.aborted || stopSignal.aborted) abort();
+  else {
+    probeSignal.addEventListener("abort", abort, { once: true });
+    stopSignal.addEventListener("abort", abort, { once: true });
+  }
+  try {
+    return await executor(controller.signal);
+  } finally {
+    probeSignal.removeEventListener("abort", abort);
+    stopSignal.removeEventListener("abort", abort);
+  }
 }
 
 /**

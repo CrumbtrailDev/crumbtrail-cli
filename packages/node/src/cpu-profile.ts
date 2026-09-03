@@ -44,7 +44,8 @@ export class CpuProfileProbeError extends Error {
     | "profile already active"
     | "aborted"
     | "timeout"
-    | "profiler stop failed";
+    | "profiler stop failed"
+    | "profiler disable failed";
 
   constructor(reason: CpuProfileProbeError["reason"], cause?: unknown) {
     super(reason, cause === undefined ? undefined : { cause });
@@ -161,7 +162,8 @@ function profileStartError(error: unknown): CpuProfileProbeError | undefined {
 }
 
 function boundedInteger(value: unknown, max: number): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value))
+    return undefined;
   if (value < 0) return undefined;
   return Math.min(max, Math.floor(value));
 }
@@ -221,29 +223,40 @@ function readCallFrame(value: unknown): {
 
 function normalizeProfile(value: unknown): CpuProfileProbeData {
   const profile =
-    value && typeof value === "object" ? (value as RawCpuProfile) : undefined;
-  const nodes = Array.isArray(profile?.nodes) ? profile.nodes : undefined;
-  const samples = Array.isArray(profile?.samples) ? profile.samples : undefined;
-  if (!nodes || !samples || samples.length === 0)
-    throw new Error("empty cpu profile");
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as RawCpuProfile)
+      : undefined;
+  const nodes = profile?.nodes;
+  const samples = profile?.samples;
+  if (!Array.isArray(nodes) || !Array.isArray(samples))
+    throw new Error("malformed cpu profile");
+  if (samples.length === 0) throw new Error("empty cpu profile");
+  if (samples.length > CPU_PROFILE_MAX_SAMPLE_COUNT)
+    throw new Error("malformed cpu profile");
 
   const frames = new Map<number, ReturnType<typeof readCallFrame>>();
   for (const node of nodes) {
-    if (!node || typeof node !== "object") continue;
+    if (!node || typeof node !== "object" || Array.isArray(node))
+      throw new Error("malformed cpu profile");
     const candidate = node as ProfileNode;
-    const id = boundedInteger(candidate.id, CPU_PROFILE_MAX_SAMPLE_COUNT);
-    if (id === undefined) continue;
+    const id = profileId(candidate.id);
+    const callFrame =
+      candidate.callFrame &&
+      typeof candidate.callFrame === "object" &&
+      !Array.isArray(candidate.callFrame)
+        ? (candidate.callFrame as Record<string, unknown>)
+        : undefined;
+    if (id === undefined || !callFrame || typeof callFrame.functionName !== "string")
+      throw new Error("malformed cpu profile");
+    if (frames.has(id)) throw new Error("malformed cpu profile");
     frames.set(id, readCallFrame(candidate.callFrame));
   }
 
   const rows = new Map<string, CpuProfileFunction>();
-  const sampleLimit = Math.min(samples.length, CPU_PROFILE_MAX_SAMPLE_COUNT);
-  for (let index = 0; index < sampleLimit; index += 1) {
-    const id = boundedInteger(samples[index], CPU_PROFILE_MAX_SAMPLE_COUNT);
-    if (id === undefined) continue;
-    const frame = frames.get(id) ?? {
-      functionName: "(anonymous)",
-    };
+  for (const sample of samples) {
+    const id = profileId(sample);
+    const frame = id === undefined ? undefined : frames.get(id);
+    if (!frame) throw new Error("malformed cpu profile");
     const key = [
       frame.functionName,
       frame.url ?? "",
@@ -272,9 +285,20 @@ function normalizeProfile(value: unknown): CpuProfileProbeData {
 
   return {
     durationMs: CPU_PROFILE_DURATION_MS,
-    sampleCount: Math.min(samples.length, CPU_PROFILE_MAX_SAMPLE_COUNT),
+    sampleCount: samples.length,
     topFunctions,
   };
+}
+
+function profileId(value: unknown): number | undefined {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value <= 0 ||
+    value > CPU_PROFILE_MAX_SAMPLE_COUNT
+  )
+    return undefined;
+  return value;
 }
 
 /** Test-only reset for the process-global profiler lock. */
@@ -303,29 +327,34 @@ export function createCpuProfileProbeExecutor(
 
     const deadline = makeDeadline(setTimeoutImpl);
     const aborted = abortPromise(signal);
+    const cleanupAbort = new Promise<never>(() => {});
     let session: CpuProfileInspectorSession | undefined;
+    let profilerEnabled = false;
+    let profileStarted = false;
     let stopAttempted = false;
     let disableAttempted = false;
 
     const cleanupPost = async (
       method: string,
       params?: Record<string, unknown>,
-    ): Promise<void> => {
-      if (!session) return;
+    ): Promise<unknown> => {
+      if (!session) return undefined;
       try {
         await postWithGuards(
           session,
           method,
           params,
           deadline,
-          aborted.promise,
+          cleanupAbort,
         );
+        return undefined;
       } catch {
-        // The primary outcome is retained. Cleanup is best effort but every
-        // cleanup command is attempted before disconnecting.
+        return new Error(`${method} failed`);
       }
     };
 
+    let outcomeError: unknown;
+    let result: CpuProfileProbeData | undefined;
     try {
       try {
         session = createSession();
@@ -353,6 +382,7 @@ export function createCpuProfileProbeExecutor(
         deadline,
         aborted.promise,
       );
+      profilerEnabled = true;
 
       await postWithGuards(
         session,
@@ -373,6 +403,7 @@ export function createCpuProfileProbeExecutor(
       } catch (error) {
         throw profileStartError(error) ?? error;
       }
+      profileStarted = true;
 
       let windowTimer: ReturnType<typeof setTimeout> | undefined;
       try {
@@ -406,16 +437,32 @@ export function createCpuProfileProbeExecutor(
         stopped && typeof stopped === "object"
           ? (stopped as Record<string, unknown>).profile
           : undefined;
-      return normalizeProfile(profile);
-    } finally {
-      if (session && !stopAttempted) {
+      result = normalizeProfile(profile);
+    } catch (error) {
+      outcomeError = error;
+    }
+
+    let cleanupError: CpuProfileProbeError | undefined;
+    try {
+      if (session && profileStarted && !stopAttempted) {
         stopAttempted = true;
-        await cleanupPost("Profiler.stop");
+        const error = await cleanupPost("Profiler.stop");
+        if (error)
+          cleanupError = new CpuProfileProbeError(
+            "profiler stop failed",
+            error,
+          );
       }
-      if (session && !disableAttempted) {
+      if (session && profilerEnabled && !disableAttempted) {
         disableAttempted = true;
-        await cleanupPost("Profiler.disable");
+        const error = await cleanupPost("Profiler.disable");
+        if (error && !cleanupError)
+          cleanupError = new CpuProfileProbeError(
+            "profiler disable failed",
+            error,
+          );
       }
+    } finally {
       aborted.remove();
       clearTimeoutImpl(deadline.timer);
       try {
@@ -425,5 +472,10 @@ export function createCpuProfileProbeExecutor(
       }
       activeProfile = false;
     }
+
+    if (outcomeError) throw outcomeError;
+    if (cleanupError) throw cleanupError;
+    if (!result) throw new Error("missing cpu profile");
+    return result;
   };
 }

@@ -36,11 +36,13 @@ export {
 } from "./http-transport";
 export {
   createRuntimeBindingHandle,
+  fetchRuntimeBindingConfig,
   retireRuntimeBindingHandle,
 } from "../runtime-binding";
 export type {
   RuntimeBindingHandle,
   RuntimeBindingHandleOptions,
+  RuntimeBindingConfigResponse,
 } from "../runtime-binding";
 export type {
   HeadlessSession,

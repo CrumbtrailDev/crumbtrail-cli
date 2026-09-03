@@ -76,8 +76,10 @@ describe("crumbtrail-core/serverless package boundary", () => {
     expect(typeof esm.withCrumbtrailFetch).toBe("function");
     expect(typeof cjs.withCrumbtrailFetch).toBe("function");
     expect(typeof esm.createRuntimeBindingHandle).toBe("function");
+    expect(typeof esm.fetchRuntimeBindingConfig).toBe("function");
     expect(typeof esm.retireRuntimeBindingHandle).toBe("function");
     expect(typeof cjs.createRuntimeBindingHandle).toBe("function");
+    expect(typeof cjs.fetchRuntimeBindingConfig).toBe("function");
     expect(typeof cjs.retireRuntimeBindingHandle).toBe("function");
     expect(esm.RuntimeBindingClient).toBeUndefined();
     expect(esm.createRuntimeBindingClient).toBeUndefined();

@@ -3,6 +3,7 @@ import {
   __resetRuntimeBindingCacheForTests,
   createRuntimeBindingClient,
   createRuntimeBindingHandle,
+  fetchRuntimeBindingConfig,
   getCachedRuntimeBindingClient,
   RUNTIME_BINDING_CACHE_MAX_ENTRIES,
   RUNTIME_BINDING_CACHE_TTL_MS,
@@ -1114,6 +1115,40 @@ describe("HttpTransport runtime binding seam", () => {
 });
 
 describe("serverless runtime binding forwarding", () => {
+  it("keeps an opaque handle origin-gated for config requests", async () => {
+    const runtime = binding(NOW + 86_400_000, "config");
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(response(runtime, 201))
+      .mockResolvedValue(response({ killSwitch: false }));
+    const handle = createRuntimeBindingHandle({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => NOW,
+    });
+
+    const targeted = await fetchRuntimeBindingConfig(
+      handle,
+      `${ENDPOINT}/api/capture-config?projectKey=project-key`,
+    );
+    const crossOrigin = await fetchRuntimeBindingConfig(
+      handle,
+      "https://policy.example/api/capture-config?projectKey=project-key",
+    );
+
+    expect(targeted?.targeted).toBe(true);
+    expect(String(fetcher.mock.calls[1]?.[0])).toContain(
+      `instanceId=${runtime.instanceId}`,
+    );
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({
+      headers: { Authorization: `Bearer ${runtime.instanceProof}` },
+    });
+    expect(crossOrigin?.targeted).toBe(false);
+    expect(String(fetcher.mock.calls[2]?.[0])).not.toContain("instanceId=");
+    expect(fetcher.mock.calls[2]?.[1]).not.toHaveProperty("headers");
+  });
+
   it("forwards an explicit binding instead of replacing it with the default cache", async () => {
     const runtime = binding(NOW + 86_400_000, "explicit");
     const runtimeFetch = vi.fn().mockResolvedValue(response(runtime, 201));

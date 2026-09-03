@@ -10,6 +10,7 @@ import {
 interface SessionOptions {
   profile?: unknown;
   stop?: () => Promise<unknown>;
+  disable?: () => Promise<unknown>;
   hangingMethods?: string[];
 }
 
@@ -30,6 +31,8 @@ function makeSession(options: SessionOptions = {}): {
       if (options.hangingMethods?.includes(method))
         return new Promise(() => {});
       if (method === "Profiler.stop" && options.stop) return options.stop();
+      if (method === "Profiler.disable" && options.disable)
+        return options.disable();
       if (method === "Profiler.stop")
         return Promise.resolve({ profile: options.profile ?? profile() });
       return Promise.resolve({});
@@ -134,7 +137,6 @@ describe("runtime.cpu_profile Node executor", () => {
       "Profiler.enable",
       "Profiler.setSamplingInterval",
       "Profiler.start",
-      "Profiler.stop",
       "Profiler.disable",
     ]);
     expect(fake.disconnect).toHaveBeenCalledOnce();
@@ -180,6 +182,73 @@ describe("runtime.cpu_profile Node executor", () => {
       "Profiler.disable",
     ]);
     expect(fake.disconnect).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not stop a profile owned by another inspector consumer", async () => {
+    vi.useFakeTimers();
+    const fake = makeSession();
+    fake.session.post = vi.fn((method: string) => {
+      fake.calls.push(method);
+      if (method === "Profiler.start")
+        return Promise.reject(new Error("Profiler is already active"));
+      return Promise.resolve({});
+    });
+
+    const pending = executorFor(fake.session)(new AbortController().signal);
+    await expect(pending).rejects.toMatchObject({
+      reason: "profile already active",
+    });
+
+    expect(fake.calls).toEqual([
+      "Profiler.enable",
+      "Profiler.setSamplingInterval",
+      "Profiler.start",
+      "Profiler.disable",
+    ]);
+  });
+
+  it("does not report success when Profiler.disable rejects", async () => {
+    vi.useFakeTimers();
+    const fake = makeSession({
+      disable: () => Promise.reject(new Error("disable rejected")),
+    });
+    const pending = executorFor(fake.session)(new AbortController().signal);
+    await flush();
+    const rejected = expect(pending).rejects.toMatchObject({
+      reason: "profiler disable failed",
+    });
+    await vi.advanceTimersByTimeAsync(CPU_PROFILE_DURATION_MS);
+
+    await rejected;
+    expect(fake.calls).toEqual([
+      "Profiler.enable",
+      "Profiler.setSamplingInterval",
+      "Profiler.start",
+      "Profiler.stop",
+      "Profiler.disable",
+    ]);
+  });
+
+  it("bounds a hanging Profiler.disable to the existing deadline", async () => {
+    vi.useFakeTimers();
+    const fake = makeSession({ hangingMethods: ["Profiler.disable"] });
+    const pending = executorFor(fake.session)(new AbortController().signal);
+    await flush();
+    await vi.advanceTimersByTimeAsync(CPU_PROFILE_DURATION_MS);
+    const rejected = expect(pending).rejects.toMatchObject({
+      reason: "profiler disable failed",
+    });
+    await vi.advanceTimersByTimeAsync(CPU_PROFILE_DEADLINE_MS);
+    await rejected;
+
+    expect(fake.calls).toEqual([
+      "Profiler.enable",
+      "Profiler.setSamplingInterval",
+      "Profiler.start",
+      "Profiler.stop",
+      "Profiler.disable",
+    ]);
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -285,10 +354,58 @@ describe("runtime.cpu_profile Node executor", () => {
     await expect(pending).rejects.toThrow("enable failed");
     expect(fake.calls).toEqual([
       "Profiler.enable",
-      "Profiler.stop",
-      "Profiler.disable",
     ]);
     expect(fake.disconnect).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    ["non-array nodes", { nodes: {}, samples: [1] }],
+    ["non-array samples", { nodes: [], samples: {} }],
+    ["unknown sample id", {
+      nodes: [{ id: 1, callFrame: { functionName: "checkout" } }],
+      samples: [2],
+    }],
+    ["invalid node id", {
+      nodes: [{ id: 1.5, callFrame: { functionName: "checkout" } }],
+      samples: [1],
+    }],
+    ["invalid node shape", { nodes: [{ id: 1 }], samples: [1] }],
+    ["empty samples", {
+      nodes: [{ id: 1, callFrame: { functionName: "checkout" } }],
+      samples: [],
+    }],
+  ])("rejects %s without creating anonymous evidence", async (_label, value) => {
+    vi.useFakeTimers();
+    const fake = makeSession({ profile: value });
+    const pending = executorFor(fake.session)(new AbortController().signal);
+    await flush();
+    const rejected = expect(pending).rejects.toThrow(/malformed|empty/);
+    await vi.advanceTimersByTimeAsync(CPU_PROFILE_DURATION_MS);
+
+    await rejected;
+    expect(fake.disconnect).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("consumes a late cleanup rejection after the deadline", async () => {
+    vi.useFakeTimers();
+    let rejectDisable!: (error: Error) => void;
+    const lateDisable = new Promise<unknown>((_resolve, reject) => {
+      rejectDisable = reject;
+    });
+    const fake = makeSession({ disable: () => lateDisable as Promise<unknown> });
+    const pending = executorFor(fake.session)(new AbortController().signal);
+    await flush();
+    await vi.advanceTimersByTimeAsync(CPU_PROFILE_DURATION_MS);
+    const rejected = expect(pending).rejects.toMatchObject({
+      reason: "profiler disable failed",
+    });
+    await vi.advanceTimersByTimeAsync(CPU_PROFILE_DEADLINE_MS);
+    await rejected;
+
+    rejectDisable(new Error("late disable rejection"));
+    await flush();
     expect(vi.getTimerCount()).toBe(0);
   });
 });

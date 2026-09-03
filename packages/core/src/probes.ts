@@ -380,8 +380,9 @@ function capTable(
   };
 }
 
-function boundedProfileNumber(value: unknown, max: number): number | undefined {
-  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+function boundedProfileInteger(value: unknown, max: number): number | undefined {
+  if (typeof value !== "number" || !Number.isSafeInteger(value))
+    return undefined;
   if (value < 0) return undefined;
   return Math.min(max, Math.floor(value));
 }
@@ -428,35 +429,64 @@ function normalizedProfileFunctionName(value: unknown): string {
 function sanitizeCpuProfileData(
   value: CpuProfileProbeData,
 ): Pick<ProbeResult, "durationMs" | "sampleCount" | "topFunctions"> {
-  const durationMs = boundedProfileNumber(
+  const durationMs = boundedProfileInteger(
     value?.durationMs,
     CPU_PROFILE_MAX_DURATION_MS,
   );
-  const sampleCount = boundedProfileNumber(
+  const sampleCount = boundedProfileInteger(
     value?.sampleCount,
     CPU_PROFILE_MAX_SAMPLE_COUNT,
   );
-  if (durationMs === undefined || sampleCount === undefined)
+  if (
+    durationMs === undefined ||
+    sampleCount === undefined ||
+    sampleCount <= 0
+  )
     throw new Error("malformed cpu profile");
   if (!Array.isArray(value.topFunctions))
     throw new Error("malformed cpu profile");
+  if (value.topFunctions.length === 0)
+    throw new Error("empty cpu profile");
 
   const topFunctions: CpuProfileFunction[] = [];
   for (const row of value.topFunctions.slice(0, CPU_PROFILE_MAX_FUNCTIONS)) {
-    if (!row || typeof row !== "object") continue;
+    if (!row || typeof row !== "object" || Array.isArray(row))
+      throw new Error("malformed cpu profile");
     const source = row as unknown as Record<string, unknown>;
-    const selfSamples = boundedProfileNumber(
+    const selfSamples = boundedProfileInteger(
       source.selfSamples,
       CPU_PROFILE_MAX_SAMPLE_COUNT,
     );
-    if (selfSamples === undefined) continue;
+    if (selfSamples === undefined || selfSamples <= 0)
+      throw new Error("malformed cpu profile");
+    if (typeof source.functionName !== "string")
+      throw new Error("malformed cpu profile");
+    if (
+      source.url !== undefined &&
+      typeof source.url !== "string"
+    )
+      throw new Error("malformed cpu profile");
+    if (
+      source.lineNumber !== undefined &&
+      boundedProfileInteger(source.lineNumber, CPU_PROFILE_SOURCE_POSITION_MAX) ===
+        undefined
+    )
+      throw new Error("malformed cpu profile");
+    if (
+      source.columnNumber !== undefined &&
+      boundedProfileInteger(
+        source.columnNumber,
+        CPU_PROFILE_SOURCE_POSITION_MAX,
+      ) === undefined
+    )
+      throw new Error("malformed cpu profile");
     const functionName = normalizedProfileFunctionName(source.functionName);
     const url = boundedProfileUrl(source.url);
-    const lineNumber = boundedProfileNumber(
+    const lineNumber = boundedProfileInteger(
       source.lineNumber,
       CPU_PROFILE_SOURCE_POSITION_MAX,
     );
-    const columnNumber = boundedProfileNumber(
+    const columnNumber = boundedProfileInteger(
       source.columnNumber,
       CPU_PROFILE_SOURCE_POSITION_MAX,
     );
@@ -468,6 +498,8 @@ function sanitizeCpuProfileData(
       selfSamples,
     });
   }
+
+  if (topFunctions.length === 0) throw new Error("empty cpu profile");
 
   return { durationMs, sampleCount, topFunctions };
 }

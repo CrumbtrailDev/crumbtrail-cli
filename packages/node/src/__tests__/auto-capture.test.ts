@@ -191,6 +191,219 @@ describe("autoCapture", () => {
     vi.useRealTimers();
   });
 
+  it("keeps a different-origin config poll untargeted", async () => {
+    vi.useFakeTimers();
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "project-key" } });
+    const runtime = {
+      instanceId: "ri_cpu_cross_origin",
+      instanceProof: `proof_${"x".repeat(40)}`,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    };
+    const calls: FetchCall[] = [];
+    const createSession = vi.fn();
+    const fetchImpl = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        const value = String(url);
+        if (value.includes("/api/runtime/register"))
+          return new Response(JSON.stringify(runtime), { status: 201 });
+        if (value.startsWith("https://policy.example.test/"))
+          return new Response(
+            JSON.stringify({
+              killSwitch: false,
+              probes: ["runtime.cpu_profile"],
+            }),
+            { status: 200 },
+          );
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    ) as unknown as typeof fetch;
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        configEndpoint: "https://policy.example.test/api/capture-config",
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        cpuProfileSessionFactory: createSession,
+        captureHttpRequests: false,
+        captureOutboundHttp: false,
+        captureRuntimeWarnings: false,
+        captureLogs: false,
+        captureProcessSignals: false,
+      }),
+    );
+    await flushAutoCaptureMicrotasks();
+
+    const config = calls.find((call) =>
+      call.url.startsWith("https://policy.example.test/"),
+    );
+    expect(config?.url).not.toContain("instanceId=");
+    expect(config?.init.headers).toBeUndefined();
+    expect(createSession).not.toHaveBeenCalled();
+    const result = eventsFrom(calls).find(
+      (event) => event.k === "probe.result",
+    );
+    expect(result?.d).toMatchObject({
+      name: "runtime.cpu_profile",
+      ok: false,
+      error: "unavailable",
+    });
+  });
+
+  it("invalidates a binding after a targeted config 401", async () => {
+    vi.useFakeTimers();
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "project-key" } });
+    const first = {
+      instanceId: "ri_cpu_first",
+      instanceProof: `proof_first_${"x".repeat(40)}`,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    };
+    const second = {
+      instanceId: "ri_cpu_second",
+      instanceProof: `proof_second_${"x".repeat(40)}`,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    };
+    const calls: FetchCall[] = [];
+    let registrations = 0;
+    let configPolls = 0;
+    const fetchImpl = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        const value = String(url);
+        if (value.includes("/api/runtime/register")) {
+          registrations += 1;
+          return new Response(
+            JSON.stringify(registrations === 1 ? first : second),
+            { status: 201 },
+          );
+        }
+        if (value.includes("/api/capture-config")) {
+          configPolls += 1;
+          if (configPolls === 1)
+            return new Response(JSON.stringify({ error: "revoked" }), {
+              status: 401,
+            });
+          return new Response(JSON.stringify({ killSwitch: false }), {
+            status: 200,
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    ) as unknown as typeof fetch;
+
+    track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        configPollIntervalMs: 60_000,
+        captureHttpRequests: false,
+        captureOutboundHttp: false,
+        captureRuntimeWarnings: false,
+        captureLogs: false,
+        captureProcessSignals: false,
+      }),
+    );
+    await flushAutoCaptureMicrotasks();
+
+    const firstPoll = calls.find((call) =>
+      call.url.includes("/api/capture-config"),
+    );
+    expect(firstPoll?.url).toContain(`instanceId=${first.instanceId}`);
+    expect(firstPoll?.init.headers).toEqual({
+      Authorization: `Bearer ${first.instanceProof}`,
+    });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    await flushAutoCaptureMicrotasks();
+
+    const configCalls = calls.filter((call) =>
+      call.url.includes("/api/capture-config"),
+    );
+    expect(registrations).toBe(2);
+    expect(configCalls).toHaveLength(2);
+    expect(configCalls[1]?.url).toContain(`instanceId=${second.instanceId}`);
+    expect(configCalls[1]?.init.headers).toEqual({
+      Authorization: `Bearer ${second.instanceProof}`,
+    });
+  });
+
+  it("aborts an in-flight CPU probe when stopped", async () => {
+    vi.useFakeTimers();
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "project-key" } });
+    const calls: FetchCall[] = [];
+    const fetchImpl = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(url), init: init ?? {} });
+        const value = String(url);
+        if (value.includes("/api/runtime/register"))
+          return new Response(
+            JSON.stringify({
+              instanceId: "ri_cpu_stop",
+              instanceProof: `proof_${"x".repeat(40)}`,
+              expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+            }),
+            { status: 201 },
+          );
+        if (value.includes("/api/capture-config"))
+          return new Response(
+            JSON.stringify({
+              killSwitch: false,
+              probes: ["runtime.cpu_profile"],
+            }),
+            { status: 200 },
+          );
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    ) as unknown as typeof fetch;
+    const callsToProfiler: string[] = [];
+    const session: CpuProfileInspectorSession = {
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      post: vi.fn(async (method: string) => {
+        callsToProfiler.push(method);
+        if (method === "Profiler.stop")
+          return {
+            profile: {
+              nodes: [{ id: 1, callFrame: { functionName: "checkout" } }],
+              samples: [1],
+            },
+          };
+        return {};
+      }),
+    };
+
+    const handle = track(
+      await autoCapture({
+        endpoint: ENDPOINT,
+        processImpl: proc,
+        consoleImpl: { error: vi.fn() },
+        fetchImpl,
+        cpuProfileSessionFactory: () => session,
+        configPollIntervalMs: 60_000,
+        captureHttpRequests: false,
+        captureOutboundHttp: false,
+        captureRuntimeWarnings: false,
+        captureLogs: false,
+        captureProcessSignals: false,
+      }),
+    );
+    await flushAutoCaptureMicrotasks();
+    expect(callsToProfiler).toContain("Profiler.start");
+
+    handle.stop();
+    await flushAutoCaptureMicrotasks();
+
+    expect(callsToProfiler.filter((method) => method === "Profiler.stop"))
+      .toHaveLength(1);
+    expect(
+      callsToProfiler.filter((method) => method === "Profiler.disable"),
+    ).toHaveLength(1);
+  });
+
   it("reports unavailable and does not profile when an old response is untargeted", async () => {
     vi.useFakeTimers();
     const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "project-key" } });

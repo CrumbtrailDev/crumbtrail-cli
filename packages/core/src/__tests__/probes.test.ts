@@ -426,7 +426,7 @@ describe("runtime.cpu_profile", () => {
     const executor = vi.fn(async () => ({
       durationMs: 1_000,
       sampleCount: 1,
-      topFunctions: [],
+      topFunctions: [{ functionName: "checkout", selfSamples: 1 }],
     }));
     const browser = await runProbe("runtime.cpu_profile", {
       runtimeTargeted: true,
@@ -459,7 +459,7 @@ describe("runtime.cpu_profile", () => {
             {
               functionName: "",
               url: "https://api.example.test/run?access_token=secret-value-123456789",
-              lineNumber: -1,
+              lineNumber: undefined,
               columnNumber: 12,
               selfSamples: 2,
               args: [{ secret: "must not cross the boundary" }],
@@ -503,6 +503,35 @@ describe("runtime.cpu_profile", () => {
         ),
       ).toBe(true);
     }
+  });
+
+  it.each([
+    ["non-array nodes", { nodes: {}, samples: [1] }],
+    ["non-array samples", { nodes: [], samples: {} }],
+    ["unknown sample id", {
+      nodes: [{ functionName: "checkout", selfSamples: 1 }],
+      samples: [1],
+    }],
+    ["invalid function row", {
+      nodes: [{ functionName: "checkout", selfSamples: 0 }],
+      samples: [1],
+    }],
+    ["empty rows", { nodes: [{ functionName: "checkout" }], samples: [1] }],
+  ])("rejects %s instead of emitting successful anonymous evidence", async (_label, value) => {
+    const getCpuProfile = vi.fn(async () => ({
+      durationMs: 1_000,
+      sampleCount: 1,
+      topFunctions: value,
+    }) as never);
+
+    const result = await runProbe("runtime.cpu_profile", {
+      runtimeTargeted: true,
+      getCpuProfile,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.rows).toEqual([]);
+    expect(result.error).toMatch(/malformed|empty/);
   });
 });
 
