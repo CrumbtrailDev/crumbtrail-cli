@@ -6,7 +6,8 @@ export const CORS_REQUIRED_HEADERS = [
 ] as const;
 export const CORS_REQUEST_CREDENTIALS: RequestCredentials = "same-origin";
 
-export type CorsDiagnosticStatus = "pass" | "fail" | "unknown" | "not-applicable";
+export type CorsDiagnosticStatus =
+  "pass" | "fail" | "unknown" | "not-applicable";
 export type CorsNetworkCategory =
   | "http"
   | "redirect"
@@ -33,6 +34,8 @@ export interface CorsDiagnosticOptions {
   endpoint: string;
   origin?: string;
   applicable: boolean;
+  /** Matches the browser request's credentials mode. Defaults to same-origin. */
+  credentials?: RequestCredentials;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
 }
@@ -51,7 +54,10 @@ function headerValues(response: Response, name: string): string[] {
     .filter(Boolean);
 }
 
-function networkCategory(error: unknown, timedOut: boolean): CorsNetworkCategory {
+function networkCategory(
+  error: unknown,
+  timedOut: boolean,
+): CorsNetworkCategory {
   if (timedOut) return "timeout";
   const value = error as { code?: string; cause?: { code?: string } };
   const code = value?.code ?? value?.cause?.code;
@@ -83,12 +89,15 @@ export async function diagnoseCors(
       endpoint: opts.endpoint,
       category: "network",
       missingHeaders: [],
-      reason: "Application origin is not configured, so CORS cannot be verified.",
-      nextStep: "Set the application's public origin, then run `crumbtrail doctor` again.",
+      reason:
+        "Application origin is not configured, so CORS cannot be verified.",
+      nextStep:
+        "Set the application's public origin, then run `crumbtrail doctor` again.",
     };
   }
 
   const controller = new AbortController();
+  const credentials = opts.credentials ?? CORS_REQUEST_CREDENTIALS;
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
@@ -98,7 +107,7 @@ export async function diagnoseCors(
     const response = await (opts.fetchImpl ?? fetch)(opts.endpoint, {
       method: "OPTIONS",
       redirect: "manual",
-      credentials: CORS_REQUEST_CREDENTIALS,
+      credentials,
       signal: controller.signal,
       headers: {
         Origin: opts.origin,
@@ -108,55 +117,99 @@ export async function diagnoseCors(
     });
     if (response.type === "opaque") {
       return {
-        status: "unknown", endpoint: opts.endpoint, origin: opts.origin,
-        category: "opaque", missingHeaders: [],
-        reason: "Opaque preflight response cannot be verified.", nextStep,
+        status: "unknown",
+        endpoint: opts.endpoint,
+        origin: opts.origin,
+        category: "opaque",
+        missingHeaders: [],
+        reason: "Opaque preflight response cannot be verified.",
+        nextStep,
       };
     }
     if (response.status >= 300 && response.status < 400) {
       return {
-        status: "fail", endpoint: opts.endpoint, origin: opts.origin,
-        category: "redirect", responseStatus: response.status, missingHeaders: [],
-        reason: `Preflight received ${statusClass(response.status)} (HTTP ${response.status}) redirect.`, nextStep,
+        status: "fail",
+        endpoint: opts.endpoint,
+        origin: opts.origin,
+        category: "redirect",
+        responseStatus: response.status,
+        missingHeaders: [],
+        reason: `Preflight received ${statusClass(response.status)} (HTTP ${response.status}) redirect.`,
+        nextStep,
       };
     }
     const allowedOrigin = response.headers.get("access-control-allow-origin");
-    const credentialed = CORS_REQUEST_CREDENTIALS === "include";
+    const credentialed = credentials === "include";
     const allowsOrigin =
       allowedOrigin === opts.origin || (allowedOrigin === "*" && !credentialed);
     const methods = headerValues(response, "access-control-allow-methods");
     const headers = headerValues(response, "access-control-allow-headers");
     const allowsCredentials =
       !credentialed ||
-      response.headers.get("access-control-allow-credentials")?.toLowerCase() === "true";
-    const missingHeaders = CORS_REQUIRED_HEADERS.filter((header) => !headers.includes(header));
-    const missingMethod = methods.includes(CORS_REQUEST_METHOD.toLowerCase()) ? undefined : CORS_REQUEST_METHOD;
+      response.headers
+        .get("access-control-allow-credentials")
+        ?.toLowerCase() === "true";
+    const missingHeaders =
+      headers.includes("*") && !credentialed
+        ? []
+        : CORS_REQUIRED_HEADERS.filter((header) => !headers.includes(header));
+    const missingMethod =
+      methods.includes("*") && !credentialed
+        ? undefined
+        : methods.includes(CORS_REQUEST_METHOD.toLowerCase())
+          ? undefined
+          : CORS_REQUEST_METHOD;
     const validStatus = response.status >= 200 && response.status < 300;
-    if (validStatus && allowsOrigin && allowsCredentials && !missingMethod && missingHeaders.length === 0) {
+    if (
+      validStatus &&
+      allowsOrigin &&
+      allowsCredentials &&
+      !missingMethod &&
+      missingHeaders.length === 0
+    ) {
       return {
-        status: "pass", endpoint: opts.endpoint, origin: opts.origin, category: "http",
-        responseStatus: response.status, missingHeaders: [],
-        reason: `Preflight allowed ${opts.origin} (HTTP ${response.status}).`, nextStep: "No CORS change is needed.",
+        status: "pass",
+        endpoint: opts.endpoint,
+        origin: opts.origin,
+        category: "http",
+        responseStatus: response.status,
+        missingHeaders: [],
+        reason: `Preflight allowed ${opts.origin} (HTTP ${response.status}).`,
+        nextStep: "No CORS change is needed.",
       };
     }
     const failures = [
-      !validStatus ? `response ${statusClass(response.status)} (HTTP ${response.status})` : "",
+      !validStatus
+        ? `response ${statusClass(response.status)} (HTTP ${response.status})`
+        : "",
       !allowsOrigin ? `origin ${opts.origin} is not allowed` : "",
       !allowsCredentials ? "credentialed requests are not allowed" : "",
       missingMethod ? `missing allowed method ${missingMethod}` : "",
-      missingHeaders.length ? `missing allowed headers ${missingHeaders.join(", ")}` : "",
+      missingHeaders.length
+        ? `missing allowed headers ${missingHeaders.join(", ")}`
+        : "",
     ].filter(Boolean);
     return {
-      status: "fail", endpoint: opts.endpoint, origin: opts.origin, category: "http",
-      responseStatus: response.status, missingHeaders, missingMethod,
-      reason: failures.join("; ") + ".", nextStep,
+      status: "fail",
+      endpoint: opts.endpoint,
+      origin: opts.origin,
+      category: "http",
+      responseStatus: response.status,
+      missingHeaders,
+      missingMethod,
+      reason: failures.join("; ") + ".",
+      nextStep,
     };
   } catch (error) {
     const category = networkCategory(error, timedOut);
     return {
-      status: "unknown", endpoint: opts.endpoint, origin: opts.origin, category,
+      status: "unknown",
+      endpoint: opts.endpoint,
+      origin: opts.origin,
+      category,
       missingHeaders: [],
-      reason: `Preflight could not reach the endpoint (${category}).`, nextStep,
+      reason: `Preflight could not reach the endpoint (${category}).`,
+      nextStep,
     };
   } finally {
     clearTimeout(timer);

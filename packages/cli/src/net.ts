@@ -26,6 +26,18 @@ export function normalizeBase(base: string): string {
 }
 
 /**
+ * The browser SDK starts every capture session with this exact route. Accept a
+ * full session-start URL too, so `crumbtrail doctor --endpoint <route>` does
+ * not append the route twice.
+ */
+export function ingestSessionStartEndpoint(baseOrEndpoint: string): string {
+  const normalized = normalizeBase(baseOrEndpoint);
+  return normalized.endsWith("/api/session/start")
+    ? normalized
+    : `${normalized}/api/session/start`;
+}
+
+/**
  * Env var that pins the browser dashboard origin.
  *
  * Last resort, and it exists because the deployment can be wrong about itself:

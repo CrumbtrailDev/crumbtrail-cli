@@ -82,6 +82,7 @@ import { runPackageManager } from "./install/run-package-manager";
 import {
   APP_URL_ENV_VAR,
   dashboardBase,
+  ingestSessionStartEndpoint,
   requestJson,
   resolveEndpoint,
 } from "./net";
@@ -257,7 +258,14 @@ export function resolvedSdkVersion(
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
 export type Command =
-  "wizard" | "login" | "logout" | "token" | "verify" | "doctor" | "help" | "version";
+  | "wizard"
+  | "login"
+  | "logout"
+  | "token"
+  | "verify"
+  | "doctor"
+  | "help"
+  | "version";
 
 export interface ParsedArgs {
   command: Command;
@@ -408,7 +416,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
         {
           const value = flagValue(args, i, a);
           if (value.error) parsed.parseError ??= value.error;
-          else { parsed.origin = value.value; i += 1; }
+          else {
+            parsed.origin = value.value;
+            i += 1;
+          }
         }
         break;
       case "--key":
@@ -478,7 +489,11 @@ export function parseArgs(argv: string[]): ParsedArgs {
           else parsed.parseError ??= "--workspace requires a value.";
         } else if (
           !commandSet &&
-          (a === "login" || a === "logout" || a === "token" || a === "verify" || a === "doctor")
+          (a === "login" ||
+            a === "logout" ||
+            a === "token" ||
+            a === "verify" ||
+            a === "doctor")
         ) {
           parsed.command = a;
           commandSet = true;
@@ -525,7 +540,10 @@ function usage(): string {
       "crumbtrail verify",
       "Preflight an endpoint + key (DNS, TLS, auth): PASS/FAIL",
     ),
-    cmd("crumbtrail doctor", "Check browser CORS without changing your project"),
+    cmd(
+      "crumbtrail doctor",
+      "Check browser CORS without changing your project",
+    ),
     "",
     color.dim(
       "With more than one app, run it from the repo root: it scans every workspace and service,",
@@ -589,7 +607,10 @@ function usage(): string {
     flag("--json", "Emit JSON instead of the table (exit 0 = pass, else fail)"),
     "",
     head("doctor options"),
-    flag("--origin <url>", "Browser origin to check (or $CRUMBTRAIL_APP_ORIGIN)"),
+    flag(
+      "--origin <url>",
+      "Browser origin to check (or $CRUMBTRAIL_APP_ORIGIN)",
+    ),
     "",
     head("Appearance"),
     color.dim(
@@ -1502,7 +1523,7 @@ export async function runWizard(
   );
   if (BROWSER_RECIPES.has(result.recipe)) {
     const cors = await deps.runCorsDiagnostic({
-      endpoint: base,
+      endpoint: ingestSessionStartEndpoint(base),
       origin: deps.env.CRUMBTRAIL_APP_ORIGIN,
       applicable: true,
       fetchImpl: deps.fetchImpl,
@@ -4521,8 +4542,16 @@ async function runVerify(
 }
 
 const BROWSER_RECIPES = new Set<Recipe>([
-  "next", "sveltekit", "nuxt", "remix", "astro", "angular", "vite-spa",
-  "cra", "capacitor", "react-native", "static",
+  "next",
+  "sveltekit",
+  "nuxt",
+  "remix",
+  "astro",
+  "angular",
+  "vite-spa",
+  "cra",
+  "capacitor",
+  "static",
 ]);
 
 function renderCorsDiagnostic(result: CorsDiagnosticResult, ui: Ui): void {
@@ -4532,10 +4561,15 @@ function renderCorsDiagnostic(result: CorsDiagnosticResult, ui: Ui): void {
   ui.out(`  Next: ${result.nextStep}`);
 }
 
-async function runDoctor(parsed: ParsedArgs, deps: WizardDeps): Promise<number> {
+async function runDoctor(
+  parsed: ParsedArgs,
+  deps: WizardDeps,
+): Promise<number> {
   const detected = deps.detect(deps.cwd);
   const result = await deps.runCorsDiagnostic({
-    endpoint: resolveEndpoint(parsed.endpoint, deps.env),
+    endpoint: ingestSessionStartEndpoint(
+      resolveEndpoint(parsed.endpoint, deps.env),
+    ),
     origin: parsed.origin ?? deps.env.CRUMBTRAIL_APP_ORIGIN,
     applicable: !!detected.recipe && BROWSER_RECIPES.has(detected.recipe),
     fetchImpl: deps.fetchImpl,

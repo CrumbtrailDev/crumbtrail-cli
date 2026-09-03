@@ -129,11 +129,13 @@ crumbtrail doctor --endpoint https://capture.example.com/api/session/start \
   --origin https://app.example.com
 ```
 
-It checks an explicit matching origin, `POST`, and the Crumbtrail correlation
-and authorization headers. A redirect, timeout, DNS, TLS, network, or opaque
-response is reported as unknown rather than success. Without `--origin`, it
-uses `CRUMBTRAIL_APP_ORIGIN`; if neither is configured, it tells you that the
-origin cannot be verified. Non browser projects are not applicable.
+It probes the SDK's `POST /api/session/start` route. The preflight requests
+`content-type` and `x-crumbtrail-auth`, which are the headers the browser SDK
+sends. A redirect, timeout, DNS, TLS, network, or opaque response is reported
+as unknown rather than success. Without `--origin`, it uses
+`CRUMBTRAIL_APP_ORIGIN`; if neither is configured, it tells you that the origin
+cannot be verified. Native-only projects, including React Native, are not
+applicable.
 
 Run `verify` in your deploy pipeline to **confirm prod ingest works before you
 ship, instead of deploy-and-pray**. Because a broken config (wrong key, wrong
