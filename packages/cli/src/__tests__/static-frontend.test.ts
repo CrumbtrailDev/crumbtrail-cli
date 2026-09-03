@@ -639,6 +639,72 @@ describe("buildPlan — static", () => {
     }
   });
 
+  it("moves a valid bootstrap ahead of an earlier application script", () => {
+    const wired = PAGE.replace(
+      "    <title>Landing</title>",
+      [
+        "    <title>Landing</title>",
+        '    <script src="/app.js"></script>',
+        '    <script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        '    <script type="module">',
+        '      import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
+        `      Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });`,
+        "    </script>",
+      ].join("\n"),
+    );
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
+    );
+    expect(plan.kind).toBe("rewrite");
+    expect(plan.content!.match(/early-bootstrap\.global\.js/g)).toHaveLength(1);
+    expect(plan.content!.indexOf("early-bootstrap.global.js")).toBeLessThan(
+      plan.content!.indexOf("/app.js"),
+    );
+  });
+
+  it.each([
+    "http://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js",
+    "https://evil.example/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js",
+    "https://user:pass@unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js",
+    "https://unpkg.com:444/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js",
+    "https://unpkg.com/other/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js",
+    "https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js?redirect=1",
+  ])("does not trust a noncanonical bootstrap URL %s", (source) => {
+    const wired = insertIntoHtmlHead(
+      PAGE,
+      [
+        `<script src="${source}"></script>`,
+        '<script type="module">',
+        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });`,
+        "</script>",
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
+    );
+    expect(plan.kind).toBe("rewrite");
+    expect(plan.content).toContain(
+      '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+    );
+  });
+
   it("retrofits a real module when a fake marker appears only in inert HTML", () => {
     const wired = insertIntoHtmlHead(
       PAGE,

@@ -1598,18 +1598,36 @@ function staticBlockFor(input: BuildPlanInput): string {
 
 const STATIC_MODULE_VERSION =
   /https:\/\/esm\.sh\/crumbtrail-core@(\d+\.\d+\.\d+)(?:["'/?#]|$)/i;
-const STATIC_BOOTSTRAP_SOURCE = /early-bootstrap\.global\.js(?:[?#]|$)/i;
-const STATIC_BOOTSTRAP_VERSION =
-  /crumbtrail-core@(\d+\.\d+\.\d+)[^"'?#]*\/early-bootstrap\.global\.js(?:[?#]|$)/i;
+const STATIC_BOOTSTRAP_PATH =
+  /^\/crumbtrail-core@(\d+\.\d+\.\d+)\/dist\/early-bootstrap\.global\.js$/;
 
-function staticBootstrapSource(html: string): string | null {
+function staticBootstrapVersion(source: string): string | null {
+  try {
+    const url = new URL(source);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.toLowerCase() !== "unpkg.com" ||
+      url.username !== "" ||
+      url.password !== "" ||
+      url.port !== "" ||
+      url.search !== "" ||
+      url.hash !== ""
+    )
+      return null;
+    return STATIC_BOOTSTRAP_PATH.exec(url.pathname)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function staticBootstrapBlock(html: string) {
   for (const block of htmlScriptBlocks(html)) {
     if (
       block.executable &&
       block.src !== null &&
-      STATIC_BOOTSTRAP_SOURCE.test(block.src)
+      staticBootstrapVersion(block.src) !== null
     ) {
-      return block.src;
+      return block;
     }
   }
   return null;
@@ -1624,10 +1642,6 @@ function staticModuleVersion(html: string): string | null {
     if (match?.[1]) return match[1];
   }
   return null;
-}
-
-function staticBootstrapVersion(source: string): string | null {
-  return STATIC_BOOTSTRAP_VERSION.exec(source)?.[1] ?? null;
 }
 
 function staticBootstrapMismatchPlan(
@@ -1733,7 +1747,8 @@ function staticExistingPagePlan(
   target: string,
   html: string,
 ): Plan {
-  const markerSource = staticBootstrapSource(html);
+  const markerBlock = staticBootstrapBlock(html);
+  const markerSource = markerBlock?.src ?? null;
   const moduleVersion = staticModuleVersion(html);
   const status = inspectIntegration({
     cwd: input.cwd,
@@ -1763,6 +1778,19 @@ function staticExistingPagePlan(
     }
     if (!status.complete)
       return staticIncompletePlan(input, target, status, true);
+    const firstExecutable = htmlScriptBlocks(html).find(
+      (block) => block.executable,
+    );
+    if (firstExecutable?.start !== markerBlock!.start) {
+      const withoutLateBootstrap =
+        html.slice(0, markerBlock!.start) + html.slice(markerBlock!.end);
+      return staticEarlyBootstrapUpgrade(
+        input,
+        io,
+        target,
+        withoutLateBootstrap,
+      );
+    }
     return skipPlan(input, [
       `${path.relative(input.cwd, target) || target} already references Crumbtrail and has a verified early browser bootstrap — left as it is.`,
     ]);
