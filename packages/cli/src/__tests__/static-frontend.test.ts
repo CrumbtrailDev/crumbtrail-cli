@@ -850,7 +850,7 @@ describe("buildPlan — the frontend an Express app serves", () => {
     expect(plan.warnings.join(" ")).toContain("public/index.html");
   });
 
-  it("does not overwrite a dirty unwired served page", () => {
+  it("retains a dirty unwired served page behind one confirmation", () => {
     const wiredServer = [
       'import express from "express";',
       'import { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } from "crumbtrail-node";',
@@ -885,11 +885,12 @@ describe("buildPlan — the frontend an Express app serves", () => {
       io,
     );
 
+    expect(plan.kind).toBe("needs-confirm-dirty");
     expect(
       (plan.extraEdits ?? []).some((edit) => edit.path === indexPath),
-    ).toBe(false);
+    ).toBe(true);
     expect(plan.warnings.join(" ")).toMatch(
-      /public\/index\.html.*uncommitted changes.*left it alone/i,
+      /public\/index\.html.*uncommitted changes.*confirm/i,
     );
   });
 

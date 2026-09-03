@@ -2086,10 +2086,12 @@ function planServedStaticFrontend(
   edits: NonNullable<Plan["extraEdits"]>;
   warnings: string[];
   unresolved: boolean;
+  needsConfirmDirty: boolean;
 } {
   const edits: NonNullable<Plan["extraEdits"]> = [];
   const warnings: string[] = [];
   let unresolved = false;
+  let needsConfirmDirty = false;
   const entryDir = path.dirname(input.entryFile ?? path.join(input.cwd, "x"));
   const reader: FileReader = {
     readFile: (p) => io.readFile(p),
@@ -2123,13 +2125,18 @@ function planServedStaticFrontend(
     if (htmlReferencesCrumbtrail(html)) {
       const upgrade = staticExistingPagePlan(input, io, indexPath, html);
       warnings.push(...upgrade.warnings);
-      if (upgrade.kind === "rewrite" && upgrade.content) {
+      if (
+        (upgrade.kind === "rewrite" ||
+          upgrade.kind === "needs-confirm-dirty") &&
+        upgrade.content
+      ) {
         edits.push({
           path: indexPath,
           mode: "update",
           content: upgrade.content,
           label: `added early browser capture to ${path.relative(input.cwd, indexPath) || indexPath}`,
         });
+        if (upgrade.kind === "needs-confirm-dirty") needsConfirmDirty = true;
       } else {
         unresolved = true;
       }
@@ -2161,10 +2168,9 @@ function planServedStaticFrontend(
     const status = io.gitStatus(input.cwd, indexPath);
     if (status.dirty && !input.options?.force) {
       warnings.push(
-        `${rel} is served to browsers but has uncommitted changes, so Crumbtrail left it alone. Confirm the edit or re-run with force to wire browser capture.`,
+        `${rel} is served to browsers and has uncommitted changes. Confirm the edit or re-run with force to wire browser capture.`,
       );
-      unresolved = true;
-      continue;
+      needsConfirmDirty = true;
     }
     edits.push({
       path: indexPath,
@@ -2176,7 +2182,7 @@ function planServedStaticFrontend(
       `Wired browser capture into ${rel}, the page this server serves. Replace ${KEY_PLACEHOLDER} in it with your ingest key — a page with no bundler has no env var to read.`,
     );
   }
-  return { edits, warnings, unresolved };
+  return { edits, warnings, unresolved, needsConfirmDirty };
 }
 
 /**
@@ -3946,6 +3952,11 @@ export function buildPlan(
         plan.keyIsSourceLiteral = true;
       }
       plan.warnings = [...plan.warnings, ...served.warnings];
+      if (served.needsConfirmDirty && !input.options?.force) {
+        if (plan.kind === "rewrite" || plan.kind === "amend-init")
+          plan.applyMode = "rewrite";
+        plan.kind = "needs-confirm-dirty";
+      }
       if (served.unresolved && plan.kind === "skip-already-wired") {
         plan.kind = "fallback-ai";
         plan.snippet = "";
