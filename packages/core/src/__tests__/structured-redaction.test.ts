@@ -156,12 +156,7 @@ describe("redactDiagnosticFields", () => {
     };
 
     const result = redactDiagnosticFields(value, {
-      diagnosticFields: [
-        "short",
-        "oversized",
-        "infinity",
-        "denied",
-      ],
+      diagnosticFields: ["short", "oversized", "infinity", "denied"],
       denyFields: ["denied"],
     });
 
@@ -179,9 +174,9 @@ describe("redactDiagnosticFields", () => {
     const boundedResult = redactDiagnosticFields(bounded, {
       diagnosticFields: Object.keys(bounded),
     });
-    expect(Object.keys(boundedResult.value as Record<string, unknown>)).toHaveLength(
-      16,
-    );
+    expect(
+      Object.keys(boundedResult.value as Record<string, unknown>),
+    ).toHaveLength(16);
   });
 
   it("applies structured parent denies while preserving card and account containers", () => {
@@ -282,6 +277,7 @@ describe("redactDiagnosticFields", () => {
     const result = redactDiagnosticFields(
       {
         ftp: "ftp://alice:ftp-pass@files.example/private",
+        opaque: "ftp:opaque-secret/file",
         ssh: "ssh://alice:ssh-pass@host.example/private",
         custom: "custom://alice:custom-pass@host.example/private",
         data: "data:text/plain,raw-data-secret",
@@ -292,6 +288,7 @@ describe("redactDiagnosticFields", () => {
       {
         diagnosticFields: [
           "ftp",
+          "opaque",
           "ssh",
           "custom",
           "data",
@@ -357,6 +354,65 @@ describe("redactDiagnosticFields", () => {
     expect(JSON.stringify(result.value)).not.toContain("must not retain");
   });
 
+  it("folds Unicode confusables in sensitive diagnostic keys", () => {
+    const password = "\u0440\u0430ssword";
+    const cardNumber = "\u0441ardNumber";
+    const accountNumber = "\u0430ccountNumber";
+    const result = redactDiagnosticFields(
+      {
+        [password]: "hunter2",
+        [cardNumber]: "1234567890123456",
+        [accountNumber]: "1234",
+        status: "SAFE_OK",
+      },
+      { diagnosticFields: [password, cardNumber, accountNumber, "status"] },
+    );
+
+    expect(result.value).toEqual({ status: "SAFE_OK" });
+    expect(JSON.stringify(result.value)).not.toContain("hunter2");
+    expect(JSON.stringify(result.value)).not.toContain("1234567890123456");
+    expect(JSON.stringify(result.value)).not.toContain("1234");
+  });
+
+  it("redacts short numbers inside confusable card and account containers", () => {
+    const result = redactDiagnosticFields(
+      {
+        сard: { brand: "visa", number: "4242" },
+        аccount: { status: "active", number: "1234" },
+      },
+      {
+        diagnosticFields: [
+          "сard.brand",
+          "сard.number",
+          "аccount.status",
+          "аccount.number",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({
+      сard: { brand: "visa" },
+      аccount: { status: "active" },
+    });
+    expect(JSON.stringify(result.value)).not.toContain("4242");
+    expect(JSON.stringify(result.value)).not.toContain("1234");
+  });
+
+  it("keeps ordinary colon labels instead of treating them as URI schemes", () => {
+    const result = redactDiagnosticFields(
+      {
+        message: "Error: failed",
+        status: "Status: pending",
+      },
+      { diagnosticFields: ["message", "status"] },
+    );
+
+    expect(result.value).toEqual({
+      message: "Error: failed",
+      status: "Status: pending",
+    });
+  });
+
   it("redacts relative URL query secrets in diagnostic prose", () => {
     const secret = "abc123def456";
     const result = redactDiagnosticFields(
@@ -405,10 +461,17 @@ describe("redactDiagnosticFields", () => {
         idn: `https://例え.テスト/callback?token=${secret}`,
         path: `https://example.test/こんにちは?token=${secret}`,
         encodedPath: `https://example.test/%E3%81%93%E3%82%93?token=${secret}`,
+        normalizedPath: `https://example.test/ｐａｙｍｅｎｔ?token=${secret}`,
         ascii: "https://a.io/x",
       },
       {
-        diagnosticFields: ["idn", "path", "encodedPath", "ascii"],
+        diagnosticFields: [
+          "idn",
+          "path",
+          "encodedPath",
+          "normalizedPath",
+          "ascii",
+        ],
       },
     );
 
@@ -416,6 +479,7 @@ describe("redactDiagnosticFields", () => {
     expect(values).not.toHaveProperty("idn");
     expect(values).not.toHaveProperty("path");
     expect(values).not.toHaveProperty("encodedPath");
+    expect(values).not.toHaveProperty("normalizedPath");
     expect(values.ascii).toBe("https://a.io/x");
     expect(JSON.stringify(result.value)).not.toContain(secret);
     expect(result.metadata?.fields).toEqual(
@@ -1492,6 +1556,34 @@ describe("keepFields vs the built-in deny rules", () => {
       expect(JSON.stringify(out)).not.toContain("4111111111111111");
     });
 
+    it("redacts number fields without deleting ordinary card and account fields", () => {
+      const out = structured(
+        JSON.stringify({
+          card: {
+            brand: "visa",
+            balanceCents: 1250,
+            number: "1234567890123456",
+          },
+          account: {
+            status: "active",
+            number: "1234",
+          },
+        }),
+        [],
+      );
+
+      expect(out.card).toMatchObject({ brand: "visa", balanceCents: 1250 });
+      expect(out.account).toMatchObject({ status: "active" });
+      expect((out.card as Record<string, unknown>).number).toMatchObject({
+        $redacted: "[REDACTED]",
+      });
+      expect((out.account as Record<string, unknown>).number).toMatchObject({
+        $redacted: "[REDACTED]",
+      });
+      expect(JSON.stringify(out)).not.toContain("1234567890123456");
+      expect(JSON.stringify(out)).not.toContain("1234");
+    });
+
     it("still redacts a scalar whose own name matches", () => {
       const out = structured(
         JSON.stringify({ cardNumber: "4111111111111111" }),
@@ -1599,6 +1691,23 @@ describe("query parameters answer to the same keep list", () => {
     expect(redactUrl("/api/search?token=1&page=1").value).toBe(
       "/api/search?token=[REDACTED;len=1;charset=num]&page=1",
     );
+  });
+
+  it("redacts short numeric values under credential and verification names", () => {
+    setRedactionKeepFields([]);
+    const result = redactUrl(
+      "/checkout?code=1234&card=4242&account=1234&\u0441ard=5678&page=1",
+    );
+
+    const params = new URLSearchParams(result.value.split("?", 2)[1]);
+    const redacted = "[REDACTED;len=4;charset=num]";
+    expect(result.value).toContain("page=1");
+    for (const key of ["code", "card", "account", "\u0441ard"])
+      expect(params.get(key)).toBe(redacted);
+    expect(result.value).not.toContain("code=1234");
+    expect(result.value).not.toContain("card=4242");
+    expect(result.value).not.toContain("account=1234");
+    expect(result.value).not.toContain("\u0441ard=5678");
   });
 
   it("keeps a declared parameter so the query that broke is readable", () => {

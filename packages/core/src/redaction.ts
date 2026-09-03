@@ -149,7 +149,10 @@ export function credentialPresence(
     const raw = typeof value === "string" ? value : String(value ?? "");
     if (raw.trim() === "") continue;
     const normalized = name.trim().toLowerCase();
-    if (normalized === "authorization" || normalized === "proxy-authorization") {
+    if (
+      normalized === "authorization" ||
+      normalized === "proxy-authorization"
+    ) {
       presence.authorization = true;
     } else if (normalized === "cookie") {
       // Names only. The value after the first `=` is never read.
@@ -417,6 +420,80 @@ const SENSITIVE_COMPACT_SUFFIXES = [
 ];
 
 /**
+ * Common Unicode lookalikes used to disguise field names. This is intentionally
+ * a small security skeleton rather than transliteration: only characters that
+ * can plausibly turn a sensitive ASCII name into a visual confusable are
+ * folded, and the original key is still retained in structured JSON output.
+ */
+const CONFUSABLE_FIELD_CHARACTERS = new Map<string, string>([
+  ["а", "a"],
+  ["в", "b"],
+  ["с", "c"],
+  ["ԁ", "d"],
+  ["е", "e"],
+  ["һ", "h"],
+  ["і", "i"],
+  ["ј", "j"],
+  ["κ", "k"],
+  ["к", "k"],
+  ["ӏ", "l"],
+  ["м", "m"],
+  ["η", "n"],
+  ["ο", "o"],
+  ["о", "o"],
+  ["ρ", "p"],
+  ["р", "p"],
+  ["ԛ", "q"],
+  ["ѕ", "s"],
+  ["τ", "t"],
+  ["т", "t"],
+  ["υ", "y"],
+  ["у", "y"],
+  ["χ", "x"],
+  ["х", "x"],
+  ["γ", "y"],
+  ["ζ", "z"],
+  ["α", "a"],
+  ["β", "b"],
+  ["δ", "d"],
+  ["ε", "e"],
+  ["ι", "i"],
+  ["μ", "m"],
+  ["ν", "v"],
+  ["π", "p"],
+  ["ϲ", "c"],
+  ["ϳ", "j"],
+  ["ı", "i"],
+  ["ſ", "s"],
+]);
+
+/** Short numeric query names that can carry credentials or verification data. */
+const SENSITIVE_SHORT_NUMERIC_QUERY_NAMES = new Set([
+  "account",
+  "accountnumber",
+  "auth",
+  "card",
+  "cardnumber",
+  "code",
+  "cvc",
+  "cvv",
+  "invite",
+  "magic",
+  "mfa",
+  "otp",
+  "pan",
+  "passcode",
+  "pin",
+  "reset",
+  "securitycode",
+  "session",
+  "ssn",
+  "token",
+  "verificationcode",
+  "verify",
+]);
+
+/**
  * `generic: true` marks a pattern that matches by shape alone rather than by a
  * declared secret prefix. Those two are the ones that also match a correlation
  * id — a W3C trace id is exactly 32 hex characters — so a caller that knows the
@@ -568,7 +645,7 @@ function isSensitiveName(name: string | undefined): boolean {
   if (!name) return false;
   const normalized = normalizeFieldName(name);
   const wordSeparated = normalized.replace(/([a-z])([A-Z])/g, "$1_$2");
-  const compact = wordSeparated.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const compact = compactFieldName(name);
   return (
     SENSITIVE_NAME_RE.test(name) ||
     PII_NAME_RE.test(name) ||
@@ -742,8 +819,15 @@ function redactedQueryValue(value: string): string {
  * step, quantity and their kin, and nothing that could be a credential.
  */
 function isHarmlessQueryValue(key: string, value: string): boolean {
-  if (isSensitiveName(key)) return false;
+  if (isSensitiveQueryName(key)) return false;
   return /^-?[0-9]{1,4}$/.test(value);
+}
+
+function isSensitiveQueryName(key: string): boolean {
+  return (
+    isSensitiveName(key) ||
+    SENSITIVE_SHORT_NUMERIC_QUERY_NAMES.has(compactFieldName(key))
+  );
 }
 
 /**
@@ -1223,9 +1307,18 @@ export function redactUrl(
   path = "url",
   options: UrlRedactionOptions = {},
 ): RedactionResult<string> {
-  if (url.trim().startsWith("//")) {
-    const leadingWhitespace = url.match(/^\s*/)?.[0] ?? "";
-    const trimmed = url.trim();
+  const leadingWhitespace = url.match(/^\s*/)?.[0] ?? "";
+  const trimmedUrl = url.slice(leadingWhitespace.length);
+  if (isUrlLikeValue(trimmedUrl) && hasNonAsciiUrlComponents(trimmedUrl)) {
+    return withMetadata(`${leadingWhitespace}${REDACTED_VALUE}`, {
+      path,
+      reason: "non_ascii_url_component",
+      action: "dropped",
+    });
+  }
+
+  if (trimmedUrl.startsWith("//")) {
+    const trimmed = trimmedUrl;
     try {
       const parsed = new URL(`https:${trimmed}`);
       const fields: RedactionField[] = [];
@@ -1272,10 +1365,9 @@ export function redactUrl(
       return redactMalformedAbsoluteUrl(path);
     }
   }
-  const leadingWhitespace = url.match(/^\s*/)?.[0] ?? "";
-  const trimmedUrl = url.slice(leadingWhitespace.length);
   const hasScheme = /^[a-z][a-z\d+.-]*:/i.test(trimmedUrl);
-  if (!hasScheme) return redactRelativeUrl(url, path, options);
+  if (!isUrlLikeValue(trimmedUrl) || !hasScheme)
+    return redactRelativeUrl(url, path, options);
 
   try {
     const parsed = new URL(trimmedUrl);
@@ -1356,16 +1448,53 @@ export function redactUrl(
 const URL_IN_TEXT_RE = /https?:\/\/[^\s"'`<>\\{}()[\]|^]+/gi;
 /** Relative candidates require a boundary and a `name=value` query. */
 const RELATIVE_URL_IN_TEXT_RE =
-  /(^|[\s"'`<([{])((?:\/\/[^\s"'`<>\\{}()[\]|^/?#]+(?:\/[^\s"'`<>\\{}()[\]|^?#]{0,2048})?|(?:\.{1,2}\/|\/)[^\s"'`<>\\{}()[\]|^?#]{0,2048})\?[^\s"'`<>\\{}()[\]|^#]{0,2048}=[^\s"'`<>\\{}()[\]|^]+)/gi;
+  /(^|[\s"'`<([{=:])((?:(?:\/\/[^\s"'`<>\\{}()[\]|^/?#]+(?:\/[^\s"'`<>\\{}()[\]|^?#]{0,2048})?|(?:\.{1,2}\/|\/)[^\s"'`<>\\{}()[\]|^?#]{0,2048}|[A-Za-z0-9][A-Za-z0-9._~-]{0,127}(?:\/[^\s"'`<>\\{}()[\]|^?#]{0,2048})?)\?[^\s"'`<>\\{}()[\]|^#]{0,2048}=[^\s"'`<>\\{}()[\]|^]+|\?[^\s"'`<>\\{}()[\]|^#]{0,2048}=[^\s"'`<>\\{}()[\]|^]+))/gi;
 const DIAGNOSTIC_URL_SCHEME_RE =
   /\b([a-z][a-z\d+.-]*):(?=\/\/|[^\s"'`<>\\{}()[\]|^])/gi;
 const URL_TRAILING_PUNCT_RE = /[.,;:!?]+$/;
 const MAX_RELATIVE_URL_IN_TEXT_MATCHES = 16;
+const URL_SPECIAL_SCHEMES = new Set([
+  ...SENSITIVE_URL_SCHEMES,
+  "mailto:",
+  "tel:",
+  "urn:",
+]);
+
+function isUrlLikeValue(value: string): boolean {
+  const trimmed = value.trim();
+  if (
+    trimmed.startsWith("//") ||
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("./") ||
+    trimmed.startsWith("../")
+  )
+    return true;
+
+  const scheme = /^[a-z][a-z\d+.-]*:/i.exec(trimmed)?.[0]?.toLowerCase();
+  if (!scheme) return false;
+  if (trimmed.slice(scheme.length).startsWith("//")) return true;
+  if (URL_SPECIAL_SCHEMES.has(scheme)) return true;
+
+  // `status: failed` is a label, not a URI. An unknown opaque URI is only
+  // treated as URL-like when its payload has URI punctuation and no whitespace.
+  const payload = trimmed.slice(scheme.length);
+  return !/\s/.test(payload) && /[/?#@%=&.]/.test(payload);
+}
 
 function hasUnsafeDiagnosticUrlScheme(value: string): boolean {
   for (const match of value.matchAll(DIAGNOSTIC_URL_SCHEME_RE)) {
     const scheme = match[1]?.toLowerCase();
-    if (scheme !== "http" && scheme !== "https") return true;
+    if (!scheme || scheme === "http" || scheme === "https") continue;
+
+    const matchEnd = (match.index ?? 0) + match[0].length;
+    const remainder = value.slice(matchEnd);
+    const payload = remainder.match(/^[^\s"'`<>\\{}()[\]|^]+/)?.[0];
+    if (
+      remainder.startsWith("//") ||
+      URL_SPECIAL_SCHEMES.has(`${scheme}:`) ||
+      (payload !== undefined && /[/?#@%=&]/.test(payload))
+    )
+      return true;
   }
   return false;
 }
@@ -1465,10 +1594,13 @@ function hasNonAsciiUrlComponents(url: string): boolean {
   const trimmed = url.trim();
   const hashIndex = trimmed.indexOf("#");
   const beforeHash = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed;
+  const queryIndex = beforeHash.indexOf("?");
+  const beforeQuery =
+    queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash;
   const hierarchicalScheme = /^(?:[a-z][a-z\d+.-]*:)?\/\//i.exec(beforeHash);
 
   if (hierarchicalScheme) {
-    const remainder = beforeHash.slice(hierarchicalScheme[0].length);
+    const remainder = beforeQuery.slice(hierarchicalScheme[0].length);
     const authorityEnd = remainder.search(/[/?]/);
     const authority =
       authorityEnd < 0 ? remainder : remainder.slice(0, authorityEnd);
@@ -1479,7 +1611,7 @@ function hasNonAsciiUrlComponents(url: string): boolean {
     );
   }
 
-  return hasNonAsciiDecodedComponent(beforeHash);
+  return hasNonAsciiDecodedComponent(beforeQuery);
 }
 
 function urlTextCore(value: string): string {
@@ -2173,18 +2305,26 @@ const STRUCTURED_JWT_RE =
   /eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{2,}/;
 const ENUM_LIKE_RE = /^[A-Za-z0-9_-]{1,24}$/;
 
-function compactFieldName(name: string): string {
-  return normalizeFieldName(name)
+function fieldNameSkeleton(name: string): string {
+  const normalized = normalizeFieldName(name)
     .replace(/([a-z])([A-Z])/g, "$1_$2")
-    .toLowerCase()
+    .toLowerCase();
+  let skeleton = "";
+  for (const character of normalized) {
+    skeleton += CONFUSABLE_FIELD_CHARACTERS.get(character) ?? character;
+  }
+  return skeleton.normalize("NFKD").replace(/\p{M}/gu, "");
+}
+
+function compactFieldName(name: string): string {
+  return fieldNameSkeleton(name)
+    .normalize("NFKD")
     .replace(/[^a-z0-9]/g, "");
 }
 
 /** Field name split into words at camelCase/snake/kebab boundaries. */
 function fieldNameWords(name: string): string[] {
-  return normalizeFieldName(name)
-    .replace(/([a-z])([A-Z])/g, "$1_$2")
-    .toLowerCase()
+  return fieldNameSkeleton(name)
     .split(/[^a-z0-9]+/)
     .filter(Boolean);
 }
@@ -2573,8 +2713,7 @@ export function classifyStructuredValue(
 }
 
 type DiagnosticPathPart =
-  | { kind: "key"; value: string }
-  | { kind: "index"; value: number };
+  { kind: "key"; value: string } | { kind: "index"; value: number };
 
 interface DiagnosticPathNode {
   terminal: boolean;
@@ -2785,7 +2924,17 @@ function diagnosticLeafValue(
   path: string,
   fields: RedactionField[],
   denyFields: readonly string[] | undefined,
+  container: StructuredContainerContext,
 ): DiagnosticScalar | undefined {
+  if (isStructuredContainerNumber(value, keyName, container)) {
+    fields.push({
+      path,
+      reason: "sensitive_container_number",
+      action: "redacted",
+    });
+    return undefined;
+  }
+
   if (typeof value === "number" && !Number.isFinite(value)) {
     fields.push({ path, reason: "diagnostic_non_finite", action: "redacted" });
     return undefined;
@@ -2805,6 +2954,11 @@ function diagnosticLeafValue(
 
   let candidate = value;
   if (typeof value === "string") {
+    const rawLooksLikeWholeUrl = isUrlLikeValue(value);
+    const rawHasNonAsciiUrlComponent = rawLooksLikeWholeUrl
+      ? hasNonAsciiUrlComponents(value)
+      : hasNonAsciiDiagnosticUrlInText(value);
+
     let normalized: string;
     try {
       normalized = value.normalize("NFKC");
@@ -2825,18 +2979,11 @@ function diagnosticLeafValue(
       return undefined;
     }
 
-    const urlOptions: UrlRedactionOptions = {
-      ignoreKeepFields: true,
-      allowOnlyHttpSchemes: true,
-      allowRelativeUrlsInText: true,
-    };
-    const looksLikeWholeUrl = /^\s*(?:\/\/|[a-z][a-z\d+.-]*:|\.{0,2}\/)/i.test(
-      normalized,
-    );
-    const hasNonAsciiUrlComponent = looksLikeWholeUrl
-      ? hasNonAsciiUrlComponents(normalized)
-      : hasNonAsciiDiagnosticUrlInText(normalized);
-    if (hasNonAsciiUrlComponent) {
+    const normalizedLooksLikeWholeUrl = isUrlLikeValue(normalized);
+    if (
+      rawHasNonAsciiUrlComponent ||
+      (normalizedLooksLikeWholeUrl && !isAsciiDiagnosticString(value))
+    ) {
       fields.push({
         path,
         reason: "diagnostic_non_ascii_url_component",
@@ -2844,6 +2991,13 @@ function diagnosticLeafValue(
       });
       return undefined;
     }
+
+    const urlOptions: UrlRedactionOptions = {
+      ignoreKeepFields: true,
+      allowOnlyHttpSchemes: true,
+      allowRelativeUrlsInText: true,
+    };
+    const looksLikeWholeUrl = normalizedLooksLikeWholeUrl;
     const urlResult = looksLikeWholeUrl
       ? redactUrl(normalized, path, urlOptions)
       : redactUrlsInText(normalized, path, urlOptions);
@@ -2907,11 +3061,20 @@ function collectDiagnosticFields(
   fields: RedactionField[],
   denyFields: readonly string[] | undefined,
   seen: WeakSet<object>,
+  inheritedContainer: StructuredContainerContext,
 ): unknown {
+  const container = structuredContainerContext(keyName, inheritedContainer);
   const isObject = value !== null && typeof value === "object";
   if (!isObject) {
     if (!node.terminal) return undefined;
-    return diagnosticLeafValue(value, keyName, path, fields, denyFields);
+    return diagnosticLeafValue(
+      value,
+      keyName,
+      path,
+      fields,
+      denyFields,
+      container,
+    );
   }
   if (seen.has(value)) {
     fields.push({ path, reason: "diagnostic_circular", action: "redacted" });
@@ -2970,6 +3133,7 @@ function collectDiagnosticFields(
         fields,
         denyFields,
         seen,
+        container,
       );
       if (childValue === undefined) return;
       if (part.kind === "index") {
@@ -3034,6 +3198,7 @@ export function redactDiagnosticFields(
       fields,
       options.denyFields,
       new WeakSet<object>(),
+      undefined,
     );
   } catch {
     fields.push({
@@ -3197,8 +3362,7 @@ function isRedactedPlaceholder(value: unknown): boolean {
           typeof separatorIndex !== "number" ||
           !Number.isInteger(separatorIndex) ||
           separatorIndex < 0 ||
-          (typeof record.len === "number" &&
-            separatorIndex >= record.len) ||
+          (typeof record.len === "number" && separatorIndex >= record.len) ||
           (separatorChar !== "." &&
             separatorChar !== "," &&
             separatorChar !== " ")
@@ -3210,6 +3374,53 @@ function isRedactedPlaceholder(value: unknown): boolean {
     if (!HASH8_RE.test(entry)) return false;
   }
   return true;
+}
+
+type StructuredContainerContext = "card" | "account" | undefined;
+
+const STRUCTURED_CONTAINER_NUMBER_NAMES = new Set([
+  "accountnumber",
+  "cardnumber",
+  "number",
+  "pan",
+  "primaryaccountnumber",
+]);
+
+function structuredContainerContext(
+  keyName: string | undefined,
+  inherited: StructuredContainerContext,
+): StructuredContainerContext {
+  if (!keyName) return inherited;
+  const compact = compactFieldName(keyName);
+  return compact === "card" || compact === "account" ? compact : inherited;
+}
+
+/**
+ * Protect number-bearing leaves inside the two intentionally traversable
+ * containers without closing their ordinary business fields. A `number` field
+ * in either container is a credential by schema, while a numeric `id` is only
+ * denied when it has the length of an account or card number.
+ */
+function isStructuredContainerNumber(
+  value: unknown,
+  keyName: string | undefined,
+  container: StructuredContainerContext,
+): boolean {
+  if (!container || keyName === undefined) return false;
+  const compact = compactFieldName(keyName);
+  if (STRUCTURED_CONTAINER_NUMBER_NAMES.has(compact)) return true;
+
+  if (compact !== container && compact !== "id") return false;
+  const text =
+    typeof value === "number" && Number.isFinite(value)
+      ? String(Math.abs(value))
+      : typeof value === "string"
+        ? value.replace(/[\s-]/g, "")
+        : "";
+  if (!/^\d+$/.test(text)) return false;
+  return container === "card"
+    ? text.length >= 13 && text.length <= 19
+    : text.length >= 6 && text.length <= 20;
 }
 
 function redactStructuredStringValue(
@@ -3224,9 +3435,7 @@ function redactStructuredStringValue(
     allowOnlyHttpSchemes: true,
     allowRelativeUrlsInText: true,
   };
-  const looksLikeWholeUrl = /^\s*(?:\/\/|[a-z][a-z\d+.-]*:|\.{0,2}\/)/i.test(
-    value,
-  );
+  const looksLikeWholeUrl = isUrlLikeValue(value);
   const urlResult = looksLikeWholeUrl
     ? redactUrl(value, path, urlOptions)
     : redactUrlsInText(value, path, urlOptions);
@@ -3262,10 +3471,20 @@ function redactStructuredJsonValue(
   policy: StructuredFieldPolicy,
   fields: RedactionField[],
   keyName?: string,
+  inheritedContainer?: StructuredContainerContext,
 ): unknown {
   // Already redacted by an earlier pass. Re-wrapping it would replace the
   // original value's shape facts with the placeholder's own.
   if (isRedactedPlaceholder(value)) return value;
+  const container = structuredContainerContext(keyName, inheritedContainer);
+  if (isStructuredContainerNumber(value, keyName, container)) {
+    fields.push({
+      path,
+      reason: "sensitive_container_number",
+      action: "redacted",
+    });
+    return redactedShapePlaceholder(value);
+  }
   // A deny-listed field name redacts its entire subtree, except for the exact
   // known object container names handled by isOpenableHeuristicName.
   const isContainer =
@@ -3291,6 +3510,7 @@ function redactStructuredJsonValue(
         policy,
         fields,
         keyName,
+        container,
       ),
     );
   }
@@ -3324,6 +3544,7 @@ function redactStructuredJsonValue(
           policy,
           fields,
           normalizeFieldName(key),
+          container,
         ),
         writable: true,
       });
