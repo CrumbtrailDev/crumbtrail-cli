@@ -147,6 +147,49 @@ describe("redactDiagnosticFields", () => {
     );
   });
 
+  it("redacts numeric verification fields without closing containers or operational codes", () => {
+    const result = redactDiagnosticFields(
+      {
+        code: 1234,
+        invite: "5678",
+        magic: 901234,
+        reset: "345678",
+        verify: 789012,
+        checkout: { code: 2468, state: "pending" },
+        operation: { code: "E_TIMEOUT" },
+        statusCode: 503,
+        operationCode: 200,
+      },
+      {
+        diagnosticFields: [
+          "code",
+          "invite",
+          "magic",
+          "reset",
+          "verify",
+          "checkout.code",
+          "checkout.state",
+          "operation.code",
+          "statusCode",
+          "operationCode",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({
+      checkout: { state: "pending" },
+      operation: { code: "E_TIMEOUT" },
+      operationCode: 200,
+      statusCode: 503,
+    });
+    expect(JSON.stringify(result.value)).not.toContain("1234");
+    expect(JSON.stringify(result.value)).not.toContain("5678");
+    expect(JSON.stringify(result.value)).not.toContain("901234");
+    expect(JSON.stringify(result.value)).not.toContain("345678");
+    expect(JSON.stringify(result.value)).not.toContain("789012");
+    expect(JSON.stringify(result.value)).not.toContain("2468");
+  });
+
   it("drops oversized and non-finite values, enforces the entry bound, and honors denyFields", () => {
     const value: Record<string, unknown> = {
       short: "support detail",
@@ -210,14 +253,17 @@ describe("redactDiagnosticFields", () => {
     expect(JSON.stringify(result.value)).not.toContain("must not retain");
   });
 
-  it("closes sensitive compound containers while allowing exact object names", () => {
+  it("opens ordinary card and account containers but closes value containers", () => {
     const result = redactDiagnosticFields(
       {
         cardNumber: { label: "must not retain" },
         creditCardNumber: { label: "must not retain" },
         accountNumber: { status: "must not retain" },
         cardToken: { label: "must not retain" },
-        accountDetails: { status: "must not retain" },
+        giftCard: { label: "SAFE_GIFT_CARD", number: "4111111111111111" },
+        customerAccount: { status: "SAFE_CUSTOMER_ACCOUNT", number: "1234" },
+        accountingPeriod: { status: "SAFE_ACCOUNTING_PERIOD" },
+        accountDetails: { status: "SAFE_ACCOUNT_DETAILS" },
         card: { label: "SAFE_CARD" },
         account: { status: "SAFE_ACCOUNT" },
       },
@@ -227,6 +273,11 @@ describe("redactDiagnosticFields", () => {
           "creditCardNumber.label",
           "accountNumber.status",
           "cardToken.label",
+          "giftCard.label",
+          "giftCard.number",
+          "customerAccount.status",
+          "customerAccount.number",
+          "accountingPeriod.status",
           "accountDetails.status",
           "card.label",
           "account.status",
@@ -235,10 +286,16 @@ describe("redactDiagnosticFields", () => {
     );
 
     expect(result.value).toEqual({
+      accountingPeriod: { status: "SAFE_ACCOUNTING_PERIOD" },
       account: { status: "SAFE_ACCOUNT" },
+      accountDetails: { status: "SAFE_ACCOUNT_DETAILS" },
       card: { label: "SAFE_CARD" },
+      customerAccount: { status: "SAFE_CUSTOMER_ACCOUNT" },
+      giftCard: { label: "SAFE_GIFT_CARD" },
     });
     expect(JSON.stringify(result.value)).not.toContain("must not retain");
+    expect(JSON.stringify(result.value)).not.toContain("4111111111111111");
+    expect(JSON.stringify(result.value)).not.toContain('"number":"1234"');
   });
 
   it("ignores process-wide keepFields while redacting diagnostic URL queries", () => {
@@ -268,6 +325,7 @@ describe("redactDiagnosticFields", () => {
   it("redacts unsafe whole and embedded URL schemes in diagnostic strings", () => {
     const secrets = [
       "ftp-pass",
+      "opaque-secret",
       "ssh-pass",
       "custom-pass",
       "raw-data-secret",
@@ -278,7 +336,9 @@ describe("redactDiagnosticFields", () => {
       {
         ftp: "ftp://alice:ftp-pass@files.example/private",
         opaque: "ftp:opaque-secret/file",
+        opaqueBare: "ftp:opaque-secret",
         ssh: "ssh://alice:ssh-pass@host.example/private",
+        sshBare: "ssh:opaque-secret",
         custom: "custom://alice:custom-pass@host.example/private",
         data: "data:text/plain,raw-data-secret",
         javascript: 'javascript:alert("js-secret")',
@@ -289,7 +349,9 @@ describe("redactDiagnosticFields", () => {
         diagnosticFields: [
           "ftp",
           "opaque",
+          "opaqueBare",
           "ssh",
+          "sshBare",
           "custom",
           "data",
           "javascript",
@@ -401,15 +463,15 @@ describe("redactDiagnosticFields", () => {
   it("keeps ordinary colon labels instead of treating them as URI schemes", () => {
     const result = redactDiagnosticFields(
       {
-        message: "Error: failed",
-        status: "Status: pending",
+        message: "Error: failed. Version:1.2.3.",
+        status: "Status: pending. Build:2.4.0.",
       },
       { diagnosticFields: ["message", "status"] },
     );
 
     expect(result.value).toEqual({
-      message: "Error: failed",
-      status: "Status: pending",
+      message: "Error: failed. Version:1.2.3.",
+      status: "Status: pending. Build:2.4.0.",
     });
   });
 
@@ -995,14 +1057,20 @@ describe("redactNetworkTextBody structured mode", () => {
     expect(parsed.qty).toBe(1);
   });
 
-  it("does not open sensitive compound card and account containers", () => {
+  it("opens ordinary card and account containers but closes value containers", () => {
     const result = redactNetworkTextBody(
       JSON.stringify({
         cardNumber: { label: "must not retain" },
         creditCardNumber: { label: "must not retain" },
         accountNumber: { status: "must not retain" },
         cardToken: { label: "must not retain" },
-        accountDetails: { status: "must not retain" },
+        giftCard: { label: "SAFE_GIFT_CARD", number: "4111111111111111" },
+        customerAccount: {
+          status: "SAFE_CUSTOMER_ACCOUNT",
+          number: "1234",
+        },
+        accountingPeriod: { status: "SAFE_ACCOUNTING_PERIOD" },
+        accountDetails: { status: "SAFE_ACCOUNT_DETAILS" },
         card: { label: "SAFE_CARD" },
         account: { status: "SAFE_ACCOUNT" },
       }),
@@ -1015,13 +1083,26 @@ describe("redactNetworkTextBody structured mode", () => {
       "creditCardNumber",
       "accountNumber",
       "cardToken",
-      "accountDetails",
     ]) {
       expect(parsed[key]).toMatchObject({ $redacted: "[REDACTED]" });
     }
+    expect(parsed.accountDetails).toEqual({ status: "SAFE_ACCOUNT_DETAILS" });
+    expect(parsed.accountingPeriod).toEqual({
+      status: "SAFE_ACCOUNTING_PERIOD",
+    });
     expect(parsed.card).toEqual({ label: "SAFE_CARD" });
     expect(parsed.account).toEqual({ status: "SAFE_ACCOUNT" });
+    expect(parsed.customerAccount).toMatchObject({
+      status: "SAFE_CUSTOMER_ACCOUNT",
+      number: { $redacted: "[REDACTED]" },
+    });
+    expect(parsed.giftCard).toMatchObject({
+      label: "SAFE_GIFT_CARD",
+      number: { $redacted: "[REDACTED]" },
+    });
     expect(result.body).not.toContain("must not retain");
+    expect(result.body).not.toContain("4111111111111111");
+    expect(result.body).not.toContain('"number":"1234"');
   });
 
   it("normalizes compatibility keys without rewriting safe output keys", () => {

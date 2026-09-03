@@ -861,9 +861,25 @@ describe("redactUrlsInText — URL query secrets inside free text", () => {
   });
 
   it("preserves ordinary colon labels when redacting URL-like text", () => {
-    const result = redactUrlsInText("Error:failed. Status: pending.");
-    expect(result.value).toBe("Error:failed. Status: pending.");
+    const value = "Error:failed. Status: pending. Version:1.2.3. Build:2.4.0.";
+    const result = redactUrlsInText(value);
+    expect(result.value).toBe(value);
     expect(result.metadata).toBeUndefined();
+  });
+
+  it("rejects opaque ftp and ssh schemes without requiring URL punctuation", () => {
+    for (const value of ["ftp:private-file", "ssh:private-host"]) {
+      const result = redactUrlsInText(value, "message", {
+        allowOnlyHttpSchemes: true,
+      });
+      expect(result.value).toBe(REDACTED_VALUE);
+      expect(result.metadata?.fields).toContainEqual(
+        expect.objectContaining({
+          reason: "unsafe_url_scheme",
+          action: "redacted",
+        }),
+      );
+    }
   });
 
   it("leaves free text without a URL untouched (no metadata)", () => {

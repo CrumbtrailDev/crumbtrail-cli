@@ -831,6 +831,30 @@ function isSensitiveQueryName(key: string): boolean {
 }
 
 /**
+ * Diagnostic verification fields are allowed to retain operational strings,
+ * but their numeric forms are credentials just like their query equivalents.
+ * Match exact compact names so `statusCode` and other operational fields do
+ * not inherit the rule merely because they contain `code`.
+ */
+function isSensitiveShortNumericDiagnosticValue(
+  value: unknown,
+  keyName: string | undefined,
+): boolean {
+  if (
+    keyName === undefined ||
+    !SENSITIVE_SHORT_NUMERIC_QUERY_NAMES.has(compactFieldName(keyName))
+  )
+    return false;
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  return (
+    typeof value === "string" &&
+    /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(value.trim())
+  );
+}
+
+/**
  * The only query parameter names campaign capture may read. First-party UTM
  * labels, nothing else.
  *
@@ -1455,10 +1479,19 @@ const URL_TRAILING_PUNCT_RE = /[.,;:!?]+$/;
 const MAX_RELATIVE_URL_IN_TEXT_MATCHES = 16;
 const URL_SPECIAL_SCHEMES = new Set([
   ...SENSITIVE_URL_SCHEMES,
+  // These standard opaque schemes can carry credentials or private locations,
+  // even when their payload has no URL punctuation. Keep them in the same
+  // set used by whole-value and embedded-text detection.
+  "ftp:",
+  "ssh:",
   "mailto:",
   "tel:",
   "urn:",
 ]);
+
+function hasOpaqueUrlPayloadPunctuation(payload: string): boolean {
+  return !/\s/.test(payload) && /[/?#@%=&]/.test(payload);
+}
 
 function isUrlLikeValue(value: string): boolean {
   const trimmed = value.trim();
@@ -1478,7 +1511,7 @@ function isUrlLikeValue(value: string): boolean {
   // `status: failed` is a label, not a URI. An unknown opaque URI is only
   // treated as URL-like when its payload has URI punctuation and no whitespace.
   const payload = trimmed.slice(scheme.length);
-  return !/\s/.test(payload) && /[/?#@%=&.]/.test(payload);
+  return hasOpaqueUrlPayloadPunctuation(payload);
 }
 
 function hasUnsafeDiagnosticUrlScheme(value: string): boolean {
@@ -1492,7 +1525,7 @@ function hasUnsafeDiagnosticUrlScheme(value: string): boolean {
     if (
       remainder.startsWith("//") ||
       URL_SPECIAL_SCHEMES.has(`${scheme}:`) ||
-      (payload !== undefined && /[/?#@%=&]/.test(payload))
+      (payload !== undefined && hasOpaqueUrlPayloadPunctuation(payload))
     )
       return true;
   }
@@ -2352,24 +2385,67 @@ function isApplicationDeniedName(
 /**
  * Built-in name tokens that name a business OBJECT rather than a secret.
  *
- * The rest of `STRUCTURED_DENY_NAME_TOKENS` name the sensitive thing itself: everything under a key
- * called `auth`, `password`, `secret`, `cvv` or `ssn` is that secret, so dropping the whole subtree
- * loses nothing. These two exact names are the narrow object-container exception. Compound names
- * such as `creditCardNumber` and `accountNumber` remain closed because they name sensitive values.
- *
- * Kept deliberately short. Every addition trades a real class of evidence for a name-shaped guess.
+ * `card` and `account` also occur in ordinary compound containers such as
+ * `giftCard`, `customerAccount`, and `accountingPeriod`. Those containers are
+ * useful diagnostic structure, so the object token alone must not close them.
+ * Names that add a value or credential token remain closed.
  */
-const STRUCTURED_OPENABLE_CONTAINER_NAMES = new Set(["card", "account"]);
+const STRUCTURED_OPENABLE_CONTAINER_TOKENS = new Set(["card", "account"]);
+const STRUCTURED_CLOSED_CONTAINER_SUFFIXES = [
+  "number",
+  "num",
+  "token",
+  "password",
+  "passcode",
+  "secret",
+  "credential",
+  "credentials",
+  "auth",
+  "authorization",
+  "key",
+  "pan",
+  "cvv",
+  "cvc",
+  "pin",
+  "code",
+];
 
 /**
- * May a CONTAINER under this name be walked into rather than dropped whole?
+ * May a container under this name be walked into rather than dropped whole?
  *
- * True only for the exact names of the two known object containers. Compound names stay closed even
- * when they contain one of those words, because `cardNumber` and `accountNumber` name secrets.
+ * A compound name is open only when the card/account token is the sole
+ * sensitive signal. This preserves ordinary business containers while keeping
+ * explicit value names such as `cardNumber`, `cardToken`, and `accountNumber`
+ * closed. The caller still applies application denyFields absolutely.
  */
 function isOpenableHeuristicName(name: string | undefined): boolean {
   if (!name) return false;
-  return STRUCTURED_OPENABLE_CONTAINER_NAMES.has(compactFieldName(name));
+  const compact = compactFieldName(name);
+  const containerToken = [...STRUCTURED_OPENABLE_CONTAINER_TOKENS].find(
+    (token) => compact.includes(token),
+  );
+  if (!containerToken) return false;
+  if (compact === containerToken) return true;
+
+  const sensitiveSuffix = STRUCTURED_CLOSED_CONTAINER_SUFFIXES.some((suffix) =>
+    compact.includes(`${containerToken}${suffix}`),
+  );
+  if (sensitiveSuffix) return false;
+
+  // A second built-in deny token means this is more than an object token. For
+  // example, `accountPassword` and `cardCredentials` must not be opened.
+  if (
+    STRUCTURED_DENY_NAME_TOKENS.some(
+      (token) =>
+        !STRUCTURED_OPENABLE_CONTAINER_TOKENS.has(token) &&
+        compact.includes(token),
+    )
+  )
+    return false;
+  if (fieldNameWords(name).some((word) => STRUCTURED_DENY_WORD_RE.test(word)))
+    return false;
+
+  return true;
 }
 
 function isStructuredDenyName(
@@ -2878,8 +2954,8 @@ function compileDiagnosticFieldPaths(
 
 /**
  * Keep diagnostic traversal aligned with structured redaction. Sensitive
- * containers are closed, while the intentional `card` and `account` object
- * exceptions remain traversable so their individual leaves can be classified.
+ * containers are closed, while ordinary card and account object containers
+ * remain traversable so their individual leaves can be classified.
  */
 function isDiagnosticPathKeyAllowed(
   key: string,
@@ -2930,6 +3006,15 @@ function diagnosticLeafValue(
     fields.push({
       path,
       reason: "sensitive_container_number",
+      action: "redacted",
+    });
+    return undefined;
+  }
+
+  if (isSensitiveShortNumericDiagnosticValue(value, keyName)) {
+    fields.push({
+      path,
+      reason: "sensitive_short_numeric_field",
       action: "redacted",
     });
     return undefined;
@@ -3392,7 +3477,11 @@ function structuredContainerContext(
 ): StructuredContainerContext {
   if (!keyName) return inherited;
   const compact = compactFieldName(keyName);
-  return compact === "card" || compact === "account" ? compact : inherited;
+  if (compact === "card" || compact === "account") return compact;
+  if (!isOpenableHeuristicName(keyName)) return inherited;
+  if (compact.includes("card")) return "card";
+  if (compact.includes("account")) return "account";
+  return inherited;
 }
 
 /**
