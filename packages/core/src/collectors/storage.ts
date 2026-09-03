@@ -184,6 +184,183 @@ function previousStorageValue(storage: Storage, key: string): string | null | un
   }
 }
 
+type StorageFailureType = "idb" | "cache";
+
+function isAbortedStorageError(error: unknown): boolean {
+  return boundedStorageErrorName(error) === "AbortError";
+}
+
+function reportAsyncStorageFailure(
+  bus: EventBus,
+  config: CrumbtrailConfig,
+  type: StorageFailureType,
+  op: string,
+  error: unknown,
+): void {
+  if (!config.autoFlagOnStorageFailure || isAbortedStorageError(error)) return;
+  try {
+    bus.emit({
+      t: now(),
+      k: "stor",
+      d: {
+        type,
+        op,
+        outcome: "failure",
+        errorName: boundedStorageErrorName(error),
+      },
+    });
+  } catch {
+    // Observing a failure must never alter the host API's failure path.
+  }
+}
+
+function observeRejectedPromise(
+  value: unknown,
+  report: (error: unknown) => void,
+): void {
+  if (!value || (typeof value !== "object" && typeof value !== "function"))
+    return;
+  try {
+    const then = (value as Promise<unknown>).then;
+    if (typeof then === "function") {
+      // Keep the exact promise the host API returned. Returning a chained promise
+      // changes identity and can change an application's cancellation handling.
+      then.call(value, undefined, (error: unknown) => {
+        report(error);
+      });
+    }
+  } catch {
+    // An exotic thenable is not worth changing the host operation for.
+  }
+}
+
+function patchFailureMethod(
+  target: Record<string, unknown>,
+  method: string,
+  type: StorageFailureType,
+  bus: EventBus,
+  config: CrumbtrailConfig,
+  onResult?: (value: unknown) => void,
+  onFulfilled?: (value: unknown) => void,
+): () => void {
+  const originalDescriptor = Object.getOwnPropertyDescriptor(target, method);
+  const original = target[method];
+  if (typeof original !== "function") return () => {};
+
+  try {
+    Object.defineProperty(target, method, {
+      configurable: true,
+      writable: true,
+      enumerable: originalDescriptor?.enumerable ?? false,
+      value: function patchedStorageFailureMethod(this: unknown, ...args: unknown[]) {
+        try {
+          const result = original.apply(this, args);
+          observeRejectedPromise(result, (error) =>
+            reportAsyncStorageFailure(bus, config, type, method, error),
+          );
+          if (onResult) {
+            try {
+              onResult(result);
+            } catch {
+              // Storage instrumentation is observational only.
+            }
+          }
+          if (onFulfilled) {
+            try {
+              (result as Promise<unknown>).then(
+                (value) => {
+                  try {
+                    onFulfilled(value);
+                  } catch {
+                    // Cache instrumentation is observational only.
+                  }
+                },
+                () => {},
+              );
+            } catch {
+              // Keep the original promise untouched.
+            }
+          }
+          return result;
+        } catch (error) {
+          reportAsyncStorageFailure(bus, config, type, method, error);
+          throw error;
+        }
+      },
+    });
+  } catch {
+    return () => {};
+  }
+
+  return () => {
+    try {
+      if (originalDescriptor) Object.defineProperty(target, method, originalDescriptor);
+      else delete target[method];
+    } catch {
+      // A host can freeze the API after installation.
+    }
+  };
+}
+
+function installIndexedDbFailureCapture(
+  bus: EventBus,
+  config: CrumbtrailConfig,
+): () => void {
+  const factory = typeof indexedDB === "undefined" ? undefined : indexedDB;
+  if (!factory) return () => {};
+  const restores = ["open", "deleteDatabase"].map((method) =>
+    patchFailureMethod(factory as unknown as Record<string, unknown>, method, "idb", bus, config, (request) => {
+      if (!request || typeof (request as IDBRequest).addEventListener !== "function") return;
+      let reported = false;
+      try {
+        (request as IDBRequest).addEventListener("error", () => {
+          if (reported) return;
+          reported = true;
+          let error: unknown;
+          try {
+            error = (request as IDBRequest).error;
+          } catch {
+            error = undefined;
+          }
+          reportAsyncStorageFailure(bus, config, "idb", method, error);
+        });
+      } catch {
+        // The request still belongs to the application if observation is unavailable.
+      }
+    }),
+  );
+  return () => restores.forEach((restore) => restore());
+}
+
+function installCacheFailureCapture(
+  bus: EventBus,
+  config: CrumbtrailConfig,
+): () => void {
+  const cacheStorage = typeof caches === "undefined" ? undefined : caches;
+  if (!cacheStorage) return () => {};
+  const restores: Array<() => void> = [];
+  const patchCache = (cache: unknown) => {
+    if (!cache || typeof cache !== "object") return;
+    for (const method of ["match", "matchAll", "add", "addAll", "put", "delete", "keys"])
+      restores.push(
+        patchFailureMethod(cache as Record<string, unknown>, method, "cache", bus, config),
+      );
+  };
+  for (const method of ["open", "delete", "has", "match", "keys"])
+    restores.push(
+      patchFailureMethod(
+        cacheStorage as unknown as Record<string, unknown>,
+        method,
+        "cache",
+        bus,
+        config,
+        undefined,
+        method === "open" ? patchCache : undefined,
+      ),
+    );
+  return () => restores.forEach((restore) => restore());
+}
+
 export function storageCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
@@ -617,6 +794,13 @@ export function storageCollector(
     makeClear("session", origSessionClear),
   );
 
+  const indexedDbFailureCleanup = config.autoFlagOnStorageFailure
+    ? installIndexedDbFailureCapture(bus, config)
+    : () => {};
+  const cacheFailureCleanup = config.autoFlagOnStorageFailure
+    ? installCacheFailureCapture(bus, config)
+    : () => {};
+
   // --- Cross-tab storage events ---
   const storageHandler = (event: StorageEvent) => {
     if (event.key && excludeKeys.has(event.key)) return;
@@ -741,6 +925,8 @@ export function storageCollector(
         restoreStorageMethod(sessionStorage, "clear", origSessionClear),
       ),
       step(() => window.removeEventListener("storage", storageHandler)),
+      step(indexedDbFailureCleanup),
+      step(cacheFailureCleanup),
     ];
 
     // Reported, not swallowed: the caller's teardown handler is what stops a half-restored

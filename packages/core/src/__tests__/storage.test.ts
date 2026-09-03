@@ -507,6 +507,138 @@ describe("storageCollector", () => {
     cleanup();
   });
 
+  it("records one IndexedDB request failure without changing the request or its listeners", () => {
+    const failure = new DOMException("database secret", "InvalidStateError");
+    const request = new EventTarget() as IDBRequest;
+    Object.defineProperty(request, "error", { value: failure });
+    const factory = {
+      open: vi.fn(() => request),
+      deleteDatabase: vi.fn(() => request),
+    };
+    vi.stubGlobal("indexedDB", factory);
+    const cleanup = storageCollector(bus, makeConfig({ autoFlagOnStorageFailure: true }));
+    const returned = factory.open("customer-private-db");
+    const appListener = vi.fn();
+    returned.addEventListener("error", appListener);
+
+    returned.dispatchEvent(new Event("error"));
+    returned.dispatchEvent(new Event("error"));
+    bus.flush();
+
+    expect(returned).toBe(request);
+    expect(appListener).toHaveBeenCalledTimes(2);
+    const failures = events.filter((event) => event.k === "stor" && event.d.type === "idb");
+    expect(failures).toHaveLength(1);
+    expect(failures[0].d).toMatchObject({
+      op: "open",
+      outcome: "failure",
+      errorName: "InvalidStateError",
+    });
+    expect(JSON.stringify(failures)).not.toContain("customer-private-db");
+    expect(JSON.stringify(failures)).not.toContain("database secret");
+
+    cleanup();
+  });
+
+  it("records IndexedDB synchronous throws and ignores aborted requests", () => {
+    const syncFailure = new DOMException("private database", "SecurityError");
+    const abortedRequest = new EventTarget() as IDBRequest;
+    Object.defineProperty(abortedRequest, "error", {
+      value: new DOMException("cancelled", "AbortError"),
+    });
+    const factory = {
+      open: vi
+        .fn()
+        .mockImplementationOnce(() => {
+          throw syncFailure;
+        })
+        .mockReturnValue(abortedRequest),
+      deleteDatabase: vi.fn(),
+    };
+    vi.stubGlobal("indexedDB", factory);
+    const cleanup = storageCollector(bus, makeConfig({ autoFlagOnStorageFailure: true }));
+
+    expect(() => factory.open("private-db")).toThrow(syncFailure);
+    factory.open("private-db").dispatchEvent(new Event("error"));
+    bus.flush();
+
+    expect(events.filter((event) => event.k === "stor")).toEqual([
+      expect.objectContaining({
+        d: expect.objectContaining({
+          type: "idb",
+          op: "open",
+          errorName: "SecurityError",
+        }),
+      }),
+    ]);
+    cleanup();
+  });
+
+  it("records Cache API promise failures without changing promise identity or payload privacy", async () => {
+    const failure = new DOMException("request body secret", "QuotaExceededError");
+    const cache = {
+      put: vi.fn(() => Promise.reject(failure)),
+    };
+    const openResult = Promise.resolve(cache);
+    const cacheStorage = {
+      open: vi.fn(() => openResult),
+      delete: vi.fn(),
+      has: vi.fn(),
+      match: vi.fn(),
+      keys: vi.fn(),
+    };
+    vi.stubGlobal("caches", cacheStorage);
+    const cleanup = storageCollector(bus, makeConfig({ autoFlagOnStorageFailure: true }));
+
+    const returnedOpen = cacheStorage.open("private-cache");
+    expect(returnedOpen).toBe(openResult);
+    const returnedCache = await returnedOpen;
+    const returnedPut = returnedCache.put(
+      new Request("https://example.test/private"),
+      new Response("response secret"),
+    );
+    await expect(returnedPut).rejects.toBe(failure);
+    await Promise.resolve();
+    bus.flush();
+
+    const failures = events.filter((event) => event.k === "stor" && event.d.type === "cache");
+    expect(failures).toHaveLength(1);
+    expect(failures[0].d).toMatchObject({
+      op: "put",
+      outcome: "failure",
+      errorName: "QuotaExceededError",
+    });
+    expect(JSON.stringify(failures)).not.toContain("private-cache");
+    expect(JSON.stringify(failures)).not.toContain("response secret");
+    cleanup();
+  });
+
+  it("does not emit IndexedDB or Cache API failures while the trigger is disabled", async () => {
+    const request = new EventTarget() as IDBRequest;
+    Object.defineProperty(request, "error", {
+      value: new DOMException("private", "UnknownError"),
+    });
+    const factory = { open: vi.fn(() => request), deleteDatabase: vi.fn() };
+    const cacheStorage = {
+      open: vi.fn(() => Promise.reject(new Error("private cache failure"))),
+      delete: vi.fn(),
+      has: vi.fn(),
+      match: vi.fn(),
+      keys: vi.fn(),
+    };
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("caches", cacheStorage);
+    const cleanup = storageCollector(bus, makeConfig({ autoFlagOnStorageFailure: false }));
+
+    factory.open("private").dispatchEvent(new Event("error"));
+    await expect(cacheStorage.open("private")).rejects.toThrow("private cache failure");
+    await Promise.resolve();
+    bus.flush();
+
+    expect(events.filter((event) => event.k === "stor")).toHaveLength(0);
+    cleanup();
+  });
+
   it("cleanup restores original Storage methods", () => {
     const cleanup = storageCollector(
       bus,
