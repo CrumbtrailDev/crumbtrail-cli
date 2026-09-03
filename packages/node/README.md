@@ -49,10 +49,12 @@ The SDK evaluates the fixed operator and emits `app.assertion` only for a
 bounded primitive fact. Objects, prose, emails, tokens, response bodies, and
 redaction markers are rejected. At most 100 valid assertions are emitted per
 session, and delivery returns whether the event reached the capture endpoint.
-The process retains accounting for at most 1,000 distinct session IDs. Once
-that bounded admission is full, new IDs are rejected with
-`session_tracking_limit_reached` so an existing session can never regain
-assertion capacity. `autoCapture().stop()` releases its process-owned session.
+The process retains accounting for at most 1,000 active session IDs. Once that
+bounded admission is full, new IDs are rejected with
+`session_tracking_limit_reached`. Call `endApplicationAssertionSession()` when
+an explicit or manually managed session ends. It releases the entry so another
+session can be admitted, and `autoCapture().stop()` releases its process-owned
+session automatically.
 
 ## Fresh-install validation
 

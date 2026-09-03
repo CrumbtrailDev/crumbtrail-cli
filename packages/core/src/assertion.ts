@@ -1,3 +1,4 @@
+import { classifyStructuredValue } from "./redaction";
 import type { BugEvent } from "./types";
 
 /** One stable event kind for an application's own bounded correctness claim. */
@@ -51,6 +52,7 @@ export interface ApplicationAssertionOptions {
 export type SupportAssertionOptions = ApplicationAssertionOptions;
 
 export type ApplicationAssertionRejection =
+  | "invalid_options"
   | "invalid_name"
   | "invalid_operator"
   | "invalid_expected"
@@ -59,6 +61,7 @@ export type ApplicationAssertionRejection =
   | "operator_requires_numbers"
   | "correlation_invalid"
   | "invalid_timestamp"
+  | "capture_not_admitted"
   | "session_cap_reached"
   | "session_tracking_limit_reached";
 
@@ -88,16 +91,75 @@ export interface ApplicationAssertionEventData {
 
 type ApplicationAssertionDataRejection = Exclude<
   ApplicationAssertionRejection,
-  "invalid_timestamp" | "session_cap_reached" | "session_tracking_limit_reached"
+  | "invalid_timestamp"
+  | "capture_not_admitted"
+  | "session_cap_reached"
+  | "session_tracking_limit_reached"
 >;
 
 const NAME_RE = /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/;
 const SAFE_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$/;
 const CORRELATION_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 const SECRET_PREFIX_RE =
   /^(?:sk|pk)_(?:live|test)_|^(?:ghp|gho|ghu|ghs|ghr)_|^github_pat_|^xox[abprs]-|^bearer[: _-]/i;
+
+type AssertionSnapshot = {
+  name: unknown;
+  operator: unknown;
+  expected: unknown;
+  actual: unknown;
+  requestId?: unknown;
+  traceId?: unknown;
+  sessionId?: unknown;
+};
+
+type SnapshotResult =
+  | { accepted: true; options: ApplicationAssertionOptions }
+  | { accepted: false; rejection: "invalid_options" };
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object")
+    return false;
+  try {
+    if (Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
+    return false;
+  }
+}
+
+function readOwn(record: Record<string, unknown>, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(record, key)
+    ? record[key]
+    : undefined;
+}
+
+/** Read only assertion fields once, without invoking unknown keys or spreading the caller. */
+function snapshotApplicationAssertionOptions(input: unknown): SnapshotResult {
+  if (!isPlainRecord(input))
+    return { accepted: false, rejection: "invalid_options" };
+  try {
+    const snapshot: AssertionSnapshot = {
+      name: readOwn(input, "name"),
+      operator: readOwn(input, "operator"),
+      expected: readOwn(input, "expected"),
+      actual: readOwn(input, "actual"),
+    };
+    const requestId = readOwn(input, "requestId");
+    const traceId = readOwn(input, "traceId");
+    const sessionId = readOwn(input, "sessionId");
+    if (requestId !== undefined) snapshot.requestId = requestId;
+    if (traceId !== undefined) snapshot.traceId = traceId;
+    if (sessionId !== undefined) snapshot.sessionId = sessionId;
+    return {
+      accepted: true,
+      options: snapshot as ApplicationAssertionOptions,
+    };
+  } catch {
+    return { accepted: false, rejection: "invalid_options" };
+  }
+}
 
 function isSafeName(value: unknown): value is string {
   return (
@@ -125,9 +187,18 @@ export function isSafeApplicationAssertionValue(
     !SAFE_VALUE_RE.test(value)
   )
     return false;
-  if (EMAIL_RE.test(value) || JWT_RE.test(value)) return false;
   if (SECRET_PREFIX_RE.test(value)) return false;
-  return true;
+  return classifyStructuredValue(value).action === "keep";
+}
+
+function isSafeApplicationAssertionValueForName(
+  value: unknown,
+  name: string,
+): value is ApplicationAssertionValue {
+  return (
+    isSafeApplicationAssertionValue(value) &&
+    classifyStructuredValue(value, name).action === "keep"
+  );
 }
 
 function assertionValueType(
@@ -187,18 +258,20 @@ export function evaluateApplicationAssertion(
  * Validate and evaluate an assertion without emitting or retaining anything.
  * The returned event data is the exact bounded payload used by the SDK.
  */
-export function buildApplicationAssertionData(
+function buildApplicationAssertionDataFromSnapshot(
   options: ApplicationAssertionOptions,
 ):
   | { accepted: true; passed: boolean; data: ApplicationAssertionEventData }
   | { accepted: false; rejection: ApplicationAssertionDataRejection } {
   if (!isSafeName(options.name))
     return { accepted: false, rejection: "invalid_name" };
+  if (classifyStructuredValue(true, options.name).action !== "keep")
+    return { accepted: false, rejection: "invalid_name" };
   if (!isApplicationAssertionOperator(options.operator))
     return { accepted: false, rejection: "invalid_operator" };
-  if (!isSafeApplicationAssertionValue(options.expected))
+  if (!isSafeApplicationAssertionValueForName(options.expected, options.name))
     return { accepted: false, rejection: "invalid_expected" };
-  if (!isSafeApplicationAssertionValue(options.actual))
+  if (!isSafeApplicationAssertionValueForName(options.actual, options.name))
     return { accepted: false, rejection: "invalid_actual" };
   const expectedType = assertionValueType(options.expected);
   const actualType = assertionValueType(options.actual);
@@ -241,12 +314,29 @@ export function buildApplicationAssertionData(
   };
 }
 
+export function buildApplicationAssertionData(
+  options: ApplicationAssertionOptions,
+):
+  | { accepted: true; passed: boolean; data: ApplicationAssertionEventData }
+  | { accepted: false; rejection: ApplicationAssertionDataRejection } {
+  const snapshot = snapshotApplicationAssertionOptions(options);
+  if (!snapshot.accepted) return snapshot;
+  return buildApplicationAssertionDataFromSnapshot(snapshot.options);
+}
+
 /** Build the stable wire event after validation. */
 export function buildApplicationAssertionEvent(
   options: ApplicationAssertionOptions,
   timestamp: number,
+  sessionIdOverride?: string,
 ): ApplicationAssertionResult {
-  const built = buildApplicationAssertionData(options);
+  const snapshot = snapshotApplicationAssertionOptions(options);
+  if (!snapshot.accepted) return snapshot;
+  const safeOptions =
+    sessionIdOverride === undefined
+      ? snapshot.options
+      : { ...snapshot.options, sessionId: sessionIdOverride };
+  const built = buildApplicationAssertionDataFromSnapshot(safeOptions);
   if (!built.accepted) return built;
   if (!isCanonicalApplicationAssertionTimestamp(timestamp)) {
     return { accepted: false, rejection: "invalid_timestamp" };
@@ -258,9 +348,9 @@ export function buildApplicationAssertionEvent(
       t: timestamp,
       k: APPLICATION_ASSERTION_EVENT_KIND,
       d: { ...built.data },
-      ...(options.sessionId === undefined
+      ...(safeOptions.sessionId === undefined
         ? {}
-        : { sessionId: options.sessionId }),
+        : { sessionId: safeOptions.sessionId }),
     },
   };
 }

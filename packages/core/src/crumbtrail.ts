@@ -431,15 +431,46 @@ function bodyPlaceholder(summary: PayloadSummary | undefined): string {
 function readPersistedSessionId(
   store: SessionStore,
   idleMs: number,
-): string | undefined {
-  const persisted = store.read();
-  if (!persisted) return undefined;
-  if (now() - persisted.lastActivity > idleMs) return undefined; // stale -> mint a fresh session
-  return persisted.id;
+): { id: string; applicationAssertionCount: number } | undefined {
+  try {
+    const persisted = store.read();
+    if (!persisted || typeof persisted !== "object") return undefined;
+    const id = persisted.id;
+    const lastActivity = persisted.lastActivity;
+    const applicationAssertionCount = persisted.applicationAssertionCount;
+    if (
+      typeof id !== "string" ||
+      id.length === 0 ||
+      typeof lastActivity !== "number" ||
+      !Number.isSafeInteger(lastActivity) ||
+      lastActivity < 0 ||
+      (applicationAssertionCount !== undefined &&
+        (typeof applicationAssertionCount !== "number" ||
+          !Number.isSafeInteger(applicationAssertionCount) ||
+          applicationAssertionCount < 0 ||
+          applicationAssertionCount > MAX_APPLICATION_ASSERTIONS_PER_SESSION))
+    )
+      return undefined;
+    if (now() - lastActivity > idleMs) return undefined; // stale -> mint a fresh session
+    return {
+      id,
+      applicationAssertionCount: applicationAssertionCount ?? 0,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
-function writePersistedSession(store: SessionStore, id: string): void {
-  store.write({ id, lastActivity: now() });
+function writePersistedSession(
+  store: SessionStore,
+  id: string,
+  applicationAssertionCount = 0,
+): void {
+  try {
+    store.write({ id, lastActivity: now(), applicationAssertionCount });
+  } catch {
+    // Persistence is best effort. A custom store must not break capture.
+  }
 }
 
 /**
@@ -490,6 +521,7 @@ export class Crumbtrail {
   private storageFailureSyncs = new Set<() => void>();
   private sessionId: string;
   private applicationAssertions = 0;
+  private pendingApplicationAssertions = 0;
   private widgetCleanup?: () => void;
   /** Names uploaded by this live session and therefore eligible for association. */
   private visualArtifactNames = new Set<string>();
@@ -548,6 +580,7 @@ export class Crumbtrail {
   /** Refuses new explicit screenshot uploads once direct shutdown starts. */
   private screenshotClosing = false;
   private stopped = false;
+  private inert: boolean;
   private stopPromise?: Promise<{ sessionId: string }>;
   private identity: CrumbtrailIdentity = {};
   private applicationRelease: ApplicationReleaseIdentity;
@@ -585,8 +618,10 @@ export class Crumbtrail {
     applicationRelease: ApplicationReleaseIdentity,
     sessionStore?: SessionStore,
     runtimeBinding?: RuntimeBindingClient,
+    inert = false,
   ) {
     this.config = config;
+    this.inert = inert;
     this.localCaptureFloor = readLocalCaptureFloor(config);
     this.bus = bus;
     this.transport = transport;
@@ -650,6 +685,9 @@ export class Crumbtrail {
         new RingBuffer(config.ringBufferMs, config.ringBufferMaxEvents),
         config.sessionId ?? generateSessionId(),
         applicationRelease,
+        undefined,
+        undefined,
+        true,
       );
     }
 
@@ -669,14 +707,20 @@ export class Crumbtrail {
     // session exists. Once an early request is on the wire its session header cannot be changed,
     // so that id also has to win over an explicit `sessionId`; otherwise the browser finalizes
     // one session while the correlated backend and database events remain orphaned in another.
+    const persistedSession = sessionStore
+      ? readPersistedSessionId(sessionStore, config.sessionIdleMs)
+      : undefined;
     const sessionId =
       readEarlySessionId() ??
       config.sessionId ??
-      (sessionStore
-        ? readPersistedSessionId(sessionStore, config.sessionIdleMs)
-        : undefined) ??
+      persistedSession?.id ??
       generateSessionId();
-    if (sessionStore) writePersistedSession(sessionStore, sessionId);
+    const persistedAssertionCount =
+      persistedSession?.id === sessionId
+        ? persistedSession.applicationAssertionCount
+        : 0;
+    if (sessionStore)
+      writePersistedSession(sessionStore, sessionId, persistedAssertionCount);
 
     // Nowhere to send: same inert shape as the non-browser guard above, and for
     // the same reason. A capture SDK that throws inside a host app's module
@@ -696,6 +740,8 @@ export class Crumbtrail {
         sessionId,
         applicationRelease,
         sessionStore,
+        undefined,
+        true,
       );
     }
 
@@ -728,6 +774,7 @@ export class Crumbtrail {
       sessionStore,
       runtimeBinding,
     );
+    instance.applicationAssertions = persistedAssertionCount;
 
     // Send events to transport. Flight recorder sessions deliberately keep pre-trigger events
     // local; capture gap records remain visible so sampling never fails silently.
@@ -755,7 +802,11 @@ export class Crumbtrail {
     // its rolling idle window alive across reloads.
     if (useSessionStore && sessionStore) {
       bus.subscribe(() => {
-        writePersistedSession(sessionStore, instance.sessionId);
+        writePersistedSession(
+          sessionStore,
+          instance.sessionId,
+          instance.applicationAssertions,
+        );
       });
     }
 
@@ -1864,9 +1915,7 @@ export class Crumbtrail {
 
   private isScreenshotSessionActive(sessionId: string): boolean {
     return (
-      this.sessionStarted &&
-      this.sessionId === sessionId &&
-      this.canTransport()
+      this.sessionStarted && this.sessionId === sessionId && this.canTransport()
     );
   }
 
@@ -2089,9 +2138,7 @@ export class Crumbtrail {
     return completed;
   }
 
-  private abandonLifecycleSends(
-    pending = [...this.pendingSends],
-  ): void {
+  private abandonLifecycleSends(pending = [...this.pendingSends]): void {
     // Do not let a transport that never settles keep a later explicit stop() hostage. The page
     // is already closing and the server can finalize this still-open session by TTL.
     for (const send of pending) this.pendingSends.delete(send);
@@ -2172,6 +2219,7 @@ export class Crumbtrail {
 
   private canTransport(): boolean {
     return (
+      !this.inert &&
       !this.stopped &&
       !this.lifecycleClosing &&
       !this.lifecycleSuspended &&
@@ -2406,17 +2454,43 @@ export class Crumbtrail {
    * `reportAssertion()` exposes the admission result for callers that need to
    * distinguish a failed claim from a refused one.
    */
-  reportAssertion(options: ApplicationAssertionOptions): ApplicationAssertionResult {
+  reportAssertion(
+    options: ApplicationAssertionOptions,
+  ): ApplicationAssertionResult {
     const result = buildApplicationAssertionEvent(
-      { ...options, sessionId: this.sessionId },
+      options,
       now(),
+      this.sessionId,
     );
     if (!result.accepted || result.event === undefined) return result;
-    if (this.applicationAssertions >= MAX_APPLICATION_ASSERTIONS_PER_SESSION) {
+    if (!this.canCapture()) {
+      return { accepted: false, rejection: "capture_not_admitted" };
+    }
+    if (
+      this.applicationAssertions + this.pendingApplicationAssertions >=
+      MAX_APPLICATION_ASSERTIONS_PER_SESSION
+    ) {
       return { accepted: false, rejection: "session_cap_reached" };
     }
+    this.pendingApplicationAssertions += 1;
+    let admitted = false;
+    try {
+      admitted = this.bus.emit(result.event);
+    } catch {
+      admitted = false;
+    } finally {
+      this.pendingApplicationAssertions -= 1;
+    }
+    if (!admitted) {
+      return { accepted: false, rejection: "capture_not_admitted" };
+    }
     this.applicationAssertions += 1;
-    this.bus.emit(result.event);
+    if (this.sessionStore)
+      writePersistedSession(
+        this.sessionStore,
+        this.sessionId,
+        this.applicationAssertions,
+      );
     return result;
   }
 
@@ -2801,7 +2875,11 @@ export class Crumbtrail {
             .then(
               () => true,
               (error: unknown) => {
-                recordStopFailure(teardownFailures, "transport.endSession", error);
+                recordStopFailure(
+                  teardownFailures,
+                  "transport.endSession",
+                  error,
+                );
                 return true;
               },
             ),

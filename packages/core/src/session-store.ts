@@ -1,6 +1,10 @@
+import { MAX_APPLICATION_ASSERTIONS_PER_SESSION } from "./assertion";
+
 export interface PersistedSession {
   id: string;
   lastActivity: number;
+  /** Count only. Assertion values and identifiers are never persisted. */
+  applicationAssertionCount?: number;
 }
 
 export interface SessionStore {
@@ -26,13 +30,31 @@ export function createWebSessionStore(
         const parsed = JSON.parse(raw) as {
           id?: unknown;
           lastActivity?: unknown;
+          applicationAssertionCount?: unknown;
         };
         if (typeof parsed.id !== "string" || parsed.id.length === 0)
           return undefined;
+        if (
+          typeof parsed.lastActivity !== "number" ||
+          !Number.isSafeInteger(parsed.lastActivity) ||
+          parsed.lastActivity < 0
+        )
+          return undefined;
+        const applicationAssertionCount = parsed.applicationAssertionCount;
+        if (
+          applicationAssertionCount !== undefined &&
+          (typeof applicationAssertionCount !== "number" ||
+            !Number.isSafeInteger(applicationAssertionCount) ||
+            applicationAssertionCount < 0 ||
+            applicationAssertionCount > MAX_APPLICATION_ASSERTIONS_PER_SESSION)
+        )
+          return undefined;
         return {
           id: parsed.id,
-          lastActivity:
-            typeof parsed.lastActivity === "number" ? parsed.lastActivity : 0,
+          lastActivity: parsed.lastActivity,
+          ...(applicationAssertionCount === undefined
+            ? {}
+            : { applicationAssertionCount }),
         };
       } catch {
         return undefined;

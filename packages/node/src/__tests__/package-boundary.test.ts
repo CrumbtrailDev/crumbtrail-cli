@@ -101,3 +101,11 @@ describe("package runtime boundary", () => {
     }
   });
 });
+
+it("does not publish assertion test reset helpers", async () => {
+  const api = await import("../index");
+
+  expect("resetApplicationAssertionCountsForTests" in api).toBe(false);
+  expect("clearApplicationAssertionSession" in api).toBe(false);
+  expect(typeof api.endApplicationAssertionSession).toBe("function");
+});

@@ -301,6 +301,11 @@ response bodies, and redaction markers are rejected. At most 100 valid
 assertions are emitted per session. Use `reportAssertion()` when the caller
 needs to distinguish a failed assertion from an invalid or capped input. Pass
 `requestId` and `traceId` when the application owns those correlation values.
+With the default `sessionPersistence: "session"`, the assertion count is kept
+with the session ID in `sessionStorage`, so a hard reload cannot reset the
+session cap. An assertion is counted only after the EventBus admits it, so
+consent, remote policy, sampling, flight recorder finalization, and lifecycle
+shutdown can refuse it with `capture_not_admitted` without spending the cap.
 Assertion event timestamps are non-negative safe integer Unix milliseconds within
 the ECMAScript `Date` range. The exported event builder rejects timestamps
 outside that definition.

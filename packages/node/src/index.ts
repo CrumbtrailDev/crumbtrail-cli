@@ -4,7 +4,7 @@ export {
   sendApplicationAssertion,
   sendSupportAssertion,
   recordApplicationAssertion,
-  resetApplicationAssertionCountsForTests,
+  endApplicationAssertionSession,
 } from "./assertion";
 
 export type {

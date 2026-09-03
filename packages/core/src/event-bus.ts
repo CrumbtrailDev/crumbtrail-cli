@@ -20,7 +20,13 @@ export class EventBus {
   private droppedFromBuffer = 0;
 
   emit(event: BugEvent, options?: { bypassAdmission?: boolean }): boolean {
-    if (!options?.bypassAdmission && !this.admissionPredicate(event)) return false;
+    if (!options?.bypassAdmission) {
+      try {
+        if (!this.admissionPredicate(event)) return false;
+      } catch {
+        return false;
+      }
+    }
     for (const tap of this.taps) {
       try {
         tap(event);

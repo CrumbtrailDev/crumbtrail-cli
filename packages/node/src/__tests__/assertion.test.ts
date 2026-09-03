@@ -3,6 +3,7 @@ import { MAX_APPLICATION_ASSERTIONS_PER_SESSION } from "crumbtrail-core";
 import { clearProcessSessionId, setProcessSessionId } from "../process-session";
 import {
   clearApplicationAssertionSession,
+  endApplicationAssertionSession,
   resetApplicationAssertionCountsForTests,
   sendApplicationAssertion,
 } from "../assertion";
@@ -60,7 +61,7 @@ describe("Node application assertions", () => {
     setProcessSessionId("ses_support_assertion");
     const fetch = vi.fn().mockResolvedValue({ ok: true, status: 200 });
     const malformed = await sendApplicationAssertion({
-      name: "account_email",
+      name: "order_status",
       operator: "equals",
       expected: "person@example.com",
       actual: "person@example.com",
@@ -117,7 +118,69 @@ describe("Node application assertions", () => {
       rejection: "session_cap_reached",
     });
 
+    endApplicationAssertionSession("ses_other_0");
+    expect((await assertion("ses_after_cleanup")).accepted).toBe(true);
+
     clearApplicationAssertionSession("ses_capped");
     expect((await assertion("ses_capped")).accepted).toBe(true);
+  });
+
+  it("does not throw, reread, or leak hostile assertion options", async () => {
+    setProcessSessionId("ses_hostile_options");
+    const fetch = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    expect(await sendApplicationAssertion(null as never)).toEqual({
+      accepted: false,
+      rejection: "invalid_options",
+    });
+
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    expect(await sendApplicationAssertion(revoked.proxy as never)).toEqual({
+      accepted: false,
+      rejection: "invalid_options",
+    });
+
+    let expectedReads = 0;
+    const options = {
+      name: "order_status",
+      operator: "equals" as const,
+      get expected() {
+        expectedReads += 1;
+        return expectedReads === 1 ? "ready" : "sk_live_leaked";
+      },
+      actual: "ready",
+      endpoint: "https://capture.example",
+      fetch,
+    };
+    const result = await sendApplicationAssertion(options);
+    expect(result.accepted).toBe(true);
+    expect(expectedReads).toBe(1);
+    expect(fetch.mock.calls[0]![1].body).toContain('"expected":"ready"');
+    expect(fetch.mock.calls[0]![1].body).not.toContain("sk_live_leaked");
+  });
+
+  it("rejects hostile transport values without sending or throwing", async () => {
+    setProcessSessionId("ses_hostile_transport");
+    const fetch = vi.fn();
+    for (const key of [
+      "endpoint",
+      "authToken",
+      "fetch",
+      "onWarning",
+      "sleep",
+    ]) {
+      const result = await sendApplicationAssertion({
+        name: "order_status",
+        operator: "equals",
+        expected: "ready",
+        actual: "ready",
+        [key]: key === "fetch" ? "not-a-function" : {},
+      } as never);
+      expect(result).toEqual({
+        accepted: false,
+        rejection: "invalid_options",
+      });
+    }
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
