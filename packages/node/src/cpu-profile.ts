@@ -1,6 +1,5 @@
 import * as inspector from "node:inspector";
 import {
-  CPU_PROFILE_MAX_DURATION_MS,
   CPU_PROFILE_MAX_FUNCTIONS,
   CPU_PROFILE_MAX_SAMPLE_COUNT,
   type CpuProfileFunction,
@@ -178,7 +177,12 @@ function normalizedFunctionName(value: unknown): string {
   const name = boundedString(value, FUNCTION_NAME_MAX_LENGTH);
   if (!name || name === "(anonymous)" || name === "(program)")
     return "(anonymous)";
-  if (name === "(root)" || name.startsWith("internal/")) return "[internal]";
+  if (
+    ["(root)", "(idle)", "(garbage collector)"].includes(name) ||
+    name.startsWith("internal/") ||
+    name.startsWith("node:internal/")
+  )
+    return "[internal]";
   return name;
 }
 

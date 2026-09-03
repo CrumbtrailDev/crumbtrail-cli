@@ -408,6 +408,22 @@ function boundedProfileUrl(value: unknown): string | undefined {
   }
 }
 
+function normalizedProfileFunctionName(value: unknown): string {
+  const name = boundedProfileString(
+    value,
+    CPU_PROFILE_FUNCTION_NAME_MAX_LENGTH,
+  );
+  if (!name || name === "(anonymous)" || name === "(program)")
+    return "(anonymous)";
+  if (
+    ["(root)", "(idle)", "(garbage collector)"].includes(name) ||
+    name.startsWith("internal/") ||
+    name.startsWith("node:internal/")
+  )
+    return "[internal]";
+  return name;
+}
+
 /** Copy only the fixed CPU profile schema into the public probe result. */
 function sanitizeCpuProfileData(
   value: CpuProfileProbeData,
@@ -434,11 +450,7 @@ function sanitizeCpuProfileData(
       CPU_PROFILE_MAX_SAMPLE_COUNT,
     );
     if (selfSamples === undefined) continue;
-    const functionName =
-      boundedProfileString(
-        source.functionName,
-        CPU_PROFILE_FUNCTION_NAME_MAX_LENGTH,
-      ) ?? "(anonymous)";
+    const functionName = normalizedProfileFunctionName(source.functionName);
     const url = boundedProfileUrl(source.url);
     const lineNumber = boundedProfileNumber(
       source.lineNumber,
