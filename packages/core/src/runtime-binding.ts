@@ -276,6 +276,22 @@ export class RuntimeBindingClient {
     this.retirement = Promise.allSettled(retirements).then(() => undefined);
   }
 
+  /**
+   * Forget a proof the server rejected while leaving this client able to
+   * register a fresh runtime identity on the next poll.
+   */
+  invalidate(): void {
+    if (this.stopped) return;
+    this.requestGeneration += 1;
+    try {
+      this.activeRegistrationController?.abort();
+    } catch {
+      // A host supplied AbortController must not break the invalidation path.
+    }
+    this.current = undefined;
+    this.retryAfter = 0;
+  }
+
   private async registerOrRotate(
     previous: RuntimeBinding | undefined,
     generation: number,

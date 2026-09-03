@@ -55,10 +55,11 @@ const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const flushMicrotasks = () => delay(10);
 
 describe("the allowlist", () => {
-  it("is frozen and holds exactly the four declared probes", () => {
+  it("is frozen and holds exactly the five declared probes", () => {
     expect(Object.isFrozen(PROBE_NAMES)).toBe(true);
     expect([...PROBE_NAMES]).toEqual([
       "runtime.env",
+      "runtime.cpu_profile",
       "storage.snapshot",
       "network.inflight",
       "flags.current",
@@ -417,6 +418,91 @@ describe("bounds", () => {
     expect(result.ok).toBe(true);
     expect(result.rowCount).toBe(1);
     expect(result.truncated).toBe(true);
+  });
+});
+
+describe("runtime.cpu_profile", () => {
+  it("is unavailable in core without a Node executor and never profiles an untargeted poll", async () => {
+    const executor = vi.fn(async () => ({
+      durationMs: 1_000,
+      sampleCount: 1,
+      topFunctions: [],
+    }));
+    const browser = await runProbe("runtime.cpu_profile", {
+      runtimeTargeted: true,
+    });
+    const targeted = await runProbe("runtime.cpu_profile", {
+      runtimeTargeted: true,
+      getCpuProfile: executor,
+    });
+    const untargeted = await runProbe("runtime.cpu_profile", {
+      runtimeTargeted: false,
+      getCpuProfile: executor,
+    });
+
+    expect(browser.ok).toBe(false);
+    expect(browser.error).toBe("unavailable");
+    expect(targeted.ok).toBe(true);
+    expect(browser.durationMs).toBeUndefined();
+    expect(untargeted.ok).toBe(false);
+    expect(untargeted.error).toBe("unavailable");
+    expect(executor).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns only bounded, redacted CPU profile summary fields", async () => {
+    const getCpuProfile = vi.fn(
+      async () =>
+        ({
+          durationMs: 999_999,
+          sampleCount: 9_999_999,
+          topFunctions: [
+            {
+              functionName: "",
+              url: "https://api.example.test/run?access_token=secret-value-123456789",
+              lineNumber: -1,
+              columnNumber: 12,
+              selfSamples: 2,
+              args: [{ secret: "must not cross the boundary" }],
+            },
+            ...Array.from({ length: 50 }, (_, index) => ({
+              functionName: `function-${index}`,
+              selfSamples: 1,
+              source: { body: "must not cross the boundary" },
+            })),
+          ],
+        }) as never,
+    );
+
+    const result = await runProbe("runtime.cpu_profile", {
+      runtimeTargeted: true,
+      getCpuProfile,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.durationMs).toBe(2_000);
+    expect(result.sampleCount).toBe(1_000_000);
+    expect(result.topFunctions).toHaveLength(50);
+    expect(result.topFunctions?.[0]).toEqual({
+      functionName: "(anonymous)",
+      url: expect.stringContaining("api.example.test/run"),
+      columnNumber: 12,
+      selfSamples: 2,
+    });
+    expect(JSON.stringify(result)).not.toContain("secret-value-123456789");
+    expect(JSON.stringify(result)).not.toContain("must not cross the boundary");
+    for (const row of result.topFunctions ?? []) {
+      expect(
+        Object.keys(row).every((key) =>
+          [
+            "functionName",
+            "url",
+            "lineNumber",
+            "columnNumber",
+            "selfSamples",
+          ].includes(key),
+        ),
+      ).toBe(true);
+    }
   });
 });
 

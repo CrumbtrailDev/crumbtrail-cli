@@ -234,10 +234,9 @@ describe("probe dispatch from the config poll", () => {
   });
 
   it("caps a poll at four probes and runs each name once", async () => {
-    // PROBE_NAMES holds exactly four names today, so the cap and the allowlist coincide. This
-    // assertion is the tripwire: a fifth probe makes the cap the binding constraint and this test
-    // must then feed five distinct names.
-    expect(PROBE_NAMES).toHaveLength(4);
+    // The allowlist has five names while delivery remains capped at four. This assertion is the
+    // tripwire that keeps a fifth name from silently widening one poll's execution budget.
+    expect(PROBE_NAMES).toHaveLength(5);
 
     const { logger, transport } = startWithPollPayload({
       probes: [
@@ -253,7 +252,7 @@ describe("probe dispatch from the config poll", () => {
 
     expect(probeCalls).toHaveLength(4);
     expect(probeCalls.map((call) => call.name).sort()).toEqual(
-      [...PROBE_NAMES].sort(),
+      [...PROBE_NAMES.slice(0, 4)].sort(),
     );
     expect(probeResults(transport)).toHaveLength(4);
 
