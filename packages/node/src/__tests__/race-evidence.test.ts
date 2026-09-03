@@ -8,6 +8,7 @@ import type {
 } from "crumbtrail-core";
 import { buildCacheEvent, instrumentIoredisClient } from "../cache";
 import { buildDbDiffEvent, buildDbReadEvent, instrumentPgClient } from "../db";
+import { emitDbDiffEvents } from "../db/instrument-shared";
 import {
   buildRaceEvidence,
   createHmacRaceEvidenceResolver,
@@ -154,6 +155,28 @@ describe("race evidence contract", () => {
     expect(empty?.entityHash).toMatch(/^[a-f0-9]{64}$/);
     expect(sparse?.entityHash).toMatch(/^[a-f0-9]{64}$/);
     expect(empty?.entityHash).not.toBe(sparse?.entityHash);
+  });
+
+  it("keeps lone UTF-16 surrogates distinct from replacement characters", () => {
+    const resolver = createHmacRaceEvidenceResolver(
+      "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef",
+    )!;
+    const loneSurrogate = resolver({
+      surface: "db.read",
+      operation: "read",
+      table: "orders",
+      primaryKey: { id: "\uD800" },
+    });
+    const replacement = resolver({
+      surface: "db.read",
+      operation: "read",
+      table: "orders",
+      primaryKey: { id: "\uFFFD" },
+    });
+
+    expect(loneSurrogate?.entityHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(replacement?.entityHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(loneSurrogate?.entityHash).not.toBe(replacement?.entityHash);
   });
 
   it("refuses weak credentials and malformed opaque output", () => {
@@ -356,6 +379,66 @@ describe("race evidence contract", () => {
     });
     expect(read.k).toBe("db.read");
     expect(read.d.raceEvidence).toBeUndefined();
+  });
+
+  it("rejects valid-looking primary-key proxies before static identifiers attach", () => {
+    const proxy = new Proxy(
+      { id: 42 },
+      {
+        get(target, property, receiver) {
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    const raceEvidence = {
+      enabled: true,
+      identifiers: { entityHash: opaque("e") },
+    };
+
+    const diff = buildDbDiffEvent({
+      op: "update",
+      table: "orders",
+      pk: proxy,
+      after: { id: 42 },
+      requestId: "req-proxy-pk",
+      raceEvidence,
+    });
+
+    expect(diff.k).toBe("db.diff");
+    expect(diff.d.raceEvidence).toBeUndefined();
+    expect(
+      createHmacRaceEvidenceResolver(
+        "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef",
+      )!({
+        surface: "db.read",
+        operation: "read",
+        table: "orders",
+        primaryKey: proxy,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("does not treat a one-row bulk result as a single entity operation", () => {
+    const events: BugEvent[] = [];
+    emitDbDiffEvents({
+      engine: "postgres",
+      op: "update",
+      table: "orders",
+      requestId: "req-bulk-one",
+      rows: [{ id: 42, version: 2 }],
+      rowCount: 1,
+      bulk: true,
+      options: {
+        requestId: "req-bulk-one",
+        emit: (event) => events.push(event),
+        raceEvidence: {
+          enabled: true,
+          resolve: () => ({ entityHash: opaque("e") }),
+        },
+      },
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]?.d.raceEvidence).toBeUndefined();
   });
 
   it("keeps canonical object identity stable across process locale settings", () => {

@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { isProxy } from "node:util/types";
 
 /** The event planes that can carry bounded cross session race evidence. */
 export type RaceEvidenceSurface = "db.diff" | "db.read" | "cache";
@@ -329,18 +330,48 @@ function isResolvedDatabasePrimaryKey(
     if (
       !primaryKey ||
       typeof primaryKey !== "object" ||
-      Array.isArray(primaryKey)
+      Array.isArray(primaryKey) ||
+      isProxy(primaryKey)
     )
       return false;
+    if (
+      columns !== undefined &&
+      (!Array.isArray(columns) ||
+        isProxy(columns) ||
+        columns.length > MAX_OBJECT_KEYS)
+    ) {
+      return false;
+    }
+    const prototype = Object.getPrototypeOf(primaryKey);
+    if (prototype !== Object.prototype && prototype !== null) return false;
+    const ownKeys = Reflect.ownKeys(primaryKey);
+    if (ownKeys.length === 0 || ownKeys.length > MAX_OBJECT_KEYS) return false;
+    const descriptors = new Map<string, PropertyDescriptor>();
+    for (const key of ownKeys) {
+      if (typeof key !== "string") return false;
+      const descriptor = Object.getOwnPropertyDescriptor(primaryKey, key);
+      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+        return false;
+      }
+      // A primary-key value may be an ObjectId or another opaque driver value,
+      // but a proxy is not a stable value boundary. Reject it before either a
+      // resolver or a static identifier can make the event look trustworthy.
+      if (isProxy(descriptor.value)) return false;
+      descriptors.set(key, descriptor);
+    }
+    if (descriptors.size === 0 || descriptors.size > MAX_OBJECT_KEYS)
+      return false;
     const keys =
-      columns && columns.length > 0 ? columns : Object.keys(primaryKey);
+      columns && columns.length > 0 ? [...columns] : [...descriptors.keys()];
     if (keys.length === 0) return false;
+    const seen = new Set<string>();
     return keys.every(
       (key) =>
         typeof key === "string" &&
         key.length > 0 &&
-        Object.prototype.hasOwnProperty.call(primaryKey, key) &&
-        primaryKey[key] !== undefined,
+        !seen.has(key) &&
+        seen.add(key) &&
+        descriptors.get(key)?.value !== undefined,
     );
   } catch {
     return false;
@@ -389,9 +420,15 @@ function digest(
 function canonicalize(value: unknown, depth = 0): string | undefined {
   if (depth > 4) return undefined;
   if (value === null) return encodeToken("z", "");
+  if (
+    (typeof value === "object" || typeof value === "function") &&
+    isProxy(value)
+  ) {
+    return undefined;
+  }
   switch (typeof value) {
     case "string":
-      return encodeToken("s", value);
+      return encodeToken("s", encodeUtf16(value));
     case "number":
       return Number.isFinite(value)
         ? encodeToken("n", Object.is(value, -0) ? "-0" : String(value))
@@ -422,7 +459,7 @@ function canonicalize(value: unknown, depth = 0): string | undefined {
         entries.sort(([left], [right]) => compareUtf16(left, right));
         const rendered = entries.map(([key, descriptor]) => {
           const normalized = canonicalize(descriptor.value, depth + 1);
-          const encodedKey = encodeToken("k", key);
+          const encodedKey = encodeToken("k", encodeUtf16(key));
           return normalized === undefined || encodedKey === undefined
             ? undefined
             : `${encodedKey}${normalized}`;
@@ -486,6 +523,15 @@ function encodeToken(tag: string, payload: string): string | undefined {
   return Buffer.byteLength(source, "utf8") <= MAX_SOURCE_LENGTH
     ? source
     : undefined;
+}
+
+/** Encode UTF-16 code units so lone surrogates cannot collapse during UTF-8 hashing. */
+function encodeUtf16(value: string): string {
+  let encoded = "";
+  for (let index = 0; index < value.length; index += 1) {
+    encoded += value.charCodeAt(index).toString(16).padStart(4, "0");
+  }
+  return encoded;
 }
 
 /** Compare strings by UTF-16 code units, without process locale state. */

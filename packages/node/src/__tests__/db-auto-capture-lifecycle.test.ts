@@ -163,7 +163,9 @@ describe("auto-captured database client lifecycle", () => {
     );
     openHandles.push(first);
 
-    const client = new (mod.PrismaClient as new () => FakeExtendedPrismaClient)();
+    const client = new (
+      mod.PrismaClient as new () => FakeExtendedPrismaClient
+    )();
     await runInBackendRequestContext({ requestId: "prisma-before-stop" }, () =>
       client.run(
         { model: "Order", operation: "create", args: { data: { id: 1 } } },
@@ -172,6 +174,18 @@ describe("auto-captured database client lifecycle", () => {
     );
     await flushCapture();
     first.stop();
+    const firstCallsAfterStop = firstTransport.calls.length;
+
+    await runInBackendRequestContext(
+      { requestId: "prisma-after-stop-no-capture" },
+      () =>
+        client.run(
+          { model: "Order", operation: "create", args: { data: { id: 99 } } },
+          { id: 99 },
+        ),
+    );
+    await flushCapture();
+    expect(firstTransport.calls.length).toBe(firstCallsAfterStop);
 
     const secondTransport = makeFetch();
     const second = await autoCapture(
@@ -225,6 +239,20 @@ describe("auto-captured database client lifecycle", () => {
     );
     await flushCapture();
     first.stop();
+    const firstCallsAfterStop = firstTransport.calls.length;
+
+    await runInBackendRequestContext(
+      { requestId: "mongo-after-stop-no-capture" },
+      () =>
+        client.succeed(
+          99,
+          "insert",
+          { insert: "accounts", documents: [{ _id: "no-capture" }] },
+          { ok: 1, n: 1 },
+        ),
+    );
+    await flushCapture();
+    expect(firstTransport.calls.length).toBe(firstCallsAfterStop);
 
     const secondTransport = makeFetch();
     const second = await autoCapture(
