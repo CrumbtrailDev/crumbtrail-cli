@@ -1207,12 +1207,32 @@ export function htmlScriptBlocks(html: string): HtmlScriptBlock[] {
   return blocks;
 }
 
+const CRUMBTRAIL_CDN_HOSTS = new Set(["esm.sh", "unpkg.com"]);
+const CRUMBTRAIL_PACKAGE_URL =
+  /^\/crumbtrail-(?:core|node|react-native|capacitor)(?:@|\/|$)/i;
+
+/** True only for the package URLs emitted by the static recipe. */
+function isCrumbtrailScriptUrl(source: string): boolean {
+  try {
+    const url = new URL(source);
+    return (
+      url.protocol === "https:" &&
+      CRUMBTRAIL_CDN_HOSTS.has(url.hostname.toLowerCase()) &&
+      CRUMBTRAIL_PACKAGE_URL.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** Whether this HTML already carries a Crumbtrail script or module. */
 export function htmlReferencesCrumbtrail(html: string): boolean {
   return htmlScriptBlocks(html)
     .filter((block) => block.executable)
     .some((block) =>
-      /crumbtrail/i.test(`${block.src ?? ""}\n${block.content}`),
+      block.src !== null
+        ? isCrumbtrailScriptUrl(block.src)
+        : hasExecutableCrumbtrailReference(block.content),
     );
 }
 

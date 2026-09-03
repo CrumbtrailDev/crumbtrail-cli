@@ -310,6 +310,8 @@ const STATIC_IMPORT_REFERENCE = /\bimport\s+(?:"([^"]*)"|'([^']*)')/g;
 // JavaScript file until its surrounding tags are removed.
 const IMPORT_FROM_REFERENCE =
   /\bimport\s+(?!type\b)[^;\n<>]*?\sfrom\s*(?:"([^"]*)"|'([^']*)')/g;
+const EXPORT_FROM_REFERENCE =
+  /\bexport\s+(?!type\b)[^;\n<>]*?\sfrom\s*(?:"([^"]*)"|'([^']*)')/g;
 const DYNAMIC_IMPORT_REFERENCE =
   /\bimport\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/g;
 const BARE_REQUIRE_REFERENCE = /\brequire\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/g;
@@ -317,7 +319,7 @@ const BARE_REQUIRE_REFERENCE = /\brequire\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/g;
 function executableModuleKeyword(
   mask: string,
   match: RegExpMatchArray,
-  keyword: "import" | "require",
+  keyword: "import" | "require" | "export",
 ): boolean {
   const matchAt = match.index ?? -1;
   const keywordAt = matchAt < 0 ? -1 : matchAt + match[0].indexOf(keyword);
@@ -417,33 +419,81 @@ function astHasModuleReference(
   return found;
 }
 
-function maskedModuleReference(
+/**
+ * Return the literal module specifiers that executable source actually loads.
+ *
+ * This is the shared seam for both integration detection and local-import
+ * reachability. The AST path ignores comments, strings, type-only imports, and
+ * member calls. The masked fallback keeps the same rules for source that Babel
+ * cannot parse, such as an inline HTML module script.
+ */
+export function executableModuleSpecifiers(
   text: string,
-  matches: ModuleSpecifierMatcher,
-): boolean {
+  options: { allowExports?: boolean } = {},
+): string[] {
+  const allowExports = options.allowExports ?? true;
+  const program = parseModuleProgram(text);
+  if (program) {
+    const specifiers: string[] = [];
+    const add = (node: any): void => {
+      const value = stringLiteralValue(node);
+      if (value !== null) specifiers.push(value);
+    };
+    const visit = (node: any): void => {
+      if (!node || typeof node !== "object") return;
+      if (node.type === "ImportDeclaration" && node.importKind !== "type") {
+        add(node.source);
+      }
+      if (
+        allowExports &&
+        (node.type === "ExportNamedDeclaration" ||
+          node.type === "ExportAllDeclaration") &&
+        node.exportKind !== "type" &&
+        node.source
+      ) {
+        add(node.source);
+      }
+      if (node.type === "ImportExpression") add(node.source);
+      if (node.type === "CallExpression") {
+        const isBareLoader =
+          node.callee?.type === "Import" ||
+          (node.callee?.type === "Identifier" &&
+            node.callee.name === "require");
+        if (isBareLoader) add(node.arguments?.[0]);
+      }
+      for (const value of Object.values(node)) {
+        if (Array.isArray(value)) value.forEach(visit);
+        else if (value && typeof value === "object" && "type" in value)
+          visit(value);
+      }
+    };
+    visit(program);
+    return [...new Set(specifiers)];
+  }
+
   const mask = maskLiterals(text);
-  if (mask === null) return false;
+  if (mask === null) return [];
   const patterns: Array<{
     pattern: RegExp;
-    keyword: "import" | "require";
+    keyword: "import" | "require" | "export";
   }> = [
     { pattern: STATIC_IMPORT_REFERENCE, keyword: "import" },
     { pattern: IMPORT_FROM_REFERENCE, keyword: "import" },
+    { pattern: EXPORT_FROM_REFERENCE, keyword: "export" },
     { pattern: DYNAMIC_IMPORT_REFERENCE, keyword: "import" },
     { pattern: BARE_REQUIRE_REFERENCE, keyword: "require" },
   ];
+  const specifiers: string[] = [];
   for (const { pattern, keyword } of patterns) {
+    if (keyword === "export" && !allowExports) continue;
     pattern.lastIndex = 0;
     for (const candidate of text.matchAll(pattern)) {
-      if (
-        executableModuleKeyword(mask, candidate, keyword) &&
-        matches(firstModuleSpecifier(candidate) ?? "")
-      ) {
-        return true;
-      }
+      if (!executableModuleKeyword(mask, candidate, keyword)) continue;
+      const value = firstModuleSpecifier(candidate);
+      if (value !== null) specifiers.push(value);
     }
   }
-  return false;
+  return [...new Set(specifiers)];
 }
 
 /**
@@ -460,7 +510,7 @@ export function hasExecutableModuleReference(
   const program = parseModuleProgram(text);
   return program
     ? astHasModuleReference(program, matches, options.allowExports ?? true)
-    : maskedModuleReference(text, matches);
+    : executableModuleSpecifiers(text, options).some(matches);
 }
 
 function isCrumbtrailModuleSpecifier(specifier: string): boolean {
@@ -478,13 +528,122 @@ export function hasExecutableCrumbtrailReference(text: string): boolean {
   return hasExecutableModuleReference(text, isCrumbtrailModuleSpecifier);
 }
 
-/** True when source executes the early browser side-effect module. */
+function earlyImportArgument(node: any): boolean {
+  const argument =
+    node?.type === "ImportExpression"
+      ? node.source
+      : node?.type === "CallExpression" && node.callee?.type === "Import"
+        ? node.arguments?.[0]
+        : null;
+  return stringLiteralValue(argument) === "crumbtrail-core/early";
+}
+
+function topLevelAwaitedEarlyImportPositions(program: any): number[] {
+  const positions: number[] = [];
+  for (const statement of program.body ?? []) {
+    if (
+      statement.type === "ExpressionStatement" &&
+      statement.expression?.type === "AwaitExpression" &&
+      earlyImportArgument(statement.expression.argument)
+    ) {
+      positions.push(statement.start ?? 0);
+      continue;
+    }
+    if (statement.type !== "VariableDeclaration") continue;
+    for (const declaration of statement.declarations ?? []) {
+      if (
+        declaration.init?.type === "AwaitExpression" &&
+        earlyImportArgument(declaration.init.argument)
+      ) {
+        positions.push(statement.start ?? 0);
+      }
+    }
+  }
+  return positions;
+}
+
+function topLevelInitPositions(program: any): number[] {
+  const positions: number[] = [];
+  const visit = (node: any): void => {
+    if (!node || typeof node !== "object") return;
+    if (
+      /^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
+        node.type ?? "",
+      )
+    )
+      return;
+    if (
+      node.type === "CallExpression" &&
+      node.callee?.type === "MemberExpression" &&
+      !node.callee.computed &&
+      node.callee.object?.type === "Identifier" &&
+      node.callee.object.name === "Crumbtrail" &&
+      node.callee.property?.type === "Identifier" &&
+      node.callee.property.name === "init"
+    ) {
+      positions.push(node.start ?? 0);
+      return;
+    }
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object" && "type" in value)
+        visit(value);
+    }
+  };
+  for (const statement of program.body ?? []) visit(statement);
+  return positions;
+}
+
+/**
+ * True when the early module is proven to run before browser initialization.
+ *
+ * A static side-effect import is evaluated before the module body regardless of
+ * where its declaration appears. A dynamic import is only equivalent when its
+ * promise is awaited by a top-level statement before every visible init call.
+ * An unawaited import, or one hidden in a function, is not ordering evidence.
+ */
 export function hasExecutableEarlyBrowserImport(text: string): boolean {
-  return hasExecutableModuleReference(
-    text,
-    (specifier) => specifier === "crumbtrail-core/early",
-    { allowExports: false },
-  );
+  const program = parseModuleProgram(text);
+  if (program) {
+    const staticSideEffect = (program.body ?? []).some(
+      (statement: any) =>
+        statement.type === "ImportDeclaration" &&
+        statement.importKind !== "type" &&
+        (statement.specifiers?.length ?? 0) === 0 &&
+        stringLiteralValue(statement.source) === "crumbtrail-core/early",
+    );
+    if (staticSideEffect) return true;
+    const awaited = topLevelAwaitedEarlyImportPositions(program);
+    if (awaited.length === 0) return false;
+    const initPositions = topLevelInitPositions(program);
+    return awaited.some((position) =>
+      initPositions.every((initPosition) => position < initPosition),
+    );
+  }
+
+  const mask = maskLiterals(text);
+  if (mask === null) return false;
+  STATIC_IMPORT_REFERENCE.lastIndex = 0;
+  for (const candidate of text.matchAll(STATIC_IMPORT_REFERENCE)) {
+    if (
+      executableModuleKeyword(mask, candidate, "import") &&
+      firstModuleSpecifier(candidate) === "crumbtrail-core/early"
+    )
+      return true;
+  }
+  const initPositions = [
+    ...mask.matchAll(/\bCrumbtrail\s*\.\s*init\s*\(/g),
+  ].map((match) => match.index ?? Number.POSITIVE_INFINITY);
+  const awaited = /\bawait\s+import\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/g;
+  for (const candidate of text.matchAll(awaited)) {
+    if (
+      executableModuleKeyword(mask, candidate, "import") &&
+      firstModuleSpecifier(candidate) === "crumbtrail-core/early" &&
+      initPositions.every((position) => (candidate.index ?? 0) < position)
+    )
+      return true;
+  }
+  return false;
 }
 
 /** Offset of the `}` matching the `{` at `open`, or -1. Runs over the mask. */

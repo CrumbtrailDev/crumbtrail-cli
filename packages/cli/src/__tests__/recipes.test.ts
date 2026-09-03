@@ -359,6 +359,52 @@ describe("buildPlan — idempotency", () => {
     expect(plan.content).toBe('import "crumbtrail-core/early";');
   });
 
+  it("retrofits at the browser entry boundary when init lives in a helper", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.49.0" },
+      }),
+      [installed("crumbtrail-core")]: JSON.stringify({
+        name: "crumbtrail-core",
+        version: "0.49.0",
+      }),
+      [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+      [p("src", "main.ts")]:
+        '"use client";\nimport "./telemetry";\nrender();\n',
+      [p("src", "telemetry.ts")]: [
+        'import { Crumbtrail } from "crumbtrail-core";',
+        "Crumbtrail.init({",
+        `  httpEndpoint: "${ENDPOINT}",`,
+        "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+        "  remoteConfig: true,",
+        '  service: "web",',
+        "});",
+        "",
+      ].join("\n"),
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.targetPath).toBe(p("src", "main.ts"));
+    const materialized = prependIntoSource(
+      io.readFile(p("src", "main.ts"))!,
+      plan.content!,
+    );
+    expect(materialized.startsWith('"use client";')).toBe(true);
+    expect(
+      materialized.indexOf('import "crumbtrail-core/early";'),
+    ).toBeLessThan(materialized.indexOf('import "./telemetry";'));
+  });
+
   it.each([
     ["a line comment", '// import "crumbtrail-core/early";'],
     ["a block comment", '/* import "crumbtrail-core/early"; */'],
@@ -405,14 +451,19 @@ describe("buildPlan — idempotency", () => {
     ["window.import", 'window.import("crumbtrail-core/early")', "prepend"],
     ["loader.require", 'loader.require("crumbtrail-core/early")', "prepend"],
     [
-      "a dynamic import",
+      "an unawaited dynamic import",
       'import("crumbtrail-core/early")',
+      "prepend",
+    ],
+    [
+      "an awaited dynamic import",
+      'await import("crumbtrail-core/early")',
       "skip-already-wired",
     ],
     [
       "a bare require",
       'require("crumbtrail-core/early")',
-      "skip-already-wired",
+      "prepend",
     ],
     [
       "a static import",
@@ -425,7 +476,7 @@ describe("buildPlan — idempotency", () => {
       "prepend",
     ],
   ] as const)(
-    "accepts only a bare executable early marker in %s",
+    "accepts only an ordering-safe executable early marker in %s",
     (_kind, marker, expected) => {
       const source = [
         marker,
@@ -463,6 +514,44 @@ describe("buildPlan — idempotency", () => {
       expect(plan.kind).toBe(expected);
     },
   );
+
+  it("does not treat an awaited dynamic import after init as an early marker", () => {
+    const source = [
+      'import { Crumbtrail } from "crumbtrail-core";',
+      "Crumbtrail.init({",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "  remoteConfig: true,",
+      '  service: "web",',
+      "});",
+      'await import("crumbtrail-core/early");',
+      "",
+    ].join("\n");
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.49.0" },
+      }),
+      [installed("crumbtrail-core")]: JSON.stringify({
+        name: "crumbtrail-core",
+        version: "0.49.0",
+      }),
+      [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+      [p("src", "main.ts")]: source,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.content).toBe('import "crumbtrail-core/early";');
+  });
 
   it("returns an upgrade action instead of skipping a framework integration on an older SDK", () => {
     const source = [

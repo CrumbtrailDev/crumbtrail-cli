@@ -8,6 +8,7 @@ import {
 import type { Recipe } from "../detect";
 import type { InjectIO } from "./io";
 import {
+  executableModuleSpecifiers,
   findCallSites,
   hasExecutableCrumbtrailReference,
   maskLiterals,
@@ -95,8 +96,6 @@ const SERVER_RECIPES = new Set<Recipe>([
 ]);
 
 const CRUMBTRAIL_REFERENCE = hasExecutableCrumbtrailReference;
-export const LOCAL_IMPORT =
-  /(?:from\s+|import\s*\(|import\s+|require\s*\()\s*["']([^"']+)["']/g;
 const ENDPOINT_ENV =
   /\b[A-Z][A-Z0-9_]*CRUMBTRAIL[A-Z0-9_]*ENDPOINT[A-Z0-9_]*\b/g;
 const ENV_NAME =
@@ -262,9 +261,8 @@ export function reachableSourceFiles(
     const text = input.io.readFile(file);
     if (text === null) continue;
     files.push({ file, text });
-    LOCAL_IMPORT.lastIndex = 0;
-    for (const match of text.matchAll(LOCAL_IMPORT)) {
-      const imported = sourceModulePath(input.io, file, match[1]);
+    for (const specifier of executableModuleSpecifiers(text)) {
+      const imported = sourceModulePath(input.io, file, specifier);
       if (imported && !visited.has(imported)) pending.push(imported);
     }
   }

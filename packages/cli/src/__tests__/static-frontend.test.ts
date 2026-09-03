@@ -190,6 +190,33 @@ describe("insertIntoHtmlHead", () => {
     expect(htmlReferencesCrumbtrail(html)).toBe(false);
   });
 
+  it("requires an actual package URL for src and executable module code inline", () => {
+    expect(
+      htmlReferencesCrumbtrail(
+        PAGE.replace(
+          "    <title>Landing</title>",
+          '    <script src="https://untrusted.example/crumbtrail-core@0.49.0.js"></script>',
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      htmlReferencesCrumbtrail(
+        PAGE.replace(
+          "    <title>Landing</title>",
+          '<script type="module">// import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";\nconst note = "crumbtrail-core";</script>',
+        ),
+      ),
+    ).toBe(false);
+    expect(
+      htmlReferencesCrumbtrail(
+        PAGE.replace(
+          "    <title>Landing</title>",
+          '<script type="module">import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";</script>',
+        ),
+      ),
+    ).toBe(true);
+  });
+
   it.each(["template", "noscript", "style", "textarea"])(
     "does not inject into an inert %s element",
     (tag) => {

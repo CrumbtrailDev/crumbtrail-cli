@@ -90,6 +90,29 @@ describe("inspectIntegration", () => {
     );
   });
 
+  it("follows only executable local imports, not comments or strings", () => {
+    const reachable = reachableSourceFiles({
+      cwd: CWD,
+      recipe: "node",
+      endpoint: ENDPOINT,
+      entryFile: p("src", "index.ts"),
+      io: fakeInjectIO({
+        [p("src", "index.ts")]: [
+          '// import "./commented.ts";',
+          'const note = "import ./quoted.ts";',
+          'import "./real.ts";',
+        ].join("\n"),
+        [p("src", "commented.ts")]: "commented()",
+        [p("src", "quoted.ts")]: "quoted()",
+        [p("src", "real.ts")]: "real()",
+      }),
+    });
+    const files = reachable.map((entry) => entry.file);
+    expect(files).toContain(p("src", "real.ts"));
+    expect(files).not.toContain(p("src", "commented.ts"));
+    expect(files).not.toContain(p("src", "quoted.ts"));
+  });
+
   it("requires complete endpoint, key, service and remote configuration evidence", () => {
     const status = inspectIntegration({
       cwd: CWD,

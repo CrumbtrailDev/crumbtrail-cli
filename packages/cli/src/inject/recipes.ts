@@ -557,18 +557,41 @@ const EARLY_BROWSER_RECIPES = new Set<Recipe>([
 function hasEarlyBrowserMarker(
   input: BuildPlanInput,
   io: InjectIO,
-  source?: string,
+  boundaryFile?: string | null,
 ): boolean {
   if (!EARLY_BROWSER_RECIPES.has(input.recipe)) return true;
-  if (source && hasExecutableEarlyBrowserImport(source)) return true;
-  return reachableSourceFiles({
+  const reachable = reachableSourceFiles({
     cwd: input.cwd,
     recipe: input.recipe,
     endpoint: input.endpoint,
     entryFile: input.entryFile,
     serviceName: input.serviceName,
     io,
-  }).some((entry) => hasExecutableEarlyBrowserImport(entry.text));
+  });
+  const boundary = boundaryFile ?? input.entryFile ?? reachable[0]?.file;
+  const source = boundary ? io.readFile(boundary) : null;
+  return source !== null && source !== undefined
+    ? hasExecutableEarlyBrowserImport(source)
+    : false;
+}
+
+/** The first browser module the framework executes, not a helper it imports. */
+function browserEntryBoundary(
+  input: BuildPlanInput,
+  io: InjectIO,
+): string | null {
+  if (input.entryFile) return path.resolve(input.entryFile);
+  if (!EARLY_BROWSER_RECIPES.has(input.recipe)) return null;
+  return (
+    reachableSourceFiles({
+      cwd: input.cwd,
+      recipe: input.recipe,
+      endpoint: input.endpoint,
+      entryFile: input.entryFile,
+      serviceName: input.serviceName,
+      io,
+    })[0]?.file ?? null
+  );
 }
 
 function earlyCaptureUnavailablePlan(
@@ -593,7 +616,11 @@ function earlyCaptureUnavailablePlan(
   };
 }
 
-function earlyBrowserUpgradePlan(input: BuildPlanInput, io: InjectIO): Plan {
+function earlyBrowserUpgradePlan(
+  input: BuildPlanInput,
+  io: InjectIO,
+  boundaryFile?: string | null,
+): Plan {
   const reachable = reachableSourceFiles({
     cwd: input.cwd,
     recipe: input.recipe,
@@ -603,8 +630,9 @@ function earlyBrowserUpgradePlan(input: BuildPlanInput, io: InjectIO): Plan {
     io,
   });
   const file =
+    boundaryFile ??
+    browserEntryBoundary(input, io) ??
     reachable.find((entry) => referencesCrumbtrail(entry.text))?.file ??
-    input.entryFile ??
     null;
   const version = browserEarlyCaptureVersion(input.sdkVersion);
   if (!version || !file)
@@ -637,6 +665,7 @@ function existingIntegrationPlan(
   input: BuildPlanInput,
   io: InjectIO,
   source: string,
+  boundaryFile?: string | null,
 ): Plan | null {
   if (!referencesCrumbtrail(source)) return null;
   const status = inspectIntegration({
@@ -648,8 +677,8 @@ function existingIntegrationPlan(
     io,
   });
   if (status.complete) {
-    if (!hasEarlyBrowserMarker(input, io, source))
-      return earlyBrowserUpgradePlan(input, io);
+    if (!hasEarlyBrowserMarker(input, io, boundaryFile))
+      return earlyBrowserUpgradePlan(input, io, boundaryFile);
     return skipPlan(input);
   }
   return amendPlan(input, io, status) ?? incompletePlan(input, status);
@@ -884,7 +913,7 @@ function prependWithPreflight(
       `Could not read ${target}; use the snippet or AI prompt to wire it manually.`,
     ]);
   }
-  const existingPlan = existingIntegrationPlan(input, io, existing);
+  const existingPlan = existingIntegrationPlan(input, io, existing, target);
   if (existingPlan) return existingPlan;
 
   // Wiring a backend whose CORS config pins an explicit header list, without
@@ -1148,7 +1177,12 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
     if (loaded) {
       const existing = io.readFile(loaded);
       if (existing) {
-        const existingPlan = existingIntegrationPlan(input, io, existing);
+        const existingPlan = existingIntegrationPlan(
+          input,
+          io,
+          existing,
+          loaded,
+        );
         if (existingPlan) return existingPlan;
       }
       // A user-owned instrumentation-client already exists — prepend into it,
@@ -1253,7 +1287,7 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
   if (io.exists(target)) {
     const existing = io.readFile(target);
     if (existing) {
-      const existingPlan = existingIntegrationPlan(input, io, existing);
+      const existingPlan = existingIntegrationPlan(input, io, existing, target);
       if (existingPlan) return existingPlan;
     }
     // Don't clobber an existing user plugin of the same name — hand off.
@@ -1394,7 +1428,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
       `Could not read ${target}; use the snippet or AI prompt to wire it manually.`,
     ]);
   }
-  const existingPlan = existingIntegrationPlan(input, io, existing);
+  const existingPlan = existingIntegrationPlan(input, io, existing, target);
   if (existingPlan) return existingPlan;
 
   const style = detectExpressModuleStyle(existing);
@@ -2106,7 +2140,7 @@ function planFlutter(input: BuildPlanInput, io: InjectIO): Plan {
       buildNote,
     ]);
   }
-  const existingPlan = existingIntegrationPlan(input, io, existing);
+  const existingPlan = existingIntegrationPlan(input, io, existing, target);
   if (existingPlan) return existingPlan;
 
   const wired = wireFlutterMain(
@@ -3812,8 +3846,9 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
     io,
   });
   if (integration.complete) {
-    if (!hasEarlyBrowserMarker(input, io))
-      return earlyBrowserUpgradePlan(input, io);
+    const boundary = browserEntryBoundary(input, io);
+    if (!hasEarlyBrowserMarker(input, io, boundary))
+      return earlyBrowserUpgradePlan(input, io, boundary);
     return skipPlan(input);
   }
   // An incomplete integration the customer already wrote is a thing to FINISH,

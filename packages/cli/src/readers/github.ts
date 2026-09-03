@@ -24,7 +24,8 @@ import {
   serverlessDetectionSourceFiles,
 } from "../detect";
 import { DEPLOY_CONFIG_RE } from "../inject/entrypoints";
-import { LOCAL_IMPORT, SOURCE_EXTENSIONS } from "../inject/integration";
+import { executableModuleSpecifiers } from "../inject/amend";
+import { SOURCE_EXTENSIONS } from "../inject/integration";
 import type { FileReader } from "./types";
 
 /** Thrown when detection reads a path hydration did not prefetch. */
@@ -483,8 +484,7 @@ export async function prefetchImportClosure(
     read += 1;
 
     const targets: string[] = [];
-    for (const match of text.matchAll(LOCAL_IMPORT)) {
-      const specifier = match[1];
+    for (const specifier of executableModuleSpecifiers(text)) {
       if (!specifier.startsWith(".")) continue;
       const base = path.posix.resolve(path.posix.dirname(file), specifier);
       const ext = path.posix.extname(base);

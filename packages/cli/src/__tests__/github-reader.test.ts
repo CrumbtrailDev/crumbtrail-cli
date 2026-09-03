@@ -260,6 +260,29 @@ describe("hydrateGithubReader", () => {
     expect(reader.readFile(`/src/file${count - 1}.ts`)).toContain("done");
   });
 
+  it("does not prefetch local paths mentioned only in comments or strings", async () => {
+    const { src } = source(
+      {
+        "package.json": "{}",
+        "src/index.ts": [
+          '// import "./commented.ts";',
+          'const note = "import ./quoted.ts";',
+        ].join("\n"),
+        "src/commented.ts": "commented()",
+        "src/quoted.ts": "quoted()",
+      },
+      ["src"],
+    );
+    const reader = await hydrateGithubReader(src);
+    await prefetchImportClosure(reader, ["/src/index.ts"]);
+    expect(() => reader.readFile("/src/commented.ts")).toThrow(
+      UnhydratedPathError,
+    );
+    expect(() => reader.readFile("/src/quoted.ts")).toThrow(
+      UnhydratedPathError,
+    );
+  });
+
   it("hydrates every ambiguous emitted source before refusing resolution", async () => {
     const { src } = source(
       {
