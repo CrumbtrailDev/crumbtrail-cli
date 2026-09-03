@@ -439,6 +439,70 @@ describe("HttpTransport session start ordering", () => {
     expect(eventCalls).toHaveLength(0);
   });
 
+  it("uploads delayed replay to its admitted old session after rollover", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response('{"ok":true}')),
+    );
+    const transport = new HttpTransport(endpoint, { authToken: "t" });
+    await transport.startSession("ses_old", {});
+    await transport.startSession("ses_new", {});
+
+    await transport.sendBlob(
+      "replay-000000.json.gz",
+      new Blob(["late"]),
+      undefined,
+      "ses_old",
+      true,
+    );
+
+    const blobCall = (fetch as ReturnType<typeof vi.fn>).mock.calls.find(
+      ([url]) => String(url).endsWith("/api/blob/replay-000000.json.gz"),
+    );
+    expect(blobCall?.[1]?.headers).toMatchObject({
+      "X-Session-Id": "ses_old",
+    });
+  });
+
+  it("rejects delayed replay for refused or finalized old sessions", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (
+          String(url).endsWith("/api/session/start") &&
+          JSON.parse(String(init?.body)).sessionId === "ses_refused"
+        ) {
+          return new Response('{"error":"refused"}', { status: 402 });
+        }
+        return new Response('{"ok":true}');
+      }),
+    );
+    const transport = new HttpTransport(endpoint, { authToken: "t" });
+    await expect(transport.startSession("ses_refused", {})).rejects.toThrow();
+    await transport.startSession("ses_old", {});
+    await transport.startSession("ses_new", {});
+
+    await expect(
+      transport.sendBlob(
+        "replay.json",
+        new Blob(["late"]),
+        undefined,
+        "ses_refused",
+        true,
+      ),
+    ).rejects.toMatchObject({ status: 402 });
+    await transport.endSession("ses_old");
+    await expect(
+      transport.sendBlob(
+        "replay.json",
+        new Blob(["late"]),
+        undefined,
+        "ses_old",
+        true,
+      ),
+    ).rejects.toMatchObject({ status: 0 });
+  });
+
   it("refuses events locally when the start it waited for was refused", async () => {
     vi.stubGlobal(
       "fetch",

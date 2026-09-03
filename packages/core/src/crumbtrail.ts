@@ -2179,8 +2179,23 @@ export class Crumbtrail {
         masking: this.replayMasking,
         ...this.applicationRelease,
         sdkVersion: CRUMBTRAIL_SDK_VERSION,
-        send: (name, body) =>
-          this.transport.sendBlob(name, body, undefined, replaySessionId),
+        send: (name, body) => {
+          const sendBlob = this.transport.sendBlob as (
+            name: string,
+            blob: Blob,
+            metadata?: Record<string, unknown>,
+            sessionId?: string,
+            allowPreviousSession?: boolean,
+          ) => Promise<void>;
+          return sendBlob.call(
+            this.transport,
+            name,
+            body,
+            undefined,
+            replaySessionId,
+            true,
+          );
+        },
       });
       this.replay.start();
       return;

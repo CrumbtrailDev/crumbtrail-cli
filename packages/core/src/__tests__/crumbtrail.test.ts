@@ -1108,6 +1108,7 @@ describe("Crumbtrail", () => {
         expect.any(Blob),
         undefined,
         oldSessionId,
+        true,
       );
       await logger.stop();
     });
