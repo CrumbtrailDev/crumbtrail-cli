@@ -60,9 +60,10 @@ fun installCrashHandler(
         runCatching {
             crashStore.write(
                 CrumbtrailPendingCrash(
-                    message = throwable.message ?: throwable.toString(),
-                    stack = throwable.stackTraceToString(),
-                    thread = thread.name,
+                    message = boundedDiagnosticText(throwable.message ?: throwable.toString(), 1_024)
+                        ?: "uncaught exception",
+                    stack = boundedStackTrace(throwable),
+                    thread = boundedDiagnosticText(thread.name, 256),
                     at = System.currentTimeMillis(),
                 )
             )

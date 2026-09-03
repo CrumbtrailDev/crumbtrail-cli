@@ -67,6 +67,10 @@ data class CrumbtrailCollectors(
     val appLifecycle: Boolean = true,
     val navigation: Boolean = true,
     val environment: Boolean = true,
+    /** Foreground main-thread watchdog with a five second default threshold. */
+    val nativeWatchdog: Boolean = true,
+    /** Previous-launch process exits, memory pressure and native diagnostics. */
+    val nativeDiagnostics: Boolean = true,
 )
 
 data class CrumbtrailConfig(
