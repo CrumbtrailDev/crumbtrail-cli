@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Crumbtrail } from "../crumbtrail";
 import {
   APPLICATION_EXPECTATION_MISSED_EVENT_KIND,
   APPLICATION_RESPONSE_ASSERTION_EVENT_KIND,
@@ -412,5 +413,70 @@ describe("application expectation lifecycle", () => {
         timestamp,
       ),
     ).toEqual({ accepted: false, rejection: "invalid_options" });
+  });
+});
+
+describe("application contracts through Crumbtrail", () => {
+  it("flushes response mismatches and shutdown misses through the active session", async () => {
+    const sink = {
+      sendEvents: vi.fn().mockResolvedValue(undefined),
+      sendBlob: vi.fn().mockResolvedValue(undefined),
+      startSession: vi.fn().mockResolvedValue(undefined),
+      endSession: vi.fn().mockResolvedValue(undefined),
+      sendBugReport: vi.fn().mockResolvedValue(undefined),
+    };
+    const logger = Crumbtrail.init({
+      transportInstance: sink,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1,
+    });
+
+    const response = logger.checkResponse(
+      { data: { status: "wrong" } },
+      [
+        {
+          name: "status",
+          operator: "equals",
+          expected: "right",
+          path: "data.status",
+        },
+      ],
+      { requestId: "req_contract" },
+    );
+    const expectation = logger.expectSideEffect({
+      name: "external_sync",
+      kind: "external",
+      deadlineMs: 10_000,
+    });
+
+    await logger.stop();
+
+    const events = sink.sendEvents.mock.calls.flatMap(
+      (call) => call[0] as Array<{ k: string; d: Record<string, unknown> }>,
+    );
+    expect(response.results[0]).toMatchObject({
+      accepted: true,
+      passed: false,
+    });
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          k: APPLICATION_RESPONSE_ASSERTION_EVENT_KIND,
+          d: expect.objectContaining({
+            name: "status",
+            actual: "wrong",
+            requestId: "req_contract",
+          }),
+        }),
+        expect.objectContaining({
+          k: APPLICATION_EXPECTATION_MISSED_EVENT_KIND,
+          d: expect.objectContaining({
+            name: "external_sync",
+            reason: "session_shutdown",
+          }),
+        }),
+      ]),
+    );
+    expect(expectation.handle?.satisfy()).toBe(false);
   });
 });
