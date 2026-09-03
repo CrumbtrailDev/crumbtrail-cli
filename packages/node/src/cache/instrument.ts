@@ -45,6 +45,7 @@ const MAX_BATCH_KEYS = 50;
 const MAX_BATCH_FAILURES = 100;
 
 interface OperationCapture {
+  acknowledged?: (result: unknown) => boolean;
   op: string;
   keys: unknown[];
   value?: unknown;
@@ -224,6 +225,9 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
               op: capture.op,
               keys: capture.keys,
               requestId,
+              ...(capture.acknowledged?.(value)
+                ? { outcome: "success" as const }
+                : {}),
               ...(capture.hit ? { hit: capture.hit(value) } : {}),
               ...ttlInput(capture, value),
               ...(capture.resultValue
@@ -718,6 +722,47 @@ function isBatchInstrumented(value: DuckTypedCacheClient): boolean {
   }
 }
 
+function hasStatusReplySetOptions(options: readonly unknown[]): boolean {
+  try {
+    if (options.length > 16) return false;
+    // SET GET returns the previous value, which can itself be "OK" even when NX prevents a write.
+    if (options.length === 1 && isRecord(options[0])) {
+      const prototype = Object.getPrototypeOf(options[0]);
+      if (prototype !== Object.prototype && prototype !== null) return false;
+      const descriptors = Object.getOwnPropertyDescriptors(options[0]);
+      if (Reflect.ownKeys(descriptors).length > 8) return false;
+      return Reflect.ownKeys(descriptors).every((key) => {
+        if (typeof key !== "string") return false;
+        const descriptor = descriptors[key]!;
+        if (!("value" in descriptor)) return false;
+        if (["NX", "XX", "KEEPTTL"].includes(key))
+          return typeof descriptor.value === "boolean";
+        return (
+          ["EX", "PX", "EXAT", "PXAT"].includes(key) &&
+          typeof descriptor.value === "number" &&
+          Number.isFinite(descriptor.value)
+        );
+      });
+    }
+    for (let index = 0; index < options.length; index++) {
+      const option = options[index];
+      if (typeof option !== "string") return false;
+      const flag = option.toUpperCase();
+      if (["NX", "XX", "KEEPTTL"].includes(flag)) continue;
+      if (!["EX", "PX", "EXAT", "PXAT"].includes(flag)) return false;
+      const value = options[++index];
+      if (
+        (typeof value !== "number" && typeof value !== "string") ||
+        !Number.isFinite(Number(value))
+      )
+        return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function describeOperation(
   op: string,
   args: readonly unknown[],
@@ -745,10 +790,12 @@ function describeOperation(
   }
   if (op === "set") {
     const ttlMs = ttlFromSetArgs(args);
+    const statusReply = hasStatusReplySetOptions(args.slice(2));
     return {
       op,
       keys: [args[0]],
       value: args[1],
+      acknowledged: (result) => result === "OK" && statusReply,
       ...(ttlMs !== undefined ? { ttlMs } : {}),
     };
   }
@@ -758,6 +805,7 @@ function describeOperation(
       op,
       keys: [args[0]],
       value: args[2],
+      acknowledged: (result) => result === "OK" && args.length === 3,
       ...(amount !== undefined
         ? { ttlMs: op === "setex" ? amount * 1_000 : amount }
         : {}),

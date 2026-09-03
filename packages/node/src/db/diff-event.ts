@@ -59,6 +59,8 @@ export interface BuildDbDiffEventInput {
    * PlanetScale uses the same `mysql` tag as transactional MySQL clients.
    */
   raceEvidenceCapability?: "transaction-outcome";
+  /** Driver observed no active transaction immediately after this successful mutation. */
+  observedAutocommit?: boolean;
 }
 
 /**
@@ -213,7 +215,8 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     if (raceEvidence) {
       d.raceEvidence = raceEvidence;
       d.serviceCompatibility = readRaceServiceCompatibility(input.raceEvidence);
-      d.transactionOutcome = "committed";
+      d.transactionOutcome =
+        input.observedAutocommit === true ? "committed" : "unknown";
     }
   }
 

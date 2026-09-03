@@ -234,10 +234,14 @@ export function readInstrumentRaceEvidence(options: {
   }
 }
 
-export function readRaceServiceCompatibility(options: RaceEvidenceOptions | undefined): "compatible" | "incompatible" | "unknown" {
+export function readRaceServiceCompatibility(
+  options: RaceEvidenceOptions | undefined,
+): "compatible" | "incompatible" | "unknown" {
   try {
     const value = options?.serviceCompatibility;
-    return value === "compatible" || value === "incompatible" ? value : "unknown";
+    return value === "compatible" || value === "incompatible"
+      ? value
+      : "unknown";
   } catch {
     return "unknown";
   }
