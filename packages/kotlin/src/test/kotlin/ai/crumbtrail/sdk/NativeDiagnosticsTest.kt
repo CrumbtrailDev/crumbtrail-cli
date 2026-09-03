@@ -29,6 +29,7 @@ private class FakeWatchdogScheduler : CrumbtrailWatchdogScheduler {
 
     override fun postToMain(task: () -> Unit) { main.addLast(task) }
     override fun postToBackground(task: () -> Unit) { background.addLast(task) }
+    override fun drain() { runBackground() }
 
     override fun shutdown() { shutdownCalled = true }
 
@@ -103,15 +104,42 @@ class MainThreadWatchdogTest {
         now = 6_200
         scheduler.runMain()
 
+        assertEquals(0, observations.size)
+        assertNotNull(handoff.read())
+        scheduler.runBackground()
         assertEquals(1, observations.size)
         assertTrue(observations.single().recovered)
         assertFalse(observations.single().previousLaunch)
         assertEquals(6_200L, observations.single().observedDurationMs)
-        assertNotNull(handoff.read())
-        scheduler.runBackground()
         assertNull(handoff.read())
         scheduler.runMain()
         assertEquals(1, observations.size)
+    }
+
+    @Test
+    fun `stop drains recovery cleanup without main thread disk work`() {
+        val scheduler = FakeWatchdogScheduler()
+        val handoff = MemoryPendingHangStore()
+        var now = 0L
+        val watchdog = CrumbtrailMainThreadWatchdog(
+            scheduler = scheduler,
+            handoff = handoff,
+            onHang = {},
+            now = { now },
+        )
+
+        watchdog.start()
+        scheduler.runMain()
+        now = 5_000
+        scheduler.runNextScheduled()
+        now = 5_100
+        scheduler.runMain()
+        assertNotNull(handoff.read())
+
+        watchdog.stop()
+
+        assertNull(handoff.read())
+        assertTrue(scheduler.shutdownCalled)
     }
 
     @Test
@@ -163,6 +191,28 @@ class MainThreadWatchdogTest {
         dynamicallyAttached = false
         attachedScheduler.runNextScheduled()
         assertEquals(1, attachedScheduler.scheduledCount)
+
+        val racedScheduler = FakeWatchdogScheduler()
+        var racedAttached = true
+        var pauseDuringPoll = false
+        lateinit var racedWatchdog: CrumbtrailMainThreadWatchdog
+        racedWatchdog = CrumbtrailMainThreadWatchdog(
+            scheduler = racedScheduler,
+            handoff = MemoryPendingHangStore(),
+            onHang = {},
+            isDebuggerAttached = {
+                if (pauseDuringPoll) {
+                    pauseDuringPoll = false
+                    racedWatchdog.pause()
+                }
+                racedAttached
+            },
+        )
+        racedWatchdog.start()
+        racedAttached = false
+        pauseDuringPoll = true
+        racedScheduler.runNextScheduled()
+        assertEquals(0, racedScheduler.scheduledCount)
     }
 
     @Test

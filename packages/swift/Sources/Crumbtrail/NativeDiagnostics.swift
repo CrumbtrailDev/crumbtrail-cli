@@ -101,6 +101,7 @@ public protocol CrumbtrailWatchdogScheduler: AnyObject {
     func schedule(after seconds: TimeInterval, _ task: @escaping () -> Void) -> CrumbtrailWatchdogTask
     func postToMain(_ task: @escaping () -> Void)
     func postToBackground(_ task: @escaping () -> Void)
+    func drain()
     func shutdown()
 }
 
@@ -108,6 +109,8 @@ public extension CrumbtrailWatchdogScheduler {
     func postToBackground(_ task: @escaping () -> Void) {
         _ = schedule(after: 0, task)
     }
+
+    func drain() {}
 }
 
 /// Foreground only watchdog state machine. The platform adapter supplies the
@@ -200,6 +203,7 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
 
     public func stop() {
         pause()
+        scheduler.drain()
         scheduler.shutdown()
     }
 
@@ -284,11 +288,13 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
             )
         }
         lastHeartbeatAt = current
-        lock.unlock()
         if let observation {
-            onHang(observation)
-            scheduler.postToBackground { self.handoff.clear() }
+            scheduler.postToBackground {
+                self.handoff.clear()
+                self.onHang(observation)
+            }
         }
+        lock.unlock()
     }
 
     private func debuggerAttached() -> Bool {
@@ -309,11 +315,15 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
     }
 
     private func scheduleDebuggerPoll() {
+        lock.lock()
+        if !debuggerSuppressed || running {
+            lock.unlock()
+            return
+        }
         let task = scheduler.schedule(after: TimeInterval(checkIntervalMs) / 1_000) {
             [weak self] in self?.pollDebugger()
         }
-        lock.lock()
-        if debuggerSuppressed { debuggerPollTask = task } else { task.cancel() }
+        if debuggerSuppressed && !running { debuggerPollTask = task } else { task.cancel() }
         lock.unlock()
     }
 
@@ -326,17 +336,29 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
             scheduleDebuggerPoll()
             return
         }
+        resumeAfterDebugger()
+    }
+
+    /// Transition out of debugger suppression atomically with the running state.
+    private func resumeAfterDebugger() {
+        var token: Int64 = 0
         lock.lock()
-        let shouldResume: Bool
-        if debuggerSuppressed {
-            debuggerSuppressed = false
-            debuggerPollTask = nil
-            shouldResume = true
-        } else {
-            shouldResume = false
+        guard debuggerSuppressed && !running else {
+            lock.unlock()
+            return
         }
+        debuggerSuppressed = false
+        debuggerPollTask = nil
+        running = true
+        generation += 1
+        token = generation
+        lastHeartbeatAt = now()
         lock.unlock()
-        if shouldResume { start() }
+
+        // Pause can win after the transition. scheduleCheck cancels its task
+        // when it observes the newer generation, and the heartbeat is a no-op.
+        scheduleCheck(token)
+        scheduler.postToMain { [weak self] in self?.heartbeat(token) }
     }
 }
 
@@ -366,6 +388,10 @@ public func drainPendingHang(
 /// without using UserDefaults as a second persistence mechanism.
 public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStore {
     private static let fileName = "crumbtrail-pending-hang.json"
+    private static let temporaryFileSuffix = ".tmp"
+    private static let temporaryFileLifetime: TimeInterval = 24 * 60 * 60
+    private static let maximumTemporaryFilesToInspect = 32
+    private static let maximumTemporaryFilesToRemove = 8
     private let fileURL: URL?
     private let fileManager: FileManager
 
@@ -374,6 +400,7 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
             named: Self.fileName
         )
         self.fileManager = fileManager
+        cleanupTemporaryFiles()
     }
 
     public func write(_ hang: CrumbtrailPendingHang) {
@@ -390,6 +417,7 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
               data.count <= crumbtrailMaxPendingHangFileBytes
         else { return }
 
+        cleanupTemporaryFiles()
         let temporaryName = "." + fileURL.lastPathComponent + "." + UUID().uuidString + ".tmp"
         let temporaryURL = fileURL.deletingLastPathComponent().appendingPathComponent(temporaryName)
         do {
@@ -409,6 +437,7 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
     }
 
     public func read() -> CrumbtrailPendingHang? {
+        cleanupTemporaryFiles()
         guard let fileURL,
               let data = try? Data(contentsOf: fileURL),
               data.count <= crumbtrailMaxPendingHangFileBytes,
@@ -424,8 +453,44 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
     }
 
     public func clear() {
+        cleanupTemporaryFiles()
         guard let fileURL else { return }
         try? fileManager.removeItem(at: fileURL)
+    }
+
+    /// Removes only old temporary replacements owned by this handoff file.
+    /// Fresh replacements may still belong to an interrupted writer, so age is
+    /// required before deletion and both inspection and removal are bounded.
+    private func cleanupTemporaryFiles(now: Date = Date()) {
+        guard let fileURL else { return }
+        let directory = fileURL.deletingLastPathComponent()
+        let prefix = "." + fileURL.lastPathComponent + "."
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: []
+        ) else { return }
+
+        let candidates = entries
+            .filter {
+                let name = $0.lastPathComponent
+                return name.hasPrefix(prefix) && name.hasSuffix(Self.temporaryFileSuffix)
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .prefix(Self.maximumTemporaryFilesToInspect)
+        let cutoff = now.addingTimeInterval(-Self.temporaryFileLifetime)
+        var removed = 0
+        for entry in candidates {
+            guard removed < Self.maximumTemporaryFilesToRemove,
+                  let values = try? entry.resourceValues(
+                      forKeys: [.contentModificationDateKey, .isRegularFileKey]
+                  ),
+                  values.isRegularFile == true,
+                  let modified = values.contentModificationDate,
+                  modified < cutoff
+            else { continue }
+            if (try? fileManager.removeItem(at: entry)) != nil { removed += 1 }
+        }
     }
 }
 

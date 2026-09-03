@@ -29,6 +29,7 @@ private final class FakeWatchdogScheduler: CrumbtrailWatchdogScheduler {
 
     func postToMain(_ task: @escaping () -> Void) { main.append(task) }
     func postToBackground(_ task: @escaping () -> Void) { background.append(task) }
+    func drain() { runBackground() }
 
     func shutdown() { shutdownCalled = true }
 
@@ -85,13 +86,39 @@ final class NativeDiagnosticsTests: XCTestCase {
 
         now = 6_200
         scheduler.runMain()
+        XCTAssertTrue(observations.isEmpty)
+        XCTAssertNotNil(handoff.read())
+        scheduler.runBackground()
         XCTAssertEqual(observations.count, 1)
         XCTAssertTrue(observations[0].recovered)
         XCTAssertFalse(observations[0].previousLaunch)
         XCTAssertEqual(observations[0].observedDurationMs, 6_200)
-        XCTAssertNotNil(handoff.read())
-        scheduler.runBackground()
         XCTAssertNil(handoff.read())
+    }
+
+    func testWatchdogStopDrainsRecoveryCleanup() {
+        let scheduler = FakeWatchdogScheduler()
+        let handoff = MemoryPendingHangStore()
+        var now: Int64 = 0
+        let watchdog = CrumbtrailMainThreadWatchdog(
+            scheduler: scheduler,
+            handoff: handoff,
+            onHang: { _ in },
+            now: { now }
+        )
+
+        watchdog.start()
+        scheduler.runMain()
+        now = 5_000
+        scheduler.runNextScheduled()
+        now = 5_100
+        scheduler.runMain()
+        XCTAssertNotNil(handoff.read())
+
+        watchdog.stop()
+
+        XCTAssertNil(handoff.read())
+        XCTAssertTrue(scheduler.shutdownCalled)
     }
 
     func testWatchdogPauseAndDebuggerSuppressChecks() {
@@ -126,6 +153,28 @@ final class NativeDiagnosticsTests: XCTestCase {
         dynamicallyAttached = false
         attachedScheduler.runNextScheduled()
         XCTAssertEqual(attachedScheduler.activeScheduledCount, 1)
+
+        let racedScheduler = FakeWatchdogScheduler()
+        var racedAttached = true
+        var pauseDuringPoll = false
+        var racedWatchdog: CrumbtrailMainThreadWatchdog!
+        racedWatchdog = CrumbtrailMainThreadWatchdog(
+            scheduler: racedScheduler,
+            handoff: MemoryPendingHangStore(),
+            onHang: { _ in },
+            isDebuggerAttached: {
+                if pauseDuringPoll {
+                    pauseDuringPoll = false
+                    racedWatchdog.pause()
+                }
+                return racedAttached
+            }
+        )
+        racedWatchdog.start()
+        racedAttached = false
+        pauseDuringPoll = true
+        racedScheduler.runNextScheduled()
+        XCTAssertEqual(racedScheduler.activeScheduledCount, 0)
 
         let runningScheduler = FakeWatchdogScheduler()
         let running = CrumbtrailMainThreadWatchdog(
@@ -181,6 +230,57 @@ final class NativeDiagnosticsTests: XCTestCase {
         XCTAssertEqual(store.read()?.at, 43)
         store.clear()
         XCTAssertNil(store.read())
+    }
+
+    func testApplicationSupportHandoffCleansOnlyBoundedStaleTemporaryReplacements() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ai.crumbtrail.tests.native-diagnostics-stale", isDirectory: true)
+        try? FileManager.default.removeItem(at: directory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("hang.json")
+        let stale = directory.appendingPathComponent(".hang.json.interrupted.tmp")
+        let fresh = directory.appendingPathComponent(".hang.json.active.tmp")
+        let unrelated = directory.appendingPathComponent(".other-file.interrupted.tmp")
+        try Data("stale".utf8).write(to: stale)
+        try Data("fresh".utf8).write(to: fresh)
+        try Data("unrelated".utf8).write(to: unrelated)
+        let old = Date(timeIntervalSinceNow: -2 * 24 * 60 * 60)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: stale.path)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: unrelated.path)
+
+        let store = ApplicationSupportPendingHangStore(fileURL: url)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fresh.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+
+        try Data("stale-again".utf8).write(to: stale)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: stale.path)
+        _ = store.read()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path))
+
+        for index in 0..<12 {
+            let bounded = directory.appendingPathComponent(".hang.json.bounded.\(index).tmp")
+            try Data("stale-\(index)".utf8).write(to: bounded)
+            try FileManager.default.setAttributes(
+                [.modificationDate: old], ofItemAtPath: bounded.path
+            )
+        }
+        _ = store.read()
+        let remainingBounded = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ).filter {
+            $0.lastPathComponent.hasPrefix(".hang.json.bounded.")
+                && $0.lastPathComponent.hasSuffix(".tmp")
+        }
+        XCTAssertEqual(remainingBounded.count, 4)
+
+        try Data("stale-before-clear".utf8).write(to: stale)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: stale.path)
+        store.clear()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path))
+        try? FileManager.default.removeItem(at: directory)
     }
 
     func testMetricKitSeamImportsOnlyCrashAndHangContracts() throws {

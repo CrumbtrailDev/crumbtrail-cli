@@ -76,6 +76,7 @@ interface CrumbtrailWatchdogScheduler {
     fun postToBackground(task: () -> Unit) {
         schedule(0, task)
     }
+    fun drain() = Unit
     fun shutdown() = Unit
 }
 
@@ -157,6 +158,7 @@ class CrumbtrailMainThreadWatchdog(
     /** Stop and release the scheduler owned by this watchdog. */
     fun stop() {
         pause()
+        scheduler.drain()
         scheduler.shutdown()
     }
 
@@ -231,10 +233,12 @@ class CrumbtrailMainThreadWatchdog(
                 null
             }
             lastHeartbeatAt = current
-        }
-        observation?.let {
-            val delivered = runCatching { onHang(it) }.isSuccess
-            if (delivered) scheduler.postToBackground { runCatching { handoff.clear() } }
+            if (observation != null) {
+                scheduler.postToBackground {
+                    runCatching { handoff.clear() }
+                    runCatching { onHang(observation) }
+                }
+            }
         }
     }
 
@@ -254,9 +258,10 @@ class CrumbtrailMainThreadWatchdog(
     }
 
     private fun scheduleDebuggerPoll() {
-        val task = scheduler.schedule(checkIntervalMs) { pollDebugger() }
         synchronized(lock) {
-            if (debuggerSuppressed) debuggerPollTask = task else task.cancel()
+            if (!debuggerSuppressed || running) return
+            val task = scheduler.schedule(checkIntervalMs) { pollDebugger() }
+            if (debuggerSuppressed && !running) debuggerPollTask = task else task.cancel()
         }
     }
 
@@ -267,15 +272,25 @@ class CrumbtrailMainThreadWatchdog(
             scheduleDebuggerPoll()
             return
         }
-        val shouldResume = synchronized(lock) {
-            if (!debuggerSuppressed) false
-            else {
-                debuggerSuppressed = false
-                debuggerPollTask = null
-                true
-            }
+        resumeAfterDebugger()
+    }
+
+    /** Transition out of debugger suppression atomically with the running state. */
+    private fun resumeAfterDebugger() {
+        val token: Long
+        synchronized(lock) {
+            if (!debuggerSuppressed || running) return
+            debuggerSuppressed = false
+            debuggerPollTask = null
+            running = true
+            generation += 1
+            token = generation
+            lastHeartbeatAt = now()
         }
-        if (shouldResume) start()
+        // Pause can win after the transition. scheduleCheck cancels its task
+        // when it observes the newer generation, and the heartbeat is a no-op.
+        scheduleCheck(token)
+        scheduler.postToMain { heartbeat(token) }
     }
 
     companion object {
@@ -379,6 +394,13 @@ class CrumbtrailExecutorWatchdogScheduler : CrumbtrailWatchdogScheduler {
     }
 
     override fun shutdown() {
-        executor.shutdownNow()
+        executor.shutdown()
+    }
+
+    override fun drain() {
+        if (Thread.currentThread().name == "crumbtrail-native-watchdog") return
+        runCatching {
+            executor.submit {}.get(2, TimeUnit.SECONDS)
+        }
     }
 }
