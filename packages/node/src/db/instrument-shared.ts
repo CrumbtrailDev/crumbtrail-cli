@@ -761,7 +761,6 @@ export function emitDbDiffEvents(input: {
       now: options.now?.(),
       sessionStartedAt: options.sessionStartedAt,
       valueBounds: input.valueBounds,
-      rowCount,
       beforeImageStatus,
       // A row from a bulk statement is not a single entity operation. Omit
       // race evidence even when the row cap leaves one image to emit.
