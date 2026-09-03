@@ -503,6 +503,34 @@ describe("report screenshot API", () => {
     vi.useRealTimers();
   });
 
+  it("bounds a never settling lifecycle end before a later stop", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    transport.endSession.mockImplementationOnce(
+      async () => new Promise<void>(() => {}),
+    );
+    const logger = init(transport);
+    await logger.captureScreenshot(imageBlob(png()));
+
+    window.dispatchEvent(new Event("pagehide"));
+    const lifecycleClose = (
+      logger as unknown as { lifecycleClosePromise?: Promise<void> }
+    ).lifecycleClosePromise;
+    expect(lifecycleClose).toBeDefined();
+    await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
+    await expect(lifecycleClose).resolves.toBeUndefined();
+    expect(transport.endSession).toHaveBeenCalledTimes(1);
+    await expect(logger.captureScreenshot(imageBlob(png()))).rejects.toThrow(
+      "active session",
+    );
+
+    await expect(logger.stop()).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(transport.endSession).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
   it("uses one pagehide deadline for admission and a pending send", async () => {
     vi.useFakeTimers();
     const transport = makeTransport();

@@ -1920,7 +1920,12 @@ export class Crumbtrail {
           await this.transport.sendEvents(deferred).catch(() => {});
         }
         this.startLifecycleEnd();
-        await this.lifecycleEndPromise;
+        const lifecycleEndSettled = await this.waitForLifecycleEnd(closeState);
+        if (!lifecycleEndSettled) {
+          this.sessionStarted = false;
+          this.lifecycleSuspended = true;
+          return;
+        }
         // The lifecycle end finalized this session. Mark it closed before releasing the
         // lifecycle promise so a later explicit stop cannot end the same session again.
         this.sessionStarted = false;
@@ -1967,6 +1972,25 @@ export class Crumbtrail {
     settled = Promise.allSettled(promises).then(() => true),
   ): Promise<boolean> {
     if (promises.length === 0) return true;
+    if (!closeState.immediateEnd) {
+      const escalated = closeState.escalationPromise?.then(() => false);
+      if (escalated) {
+        const completed = await Promise.race([settled, escalated]);
+        if (completed) return true;
+      } else {
+        await settled;
+        return true;
+      }
+    }
+    return this.waitUntilLifecycleDeadline(settled, closeState.deadline);
+  }
+
+  /** Wait for lifecycle end, applying a deadline once an explicit close is requested. */
+  private async waitForLifecycleEnd(
+    closeState: NonNullable<typeof this.lifecycleCloseState>,
+  ): Promise<boolean> {
+    const settled = this.lifecycleEndPromise?.then(() => true);
+    if (!settled) return true;
     if (!closeState.immediateEnd) {
       const escalated = closeState.escalationPromise?.then(() => false);
       if (escalated) {
