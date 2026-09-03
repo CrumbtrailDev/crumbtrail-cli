@@ -492,6 +492,8 @@ export interface RaceEvidenceEventData {
  * the `engine` tag differs.
  */
 export interface DbDiffEventData {
+  serviceCompatibility?: "compatible" | "incompatible" | "unknown";
+  transactionOutcome?: "committed" | "rolled_back" | "unknown";
   engine: DbEngine;
   connection?: DbConnectionIdentity;
   op: DbDiffOp;
@@ -545,6 +547,7 @@ export interface DbDiffBulkEventData {
  * an active request scope. Disabled by default because read capture can increase PII surface.
  */
 export interface DbReadEventData {
+  serviceCompatibility?: "compatible" | "incompatible" | "unknown";
   engine: DbEngine;
   connection?: DbConnectionIdentity;
   table: string;

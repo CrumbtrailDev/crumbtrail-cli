@@ -12,6 +12,7 @@ import type { DbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import {
   buildRaceEvidence,
+  readRaceServiceCompatibility,
   isRaceEvidenceInputEligible,
   readOptimisticVersion,
   type RaceEvidenceOptions,
@@ -209,7 +210,11 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
       beforeVersion: readOptimisticVersion(input.before, versionField),
       afterVersion: readOptimisticVersion(input.after, versionField),
     });
-    if (raceEvidence) d.raceEvidence = raceEvidence;
+    if (raceEvidence) {
+      d.raceEvidence = raceEvidence;
+      d.serviceCompatibility = readRaceServiceCompatibility(input.raceEvidence);
+      d.transactionOutcome = "committed";
+    }
   }
 
   const redaction = mergeRedactionMetadata(

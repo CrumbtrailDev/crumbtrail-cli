@@ -41,6 +41,8 @@ export type RaceEvidenceResolver = (
 
 /** Opt in configuration for race evidence on a DB or cache instrumentation path. */
 export interface RaceEvidenceOptions {
+  /** Application declaration that participating services use compatible identity and version semantics. */
+  serviceCompatibility?: "compatible" | "incompatible" | "unknown";
   /** Race evidence is absent unless this is explicitly true. */
   enabled?: boolean;
   /** One application declared subject shared by DB and cache operations. */
@@ -229,6 +231,15 @@ export function readInstrumentRaceEvidence(options: {
     return perOperation;
   } catch {
     return undefined;
+  }
+}
+
+export function readRaceServiceCompatibility(options: RaceEvidenceOptions | undefined): "compatible" | "incompatible" | "unknown" {
+  try {
+    const value = options?.serviceCompatibility;
+    return value === "compatible" || value === "incompatible" ? value : "unknown";
+  } catch {
+    return "unknown";
   }
 }
 
