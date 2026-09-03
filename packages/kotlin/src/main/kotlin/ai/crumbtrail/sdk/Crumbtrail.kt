@@ -74,7 +74,7 @@ data class CrumbtrailCollectors(
 ) {
     /** Platform lifecycle observation needed internally, even when lifecycle events are disabled. */
     internal val needsApplicationLifecycleObserver: Boolean
-        get() = appLifecycle || nativeWatchdog
+        get() = appLifecycle || navigation || nativeWatchdog
 }
 
 data class CrumbtrailConfig(

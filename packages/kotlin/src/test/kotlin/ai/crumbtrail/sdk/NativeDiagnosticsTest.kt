@@ -75,6 +75,29 @@ class MainThreadWatchdogTest {
     }
 
     @Test
+    fun `platform lifecycle observation follows each independent collector flag`() {
+        for (appLifecycle in listOf(false, true)) {
+            for (navigation in listOf(false, true)) {
+                for (nativeWatchdog in listOf(false, true)) {
+                    val collectors = CrumbtrailCollectors(
+                        appLifecycle = appLifecycle,
+                        navigation = navigation,
+                        nativeWatchdog = nativeWatchdog,
+                    )
+
+                    assertEquals(
+                        appLifecycle || navigation || nativeWatchdog,
+                        collectors.needsApplicationLifecycleObserver,
+                    )
+                    assertEquals(appLifecycle, collectors.appLifecycle)
+                    assertEquals(navigation, collectors.navigation)
+                    assertEquals(nativeWatchdog, collectors.nativeWatchdog)
+                }
+            }
+        }
+    }
+
+    @Test
     fun `uses a five second threshold and persists a missed heartbeat`() {
         val scheduler = FakeWatchdogScheduler()
         val handoff = MemoryPendingHangStore()
