@@ -359,6 +359,48 @@ describe("buildPlan — idempotency", () => {
     expect(plan.content).toBe('import "crumbtrail-core/early";');
   });
 
+  it.each([
+    ["a line comment", '// import "crumbtrail-core/early";'],
+    ["a block comment", '/* import "crumbtrail-core/early"; */'],
+    ["a quoted string", 'const marker = "import \\"crumbtrail-core/early\\"";'],
+  ])("does not treat %s as an executable early import", (_kind, marker) => {
+    const source = [
+      marker,
+      'import { Crumbtrail } from "crumbtrail-core";',
+      "Crumbtrail.init({",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "  remoteConfig: true,",
+      '  service: "web",',
+      "});",
+      "",
+    ].join("\n");
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.49.0" },
+      }),
+      [installed("crumbtrail-core")]: JSON.stringify({
+        name: "crumbtrail-core",
+        version: "0.49.0",
+      }),
+      [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+      [p("src", "main.ts")]: source,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.content).toBe('import "crumbtrail-core/early";');
+  });
+
   it("returns an upgrade action instead of skipping a framework integration on an older SDK", () => {
     const source = [
       'import { Crumbtrail } from "crumbtrail-core";',

@@ -35,7 +35,7 @@ import {
   type IntegrationRequirement,
   type IntegrationStatus,
 } from "./integration";
-import { amendSource, type AmendField } from "./amend";
+import { amendSource, maskLiterals, type AmendField } from "./amend";
 import { addDockerBuildArg, DOCKERFILE_CANDIDATES } from "./docker";
 import {
   deployManifestNaming,
@@ -551,7 +551,31 @@ const EARLY_BROWSER_RECIPES = new Set<Recipe>([
 ]);
 
 const EARLY_BROWSER_IMPORT =
-  /(?:^|[\s;(])(?:import|require)\s*(?:\(\s*)?["']crumbtrail-core\/early["']/m;
+  /\b(?:import|require)\s*(?:\(\s*)?["']crumbtrail-core\/early["']/g;
+
+/**
+ * Detect the early side-effect import in executable source only. The raw
+ * spelling is useful for preserving the customer's quote and import form, but
+ * it also matches comments and strings. `maskLiterals` keeps code positions
+ * stable while blanking those non-executable regions, so only a real import or
+ * require keyword can satisfy an idempotent rerun.
+ */
+function hasExecutableEarlyBrowserImport(source: string): boolean {
+  const mask = maskLiterals(source);
+  if (mask === null) return false;
+  EARLY_BROWSER_IMPORT.lastIndex = 0;
+  for (const match of source.matchAll(EARLY_BROWSER_IMPORT)) {
+    if (match.index === undefined) continue;
+    const keyword = /^(?:import|require)/.exec(match[0])?.[0];
+    if (
+      keyword &&
+      mask.slice(match.index, match.index + keyword.length) === keyword
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function hasEarlyBrowserMarker(
   input: BuildPlanInput,
@@ -559,7 +583,7 @@ function hasEarlyBrowserMarker(
   source?: string,
 ): boolean {
   if (!EARLY_BROWSER_RECIPES.has(input.recipe)) return true;
-  if (source && EARLY_BROWSER_IMPORT.test(source)) return true;
+  if (source && hasExecutableEarlyBrowserImport(source)) return true;
   return reachableSourceFiles({
     cwd: input.cwd,
     recipe: input.recipe,
@@ -567,7 +591,7 @@ function hasEarlyBrowserMarker(
     entryFile: input.entryFile,
     serviceName: input.serviceName,
     io,
-  }).some((entry) => EARLY_BROWSER_IMPORT.test(entry.text));
+  }).some((entry) => hasExecutableEarlyBrowserImport(entry.text));
 }
 
 function earlyCaptureUnavailablePlan(
