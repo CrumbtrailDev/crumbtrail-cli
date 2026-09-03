@@ -1062,11 +1062,6 @@ export function corsImportedElsewhereNote(): string {
 
 // ── Static frontends ─────────────────────────────────────────────────────────
 
-/** Whether this HTML already carries a Crumbtrail script tag. */
-export function htmlReferencesCrumbtrail(html: string): boolean {
-  return /crumbtrail/i.test(html);
-}
-
 /** JavaScript script types that execute as application code in an HTML page. */
 const JAVASCRIPT_SCRIPT_TYPE = new Set([
   "application/ecmascript",
@@ -1122,6 +1117,15 @@ function tagEnd(html: string, start: number): number | null {
 
 const INERT_HTML_ELEMENT = /^<(template|noscript|style|textarea)\b/i;
 
+export interface HtmlScriptBlock {
+  start: number;
+  end: number;
+  attributes: string;
+  content: string;
+  src: string | null;
+  executable: boolean;
+}
+
 function afterInertElement(
   html: string,
   start: number,
@@ -1144,12 +1148,23 @@ function afterInertElement(
   return null;
 }
 
-/** Finds a real executable script tag without entering comments or data blocks. */
-function firstExecutableScript(html: string): number | null {
+function scriptSource(attrs: string): string | null {
+  const match =
+    /(?:^|\s)src\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(attrs);
+  return match?.[1] ?? match?.[2] ?? match?.[3] ?? null;
+}
+
+/**
+ * Scans HTML script elements while ignoring comments and inert elements. The
+ * same scan drives insertion, Crumbtrail detection, and bootstrap detection so
+ * a marker in a comment or data block can never make setup claim completion.
+ */
+export function htmlScriptBlocks(html: string): HtmlScriptBlock[] {
+  const blocks: HtmlScriptBlock[] = [];
   let offset = 0;
   while (offset < html.length) {
     const start = html.indexOf("<", offset);
-    if (start < 0) return null;
+    if (start < 0) return blocks;
 
     if (html.startsWith("<!--", start)) {
       const commentEnd = html.indexOf("-->", start + 4);
@@ -1160,7 +1175,7 @@ function firstExecutableScript(html: string): number | null {
     const inert = INERT_HTML_ELEMENT.exec(html.slice(start));
     if (inert) {
       const after = afterInertElement(html, start, inert[1]);
-      if (after === null) return null;
+      if (after === null) return blocks;
       offset = after;
       continue;
     }
@@ -1172,16 +1187,41 @@ function firstExecutableScript(html: string): number | null {
     }
 
     const end = tagEnd(html, start + open[0].length);
-    if (end === null) return null;
+    if (end === null) return blocks;
     const attributes = html.slice(start + open[0].length, end);
-    if (executableScript(attributes)) return start;
-
     const close = /<\/script\s*>/gi;
     close.lastIndex = end + 1;
     const closeMatch = close.exec(html);
-    offset = closeMatch ? closeMatch.index + closeMatch[0].length : html.length;
+    const blockEnd = closeMatch
+      ? closeMatch.index + closeMatch[0].length
+      : html.length;
+    blocks.push({
+      start,
+      end: blockEnd,
+      attributes,
+      content: html.slice(end + 1, closeMatch?.index ?? html.length),
+      src: scriptSource(attributes),
+      executable: executableScript(attributes),
+    });
+    offset = blockEnd;
   }
-  return null;
+  return blocks;
+}
+
+/** Whether this HTML already carries a Crumbtrail script or module. */
+export function htmlReferencesCrumbtrail(html: string): boolean {
+  return htmlScriptBlocks(html)
+    .filter((block) => block.executable)
+    .some((block) =>
+      /crumbtrail/i.test(`${block.src ?? ""}\n${block.content}`),
+    );
+}
+
+/** Finds a real executable script tag without entering comments or data blocks. */
+function firstExecutableScript(html: string): number | null {
+  return (
+    htmlScriptBlocks(html).find((block) => block.executable)?.start ?? null
+  );
 }
 
 /**

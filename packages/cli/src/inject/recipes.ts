@@ -51,6 +51,7 @@ import {
   corsWideningGuidance,
   detectExpressModuleStyle,
   findStaticMountDirs,
+  htmlScriptBlocks,
   htmlReferencesCrumbtrail,
   insertIntoHtmlHead,
   prependIntoSource,
@@ -1528,13 +1529,38 @@ function staticBlockFor(input: BuildPlanInput): string {
   });
 }
 
-const STATIC_EARLY_BOOTSTRAP_MARKER =
-  /<script\b[^>]*\bsrc\s*=\s*(?:"[^"]*early-bootstrap\.global\.js|'[^']*early-bootstrap\.global\.js'|[^\s>]*early-bootstrap\.global\.js)[^>]*>/i;
 const STATIC_MODULE_VERSION =
   /https:\/\/esm\.sh\/crumbtrail-core@(\d+\.\d+\.\d+)(?:["'/?#]|$)/i;
+const STATIC_BOOTSTRAP_SOURCE = /early-bootstrap\.global\.js(?:[?#]|$)/i;
+const STATIC_BOOTSTRAP_VERSION =
+  /crumbtrail-core@(\d+\.\d+\.\d+)[^"'?#]*\/early-bootstrap\.global\.js(?:[?#]|$)/i;
+
+function staticBootstrapSource(html: string): string | null {
+  for (const block of htmlScriptBlocks(html)) {
+    if (
+      block.executable &&
+      block.src !== null &&
+      STATIC_BOOTSTRAP_SOURCE.test(block.src)
+    ) {
+      return block.src;
+    }
+  }
+  return null;
+}
 
 function staticModuleVersion(html: string): string | null {
-  return STATIC_MODULE_VERSION.exec(html)?.[1] ?? null;
+  for (const block of htmlScriptBlocks(html)) {
+    if (!block.executable) continue;
+    const match = STATIC_MODULE_VERSION.exec(
+      `${block.src ?? ""}\n${block.content}`,
+    );
+    if (match?.[1]) return match[1];
+  }
+  return null;
+}
+
+function staticBootstrapVersion(source: string): string | null {
+  return STATIC_BOOTSTRAP_VERSION.exec(source)?.[1] ?? null;
 }
 
 function staticBootstrapMismatchPlan(
@@ -1558,6 +1584,161 @@ function staticBootstrapMismatchPlan(
       `${location} already references Crumbtrail, but ${installed}. The early bootstrap must match the ${bootstrapVersion} module release, so it was left unchanged. Upgrade the page's crumbtrail-core ESM URL to ${bootstrapVersion} and run setup again.`,
     ],
   };
+}
+
+function staticMarkerValidationPlan(
+  input: BuildPlanInput,
+  target: string,
+  markerSource: string,
+  moduleVersion: string | null,
+): Plan {
+  const location = path.relative(input.cwd, target) || target;
+  const suppliedVersion = browserEarlyCaptureVersion(input.sdkVersion);
+  const bootstrapVersion = staticBootstrapVersion(markerSource);
+  let reason: string;
+  if (!suppliedVersion) {
+    reason =
+      "this CLI does not supply a compatible published early capture release";
+  } else if (!bootstrapVersion) {
+    reason =
+      "the bootstrap URL is not pinned to a released crumbtrail-core version";
+  } else if (!browserEarlyCaptureVersion(bootstrapVersion)) {
+    reason = `the bootstrap URL is pinned to the incompatible ${bootstrapVersion} release`;
+  } else if (bootstrapVersion !== suppliedVersion) {
+    reason = `the bootstrap URL is pinned to ${bootstrapVersion}, but this CLI supplies ${suppliedVersion}`;
+  } else if (!moduleVersion) {
+    reason = "the page's ESM crumbtrail-core version could not be determined";
+  } else if (moduleVersion !== bootstrapVersion) {
+    reason = `the bootstrap is ${bootstrapVersion}, while the page's ESM import is ${moduleVersion}`;
+  } else {
+    reason = "the bootstrap release could not be verified";
+  }
+  return {
+    recipe: input.recipe,
+    kind: "fallback-ai",
+    targetPath: null,
+    content: null,
+    snippet: "",
+    keyIsSourceLiteral: true,
+    warnings: [
+      `${location} already has an early browser bootstrap, but ${reason}. Upgrade the CLI and page to one coordinated published crumbtrail-core release, then run setup again.`,
+    ],
+  };
+}
+
+function staticCheckInput(
+  input: BuildPlanInput,
+  target: string,
+): BuildPlanInput {
+  return { ...input, recipe: "static", entryFile: target };
+}
+
+function staticIncompletePlan(
+  input: BuildPlanInput,
+  target: string,
+  status: IntegrationStatus,
+  hasBootstrap: boolean,
+): Plan {
+  const checkInput = staticCheckInput(input, target);
+  const location = path.relative(input.cwd, target) || target;
+  const missing = status.missing
+    .map((requirement) => INTEGRATION_REQUIREMENT_COPY[requirement])
+    .join(", ");
+  const detail = missing ? ` Missing ${missing}.` : "";
+  return {
+    recipe: input.recipe,
+    kind: "fallback-ai",
+    targetPath: null,
+    content: null,
+    snippet: "",
+    keyIsSourceLiteral: true,
+    warnings: [
+      `${location} already references Crumbtrail${hasBootstrap ? " and an early bootstrap" : ""}, but the integration is not complete for ${input.endpoint}.${detail}`,
+      ...integrationInstructions(checkInput, status, null, target),
+    ],
+  };
+}
+
+/** Validate an existing static page before deciding whether a marker is enough. */
+function staticExistingPagePlan(
+  input: BuildPlanInput,
+  io: InjectIO,
+  target: string,
+  html: string,
+): Plan {
+  const markerSource = staticBootstrapSource(html);
+  const moduleVersion = staticModuleVersion(html);
+  const status = inspectIntegration({
+    cwd: input.cwd,
+    recipe: "static",
+    endpoint: input.endpoint,
+    entryFile: target,
+    serviceName: input.serviceName,
+    io,
+  });
+  if (markerSource !== null) {
+    const suppliedVersion = browserEarlyCaptureVersion(input.sdkVersion);
+    const bootstrapVersion = staticBootstrapVersion(markerSource);
+    if (
+      !suppliedVersion ||
+      !bootstrapVersion ||
+      !browserEarlyCaptureVersion(bootstrapVersion) ||
+      bootstrapVersion !== suppliedVersion ||
+      !moduleVersion ||
+      moduleVersion !== bootstrapVersion
+    ) {
+      return staticMarkerValidationPlan(
+        input,
+        target,
+        markerSource,
+        moduleVersion,
+      );
+    }
+    if (!status.complete)
+      return staticIncompletePlan(input, target, status, true);
+    return skipPlan(input, [
+      `${path.relative(input.cwd, target) || target} already references Crumbtrail and has a verified early browser bootstrap — left as it is.`,
+    ]);
+  }
+  if (!status.complete) {
+    if (
+      moduleVersion !== null &&
+      browserEarlyCaptureVersion(input.sdkVersion) !== null &&
+      moduleVersion !== browserEarlyCaptureVersion(input.sdkVersion)
+    ) {
+      const mismatch = staticBootstrapMismatchPlan(
+        input,
+        target,
+        moduleVersion,
+        browserEarlyCaptureVersion(input.sdkVersion)!,
+      );
+      mismatch.warnings.push(
+        ...integrationInstructions(
+          staticCheckInput(input, target),
+          status,
+          null,
+          target,
+        ),
+      );
+      return mismatch;
+    }
+    const onlyMissingKey =
+      status.missing.length === 1 && status.missing[0] === "ingest-key";
+    if (!onlyMissingKey || status.hazards.length > 0)
+      return staticIncompletePlan(input, target, status, false);
+    const upgrade = staticEarlyBootstrapUpgrade(input, io, target, html);
+    upgrade.warnings = [
+      ...upgrade.warnings,
+      ...integrationInstructions(
+        staticCheckInput(input, target),
+        status,
+        null,
+        target,
+      ),
+    ];
+    return upgrade;
+  }
+  return staticEarlyBootstrapUpgrade(input, io, target, html);
 }
 
 function staticEarlyBootstrapUpgrade(
@@ -1653,12 +1834,7 @@ function planStatic(input: BuildPlanInput, io: InjectIO): Plan {
     ]);
   }
   if (htmlReferencesCrumbtrail(html)) {
-    if (STATIC_EARLY_BOOTSTRAP_MARKER.test(html)) {
-      return skipPlan(input, [
-        `${path.relative(input.cwd, target) || target} already references Crumbtrail and has early browser capture — left as it is.`,
-      ]);
-    }
-    return staticEarlyBootstrapUpgrade(input, io, target, html);
+    return staticExistingPagePlan(input, io, target, html);
   }
   const wired = insertIntoHtmlHead(html, block);
   if (wired == null) {
@@ -1749,8 +1925,7 @@ function planServedStaticFrontend(
     }
     const html = io.readFile(indexPath)!;
     if (htmlReferencesCrumbtrail(html)) {
-      if (STATIC_EARLY_BOOTSTRAP_MARKER.test(html)) continue;
-      const upgrade = staticEarlyBootstrapUpgrade(input, io, indexPath, html);
+      const upgrade = staticExistingPagePlan(input, io, indexPath, html);
       warnings.push(...upgrade.warnings);
       if (upgrade.kind === "rewrite" && upgrade.content) {
         edits.push({

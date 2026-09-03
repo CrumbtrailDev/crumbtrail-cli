@@ -7,7 +7,11 @@ import { describe, expect, it, afterEach } from "vitest";
 import path from "node:path";
 import { detect } from "../detect";
 import { buildPlan } from "../inject/recipes";
-import { findStaticMountDirs, insertIntoHtmlHead } from "../inject/text";
+import {
+  findStaticMountDirs,
+  htmlReferencesCrumbtrail,
+  insertIntoHtmlHead,
+} from "../inject/text";
 import { cleanup, fakeInjectIO, makeTmpRepo } from "./helpers";
 
 const ENDPOINT = "https://ingest.example.com";
@@ -169,6 +173,21 @@ describe("insertIntoHtmlHead", () => {
       out.indexOf('<script src="/app.js"></script>'),
     );
     expect(out).toContain('/commented.js"></script> -->');
+  });
+
+  it("does not treat Crumbtrail text in comments or inert HTML as an integration", () => {
+    const html = PAGE.replace(
+      "    <title>Landing</title>",
+      [
+        "    <title>Landing</title>",
+        "    <!-- crumbtrail-core early-bootstrap.global.js -->",
+        '    <template><script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script></template>',
+        "    <noscript>crumbtrail-core</noscript>",
+        '    <style>.crumbtrail { content: "crumbtrail-core"; }</style>',
+        "    <textarea>crumbtrail-core</textarea>",
+      ].join("\n"),
+    );
+    expect(htmlReferencesCrumbtrail(html)).toBe(false);
   });
 
   it.each(["template", "noscript", "style", "textarea"])(
@@ -444,6 +463,151 @@ describe("buildPlan — static", () => {
     expect(plan.content).toContain("early-bootstrap.global.js");
     expect(plan.warnings.join(" ")).not.toContain("Nothing to inject");
   });
+
+  it("skips only a verified marker and complete integration", () => {
+    const wired = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        '<script type="module">',
+        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });`,
+        "</script>",
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
+    );
+    expect(plan.kind).toBe("skip-already-wired");
+  });
+
+  it("does not skip a verified marker when the source key is still a placeholder", () => {
+    const wired = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        '<script type="module">',
+        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "${KEY_PLACEHOLDER}", remoteConfig: true, service: "web" });`,
+        "</script>",
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.warnings.join(" ")).toMatch(/ingest key/i);
+    expect(plan.warnings.join(" ")).toMatch(/dashboard/i);
+  });
+
+  it("does not skip a marker when the endpoint no longer matches", () => {
+    const wired = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        '<script type="module">',
+        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
+        '  Crumbtrail.init({ httpEndpoint: "https://old.example.com", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });',
+        "</script>",
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.warnings.join(" ")).toMatch(/endpoint/i);
+    expect(plan.warnings.join(" ")).toMatch(
+      /old\.example\.com|https:\/\/ingest\.example\.com/,
+    );
+  });
+
+  it("rejects stale or mismatched marker releases", () => {
+    const stale = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script src="https://unpkg.com/crumbtrail-core@0.48.0/dist/early-bootstrap.global.js"></script>',
+        '<script type="module">import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.48.0"; Crumbtrail.init({ httpEndpoint: "https://ingest.example.com", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });</script>',
+      ].join("\n"),
+    )!;
+    const mismatched = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        '<script type="module">import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.48.0"; Crumbtrail.init({ httpEndpoint: "https://ingest.example.com", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });</script>',
+      ].join("\n"),
+    )!;
+    for (const html of [stale, mismatched]) {
+      const plan = buildPlan(
+        {
+          cwd: CWD,
+          recipe: "static",
+          endpoint: ENDPOINT,
+          entryFile: p("index.html"),
+          serviceName: "web",
+          sdkVersion: "0.49.0",
+        },
+        fakeInjectIO({ [p("index.html")]: html }),
+      );
+      expect(plan.kind).toBe("fallback-ai");
+      expect(plan.warnings.join(" ")).toMatch(
+        /coordinated|incompatible|bootstrap/i,
+      );
+    }
+  });
+
+  it("retrofits a real module when a fake marker appears only in inert HTML", () => {
+    const wired = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<!-- <script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script> -->',
+        '<template><script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script></template>',
+        '<script type="module">',
+        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });`,
+        "</script>",
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
+    );
+    expect(plan.kind).toBe("rewrite");
+    expect(plan.content).toContain(
+      '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+    );
+    expect(plan.content!.match(/early-bootstrap\.global\.js/g)).toHaveLength(3);
+  });
 });
 
 describe("buildPlan — the frontend an Express app serves", () => {
@@ -578,5 +742,51 @@ describe("buildPlan — the frontend an Express app serves", () => {
       extra!.content.indexOf('<script type="module">'),
     );
     expect(plan.warnings.join(" ")).toContain("early browser bootstrap");
+  });
+
+  it("does not silently skip a served marker when its page key is a placeholder", () => {
+    const server = [
+      'import express from "express";',
+      'import { Crumbtrail } from "crumbtrail-core";',
+      'import { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } from "crumbtrail-node";',
+      "const app = express();",
+      'app.use(createCrumbtrailExpressMiddleware({ endpoint: "https://ingest.example.com", authToken: process.env.CRUMBTRAIL_KEY }));',
+      'app.use(express.static("public"));',
+      "app.use(createCrumbtrailExpressErrorMiddleware());",
+      "app.listen(3000);",
+      "",
+    ].join("\n");
+    const page = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        '<script type="module">',
+        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "${KEY_PLACEHOLDER}", remoteConfig: true, service: "api" });`,
+        "</script>",
+      ].join("\n"),
+    )!;
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({ dependencies: { express: "^4" } }),
+      [p("server.js")]: server,
+      [p("public", "index.html")]: page,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+        serviceName: "api",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    expect(
+      (plan.extraEdits ?? []).some(
+        (edit) => edit.path === p("public", "index.html"),
+      ),
+    ).toBe(false);
+    expect(plan.warnings.join(" ")).toMatch(/ingest key|dashboard/i);
   });
 });

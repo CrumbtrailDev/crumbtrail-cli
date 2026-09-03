@@ -542,6 +542,7 @@ function hazardsFor(
       for (const keyName of ["authToken", "httpAuthToken"]) {
         const value = site.keys.get(keyName);
         if (
+          input.recipe !== "static" &&
           !generatedNodeInit &&
           value !== undefined &&
           value.trim() !== keyRef?.expr
