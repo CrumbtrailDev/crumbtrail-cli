@@ -227,6 +227,7 @@ describe("HttpTransport", () => {
       c[0].includes("/api/blob/"),
     )!;
     expect(call[1].headers["Content-Type"]).toBe("image/png");
+    expect(call[1].headers).not.toHaveProperty("X-Metadata");
   });
 
   it("sends a bug report without a voice blob using a single request", async () => {

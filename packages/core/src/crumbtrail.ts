@@ -109,7 +109,6 @@ import {
   generateReportScreenshotArtifactName,
   isReportScreenshotArtifactName,
   prepareReportScreenshot,
-  redactScreenshotMetadata,
   type CaptureScreenshotOptions,
 } from "./screenshot";
 
@@ -264,6 +263,7 @@ const REMOTE_CONFIG_KEYS = [
   "baselineSampleRate",
   "flightRecorder",
   "flightRecorderTailMs",
+  "reportScreenshotsEnabled",
   "autoFlagOnError",
   "autoFlagOnUncaughtError",
   "autoFlagOnUnhandledRejection",
@@ -521,6 +521,8 @@ export class Crumbtrail {
    */
   private pendingSends = new Set<Promise<void>>();
   private sessionMetadataWrite: Promise<void> = Promise.resolve();
+  /** Resolves true only when the current session's start request was admitted. */
+  private sessionAdmission: Promise<boolean> = Promise.resolve(true);
   /** Refuses new explicit screenshot uploads once direct shutdown starts. */
   private screenshotClosing = false;
   private stopped = false;
@@ -895,35 +897,44 @@ export class Crumbtrail {
     source: Blob | HTMLCanvasElement,
     options?: CaptureScreenshotOptions,
   ): Promise<{ artifactName: string }> {
-    if (
-      this.screenshotClosing ||
-      !this.sessionStarted ||
-      !this.canTransport()
-    )
+    if (!this.sessionStarted || !this.canTransport() || this.screenshotClosing)
       throw new Error("captureScreenshot requires an active session");
+    if (!this.config.reportScreenshotsEnabled)
+      throw new Error("captureScreenshot is not enabled by the project policy");
 
-    const blob = await prepareReportScreenshot(source, options);
-    if (
-      this.screenshotClosing ||
-      !this.sessionStarted ||
-      !this.canTransport()
-    )
-      throw new Error("captureScreenshot requires an active session");
-    const artifactName = generateReportScreenshotArtifactName();
-    const metadata = redactScreenshotMetadata(options?.metadata);
-    const send = Promise.resolve().then(() =>
-      metadata
-        ? this.transport.sendBlob(artifactName, blob, metadata)
-        : this.transport.sendBlob(artifactName, blob),
+    // Bind the complete operation to the session that admitted it. Register the pending promise
+    // before the first await so stop() and lifecycle rollover cannot finalize the session while
+    // this upload is still in flight.
+    const capturedSessionId = this.sessionId;
+    const upload = (async () => {
+      const admitted = await this.sessionAdmission;
+      if (!admitted || !this.isScreenshotSessionActive(capturedSessionId))
+        throw new Error("captureScreenshot requires an active session");
+
+      const blob = await prepareReportScreenshot(source, options);
+      if (!this.isScreenshotSessionActive(capturedSessionId))
+        throw new Error("captureScreenshot requires an active session");
+      const artifactName = generateReportScreenshotArtifactName();
+      await this.transport.sendBlob(
+        artifactName,
+        blob,
+        undefined,
+        capturedSessionId,
+      );
+      // A custom transport may not enforce the optional session binding itself. Never make an
+      // artifact eligible for association after the SDK observes a rollover or shutdown.
+      if (!this.isScreenshotSessionActive(capturedSessionId))
+        throw new Error("captureScreenshot requires an active session");
+      this.visualArtifactNames.add(artifactName);
+      return { artifactName };
+    })();
+    const pending = upload.then(
+      () => undefined,
+      () => undefined,
     );
-    this.pendingSends.add(send);
-    void send.then(
-      () => this.pendingSends.delete(send),
-      () => this.pendingSends.delete(send),
-    );
-    await send;
-    this.visualArtifactNames.add(artifactName);
-    return { artifactName };
+    this.pendingSends.add(pending);
+    void pending.then(() => this.pendingSends.delete(pending));
+    return upload;
   }
 
   private async flagBugFromSource(
@@ -1760,30 +1771,49 @@ export class Crumbtrail {
   }
 
   private startSessionWithCurrentIdentity(): void {
-    this.sessionMetadataWrite = this.sendSessionMetadata();
+    const sessionId = this.sessionId;
+    const admission = this.startSession(sessionId);
+    this.sessionAdmission = admission;
+    this.sessionMetadataWrite = admission.then(() => undefined);
   }
 
   private refreshSessionIdentity(): void {
-    this.sessionMetadataWrite = this.sessionMetadataWrite.then(() =>
-      this.sendSessionMetadata(),
+    this.sessionMetadataWrite = this.sessionMetadataWrite.then(() => {
+      const admission = this.startSession(this.sessionId);
+      this.sessionAdmission = admission;
+      return admission.then(() => undefined);
+    });
+  }
+
+  private startSession(sessionId: string): Promise<boolean> {
+    let attempt: Promise<void>;
+    try {
+      attempt = this.transport.startSession(sessionId, {
+        url: currentPageUrl(),
+        ua: typeof navigator !== "undefined" ? navigator.userAgent : "",
+        ...(this.config.service ? { service: this.config.service } : {}),
+        ...this.applicationRelease,
+        sdkVersion: CRUMBTRAIL_SDK_VERSION,
+        ...this.identity,
+      });
+    } catch {
+      return Promise.resolve(false);
+    }
+    // Keep admission non-throwing so the existing session start behavior remains fire-and-forget,
+    // while captureScreenshot can await the decision before spending an upload.
+    return Promise.resolve(attempt).then(
+      () => this.sessionId === sessionId,
+      () => false,
     );
   }
 
-  private sendSessionMetadata(): Promise<void> {
-    try {
-      return this.transport
-        .startSession(this.sessionId, {
-          url: currentPageUrl(),
-          ua: typeof navigator !== "undefined" ? navigator.userAgent : "",
-          ...(this.config.service ? { service: this.config.service } : {}),
-          ...this.applicationRelease,
-          sdkVersion: CRUMBTRAIL_SDK_VERSION,
-          ...this.identity,
-        })
-        .catch(() => {});
-    } catch {
-      return Promise.resolve();
-    }
+  private isScreenshotSessionActive(sessionId: string): boolean {
+    return (
+      !this.screenshotClosing &&
+      this.sessionStarted &&
+      this.sessionId === sessionId &&
+      this.canTransport()
+    );
   }
 
   /** Schedule a close for a page that remains hidden after lifecycle events settle. */
@@ -1888,6 +1918,7 @@ export class Crumbtrail {
     this.visualArtifactNames.clear();
     this.sessionStarted = false;
     this.lifecycleSuspended = false;
+    this.sessionAdmission = Promise.resolve(false);
     this.sessionMetadataWrite = Promise.resolve();
     this.startSessionIfAllowed();
     return this.sessionMetadataWrite;
@@ -3218,6 +3249,7 @@ function isRemoteConfigValue(
 ): value is boolean | number {
   if (
     key === "flightRecorder" ||
+    key === "reportScreenshotsEnabled" ||
     key === "autoFlagOnError" ||
     key === "autoFlagOnUncaughtError" ||
     key === "autoFlagOnUnhandledRejection" ||
@@ -3329,6 +3361,7 @@ function hasRecognizedRemoteMasking(
 function hasRecognizedRemoteCaptureSettings(
   settings: Record<string, unknown>,
 ): boolean {
+  if (typeof settings.reportScreenshotsEnabled === "boolean") return true;
   const collectors = asRecord(settings.collectors);
   if (
     collectors &&

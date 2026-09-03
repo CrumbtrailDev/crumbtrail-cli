@@ -27,10 +27,11 @@ export class TauriTransport implements CrumbtrailTransport {
     name: string,
     blob: Blob,
     metadata?: Record<string, unknown>,
+    sessionIdOverride?: string,
   ): Promise<void> {
     const buffer = await blob.arrayBuffer();
     await invoke("plugin:crumbtrail|write_blob", {
-      sessionId: this.sessionId,
+      sessionId: sessionIdOverride ?? this.sessionId,
       name,
       data: Array.from(new Uint8Array(buffer)),
       metadata: metadata ?? {},

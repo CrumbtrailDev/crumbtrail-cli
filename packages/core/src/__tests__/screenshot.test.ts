@@ -44,6 +44,7 @@ function init(transport: ReturnType<typeof makeTransport>) {
     domSnapshot: false,
     flushIntervalMs: 100_000,
     flushBufferSize: 100_000,
+    reportScreenshotsEnabled: true,
   });
 }
 
@@ -61,16 +62,52 @@ describe("report screenshot API", () => {
     const logger = init(transport);
     const blob = imageBlob(png());
 
-    const result = await logger.captureScreenshot(blob, {
-      metadata: { surface: "checkout" },
-    });
+    const result = await logger.captureScreenshot(blob);
 
     expect(result.artifactName).toMatch(
       /^report-screenshot-[0-9a-f]{32}\.png$/,
     );
-    expect(transport.sendBlob).toHaveBeenCalledWith(result.artifactName, blob, {
-      surface: "checkout",
+    expect(transport.sendBlob).toHaveBeenCalledWith(
+      result.artifactName,
+      blob,
+      undefined,
+      expect.any(String),
+    );
+    await logger.stop();
+  });
+
+  it("stays disabled until the project policy enables report screenshots", async () => {
+    const transport = makeTransport();
+    const logger = Crumbtrail.init({
+      ...initConfig(),
+      transportInstance: transport,
     });
+
+    await expect(logger.captureScreenshot(imageBlob(png()))).rejects.toThrow(
+      "not enabled",
+    );
+    expect(transport.sendBlob).not.toHaveBeenCalled();
+
+    (
+      logger as unknown as {
+        applyRemoteConfig: (settings: Record<string, unknown>) => void;
+      }
+    ).applyRemoteConfig({ reportScreenshotsEnabled: true });
+    await expect(logger.captureScreenshot(imageBlob(png()))).resolves.toEqual(
+      expect.objectContaining({ artifactName: expect.any(String) }),
+    );
+    await logger.stop();
+  });
+
+  it("rejects locally when session admission fails before uploading", async () => {
+    const transport = makeTransport();
+    transport.startSession.mockRejectedValueOnce(new Error("session refused"));
+    const logger = init(transport);
+
+    await expect(logger.captureScreenshot(imageBlob(png()))).rejects.toThrow(
+      "active session",
+    );
+    expect(transport.sendBlob).not.toHaveBeenCalled();
     await logger.stop();
   });
 
@@ -156,7 +193,12 @@ describe("report screenshot API", () => {
     const result = await logger.captureScreenshot(canvas);
 
     expect(toBlob).toHaveBeenCalledWith(expect.any(Function), "image/png");
-    expect(transport.sendBlob).toHaveBeenCalledWith(result.artifactName, blob);
+    expect(transport.sendBlob).toHaveBeenCalledWith(
+      result.artifactName,
+      blob,
+      undefined,
+      expect.any(String),
+    );
     expect(
       (globalThis as { getDisplayMedia?: unknown }).getDisplayMedia,
     ).toBeUndefined();
@@ -177,30 +219,6 @@ describe("report screenshot API", () => {
 
     await expect(logger.captureScreenshot(canvas)).rejects.toThrow("4096");
     expect(toBlob).not.toHaveBeenCalled();
-    await logger.stop();
-  });
-
-  it("redacts and bounds metadata", async () => {
-    const transport = makeTransport();
-    const logger = init(transport);
-    const metadata = {
-      password: "secret-value",
-      long: "plain text ".repeat(50),
-      ...Object.fromEntries(
-        Array.from({ length: 20 }, (_, index) => [`extra${index}`, index]),
-      ),
-    };
-    await logger.captureScreenshot(imageBlob(png()), {
-      metadata,
-    });
-
-    const sentMetadata = transport.sendBlob.mock.calls[0][2] as Record<
-      string,
-      unknown
-    >;
-    expect(sentMetadata.password).toBe("[REDACTED]");
-    expect(sentMetadata.long).toHaveLength(256);
-    expect(Object.keys(sentMetadata)).toHaveLength(16);
     await logger.stop();
   });
 
@@ -258,34 +276,61 @@ describe("report screenshot API", () => {
     await logger.stop();
   });
 
-  it("finishes an admitted upload before ending the session", async () => {
-    const order: string[] = [];
-    let releaseUpload: () => void = () => {};
-    const uploadGate = new Promise<void>((resolve) => {
-      releaseUpload = resolve;
-    });
+  it("does not associate an old upload when lifecycle rollover happens", async () => {
+    vi.useFakeTimers();
     const transport = makeTransport();
-    transport.sendBlob.mockImplementation(async () => {
-      order.push("upload:start");
-      await uploadGate;
-      order.push("upload:done");
+    let finishUpload!: () => void;
+    const uploadFinished = new Promise<void>((resolve) => {
+      finishUpload = resolve;
     });
-    transport.endSession.mockImplementation(async () => {
-      order.push("endSession");
-    });
+    transport.sendBlob.mockImplementationOnce(async () => uploadFinished);
     const logger = init(transport);
+    const oldSessionId = logger.getSessionId();
+    const capture = logger.captureScreenshot(imageBlob(png()));
 
-    const upload = logger.captureScreenshot(imageBlob(png()));
-    await vi.waitFor(() => expect(order).toContain("upload:start"));
-    const stopping = logger.stop();
+    // Let the session admission, PNG validation, and transport invocation reach the pending
+    // upload without resolving it.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(transport.sendBlob).toHaveBeenCalledOnce();
+    const oldArtifactName = transport.sendBlob.mock.calls[0][0] as string;
+    expect(transport.sendBlob.mock.calls[0][3]).toBe(oldSessionId);
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(transport.endSession).not.toHaveBeenCalled();
+
+    finishUpload();
     await Promise.resolve();
-    expect(order).not.toContain("endSession");
-    releaseUpload();
-    await upload;
-    await stopping;
-    expect(order.indexOf("endSession")).toBeGreaterThan(
-      order.indexOf("upload:done"),
-    );
+    await Promise.resolve();
+    await Promise.resolve();
+    await expect(capture).rejects.toThrow("active session");
+
+    // The lifecycle close waited for the pending upload. Visibility then starts a fresh session,
+    // and the old name must not become eligible in that new session.
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(logger.getSessionId()).not.toBe(oldSessionId);
+
+    await logger.flagBug({ visualArtifactName: oldArtifactName });
+    const events = transport.sendBugReport.mock.calls.at(-1)?.[1] as Array<{
+      k: string;
+      d: Record<string, unknown>;
+    }>;
+    expect(
+      "visualArtifactName" in
+        (events.find((event) => event.k === "bug.flag")?.d ?? {}),
+    ).toBe(false);
+    await logger.stop();
+    vi.useRealTimers();
   });
 });
 

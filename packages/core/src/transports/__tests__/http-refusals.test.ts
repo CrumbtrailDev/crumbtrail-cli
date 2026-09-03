@@ -11,6 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  BlobDeliveryError,
   BugReportDeliveryError,
   CaptureShedError,
   EventDeliveryError,
@@ -68,7 +69,10 @@ afterEach(() => {
 describe("startSession", () => {
   for (const status of [401, 402, 409, 429]) {
     it(`throws when the server answers ${status}`, async () => {
-      vi.stubGlobal("fetch", routed({ "/api/session/start": () => new Response("no", { status }) }));
+      vi.stubGlobal(
+        "fetch",
+        routed({ "/api/session/start": () => new Response("no", { status }) }),
+      );
       const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
 
       const error = await transport
@@ -82,7 +86,12 @@ describe("startSession", () => {
   }
 
   it("names the refusal on the console exactly once", async () => {
-    vi.stubGlobal("fetch", routed({ "/api/session/start": () => new Response("no", { status: 402 }) }));
+    vi.stubGlobal(
+      "fetch",
+      routed({
+        "/api/session/start": () => new Response("no", { status: 402 }),
+      }),
+    );
     const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
 
     await transport.startSession("ses_test", {}).catch(() => {});
@@ -94,7 +103,9 @@ describe("startSession", () => {
   });
 
   it("refuses later batches locally instead of posting them into a 404", async () => {
-    const fetchMock = routed({ "/api/session/start": () => new Response("no", { status: 402 }) });
+    const fetchMock = routed({
+      "/api/session/start": () => new Response("no", { status: 402 }),
+    });
     vi.stubGlobal("fetch", fetchMock);
     const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
     await transport.startSession("ses_test", {}).catch(() => {});
@@ -136,14 +147,64 @@ describe("startSession", () => {
   it("still resolves on a 2xx", async () => {
     vi.stubGlobal("fetch", routed({}));
     const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
-    await expect(transport.startSession("ses_test", {})).resolves.toBeUndefined();
+    await expect(
+      transport.startSession("ses_test", {}),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("sendBlob", () => {
+  it("refuses locally after session admission fails", async () => {
+    const fetchMock = routed({
+      "/api/session/start": () => new Response("no", { status: 402 }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
+    await transport.startSession("ses_test", {}).catch(() => {});
+    fetchMock.mockClear();
+
+    const error = await transport
+      .sendBlob(
+        "report-screenshot-0123456789abcdef0123456789abcdef.png",
+        new Blob(["png"], { type: "image/png" }),
+      )
+      .catch((caught) => caught as BlobDeliveryError);
+
+    expect(error).toBeInstanceOf(BlobDeliveryError);
+    expect((error as BlobDeliveryError).status).toBe(402);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not send a captured artifact into a newer session", async () => {
+    const fetchMock = routed({});
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
+    await transport.startSession("ses_old", {});
+    await transport.startSession("ses_new", {});
+    fetchMock.mockClear();
+
+    const error = await transport
+      .sendBlob(
+        "report-screenshot-0123456789abcdef0123456789abcdef.png",
+        new Blob(["png"], { type: "image/png" }),
+        undefined,
+        "ses_old",
+      )
+      .catch((caught) => caught as BlobDeliveryError);
+
+    expect(error).toBeInstanceOf(BlobDeliveryError);
+    expect((error as BlobDeliveryError).status).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
 describe("sendBugReport", () => {
   for (const status of [401, 413, 429, 404]) {
     it(`throws when the flag is refused with ${status}`, async () => {
-      vi.stubGlobal("fetch", routed({ "/api/bug/flag": () => new Response("no", { status }) }));
+      vi.stubGlobal(
+        "fetch",
+        routed({ "/api/bug/flag": () => new Response("no", { status }) }),
+      );
       const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
 
       const error = await transport
@@ -157,7 +218,10 @@ describe("sendBugReport", () => {
   }
 
   it("throws when the voice upload 404s, which is what hosted mode does today", async () => {
-    vi.stubGlobal("fetch", routed({ "/voice": () => new Response("not found", { status: 404 }) }));
+    vi.stubGlobal(
+      "fetch",
+      routed({ "/voice": () => new Response("not found", { status: 404 }) }),
+    );
     const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
 
     const error = await transport
@@ -170,7 +234,9 @@ describe("sendBugReport", () => {
   });
 
   it("does not attempt the voice upload when the flag itself was refused", async () => {
-    const fetchMock = routed({ "/api/bug/flag": () => new Response("no", { status: 413 }) });
+    const fetchMock = routed({
+      "/api/bug/flag": () => new Response("no", { status: 413 }),
+    });
     vi.stubGlobal("fetch", fetchMock);
     const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
 
@@ -184,7 +250,10 @@ describe("sendBugReport", () => {
 
 describe("endSession", () => {
   it("warns on a refusal but never throws into the host's teardown", async () => {
-    vi.stubGlobal("fetch", routed({ "/api/session/end": () => new Response("no", { status: 409 }) }));
+    vi.stubGlobal(
+      "fetch",
+      routed({ "/api/session/end": () => new Response("no", { status: 409 }) }),
+    );
     const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
     await transport.startSession("ses_test", {});
 
@@ -325,8 +394,12 @@ describe("byte aware batching", () => {
     // of a server whose cap the client guessed wrong.
     const fetchMock = vi.fn(async (url: string, init: RequestInit) => {
       if (!url.includes("/api/events")) return ok();
-      const { events } = JSON.parse(String(init.body)) as { events: BugEvent[] };
-      return events.length > 2 ? new Response("too large", { status: 413 }) : ok();
+      const { events } = JSON.parse(String(init.body)) as {
+        events: BugEvent[];
+      };
+      return events.length > 2
+        ? new Response("too large", { status: 413 })
+        : ok();
     });
     vi.stubGlobal("fetch", fetchMock);
     const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
@@ -341,7 +414,10 @@ describe("byte aware batching", () => {
     await expect(transport.sendEvents(events)).resolves.toBeUndefined();
 
     const delivered = fetchMock.mock.calls.map(
-      (c) => JSON.parse(String((c[1] as RequestInit).body)) as { events: BugEvent[] },
+      (c) =>
+        JSON.parse(String((c[1] as RequestInit).body)) as {
+          events: BugEvent[];
+        },
     );
     const accepted = delivered
       .filter((b) => b.events.length <= 2)
@@ -352,7 +428,9 @@ describe("byte aware batching", () => {
   it("reports a single event the server will never accept", async () => {
     vi.stubGlobal(
       "fetch",
-      routed({ "/api/events": () => new Response("too large", { status: 413 }) }),
+      routed({
+        "/api/events": () => new Response("too large", { status: 413 }),
+      }),
     );
     const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
     await transport.startSession("ses_test", {});
@@ -437,7 +515,9 @@ describe("202 capture shed", () => {
   it("leaves an ordinary 202 as a delivery", async () => {
     vi.stubGlobal(
       "fetch",
-      routed({ "/api/events": () => new Response('{"ok":true}', { status: 202 }) }),
+      routed({
+        "/api/events": () => new Response('{"ok":true}', { status: 202 }),
+      }),
     );
     const transport = new HttpTransport(ENDPOINT, { authToken: "ctkey_x" });
     await transport.startSession("ses_test", {});

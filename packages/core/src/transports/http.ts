@@ -473,13 +473,25 @@ export class HttpTransport implements CrumbtrailTransport {
     name: string,
     blob: Blob,
     metadata?: Record<string, unknown>,
+    sessionIdOverride?: string,
   ): Promise<void> {
+    const sessionId = sessionIdOverride ?? this.sessionId;
     await this.sessionReady;
+    // The session start promise is deliberately non-throwing, so inspect the remembered refusal
+    // after it settles. This avoids a second network request for a session the server never
+    // admitted, including screenshot uploads that arrive before the first event flush.
+    if (this.startRefusedStatus > 0)
+      throw new BlobDeliveryError(name, this.startRefusedStatus);
+    // A screenshot captures its session id before awaiting encoding or the start request. If a
+    // lifecycle rollover changed the transport's active id meanwhile, do not send old evidence
+    // into the new session.
+    if (sessionIdOverride !== undefined && sessionId !== this.sessionId)
+      throw new BlobDeliveryError(name, 0);
     const headers = this.withAuthHeaders({
       // Image artifact routes validate the declared type against their generated
       // name. Keep the historical binary fallback for blobs without a type.
       "Content-Type": blob.type || "application/octet-stream",
-      "X-Session-Id": this.sessionId,
+      "X-Session-Id": sessionId,
     });
     if (metadata) {
       headers["X-Metadata"] = JSON.stringify(metadata);

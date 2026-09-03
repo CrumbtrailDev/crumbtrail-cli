@@ -1,5 +1,3 @@
-import { redactValue } from "./redaction";
-
 /** MIME type accepted by the v1 report screenshot endpoint. */
 export type ReportScreenshotMimeType = "image/png";
 
@@ -7,8 +5,6 @@ export type ReportScreenshotMimeType = "image/png";
 export interface CaptureScreenshotOptions {
   /** The output MIME type. PNG is the only v1 format. */
   mimeType?: ReportScreenshotMimeType;
-  /** Bounded, redacted scalar metadata stored with the artifact. */
-  metadata?: Record<string, string | number | boolean>;
 }
 
 export const REPORT_SCREENSHOT_MAX_BYTES = 5 * 1024 * 1024;
@@ -19,65 +15,9 @@ const REPORT_SCREENSHOT_NAME = /^report-screenshot-[a-f0-9]{32}\.png$/u;
 const PNG_SIGNATURE = new Uint8Array([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
 ]);
-const MAX_METADATA_ENTRIES = 16;
-const MAX_METADATA_KEY_LENGTH = 64;
-const MAX_METADATA_STRING_LENGTH = 256;
-
 /** True only for names minted by this SDK. */
 export function isReportScreenshotArtifactName(name: string): boolean {
   return REPORT_SCREENSHOT_NAME.test(name);
-}
-
-/**
- * Prepare caller metadata before it reaches a transport. The blob itself is
- * already an explicit user action, but metadata is still application data and
- * must follow the browser redaction boundary.
- */
-export function redactScreenshotMetadata(
-  metadata: CaptureScreenshotOptions["metadata"],
-): Record<string, unknown> | undefined {
-  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata))
-    return undefined;
-
-  const safe: Record<string, unknown> = {};
-  let accepted = 0;
-  for (const key of Object.keys(metadata)) {
-    if (accepted >= MAX_METADATA_ENTRIES) break;
-    const boundedKey = key.trim().slice(0, MAX_METADATA_KEY_LENGTH);
-    if (!boundedKey) continue;
-    const value = metadata[key];
-    if (
-      typeof value !== "string" &&
-      typeof value !== "number" &&
-      typeof value !== "boolean"
-    )
-      continue;
-    if (typeof value === "number" && !Number.isFinite(value)) continue;
-
-    const redacted = redactValue({ [boundedKey]: value }, "screenshot.metadata")
-      .value as Record<string, unknown>;
-    const entry = Object.entries(redacted)[0];
-    if (!entry) continue;
-    const [safeKey, safeValue] = entry;
-    if (
-      typeof safeValue !== "string" &&
-      typeof safeValue !== "number" &&
-      typeof safeValue !== "boolean"
-    )
-      continue;
-    const boundedValue =
-      typeof safeValue === "string"
-        ? safeValue.slice(0, MAX_METADATA_STRING_LENGTH)
-        : safeValue;
-    Object.defineProperty(safe, safeKey, {
-      value: boundedValue,
-      enumerable: true,
-      configurable: true,
-      writable: true,
-    });
-    accepted += 1;
-  }
-  return accepted > 0 ? safe : undefined;
 }
 
 /** Read PNG dimensions from its IHDR header without decoding pixels. */
