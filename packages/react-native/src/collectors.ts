@@ -8,6 +8,16 @@ import type {
   OptionalModuleResolver,
   ReactNativeCapabilities,
 } from "./capabilities";
+import {
+  startReactNativeNativeDiagnostics,
+  type ReactNativeNativeDiagnosticsController,
+  type ReactNativeNativeDiagnosticsModule,
+  type ReactNativeWatchdogHandoff,
+} from "./native-diagnostics";
+import {
+  startReactNativeJsWatchdog,
+  type ReactNativeJsWatchdogController,
+} from "./js-watchdog";
 
 export type ReactNativeCollectorName =
   | "console"
@@ -16,7 +26,9 @@ export type ReactNativeCollectorName =
   | "appState"
   | "environment"
   | "navigation"
-  | "replayLite";
+  | "replayLite"
+  | "nativeDiagnostics"
+  | "jsWatchdog";
 
 export type ReactNativeCollectorConfig =
   | boolean
@@ -79,17 +91,23 @@ export interface ReactNativeCollectorRuntime {
   reactNative?: ReactNativeModule | null;
   navigation?: ReactNativeNavigationLike | null;
   errorUtils?: ReactNativeErrorUtilsLike | null;
+  nativeDiagnostics?: ReactNativeNativeDiagnosticsModule | null;
+  watchdogHandoff?: ReactNativeWatchdogHandoff;
 }
 
 export interface StartReactNativeCollectorsOptions extends ReactNativeCollectorRuntime {
   config?: ReactNativeCollectorConfig;
   capabilities: ReactNativeCapabilities;
   resolver?: OptionalModuleResolver;
+  nativeDiagnosticsEnabled?: boolean;
+  jsWatchdogEnabled?: boolean;
 }
 
 export interface ReactNativeCollectorController {
   cleanup(): void;
   replayLite?: ReactNativeReplayLiteController;
+  nativeDiagnostics?: ReactNativeNativeDiagnosticsController;
+  jsWatchdog?: ReactNativeJsWatchdogController;
 }
 
 const DEFAULT_COLLECTORS: Record<ReactNativeCollectorName, boolean> = {
@@ -100,6 +118,8 @@ const DEFAULT_COLLECTORS: Record<ReactNativeCollectorName, boolean> = {
   environment: true,
   navigation: true,
   replayLite: true,
+  nativeDiagnostics: true,
+  jsWatchdog: true,
 };
 
 type Cleanup = () => void;
@@ -116,6 +136,14 @@ export function startReactNativeCollectors(
     options.reactNative ??
     resolveModule<ReactNativeModule>("react-native", options.resolver);
   const cleanup: Cleanup[] = [];
+
+  const jsWatchdog = enabledJsWatchdog(options)
+    ? startReactNativeJsWatchdog(logger, {
+        globalObject,
+        capabilities: options.capabilities,
+        handoff: options.watchdogHandoff,
+      })
+    : undefined;
 
   if (enabled.console)
     cleanup.push(
@@ -140,6 +168,10 @@ export function startReactNativeCollectors(
         logger,
         options.capabilities,
         reactNative?.AppState,
+        (state) => {
+          if (state === "active") jsWatchdog?.resume();
+          else jsWatchdog?.pause();
+        },
       ),
     );
   if (enabled.environment)
@@ -153,6 +185,13 @@ export function startReactNativeCollectors(
       ),
     );
 
+  const nativeDiagnostics = enabled.nativeDiagnostics
+    ? startReactNativeNativeDiagnostics(logger, options.capabilities, {
+        module: options.nativeDiagnostics,
+        resolver: options.resolver,
+        enabled: options.nativeDiagnosticsEnabled,
+      })
+    : undefined;
   const viewShot = resolveModule<ReactNativeViewShotModule>(
     "react-native-view-shot",
     options.resolver,
@@ -167,9 +206,13 @@ export function startReactNativeCollectors(
 
   return {
     cleanup() {
+      jsWatchdog?.cleanup();
+      nativeDiagnostics?.cleanup();
       for (const stop of cleanup.splice(0).reverse()) stop();
     },
     replayLite,
+    nativeDiagnostics,
+    jsWatchdog,
   };
 }
 
@@ -408,17 +451,25 @@ function startAppStateCollector(
   logger: Crumbtrail,
   capabilities: ReactNativeCapabilities,
   appState?: ReactNativeAppStateModule,
+  onState?: (state: string) => void,
 ): Cleanup {
   if (!appState?.addEventListener) return () => {};
   const subscription = appState.addEventListener("change", (state) => {
+    onState?.(state);
     emit(logger, capabilities, "app-lifecycle", { state, source: "AppState" });
   });
+  onState?.(appState.currentState ?? "active");
   emit(logger, capabilities, "app-lifecycle", {
     state: appState.currentState,
     source: "AppState",
     kind: "initial",
   });
   return toCleanup(subscription);
+}
+
+function enabledJsWatchdog(options: StartReactNativeCollectorsOptions): boolean {
+  const config = resolveCollectorConfig(options.config);
+  return config.jsWatchdog && options.jsWatchdogEnabled !== false;
 }
 
 function startEnvironmentCollector(

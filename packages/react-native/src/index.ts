@@ -52,6 +52,27 @@ export type {
 export { createReactNativeTargetDescriptor } from "./target-descriptor";
 export type { ReactNativeTargetInput } from "./target-descriptor";
 export {
+  createReactNativeNativeDiagnostics,
+  createReactNativeWatchdogHandoff,
+  REACT_NATIVE_NATIVE_DIAGNOSTICS_MODULE,
+  startReactNativeNativeDiagnostics,
+} from "./native-diagnostics";
+export type {
+  ReactNativeNativeCapabilities,
+  ReactNativeNativeCapabilityDetail,
+  ReactNativeNativeDiagnosticEvent,
+  ReactNativeNativeDiagnosticKind,
+  ReactNativeNativeDiagnosticsController,
+  ReactNativeNativeDiagnosticsModule,
+  ReactNativeNativeDiagnosticsOptions,
+  ReactNativeWatchdogHandoff,
+} from "./native-diagnostics";
+export { startReactNativeJsWatchdog } from "./js-watchdog";
+export type {
+  ReactNativeJsWatchdogController,
+  ReactNativeJsWatchdogOptions,
+} from "./js-watchdog";
+export {
   CrumbtrailReactNativeProvider,
   useCrumbtrailReactNative,
 } from "./provider";

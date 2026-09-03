@@ -13,6 +13,7 @@ import type {
   ReactNativeCollectorController,
   ReactNativeCollectorRuntime,
 } from "./collectors";
+import { createReactNativeWatchdogHandoff } from "./native-diagnostics";
 
 export interface ReactNativeCrumbtrailOptions
   extends DetectReactNativeCapabilitiesOptions, ReactNativeCollectorRuntime {
@@ -20,6 +21,8 @@ export interface ReactNativeCrumbtrailOptions
   asyncStorage?: AsyncStorageLike | null;
   reportCapabilities?: boolean;
   collectors?: ReactNativeCollectorConfig;
+  nativeDiagnosticsEnabled?: boolean;
+  jsWatchdogEnabled?: boolean;
 }
 
 export interface ReactNativeCrumbtrailResult {
@@ -100,6 +103,10 @@ export function createReactNativeCrumbtrail(
     reactNative: options.reactNative,
     navigation: options.navigation,
     errorUtils: options.errorUtils,
+    nativeDiagnostics: options.nativeDiagnostics,
+    nativeDiagnosticsEnabled: options.nativeDiagnosticsEnabled,
+    jsWatchdogEnabled: options.jsWatchdogEnabled,
+    watchdogHandoff: createReactNativeWatchdogHandoff(options.asyncStorage),
   });
   wrapStopWithCollectorCleanup(logger, collectors);
 
