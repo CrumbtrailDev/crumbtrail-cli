@@ -628,7 +628,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
               requestId: reqId,
               rowCount,
               options: operationOptions,
-            context: statementContext(durationMs, statementSeq),
+              context: statementContext(durationMs, statementSeq),
             });
           }
         } catch (error) {
@@ -836,8 +836,6 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
                 }
               }
               throw error;
-            } finally {
-              recordedInputs.length = 0;
             }
           };
         }
@@ -970,7 +968,7 @@ export function instrumentMssqlTransaction<T extends DuckTypedMssqlTransaction>(
                 transaction: activeBefore,
                 outcome: "unknown",
                 requestId,
-                options,
+                options: operationOptions,
               });
               transaction = undefined;
             }
@@ -982,7 +980,7 @@ export function instrumentMssqlTransaction<T extends DuckTypedMssqlTransaction>(
                 statement: String(prop),
                 requestId,
                 error,
-                options,
+                options: operationOptions,
                 context: { connection, transactionId: activeBefore?.id },
               });
             }

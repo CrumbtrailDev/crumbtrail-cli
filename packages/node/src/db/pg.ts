@@ -110,7 +110,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
             transaction: activeBefore,
             outcome: "unknown",
             requestId,
-            options,
+            options: operationOptions,
           });
           transaction = undefined;
         }
@@ -366,7 +366,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
     // The statement ran. Record what it asked before deciding what it changed: a mutation whose
     // WHERE matched no row changes nothing and so appears in no diff, which is the same silence a
     // mutation that never ran would leave.
-    emitDbStatementEvent({
+    const relationalSequence = emitDbStatementEvent({
       engine: ENGINE,
       op: parsed.op,
       table: parsed.table,
@@ -398,7 +398,12 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         beforeImageStatus,
         rowCount,
         options: operationOptions,
-        context: { connection, durationMs, transactionId: transaction?.id },
+        context: {
+          connection,
+          durationMs,
+          transactionId: transaction?.id,
+          relationalSequence,
+        },
       });
     } catch (error) {
       emitGap(operationOptions, { reason: "capture_exception", error });

@@ -450,10 +450,12 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
         op: parsed.op,
         table: parsed.table,
         statement,
-        statementParams: args,
+        statementParams:
+          args.length === 1 && isRecord(args[0]) ? args[0] : args,
         requestId,
         error,
         options: operationOptions,
+        context: { connection, transactionId: transaction?.id },
       });
       throw error;
     }

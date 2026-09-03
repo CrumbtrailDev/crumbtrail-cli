@@ -18,6 +18,7 @@ import {
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
 import { captureGenerationFor } from "../capture-generation";
+import { nextRelationalOrderSequence } from "./relational-order";
 
 const ENGINE = "prisma" as const;
 const instrumentedClients = new WeakMap<object, object>();
@@ -225,6 +226,10 @@ function captureModelResult(input: {
   }
 
   const rows = modelRowsFromResult(input.result, mutation.bulk);
+  const relationalSequence = nextRelationalOrderSequence(
+    input.options,
+    input.requestId,
+  );
   const rowCount =
     rows.length > 0 ? rows.length : resultRowCount(input.result, rows);
   if (rows.length > 0) {
@@ -236,6 +241,7 @@ function captureModelResult(input: {
       rows,
       rowCount,
       bulk: mutation.bulk,
+      context: { relationalSequence },
       beforeImageStatus: modelBeforeImageStatus(
         input.operation,
         input.args,
@@ -274,7 +280,7 @@ function captureRawResult(input: {
   const rows = rowsFromResult(input.result);
   const rowCount = resultRowCount(input.result, rows);
   const raw = rawOperation(input.classification);
-  emitDbStatementEvent({
+  const relationalSequence = emitDbStatementEvent({
     engine: ENGINE,
     op: raw.op,
     table: raw.table,
@@ -302,6 +308,7 @@ function captureRawResult(input: {
               ? { status: "partial", reason: "prisma_raw_result_selection" }
               : undefined,
         options: input.options,
+        context: { relationalSequence },
       });
     } else if (rowCount > 0) {
       emitImagelessDbDiff({

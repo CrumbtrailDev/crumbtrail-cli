@@ -207,7 +207,7 @@ function runCaptured(
       const eventOptions = capture?.suppressRaceEvidence
         ? suppressRaceEvidence(operationOptions)
         : operationOptions;
-      emitDbStatementEvent({
+      const relationalSequence = emitDbStatementEvent({
         engine: ENGINE,
         op: parsed?.op ?? (parsedRead ? "select" : "other"),
         table: parsed?.table ?? parsedRead?.table ?? null,
@@ -230,6 +230,7 @@ function runCaptured(
               rows,
               rowCount,
               options: eventOptions,
+              context: { relationalSequence },
             });
           } else {
             emitImagelessDbDiff({
@@ -275,7 +276,10 @@ function runCaptured(
       throw error;
     },
   );
-  if (observed && (typeof observed === "object" || typeof observed === "function")) {
+  if (
+    observed &&
+    (typeof observed === "object" || typeof observed === "function")
+  ) {
     queryCaptures.set(observed, capture);
   }
   preserveQueryMetadata(hostResult, observed);

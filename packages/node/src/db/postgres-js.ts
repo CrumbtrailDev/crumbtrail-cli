@@ -646,7 +646,7 @@ function recordSuccess(input: {
   const statement = statementTextOf(query, input.plannedText);
   const { rows, rowCount } = rowsOf(query, result);
 
-  emitDbStatementEvent({
+  const relationalSequence = emitDbStatementEvent({
     engine: ENGINE,
     op: parsed?.op ?? (parsedRead ? "select" : "other"),
     table: parsed?.table ?? parsedRead?.table ?? null,
@@ -680,6 +680,7 @@ function recordSuccess(input: {
       rowCount: rowCount ?? rows.length,
       options,
       context: {
+        relationalSequence,
         connection: input.context.connection,
         durationMs: input.context.durationMs,
         transactionId: input.context.transaction?.id,

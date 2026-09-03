@@ -402,7 +402,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
               transaction: activeBefore,
               outcome: "unknown",
               requestId,
-              options,
+              options: operationOptions,
             });
             transaction = undefined;
           }
@@ -415,7 +415,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
               statementParams: values,
               requestId,
               error,
-              options,
+              options: operationOptions,
               context: { connection, transactionId: activeBefore?.id },
             });
           }
@@ -510,7 +510,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           });
           throw error;
         }
-        const context = {
+        const context: DbStatementContext = {
           connection,
           durationMs: elapsed(),
           transactionId: transaction?.id,
@@ -518,7 +518,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
         // Record what the statement ASKED, whatever it returned. Outside `captureReads` on
         // purpose: that flag caps row IMAGES and this record carries none, and a SELECT that
         // matched nothing emits no row event at all.
-        emitDbStatementEvent({
+        context.relationalSequence = emitDbStatementEvent({
           engine: ENGINE,
           op: parsedRead ? "select" : "other",
           table: parsedRead?.table ?? null,
@@ -573,12 +573,12 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           });
           throw error;
         }
-        const context = {
+        const context: DbStatementContext = {
           connection,
           durationMs: elapsed(),
           transactionId: transaction?.id,
         };
-        emitDbStatementEvent({
+        context.relationalSequence = emitDbStatementEvent({
           engine: ENGINE,
           op: parsed.op,
           table: parsed.table,
@@ -641,14 +641,14 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
         });
         throw error;
       }
-      const context = {
+      const context: DbStatementContext = {
         connection,
         durationMs: elapsed(),
         transactionId: transaction?.id,
       };
       // A mutation whose WHERE matched nothing changes no row and so appears in no diff — the
       // same silence a mutation that never ran would leave. The statement record separates them.
-      emitDbStatementEvent({
+      context.relationalSequence = emitDbStatementEvent({
         engine: ENGINE,
         op: parsedMutation.op,
         table: parsedMutation.table,
@@ -768,9 +768,10 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           const activeBefore = transaction;
           let result: unknown;
           try {
-            result = await (
-              method as (...values: unknown[]) => unknown
-            ).apply(target, args);
+            result = await (method as (...values: unknown[]) => unknown).apply(
+              target,
+              args,
+            );
           } catch (error) {
             if (activeBefore && prop !== "beginTransaction") {
               finishDbTransaction({
@@ -778,7 +779,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
                 transaction: activeBefore,
                 outcome: "unknown",
                 requestId,
-                options,
+                options: operationOptions,
               });
               transaction = undefined;
             }
@@ -790,7 +791,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
                 statement: String(prop),
                 requestId,
                 error,
-                options,
+                options: operationOptions,
                 context: { connection, transactionId: activeBefore?.id },
               });
             }

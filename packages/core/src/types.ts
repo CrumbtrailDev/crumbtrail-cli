@@ -377,12 +377,7 @@ export type DbDiffOp = "insert" | "update" | "delete" | "upsert";
  * agents and humans know which dialect the captured statement ran against.
  */
 export type DbEngine =
-  | "postgres"
-  | "mysql"
-  | "mssql"
-  | "sqlite"
-  | "prisma"
-  | "mongodb";
+  "postgres" | "mysql" | "mssql" | "sqlite" | "prisma" | "mongodb";
 
 /** Why a Prisma mutation could not carry a complete pre-mutation row image. */
 export type DbBeforeImageStatus =
@@ -650,6 +645,8 @@ export interface DbErrorEventData {
   requestId: string;
   /** Present when the refused statement ran inside an observed transaction. */
   transactionId?: string;
+  /** Exact statement ordinal shared with configured relational order evidence. */
+  relationalSequence?: number;
   /** Application callsite that issued the refused statement, when a host frame exists. */
   callsite?: DbCallsite;
   t: number;

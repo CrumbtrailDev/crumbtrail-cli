@@ -83,7 +83,7 @@ describe("instrumentMssqlPool OUTPUT injection", () => {
     const db = instrumentMssqlPool(pool, {
       requestId: "req-relational",
       relationalOrder: {
-        key: "test-only-key",
+        key: "test-only-key-with-at-least-32-bytes",
         declarations: [
           {
             relationId: "order-line-order",

@@ -22,6 +22,7 @@ export interface BuildDbErrorEventInput {
   error: unknown;
   requestId: string;
   transactionId?: string;
+  relationalSequence?: number;
   /** Application callsite captured while the refused statement was being emitted. */
   callsite?: DbCallsite;
   sessionId?: string;
@@ -245,6 +246,11 @@ export function buildDbErrorEvent(input: BuildDbErrorEventInput): BugEvent {
     errorName: captureDbErrorName(input.error),
     requestId: input.requestId,
     ...(input.transactionId ? { transactionId: input.transactionId } : {}),
+    ...(Number.isSafeInteger(input.relationalSequence) &&
+    Number(input.relationalSequence) > 0 &&
+    Number(input.relationalSequence) <= 0x7fffffff
+      ? { relationalSequence: input.relationalSequence }
+      : {}),
     ...(input.callsite !== undefined ? { callsite: input.callsite } : {}),
     t: now,
   };

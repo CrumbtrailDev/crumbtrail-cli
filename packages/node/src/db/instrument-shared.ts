@@ -47,6 +47,7 @@ import {
 import {
   emitRelationalOrderEvents,
   emitRelationalOrderAttempt,
+  nextRelationalOrderSequence,
   type RelationalOrderCaptureOptions,
 } from "./relational-order";
 
@@ -82,32 +83,6 @@ export const DEFAULT_MAX_CALLSITES_PER_REQUEST = 8;
  * hole; this one is bounded because it holds objects rather than counters.
  */
 const MAX_TRACKED_CALLSITE_REQUESTS = 256;
-
-const lastStatementSeqByOptions = new WeakMap<object, Map<string, number>>();
-
-function statementSequenceMap(
-  options: InstrumentDbClientOptions,
-): Map<string, number> {
-  let sequences = lastStatementSeqByOptions.get(options);
-  if (!sequences) {
-    sequences = new Map();
-    lastStatementSeqByOptions.set(options, sequences);
-  }
-  return sequences;
-}
-
-function rememberStatementSequence(
-  options: InstrumentDbClientOptions,
-  requestId: string,
-  sequence: number,
-): void {
-  const sequences = statementSequenceMap(options);
-  if (sequences.size >= 256 && !sequences.has(requestId)) {
-    const oldest = sequences.keys().next().value;
-    if (typeof oldest === "string") sequences.delete(oldest);
-  }
-  sequences.set(requestId, sequence);
-}
 
 /**
  * Options accepted by every `instrument*` adapter. Every field is engine-agnostic; the Postgres
@@ -239,6 +214,8 @@ export interface DbStatementContext {
   transactionId?: string;
   /** Statement ordinal, when the adapter has one. */
   statementSeq?: number;
+  /** Immutable ordinal allocated when this operation's statement completes. */
+  relationalSequence?: number;
 }
 
 export function startDbQueryTimer(
@@ -828,6 +805,11 @@ export function emitDbDiffEvents(input: {
   } = input;
   const maxRows = normalizeMaxRowsPerStatement(options.maxRowsPerStatement);
   const emittedRows = Math.min(rows.length, maxRows);
+  const relationalSequence =
+    input.context?.relationalSequence ??
+    (input.context?.statementSeq !== undefined
+      ? nextRelationalOrderSequence(options, requestId)
+      : undefined);
   const emitRows = rows.slice(0, emittedRows);
   const samplePks: Array<Record<string, unknown>> = [];
   const sensitive = buildSensitiveColumnSet(options.redactColumns);
@@ -867,22 +849,19 @@ export function emitDbDiffEvents(input: {
         : { after: row, before: beforeByPk?.get(pkKey(pk)) }),
     });
     if (!emitDbEvent(options, event)) return;
-    if (input.context?.statementSeq !== undefined)
-      rememberStatementSequence(
-        options,
-        requestId,
-        input.context.statementSeq,
-      );
     emitRelationalOrderEvents({
       engine,
       op,
       table,
       requestId,
       rows: [row],
-      options,
-      sequence:
-        input.context?.statementSeq ??
-        lastStatementSeqByOptions.get(options)?.get(requestId),
+      options: {
+        ...options,
+        emit: (event) => {
+          emitDbEvent(options, event);
+        },
+      },
+      sequence: relationalSequence,
       transactionId: input.context?.transactionId,
     });
   }
@@ -1014,9 +993,7 @@ export function emitDbErrorEvent(input: {
 }): void {
   const { options } = input;
   try {
-    const seqs = statementSequenceMap(options);
-    const sequence =
-      input.context?.statementSeq ?? nextStatementSeq(seqs, input.requestId);
+    const sequence = nextRelationalOrderSequence(options, input.requestId);
     emitDbEvent(
       options,
       buildDbErrorEvent({
@@ -1027,6 +1004,7 @@ export function emitDbErrorEvent(input: {
         statement: input.statement,
         error: input.error,
         requestId: input.requestId,
+        relationalSequence: sequence,
         transactionId: input.context?.transactionId,
         callsite: errorCallsiteFor(
           options,
@@ -1039,17 +1017,23 @@ export function emitDbErrorEvent(input: {
         sessionStartedAt: options.sessionStartedAt,
       }),
     );
-    emitRelationalOrderAttempt({
-      engine: input.engine,
-      op: input.op === "insert" ? "insert" : input.op,
-      table: input.table ?? "",
-      statement: input.statement,
-      params: input.statementParams,
-      requestId: input.requestId,
-      sequence,
-      transactionId: input.context?.transactionId,
-      options,
-    });
+    if (sequence !== undefined)
+      emitRelationalOrderAttempt({
+        engine: input.engine,
+        op: input.op === "insert" ? "insert" : input.op,
+        table: input.table ?? "",
+        statement: input.statement,
+        params: input.statementParams,
+        requestId: input.requestId,
+        sequence,
+        transactionId: input.context?.transactionId,
+        options: {
+          ...options,
+          emit: (event) => {
+            emitDbEvent(options, event);
+          },
+        },
+      });
   } catch {
     // Building or routing the record is capture work. It may never decide what the caller sees.
   }
@@ -1082,9 +1066,9 @@ export function emitDbStatementEvent(input: {
   requestId: string;
   options: InstrumentDbClientOptions;
   context?: DbStatementContext;
-}): void {
+}): number | undefined {
   const { options } = input;
-  rememberStatementSequence(options, input.requestId, input.seq);
+  const sequence = nextRelationalOrderSequence(options, input.requestId);
   try {
     emitDbEvent(
       options,
@@ -1106,6 +1090,7 @@ export function emitDbStatementEvent(input: {
   } catch {
     // Building or routing the record is capture work. It may never decide what the caller sees.
   }
+  return sequence;
 }
 
 /**
@@ -1119,7 +1104,10 @@ export function nextStatementSeq(
   statementsByRequest: Map<string, number>,
   requestId: string,
 ): number {
-  if (statementsByRequest.size >= MAX_TRACKED_CALLSITE_REQUESTS && !statementsByRequest.has(requestId)) {
+  if (
+    statementsByRequest.size >= MAX_TRACKED_CALLSITE_REQUESTS &&
+    !statementsByRequest.has(requestId)
+  ) {
     const oldest = statementsByRequest.keys().next().value;
     if (typeof oldest === "string") statementsByRequest.delete(oldest);
   }
