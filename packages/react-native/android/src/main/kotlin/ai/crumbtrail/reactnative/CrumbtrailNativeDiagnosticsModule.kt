@@ -143,9 +143,13 @@ class CrumbtrailNativeDiagnosticsModule(
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val manager = reactContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return
         runCatching {
+            val prefs = preferences
+            val lastSeen = prefs.getLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, 0L)
+            var newest = lastSeen
             manager.getHistoricalProcessExitReasons(reactContext.packageName, 0, 4)
-                .filter { it.timestamp > 0 }
+                .filter { it.timestamp > lastSeen }
                 .forEach { info ->
+                    newest = maxOf(newest, info.timestamp)
                     val reason = info.reason
                     when (reason) {
                         android.app.ApplicationExitInfo.REASON_ANR -> appendPending(
@@ -180,6 +184,9 @@ class CrumbtrailNativeDiagnosticsModule(
                         ))
                     }
                 }
+            if (newest > lastSeen) {
+                prefs.edit().putLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, newest).commit()
+            }
         }
     }
 
@@ -242,6 +249,7 @@ class CrumbtrailNativeDiagnosticsModule(
         const val MODULE_NAME = "CrumbtrailNativeDiagnostics"
         private const val PREFERENCES = "ai.crumbtrail.react-native"
         private const val PENDING_KEY = "native-diagnostics"
+        private const val LAST_PROCESS_EXIT_TIMESTAMP_KEY = "native-diagnostics.last-process-exit"
         private const val MAX_PENDING_EVENTS = 32
         private const val MAX_TEXT = 8_192
         private const val HANG_THRESHOLD_MS = 5_000L

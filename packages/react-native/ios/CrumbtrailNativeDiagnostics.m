@@ -110,10 +110,11 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
     @{ @"name": UIApplicationWillEnterForegroundNotification, @"state": @"foreground" },
     @{ @"name": UIApplicationDidReceiveMemoryWarningNotification, @"state": @"memory-warning" },
   ];
+  __weak typeof(self) weakSelf = self;
   for (NSDictionary *entry in notifications) {
     id token = [center addObserverForName:entry[@"name"] object:nil queue:[NSOperationQueue mainQueue]
                     usingBlock:^(__unused NSNotification *notification) {
-      [self appendPendingKind:@"app-lifecycle" data:@{
+      [weakSelf appendPendingKind:@"app-lifecycle" data:@{
         @"state": entry[@"state"], @"source": @"uiapplication"
       }];
     }];
