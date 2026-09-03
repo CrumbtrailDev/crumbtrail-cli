@@ -39,6 +39,7 @@ interface OperationCapture {
 interface BatchCapture {
   mode: "pipeline" | "transaction";
   queuedTransaction: boolean;
+  terminal: boolean;
   operationCount: number;
   operations: string[];
   keys: unknown[];
@@ -106,8 +107,9 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
               result = Reflect.apply(original, target, args);
             } catch (error) {
               capture.startStatus = "rejected";
+              capture.terminal = true;
               clear();
-              emitQueuedTransactionFailure(driver, options, error);
+              emitQueuedTransactionFailure(driver, options, error, capture);
               throw error;
             }
             return wrapQueuedTransactionStart(
@@ -140,8 +142,14 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
               try {
                 execution = Reflect.apply(original, target, args);
               } catch (error) {
+                transaction.terminal = true;
                 queuedTransaction = undefined;
-                emitQueuedTransactionFailure(driver, options, error);
+                emitQueuedTransactionFailure(
+                  driver,
+                  options,
+                  error,
+                  transaction,
+                );
                 throw error;
               }
               return wrapQueuedTransactionExecution(
@@ -314,20 +322,27 @@ function wrapQueuedTransactionStart(
 ): unknown {
   if (!isThenable(result)) {
     capture.startStatus = result === "OK" ? "fulfilled" : "rejected";
-    if (result !== "OK") clear();
+    if (result !== "OK") {
+      capture.terminal = true;
+      clear();
+    }
     return result;
   }
   return result.then(
     (resolved: unknown) => {
       capture.startStatus = resolved === "OK" ? "fulfilled" : "rejected";
-      if (resolved !== "OK" && isCurrent()) clear();
+      if (resolved !== "OK") {
+        capture.terminal = true;
+        if (isCurrent()) clear();
+      }
       return resolved;
     },
     (error: unknown) => {
       capture.startStatus = "rejected";
+      capture.terminal = true;
       if (isCurrent()) {
         clear();
-        emitQueuedTransactionFailure(driver, options, error);
+        emitQueuedTransactionFailure(driver, options, error, capture);
       }
       throw error;
     },
@@ -338,6 +353,7 @@ function createQueuedTransactionCapture(): QueuedTransactionCapture {
   return {
     mode: "transaction",
     queuedTransaction: true,
+    terminal: false,
     startStatus: "pending",
     operationCount: 0,
     operations: [],
@@ -354,6 +370,8 @@ function wrapQueuedTransactionExecution(
 ): unknown {
   const requestId = resolveRequestId(options);
   const complete = (resolved: unknown): unknown => {
+    if (capture.terminal) return resolved;
+    capture.terminal = true;
     clear();
     if (!requestId) return resolved;
     const inspection = inspectBatchResult(driver, resolved);
@@ -372,6 +390,8 @@ function wrapQueuedTransactionExecution(
     return resolved;
   };
   const fail = (error: unknown): never => {
+    if (capture.terminal) throw error;
+    capture.terminal = true;
     clear();
     if (requestId) {
       emitSafely(options, {
@@ -394,6 +414,7 @@ function emitQueuedTransactionFailure(
   driver: CacheDriver,
   options: InstrumentCacheClientOptions,
   error: unknown,
+  capture?: BatchCapture,
 ): void {
   const requestId = resolveRequestId(options);
   if (!requestId) return;
@@ -404,7 +425,7 @@ function emitQueuedTransactionFailure(
     requestId,
     outcome: "failure",
     error,
-    summary: emptyBatchSummary(),
+    summary: capture ? batchSummary(capture) : emptyBatchSummary(),
   });
 }
 
@@ -424,6 +445,7 @@ function wrapBatch(
   const capture: BatchCapture = {
     mode,
     queuedTransaction,
+    terminal: false,
     operationCount: 0,
     operations: [],
     keys: [],

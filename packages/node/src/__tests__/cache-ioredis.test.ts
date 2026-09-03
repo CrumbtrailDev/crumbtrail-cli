@@ -470,6 +470,98 @@ describe("instrumentIoredisClient", () => {
     expect(events[1]?.d).toMatchObject({ op: "get", hit: true });
   });
 
+  it("emits only the start failure when MULTI rejects before exec resolves", async () => {
+    const events: BugEvent[] = [];
+    const startFailure = new Error("MULTI failure token=start-secret");
+    const tuples: unknown[] = [[null, "OK"]];
+    let rejectStart!: (error: Error) => void;
+    let resolveExecution!: (value: unknown[]) => void;
+    const startResult = new Promise<string>((_resolve, reject) => {
+      rejectStart = reject;
+    });
+    const executionResult = new Promise<unknown[]>((resolve) => {
+      resolveExecution = resolve;
+    });
+    const client = instrumentIoredisClient(
+      {
+        multi(_options?: unknown) {
+          return startResult;
+        },
+        get(_key: string) {
+          return Promise.resolve("QUEUED");
+        },
+        exec() {
+          return executionResult;
+        },
+      },
+      {
+        emit: (event) => events.push(event),
+        requestId: "req_ioredis_start_first",
+      },
+    );
+
+    const start = client.multi({ pipeline: false });
+    const queued = client.get("cart:123");
+    const execution = client.exec();
+    rejectStart(startFailure);
+
+    await expect(start).rejects.toBe(startFailure);
+    await expect(queued).resolves.toBe("QUEUED");
+    expect(events).toHaveLength(1);
+    expect(events[0]?.d).toMatchObject({
+      outcome: "failure",
+      summary: { operationCount: 1, operations: ["get"] },
+    });
+
+    resolveExecution(tuples);
+    await expect(execution).resolves.toBe(tuples);
+    expect(events).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toContain("start-secret");
+  });
+
+  it("emits only exec success when MULTI rejects after exec resolves", async () => {
+    const events: BugEvent[] = [];
+    const startFailure = new Error("MULTI failure token=late-start-secret");
+    const tuples: unknown[] = [[null, "OK"]];
+    let rejectStart!: (error: Error) => void;
+    const startResult = new Promise<string>((_resolve, reject) => {
+      rejectStart = reject;
+    });
+    const client = instrumentIoredisClient(
+      {
+        multi(_options?: unknown) {
+          return startResult;
+        },
+        get(_key: string) {
+          return Promise.resolve("QUEUED");
+        },
+        exec() {
+          return Promise.resolve(tuples);
+        },
+      },
+      {
+        emit: (event) => events.push(event),
+        requestId: "req_ioredis_exec_first",
+      },
+    );
+
+    const start = client.multi({ pipeline: false });
+    const queued = client.get("cart:123");
+    const execution = client.exec();
+    await expect(execution).resolves.toBe(tuples);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.d).toMatchObject({
+      op: "transaction",
+      summary: { operationCount: 1, operations: ["get"] },
+    });
+
+    rejectStart(startFailure);
+    await expect(start).rejects.toBe(startFailure);
+    await expect(queued).resolves.toBe("QUEUED");
+    expect(events).toHaveLength(1);
+    expect(JSON.stringify(events)).not.toContain("late-start-secret");
+  });
+
   it("clears root ioredis pipeline:false state after an exec abort", async () => {
     const events: BugEvent[] = [];
     const client = instrumentIoredisClient(
