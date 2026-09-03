@@ -323,6 +323,32 @@ describe("buildPlan — Next.js", () => {
 
 describe("buildPlan — idempotency", () => {
   it.each([
+    "function require() {}",
+    "const require = () => {};",
+    "class require {}",
+    "const { loader: require } = loaders;",
+    "const [require] = loaders;",
+    'import require from "loader";',
+    'import { loader as require } from "loader";',
+    'import * as require from "loader";',
+  ])(
+    "rejects shadowed require proof including hoisted bindings: %s",
+    (binding) => {
+      expect(
+        hasExecutableEarlyBrowserImport(
+          `require("crumbtrail-core/early");\n${binding}`,
+        ),
+      ).toBe(false);
+    },
+  );
+  it("accepts the genuine unbound CommonJS loader first", () => {
+    expect(
+      hasExecutableEarlyBrowserImport(
+        'require("crumbtrail-core/early");\nrequire("./app");',
+      ),
+    ).toBe(true);
+  });
+  it.each([
     'fetch("/startup");',
     'function startup() { fetch("/startup"); } startup();',
     "window.started = true;",

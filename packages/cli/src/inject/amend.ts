@@ -572,6 +572,41 @@ function topLevelAwaitedEarlyImportPositions(program: any): number[] {
 }
 
 function topLevelEarlyRequirePositions(program: any): number[] {
+  const bindsRequire = (pattern: any): boolean => {
+    if (!pattern) return false;
+    if (pattern.type === "Identifier") return pattern.name === "require";
+    if (pattern.type === "RestElement") return bindsRequire(pattern.argument);
+    if (pattern.type === "AssignmentPattern") return bindsRequire(pattern.left);
+    if (pattern.type === "ArrayPattern")
+      return pattern.elements.some(bindsRequire);
+    if (pattern.type === "ObjectPattern")
+      return pattern.properties.some((property: any) =>
+        bindsRequire(
+          property.type === "RestElement" ? property.argument : property.value,
+        ),
+      );
+    return false;
+  };
+  const hasRequireBinding = (node: any): boolean => {
+    if (!node || typeof node !== "object") return false;
+    if (
+      ((node.type === "VariableDeclarator" ||
+        /^(?:Function|Class)/.test(node.type ?? "")) &&
+        bindsRequire(node.id)) ||
+      (node.type?.startsWith("Import") && bindsRequire(node.local)) ||
+      (node.type === "CatchClause" && bindsRequire(node.param)) ||
+      node.params?.some(bindsRequire)
+    )
+      return true;
+    return Object.values(node).some((value) =>
+      Array.isArray(value)
+        ? value.some(hasRequireBinding)
+        : value && typeof value === "object" && "type" in value
+          ? hasRequireBinding(value)
+          : false,
+    );
+  };
+  if (hasRequireBinding(program)) return [];
   const positions: number[] = [];
   for (const statement of program.body ?? []) {
     if (
