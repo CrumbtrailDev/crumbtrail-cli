@@ -30,6 +30,7 @@ import {
   type AwsSqsRecord,
 } from "../aws";
 import type { CrumbtrailContextToken } from "../../distributed-context";
+import { runInBackendRequestContext } from "../../request-context";
 
 function token(now = Date.now()): CrumbtrailContextToken {
   return {
@@ -402,9 +403,9 @@ describe("AWS event carriers", () => {
     expect(losses).toEqual(["collision", "collision"]);
   });
 
-  it("only strips a validated canonical AWS carrier from processor records", async () => {
+  it("strips an invalid AWS carrier before the handler and preserves application attributes", async () => {
     const messageAttributes = {
-      "crumbtrail.context": { DataType: "String", StringValue: "application" },
+      Application: { DataType: "String", StringValue: "application" },
       [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: {
         DataType: "String",
         StringValue: "malformed",
@@ -412,14 +413,75 @@ describe("AWS event carriers", () => {
     };
     const handler = vi.fn(async (record: AwsSqsRecord) => record.messageAttributes);
 
-    await withCrumbtrailAwsSqsProcessor(handler, { now: 1_000 })({
-      messageAttributes,
-    });
+    await expect(
+      withCrumbtrailAwsSqsProcessor(handler, { now: 1_000 })({
+        messageAttributes,
+      }),
+    ).resolves.toEqual({ Application: messageAttributes.Application });
 
     expect(handler).toHaveBeenCalledWith(
-      expect.objectContaining({ messageAttributes }),
+      expect.objectContaining({
+        messageAttributes: { Application: messageAttributes.Application },
+      }),
       expect.anything(),
     );
+  });
+
+  it("strips expired JSON carriers without inheriting ambient context", async () => {
+    const expired = { ...token(1_000), expiresAt: 1_000 };
+    const links: unknown[] = [];
+    const sink = {
+      sessionId: "ambient_session",
+      record: async () => undefined,
+      startChildSession: async () => ({
+        sessionId: "job_session",
+        record: async () => undefined,
+      }),
+      linkSessions: async (input: unknown) => {
+        links.push(input);
+      },
+    };
+    const handler = vi.fn(async (event: AwsEventBridgeEvent) => event.detail);
+    const wrapped = withCrumbtrailAwsEventBridgeProcessor(handler, {
+      now: 1_000,
+      job: { sink },
+    });
+    const event: AwsEventBridgeEvent = {
+      id: "event_1",
+      source: "payments",
+      detail: {
+        paymentId: "pay_1",
+        __crumbtrail: expired,
+        [AWS_CRUMBTRAIL_ENVELOPE_FIELD]: 1,
+      },
+    };
+
+    await runInBackendRequestContext(
+      {
+        sessionId: "ambient_session",
+        requestId: "ambient_request",
+        traceparent: token().traceparent,
+      },
+      async () => {
+        await expect(wrapped(event)).resolves.toEqual({ paymentId: "pay_1" });
+      },
+    );
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(links).toEqual([]);
+    expect(event.detail).toEqual({
+      paymentId: "pay_1",
+      __crumbtrail: expired,
+      [AWS_CRUMBTRAIL_ENVELOPE_FIELD]: 1,
+    });
+
+    expect(
+      stripCrumbtrailSchedulerContext({
+        paymentId: "pay_1",
+        __crumbtrail: expired,
+        [AWS_CRUMBTRAIL_ENVELOPE_FIELD]: 1,
+      }, 1_000),
+    ).toEqual({ paymentId: "pay_1" });
   });
 
   it("prefers the exact canonical AWS attribute when both variants arrive", () => {

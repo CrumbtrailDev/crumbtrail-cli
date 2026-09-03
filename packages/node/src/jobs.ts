@@ -30,8 +30,8 @@ export interface CrumbtrailJobOptions {
   jobId?: string;
   /** First execution is one. Retries keep the same logical identity. */
   attempt?: number;
-  /** Parent context captured when the work was enqueued. */
-  context?: CrumbtrailContextToken;
+  /** Parent context captured when the work was enqueued. Null disables ambient fallback. */
+  context?: CrumbtrailContextToken | null;
   /** Explicit sink, primarily for hosts and tests. Defaults to autoCapture. */
   sink?: BackendEventSink;
   /** Used when no active sink can create a child session. */
@@ -78,7 +78,8 @@ export async function withCrumbtrailJob<T>(
   fn: (context: CrumbtrailJobContext) => T | Promise<T>,
 ): Promise<T> {
   const now = safeNow(options.now);
-  const parentToken = options.context ?? captureToken({ now });
+  const parentToken =
+    options.context === null ? undefined : options.context ?? captureToken({ now });
   const validatedParent = parentToken
     ? validateCrumbtrailContextToken(parentToken, now)
     : undefined;

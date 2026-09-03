@@ -8,6 +8,7 @@ import {
   type BullMqJobLike,
 } from "../bullmq";
 import type { CrumbtrailContextToken } from "../../distributed-context";
+import { runInBackendRequestContext } from "../../request-context";
 
 const TRACEPARENT =
   "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
@@ -191,6 +192,93 @@ describe("BullMQ adapters", () => {
       /^00-0123456789abcdef0123456789abcdef-[0-9a-f]{16}-01$/,
     );
     expect(originalJob.data).toEqual(originalData);
+  });
+
+  it("strips an expired carrier without inheriting ambient context", async () => {
+    const expired = { ...token(1_000), expiresAt: 1_000 };
+    const links: unknown[] = [];
+    const handler = vi.fn(async (job: BullMqJobLike) => job.data);
+    const wrapped = withCrumbtrailBullMqProcessor(handler, {
+      now: 1_000,
+      job: {
+        sink: {
+          sessionId: "ambient_session",
+          record: async () => undefined,
+          startChildSession: async () => ({
+            sessionId: "job_session",
+            record: async () => undefined,
+          }),
+          linkSessions: async (input) => {
+            links.push(input);
+          },
+        },
+      },
+    });
+
+    const job: BullMqJobLike = {
+      name: "record-payment",
+      data: {
+        paymentId: "pay_1",
+        __crumbtrail: expired,
+        __crumbtrailEnvelope: 1,
+      },
+    };
+    await runInBackendRequestContext(
+      {
+        sessionId: "ambient_session",
+        requestId: "ambient_request",
+        traceparent: TRACEPARENT,
+      },
+      async () => {
+        await expect(wrapped(job)).resolves.toEqual({ paymentId: "pay_1" });
+      },
+    );
+
+    expect(handler.mock.calls[0]?.[0].data).toEqual({ paymentId: "pay_1" });
+    expect(links).toEqual([]);
+    expect(job.data).toEqual({
+      paymentId: "pay_1",
+      __crumbtrail: expired,
+      __crumbtrailEnvelope: 1,
+    });
+  });
+
+  it("does not inherit ambient context when the explicit processor token is invalid", async () => {
+    const links: unknown[] = [];
+    const handler = vi.fn(async () => "ok");
+    const wrapped = withCrumbtrailBullMqProcessor(handler, {
+      now: 1_000,
+      context: { v: 1, traceparent: "00-invalid" } as CrumbtrailContextToken,
+      job: {
+        sink: {
+          sessionId: "ambient_session",
+          record: async () => undefined,
+          startChildSession: async () => ({
+            sessionId: "job_session",
+            record: async () => undefined,
+          }),
+          linkSessions: async (input) => {
+            links.push(input);
+          },
+        },
+      },
+    });
+
+    await runInBackendRequestContext(
+      {
+        sessionId: "ambient_session",
+        requestId: "ambient_request",
+        traceparent: TRACEPARENT,
+      },
+      async () => {
+        await expect(wrapped({ name: "record-payment", data: { paymentId: "pay_1" } })).resolves.toBe(
+          "ok",
+        );
+      },
+    );
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(links).toEqual([]);
   });
 
   it("does not double wrap a processor callback", () => {

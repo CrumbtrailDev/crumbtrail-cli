@@ -209,18 +209,22 @@ export function injectCrumbtrailSqsMessage<T extends AwsSqsSendMessageInput>(
   input: T,
   options: AwsContextOptions = {},
 ): T & AwsSqsSendMessageInput {
-  const token = resolveToken(options);
-  if (!token) return cloneValue(input);
-  const messageAttributes = withContextAttribute(
-    input.MessageAttributes,
-    token,
-    options,
-  );
-  if (!messageAttributes) return cloneValue(input);
-  return {
-    ...cloneValue(input),
-    MessageAttributes: messageAttributes,
-  } as T;
+  try {
+    const token = resolveToken(options);
+    if (!token) return cloneValue(input);
+    const messageAttributes = withContextAttribute(
+      safeGet(input, "MessageAttributes") as AwsMessageAttributes | undefined,
+      token,
+      options,
+    );
+    if (!messageAttributes) return cloneValue(input);
+    return {
+      ...cloneValue(input),
+      MessageAttributes: messageAttributes,
+    } as T;
+  } catch {
+    return input as T & AwsSqsSendMessageInput;
+  }
 }
 
 /** Add a token to every SQS batch entry while preserving IDs and retry fields. */
@@ -228,24 +232,32 @@ export function injectCrumbtrailSqsBatch<T extends AwsSqsSendMessageBatchInput>(
   input: T,
   options: AwsContextOptions = {},
 ): Omit<T, "Entries"> & AwsSqsSendMessageBatchInput {
-  const token = resolveToken(options);
-  const cloned = cloneValue(input);
-  if (!token) return cloned;
-  return {
-    ...cloned,
-    Entries: input.Entries.map((entry) => {
-      const messageAttributes = withContextAttribute(
-        entry.MessageAttributes,
-        token,
-        options,
-      );
-      if (!messageAttributes) return cloneValue(entry);
-      return {
-        ...cloneValue(entry),
-        MessageAttributes: messageAttributes,
-      };
-    }),
-  } as T;
+  try {
+    const token = resolveToken(options);
+    const cloned = cloneValue(input);
+    if (!token) return cloned;
+    const entries = safeGet(input, "Entries");
+    if (!Array.isArray(entries)) return cloned;
+    return {
+      ...cloned,
+      Entries: entries.map((entry) => {
+        const messageAttributes = withContextAttribute(
+          safeGet(entry, "MessageAttributes") as
+            | AwsMessageAttributes
+            | undefined,
+          token,
+          options,
+        );
+        if (!messageAttributes) return cloneValue(entry);
+        return {
+          ...cloneValue(entry),
+          MessageAttributes: messageAttributes,
+        };
+      }),
+    } as T;
+  } catch {
+    return input as Omit<T, "Entries"> & AwsSqsSendMessageBatchInput;
+  }
 }
 
 /** Add a token to an SNS publish attribute without changing the message body. */
@@ -253,37 +265,46 @@ export function injectCrumbtrailSnsMessage<T extends AwsSnsPublishInput>(
   input: T,
   options: AwsContextOptions = {},
 ): T & AwsSnsPublishInput {
-  const token = resolveToken(options);
-  if (!token) return cloneValue(input);
-  const messageAttributes = withContextAttribute(
-    input.MessageAttributes,
-    token,
-    options,
-  );
-  if (!messageAttributes) return cloneValue(input);
-  return {
-    ...cloneValue(input),
-    MessageAttributes: messageAttributes,
-  } as T;
+  try {
+    const token = resolveToken(options);
+    if (!token) return cloneValue(input);
+    const messageAttributes = withContextAttribute(
+      safeGet(input, "MessageAttributes") as AwsMessageAttributes | undefined,
+      token,
+      options,
+    );
+    if (!messageAttributes) return cloneValue(input);
+    return {
+      ...cloneValue(input),
+      MessageAttributes: messageAttributes,
+    } as T;
+  } catch {
+    return input as T & AwsSnsPublishInput;
+  }
 }
 
 /** Add a token to EventBridge Detail JSON, whose envelope has no metadata field. */
 export function injectCrumbtrailEventBridgeEntry<
   T extends AwsEventBridgeEntry,
 >(input: T, options: AwsContextOptions = {}): T {
-  const token = resolveToken(options);
-  if (!token || typeof input.Detail !== "string") return cloneValue(input);
-  const detail = injectJsonCarrier(input.Detail, token, options);
-  const candidate = { ...cloneValue(input), Detail: detail } as T;
-  if (eventBridgeEntryBytes(candidate) >= MAX_AWS_EVENTBRIDGE_REQUEST_BYTES) {
-    reportCaptureLoss(
-      options,
-      "size",
-      "EventBridge entry exceeds the 1 MiB PutEvents request limit with Crumbtrail context",
-    );
-    return cloneValue(input);
+  try {
+    const token = resolveToken(options);
+    const encoded = safeGet(input, "Detail");
+    if (!token || typeof encoded !== "string") return cloneValue(input);
+    const detail = injectJsonCarrier(encoded, token, options);
+    const candidate = { ...cloneValue(input), Detail: detail } as T;
+    if (eventBridgeEntryBytes(candidate) >= MAX_AWS_EVENTBRIDGE_REQUEST_BYTES) {
+      reportCaptureLoss(
+        options,
+        "size",
+        "EventBridge entry exceeds the 1 MiB PutEvents request limit with Crumbtrail context",
+      );
+      return cloneValue(input);
+    }
+    return candidate;
+  } catch {
+    return input;
   }
-  return candidate;
 }
 
 /**
@@ -294,28 +315,35 @@ export function injectCrumbtrailEventBridgeEntry<
 export function injectCrumbtrailSchedulerInput<
   T extends AwsSchedulerCreateScheduleInput,
 >(input: T, options: AwsSchedulerProducerOptions = {}): T {
-  const expressionIsOneShot = isOneShotSchedule(input.ScheduleExpression);
-  const oneShot = expressionIsOneShot && options.oneShot !== false;
-  const token = oneShot ? resolveToken(options) : undefined;
-  if (!token || !input.Target || typeof input.Target.Input !== "string")
-    return cloneValue(input);
-  const carriedInput = injectJsonCarrier(input.Target.Input, token, options);
-  const inputBytes = utf8Bytes(carriedInput);
-  if (inputBytes > MAX_AWS_SCHEDULER_INPUT_BYTES) {
-    reportCaptureLoss(
-      options,
-      "size",
-      "Scheduler Target.Input exceeds the 256 KiB service limit with Crumbtrail context",
+  try {
+    const expressionIsOneShot = isOneShotSchedule(
+      safeGet(input, "ScheduleExpression"),
     );
-    return cloneValue(input);
+    const oneShot = expressionIsOneShot && safeGet(options, "oneShot") !== false;
+    const token = oneShot ? resolveToken(options) : undefined;
+    const target = safeGet(input, "Target");
+    const encoded = safeGet(target, "Input");
+    if (!token || !target || typeof encoded !== "string") return cloneValue(input);
+    const carriedInput = injectJsonCarrier(encoded, token, options);
+    const inputBytes = utf8Bytes(carriedInput);
+    if (inputBytes > MAX_AWS_SCHEDULER_INPUT_BYTES) {
+      reportCaptureLoss(
+        options,
+        "size",
+        "Scheduler Target.Input exceeds the 256 KiB service limit with Crumbtrail context",
+      );
+      return cloneValue(input);
+    }
+    return {
+      ...cloneValue(input),
+      Target: {
+        ...cloneValue(target),
+        Input: carriedInput,
+      },
+    } as T;
+  } catch {
+    return input;
   }
-  return {
-    ...cloneValue(input),
-    Target: {
-      ...cloneValue(input.Target),
-      Input: carriedInput,
-    },
-  } as T;
 }
 
 /** Extract a token from an incoming SQS record. */
@@ -323,7 +351,10 @@ export function extractCrumbtrailSqsRecord(
   record: AwsSqsRecord,
   now: number | (() => number) = Date.now,
 ): CrumbtrailContextToken | undefined {
-  return extractMessageAttribute(record.messageAttributes, now);
+  return extractMessageAttribute(
+    safeGet(record, "messageAttributes") as AwsMessageAttributes | undefined,
+    now,
+  );
 }
 
 /** Extract a token from an incoming SNS record. */
@@ -331,7 +362,11 @@ export function extractCrumbtrailSnsRecord(
   record: AwsSnsRecord,
   now: number | (() => number) = Date.now,
 ): CrumbtrailContextToken | undefined {
-  return extractMessageAttribute(record.Sns?.MessageAttributes, now);
+  const sns = safeGet(record, "Sns");
+  return extractMessageAttribute(
+    safeGet(sns, "MessageAttributes") as AwsMessageAttributes | undefined,
+    now,
+  );
 }
 
 /** Extract a token from EventBridge detail JSON. */
@@ -339,7 +374,7 @@ export function extractCrumbtrailEventBridgeContext(
   event: AwsEventBridgeEvent,
   now: number | (() => number) = Date.now,
 ): CrumbtrailContextToken | undefined {
-  return extractJsonCarrier(event.detail, now);
+  return extractJsonCarrier(safeGet(event, "detail"), now);
 }
 
 /** Extract a token from a Scheduler target input or direct invocation input. */
@@ -420,17 +455,25 @@ export function withCrumbtrailAwsSqsProcessor<
   options: AwsJobProcessorOptions = {},
 ): (record: TRecord) => Promise<TResult> {
   return async (record) => {
-    const now = readNow(options.now);
-    const token =
-      extractCrumbtrailSqsRecord(record, now) ?? resolveToken(options, now);
+    const now = readNow(safeGet(options, "now") as number | (() => number) | undefined);
+    const hasCarrier = hasReservedMessageAttribute(
+      safeGet(record, "messageAttributes") as AwsMessageAttributes | undefined,
+    );
+    const extractedToken = hasCarrier
+      ? extractCrumbtrailSqsRecord(record, now)
+      : undefined;
+    const token = hasCarrier ? extractedToken : resolveToken(options, now);
     const safeRecord = stripSqsRecord(record, now);
+    const attributes = safeGet(record, "attributes");
     return withCrumbtrailJob(
       jobOptions(options, {
-        name: options.name ?? "sqs-message",
-        queue: options.queue ?? queueFromArn(record.eventSourceARN),
-        jobId: record.messageId,
-        attempt: receiveAttempt(record.attributes?.ApproximateReceiveCount),
-        context: token,
+        name: safeText(safeGet(options, "name")) ?? "sqs-message",
+        queue:
+          safeText(safeGet(options, "queue")) ??
+          queueFromArn(safeGet(record, "eventSourceARN")),
+        jobId: safeText(safeGet(record, "messageId")),
+        attempt: receiveAttempt(stringValue(safeGet(attributes, "ApproximateReceiveCount"))),
+        context: processorContext(options, hasCarrier, token),
         now,
       }),
       (context) => handler(safeRecord as TRecord, context),
@@ -452,14 +495,21 @@ export function withCrumbtrailAwsSqsBatchProcessor<
 ): (event: AwsSqsEvent<TRecord>) => Promise<AwsSqsBatchResponse> {
   const processRecord = withCrumbtrailAwsSqsProcessor(handler, options);
   return async (event) => {
-    const results = await Promise.allSettled(
-      event.Records.map((record) => processRecord(record)),
-    );
-    const failures = event.Records.flatMap((record, index) =>
-      results[index]?.status === "rejected" && record.messageId
-        ? [{ itemIdentifier: record.messageId }]
-        : [],
-    );
+    const failures: Array<{ itemIdentifier: string }> = [];
+    for (let index = 0; index < event.Records.length; index += 1) {
+      const record = event.Records[index];
+      try {
+        await processRecord(record);
+      } catch {
+        for (let remaining = index; remaining < event.Records.length; remaining += 1) {
+          const itemIdentifier = safeText(
+            safeGet(event.Records[remaining], "messageId"),
+          );
+          if (itemIdentifier) failures.push({ itemIdentifier });
+        }
+        break;
+      }
+    }
     return {
       batchItemFailures: failures,
     } as AwsSqsBatchResponse;
@@ -475,17 +525,25 @@ export function withCrumbtrailAwsSnsProcessor<
   options: AwsJobProcessorOptions = {},
 ): (record: TRecord) => Promise<TResult> {
   return async (record) => {
-    const now = readNow(options.now);
-    const token =
-      extractCrumbtrailSnsRecord(record, now) ?? resolveToken(options, now);
+    const now = readNow(safeGet(options, "now") as number | (() => number) | undefined);
+    const sns = safeGet(record, "Sns");
+    const hasCarrier = hasReservedMessageAttribute(
+      safeGet(sns, "MessageAttributes") as AwsMessageAttributes | undefined,
+    );
+    const extractedToken = hasCarrier
+      ? extractCrumbtrailSnsRecord(record, now)
+      : undefined;
+    const token = hasCarrier ? extractedToken : resolveToken(options, now);
     const safeRecord = stripSnsRecord(record, now);
     return withCrumbtrailJob(
       jobOptions(options, {
-        name: options.name ?? "sns-message",
-        queue: options.queue ?? topicFromArn(record.Sns?.TopicArn),
-        jobId: record.Sns?.MessageId,
+        name: safeText(safeGet(options, "name")) ?? "sns-message",
+        queue:
+          safeText(safeGet(options, "queue")) ??
+          topicFromArn(safeGet(sns, "TopicArn")),
+        jobId: safeText(safeGet(sns, "MessageId")),
         attempt: 1,
-        context: token,
+        context: processorContext(options, hasCarrier, token),
         now,
       }),
       (context) => handler(safeRecord as TRecord, context),
@@ -499,21 +557,24 @@ export function withCrumbtrailAwsEventBridgeProcessor<TResult = unknown>(
   options: AwsJobProcessorOptions = {},
 ): (event: AwsEventBridgeEvent) => Promise<TResult> {
   return async (event) => {
-    const now = readNow(options.now);
-    const token =
-      extractCrumbtrailEventBridgeContext(event, now) ??
-      resolveToken(options, now);
+    const now = readNow(safeGet(options, "now") as number | (() => number) | undefined);
+    const detail = safeGet(event, "detail");
+    const hasCarrier = hasJsonCarrier(detail);
+    const extractedToken = hasCarrier
+      ? extractCrumbtrailEventBridgeContext(event, now)
+      : undefined;
+    const token = hasCarrier ? extractedToken : resolveToken(options, now);
     const safeEvent = {
       ...event,
-      detail: stripCrumbtrailEventBridgeContext(event.detail, now),
+      detail: stripCrumbtrailEventBridgeContext(detail, now),
     };
     return withCrumbtrailJob(
       jobOptions(options, {
-        name: options.name ?? "eventbridge-event",
-        queue: options.queue ?? event.source,
-        jobId: event.id,
+        name: safeText(safeGet(options, "name")) ?? "eventbridge-event",
+        queue: safeText(safeGet(options, "queue")) ?? safeText(safeGet(event, "source")),
+        jobId: safeText(safeGet(event, "id")),
         attempt: 1,
-        context: token,
+        context: processorContext(options, hasCarrier, token),
         now,
       }),
       (context) => handler(safeEvent, context),
@@ -527,17 +588,20 @@ export function withCrumbtrailAwsSchedulerProcessor<TResult = unknown>(
   options: AwsJobProcessorOptions = {},
 ): (event: Record<string, unknown>) => Promise<TResult> {
   return async (event) => {
-    const now = readNow(options.now);
-    const token =
-      extractCrumbtrailSchedulerContext(event, now) ?? resolveToken(options, now);
+    const now = readNow(safeGet(options, "now") as number | (() => number) | undefined);
+    const hasCarrier = hasJsonCarrier(event);
+    const extractedToken = hasCarrier
+      ? extractCrumbtrailSchedulerContext(event, now)
+      : undefined;
+    const token = hasCarrier ? extractedToken : resolveToken(options, now);
     const safeEvent = stripCrumbtrailSchedulerContext(event, now);
     return withCrumbtrailJob(
       jobOptions(options, {
-        name: options.name ?? "scheduler-invocation",
-        queue: options.queue,
-        jobId: stringValue(event.id),
+        name: safeText(safeGet(options, "name")) ?? "scheduler-invocation",
+        queue: safeText(safeGet(options, "queue")),
+        jobId: stringValue(safeGet(event, "id")),
         attempt: 1,
-        context: token,
+        context: processorContext(options, hasCarrier, token),
         now,
       }),
       (context) => handler(safeEvent as Record<string, unknown>, context),
@@ -546,7 +610,7 @@ export function withCrumbtrailAwsSchedulerProcessor<TResult = unknown>(
 }
 
 type AwsWrapperKind = "sqs" | "sns" | "eventbridge" | "scheduler";
-const CLIENT_WRAPPERS = new WeakMap<object, Map<AwsWrapperKind, AwsClientLike>>();
+const CLIENT_WRAPPER_KINDS = new WeakMap<object, Set<AwsWrapperKind>>();
 
 function wrapAwsClient<TClient extends AwsClientLike>(
   client: TClient,
@@ -556,11 +620,10 @@ function wrapAwsClient<TClient extends AwsClientLike>(
 ): TClient {
   if (!client || typeof client !== "object")
     throw new TypeError(`withCrumbtrailAws${kind}Producer requires an AWS client`);
-  const existing = CLIENT_WRAPPERS.get(client)?.get(kind);
-  if (existing) return existing as TClient;
-  const hasSend = typeof client.send === "function";
+  if (CLIENT_WRAPPER_KINDS.get(client)?.has(kind)) return client;
+  const hasSend = typeof safeGet(client, "send") === "function";
   const hasDirect = directMethods.some(
-    (method) => typeof Reflect.get(client, method) === "function",
+    (method) => typeof safeGet(client, method) === "function",
   );
   if (!hasSend && !hasDirect)
     throw new TypeError(
@@ -568,16 +631,22 @@ function wrapAwsClient<TClient extends AwsClientLike>(
     );
 
   const wrapped = new Proxy(client, {
-    get(target, property, receiver) {
-      const value = Reflect.get(target, property, receiver);
+    get(target, property) {
+      const value = safeGet(target, property);
       if (typeof value !== "function") return value;
       if (directMethods.includes(String(property))) {
         return function crumbtrailAwsDirectSend(
           this: unknown,
-          ...args: readonly unknown[]
+        ...args: readonly unknown[]
         ): unknown {
-          return Reflect.apply(value, this === undefined ? target : this, [
-            wrapAwsInput(kind, args[0], options),
+          let input = args[0];
+          try {
+            input = wrapAwsInput(kind, input, options);
+          } catch {
+            // The AWS operation remains authoritative when inspection fails.
+          }
+          return Reflect.apply(value, target, [
+            input,
             ...args.slice(1),
           ]);
         };
@@ -585,29 +654,24 @@ function wrapAwsClient<TClient extends AwsClientLike>(
       if (property === "send") {
         return function crumbtrailAwsCommandSend(
           this: unknown,
-          ...args: readonly unknown[]
+        ...args: readonly unknown[]
         ): unknown {
-          return Reflect.apply(value, this === undefined ? target : this, [
-            wrapAwsCommand(kind, args[0], options),
+          let command = args[0];
+          try {
+            command = wrapAwsCommand(kind, command, options);
+          } catch {
+            // The AWS operation remains authoritative when inspection fails.
+          }
+          return Reflect.apply(value, target, [
+            command,
             ...args.slice(1),
           ]);
         };
       }
-      return value;
+      return value.bind(target);
     },
   });
-  let byKind = CLIENT_WRAPPERS.get(client);
-  if (!byKind) {
-    byKind = new Map();
-    CLIENT_WRAPPERS.set(client, byKind);
-  }
-  byKind.set(kind, wrapped);
-  let wrappedByKind = CLIENT_WRAPPERS.get(wrapped);
-  if (!wrappedByKind) {
-    wrappedByKind = new Map();
-    CLIENT_WRAPPERS.set(wrapped, wrappedByKind);
-  }
-  wrappedByKind.set(kind, wrapped);
+  markClientWrapper(wrapped, kind);
   return wrapped as TClient;
 }
 
@@ -616,21 +680,25 @@ function wrapAwsInput(
   input: unknown,
   options: AwsContextOptions,
 ): unknown {
-  if (!input || typeof input !== "object") return input;
-  switch (kind) {
-    case "sqs":
-      return "Entries" in input
-        ? injectCrumbtrailSqsBatch(input as AwsSqsSendMessageBatchInput, options)
-        : injectCrumbtrailSqsMessage(input as AwsSqsSendMessageInput, options);
-    case "sns":
-      return injectCrumbtrailSnsMessage(input as AwsSnsPublishInput, options);
-    case "eventbridge":
-      return wrapEventBridgePutEvents(input as Record<string, unknown>, options);
-    case "scheduler":
-      return injectCrumbtrailSchedulerInput(
-        input as AwsSchedulerCreateScheduleInput,
-        options,
-      );
+  try {
+    if (!input || typeof input !== "object") return input;
+    switch (kind) {
+      case "sqs":
+        return safeHas(input, "Entries")
+          ? injectCrumbtrailSqsBatch(input as AwsSqsSendMessageBatchInput, options)
+          : injectCrumbtrailSqsMessage(input as AwsSqsSendMessageInput, options);
+      case "sns":
+        return injectCrumbtrailSnsMessage(input as AwsSnsPublishInput, options);
+      case "eventbridge":
+        return wrapEventBridgePutEvents(input as Record<string, unknown>, options);
+      case "scheduler":
+        return injectCrumbtrailSchedulerInput(
+          input as AwsSchedulerCreateScheduleInput,
+          options,
+        );
+    }
+  } catch {
+    return input;
   }
 }
 
@@ -639,65 +707,70 @@ function wrapAwsCommand(
   command: unknown,
   options: AwsContextOptions,
 ): unknown {
-  if (!command || typeof command !== "object") return command;
-  const input = (command as { input?: unknown }).input;
-  if (!input || typeof input !== "object") return command;
-  const name = String(
-    (command as { commandName?: unknown }).commandName ??
-      (command as { constructor?: { name?: string } }).constructor?.name ??
-        ""
-  ).toLowerCase();
-  const shouldWrap =
-    (kind === "sqs" && /sendmessage/.test(name)) ||
-    (kind === "sns" && /publish/.test(name)) ||
-    (kind === "eventbridge" && /putevents/.test(name)) ||
-    (kind === "scheduler" && /(createschedule|updateschedule)/.test(name));
-  return shouldWrap ? cloneCommand(command, wrapAwsInput(kind, input, options)) : command;
+  try {
+    if (!command || typeof command !== "object") return command;
+    const input = safeGet(command, "input");
+    if (!input || typeof input !== "object") return command;
+    const commandName = safeGet(command, "commandName");
+    const constructor = safeGet(command, "constructor");
+    const name = stringValue(commandName ?? safeGet(constructor, "name"))
+      ?.toLowerCase() ?? "";
+    const shouldWrap =
+      (kind === "sqs" && /sendmessage/.test(name)) ||
+      (kind === "sns" && /publish/.test(name)) ||
+      (kind === "eventbridge" && /putevents/.test(name)) ||
+      (kind === "scheduler" && /(createschedule|updateschedule)/.test(name));
+    return shouldWrap
+      ? cloneCommand(command, wrapAwsInput(kind, input, options))
+      : command;
+  } catch {
+    return command;
+  }
 }
 
 function wrapEventBridgePutEvents(
   input: Record<string, unknown>,
   options: AwsContextOptions,
 ): Record<string, unknown> {
-  const token = resolveToken(options);
-  const entries = input.Entries;
-  const cloned = cloneValue(input);
-  if (!token || !Array.isArray(entries)) return cloned;
-  const contextOptions = { ...options, context: token };
-  const carriedEntries = entries.map((entry) =>
-    entry && typeof entry === "object"
-      ? injectCrumbtrailEventBridgeEntry(
-          entry as AwsEventBridgeEntry,
-          contextOptions,
-        )
-      : entry,
-  );
-  if (eventBridgeRequestBytes(carriedEntries) >= MAX_AWS_EVENTBRIDGE_REQUEST_BYTES) {
-    reportCaptureLoss(
-      options,
-      "size",
-      "EventBridge request exceeds the 1 MiB service limit with Crumbtrail context",
+  try {
+    const token = resolveToken(options);
+    const entries = safeGet(input, "Entries");
+    const cloned = cloneValue(input);
+    if (!token || !Array.isArray(entries)) return cloned;
+    const contextOptions = { ...options, context: token };
+    const carriedEntries = entries.map((entry) =>
+      entry && typeof entry === "object"
+        ? injectCrumbtrailEventBridgeEntry(
+            entry as AwsEventBridgeEntry,
+            contextOptions,
+          )
+        : entry,
     );
-    return cloned;
+    if (eventBridgeRequestBytes(carriedEntries) >= MAX_AWS_EVENTBRIDGE_REQUEST_BYTES) {
+      reportCaptureLoss(
+        options,
+        "size",
+        "EventBridge request exceeds the 1 MiB service limit with Crumbtrail context",
+      );
+      return cloned;
+    }
+    return {
+      ...cloned,
+      Entries: carriedEntries,
+    };
+  } catch {
+    return input;
   }
-  return {
-    ...cloned,
-    Entries: carriedEntries,
-  };
 }
 
 function cloneCommand(command: object, input: unknown): object {
-  const cloned = Object.create(Object.getPrototypeOf(command));
-  const descriptors = Object.getOwnPropertyDescriptors(command);
-  delete descriptors.input;
-  Object.defineProperties(cloned, descriptors);
-  Object.defineProperty(cloned, "input", {
-    configurable: true,
-    enumerable: true,
-    value: input,
-    writable: true,
+  return new Proxy(command, {
+    get(target, property) {
+      if (property === "input") return input;
+      const value = safeGet(target, property);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
   });
-  return cloned;
 }
 
 function jobOptions(
@@ -707,39 +780,49 @@ function jobOptions(
   },
 ): CrumbtrailJobOptions {
   const { now, ...jobValues } = values;
+  const job = safeGet(options, "job");
+  const jobNow = safeGet(job, "now");
+  const clonedJob = cloneValue(job);
   return {
-    ...(options.job ?? {}),
+    ...(isObject(clonedJob) ? clonedJob : {}),
     ...jobValues,
-    now: options.job?.now ?? (() => now),
+    now: typeof jobNow === "function" ? (jobNow as () => number) : () => now,
   };
 }
 
 function resolveToken(
   options: AwsContextOptions,
-  now: number | (() => number) = options.now ?? Date.now,
+  now: number | (() => number) =
+    (safeGet(options, "now") as number | (() => number) | undefined) ?? Date.now,
 ): CrumbtrailContextToken | undefined {
-  const explicit = options.context ?? options.token;
-  const at = readNow(now);
-  const validated = explicit
-    ? validateCrumbtrailContextToken(explicit, at)
-    : captureToken({ now: at });
-  if (explicit && !validated) {
-    reportCaptureLoss(
-      options,
-      "context",
-      "AWS context token was invalid or expired",
+  try {
+    const explicit =
+      (safeGet(options, "context") as CrumbtrailContextToken | undefined) ??
+      (safeGet(options, "token") as CrumbtrailContextToken | undefined);
+    const at = readNow(now);
+    const validated = explicit
+      ? validateCrumbtrailContextToken(explicit, at)
+      : captureToken({ now: at });
+    if (explicit && !validated) {
+      reportCaptureLoss(
+        options,
+        "context",
+        "AWS context token was invalid or expired",
+      );
+    }
+    if (!validated) return undefined;
+    const expiresAt = Math.min(
+      validated.expiresAt ?? at + DEFAULT_CONTEXT_TOKEN_TTL_MS,
+      at + DEFAULT_CONTEXT_TOKEN_TTL_MS,
     );
+    return Object.freeze({
+      ...validated,
+      enqueuedAt: validated.enqueuedAt ?? at,
+      expiresAt,
+    });
+  } catch {
+    return undefined;
   }
-  if (!validated) return undefined;
-  const expiresAt = Math.min(
-    validated.expiresAt ?? at + DEFAULT_CONTEXT_TOKEN_TTL_MS,
-    at + DEFAULT_CONTEXT_TOKEN_TTL_MS,
-  );
-  return Object.freeze({
-    ...validated,
-    enqueuedAt: validated.enqueuedAt ?? at,
-    expiresAt,
-  });
 }
 
 function withContextAttribute(
@@ -747,62 +830,66 @@ function withContextAttribute(
   token: CrumbtrailContextToken,
   options: AwsContextOptions,
 ): AwsMessageAttributes | undefined {
-  const value = JSON.stringify(token);
-  if (value.length > MAX_AWS_CONTEXT_VALUE_LENGTH) {
-    reportCaptureLoss(
-      options,
-      "size",
-      "Crumbtrail AWS context attribute exceeds its 2 KiB carrier limit",
-    );
-    return cloneValue(attributes ?? {});
-  }
-  const next = cloneValue(attributes ?? {}) as AwsMessageAttributes;
-  if (
-    Object.keys(next).some(
-      (key) =>
-        key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase(),
-    )
-  ) {
-    reportCaptureLoss(
-      options,
-      "collision",
-      "AWS message attributes already contain the reserved Crumbtrail.Context name",
-    );
+  try {
+    const value = JSON.stringify(token);
+    if (value.length > MAX_AWS_CONTEXT_VALUE_LENGTH) {
+      reportCaptureLoss(
+        options,
+        "size",
+        "Crumbtrail AWS context attribute exceeds its 2 KiB carrier limit",
+      );
+      return cloneValue(attributes ?? {});
+    }
+    const next = cloneValue(attributes ?? {}) as AwsMessageAttributes;
+    if (
+      Object.keys(next).some(
+        (key) =>
+          key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase(),
+      )
+    ) {
+      reportCaptureLoss(
+        options,
+        "collision",
+        "AWS message attributes already contain the reserved Crumbtrail.Context name",
+      );
+      return undefined;
+    }
+    return {
+      ...next,
+      [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: {
+        DataType: "String",
+        StringValue: value,
+      },
+    };
+  } catch {
     return undefined;
   }
-  return {
-    ...next,
-    [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: {
-      DataType: "String",
-      StringValue: value,
-    },
-  };
 }
 
 function extractMessageAttribute(
   attributes: AwsMessageAttributes | undefined,
   now: number | (() => number),
 ): CrumbtrailContextToken | undefined {
-  if (!attributes) return undefined;
-  const attribute = Object.prototype.hasOwnProperty.call(
-    attributes,
-    AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE,
-  )
-    ? attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]
-    : Object.entries(attributes).find(
-        ([key]) =>
-          key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase(),
-      )?.[1];
-  const value =
-    typeof attribute === "string"
-      ? attribute
-      : attribute?.StringValue ??
-        attribute?.stringValue ??
-        attribute?.Value ??
-        attribute?.value;
-  if (typeof value !== "string" || value.length > MAX_AWS_CONTEXT_VALUE_LENGTH)
-    return undefined;
   try {
+    if (!attributes) return undefined;
+    const attribute = Object.prototype.hasOwnProperty.call(
+      attributes,
+      AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE,
+    )
+      ? attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]
+      : Object.entries(attributes).find(
+          ([key]) =>
+            key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase(),
+        )?.[1];
+    const value =
+      typeof attribute === "string"
+        ? attribute
+        : attribute?.StringValue ??
+          attribute?.stringValue ??
+          attribute?.Value ??
+          attribute?.value;
+    if (typeof value !== "string" || value.length > MAX_AWS_CONTEXT_VALUE_LENGTH)
+      return undefined;
     return validateCrumbtrailContextToken(JSON.parse(value), now);
   } catch {
     return undefined;
@@ -864,68 +951,81 @@ function extractJsonCarrier(
   value: unknown,
   now: number | (() => number),
 ): CrumbtrailContextToken | undefined {
-  const parsed = typeof value === "string" ? parseJson(value) : value;
-  if (!isPlainRecord(parsed)) return undefined;
-  if (parsed[AWS_CRUMBTRAIL_ENVELOPE_FIELD] !== 1) return undefined;
-  const candidate = parsed[AWS_CRUMBTRAIL_CONTEXT_FIELD];
-  return validateCrumbtrailContextToken(candidate, now);
+  try {
+    const parsed = typeof value === "string" ? parseJson(value) : value;
+    if (!isPlainRecord(parsed)) return undefined;
+    if (safeGet(parsed, AWS_CRUMBTRAIL_ENVELOPE_FIELD) !== 1) return undefined;
+    const candidate = safeGet(parsed, AWS_CRUMBTRAIL_CONTEXT_FIELD);
+    return validateCrumbtrailContextToken(candidate, now);
+  } catch {
+    return undefined;
+  }
 }
 
 function stripJsonCarrier<T>(value: T, now: number | (() => number)): T {
-  const parsed = typeof value === "string" ? parseJson(value) : value;
-  const token = extractJsonCarrier(value, now);
-  if (!token || !isPlainRecord(parsed)) return cloneValue(value);
-  if (AWS_CRUMBTRAIL_PAYLOAD_FIELD in parsed)
-    return parsed[AWS_CRUMBTRAIL_PAYLOAD_FIELD] as T;
-  const output = { ...cloneValue(parsed) } as Record<string, unknown>;
-  delete output[AWS_CRUMBTRAIL_CONTEXT_FIELD];
-  delete output[AWS_CRUMBTRAIL_ENVELOPE_FIELD];
-  return (typeof value === "string" ? JSON.stringify(output) : output) as T;
+  try {
+    const parsed = typeof value === "string" ? parseJson(value) : value;
+    if (!hasJsonCarrier(value) || !isPlainRecord(parsed)) return cloneValue(value);
+    if (safeHas(parsed, AWS_CRUMBTRAIL_PAYLOAD_FIELD))
+      return safeGet(parsed, AWS_CRUMBTRAIL_PAYLOAD_FIELD) as T;
+    const output = { ...cloneValue(parsed) } as Record<string, unknown>;
+    delete output[AWS_CRUMBTRAIL_CONTEXT_FIELD];
+    delete output[AWS_CRUMBTRAIL_ENVELOPE_FIELD];
+    return (typeof value === "string" ? JSON.stringify(output) : output) as T;
+  } catch {
+    return value;
+  }
 }
 
 function stripSqsRecord(
   record: AwsSqsRecord,
   now: number | (() => number),
 ): AwsSqsRecord {
-  if (!record.messageAttributes) return cloneValue(record);
-  const attributes = { ...cloneValue(record.messageAttributes) } as AwsMessageAttributes;
-  const canonical = attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE];
-  if (
-    canonical === undefined ||
-    !extractMessageAttribute(
-      { [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: canonical },
-      now,
-    )
-  )
-    return cloneValue(record);
-  delete attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE];
-  return { ...cloneValue(record), messageAttributes: attributes };
+  try {
+    const source = safeGet(record, "messageAttributes") as
+      | AwsMessageAttributes
+      | undefined;
+    if (!source || !hasReservedMessageAttribute(source)) return cloneValue(record);
+    const attributes = cloneValue(source) as AwsMessageAttributes;
+    for (const key of Object.keys(attributes)) {
+      if (isReservedMessageAttribute(key)) delete attributes[key];
+    }
+    return { ...cloneValue(record), messageAttributes: attributes };
+  } catch {
+    return record;
+  }
 }
 
 function stripSnsRecord(
   record: AwsSnsRecord,
   now: number | (() => number),
 ): AwsSnsRecord {
-  if (!record.Sns?.MessageAttributes) return cloneValue(record);
-  const attributes = { ...cloneValue(record.Sns.MessageAttributes) } as AwsMessageAttributes;
-  const canonical = attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE];
-  if (
-    canonical === undefined ||
-    !extractMessageAttribute(
-      { [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: canonical },
-      now,
-    )
-  )
-    return cloneValue(record);
-  delete attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE];
-  return {
-    ...cloneValue(record),
-    Sns: { ...cloneValue(record.Sns), MessageAttributes: attributes },
-  };
+  try {
+    const sns = safeGet(record, "Sns");
+    const source = safeGet(sns, "MessageAttributes") as
+      | AwsMessageAttributes
+      | undefined;
+    if (!source || !hasReservedMessageAttribute(source))
+      return cloneValue(record);
+    const attributes = cloneValue(source) as AwsMessageAttributes;
+    for (const key of Object.keys(attributes)) {
+      if (isReservedMessageAttribute(key)) delete attributes[key];
+    }
+    const clonedSns = cloneValue(sns);
+    return {
+      ...cloneValue(record),
+      Sns: {
+        ...(isObject(clonedSns) ? clonedSns : {}),
+        MessageAttributes: attributes,
+      },
+    };
+  } catch {
+    return record;
+  }
 }
 
-function isOneShotSchedule(expression: string): boolean {
-  return /^\s*at\s*\(/i.test(expression);
+function isOneShotSchedule(expression: unknown): boolean {
+  return typeof expression === "string" && /^\s*at\s*\(/i.test(expression);
 }
 
 function eventBridgeEntryBytes(entry: AwsEventBridgeEntry): number {
@@ -962,18 +1062,27 @@ function receiveAttempt(value: string | undefined): number {
   return Number.isFinite(attempt) ? Math.max(1, Math.round(attempt)) : 1;
 }
 
-function queueFromArn(arn: string | undefined): string | undefined {
-  return arn?.split(":").pop() || undefined;
+function queueFromArn(arn: unknown): string | undefined {
+  return stringValue(arn)?.split(":").pop() || undefined;
 }
 
-function topicFromArn(arn: string | undefined): string | undefined {
-  return arn?.split(":").pop() || undefined;
+function topicFromArn(arn: unknown): string | undefined {
+  return stringValue(arn)?.split(":").pop() || undefined;
 }
 
 function stringValue(value: unknown): string | undefined {
-  return typeof value === "string" || typeof value === "number"
-    ? String(value)
-    : undefined;
+  try {
+    return typeof value === "string" || typeof value === "number"
+      ? String(value)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeText(value: unknown): string | undefined {
+  const text = stringValue(value)?.trim();
+  return text ? text.slice(0, 256) : undefined;
 }
 
 function reportCaptureLoss(
@@ -1005,26 +1114,111 @@ function parseJson(value: string): unknown {
   }
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object";
+}
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== "object" || Array.isArray(value))
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  } catch {
     return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
+  }
 }
 
 function cloneValue<T>(value: T): T {
-  if (typeof structuredClone === "function") {
-    try {
+  try {
+    if (typeof structuredClone === "function") {
       return structuredClone(value);
-    } catch {
-      // Fall through for host objects containing functions or SDK internals.
     }
+    if (value === null || typeof value !== "object") return value;
+    if (Array.isArray(value)) return value.map((item) => cloneValue(item)) as T;
+    if (!isPlainRecord(value)) return value;
+    const output: Record<string, unknown> = {};
+    for (const key of Object.keys(value)) output[key] = value[key];
+    return output as T;
+  } catch {
+    // Host operations remain authoritative when defensive inspection is unsafe.
+    return value;
   }
-  if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((item) => cloneValue(item)) as T;
-  if (!isPlainRecord(value)) return value;
-  const output: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value))
-    output[key] = cloneValue(item);
-  return output as T;
+}
+
+function safeGet(target: unknown, property: PropertyKey): unknown {
+  if (
+    target === null ||
+    (typeof target !== "object" && typeof target !== "function")
+  )
+    return undefined;
+  try {
+    return Reflect.get(target, property, target);
+  } catch {
+    return undefined;
+  }
+}
+
+function safeHas(target: unknown, property: PropertyKey): boolean {
+  if (
+    target === null ||
+    (typeof target !== "object" && typeof target !== "function")
+  )
+    return false;
+  try {
+    return Reflect.has(target, property);
+  } catch {
+    return false;
+  }
+}
+
+function markClientWrapper(client: object, kind: AwsWrapperKind): void {
+  let kinds = CLIENT_WRAPPER_KINDS.get(client);
+  if (!kinds) {
+    kinds = new Set();
+    CLIENT_WRAPPER_KINDS.set(client, kinds);
+  }
+  kinds.add(kind);
+}
+
+function hasReservedMessageAttribute(
+  attributes: AwsMessageAttributes | undefined,
+): boolean {
+  try {
+    return (
+      attributes !== undefined &&
+      Object.keys(attributes).some(isReservedMessageAttribute)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isReservedMessageAttribute(key: string): boolean {
+  return key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase();
+}
+
+function hasJsonCarrier(value: unknown): boolean {
+  try {
+    const parsed = typeof value === "string" ? parseJson(value) : value;
+    return (
+      isPlainRecord(parsed) &&
+      safeGet(parsed, AWS_CRUMBTRAIL_ENVELOPE_FIELD) === 1
+    );
+  } catch {
+    return false;
+  }
+}
+
+function processorContext(
+  options: AwsJobProcessorOptions,
+  hasCarrier: boolean,
+  token: CrumbtrailContextToken | undefined,
+): CrumbtrailContextToken | null | undefined {
+  if (hasCarrier || (!token && hasExplicitContext(options))) return token ?? null;
+  return token;
+}
+
+function hasExplicitContext(options: AwsContextOptions): boolean {
+  return safeGet(options, "context") !== undefined || safeGet(options, "token") !== undefined;
 }
