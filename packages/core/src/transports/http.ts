@@ -149,6 +149,9 @@ const MAX_EVENTS_BODY_BYTES = 1_000_000;
  */
 const MAX_BISECT_DEPTH = 6;
 
+/** Keep browser shutdown from waiting on a session start that ignores abort. */
+export const BROWSER_SESSION_START_TIMEOUT_MS = 3_000;
+
 /**
  * A receiver running on this machine — `crumbtrail-node`, which accepts
  * unauthenticated sessions on purpose. Used only to decide whether a missing
@@ -194,6 +197,8 @@ export class HttpTransport implements CrumbtrailTransport {
       finalized: boolean;
     }
   >();
+  private sessionStartController?: AbortController;
+  private sessionStartAbortRequested = false;
   /** Epoch ms until which the server has asked us to stop sending. */
   private shedUntil = 0;
   /** The server's reason for the active shed, for the gap the caller records. */
@@ -243,7 +248,10 @@ export class HttpTransport implements CrumbtrailTransport {
     if (this.warned.has(key)) return;
     this.warned.add(key);
     try {
-      if (typeof console !== "undefined" && typeof console.warn === "function") {
+      if (
+        typeof console !== "undefined" &&
+        typeof console.warn === "function"
+      ) {
         console.warn(`[crumbtrail] ${message}`);
       }
     } catch {
@@ -333,11 +341,15 @@ export class HttpTransport implements CrumbtrailTransport {
    * `eventCount`, so reporting only the first failed chunk would understate a
    * flush that lost several.
    */
+<<<<<<< HEAD
   private async deliverAll(
     chunks: BugEvent[][],
     depth = 0,
     sessionId = this.sessionId,
   ): Promise<void> {
+=======
+  private async deliverAll(chunks: BugEvent[][], depth = 0): Promise<void> {
+>>>>>>> fb633de (fix(runtime): finish binding review fixes)
     let first: EventDeliveryError | undefined;
     let lost = 0;
     for (const chunk of chunks) {
@@ -544,6 +556,15 @@ export class HttpTransport implements CrumbtrailTransport {
     return attempt;
   }
 
+  abortPendingSessionStart(): void {
+    this.sessionStartAbortRequested = true;
+    try {
+      this.sessionStartController?.abort();
+    } catch {
+      // A host supplied AbortController must not prevent the rest of shutdown.
+    }
+  }
+
   private async postSessionStart(
     sessionId: string,
     metadata: Record<string, unknown>,
@@ -553,28 +574,44 @@ export class HttpTransport implements CrumbtrailTransport {
     },
   ): Promise<void> {
     const binding = await this.runtimeBinding?.getBinding();
+    if (this.sessionStartAbortRequested) {
+      throw new SessionDeliveryError("start", 0);
+    }
+    const Controller = globalThis.AbortController;
+    const controller =
+      typeof Controller === "function" ? new Controller() : undefined;
+    this.sessionStartController = controller;
     let response: Response;
     try {
-      response = await fetch(`${this.endpoint}/api/session/start`, {
-        method: "POST",
-        headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({
-          sessionId,
-          ...(binding
-            ? {
-                instanceId: binding.instanceId,
-                instanceProof: binding.instanceProof,
-              }
-            : {}),
-          metadata,
-        }),
-      });
+      response = await fetchWithTimeout(
+        `${this.endpoint}/api/session/start`,
+        {
+          method: "POST",
+          headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({
+            sessionId,
+            ...(binding
+              ? {
+                  instanceId: binding.instanceId,
+                  instanceProof: binding.instanceProof,
+                }
+              : {}),
+            metadata,
+          }),
+        },
+        BROWSER_SESSION_START_TIMEOUT_MS,
+        controller,
+      );
     } catch {
       // The caller swallows this rejection, so this warning is the only trace
       // an unreachable endpoint leaves. It is also the first request the SDK
       // makes, which makes it the earliest possible moment to say so.
-      this.warnUnreachable("the session start");
+      if (!this.sessionStartAbortRequested)
+        this.warnUnreachable("the session start");
       throw new SessionDeliveryError("start", 0);
+    } finally {
+      if (this.sessionStartController === controller)
+        this.sessionStartController = undefined;
     }
     if (response.ok) {
       session.admitted = true;
@@ -607,11 +644,7 @@ export class HttpTransport implements CrumbtrailTransport {
     // Refused reports are the one loss a person witnesses: the widget says
     // "Saved" and they walk away. Throwing is what lets it say otherwise.
     if (!response.ok) {
-      throw new BugReportDeliveryError(
-        report.bugId,
-        "report",
-        response.status,
-      );
+      throw new BugReportDeliveryError(report.bugId, "report", response.status);
     }
 
     if (voiceBlob) {
@@ -674,6 +707,61 @@ export class HttpTransport implements CrumbtrailTransport {
         `session end was refused with HTTP ${response.status}; this session will be closed by server side timeout instead`,
       );
     }
+  }
+}
+
+async function fetchWithTimeout(
+  input: string,
+  init: RequestInit,
+  timeoutMs: number,
+  controller: AbortController | undefined,
+): Promise<Response> {
+  const request = Promise.resolve().then(() =>
+    fetch(input, {
+      ...init,
+      ...(controller ? { signal: controller.signal } : {}),
+    }),
+  );
+  // The race observes a late rejection, but this explicit handler also covers
+  // host fetch implementations that attach their own promise after returning.
+  void request.catch(() => undefined);
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let removeAbortListener: (() => void) | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => {
+        try {
+          controller?.abort();
+        } finally {
+          reject(new Error("browser session start timed out"));
+        }
+      },
+      Math.max(0, timeoutMs),
+    );
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+  const aborted = controller
+    ? new Promise<never>((_, reject) => {
+        const onAbort = () =>
+          reject(new Error("browser session start aborted"));
+        if (controller.signal.aborted) {
+          onAbort();
+          return;
+        }
+        controller.signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () =>
+          controller.signal.removeEventListener("abort", onAbort);
+      })
+    : undefined;
+
+  try {
+    return await Promise.race(
+      aborted ? [request, timeout, aborted] : [request, timeout],
+    );
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    removeAbortListener?.();
   }
 }
 

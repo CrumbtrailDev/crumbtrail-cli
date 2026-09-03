@@ -135,6 +135,7 @@ export async function withCrumbtrailJob<T>(
             sessionId: childSessionId,
             authToken: options.authToken,
             fetchImpl: options.fetchImpl,
+            now: options.now,
             signal,
             metadata: {
               ...(options.metadata ?? {}),

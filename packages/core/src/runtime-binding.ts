@@ -150,6 +150,8 @@ function createLateCleanupWindow(timeoutMs: number): LateCleanupWindow {
 
 const runtimeBindingCache = new Map<string, RuntimeBindingCacheEntry>();
 const runtimeBindingRetirements = new Map<string, Promise<void>>();
+const runtimeBindingFunctionIds = new WeakMap<Function, number>();
+let nextRuntimeBindingFunctionId = 1;
 const runtimeBindingHandles = new WeakMap<
   RuntimeBindingHandle,
   RuntimeBindingClient
@@ -161,8 +163,9 @@ const runtimeBindingHandles = new WeakMap<
  * The client itself has no module-level storage. Browser callers create one per
  * runtime, keeping a binding scoped to that tab and preventing a key or proof
  * from one origin or project being reused by another initialization. The
- * serverless default wrapper owns a separate bounded cache keyed by endpoint
- * and project. Node callers can keep one explicit instance across re-establishes.
+ * serverless default wrapper owns a separate bounded cache keyed by endpoint,
+ * project, and the identity of any supplied fetch or clock seam. Node callers
+ * can keep one explicit instance across re-establishes.
  */
 export class RuntimeBindingClient {
   private readonly endpoint: string;
@@ -626,10 +629,11 @@ export function retireRuntimeBindingHandle(
 }
 
 /**
- * Reuse the default binding for one endpoint and project across warm
- * serverless invocations. Explicit clients bypass this cache so callers retain
- * ownership of their lifecycle. The bounded LRU also keeps a process that
- * serves many projects from retaining every client forever.
+ * Reuse one binding across warm serverless invocations when the endpoint,
+ * project, and supplied function seams are the same. Function identity is
+ * intentional: a different fetch or clock must never reuse a client that holds
+ * the other invocation's closures. The bounded LRU keeps a process that serves
+ * many identities from retaining every client forever.
  */
 export function getCachedRuntimeBindingClient(
   options: RuntimeBindingClientOptions,
@@ -638,18 +642,12 @@ export function getCachedRuntimeBindingClient(
   const projectKey = options.projectKey?.trim() ?? "";
   if (!endpoint || !projectKey) return createRuntimeBindingClient(options);
 
-  const key = `${endpoint}\u0000${projectKey}`;
-  const customSeam =
-    options.fetchImpl !== undefined || options.now !== undefined;
-  if (customSeam) {
-    const ready = runtimeBindingRetirements.get(key);
-    return createRuntimeBindingClient({
-      ...options,
-      endpoint,
-      projectKey,
-      ...(ready ? { ready } : {}),
-    });
-  }
+  const fetchIdentity = functionIdentity(
+    options.fetchImpl ??
+      (typeof globalThis.fetch === "function" ? globalThis.fetch : undefined),
+  );
+  const nowIdentity = functionIdentity(options.now ?? Date.now);
+  const key = `${endpoint}\u0000${projectKey}\u0000fetch:${fetchIdentity}\u0000now:${nowIdentity}`;
 
   const now = Date.now();
   pruneRuntimeBindingCache(now);
@@ -695,6 +693,15 @@ export function getCachedRuntimeBindingClient(
     rememberRuntimeBindingRetirement(oldest[0], oldest[1].client);
   }
   return client;
+}
+
+function functionIdentity(value: Function | undefined): number {
+  if (!value) return 0;
+  const existing = runtimeBindingFunctionIds.get(value);
+  if (existing !== undefined) return existing;
+  const identity = nextRuntimeBindingFunctionId++;
+  runtimeBindingFunctionIds.set(value, identity);
+  return identity;
 }
 
 /** Test-only cleanup for module-cache lifecycle assertions. */

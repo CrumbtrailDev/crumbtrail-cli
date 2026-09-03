@@ -9,7 +9,10 @@ import {
   RUNTIME_BINDING_MAX_PENDING_RETIREMENTS,
   RUNTIME_BINDING_ROTATE_AHEAD_MS,
 } from "../runtime-binding";
-import { HttpTransport } from "../transports/http";
+import {
+  BROWSER_SESSION_START_TIMEOUT_MS,
+  HttpTransport,
+} from "../transports/http";
 import { Crumbtrail, REMOTE_POLICY_TIMEOUT_MS } from "../crumbtrail";
 import { runServerlessInvocation } from "../serverless";
 
@@ -19,14 +22,17 @@ const NOW = Date.parse("2026-09-02T12:00:00.000Z");
 interface Deferred<T> {
   promise: Promise<T>;
   resolve(value: T | PromiseLike<T>): void;
+  reject(reason?: unknown): void;
 }
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((settle) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((settle, fail) => {
     resolve = settle;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function binding(expiresAt: number, suffix = "a") {
@@ -510,10 +516,10 @@ describe("runtime binding client", () => {
     resolveLate(response({ ok: true }));
   });
 
-  it("does not share a cache entry across custom fetch and clock seams", async () => {
-    const fetchA = vi
-      .fn()
-      .mockResolvedValue(response(binding(NOW + 86_400_000, "fetch-a"), 201));
+  it("reuses stable custom seams without crossing fetch or clock identities", async () => {
+    const fetchA = vi.fn(() =>
+      Promise.resolve(response(binding(NOW + 86_400_000, "fetch-a"), 201)),
+    );
     const fetchB = vi
       .fn()
       .mockResolvedValue(response(binding(NOW + 86_400_000, "fetch-b"), 201));
@@ -529,20 +535,71 @@ describe("runtime binding client", () => {
       endpoint: ENDPOINT,
       projectKey: "project-key",
       fetchImpl: fetchB,
+      now: clockA,
+    });
+    const differentClock = getCachedRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetchA,
       now: clockB,
     });
 
+    expect(
+      getCachedRuntimeBindingClient({
+        endpoint: ENDPOINT,
+        projectKey: "project-key",
+        fetchImpl: fetchA,
+        now: clockA,
+      }),
+    ).toBe(first);
     expect(second).not.toBe(first);
+    expect(differentClock).not.toBe(first);
     await expect(first.getBinding()).resolves.toMatchObject({
       instanceId: "ri_runtime_fetch-a",
     });
     await expect(second.getBinding()).resolves.toMatchObject({
       instanceId: "ri_runtime_fetch-b",
     });
-    expect(fetchA).toHaveBeenCalledOnce();
+    await expect(differentClock.getBinding()).resolves.toMatchObject({
+      instanceId: "ri_runtime_fetch-a",
+    });
+    expect(fetchA).toHaveBeenCalledTimes(2);
     expect(fetchB).toHaveBeenCalledOnce();
     expect(clockA).toHaveBeenCalled();
     expect(clockB).toHaveBeenCalled();
+  });
+
+  it("reuses stable custom seams across warm serverless invocations", async () => {
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, _init?: RequestInit) => {
+        if (String(input).includes("/api/runtime/register"))
+          return response(binding(NOW + 86_400_000, "warm"), 201);
+        return response({ ok: true });
+      },
+    );
+    const clock = vi.fn(() => NOW);
+    const options = {
+      endpoint: ENDPOINT,
+      authToken: "project-key",
+      fetchImpl: fetcher,
+      now: clock,
+    };
+
+    await runServerlessInvocation(options, () => "first");
+    await runServerlessInvocation(options, () => "second");
+
+    expect(
+      fetcher.mock.calls.filter(
+        (call) =>
+          String(call[0]).includes("/api/runtime/register") &&
+          call[1]?.method === "POST",
+      ),
+    ).toHaveLength(1);
+    expect(
+      fetcher.mock.calls.filter((call) =>
+        String(call[0]).endsWith("/api/session/start"),
+      ),
+    ).toHaveLength(2);
   });
 
   it("reuses defaults by endpoint and project while isolating project keys", async () => {
@@ -657,8 +714,11 @@ describe("runtime binding client", () => {
       },
     );
     vi.stubGlobal("fetch", fetcher);
+    const clock = vi.fn(() => NOW);
     const options = {
       endpoint: ENDPOINT,
+      fetchImpl: fetcher,
+      now: clock,
     };
 
     const first = getCachedRuntimeBindingClient({
@@ -870,9 +930,9 @@ describe("HttpTransport runtime binding seam", () => {
     await logger.stop();
   });
 
-  it("settles browser session start before revoking its runtime binding", async () => {
-    const runtime = binding(NOW + 86_400_000, "browser-stop");
-    const pendingStart = deferred<Response>();
+  it("bounds a never-settling browser session start and retires its binding", async () => {
+    vi.useFakeTimers();
+    const runtime = binding(NOW + 86_400_000, "browser-stop-never");
     const operations: string[] = [];
     const fetcher = vi.fn(
       async (input: string | URL | Request, init?: RequestInit) => {
@@ -887,9 +947,7 @@ describe("HttpTransport runtime binding seam", () => {
         }
         if (url.endsWith("/api/session/start")) {
           operations.push("session-start");
-          const result = await pendingStart.promise;
-          operations.push("session-start-settled");
-          return result;
+          return new Promise<Response>(() => undefined);
         }
         if (url.endsWith("/api/session/end")) {
           operations.push("session-end");
@@ -933,24 +991,38 @@ describe("HttpTransport runtime binding seam", () => {
     expect(operations).toContain("session-start");
 
     const stopping = logger.stop();
-    await Promise.resolve();
-    expect(operations).not.toContain("DELETE");
-
-    pendingStart.resolve(response({ ok: true }));
-    await stopping;
-    expect(operations.indexOf("session-start-settled")).toBeGreaterThanOrEqual(
-      0,
-    );
-    expect(operations.indexOf("DELETE")).toBeGreaterThan(
-      operations.indexOf("session-start-settled"),
-    );
+    await vi.advanceTimersByTimeAsync(BROWSER_SESSION_START_TIMEOUT_MS);
+    await expect(stopping).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    expect(operations).toEqual([
+      "register",
+      "session-start",
+      "DELETE",
+      "session-end",
+    ]);
   });
 
-  it("bounds stop while session start is still pending and retires afterward", async () => {
-    vi.useFakeTimers();
-    const runtime = binding(NOW + 86_400_000, "browser-stop-timeout");
+  it("handles a late session-start rejection without leaking or repeating stop", async () => {
+    const runtime = binding(NOW + 86_400_000, "browser-stop-late");
     const pendingStart = deferred<Response>();
     const operations: string[] = [];
+    const rejectionHost = globalThis as unknown as {
+      process?: {
+        on(
+          event: "unhandledRejection",
+          listener: (reason: unknown) => void,
+        ): void;
+        off(
+          event: "unhandledRejection",
+          listener: (reason: unknown) => void,
+        ): void;
+      };
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    rejectionHost.process?.on("unhandledRejection", onUnhandled);
     const fetcher = vi.fn(
       async (input: string | URL | Request, init?: RequestInit) => {
         const url = String(input);
@@ -963,60 +1035,68 @@ describe("HttpTransport runtime binding seam", () => {
           return response(runtime, 201);
         }
         if (url.endsWith("/api/session/start")) {
-          operations.push("session-start");
-          const result = await pendingStart.promise;
-          operations.push("session-start-settled");
-          return result;
+          operations.push(
+            init?.signal?.aborted ? "start-aborted" : "session-start",
+          );
+          return pendingStart.promise;
+        }
+        if (url.endsWith("/api/session/end")) {
+          operations.push("session-end");
+          return response({ ok: true });
         }
         return response({ ok: true });
       },
     );
     vi.stubGlobal("fetch", fetcher);
 
-    const logger = Crumbtrail.init({
-      httpEndpoint: ENDPOINT,
-      httpAuthToken: "project-key",
-      remoteConfig: false,
-      widget: false,
-      environment: false,
-      domSnapshot: false,
-      console: false,
-      network: false,
-      interactions: false,
-      keystrokes: false,
-      scroll: false,
-      visibility: false,
-      clipboard: false,
-      errors: false,
-      performance: false,
-      cookies: false,
-      storage: false,
-      heartbeat: false,
-      uiNumbers: false,
-      listeners: false,
-      eventSource: false,
-      webSocket: false,
-      workers: false,
-      flushIntervalMs: 100_000,
-      flushBufferSize: 1_000,
-      sessionPersistence: "memory",
-    });
+    try {
+      const logger = Crumbtrail.init({
+        httpEndpoint: ENDPOINT,
+        httpAuthToken: "project-key",
+        remoteConfig: false,
+        widget: false,
+        environment: false,
+        domSnapshot: false,
+        console: false,
+        network: false,
+        interactions: false,
+        keystrokes: false,
+        scroll: false,
+        visibility: false,
+        clipboard: false,
+        errors: false,
+        performance: false,
+        cookies: false,
+        storage: false,
+        heartbeat: false,
+        uiNumbers: false,
+        listeners: false,
+        eventSource: false,
+        webSocket: false,
+        workers: false,
+        flushIntervalMs: 100_000,
+        flushBufferSize: 1_000,
+        sessionPersistence: "memory",
+      });
 
-    for (let index = 0; index < 20; index += 1) await Promise.resolve();
-    expect(operations).toContain("session-start");
+      for (let index = 0; index < 20; index += 1) await Promise.resolve();
+      expect(operations).toContain("session-start");
 
-    const stopping = logger.stop();
-    await vi.advanceTimersByTimeAsync(REMOTE_POLICY_TIMEOUT_MS);
-    await expect(stopping).resolves.toMatchObject({
-      sessionId: expect.any(String),
-    });
-    expect(operations).not.toContain("DELETE");
+      const stopping = logger.stop();
+      expect(logger.stop()).toBe(stopping);
+      await stopping;
+      expect(operations).toContain("DELETE");
 
-    pendingStart.resolve(response({ ok: true }));
-    for (let index = 0; index < 20; index += 1) await Promise.resolve();
-    expect(operations.indexOf("DELETE")).toBeGreaterThan(
-      operations.indexOf("session-start-settled"),
-    );
+      pendingStart.reject(new Error("late session-start failure"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandled).toEqual([]);
+      expect(logger.stop()).toBe(stopping);
+      expect(
+        operations.filter((operation) => operation === "DELETE"),
+      ).toHaveLength(1);
+    } finally {
+      rejectionHost.process?.off("unhandledRejection", onUnhandled);
+    }
   });
 });
 

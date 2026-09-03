@@ -445,16 +445,28 @@ describe("withCrumbtrailJob", () => {
   });
 
   it("uses the existing HTTP session, link, event, and end routes in order", async () => {
-    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const runtime = {
+      instanceId: "ri_runtime_job",
+      instanceProof: `proof_runtime_job_${"x".repeat(32)}`,
+      expiresAt: new Date(86_400_000).toISOString(),
+    };
+    const calls: Array<{
+      url: string;
+      method: string;
+      body: Record<string, unknown>;
+    }> = [];
     const fetchImpl = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         calls.push({
           url: String(input),
+          method: String(init?.method ?? "GET"),
           body: JSON.parse(String(init?.body ?? "{}")) as Record<
             string,
             unknown
           >,
         });
+        if (String(input).includes("/api/runtime/register"))
+          return new Response(JSON.stringify(runtime), { status: 201 });
         return new Response("{}", { status: 200 });
       },
     );
@@ -472,14 +484,21 @@ describe("withCrumbtrailJob", () => {
       () => "ok",
     );
     expect(result).toBe("ok");
-    expect(calls.map((call) => call.url)).toEqual([
-      "http://capture.test/api/session/start",
-      "http://capture.test/api/session/link",
-      "http://capture.test/api/events",
-      "http://capture.test/api/events",
-      "http://capture.test/api/session/end",
+    expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+      "POST http://capture.test/api/runtime/register?projectKey=key_test",
+      "POST http://capture.test/api/session/start",
+      "POST http://capture.test/api/session/link",
+      "POST http://capture.test/api/events",
+      "POST http://capture.test/api/events",
+      "POST http://capture.test/api/session/end",
     ]);
+    expect(calls[0]?.body).toEqual({});
     expect(calls[1]?.body).toMatchObject({
+      sessionId: expect.any(String),
+      instanceId: expect.any(String),
+      instanceProof: expect.any(String),
+    });
+    expect(calls[2]?.body).toMatchObject({
       fromSessionId: "session_parent",
       relation: "caused",
       method: "trace_context",
@@ -492,6 +511,6 @@ describe("withCrumbtrailJob", () => {
     expect(
       (eventCalls[1]?.body.events as Array<Record<string, unknown>>)[0]?.k,
     ).toBe("backend.job.end");
-    expect(fetchImpl).toHaveBeenCalledTimes(5);
+    expect(fetchImpl).toHaveBeenCalledTimes(6);
   });
 });

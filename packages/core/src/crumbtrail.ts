@@ -1863,38 +1863,6 @@ export class Crumbtrail {
     );
   }
 
-  private deferShutdownUntilSessionMetadataSettles(
-    sessionMetadataWrite: Promise<void>,
-  ): void {
-    void sessionMetadataWrite.then(
-      () => void this.finishDeferredShutdown(),
-      () => void this.finishDeferredShutdown(),
-    );
-  }
-
-  private async finishDeferredShutdown(): Promise<void> {
-    this.runtimeBinding?.stop();
-    await Promise.allSettled([...this.pendingSends]);
-    if (this.deferredDeliveryGaps.length > 0) {
-      const deferred = this.deferredDeliveryGaps;
-      this.deferredDeliveryGaps = [];
-      try {
-        await this.transport.sendEvents(deferred);
-      } catch {
-        // A deferred shutdown must not surface a transport failure as an
-        // unhandled rejection after stop() has already returned.
-      }
-    }
-    if (this.sessionStarted) {
-      try {
-        await this.transport.endSession(this.sessionId);
-      } catch {
-        // A deferred shutdown must not surface a transport failure as an
-        // unhandled rejection after stop() has already returned.
-      }
-    }
-  }
-
   /** Schedule a close for a page that remains hidden after lifecycle events settle. */
   private scheduleLifecycleClose(): void {
     if (
@@ -2587,6 +2555,11 @@ export class Crumbtrail {
       }
     };
 
+    if (this.transport.abortPendingSessionStart) {
+      runTeardown("transport.abortPendingSessionStart", () =>
+        this.transport.abortPendingSessionStart?.(),
+      );
+    }
     this.cancelLifecycleTimer();
     const stopState: NonNullable<typeof this.lifecycleCloseState> = {
       immediateEnd: true,
@@ -2733,10 +2706,12 @@ export class Crumbtrail {
     if (sessionMetadataSettled) {
       this.runtimeBinding?.stop();
     } else {
-      // A custom transport can return an unbounded promise. Keep the ordering
-      // by deferring retirement and session end, but let stop() return after
-      // the same finite budget used by remote policy admission.
-      this.deferShutdownUntilSessionMetadataSettles(this.sessionMetadataWrite);
+      // A custom transport can return an unbounded promise. Do not attach a
+      // shutdown continuation to it: that would retain the instance forever.
+      // The binding and all SDK-owned closures are released on this path, and
+      // a late session response is intentionally not followed by more work.
+      this.runtimeBinding?.stop();
+      this.sessionMetadataWrite = Promise.resolve();
       return { sessionId: this.sessionId };
     }
     if (this.sessionStarted) {
