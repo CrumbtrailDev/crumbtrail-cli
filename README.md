@@ -169,6 +169,42 @@ test IDs, or copy, so plain error elements without these standards signals are
 outside its coverage. It does not infer errors from `aria-describedby`,
 `aria-errormessage`, `:user-invalid`, or application-specific state.
 
+### Application-declared correctness checks
+
+For the two gaps ordinary HTTP capture cannot settle, declare the application
+fact or expected effect. `crumbtrail-core` provides `checkResponse()` for a
+successful response with a wrong business value and `expectSideEffect()` for
+updates, external effects, queue actions, or other work that should happen:
+
+```ts
+const result = crumbtrail.checkResponse(response, [
+  {
+    name: "cart_total",
+    operator: "equals",
+    expected: 100,
+    path: "data.total",
+  },
+]);
+
+const expectation = crumbtrail.expectSideEffect({
+  name: "inventory_update",
+  kind: "update",
+  deadlineMs: 2_000,
+});
+```
+
+Response checks read only exact safe own-property paths or a bounded array
+selector. Expectations return an opaque handle with `satisfy()` and `cancel()`.
+Only booleans, finite numbers, and short identifier-shaped strings may cross
+telemetry. Objects, prose, emails, tokens, headers, accessors, and prototype
+paths are rejected. Response checks accept at most 20 facts per call and 100
+per session. Selectors scan at most 25 items. An unsatisfied expectation emits
+one `app.expectation.missed` event at its deadline or when the session stops.
+
+These are application-declared oracles, not generic inference. The SDK does not
+choose business expected values or discover an undeclared effect. Missing
+session, invalid input, caps, and delivery failures remain explicit outcomes.
+
 ## Failure archetype skills
 
 [`plugins/crumbtrail-skills`](plugins/crumbtrail-skills) packages twelve failure archetypes as

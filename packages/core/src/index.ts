@@ -68,6 +68,9 @@ export {
   evaluateApplicationAssertion,
   evaluateSupportAssertion,
   isSafeApplicationAssertionValue,
+  isSafeApplicationAssertionName,
+  isSafeApplicationAssertionCorrelation,
+  isCanonicalApplicationAssertionTimestamp,
 } from "./assertion";
 export type {
   ApplicationAssertionOperator,
@@ -81,6 +84,44 @@ export type {
   SupportAssertionResult,
   ApplicationAssertionEventData,
 } from "./assertion";
+export {
+  APPLICATION_RESPONSE_ASSERTION_EVENT_KIND,
+  APPLICATION_EXPECTATION_MISSED_EVENT_KIND,
+  MAX_APPLICATION_RESPONSE_FACTS_PER_CALL,
+  MAX_APPLICATION_RESPONSE_ASSERTIONS_PER_SESSION,
+  MAX_APPLICATION_RESPONSE_PATH_LENGTH,
+  MAX_APPLICATION_RESPONSE_PATH_DEPTH,
+  MAX_APPLICATION_RESPONSE_PATH_SEGMENT_LENGTH,
+  MAX_APPLICATION_RESPONSE_SELECTOR_SCAN,
+  APPLICATION_EXPECTATION_KIND_MAX_LENGTH,
+  APPLICATION_EXPECTATION_DEADLINE_MIN_MS,
+  APPLICATION_EXPECTATION_DEADLINE_MAX_MS,
+  MAX_APPLICATION_EXPECTATIONS_PER_SESSION,
+  buildApplicationResponseAssertionEvent,
+  checkApplicationResponse,
+  isSafeApplicationExpectationKind,
+  buildApplicationExpectationMissedEvent,
+  ApplicationExpectationManager,
+  createApplicationExpectationManager,
+} from "./application-contracts";
+export type {
+  ApplicationResponseFactRejection,
+  ApplicationResponseSource,
+  ApplicationResponseSelector,
+  ApplicationResponseFactOptions,
+  ApplicationResponseCorrelation,
+  ApplicationResponseAssertionEventData,
+  ApplicationResponseFactResult,
+  ApplicationResponseCheckResult,
+  ApplicationExpectationKind,
+  ApplicationExpectationMissReason,
+  ApplicationExpectationOptions,
+  ApplicationExpectationRejection,
+  ApplicationExpectationHandle,
+  ApplicationExpectationResult,
+  ApplicationExpectationMissedEventData,
+  ApplicationExpectationEventEmitter,
+} from "./application-contracts";
 export { normalizeStatementShape } from "./db-statement-shape";
 export {
   buildMaskedDomSnapshot,

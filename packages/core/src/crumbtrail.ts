@@ -122,6 +122,16 @@ import {
   type ApplicationAssertionOptions,
   type ApplicationAssertionResult,
 } from "./assertion";
+import {
+  checkApplicationResponse,
+  createApplicationExpectationManager,
+  MAX_APPLICATION_RESPONSE_ASSERTIONS_PER_SESSION,
+  type ApplicationExpectationOptions,
+  type ApplicationExpectationResult,
+  type ApplicationResponseCheckResult,
+  type ApplicationResponseCorrelation,
+  type ApplicationResponseFactOptions,
+} from "./application-contracts";
 
 /** Cap on delivery-failure gap records per session. */
 const MAX_DELIVERY_GAP_EVENTS = 3;
@@ -522,6 +532,10 @@ export class Crumbtrail {
   private sessionId: string;
   private applicationAssertions = 0;
   private pendingApplicationAssertions = 0;
+  private applicationResponseAssertions = 0;
+  private applicationExpectations: ReturnType<
+    typeof createApplicationExpectationManager
+  >;
   private widgetCleanup?: () => void;
   /** Names uploaded by this live session and therefore eligible for association. */
   private visualArtifactNames = new Set<string>();
@@ -630,6 +644,10 @@ export class Crumbtrail {
     this.applicationRelease = applicationRelease;
     this.sessionStore = sessionStore;
     this.runtimeBinding = runtimeBinding;
+    this.applicationExpectations = createApplicationExpectationManager({
+      sessionId,
+      emit: (event) => this.bus.emit(event),
+    });
     this.remotePolicyReady = !remoteConfigProjectKey(config);
     const gpcSuppressed = Boolean(
       config.respectGpc && hasGlobalPrivacyControl(),
@@ -2514,6 +2532,68 @@ export class Crumbtrail {
     return this.reportAssertion(options).passed === true;
   }
 
+  /**
+   * Check application-declared facts on a response without capturing the response.
+   * Each fact reads one exact safe path or one bounded array selector.
+   */
+  checkResponse(
+    response: unknown,
+    facts: readonly ApplicationResponseFactOptions[],
+    correlation: ApplicationResponseCorrelation = {},
+  ): ApplicationResponseCheckResult {
+    const built = checkApplicationResponse(
+      response,
+      facts,
+      now(),
+      correlation,
+      this.sessionId,
+    );
+    let acceptedCount = 0;
+    const results = built.results.map((result) => {
+      if (!result.accepted || result.event === undefined) return result;
+      if (
+        this.applicationResponseAssertions >=
+        MAX_APPLICATION_RESPONSE_ASSERTIONS_PER_SESSION
+      ) {
+        return {
+          accepted: false,
+          rejection: "response_session_cap_reached" as const,
+        };
+      }
+      this.applicationResponseAssertions += 1;
+      acceptedCount += 1;
+      this.bus.emit(result.event);
+      return result;
+    });
+    return {
+      ...built,
+      accepted: acceptedCount > 0,
+      acceptedCount,
+      results,
+    };
+  }
+
+  reportResponse(
+    response: unknown,
+    facts: readonly ApplicationResponseFactOptions[],
+    correlation: ApplicationResponseCorrelation = {},
+  ): ApplicationResponseCheckResult {
+    return this.checkResponse(response, facts, correlation);
+  }
+
+  /** Begin a provider-neutral declaration that an application effect should occur. */
+  expectSideEffect(
+    options: ApplicationExpectationOptions,
+  ): ApplicationExpectationResult {
+    return this.applicationExpectations.begin(options);
+  }
+
+  beginExpectation(
+    options: ApplicationExpectationOptions,
+  ): ApplicationExpectationResult {
+    return this.expectSideEffect(options);
+  }
+
   addEvent(partial: AddBugEventOptions): boolean {
     const { type, data, ...envelope } = partial;
     return this.bus.emit({
@@ -2720,6 +2800,9 @@ export class Crumbtrail {
     this.applyRemotePolicyFallback();
     this.clearRemotePolicyTimer();
     this.settleAdmissionWaiters();
+    // Missed application expectations are part of the final evidence window and
+    // must be emitted before the final flush while the bus is still live.
+    this.applicationExpectations.stop();
     // Ship everything captured up to this instant BEFORE tearing down.
     // shouldPersistEvent consults canTransport(), which is false once
     // `stopped` is set — so a flush that runs after the flag would hand the
