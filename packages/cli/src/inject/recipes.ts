@@ -1705,10 +1705,7 @@ function isParserBlockingBootstrap(
 function staticModuleVersion(html: string): string | null {
   for (const block of htmlScriptBlocks(html)) {
     if (!block.executable) continue;
-    const isModule =
-      (block.attributeValues.get("type") ?? "").trim().toLowerCase() ===
-      "module";
-    if (!isModule) continue;
+    if (block.scriptKind !== "module") continue;
     const sources = block.src === null ? [] : [block.src];
     if (block.src === null) {
       let program: any;
@@ -1862,7 +1859,10 @@ function staticExistingPagePlan(
     io,
   });
   if (markerSource !== null) {
-    if (!isParserBlockingBootstrap(markerBlock!.attributeValues)) {
+    if (
+      markerBlock!.scriptKind !== "classic" ||
+      !isParserBlockingBootstrap(markerBlock!.attributeValues)
+    ) {
       return {
         recipe: input.recipe,
         kind: "fallback-ai",

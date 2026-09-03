@@ -1081,15 +1081,16 @@ const JAVASCRIPT_SCRIPT_TYPE = new Set([
   "text/x-javascript",
 ]);
 
-function executableScript(attrs: ReadonlyMap<string, string>): boolean {
+function classifyScript(
+  attrs: ReadonlyMap<string, string>,
+): "classic" | "module" | "inert" {
   // An omitted or empty type is a classic script. An explicit non-JavaScript
   // type is a data block and does not establish an execution boundary.
-  const type = (attrs.get("type") ?? "").split(";", 1)[0].trim();
-  return (
-    type === "" ||
-    type.toLowerCase() === "module" ||
-    JAVASCRIPT_SCRIPT_TYPE.has(type.toLowerCase())
-  );
+  const type = (attrs.get("type") ?? "").trim().toLowerCase();
+  if (type === "module") return "module";
+  if (type === "" || JAVASCRIPT_SCRIPT_TYPE.has(type.split(";", 1)[0].trim()))
+    return "classic";
+  return "inert";
 }
 
 function tagEnd(html: string, start: number): number | null {
@@ -1131,6 +1132,7 @@ export interface HtmlScriptBlock {
   content: string;
   src: string | null;
   executable: boolean;
+  scriptKind: "classic" | "module" | "inert";
 }
 
 function afterInertElement(
@@ -1265,6 +1267,7 @@ export function htmlScriptBlocks(html: string): HtmlScriptBlock[] {
     if (end === null) return blocks;
     const attributes = html.slice(start + open[0].length, end);
     const attributeValues = htmlAttributes(attributes);
+    const scriptKind = classifyScript(attributeValues);
     const closeMatch = afterRawElement(html, end + 1, "script");
     const blockEnd = closeMatch?.end ?? html.length;
     blocks.push({
@@ -1274,7 +1277,8 @@ export function htmlScriptBlocks(html: string): HtmlScriptBlock[] {
       attributeValues,
       content: html.slice(end + 1, closeMatch?.start ?? html.length),
       src: attributeValues.get("src") ?? null,
-      executable: executableScript(attributeValues),
+      executable: scriptKind !== "inert",
+      scriptKind,
     });
     offset = blockEnd;
   }

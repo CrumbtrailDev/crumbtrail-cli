@@ -188,6 +188,21 @@ describe("insertIntoHtmlHead", () => {
   });
 
   it.each([
+    ["module;foo", "inert"],
+    [" MoDuLe ", "module"],
+    ["text/javascript; charset=utf-8", "classic"],
+    [" APPLICATION/JAVASCRIPT ; charset=utf-8 ", "classic"],
+    ["application/json; charset=utf-8", "inert"],
+    ["", "classic"],
+  ])("classifies the complete script type consistently: %s", (type, kind) => {
+    const blocks = htmlScriptBlocks(
+      `<script type="${type}" src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>`,
+    );
+    expect(blocks[0].scriptKind).toBe(kind);
+    expect(blocks[0].executable).toBe(kind !== "inert");
+  });
+
+  it.each([
     `<style>.x::before { content: '<style>'; }</style>`,
     `<textarea>literal <textarea> <script>notParent()</script></textarea>`,
     `<template><!-- </template> --><script>notParent()</script></template>`,
