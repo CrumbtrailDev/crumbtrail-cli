@@ -227,7 +227,11 @@ export async function createService(
     // this token cannot read, and inventing a service would be worse than the
     // original error. The server's own words stand.
     if (!match) throw err;
-    return { ...match, adopted: true, adoptionMatch: compareIdentity(match, identity) };
+    return {
+      ...match,
+      adopted: true,
+      adoptionMatch: compareIdentity(match, identity),
+    };
   }
 }
 
@@ -326,6 +330,26 @@ export async function setSessionReplay(
       method: "PATCH",
       token,
       body: { replayEnabled: enabled },
+      fetchImpl,
+    });
+  } catch (err) {
+    throw explainWrongAccount(err, projectId, identityLabel);
+  }
+}
+
+export async function setDataReproduction(
+  base: string,
+  token: string,
+  projectId: string,
+  enabled: boolean,
+  fetchImpl?: typeof fetch,
+  identityLabel?: string,
+): Promise<void> {
+  try {
+    await requestJson(`${base}/api/projects/${projectId}/capture-settings`, {
+      method: "PATCH",
+      token,
+      body: { reproductionEnabled: enabled, captureDatabaseReads: enabled },
       fetchImpl,
     });
   } catch (err) {

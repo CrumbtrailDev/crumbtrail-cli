@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { witnessCopy } from "./witness/copy";
 // The `crumbtrail` setup wizard. Hand-rolled arg parsing (no CLI framework to keep
 // npx cold-start fast), a non-TTY guard that runs BEFORE any prompt, and the
 // end-to-end flow: banner → detect → login → provision → SDK install → inject →
@@ -53,6 +54,7 @@ import {
   ProjectAccessError,
   resolveProject,
   setSessionReplay,
+  setDataReproduction,
   uniqueServiceNames,
   UpgradeRequiredError,
   type ProvisionResult,
@@ -311,6 +313,7 @@ export interface ParsedArgs {
    * non-interactive run should pick on their behalf.
    */
   replay?: boolean;
+  reproduction?: boolean;
   /**
    * `verify` only: the ingest key to probe with (else $CRUMBTRAIL_KEY, else the
    * cached login token). The primary CI credential for a pre-deploy check.
@@ -369,6 +372,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
         break;
       case "--skip-verify":
         parsed.skipVerify = true;
+        break;
+      case "--reproduction":
+        parsed.reproduction = true;
+        break;
+      case "--no-reproduction":
+        parsed.reproduction = false;
         break;
       case "--replay":
         parsed.replay = true;
@@ -994,6 +1003,7 @@ export interface WizardDeps {
   resolveProject: typeof resolveProject;
   provisionService: typeof provisionService;
   setSessionReplay: typeof setSessionReplay;
+  setDataReproduction?: typeof setDataReproduction;
   pollForServices: typeof pollForServices;
   /** Synthetic preflight for `verify` (stub in tests). */
   runPreflight: typeof runPreflight;
@@ -1031,6 +1041,7 @@ export function defaultDeps(): WizardDeps {
     resolveProject,
     provisionService,
     setSessionReplay,
+    setDataReproduction,
     pollForServices,
     runPreflight,
     runCorsDiagnostic: diagnoseCors,
@@ -1541,6 +1552,16 @@ export async function runWizard(
   // run that wired nothing is a question about a feature the asker cannot yet
   // reach, and the setup that failed is the thing they need to hear about.
   if (keyReady) {
+    notes.push(
+      await offerDataReproduction({
+        base,
+        token,
+        projectId: provisioned.projectId,
+        parsed,
+        deps,
+        identityLabel,
+      }),
+    );
     notes.push(
       await offerSessionReplay({
         base,
@@ -2528,6 +2549,16 @@ export async function runBatchWizard(
   // same yes. Skipped entirely when nothing reports to the cloud, because a
   // run with no reporting service has a more urgent thing to say.
   if (cloudReporting.some((o) => o.keyReady)) {
+    batchNotes.push(
+      await offerDataReproduction({
+        base,
+        token,
+        projectId: project.id,
+        parsed,
+        deps,
+        identityLabel,
+      }),
+    );
     batchNotes.push(
       await offerSessionReplay({
         base,
@@ -3695,6 +3726,43 @@ async function connectCodingAgent(args: {
  * A failure here is reported and never fatal: the app is wired either way, and
  * the setting is one click away in the dashboard.
  */
+export async function offerDataReproduction(args: {
+  base: string;
+  token: string;
+  projectId: string;
+  parsed: ParsedArgs;
+  deps: WizardDeps;
+  identityLabel: string;
+}): Promise<string> {
+  const { base, token, projectId, parsed, deps, identityLabel } = args;
+  const enabled =
+    parsed.reproduction ??
+    (parsed.yes || !deps.isTTY
+      ? undefined
+      : await deps.prompter.confirm(
+          witnessCopy("WITNESS_REPRODUCTION_ASK"),
+          false,
+        ));
+  if (
+    enabled === undefined ||
+    (enabled === false && parsed.reproduction === undefined)
+  )
+    return witnessCopy("WITNESS_REPRODUCTION_UNCHANGED");
+  try {
+    await (deps.setDataReproduction ?? setDataReproduction)(
+      base,
+      token,
+      projectId,
+      enabled,
+      deps.fetchImpl,
+      identityLabel,
+    );
+    return witnessCopy(enabled ? "WITNESS_READS_ON" : "WITNESS_READS_OFF");
+  } catch {
+    return witnessCopy("WITNESS_REPRODUCTION_SAVE_FAILED");
+  }
+}
+
 async function offerSessionReplay(args: {
   base: string;
   token: string;
@@ -4632,6 +4700,8 @@ export async function runCli(
   deps: WizardDeps = defaultDeps(),
   nodeVersion: string = process.version,
 ): Promise<number> {
+  if (argv[2] === "witness")
+    return (await import("./witness/command")).runWitnessCommand(argv.slice(3));
   const parsed = parseArgs(argv);
 
   // Before anything reads the repo or writes to it.

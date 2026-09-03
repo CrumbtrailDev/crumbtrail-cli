@@ -21,7 +21,7 @@ export default defineConfig({
   // than leaning on tsup's bundle-devDependencies default is what lets the
   // release planner see that a core change alters this tarball — without it the
   // CLI silently drops out of the release set on a core-only change.
-  noExternal: ["crumbtrail-core"],
+  noExternal: ["crumbtrail-core", "crumbtrail-node"],
   dts: true,
   clean: true,
 });

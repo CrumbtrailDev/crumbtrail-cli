@@ -519,7 +519,13 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     };
     // Preserve the existing read-capture boundary: `.all()` emits row evidence;
     // `.get()` is wrapped only so a refused SELECT is no longer invisible.
-    if (!requestId || !operationOptions.captureReads || method === "get")
+    if (
+      !requestId ||
+      !(
+        operationOptions.getCaptureReads?.() ?? operationOptions.captureReads
+      ) ||
+      method === "get"
+    )
       return result;
     try {
       const rows = (

@@ -529,7 +529,11 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           options: operationOptions,
           context,
         });
-        if (operationOptions.captureReads && parsedRead) {
+        if (
+          (operationOptions.getCaptureReads?.() ??
+            operationOptions.captureReads) &&
+          parsedRead
+        ) {
           try {
             const payload = resultPayload(result);
             const rows = Array.isArray(payload) ? payload.filter(isRecord) : [];

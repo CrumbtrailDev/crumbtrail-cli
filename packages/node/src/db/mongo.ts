@@ -218,7 +218,10 @@ function handleSucceeded(
     return;
   }
 
-  if (options.captureReads && isReadCommand(commandName)) {
+  if (
+    (options.getCaptureReads?.() ?? options.captureReads) &&
+    isReadCommand(commandName)
+  ) {
     const rows = cursorBatch(reply).map(boundMongoDocument);
     if (rows.length === 0) return;
     emitDbReadEvents({

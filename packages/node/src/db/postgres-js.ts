@@ -689,7 +689,11 @@ function recordSuccess(input: {
     return;
   }
 
-  if (options.captureReads && parsedRead && rows.length > 0) {
+  if (
+    (options.getCaptureReads?.() ?? options.captureReads) &&
+    parsedRead &&
+    rows.length > 0
+  ) {
     emitDbReadEvents({
       engine: ENGINE,
       table: parsedRead.table,

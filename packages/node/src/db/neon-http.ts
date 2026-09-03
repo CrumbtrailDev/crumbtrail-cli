@@ -242,7 +242,10 @@ function runCaptured(
               options: eventOptions,
             });
           }
-        } else if (eventOptions.captureReads && parsedRead) {
+        } else if (
+          (eventOptions.getCaptureReads?.() ?? eventOptions.captureReads) &&
+          parsedRead
+        ) {
           emitDbReadEvents({
             engine: ENGINE,
             table: parsedRead.table,

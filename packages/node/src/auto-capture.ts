@@ -577,6 +577,7 @@ export function __resetAutoCaptureInstallForTests(): void {
 }
 
 function startNodeCpuProfilePolling(options: {
+  onConfig?: (payload: unknown) => void;
   endpoint: string;
   configEndpoint?: string;
   projectKey: string;
@@ -627,6 +628,7 @@ function startNodeCpuProfilePolling(options: {
         pollAbort.signal,
       );
       clearTimeout(deadline);
+      if (!stopped && !pollAbort.signal.aborted) options.onConfig?.(payload);
       if (
         stopped ||
         pollAbort.signal.aborted ||
@@ -1154,6 +1156,8 @@ export async function autoCapture(
   };
   setActiveDbSink(dbSink);
 
+  let remoteDatabaseReads = false;
+  let remoteCaptureKilled = false;
   let dbInstrumentation: AutoInstrumentReport | undefined;
   if (options.instrumentDatabases !== false) {
     try {
@@ -1166,7 +1170,9 @@ export async function autoCapture(
         // per statement, because the scope is AsyncLocalStorage state that only
         // exists once a request is in flight.
         getRequestId: readActiveDbRequestId,
-        captureReads: options.captureDatabaseReads ?? false,
+        getCaptureReads: () =>
+          !remoteCaptureKilled &&
+          (options.captureDatabaseReads ?? remoteDatabaseReads),
         captureBefore: options.captureDatabaseBeforeImages ?? false,
         captureCallsite: options.captureDatabaseCallsites ?? false,
         drivers: options.databaseDrivers,
@@ -1243,6 +1249,12 @@ export async function autoCapture(
   // instead of profiling an untargeted process. The profiler itself is created
   // once, but its inspector session is fresh for each requested run.
   const stopCpuProfilePolling = startNodeCpuProfilePolling({
+    onConfig(payload) {
+      remoteCaptureKilled = captureKilled(payload);
+      remoteDatabaseReads = configRecords(payload).some(
+        (record) => record.captureDatabaseReads === true,
+      );
+    },
     endpoint: options.endpoint,
     configEndpoint: options.configEndpoint,
     projectKey: authToken ?? "",
