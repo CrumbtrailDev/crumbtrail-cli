@@ -13,11 +13,11 @@ public let crumbtrailMaxMetricKitDiagnostics = 32
 public let crumbtrailMaxMetricKitPayloads = 32
 
 private let crumbtrailDiagnosticAuthorizationPattern = try! NSRegularExpression(
-    pattern: #"(?i)(\b(?:proxy-)?authorization\b[ \t]*[:=][ \t]*)(?:bearer|basic)[ \t]+[^\s,;]+"#
+    pattern: #"(?i)(\b(?:proxy-)?authorization\b["']?[ \t]*[:=][ \t]*["']?)(?:bearer|basic)[ \t]+[^\s,;"']+"#
 )
 
 private let crumbtrailDiagnosticCredentialPattern = try! NSRegularExpression(
-    pattern: #"(?i)(\b(?:authorization|cookie|set-cookie|proxy-authorization|www-authenticate|x[-_]?api[-_]?key|x[-_]?auth[-_]?token|x[-_]?csrf[-_]?token|access[-_]?token|refresh[-_]?token|client[-_]?secret|api[-_]?key|auth[-_]?(?:token|key)|token|secret|password|passwd|credential|signature|bearer)\b\s*(?:[:=]\s*|\s+))([^\s,;]+)"#
+    pattern: #"(?i)(\b(?:authorization|cookie|set-cookie|proxy-authorization|www-authenticate|x[-_]?api[-_]?key|x[-_]?auth[-_]?token|x[-_]?csrf[-_]?token|access[-_]?token|refresh[-_]?token|client[-_]?secret|api[-_]?key|auth[-_]?(?:token|key)|token|secret|password|passwd|credential|signature|bearer)\b["']?\s*(?:[:=]\s*|\s+)["']?)([^\s,;"']+)"#
 )
 
 /// Keep diagnostic text bounded before it reaches the event queue or disk.
@@ -42,11 +42,12 @@ public func crumbtrailRedactedDiagnosticText(
         withTemplate: "$1[REDACTED]"
     )
     let range = NSRange(authorizationRedacted.startIndex..<authorizationRedacted.endIndex, in: authorizationRedacted)
-    return crumbtrailDiagnosticCredentialPattern.stringByReplacingMatches(
+    let redacted = crumbtrailDiagnosticCredentialPattern.stringByReplacingMatches(
         in: authorizationRedacted,
         range: range,
         withTemplate: "$1[REDACTED]"
     )
+    return crumbtrailBoundedDiagnosticText(redacted, maxCharacters: maxCharacters)
 }
 
 /// A main-thread hang waiting for recovery or a later launch.

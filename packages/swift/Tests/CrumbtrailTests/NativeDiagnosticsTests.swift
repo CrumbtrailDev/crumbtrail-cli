@@ -57,6 +57,46 @@ private final class FakeMetricKitSource: CrumbtrailMetricKitSource {
 }
 
 final class NativeDiagnosticsTests: XCTestCase {
+    func testQuotedAuthorizationAndBoundaryExpansionStayRedactedAndStable() {
+        for scheme in ["Basic", "Bearer"] {
+            for input in ["Authorization: \"\(scheme) abc123==\"", "{\"Authorization\": \"\(scheme) abc123==\"}"] {
+                let sanitized = crumbtrailRedactedDiagnosticText(input)!
+                XCTAssertFalse(sanitized.contains("abc123"))
+                XCTAssertEqual(sanitized, crumbtrailRedactedDiagnosticText(sanitized))
+            }
+        }
+        let input = String(repeating: "token=x ", count: 2_000)
+        for limit in Array(1...64) + [crumbtrailMaxDiagnosticStackCharacters] {
+            let sanitized = crumbtrailRedactedDiagnosticText(input, maxCharacters: limit)!
+            XCTAssertLessThanOrEqual(sanitized.count, limit)
+            XCTAssertEqual(sanitized, crumbtrailRedactedDiagnosticText(sanitized, maxCharacters: limit))
+        }
+    }
+
+    func testDurableHandoffRetainsRecoveryOwnershipAtTheStackLimit() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let handoff = ApplicationSupportPendingHangStore(fileURL: directory.appendingPathComponent("hang.json"))
+        let scheduler = FakeWatchdogScheduler()
+        var now: Int64 = 0
+        var accepted = 0
+        let watchdog = CrumbtrailMainThreadWatchdog(
+            scheduler: scheduler, handoff: handoff,
+            onHang: { _ in accepted += 1; return true }, now: { now },
+            captureStack: { String(repeating: "token=x ", count: 2_000) }
+        )
+        watchdog.start()
+        scheduler.runMain()
+        now = 5_000
+        scheduler.runNextScheduled()
+        XCTAssertNotNil(handoff.read())
+        now = 6_000
+        scheduler.runMain()
+        scheduler.runBackground()
+        XCTAssertEqual(accepted, 1)
+        XCTAssertNil(handoff.read())
+    }
+
     func testAuthorizationRedactionRemovesSchemesAndCredentialsIdempotently() {
         for key in ["Authorization", "authorization", "PROXY-AUTHORIZATION"] {
             for scheme in ["Bearer", "bEaReR", "Basic", "BASIC"] {

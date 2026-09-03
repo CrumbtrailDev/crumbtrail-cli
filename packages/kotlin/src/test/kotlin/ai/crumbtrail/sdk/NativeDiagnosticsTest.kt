@@ -54,6 +54,51 @@ private class MarkerStore(private var timestamp: Long? = null) : CrumbtrailProce
 
 class MainThreadWatchdogTest {
     @Test
+    fun `quoted authorization and boundary expansion stay redacted and stable`() {
+        for (scheme in listOf("Basic", "Bearer")) {
+            for (input in listOf("Authorization: \"$scheme abc123==\"", "{\"Authorization\": \"$scheme abc123==\"}")) {
+                val sanitized = redactedDiagnosticText(input)
+                assertFalse(sanitized!!.contains("abc123"))
+                assertEquals(sanitized, redactedDiagnosticText(sanitized))
+            }
+        }
+        val input = "token=x ".repeat(2_000)
+        for (limit in (1..64).toList() + MAX_DIAGNOSTIC_STACK_CHARS) {
+            val sanitized = redactedDiagnosticText(input, limit)!!
+            assertTrue(sanitized.length <= limit)
+            assertEquals(sanitized, redactedDiagnosticText(sanitized, limit))
+        }
+    }
+
+    @Test
+    fun `sanitizing durable handoff retains recovery ownership at the stack limit`() {
+        val scheduler = FakeWatchdogScheduler()
+        val handoff = object : CrumbtrailPendingHangStore {
+            var stored: CrumbtrailPendingHang? = null
+            override fun write(hang: CrumbtrailPendingHang) { stored = hang.copy(stack = redactedDiagnosticText(hang.stack)) }
+            override fun read() = stored?.let { it.copy(stack = redactedDiagnosticText(it.stack)) }
+            override fun clear() { stored = null }
+        }
+        var now = 0L
+        var accepted = 0
+        val watchdog = CrumbtrailMainThreadWatchdog(
+            scheduler = scheduler, handoff = handoff,
+            onHang = { accepted++; true }, now = { now },
+            captureStack = { "token=x ".repeat(2_000) },
+        )
+        watchdog.start()
+        scheduler.runMain()
+        now = 5_000
+        scheduler.runNextScheduled()
+        assertNotNull(handoff.read())
+        now = 6_000
+        scheduler.runMain()
+        scheduler.runBackground()
+        assertEquals(1, accepted)
+        assertNull(handoff.read())
+    }
+
+    @Test
     fun `authorization redaction removes schemes and credentials idempotently`() {
         for (key in listOf("Authorization", "authorization", "PROXY-AUTHORIZATION")) {
             for (scheme in listOf("Bearer", "bEaReR", "Basic", "BASIC")) {
