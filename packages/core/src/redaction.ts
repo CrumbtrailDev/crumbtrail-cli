@@ -149,7 +149,10 @@ export function credentialPresence(
     const raw = typeof value === "string" ? value : String(value ?? "");
     if (raw.trim() === "") continue;
     const normalized = name.trim().toLowerCase();
-    if (normalized === "authorization" || normalized === "proxy-authorization") {
+    if (
+      normalized === "authorization" ||
+      normalized === "proxy-authorization"
+    ) {
       presence.authorization = true;
     } else if (normalized === "cookie") {
       // Names only. The value after the first `=` is never read.
@@ -229,6 +232,47 @@ export interface BodyRedactionOptions {
 export interface StructuredFieldPolicy {
   denyFields?: string[];
   keepFields?: string[];
+}
+
+export type DiagnosticScalar = string | number | boolean | null;
+
+export type DiagnosticFieldsValue =
+  | DiagnosticScalar
+  | DiagnosticFieldsValue[]
+  | { [key: string]: DiagnosticFieldsValue };
+
+/** The maximum number of explicitly selected diagnostic leaves in one event. */
+export const DIAGNOSTIC_FIELD_MAX_ENTRIES = 16;
+
+/** The maximum number of configured diagnostic paths inspected before parsing. */
+export const DIAGNOSTIC_FIELD_MAX_PATHS = 64;
+
+/** The exclusive upper bound for diagnostic array indexes. */
+export const DIAGNOSTIC_INDEX_MAX = 64;
+
+/** The maximum length of a retained diagnostic string. */
+export const DIAGNOSTIC_FIELD_MAX_STRING_LENGTH = 256;
+
+/**
+ * An explicit, relative field-path allowlist for small diagnostic maps.
+ *
+ * Paths use dot-separated property names and numeric array indexes such as
+ * `checkout.status` and `attempts[0].code`. Wildcards and prototype paths are
+ * intentionally not part of this grammar.
+ */
+export interface DiagnosticFieldRedactionOptions {
+  diagnosticFields: readonly string[];
+  denyFields?: readonly string[];
+  path?: string;
+}
+
+interface UrlRedactionOptions {
+  /** Do not consult the process-wide application query keep list. */
+  ignoreKeepFields?: boolean;
+  /** Only HTTP(S), scheme-relative, and relative URLs are safe in diagnostics. */
+  allowOnlyHttpSchemes?: boolean;
+  /** Include bounded root-relative URL substrings when scanning prose. */
+  allowRelativeUrlsInText?: boolean;
 }
 
 export interface StoredValueRedactionOptions {
@@ -374,6 +418,80 @@ const SENSITIVE_COMPACT_SUFFIXES = [
   "sessiontokens",
   "xsrftoken",
 ];
+
+/**
+ * Common Unicode lookalikes used to disguise field names. This is intentionally
+ * a small security skeleton rather than transliteration: only characters that
+ * can plausibly turn a sensitive ASCII name into a visual confusable are
+ * folded, and the original key is still retained in structured JSON output.
+ */
+const CONFUSABLE_FIELD_CHARACTERS = new Map<string, string>([
+  ["а", "a"],
+  ["в", "b"],
+  ["с", "c"],
+  ["ԁ", "d"],
+  ["е", "e"],
+  ["һ", "h"],
+  ["і", "i"],
+  ["ј", "j"],
+  ["κ", "k"],
+  ["к", "k"],
+  ["ӏ", "l"],
+  ["м", "m"],
+  ["η", "n"],
+  ["ο", "o"],
+  ["о", "o"],
+  ["ρ", "p"],
+  ["р", "p"],
+  ["ԛ", "q"],
+  ["ѕ", "s"],
+  ["τ", "t"],
+  ["т", "t"],
+  ["υ", "y"],
+  ["у", "y"],
+  ["χ", "x"],
+  ["х", "x"],
+  ["γ", "y"],
+  ["ζ", "z"],
+  ["α", "a"],
+  ["β", "b"],
+  ["δ", "d"],
+  ["ε", "e"],
+  ["ι", "i"],
+  ["μ", "m"],
+  ["ν", "v"],
+  ["π", "p"],
+  ["ϲ", "c"],
+  ["ϳ", "j"],
+  ["ı", "i"],
+  ["ſ", "s"],
+]);
+
+/** Short numeric query names that can carry credentials or verification data. */
+const SENSITIVE_SHORT_NUMERIC_QUERY_NAMES = new Set([
+  "account",
+  "accountnumber",
+  "auth",
+  "card",
+  "cardnumber",
+  "code",
+  "cvc",
+  "cvv",
+  "invite",
+  "magic",
+  "mfa",
+  "otp",
+  "pan",
+  "passcode",
+  "pin",
+  "reset",
+  "securitycode",
+  "session",
+  "ssn",
+  "token",
+  "verificationcode",
+  "verify",
+]);
 
 /**
  * `generic: true` marks a pattern that matches by shape alone rather than by a
@@ -525,15 +643,24 @@ function withMetadata<T>(
 
 function isSensitiveName(name: string | undefined): boolean {
   if (!name) return false;
-  const normalized = name.replace(/([a-z])([A-Z])/g, "$1_$2");
-  const compact = normalized.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const normalized = normalizeFieldName(name);
+  const wordSeparated = normalized.replace(/([a-z])([A-Z])/g, "$1_$2");
+  const compact = compactFieldName(name);
   return (
     SENSITIVE_NAME_RE.test(name) ||
     PII_NAME_RE.test(name) ||
-    SENSITIVE_NAME_RE.test(normalized) ||
-    PII_NAME_RE.test(normalized) ||
+    SENSITIVE_NAME_RE.test(wordSeparated) ||
+    PII_NAME_RE.test(wordSeparated) ||
     isSensitiveCompactName(compact)
   );
+}
+
+function normalizeFieldName(name: string): string {
+  try {
+    return name.normalize("NFKC");
+  } catch {
+    return name;
+  }
 }
 
 function isSensitiveCompactName(compact: string): boolean {
@@ -592,13 +719,14 @@ export function redactTokenLikeString(
 function redactQueryString(
   query: string,
   path: string,
+  options: UrlRedactionOptions = {},
 ): RedactionResult<string> {
   if (!query) return { value: "" };
 
   const search = query.startsWith("?") ? query.slice(1) : query;
   const params = new URLSearchParams(search);
   const fields: RedactionField[] = [];
-  const keepFields = getRedactionKeepFields();
+  const keepFields = options.ignoreKeepFields ? [] : getRedactionKeepFields();
 
   for (const key of Array.from(params.keys())) {
     const values = params.getAll(key);
@@ -691,8 +819,39 @@ function redactedQueryValue(value: string): string {
  * step, quantity and their kin, and nothing that could be a credential.
  */
 function isHarmlessQueryValue(key: string, value: string): boolean {
-  if (isSensitiveName(key)) return false;
+  if (isSensitiveQueryName(key)) return false;
   return /^-?[0-9]{1,4}$/.test(value);
+}
+
+function isSensitiveQueryName(key: string): boolean {
+  return (
+    isSensitiveName(key) ||
+    SENSITIVE_SHORT_NUMERIC_QUERY_NAMES.has(compactFieldName(key))
+  );
+}
+
+/**
+ * Verification fields are allowed to retain operational strings, but their
+ * numeric forms are credentials in query, structured JSON, and diagnostic
+ * selections. Match exact compact names so `statusCode` and other operational
+ * fields do not inherit the rule merely because they contain `code`.
+ */
+function isSensitiveShortNumericValue(
+  value: unknown,
+  keyName: string | undefined,
+): boolean {
+  if (
+    keyName === undefined ||
+    !SENSITIVE_SHORT_NUMERIC_QUERY_NAMES.has(compactFieldName(keyName))
+  )
+    return false;
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  return (
+    typeof value === "string" &&
+    /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(value.trim())
+  );
 }
 
 /**
@@ -1119,14 +1278,18 @@ function isWordLikeSlug(segment: string): boolean {
   });
 }
 
-function redactRelativeUrl(url: string, path: string): RedactionResult<string> {
+function redactRelativeUrl(
+  url: string,
+  path: string,
+  options: UrlRedactionOptions = {},
+): RedactionResult<string> {
   const hashIndex = url.indexOf("#");
   const beforeHash = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
   const hash = hashIndex >= 0 ? url.slice(hashIndex) : "";
   const queryIndex = beforeHash.indexOf("?");
   const base = queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash;
   const query = queryIndex >= 0 ? beforeHash.slice(queryIndex) : "";
-  const queryResult = redactQueryString(query, path);
+  const queryResult = redactQueryString(query, path, options);
   const pathResult = redactUrlPath(base, path);
   const tokenResult = redactTokenLikeString(
     `${pathResult.value}${queryResult.value}`,
@@ -1163,10 +1326,23 @@ function redactMalformedAbsoluteUrl(path: string): RedactionResult<string> {
   });
 }
 
-export function redactUrl(url: string, path = "url"): RedactionResult<string> {
-  if (url.trim().startsWith("//")) {
-    const leadingWhitespace = url.match(/^\s*/)?.[0] ?? "";
-    const trimmed = url.trim();
+export function redactUrl(
+  url: string,
+  path = "url",
+  options: UrlRedactionOptions = {},
+): RedactionResult<string> {
+  const leadingWhitespace = url.match(/^\s*/)?.[0] ?? "";
+  const trimmedUrl = url.slice(leadingWhitespace.length);
+  if (isUrlLikeValue(trimmedUrl) && hasNonAsciiUrlComponents(trimmedUrl)) {
+    return withMetadata(`${leadingWhitespace}${REDACTED_VALUE}`, {
+      path,
+      reason: "non_ascii_url_component",
+      action: "dropped",
+    });
+  }
+
+  if (trimmedUrl.startsWith("//")) {
+    const trimmed = trimmedUrl;
     try {
       const parsed = new URL(`https:${trimmed}`);
       const fields: RedactionField[] = [];
@@ -1180,7 +1356,7 @@ export function redactUrl(url: string, path = "url"): RedactionResult<string> {
         });
       }
       if (parsed.search) {
-        const queryResult = redactQueryString(parsed.search, path);
+        const queryResult = redactQueryString(parsed.search, path, options);
         parsed.search = queryResult.value;
         if (queryResult.metadata) fields.push(...queryResult.metadata.fields);
       }
@@ -1213,20 +1389,27 @@ export function redactUrl(url: string, path = "url"): RedactionResult<string> {
       return redactMalformedAbsoluteUrl(path);
     }
   }
-  const leadingWhitespace = url.match(/^\s*/)?.[0] ?? "";
-  const trimmedUrl = url.slice(leadingWhitespace.length);
   const hasScheme = /^[a-z][a-z\d+.-]*:/i.test(trimmedUrl);
-  if (!hasScheme) return redactRelativeUrl(url, path);
+  if (!isUrlLikeValue(trimmedUrl) || !hasScheme)
+    return redactRelativeUrl(url, path, options);
 
   try {
     const parsed = new URL(trimmedUrl);
     const fields: RedactionField[] = [];
 
-    if (SENSITIVE_URL_SCHEMES.has(parsed.protocol.toLowerCase())) {
+    const protocol = parsed.protocol.toLowerCase();
+    if (
+      SENSITIVE_URL_SCHEMES.has(protocol) ||
+      (options.allowOnlyHttpSchemes &&
+        protocol !== "http:" &&
+        protocol !== "https:")
+    ) {
       const summary = `${parsed.protocol}${REDACTED_VALUE}`;
       return withMetadata(`${leadingWhitespace}${summary}`, {
         path,
-        reason: "sensitive_url_scheme",
+        reason: SENSITIVE_URL_SCHEMES.has(protocol)
+          ? "sensitive_url_scheme"
+          : "unsafe_url_scheme",
         action: "redacted",
       });
     }
@@ -1242,7 +1425,7 @@ export function redactUrl(url: string, path = "url"): RedactionResult<string> {
     }
 
     if (parsed.search) {
-      const queryResult = redactQueryString(parsed.search, path);
+      const queryResult = redactQueryString(parsed.search, path, options);
       parsed.search = queryResult.value;
       if (queryResult.metadata) fields.push(...queryResult.metadata.fields);
     }
@@ -1287,10 +1470,115 @@ export function redactUrl(url: string, path = "url"): RedactionResult<string> {
  * trimmed separately (see below) so a period/comma after the URL is not swallowed.
  */
 const URL_IN_TEXT_RE = /https?:\/\/[^\s"'`<>\\{}()[\]|^]+/gi;
+/** Relative candidates require a boundary and a `name=value` query. */
+const RELATIVE_URL_IN_TEXT_RE =
+  /(^|[\s"'`<([{=:])((?:(?:\/\/[^\s"'`<>\\{}()[\]|^/?#]+(?:\/[^\s"'`<>\\{}()[\]|^?#]{0,2048})?|(?:\.{1,2}\/|\/)[^\s"'`<>\\{}()[\]|^?#]{0,2048}|[A-Za-z0-9][A-Za-z0-9._~-]{0,127}(?:\/[^\s"'`<>\\{}()[\]|^?#]{0,2048})?)\?[^\s"'`<>\\{}()[\]|^#]{0,2048}=[^\s"'`<>\\{}()[\]|^]+|\?[^\s"'`<>\\{}()[\]|^#]{0,2048}=[^\s"'`<>\\{}()[\]|^]+))/gi;
+const DIAGNOSTIC_URL_SCHEME_RE =
+  /\b([a-z][a-z\d+.-]*):(?=\/\/|[^\s"'`<>\\{}()[\]|^])/gi;
 const URL_TRAILING_PUNCT_RE = /[.,;:!?]+$/;
+const MAX_RELATIVE_URL_IN_TEXT_MATCHES = 16;
+const URL_SPECIAL_SCHEMES = new Set([
+  ...SENSITIVE_URL_SCHEMES,
+  // These standard opaque schemes can carry credentials or private locations,
+  // even when their payload has no URL punctuation. Keep them in the same
+  // set used by whole-value and embedded-text detection.
+  "ftp:",
+  "ssh:",
+  "mailto:",
+  "tel:",
+  "urn:",
+]);
+const DIAGNOSTIC_LABEL_SCHEMES = new Set([
+  "build",
+  "cause",
+  "code",
+  "detail",
+  "details",
+  "error",
+  "event",
+  "info",
+  "kind",
+  "message",
+  "mode",
+  "msg",
+  "name",
+  "note",
+  "operation",
+  "phase",
+  "query",
+  "reason",
+  "result",
+  "source",
+  "state",
+  "status",
+  "step",
+  "type",
+  "version",
+  "warning",
+]);
+function firstDiagnosticSchemePayload(payload: string): string | undefined {
+  return payload.match(/^[^\s"'`<>\\{}()[\]|^]+/)?.[0];
+}
 
 /**
- * Scrub secrets from `http(s)://…` URL substrings embedded in FREE TEXT, reusing
+ * Ordinary diagnostics use a small set of explicit colon-delimited labels.
+ * Unknown schemes are opaque values even when their payload ends with sentence
+ * punctuation. This keeps a value such as `custom:secret.` from being treated
+ * as prose merely because it looks like the end of a sentence.
+ */
+function isOrdinaryDiagnosticColonLabel(
+  schemeName: string,
+  payload: string,
+): boolean {
+  const candidate = firstDiagnosticSchemePayload(payload);
+  if (candidate === undefined) return true;
+  const scheme = schemeName.toLowerCase();
+  return DIAGNOSTIC_LABEL_SCHEMES.has(scheme);
+}
+
+function isUrlLikeValue(value: string): boolean {
+  const trimmed = value.trim();
+  if (
+    trimmed.startsWith("//") ||
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("./") ||
+    trimmed.startsWith("../")
+  )
+    return true;
+
+  const schemeMatch = /^([a-z][a-z\d+.-]*):/i.exec(trimmed);
+  const scheme = schemeMatch?.[0]?.toLowerCase();
+  if (!scheme) return false;
+  if (trimmed.slice(scheme.length).startsWith("//")) return true;
+  if (URL_SPECIAL_SCHEMES.has(scheme)) return true;
+
+  // `status: failed` is a label, not a URI. An unknown opaque value is a URL
+  // candidate unless it matches the narrow ordinary-label grammar above.
+  const payload = trimmed.slice(scheme.length);
+  return !isOrdinaryDiagnosticColonLabel(schemeMatch?.[1] ?? "", payload);
+}
+
+function hasUnsafeDiagnosticUrlScheme(value: string): boolean {
+  for (const match of value.matchAll(DIAGNOSTIC_URL_SCHEME_RE)) {
+    const scheme = match[1]?.toLowerCase();
+    if (!scheme || scheme === "http" || scheme === "https") continue;
+
+    const matchEnd = (match.index ?? 0) + match[0].length;
+    const remainder = value.slice(matchEnd);
+    const payload = firstDiagnosticSchemePayload(remainder);
+    if (
+      remainder.startsWith("//") ||
+      URL_SPECIAL_SCHEMES.has(`${scheme}:`) ||
+      (payload !== undefined &&
+        !isOrdinaryDiagnosticColonLabel(match[1] ?? "", payload))
+    )
+      return true;
+  }
+  return false;
+}
+
+/**
+ * Scrub secrets from URL substrings embedded in FREE TEXT, reusing
  * the SAME query-key-aware policy {@link redactUrl} applies to `ref.url`.
  *
  * The token-shape patterns in {@link redactTokenLikeString} catch Bearer/JWT/
@@ -1299,7 +1587,8 @@ const URL_TRAILING_PUNCT_RE = /[.,;:!?]+$/;
  * query-aware and drops every query value. This finds each URL substring and runs
  * it through `redactUrl`, so a tokenized URL sitting in an adapter's `after`/
  * `brief`/gap text loses its query secret while keeping its origin + path as
- * provenance. Non-URL text is left untouched (fast-path bail when no `://`).
+ * provenance. Diagnostic callers also opt into bounded root-relative candidates
+ * such as `/callback?token=…`; arbitrary slash text is not a candidate.
  *
  * This shares one implementation with `ref.url` redaction — there is no second
  * URL-redaction policy.
@@ -1307,20 +1596,120 @@ const URL_TRAILING_PUNCT_RE = /[.,;:!?]+$/;
 export function redactUrlsInText(
   value: string,
   path = "value",
+  options: UrlRedactionOptions = {},
 ): RedactionResult<string> {
-  if (value.indexOf("://") === -1) return { value };
+  if (options.allowOnlyHttpSchemes && hasUnsafeDiagnosticUrlScheme(value)) {
+    return withMetadata(REDACTED_VALUE, {
+      path,
+      reason: "unsafe_url_scheme",
+      action: "redacted",
+    });
+  }
+  if (
+    value.indexOf("://") === -1 &&
+    (!options.allowRelativeUrlsInText || value.indexOf("?") === -1)
+  )
+    return { value };
   const fields: RedactionField[] = [];
-  const output = value.replace(URL_IN_TEXT_RE, (match) => {
+  let output = value.replace(URL_IN_TEXT_RE, (match) => {
     const trailing = match.match(URL_TRAILING_PUNCT_RE)?.[0] ?? "";
     const core = trailing
       ? match.slice(0, match.length - trailing.length)
       : match;
-    const result = redactUrl(core, path);
+    const result = redactUrl(core, path, options);
     if (result.metadata) fields.push(...result.metadata.fields);
     return `${result.value}${trailing}`;
   });
+  if (options.allowRelativeUrlsInText) {
+    let relativeMatches = 0;
+    let relativeLimitExceeded = false;
+    output = output.replace(
+      RELATIVE_URL_IN_TEXT_RE,
+      (match, prefix: string, rawUrl: string) => {
+        if (relativeMatches >= MAX_RELATIVE_URL_IN_TEXT_MATCHES) {
+          relativeLimitExceeded = true;
+          return match;
+        }
+        relativeMatches += 1;
+        const trailing = rawUrl.match(URL_TRAILING_PUNCT_RE)?.[0] ?? "";
+        const core = trailing
+          ? rawUrl.slice(0, rawUrl.length - trailing.length)
+          : rawUrl;
+        const result = redactUrl(core, path, options);
+        if (result.metadata) fields.push(...result.metadata.fields);
+        return `${prefix}${result.value}${trailing}`;
+      },
+    );
+    if (relativeLimitExceeded) {
+      fields.push({
+        path,
+        reason: "url_in_text_match_limit",
+        action: "redacted",
+      });
+      const metadata = metadataFromFields(fields);
+      return {
+        value: REDACTED_VALUE,
+        ...(metadata ? { metadata } : {}),
+      };
+    }
+  }
   const metadata = metadataFromFields(fields);
   return { value: output, ...(metadata ? { metadata } : {}) };
+}
+
+function hasNonAsciiDecodedComponent(value: string): boolean {
+  let decoded = value;
+  for (let depth = 0; depth <= 3; depth += 1) {
+    if (!isAsciiDiagnosticString(decoded)) return true;
+    const next = decodeURIComponentSafe(decoded);
+    if (next === decoded) return false;
+    decoded = next;
+  }
+  return !isAsciiDiagnosticString(decoded);
+}
+
+function hasNonAsciiUrlComponents(url: string): boolean {
+  const trimmed = url.trim();
+  const hashIndex = trimmed.indexOf("#");
+  const beforeHash = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed;
+  const queryIndex = beforeHash.indexOf("?");
+  const beforeQuery =
+    queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash;
+  const hierarchicalScheme = /^(?:[a-z][a-z\d+.-]*:)?\/\//i.exec(beforeHash);
+
+  if (hierarchicalScheme) {
+    const remainder = beforeQuery.slice(hierarchicalScheme[0].length);
+    const authorityEnd = remainder.search(/[/?]/);
+    const authority =
+      authorityEnd < 0 ? remainder : remainder.slice(0, authorityEnd);
+    const rest = authorityEnd < 0 ? "" : remainder.slice(authorityEnd);
+    return (
+      hasNonAsciiDecodedComponent(authority) ||
+      hasNonAsciiDecodedComponent(rest)
+    );
+  }
+
+  return hasNonAsciiDecodedComponent(beforeQuery);
+}
+
+function urlTextCore(value: string): string {
+  const trailing = value.match(URL_TRAILING_PUNCT_RE)?.[0] ?? "";
+  return trailing ? value.slice(0, value.length - trailing.length) : value;
+}
+
+function hasNonAsciiDiagnosticUrlInText(value: string): boolean {
+  for (const match of value.match(URL_IN_TEXT_RE) ?? []) {
+    if (hasNonAsciiUrlComponents(urlTextCore(match))) return true;
+  }
+
+  RELATIVE_URL_IN_TEXT_RE.lastIndex = 0;
+  for (const match of value.matchAll(RELATIVE_URL_IN_TEXT_RE)) {
+    const candidate = match[2];
+    if (candidate && hasNonAsciiUrlComponents(urlTextCore(candidate))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function redactHeaders(
@@ -1994,18 +2383,26 @@ const STRUCTURED_JWT_RE =
   /eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{2,}/;
 const ENUM_LIKE_RE = /^[A-Za-z0-9_-]{1,24}$/;
 
-function compactFieldName(name: string): string {
-  return name
+function fieldNameSkeleton(name: string): string {
+  const normalized = normalizeFieldName(name)
     .replace(/([a-z])([A-Z])/g, "$1_$2")
-    .toLowerCase()
+    .toLowerCase();
+  let skeleton = "";
+  for (const character of normalized) {
+    skeleton += CONFUSABLE_FIELD_CHARACTERS.get(character) ?? character;
+  }
+  return skeleton.normalize("NFKD").replace(/\p{M}/gu, "");
+}
+
+function compactFieldName(name: string): string {
+  return fieldNameSkeleton(name)
+    .normalize("NFKD")
     .replace(/[^a-z0-9]/g, "");
 }
 
 /** Field name split into words at camelCase/snake/kebab boundaries. */
 function fieldNameWords(name: string): string[] {
-  return name
-    .replace(/([a-z])([A-Z])/g, "$1_$2")
-    .toLowerCase()
+  return fieldNameSkeleton(name)
     .split(/[^a-z0-9]+/)
     .filter(Boolean);
 }
@@ -2020,7 +2417,7 @@ function fieldNameWords(name: string): string[] {
  */
 function isApplicationDeniedName(
   name: string | undefined,
-  denyFields?: string[],
+  denyFields?: readonly string[],
 ): boolean {
   if (!name || !denyFields || denyFields.length === 0) return false;
   const compact = compactFieldName(name);
@@ -2033,34 +2430,34 @@ function isApplicationDeniedName(
 /**
  * Built-in name tokens that name a business OBJECT rather than a secret.
  *
- * The rest of `STRUCTURED_DENY_NAME_TOKENS` name the sensitive thing itself: everything under a key
- * called `auth`, `password`, `secret`, `cvv` or `ssn` is that secret, so dropping the whole subtree
- * loses nothing. These two do not. A gift card, a loyalty card, a customer account are ordinary
- * records that may merely CONTAIN a sensitive scalar, and their other fields are often the whole
- * subject of a bug report.
- *
- * Kept deliberately short. Every addition trades a real class of evidence for a name-shaped guess,
- * so a token belongs here only once a measured capture shows the guess destroying the answer.
+ * `card` and `account` also occur in ordinary compound containers such as
+ * `giftCard`, `customerAccount`, and `accountingPeriod`. Those containers are
+ * useful diagnostic structure, so the object token alone must not close them.
+ * Compound exceptions are deliberately allowlisted. A broad substring rule
+ * would open names such as `cardSecurityCode` and `accountPassphrase`.
  */
-const STRUCTURED_OPENABLE_NAME_TOKENS = new Set(["card", "account"]);
+const STRUCTURED_OPENABLE_CONTAINER_TOKENS = new Set(["card", "account"]);
+const STRUCTURED_OPENABLE_COMPOUND_CONTAINER_NAMES = new Set([
+  "giftcard",
+  "customeraccount",
+  "accountingperiod",
+]);
 
 /**
- * May a CONTAINER under this name be walked into rather than dropped whole?
+ * May a container under this name be walked into rather than dropped whole?
  *
- * True only when every built-in token the name matched is an object-naming one. `cardToken` matches
- * both `card` and `token`, so it stays closed; `giftCard` matches only `card`, so its leaves are
- * classified individually. Names the application itself denied never reach here.
+ * Only exact names in the ordinary-container allowlist are opened. This
+ * preserves the known business containers while keeping every other compound
+ * value or credential name closed. The caller still applies application
+ * denyFields absolutely.
  */
 function isOpenableHeuristicName(name: string | undefined): boolean {
   if (!name) return false;
-  if (fieldNameWords(name).some((word) => STRUCTURED_DENY_WORD_RE.test(word)))
-    return false;
   const compact = compactFieldName(name);
-  const matched = STRUCTURED_DENY_NAME_TOKENS.filter((token) =>
-    compact.includes(token),
+  return (
+    STRUCTURED_OPENABLE_CONTAINER_TOKENS.has(compact) ||
+    STRUCTURED_OPENABLE_COMPOUND_CONTAINER_NAMES.has(compact)
   );
-  if (matched.length === 0) return false;
-  return matched.every((token) => STRUCTURED_OPENABLE_NAME_TOKENS.has(token));
 }
 
 function isStructuredDenyName(
@@ -2403,6 +2800,535 @@ export function classifyStructuredValue(
   return { action: "redact", reason: "free_text_value" };
 }
 
+type DiagnosticPathPart =
+  { kind: "key"; value: string } | { kind: "index"; value: number };
+
+interface DiagnosticPathNode {
+  terminal: boolean;
+  keys: Map<string, DiagnosticPathNode>;
+  indexes: Map<number, DiagnosticPathNode>;
+}
+
+const DIAGNOSTIC_PATH_MAX_LENGTH = 256;
+const DIAGNOSTIC_RESERVED_KEYS = new Set([
+  "__proto__",
+  "prototype",
+  "constructor",
+  "body",
+  "requestbody",
+  "responsebody",
+  "header",
+  "headers",
+  "rawbody",
+  "rawheaders",
+  "rawstack",
+  "stack",
+  "locals",
+]);
+const DIAGNOSTIC_KEY_RE = /^(?:[$_]|\p{ID_Start})(?:[$\p{ID_Continue}-])*$/u;
+const DIAGNOSTIC_INDEX_RE = /^(?:0|[1-9][0-9]?)$/;
+
+function newDiagnosticPathNode(): DiagnosticPathNode {
+  return { terminal: false, keys: new Map(), indexes: new Map() };
+}
+
+function parseDiagnosticFieldPath(
+  path: string,
+): DiagnosticPathPart[] | undefined {
+  if (
+    path.length === 0 ||
+    path.length > DIAGNOSTIC_PATH_MAX_LENGTH ||
+    path.trim() !== path
+  ) {
+    return undefined;
+  }
+
+  const parts: DiagnosticPathPart[] = [];
+  let offset = 0;
+  const readKey = (): boolean => {
+    const start = offset;
+    while (
+      offset < path.length &&
+      path[offset] !== "." &&
+      path[offset] !== "["
+    ) {
+      offset += 1;
+    }
+    const key = path.slice(start, offset);
+    if (!DIAGNOSTIC_KEY_RE.test(key)) return false;
+    parts.push({ kind: "key", value: key });
+    return true;
+  };
+  const readIndex = (): boolean => {
+    const start = offset;
+    const closing = path.indexOf("]", offset);
+    if (closing < 0) return false;
+    const index = path.slice(start, closing);
+    if (!DIAGNOSTIC_INDEX_RE.test(index)) return false;
+    const numericIndex = Number(index);
+    if (numericIndex >= DIAGNOSTIC_INDEX_MAX) return false;
+    parts.push({ kind: "index", value: numericIndex });
+    offset = closing + 1;
+    return true;
+  };
+
+  if (path[0] === "[") {
+    offset = 1;
+    if (!readIndex()) return undefined;
+  } else if (!readKey()) {
+    return undefined;
+  }
+
+  while (offset < path.length) {
+    if (path[offset] === ".") {
+      offset += 1;
+      if (!readKey()) return undefined;
+      continue;
+    }
+    if (path[offset] === "[") {
+      offset += 1;
+      if (!readIndex()) return undefined;
+      continue;
+    }
+    return undefined;
+  }
+  return parts;
+}
+
+function isDiagnosticReservedKey(key: string): boolean {
+  const compact = compactFieldName(key);
+  return (
+    DIAGNOSTIC_RESERVED_KEYS.has(key.toLowerCase()) ||
+    DIAGNOSTIC_RESERVED_KEYS.has(compact) ||
+    compact.startsWith("raw") ||
+    compact.includes("body") ||
+    compact.includes("header") ||
+    compact.includes("stack") ||
+    compact.includes("local")
+  );
+}
+
+function compileDiagnosticFieldPaths(
+  paths: readonly string[],
+  denyFields: readonly string[] | undefined,
+): DiagnosticPathNode {
+  const root = newDiagnosticPathNode();
+  const normalized = new Map<string, DiagnosticPathPart[]>();
+
+  const pathCount = Number.isSafeInteger(paths.length)
+    ? Math.min(Math.max(paths.length, 0), DIAGNOSTIC_FIELD_MAX_PATHS)
+    : 0;
+  for (let index = 0; index < pathCount; index += 1) {
+    let candidate: unknown;
+    try {
+      candidate = paths[index];
+    } catch {
+      continue;
+    }
+    if (typeof candidate !== "string") continue;
+    const parsed = parseDiagnosticFieldPath(candidate);
+    if (!parsed || parsed.length === 0) continue;
+    if (
+      parsed.some(
+        (part) =>
+          part.kind === "key" &&
+          !isDiagnosticPathKeyAllowed(part.value, denyFields),
+      )
+    ) {
+      continue;
+    }
+    normalized.set(candidate, parsed);
+  }
+
+  for (const [, parts] of [...normalized.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .slice(0, DIAGNOSTIC_FIELD_MAX_ENTRIES)) {
+    let node = root;
+    for (const part of parts) {
+      let child =
+        part.kind === "key"
+          ? node.keys.get(part.value)
+          : node.indexes.get(part.value);
+      if (!child) {
+        child = newDiagnosticPathNode();
+        if (part.kind === "key") {
+          node.keys.set(part.value, child);
+        } else {
+          node.indexes.set(part.value, child);
+        }
+      }
+      node = child;
+    }
+    node.terminal = true;
+  }
+  return root;
+}
+
+/**
+ * Keep diagnostic traversal aligned with structured redaction. Sensitive
+ * containers are closed, while ordinary card and account object containers
+ * remain traversable so their individual leaves can be classified.
+ */
+function isDiagnosticPathKeyAllowed(
+  key: string,
+  denyFields: readonly string[] | undefined,
+): boolean {
+  if (isDiagnosticReservedKey(key)) return false;
+  // Match structured JSON key handling. A selected path may name an own
+  // property, but a token-shaped property name is itself sensitive and must
+  // not reach the output or redaction metadata.
+  if (sanitizeKeyName(key) !== key) return false;
+  if (isApplicationDeniedName(key, denyFields)) return false;
+  return true;
+}
+
+function diagnosticPathForPart(path: string, part: DiagnosticPathPart): string {
+  return part.kind === "key"
+    ? `${path}.${part.value}`
+    : `${path}[${part.value}]`;
+}
+
+function safeDiagnosticObject(): Record<string, unknown> {
+  return Object.create(null) as Record<string, unknown>;
+}
+
+function readOwnDiagnosticValue(
+  value: object,
+  key: string,
+): { found: true; value: unknown } | { found: false } {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    // Accessors can execute arbitrary code and are not stable telemetry input.
+    // Only own, enumerable data properties are eligible.
+    if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+      return { found: false };
+    }
+    return { found: true, value: descriptor.value };
+  } catch {
+    // A revoked or hostile proxy is not a reason to break the host's capture.
+    return { found: false };
+  }
+}
+
+function diagnosticLeafValue(
+  value: unknown,
+  keyName: string | undefined,
+  path: string,
+  fields: RedactionField[],
+  denyFields: readonly string[] | undefined,
+  container: StructuredContainerContext,
+): DiagnosticScalar | undefined {
+  if (isStructuredContainerNumber(keyName, container)) {
+    fields.push({
+      path,
+      reason: "sensitive_container_number",
+      action: "redacted",
+    });
+    return undefined;
+  }
+
+  if (isSensitiveShortNumericValue(value, keyName)) {
+    fields.push({
+      path,
+      reason: "sensitive_short_numeric_field",
+      action: "redacted",
+    });
+    return undefined;
+  }
+
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    fields.push({ path, reason: "diagnostic_non_finite", action: "redacted" });
+    return undefined;
+  }
+
+  if (
+    typeof value === "string" &&
+    value.length > DIAGNOSTIC_FIELD_MAX_STRING_LENGTH
+  ) {
+    fields.push({
+      path,
+      reason: "diagnostic_value_too_large",
+      action: "redacted",
+    });
+    return undefined;
+  }
+
+  let candidate = value;
+  if (typeof value === "string") {
+    const rawLooksLikeWholeUrl = isUrlLikeValue(value);
+    const rawHasNonAsciiUrlComponent = rawLooksLikeWholeUrl
+      ? hasNonAsciiUrlComponents(value)
+      : hasNonAsciiDiagnosticUrlInText(value);
+
+    let normalized: string;
+    try {
+      normalized = value.normalize("NFKC");
+    } catch {
+      fields.push({
+        path,
+        reason: "diagnostic_value_normalization_failed",
+        action: "redacted",
+      });
+      return undefined;
+    }
+    if (normalized.length > DIAGNOSTIC_FIELD_MAX_STRING_LENGTH) {
+      fields.push({
+        path,
+        reason: "diagnostic_value_too_large",
+        action: "redacted",
+      });
+      return undefined;
+    }
+
+    const normalizedLooksLikeWholeUrl = isUrlLikeValue(normalized);
+    if (
+      rawHasNonAsciiUrlComponent ||
+      (normalizedLooksLikeWholeUrl && !isAsciiDiagnosticString(value))
+    ) {
+      fields.push({
+        path,
+        reason: "diagnostic_non_ascii_url_component",
+        action: "dropped",
+      });
+      return undefined;
+    }
+
+    const urlOptions: UrlRedactionOptions = {
+      ignoreKeepFields: true,
+      allowOnlyHttpSchemes: true,
+      allowRelativeUrlsInText: true,
+    };
+    const looksLikeWholeUrl = normalizedLooksLikeWholeUrl;
+    const urlResult = looksLikeWholeUrl
+      ? redactUrl(normalized, path, urlOptions)
+      : redactUrlsInText(normalized, path, urlOptions);
+    const urlValue = urlResult.value;
+    candidate = urlValue;
+    if (urlResult.metadata) fields.push(...urlResult.metadata.fields);
+    if (urlValue.length > DIAGNOSTIC_FIELD_MAX_STRING_LENGTH) {
+      fields.push({
+        path,
+        reason: "diagnostic_value_too_large",
+        action: "redacted",
+      });
+      return undefined;
+    }
+    if (!isAsciiDiagnosticString(urlValue)) {
+      fields.push({
+        path,
+        reason: "diagnostic_non_ascii_value",
+        action: "redacted",
+      });
+      return undefined;
+    }
+  }
+
+  const classification = classifyStructuredValue(
+    candidate,
+    keyName,
+    denyFields ? [...denyFields] : undefined,
+    undefined,
+  );
+  if (
+    classification.action === "redact" &&
+    classification.reason !== "free_text_value"
+  ) {
+    fields.push({
+      path,
+      reason: classification.reason,
+      action: "redacted",
+    });
+    return undefined;
+  }
+
+  if (
+    candidate === null ||
+    typeof candidate === "string" ||
+    typeof candidate === "number" ||
+    typeof candidate === "boolean"
+  ) {
+    return candidate;
+  }
+
+  fields.push({ path, reason: "diagnostic_non_scalar", action: "redacted" });
+  return undefined;
+}
+
+function collectDiagnosticFields(
+  node: DiagnosticPathNode,
+  value: unknown,
+  path: string,
+  keyName: string | undefined,
+  fields: RedactionField[],
+  denyFields: readonly string[] | undefined,
+  seen: WeakSet<object>,
+  inheritedContainer: StructuredContainerContext,
+): unknown {
+  const container = structuredContainerContext(keyName, inheritedContainer);
+  const isObject = value !== null && typeof value === "object";
+  if (!isObject) {
+    if (!node.terminal) return undefined;
+    return diagnosticLeafValue(
+      value,
+      keyName,
+      path,
+      fields,
+      denyFields,
+      container,
+    );
+  }
+  if (seen.has(value)) {
+    fields.push({ path, reason: "diagnostic_circular", action: "redacted" });
+    return undefined;
+  }
+  seen.add(value);
+
+  try {
+    if (
+      isStructuredDenyName(keyName, denyFields ? [...denyFields] : undefined)
+    ) {
+      const openable =
+        !isApplicationDeniedName(keyName, denyFields) &&
+        isOpenableHeuristicName(keyName);
+      if (!openable) {
+        fields.push({ path, reason: "deny_field", action: "redacted" });
+        return undefined;
+      }
+    }
+
+    if (node.terminal && node.keys.size === 0 && node.indexes.size === 0) {
+      fields.push({
+        path,
+        reason: "diagnostic_non_scalar",
+        action: "redacted",
+      });
+      return undefined;
+    }
+
+    let isArray: boolean;
+    try {
+      isArray = Array.isArray(value);
+    } catch {
+      fields.push({
+        path,
+        reason: "diagnostic_unreadable_value",
+        action: "dropped",
+      });
+      return undefined;
+    }
+    const output = isArray ? [] : safeDiagnosticObject();
+    let retained = 0;
+
+    const append = (part: DiagnosticPathPart, child: DiagnosticPathNode) => {
+      if (retained >= DIAGNOSTIC_FIELD_MAX_ENTRIES) return;
+      if (isArray && part.kind !== "index") return;
+      if (!isArray && part.kind !== "key") return;
+      const key = part.kind === "key" ? part.value : String(part.value);
+      const own = readOwnDiagnosticValue(value, key);
+      if (!own.found) return;
+      const childValue = collectDiagnosticFields(
+        child,
+        own.value,
+        diagnosticPathForPart(path, part),
+        part.kind === "key" ? part.value : keyName,
+        fields,
+        denyFields,
+        seen,
+        container,
+      );
+      if (childValue === undefined) return;
+      if (part.kind === "index") {
+        (output as unknown[])[part.value] = childValue;
+      } else {
+        Object.defineProperty(output, key, {
+          configurable: true,
+          enumerable: true,
+          value: childValue,
+
+          writable: true,
+        });
+      }
+      retained += 1;
+    };
+
+    for (const [key, child] of [...node.keys.entries()].sort(([a], [b]) =>
+      a.localeCompare(b),
+    )) {
+      append({ kind: "key", value: key }, child);
+    }
+    for (const [index, child] of [...node.indexes.entries()].sort(
+      ([a], [b]) => a - b,
+    )) {
+      append({ kind: "index", value: index }, child);
+    }
+
+    if (retained === 0) return undefined;
+    return output;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+/**
+ * Selects explicitly named scalar diagnostics from an arbitrary object.
+ *
+ * This is a narrow opt-in for support evidence, not a general serializer. It
+ * never follows unselected fields, inherited properties, accessors, or
+ * prototype-like keys. Sensitive names and value patterns are still denied,
+ * selected containers are traversed only to reach another selected path, and
+ * oversized strings and non-scalars are dropped.
+ */
+export function redactDiagnosticFields(
+  value: unknown,
+  options: DiagnosticFieldRedactionOptions,
+): RedactionResult<DiagnosticFieldsValue> {
+  const fields: RedactionField[] = [];
+  let output: unknown;
+  let path = "diagnosticFields";
+  try {
+    path = typeof options.path === "string" ? options.path : path;
+    const root = compileDiagnosticFieldPaths(
+      options.diagnosticFields,
+      options.denyFields,
+    );
+    output = collectDiagnosticFields(
+      root,
+      value,
+      path,
+      undefined,
+      fields,
+      options.denyFields,
+      new WeakSet<object>(),
+      undefined,
+    );
+  } catch {
+    fields.push({
+      path,
+      reason: "diagnostic_selection_failed",
+      action: "dropped",
+    });
+    output = undefined;
+  }
+  return {
+    value: (output ?? safeDiagnosticObject()) as DiagnosticFieldsValue,
+    ...(fields.length > 0
+      ? {
+          metadata: {
+            policy: BROWSER_REDACTION_POLICY_V2,
+            fields,
+          },
+        }
+      : {}),
+  };
+}
+
+function isAsciiDiagnosticString(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) > 0x7f) return false;
+  }
+  return true;
+}
+
 /**
  * The application's keep list, for the redaction paths that have no config in
  * hand.
@@ -2537,8 +3463,7 @@ function isRedactedPlaceholder(value: unknown): boolean {
           typeof separatorIndex !== "number" ||
           !Number.isInteger(separatorIndex) ||
           separatorIndex < 0 ||
-          (typeof record.len === "number" &&
-            separatorIndex >= record.len) ||
+          (typeof record.len === "number" && separatorIndex >= record.len) ||
           (separatorChar !== "." &&
             separatorChar !== "," &&
             separatorChar !== " ")
@@ -2552,36 +3477,119 @@ function isRedactedPlaceholder(value: unknown): boolean {
   return true;
 }
 
+type StructuredContainerContext = "card" | "account" | undefined;
+
+const STRUCTURED_CONTAINER_NUMBER_NAMES = new Set([
+  "accountnumber",
+  "cardnumber",
+  "num",
+  "number",
+  "pan",
+  "primaryaccountnumber",
+]);
+
+function structuredContainerContext(
+  keyName: string | undefined,
+  inherited: StructuredContainerContext,
+): StructuredContainerContext {
+  if (!keyName) return inherited;
+  const compact = compactFieldName(keyName);
+  if (compact === "card" || compact === "account") return compact;
+  if (!isOpenableHeuristicName(keyName)) return inherited;
+  if (compact.includes("card")) return "card";
+  if (compact.includes("account")) return "account";
+  return inherited;
+}
+
+/**
+ * Protect number-bearing leaves inside the two intentionally traversable
+ * containers without closing their ordinary business fields. These explicit
+ * number field names are credentials by schema. An `id` remains ordinary
+ * business evidence because its value alone cannot say whether it is a card or
+ * account number.
+ */
+function isStructuredContainerNumber(
+  keyName: string | undefined,
+  container: StructuredContainerContext,
+): boolean {
+  if (!container || keyName === undefined) return false;
+  const compact = compactFieldName(keyName);
+  if (STRUCTURED_CONTAINER_NUMBER_NAMES.has(compact)) return true;
+  return false;
+}
+
+function redactStructuredStringValue(
+  value: string,
+  path: string,
+  keyName: string | undefined,
+  policy: StructuredFieldPolicy,
+  fields: RedactionField[],
+): unknown {
+  const urlOptions: UrlRedactionOptions = {
+    ignoreKeepFields: true,
+    allowOnlyHttpSchemes: true,
+    allowRelativeUrlsInText: true,
+  };
+  const looksLikeWholeUrl = isUrlLikeValue(value);
+  const urlResult = looksLikeWholeUrl
+    ? redactUrl(value, path, urlOptions)
+    : redactUrlsInText(value, path, urlOptions);
+  if (urlResult.metadata) fields.push(...urlResult.metadata.fields);
+
+  const classificationValue = looksLikeWholeUrl
+    ? "url"
+    : maskUrlsForClassification(value);
+  const classification = classifyStructuredValue(
+    classificationValue,
+    keyName,
+    policy.denyFields,
+    policy.keepFields,
+  );
+  if (classification.action === "keep") return urlResult.value;
+  fields.push({ path, reason: classification.reason, action: "redacted" });
+  return redactedShapePlaceholder(value);
+}
+
+function maskUrlsForClassification(value: string): string {
+  let masked = value.replace(URL_IN_TEXT_RE, "url");
+  RELATIVE_URL_IN_TEXT_RE.lastIndex = 0;
+  masked = masked.replace(
+    RELATIVE_URL_IN_TEXT_RE,
+    (_match, prefix: string) => `${prefix}url`,
+  );
+  return masked;
+}
+
 function redactStructuredJsonValue(
   value: unknown,
   path: string,
   policy: StructuredFieldPolicy,
   fields: RedactionField[],
   keyName?: string,
+  inheritedContainer?: StructuredContainerContext,
 ): unknown {
   // Already redacted by an earlier pass. Re-wrapping it would replace the
   // original value's shape facts with the placeholder's own.
   if (isRedactedPlaceholder(value)) return value;
-  // A deny-listed field name redacts its entire subtree, with one narrow exception: a CONTAINER
-  // matched only by an object-naming built-in token is walked into instead.
-  //
-  // The built-in name tokens are substrings, and `card` is one of them. A gift-card object, a
-  // loyalty-card object, a card-layout config: all match, and all had their whole contents replaced
-  // by a shape placeholder because of the key they hang from. Measured on a real session, the
-  // response that decided the defect rendered as `{[REDACTED_KEY]:[REDACTED]}` while the sibling
-  // `/history` endpoint reported the identical number in the clear — it simply was not nested under
-  // a key spelled `card`. The redaction was not protecting anything there; it was deleting the
-  // answer.
-  //
-  // Opening the container costs no protection, because a name is not the only defence and never was:
-  // every leaf is still classified by its OWN name and, behind that, by its VALUE. A real PAN at
-  // `card.number` is caught by the Luhn digit-run check; a token, JWT, email or high-entropy secret
-  // by their own value rules. That is the same reasoning the `keepFields` escape hatch already
-  // relies on — see `isStructuredDenyName`, which documents that every value-based check still runs
-  // behind a kept name.
-  //
-  // An application's own `denyFields` keeps the old absolute behaviour. When the app says a subtree
-  // is sensitive, that is a statement about its data that no heuristic here can outrank.
+  const container = structuredContainerContext(keyName, inheritedContainer);
+  if (isStructuredContainerNumber(keyName, container)) {
+    fields.push({
+      path,
+      reason: "sensitive_container_number",
+      action: "redacted",
+    });
+    return redactedShapePlaceholder(value);
+  }
+  if (isSensitiveShortNumericValue(value, keyName)) {
+    fields.push({
+      path,
+      reason: "sensitive_short_numeric_field",
+      action: "redacted",
+    });
+    return redactedShapePlaceholder(value);
+  }
+  // A deny-listed field name redacts its entire subtree, except for the exact
+  // known object container names handled by isOpenableHeuristicName.
   const isContainer =
     Array.isArray(value) || (value !== null && typeof value === "object");
   if (isStructuredDenyName(keyName, policy.denyFields, policy.keepFields)) {
@@ -2605,6 +3613,7 @@ function redactStructuredJsonValue(
         policy,
         fields,
         keyName,
+        container,
       ),
     );
   }
@@ -2621,19 +3630,33 @@ function redactStructuredJsonValue(
           reason: "json_key_token_like",
           action: "redacted",
         });
-        output[safeKey] = redactedShapePlaceholder(entry);
+        Object.defineProperty(output, safeKey, {
+          configurable: true,
+          enumerable: true,
+          value: redactedShapePlaceholder(entry),
+          writable: true,
+        });
         continue;
       }
-      output[safeKey] = redactStructuredJsonValue(
-        entry,
-        `${path}.${safeKey}`,
-        policy,
-        fields,
-        key,
-      );
+      Object.defineProperty(output, safeKey, {
+        configurable: true,
+        enumerable: true,
+        value: redactStructuredJsonValue(
+          entry,
+          `${path}.${safeKey}`,
+          policy,
+          fields,
+          normalizeFieldName(key),
+          container,
+        ),
+        writable: true,
+      });
     }
     return output;
   }
+
+  if (typeof value === "string")
+    return redactStructuredStringValue(value, path, keyName, policy, fields);
 
   const classification = classifyStructuredValue(
     value,

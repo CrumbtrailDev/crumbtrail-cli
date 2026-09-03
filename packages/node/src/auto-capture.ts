@@ -212,6 +212,8 @@ export interface AutoCaptureOptions {
   captureLogs?: boolean;
   /** Lowest log level captured. Defaults to `warn`. */
   logLevel?: BackendLogLevel;
+  /** Explicit dotted/indexed paths selected from structured log context. */
+  diagnosticFields?: readonly string[];
   /** Streams and `fs` the log capture patches (tests). Defaults to the process's. */
   logStreams?: Pick<
     BackendLogCaptureOptions,
@@ -1287,6 +1289,7 @@ export async function autoCapture(
       logCapture = installBackendLogCapture({
         sessionId: stableSessionId,
         minLevel: options.logLevel,
+        diagnosticFields: options.diagnosticFields,
         ...options.logStreams,
         emit: (event) => {
           if (stopped) return;

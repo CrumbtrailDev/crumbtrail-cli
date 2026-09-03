@@ -206,6 +206,7 @@ export type {
   BackendLogCaptureOptions,
   BackendLogLevel,
   ParsedStructuredLog,
+  StructuredLogParseOptions,
 } from "./backend-logs";
 
 // ── Inbound HTTP request capture ─────────────────────────────────────────────

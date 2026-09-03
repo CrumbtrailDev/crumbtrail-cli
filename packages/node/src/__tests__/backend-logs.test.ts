@@ -92,6 +92,36 @@ describe("parseStructuredLogLine", () => {
     expect(parseStructuredLogLine('{"msg":"hello"}')).toBeUndefined();
     expect(parseStructuredLogLine("[1,2,3]")).toBeUndefined();
   });
+
+  it("selects exact nested diagnostic paths while excluding logger internals and raw surfaces", () => {
+    const parsed = parseStructuredLogLine(
+      JSON.stringify({
+        level: 50,
+        msg: "request failed",
+        context: {
+          status: "failed",
+          attempts: [{ code: "E_TIMEOUT" }],
+        },
+        headers: { "content-type": "application/json" },
+        stack: "must not retain",
+      }),
+      {
+        diagnosticFields: [
+          "context.status",
+          "context.attempts[0].code",
+          "headers.content-type",
+          "stack",
+        ],
+      },
+    );
+
+    expect(parsed?.fields).toEqual({
+      context: {
+        attempts: [{ code: "E_TIMEOUT" }],
+        status: "failed",
+      },
+    });
+  });
 });
 
 describe("buildBackendLogEvent", () => {
@@ -132,6 +162,37 @@ describe("buildBackendLogEvent", () => {
 });
 
 describe("installBackendLogCapture", () => {
+  it("applies the diagnostic allowlist to captured structured log context", () => {
+    const stdout = fakeStream();
+    const events: BugEvent[] = [];
+    const handle = installBackendLogCapture({
+      emit: (event) => events.push(event),
+      stdout,
+      stderr: fakeStream(),
+      diagnosticFields: ["context.status", "context.attempts[0].code"],
+    });
+
+    stdout.write(
+      `${JSON.stringify({
+        level: 50,
+        msg: "request failed",
+        context: {
+          status: "failed",
+          attempts: [{ code: "E_TIMEOUT", ignored: "not selected" }],
+        },
+        headers: { authorization: "must not retain" },
+      })}\n`,
+    );
+    handle.stop();
+
+    expect(events).toHaveLength(1);
+    expect(events[0].d.fields).toEqual({
+      context: { attempts: [{ code: "E_TIMEOUT" }], status: "failed" },
+    });
+    expect(JSON.stringify(events)).not.toContain("not selected");
+    expect(JSON.stringify(events)).not.toContain("must not retain");
+  });
+
   it("captures a pino error written straight to stdout, with the app unchanged", () => {
     const stdout = fakeStream();
     const stderr = fakeStream();

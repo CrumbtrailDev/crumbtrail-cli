@@ -854,12 +854,20 @@ export interface CrumbtrailConfig {
    *   anything reads it. Set `false` to opt out entirely: every input value
    *   becomes a placeholder regardless of the field, and `keepFields` cannot
    *   bring one back. Nothing else about redaction changes.
+   * - `diagnosticFields`: an explicit path allowlist for declared feature-flag
+   *   and runtime-config diagnostics. Paths are relative to each map and use
+   *   dot properties or numeric indexes such as `checkout.status` and
+   *   `attempts[0].code`. Only selected scalar values are considered, with
+   *   the shared sensitive-name and value-pattern rules still winning. The
+   *   list does not widen request/response body, header, stack, or local
+   *   capture, and `keepFields` and `mode` do not widen it either.
    */
   redaction?: {
     mode?: "structured" | "full";
     denyFields?: string[];
     keepFields?: string[];
     captureInputValues?: boolean;
+    diagnosticFields?: string[];
   };
 
   // Interaction

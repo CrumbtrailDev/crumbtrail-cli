@@ -283,6 +283,7 @@ The Fetch and Node wrappers share these options.
 | `authToken` | `string` | Omitted | Sent as `X-Crumbtrail-Auth` when set. Available only with `endpoint`. |
 | `service` | `string` | Omitted | Added to metadata when the wrapper creates a fresh session. |
 | `metadata` | `Readonly<Record<string, unknown>>` | Omitted | Adds bounded scalar metadata to lifecycle events. |
+| `diagnosticFields` | `readonly string[]` | Omitted | Exact dotted or indexed paths selected from metadata. Unselected values are omitted. |
 | `onError` | `(error, context) => void` | `console.error` | Receives configuration and delivery failures with their phase and session ID. |
 | `requestTimeoutMs` | `number` | `10000` | Sets the deadline for each Crumbtrail HTTP request. A value less than or equal to zero disables the wrapper deadline. |
 | `transport` | `ServerlessInvocationTransport` | Omitted | Replaces HTTP delivery. It must provide `startSession`, `capture`, and `endSession`. `flush` is optional. Do not combine it with `endpoint`. |
@@ -332,6 +333,33 @@ Numbers must be finite. Error names are limited to 120 characters, messages to
 
 Request and response bodies are excluded by default, including metadata fields
 named as bodies.
+
+Set `diagnosticFields` when metadata contains nested support diagnostics that
+should be retained:
+
+```ts
+withCrumbtrailFetch(handler, {
+  endpoint: "https://api.crumbtrail.ai",
+  metadata: {
+    checkout: { status: "failed" },
+    attempts: [{ code: "E_TIMEOUT" }],
+    headers: { "content-type": "application/json" },
+  },
+  diagnosticFields: ["checkout.status", "attempts[0].code", "headers.content-type"],
+});
+```
+
+The example emits `checkout.status` and `attempts[0].code` as scalar metadata
+keys. The header path is rejected. Diagnostic paths are exact, have no
+wildcards, and only the first 64 configured paths are parsed. Up to 16 selected
+values are retained, array indexes must be between 0 and 63, and strings are
+limited to 256 characters. Sensitive names, token, card, password, email, and
+other secret patterns still win. Selected strings are normalized with Unicode
+NFKC before classification. Values that remain non-ASCII are omitted, and whole
+or embedded URLs go through `redactUrl`; only HTTP(S), scheme-relative, and
+relative URLs can retain their non-secret parts. Bodies, headers, stacks, locals,
+inherited properties, accessors, cycles, and non-scalars are never retained.
+Without `diagnosticFields`, existing metadata redaction is unchanged.
 
 Routes, metadata strings, and error fields pass through the shared credential
 and URL redaction policy before delivery. Correlation headers identify related

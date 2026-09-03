@@ -10,6 +10,7 @@ import type {
 } from "../types";
 import {
   redactCampaignParams,
+  redactDiagnosticFields,
   redactUrl,
   redactValue,
   type RedactionMetadata,
@@ -34,6 +35,8 @@ export function environmentCollector(
   const declared = context.getDeclaredEnv?.() ?? {};
   const snapshot = buildEnvSnapshot(declared.flags, declared.config, {
     campaign: config.campaign,
+    diagnosticFields: config.redaction?.diagnosticFields,
+    denyFields: config.redaction?.denyFields,
   });
 
   bus.emit({
@@ -53,6 +56,13 @@ export interface EnvSnapshotOptions {
    * turned `campaign` on, so a two-argument call captures nothing extra.
    */
   campaign?: boolean;
+  /**
+   * Explicit diagnostic paths applied independently to declared `flags` and
+   * `config` maps. When present, unselected values are omitted.
+   */
+  diagnosticFields?: readonly string[];
+  /** Extra name deny rules applied to selected diagnostic fields. */
+  denyFields?: readonly string[];
 }
 
 /** Builds the redaction-aware snapshot payload. Exported for direct unit testing. */
@@ -113,7 +123,7 @@ export function buildEnvSnapshot(
   if (hardwareConcurrency !== undefined)
     snapshot.hardwareConcurrency = hardwareConcurrency;
 
-  applyDeclaredEnv(snapshot, flags, config);
+  applyDeclaredEnv(snapshot, flags, config, options);
 
   return snapshot;
 }
@@ -195,9 +205,10 @@ function safeAppBuild(): string | undefined {
 export function buildEnvDelta(
   flags?: Record<string, unknown>,
   config?: Record<string, unknown>,
+  options?: Pick<EnvSnapshotOptions, "diagnosticFields" | "denyFields">,
 ): EnvSnapshot {
   const delta: EnvSnapshot = { kind: "delta" };
-  applyDeclaredEnv(delta, flags, config);
+  applyDeclaredEnv(delta, flags, config, options);
   return delta;
 }
 
@@ -205,23 +216,52 @@ function applyDeclaredEnv(
   target: EnvSnapshot,
   flags?: Record<string, unknown>,
   config?: Record<string, unknown>,
+  options?: Pick<EnvSnapshotOptions, "diagnosticFields" | "denyFields">,
 ): void {
   const metadataItems: RedactionMetadata[] = [];
 
-  if (flags && Object.keys(flags).length > 0) {
-    const result = redactValue(flags, "env.flags");
-    target.flags = result.value;
+  if (
+    flags &&
+    (options?.diagnosticFields !== undefined || hasEnumerableKeys(flags))
+  ) {
+    const result =
+      options?.diagnosticFields !== undefined
+        ? redactDiagnosticFields(flags, {
+            diagnosticFields: options.diagnosticFields,
+            ...(options.denyFields ? { denyFields: options.denyFields } : {}),
+            path: "env.flags",
+          })
+        : redactValue(flags, "env.flags");
+    target.flags = result.value as Record<string, unknown>;
     if (result.metadata) metadataItems.push(result.metadata);
   }
 
-  if (config && Object.keys(config).length > 0) {
-    const result = redactValue(config, "env.config");
-    target.config = result.value;
+  if (
+    config &&
+    (options?.diagnosticFields !== undefined || hasEnumerableKeys(config))
+  ) {
+    const result =
+      options?.diagnosticFields !== undefined
+        ? redactDiagnosticFields(config, {
+            diagnosticFields: options.diagnosticFields,
+            ...(options.denyFields ? { denyFields: options.denyFields } : {}),
+            path: "env.config",
+          })
+        : redactValue(config, "env.config");
+    target.config = result.value as Record<string, unknown>;
     if (result.metadata) metadataItems.push(result.metadata);
   }
 
   if (metadataItems.length > 0) {
     addRedactionMetadata(target, mergeMetadata(metadataItems));
+  }
+}
+
+function hasEnumerableKeys(value: Record<string, unknown>): boolean {
+  try {
+    return Object.keys(value).length > 0;
+  } catch {
+    return false;
   }
 }
 

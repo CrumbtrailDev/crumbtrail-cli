@@ -396,6 +396,28 @@ high-severity candidate carrying the logged stack, collapsed by content so an
 upstream outage logged once per request reads as one finding. Disable with
 `captureLogs: false`.
 
+To retain a small set of support-relevant fields from structured log context,
+pass an exact path allowlist. This applies to log context only:
+
+```ts
+autoCapture({
+  endpoint: "https://api.crumbtrail.ai",
+  diagnosticFields: ["context.status", "attempts[0].code"],
+});
+```
+
+The same option is available on the Express middleware and on
+`installBackendLogCapture`. It retains only selected scalar values. The first
+64 configured paths are parsed, at most 16 leaves are retained, array indexes
+must be between 0 and 63, and strings are capped at 256 characters. Selected
+strings are normalized with Unicode NFKC before classification. Values that
+remain non-ASCII are omitted. Whole or embedded URLs use the diagnostic URL
+policy, which ignores `keepFields` and redacts unsafe schemes. Sensitive names
+and token, card, password, email, and other secret patterns still redact.
+Wildcards, bodies, headers, stacks, locals, inherited properties, accessors,
+cycles, and non-scalars are excluded. Omit the option to keep the existing log
+redaction behavior. It does not change `keepFields` or response-body capture.
+
 ### Runtime warnings
 
 The Express middleware (like `autoCapture` before it) subscribes to `process.on("warning")` and

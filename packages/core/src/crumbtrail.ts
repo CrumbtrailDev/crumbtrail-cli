@@ -89,6 +89,7 @@ import {
   attachRedactionMetadata,
   mergeRedactionMetadata,
   REDACTED_VALUE,
+  redactDiagnosticFields,
   redactNetworkTextBody,
   redactUrl,
   redactValue,
@@ -942,6 +943,10 @@ export class Crumbtrail {
       const flagSnapshot = buildEnvDelta(
         this.declaredFlags,
         this.declaredConfig,
+        {
+          diagnosticFields: this.config.redaction?.diagnosticFields,
+          denyFields: this.config.redaction?.denyFields,
+        },
       );
       flagSnapshot.kind = "flag-snapshot";
       this.bus.emit(
@@ -2166,6 +2171,10 @@ export class Crumbtrail {
     const delta = buildEnvDelta(
       pickKeys(this.declaredFlags, changedFlagKeys),
       pickKeys(this.declaredConfig, changedConfigKeys),
+      {
+        diagnosticFields: this.config.redaction?.diagnosticFields,
+        denyFields: this.config.redaction?.denyFields,
+      },
     );
 
     if (flagDiff && changedFlagKeys.length > 0) {
@@ -2183,9 +2192,17 @@ export class Crumbtrail {
       ];
       for (const key of changedFlagKeys) {
         const change = flagDiff.changed[key];
-        const from = redactFlagSide(key, change.from);
-        const to = redactFlagSide(key, change.to);
+        const from = redactFlagSide(key, change.from, {
+          diagnosticFields: this.config.redaction?.diagnosticFields,
+          denyFields: this.config.redaction?.denyFields,
+        });
+        const to = redactFlagSide(key, change.to, {
+          diagnosticFields: this.config.redaction?.diagnosticFields,
+          denyFields: this.config.redaction?.denyFields,
+        });
         metadata.push(from.metadata, to.metadata);
+        if (from.value?.value === undefined && to.value?.value === undefined)
+          continue;
         changes[key] = { from: from.value, to: to.value };
       }
       delta.flagChanges = changes as EnvSnapshot["flagChanges"];
@@ -2441,10 +2458,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function redactFlagSide(
   key: string,
   side: NormalizedFlag | undefined,
+  options?: {
+    diagnosticFields?: readonly string[];
+    denyFields?: readonly string[];
+  },
 ): { value: NormalizedFlag | undefined; metadata?: RedactionMetadata } {
   if (side === undefined) return { value: undefined };
-  const result = redactValue({ [key]: side.value }, "env.flags");
-  const value: NormalizedFlag = { value: result.value[key] };
+  const result =
+    options?.diagnosticFields !== undefined
+      ? redactDiagnosticFields(
+          { [key]: side.value },
+          {
+            diagnosticFields: options.diagnosticFields,
+            ...(options.denyFields ? { denyFields: options.denyFields } : {}),
+            path: "env.flags",
+          },
+        )
+      : redactValue({ [key]: side.value }, "env.flags");
+  const redacted = result.value as Record<string, unknown>;
+  const value: NormalizedFlag = { value: redacted[key] };
   if (side.variant !== undefined) value.variant = side.variant;
   return { value, ...(result.metadata ? { metadata: result.metadata } : {}) };
 }

@@ -8,6 +8,9 @@ import {
   BROWSER_REDACTION_POLICY_V2,
   classifyStructuredValue,
   computeRedactedShape,
+  DIAGNOSTIC_FIELD_MAX_PATHS,
+  DIAGNOSTIC_INDEX_MAX,
+  redactDiagnosticFields,
   redactNetworkTextBody,
   resetStructuredShapeSaltForTests,
   redactUrl,
@@ -16,6 +19,695 @@ import {
 
 const JWT =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c";
+
+describe("redactDiagnosticFields", () => {
+  const pick = (
+    value: unknown,
+    diagnosticFields: readonly string[],
+    options: { denyFields?: readonly string[] } = {},
+  ) => redactDiagnosticFields(value, { diagnosticFields, ...options }).value;
+
+  it("keeps only exact nested scalar paths and selected array entries", () => {
+    expect(
+      pick(
+        {
+          checkout: {
+            status: "failed",
+            message: "upstream failed",
+            ignored: "not selected",
+          },
+          attempts: [
+            { code: "E_TIMEOUT", label: "first" },
+            { code: "E_OTHER", label: "second" },
+          ],
+        },
+        ["checkout.status", "checkout.message", "attempts[0].code"],
+      ),
+    ).toEqual({
+      checkout: { message: "upstream failed", status: "failed" },
+      attempts: [{ code: "E_TIMEOUT" }],
+    });
+  });
+
+  it("rejects wildcards, inherited properties, accessors, and prototype paths", () => {
+    const value = Object.create({ inherited: "must not be read" }) as Record<
+      string,
+      unknown
+    >;
+    Object.defineProperty(value, "safe", {
+      enumerable: true,
+      value: "ok",
+    });
+    Object.defineProperty(value, "__proto__", {
+      enumerable: true,
+      value: { polluted: "must not survive" },
+    });
+    Object.assign(value, {
+      bodyText: "must not survive",
+      httpHeaders: { contentType: "must not survive" },
+      localState: { value: "must not survive" },
+      rawData: "must not survive",
+      stackTrace: "must not survive",
+    });
+    let getterReads = 0;
+    Object.defineProperty(value, "getter", {
+      enumerable: true,
+      get: () => {
+        getterReads += 1;
+        return "must not execute";
+      },
+    });
+
+    const result = redactDiagnosticFields(value, {
+      diagnosticFields: [
+        "safe",
+        "inherited",
+        "getter",
+        "safe.*",
+        "__proto__.polluted",
+        "constructor.prototype.polluted",
+        "bodyText",
+        "httpHeaders.contentType",
+        "localState.value",
+        "rawData",
+        "stackTrace",
+      ],
+    });
+
+    expect(result.value).toEqual({ safe: "ok" });
+    expect(getterReads).toBe(0);
+    expect(Object.prototype).not.toHaveProperty("polluted");
+  });
+
+  it("stops safely at circular objects", () => {
+    const value: Record<string, unknown> = { status: "ok" };
+    value.self = value;
+
+    const result = redactDiagnosticFields(value, {
+      diagnosticFields: ["status", "self.status"],
+    });
+
+    expect(result.value).toEqual({ status: "ok" });
+    expect(result.metadata?.fields).toContainEqual({
+      path: "diagnosticFields.self",
+      reason: "diagnostic_circular",
+      action: "redacted",
+    });
+  });
+
+  it("keeps explicit plain strings but sensitive names and value patterns still win", () => {
+    const result = redactDiagnosticFields(
+      {
+        safe: "upstream failed",
+        url: "https://example.test/callback?token=short-secret",
+        email: "person@example.com",
+        neutral: `Bearer ${JWT}`,
+        cardish: "4111111111111111",
+        password: "hunter2",
+      },
+      {
+        diagnosticFields: [
+          "safe",
+          "url",
+          "email",
+          "neutral",
+          "cardish",
+          "password",
+        ],
+      },
+    );
+
+    expect(result.value).toMatchObject({ safe: "upstream failed" });
+    expect(JSON.stringify(result.value)).not.toContain("short-secret");
+    expect(result.metadata?.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "diagnosticFields.neutral" }),
+        expect.objectContaining({ path: "diagnosticFields.cardish" }),
+      ]),
+    );
+  });
+
+  it("redacts numeric verification fields without closing containers or operational codes", () => {
+    const result = redactDiagnosticFields(
+      {
+        code: 1234,
+        invite: "5678",
+        magic: 901234,
+        reset: "345678",
+        verify: 789012,
+        checkout: { code: 2468, state: "pending" },
+        operation: { code: "E_TIMEOUT" },
+        statusCode: 503,
+        operationCode: 200,
+      },
+      {
+        diagnosticFields: [
+          "code",
+          "invite",
+          "magic",
+          "reset",
+          "verify",
+          "checkout.code",
+          "checkout.state",
+          "operation.code",
+          "statusCode",
+          "operationCode",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({
+      checkout: { state: "pending" },
+      operation: { code: "E_TIMEOUT" },
+      operationCode: 200,
+      statusCode: 503,
+    });
+    expect(JSON.stringify(result.value)).not.toContain("1234");
+    expect(JSON.stringify(result.value)).not.toContain("5678");
+    expect(JSON.stringify(result.value)).not.toContain("901234");
+    expect(JSON.stringify(result.value)).not.toContain("345678");
+    expect(JSON.stringify(result.value)).not.toContain("789012");
+    expect(JSON.stringify(result.value)).not.toContain("2468");
+  });
+
+  it("drops oversized and non-finite values, enforces the entry bound, and honors denyFields", () => {
+    const value: Record<string, unknown> = {
+      short: "support detail",
+      oversized: "x".repeat(257),
+      infinity: Number.POSITIVE_INFINITY,
+      denied: "do not retain",
+    };
+
+    const result = redactDiagnosticFields(value, {
+      diagnosticFields: ["short", "oversized", "infinity", "denied"],
+      denyFields: ["denied"],
+    });
+
+    expect(result.value).toMatchObject({ short: "support detail" });
+    expect(result.value).not.toHaveProperty("oversized");
+    expect(result.value).not.toHaveProperty("infinity");
+    expect(result.value).not.toHaveProperty("denied");
+
+    const bounded = Object.fromEntries(
+      Array.from({ length: 17 }, (_, index) => [
+        `field${String(index).padStart(2, "0")}`,
+        index,
+      ]),
+    );
+    const boundedResult = redactDiagnosticFields(bounded, {
+      diagnosticFields: Object.keys(bounded),
+    });
+    expect(
+      Object.keys(boundedResult.value as Record<string, unknown>),
+    ).toHaveLength(16);
+  });
+
+  it("applies structured parent denies while preserving card and account containers", () => {
+    const result = redactDiagnosticFields(
+      {
+        ibanDetails: { reference: "GB29NWBK60161331926819" },
+        birthDetails: { date: "1984-01-01" },
+        card: { balanceCents: 1250, number: "4111111111111111" },
+        account: { status: "active", token: "must not retain" },
+      },
+      {
+        diagnosticFields: [
+          "ibanDetails.reference",
+          "birthDetails.date",
+          "card.balanceCents",
+          "card.number",
+          "account.status",
+          "account.token",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({
+      account: { status: "active" },
+      card: { balanceCents: 1250 },
+    });
+    expect(JSON.stringify(result.value)).not.toContain(
+      "GB29NWBK60161331926819",
+    );
+    expect(JSON.stringify(result.value)).not.toContain("4111111111111111");
+    expect(JSON.stringify(result.value)).not.toContain("must not retain");
+  });
+
+  it("opens ordinary card and account containers but closes value containers", () => {
+    const result = redactDiagnosticFields(
+      {
+        cardNumber: { label: "must not retain" },
+        creditCardNumber: { label: "must not retain" },
+        accountNumber: { status: "must not retain" },
+        cardToken: { label: "must not retain" },
+        giftCard: { label: "SAFE_GIFT_CARD", number: "4111111111111111" },
+        customerAccount: { status: "SAFE_CUSTOMER_ACCOUNT", number: "1234" },
+        accountingPeriod: { status: "SAFE_ACCOUNTING_PERIOD" },
+        accountDetails: { status: "must not retain" },
+        card: { label: "SAFE_CARD" },
+        account: { status: "SAFE_ACCOUNT" },
+      },
+      {
+        diagnosticFields: [
+          "cardNumber.label",
+          "creditCardNumber.label",
+          "accountNumber.status",
+          "cardToken.label",
+          "giftCard.label",
+          "giftCard.number",
+          "customerAccount.status",
+          "customerAccount.number",
+          "accountingPeriod.status",
+          "accountDetails.status",
+          "card.label",
+          "account.status",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({
+      accountingPeriod: { status: "SAFE_ACCOUNTING_PERIOD" },
+      account: { status: "SAFE_ACCOUNT" },
+      card: { label: "SAFE_CARD" },
+      customerAccount: { status: "SAFE_CUSTOMER_ACCOUNT" },
+      giftCard: { label: "SAFE_GIFT_CARD" },
+    });
+    expect(JSON.stringify(result.value)).not.toContain("must not retain");
+    expect(JSON.stringify(result.value)).not.toContain("4111111111111111");
+    expect(JSON.stringify(result.value)).not.toContain('"number":"1234"');
+  });
+
+  it("closes sensitive card and account credential containers before traversal", () => {
+    const result = redactDiagnosticFields(
+      {
+        cardSecurityCode: { label: "must not retain" },
+        cardApiKey: { label: "must not retain" },
+        cardPrivateKey: { label: "must not retain" },
+        cardVerificationCode: { label: "must not retain" },
+        accountSecurityCode: { label: "must not retain" },
+        accountPassphrase: { label: "must not retain" },
+      },
+      {
+        diagnosticFields: [
+          "cardSecurityCode.label",
+          "cardApiKey.label",
+          "cardPrivateKey.label",
+          "cardVerificationCode.label",
+          "accountSecurityCode.label",
+          "accountPassphrase.label",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({});
+    expect(JSON.stringify(result.value)).not.toContain("must not retain");
+    expect(result.metadata?.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: "deny_field" }),
+      ]),
+    );
+  });
+
+  it("ignores process-wide keepFields while redacting diagnostic URL queries", () => {
+    setRedactionKeepFields(["q"]);
+    try {
+      const result = redactDiagnosticFields(
+        { url: "https://example.test/search?q=widget&token=abc123def456" },
+        { diagnosticFields: ["url"] },
+      );
+
+      expect(result.value).toEqual({});
+      expect(JSON.stringify(result.value)).not.toContain("widget");
+      expect(JSON.stringify(result.value)).not.toContain("abc123def456");
+      expect(result.metadata?.fields).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "diagnosticFields.url.query.q",
+            reason: "url_query_value",
+          }),
+        ]),
+      );
+    } finally {
+      setRedactionKeepFields([]);
+    }
+  });
+
+  it("redacts unsafe whole and embedded URL schemes in diagnostic strings", () => {
+    const secrets = [
+      "ftp-pass",
+      "opaque-secret",
+      "ssh-pass",
+      "custom-pass",
+      "raw-data-secret",
+      "js-secret",
+      "private-secret",
+    ];
+    const result = redactDiagnosticFields(
+      {
+        ftp: "ftp://alice:ftp-pass@files.example/private",
+        opaque: "ftp:opaque-secret/file",
+        opaqueBare: "ftp:opaque-secret",
+        ssh: "ssh://alice:ssh-pass@host.example/private",
+        sshBare: "ssh:opaque-secret",
+        custom: "custom://alice:custom-pass@host.example/private",
+        data: "data:text/plain,raw-data-secret",
+        javascript: 'javascript:alert("js-secret")',
+        file: "file:///Users/alice/private-secret.txt",
+        embedded: "see ssh://alice:ssh-pass@host.example/private now",
+      },
+      {
+        diagnosticFields: [
+          "ftp",
+          "opaque",
+          "opaqueBare",
+          "ssh",
+          "sshBare",
+          "custom",
+          "data",
+          "javascript",
+          "file",
+          "embedded",
+        ],
+      },
+    );
+
+    const serialized = JSON.stringify(result.value);
+    for (const secret of secrets) expect(serialized).not.toContain(secret);
+    expect(result.metadata?.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: "unsafe_url_scheme" }),
+      ]),
+    );
+    for (const value of Object.values(result.value as Record<string, unknown>))
+      expect(value).toMatch(/\[REDACTED\]/);
+  });
+
+  it("normalizes compatibility forms before checks and omits residual Unicode", () => {
+    const toFullWidth = (value: string) =>
+      value.replace(/[!-~]/g, (character) =>
+        String.fromCharCode(character.charCodeAt(0) + 0xfee0),
+      );
+    const result = redactDiagnosticFields(
+      {
+        contact: toFullWidth("omar@example.com"),
+        reference: toFullWidth("4111111111111111"),
+        compatibilityStatus: toFullWidth("SAFE_OK"),
+        unicodeStatus: "ошибка",
+      },
+      {
+        diagnosticFields: [
+          "contact",
+          "reference",
+          "compatibilityStatus",
+          "unicodeStatus",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({ compatibilityStatus: "SAFE_OK" });
+    expect(JSON.stringify(result.value)).not.toContain("omar@example.com");
+    expect(JSON.stringify(result.value)).not.toContain("4111111111111111");
+    expect(JSON.stringify(result.value)).not.toContain("ошибка");
+  });
+
+  it("normalizes compatibility keys for diagnostic classification", () => {
+    const fullWidth = (value: string) =>
+      value.replace(/[!-~]/g, (character) =>
+        String.fromCharCode(character.charCodeAt(0) + 0xfee0),
+      );
+    const password = fullWidth("password");
+    const status = fullWidth("status");
+    const result = redactDiagnosticFields(
+      { [password]: "must not retain", [status]: "SAFE_OK" },
+      { diagnosticFields: [password, status] },
+    );
+
+    expect(result.value).toEqual({ [status]: "SAFE_OK" });
+    expect(JSON.stringify(result.value)).not.toContain("must not retain");
+  });
+
+  it("folds Unicode confusables in sensitive diagnostic keys", () => {
+    const password = "\u0440\u0430ssword";
+    const cardNumber = "\u0441ardNumber";
+    const accountNumber = "\u0430ccountNumber";
+    const result = redactDiagnosticFields(
+      {
+        [password]: "hunter2",
+        [cardNumber]: "1234567890123456",
+        [accountNumber]: "1234",
+        status: "SAFE_OK",
+      },
+      { diagnosticFields: [password, cardNumber, accountNumber, "status"] },
+    );
+
+    expect(result.value).toEqual({ status: "SAFE_OK" });
+    expect(JSON.stringify(result.value)).not.toContain("hunter2");
+    expect(JSON.stringify(result.value)).not.toContain("1234567890123456");
+    expect(JSON.stringify(result.value)).not.toContain("1234");
+  });
+
+  it("redacts short numbers inside confusable card and account containers", () => {
+    const result = redactDiagnosticFields(
+      {
+        сard: { brand: "visa", number: "4242", num: "5678" },
+        аccount: { status: "active", number: "1234", num: "9012" },
+      },
+      {
+        diagnosticFields: [
+          "сard.brand",
+          "сard.number",
+          "сard.num",
+          "аccount.status",
+          "аccount.number",
+          "аccount.num",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({
+      сard: { brand: "visa" },
+      аccount: { status: "active" },
+    });
+    expect(JSON.stringify(result.value)).not.toContain("4242");
+    expect(JSON.stringify(result.value)).not.toContain("1234");
+    expect(JSON.stringify(result.value)).not.toContain("5678");
+    expect(JSON.stringify(result.value)).not.toContain("9012");
+  });
+
+  it("keeps ordinary colon labels instead of treating them as URI schemes", () => {
+    const result = redactDiagnosticFields(
+      {
+        message: "Error: failed. Version:1.2.3. State:ready.",
+        status: "Status: pending. Build:2.4.0.",
+      },
+      { diagnosticFields: ["message", "status"] },
+    );
+
+    expect(result.value).toEqual({
+      message: "Error: failed. Version:1.2.3. State:ready.",
+      status: "Status: pending. Build:2.4.0.",
+    });
+  });
+
+  it("rejects unknown opaque schemes even when punctuation makes them sentence shaped", () => {
+    const result = redactDiagnosticFields(
+      {
+        status: "custom:secret.",
+        message: "failed at myapp:abc-def,",
+        safe: "Status: pending.",
+      },
+      { diagnosticFields: ["status", "message", "safe"] },
+    );
+
+    expect(result.value).toEqual({
+      message: "[REDACTED]",
+      safe: "Status: pending.",
+    });
+    expect(JSON.stringify(result.value)).not.toContain("secret");
+    expect(JSON.stringify(result.value)).not.toContain("abc-def");
+    expect(result.metadata?.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: "unsafe_url_scheme" }),
+      ]),
+    );
+  });
+
+  it("rejects selected token shaped property names before traversal", () => {
+    const tokenKey = "sk_live_4eC39HqLyjWDarjt";
+    const result = redactDiagnosticFields(
+      {
+        [tokenKey]: "must not retain",
+        safe: "SAFE_OK",
+      },
+      { diagnosticFields: [tokenKey, "safe"] },
+    );
+
+    expect(result.value).toEqual({ safe: "SAFE_OK" });
+    expect(JSON.stringify(result.value)).not.toContain(tokenKey);
+    expect(JSON.stringify(result.value)).not.toContain("must not retain");
+  });
+
+  it("redacts relative URL query secrets in diagnostic prose", () => {
+    const secret = "abc123def456";
+    const result = redactDiagnosticFields(
+      {
+        rootRelative: `failed at /callback?token=${secret}`,
+        schemeRelative: `failed at //example.test/callback?token=${secret}`,
+        currentRelative: `failed at ./callback?token=${secret}`,
+        parentRelative: `failed at ../callback?token=${secret}`,
+        ordinarySlashText: "literal /usr/local/bin and path/to/file",
+        querylessSlashText: "literal /not/a?maybe",
+      },
+      {
+        diagnosticFields: [
+          "rootRelative",
+          "schemeRelative",
+          "currentRelative",
+          "parentRelative",
+          "ordinarySlashText",
+          "querylessSlashText",
+        ],
+      },
+    );
+
+    const serialized = JSON.stringify(result.value);
+    expect(serialized).not.toContain(secret);
+    expect(result.value).toMatchObject({
+      ordinarySlashText: "literal /usr/local/bin and path/to/file",
+      querylessSlashText: "literal /not/a?maybe",
+    });
+    for (const key of [
+      "rootRelative",
+      "schemeRelative",
+      "currentRelative",
+      "parentRelative",
+    ]) {
+      expect((result.value as Record<string, unknown>)[key]).toContain(
+        "[REDACTED",
+      );
+    }
+  });
+
+  it("rejects Unicode URL components before URL serialization", () => {
+    const secret = "abc123def456";
+    const result = redactDiagnosticFields(
+      {
+        idn: `https://例え.テスト/callback?token=${secret}`,
+        path: `https://example.test/こんにちは?token=${secret}`,
+        encodedPath: `https://example.test/%E3%81%93%E3%82%93?token=${secret}`,
+        normalizedPath: `https://example.test/ｐａｙｍｅｎｔ?token=${secret}`,
+        ascii: "https://a.io/x",
+      },
+      {
+        diagnosticFields: [
+          "idn",
+          "path",
+          "encodedPath",
+          "normalizedPath",
+          "ascii",
+        ],
+      },
+    );
+
+    const values = result.value as Record<string, unknown>;
+    expect(values).not.toHaveProperty("idn");
+    expect(values).not.toHaveProperty("path");
+    expect(values).not.toHaveProperty("encodedPath");
+    expect(values).not.toHaveProperty("normalizedPath");
+    expect(values.ascii).toBe("https://a.io/x");
+    expect(JSON.stringify(result.value)).not.toContain(secret);
+    expect(result.metadata?.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reason: "diagnostic_non_ascii_url_component",
+          action: "dropped",
+        }),
+      ]),
+    );
+  });
+
+  it("caps configured paths before parsing and bounds sparse array indexes", () => {
+    let numericPathReads = 0;
+    const paths = new Proxy(
+      [
+        ...Array.from(
+          { length: DIAGNOSTIC_FIELD_MAX_PATHS },
+          (_, index) => `z${String(index).padStart(2, "0")}`,
+        ),
+        "aLate",
+      ],
+      {
+        get(target, property, receiver) {
+          if (typeof property === "string" && /^\d+$/.test(property))
+            numericPathReads += 1;
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    const values = Object.fromEntries([
+      ...Array.from({ length: DIAGNOSTIC_FIELD_MAX_PATHS }, (_, index) => [
+        `z${String(index).padStart(2, "0")}`,
+        index,
+      ]),
+      ["aLate", 999],
+    ]);
+    const bounded = redactDiagnosticFields(values, {
+      diagnosticFields: paths,
+    });
+
+    expect(bounded.value).not.toHaveProperty("aLate");
+    expect(numericPathReads).toBeLessThanOrEqual(DIAGNOSTIC_FIELD_MAX_PATHS);
+    expect(Object.keys(bounded.value as Record<string, unknown>)).toHaveLength(
+      16,
+    );
+
+    const attempts: unknown[] = [];
+    attempts[DIAGNOSTIC_INDEX_MAX - 1] = { code: "E_LAST" };
+    attempts[DIAGNOSTIC_INDEX_MAX] = { code: "must not retain" };
+    const sparse = redactDiagnosticFields(
+      { attempts },
+      {
+        diagnosticFields: [
+          `attempts[${DIAGNOSTIC_INDEX_MAX - 1}].code`,
+          `attempts[${DIAGNOSTIC_INDEX_MAX}].code`,
+        ],
+      },
+    );
+
+    const sparseAttempts = (sparse.value as { attempts: unknown[] }).attempts;
+    expect(sparseAttempts[DIAGNOSTIC_INDEX_MAX - 1]).toEqual({
+      code: "E_LAST",
+    });
+    expect(sparseAttempts.length).toBe(DIAGNOSTIC_INDEX_MAX);
+    expect(Object.keys(sparseAttempts)).toEqual([
+      String(DIAGNOSTIC_INDEX_MAX - 1),
+    ]);
+    expect(JSON.stringify(sparse.value)).not.toContain("must not retain");
+  });
+
+  it("contains revoked proxy failures without reading accessors or breaking sibling fields", () => {
+    const revoked = Proxy.revocable({ status: "must not retain" }, {});
+    revoked.revoke();
+
+    expect(() =>
+      redactDiagnosticFields(
+        { good: "ok", revoked: revoked.proxy },
+        { diagnosticFields: ["good", "revoked.status"] },
+      ),
+    ).not.toThrow();
+
+    const result = redactDiagnosticFields(
+      { good: "ok", revoked: revoked.proxy },
+      { diagnosticFields: ["good", "revoked.status"] },
+    );
+    expect(result.value).toEqual({ good: "ok" });
+    expect(result.metadata?.fields).toContainEqual({
+      path: "diagnosticFields.revoked",
+      reason: "diagnostic_unreadable_value",
+      action: "dropped",
+    });
+  });
+});
 
 /* ------------------------------------------------------------------ */
 /* Classifier table tests                                              */
@@ -437,6 +1129,140 @@ describe("redactNetworkTextBody structured mode", () => {
     expect(parsed.qty).toBe(1);
   });
 
+  it("opens ordinary card and account containers but closes value containers", () => {
+    const result = redactNetworkTextBody(
+      JSON.stringify({
+        cardNumber: { label: "must not retain" },
+        creditCardNumber: { label: "must not retain" },
+        accountNumber: { status: "must not retain" },
+        cardToken: { label: "must not retain" },
+        cardSecurityCode: { label: "must not retain" },
+        cardApiKey: { label: "must not retain" },
+        cardPrivateKey: { label: "must not retain" },
+        cardVerificationCode: { label: "must not retain" },
+        accountSecurityCode: { label: "must not retain" },
+        accountPassphrase: { label: "must not retain" },
+        giftCard: { label: "SAFE_GIFT_CARD", number: "4111111111111111" },
+        customerAccount: {
+          status: "SAFE_CUSTOMER_ACCOUNT",
+          number: "1234",
+          num: "5678",
+        },
+        accountingPeriod: { status: "SAFE_ACCOUNTING_PERIOD" },
+        accountDetails: { status: "must not retain" },
+        card: { label: "SAFE_CARD" },
+        account: { status: "SAFE_ACCOUNT" },
+      }),
+      jsonOpts,
+    );
+    const parsed = JSON.parse(result.body!) as Record<string, unknown>;
+
+    for (const key of [
+      "cardNumber",
+      "creditCardNumber",
+      "accountNumber",
+      "cardToken",
+      "cardSecurityCode",
+      "cardApiKey",
+      "cardPrivateKey",
+      "cardVerificationCode",
+      "accountSecurityCode",
+      "accountPassphrase",
+      "accountDetails",
+    ]) {
+      expect(parsed[key]).toMatchObject({ $redacted: "[REDACTED]" });
+    }
+    expect(parsed.accountDetails).toMatchObject({
+      $redacted: "[REDACTED]",
+    });
+    expect(parsed.accountingPeriod).toEqual({
+      status: "SAFE_ACCOUNTING_PERIOD",
+    });
+    expect(parsed.card).toEqual({ label: "SAFE_CARD" });
+    expect(parsed.account).toEqual({ status: "SAFE_ACCOUNT" });
+    expect(parsed.customerAccount).toMatchObject({
+      status: "SAFE_CUSTOMER_ACCOUNT",
+      number: { $redacted: "[REDACTED]" },
+    });
+    expect(
+      (parsed.customerAccount as Record<string, unknown>).num,
+    ).toMatchObject({
+      $redacted: "[REDACTED]",
+    });
+    expect(parsed.giftCard).toMatchObject({
+      label: "SAFE_GIFT_CARD",
+      number: { $redacted: "[REDACTED]" },
+    });
+    expect(result.body).not.toContain("must not retain");
+    expect(result.body).not.toContain("4111111111111111");
+    expect(result.body).not.toContain('"number":"1234"');
+  });
+
+  it("normalizes compatibility keys without rewriting safe output keys", () => {
+    const fullWidth = (value: string) =>
+      value.replace(/[!-~]/g, (character) =>
+        String.fromCharCode(character.charCodeAt(0) + 0xfee0),
+      );
+    const password = fullWidth("password");
+    const status = fullWidth("status");
+    const result = redactNetworkTextBody(
+      JSON.stringify({
+        [password]: "must not retain",
+        [status]: "SAFE_OK",
+      }),
+      jsonOpts,
+    );
+    const parsed = JSON.parse(result.body!) as Record<string, unknown>;
+
+    expect(Object.keys(parsed)).toEqual([password, status]);
+    expect(parsed[password]).toMatchObject({ $redacted: "[REDACTED]" });
+    expect(parsed[status]).toBe("SAFE_OK");
+    expect(result.body).not.toContain("must not retain");
+  });
+
+  it("does not let structured output assignment mutate the prototype", () => {
+    const result = redactNetworkTextBody(
+      '{"__proto__":{"polluted":true},"safe":"SAFE_OK"}',
+      jsonOpts,
+    );
+    const parsed = JSON.parse(result.body!) as Record<string, unknown>;
+
+    expect(parsed).toHaveProperty("__proto__");
+    expect((parsed.__proto__ as Record<string, unknown>).polluted).toBe(true);
+    expect(Object.prototype).not.toHaveProperty("polluted");
+    expect(parsed.safe).toBe("SAFE_OK");
+  });
+
+  it("redacts numeric verification fields in structured bodies without closing operational codes", () => {
+    const result = redactNetworkTextBody(
+      JSON.stringify({
+        code: 1234,
+        invite: "5678",
+        checkout: { code: "2468", state: "pending" },
+        operation: { code: "E_TIMEOUT" },
+        statusCode: 503,
+        operationCode: 200,
+        ordinary: "1234",
+      }),
+      jsonOpts,
+    );
+    const parsed = JSON.parse(result.body!) as Record<string, unknown>;
+
+    expect(parsed.code).toMatchObject({ $redacted: "[REDACTED]" });
+    expect(parsed.invite).toMatchObject({ $redacted: "[REDACTED]" });
+    expect(parsed.checkout).toMatchObject({
+      code: { $redacted: "[REDACTED]" },
+      state: "pending",
+    });
+    expect(parsed.operation).toEqual({ code: "E_TIMEOUT" });
+    expect(parsed.statusCode).toBe(503);
+    expect(parsed.operationCode).toBe(200);
+    expect(parsed.ordinary).toBe("1234");
+    expect(result.body).not.toContain('"code":1234');
+    expect(result.body).not.toContain('"invite":"5678"');
+    expect(result.body).not.toContain('"code":"2468"');
+  });
+
   it("redacts Luhn-passing numeric card values but keeps ordinary numbers", () => {
     const body = JSON.stringify({
       pan: 4111111111111111,
@@ -761,6 +1587,31 @@ describe("redaction.keepFields", () => {
     expect(parsed.q).toBe('O\'Brien "widget"');
   });
 
+  it("keeps URL names only while redacting URL credentials and query values", () => {
+    setRedactionKeepFields(["q"]);
+    try {
+      const parsed = structured(
+        JSON.stringify({
+          url: "https://alice:password@example.test/search?q=widget&token=abc123def456",
+          note: "see /callback?q=widget&token=abc123def456",
+        }),
+        ["url", "note"],
+      );
+
+      expect(parsed.url).toContain("https://example.test/search");
+      expect(parsed.url).toContain("q=[REDACTED");
+      expect(parsed.url).toContain("token=[REDACTED");
+      expect(parsed.note).toContain("/callback");
+      expect(parsed.note).toContain("q=[REDACTED");
+      expect(parsed.note).toContain("token=[REDACTED");
+      expect(JSON.stringify(parsed)).not.toContain("alice:password");
+      expect(JSON.stringify(parsed)).not.toContain("abc123def456");
+      expect(JSON.stringify(parsed)).not.toContain("widget");
+    } finally {
+      setRedactionKeepFields([]);
+    }
+  });
+
   it("matches the whole compacted name, never a substring", () => {
     const parsed = structured(JSON.stringify({ shadowBody: "free text here" }));
     expect(parsed.shadowBody).toMatchObject({ $redacted: "[REDACTED]" });
@@ -884,11 +1735,7 @@ describe("keepFields vs the built-in deny rules", () => {
     expect(parsed.password).toMatchObject({ $redacted: "[REDACTED]" });
   });
 
-  // A built-in name token is a substring guess. It may not silently delete a whole structure it
-  // merely shares a syllable with — measured on a real session, a gift-card response rendered as
-  // `{[REDACTED_KEY]:[REDACTED]}` and took the answer with it, while the sibling endpoint reported
-  // the identical number in the clear because it was not nested under a key spelled `card`.
-  describe("a heuristic name match opens a container instead of deleting it", () => {
+  describe("exact object container names remain traversable", () => {
     it("keeps business fields nested under a card object", () => {
       const out = structured(
         JSON.stringify({ card: { balanceCents: 1250, initialCents: 5000 } }),
@@ -900,8 +1747,6 @@ describe("keepFields vs the built-in deny rules", () => {
       });
     });
 
-    // The load-bearing test. Opening the container costs no protection only if the VALUE rules
-    // still catch what the NAME used to. If this ever fails, the change above must be reverted.
     it("still redacts a real card number nested under that same object", () => {
       const out = structured(
         JSON.stringify({
@@ -913,6 +1758,35 @@ describe("keepFields vs the built-in deny rules", () => {
       expect(card.balanceCents).toBe(1250);
       expect(card.number).toMatchObject({ $redacted: "[REDACTED]" });
       expect(JSON.stringify(out)).not.toContain("4111111111111111");
+    });
+
+    it("redacts number fields without deleting ordinary card and account fields", () => {
+      const out = structured(
+        JSON.stringify({
+          card: {
+            brand: "visa",
+            balanceCents: 1250,
+            number: "1234567890123456",
+          },
+          account: {
+            status: "active",
+            id: 12345678,
+            number: "1234",
+          },
+        }),
+        [],
+      );
+
+      expect(out.card).toMatchObject({ brand: "visa", balanceCents: 1250 });
+      expect(out.account).toMatchObject({ status: "active", id: 12345678 });
+      expect((out.card as Record<string, unknown>).number).toMatchObject({
+        $redacted: "[REDACTED]",
+      });
+      expect((out.account as Record<string, unknown>).number).toMatchObject({
+        $redacted: "[REDACTED]",
+      });
+      expect(JSON.stringify(out)).not.toContain("1234567890123456");
+      expect(JSON.stringify(out)).not.toContain('"number":"1234"');
     });
 
     it("still redacts a scalar whose own name matches", () => {
@@ -1022,6 +1896,23 @@ describe("query parameters answer to the same keep list", () => {
     expect(redactUrl("/api/search?token=1&page=1").value).toBe(
       "/api/search?token=[REDACTED;len=1;charset=num]&page=1",
     );
+  });
+
+  it("redacts short numeric values under credential and verification names", () => {
+    setRedactionKeepFields([]);
+    const result = redactUrl(
+      "/checkout?code=1234&card=4242&account=1234&\u0441ard=5678&page=1",
+    );
+
+    const params = new URLSearchParams(result.value.split("?", 2)[1]);
+    const redacted = "[REDACTED;len=4;charset=num]";
+    expect(result.value).toContain("page=1");
+    for (const key of ["code", "card", "account", "\u0441ard"])
+      expect(params.get(key)).toBe(redacted);
+    expect(result.value).not.toContain("code=1234");
+    expect(result.value).not.toContain("card=4242");
+    expect(result.value).not.toContain("account=1234");
+    expect(result.value).not.toContain("\u0441ard=5678");
   });
 
   it("keeps a declared parameter so the query that broke is readable", () => {
