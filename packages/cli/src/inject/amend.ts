@@ -590,63 +590,28 @@ function topLevelEarlyRequirePositions(program: any): number[] {
   return positions;
 }
 
-function topLevelInitPositions(program: any): number[] {
+function topLevelEffectPositions(program: any): number[] {
   const positions: number[] = [];
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") return;
+  for (const statement of program.body ?? []) {
     if (
-      /^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
-        node.type ?? "",
-      )
+      [
+        "ImportDeclaration",
+        "FunctionDeclaration",
+        "EmptyStatement",
+        "TSInterfaceDeclaration",
+        "TSTypeAliasDeclaration",
+      ].includes(statement.type) ||
+      statement.exportKind === "type"
     )
-      return;
-    if (
-      node.type === "CallExpression" &&
-      node.callee?.type === "MemberExpression" &&
-      !node.callee.computed &&
-      node.callee.object?.type === "Identifier" &&
-      node.callee.object.name === "Crumbtrail" &&
-      node.callee.property?.type === "Identifier" &&
-      node.callee.property.name === "init"
-    ) {
-      positions.push(node.start ?? 0);
-      return;
+      continue;
+    if (statement.type === "VariableDeclaration") {
+      for (const declaration of statement.declarations ?? []) {
+        if (declaration.init) positions.push(declaration.init.start ?? 0);
+      }
+    } else {
+      positions.push(statement.expression?.start ?? statement.start ?? 0);
     }
-    for (const value of Object.values(node)) {
-      if (Array.isArray(value)) value.forEach(visit);
-      else if (value && typeof value === "object" && "type" in value)
-        visit(value);
-    }
-  };
-  for (const statement of program.body ?? []) visit(statement);
-  return positions;
-}
-
-function topLevelRuntimeDependencyPositions(program: any): number[] {
-  const positions: number[] = [];
-  const visit = (node: any): void => {
-    if (!node || typeof node !== "object") return;
-    if (
-      /^(?:Function|ArrowFunction|ObjectMethod|ClassMethod)/.test(
-        node.type ?? "",
-      )
-    )
-      return;
-    const dependency =
-      node.type === "ImportExpression" ||
-      (node.type === "CallExpression" &&
-        (node.callee?.type === "Import" ||
-          (node.callee?.type === "Identifier" &&
-            node.callee.name === "require")));
-    if (dependency && !earlyImportArgument(node) && !bareEarlyRequire(node))
-      positions.push(node.start ?? 0);
-    for (const value of Object.values(node)) {
-      if (Array.isArray(value)) value.forEach(visit);
-      else if (value && typeof value === "object" && "type" in value)
-        visit(value);
-    }
-  };
-  for (const statement of program.body ?? []) visit(statement);
+  }
   return positions;
 }
 
@@ -690,12 +655,9 @@ export function hasExecutableEarlyBrowserImport(text: string): boolean {
     const requires = topLevelEarlyRequirePositions(program);
     const ordered = [...awaited, ...requires];
     if (ordered.length === 0) return false;
-    const initPositions = [
-      ...topLevelInitPositions(program),
-      ...topLevelRuntimeDependencyPositions(program),
-    ];
+    const effectPositions = topLevelEffectPositions(program);
     return ordered.some((position) =>
-      initPositions.every((initPosition) => position < initPosition),
+      effectPositions.every((effectPosition) => position <= effectPosition),
     );
   }
 

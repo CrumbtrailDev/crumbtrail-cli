@@ -323,6 +323,34 @@ describe("buildPlan — Next.js", () => {
 
 describe("buildPlan — idempotency", () => {
   it.each([
+    'fetch("/startup");',
+    'function startup() { fetch("/startup"); } startup();',
+    "window.started = true;",
+    "const value = window.startup;",
+    "new Startup();",
+  ])("requires runtime early capture before effects: %s", (effect) => {
+    expect(
+      hasExecutableEarlyBrowserImport(
+        `${effect}\nawait import("crumbtrail-core/early");`,
+      ),
+    ).toBe(false);
+    expect(
+      hasExecutableEarlyBrowserImport(
+        `await import("crumbtrail-core/early");\n${effect}`,
+      ),
+    ).toBe(true);
+    expect(
+      hasExecutableEarlyBrowserImport(
+        `${effect}\nrequire("crumbtrail-core/early");`,
+      ),
+    ).toBe(false);
+    expect(
+      hasExecutableEarlyBrowserImport(
+        `require("crumbtrail-core/early");\n${effect}`,
+      ),
+    ).toBe(true);
+  });
+  it.each([
     [
       'await import("./telemetry"); await import("crumbtrail-core/early");',
       false,
