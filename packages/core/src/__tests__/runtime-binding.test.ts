@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   __resetRuntimeBindingCacheForTests,
   createRuntimeBindingClient,
@@ -18,6 +18,7 @@ import { runServerlessInvocation } from "../serverless";
 
 const ENDPOINT = "https://capture.example";
 const NOW = Date.parse("2026-09-02T12:00:00.000Z");
+beforeEach(() => vi.setSystemTime(NOW));
 
 interface Deferred<T> {
   promise: Promise<T>;

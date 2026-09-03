@@ -122,10 +122,17 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
     this.fetcher = options.fetchImpl ?? fetch;
     this.timeoutMs = normalizeTimeout(options.requestTimeoutMs);
     this.requestSubject = requestSubject;
+    const suppliedBinding = options.runtimeBinding
+      ? resolveRuntimeBindingClient(options.runtimeBinding)
+      : undefined;
+    if (options.runtimeBinding &&
+        !suppliedBinding?.matchesScope(endpoint, options.authToken)) {
+      throw new ServerlessConfigurationError(
+        "Crumbtrail runtime binding does not match the capture endpoint and project",
+      );
+    }
     this.runtimeBinding =
-      (options.runtimeBinding
-        ? resolveRuntimeBindingClient(options.runtimeBinding)
-        : undefined) ??
+      suppliedBinding ??
       getCachedRuntimeBindingClient({
         endpoint,
         projectKey: options.authToken,
@@ -193,22 +200,29 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
 
     for (const operation of operations) {
       if (failures.some((failure) => failure.phase === "session-start")) break;
+      const deadline = startDeadline(this.timeoutMs, signal);
       try {
+        throwIfAborted(deadline?.signal ?? signal);
         const body =
           operation.phase === "session-start"
-            ? await this.sessionStartBody(operation.body)
+            ? await waitForSignal(this.sessionStartBody(operation.body), deadline?.signal ?? signal)
             : operation.body;
-        lastResponse = await postJson(
+        throwIfAborted(deadline?.signal ?? signal);
+        lastResponse = await waitForSignal(postJson(
           this.fetcher,
           `${this.endpoint}${operation.path}`,
           this.headers,
           body,
           this.timeoutMs,
           this.requestSubject,
-          signal,
-        );
+          deadline?.signal ?? signal,
+        ), deadline?.signal ?? signal);
       } catch (error) {
-        failures.push({ phase: operation.phase, error });
+        failures.push({ phase: operation.phase, error: deadline?.expired
+          ? new HeadlessTimeoutError(this.timeoutMs, this.requestSubject)
+          : error });
+      } finally {
+        deadline?.cancel();
       }
     }
 
@@ -225,6 +239,25 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
       instanceId: binding.instanceId,
       instanceProof: binding.instanceProof,
     });
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason ?? new Error("Request aborted");
+}
+
+async function waitForSignal<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return pending;
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error("Request aborted"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([pending, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
 }
 

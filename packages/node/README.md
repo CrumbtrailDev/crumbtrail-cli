@@ -446,10 +446,10 @@ silent, so a request is recorded once. Disable the hook with
 `captureHttpRequests: false`.
 
 With an ingest key, `autoCapture` registers one runtime identity for the Node
-process. The identity is sent only as top level fields on the session start and
-as bearer authentication for same-origin config polls. A different-origin
-`configEndpoint` remains an untargeted poll. The proof stays in process memory,
-rotates before its one day expiry, and is discarded on `stop()`. If registration
+process. The identity is sent as top level fields on session start.
+`autoCapture` does not poll remote capture configuration. The proof stays in
+process memory and is reused or rotated when a session is re-established.
+There is no background rotation timer. `stop()` retires the binding. If registration
 is unavailable or rate limited, auto capture keeps the existing untargeted
 session behavior and does not retry in a loop. The AWS, Vercel, and Netlify
 endpoint wrappers similarly reuse one binding across warm invocations for the

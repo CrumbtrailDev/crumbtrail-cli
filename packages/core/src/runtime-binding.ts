@@ -252,6 +252,11 @@ export class RuntimeBindingClient {
     );
   }
 
+  matchesScope(endpoint: string, projectKey?: string): boolean {
+    return this.endpoint === endpoint.trim().replace(/\/+$/, "") &&
+      this.projectKey === (projectKey?.trim() ?? "");
+  }
+
   /** Clear the private proof and prevent late registration responses being adopted. */
   stop(): void {
     if (this.stopped) return;

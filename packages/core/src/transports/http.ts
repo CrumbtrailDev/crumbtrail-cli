@@ -306,6 +306,7 @@ export class HttpTransport implements CrumbtrailTransport {
       session?.refusedStatus,
     );
     if (standing) throw standing;
+    if (session && !session.admitted) throw new EventDeliveryError(0, events.length);
     if (!session?.admitted || session.finalized) return;
     await this.deliverAll(this.splitToBudget(events, sessionId), 0, sessionId);
   }
@@ -341,15 +342,11 @@ export class HttpTransport implements CrumbtrailTransport {
    * `eventCount`, so reporting only the first failed chunk would understate a
    * flush that lost several.
    */
-<<<<<<< HEAD
   private async deliverAll(
     chunks: BugEvent[][],
     depth = 0,
     sessionId = this.sessionId,
   ): Promise<void> {
-=======
-  private async deliverAll(chunks: BugEvent[][], depth = 0): Promise<void> {
->>>>>>> fb633de (fix(runtime): finish binding review fixes)
     let first: EventDeliveryError | undefined;
     let lost = 0;
     for (const chunk of chunks) {
