@@ -76,6 +76,28 @@ describe("runtime binding client", () => {
     });
   });
 
+  it("keeps a still-live binding on a failed rotation and falls back untargeted after expiry", async () => {
+    let now = NOW;
+    const first = binding(NOW + 2 * RUNTIME_BINDING_ROTATE_AHEAD_MS + 1, "one");
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(response(first, 201))
+      .mockResolvedValue(response({ error: "unavailable" }, 503));
+    const client = createRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => now,
+    });
+
+    await expect(client.getBinding()).resolves.toEqual(first);
+    now = NOW + RUNTIME_BINDING_ROTATE_AHEAD_MS + 1;
+    await expect(client.getBinding()).resolves.toEqual(first);
+    now = NOW + 2 * RUNTIME_BINDING_ROTATE_AHEAD_MS + 2;
+    await expect(client.getBinding()).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
   it("honors a bounded Retry After without entering a registration loop", async () => {
     let now = NOW;
     const fetcher = vi

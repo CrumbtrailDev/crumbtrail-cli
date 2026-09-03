@@ -95,7 +95,11 @@ export class RuntimeBindingClient {
     try {
       const next = await request;
       if (!this.stopped && next) this.current = next;
-      return this.stopped ? undefined : (next ?? this.current);
+      const fallback =
+        this.current && this.isUsable(this.current, this.now())
+          ? this.current
+          : undefined;
+      return this.stopped ? undefined : (next ?? fallback);
     } finally {
       if (this.inFlight === request) this.inFlight = undefined;
     }
