@@ -1068,19 +1068,39 @@ export function htmlReferencesCrumbtrail(html: string): boolean {
 }
 
 /** JavaScript script types that execute as application code in an HTML page. */
-const JAVASCRIPT_SCRIPT_TYPE =
-  /^(?:text|application)\/(?:x-)?(?:javascript|ecmascript)$/i;
+const JAVASCRIPT_SCRIPT_TYPE = new Set([
+  "application/ecmascript",
+  "application/javascript",
+  "application/x-ecmascript",
+  "application/x-javascript",
+  "text/ecmascript",
+  "text/javascript",
+  "text/javascript1.0",
+  "text/javascript1.1",
+  "text/javascript1.2",
+  "text/javascript1.3",
+  "text/javascript1.4",
+  "text/javascript1.5",
+  "text/jscript",
+  "text/livescript",
+  "text/x-ecmascript",
+  "text/x-javascript",
+]);
 
 function executableScript(attrs: string): boolean {
   const typeAttribute =
     /(?:^|\s)type\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(attrs);
-  // An omitted type is a classic script. An explicit empty or non-JavaScript
+  // An omitted or empty type is a classic script. An explicit non-JavaScript
   // type is a data block and does not establish an execution boundary.
   if (!typeAttribute) return true;
   const type = (typeAttribute[1] ?? typeAttribute[2] ?? typeAttribute[3] ?? "")
     .split(";", 1)[0]
     .trim();
-  return type.toLowerCase() === "module" || JAVASCRIPT_SCRIPT_TYPE.test(type);
+  return (
+    type === "" ||
+    type.toLowerCase() === "module" ||
+    JAVASCRIPT_SCRIPT_TYPE.has(type.toLowerCase())
+  );
 }
 
 function tagEnd(html: string, start: number): number | null {

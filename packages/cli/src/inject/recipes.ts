@@ -63,6 +63,8 @@ import {
   withTrailingNewline,
 } from "./text";
 import {
+  browserEarlyBootstrapUrl,
+  browserEarlyCaptureVersion,
   capacitorInitSnippet,
   clientInitSnippet,
   envPreloadSnippet,
@@ -291,6 +293,7 @@ function incompleteSnippet(input: BuildPlanInput): string {
         keyExpr,
         input.serviceName,
         input.backendOrigins,
+        input.sdkVersion,
       );
     case "flutter":
       return [
@@ -309,7 +312,7 @@ function incompleteSnippet(input: BuildPlanInput): string {
         input.backendOrigins,
       );
     case "tauri":
-      return tauriInitSnippet();
+      return tauriInitSnippet(input.sdkVersion);
     case "static":
       return staticBlockFor(input);
     case "express":
@@ -323,6 +326,7 @@ function incompleteSnippet(input: BuildPlanInput): string {
         keyExpr,
         input.serviceName,
         input.backendOrigins,
+        input.sdkVersion,
       );
     default:
       return clientInitSnippet(
@@ -330,6 +334,7 @@ function incompleteSnippet(input: BuildPlanInput): string {
         keyExpr,
         input.serviceName,
         input.backendOrigins,
+        input.sdkVersion,
       );
   }
 }
@@ -530,6 +535,102 @@ function incompletePlan(
   ]);
 }
 
+/** Browser integrations whose entry must load the early side-effect module. */
+const EARLY_BROWSER_RECIPES = new Set<Recipe>([
+  "vite-spa",
+  "cra",
+  "next",
+  "sveltekit",
+  "nuxt",
+  "remix",
+  "astro",
+  "angular",
+  "capacitor",
+  "tauri",
+]);
+
+const EARLY_BROWSER_IMPORT =
+  /(?:^|[\s;(])(?:import|require)\s*(?:\(\s*)?["']crumbtrail-core\/early["']/m;
+
+function hasEarlyBrowserMarker(
+  input: BuildPlanInput,
+  io: InjectIO,
+  source?: string,
+): boolean {
+  if (!EARLY_BROWSER_RECIPES.has(input.recipe)) return true;
+  if (source && EARLY_BROWSER_IMPORT.test(source)) return true;
+  return reachableSourceFiles({
+    cwd: input.cwd,
+    recipe: input.recipe,
+    endpoint: input.endpoint,
+    entryFile: input.entryFile,
+    serviceName: input.serviceName,
+    io,
+  }).some((entry) => EARLY_BROWSER_IMPORT.test(entry.text));
+}
+
+function earlyCaptureUnavailablePlan(
+  input: BuildPlanInput,
+  file: string | null,
+  kind: "browser" | "static",
+): Plan {
+  const location = file
+    ? path.relative(input.cwd, file) || file
+    : "the existing integration";
+  const subject = kind === "static" ? "page" : "browser integration";
+  return {
+    recipe: input.recipe,
+    kind: "fallback-ai",
+    targetPath: null,
+    content: null,
+    snippet: "",
+    warnings: [
+      `This ${subject} is already wired but does not include early browser capture. The compatible SDK release is not available in this CLI yet, so ${location} was left unchanged. Upgrade to the coordinated CLI and crumbtrail-core release that supplies the early capture entry, then run setup again.`,
+    ],
+    ...(kind === "static" ? { keyIsSourceLiteral: true as const } : {}),
+  };
+}
+
+function earlyBrowserUpgradePlan(input: BuildPlanInput, io: InjectIO): Plan {
+  const reachable = reachableSourceFiles({
+    cwd: input.cwd,
+    recipe: input.recipe,
+    endpoint: input.endpoint,
+    entryFile: input.entryFile,
+    serviceName: input.serviceName,
+    io,
+  });
+  const file =
+    reachable.find((entry) => referencesCrumbtrail(entry.text))?.file ??
+    input.entryFile ??
+    null;
+  const version = browserEarlyCaptureVersion(input.sdkVersion);
+  if (!version || !file)
+    return earlyCaptureUnavailablePlan(input, file, "browser");
+  const status = io.gitStatus(input.cwd, file);
+  if (status.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: file,
+      content: 'import "crumbtrail-core/early";',
+      warnings: [
+        `This existing browser integration is missing early capture. The ${version} SDK supplies it, but ${path.relative(input.cwd, file) || file} has uncommitted changes.`,
+        "Confirm the edit or re-run with force to add the import.",
+      ],
+    };
+  }
+  return {
+    recipe: input.recipe,
+    kind: "prepend",
+    targetPath: file,
+    content: 'import "crumbtrail-core/early";',
+    warnings: [
+      `Added the early browser capture import to ${path.relative(input.cwd, file) || file}. It must run before this integration's initialization to retain first page errors and requests.`,
+    ],
+  };
+}
+
 function existingIntegrationPlan(
   input: BuildPlanInput,
   io: InjectIO,
@@ -544,7 +645,11 @@ function existingIntegrationPlan(
     serviceName: input.serviceName,
     io,
   });
-  if (status.complete) return skipPlan(input);
+  if (status.complete) {
+    if (!hasEarlyBrowserMarker(input, io, source))
+      return earlyBrowserUpgradePlan(input, io);
+    return skipPlan(input);
+  }
   return amendPlan(input, io, status) ?? incompletePlan(input, status);
 }
 
@@ -1023,6 +1128,7 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   // Prefer `src/` when the app uses a src directory.
   const usesSrc =
@@ -1110,6 +1216,7 @@ function planSvelteKit(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   if (io.exists(target)) {
     return prependWithPreflight(input, io, target, block);
@@ -1139,6 +1246,7 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   if (io.exists(target)) {
     const existing = io.readFile(target);
@@ -1160,6 +1268,7 @@ function planVite(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -1181,6 +1290,7 @@ function planCra(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -1351,6 +1461,7 @@ function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -1372,6 +1483,7 @@ function planAstro(input: BuildPlanInput, _io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   return fallbackPlan(input, block, [
     "Astro has no single client entry — add this snippet inside a client-side <script> in a shared layout (e.g. src/layouts/*.astro) so it runs on every page.",
@@ -1393,6 +1505,7 @@ function planAngular(input: BuildPlanInput, _io: InjectIO): Plan {
     "environment.crumbtrailKey",
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   return fallbackPlan(input, block, [
     "Angular has no browser-safe env-var mechanism — add `crumbtrailKey: '<your-ingest-key>'` to src/environments/environment.ts (get your key from the dashboard), import `environment`, and prepend the snippet above bootstrapApplication in src/main.ts.",
@@ -1413,6 +1526,102 @@ function staticBlockFor(input: BuildPlanInput): string {
     sdkVersion: input.sdkVersion,
     mintUrl: input.mintUrl,
   });
+}
+
+const STATIC_EARLY_BOOTSTRAP_MARKER =
+  /<script\b[^>]*\bsrc\s*=\s*(?:"[^"]*early-bootstrap\.global\.js|'[^']*early-bootstrap\.global\.js'|[^\s>]*early-bootstrap\.global\.js)[^>]*>/i;
+const STATIC_MODULE_VERSION =
+  /https:\/\/esm\.sh\/crumbtrail-core@(\d+\.\d+\.\d+)(?:["'/?#]|$)/i;
+
+function staticModuleVersion(html: string): string | null {
+  return STATIC_MODULE_VERSION.exec(html)?.[1] ?? null;
+}
+
+function staticBootstrapMismatchPlan(
+  input: BuildPlanInput,
+  target: string,
+  moduleVersion: string | null,
+  bootstrapVersion: string,
+): Plan {
+  const location = path.relative(input.cwd, target) || target;
+  const installed = moduleVersion
+    ? `its ESM import is pinned to ${moduleVersion}`
+    : "its ESM import version could not be determined";
+  return {
+    recipe: input.recipe,
+    kind: "fallback-ai",
+    targetPath: null,
+    content: null,
+    snippet: "",
+    keyIsSourceLiteral: true,
+    warnings: [
+      `${location} already references Crumbtrail, but ${installed}. The early bootstrap must match the ${bootstrapVersion} module release, so it was left unchanged. Update the page's crumbtrail-core ESM URL to ${bootstrapVersion} and run setup again.`,
+    ],
+  };
+}
+
+function staticEarlyBootstrapUpgrade(
+  input: BuildPlanInput,
+  io: InjectIO,
+  target: string,
+  html: string,
+): Plan {
+  const location = path.relative(input.cwd, target) || target;
+  const bootstrapUrl = browserEarlyBootstrapUrl(input.sdkVersion);
+  const bootstrapVersion = browserEarlyCaptureVersion(input.sdkVersion);
+  if (!bootstrapUrl || !bootstrapVersion)
+    return earlyCaptureUnavailablePlan(input, target, "static");
+  const moduleVersion = staticModuleVersion(html);
+  if (moduleVersion !== bootstrapVersion) {
+    return staticBootstrapMismatchPlan(
+      input,
+      target,
+      moduleVersion,
+      bootstrapVersion,
+    );
+  }
+
+  const content = insertIntoHtmlHead(
+    html,
+    `<script src=${JSON.stringify(bootstrapUrl)}></script>`,
+  );
+  if (content == null) {
+    return {
+      recipe: input.recipe,
+      kind: "fallback-ai",
+      targetPath: null,
+      content: null,
+      snippet: "",
+      keyIsSourceLiteral: true,
+      warnings: [
+        `${location} already references Crumbtrail but has no <head> or <body> for the early bootstrap. Add the parser blocking bootstrap before the page's first executable script, then run setup again.`,
+      ],
+    };
+  }
+  const status = io.gitStatus(input.cwd, target);
+  if (status.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: target,
+      content,
+      applyMode: "rewrite",
+      keyIsSourceLiteral: true,
+      warnings: [
+        `${location} already references Crumbtrail but is missing early browser capture. The ${bootstrapUrl} bootstrap is ready, but the file has uncommitted changes. Confirm the edit or re-run with force.`,
+      ],
+    };
+  }
+  return {
+    recipe: input.recipe,
+    kind: "rewrite",
+    targetPath: target,
+    content,
+    keyIsSourceLiteral: true,
+    warnings: [
+      `Added the early browser bootstrap before the first executable script in ${location}.`,
+    ],
+  };
 }
 
 /**
@@ -1444,9 +1653,12 @@ function planStatic(input: BuildPlanInput, io: InjectIO): Plan {
     ]);
   }
   if (htmlReferencesCrumbtrail(html)) {
-    return skipPlan(input, [
-      `${path.relative(input.cwd, target) || target} already references Crumbtrail — left as it is.`,
-    ]);
+    if (STATIC_EARLY_BOOTSTRAP_MARKER.test(html)) {
+      return skipPlan(input, [
+        `${path.relative(input.cwd, target) || target} already references Crumbtrail and has early browser capture — left as it is.`,
+      ]);
+    }
+    return staticEarlyBootstrapUpgrade(input, io, target, html);
   }
   const wired = insertIntoHtmlHead(html, block);
   if (wired == null) {
@@ -1498,9 +1710,14 @@ function planServedStaticFrontend(
   input: BuildPlanInput,
   io: InjectIO,
   entrySource: string,
-): { edits: NonNullable<Plan["extraEdits"]>; warnings: string[] } {
+): {
+  edits: NonNullable<Plan["extraEdits"]>;
+  warnings: string[];
+  unresolved: boolean;
+} {
   const edits: NonNullable<Plan["extraEdits"]> = [];
   const warnings: string[] = [];
+  let unresolved = false;
   const entryDir = path.dirname(input.entryFile ?? path.join(input.cwd, "x"));
   const reader: FileReader = {
     readFile: (p) => io.readFile(p),
@@ -1531,7 +1748,22 @@ function planServedStaticFrontend(
       continue;
     }
     const html = io.readFile(indexPath)!;
-    if (htmlReferencesCrumbtrail(html)) continue;
+    if (htmlReferencesCrumbtrail(html)) {
+      if (STATIC_EARLY_BOOTSTRAP_MARKER.test(html)) continue;
+      const upgrade = staticEarlyBootstrapUpgrade(input, io, indexPath, html);
+      warnings.push(...upgrade.warnings);
+      if (upgrade.kind === "rewrite" && upgrade.content) {
+        edits.push({
+          path: indexPath,
+          mode: "update",
+          content: upgrade.content,
+          label: `added early browser capture to ${path.relative(input.cwd, indexPath) || indexPath}`,
+        });
+      } else {
+        unresolved = true;
+      }
+      continue;
+    }
     const wired = insertIntoHtmlHead(
       html,
       staticScriptTagSnippet({
@@ -1565,7 +1797,7 @@ function planServedStaticFrontend(
       `Wired browser capture into ${rel}, the page this server serves. Replace ${KEY_PLACEHOLDER} in it with your ingest key — a page with no bundler has no env var to read.`,
     );
   }
-  return { edits, warnings };
+  return { edits, warnings, unresolved };
 }
 
 /**
@@ -1610,6 +1842,7 @@ function planCapacitor(input: BuildPlanInput, io: InjectIO): Plan {
     keyExpr,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
 
   // Native plugins are optional peers, so the SDK degrades rather than failing
@@ -1789,7 +2022,7 @@ const TAURI_RUST_WARNINGS = [
 function planTauri(input: BuildPlanInput, io: InjectIO): Plan {
   // The Tauri transport routes to the local Rust store, so the block needs no
   // endpoint/apiKey — but they still thread through fallbackPlan's agent prompt.
-  const block = tauriInitSnippet();
+  const block = tauriInitSnippet(input.sdkVersion);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the Tauri frontend entry from index.html — wire it manually.",
@@ -3334,6 +3567,12 @@ export function buildPlan(
         plan.keyIsSourceLiteral = true;
       }
       plan.warnings = [...plan.warnings, ...served.warnings];
+      if (served.unresolved && plan.kind === "skip-already-wired") {
+        plan.kind = "fallback-ai";
+        plan.snippet = "";
+        plan.targetPath = null;
+        plan.content = null;
+      }
     }
   }
   return plan;

@@ -92,7 +92,12 @@ describe("buildPlan — Next.js", () => {
       [p("instrumentation-client.js")]: existing,
     });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "next", endpoint: ENDPOINT, nextVersion: "15.5.12" },
+      {
+        cwd: CWD,
+        recipe: "next",
+        endpoint: ENDPOINT,
+        nextVersion: "15.5.12",
+      },
       io,
     );
     // "prepend", not "create": the customer's Sentry and PostHog init survives
@@ -111,7 +116,13 @@ describe("buildPlan — Next.js", () => {
         '"use client";\nexport const register = () => {};\n',
     });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "next", endpoint: ENDPOINT, nextVersion: "15.5.12" },
+      {
+        cwd: CWD,
+        recipe: "next",
+        endpoint: ENDPOINT,
+        nextVersion: "15.5.12",
+        sdkVersion: "0.49.0",
+      },
       io,
     );
     expect(plan.kind).toBe("prepend");
@@ -120,8 +131,12 @@ describe("buildPlan — Next.js", () => {
       plan.content!,
     );
     expect(materialized.startsWith('"use client";')).toBe(true);
-    expect(materialized.indexOf('import "crumbtrail-core/early";')).toBeLessThan(
-      materialized.indexOf('import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";'),
+    expect(
+      materialized.indexOf('import "crumbtrail-core/early";'),
+    ).toBeLessThan(
+      materialized.indexOf(
+        'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
+      ),
     );
   });
 
@@ -306,6 +321,83 @@ describe("buildPlan — Next.js", () => {
 });
 
 describe("buildPlan — idempotency", () => {
+  it("retrofits early capture into a complete framework integration", () => {
+    const source = [
+      'import { Crumbtrail } from "crumbtrail-core";',
+      "Crumbtrail.init({",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "  remoteConfig: true,",
+      '  service: "web",',
+      "});",
+      "",
+    ].join("\n");
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.49.0" },
+      }),
+      [installed("crumbtrail-core")]: JSON.stringify({
+        name: "crumbtrail-core",
+        version: "0.49.0",
+      }),
+      [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+      [p("src", "main.ts")]: source,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.targetPath).toBe(p("src", "main.ts"));
+    expect(plan.content).toBe('import "crumbtrail-core/early";');
+  });
+
+  it("returns an upgrade action instead of skipping a framework integration on an older SDK", () => {
+    const source = [
+      'import { Crumbtrail } from "crumbtrail-core";',
+      "Crumbtrail.init({",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "  remoteConfig: true,",
+      '  service: "web",',
+      "});",
+      "",
+    ].join("\n");
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.48.0" },
+      }),
+      [installed("crumbtrail-core")]: JSON.stringify({
+        name: "crumbtrail-core",
+        version: "0.48.0",
+      }),
+      [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+      [p("src", "main.ts")]: source,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+        serviceName: "web",
+        sdkVersion: "0.48.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.content).toBeNull();
+    expect(plan.warnings.join(" ")).toMatch(/upgrade/i);
+    expect(plan.warnings.join(" ")).not.toContain("skip");
+  });
+
   it("does not skip when package.json only depends on crumbtrail-core", () => {
     const io = fakeInjectIO({
       [p("package.json")]: JSON.stringify({
@@ -421,7 +513,12 @@ describe("buildPlan — SvelteKit / Nuxt", () => {
     // No app/ dir (Nuxt 3 default): the plugin lands in the repo-root plugins/.
     const io = fakeInjectIO({ [p("package.json")]: "{}" });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "nuxt", endpoint: ENDPOINT },
+      {
+        cwd: CWD,
+        recipe: "nuxt",
+        endpoint: ENDPOINT,
+        sdkVersion: "0.49.0",
+      },
       io,
     );
     expect(plan.kind).toBe("create");
@@ -624,6 +721,7 @@ describe("buildPlan — Capacitor", () => {
         recipe: "capacitor",
         endpoint: ENDPOINT,
         entryFile: p("src", "main.tsx"),
+        sdkVersion: "0.49.0",
       },
       io,
     );
@@ -1050,6 +1148,7 @@ describe("buildPlan — Remix", () => {
         recipe: "remix",
         endpoint: ENDPOINT,
         entryFile: p("app", "entry.client.tsx"),
+        sdkVersion: "0.49.0",
       },
       io,
     );
@@ -1073,6 +1172,7 @@ describe("buildPlan — Remix", () => {
         recipe: "remix",
         endpoint: ENDPOINT,
         entryFile: null,
+        sdkVersion: "0.49.0",
       },
       io,
     );
@@ -1110,6 +1210,7 @@ describe("buildPlan — Astro", () => {
         recipe: "astro",
         endpoint: ENDPOINT,
         entryFile: null,
+        sdkVersion: "0.49.0",
       },
       io,
     );
@@ -1142,6 +1243,7 @@ describe("buildPlan — Angular", () => {
         recipe: "angular",
         endpoint: ENDPOINT,
         entryFile: p("src", "main.ts"),
+        sdkVersion: "0.49.0",
       },
       io,
     );

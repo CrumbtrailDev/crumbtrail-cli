@@ -116,6 +116,39 @@ describe("insertIntoHtmlHead", () => {
     expect(out.indexOf("<script>early</script>")).toBeLessThan(
       out.indexOf('<script type=module src="/app.js"></script>'),
     );
+    expect(out.indexOf("<script>early</script>")).toBeLessThan(
+      out.indexOf(
+        '<script type="text/javascript; charset=utf-8" src="/legacy.js"></script>',
+      ),
+    );
+  });
+
+  it.each([
+    "application/ecmascript",
+    "application/javascript",
+    "application/x-ecmascript",
+    "application/x-javascript",
+    "text/ecmascript",
+    "text/javascript",
+    "text/javascript1.0",
+    "text/javascript1.1",
+    "text/javascript1.2",
+    "text/javascript1.3",
+    "text/javascript1.4",
+    "text/javascript1.5",
+    "text/jscript",
+    "text/livescript",
+    "text/x-ecmascript",
+    "text/x-javascript",
+  ])("recognizes legacy JavaScript MIME type %s", (type) => {
+    const html = PAGE.replace(
+      "    <title>Landing</title>",
+      `    <title>Landing</title>\n    <script type="${type}">app()</script>`,
+    );
+    const out = insertIntoHtmlHead(html, "<script>early</script>")!;
+    expect(out.indexOf("<script>early</script>")).toBeLessThan(
+      out.indexOf(`<script type="${type}">`),
+    );
   });
 
   it("skips commented script tags and script-like data text", () => {
@@ -186,16 +219,13 @@ describe("insertIntoHtmlHead", () => {
     );
   });
 
-  it("does not treat an explicit empty type as executable", () => {
+  it("treats an explicit empty type as executable", () => {
     const html = PAGE.replace(
       "    <title>Landing</title>",
       '    <title>Landing</title>\n    <script type="">data</script>\n    <script src="/app.js"></script>',
     );
     const out = insertIntoHtmlHead(html, "<script>early</script>")!;
     expect(out.indexOf("<script>early</script>")).toBeLessThan(
-      out.indexOf('<script src="/app.js"></script>'),
-    );
-    expect(out.indexOf("<script>early</script>")).toBeGreaterThan(
       out.indexOf('<script type="">data</script>'),
     );
   });
@@ -314,16 +344,16 @@ describe("buildPlan — static", () => {
       fakeInjectIO({}),
     );
     expect(plan.kind).toBe("fallback-ai");
-    expect(plan.snippet).toContain("early-bootstrap.global.js");
+    expect(plan.snippet).not.toContain("early-bootstrap.global.js");
     expect(plan.snippet).toContain('<script type="module">');
     // The JS agent prompt would tell a bundler-less page to npm install and read
     // import.meta.env; the tag above is the whole instruction.
     expect(plan.agentPrompt).toBeUndefined();
     expect(plan.warnings.join(" ")).toMatch(/Paste the script tag/);
-    expect(plan.snippet).toContain("crumbtrail-core@0.49.0");
+    expect(plan.snippet).toContain("https://esm.sh/crumbtrail-core@0.31.0");
   });
 
-  it("raises an older static SDK version to the bootstrap capability floor", () => {
+  it("keeps an older static SDK at the published SDK floor without a bootstrap", () => {
     const plan = buildPlan(
       {
         cwd: CWD,
@@ -334,12 +364,58 @@ describe("buildPlan — static", () => {
       },
       fakeInjectIO({ [p("index.html")]: PAGE }),
     );
-    expect(plan.content).toContain(
-      "https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js",
+    expect(plan.content).not.toContain("early-bootstrap.global.js");
+    expect(plan.content).toContain("https://esm.sh/crumbtrail-core@0.48.0");
+  });
+
+  it("retrofits an existing static integration once a compatible SDK is supplied", () => {
+    const wired = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script type="module">',
+        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "${KEY_PLACEHOLDER}", remoteConfig: true, service: "web" });`,
+        "</script>",
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
     );
-    expect(plan.content).toContain(
-      "https://esm.sh/crumbtrail-core@0.49.0",
+    expect(plan.kind).toBe("rewrite");
+    expect(plan.content).toContain("early-bootstrap.global.js");
+    expect(plan.content!.indexOf("early-bootstrap.global.js")).toBeLessThan(
+      plan.content!.indexOf('<script type="module">'),
     );
+  });
+
+  it("returns an upgrade action instead of adding a mismatched bootstrap", () => {
+    const wired = insertIntoHtmlHead(
+      PAGE,
+      '<script type="module">import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.48.0";</script>',
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.content).toBeNull();
+    expect(plan.warnings.join(" ")).toContain("pinned to 0.48.0");
+    expect(plan.warnings.join(" ")).not.toContain("early-bootstrap.global.js");
+    expect(plan.warnings.join(" ")).toMatch(/upgrade/i);
   });
 
   it("re-run: says the one remaining step instead of the snippet again", () => {
@@ -347,7 +423,7 @@ describe("buildPlan — static", () => {
       PAGE,
       [
         '<script type="module">',
-        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@1.2.3";',
+        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
         `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "${KEY_PLACEHOLDER}", remoteConfig: true, service: "web" });`,
         "</script>",
       ].join("\n"),
@@ -360,11 +436,12 @@ describe("buildPlan — static", () => {
         endpoint: ENDPOINT,
         entryFile: p("index.html"),
         serviceName: "web",
+        sdkVersion: "0.49.0",
       },
       io,
     );
-    expect(plan.kind).toBe("skip-already-wired");
-    expect(plan.warnings.join(" ")).toContain(KEY_PLACEHOLDER);
+    expect(plan.kind).toBe("rewrite");
+    expect(plan.content).toContain("early-bootstrap.global.js");
     expect(plan.warnings.join(" ")).not.toContain("Nothing to inject");
   });
 });
@@ -393,6 +470,7 @@ describe("buildPlan — the frontend an Express app serves", () => {
         endpoint: ENDPOINT,
         entryFile: p("server.js"),
         serviceName: "api",
+        sdkVersion: "0.49.0",
       },
       io,
     );
@@ -453,5 +531,52 @@ describe("buildPlan — the frontend an Express app serves", () => {
     expect(
       (plan.extraEdits ?? []).some((edit) => edit.path.includes("index.html")),
     ).toBe(false);
+  });
+
+  it("retrofits early capture into an existing served page", () => {
+    const server = [
+      'import express from "express";',
+      'import { Crumbtrail } from "crumbtrail-core";',
+      'import { createCrumbtrailExpressMiddleware, createCrumbtrailExpressErrorMiddleware } from "crumbtrail-node";',
+      "const app = express();",
+      'app.use(createCrumbtrailExpressMiddleware({ endpoint: "https://ingest.example.com", authToken: process.env.CRUMBTRAIL_KEY }));',
+      'app.use(express.static("public"));',
+      "app.use(createCrumbtrailExpressErrorMiddleware());",
+      "app.listen(3000);",
+      "",
+    ].join("\n");
+    const page = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script type="module">',
+        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "${KEY_PLACEHOLDER}", remoteConfig: true, service: "api" });`,
+        "</script>",
+      ].join("\n"),
+    )!;
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({ dependencies: { express: "^4" } }),
+      [p("server.js")]: server,
+      [p("public", "index.html")]: page,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+        serviceName: "api",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    const extra = (plan.extraEdits ?? []).find(
+      (edit) => edit.path === p("public", "index.html"),
+    );
+    expect(extra).toBeDefined();
+    expect(extra!.content.indexOf("early-bootstrap.global.js")).toBeLessThan(
+      extra!.content.indexOf('<script type="module">'),
+    );
+    expect(plan.warnings.join(" ")).toContain("early browser bootstrap");
   });
 });

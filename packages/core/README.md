@@ -155,9 +155,11 @@ text only in page memory and `init()` drains it through the normal redaction
 pipeline before emission. If `init()` never runs within 60 seconds, the queue
 and early resource listener are dropped and the patches become pass-throughs.
 
-For a page with no bundler, load the published classic bootstrap before the
-page's first executable script. The CLI's static recipe pins this URL to the
-same exact SDK release as the module that initializes the SDK:
+After the coordinated SDK 0.49.0 release is published, a page with no bundler
+can load the published classic bootstrap before the page's first executable
+script. The CLI's static recipe emits this URL only when that compatible SDK
+release is supplied, and pins it to the same exact release as the module that
+initializes the SDK:
 
 ```html
 <script src="https://unpkg.com/crumbtrail-core@<version>/dist/early-bootstrap.global.js"></script>
@@ -176,6 +178,10 @@ offline or stricter policies, self-host the published `dist` files, including
 relative ESM chunks, replace both pinned URLs, and use an approved external or
 nonce/hash-approved module. If the bootstrap itself is blocked or unavailable,
 no early hooks can run.
+
+An older CLI or SDK does not emit a bootstrap URL. It keeps the module import
+at the supported SDK floor and tells a rerun to upgrade to the coordinated
+release before adding early capture.
 
 ### Presets
 

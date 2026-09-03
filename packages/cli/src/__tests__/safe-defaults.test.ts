@@ -73,15 +73,22 @@ describe("browser inits opt out of the collectors that record the person", () =>
 describe("early browser capture", () => {
   it("starts before each supported browser initializer", () => {
     const snippets: Array<[string, string]> = [
-      ["client", clientInitSnippet(ENDPOINT, CLIENT_KEY, "web")],
-      ["nuxt", nuxtPluginSnippet(ENDPOINT, CLIENT_KEY, "web")],
-      ["capacitor", capacitorInitSnippet(ENDPOINT, CLIENT_KEY, "app")],
-      ["tauri", tauriInitSnippet()],
+      [
+        "client",
+        clientInitSnippet(ENDPOINT, CLIENT_KEY, "web", null, "0.49.0"),
+      ],
+      ["nuxt", nuxtPluginSnippet(ENDPOINT, CLIENT_KEY, "web", null, "0.49.0")],
+      [
+        "capacitor",
+        capacitorInitSnippet(ENDPOINT, CLIENT_KEY, "app", null, "0.49.0"),
+      ],
+      ["tauri", tauriInitSnippet("0.49.0")],
       [
         "static",
         staticScriptTagSnippet({
           endpoint: ENDPOINT,
           keyLiteral: "ctkey_TODO",
+          sdkVersion: "0.49.0",
         }),
       ],
     ];
@@ -96,8 +103,21 @@ describe("early browser capture", () => {
     );
   });
 
+  it("does not emit an early URL or import before the coordinated SDK release", () => {
+    const staticSnippet = staticScriptTagSnippet({
+      endpoint: ENDPOINT,
+      keyLiteral: "ctkey_TODO",
+      sdkVersion: "0.48.0",
+    });
+    expect(staticSnippet).not.toContain("early-bootstrap.global.js");
+    expect(staticSnippet).toContain("https://esm.sh/crumbtrail-core@0.48.0");
+    expect(
+      clientInitSnippet(ENDPOINT, CLIENT_KEY, "web", null, "0.48.0"),
+    ).not.toContain("crumbtrail-core/early");
+  });
+
   it("starts Tauri early capture before its main SDK import", () => {
-    const snippet = tauriInitSnippet();
+    const snippet = tauriInitSnippet("0.49.0");
     expect(snippet.indexOf('import "crumbtrail-core/early";')).toBeLessThan(
       snippet.indexOf(
         'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
