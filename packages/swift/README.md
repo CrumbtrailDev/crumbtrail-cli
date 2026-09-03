@@ -11,14 +11,17 @@ Use this for a native Swift app. If your app is React Native use
 
 ## Install
 
-Swift Package Manager, in `Package.swift`:
+The Swift SDK is built and tested in this repository but is not published as a
+standalone Swift Package Manager dependency yet. Add the local package from an
+app checkout:
 
 ```swift
-.package(url: "https://github.com/CrumbtrailDev/crumbtrail-cli.git", from: "0.1.0")
+.package(path: "../crumbtrail-cli/packages/swift")
 ```
 
-or in Xcode: **File → Add Package Dependencies**, paste the repository URL, and
-pick the `Crumbtrail` library.
+In Xcode, choose **File → Add Package Dependencies → Add Local…** and select
+`packages/swift`. No standalone Git URL or registry version is available until a
+release publishes this package.
 
 ## Setup
 
@@ -48,10 +51,10 @@ agent key in an app.
 | Event | Source |
 | --- | --- |
 | `native-crash` | An uncaught exception from the **previous** launch |
-| `native-hang` | Foreground main thread stalls after recovery or on the next launch |
+| `native-hang` | Foreground main thread stalls after recovery or on the next launch, when enabled |
 | `err` | Errors you report with `recordError` |
 | `net` | HTTP requests, when the URLProtocol is registered (see below) |
-| `app-lifecycle` | Foreground, background, terminate, and memory warnings |
+| `app-lifecycle` | Foreground, background, terminate, and memory warnings when app-lifecycle capture is enabled |
 | `env` | Device, OS, app version and locale at startup; orientation on rotation |
 
 ### Crashes are reported on the next launch
@@ -66,24 +69,47 @@ Crumbtrail chains to any exception handler already installed rather than
 replacing it, so adding this SDK does not silently disable an existing crash
 reporter.
 
-### Main thread hangs and MetricKit diagnostics
+### Opt in to main thread hangs and MetricKit diagnostics
 
-The default configuration watches the foreground main thread with a five second
-threshold. The watchdog pauses when the app becomes inactive or enters the
-background and while a debugger is attached. It automatically resumes polling
-when the debugger detaches. A missed heartbeat is written to a bounded file in
-Application Support and emitted when the main thread recovers. If the process
-never recovers, the next launch emits `native-hang` with `previousLaunch: true`
-and `recovered: false`. Stacks are limited to 64 frames and 8,192 characters.
-The handoff is cleared only after the logger accepts the event. Atomic
-replacement temporary files are isolated in a bounded Application Support
-directory and stale files are removed during later store access.
+Native watchdogs and native diagnostics are disabled by default. Enable the
+switches only after the app's capture consent has been granted:
 
-On iOS 14 and newer, MetricKit diagnostics are imported through the optional
-framework. Hang diagnostics are emitted as `native-hang` and crash diagnostics
-as `native-crash`, both marked as previous launch observations. MetricKit is
-not used on tvOS. The SDK does not install signal handlers or swizzle system
-classes.
+```swift
+Crumbtrail.start(config: CrumbtrailConfig(
+    endpoint: "https://api.crumbtrail.ai",
+    ingestKey: ProcessInfo.processInfo.environment["CRUMBTRAIL_KEY"],
+    // Set these only after the app's capture consent has been granted.
+    collectors: CrumbtrailCollectors(
+        nativeWatchdog: true,
+        nativeDiagnostics: true
+    )
+))
+```
+
+When enabled, the watchdog uses a five second threshold. It pauses when the app
+becomes inactive or enters the background and while a debugger is attached. It
+resumes polling when the debugger detaches. A missed heartbeat is written to a
+bounded file in Application Support and emitted when the main thread recovers.
+If the process never recovers, the next launch emits `native-hang` with
+`previousLaunch: true` and `recovered: false`. Stacks are limited to 64 frames
+and 8,192 characters. The handoff is cleared only after the logger accepts the
+event. Atomic replacement temporary files are isolated in a bounded Application
+Support directory and stale files are removed during later store access.
+
+`nativeWatchdog` observes foreground and background state independently of
+`appLifecycle`. You can disable lifecycle event capture without disabling hang
+detection or causing background time to be reported as a hang.
+
+On iOS 14 and newer, and macOS 12 and newer when the optional framework is
+available, native diagnostics imports MetricKit diagnostics. Hang diagnostics
+are emitted as `native-hang` and crash diagnostics as `native-crash`, both
+marked as previous launch observations. MetricKit is not used on tvOS or
+watchOS. The SDK does not install signal handlers or swizzle system classes.
+Credential-shaped values in native diagnostic text are replaced with
+`[REDACTED]` before storage or delivery. `Crumbtrail.start` installs
+process-wide collectors, so call it once per process. Multiple `Crumbtrail`
+instances created with `init` remain supported for manual event routing, but
+they do not install platform collectors.
 
 ### Network capture needs one line from you
 
@@ -182,6 +208,7 @@ CrumbtrailConfig(
     queueCapacity: 2000,
     flushBatchSize: 50,
     flushIntervalSeconds: 10,
+    // Set these only after the app's capture consent has been granted.
     collectors: CrumbtrailCollectors(
         network: false,
         nativeWatchdog: true,

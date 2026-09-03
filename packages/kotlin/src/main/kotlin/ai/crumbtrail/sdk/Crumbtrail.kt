@@ -67,11 +67,15 @@ data class CrumbtrailCollectors(
     val appLifecycle: Boolean = true,
     val navigation: Boolean = true,
     val environment: Boolean = true,
-    /** Foreground main-thread watchdog with a five second default threshold. */
-    val nativeWatchdog: Boolean = true,
-    /** Previous-launch process exits, memory pressure and native diagnostics. */
-    val nativeDiagnostics: Boolean = true,
-)
+    /** Foreground main-thread watchdog with a five second threshold. Opt in after capture consent. */
+    val nativeWatchdog: Boolean = false,
+    /** Previous-launch process exits, memory pressure and native diagnostics. Opt in after capture consent. */
+    val nativeDiagnostics: Boolean = false,
+) {
+    /** Platform lifecycle observation needed internally, even when lifecycle events are disabled. */
+    internal val needsApplicationLifecycleObserver: Boolean
+        get() = appLifecycle || nativeWatchdog
+}
 
 data class CrumbtrailConfig(
     val endpoint: String,
@@ -222,10 +226,15 @@ class Crumbtrail(
         addEvent(
             CrumbtrailEventKind.ERROR,
             JsonValue.of(
-                "msg" to JsonValue.Str(throwable.message ?: throwable.toString()),
-                "stk" to JsonValue.str(throwable.stackTraceToString()),
+                "msg" to JsonValue.Str(
+                    redactedDiagnosticText(
+                        throwable.message ?: throwable.toString(),
+                        1_024,
+                    ) ?: "unknown error"
+                ),
+                "stk" to JsonValue.str(redactedDiagnosticText(throwable.stackTraceToString())),
                 "fatal" to JsonValue.Bool(fatal),
-                "source" to JsonValue.Str(source),
+                "source" to JsonValue.Str(redactedDiagnosticText(source, 256) ?: "manual"),
             ),
         )
     }
@@ -247,8 +256,8 @@ class Crumbtrail(
                 "status" to JsonValue.num(status),
                 "ok" to JsonValue.bool(status?.let { it in 200..299 }),
                 "dur" to JsonValue.Num(durationMs),
-                "source" to JsonValue.Str(source),
-                "error" to JsonValue.str(error),
+                "source" to JsonValue.Str(redactedDiagnosticText(source, 256) ?: "okhttp"),
+                "error" to JsonValue.str(redactedDiagnosticText(error, 1_024)),
             ),
         )
     }

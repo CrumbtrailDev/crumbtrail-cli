@@ -148,8 +148,14 @@ hang imports. Its required payload is:
 The event is additive and does not change the meaning of `app-lifecycle`.
 Memory pressure and process termination remain `app-lifecycle` observations.
 The Swift and Kotlin SDKs emit `native-hang` when their native watchdogs are
-enabled. Other SDKs may support the shared contract without implementing a
-platform watchdog.
+explicitly enabled by the host after app capture consent. Their default collector
+configuration leaves native watchdog and native diagnostic capture off. The SDKs
+do not infer or grant consent. Other SDKs may support the shared contract without
+implementing a platform watchdog.
+
+Native watchdog enablement is independent of lifecycle event capture. A platform
+adapter may observe foreground state internally to pause the watchdog without
+emitting `app-lifecycle` events.
 
 `err` also allows `componentStk`, the framework component path a render crash
 happened inside. It is emitted by the React and React Native error boundaries

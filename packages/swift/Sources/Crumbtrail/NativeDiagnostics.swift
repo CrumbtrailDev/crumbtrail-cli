@@ -9,6 +9,12 @@ public let crumbtrailMaxDiagnosticStackFrames = 64
 public let crumbtrailMaxPendingHangFileBytes = 128 * 1024
 public let crumbtrailNativeHangThresholdMilliseconds: Int64 = 5_000
 public let crumbtrailMaxNativeHangDurationMilliseconds: Int64 = 86_400_000
+public let crumbtrailMaxMetricKitDiagnostics = 32
+public let crumbtrailMaxMetricKitPayloads = 32
+
+private let crumbtrailDiagnosticCredentialPattern = try! NSRegularExpression(
+    pattern: #"(?i)(\b(?:authorization|cookie|set-cookie|proxy-authorization|www-authenticate|x[-_]?api[-_]?key|x[-_]?auth[-_]?token|x[-_]?csrf[-_]?token|access[-_]?token|refresh[-_]?token|client[-_]?secret|api[-_]?key|auth[-_]?(?:token|key)|token|secret|password|passwd|credential|signature|bearer)\b\s*(?:[:=]\s*|\s+))([^\s,;]+)"#
+)
 
 /// Keep diagnostic text bounded before it reaches the event queue or disk.
 public func crumbtrailBoundedDiagnosticText(
@@ -17,6 +23,21 @@ public func crumbtrailBoundedDiagnosticText(
 ) -> String? {
     guard let value, !value.isEmpty, maxCharacters > 0 else { return nil }
     return value.count <= maxCharacters ? value : String(value.prefix(maxCharacters))
+}
+
+/// Remove credential-shaped values from diagnostic text before it leaves the device.
+public func crumbtrailRedactedDiagnosticText(
+    _ value: String?,
+    maxCharacters: Int = crumbtrailMaxDiagnosticStackCharacters
+) -> String? {
+    guard let bounded = crumbtrailBoundedDiagnosticText(value, maxCharacters: maxCharacters)
+    else { return nil }
+    let range = NSRange(bounded.startIndex..<bounded.endIndex, in: bounded)
+    return crumbtrailDiagnosticCredentialPattern.stringByReplacingMatches(
+        in: bounded,
+        range: range,
+        withTemplate: "$1[REDACTED]"
+    )
 }
 
 /// A main-thread hang waiting for recovery or a later launch.
@@ -46,6 +67,30 @@ public protocol CrumbtrailPendingHangStore: AnyObject {
     func write(_ hang: CrumbtrailPendingHang)
     func read() -> CrumbtrailPendingHang?
     func clear()
+
+    /// Claim the single durable slot without racing another watchdog instance.
+    @discardableResult
+    func writeIfEmpty(_ hang: CrumbtrailPendingHang) -> Bool
+
+    /// Clear only the record this watchdog claimed, not a replacement record.
+    @discardableResult
+    func clearIfMatches(_ hang: CrumbtrailPendingHang) -> Bool
+}
+
+public extension CrumbtrailPendingHangStore {
+    @discardableResult
+    func writeIfEmpty(_ hang: CrumbtrailPendingHang) -> Bool {
+        guard read() == nil else { return false }
+        write(hang)
+        return read() == hang
+    }
+
+    @discardableResult
+    func clearIfMatches(_ hang: CrumbtrailPendingHang) -> Bool {
+        guard read() == hang else { return false }
+        clear()
+        return true
+    }
 }
 
 public final class MemoryPendingHangStore: CrumbtrailPendingHangStore {
@@ -67,6 +112,23 @@ public final class MemoryPendingHangStore: CrumbtrailPendingHangStore {
         lock.lock()
         defer { lock.unlock() }
         hang = nil
+    }
+    @discardableResult
+    public func writeIfEmpty(_ hang: CrumbtrailPendingHang) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.hang == nil else { return false }
+        self.hang = hang
+        return true
+    }
+
+    @discardableResult
+    public func clearIfMatches(_ hang: CrumbtrailPendingHang) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.hang == hang else { return false }
+        self.hang = nil
+        return true
     }
 }
 
@@ -132,7 +194,7 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
     private var running = false
     private var generation: Int64 = 0
     private var lastHeartbeatAt: Int64 = 0
-    private var pendingAt: Int64?
+    private var pendingHang: CrumbtrailPendingHang?
     private var pendingStartedMonotonic: Int64?
     private var checkTask: CrumbtrailWatchdogTask?
     private var debuggerPollTask: CrumbtrailWatchdogTask?
@@ -237,18 +299,19 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
         lock.lock()
         if running && generation == token {
             let elapsed = max(0, current - lastHeartbeatAt)
-            if elapsed >= thresholdMs && pendingAt == nil && handoff.read() == nil {
+            if elapsed >= thresholdMs && pendingHang == nil && handoff.read() == nil {
                 let at = wallNow()
                 let pending = CrumbtrailPendingHang(
                     thresholdMs: thresholdMs,
                     observedDurationMs: min(elapsed, crumbtrailMaxNativeHangDurationMilliseconds),
-                    stack: crumbtrailBoundedDiagnosticText(captureStack()),
+                    stack: crumbtrailRedactedDiagnosticText(captureStack()),
                     at: at,
                     startedAt: max(0, at - elapsed)
                 )
-                handoff.write(pending)
-                pendingAt = at
-                pendingStartedMonotonic = lastHeartbeatAt
+                if handoff.writeIfEmpty(pending) {
+                    pendingHang = pending
+                    pendingStartedMonotonic = lastHeartbeatAt
+                }
             }
         }
         lock.unlock()
@@ -265,8 +328,8 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
             return
         }
         let current = now()
-        let pending = handoff.read()
-        if let activeAt = pendingAt, let pending, pending.at == activeAt {
+        let pending = pendingHang
+        if let pending {
             let duration: Int64
             if let started = pendingStartedMonotonic {
                 duration = min(
@@ -279,7 +342,7 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
                     crumbtrailMaxNativeHangDurationMilliseconds
                 )
             }
-            pendingAt = nil
+            pendingHang = nil
             pendingStartedMonotonic = nil
             observation = CrumbtrailNativeHang(
                 thresholdMs: pending.thresholdMs,
@@ -290,9 +353,10 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
             )
         }
         lastHeartbeatAt = current
-        if let observation {
+        if let observation, let expectedHang = pending {
             scheduler.postToBackground {
-                if self.onHang(observation) { self.handoff.clear() }
+                guard self.handoff.read() == expectedHang else { return }
+                if self.onHang(observation) { _ = self.handoff.clearIfMatches(expectedHang) }
             }
         }
         lock.unlock()
@@ -380,10 +444,10 @@ public func drainPendingHang(
             ),
             recovered: false,
             previousLaunch: true,
-            stack: crumbtrailBoundedDiagnosticText(pending.stack)
+                stack: crumbtrailRedactedDiagnosticText(pending.stack)
         )
     )
-    if accepted { handoff.clear() }
+    if accepted { _ = handoff.clearIfMatches(pending) }
     return accepted
 }
 
@@ -400,6 +464,7 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
     private static let temporaryFileLifetime: TimeInterval = 24 * 60 * 60
     private static let maximumTemporaryFilesToInspect = 32
     private static let maximumTemporaryFilesToRemove = 8
+    private static let handoffLock = NSLock()
     private let fileURL: URL?
     private let fileManager: FileManager
 
@@ -411,19 +476,23 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
         cleanupTemporaryFiles()
     }
 
-    public func write(_ hang: CrumbtrailPendingHang) {
+    private func encodedData(for hang: CrumbtrailPendingHang) -> Data? {
+        try? JSONEncoder().encode(
+            CrumbtrailPendingHang(
+                thresholdMs: min(max(0, hang.thresholdMs), crumbtrailMaxNativeHangDurationMilliseconds),
+                observedDurationMs: min(max(0, hang.observedDurationMs), crumbtrailMaxNativeHangDurationMilliseconds),
+                stack: crumbtrailRedactedDiagnosticText(hang.stack),
+                at: hang.at,
+                startedAt: hang.startedAt
+            )
+        )
+    }
+
+    private func writeUnlocked(_ hang: CrumbtrailPendingHang) -> Bool {
         guard let fileURL,
-              let data = try? JSONEncoder().encode(
-                  CrumbtrailPendingHang(
-                      thresholdMs: hang.thresholdMs,
-                      observedDurationMs: hang.observedDurationMs,
-                      stack: crumbtrailBoundedDiagnosticText(hang.stack),
-                      at: hang.at,
-                      startedAt: hang.startedAt
-                  )
-              ),
+              let data = encodedData(for: hang),
               data.count <= crumbtrailMaxPendingHangFileBytes
-        else { return }
+        else { return false }
 
         cleanupTemporaryFiles()
         let temporaryDirectory = temporaryDirectoryURL(for: fileURL)
@@ -443,12 +512,43 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
             } else {
                 try fileManager.moveItem(at: temporaryURL, to: fileURL)
             }
+            return true
         } catch {
             try? fileManager.removeItem(at: temporaryURL)
+            return false
         }
     }
 
-    public func read() -> CrumbtrailPendingHang? {
+    public func write(_ hang: CrumbtrailPendingHang) {
+        Self.handoffLock.lock()
+        defer { Self.handoffLock.unlock() }
+        _ = writeUnlocked(hang)
+    }
+
+    @discardableResult
+    public func writeIfEmpty(_ hang: CrumbtrailPendingHang) -> Bool {
+        Self.handoffLock.lock()
+        defer { Self.handoffLock.unlock() }
+        guard readUnlocked() == nil else { return false }
+        return writeUnlocked(hang)
+    }
+
+    @discardableResult
+    public func clearIfMatches(_ hang: CrumbtrailPendingHang) -> Bool {
+        Self.handoffLock.lock()
+        defer { Self.handoffLock.unlock() }
+        guard readUnlocked() == hang else { return false }
+        cleanupTemporaryFiles()
+        guard let fileURL else { return false }
+        do {
+            try fileManager.removeItem(at: fileURL)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func readUnlocked() -> CrumbtrailPendingHang? {
         cleanupTemporaryFiles()
         guard let fileURL,
               let data = try? Data(contentsOf: fileURL),
@@ -456,15 +556,29 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
               let hang = try? JSONDecoder().decode(CrumbtrailPendingHang.self, from: data)
         else { return nil }
         return CrumbtrailPendingHang(
-            thresholdMs: hang.thresholdMs,
-            observedDurationMs: hang.observedDurationMs,
-            stack: crumbtrailBoundedDiagnosticText(hang.stack),
+            thresholdMs: min(
+                max(1, hang.thresholdMs),
+                crumbtrailMaxNativeHangDurationMilliseconds
+            ),
+            observedDurationMs: min(
+                max(0, hang.observedDurationMs),
+                crumbtrailMaxNativeHangDurationMilliseconds
+            ),
+            stack: crumbtrailRedactedDiagnosticText(hang.stack),
             at: hang.at,
             startedAt: hang.startedAt
         )
     }
 
+    public func read() -> CrumbtrailPendingHang? {
+        Self.handoffLock.lock()
+        defer { Self.handoffLock.unlock() }
+        return readUnlocked()
+    }
+
     public func clear() {
+        Self.handoffLock.lock()
+        defer { Self.handoffLock.unlock() }
         cleanupTemporaryFiles()
         guard let fileURL else { return }
         try? fileManager.removeItem(at: fileURL)
@@ -516,10 +630,13 @@ public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStor
 public final class CrumbtrailDispatchWatchdogScheduler: CrumbtrailWatchdogScheduler,
     @unchecked Sendable {
     private let queue = DispatchQueue(label: "ai.crumbtrail.native-watchdog", qos: .utility)
+    private let queueKey = DispatchSpecificKey<UInt8>()
     private let lock = NSLock()
     private var stopped = false
 
-    public init() {}
+    public init() {
+        queue.setSpecific(key: queueKey, value: 1)
+    }
 
     @discardableResult
     public func schedule(
@@ -550,6 +667,11 @@ public final class CrumbtrailDispatchWatchdogScheduler: CrumbtrailWatchdogSchedu
         lock.lock()
         stopped = true
         lock.unlock()
+    }
+
+    public func drain() {
+        if DispatchQueue.getSpecific(key: queueKey) != nil { return }
+        queue.sync {}
     }
 
     private final class DispatchWorkItemTask: CrumbtrailWatchdogTask {
@@ -620,7 +742,9 @@ public final class CrumbtrailMetricKitCollector: @unchecked Sendable {
     public func start() {
         source.start { [weak self] payloads in
             guard let self else { return }
-            for payload in payloads { self.consume(payload) }
+            for payload in payloads.prefix(crumbtrailMaxMetricKitPayloads) {
+                self.consume(payload)
+            }
         }
     }
 
@@ -631,7 +755,9 @@ public final class CrumbtrailMetricKitCollector: @unchecked Sendable {
         // malformed values before they can consume memory in JSONSerialization.
         guard data.count <= 2 * 1024 * 1024,
               let root = try? JSONSerialization.jsonObject(with: data) else { return }
-        for diagnostic in dictionaries(forKey: "hangDiagnostics", in: root) {
+        for diagnostic in dictionaries(
+            forKey: "hangDiagnostics", in: root, limit: crumbtrailMaxMetricKitDiagnostics
+        ) {
             guard let duration = durationMilliseconds(in: diagnostic) else { continue }
             emitHang(
                 CrumbtrailNativeHang(
@@ -643,32 +769,60 @@ public final class CrumbtrailMetricKitCollector: @unchecked Sendable {
                 )
             )
         }
-        for diagnostic in dictionaries(forKey: "crashDiagnostics", in: root) {
+        for diagnostic in dictionaries(
+            forKey: "crashDiagnostics", in: root, limit: crumbtrailMaxMetricKitDiagnostics
+        ) {
             let message = firstString(
                 keys: ["terminationReason", "exceptionType", "exceptionReason"],
                 in: diagnostic
             ) ?? "MetricKit crash"
             emitCrash(
                 CrumbtrailNativeCrash(
-                    message: String(message.prefix(1_024)),
+                    message: crumbtrailRedactedDiagnosticText(message, maxCharacters: 1_024)
+                        ?? "MetricKit crash",
                     stack: stackString(in: diagnostic),
-                    signal: firstString(keys: ["signal"], in: diagnostic),
+                    signal: crumbtrailRedactedDiagnosticText(
+                        firstString(keys: ["signal"], in: diagnostic), maxCharacters: 128
+                    ),
                     at: timestampMilliseconds(in: diagnostic)
                 )
             )
         }
     }
 
-    private func dictionaries(forKey key: String, in value: Any, depth: Int = 0) -> [[String: Any]] {
-        guard depth < 12 else { return [] }
+    private func dictionaries(
+        forKey key: String,
+        in value: Any,
+        depth: Int = 0,
+        limit: Int
+    ) -> [[String: Any]] {
+        guard depth < 12, limit > 0 else { return [] }
         if let object = value as? [String: Any] {
             var result: [[String: Any]] = []
-            if let matches = object[key] as? [[String: Any]] { result.append(contentsOf: matches) }
-            for child in object.values { result.append(contentsOf: dictionaries(forKey: key, in: child, depth: depth + 1)) }
+            if let matches = object[key] as? [[String: Any]] {
+                result.append(contentsOf: matches.prefix(limit))
+            }
+            for child in object.values where result.count < limit {
+                result.append(contentsOf: dictionaries(
+                    forKey: key,
+                    in: child,
+                    depth: depth + 1,
+                    limit: limit - result.count
+                ))
+            }
             return result
         }
         if let array = value as? [Any] {
-            return array.flatMap { dictionaries(forKey: key, in: $0, depth: depth + 1) }
+            var result: [[String: Any]] = []
+            for child in array where result.count < limit {
+                result.append(contentsOf: dictionaries(
+                    forKey: key,
+                    in: child,
+                    depth: depth + 1,
+                    limit: limit - result.count
+                ))
+            }
+            return result
         }
         return []
     }
@@ -685,26 +839,50 @@ public final class CrumbtrailMetricKitCollector: @unchecked Sendable {
         for key in ["hangDuration", "duration", "hangDurationSeconds"] {
             guard let value = object[key] else { continue }
             if let number = value as? NSNumber {
-                let seconds = key.hasSuffix("Seconds") ? number.doubleValue : number.doubleValue
-                return Int64(max(0, seconds * (key.hasSuffix("Seconds") ? 1_000 : 1)))
+                return safeMilliseconds(
+                    number.doubleValue,
+                    multiplier: key.hasSuffix("Seconds") ? 1_000 : 1
+                )
             }
             if let string = value as? String {
-                if let number = Double(string) { return Int64(max(0, number * 1_000)) }
+                if let number = Double(string) {
+                    return safeMilliseconds(
+                        number,
+                        multiplier: key.hasSuffix("Seconds") ? 1_000 : 1
+                    )
+                }
                 if let match = string.range(of: "PT"), string.hasSuffix("S") {
                     let seconds = String(string[match.upperBound..<string.index(before: string.endIndex)])
-                    if let number = Double(seconds) { return Int64(max(0, number * 1_000)) }
+                    if let number = Double(seconds) {
+                        return safeMilliseconds(number, multiplier: 1_000)
+                    }
                 }
             }
         }
         return nil
     }
 
+    private func safeMilliseconds(_ value: Double, multiplier: Double) -> Int64? {
+        guard !value.isNaN else { return nil }
+        if value.isInfinite { return value.sign == .minus ? 0 : crumbtrailMaxNativeHangDurationMilliseconds }
+        let milliseconds = max(0, value * multiplier)
+        if milliseconds.isInfinite { return crumbtrailMaxNativeHangDurationMilliseconds }
+        let capped = min(milliseconds, Double(crumbtrailMaxNativeHangDurationMilliseconds))
+        return Int64(capped.rounded(.towardZero))
+    }
+
     private func timestampMilliseconds(in object: [String: Any]) -> Int64? {
         for key in ["timestamp", "timeStamp", "date"] {
-            if let number = object[key] as? NSNumber { return number.int64Value }
+            if let number = object[key] as? NSNumber {
+                let value = number.doubleValue
+                guard value.isFinite, value >= 0, value < Double(Int64.max) else { continue }
+                return Int64(value.rounded(.towardZero))
+            }
             if let string = object[key] as? String,
                let date = ISO8601DateFormatter().date(from: string) {
-                return Int64(date.timeIntervalSince1970 * 1_000)
+                let value = date.timeIntervalSince1970 * 1_000
+                guard value.isFinite, value >= 0, value < Double(Int64.max) else { continue }
+                return Int64(value.rounded(.towardZero))
             }
         }
         return nil
@@ -716,7 +894,11 @@ public final class CrumbtrailMetricKitCollector: @unchecked Sendable {
             let symbol = object["symbol"] as? String
             let binary = object["binaryName"] as? String
             let source = object["sourceFile"] as? String
-            if let text = symbol ?? binary ?? source, !text.isEmpty { lines.append(text) }
+            if let text = symbol ?? binary ?? source,
+               let redacted = crumbtrailRedactedDiagnosticText(text),
+               !redacted.isEmpty {
+                lines.append(redacted)
+            }
             for child in object.values { stackString(in: child, depth: depth + 1, lines: &lines) }
         } else if let array = value as? [Any] {
             for child in array { stackString(in: child, depth: depth + 1, lines: &lines) }
@@ -728,7 +910,7 @@ public final class CrumbtrailMetricKitCollector: @unchecked Sendable {
         for key in ["callStackTree", "callStackPerThread", "callStackRootFrames"] {
             if let value = object[key] { stackString(in: value, lines: &lines) }
         }
-        return crumbtrailBoundedDiagnosticText(lines.joined(separator: "\n"))
+        return crumbtrailRedactedDiagnosticText(lines.joined(separator: "\n"))
     }
 }
 

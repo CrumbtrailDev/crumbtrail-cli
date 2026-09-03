@@ -9,14 +9,24 @@ import java.util.concurrent.TimeUnit
 const val MAX_DIAGNOSTIC_STACK_CHARS = 8_192
 const val MAX_DIAGNOSTIC_STACK_FRAMES = 64
 
+private val diagnosticCredentialPattern = Regex(
+    """(?i)(\b(?:authorization|cookie|set-cookie|proxy-authorization|www-authenticate|x[-_]?api[-_]?key|x[-_]?auth[-_]?token|x[-_]?csrf[-_]?token|access[-_]?token|refresh[-_]?token|client[-_]?secret|api[-_]?key|auth[-_]?(?:token|key)|token|secret|password|passwd|credential|signature|bearer)\b\s*(?:[:=]\s*|\s+))([^\s,;]+)""",
+)
+
 /** Text that may safely be included in a diagnostic event. */
 fun boundedDiagnosticText(value: String?, maxChars: Int = MAX_DIAGNOSTIC_STACK_CHARS): String? {
     if (value.isNullOrEmpty() || maxChars <= 0) return null
     return if (value.length <= maxChars) value else value.take(maxChars)
 }
 
+/** Remove credential-shaped values from diagnostic text before it leaves the device. */
+fun redactedDiagnosticText(value: String?, maxChars: Int = MAX_DIAGNOSTIC_STACK_CHARS): String? =
+    boundedDiagnosticText(value, maxChars)?.replace(diagnosticCredentialPattern) {
+        "${it.groupValues[1]}[REDACTED]"
+    }
+
 /** A bounded stack avoids making a failure in the diagnostic path worse. */
-fun boundedStackTrace(throwable: Throwable): String? = boundedDiagnosticText(
+fun boundedStackTrace(throwable: Throwable): String? = redactedDiagnosticText(
     buildString {
         append(throwable.toString())
         throwable.stackTrace
@@ -44,6 +54,20 @@ interface CrumbtrailPendingHangStore {
     fun write(hang: CrumbtrailPendingHang)
     fun read(): CrumbtrailPendingHang?
     fun clear()
+
+    /** Claim the single durable slot without racing another watchdog instance. */
+    fun writeIfEmpty(hang: CrumbtrailPendingHang): Boolean {
+        if (read() != null) return false
+        write(hang)
+        return read() == hang
+    }
+
+    /** Clear only the record this watchdog claimed, not a replacement record. */
+    fun clearIfMatches(hang: CrumbtrailPendingHang): Boolean {
+        if (read() != hang) return false
+        clear()
+        return true
+    }
 }
 
 /** In-memory implementation for hosts that opt out of persistence and tests. */
@@ -53,6 +77,16 @@ class MemoryPendingHangStore(private var hang: CrumbtrailPendingHang? = null) :
     override fun write(hang: CrumbtrailPendingHang) = synchronized(lock) { this.hang = hang }
     override fun read(): CrumbtrailPendingHang? = synchronized(lock) { hang }
     override fun clear() = synchronized(lock) { hang = null }
+    override fun writeIfEmpty(hang: CrumbtrailPendingHang): Boolean = synchronized(lock) {
+        if (this.hang != null) return@synchronized false
+        this.hang = hang
+        true
+    }
+    override fun clearIfMatches(hang: CrumbtrailPendingHang): Boolean = synchronized(lock) {
+        if (this.hang != hang) return@synchronized false
+        this.hang = null
+        true
+    }
 }
 
 /** One watchdog observation in the shared native-hang shape. */
@@ -108,7 +142,7 @@ class CrumbtrailMainThreadWatchdog(
     private var running = false
     private var generation = 0L
     private var lastHeartbeatAt = 0L
-    private var pendingAt: Long? = null
+    private var pendingHang: CrumbtrailPendingHang? = null
     private var pendingStartedMonotonic: Long? = null
     private var checkTask: CrumbtrailWatchdogTask? = null
     private var debuggerPollTask: CrumbtrailWatchdogTask? = null
@@ -183,20 +217,20 @@ class CrumbtrailMainThreadWatchdog(
         synchronized(lock) {
             if (running && generation == token) {
                 val elapsed = (current - lastHeartbeatAt).coerceAtLeast(0)
-                if (elapsed >= thresholdMs && pendingAt == null && handoff.read() == null) {
+                if (elapsed >= thresholdMs && pendingHang == null && handoff.read() == null) {
                     val at = wallNow()
+                    val pending = CrumbtrailPendingHang(
+                        thresholdMs = thresholdMs,
+                        observedDurationMs = elapsed.coerceAtMost(MAX_NATIVE_HANG_DURATION_MS),
+                        stack = redactedDiagnosticText(captureStack()),
+                        at = at,
+                        startedAt = (at - elapsed).coerceAtLeast(0),
+                    )
                     runCatching {
-                        handoff.write(
-                            CrumbtrailPendingHang(
-                                thresholdMs = thresholdMs,
-                                observedDurationMs = elapsed.coerceAtMost(MAX_NATIVE_HANG_DURATION_MS),
-                                stack = boundedDiagnosticText(captureStack()),
-                                at = at,
-                                startedAt = (at - elapsed).coerceAtLeast(0),
-                            )
-                        )
-                        pendingAt = at
-                        pendingStartedMonotonic = lastHeartbeatAt
+                        if (handoff.writeIfEmpty(pending)) {
+                            pendingHang = pending
+                            pendingStartedMonotonic = lastHeartbeatAt
+                        }
                     }
                 }
             }
@@ -211,9 +245,8 @@ class CrumbtrailMainThreadWatchdog(
         synchronized(lock) {
             if (!running || generation != token) return
             val current = now()
-            val pending = handoff.read()
-            val activeAt = pendingAt
-            observation = if (activeAt != null && pending != null && pending.at == activeAt) {
+            val pending = pendingHang
+            observation = if (pending != null) {
                 val duration = if (pendingStartedMonotonic != null) {
                     (current - pendingStartedMonotonic!!)
                         .coerceAtLeast(pending.observedDurationMs)
@@ -221,7 +254,7 @@ class CrumbtrailMainThreadWatchdog(
                 } else {
                     pending.observedDurationMs.coerceIn(0, MAX_NATIVE_HANG_DURATION_MS)
                 }
-                pendingAt = null
+                pendingHang = null
                 pendingStartedMonotonic = null
                 CrumbtrailNativeHang(
                     thresholdMs = pending.thresholdMs,
@@ -236,9 +269,14 @@ class CrumbtrailMainThreadWatchdog(
             lastHeartbeatAt = current
             if (observation != null) {
                 val recoveredObservation = observation
+                val expectedHang = checkNotNull(pending)
                 scheduler.postToBackground {
+                    val stillOwned = runCatching {
+                        handoff.read() == expectedHang
+                    }.getOrDefault(false)
+                    if (!stillOwned) return@postToBackground
                     val accepted = runCatching { onHang(recoveredObservation) }.getOrDefault(false)
-                    if (accepted) runCatching { handoff.clear() }
+                    if (accepted) runCatching { handoff.clearIfMatches(expectedHang) }
                 }
             }
         }
@@ -320,11 +358,11 @@ fun drainPendingHang(
                 observedDurationMs = pending.observedDurationMs.coerceIn(0, CrumbtrailMainThreadWatchdog.MAX_NATIVE_HANG_DURATION_MS),
                 recovered = false,
                 previousLaunch = true,
-                stack = boundedDiagnosticText(pending.stack),
+                stack = redactedDiagnosticText(pending.stack),
             )
         )
     }.getOrDefault(false)
-    if (accepted) runCatching { handoff.clear() }
+    if (accepted) runCatching { handoff.clearIfMatches(pending) }
     return accepted
 }
 
@@ -351,21 +389,31 @@ class CrumbtrailProcessExitCollector(
     private val reader: CrumbtrailProcessExitReader,
     private val marker: CrumbtrailProcessExitMarker,
     private val emit: (CrumbtrailProcessExit) -> Unit,
+    private val acknowledge: ((CrumbtrailProcessExit) -> Boolean)? = null,
 ) {
     fun collect() {
         val entries = runCatching { reader.read(MAX_PROCESS_EXIT_ENTRIES) }
             .getOrDefault(emptyList())
             .filter { it.timestamp > 0 }
+            .take(MAX_PROCESS_EXIT_ENTRIES)
             .sortedByDescending { it.timestamp }
         if (entries.isEmpty()) return
         val seen = runCatching { marker.read() }.getOrNull()
-        val newest = entries.first()
-        val candidate = entries.firstOrNull { seen == null || it.timestamp > seen }
-            ?: return
-        runCatching {
-            emit(candidate.copy(description = boundedDiagnosticText(candidate.description, 1_024)))
-            marker.write(newest.timestamp)
-        }
+        entries.asReversed()
+            .filter { seen == null || it.timestamp > seen }
+            .forEach { candidate ->
+                val accepted = runCatching {
+                    val bounded = candidate.copy(
+                        description = redactedDiagnosticText(candidate.description, 1_024)
+                    )
+                    acknowledge?.invoke(bounded) ?: run {
+                        emit(bounded)
+                        true
+                    }
+                }.getOrDefault(false)
+                if (!accepted) return
+                runCatching { marker.write(candidate.timestamp) }
+            }
     }
 
     companion object { const val MAX_PROCESS_EXIT_ENTRIES = 8 }

@@ -54,6 +54,27 @@ private class MarkerStore(private var timestamp: Long? = null) : CrumbtrailProce
 
 class MainThreadWatchdogTest {
     @Test
+    fun `native collectors require explicit opt in`() {
+        assertFalse(CrumbtrailCollectors().nativeWatchdog)
+        assertFalse(CrumbtrailCollectors().nativeDiagnostics)
+        assertTrue(CrumbtrailCollectors(nativeWatchdog = true, nativeDiagnostics = true).nativeWatchdog)
+        assertTrue(CrumbtrailCollectors(nativeWatchdog = true, nativeDiagnostics = true).nativeDiagnostics)
+    }
+
+    @Test
+    fun `native watchdog observes lifecycle without emitting lifecycle events`() {
+        val collectors = CrumbtrailCollectors(
+            appLifecycle = false,
+            navigation = false,
+            nativeWatchdog = true,
+        )
+
+        assertTrue(collectors.needsApplicationLifecycleObserver)
+        assertFalse(collectors.appLifecycle)
+        assertFalse(collectors.navigation)
+    }
+
+    @Test
     fun `uses a five second threshold and persists a missed heartbeat`() {
         val scheduler = FakeWatchdogScheduler()
         val handoff = MemoryPendingHangStore()
@@ -166,6 +187,33 @@ class MainThreadWatchdogTest {
     }
 
     @Test
+    fun `does not clear a replacement handoff after accepting a recovered hang`() {
+        val scheduler = FakeWatchdogScheduler()
+        val handoff = MemoryPendingHangStore()
+        var now = 0L
+        val replacement = CrumbtrailPendingHang(5_000, 5_000, "replacement", 200)
+        val watchdog = CrumbtrailMainThreadWatchdog(
+            scheduler = scheduler,
+            handoff = handoff,
+            onHang = {
+                handoff.write(replacement)
+                true
+            },
+            now = { now },
+        )
+
+        watchdog.start()
+        scheduler.runMain()
+        now = 5_000
+        scheduler.runNextScheduled()
+        now = 5_100
+        scheduler.runMain()
+        scheduler.runBackground()
+
+        assertEquals(replacement, handoff.read())
+    }
+
+    @Test
     fun `retains previous launch handoff when import is rejected`() {
         val store = MemoryPendingHangStore(
             CrumbtrailPendingHang(
@@ -178,6 +226,34 @@ class MainThreadWatchdogTest {
 
         assertFalse(drainPendingHang(store) { false })
         assertNotNull(store.read())
+    }
+
+    @Test
+    fun `a replaced shared handoff does not wedge the watchdog`() {
+        val scheduler = FakeWatchdogScheduler()
+        val handoff = MemoryPendingHangStore()
+        var now = 0L
+        val watchdog = CrumbtrailMainThreadWatchdog(
+            scheduler = scheduler,
+            handoff = handoff,
+            onHang = { true },
+            now = { now },
+            wallNow = { 100 },
+        )
+
+        watchdog.start()
+        scheduler.runMain()
+        now = 5_000
+        scheduler.runNextScheduled()
+        handoff.write(CrumbtrailPendingHang(5_000, 5_000, "other", 200))
+
+        now = 5_100
+        scheduler.runMain()
+        handoff.clear()
+        now = 10_100
+        scheduler.runNextScheduled()
+
+        assertNotNull(handoff.read(), "a competing instance must not leave this watchdog stuck")
     }
 
     @Test
@@ -276,6 +352,7 @@ class MainThreadWatchdogTest {
     @Test
     fun `bounds diagnostic text and process exit descriptions`() {
         assertEquals(8_192, boundedDiagnosticText("x".repeat(20_000))?.length)
+        assertEquals("authorization: [REDACTED]", redactedDiagnosticText("authorization: secret"))
         val reader = object : CrumbtrailProcessExitReader {
             override fun read(maxEntries: Int): List<CrumbtrailProcessExit> {
                 assertEquals(8, maxEntries)
@@ -297,6 +374,45 @@ class MainThreadWatchdogTest {
         assertEquals(1_024, exits.single().description?.length)
         CrumbtrailProcessExitCollector(reader, marker, exits::add).collect()
         assertEquals(1, exits.size)
+    }
+
+    @Test
+    fun `emits every new process exit and advances only after acceptance`() {
+        val marker = MarkerStore(10)
+        val entries = listOf(
+            CrumbtrailProcessExit("anr", 30),
+            CrumbtrailProcessExit("crash", 20),
+            CrumbtrailProcessExit("old", 10),
+        )
+        val emitted = mutableListOf<CrumbtrailProcessExit>()
+        CrumbtrailProcessExitCollector(
+            reader = object : CrumbtrailProcessExitReader {
+                override fun read(maxEntries: Int) = entries
+            },
+            marker = marker,
+            emit = { exit -> emitted.add(exit) },
+        ).collect()
+
+        assertEquals(listOf(20L, 30L), emitted.map { it.timestamp })
+        assertEquals(30L, marker.read())
+
+        val retryMarker = MarkerStore()
+        var accept = false
+        val retryEmitted = mutableListOf<CrumbtrailProcessExit>()
+        val retryCollector = CrumbtrailProcessExitCollector(
+            reader = object : CrumbtrailProcessExitReader {
+                override fun read(maxEntries: Int) = listOf(CrumbtrailProcessExit("anr", 40))
+            },
+            marker = retryMarker,
+            emit = {},
+            acknowledge = { exit -> retryEmitted.add(exit); accept },
+        )
+        retryCollector.collect()
+        assertNull(retryMarker.read())
+        accept = true
+        retryCollector.collect()
+        assertEquals(40L, retryMarker.read())
+        assertEquals(2, retryEmitted.size)
     }
 
     @Test

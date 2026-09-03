@@ -165,4 +165,66 @@ class PendingCrashTest {
             Thread.setDefaultUncaughtExceptionHandler(previous)
         }
     }
+
+    @Test
+    fun `multiple logger instances share crash handler ownership safely`() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        val firstStore = MemoryPendingCrashStore()
+        val secondStore = MemoryPendingCrashStore()
+        val first = Crumbtrail(
+            config(), ThreadRecordingTransport(), MemorySessionStore(), delivery = CrumbtrailInlineDelivery
+        )
+        val second = Crumbtrail(
+            config(), ThreadRecordingTransport(), MemorySessionStore(), delivery = CrumbtrailInlineDelivery
+        )
+        try {
+            installCrashHandler(first, firstStore)
+            val firstHandler = Thread.getDefaultUncaughtExceptionHandler()
+            installCrashHandler(second, secondStore)
+            val secondHandler = Thread.getDefaultUncaughtExceptionHandler()
+
+            assertTrue(firstHandler === secondHandler)
+            first.stop()
+            assertTrue(
+                Thread.getDefaultUncaughtExceptionHandler() === secondHandler,
+                "stopping one logger must not remove the other logger's handler",
+            )
+            second.stop()
+            assertTrue(Thread.getDefaultUncaughtExceptionHandler() === previous)
+        } finally {
+            first.stop()
+            second.stop()
+            Thread.setDefaultUncaughtExceptionHandler(previous)
+        }
+    }
+
+    @Test
+    fun `the newest active logger owns crash storage and older logger resumes ownership`() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        val firstStore = MemoryPendingCrashStore()
+        val secondStore = MemoryPendingCrashStore()
+        val first = Crumbtrail(
+            config(), ThreadRecordingTransport(), MemorySessionStore(), delivery = CrumbtrailInlineDelivery
+        )
+        val second = Crumbtrail(
+            config(), ThreadRecordingTransport(), MemorySessionStore(), delivery = CrumbtrailInlineDelivery
+        )
+        try {
+            Thread.setDefaultUncaughtExceptionHandler { _, _ -> }
+            installCrashHandler(first, firstStore)
+            installCrashHandler(second, secondStore)
+
+            uncaught(IllegalStateException("second"))
+            assertNull(firstStore.read())
+            assertEquals("second", secondStore.read()?.message)
+
+            second.stop()
+            uncaught(IllegalStateException("first"))
+            assertEquals("first", firstStore.read()?.message)
+        } finally {
+            first.stop()
+            second.stop()
+            Thread.setDefaultUncaughtExceptionHandler(previous)
+        }
+    }
 }

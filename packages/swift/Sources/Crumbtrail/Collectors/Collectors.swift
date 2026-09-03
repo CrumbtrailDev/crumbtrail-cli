@@ -10,8 +10,61 @@ import UIKit
 /// capture context. Global mutable state is the trade for being able to chain to
 /// a host's existing crash reporter instead of silently replacing it.
 enum CrumbtrailExceptionChain {
-    nonisolated(unsafe) static var previous:
-        (@convention(c) (NSException) -> Void)?
+    private static let lock = NSLock()
+    private static var previous: (@convention(c) (NSException) -> Void)?
+    private static var installedAddress: UnsafeRawPointer?
+    private static var registrations: Set<UInt64> = []
+    private static var nextRegistration: UInt64 = 0
+
+    static var activeRegistrationCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return registrations.count
+    }
+
+    static func install() -> () -> Void {
+        lock.lock()
+        nextRegistration += 1
+        let registration = nextRegistration
+        if registrations.isEmpty {
+            previous = NSGetUncaughtExceptionHandler()
+            let handler: @convention(c) (NSException) -> Void = { exception in
+                CrumbtrailExceptionChain.handle(exception)
+            }
+            installedAddress = unsafeBitCast(handler, to: UnsafeRawPointer.self)
+            NSSetUncaughtExceptionHandler(handler)
+        }
+        registrations.insert(registration)
+        lock.unlock()
+        return { remove(registration) }
+    }
+
+    private static func handle(_ exception: NSException) {
+        CrumbtrailCrashStore.writePending(
+            message: exception.reason ?? exception.name.rawValue,
+            stack: exception.callStackSymbols.joined(separator: "\n"),
+            signal: exception.name.rawValue
+        )
+        lock.lock()
+        let handler = previous
+        lock.unlock()
+        handler?(exception)
+    }
+
+    private static func remove(_ registration: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        registrations.remove(registration)
+        guard registrations.isEmpty else { return }
+        let currentAddress = NSGetUncaughtExceptionHandler().map {
+            unsafeBitCast($0, to: UnsafeRawPointer.self)
+        }
+        if currentAddress == installedAddress {
+            NSSetUncaughtExceptionHandler(previous)
+        }
+        installedAddress = nil
+        previous = nil
+    }
 }
 
 extension Crumbtrail {
@@ -25,7 +78,9 @@ extension Crumbtrail {
     func installCollectors() {
         if config.collectors.errors { installErrorCollector() }
         #if canImport(UIKit) && !os(macOS)
-        if config.collectors.appLifecycle { installLifecycleCollector() }
+        if config.collectors.needsApplicationLifecycleObserver || config.collectors.nativeDiagnostics {
+            installLifecycleCollector()
+        }
         #if !os(tvOS)
         if config.collectors.navigation { installOrientationCollector() }
         #endif
@@ -54,25 +109,9 @@ extension Crumbtrail {
     private func installErrorCollector() {
         drainPendingCrash()
 
-        // `NSSetUncaughtExceptionHandler` takes a C function pointer, which
-        // cannot carry captured context — so the previously installed handler
-        // is parked in static storage and the closure below captures nothing.
-        // Chaining to it is not optional: an app using a crash reporter already
-        // installed one, and replacing it outright would silently disable their
-        // crash reporting the moment they add Crumbtrail.
-        CrumbtrailExceptionChain.previous = NSGetUncaughtExceptionHandler()
-        NSSetUncaughtExceptionHandler { exception in
-            CrumbtrailCrashStore.writePending(
-                message: exception.reason ?? exception.name.rawValue,
-                stack: exception.callStackSymbols.joined(separator: "\n"),
-                signal: exception.name.rawValue
-            )
-            CrumbtrailExceptionChain.previous?(exception)
-        }
-        registerCleanup {
-            NSSetUncaughtExceptionHandler(CrumbtrailExceptionChain.previous)
-            CrumbtrailExceptionChain.previous = nil
-        }
+        // `NSSetUncaughtExceptionHandler` takes a C function pointer, so one
+        // process-wide handler is shared by all active logger instances.
+        registerCleanup(CrumbtrailExceptionChain.install())
     }
 
     /// Read and clear anything the previous launch's crash handler left behind.
@@ -82,9 +121,16 @@ extension Crumbtrail {
         addEvent(
             kind: .nativeCrash,
             data: .object(compacting: [
-                "msg": .string(pending.message),
-                "stk": pending.stack.map(JSONValue.string),
-                "signal": pending.signal.map(JSONValue.string),
+                "msg": .string(
+                    crumbtrailRedactedDiagnosticText(pending.message, maxCharacters: 1_024)
+                        ?? "uncaught exception"
+                ),
+                "stk": pending.stack
+                    .flatMap { crumbtrailRedactedDiagnosticText($0) }
+                    .map(JSONValue.string),
+                "signal": pending.signal
+                    .flatMap { crumbtrailRedactedDiagnosticText($0, maxCharacters: 128) }
+                    .map(JSONValue.string),
                 "source": .string("previous-launch"),
             ])
         )
@@ -99,7 +145,9 @@ extension Crumbtrail {
                 "observedDurationMs": .int(hang.observedDurationMs),
                 "recovered": .bool(hang.recovered),
                 "previousLaunch": .bool(hang.previousLaunch),
-                "stk": hang.stack.map(JSONValue.string),
+                "stk": hang.stack
+                    .flatMap { crumbtrailRedactedDiagnosticText($0) }
+                    .map(JSONValue.string),
             ])
         )
     }
@@ -108,9 +156,16 @@ extension Crumbtrail {
         addEvent(
             kind: .nativeCrash,
             data: .object(compacting: [
-                "msg": .string(crash.message),
-                "stk": crash.stack.map(JSONValue.string),
-                "signal": crash.signal.map(JSONValue.string),
+                "msg": .string(
+                    crumbtrailRedactedDiagnosticText(crash.message, maxCharacters: 1_024)
+                        ?? "MetricKit crash"
+                ),
+                "stk": crash.stack
+                    .flatMap { crumbtrailRedactedDiagnosticText($0) }
+                    .map(JSONValue.string),
+                "signal": crash.signal
+                    .flatMap { crumbtrailRedactedDiagnosticText($0, maxCharacters: 128) }
+                    .map(JSONValue.string),
                 "source": .string("previous-launch"),
                 "at": crash.at.map(JSONValue.int),
             ])
@@ -128,8 +183,18 @@ extension Crumbtrail {
     /// active hangs.
     private func installLifecycleCollector() {
         let pendingHangStore = ApplicationSupportPendingHangStore()
+        let pendingHangDrainScheduler: CrumbtrailDispatchWatchdogScheduler?
         if config.collectors.nativeDiagnostics || config.collectors.nativeWatchdog {
-            drainPendingHang(pendingHangStore, onHang: recordNativeHang)
+            let scheduler = CrumbtrailDispatchWatchdogScheduler()
+            pendingHangDrainScheduler = scheduler
+            scheduler.postToBackground { [weak self] in
+                _ = drainPendingHang(pendingHangStore) { [weak self] hang in
+                    self?.recordNativeHang(hang) ?? false
+                }
+                scheduler.shutdown()
+            }
+        } else {
+            pendingHangDrainScheduler = nil
         }
         let watchdog: CrumbtrailMainThreadWatchdog? = config.collectors.nativeWatchdog
             ? CrumbtrailMainThreadWatchdog(
@@ -161,13 +226,15 @@ extension Crumbtrail {
                 case "terminate": watchdog?.stop()
                 default: break
                 }
-                self.addEvent(
-                    kind: .appLifecycle,
-                    data: .object(compacting: [
-                        "state": .string(state),
-                        "source": .string("uiapplication"),
-                    ])
-                )
+                if self.config.collectors.appLifecycle {
+                    self.addEvent(
+                        kind: .appLifecycle,
+                        data: .object(compacting: [
+                            "state": .string(state),
+                            "source": .string("uiapplication"),
+                        ])
+                    )
+                }
                 // Backgrounding is the last reliable moment to deliver. iOS may
                 // suspend the process seconds later and never resume it, so a
                 // batch still sitting in the queue would be lost with the app.
@@ -185,7 +252,10 @@ extension Crumbtrail {
             forName: UIApplication.didReceiveMemoryWarningNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            self?.addEvent(
+            guard let self,
+                  self.config.collectors.appLifecycle || self.config.collectors.nativeDiagnostics
+            else { return }
+            self.addEvent(
                 kind: .appLifecycle,
                 data: .object(compacting: [
                     "state": .string("memory-warning"),
@@ -197,6 +267,8 @@ extension Crumbtrail {
 
         registerCleanup {
             for token in tokens { center.removeObserver(token) }
+            pendingHangDrainScheduler?.drain()
+            pendingHangDrainScheduler?.shutdown()
             watchdog?.stop()
         }
 

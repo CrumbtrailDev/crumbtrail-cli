@@ -369,6 +369,32 @@ class CrumbtrailTest {
     }
 
     @Test
+    fun `recordError and request errors redact diagnostic credentials`() {
+        val transport = CapturingTransport()
+        val logger = Crumbtrail(config(), transport, MemorySessionStore(), delivery = CrumbtrailInlineDelivery)
+
+        logger.recordError(
+            IllegalStateException("authorization: secret-value"),
+            source = "access_token=source-secret",
+        )
+        logger.recordRequest(
+            url = "https://api.example.com/orders",
+            method = "get",
+            status = null,
+            durationMs = 20,
+            source = "bearer=source-secret",
+            error = "client_secret=transport-secret",
+        )
+        logger.flush()
+
+        val json = transport.batches.flatten().joinToString { it.toJson().toJson() }
+        assertFalse(json.contains("secret-value"))
+        assertFalse(json.contains("source-secret"))
+        assertFalse(json.contains("transport-secret"))
+        assertTrue(json.contains("[REDACTED]"))
+    }
+
+    @Test
     fun `stop flushes and closes the session`() {
         val transport = CapturingTransport()
         val logger = Crumbtrail(config(), transport, MemorySessionStore(), delivery = CrumbtrailInlineDelivery)

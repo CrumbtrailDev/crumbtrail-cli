@@ -57,6 +57,25 @@ private final class FakeMetricKitSource: CrumbtrailMetricKitSource {
 }
 
 final class NativeDiagnosticsTests: XCTestCase {
+    func testNativeCollectorsRequireExplicitOptIn() {
+        XCTAssertFalse(CrumbtrailCollectors.standard.nativeWatchdog)
+        XCTAssertFalse(CrumbtrailCollectors.standard.nativeDiagnostics)
+        XCTAssertTrue(CrumbtrailCollectors.all.nativeWatchdog)
+        XCTAssertTrue(CrumbtrailCollectors.all.nativeDiagnostics)
+    }
+
+    func testNativeWatchdogObservesLifecycleWithoutEmittingLifecycleEvents() {
+        let collectors = CrumbtrailCollectors(
+            appLifecycle: false,
+            navigation: false,
+            nativeWatchdog: true
+        )
+
+        XCTAssertTrue(collectors.needsApplicationLifecycleObserver)
+        XCTAssertFalse(collectors.appLifecycle)
+        XCTAssertFalse(collectors.navigation)
+    }
+
     func testWatchdogPersistsAndEmitsOnRecovery() {
         let scheduler = FakeWatchdogScheduler()
         let handoff = MemoryPendingHangStore()
@@ -141,6 +160,64 @@ final class NativeDiagnosticsTests: XCTestCase {
         scheduler.runBackground()
 
         XCTAssertNotNil(handoff.read())
+    }
+
+    func testWatchdogDoesNotClearAReplacementAfterAcceptingRecovery() {
+        let scheduler = FakeWatchdogScheduler()
+        let handoff = MemoryPendingHangStore()
+        var now: Int64 = 0
+        let replacement = CrumbtrailPendingHang(
+            thresholdMs: 5_000,
+            observedDurationMs: 5_000,
+            stack: "replacement",
+            at: 200
+        )
+        let watchdog = CrumbtrailMainThreadWatchdog(
+            scheduler: scheduler,
+            handoff: handoff,
+            onHang: { _ in
+                handoff.write(replacement)
+                return true
+            },
+            now: { now }
+        )
+
+        watchdog.start()
+        scheduler.runMain()
+        now = 5_000
+        scheduler.runNextScheduled()
+        now = 5_100
+        scheduler.runMain()
+        scheduler.runBackground()
+
+        XCTAssertEqual(handoff.read(), replacement)
+    }
+
+    func testWatchdogDoesNotWedgeWhenAnotherInstanceReplacesTheHandoff() {
+        let scheduler = FakeWatchdogScheduler()
+        let handoff = MemoryPendingHangStore()
+        var now: Int64 = 0
+        let watchdog = CrumbtrailMainThreadWatchdog(
+            scheduler: scheduler,
+            handoff: handoff,
+            onHang: { _ in true },
+            now: { now },
+            wallNow: { 100 }
+        )
+
+        watchdog.start()
+        scheduler.runMain()
+        now = 5_000
+        scheduler.runNextScheduled()
+        handoff.write(CrumbtrailPendingHang(thresholdMs: 5_000, observedDurationMs: 5_000, stack: "other", at: 200))
+
+        now = 5_100
+        scheduler.runMain()
+        handoff.clear()
+        now = 10_100
+        scheduler.runNextScheduled()
+
+        XCTAssertNotNil(handoff.read(), "a competing instance must not leave this watchdog stuck")
     }
 
     func testWatchdogPauseAndDebuggerSuppressChecks() {
@@ -343,7 +420,7 @@ final class NativeDiagnosticsTests: XCTestCase {
                 "callStackTree": ["callStackRootFrames": [["symbol": "Checkout.submit()"]]],
             ]],
             "crashDiagnostics": [[
-                "terminationReason": "fatal access",
+                "terminationReason": "authorization: secret-value",
                 "signal": "SIGABRT",
                 "callStackTree": ["callStackRootFrames": [["symbol": "Checkout.tap()"]]],
             ]],
@@ -357,11 +434,109 @@ final class NativeDiagnosticsTests: XCTestCase {
         XCTAssertTrue(hangs[0].previousLaunch)
         XCTAssertEqual(hangs[0].stack, "Checkout.submit()")
         XCTAssertEqual(crashes.count, 1)
-        XCTAssertEqual(crashes[0].message, "fatal access")
+        XCTAssertEqual(crashes[0].message, "authorization: [REDACTED]")
         XCTAssertEqual(crashes[0].signal, "SIGABRT")
         XCTAssertEqual(crashes[0].stack, "Checkout.tap()")
 
         collector.stop()
         XCTAssertTrue(source.stopped)
     }
+
+    func testMetricKitBoundsDiagnosticCountAndRejectsUnsafeDurations() throws {
+        let source = FakeMetricKitSource()
+        var hangs: [CrumbtrailNativeHang] = []
+        let collector = CrumbtrailMetricKitCollector(
+            source: source,
+            emitHang: { hangs.append($0) },
+            emitCrash: { _ in }
+        )
+        collector.start()
+        let payload: [String: Any] = [
+            "hangDiagnostics": (0..<40).map { _ in ["duration": "1e100"] },
+            "crashDiagnostics": [["terminationReason": "ignored"]]
+        ]
+        source.send(try JSONSerialization.data(withJSONObject: payload))
+
+        XCTAssertEqual(hangs.count, crumbtrailMaxMetricKitDiagnostics)
+        XCTAssertTrue(hangs.allSatisfy {
+            $0.observedDurationMs == crumbtrailMaxNativeHangDurationMilliseconds
+        })
+    }
+
+    func testDispatchWatchdogSchedulerDrainsBackgroundWorkBeforeShutdown() {
+        let scheduler = CrumbtrailDispatchWatchdogScheduler()
+        let semaphore = DispatchSemaphore(value: 0)
+        scheduler.postToBackground { semaphore.signal() }
+
+        scheduler.drain()
+
+        XCTAssertEqual(semaphore.wait(timeout: .now()), .success)
+        scheduler.shutdown()
+    }
+
+    func testMultipleLoggerInstancesShareCrashHandlerOwnership() async {
+        let config = CrumbtrailConfig(
+            endpoint: "https://api.crumbtrail.ai",
+            flushIntervalSeconds: 0,
+            collectors: CrumbtrailCollectors(
+                errors: true,
+                network: false,
+                appLifecycle: false,
+                navigation: false,
+                environment: false,
+                console: false,
+                nativeWatchdog: false,
+                nativeDiagnostics: false
+            )
+        )
+        let first = Crumbtrail(config: config, transport: NoopTransport(), store: MemorySessionStore())
+        let second = Crumbtrail(config: config, transport: NoopTransport(), store: MemorySessionStore())
+        first.installCollectors()
+        second.installCollectors()
+        XCTAssertEqual(CrumbtrailExceptionChain.activeRegistrationCount, 2)
+
+        await first.stop()
+        XCTAssertEqual(CrumbtrailExceptionChain.activeRegistrationCount, 1)
+        await second.stop()
+        XCTAssertEqual(CrumbtrailExceptionChain.activeRegistrationCount, 0)
+    }
+
+    func testCrashHandlerDoesNotRestoreOverAHandlerInstalledAfterIt() async {
+        let previous = NSGetUncaughtExceptionHandler()
+        let replacement: @convention(c) (NSException) -> Void = { _ in }
+        let config = CrumbtrailConfig(
+            endpoint: "https://api.crumbtrail.ai",
+            flushIntervalSeconds: 0,
+            collectors: CrumbtrailCollectors(
+                errors: true,
+                network: false,
+                appLifecycle: false,
+                navigation: false,
+                environment: false,
+                console: false,
+                nativeWatchdog: false,
+                nativeDiagnostics: false
+            )
+        )
+        let logger = Crumbtrail(config: config, transport: NoopTransport(), store: MemorySessionStore())
+        logger.installCollectors()
+        NSSetUncaughtExceptionHandler(replacement)
+        defer { NSSetUncaughtExceptionHandler(previous) }
+
+        await logger.stop()
+
+        let actualAddress = NSGetUncaughtExceptionHandler().map {
+            unsafeBitCast($0, to: UnsafeRawPointer.self)
+        }
+        XCTAssertEqual(
+            actualAddress,
+            unsafeBitCast(replacement, to: UnsafeRawPointer.self)
+        )
+    }
+}
+
+private final class NoopTransport: CrumbtrailTransport {
+    func startSession(id: String, metadata: JSONValue) async {}
+    func sendEvents(sessionId: String, events: [CrumbtrailEvent]) async throws {}
+    func endSession(id: String) async {}
 }

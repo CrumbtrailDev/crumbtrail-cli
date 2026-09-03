@@ -148,9 +148,16 @@ public final class Crumbtrail: @unchecked Sendable {
         addEvent(
             kind: .error,
             data: .object(compacting: [
-                "msg": .string(String(describing: error)),
+                "msg": .string(
+                    crumbtrailRedactedDiagnosticText(
+                        String(describing: error),
+                        maxCharacters: 1_024
+                    ) ?? "unknown error"
+                ),
                 "fatal": .bool(fatal),
-                "source": .string(source),
+                "source": .string(
+                    crumbtrailRedactedDiagnosticText(source, maxCharacters: 256) ?? "manual"
+                ),
             ])
         )
     }
@@ -172,8 +179,12 @@ public final class Crumbtrail: @unchecked Sendable {
                 "status": status.map { JSONValue.int(Int64($0)) },
                 "ok": status.map { JSONValue.bool((200..<300).contains($0)) },
                 "dur": .int(durationMs),
-                "source": .string(source),
-                "error": error.map(JSONValue.string),
+                "source": .string(
+                    crumbtrailRedactedDiagnosticText(source, maxCharacters: 256) ?? "urlsession"
+                ),
+                "error": error
+                    .flatMap { crumbtrailRedactedDiagnosticText($0, maxCharacters: 1_024) }
+                    .map(JSONValue.string),
             ])
         )
     }

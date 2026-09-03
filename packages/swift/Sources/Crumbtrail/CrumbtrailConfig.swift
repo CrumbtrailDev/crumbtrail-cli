@@ -8,9 +8,9 @@ public struct CrumbtrailCollectors: Equatable, Sendable {
     public var navigation: Bool
     public var environment: Bool
     public var console: Bool
-    /// Foreground main thread watchdog with a five second threshold.
+    /// Foreground main thread watchdog with a five second threshold. Opt in after capture consent.
     public var nativeWatchdog: Bool
-    /// MetricKit diagnostics and previous launch hang handoff.
+    /// MetricKit diagnostics and previous launch hang handoff. Opt in after capture consent.
     public var nativeDiagnostics: Bool
 
     public init(
@@ -20,8 +20,8 @@ public struct CrumbtrailCollectors: Equatable, Sendable {
         navigation: Bool = true,
         environment: Bool = true,
         console: Bool = true,
-        nativeWatchdog: Bool = true,
-        nativeDiagnostics: Bool = true
+        nativeWatchdog: Bool = false,
+        nativeDiagnostics: Bool = false
     ) {
         self.errors = errors
         self.network = network
@@ -33,12 +33,16 @@ public struct CrumbtrailCollectors: Equatable, Sendable {
         self.nativeDiagnostics = nativeDiagnostics
     }
 
-    public static let all = CrumbtrailCollectors()
+    public static let standard = CrumbtrailCollectors()
+    public static let all = CrumbtrailCollectors(nativeWatchdog: true, nativeDiagnostics: true)
     public static let none = CrumbtrailCollectors(
         errors: false, network: false, appLifecycle: false,
         navigation: false, environment: false, console: false,
         nativeWatchdog: false, nativeDiagnostics: false
     )
+
+    /// Platform lifecycle observation needed internally, even when lifecycle events are disabled.
+    var needsApplicationLifecycleObserver: Bool { appLifecycle || nativeWatchdog }
 }
 
 public struct CrumbtrailConfig: Sendable {
@@ -70,7 +74,7 @@ public struct CrumbtrailConfig: Sendable {
         queueCapacity: Int = 2000,
         flushBatchSize: Int = 50,
         flushIntervalSeconds: TimeInterval = 10,
-        collectors: CrumbtrailCollectors = .all
+        collectors: CrumbtrailCollectors = .standard
     ) {
         self.endpoint = endpoint
         self.ingestKey = ingestKey
