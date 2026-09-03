@@ -107,21 +107,21 @@ describe("insertIntoHtmlHead", () => {
     );
   });
 
-  it("recognizes unquoted module types and JavaScript MIME parameters", () => {
+  it("recognizes unquoted modules after inert parameterized script types", () => {
     const html = PAGE.replace(
       "    <title>Landing</title>",
       [
         "    <title>Landing</title>",
         '    <script type=application/ld+json>{"name":"site"}</script>',
-        '    <script type=module src="/app.js"></script>',
         '    <script type="text/javascript; charset=utf-8" src="/legacy.js"></script>',
+        '    <script type=module src="/app.js"></script>',
       ].join("\n"),
     );
     const out = insertIntoHtmlHead(html, "<script>early</script>")!;
     expect(out.indexOf("<script>early</script>")).toBeLessThan(
       out.indexOf('<script type=module src="/app.js"></script>'),
     );
-    expect(out.indexOf("<script>early</script>")).toBeLessThan(
+    expect(out.indexOf("<script>early</script>")).toBeGreaterThan(
       out.indexOf(
         '<script type="text/javascript; charset=utf-8" src="/legacy.js"></script>',
       ),
@@ -208,8 +208,8 @@ describe("insertIntoHtmlHead", () => {
   it.each([
     ["module;foo", "inert"],
     [" MoDuLe ", "module"],
-    ["text/javascript; charset=utf-8", "classic"],
-    [" APPLICATION/JAVASCRIPT ; charset=utf-8 ", "classic"],
+    ["text/javascript; charset=utf-8", "inert"],
+    [" APPLICATION/JAVASCRIPT ; charset=utf-8 ", "inert"],
     ["application/json; charset=utf-8", "inert"],
     ["", "classic"],
   ])("classifies the complete script type consistently: %s", (type, kind) => {
@@ -748,6 +748,38 @@ describe("buildPlan — static", () => {
       fakeInjectIO({ [p("index.html")]: html }),
     );
     expect(plan.kind).toBe("skip-already-wired");
+  });
+
+  it.each([
+    "text/javascript; charset=utf-8",
+    " APPLICATION/JAVASCRIPT ; charset=utf-8 ",
+    "text/javascript&semi; charset=utf-8",
+  ])("does not accept an inert parameterized bootstrap as rerun proof: %s", (type) => {
+    const inertBootstrap = `<script type="${type}" src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>`;
+    const html = insertIntoHtmlHead(
+      PAGE,
+      [
+        inertBootstrap,
+        `<script type="module">import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0"; Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });</script>`,
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: html }),
+    );
+    expect(plan.kind).toBe("rewrite");
+    expect(plan.content).toContain(inertBootstrap);
+    const executable = htmlScriptBlocks(plan.content!).filter((block) => block.executable);
+    expect(executable[0].scriptKind).toBe("classic");
+    expect(executable[0].src).toBe("https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js");
+    expect(executable[1].scriptKind).toBe("module");
   });
 
   it("moves a valid bootstrap ahead of an earlier application script", () => {

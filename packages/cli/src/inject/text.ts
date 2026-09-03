@@ -1089,7 +1089,7 @@ function classifyScript(
   // type is a data block and does not establish an execution boundary.
   const type = (attrs.get("type") ?? "").trim().toLowerCase();
   if (type === "module") return "module";
-  if (type === "" || JAVASCRIPT_SCRIPT_TYPE.has(type.split(";", 1)[0].trim()))
+  if (type === "" || JAVASCRIPT_SCRIPT_TYPE.has(type))
     return "classic";
   return "inert";
 }
