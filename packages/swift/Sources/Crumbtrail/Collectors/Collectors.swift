@@ -123,10 +123,9 @@ extension Crumbtrail {
 
     /// Foreground and background transitions.
     ///
-    /// This is load-bearing evidence on a phone in a way it never is on desktop
-    /// web: the OS suspends timers, drops sockets, and may kill the process. A
-    /// request that "hung" is usually a request whose app was suspended
-    /// mid-flight, and only this track separates the two.
+    /// Apple platforms can suspend timers, drop sockets, or kill the process
+    /// while the app is backgrounded. This separates those transitions from
+    /// active hangs.
     private func installLifecycleCollector() {
         let pendingHangStore = UserDefaultsPendingHangStore()
         if config.collectors.nativeDiagnostics || config.collectors.nativeWatchdog {

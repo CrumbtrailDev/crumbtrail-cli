@@ -399,10 +399,8 @@ private fun installMemoryPressureCollector(application: Application, logger: Cru
 /**
  * Foreground and background transitions, plus which screen is on top.
  *
- * Load-bearing on a phone in a way it never is on desktop web: the OS suspends
- * timers, drops sockets, and may kill the process. A request that "hung" is
- * usually a request whose app was backgrounded mid-flight, and only this track
- * separates the two.
+ * Android can suspend timers, drop sockets, or kill the process while the app is
+ * backgrounded. This collector separates those transitions from active hangs.
  */
 fun installLifecycleCollector(application: Application, logger: Crumbtrail) {
     installLifecycleCollector(application, logger, null)
