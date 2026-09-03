@@ -55,7 +55,7 @@ export const FIXTURE_CAPABILITIES: string[] = ["app-lifecycle", "device-info"];
  * `crumbtrail-core` assertion fails here, loudly, rather than passing silently
  * while the reference implementation is quietly exempt from the new kind.
  */
-export const EVENT_FIXTURE_COUNT = 13;
+export const EVENT_FIXTURE_COUNT = 15;
 
 /**
  * Keys that make a target descriptor identify something.

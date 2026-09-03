@@ -2868,7 +2868,9 @@ export class Crumbtrail {
       );
     }
     this.cancelLifecycleTimer();
-    const stopState: NonNullable<typeof this.lifecycleCloseState> = {
+    const stopState: NonNullable<typeof this.lifecycleCloseState> & {
+      deadline: number;
+    } = {
       immediateEnd: true,
       deadline: Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
     };
@@ -3009,10 +3011,18 @@ export class Crumbtrail {
     // The session start owns the binding proof used in its request. Retire the
     // proof only after that request settles, while retaining the transport's
     // existing request bounds and its normal error swallowing.
-    const sessionMetadataSettled = await waitForPromiseWithin(
-      this.sessionMetadataWrite,
-      SESSION_METADATA_STOP_TIMEOUT_MS,
-    );
+    const sessionMetadataSettled =
+      !this.lifecycleSuspended &&
+      (await waitForPromiseWithin(
+        this.sessionMetadataWrite,
+        Math.max(
+          0,
+          Math.min(
+            SESSION_METADATA_STOP_TIMEOUT_MS,
+            stopState.deadline - Date.now(),
+          ),
+        ),
+      ));
     if (sessionMetadataSettled) {
       this.runtimeBinding?.stop();
     } else {
@@ -3102,6 +3112,7 @@ async function waitForPromiseWithin(
   promise: Promise<unknown>,
   timeoutMs: number,
 ): Promise<boolean> {
+  if (timeoutMs <= 0) return false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<boolean>((resolve) => {
     timer = setTimeout(() => resolve(false), timeoutMs);

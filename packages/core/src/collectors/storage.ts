@@ -1,4 +1,5 @@
 import type { EventBus } from "../event-bus";
+import { DEFAULT_SESSION_STORAGE_KEY } from "../session-store";
 import type {
   CollectorCleanup,
   CollectorContext,
@@ -994,7 +995,10 @@ export function storageCollector(
   // Read per emit rather than snapshotted at install: a remote policy lowers this cap
   // mid-session and the running collector is the one it has to reach.
   const maxLen = (): number => config.storageValueMaxLength;
-  const excludeKeys = new Set(config.storageExcludeKeys);
+  const excludeKeys = new Set([
+    DEFAULT_SESSION_STORAGE_KEY,
+    ...config.storageExcludeKeys,
+  ]);
 
   const cookieSnap = redactCookieMap(
     parseCookies(document.cookie),

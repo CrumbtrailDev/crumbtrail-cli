@@ -1,8 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  Crumbtrail,
-  PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
-} from "../crumbtrail";
+import { Crumbtrail, PAGEHIDE_PENDING_SEND_TIMEOUT_MS } from "../crumbtrail";
 import {
   REPORT_SCREENSHOT_MAX_BYTES,
   REPORT_SCREENSHOT_MAX_EDGE,
@@ -474,8 +471,10 @@ describe("report screenshot API", () => {
     await expect(logger.captureScreenshot(imageBlob(png()))).rejects.toThrow(
       "active session",
     );
+    await expect(logger.stop()).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
     vi.useRealTimers();
-    await logger.stop();
   });
 
   it("does not end a closed lifecycle session twice when stop follows", async () => {

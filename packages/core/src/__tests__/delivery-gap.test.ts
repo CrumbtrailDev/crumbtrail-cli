@@ -61,8 +61,9 @@ describe("a refused batch is declared, not swallowed", () => {
       reason: "delivery_failed",
     });
     // `detail` is a classification field, so the size rides a structured count.
-    expect((gap.d as { droppedEventCount?: number }).droppedEventCount)
-      .toBeGreaterThan(0);
+    expect(
+      (gap.d as { droppedEventCount?: number }).droppedEventCount,
+    ).toBeGreaterThan(0);
   });
 
   it("stays bounded when the endpoint refuses everything", async () => {
@@ -102,12 +103,15 @@ describe("a refused batch is declared, not swallowed", () => {
     await logger.stop();
 
     const total = capturedGaps(transport).reduce(
-      (sum, gap) => sum + ((gap.d as { droppedEventCount?: number }).droppedEventCount ?? 0),
+      (sum, gap) =>
+        sum +
+        ((gap.d as { droppedEventCount?: number }).droppedEventCount ?? 0),
       0,
     );
     // Three per-batch records could only speak for three batches; the total has
     // to reflect every failed send, not the first few.
     expect(total).toBeGreaterThan(counters.sends / 2);
+    expect(counters.sends).toBeLessThan(100);
     // `flushBufferSize: 1` buys the coverage with 40 real flush cycles, so this
     // case costs seconds where the rest of the file costs milliseconds. It ran
     // 2.6s on a dev machine and 7.4s on a CI runner, over the 5s default.

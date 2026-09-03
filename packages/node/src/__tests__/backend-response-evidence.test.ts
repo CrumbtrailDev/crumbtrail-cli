@@ -316,13 +316,15 @@ describe("backend response evidence", () => {
     res.finish();
     await flush();
 
-    // Numbers are kept by the classifier, so they prove the reassembly rather
-    // than the policy: all three chunks reached the event as one body.
+    // Chunk assembly must preserve safe counts without bypassing identifier redaction.
     const body = JSON.parse(String(endEvent(sent)?.d.responseBody)) as {
-      code?: number;
+      code?: { $redacted?: string };
       rows?: number;
     };
-    expect(body).toEqual({ code: 42, rows: 17 });
+    expect(body).toEqual({
+      code: expect.objectContaining({ $redacted: expect.any(String) }),
+      rows: 17,
+    });
   });
 
   it("survives a response with no write, end or getHeader", async () => {

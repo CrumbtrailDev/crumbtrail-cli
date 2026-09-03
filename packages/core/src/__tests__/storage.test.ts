@@ -4,6 +4,7 @@ import type { BugEvent, CrumbtrailConfig } from "../types";
 import { DEFAULT_CONFIG } from "../types";
 import { REDACTED_VALUE } from "../redaction";
 import { storageCollector } from "../collectors/storage";
+import { DEFAULT_SESSION_STORAGE_KEY } from "../session-store";
 
 function makeConfig(
   overrides: Partial<CrumbtrailConfig> = {},
@@ -158,6 +159,32 @@ describe("storageCollector", () => {
     expect(d.sessionStorage).toEqual({ sk: REDACTED_VALUE });
     expect(snapEvents[0].d.redaction).toBeDefined();
 
+    cleanup();
+  });
+
+  it("never captures the SDK session persistence key", () => {
+    sessionStorage.setItem(
+      DEFAULT_SESSION_STORAGE_KEY,
+      "private session metadata",
+    );
+    const cleanup = storageCollector(
+      bus,
+      makeConfig({ captureIdb: false, captureCacheApi: false }),
+    );
+    bus.flush();
+    expect(
+      events.find((event) => event.k === "snap")?.d.sessionStorage,
+    ).toEqual({});
+    events.length = 0;
+    sessionStorage.setItem(DEFAULT_SESSION_STORAGE_KEY, "updated metadata");
+    Storage.prototype.setItem.call(
+      sessionStorage,
+      DEFAULT_SESSION_STORAGE_KEY,
+      "prototype metadata",
+    );
+    sessionStorage.removeItem(DEFAULT_SESSION_STORAGE_KEY);
+    bus.flush();
+    expect(events).toEqual([]);
     cleanup();
   });
 

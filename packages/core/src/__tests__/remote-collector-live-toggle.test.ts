@@ -555,32 +555,63 @@ describe("deny fields applied to a running ui.num collector", () => {
   }
 
   it("stops emitting a denied label without reinstalling the collector", async () => {
+    const observers: Array<{
+      notify: () => void;
+      observe: ReturnType<typeof vi.fn>;
+      disconnect: ReturnType<typeof vi.fn>;
+    }> = [];
+    vi.stubGlobal(
+      "MutationObserver",
+      class {
+        constructor(callback: () => void) {
+          observers.push({
+            notify: callback,
+            observe: this.observe,
+            disconnect: this.disconnect,
+          });
+        }
+        observe = vi.fn();
+        disconnect = vi.fn();
+      },
+    );
     document.body.innerHTML = `
       <dl class="totals">
         <dt>Subtotal</dt><dd>$199.00</dd>
-        <dt>Invoice ref</dt><dd>4021</dd>
+        <dt>Handling</dt><dd>$4.00</dd>
       </dl>`;
 
     const { logger, internals, kinds } = start({ uiNumbers: true });
     await settle(internals);
-    expect(labels(kinds(UI_NUM_EVENT_KIND))).toContain("Invoice ref");
+    expect(labels(kinds(UI_NUM_EVENT_KIND))).toContain("Handling");
     const installed = internals.collectorTeardowns.get("uiNumbers");
+    const observer = observers.find((entry) =>
+      entry.observe.mock.calls.some(
+        (call) => call[1]?.characterData === true && !call[1]?.attributes,
+      ),
+    )!;
+    expect(observer).toBeDefined();
+    const installedObserverCount = observers.length;
 
     internals.applyRemoteConfig({
-      redaction: { denyFields: ["invoice ref"] },
+      redaction: { denyFields: ["handling"] },
     });
 
     // Change the region so the collector re-scans and re-emits it.
     document.querySelector("dd")!.textContent = "$249.00";
     const before = kinds(UI_NUM_EVENT_KIND).length;
+    observer.notify();
     await settle(internals);
 
     const emitted = kinds(UI_NUM_EVENT_KIND).slice(before);
     expect(emitted.length).toBeGreaterThan(0);
-    expect(labels(emitted)).not.toContain("Invoice ref");
+    expect(labels(emitted)).not.toContain("Handling");
     // Same collector throughout: the deny list reached it, it was not restarted.
     expect(internals.collectorTeardowns.get("uiNumbers")).toBe(installed);
+    expect(observers).toHaveLength(installedObserverCount);
+    expect(observer.observe).toHaveBeenCalledOnce();
+    expect(observer.disconnect).not.toHaveBeenCalled();
     await logger.stop();
+    expect(observer.disconnect).toHaveBeenCalledOnce();
   });
 
   it("honours a deny field that arrives on the poll that starts the collector", async () => {
