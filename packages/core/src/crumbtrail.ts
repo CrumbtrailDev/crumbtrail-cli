@@ -1823,7 +1823,6 @@ export class Crumbtrail {
 
   private isScreenshotSessionActive(sessionId: string): boolean {
     return (
-      !this.screenshotClosing &&
       this.sessionStarted &&
       this.sessionId === sessionId &&
       this.canTransport()
