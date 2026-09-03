@@ -851,6 +851,37 @@ function amendPlan(
     );
   }
 
+  let earlyCaptureEdit: NonNullable<Plan["extraEdits"]>[number] | null = null;
+  let earlyCaptureAdded = false;
+  if (EARLY_BROWSER_RECIPES.has(input.recipe)) {
+    const boundary = browserEntryBoundary(input, io);
+    if (!hasEarlyBrowserMarker(input, io, boundary)) {
+      const version = browserEarlyCaptureVersion(input.sdkVersion);
+      if (!version || !boundary)
+        return earlyCaptureUnavailablePlan(input, boundary, "browser");
+      if (boundary === amended.file) {
+        amended.text = prependIntoSource(
+          amended.text,
+          'import "crumbtrail-core/early";',
+        );
+      } else {
+        const boundarySource = io.readFile(boundary);
+        if (boundarySource === null || boundarySource === undefined)
+          return earlyCaptureUnavailablePlan(input, boundary, "browser");
+        earlyCaptureEdit = {
+          path: boundary,
+          mode: "update",
+          content: prependIntoSource(
+            boundarySource,
+            'import "crumbtrail-core/early";',
+          ),
+          label: `added early browser capture to ${path.relative(input.cwd, boundary) || boundary}`,
+        };
+      }
+      earlyCaptureAdded = true;
+    }
+  }
+
   const stillMissing = status.missing.filter((r) => !report.added.includes(r));
   const rel = path.relative(input.cwd, amended.file) || amended.file;
   const added = report.added
@@ -862,8 +893,13 @@ function amendPlan(
     // beside a single edit, and stayed put once a second one was prepended
     // above the init, so it described a file the wizard no longer produced.
     preloadEnvVar
-      ? `Your own Crumbtrail initialization in ${rel} was missing ${added}. Crumbtrail added ${fieldList} to it instead of starting a second one, and prepended a guarded env file load above it so ${preloadEnvVar} is set before that init reads it. Nothing else in that file changed.`
-      : `Your own Crumbtrail initialization in ${rel} was missing ${added}. Crumbtrail added ${fieldList} to it instead of starting a second one. Nothing else in that file changed.`,
+      ? `Your own Crumbtrail initialization in ${rel} was missing ${added}. Crumbtrail added ${fieldList} to it instead of starting a second one, and prepended a guarded env file load above it so ${preloadEnvVar} is set before that init reads it.${earlyCaptureAdded ? "" : " Nothing else in that file changed."}`
+      : `Your own Crumbtrail initialization in ${rel} was missing ${added}. Crumbtrail added ${fieldList} to it instead of starting a second one.${earlyCaptureAdded ? "" : " Nothing else in that file changed."}`,
+    ...(earlyCaptureAdded
+      ? [
+          `Added the early browser capture import at the application entry boundary in the same plan.`,
+        ]
+      : []),
     ...stillMissing
       .filter((r) => !NOT_A_SOURCE_EDIT.has(r))
       .map((r) => `Next: ${nextActionFor(input, r, status, report)}`),
@@ -885,7 +921,11 @@ function amendPlan(
   };
 
   const git = io.gitStatus(input.cwd, amended.file);
-  if (git.dirty && !input.options?.force) {
+  const earlyGit = earlyCaptureEdit
+    ? io.gitStatus(input.cwd, earlyCaptureEdit.path)
+    : null;
+  const extraEdits = earlyCaptureEdit ? [earlyCaptureEdit] : undefined;
+  if ((git.dirty || earlyGit?.dirty) && !input.options?.force) {
     return {
       recipe: input.recipe,
       kind: "needs-confirm-dirty",
@@ -894,6 +934,7 @@ function amendPlan(
       applyMode: "rewrite",
       amendedFields,
       integration,
+      extraEdits,
       ...preload,
       warnings,
     };
@@ -905,6 +946,7 @@ function amendPlan(
     content: amended.text,
     amendedFields,
     integration,
+    extraEdits,
     ...preload,
     warnings,
   };
@@ -1654,11 +1696,44 @@ function staticBootstrapBlock(html: string) {
 function staticModuleVersion(html: string): string | null {
   for (const block of htmlScriptBlocks(html)) {
     if (!block.executable) continue;
+    const type =
+      /(?:^|\s)type\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(
+        block.attributes,
+      );
+    const isModule =
+      (type?.[1] ?? type?.[2] ?? type?.[3] ?? "").trim().toLowerCase() ===
+      "module";
+    if (!isModule) continue;
     const sources = block.src === null ? [] : [block.src];
-    for (const match of block.content.matchAll(
-      /["'](https?:\/\/[^"'\\\s]+)["']/gi,
-    ))
-      sources.push(match[1]);
+    if (block.src === null) {
+      let program: any;
+      try {
+        program = parse(block.content, {
+          sourceType: "module",
+          plugins: ["typescript", "jsx", "dynamicImport"],
+        }).program;
+      } catch {
+        continue;
+      }
+      const visit = (node: any): void => {
+        if (!node || typeof node !== "object") return;
+        if (node.type === "ImportDeclaration" && node.source?.value)
+          sources.push(node.source.value);
+        if (node.type === "ImportExpression" && node.source?.value)
+          sources.push(node.source.value);
+        if (
+          node.type === "CallExpression" &&
+          node.callee?.type === "Import" &&
+          node.arguments?.[0]?.value
+        )
+          sources.push(node.arguments[0].value);
+        for (const value of Object.values(node)) {
+          if (Array.isArray(value)) value.forEach(visit);
+          else if (value && typeof value === "object") visit(value);
+        }
+      };
+      (program.body ?? []).forEach(visit);
+    }
     for (const source of sources) {
       const version = staticModuleUrlVersion(source);
       if (version !== null) return version;

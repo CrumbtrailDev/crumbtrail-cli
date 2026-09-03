@@ -613,6 +613,7 @@ describe("amending an integration the customer already has", () => {
         endpoint: ENDPOINT,
         entryFile: p("src", "main.tsx"),
         serviceName: "web",
+        sdkVersion: "0.49.0",
         options: { force: true },
       },
       fakeInjectIO(files),
@@ -637,6 +638,8 @@ describe("amending an integration the customer already has", () => {
     });
     expect(plan.content).toBe(
       [
+        'import "crumbtrail-core/early";',
+        "",
         'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
         "",
         "Crumbtrail.init({",
@@ -652,10 +655,64 @@ describe("amending an integration the customer already has", () => {
     // Byte-identical outside the inserted line.
     expect(
       plan
-        .content!.split("\n")
+        .content!.replace('import "crumbtrail-core/early";\n\n', "")
+        .split("\n")
         .filter((line) => line !== '  service: "web",')
         .join("\n"),
     ).toBe(before);
+  });
+
+  it("amends init and adds early capture at a separate entry boundary", () => {
+    const files = amendableFiles();
+    files[p("src", "main.tsx")] = 'import "./telemetry";\nrender();\n';
+    files[p("src", "telemetry.ts")] = [
+      'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
+      "Crumbtrail.init({",
+      "  ...PRESET_PASSIVE,",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "});",
+      "",
+    ].join("\n");
+    const plan = amendPlanFor(files);
+
+    expect(plan.kind).toBe("amend-init");
+    expect(plan.targetPath).toBe(p("src", "telemetry.ts"));
+    expect(plan.content).toContain('service: "web"');
+    expect(plan.extraEdits).toEqual([
+      expect.objectContaining({
+        path: p("src", "main.tsx"),
+        mode: "update",
+        content:
+          'import "crumbtrail-core/early";\n\nimport "./telemetry";\nrender();\n',
+      }),
+    ]);
+  });
+
+  it("requires confirmation when the separate entry boundary is dirty", () => {
+    const files = amendableFiles();
+    files[p("src", "main.tsx")] = 'import "./telemetry";\nrender();\n';
+    files[p("src", "telemetry.ts")] = files[p("src", "main.tsx")].replace(
+      'import "./telemetry";\nrender();',
+      [
+        'import { Crumbtrail } from "crumbtrail-core";',
+        `Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY });`,
+      ].join("\n"),
+    );
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.tsx"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO(files, { dirty: [p("src", "main.tsx")] }),
+    );
+
+    expect(plan.kind).toBe("needs-confirm-dirty");
+    expect(plan.extraEdits?.[0]?.path).toBe(p("src", "main.tsx"));
   });
 
   it("refuses a partial amend when an existing option disagrees", () => {
@@ -824,6 +881,7 @@ describe("an amended service reads the key the wizard just wrote", () => {
         endpoint: ENDPOINT,
         entryFile: p("src", "main.tsx"),
         serviceName: "web",
+        sdkVersion: "0.49.0",
         options: { force: true },
       },
       fakeInjectIO({
@@ -853,10 +911,7 @@ describe("SDK packages an adapter already implies", () => {
   ): Record<string, string> => ({
     [p("package.json")]: JSON.stringify({ dependencies }),
     ...Object.fromEntries(
-      installed.map((name) => [
-        p("node_modules", name, "package.json"),
-        "{}",
-      ]),
+      installed.map((name) => [p("node_modules", name, "package.json"), "{}"]),
     ),
     [p("server.js")]: [
       'import { autoCapture } from "crumbtrail-node";',

@@ -713,6 +713,38 @@ describe("buildPlan — static", () => {
   });
 
   it.each([
+    [
+      "a decoy string literal",
+      '<script type="module">const decoy = "https://esm.sh/crumbtrail-core@0.49.0"; Crumbtrail.init({ httpEndpoint: "https://ingest.example.com", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });</script>',
+    ],
+    [
+      "a classic external script",
+      '<script src="https://esm.sh/crumbtrail-core@0.49.0"></script><script>Crumbtrail.init({ httpEndpoint: "https://ingest.example.com", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });</script>',
+    ],
+  ])("does not use %s as module version proof", (_kind, moduleMarkup) => {
+    const wired = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        moduleMarkup,
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.warnings.join(" ")).toMatch(/version could not be determined/);
+  });
+
+  it.each([
     "http://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js",
     "https://evil.example/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js",
     "https://user:pass@unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js",
