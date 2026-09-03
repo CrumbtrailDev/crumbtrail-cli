@@ -173,8 +173,13 @@ class SharedPreferencesProcessExitMarker(
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences("ai.crumbtrail", Context.MODE_PRIVATE)
 
-    override fun read(): Long? = prefs.getLong(key, 0).takeIf { it > 0 }
-    override fun write(timestamp: Long) { prefs.edit().putLong(key, timestamp).apply() }
+    override fun read(): Long? = runCatching {
+        prefs.getLong(key, 0).takeIf { it > 0 }
+    }.getOrNull()
+
+    override fun write(timestamp: Long) {
+        runCatching { prefs.edit().putLong(key, timestamp).apply() }
+    }
 }
 
 /** API 30+ process exit history behind a compile-only Android seam. */
@@ -266,9 +271,9 @@ fun startCrumbtrail(
     }
     val pendingHangs = SharedPreferencesPendingHangStore(application)
     if (config.collectors.nativeDiagnostics) {
-        drainPendingHang(pendingHangs, logger)
-        installProcessExitCollector(application, logger)
-        installMemoryPressureCollector(application, logger)
+        runCatching { drainPendingHang(pendingHangs, logger) }
+        runCatching { installProcessExitCollector(application, logger) }
+        runCatching { installMemoryPressureCollector(application, logger) }
     }
     val watchdog = if (config.collectors.nativeWatchdog && config.collectors.appLifecycle) {
         createWatchdog(application, logger, pendingHangs)
@@ -382,6 +387,7 @@ private fun installMemoryPressureCollector(application: Application, logger: Cru
             )
         }
 
+        @Suppress("DEPRECATION")
         override fun onConfigurationChanged(newConfig: android.content.res.Configuration) = Unit
     }
     application.registerComponentCallbacks(callbacks)

@@ -63,10 +63,10 @@ in an app.
 | Event | Source |
 | --- | --- |
 | `native-crash` | An uncaught exception, delivered on the next launch |
-| `native-hang` | Shared wire contract for future watchdog observations. This package does not emit it yet |
+| `native-hang` | Foreground main thread stalls after recovery or on the next launch |
 | `err` | Errors you report with `recordError` |
 | `net` | HTTP requests you report with `recordRequest` |
-| `app-lifecycle` | Foreground and background transitions |
+| `app-lifecycle` | Foreground and background transitions, process exits on API 30 and newer, and memory pressure |
 | `navigation` | Which Activity came to the front |
 | `env` | Device, OS, app version and locale at startup |
 
@@ -87,6 +87,21 @@ app is never reported.
 
 Crumbtrail always chains to whatever handler was already installed, so adding
 this SDK does not silently disable an existing crash reporter.
+
+### Main thread hangs and process exits
+
+The default configuration watches the foreground main thread with a five second
+threshold. The watchdog pauses when the app enters the background and while a
+debugger is attached. A missed heartbeat is written to `SharedPreferences` and
+emitted when the main thread recovers. If the process never recovers, the next
+launch emits `native-hang` with `previousLaunch: true` and `recovered: false`.
+Stacks are limited to 64 frames and 8,192 characters.
+
+On Android API 30 and newer the SDK also reads `ApplicationExitInfo` for the
+most recent ANR, crash, native crash, or low memory exit. These observations are
+sent as `app-lifecycle` with `state: "process-exit"`. `ComponentCallbacks2`
+memory pressure notifications are sent as `app-lifecycle` with
+`state: "memory-pressure"`.
 
 ### Network
 
@@ -211,7 +226,11 @@ CrumbtrailConfig(
     queueCapacity = 2000,
     flushBatchSize = 50,
     flushIntervalSeconds = 10,
-    collectors = CrumbtrailCollectors(navigation = false),
+    collectors = CrumbtrailCollectors(
+        navigation = false,
+        nativeWatchdog = true,
+        nativeDiagnostics = true,
+    ),
 )
 ```
 

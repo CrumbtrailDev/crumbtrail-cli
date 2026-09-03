@@ -8,6 +8,10 @@ public struct CrumbtrailCollectors: Equatable, Sendable {
     public var navigation: Bool
     public var environment: Bool
     public var console: Bool
+    /// Foreground main thread watchdog with a five second threshold.
+    public var nativeWatchdog: Bool
+    /// MetricKit diagnostics and previous launch hang handoff.
+    public var nativeDiagnostics: Bool
 
     public init(
         errors: Bool = true,
@@ -15,7 +19,9 @@ public struct CrumbtrailCollectors: Equatable, Sendable {
         appLifecycle: Bool = true,
         navigation: Bool = true,
         environment: Bool = true,
-        console: Bool = true
+        console: Bool = true,
+        nativeWatchdog: Bool = true,
+        nativeDiagnostics: Bool = true
     ) {
         self.errors = errors
         self.network = network
@@ -23,12 +29,15 @@ public struct CrumbtrailCollectors: Equatable, Sendable {
         self.navigation = navigation
         self.environment = environment
         self.console = console
+        self.nativeWatchdog = nativeWatchdog
+        self.nativeDiagnostics = nativeDiagnostics
     }
 
     public static let all = CrumbtrailCollectors()
     public static let none = CrumbtrailCollectors(
         errors: false, network: false, appLifecycle: false,
-        navigation: false, environment: false, console: false
+        navigation: false, environment: false, console: false,
+        nativeWatchdog: false, nativeDiagnostics: false
     )
 }
 

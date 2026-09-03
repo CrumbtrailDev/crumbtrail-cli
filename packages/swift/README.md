@@ -48,7 +48,7 @@ agent key in an app.
 | Event | Source |
 | --- | --- |
 | `native-crash` | An uncaught exception from the **previous** launch |
-| `native-hang` | Shared wire contract for future watchdog observations. This package does not emit it yet |
+| `native-hang` | Foreground main thread stalls after recovery or on the next launch |
 | `err` | Errors you report with `recordError` |
 | `net` | HTTP requests, when the URLProtocol is registered (see below) |
 | `app-lifecycle` | Foreground, background, terminate, and memory warnings |
@@ -65,6 +65,21 @@ than a limitation of this SDK.
 Crumbtrail chains to any exception handler already installed rather than
 replacing it, so adding this SDK does not silently disable an existing crash
 reporter.
+
+### Main thread hangs and MetricKit diagnostics
+
+The default configuration watches the foreground main thread with a five second
+threshold. The watchdog pauses when the app becomes inactive or enters the
+background and while a debugger is attached. A missed heartbeat is written to
+`UserDefaults` and emitted when the main thread recovers. If the process never
+recovers, the next launch emits `native-hang` with `previousLaunch: true` and
+`recovered: false`. Stacks are limited to 64 frames and 8,192 characters.
+
+On iOS 14 and newer, MetricKit diagnostics are imported through the optional
+framework. Hang diagnostics are emitted as `native-hang` and crash diagnostics
+as `native-crash`, both marked as previous launch observations. MetricKit is
+not used on tvOS. The SDK does not install signal handlers or swizzle system
+classes.
 
 ### Network capture needs one line from you
 
@@ -163,7 +178,11 @@ CrumbtrailConfig(
     queueCapacity: 2000,
     flushBatchSize: 50,
     flushIntervalSeconds: 10,
-    collectors: CrumbtrailCollectors(network: false)
+    collectors: CrumbtrailCollectors(
+        network: false,
+        nativeWatchdog: true,
+        nativeDiagnostics: true
+    )
 )
 ```
 

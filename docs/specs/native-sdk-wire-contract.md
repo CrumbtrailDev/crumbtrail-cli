@@ -147,7 +147,9 @@ hang imports. Its required payload is:
 
 The event is additive and does not change the meaning of `app-lifecycle`.
 Memory pressure and process termination remain `app-lifecycle` observations.
-This contract does not claim that any current native SDK emits `native-hang`.
+The Swift and Kotlin SDKs emit `native-hang` when their native watchdogs are
+enabled. Other SDKs may support the shared contract without implementing a
+platform watchdog.
 
 `err` also allows `componentStk`, the framework component path a render crash
 happened inside. It is emitted by the React and React Native error boundaries

@@ -1,5 +1,9 @@
 import Foundation
 
+#if canImport(Darwin)
+import Darwin
+#endif
+
 #if canImport(UIKit) && !os(macOS)
 import UIKit
 #endif
@@ -26,7 +30,15 @@ extension Crumbtrail {
         if config.collectors.errors { installErrorCollector() }
         #if canImport(UIKit) && !os(macOS)
         if config.collectors.appLifecycle { installLifecycleCollector() }
+        #if !os(tvOS)
         if config.collectors.navigation { installOrientationCollector() }
+        #endif
+        #endif
+        #if canImport(MetricKit) && !os(tvOS) && !os(watchOS)
+        if config.collectors.nativeDiagnostics,
+           #available(iOS 14.0, macOS 12.0, *) {
+            installMetricKitCollector()
+        }
         #endif
     }
 
@@ -82,6 +94,33 @@ extension Crumbtrail {
         )
     }
 
+    private func recordNativeHang(_ hang: CrumbtrailNativeHang) {
+        addEvent(
+            kind: .nativeHang,
+            data: .object(compacting: [
+                "source": .string("main-thread"),
+                "thresholdMs": .int(hang.thresholdMs),
+                "observedDurationMs": .int(hang.observedDurationMs),
+                "recovered": .bool(hang.recovered),
+                "previousLaunch": .bool(hang.previousLaunch),
+                "stk": hang.stack.map(JSONValue.string),
+            ])
+        )
+    }
+
+    private func recordNativeCrash(_ crash: CrumbtrailNativeCrash) {
+        addEvent(
+            kind: .nativeCrash,
+            data: .object(compacting: [
+                "msg": .string(crash.message),
+                "stk": crash.stack.map(JSONValue.string),
+                "signal": crash.signal.map(JSONValue.string),
+                "source": .string("previous-launch"),
+                "at": crash.at.map(JSONValue.int),
+            ])
+        )
+    }
+
     #if canImport(UIKit) && !os(macOS)
 
     // MARK: - Lifecycle
@@ -93,6 +132,19 @@ extension Crumbtrail {
     /// request that "hung" is usually a request whose app was suspended
     /// mid-flight, and only this track separates the two.
     private func installLifecycleCollector() {
+        let pendingHangStore = UserDefaultsPendingHangStore()
+        if config.collectors.nativeDiagnostics {
+            drainPendingHang(pendingHangStore, onHang: recordNativeHang)
+        }
+        let watchdog: CrumbtrailMainThreadWatchdog? = config.collectors.nativeWatchdog
+            ? CrumbtrailMainThreadWatchdog(
+                scheduler: CrumbtrailDispatchWatchdogScheduler(),
+                handoff: pendingHangStore,
+                onHang: { [weak self] hang in self?.recordNativeHang(hang) },
+                isDebuggerAttached: CrumbtrailDebugger.isAttached
+            )
+            : nil
+
         let center = NotificationCenter.default
         let transitions: [(Notification.Name, String)] = [
             (UIApplication.didBecomeActiveNotification, "active"),
@@ -108,6 +160,12 @@ extension Crumbtrail {
                 forName: name, object: nil, queue: .main
             ) { [weak self] _ in
                 guard let self else { return }
+                switch state {
+                case "active", "foreground": watchdog?.resume()
+                case "inactive", "background": watchdog?.pause()
+                case "terminate": watchdog?.stop()
+                default: break
+                }
                 self.addEvent(
                     kind: .appLifecycle,
                     data: .object(compacting: [
@@ -144,10 +202,16 @@ extension Crumbtrail {
 
         registerCleanup {
             for token in tokens { center.removeObserver(token) }
+            watchdog?.stop()
+        }
+
+        if UIApplication.shared.applicationState == .active {
+            watchdog?.resume()
         }
     }
 
     /// Portrait and landscape, which reproduces a whole class of layout-only bugs.
+    #if !os(tvOS)
     private func installOrientationCollector() {
         let center = NotificationCenter.default
         let token = center.addObserver(
@@ -166,11 +230,28 @@ extension Crumbtrail {
         }
         registerCleanup { center.removeObserver(token) }
     }
+    #endif
 
     #endif
 }
 
-#if canImport(UIKit) && !os(macOS)
+#if canImport(MetricKit) && !os(tvOS) && !os(watchOS)
+@available(iOS 14.0, macOS 12.0, *)
+private extension Crumbtrail {
+    func installMetricKitCollector() {
+        let source = CrumbtrailSystemMetricKitSource()
+        let collector = CrumbtrailMetricKitCollector(
+            source: source,
+            emitHang: { [weak self] hang in self?.recordNativeHang(hang) },
+            emitCrash: { [weak self] crash in self?.recordNativeCrash(crash) }
+        )
+        collector.start()
+        registerCleanup { collector.stop() }
+    }
+}
+#endif
+
+#if canImport(UIKit) && !os(macOS) && !os(tvOS)
 enum CrumbtrailOrientation {
     static func name(_ orientation: UIDeviceOrientation) -> String {
         switch orientation {

@@ -121,7 +121,6 @@ class CrumbtrailMainThreadWatchdog(
             generation += 1
             token = generation
             lastHeartbeatAt = now()
-            pendingAt = null
         }
         scheduleCheck(token)
         scheduler.postToMain { heartbeat(token) }
@@ -134,7 +133,6 @@ class CrumbtrailMainThreadWatchdog(
             generation += 1
             checkTask?.cancel()
             checkTask = null
-            pendingAt = null
         }
     }
 

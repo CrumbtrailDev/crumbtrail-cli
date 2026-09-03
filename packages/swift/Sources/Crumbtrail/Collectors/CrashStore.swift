@@ -45,9 +45,10 @@ public enum CrumbtrailCrashStore {
     public static func writePending(message: String, stack: String?, signal: String?) {
         guard let url = fileURL else { return }
         let crash = CrumbtrailPendingCrash(
-            message: message,
-            stack: stack,
-            signal: signal,
+            message: crumbtrailBoundedDiagnosticText(message, maxCharacters: 1_024)
+                ?? "uncaught exception",
+            stack: crumbtrailBoundedDiagnosticText(stack),
+            signal: crumbtrailBoundedDiagnosticText(signal, maxCharacters: 128),
             at: Int64(Date().timeIntervalSince1970 * 1000)
         )
         guard let data = try? JSONEncoder().encode(crash) else { return }
