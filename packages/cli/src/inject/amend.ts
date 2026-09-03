@@ -305,6 +305,11 @@ export function maskLiterals(text: string): string | null {
 type ModuleSpecifierMatcher = (specifier: string) => boolean;
 
 const STATIC_IMPORT_REFERENCE = /\bimport\s+(?:"([^"]*)"|'([^']*)')/g;
+// The normal path uses Babel's ImportDeclaration AST. This bounded fallback is
+// also needed for an HTML module script, which is intentionally not a complete
+// JavaScript file until its surrounding tags are removed.
+const IMPORT_FROM_REFERENCE =
+  /\bimport\s+(?!type\b)[^;\n<>]*?\sfrom\s*(?:"([^"]*)"|'([^']*)')/g;
 const DYNAMIC_IMPORT_REFERENCE =
   /\bimport\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/g;
 const BARE_REQUIRE_REFERENCE = /\brequire\s*\(\s*(?:"([^"]*)"|'([^']*)')\s*\)/g;
@@ -423,6 +428,7 @@ function maskedModuleReference(
     keyword: "import" | "require";
   }> = [
     { pattern: STATIC_IMPORT_REFERENCE, keyword: "import" },
+    { pattern: IMPORT_FROM_REFERENCE, keyword: "import" },
     { pattern: DYNAMIC_IMPORT_REFERENCE, keyword: "import" },
     { pattern: BARE_REQUIRE_REFERENCE, keyword: "require" },
   ];
@@ -458,11 +464,13 @@ export function hasExecutableModuleReference(
 }
 
 function isCrumbtrailModuleSpecifier(specifier: string): boolean {
-  return (
-    /^(?:crumbtrail-core|crumbtrail-node|crumbtrail-react-native|crumbtrail-capacitor)(?:\/|$)/.test(
-      specifier,
-    ) || /^package:crumbtrail_flutter(?:\/|$)/.test(specifier)
-  );
+  if (/^package:crumbtrail_flutter(?:\/|$)/.test(specifier)) return true;
+  return [
+    "crumbtrail-core",
+    "crumbtrail-node",
+    "crumbtrail-react-native",
+    "crumbtrail-capacitor",
+  ].some((name) => new RegExp(`(?:^|/)${name}(?:@|/|$)`).test(specifier));
 }
 
 /** True when source executes an import/require of one of Crumbtrail's packages. */
