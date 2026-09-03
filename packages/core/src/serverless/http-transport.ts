@@ -1,4 +1,8 @@
 import type { BugEvent } from "../types";
+import {
+  createRuntimeBindingClient,
+  type RuntimeBindingClient,
+} from "../runtime-binding";
 import type {
   ServerlessInvocationEvent,
   ServerlessInvocationSession,
@@ -14,6 +18,8 @@ export interface ServerlessHttpTransportOptions {
   authToken?: string;
   fetchImpl?: typeof fetch;
   requestTimeoutMs?: number;
+  /** Internal per-process runtime identity for targeted probe delivery. */
+  runtimeBinding?: RuntimeBindingClient;
 }
 
 export class ServerlessConfigurationError extends Error {
@@ -93,6 +99,7 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
   private readonly fetcher: typeof fetch;
   private readonly timeoutMs: number;
   private readonly requestSubject: string;
+  private readonly runtimeBinding: RuntimeBindingClient;
   private readonly operations: QueuedOperation[] = [];
   private flushTail: Promise<void> = Promise.resolve();
 
@@ -111,6 +118,13 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
     this.fetcher = options.fetchImpl ?? fetch;
     this.timeoutMs = normalizeTimeout(options.requestTimeoutMs);
     this.requestSubject = requestSubject;
+    this.runtimeBinding =
+      options.runtimeBinding ??
+      createRuntimeBindingClient({
+        endpoint,
+        projectKey: options.authToken,
+        fetchImpl: this.fetcher,
+      });
   }
 
   startSession(session: ServerlessInvocationSession): void {
@@ -173,11 +187,15 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
     for (const operation of operations) {
       if (failures.some((failure) => failure.phase === "session-start")) break;
       try {
+        const body =
+          operation.phase === "session-start"
+            ? await this.sessionStartBody(operation.body)
+            : operation.body;
         lastResponse = await postJson(
           this.fetcher,
           `${this.endpoint}${operation.path}`,
           this.headers,
-          operation.body,
+          body,
           this.timeoutMs,
           this.requestSubject,
           signal,
@@ -189,6 +207,17 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
 
     if (failures.length > 0) throw new ServerlessHttpFlushError(failures);
     return lastResponse;
+  }
+
+  private async sessionStartBody(body: string): Promise<string> {
+    const binding = await this.runtimeBinding.getBinding();
+    if (!binding) return body;
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    return JSON.stringify({
+      ...parsed,
+      instanceId: binding.instanceId,
+      instanceProof: binding.instanceProof,
+    });
   }
 }
 
@@ -206,6 +235,8 @@ export interface HeadlessSessionOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Reused by Node autoCapture across session re-establishes. */
+  runtimeBinding?: RuntimeBindingClient;
 }
 
 export interface HeadlessSession {
@@ -224,6 +255,9 @@ export async function startHeadlessSession(
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
       ...(options.timeoutMs !== undefined
         ? { requestTimeoutMs: options.timeoutMs }
+        : {}),
+      ...(options.runtimeBinding
+        ? { runtimeBinding: options.runtimeBinding }
         : {}),
     },
     "headless session",

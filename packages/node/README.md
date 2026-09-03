@@ -445,6 +445,13 @@ installed the middleware claims the request and the `http.Server` hook stays
 silent, so a request is recorded once. Disable the hook with
 `captureHttpRequests: false`.
 
+With an ingest key, `autoCapture` registers one runtime identity for the Node
+process. The identity is sent only as top level fields on the session start and
+as bearer authentication for browser config polls. The proof stays in process
+memory, rotates before its one day expiry, and is discarded on `stop()`. If
+registration is unavailable or rate limited, auto capture keeps the existing
+untargeted session behavior and does not retry in a loop.
+
 ### Structured logs
 
 A real backend logs through pino, winston or bunyan, and a failure it expected is

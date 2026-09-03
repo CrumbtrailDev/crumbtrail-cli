@@ -50,25 +50,27 @@ describe("createServerlessHttpTransport", () => {
     await transport.flush();
 
     expect(calls.map(({ url }) => url)).toEqual([
+      "https://capture.example/api/runtime/register?projectKey=ingest-key",
       "https://capture.example/api/session/start",
       "https://capture.example/api/events",
       "https://capture.example/api/session/end",
     ]);
-    for (const { init } of calls) {
+    for (const { init } of calls.slice(1)) {
       expect(init?.headers).toMatchObject({
         "content-type": "application/json",
         "x-crumbtrail-auth": "ingest-key",
       });
     }
-    expect(JSON.parse(String(calls[0].init?.body))).toEqual({
+    expect(calls[0].init?.headers).toBeUndefined();
+    expect(JSON.parse(String(calls[1].init?.body))).toEqual({
       sessionId: "ses_owned",
       metadata: { service: "checkout" },
     });
-    expect(JSON.parse(String(calls[1].init?.body))).toEqual({
+    expect(JSON.parse(String(calls[2].init?.body))).toEqual({
       sessionId: "ses_owned",
       events: [event("ses_owned")],
     });
-    expect(JSON.parse(String(calls[2].init?.body))).toEqual({
+    expect(JSON.parse(String(calls[3].init?.body))).toEqual({
       sessionId: "ses_owned",
     });
   });

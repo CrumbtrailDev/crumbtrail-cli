@@ -34,6 +34,15 @@ export {
   createServerlessHttpTransport,
   startHeadlessSession,
 } from "./http-transport";
+export {
+  createRuntimeBindingClient,
+  RuntimeBindingClient,
+  RUNTIME_BINDING_ROTATE_AHEAD_MS,
+} from "../runtime-binding";
+export type {
+  RuntimeBinding,
+  RuntimeBindingClientOptions,
+} from "../runtime-binding";
 export type {
   HeadlessSession,
   HeadlessSessionOptions,

@@ -1,4 +1,5 @@
 import type { BugEvent, CrumbtrailTransport, BugReport } from "../types";
+import type { RuntimeBindingClient } from "../runtime-binding";
 
 /**
  * A batch the server refused.
@@ -111,6 +112,8 @@ export class CaptureShedError extends EventDeliveryError {
 
 export interface HttpTransportOptions {
   authToken?: string;
+  /** Internal runtime identity used for targeted probe delivery. */
+  runtimeBinding?: RuntimeBindingClient;
 }
 
 /**
@@ -180,6 +183,7 @@ function utf8ByteLength(text: string): number {
 export class HttpTransport implements CrumbtrailTransport {
   private sessionId = "";
   private authToken?: string;
+  private runtimeBinding?: RuntimeBindingClient;
   private endpoint: string;
   private sessions = new Map<
     string,
@@ -199,6 +203,7 @@ export class HttpTransport implements CrumbtrailTransport {
   constructor(endpoint: string, options?: HttpTransportOptions) {
     this.endpoint = endpoint.replace(/\/+$/, "");
     this.authToken = options?.authToken;
+    this.runtimeBinding = options?.runtimeBinding;
     if (!this.authToken && !isLocalEndpoint(this.endpoint)) {
       // The one line that closes the commonest cold-start dead end.
       //
@@ -547,12 +552,22 @@ export class HttpTransport implements CrumbtrailTransport {
       refusedStatus: number;
     },
   ): Promise<void> {
+    const binding = await this.runtimeBinding?.getBinding();
     let response: Response;
     try {
       response = await fetch(`${this.endpoint}/api/session/start`, {
         method: "POST",
         headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ sessionId, metadata }),
+        body: JSON.stringify({
+          sessionId,
+          ...(binding
+            ? {
+                instanceId: binding.instanceId,
+                instanceProof: binding.instanceProof,
+              }
+            : {}),
+          metadata,
+        }),
       });
     } catch {
       // The caller swallows this rejection, so this warning is the only trace

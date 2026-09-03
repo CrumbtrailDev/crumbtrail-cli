@@ -1,4 +1,5 @@
 import { buildCaptureGapEvent, type BugEvent } from "crumbtrail-core";
+import { createRuntimeBindingClient } from "crumbtrail-core/serverless";
 import {
   autoInstrumentCacheClients,
   autoInstrumentCachePatchedAnything,
@@ -543,6 +544,15 @@ export async function autoCapture(
     authToken,
   );
   const now = options.nowImpl ?? Date.now;
+  // One binding belongs to this Node process. It is intentionally held outside
+  // each headless session so re-establishes rotate or reuse the same runtime
+  // identity instead of minting one row per outage.
+  const runtimeBinding = createRuntimeBindingClient({
+    endpoint: options.endpoint,
+    projectKey: authToken,
+    fetchImpl: options.fetchImpl,
+    now,
+  });
   // Stable id reused across every (re-)establishment attempt so events correlate
   // to one logical session even if the first handshake failed and a later one
   // succeeds.
@@ -697,6 +707,7 @@ export async function autoCapture(
       ...(options.requestTimeoutMs !== undefined
         ? { timeoutMs: options.requestTimeoutMs }
         : {}),
+      runtimeBinding,
     });
 
   // Lazily (re-)establish the ingest session, bounded by the backoff gate.
@@ -1463,6 +1474,7 @@ export async function autoCapture(
     // stop() short-circuits and an in-flight handshake resolves to a discarded
     // session instead of arming further retries.
     stopped = true;
+    runtimeBinding.stop();
     clearProcessSessionId(stableSessionId);
     if (consoleRef.error === patchedError) {
       consoleRef.error = originalError as typeof consoleRef.error;
