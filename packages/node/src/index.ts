@@ -1,6 +1,18 @@
 export { captureDbCallsite, type DbCallsite } from "./db/callsite";
 
 export {
+  sendApplicationAssertion,
+  sendSupportAssertion,
+  recordApplicationAssertion,
+  resetApplicationAssertionCountsForTests,
+} from "./assertion";
+
+export type {
+  SendApplicationAssertionOptions,
+  SendApplicationAssertionResult,
+} from "./assertion";
+
+export {
   CACHE_EVENT_KIND,
   AUTO_INSTRUMENT_CACHE_DRIVERS,
   autoInstrumentCacheClients,

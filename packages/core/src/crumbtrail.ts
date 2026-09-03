@@ -116,6 +116,12 @@ import {
   prepareReportScreenshot,
   type CaptureScreenshotOptions,
 } from "./screenshot";
+import {
+  buildApplicationAssertionEvent,
+  MAX_APPLICATION_ASSERTIONS_PER_SESSION,
+  type ApplicationAssertionOptions,
+  type ApplicationAssertionResult,
+} from "./assertion";
 
 /** Cap on delivery-failure gap records per session. */
 const MAX_DELIVERY_GAP_EVENTS = 3;
@@ -483,6 +489,7 @@ export class Crumbtrail {
   /** Storage-failure hooks follow trigger changes without restarting the storage collector. */
   private storageFailureSyncs = new Set<() => void>();
   private sessionId: string;
+  private applicationAssertions = 0;
   private widgetCleanup?: () => void;
   /** Names uploaded by this live session and therefore eligible for association. */
   private visualArtifactNames = new Set<string>();
@@ -2121,6 +2128,7 @@ export class Crumbtrail {
     if (this.stopped || !this.lifecycleSuspended) return undefined;
 
     this.sessionId = generateSessionId();
+    this.applicationAssertions = 0;
     if (this.sessionStore)
       writePersistedSession(this.sessionStore, this.sessionId);
     this.visualArtifactNames.clear();
@@ -2387,6 +2395,33 @@ export class Crumbtrail {
 
   mark(label: string): void {
     this.bus.emit({ t: now(), k: "mark", d: { label } });
+  }
+
+  /**
+   * Record a bounded application-owned correctness claim.
+   *
+   * The SDK never infers a claim from a response or a UI state. The host must
+   * provide both values, and invalid values are rejected before the event bus
+   * sees them. `assert()` is a convenience that returns the computed result;
+   * `reportAssertion()` exposes the admission result for callers that need to
+   * distinguish a failed claim from a refused one.
+   */
+  reportAssertion(options: ApplicationAssertionOptions): ApplicationAssertionResult {
+    if (this.applicationAssertions >= MAX_APPLICATION_ASSERTIONS_PER_SESSION) {
+      return { accepted: false, rejection: "session_cap_reached" };
+    }
+    const result = buildApplicationAssertionEvent(
+      { ...options, sessionId: this.sessionId },
+      now(),
+    );
+    if (!result.accepted || result.event === undefined) return result;
+    this.applicationAssertions += 1;
+    this.bus.emit(result.event);
+    return result;
+  }
+
+  assert(options: ApplicationAssertionOptions): boolean {
+    return this.reportAssertion(options).passed === true;
   }
 
   addEvent(partial: AddBugEventOptions): boolean {

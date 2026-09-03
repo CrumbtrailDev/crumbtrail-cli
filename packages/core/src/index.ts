@@ -51,6 +51,34 @@ export {
 export type { W3CTraceContext, OutboundCorrelation } from "./correlation";
 export { buildCaptureGapEvent } from "./capture-gap";
 export type { BuildCaptureGapEventInput } from "./capture-gap";
+export {
+  APPLICATION_ASSERTION_EVENT_KIND,
+  SUPPORT_ASSERTION_EVENT_KIND,
+  APPLICATION_ASSERTION_OPERATORS,
+  MAX_APPLICATION_ASSERTIONS_PER_SESSION,
+  MAX_SUPPORT_ASSERTIONS_PER_SESSION,
+  APPLICATION_ASSERTION_NAME_MAX_LENGTH,
+  APPLICATION_ASSERTION_STRING_MAX_LENGTH,
+  APPLICATION_ASSERTION_CORRELATION_MAX_LENGTH,
+  buildApplicationAssertionData,
+  buildApplicationAssertionEvent,
+  buildSupportAssertionEvent,
+  evaluateApplicationAssertion,
+  evaluateSupportAssertion,
+  isSafeApplicationAssertionValue,
+} from "./assertion";
+export type {
+  ApplicationAssertionOperator,
+  SupportAssertionOperator,
+  ApplicationAssertionValue,
+  SupportAssertionValue,
+  ApplicationAssertionOptions,
+  SupportAssertionOptions,
+  ApplicationAssertionRejection,
+  ApplicationAssertionResult,
+  SupportAssertionResult,
+  ApplicationAssertionEventData,
+} from "./assertion";
 export { normalizeStatementShape } from "./db-statement-shape";
 export {
   buildMaskedDomSnapshot,
