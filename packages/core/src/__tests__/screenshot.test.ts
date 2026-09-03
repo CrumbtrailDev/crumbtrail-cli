@@ -45,6 +45,18 @@ function init(transport: ReturnType<typeof makeTransport>) {
     performance: false,
     environment: false,
     domSnapshot: false,
+    keystrokes: false,
+    scroll: false,
+    visibility: false,
+    clipboard: false,
+    cookies: false,
+    storage: false,
+    heartbeat: false,
+    uiNumbers: false,
+    listeners: false,
+    eventSource: false,
+    webSocket: false,
+    workers: false,
     flushIntervalMs: 100_000,
     flushBufferSize: 100_000,
     reportScreenshotsEnabled: true,
@@ -547,7 +559,7 @@ describe("report screenshot API", () => {
       logger as unknown as { lifecycleClosePromise?: Promise<void> }
     ).lifecycleClosePromise;
     expect(lifecycleClose).toBeDefined();
-    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
     expect(transport.sendEvents).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
     await expect(lifecycleClose).resolves.toBeUndefined();
@@ -646,7 +658,7 @@ describe("report screenshot API", () => {
     ).deferredDeliveryGaps = [{ t: Date.now(), k: "mark", d: {} }];
 
     const stopping = logger.stop();
-    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
     expect(transport.sendEvents).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
 
@@ -670,7 +682,7 @@ describe("report screenshot API", () => {
     const logger = init(transport);
 
     const stopping = logger.stop();
-    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
     expect(transport.endSession).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
 

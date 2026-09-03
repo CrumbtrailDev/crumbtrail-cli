@@ -1907,12 +1907,14 @@ export class Crumbtrail {
 
         const replay = this.replay;
         this.replay = undefined;
-        const replaySettled = await this.waitForLifecycleOperation(
-          Promise.resolve()
-            .then(() => replay?.stop())
-            .catch(() => {}),
-          closeState,
-        );
+        const replaySettled = replay
+          ? await this.waitForLifecycleOperation(
+              Promise.resolve()
+                .then(() => replay.stop())
+                .catch(() => {}),
+              closeState,
+            )
+          : true;
         if (!replaySettled) {
           this.lifecycleSuspended = true;
           this.sessionStarted = false;
