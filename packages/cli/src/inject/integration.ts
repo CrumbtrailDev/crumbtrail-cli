@@ -1,6 +1,10 @@
 import path from "node:path";
 import { readEnvVar } from "../env-file";
-import { RECIPE_REGISTRY } from "../recipe-registry";
+import {
+  RECIPE_REGISTRY,
+  SDK_IMPLIED_BY,
+  satisfiesFloor,
+} from "../recipe-registry";
 import type { Recipe } from "../detect";
 import type { InjectIO } from "./io";
 import { findCallSites, maskLiterals } from "./amend";
@@ -36,6 +40,15 @@ export interface IntegrationStatus {
   found: boolean;
   /** The concrete pieces that keep an existing integration from being complete. */
   missing: IntegrationRequirement[];
+  /**
+   * The SDK packages the manifest is actually short of, when `missing` carries
+   * `sdk`. Empty otherwise.
+   *
+   * Carried on the status rather than recomputed by the caller so the guidance a
+   * reader gets names the same packages the check failed on — the two drifted
+   * apart once, and the advice named a package the app already had.
+   */
+  missingSdkPackages: string[];
   /** Reasons an existing integration cannot be safely amended automatically. */
   hazards: IntegrationHazard[];
   /** Environment names found in source or project configuration. */
@@ -289,23 +302,58 @@ function sdkPackageInstalled(cwd: string, io: InjectIO, name: string): boolean {
   }
 }
 
-function sdkComplete(input: IntegrationCheckInput): boolean {
+/**
+ * Whether a manifest already carries `name`, directly or through a package that
+ * depends on it.
+ *
+ * An adapter satisfies its implied package only when it is declared at or above
+ * its own floor AND resolvable on disk, because the implication is a real
+ * dependency edge: `crumbtrail-node@>=0.31.0` pulls `crumbtrail-core` in, so
+ * `import` from core resolves whether or not the app names core itself.
+ */
+function sdkPackageSatisfied(
+  input: IntegrationCheckInput,
+  deps: Record<string, string>,
+  name: string,
+): boolean {
+  if (name in deps && sdkPackageInstalled(input.cwd, input.io, name)) {
+    return true;
+  }
+  return (SDK_IMPLIED_BY[name] ?? []).some(
+    (implier) =>
+      implier in deps &&
+      satisfiesFloor(implier, deps[implier]) &&
+      sdkPackageInstalled(input.cwd, input.io, implier),
+  );
+}
+
+/**
+ * The SDK packages this app is genuinely short of — never the whole recipe list.
+ *
+ * The distinction is the entire point: a server app declaring only
+ * `crumbtrail-node` used to be told to "Install crumbtrail-core,
+ * crumbtrail-node", naming a package it already had and one it never needed to
+ * name. What a reader can act on is the shortfall.
+ */
+export function missingSdkPackages(input: IntegrationCheckInput): string[] {
   if (input.recipe === "flutter") {
     const pubspec = input.io.readFile(path.join(input.cwd, "pubspec.yaml"));
-    return pubspec != null && /^\s*crumbtrail_flutter\s*:/m.test(pubspec);
+    const wired =
+      pubspec != null && /^\s*crumbtrail_flutter\s*:/m.test(pubspec);
+    return wired ? [] : ["crumbtrail_flutter"];
   }
   // A recipe with no packages to add (otlp guidance, and a static page that
   // loads the SDK from a CDN) is complete on this requirement by construction.
   // Checked BEFORE package.json, because those are exactly the projects that may
   // not have one — and demanding a manifest they never needed made every re-run
   // report the wiring as incomplete.
-  if (RECIPE_REGISTRY[input.recipe].sdkPackages.length === 0) return true;
+  const wanted = RECIPE_REGISTRY[input.recipe].sdkPackages;
+  if (wanted.length === 0) return [];
   const pkg = packageJson(input);
-  if (!pkg) return false;
+  // No readable manifest at all: nothing is declared, so everything is short.
+  if (!pkg) return [...wanted];
   const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-  return RECIPE_REGISTRY[input.recipe].sdkPackages.every(
-    (name) => name in deps && sdkPackageInstalled(input.cwd, input.io, name),
-  );
+  return wanted.filter((name) => !sdkPackageSatisfied(input, deps, name));
 }
 
 function normalizedEndpoint(value: string): string {
@@ -553,7 +601,8 @@ export function inspectIntegration(
   const found = CRUMBTRAIL_REFERENCE.test(source);
   const missing: IntegrationRequirement[] = [];
 
-  if (!sdkComplete(input)) missing.push("sdk");
+  const shortOfSdk = missingSdkPackages(input);
+  if (shortOfSdk.length > 0) missing.push("sdk");
   if (source.length === 0 || !found) missing.push("entry");
   if (!endpointConfigured(input, source)) missing.push("endpoint");
   if (!keyConfigured(input, source)) missing.push("ingest-key");
@@ -577,6 +626,7 @@ export function inspectIntegration(
     complete: missing.length === 0 && hazards.length === 0,
     found,
     missing,
+    missingSdkPackages: shortOfSdk,
     hazards,
     existingEnvVars,
     keyEnvVarsSeen,
