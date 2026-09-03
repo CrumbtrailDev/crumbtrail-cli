@@ -301,6 +301,9 @@ response bodies, and redaction markers are rejected. At most 100 valid
 assertions are emitted per session. Use `reportAssertion()` when the caller
 needs to distinguish a failed assertion from an invalid or capped input. Pass
 `requestId` and `traceId` when the application owns those correlation values.
+Assertion event timestamps are non-negative safe integer Unix milliseconds within
+the ECMAScript `Date` range. The exported event builder rejects timestamps
+outside that definition.
 
 `createRequestHeaders()` is for a transport Crumbtrail does not patch, such as a
 WebSocket frame, a server action, or a queue message. It returns the session

@@ -24,6 +24,12 @@ export const MAX_APPLICATION_ASSERTIONS_PER_SESSION = 100 as const;
 export const MAX_SUPPORT_ASSERTIONS_PER_SESSION =
   MAX_APPLICATION_ASSERTIONS_PER_SESSION;
 
+/** Canonical assertion event timestamps are non-negative Unix milliseconds. */
+export const APPLICATION_ASSERTION_TIMESTAMP_MIN = 0 as const;
+/** Match the largest timestamp representable by an ECMAScript Date. */
+export const APPLICATION_ASSERTION_TIMESTAMP_MAX =
+  8_640_000_000_000_000 as const;
+
 /** Bounds are deliberately small so this contract cannot become a logging escape hatch. */
 export const APPLICATION_ASSERTION_NAME_MAX_LENGTH = 64 as const;
 export const APPLICATION_ASSERTION_STRING_MAX_LENGTH = 64 as const;
@@ -52,7 +58,9 @@ export type ApplicationAssertionRejection =
   | "value_types_differ"
   | "operator_requires_numbers"
   | "correlation_invalid"
-  | "session_cap_reached";
+  | "invalid_timestamp"
+  | "session_cap_reached"
+  | "session_tracking_limit_reached";
 
 export interface ApplicationAssertionResult {
   /** Whether the inputs formed a bounded assertion and were eligible to emit. */
@@ -78,12 +86,18 @@ export interface ApplicationAssertionEventData {
   traceId?: string;
 }
 
+type ApplicationAssertionDataRejection = Exclude<
+  ApplicationAssertionRejection,
+  "invalid_timestamp" | "session_cap_reached" | "session_tracking_limit_reached"
+>;
+
 const NAME_RE = /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/;
 const SAFE_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$/;
 const CORRELATION_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const JWT_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
-const SECRET_PREFIX_RE = /^(?:sk|pk)_(?:live|test)_|^(?:ghp|gho|ghu|ghs|ghr)_|^github_pat_|^xox[abprs]-|^bearer[: _-]/i;
+const SECRET_PREFIX_RE =
+  /^(?:sk|pk)_(?:live|test)_|^(?:ghp|gho|ghu|ghs|ghr)_|^github_pat_|^xox[abprs]-|^bearer[: _-]/i;
 
 function isSafeName(value: unknown): value is string {
   return (
@@ -140,6 +154,17 @@ function isSafeCorrelation(value: unknown): value is string {
   );
 }
 
+function isCanonicalApplicationAssertionTimestamp(
+  value: unknown,
+): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= APPLICATION_ASSERTION_TIMESTAMP_MIN &&
+    value <= APPLICATION_ASSERTION_TIMESTAMP_MAX
+  );
+}
+
 /** Evaluate a validated bounded assertion. */
 export function evaluateApplicationAssertion(
   operator: ApplicationAssertionOperator,
@@ -166,7 +191,7 @@ export function buildApplicationAssertionData(
   options: ApplicationAssertionOptions,
 ):
   | { accepted: true; passed: boolean; data: ApplicationAssertionEventData }
-  | { accepted: false; rejection: Exclude<ApplicationAssertionRejection, "session_cap_reached"> } {
+  | { accepted: false; rejection: ApplicationAssertionDataRejection } {
   if (!isSafeName(options.name))
     return { accepted: false, rejection: "invalid_name" };
   if (!isApplicationAssertionOperator(options.operator))
@@ -186,7 +211,8 @@ export function buildApplicationAssertionData(
   )
     return { accepted: false, rejection: "operator_requires_numbers" };
   if (
-    (options.requestId !== undefined && !isSafeCorrelation(options.requestId)) ||
+    (options.requestId !== undefined &&
+      !isSafeCorrelation(options.requestId)) ||
     (options.traceId !== undefined && !isSafeCorrelation(options.traceId)) ||
     (options.sessionId !== undefined && !isSafeCorrelation(options.sessionId))
   )
@@ -222,6 +248,9 @@ export function buildApplicationAssertionEvent(
 ): ApplicationAssertionResult {
   const built = buildApplicationAssertionData(options);
   if (!built.accepted) return built;
+  if (!isCanonicalApplicationAssertionTimestamp(timestamp)) {
+    return { accepted: false, rejection: "invalid_timestamp" };
+  }
   return {
     accepted: true,
     passed: built.passed,

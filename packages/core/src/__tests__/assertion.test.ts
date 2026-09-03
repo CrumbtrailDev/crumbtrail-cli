@@ -2,8 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Crumbtrail } from "../crumbtrail";
 import {
   APPLICATION_ASSERTION_EVENT_KIND,
+  APPLICATION_ASSERTION_TIMESTAMP_MAX,
+  APPLICATION_ASSERTION_TIMESTAMP_MIN,
   MAX_APPLICATION_ASSERTIONS_PER_SESSION,
   buildApplicationAssertionData,
+  buildApplicationAssertionEvent,
   evaluateApplicationAssertion,
 } from "../index";
 
@@ -70,6 +73,50 @@ describe("application assertions", () => {
         actual: "1",
       }).accepted,
     ).toBe(false);
+  });
+
+  it.each([
+    { label: "fractional", timestamp: 1.5 },
+    {
+      label: "negative",
+      timestamp: APPLICATION_ASSERTION_TIMESTAMP_MIN - 1,
+    },
+    {
+      label: "too large",
+      timestamp: APPLICATION_ASSERTION_TIMESTAMP_MAX + 1,
+    },
+    { label: "unsafe", timestamp: Number.MAX_SAFE_INTEGER + 1 },
+  ])("rejects $label assertion timestamps", ({ timestamp }) => {
+    expect(
+      buildApplicationAssertionEvent(
+        {
+          name: "checkout_total",
+          operator: "equals",
+          expected: 1,
+          actual: 1,
+        },
+        timestamp,
+      ),
+    ).toEqual({ accepted: false, rejection: "invalid_timestamp" });
+  });
+
+  it("accepts the canonical timestamp boundaries", () => {
+    for (const timestamp of [
+      APPLICATION_ASSERTION_TIMESTAMP_MIN,
+      APPLICATION_ASSERTION_TIMESTAMP_MAX,
+    ]) {
+      expect(
+        buildApplicationAssertionEvent(
+          {
+            name: "checkout_total",
+            operator: "equals",
+            expected: 1,
+            actual: 1,
+          },
+          timestamp,
+        ).accepted,
+      ).toBe(true);
+    }
   });
 
   it("emits only fixed bounded fields and includes the active correlation", async () => {
@@ -146,7 +193,9 @@ describe("application assertions", () => {
     const assertionEvents = sink.sendEvents.mock.calls
       .flatMap((call) => call[0] as Array<{ k?: string }>)
       .filter((event) => event.k === "app.assertion");
-    expect(assertionEvents).toHaveLength(MAX_APPLICATION_ASSERTIONS_PER_SESSION);
+    expect(assertionEvents).toHaveLength(
+      MAX_APPLICATION_ASSERTIONS_PER_SESSION,
+    );
     await logger.stop();
   }, 15_000);
 });
