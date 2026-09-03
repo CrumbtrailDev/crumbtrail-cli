@@ -226,12 +226,48 @@ export type {
 // too, so that work's evidence joins the request that queued it.
 export {
   getBackendRequestContext,
+  extractBackendTraceContext,
   readRequestCorrelation,
   runInBackendRequestContext,
   updateBackendRequestContext,
 } from "./request-context";
 
 export type { BackendRequestContext } from "./request-context";
+
+// ── Distributed job context ─────────────────────────────────────────────────
+export {
+  captureToken,
+  extractCrumbtrailContext,
+  injectCrumbtrailContext,
+  isCrumbtrailContextToken,
+  validateCrumbtrailContextToken,
+  withCausalContext,
+  CRUMBTRAIL_CONTEXT_TOKEN_VERSION,
+  DEFAULT_CONTEXT_TOKEN_TTL_MS,
+  MAX_CONTEXT_TOKEN_ID_LENGTH,
+  MAX_CONTEXT_TOKEN_TRACESTATE_LENGTH,
+} from "./distributed-context";
+
+export type {
+  CaptureTokenOptions,
+  CrumbtrailContextCarrier,
+  CrumbtrailContextToken,
+  WithCausalContextOptions,
+} from "./distributed-context";
+
+export {
+  withCrumbtrailJob,
+  DEFAULT_JOB_CLEANUP_TIMEOUT_MS,
+  DEFAULT_JOB_LINK_TIMEOUT_MS,
+} from "./jobs";
+
+export type {
+  CrumbtrailJobContext,
+  CrumbtrailJobOptions,
+  JobCaptureLossPhase,
+} from "./jobs";
+
+export type { BackendEventSink } from "./backend-event-sink";
 
 // Capture-side utilities the pipeline tests reach for directly. They were
 // internal while those tests lived beside them; now that the tests live with

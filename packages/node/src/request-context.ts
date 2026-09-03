@@ -56,6 +56,10 @@ export interface BackendRequestContext {
    * it must not be presented as joined to a browser.
    */
   sessionIdSource?: string;
+  /** The W3C trace context active for this request or background operation. */
+  traceparent?: string;
+  /** Bounded W3C vendor state carried with {@link traceparent}. */
+  tracestate?: string;
 }
 
 const storage = new AsyncLocalStorage<BackendRequestContext>();
@@ -119,9 +123,37 @@ export function updateBackendRequestContext(
     if (patch.sessionId !== undefined) store.sessionId = patch.sessionId;
     if (patch.sessionIdSource !== undefined)
       store.sessionIdSource = patch.sessionIdSource;
+    if (patch.traceparent !== undefined) store.traceparent = patch.traceparent;
+    if (patch.tracestate !== undefined) store.tracestate = patch.tracestate;
   } catch {
     // A frozen or exotic store is not worth failing a request over.
   }
+}
+
+/**
+ * Read W3C context headers from a framework-neutral header map.
+ *
+ * Node's incoming headers are normally lowercase, while Express test doubles
+ * and application adapters often preserve the spelling supplied by a caller.
+ * Keeping this lookup here makes every recorder update the same ALS store.
+ */
+export function extractBackendTraceContext(
+  headers: Record<string, unknown> | undefined,
+): Pick<BackendRequestContext, "traceparent" | "tracestate"> {
+  if (!headers) return {};
+  const read = (name: string): string | undefined => {
+    const key = Object.keys(headers).find(
+      (candidate) => candidate.toLowerCase() === name,
+    );
+    const value = key ? headers[key] : undefined;
+    return typeof value === "string" ? value : undefined;
+  };
+  const traceparent = read("traceparent");
+  const tracestate = read("tracestate");
+  return {
+    ...(traceparent ? { traceparent } : {}),
+    ...(tracestate ? { tracestate } : {}),
+  };
 }
 
 /**

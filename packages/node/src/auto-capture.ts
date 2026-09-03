@@ -37,9 +37,15 @@ import {
   type OutboundHttpCaptureHandle,
   type OutboundHttpCaptureOptions,
 } from "./http-server";
-import { sendBackendEvent } from "./backend-intake";
+import { flushBackendEvents, sendBackendEvent } from "./backend-intake";
 import { clearProcessSessionId, setProcessSessionId } from "./process-session";
 import { readRequestCorrelation } from "./request-context";
+import {
+  clearActiveBackendEventSink,
+  setActiveBackendEventSink,
+  type BackendEventSink,
+} from "./backend-event-sink";
+import { postSessionLink } from "./jobs";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -280,6 +286,10 @@ export interface AutoCaptureOptions {
 export interface AutoCaptureHandle {
   /** The started session id, when the session start succeeded. */
   sessionId?: string;
+  /** Record background job evidence through this running capture. */
+  record?(event: BugEvent | readonly BugEvent[]): Promise<void>;
+  /** Flush background job evidence without ending the process session. */
+  flush?(): Promise<void>;
   /** Restore the original console.error and remove the process hooks. */
   stop(): void;
 }
@@ -390,6 +400,7 @@ let installedService: string | undefined;
 export function __resetAutoCaptureInstallForTests(): void {
   installed = false;
   installedService = undefined;
+  clearActiveBackendEventSink();
 }
 
 /**
@@ -713,6 +724,71 @@ export async function autoCapture(
       emitError(sendErr, { phase: "record", source: "console.error" });
     });
   };
+
+  // Generic queue helpers use this narrow sink rather than reaching into the
+  // auto-capture closure. Child sessions and links share this process's
+  // endpoint and credentials, while failures remain capture loss.
+  const backendEventSink: BackendEventSink = {
+    sessionId: stableSessionId,
+    async record(events, signal) {
+      const live = session ?? (await ensureSession());
+      const batch = Array.isArray(events) ? [...events] : [events];
+      if (!live) {
+        for (const event of batch) holdEvent(event);
+        return;
+      }
+      try {
+        await live.record(batch, signal);
+      } catch (error) {
+        for (const event of batch) holdEvent(event);
+        armBackoff(error);
+        emitError(error, { phase: "record", source: "console.error" });
+      }
+    },
+    async flush(signal) {
+      const live = session;
+      if (live) await drainPending(live);
+      if (signal?.aborted) return;
+      await flushBackendEvents();
+    },
+    async startChildSession(input, signal) {
+      const child = await startHeadlessSession({
+        endpoint: options.endpoint,
+        sessionId: input.sessionId,
+        authToken,
+        fetchImpl: options.fetchImpl,
+        metadata: input.metadata,
+        ...(options.requestTimeoutMs !== undefined
+          ? { timeoutMs: options.requestTimeoutMs }
+          : {}),
+        signal,
+      });
+      return {
+        sessionId: child.sessionId,
+        record: (events, childSignal) =>
+          child.record(
+            Array.isArray(events)
+              ? ([...events] as BugEvent[])
+              : (events as BugEvent),
+            childSignal,
+          ),
+        end: async (childSignal) => {
+          await child.end(childSignal);
+        },
+      };
+    },
+    async linkSessions(input, signal) {
+      await postSessionLink({
+        endpoint: options.endpoint,
+        authToken,
+        fetchImpl: options.fetchImpl,
+        input,
+        timeoutMs: options.requestTimeoutMs ?? 500,
+        signal,
+      });
+    },
+  };
+  setActiveBackendEventSink(backendEventSink);
 
   // Zero-config DB capture. Installed BEFORE the initial handshake, and so
   // before this function first yields, because the patch works by replacing the
@@ -1329,6 +1405,7 @@ export async function autoCapture(
       }
     }
     signalHandlers.clear();
+    clearActiveBackendEventSink(backendEventSink);
     warningCapture?.stop();
     logCapture?.stop();
     httpCapture?.stop();
@@ -1340,7 +1417,12 @@ export async function autoCapture(
     installedService = undefined;
   };
 
-  return { sessionId: session?.sessionId, stop };
+  return {
+    sessionId: session?.sessionId,
+    record: (events) => backendEventSink.record(events),
+    flush: () => backendEventSink.flush?.() ?? Promise.resolve(),
+    stop,
+  };
 }
 
 /** Normalize the held-event cap, refusing a negative or non-finite value. */
