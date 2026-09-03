@@ -13,7 +13,11 @@
  * and starting capture afterwards works, and is the ordinary shape.
  */
 
-import { emitActiveDbEvent, readActiveDbRequestId } from "./active-sink";
+import {
+  emitActiveDbEvent,
+  readActiveDbRaceEvidence,
+  readActiveDbRequestId,
+} from "./active-sink";
 import type { InstrumentDbClientOptions } from "./instrument-shared";
 import { instrumentPgClient } from "./pg";
 import { instrumentPostgresSql } from "./postgres-js";
@@ -90,6 +94,7 @@ export function instrumentDatabaseClient<T>(
     // An explicit requestId still wins; this is the fallback that makes the
     // call behave like the automatic path.
     getRequestId: rest.getRequestId ?? readActiveDbRequestId,
+    raceEvidence: rest.raceEvidence ?? readActiveDbRaceEvidence(),
   };
 
   try {

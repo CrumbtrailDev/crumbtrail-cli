@@ -25,6 +25,21 @@ export type {
 } from "./cache";
 
 export {
+  RACE_EVIDENCE_IDENTIFIER_LENGTH,
+  RACE_EVIDENCE_IDENTIFIER_PATTERN,
+  createHmacRaceEvidenceResolver,
+  isRaceEligibleCacheOperation,
+} from "./race-evidence";
+
+export type {
+  RaceEvidenceIdentifiers,
+  RaceEvidenceOptions,
+  RaceEvidenceResolver,
+  RaceEvidenceResolverInput,
+  RaceEvidenceSurface,
+} from "./race-evidence";
+
+export {
   buildDbDiffEvent,
   buildDbReadBulkEvent,
   buildDbReadEvent,

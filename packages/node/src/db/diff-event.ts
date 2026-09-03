@@ -10,6 +10,11 @@ import {
 } from "crumbtrail-core";
 import type { DbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
+import {
+  buildRaceEvidence,
+  readOptimisticVersion,
+  type RaceEvidenceOptions,
+} from "../race-evidence";
 
 export interface BuildDbDiffEventInput {
   /** Engine that produced the mutation. Defaults to `"postgres"` for back-compat. */
@@ -42,6 +47,8 @@ export interface BuildDbDiffEventInput {
   sessionStartedAt?: number | Date;
   /** Optional nested-value bounds applied after redaction. */
   valueBounds?: DbValueBounds;
+  /** Explicit opt in configuration for bounded cross session race evidence. */
+  raceEvidence?: RaceEvidenceOptions;
 }
 
 /**
@@ -169,6 +176,23 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     // the one thing in the event that is definitionally not user data.
     ...(input.callsite !== undefined ? { callsite: input.callsite } : {}),
   };
+  if (
+    !input.transactionId &&
+    input.pk !== null &&
+    (input.rowCount === undefined || input.rowCount === 1)
+  ) {
+    const versionField = input.raceEvidence?.optimisticVersionField;
+    const raceEvidence = buildRaceEvidence(input.raceEvidence, {
+      surface: "db.diff",
+      operation: input.op,
+      table: input.table,
+      primaryKey: input.pk,
+      resourceSubject: input.raceEvidence?.resourceSubject,
+      beforeVersion: readOptimisticVersion(input.before, versionField),
+      afterVersion: readOptimisticVersion(input.after, versionField),
+    });
+    if (raceEvidence) d.raceEvidence = raceEvidence;
+  }
 
   const redaction = mergeRedactionMetadata(
     after.metadata,

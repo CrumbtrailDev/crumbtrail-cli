@@ -84,6 +84,61 @@ bind values. Pool checkouts emit `db.pool.wait` with their wait duration. `mssql
 distinct `db.pool.timeout` event when acquisition fails with `ETIMEOUT`; the other drivers do not
 provide a stable pool-timeout code, so their error prose is never guessed.
 
+### Cross session race evidence
+
+Race evidence is off by default. Enable it only when the hosted product will inspect lost updates
+or stale cache repopulation. It adds a sealed `raceEvidence` object to eligible single entity
+`db.read`, `db.diff`, and single key cache `get`, `set`, `del`, or `unlink` events. The object has
+only fixed length identifiers:
+
+```ts
+await autoCapture({
+  endpoint: process.env.CRUMBTRAIL_ENDPOINT!,
+  raceEvidence: {
+    enabled: true,
+    resourceSubject: "orders",
+    optimisticVersionField: "version",
+  },
+});
+```
+
+When `autoCapture` has an ingest credential with at least 32 non whitespace bytes, the SDK keeps
+that credential in memory and uses it only as the key for domain separated HMAC SHA 256 digests.
+It never places the credential in an event or in the race evidence object. `resourceSubject` is
+optional. Set the same subject for the database and cache integrations when they represent the
+same application resource. The configured version field produces `versionHash` on reads,
+`beforeVersionHash` and `afterVersionHash` on diffs, and no version identifier when the field is
+missing.
+
+Bulk database statements, image less diffs, multi key cache calls, and database work inside an
+observed transaction do not receive race evidence. Existing row, key, value, and redaction capture
+is unchanged. A resolver or HMAC failure omits only `raceEvidence` and never changes the host
+operation.
+
+If the instrumentation path has no strong ingest credential, supply already opaque 64 character
+identifiers through an explicit operation option or resolver. The SDK accepts letters, numbers,
+underscore, and hyphen only, and requires `entityHash`:
+
+```ts
+import { instrumentIoredisClient } from "crumbtrail-node";
+
+const cache = instrumentIoredisClient(redis, {
+  requestId: "request-id-from-your-context",
+  emit: sendEvent,
+  raceEvidence: {
+    enabled: true,
+    identifiers: {
+      resourceHash: "r".repeat(64),
+      entityHash: "e".repeat(64),
+    },
+  },
+});
+```
+
+Do not use a raw primary key, raw cache key, redacted key shape, version value, row value, or
+arbitrary metadata as an identifier. The identifiers are the only fields intended for future
+cross session joins.
+
 ### Which clients get instrumented
 
 `autoCapture` instruments for you: it replaces the exported factories of every driver above

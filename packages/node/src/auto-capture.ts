@@ -50,6 +50,10 @@ import {
   installRuntimeMetrics,
   type RuntimeMetricsHandle,
 } from "./runtime-metrics";
+import {
+  createHmacRaceEvidenceResolver,
+  type RaceEvidenceOptions,
+} from "./race-evidence";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -187,6 +191,12 @@ export interface AutoCaptureOptions {
   cacheDrivers?: readonly AutoInstrumentCacheDriver[];
   /** Module resolver seam for cache auto-instrumentation (tests). */
   cacheResolve?: (specifier: string) => unknown;
+  /**
+   * Opt in to bounded cross session DB and cache race evidence. A strong
+   * ingest credential is used only inside an HMAC resolver. Without one,
+   * provide fixed format opaque identifiers through `identifiers` or `resolve`.
+   */
+  raceEvidence?: RaceEvidenceOptions;
   /**
    * When true (default) record Node runtime warnings (`process.on("warning")`)
    * as `backend.warning` events. This is the only path by which a
@@ -518,6 +528,10 @@ export async function autoCapture(
   }
 
   const authToken = options.authToken ?? proc.env.CRUMBTRAIL_KEY;
+  const raceEvidence = resolveRaceEvidenceOptions(
+    options.raceEvidence,
+    authToken,
+  );
   const now = options.nowImpl ?? Date.now;
   // Stable id reused across every (re-)establishment attempt so events correlate
   // to one logical session even if the first handshake failed and a later one
@@ -825,6 +839,7 @@ export async function autoCapture(
   const dbSink = {
     emit: emitSessionEvent,
     getRequestId: () => readRequestCorrelation()?.requestId,
+    raceEvidence,
   };
   setActiveDbSink(dbSink);
 
@@ -845,6 +860,7 @@ export async function autoCapture(
         captureCallsite: options.captureDatabaseCallsites ?? false,
         drivers: options.databaseDrivers,
         resolve: options.databaseResolve,
+        raceEvidence,
       });
       const line = formatAutoInstrumentReport(dbInstrumentation);
       // The success line stays behind `debug`: a healthy install is quiet. The
@@ -872,6 +888,7 @@ export async function autoCapture(
         getRequestId: dbSink.getRequestId,
         drivers: options.cacheDrivers,
         resolve: options.cacheResolve,
+        raceEvidence,
       });
       const line = formatAutoInstrumentCacheReport(cacheInstrumentation);
       if (
@@ -1467,6 +1484,23 @@ export async function autoCapture(
     flush: () => backendEventSink.flush?.() ?? Promise.resolve(),
     stop,
   };
+}
+
+/**
+ * Resolve the process credential once at startup. The returned resolver closes
+ * over the credential and exposes only fixed length digests to event builders.
+ * Weak or absent credentials leave the application's opaque identifier path in
+ * force and never become an event field.
+ */
+function resolveRaceEvidenceOptions(
+  configured: RaceEvidenceOptions | undefined,
+  authToken: string | undefined,
+): RaceEvidenceOptions | undefined {
+  if (!configured?.enabled || configured.identifiers || configured.resolve) {
+    return configured;
+  }
+  const resolver = createHmacRaceEvidenceResolver(authToken);
+  return resolver ? { ...configured, resolve: resolver } : configured;
 }
 
 /** Normalize the held-event cap, refusing a negative or non-finite value. */

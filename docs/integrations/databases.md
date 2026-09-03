@@ -29,6 +29,41 @@ app.post("/api/checkout", async (req, res) => {
 For a long-lived instrumented client, pass `getRequestId: () => …` (e.g. backed by
 `AsyncLocalStorage`) instead of per-request `requestId`.
 
+## Opt in to cross session race evidence
+
+Race evidence is disabled unless `raceEvidence.enabled` is `true`. When enabled, a single row
+read or diff can carry a sealed `raceEvidence` object for a future lost update analysis:
+
+```ts
+const db = instrumentPgClient(pool, {
+  getRequestId: () => requestStore.getStore()?.requestId,
+  emit: sendBackendEvent,
+  captureBefore: true,
+  raceEvidence: {
+    enabled: true,
+    resourceSubject: "orders",
+    optimisticVersionField: "version",
+  },
+});
+```
+
+With `autoCapture`, the ingest credential is used as an in memory HMAC key only when it has at
+least 32 non whitespace bytes. The key never enters an event. The SDK emits fixed length,
+domain separated HMAC SHA 256 identifiers for the entity, the optional common resource subject,
+and the configured version field. DB reads and diffs use the same entity domain, so one row and
+its version can be compared across requests. Use the same `resourceSubject` in a cache integration
+when both planes represent the same application resource.
+
+Without a strong ingest credential, use an explicit `identifiers` object or `resolve` callback that
+returns opaque identifiers exactly 64 characters long. It must include `entityHash`; accepted
+characters are letters, numbers, underscore, and hyphen. The callback can throw safely, and invalid
+output omits only the race object.
+
+Race evidence is omitted from bulk and image less diffs, reads that return more than one row,
+multi key cache operations, and database work observed inside a transaction. Existing primary key,
+cache key, row, value, and redaction capture remains unchanged. Do not use any of those raw or
+redacted values as a cross session join key.
+
 ## Postgres (`pg` Client or Pool)
 
 ```ts

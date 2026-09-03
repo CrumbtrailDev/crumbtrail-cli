@@ -16,10 +16,12 @@
  */
 
 import type { BugEvent } from "crumbtrail-core";
+import type { RaceEvidenceOptions } from "../race-evidence";
 
 interface ActiveDbSink {
   emit: (event: BugEvent) => void;
   getRequestId: () => string | undefined;
+  raceEvidence?: RaceEvidenceOptions;
 }
 
 let active: ActiveDbSink | undefined;
@@ -48,4 +50,9 @@ export function emitActiveDbEvent(event: BugEvent): void {
 /** The request the current statement is running inside, when capture is live. */
 export function readActiveDbRequestId(): string | undefined {
   return active?.getRequestId();
+}
+
+/** Race evidence configuration installed by autoCapture for explicit clients. */
+export function readActiveDbRaceEvidence(): RaceEvidenceOptions | undefined {
+  return active?.raceEvidence;
 }

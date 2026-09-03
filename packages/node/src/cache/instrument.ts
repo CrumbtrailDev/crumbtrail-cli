@@ -5,6 +5,11 @@ import {
   type CacheDriver,
   type CacheOperationSummary,
 } from "./event";
+import {
+  readInstrumentRaceEvidence,
+  type RaceEvidenceOptions,
+  type RaceEvidenceInstrumentationOptions,
+} from "../race-evidence";
 
 export interface DuckTypedCacheClient {
   [method: string]: unknown;
@@ -17,6 +22,9 @@ export interface InstrumentCacheClientOptions {
   emit: (event: BugEvent) => void;
   now?: () => number;
   sessionStartedAt?: number | Date;
+  raceEvidence?: RaceEvidenceInstrumentationOptions;
+  /** Resolve race evidence configuration when each event is built. */
+  getRaceEvidence?: () => RaceEvidenceOptions | undefined;
 }
 
 const INSTRUMENTED = Symbol.for("crumbtrail.cache.instrumented");
@@ -201,9 +209,10 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
               ...ttlInput(capture, value),
               ...(capture.resultValue
                 ? { value }
-                : capture.value !== undefined
+              : capture.value !== undefined
                   ? { value: capture.value }
                   : {}),
+              raceEvidence: readInstrumentRaceEvidence(options),
             });
             return value;
           },

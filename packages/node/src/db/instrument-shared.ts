@@ -32,6 +32,7 @@ import {
   DB_STATEMENT_SHAPE_LABEL,
 } from "./statement-event";
 import { buildDbTransactionEvent } from "./transaction-event";
+import type { RaceEvidenceOptions } from "../race-evidence";
 
 /**
  * Engine-agnostic emission pipeline shared by every DB adapter. All functions here are synchronous
@@ -110,6 +111,8 @@ export interface InstrumentDbClientOptions {
   /** Monotonic clock seam used only for statement duration measurement. */
   durationNow?: () => number;
   sessionStartedAt?: number | Date;
+  /** Explicit opt in configuration for bounded cross session race evidence. */
+  raceEvidence?: RaceEvidenceOptions;
 }
 
 export interface PoolCheckoutCapture {
@@ -758,7 +761,12 @@ export function emitDbDiffEvents(input: {
       now: options.now?.(),
       sessionStartedAt: options.sessionStartedAt,
       valueBounds: input.valueBounds,
+      rowCount,
       beforeImageStatus,
+      // A row from a bulk statement is not a single entity operation. Omit
+      // race evidence even when the row cap leaves one image to emit.
+      raceEvidence:
+        rowCount === 1 && rows.length === 1 ? options.raceEvidence : undefined,
       ...(op === "delete"
         ? { before: row }
         : { after: row, before: beforeByPk?.get(pkKey(pk)) }),
@@ -1087,6 +1095,10 @@ export function emitDbReadEvents(input: {
           now: options.now?.(),
           sessionStartedAt: options.sessionStartedAt,
           valueBounds: input.valueBounds,
+          raceEvidence:
+            rowCount === 1 && rows.length === 1
+              ? options.raceEvidence
+              : undefined,
         }),
       )
     ) {

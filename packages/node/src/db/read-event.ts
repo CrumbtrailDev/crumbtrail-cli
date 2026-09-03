@@ -11,6 +11,11 @@ import {
 import type { DbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import { boundColumnRow, type DbValueBounds } from "./diff-event";
+import {
+  buildRaceEvidence,
+  readOptimisticVersion,
+  type RaceEvidenceOptions,
+} from "../race-evidence";
 
 export interface BuildDbReadEventInput {
   /** Engine that produced the read. Defaults to `"postgres"` for back-compat. */
@@ -36,6 +41,8 @@ export interface BuildDbReadEventInput {
   sessionStartedAt?: number | Date;
   /** Optional nested-value bounds applied after redaction. */
   valueBounds?: DbValueBounds;
+  /** Explicit opt in configuration for bounded cross session race evidence. */
+  raceEvidence?: RaceEvidenceOptions;
 }
 
 export interface BuildDbReadBulkEventInput {
@@ -91,6 +98,18 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
       ...(Number.isInteger(shape.limit) ? { limit: shape.limit } : {}),
       ...(Number.isInteger(shape.offset) ? { offset: shape.offset } : {}),
     };
+  }
+  if (!input.transactionId && input.pk !== null) {
+    const versionField = input.raceEvidence?.optimisticVersionField;
+    const raceEvidence = buildRaceEvidence(input.raceEvidence, {
+      surface: "db.read",
+      operation: "read",
+      table: input.table,
+      primaryKey: input.pk,
+      resourceSubject: input.raceEvidence?.resourceSubject,
+      currentVersion: readOptimisticVersion(input.row, versionField),
+    });
+    if (raceEvidence) d.raceEvidence = raceEvidence;
   }
   const redaction = mergeRedactionMetadata(row.metadata, pk.metadata);
   if (redaction) d.redaction = redaction;

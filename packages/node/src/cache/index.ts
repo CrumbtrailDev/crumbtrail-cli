@@ -7,6 +7,17 @@ export {
   type CacheOperationSummary,
 } from "./event";
 export {
+  RACE_EVIDENCE_IDENTIFIER_LENGTH,
+  RACE_EVIDENCE_IDENTIFIER_PATTERN,
+  createHmacRaceEvidenceResolver,
+  isRaceEligibleCacheOperation,
+  type RaceEvidenceIdentifiers,
+  type RaceEvidenceOptions,
+  type RaceEvidenceResolver,
+  type RaceEvidenceResolverInput,
+  type RaceEvidenceSurface,
+} from "../race-evidence";
+export {
   instrumentIoredisClient,
   instrumentNodeRedisClient,
   type DuckTypedCacheClient,
