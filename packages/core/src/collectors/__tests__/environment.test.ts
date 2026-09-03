@@ -182,6 +182,17 @@ describe("buildEnvSnapshot redaction", () => {
     expect(snap.flags).toEqual({ selected: "upstream failed" });
     expect(snap.flags).not.toHaveProperty("keptButUnselected");
   });
+
+  it("contains revoked diagnostic map proxies without breaking the snapshot", () => {
+    const revoked = Proxy.revocable({ status: "must not retain" }, {});
+    revoked.revoke();
+
+    expect(() =>
+      buildEnvSnapshot(revoked.proxy, undefined, {
+        diagnosticFields: ["status"],
+      }),
+    ).not.toThrow();
+  });
 });
 
 describe("buildEnvDelta", () => {

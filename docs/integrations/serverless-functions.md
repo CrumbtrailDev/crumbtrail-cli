@@ -351,11 +351,15 @@ withCrumbtrailFetch(handler, {
 
 The example emits `checkout.status` and `attempts[0].code` as scalar metadata
 keys. The header path is rejected. Diagnostic paths are exact, have no
-wildcards, and are limited to 16 selected values with 256-character strings.
-Sensitive names, token, card, password, email, and other secret patterns still
-win. Bodies, headers, stacks, locals, inherited properties, accessors, cycles,
-and non-scalars are never retained. Without `diagnosticFields`, existing
-metadata redaction is unchanged.
+wildcards, and only the first 64 configured paths are parsed. Up to 16 selected
+values are retained, array indexes must be between 0 and 63, and strings are
+limited to 256 characters. Sensitive names, token, card, password, email, and
+other secret patterns still win. Selected strings are normalized with Unicode
+NFKC before classification. Values that remain non-ASCII are omitted, and whole
+or embedded URLs go through `redactUrl`; only HTTP(S), scheme-relative, and
+relative URLs can retain their non-secret parts. Bodies, headers, stacks, locals,
+inherited properties, accessors, cycles, and non-scalars are never retained.
+Without `diagnosticFields`, existing metadata redaction is unchanged.
 
 Routes, metadata strings, and error fields pass through the shared credential
 and URL redaction policy before delivery. Correlation headers identify related

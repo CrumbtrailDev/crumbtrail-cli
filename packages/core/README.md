@@ -279,7 +279,8 @@ What a keep does and does not do:
 Use `redaction.diagnosticFields` when the application needs a small set of
 declared flag or runtime-config values in an environment event. The paths are
 relative to each map passed to `setEnv`, use exact property names and numeric
-array indexes, and select at most 16 scalar values:
+array indexes, and select at most 16 scalar values. Only the first 64 configured
+paths are parsed, and array indexes must be between 0 and 63:
 
 ```ts
 const logger = Crumbtrail.init({
@@ -297,8 +298,11 @@ logger.setEnv({
 ```
 
 Only the selected paths are considered. Values must be scalar and no longer
-than 256 characters. Sensitive names, email, token, card, password, and other
-secret patterns still win. Wildcards, inherited properties, accessors, cycles,
+than 256 characters. Selected strings are normalized with Unicode NFKC before
+classification. Values that remain non-ASCII are omitted. Whole or embedded
+URLs go through `redactUrl` with `keepFields` ignored, and unsafe schemes are
+redacted. Sensitive names, email, token, card, password, and other secret
+patterns still win. Wildcards, inherited properties, accessors, cycles,
 prototype-like keys, bodies, headers, stacks, locals, and non-scalars are not
 retained. Omitting `diagnosticFields` preserves the existing environment
 redaction behavior. `keepFields` and `redaction.mode` do not widen this list.

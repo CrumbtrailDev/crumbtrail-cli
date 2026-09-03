@@ -241,6 +241,12 @@ export type DiagnosticFieldsValue =
 /** The maximum number of explicitly selected diagnostic leaves in one event. */
 export const DIAGNOSTIC_FIELD_MAX_ENTRIES = 16;
 
+/** The maximum number of configured diagnostic paths inspected before parsing. */
+export const DIAGNOSTIC_FIELD_MAX_PATHS = 64;
+
+/** The exclusive upper bound for diagnostic array indexes. */
+export const DIAGNOSTIC_INDEX_MAX = 64;
+
 /** The maximum length of a retained diagnostic string. */
 export const DIAGNOSTIC_FIELD_MAX_STRING_LENGTH = 256;
 
@@ -255,6 +261,13 @@ export interface DiagnosticFieldRedactionOptions {
   diagnosticFields: readonly string[];
   denyFields?: readonly string[];
   path?: string;
+}
+
+interface UrlRedactionOptions {
+  /** Do not consult the process-wide application query keep list. */
+  ignoreKeepFields?: boolean;
+  /** Only HTTP(S), scheme-relative, and relative URLs are safe in diagnostics. */
+  allowOnlyHttpSchemes?: boolean;
 }
 
 export interface StoredValueRedactionOptions {
@@ -618,13 +631,14 @@ export function redactTokenLikeString(
 function redactQueryString(
   query: string,
   path: string,
+  options: UrlRedactionOptions = {},
 ): RedactionResult<string> {
   if (!query) return { value: "" };
 
   const search = query.startsWith("?") ? query.slice(1) : query;
   const params = new URLSearchParams(search);
   const fields: RedactionField[] = [];
-  const keepFields = getRedactionKeepFields();
+  const keepFields = options.ignoreKeepFields ? [] : getRedactionKeepFields();
 
   for (const key of Array.from(params.keys())) {
     const values = params.getAll(key);
@@ -1145,14 +1159,18 @@ function isWordLikeSlug(segment: string): boolean {
   });
 }
 
-function redactRelativeUrl(url: string, path: string): RedactionResult<string> {
+function redactRelativeUrl(
+  url: string,
+  path: string,
+  options: UrlRedactionOptions = {},
+): RedactionResult<string> {
   const hashIndex = url.indexOf("#");
   const beforeHash = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
   const hash = hashIndex >= 0 ? url.slice(hashIndex) : "";
   const queryIndex = beforeHash.indexOf("?");
   const base = queryIndex >= 0 ? beforeHash.slice(0, queryIndex) : beforeHash;
   const query = queryIndex >= 0 ? beforeHash.slice(queryIndex) : "";
-  const queryResult = redactQueryString(query, path);
+  const queryResult = redactQueryString(query, path, options);
   const pathResult = redactUrlPath(base, path);
   const tokenResult = redactTokenLikeString(
     `${pathResult.value}${queryResult.value}`,
@@ -1189,7 +1207,11 @@ function redactMalformedAbsoluteUrl(path: string): RedactionResult<string> {
   });
 }
 
-export function redactUrl(url: string, path = "url"): RedactionResult<string> {
+export function redactUrl(
+  url: string,
+  path = "url",
+  options: UrlRedactionOptions = {},
+): RedactionResult<string> {
   if (url.trim().startsWith("//")) {
     const leadingWhitespace = url.match(/^\s*/)?.[0] ?? "";
     const trimmed = url.trim();
@@ -1206,7 +1228,7 @@ export function redactUrl(url: string, path = "url"): RedactionResult<string> {
         });
       }
       if (parsed.search) {
-        const queryResult = redactQueryString(parsed.search, path);
+        const queryResult = redactQueryString(parsed.search, path, options);
         parsed.search = queryResult.value;
         if (queryResult.metadata) fields.push(...queryResult.metadata.fields);
       }
@@ -1242,17 +1264,25 @@ export function redactUrl(url: string, path = "url"): RedactionResult<string> {
   const leadingWhitespace = url.match(/^\s*/)?.[0] ?? "";
   const trimmedUrl = url.slice(leadingWhitespace.length);
   const hasScheme = /^[a-z][a-z\d+.-]*:/i.test(trimmedUrl);
-  if (!hasScheme) return redactRelativeUrl(url, path);
+  if (!hasScheme) return redactRelativeUrl(url, path, options);
 
   try {
     const parsed = new URL(trimmedUrl);
     const fields: RedactionField[] = [];
 
-    if (SENSITIVE_URL_SCHEMES.has(parsed.protocol.toLowerCase())) {
+    const protocol = parsed.protocol.toLowerCase();
+    if (
+      SENSITIVE_URL_SCHEMES.has(protocol) ||
+      (options.allowOnlyHttpSchemes &&
+        protocol !== "http:" &&
+        protocol !== "https:")
+    ) {
       const summary = `${parsed.protocol}${REDACTED_VALUE}`;
       return withMetadata(`${leadingWhitespace}${summary}`, {
         path,
-        reason: "sensitive_url_scheme",
+        reason: SENSITIVE_URL_SCHEMES.has(protocol)
+          ? "sensitive_url_scheme"
+          : "unsafe_url_scheme",
         action: "redacted",
       });
     }
@@ -1268,7 +1298,7 @@ export function redactUrl(url: string, path = "url"): RedactionResult<string> {
     }
 
     if (parsed.search) {
-      const queryResult = redactQueryString(parsed.search, path);
+      const queryResult = redactQueryString(parsed.search, path, options);
       parsed.search = queryResult.value;
       if (queryResult.metadata) fields.push(...queryResult.metadata.fields);
     }
@@ -1313,7 +1343,17 @@ export function redactUrl(url: string, path = "url"): RedactionResult<string> {
  * trimmed separately (see below) so a period/comma after the URL is not swallowed.
  */
 const URL_IN_TEXT_RE = /https?:\/\/[^\s"'`<>\\{}()[\]|^]+/gi;
+const DIAGNOSTIC_URL_SCHEME_RE =
+  /\b([a-z][a-z\d+.-]*):(?=\/\/|[^\s"'`<>\\{}()[\]|^])/gi;
 const URL_TRAILING_PUNCT_RE = /[.,;:!?]+$/;
+
+function hasUnsafeDiagnosticUrlScheme(value: string): boolean {
+  for (const match of value.matchAll(DIAGNOSTIC_URL_SCHEME_RE)) {
+    const scheme = match[1]?.toLowerCase();
+    if (scheme !== "http" && scheme !== "https") return true;
+  }
+  return false;
+}
 
 /**
  * Scrub secrets from `http(s)://…` URL substrings embedded in FREE TEXT, reusing
@@ -1333,7 +1373,15 @@ const URL_TRAILING_PUNCT_RE = /[.,;:!?]+$/;
 export function redactUrlsInText(
   value: string,
   path = "value",
+  options: UrlRedactionOptions = {},
 ): RedactionResult<string> {
+  if (options.allowOnlyHttpSchemes && hasUnsafeDiagnosticUrlScheme(value)) {
+    return withMetadata(REDACTED_VALUE, {
+      path,
+      reason: "unsafe_url_scheme",
+      action: "redacted",
+    });
+  }
   if (value.indexOf("://") === -1) return { value };
   const fields: RedactionField[] = [];
   const output = value.replace(URL_IN_TEXT_RE, (match) => {
@@ -1341,7 +1389,7 @@ export function redactUrlsInText(
     const core = trailing
       ? match.slice(0, match.length - trailing.length)
       : match;
-    const result = redactUrl(core, path);
+    const result = redactUrl(core, path, options);
     if (result.metadata) fields.push(...result.metadata.fields);
     return `${result.value}${trailing}`;
   });
@@ -2456,13 +2504,15 @@ const DIAGNOSTIC_RESERVED_KEYS = new Set([
   "locals",
 ]);
 const DIAGNOSTIC_KEY_RE = /^[A-Za-z_$][A-Za-z0-9_$-]*$/;
-const DIAGNOSTIC_INDEX_RE = /^(?:0|[1-9][0-9]{0,5})$/;
+const DIAGNOSTIC_INDEX_RE = /^(?:0|[1-9][0-9]?)$/;
 
 function newDiagnosticPathNode(): DiagnosticPathNode {
   return { terminal: false, keys: new Map(), indexes: new Map() };
 }
 
-function parseDiagnosticFieldPath(path: string): DiagnosticPathPart[] | undefined {
+function parseDiagnosticFieldPath(
+  path: string,
+): DiagnosticPathPart[] | undefined {
   if (
     path.length === 0 ||
     path.length > DIAGNOSTIC_PATH_MAX_LENGTH ||
@@ -2493,7 +2543,9 @@ function parseDiagnosticFieldPath(path: string): DiagnosticPathPart[] | undefine
     if (closing < 0) return false;
     const index = path.slice(start, closing);
     if (!DIAGNOSTIC_INDEX_RE.test(index)) return false;
-    parts.push({ kind: "index", value: Number(index) });
+    const numericIndex = Number(index);
+    if (numericIndex >= DIAGNOSTIC_INDEX_MAX) return false;
+    parts.push({ kind: "index", value: numericIndex });
     offset = closing + 1;
     return true;
   };
@@ -2541,7 +2593,16 @@ function compileDiagnosticFieldPaths(
   const root = newDiagnosticPathNode();
   const normalized = new Map<string, DiagnosticPathPart[]>();
 
-  for (const candidate of paths) {
+  const pathCount = Number.isSafeInteger(paths.length)
+    ? Math.min(Math.max(paths.length, 0), DIAGNOSTIC_FIELD_MAX_PATHS)
+    : 0;
+  for (let index = 0; index < pathCount; index += 1) {
+    let candidate: unknown;
+    try {
+      candidate = paths[index];
+    } catch {
+      continue;
+    }
     if (typeof candidate !== "string") continue;
     const parsed = parseDiagnosticFieldPath(candidate);
     if (!parsed || parsed.length === 0) continue;
@@ -2549,9 +2610,7 @@ function compileDiagnosticFieldPaths(
       parsed.some(
         (part) =>
           part.kind === "key" &&
-          (isDiagnosticReservedKey(part.value) ||
-            isSensitiveName(part.value) ||
-            isApplicationDeniedName(part.value, denyFields)),
+          !isDiagnosticPathKeyAllowed(part.value, denyFields),
       )
     ) {
       continue;
@@ -2583,8 +2642,25 @@ function compileDiagnosticFieldPaths(
   return root;
 }
 
+/**
+ * Keep diagnostic traversal aligned with structured redaction. Sensitive
+ * containers are closed, while the intentional `card` and `account` object
+ * exceptions remain traversable so their individual leaves can be classified.
+ */
+function isDiagnosticPathKeyAllowed(
+  key: string,
+  denyFields: readonly string[] | undefined,
+): boolean {
+  if (isDiagnosticReservedKey(key)) return false;
+  if (isApplicationDeniedName(key, denyFields)) return false;
+  if (!isStructuredDenyName(key)) return true;
+  return isOpenableHeuristicName(key);
+}
+
 function diagnosticPathForPart(path: string, part: DiagnosticPathPart): string {
-  return part.kind === "key" ? `${path}.${part.value}` : `${path}[${part.value}]`;
+  return part.kind === "key"
+    ? `${path}.${part.value}`
+    : `${path}[${part.value}]`;
 }
 
 function safeDiagnosticObject(): Record<string, unknown> {
@@ -2635,16 +2711,51 @@ function diagnosticLeafValue(
 
   let candidate = value;
   if (typeof value === "string") {
-    const urlResult = redactUrlsInText(value, path);
-    candidate = urlResult.value;
-    if (urlResult.metadata) fields.push(...urlResult.metadata.fields);
-    if (
-      typeof candidate === "string" &&
-      candidate.length > DIAGNOSTIC_FIELD_MAX_STRING_LENGTH
-    ) {
+    let normalized: string;
+    try {
+      normalized = value.normalize("NFKC");
+    } catch {
+      fields.push({
+        path,
+        reason: "diagnostic_value_normalization_failed",
+        action: "redacted",
+      });
+      return undefined;
+    }
+    if (normalized.length > DIAGNOSTIC_FIELD_MAX_STRING_LENGTH) {
       fields.push({
         path,
         reason: "diagnostic_value_too_large",
+        action: "redacted",
+      });
+      return undefined;
+    }
+
+    const urlOptions: UrlRedactionOptions = {
+      ignoreKeepFields: true,
+      allowOnlyHttpSchemes: true,
+    };
+    const looksLikeWholeUrl = /^\s*(?:\/\/|[a-z][a-z\d+.-]*:|\.{0,2}\/)/i.test(
+      normalized,
+    );
+    const urlResult = looksLikeWholeUrl
+      ? redactUrl(normalized, path, urlOptions)
+      : redactUrlsInText(normalized, path, urlOptions);
+    const urlValue = urlResult.value;
+    candidate = urlValue;
+    if (urlResult.metadata) fields.push(...urlResult.metadata.fields);
+    if (urlValue.length > DIAGNOSTIC_FIELD_MAX_STRING_LENGTH) {
+      fields.push({
+        path,
+        reason: "diagnostic_value_too_large",
+        action: "redacted",
+      });
+      return undefined;
+    }
+    if (!isAsciiDiagnosticString(urlValue)) {
+      fields.push({
+        path,
+        reason: "diagnostic_non_ascii_value",
         action: "redacted",
       });
       return undefined;
@@ -2704,11 +2815,25 @@ function collectDiagnosticFields(
 
   try {
     if (node.terminal && node.keys.size === 0 && node.indexes.size === 0) {
-      fields.push({ path, reason: "diagnostic_non_scalar", action: "redacted" });
+      fields.push({
+        path,
+        reason: "diagnostic_non_scalar",
+        action: "redacted",
+      });
       return undefined;
     }
 
-    const isArray = Array.isArray(value);
+    let isArray: boolean;
+    try {
+      isArray = Array.isArray(value);
+    } catch {
+      fields.push({
+        path,
+        reason: "diagnostic_unreadable_value",
+        action: "dropped",
+      });
+      return undefined;
+    }
     const output = isArray ? [] : safeDiagnosticObject();
     let retained = 0;
 
@@ -2775,19 +2900,31 @@ export function redactDiagnosticFields(
   options: DiagnosticFieldRedactionOptions,
 ): RedactionResult<DiagnosticFieldsValue> {
   const fields: RedactionField[] = [];
-  const root = compileDiagnosticFieldPaths(
-    options.diagnosticFields,
-    options.denyFields,
-  );
-  const output = collectDiagnosticFields(
-    root,
-    value,
-    options.path ?? "diagnosticFields",
-    undefined,
-    fields,
-    options.denyFields,
-    new WeakSet<object>(),
-  );
+  let output: unknown;
+  let path = "diagnosticFields";
+  try {
+    path = typeof options.path === "string" ? options.path : path;
+    const root = compileDiagnosticFieldPaths(
+      options.diagnosticFields,
+      options.denyFields,
+    );
+    output = collectDiagnosticFields(
+      root,
+      value,
+      path,
+      undefined,
+      fields,
+      options.denyFields,
+      new WeakSet<object>(),
+    );
+  } catch {
+    fields.push({
+      path,
+      reason: "diagnostic_selection_failed",
+      action: "dropped",
+    });
+    output = undefined;
+  }
   return {
     value: (output ?? safeDiagnosticObject()) as DiagnosticFieldsValue,
     ...(fields.length > 0
@@ -2799,6 +2936,13 @@ export function redactDiagnosticFields(
         }
       : {}),
   };
+}
+
+function isAsciiDiagnosticString(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) > 0x7f) return false;
+  }
+  return true;
 }
 
 /**

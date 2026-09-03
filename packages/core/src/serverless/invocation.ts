@@ -498,13 +498,9 @@ function flattenDiagnosticMetadata(
     return entries;
 
   if (Array.isArray(value)) {
-    for (let index = 0; index < value.length; index += 1) {
-      if (!Object.prototype.hasOwnProperty.call(value, index)) continue;
-      flattenDiagnosticMetadata(
-        value[index],
-        `${prefix}[${index}]`,
-        entries,
-      );
+    for (const key of Object.keys(value)) {
+      const index = Number(key);
+      flattenDiagnosticMetadata(value[index], `${prefix}[${index}]`, entries);
       if (entries.length >= SERVERLESS_LIMITS.metadataEntries) break;
     }
     return entries;

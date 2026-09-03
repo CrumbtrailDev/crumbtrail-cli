@@ -331,12 +331,16 @@ autoCapture({
 ```
 
 The same option is available on the Express middleware and on
-`installBackendLogCapture`. It retains only selected scalar values, capped at
-16 paths and 256 characters per string. Sensitive names and token, card,
-password, email, and other secret patterns still redact. Wildcards, bodies,
-headers, stacks, locals, inherited properties, accessors, cycles, and
-non-scalars are excluded. Omit the option to keep the existing log redaction
-behavior. It does not change `keepFields` or response-body capture.
+`installBackendLogCapture`. It retains only selected scalar values. The first
+64 configured paths are parsed, at most 16 leaves are retained, array indexes
+must be between 0 and 63, and strings are capped at 256 characters. Selected
+strings are normalized with Unicode NFKC before classification. Values that
+remain non-ASCII are omitted. Whole or embedded URLs use the diagnostic URL
+policy, which ignores `keepFields` and redacts unsafe schemes. Sensitive names
+and token, card, password, email, and other secret patterns still redact.
+Wildcards, bodies, headers, stacks, locals, inherited properties, accessors,
+cycles, and non-scalars are excluded. Omit the option to keep the existing log
+redaction behavior. It does not change `keepFields` or response-body capture.
 
 ### Runtime warnings
 

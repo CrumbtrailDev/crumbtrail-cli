@@ -220,7 +220,10 @@ function applyDeclaredEnv(
 ): void {
   const metadataItems: RedactionMetadata[] = [];
 
-  if (flags && Object.keys(flags).length > 0) {
+  if (
+    flags &&
+    (options?.diagnosticFields !== undefined || hasEnumerableKeys(flags))
+  ) {
     const result =
       options?.diagnosticFields !== undefined
         ? redactDiagnosticFields(flags, {
@@ -233,7 +236,10 @@ function applyDeclaredEnv(
     if (result.metadata) metadataItems.push(result.metadata);
   }
 
-  if (config && Object.keys(config).length > 0) {
+  if (
+    config &&
+    (options?.diagnosticFields !== undefined || hasEnumerableKeys(config))
+  ) {
     const result =
       options?.diagnosticFields !== undefined
         ? redactDiagnosticFields(config, {
@@ -248,6 +254,14 @@ function applyDeclaredEnv(
 
   if (metadataItems.length > 0) {
     addRedactionMetadata(target, mergeMetadata(metadataItems));
+  }
+}
+
+function hasEnumerableKeys(value: Record<string, unknown>): boolean {
+  try {
+    return Object.keys(value).length > 0;
+  } catch {
+    return false;
   }
 }
 

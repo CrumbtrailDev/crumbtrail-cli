@@ -8,6 +8,8 @@ import {
   BROWSER_REDACTION_POLICY_V2,
   classifyStructuredValue,
   computeRedactedShape,
+  DIAGNOSTIC_FIELD_MAX_PATHS,
+  DIAGNOSTIC_INDEX_MAX,
   redactDiagnosticFields,
   redactNetworkTextBody,
   resetStructuredShapeSaltForTests,
@@ -180,6 +182,214 @@ describe("redactDiagnosticFields", () => {
     expect(Object.keys(boundedResult.value as Record<string, unknown>)).toHaveLength(
       16,
     );
+  });
+
+  it("applies structured parent denies while preserving card and account containers", () => {
+    const result = redactDiagnosticFields(
+      {
+        ibanDetails: { reference: "GB29NWBK60161331926819" },
+        birthDetails: { date: "1984-01-01" },
+        card: { balanceCents: 1250, number: "4111111111111111" },
+        account: { status: "active", token: "must not retain" },
+      },
+      {
+        diagnosticFields: [
+          "ibanDetails.reference",
+          "birthDetails.date",
+          "card.balanceCents",
+          "card.number",
+          "account.status",
+          "account.token",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({
+      account: { status: "active" },
+      card: { balanceCents: 1250 },
+    });
+    expect(JSON.stringify(result.value)).not.toContain(
+      "GB29NWBK60161331926819",
+    );
+    expect(JSON.stringify(result.value)).not.toContain("4111111111111111");
+    expect(JSON.stringify(result.value)).not.toContain("must not retain");
+  });
+
+  it("ignores process-wide keepFields while redacting diagnostic URL queries", () => {
+    setRedactionKeepFields(["q"]);
+    try {
+      const result = redactDiagnosticFields(
+        { url: "https://example.test/search?q=widget&token=abc123def456" },
+        { diagnosticFields: ["url"] },
+      );
+
+      expect(result.value).toEqual({});
+      expect(JSON.stringify(result.value)).not.toContain("widget");
+      expect(JSON.stringify(result.value)).not.toContain("abc123def456");
+      expect(result.metadata?.fields).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "diagnosticFields.url.query.q",
+            reason: "url_query_value",
+          }),
+        ]),
+      );
+    } finally {
+      setRedactionKeepFields([]);
+    }
+  });
+
+  it("redacts unsafe whole and embedded URL schemes in diagnostic strings", () => {
+    const secrets = [
+      "ftp-pass",
+      "ssh-pass",
+      "custom-pass",
+      "raw-data-secret",
+      "js-secret",
+      "private-secret",
+    ];
+    const result = redactDiagnosticFields(
+      {
+        ftp: "ftp://alice:ftp-pass@files.example/private",
+        ssh: "ssh://alice:ssh-pass@host.example/private",
+        custom: "custom://alice:custom-pass@host.example/private",
+        data: "data:text/plain,raw-data-secret",
+        javascript: 'javascript:alert("js-secret")',
+        file: "file:///Users/alice/private-secret.txt",
+        embedded: "see ssh://alice:ssh-pass@host.example/private now",
+      },
+      {
+        diagnosticFields: [
+          "ftp",
+          "ssh",
+          "custom",
+          "data",
+          "javascript",
+          "file",
+          "embedded",
+        ],
+      },
+    );
+
+    const serialized = JSON.stringify(result.value);
+    for (const secret of secrets) expect(serialized).not.toContain(secret);
+    expect(result.metadata?.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: "unsafe_url_scheme" }),
+      ]),
+    );
+    for (const value of Object.values(result.value as Record<string, unknown>))
+      expect(value).toMatch(/\[REDACTED\]/);
+  });
+
+  it("normalizes compatibility forms before checks and omits residual Unicode", () => {
+    const toFullWidth = (value: string) =>
+      value.replace(/[!-~]/g, (character) =>
+        String.fromCharCode(character.charCodeAt(0) + 0xfee0),
+      );
+    const result = redactDiagnosticFields(
+      {
+        contact: toFullWidth("omar@example.com"),
+        reference: toFullWidth("4111111111111111"),
+        compatibilityStatus: toFullWidth("SAFE_OK"),
+        unicodeStatus: "ошибка",
+      },
+      {
+        diagnosticFields: [
+          "contact",
+          "reference",
+          "compatibilityStatus",
+          "unicodeStatus",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({ compatibilityStatus: "SAFE_OK" });
+    expect(JSON.stringify(result.value)).not.toContain("omar@example.com");
+    expect(JSON.stringify(result.value)).not.toContain("4111111111111111");
+    expect(JSON.stringify(result.value)).not.toContain("ошибка");
+  });
+
+  it("caps configured paths before parsing and bounds sparse array indexes", () => {
+    let numericPathReads = 0;
+    const paths = new Proxy(
+      [
+        ...Array.from(
+          { length: DIAGNOSTIC_FIELD_MAX_PATHS },
+          (_, index) => `z${String(index).padStart(2, "0")}`,
+        ),
+        "aLate",
+      ],
+      {
+        get(target, property, receiver) {
+          if (typeof property === "string" && /^\d+$/.test(property))
+            numericPathReads += 1;
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    const values = Object.fromEntries([
+      ...Array.from({ length: DIAGNOSTIC_FIELD_MAX_PATHS }, (_, index) => [
+        `z${String(index).padStart(2, "0")}`,
+        index,
+      ]),
+      ["aLate", 999],
+    ]);
+    const bounded = redactDiagnosticFields(values, {
+      diagnosticFields: paths,
+    });
+
+    expect(bounded.value).not.toHaveProperty("aLate");
+    expect(numericPathReads).toBeLessThanOrEqual(DIAGNOSTIC_FIELD_MAX_PATHS);
+    expect(Object.keys(bounded.value as Record<string, unknown>)).toHaveLength(
+      16,
+    );
+
+    const attempts: unknown[] = [];
+    attempts[DIAGNOSTIC_INDEX_MAX - 1] = { code: "E_LAST" };
+    attempts[DIAGNOSTIC_INDEX_MAX] = { code: "must not retain" };
+    const sparse = redactDiagnosticFields(
+      { attempts },
+      {
+        diagnosticFields: [
+          `attempts[${DIAGNOSTIC_INDEX_MAX - 1}].code`,
+          `attempts[${DIAGNOSTIC_INDEX_MAX}].code`,
+        ],
+      },
+    );
+
+    const sparseAttempts = (sparse.value as { attempts: unknown[] }).attempts;
+    expect(sparseAttempts[DIAGNOSTIC_INDEX_MAX - 1]).toEqual({
+      code: "E_LAST",
+    });
+    expect(sparseAttempts.length).toBe(DIAGNOSTIC_INDEX_MAX);
+    expect(Object.keys(sparseAttempts)).toEqual([
+      String(DIAGNOSTIC_INDEX_MAX - 1),
+    ]);
+    expect(JSON.stringify(sparse.value)).not.toContain("must not retain");
+  });
+
+  it("contains revoked proxy failures without reading accessors or breaking sibling fields", () => {
+    const revoked = Proxy.revocable({ status: "must not retain" }, {});
+    revoked.revoke();
+
+    expect(() =>
+      redactDiagnosticFields(
+        { good: "ok", revoked: revoked.proxy },
+        { diagnosticFields: ["good", "revoked.status"] },
+      ),
+    ).not.toThrow();
+
+    const result = redactDiagnosticFields(
+      { good: "ok", revoked: revoked.proxy },
+      { diagnosticFields: ["good", "revoked.status"] },
+    );
+    expect(result.value).toEqual({ good: "ok" });
+    expect(result.metadata?.fields).toContainEqual({
+      path: "diagnosticFields.revoked",
+      reason: "diagnostic_unreadable_value",
+      action: "dropped",
+    });
   });
 });
 
