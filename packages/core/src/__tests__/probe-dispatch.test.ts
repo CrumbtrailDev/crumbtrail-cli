@@ -286,6 +286,24 @@ describe("probe dispatch from the config poll", () => {
     await logger.stop();
   });
 
+  it("reports runtime.cpu_profile as unavailable in the browser/core dispatcher", async () => {
+    const { logger, transport } = startWithPollPayload({
+      probes: ["runtime.cpu_profile"],
+    });
+    await settle();
+
+    const results = probeResults(transport);
+    expect(results).toHaveLength(1);
+    expect(results[0].d).toMatchObject({
+      name: "runtime.cpu_profile",
+      ok: false,
+      error: "unavailable",
+    });
+    expect(results[0].d.rows).toEqual([]);
+
+    await logger.stop();
+  });
+
   it("answers network.inflight from the collector's registered live state", async () => {
     const { logger, transport } = startWithPollPayload({
       probes: ["network.inflight"],

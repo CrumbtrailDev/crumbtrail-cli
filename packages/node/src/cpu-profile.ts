@@ -122,6 +122,7 @@ function abortPromise(signal: AbortSignal): {
   const onAbort = () => rejectAbort(new CpuProfileProbeError("aborted"));
   if (signal.aborted) onAbort();
   else signal.addEventListener("abort", onAbort, { once: true });
+  promise.catch(() => undefined);
   return {
     promise,
     remove: () => signal.removeEventListener("abort", onAbort),

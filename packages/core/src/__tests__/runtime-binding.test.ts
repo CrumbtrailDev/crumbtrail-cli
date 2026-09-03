@@ -257,6 +257,18 @@ describe("runtime binding client", () => {
     expect(operations).toEqual(["POST:1", "DELETE", "POST:2"]);
   });
 
+  it("invalidates a revoked proof and registers a fresh runtime identity", async () => {
+    const first = binding(NOW + 86_400_000, "one");
+    const next = binding(NOW + 2 * 86_400_000, "two");
+    const fetcher = vi.fn().mockResolvedValueOnce(response(first, 201)).mockResolvedValueOnce(response(next, 201));
+    const client = createRuntimeBindingClient({ endpoint: ENDPOINT, projectKey: "project-key", fetchImpl: fetcher, now: () => NOW });
+    await expect(client.getBinding()).resolves.toEqual(first);
+    client.invalidate();
+    await expect(client.getBinding()).resolves.toEqual(next);
+    expect(String(fetcher.mock.calls[1]?.[0])).not.toContain("instanceId=");
+    expect(fetcher.mock.calls[1]?.[1]).not.toHaveProperty("headers");
+  });
+
   it("keeps a still-live binding on a failed rotation and falls back untargeted after expiry", async () => {
     let now = NOW;
     const first = binding(NOW + 2 * RUNTIME_BINDING_ROTATE_AHEAD_MS + 1, "one");
