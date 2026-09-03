@@ -110,6 +110,133 @@ afterEach(() => {
 });
 
 describe("autoCapture", () => {
+  it.each(["headers", "body"])(
+    "bounds hung config %s, ignores late data, and resumes polling",
+    async (stage) => {
+      vi.useFakeTimers();
+      const stalled = deferred<Response>();
+      const body = deferred<unknown>();
+      const signals: AbortSignal[] = [];
+      const createSession = vi.fn(() => undefined);
+      const fetchImpl = vi.fn(
+        async (url: string | URL | Request, init?: RequestInit) => {
+          if (String(url).includes("runtime/register"))
+            return new Response(
+              JSON.stringify({
+                instanceId: "ri_poll",
+                instanceProof: "x".repeat(40),
+                expiresAt: new Date(Date.now() + 86400000).toISOString(),
+              }),
+            );
+          if (String(url).includes("capture-config")) {
+            signals.push(init?.signal as AbortSignal);
+            if (signals.length === 1) {
+              if (stage === "headers") return stalled.promise;
+              return {
+                ok: true,
+                status: 200,
+                json: () => body.promise,
+              } as Response;
+            }
+            return new Response(JSON.stringify({ probes: [] }));
+          }
+          return new Response("{}");
+        },
+      );
+      track(
+        await autoCapture({
+          endpoint: ENDPOINT,
+          processImpl: makeFakeProcess({
+            env: { CRUMBTRAIL_KEY: "project-key" },
+          }),
+          consoleImpl: { error: vi.fn() },
+          fetchImpl,
+          cpuProfileSessionFactory: createSession,
+          configPollIntervalMs: 60_000,
+          captureHttpRequests: false,
+          captureOutboundHttp: false,
+          captureRuntimeWarnings: false,
+          captureLogs: false,
+          captureProcessSignals: false,
+        }),
+      );
+      await flushAutoCaptureMicrotasks();
+      expect(signals).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(signals[0]?.aborted).toBe(true);
+      const late = { probes: ["runtime.cpu_profile"] };
+      stalled.resolve(new Response(JSON.stringify(late)));
+      body.resolve(late);
+      await flushAutoCaptureMicrotasks();
+      expect(createSession).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(55_000);
+      expect(signals).toHaveLength(2);
+    },
+  );
+
+  it.each(["headers", "body"])(
+    "aborts hung config %s on stop and suppresses late profiling",
+    async (stage) => {
+      vi.useFakeTimers();
+      const stalled = deferred<Response>();
+      const body = deferred<unknown>();
+      let signal: AbortSignal | undefined;
+      const createSession = vi.fn(() => undefined);
+      const fetchImpl = vi.fn(
+        async (url: string | URL | Request, init?: RequestInit) => {
+          if (String(url).includes("runtime/register"))
+            return new Response(
+              JSON.stringify({
+                instanceId: "ri_poll_stop",
+                instanceProof: "x".repeat(40),
+                expiresAt: new Date(Date.now() + 86400000).toISOString(),
+              }),
+            );
+          if (String(url).includes("capture-config")) {
+            signal = init?.signal ?? undefined;
+            if (stage === "headers") return stalled.promise;
+            return {
+              ok: true,
+              status: 200,
+              json: () => body.promise,
+            } as Response;
+          }
+          return new Response("{}");
+        },
+      );
+      const handle = track(
+        await autoCapture({
+          endpoint: ENDPOINT,
+          processImpl: makeFakeProcess({
+            env: { CRUMBTRAIL_KEY: "project-key" },
+          }),
+          consoleImpl: { error: vi.fn() },
+          fetchImpl,
+          cpuProfileSessionFactory: createSession,
+          configPollIntervalMs: 60_000,
+          captureHttpRequests: false,
+          captureOutboundHttp: false,
+          captureRuntimeWarnings: false,
+          captureLogs: false,
+          captureProcessSignals: false,
+        }),
+      );
+      await flushAutoCaptureMicrotasks();
+      handle.stop();
+      expect(signal?.aborted).toBe(true);
+      const late = { probes: ["runtime.cpu_profile"] };
+      stalled.resolve(new Response(JSON.stringify(late)));
+      body.resolve(late);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(createSession).not.toHaveBeenCalled();
+      expect(
+        fetchImpl.mock.calls.filter(([url]) =>
+          String(url).includes("capture-config"),
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
   it("polls the targeted config and emits a Node CPU profile result", async () => {
     vi.useFakeTimers();
     const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "project-key" } });
@@ -397,8 +524,9 @@ describe("autoCapture", () => {
     handle.stop();
     await flushAutoCaptureMicrotasks();
 
-    expect(callsToProfiler.filter((method) => method === "Profiler.stop"))
-      .toHaveLength(1);
+    expect(
+      callsToProfiler.filter((method) => method === "Profiler.stop"),
+    ).toHaveLength(1);
     expect(
       callsToProfiler.filter((method) => method === "Profiler.disable"),
     ).toHaveLength(1);

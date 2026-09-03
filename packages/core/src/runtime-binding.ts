@@ -258,31 +258,44 @@ export class RuntimeBindingClient {
   }
 
   matchesScope(endpoint: string, projectKey?: string): boolean {
-    return this.endpoint === endpoint.trim().replace(/\/+$/, "") &&
-      this.projectKey === (projectKey?.trim() ?? "");
+    return (
+      this.endpoint === endpoint.trim().replace(/\/+$/, "") &&
+      this.projectKey === (projectKey?.trim() ?? "")
+    );
   }
 
   async fetchConfig(
     endpoint: string,
+    signal?: AbortSignal,
   ): Promise<RuntimeBindingConfigResponse | undefined> {
+    if (signal?.aborted)
+      throw signal.reason ?? new Error("Config poll aborted");
     const fetcher = this.fetcher;
     if (!fetcher) return undefined;
 
     const targetedOrigin = this.matchesOrigin(endpoint);
-    const binding = targetedOrigin ? await this.getBinding() : undefined;
+    const binding = targetedOrigin
+      ? await waitForConfigSignal(this.getBinding(), signal)
+      : undefined;
+    if (signal?.aborted)
+      throw signal.reason ?? new Error("Config poll aborted");
     const url = new URL(
       endpoint,
       this.endpoint ||
         (typeof location !== "undefined" ? location.href : "http://localhost/"),
     );
     if (binding) url.searchParams.set("instanceId", binding.instanceId);
-    const response = await fetcher(url.toString(), {
-      method: "GET",
-      cache: "no-store",
-      ...(binding
-        ? { headers: { Authorization: `Bearer ${binding.instanceProof}` } }
-        : {}),
-    });
+    const response = await waitForConfigSignal(
+      fetcher(url.toString(), {
+        method: "GET",
+        cache: "no-store",
+        signal,
+        ...(binding
+          ? { headers: { Authorization: `Bearer ${binding.instanceProof}` } }
+          : {}),
+      }),
+      signal,
+    );
     if (response.status === 401 && binding) this.invalidate();
     return { response, targeted: binding !== undefined };
   }
@@ -682,9 +695,31 @@ export function retireRuntimeBindingHandle(
 export function fetchRuntimeBindingConfig(
   handle: RuntimeBindingHandle,
   endpoint: string,
+  signal?: AbortSignal,
 ): Promise<RuntimeBindingConfigResponse | undefined> {
-  return resolveRuntimeBindingClient(handle)?.fetchConfig(endpoint) ??
-    Promise.resolve(undefined);
+  return (
+    resolveRuntimeBindingClient(handle)?.fetchConfig(endpoint, signal) ??
+    Promise.resolve(undefined)
+  );
+}
+
+/** Cancel this config consumer's wait without retiring another consumer's binding. */
+async function waitForConfigSignal<T>(
+  pending: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return pending;
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error("Config poll aborted"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([pending, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 /**

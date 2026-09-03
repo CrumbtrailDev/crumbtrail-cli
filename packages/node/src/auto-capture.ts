@@ -594,11 +594,16 @@ function startNodeCpuProfilePolling(options: {
   const intervalMs = normalizeConfigPollInterval(options.intervalMs);
   let stopped = false;
   let polling = false;
+  let activePollAbort: AbortController | undefined;
   let activeProbeAbort: AbortController | undefined;
 
   const poll = async (): Promise<void> => {
     if (stopped || polling) return;
     polling = true;
+    const pollAbort = new AbortController();
+    activePollAbort = pollAbort;
+    const deadline = setTimeout(() => pollAbort.abort(), 5_000);
+    (deadline as unknown as { unref?: () => void }).unref?.();
     try {
       if (stopped) return;
       const url = configPollUrl(
@@ -610,13 +615,23 @@ function startNodeCpuProfilePolling(options: {
       const config = await fetchRuntimeBindingConfig(
         options.runtimeBinding,
         url,
+        pollAbort.signal,
       );
       if (!config) return;
       const { response, targeted } = config;
       if (stopped) return;
       if (!response.ok) return;
-      const payload: unknown = await response.json();
-      if (stopped || captureKilled(payload) || !cpuProfileRequested(payload))
+      const payload: unknown = await waitForCpuPollSignal(
+        Promise.resolve().then(() => response.json()),
+        pollAbort.signal,
+      );
+      clearTimeout(deadline);
+      if (
+        stopped ||
+        pollAbort.signal.aborted ||
+        captureKilled(payload) ||
+        !cpuProfileRequested(payload)
+      )
         return;
 
       const probeAbort = new AbortController();
@@ -643,6 +658,8 @@ function startNodeCpuProfilePolling(options: {
     } catch {
       // A config or profiler failure must never affect the host process.
     } finally {
+      clearTimeout(deadline);
+      if (activePollAbort === pollAbort) activePollAbort = undefined;
       activeProbeAbort = undefined;
       polling = false;
     }
@@ -656,11 +673,29 @@ function startNodeCpuProfilePolling(options: {
     stopped = true;
     clearInterval(timer);
     try {
+      activePollAbort?.abort();
       activeProbeAbort?.abort();
     } catch {
       // A host supplied AbortController must not break capture teardown.
     }
   };
+}
+
+async function waitForCpuPollSignal<T>(
+  pending: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error("Config poll aborted"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([pending, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 async function runCpuProfileWithAbort(
