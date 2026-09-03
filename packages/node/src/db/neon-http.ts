@@ -14,6 +14,7 @@ import {
   emitDbReadEvents,
   emitDbStatementEvent,
   emitImagelessDbDiff,
+  suppressRaceEvidence,
   isRecord,
   nextStatementSeq,
   type InstrumentDbClientOptions,
@@ -324,11 +325,16 @@ export function instrumentNeonHttpQuery<T>(
       }
       if (prop === "transaction" && typeof target.transaction === "function") {
         return (...args: unknown[]) => {
+          const operationOptions = captureGenerationFor(options);
+          // Neon HTTP does not expose the surrounding transaction outcome to
+          // this callback. Keep ordinary events, but never claim its inner
+          // writes are committed race evidence.
+          const transactionOptions = suppressRaceEvidence(operationOptions);
           const next = [...args];
           if (typeof next[0] === "function") {
             const fn = next[0] as (tx: DuckTypedNeonHttpQuery) => unknown;
             next[0] = (tx: DuckTypedNeonHttpQuery) =>
-              fn(instrumentNeonHttpQuery(tx, options));
+              fn(instrumentNeonHttpQuery(tx, transactionOptions));
           }
           return (
             target.transaction as (...values: unknown[]) => unknown

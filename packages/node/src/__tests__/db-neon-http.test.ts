@@ -6,7 +6,16 @@ import { autoInstrumentDbClients } from "../db/auto-instrument";
 interface FakeNeonQuery {
   (...args: unknown[]): Promise<unknown>;
   query(text: string, params?: unknown[], options?: unknown): Promise<unknown>;
+  transaction?: (fn: (tx: FakeNeonQuery) => unknown) => Promise<unknown>;
   executed: string[];
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function tag(parts: string[]): string[] {
@@ -96,6 +105,82 @@ describe("instrumentNeonHttpQuery", () => {
     );
     expect(events.some((event) => event.k === "db.statement")).toBe(true);
     expect(events.some((event) => event.k === "db.read")).toBe(true);
+  });
+
+  it("suppresses race evidence for a throwing transaction callback", async () => {
+    const events: BugEvent[] = [];
+    const raw = makeNeon();
+    raw.transaction = async (fn) => fn(makeNeon());
+    const sql = instrumentNeonHttpQuery(raw, {
+      requestId: "req-neon-transaction",
+      emit: (event) => events.push(event),
+      raceEvidence: {
+        enabled: true,
+        resolve: () => ({ entityHash: "e".repeat(64) }),
+      },
+    });
+
+    await sql.query!(
+      "update carts set total_cents = $1 where id = $2",
+      [500, 7],
+    );
+    const rollback = new Error("rollback");
+    await expect(
+      sql.transaction!(async (tx) => {
+        await tx.query!(
+          "update carts set total_cents = $1 where id = $2",
+          [501, 7],
+        );
+        throw rollback;
+      }),
+    ).rejects.toBe(rollback);
+
+    const diffs = events.filter((event) => event.k === "db.diff");
+    expect(diffs).toHaveLength(2);
+    expect(diffs[0]?.d.raceEvidence).toEqual({ entityHash: "e".repeat(64) });
+    expect(diffs[1]?.d.raceEvidence).toBeUndefined();
+  });
+
+  it("drops an old transaction completion after restart and rebinds new work", async () => {
+    const firstGeneration = Symbol("first");
+    const secondGeneration = Symbol("second");
+    let generation: symbol | undefined = firstGeneration;
+    const old = deferred<unknown>();
+    const fresh = deferred<unknown>();
+    const queue = [old, fresh];
+    const raw = makeNeon();
+    raw.query = () => queue.shift()!.promise as Promise<unknown>;
+    raw.transaction = async (fn) => fn(raw);
+    const events: BugEvent[] = [];
+    const sql = instrumentNeonHttpQuery(raw, {
+      requestId: "req-neon-generation",
+      getCaptureGeneration: () => generation,
+      emit: (event, owner) => {
+        if (owner === generation) events.push(event);
+      },
+      raceEvidence: {
+        enabled: true,
+        resolve: () => ({ entityHash: "e".repeat(64) }),
+      },
+    });
+
+    const oldOperation = sql.transaction!(async (tx) =>
+      tx.query!("update carts set total_cents = $1 where id = $2", [500, 7]),
+    );
+    generation = secondGeneration;
+    old.resolve([{ id: 7, total_cents: 500 }]);
+    await oldOperation;
+    expect(events.filter((event) => event.k === "db.diff")).toHaveLength(0);
+
+    const newOperation = sql.query!(
+      "update carts set total_cents = $1 where id = $2",
+      [501, 7],
+    );
+    fresh.resolve([{ id: 7, total_cents: 501 }]);
+    await newOperation;
+    const diffs = events.filter((event) => event.k === "db.diff");
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0]?.d.raceEvidence).toEqual({ entityHash: "e".repeat(64) });
   });
 
   it("returns the original rejection and records the failed statement", async () => {
