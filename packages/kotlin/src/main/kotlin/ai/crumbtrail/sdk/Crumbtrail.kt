@@ -67,7 +67,15 @@ data class CrumbtrailCollectors(
     val appLifecycle: Boolean = true,
     val navigation: Boolean = true,
     val environment: Boolean = true,
-)
+    /** Foreground main-thread watchdog with a five second threshold. Opt in after capture consent. */
+    val nativeWatchdog: Boolean = false,
+    /** Previous-launch process exits, memory pressure and native diagnostics. Opt in after capture consent. */
+    val nativeDiagnostics: Boolean = false,
+) {
+    /** Platform lifecycle observation needed internally, even when lifecycle events are disabled. */
+    internal val needsApplicationLifecycleObserver: Boolean
+        get() = appLifecycle || navigation || nativeWatchdog
+}
 
 data class CrumbtrailConfig(
     val endpoint: String,
@@ -145,6 +153,7 @@ class Crumbtrail(
     private val queue = CrumbtrailEventQueue(config.queueCapacity)
     private val gapLock = Any()
     private val _gaps = mutableListOf<CrumbtrailCaptureGap>()
+    private val lifecycleLock = Any()
     private var stopped = false
     private val cleanups = mutableListOf<() -> Unit>()
 
@@ -186,22 +195,30 @@ class Crumbtrail(
     fun addEvent(kind: CrumbtrailEventKind, data: JsonValue, target: CrumbtrailTarget? = null) =
         addEvent(kind.wireValue, data, target)
 
-    fun addEvent(kind: String, data: JsonValue, target: CrumbtrailTarget? = null) {
-        if (stopped) return
-        queue.append(
-            CrumbtrailEvent(
-                timestamp = clock(),
-                kind = kind,
-                data = data,
-                platform = platform,
-                sdk = CrumbtrailSdk.descriptor,
-                capabilities = capabilities,
-                target = target,
-            )
-        )
+    fun addEvent(kind: String, data: JsonValue, target: CrumbtrailTarget? = null): Boolean {
+        val accepted = synchronized(lifecycleLock) {
+            if (stopped) {
+                false
+            } else {
+                queue.append(
+                    CrumbtrailEvent(
+                        timestamp = clock(),
+                        kind = kind,
+                        data = data,
+                        platform = platform,
+                        sdk = CrumbtrailSdk.descriptor,
+                        capabilities = capabilities,
+                        target = target,
+                    )
+                )
+                true
+            }
+        }
+        if (!accepted) return false
         // Touch the session so a resumed one does not expire mid-use.
         store.write(PersistedSession(sessionId, clock()))
         if (queue.size >= config.flushBatchSize) flush()
+        return true
     }
 
     /** Record a caught error. `fatal` stays false: the process survived. */
@@ -209,10 +226,15 @@ class Crumbtrail(
         addEvent(
             CrumbtrailEventKind.ERROR,
             JsonValue.of(
-                "msg" to JsonValue.Str(throwable.message ?: throwable.toString()),
-                "stk" to JsonValue.str(throwable.stackTraceToString()),
+                "msg" to JsonValue.Str(
+                    redactedDiagnosticText(
+                        throwable.message ?: throwable.toString(),
+                        1_024,
+                    ) ?: "unknown error"
+                ),
+                "stk" to JsonValue.str(redactedDiagnosticText(throwable.stackTraceToString())),
                 "fatal" to JsonValue.Bool(fatal),
-                "source" to JsonValue.Str(source),
+                "source" to JsonValue.Str(redactedDiagnosticText(source, 256) ?: "manual"),
             ),
         )
     }
@@ -234,8 +256,8 @@ class Crumbtrail(
                 "status" to JsonValue.num(status),
                 "ok" to JsonValue.bool(status?.let { it in 200..299 }),
                 "dur" to JsonValue.Num(durationMs),
-                "source" to JsonValue.Str(source),
-                "error" to JsonValue.str(error),
+                "source" to JsonValue.Str(redactedDiagnosticText(source, 256) ?: "okhttp"),
+                "error" to JsonValue.str(redactedDiagnosticText(error, 1_024)),
             ),
         )
     }
@@ -276,8 +298,10 @@ class Crumbtrail(
     }
 
     fun stop() {
-        if (stopped) return
-        stopped = true
+        synchronized(lifecycleLock) {
+            if (stopped) return
+            stopped = true
+        }
         cleanups.asReversed().forEach { runCatching(it) }
         cleanups.clear()
         // Waited on, unlike an ordinary flush: a caller that stops the SDK is

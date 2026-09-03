@@ -38,6 +38,7 @@ public final class Crumbtrail: @unchecked Sendable {
     private let queue: CrumbtrailEventQueue
     private let clock: () -> Int64
     private let lock = NSLock()
+    private let lifecycleLock = NSLock()
     private var flushTimer: Timer?
     private var collectorCleanups: [() -> Void] = []
     private var stopped = false
@@ -107,12 +108,17 @@ public final class Crumbtrail: @unchecked Sendable {
 
     // MARK: - Recording
 
+    @discardableResult
     public func addEvent(
         kind: CrumbtrailEventKind,
         data: JSONValue,
         target: CrumbtrailTarget? = nil
-    ) {
-        guard !stopped else { return }
+    ) -> Bool {
+        lifecycleLock.lock()
+        guard !stopped else {
+            lifecycleLock.unlock()
+            return false
+        }
         let event = CrumbtrailEvent(
             timestamp: clock(),
             kind: kind,
@@ -123,12 +129,14 @@ public final class Crumbtrail: @unchecked Sendable {
             target: target
         )
         queue.append(event)
+        lifecycleLock.unlock()
         // Touch the session so a resumed one does not expire mid-use.
         store.write(PersistedSession(id: sessionId, lastActivity: clock()))
 
         if queue.count >= config.flushBatchSize {
             Task { await flush() }
         }
+        return true
     }
 
     /// Record a caught error. `fatal` stays false: the process survived.
@@ -140,9 +148,16 @@ public final class Crumbtrail: @unchecked Sendable {
         addEvent(
             kind: .error,
             data: .object(compacting: [
-                "msg": .string(String(describing: error)),
+                "msg": .string(
+                    crumbtrailRedactedDiagnosticText(
+                        String(describing: error),
+                        maxCharacters: 1_024
+                    ) ?? "unknown error"
+                ),
                 "fatal": .bool(fatal),
-                "source": .string(source),
+                "source": .string(
+                    crumbtrailRedactedDiagnosticText(source, maxCharacters: 256) ?? "manual"
+                ),
             ])
         )
     }
@@ -164,8 +179,12 @@ public final class Crumbtrail: @unchecked Sendable {
                 "status": status.map { JSONValue.int(Int64($0)) },
                 "ok": status.map { JSONValue.bool((200..<300).contains($0)) },
                 "dur": .int(durationMs),
-                "source": .string(source),
-                "error": error.map(JSONValue.string),
+                "source": .string(
+                    crumbtrailRedactedDiagnosticText(source, maxCharacters: 256) ?? "urlsession"
+                ),
+                "error": error
+                    .flatMap { crumbtrailRedactedDiagnosticText($0, maxCharacters: 1_024) }
+                    .map(JSONValue.string),
             ])
         )
     }
@@ -219,8 +238,7 @@ public final class Crumbtrail: @unchecked Sendable {
     }
 
     public func stop() async {
-        guard !stopped else { return }
-        stopped = true
+        guard markStopped() else { return }
         flushTimer?.invalidate()
         flushTimer = nil
         for cleanup in collectorCleanups.reversed() { cleanup() }
@@ -232,5 +250,13 @@ public final class Crumbtrail: @unchecked Sendable {
 
     func registerCleanup(_ cleanup: @escaping () -> Void) {
         collectorCleanups.append(cleanup)
+    }
+
+    private func markStopped() -> Bool {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        guard !stopped else { return false }
+        stopped = true
+        return true
     }
 }

@@ -349,4 +349,15 @@ final class RedactionTests: XCTestCase {
         let redacted = CrumbtrailRedaction.redactURL("not a url?token=abc123")
         XCTAssertFalse(redacted.contains("abc123"))
     }
+
+    func testDiagnosticTextRedactsCredentialShapedValues() {
+        let redacted = crumbtrailRedactedDiagnosticText(
+            "authorization: secret-value access_token=source-secret client_secret=transport-secret"
+        )
+
+        XCTAssertEqual(
+            redacted,
+            "authorization: [REDACTED] access_token=[REDACTED] client_secret=[REDACTED]"
+        )
+    }
 }

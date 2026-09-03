@@ -29,6 +29,60 @@ class MemoryPendingCrashStore(private var crash: CrumbtrailPendingCrash? = null)
     override fun clear() { crash = null }
 }
 
+/** One process-wide crash handler shared by all active logger instances. */
+private object CrumbtrailCrashHandlerRegistry {
+    private val lock = Any()
+    private val registrations = LinkedHashMap<Any, CrumbtrailPendingCrashStore>()
+    private var previous: Thread.UncaughtExceptionHandler? = null
+    private var installed: Thread.UncaughtExceptionHandler? = null
+
+    fun install(store: CrumbtrailPendingCrashStore): () -> Unit {
+        val token = Any()
+        synchronized(lock) {
+            if (registrations.isEmpty()) {
+                previous = Thread.getDefaultUncaughtExceptionHandler()
+                val handler = Thread.UncaughtExceptionHandler { thread, throwable ->
+                    // The newest logger owns the active capture path. This matters
+                    // for tests and hosts that temporarily run more than one
+                    // logger with distinct stores: stopping the newer logger must
+                    // reveal the older one again, not leave a stale store active.
+                    val activeStore = synchronized(lock) { registrations.values.lastOrNull() }
+                    runCatching {
+                        activeStore?.write(
+                            CrumbtrailPendingCrash(
+                                message = redactedDiagnosticText(
+                                    throwable.message ?: throwable.toString(),
+                                    1_024,
+                                ) ?: "uncaught exception",
+                                stack = boundedStackTrace(throwable),
+                                thread = redactedDiagnosticText(thread.name, 256),
+                                at = System.currentTimeMillis(),
+                            )
+                        )
+                    }
+                    synchronized(lock) { previous }?.uncaughtException(thread, throwable)
+                }
+                installed = handler
+                Thread.setDefaultUncaughtExceptionHandler(handler)
+            }
+            registrations[token] = store
+        }
+        return { remove(token) }
+    }
+
+    private fun remove(token: Any) {
+        synchronized(lock) {
+            registrations.remove(token)
+            if (registrations.isNotEmpty()) return
+            if (Thread.getDefaultUncaughtExceptionHandler() === installed) {
+                Thread.setDefaultUncaughtExceptionHandler(previous)
+            }
+            installed = null
+            previous = null
+        }
+    }
+}
+
 /**
  * Capture an uncaught exception, and report it on the NEXT launch.
  *
@@ -54,22 +108,7 @@ fun installCrashHandler(
     crashStore: CrumbtrailPendingCrashStore,
 ) {
     drainPendingCrash(logger, crashStore)
-
-    val previous = Thread.getDefaultUncaughtExceptionHandler()
-    Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-        runCatching {
-            crashStore.write(
-                CrumbtrailPendingCrash(
-                    message = throwable.message ?: throwable.toString(),
-                    stack = throwable.stackTraceToString(),
-                    thread = thread.name,
-                    at = System.currentTimeMillis(),
-                )
-            )
-        }
-        previous?.uncaughtException(thread, throwable)
-    }
-    logger.registerCleanup { Thread.setDefaultUncaughtExceptionHandler(previous) }
+    logger.registerCleanup(CrumbtrailCrashHandlerRegistry.install(crashStore))
 }
 
 /**
@@ -88,10 +127,10 @@ internal fun drainPendingCrash(
     logger.addEvent(
         CrumbtrailEventKind.NATIVE_CRASH,
         JsonValue.of(
-            "msg" to JsonValue.Str(pending.message),
-            "stk" to JsonValue.str(pending.stack),
+            "msg" to JsonValue.Str(redactedDiagnosticText(pending.message, 1_024) ?: "uncaught exception"),
+            "stk" to JsonValue.str(redactedDiagnosticText(pending.stack)),
             "fatal" to JsonValue.Bool(true),
-            "thread" to JsonValue.str(pending.thread),
+            "thread" to JsonValue.str(redactedDiagnosticText(pending.thread, 256)),
             // Names both what happened and when it was recovered, so a reader
             // is never left thinking the crash happened at relaunch time.
             "source" to JsonValue.Str("previous-launch"),

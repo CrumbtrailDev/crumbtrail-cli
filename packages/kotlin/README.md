@@ -12,11 +12,21 @@ Use this for a native Android app. If your app is React Native use
 
 ## Install
 
+The Android SDK is built and tested in this repository but is not published to
+Maven Central yet. Use it as a local Gradle composite build:
+
 ```kotlin
+// app/settings.gradle.kts
+includeBuild("../crumbtrail-cli/packages/kotlin")
+
+// app/build.gradle.kts
 dependencies {
     implementation("ai.crumbtrail:crumbtrail-kotlin:0.1.0")
 }
 ```
+
+From the checkout, verify the local package with `gradle build` in
+`packages/kotlin`. No Maven artifact is available until a release publishes it.
 
 The SDK needs the internet permission, which most apps already declare:
 
@@ -63,10 +73,10 @@ in an app.
 | Event | Source |
 | --- | --- |
 | `native-crash` | An uncaught exception, delivered on the next launch |
-| `native-hang` | Shared wire contract for future watchdog observations. This package does not emit it yet |
+| `native-hang` | Foreground main thread stalls after recovery or on the next launch, when enabled |
 | `err` | Errors you report with `recordError` |
 | `net` | HTTP requests you report with `recordRequest` |
-| `app-lifecycle` | Foreground and background transitions |
+| `app-lifecycle` | Foreground and background transitions; process exits and memory pressure when native diagnostics are enabled |
 | `navigation` | Which Activity came to the front |
 | `env` | Device, OS, app version and locale at startup |
 
@@ -87,6 +97,45 @@ app is never reported.
 
 Crumbtrail always chains to whatever handler was already installed, so adding
 this SDK does not silently disable an existing crash reporter.
+
+### Opt in to main thread hangs and process exits
+
+Native watchdogs and native diagnostics are disabled by default. Enable the
+switches only after the app's capture consent has been granted:
+
+```kotlin
+CrumbtrailConfig(
+    endpoint = "https://api.crumbtrail.ai",
+    ingestKey = BuildConfig.CRUMBTRAIL_KEY,
+    // Set these only after the app's capture consent has been granted.
+    collectors = CrumbtrailCollectors(
+        nativeWatchdog = true,
+        nativeDiagnostics = true,
+    ),
+)
+```
+
+When enabled, the watchdog uses a five second threshold. It pauses when the app
+enters the background and while a debugger is attached, then resumes when the
+debugger detaches. A missed heartbeat is written to `SharedPreferences` and
+emitted when the main thread recovers. If the process never recovers, the next
+launch emits `native-hang` with `previousLaunch: true` and `recovered: false`.
+Stacks are limited to 64 frames and 8,192 characters. A previous launch handoff
+is read and recorded on the watchdog executor. It is cleared only after the
+event is accepted by the logger, so stopping the logger or rejecting the event
+leaves it for the next launch.
+
+`nativeWatchdog` observes foreground and background state independently of
+`appLifecycle`. You can disable lifecycle event capture without disabling hang
+detection or causing background time to be reported as a hang.
+
+On Android API 30 and newer, native diagnostics also reads up to eight
+`ApplicationExitInfo` records and sends newly observed entries as
+`app-lifecycle` with `state: "process-exit"`. `ComponentCallbacks2` memory
+pressure notifications are sent as `app-lifecycle` with
+`state: "memory-pressure"`. The process-exit marker advances only after the
+logger accepts an event. Credential-shaped values in native diagnostic text are
+replaced with `[REDACTED]` before storage or delivery.
 
 ### Network
 
@@ -211,7 +260,12 @@ CrumbtrailConfig(
     queueCapacity = 2000,
     flushBatchSize = 50,
     flushIntervalSeconds = 10,
-    collectors = CrumbtrailCollectors(navigation = false),
+    // Set these only after the app's capture consent has been granted.
+    collectors = CrumbtrailCollectors(
+        navigation = false,
+        nativeWatchdog = true,
+        nativeDiagnostics = true,
+    ),
 )
 ```
 
