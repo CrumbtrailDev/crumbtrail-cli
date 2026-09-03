@@ -92,10 +92,11 @@ this SDK does not silently disable an existing crash reporter.
 
 The default configuration watches the foreground main thread with a five second
 threshold. The watchdog pauses when the app enters the background and while a
-debugger is attached. A missed heartbeat is written to `SharedPreferences` and
-emitted when the main thread recovers. If the process never recovers, the next
-launch emits `native-hang` with `previousLaunch: true` and `recovered: false`.
-Stacks are limited to 64 frames and 8,192 characters.
+debugger is attached. It automatically resumes polling when the debugger
+detaches. A missed heartbeat is written to `SharedPreferences` and emitted when
+the main thread recovers. If the process never recovers, the next launch emits
+`native-hang` with `previousLaunch: true` and `recovered: false`. Stacks are
+limited to 64 frames and 8,192 characters.
 
 On Android API 30 and newer the SDK also reads `ApplicationExitInfo` for the
 most recent ANR, crash, native crash, or low memory exit. These observations are

@@ -70,10 +70,11 @@ reporter.
 
 The default configuration watches the foreground main thread with a five second
 threshold. The watchdog pauses when the app becomes inactive or enters the
-background and while a debugger is attached. A missed heartbeat is written to
-`UserDefaults` and emitted when the main thread recovers. If the process never
-recovers, the next launch emits `native-hang` with `previousLaunch: true` and
-`recovered: false`. Stacks are limited to 64 frames and 8,192 characters.
+background and while a debugger is attached. It automatically resumes polling
+when the debugger detaches. A missed heartbeat is written to a bounded file in
+Application Support and emitted when the main thread recovers. If the process
+never recovers, the next launch emits `native-hang` with `previousLaunch: true`
+and `recovered: false`. Stacks are limited to 64 frames and 8,192 characters.
 
 On iOS 14 and newer, MetricKit diagnostics are imported through the optional
 framework. Hang diagnostics are emitted as `native-hang` and crash diagnostics

@@ -193,7 +193,7 @@ class AndroidApplicationExitInfoReader(private val context: Context) : Crumbtrai
                     val timestamp = info.timestamp
                     if (timestamp <= 0) return@mapNotNull null
                     CrumbtrailProcessExit(
-                        reason = processExitReason(info.reason),
+                        reason = androidProcessExitReason(info.reason),
                         timestamp = timestamp,
                         importance = info.importance,
                         status = info.status,
@@ -203,20 +203,28 @@ class AndroidApplicationExitInfoReader(private val context: Context) : Crumbtrai
         }.getOrDefault(emptyList())
     }
 
-    private fun processExitReason(reason: Int): String = when (reason) {
-        android.app.ApplicationExitInfo.REASON_ANR -> "anr"
-        android.app.ApplicationExitInfo.REASON_CRASH -> "crash"
-        android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "native-crash"
-        android.app.ApplicationExitInfo.REASON_LOW_MEMORY -> "low-memory"
-        android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "initialization-failure"
-        android.app.ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "permission-change"
-        android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "excessive-resource-usage"
-        android.app.ApplicationExitInfo.REASON_USER_REQUESTED -> "user-requested"
-        android.app.ApplicationExitInfo.REASON_USER_STOPPED -> "user-stopped"
-        android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "dependency-died"
-        android.app.ApplicationExitInfo.REASON_OTHER -> "other"
-        else -> "unknown"
-    }
+}
+
+/** Keep expected lifecycle exits distinct from failures as Android adds reasons. */
+internal fun androidProcessExitReason(reason: Int): String = when (reason) {
+    android.app.ApplicationExitInfo.REASON_ANR -> "anr"
+    android.app.ApplicationExitInfo.REASON_CRASH -> "crash"
+    android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "native-crash"
+    android.app.ApplicationExitInfo.REASON_LOW_MEMORY -> "low-memory"
+    android.app.ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "initialization-failure"
+    android.app.ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "permission-change"
+    android.app.ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "excessive-resource-usage"
+    android.app.ApplicationExitInfo.REASON_USER_REQUESTED -> "user-requested"
+    android.app.ApplicationExitInfo.REASON_USER_STOPPED -> "user-stopped"
+    android.app.ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "dependency-died"
+    android.app.ApplicationExitInfo.REASON_PACKAGE_UPDATED -> "package-updated"
+    android.app.ApplicationExitInfo.REASON_PACKAGE_STATE_CHANGE -> "package-state-change"
+    android.app.ApplicationExitInfo.REASON_FREEZER -> "freezer"
+    android.app.ApplicationExitInfo.REASON_EXIT_SELF -> "exit-self"
+    android.app.ApplicationExitInfo.REASON_SIGNALED -> "signaled"
+    android.app.ApplicationExitInfo.REASON_UNKNOWN -> "unknown"
+    android.app.ApplicationExitInfo.REASON_OTHER -> "other"
+    else -> "unknown"
 }
 
 /** Read device and app facts from the platform. */

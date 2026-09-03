@@ -6,6 +6,7 @@ import Darwin
 
 public let crumbtrailMaxDiagnosticStackCharacters = 8_192
 public let crumbtrailMaxDiagnosticStackFrames = 64
+public let crumbtrailMaxPendingHangFileBytes = 128 * 1024
 public let crumbtrailNativeHangThresholdMilliseconds: Int64 = 5_000
 public let crumbtrailMaxNativeHangDurationMilliseconds: Int64 = 86_400_000
 
@@ -99,7 +100,14 @@ public protocol CrumbtrailWatchdogScheduler: AnyObject {
     @discardableResult
     func schedule(after seconds: TimeInterval, _ task: @escaping () -> Void) -> CrumbtrailWatchdogTask
     func postToMain(_ task: @escaping () -> Void)
+    func postToBackground(_ task: @escaping () -> Void)
     func shutdown()
+}
+
+public extension CrumbtrailWatchdogScheduler {
+    func postToBackground(_ task: @escaping () -> Void) {
+        _ = schedule(after: 0, task)
+    }
 }
 
 /// Foreground only watchdog state machine. The platform adapter supplies the
@@ -110,6 +118,7 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
     private let handoff: CrumbtrailPendingHangStore
     private let onHang: (CrumbtrailNativeHang) -> Void
     private let now: () -> Int64
+    private let wallNow: () -> Int64
     private let isDebuggerAttached: () -> Bool
     private let captureStack: () -> String?
     private let thresholdMs: Int64
@@ -119,13 +128,21 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
     private var generation: Int64 = 0
     private var lastHeartbeatAt: Int64 = 0
     private var pendingAt: Int64?
+    private var pendingStartedMonotonic: Int64?
     private var checkTask: CrumbtrailWatchdogTask?
+    private var debuggerPollTask: CrumbtrailWatchdogTask?
+    private var debuggerSuppressed = false
 
     public init(
         scheduler: CrumbtrailWatchdogScheduler,
         handoff: CrumbtrailPendingHangStore,
         onHang: @escaping (CrumbtrailNativeHang) -> Void,
-        now: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1_000) },
+        /// Monotonic milliseconds used only for elapsed-time calculations.
+        now: @escaping () -> Int64 = {
+            Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
+        },
+        /// Wall-clock milliseconds used only for persisted event timestamps.
+        wallNow: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1_000) },
         isDebuggerAttached: @escaping () -> Bool = { false },
         thresholdMs: Int64 = crumbtrailNativeHangThresholdMilliseconds,
         checkIntervalMs: Int64 = 250,
@@ -135,6 +152,7 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
         self.handoff = handoff
         self.onHang = onHang
         self.now = now
+        self.wallNow = wallNow
         self.isDebuggerAttached = isDebuggerAttached
         self.thresholdMs = min(max(1, thresholdMs), crumbtrailMaxNativeHangDurationMilliseconds)
         self.checkIntervalMs = max(1, checkIntervalMs)
@@ -144,8 +162,8 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
     public var threshold: Int64 { thresholdMs }
 
     public func start() {
-        if isDebuggerAttached() {
-            pause()
+        if debuggerAttached() {
+            suppressForDebugger()
             return
         }
         let token: Int64
@@ -154,6 +172,9 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
             lock.unlock()
             return
         }
+        debuggerSuppressed = false
+        debuggerPollTask?.cancel()
+        debuggerPollTask = nil
         running = true
         generation += 1
         token = generation
@@ -168,9 +189,12 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
     public func pause() {
         lock.lock()
         running = false
+        debuggerSuppressed = false
         generation += 1
         checkTask?.cancel()
         checkTask = nil
+        debuggerPollTask?.cancel()
+        debuggerPollTask = nil
         lock.unlock()
     }
 
@@ -198,8 +222,8 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
         let active = running && generation == token
         lock.unlock()
         guard active else { return }
-        if isDebuggerAttached() {
-            pause()
+        if debuggerAttached() {
+            suppressForDebugger()
             return
         }
 
@@ -208,16 +232,17 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
         if running && generation == token {
             let elapsed = max(0, current - lastHeartbeatAt)
             if elapsed >= thresholdMs && pendingAt == nil && handoff.read() == nil {
-                let at = current
+                let at = wallNow()
                 let pending = CrumbtrailPendingHang(
                     thresholdMs: thresholdMs,
                     observedDurationMs: min(elapsed, crumbtrailMaxNativeHangDurationMilliseconds),
                     stack: crumbtrailBoundedDiagnosticText(captureStack()),
                     at: at,
-                    startedAt: lastHeartbeatAt
+                    startedAt: max(0, at - elapsed)
                 )
                 handoff.write(pending)
                 pendingAt = at
+                pendingStartedMonotonic = lastHeartbeatAt
             }
         }
         lock.unlock()
@@ -236,12 +261,20 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
         let current = now()
         let pending = handoff.read()
         if let activeAt = pendingAt, let pending, pending.at == activeAt {
-            let duration = min(
-                max(pending.observedDurationMs, current - pending.startedAt),
-                crumbtrailMaxNativeHangDurationMilliseconds
-            )
-            handoff.clear()
+            let duration: Int64
+            if let started = pendingStartedMonotonic {
+                duration = min(
+                    max(pending.observedDurationMs, current - started),
+                    crumbtrailMaxNativeHangDurationMilliseconds
+                )
+            } else {
+                duration = min(
+                    max(0, pending.observedDurationMs),
+                    crumbtrailMaxNativeHangDurationMilliseconds
+                )
+            }
             pendingAt = nil
+            pendingStartedMonotonic = nil
             observation = CrumbtrailNativeHang(
                 thresholdMs: pending.thresholdMs,
                 observedDurationMs: duration,
@@ -252,7 +285,58 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
         }
         lastHeartbeatAt = current
         lock.unlock()
-        if let observation { onHang(observation) }
+        if let observation {
+            onHang(observation)
+            scheduler.postToBackground { self.handoff.clear() }
+        }
+    }
+
+    private func debuggerAttached() -> Bool {
+        isDebuggerAttached()
+    }
+
+    private func suppressForDebugger() {
+        let shouldPoll: Bool
+        lock.lock()
+        running = false
+        generation += 1
+        checkTask?.cancel()
+        checkTask = nil
+        shouldPoll = !debuggerSuppressed
+        debuggerSuppressed = true
+        lock.unlock()
+        if shouldPoll { scheduleDebuggerPoll() }
+    }
+
+    private func scheduleDebuggerPoll() {
+        let task = scheduler.schedule(after: TimeInterval(checkIntervalMs) / 1_000) {
+            [weak self] in self?.pollDebugger()
+        }
+        lock.lock()
+        if debuggerSuppressed { debuggerPollTask = task } else { task.cancel() }
+        lock.unlock()
+    }
+
+    private func pollDebugger() {
+        lock.lock()
+        let shouldPoll = debuggerSuppressed
+        lock.unlock()
+        guard shouldPoll else { return }
+        if debuggerAttached() {
+            scheduleDebuggerPoll()
+            return
+        }
+        lock.lock()
+        let shouldResume: Bool
+        if debuggerSuppressed {
+            debuggerSuppressed = false
+            debuggerPollTask = nil
+            shouldResume = true
+        } else {
+            shouldResume = false
+        }
+        lock.unlock()
+        if shouldResume { start() }
     }
 }
 
@@ -277,31 +361,72 @@ public func drainPendingHang(
     )
 }
 
-/// Durable handoff in UserDefaults. A separate key keeps this additive to the
-/// existing crash handoff and lets the host clear either diagnostic independently.
-public final class UserDefaultsPendingHangStore: CrumbtrailPendingHangStore {
-    private let defaults: UserDefaults
-    private let key: String
+/// Durable hang handoff in Application Support, alongside the crash handoff.
+/// A bounded JSON file with atomic replacement survives process termination
+/// without using UserDefaults as a second persistence mechanism.
+public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStore {
+    private static let fileName = "crumbtrail-pending-hang.json"
+    private let fileURL: URL?
+    private let fileManager: FileManager
 
-    public init(
-        defaults: UserDefaults = .standard,
-        key: String = "ai.crumbtrail.pending-hang"
-    ) {
-        self.defaults = defaults
-        self.key = key
+    public init(fileURL: URL? = nil, fileManager: FileManager = .default) {
+        self.fileURL = fileURL ?? CrumbtrailCrashStore.applicationSupportFileURL(
+            named: Self.fileName
+        )
+        self.fileManager = fileManager
     }
 
     public func write(_ hang: CrumbtrailPendingHang) {
-        guard let data = try? JSONEncoder().encode(hang) else { return }
-        defaults.set(data, forKey: key)
+        guard let fileURL,
+              let data = try? JSONEncoder().encode(
+                  CrumbtrailPendingHang(
+                      thresholdMs: hang.thresholdMs,
+                      observedDurationMs: hang.observedDurationMs,
+                      stack: crumbtrailBoundedDiagnosticText(hang.stack),
+                      at: hang.at,
+                      startedAt: hang.startedAt
+                  )
+              ),
+              data.count <= crumbtrailMaxPendingHangFileBytes
+        else { return }
+
+        let temporaryName = "." + fileURL.lastPathComponent + "." + UUID().uuidString + ".tmp"
+        let temporaryURL = fileURL.deletingLastPathComponent().appendingPathComponent(temporaryName)
+        do {
+            try fileManager.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try data.write(to: temporaryURL, options: .atomic)
+            if fileManager.fileExists(atPath: fileURL.path) {
+                _ = try fileManager.replaceItemAt(fileURL, withItemAt: temporaryURL)
+            } else {
+                try fileManager.moveItem(at: temporaryURL, to: fileURL)
+            }
+        } catch {
+            try? fileManager.removeItem(at: temporaryURL)
+        }
     }
 
     public func read() -> CrumbtrailPendingHang? {
-        guard let data = defaults.data(forKey: key) else { return nil }
-        return try? JSONDecoder().decode(CrumbtrailPendingHang.self, from: data)
+        guard let fileURL,
+              let data = try? Data(contentsOf: fileURL),
+              data.count <= crumbtrailMaxPendingHangFileBytes,
+              let hang = try? JSONDecoder().decode(CrumbtrailPendingHang.self, from: data)
+        else { return nil }
+        return CrumbtrailPendingHang(
+            thresholdMs: hang.thresholdMs,
+            observedDurationMs: hang.observedDurationMs,
+            stack: crumbtrailBoundedDiagnosticText(hang.stack),
+            at: hang.at,
+            startedAt: hang.startedAt
+        )
     }
 
-    public func clear() { defaults.removeObject(forKey: key) }
+    public func clear() {
+        guard let fileURL else { return }
+        try? fileManager.removeItem(at: fileURL)
+    }
 }
 
 /// A small dispatch based scheduler used by the UIKit adapter.
@@ -332,6 +457,10 @@ public final class CrumbtrailDispatchWatchdogScheduler: CrumbtrailWatchdogSchedu
 
     public func postToMain(_ task: @escaping () -> Void) {
         DispatchQueue.main.async(execute: task)
+    }
+
+    public func postToBackground(_ task: @escaping () -> Void) {
+        queue.async(execute: task)
     }
 
     public func shutdown() {

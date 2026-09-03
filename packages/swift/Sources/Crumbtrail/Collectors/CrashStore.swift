@@ -27,7 +27,7 @@ public struct CrumbtrailPendingCrash: Codable, Equatable, Sendable {
 public enum CrumbtrailCrashStore {
     static let fileName = "crumbtrail-pending-crash.json"
 
-    static var fileURL: URL? {
+    static func applicationSupportFileURL(named fileName: String) -> URL? {
         guard
             let directory = FileManager.default.urls(
                 for: .applicationSupportDirectory, in: .userDomainMask
@@ -38,6 +38,10 @@ public enum CrumbtrailCrashStore {
             at: folder, withIntermediateDirectories: true
         )
         return folder.appendingPathComponent(fileName)
+    }
+
+    static var fileURL: URL? {
+        applicationSupportFileURL(named: fileName)
     }
 
     /// Called from a crash handler. Everything is `try?`: throwing inside a

@@ -127,7 +127,7 @@ extension Crumbtrail {
     /// while the app is backgrounded. This separates those transitions from
     /// active hangs.
     private func installLifecycleCollector() {
-        let pendingHangStore = UserDefaultsPendingHangStore()
+        let pendingHangStore = ApplicationSupportPendingHangStore()
         if config.collectors.nativeDiagnostics || config.collectors.nativeWatchdog {
             drainPendingHang(pendingHangStore, onHang: recordNativeHang)
         }

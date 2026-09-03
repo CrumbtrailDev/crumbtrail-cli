@@ -73,6 +73,9 @@ fun interface CrumbtrailWatchdogTask {
 interface CrumbtrailWatchdogScheduler {
     fun schedule(delayMs: Long, task: () -> Unit): CrumbtrailWatchdogTask
     fun postToMain(task: () -> Unit)
+    fun postToBackground(task: () -> Unit) {
+        schedule(0, task)
+    }
     fun shutdown() = Unit
 }
 
@@ -89,7 +92,10 @@ class CrumbtrailMainThreadWatchdog(
     private val scheduler: CrumbtrailWatchdogScheduler,
     private val handoff: CrumbtrailPendingHangStore,
     private val onHang: (CrumbtrailNativeHang) -> Unit,
-    private val now: () -> Long = System::currentTimeMillis,
+    /** Monotonic milliseconds used only for elapsed-time calculations. */
+    private val now: () -> Long = { System.nanoTime() / 1_000_000L },
+    /** Wall-clock milliseconds used only for persisted event timestamps. */
+    private val wallNow: () -> Long = System::currentTimeMillis,
     private val isDebuggerAttached: () -> Boolean = { false },
     thresholdMs: Long = DEFAULT_NATIVE_HANG_THRESHOLD_MS,
     private val checkIntervalMs: Long = DEFAULT_NATIVE_HANG_CHECK_INTERVAL_MS,
@@ -101,7 +107,10 @@ class CrumbtrailMainThreadWatchdog(
     private var generation = 0L
     private var lastHeartbeatAt = 0L
     private var pendingAt: Long? = null
+    private var pendingStartedMonotonic: Long? = null
     private var checkTask: CrumbtrailWatchdogTask? = null
+    private var debuggerPollTask: CrumbtrailWatchdogTask? = null
+    private var debuggerSuppressed = false
 
     init {
         require(checkIntervalMs > 0) { "checkIntervalMs must be positive" }
@@ -111,13 +120,16 @@ class CrumbtrailMainThreadWatchdog(
 
     /** Start or resume the watchdog. A debugger suppresses the watchdog. */
     fun start() {
-        if (isDebuggerAttached()) {
-            pause()
+        if (debuggerAttached()) {
+            suppressForDebugger()
             return
         }
         val token: Long
         synchronized(lock) {
             if (running) return
+            debuggerSuppressed = false
+            debuggerPollTask?.cancel()
+            debuggerPollTask = null
             running = true
             generation += 1
             token = generation
@@ -131,9 +143,12 @@ class CrumbtrailMainThreadWatchdog(
     fun pause() {
         synchronized(lock) {
             running = false
+            debuggerSuppressed = false
             generation += 1
             checkTask?.cancel()
             checkTask = null
+            debuggerPollTask?.cancel()
+            debuggerPollTask = null
         }
     }
 
@@ -156,8 +171,8 @@ class CrumbtrailMainThreadWatchdog(
         val shouldContinue: Boolean
         synchronized(lock) { shouldContinue = running && generation == token }
         if (!shouldContinue) return
-        if (isDebuggerAttached()) {
-            pause()
+        if (debuggerAttached()) {
+            suppressForDebugger()
             return
         }
 
@@ -166,7 +181,7 @@ class CrumbtrailMainThreadWatchdog(
             if (running && generation == token) {
                 val elapsed = (current - lastHeartbeatAt).coerceAtLeast(0)
                 if (elapsed >= thresholdMs && pendingAt == null && handoff.read() == null) {
-                    val at = current
+                    val at = wallNow()
                     runCatching {
                         handoff.write(
                             CrumbtrailPendingHang(
@@ -174,10 +189,11 @@ class CrumbtrailMainThreadWatchdog(
                                 observedDurationMs = elapsed.coerceAtMost(MAX_NATIVE_HANG_DURATION_MS),
                                 stack = boundedDiagnosticText(captureStack()),
                                 at = at,
-                                startedAt = lastHeartbeatAt,
+                                startedAt = (at - elapsed).coerceAtLeast(0),
                             )
                         )
                         pendingAt = at
+                        pendingStartedMonotonic = lastHeartbeatAt
                     }
                 }
             }
@@ -195,10 +211,15 @@ class CrumbtrailMainThreadWatchdog(
             val pending = handoff.read()
             val activeAt = pendingAt
             observation = if (activeAt != null && pending != null && pending.at == activeAt) {
-                val duration = (current - pending.startedAt).coerceAtLeast(pending.observedDurationMs)
-                    .coerceAtMost(MAX_NATIVE_HANG_DURATION_MS)
-                runCatching { handoff.clear() }
+                val duration = if (pendingStartedMonotonic != null) {
+                    (current - pendingStartedMonotonic!!)
+                        .coerceAtLeast(pending.observedDurationMs)
+                        .coerceIn(0, MAX_NATIVE_HANG_DURATION_MS)
+                } else {
+                    pending.observedDurationMs.coerceIn(0, MAX_NATIVE_HANG_DURATION_MS)
+                }
                 pendingAt = null
+                pendingStartedMonotonic = null
                 CrumbtrailNativeHang(
                     thresholdMs = pending.thresholdMs,
                     observedDurationMs = duration,
@@ -211,7 +232,50 @@ class CrumbtrailMainThreadWatchdog(
             }
             lastHeartbeatAt = current
         }
-        observation?.let { runCatching { onHang(it) } }
+        observation?.let {
+            val delivered = runCatching { onHang(it) }.isSuccess
+            if (delivered) scheduler.postToBackground { runCatching { handoff.clear() } }
+        }
+    }
+
+    private fun debuggerAttached(): Boolean = runCatching { isDebuggerAttached() }.getOrDefault(false)
+
+    private fun suppressForDebugger() {
+        val shouldPoll: Boolean
+        synchronized(lock) {
+            running = false
+            generation += 1
+            checkTask?.cancel()
+            checkTask = null
+            shouldPoll = !debuggerSuppressed
+            debuggerSuppressed = true
+        }
+        if (shouldPoll) scheduleDebuggerPoll()
+    }
+
+    private fun scheduleDebuggerPoll() {
+        val task = scheduler.schedule(checkIntervalMs) { pollDebugger() }
+        synchronized(lock) {
+            if (debuggerSuppressed) debuggerPollTask = task else task.cancel()
+        }
+    }
+
+    private fun pollDebugger() {
+        val shouldPoll = synchronized(lock) { debuggerSuppressed }
+        if (!shouldPoll) return
+        if (debuggerAttached()) {
+            scheduleDebuggerPoll()
+            return
+        }
+        val shouldResume = synchronized(lock) {
+            if (!debuggerSuppressed) false
+            else {
+                debuggerSuppressed = false
+                debuggerPollTask = null
+                true
+            }
+        }
+        if (shouldResume) start()
     }
 
     companion object {
@@ -308,6 +372,10 @@ class CrumbtrailExecutorWatchdogScheduler : CrumbtrailWatchdogScheduler {
 
     override fun postToMain(task: () -> Unit) {
         runCatching { mainPoster(Runnable { runCatching(task) }) }
+    }
+
+    override fun postToBackground(task: () -> Unit) {
+        runCatching { executor.execute { runCatching(task) } }
     }
 
     override fun shutdown() {

@@ -15,6 +15,7 @@ private final class FakeWatchdogScheduler: CrumbtrailWatchdogScheduler {
 
     private var scheduled: [Entry] = []
     private var main: [() -> Void] = []
+    private var background: [() -> Void] = []
     private(set) var shutdownCalled = false
 
     var activeScheduledCount: Int { scheduled.filter { !$0.task.cancelled }.count }
@@ -27,6 +28,7 @@ private final class FakeWatchdogScheduler: CrumbtrailWatchdogScheduler {
     }
 
     func postToMain(_ task: @escaping () -> Void) { main.append(task) }
+    func postToBackground(_ task: @escaping () -> Void) { background.append(task) }
 
     func shutdown() { shutdownCalled = true }
 
@@ -37,6 +39,10 @@ private final class FakeWatchdogScheduler: CrumbtrailWatchdogScheduler {
 
     func runMain() {
         while !main.isEmpty { main.removeFirst()() }
+    }
+
+    func runBackground() {
+        while !background.isEmpty { background.removeFirst()() }
     }
 }
 
@@ -54,12 +60,14 @@ final class NativeDiagnosticsTests: XCTestCase {
         let scheduler = FakeWatchdogScheduler()
         let handoff = MemoryPendingHangStore()
         var now: Int64 = 0
+        var wallNow: Int64 = 100_000
         var observations: [CrumbtrailNativeHang] = []
         let watchdog = CrumbtrailMainThreadWatchdog(
             scheduler: scheduler,
             handoff: handoff,
             onHang: { observations.append($0) },
             now: { now },
+            wallNow: { wallNow },
             thresholdMs: 5_000,
             captureStack: { "main stack" }
         )
@@ -68,8 +76,11 @@ final class NativeDiagnosticsTests: XCTestCase {
         watchdog.start()
         scheduler.runMain()
         now = 5_000
+        wallNow = 90_000
         scheduler.runNextScheduled()
         XCTAssertEqual(handoff.read()?.observedDurationMs, 5_000)
+        XCTAssertEqual(handoff.read()?.at, 90_000)
+        XCTAssertEqual(handoff.read()?.startedAt, 85_000)
         XCTAssertTrue(observations.isEmpty)
 
         now = 6_200
@@ -78,20 +89,43 @@ final class NativeDiagnosticsTests: XCTestCase {
         XCTAssertTrue(observations[0].recovered)
         XCTAssertFalse(observations[0].previousLaunch)
         XCTAssertEqual(observations[0].observedDurationMs, 6_200)
+        XCTAssertNotNil(handoff.read())
+        scheduler.runBackground()
         XCTAssertNil(handoff.read())
     }
 
     func testWatchdogPauseAndDebuggerSuppressChecks() {
         let scheduler = FakeWatchdogScheduler()
+        var attached = true
         let watchdog = CrumbtrailMainThreadWatchdog(
             scheduler: scheduler,
             handoff: MemoryPendingHangStore(),
             onHang: { _ in },
-            isDebuggerAttached: { true }
+            isDebuggerAttached: { attached }
         )
         watchdog.start()
-        XCTAssertEqual(scheduler.activeScheduledCount, 0)
+        XCTAssertEqual(scheduler.activeScheduledCount, 1)
         XCTAssertFalse(scheduler.shutdownCalled)
+        attached = false
+        scheduler.runNextScheduled()
+        XCTAssertEqual(scheduler.activeScheduledCount, 1)
+
+        let attachedScheduler = FakeWatchdogScheduler()
+        var dynamicallyAttached = false
+        let attachedWatchdog = CrumbtrailMainThreadWatchdog(
+            scheduler: attachedScheduler,
+            handoff: MemoryPendingHangStore(),
+            onHang: { _ in },
+            isDebuggerAttached: { dynamicallyAttached }
+        )
+        attachedWatchdog.start()
+        attachedScheduler.runMain()
+        dynamicallyAttached = true
+        attachedScheduler.runNextScheduled()
+        XCTAssertEqual(attachedScheduler.activeScheduledCount, 1)
+        dynamicallyAttached = false
+        attachedScheduler.runNextScheduled()
+        XCTAssertEqual(attachedScheduler.activeScheduledCount, 1)
 
         let runningScheduler = FakeWatchdogScheduler()
         let running = CrumbtrailMainThreadWatchdog(
@@ -126,11 +160,12 @@ final class NativeDiagnosticsTests: XCTestCase {
         XCTAssertNil(store.read())
     }
 
-    func testUserDefaultsHandoffRoundTripsAndBoundsText() {
-        let suite = "ai.crumbtrail.tests.native-diagnostics"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
-        let store = UserDefaultsPendingHangStore(defaults: defaults, key: "hang")
+    func testApplicationSupportHandoffRoundTripsAndBoundsText() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ai.crumbtrail.tests.native-diagnostics", isDirectory: true)
+        try? FileManager.default.removeItem(at: directory)
+        let url = directory.appendingPathComponent("hang.json")
+        let store = ApplicationSupportPendingHangStore(fileURL: url)
         store.write(
             CrumbtrailPendingHang(
                 thresholdMs: 5_000,

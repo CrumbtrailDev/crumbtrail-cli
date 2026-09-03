@@ -6,6 +6,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import ai.crumbtrail.sdk.android.androidProcessExitReason
 
 private class FakeWatchdogScheduler : CrumbtrailWatchdogScheduler {
     private data class Entry(
@@ -15,6 +16,7 @@ private class FakeWatchdogScheduler : CrumbtrailWatchdogScheduler {
 
     private val scheduled = ArrayDeque<Entry>()
     private val main = ArrayDeque<() -> Unit>()
+    private val background = ArrayDeque<() -> Unit>()
     var shutdownCalled = false
 
     val scheduledCount: Int get() = scheduled.count { !it.cancelled }
@@ -26,6 +28,7 @@ private class FakeWatchdogScheduler : CrumbtrailWatchdogScheduler {
     }
 
     override fun postToMain(task: () -> Unit) { main.addLast(task) }
+    override fun postToBackground(task: () -> Unit) { background.addLast(task) }
 
     override fun shutdown() { shutdownCalled = true }
 
@@ -36,6 +39,10 @@ private class FakeWatchdogScheduler : CrumbtrailWatchdogScheduler {
 
     fun runMain() {
         while (main.isNotEmpty()) main.removeFirst()()
+    }
+
+    fun runBackground() {
+        while (background.isNotEmpty()) background.removeFirst()()
     }
 }
 
@@ -50,11 +57,13 @@ class MainThreadWatchdogTest {
         val scheduler = FakeWatchdogScheduler()
         val handoff = MemoryPendingHangStore()
         var now = 0L
+        var wallNow = 100_000L
         val watchdog = CrumbtrailMainThreadWatchdog(
             scheduler = scheduler,
             handoff = handoff,
             onHang = {},
             now = { now },
+            wallNow = { wallNow },
             captureStack = { "main frame" },
         )
 
@@ -65,9 +74,12 @@ class MainThreadWatchdogTest {
         scheduler.runNextScheduled()
         assertNull(handoff.read())
         now = 5_000
+        wallNow = 90_000
         scheduler.runNextScheduled()
         assertEquals(5_000L, handoff.read()?.observedDurationMs)
         assertEquals("main frame", handoff.read()?.stack)
+        assertEquals(90_000L, handoff.read()?.at)
+        assertEquals(85_000L, handoff.read()?.startedAt)
     }
 
     @Test
@@ -95,6 +107,8 @@ class MainThreadWatchdogTest {
         assertTrue(observations.single().recovered)
         assertFalse(observations.single().previousLaunch)
         assertEquals(6_200L, observations.single().observedDurationMs)
+        assertNotNull(handoff.read())
+        scheduler.runBackground()
         assertNull(handoff.read())
         scheduler.runMain()
         assertEquals(1, observations.size)
@@ -119,15 +133,36 @@ class MainThreadWatchdogTest {
         assertNull(pausedStore.read())
 
         val debugScheduler = FakeWatchdogScheduler()
+        var attached = true
         val debug = CrumbtrailMainThreadWatchdog(
             scheduler = debugScheduler,
             handoff = MemoryPendingHangStore(),
             onHang = {},
-            isDebuggerAttached = { true },
+            isDebuggerAttached = { attached },
         )
         debug.start()
         assertTrue(debugScheduler.shutdownCalled.not())
-        assertFalse(debugScheduler.scheduledCount > 0)
+        assertEquals(1, debugScheduler.scheduledCount)
+        attached = false
+        debugScheduler.runNextScheduled()
+        assertEquals(1, debugScheduler.scheduledCount)
+
+        val attachedScheduler = FakeWatchdogScheduler()
+        var dynamicallyAttached = false
+        val attachedWatchdog = CrumbtrailMainThreadWatchdog(
+            scheduler = attachedScheduler,
+            handoff = MemoryPendingHangStore(),
+            onHang = {},
+            isDebuggerAttached = { dynamicallyAttached },
+        )
+        attachedWatchdog.start()
+        attachedScheduler.runMain()
+        dynamicallyAttached = true
+        attachedScheduler.runNextScheduled()
+        assertEquals(1, attachedScheduler.scheduledCount)
+        dynamicallyAttached = false
+        attachedScheduler.runNextScheduled()
+        assertEquals(1, attachedScheduler.scheduledCount)
     }
 
     @Test
@@ -174,5 +209,16 @@ class MainThreadWatchdogTest {
         assertEquals(1_024, exits.single().description?.length)
         CrumbtrailProcessExitCollector(reader, marker, exits::add).collect()
         assertEquals(1, exits.size)
+    }
+
+    @Test
+    fun `maps modern Android process exit reasons explicitly`() {
+        // API 30 ApplicationExitInfo values are tested through the plain JVM seam.
+        assertEquals("package-updated", androidProcessExitReason(16))
+        assertEquals("package-state-change", androidProcessExitReason(15))
+        assertEquals("freezer", androidProcessExitReason(14))
+        assertEquals("exit-self", androidProcessExitReason(1))
+        assertEquals("signaled", androidProcessExitReason(2))
+        assertEquals("unknown", androidProcessExitReason(99))
     }
 }
