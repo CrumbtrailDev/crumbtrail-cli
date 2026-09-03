@@ -374,7 +374,7 @@ describe("buildPlan — static", () => {
       [
         '<script type="module">',
         '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
-        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "${KEY_PLACEHOLDER}", remoteConfig: true, service: "web" });`,
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });`,
         "</script>",
       ].join("\n"),
     )!;
@@ -424,7 +424,7 @@ describe("buildPlan — static", () => {
       [
         '<script type="module">',
         '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
-        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "${KEY_PLACEHOLDER}", remoteConfig: true, service: "web" });`,
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });`,
         "</script>",
       ].join("\n"),
     )!;

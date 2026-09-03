@@ -78,7 +78,9 @@ describe("executePlan — golden create/prepend on a real repo", () => {
     expect(written.endsWith("\n")).toBe(true);
     writeFileSync(path.join(root, ".env.local"), "VITE_CRUMBTRAIL_KEY=ctkey_test\n");
 
-    // Re-detect after the code and key are present -> the complete integration skips.
+    // Re-detect after the code and key are present. The older installed SDK
+    // cannot supply early capture, so the rerun must surface the upgrade action
+    // instead of silently claiming the integration is complete.
     const second = buildPlan(
       {
         cwd: root,
@@ -88,7 +90,8 @@ describe("executePlan — golden create/prepend on a real repo", () => {
       },
       defaultInjectIO,
     );
-    expect(second.kind).toBe("skip-already-wired");
+    expect(second.kind).toBe("fallback-ai");
+    expect(second.warnings.join(" ")).toMatch(/upgrade/i);
     expect(executePlan(second).skipped).toBe(true);
   });
 

@@ -1555,7 +1555,7 @@ function staticBootstrapMismatchPlan(
     snippet: "",
     keyIsSourceLiteral: true,
     warnings: [
-      `${location} already references Crumbtrail, but ${installed}. The early bootstrap must match the ${bootstrapVersion} module release, so it was left unchanged. Update the page's crumbtrail-core ESM URL to ${bootstrapVersion} and run setup again.`,
+      `${location} already references Crumbtrail, but ${installed}. The early bootstrap must match the ${bootstrapVersion} module release, so it was left unchanged. Upgrade the page's crumbtrail-core ESM URL to ${bootstrapVersion} and run setup again.`,
     ],
   };
 }
@@ -3623,6 +3623,7 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
     default:
       break;
   }
+  if (input.recipe === "static") return planStatic(input, io);
   // Dependency presence is not enough. Only a complete integration for this
   // endpoint and service may skip the write. An incomplete reachable setup is
   // handed back as guidance so the existing initializer is repaired in place.
@@ -3634,25 +3635,10 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
     serviceName: input.serviceName,
     io,
   });
-  if (integration.complete) return skipPlan(input);
-  // A wired static page whose ONLY gap is the key placeholder is not a broken
-  // integration — it is a finished edit with one step left that only the user
-  // can do. Handing back the whole snippet again told them to paste code their
-  // page already carries, and named an env var this recipe does not use.
-  if (
-    integration.found &&
-    input.recipe === "static" &&
-    integration.missing.every((piece) => piece === "ingest-key")
-  ) {
-    const plan = skipPlan(
-      input,
-      [
-        `This page is already wired. One step is left, and only you can do it: replace ${KEY_PLACEHOLDER} in ${input.entryFile ? path.relative(input.cwd, input.entryFile) || input.entryFile : "the page"} with your ingest key${input.mintUrl ? ` from ${input.mintUrl}` : ""}.`,
-      ],
-      { replaceDefaultWarning: true },
-    );
-    plan.keyIsSourceLiteral = true;
-    return plan;
+  if (integration.complete) {
+    if (!hasEarlyBrowserMarker(input, io))
+      return earlyBrowserUpgradePlan(input, io);
+    return skipPlan(input);
   }
   // An incomplete integration the customer already wrote is a thing to FINISH,
   // not a thing to refuse. Only when its init call cannot be parsed and extended
@@ -3687,10 +3673,6 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
       return planVite(input, io);
     case "cra":
       return planCra(input, io);
-    case "static":
-      // A page with no bundler: the HTML itself is the entry, wired with a
-      // script tag rather than an import.
-      return planStatic(input, io);
     case "express":
       // Express additionally wires the request/error middleware pair so the
       // backend emits backend.req.* spans, not just crash capture.
