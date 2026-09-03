@@ -2,10 +2,14 @@
 
 Machine readable form of [`docs/specs/native-sdk-wire-contract.md`](../../docs/specs/native-sdk-wire-contract.md).
 
-Every SDK that is not built on `crumbtrail-core` — Swift, Kotlin, Dart — ships a
-conformance test that constructs its own event types, serialises them, and
-asserts the result equals the fixture here. `crumbtrail-core` has a matching test
-so the reference implementation is held to the same file.
+Every SDK that is not built on `crumbtrail-core` — Swift, Kotlin, and Dart —
+ships a conformance test that constructs its own event types, serialises them,
+and asserts the result equals the fixture here. React Native uses the core
+event envelope, and its native bridge tests validate the same bounded payload
+before handing it to core. The `native-hang-js.json` and
+`native-hang-dart.json` fixtures cover the framework specific watchdog sources.
+`crumbtrail-core` has a matching test so the reference implementation is held
+to the same file.
 
 Changing a fixture fails every SDK at once. That is the point: a field rename
 that would otherwise drift silently through three languages becomes one

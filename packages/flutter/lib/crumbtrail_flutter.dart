@@ -8,6 +8,7 @@ library;
 export 'src/crumbtrail.dart';
 export 'src/event.dart';
 export 'src/navigator_observer.dart';
+export 'src/native_diagnostics.dart';
 export 'src/redaction.dart';
 export 'src/session.dart';
 export 'src/transport.dart';

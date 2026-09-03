@@ -6,6 +6,7 @@ import 'package:flutter/widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'event.dart';
+import 'native_diagnostics.dart';
 import 'redaction.dart';
 import 'session.dart';
 import 'transport.dart';
@@ -31,11 +32,15 @@ class CrumbtrailCollectors {
     this.errors = true,
     this.appLifecycle = true,
     this.environment = true,
+    this.nativeDiagnostics = true,
+    this.nativeWatchdog = true,
   });
 
   final bool errors;
   final bool appLifecycle;
   final bool environment;
+  final bool nativeDiagnostics;
+  final bool nativeWatchdog;
 }
 
 class CrumbtrailConfig {
@@ -127,11 +132,21 @@ class Crumbtrail with WidgetsBindingObserver {
     List<String> capabilities = const [],
     int Function()? clock,
     bool startTimer = true,
+    CrumbtrailNativeDiagnosticsPlatform? nativeDiagnosticsPlatform,
+    CrumbtrailDartHangHandoff? nativeWatchdogHandoff,
+    bool Function()? nativeDebuggerAttached,
+    bool suppressNativeWatchdogInDebug = true,
   })  : _transport = transport,
         _store = store ?? MemorySessionStore(),
         _capabilities = capabilities,
         _clock = clock ?? (() => DateTime.now().millisecondsSinceEpoch),
-        _queue = CrumbtrailEventQueue(capacity: config.queueCapacity) {
+        _queue = CrumbtrailEventQueue(capacity: config.queueCapacity),
+        _nativeDiagnosticsPlatform = nativeDiagnosticsPlatform ??
+            MethodChannelCrumbtrailNativeDiagnostics(),
+        _nativeWatchdogHandoff =
+            nativeWatchdogHandoff ?? MemoryCrumbtrailDartHangHandoff(),
+        _nativeDebuggerAttached = nativeDebuggerAttached ?? (() => false),
+        _suppressNativeWatchdogInDebug = suppressNativeWatchdogInDebug {
     final session = CrumbtrailSessionResolver.resolve(
       store: _store,
       idleMs: config.sessionIdleMs,
@@ -140,11 +155,13 @@ class Crumbtrail with WidgetsBindingObserver {
     sessionId = session.id;
 
     final device = deviceInfo ?? describePlatform();
-    unawaited(_transport.startSession(sessionId, compactJson({
-      'service': config.service,
-      'platform': CrumbtrailPlatform.flutter.wireValue,
-      'device': device,
-    })));
+    unawaited(_transport.startSession(
+        sessionId,
+        compactJson({
+          'service': config.service,
+          'platform': CrumbtrailPlatform.flutter.wireValue,
+          'device': device,
+        })));
 
     if (config.collectors.environment) {
       addEvent(
@@ -164,12 +181,18 @@ class Crumbtrail with WidgetsBindingObserver {
   final CrumbtrailEventQueue _queue;
   final List<String> _capabilities;
   final int Function() _clock;
+  final CrumbtrailNativeDiagnosticsPlatform _nativeDiagnosticsPlatform;
+  final CrumbtrailDartHangHandoff _nativeWatchdogHandoff;
+  final bool Function() _nativeDebuggerAttached;
+  final bool _suppressNativeWatchdogInDebug;
 
   late final String sessionId;
   Timer? _flushTimer;
   bool _stopped = false;
   final List<CrumbtrailCaptureGap> _gaps = [];
   final List<void Function()> _cleanups = [];
+  CrumbtrailDartEventLoopWatchdog? _nativeWatchdog;
+  bool _nativeDiagnosticsStarted = false;
 
   List<CrumbtrailCaptureGap> get gaps => List.unmodifiable(_gaps);
   int get droppedEventCount => _queue.dropped;
@@ -193,6 +216,7 @@ class Crumbtrail with WidgetsBindingObserver {
         ingestKey: config.ingestKey,
       ),
       store: SharedPreferencesSessionStore(preferences),
+      nativeWatchdogHandoff: SharedPreferencesDartHangHandoff(preferences),
     );
     if (config.collectors.errors) logger.installErrorHandlers();
     if (config.collectors.appLifecycle) {
@@ -201,8 +225,57 @@ class Crumbtrail with WidgetsBindingObserver {
         () => WidgetsBinding.instance.removeObserver(logger),
       );
     }
+    await logger.startNativeDiagnostics();
     _shared = logger;
     return logger;
+  }
+
+  /// Start optional native diagnostics and the Dart event loop watchdog.
+  ///
+  /// This is separate from the synchronous constructor so plugin registration
+  /// and durable session restoration can finish before platform calls happen.
+  Future<void> startNativeDiagnostics() async {
+    if (_nativeDiagnosticsStarted || _stopped) return;
+    _nativeDiagnosticsStarted = true;
+
+    if (config.collectors.nativeDiagnostics) {
+      try {
+        final nativeCapabilities =
+            await _nativeDiagnosticsPlatform.getCapabilities();
+        addEvent(
+          CrumbtrailEventKind.environment,
+          compactJson({
+            'kind': 'native-capabilities',
+            'native': nativeCapabilities.toJson(),
+          }),
+        );
+        final events = await _nativeDiagnosticsPlatform.drainDiagnostics();
+        for (final event in events) {
+          if (event.kind == CrumbtrailEventKind.nativeHang.wireValue &&
+              _validNativeHang(event.data)) {
+            addEvent(CrumbtrailEventKind.nativeHang, event.data);
+          } else if (event.kind == CrumbtrailEventKind.nativeCrash.wireValue) {
+            addEvent(CrumbtrailEventKind.nativeCrash, event.data);
+          } else if (event.kind == CrumbtrailEventKind.appLifecycle.wireValue) {
+            addEvent(CrumbtrailEventKind.appLifecycle, event.data);
+          }
+        }
+      } on Object {
+        // An unregistered platform plugin is an unavailable capability.
+      }
+    }
+
+    if (config.collectors.nativeWatchdog) {
+      final watchdog = CrumbtrailDartEventLoopWatchdog(
+        handoff: _nativeWatchdogHandoff,
+        debuggerAttached: _nativeDebuggerAttached,
+        suppressInDebug: _suppressNativeWatchdogInDebug,
+        onHang: (data) => addEvent(CrumbtrailEventKind.nativeHang, data),
+      );
+      _nativeWatchdog = watchdog;
+      watchdog.start();
+      _cleanups.add(watchdog.stop);
+    }
   }
 
   // MARK: recording
@@ -318,6 +391,11 @@ class Crumbtrail with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _nativeWatchdog?.resume();
+    } else {
+      _nativeWatchdog?.pause();
+    }
     addEvent(
       CrumbtrailEventKind.appLifecycle,
       {'state': state.name, 'source': 'widgets-binding'},
@@ -414,4 +492,19 @@ class SharedPreferencesSessionStore implements CrumbtrailSessionStore {
 
   @override
   void clear() => unawaited(_preferences.remove(key));
+}
+
+bool _validNativeHang(Map<String, Object?> data) {
+  final source = data['source'];
+  final threshold = data['thresholdMs'];
+  final observed = data['observedDurationMs'];
+  return (source == 'main-thread' || source == 'js' || source == 'dart') &&
+      threshold is int &&
+      threshold >= 0 &&
+      threshold <= const Duration(days: 1).inMilliseconds &&
+      observed is int &&
+      observed >= 0 &&
+      observed <= const Duration(days: 1).inMilliseconds &&
+      data['recovered'] is bool &&
+      data['previousLaunch'] is bool;
 }

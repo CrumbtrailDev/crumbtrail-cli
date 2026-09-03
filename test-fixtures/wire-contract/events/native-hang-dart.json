@@ -1,0 +1,18 @@
+{
+  "t": 1754000000000,
+  "k": "native-hang",
+  "d": {
+    "source": "dart",
+    "thresholdMs": 5000,
+    "observedDurationMs": 7420,
+    "recovered": true,
+    "previousLaunch": false
+  },
+  "schemaVersion": 1,
+  "platform": "flutter",
+  "sdk": {
+    "name": "crumbtrail-fixture",
+    "version": "0.0.0-fixture"
+  },
+  "capabilities": ["app-lifecycle", "device-info"]
+}

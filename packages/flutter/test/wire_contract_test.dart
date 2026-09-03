@@ -36,13 +36,14 @@ void main() {
     CrumbtrailEventKind kind,
     Map<String, Object?> data, {
     CrumbtrailTarget? target,
+    CrumbtrailPlatform platform = CrumbtrailPlatform.ios,
   }) =>
       CrumbtrailEvent.of(
         timestamp: timestamp,
         kind: kind,
         data: data,
         sdk: sdk,
-        platform: CrumbtrailPlatform.ios,
+        platform: platform,
         capabilities: capabilities,
         target: target,
       );
@@ -204,6 +205,23 @@ void main() {
             'CrumbtrailDemo.CheckoutViewController.tap()',
       }),
       'native-hang',
+    );
+  });
+
+  test('Dart native hang event', () {
+    expectMatchesFixture(
+      event(
+        CrumbtrailEventKind.nativeHang,
+        {
+          'source': 'dart',
+          'thresholdMs': 5000,
+          'observedDurationMs': 7420,
+          'recovered': true,
+          'previousLaunch': false,
+        },
+        platform: CrumbtrailPlatform.flutter,
+      ),
+      'native-hang-dart',
     );
   });
 

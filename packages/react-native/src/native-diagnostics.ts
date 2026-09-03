@@ -241,9 +241,23 @@ function normalizeNativeDiagnostic(
   if (record.kind === NATIVE_HANG_EVENT_KIND && !isNativeHangEventData(data)) {
     return undefined;
   }
+  const bounded = boundedRecord(data);
+  // A drain happens during the next launch. Native watchdog evidence is
+  // therefore prior-launch evidence even when the native process recorded it
+  // with its live-process defaults.
+  if (record.kind === NATIVE_HANG_EVENT_KIND) {
+    return {
+      kind: record.kind as ReactNativeNativeDiagnosticKind,
+      data: {
+        ...bounded,
+        recovered: false,
+        previousLaunch: true,
+      },
+    };
+  }
   return {
     kind: record.kind as ReactNativeNativeDiagnosticKind,
-    data: boundedRecord(data),
+    data: bounded,
   };
 }
 

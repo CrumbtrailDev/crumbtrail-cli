@@ -14,7 +14,9 @@
     "./package.json": "./package.json"
   },
   "files": [
-    "dist"
+    "dist",
+    "android",
+    "ios"
   ],
   "scripts": {
     "prepack": "node ../../scripts/assert-publish-safe.mjs",

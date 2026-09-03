@@ -1,0 +1,46 @@
+group 'ai.crumbtrail.flutter'
+version '1.0-SNAPSHOT'
+
+buildscript {
+    ext.kotlin_version = '2.0.21'
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.7.3'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    namespace 'ai.crumbtrail.flutter'
+    compileSdk 35
+
+    defaultConfig {
+        minSdk 21
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    // Flutter supplies this embedding from the host application's Gradle
+    // project. The optional local compile path makes the bridge verifiable
+    // without turning Flutter into a packaged runtime dependency.
+    def flutterRoot = System.getenv('FLUTTER_ROOT')
+    if (flutterRoot != null) {
+        compileOnly files("${flutterRoot}/bin/cache/artifacts/engine/android-arm64/flutter.jar")
+    }
+}

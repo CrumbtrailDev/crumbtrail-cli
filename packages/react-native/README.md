@@ -194,9 +194,24 @@ RN-specific collectors, each capability-gated and independently toggleable via
 - `appState` — foreground/background/terminate transitions
 - `environment` — platform, dimensions, device/OS/app version
 - `navigation` — route changes (requires `@react-navigation/native`)
-- `native-hang` is a shared wire contract for future watchdog observations. This package does not emit it yet.
+- `nativeDiagnostics` — previous-launch native crash, native hang, process-exit, and lifecycle evidence when the autolinked native module is available
+- `jsWatchdog` — foreground JavaScript event-loop stall detection with debugger and development suppression
 - `replayLite` — periodic serialized view-tree snapshot + touch overlay
   (crash screenshot requires `react-native-view-shot`)
+
+Native diagnostics is optional. The JavaScript bridge reports a capability event
+with `supported`, `enabled`, and `observed` states, then continues normally when
+the native module is absent or its platform call is unavailable. The native
+module stores only bounded local handoff and does not perform network requests.
+The package's standard `android/` and `ios/` directories are discovered by the
+React Native CLI autolinker, so no separate native dependency or manual module
+registration is required.
+
+The JavaScript watchdog defaults to a five second threshold and one second
+checks. It pauses when `AppState` is not active, and is disabled in development
+mode or when a remote debugger is detected. Pass
+`collectors: { nativeDiagnostics: false, jsWatchdog: false }` to disable either
+collector.
 
 `crumbtrail-core`'s own DOM-bound collectors (interactions, keystrokes, scroll,
 clipboard, cookies, storage, performance, video, audio, widget) are disabled by
