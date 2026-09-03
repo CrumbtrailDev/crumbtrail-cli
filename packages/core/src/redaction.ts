@@ -831,12 +831,12 @@ function isSensitiveQueryName(key: string): boolean {
 }
 
 /**
- * Diagnostic verification fields are allowed to retain operational strings,
- * but their numeric forms are credentials just like their query equivalents.
- * Match exact compact names so `statusCode` and other operational fields do
- * not inherit the rule merely because they contain `code`.
+ * Verification fields are allowed to retain operational strings, but their
+ * numeric forms are credentials in query, structured JSON, and diagnostic
+ * selections. Match exact compact names so `statusCode` and other operational
+ * fields do not inherit the rule merely because they contain `code`.
  */
-function isSensitiveShortNumericDiagnosticValue(
+function isSensitiveShortNumericValue(
   value: unknown,
   keyName: string | undefined,
 ): boolean {
@@ -3027,7 +3027,7 @@ function diagnosticLeafValue(
     return undefined;
   }
 
-  if (isSensitiveShortNumericDiagnosticValue(value, keyName)) {
+  if (isSensitiveShortNumericValue(value, keyName)) {
     fields.push({
       path,
       reason: "sensitive_short_numeric_field",
@@ -3576,6 +3576,14 @@ function redactStructuredJsonValue(
     fields.push({
       path,
       reason: "sensitive_container_number",
+      action: "redacted",
+    });
+    return redactedShapePlaceholder(value);
+  }
+  if (isSensitiveShortNumericValue(value, keyName)) {
+    fields.push({
+      path,
+      reason: "sensitive_short_numeric_field",
       action: "redacted",
     });
     return redactedShapePlaceholder(value);

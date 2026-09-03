@@ -1233,6 +1233,36 @@ describe("redactNetworkTextBody structured mode", () => {
     expect(parsed.safe).toBe("SAFE_OK");
   });
 
+  it("redacts numeric verification fields in structured bodies without closing operational codes", () => {
+    const result = redactNetworkTextBody(
+      JSON.stringify({
+        code: 1234,
+        invite: "5678",
+        checkout: { code: "2468", state: "pending" },
+        operation: { code: "E_TIMEOUT" },
+        statusCode: 503,
+        operationCode: 200,
+        ordinary: "1234",
+      }),
+      jsonOpts,
+    );
+    const parsed = JSON.parse(result.body!) as Record<string, unknown>;
+
+    expect(parsed.code).toMatchObject({ $redacted: "[REDACTED]" });
+    expect(parsed.invite).toMatchObject({ $redacted: "[REDACTED]" });
+    expect(parsed.checkout).toMatchObject({
+      code: { $redacted: "[REDACTED]" },
+      state: "pending",
+    });
+    expect(parsed.operation).toEqual({ code: "E_TIMEOUT" });
+    expect(parsed.statusCode).toBe(503);
+    expect(parsed.operationCode).toBe(200);
+    expect(parsed.ordinary).toBe("1234");
+    expect(result.body).not.toContain('"code":1234');
+    expect(result.body).not.toContain('"invite":"5678"');
+    expect(result.body).not.toContain('"code":"2468"');
+  });
+
   it("redacts Luhn-passing numeric card values but keeps ordinary numbers", () => {
     const body = JSON.stringify({
       pan: 4111111111111111,
