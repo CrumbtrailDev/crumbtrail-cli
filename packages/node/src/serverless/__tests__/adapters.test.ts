@@ -40,7 +40,7 @@ function terminalEvents(events: readonly ServerlessInvocationEvent[]) {
 }
 
 describe("Node serverless adapters", () => {
-  it("keeps custom fetch seams isolated across AWS, Vercel, and Netlify lifecycles", async () => {
+  it("reuses stable fetch and clock seams across AWS, Vercel, and Netlify lifecycles", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const runtime = {
       instanceId: "ri_runtime_adapters",
@@ -53,11 +53,13 @@ describe("Node serverless adapters", () => {
         return new Response(JSON.stringify(runtime), { status: 201 });
       return new Response("{}", { status: 200 });
     };
+    const now = () => Date.now();
     const options = {
       endpoint: "https://capture.example",
       authToken: "ingest-key",
       service: "orders-api",
       fetchImpl,
+      now,
     };
 
     await withCrumbtrailAwsLambda(async () => ({ statusCode: 201 }), options)(
@@ -84,7 +86,7 @@ describe("Node serverless adapters", () => {
     ).toHaveLength(3);
     expect(
       calls.filter((call) => call.url.includes("/api/runtime/register")),
-    ).toHaveLength(3);
+    ).toHaveLength(1);
     const starts = calls.filter((call) =>
       call.url.endsWith("/api/session/start"),
     );
