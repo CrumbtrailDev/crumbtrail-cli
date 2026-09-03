@@ -774,6 +774,8 @@ export interface FlagBugOptions {
   windowMs?: number;
   tags?: string[];
   voiceBlob?: Blob;
+  /** Artifact name returned by a successful captureScreenshot() call. */
+  visualArtifactName?: string;
 }
 
 /** Options for recording an application error that was caught by host code. */

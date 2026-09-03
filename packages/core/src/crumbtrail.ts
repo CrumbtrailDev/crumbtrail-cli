@@ -105,6 +105,13 @@ import {
   type ApplicationReleaseIdentity,
 } from "./release-identity";
 import { renderedErrorCollector } from "./collectors/rendered-error";
+import {
+  generateReportScreenshotArtifactName,
+  isReportScreenshotArtifactName,
+  prepareReportScreenshot,
+  redactScreenshotMetadata,
+  type CaptureScreenshotOptions,
+} from "./screenshot";
 
 /** Cap on delivery-failure gap records per session. */
 const MAX_DELIVERY_GAP_EVENTS = 3;
@@ -464,6 +471,8 @@ export class Crumbtrail {
   private storageFailureSyncs = new Set<() => void>();
   private sessionId: string;
   private widgetCleanup?: () => void;
+  /** Names uploaded by this live session and therefore eligible for association. */
+  private visualArtifactNames = new Set<string>();
   private stateProviders = new Map<string, () => unknown>();
   private declaredFlags: Record<string, unknown> = {};
   private declaredConfig: Record<string, unknown> = {};
@@ -512,6 +521,8 @@ export class Crumbtrail {
    */
   private pendingSends = new Set<Promise<void>>();
   private sessionMetadataWrite: Promise<void> = Promise.resolve();
+  /** Refuses new explicit screenshot uploads once direct shutdown starts. */
+  private screenshotClosing = false;
   private stopped = false;
   private stopPromise?: Promise<{ sessionId: string }>;
   private identity: CrumbtrailIdentity = {};
@@ -873,6 +884,48 @@ export class Crumbtrail {
     return { bugId };
   }
 
+  /**
+   * Upload one user supplied PNG artifact for the active session.
+   *
+   * This method accepts an already available Blob or an application owned
+   * canvas. It never requests display media and never captures on its own.
+   * The generated name is the only path the caller can associate with a bug.
+   */
+  async captureScreenshot(
+    source: Blob | HTMLCanvasElement,
+    options?: CaptureScreenshotOptions,
+  ): Promise<{ artifactName: string }> {
+    if (
+      this.screenshotClosing ||
+      !this.sessionStarted ||
+      !this.canTransport()
+    )
+      throw new Error("captureScreenshot requires an active session");
+
+    const blob = await prepareReportScreenshot(source, options);
+    if (
+      this.screenshotClosing ||
+      !this.sessionStarted ||
+      !this.canTransport()
+    )
+      throw new Error("captureScreenshot requires an active session");
+    const artifactName = generateReportScreenshotArtifactName();
+    const metadata = redactScreenshotMetadata(options?.metadata);
+    const send = Promise.resolve().then(() =>
+      metadata
+        ? this.transport.sendBlob(artifactName, blob, metadata)
+        : this.transport.sendBlob(artifactName, blob),
+    );
+    this.pendingSends.add(send);
+    void send.then(
+      () => this.pendingSends.delete(send),
+      () => this.pendingSends.delete(send),
+    );
+    await send;
+    this.visualArtifactNames.add(artifactName);
+    return { artifactName };
+  }
+
   private async flagBugFromSource(
     options: InternalFlagOptions | undefined,
     isExplicitBeacon: boolean,
@@ -921,6 +974,12 @@ export class Crumbtrail {
     const reason =
       origin === "auto" && typeof options?.autoReason === "string"
         ? options.autoReason
+        : undefined;
+    const visualArtifactName =
+      typeof options?.visualArtifactName === "string" &&
+      isReportScreenshotArtifactName(options.visualArtifactName) &&
+      this.visualArtifactNames.has(options.visualArtifactName)
+        ? options.visualArtifactName
         : undefined;
 
     // Resolved flag/config state at flag time. The session-start snapshot plus deltas answers
@@ -1060,6 +1119,7 @@ export class Crumbtrail {
           origin,
           ...(note !== undefined ? { note } : {}),
           ...(reason !== undefined ? { reason } : {}),
+          ...(visualArtifactName !== undefined ? { visualArtifactName } : {}),
         },
       },
       { bypassAdmission: finalizerOriginated },
@@ -1825,6 +1885,7 @@ export class Crumbtrail {
     this.sessionId = generateSessionId();
     if (this.sessionStore)
       writePersistedSession(this.sessionStore, this.sessionId);
+    this.visualArtifactNames.clear();
     this.sessionStarted = false;
     this.lifecycleSuspended = false;
     this.sessionMetadataWrite = Promise.resolve();
@@ -2219,6 +2280,7 @@ export class Crumbtrail {
 
   stop(): Promise<{ sessionId: string }> {
     if (this.stopPromise) return this.stopPromise;
+    this.screenshotClosing = true;
     this.stopPromise = this.stopInternal();
     return this.stopPromise;
   }
@@ -2237,7 +2299,7 @@ export class Crumbtrail {
       }
     };
 
-    this.cancelLifecycleTimer();
+  this.cancelLifecycleTimer();
     if (this.lifecycleClosePromise) {
       try {
         await this.lifecycleClosePromise;

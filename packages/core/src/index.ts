@@ -1,5 +1,14 @@
 export { Crumbtrail, PROBE_RESULT_EVENT_KIND } from "./crumbtrail";
 export {
+  REPORT_SCREENSHOT_MAX_BYTES,
+  REPORT_SCREENSHOT_MAX_EDGE,
+  isReportScreenshotArtifactName,
+} from "./screenshot";
+export type {
+  CaptureScreenshotOptions,
+  ReportScreenshotMimeType,
+} from "./screenshot";
+export {
   CRUMBTRAIL_SDK_VERSION,
   readApplicationReleaseIdentity,
 } from "./release-identity";

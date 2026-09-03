@@ -214,6 +214,21 @@ describe("HttpTransport", () => {
     expect(call[1].headers["X-Crumbtrail-Auth"]).toBe("test-token");
   });
 
+  it("uses an image Blob MIME type for typed artifact uploads", async () => {
+    await transport.startSession("ses_test", {});
+    const blob = new Blob(["png bytes"], { type: "image/png" });
+
+    await transport.sendBlob(
+      "report-screenshot-0123456789abcdef0123456789abcdef.png",
+      blob,
+    );
+
+    const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.find((c) =>
+      c[0].includes("/api/blob/"),
+    )!;
+    expect(call[1].headers["Content-Type"]).toBe("image/png");
+  });
+
   it("sends a bug report without a voice blob using a single request", async () => {
     const report = makeReport();
     const events = [{ t: 1000, k: "con", d: { lv: "log", args: ['"hi"'] } }];

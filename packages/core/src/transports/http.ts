@@ -476,7 +476,9 @@ export class HttpTransport implements CrumbtrailTransport {
   ): Promise<void> {
     await this.sessionReady;
     const headers = this.withAuthHeaders({
-      "Content-Type": "application/octet-stream",
+      // Image artifact routes validate the declared type against their generated
+      // name. Keep the historical binary fallback for blobs without a type.
+      "Content-Type": blob.type || "application/octet-stream",
       "X-Session-Id": this.sessionId,
     });
     if (metadata) {

@@ -225,8 +225,33 @@ try {
 }
 ```
 
-Also on the instance: `addEvent`, `recordError`, `registerStateProvider`, `setEnv`,
-`createRequestHeaders`, `pause`, `resume`, `stop`, `getSessionId`.
+Also on the instance: `addEvent`, `recordError`, `registerStateProvider`,
+`setEnv`, `captureScreenshot`, `createRequestHeaders`, `pause`, `resume`,
+`stop`, `getSessionId`.
+
+### Attach a report screenshot
+
+Capture an application owned PNG only after the user has chosen the image or
+the application has rendered the canvas. The SDK does not request display media
+or capture images automatically:
+
+```ts
+const image = await crumbtrail.captureScreenshot(canvas, {
+  metadata: { surface: "checkout" },
+});
+
+await crumbtrail.flagBug({
+  note: "The total is wrong",
+  visualArtifactName: image.artifactName,
+});
+```
+
+`captureScreenshot` accepts a PNG `Blob` with `type: "image/png"` or an
+`HTMLCanvasElement`. Canvas output is encoded as PNG. The generated artifact
+name is the only name accepted for a later association. The image is limited
+to 5 MiB and 4096 pixels on either edge. Metadata is limited to bounded scalar
+values and redacted before upload. The project administrator must enable report
+screenshots before the Cloud endpoint accepts the upload.
 
 `createRequestHeaders()` is for a transport Crumbtrail does not patch, such as a
 WebSocket frame, a server action, or a queue message. It returns the session
