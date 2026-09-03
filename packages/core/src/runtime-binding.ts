@@ -18,6 +18,8 @@ export interface RuntimeBindingClientOptions {
   projectKey?: string;
   fetchImpl?: typeof fetch;
   now?: () => number;
+  /** Internal retirement gate used by the bounded serverless cache. */
+  ready?: Promise<void>;
 }
 
 /** Rotate well before the one day proof lifetime ends. */
@@ -34,6 +36,9 @@ const RUNTIME_BINDING_DEFAULT_RETRY_MS = 30 * 1000;
 
 /** Registration must not hold the first session handshake indefinitely. */
 const RUNTIME_BINDING_REQUEST_TIMEOUT_MS = 3_000;
+
+/** Retiring a binding is best effort and must not hold an invocation forever. */
+const RUNTIME_BINDING_REVOKE_TIMEOUT_MS = 3_000;
 
 /** Keep warm-runtime defaults bounded when one process serves many projects. */
 export const RUNTIME_BINDING_CACHE_MAX_ENTRIES = 32;
@@ -60,6 +65,7 @@ interface RuntimeBindingCacheEntry {
 }
 
 const runtimeBindingCache = new Map<string, RuntimeBindingCacheEntry>();
+const runtimeBindingRetirements = new Map<string, Promise<void>>();
 
 /**
  * Owns one browser tab or Node process binding.
@@ -80,6 +86,9 @@ export class RuntimeBindingClient {
   private retryAfter = 0;
   private requestGeneration = 0;
   private stopped = false;
+  private activeRegistrationController: AbortController | undefined;
+  private retirement: Promise<void> | undefined;
+  private readonly ready: Promise<void>;
 
   constructor(options: RuntimeBindingClientOptions) {
     this.endpoint = options.endpoint.trim().replace(/\/+$/, "");
@@ -88,6 +97,7 @@ export class RuntimeBindingClient {
       options.fetchImpl ??
       (typeof fetch === "function" ? fetch.bind(globalThis) : undefined);
     this.now = options.now ?? Date.now;
+    this.ready = options.ready ?? Promise.resolve();
   }
 
   /**
@@ -96,6 +106,7 @@ export class RuntimeBindingClient {
    * preserved when Cloud is unavailable or does not yet expose this route.
    */
   async getBinding(): Promise<RuntimeBinding | undefined> {
+    await this.ready;
     if (this.stopped || !this.projectKey || !this.endpoint || !this.fetcher)
       return undefined;
 
@@ -136,10 +147,20 @@ export class RuntimeBindingClient {
 
   /** Clear the private proof and prevent late registration responses being adopted. */
   stop(): void {
+    if (this.stopped) return;
     this.stopped = true;
     this.requestGeneration += 1;
+    try {
+      this.activeRegistrationController?.abort();
+    } catch {
+      // A host supplied AbortController must not break retirement.
+    }
+    const previous = this.current;
     this.current = undefined;
     this.retryAfter = 0;
+    this.retirement = previous
+      ? this.revoke(previous).catch(() => undefined)
+      : Promise.resolve();
   }
 
   private async registerOrRotate(
@@ -160,16 +181,27 @@ export class RuntimeBindingClient {
         url.searchParams.set("instanceId", previous.instanceId);
         headers.Authorization = `Bearer ${previous.instanceProof}`;
       }
-      const response = await fetchWithTimeout(
-        fetcher,
-        url.toString(),
-        {
-          method: "POST",
-          ...(Object.keys(headers).length > 0 ? { headers } : {}),
-          cache: "no-store",
-        },
-        RUNTIME_BINDING_REQUEST_TIMEOUT_MS,
-      );
+      const Controller = globalThis.AbortController;
+      const controller =
+        typeof Controller === "function" ? new Controller() : undefined;
+      this.activeRegistrationController = controller;
+      let response: Response;
+      try {
+        response = await fetchWithTimeout(
+          fetcher,
+          url.toString(),
+          {
+            method: "POST",
+            ...(Object.keys(headers).length > 0 ? { headers } : {}),
+            cache: "no-store",
+          },
+          RUNTIME_BINDING_REQUEST_TIMEOUT_MS,
+          controller,
+        );
+      } finally {
+        if (this.activeRegistrationController === controller)
+          this.activeRegistrationController = undefined;
+      }
       if (this.stopped || generation !== this.requestGeneration)
         return undefined;
       if (!response.ok) {
@@ -198,7 +230,7 @@ export class RuntimeBindingClient {
         this.current = undefined;
         this.requestGeneration += 1;
       }
-      this.armRetry();
+      if (!this.stopped) this.armRetry();
       return undefined;
     }
   }
@@ -226,6 +258,37 @@ export class RuntimeBindingClient {
     const expiresAt = this.expiresAtMs(binding);
     return Number.isFinite(expiresAt) && expiresAt > now;
   }
+
+  private async revoke(binding: RuntimeBinding): Promise<void> {
+    const fetcher = this.fetcher;
+    if (!fetcher || !this.projectKey || !this.endpoint) return;
+    try {
+      const url = new URL(
+        `${this.endpoint}/api/runtime/register`,
+        typeof location !== "undefined" ? location.href : "http://localhost/",
+      );
+      url.searchParams.set("projectKey", this.projectKey);
+      url.searchParams.set("instanceId", binding.instanceId);
+      await fetchWithTimeout(
+        fetcher,
+        url.toString(),
+        {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${binding.instanceProof}` },
+          cache: "no-store",
+        },
+        RUNTIME_BINDING_REVOKE_TIMEOUT_MS,
+      );
+    } catch {
+      // Revocation is best effort. Capture already fell back to the old
+      // untargeted contract when stop or eviction cleared this binding.
+    }
+  }
+
+  /** Internal cache seam. The public stop operation remains synchronous. */
+  getRetirement(): Promise<void> {
+    return this.retirement ?? Promise.resolve();
+  }
 }
 
 async function fetchWithTimeout(
@@ -233,12 +296,14 @@ async function fetchWithTimeout(
   input: string,
   init: RequestInit,
   timeoutMs: number,
+  providedController?: AbortController,
 ): Promise<Response> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let timedOut = false;
   const Controller = globalThis.AbortController;
   const controller =
-    typeof Controller === "function" ? new Controller() : undefined;
+    providedController ??
+    (typeof Controller === "function" ? new Controller() : undefined);
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
       timedOut = true;
@@ -297,10 +362,12 @@ export function getCachedRuntimeBindingClient(
     return existing.client;
   }
 
+  const ready = runtimeBindingRetirements.get(key);
   const client = createRuntimeBindingClient({
     ...options,
     endpoint,
     projectKey,
+    ...(ready ? { ready } : {}),
   });
   runtimeBindingCache.set(key, { client, lastUsedAt: now });
   while (runtimeBindingCache.size > RUNTIME_BINDING_CACHE_MAX_ENTRIES) {
@@ -309,6 +376,7 @@ export function getCachedRuntimeBindingClient(
     if (!oldest) break;
     runtimeBindingCache.delete(oldest[0]);
     oldest[1].client.stop();
+    rememberRuntimeBindingRetirement(oldest[0], oldest[1].client);
   }
   return client;
 }
@@ -317,13 +385,37 @@ export function getCachedRuntimeBindingClient(
 export function __resetRuntimeBindingCacheForTests(): void {
   for (const entry of runtimeBindingCache.values()) entry.client.stop();
   runtimeBindingCache.clear();
+  runtimeBindingRetirements.clear();
 }
 
 function pruneRuntimeBindingCache(now: number): void {
   for (const [key, entry] of runtimeBindingCache) {
     if (now - entry.lastUsedAt <= RUNTIME_BINDING_CACHE_TTL_MS) continue;
     entry.client.stop();
+    rememberRuntimeBindingRetirement(key, entry.client);
     runtimeBindingCache.delete(key);
+  }
+}
+
+function rememberRuntimeBindingRetirement(
+  key: string,
+  client: RuntimeBindingClient,
+): void {
+  const clientRetirement = client.getRetirement();
+  const previousRetirement = runtimeBindingRetirements.get(key);
+  const retirement = previousRetirement
+    ? Promise.all([previousRetirement, clientRetirement]).then(() => undefined)
+    : clientRetirement;
+  runtimeBindingRetirements.set(key, retirement);
+  void retirement.then(() => {
+    if (runtimeBindingRetirements.get(key) === retirement)
+      runtimeBindingRetirements.delete(key);
+  });
+  while (runtimeBindingRetirements.size > RUNTIME_BINDING_CACHE_MAX_ENTRIES) {
+    const oldest = runtimeBindingRetirements.keys().next().value as
+      string | undefined;
+    if (!oldest) break;
+    runtimeBindingRetirements.delete(oldest);
   }
 }
 

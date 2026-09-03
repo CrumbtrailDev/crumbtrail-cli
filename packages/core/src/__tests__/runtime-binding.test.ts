@@ -220,10 +220,12 @@ describe("runtime binding client", () => {
     expect(String(failed.mock.calls[0]?.[0])).toContain("project-a");
   });
 
-  it("clears the private binding on stop", async () => {
+  it("clears and revokes the private binding on stop exactly once", async () => {
+    const first = binding(NOW + 86_400_000);
     const fetcher = vi
       .fn()
-      .mockResolvedValue(response(binding(NOW + 86_400_000), 201));
+      .mockResolvedValueOnce(response(first, 201))
+      .mockResolvedValue(response({ ok: true }));
     const client = createRuntimeBindingClient({
       endpoint: ENDPOINT,
       projectKey: "project-key",
@@ -232,8 +234,68 @@ describe("runtime binding client", () => {
     });
     await client.getBinding();
     client.stop();
+    client.stop();
     await expect(client.getBinding()).resolves.toBeUndefined();
+    await client.getRetirement();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    const revoke = fetcher.mock.calls[1];
+    expect(String(revoke?.[0])).toContain(
+      `/api/runtime/register?projectKey=project-key&instanceId=${first.instanceId}`,
+    );
+    expect(revoke?.[1]).toMatchObject({
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${first.instanceProof}` },
+    });
+    expect(revoke?.[1]).not.toHaveProperty("body");
+  });
+
+  it("does not revoke when registration never yielded a valid binding", async () => {
+    const fetcher = vi.fn().mockResolvedValue(response({ ok: false }, 503));
+    const client = createRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => NOW,
+    });
+
+    await expect(client.getBinding()).resolves.toBeUndefined();
+    client.stop();
+    await client.getRetirement();
     expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher.mock.calls[0]?.[1]).toMatchObject({ method: "POST" });
+  });
+
+  it("bounds a failed revoke and keeps its proof out of the request body", async () => {
+    vi.useFakeTimers();
+    const first = binding(NOW + 86_400_000);
+    let resolveLate!: (value: Response) => void;
+    const fetcher = vi.fn(
+      (_input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "DELETE")
+          return new Promise<Response>((resolve) => {
+            resolveLate = resolve;
+          });
+        return Promise.resolve(response(first, 201));
+      },
+    );
+    const client = createRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => NOW,
+    });
+
+    await expect(client.getBinding()).resolves.toEqual(first);
+    client.stop();
+    const retirement = client.getRetirement();
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({ method: "DELETE" });
+    expect(fetcher.mock.calls[1]?.[1]).not.toHaveProperty("body");
+    await vi.advanceTimersByTimeAsync(3_001);
+    await expect(retirement).resolves.toBeUndefined();
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({
+      signal: expect.objectContaining({ aborted: true }),
+    });
+    resolveLate(response({ ok: true }));
   });
 
   it("reuses defaults by endpoint and project while isolating project keys", async () => {
@@ -277,8 +339,9 @@ describe("runtime binding client", () => {
   it("bounds and expires the warm-runtime default cache", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
-    const fetcher = vi.fn(async () =>
-      response(binding(Date.now() + 2 * 86_400_000), 201),
+    const fetcher = vi.fn(
+      async (_input: string | URL | Request, _init?: RequestInit) =>
+        response(binding(Date.now() + 2 * 86_400_000), 201),
     );
     const first = getCachedRuntimeBindingClient({
       endpoint: ENDPOINT,
@@ -293,7 +356,9 @@ describe("runtime binding client", () => {
         fetchImpl: fetcher,
       });
     await expect(first.getBinding()).resolves.toBeUndefined();
-    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(
+      fetcher.mock.calls.filter((call) => call[1]?.method === "POST"),
+    ).toHaveLength(1);
 
     vi.setSystemTime(NOW + RUNTIME_BINDING_CACHE_TTL_MS + 1);
     const expired = getCachedRuntimeBindingClient({
@@ -302,7 +367,87 @@ describe("runtime binding client", () => {
       fetchImpl: fetcher,
     });
     await expect(expired.getBinding()).resolves.toBeTruthy();
-    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(
+      fetcher.mock.calls.filter((call) => call[1]?.method === "POST"),
+    ).toHaveLength(2);
+  });
+
+  it("revokes LRU evictions and waits before same-key reentry", async () => {
+    const active = new Set<string>();
+    const operations: string[] = [];
+    const registrationCounts = new Map<string, number>();
+    let releaseFirstRevoke!: () => void;
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(String(input));
+        const projectKey = url.searchParams.get("projectKey") ?? "unknown";
+        if (init?.method === "DELETE") {
+          const instanceId = url.searchParams.get("instanceId") ?? "unknown";
+          operations.push(`DELETE:${projectKey}`);
+          if (projectKey === "project-0")
+            await new Promise<void>((resolve) => {
+              releaseFirstRevoke = resolve;
+            });
+          active.delete(instanceId);
+          return response({ ok: true });
+        }
+
+        const count = (registrationCounts.get(projectKey) ?? 0) + 1;
+        registrationCounts.set(projectKey, count);
+        const instance = binding(
+          NOW + 2 * 86_400_000,
+          `${projectKey}-${count}`,
+        );
+        active.add(instance.instanceId);
+        operations.push(`POST:${projectKey}`);
+        return response(instance, 201);
+      },
+    );
+    const options = {
+      endpoint: ENDPOINT,
+      fetchImpl: fetcher,
+      now: () => NOW,
+    };
+
+    const first = getCachedRuntimeBindingClient({
+      ...options,
+      projectKey: "project-0",
+    });
+    await first.getBinding();
+    for (
+      let index = 1;
+      index <= RUNTIME_BINDING_CACHE_MAX_ENTRIES;
+      index += 1
+    ) {
+      const client = getCachedRuntimeBindingClient({
+        ...options,
+        projectKey: `project-${index}`,
+      });
+      await client.getBinding();
+    }
+
+    expect(operations).toContain("DELETE:project-0");
+    // The old row remains active only while its bounded revoke is in flight.
+    expect(active.size).toBe(RUNTIME_BINDING_CACHE_MAX_ENTRIES + 1);
+    const reentry = getCachedRuntimeBindingClient({
+      ...options,
+      projectKey: "project-0",
+    });
+    const reentryBinding = reentry.getBinding();
+    await Promise.resolve();
+    expect(registrationCounts.get("project-0")).toBe(1);
+    releaseFirstRevoke();
+    await expect(reentryBinding).resolves.toBeTruthy();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const deleteIndex = operations.indexOf("DELETE:project-0");
+    const reentryPostIndex = operations.lastIndexOf("POST:project-0");
+    expect(deleteIndex).toBeGreaterThanOrEqual(0);
+    expect(reentryPostIndex).toBeGreaterThan(deleteIndex);
+    expect(registrationCounts.get("project-0")).toBe(2);
+    expect(operations).toContain("DELETE:project-1");
+    expect(active.size).toBe(RUNTIME_BINDING_CACHE_MAX_ENTRIES);
   });
 });
 
