@@ -263,7 +263,7 @@ describe("redactDiagnosticFields", () => {
         giftCard: { label: "SAFE_GIFT_CARD", number: "4111111111111111" },
         customerAccount: { status: "SAFE_CUSTOMER_ACCOUNT", number: "1234" },
         accountingPeriod: { status: "SAFE_ACCOUNTING_PERIOD" },
-        accountDetails: { status: "SAFE_ACCOUNT_DETAILS" },
+        accountDetails: { status: "must not retain" },
         card: { label: "SAFE_CARD" },
         account: { status: "SAFE_ACCOUNT" },
       },
@@ -288,7 +288,6 @@ describe("redactDiagnosticFields", () => {
     expect(result.value).toEqual({
       accountingPeriod: { status: "SAFE_ACCOUNTING_PERIOD" },
       account: { status: "SAFE_ACCOUNT" },
-      accountDetails: { status: "SAFE_ACCOUNT_DETAILS" },
       card: { label: "SAFE_CARD" },
       customerAccount: { status: "SAFE_CUSTOMER_ACCOUNT" },
       giftCard: { label: "SAFE_GIFT_CARD" },
@@ -296,6 +295,37 @@ describe("redactDiagnosticFields", () => {
     expect(JSON.stringify(result.value)).not.toContain("must not retain");
     expect(JSON.stringify(result.value)).not.toContain("4111111111111111");
     expect(JSON.stringify(result.value)).not.toContain('"number":"1234"');
+  });
+
+  it("closes sensitive card and account credential containers before traversal", () => {
+    const result = redactDiagnosticFields(
+      {
+        cardSecurityCode: { label: "must not retain" },
+        cardApiKey: { label: "must not retain" },
+        cardPrivateKey: { label: "must not retain" },
+        cardVerificationCode: { label: "must not retain" },
+        accountSecurityCode: { label: "must not retain" },
+        accountPassphrase: { label: "must not retain" },
+      },
+      {
+        diagnosticFields: [
+          "cardSecurityCode.label",
+          "cardApiKey.label",
+          "cardPrivateKey.label",
+          "cardVerificationCode.label",
+          "accountSecurityCode.label",
+          "accountPassphrase.label",
+        ],
+      },
+    );
+
+    expect(result.value).toEqual({});
+    expect(JSON.stringify(result.value)).not.toContain("must not retain");
+    expect(result.metadata?.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: "deny_field" }),
+      ]),
+    );
   });
 
   it("ignores process-wide keepFields while redacting diagnostic URL queries", () => {
@@ -463,14 +493,14 @@ describe("redactDiagnosticFields", () => {
   it("keeps ordinary colon labels instead of treating them as URI schemes", () => {
     const result = redactDiagnosticFields(
       {
-        message: "Error: failed. Version:1.2.3.",
+        message: "Error: failed. Version:1.2.3. Label:ready.",
         status: "Status: pending. Build:2.4.0.",
       },
       { diagnosticFields: ["message", "status"] },
     );
 
     expect(result.value).toEqual({
-      message: "Error: failed. Version:1.2.3.",
+      message: "Error: failed. Version:1.2.3. Label:ready.",
       status: "Status: pending. Build:2.4.0.",
     });
   });
@@ -1064,13 +1094,19 @@ describe("redactNetworkTextBody structured mode", () => {
         creditCardNumber: { label: "must not retain" },
         accountNumber: { status: "must not retain" },
         cardToken: { label: "must not retain" },
+        cardSecurityCode: { label: "must not retain" },
+        cardApiKey: { label: "must not retain" },
+        cardPrivateKey: { label: "must not retain" },
+        cardVerificationCode: { label: "must not retain" },
+        accountSecurityCode: { label: "must not retain" },
+        accountPassphrase: { label: "must not retain" },
         giftCard: { label: "SAFE_GIFT_CARD", number: "4111111111111111" },
         customerAccount: {
           status: "SAFE_CUSTOMER_ACCOUNT",
           number: "1234",
         },
         accountingPeriod: { status: "SAFE_ACCOUNTING_PERIOD" },
-        accountDetails: { status: "SAFE_ACCOUNT_DETAILS" },
+        accountDetails: { status: "must not retain" },
         card: { label: "SAFE_CARD" },
         account: { status: "SAFE_ACCOUNT" },
       }),
@@ -1083,10 +1119,19 @@ describe("redactNetworkTextBody structured mode", () => {
       "creditCardNumber",
       "accountNumber",
       "cardToken",
+      "cardSecurityCode",
+      "cardApiKey",
+      "cardPrivateKey",
+      "cardVerificationCode",
+      "accountSecurityCode",
+      "accountPassphrase",
+      "accountDetails",
     ]) {
       expect(parsed[key]).toMatchObject({ $redacted: "[REDACTED]" });
     }
-    expect(parsed.accountDetails).toEqual({ status: "SAFE_ACCOUNT_DETAILS" });
+    expect(parsed.accountDetails).toMatchObject({
+      $redacted: "[REDACTED]",
+    });
     expect(parsed.accountingPeriod).toEqual({
       status: "SAFE_ACCOUNTING_PERIOD",
     });

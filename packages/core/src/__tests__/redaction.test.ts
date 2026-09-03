@@ -867,8 +867,13 @@ describe("redactUrlsInText — URL query secrets inside free text", () => {
     expect(result.metadata).toBeUndefined();
   });
 
-  it("rejects opaque ftp and ssh schemes without requiring URL punctuation", () => {
-    for (const value of ["ftp:private-file", "ssh:private-host"]) {
+  it("rejects opaque standard and unknown schemes without requiring URL punctuation", () => {
+    for (const value of [
+      "ftp:private-file",
+      "ssh:private-host",
+      "custom:secret",
+      "myapp:abc-def",
+    ]) {
       const result = redactUrlsInText(value, "message", {
         allowOnlyHttpSchemes: true,
       });
@@ -879,6 +884,16 @@ describe("redactUrlsInText — URL query secrets inside free text", () => {
           action: "redacted",
         }),
       );
+
+      const whole = redactUrl(value, "message", {
+        allowOnlyHttpSchemes: true,
+      });
+      expect(whole.value).toContain(REDACTED_VALUE);
+
+      const embedded = redactUrlsInText(`see ${value} now`, "message", {
+        allowOnlyHttpSchemes: true,
+      });
+      expect(embedded.value).toBe(REDACTED_VALUE);
     }
   });
 

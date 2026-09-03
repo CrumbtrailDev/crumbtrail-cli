@@ -1488,9 +1488,62 @@ const URL_SPECIAL_SCHEMES = new Set([
   "tel:",
   "urn:",
 ]);
+const DIAGNOSTIC_LABEL_SCHEMES = new Set([
+  "build",
+  "cause",
+  "code",
+  "detail",
+  "details",
+  "error",
+  "event",
+  "info",
+  "kind",
+  "message",
+  "mode",
+  "msg",
+  "name",
+  "note",
+  "operation",
+  "phase",
+  "query",
+  "reason",
+  "result",
+  "source",
+  "state",
+  "status",
+  "step",
+  "type",
+  "version",
+  "warning",
+]);
+const DIAGNOSTIC_SCHEME_PAYLOAD_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
 
-function hasOpaqueUrlPayloadPunctuation(payload: string): boolean {
-  return !/\s/.test(payload) && /[/?#@%=&]/.test(payload);
+function firstDiagnosticSchemePayload(payload: string): string | undefined {
+  return payload.match(/^[^\s"'`<>\\{}()[\]|^]+/)?.[0];
+}
+
+/**
+ * Ordinary diagnostics use a small set of colon-delimited labels. Unknown
+ * schemes with a bare payload are treated as opaque URLs unless the payload
+ * has sentence punctuation, which preserves labels such as `Error:failed.`
+ * while denying values such as `custom:secret` and `myapp:abc-def`.
+ */
+function isOrdinaryDiagnosticColonLabel(
+  schemeName: string,
+  payload: string,
+): boolean {
+  const candidate = firstDiagnosticSchemePayload(payload);
+  if (candidate === undefined) return true;
+  const scheme = schemeName.toLowerCase();
+  if (DIAGNOSTIC_LABEL_SCHEMES.has(scheme)) return true;
+  const withoutTrailingPunctuation = candidate.replace(
+    URL_TRAILING_PUNCT_RE,
+    "",
+  );
+  return (
+    URL_TRAILING_PUNCT_RE.test(candidate) &&
+    DIAGNOSTIC_SCHEME_PAYLOAD_RE.test(withoutTrailingPunctuation)
+  );
 }
 
 function isUrlLikeValue(value: string): boolean {
@@ -1503,15 +1556,16 @@ function isUrlLikeValue(value: string): boolean {
   )
     return true;
 
-  const scheme = /^[a-z][a-z\d+.-]*:/i.exec(trimmed)?.[0]?.toLowerCase();
+  const schemeMatch = /^([a-z][a-z\d+.-]*):/i.exec(trimmed);
+  const scheme = schemeMatch?.[0]?.toLowerCase();
   if (!scheme) return false;
   if (trimmed.slice(scheme.length).startsWith("//")) return true;
   if (URL_SPECIAL_SCHEMES.has(scheme)) return true;
 
-  // `status: failed` is a label, not a URI. An unknown opaque URI is only
-  // treated as URL-like when its payload has URI punctuation and no whitespace.
+  // `status: failed` is a label, not a URI. An unknown opaque value is a URL
+  // candidate unless it matches the narrow ordinary-label grammar above.
   const payload = trimmed.slice(scheme.length);
-  return hasOpaqueUrlPayloadPunctuation(payload);
+  return !isOrdinaryDiagnosticColonLabel(schemeMatch?.[1] ?? "", payload);
 }
 
 function hasUnsafeDiagnosticUrlScheme(value: string): boolean {
@@ -1521,11 +1575,12 @@ function hasUnsafeDiagnosticUrlScheme(value: string): boolean {
 
     const matchEnd = (match.index ?? 0) + match[0].length;
     const remainder = value.slice(matchEnd);
-    const payload = remainder.match(/^[^\s"'`<>\\{}()[\]|^]+/)?.[0];
+    const payload = firstDiagnosticSchemePayload(remainder);
     if (
       remainder.startsWith("//") ||
       URL_SPECIAL_SCHEMES.has(`${scheme}:`) ||
-      (payload !== undefined && hasOpaqueUrlPayloadPunctuation(payload))
+      (payload !== undefined &&
+        !isOrdinaryDiagnosticColonLabel(match[1] ?? "", payload))
     )
       return true;
   }
@@ -2388,64 +2443,31 @@ function isApplicationDeniedName(
  * `card` and `account` also occur in ordinary compound containers such as
  * `giftCard`, `customerAccount`, and `accountingPeriod`. Those containers are
  * useful diagnostic structure, so the object token alone must not close them.
- * Names that add a value or credential token remain closed.
+ * Compound exceptions are deliberately allowlisted. A broad substring rule
+ * would open names such as `cardSecurityCode` and `accountPassphrase`.
  */
 const STRUCTURED_OPENABLE_CONTAINER_TOKENS = new Set(["card", "account"]);
-const STRUCTURED_CLOSED_CONTAINER_SUFFIXES = [
-  "number",
-  "num",
-  "token",
-  "password",
-  "passcode",
-  "secret",
-  "credential",
-  "credentials",
-  "auth",
-  "authorization",
-  "key",
-  "pan",
-  "cvv",
-  "cvc",
-  "pin",
-  "code",
-];
+const STRUCTURED_OPENABLE_COMPOUND_CONTAINER_NAMES = new Set([
+  "giftcard",
+  "customeraccount",
+  "accountingperiod",
+]);
 
 /**
  * May a container under this name be walked into rather than dropped whole?
  *
- * A compound name is open only when the card/account token is the sole
- * sensitive signal. This preserves ordinary business containers while keeping
- * explicit value names such as `cardNumber`, `cardToken`, and `accountNumber`
- * closed. The caller still applies application denyFields absolutely.
+ * Only exact names in the ordinary-container allowlist are opened. This
+ * preserves the known business containers while keeping every other compound
+ * value or credential name closed. The caller still applies application
+ * denyFields absolutely.
  */
 function isOpenableHeuristicName(name: string | undefined): boolean {
   if (!name) return false;
   const compact = compactFieldName(name);
-  const containerToken = [...STRUCTURED_OPENABLE_CONTAINER_TOKENS].find(
-    (token) => compact.includes(token),
+  return (
+    STRUCTURED_OPENABLE_CONTAINER_TOKENS.has(compact) ||
+    STRUCTURED_OPENABLE_COMPOUND_CONTAINER_NAMES.has(compact)
   );
-  if (!containerToken) return false;
-  if (compact === containerToken) return true;
-
-  const sensitiveSuffix = STRUCTURED_CLOSED_CONTAINER_SUFFIXES.some((suffix) =>
-    compact.includes(`${containerToken}${suffix}`),
-  );
-  if (sensitiveSuffix) return false;
-
-  // A second built-in deny token means this is more than an object token. For
-  // example, `accountPassword` and `cardCredentials` must not be opened.
-  if (
-    STRUCTURED_DENY_NAME_TOKENS.some(
-      (token) =>
-        !STRUCTURED_OPENABLE_CONTAINER_TOKENS.has(token) &&
-        compact.includes(token),
-    )
-  )
-    return false;
-  if (fieldNameWords(name).some((word) => STRUCTURED_DENY_WORD_RE.test(word)))
-    return false;
-
-  return true;
 }
 
 function isStructuredDenyName(
