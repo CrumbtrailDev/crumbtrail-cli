@@ -1516,17 +1516,15 @@ const DIAGNOSTIC_LABEL_SCHEMES = new Set([
   "version",
   "warning",
 ]);
-const DIAGNOSTIC_SCHEME_PAYLOAD_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
-
 function firstDiagnosticSchemePayload(payload: string): string | undefined {
   return payload.match(/^[^\s"'`<>\\{}()[\]|^]+/)?.[0];
 }
 
 /**
- * Ordinary diagnostics use a small set of colon-delimited labels. Unknown
- * schemes with a bare payload are treated as opaque URLs unless the payload
- * has sentence punctuation, which preserves labels such as `Error:failed.`
- * while denying values such as `custom:secret` and `myapp:abc-def`.
+ * Ordinary diagnostics use a small set of explicit colon-delimited labels.
+ * Unknown schemes are opaque values even when their payload ends with sentence
+ * punctuation. This keeps a value such as `custom:secret.` from being treated
+ * as prose merely because it looks like the end of a sentence.
  */
 function isOrdinaryDiagnosticColonLabel(
   schemeName: string,
@@ -1535,15 +1533,7 @@ function isOrdinaryDiagnosticColonLabel(
   const candidate = firstDiagnosticSchemePayload(payload);
   if (candidate === undefined) return true;
   const scheme = schemeName.toLowerCase();
-  if (DIAGNOSTIC_LABEL_SCHEMES.has(scheme)) return true;
-  const withoutTrailingPunctuation = candidate.replace(
-    URL_TRAILING_PUNCT_RE,
-    "",
-  );
-  return (
-    URL_TRAILING_PUNCT_RE.test(candidate) &&
-    DIAGNOSTIC_SCHEME_PAYLOAD_RE.test(withoutTrailingPunctuation)
-  );
+  return DIAGNOSTIC_LABEL_SCHEMES.has(scheme);
 }
 
 function isUrlLikeValue(value: string): boolean {
@@ -2984,6 +2974,10 @@ function isDiagnosticPathKeyAllowed(
   denyFields: readonly string[] | undefined,
 ): boolean {
   if (isDiagnosticReservedKey(key)) return false;
+  // Match structured JSON key handling. A selected path may name an own
+  // property, but a token-shaped property name is itself sensitive and must
+  // not reach the output or redaction metadata.
+  if (sanitizeKeyName(key) !== key) return false;
   if (isApplicationDeniedName(key, denyFields)) return false;
   return true;
 }
@@ -3488,6 +3482,7 @@ type StructuredContainerContext = "card" | "account" | undefined;
 const STRUCTURED_CONTAINER_NUMBER_NAMES = new Set([
   "accountnumber",
   "cardnumber",
+  "num",
   "number",
   "pan",
   "primaryaccountnumber",

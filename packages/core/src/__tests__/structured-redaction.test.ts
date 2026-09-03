@@ -469,15 +469,17 @@ describe("redactDiagnosticFields", () => {
   it("redacts short numbers inside confusable card and account containers", () => {
     const result = redactDiagnosticFields(
       {
-        сard: { brand: "visa", number: "4242" },
-        аccount: { status: "active", number: "1234" },
+        сard: { brand: "visa", number: "4242", num: "5678" },
+        аccount: { status: "active", number: "1234", num: "9012" },
       },
       {
         diagnosticFields: [
           "сard.brand",
           "сard.number",
+          "сard.num",
           "аccount.status",
           "аccount.number",
+          "аccount.num",
         ],
       },
     );
@@ -488,21 +490,61 @@ describe("redactDiagnosticFields", () => {
     });
     expect(JSON.stringify(result.value)).not.toContain("4242");
     expect(JSON.stringify(result.value)).not.toContain("1234");
+    expect(JSON.stringify(result.value)).not.toContain("5678");
+    expect(JSON.stringify(result.value)).not.toContain("9012");
   });
 
   it("keeps ordinary colon labels instead of treating them as URI schemes", () => {
     const result = redactDiagnosticFields(
       {
-        message: "Error: failed. Version:1.2.3. Label:ready.",
+        message: "Error: failed. Version:1.2.3. State:ready.",
         status: "Status: pending. Build:2.4.0.",
       },
       { diagnosticFields: ["message", "status"] },
     );
 
     expect(result.value).toEqual({
-      message: "Error: failed. Version:1.2.3. Label:ready.",
+      message: "Error: failed. Version:1.2.3. State:ready.",
       status: "Status: pending. Build:2.4.0.",
     });
+  });
+
+  it("rejects unknown opaque schemes even when punctuation makes them sentence shaped", () => {
+    const result = redactDiagnosticFields(
+      {
+        status: "custom:secret.",
+        message: "failed at myapp:abc-def,",
+        safe: "Status: pending.",
+      },
+      { diagnosticFields: ["status", "message", "safe"] },
+    );
+
+    expect(result.value).toEqual({
+      message: "[REDACTED]",
+      safe: "Status: pending.",
+    });
+    expect(JSON.stringify(result.value)).not.toContain("secret");
+    expect(JSON.stringify(result.value)).not.toContain("abc-def");
+    expect(result.metadata?.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ reason: "unsafe_url_scheme" }),
+      ]),
+    );
+  });
+
+  it("rejects selected token shaped property names before traversal", () => {
+    const tokenKey = "sk_live_4eC39HqLyjWDarjt";
+    const result = redactDiagnosticFields(
+      {
+        [tokenKey]: "must not retain",
+        safe: "SAFE_OK",
+      },
+      { diagnosticFields: [tokenKey, "safe"] },
+    );
+
+    expect(result.value).toEqual({ safe: "SAFE_OK" });
+    expect(JSON.stringify(result.value)).not.toContain(tokenKey);
+    expect(JSON.stringify(result.value)).not.toContain("must not retain");
   });
 
   it("redacts relative URL query secrets in diagnostic prose", () => {
@@ -1104,6 +1146,7 @@ describe("redactNetworkTextBody structured mode", () => {
         customerAccount: {
           status: "SAFE_CUSTOMER_ACCOUNT",
           number: "1234",
+          num: "5678",
         },
         accountingPeriod: { status: "SAFE_ACCOUNTING_PERIOD" },
         accountDetails: { status: "must not retain" },
@@ -1140,6 +1183,11 @@ describe("redactNetworkTextBody structured mode", () => {
     expect(parsed.customerAccount).toMatchObject({
       status: "SAFE_CUSTOMER_ACCOUNT",
       number: { $redacted: "[REDACTED]" },
+    });
+    expect(
+      (parsed.customerAccount as Record<string, unknown>).num,
+    ).toMatchObject({
+      $redacted: "[REDACTED]",
     });
     expect(parsed.giftCard).toMatchObject({
       label: "SAFE_GIFT_CARD",

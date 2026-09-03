@@ -870,9 +870,13 @@ describe("redactUrlsInText — URL query secrets inside free text", () => {
   it("rejects opaque standard and unknown schemes without requiring URL punctuation", () => {
     for (const value of [
       "ftp:private-file",
+      "ftp:private-file.",
       "ssh:private-host",
+      "ssh:private-host!",
       "custom:secret",
+      "custom:secret.",
       "myapp:abc-def",
+      "myapp:abc-def,",
     ]) {
       const result = redactUrlsInText(value, "message", {
         allowOnlyHttpSchemes: true,
