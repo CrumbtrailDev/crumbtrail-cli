@@ -52,7 +52,8 @@ import {
 } from "./runtime-metrics";
 import {
   createHmacRaceEvidenceResolver,
-  type RaceEvidenceOptions,
+  readInstrumentRaceEvidence,
+  type RaceEvidenceInstrumentationOptions,
 } from "./race-evidence";
 
 /**
@@ -194,9 +195,11 @@ export interface AutoCaptureOptions {
   /**
    * Opt in to bounded cross session DB and cache race evidence. A strong
    * ingest credential is used only inside an HMAC resolver. Without one,
-   * provide fixed format opaque identifiers through `identifiers` or `resolve`.
+   * provide fixed format opaque identifiers through a per-operation `resolve`.
+   * Static `identifiers` are reserved for direct one-event builders and are
+   * ignored by this multi-operation capture path.
    */
-  raceEvidence?: RaceEvidenceOptions;
+  raceEvidence?: RaceEvidenceInstrumentationOptions;
   /**
    * When true (default) record Node runtime warnings (`process.on("warning")`)
    * as `backend.warning` events. This is the only path by which a
@@ -1489,18 +1492,22 @@ export async function autoCapture(
 /**
  * Resolve the process credential once at startup. The returned resolver closes
  * over the credential and exposes only fixed length digests to event builders.
- * Weak or absent credentials leave the application's opaque identifier path in
- * force and never become an event field.
+ * Weak or absent credentials leave the application's per operation resolver
+ * path in force and never become an event field. Static identifiers are not
+ * accepted by this multi operation capture path.
  */
 function resolveRaceEvidenceOptions(
-  configured: RaceEvidenceOptions | undefined,
+  configured: RaceEvidenceInstrumentationOptions | undefined,
   authToken: string | undefined,
-): RaceEvidenceOptions | undefined {
-  if (!configured?.enabled || configured.identifiers || configured.resolve) {
-    return configured;
+): RaceEvidenceInstrumentationOptions | undefined {
+  const perOperation = readInstrumentRaceEvidence({
+    raceEvidence: configured,
+  });
+  if (!perOperation?.enabled || perOperation.resolve) {
+    return perOperation;
   }
   const resolver = createHmacRaceEvidenceResolver(authToken);
-  return resolver ? { ...configured, resolve: resolver } : configured;
+  return resolver ? { ...perOperation, resolve: resolver } : perOperation;
 }
 
 /** Normalize the held-event cap, refusing a negative or non-finite value. */

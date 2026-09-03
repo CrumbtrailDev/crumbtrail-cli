@@ -13,6 +13,7 @@ import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import { boundColumnRow, type DbValueBounds } from "./diff-event";
 import {
   buildRaceEvidence,
+  isRaceEvidenceInputEligible,
   readOptimisticVersion,
   type RaceEvidenceOptions,
 } from "../race-evidence";
@@ -43,6 +44,8 @@ export interface BuildDbReadEventInput {
   valueBounds?: DbValueBounds;
   /** Explicit opt in configuration for bounded cross session race evidence. */
   raceEvidence?: RaceEvidenceOptions;
+  /** Configured DB primary-key columns used to require a complete identity. */
+  primaryKeyColumns?: readonly string[];
 }
 
 export interface BuildDbReadBulkEventInput {
@@ -99,13 +102,23 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
       ...(Number.isInteger(shape.offset) ? { offset: shape.offset } : {}),
     };
   }
-  if (!input.transactionId && input.pk !== null) {
+  if (
+    !input.transactionId &&
+    isRaceEvidenceInputEligible({
+      surface: "db.read",
+      operation: "read",
+      table: input.table,
+      primaryKey: input.pk,
+      primaryKeyColumns: input.primaryKeyColumns,
+    })
+  ) {
     const versionField = input.raceEvidence?.optimisticVersionField;
     const raceEvidence = buildRaceEvidence(input.raceEvidence, {
       surface: "db.read",
       operation: "read",
       table: input.table,
       primaryKey: input.pk,
+      primaryKeyColumns: input.primaryKeyColumns,
       resourceSubject: input.raceEvidence?.resourceSubject,
       currentVersion: readOptimisticVersion(input.row, versionField),
     });

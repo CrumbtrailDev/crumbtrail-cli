@@ -11,6 +11,7 @@ import {
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
+import { readInstrumentRaceEvidence } from "../race-evidence";
 
 const ENGINE = "mongodb" as DbEngine;
 const INSTRUMENTED_CLIENTS = new WeakSet<object>();
@@ -252,6 +253,9 @@ function emitPartialMutation(
       pk: upsertPk ?? exactPk,
       rowCount,
       requestId,
+      primaryKeyColumns: ["_id"],
+      raceEvidence:
+        rowCount === 1 ? readInstrumentRaceEvidence(options) : undefined,
       imageUnavailable:
         commandName === "update"
           ? {
@@ -295,6 +299,9 @@ function emitFindAndModify(
       table,
       pk,
       requestId,
+      primaryKeyColumns: ["_id"],
+      raceEvidence:
+        changed === 1 ? readInstrumentRaceEvidence(options) : undefined,
       ...(row && (isDelete || !returnsAfter) ? { before: row } : {}),
       ...(row && !isDelete && returnsAfter ? { after: row } : {}),
       ...(!row

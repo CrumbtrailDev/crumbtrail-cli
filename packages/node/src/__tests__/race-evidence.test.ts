@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type {
   BugEvent,
@@ -144,6 +146,120 @@ describe("race evidence contract", () => {
     ).toBeUndefined();
   });
 
+  it("rejects inherited unknown fields and non plain identifier prototypes", () => {
+    const inherited = Object.create({ extra: opaque("x") }) as {
+      entityHash: string;
+    };
+    inherited.entityHash = opaque("e");
+    expect(
+      buildRaceEvidence(
+        { enabled: true, identifiers: inherited },
+        { surface: "cache", operation: "get", cacheKey: "key" },
+      ),
+    ).toBeUndefined();
+
+    class Identifier {
+      entityHash = opaque("e");
+    }
+    expect(
+      buildRaceEvidence(
+        { enabled: true, identifiers: new Identifier() },
+        { surface: "cache", operation: "get", cacheKey: "key" },
+      ),
+    ).toBeUndefined();
+  });
+
+  it("supports common BSON ObjectId values without calling plain object lookalikes", () => {
+    class ObjectId {
+      constructor(private readonly value: string) {}
+
+      toHexString(): string {
+        return this.value;
+      }
+    }
+    const credential = "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef";
+    const resolver = createHmacRaceEvidenceResolver(credential)!;
+    const first = resolver({
+      surface: "db.read",
+      operation: "read",
+      table: "orders",
+      primaryKey: { _id: new ObjectId("0123456789abcdef01234567") },
+    });
+    const second = resolver({
+      surface: "db.read",
+      operation: "read",
+      table: "orders",
+      primaryKey: { _id: new ObjectId("0123456789ABCDEF01234567") },
+    });
+    expect(first?.entityHash).toBe(second?.entityHash);
+
+    let called = false;
+    const lookalike = {
+      toHexString: () => {
+        called = true;
+        return "0123456789abcdef01234567";
+      },
+    };
+    expect(
+      resolver({
+        surface: "db.read",
+        operation: "read",
+        table: "orders",
+        primaryKey: { _id: lookalike },
+      }),
+    ).toBeUndefined();
+    expect(called).toBe(false);
+  });
+
+  it("requires a complete nonempty configured DB primary key", () => {
+    const identifiers = {
+      enabled: true,
+      identifiers: { entityHash: opaque("e") },
+    };
+    const base = {
+      op: "update" as const,
+      table: "orders",
+      after: { tenantId: "t1", id: 1 },
+      requestId: "req-pk",
+      raceEvidence: identifiers,
+      primaryKeyColumns: ["tenantId", "id"],
+    };
+    expect(
+      buildDbDiffEvent({ ...base, pk: { tenantId: "t1" } }).d.raceEvidence,
+    ).toBeUndefined();
+    expect(
+      buildDbDiffEvent({ ...base, pk: { tenantId: "t1", id: undefined } }).d
+        .raceEvidence,
+    ).toBeUndefined();
+    expect(
+      buildDbDiffEvent({ ...base, pk: { tenantId: "t1", id: 1 } }).d
+        .raceEvidence,
+    ).toEqual({ entityHash: opaque("e") });
+  });
+
+  it("keeps canonical object identity stable across process locale settings", () => {
+    const packageRoot = fileURLToPath(new URL("../..", import.meta.url));
+    const child = `
+      import { createHmacRaceEvidenceResolver } from "./src/race-evidence.ts";
+      const resolver = createHmacRaceEvidenceResolver("ctkey_0123456789abcdef0123456789abcdef0123456789abcdef");
+      const primaryKey = { "\\uE000": "a", Z: "b", "\\u00E9": "c", e: "d" };
+      process.stdout.write(JSON.stringify(resolver({ surface: "db.read", operation: "read", table: "orders", primaryKey })));
+    `;
+    const outputs = ["C", "en_US.UTF-8", "tr_TR.UTF-8", "sv_SE.UTF-8"].map(
+      (locale) =>
+        execFileSync(
+          process.execPath,
+          ["--experimental-strip-types", "--input-type=module", "-e", child],
+          {
+            cwd: packageRoot,
+            env: { ...process.env, LANG: locale, LC_ALL: locale },
+            encoding: "utf8",
+          },
+        ),
+    );
+    expect(new Set(outputs).size).toBe(1);
+  });
+
   it("seals accepted application supplied identifiers", () => {
     const evidence = buildRaceEvidence(
       {
@@ -270,7 +386,7 @@ describe("race evidence contract", () => {
         requestId: "req-bulk-adapter",
         captureReads: true,
         emit: (event) => events.push(event),
-        raceEvidence: identifiers,
+        raceEvidence: identifiers as never,
       },
     );
 
@@ -326,7 +442,10 @@ describe("race evidence contract", () => {
       {
         requestId: "req-cache",
         emit: (event) => cacheEvents.push(event),
-        raceEvidence: identifiers,
+        raceEvidence: {
+          enabled: true,
+          resolve: () => identifiers.identifiers,
+        },
       },
     );
     await expect(cache.get("orders:42")).resolves.toBe("private value");
@@ -337,7 +456,11 @@ describe("race evidence contract", () => {
       requestId: "req-db",
       captureReads: true,
       emit: (event) => dbEvents.push(event),
-      raceEvidence: { ...identifiers, optimisticVersionField: "version" },
+      raceEvidence: {
+        enabled: true,
+        optimisticVersionField: "version",
+        resolve: () => identifiers.identifiers,
+      },
     });
     await expect(
       db.query("SELECT * FROM orders WHERE id = $1", [42]),
@@ -347,5 +470,49 @@ describe("race evidence contract", () => {
     });
     const read = dbEvents.find((event) => event.k === "db.read");
     expect(read?.d.raceEvidence).toEqual({ entityHash: opaque("e") });
+  });
+
+  it("does not reuse static identifiers on a multi-operation cache wrapper", async () => {
+    const events: BugEvent[] = [];
+    const cache = instrumentIoredisClient(
+      {
+        async get(key: string) {
+          return key;
+        },
+      },
+      {
+        requestId: "req-static",
+        emit: (event) => events.push(event),
+        raceEvidence: {
+          enabled: true,
+          identifiers: { entityHash: opaque("e") },
+        } as never,
+      },
+    );
+    const get = (cache as unknown as { get(key: string): Promise<unknown> })
+      .get;
+    await get.call(cache, "orders:1");
+    await get.call(cache, "orders:2");
+    expect(events.every((event) => event.d.raceEvidence === undefined)).toBe(
+      true,
+    );
+  });
+
+  it("does not reuse static identifiers on a multi-operation DB wrapper", async () => {
+    const events: BugEvent[] = [];
+    const db = instrumentPgClient(fakePgClient([{ id: 1 }]), {
+      requestId: "req-static-db",
+      captureReads: true,
+      emit: (event) => events.push(event),
+      raceEvidence: {
+        enabled: true,
+        identifiers: { entityHash: opaque("e") },
+      } as never,
+    });
+    await db.query("SELECT * FROM orders WHERE id = 1");
+    await db.query("SELECT * FROM orders WHERE id = 2");
+    expect(events.every((event) => event.d.raceEvidence === undefined)).toBe(
+      true,
+    );
   });
 });

@@ -32,7 +32,11 @@ import {
   DB_STATEMENT_SHAPE_LABEL,
 } from "./statement-event";
 import { buildDbTransactionEvent } from "./transaction-event";
-import type { RaceEvidenceOptions } from "../race-evidence";
+import {
+  readInstrumentRaceEvidence,
+  type RaceEvidenceOptions,
+  type RaceEvidenceInstrumentationOptions,
+} from "../race-evidence";
 
 /**
  * Engine-agnostic emission pipeline shared by every DB adapter. All functions here are synchronous
@@ -112,7 +116,9 @@ export interface InstrumentDbClientOptions {
   durationNow?: () => number;
   sessionStartedAt?: number | Date;
   /** Explicit opt in configuration for bounded cross session race evidence. */
-  raceEvidence?: RaceEvidenceOptions;
+  raceEvidence?: RaceEvidenceInstrumentationOptions;
+  /** Resolve race evidence configuration when each event is built. */
+  getRaceEvidence?: () => RaceEvidenceOptions | undefined;
 }
 
 export interface PoolCheckoutCapture {
@@ -765,7 +771,10 @@ export function emitDbDiffEvents(input: {
       // A row from a bulk statement is not a single entity operation. Omit
       // race evidence even when the row cap leaves one image to emit.
       raceEvidence:
-        rowCount === 1 && rows.length === 1 ? options.raceEvidence : undefined,
+        rowCount === 1 && rows.length === 1
+          ? readInstrumentRaceEvidence(options)
+          : undefined,
+      primaryKeyColumns: options.pkColumns?.[table] ?? ["id"],
       ...(op === "delete"
         ? { before: row }
         : { after: row, before: beforeByPk?.get(pkKey(pk)) }),
@@ -1096,8 +1105,9 @@ export function emitDbReadEvents(input: {
           valueBounds: input.valueBounds,
           raceEvidence:
             rowCount === 1 && rows.length === 1
-              ? options.raceEvidence
+              ? readInstrumentRaceEvidence(options)
               : undefined,
+          primaryKeyColumns: options.pkColumns?.[table] ?? ["id"],
         }),
       )
     ) {

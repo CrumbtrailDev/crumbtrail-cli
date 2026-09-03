@@ -24,6 +24,8 @@ export interface RaceEvidenceResolverInput {
   operation: string;
   table?: string;
   primaryKey?: Record<string, unknown> | null;
+  /** Configured DB primary-key columns, when the adapter knows them. */
+  primaryKeyColumns?: readonly string[];
   cacheKey?: unknown;
   resourceSubject?: string;
   currentVersion?: unknown;
@@ -49,6 +51,16 @@ export interface RaceEvidenceOptions {
   /** Resolver used when identifiers are not supplied. */
   resolve?: RaceEvidenceResolver;
 }
+
+/**
+ * Configuration accepted by multi-operation instrumentation. Static identifiers
+ * are intentionally excluded because one client can issue operations for many
+ * entities. Use `resolve` for those paths.
+ */
+export type RaceEvidenceInstrumentationOptions = Omit<
+  RaceEvidenceOptions,
+  "identifiers"
+>;
 
 /** Runtime sealed form. Entity identity is mandatory after validation. */
 export type SealedRaceEvidence = Readonly<
@@ -147,25 +159,26 @@ export function buildRaceEvidence(
   options: RaceEvidenceOptions | undefined,
   input: RaceEvidenceResolverInput,
 ): SealedRaceEvidence | undefined {
-  if (!options?.enabled || !isRaceEvidenceInputEligible(input)) return undefined;
+  try {
+    if (!options?.enabled || !isRaceEvidenceInputEligible(input))
+      return undefined;
 
-  let candidate: RaceEvidenceIdentifiers | undefined;
-  if (options.identifiers !== undefined) {
-    candidate = options.identifiers;
-  } else if (options.resolve) {
-    try {
+    let candidate: RaceEvidenceIdentifiers | undefined;
+    if (options.identifiers !== undefined) {
+      candidate = options.identifiers;
+    } else if (options.resolve) {
       candidate = options.resolve({
         ...input,
         ...(options.resourceSubject
           ? { resourceSubject: options.resourceSubject }
           : {}),
       });
-    } catch {
-      return undefined;
     }
+    if (!candidate) return undefined;
+    return sanitizeRaceEvidence(candidate);
+  } catch {
+    return undefined;
   }
-  if (!candidate) return undefined;
-  return sanitizeRaceEvidence(candidate);
 }
 
 /** Return the configured version field only when it is a safe own property name. */
@@ -192,6 +205,28 @@ export function isRaceEligibleCacheOperation(operation: string): boolean {
   return ELIGIBLE_CACHE_OPERATIONS.has(operation);
 }
 
+/**
+ * Resolve configuration at event-build time. This keeps clients instrumented
+ * before `autoCapture` connected to the later active configuration.
+ *
+ * Static identifiers are deliberately dropped at this boundary. They are safe
+ * only when a caller builds one event directly and can tie the value to that
+ * event. A long-lived wrapper must resolve one operation at a time.
+ */
+export function readInstrumentRaceEvidence(options: {
+  raceEvidence?: RaceEvidenceOptions;
+  getRaceEvidence?: () => RaceEvidenceOptions | undefined;
+}): RaceEvidenceInstrumentationOptions | undefined {
+  try {
+    const configured = options.getRaceEvidence?.() ?? options.raceEvidence;
+    if (!configured) return undefined;
+    const { identifiers: _identifiers, ...perOperation } = configured;
+    return perOperation;
+  } catch {
+    return undefined;
+  }
+}
+
 function sanitizeRaceEvidence(
   candidate: RaceEvidenceIdentifiers,
 ): SealedRaceEvidence | undefined {
@@ -202,6 +237,12 @@ function sanitizeRaceEvidence(
       Array.isArray(candidate)
     ) {
       return undefined;
+    }
+    const prototype = Object.getPrototypeOf(candidate);
+    if (prototype !== Object.prototype && prototype !== null) return undefined;
+    for (const key in candidate) {
+      if (!Object.prototype.hasOwnProperty.call(candidate, key))
+        return undefined;
     }
     const keys = Reflect.ownKeys(candidate);
     if (keys.length < 1 || keys.length > IDENTIFIER_KEYS.size) return undefined;
@@ -225,9 +266,7 @@ function sanitizeRaceEvidence(
     if (!isIdentifier(values.entityHash)) return undefined;
     const sealed: RaceEvidenceIdentifiers & { entityHash: string } = {
       entityHash: values.entityHash,
-      ...(values.resourceHash
-        ? { resourceHash: values.resourceHash }
-        : {}),
+      ...(values.resourceHash ? { resourceHash: values.resourceHash } : {}),
       ...(values.versionHash ? { versionHash: values.versionHash } : {}),
       ...(values.beforeVersionHash
         ? { beforeVersionHash: values.beforeVersionHash }
@@ -248,7 +287,7 @@ function isIdentifier(value: unknown): value is string {
   );
 }
 
-function isRaceEvidenceInputEligible(
+export function isRaceEvidenceInputEligible(
   input: RaceEvidenceResolverInput,
 ): boolean {
   if (
@@ -269,7 +308,30 @@ function isRaceEvidenceInputEligible(
   }
   return (
     (input.surface === "db.read" || input.surface === "db.diff") &&
-    input.operation.length > 0
+    input.operation.length > 0 &&
+    isResolvedDatabasePrimaryKey(input.primaryKey, input.primaryKeyColumns)
+  );
+}
+
+function isResolvedDatabasePrimaryKey(
+  primaryKey: Record<string, unknown> | null | undefined,
+  columns?: readonly string[],
+): boolean {
+  if (
+    !primaryKey ||
+    typeof primaryKey !== "object" ||
+    Array.isArray(primaryKey)
+  )
+    return false;
+  const keys =
+    columns && columns.length > 0 ? columns : Object.keys(primaryKey);
+  if (keys.length === 0) return false;
+  return keys.every(
+    (key) =>
+      typeof key === "string" &&
+      key.length > 0 &&
+      Object.prototype.hasOwnProperty.call(primaryKey, key) &&
+      primaryKey[key] !== undefined,
   );
 }
 
@@ -336,11 +398,13 @@ function canonicalize(value: unknown, depth = 0): string | undefined {
       }
       try {
         const prototype = Object.getPrototypeOf(value);
+        const objectId = canonicalizeObjectId(value, prototype);
+        if (objectId !== undefined) return objectId;
         if (prototype !== Object.prototype && prototype !== null)
           return undefined;
         const entries = Object.entries(value as Record<string, unknown>);
         if (entries.length > MAX_OBJECT_KEYS) return undefined;
-        entries.sort(([left], [right]) => left.localeCompare(right));
+        entries.sort(([left], [right]) => compareUtf16(left, right));
         const rendered = entries.map(([key, entry]) => {
           const normalized = canonicalize(entry, depth + 1);
           return normalized === undefined
@@ -355,5 +419,47 @@ function canonicalize(value: unknown, depth = 0): string | undefined {
       }
     default:
       return undefined;
+  }
+}
+
+/** Compare strings by UTF-16 code units, without process locale state. */
+function compareUtf16(left: string, right: string): number {
+  if (left === right) return 0;
+  return left < right ? -1 : 1;
+}
+
+/**
+ * Recognize the common BSON ObjectId shape without importing bson. The method
+ * must be the ObjectId prototype's own `toHexString`, and its result must be a
+ * canonical 24 hex character value. Plain objects with a lookalike method are
+ * never called.
+ */
+function canonicalizeObjectId(
+  value: object,
+  prototype: object | null,
+): string | undefined {
+  if (!prototype || prototype === Object.prototype) return undefined;
+  try {
+    const method = Object.getOwnPropertyDescriptor(
+      prototype,
+      "toHexString",
+    )?.value;
+    const constructor = Object.getOwnPropertyDescriptor(
+      prototype,
+      "constructor",
+    )?.value;
+    if (
+      typeof method !== "function" ||
+      typeof constructor !== "function" ||
+      constructor.name !== "ObjectId"
+    ) {
+      return undefined;
+    }
+    const hex = Reflect.apply(method, value, []);
+    return typeof hex === "string" && /^[a-f0-9]{24}$/i.test(hex)
+      ? `oid:${hex.toLowerCase()}`
+      : undefined;
+  } catch {
+    return undefined;
   }
 }

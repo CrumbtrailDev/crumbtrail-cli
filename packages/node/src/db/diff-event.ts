@@ -12,6 +12,7 @@ import type { DbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import {
   buildRaceEvidence,
+  isRaceEvidenceInputEligible,
   readOptimisticVersion,
   type RaceEvidenceOptions,
 } from "../race-evidence";
@@ -49,6 +50,8 @@ export interface BuildDbDiffEventInput {
   valueBounds?: DbValueBounds;
   /** Explicit opt in configuration for bounded cross session race evidence. */
   raceEvidence?: RaceEvidenceOptions;
+  /** Configured DB primary-key columns used to require a complete identity. */
+  primaryKeyColumns?: readonly string[];
 }
 
 /**
@@ -178,7 +181,13 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
   };
   if (
     !input.transactionId &&
-    input.pk !== null &&
+    isRaceEvidenceInputEligible({
+      surface: "db.diff",
+      operation: input.op,
+      table: input.table,
+      primaryKey: input.pk,
+      primaryKeyColumns: input.primaryKeyColumns,
+    }) &&
     (input.rowCount === undefined || input.rowCount === 1)
   ) {
     const versionField = input.raceEvidence?.optimisticVersionField;
@@ -187,6 +196,7 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
       operation: input.op,
       table: input.table,
       primaryKey: input.pk,
+      primaryKeyColumns: input.primaryKeyColumns,
       resourceSubject: input.raceEvidence?.resourceSubject,
       beforeVersion: readOptimisticVersion(input.before, versionField),
       afterVersion: readOptimisticVersion(input.after, versionField),

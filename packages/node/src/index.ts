@@ -34,6 +34,7 @@ export {
 export type {
   RaceEvidenceIdentifiers,
   RaceEvidenceOptions,
+  RaceEvidenceInstrumentationOptions,
   RaceEvidenceResolver,
   RaceEvidenceResolverInput,
   RaceEvidenceSurface,

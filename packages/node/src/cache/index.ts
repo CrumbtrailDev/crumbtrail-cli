@@ -13,6 +13,7 @@ export {
   isRaceEligibleCacheOperation,
   type RaceEvidenceIdentifiers,
   type RaceEvidenceOptions,
+  type RaceEvidenceInstrumentationOptions,
   type RaceEvidenceResolver,
   type RaceEvidenceResolverInput,
   type RaceEvidenceSurface,

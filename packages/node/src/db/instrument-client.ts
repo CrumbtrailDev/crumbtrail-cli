@@ -94,7 +94,12 @@ export function instrumentDatabaseClient<T>(
     // An explicit requestId still wins; this is the fallback that makes the
     // call behave like the automatic path.
     getRequestId: rest.getRequestId ?? readActiveDbRequestId,
-    raceEvidence: rest.raceEvidence ?? readActiveDbRaceEvidence(),
+    // Resolve on every event. A client may be instrumented before autoCapture
+    // installs its active sink, and must still pick up that later configuration.
+    getRaceEvidence:
+      rest.getRaceEvidence ??
+      (() => rest.raceEvidence ?? readActiveDbRaceEvidence()),
+    raceEvidence: undefined,
   };
 
   try {

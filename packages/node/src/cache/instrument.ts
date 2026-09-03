@@ -209,7 +209,7 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
               ...ttlInput(capture, value),
               ...(capture.resultValue
                 ? { value }
-              : capture.value !== undefined
+                : capture.value !== undefined
                   ? { value: capture.value }
                   : {}),
               raceEvidence: readInstrumentRaceEvidence(options),

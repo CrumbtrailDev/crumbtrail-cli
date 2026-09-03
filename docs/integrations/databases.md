@@ -54,15 +54,27 @@ and the configured version field. DB reads and diffs use the same entity domain,
 its version can be compared across requests. Use the same `resourceSubject` in a cache integration
 when both planes represent the same application resource.
 
-Without a strong ingest credential, use an explicit `identifiers` object or `resolve` callback that
-returns exactly these fields: required `entityHash`, plus optional `resourceHash`, `versionHash`,
+Without a strong ingest credential, use a per operation `resolve` callback that returns exactly
+these fields: required `entityHash`, plus optional `resourceHash`, `versionHash`,
 `beforeVersionHash`, and `afterVersionHash`. Every identifier is exactly 64 characters long.
+Static `identifiers` are accepted only by the direct event builders. Multiple operation database and
+cache instrumentation ignores them so one entity's identifier cannot be reused for another.
 Accepted characters are letters, numbers, underscore, and hyphen. The callback can throw safely,
 and invalid output omits only the race object.
 
 Race evidence is omitted from bulk and image less diffs without a resolvable entity, reads that
 return more than one row, multi key cache operations, and database work observed inside a
-transaction. Existing primary key, cache key, row, value, and redaction capture remains unchanged.
+transaction. A DB primary key must be nonempty and fully resolved. Every configured primary key
+column must be an own property with a defined value, including composite keys. Existing primary
+key, cache key, row, value, and redaction capture remains unchanged.
+
+MongoDB single entity `update`, `delete`, and `findAndModify` diffs use a fully resolved `_id`.
+Bulk and unresolved commands omit race evidence. Common BSON `ObjectId` values are supported by
+validating the ObjectId prototype's `toHexString()` result as 24 hexadecimal characters, without
+adding a MongoDB package dependency.
+
+Explicit clients instrumented before `autoCapture` starts read the active race configuration when
+each event is built, so the call order remains safe.
 Do not use any of those raw or redacted values as a cross session join key.
 
 ## Postgres (`pg` Client or Pool)
