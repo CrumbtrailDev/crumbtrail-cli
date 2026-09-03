@@ -22,6 +22,20 @@ export interface RuntimeBindingClientOptions {
   ready?: Promise<void>;
 }
 
+export interface RuntimeBindingHandleOptions {
+  endpoint: string;
+  projectKey?: string;
+  fetchImpl?: typeof fetch;
+  now?: () => number;
+}
+
+declare const runtimeBindingHandleBrand: unique symbol;
+
+/** An opaque binding owned by the SDK. It contains no bearer or callable access to one. */
+export interface RuntimeBindingHandle {
+  readonly [runtimeBindingHandleBrand]: "RuntimeBindingHandle";
+}
+
 /** Rotate well before the one day proof lifetime ends. */
 export const RUNTIME_BINDING_ROTATE_AHEAD_MS = 60 * 60 * 1000;
 
@@ -66,6 +80,10 @@ interface RuntimeBindingCacheEntry {
 
 const runtimeBindingCache = new Map<string, RuntimeBindingCacheEntry>();
 const runtimeBindingRetirements = new Map<string, Promise<void>>();
+const runtimeBindingHandles = new WeakMap<
+  RuntimeBindingHandle,
+  RuntimeBindingClient
+>();
 
 /**
  * Owns one browser tab or Node process binding.
@@ -89,6 +107,7 @@ export class RuntimeBindingClient {
   private activeRegistrationController: AbortController | undefined;
   private retirement: Promise<void> | undefined;
   private readonly ready: Promise<void>;
+  private readonly bindingOrigin: string | undefined;
 
   constructor(options: RuntimeBindingClientOptions) {
     this.endpoint = options.endpoint.trim().replace(/\/+$/, "");
@@ -98,6 +117,7 @@ export class RuntimeBindingClient {
       (typeof fetch === "function" ? fetch.bind(globalThis) : undefined);
     this.now = options.now ?? Date.now;
     this.ready = options.ready ?? Promise.resolve();
+    this.bindingOrigin = resolveOrigin(this.endpoint);
   }
 
   /**
@@ -145,6 +165,13 @@ export class RuntimeBindingClient {
     }
   }
 
+  matchesOrigin(endpoint: string): boolean {
+    const targetOrigin = resolveOrigin(endpoint);
+    return Boolean(
+      this.bindingOrigin && targetOrigin && this.bindingOrigin === targetOrigin,
+    );
+  }
+
   /** Clear the private proof and prevent late registration responses being adopted. */
   stop(): void {
     if (this.stopped) return;
@@ -187,6 +214,7 @@ export class RuntimeBindingClient {
       this.activeRegistrationController = controller;
       let response: Response;
       try {
+        const deadline = Date.now() + RUNTIME_BINDING_REQUEST_TIMEOUT_MS;
         response = await fetchWithTimeout(
           fetcher,
           url.toString(),
@@ -195,33 +223,43 @@ export class RuntimeBindingClient {
             ...(Object.keys(headers).length > 0 ? { headers } : {}),
             cache: "no-store",
           },
-          RUNTIME_BINDING_REQUEST_TIMEOUT_MS,
+          Math.max(0, deadline - Date.now()),
           controller,
+          (lateResponse) => this.revokeLateResponse(lateResponse),
         );
+        if (this.stopped || generation !== this.requestGeneration) {
+          this.revokeLateResponse(response);
+          return undefined;
+        }
+        if (!response.ok) {
+          this.armRetry(response);
+          // A throttled or unreachable endpoint does not invalidate a proof that
+          // remains live. A 401 on rotation does, so the next request falls back
+          // to the old untargeted contract until a fresh registration succeeds.
+          if (response.status === 401 && previous) this.current = undefined;
+          return undefined;
+        }
+        const payload = (await responseJsonWithTimeout(
+          response,
+          Math.max(0, deadline - Date.now()),
+          controller,
+          (latePayload) => this.revokeLatePayload(latePayload),
+        )) as RuntimeBindingResponse;
+        if (this.stopped || generation !== this.requestGeneration) {
+          this.revokeLatePayload(payload);
+          return undefined;
+        }
+        const binding = parseRuntimeBinding(payload, this.now());
+        if (!binding) {
+          this.armRetry();
+          return undefined;
+        }
+        this.retryAfter = 0;
+        return binding;
       } finally {
         if (this.activeRegistrationController === controller)
           this.activeRegistrationController = undefined;
       }
-      if (this.stopped || generation !== this.requestGeneration)
-        return undefined;
-      if (!response.ok) {
-        this.armRetry(response);
-        // A throttled or unreachable endpoint does not invalidate a proof that
-        // remains live. A 401 on rotation does, so the next request falls back
-        // to the old untargeted contract until a fresh registration succeeds.
-        if (response.status === 401 && previous) this.current = undefined;
-        return undefined;
-      }
-      const payload = (await response.json()) as RuntimeBindingResponse;
-      if (this.stopped || generation !== this.requestGeneration)
-        return undefined;
-      const binding = parseRuntimeBinding(payload, this.now());
-      if (!binding) {
-        this.armRetry();
-        return undefined;
-      }
-      this.retryAfter = 0;
-      return binding;
     } catch (error) {
       if (error instanceof RuntimeBindingTimeoutError) {
         // A timeout is ambiguous. The server may have committed rotation
@@ -285,6 +323,28 @@ export class RuntimeBindingClient {
     }
   }
 
+  private revokeLateResponse(response: Response): void {
+    if (!response.ok) return;
+    const body = Promise.resolve().then(() => response.json());
+    void responseJsonWithTimeout(
+      response,
+      RUNTIME_BINDING_REVOKE_TIMEOUT_MS,
+      undefined,
+      (latePayload) => this.revokeLatePayload(latePayload),
+      body,
+    )
+      .then((payload) => this.revokeLatePayload(payload))
+      .catch(() => {});
+  }
+
+  private revokeLatePayload(value: unknown): void {
+    const binding = parseRuntimeBinding(
+      (value ?? {}) as RuntimeBindingResponse,
+      this.now(),
+    );
+    if (binding) void this.revoke(binding).catch(() => {});
+  }
+
   /** Internal cache seam. The public stop operation remains synchronous. */
   getRetirement(): Promise<void> {
     return this.retirement ?? Promise.resolve();
@@ -297,32 +357,75 @@ async function fetchWithTimeout(
   init: RequestInit,
   timeoutMs: number,
   providedController?: AbortController,
+  onLateResponse?: (response: Response) => void,
 ): Promise<Response> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let timedOut = false;
   const Controller = globalThis.AbortController;
   const controller =
     providedController ??
     (typeof Controller === "function" ? new Controller() : undefined);
-  const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      timedOut = true;
-      try {
-        controller?.abort();
-      } finally {
-        reject(new RuntimeBindingTimeoutError());
-      }
-    }, timeoutMs);
-    (timer as unknown as { unref?: () => void }).unref?.();
-  });
+  let request: Promise<Response>;
   try {
-    return await Promise.race([
+    request = Promise.resolve(
       fetcher(input, {
         ...init,
         ...(controller ? { signal: controller.signal } : {}),
       }),
-      timeout,
-    ]);
+    );
+  } catch (error) {
+    request = Promise.reject(error);
+  }
+  return awaitWithTimeout(request, timeoutMs, controller, onLateResponse);
+}
+
+async function responseJsonWithTimeout(
+  response: Response,
+  timeoutMs: number,
+  controller: AbortController | undefined,
+  onLatePayload?: (payload: unknown) => void,
+  bodyPromise: Promise<unknown> = Promise.resolve().then(() => response.json()),
+): Promise<unknown> {
+  return awaitWithTimeout(bodyPromise, timeoutMs, controller, onLatePayload);
+}
+
+async function awaitWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  controller: AbortController | undefined,
+  onLate?: (value: T) => void,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const observed = promise.then(
+    (value) => {
+      if (timedOut && onLate) {
+        try {
+          onLate(value);
+        } catch {
+          // Late cleanup is best effort and must not create an unhandled rejection.
+        }
+      }
+      return value;
+    },
+    (error: unknown) => {
+      throw error;
+    },
+  );
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(
+      () => {
+        timedOut = true;
+        try {
+          controller?.abort();
+        } finally {
+          reject(new RuntimeBindingTimeoutError());
+        }
+      },
+      Math.max(0, timeoutMs),
+    );
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([observed, timeout]);
   } catch (error) {
     if (timedOut) throw new RuntimeBindingTimeoutError();
     throw error;
@@ -335,6 +438,29 @@ export function createRuntimeBindingClient(
   options: RuntimeBindingClientOptions,
 ): RuntimeBindingClient {
   return new RuntimeBindingClient(options);
+}
+
+export function createRuntimeBindingHandle(
+  options: RuntimeBindingHandleOptions,
+): RuntimeBindingHandle {
+  const handle = Object.freeze({}) as RuntimeBindingHandle;
+  runtimeBindingHandles.set(handle, createRuntimeBindingClient(options));
+  return handle;
+}
+
+export function resolveRuntimeBindingClient(
+  handle: RuntimeBindingHandle,
+): RuntimeBindingClient | undefined {
+  return runtimeBindingHandles.get(handle);
+}
+
+export function retireRuntimeBindingHandle(
+  handle: RuntimeBindingHandle,
+): Promise<void> {
+  const client = resolveRuntimeBindingClient(handle);
+  if (!client) return Promise.resolve();
+  client.stop();
+  return client.getRetirement();
 }
 
 /**
@@ -448,4 +574,15 @@ function retryAfterMs(value: string | null, now: number): number | undefined {
   const timestamp = Date.parse(value);
   if (Number.isFinite(timestamp)) return Math.max(0, timestamp - now);
   return undefined;
+}
+
+function resolveOrigin(value: string): string | undefined {
+  try {
+    return new URL(
+      value,
+      typeof location !== "undefined" ? location.href : "http://localhost/",
+    ).origin;
+  } catch {
+    return undefined;
+  }
 }

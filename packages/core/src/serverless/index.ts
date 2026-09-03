@@ -35,13 +35,12 @@ export {
   startHeadlessSession,
 } from "./http-transport";
 export {
-  createRuntimeBindingClient,
-  RuntimeBindingClient,
-  RUNTIME_BINDING_ROTATE_AHEAD_MS,
+  createRuntimeBindingHandle,
+  retireRuntimeBindingHandle,
 } from "../runtime-binding";
 export type {
-  RuntimeBinding,
-  RuntimeBindingClientOptions,
+  RuntimeBindingHandle,
+  RuntimeBindingHandleOptions,
 } from "../runtime-binding";
 export type {
   HeadlessSession,

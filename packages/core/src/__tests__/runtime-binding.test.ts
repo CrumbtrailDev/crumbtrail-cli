@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   __resetRuntimeBindingCacheForTests,
   createRuntimeBindingClient,
+  createRuntimeBindingHandle,
   getCachedRuntimeBindingClient,
   RUNTIME_BINDING_CACHE_MAX_ENTRIES,
   RUNTIME_BINDING_CACHE_TTL_MS,
@@ -13,6 +14,19 @@ import { runServerlessInvocation } from "../serverless";
 
 const ENDPOINT = "https://capture.example";
 const NOW = Date.parse("2026-09-02T12:00:00.000Z");
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T | PromiseLike<T>): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
 
 function binding(expiresAt: number, suffix = "a") {
   return {
@@ -85,6 +99,46 @@ describe("runtime binding client", () => {
     });
   });
 
+  it("bounds the complete registration response and revokes a late body privately", async () => {
+    vi.useFakeTimers();
+    const body = deferred<unknown>();
+    const first = binding(NOW + 86_400_000, "late-body");
+    const fetcher = vi.fn(
+      (_input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "DELETE")
+          return Promise.resolve(response({ ok: true }));
+        return Promise.resolve({
+          ok: true,
+          status: 201,
+          headers: new Headers(),
+          json: () => body.promise,
+        } as Response);
+      },
+    );
+    const client = createRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => NOW,
+    });
+
+    const registration = client.getBinding();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(3_001);
+    await expect(registration).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    body.resolve(first);
+    for (let index = 0; index < 6; index += 1) await Promise.resolve();
+
+    const revoke = fetcher.mock.calls[1];
+    expect(revoke?.[1]).toMatchObject({
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${first.instanceProof}` },
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps a still-live binding on a failed rotation and falls back untargeted after expiry", async () => {
     let now = NOW;
     const first = binding(NOW + 2 * RUNTIME_BINDING_ROTATE_AHEAD_MS + 1, "one");
@@ -123,6 +177,8 @@ describe("runtime binding client", () => {
           return new Promise<Response>((resolve) => {
             resolveLate = resolve;
           });
+        if (_init?.method === "DELETE")
+          return Promise.resolve(response({ ok: true }));
         return Promise.resolve(response(fresh, 201));
       },
     );
@@ -142,13 +198,58 @@ describe("runtime binding client", () => {
       signal: expect.objectContaining({ aborted: true }),
     });
 
-    resolveLate(response(late, 200));
-    await Promise.resolve();
+    resolveLate({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      json: () => Promise.resolve(late),
+    } as Response);
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    const revoke = fetcher.mock.calls[2];
+    expect(revoke?.[1]).toMatchObject({
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${late.instanceProof}` },
+    });
     now += 30_001;
     await expect(client.getBinding()).resolves.toEqual(fresh);
-    const freshRequest = fetcher.mock.calls[2];
+    const freshRequest = fetcher.mock.calls[3];
     expect(String(freshRequest?.[0])).not.toContain("instanceId=");
     expect(freshRequest?.[1]).not.toHaveProperty("headers");
+  });
+
+  it("revokes a late initial registration after stop without adopting it", async () => {
+    const late = binding(NOW + 86_400_000, "stopped-late");
+    let resolveRegistration!: (value: Response) => void;
+    const fetcher = vi.fn(
+      (_input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "DELETE")
+          return Promise.resolve(response({ ok: true }));
+        return new Promise<Response>((resolve) => {
+          resolveRegistration = resolve;
+        });
+      },
+    );
+    const client = createRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => NOW,
+    });
+
+    const registration = client.getBinding();
+    await Promise.resolve();
+    client.stop();
+    resolveRegistration(response(late, 201));
+    await expect(registration).resolves.toBeUndefined();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls[1]?.[1]).toMatchObject({
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${late.instanceProof}` },
+    });
+    await expect(client.getBinding()).resolves.toBeUndefined();
   });
 
   it("honors a bounded Retry After without entering a registration loop", async () => {
@@ -565,7 +666,7 @@ describe("serverless runtime binding forwarding", () => {
     const runtime = binding(NOW + 86_400_000, "explicit");
     const runtimeFetch = vi.fn().mockResolvedValue(response(runtime, 201));
     const intakeFetch = vi.fn().mockResolvedValue(response({ ok: true }));
-    const client = createRuntimeBindingClient({
+    const client = createRuntimeBindingHandle({
       endpoint: ENDPOINT,
       projectKey: "project-key",
       fetchImpl: runtimeFetch,
