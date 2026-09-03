@@ -57,6 +57,14 @@ const RUNTIME_BINDING_REVOKE_TIMEOUT_MS = 3_000;
 /** Keep warm-runtime defaults bounded when one process serves many projects. */
 export const RUNTIME_BINDING_CACHE_MAX_ENTRIES = 32;
 
+/**
+ * Unsettled retirement gates are never evicted for space. Once this finite
+ * admission limit is reached, new cache entries use an uncached client until a
+ * gate settles.
+ */
+export const RUNTIME_BINDING_MAX_PENDING_RETIREMENTS =
+  RUNTIME_BINDING_CACHE_MAX_ENTRIES * 2;
+
 /** Drop abandoned warm-runtime defaults after one proof lifetime. */
 export const RUNTIME_BINDING_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -76,6 +84,68 @@ class RuntimeBindingTimeoutError extends Error {
 interface RuntimeBindingCacheEntry {
   client: RuntimeBindingClient;
   lastUsedAt: number;
+}
+
+interface DeferredPromise<T> {
+  promise: Promise<T>;
+  resolve(value: T | PromiseLike<T>): void;
+}
+
+interface LateCleanupWindow {
+  promise: Promise<void>;
+  arm(): void;
+  close(): void;
+  run(task: (timeoutMs: number) => Promise<void> | void): void;
+}
+
+function createDeferredPromise<T>(): DeferredPromise<T> {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * Reserve a bounded window for cleanup that can only begin after a timed-out
+ * response or body becomes observable. Once the window closes, a late value is
+ * ignored so cleanup cannot begin after the retirement gate has settled.
+ */
+function createLateCleanupWindow(timeoutMs: number): LateCleanupWindow {
+  const deferred = createDeferredPromise<void>();
+  let closed = false;
+  let deadline = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    if (timer !== undefined) clearTimeout(timer);
+    deferred.resolve();
+  };
+
+  return {
+    promise: deferred.promise,
+    arm() {
+      if (closed || timer !== undefined) return;
+      deadline = Date.now() + timeoutMs;
+      timer = setTimeout(close, timeoutMs);
+      (timer as unknown as { unref?: () => void }).unref?.();
+    },
+    close,
+    run(task) {
+      if (closed || deadline === 0) return;
+      const remaining = Math.max(0, deadline - Date.now());
+      if (remaining === 0) {
+        close();
+        return;
+      }
+      void Promise.resolve()
+        .then(() => task(remaining))
+        .catch(() => {})
+        .finally(close);
+    },
+  };
 }
 
 const runtimeBindingCache = new Map<string, RuntimeBindingCacheEntry>();
@@ -108,6 +178,8 @@ export class RuntimeBindingClient {
   private retirement: Promise<void> | undefined;
   private readonly ready: Promise<void>;
   private readonly bindingOrigin: string | undefined;
+  private pendingRetirements = new Set<Promise<void>>();
+  private lateCleanupWindows = new Set<LateCleanupWindow>();
 
   constructor(options: RuntimeBindingClientOptions) {
     this.endpoint = options.endpoint.trim().replace(/\/+$/, "");
@@ -147,12 +219,16 @@ export class RuntimeBindingClient {
 
     const previous = this.current;
     const generation = ++this.requestGeneration;
+    const requestLifecycle = createDeferredPromise<void>();
+    this.trackRetirement(requestLifecycle.promise);
     const request = this.registerOrRotate(previous, generation);
     this.inFlight = request;
     try {
       const next = await request;
       if (!this.stopped && generation === this.requestGeneration && next)
         this.current = next;
+      if ((this.stopped || generation !== this.requestGeneration) && next)
+        await this.revokeLatePayload(next);
       const fallback =
         generation === this.requestGeneration &&
         this.current &&
@@ -162,6 +238,7 @@ export class RuntimeBindingClient {
       return this.stopped ? undefined : (next ?? fallback);
     } finally {
       if (this.inFlight === request) this.inFlight = undefined;
+      requestLifecycle.resolve();
     }
   }
 
@@ -182,12 +259,13 @@ export class RuntimeBindingClient {
     } catch {
       // A host supplied AbortController must not break retirement.
     }
+    for (const window of this.lateCleanupWindows) window.arm();
     const previous = this.current;
     this.current = undefined;
     this.retryAfter = 0;
-    this.retirement = previous
-      ? this.revoke(previous).catch(() => undefined)
-      : Promise.resolve();
+    const retirements = [...this.pendingRetirements];
+    if (previous) retirements.push(this.revoke(previous));
+    this.retirement = Promise.allSettled(retirements).then(() => undefined);
   }
 
   private async registerOrRotate(
@@ -197,6 +275,11 @@ export class RuntimeBindingClient {
     const fetcher = this.fetcher;
     if (!fetcher) return undefined;
     const now = this.now();
+    const lateResponse = createLateCleanupWindow(
+      RUNTIME_BINDING_REVOKE_TIMEOUT_MS,
+    );
+    this.trackLateCleanup(lateResponse);
+    let requestTimedOut = false;
     try {
       const url = new URL(
         `${this.endpoint}/api/runtime/register`,
@@ -225,10 +308,21 @@ export class RuntimeBindingClient {
           },
           Math.max(0, deadline - Date.now()),
           controller,
-          (lateResponse) => this.revokeLateResponse(lateResponse),
+          (response) =>
+            lateResponse.run((timeoutMs) =>
+              this.revokeLateResponse(response, timeoutMs),
+            ),
+          () => {
+            requestTimedOut = true;
+            lateResponse.arm();
+          },
         );
+        if (!requestTimedOut) lateResponse.close();
         if (this.stopped || generation !== this.requestGeneration) {
-          this.revokeLateResponse(response);
+          await this.revokeLateResponse(
+            response,
+            RUNTIME_BINDING_REVOKE_TIMEOUT_MS,
+          );
           return undefined;
         }
         if (!response.ok) {
@@ -239,14 +333,35 @@ export class RuntimeBindingClient {
           if (response.status === 401 && previous) this.current = undefined;
           return undefined;
         }
-        const payload = (await responseJsonWithTimeout(
-          response,
-          Math.max(0, deadline - Date.now()),
-          controller,
-          (latePayload) => this.revokeLatePayload(latePayload),
-        )) as RuntimeBindingResponse;
+        const latePayload = createLateCleanupWindow(
+          RUNTIME_BINDING_REVOKE_TIMEOUT_MS,
+        );
+        this.trackLateCleanup(latePayload);
+        let bodyTimedOut = false;
+        let payload: RuntimeBindingResponse;
+        try {
+          payload = (await responseJsonWithTimeout(
+            response,
+            Math.max(0, deadline - Date.now()),
+            controller,
+            (value) =>
+              latePayload.run((timeoutMs) =>
+                this.revokeLatePayload(value, timeoutMs),
+              ),
+            () => {
+              bodyTimedOut = true;
+              latePayload.arm();
+            },
+          )) as RuntimeBindingResponse;
+          if (!bodyTimedOut) latePayload.close();
+        } finally {
+          if (!bodyTimedOut) latePayload.close();
+        }
         if (this.stopped || generation !== this.requestGeneration) {
-          this.revokeLatePayload(payload);
+          await this.revokeLatePayload(
+            payload,
+            RUNTIME_BINDING_REVOKE_TIMEOUT_MS,
+          );
           return undefined;
         }
         const binding = parseRuntimeBinding(payload, this.now());
@@ -270,6 +385,8 @@ export class RuntimeBindingClient {
       }
       if (!this.stopped) this.armRetry();
       return undefined;
+    } finally {
+      if (!requestTimedOut) lateResponse.close();
     }
   }
 
@@ -297,9 +414,13 @@ export class RuntimeBindingClient {
     return Number.isFinite(expiresAt) && expiresAt > now;
   }
 
-  private async revoke(binding: RuntimeBinding): Promise<void> {
+  private async revoke(
+    binding: RuntimeBinding,
+    timeoutMs = RUNTIME_BINDING_REVOKE_TIMEOUT_MS,
+  ): Promise<void> {
     const fetcher = this.fetcher;
-    if (!fetcher || !this.projectKey || !this.endpoint) return;
+    if (!fetcher || !this.projectKey || !this.endpoint || timeoutMs <= 0)
+      return;
     try {
       const url = new URL(
         `${this.endpoint}/api/runtime/register`,
@@ -315,7 +436,7 @@ export class RuntimeBindingClient {
           headers: { Authorization: `Bearer ${binding.instanceProof}` },
           cache: "no-store",
         },
-        RUNTIME_BINDING_REVOKE_TIMEOUT_MS,
+        timeoutMs,
       );
     } catch {
       // Revocation is best effort. Capture already fell back to the old
@@ -323,26 +444,47 @@ export class RuntimeBindingClient {
     }
   }
 
-  private revokeLateResponse(response: Response): void {
+  private async revokeLateResponse(
+    response: Response,
+    timeoutMs: number,
+  ): Promise<void> {
     if (!response.ok) return;
-    const body = Promise.resolve().then(() => response.json());
-    void responseJsonWithTimeout(
-      response,
-      RUNTIME_BINDING_REVOKE_TIMEOUT_MS,
-      undefined,
-      (latePayload) => this.revokeLatePayload(latePayload),
-      body,
-    )
-      .then((payload) => this.revokeLatePayload(payload))
-      .catch(() => {});
+    const deadline = Date.now() + timeoutMs;
+    try {
+      const payload = await responseJsonWithTimeout(
+        response,
+        timeoutMs,
+        undefined,
+      );
+      await this.revokeLatePayload(payload, deadline - Date.now());
+    } catch {
+      // Late cleanup is bounded and best effort.
+    }
   }
 
-  private revokeLatePayload(value: unknown): void {
+  private async revokeLatePayload(
+    value: unknown,
+    timeoutMs = RUNTIME_BINDING_REVOKE_TIMEOUT_MS,
+  ): Promise<void> {
     const binding = parseRuntimeBinding(
       (value ?? {}) as RuntimeBindingResponse,
       this.now(),
     );
-    if (binding) void this.revoke(binding).catch(() => {});
+    if (binding) await this.revoke(binding, timeoutMs).catch(() => {});
+  }
+
+  private trackRetirement(retirement: Promise<void>): void {
+    this.pendingRetirements.add(retirement);
+    void retirement.then(
+      () => this.pendingRetirements.delete(retirement),
+      () => this.pendingRetirements.delete(retirement),
+    );
+  }
+
+  private trackLateCleanup(window: LateCleanupWindow): void {
+    this.lateCleanupWindows.add(window);
+    this.trackRetirement(window.promise);
+    void window.promise.then(() => this.lateCleanupWindows.delete(window));
   }
 
   /** Internal cache seam. The public stop operation remains synchronous. */
@@ -358,6 +500,7 @@ async function fetchWithTimeout(
   timeoutMs: number,
   providedController?: AbortController,
   onLateResponse?: (response: Response) => void,
+  onTimeout?: () => void,
 ): Promise<Response> {
   const Controller = globalThis.AbortController;
   const controller =
@@ -374,7 +517,13 @@ async function fetchWithTimeout(
   } catch (error) {
     request = Promise.reject(error);
   }
-  return awaitWithTimeout(request, timeoutMs, controller, onLateResponse);
+  return awaitWithTimeout(
+    request,
+    timeoutMs,
+    controller,
+    onLateResponse,
+    onTimeout,
+  );
 }
 
 async function responseJsonWithTimeout(
@@ -382,9 +531,16 @@ async function responseJsonWithTimeout(
   timeoutMs: number,
   controller: AbortController | undefined,
   onLatePayload?: (payload: unknown) => void,
+  onTimeout?: () => void,
   bodyPromise: Promise<unknown> = Promise.resolve().then(() => response.json()),
 ): Promise<unknown> {
-  return awaitWithTimeout(bodyPromise, timeoutMs, controller, onLatePayload);
+  return awaitWithTimeout(
+    bodyPromise,
+    timeoutMs,
+    controller,
+    onLatePayload,
+    onTimeout,
+  );
 }
 
 async function awaitWithTimeout<T>(
@@ -392,6 +548,7 @@ async function awaitWithTimeout<T>(
   timeoutMs: number,
   controller: AbortController | undefined,
   onLate?: (value: T) => void,
+  onTimeout?: () => void,
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let timedOut = false;
@@ -414,6 +571,11 @@ async function awaitWithTimeout<T>(
     timer = setTimeout(
       () => {
         timedOut = true;
+        try {
+          onTimeout?.();
+        } catch {
+          // Timeout bookkeeping must not prevent the bounded rejection.
+        }
         try {
           controller?.abort();
         } finally {
@@ -476,9 +638,21 @@ export function getCachedRuntimeBindingClient(
   const projectKey = options.projectKey?.trim() ?? "";
   if (!endpoint || !projectKey) return createRuntimeBindingClient(options);
 
-  const now = options.now?.() ?? Date.now();
-  pruneRuntimeBindingCache(now);
   const key = `${endpoint}\u0000${projectKey}`;
+  const customSeam =
+    options.fetchImpl !== undefined || options.now !== undefined;
+  if (customSeam) {
+    const ready = runtimeBindingRetirements.get(key);
+    return createRuntimeBindingClient({
+      ...options,
+      endpoint,
+      projectKey,
+      ...(ready ? { ready } : {}),
+    });
+  }
+
+  const now = Date.now();
+  pruneRuntimeBindingCache(now);
   const existing = runtimeBindingCache.get(key);
   if (existing) {
     existing.lastUsedAt = now;
@@ -489,6 +663,22 @@ export function getCachedRuntimeBindingClient(
   }
 
   const ready = runtimeBindingRetirements.get(key);
+  const oldest = runtimeBindingCache.entries().next().value as
+    [string, RuntimeBindingCacheEntry] | undefined;
+  if (
+    runtimeBindingCache.size >= RUNTIME_BINDING_CACHE_MAX_ENTRIES &&
+    oldest &&
+    !canRememberRuntimeBindingRetirement(oldest[0])
+  ) {
+    // Keep all unsettled gates. A caller gets an uncached client until one
+    // settles, so cache admission cannot grow process state or drop ordering.
+    return createRuntimeBindingClient({
+      ...options,
+      endpoint,
+      projectKey,
+      ...(ready ? { ready } : {}),
+    });
+  }
   const client = createRuntimeBindingClient({
     ...options,
     endpoint,
@@ -517,10 +707,18 @@ export function __resetRuntimeBindingCacheForTests(): void {
 function pruneRuntimeBindingCache(now: number): void {
   for (const [key, entry] of runtimeBindingCache) {
     if (now - entry.lastUsedAt <= RUNTIME_BINDING_CACHE_TTL_MS) continue;
+    if (!canRememberRuntimeBindingRetirement(key)) continue;
     entry.client.stop();
     rememberRuntimeBindingRetirement(key, entry.client);
     runtimeBindingCache.delete(key);
   }
+}
+
+function canRememberRuntimeBindingRetirement(key: string): boolean {
+  return (
+    runtimeBindingRetirements.has(key) ||
+    runtimeBindingRetirements.size < RUNTIME_BINDING_MAX_PENDING_RETIREMENTS
+  );
 }
 
 function rememberRuntimeBindingRetirement(
@@ -537,12 +735,6 @@ function rememberRuntimeBindingRetirement(
     if (runtimeBindingRetirements.get(key) === retirement)
       runtimeBindingRetirements.delete(key);
   });
-  while (runtimeBindingRetirements.size > RUNTIME_BINDING_CACHE_MAX_ENTRIES) {
-    const oldest = runtimeBindingRetirements.keys().next().value as
-      string | undefined;
-    if (!oldest) break;
-    runtimeBindingRetirements.delete(oldest);
-  }
 }
 
 function parseRuntimeBinding(

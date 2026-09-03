@@ -2690,6 +2690,15 @@ export class Crumbtrail {
     this.stateProviders.clear();
     this.bus.stop();
     this.ringBuffer.clear();
+    // The session start owns the binding proof used in its request. Retire the
+    // proof only after that request settles, while retaining the transport's
+    // existing request bounds and its normal error swallowing.
+    try {
+      await this.sessionMetadataWrite;
+    } catch {
+      // sendSessionMetadata() normally absorbs this. A custom transport must
+      // not prevent the rest of shutdown from running.
+    }
     this.runtimeBinding?.stop();
     if (this.sessionStarted) {
       // bus.stop() just flushed the final batch into the transport; every

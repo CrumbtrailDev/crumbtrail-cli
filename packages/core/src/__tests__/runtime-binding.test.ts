@@ -6,6 +6,7 @@ import {
   getCachedRuntimeBindingClient,
   RUNTIME_BINDING_CACHE_MAX_ENTRIES,
   RUNTIME_BINDING_CACHE_TTL_MS,
+  RUNTIME_BINDING_MAX_PENDING_RETIREMENTS,
   RUNTIME_BINDING_ROTATE_AHEAD_MS,
 } from "../runtime-binding";
 import { HttpTransport } from "../transports/http";
@@ -137,6 +138,116 @@ describe("runtime binding client", () => {
       headers: { Authorization: `Bearer ${first.instanceProof}` },
     });
     expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("holds same-key restart behind a late response DELETE after timeout", async () => {
+    vi.useFakeTimers();
+    const late = binding(NOW + 2 * 86_400_000, "late-response");
+    const fresh = binding(NOW + 3 * 86_400_000, "fresh-response");
+    const pendingResponse = deferred<Response>();
+    const pendingDelete = deferred<Response>();
+    const operations: string[] = [];
+    let postCount = 0;
+    const fetcher = vi.fn(
+      (input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "DELETE") {
+          operations.push("DELETE");
+          return pendingDelete.promise;
+        }
+        postCount += 1;
+        operations.push(`POST:${postCount}`);
+        return postCount === 1
+          ? pendingResponse.promise
+          : Promise.resolve(response(fresh, 201));
+      },
+    );
+    const first = createRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => NOW,
+    });
+    const firstRegistration = first.getBinding();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(3_001);
+    await expect(firstRegistration).resolves.toBeUndefined();
+
+    first.stop();
+    const second = createRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => NOW,
+      ready: first.getRetirement(),
+    });
+    const secondRegistration = second.getBinding();
+    await Promise.resolve();
+    expect(postCount).toBe(1);
+
+    pendingResponse.resolve(response(late, 201));
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    expect(operations).toEqual(["POST:1", "DELETE"]);
+    expect(postCount).toBe(1);
+
+    pendingDelete.resolve(response({ ok: true }));
+    await expect(secondRegistration).resolves.toEqual(fresh);
+    expect(operations).toEqual(["POST:1", "DELETE", "POST:2"]);
+  });
+
+  it("holds same-key restart behind a late body DELETE after stop", async () => {
+    vi.useFakeTimers();
+    const late = binding(NOW + 2 * 86_400_000, "late-body-stop");
+    const fresh = binding(NOW + 3 * 86_400_000, "fresh-body-stop");
+    const pendingBody = deferred<unknown>();
+    const pendingDelete = deferred<Response>();
+    const operations: string[] = [];
+    let postCount = 0;
+    const fetcher = vi.fn(
+      (input: string | URL | Request, init?: RequestInit) => {
+        if (init?.method === "DELETE") {
+          operations.push("DELETE");
+          return pendingDelete.promise;
+        }
+        postCount += 1;
+        operations.push(`POST:${postCount}`);
+        if (postCount === 1)
+          return Promise.resolve({
+            ok: true,
+            status: 201,
+            headers: new Headers(),
+            json: () => pendingBody.promise,
+          } as Response);
+        return Promise.resolve(response(fresh, 201));
+      },
+    );
+    const first = createRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => NOW,
+    });
+    const firstRegistration = first.getBinding();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(3_001);
+    await expect(firstRegistration).resolves.toBeUndefined();
+
+    first.stop();
+    const second = createRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetcher,
+      now: () => NOW,
+      ready: first.getRetirement(),
+    });
+    const secondRegistration = second.getBinding();
+    pendingBody.resolve(late);
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    expect(operations).toEqual(["POST:1", "DELETE"]);
+    expect(postCount).toBe(1);
+
+    pendingDelete.resolve(response({ ok: true }));
+    await expect(secondRegistration).resolves.toEqual(fresh);
+    expect(operations).toEqual(["POST:1", "DELETE", "POST:2"]);
   });
 
   it("keeps a still-live binding on a failed rotation and falls back untargeted after expiry", async () => {
@@ -399,6 +510,41 @@ describe("runtime binding client", () => {
     resolveLate(response({ ok: true }));
   });
 
+  it("does not share a cache entry across custom fetch and clock seams", async () => {
+    const fetchA = vi
+      .fn()
+      .mockResolvedValue(response(binding(NOW + 86_400_000, "fetch-a"), 201));
+    const fetchB = vi
+      .fn()
+      .mockResolvedValue(response(binding(NOW + 86_400_000, "fetch-b"), 201));
+    const clockA = vi.fn(() => NOW);
+    const clockB = vi.fn(() => NOW);
+    const first = getCachedRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetchA,
+      now: clockA,
+    });
+    const second = getCachedRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-key",
+      fetchImpl: fetchB,
+      now: clockB,
+    });
+
+    expect(second).not.toBe(first);
+    await expect(first.getBinding()).resolves.toMatchObject({
+      instanceId: "ri_runtime_fetch-a",
+    });
+    await expect(second.getBinding()).resolves.toMatchObject({
+      instanceId: "ri_runtime_fetch-b",
+    });
+    expect(fetchA).toHaveBeenCalledOnce();
+    expect(fetchB).toHaveBeenCalledOnce();
+    expect(clockA).toHaveBeenCalled();
+    expect(clockB).toHaveBeenCalled();
+  });
+
   it("reuses defaults by endpoint and project while isolating project keys", async () => {
     const fetcher = vi.fn(
       async (input: string | URL | Request, _init?: RequestInit) => {
@@ -411,20 +557,18 @@ describe("runtime binding client", () => {
         );
       },
     );
+    vi.stubGlobal("fetch", fetcher);
     const first = getCachedRuntimeBindingClient({
       endpoint: ENDPOINT,
       projectKey: "project-a",
-      fetchImpl: fetcher,
     });
     const same = getCachedRuntimeBindingClient({
       endpoint: `${ENDPOINT}/`,
       projectKey: "project-a",
-      fetchImpl: fetcher,
     });
     const other = getCachedRuntimeBindingClient({
       endpoint: ENDPOINT,
       projectKey: "project-b",
-      fetchImpl: fetcher,
     });
 
     expect(same).toBe(first);
@@ -454,17 +598,16 @@ describe("runtime binding client", () => {
       async (_input: string | URL | Request, _init?: RequestInit) =>
         response(binding(Date.now() + 2 * 86_400_000), 201),
     );
+    vi.stubGlobal("fetch", fetcher);
     const first = getCachedRuntimeBindingClient({
       endpoint: ENDPOINT,
       projectKey: "project-0",
-      fetchImpl: fetcher,
     });
     await first.getBinding();
     for (let index = 1; index <= RUNTIME_BINDING_CACHE_MAX_ENTRIES; index += 1)
       getCachedRuntimeBindingClient({
         endpoint: ENDPOINT,
         projectKey: `project-${index}`,
-        fetchImpl: fetcher,
       });
     await expect(first.getBinding()).resolves.toBeUndefined();
     expect(
@@ -475,7 +618,6 @@ describe("runtime binding client", () => {
     const expired = getCachedRuntimeBindingClient({
       endpoint: ENDPOINT,
       projectKey: "project-1",
-      fetchImpl: fetcher,
     });
     await expect(expired.getBinding()).resolves.toBeTruthy();
     expect(
@@ -514,10 +656,9 @@ describe("runtime binding client", () => {
         return response(instance, 201);
       },
     );
+    vi.stubGlobal("fetch", fetcher);
     const options = {
       endpoint: ENDPOINT,
-      fetchImpl: fetcher,
-      now: () => NOW,
     };
 
     const first = getCachedRuntimeBindingClient({
@@ -559,6 +700,75 @@ describe("runtime binding client", () => {
     expect(registrationCounts.get("project-0")).toBe(2);
     expect(operations).toContain("DELETE:project-1");
     expect(active.size).toBe(RUNTIME_BINDING_CACHE_MAX_ENTRIES);
+  });
+
+  it("retains more than 32 stalled retirement gates for oldest-key reentry", async () => {
+    const stalledRetirementCount = RUNTIME_BINDING_CACHE_MAX_ENTRIES + 1;
+    expect(stalledRetirementCount).toBeGreaterThan(32);
+    expect(stalledRetirementCount).toBeLessThan(
+      RUNTIME_BINDING_MAX_PENDING_RETIREMENTS,
+    );
+    const operations: string[] = [];
+    const registrationCounts = new Map<string, number>();
+    const deleteGates = new Map<string, Deferred<Response>>();
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(String(input));
+        const projectKey = url.searchParams.get("projectKey") ?? "unknown";
+        if (init?.method === "DELETE") {
+          operations.push(`DELETE:${projectKey}`);
+          let gate = deleteGates.get(projectKey);
+          if (!gate) {
+            gate = deferred<Response>();
+            deleteGates.set(projectKey, gate);
+          }
+          return gate.promise;
+        }
+
+        const count = (registrationCounts.get(projectKey) ?? 0) + 1;
+        registrationCounts.set(projectKey, count);
+        operations.push(`POST:${projectKey}`);
+        return response(
+          binding(NOW + 2 * 86_400_000, `${projectKey}-${count}`),
+          201,
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetcher);
+
+    for (
+      let index = 0;
+      index < RUNTIME_BINDING_CACHE_MAX_ENTRIES + stalledRetirementCount;
+      index += 1
+    ) {
+      const client = getCachedRuntimeBindingClient({
+        endpoint: ENDPOINT,
+        projectKey: `project-${index}`,
+      });
+      await client.getBinding();
+    }
+
+    expect(deleteGates.size).toBe(stalledRetirementCount);
+    const reentry = getCachedRuntimeBindingClient({
+      endpoint: ENDPOINT,
+      projectKey: "project-0",
+    });
+    const reentryBinding = reentry.getBinding();
+    await Promise.resolve();
+    expect(registrationCounts.get("project-0")).toBe(1);
+    expect(
+      operations.filter((operation) => operation === "POST:project-0"),
+    ).toHaveLength(1);
+
+    deleteGates.get("project-0")!.resolve(response({ ok: true }));
+    await expect(reentryBinding).resolves.toBeTruthy();
+    const oldestDeleteIndex = operations.indexOf("DELETE:project-0");
+    const reentryPostIndex = operations.lastIndexOf("POST:project-0");
+    expect(reentryPostIndex).toBeGreaterThan(oldestDeleteIndex);
+    expect(registrationCounts.get("project-0")).toBe(2);
+
+    for (const gate of deleteGates.values())
+      gate.resolve(response({ ok: true }));
   });
 });
 
@@ -658,6 +868,82 @@ describe("HttpTransport runtime binding seam", () => {
       instanceProof: first.instanceProof,
     });
     await logger.stop();
+  });
+
+  it("settles browser session start before revoking its runtime binding", async () => {
+    const runtime = binding(NOW + 86_400_000, "browser-stop");
+    const pendingStart = deferred<Response>();
+    const operations: string[] = [];
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/api/runtime/register")) {
+          if (init?.method === "DELETE") {
+            operations.push("DELETE");
+            return response({ ok: true });
+          }
+          operations.push("register");
+          return response(runtime, 201);
+        }
+        if (url.endsWith("/api/session/start")) {
+          operations.push("session-start");
+          const result = await pendingStart.promise;
+          operations.push("session-start-settled");
+          return result;
+        }
+        if (url.endsWith("/api/session/end")) {
+          operations.push("session-end");
+          return response({ ok: true });
+        }
+        return response({ ok: true });
+      },
+    );
+    vi.stubGlobal("fetch", fetcher);
+
+    const logger = Crumbtrail.init({
+      httpEndpoint: ENDPOINT,
+      httpAuthToken: "project-key",
+      remoteConfig: false,
+      widget: false,
+      environment: false,
+      domSnapshot: false,
+      console: false,
+      network: false,
+      interactions: false,
+      keystrokes: false,
+      scroll: false,
+      visibility: false,
+      clipboard: false,
+      errors: false,
+      performance: false,
+      cookies: false,
+      storage: false,
+      heartbeat: false,
+      uiNumbers: false,
+      listeners: false,
+      eventSource: false,
+      webSocket: false,
+      workers: false,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1_000,
+      sessionPersistence: "memory",
+    });
+
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    expect(operations).toContain("session-start");
+
+    const stopping = logger.stop();
+    await Promise.resolve();
+    expect(operations).not.toContain("DELETE");
+
+    pendingStart.resolve(response({ ok: true }));
+    await stopping;
+    expect(operations.indexOf("session-start-settled")).toBeGreaterThanOrEqual(
+      0,
+    );
+    expect(operations.indexOf("DELETE")).toBeGreaterThan(
+      operations.indexOf("session-start-settled"),
+    );
   });
 });
 

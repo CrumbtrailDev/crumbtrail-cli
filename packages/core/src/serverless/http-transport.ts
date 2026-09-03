@@ -129,8 +129,8 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
       getCachedRuntimeBindingClient({
         endpoint,
         projectKey: options.authToken,
-        fetchImpl: this.fetcher,
-        now: options.now,
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+        ...(options.now ? { now: options.now } : {}),
       });
   }
 

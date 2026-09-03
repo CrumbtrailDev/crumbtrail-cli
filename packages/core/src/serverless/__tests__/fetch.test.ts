@@ -118,10 +118,10 @@ describe("withCrumbtrailFetch", () => {
         return new Response(JSON.stringify(runtime), { status: 201 });
       return new Response("{}", { status: 200 });
     };
+    vi.stubGlobal("fetch", fetchImpl);
     const options = {
       endpoint: "https://capture.example",
       authToken: "ingest-key",
-      fetchImpl,
     };
     const handler = withCrumbtrailFetch(
       () => new Response("ok", { status: 200 }),
