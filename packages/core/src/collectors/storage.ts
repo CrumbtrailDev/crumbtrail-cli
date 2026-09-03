@@ -161,6 +161,29 @@ function restoreStorageMethod(
   });
 }
 
+function boundedStorageErrorName(error: unknown): string {
+  let name: unknown;
+  try {
+    name =
+      error && (typeof error === "object" || typeof error === "function")
+        ? (error as Record<string, unknown>).name
+        : undefined;
+  } catch {
+    name = undefined;
+  }
+  if (typeof name !== "string") return "Error";
+  const trimmed = name.trim().slice(0, 100);
+  return trimmed || "Error";
+}
+
+function previousStorageValue(storage: Storage, key: string): string | null | undefined {
+  try {
+    return storage.getItem(key);
+  } catch {
+    return undefined;
+  }
+}
+
 export function storageCollector(
   bus: EventBus,
   config: CrumbtrailConfig,
@@ -266,9 +289,11 @@ export function storageCollector(
   // --- Patched method factories ---
   function recordSet(
     type: "local" | "session",
-    storage: Storage,
     key: string,
     value: string,
+    oldValue: string | null | undefined,
+    outcome: "success" | "failure",
+    errorName?: string,
   ): void {
     if (!excludeKeys.has(key)) {
       const keyResult = redactStorageKey(key, `${type}.key`);
@@ -276,11 +301,13 @@ export function storageCollector(
         type,
         op: "set",
         key: keyResult.value,
+        outcome,
+        ...(errorName ? { errorName } : {}),
       };
       const oldValMetadata = assignRedactedStorageValue(
         d,
         "oldVal",
-        redactStoredValue(storage.getItem(key), {
+        redactStoredValue(oldValue, {
           key,
           maxLength: maxLen(),
           path: `${type}.${keyResult.value}.oldVal`,
@@ -315,15 +342,41 @@ export function storageCollector(
     origFn: (key: string, value: string) => void,
   ) {
     return function patchedSetItem(key: string, value: string) {
-      recordSet(type, storage, key, value);
-      return origFn(key, value);
+      const oldValue = excludeKeys.has(key)
+        ? undefined
+        : previousStorageValue(storage, key);
+      try {
+        const result = origFn(key, value);
+        try {
+          recordSet(type, key, value, oldValue, "success");
+        } catch {
+          // Instrumentation must never change a successful host mutation.
+        }
+        return result;
+      } catch (error) {
+        try {
+          recordSet(
+            type,
+            key,
+            value,
+            oldValue,
+            "failure",
+            boundedStorageErrorName(error),
+          );
+        } catch {
+          // Preserve the original storage exception if redaction cannot run.
+        }
+        throw error;
+      }
     };
   }
 
   function recordRemove(
     type: "local" | "session",
-    storage: Storage,
     key: string,
+    oldValue: string | null | undefined,
+    outcome: "success" | "failure",
+    errorName?: string,
   ): void {
     if (!excludeKeys.has(key)) {
       const keyResult = redactStorageKey(key, `${type}.key`);
@@ -331,11 +384,13 @@ export function storageCollector(
         type,
         op: "del",
         key: keyResult.value,
+        outcome,
+        ...(errorName ? { errorName } : {}),
       };
       const oldValMetadata = assignRedactedStorageValue(
         d,
         "oldVal",
-        redactStoredValue(storage.getItem(key), {
+        redactStoredValue(oldValue, {
           key,
           maxLength: maxLen(),
           path: `${type}.${keyResult.value}.oldVal`,
@@ -356,23 +411,64 @@ export function storageCollector(
     origFn: (key: string) => void,
   ) {
     return function patchedRemoveItem(key: string) {
-      recordRemove(type, storage, key);
-      return origFn(key);
+      const oldValue = excludeKeys.has(key)
+        ? undefined
+        : previousStorageValue(storage, key);
+      try {
+        const result = origFn(key);
+        try {
+          recordRemove(type, key, oldValue, "success");
+        } catch {
+          // Instrumentation must never change a successful host mutation.
+        }
+        return result;
+      } catch (error) {
+        try {
+          recordRemove(
+            type,
+            key,
+            oldValue,
+            "failure",
+            boundedStorageErrorName(error),
+          );
+        } catch {
+          // Preserve the original storage exception if redaction cannot run.
+        }
+        throw error;
+      }
     };
   }
 
-  function recordClear(type: "local" | "session"): void {
+  function recordClear(
+    type: "local" | "session",
+    outcome: "success" | "failure",
+    errorName?: string,
+  ): void {
     bus.emit({
       t: now(),
       k: "stor",
-      d: { type, op: "clear" },
+      d: { type, op: "clear", outcome, ...(errorName ? { errorName } : {}) },
     });
   }
 
   function makeClear(type: "local" | "session", origFn: () => void) {
     return function patchedClear() {
-      recordClear(type);
-      return origFn();
+      try {
+        const result = origFn();
+        try {
+          recordClear(type, "success");
+        } catch {
+          // Instrumentation must never change a successful host mutation.
+        }
+        return result;
+      } catch (error) {
+        try {
+          recordClear(type, "failure", boundedStorageErrorName(error));
+        } catch {
+          // Preserve the original storage exception if redaction cannot run.
+        }
+        throw error;
+      }
     };
   }
 
@@ -413,21 +509,82 @@ export function storageCollector(
     value: string,
   ) {
     const { type, storage } = storageOf(this);
-    recordSet(type, storage, key, value);
-    return origProtoSetItem.call(this ?? storage, key, value);
+    const oldValue = excludeKeys.has(key)
+      ? undefined
+      : previousStorageValue(storage, key);
+    try {
+      const result = origProtoSetItem.call(this ?? storage, key, value);
+      try {
+        recordSet(type, key, value, oldValue, "success");
+      } catch {
+        // Instrumentation must never change a successful host mutation.
+      }
+      return result;
+    } catch (error) {
+      try {
+        recordSet(
+          type,
+          key,
+          value,
+          oldValue,
+          "failure",
+          boundedStorageErrorName(error),
+        );
+      } catch {
+        // Preserve the original storage exception if redaction cannot run.
+      }
+      throw error;
+    }
   };
   Storage.prototype.removeItem = function patchedProtoRemoveItem(
     this: Storage,
     key: string,
   ) {
     const { type, storage } = storageOf(this);
-    recordRemove(type, storage, key);
-    return origProtoRemoveItem.call(this ?? storage, key);
+    const oldValue = excludeKeys.has(key)
+      ? undefined
+      : previousStorageValue(storage, key);
+    try {
+      const result = origProtoRemoveItem.call(this ?? storage, key);
+      try {
+        recordRemove(type, key, oldValue, "success");
+      } catch {
+        // Instrumentation must never change a successful host mutation.
+      }
+      return result;
+    } catch (error) {
+      try {
+        recordRemove(
+          type,
+          key,
+          oldValue,
+          "failure",
+          boundedStorageErrorName(error),
+        );
+      } catch {
+        // Preserve the original storage exception if redaction cannot run.
+      }
+      throw error;
+    }
   };
   Storage.prototype.clear = function patchedProtoClear(this: Storage) {
     const { type, storage } = storageOf(this);
-    recordClear(type);
-    return origProtoClear.call(this ?? storage);
+    try {
+      const result = origProtoClear.call(this ?? storage);
+      try {
+        recordClear(type, "success");
+      } catch {
+        // Instrumentation must never change a successful host mutation.
+      }
+      return result;
+    } catch (error) {
+      try {
+        recordClear(type, "failure", boundedStorageErrorName(error));
+      } catch {
+        // Preserve the original storage exception if redaction cannot run.
+      }
+      throw error;
+    }
   };
 
   // Patch instances via Object.defineProperty (works in Proxy-based environments
@@ -470,7 +627,7 @@ export function storageCollector(
       bus.emit({
         t: now(),
         k: "stor",
-        d: { type, op: "clear" },
+        d: { type, op: "clear", outcome: "success" },
       });
     } else if (event.newValue === null) {
       const keyResult = redactStorageKey(event.key, `${type}.key`);
@@ -478,6 +635,7 @@ export function storageCollector(
         type,
         op: "del",
         key: keyResult.value,
+        outcome: "success",
       };
       const oldValMetadata = assignRedactedStorageValue(
         d,
@@ -500,6 +658,7 @@ export function storageCollector(
         type,
         op: "set",
         key: keyResult.value,
+        outcome: "success",
       };
       const oldValMetadata = assignRedactedStorageValue(
         d,

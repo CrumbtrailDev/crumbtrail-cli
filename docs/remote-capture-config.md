@@ -86,10 +86,19 @@ cannot ratchet a limit back up one step at a time.
 Under `triggers`, each accepting `true`, `false`, or `{ "enabled": true }`:
 
 `error` (`errors`, `onError`), `uncaughtError`, `unhandledRejection`, `request5xx`,
-`renderedError` (`renderedErrors`, `onRenderedError`), `explicitBeacon`, `serverSidePull`,
-`signals` (`onSignals`), `rageClick` (`rageClicks`, `onRageClick`), `retryStorm` (`retryStorms`,
-`onRetryStorm`), `slowResponse` (`slowResponses`, `onSlowResponse`), `abandonedFlow`
-(`abandonedFlows`, `onAbandonedFlow`).
+`renderedError` (`renderedErrors`, `onRenderedError`), `caughtError` (`caughtErrors`,
+`onCaughtError`), `responseBodyError` (`responseBodyErrors`, `onResponseBodyError`),
+`streamFailure` (`streamFailures`, `onStreamFailure`), `workerError` (`workerErrors`,
+`onWorkerError`), `wrongNumber` (`wrongNumbers`, `onWrongNumber`), `resourceLoadFailure`
+(`resourceLoadFailures`, `onResourceLoadFailure`), `storageFailure` (`storageFailures`,
+`onStorageFailure`), `explicitBeacon`, `serverSidePull`, `signals` (`onSignals`),
+`rageClick` (`rageClicks`, `onRageClick`), `retryStorm` (`retryStorms`, `onRetryStorm`),
+`slowResponse` (`slowResponses`, `onSlowResponse`), `abandonedFlow` (`abandonedFlows`,
+`onAbandonedFlow`).
+
+The Cloud policy enables `caughtError`, `responseBodyError`, `streamFailure`, and
+`workerError` by default. It keeps `wrongNumber`, `resourceLoadFailure`, and
+`storageFailure` disabled until a project enables them.
 
 `triggers.mask_all: true` also forces full masking. It cannot unmask.
 

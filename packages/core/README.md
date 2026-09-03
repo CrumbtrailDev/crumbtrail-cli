@@ -167,11 +167,20 @@ and early resource listener are dropped and the patches become pass-throughs.
 
 The automatic triggers are `autoFlagOnError`,
 `autoFlagOnUncaughtError`, `autoFlagOnUnhandledRejection`,
-`autoFlagOnRequest5xx`, `autoFlagOnRenderedError`, and the configured signal
-triggers `autoFlagOnRageClick`, `autoFlagOnRetryStorm`,
-`autoFlagOnSlowResponse`, and `autoFlagOnAbandonedFlow`.
+`autoFlagOnRequest5xx`, `autoFlagOnRenderedError`,
+`autoFlagOnCaughtError`, `autoFlagOnResponseBodyError`,
+`autoFlagOnStreamFailure`, `autoFlagOnWorkerError`,
+`autoFlagOnWrongNumber`, `autoFlagOnResourceLoadFailure`,
+`autoFlagOnStorageFailure`, and the configured signal triggers
+`autoFlagOnRageClick`, `autoFlagOnRetryStorm`, `autoFlagOnSlowResponse`, and
+`autoFlagOnAbandonedFlow`.
 `autoFlagDebounceMs` coalesces a burst and
 `autoFlagMaxPerSession` caps automatic reports across all triggers.
+
+`autoFlagOnCaughtError`, `autoFlagOnResponseBodyError`,
+`autoFlagOnStreamFailure`, and `autoFlagOnWorkerError` are enabled by default.
+`autoFlagOnWrongNumber`, `autoFlagOnResourceLoadFailure`, and
+`autoFlagOnStorageFailure` are disabled by default because they can be noisy.
 
 `autoFlagOnRenderedError` is enabled by default. It watches browser-standard
 signals: `role="alert"` or `role="alertdialog"` entering the document,
@@ -199,7 +208,19 @@ await crumbtrail.flagBug({
 });
 ```
 
-Also on the instance: `addEvent`, `registerStateProvider`, `setEnv`,
+To record an error that your application caught, use `recordError`. It emits a
+canonical `err` event with `handled: true`, `fatal: false` by default, and
+bounded message and stack fields, redacted unless `captureRawErrors` is enabled:
+
+```ts
+try {
+  await submitOrder();
+} catch (error) {
+  crumbtrail.recordError(error, { source: "checkout" });
+}
+```
+
+Also on the instance: `addEvent`, `recordError`, `registerStateProvider`, `setEnv`,
 `createRequestHeaders`, `pause`, `resume`, `stop`, `getSessionId`.
 
 `createRequestHeaders()` is for a transport Crumbtrail does not patch, such as a

@@ -155,6 +155,68 @@ describe("Crumbtrail", () => {
     await logger.stop();
   });
 
+  it("recordError() emits a handled, bounded error event", async () => {
+    const mockTransport = {
+      sendEvents: vi.fn().mockResolvedValue(undefined),
+      sendBlob: vi.fn().mockResolvedValue(undefined),
+      startSession: vi.fn().mockResolvedValue(undefined),
+      endSession: vi.fn().mockResolvedValue(undefined),
+      sendBugReport: vi.fn().mockResolvedValue(undefined),
+    };
+    const logger = Crumbtrail.init({
+      transportInstance: mockTransport,
+      captureRawErrors: true,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1,
+    });
+
+    logger.recordError(
+      {
+        message: "secret message",
+        stack: "stack frame\n".repeat(2_000),
+      },
+      { fatal: true, source: "checkout" },
+    );
+
+    const event = mockTransport.sendEvents.mock.calls
+      .flatMap(([batch]) => batch)
+      .find((entry: { k: string }) => entry.k === "err");
+    expect(event).toMatchObject({
+      k: "err",
+      d: {
+        handled: true,
+        fatal: true,
+        source: "checkout",
+        msg: "secret message",
+      },
+    });
+    expect(event.d.stk).toHaveLength(8_000);
+    await logger.stop();
+  });
+
+  it("recordError() redacts the message and stack by default", async () => {
+    const mockTransport = {
+      sendEvents: vi.fn().mockResolvedValue(undefined),
+      sendBlob: vi.fn().mockResolvedValue(undefined),
+      startSession: vi.fn().mockResolvedValue(undefined),
+      endSession: vi.fn().mockResolvedValue(undefined),
+      sendBugReport: vi.fn().mockResolvedValue(undefined),
+    };
+    const logger = Crumbtrail.init({
+      transportInstance: mockTransport,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1,
+    });
+    logger.recordError(new Error("failed with Bearer abcdefghijklmnop token"));
+
+    const event = mockTransport.sendEvents.mock.calls
+      .flatMap(([batch]) => batch)
+      .find((entry: { k: string }) => entry.k === "err");
+    expect(event?.d.handled).toBe(true);
+    expect(JSON.stringify(event)).not.toContain("Bearer abcdefghijklmnop");
+    await logger.stop();
+  });
+
   it("pause() and resume() work without error", async () => {
     const logger = Crumbtrail.init({
       flushIntervalMs: 100_000,
