@@ -56,6 +56,63 @@ an explicit or manually managed session ends. It releases the entry so another
 session can be admitted, and `autoCapture().stop()` releases its process-owned
 session automatically.
 
+### Checking response semantics and expected effects
+
+For a successful response whose business value is wrong, send a bounded
+application-declared fact through `sendApplicationResponseAssertions()`:
+
+```ts
+import { sendApplicationResponseAssertions } from "crumbtrail-node";
+
+const result = await sendApplicationResponseAssertions({
+  response,
+  facts: [
+    {
+      name: "cart_total",
+      operator: "equals",
+      expected: 100,
+      path: "data.total",
+    },
+  ],
+  endpoint: process.env.CRUMBTRAIL_ENDPOINT,
+  authToken: process.env.CRUMBTRAIL_KEY,
+});
+```
+
+The core contract reads only exact own-property paths or a bounded array
+selector. It never sends the response, body, headers, or declaration prose.
+Only booleans, finite numbers, and short identifier-shaped strings are eligible.
+Objects, emails, tokens, accessors, prototype paths, and missing values are
+rejected. A call accepts at most 20 facts, selectors scan at most 25 items, and
+each session emits at most 100 response facts. Correlation comes from explicit
+IDs, the active request, or the process capture session. Without a session the
+function returns `correlation_invalid` and does not attempt delivery.
+
+For an update, external effect, queue action, or other work that should happen
+but may be absent, declare it before the operation:
+
+```ts
+import { beginApplicationExpectation } from "crumbtrail-node";
+
+const expectation = beginApplicationExpectation({
+  name: "inventory_update",
+  kind: "update",
+  deadlineMs: 2_000,
+  endpoint: process.env.CRUMBTRAIL_ENDPOINT,
+  authToken: process.env.CRUMBTRAIL_KEY,
+});
+
+// Call this when the application observes the effect.
+expectation.handle?.satisfy();
+```
+
+An unsatisfied declaration emits one `app.expectation.missed` event at its
+deadline or when its process session is cleared. `cancel()` suppresses that
+event for intentionally abandoned work. Handles are local and opaque, timers
+are unref'ed in Node, and all declarations have bounded names, kinds, deadlines,
+correlation, and session state. Delivery failures are swallowed like other
+best-effort telemetry and do not retry the missed event.
+
 ## Fresh-install validation
 
 The published package's install contract is exercised from a temporary standalone

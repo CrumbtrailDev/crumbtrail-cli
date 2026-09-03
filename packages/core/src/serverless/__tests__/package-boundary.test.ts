@@ -10,6 +10,9 @@ const packageRoot = path.resolve(testDir, "../../..");
 const esmPath = path.join(packageRoot, "dist/serverless/index.js");
 const cjsPath = path.join(packageRoot, "dist/serverless/index.cjs");
 const declarationPath = path.join(packageRoot, "dist/serverless/index.d.ts");
+const rootEsmPath = path.join(packageRoot, "dist/index.js");
+const rootCjsPath = path.join(packageRoot, "dist/index.cjs");
+const rootDeclarationPath = path.join(packageRoot, "dist/index.d.ts");
 
 // The hook builds the package, and `buildCorePackage` waits up to 60 seconds for
 // another worker to finish building it first. Vitest's default hook timeout is 10
@@ -96,6 +99,30 @@ describe("crumbtrail-core/serverless package boundary", () => {
     )({ endpoint: "https://capture.example", projectKey: "project-key" });
     expect(Reflect.ownKeys(handle)).toEqual([]);
     expect((handle as { getBinding?: unknown }).getBinding).toBeUndefined();
+  });
+
+  it("ships application contracts from the published root entry", async () => {
+    expect(fs.existsSync(rootDeclarationPath)).toBe(true);
+    expect(fs.existsSync(rootEsmPath)).toBe(true);
+    expect(fs.existsSync(rootCjsPath)).toBe(true);
+    expect(fs.readFileSync(rootDeclarationPath, "utf8")).toContain(
+      "checkApplicationResponse",
+    );
+    expect(fs.readFileSync(rootDeclarationPath, "utf8")).toContain(
+      "ApplicationExpectationHandle",
+    );
+
+    const esm = (await import(
+      `${pathToFileURL(rootEsmPath).href}?contracts=${Date.now()}`
+    )) as Record<string, unknown>;
+    const cjs = createRequire(import.meta.url)(rootCjsPath) as Record<
+      string,
+      unknown
+    >;
+    expect(typeof esm.checkApplicationResponse).toBe("function");
+    expect(typeof cjs.checkApplicationResponse).toBe("function");
+    expect(typeof esm.createApplicationExpectationManager).toBe("function");
+    expect(typeof cjs.createApplicationExpectationManager).toBe("function");
   });
 
   it("imports without Node builtins or browser collector initialization", async () => {

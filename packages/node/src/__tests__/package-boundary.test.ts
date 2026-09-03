@@ -4,8 +4,10 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   autoCapture,
+  beginApplicationExpectation,
   createCrumbtrailExpressErrorMiddleware,
   createCrumbtrailExpressMiddleware,
+  sendApplicationResponseAssertions,
   installHttpRequestCapture,
   instrumentDatabaseClient,
   instrumentMongoClient,
@@ -72,6 +74,7 @@ describe("package runtime boundary", () => {
 
   it("exports the capture primitives the setup wizard injects", () => {
     expect(typeof autoCapture).toBe("function");
+    expect(typeof beginApplicationExpectation).toBe("function");
     expect(typeof createCrumbtrailExpressMiddleware).toBe("function");
     expect(typeof createCrumbtrailExpressErrorMiddleware).toBe("function");
     expect(typeof installHttpRequestCapture).toBe("function");
@@ -83,6 +86,7 @@ describe("package runtime boundary", () => {
     expect(typeof withCrumbtrailAwsLambda).toBe("function");
     expect(typeof withCrumbtrailVercel).toBe("function");
     expect(typeof withCrumbtrailNetlify).toBe("function");
+    expect(typeof sendApplicationResponseAssertions).toBe("function");
   });
 
   it("exports nothing that analyses a session", async () => {

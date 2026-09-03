@@ -310,6 +310,55 @@ Assertion event timestamps are non-negative safe integer Unix milliseconds withi
 the ECMAScript `Date` range. The exported event builder rejects timestamps
 outside that definition.
 
+### Checking response semantics and expected effects
+
+When a response has a valid HTTP shape but the application knows that a bounded
+business fact is wrong, check it with `checkResponse()`:
+
+```ts
+const result = crumbtrail.checkResponse(response, [
+  {
+    name: "cart_total",
+    operator: "equals",
+    expected: 100,
+    path: "data.total",
+  },
+]);
+```
+
+Each declaration reads one exact own-property path, or one bounded selector for
+an array item. The response is not retained or sent. Only a boolean, finite
+number, or short identifier-shaped string may become event data. Objects,
+prose, emails, tokens, headers, accessors, prototype paths, and missing values
+are rejected. A call accepts at most 20 facts, selectors scan at most 25 items,
+and a session emits at most 100 response facts. Only admitted events consume
+the cap, and the count survives reloads with session persistence enabled.
+Inactive capture returns `capture_not_admitted`. The event kind is
+`app.response.assertion`, and `reportResponse()` is an alias when the name is
+more readable at the call site.
+
+For work that should happen after a successful operation, declare the expected
+effect before starting it:
+
+```ts
+const expectation = crumbtrail.expectSideEffect({
+  name: "inventory_update",
+  kind: "update",
+  deadlineMs: 2_000,
+});
+
+// Call this when the application observes the update or external effect.
+expectation.handle?.satisfy();
+```
+
+The supported kinds include `update`, `external`, `queue`, and `work`. An
+unsatisfied declaration emits one `app.expectation.missed` event at its
+deadline or when the session stops. `cancel()` suppresses that event for work
+the application intentionally abandoned. Deadlines are bounded from 1 ms to
+24 hours, expectation handles are opaque, and timers do not keep a Node process
+alive. These APIs declare application knowledge. They do not infer business
+correctness or discover an effect that the application did not declare.
+
 `createRequestHeaders()` is for a transport Crumbtrail does not patch, such as a
 WebSocket frame, a server action, or a queue message. It returns the session
 header, the request id header, and a `traceparent`, exactly what the automatic

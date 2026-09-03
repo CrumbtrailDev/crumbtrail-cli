@@ -102,6 +102,8 @@ const SAFE_VALUE_RE = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}$/;
 const CORRELATION_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 const SECRET_PREFIX_RE =
   /^(?:sk|pk)_(?:live|test)_|^(?:ghp|gho|ghu|ghs|ghr)_|^github_pat_|^xox[abprs]-|^bearer[: _-]/i;
+const SENSITIVE_VALUE_RE =
+  /(?:^|[_:./-])(secret|token|password|passwd|authorization|cookie|bearer|credential|credentials|api[_-]?key|access[_-]?token|refresh[_-]?token|private[_-]?key)(?:$|[_:./-])/i;
 
 type AssertionSnapshot = {
   name: unknown;
@@ -118,8 +120,7 @@ type SnapshotResult =
   | { accepted: false; rejection: "invalid_options" };
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== "object")
-    return false;
+  if (value === null || typeof value !== "object") return false;
   try {
     if (Array.isArray(value)) return false;
     const prototype = Object.getPrototypeOf(value);
@@ -161,7 +162,9 @@ function snapshotApplicationAssertionOptions(input: unknown): SnapshotResult {
   }
 }
 
-function isSafeName(value: unknown): value is string {
+export function isSafeApplicationAssertionName(
+  value: unknown,
+): value is string {
   return (
     typeof value === "string" &&
     value.length > 0 &&
@@ -187,7 +190,8 @@ export function isSafeApplicationAssertionValue(
     !SAFE_VALUE_RE.test(value)
   )
     return false;
-  if (SECRET_PREFIX_RE.test(value)) return false;
+  if (SECRET_PREFIX_RE.test(value) || SENSITIVE_VALUE_RE.test(value))
+    return false;
   return classifyStructuredValue(value).action === "keep";
 }
 
@@ -216,7 +220,9 @@ function isApplicationAssertionOperator(
   );
 }
 
-function isSafeCorrelation(value: unknown): value is string {
+export function isSafeApplicationAssertionCorrelation(
+  value: unknown,
+): value is string {
   return (
     typeof value === "string" &&
     value.length > 0 &&
@@ -225,7 +231,7 @@ function isSafeCorrelation(value: unknown): value is string {
   );
 }
 
-function isCanonicalApplicationAssertionTimestamp(
+export function isCanonicalApplicationAssertionTimestamp(
   value: unknown,
 ): value is number {
   return (
@@ -263,7 +269,7 @@ function buildApplicationAssertionDataFromSnapshot(
 ):
   | { accepted: true; passed: boolean; data: ApplicationAssertionEventData }
   | { accepted: false; rejection: ApplicationAssertionDataRejection } {
-  if (!isSafeName(options.name))
+  if (!isSafeApplicationAssertionName(options.name))
     return { accepted: false, rejection: "invalid_name" };
   if (classifyStructuredValue(true, options.name).action !== "keep")
     return { accepted: false, rejection: "invalid_name" };
@@ -285,9 +291,11 @@ function buildApplicationAssertionDataFromSnapshot(
     return { accepted: false, rejection: "operator_requires_numbers" };
   if (
     (options.requestId !== undefined &&
-      !isSafeCorrelation(options.requestId)) ||
-    (options.traceId !== undefined && !isSafeCorrelation(options.traceId)) ||
-    (options.sessionId !== undefined && !isSafeCorrelation(options.sessionId))
+      !isSafeApplicationAssertionCorrelation(options.requestId)) ||
+    (options.traceId !== undefined &&
+      !isSafeApplicationAssertionCorrelation(options.traceId)) ||
+    (options.sessionId !== undefined &&
+      !isSafeApplicationAssertionCorrelation(options.sessionId))
   )
     return { accepted: false, rejection: "correlation_invalid" };
 

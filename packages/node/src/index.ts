@@ -13,6 +13,23 @@ export type {
 } from "./assertion";
 
 export {
+  beginApplicationExpectation,
+  expectSideEffect,
+  expectApplicationEffect,
+  sendApplicationResponseAssertions,
+  sendResponseAssertions,
+  sendApplicationResponseFacts,
+  clearApplicationExpectationSession,
+} from "./application-contracts";
+
+export type {
+  SendApplicationResponseAssertionsOptions,
+  SendApplicationResponseFactResult,
+  SendApplicationResponseAssertionsResult,
+  BeginApplicationExpectationOptions,
+} from "./application-contracts";
+
+export {
   CACHE_EVENT_KIND,
   AUTO_INSTRUMENT_CACHE_DRIVERS,
   autoInstrumentCacheClients,
