@@ -466,6 +466,43 @@ describe("report screenshot API", () => {
     await logger.stop();
   });
 
+  it("does not end a closed lifecycle session twice when stop follows", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    let finishEvents!: () => void;
+    const eventsFinished = new Promise<void>((resolve) => {
+      finishEvents = resolve;
+    });
+    transport.sendEvents.mockImplementationOnce(async () => eventsFinished);
+    const logger = init(transport);
+    await logger.captureScreenshot(imageBlob(png()));
+    logger.mark("keep lifecycle close pending");
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(transport.sendEvents).toHaveBeenCalledOnce();
+    const lifecycleClose = (
+      logger as unknown as { lifecycleClosePromise?: Promise<void> }
+    ).lifecycleClosePromise;
+    expect(lifecycleClose).toBeDefined();
+    const stopping = logger.stop();
+    expect(transport.endSession).not.toHaveBeenCalled();
+
+    await expect(logger.captureScreenshot(imageBlob(png()))).rejects.toThrow(
+      "active session",
+    );
+    finishEvents();
+    await expect(stopping).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(transport.endSession).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
   it("uses one pagehide deadline for admission and a pending send", async () => {
     vi.useFakeTimers();
     const transport = makeTransport();

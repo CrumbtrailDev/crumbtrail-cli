@@ -1921,6 +1921,9 @@ export class Crumbtrail {
         }
         this.startLifecycleEnd();
         await this.lifecycleEndPromise;
+        // The lifecycle end finalized this session. Mark it closed before releasing the
+        // lifecycle promise so a later explicit stop cannot end the same session again.
+        this.sessionStarted = false;
         this.lifecycleSuspended = true;
       } finally {
         this.lifecycleClosing = false;
