@@ -486,6 +486,15 @@ session behavior and does not retry in a loop. The AWS, Vercel, and Netlify
 endpoint wrappers similarly reuse one binding across warm invocations for the
 same endpoint and project, with a bounded idle cache.
 
+The Node package executes the `runtime.cpu_profile` probe when a targeted
+config response requests it. It uses `node:inspector` for a fixed 1,000 ms
+sampling window and a 2,000 ms hard deadline. The result contains only
+`durationMs`, `sampleCount` and up to 50 bounded function rows. The profiler
+does not accept a duration or interval from the caller. If the runtime binding
+is absent, expired or revoked, the response is untargeted, the inspector is
+unsupported, another profile is active, or cleanup fails, the SDK emits an
+explicit unavailable/error result and leaves application execution unchanged.
+
 ### Structured logs
 
 A real backend logs through pino, winston or bunyan, and a failure it expected is

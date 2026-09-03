@@ -275,6 +275,12 @@ that started the target session. A same-origin config poll carries that binding.
 `configEndpoint`, and older SDKs that omit the binding, continue to receive untargeted project
 probes.
 
+The exact allowlist includes `runtime.env`, `runtime.cpu_profile`, `storage.snapshot`,
+`network.inflight` and `flags.current`. `runtime.cpu_profile` is Node-only and requires the exact
+runtime binding for the targeted session. It uses a fixed 1,000 ms sampling window and a 2,000 ms
+hard deadline, and returns only `durationMs`, `sampleCount` and up to 50 bounded function rows.
+Browser/core callers and untargeted or stale responses return an explicit `unavailable` result.
+
 ## Never remotely settable
 
 These are ignored wherever they appear in a response, including inside `collectors`:
