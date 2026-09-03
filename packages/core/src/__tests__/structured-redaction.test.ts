@@ -8,6 +8,7 @@ import {
   BROWSER_REDACTION_POLICY_V2,
   classifyStructuredValue,
   computeRedactedShape,
+  redactDiagnosticFields,
   redactNetworkTextBody,
   resetStructuredShapeSaltForTests,
   redactUrl,
@@ -16,6 +17,150 @@ import {
 
 const JWT =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c";
+
+describe("redactDiagnosticFields", () => {
+  const pick = (
+    value: unknown,
+    diagnosticFields: readonly string[],
+    options: { denyFields?: readonly string[] } = {},
+  ) => redactDiagnosticFields(value, { diagnosticFields, ...options }).value;
+
+  it("keeps only exact nested scalar paths and selected array entries", () => {
+    expect(
+      pick(
+        {
+          checkout: {
+            status: "failed",
+            message: "upstream failed",
+            ignored: "not selected",
+          },
+          attempts: [
+            { code: "E_TIMEOUT", label: "first" },
+            { code: "E_OTHER", label: "second" },
+          ],
+        },
+        ["checkout.status", "checkout.message", "attempts[0].code"],
+      ),
+    ).toEqual({
+      checkout: { message: "upstream failed", status: "failed" },
+      attempts: [{ code: "E_TIMEOUT" }],
+    });
+  });
+
+  it("rejects wildcards, inherited properties, accessors, and prototype paths", () => {
+    const value = Object.create({ inherited: "must not be read" }) as Record<
+      string,
+      unknown
+    >;
+    Object.defineProperty(value, "safe", {
+      enumerable: true,
+      value: "ok",
+    });
+    Object.defineProperty(value, "__proto__", {
+      enumerable: true,
+      value: { polluted: "must not survive" },
+    });
+    let getterReads = 0;
+    Object.defineProperty(value, "getter", {
+      enumerable: true,
+      get: () => {
+        getterReads += 1;
+        return "must not execute";
+      },
+    });
+
+    const result = redactDiagnosticFields(value, {
+      diagnosticFields: [
+        "safe",
+        "inherited",
+        "getter",
+        "safe.*",
+        "__proto__.polluted",
+        "constructor.prototype.polluted",
+      ],
+    });
+
+    expect(result.value).toEqual({ safe: "ok" });
+    expect(getterReads).toBe(0);
+    expect(Object.prototype).not.toHaveProperty("polluted");
+  });
+
+  it("stops safely at circular objects", () => {
+    const value: Record<string, unknown> = { status: "ok" };
+    value.self = value;
+
+    const result = redactDiagnosticFields(value, {
+      diagnosticFields: ["status", "self.status"],
+    });
+
+    expect(result.value).toEqual({ status: "ok" });
+    expect(result.metadata?.fields).toContainEqual({
+      path: "diagnosticFields.self",
+      reason: "diagnostic_circular",
+      action: "redacted",
+    });
+  });
+
+  it("keeps explicit plain strings but sensitive names and value patterns still win", () => {
+    const result = redactDiagnosticFields(
+      {
+        safe: "upstream failed",
+        email: "person@example.com",
+        neutral: `Bearer ${JWT}`,
+        cardish: "4111111111111111",
+        password: "hunter2",
+      },
+      {
+        diagnosticFields: ["safe", "email", "neutral", "cardish", "password"],
+      },
+    );
+
+    expect(result.value).toEqual({ safe: "upstream failed" });
+    expect(result.metadata?.fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: "diagnosticFields.neutral" }),
+        expect.objectContaining({ path: "diagnosticFields.cardish" }),
+      ]),
+    );
+  });
+
+  it("drops oversized and non-finite values, enforces the entry bound, and honors denyFields", () => {
+    const value: Record<string, unknown> = {
+      short: "support detail",
+      oversized: "x".repeat(257),
+      infinity: Number.POSITIVE_INFINITY,
+      denied: "do not retain",
+    };
+
+    const result = redactDiagnosticFields(value, {
+      diagnosticFields: [
+        "short",
+        "oversized",
+        "infinity",
+        "denied",
+      ],
+      denyFields: ["denied"],
+    });
+
+    expect(result.value).toMatchObject({ short: "support detail" });
+    expect(result.value).not.toHaveProperty("oversized");
+    expect(result.value).not.toHaveProperty("infinity");
+    expect(result.value).not.toHaveProperty("denied");
+
+    const bounded = Object.fromEntries(
+      Array.from({ length: 17 }, (_, index) => [
+        `field${String(index).padStart(2, "0")}`,
+        index,
+      ]),
+    );
+    const boundedResult = redactDiagnosticFields(bounded, {
+      diagnosticFields: Object.keys(bounded),
+    });
+    expect(Object.keys(boundedResult.value as Record<string, unknown>)).toHaveLength(
+      16,
+    );
+  });
+});
 
 /* ------------------------------------------------------------------ */
 /* Classifier table tests                                              */

@@ -231,6 +231,27 @@ export interface StructuredFieldPolicy {
   keepFields?: string[];
 }
 
+export type DiagnosticScalar = string | number | boolean | null;
+
+/** The maximum number of explicitly selected diagnostic leaves in one event. */
+export const DIAGNOSTIC_FIELD_MAX_ENTRIES = 16;
+
+/** The maximum length of a retained diagnostic string. */
+export const DIAGNOSTIC_FIELD_MAX_STRING_LENGTH = 256;
+
+/**
+ * An explicit, relative field-path allowlist for small diagnostic maps.
+ *
+ * Paths use dot-separated property names and numeric array indexes such as
+ * `checkout.status` and `attempts[0].code`. Wildcards and prototype paths are
+ * intentionally not part of this grammar.
+ */
+export interface DiagnosticFieldRedactionOptions {
+  diagnosticFields: readonly string[];
+  denyFields?: readonly string[];
+  path?: string;
+}
+
 export interface StoredValueRedactionOptions {
   key?: string;
   maxLength?: number;
@@ -2020,7 +2041,7 @@ function fieldNameWords(name: string): string[] {
  */
 function isApplicationDeniedName(
   name: string | undefined,
-  denyFields?: string[],
+  denyFields?: readonly string[],
 ): boolean {
   if (!name || !denyFields || denyFields.length === 0) return false;
   const compact = compactFieldName(name);
@@ -2401,6 +2422,347 @@ export function classifyStructuredValue(
   if (kept) return { action: "keep" };
   if (isPlainMessageValue(value, keyName)) return { action: "keep" };
   return { action: "redact", reason: "free_text_value" };
+}
+
+type DiagnosticPathPart =
+  | { kind: "key"; value: string }
+  | { kind: "index"; value: number };
+
+interface DiagnosticPathNode {
+  terminal: boolean;
+  keys: Map<string, DiagnosticPathNode>;
+  indexes: Map<number, DiagnosticPathNode>;
+}
+
+const DIAGNOSTIC_PATH_MAX_LENGTH = 256;
+const DIAGNOSTIC_RESERVED_KEYS = new Set([
+  "__proto__",
+  "prototype",
+  "constructor",
+  "body",
+  "requestbody",
+  "responsebody",
+  "header",
+  "headers",
+  "rawbody",
+  "rawheaders",
+  "rawstack",
+  "stack",
+  "locals",
+]);
+const DIAGNOSTIC_KEY_RE = /^[A-Za-z_$][A-Za-z0-9_$-]*$/;
+const DIAGNOSTIC_INDEX_RE = /^(?:0|[1-9][0-9]{0,5})$/;
+
+function newDiagnosticPathNode(): DiagnosticPathNode {
+  return { terminal: false, keys: new Map(), indexes: new Map() };
+}
+
+function parseDiagnosticFieldPath(path: string): DiagnosticPathPart[] | undefined {
+  if (
+    path.length === 0 ||
+    path.length > DIAGNOSTIC_PATH_MAX_LENGTH ||
+    path.trim() !== path
+  ) {
+    return undefined;
+  }
+
+  const parts: DiagnosticPathPart[] = [];
+  let offset = 0;
+  const readKey = (): boolean => {
+    const start = offset;
+    while (
+      offset < path.length &&
+      path[offset] !== "." &&
+      path[offset] !== "["
+    ) {
+      offset += 1;
+    }
+    const key = path.slice(start, offset);
+    if (!DIAGNOSTIC_KEY_RE.test(key)) return false;
+    parts.push({ kind: "key", value: key });
+    return true;
+  };
+  const readIndex = (): boolean => {
+    const start = offset;
+    const closing = path.indexOf("]", offset);
+    if (closing < 0) return false;
+    const index = path.slice(start, closing);
+    if (!DIAGNOSTIC_INDEX_RE.test(index)) return false;
+    parts.push({ kind: "index", value: Number(index) });
+    offset = closing + 1;
+    return true;
+  };
+
+  if (path[0] === "[") {
+    offset = 1;
+    if (!readIndex()) return undefined;
+  } else if (!readKey()) {
+    return undefined;
+  }
+
+  while (offset < path.length) {
+    if (path[offset] === ".") {
+      offset += 1;
+      if (!readKey()) return undefined;
+      continue;
+    }
+    if (path[offset] === "[") {
+      offset += 1;
+      if (!readIndex()) return undefined;
+      continue;
+    }
+    return undefined;
+  }
+  return parts;
+}
+
+function isDiagnosticReservedKey(key: string): boolean {
+  const compact = compactFieldName(key);
+  return (
+    DIAGNOSTIC_RESERVED_KEYS.has(key.toLowerCase()) ||
+    DIAGNOSTIC_RESERVED_KEYS.has(compact)
+  );
+}
+
+function compileDiagnosticFieldPaths(
+  paths: readonly string[],
+  denyFields: readonly string[] | undefined,
+): DiagnosticPathNode {
+  const root = newDiagnosticPathNode();
+  const normalized = new Map<string, DiagnosticPathPart[]>();
+
+  for (const candidate of paths) {
+    if (typeof candidate !== "string") continue;
+    const parsed = parseDiagnosticFieldPath(candidate);
+    if (!parsed || parsed.length === 0) continue;
+    if (
+      parsed.some(
+        (part) =>
+          part.kind === "key" &&
+          (isDiagnosticReservedKey(part.value) ||
+            isSensitiveName(part.value) ||
+            isApplicationDeniedName(part.value, denyFields)),
+      )
+    ) {
+      continue;
+    }
+    normalized.set(candidate, parsed);
+  }
+
+  for (const [, parts] of [...normalized.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .slice(0, DIAGNOSTIC_FIELD_MAX_ENTRIES)) {
+    let node = root;
+    for (const part of parts) {
+      let child =
+        part.kind === "key"
+          ? node.keys.get(part.value)
+          : node.indexes.get(part.value);
+      if (!child) {
+        child = newDiagnosticPathNode();
+        if (part.kind === "key") {
+          node.keys.set(part.value, child);
+        } else {
+          node.indexes.set(part.value, child);
+        }
+      }
+      node = child;
+    }
+    node.terminal = true;
+  }
+  return root;
+}
+
+function diagnosticPathForPart(path: string, part: DiagnosticPathPart): string {
+  return part.kind === "key" ? `${path}.${part.value}` : `${path}[${part.value}]`;
+}
+
+function safeDiagnosticObject(): Record<string, unknown> {
+  return Object.create(null) as Record<string, unknown>;
+}
+
+function readOwnDiagnosticValue(
+  value: object,
+  key: string,
+): { found: true; value: unknown } | { found: false } {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  // Accessors can execute arbitrary code and are not stable telemetry input.
+  // Only own, enumerable data properties are eligible.
+  if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+    return { found: false };
+  }
+  return { found: true, value: descriptor.value };
+}
+
+function diagnosticLeafValue(
+  value: unknown,
+  keyName: string | undefined,
+  path: string,
+  fields: RedactionField[],
+  denyFields: readonly string[] | undefined,
+): DiagnosticScalar | undefined {
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    fields.push({ path, reason: "diagnostic_non_finite", action: "redacted" });
+    return undefined;
+  }
+
+  const classification = classifyStructuredValue(
+    value,
+    keyName,
+    denyFields ? [...denyFields] : undefined,
+    undefined,
+  );
+  if (
+    classification.action === "redact" &&
+    classification.reason !== "free_text_value"
+  ) {
+    fields.push({
+      path,
+      reason: classification.reason,
+      action: "redacted",
+    });
+    return undefined;
+  }
+
+  if (typeof value === "string" && value.length > DIAGNOSTIC_FIELD_MAX_STRING_LENGTH) {
+    fields.push({
+      path,
+      reason: "diagnostic_value_too_large",
+      action: "redacted",
+    });
+    return undefined;
+  }
+
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+
+  fields.push({ path, reason: "diagnostic_non_scalar", action: "redacted" });
+  return undefined;
+}
+
+function collectDiagnosticFields(
+  node: DiagnosticPathNode,
+  value: unknown,
+  path: string,
+  keyName: string | undefined,
+  fields: RedactionField[],
+  denyFields: readonly string[] | undefined,
+  seen: WeakSet<object>,
+): unknown {
+  const isObject = value !== null && typeof value === "object";
+  if (!isObject) {
+    if (!node.terminal) return undefined;
+    return diagnosticLeafValue(value, keyName, path, fields, denyFields);
+  }
+  if (seen.has(value)) {
+    fields.push({ path, reason: "diagnostic_circular", action: "redacted" });
+    return undefined;
+  }
+  seen.add(value);
+
+  try {
+    if (node.terminal && node.keys.size === 0 && node.indexes.size === 0) {
+      fields.push({ path, reason: "diagnostic_non_scalar", action: "redacted" });
+      return undefined;
+    }
+
+    const isArray = Array.isArray(value);
+    const output = isArray ? [] : safeDiagnosticObject();
+    let retained = 0;
+
+    const append = (part: DiagnosticPathPart, child: DiagnosticPathNode) => {
+      if (retained >= DIAGNOSTIC_FIELD_MAX_ENTRIES) return;
+      if (isArray && part.kind !== "index") return;
+      if (!isArray && part.kind !== "key") return;
+      const key = part.kind === "key" ? part.value : String(part.value);
+      const own = readOwnDiagnosticValue(value, key);
+      if (!own.found) return;
+      const childValue = collectDiagnosticFields(
+        child,
+        own.value,
+        diagnosticPathForPart(path, part),
+        part.kind === "key" ? part.value : keyName,
+        fields,
+        denyFields,
+        seen,
+      );
+      if (childValue === undefined) return;
+      if (part.kind === "index") {
+        (output as unknown[])[part.value] = childValue;
+      } else {
+        Object.defineProperty(output, key, {
+          configurable: true,
+          enumerable: true,
+          value: childValue,
+
+          writable: true,
+        });
+      }
+      retained += 1;
+    };
+
+    for (const [key, child] of [...node.keys.entries()].sort(([a], [b]) =>
+      a.localeCompare(b),
+    )) {
+      append({ kind: "key", value: key }, child);
+    }
+    for (const [index, child] of [...node.indexes.entries()].sort(
+      ([a], [b]) => a - b,
+    )) {
+      append({ kind: "index", value: index }, child);
+    }
+
+    if (retained === 0) return undefined;
+    return output;
+  } finally {
+    seen.delete(value);
+  }
+}
+
+/**
+ * Selects explicitly named scalar diagnostics from an arbitrary object.
+ *
+ * This is a narrow opt-in for support evidence, not a general serializer. It
+ * never follows unselected fields, inherited properties, accessors, or
+ * prototype-like keys. Sensitive names and value patterns are still denied,
+ * selected containers are traversed only to reach another selected path, and
+ * oversized strings and non-scalars are dropped.
+ */
+export function redactDiagnosticFields(
+  value: unknown,
+  options: DiagnosticFieldRedactionOptions,
+): RedactionResult<unknown> {
+  const fields: RedactionField[] = [];
+  const root = compileDiagnosticFieldPaths(
+    options.diagnosticFields,
+    options.denyFields,
+  );
+  const output = collectDiagnosticFields(
+    root,
+    value,
+    options.path ?? "diagnosticFields",
+    undefined,
+    fields,
+    options.denyFields,
+    new WeakSet<object>(),
+  );
+  return {
+    value: output ?? safeDiagnosticObject(),
+    ...(fields.length > 0
+      ? {
+          metadata: {
+            policy: BROWSER_REDACTION_POLICY_V2,
+            fields,
+          },
+        }
+      : {}),
+  };
 }
 
 /**
