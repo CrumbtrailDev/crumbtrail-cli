@@ -21,9 +21,16 @@ const PARENT_TRACEPARENT =
 function makeFakeProcess(opts: {
   env?: Record<string, string | undefined>;
   loadEnvFile?: () => void;
-  runtime?: Partial<
-    Pick<NodeJS.Process, "pid" | "memoryUsage" | "cpuUsage" | "uptime">
-  >;
+  runtime?: {
+    pid?: number;
+    memoryUsage?: () => {
+      rss?: number;
+      heapUsed?: number;
+      external?: number;
+    };
+    cpuUsage?: () => { user: number; system: number };
+    uptime?: () => number;
+  };
 }): NodeJS.Process {
   const emitter = new EventEmitter() as unknown as NodeJS.Process;
   (emitter as unknown as { env: Record<string, string | undefined> }).env =
