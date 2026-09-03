@@ -445,6 +445,16 @@ installed the middleware claims the request and the `http.Server` hook stays
 silent, so a request is recorded once. Disable the hook with
 `captureHttpRequests: false`.
 
+With an ingest key, `autoCapture` registers one runtime identity for the Node
+process. The identity is sent as top level fields on session start.
+`autoCapture` does not poll remote capture configuration. The proof stays in
+process memory and is reused or rotated when a session is re-established.
+There is no background rotation timer. `stop()` retires the binding. If registration
+is unavailable or rate limited, auto capture keeps the existing untargeted
+session behavior and does not retry in a loop. The AWS, Vercel, and Netlify
+endpoint wrappers similarly reuse one binding across warm invocations for the
+same endpoint and project, with a bounded idle cache.
+
 ### Structured logs
 
 A real backend logs through pino, winston or bunyan, and a failure it expected is

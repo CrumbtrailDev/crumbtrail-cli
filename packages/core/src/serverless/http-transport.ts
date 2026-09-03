@@ -1,4 +1,10 @@
 import type { BugEvent } from "../types";
+import {
+  getCachedRuntimeBindingClient,
+  resolveRuntimeBindingClient,
+  type RuntimeBindingClient,
+  type RuntimeBindingHandle,
+} from "../runtime-binding";
 import type {
   ServerlessInvocationEvent,
   ServerlessInvocationSession,
@@ -14,6 +20,10 @@ export interface ServerlessHttpTransportOptions {
   authToken?: string;
   fetchImpl?: typeof fetch;
   requestTimeoutMs?: number;
+  /** Internal clock shared with the invocation for deterministic rotation. */
+  now?: () => number;
+  /** Opaque SDK-owned runtime identity for targeted probe delivery. */
+  runtimeBinding?: RuntimeBindingHandle;
 }
 
 export class ServerlessConfigurationError extends Error {
@@ -93,6 +103,7 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
   private readonly fetcher: typeof fetch;
   private readonly timeoutMs: number;
   private readonly requestSubject: string;
+  private readonly runtimeBinding: RuntimeBindingClient;
   private readonly operations: QueuedOperation[] = [];
   private flushTail: Promise<void> = Promise.resolve();
 
@@ -111,6 +122,23 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
     this.fetcher = options.fetchImpl ?? fetch;
     this.timeoutMs = normalizeTimeout(options.requestTimeoutMs);
     this.requestSubject = requestSubject;
+    const suppliedBinding = options.runtimeBinding
+      ? resolveRuntimeBindingClient(options.runtimeBinding)
+      : undefined;
+    if (options.runtimeBinding &&
+        !suppliedBinding?.matchesScope(endpoint, options.authToken)) {
+      throw new ServerlessConfigurationError(
+        "Crumbtrail runtime binding does not match the capture endpoint and project",
+      );
+    }
+    this.runtimeBinding =
+      suppliedBinding ??
+      getCachedRuntimeBindingClient({
+        endpoint,
+        projectKey: options.authToken,
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+        ...(options.now ? { now: options.now } : {}),
+      });
   }
 
   startSession(session: ServerlessInvocationSession): void {
@@ -172,23 +200,64 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
 
     for (const operation of operations) {
       if (failures.some((failure) => failure.phase === "session-start")) break;
+      const deadline = startDeadline(this.timeoutMs, signal);
       try {
-        lastResponse = await postJson(
+        throwIfAborted(deadline?.signal ?? signal);
+        const body =
+          operation.phase === "session-start"
+            ? await waitForSignal(this.sessionStartBody(operation.body), deadline?.signal ?? signal)
+            : operation.body;
+        throwIfAborted(deadline?.signal ?? signal);
+        lastResponse = await waitForSignal(postJson(
           this.fetcher,
           `${this.endpoint}${operation.path}`,
           this.headers,
-          operation.body,
+          body,
           this.timeoutMs,
           this.requestSubject,
-          signal,
-        );
+          deadline?.signal ?? signal,
+        ), deadline?.signal ?? signal);
       } catch (error) {
-        failures.push({ phase: operation.phase, error });
+        failures.push({ phase: operation.phase, error: deadline?.expired
+          ? new HeadlessTimeoutError(this.timeoutMs, this.requestSubject)
+          : error });
+      } finally {
+        deadline?.cancel();
       }
     }
 
     if (failures.length > 0) throw new ServerlessHttpFlushError(failures);
     return lastResponse;
+  }
+
+  private async sessionStartBody(body: string): Promise<string> {
+    const binding = await this.runtimeBinding.getBinding();
+    if (!binding) return body;
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    return JSON.stringify({
+      ...parsed,
+      instanceId: binding.instanceId,
+      instanceProof: binding.instanceProof,
+    });
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason ?? new Error("Request aborted");
+}
+
+async function waitForSignal<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return pending;
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error("Request aborted"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([pending, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -206,6 +275,10 @@ export interface HeadlessSessionOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   signal?: AbortSignal;
+  now?: () => number;
+  /** Reused by Node autoCapture across session re-establishes. */
+  /** Opaque SDK-owned runtime identity for targeted probe delivery. */
+  runtimeBinding?: RuntimeBindingHandle;
 }
 
 export interface HeadlessSession {
@@ -224,6 +297,10 @@ export async function startHeadlessSession(
       ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
       ...(options.timeoutMs !== undefined
         ? { requestTimeoutMs: options.timeoutMs }
+        : {}),
+      ...(options.now ? { now: options.now } : {}),
+      ...(options.runtimeBinding
+        ? { runtimeBinding: options.runtimeBinding }
         : {}),
     },
     "headless session",

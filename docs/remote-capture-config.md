@@ -12,6 +12,19 @@ Applies to `crumbtrail-core` 0.40.0 and later. Schema version: **2**.
 - The endpoint answers `200` with JSON. `4xx` and `5xx` are ignored and the last known policy
   stands.
 
+The current SDK first registers a per tab runtime identity with
+`POST <httpEndpoint>/api/runtime/register?projectKey=<key>`. The response contains
+an opaque `instanceId`, an `instanceProof`, and an `expiresAt` timestamp. The
+proof is kept in memory and sent only on session start as the top level
+`instanceProof`. A config poll also carries the `instanceId` and
+`Authorization: Bearer <instanceProof>` only when the resolved config polling
+origin matches the `httpEndpoint` origin. An explicit `configEndpoint` on another
+origin uses the legacy untargeted request and receives no runtime proof. The SDK
+rotates the proof before expiry. A failed or rate limited registration does not
+stop capture, and the poll falls back to the legacy untargeted request. Endpoint
+based serverless wrappers reuse one binding across warm invocations for the same
+endpoint and project, with a bounded idle cache.
+
 ## Minimal working response
 
 ```json
@@ -29,8 +42,13 @@ Applies to `crumbtrail-core` 0.40.0 and later. Schema version: **2**.
 ## Verify it applied
 
 1. Serve the response above from the config route.
-2. Reload the app and watch the network tab for `GET /api/capture-config`. The SDK sends
-   `cache: "no-store"`, so every poll is a real request.
+2. Reload the app and watch the network tab for `POST /api/runtime/register`,
+   `POST /api/session/start`, and `GET /api/capture-config`. When the config poll
+   uses the same origin as `httpEndpoint`, it includes `instanceId` and an
+   `Authorization` bearer header. A different-origin `configEndpoint` uses the
+   untargeted request without either value. The SDK sends `cache: "no-store"`,
+   so every poll is a real request. The bearer must not appear in session
+   metadata or captured events.
 3. The policy is live once the SDK starts sending events. Until a poll returns a **recognised**
    policy, capture is buffered and nothing is delivered; after `REMOTE_POLICY_TIMEOUT_MS` with no
    recognised policy the SDK opens the gate on the local config and records a
@@ -251,7 +269,11 @@ window is visible to whoever reads the report cut from it.
 
 `probes` is an array of probe names. At most 4 run per poll, duplicates are dropped, an unknown
 name is dropped, and one non-string entry refuses the whole field. A poll carrying `probes` and
-nothing else is not a recognised policy, so its probes do not run.
+nothing else is not a recognised policy, so its probes do not run. A current SDK binds targeted
+delivery to its registered runtime identity. Cloud delivers a targeted probe only to the runtime
+that started the target session. A same-origin config poll carries that binding. A different-origin
+`configEndpoint`, and older SDKs that omit the binding, continue to receive untargeted project
+probes.
 
 ## Never remotely settable
 

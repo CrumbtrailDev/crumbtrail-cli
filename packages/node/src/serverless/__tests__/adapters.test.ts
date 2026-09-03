@@ -40,17 +40,26 @@ function terminalEvents(events: readonly ServerlessInvocationEvent[]) {
 }
 
 describe("Node serverless adapters", () => {
-  it("uses endpoint only configuration for AWS, Vercel, and Netlify lifecycles", async () => {
+  it("reuses stable fetch and clock seams across AWS, Vercel, and Netlify lifecycles", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const runtime = {
+      instanceId: "ri_runtime_adapters",
+      instanceProof: `proof_adapters_${"x".repeat(40)}`,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    };
     const fetchImpl: typeof fetch = async (input, init) => {
       calls.push({ url: String(input), init });
+      if (String(input).includes("/api/runtime/register"))
+        return new Response(JSON.stringify(runtime), { status: 201 });
       return new Response("{}", { status: 200 });
     };
+    const now = () => Date.now();
     const options = {
       endpoint: "https://capture.example",
       authToken: "ingest-key",
       service: "orders-api",
       fetchImpl,
+      now,
     };
 
     await withCrumbtrailAwsLambda(async () => ({ statusCode: 201 }), options)(
@@ -75,6 +84,23 @@ describe("Node serverless adapters", () => {
     expect(
       calls.filter((call) => call.url.endsWith("/api/session/end")),
     ).toHaveLength(3);
+    expect(
+      calls.filter((call) => call.url.includes("/api/runtime/register")),
+    ).toHaveLength(1);
+    const starts = calls.filter((call) =>
+      call.url.endsWith("/api/session/start"),
+    );
+    expect(starts.map((call) => JSON.parse(String(call.init?.body)))).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          instanceId: runtime.instanceId,
+          instanceProof: runtime.instanceProof,
+        }),
+      ]),
+    );
+    expect(
+      starts.map((call) => JSON.parse(String(call.init?.body)).instanceId),
+    ).toEqual([runtime.instanceId, runtime.instanceId, runtime.instanceId]);
   });
 
   it("normalizes API Gateway v1, v2, and compatible HTTP events", async () => {

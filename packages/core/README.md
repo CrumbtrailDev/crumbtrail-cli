@@ -391,6 +391,18 @@ first policy response, then falls back to this call and records a
 wait on first load rather than the session. Point `configEndpoint` somewhere
 else only for a self hosted config service.
 
+When an ingest key is present, the SDK also registers one runtime identity with
+`POST /api/runtime/register` on the ingest host. Cloud returns an opaque
+`instanceId`, a short lived bearer proof, and `expiresAt`. The SDK keeps these
+values in memory and sends them only as top level session start fields. A config
+poll also uses the identity and bearer proof only when its resolved origin
+matches the ingest host. A different-origin `configEndpoint` stays on the
+legacy untargeted poll. It rotates the proof before expiry and falls back to the
+untargeted poll when registration is unavailable or rate limited. Registration
+is bounded and does not block capture indefinitely. Endpoint based serverless
+wrappers reuse one binding across warm invocations for the same endpoint and
+project, with a bounded idle cache.
+
 Set `flightRecorder: true` to buffer locally until an error, signal, widget
 action, or `flag()` triggers capture. The recorder adds the configured tail
 before finalizing the report. A cloud config response can disable capture with
@@ -417,10 +429,10 @@ probe never throws: a failure rests as a `probe.result` carrying `ok: false` and
 because "this source was not available in production" is itself an answer. Values pass through the
 same redaction the rest of capture uses.
 
-A probe is answered by whichever application instance is polling when the request goes out. That is
-not the session an agent is investigating, and by the time a bundle is being read that session has
-ended, so a probe reports on a bystander rather than on the person who hit the defect. Read every
-reading as "the app looks like this right now", never as "the failing session looked like this".
+A current SDK registers its runtime before polling. When an agent targets a
+session, Cloud sends the probe only to the matching runtime identity. Older SDKs
+continue to receive untargeted project probes. A targeted probe whose runtime
+does not poll remains unavailable instead of being answered by a bystander.
 
 `storage.snapshot` is the reading where that distinction changes what is emitted, so its keys get a
 stricter treatment than the ordinary storage capture uses. It reports which keys exist, how many,

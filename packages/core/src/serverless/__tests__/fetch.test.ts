@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { __resetRuntimeBindingCacheForTests } from "../../runtime-binding";
 import {
   SERVERLESS_INVOCATION_START_EVENT,
   SERVERLESS_INVOCATION_SUCCESS_EVENT,
@@ -7,6 +8,8 @@ import {
   type ServerlessInvocationEvent,
   type ServerlessInvocationTransport,
 } from "../index";
+
+afterEach(() => __resetRuntimeBindingCacheForTests());
 
 function collectingTransport(
   overrides: Partial<ServerlessInvocationTransport> = {},
@@ -54,8 +57,15 @@ describe("withCrumbtrailFetch", () => {
 
   it("uses endpoint only configuration for an owned delivery lifecycle", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const runtime = {
+      instanceId: "ri_runtime_fetch_owned",
+      instanceProof: `proof_fetch_owned_${"x".repeat(40)}`,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    };
     const fetchImpl: typeof fetch = async (input, init) => {
       calls.push({ url: String(input), init });
+      if (String(input).includes("/api/runtime/register"))
+        return new Response(JSON.stringify(runtime), { status: 201 });
       return new Response("{}", { status: 200 });
     };
     const response = new Response("created", { status: 201 });
@@ -70,12 +80,14 @@ describe("withCrumbtrailFetch", () => {
 
     expect(result).toBe(response);
     expect(calls.map((call) => call.url)).toEqual([
+      "https://capture.example/api/runtime/register?projectKey=ingest-key",
       "https://capture.example/api/session/start",
       "https://capture.example/api/events",
       "https://capture.example/api/events",
       "https://capture.example/api/session/end",
     ]);
-    const bodies = calls.map(
+    const intakeCalls = calls.slice(1);
+    const bodies = intakeCalls.map(
       (call) => JSON.parse(String(call.init?.body)) as Record<string, unknown>,
     );
     const sessionId = String(bodies[0].sessionId);
@@ -86,9 +98,50 @@ describe("withCrumbtrailFetch", () => {
       service: "checkout-worker",
       environment: "test",
     });
-    for (const call of calls) {
+    for (const call of intakeCalls) {
       expect(call.init?.headers).toMatchObject({
         "x-crumbtrail-auth": "ingest-key",
+      });
+    }
+  });
+
+  it("reuses one default binding across sequential warm runtime invocations", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const runtime = {
+      instanceId: "ri_runtime_fetch",
+      instanceProof: `proof_fetch_${"x".repeat(40)}`,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    };
+    const fetchImpl: typeof fetch = async (input, init) => {
+      calls.push({ url: String(input), init });
+      if (String(input).includes("/api/runtime/register"))
+        return new Response(JSON.stringify(runtime), { status: 201 });
+      return new Response("{}", { status: 200 });
+    };
+    vi.stubGlobal("fetch", fetchImpl);
+    const options = {
+      endpoint: "https://capture.example",
+      authToken: "ingest-key",
+    };
+    const handler = withCrumbtrailFetch(
+      () => new Response("ok", { status: 200 }),
+      options,
+    );
+
+    await handler(new Request("https://worker.example/one"));
+    await handler(new Request("https://worker.example/two"));
+
+    expect(
+      calls.filter((call) => call.url.includes("/api/runtime/register")),
+    ).toHaveLength(1);
+    const starts = calls.filter((call) =>
+      call.url.endsWith("/api/session/start"),
+    );
+    expect(starts).toHaveLength(2);
+    for (const start of starts) {
+      expect(JSON.parse(String(start.init?.body))).toMatchObject({
+        instanceId: runtime.instanceId,
+        instanceProof: runtime.instanceProof,
       });
     }
   });

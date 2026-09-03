@@ -52,6 +52,15 @@ describe("crumbtrail-core/serverless package boundary", () => {
     expect(fs.readFileSync(declarationPath, "utf8")).toContain(
       "ServerlessTransportConfig",
     );
+    expect(fs.readFileSync(declarationPath, "utf8")).toContain(
+      "RuntimeBindingHandle",
+    );
+    expect(fs.readFileSync(declarationPath, "utf8")).not.toContain(
+      "RuntimeBindingClient",
+    );
+    expect(fs.readFileSync(declarationPath, "utf8")).not.toContain(
+      "instanceProof",
+    );
 
     const esm = (await import(
       `${pathToFileURL(esmPath).href}?boundary=${Date.now()}`
@@ -66,6 +75,25 @@ describe("crumbtrail-core/serverless package boundary", () => {
     expect(typeof cjs.createServerlessHttpTransport).toBe("function");
     expect(typeof esm.withCrumbtrailFetch).toBe("function");
     expect(typeof cjs.withCrumbtrailFetch).toBe("function");
+    expect(typeof esm.createRuntimeBindingHandle).toBe("function");
+    expect(typeof esm.retireRuntimeBindingHandle).toBe("function");
+    expect(typeof cjs.createRuntimeBindingHandle).toBe("function");
+    expect(typeof cjs.retireRuntimeBindingHandle).toBe("function");
+    expect(esm.RuntimeBindingClient).toBeUndefined();
+    expect(esm.createRuntimeBindingClient).toBeUndefined();
+    expect(esm.getBinding).toBeUndefined();
+    expect(cjs.RuntimeBindingClient).toBeUndefined();
+    expect(cjs.createRuntimeBindingClient).toBeUndefined();
+    expect(cjs.getBinding).toBeUndefined();
+
+    const handle = (
+      esm.createRuntimeBindingHandle as (options: {
+        endpoint: string;
+        projectKey: string;
+      }) => object
+    )({ endpoint: "https://capture.example", projectKey: "project-key" });
+    expect(Reflect.ownKeys(handle)).toEqual([]);
+    expect((handle as { getBinding?: unknown }).getBinding).toBeUndefined();
   });
 
   it("imports without Node builtins or browser collector initialization", async () => {

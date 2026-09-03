@@ -1383,4 +1383,6 @@ export interface CrumbtrailTransport {
     events: BugEvent[],
     voiceBlob?: Blob,
   ): Promise<void>;
+  /** Abort a browser session-start request during `Crumbtrail.stop()`. */
+  abortPendingSessionStart?(): void;
 }

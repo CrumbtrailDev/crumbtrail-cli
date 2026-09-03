@@ -1,5 +1,9 @@
 import { buildCaptureGapEvent, type BugEvent } from "crumbtrail-core";
 import {
+  createRuntimeBindingHandle,
+  retireRuntimeBindingHandle,
+} from "crumbtrail-core/serverless";
+import {
   autoInstrumentCacheClients,
   autoInstrumentCachePatchedAnything,
   formatAutoInstrumentCacheReport,
@@ -416,12 +420,42 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
+function autoCaptureBindingKey(
+  endpoint: string,
+  projectKey: string | undefined,
+): string {
+  return `${endpoint.trim().replace(/\/+$/, "")}\u0000${projectKey?.trim() ?? ""}`;
+}
+
+function rememberAutoCaptureRetirement(
+  key: string,
+  retirement: Promise<void>,
+): void {
+  const previous = autoCaptureRetirements.get(key);
+  const combined = previous
+    ? Promise.all([previous, retirement]).then(() => undefined)
+    : retirement;
+  autoCaptureRetirements.set(key, combined);
+  void combined.then(
+    () => {
+      if (autoCaptureRetirements.get(key) === combined)
+        autoCaptureRetirements.delete(key);
+    },
+    () => {
+      if (autoCaptureRetirements.get(key) === combined)
+        autoCaptureRetirements.delete(key);
+    },
+  );
+}
+
 // Double-install guard, scoped to this module instance: prepend-injected into an
 // app entry, `autoCapture` must be idempotent if the same module instance is
 // invoked twice (e.g. test re-imports, or an entry that calls it more than once).
 // A second call on the same instance returns an inert handle. (A distinct module
 // instance — a separate CJS/ESM copy — has its own guard and is not covered.)
 let installed = false;
+
+const autoCaptureRetirements = new Map<string, Promise<void>>();
 
 /**
  * The service the live capture was installed for.
@@ -456,6 +490,7 @@ export function __resetAutoCaptureInstallForTests(): void {
 export async function autoCapture(
   options: AutoCaptureOptions,
 ): Promise<AutoCaptureHandle> {
+  const proc = options.processImpl ?? process;
   if (installed) {
     // Same name (or no name either time) is an ordinary double call — idempotent,
     // and silent as it has always been. A DIFFERENT name is two apps, and saying
@@ -473,10 +508,36 @@ export async function autoCapture(
     // tear down a capture it does not own. The existing double-install contract.
     return { stop() {} };
   }
+
+  if (options.loadEnv !== false) {
+    try {
+      const loader = (proc as unknown as { loadEnvFile?: (p?: string) => void })
+        .loadEnvFile;
+      if (typeof loader === "function") loader.call(proc);
+    } catch {
+      // .env missing/unreadable, or loadEnvFile unavailable (<20.12): proceed
+      // with whatever is already in the environment.
+    }
+  }
+  const authToken = options.authToken ?? proc.env.CRUMBTRAIL_KEY;
+  const runtimeBindingKey = autoCaptureBindingKey(options.endpoint, authToken);
+  const pendingRetirement = autoCaptureRetirements.get(runtimeBindingKey);
+  if (pendingRetirement) await pendingRetirement;
+  if (installed) {
+    if (options.service !== installedService) {
+      const consoleForWarning = options.consoleImpl ?? console;
+      consoleForWarning.error(
+        `[crumbtrail] capture is already running for ${describeService(installedService)}, ` +
+          `so the later call for ${describeService(options.service)} was ignored: ` +
+          "one process captures under one service name. Run the second app in its own " +
+          "process, or give both calls the same service name.",
+      );
+    }
+    return { stop() {} };
+  }
   installed = true;
   installedService = options.service;
 
-  const proc = options.processImpl ?? process;
   const consoleRef = options.consoleImpl ?? console;
 
   // The real console.error, captured before we patch it. The `debug` fallback
@@ -526,23 +587,20 @@ export async function autoCapture(
     }
   };
 
-  if (options.loadEnv !== false) {
-    try {
-      const loader = (proc as unknown as { loadEnvFile?: (p?: string) => void })
-        .loadEnvFile;
-      if (typeof loader === "function") loader.call(proc);
-    } catch {
-      // .env missing/unreadable, or loadEnvFile unavailable (<20.12): proceed
-      // with whatever is already in the environment.
-    }
-  }
-
-  const authToken = options.authToken ?? proc.env.CRUMBTRAIL_KEY;
   const raceEvidence = resolveRaceEvidenceOptions(
     options.raceEvidence,
     authToken,
   );
   const now = options.nowImpl ?? Date.now;
+  // One binding belongs to this Node process. It is intentionally held outside
+  // each headless session so re-establishes rotate or reuse the same runtime
+  // identity instead of minting one row per outage.
+  const runtimeBinding = createRuntimeBindingHandle({
+    endpoint: options.endpoint,
+    projectKey: authToken,
+    fetchImpl: options.fetchImpl,
+    now,
+  });
   // Stable id reused across every (re-)establishment attempt so events correlate
   // to one logical session even if the first handshake failed and a later one
   // succeeds.
@@ -697,6 +755,7 @@ export async function autoCapture(
       ...(options.requestTimeoutMs !== undefined
         ? { timeoutMs: options.requestTimeoutMs }
         : {}),
+      runtimeBinding,
     });
 
   // Lazily (re-)establish the ingest session, bounded by the backoff gate.
@@ -1463,6 +1522,7 @@ export async function autoCapture(
     // stop() short-circuits and an in-flight handshake resolves to a discarded
     // session instead of arming further retries.
     stopped = true;
+    const runtimeBindingRetirement = retireRuntimeBindingHandle(runtimeBinding);
     clearProcessSessionId(stableSessionId);
     if (consoleRef.error === patchedError) {
       consoleRef.error = originalError as typeof consoleRef.error;
@@ -1486,6 +1546,7 @@ export async function autoCapture(
     clearActiveDbSink(dbSink);
     dbInstrumentation?.restore();
     cacheInstrumentation?.restore();
+    rememberAutoCaptureRetirement(runtimeBindingKey, runtimeBindingRetirement);
     installed = false;
     installedService = undefined;
   };

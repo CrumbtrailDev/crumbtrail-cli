@@ -61,6 +61,11 @@ const PRESETS: Record<CrumbtrailPreset, Partial<CrumbtrailConfig>> = {
 };
 import { generateSessionId, now } from "./utils";
 import { HttpTransport } from "./transports/http";
+import {
+  createRuntimeBindingClient,
+  type RuntimeBinding,
+  type RuntimeBindingClient,
+} from "./runtime-binding";
 import { createWebSessionStore, type SessionStore } from "./session-store";
 import { consoleCollector } from "./collectors/console";
 import { errorCollector, buildRecordedErrorData } from "./collectors/error";
@@ -189,6 +194,7 @@ const DEFAULT_CONFIG_POLL_INTERVAL_MS = 60_000;
  * the fallback declares itself with a `policy_unavailable` gap.
  */
 export const REMOTE_POLICY_TIMEOUT_MS = 5_000;
+const SESSION_METADATA_STOP_TIMEOUT_MS = REMOTE_POLICY_TIMEOUT_MS;
 const EMAIL_SHAPED_VALUE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
 /**
  * There is no terminal state: a recorder that has finalized a window re-arms to
@@ -488,6 +494,8 @@ export class Crumbtrail {
   private autoFlag?: AutoFlagController;
   private configPollingCleanup?: () => void;
   private configPollGeneration = 0;
+  /** Per tab runtime binding. Never copied into metadata or emitted events. */
+  private runtimeBinding?: RuntimeBindingClient;
   private flightRecorderTimer?: ReturnType<typeof setTimeout>;
   private flightRecorderFinalization?: Promise<FlagOutcome>;
   private flightRecorderTailResolver?: (result: FlagOutcome) => void;
@@ -569,6 +577,7 @@ export class Crumbtrail {
     sessionId: string,
     applicationRelease: ApplicationReleaseIdentity,
     sessionStore?: SessionStore,
+    runtimeBinding?: RuntimeBindingClient,
   ) {
     this.config = config;
     this.localCaptureFloor = readLocalCaptureFloor(config);
@@ -578,6 +587,7 @@ export class Crumbtrail {
     this.sessionId = sessionId;
     this.applicationRelease = applicationRelease;
     this.sessionStore = sessionStore;
+    this.runtimeBinding = runtimeBinding;
     this.remotePolicyReady = !remoteConfigProjectKey(config);
     const gpcSuppressed = Boolean(
       config.respectGpc && hasGlobalPrivacyControl(),
@@ -688,10 +698,17 @@ export class Crumbtrail {
       config.ringBufferMaxEvents,
     );
 
+    const runtimeBinding = config.transportInstance
+      ? undefined
+      : createRuntimeBindingClient({
+          endpoint: config.httpEndpoint,
+          projectKey: config.httpAuthToken,
+        });
     const transport: CrumbtrailTransport =
       config.transportInstance ??
       new HttpTransport(config.httpEndpoint, {
         authToken: config.httpAuthToken,
+        ...(runtimeBinding ? { runtimeBinding } : {}),
       });
 
     const instance = new Crumbtrail(
@@ -702,6 +719,7 @@ export class Crumbtrail {
       sessionId,
       applicationRelease,
       sessionStore,
+      runtimeBinding,
     );
 
     // Send events to transport. Flight recorder sessions deliberately keep pre-trigger events
@@ -876,6 +894,7 @@ export class Crumbtrail {
         endpoint: captureConfigEndpoint(config),
         projectKey: remoteConfigKey,
         intervalMs: config.configPollIntervalMs,
+        ...(runtimeBinding ? { runtimeBinding } : {}),
       });
     }
 
@@ -1226,7 +1245,11 @@ export class Crumbtrail {
     if (changed && this.sessionStarted) this.refreshSessionIdentity();
   }
 
-  startConfigPolling(options: CaptureConfigPollingOptions): () => void {
+  startConfigPolling(
+    options: CaptureConfigPollingOptions & {
+      runtimeBinding?: RuntimeBindingClient;
+    },
+  ): () => void {
     this.stopConfigPolling();
     this.remotePolicyReady = false;
     this.updateFlightRecorderState();
@@ -1242,13 +1265,24 @@ export class Crumbtrail {
       if (stopped || typeof fetch !== "function") return;
       const generation = ++this.configPollGeneration;
       try {
+        let binding: RuntimeBinding | undefined;
+        if (
+          options.runtimeBinding?.matchesOrigin(options.endpoint) &&
+          !stopped &&
+          generation === this.configPollGeneration
+        )
+          binding = await options.runtimeBinding.getBinding();
+        if (stopped || generation !== this.configPollGeneration) return;
         // `no-store`: the config route answers with `Cache-Control: private, max-age=60` and the
         // default poll interval is exactly that, so an HTTP cache hit would replay the previous
         // body. A replayed body re-runs whatever probe it asked for and rests a second copy of the
         // answer, which for `storage.snapshot` is a duplicate payload out of a live application.
-        const response = await fetch(configPollingUrl(options), {
+        const response = await fetch(configPollingUrl(options, binding), {
           method: "GET",
           cache: "no-store",
+          ...(binding
+            ? { headers: { Authorization: `Bearer ${binding.instanceProof}` } }
+            : {}),
         });
         if (!response.ok && response.status >= 400) return;
         const payload: unknown = await response.json();
@@ -2521,6 +2555,11 @@ export class Crumbtrail {
       }
     };
 
+    if (this.transport.abortPendingSessionStart) {
+      runTeardown("transport.abortPendingSessionStart", () =>
+        this.transport.abortPendingSessionStart?.(),
+      );
+    }
     this.cancelLifecycleTimer();
     const stopState: NonNullable<typeof this.lifecycleCloseState> = {
       immediateEnd: true,
@@ -2657,6 +2696,24 @@ export class Crumbtrail {
     this.stateProviders.clear();
     this.bus.stop();
     this.ringBuffer.clear();
+    // The session start owns the binding proof used in its request. Retire the
+    // proof only after that request settles, while retaining the transport's
+    // existing request bounds and its normal error swallowing.
+    const sessionMetadataSettled = await waitForPromiseWithin(
+      this.sessionMetadataWrite,
+      SESSION_METADATA_STOP_TIMEOUT_MS,
+    );
+    if (sessionMetadataSettled) {
+      this.runtimeBinding?.stop();
+    } else {
+      // A custom transport can return an unbounded promise. Do not attach a
+      // shutdown continuation to it: that would retain the instance forever.
+      // The binding and all SDK-owned closures are released on this path, and
+      // a late session response is intentionally not followed by more work.
+      this.runtimeBinding?.stop();
+      this.sessionMetadataWrite = Promise.resolve();
+      return { sessionId: this.sessionId };
+    }
     if (this.sessionStarted) {
       // bus.stop() just flushed the final batch into the transport; every
       // in-flight POST must land before end-of-session finalizes the log.
@@ -2724,6 +2781,28 @@ export class Crumbtrail {
     }
     if (teardownFailures.length > 0) throw buildStopFailure(teardownFailures);
     return { sessionId: this.sessionId };
+  }
+}
+
+async function waitForPromiseWithin(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true,
+        () => true,
+      ),
+      timeout,
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -2971,12 +3050,16 @@ function captureConfigEndpoint(config: CrumbtrailConfig): string {
   return `${config.httpEndpoint.replace(/\/+$/, "")}/api/capture-config`;
 }
 
-function configPollingUrl(options: CaptureConfigPollingOptions): string {
+function configPollingUrl(
+  options: CaptureConfigPollingOptions,
+  binding?: RuntimeBinding,
+): string {
   const base =
     typeof location !== "undefined" ? location.href : "http://localhost/";
   try {
     const url = new URL(options.endpoint, base);
     url.searchParams.set("projectKey", options.projectKey);
+    if (binding) url.searchParams.set("instanceId", binding.instanceId);
     return url.toString();
   } catch {
     return options.endpoint;
