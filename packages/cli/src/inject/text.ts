@@ -1083,10 +1083,51 @@ function executableScript(attrs: string): boolean {
   return type.toLowerCase() === "module" || JAVASCRIPT_SCRIPT_TYPE.test(type);
 }
 
-function firstExecutableScript(html: string): RegExpExecArray | null {
-  const scriptTag = /<script\b([^>]*)>/gi;
-  for (const match of html.matchAll(scriptTag)) {
-    if (executableScript(match[1])) return match;
+function tagEnd(html: string, start: number): number | null {
+  let quote: '"' | "'" | undefined;
+  for (let index = start; index < html.length; index += 1) {
+    const character = html[index];
+    if (quote) {
+      if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === ">") return index;
+  }
+  return null;
+}
+
+/** Finds a real executable script tag without entering comments or data blocks. */
+function firstExecutableScript(html: string): number | null {
+  let offset = 0;
+  while (offset < html.length) {
+    const start = html.indexOf("<", offset);
+    if (start < 0) return null;
+
+    if (html.startsWith("<!--", start)) {
+      const commentEnd = html.indexOf("-->", start + 4);
+      offset = commentEnd < 0 ? html.length : commentEnd + 3;
+      continue;
+    }
+
+    const open = /^<script\b/i.exec(html.slice(start));
+    if (!open) {
+      offset = start + 1;
+      continue;
+    }
+
+    const end = tagEnd(html, start + open[0].length);
+    if (end === null) return null;
+    const attributes = html.slice(start + open[0].length, end);
+    if (executableScript(attributes)) return start;
+
+    const close = /<\/script\s*>/gi;
+    close.lastIndex = end + 1;
+    const closeMatch = close.exec(html);
+    offset = closeMatch ? closeMatch.index + closeMatch[0].length : html.length;
   }
   return null;
 }
@@ -1123,35 +1164,23 @@ export function insertIntoHtmlHead(html: string, block: string): string | null {
     return `${html.slice(0, at)}\n${indented}\n${indent}${html.slice(at)}`;
   };
 
+  const firstScript = firstExecutableScript(html);
+  if (firstScript !== null) return spliceBefore(firstScript);
+
   const head = /<head\b[^>]*>/i.exec(html);
   const closeHead = /<\/head\s*>/i.exec(html);
-  if (head && closeHead && head.index < closeHead.index) {
-    const firstHeadScript = firstExecutableScript(
-      html.slice(head.index + head[0].length, closeHead.index),
-    );
-    if (firstHeadScript) {
-      return spliceBefore(
-        head.index + head[0].length + (firstHeadScript.index ?? 0),
-      );
-    }
+  if (head && closeHead && head.index < closeHead.index)
     return spliceBefore(closeHead.index);
-  }
 
   const openBody = /<body\b[^>]*>/i.exec(html);
   if (openBody) {
     const at = openBody.index + openBody[0].length;
-    const firstScript = firstExecutableScript(html);
-    if (firstScript && (firstScript.index ?? 0) < at)
-      return spliceBefore(firstScript.index ?? 0);
     const indented = block
       .split("\n")
       .map((line) => (line ? `  ${line}` : line))
       .join("\n");
     return `${html.slice(0, at)}\n${indented}${html.slice(at)}`;
   }
-
-  const firstScript = firstExecutableScript(html);
-  if (firstScript) return spliceBefore(firstScript.index ?? 0);
 
   const closeBody = /<\/body\s*>/i.exec(html);
   if (closeBody) return spliceBefore(closeBody.index);

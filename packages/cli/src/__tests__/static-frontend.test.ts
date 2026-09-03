@@ -118,6 +118,35 @@ describe("insertIntoHtmlHead", () => {
     );
   });
 
+  it("skips commented script tags and script-like data text", () => {
+    const html = PAGE.replace(
+      "    <title>Landing</title>",
+      [
+        "    <title>Landing</title>",
+        '    <!-- <script src="/commented.js"></script> -->',
+        '    <script type="application/json">{"html":"<script src=\\"/data.js\\"></script>"}</script>',
+        '    <script src="/app.js"></script>',
+      ].join("\n"),
+    );
+    const out = insertIntoHtmlHead(html, "<script>early</script>")!;
+    const bootstrap = out.indexOf("<script>early</script>");
+    expect(bootstrap).toBeGreaterThan(out.indexOf("<!--"));
+    expect(bootstrap).toBeGreaterThan(out.indexOf('</script>"}</script>') + 9);
+    expect(bootstrap).toBeLessThan(
+      out.indexOf('<script src="/app.js"></script>'),
+    );
+    expect(out).toContain('/commented.js"></script> -->');
+  });
+
+  it("moves ahead of an executable script that appears before head", () => {
+    const html =
+      '<html><script src="/before-head.js"></script><head></head><body></body></html>';
+    const out = insertIntoHtmlHead(html, "<script>early</script>")!;
+    expect(out.indexOf("<script>early</script>")).toBeLessThan(
+      out.indexOf('<script src="/before-head.js"></script>'),
+    );
+  });
+
   it("does not treat an explicit empty type as executable", () => {
     const html = PAGE.replace(
       "    <title>Landing</title>",
@@ -221,10 +250,16 @@ describe("buildPlan — static", () => {
     expect(plan.content).not.toContain("crumbtrail-core@1.2.3/early");
     expect(plan.content).toContain("parser-blocking");
     expect(plan.content).toContain(
-      "inline module needs a matching nonce or hash",
+      "approve this inline module with a nonce or hash",
     );
-    expect(plan.content).toContain("integrity and crossorigin=anonymous");
-    expect(plan.content).toContain("Offline or strict-CSP");
+    expect(plan.content).toContain(
+      'integrity and crossorigin="anonymous" can protect this external bootstrap tag only',
+    );
+    expect(plan.content).toContain("Offline:");
+    expect(plan.content).toContain(
+      "SRI does not protect the inline module or its esm.sh import",
+    );
+    expect(plan.content).not.toContain('integrity="');
     expect(plan.content).toContain(`httpAuthToken: "${KEY_PLACEHOLDER}"`);
     expect(plan.content?.split(KEY_PLACEHOLDER)).toHaveLength(2);
     expect(plan.content).toContain('service: "web"');

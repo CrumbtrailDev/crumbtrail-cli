@@ -22,7 +22,10 @@ const packageConfig = {
   // entry never has to have them installed.
   external: ["react", "@tauri-apps/api", "@tauri-apps/api/core"],
   dts: true,
-  clean: true,
+  // The IIFE is built by a second config in the same invocation. tsup runs
+  // config entries concurrently, so a clean here can delete the IIFE after it
+  // has been written. The package clean script owns removal of stale output.
+  clean: false,
 };
 
 const browserBootstrapConfig = {

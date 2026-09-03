@@ -688,11 +688,9 @@ export function browserEarlyBootstrapUrl(version?: string | null): string {
  * key — the wizard mints nothing for this recipe and points at the dashboard
  * instead, so what lands in the file is a TODO rather than a credential.
  *
- * The generated page does not claim a CDN is always available. The comments
- * tell strict-CSP and offline deployments to self-host the exact published
- * package files, and to add SRI for those exact bytes when their policy needs
- * it. The URL is pinned to an exact release so a later package cannot silently
- * change the bootstrap contract.
+ * The generated page names its CDN, CSP, SRI, and offline requirements. The URL
+ * is pinned to an exact release so a later package cannot silently change the
+ * bootstrap contract.
  */
 export function staticScriptTagSnippet(options: {
   endpoint: string;
@@ -709,7 +707,7 @@ export function staticScriptTagSnippet(options: {
   return [
     "<!-- Crumbtrail — browser capture (console, network, DOM, errors). -->",
     `<!-- httpAuthToken must contain this project's ingest key.${mint} -->`,
-    "<!-- The classic bootstrap is parser-blocking and pinned to this SDK release. CSP: script-src must allow unpkg.com and esm.sh, the inline module needs a matching nonce or hash, and connect-src must allow the ingest endpoint. SRI: add integrity and crossorigin=anonymous to the external tags for the exact bytes you serve. Offline or strict-CSP: self-host the exact published package files, replace both URLs, and move the inline module to a nonce/hash-approved or external file. -->",
+    '<!-- The classic bootstrap is parser-blocking and pinned to this SDK release. CSP: allow https://unpkg.com for this tag and https://esm.sh for its module import in script-src (or the corresponding script-src-elem policy), approve this inline module with a nonce or hash, and allow the ingest endpoint in connect-src. SRI: integrity and crossorigin="anonymous" can protect this external bootstrap tag only when the hash matches its exact response. SRI does not protect the inline module or its esm.sh import. Offline: self-host the published dist files, including relative ESM chunks, replace both URLs, and use an approved external or nonce/hash-approved module. -->',
     `<script src=${JSON.stringify(browserEarlyBootstrapUrl(options.sdkVersion))}></script>`,
     '<script type="module">',
     `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(options.sdkVersion))};`,

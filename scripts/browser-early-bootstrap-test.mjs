@@ -13,6 +13,19 @@ import { extname, resolve } from "node:path";
 import { chromium } from "playwright";
 
 const distRoot = resolve("packages/core/dist");
+const bootstrapSource = await readFile(
+  resolve(distRoot, "early-bootstrap.global.js"),
+  "utf8",
+);
+if (
+  !/^"use strict";\s*var CrumbtrailEarlyBootstrap = \(\(\) =>/.test(
+    bootstrapSource,
+  )
+)
+  throw new Error("early bootstrap is not a classic IIFE artifact");
+if (/\b(?:import|export)\s/.test(bootstrapSource))
+  throw new Error("early bootstrap still contains module syntax");
+
 const pageHtml = `<!doctype html>
 <meta charset="utf-8">
 <title>Crumbtrail early bootstrap regression</title>
@@ -32,6 +45,7 @@ const pageHtml = `<!doctype html>
 <script src="/missing-classic.js"></script>
 <script type="module" src="/missing-module.js"></script>
 <script type="module">
+  import "/core/early.js";
   window.__earlyOrder.push("module-before-init");
   fetch("/api/module-before-init");
 </script>
@@ -86,6 +100,7 @@ const pageHtml = `<!doctype html>
     flushIntervalMs: 100_000,
     flushBufferSize: 1_000,
   });
+  await fetch("/api/after-init");
 
   window.__earlyBootstrapResult = (async () => {
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -196,6 +211,15 @@ try {
         `pre-init request was not replayed as early evidence: ${path}`,
       );
   }
+
+  const afterInitRequests = result.events.filter(
+    (event) =>
+      event.kind === "net.req" && event.url.endsWith("/api/after-init"),
+  );
+  if (afterInitRequests.length !== 1 || afterInitRequests[0].early)
+    throw new Error(
+      "the full SDK did not coexist with the bootstrap exactly once",
+    );
 
   const resourceFailures = result.events.filter(
     (event) => event.kind === "net.err" && event.transport === "resource",

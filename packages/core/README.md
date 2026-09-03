@@ -165,13 +165,17 @@ same exact SDK release as the module that initializes the SDK:
 
 This script is parser-blocking, installs no configuration, and makes no network
 request of its own. The following module script initializes Crumbtrail and
-drains the queue. A Content Security Policy must allow both CDNs in
-`script-src`, allow the ingest endpoint in `connect-src`, and approve the
-inline module with a matching nonce or hash. If SRI is required, add
-`integrity` and `crossorigin="anonymous"` to the external tags for the exact
-bytes being served. For offline or stricter policies, self-host the exact
-published package files, replace both pinned URLs, and move the inline module
-to a nonce/hash-approved or external file.
+drains the queue. A Content Security Policy must allow `https://unpkg.com` for
+the bootstrap tag and `https://esm.sh` for its module import in `script-src` or
+the corresponding `script-src-elem` policy. It must also approve the inline
+module with a matching nonce or hash and allow the ingest endpoint in
+`connect-src`. If SRI is required, add `integrity` and
+`crossorigin="anonymous"` to the bootstrap tag only, using a hash for its exact
+response. SRI does not protect the inline module or its static import. For
+offline or stricter policies, self-host the published `dist` files, including
+relative ESM chunks, replace both pinned URLs, and use an approved external or
+nonce/hash-approved module. If the bootstrap itself is blocked or unavailable,
+no early hooks can run.
 
 ### Presets
 
