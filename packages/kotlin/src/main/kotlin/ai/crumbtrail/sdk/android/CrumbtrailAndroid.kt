@@ -377,7 +377,7 @@ private fun installMemoryPressureCollector(application: Application, logger: Cru
             )
         }
 
-        @Suppress("DEPRECATION")
+        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
         override fun onLowMemory() {
             logger.addEvent(
                 CrumbtrailEventKind.APP_LIFECYCLE,
