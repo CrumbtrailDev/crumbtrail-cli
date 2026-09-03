@@ -48,7 +48,7 @@ const db = instrumentPgClient(pool, {
 ```
 
 With `autoCapture`, the ingest credential is used as an in memory HMAC key only when it has at
-least 32 non whitespace bytes. The key never enters an event. The SDK emits fixed length,
+least 32 non whitespace bytes and sufficient character diversity. The key never enters an event. The SDK emits fixed length,
 domain separated HMAC SHA 256 identifiers for the entity, the optional common resource subject,
 and the configured version field. DB reads and diffs use the same entity domain, so one row and
 its version can be compared across requests. Use the same `resourceSubject` in a cache integration

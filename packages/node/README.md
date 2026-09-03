@@ -102,9 +102,10 @@ await autoCapture({
 });
 ```
 
-When `autoCapture` has an ingest credential with at least 32 non whitespace bytes, the SDK keeps
-that credential in memory and uses it only as the key for domain separated HMAC SHA 256 digests.
-It never places the credential in an event or in the race evidence object. `resourceSubject` is
+When `autoCapture` has an ingest credential with at least 32 non whitespace bytes and sufficient
+character diversity, the SDK keeps that credential in memory and uses it only as the key for domain
+separated HMAC SHA 256 digests. It never places the credential in an event or in the race evidence
+object. `resourceSubject` is
 optional. Set the same subject for the database and cache integrations when they represent the
 same application resource. The configured version field produces `versionHash` on reads,
 `beforeVersionHash` and `afterVersionHash` on diffs, and no version identifier when the field is

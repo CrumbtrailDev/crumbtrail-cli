@@ -91,28 +91,41 @@ export function createHmacRaceEvidenceResolver(
   const key = Buffer.from(normalized, "utf8");
 
   return (input) => {
-    const entitySource =
-      input.surface === "cache" ? input.cacheKey : input.primaryKey;
-    // DB reads and diffs for one row must join, while cache identities stay in
-    // their own domain even when a cache key happens to equal a DB primary key.
-    const entityDomain =
-      input.surface === "cache" ? "cache:entity" : "db:entity";
-    const entityHash = digest(key, entityDomain, entitySource);
-    if (!entityHash) return undefined;
+    try {
+      const entitySource =
+        input.surface === "cache" ? input.cacheKey : input.primaryKey;
+      if (entitySource === undefined || entitySource === null) return undefined;
+      if (
+        input.surface !== "cache" &&
+        typeof entitySource === "object" &&
+        !Array.isArray(entitySource) &&
+        Object.keys(entitySource).length === 0
+      ) {
+        return undefined;
+      }
+      // DB reads and diffs for one row must join, while cache identities stay in
+      // their own domain even when a cache key happens to equal a DB primary key.
+      const entityDomain =
+        input.surface === "cache" ? "cache:entity" : "db:entity";
+      const entityHash = digest(key, entityDomain, entitySource);
+      if (!entityHash) return undefined;
 
-    const resourceHash = input.resourceSubject
-      ? digest(key, "resource", input.resourceSubject)
-      : undefined;
-    const currentVersion = hashVersion(key, input.currentVersion);
-    const beforeVersion = hashVersion(key, input.beforeVersion);
-    const afterVersion = hashVersion(key, input.afterVersion);
-    return {
-      entityHash,
-      ...(resourceHash ? { resourceHash } : {}),
-      ...(currentVersion ? { versionHash: currentVersion } : {}),
-      ...(beforeVersion ? { beforeVersionHash: beforeVersion } : {}),
-      ...(afterVersion ? { afterVersionHash: afterVersion } : {}),
-    };
+      const resourceHash = input.resourceSubject
+        ? digest(key, "resource", input.resourceSubject)
+        : undefined;
+      const currentVersion = hashVersion(key, input.currentVersion);
+      const beforeVersion = hashVersion(key, input.beforeVersion);
+      const afterVersion = hashVersion(key, input.afterVersion);
+      return {
+        entityHash,
+        ...(resourceHash ? { resourceHash } : {}),
+        ...(currentVersion ? { versionHash: currentVersion } : {}),
+        ...(beforeVersion ? { beforeVersionHash: beforeVersion } : {}),
+        ...(afterVersion ? { afterVersionHash: afterVersion } : {}),
+      };
+    } catch {
+      return undefined;
+    }
   };
 }
 
@@ -226,6 +239,16 @@ function normalizeCredential(value: string | undefined): string | undefined {
   const normalized = value.trim();
   if (normalized.length < 32 || /\s/.test(normalized)) return undefined;
   if (Buffer.byteLength(normalized, "utf8") < 32) return undefined;
+  const frequencies = new Map<string, number>();
+  for (const character of normalized) {
+    frequencies.set(character, (frequencies.get(character) ?? 0) + 1);
+  }
+  if (frequencies.size < 8) return undefined;
+  const entropyBits = [...frequencies.values()].reduce((total, count) => {
+    const probability = count / normalized.length;
+    return total - probability * Math.log2(probability) * normalized.length;
+  }, 0);
+  if (entropyBits < 96) return undefined;
   return normalized;
 }
 
@@ -268,11 +291,14 @@ function canonicalize(value: unknown, depth = 0): string | undefined {
       if (Array.isArray(value)) {
         if (value.length > MAX_OBJECT_KEYS) return undefined;
         const entries = value.map((entry) => canonicalize(entry, depth + 1));
-        return entries.every((entry) => entry !== undefined)
-          ? `a:[${entries.join(",")}]`
-          : undefined;
+        if (!entries.every((entry) => entry !== undefined)) return undefined;
+        const source = `a:[${entries.join(",")}]`;
+        return source.length <= MAX_SOURCE_LENGTH ? source : undefined;
       }
       try {
+        const prototype = Object.getPrototypeOf(value);
+        if (prototype !== Object.prototype && prototype !== null)
+          return undefined;
         const entries = Object.entries(value as Record<string, unknown>);
         if (entries.length > MAX_OBJECT_KEYS) return undefined;
         entries.sort(([left], [right]) => left.localeCompare(right));
@@ -282,9 +308,9 @@ function canonicalize(value: unknown, depth = 0): string | undefined {
             ? undefined
             : `${key.length}:${key}=${normalized}`;
         });
-        return rendered.every((entry) => entry !== undefined)
-          ? `o:{${rendered.join(",")}}`
-          : undefined;
+        if (!rendered.every((entry) => entry !== undefined)) return undefined;
+        const source = `o:{${rendered.join(",")}}`;
+        return source.length <= MAX_SOURCE_LENGTH ? source : undefined;
       } catch {
         return undefined;
       }

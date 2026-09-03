@@ -17,7 +17,7 @@ const opaque = (character: string): string =>
 
 function fakePgClient(rows: Array<Record<string, unknown>>) {
   return {
-    query(text: string) {
+    query(text: string, _params?: unknown[]) {
       if (/^select/i.test(text)) {
         return Promise.resolve({ rows, rowCount: rows.length });
       }
@@ -28,7 +28,7 @@ function fakePgClient(rows: Array<Record<string, unknown>>) {
 
 describe("race evidence contract", () => {
   it("derives deterministic domain separated identifiers without exposing the credential", () => {
-    const credential = `ctkey_${"x".repeat(48)}`;
+    const credential = "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef";
     const resolver = createHmacRaceEvidenceResolver(credential)!;
     const first = resolver({
       surface: "db.read",
@@ -65,6 +65,13 @@ describe("race evidence contract", () => {
 
   it("refuses weak credentials and malformed opaque output", () => {
     expect(createHmacRaceEvidenceResolver("short")).toBeUndefined();
+    expect(createHmacRaceEvidenceResolver("a".repeat(64))).toBeUndefined();
+    const resolver = createHmacRaceEvidenceResolver(
+      "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef",
+    )!;
+    expect(
+      resolver({ surface: "db.read", operation: "read", primaryKey: {} }),
+    ).toBeUndefined();
     expect(
       buildRaceEvidence(
         {
@@ -117,7 +124,9 @@ describe("race evidence contract", () => {
   it("adds only DB read and diff evidence for one entity, including configured versions", () => {
     const raceEvidence = {
       enabled: true,
-      resolve: createHmacRaceEvidenceResolver(`ctkey_${"x".repeat(48)}`),
+      resolve: createHmacRaceEvidenceResolver(
+        "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef",
+      ),
       resourceSubject: "order:42",
       optimisticVersionField: "version",
     };
