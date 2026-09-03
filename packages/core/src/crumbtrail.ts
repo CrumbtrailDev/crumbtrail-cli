@@ -24,10 +24,7 @@ import {
 } from "./types";
 import { createCrumbtrailRequestHeaders } from "./correlation";
 import { readEarlySessionId } from "./early-capture";
-import {
-  createAutoFlagController,
-  type AutoFlagController,
-} from "./auto-flag";
+import { createAutoFlagController, type AutoFlagController } from "./auto-flag";
 import {
   ReplayRecorder,
   replaySupported,
@@ -118,6 +115,35 @@ type Collector = (
   config: CrumbtrailConfig,
   context: CollectorContext,
 ) => CollectorCleanup;
+
+interface StopFailure {
+  label: string;
+  error: unknown;
+}
+
+function recordStopFailure(
+  failures: StopFailure[],
+  label: string,
+  error: unknown,
+): void {
+  if (error instanceof AggregateError) {
+    error.errors.forEach((nested, index) =>
+      recordStopFailure(failures, `${label}[${index}]`, nested),
+    );
+    return;
+  }
+  failures.push({ label, error });
+}
+
+function buildStopFailure(failures: readonly StopFailure[]): AggregateError {
+  const errors = failures.map(
+    ({ label, error }) => new Error(label, { cause: error }),
+  );
+  return new AggregateError(
+    errors,
+    "Crumbtrail.stop() completed with teardown failures",
+  );
+}
 
 export const COLLECTOR_MAP: Record<string, Collector> = {
   environment: environmentCollector,
@@ -433,6 +459,8 @@ export class Crumbtrail {
   private poisonedCollectors = new Set<string>();
   /** The context handed to collectors at init, kept so a later start hands over the same one. */
   private collectorContext?: CollectorContext;
+  /** Storage-failure hooks follow trigger changes without restarting the storage collector. */
+  private storageFailureSyncs = new Set<() => void>();
   private sessionId: string;
   private widgetCleanup?: () => void;
   private stateProviders = new Map<string, () => unknown>();
@@ -484,6 +512,7 @@ export class Crumbtrail {
   private pendingSends = new Set<Promise<void>>();
   private sessionMetadataWrite: Promise<void> = Promise.resolve();
   private stopped = false;
+  private stopPromise?: Promise<{ sessionId: string }>;
   private identity: CrumbtrailIdentity = {};
   private applicationRelease: ApplicationReleaseIdentity;
   private sessionStore?: SessionStore;
@@ -790,6 +819,10 @@ export class Crumbtrail {
       registerStateProvider: (name, provider) =>
         instance.registerStateProvider(name, provider),
       whenCaptureAdmitted: (settle) => instance.whenCaptureAdmitted(settle),
+      registerStorageFailureSync: (sync) => {
+        instance.storageFailureSyncs.add(sync);
+        return () => instance.storageFailureSyncs.delete(sync);
+      },
     };
 
     instance.collectorContext = collectorContext;
@@ -845,7 +878,8 @@ export class Crumbtrail {
   ): Promise<FlagOutcome> {
     if (isExplicitBeacon && !this.config.explicitBeacon)
       return { bugId: this.createBugId(), captured: false };
-    if (!this.canCapture()) return { bugId: this.createBugId(), captured: false };
+    if (!this.canCapture())
+      return { bugId: this.createBugId(), captured: false };
 
     if (this.config.flightRecorder) {
       if (this.flightRecorderFinalization)
@@ -1208,6 +1242,7 @@ export class Crumbtrail {
       this.localCaptureFloor,
     );
     this.applyRemoteCollectorChanges();
+    for (const sync of this.storageFailureSyncs) sync();
 
     if (typeof settings.killSwitch === "boolean") {
       const changed = this.killSwitch !== settings.killSwitch;
@@ -1329,21 +1364,23 @@ export class Crumbtrail {
    * Stop one collector and drop its teardown. Already-buffered events are untouched: the switch
    * says what to capture from here, not what to forget.
    */
-  private teardownCollector(key: string): void {
+  private teardownCollector(key: string): unknown | undefined {
     const teardown = this.collectorTeardowns.get(key);
-    if (!teardown) return;
+    if (!teardown) return undefined;
     // Deleted before the call so a teardown that throws still leaves the collector gone from
     // the registry; otherwise `stop()` would run the same failing teardown a second time.
     this.collectorTeardowns.delete(key);
     try {
       teardown();
-    } catch {
+    } catch (error) {
       // One collector failing to tear down must not take the rest of the poll with it, the same
       // reasoning the shutdown loop runs on. The throw is still recorded: the collector is now
       // in an unknown state, so a later ON switch must not install a second copy over the half
       // that survived. See `poisonedCollectors`.
       this.poisonedCollectors.add(key);
+      return error;
     }
+    return undefined;
   }
 
   /**
@@ -2163,9 +2200,34 @@ export class Crumbtrail {
     });
   }
 
-  async stop(): Promise<{ sessionId: string }> {
+  stop(): Promise<{ sessionId: string }> {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopPromise = this.stopInternal();
+    return this.stopPromise;
+  }
+
+  private async stopInternal(): Promise<{ sessionId: string }> {
+    const teardownFailures: StopFailure[] = [];
+    const runTeardown = (
+      label: string,
+      teardown: (() => void) | undefined,
+    ): void => {
+      if (!teardown) return;
+      try {
+        teardown();
+      } catch (error) {
+        recordStopFailure(teardownFailures, label, error);
+      }
+    };
+
     this.cancelLifecycleTimer();
-    if (this.lifecycleClosePromise) await this.lifecycleClosePromise;
+    if (this.lifecycleClosePromise) {
+      try {
+        await this.lifecycleClosePromise;
+      } catch (error) {
+        recordStopFailure(teardownFailures, "lifecycle.close", error);
+      }
+    }
     // A session ending while the remote policy is still outstanding takes the
     // same fallback the timeout takes: open on the local config, say so with a
     // gap, and release the collectors still holding unrepeatable evidence — the
@@ -2209,10 +2271,12 @@ export class Crumbtrail {
     // flush, the flag, `abortFlightRecorder()` and `endSession()`.
     const replay = this.replay;
     this.replay = undefined;
-    try {
-      await replay?.stop().catch(() => {});
-    } catch {
-      // Shutdown continues, same as everywhere else in this sequence.
+    if (replay) {
+      try {
+        await replay.stop();
+      } catch (error) {
+        recordStopFailure(teardownFailures, "replay", error);
+      }
     }
     // These three run BEFORE the collector loop and are teardown in exactly the
     // same sense, so they answer to the same rule: a throw here must not strand
@@ -2221,17 +2285,9 @@ export class Crumbtrail {
     // in the whole of stop(). Unguarded, it skipped the collector loop, both
     // flushes and `abortFlightRecorder()`, leaving a pending flag() tail promise
     // that never settles for the caller awaiting it.
-    for (const teardown of [
-      this.widgetCleanup,
-      this.autoFlagCleanup,
-      () => this.stopConfigPolling(),
-    ]) {
-      try {
-        teardown?.();
-      } catch {
-        // Same reasoning as the collector loop below: shutdown continues.
-      }
-    }
+    runTeardown("widget", this.widgetCleanup);
+    runTeardown("autoFlag", this.autoFlagCleanup);
+    runTeardown("configPolling", () => this.stopConfigPolling());
     // Collector cleanup is not only teardown: the performance collector's
     // finalizers emit the scores that are knowable nowhere else — `inp`,
     // `cls.score`, `lcp.final` — from this loop. So the loop runs, and its
@@ -2239,31 +2295,26 @@ export class Crumbtrail {
     // `stopped` first would have handed those three straight to a subscriber
     // that drops everything, and an app that calls stop() explicitly rather
     // than letting the tab go hidden would lose its vitals entirely.
-    for (const cleanup of this.cleanups) {
-      try {
-        cleanup();
-      } catch {
-        // One collector failing to tear down must not take the rest of the
-        // shutdown with it. Everything after this loop is load bearing: the
-        // second flush ships the finalized vitals emitted above, and
-        // `abortFlightRecorder()` settles a pending flag() tail promise that
-        // would otherwise never resolve for the caller awaiting it. An
-        // unguarded loop made all of that hostage to any collector's teardown.
-      }
-    }
+    this.cleanups.forEach((cleanup, index) =>
+      runTeardown(`cleanup[${index}]`, cleanup),
+    );
     // Registry collectors live in their own map so a policy switch can reach exactly one of
     // them. At shutdown they are the same list, torn down after `cleanups` to keep the order
     // init installed them in — the performance collector's finalizers still emit from here, so
     // the severity tap and the flush below must both still be in place.
     // `teardownCollector` guards each call, for the reason the loop above states, and removes
     // the key as it goes, so a second stop() cannot run any of them twice.
-    for (const key of [...this.collectorTeardowns.keys()])
-      this.teardownCollector(key);
+    for (const key of [...this.collectorTeardowns.keys()]) {
+      const error = this.teardownCollector(key);
+      if (error) recordStopFailure(teardownFailures, `collector:${key}`, error);
+    }
     // Every cleanup has now run, so the list holds nothing but closures over
     // collector state that the teardown just released. Dropped alongside the
     // ring buffer and the state providers below, and dropped here so a second
     // stop() cannot run any of them twice.
     this.cleanups = [];
+    this.widgetCleanup = undefined;
+    this.autoFlagCleanup = undefined;
     this.bus.flush();
     this.stopped = true;
     // Kept after the flag, where it has always been: with `stopped` set,
@@ -2301,8 +2352,13 @@ export class Crumbtrail {
         this.deferredDeliveryGaps = [];
         await this.transport.sendEvents(deferred).catch(() => {});
       }
-      await this.transport.endSession(this.sessionId);
+      try {
+        await this.transport.endSession(this.sessionId);
+      } catch (error) {
+        recordStopFailure(teardownFailures, "transport.endSession", error);
+      }
     }
+    if (teardownFailures.length > 0) throw buildStopFailure(teardownFailures);
     return { sessionId: this.sessionId };
   }
 }
@@ -2924,7 +2980,9 @@ function applyRemoteTriggerSwitches(
       triggers.onResponseBodyError,
   );
   const streamFailure = triggerSwitch(
-    triggers.streamFailure ?? triggers.streamFailures ?? triggers.onStreamFailure,
+    triggers.streamFailure ??
+      triggers.streamFailures ??
+      triggers.onStreamFailure,
   );
   const workerError = triggerSwitch(
     triggers.workerError ?? triggers.workerErrors ?? triggers.onWorkerError,

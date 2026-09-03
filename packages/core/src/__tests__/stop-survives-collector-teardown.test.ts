@@ -112,12 +112,12 @@ describe("stop() survives a collector that throws on teardown", () => {
     vi.restoreAllMocks();
   });
 
-  it("resolves rather than rejecting", async () => {
+  it("rejects after reporting the teardown failure", async () => {
     const transport = makeTransport();
     const logger = initWithThrower(transport);
 
-    await expect(logger.stop()).resolves.toMatchObject({
-      sessionId: expect.any(String),
+    await expect(logger.stop()).rejects.toMatchObject({
+      message: "Crumbtrail.stop() completed with teardown failures",
     });
   });
 
@@ -150,7 +150,9 @@ describe("stop() survives a collector that throws on teardown", () => {
       },
     ]);
 
-    await logger.stop();
+    await expect(logger.stop()).rejects.toThrow(
+      "Crumbtrail.stop() completed with teardown failures",
+    );
 
     const metrics = transport.sent
       .filter((event) => event.k === "perf")
@@ -164,10 +166,27 @@ describe("stop() survives a collector that throws on teardown", () => {
     const transport = makeTransport();
     const logger = initWithThrower(transport);
 
-    await logger.stop();
+    await expect(logger.stop()).rejects.toThrow(
+      "Crumbtrail.stop() completed with teardown failures",
+    );
 
     // `endSession` is the last thing stop() does. Reaching it means the flag,
     // the flight recorder abort and the bus stop all ran too.
+    expect(transport.transport.endSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the rejection and shutdown result idempotent", async () => {
+    const transport = makeTransport();
+    const logger = initWithThrower(transport);
+
+    const first = logger.stop();
+    const second = logger.stop();
+    await expect(first).rejects.toThrow(
+      "Crumbtrail.stop() completed with teardown failures",
+    );
+    await expect(second).rejects.toThrow(
+      "Crumbtrail.stop() completed with teardown failures",
+    );
     expect(transport.transport.endSession).toHaveBeenCalledTimes(1);
   });
 });

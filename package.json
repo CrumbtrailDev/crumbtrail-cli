@@ -20,6 +20,7 @@
     "verify:fresh-install": "node scripts/verify-fresh-install.mjs",
     "verify:sdk-version-floors": "node scripts/verify-sdk-version-floors.mjs",
     "refresh:installer-fixtures": "node scripts/refresh-installer-fixtures.mjs",
+    "test:browser-storage": "pnpm --filter crumbtrail-core build && node scripts/browser-storage-test.mjs",
     "release:plan": "node scripts/release/run-release-plan.mjs",
     "test:release": "vitest run --config scripts/release/vitest.config.ts",
     "test:dev-harness": "vitest run --config scripts/dev-harness/vitest.config.ts",
