@@ -1772,39 +1772,41 @@ export class Crumbtrail {
 
   private startSessionWithCurrentIdentity(): void {
     const sessionId = this.sessionId;
-    const admission = this.startSession(sessionId);
-    this.sessionAdmission = admission;
-    this.sessionMetadataWrite = admission.then(() => undefined);
+    const attempt = this.sendSessionMetadata(sessionId);
+    this.sessionAdmission = attempt.then(
+      () => this.sessionId === sessionId,
+      () => false,
+    );
+    this.sessionMetadataWrite = attempt.catch(() => {});
   }
 
   private refreshSessionIdentity(): void {
     this.sessionMetadataWrite = this.sessionMetadataWrite.then(() => {
-      const admission = this.startSession(this.sessionId);
-      this.sessionAdmission = admission;
-      return admission.then(() => undefined);
+      const sessionId = this.sessionId;
+      const attempt = this.sendSessionMetadata(sessionId);
+      this.sessionAdmission = attempt.then(
+        () => this.sessionId === sessionId,
+        () => false,
+      );
+      return attempt.catch(() => {});
     });
   }
 
-  private startSession(sessionId: string): Promise<boolean> {
-    let attempt: Promise<void>;
+  private sendSessionMetadata(sessionId: string): Promise<void> {
     try {
-      attempt = this.transport.startSession(sessionId, {
-        url: currentPageUrl(),
-        ua: typeof navigator !== "undefined" ? navigator.userAgent : "",
-        ...(this.config.service ? { service: this.config.service } : {}),
-        ...this.applicationRelease,
-        sdkVersion: CRUMBTRAIL_SDK_VERSION,
-        ...this.identity,
-      });
+      return Promise.resolve(
+        this.transport.startSession(sessionId, {
+          url: currentPageUrl(),
+          ua: typeof navigator !== "undefined" ? navigator.userAgent : "",
+          ...(this.config.service ? { service: this.config.service } : {}),
+          ...this.applicationRelease,
+          sdkVersion: CRUMBTRAIL_SDK_VERSION,
+          ...this.identity,
+        }),
+      );
     } catch {
-      return Promise.resolve(false);
+      return Promise.reject(new Error("session start failed"));
     }
-    // Keep admission non-throwing so the existing session start behavior remains fire-and-forget,
-    // while captureScreenshot can await the decision before spending an upload.
-    return Promise.resolve(attempt).then(
-      () => this.sessionId === sessionId,
-      () => false,
-    );
   }
 
   private isScreenshotSessionActive(sessionId: string): boolean {
