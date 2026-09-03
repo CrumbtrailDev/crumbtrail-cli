@@ -122,6 +122,12 @@ primary key. Every configured primary key column must be present as an own prope
 value, including composite keys. Existing row, key, value, and redaction capture is unchanged. A
 resolver or HMAC failure omits only `raceEvidence` and never changes the host operation.
 
+The direct `buildDbReadEvent` and `buildDbDiffEvent` builders also require
+`raceEvidenceCapability: "transaction-outcome"` before they attach race evidence. Set that field
+only when the producer observed the operation's transaction outcome. The builders reject Prisma and
+MongoDB engine tags at this boundary. The PlanetScale adapter suppresses race evidence because its
+HTTP hook does not expose a transaction outcome.
+
 MongoDB single-entity ordinary `update`, `delete`, and `findAndModify` diffs use a fully resolved
 `_id`. Bulk and unresolved commands omit race evidence. Common BSON `ObjectId` values are
 represented by a validated 24 character hexadecimal `toHexString()` value without adding a MongoDB
@@ -132,7 +138,8 @@ identifiers through a per operation `resolve` callback. Multiple operation instr
 reuse a static `identifiers` object across calls. Static identifiers are accepted only by the
 direct `buildCacheEvent`, `buildDbReadEvent`, and `buildDbDiffEvent` builders, where the caller
 constructs one event at a time. The SDK accepts letters, numbers, underscore, and hyphen only,
-and requires `entityHash`:
+and requires `entityHash`. Database builders still require the explicit transaction outcome
+capability described above:
 
 ```ts
 import { instrumentIoredisClient } from "crumbtrail-node";

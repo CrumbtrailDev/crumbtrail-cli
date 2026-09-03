@@ -12,6 +12,7 @@ import {
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
+import { captureGenerationFor } from "../capture-generation";
 
 const ENGINE = "mongodb" as const;
 const INSTRUMENTED_CLIENTS = new WeakSet<object>();
@@ -44,6 +45,7 @@ interface PendingCommand {
   command: Record<string, unknown>;
   requestId: string;
   table: string | null;
+  options: InstrumentDbClientOptions;
 }
 
 interface MongoCounters {
@@ -100,11 +102,13 @@ export function instrumentMongoClient<T extends DuckTypedMongoClient>(
         const requestId =
           captureOptions.requestId ?? captureOptions.getRequestId?.();
         if (!command || !commandName || !key || !requestId) return;
+        const operationOptions = captureGenerationFor(captureOptions);
         pending.set(key, {
           commandName,
           command,
           requestId,
           table: commandTable(commandName, command),
+          options: operationOptions,
         });
       } catch {
         // Command observation must never affect the host operation.
@@ -121,7 +125,7 @@ export function instrumentMongoClient<T extends DuckTypedMongoClient>(
         handleSucceeded(
           started,
           isRecord(event?.reply) ? event.reply : {},
-          captureOptions,
+          started.options,
           counters,
         );
       } catch {
@@ -143,7 +147,7 @@ export function instrumentMongoClient<T extends DuckTypedMongoClient>(
           statement: mongoStatement(started.commandName),
           requestId: started.requestId,
           error: event?.failure ?? event,
-          options: captureOptions,
+          options: started.options,
         });
       } catch {
         // Command observation must never affect the host operation.

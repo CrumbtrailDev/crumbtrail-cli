@@ -14,6 +14,7 @@ import {
 import {
   clearActiveDbSink,
   emitActiveDbEvent,
+  readActiveDbCaptureGeneration,
   readActiveDbRaceEvidence,
   readActiveDbRequestId,
   setActiveDbSink,
@@ -870,6 +871,7 @@ export async function autoCapture(
         drivers: options.databaseDrivers,
         resolve: options.databaseResolve,
         getRaceEvidence: readActiveDbRaceEvidence,
+        getCaptureGeneration: readActiveDbCaptureGeneration,
       });
       const line = formatAutoInstrumentReport(dbInstrumentation);
       // The success line stays behind `debug`: a healthy install is quiet. The
@@ -898,6 +900,7 @@ export async function autoCapture(
         drivers: options.cacheDrivers,
         resolve: options.cacheResolve,
         getRaceEvidence: readActiveDbRaceEvidence,
+        getCaptureGeneration: readActiveDbCaptureGeneration,
       });
       const line = formatAutoInstrumentCacheReport(cacheInstrumentation);
       if (

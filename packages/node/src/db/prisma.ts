@@ -17,6 +17,7 @@ import {
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
+import { captureGenerationFor } from "../capture-generation";
 
 const ENGINE = "prisma" as const;
 const instrumentedClients = new WeakMap<object, object>();
@@ -116,11 +117,12 @@ async function observePrismaOperation(
   options: InstrumentDbClientOptions,
   counters: RequestCounters,
 ): Promise<unknown> {
+  const operationOptions = captureGenerationFor(options);
   let requestId: string | undefined;
   try {
-    requestId = options.requestId ?? options.getRequestId?.();
+    requestId = operationOptions.requestId ?? operationOptions.getRequestId?.();
   } catch (error) {
-    emitGap(options, { reason: "capture_exception", error });
+    emitGap(operationOptions, { reason: "capture_exception", error });
     return input.query(input.args);
   }
   if (!requestId) return input.query(input.args);
@@ -134,13 +136,13 @@ async function observePrismaOperation(
     try {
       classification = classifyStatement(rawStatement);
       if (classification.kind === "unparsable" && classification.mayMutate) {
-        emitGap(options, {
+        emitGap(operationOptions, {
           reason: "unparsed_sql",
           detail: leadingSqlKeyword(rawStatement),
         });
       }
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
   }
 
@@ -157,7 +159,7 @@ async function observePrismaOperation(
         statement: rawStatement,
         requestId,
         error,
-        options,
+        options: operationOptions,
       });
     }
     throw error;
@@ -171,7 +173,7 @@ async function observePrismaOperation(
         args: input.args,
         result,
         requestId,
-        options,
+        options: operationOptions,
         counters,
       });
     } else if (rawStatement) {
@@ -180,12 +182,12 @@ async function observePrismaOperation(
         classification,
         result,
         requestId,
-        options,
+        options: operationOptions,
         counters,
       });
     }
   } catch (error) {
-    emitGap(options, { reason: "capture_exception", error });
+    emitGap(operationOptions, { reason: "capture_exception", error });
   }
   return result;
 }

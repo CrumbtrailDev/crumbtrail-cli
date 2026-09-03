@@ -52,6 +52,12 @@ export interface BuildDbDiffEventInput {
   raceEvidence?: RaceEvidenceOptions;
   /** Configured DB primary-key columns used to require a complete identity. */
   primaryKeyColumns?: readonly string[];
+  /**
+   * Capability asserted by a producer that observed this operation's
+   * transaction outcome. Generic builders cannot infer this from `engine`:
+   * PlanetScale uses the same `mysql` tag as transactional MySQL clients.
+   */
+  raceEvidenceCapability?: "transaction-outcome";
 }
 
 /**
@@ -143,11 +149,7 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
   const sensitive = buildSensitiveColumnSet(input.redactColumns);
 
   const after = safeRedactColumns(input.after, sensitive, "db.diff.after");
-  const before = safeRedactColumns(
-    input.before,
-    sensitive,
-    "db.diff.before",
-  );
+  const before = safeRedactColumns(input.before, sensitive, "db.diff.before");
   const pk = input.pk
     ? safeRedactColumns(input.pk, sensitive, "db.diff.pk")
     : { value: null as Record<string, unknown> | null, metadata: undefined };
@@ -184,6 +186,8 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     ...(input.callsite !== undefined ? { callsite: input.callsite } : {}),
   };
   if (
+    input.raceEvidenceCapability === "transaction-outcome" &&
+    supportsGenericRaceEvidenceEngine(input.engine) &&
     !input.transactionId &&
     isRaceEvidenceInputEligible({
       surface: "db.diff",
@@ -226,6 +230,15 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
   if (startedAt !== undefined) event.offsetMs = Math.max(0, now - startedAt);
 
   return event;
+}
+
+function supportsGenericRaceEvidenceEngine(
+  engine: BuildDbDiffEventInput["engine"],
+): boolean {
+  // Prisma and MongoDB adapters do not expose a transaction outcome at this
+  // builder boundary. PlanetScale is intentionally represented as mysql, so a
+  // producer must assert the outcome capability explicitly instead.
+  return engine !== "prisma" && engine !== "mongodb";
 }
 
 function safeRedactColumns(

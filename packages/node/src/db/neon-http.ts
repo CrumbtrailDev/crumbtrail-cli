@@ -19,6 +19,7 @@ import {
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
+import { captureGenerationFor } from "../capture-generation";
 
 export type DuckTypedNeonHttpQuery = ((...args: unknown[]) => unknown) & {
   query?: (sql: string, params?: unknown[], options?: unknown) => unknown;
@@ -139,13 +140,14 @@ function runCaptured(
   options: InstrumentDbClientOptions,
   counters: RequestCounters,
 ): unknown {
+  const operationOptions = captureGenerationFor(options);
   let parsed: ParsedMutation | undefined;
   let parsedRead: ParsedRead | undefined;
   let requestId: string | undefined;
   try {
     const classification = classifyStatement(text);
     if (classification.kind === "unparsable" && classification.mayMutate) {
-      emitGap(options, {
+      emitGap(operationOptions, {
         reason: "unparsed_sql",
         detail: leadingSqlKeyword(text),
       });
@@ -154,9 +156,9 @@ function runCaptured(
       classification.kind === "mutation" ? classification.mutation : undefined;
     parsedRead =
       classification.kind === "read" ? classification.read : undefined;
-    requestId = options.requestId ?? options.getRequestId?.();
+    requestId = operationOptions.requestId ?? operationOptions.getRequestId?.();
   } catch (error) {
-    emitGap(options, { reason: "capture_exception", error });
+    emitGap(operationOptions, { reason: "capture_exception", error });
     return invoke(text);
   }
   if (!requestId) return invoke(text);
@@ -166,7 +168,7 @@ function runCaptured(
     try {
       executedText = ensureReturning(text);
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
   }
 
@@ -181,7 +183,7 @@ function runCaptured(
       statement: text,
       requestId,
       error,
-      options,
+      options: operationOptions,
     });
     throw error;
   }
@@ -196,7 +198,7 @@ function runCaptured(
         rowCount: resultRowCount(result),
         seq: nextStatementSeq(counters.statementsByRequest, requestId),
         requestId,
-        options,
+        options: operationOptions,
       });
       try {
         const rows = resultRows(result);
@@ -210,7 +212,7 @@ function runCaptured(
               requestId,
               rows,
               rowCount,
-              options,
+              options: operationOptions,
             });
           } else {
             emitImagelessDbDiff({
@@ -219,17 +221,17 @@ function runCaptured(
               table: parsed.table,
               requestId,
               rowCount,
-              options,
+              options: operationOptions,
             });
           }
-        } else if (options.captureReads && parsedRead) {
+        } else if (operationOptions.captureReads && parsedRead) {
           emitDbReadEvents({
             engine: ENGINE,
             table: parsedRead.table,
             requestId,
             rows,
             rowCount,
-            options,
+            options: operationOptions,
             emittedReadRowsByRequest: counters.emittedReadRowsByRequest,
             readCallsitesByRequest: counters.readCallsitesByRequest,
             readStatementsByRequest: counters.readStatementsByRequest,
@@ -238,7 +240,7 @@ function runCaptured(
           });
         }
       } catch (error) {
-        emitGap(options, { reason: "capture_exception", error });
+        emitGap(operationOptions, { reason: "capture_exception", error });
       }
       return result;
     },
@@ -250,7 +252,7 @@ function runCaptured(
         statement: text,
         requestId,
         error,
-        options,
+        options: operationOptions,
       });
       throw error;
     },
@@ -270,6 +272,7 @@ export function instrumentNeonHttpQuery<T>(
 
   return new Proxy(sql, {
     apply(target, thisArg, args) {
+      const operationOptions = captureGenerationFor(options);
       const text = plannedTextFor(args);
       if (!text) {
         try {
@@ -278,9 +281,9 @@ export function instrumentNeonHttpQuery<T>(
             : "";
           if (
             looksLikePotentialWrite(staticText) &&
-            (options.requestId ?? options.getRequestId?.())
+            (operationOptions.requestId ?? operationOptions.getRequestId?.())
           ) {
-            emitGap(options, {
+            emitGap(operationOptions, {
               reason: "unparsed_sql",
               detail: leadingSqlKeyword(staticText),
             });
@@ -300,22 +303,24 @@ export function instrumentNeonHttpQuery<T>(
               ? args
               : rewrittenTemplateArgs(args, statement, text),
           ),
-        options,
+        operationOptions,
         counters,
       );
     },
     get(target, prop, receiver) {
       if (prop === INSTRUMENTED) return true;
       if (prop === "query" && typeof target.query === "function") {
-        return (text: string, params?: unknown[], queryOptions?: unknown) =>
-          typeof text === "string"
+        return (text: string, params?: unknown[], queryOptions?: unknown) => {
+          const operationOptions = captureGenerationFor(options);
+          return typeof text === "string"
             ? runCaptured(
                 text,
                 (statement) => target.query!(statement, params, queryOptions),
-                options,
+                operationOptions,
                 counters,
               )
             : target.query!(text, params, queryOptions);
+        };
       }
       if (prop === "transaction" && typeof target.transaction === "function") {
         return (...args: unknown[]) => {

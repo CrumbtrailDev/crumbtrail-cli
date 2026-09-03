@@ -309,7 +309,8 @@ export function isRaceEvidenceInputEligible(
         isRaceEligibleCacheOperation(input.operation) &&
         input.cacheKey !== undefined &&
         input.cacheKey !== null &&
-        !Array.isArray(input.cacheKey)
+        !Array.isArray(input.cacheKey) &&
+        isBoundedRaceEvidenceValue(input.cacheKey)
       );
     }
     return (
@@ -365,17 +366,32 @@ function isResolvedDatabasePrimaryKey(
       columns && columns.length > 0 ? [...columns] : [...descriptors.keys()];
     if (keys.length === 0) return false;
     const seen = new Set<string>();
-    return keys.every(
-      (key) =>
-        typeof key === "string" &&
-        key.length > 0 &&
-        !seen.has(key) &&
-        seen.add(key) &&
-        descriptors.get(key)?.value !== undefined,
-    );
+    if (
+      !keys.every(
+        (key) =>
+          typeof key === "string" &&
+          key.length > 0 &&
+          !seen.has(key) &&
+          seen.add(key) &&
+          descriptors.get(key)?.value !== undefined,
+      )
+    ) {
+      return false;
+    }
+    // Eligibility is shared by HMAC, static identifiers, and custom resolvers.
+    // Canonicalization performs the complete bounded walk, including nested
+    // proxies, accessors, cycles, unsupported objects, and oversized values.
+    return isBoundedRaceEvidenceValue({
+      table: "race-evidence",
+      primaryKey,
+    });
   } catch {
     return false;
   }
+}
+
+function isBoundedRaceEvidenceValue(value: unknown): boolean {
+  return canonicalize(value) !== undefined;
 }
 
 function normalizeCredential(value: string | undefined): string | undefined {

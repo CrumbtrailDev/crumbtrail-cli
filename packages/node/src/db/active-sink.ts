@@ -17,6 +17,10 @@
 
 import type { BugEvent } from "crumbtrail-core";
 import type { RaceEvidenceOptions } from "../race-evidence";
+import type {
+  CaptureGeneration,
+  CaptureGenerationState,
+} from "../capture-generation";
 
 interface ActiveDbSink {
   emit: (event: BugEvent) => void;
@@ -25,15 +29,20 @@ interface ActiveDbSink {
 }
 
 let active: ActiveDbSink | undefined;
+let activeGeneration: CaptureGeneration | undefined;
 
 /** Installed by `autoCapture`; replaced wholesale if capture is re-established. */
 export function setActiveDbSink(sink: ActiveDbSink): void {
   active = sink;
+  activeGeneration = Symbol("crumbtrail.db.capture");
 }
 
 /** Cleared by `stop()`, after which a host-instrumented client emits nothing. */
 export function clearActiveDbSink(sink?: ActiveDbSink): void {
-  if (!sink || active === sink) active = undefined;
+  if (!sink || active === sink) {
+    active = undefined;
+    activeGeneration = undefined;
+  }
 }
 
 /**
@@ -43,8 +52,22 @@ export function clearActiveDbSink(sink?: ActiveDbSink): void {
  * capture there is no session to hold the event for, and a host that
  * instruments a client without ever starting capture has asked for nothing.
  */
-export function emitActiveDbEvent(event: BugEvent): void {
+export function emitActiveDbEvent(
+  event: BugEvent,
+  generation?: CaptureGenerationState,
+): void {
+  if (
+    generation === null ||
+    (generation !== undefined && generation !== activeGeneration)
+  ) {
+    return;
+  }
   active?.emit(event);
+}
+
+/** Generation a new operation should capture, when a session is active. */
+export function readActiveDbCaptureGeneration(): CaptureGeneration | undefined {
+  return activeGeneration;
 }
 
 /** The request the current statement is running inside, when capture is live. */

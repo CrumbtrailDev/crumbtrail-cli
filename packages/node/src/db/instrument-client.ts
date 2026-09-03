@@ -15,6 +15,7 @@
 
 import {
   emitActiveDbEvent,
+  readActiveDbCaptureGeneration,
   readActiveDbRaceEvidence,
   readActiveDbRequestId,
 } from "./active-sink";
@@ -99,6 +100,8 @@ export function instrumentDatabaseClient<T>(
     getRaceEvidence:
       rest.getRaceEvidence ??
       (() => rest.raceEvidence ?? readActiveDbRaceEvidence()),
+    getCaptureGeneration:
+      rest.getCaptureGeneration ?? readActiveDbCaptureGeneration,
     raceEvidence: undefined,
   };
 

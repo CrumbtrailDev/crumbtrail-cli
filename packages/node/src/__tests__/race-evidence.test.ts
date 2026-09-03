@@ -312,6 +312,7 @@ describe("race evidence contract", () => {
       requestId: "req-pk",
       raceEvidence: identifiers,
       primaryKeyColumns: ["tenantId", "id"],
+      raceEvidenceCapability: "transaction-outcome" as const,
     };
     expect(
       buildDbDiffEvent({ ...base, pk: { tenantId: "t1" } }).d.raceEvidence,
@@ -402,6 +403,7 @@ describe("race evidence contract", () => {
       after: { id: 42 },
       requestId: "req-proxy-pk",
       raceEvidence,
+      raceEvidenceCapability: "transaction-outcome",
     });
 
     expect(diff.k).toBe("db.diff");
@@ -416,6 +418,114 @@ describe("race evidence contract", () => {
         primaryKey: proxy,
       }),
     ).toBeUndefined();
+  });
+
+  it("rejects hostile nested values before static identifiers or resolvers attach", () => {
+    let resolverCalls = 0;
+    const nestedProxy = new Proxy(
+      { value: "secret" },
+      {
+        get(target, property, receiver) {
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    const raceEvidence = {
+      enabled: true,
+      identifiers: { entityHash: opaque("e") },
+    };
+    const resolver = {
+      enabled: true,
+      resolve: () => {
+        resolverCalls += 1;
+        return { entityHash: opaque("r") };
+      },
+    };
+    const diff = buildDbDiffEvent({
+      op: "update",
+      table: "orders",
+      pk: { id: nestedProxy },
+      after: { id: 1 },
+      requestId: "req-nested-proxy",
+      raceEvidence,
+      raceEvidenceCapability: "transaction-outcome",
+    });
+    expect(diff.d.raceEvidence).toBeUndefined();
+    const resolved = buildDbReadEvent({
+      table: "orders",
+      pk: { id: nestedProxy },
+      row: { id: 1 },
+      requestId: "req-nested-proxy-read",
+      raceEvidence: resolver,
+      raceEvidenceCapability: "transaction-outcome",
+    });
+    expect(resolved.d.raceEvidence).toBeUndefined();
+    expect(resolverCalls).toBe(0);
+
+    const cache = buildCacheEvent({
+      driver: "redis",
+      op: "get",
+      keys: [nestedProxy],
+      requestId: "req-nested-cache",
+      raceEvidence: resolver,
+    });
+    expect(cache.d.raceEvidence).toBeUndefined();
+  });
+
+  it("requires a transaction outcome capability and rejects unsupported engines", () => {
+    const identifiers = {
+      enabled: true,
+      identifiers: { entityHash: opaque("e") },
+    };
+    const base = {
+      op: "update" as const,
+      table: "orders",
+      pk: { id: 1 },
+      after: { id: 1, version: 2 },
+      requestId: "req-capability",
+      raceEvidence: identifiers,
+    };
+    expect(buildDbDiffEvent(base).d.raceEvidence).toBeUndefined();
+    expect(
+      buildDbReadEvent({
+        table: "orders",
+        pk: { id: 1 },
+        row: { id: 1, version: 2 },
+        requestId: "req-capability-read",
+        raceEvidence: identifiers,
+      }).d.raceEvidence,
+    ).toBeUndefined();
+    expect(
+      buildDbDiffEvent({
+        ...base,
+        engine: "prisma",
+        raceEvidenceCapability: "transaction-outcome",
+      }).d.raceEvidence,
+    ).toBeUndefined();
+    expect(
+      buildDbDiffEvent({
+        ...base,
+        engine: "mongodb",
+        raceEvidenceCapability: "transaction-outcome",
+      }).d.raceEvidence,
+    ).toBeUndefined();
+    expect(
+      buildDbReadEvent({
+        engine: "prisma",
+        table: "orders",
+        pk: { id: 1 },
+        row: { id: 1 },
+        requestId: "req-capability-prisma-read",
+        raceEvidence: identifiers,
+        raceEvidenceCapability: "transaction-outcome",
+      }).d.raceEvidence,
+    ).toBeUndefined();
+    expect(
+      buildDbDiffEvent({
+        ...base,
+        raceEvidenceCapability: "transaction-outcome",
+      }).d.raceEvidence,
+    ).toEqual({ entityHash: opaque("e") });
   });
 
   it("does not treat a one-row bulk result as a single entity operation", () => {
@@ -524,6 +634,7 @@ describe("race evidence contract", () => {
       after: { id: 42, version: 4, total: 11 },
       requestId: "req-1",
       raceEvidence,
+      raceEvidenceCapability: "transaction-outcome",
     });
     const read = buildDbReadEvent({
       table: "orders",
@@ -531,6 +642,7 @@ describe("race evidence contract", () => {
       row: { id: 42, version: 4 },
       requestId: "req-2",
       raceEvidence,
+      raceEvidenceCapability: "transaction-outcome",
     });
 
     const diffEvidence = (diff.d as unknown as DbDiffEventData).raceEvidence!;

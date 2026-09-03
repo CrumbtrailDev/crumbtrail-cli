@@ -46,6 +46,12 @@ export interface BuildDbReadEventInput {
   raceEvidence?: RaceEvidenceOptions;
   /** Configured DB primary-key columns used to require a complete identity. */
   primaryKeyColumns?: readonly string[];
+  /**
+   * Capability asserted by a producer that observed this operation's
+   * transaction outcome. Generic builders cannot infer this from `engine`:
+   * PlanetScale uses the same `mysql` tag as transactional MySQL clients.
+   */
+  raceEvidenceCapability?: "transaction-outcome";
 }
 
 export interface BuildDbReadBulkEventInput {
@@ -103,6 +109,8 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
     };
   }
   if (
+    input.raceEvidenceCapability === "transaction-outcome" &&
+    supportsGenericRaceEvidenceEngine(input.engine) &&
     !input.transactionId &&
     isRaceEvidenceInputEligible({
       surface: "db.read",
@@ -137,6 +145,15 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
   const startedAt = normalizeStartedAt(input.sessionStartedAt);
   if (startedAt !== undefined) event.offsetMs = Math.max(0, now - startedAt);
   return event;
+}
+
+function supportsGenericRaceEvidenceEngine(
+  engine: BuildDbReadEventInput["engine"],
+): boolean {
+  // Prisma and MongoDB adapters do not expose a transaction outcome at this
+  // builder boundary. PlanetScale is intentionally represented as mysql, so a
+  // producer must assert the outcome capability explicitly instead.
+  return engine !== "prisma" && engine !== "mongodb";
 }
 
 function safeRedactColumns(

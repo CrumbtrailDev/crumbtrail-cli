@@ -81,6 +81,39 @@ function captureOptions(
   } as const;
 }
 
+function cacheCaptureOptions(
+  fetchImpl: typeof fetch,
+  processImpl: NodeJS.Process,
+  cacheResolve: (specifier: string) => unknown,
+  service: string,
+) {
+  return {
+    endpoint: ENDPOINT,
+    service,
+    processImpl,
+    consoleImpl: { error: vi.fn() },
+    fetchImpl,
+    onCrashExit: () => {},
+    instrumentDatabases: false,
+    cacheDrivers: ["redis"] as const,
+    cacheResolve,
+    captureRuntimeWarnings: false,
+    captureLogs: false,
+    captureHttpRequests: false,
+    captureOutboundHttp: false,
+  } as const;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 interface FakePrismaClient {
   $extends(extension: DuckTypedPrismaExtension): FakeExtendedPrismaClient;
 }
@@ -127,7 +160,23 @@ class FakeMongoClient {
     command: Record<string, unknown>,
     reply: Record<string, unknown>,
   ): void {
+    this.start(requestId, commandName, command);
+    this.complete(requestId, commandName, reply);
+  }
+
+  start(
+    requestId: number,
+    commandName: string,
+    command: Record<string, unknown>,
+  ): void {
     this.fire("commandStarted", { requestId, commandName, command });
+  }
+
+  complete(
+    requestId: number,
+    commandName: string,
+    reply: Record<string, unknown>,
+  ): void {
     this.fire("commandSucceeded", { requestId, commandName, reply });
   }
 
@@ -144,6 +193,196 @@ afterEach(() => {
 });
 
 describe("auto-captured database client lifecycle", () => {
+  it("does not rebind a late Prisma completion to a restarted session", async () => {
+    class PrismaClient {
+      $extends(extension: DuckTypedPrismaExtension): FakeExtendedPrismaClient {
+        return makePrismaClient().$extends(extension);
+      }
+    }
+    const mod: Record<string, unknown> = { PrismaClient };
+    const firstTransport = makeFetch();
+    const first = await autoCapture(
+      captureOptions(
+        firstTransport.fetchImpl,
+        makeFakeProcess(),
+        ["@prisma/client"],
+        () => mod,
+        "prisma-late-first",
+      ),
+    );
+    openHandles.push(first);
+
+    const client = new (
+      mod.PrismaClient as new () => FakeExtendedPrismaClient
+    )();
+    const old = deferred<{ id: number }>();
+    const oldOperation = runInBackendRequestContext(
+      { requestId: "prisma-late-old" },
+      () =>
+        client.run(
+          { model: "Order", operation: "create", args: { data: { id: 1 } } },
+          old.promise,
+        ),
+    );
+    first.stop();
+
+    const secondTransport = makeFetch();
+    const second = await autoCapture(
+      captureOptions(
+        secondTransport.fetchImpl,
+        makeFakeProcess(),
+        ["@prisma/client"],
+        () => mod,
+        "prisma-late-second",
+      ),
+    );
+    openHandles.push(second);
+    old.resolve({ id: 1 });
+    await oldOperation;
+    await flushCapture();
+    expect(
+      eventsFrom(secondTransport.calls).some(
+        (event) =>
+          event.k === "db.diff" && event.d.requestId === "prisma-late-old",
+      ),
+    ).toBe(false);
+
+    await runInBackendRequestContext({ requestId: "prisma-late-new" }, () =>
+      client.run(
+        { model: "Order", operation: "create", args: { data: { id: 2 } } },
+        { id: 2 },
+      ),
+    );
+    await flushCapture();
+    const newDiffs = eventsFrom(secondTransport.calls).filter(
+      (event) =>
+        event.k === "db.diff" && event.d.requestId === "prisma-late-new",
+    );
+    expect(newDiffs).toHaveLength(1);
+  });
+
+  it("does not rebind a late Mongo completion to a restarted session", async () => {
+    class MongoClient extends FakeMongoClient {}
+    const mod: Record<string, unknown> = { MongoClient };
+    const firstTransport = makeFetch();
+    const first = await autoCapture(
+      captureOptions(
+        firstTransport.fetchImpl,
+        makeFakeProcess(),
+        ["mongodb"],
+        () => mod,
+        "mongo-late-first",
+      ),
+    );
+    openHandles.push(first);
+    const client = new (mod.MongoClient as new () => FakeMongoClient)();
+    runInBackendRequestContext({ requestId: "mongo-late-old" }, () =>
+      client.start(7, "insert", {
+        insert: "accounts",
+        documents: [{ _id: "old" }],
+      }),
+    );
+    first.stop();
+
+    const secondTransport = makeFetch();
+    const second = await autoCapture(
+      captureOptions(
+        secondTransport.fetchImpl,
+        makeFakeProcess(),
+        ["mongodb"],
+        () => mod,
+        "mongo-late-second",
+      ),
+    );
+    openHandles.push(second);
+    runInBackendRequestContext({ requestId: "mongo-late-new" }, () =>
+      client.complete(7, "insert", { ok: 1, n: 1 }),
+    );
+    await flushCapture();
+    expect(
+      eventsFrom(secondTransport.calls).some(
+        (event) =>
+          event.k === "db.diff" && event.d.requestId === "mongo-late-old",
+      ),
+    ).toBe(false);
+
+    runInBackendRequestContext({ requestId: "mongo-new" }, () =>
+      client.succeed(
+        8,
+        "insert",
+        { insert: "accounts", documents: [{ _id: "new" }] },
+        { ok: 1, n: 1 },
+      ),
+    );
+    await flushCapture();
+    const newDiffs = eventsFrom(secondTransport.calls).filter(
+      (event) => event.k === "db.diff" && event.d.requestId === "mongo-new",
+    );
+    expect(newDiffs).toHaveLength(1);
+  });
+
+  it("does not rebind a late cache completion to a restarted session", async () => {
+    const old = deferred<string>();
+    const pending: Array<Promise<string>> = [old.promise];
+    const redis = {
+      createClient() {
+        return {
+          get() {
+            return pending.shift() ?? Promise.resolve("new");
+          },
+        };
+      },
+    } as Record<string, unknown>;
+    const resolve = () => redis;
+    const firstTransport = makeFetch();
+    const first = await autoCapture(
+      cacheCaptureOptions(
+        firstTransport.fetchImpl,
+        makeFakeProcess(),
+        resolve,
+        "cache-late-first",
+      ),
+    );
+    openHandles.push(first);
+    const client = (
+      redis.createClient as () => { get(key: string): Promise<string> }
+    )();
+    const oldOperation = runInBackendRequestContext(
+      { requestId: "cache-late-old" },
+      () => client.get("orders:old"),
+    );
+    first.stop();
+
+    const secondTransport = makeFetch();
+    const second = await autoCapture(
+      cacheCaptureOptions(
+        secondTransport.fetchImpl,
+        makeFakeProcess(),
+        resolve,
+        "cache-late-second",
+      ),
+    );
+    openHandles.push(second);
+    old.resolve("old");
+    await oldOperation;
+    await flushCapture();
+    expect(
+      eventsFrom(secondTransport.calls).some(
+        (event) =>
+          event.k === "cache" && event.d.requestId === "cache-late-old",
+      ),
+    ).toBe(false);
+
+    await runInBackendRequestContext({ requestId: "cache-late-new" }, () =>
+      client.get("orders:new"),
+    );
+    await flushCapture();
+    const newEvents = eventsFrom(secondTransport.calls).filter(
+      (event) => event.k === "cache" && event.d.requestId === "cache-late-new",
+    );
+    expect(newEvents).toHaveLength(1);
+  });
+
   it("rebinds an existing Prisma client after stop/start exactly once", async () => {
     class PrismaClient {
       $extends(extension: DuckTypedPrismaExtension): FakeExtendedPrismaClient {

@@ -62,6 +62,12 @@ cache instrumentation ignores them so one entity's identifier cannot be reused f
 Accepted characters are letters, numbers, underscore, and hyphen. The callback can throw safely,
 and invalid output omits only the race object.
 
+The direct `buildDbReadEvent` and `buildDbDiffEvent` builders require
+`raceEvidenceCapability: "transaction-outcome"` before they attach race evidence. Set it only when
+the producer observed the operation's transaction outcome. The builders reject Prisma and MongoDB
+engine tags at this boundary. The PlanetScale adapter suppresses race evidence because its HTTP
+hook does not expose a transaction outcome.
+
 Race evidence is omitted from bulk and image less diffs without a resolvable entity, reads that
 return more than one row, multi key cache operations, and database work observed inside a
 transaction. A DB primary key must be nonempty and fully resolved. Every configured primary key

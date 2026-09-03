@@ -30,6 +30,7 @@ import {
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
+import { captureGenerationFor } from "../capture-generation";
 
 export { parseMutation, parseRead } from "./sql";
 
@@ -85,17 +86,19 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
     text: unknown,
     params?: unknown,
   ): Promise<DuckTypedPgQueryResult> => {
+    const operationOptions = captureGenerationFor(options);
     if (typeof text !== "string") return client.query(text, params);
 
     const transactionCommand = classifyDbTransactionCommand(text);
     if (transactionCommand) {
       let requestId: string | undefined;
       try {
-        requestId = options.requestId ?? options.getRequestId?.();
+        requestId =
+          operationOptions.requestId ?? operationOptions.getRequestId?.();
       } catch (error) {
-        emitGap(options, { reason: "capture_exception", error });
+        emitGap(operationOptions, { reason: "capture_exception", error });
       }
-      const elapsed = startDbQueryTimer(options);
+      const elapsed = startDbQueryTimer(operationOptions);
       let result: DuckTypedPgQueryResult;
       try {
         result = await client.query(text, params);
@@ -108,7 +111,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
             statement: text,
             requestId,
             error,
-            options,
+            options: operationOptions,
             context: { connection, transactionId: transaction?.id },
           });
         }
@@ -121,7 +124,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           engine: ENGINE,
           requestId,
           connection,
-          options,
+          options: operationOptions,
         });
       } else if (transaction) {
         finishDbTransaction({
@@ -129,7 +132,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           transaction,
           outcome: transactionCommand,
           requestId,
-          options,
+          options: operationOptions,
         });
         transaction = undefined;
       }
@@ -142,7 +145,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           rowCount: resultRowCount(result),
           seq: nextStatementSeq(statementsByRequest, requestId),
           requestId,
-          options,
+          options: operationOptions,
           context: {
             connection,
             durationMs,
@@ -161,7 +164,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
     try {
       const classification = classifyStatement(text);
       if (classification.kind === "unparsable" && classification.mayMutate) {
-        emitGap(options, {
+        emitGap(operationOptions, {
           reason: "unparsed_sql",
           detail: leadingSqlKeyword(text),
         });
@@ -172,9 +175,10 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           : undefined;
       parsedRead =
         classification.kind === "read" ? classification.read : undefined;
-      requestId = options.requestId ?? options.getRequestId?.();
+      requestId =
+        operationOptions.requestId ?? operationOptions.getRequestId?.();
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
       return client.query(text, params);
     }
     if (!requestId) return client.query(text, params);
@@ -185,7 +189,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       // NOT behind `captureReads`: that flag caps row IMAGES, and a failure record carries no
       // rows. Gating it there would leave a failed SELECT invisible on every default install.
       let result: DuckTypedPgQueryResult;
-      const elapsed = startDbQueryTimer(options);
+      const elapsed = startDbQueryTimer(operationOptions);
       try {
         result = await client.query(text, params);
       } catch (error) {
@@ -196,7 +200,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           statement: text,
           requestId,
           error,
-          options,
+          options: operationOptions,
           context: { connection, transactionId: transaction?.id },
         });
         throw error;
@@ -214,10 +218,10 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         rowCount: resultRowCount(result),
         seq: nextStatementSeq(statementsByRequest, requestId),
         requestId,
-        options,
+        options: operationOptions,
         context: { connection, durationMs, transactionId: transaction?.id },
       });
-      if (options.captureReads && parsedRead) {
+      if (operationOptions.captureReads && parsedRead) {
         try {
           const rows = (result.rows ?? []).filter(isRecord);
           const rowCount =
@@ -231,7 +235,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
             requestId,
             rows,
             rowCount,
-            options,
+            options: operationOptions,
             emittedReadRowsByRequest,
             readCallsitesByRequest,
             readStatementsByRequest,
@@ -240,7 +244,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
             context: { connection, durationMs, transactionId: transaction?.id },
           });
         } catch (error) {
-          emitGap(options, { reason: "capture_exception", error });
+          emitGap(operationOptions, { reason: "capture_exception", error });
         }
       }
       return result;
@@ -253,20 +257,24 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
     // to tell a probe that failed from a before-image nobody asked for.
     let beforeByPk: Map<string, Record<string, unknown>> | undefined;
     let beforeImageStatus: DbBeforeImageStatus | undefined;
-    if (options.captureBefore && parsed.op === "update" && parsed.whereClause) {
+    if (
+      operationOptions.captureBefore &&
+      parsed.op === "update" &&
+      parsed.whereClause
+    ) {
       try {
         const outcome = await captureBeforeImage(
           client,
           parsed,
           parsed.whereClause,
           paramArray,
-          options,
+          operationOptions,
           poolTarget,
         );
         beforeByPk = outcome.beforeByPk;
         beforeImageStatus = outcome.status;
       } catch (error) {
-        emitGap(options, { reason: "capture_exception", error });
+        emitGap(operationOptions, { reason: "capture_exception", error });
         beforeByPk = undefined;
         beforeImageStatus = {
           status: "unavailable",
@@ -281,13 +289,13 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
     try {
       instrumentedText = ensureReturning(text);
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
       // We declined to instrument this mutation, but it is still the host's statement: if it
       // raises, the failure is the application's and gets recorded like any other. Two events on
       // this path is correct and says two different things — our RETURNING rewrite failed, AND
       // their statement failed — and they have different owners.
       try {
-        const elapsed = startDbQueryTimer(options);
+        const elapsed = startDbQueryTimer(operationOptions);
         const uninstrumented = await client.query(text, paramArray);
         const durationMs = elapsed();
         emitDbStatementEvent({
@@ -298,7 +306,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           rowCount: resultRowCount(uninstrumented),
           seq: nextStatementSeq(statementsByRequest, requestId),
           requestId,
-          options,
+          options: operationOptions,
           context: { connection, durationMs, transactionId: transaction?.id },
         });
         return uninstrumented;
@@ -310,7 +318,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           statement: text,
           requestId,
           error: queryError,
-          options,
+          options: operationOptions,
           context: { connection, transactionId: transaction?.id },
         });
         throw queryError;
@@ -321,7 +329,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
     // We now also RECORD the failure on the way past: a mutation that raised is the decisive
     // observable in exactly the incidents where nothing else explains the response.
     let result: DuckTypedPgQueryResult;
-    const elapsed = startDbQueryTimer(options);
+    const elapsed = startDbQueryTimer(operationOptions);
     try {
       result = await client.query(instrumentedText, paramArray);
     } catch (error) {
@@ -334,7 +342,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         statement: text,
         requestId,
         error,
-        options,
+        options: operationOptions,
         context: { connection, transactionId: transaction?.id },
       });
       throw error;
@@ -354,7 +362,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
       rowCount: resultRowCount(result),
       seq: nextStatementSeq(statementsByRequest, requestId),
       requestId,
-      options,
+      options: operationOptions,
       context: { connection, durationMs, transactionId: transaction?.id },
     });
 
@@ -375,11 +383,11 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         beforeByPk,
         beforeImageStatus,
         rowCount,
-        options,
+        options: operationOptions,
         context: { connection, durationMs, transactionId: transaction?.id },
       });
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
 
     return result;
