@@ -278,12 +278,15 @@ class CrumbtrailMainThreadWatchdog(
                 val recoveredObservation = observation
                 val expectedHang = checkNotNull(pending)
                 scheduler.postToBackground {
-                    val stillOwned = runCatching {
-                        handoff.read() == expectedHang
-                    }.getOrDefault(false)
-                    if (!stillOwned) return@postToBackground
-                    val accepted = runCatching { onHang(recoveredObservation) }.getOrDefault(false)
-                    if (accepted) runCatching { handoff.clearIfMatches(expectedHang) }
+                    withPendingHangClaim(handoff) {
+                        val stillOwned = runCatching {
+                            handoff.read() == expectedHang
+                        }.getOrDefault(false)
+                        if (!stillOwned) return@withPendingHangClaim false
+                        val accepted = runCatching { onHang(recoveredObservation) }.getOrDefault(false)
+                        if (accepted) runCatching { handoff.clearIfMatches(expectedHang) }
+                        accepted
+                    }
                 }
             }
         }
@@ -359,10 +362,14 @@ fun drainPendingHang(
     handoff: CrumbtrailPendingHangStore,
     onHang: (CrumbtrailNativeHang) -> Boolean,
 ): Boolean {
+    return withPendingHangClaim(handoff) { drainClaimedPendingHang(handoff, onHang) }
+}
+
+private fun withPendingHangClaim(handoff: CrumbtrailPendingHangStore, action: () -> Boolean): Boolean {
     val identity = handoff.importIdentity
     if (!synchronized(pendingHangImports) { pendingHangImports.add(identity) }) return false
     try {
-        return drainClaimedPendingHang(handoff, onHang)
+        return action()
     } finally {
         synchronized(pendingHangImports) { pendingHangImports.remove(identity) }
     }

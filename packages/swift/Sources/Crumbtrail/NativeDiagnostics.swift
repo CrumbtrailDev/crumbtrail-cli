@@ -367,8 +367,12 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
         lastHeartbeatAt = current
         if let observation, let expectedHang = pending {
             scheduler.postToBackground {
-                guard self.handoff.read() == expectedHang else { return }
-                if self.onHang(observation) { _ = self.handoff.clearIfMatches(expectedHang) }
+                _ = withPendingHangClaim(self.handoff) {
+                    guard self.handoff.read() == expectedHang else { return false }
+                    let accepted = self.onHang(observation)
+                    if accepted { _ = self.handoff.clearIfMatches(expectedHang) }
+                    return accepted
+                }
             }
         }
         lock.unlock()
@@ -450,6 +454,10 @@ public func drainPendingHang(
     _ handoff: CrumbtrailPendingHangStore,
     onHang: (CrumbtrailNativeHang) -> Bool
 ) -> Bool {
+    withPendingHangClaim(handoff) { drainClaimedPendingHang(handoff, onHang: onHang) }
+}
+
+private func withPendingHangClaim(_ handoff: CrumbtrailPendingHangStore, action: () -> Bool) -> Bool {
     let identity = handoff.importIdentity
     PendingHangImports.lock.lock()
     let claimed = PendingHangImports.active.insert(identity).inserted
@@ -460,6 +468,13 @@ public func drainPendingHang(
         PendingHangImports.active.remove(identity)
         PendingHangImports.lock.unlock()
     }
+    return action()
+}
+
+private func drainClaimedPendingHang(
+    _ handoff: CrumbtrailPendingHangStore,
+    onHang: (CrumbtrailNativeHang) -> Bool
+) -> Bool {
     guard let pending = handoff.read() else { return false }
     let accepted = onHang(
         CrumbtrailNativeHang(

@@ -114,7 +114,19 @@ class MainThreadWatchdogTest {
         var accepted = 0
         val watchdog = CrumbtrailMainThreadWatchdog(
             scheduler = scheduler, handoff = handoff,
-            onHang = { accepted++; true }, now = { now },
+            onHang = { observation ->
+                assertTrue(observation.recovered)
+                assertFalse(observation.previousLaunch)
+                val completed = java.util.concurrent.CountDownLatch(1)
+                Thread {
+                    assertFalse(drainPendingHang(handoff) { error("duplicate startup import") })
+                    completed.countDown()
+                }.start()
+                assertTrue(completed.await(2, java.util.concurrent.TimeUnit.SECONDS))
+                assertFalse(drainPendingHang(handoff) { error("reentrant import") })
+                accepted++
+                true
+            }, now = { now },
             captureStack = { "token=x ".repeat(2_000) },
         )
         watchdog.start()

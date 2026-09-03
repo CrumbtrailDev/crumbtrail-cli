@@ -114,7 +114,20 @@ final class NativeDiagnosticsTests: XCTestCase {
         var accepted = 0
         let watchdog = CrumbtrailMainThreadWatchdog(
             scheduler: scheduler, handoff: handoff,
-            onHang: { _ in accepted += 1; return true }, now: { now },
+            onHang: { observation in
+                XCTAssertTrue(observation.recovered)
+                XCTAssertFalse(observation.previousLaunch)
+                let completed = DispatchSemaphore(value: 0)
+                DispatchQueue.global().async {
+                    let importer = ApplicationSupportPendingHangStore(fileURL: directory.appendingPathComponent("hang.json"))
+                    XCTAssertFalse(drainPendingHang(importer) { _ in XCTFail("duplicate startup import"); return true })
+                    completed.signal()
+                }
+                XCTAssertEqual(completed.wait(timeout: .now() + 2), .success)
+                XCTAssertFalse(drainPendingHang(handoff) { _ in XCTFail("reentrant import"); return true })
+                accepted += 1
+                return true
+            }, now: { now },
             captureStack: { String(repeating: "token=x ", count: 2_000) }
         )
         watchdog.start()
