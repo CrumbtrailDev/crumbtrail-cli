@@ -450,7 +450,9 @@ process. The identity is sent only as top level fields on the session start and
 as bearer authentication for browser config polls. The proof stays in process
 memory, rotates before its one day expiry, and is discarded on `stop()`. If
 registration is unavailable or rate limited, auto capture keeps the existing
-untargeted session behavior and does not retry in a loop.
+untargeted session behavior and does not retry in a loop. The AWS, Vercel, and
+Netlify endpoint wrappers similarly reuse one binding across warm invocations
+for the same endpoint and project, with a bounded idle cache.
 
 ### Structured logs
 

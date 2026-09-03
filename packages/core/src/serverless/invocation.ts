@@ -771,6 +771,10 @@ function resolveTransport(options: ServerlessInvocationOptions): {
         ...(options.requestTimeoutMs !== undefined
           ? { requestTimeoutMs: options.requestTimeoutMs }
           : {}),
+        ...(options.now ? { now: options.now } : {}),
+        ...(options.runtimeBinding
+          ? { runtimeBinding: options.runtimeBinding }
+          : {}),
       }),
     };
   } catch (error) {

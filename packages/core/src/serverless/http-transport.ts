@@ -1,6 +1,6 @@
 import type { BugEvent } from "../types";
 import {
-  createRuntimeBindingClient,
+  getCachedRuntimeBindingClient,
   type RuntimeBindingClient,
 } from "../runtime-binding";
 import type {
@@ -18,6 +18,8 @@ export interface ServerlessHttpTransportOptions {
   authToken?: string;
   fetchImpl?: typeof fetch;
   requestTimeoutMs?: number;
+  /** Internal clock shared with the invocation for deterministic rotation. */
+  now?: () => number;
   /** Internal per-process runtime identity for targeted probe delivery. */
   runtimeBinding?: RuntimeBindingClient;
 }
@@ -120,10 +122,11 @@ export class ServerlessHttpTransport implements ServerlessInvocationTransport {
     this.requestSubject = requestSubject;
     this.runtimeBinding =
       options.runtimeBinding ??
-      createRuntimeBindingClient({
+      getCachedRuntimeBindingClient({
         endpoint,
         projectKey: options.authToken,
         fetchImpl: this.fetcher,
+        now: options.now,
       });
   }
 
@@ -235,6 +238,7 @@ export interface HeadlessSessionOptions {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   signal?: AbortSignal;
+  now?: () => number;
   /** Reused by Node autoCapture across session re-establishes. */
   runtimeBinding?: RuntimeBindingClient;
 }
@@ -256,6 +260,7 @@ export async function startHeadlessSession(
       ...(options.timeoutMs !== undefined
         ? { requestTimeoutMs: options.timeoutMs }
         : {}),
+      ...(options.now ? { now: options.now } : {}),
       ...(options.runtimeBinding
         ? { runtimeBinding: options.runtimeBinding }
         : {}),

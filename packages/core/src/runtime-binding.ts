@@ -35,19 +35,40 @@ const RUNTIME_BINDING_DEFAULT_RETRY_MS = 30 * 1000;
 /** Registration must not hold the first session handshake indefinitely. */
 const RUNTIME_BINDING_REQUEST_TIMEOUT_MS = 3_000;
 
+/** Keep warm-runtime defaults bounded when one process serves many projects. */
+export const RUNTIME_BINDING_CACHE_MAX_ENTRIES = 32;
+
+/** Drop abandoned warm-runtime defaults after one proof lifetime. */
+export const RUNTIME_BINDING_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
 interface RuntimeBindingResponse {
   instanceId?: unknown;
   instanceProof?: unknown;
   expiresAt?: unknown;
 }
 
+class RuntimeBindingTimeoutError extends Error {
+  constructor() {
+    super("runtime binding registration timed out");
+    this.name = "RuntimeBindingTimeoutError";
+  }
+}
+
+interface RuntimeBindingCacheEntry {
+  client: RuntimeBindingClient;
+  lastUsedAt: number;
+}
+
+const runtimeBindingCache = new Map<string, RuntimeBindingCacheEntry>();
+
 /**
  * Owns one browser tab or Node process binding.
  *
- * There is deliberately no module level cache and no storage. That keeps a
- * browser binding scoped to this runtime and prevents a key or proof from one
- * origin or project being reused by another initialization. Node callers keep
- * one instance for the process lifetime and can pass it across re-establishes.
+ * The client itself has no module-level storage. Browser callers create one per
+ * runtime, keeping a binding scoped to that tab and preventing a key or proof
+ * from one origin or project being reused by another initialization. The
+ * serverless default wrapper owns a separate bounded cache keyed by endpoint
+ * and project. Node callers can keep one explicit instance across re-establishes.
  */
 export class RuntimeBindingClient {
   private readonly endpoint: string;
@@ -57,6 +78,7 @@ export class RuntimeBindingClient {
   private current: RuntimeBinding | undefined;
   private inFlight: Promise<RuntimeBinding | undefined> | undefined;
   private retryAfter = 0;
+  private requestGeneration = 0;
   private stopped = false;
 
   constructor(options: RuntimeBindingClientOptions) {
@@ -93,13 +115,17 @@ export class RuntimeBindingClient {
     }
 
     const previous = this.current;
-    const request = this.registerOrRotate(previous);
+    const generation = ++this.requestGeneration;
+    const request = this.registerOrRotate(previous, generation);
     this.inFlight = request;
     try {
       const next = await request;
-      if (!this.stopped && next) this.current = next;
+      if (!this.stopped && generation === this.requestGeneration && next)
+        this.current = next;
       const fallback =
-        this.current && this.isUsable(this.current, this.now())
+        generation === this.requestGeneration &&
+        this.current &&
+        this.isUsable(this.current, this.now())
           ? this.current
           : undefined;
       return this.stopped ? undefined : (next ?? fallback);
@@ -111,12 +137,14 @@ export class RuntimeBindingClient {
   /** Clear the private proof and prevent late registration responses being adopted. */
   stop(): void {
     this.stopped = true;
+    this.requestGeneration += 1;
     this.current = undefined;
     this.retryAfter = 0;
   }
 
   private async registerOrRotate(
     previous: RuntimeBinding | undefined,
+    generation: number,
   ): Promise<RuntimeBinding | undefined> {
     const fetcher = this.fetcher;
     if (!fetcher) return undefined;
@@ -142,6 +170,8 @@ export class RuntimeBindingClient {
         },
         RUNTIME_BINDING_REQUEST_TIMEOUT_MS,
       );
+      if (this.stopped || generation !== this.requestGeneration)
+        return undefined;
       if (!response.ok) {
         this.armRetry(response);
         // A throttled or unreachable endpoint does not invalidate a proof that
@@ -151,14 +181,23 @@ export class RuntimeBindingClient {
         return undefined;
       }
       const payload = (await response.json()) as RuntimeBindingResponse;
-      const binding = parseRuntimeBinding(payload, now);
+      if (this.stopped || generation !== this.requestGeneration)
+        return undefined;
+      const binding = parseRuntimeBinding(payload, this.now());
       if (!binding) {
         this.armRetry();
         return undefined;
       }
       this.retryAfter = 0;
       return binding;
-    } catch {
+    } catch (error) {
+      if (error instanceof RuntimeBindingTimeoutError) {
+        // A timeout is ambiguous. The server may have committed rotation
+        // before the client stopped waiting, so the previous proof cannot be
+        // used again. Invalidate the generation so a late response is ignored.
+        this.current = undefined;
+        this.requestGeneration += 1;
+      }
       this.armRetry();
       return undefined;
     }
@@ -196,15 +235,32 @@ async function fetchWithTimeout(
   timeoutMs: number,
 ): Promise<Response> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const Controller = globalThis.AbortController;
+  const controller =
+    typeof Controller === "function" ? new Controller() : undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(
-      () => reject(new Error("runtime binding registration timed out")),
-      timeoutMs,
-    );
+    timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        controller?.abort();
+      } finally {
+        reject(new RuntimeBindingTimeoutError());
+      }
+    }, timeoutMs);
     (timer as unknown as { unref?: () => void }).unref?.();
   });
   try {
-    return await Promise.race([fetcher(input, init), timeout]);
+    return await Promise.race([
+      fetcher(input, {
+        ...init,
+        ...(controller ? { signal: controller.signal } : {}),
+      }),
+      timeout,
+    ]);
+  } catch (error) {
+    if (timedOut) throw new RuntimeBindingTimeoutError();
+    throw error;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
@@ -214,6 +270,61 @@ export function createRuntimeBindingClient(
   options: RuntimeBindingClientOptions,
 ): RuntimeBindingClient {
   return new RuntimeBindingClient(options);
+}
+
+/**
+ * Reuse the default binding for one endpoint and project across warm
+ * serverless invocations. Explicit clients bypass this cache so callers retain
+ * ownership of their lifecycle. The bounded LRU also keeps a process that
+ * serves many projects from retaining every client forever.
+ */
+export function getCachedRuntimeBindingClient(
+  options: RuntimeBindingClientOptions,
+): RuntimeBindingClient {
+  const endpoint = options.endpoint.trim().replace(/\/+$/, "");
+  const projectKey = options.projectKey?.trim() ?? "";
+  if (!endpoint || !projectKey) return createRuntimeBindingClient(options);
+
+  const now = options.now?.() ?? Date.now();
+  pruneRuntimeBindingCache(now);
+  const key = `${endpoint}\u0000${projectKey}`;
+  const existing = runtimeBindingCache.get(key);
+  if (existing) {
+    existing.lastUsedAt = now;
+    // Map insertion order is the LRU order.
+    runtimeBindingCache.delete(key);
+    runtimeBindingCache.set(key, existing);
+    return existing.client;
+  }
+
+  const client = createRuntimeBindingClient({
+    ...options,
+    endpoint,
+    projectKey,
+  });
+  runtimeBindingCache.set(key, { client, lastUsedAt: now });
+  while (runtimeBindingCache.size > RUNTIME_BINDING_CACHE_MAX_ENTRIES) {
+    const oldest = runtimeBindingCache.entries().next().value as
+      [string, RuntimeBindingCacheEntry] | undefined;
+    if (!oldest) break;
+    runtimeBindingCache.delete(oldest[0]);
+    oldest[1].client.stop();
+  }
+  return client;
+}
+
+/** Test-only cleanup for module-cache lifecycle assertions. */
+export function __resetRuntimeBindingCacheForTests(): void {
+  for (const entry of runtimeBindingCache.values()) entry.client.stop();
+  runtimeBindingCache.clear();
+}
+
+function pruneRuntimeBindingCache(now: number): void {
+  for (const [key, entry] of runtimeBindingCache) {
+    if (now - entry.lastUsedAt <= RUNTIME_BINDING_CACHE_TTL_MS) continue;
+    entry.client.stop();
+    runtimeBindingCache.delete(key);
+  }
 }
 
 function parseRuntimeBinding(

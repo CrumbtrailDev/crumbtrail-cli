@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { __resetRuntimeBindingCacheForTests } from "../../runtime-binding";
 import {
   HeadlessRequestError,
   HeadlessTimeoutError,
@@ -6,6 +7,8 @@ import {
   startHeadlessSession,
   type ServerlessInvocationEvent,
 } from "../index";
+
+afterEach(() => __resetRuntimeBindingCacheForTests());
 
 function event(sessionId: string): ServerlessInvocationEvent {
   return {

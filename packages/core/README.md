@@ -398,7 +398,8 @@ values in memory for the current tab and sends them only as top level session
 start fields and as bearer authentication for config polling. It rotates the
 proof before expiry and falls back to the untargeted poll when registration is
 unavailable or rate limited. Registration is bounded and does not block capture
-indefinitely.
+indefinitely. Endpoint based serverless wrappers reuse one binding across warm
+invocations for the same endpoint and project, with a bounded idle cache.
 
 Set `flightRecorder: true` to buffer locally until an error, signal, widget
 action, or `flag()` triggers capture. The recorder adds the configured tail

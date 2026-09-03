@@ -19,6 +19,8 @@ proof is kept in memory, sent only on session start as the top level
 `instanceProof`, and used as `Authorization: Bearer <instanceProof>` on config
 polls. The SDK rotates it before expiry. A failed or rate limited registration
 does not stop capture, and the poll falls back to the legacy untargeted request.
+Endpoint based serverless wrappers reuse one binding across warm invocations for
+the same endpoint and project, with a bounded idle cache.
 
 ## Minimal working response
 
