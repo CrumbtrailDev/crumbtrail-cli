@@ -57,6 +57,38 @@ private final class FakeMetricKitSource: CrumbtrailMetricKitSource {
 }
 
 final class NativeDiagnosticsTests: XCTestCase {
+    func testConcurrentSlotImportDoesNotBlockCallbacksAndRejectionRetries() {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("hang.json")
+        let first = ApplicationSupportPendingHangStore(fileURL: url)
+        let second = ApplicationSupportPendingHangStore(fileURL: url)
+        let pending = CrumbtrailPendingHang(thresholdMs: 5_000, observedDurationMs: 6_000, stack: nil, at: 42)
+        first.write(pending)
+        XCTAssertFalse(drainPendingHang(first) { _ in
+            let completed = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                XCTAssertFalse(drainPendingHang(second) { _ in XCTFail("duplicate import"); return true })
+                completed.signal()
+            }
+            XCTAssertEqual(completed.wait(timeout: .now() + 2), .success)
+            return false
+        })
+        XCTAssertEqual(first.read(), pending)
+        var accepted = 0
+        XCTAssertTrue(drainPendingHang(second) { hang in
+            XCTAssertNil(hang.stack)
+            accepted += 1
+            return true
+        })
+        XCTAssertEqual(accepted, 1)
+        XCTAssertNil(first.read())
+        first.write(pending)
+        let replacement = CrumbtrailPendingHang(thresholdMs: 5_000, observedDurationMs: 6_000, stack: nil, at: 43)
+        XCTAssertTrue(drainPendingHang(first) { _ in first.write(replacement); return true })
+        XCTAssertEqual(first.read(), replacement)
+    }
+
     func testQuotedAuthorizationAndBoundaryExpansionStayRedactedAndStable() {
         for scheme in ["Basic", "Bearer"] {
             for input in ["Authorization: \"\(scheme) abc123==\"", "{\"Authorization\": \"\(scheme) abc123==\"}"] {

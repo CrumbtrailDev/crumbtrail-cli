@@ -54,6 +54,37 @@ private class MarkerStore(private var timestamp: Long? = null) : CrumbtrailProce
 
 class MainThreadWatchdogTest {
     @Test
+    fun `concurrent slot import is claimed without blocking callbacks and rejection retries`() {
+        val pending = CrumbtrailPendingHang(5_000, 6_000, null, 42)
+        val backing = MemoryPendingHangStore(pending)
+        val slot = Any()
+        val first = object : CrumbtrailPendingHangStore by backing { override val importIdentity = slot }
+        val second = object : CrumbtrailPendingHangStore by backing { override val importIdentity = slot }
+        var accepted = 0
+        assertFalse(drainPendingHang(first) {
+            val contender = Thread {
+                assertFalse(drainPendingHang(second) { accepted++; true })
+            }
+            contender.start()
+            contender.join(2_000)
+            assertFalse(contender.isAlive)
+            false
+        })
+        assertEquals(pending, backing.read())
+        assertTrue(drainPendingHang(second) {
+            assertNull(it.stack)
+            accepted++
+            true
+        })
+        assertEquals(1, accepted)
+        assertNull(backing.read())
+        backing.write(pending)
+        val replacement = pending.copy(at = 43)
+        assertTrue(drainPendingHang(first) { backing.write(replacement); true })
+        assertEquals(replacement, backing.read())
+    }
+
+    @Test
     fun `quoted authorization and boundary expansion stay redacted and stable`() {
         for (scheme in listOf("Basic", "Bearer")) {
             for (input in listOf("Authorization: \"$scheme abc123==\"", "{\"Authorization\": \"$scheme abc123==\"}")) {

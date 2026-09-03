@@ -57,6 +57,7 @@ data class CrumbtrailPendingHang(
 
 /** Durable handoff for a watchdog event that cannot safely be delivered yet. */
 interface CrumbtrailPendingHangStore {
+    val importIdentity: Any get() = this
     fun write(hang: CrumbtrailPendingHang)
     fun read(): CrumbtrailPendingHang?
     fun clear()
@@ -352,7 +353,22 @@ class CrumbtrailMainThreadWatchdog(
  * The sink acknowledges that the event was accepted. A rejected event keeps
  * its durable handoff so a later launch can retry it.
  */
+private val pendingHangImports = mutableSetOf<Any>()
+
 fun drainPendingHang(
+    handoff: CrumbtrailPendingHangStore,
+    onHang: (CrumbtrailNativeHang) -> Boolean,
+): Boolean {
+    val identity = handoff.importIdentity
+    if (!synchronized(pendingHangImports) { pendingHangImports.add(identity) }) return false
+    try {
+        return drainClaimedPendingHang(handoff, onHang)
+    } finally {
+        synchronized(pendingHangImports) { pendingHangImports.remove(identity) }
+    }
+}
+
+private fun drainClaimedPendingHang(
     handoff: CrumbtrailPendingHangStore,
     onHang: (CrumbtrailNativeHang) -> Boolean,
 ): Boolean {

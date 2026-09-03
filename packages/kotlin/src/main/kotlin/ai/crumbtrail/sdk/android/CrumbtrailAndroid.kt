@@ -128,6 +128,7 @@ class SharedPreferencesPendingHangStore(
     context: Context,
     private val key: String = "ai.crumbtrail.pending-hang",
 ) : CrumbtrailPendingHangStore {
+    override val importIdentity: Any = "${context.applicationContext.packageName}:ai.crumbtrail:$key"
     private companion object {
         // SharedPreferences instances created by separate logger instances
         // still address the same durable slot. Keep the claim atomic in this
@@ -172,7 +173,7 @@ class SharedPreferencesPendingHangStore(
             else CrumbtrailPendingHang(
                 thresholdMs = threshold.coerceAtMost(CrumbtrailMainThreadWatchdog.MAX_NATIVE_HANG_DURATION_MS),
                 observedDurationMs = observed.coerceAtMost(CrumbtrailMainThreadWatchdog.MAX_NATIVE_HANG_DURATION_MS),
-                stack = redactedDiagnosticText(json.optString("stack").takeIf { it.isNotEmpty() }),
+                stack = if (json.isNull("stack")) null else redactedDiagnosticText(json.optString("stack").takeIf { it.isNotEmpty() }),
                 at = at,
                 startedAt = json.optLong("startedAt", at),
             )

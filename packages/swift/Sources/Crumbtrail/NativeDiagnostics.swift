@@ -74,6 +74,7 @@ public struct CrumbtrailPendingHang: Codable, Equatable, Sendable {
 }
 
 public protocol CrumbtrailPendingHangStore: AnyObject {
+    var importIdentity: AnyHashable { get }
     func write(_ hang: CrumbtrailPendingHang)
     func read() -> CrumbtrailPendingHang?
     func clear()
@@ -88,6 +89,7 @@ public protocol CrumbtrailPendingHangStore: AnyObject {
 }
 
 public extension CrumbtrailPendingHangStore {
+    var importIdentity: AnyHashable { ObjectIdentifier(self) }
     @discardableResult
     func writeIfEmpty(_ hang: CrumbtrailPendingHang) -> Bool {
         guard read() == nil else { return false }
@@ -437,12 +439,27 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
     }
 }
 
-/// Imports one previous-launch hang and clears it only after the sink accepts it.
+private enum PendingHangImports {
+    static let lock = NSLock()
+    static var active: Set<AnyHashable> = []
+}
+
+/// Claims the import without holding a storage or registry lock during the callback.
 @discardableResult
 public func drainPendingHang(
     _ handoff: CrumbtrailPendingHangStore,
     onHang: (CrumbtrailNativeHang) -> Bool
 ) -> Bool {
+    let identity = handoff.importIdentity
+    PendingHangImports.lock.lock()
+    let claimed = PendingHangImports.active.insert(identity).inserted
+    PendingHangImports.lock.unlock()
+    guard claimed else { return false }
+    defer {
+        PendingHangImports.lock.lock()
+        PendingHangImports.active.remove(identity)
+        PendingHangImports.lock.unlock()
+    }
     guard let pending = handoff.read() else { return false }
     let accepted = onHang(
         CrumbtrailNativeHang(
@@ -467,6 +484,10 @@ public func drainPendingHang(
 /// files live in a dedicated directory so cleanup never scans the whole support
 /// directory.
 public final class ApplicationSupportPendingHangStore: CrumbtrailPendingHangStore {
+    public var importIdentity: AnyHashable {
+        fileURL.map { AnyHashable($0.standardizedFileURL.resolvingSymlinksInPath().path) }
+            ?? AnyHashable(ObjectIdentifier(self))
+    }
     private static let fileName = "crumbtrail-pending-hang.json"
     private static let temporaryDirectoryName = "crumbtrail-pending-hang-tmp"
     private static let temporaryFileSuffix = ".tmp"
