@@ -175,6 +175,24 @@ describe("insertIntoHtmlHead", () => {
     expect(out).toContain('/commented.js"></script> -->');
   });
 
+  it.each([
+    `<iframe srcdoc="<script src='/frame.js'></script>"></iframe>`,
+    `<iframe srcdoc='<script src="/frame.js"></script>'></iframe>`,
+    `<div data-template="<script src='/data.js'></script>"></div>`,
+    `<div data-template='<script src="/data.js"></script>'></div>`,
+    `<input data-template="<script>fake()</script>" />`,
+  ])("skips script text inside complete tag attributes: %s", (markup) => {
+    const html = `<html><head></head><body>${markup}<script src="/real.js"></script></body></html>`;
+    const out = insertIntoHtmlHead(html, "<script>early()</script>")!;
+    expect(out).toContain(markup);
+    expect(out.indexOf("<script>early()</script>")).toBeGreaterThan(
+      out.indexOf(markup) + markup.length - 1,
+    );
+    expect(out.indexOf("<script>early()</script>")).toBeLessThan(
+      out.indexOf('<script src="/real.js">'),
+    );
+  });
+
   it("does not treat Crumbtrail text in comments or inert HTML as an integration", () => {
     const html = PAGE.replace(
       "    <title>Landing</title>",

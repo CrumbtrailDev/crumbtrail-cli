@@ -1181,7 +1181,13 @@ export function htmlScriptBlocks(html: string): HtmlScriptBlock[] {
 
     const open = /^<script\b/i.exec(html.slice(start));
     if (!open) {
-      offset = start + 1;
+      if (/^<(?:\/?[a-z]|[!?])/i.test(html.slice(start))) {
+        const end = tagEnd(html, start + 1);
+        if (end === null) return blocks;
+        offset = end + 1;
+      } else {
+        offset = start + 1;
+      }
       continue;
     }
 
