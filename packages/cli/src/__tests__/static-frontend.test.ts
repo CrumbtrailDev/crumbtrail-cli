@@ -75,6 +75,91 @@ describe("insertIntoHtmlHead", () => {
     expect(script).toBeLessThan(closeHead);
   });
 
+  it("puts the block before the first executable classic head script", () => {
+    const out = insertIntoHtmlHead(
+      PAGE.replace(
+        "    <title>Landing</title>",
+        '    <title>Landing</title>\n    <script src="/app.js"></script>',
+      ),
+      '<script src="/early-bootstrap.global.js"></script>',
+    )!;
+    const bootstrap = out.indexOf("early-bootstrap.global.js");
+    const appScript = out.indexOf('<script src="/app.js"></script>');
+    expect(bootstrap).toBeLessThan(appScript);
+  });
+
+  it("puts the block before an earlier module script and skips JSON data", () => {
+    const html = PAGE.replace(
+      "    <title>Landing</title>",
+      '    <title>Landing</title>\n    <script type="application/ld+json">{"name":"site"}</script>\n    <script type="module" src="/app.js"></script>',
+    );
+    const out = insertIntoHtmlHead(html, "<script>early</script>")!;
+    expect(out.indexOf("<script>early</script>")).toBeLessThan(
+      out.indexOf('<script type="module" src="/app.js"></script>'),
+    );
+    expect(out.indexOf("<script>early</script>")).toBeGreaterThan(
+      out.indexOf('<script type="application/ld+json">'),
+    );
+  });
+
+  it("recognizes unquoted module types and JavaScript MIME parameters", () => {
+    const html = PAGE.replace(
+      "    <title>Landing</title>",
+      [
+        "    <title>Landing</title>",
+        '    <script type=application/ld+json>{"name":"site"}</script>',
+        '    <script type=module src="/app.js"></script>',
+        '    <script type="text/javascript; charset=utf-8" src="/legacy.js"></script>',
+      ].join("\n"),
+    );
+    const out = insertIntoHtmlHead(html, "<script>early</script>")!;
+    expect(out.indexOf("<script>early</script>")).toBeLessThan(
+      out.indexOf('<script type=module src="/app.js"></script>'),
+    );
+  });
+
+  it("does not treat an explicit empty type as executable", () => {
+    const html = PAGE.replace(
+      "    <title>Landing</title>",
+      '    <title>Landing</title>\n    <script type="">data</script>\n    <script src="/app.js"></script>',
+    );
+    const out = insertIntoHtmlHead(html, "<script>early</script>")!;
+    expect(out.indexOf("<script>early</script>")).toBeLessThan(
+      out.indexOf('<script src="/app.js"></script>'),
+    );
+    expect(out.indexOf("<script>early</script>")).toBeGreaterThan(
+      out.indexOf('<script type="">data</script>'),
+    );
+  });
+
+  it("does not place the block after an executable script before body", () => {
+    const html =
+      '<html><script src="/before-body.js"></script><body>hi</body></html>';
+    const out = insertIntoHtmlHead(html, "<script>early</script>")!;
+    expect(out.indexOf("<script>early</script>")).toBeLessThan(
+      out.indexOf('<script src="/before-body.js"></script>'),
+    );
+  });
+
+  it("leaves existing Sentry and PostHog tags in place", () => {
+    const html = PAGE.replace(
+      "    <title>Landing</title>",
+      [
+        "    <title>Landing</title>",
+        '    <script src="https://browser.sentry-cdn.com/8.0.0/bundle.min.js"></script>',
+        '    <script src="https://cdn.posthog.com/posthog.js"></script>',
+      ].join("\n"),
+    );
+    const out = insertIntoHtmlHead(
+      html,
+      '<script src="https://unpkg.com/crumbtrail-core@1.2.3/dist/early-bootstrap.global.js"></script>',
+    )!;
+    expect(out.indexOf("early-bootstrap.global.js")).toBeLessThan(
+      out.indexOf("browser.sentry-cdn.com"),
+    );
+    expect(out).toContain("cdn.posthog.com");
+  });
+
   it("splits a one-line head rather than landing outside it", () => {
     const out = insertIntoHtmlHead(
       "<html>\n  <head><title>x</title></head>\n  <body></body>\n</html>\n",
@@ -128,14 +213,18 @@ describe("buildPlan — static", () => {
     );
     expect(plan.kind).toBe("rewrite");
     expect(plan.targetPath).toBe(p("index.html"));
-    expect(plan.content).toContain('<script type="module">');
     expect(plan.content).toContain(
-      'import "https://esm.sh/crumbtrail-core@1.2.3/early";',
+      '<script src="https://unpkg.com/crumbtrail-core@1.2.3/dist/early-bootstrap.global.js"></script>',
     );
+    expect(plan.content).toContain('<script type="module">');
     expect(plan.content).toContain("https://esm.sh/crumbtrail-core@1.2.3");
-    expect(plan.content?.indexOf("@1.2.3/early")).toBeLessThan(
-      plan.content?.indexOf("@1.2.3\";") ?? Infinity,
+    expect(plan.content).not.toContain("crumbtrail-core@1.2.3/early");
+    expect(plan.content).toContain("parser-blocking");
+    expect(plan.content).toContain(
+      "inline module needs a matching nonce or hash",
     );
+    expect(plan.content).toContain("integrity and crossorigin=anonymous");
+    expect(plan.content).toContain("Offline or strict-CSP");
     expect(plan.content).toContain(`httpAuthToken: "${KEY_PLACEHOLDER}"`);
     expect(plan.content?.split(KEY_PLACEHOLDER)).toHaveLength(2);
     expect(plan.content).toContain('service: "web"');
@@ -151,6 +240,7 @@ describe("buildPlan — static", () => {
       fakeInjectIO({}),
     );
     expect(plan.kind).toBe("fallback-ai");
+    expect(plan.snippet).toContain("early-bootstrap.global.js");
     expect(plan.snippet).toContain('<script type="module">');
     // The JS agent prompt would tell a bundler-less page to npm install and read
     // import.meta.env; the tag above is the whole instruction.
@@ -216,6 +306,7 @@ describe("buildPlan — the frontend an Express app serves", () => {
       (edit) => edit.path === p("public", "index.html"),
     );
     expect(extra).toBeDefined();
+    expect(extra!.content).toContain("early-bootstrap.global.js");
     expect(extra!.content).toContain('<script type="module">');
     // Same service as the server: it is one deployed app, and a `-web` label the
     // wizard never provisioned shows up nowhere.

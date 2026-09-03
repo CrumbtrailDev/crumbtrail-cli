@@ -665,21 +665,34 @@ export function browserModuleUrl(version?: string | null): string {
   return `https://esm.sh/crumbtrail-core@${pinned}`;
 }
 
-/** The side-effect entry must evaluate before the main browser SDK module. */
-export function browserEarlyModuleUrl(version?: string | null): string {
-  return `${browserModuleUrl(version)}/early`;
+/**
+ * The published classic bootstrap that must run before every application
+ * script. It is a package file rather than generated page code, so it has no
+ * customer configuration, secrets, or module/network work of its own.
+ */
+export function browserEarlyBootstrapUrl(version?: string | null): string {
+  const moduleUrl = browserModuleUrl(version);
+  const pinned = moduleUrl.slice(moduleUrl.lastIndexOf("@") + 1);
+  return `https://unpkg.com/crumbtrail-core@${pinned}/dist/early-bootstrap.global.js`;
 }
 
 /**
  * Browser capture for a page with no framework and no bundler: one
- * `<script type="module">` block, dropped into the HTML itself.
+ * classic bootstrap plus a `<script type="module">` block, dropped into the
+ * HTML itself.
  *
- * This is the ONE snippet that carries the key as a literal. Every other client
- * recipe reads a public env var that its bundler inlines at build time; a page
- * served as files has neither, so there is no variable to read and no build to
- * read it. The value emitted is a placeholder, never a live key — the wizard
- * mints nothing for this recipe and points at the dashboard instead, so what
- * lands in the file is a TODO rather than a credential.
+ * The first tag is an exact-version, published package artifact loaded as a
+ * parser-blocking classic script. It installs only the bounded pre-init hooks.
+ * The second tag remains the configurable module that initializes and drains
+ * those hooks. The value emitted for its key is a placeholder, never a live
+ * key — the wizard mints nothing for this recipe and points at the dashboard
+ * instead, so what lands in the file is a TODO rather than a credential.
+ *
+ * The generated page does not claim a CDN is always available. The comments
+ * tell strict-CSP and offline deployments to self-host the exact published
+ * package files, and to add SRI for those exact bytes when their policy needs
+ * it. The URL is pinned to an exact release so a later package cannot silently
+ * change the bootstrap contract.
  */
 export function staticScriptTagSnippet(options: {
   endpoint: string;
@@ -696,8 +709,9 @@ export function staticScriptTagSnippet(options: {
   return [
     "<!-- Crumbtrail — browser capture (console, network, DOM, errors). -->",
     `<!-- httpAuthToken must contain this project's ingest key.${mint} -->`,
+    "<!-- The classic bootstrap is parser-blocking and pinned to this SDK release. CSP: script-src must allow unpkg.com and esm.sh, the inline module needs a matching nonce or hash, and connect-src must allow the ingest endpoint. SRI: add integrity and crossorigin=anonymous to the external tags for the exact bytes you serve. Offline or strict-CSP: self-host the exact published package files, replace both URLs, and move the inline module to a nonce/hash-approved or external file. -->",
+    `<script src=${JSON.stringify(browserEarlyBootstrapUrl(options.sdkVersion))}></script>`,
     '<script type="module">',
-    `  import ${JSON.stringify(browserEarlyModuleUrl(options.sdkVersion))};`,
     `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(options.sdkVersion))};`,
     "",
     "  Crumbtrail.init({",

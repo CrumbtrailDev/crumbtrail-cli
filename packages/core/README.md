@@ -155,6 +155,24 @@ text only in page memory and `init()` drains it through the normal redaction
 pipeline before emission. If `init()` never runs within 60 seconds, the queue
 and early resource listener are dropped and the patches become pass-throughs.
 
+For a page with no bundler, load the published classic bootstrap before the
+page's first executable script. The CLI's static recipe pins this URL to the
+same exact SDK release as the module that initializes the SDK:
+
+```html
+<script src="https://unpkg.com/crumbtrail-core@<version>/dist/early-bootstrap.global.js"></script>
+```
+
+This script is parser-blocking, installs no configuration, and makes no network
+request of its own. The following module script initializes Crumbtrail and
+drains the queue. A Content Security Policy must allow both CDNs in
+`script-src`, allow the ingest endpoint in `connect-src`, and approve the
+inline module with a matching nonce or hash. If SRI is required, add
+`integrity` and `crossorigin="anonymous"` to the external tags for the exact
+bytes being served. For offline or stricter policies, self-host the exact
+published package files, replace both pinned URLs, and move the inline module
+to a nonce/hash-approved or external file.
+
 ### Presets
 
 | Preset           | Behaviour                                                              |

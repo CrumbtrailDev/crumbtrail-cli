@@ -79,11 +79,14 @@ describe("early browser capture", () => {
       ["tauri", tauriInitSnippet()],
       [
         "static",
-        staticScriptTagSnippet({ endpoint: ENDPOINT, keyLiteral: "ctkey_TODO" }),
+        staticScriptTagSnippet({
+          endpoint: ENDPOINT,
+          keyLiteral: "ctkey_TODO",
+        }),
       ],
     ];
     for (const [name, snippet] of snippets) {
-      expect(snippet, name).toContain("/early");
+      expect(snippet, name).toContain("early");
     }
   });
 
@@ -96,7 +99,24 @@ describe("early browser capture", () => {
   it("starts Tauri early capture before its main SDK import", () => {
     const snippet = tauriInitSnippet();
     expect(snippet.indexOf('import "crumbtrail-core/early";')).toBeLessThan(
-      snippet.indexOf('import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";'),
+      snippet.indexOf(
+        'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
+      ),
+    );
+  });
+
+  it("uses a synchronous packaged bootstrap for static HTML", () => {
+    const snippet = staticScriptTagSnippet({
+      endpoint: ENDPOINT,
+      keyLiteral: "ctkey_TODO",
+      sdkVersion: "1.2.3",
+    });
+    expect(snippet).toContain(
+      '<script src="https://unpkg.com/crumbtrail-core@1.2.3/dist/early-bootstrap.global.js"></script>',
+    );
+    expect(snippet).not.toContain("crumbtrail-core@1.2.3/early");
+    expect(snippet.indexOf("early-bootstrap.global.js")).toBeLessThan(
+      snippet.indexOf('<script type="module">'),
     );
   });
 });
@@ -143,11 +163,11 @@ describe("backend capture only runs with a key", () => {
       );
       const errors = ts
         .getPreEmitDiagnostics(program)
-        .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error);
+        .filter(
+          (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error,
+        );
       expect(errors.map((diagnostic) => diagnostic.messageText)).toEqual([]);
-      expect(source).toContain(
-        "authToken: __crumbtrailKey, service: \"api\"",
-      );
+      expect(source).toContain('authToken: __crumbtrailKey, service: "api"');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

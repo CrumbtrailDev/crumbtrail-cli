@@ -197,9 +197,9 @@ export interface BuildPlanInput {
    */
   backendOrigins?: readonly string[] | null;
   /**
-   * This CLI's own release, used to pin the CDN module URL the `static` recipe
-   * emits (SDK and CLI versions move in lockstep). Only that recipe reads it;
-   * every other one imports a bare specifier its bundler resolves.
+   * This CLI's own release, used to pin both CDN URLs the `static` recipe emits
+   * (SDK and CLI versions move in lockstep). Only that recipe reads it; every
+   * other one imports a bare specifier its bundler resolves.
    */
   sdkVersion?: string | null;
   /**

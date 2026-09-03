@@ -43,6 +43,7 @@
       "import": "./dist/early.js",
       "require": "./dist/early.cjs"
     },
+    "./early-bootstrap": "./dist/early-bootstrap.global.js",
     "./react": {
       "types": "./dist/react/index.d.ts",
       "import": "./dist/react/index.js",

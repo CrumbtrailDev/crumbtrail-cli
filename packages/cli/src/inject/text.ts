@@ -721,8 +721,7 @@ function widenFinalSetHeaderAllowlist(
   visitReturnedHeaderPolicy(installed[0].body, (node) => {
     if (
       node.type !== "ObjectProperty" ||
-      objectPropertyName(node)?.toLowerCase() !==
-        "access-control-allow-headers"
+      objectPropertyName(node)?.toLowerCase() !== "access-control-allow-headers"
     )
       return;
     policyCount++;
@@ -1068,15 +1067,38 @@ export function htmlReferencesCrumbtrail(html: string): boolean {
   return /crumbtrail/i.test(html);
 }
 
+/** JavaScript script types that execute as application code in an HTML page. */
+const JAVASCRIPT_SCRIPT_TYPE =
+  /^(?:text|application)\/(?:x-)?(?:javascript|ecmascript)$/i;
+
+function executableScript(attrs: string): boolean {
+  const typeAttribute =
+    /(?:^|\s)type\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(attrs);
+  // An omitted type is a classic script. An explicit empty or non-JavaScript
+  // type is a data block and does not establish an execution boundary.
+  if (!typeAttribute) return true;
+  const type = (typeAttribute[1] ?? typeAttribute[2] ?? typeAttribute[3] ?? "")
+    .split(";", 1)[0]
+    .trim();
+  return type.toLowerCase() === "module" || JAVASCRIPT_SCRIPT_TYPE.test(type);
+}
+
+function firstExecutableScript(html: string): RegExpExecArray | null {
+  const scriptTag = /<script\b([^>]*)>/gi;
+  for (const match of html.matchAll(scriptTag)) {
+    if (executableScript(match[1])) return match;
+  }
+  return null;
+}
+
 /**
- * Put a block into an HTML document, as late in `<head>` as possible.
+ * Put a block into an HTML document before the first executable script.
  *
  * Order matters more here than in a module graph: capture has to be installed
  * before the page's own scripts run, or the errors it exists to record happen
- * first and are gone. `</head>` is therefore the target, with `<body>` and then
- * `</body>` as fallbacks for the many real pages that have neither a head nor a
- * closing tag. A file with no HTML structure at all returns null rather than
- * having a script tag guessed into it.
+ * first and are gone. If the page has no executable script in its head, the
+ * block goes at the end of head. `<body>` and then `</body>` are fallbacks for
+ * pages that have no head. A file with no HTML structure at all returns null.
  */
 export function insertIntoHtmlHead(html: string, block: string): string | null {
   // Indent the block to match the tag it lands above, and insert at the START
@@ -1100,17 +1122,37 @@ export function insertIntoHtmlHead(html: string, block: string): string | null {
     }
     return `${html.slice(0, at)}\n${indented}\n${indent}${html.slice(at)}`;
   };
+
+  const head = /<head\b[^>]*>/i.exec(html);
   const closeHead = /<\/head\s*>/i.exec(html);
-  if (closeHead) return spliceBefore(closeHead.index);
+  if (head && closeHead && head.index < closeHead.index) {
+    const firstHeadScript = firstExecutableScript(
+      html.slice(head.index + head[0].length, closeHead.index),
+    );
+    if (firstHeadScript) {
+      return spliceBefore(
+        head.index + head[0].length + (firstHeadScript.index ?? 0),
+      );
+    }
+    return spliceBefore(closeHead.index);
+  }
+
   const openBody = /<body\b[^>]*>/i.exec(html);
   if (openBody) {
     const at = openBody.index + openBody[0].length;
+    const firstScript = firstExecutableScript(html);
+    if (firstScript && (firstScript.index ?? 0) < at)
+      return spliceBefore(firstScript.index ?? 0);
     const indented = block
       .split("\n")
       .map((line) => (line ? `  ${line}` : line))
       .join("\n");
     return `${html.slice(0, at)}\n${indented}${html.slice(at)}`;
   }
+
+  const firstScript = firstExecutableScript(html);
+  if (firstScript) return spliceBefore(firstScript.index ?? 0);
+
   const closeBody = /<\/body\s*>/i.exec(html);
   if (closeBody) return spliceBefore(closeBody.index);
   return null;
