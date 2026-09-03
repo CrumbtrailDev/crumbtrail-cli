@@ -540,6 +540,24 @@ describe("report screenshot API", () => {
     vi.useRealTimers();
   });
 
+  it("shares concurrent stop calls while cleaning up screenshot state", async () => {
+    const transport = makeTransport();
+    const logger = init(transport);
+    await logger.captureScreenshot(imageBlob(png()));
+
+    const firstStop = logger.stop();
+    const secondStop = logger.stop();
+    expect(secondStop).toBe(firstStop);
+    await expect(logger.captureScreenshot(imageBlob(png()))).rejects.toThrow(
+      "active session",
+    );
+    await expect(firstStop).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    await expect(secondStop).resolves.toEqual(await firstStop);
+    expect(transport.endSession).toHaveBeenCalledTimes(1);
+  });
+
   it("waits for a hidden pending upload when stop races its lifecycle timer", async () => {
     const order: string[] = [];
     const transport = makeTransport();
