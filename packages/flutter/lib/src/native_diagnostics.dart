@@ -77,7 +77,25 @@ class CrumbtrailNativeCapabilities {
         'nativeCrash': nativeCrash.toJson(),
         'appLifecycle': appLifecycle.toJson(),
       };
+
+  CrumbtrailNativeCapabilities withEnabled(bool enabled) =>
+      CrumbtrailNativeCapabilities(
+        nativeDiagnostics: _withEnabled(nativeDiagnostics, enabled),
+        nativeHang: _withEnabled(nativeHang, enabled),
+        nativeCrash: _withEnabled(nativeCrash, enabled),
+        appLifecycle: _withEnabled(appLifecycle, enabled),
+      );
 }
+
+CrumbtrailNativeCapabilityDetail _withEnabled(
+  CrumbtrailNativeCapabilityDetail detail,
+  bool enabled,
+) =>
+    CrumbtrailNativeCapabilityDetail(
+      supported: detail.supported,
+      enabled: enabled && detail.enabled,
+      observed: detail.observed,
+    );
 
 /// Platform seam for native diagnostics. Tests and platform implementations can
 /// provide this without booting a native engine.
@@ -87,14 +105,32 @@ abstract interface class CrumbtrailNativeDiagnosticsPlatform {
   Future<List<CrumbtrailNativeDiagnosticEvent>> drainDiagnostics();
 }
 
+/// Optional configuration seam for platform plugins that own native
+/// collectors. Keeping it separate preserves compatibility with custom bridge
+/// implementations that only support capability reads and drains.
+abstract interface class CrumbtrailNativeDiagnosticsConfigurable {
+  Future<void> setEnabled(bool enabled);
+}
+
 /// Method channel implementation used by Android and iOS plugin registrants.
 class MethodChannelCrumbtrailNativeDiagnostics
-    implements CrumbtrailNativeDiagnosticsPlatform {
+    implements
+        CrumbtrailNativeDiagnosticsPlatform,
+        CrumbtrailNativeDiagnosticsConfigurable {
   MethodChannelCrumbtrailNativeDiagnostics({MethodChannel? channel})
       : _channel =
             channel ?? const MethodChannel(crumbtrailNativeDiagnosticsChannel);
 
   final MethodChannel _channel;
+
+  @override
+  Future<void> setEnabled(bool enabled) async {
+    try {
+      await _channel.invokeMethod<void>('setEnabled', enabled);
+    } on Object {
+      // An unavailable plugin is represented by its capability response.
+    }
+  }
 
   @override
   Future<CrumbtrailNativeCapabilities> getCapabilities() async {
@@ -132,7 +168,17 @@ abstract interface class CrumbtrailDartHangHandoff {
   void clear();
 }
 
-class MemoryCrumbtrailDartHangHandoff implements CrumbtrailDartHangHandoff {
+/// Async persistence operations used when a platform write can outlive the
+/// current Dart callback. The synchronous methods remain the compatibility
+/// seam for in-memory and existing custom handoffs.
+abstract interface class CrumbtrailAsyncDartHangHandoff {
+  Future<void> writeAndWait(Map<String, Object?> event);
+
+  Future<void> clearIfCurrent(Map<String, Object?> event);
+}
+
+class MemoryCrumbtrailDartHangHandoff
+    implements CrumbtrailDartHangHandoff, CrumbtrailAsyncDartHangHandoff {
   Map<String, Object?>? _pending;
 
   @override
@@ -147,9 +193,18 @@ class MemoryCrumbtrailDartHangHandoff implements CrumbtrailDartHangHandoff {
   void clear() {
     _pending = null;
   }
+
+  @override
+  Future<void> writeAndWait(Map<String, Object?> event) async => write(event);
+
+  @override
+  Future<void> clearIfCurrent(Map<String, Object?> event) async {
+    if (_pending != null && _sameHangData(_pending!, event)) clear();
+  }
 }
 
-class SharedPreferencesDartHangHandoff implements CrumbtrailDartHangHandoff {
+class SharedPreferencesDartHangHandoff
+    implements CrumbtrailDartHangHandoff, CrumbtrailAsyncDartHangHandoff {
   SharedPreferencesDartHangHandoff(
     this.preferences, {
     this.key = 'crumbtrail.dart.native-hang',
@@ -157,6 +212,7 @@ class SharedPreferencesDartHangHandoff implements CrumbtrailDartHangHandoff {
 
   final SharedPreferences preferences;
   final String key;
+  Future<void> _pendingOperation = Future<void>.value();
 
   @override
   Map<String, Object?>? read() {
@@ -172,26 +228,35 @@ class SharedPreferencesDartHangHandoff implements CrumbtrailDartHangHandoff {
 
   @override
   void write(Map<String, Object?> event) {
-    try {
-      // setString is asynchronous at the platform boundary, but it returns
-      // immediately and cannot block the Dart event loop.
-      unawaited(
-        preferences
-            .setString(key, jsonEncode(_boundedEvent(event)))
-            .then((_) {}),
-      );
-    } on Object {
-      // Diagnostic storage must never take down the host.
-    }
+    unawaited(writeAndWait(event).catchError((_) {}));
   }
 
   @override
+  Future<void> writeAndWait(Map<String, Object?> event) => _enqueue(() async {
+        await preferences.setString(key, jsonEncode(_boundedEvent(event)));
+      });
+
+  @override
   void clear() {
-    try {
-      unawaited(preferences.remove(key).then((_) {}));
-    } on Object {
-      // Best effort only.
-    }
+    unawaited(_enqueue(() async {
+      await preferences.remove(key);
+    }).catchError((_) {}));
+  }
+
+  @override
+  Future<void> clearIfCurrent(Map<String, Object?> event) => _enqueue(() async {
+        final current = preferences.getString(key);
+        if (current != jsonEncode(_boundedEvent(event))) return;
+        await preferences.remove(key);
+      });
+
+  Future<void> _enqueue(Future<void> Function() operation) {
+    final next = _pendingOperation.then<void>(
+      (_) => operation(),
+      onError: (_) => operation(),
+    );
+    _pendingOperation = next.then<void>((_) {}, onError: (_) {});
+    return next;
   }
 }
 
@@ -203,21 +268,25 @@ class CrumbtrailDartEventLoopWatchdog {
     this.threshold = const Duration(seconds: 5),
     this.checkInterval = const Duration(seconds: 1),
     DateTime Function()? now,
+    this.monotonicNow,
     bool Function()? debuggerAttached,
     this.suppressInDebug = true,
-  })  : _now = now ?? DateTime.now,
+  })  : _now = now,
         _debuggerAttached = debuggerAttached ?? (() => false);
 
   final void Function(Map<String, Object?> data) onHang;
   final CrumbtrailDartHangHandoff? handoff;
   final Duration threshold;
   final Duration checkInterval;
-  final DateTime Function() _now;
+  final DateTime Function()? _now;
+  final Duration Function()? monotonicNow;
   final bool Function() _debuggerAttached;
   final bool suppressInDebug;
+  final Stopwatch _monotonicClock = Stopwatch()..start();
+  DateTime? _clockOrigin;
 
   Timer? _timer;
-  DateTime? _lastTick;
+  Duration? _lastTick;
   bool _foreground = true;
   bool _reportedForBlock = false;
   bool _stopped = false;
@@ -226,7 +295,7 @@ class CrumbtrailDartEventLoopWatchdog {
   void start({bool foreground = true}) {
     if (_stopped) return;
     _foreground = foreground;
-    _lastTick = _now();
+    _lastTick = _clockNow();
     final pending = _safeRead();
     if (pending != null && _isValidHangData(pending)) {
       _safeEmit({
@@ -234,9 +303,8 @@ class CrumbtrailDartEventLoopWatchdog {
         'recovered': false,
         'previousLaunch': true,
       });
-      _safeClear();
+      _safeClearIfCurrent(pending);
     }
-    if (_isSuppressed) return;
     _timer?.cancel();
     final interval = checkInterval <= Duration.zero
         ? const Duration(seconds: 1)
@@ -248,14 +316,14 @@ class CrumbtrailDartEventLoopWatchdog {
     if (_stopped) return;
     _foreground = false;
     _reportedForBlock = false;
-    _lastTick = _now();
+    _lastTick = _clockNow();
   }
 
   void resume() {
     if (_stopped) return;
     _foreground = true;
     _reportedForBlock = false;
-    _lastTick = _now();
+    _lastTick = _clockNow();
   }
 
   void stop() {
@@ -274,8 +342,8 @@ class CrumbtrailDartEventLoopWatchdog {
   }
 
   void _tick() {
-    final current = _now();
-    final elapsed = current.difference(_lastTick ?? current);
+    final current = _clockNow();
+    final elapsed = current - (_lastTick ?? current);
     _lastTick = current;
     if (!_foreground || _isSuppressed) {
       _reportedForBlock = false;
@@ -293,9 +361,56 @@ class CrumbtrailDartEventLoopWatchdog {
       'recovered': true,
       'previousLaunch': false,
     });
-    _safeWrite(data);
+    unawaited(_persistAndEmit(data));
+  }
+
+  Future<void> _persistAndEmit(Map<String, Object?> data) async {
+    var persisted = false;
+    final currentHandoff = handoff;
+    if (currentHandoff is CrumbtrailAsyncDartHangHandoff) {
+      try {
+        await (currentHandoff as CrumbtrailAsyncDartHangHandoff)
+            .writeAndWait(data);
+        persisted = true;
+      } on Object {
+        // A storage failure must not suppress an in-memory observation.
+      }
+    } else if (_tryWrite(data)) {
+      persisted = true;
+    }
     _safeEmit(data);
-    _safeClear();
+    if (!persisted || currentHandoff == null) return;
+    if (currentHandoff is CrumbtrailAsyncDartHangHandoff) {
+      try {
+        await (currentHandoff as CrumbtrailAsyncDartHangHandoff)
+            .clearIfCurrent(data);
+      } on Object {
+        // A failed clear leaves the handoff for the next launch.
+      }
+    } else {
+      _safeClear();
+    }
+  }
+
+  void _safeClearIfCurrent(Map<String, Object?> expected) {
+    final currentHandoff = handoff;
+    if (currentHandoff is CrumbtrailAsyncDartHangHandoff) {
+      unawaited((currentHandoff as CrumbtrailAsyncDartHangHandoff)
+          .clearIfCurrent(expected)
+          .catchError((_) {}));
+      return;
+    }
+    if (_sameHangData(_safeRead(), expected)) _safeClear();
+  }
+
+  Duration _clockNow() {
+    if (monotonicNow != null) return monotonicNow!();
+    if (_now != null) {
+      final current = _now();
+      _clockOrigin ??= current;
+      return current.difference(_clockOrigin!);
+    }
+    return _monotonicClock.elapsed;
   }
 
   Map<String, Object?>? _safeRead() {
@@ -306,11 +421,14 @@ class CrumbtrailDartEventLoopWatchdog {
     }
   }
 
-  void _safeWrite(Map<String, Object?> data) {
+  bool _tryWrite(Map<String, Object?> data) {
     try {
-      handoff?.write(data);
+      if (handoff == null) return false;
+      handoff!.write(data);
+      return true;
     } on Object {
       // A storage failure is capture loss, never a host failure.
+      return false;
     }
   }
 
@@ -423,4 +541,14 @@ bool _isValidHangData(Map<String, Object?> value) {
       value['previousLaunch'] is bool &&
       (value['stk'] == null ||
           (value['stk'] is String && (value['stk']! as String).isNotEmpty));
+}
+
+bool _sameHangData(Map<String, Object?>? left, Map<String, Object?> right) {
+  if (left == null) return false;
+  return left['source'] == right['source'] &&
+      left['thresholdMs'] == right['thresholdMs'] &&
+      left['observedDurationMs'] == right['observedDurationMs'] &&
+      left['recovered'] == right['recovered'] &&
+      left['previousLaunch'] == right['previousLaunch'] &&
+      left['stk'] == right['stk'];
 }

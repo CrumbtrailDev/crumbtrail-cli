@@ -238,17 +238,28 @@ class Crumbtrail with WidgetsBindingObserver {
     if (_nativeDiagnosticsStarted || _stopped) return;
     _nativeDiagnosticsStarted = true;
 
-    if (config.collectors.nativeDiagnostics) {
+    final diagnosticsEnabled = config.collectors.nativeDiagnostics;
+    var nativeCapabilities = CrumbtrailNativeCapabilities.absent;
+    try {
+      final configurable = _nativeDiagnosticsPlatform;
+      if (configurable is CrumbtrailNativeDiagnosticsConfigurable) {
+        await (configurable as CrumbtrailNativeDiagnosticsConfigurable)
+            .setEnabled(diagnosticsEnabled);
+      }
+      nativeCapabilities = await _nativeDiagnosticsPlatform.getCapabilities();
+    } on Object {
+      // An unregistered platform plugin is an unavailable capability.
+    }
+    addEvent(
+      CrumbtrailEventKind.environment,
+      compactJson({
+        'kind': 'native-capabilities',
+        'native': nativeCapabilities.withEnabled(diagnosticsEnabled).toJson(),
+      }),
+    );
+
+    if (diagnosticsEnabled) {
       try {
-        final nativeCapabilities =
-            await _nativeDiagnosticsPlatform.getCapabilities();
-        addEvent(
-          CrumbtrailEventKind.environment,
-          compactJson({
-            'kind': 'native-capabilities',
-            'native': nativeCapabilities.toJson(),
-          }),
-        );
         final events = await _nativeDiagnosticsPlatform.drainDiagnostics();
         for (final event in events) {
           if (event.kind == CrumbtrailEventKind.nativeHang.wireValue &&
@@ -261,7 +272,7 @@ class Crumbtrail with WidgetsBindingObserver {
           }
         }
       } on Object {
-        // An unregistered platform plugin is an unavailable capability.
+        // A diagnostics failure is an unavailable capability, not an app error.
       }
     }
 
@@ -442,6 +453,15 @@ class Crumbtrail with WidgetsBindingObserver {
       cleanup();
     }
     _cleanups.clear();
+    final configurable = _nativeDiagnosticsPlatform;
+    if (configurable is CrumbtrailNativeDiagnosticsConfigurable) {
+      try {
+        await (configurable as CrumbtrailNativeDiagnosticsConfigurable)
+            .setEnabled(false);
+      } on Object {
+        // Native teardown is best effort and must not escape logger.stop().
+      }
+    }
     await flush();
     await _transport.endSession(sessionId);
     if (identical(_shared, this)) _shared = null;

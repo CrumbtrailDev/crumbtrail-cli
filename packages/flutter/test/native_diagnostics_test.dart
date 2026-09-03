@@ -37,6 +37,50 @@ class FakeNativeDiagnostics implements CrumbtrailNativeDiagnosticsPlatform {
       events;
 }
 
+class ConfigurableNativeDiagnostics
+    implements
+        CrumbtrailNativeDiagnosticsPlatform,
+        CrumbtrailNativeDiagnosticsConfigurable {
+  bool? enabled;
+  bool drained = false;
+
+  @override
+  Future<void> setEnabled(bool value) async {
+    enabled = value;
+  }
+
+  @override
+  Future<CrumbtrailNativeCapabilities> getCapabilities() async =>
+      const CrumbtrailNativeCapabilities(
+        nativeDiagnostics: CrumbtrailNativeCapabilityDetail(
+          supported: true,
+          enabled: true,
+          observed: false,
+        ),
+        nativeHang: CrumbtrailNativeCapabilityDetail(
+          supported: true,
+          enabled: true,
+          observed: false,
+        ),
+        nativeCrash: CrumbtrailNativeCapabilityDetail(
+          supported: true,
+          enabled: true,
+          observed: false,
+        ),
+        appLifecycle: CrumbtrailNativeCapabilityDetail(
+          supported: true,
+          enabled: true,
+          observed: false,
+        ),
+      );
+
+  @override
+  Future<List<CrumbtrailNativeDiagnosticEvent>> drainDiagnostics() async {
+    drained = true;
+    return const [];
+  }
+}
+
 class RecordingTransport implements CrumbtrailTransport {
   final List<List<CrumbtrailEvent>> batches = [];
 
@@ -140,6 +184,32 @@ void main() {
     });
   });
 
+  test('Dart watchdog rearms after a debugger detaches', () {
+    fakeAsync((async) {
+      var nowMs = 0;
+      var debuggerAttached = true;
+      final events = <Map<String, Object?>>[];
+      final watchdog = CrumbtrailDartEventLoopWatchdog(
+        checkInterval: const Duration(seconds: 1),
+        monotonicNow: () => Duration(milliseconds: nowMs),
+        debuggerAttached: () => debuggerAttached,
+        suppressInDebug: false,
+        onHang: events.add,
+      );
+
+      watchdog.start();
+      nowMs = 6500;
+      async.elapse(const Duration(seconds: 1));
+      expect(events, isEmpty);
+
+      debuggerAttached = false;
+      nowMs = 13000;
+      async.elapse(const Duration(seconds: 1));
+      expect(events, hasLength(1));
+      watchdog.stop();
+    });
+  });
+
   test('previous Dart handoff is bounded and imported once', () {
     final handoff = MemoryCrumbtrailDartHangHandoff();
     handoff.write(const {
@@ -160,5 +230,59 @@ void main() {
     expect(seen.single['previousLaunch'], true);
     expect(handoff.read(), isNull);
     watchdog.stop();
+  });
+
+  test('disabled native diagnostics configures the plugin off', () async {
+    final transport = RecordingTransport();
+    final native = ConfigurableNativeDiagnostics();
+    final logger = Crumbtrail(
+      config: const CrumbtrailConfig(
+        endpoint: 'https://ingest.example.com',
+        flushBatchSize: 100,
+        collectors: CrumbtrailCollectors(nativeDiagnostics: false),
+      ),
+      transport: transport,
+      nativeDiagnosticsPlatform: native,
+      startTimer: false,
+    );
+
+    await logger.startNativeDiagnostics();
+    await logger.flush();
+    final events = transport.batches.expand((batch) => batch).toList();
+    final capability = events.singleWhere(
+      (event) =>
+          event.kind == 'env' && event.data['kind'] == 'native-capabilities',
+    );
+    final nativeData = capability.data['native'] as Map<String, Object?>;
+    final diagnostics = nativeData['nativeDiagnostics'] as Map<String, Object?>;
+    expect(native.enabled, false);
+    expect(native.drained, false);
+    expect(diagnostics['supported'], true);
+    expect(diagnostics['enabled'], false);
+    await logger.stop();
+    expect(native.enabled, false);
+  });
+
+  test('a stale handoff clear cannot erase a newer event', () async {
+    final handoff = MemoryCrumbtrailDartHangHandoff();
+    const older = <String, Object?>{
+      'source': 'dart',
+      'thresholdMs': 5000,
+      'observedDurationMs': 6000,
+      'recovered': true,
+      'previousLaunch': false,
+    };
+    const newer = <String, Object?>{
+      'source': 'dart',
+      'thresholdMs': 5000,
+      'observedDurationMs': 7000,
+      'recovered': true,
+      'previousLaunch': false,
+    };
+
+    await handoff.writeAndWait(older);
+    await handoff.writeAndWait(newer);
+    await handoff.clearIfCurrent(older);
+    expect(handoff.read(), newer);
   });
 }

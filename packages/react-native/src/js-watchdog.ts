@@ -40,7 +40,10 @@ export function startReactNativeJsWatchdog(
   logger: Crumbtrail,
   options: ReactNativeJsWatchdogOptions,
 ): ReactNativeJsWatchdogController {
-  const now = options.now ?? Date.now;
+  const globalObject =
+    options.globalObject ??
+    (globalThis as typeof globalThis & Record<string, unknown>);
+  const now = options.now ?? (() => monotonicNow(globalObject));
   const thresholdMs = clampDuration(
     options.thresholdMs ?? DEFAULT_THRESHOLD_MS,
   );
@@ -51,9 +54,6 @@ export function startReactNativeJsWatchdog(
       Math.floor(options.checkIntervalMs ?? DEFAULT_CHECK_INTERVAL_MS),
     ),
   );
-  const globalObject =
-    options.globalObject ??
-    (globalThis as typeof globalThis & Record<string, unknown>);
   const timer = globalObject.setInterval?.bind(globalObject) ?? setInterval;
   const clearTimer =
     globalObject.clearInterval?.bind(globalObject) ?? clearInterval;
@@ -72,14 +72,14 @@ export function startReactNativeJsWatchdog(
   let timerId: ReturnType<typeof setInterval> | undefined;
 
   const pending = safeCall(() => options.handoff?.read());
-  void Promise.resolve(pending).then((event) => {
+  void Promise.resolve(pending).then(async (event) => {
     if (!event || stopped || !isNativeHangEventData(event)) return;
     emit(logger, options.capabilities, {
       ...event,
       previousLaunch: true,
       recovered: false,
     });
-    void safePromise(() => options.handoff?.clear());
+    await clearHandoff(options.handoff, event);
   });
 
   const onState = (state: string) => {
@@ -106,9 +106,21 @@ export function startReactNativeJsWatchdog(
       recovered: true,
       previousLaunch: false,
     };
-    void safePromise(() => options.handoff?.write(event));
+    void persistAndEmit(event);
+  }
+
+  async function persistAndEmit(event: NativeHangEventData): Promise<void> {
+    let persisted = false;
+    if (options.handoff) {
+      try {
+        await options.handoff.write(event);
+        persisted = true;
+      } catch {
+        // A storage failure must not suppress an in-memory observation.
+      }
+    }
     emit(logger, options.capabilities, event);
-    void safePromise(() => options.handoff?.clear());
+    if (persisted) await clearHandoff(options.handoff, event);
   }
 
   function pause(): void {
@@ -130,7 +142,9 @@ export function startReactNativeJsWatchdog(
     toCleanup(subscription)();
   }
 
-  if (!isSuppressed()) timerId = timer(tick, checkIntervalMs);
+  // Keep checking while suppressed so a debugger attached at startup can be
+  // detached later without requiring a second SDK start.
+  timerId = timer(tick, checkIntervalMs);
 
   return { cleanup, pause, resume };
 }
@@ -152,6 +166,34 @@ function emit(
 function clampDuration(value: number): number {
   if (!Number.isFinite(value)) return DEFAULT_THRESHOLD_MS;
   return Math.max(1, Math.min(NATIVE_HANG_MAX_DURATION_MS, Math.floor(value)));
+}
+
+function monotonicNow(
+  globalObject: typeof globalThis & Record<string, unknown>,
+): number {
+  const performanceObject = globalObject.performance as
+    { now?: () => number } | undefined;
+  try {
+    if (typeof performanceObject?.now === "function") {
+      return performanceObject.now.call(performanceObject);
+    }
+  } catch {
+    // Fall through to the platform clock when the runtime exposes no usable
+    // monotonic clock.
+  }
+  return Date.now();
+}
+
+async function clearHandoff(
+  handoff: ReactNativeWatchdogHandoff | undefined,
+  expected: NativeHangEventData,
+): Promise<void> {
+  if (!handoff) return;
+  try {
+    await handoff.clear(expected);
+  } catch {
+    // A failed clear leaves the handoff for the next launch.
+  }
 }
 
 function isDebuggerAttached(
@@ -176,13 +218,5 @@ function safeCall<T>(call: () => T): T | undefined {
     return call();
   } catch {
     return undefined;
-  }
-}
-
-function safePromise(call: () => unknown): Promise<void> {
-  try {
-    return Promise.resolve(call()).then(() => undefined, () => undefined);
-  } catch {
-    return Promise.resolve();
   }
 }

@@ -56,7 +56,10 @@ optional Android or iOS native diagnostics plugin before returning. Call it
 before `runApp` so startup errors and previous launch evidence are inside the
 capture window. The plugin is registered automatically by Flutter when the
 package is installed. On another platform the bridge reports unavailable and
-the Dart SDK continues normally.
+the Dart SDK continues normally. The plugin starts its native collectors only
+after `CrumbtrailCollectors.nativeDiagnostics` is enabled. When disabled, an
+available plugin reports `supported: true, enabled: false` and drains no pending
+native data.
 
 `service` names which app in the project this is. One ingest key covers a whole
 project, so without it every app in that project arrives as an anonymous

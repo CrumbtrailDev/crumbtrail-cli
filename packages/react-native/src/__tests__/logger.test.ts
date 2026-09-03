@@ -76,7 +76,20 @@ describe("createReactNativeCrumbtrail", () => {
         }),
       }),
     );
-    expect(addEvent).not.toHaveBeenCalled();
+    expect(addEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "rn.native-capabilities",
+        data: expect.objectContaining({
+          native: expect.objectContaining({
+            nativeDiagnostics: {
+              supported: false,
+              enabled: false,
+              observed: false,
+            },
+          }),
+        }),
+      }),
+    );
   });
 
   it("hydrates AsyncStorage before initializing the shared Crumbtrail pipeline", async () => {

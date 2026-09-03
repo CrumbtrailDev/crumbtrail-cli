@@ -4,7 +4,10 @@ import {
   NATIVE_HANG_EVENT_KIND,
   type NativeHangEventData,
 } from "crumbtrail-core";
-import type { OptionalModuleResolver, ReactNativeCapabilities } from "./capabilities";
+import type {
+  OptionalModuleResolver,
+  ReactNativeCapabilities,
+} from "./capabilities";
 import type { AsyncStorageLike } from "./session-store";
 
 /** The native module name used by React Native autolinking. */
@@ -13,9 +16,7 @@ export const REACT_NATIVE_NATIVE_DIAGNOSTICS_MODULE =
 
 /** The event kinds a native bridge may hand to the JavaScript SDK. */
 export type ReactNativeNativeDiagnosticKind =
-  | typeof NATIVE_HANG_EVENT_KIND
-  | "native-crash"
-  | "app-lifecycle";
+  typeof NATIVE_HANG_EVENT_KIND | "native-crash" | "app-lifecycle";
 
 export interface ReactNativeNativeDiagnosticEvent {
   kind: ReactNativeNativeDiagnosticKind;
@@ -38,6 +39,7 @@ export interface ReactNativeNativeCapabilities {
 export interface ReactNativeNativeDiagnosticsModule {
   getCapabilities?: () => Promise<unknown> | unknown;
   drainDiagnostics?: () => Promise<unknown> | unknown;
+  setEnabled?: (enabled: boolean) => Promise<void> | void;
 }
 
 export interface ReactNativeNativeDiagnosticsOptions {
@@ -74,13 +76,18 @@ export function startReactNativeNativeDiagnostics(
       : options.module;
   const enabled = options.enabled !== false;
 
-  if (!enabled || !nativeModule) {
+  if (!nativeModule) {
     emitCapabilityEvent(logger, capabilities, EMPTY_CAPABILITIES);
     return { cleanup() {}, modulePresent: false };
   }
 
   let active = true;
-  void drainNativeDiagnostics(logger, capabilities, nativeModule).catch(() => {
+  void drainNativeDiagnostics(
+    logger,
+    capabilities,
+    nativeModule,
+    enabled,
+  ).catch(() => {
     // Native diagnostics are best effort. The native module has no permission
     // to make a host startup or render fail.
   });
@@ -89,6 +96,15 @@ export function startReactNativeNativeDiagnostics(
     modulePresent: true,
     cleanup() {
       active = false;
+      if (typeof nativeModule.setEnabled === "function") {
+        try {
+          void Promise.resolve(nativeModule.setEnabled(false)).catch(() => {
+            // Native teardown is best effort and must not escape logger.stop().
+          });
+        } catch {
+          // A synchronous teardown failure is also isolated from the host.
+        }
+      }
     },
   };
 
@@ -96,12 +112,25 @@ export function startReactNativeNativeDiagnostics(
     target: Crumbtrail,
     sdkCapabilities: ReactNativeCapabilities,
     module: ReactNativeNativeDiagnosticsModule,
+    shouldEnable: boolean,
   ): Promise<void> {
+    if (typeof module.setEnabled === "function") {
+      try {
+        await module.setEnabled(shouldEnable);
+      } catch {
+        // An older or partially registered native module may not expose the
+        // configuration call. Capability reads still remain useful.
+      }
+    }
     const reported = await readCapabilities(module);
     if (!active) return;
-    emitCapabilityEvent(target, sdkCapabilities, reported);
+    emitCapabilityEvent(
+      target,
+      sdkCapabilities,
+      shouldEnable ? reported : disabledCapabilities(reported),
+    );
 
-    if (typeof module.drainDiagnostics !== "function") return;
+    if (!shouldEnable || typeof module.drainDiagnostics !== "function") return;
     const raw = await module.drainDiagnostics();
     if (!active || !Array.isArray(raw)) return;
     for (const candidate of raw) {
@@ -127,40 +156,49 @@ export function createReactNativeWatchdogHandoff(
   key = "@crumbtrail/react-native/native-hang",
 ): ReactNativeWatchdogHandoff {
   if (!storage) return new MemoryReactNativeWatchdogHandoff();
+  let tail = Promise.resolve();
+  const enqueue = <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = tail.then(operation, operation);
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
   return {
-    async read() {
-      try {
+    read() {
+      return enqueue(async () => {
         const raw = await storage.getItem(key);
         if (!raw) return undefined;
         const parsed: unknown = JSON.parse(raw);
         return isNativeHangEventData(parsed) ? parsed : undefined;
-      } catch {
-        return undefined;
-      }
+      }).catch(() => undefined);
     },
-    async write(event) {
-      try {
+    write(event) {
+      return enqueue(async () => {
         await storage.setItem(key, JSON.stringify(event));
-      } catch {
-        // Handoff loss is reported by the next native or JS event, not thrown.
-      }
+      });
     },
-    async clear() {
-      // AsyncStorageLike intentionally has no removeItem in the public peer
-      // contract. Writing an empty value is compatible with the narrow seam.
-      try {
+    clear(expected) {
+      return enqueue(async () => {
+        if (expected) {
+          const raw = await storage.getItem(key);
+          if (raw !== JSON.stringify(expected)) return;
+        }
+        // AsyncStorageLike intentionally has no removeItem in the public peer
+        // contract. Writing an empty value is compatible with the narrow seam.
         await storage.setItem(key, "");
-      } catch {
-        // Best effort only.
-      }
+      }).catch(() => undefined);
     },
   };
 }
 
 export interface ReactNativeWatchdogHandoff {
-  read(): Promise<NativeHangEventData | undefined> | NativeHangEventData | undefined;
+  read():
+    Promise<NativeHangEventData | undefined> | NativeHangEventData | undefined;
   write(event: NativeHangEventData): Promise<void> | void;
-  clear(): Promise<void> | void;
+  /** Clear only if the current handoff still contains `expected`. */
+  clear(expected?: NativeHangEventData): Promise<void> | void;
 }
 
 class MemoryReactNativeWatchdogHandoff implements ReactNativeWatchdogHandoff {
@@ -174,9 +212,35 @@ class MemoryReactNativeWatchdogHandoff implements ReactNativeWatchdogHandoff {
     this.pending = event;
   }
 
-  clear(): void {
+  clear(expected?: NativeHangEventData): void {
+    if (expected && !sameHang(this.pending, expected)) return;
     this.pending = undefined;
   }
+}
+
+function disabledCapabilities(
+  capabilities: ReactNativeNativeCapabilities,
+): ReactNativeNativeCapabilities {
+  return Object.fromEntries(
+    Object.entries(capabilities).map(([key, detail]) => [
+      key,
+      { ...detail, enabled: false },
+    ]),
+  ) as ReactNativeNativeCapabilities;
+}
+
+function sameHang(
+  left: NativeHangEventData | undefined,
+  right: NativeHangEventData,
+): boolean {
+  return (
+    left?.source === right.source &&
+    left.thresholdMs === right.thresholdMs &&
+    left.observedDurationMs === right.observedDurationMs &&
+    left.recovered === right.recovered &&
+    left.previousLaunch === right.previousLaunch &&
+    left.stk === right.stk
+  );
 }
 
 async function readCapabilities(
@@ -267,11 +331,9 @@ function resolveNativeDiagnosticsModule(
   const resolve = resolver ?? safeRequireOptionalModule;
   try {
     const reactNative = resolve("react-native") as
-      | { NativeModules?: Record<string, unknown> }
-      | undefined;
-    const nativeModule = reactNative?.NativeModules?.[
-      REACT_NATIVE_NATIVE_DIAGNOSTICS_MODULE
-    ];
+      { NativeModules?: Record<string, unknown> } | undefined;
+    const nativeModule =
+      reactNative?.NativeModules?.[REACT_NATIVE_NATIVE_DIAGNOSTICS_MODULE];
     return isNativeDiagnosticsModule(nativeModule) ? nativeModule : undefined;
   } catch {
     return undefined;
@@ -301,7 +363,9 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function boundedRecord(value: Record<string, unknown>): Record<string, unknown> {
+function boundedRecord(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, candidate] of Object.entries(value).slice(0, 32)) {
     if (key.length > 64) continue;

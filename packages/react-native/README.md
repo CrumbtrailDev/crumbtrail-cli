@@ -202,7 +202,10 @@ RN-specific collectors, each capability-gated and independently toggleable via
 Native diagnostics is optional. The JavaScript bridge reports a capability event
 with `supported`, `enabled`, and `observed` states, then continues normally when
 the native module is absent or its platform call is unavailable. The native
-module stores only bounded local handoff and does not perform network requests.
+module is dormant until `nativeDiagnostics` is enabled. When disabled, it reports
+`supported: true, enabled: false`, starts no native collectors, and drains no
+pending data. It stores only bounded local handoff and does not perform network
+requests.
 The package's standard `android/` and `ios/` directories are discovered by the
 React Native CLI autolinker, so no separate native dependency or manual module
 registration is required.
