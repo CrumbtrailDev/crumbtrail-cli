@@ -100,6 +100,12 @@ export {
   parseMutation,
   parseRead,
   DEFAULT_SENSITIVE_DB_COLUMNS,
+  emitRelationalOrderEvents,
+  DEFAULT_MAX_RELATIONAL_ORDER_EVENTS_PER_REQUEST,
+  MAX_RELATIONAL_ORDER_COLUMNS,
+  MAX_RELATIONAL_ORDER_DECLARATIONS,
+  MAX_RELATIONAL_ORDER_EVENTS_PER_REQUEST,
+  RELATIONAL_ORDER_CONTRACT_VERSION,
 } from "./db";
 
 export type {
@@ -126,6 +132,8 @@ export type {
   DuckTypedSqliteRunResult,
   DuckTypedSqliteStatement,
   InstrumentDbClientOptions,
+  DbRelationalOrderDeclaration,
+  RelationalOrderCaptureOptions,
   InstrumentPgClientOptions,
   StatementClassification,
 } from "./db";

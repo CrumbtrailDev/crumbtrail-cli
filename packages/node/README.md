@@ -250,6 +250,67 @@ bind values. Pool checkouts emit `db.pool.wait` with their wait duration. `mssql
 distinct `db.pool.timeout` event when acquisition fails with `ETIMEOUT`; the other drivers do not
 provide a stable pool-timeout code, so their error prose is never guessed.
 
+### Capture relational statement order
+
+Relational order capture is off by default. Configure `relationalOrder` on a manually
+instrumented database client when a consumer needs to compare explicitly declared parent and
+child writes. It does not discover foreign keys or enable a detector. `autoCapture` does not
+configure this option.
+
+```ts
+import { randomBytes } from "node:crypto";
+import type { RelationalOrderCaptureOptions } from "crumbtrail-node";
+
+const relationalOrder: RelationalOrderCaptureOptions = {
+  key: randomBytes(32),
+  declarations: [
+    {
+      relationId: "order-line-order",
+      parent: { table: "orders", columns: ["id"] },
+      child: { table: "order_lines", columns: ["order_id"] },
+      childNullable: [false],
+      constraintTiming: "immediate",
+      deferrable: false,
+    },
+  ],
+};
+```
+
+Pass that same configuration object as `relationalOrder` in the existing `instrumentPgClient`,
+`instrumentMysqlClient`, `instrumentMssqlPool`, `instrumentSqliteDatabase`,
+`instrumentPostgresSql`, `instrumentNeonHttpQuery`, or `instrumentPrismaClient` options, alongside
+the request ID and event sink. Match table and column names exactly as the adapter reports them.
+Use an application secret containing 32 to 1024 bytes. Keep both the key and declarations stable
+across clients whose events must compare. A newly generated key, as above, limits comparison to
+clients sharing that process configuration. Never send the key to the consumer.
+
+Successful image bearing inserts, updates, and upserts emit `db.relational_order` for resolved
+parent or child values. Refused simple `INSERT ... VALUES` statements can emit an observation
+from positional or named binds. Expressions, unsupported SQL, missing values, null identities,
+deletes, and image less mutations omit observations. A refused statement's `db.error` carries
+`relationalSequence`, matching the observation's `sequence`. Consumers must join the exact
+request, engine, transaction identity, and ordinal, not another error in the same request.
+
+Each observation contains only engine, request ID, optional transaction ID, operation, role,
+ordinal, two HMAC SHA 256 identities, and the declared contract. Relation identity covers the
+declaration. Value identity covers that relation and its ordered typed values, so string `"42"`
+and number `42` differ. Raw table names, column names, keys, and row values are absent from this
+event. Other database events retain their existing redaction behavior.
+
+The contract requires equal nonempty parent and child column lists, one nullability boolean per
+child column, `immediate` or `deferred` timing, and explicit deferrability. Deferred timing requires
+`deferrable: true`. Limits are 32 declarations, eight columns per relation, and 64 events per
+request by default. `maxEventsPerRequest` clamps to 1 through 128. A configuration retains at
+most 256 request budgets, evicting the oldest. Ordinals never reset within a configuration,
+including after budget eviction. Use unique request IDs. Value encoding is limited to 16 KiB and 32
+entries. Failed inserts inspect at most 16 rows and 64 KiB of SQL. Invalid configuration disables
+only relational evidence. Capture failures never replace the database result or error.
+
+Verify the configured sink receives `db.relational_order` with matching 64 character hexadecimal
+identities for a parent and child using the same typed key. Ordinals represent observed statement
+completion order within the shared configuration, not a cross process clock or proof of commit.
+Use observed transaction outcomes separately. Prisma hooks do not establish transaction outcome.
+
 ### Cross session race evidence
 
 Race evidence is off by default. Enable it only when the hosted product will inspect lost updates

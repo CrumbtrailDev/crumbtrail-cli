@@ -18,6 +18,7 @@ import {
   extractPk,
   isRecord,
   normalizeMaxRowsPerStatement,
+  nextStatementSeq,
   pkKey,
   startDbQueryTimer,
   startDbTransaction,
@@ -164,6 +165,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
   const emittedReadRowsByRequest = new Map<string, number>();
   const readStatementsByRequest = new Map<string, number>();
   const readCallsitesByRequest: ReadCallsitesByRequest = new Map();
+  const statementSeqByRequest = new Map<string, number>();
   const connection = extractDbConnectionIdentity(ENGINE, db);
   let transaction: DbTransactionContext | undefined;
 
@@ -174,6 +176,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     requestId: string,
     operationOptions: InstrumentDbClientOptions,
   ): unknown => {
+    const statementSeq = nextStatementSeq(statementSeqByRequest, requestId);
     // The host mutation. Its own errors propagate normally — we never swallow the caller's query.
     const elapsed = startDbQueryTimer(operationOptions);
     const info = realStmt.run(...args);
@@ -181,6 +184,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
       connection,
       durationMs: elapsed(),
       transactionId: transaction?.id,
+      statementSeq,
     };
     try {
       const changes = toChangeCount(info);
@@ -235,6 +239,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     requestId: string,
     operationOptions: InstrumentDbClientOptions,
   ): unknown => {
+    const statementSeq = nextStatementSeq(statementSeqByRequest, requestId);
     const resolved = resolveParams(args);
     const pkCols = operationOptions.pkColumns?.[parsed.table] ?? ["id"];
 
@@ -271,6 +276,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
       connection,
       durationMs: elapsed(),
       transactionId: transaction?.id,
+      statementSeq,
     };
 
     try {
@@ -331,6 +337,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     requestId: string,
     operationOptions: InstrumentDbClientOptions,
   ): unknown => {
+    const statementSeq = nextStatementSeq(statementSeqByRequest, requestId);
     const resolved = resolveParams(args);
 
     // Deletes always carry a before-image (pg parity): pre-SELECT the rows before they vanish.
@@ -354,6 +361,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
       connection,
       durationMs: elapsed(),
       transactionId: transaction?.id,
+      statementSeq,
     };
 
     try {
@@ -442,9 +450,12 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
         op: parsed.op,
         table: parsed.table,
         statement,
+        statementParams:
+          args.length === 1 && isRecord(args[0]) ? args[0] : args,
         requestId,
         error,
         options: operationOptions,
+        context: { connection, transactionId: transaction?.id },
       });
       throw error;
     }

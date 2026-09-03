@@ -27,6 +27,16 @@ export {
 export { buildDbDiffEvent, type BuildDbDiffEventInput } from "./diff-event";
 export { buildDbTransactionEvent } from "./transaction-event";
 export {
+  emitRelationalOrderEvents,
+  DEFAULT_MAX_RELATIONAL_ORDER_EVENTS_PER_REQUEST,
+  MAX_RELATIONAL_ORDER_COLUMNS,
+  MAX_RELATIONAL_ORDER_DECLARATIONS,
+  MAX_RELATIONAL_ORDER_EVENTS_PER_REQUEST,
+  RELATIONAL_ORDER_CONTRACT_VERSION,
+  type DbRelationalOrderDeclaration,
+  type RelationalOrderCaptureOptions,
+} from "./relational-order";
+export {
   buildDbPoolWaitEvent,
   buildDbPoolTimeoutEvent,
   isPoolCheckoutTimeout,

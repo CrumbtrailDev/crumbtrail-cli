@@ -58,6 +58,57 @@ function setup(extra: Record<string, unknown> = {}) {
 }
 
 describe("instrumentPrismaClient", () => {
+  it("captures ordered relational evidence for normal model create, update, and upsert", async () => {
+    const { client, events } = setup({
+      relationalOrder: {
+        key: "test-only-relational-key-at-least-32-bytes",
+        declarations: [
+          {
+            relationId: "line-order",
+            parent: { table: "Order", columns: ["id"] },
+            child: { table: "OrderLine", columns: ["orderId"] },
+            childNullable: [false],
+            constraintTiming: "immediate",
+            deferrable: false,
+          },
+        ],
+      },
+    });
+    for (const operation of ["create", "update", "upsert"]) {
+      const result = { id: 1, orderId: 42 };
+      await expect(
+        client.run({ model: "OrderLine", operation, args: {} }, result),
+      ).resolves.toBe(result);
+    }
+    await client.run(
+      { model: "Order", operation: "create", args: {} },
+      { id: 42 },
+    );
+    const relational = events.filter(
+      (event) => event.k === "db.relational_order",
+    );
+    expect(relational.map((event) => event.d.sequence)).toEqual([1, 2, 3, 4]);
+    expect(relational.map((event) => event.d.op)).toEqual([
+      "insert",
+      "update",
+      "upsert",
+      "insert",
+    ]);
+    expect(relational.map((event) => event.d.role)).toEqual([
+      "child",
+      "child",
+      "child",
+      "parent",
+    ]);
+    expect(new Set(relational.map((event) => event.d.valueIdentity)).size).toBe(
+      1,
+    );
+    expect(
+      relational.every((event) => event.d.transactionId === undefined),
+    ).toBe(true);
+    expect(JSON.stringify(relational)).not.toContain("OrderLine");
+  });
+
   it("uses delete's returned row as the real before-image", async () => {
     const { client, events } = setup();
     const deleted = {

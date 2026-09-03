@@ -44,6 +44,12 @@ import {
   type CaptureGeneration,
   type CaptureGenerationState,
 } from "../capture-generation";
+import {
+  emitRelationalOrderEvents,
+  emitRelationalOrderAttempt,
+  nextRelationalOrderSequence,
+  type RelationalOrderCaptureOptions,
+} from "./relational-order";
 
 /**
  * Engine-agnostic emission pipeline shared by every DB adapter. All functions here are synchronous
@@ -130,6 +136,8 @@ export interface InstrumentDbClientOptions {
   captureGeneration?: CaptureGenerationState;
   /** Internal lifecycle seam used to capture ownership for a new operation. */
   getCaptureGeneration?: () => CaptureGeneration | undefined;
+  /** Explicit relation declarations used for sealed dependent-row ordering evidence. */
+  relationalOrder?: RelationalOrderCaptureOptions;
 }
 
 export interface PoolCheckoutCapture {
@@ -204,6 +212,10 @@ export interface DbStatementContext {
   connection?: DbConnectionIdentity;
   durationMs?: number;
   transactionId?: string;
+  /** Statement ordinal, when the adapter has one. */
+  statementSeq?: number;
+  /** Immutable ordinal allocated when this operation's statement completes. */
+  relationalSequence?: number;
 }
 
 export function startDbQueryTimer(
@@ -404,7 +416,7 @@ export function startDbTransaction(input: {
 export function finishDbTransaction(input: {
   engine: DbEngine;
   transaction: DbTransactionContext;
-  outcome: "commit" | "rollback";
+  outcome: "commit" | "rollback" | "unknown";
   requestId?: string;
   options: InstrumentDbClientOptions;
 }): void {
@@ -793,6 +805,11 @@ export function emitDbDiffEvents(input: {
   } = input;
   const maxRows = normalizeMaxRowsPerStatement(options.maxRowsPerStatement);
   const emittedRows = Math.min(rows.length, maxRows);
+  const relationalSequence =
+    input.context?.relationalSequence ??
+    (input.context?.statementSeq !== undefined
+      ? nextRelationalOrderSequence(options, requestId)
+      : undefined);
   const emitRows = rows.slice(0, emittedRows);
   const samplePks: Array<Record<string, unknown>> = [];
   const sensitive = buildSensitiveColumnSet(options.redactColumns);
@@ -832,6 +849,21 @@ export function emitDbDiffEvents(input: {
         : { after: row, before: beforeByPk?.get(pkKey(pk)) }),
     });
     if (!emitDbEvent(options, event)) return;
+    emitRelationalOrderEvents({
+      engine,
+      op,
+      table,
+      requestId,
+      rows: [row],
+      options: {
+        ...options,
+        emit: (event) => {
+          emitDbEvent(options, event);
+        },
+      },
+      sequence: relationalSequence,
+      transactionId: input.context?.transactionId,
+    });
   }
 
   if (rowCount > maxRows) {
@@ -956,9 +988,12 @@ export function emitDbErrorEvent(input: {
   error: unknown;
   options: InstrumentDbClientOptions;
   context?: DbStatementContext;
+  /** Original bind values used only to seal an explicitly declared failed INSERT. */
+  statementParams?: unknown;
 }): void {
   const { options } = input;
   try {
+    const sequence = nextRelationalOrderSequence(options, input.requestId);
     emitDbEvent(
       options,
       buildDbErrorEvent({
@@ -969,6 +1004,7 @@ export function emitDbErrorEvent(input: {
         statement: input.statement,
         error: input.error,
         requestId: input.requestId,
+        relationalSequence: sequence,
         transactionId: input.context?.transactionId,
         callsite: errorCallsiteFor(
           options,
@@ -981,6 +1017,23 @@ export function emitDbErrorEvent(input: {
         sessionStartedAt: options.sessionStartedAt,
       }),
     );
+    if (sequence !== undefined)
+      emitRelationalOrderAttempt({
+        engine: input.engine,
+        op: input.op === "insert" ? "insert" : input.op,
+        table: input.table ?? "",
+        statement: input.statement,
+        params: input.statementParams,
+        requestId: input.requestId,
+        sequence,
+        transactionId: input.context?.transactionId,
+        options: {
+          ...options,
+          emit: (event) => {
+            emitDbEvent(options, event);
+          },
+        },
+      });
   } catch {
     // Building or routing the record is capture work. It may never decide what the caller sees.
   }
@@ -1013,8 +1066,9 @@ export function emitDbStatementEvent(input: {
   requestId: string;
   options: InstrumentDbClientOptions;
   context?: DbStatementContext;
-}): void {
+}): number | undefined {
   const { options } = input;
+  const sequence = nextRelationalOrderSequence(options, input.requestId);
   try {
     emitDbEvent(
       options,
@@ -1036,6 +1090,7 @@ export function emitDbStatementEvent(input: {
   } catch {
     // Building or routing the record is capture work. It may never decide what the caller sees.
   }
+  return sequence;
 }
 
 /**
@@ -1049,6 +1104,13 @@ export function nextStatementSeq(
   statementsByRequest: Map<string, number>,
   requestId: string,
 ): number {
+  if (
+    statementsByRequest.size >= MAX_TRACKED_CALLSITE_REQUESTS &&
+    !statementsByRequest.has(requestId)
+  ) {
+    const oldest = statementsByRequest.keys().next().value;
+    if (typeof oldest === "string") statementsByRequest.delete(oldest);
+  }
   const seq = (statementsByRequest.get(requestId) ?? 0) + 1;
   statementsByRequest.set(requestId, seq);
   return seq;
