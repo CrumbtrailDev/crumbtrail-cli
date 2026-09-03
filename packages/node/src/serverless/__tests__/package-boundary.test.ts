@@ -42,6 +42,17 @@ describe("crumbtrail-node serverless package boundary", () => {
       "withCrumbtrailAwsLambda",
       "withCrumbtrailNetlify",
       "withCrumbtrailVercel",
+      "withCrumbtrailBullMqProducer",
+      "withCrumbtrailBullMqProcessor",
+      "withCrumbtrailAwsSqsProducer",
+      "withCrumbtrailAwsSnsProducer",
+      "withCrumbtrailAwsEventBridgeProducer",
+      "withCrumbtrailAwsSchedulerProducer",
+      "withCrumbtrailAwsSqsProcessor",
+      "withCrumbtrailAwsSqsBatchProcessor",
+      "withCrumbtrailAwsSnsProcessor",
+      "withCrumbtrailAwsEventBridgeProcessor",
+      "withCrumbtrailAwsSchedulerProcessor",
     ]) {
       expect(typeof esm[name]).toBe("function");
       expect(typeof cjs[name]).toBe("function");

@@ -181,12 +181,13 @@ export async function withCausalContext<T>(
 /** Extract a token from a namespaced carrier without trusting extra fields. */
 export function extractCrumbtrailContext(
   carrier: unknown,
+  now: number | (() => number) = Date.now,
 ): CrumbtrailContextToken | undefined {
   const value =
     isRecord(carrier) && "__crumbtrail" in carrier
       ? carrier.__crumbtrail
       : carrier;
-  return validateCrumbtrailContextToken(value);
+  return validateCrumbtrailContextToken(value, now);
 }
 
 /** Put a token into a namespaced mutable carrier. */

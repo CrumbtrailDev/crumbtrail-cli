@@ -319,6 +319,92 @@ export type {
 
 export type { BackendEventSink } from "./backend-event-sink";
 
+// ── Optional queue adapters ─────────────────────────────────────────────────
+// These adapters are duck typed so BullMQ remains an application dependency.
+export {
+  extractBullMqContext,
+  BULLMQ_CONTEXT_ENVELOPE_FIELD,
+  injectBullMqContext,
+  stripBullMqContext,
+  withCrumbtrailBullMqProducer,
+  withCrumbtrailBullMqProcessor,
+  wrapBullMqProducer,
+  wrapBullMqProcessor,
+} from "./queue/bullmq";
+
+export type {
+  BullMqBulkJobInput,
+  BullMqContextOptions,
+  BullMqJobLike,
+  BullMqProcessor,
+  BullMqProcessorHandler,
+  BullMqProcessorOptions,
+  BullMqProducerOptions,
+  BullMqQueueLike,
+} from "./queue/bullmq";
+
+export {
+  AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE,
+  AWS_CRUMBTRAIL_CONTEXT_FIELD,
+  AWS_CRUMBTRAIL_ENVELOPE_FIELD,
+  AWS_CRUMBTRAIL_PAYLOAD_FIELD,
+  MAX_AWS_EVENTBRIDGE_REQUEST_BYTES,
+  MAX_AWS_CONTEXT_VALUE_LENGTH,
+  MAX_AWS_SCHEDULER_INPUT_BYTES,
+  extractCrumbtrailEventBridgeContext,
+  extractCrumbtrailSchedulerContext,
+  extractCrumbtrailSnsRecord,
+  extractCrumbtrailSqsRecord,
+  injectCrumbtrailEventBridgeEntry,
+  injectCrumbtrailSchedulerInput,
+  injectCrumbtrailSnsMessage,
+  injectCrumbtrailSqsBatch,
+  injectCrumbtrailSqsMessage,
+  stripCrumbtrailEventBridgeContext,
+  stripCrumbtrailSchedulerContext,
+  withCrumbtrailAwsEventBridgeProducer,
+  withCrumbtrailAwsSchedulerProducer,
+  withCrumbtrailAwsSnsProducer,
+  withCrumbtrailAwsSqsProducer,
+  withCrumbtrailAwsEventBridgeProcessor,
+  withCrumbtrailAwsSchedulerProcessor,
+  withCrumbtrailAwsSnsProcessor,
+  withCrumbtrailAwsSqsBatchProcessor,
+  withCrumbtrailAwsSqsProcessor,
+  wrapAwsEventBridgeProducer,
+  wrapAwsSchedulerProducer,
+  wrapAwsSnsProducer,
+  wrapAwsSqsProducer,
+} from "./queue/aws";
+
+export type {
+  AwsClientLike,
+  AwsCaptureLossPhase,
+  AwsContextOptions,
+  AwsEventBridgeEntry,
+  AwsEventBridgeEvent,
+  AwsEventBridgeHandler,
+  AwsJobProcessorOptions,
+  AwsMessageAttribute,
+  AwsMessageAttributes,
+  AwsSchedulerCreateScheduleInput,
+  AwsSchedulerHandler,
+  AwsSchedulerProducerOptions,
+  AwsSnsEvent,
+  AwsSnsProducerOptions,
+  AwsSnsPublishInput,
+  AwsSnsRecord,
+  AwsSnsRecordHandler,
+  AwsSqsBatchResponse,
+  AwsSqsEvent,
+  AwsSqsProducerOptions,
+  AwsSqsRecord,
+  AwsSqsRecordHandler,
+  AwsSqsSendMessageBatchEntry,
+  AwsSqsSendMessageBatchInput,
+  AwsSqsSendMessageInput,
+} from "./queue/aws";
+
 // Capture-side utilities the pipeline tests reach for directly. They were
 // internal while those tests lived beside them; now that the tests live with
 // the analysis in the cloud repository, the boundary has to name them.
