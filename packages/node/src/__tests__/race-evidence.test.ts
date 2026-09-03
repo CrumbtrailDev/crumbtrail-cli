@@ -242,7 +242,7 @@ describe("race evidence contract", () => {
     const child = `
       import { createHmacRaceEvidenceResolver } from "./src/race-evidence.ts";
       const resolver = createHmacRaceEvidenceResolver("ctkey_0123456789abcdef0123456789abcdef0123456789abcdef");
-      const primaryKey = { "\\uE000": "a", Z: "b", "\\u00E9": "c", e: "d" };
+      const primaryKey = { z: "a", "\\u00E4": "b", "\\u00E5": "c", "\\u00F6": "d", a: "e" };
       process.stdout.write(JSON.stringify(resolver({ surface: "db.read", operation: "read", table: "orders", primaryKey })));
     `;
     const outputs = ["C", "en_US.UTF-8", "tr_TR.UTF-8", "sv_SE.UTF-8"].map(
