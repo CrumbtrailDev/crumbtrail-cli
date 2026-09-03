@@ -1693,6 +1693,21 @@ function staticBootstrapBlock(html: string) {
   return null;
 }
 
+function isParserBlockingBootstrap(attributes: string): boolean {
+  const attribute =
+    /([^\s=<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
+  for (const match of attributes.matchAll(attribute)) {
+    const name = match[1].toLowerCase();
+    if (["async", "defer", "nomodule"].includes(name)) return false;
+    if (
+      name === "type" &&
+      (match[2] ?? match[3] ?? match[4] ?? "").trim().toLowerCase() === "module"
+    )
+      return false;
+  }
+  return true;
+}
+
 function staticModuleVersion(html: string): string | null {
   for (const block of htmlScriptBlocks(html)) {
     if (!block.executable) continue;
@@ -1857,6 +1872,19 @@ function staticExistingPagePlan(
     io,
   });
   if (markerSource !== null) {
+    if (!isParserBlockingBootstrap(markerBlock!.attributes)) {
+      return {
+        recipe: input.recipe,
+        kind: "fallback-ai",
+        targetPath: null,
+        content: null,
+        snippet: "",
+        keyIsSourceLiteral: true,
+        warnings: [
+          `${path.relative(input.cwd, target) || target} has a bootstrap that is not a parser blocking classic script. Remove async, defer, nomodule, and type="module" from that tag while preserving its nonce, integrity, and crossorigin attributes, then run setup again.`,
+        ],
+      };
+    }
     const suppliedVersion = browserEarlyCaptureVersion(input.sdkVersion);
     const bootstrapVersion = staticBootstrapVersion(markerSource);
     if (

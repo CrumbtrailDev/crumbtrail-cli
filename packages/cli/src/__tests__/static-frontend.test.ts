@@ -677,6 +677,47 @@ describe("buildPlan — static", () => {
   });
 
   it.each([
+    "async",
+    'ASYNC="false"',
+    "defer",
+    "DeFeR=''",
+    "nomodule",
+    'NoMoDuLe="false"',
+    'type="module"',
+    "TYPE=MoDuLe",
+  ])("rejects nonblocking bootstrap attributes %s at any position", (attrs) => {
+    for (const late of [false, true]) {
+      const app = '<script src="/app.js"></script>';
+      const bootstrap = `<script ${attrs} nonce="safe" integrity="sha384-test" src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>`;
+      const wired = insertIntoHtmlHead(
+        PAGE,
+        [
+          ...(late ? [app] : []),
+          bootstrap,
+          '<script type="module">import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0"; Crumbtrail.init({ httpEndpoint: "https://ingest.example.com", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });</script>',
+        ].join("\n"),
+      )!;
+      const plan = buildPlan(
+        {
+          cwd: CWD,
+          recipe: "static",
+          endpoint: ENDPOINT,
+          entryFile: p("index.html"),
+          serviceName: "web",
+          sdkVersion: "0.49.0",
+        },
+        fakeInjectIO({ [p("index.html")]: wired }),
+      );
+      expect(plan.kind).toBe("fallback-ai");
+      expect(plan.content).toBeNull();
+      expect(plan.warnings.join(" ")).toContain(
+        "parser blocking classic script",
+      );
+      expect(plan.warnings.join(" ")).toContain("preserving its nonce");
+    }
+  });
+
+  it.each([
     "http://esm.sh/crumbtrail-core@0.49.0",
     "https://evil.example/crumbtrail-core@0.49.0",
     "https://esm.sh.evil.example/crumbtrail-core@0.49.0",
