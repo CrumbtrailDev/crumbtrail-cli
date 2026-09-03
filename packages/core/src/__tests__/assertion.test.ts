@@ -418,6 +418,7 @@ describe("application assertions", () => {
       lastActivity: expect.any(Number),
       applicationAssertionCount: MAX_APPLICATION_ASSERTIONS_PER_SESSION,
       applicationResponseAssertionCount: 0,
+      applicationExpectationCount: 0,
     });
     expect(JSON.stringify(persisted)).not.toContain("item_count");
 

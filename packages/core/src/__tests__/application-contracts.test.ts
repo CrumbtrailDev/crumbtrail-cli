@@ -458,7 +458,7 @@ describe("application contracts through Crumbtrail", () => {
     await logger.stop();
   });
 
-  it("retains response caps across restoration and counts only admitted events", async () => {
+  it("retains response and expectation caps across restoration without restoring handles", async () => {
     const sink = {
       sendEvents: vi.fn().mockResolvedValue(undefined),
       sendBlob: vi.fn().mockResolvedValue(undefined),
@@ -496,17 +496,57 @@ describe("application contracts through Crumbtrail", () => {
       false,
     );
     blocked.mockRestore();
+    expect(
+      logger.expectSideEffect({ name: "invalid", kind: "work", deadlineMs: 0 })
+        .accepted,
+    ).toBe(false);
+    for (let index = 0; index < 100; index += 1) {
+      const expectation = logger.expectSideEffect({
+        name: "work",
+        kind: "work",
+        deadlineMs: 100_000,
+      });
+      expect(expectation.accepted).toBe(true);
+      if (index < 99) expectation.handle?.cancel();
+    }
+    expect(saved?.applicationExpectationCount).toBe(100);
     for (let index = 0; index < 100; index += 1)
       expect(logger.checkResponse({ state: "ready" }, facts).accepted).toBe(
         true,
       );
     expect(saved?.applicationResponseAssertionCount).toBe(100);
+    expect(saved?.applicationExpectationCount).toBe(100);
+    expect(Object.keys(saved!)).toEqual(
+      expect.arrayContaining([
+        "id",
+        "lastActivity",
+        "applicationExpectationCount",
+      ]),
+    );
+    expect(JSON.stringify(saved)).not.toContain("deadlineMs");
     await logger.stop();
+    const missesBeforeResume = sink.sendEvents.mock.calls
+      .flatMap((call) => call[0])
+      .filter(
+        (event: { k: string }) => event.k === "app.expectation.missed",
+      ).length;
     const resumed = Crumbtrail.init(options);
+    expect(
+      resumed.expectSideEffect({
+        name: "work",
+        kind: "work",
+        deadlineMs: 100_000,
+      }),
+    ).toEqual({ accepted: false, rejection: "expectation_cap_reached" });
     expect(resumed.checkResponse({ state: "ready" }, facts).results[0]).toEqual(
       { accepted: false, rejection: "response_session_cap_reached" },
     );
     await resumed.stop();
+    expect(
+      sink.sendEvents.mock.calls
+        .flatMap((call) => call[0])
+        .filter((event: { k: string }) => event.k === "app.expectation.missed"),
+    ).toHaveLength(missesBeforeResume);
   });
 
   it("flushes response mismatches and shutdown misses through the active session", async () => {

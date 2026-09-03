@@ -22,6 +22,7 @@ describe("SessionStore", () => {
         id: "ses_existing",
         lastActivity: 123,
         applicationAssertionCount: 4,
+        applicationExpectationCount: 99,
       }),
     });
     const store = createWebSessionStore(storage)!;
@@ -30,6 +31,7 @@ describe("SessionStore", () => {
       id: "ses_existing",
       lastActivity: 123,
       applicationAssertionCount: 4,
+      applicationExpectationCount: 99,
     });
 
     store.write({ id: "ses_next", lastActivity: 456 });
@@ -39,6 +41,18 @@ describe("SessionStore", () => {
   });
 
   it("rejects unbounded assertion counts and invalid activity timestamps", () => {
+    for (const applicationExpectationCount of [-1, 101, 1.5, "1", null]) {
+      const store = createWebSessionStore(
+        makeStorage({
+          [DEFAULT_SESSION_STORAGE_KEY]: JSON.stringify({
+            id: "ses_bad",
+            lastActivity: 123,
+            applicationExpectationCount,
+          }),
+        }),
+      )!;
+      expect(store.read()).toBeUndefined();
+    }
     const tooMany = createWebSessionStore(
       makeStorage({
         [DEFAULT_SESSION_STORAGE_KEY]: JSON.stringify({

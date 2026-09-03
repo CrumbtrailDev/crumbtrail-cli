@@ -779,10 +779,22 @@ export class ApplicationExpectationManager {
     sessionId?: string;
     emit: ApplicationExpectationEventEmitter;
     now?: () => number;
+    admittedCount?: number;
   }) {
+    const restoredCount = options.admittedCount ?? 0;
+    this.startedCount =
+      Number.isSafeInteger(restoredCount) &&
+      restoredCount >= 0 &&
+      restoredCount <= MAX_APPLICATION_EXPECTATIONS_PER_SESSION
+        ? restoredCount
+        : MAX_APPLICATION_EXPECTATIONS_PER_SESSION;
     this.sessionId = options.sessionId;
     this.defaultEmit = options.emit;
     this.now = options.now ?? Date.now;
+  }
+
+  get admittedCount(): number {
+    return this.startedCount;
   }
 
   begin(
@@ -871,6 +883,7 @@ export function createApplicationExpectationManager(options: {
   sessionId?: string;
   emit: ApplicationExpectationEventEmitter;
   now?: () => number;
+  admittedCount?: number;
 }): ApplicationExpectationManager {
   return new ApplicationExpectationManager(options);
 }

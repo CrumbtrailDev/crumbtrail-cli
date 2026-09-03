@@ -1,5 +1,8 @@
 import { MAX_APPLICATION_ASSERTIONS_PER_SESSION } from "./assertion";
-import { MAX_APPLICATION_RESPONSE_ASSERTIONS_PER_SESSION } from "./application-contracts";
+import {
+  MAX_APPLICATION_RESPONSE_ASSERTIONS_PER_SESSION,
+  MAX_APPLICATION_EXPECTATIONS_PER_SESSION,
+} from "./application-contracts";
 
 export interface PersistedSession {
   id: string;
@@ -7,6 +10,7 @@ export interface PersistedSession {
   /** Count only. Assertion values and identifiers are never persisted. */
   applicationAssertionCount?: number;
   applicationResponseAssertionCount?: number;
+  applicationExpectationCount?: number;
 }
 
 export interface SessionStore {
@@ -34,6 +38,7 @@ export function createWebSessionStore(
           lastActivity?: unknown;
           applicationAssertionCount?: unknown;
           applicationResponseAssertionCount?: unknown;
+          applicationExpectationCount?: unknown;
         };
         if (typeof parsed.id !== "string" || parsed.id.length === 0)
           return undefined;
@@ -44,6 +49,16 @@ export function createWebSessionStore(
         )
           return undefined;
         const applicationAssertionCount = parsed.applicationAssertionCount;
+        const applicationExpectationCount = parsed.applicationExpectationCount;
+        if (
+          applicationExpectationCount !== undefined &&
+          (typeof applicationExpectationCount !== "number" ||
+            !Number.isSafeInteger(applicationExpectationCount) ||
+            applicationExpectationCount < 0 ||
+            applicationExpectationCount >
+              MAX_APPLICATION_EXPECTATIONS_PER_SESSION)
+        )
+          return undefined;
         const applicationResponseAssertionCount =
           parsed.applicationResponseAssertionCount;
         if (
@@ -66,6 +81,9 @@ export function createWebSessionStore(
         return {
           id: parsed.id,
           lastActivity: parsed.lastActivity,
+          ...(applicationExpectationCount === undefined
+            ? {}
+            : { applicationExpectationCount }),
           ...(applicationResponseAssertionCount === undefined
             ? {}
             : { applicationResponseAssertionCount }),
