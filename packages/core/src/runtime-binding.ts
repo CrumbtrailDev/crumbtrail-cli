@@ -150,7 +150,7 @@ function createLateCleanupWindow(timeoutMs: number): LateCleanupWindow {
 
 const runtimeBindingCache = new Map<string, RuntimeBindingCacheEntry>();
 const runtimeBindingRetirements = new Map<string, Promise<void>>();
-const runtimeBindingFunctionIds = new WeakMap<Function, number>();
+const runtimeBindingFunctionIds = new WeakMap<object, number>();
 let nextRuntimeBindingFunctionId = 1;
 const runtimeBindingHandles = new WeakMap<
   RuntimeBindingHandle,
@@ -695,7 +695,7 @@ export function getCachedRuntimeBindingClient(
   return client;
 }
 
-function functionIdentity(value: Function | undefined): number {
+function functionIdentity(value: object | undefined): number {
   if (!value) return 0;
   const existing = runtimeBindingFunctionIds.get(value);
   if (existing !== undefined) return existing;

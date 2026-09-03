@@ -13,7 +13,7 @@ import {
   BROWSER_SESSION_START_TIMEOUT_MS,
   HttpTransport,
 } from "../transports/http";
-import { Crumbtrail, REMOTE_POLICY_TIMEOUT_MS } from "../crumbtrail";
+import { Crumbtrail } from "../crumbtrail";
 import { runServerlessInvocation } from "../serverless";
 
 const ENDPOINT = "https://capture.example";
