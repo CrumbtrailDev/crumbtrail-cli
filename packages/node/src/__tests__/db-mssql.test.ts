@@ -3,6 +3,8 @@ import {
   CAPTURE_GAP_EVENT_KIND,
   DB_DIFF_BULK_EVENT_KIND,
   DB_DIFF_EVENT_KIND,
+  DB_ERROR_EVENT_KIND,
+  DB_RELATIONAL_ORDER_EVENT_KIND,
   DB_READ_BULK_EVENT_KIND,
   DB_READ_EVENT_KIND,
   type BugEvent,
@@ -73,6 +75,44 @@ function diffEvents(events: BugEvent[]): DbDiffEventData[] {
 }
 
 describe("instrumentMssqlPool OUTPUT injection", () => {
+  it("seals a failed dependent INSERT from named mssql binds", async () => {
+    const pool = fakeMssqlPool(() => {
+      throw new Error("FOREIGN KEY constraint failed");
+    });
+    const events: BugEvent[] = [];
+    const db = instrumentMssqlPool(pool, {
+      requestId: "req-relational",
+      relationalOrder: {
+        key: "test-only-key",
+        declarations: [
+          {
+            relationId: "order-line-order",
+            parent: { table: "orders", columns: ["id"] },
+            child: { table: "order_lines", columns: ["order_id"] },
+            childNullable: [false],
+            constraintTiming: "immediate",
+            deferrable: false,
+          },
+        ],
+      },
+      emit: (event) => events.push(event),
+    });
+
+    const request = db.request();
+    request.input("order_id", "Int", 42);
+    await expect(
+      request.query("INSERT INTO order_lines (order_id) VALUES (@order_id)"),
+    ).rejects.toThrow("FOREIGN KEY");
+
+    expect(events.some((event) => event.k === DB_ERROR_EVENT_KIND)).toBe(true);
+    const relational = events.find(
+      (event) => event.k === DB_RELATIONAL_ORDER_EVENT_KIND,
+    );
+    expect(relational).toBeDefined();
+    expect(JSON.stringify(relational)).not.toContain("order_lines");
+    expect(JSON.stringify(relational)).not.toContain('"42"');
+  });
+
   it("injects OUTPUT INSERTED.* before VALUES and records the insert diff", async () => {
     const pool = fakeMssqlPool(() => ({
       recordset: [{ id: 1, name: "Ada" }],

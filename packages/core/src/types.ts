@@ -240,6 +240,9 @@ export const DB_STATEMENT_EVENT_KIND = "db.statement" as const;
 /** Canonical lifecycle event for one database transaction (`k:'db.transaction'`). */
 export const DB_TRANSACTION_EVENT_KIND = "db.transaction" as const;
 
+/** Canonical event kind for sealed, explicitly declared relational write-order evidence. */
+export const DB_RELATIONAL_ORDER_EVENT_KIND = "db.relational_order" as const;
+
 /** Canonical event kind for a bounded record of evidence the capture path could not collect. */
 export const CAPTURE_GAP_EVENT_KIND = "capture_gap" as const;
 
@@ -419,7 +422,7 @@ export interface DbConnectionIdentity {
   role?: "primary" | "replica";
 }
 
-export type DbTransactionOutcome = "open" | "commit" | "rollback";
+export type DbTransactionOutcome = "open" | "commit" | "rollback" | "unknown";
 
 export interface DbTransactionEventData {
   engine: DbEngine;
@@ -427,6 +430,38 @@ export interface DbTransactionEventData {
   outcome: DbTransactionOutcome;
   requestId?: string;
   connection?: DbConnectionIdentity;
+}
+
+export type DbRelationalOrderRole = "parent" | "child";
+export type DbRelationalOrderOp = "insert" | "update" | "upsert";
+export type DbRelationalConstraintTiming = "immediate" | "deferred";
+
+/** The safe wire contract for one explicitly configured relational write observation. */
+export interface DbRelationalOrderContract {
+  version: 1;
+  columnCount: number;
+  childNullable: boolean[];
+  constraintTiming: DbRelationalConstraintTiming;
+  deferrable: boolean;
+}
+
+/**
+ * Type-specific payload (`d`) of a `k:'db.relational_order'` event.
+ *
+ * This event deliberately contains no schema names, SQL, row images, keys or values. The two
+ * identities are keyed digests made by the Node SDK from an explicit declaration and its ordered
+ * participating values. Cloud validates this subtractive contract before indexing it.
+ */
+export interface DbRelationalOrderEventData {
+  engine: DbEngine;
+  relationIdentity: string;
+  valueIdentity: string;
+  role: DbRelationalOrderRole;
+  op: DbRelationalOrderOp;
+  sequence: number;
+  requestId: string;
+  transactionId?: string;
+  contract: DbRelationalOrderContract;
 }
 
 /** Runtime-derived application location attached to database evidence when a host frame exists. */

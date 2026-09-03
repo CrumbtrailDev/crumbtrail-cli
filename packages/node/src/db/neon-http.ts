@@ -150,6 +150,7 @@ function runCaptured(
   invoke: (statement: string) => unknown,
   options: InstrumentDbClientOptions,
   counters: RequestCounters,
+  params?: unknown,
 ): unknown {
   const operationOptions = captureGenerationFor(options);
   let parsed: ParsedMutation | undefined;
@@ -192,6 +193,7 @@ function runCaptured(
       op: parsed?.op ?? (parsedRead ? "select" : "other"),
       table: parsed?.table ?? parsedRead?.table ?? null,
       statement: text,
+      statementParams: params,
       requestId,
       error,
       options: operationOptions,
@@ -265,6 +267,7 @@ function runCaptured(
         op: parsed?.op ?? (parsedRead ? "select" : "other"),
         table: parsed?.table ?? parsedRead?.table ?? null,
         statement: text,
+        statementParams: params,
         requestId,
         error,
         options: operationOptions,
@@ -323,6 +326,7 @@ export function instrumentNeonHttpQuery<T>(
           ),
         operationOptions,
         counters,
+        args.slice(1),
       );
     },
     get(target, prop, receiver) {
@@ -336,6 +340,7 @@ export function instrumentNeonHttpQuery<T>(
                 (statement) => target.query!(statement, params, queryOptions),
                 operationOptions,
                 counters,
+                params,
               )
             : target.query!(text, params, queryOptions);
         };

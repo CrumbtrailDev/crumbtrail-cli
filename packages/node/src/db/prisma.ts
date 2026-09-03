@@ -157,6 +157,7 @@ async function observePrismaOperation(
         op: raw.op,
         table: raw.table,
         statement: rawStatement,
+        statementParams: rawParamsFrom(input.args),
         requestId,
         error,
         options: operationOptions,
@@ -397,6 +398,25 @@ function rawStatementFrom(args: unknown): string | undefined {
     strings.every((value) => typeof value === "string")
   ) {
     return strings.join("?");
+  }
+  return undefined;
+}
+
+function rawParamsFrom(args: unknown): unknown {
+  try {
+    if (!Array.isArray(args) || args.length === 0) return undefined;
+    const first = args[0];
+    if (typeof first === "string") return args.slice(1);
+    if (!isRecord(first)) return args.slice(1);
+    if (Array.isArray(first.values)) return first.values;
+    if (Array.isArray(first.params)) return first.params;
+    if (
+      Array.isArray(first.strings) &&
+      first.strings.every((value) => typeof value === "string")
+    )
+      return args.slice(1);
+  } catch {
+    return undefined;
   }
   return undefined;
 }

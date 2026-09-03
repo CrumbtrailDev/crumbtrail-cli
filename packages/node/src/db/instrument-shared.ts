@@ -44,6 +44,11 @@ import {
   type CaptureGeneration,
   type CaptureGenerationState,
 } from "../capture-generation";
+import {
+  emitRelationalOrderEvents,
+  emitRelationalOrderAttempt,
+  type RelationalOrderCaptureOptions,
+} from "./relational-order";
 
 /**
  * Engine-agnostic emission pipeline shared by every DB adapter. All functions here are synchronous
@@ -77,6 +82,32 @@ export const DEFAULT_MAX_CALLSITES_PER_REQUEST = 8;
  * hole; this one is bounded because it holds objects rather than counters.
  */
 const MAX_TRACKED_CALLSITE_REQUESTS = 256;
+
+const lastStatementSeqByOptions = new WeakMap<object, Map<string, number>>();
+
+function statementSequenceMap(
+  options: InstrumentDbClientOptions,
+): Map<string, number> {
+  let sequences = lastStatementSeqByOptions.get(options);
+  if (!sequences) {
+    sequences = new Map();
+    lastStatementSeqByOptions.set(options, sequences);
+  }
+  return sequences;
+}
+
+function rememberStatementSequence(
+  options: InstrumentDbClientOptions,
+  requestId: string,
+  sequence: number,
+): void {
+  const sequences = statementSequenceMap(options);
+  if (sequences.size >= 256 && !sequences.has(requestId)) {
+    const oldest = sequences.keys().next().value;
+    if (typeof oldest === "string") sequences.delete(oldest);
+  }
+  sequences.set(requestId, sequence);
+}
 
 /**
  * Options accepted by every `instrument*` adapter. Every field is engine-agnostic; the Postgres
@@ -130,6 +161,8 @@ export interface InstrumentDbClientOptions {
   captureGeneration?: CaptureGenerationState;
   /** Internal lifecycle seam used to capture ownership for a new operation. */
   getCaptureGeneration?: () => CaptureGeneration | undefined;
+  /** Explicit relation declarations used for sealed dependent-row ordering evidence. */
+  relationalOrder?: RelationalOrderCaptureOptions;
 }
 
 export interface PoolCheckoutCapture {
@@ -204,6 +237,8 @@ export interface DbStatementContext {
   connection?: DbConnectionIdentity;
   durationMs?: number;
   transactionId?: string;
+  /** Statement ordinal, when the adapter has one. */
+  statementSeq?: number;
 }
 
 export function startDbQueryTimer(
@@ -404,7 +439,7 @@ export function startDbTransaction(input: {
 export function finishDbTransaction(input: {
   engine: DbEngine;
   transaction: DbTransactionContext;
-  outcome: "commit" | "rollback";
+  outcome: "commit" | "rollback" | "unknown";
   requestId?: string;
   options: InstrumentDbClientOptions;
 }): void {
@@ -832,6 +867,24 @@ export function emitDbDiffEvents(input: {
         : { after: row, before: beforeByPk?.get(pkKey(pk)) }),
     });
     if (!emitDbEvent(options, event)) return;
+    if (input.context?.statementSeq !== undefined)
+      rememberStatementSequence(
+        options,
+        requestId,
+        input.context.statementSeq,
+      );
+    emitRelationalOrderEvents({
+      engine,
+      op,
+      table,
+      requestId,
+      rows: [row],
+      options,
+      sequence:
+        input.context?.statementSeq ??
+        lastStatementSeqByOptions.get(options)?.get(requestId),
+      transactionId: input.context?.transactionId,
+    });
   }
 
   if (rowCount > maxRows) {
@@ -956,9 +1009,14 @@ export function emitDbErrorEvent(input: {
   error: unknown;
   options: InstrumentDbClientOptions;
   context?: DbStatementContext;
+  /** Original bind values used only to seal an explicitly declared failed INSERT. */
+  statementParams?: unknown;
 }): void {
   const { options } = input;
   try {
+    const seqs = statementSequenceMap(options);
+    const sequence =
+      input.context?.statementSeq ?? nextStatementSeq(seqs, input.requestId);
     emitDbEvent(
       options,
       buildDbErrorEvent({
@@ -981,6 +1039,17 @@ export function emitDbErrorEvent(input: {
         sessionStartedAt: options.sessionStartedAt,
       }),
     );
+    emitRelationalOrderAttempt({
+      engine: input.engine,
+      op: input.op === "insert" ? "insert" : input.op,
+      table: input.table ?? "",
+      statement: input.statement,
+      params: input.statementParams,
+      requestId: input.requestId,
+      sequence,
+      transactionId: input.context?.transactionId,
+      options,
+    });
   } catch {
     // Building or routing the record is capture work. It may never decide what the caller sees.
   }
@@ -1015,6 +1084,7 @@ export function emitDbStatementEvent(input: {
   context?: DbStatementContext;
 }): void {
   const { options } = input;
+  rememberStatementSequence(options, input.requestId, input.seq);
   try {
     emitDbEvent(
       options,
@@ -1049,6 +1119,10 @@ export function nextStatementSeq(
   statementsByRequest: Map<string, number>,
   requestId: string,
 ): number {
+  if (statementsByRequest.size >= MAX_TRACKED_CALLSITE_REQUESTS && !statementsByRequest.has(requestId)) {
+    const oldest = statementsByRequest.keys().next().value;
+    if (typeof oldest === "string") statementsByRequest.delete(oldest);
+  }
   const seq = (statementsByRequest.get(requestId) ?? 0) + 1;
   statementsByRequest.set(requestId, seq);
   return seq;

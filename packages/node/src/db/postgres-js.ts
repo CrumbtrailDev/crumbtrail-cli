@@ -540,6 +540,7 @@ function observe(
           op: parsed?.op ?? (parsedRead ? "select" : "other"),
           table: parsed?.table ?? parsedRead?.table ?? null,
           statement: statementTextOf(q, plannedText),
+          statementParams: q.args,
           requestId,
           error: reason,
           options: operationOptions,

@@ -99,26 +99,37 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         emitGap(operationOptions, { reason: "capture_exception", error });
       }
       const elapsed = startDbQueryTimer(operationOptions);
+      const activeBefore = transaction;
       let result: DuckTypedPgQueryResult;
       try {
         result = await client.query(text, params);
       } catch (error) {
+        if (activeBefore && transactionCommand !== "begin") {
+          finishDbTransaction({
+            engine: ENGINE,
+            transaction: activeBefore,
+            outcome: "unknown",
+            requestId,
+            options,
+          });
+          transaction = undefined;
+        }
         if (requestId) {
           emitDbErrorEvent({
             engine: ENGINE,
             op: "other",
             table: null,
             statement: text,
+            statementParams: params,
             requestId,
             error,
             options: operationOptions,
-            context: { connection, transactionId: transaction?.id },
+            context: { connection, transactionId: activeBefore?.id },
           });
         }
         throw error;
       }
       const durationMs = elapsed();
-      const activeBefore = transaction;
       if (transactionCommand === "begin") {
         transaction = startDbTransaction({
           engine: ENGINE,
@@ -198,6 +209,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           op: parsedRead ? "select" : "other",
           table: parsedRead?.table ?? null,
           statement: text,
+          statementParams: params,
           requestId,
           error,
           options: operationOptions,
@@ -316,6 +328,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
           op: parsed.op,
           table: parsed.table,
           statement: text,
+          statementParams: paramArray,
           requestId,
           error: queryError,
           options: operationOptions,
@@ -340,6 +353,7 @@ export function instrumentPgClient<T extends DuckTypedPgClient>(
         // The statement as the host wrote it, not our RETURNING-augmented rewrite: the reader is
         // looking for this statement in their own repository.
         statement: text,
+        statementParams: paramArray,
         requestId,
         error,
         options: operationOptions,

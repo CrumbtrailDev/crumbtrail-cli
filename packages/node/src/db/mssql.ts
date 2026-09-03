@@ -18,6 +18,7 @@ import {
   finishDbTransaction,
   extractPk,
   isRecord,
+  nextStatementSeq,
   pkKey,
   startDbQueryTimer,
   startDbTransaction,
@@ -469,6 +470,24 @@ function replayInputs(
   }
 }
 
+/** Projects recorded mssql input tuples into the named-bind shape used by the sealed INSERT parser. */
+function relationalOrderParams(
+  recordedInputs: ReadonlyArray<readonly unknown[]>,
+): Record<string, unknown> | undefined {
+  const params: Record<string, unknown> = Object.create(null) as Record<
+    string,
+    unknown
+  >;
+  let found = false;
+  for (const args of recordedInputs) {
+    const name = args[0];
+    if (typeof name !== "string" || name.length === 0) return undefined;
+    params[name] = args.length >= 3 ? args[2] : args[1];
+    found = true;
+  }
+  return found ? params : undefined;
+}
+
 /**
  * Wraps a duck-typed `mssql` pool so INSERT/UPDATE/DELETE statements executed within a request scope
  * record a `db.diff` event (op, table, primary key, after-image; before-image behind `captureBefore`).
@@ -502,13 +521,18 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
   const emittedReadRowsByRequest = new Map<string, number>();
   const readStatementsByRequest = new Map<string, number>();
   const readCallsitesByRequest: ReadCallsitesByRequest = new Map();
+  const statementSeqByRequest = new Map<string, number>();
   const connection =
     instrumentationContext.connection ??
     extractDbConnectionIdentity(ENGINE, pool);
-  const statementContext = (durationMs: number): DbStatementContext => ({
+  const statementContext = (
+    durationMs: number,
+    statementSeq?: number,
+  ): DbStatementContext => ({
     connection,
     durationMs,
     transactionId: instrumentationContext.getTransaction?.()?.id,
+    ...(statementSeq !== undefined ? { statementSeq } : {}),
   });
 
   const timedQuery = async (
@@ -587,6 +611,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     // Stable const bindings for the mutation path (narrowing survives into the nested helper below).
     const mutation = parsed;
     const reqId = requestId;
+    const statementSeq = nextStatementSeq(statementSeqByRequest, reqId);
 
     // Runs the ORIGINAL text untouched and records an image-less `db.diff` when it changed rows. Used
     // whenever we deliberately decline to edit the SQL (safety gate, no injection point).
@@ -603,7 +628,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
               requestId: reqId,
               rowCount,
               options: operationOptions,
-              context: statementContext(durationMs),
+            context: statementContext(durationMs, statementSeq),
             });
           }
         } catch (error) {
@@ -697,7 +722,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
             requestId: reqId,
             rowCount,
             options: operationOptions,
-            context: statementContext(fallback.durationMs),
+            context: statementContext(fallback.durationMs, statementSeq),
           });
         }
       } catch (error) {
@@ -720,7 +745,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
           beforeByPk,
           rowCount,
           options: operationOptions,
-          context: statementContext(durationMs),
+          context: statementContext(durationMs, statementSeq),
         });
       } else if (rowCount > 0) {
         // Mutation ran but produced no imageable OUTPUT rows: still record the write.
@@ -731,7 +756,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
           requestId: reqId,
           rowCount,
           options: operationOptions,
-          context: statementContext(durationMs),
+          context: statementContext(durationMs, statementSeq),
         });
       }
     } catch (error) {
@@ -775,15 +800,21 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
                   requestId = undefined;
                 }
                 if (requestId) {
-                  const classification = classifyStatement(text);
-                  const mutation =
-                    classification.kind === "mutation"
-                      ? classification.mutation
-                      : undefined;
-                  const read =
-                    classification.kind === "read"
-                      ? classification.read
-                      : undefined;
+                  let mutation: ParsedMutation | undefined;
+                  let read: ParsedRead | undefined;
+                  try {
+                    const classification = classifyStatement(text);
+                    mutation =
+                      classification.kind === "mutation"
+                        ? classification.mutation
+                        : undefined;
+                    read =
+                      classification.kind === "read"
+                        ? classification.read
+                        : undefined;
+                  } catch {
+                    // The original driver error remains authoritative.
+                  }
                   emitDbErrorEvent({
                     engine: ENGINE,
                     op: mutation?.op ?? (read ? "select" : "other"),
@@ -792,10 +823,21 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
                     requestId,
                     error,
                     options: operationOptions,
+                    statementParams: relationalOrderParams(recordedInputs),
+                    context: {
+                      ...statementContext(
+                        0,
+                        mutation
+                          ? statementSeqByRequest.get(requestId)
+                          : undefined,
+                      ),
+                    },
                   });
                 }
               }
               throw error;
+            } finally {
+              recordedInputs.length = 0;
             }
           };
         }
@@ -908,15 +950,43 @@ export function instrumentMssqlTransaction<T extends DuckTypedMssqlTransaction>(
         if (typeof method !== "function") return method;
         return async (...args: unknown[]) => {
           const operationOptions = captureGenerationFor(options);
-          const result = await (
-            method as (...values: unknown[]) => Promise<unknown>
-          ).apply(target, args);
           let requestId: string | undefined;
           try {
             requestId =
               operationOptions.requestId ?? operationOptions.getRequestId?.();
           } catch (error) {
             emitGap(operationOptions, { reason: "capture_exception", error });
+          }
+          const activeBefore = transaction;
+          let result: unknown;
+          try {
+            result = await (
+              method as (...values: unknown[]) => Promise<unknown>
+            ).apply(target, args);
+          } catch (error) {
+            if (activeBefore && prop !== "begin") {
+              finishDbTransaction({
+                engine: ENGINE,
+                transaction: activeBefore,
+                outcome: "unknown",
+                requestId,
+                options,
+              });
+              transaction = undefined;
+            }
+            if (requestId) {
+              emitDbErrorEvent({
+                engine: ENGINE,
+                op: "other",
+                table: null,
+                statement: String(prop),
+                requestId,
+                error,
+                options,
+                context: { connection, transactionId: activeBefore?.id },
+              });
+            }
+            throw error;
           }
           if (prop === "begin") {
             transaction = startDbTransaction({

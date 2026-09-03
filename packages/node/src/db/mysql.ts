@@ -391,9 +391,37 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           emitGap(operationOptions, { reason: "capture_exception", error });
         }
         const elapsed = startDbQueryTimer(operationOptions);
-        const result = await run(sql, values);
-        const durationMs = elapsed();
         const activeBefore = transaction;
+        let result: unknown;
+        try {
+          result = await run(sql, values);
+        } catch (error) {
+          if (activeBefore && transactionCommand !== "begin") {
+            finishDbTransaction({
+              engine: ENGINE,
+              transaction: activeBefore,
+              outcome: "unknown",
+              requestId,
+              options,
+            });
+            transaction = undefined;
+          }
+          if (requestId) {
+            emitDbErrorEvent({
+              engine: ENGINE,
+              op: "other",
+              table: null,
+              statement: sql,
+              statementParams: values,
+              requestId,
+              error,
+              options,
+              context: { connection, transactionId: activeBefore?.id },
+            });
+          }
+          throw error;
+        }
+        const durationMs = elapsed();
         if (transactionCommand === "begin") {
           transaction = startDbTransaction({
             engine: ENGINE,
@@ -474,6 +502,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
             op: parsedRead ? "select" : "other",
             table: parsedRead?.table ?? null,
             statement: sql,
+            statementParams: values,
             requestId,
             error,
             options: operationOptions,
@@ -536,6 +565,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
             op: parsed.op,
             table: parsed.table,
             statement: sql,
+            statementParams: values,
             requestId,
             error,
             options: operationOptions,
@@ -603,6 +633,7 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           op: parsedMutation.op,
           table: parsedMutation.table,
           statement: sql,
+          statementParams: values,
           requestId,
           error,
           options: operationOptions,
@@ -734,9 +765,37 @@ export function instrumentMysqlClient<T extends DuckTypedMysqlClient>(
           } catch (error) {
             emitGap(operationOptions, { reason: "capture_exception", error });
           }
-          const result = await (
-            method as (...values: unknown[]) => unknown
-          ).apply(target, args);
+          const activeBefore = transaction;
+          let result: unknown;
+          try {
+            result = await (
+              method as (...values: unknown[]) => unknown
+            ).apply(target, args);
+          } catch (error) {
+            if (activeBefore && prop !== "beginTransaction") {
+              finishDbTransaction({
+                engine: ENGINE,
+                transaction: activeBefore,
+                outcome: "unknown",
+                requestId,
+                options,
+              });
+              transaction = undefined;
+            }
+            if (requestId) {
+              emitDbErrorEvent({
+                engine: ENGINE,
+                op: "other",
+                table: null,
+                statement: String(prop),
+                requestId,
+                error,
+                options,
+                context: { connection, transactionId: activeBefore?.id },
+              });
+            }
+            throw error;
+          }
           if (prop === "beginTransaction") {
             transaction = startDbTransaction({
               engine: ENGINE,
