@@ -2407,14 +2407,14 @@ export class Crumbtrail {
    * distinguish a failed claim from a refused one.
    */
   reportAssertion(options: ApplicationAssertionOptions): ApplicationAssertionResult {
-    if (this.applicationAssertions >= MAX_APPLICATION_ASSERTIONS_PER_SESSION) {
-      return { accepted: false, rejection: "session_cap_reached" };
-    }
     const result = buildApplicationAssertionEvent(
       { ...options, sessionId: this.sessionId },
       now(),
     );
     if (!result.accepted || result.event === undefined) return result;
+    if (this.applicationAssertions >= MAX_APPLICATION_ASSERTIONS_PER_SESSION) {
+      return { accepted: false, rejection: "session_cap_reached" };
+    }
     this.applicationAssertions += 1;
     this.bus.emit(result.event);
     return result;
