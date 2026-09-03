@@ -50,6 +50,7 @@ import {
 } from "./http-server";
 import { flushBackendEvents, sendBackendEvent } from "./backend-intake";
 import { clearProcessSessionId, setProcessSessionId } from "./process-session";
+import { clearApplicationAssertionSession } from "./assertion";
 import { readRequestCorrelation } from "./request-context";
 import {
   clearActiveBackendEventSink,
@@ -1524,6 +1525,7 @@ export async function autoCapture(
     stopped = true;
     const runtimeBindingRetirement = retireRuntimeBindingHandle(runtimeBinding);
     clearProcessSessionId(stableSessionId);
+    clearApplicationAssertionSession(stableSessionId);
     if (consoleRef.error === patchedError) {
       consoleRef.error = originalError as typeof consoleRef.error;
     }

@@ -279,6 +279,37 @@ to 5 MiB and 4096 pixels on either edge. The project administrator must enable
 report screenshots before the Cloud endpoint accepts the upload. The client
 also keeps this API disabled until the remote project policy enables it.
 
+### Reporting a bounded business assertion
+
+When application code knows an expected and actual bounded fact, report both
+through the assertion API. The SDK evaluates the fixed operator and emits an
+`app.assertion` event. It does not infer correctness from a response body or UI
+state.
+
+```ts
+const passed = crumbtrail.assert({
+  name: "cart_total",
+  operator: "equals",
+  expected: 100,
+  actual: cart.total,
+});
+```
+
+Names and values are strictly bounded. Values may be booleans, finite numbers,
+or short identifier and enum shaped strings. Objects, prose, emails, tokens,
+response bodies, and redaction markers are rejected. At most 100 valid
+assertions are emitted per session. Use `reportAssertion()` when the caller
+needs to distinguish a failed assertion from an invalid or capped input. Pass
+`requestId` and `traceId` when the application owns those correlation values.
+With the default `sessionPersistence: "session"`, the assertion count is kept
+with the session ID in `sessionStorage`, so a hard reload cannot reset the
+session cap. An assertion is counted only after the EventBus admits it, so
+consent, remote policy, sampling, flight recorder finalization, and lifecycle
+shutdown can refuse it with `capture_not_admitted` without spending the cap.
+Assertion event timestamps are non-negative safe integer Unix milliseconds within
+the ECMAScript `Date` range. The exported event builder rejects timestamps
+outside that definition.
+
 `createRequestHeaders()` is for a transport Crumbtrail does not patch, such as a
 WebSocket frame, a server action, or a queue message. It returns the session
 header, the request id header, and a `traceparent`, exactly what the automatic

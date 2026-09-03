@@ -116,6 +116,12 @@ import {
   prepareReportScreenshot,
   type CaptureScreenshotOptions,
 } from "./screenshot";
+import {
+  buildApplicationAssertionEvent,
+  MAX_APPLICATION_ASSERTIONS_PER_SESSION,
+  type ApplicationAssertionOptions,
+  type ApplicationAssertionResult,
+} from "./assertion";
 
 /** Cap on delivery-failure gap records per session. */
 const MAX_DELIVERY_GAP_EVENTS = 3;
@@ -425,15 +431,46 @@ function bodyPlaceholder(summary: PayloadSummary | undefined): string {
 function readPersistedSessionId(
   store: SessionStore,
   idleMs: number,
-): string | undefined {
-  const persisted = store.read();
-  if (!persisted) return undefined;
-  if (now() - persisted.lastActivity > idleMs) return undefined; // stale -> mint a fresh session
-  return persisted.id;
+): { id: string; applicationAssertionCount: number } | undefined {
+  try {
+    const persisted = store.read();
+    if (!persisted || typeof persisted !== "object") return undefined;
+    const id = persisted.id;
+    const lastActivity = persisted.lastActivity;
+    const applicationAssertionCount = persisted.applicationAssertionCount;
+    if (
+      typeof id !== "string" ||
+      id.length === 0 ||
+      typeof lastActivity !== "number" ||
+      !Number.isSafeInteger(lastActivity) ||
+      lastActivity < 0 ||
+      (applicationAssertionCount !== undefined &&
+        (typeof applicationAssertionCount !== "number" ||
+          !Number.isSafeInteger(applicationAssertionCount) ||
+          applicationAssertionCount < 0 ||
+          applicationAssertionCount > MAX_APPLICATION_ASSERTIONS_PER_SESSION))
+    )
+      return undefined;
+    if (now() - lastActivity > idleMs) return undefined; // stale -> mint a fresh session
+    return {
+      id,
+      applicationAssertionCount: applicationAssertionCount ?? 0,
+    };
+  } catch {
+    return undefined;
+  }
 }
 
-function writePersistedSession(store: SessionStore, id: string): void {
-  store.write({ id, lastActivity: now() });
+function writePersistedSession(
+  store: SessionStore,
+  id: string,
+  applicationAssertionCount = 0,
+): void {
+  try {
+    store.write({ id, lastActivity: now(), applicationAssertionCount });
+  } catch {
+    // Persistence is best effort. A custom store must not break capture.
+  }
 }
 
 /**
@@ -483,6 +520,8 @@ export class Crumbtrail {
   /** Storage-failure hooks follow trigger changes without restarting the storage collector. */
   private storageFailureSyncs = new Set<() => void>();
   private sessionId: string;
+  private applicationAssertions = 0;
+  private pendingApplicationAssertions = 0;
   private widgetCleanup?: () => void;
   /** Names uploaded by this live session and therefore eligible for association. */
   private visualArtifactNames = new Set<string>();
@@ -541,6 +580,7 @@ export class Crumbtrail {
   /** Refuses new explicit screenshot uploads once direct shutdown starts. */
   private screenshotClosing = false;
   private stopped = false;
+  private inert: boolean;
   private stopPromise?: Promise<{ sessionId: string }>;
   private identity: CrumbtrailIdentity = {};
   private applicationRelease: ApplicationReleaseIdentity;
@@ -578,8 +618,10 @@ export class Crumbtrail {
     applicationRelease: ApplicationReleaseIdentity,
     sessionStore?: SessionStore,
     runtimeBinding?: RuntimeBindingClient,
+    inert = false,
   ) {
     this.config = config;
+    this.inert = inert;
     this.localCaptureFloor = readLocalCaptureFloor(config);
     this.bus = bus;
     this.transport = transport;
@@ -643,6 +685,9 @@ export class Crumbtrail {
         new RingBuffer(config.ringBufferMs, config.ringBufferMaxEvents),
         config.sessionId ?? generateSessionId(),
         applicationRelease,
+        undefined,
+        undefined,
+        true,
       );
     }
 
@@ -662,14 +707,20 @@ export class Crumbtrail {
     // session exists. Once an early request is on the wire its session header cannot be changed,
     // so that id also has to win over an explicit `sessionId`; otherwise the browser finalizes
     // one session while the correlated backend and database events remain orphaned in another.
+    const persistedSession = sessionStore
+      ? readPersistedSessionId(sessionStore, config.sessionIdleMs)
+      : undefined;
     const sessionId =
       readEarlySessionId() ??
       config.sessionId ??
-      (sessionStore
-        ? readPersistedSessionId(sessionStore, config.sessionIdleMs)
-        : undefined) ??
+      persistedSession?.id ??
       generateSessionId();
-    if (sessionStore) writePersistedSession(sessionStore, sessionId);
+    const persistedAssertionCount =
+      persistedSession?.id === sessionId
+        ? persistedSession.applicationAssertionCount
+        : 0;
+    if (sessionStore)
+      writePersistedSession(sessionStore, sessionId, persistedAssertionCount);
 
     // Nowhere to send: same inert shape as the non-browser guard above, and for
     // the same reason. A capture SDK that throws inside a host app's module
@@ -689,6 +740,8 @@ export class Crumbtrail {
         sessionId,
         applicationRelease,
         sessionStore,
+        undefined,
+        true,
       );
     }
 
@@ -721,6 +774,7 @@ export class Crumbtrail {
       sessionStore,
       runtimeBinding,
     );
+    instance.applicationAssertions = persistedAssertionCount;
 
     // Send events to transport. Flight recorder sessions deliberately keep pre-trigger events
     // local; capture gap records remain visible so sampling never fails silently.
@@ -748,7 +802,11 @@ export class Crumbtrail {
     // its rolling idle window alive across reloads.
     if (useSessionStore && sessionStore) {
       bus.subscribe(() => {
-        writePersistedSession(sessionStore, instance.sessionId);
+        writePersistedSession(
+          sessionStore,
+          instance.sessionId,
+          instance.applicationAssertions,
+        );
       });
     }
 
@@ -1857,9 +1915,7 @@ export class Crumbtrail {
 
   private isScreenshotSessionActive(sessionId: string): boolean {
     return (
-      this.sessionStarted &&
-      this.sessionId === sessionId &&
-      this.canTransport()
+      this.sessionStarted && this.sessionId === sessionId && this.canTransport()
     );
   }
 
@@ -2082,9 +2138,7 @@ export class Crumbtrail {
     return completed;
   }
 
-  private abandonLifecycleSends(
-    pending = [...this.pendingSends],
-  ): void {
+  private abandonLifecycleSends(pending = [...this.pendingSends]): void {
     // Do not let a transport that never settles keep a later explicit stop() hostage. The page
     // is already closing and the server can finalize this still-open session by TTL.
     for (const send of pending) this.pendingSends.delete(send);
@@ -2121,6 +2175,7 @@ export class Crumbtrail {
     if (this.stopped || !this.lifecycleSuspended) return undefined;
 
     this.sessionId = generateSessionId();
+    this.applicationAssertions = 0;
     if (this.sessionStore)
       writePersistedSession(this.sessionStore, this.sessionId);
     this.visualArtifactNames.clear();
@@ -2164,6 +2219,7 @@ export class Crumbtrail {
 
   private canTransport(): boolean {
     return (
+      !this.inert &&
       !this.stopped &&
       !this.lifecycleClosing &&
       !this.lifecycleSuspended &&
@@ -2387,6 +2443,59 @@ export class Crumbtrail {
 
   mark(label: string): void {
     this.bus.emit({ t: now(), k: "mark", d: { label } });
+  }
+
+  /**
+   * Record a bounded application-owned correctness claim.
+   *
+   * The SDK never infers a claim from a response or a UI state. The host must
+   * provide both values, and invalid values are rejected before the event bus
+   * sees them. `assert()` is a convenience that returns the computed result;
+   * `reportAssertion()` exposes the admission result for callers that need to
+   * distinguish a failed claim from a refused one.
+   */
+  reportAssertion(
+    options: ApplicationAssertionOptions,
+  ): ApplicationAssertionResult {
+    const result = buildApplicationAssertionEvent(
+      options,
+      now(),
+      this.sessionId,
+    );
+    if (!result.accepted || result.event === undefined) return result;
+    if (!this.canCapture()) {
+      return { accepted: false, rejection: "capture_not_admitted" };
+    }
+    if (
+      this.applicationAssertions + this.pendingApplicationAssertions >=
+      MAX_APPLICATION_ASSERTIONS_PER_SESSION
+    ) {
+      return { accepted: false, rejection: "session_cap_reached" };
+    }
+    this.pendingApplicationAssertions += 1;
+    let admitted = false;
+    try {
+      admitted = this.bus.emit(result.event);
+    } catch {
+      admitted = false;
+    } finally {
+      this.pendingApplicationAssertions -= 1;
+    }
+    if (!admitted) {
+      return { accepted: false, rejection: "capture_not_admitted" };
+    }
+    this.applicationAssertions += 1;
+    if (this.sessionStore)
+      writePersistedSession(
+        this.sessionStore,
+        this.sessionId,
+        this.applicationAssertions,
+      );
+    return result;
+  }
+
+  assert(options: ApplicationAssertionOptions): boolean {
+    return this.reportAssertion(options).passed === true;
   }
 
   addEvent(partial: AddBugEventOptions): boolean {
@@ -2766,7 +2875,11 @@ export class Crumbtrail {
             .then(
               () => true,
               (error: unknown) => {
-                recordStopFailure(teardownFailures, "transport.endSession", error);
+                recordStopFailure(
+                  teardownFailures,
+                  "transport.endSession",
+                  error,
+                );
                 return true;
               },
             ),

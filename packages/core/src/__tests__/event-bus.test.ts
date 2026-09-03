@@ -26,6 +26,30 @@ describe("EventBus", () => {
     expect(received).toHaveLength(1);
   });
 
+  it("returns false without exposing denied events to taps or subscribers", () => {
+    const bus = new EventBus();
+    const tapped = vi.fn();
+    const received = vi.fn();
+    bus.tap(tapped);
+    bus.subscribe(received);
+    bus.setAdmissionPredicate(() => false);
+
+    expect(bus.emit(makeEvent())).toBe(false);
+    bus.flush();
+    expect(tapped).not.toHaveBeenCalled();
+    expect(received).not.toHaveBeenCalled();
+  });
+
+  it("contains a throwing admission predicate", () => {
+    const bus = new EventBus();
+    bus.setAdmissionPredicate(() => {
+      throw new Error("policy failure");
+    });
+
+    expect(() => bus.emit(makeEvent())).not.toThrow();
+    expect(bus.emit(makeEvent())).toBe(false);
+  });
+
   it("auto-flushes when buffer reaches flushBufferSize", () => {
     const bus = new EventBus();
     const received: BugEvent[] = [];
