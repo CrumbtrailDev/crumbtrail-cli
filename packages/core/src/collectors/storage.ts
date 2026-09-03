@@ -130,57 +130,6 @@ function assignRedactedStorageValue(
   return result.metadata;
 }
 
-/**
- * Patch a method on a Storage instance using Object.defineProperty.
- * Direct assignment (e.g. `localStorage.setItem = fn`) doesn't work in
- * environments that use a Proxy (like happy-dom), because the set trap
- * treats it as a storage key-value write. defineProperty bypasses the
- * Proxy set trap.
- */
-function patchStorageMethod(
-  storage: Storage,
-  method: string,
-  fn: Function,
-): void {
-  Object.defineProperty(storage, method, {
-    value: fn,
-    writable: true,
-    configurable: true,
-    enumerable: false,
-  });
-}
-
-function restoreOwnedStorageMethod(
-  storage: object,
-  method: string,
-  wrapper: Function,
-  originalDescriptor: PropertyDescriptor | undefined,
-  originalFunction: Function,
-): void {
-  if ((storage as Record<string, unknown>)[method] !== wrapper)
-    throw new Error(`storage wrapper for ${method} is no longer owned`);
-  if (originalDescriptor)
-    Object.defineProperty(storage, method, originalDescriptor);
-  else {
-    // happy-dom exposes Storage instances through a Proxy that rejects deleting
-    // these properties. Re-defining the original bound method is reversible and
-    // keeps the instance usable in that environment.
-    Object.defineProperty(storage, method, {
-      configurable: true,
-      enumerable: false,
-      value: originalFunction,
-      writable: true,
-    });
-  }
-
-  const restored = originalDescriptor
-    ? Object.getOwnPropertyDescriptor(storage, method)?.value ===
-      originalDescriptor.value
-    : (storage as Record<string, unknown>)[method] === originalFunction;
-  if (!restored)
-    throw new Error(`storage wrapper for ${method} was not restored`);
-}
-
 function boundedStorageErrorName(error: unknown): string {
   let name: unknown;
   try {
@@ -196,7 +145,10 @@ function boundedStorageErrorName(error: unknown): string {
   return trimmed || "Error";
 }
 
-function previousStorageValue(storage: Storage, key: string): string | null | undefined {
+function previousStorageValue(
+  storage: Storage,
+  key: string,
+): string | null | undefined {
   try {
     return storage.getItem(key);
   } catch {
@@ -226,7 +178,10 @@ interface PatchStack {
 
 const ownedPatches = new WeakMap<object, Map<string, PatchStack>>();
 
-function currentMethod(target: object, method: string): StorageMethod | undefined {
+function currentMethod(
+  target: object,
+  method: string,
+): StorageMethod | undefined {
   try {
     const value = (target as Record<string, unknown>)[method];
     return typeof value === "function" ? (value as StorageMethod) : undefined;
@@ -265,13 +220,27 @@ function restorePatchStack(
   if (stack.baseDescriptor) {
     Object.defineProperty(target, method, stack.baseDescriptor);
   } else {
-    delete (target as Record<string, unknown>)[method];
+    let shouldDefineOriginal: boolean;
+    try {
+      delete (target as Record<string, unknown>)[method];
+      shouldDefineOriginal =
+        currentMethod(target, method) !== stack.baseFunction;
+    } catch {
+      shouldDefineOriginal = true;
+    }
+    if (shouldDefineOriginal)
+      Object.defineProperty(target, method, {
+        configurable: true,
+        enumerable: false,
+        value: stack.baseFunction,
+        writable: true,
+      });
   }
 
   const restored = stack.baseDescriptor
     ? Object.getOwnPropertyDescriptor(target, method)?.value ===
       stack.baseDescriptor.value
-    : Object.getOwnPropertyDescriptor(target, method) === undefined;
+    : currentMethod(target, method) === stack.baseFunction;
   if (!restored)
     throw new Error(`storage wrapper for ${method} was not restored`);
 }
@@ -524,10 +493,14 @@ function installIndexedDbFailureCapture(
   const listenerRestores: IdempotentListenerCleanup[] = [];
   const requests = new WeakMap<
     object,
-    { operation: string; reported: boolean }
+    { operation: string; reported: boolean; transaction?: object }
   >();
-  const transactions = new WeakMap<object, { reported: boolean }>();
+  const transactions = new WeakMap<
+    object,
+    { reported: boolean; requestFailureReported: boolean }
+  >();
   const patchedPrototypeMethods = new Map<string, Set<string>>();
+  const attachedDatabases = new WeakSet<object>();
 
   const report = (operation: string, error: unknown) =>
     reportAsyncStorageFailure(bus, config, "idb", operation, error, lifecycle);
@@ -556,10 +529,19 @@ function installIndexedDbFailureCapture(
   const attachTransaction = (transaction: unknown): void => {
     if (!lifecycle.active || !isObjectLike(transaction)) return;
     if (transactions.has(transaction)) return;
-    const state = { reported: false };
+    const state = { reported: false, requestFailureReported: false };
     transactions.set(transaction, state);
-    const transactionError = () => {
-      if (state.reported) return;
+    const transactionError = (event: Event) => {
+      if (state.reported || state.requestFailureReported) return;
+      const target = event.target;
+      if (isObjectLike(target) && target !== transaction) {
+        const requestState = requests.get(target);
+        if (requestState?.reported) {
+          state.requestFailureReported = true;
+          state.reported = true;
+          return;
+        }
+      }
       state.reported = true;
       report(
         "database.transaction.error",
@@ -567,7 +549,7 @@ function installIndexedDbFailureCapture(
       );
     };
     const transactionAbort = () => {
-      if (state.reported) return;
+      if (state.reported || state.requestFailureReported) return;
       const error = readObjectProperty(transaction, "error");
       // A clean, deliberate abort has no error. An AbortError is ignored by
       // report() for the same reason as request AbortError failures.
@@ -583,6 +565,7 @@ function installIndexedDbFailureCapture(
     request: unknown,
     operation: string,
     onSuccess?: (result: unknown) => void,
+    onUpgrade?: (result: unknown) => void,
   ): void => {
     if (!lifecycle.active || !isObjectLike(request)) return;
     const existing = requests.get(request);
@@ -590,19 +573,37 @@ function installIndexedDbFailureCapture(
       existing.operation = operation;
       return;
     }
-    const state = { operation, reported: false };
+    const state: {
+      operation: string;
+      reported: boolean;
+      transaction?: object;
+    } = { operation, reported: false };
+    const transaction = readObjectProperty(request, "transaction");
+    if (isObjectLike(transaction)) state.transaction = transaction;
     requests.set(request, state);
     const requestError = () => {
       if (state.reported) return;
       state.reported = true;
+      if (state.transaction) {
+        const transactionState = transactions.get(state.transaction);
+        if (transactionState) {
+          transactionState.requestFailureReported = true;
+          transactionState.reported = true;
+        }
+      }
       report(state.operation, readObjectProperty(request, "error"));
     };
     const requestSuccess = () => {
       if (!lifecycle.active || !onSuccess) return;
       onSuccess(readObjectProperty(request, "result"));
     };
+    const requestUpgrade = () => {
+      if (!lifecycle.active || !onUpgrade) return;
+      onUpgrade(readObjectProperty(request, "result"));
+    };
     listen(request, "error", requestError);
     listen(request, "success", requestSuccess);
+    listen(request, "upgradeneeded", requestUpgrade);
   };
 
   const attachCursorRequest = (cursor: unknown, operation: string): void => {
@@ -684,6 +685,7 @@ function installIndexedDbFailureCapture(
       "objectStore.clear",
       (result) => attachRequest(result, "objectStore.clear"),
     ],
+    ["createIndex", "objectStore.createIndex", (result) => attachIndex(result)],
     [
       "count",
       "objectStore.count",
@@ -694,6 +696,7 @@ function installIndexedDbFailureCapture(
       "objectStore.delete",
       (result) => attachRequest(result, "objectStore.delete"),
     ],
+    ["deleteIndex", "objectStore.deleteIndex"],
     [
       "get",
       "objectStore.get",
@@ -828,9 +831,14 @@ function installIndexedDbFailureCapture(
       "open",
       "open",
       (result) =>
-        attachRequest(result, "open", (database) => {
-          attachDatabase(database);
-        }),
+        attachRequest(
+          result,
+          "open",
+          (database) => {
+            attachDatabase(database);
+          },
+          attachDatabase,
+        ),
     ],
     [
       "deleteDatabase",
@@ -838,11 +846,15 @@ function installIndexedDbFailureCapture(
       (result) => attachRequest(result, "deleteDatabase"),
     ],
     ["databases", "databases"],
+    ["cmp", "cmp"],
   ]);
 
   function attachDatabase(database: unknown): void {
     if (!lifecycle.active || !isObjectLike(database)) return;
+    if (attachedDatabases.has(database)) return;
+    attachedDatabases.add(database);
     patchMethods(database, "database", databaseMethods, true);
+    listen(database, "versionchange", () => attachDatabase(database));
   }
 
   return () => {
@@ -863,7 +875,10 @@ function installIndexedDbFailureCapture(
       }
     }
     if (failures.length > 0)
-      throw new Error("IndexedDB instrumentation could not be fully restored");
+      throw new AggregateError(
+        failures,
+        "IndexedDB instrumentation could not be fully restored",
+      );
   };
 }
 
@@ -963,7 +978,10 @@ function installCacheFailureCapture(
       }
     }
     if (failures.length > 0)
-      throw new Error("Cache instrumentation could not be fully restored");
+      throw new AggregateError(
+        failures,
+        "Cache instrumentation could not be fully restored",
+      );
   };
 }
 
@@ -1059,56 +1077,6 @@ export function storageCollector(
 
   bus.emit({ t: now(), k: "snap", d: snapData });
 
-  // --- Save originals ---
-  const origProtoSetItem = Storage.prototype.setItem;
-  const origProtoRemoveItem = Storage.prototype.removeItem;
-  const origProtoClear = Storage.prototype.clear;
-  const origProtoSetItemDescriptor = Object.getOwnPropertyDescriptor(
-    Storage.prototype,
-    "setItem",
-  );
-  const origProtoRemoveItemDescriptor = Object.getOwnPropertyDescriptor(
-    Storage.prototype,
-    "removeItem",
-  );
-  const origProtoClearDescriptor = Object.getOwnPropertyDescriptor(
-    Storage.prototype,
-    "clear",
-  );
-
-  // Bind originals from instances (before any patching) so we can call through
-  const origLocalSetItem = localStorage.setItem.bind(localStorage);
-  const origLocalRemoveItem = localStorage.removeItem.bind(localStorage);
-  const origLocalClear = localStorage.clear.bind(localStorage);
-
-  const origSessionSetItem = sessionStorage.setItem.bind(sessionStorage);
-  const origSessionRemoveItem = sessionStorage.removeItem.bind(sessionStorage);
-  const origSessionClear = sessionStorage.clear.bind(sessionStorage);
-  const origLocalSetItemDescriptor = Object.getOwnPropertyDescriptor(
-    localStorage,
-    "setItem",
-  );
-  const origLocalRemoveItemDescriptor = Object.getOwnPropertyDescriptor(
-    localStorage,
-    "removeItem",
-  );
-  const origLocalClearDescriptor = Object.getOwnPropertyDescriptor(
-    localStorage,
-    "clear",
-  );
-  const origSessionSetItemDescriptor = Object.getOwnPropertyDescriptor(
-    sessionStorage,
-    "setItem",
-  );
-  const origSessionRemoveItemDescriptor = Object.getOwnPropertyDescriptor(
-    sessionStorage,
-    "removeItem",
-  );
-  const origSessionClearDescriptor = Object.getOwnPropertyDescriptor(
-    sessionStorage,
-    "clear",
-  );
-
   // --- Patched method factories ---
   function recordSet(
     type: "local" | "session",
@@ -1162,14 +1130,16 @@ export function storageCollector(
   function makeSetItem(
     type: "local" | "session",
     storage: Storage,
-    origFn: (key: string, value: string) => void,
+    origFn: StorageMethod,
   ) {
-    return function patchedSetItem(key: string, value: string) {
+    return function patchedSetItem(this: unknown, ...args: unknown[]) {
+      const key = args[0] as string;
+      const value = args[1] as string;
       const oldValue = excludeKeys.has(key)
         ? undefined
         : previousStorageValue(storage, key);
       try {
-        const result = origFn(key, value);
+        const result = origFn.call(this ?? storage, key, value);
         try {
           recordSet(type, key, value, oldValue, "success");
         } catch {
@@ -1231,14 +1201,15 @@ export function storageCollector(
   function makeRemoveItem(
     type: "local" | "session",
     storage: Storage,
-    origFn: (key: string) => void,
+    origFn: StorageMethod,
   ) {
-    return function patchedRemoveItem(key: string) {
+    return function patchedRemoveItem(this: unknown, ...args: unknown[]) {
+      const key = args[0] as string;
       const oldValue = excludeKeys.has(key)
         ? undefined
         : previousStorageValue(storage, key);
       try {
-        const result = origFn(key);
+        const result = origFn.call(this ?? storage, key);
         try {
           recordRemove(type, key, oldValue, "success");
         } catch {
@@ -1275,10 +1246,10 @@ export function storageCollector(
     });
   }
 
-  function makeClear(type: "local" | "session", origFn: () => void) {
-    return function patchedClear() {
+  function makeClear(type: "local" | "session", origFn: StorageMethod) {
+    return function patchedClear(this: unknown, ..._args: unknown[]) {
       try {
-        const result = origFn();
+        const result = origFn.call(this);
         try {
           recordClear(type, "success");
         } catch {
@@ -1318,133 +1289,132 @@ export function storageCollector(
     return { type: "local", storage: localStorage };
   }
 
-  // Patch the prototype, for a call that reaches the method through it rather
-  // than through one of the two instances patched below.
-  //
-  // These wrappers are deliberately not arrow functions and they call the
-  // original with `.call(this, …)`. The original taken off `Storage.prototype`
-  // is unbound, and a real browser throws `TypeError: Illegal invocation` when
-  // it is invoked with no receiver — from inside the host page's own write, so
-  // the SDK would break the application it is there to observe. happy-dom does
-  // not, which is why the suite never saw it.
-  const patchedProtoSetItem = function patchedProtoSetItem(
-    this: Storage,
-    key: string,
-    value: string,
-  ) {
-    const { type, storage } = storageOf(this);
-    const oldValue = excludeKeys.has(key)
-      ? undefined
-      : previousStorageValue(storage, key);
-    try {
-      const result = origProtoSetItem.call(this ?? storage, key, value);
-      try {
-        recordSet(type, key, value, oldValue, "success");
-      } catch {
-        // Instrumentation must never change a successful host mutation.
-      }
-      return result;
-    } catch (error) {
-      try {
-        recordSet(
-          type,
-          key,
-          value,
-          oldValue,
-          "failure",
-          boundedStorageErrorName(error),
-        );
-      } catch {
-        // Preserve the original storage exception if redaction cannot run.
-      }
-      throw error;
-    }
-  };
-  Storage.prototype.setItem = patchedProtoSetItem;
-  const patchedProtoRemoveItem = function patchedProtoRemoveItem(
-    this: Storage,
-    key: string,
-  ) {
-    const { type, storage } = storageOf(this);
-    const oldValue = excludeKeys.has(key)
-      ? undefined
-      : previousStorageValue(storage, key);
-    try {
-      const result = origProtoRemoveItem.call(this ?? storage, key);
-      try {
-        recordRemove(type, key, oldValue, "success");
-      } catch {
-        // Instrumentation must never change a successful host mutation.
-      }
-      return result;
-    } catch (error) {
-      try {
-        recordRemove(
-          type,
-          key,
-          oldValue,
-          "failure",
-          boundedStorageErrorName(error),
-        );
-      } catch {
-        // Preserve the original storage exception if redaction cannot run.
-      }
-      throw error;
-    }
-  };
-  Storage.prototype.removeItem = patchedProtoRemoveItem;
-  const patchedProtoClear = function patchedProtoClear(this: Storage) {
-    const { type, storage } = storageOf(this);
-    try {
-      const result = origProtoClear.call(this ?? storage);
-      try {
-        recordClear(type, "success");
-      } catch {
-        // Instrumentation must never change a successful host mutation.
-      }
-      return result;
-    } catch (error) {
-      try {
-        recordClear(type, "failure", boundedStorageErrorName(error));
-      } catch {
-        // Preserve the original storage exception if redaction cannot run.
-      }
-      throw error;
-    }
-  };
-  Storage.prototype.clear = patchedProtoClear;
+  const storageOwner = Symbol("crumbtrail-storage");
+  const storagePatchCleanups: CollectorCleanup[] = [];
 
-  // Patch instances via Object.defineProperty (works in Proxy-based environments
-  // like happy-dom where direct assignment and prototype patching are bypassed)
-  const patchedLocalSetItem = makeSetItem(
-    "local",
-    localStorage,
-    origLocalSetItem,
+  storagePatchCleanups.push(
+    patchOwnedMethod(localStorage, "setItem", storageOwner, (original) =>
+      makeSetItem("local", localStorage, original),
+    ),
+    patchOwnedMethod(localStorage, "removeItem", storageOwner, (original) =>
+      makeRemoveItem("local", localStorage, original),
+    ),
+    patchOwnedMethod(localStorage, "clear", storageOwner, (original) =>
+      makeClear("local", original),
+    ),
+    patchOwnedMethod(sessionStorage, "setItem", storageOwner, (original) =>
+      makeSetItem("session", sessionStorage, original),
+    ),
+    patchOwnedMethod(sessionStorage, "removeItem", storageOwner, (original) =>
+      makeRemoveItem("session", sessionStorage, original),
+    ),
+    patchOwnedMethod(sessionStorage, "clear", storageOwner, (original) =>
+      makeClear("session", original),
+    ),
   );
-  const patchedLocalRemoveItem = makeRemoveItem(
-    "local",
-    localStorage,
-    origLocalRemoveItem,
-  );
-  const patchedLocalClear = makeClear("local", origLocalClear);
-  patchStorageMethod(localStorage, "setItem", patchedLocalSetItem);
-  patchStorageMethod(localStorage, "removeItem", patchedLocalRemoveItem);
-  patchStorageMethod(localStorage, "clear", patchedLocalClear);
 
-  const patchedSessionSetItem = makeSetItem(
-    "session",
-    sessionStorage,
-    origSessionSetItem,
+  // These wrappers are deliberately not arrow functions. They call the
+  // original with the receiver, which preserves native Storage invocation
+  // rules in browsers.
+  storagePatchCleanups.push(
+    patchOwnedMethod(
+      Storage.prototype,
+      "setItem",
+      storageOwner,
+      (original) =>
+        function patchedProtoSetItem(this: unknown, ...args: unknown[]) {
+          const key = args[0] as string;
+          const value = args[1] as string;
+          const { type, storage } = storageOf(this);
+          const oldValue = excludeKeys.has(key)
+            ? undefined
+            : previousStorageValue(storage, key);
+          try {
+            const result = original.call(this ?? storage, key, value);
+            try {
+              recordSet(type, key, value, oldValue, "success");
+            } catch {
+              // Instrumentation must never change a successful host mutation.
+            }
+            return result;
+          } catch (error) {
+            try {
+              recordSet(
+                type,
+                key,
+                value,
+                oldValue,
+                "failure",
+                boundedStorageErrorName(error),
+              );
+            } catch {
+              // Preserve the original storage exception if redaction cannot run.
+            }
+            throw error;
+          }
+        },
+    ),
+    patchOwnedMethod(
+      Storage.prototype,
+      "removeItem",
+      storageOwner,
+      (original) =>
+        function patchedProtoRemoveItem(this: unknown, ...args: unknown[]) {
+          const key = args[0] as string;
+          const { type, storage } = storageOf(this);
+          const oldValue = excludeKeys.has(key)
+            ? undefined
+            : previousStorageValue(storage, key);
+          try {
+            const result = original.call(this ?? storage, key);
+            try {
+              recordRemove(type, key, oldValue, "success");
+            } catch {
+              // Instrumentation must never change a successful host mutation.
+            }
+            return result;
+          } catch (error) {
+            try {
+              recordRemove(
+                type,
+                key,
+                oldValue,
+                "failure",
+                boundedStorageErrorName(error),
+              );
+            } catch {
+              // Preserve the original storage exception if redaction cannot run.
+            }
+            throw error;
+          }
+        },
+    ),
+    patchOwnedMethod(
+      Storage.prototype,
+      "clear",
+      storageOwner,
+      (original) =>
+        function patchedProtoClear(this: unknown, ..._args: unknown[]) {
+          const { type } = storageOf(this);
+          try {
+            const result = original.call(this);
+            try {
+              recordClear(type, "success");
+            } catch {
+              // Instrumentation must never change a successful host mutation.
+            }
+            return result;
+          } catch (error) {
+            try {
+              recordClear(type, "failure", boundedStorageErrorName(error));
+            } catch {
+              // Preserve the original storage exception if redaction cannot run.
+            }
+            throw error;
+          }
+        },
+    ),
   );
-  const patchedSessionRemoveItem = makeRemoveItem(
-    "session",
-    sessionStorage,
-    origSessionRemoveItem,
-  );
-  const patchedSessionClear = makeClear("session", origSessionClear);
-  patchStorageMethod(sessionStorage, "setItem", patchedSessionSetItem);
-  patchStorageMethod(sessionStorage, "removeItem", patchedSessionRemoveItem);
-  patchStorageMethod(sessionStorage, "clear", patchedSessionClear);
 
   let storageFailureHooksActive = false;
   let storageFailureHooksPoisoned = false;
@@ -1472,7 +1442,8 @@ export function storageCollector(
           }
         }
         if (failures.length > 0)
-          throw new Error(
+          throw new AggregateError(
+            failures,
             "storage failure instrumentation could not be fully restored",
           );
       };
@@ -1579,12 +1550,11 @@ export function storageCollector(
   // has since frozen one of them throws on assignment. Sequentially, that first throw skipped
   // every restore after it, leaving the rest of the collector patched in with no teardown left
   // to remove it.
-  const step = (restore: () => void): boolean => {
+  const step = (restore: () => void, failures: unknown[]): void => {
     try {
       restore();
-      return true;
-    } catch {
-      return false;
+    } catch (error) {
+      failures.push(error);
     }
   };
   let cleanupComplete = false;
@@ -1592,101 +1562,23 @@ export function storageCollector(
   return () => {
     if (cleanupComplete) return;
     collectorLifecycle.active = false;
-    unregisterStorageFailureSync?.();
-    const results = [
-      step(() => {
-        restoreOwnedStorageMethod(
-          Storage.prototype,
-          "setItem",
-          patchedProtoSetItem,
-          origProtoSetItemDescriptor,
-          origProtoSetItem,
-        );
-      }),
-      step(() => {
-        restoreOwnedStorageMethod(
-          Storage.prototype,
-          "removeItem",
-          patchedProtoRemoveItem,
-          origProtoRemoveItemDescriptor,
-          origProtoRemoveItem,
-        );
-      }),
-      step(() => {
-        restoreOwnedStorageMethod(
-          Storage.prototype,
-          "clear",
-          patchedProtoClear,
-          origProtoClearDescriptor,
-          origProtoClear,
-        );
-      }),
-      // Restore instance methods to their original bound functions
-      step(() =>
-        restoreOwnedStorageMethod(
-          localStorage,
-          "setItem",
-          patchedLocalSetItem,
-          origLocalSetItemDescriptor,
-          origLocalSetItem,
-        ),
-      ),
-      step(() =>
-        restoreOwnedStorageMethod(
-          localStorage,
-          "removeItem",
-          patchedLocalRemoveItem,
-          origLocalRemoveItemDescriptor,
-          origLocalRemoveItem,
-        ),
-      ),
-      step(() =>
-        restoreOwnedStorageMethod(
-          localStorage,
-          "clear",
-          patchedLocalClear,
-          origLocalClearDescriptor,
-          origLocalClear,
-        ),
-      ),
-      step(() =>
-        restoreOwnedStorageMethod(
-          sessionStorage,
-          "setItem",
-          patchedSessionSetItem,
-          origSessionSetItemDescriptor,
-          origSessionSetItem,
-        ),
-      ),
-      step(() =>
-        restoreOwnedStorageMethod(
-          sessionStorage,
-          "removeItem",
-          patchedSessionRemoveItem,
-          origSessionRemoveItemDescriptor,
-          origSessionRemoveItem,
-        ),
-      ),
-      step(() =>
-        restoreOwnedStorageMethod(
-          sessionStorage,
-          "clear",
-          patchedSessionClear,
-          origSessionClearDescriptor,
-          origSessionClear,
-        ),
-      ),
-      step(() => window.removeEventListener("storage", storageHandler)),
-      step(storageFailureCleanup),
-      step(() => {
-        if (storageFailureCleanupError) throw storageFailureCleanupError;
-      }),
-    ];
+    const failures: unknown[] = [];
+    step(() => unregisterStorageFailureSync?.(), failures);
+    for (const restore of [...storagePatchCleanups].reverse())
+      step(restore, failures);
+    step(() => window.removeEventListener("storage", storageHandler), failures);
+    step(storageFailureCleanup, failures);
+    step(() => {
+      if (storageFailureCleanupError) throw storageFailureCleanupError;
+    }, failures);
 
     // Reported, not swallowed: the caller's teardown handler is what stops a half-restored
     // collector from being installed over a second time.
-    if (results.some((ok) => !ok))
-      throw new Error("storage collector could not fully restore its patches");
+    if (failures.length > 0)
+      throw new AggregateError(
+        failures,
+        "storage collector could not fully restore its patches",
+      );
     cleanupComplete = true;
   };
 }
