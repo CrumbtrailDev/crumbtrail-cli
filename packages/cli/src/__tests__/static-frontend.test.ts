@@ -138,6 +138,45 @@ describe("insertIntoHtmlHead", () => {
     expect(out).toContain('/commented.js"></script> -->');
   });
 
+  it.each(["template", "noscript", "style", "textarea"])(
+    "does not inject into an inert %s element",
+    (tag) => {
+      const html = PAGE.replace(
+        "    <title>Landing</title>",
+        [
+          "    <title>Landing</title>",
+          `    <${tag}><script src="/inert.js"></script></${tag}>`,
+          '    <script src="/app.js"></script>',
+        ].join("\n"),
+      );
+      const out = insertIntoHtmlHead(html, "<script>early</script>")!;
+      expect(out.indexOf("<script>early</script>")).toBeGreaterThan(
+        out.indexOf(`</${tag}>`),
+      );
+      expect(out.indexOf("<script>early</script>")).toBeLessThan(
+        out.indexOf('<script src="/app.js"></script>'),
+      );
+    },
+  );
+
+  it("skips nested template contents", () => {
+    const html = PAGE.replace(
+      "    <title>Landing</title>",
+      [
+        "    <title>Landing</title>",
+        '    <template><template><script src="/nested.js"></script></template></template>',
+        '    <script src="/app.js"></script>',
+      ].join("\n"),
+    );
+    const out = insertIntoHtmlHead(html, "<script>early</script>")!;
+    expect(out.indexOf("<script>early</script>")).toBeGreaterThan(
+      out.indexOf("</template></template>"),
+    );
+    expect(out.indexOf("<script>early</script>")).toBeLessThan(
+      out.indexOf('<script src="/app.js"></script>'),
+    );
+  });
+
   it("moves ahead of an executable script that appears before head", () => {
     const html =
       '<html><script src="/before-head.js"></script><head></head><body></body></html>';
@@ -281,6 +320,26 @@ describe("buildPlan — static", () => {
     // import.meta.env; the tag above is the whole instruction.
     expect(plan.agentPrompt).toBeUndefined();
     expect(plan.warnings.join(" ")).toMatch(/Paste the script tag/);
+    expect(plan.snippet).toContain("crumbtrail-core@0.49.0");
+  });
+
+  it("raises an older static SDK version to the bootstrap capability floor", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        sdkVersion: "0.48.0",
+      },
+      fakeInjectIO({ [p("index.html")]: PAGE }),
+    );
+    expect(plan.content).toContain(
+      "https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js",
+    );
+    expect(plan.content).toContain(
+      "https://esm.sh/crumbtrail-core@0.49.0",
+    );
   });
 
   it("re-run: says the one remaining step instead of the snippet again", () => {

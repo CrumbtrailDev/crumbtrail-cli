@@ -665,14 +665,35 @@ export function browserModuleUrl(version?: string | null): string {
   return `https://esm.sh/crumbtrail-core@${pinned}`;
 }
 
+// The classic bootstrap first ships with the coordinated 0.49.0 SDK release.
+// Static pages must pin both tags to a release that contains that artifact,
+// even when an older general SDK floor or caller version is supplied.
+const BROWSER_EARLY_BOOTSTRAP_FLOOR = "0.49.0";
+
+function browserEarlyBootstrapVersion(version?: string | null): string {
+  const trimmed = version?.trim();
+  if (!trimmed || !/^\d+\.\d+\.\d+$/.test(trimmed)) {
+    return BROWSER_EARLY_BOOTSTRAP_FLOOR;
+  }
+  const actual = trimmed.split(".").map(Number);
+  const floor = BROWSER_EARLY_BOOTSTRAP_FLOOR.split(".").map(Number);
+  for (let index = 0; index < floor.length; index += 1) {
+    if (actual[index] !== floor[index]) {
+      return actual[index] > floor[index]
+        ? trimmed
+        : BROWSER_EARLY_BOOTSTRAP_FLOOR;
+    }
+  }
+  return trimmed;
+}
+
 /**
  * The published classic bootstrap that must run before every application
  * script. It is a package file rather than generated page code, so it has no
  * customer configuration, secrets, or module/network work of its own.
  */
 export function browserEarlyBootstrapUrl(version?: string | null): string {
-  const moduleUrl = browserModuleUrl(version);
-  const pinned = moduleUrl.slice(moduleUrl.lastIndexOf("@") + 1);
+  const pinned = browserEarlyBootstrapVersion(version);
   return `https://unpkg.com/crumbtrail-core@${pinned}/dist/early-bootstrap.global.js`;
 }
 
@@ -700,6 +721,7 @@ export function staticScriptTagSnippet(options: {
   sdkVersion?: string | null;
   mintUrl?: string | null;
 }): string {
+  const sdkVersion = browserEarlyBootstrapVersion(options.sdkVersion);
   const { endpoint, keyLiteral, serviceName, backendOrigins } = options;
   const mint = options.mintUrl
     ? ` Get one at ${options.mintUrl}.`
@@ -708,9 +730,9 @@ export function staticScriptTagSnippet(options: {
     "<!-- Crumbtrail — browser capture (console, network, DOM, errors). -->",
     `<!-- httpAuthToken must contain this project's ingest key.${mint} -->`,
     '<!-- The classic bootstrap is parser-blocking and pinned to this SDK release. CSP: allow https://unpkg.com for this tag and https://esm.sh for its module import in script-src (or the corresponding script-src-elem policy), approve this inline module with a nonce or hash, and allow the ingest endpoint in connect-src. SRI: integrity and crossorigin="anonymous" can protect this external bootstrap tag only when the hash matches its exact response. SRI does not protect the inline module or its esm.sh import. Offline: self-host the published dist files, including relative ESM chunks, replace both URLs, and use an approved external or nonce/hash-approved module. -->',
-    `<script src=${JSON.stringify(browserEarlyBootstrapUrl(options.sdkVersion))}></script>`,
+    `<script src=${JSON.stringify(browserEarlyBootstrapUrl(sdkVersion))}></script>`,
     '<script type="module">',
-    `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(options.sdkVersion))};`,
+    `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(sdkVersion))};`,
     "",
     "  Crumbtrail.init({",
     "    ...PRESET_PASSIVE,",

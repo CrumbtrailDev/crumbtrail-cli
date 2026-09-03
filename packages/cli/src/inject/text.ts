@@ -1100,6 +1100,30 @@ function tagEnd(html: string, start: number): number | null {
   return null;
 }
 
+const INERT_HTML_ELEMENT = /^<(template|noscript|style|textarea)\b/i;
+
+function afterInertElement(
+  html: string,
+  start: number,
+  tagName: string,
+): number | null {
+  const openEnd = tagEnd(html, start + tagName.length + 1);
+  if (openEnd === null) return null;
+  const tag = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const boundary = new RegExp(`<\\/?${tag}\\b`, "gi");
+  boundary.lastIndex = openEnd + 1;
+  let depth = 1;
+  for (let match = boundary.exec(html); match; match = boundary.exec(html)) {
+    const end = tagEnd(html, match.index + match[0].length);
+    if (end === null) return null;
+    if (/^<\//.test(match[0])) depth -= 1;
+    else depth += 1;
+    if (depth === 0) return end + 1;
+    boundary.lastIndex = end + 1;
+  }
+  return null;
+}
+
 /** Finds a real executable script tag without entering comments or data blocks. */
 function firstExecutableScript(html: string): number | null {
   let offset = 0;
@@ -1110,6 +1134,14 @@ function firstExecutableScript(html: string): number | null {
     if (html.startsWith("<!--", start)) {
       const commentEnd = html.indexOf("-->", start + 4);
       offset = commentEnd < 0 ? html.length : commentEnd + 3;
+      continue;
+    }
+
+    const inert = INERT_HTML_ELEMENT.exec(html.slice(start));
+    if (inert) {
+      const after = afterInertElement(html, start, inert[1]);
+      if (after === null) return null;
+      offset = after;
       continue;
     }
 
