@@ -79,8 +79,8 @@ export type BullMqProcessorHandler<
 export type BullMqProcessor<TJob extends BullMqJobLike = BullMqJobLike, TResult = unknown> =
   (job: TJob) => Promise<TResult>;
 
-const WRAPPED_PRODUCERS = new WeakSet<object>();
-const WRAPPED_PROCESSORS = new WeakSet<object>();
+const PRODUCER_WRAPPERS = new WeakMap<object, BullMqQueueLike>();
+const PROCESSOR_WRAPPERS = new WeakMap<object, object>();
 
 /**
  * Add a validated token to a BullMQ data object without mutating the caller's
@@ -191,7 +191,8 @@ export function withCrumbtrailBullMqProducer<TQueue extends BullMqQueueLike>(
       "withCrumbtrailBullMqProducer requires Queue.add; install BullMQ in the host application",
     );
 
-  if (WRAPPED_PRODUCERS.has(queue)) return queue;
+  const existing = PRODUCER_WRAPPERS.get(queue);
+  if (existing) return existing as TQueue;
 
   const wrapped = new Proxy(queue, {
     get(target, property) {
@@ -261,7 +262,8 @@ export function withCrumbtrailBullMqProducer<TQueue extends BullMqQueueLike>(
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
-  WRAPPED_PRODUCERS.add(wrapped);
+  PRODUCER_WRAPPERS.set(queue, wrapped);
+  PRODUCER_WRAPPERS.set(wrapped, wrapped);
   return wrapped as TQueue;
 }
 
@@ -284,8 +286,8 @@ export function withCrumbtrailBullMqProcessor<
     throw new TypeError(
       "withCrumbtrailBullMqProcessor requires a BullMQ processor function",
     );
-  if (WRAPPED_PROCESSORS.has(handler))
-    return handler as BullMqProcessor<TJob, TResult>;
+  const existing = PROCESSOR_WRAPPERS.get(handler);
+  if (existing) return existing as BullMqProcessor<TJob, TResult>;
 
   const wrapped = async (job: TJob): Promise<TResult> => {
     if (!job || typeof job !== "object")
@@ -326,7 +328,8 @@ export function withCrumbtrailBullMqProcessor<
       (context) => handler(safeJob, context),
     );
   };
-  WRAPPED_PROCESSORS.add(wrapped);
+  PROCESSOR_WRAPPERS.set(handler, wrapped);
+  PROCESSOR_WRAPPERS.set(wrapped, wrapped);
   return wrapped;
 }
 

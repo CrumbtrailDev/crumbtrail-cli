@@ -495,21 +495,17 @@ export function withCrumbtrailAwsSqsBatchProcessor<
 ): (event: AwsSqsEvent<TRecord>) => Promise<AwsSqsBatchResponse> {
   const processRecord = withCrumbtrailAwsSqsProcessor(handler, options);
   return async (event) => {
-    const failures: Array<{ itemIdentifier: string }> = [];
-    for (let index = 0; index < event.Records.length; index += 1) {
-      const record = event.Records[index];
-      try {
-        await processRecord(record);
-      } catch {
-        for (let remaining = index; remaining < event.Records.length; remaining += 1) {
-          const itemIdentifier = safeText(
-            safeGet(event.Records[remaining], "messageId"),
-          );
-          if (itemIdentifier) failures.push({ itemIdentifier });
-        }
-        break;
-      }
-    }
+    const records = safeGet(event, "Records");
+    if (!Array.isArray(records)) return { batchItemFailures: [] };
+    const results = await Promise.allSettled(
+      records.map((record) => processRecord(record as TRecord)),
+    );
+    const failures = records.flatMap((record, index) => {
+      const itemIdentifier = safeText(safeGet(record, "messageId"));
+      return results[index]?.status === "rejected" && itemIdentifier
+        ? [{ itemIdentifier }]
+        : [];
+    });
     return {
       batchItemFailures: failures,
     } as AwsSqsBatchResponse;
@@ -610,7 +606,10 @@ export function withCrumbtrailAwsSchedulerProcessor<TResult = unknown>(
 }
 
 type AwsWrapperKind = "sqs" | "sns" | "eventbridge" | "scheduler";
-const CLIENT_WRAPPER_KINDS = new WeakMap<object, Set<AwsWrapperKind>>();
+const CLIENT_WRAPPERS = new WeakMap<
+  object,
+  Map<AwsWrapperKind, AwsClientLike>
+>();
 
 function wrapAwsClient<TClient extends AwsClientLike>(
   client: TClient,
@@ -620,7 +619,8 @@ function wrapAwsClient<TClient extends AwsClientLike>(
 ): TClient {
   if (!client || typeof client !== "object")
     throw new TypeError(`withCrumbtrailAws${kind}Producer requires an AWS client`);
-  if (CLIENT_WRAPPER_KINDS.get(client)?.has(kind)) return client;
+  const existing = CLIENT_WRAPPERS.get(client)?.get(kind);
+  if (existing) return existing as TClient;
   const hasSend = typeof safeGet(client, "send") === "function";
   const hasDirect = directMethods.some(
     (method) => typeof safeGet(client, method) === "function",
@@ -671,7 +671,7 @@ function wrapAwsClient<TClient extends AwsClientLike>(
       return value.bind(target);
     },
   });
-  markClientWrapper(wrapped, kind);
+  markClientWrapper(client, wrapped, kind);
   return wrapped as TClient;
 }
 
@@ -1172,13 +1172,19 @@ function safeHas(target: unknown, property: PropertyKey): boolean {
   }
 }
 
-function markClientWrapper(client: object, kind: AwsWrapperKind): void {
-  let kinds = CLIENT_WRAPPER_KINDS.get(client);
-  if (!kinds) {
-    kinds = new Set();
-    CLIENT_WRAPPER_KINDS.set(client, kinds);
+function markClientWrapper(
+  client: object,
+  wrapped: object,
+  kind: AwsWrapperKind,
+): void {
+  for (const key of [client, wrapped]) {
+    let wrappers = CLIENT_WRAPPERS.get(key);
+    if (!wrappers) {
+      wrappers = new Map();
+      CLIENT_WRAPPERS.set(key, wrappers);
+    }
+    wrappers.set(kind, wrapped as AwsClientLike);
   }
-  kinds.add(kind);
 }
 
 function hasReservedMessageAttribute(
