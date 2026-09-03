@@ -4,6 +4,7 @@ export {
   type BuildCacheEventInput,
   type CacheDriver,
   type CacheEventData,
+  type CacheOperationSummary,
 } from "./event";
 export {
   instrumentIoredisClient,

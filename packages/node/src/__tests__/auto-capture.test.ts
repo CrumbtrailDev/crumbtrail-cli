@@ -1305,7 +1305,9 @@ describe("autoCapture completeness ledger", () => {
     const { fetchImpl, calls } = makeFetch();
     const executed: string[] = [];
     class Client {
-      async query(text: unknown): Promise<{ rows: unknown[]; rowCount: number }> {
+      async query(
+        text: unknown,
+      ): Promise<{ rows: unknown[]; rowCount: number }> {
         executed.push(String(text));
         return { rows: [{ id: 1, total: 10 }], rowCount: 1 };
       }
@@ -1321,6 +1323,9 @@ describe("autoCapture completeness ledger", () => {
       fetchImpl,
       onCrashExit: () => {},
       databaseDrivers: ["pg"],
+      captureDatabaseReads: true,
+      captureDatabaseBeforeImages: true,
+      captureDatabaseCallsites: true,
       databaseResolve: (specifier: string) => {
         if (specifier === "pg") return pgModule;
         const error = new Error(`Cannot find module '${specifier}'`);
@@ -1343,12 +1348,28 @@ describe("autoCapture completeness ledger", () => {
       { requestId: "req_1", sessionId: "sess_1", sessionIdSource: "header" },
       () => pool.query("UPDATE carts SET total = 10 WHERE id = 1"),
     );
+    await runInBackendRequestContext(
+      { requestId: "req_1", sessionId: "sess_1", sessionIdSource: "header" },
+      () => pool.query("SELECT * FROM carts WHERE id = 1"),
+    );
     await new Promise((r) => setTimeout(r, 0));
 
     // The host's statement still ran, and it carried evidence with it.
     expect(executed.some((sql) => sql.includes("UPDATE carts"))).toBe(true);
     const kinds = eventsFrom(calls).map((e) => e.k);
     expect(kinds.some((k) => k.startsWith("db"))).toBe(true);
+    const databaseEvents = eventsFrom(calls).filter((e) =>
+      e.k.startsWith("db"),
+    );
+    expect(databaseEvents.some((event) => event.k === "db.read")).toBe(true);
+    expect(
+      databaseEvents.some(
+        (event) =>
+          event.k === "db.diff" &&
+          event.d.before !== undefined &&
+          event.d.callsite !== undefined,
+      ),
+    ).toBe(true);
   });
 
   it("patches cache drivers before it first yields and correlates their operations", async () => {

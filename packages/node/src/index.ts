@@ -19,6 +19,7 @@ export type {
   AutoInstrumentCacheReport,
   CacheDriver,
   CacheEventData,
+  CacheOperationSummary,
   DuckTypedCacheClient,
   InstrumentCacheClientOptions,
 } from "./cache";
