@@ -1693,30 +1693,20 @@ function staticBootstrapBlock(html: string) {
   return null;
 }
 
-function isParserBlockingBootstrap(attributes: string): boolean {
-  const attribute =
-    /([^\s=<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
-  for (const match of attributes.matchAll(attribute)) {
-    const name = match[1].toLowerCase();
-    if (["async", "defer", "nomodule"].includes(name)) return false;
-    if (
-      name === "type" &&
-      (match[2] ?? match[3] ?? match[4] ?? "").trim().toLowerCase() === "module"
-    )
-      return false;
-  }
-  return true;
+function isParserBlockingBootstrap(
+  attributes: ReadonlyMap<string, string>,
+): boolean {
+  return (
+    !["async", "defer", "nomodule"].some((name) => attributes.has(name)) &&
+    (attributes.get("type") ?? "").trim().toLowerCase() !== "module"
+  );
 }
 
 function staticModuleVersion(html: string): string | null {
   for (const block of htmlScriptBlocks(html)) {
     if (!block.executable) continue;
-    const type =
-      /(?:^|\s)type\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(
-        block.attributes,
-      );
     const isModule =
-      (type?.[1] ?? type?.[2] ?? type?.[3] ?? "").trim().toLowerCase() ===
+      (block.attributeValues.get("type") ?? "").trim().toLowerCase() ===
       "module";
     if (!isModule) continue;
     const sources = block.src === null ? [] : [block.src];
@@ -1872,7 +1862,7 @@ function staticExistingPagePlan(
     io,
   });
   if (markerSource !== null) {
-    if (!isParserBlockingBootstrap(markerBlock!.attributes)) {
+    if (!isParserBlockingBootstrap(markerBlock!.attributeValues)) {
       return {
         recipe: input.recipe,
         kind: "fallback-ai",

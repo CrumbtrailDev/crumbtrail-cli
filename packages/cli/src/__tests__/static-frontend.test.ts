@@ -10,6 +10,7 @@ import { buildPlan } from "../inject/recipes";
 import {
   findStaticMountDirs,
   htmlReferencesCrumbtrail,
+  htmlScriptBlocks,
   insertIntoHtmlHead,
 } from "../inject/text";
 import { cleanup, fakeInjectIO, makeTmpRepo } from "./helpers";
@@ -174,6 +175,39 @@ describe("insertIntoHtmlHead", () => {
     );
     expect(out).toContain('/commented.js"></script> -->');
   });
+
+  it("parses real attributes once without reading quoted decoys", () => {
+    const blocks = htmlScriptBlocks(
+      `<script data-note='type="application/json" src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js" async defer nomodule'>app()</script>`,
+    );
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].executable).toBe(true);
+    expect(blocks[0].src).toBeNull();
+    expect(blocks[0].attributeValues.has("async")).toBe(false);
+    expect(blocks[0].attributeValues.has("type")).toBe(false);
+  });
+
+  it.each([
+    `<style>.x::before { content: '<style>'; }</style>`,
+    `<textarea>literal <textarea> <script>notParent()</script></textarea>`,
+    `<template><!-- </template> --><script>notParent()</script></template>`,
+    `<template><div data-note="</template>"></div><template><script>nested()</script></template></template>`,
+    `<template><style>.x { content: '<template>'; }</style></template>`,
+    `<iframe><script>fallback()</script></iframe>`,
+  ])(
+    "handles raw text and template state without false nesting: %s",
+    (markup) => {
+      const html = `<html><head></head><body>${markup}<script src="/real.js"></script></body></html>`;
+      const blocks = htmlScriptBlocks(html);
+      expect(blocks).toHaveLength(1);
+      expect(blocks[0].src).toBe("/real.js");
+      const out = insertIntoHtmlHead(html, "<script>early()</script>")!;
+      expect(out).toContain(markup);
+      expect(out.indexOf("<script>early()</script>")).toBeLessThan(
+        out.indexOf('<script src="/real.js">'),
+      );
+    },
+  );
 
   it.each([
     `<iframe srcdoc="<script src='/frame.js'></script>"></iframe>`,

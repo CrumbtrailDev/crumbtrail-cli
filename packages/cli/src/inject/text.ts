@@ -1081,15 +1081,10 @@ const JAVASCRIPT_SCRIPT_TYPE = new Set([
   "text/x-javascript",
 ]);
 
-function executableScript(attrs: string): boolean {
-  const typeAttribute =
-    /(?:^|\s)type\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(attrs);
+function executableScript(attrs: ReadonlyMap<string, string>): boolean {
   // An omitted or empty type is a classic script. An explicit non-JavaScript
   // type is a data block and does not establish an execution boundary.
-  if (!typeAttribute) return true;
-  const type = (typeAttribute[1] ?? typeAttribute[2] ?? typeAttribute[3] ?? "")
-    .split(";", 1)[0]
-    .trim();
+  const type = (attrs.get("type") ?? "").split(";", 1)[0].trim();
   return (
     type === "" ||
     type.toLowerCase() === "module" ||
@@ -1114,12 +1109,25 @@ function tagEnd(html: string, start: number): number | null {
   return null;
 }
 
-const INERT_HTML_ELEMENT = /^<(template|noscript|style|textarea)\b/i;
+const RAW_HTML_ELEMENTS = new Set([
+  "script",
+  "style",
+  "textarea",
+  "title",
+  "noscript",
+  "iframe",
+  "xmp",
+  "noembed",
+  "noframes",
+]);
+const INERT_HTML_ELEMENT =
+  /^<(template|noscript|style|textarea|title|iframe|xmp|noembed|noframes|plaintext)(?=[\s/>])/i;
 
 export interface HtmlScriptBlock {
   start: number;
   end: number;
   attributes: string;
+  attributeValues: ReadonlyMap<string, string>;
   content: string;
   src: string | null;
   executable: boolean;
@@ -1132,25 +1140,87 @@ function afterInertElement(
 ): number | null {
   const openEnd = tagEnd(html, start + tagName.length + 1);
   if (openEnd === null) return null;
-  const tag = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const boundary = new RegExp(`<\\/?${tag}\\b`, "gi");
-  boundary.lastIndex = openEnd + 1;
+  if (tagName.toLowerCase() === "plaintext") return html.length;
+  if (tagName.toLowerCase() !== "template")
+    return afterRawElement(html, openEnd + 1, tagName)?.end ?? null;
+  let offset = openEnd + 1;
   let depth = 1;
-  for (let match = boundary.exec(html); match; match = boundary.exec(html)) {
-    const end = tagEnd(html, match.index + match[0].length);
+  while (offset < html.length) {
+    const start = html.indexOf("<", offset);
+    if (start < 0) return null;
+    if (html.startsWith("<!--", start)) {
+      const end = html.indexOf("-->", start + 4);
+      if (end < 0) return null;
+      offset = end + 3;
+      continue;
+    }
+    const tag = /^<(\/?)([a-z][a-z0-9:-]*)(?=[\s/>])/i.exec(html.slice(start));
+    if (!tag) {
+      offset = start + 1;
+      continue;
+    }
+    const end = tagEnd(html, start + tag[0].length);
     if (end === null) return null;
-    if (/^<\//.test(match[0])) depth -= 1;
-    else depth += 1;
-    if (depth === 0) return end + 1;
-    boundary.lastIndex = end + 1;
+    const name = tag[2].toLowerCase();
+    if (name === "template") {
+      depth += tag[1] ? -1 : 1;
+      if (depth === 0) return end + 1;
+    }
+    if (!tag[1] && RAW_HTML_ELEMENTS.has(name)) {
+      const after = afterRawElement(html, end + 1, name);
+      if (!after) return null;
+      offset = after.end;
+    } else offset = end + 1;
   }
   return null;
 }
 
-function scriptSource(attrs: string): string | null {
-  const match =
-    /(?:^|\s)src\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(attrs);
-  return match?.[1] ?? match?.[2] ?? match?.[3] ?? null;
+function afterRawElement(
+  html: string,
+  offset: number,
+  name: string,
+): { start: number; end: number } | null {
+  const close = new RegExp(`</${name}(?=[\\s/>])`, "gi");
+  close.lastIndex = offset;
+  const match = close.exec(html);
+  if (!match) return null;
+  const end = tagEnd(html, match.index + match[0].length);
+  return end === null ? null : { start: match.index, end: end + 1 };
+}
+
+function htmlAttributes(source: string): ReadonlyMap<string, string> {
+  const values = new Map<string, string>();
+  let offset = 0;
+  while (offset < source.length) {
+    while (/[\s/]/.test(source[offset] ?? "") && offset < source.length)
+      offset++;
+    const start = offset;
+    while (offset < source.length && !/[\s=/>]/.test(source[offset])) offset++;
+    if (start === offset) {
+      offset++;
+      continue;
+    }
+    const name = source.slice(start, offset).toLowerCase();
+    while (offset < source.length && /\s/.test(source[offset])) offset++;
+    let value = "";
+    if (source[offset] === "=") {
+      offset++;
+      while (offset < source.length && /\s/.test(source[offset])) offset++;
+      const quote = source[offset];
+      if (quote === '"' || quote === "'") {
+        const valueStart = ++offset;
+        while (offset < source.length && source[offset] !== quote) offset++;
+        value = source.slice(valueStart, offset);
+        if (offset < source.length) offset++;
+      } else {
+        const valueStart = offset;
+        while (offset < source.length && !/\s/.test(source[offset])) offset++;
+        value = source.slice(valueStart, offset);
+      }
+    }
+    if (!values.has(name)) values.set(name, value);
+  }
+  return values;
 }
 
 /**
@@ -1179,7 +1249,7 @@ export function htmlScriptBlocks(html: string): HtmlScriptBlock[] {
       continue;
     }
 
-    const open = /^<script\b/i.exec(html.slice(start));
+    const open = /^<script(?=[\s/>])/i.exec(html.slice(start));
     if (!open) {
       if (/^<(?:\/?[a-z]|[!?])/i.test(html.slice(start))) {
         const end = tagEnd(html, start + 1);
@@ -1194,19 +1264,17 @@ export function htmlScriptBlocks(html: string): HtmlScriptBlock[] {
     const end = tagEnd(html, start + open[0].length);
     if (end === null) return blocks;
     const attributes = html.slice(start + open[0].length, end);
-    const close = /<\/script\s*>/gi;
-    close.lastIndex = end + 1;
-    const closeMatch = close.exec(html);
-    const blockEnd = closeMatch
-      ? closeMatch.index + closeMatch[0].length
-      : html.length;
+    const attributeValues = htmlAttributes(attributes);
+    const closeMatch = afterRawElement(html, end + 1, "script");
+    const blockEnd = closeMatch?.end ?? html.length;
     blocks.push({
       start,
       end: blockEnd,
       attributes,
-      content: html.slice(end + 1, closeMatch?.index ?? html.length),
-      src: scriptSource(attributes),
-      executable: executableScript(attributes),
+      attributeValues,
+      content: html.slice(end + 1, closeMatch?.start ?? html.length),
+      src: attributeValues.get("src") ?? null,
+      executable: executableScript(attributeValues),
     });
     offset = blockEnd;
   }
