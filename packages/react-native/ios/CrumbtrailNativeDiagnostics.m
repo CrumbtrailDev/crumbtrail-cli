@@ -286,6 +286,7 @@ RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
     }
     dispatch_async(dispatch_get_main_queue(), ^{
       strongSelf->_lastHeartbeat = mach_absolute_time();
+      strongSelf->_watchdogPending = NO;
     });
   });
   dispatch_resume(_watchdog);

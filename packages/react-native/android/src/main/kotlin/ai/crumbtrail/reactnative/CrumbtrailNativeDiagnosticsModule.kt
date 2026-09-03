@@ -345,7 +345,10 @@ class CrumbtrailNativeDiagnosticsModule(
                     "previousLaunch" to false,
                 ))
             }
-            runCatching { mainHandler.post { lastHeartbeat = SystemClock.elapsedRealtime() } }
+runCatching { mainHandler.post {
+                lastHeartbeat = SystemClock.elapsedRealtime()
+                watchdogPending = false
+            } }
         }, CHECK_INTERVAL_MS, CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS)
     }
 

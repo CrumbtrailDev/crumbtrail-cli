@@ -19,8 +19,8 @@ export class EventBus {
   private maxBufferedEvents = DEFAULT_MAX_BUFFERED_EVENTS;
   private droppedFromBuffer = 0;
 
-  emit(event: BugEvent, options?: { bypassAdmission?: boolean }): void {
-    if (!options?.bypassAdmission && !this.admissionPredicate(event)) return;
+  emit(event: BugEvent, options?: { bypassAdmission?: boolean }): boolean {
+    if (!options?.bypassAdmission && !this.admissionPredicate(event)) return false;
     for (const tap of this.taps) {
       try {
         tap(event);
@@ -39,6 +39,7 @@ export class EventBus {
     if (!this.paused && this.buffer.length >= this.flushBufferSize) {
       this.flush();
     }
+    return true;
   }
 
   /**

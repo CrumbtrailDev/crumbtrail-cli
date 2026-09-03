@@ -282,7 +282,10 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     ),
                 )
             }
-            runCatching { handler.post { lastHeartbeat = SystemClock.elapsedRealtime() } }
+runCatching { handler.post {
+                lastHeartbeat = SystemClock.elapsedRealtime()
+                watchdogPending = false
+            } }
         }, CHECK_INTERVAL_MS, CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS)
     }
 

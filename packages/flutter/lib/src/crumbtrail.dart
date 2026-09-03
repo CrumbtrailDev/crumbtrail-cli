@@ -221,13 +221,17 @@ class Crumbtrail with WidgetsBindingObserver {
       nativeWatchdogHandoff: SharedPreferencesDartHangHandoff(preferences),
     );
     if (config.collectors.errors) logger.installErrorHandlers();
-    if (config.collectors.appLifecycle) {
+    if (config.collectors.appLifecycle || config.collectors.nativeWatchdog) {
       WidgetsBinding.instance.addObserver(logger);
       logger._cleanups.add(
         () => WidgetsBinding.instance.removeObserver(logger),
       );
     }
     await logger.startNativeDiagnostics();
+    final lifecycle = WidgetsBinding.instance.lifecycleState;
+    if (lifecycle != null && lifecycle != AppLifecycleState.resumed) {
+      logger._nativeWatchdog?.pause();
+    }
     _shared = logger;
     return logger;
   }
@@ -436,10 +440,12 @@ class Crumbtrail with WidgetsBindingObserver {
     } else {
       _nativeWatchdog?.pause();
     }
-    addEvent(
-      CrumbtrailEventKind.appLifecycle,
-      {'state': state.name, 'source': 'widgets-binding'},
-    );
+    if (config.collectors.appLifecycle) {
+      addEvent(
+        CrumbtrailEventKind.appLifecycle,
+        {'state': state.name, 'source': 'widgets-binding'},
+      );
+    }
     // Backgrounding is the last reliable moment to deliver: the OS may suspend
     // or kill the process seconds later and never resume it, so a batch still
     // sitting in the queue would go with the app.

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:crumbtrail_flutter/crumbtrail_flutter.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/widgets.dart';
 
 class FakeNativeDiagnostics implements CrumbtrailNativeDiagnosticsPlatform {
   FakeNativeDiagnostics({this.events = const []});
@@ -130,6 +131,21 @@ class RecordingTransport implements CrumbtrailTransport {
 }
 
 void main() {
+  test('watchdog lifecycle handling does not emit disabled lifecycle events', () async {
+    final transport = RecordingTransport();
+    final logger = Crumbtrail(
+      config: const CrumbtrailConfig(endpoint: 'https://ingest.example.com', collectors: CrumbtrailCollectors(appLifecycle: false, nativeWatchdog: true)),
+      transport: transport,
+      nativeDiagnosticsPlatform: FakeNativeDiagnostics(),
+      startTimer: false,
+    );
+    await logger.startNativeDiagnostics();
+    logger.didChangeAppLifecycleState(AppLifecycleState.paused);
+    logger.didChangeAppLifecycleState(AppLifecycleState.resumed);
+    await logger.flush();
+    expect(transport.batches.expand((batch) => batch).where((event) => event.kind == 'app-lifecycle'), isEmpty);
+    await logger.stop();
+  });
   test('native bridge drains shared events and reports capability state',
       () async {
     final transport = RecordingTransport();
@@ -197,10 +213,16 @@ void main() {
       expect(events.single['source'], 'dart');
       expect(events.single['recovered'], true);
 
+      nowMs = 7500;
+      async.elapse(const Duration(seconds: 1));
+      nowMs = 14000;
+      async.elapse(const Duration(seconds: 1));
+      expect(events, hasLength(2));
+
       watchdog.pause();
       nowMs = 20000;
       async.elapse(const Duration(seconds: 10));
-      expect(events, hasLength(1));
+      expect(events, hasLength(2));
 
       watchdog.stop();
     });

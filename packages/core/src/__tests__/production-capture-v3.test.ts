@@ -28,10 +28,10 @@ describe("production capture v3", () => {
       flushBufferSize: 1_000,
     });
 
-    logger.addEvent({ type: "before", data: { safe: true } });
+    expect(logger.addEvent({ type: "before", data: { safe: true } })).toBe(false);
     expect((logger as any).ringBuffer.size).toBe(0);
     logger.consent(true);
-    logger.addEvent({ type: "after", data: { safe: true } });
+    expect(logger.addEvent({ type: "after", data: { safe: true } })).toBe(true);
     await logger.flag();
     expect(transport.sendBugReport.mock.calls[0][1]).toEqual(
       expect.arrayContaining([expect.objectContaining({ k: "after" })]),
@@ -40,6 +40,7 @@ describe("production capture v3", () => {
     logger.consent(false);
     expect((logger as any).ringBuffer.size).toBe(0);
     await logger.stop();
+    expect(logger.addEvent({ type: "stopped", data: {} })).toBe(false);
   });
 
   it("treats Global Privacy Control as required consent until explicitly granted", async () => {

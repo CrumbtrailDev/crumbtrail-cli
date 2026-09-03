@@ -71,6 +71,7 @@ export function startReactNativeJsWatchdog(
   let stopped = false;
   let timerId: ReturnType<typeof setInterval> | undefined;
   const inFlight = new Set<Promise<void>>();
+  let pendingEvent: NativeHangEventData | undefined;
 
   if (options.handoff) {
     track(options.handoff.drain((event) => {
@@ -94,7 +95,12 @@ export function startReactNativeJsWatchdog(
       return;
     }
     const blockedFor = elapsed - checkIntervalMs;
-    if (blockedFor < thresholdMs || reportedForBlock) return;
+    if (blockedFor < thresholdMs) {
+      reportedForBlock = false;
+      if (pendingEvent && inFlight.size === 0) track(persistAndEmit(pendingEvent));
+      return;
+    }
+    if (reportedForBlock) return;
     reportedForBlock = true;
     const event: NativeHangEventData = {
       source: "js",
@@ -103,18 +109,22 @@ export function startReactNativeJsWatchdog(
       recovered: true,
       previousLaunch: false,
     };
-    track(persistAndEmit(event));
+    if (!pendingEvent) {
+      pendingEvent = event;
+      track(persistAndEmit(event));
+    }
   }
 
   async function persistAndEmit(event: NativeHangEventData): Promise<void> {
     if (options.handoff) {
-      await options.handoff.deliver(event, (durable) => {
+      const accepted = await options.handoff.deliver(event, (durable) => {
         if (stopped) return false;
         return emit(logger, options.capabilities, durable);
       }).catch(() => false);
+      if (accepted && pendingEvent === event) pendingEvent = undefined;
       return;
     }
-    if (!stopped) emit(logger, options.capabilities, event);
+    if (!stopped && emit(logger, options.capabilities, event) && pendingEvent === event) pendingEvent = undefined;
   }
 
   function pause(): void {
@@ -159,14 +169,13 @@ function emit(
   data: NativeHangEventData,
 ): boolean {
   try {
-    logger.addEvent({
+    return logger.addEvent({
       type: NATIVE_HANG_EVENT_KIND,
       data: { ...data },
       platform: "react-native",
       sdk: { name: "crumbtrail-react-native" },
       capabilities: capabilities.capabilities,
     });
-    return true;
   } catch {
     return false;
   }

@@ -17,7 +17,7 @@ describe("React Native JavaScript event-loop watchdog", () => {
 
   it("records one foreground stall and cleans up its timer and listener", () => {
     vi.useFakeTimers();
-    const addEvent = vi.fn();
+    const addEvent = vi.fn(() => true);
     let clock = 0;
     const remove = vi.fn();
     const appState = {
@@ -51,10 +51,14 @@ describe("React Native JavaScript event-loop watchdog", () => {
     vi.advanceTimersByTime(1000);
     expect(addEvent).toHaveBeenCalledTimes(eventCount);
 
+    clock = 14000;
+    vi.advanceTimersByTime(1000);
+    expect(addEvent).toHaveBeenCalledTimes(eventCount + 1);
+
     controller.cleanup();
     expect(remove).toHaveBeenCalledOnce();
     vi.advanceTimersByTime(10_000);
-    expect(addEvent).toHaveBeenCalledTimes(eventCount);
+    expect(addEvent).toHaveBeenCalledTimes(eventCount + 1);
   });
 
   it("does not report background time or development/debugger time", () => {

@@ -162,6 +162,9 @@ Native diagnostics and the Dart watchdog are also controlled by
 `CrumbtrailCollectors.nativeDiagnostics` and
 `CrumbtrailCollectors.nativeWatchdog`. They are enabled by default. The
 watchdog pauses when the app is not resumed and while a debugger is attached.
+Lifecycle observation remains active when `collectors.appLifecycle` is false,
+without recording lifecycle events. A healthy heartbeat rearms the watchdog
+after a recovered stall.
 
 The ingest key is write only by design. It cannot read sessions back, so
 shipping it in an app binary exposes nothing. Reading data needs a separate

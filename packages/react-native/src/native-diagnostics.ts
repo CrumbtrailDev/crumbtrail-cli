@@ -85,7 +85,8 @@ export function startReactNativeNativeDiagnostics(
   }
 
   let active = true;
-  const startup = drainNativeDiagnostics(
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let startup = drainNativeDiagnostics(
     logger,
     capabilities,
     nativeModule,
@@ -99,6 +100,7 @@ export function startReactNativeNativeDiagnostics(
     modulePresent: true,
     async cleanup() {
       active = false;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
       await startup;
       if (typeof nativeModule.setEnabled === "function") {
         try {
@@ -137,7 +139,13 @@ export function startReactNativeNativeDiagnostics(
     const batch = normalizeNativeDiagnosticBatch(raw);
     if (!active || !batch) return;
     for (const event of batch.events) {
-      if (!active || !emitNativeDiagnostic(target, sdkCapabilities, event)) return;
+      if (!active) return;
+      if (!emitNativeDiagnostic(target, sdkCapabilities, event)) {
+        retryTimer = setTimeout(() => {
+          if (active) startup = drainNativeDiagnostics(target, sdkCapabilities, module, shouldEnable).catch(() => {});
+        }, 1000);
+        return;
+      }
     }
     if (!batch.events.length || !active) return;
     try {
@@ -154,14 +162,13 @@ function emitNativeDiagnostic(
   event: ReactNativeNativeDiagnosticEvent,
 ): boolean {
   try {
-    logger.addEvent({
+    return logger.addEvent({
       type: event.kind,
       data: event.data,
       platform: "react-native",
       sdk: { name: "crumbtrail-react-native" },
       capabilities: capabilities.capabilities,
     });
-    return true;
   } catch {
     return false;
   }

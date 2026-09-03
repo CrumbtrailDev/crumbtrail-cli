@@ -4,6 +4,7 @@ import {
   createReactNativeWatchdogHandoff,
 } from "../native-diagnostics";
 import type { ReactNativeCapabilities } from "../capabilities";
+import { Crumbtrail } from "crumbtrail-core";
 
 const capabilities: ReactNativeCapabilities = {
   bitset: 0,
@@ -28,10 +29,40 @@ const capabilities: ReactNativeCapabilities = {
 };
 
 function logger() {
-  return { addEvent: vi.fn() };
+  return { addEvent: vi.fn(() => true) };
 }
 
 describe("React Native native diagnostics bridge", () => {
+  it("retains a native batch until real core consent admission succeeds", async () => {
+    vi.useFakeTimers();
+    const target = Crumbtrail.init({
+      consentMode: "required", environment: false, domSnapshot: false,
+      console: false, errors: false, network: false, interactions: false,
+      keystrokes: false, scroll: false, visibility: false, clipboard: false,
+      cookies: false, storage: false, performance: false, video: false,
+      audio: false, widget: false,
+      sessionPersistence: "memory",
+      transportInstance: { startSession: vi.fn(), endSession: vi.fn(), sendEvents: vi.fn(), sendBlob: vi.fn() } as any,
+    });
+    const acknowledgeDiagnostics = vi.fn(async () => true);
+    const controller = startReactNativeNativeDiagnostics(target, capabilities, {
+      module: {
+        drainDiagnostics: async () => ({ token: "pending", events: [{ kind: "native-crash", data: { msg: "crash" } }] }),
+        acknowledgeDiagnostics,
+      },
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(acknowledgeDiagnostics).not.toHaveBeenCalled();
+      target.consent(true);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(acknowledgeDiagnostics).toHaveBeenCalledOnce();
+    } finally {
+      await controller.cleanup();
+      await target.stop();
+      vi.useRealTimers();
+    }
+  });
   it("reports an explicit absent capability when the optional module is missing", async () => {
     const target = logger();
     const controller = startReactNativeNativeDiagnostics(

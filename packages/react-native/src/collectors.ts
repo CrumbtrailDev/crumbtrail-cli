@@ -139,6 +139,7 @@ export function startReactNativeCollectors(
         globalObject,
         capabilities: options.capabilities,
         handoff: options.watchdogHandoff,
+        appState: reactNative?.AppState,
       })
     : undefined;
 
@@ -165,10 +166,6 @@ export function startReactNativeCollectors(
         logger,
         options.capabilities,
         reactNative?.AppState,
-        (state) => {
-          if (state === "active") jsWatchdog?.resume();
-          else jsWatchdog?.pause();
-        },
       ),
     );
   if (enabled.environment)

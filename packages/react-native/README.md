@@ -216,6 +216,11 @@ the acceptance callback returns `true`, compare the stored value before
 clearing it, and return `false` on any failed step. The SDK waits for in-flight
 handoff work during collector cleanup.
 
+Native batches are acknowledged only when core capture policy admits their events.
+Rejected batches remain local and retry while the bridge is active. `addEvent()`
+returns `true` for local admission, not server delivery. Watchdogs rearm after a
+healthy heartbeat and observe background state even when `appState` events are off.
+
 The JavaScript watchdog defaults to a five second threshold and one second
 checks. It pauses when `AppState` is not active, and is disabled in development
 mode or when a remote debugger is detected. Pass

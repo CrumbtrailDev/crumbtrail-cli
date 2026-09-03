@@ -428,7 +428,11 @@ class CrumbtrailDartEventLoopWatchdog {
       return;
     }
     final blocked = elapsed - checkInterval;
-    if (blocked < threshold || _reportedForBlock) return;
+    if (blocked < threshold) {
+      _reportedForBlock = false;
+      return;
+    }
+    if (_reportedForBlock) return;
     _reportedForBlock = true;
     final data = _boundedEvent({
       'source': 'dart',

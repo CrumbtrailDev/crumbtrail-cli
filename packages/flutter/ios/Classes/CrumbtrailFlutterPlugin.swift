@@ -185,6 +185,7 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
             }
             DispatchQueue.main.async { [weak self] in
                 self?.lastHeartbeat = DispatchTime.now().uptimeNanoseconds
+                self?.watchdogPending = false
             }
         }
         watchdogTimer = timer
