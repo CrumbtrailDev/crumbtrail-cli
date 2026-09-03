@@ -407,6 +407,38 @@ describe("HttpTransport session start ordering", () => {
     ]);
   });
 
+  it("does not relabel a waiting event batch after a session rollover", async () => {
+    let releaseFirstStart: (() => void) | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        if (
+          String(url).endsWith("/api/session/start") &&
+          JSON.parse(String(init?.body)).sessionId === "ses_old"
+        ) {
+          await new Promise<void>((resolve) => {
+            releaseFirstStart = resolve;
+          });
+        }
+        return new Response('{"ok":true}');
+      }),
+    );
+    const transport = new HttpTransport(endpoint, { authToken: "t" });
+
+    const firstStart = transport.startSession("ses_old", {});
+    const delayedBatch = transport.sendEvents([{ t: 1, k: "con", d: {} }]);
+    await Promise.resolve();
+    await transport.startSession("ses_new", {});
+    releaseFirstStart?.();
+    await firstStart;
+    await delayedBatch;
+
+    const eventCalls = (fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([url]) => String(url).endsWith("/api/events"),
+    );
+    expect(eventCalls).toHaveLength(0);
+  });
+
   it("refuses events locally when the start it waited for was refused", async () => {
     vi.stubGlobal(
       "fetch",

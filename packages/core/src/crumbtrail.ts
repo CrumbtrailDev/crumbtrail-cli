@@ -2173,12 +2173,14 @@ export class Crumbtrail {
       replaySupported();
     if (shouldRecord) {
       if (this.replay) return;
+      const replaySessionId = this.sessionId;
       this.replay = new ReplayRecorder({
-        sessionId: this.sessionId,
+        sessionId: replaySessionId,
         masking: this.replayMasking,
         ...this.applicationRelease,
         sdkVersion: CRUMBTRAIL_SDK_VERSION,
-        send: (name, body) => this.transport.sendBlob(name, body),
+        send: (name, body) =>
+          this.transport.sendBlob(name, body, undefined, replaySessionId),
       });
       this.replay.start();
       return;

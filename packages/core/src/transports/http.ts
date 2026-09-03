@@ -296,10 +296,16 @@ export class HttpTransport implements CrumbtrailTransport {
 
   async sendEvents(events: BugEvent[]): Promise<void> {
     if (events.length === 0) return;
-    await this.sessionReady;
+    const sessionId = this.sessionId;
+    const sessionReady = this.sessionReady;
+    await sessionReady;
+    // A lifecycle rollover can replace both identity and admission while this batch waits. The
+    // events belong to the visit active at invocation, so never relabel them as part of the new
+    // visit. The old session is already closing and owns its final flush.
+    if (sessionId !== this.sessionId) return;
     const standing = this.standingRefusal(events.length);
     if (standing) throw standing;
-    await this.deliverAll(this.splitToBudget(events));
+    await this.deliverAll(this.splitToBudget(events, sessionId), 0, sessionId);
   }
 
   /**
@@ -311,15 +317,18 @@ export class HttpTransport implements CrumbtrailTransport {
    * still returned — it is refused by the server rather than dropped silently
    * here, so the loss is recorded with a status.
    */
-  private splitToBudget(events: BugEvent[]): BugEvent[][] {
+  private splitToBudget(events: BugEvent[], sessionId: string): BugEvent[][] {
     if (events.length <= 1) return [events];
-    if (utf8ByteLength(this.eventsBody(events)) <= MAX_EVENTS_BODY_BYTES) {
+    if (
+      utf8ByteLength(this.eventsBody(events, sessionId)) <=
+      MAX_EVENTS_BODY_BYTES
+    ) {
       return [events];
     }
     const mid = Math.ceil(events.length / 2);
     return [
-      ...this.splitToBudget(events.slice(0, mid)),
-      ...this.splitToBudget(events.slice(mid)),
+      ...this.splitToBudget(events.slice(0, mid), sessionId),
+      ...this.splitToBudget(events.slice(mid), sessionId),
     ];
   }
 
@@ -333,12 +342,14 @@ export class HttpTransport implements CrumbtrailTransport {
   private async deliverAll(
     chunks: BugEvent[][],
     depth = 0,
+    sessionId = this.sessionId,
   ): Promise<void> {
     let first: EventDeliveryError | undefined;
     let lost = 0;
     for (const chunk of chunks) {
+      if (sessionId !== this.sessionId) return;
       try {
-        await this.deliverChunk(chunk, depth);
+        await this.deliverChunk(chunk, depth, sessionId);
       } catch (error) {
         const failure =
           error instanceof EventDeliveryError
@@ -363,9 +374,13 @@ export class HttpTransport implements CrumbtrailTransport {
    * usually acceptable. Dropping the whole batch instead threw away every event
    * that would have fit alongside the one oversized payload.
    */
-  private async deliverChunk(events: BugEvent[], depth: number): Promise<void> {
+  private async deliverChunk(
+    events: BugEvent[],
+    depth: number,
+    sessionId: string,
+  ): Promise<void> {
     try {
-      await this.postEvents(events);
+      await this.postEvents(events, sessionId);
     } catch (error) {
       const oversized =
         error instanceof EventDeliveryError &&
@@ -377,12 +392,13 @@ export class HttpTransport implements CrumbtrailTransport {
       await this.deliverAll(
         [events.slice(0, mid), events.slice(mid)],
         depth + 1,
+        sessionId,
       );
     }
   }
 
-  private eventsBody(events: BugEvent[]): string {
-    return JSON.stringify({ sessionId: this.sessionId, events });
+  private eventsBody(events: BugEvent[], sessionId = this.sessionId): string {
+    return JSON.stringify({ sessionId, events });
   }
 
   /**
@@ -399,8 +415,12 @@ export class HttpTransport implements CrumbtrailTransport {
     });
   }
 
-  private async postEvents(events: BugEvent[]): Promise<void> {
-    const body = this.eventsBody(events);
+  private async postEvents(
+    events: BugEvent[],
+    sessionId: string,
+  ): Promise<void> {
+    if (sessionId !== this.sessionId) return;
+    const body = this.eventsBody(events, sessionId);
     const init: RequestInit = {
       method: "POST",
       headers: this.withAuthHeaders({ "Content-Type": "application/json" }),
