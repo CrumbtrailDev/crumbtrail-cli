@@ -138,6 +138,8 @@ ever imported) so INSERT/UPDATE/DELETE statements executed inside a request scop
 Neon HTTP uses `instrumentNeonHttpQuery(query, options)` and appends `RETURNING *` for
 after-images. PlanetScale uses `instrumentPlanetScaleClient(client, options)` and applies the
 MySQL re-read strategy to its HTTP `execute()` results. `autoCapture` detects both packages.
+Prisma uses `instrumentPrismaClient(client, options)` and MongoDB uses
+`instrumentMongoClient(client, options)` when the host needs an explicit fallback.
 
 All adapters take the same `InstrumentDbClientOptions` and share the same guarantees: the host
 query never fails and never runs twice because of instrumentation — parse/correlation/capture/
@@ -160,6 +162,84 @@ bind values. Pool checkouts emit `db.pool.wait` with their wait duration. `mssql
 distinct `db.pool.timeout` event when acquisition fails with `ETIMEOUT`; the other drivers do not
 provide a stable pool-timeout code, so their error prose is never guessed.
 
+### Cross session race evidence
+
+Race evidence is off by default. Enable it only when the hosted product will inspect lost updates
+or stale cache repopulation. It adds a sealed `raceEvidence` object to eligible single entity
+`db.read`, `db.diff`, and single key cache `get`, `set`, `del`, or `unlink` events. The object has
+only these fixed length identifiers: required `entityHash`, plus optional `resourceHash`,
+`versionHash`, `beforeVersionHash`, and `afterVersionHash`:
+
+```ts
+await autoCapture({
+  endpoint: process.env.CRUMBTRAIL_ENDPOINT!,
+  raceEvidence: {
+    enabled: true,
+    resourceSubject: "orders",
+    optimisticVersionField: "version",
+  },
+});
+```
+
+When `autoCapture` has an ingest credential with at least 32 non whitespace bytes and sufficient
+character diversity, the SDK keeps that credential in memory and uses it only as the key for domain
+separated HMAC SHA 256 digests. It never places the credential in an event or in the race evidence
+object. `resourceSubject` is
+optional. Set the same subject for the database and cache integrations when they represent the
+same application resource. The configured version field produces `versionHash` on reads,
+`beforeVersionHash` and `afterVersionHash` on diffs, and no version identifier when the field is
+missing.
+
+Bulk database statements, image less diffs without a resolvable entity, multi key cache calls, and
+database work inside an observed transaction do not receive race evidence. Prisma, MongoDB, and
+PlanetScale adapters omit race evidence for all operations because their hooks do not expose
+transaction commit or rollback outcome. A database event also needs a nonempty, fully resolved
+primary key. Every configured primary key column must be present as an own property with a defined
+value, including composite keys. Existing row, key, value, and redaction capture is unchanged. A
+resolver or HMAC failure omits only `raceEvidence` and never changes the host operation.
+
+The direct `buildDbReadEvent` and `buildDbDiffEvent` builders also require
+`raceEvidenceCapability: "transaction-outcome"` before they attach race evidence. Set that field
+only when the producer observed the operation's transaction outcome. The builders reject Prisma and
+MongoDB engine tags at this boundary. The PlanetScale adapter suppresses race evidence because its
+HTTP hook does not expose a transaction outcome.
+
+MongoDB single-entity ordinary `update`, `delete`, and `findAndModify` diffs use a fully resolved
+`_id`. Bulk and unresolved commands omit race evidence. Common BSON `ObjectId` values are
+represented by a validated 24 character hexadecimal `toHexString()` value without adding a MongoDB
+package dependency.
+
+If the instrumentation path has no strong ingest credential, supply already opaque 64 character
+identifiers through a per operation `resolve` callback. Multiple operation instrumentation does not
+reuse a static `identifiers` object across calls. Static identifiers are accepted only by the
+direct `buildCacheEvent`, `buildDbReadEvent`, and `buildDbDiffEvent` builders, where the caller
+constructs one event at a time. The SDK accepts letters, numbers, underscore, and hyphen only,
+and requires `entityHash`. Database builders still require the explicit transaction outcome
+capability described above:
+
+```ts
+import { instrumentIoredisClient } from "crumbtrail-node";
+
+const cache = instrumentIoredisClient(redis, {
+  requestId: "request-id-from-your-context",
+  emit: sendEvent,
+  raceEvidence: {
+    enabled: true,
+    resolve(input) {
+      if (input.surface !== "cache") return undefined;
+      return {
+        resourceHash: "r".repeat(64),
+        entityHash: "e".repeat(64),
+      };
+    },
+  },
+});
+```
+
+Do not use a raw primary key, raw cache key, redacted key shape, version value, row value, or
+arbitrary metadata as an identifier. The identifiers are the only fields intended for future
+cross session joins.
+
 ### Which clients get instrumented
 
 `autoCapture` instruments for you: it replaces the exported factories of every driver above
@@ -181,7 +261,8 @@ like a working install:
   not allow the SDK to replace (reported as `esm-unreachable`)
 
 For both, instrument it yourself. The call routes to the running capture and its request scope,
-and is safe in any order relative to `autoCapture`:
+and is safe in any order relative to `autoCapture`. If you instrument the client first, its race
+evidence configuration is read again when each event is built after capture starts:
 
 ```ts
 import { instrumentDatabaseClient } from "crumbtrail-node";

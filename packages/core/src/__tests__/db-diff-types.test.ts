@@ -33,7 +33,13 @@ describe("db.diff event kind", () => {
   });
 
   it("accepts every engine in the DbEngine union", () => {
-    const engines: DbEngine[] = ["postgres", "mysql", "mssql", "sqlite"];
+    const engines: DbEngine[] = [
+      "postgres",
+      "mysql",
+      "mssql",
+      "sqlite",
+      "mongodb",
+    ];
     const events = engines.map<DbDiffEventData>((engine) => ({
       engine,
       op: "insert",

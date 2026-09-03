@@ -13,6 +13,9 @@ function fakeIoredis(values: Record<string, string> = {}) {
     async del(...keys: string[]) {
       return keys.filter((key) => key in values).length;
     },
+    async unlink(...keys: string[]) {
+      return keys.filter((key) => key in values).length;
+    },
   };
 }
 
@@ -89,6 +92,19 @@ describe("instrumentIoredisClient", () => {
 
     await expect(client.del("cart:7")).resolves.toBe(1);
     expect(emit).toHaveBeenCalledOnce();
+  });
+
+  it("keeps del and unlink as distinct deletion operation names", async () => {
+    const events: BugEvent[] = [];
+    const client = instrumentIoredisClient(fakeIoredis({ "cart:7": "x" }), {
+      emit: (event) => events.push(event),
+      requestId: "req_cache_delete_ops",
+    });
+
+    await client.del("cart:7");
+    await client.unlink("cart:7");
+
+    expect(events.map((event) => event.d.op)).toEqual(["del", "unlink"]);
   });
 
   it("does not emit outside a request scope", async () => {

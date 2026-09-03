@@ -142,6 +142,82 @@ describe("instrumentMongoClient", () => {
     expect(diff?.d).not.toHaveProperty("after");
   });
 
+  it("suppresses race evidence when command monitoring cannot prove transaction outcome", () => {
+    const { client, events } = capture({
+      raceEvidence: {
+        enabled: true,
+        resolve: () => ({ entityHash: "e".repeat(64) }),
+      },
+    });
+    client.succeed(
+      21,
+      "update",
+      {
+        update: "accounts",
+        updates: [{ q: { _id: "acct-1" }, u: { $set: { status: "ready" } } }],
+      },
+      { ok: 1, n: 1 },
+    );
+    client.succeed(
+      22,
+      "delete",
+      { delete: "accounts", deletes: [{ q: { _id: "acct-2" }, limit: 1 }] },
+      { ok: 1, n: 1 },
+    );
+    client.succeed(
+      23,
+      "findAndModify",
+      {
+        findAndModify: "accounts",
+        query: { _id: "acct-3" },
+        update: { $set: { status: "ready" } },
+        new: true,
+      },
+      {
+        ok: 1,
+        lastErrorObject: { n: 1 },
+        value: { _id: "acct-3", status: "ready" },
+      },
+    );
+
+    expect(eventsOf(events, "db.diff")).toHaveLength(3);
+    expect(
+      eventsOf(events, "db.diff").every(
+        (event) => event.d.raceEvidence === undefined,
+      ),
+    ).toBe(true);
+  });
+
+  it("keeps successful and failed transaction work free of race evidence", () => {
+    const { client, events } = capture({
+      raceEvidence: {
+        enabled: true,
+        resolve: () => ({ entityHash: "e".repeat(64) }),
+      },
+    });
+    client.succeed(
+      24,
+      "update",
+      {
+        update: "accounts",
+        updates: [{ q: { _id: "acct-commit" }, u: { $set: { ok: true } } }],
+      },
+      { ok: 1, n: 1 },
+    );
+    client.fail(
+      25,
+      "update",
+      {
+        update: "accounts",
+        updates: [{ q: { _id: "acct-rollback" }, u: { $set: { ok: true } } }],
+      },
+      { name: "MongoServerError", code: 112 },
+    );
+
+    expect(eventsOf(events, "db.diff")).toHaveLength(1);
+    expect(eventsOf(events, "db.diff")[0]?.d.raceEvidence).toBeUndefined();
+  });
+
   it("maps bulk update and delete commands to aggregate partial diffs", () => {
     const { client, events } = capture();
     client.succeed(

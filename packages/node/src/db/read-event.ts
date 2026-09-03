@@ -11,6 +11,12 @@ import {
 import type { DbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
 import { boundColumnRow, type DbValueBounds } from "./diff-event";
+import {
+  buildRaceEvidence,
+  isRaceEvidenceInputEligible,
+  readOptimisticVersion,
+  type RaceEvidenceOptions,
+} from "../race-evidence";
 
 export interface BuildDbReadEventInput {
   /** Engine that produced the read. Defaults to `"postgres"` for back-compat. */
@@ -36,6 +42,16 @@ export interface BuildDbReadEventInput {
   sessionStartedAt?: number | Date;
   /** Optional nested-value bounds applied after redaction. */
   valueBounds?: DbValueBounds;
+  /** Explicit opt in configuration for bounded cross session race evidence. */
+  raceEvidence?: RaceEvidenceOptions;
+  /** Configured DB primary-key columns used to require a complete identity. */
+  primaryKeyColumns?: readonly string[];
+  /**
+   * Capability asserted by a producer that observed this operation's
+   * transaction outcome. Generic builders cannot infer this from `engine`:
+   * PlanetScale uses the same `mysql` tag as transactional MySQL clients.
+   */
+  raceEvidenceCapability?: "transaction-outcome";
 }
 
 export interface BuildDbReadBulkEventInput {
@@ -56,9 +72,9 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
     ? Math.round(input.now as number)
     : Date.now();
   const sensitive = buildSensitiveColumnSet(input.redactColumns);
-  const row = redactColumns(input.row, sensitive, "db.read.row");
+  const row = safeRedactColumns(input.row, sensitive, "db.read.row");
   const pk = input.pk
-    ? redactColumns(input.pk, sensitive, "db.read.pk")
+    ? safeRedactColumns(input.pk, sensitive, "db.read.pk")
     : { value: null as Record<string, unknown> | null, metadata: undefined };
 
   const boundedRow = boundColumnRow(row.value, input.valueBounds) ?? {};
@@ -92,6 +108,30 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
       ...(Number.isInteger(shape.offset) ? { offset: shape.offset } : {}),
     };
   }
+  if (
+    input.raceEvidenceCapability === "transaction-outcome" &&
+    supportsGenericRaceEvidenceEngine(input.engine) &&
+    !input.transactionId &&
+    isRaceEvidenceInputEligible({
+      surface: "db.read",
+      operation: "read",
+      table: input.table,
+      primaryKey: input.pk,
+      primaryKeyColumns: input.primaryKeyColumns,
+    })
+  ) {
+    const versionField = input.raceEvidence?.optimisticVersionField;
+    const raceEvidence = buildRaceEvidence(input.raceEvidence, {
+      surface: "db.read",
+      operation: "read",
+      table: input.table,
+      primaryKey: input.pk,
+      primaryKeyColumns: input.primaryKeyColumns,
+      resourceSubject: input.raceEvidence?.resourceSubject,
+      currentVersion: readOptimisticVersion(input.row, versionField),
+    });
+    if (raceEvidence) d.raceEvidence = raceEvidence;
+  }
   const redaction = mergeRedactionMetadata(row.metadata, pk.metadata);
   if (redaction) d.redaction = redaction;
 
@@ -105,6 +145,27 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
   const startedAt = normalizeStartedAt(input.sessionStartedAt);
   if (startedAt !== undefined) event.offsetMs = Math.max(0, now - startedAt);
   return event;
+}
+
+function supportsGenericRaceEvidenceEngine(
+  engine: BuildDbReadEventInput["engine"],
+): boolean {
+  // Prisma and MongoDB adapters do not expose a transaction outcome at this
+  // builder boundary. PlanetScale is intentionally represented as mysql, so a
+  // producer must assert the outcome capability explicitly instead.
+  return engine !== "prisma" && engine !== "mongodb";
+}
+
+function safeRedactColumns(
+  row: Record<string, unknown> | undefined,
+  sensitive: Set<string>,
+  path: string,
+): ReturnType<typeof redactColumns> {
+  try {
+    return redactColumns(row, sensitive, path);
+  } catch {
+    return { value: undefined };
+  }
 }
 
 function normalizeDuration(value: number | undefined): number {

@@ -26,6 +26,7 @@ import {
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
+import { captureGenerationFor } from "../capture-generation";
 
 /**
  * Minimal duck-typed view of an `mssql`-package result. We never import `mssql` at module top level —
@@ -526,7 +527,9 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     request: DuckTypedMssqlRequest,
     recordedInputs: ReadonlyArray<readonly unknown[]>,
     text: unknown,
+    scopedOptions?: InstrumentDbClientOptions,
   ): Promise<DuckTypedMssqlResult> => {
+    const operationOptions = scopedOptions ?? captureGenerationFor(options);
     if (typeof text !== "string") return request.query(text);
     const sql = text;
 
@@ -536,7 +539,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     try {
       const classification = classifyStatement(sql);
       if (classification.kind === "unparsable" && classification.mayMutate) {
-        emitGap(options, {
+        emitGap(operationOptions, {
           reason: "unparsed_sql",
           detail: leadingSqlKeyword(sql),
         });
@@ -547,9 +550,10 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
           : undefined;
       parsedRead =
         classification.kind === "read" ? classification.read : undefined;
-      requestId = options.requestId ?? options.getRequestId?.();
+      requestId =
+        operationOptions.requestId ?? operationOptions.getRequestId?.();
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
       return request.query(sql);
     }
     if (!requestId) return request.query(sql);
@@ -557,7 +561,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     // Non-mutation (read) path.
     if (!parsed) {
       const { result, durationMs } = await timedQuery(request, sql);
-      if (options.captureReads && parsedRead) {
+      if (operationOptions.captureReads && parsedRead) {
         try {
           const rows = recordsetRows(result);
           emitDbReadEvents({
@@ -566,7 +570,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
             requestId,
             rows,
             rowCount: rowCountFromResult(result, rows.length),
-            options,
+            options: operationOptions,
             emittedReadRowsByRequest,
             readCallsitesByRequest,
             readStatementsByRequest,
@@ -574,7 +578,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
             context: statementContext(durationMs),
           });
         } catch (error) {
-          emitGap(options, { reason: "capture_exception", error });
+          emitGap(operationOptions, { reason: "capture_exception", error });
         }
       }
       return result;
@@ -598,12 +602,12 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
               table: mutation.table,
               requestId: reqId,
               rowCount,
-              options,
+              options: operationOptions,
               context: statementContext(durationMs),
             });
           }
         } catch (error) {
-          emitGap(options, { reason: "capture_exception", error });
+          emitGap(operationOptions, { reason: "capture_exception", error });
         }
         return result;
       };
@@ -611,7 +615,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     // The statement already carries an OUTPUT clause: run untouched and record why Crumbtrail
     // cannot distinguish its own rows from the caller's result. Never inject a second OUTPUT.
     if (hasOutputClause(sql)) {
-      emitGap(options, {
+      emitGap(operationOptions, {
         reason: "capture_exception",
         detail: "existing output clause",
       });
@@ -631,7 +635,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     // the mutation. A failing pre-SELECT must not abort a mutation that would otherwise succeed.
     let beforeByPk: Map<string, Record<string, unknown>> | undefined;
     if (
-      options.captureBefore &&
+      operationOptions.captureBefore &&
       mutation.op === "update" &&
       mutation.whereClause
     ) {
@@ -644,12 +648,12 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
         beforeByPk = new Map();
         for (const row of recordsetRows(preResult)) {
           beforeByPk.set(
-            pkKey(extractPk(row, mutation.table, options.pkColumns)),
+            pkKey(extractPk(row, mutation.table, operationOptions.pkColumns)),
             row,
           );
         }
       } catch (error) {
-        emitGap(options, { reason: "capture_exception", error });
+        emitGap(operationOptions, { reason: "capture_exception", error });
         beforeByPk = undefined;
       }
     }
@@ -659,7 +663,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
     try {
       injectedText = injectOutput(mutation.op, sql);
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
       injectedText = undefined;
     }
 
@@ -692,12 +696,12 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
             table: mutation.table,
             requestId: reqId,
             rowCount,
-            options,
+            options: operationOptions,
             context: statementContext(fallback.durationMs),
           });
         }
       } catch (error) {
-        emitGap(options, { reason: "capture_exception", error });
+        emitGap(operationOptions, { reason: "capture_exception", error });
       }
       return fallbackResult;
     }
@@ -715,7 +719,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
           rows,
           beforeByPk,
           rowCount,
-          options,
+          options: operationOptions,
           context: statementContext(durationMs),
         });
       } else if (rowCount > 0) {
@@ -726,12 +730,12 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
           table: mutation.table,
           requestId: reqId,
           rowCount,
-          options,
+          options: operationOptions,
           context: statementContext(durationMs),
         });
       }
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
 
     return stripInjectedRows(result);
@@ -752,13 +756,21 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
         }
         if (prop === "query") {
           return async (text: unknown) => {
+            const operationOptions = captureGenerationFor(options);
             try {
-              return await runInstrumentedQuery(target, recordedInputs, text);
+              return await runInstrumentedQuery(
+                target,
+                recordedInputs,
+                text,
+                operationOptions,
+              );
             } catch (error) {
               if (typeof text === "string") {
                 let requestId: string | undefined;
                 try {
-                  requestId = options.requestId ?? options.getRequestId?.();
+                  requestId =
+                    operationOptions.requestId ??
+                    operationOptions.getRequestId?.();
                 } catch {
                   requestId = undefined;
                 }
@@ -779,7 +791,7 @@ export function instrumentMssqlPool<T extends DuckTypedMssqlPool>(
                     statement: text,
                     requestId,
                     error,
-                    options,
+                    options: operationOptions,
                   });
                 }
               }
@@ -895,21 +907,23 @@ export function instrumentMssqlTransaction<T extends DuckTypedMssqlTransaction>(
         const method = Reflect.get(target, prop, receiver);
         if (typeof method !== "function") return method;
         return async (...args: unknown[]) => {
+          const operationOptions = captureGenerationFor(options);
           const result = await (
             method as (...values: unknown[]) => Promise<unknown>
           ).apply(target, args);
           let requestId: string | undefined;
           try {
-            requestId = options.requestId ?? options.getRequestId?.();
+            requestId =
+              operationOptions.requestId ?? operationOptions.getRequestId?.();
           } catch (error) {
-            emitGap(options, { reason: "capture_exception", error });
+            emitGap(operationOptions, { reason: "capture_exception", error });
           }
           if (prop === "begin") {
             transaction = startDbTransaction({
               engine: ENGINE,
               requestId,
               connection,
-              options,
+              options: operationOptions,
             });
           } else if (transaction) {
             finishDbTransaction({
@@ -917,7 +931,7 @@ export function instrumentMssqlTransaction<T extends DuckTypedMssqlTransaction>(
               transaction,
               outcome: prop === "commit" ? "commit" : "rollback",
               requestId,
-              options,
+              options: operationOptions,
             });
             transaction = undefined;
           }

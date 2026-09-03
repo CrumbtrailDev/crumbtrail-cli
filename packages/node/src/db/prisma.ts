@@ -13,9 +13,11 @@ import {
   emitImagelessDbDiff,
   isRecord,
   nextStatementSeq,
+  suppressRaceEvidence,
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
+import { captureGenerationFor } from "../capture-generation";
 
 const ENGINE = "prisma" as const;
 const instrumentedClients = new WeakMap<object, object>();
@@ -81,6 +83,9 @@ export function instrumentPrismaClient<T extends DuckTypedPrismaClient>(
   if (!isObjectLike(client)) return client;
   const existing = instrumentedClients.get(client);
   if (existing) return existing as T;
+  // Prisma query extensions do not expose transaction commit or rollback outcome.
+  // Keep diffs useful, but never present them as committed race evidence.
+  const captureOptions = suppressRaceEvidence(options);
 
   const counters: RequestCounters = {
     emittedReadRowsByRequest: new Map(),
@@ -94,7 +99,7 @@ export function instrumentPrismaClient<T extends DuckTypedPrismaClient>(
       name: "crumbtrail-database-capture",
       query: {
         $allOperations: (input) =>
-          observePrismaOperation(input, options, counters),
+          observePrismaOperation(input, captureOptions, counters),
       },
     });
     if (!isObjectLike(extended)) return client;
@@ -112,11 +117,12 @@ async function observePrismaOperation(
   options: InstrumentDbClientOptions,
   counters: RequestCounters,
 ): Promise<unknown> {
+  const operationOptions = captureGenerationFor(options);
   let requestId: string | undefined;
   try {
-    requestId = options.requestId ?? options.getRequestId?.();
+    requestId = operationOptions.requestId ?? operationOptions.getRequestId?.();
   } catch (error) {
-    emitGap(options, { reason: "capture_exception", error });
+    emitGap(operationOptions, { reason: "capture_exception", error });
     return input.query(input.args);
   }
   if (!requestId) return input.query(input.args);
@@ -130,13 +136,13 @@ async function observePrismaOperation(
     try {
       classification = classifyStatement(rawStatement);
       if (classification.kind === "unparsable" && classification.mayMutate) {
-        emitGap(options, {
+        emitGap(operationOptions, {
           reason: "unparsed_sql",
           detail: leadingSqlKeyword(rawStatement),
         });
       }
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
   }
 
@@ -153,7 +159,7 @@ async function observePrismaOperation(
         statement: rawStatement,
         requestId,
         error,
-        options,
+        options: operationOptions,
       });
     }
     throw error;
@@ -167,7 +173,7 @@ async function observePrismaOperation(
         args: input.args,
         result,
         requestId,
-        options,
+        options: operationOptions,
         counters,
       });
     } else if (rawStatement) {
@@ -176,12 +182,12 @@ async function observePrismaOperation(
         classification,
         result,
         requestId,
-        options,
+        options: operationOptions,
         counters,
       });
     }
   } catch (error) {
-    emitGap(options, { reason: "capture_exception", error });
+    emitGap(operationOptions, { reason: "capture_exception", error });
   }
   return result;
 }
@@ -228,6 +234,7 @@ function captureModelResult(input: {
       requestId: input.requestId,
       rows,
       rowCount,
+      bulk: mutation.bulk,
       beforeImageStatus: modelBeforeImageStatus(
         input.operation,
         input.args,

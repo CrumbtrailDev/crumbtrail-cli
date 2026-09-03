@@ -25,6 +25,22 @@ export type {
 } from "./cache";
 
 export {
+  RACE_EVIDENCE_IDENTIFIER_LENGTH,
+  RACE_EVIDENCE_IDENTIFIER_PATTERN,
+  createHmacRaceEvidenceResolver,
+  isRaceEligibleCacheOperation,
+} from "./race-evidence";
+
+export type {
+  RaceEvidenceIdentifiers,
+  RaceEvidenceOptions,
+  RaceEvidenceInstrumentationOptions,
+  RaceEvidenceResolver,
+  RaceEvidenceResolverInput,
+  RaceEvidenceSurface,
+} from "./race-evidence";
+
+export {
   buildDbDiffEvent,
   buildDbReadBulkEvent,
   buildDbReadEvent,
@@ -39,6 +55,8 @@ export {
   instrumentMysqlClient,
   instrumentNeonHttpQuery,
   instrumentPlanetScaleClient,
+  instrumentMongoClient,
+  instrumentPrismaClient,
   instrumentPgClient,
   // Reachable from the package root on purpose: an ESM app loads postgres.js as
   // a different module instance than the one auto instrumentation can patch, so
@@ -69,6 +87,10 @@ export type {
   DuckTypedPlanetScaleClient,
   DuckTypedPlanetScaleConnection,
   DuckTypedPlanetScaleResult,
+  DuckTypedMongoClient,
+  DuckTypedPrismaClient,
+  DuckTypedPrismaExtension,
+  DuckTypedPrismaQueryInput,
   DuckTypedPgClient,
   DuckTypedPgQueryResult,
   DuckTypedSqliteDatabase,

@@ -5,6 +5,17 @@ import {
   type CacheDriver,
   type CacheOperationSummary,
 } from "./event";
+import {
+  readInstrumentRaceEvidence,
+  type RaceEvidenceOptions,
+  type RaceEvidenceInstrumentationOptions,
+} from "../race-evidence";
+import {
+  captureGenerationFor,
+  ownsCaptureGeneration,
+  type CaptureGeneration,
+  type CaptureGenerationState,
+} from "../capture-generation";
 
 export interface DuckTypedCacheClient {
   [method: string]: unknown;
@@ -14,9 +25,16 @@ export interface InstrumentCacheClientOptions {
   requestId?: string;
   getRequestId?: () => string | undefined;
   sessionId?: string;
-  emit: (event: BugEvent) => void;
+  emit: (event: BugEvent, generation?: CaptureGenerationState) => void;
+  /** Internal auto-capture ownership token captured when an operation starts. */
+  captureGeneration?: CaptureGenerationState;
+  /** Internal auto-capture generation resolver for operation start. */
+  getCaptureGeneration?: () => CaptureGeneration | undefined;
   now?: () => number;
   sessionStartedAt?: number | Date;
+  raceEvidence?: RaceEvidenceInstrumentationOptions;
+  /** Resolve race evidence configuration when each event is built. */
+  getRaceEvidence?: () => RaceEvidenceOptions | undefined;
 }
 
 const INSTRUMENTED = Symbol.for("crumbtrail.cache.instrumented");
@@ -39,6 +57,7 @@ interface OperationCapture {
 interface BatchCapture {
   mode: "pipeline" | "transaction";
   queuedTransaction: boolean;
+  options: InstrumentCacheClientOptions;
   terminal: boolean;
   operationCount: number;
   operations: string[];
@@ -91,12 +110,13 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
       const operationName = normalizeMethod(property);
       if (operationName === "multi" || operationName === "pipeline") {
         const wrapped = (...args: unknown[]) => {
+          const operationOptions = captureGenerationFor(options);
           if (
             driver === "ioredis" &&
             operationName === "multi" &&
             isQueuedIoredisTransaction(driver, operationName, args)
           ) {
-            const capture = createQueuedTransactionCapture();
+            const capture = createQueuedTransactionCapture(operationOptions);
             queuedTransaction = capture;
             const isCurrent = () => queuedTransaction === capture;
             const clear = () => {
@@ -109,13 +129,18 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
               capture.startStatus = "rejected";
               capture.terminal = true;
               clear();
-              emitQueuedTransactionFailure(driver, options, error, capture);
+              emitQueuedTransactionFailure(
+                driver,
+                operationOptions,
+                error,
+                capture,
+              );
               throw error;
             }
             return wrapQueuedTransactionStart(
               result,
               driver,
-              options,
+              operationOptions,
               capture,
               isCurrent,
               clear,
@@ -126,7 +151,7 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
             result,
             driver,
             operationName === "multi" ? "transaction" : "pipeline",
-            options,
+            operationOptions,
             constructorBatchCommands(args),
           );
         };
@@ -146,7 +171,7 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
                 queuedTransaction = undefined;
                 emitQueuedTransactionFailure(
                   driver,
-                  options,
+                  transaction.options,
                   error,
                   transaction,
                 );
@@ -155,7 +180,7 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
               return wrapQueuedTransactionExecution(
                 execution,
                 driver,
-                options,
+                transaction.options,
                 transaction,
                 () => {
                   if (queuedTransaction === transaction) {
@@ -180,11 +205,13 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
           recordBatchOperation(transaction, operationName, args);
           return commandResult;
         }
+        const operationOptions = captureGenerationFor(options);
         const result = Reflect.apply(original, target, args);
         let requestId: string | undefined;
         let capture: OperationCapture | undefined;
         try {
-          requestId = options.requestId ?? options.getRequestId?.();
+          requestId =
+            operationOptions.requestId ?? operationOptions.getRequestId?.();
           capture = describeOperation(operationName, args);
         } catch {
           return result;
@@ -192,7 +219,7 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
         if (!requestId || !capture || !isThenable(result)) return result;
         return result.then(
           (value: unknown) => {
-            emitSafely(options, {
+            emitSafely(operationOptions, {
               driver,
               op: capture.op,
               keys: capture.keys,
@@ -204,11 +231,12 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
                 : capture.value !== undefined
                   ? { value: capture.value }
                   : {}),
+              raceEvidence: readInstrumentRaceEvidence(operationOptions),
             });
             return value;
           },
           (error: unknown) => {
-            emitSafely(options, {
+            emitSafely(operationOptions, {
               driver,
               op: capture.op,
               keys: capture.keys,
@@ -349,10 +377,13 @@ function wrapQueuedTransactionStart(
   );
 }
 
-function createQueuedTransactionCapture(): QueuedTransactionCapture {
+function createQueuedTransactionCapture(
+  options: InstrumentCacheClientOptions,
+): QueuedTransactionCapture {
   return {
     mode: "transaction",
     queuedTransaction: true,
+    options,
     terminal: false,
     startStatus: "pending",
     operationCount: 0,
@@ -445,6 +476,7 @@ function wrapBatch(
   const capture: BatchCapture = {
     mode,
     queuedTransaction,
+    options,
     terminal: false,
     operationCount: 0,
     operations: [],
@@ -861,6 +893,7 @@ function emitSafely(
   options: InstrumentCacheClientOptions,
   input: Omit<BuildCacheEventInput, "sessionId" | "now" | "sessionStartedAt">,
 ): void {
+  if (!ownsCaptureGeneration(options)) return;
   try {
     options.emit(
       buildCacheEvent({
@@ -869,6 +902,7 @@ function emitSafely(
         now: options.now?.(),
         sessionStartedAt: options.sessionStartedAt,
       }),
+      options.captureGeneration,
     );
   } catch {
     // Instrumentation cannot fail a host cache operation.

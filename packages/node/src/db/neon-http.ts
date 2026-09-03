@@ -14,11 +14,13 @@ import {
   emitDbReadEvents,
   emitDbStatementEvent,
   emitImagelessDbDiff,
+  suppressRaceEvidence,
   isRecord,
   nextStatementSeq,
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
+import { captureGenerationFor } from "../capture-generation";
 
 export type DuckTypedNeonHttpQuery = ((...args: unknown[]) => unknown) & {
   query?: (sql: string, params?: unknown[], options?: unknown) => unknown;
@@ -34,6 +36,16 @@ interface RequestCounters {
 
 const ENGINE = "postgres" as const;
 const INSTRUMENTED = Symbol.for("crumbtrail.db.neonHttpInstrumented");
+
+interface NeonQueryCapture {
+  suppressRaceEvidence: boolean;
+}
+
+// Array transactions receive promises that were created by the outer sql
+// function before transaction() sees them. Keep a weak association so the
+// transaction overload can suppress only those promises without changing
+// standalone query behavior.
+const queryCaptures = new WeakMap<object, NeonQueryCapture>();
 
 function newCounters(): RequestCounters {
   return {
@@ -139,13 +151,14 @@ function runCaptured(
   options: InstrumentDbClientOptions,
   counters: RequestCounters,
 ): unknown {
+  const operationOptions = captureGenerationFor(options);
   let parsed: ParsedMutation | undefined;
   let parsedRead: ParsedRead | undefined;
   let requestId: string | undefined;
   try {
     const classification = classifyStatement(text);
     if (classification.kind === "unparsable" && classification.mayMutate) {
-      emitGap(options, {
+      emitGap(operationOptions, {
         reason: "unparsed_sql",
         detail: leadingSqlKeyword(text),
       });
@@ -154,9 +167,9 @@ function runCaptured(
       classification.kind === "mutation" ? classification.mutation : undefined;
     parsedRead =
       classification.kind === "read" ? classification.read : undefined;
-    requestId = options.requestId ?? options.getRequestId?.();
+    requestId = operationOptions.requestId ?? operationOptions.getRequestId?.();
   } catch (error) {
-    emitGap(options, { reason: "capture_exception", error });
+    emitGap(operationOptions, { reason: "capture_exception", error });
     return invoke(text);
   }
   if (!requestId) return invoke(text);
@@ -166,7 +179,7 @@ function runCaptured(
     try {
       executedText = ensureReturning(text);
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
   }
 
@@ -181,13 +194,17 @@ function runCaptured(
       statement: text,
       requestId,
       error,
-      options,
+      options: operationOptions,
     });
     throw error;
   }
 
+  const capture: NeonQueryCapture = { suppressRaceEvidence: false };
   const observed = Promise.resolve(hostResult).then(
     (result) => {
+      const eventOptions = capture?.suppressRaceEvidence
+        ? suppressRaceEvidence(operationOptions)
+        : operationOptions;
       emitDbStatementEvent({
         engine: ENGINE,
         op: parsed?.op ?? (parsedRead ? "select" : "other"),
@@ -196,7 +213,7 @@ function runCaptured(
         rowCount: resultRowCount(result),
         seq: nextStatementSeq(counters.statementsByRequest, requestId),
         requestId,
-        options,
+        options: operationOptions,
       });
       try {
         const rows = resultRows(result);
@@ -210,7 +227,7 @@ function runCaptured(
               requestId,
               rows,
               rowCount,
-              options,
+              options: eventOptions,
             });
           } else {
             emitImagelessDbDiff({
@@ -219,17 +236,17 @@ function runCaptured(
               table: parsed.table,
               requestId,
               rowCount,
-              options,
+              options: eventOptions,
             });
           }
-        } else if (options.captureReads && parsedRead) {
+        } else if (eventOptions.captureReads && parsedRead) {
           emitDbReadEvents({
             engine: ENGINE,
             table: parsedRead.table,
             requestId,
             rows,
             rowCount,
-            options,
+            options: eventOptions,
             emittedReadRowsByRequest: counters.emittedReadRowsByRequest,
             readCallsitesByRequest: counters.readCallsitesByRequest,
             readStatementsByRequest: counters.readStatementsByRequest,
@@ -238,7 +255,7 @@ function runCaptured(
           });
         }
       } catch (error) {
-        emitGap(options, { reason: "capture_exception", error });
+        emitGap(operationOptions, { reason: "capture_exception", error });
       }
       return result;
     },
@@ -250,11 +267,14 @@ function runCaptured(
         statement: text,
         requestId,
         error,
-        options,
+        options: operationOptions,
       });
       throw error;
     },
   );
+  if (observed && (typeof observed === "object" || typeof observed === "function")) {
+    queryCaptures.set(observed, capture);
+  }
   preserveQueryMetadata(hostResult, observed);
   return observed;
 }
@@ -270,6 +290,7 @@ export function instrumentNeonHttpQuery<T>(
 
   return new Proxy(sql, {
     apply(target, thisArg, args) {
+      const operationOptions = captureGenerationFor(options);
       const text = plannedTextFor(args);
       if (!text) {
         try {
@@ -278,9 +299,9 @@ export function instrumentNeonHttpQuery<T>(
             : "";
           if (
             looksLikePotentialWrite(staticText) &&
-            (options.requestId ?? options.getRequestId?.())
+            (operationOptions.requestId ?? operationOptions.getRequestId?.())
           ) {
-            emitGap(options, {
+            emitGap(operationOptions, {
               reason: "unparsed_sql",
               detail: leadingSqlKeyword(staticText),
             });
@@ -300,30 +321,47 @@ export function instrumentNeonHttpQuery<T>(
               ? args
               : rewrittenTemplateArgs(args, statement, text),
           ),
-        options,
+        operationOptions,
         counters,
       );
     },
     get(target, prop, receiver) {
       if (prop === INSTRUMENTED) return true;
       if (prop === "query" && typeof target.query === "function") {
-        return (text: string, params?: unknown[], queryOptions?: unknown) =>
-          typeof text === "string"
+        return (text: string, params?: unknown[], queryOptions?: unknown) => {
+          const operationOptions = captureGenerationFor(options);
+          return typeof text === "string"
             ? runCaptured(
                 text,
                 (statement) => target.query!(statement, params, queryOptions),
-                options,
+                operationOptions,
                 counters,
               )
             : target.query!(text, params, queryOptions);
+        };
       }
       if (prop === "transaction" && typeof target.transaction === "function") {
         return (...args: unknown[]) => {
+          const operationOptions = captureGenerationFor(options);
+          // Neon HTTP does not expose the surrounding transaction outcome to
+          // this callback. Keep ordinary events, but never claim its inner
+          // writes are committed race evidence.
+          const transactionOptions = suppressRaceEvidence(operationOptions);
           const next = [...args];
-          if (typeof next[0] === "function") {
+          if (Array.isArray(next[0])) {
+            for (const query of next[0]) {
+              if (
+                query &&
+                (typeof query === "object" || typeof query === "function")
+              ) {
+                const capture = queryCaptures.get(query);
+                if (capture) capture.suppressRaceEvidence = true;
+              }
+            }
+          } else if (typeof next[0] === "function") {
             const fn = next[0] as (tx: DuckTypedNeonHttpQuery) => unknown;
             next[0] = (tx: DuckTypedNeonHttpQuery) =>
-              fn(instrumentNeonHttpQuery(tx, options));
+              fn(instrumentNeonHttpQuery(tx, transactionOptions));
           }
           return (
             target.transaction as (...values: unknown[]) => unknown

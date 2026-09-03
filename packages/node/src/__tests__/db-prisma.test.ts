@@ -191,6 +191,72 @@ describe("instrumentPrismaClient", () => {
     });
   });
 
+  it("preserves bulk semantics when a returning bulk mutation yields one row", async () => {
+    const { client, events } = setup({
+      raceEvidence: {
+        enabled: true,
+        identifiers: { entityHash: "e".repeat(64) },
+      },
+    });
+
+    await client.run(
+      {
+        model: "Ledger",
+        operation: "updateManyAndReturn",
+        args: { where: { id: 1 }, data: { state: "closed" } },
+      },
+      [{ id: 1, state: "closed" }],
+    );
+    await client.run(
+      {
+        model: "Ledger",
+        operation: "createManyAndReturn",
+        args: { data: [{ id: 2 }] },
+      },
+      [{ id: 2 }],
+    );
+
+    const diffs = events.filter((event) => event.k === "db.diff");
+    expect(diffs).toHaveLength(2);
+    expect(diffs.every((event) => event.d.raceEvidence === undefined)).toBe(
+      true,
+    );
+  });
+
+  it("suppresses race evidence for successful and failed work without transaction outcome", async () => {
+    const { client, events } = setup({
+      raceEvidence: {
+        enabled: true,
+        identifiers: { entityHash: "e".repeat(64) },
+      },
+    });
+    const failure = new Error("rolled back");
+
+    await client.run(
+      {
+        model: "Order",
+        operation: "update",
+        args: { where: { id: 4 }, data: { state: "paid" } },
+      },
+      { id: 4, state: "paid" },
+    );
+    await expect(
+      client.reject(
+        {
+          model: "Order",
+          operation: "update",
+          args: { where: { id: 4 }, data: { state: "rolled-back" } },
+        },
+        failure,
+      ),
+    ).rejects.toBe(failure);
+
+    expect(events.filter((event) => event.k === "db.diff")).toHaveLength(1);
+    expect(
+      events.find((event) => event.k === "db.diff")?.d.raceEvidence,
+    ).toBeUndefined();
+  });
+
   it("keeps upsert distinct when Prisma cannot reveal which branch ran", async () => {
     const { client, events } = setup();
 
