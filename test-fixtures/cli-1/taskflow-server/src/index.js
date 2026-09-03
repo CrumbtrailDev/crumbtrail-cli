@@ -1,8 +1,7 @@
-import { createCrumbtrailExpressMiddleware } from "crumbtrail-node";
+import { attachCrumbtrail, attachCrumbtrailErrors } from "./crumbtrail.js";
 
-const ENDPOINT = process.env.CRUMBTRAIL_ENDPOINT;
-const API_KEY = process.env.CRUMBTRAIL_API_KEY;
+const app = express();
 
-app.use(
-  createCrumbtrailExpressMiddleware({ endpoint: ENDPOINT, authToken: API_KEY }),
-);
+// Optional Crumbtrail backend capture (no-op unless CRUMBTRAIL_ENDPOINT is set).
+await attachCrumbtrail(app);
+await attachCrumbtrailErrors(app);

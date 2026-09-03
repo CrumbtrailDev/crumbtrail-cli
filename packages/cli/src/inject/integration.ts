@@ -133,6 +133,10 @@ function inspectionFiles(
       files.push({ file, text });
       if (files.length >= maxFiles) break;
     }
+    // The repository is the boundary. Without it the walk reaches the user's
+    // home directory and the filesystem root, and names harvested from an
+    // unrelated project above the checkout become hazards in this one.
+    if (input.io.exists(path.join(dir, ".git"))) break;
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
@@ -366,21 +370,94 @@ function declaredServiceName(source: string): string | undefined {
   return match?.[1];
 }
 
-function blockDepthAt(mask: string, offset: number): number {
-  let depth = 0;
+/** Offsets of the `{` of every block still open at `offset`, outermost first. */
+function openBlocksAt(mask: string, offset: number): number[] {
+  const stack: number[] = [];
   for (let i = 0; i < offset; i += 1) {
-    if (mask[i] === "{") depth += 1;
-    else if (mask[i] === "}") depth -= 1;
+    if (mask[i] === "{") stack.push(i);
+    else if (mask[i] === "}") stack.pop();
   }
-  return depth;
+  return stack;
 }
 
-function isGuardedCallSite(source: string, open: number): boolean {
+/** Index just past the `)` closing the `(` at `from`, or -1. */
+function closingParen(mask: string, from: number): number {
+  let depth = 0;
+  for (let i = from; i < mask.length; i += 1) {
+    if (mask[i] === "(") depth += 1;
+    else if (mask[i] === ")") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The condition of an `if` whose body starts at `at`, or undefined when `at` is
+ * not the head of an `if` body. `at` is the `{` of a block or the first token of
+ * a single-statement body.
+ */
+function ifConditionBefore(
+  mask: string,
+  source: string,
+  at: number,
+): string | undefined {
+  const lineStart = mask.lastIndexOf("\n", at - 1) + 1;
+  const prefix = mask.slice(lineStart, at);
+  let found: string | undefined;
+  for (const match of prefix.matchAll(/\bif\s*\(/g)) {
+    const openParen = lineStart + match.index + match[0].length - 1;
+    const close = closingParen(mask, openParen);
+    if (close === -1 || close >= at) continue;
+    // Anything statement-ending between the condition and `at` means this `if`
+    // finished before the call site: `if (a) f(); g({…})` does not guard `g`.
+    if (/[;{}]/.test(mask.slice(close + 1, at))) continue;
+    found = source.slice(openParen + 1, close).trim();
+  }
+  return found;
+}
+
+/**
+ * A block the CLI itself emits around its own wiring, which always runs when
+ * the key is present and is therefore not an unknown guard. The node snippet
+ * writes `if (<keyExpr>) { … }` and the Express one `if (<keyExpr>) app.use(…)`;
+ * a Nuxt plugin body is unconditional startup code that Nuxt always invokes.
+ */
+function isKnownWrapper(
+  condition: string | undefined,
+  before: string,
+  keyExpr?: string,
+): boolean {
+  if (condition !== undefined)
+    return keyExpr !== undefined && condition === keyExpr;
+  return /\bdefineNuxtPlugin\s*\(\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)?\s*=>\s*$/.test(
+    before,
+  );
+}
+
+/**
+ * Whether reaching this call site depends on something this planner cannot see:
+ * an enclosing block, or an `if` on the same statement. The CLI's own key guard
+ * and a Nuxt plugin body are the exceptions, so a project the CLI wired is not
+ * refused on its next run.
+ */
+function isGuardedCallSite(
+  source: string,
+  open: number,
+  keyExpr?: string,
+): boolean {
   const mask = maskLiterals(source);
   if (mask === null) return true;
-  if (blockDepthAt(mask, open) > 0) return true;
-  const lineStart = mask.lastIndexOf("\n", open) + 1;
-  return /\bif\s*\([^)]*\)\s*$/.test(mask.slice(lineStart, open));
+  for (const brace of openBlocksAt(mask, open)) {
+    const condition = ifConditionBefore(mask, source, brace);
+    const before = mask.slice(mask.lastIndexOf("\n", brace - 1) + 1, brace);
+    if (!isKnownWrapper(condition, before, keyExpr)) return true;
+  }
+  // The call's own statement. `open` is the options object's `{`, so the guard
+  // sits behind the callee expression rather than immediately before it.
+  const condition = ifConditionBefore(mask, source, open);
+  return condition !== undefined && condition !== keyExpr;
 }
 
 function hazardsFor(
@@ -398,12 +475,7 @@ function hazardsFor(
         site.keys.get("authToken") === "__crumbtrailKey" &&
         /const\s+__crumbtrailKey\s*=\s*process\.env\./.test(entry.text) &&
         entry.text.includes('import("crumbtrail-node")');
-      if (
-        site.callee !== "createCrumbtrailExpressMiddleware" &&
-        site.callee !== "createCrumbtrailExpressErrorMiddleware" &&
-        !generatedNodeInit &&
-        isGuardedCallSite(entry.text, site.open)
-      ) {
+      if (isGuardedCallSite(entry.text, site.open, keyRef?.expr)) {
         hazards.add("guarded-init");
       }
       if (

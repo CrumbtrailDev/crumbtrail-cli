@@ -244,6 +244,18 @@ describe("inspectIntegration", () => {
     expect(serverPlan.kind).toBe("needs-hands");
     expect(clientPlan.content).toBeNull();
     expect(serverPlan.content).toBeNull();
+    // Each half names every reason it is unsafe. The server reaches its
+    // middleware through a function behind an endpoint check and a dynamic
+    // import, which is the same unknown startup path as the client's.
+    expect(clientPlan.integration?.hazards).toEqual([
+      "guarded-init",
+      "transport-instance",
+      "other-key-channel",
+    ]);
+    expect(serverPlan.integration?.hazards).toEqual([
+      "guarded-init",
+      "other-key-channel",
+    ]);
     expect(clientPlan.integration?.existingEnvVars).toEqual([
       "VITE_CRUMBTRAIL_ENDPOINT",
       "VITE_CRUMBTRAIL_API_KEY",
@@ -303,6 +315,157 @@ describe("inspectIntegration", () => {
       "autoCapture({ service })",
     );
     expect(plan.integration?.instructions.join(" ")).not.toContain("service:");
+  });
+
+  describe("guarded-init", () => {
+    const hazardsFor = (
+      source: string,
+      recipe: "vite-spa" | "express" | "nuxt" = "vite-spa",
+      entry = p("src", "main.tsx"),
+    ) =>
+      inspectIntegration({
+        cwd: CWD,
+        recipe,
+        endpoint: ENDPOINT,
+        entryFile: entry,
+        serviceName: "web",
+        io: fakeInjectIO({
+          [p("package.json")]: JSON.stringify({
+            dependencies: {
+              "crumbtrail-core": "0.47.0",
+              "crumbtrail-node": "0.47.0",
+            },
+          }),
+          [p("node_modules", "crumbtrail-core", "package.json")]: "{}",
+          [p("node_modules", "crumbtrail-node", "package.json")]: "{}",
+          [entry]: source,
+        }),
+      }).hazards;
+
+    it("flags a top level init that only runs behind a condition", () => {
+      expect(
+        hazardsFor(
+          'import { Crumbtrail } from "crumbtrail-core";\n' +
+            "if (import.meta.env.PROD) Crumbtrail.init({\n" +
+            `  httpEndpoint: "${ENDPOINT}",\n` +
+            "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,\n" +
+            "});\n",
+        ),
+      ).toContain("guarded-init");
+    });
+
+    it("flags an init only a dynamic import inside a function reaches", () => {
+      expect(
+        hazardsFor(
+          "export async function boot() {\n" +
+            '  const { Crumbtrail } = await import("crumbtrail-core");\n' +
+            `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY });\n` +
+            "}\n",
+        ),
+      ).toContain("guarded-init");
+    });
+
+    it("flags a top level try, which is still a startup path this cannot see", () => {
+      expect(
+        hazardsFor(
+          "try {\n" +
+            `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY });\n` +
+            "} catch {}\n",
+        ),
+      ).toContain("guarded-init");
+    });
+
+    it("leaves a plain top level init alone", () => {
+      expect(
+        hazardsFor(
+          'import { Crumbtrail } from "crumbtrail-core";\n' +
+            "Crumbtrail.init({\n" +
+            `  httpEndpoint: "${ENDPOINT}",\n` +
+            "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,\n" +
+            "});\n",
+        ),
+      ).toEqual([]);
+    });
+
+    // A run that refused the wiring it wrote itself would make the wizard
+    // unrepeatable. Both of these are exactly what the injector emits.
+    it("leaves this CLI's own key guarded Express wiring alone", () => {
+      expect(
+        hazardsFor(
+          'import { createCrumbtrailExpressMiddleware } from "crumbtrail-node";\n' +
+            "if (process.env.CRUMBTRAIL_KEY) app.use(createCrumbtrailExpressMiddleware({ " +
+            `endpoint: "${ENDPOINT}", authToken: process.env.CRUMBTRAIL_KEY, service: undefined }));\n`,
+          "express",
+          p("src", "index.js"),
+        ),
+      ).not.toContain("guarded-init");
+    });
+
+    it("leaves this CLI's own Nuxt plugin body alone", () => {
+      expect(
+        hazardsFor(
+          'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";\n\n' +
+            "export default defineNuxtPlugin(() => {\n" +
+            "  Crumbtrail.init({\n" +
+            "    ...PRESET_PASSIVE,\n" +
+            `    httpEndpoint: "${ENDPOINT}",\n` +
+            "    httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,\n" +
+            "  });\n" +
+            "});\n",
+          "nuxt",
+          p("plugins", "crumbtrail.client.ts"),
+        ),
+      ).toEqual([]);
+    });
+  });
+
+  describe("other-key-channel", () => {
+    const viteHazards = (source: string, envExample: string) =>
+      inspectIntegration({
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.tsx"),
+        serviceName: "web",
+        io: fakeInjectIO({
+          [p("package.json")]: JSON.stringify({
+            dependencies: { "crumbtrail-core": "0.47.0" },
+          }),
+          [p("node_modules", "crumbtrail-core", "package.json")]: "{}",
+          [p("src", "main.tsx")]: source,
+          [p(".env.example")]: envExample,
+        }),
+      }).hazards;
+
+    const init = (token: string) =>
+      'import { Crumbtrail } from "crumbtrail-core";\n' +
+      `Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: ${token}, service: "web" });\n`;
+
+    it("accepts the key expression this recipe would have written itself", () => {
+      expect(
+        viteHazards(
+          init("import.meta.env.VITE_CRUMBTRAIL_KEY"),
+          "VITE_CRUMBTRAIL_KEY=\n",
+        ),
+      ).toEqual([]);
+    });
+
+    it("flags a key read through any other expression", () => {
+      expect(
+        viteHazards(init("window.__KEY"), "VITE_CRUMBTRAIL_KEY=\n"),
+      ).toEqual(["other-key-channel"]);
+    });
+
+    // The taskflow name. Pasting this run's key into VITE_CRUMBTRAIL_KEY would
+    // leave the variable the customer's build actually reads unset.
+    it("flags a second Crumbtrail key variable the project already names", () => {
+      expect(
+        viteHazards(
+          init("import.meta.env.VITE_CRUMBTRAIL_KEY"),
+          "VITE_CRUMBTRAIL_ENDPOINT=\nVITE_CRUMBTRAIL_API_KEY=\n",
+        ),
+      ).toEqual(["other-key-channel"]);
+    });
   });
 
   it("does not call a local only helper complete", () => {
