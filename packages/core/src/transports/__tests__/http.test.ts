@@ -228,6 +228,7 @@ describe("HttpTransport", () => {
     )!;
     expect(call[1].headers["Content-Type"]).toBe("image/png");
     expect(call[1].headers).not.toHaveProperty("X-Metadata");
+    expect(call[1].keepalive).toBeUndefined();
   });
 
   it("sends a bug report without a voice blob using a single request", async () => {

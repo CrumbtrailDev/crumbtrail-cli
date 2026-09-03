@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Crumbtrail } from "../crumbtrail";
+import {
+  Crumbtrail,
+  PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
+} from "../crumbtrail";
 import {
   REPORT_SCREENSHOT_MAX_BYTES,
   REPORT_SCREENSHOT_MAX_EDGE,
@@ -302,12 +305,21 @@ describe("report screenshot API", () => {
     document.dispatchEvent(new Event("visibilitychange"));
     await vi.advanceTimersByTimeAsync(0);
     expect(transport.endSession).not.toHaveBeenCalled();
+    await logger.flagBug({ visualArtifactName: oldArtifactName });
+    expect(transport.sendBugReport).not.toHaveBeenCalled();
+    const lifecycleClose = (
+      logger as unknown as {
+        lifecycleClosePromise?: Promise<void>;
+      }
+    ).lifecycleClosePromise;
+    expect(lifecycleClose).toBeDefined();
 
     finishUpload();
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
     await expect(capture).rejects.toThrow("active session");
+    await lifecycleClose;
 
     // The lifecycle close waited for the pending upload. Visibility then starts a fresh session,
     // and the old name must not become eligible in that new session.
@@ -330,6 +342,84 @@ describe("report screenshot API", () => {
         (events.find((event) => event.k === "bug.flag")?.d ?? {}),
     ).toBe(false);
     await logger.stop();
+    vi.useRealTimers();
+  });
+
+  it("orders a nonpersisted pagehide after a completed screenshot upload", async () => {
+    const order: string[] = [];
+    const transport = makeTransport();
+    let finishUpload!: () => void;
+    const uploadFinished = new Promise<void>((resolve) => {
+      finishUpload = resolve;
+    });
+    transport.sendBlob.mockImplementationOnce(async () => {
+      order.push("blob-start");
+      await uploadFinished;
+      order.push("blob-done");
+    });
+    transport.endSession.mockImplementationOnce(async () => {
+      order.push("endSession");
+    });
+    const logger = init(transport);
+    const capture = logger.captureScreenshot(imageBlob(png()));
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(order).toEqual(["blob-start"]);
+
+    window.dispatchEvent(new Event("pagehide"));
+    await Promise.resolve();
+    expect(order).toEqual(["blob-start"]);
+
+    finishUpload();
+    await expect(capture).rejects.toThrow("active session");
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(order).toEqual(["blob-start", "blob-done", "endSession"]);
+    await logger.stop();
+  });
+
+  it("ends after a pagehide upload fails", async () => {
+    const order: string[] = [];
+    const transport = makeTransport();
+    transport.sendBlob.mockImplementationOnce(async () => {
+      order.push("blob-start");
+      order.push("blob-done");
+      throw new Error("upload failed");
+    });
+    transport.endSession.mockImplementationOnce(async () => {
+      order.push("endSession");
+    });
+    const logger = init(transport);
+    const capture = logger.captureScreenshot(imageBlob(png()));
+    await expect(capture).rejects.toThrow("upload failed");
+
+    window.dispatchEvent(new Event("pagehide"));
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(order).toEqual(["blob-start", "blob-done", "endSession"]);
+    await logger.stop();
+  });
+
+  it("bounds a never settling pagehide upload without sending session end", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    transport.sendBlob.mockImplementationOnce(async () => {
+      await new Promise<void>(() => {});
+    });
+    const logger = init(transport);
+    const capture = logger.captureScreenshot(imageBlob(png()));
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(transport.sendBlob).toHaveBeenCalledOnce();
+
+    window.dispatchEvent(new Event("pagehide"));
+    await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
+    expect(transport.endSession).not.toHaveBeenCalled();
+    await expect(logger.captureScreenshot(imageBlob(png()))).rejects.toThrow(
+      "active session",
+    );
+    // The timed out pending send is removed from shutdown tracking, so stop remains bounded too.
+    await expect(logger.stop()).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(transport.endSession).not.toHaveBeenCalled();
+    void capture.catch(() => {});
     vi.useRealTimers();
   });
 });

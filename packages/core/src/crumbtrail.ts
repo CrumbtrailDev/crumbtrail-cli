@@ -393,6 +393,13 @@ const SEVERITY_FLUSH_MIN_INTERVAL_MS = 1000;
 const PAGE_HIDDEN_END_DELAY_MS = 0;
 
 /**
+ * A nonpersisted pagehide cannot keep a browser alive for an arbitrary upload. Give already
+ * admitted sends a short chance to finish, then leave the session open for the server's TTL
+ * rather than ending it ahead of evidence that may still be on the wire.
+ */
+export const PAGEHIDE_PENDING_SEND_TIMEOUT_MS = 5_000;
+
+/**
  * Transport that drops every call. Backs the inert instance returned when
  * `init()` runs outside a browser, guaranteeing no socket is opened during SSR
  * or a build step.
@@ -782,9 +789,8 @@ export class Crumbtrail {
           bus.flush();
           return;
         }
-        // Start the keepalive end request before the unload task can be
-        // discarded. The orderly path used for a page that is merely hidden
-        // can await its event sends; a real navigation or tab close cannot.
+        // Defer the keepalive end request until already admitted sends settle. A real navigation
+        // may terminate this task first, in which case the server's session TTL finalizes it.
         void instance.closeForLifecycle(true);
       };
       const onPageShow = (event: Event & { persisted?: boolean }) => {
@@ -1851,7 +1857,6 @@ export class Crumbtrail {
    */
   private closeForLifecycle(immediateEnd: boolean): Promise<void> {
     if (this.stopped || this.lifecycleSuspended || this.lifecycleClosePromise) {
-      if (immediateEnd) this.startLifecycleEnd();
       return this.lifecycleClosePromise ?? Promise.resolve();
     }
 
@@ -1861,9 +1866,13 @@ export class Crumbtrail {
       this.bus.flush();
       this.lifecycleClosing = true;
       try {
-        if (immediateEnd) this.startLifecycleEnd();
         await this.sessionMetadataWrite;
-        await Promise.allSettled([...this.pendingSends]);
+        const pendingSettled = await this.waitForLifecycleSends(immediateEnd);
+        if (!pendingSettled) {
+          this.lifecycleSuspended = true;
+          this.sessionStarted = false;
+          return;
+        }
 
         const replay = this.replay;
         this.replay = undefined;
@@ -1879,7 +1888,7 @@ export class Crumbtrail {
           this.deferredDeliveryGaps = [];
           await this.transport.sendEvents(deferred).catch(() => {});
         }
-        if (!immediateEnd) this.startLifecycleEnd();
+        this.startLifecycleEnd();
         await this.lifecycleEndPromise;
         this.lifecycleSuspended = true;
       } finally {
@@ -1890,6 +1899,40 @@ export class Crumbtrail {
       this.lifecycleEndPromise = undefined;
     });
     return this.lifecycleClosePromise;
+  }
+
+  /**
+   * Wait for in-flight delivery before finalizing a session. Ordinary hidden-page suspension can
+   * wait without a deadline. A nonpersisted pagehide gets a bounded wait because the page may be
+   * torn down at any moment, and a late end request is worse than letting the server TTL reclaim
+   * a session whose last upload did not finish.
+   */
+  private async waitForLifecycleSends(immediateEnd: boolean): Promise<boolean> {
+    const pending = [...this.pendingSends];
+    if (pending.length === 0) return true;
+    const settled = Promise.allSettled(pending).then(() => true);
+    if (!immediateEnd) {
+      await settled;
+      return true;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const completed = await Promise.race([
+      settled,
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(
+          () => resolve(false),
+          PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (!completed) {
+      // Do not let a transport that never settles keep a later explicit stop() hostage. The page
+      // is already closing and the server can finalize this still-open session by TTL.
+      for (const send of pending) this.pendingSends.delete(send);
+    }
+    return completed;
   }
 
   /** Start the unload safe close without waiting for async teardown work. */
