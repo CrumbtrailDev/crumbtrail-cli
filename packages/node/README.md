@@ -62,6 +62,8 @@ ever imported) so INSERT/UPDATE/DELETE statements executed inside a request scop
 Neon HTTP uses `instrumentNeonHttpQuery(query, options)` and appends `RETURNING *` for
 after-images. PlanetScale uses `instrumentPlanetScaleClient(client, options)` and applies the
 MySQL re-read strategy to its HTTP `execute()` results. `autoCapture` detects both packages.
+Prisma uses `instrumentPrismaClient(client, options)` and MongoDB uses
+`instrumentMongoClient(client, options)` when the host needs an explicit fallback.
 
 All adapters take the same `InstrumentDbClientOptions` and share the same guarantees: the host
 query never fails and never runs twice because of instrumentation — parse/correlation/capture/
@@ -113,16 +115,17 @@ same application resource. The configured version field produces `versionHash` o
 missing.
 
 Bulk database statements, image less diffs without a resolvable entity, multi key cache calls, and
-database work inside an observed transaction do not receive race evidence. A database event also
-needs a nonempty, fully resolved primary key. Every configured primary key column must be present
-as an own property with a defined value, including composite keys. Existing row, key, value, and
-redaction capture is unchanged. A resolver or HMAC failure omits only `raceEvidence` and never
-changes the host operation.
+database work inside an observed transaction do not receive race evidence. Prisma, MongoDB, and
+PlanetScale adapters omit race evidence for all operations because their hooks do not expose
+transaction commit or rollback outcome. A database event also needs a nonempty, fully resolved
+primary key. Every configured primary key column must be present as an own property with a defined
+value, including composite keys. Existing row, key, value, and redaction capture is unchanged. A
+resolver or HMAC failure omits only `raceEvidence` and never changes the host operation.
 
-MongoDB single entity `update`, `delete`, and `findAndModify` diffs use a fully resolved `_id`.
-Bulk and unresolved commands omit race evidence. Common BSON `ObjectId` values are represented by
-a validated 24 character hexadecimal `toHexString()` value without adding a MongoDB package
-dependency.
+MongoDB single-entity ordinary `update`, `delete`, and `findAndModify` diffs use a fully resolved
+`_id`. Bulk and unresolved commands omit race evidence. Common BSON `ObjectId` values are
+represented by a validated 24 character hexadecimal `toHexString()` value without adding a MongoDB
+package dependency.
 
 If the instrumentation path has no strong ingest credential, supply already opaque 64 character
 identifiers through a per operation `resolve` callback. Multiple operation instrumentation does not

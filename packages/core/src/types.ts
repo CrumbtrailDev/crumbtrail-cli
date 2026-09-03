@@ -373,7 +373,13 @@ export type DbDiffOp = "insert" | "update" | "delete" | "upsert";
  * index, fix-context, comparator) treat every engine identically — the engine tag exists so
  * agents and humans know which dialect the captured statement ran against.
  */
-export type DbEngine = "postgres" | "mysql" | "mssql" | "sqlite" | "prisma";
+export type DbEngine =
+  | "postgres"
+  | "mysql"
+  | "mssql"
+  | "sqlite"
+  | "prisma"
+  | "mongodb";
 
 /** Why a Prisma mutation could not carry a complete pre-mutation row image. */
 export type DbBeforeImageStatus =

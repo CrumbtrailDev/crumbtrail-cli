@@ -68,14 +68,60 @@ transaction. A DB primary key must be nonempty and fully resolved. Every configu
 column must be an own property with a defined value, including composite keys. Existing primary
 key, cache key, row, value, and redaction capture remains unchanged.
 
-MongoDB single entity `update`, `delete`, and `findAndModify` diffs use a fully resolved `_id`.
-Bulk and unresolved commands omit race evidence. Common BSON `ObjectId` values are supported by
-validating the ObjectId prototype's `toHexString()` result as 24 hexadecimal characters, without
+Prisma, MongoDB, and PlanetScale adapters omit race evidence for all operations. Their hooks do not
+expose transaction commit or rollback outcome, so this also applies when an operation succeeds and
+when its surrounding transaction later rolls back. Ordinary database events still capture where
+the adapter can provide them.
+
+MongoDB single-entity ordinary `update`, `delete`, and `findAndModify` diffs use a fully resolved
+`_id`. Bulk and unresolved commands omit race evidence. Common BSON `ObjectId` values are supported
+by validating the ObjectId prototype's `toHexString()` result as 24 hexadecimal characters, without
 adding a MongoDB package dependency.
 
-Explicit clients instrumented before `autoCapture` starts read the active race configuration when
-each event is built, so the call order remains safe.
+Clients instrumented through `instrumentDatabaseClient` before `autoCapture` starts read the active
+race configuration when each event is built, so the call order remains safe.
 Do not use any of those raw or redacted values as a cross session join key.
+
+## Prisma
+
+Use the explicit fallback when the Prisma client already exists before `autoCapture` starts, or
+when the application wants to wire the client itself:
+
+```ts
+import { instrumentPrismaClient } from "crumbtrail-node";
+
+const db = instrumentPrismaClient(prisma, {
+  getRequestId: () => requestStore.getStore()?.requestId,
+  emit: sendBackendEvent,
+});
+```
+
+The function returns Prisma's extended client. Prisma query extensions do not expose transaction
+commit or rollback outcome, so the adapter captures ordinary database evidence but never adds
+`raceEvidence`.
+
+## MongoDB
+
+Enable command monitoring before instrumenting an existing `MongoClient`:
+
+```ts
+import { MongoClient, type Db } from "mongodb";
+import { instrumentMongoClient } from "crumbtrail-node";
+
+const client = new MongoClient(process.env.MONGODB_URL!, {
+  monitorCommands: true,
+});
+const instrumented = instrumentMongoClient(client, {
+  getRequestId: () => requestStore.getStore()?.requestId,
+  emit: sendBackendEvent,
+});
+const db: Db = instrumented.db("app");
+```
+
+The command monitor captures supported statements and returns the original client. MongoDB command
+monitoring does not expose transaction commit or rollback outcome, so this adapter never adds
+`raceEvidence`. `autoCapture` enables `monitorCommands` when it patches the `MongoClient`
+constructor.
 
 ## Postgres (`pg` Client or Pool)
 

@@ -55,6 +55,8 @@ export {
   instrumentMysqlClient,
   instrumentNeonHttpQuery,
   instrumentPlanetScaleClient,
+  instrumentMongoClient,
+  instrumentPrismaClient,
   instrumentPgClient,
   // Reachable from the package root on purpose: an ESM app loads postgres.js as
   // a different module instance than the one auto instrumentation can patch, so
@@ -85,6 +87,10 @@ export type {
   DuckTypedPlanetScaleClient,
   DuckTypedPlanetScaleConnection,
   DuckTypedPlanetScaleResult,
+  DuckTypedMongoClient,
+  DuckTypedPrismaClient,
+  DuckTypedPrismaExtension,
+  DuckTypedPrismaQueryInput,
   DuckTypedPgClient,
   DuckTypedPgQueryResult,
   DuckTypedSqliteDatabase,
