@@ -1,5 +1,10 @@
 # Changelog
 
+## Next
+
+- Add optional Android and iOS native diagnostics through a platform channel.
+- Capture foreground Dart event loop stalls with bounded previous launch handoff.
+
 ## 0.1.0
 
 - Capture Flutter framework and unhandled asynchronous errors.

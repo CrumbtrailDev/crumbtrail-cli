@@ -32,6 +32,30 @@ function logger() {
 }
 
 describe("startReactNativeCollectors", () => {
+  it("observes watchdog background state with appState events disabled", async () => {
+    vi.useFakeTimers();
+    let clock = 0;
+    let listener: (state: string) => void = () => {};
+    const target = logger();
+    const controller = startReactNativeCollectors(target as any, {
+      capabilities,
+      config: { appState: false, console: false, errors: false, network: false, environment: false, navigation: false, replayLite: false, nativeDiagnostics: false, jsWatchdog: true },
+      jsWatchdogEnabled: true,
+      globalObject: { __DEV__: false, performance: { now: () => clock } } as any,
+      reactNative: { AppState: { currentState: "active", addEventListener: (_kind, next) => { listener = next; return { remove() {} }; } } },
+    });
+    try {
+      expect(controller.jsWatchdog).toBeDefined();
+      listener("background");
+      clock = 20000;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(target.addEvent).not.toHaveBeenCalledWith(expect.objectContaining({ type: "native-hang" }));
+      expect(target.addEvent).not.toHaveBeenCalledWith(expect.objectContaining({ type: "app-lifecycle" }));
+    } finally {
+      await controller.cleanup();
+      vi.useRealTimers();
+    }
+  });
   it("emits environment, app lifecycle, navigation, console, and replay-lite events", () => {
     const testLogger = logger();
     const originalLog = vi.fn();

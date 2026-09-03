@@ -2389,9 +2389,9 @@ export class Crumbtrail {
     this.bus.emit({ t: now(), k: "mark", d: { label } });
   }
 
-  addEvent(partial: AddBugEventOptions): void {
+  addEvent(partial: AddBugEventOptions): boolean {
     const { type, data, ...envelope } = partial;
-    this.bus.emit({
+    return this.bus.emit({
       t: now(),
       k: type,
       d: redactDatabaseEventValues(type, data),

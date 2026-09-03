@@ -194,9 +194,40 @@ RN-specific collectors, each capability-gated and independently toggleable via
 - `appState` — foreground/background/terminate transitions
 - `environment` — platform, dimensions, device/OS/app version
 - `navigation` — route changes (requires `@react-navigation/native`)
-- `native-hang` is a shared wire contract for future watchdog observations. This package does not emit it yet.
+- `nativeDiagnostics` — previous-launch native crash, native hang, process-exit, and lifecycle evidence when the autolinked native module is available
+- `jsWatchdog` — foreground JavaScript event-loop stall detection with debugger and development suppression
 - `replayLite` — periodic serialized view-tree snapshot + touch overlay
   (crash screenshot requires `react-native-view-shot`)
+
+Native diagnostics is optional. The JavaScript bridge reports a capability event
+with `supported`, `enabled`, and `observed` states, then continues normally when
+the native module is absent or its platform call is unavailable. The native
+module is dormant until `nativeDiagnostics` is enabled. When disabled, it reports
+`supported: true, enabled: false`, starts no native collectors, and drains no
+pending data. It stores only bounded local handoff and does not perform network
+requests.
+The package's standard `android/` and `ios/` directories are discovered by the
+React Native CLI autolinker, so no separate native dependency or manual module
+registration is required.
+
+If you provide `watchdogHandoff`, its `deliver` and `drain` methods are the
+serialized lifecycle boundary. Each method must keep the event durable until
+the acceptance callback returns `true`, compare the stored value before
+clearing it, and return `false` on any failed step. The SDK waits for in-flight
+handoff work during collector cleanup.
+
+Native batches are acknowledged only when core capture policy admits their events.
+Rejected batches remain local and retry while the bridge is active. `addEvent()`
+returns `true` for local admission, not server delivery. Watchdogs rearm after a
+healthy heartbeat and observe background state even when `appState` events are off.
+Native watchdogs suspend while the application is inactive. Pending native batches
+reserve up to 32 records until acknowledgment, plus a bounded tail of 32 newer records.
+
+The JavaScript watchdog defaults to a five second threshold and one second
+checks. It pauses when `AppState` is not active, and is disabled in development
+mode or when a remote debugger is detected. Pass
+`collectors: { nativeDiagnostics: false, jsWatchdog: false }` to disable either
+collector.
 
 `crumbtrail-core`'s own DOM-bound collectors (interactions, keystrokes, scroll,
 clipboard, cookies, storage, performance, video, audio, widget) are disabled by

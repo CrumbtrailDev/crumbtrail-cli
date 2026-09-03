@@ -8,6 +8,16 @@ import type {
   OptionalModuleResolver,
   ReactNativeCapabilities,
 } from "./capabilities";
+import {
+  startReactNativeNativeDiagnostics,
+  type ReactNativeNativeDiagnosticsController,
+  type ReactNativeNativeDiagnosticsModule,
+  type ReactNativeWatchdogHandoff,
+} from "./native-diagnostics";
+import {
+  startReactNativeJsWatchdog,
+  type ReactNativeJsWatchdogController,
+} from "./js-watchdog";
 
 export type ReactNativeCollectorName =
   | "console"
@@ -16,11 +26,12 @@ export type ReactNativeCollectorName =
   | "appState"
   | "environment"
   | "navigation"
-  | "replayLite";
+  | "replayLite"
+  | "nativeDiagnostics"
+  | "jsWatchdog";
 
 export type ReactNativeCollectorConfig =
-  | boolean
-  | Partial<Record<ReactNativeCollectorName, boolean>>;
+  boolean | Partial<Record<ReactNativeCollectorName, boolean>>;
 
 export interface ReactNativeAppStateModule {
   currentState?: string;
@@ -57,8 +68,7 @@ export interface ReactNativeModule {
 
 export interface ReactNativeNavigationLike {
   getCurrentRoute?: () =>
-    | { name?: string; path?: string; key?: string }
-    | undefined;
+    { name?: string; path?: string; key?: string } | undefined;
   addListener?: (
     event: string,
     listener: () => void,
@@ -67,8 +77,7 @@ export interface ReactNativeNavigationLike {
 
 export interface ReactNativeErrorUtilsLike {
   getGlobalHandler?: () =>
-    | ((error: unknown, isFatal?: boolean) => void)
-    | undefined;
+    ((error: unknown, isFatal?: boolean) => void) | undefined;
   setGlobalHandler?: (
     handler: (error: unknown, isFatal?: boolean) => void,
   ) => void;
@@ -79,17 +88,23 @@ export interface ReactNativeCollectorRuntime {
   reactNative?: ReactNativeModule | null;
   navigation?: ReactNativeNavigationLike | null;
   errorUtils?: ReactNativeErrorUtilsLike | null;
+  nativeDiagnostics?: ReactNativeNativeDiagnosticsModule | null;
+  watchdogHandoff?: ReactNativeWatchdogHandoff;
 }
 
 export interface StartReactNativeCollectorsOptions extends ReactNativeCollectorRuntime {
   config?: ReactNativeCollectorConfig;
   capabilities: ReactNativeCapabilities;
   resolver?: OptionalModuleResolver;
+  nativeDiagnosticsEnabled?: boolean;
+  jsWatchdogEnabled?: boolean;
 }
 
 export interface ReactNativeCollectorController {
-  cleanup(): void;
+  cleanup(): Promise<void>;
   replayLite?: ReactNativeReplayLiteController;
+  nativeDiagnostics?: ReactNativeNativeDiagnosticsController;
+  jsWatchdog?: ReactNativeJsWatchdogController;
 }
 
 const DEFAULT_COLLECTORS: Record<ReactNativeCollectorName, boolean> = {
@@ -100,9 +115,11 @@ const DEFAULT_COLLECTORS: Record<ReactNativeCollectorName, boolean> = {
   environment: true,
   navigation: true,
   replayLite: true,
+  nativeDiagnostics: true,
+  jsWatchdog: true,
 };
 
-type Cleanup = () => void;
+type Cleanup = () => void | Promise<void>;
 
 export function startReactNativeCollectors(
   logger: Crumbtrail,
@@ -116,6 +133,15 @@ export function startReactNativeCollectors(
     options.reactNative ??
     resolveModule<ReactNativeModule>("react-native", options.resolver);
   const cleanup: Cleanup[] = [];
+
+  const jsWatchdog = enabledJsWatchdog(options)
+    ? startReactNativeJsWatchdog(logger, {
+        globalObject,
+        capabilities: options.capabilities,
+        handoff: options.watchdogHandoff,
+        appState: reactNative?.AppState,
+      })
+    : undefined;
 
   if (enabled.console)
     cleanup.push(
@@ -153,6 +179,16 @@ export function startReactNativeCollectors(
       ),
     );
 
+  const nativeDiagnostics = startReactNativeNativeDiagnostics(
+    logger,
+    options.capabilities,
+    {
+      module: options.nativeDiagnostics,
+      resolver: options.resolver,
+      enabled:
+        enabled.nativeDiagnostics && options.nativeDiagnosticsEnabled !== false,
+    },
+  );
   const viewShot = resolveModule<ReactNativeViewShotModule>(
     "react-native-view-shot",
     options.resolver,
@@ -166,10 +202,16 @@ export function startReactNativeCollectors(
     : undefined;
 
   return {
-    cleanup() {
-      for (const stop of cleanup.splice(0).reverse()) stop();
+    async cleanup() {
+      const jsCleanup = jsWatchdog?.cleanup();
+      const nativeDiagnosticsCleanup = nativeDiagnostics?.cleanup();
+      for (const stop of cleanup.splice(0).reverse()) await stop();
+      await jsCleanup;
+      await nativeDiagnosticsCleanup;
     },
     replayLite,
+    nativeDiagnostics,
+    jsWatchdog,
   };
 }
 
@@ -316,7 +358,7 @@ function startNetworkCollector(
       input: RequestInfo | URL,
       init?: RequestInit,
     ) => {
-      const startedAt = Date.now();
+      const startedAt = monotonicNow(globalObject);
       const method = init?.method?.toUpperCase() ?? "GET";
       const url = extractUrl(input);
       try {
@@ -326,7 +368,7 @@ function startNetworkCollector(
           method,
           status: response.status,
           ok: response.ok,
-          dur: Date.now() - startedAt,
+          dur: Math.max(0, monotonicNow(globalObject) - startedAt),
           source: "fetch",
         });
         return response;
@@ -335,7 +377,7 @@ function startNetworkCollector(
           url,
           method,
           error: error instanceof Error ? error.message : String(error),
-          dur: Date.now() - startedAt,
+          dur: Math.max(0, monotonicNow(globalObject) - startedAt),
           source: "fetch",
         });
         throw error;
@@ -347,15 +389,13 @@ function startNetworkCollector(
   }
 
   const Xhr = globalObject.XMLHttpRequest as unknown as
-    | undefined
-    | { prototype?: Record<string, unknown> };
+    undefined | { prototype?: Record<string, unknown> };
   if (Xhr?.prototype) {
     const originalOpen = Xhr.prototype.open as
       | undefined
       | ((method: string, url: string, ...rest: unknown[]) => unknown);
     const originalSend = Xhr.prototype.send as
-      | undefined
-      | ((body?: unknown) => unknown);
+      undefined | ((body?: unknown) => unknown);
     if (
       typeof originalOpen === "function" &&
       typeof originalSend === "function"
@@ -373,10 +413,9 @@ function startNetworkCollector(
         this: Record<string, unknown>,
         body?: unknown,
       ) {
-        const startedAt = Date.now();
+        const startedAt = monotonicNow(globalObject);
         const info = this.__crumbtrailNetwork as
-          | { method?: string; url?: string }
-          | undefined;
+          { method?: string; url?: string } | undefined;
         const previous = this.onreadystatechange as undefined | (() => void);
         this.onreadystatechange = () => {
           if (this.readyState === 4) {
@@ -384,7 +423,7 @@ function startNetworkCollector(
               url: info?.url,
               method: info?.method?.toUpperCase(),
               status: this.status,
-              dur: Date.now() - startedAt,
+              dur: Math.max(0, monotonicNow(globalObject) - startedAt),
               source: "xmlhttprequest",
             });
           }
@@ -408,17 +447,27 @@ function startAppStateCollector(
   logger: Crumbtrail,
   capabilities: ReactNativeCapabilities,
   appState?: ReactNativeAppStateModule,
+  onState?: (state: string) => void,
 ): Cleanup {
   if (!appState?.addEventListener) return () => {};
   const subscription = appState.addEventListener("change", (state) => {
+    onState?.(state);
     emit(logger, capabilities, "app-lifecycle", { state, source: "AppState" });
   });
+  onState?.(appState.currentState ?? "active");
   emit(logger, capabilities, "app-lifecycle", {
     state: appState.currentState,
     source: "AppState",
     kind: "initial",
   });
   return toCleanup(subscription);
+}
+
+function enabledJsWatchdog(
+  options: StartReactNativeCollectorsOptions,
+): boolean {
+  const config = resolveCollectorConfig(options.config);
+  return config.jsWatchdog && options.jsWatchdogEnabled !== false;
 }
 
 function startEnvironmentCollector(
@@ -494,6 +543,21 @@ function safeStringify(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function monotonicNow(
+  globalObject: typeof globalThis & Record<string, unknown>,
+): number {
+  const performanceObject = globalObject.performance as
+    { now?: () => number } | undefined;
+  try {
+    if (typeof performanceObject?.now === "function") {
+      return performanceObject.now.call(performanceObject);
+    }
+  } catch {
+    // Fall through to the platform clock when no monotonic clock is exposed.
+  }
+  return Date.now();
 }
 
 function toCleanup(

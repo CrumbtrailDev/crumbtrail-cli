@@ -51,8 +51,21 @@ Future<void> main() async {
 ```
 
 `Crumbtrail.start` awaits `SharedPreferences` before it resolves the session, so
-a session id from a previous launch is actually restored. Call it before
-`runApp` so startup errors are inside the capture window.
+a session id from a previous launch is actually restored. It also drains the
+optional Android or iOS native diagnostics plugin before returning. Call it
+before `runApp` so startup errors and previous launch evidence are inside the
+capture window. The plugin is registered automatically by Flutter when the
+package is installed. On another platform the bridge reports unavailable and
+the Dart SDK continues normally. The plugin starts its native collectors only
+after `CrumbtrailCollectors.nativeDiagnostics` is enabled. When disabled, an
+available plugin reports `supported: true, enabled: false` and drains no pending
+native data.
+
+Custom `nativeWatchdogHandoff` implementations must serialize their `deliver`
+and `drain` methods. Keep each event durable until the acceptance callback
+returns `true`, compare the stored value before clearing it, and return `false`
+when any step fails. `Crumbtrail.stop()` waits for in-flight handoff work before
+tearing down the native diagnostics platform.
 
 `service` names which app in the project this is. One ingest key covers a whole
 project, so without it every app in that project arrives as an anonymous
@@ -118,7 +131,8 @@ try {
 | Framework errors | `FlutterError.onError` — a failed build, layout or paint |
 | Async errors | `PlatformDispatcher.onError` — where an unawaited Future's failure lands |
 | App lifecycle | `WidgetsBindingObserver`, including the flush on backgrounding |
-| Native hang | Shared wire contract for future watchdog observations. This package does not emit it yet |
+| Native diagnostics | Previous launch native crash and hang evidence plus Android and iOS lifecycle evidence when the optional plugin is available |
+| Dart hang | Foreground Dart event loop watchdog, disabled in debug mode by default |
 | Screen changes | `CrumbtrailNavigatorObserver` |
 | Environment | OS, OS version, locale and Dart version, from `dart:io` |
 | Requests | `recordRequest`, redacted |
@@ -142,7 +156,19 @@ advertising id, no keystrokes and no request bodies.
 | `queueCapacity` | 2000 | Pending events held before the oldest are dropped |
 | `flushBatchSize` | 50 | Queue length that triggers an immediate send |
 | `flushInterval` | 10 seconds | Periodic send |
-| `collectors` | all on | Turn off errors, app lifecycle or environment |
+| `collectors` | all on | Turn off errors, app lifecycle, environment, native diagnostics or the Dart watchdog |
+
+Native diagnostics and the Dart watchdog are also controlled by
+`CrumbtrailCollectors.nativeDiagnostics` and
+`CrumbtrailCollectors.nativeWatchdog`. They are enabled by default. The
+watchdog pauses when the app is not resumed and while a debugger is attached.
+Lifecycle observation remains active when `collectors.appLifecycle` is false,
+without recording lifecycle events. A healthy heartbeat rearms the watchdog
+after a recovered stall.
+Native watchdogs also suspend while the application is inactive. Pending native
+batches reserve up to 32 records until acknowledgment, plus 32 newer records.
+A failed native drain does not disable the Dart watchdog. Call
+`startNativeDiagnostics()` again to retry a failed native drain or acknowledgment.
 
 The ingest key is write only by design. It cannot read sessions back, so
 shipping it in an app binary exposes nothing. Reading data needs a separate
@@ -167,7 +193,8 @@ otherwise read exactly like a session where nothing happened.
 
 ## Dependencies
 
-One: `shared_preferences`, for session continuity across launches. Device facts
+One Dart package: `shared_preferences`, for session continuity and bounded
+watchdog handoff across launches. Device facts
 come from `dart:io` rather than `device_info_plus`, and requests are posted with
 `dart:io` `HttpClient` rather than `package:http`, so this package does not
 force a version on anything already in your app.
