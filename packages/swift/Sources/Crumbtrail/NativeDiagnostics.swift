@@ -205,18 +205,20 @@ public final class CrumbtrailMainThreadWatchdog: @unchecked Sendable {
 
         let current = now()
         lock.lock()
-        let elapsed = max(0, current - lastHeartbeatAt)
-        if elapsed >= thresholdMs && pendingAt == nil && handoff.read() == nil {
-            let at = current
-            let pending = CrumbtrailPendingHang(
-                thresholdMs: thresholdMs,
-                observedDurationMs: min(elapsed, crumbtrailMaxNativeHangDurationMilliseconds),
-                stack: crumbtrailBoundedDiagnosticText(captureStack()),
-                at: at,
-                startedAt: lastHeartbeatAt
-            )
-            handoff.write(pending)
-            pendingAt = at
+        if running && generation == token {
+            let elapsed = max(0, current - lastHeartbeatAt)
+            if elapsed >= thresholdMs && pendingAt == nil && handoff.read() == nil {
+                let at = current
+                let pending = CrumbtrailPendingHang(
+                    thresholdMs: thresholdMs,
+                    observedDurationMs: min(elapsed, crumbtrailMaxNativeHangDurationMilliseconds),
+                    stack: crumbtrailBoundedDiagnosticText(captureStack()),
+                    at: at,
+                    startedAt: lastHeartbeatAt
+                )
+                handoff.write(pending)
+                pendingAt = at
+            }
         }
         lock.unlock()
 

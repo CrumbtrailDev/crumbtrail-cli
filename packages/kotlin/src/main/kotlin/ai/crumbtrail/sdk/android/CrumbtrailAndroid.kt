@@ -269,8 +269,10 @@ fun startCrumbtrail(
         installCrashHandler(logger, SharedPreferencesPendingCrashStore(application))
     }
     val pendingHangs = SharedPreferencesPendingHangStore(application)
-    if (config.collectors.nativeDiagnostics) {
+    if (config.collectors.nativeDiagnostics || config.collectors.nativeWatchdog) {
         runCatching { drainPendingHang(pendingHangs, logger) }
+    }
+    if (config.collectors.nativeDiagnostics) {
         runCatching { installProcessExitCollector(application, logger) }
         runCatching { installMemoryPressureCollector(application, logger) }
     }
@@ -375,6 +377,7 @@ private fun installMemoryPressureCollector(application: Application, logger: Cru
             )
         }
 
+        @Suppress("DEPRECATION")
         override fun onLowMemory() {
             logger.addEvent(
                 CrumbtrailEventKind.APP_LIFECYCLE,
