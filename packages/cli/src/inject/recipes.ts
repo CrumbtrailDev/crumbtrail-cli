@@ -366,8 +366,17 @@ function nextActionFor(
     : "your entry file";
   switch (requirement) {
     case "sdk": {
-      const pkgs = RECIPE_REGISTRY[input.recipe].sdkPackages.join(", ");
-      return `Install ${pkgs} (the installer adds it for you on the next run once the entry is resolved).`;
+      // The shortfall the check actually found, not every package the recipe
+      // uses. An app on `crumbtrail-node` alone already resolves
+      // `crumbtrail-core` through it, and listing core here told its owner to
+      // install a package they had.
+      const short =
+        status.missingSdkPackages.length > 0
+          ? status.missingSdkPackages
+          : RECIPE_REGISTRY[input.recipe].sdkPackages;
+      const pkgs = short.join(", ");
+      const them = short.length > 1 ? "them" : "it";
+      return `Install ${pkgs} (the installer adds ${them} for you on the next run once the entry is resolved).`;
     }
     case "entry":
       return "No Crumbtrail entry point is reachable from this app's entry file — paste the snippet above into it.";
