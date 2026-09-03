@@ -2868,7 +2868,9 @@ export class Crumbtrail {
       );
     }
     this.cancelLifecycleTimer();
-    const stopState: NonNullable<typeof this.lifecycleCloseState> = {
+    const stopState: NonNullable<typeof this.lifecycleCloseState> & {
+      deadline: number;
+    } = {
       immediateEnd: true,
       deadline: Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
     };
