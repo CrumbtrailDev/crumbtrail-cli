@@ -177,6 +177,8 @@ final class NativeDiagnosticsTests: XCTestCase {
         let read = store.read()
         XCTAssertEqual(read?.at, 42)
         XCTAssertEqual(crumbtrailBoundedDiagnosticText(read?.stack)?.count, 8_192)
+        store.write(CrumbtrailPendingHang(thresholdMs: 5_000, observedDurationMs: 9_000, stack: "new", at: 43))
+        XCTAssertEqual(store.read()?.at, 43)
         store.clear()
         XCTAssertNil(store.read())
     }
