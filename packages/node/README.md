@@ -25,6 +25,31 @@ Pair it with [`crumbtrail-core`](https://www.npmjs.com/package/crumbtrail-core) 
 browser. The wizard also connects your coding agent to Crumbtrail's hosted MCP endpoint,
 which is where captured evidence is read back.
 
+### Reporting a bounded business assertion
+
+Backend application code can report an expected and actual bounded fact with
+`sendApplicationAssertion()`. Inside a correlated request it uses the current
+request and session identifiers. Background work uses the process capture
+session when one is available.
+
+```ts
+import { sendApplicationAssertion } from "crumbtrail-node";
+
+await sendApplicationAssertion({
+  name: "invoice_count",
+  operator: "greater_or_equal",
+  expected: 1,
+  actual: invoices.length,
+  endpoint: process.env.CRUMBTRAIL_ENDPOINT,
+  authToken: process.env.CRUMBTRAIL_KEY,
+});
+```
+
+The SDK evaluates the fixed operator and emits `app.assertion` only for a
+bounded primitive fact. Objects, prose, emails, tokens, response bodies, and
+redaction markers are rejected. At most 100 valid assertions are emitted per
+session, and delivery returns whether the event reached the capture endpoint.
+
 ## Fresh-install validation
 
 The published package's install contract is exercised from a temporary standalone
