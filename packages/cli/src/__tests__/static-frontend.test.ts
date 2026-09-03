@@ -545,6 +545,39 @@ describe("buildPlan — static", () => {
     );
   });
 
+  it.each([
+    ["service", 'service: "other"', /app or service name|reports as "other"/i],
+    [
+      "remote config",
+      "remoteConfig: false",
+      /remote configuration|remoteConfig/i,
+    ],
+  ])("does not skip a marker when %s is invalid", (_field, option, warning) => {
+    const wired = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        '<script type="module">',
+        '  import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", ${option} });`,
+        "</script>",
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.warnings.join(" ")).toMatch(warning);
+  });
+
   it("rejects stale or mismatched marker releases", () => {
     const stale = insertIntoHtmlHead(
       PAGE,
