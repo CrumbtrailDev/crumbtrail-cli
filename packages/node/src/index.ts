@@ -493,3 +493,5 @@ export type {
   VercelNodeRequest,
   VercelNodeResponse,
 } from "./serverless";
+
+export { buildDbWitnessEvent } from "./db/witness-event";
