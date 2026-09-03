@@ -2,7 +2,6 @@ import {
   captureToken,
   DEFAULT_CONTEXT_TOKEN_TTL_MS,
   extractCrumbtrailContext,
-  injectCrumbtrailContext,
   validateCrumbtrailContextToken,
   type CrumbtrailContextToken,
 } from "../distributed-context";
@@ -128,7 +127,10 @@ export function injectBullMqContext<TData>(
     return cloned;
   }
   const carrier: Record<string, unknown> = cloned;
-  injectCrumbtrailContext(carrier, validated);
+  // `validated` was checked with the adapter's clock above. Revalidating here
+  // with Date.now() would make deterministic hosts reject an otherwise valid
+  // carrier before it reaches BullMQ.
+  carrier.__crumbtrail = validated;
   carrier[BULLMQ_CONTEXT_ENVELOPE_FIELD] = 1;
   return carrier as TData;
 }
@@ -139,10 +141,7 @@ export function extractBullMqContext(
   now: number | (() => number) = Date.now,
 ): CrumbtrailContextToken | undefined {
   if (!isBullMqEnvelope(data)) return undefined;
-  const extracted = extractCrumbtrailContext(data);
-  return extracted
-    ? validateCrumbtrailContextToken(extracted, now)
-    : undefined;
+  return extractCrumbtrailContext(data, now);
 }
 
 /** Clone a job payload and remove the adapter field before user code runs. */

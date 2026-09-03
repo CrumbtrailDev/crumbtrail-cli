@@ -368,7 +368,8 @@ describe("AWS event carriers", () => {
     expect(stripCrumbtrailSchedulerContext(input)).toEqual(input);
   });
 
-  it("does not overwrite case variants of the reserved AWS attribute", () => {
+  it("preserves colliding AWS attributes and reports the capture loss", () => {
+    const losses: string[] = [];
     const input = {
       Message: "message",
       MessageAttributes: {
@@ -376,10 +377,48 @@ describe("AWS event carriers", () => {
         Existing: { DataType: "String", StringValue: "x" },
       },
     };
-    const carried = injectCrumbtrailSnsMessage(input, { context: token() });
-    expect(carried.MessageAttributes).not.toHaveProperty("crumbtrail.context");
-    expect(carried.MessageAttributes).toHaveProperty(
-      AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE,
+    const carried = injectCrumbtrailSnsMessage(input, {
+      context: token(),
+      onCaptureLoss: (_error, phase) => losses.push(phase),
+    });
+    expect(carried).toEqual(input);
+    expect(losses).toEqual(["collision"]);
+
+    const canonical = {
+      Message: "message",
+      MessageAttributes: {
+        [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: {
+          DataType: "String",
+          StringValue: "application-value",
+        },
+      },
+    };
+    expect(
+      injectCrumbtrailSnsMessage(canonical, {
+        context: token(),
+        onCaptureLoss: (_error, phase) => losses.push(phase),
+      }),
+    ).toEqual(canonical);
+    expect(losses).toEqual(["collision", "collision"]);
+  });
+
+  it("only strips a validated canonical AWS carrier from processor records", async () => {
+    const messageAttributes = {
+      "crumbtrail.context": { DataType: "String", StringValue: "application" },
+      [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: {
+        DataType: "String",
+        StringValue: "malformed",
+      },
+    };
+    const handler = vi.fn(async (record: AwsSqsRecord) => record.messageAttributes);
+
+    await withCrumbtrailAwsSqsProcessor(handler, { now: 1_000 })({
+      messageAttributes,
+    });
+
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ messageAttributes }),
+      expect.anything(),
     );
   });
 

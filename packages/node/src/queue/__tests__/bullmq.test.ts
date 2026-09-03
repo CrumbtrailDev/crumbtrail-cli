@@ -12,8 +12,7 @@ import type { CrumbtrailContextToken } from "../../distributed-context";
 const TRACEPARENT =
   "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
 
-function token(): CrumbtrailContextToken {
-  const now = Date.now();
+function token(now = Date.now()): CrumbtrailContextToken {
   return {
     v: 1,
     sessionId: "session_parent",
@@ -48,6 +47,18 @@ describe("BullMQ adapters", () => {
       }),
     ).toBeUndefined();
     expect(injectBullMqContext("payload", token())).toBe("payload");
+  });
+
+  it("uses the supplied clock consistently while injecting a token", () => {
+    const carried = injectBullMqContext(
+      { value: 1 },
+      token(1_000),
+      1_000,
+    );
+
+    expect(extractBullMqContext(carried, 1_000)).toMatchObject({
+      sessionId: "session_parent",
+    });
   });
 
   it("reports an invalid explicit token without changing the queue payload", () => {

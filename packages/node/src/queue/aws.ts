@@ -211,13 +211,15 @@ export function injectCrumbtrailSqsMessage<T extends AwsSqsSendMessageInput>(
 ): T & AwsSqsSendMessageInput {
   const token = resolveToken(options);
   if (!token) return cloneValue(input);
+  const messageAttributes = withContextAttribute(
+    input.MessageAttributes,
+    token,
+    options,
+  );
+  if (!messageAttributes) return cloneValue(input);
   return {
     ...cloneValue(input),
-    MessageAttributes: withContextAttribute(
-      input.MessageAttributes,
-      token,
-      options,
-    ),
+    MessageAttributes: messageAttributes,
   } as T;
 }
 
@@ -231,14 +233,18 @@ export function injectCrumbtrailSqsBatch<T extends AwsSqsSendMessageBatchInput>(
   if (!token) return cloned;
   return {
     ...cloned,
-    Entries: input.Entries.map((entry) => ({
-      ...cloneValue(entry),
-      MessageAttributes: withContextAttribute(
+    Entries: input.Entries.map((entry) => {
+      const messageAttributes = withContextAttribute(
         entry.MessageAttributes,
         token,
         options,
-      ),
-    })),
+      );
+      if (!messageAttributes) return cloneValue(entry);
+      return {
+        ...cloneValue(entry),
+        MessageAttributes: messageAttributes,
+      };
+    }),
   } as T;
 }
 
@@ -249,13 +255,15 @@ export function injectCrumbtrailSnsMessage<T extends AwsSnsPublishInput>(
 ): T & AwsSnsPublishInput {
   const token = resolveToken(options);
   if (!token) return cloneValue(input);
+  const messageAttributes = withContextAttribute(
+    input.MessageAttributes,
+    token,
+    options,
+  );
+  if (!messageAttributes) return cloneValue(input);
   return {
     ...cloneValue(input),
-    MessageAttributes: withContextAttribute(
-      input.MessageAttributes,
-      token,
-      options,
-    ),
+    MessageAttributes: messageAttributes,
   } as T;
 }
 
@@ -415,7 +423,7 @@ export function withCrumbtrailAwsSqsProcessor<
     const now = readNow(options.now);
     const token =
       extractCrumbtrailSqsRecord(record, now) ?? resolveToken(options, now);
-    const safeRecord = stripSqsRecord(record);
+    const safeRecord = stripSqsRecord(record, now);
     return withCrumbtrailJob(
       jobOptions(options, {
         name: options.name ?? "sqs-message",
@@ -470,7 +478,7 @@ export function withCrumbtrailAwsSnsProcessor<
     const now = readNow(options.now);
     const token =
       extractCrumbtrailSnsRecord(record, now) ?? resolveToken(options, now);
-    const safeRecord = stripSnsRecord(record);
+    const safeRecord = stripSnsRecord(record, now);
     return withCrumbtrailJob(
       jobOptions(options, {
         name: options.name ?? "sns-message",
@@ -738,7 +746,7 @@ function withContextAttribute(
   attributes: AwsMessageAttributes | undefined,
   token: CrumbtrailContextToken,
   options: AwsContextOptions,
-): AwsMessageAttributes {
+): AwsMessageAttributes | undefined {
   const value = JSON.stringify(token);
   if (value.length > MAX_AWS_CONTEXT_VALUE_LENGTH) {
     reportCaptureLoss(
@@ -749,13 +757,18 @@ function withContextAttribute(
     return cloneValue(attributes ?? {});
   }
   const next = cloneValue(attributes ?? {}) as AwsMessageAttributes;
-  for (const key of Object.keys(next)) {
-    if (
-      key !== AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE &&
-      key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase()
-    ) {
-      delete next[key];
-    }
+  if (
+    Object.keys(next).some(
+      (key) =>
+        key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase(),
+    )
+  ) {
+    reportCaptureLoss(
+      options,
+      "collision",
+      "AWS message attributes already contain the reserved Crumbtrail.Context name",
+    );
+    return undefined;
   }
   return {
     ...next,
@@ -870,23 +883,41 @@ function stripJsonCarrier<T>(value: T, now: number | (() => number)): T {
   return (typeof value === "string" ? JSON.stringify(output) : output) as T;
 }
 
-function stripSqsRecord(record: AwsSqsRecord): AwsSqsRecord {
+function stripSqsRecord(
+  record: AwsSqsRecord,
+  now: number | (() => number),
+): AwsSqsRecord {
   if (!record.messageAttributes) return cloneValue(record);
   const attributes = { ...cloneValue(record.messageAttributes) } as AwsMessageAttributes;
+  const canonical = attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE];
+  if (
+    canonical === undefined ||
+    !extractMessageAttribute(
+      { [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: canonical },
+      now,
+    )
+  )
+    return cloneValue(record);
   delete attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE];
-  for (const key of Object.keys(attributes))
-    if (key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase())
-      delete attributes[key];
   return { ...cloneValue(record), messageAttributes: attributes };
 }
 
-function stripSnsRecord(record: AwsSnsRecord): AwsSnsRecord {
+function stripSnsRecord(
+  record: AwsSnsRecord,
+  now: number | (() => number),
+): AwsSnsRecord {
   if (!record.Sns?.MessageAttributes) return cloneValue(record);
   const attributes = { ...cloneValue(record.Sns.MessageAttributes) } as AwsMessageAttributes;
+  const canonical = attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE];
+  if (
+    canonical === undefined ||
+    !extractMessageAttribute(
+      { [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: canonical },
+      now,
+    )
+  )
+    return cloneValue(record);
   delete attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE];
-  for (const key of Object.keys(attributes))
-    if (key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase())
-      delete attributes[key];
   return {
     ...cloneValue(record),
     Sns: { ...cloneValue(record.Sns), MessageAttributes: attributes },
