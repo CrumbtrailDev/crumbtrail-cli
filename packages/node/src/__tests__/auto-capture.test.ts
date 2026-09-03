@@ -49,6 +49,19 @@ interface FetchCall {
   init: RequestInit;
 }
 
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
 // A fetch mock that records every call and returns a 200 session envelope.
 function makeFetch(): { fetchImpl: typeof fetch; calls: FetchCall[] } {
   const calls: FetchCall[] = [];
@@ -540,6 +553,90 @@ describe("autoCapture", () => {
     expect(proc.listenerCount("uncaughtException")).toBe(1);
 
     first.stop();
+  });
+
+  it("waits for same-key binding retirement before restarting", async () => {
+    const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "project-key" } });
+    const calls: FetchCall[] = [];
+    const firstRuntime = {
+      instanceId: "ri_runtime_first",
+      instanceProof: `proof_first_${"x".repeat(40)}`,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    };
+    const secondRuntime = {
+      instanceId: "ri_runtime_second",
+      instanceProof: `proof_second_${"x".repeat(40)}`,
+      expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+    };
+    const pendingDelete = deferred<Response>();
+    let registrationCount = 0;
+    let firstDelete = true;
+    const fetchImpl = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const call = { url: String(url), init: init ?? {} };
+        calls.push(call);
+        if (call.url.includes("/api/runtime/register")) {
+          if (call.init.method === "DELETE") {
+            if (firstDelete) {
+              firstDelete = false;
+              return pendingDelete.promise;
+            }
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }
+          registrationCount += 1;
+          return new Response(
+            JSON.stringify(
+              registrationCount === 1 ? firstRuntime : secondRuntime,
+            ),
+            { status: 201 },
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      },
+    ) as unknown as typeof fetch;
+    const options = {
+      endpoint: ENDPOINT,
+      processImpl: proc,
+      consoleImpl: { error: vi.fn() },
+      fetchImpl,
+      captureHttpRequests: false,
+      captureOutboundHttp: false,
+      captureRuntimeWarnings: false,
+      captureLogs: false,
+      captureProcessSignals: false,
+    };
+
+    const first = track(await autoCapture(options));
+    first.stop();
+
+    const secondPromise = autoCapture(options);
+    await Promise.resolve();
+    expect(
+      calls.filter(
+        (call) =>
+          call.url.includes("/api/runtime/register") &&
+          call.init.method === "POST",
+      ),
+    ).toHaveLength(1);
+
+    pendingDelete.resolve(
+      new Response(JSON.stringify({ ok: true }), { status: 200 }),
+    );
+    const second = track(await secondPromise);
+    expect(second.sessionId).toBeDefined();
+    const firstDeleteIndex = calls.findIndex(
+      (call) =>
+        call.url.includes("/api/runtime/register") &&
+        call.init.method === "DELETE",
+    );
+    const secondRegistrationIndex = calls.findIndex(
+      (call, index) =>
+        index > firstDeleteIndex &&
+        call.url.includes("/api/runtime/register") &&
+        call.init.method === "POST",
+    );
+    expect(firstDeleteIndex).toBeGreaterThanOrEqual(0);
+    expect(secondRegistrationIndex).toBeGreaterThan(firstDeleteIndex);
   });
 
   it("console.error capture records the error and passes through to the original", async () => {
