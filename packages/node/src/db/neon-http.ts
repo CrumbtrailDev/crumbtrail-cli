@@ -37,6 +37,16 @@ interface RequestCounters {
 const ENGINE = "postgres" as const;
 const INSTRUMENTED = Symbol.for("crumbtrail.db.neonHttpInstrumented");
 
+interface NeonQueryCapture {
+  suppressRaceEvidence: boolean;
+}
+
+// Array transactions receive promises that were created by the outer sql
+// function before transaction() sees them. Keep a weak association so the
+// transaction overload can suppress only those promises without changing
+// standalone query behavior.
+const queryCaptures = new WeakMap<object, NeonQueryCapture>();
+
 function newCounters(): RequestCounters {
   return {
     emittedReadRowsByRequest: new Map(),
@@ -189,8 +199,12 @@ function runCaptured(
     throw error;
   }
 
+  const capture: NeonQueryCapture = { suppressRaceEvidence: false };
   const observed = Promise.resolve(hostResult).then(
     (result) => {
+      const eventOptions = capture?.suppressRaceEvidence
+        ? suppressRaceEvidence(operationOptions)
+        : operationOptions;
       emitDbStatementEvent({
         engine: ENGINE,
         op: parsed?.op ?? (parsedRead ? "select" : "other"),
@@ -213,7 +227,7 @@ function runCaptured(
               requestId,
               rows,
               rowCount,
-              options: operationOptions,
+              options: eventOptions,
             });
           } else {
             emitImagelessDbDiff({
@@ -222,17 +236,17 @@ function runCaptured(
               table: parsed.table,
               requestId,
               rowCount,
-              options: operationOptions,
+              options: eventOptions,
             });
           }
-        } else if (operationOptions.captureReads && parsedRead) {
+        } else if (eventOptions.captureReads && parsedRead) {
           emitDbReadEvents({
             engine: ENGINE,
             table: parsedRead.table,
             requestId,
             rows,
             rowCount,
-            options: operationOptions,
+            options: eventOptions,
             emittedReadRowsByRequest: counters.emittedReadRowsByRequest,
             readCallsitesByRequest: counters.readCallsitesByRequest,
             readStatementsByRequest: counters.readStatementsByRequest,
@@ -258,6 +272,9 @@ function runCaptured(
       throw error;
     },
   );
+  if (observed && (typeof observed === "object" || typeof observed === "function")) {
+    queryCaptures.set(observed, capture);
+  }
   preserveQueryMetadata(hostResult, observed);
   return observed;
 }
@@ -331,7 +348,17 @@ export function instrumentNeonHttpQuery<T>(
           // writes are committed race evidence.
           const transactionOptions = suppressRaceEvidence(operationOptions);
           const next = [...args];
-          if (typeof next[0] === "function") {
+          if (Array.isArray(next[0])) {
+            for (const query of next[0]) {
+              if (
+                query &&
+                (typeof query === "object" || typeof query === "function")
+              ) {
+                const capture = queryCaptures.get(query);
+                if (capture) capture.suppressRaceEvidence = true;
+              }
+            }
+          } else if (typeof next[0] === "function") {
             const fn = next[0] as (tx: DuckTypedNeonHttpQuery) => unknown;
             next[0] = (tx: DuckTypedNeonHttpQuery) =>
               fn(instrumentNeonHttpQuery(tx, transactionOptions));
