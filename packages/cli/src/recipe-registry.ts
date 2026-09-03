@@ -213,6 +213,64 @@ export const SDK_VERSION_FLOORS: Record<string, string> = {
 };
 
 /**
+ * Packages that BRING a given SDK package with them, so a manifest declaring one
+ * of them already has the implied package resolvable.
+ *
+ * `crumbtrail-node`, `crumbtrail-react-native` and `crumbtrail-capacitor` each
+ * depend on `crumbtrail-core` outright. A server app that declares only
+ * `crumbtrail-node` is therefore fully wired, and reporting its SDK as missing
+ * told the owner to install a package they already had — and, worse, marked a
+ * complete integration incomplete so every re-run refused to skip.
+ *
+ * The implication only holds from the lockstep release onward, which is what
+ * `SDK_VERSION_FLOORS` names: below `0.31.0` the adapters were separate
+ * published packages on their own version lines and did not carry core. A
+ * declared range whose minimum is under the floor therefore implies nothing.
+ */
+export const SDK_IMPLIED_BY: Record<string, readonly string[]> = {
+  "crumbtrail-core": [
+    "crumbtrail-node",
+    "crumbtrail-react-native",
+    "crumbtrail-capacitor",
+  ],
+};
+
+/**
+ * The lowest version a declared dependency range can resolve to, or null when
+ * the range names no version at all (`workspace:*`, `catalog:`, `latest`, `*`,
+ * a git or file specifier).
+ *
+ * Deliberately not a semver implementation. The only question asked of it is
+ * whether a range sits at or above a floor, and every range npm writes for these
+ * packages (`^0.47.0`, `~0.47.0`, `>=0.31.0`, `0.47.0`) puts its minimum first.
+ */
+export function rangeMinimum(range: string): [number, number, number] | null {
+  const match = /(\d+)\.(\d+)\.(\d+)/.exec(range);
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+/**
+ * Whether a declared range is at or above the package's capability floor.
+ *
+ * A range with no version in it (`workspace:*`, `latest`) counts as satisfying:
+ * it resolves to whatever is current, which is never below the floor, and
+ * refusing it would report every workspace member's own manifest as stale.
+ */
+export function satisfiesFloor(pkg: string, range: string): boolean {
+  const floor = SDK_VERSION_FLOORS[pkg];
+  if (!floor) return true;
+  const declared = rangeMinimum(range);
+  if (!declared) return true;
+  const required = rangeMinimum(floor);
+  if (!required) return true;
+  for (let i = 0; i < 3; i += 1) {
+    if (declared[i] !== required[i]) return declared[i] > required[i];
+  }
+  return true;
+}
+
+/**
  * The install spec for a package: `pkg@>=<floor>`, or the bare name when
  * unknown.
  *

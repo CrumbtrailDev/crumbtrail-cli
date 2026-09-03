@@ -103,6 +103,7 @@ describe("inspectIntegration", () => {
     expect(status).toEqual({
       complete: true,
       found: true,
+      missingSdkPackages: [],
       missing: [],
       hazards: [],
       existingEnvVars: ["VITE_CRUMBTRAIL_KEY"],
@@ -795,5 +796,89 @@ describe("an amended service reads the key the wizard just wrote", () => {
     );
     expect(plan.kind).toBe("amend-init");
     expect(plan.content).not.toContain("loadEnvFile");
+  });
+});
+
+describe("SDK packages an adapter already implies", () => {
+  const serverFiles = (
+    dependencies: Record<string, string>,
+    installed: string[],
+  ): Record<string, string> => ({
+    [p("package.json")]: JSON.stringify({ dependencies }),
+    ...Object.fromEntries(
+      installed.map((name) => [
+        p("node_modules", name, "package.json"),
+        "{}",
+      ]),
+    ),
+    [p("server.js")]: [
+      'import { autoCapture } from "crumbtrail-node";',
+      "autoCapture({",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: process.env.CRUMBTRAIL_KEY,",
+      '  service: "api",',
+      "});",
+    ].join("\n"),
+    [p(".env")]: "CRUMBTRAIL_KEY=ctkey_test\n",
+  });
+
+  const inspect = (files: Record<string, string>) =>
+    inspectIntegration({
+      cwd: CWD,
+      recipe: "express",
+      endpoint: ENDPOINT,
+      entryFile: p("server.js"),
+      serviceName: "api",
+      io: fakeInjectIO(files),
+    });
+
+  it("treats a declared crumbtrail-node as supplying crumbtrail-core", () => {
+    const status = inspect(
+      serverFiles({ "crumbtrail-node": "^0.47.0" }, ["crumbtrail-node"]),
+    );
+    expect(status.missing).not.toContain("sdk");
+    expect(status.missingSdkPackages).toEqual([]);
+  });
+
+  it("does not let a pre-lockstep crumbtrail-node imply crumbtrail-core", () => {
+    const status = inspect(
+      serverFiles({ "crumbtrail-node": "^0.30.0" }, ["crumbtrail-node"]),
+    );
+    expect(status.missing).toContain("sdk");
+    expect(status.missingSdkPackages).toEqual(["crumbtrail-core"]);
+  });
+
+  it("still requires the adapter itself to be installed", () => {
+    const status = inspect(serverFiles({ "crumbtrail-node": "^0.47.0" }, []));
+    expect(status.missingSdkPackages).toEqual([
+      "crumbtrail-core",
+      "crumbtrail-node",
+    ]);
+  });
+
+  it("reports only the package the manifest is short of", () => {
+    const status = inspect(
+      serverFiles({ "crumbtrail-core": "^0.47.0" }, ["crumbtrail-core"]),
+    );
+    expect(status.missingSdkPackages).toEqual(["crumbtrail-node"]);
+  });
+
+  it("names only the shortfall in the guidance, and agrees on it/them", () => {
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: p("server.js"),
+        serviceName: "api",
+      },
+      fakeInjectIO(
+        serverFiles({ "crumbtrail-core": "^0.47.0" }, ["crumbtrail-core"]),
+      ),
+    );
+    const guidance = (plan.warnings ?? []).join("\n");
+    expect(guidance).toContain("Next: Install crumbtrail-node (");
+    expect(guidance).toContain("adds it for you");
+    expect(guidance).not.toContain("crumbtrail-core, crumbtrail-node");
   });
 });
