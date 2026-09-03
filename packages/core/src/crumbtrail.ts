@@ -1907,17 +1907,32 @@ export class Crumbtrail {
 
         const replay = this.replay;
         this.replay = undefined;
-        try {
-          await replay?.stop().catch(() => {});
-        } catch {
-          // A page leaving the foreground must not keep the host application
-          // alive because replay teardown failed.
+        const replaySettled = await this.waitForLifecycleOperation(
+          Promise.resolve()
+            .then(() => replay?.stop())
+            .catch(() => {}),
+          closeState,
+        );
+        if (!replaySettled) {
+          this.lifecycleSuspended = true;
+          this.sessionStarted = false;
+          return;
         }
 
         if (this.deferredDeliveryGaps.length > 0) {
           const deferred = this.deferredDeliveryGaps;
           this.deferredDeliveryGaps = [];
-          await this.transport.sendEvents(deferred).catch(() => {});
+          const deferredSettled = await this.waitForLifecycleOperation(
+            Promise.resolve()
+              .then(() => this.transport.sendEvents(deferred))
+              .catch(() => {}),
+            closeState,
+          );
+          if (!deferredSettled) {
+            this.lifecycleSuspended = true;
+            this.sessionStarted = false;
+            return;
+          }
         }
         this.startLifecycleEnd();
         const lifecycleEndSettled = await this.waitForLifecycleEnd(closeState);
@@ -1989,8 +2004,18 @@ export class Crumbtrail {
   private async waitForLifecycleEnd(
     closeState: NonNullable<typeof this.lifecycleCloseState>,
   ): Promise<boolean> {
-    const settled = this.lifecycleEndPromise?.then(() => true);
-    if (!settled) return true;
+    if (!this.lifecycleEndPromise) return true;
+    return this.waitForLifecycleOperation(this.lifecycleEndPromise, closeState);
+  }
+
+  private async waitForLifecycleOperation(
+    operation: Promise<unknown>,
+    closeState: NonNullable<typeof this.lifecycleCloseState>,
+  ): Promise<boolean> {
+    const settled = operation.then(
+      () => true,
+      () => true,
+    );
     if (!closeState.immediateEnd) {
       const escalated = closeState.escalationPromise?.then(() => false);
       if (escalated) {
@@ -2478,15 +2503,10 @@ export class Crumbtrail {
     };
 
     this.cancelLifecycleTimer();
-    const stopState: NonNullable<typeof this.lifecycleCloseState> | undefined =
-      this.lifecycleClosePromise ||
-      !this.sessionStarted ||
-      this.lifecycleSuspended
-        ? undefined
-        : {
-            immediateEnd: true,
-            deadline: Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
-          };
+    const stopState: NonNullable<typeof this.lifecycleCloseState> = {
+      immediateEnd: true,
+      deadline: Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
+    };
     if (this.lifecycleClosePromise) {
       try {
         this.escalateLifecycleClose();
@@ -2494,7 +2514,7 @@ export class Crumbtrail {
       } catch (error) {
         recordStopFailure(teardownFailures, "lifecycle.close", error);
       }
-    } else if (stopState) {
+    } else if (this.sessionStarted && !this.lifecycleSuspended) {
       const admissionSettled = await this.waitUntilLifecycleDeadline(
         Promise.allSettled([
           this.sessionMetadataWrite,
@@ -2534,8 +2554,9 @@ export class Crumbtrail {
     // failing in, and it uploads through `transport.sendBlob` against a session
     // the server still has open — so it has to land before `endSession()`
     // finalizes the log below. Awaiting it inline is what makes that ordering
-    // real; `updateReplayState()` may only detach the same call because a
-    // config poll must not block on an upload.
+    // real while the deadline keeps a stuck recorder from holding shutdown;
+    // `updateReplayState()` may only detach the same call because a config
+    // poll must not block on an upload.
     //
     // And it runs while the session is still live, on the same side of the flag
     // as the collector loop. The recorder reaches the transport directly rather
@@ -2552,10 +2573,21 @@ export class Crumbtrail {
     const replay = this.replay;
     this.replay = undefined;
     if (replay) {
-      try {
-        await replay.stop();
-      } catch (error) {
-        recordStopFailure(teardownFailures, "replay", error);
+      const replaySettled = await this.waitUntilLifecycleDeadline(
+        Promise.resolve()
+          .then(() => replay.stop())
+          .then(
+            () => true,
+            (error: unknown) => {
+              recordStopFailure(teardownFailures, "replay", error);
+              return true;
+            },
+          ),
+        stopState.deadline,
+      );
+      if (!replaySettled) {
+        this.lifecycleSuspended = true;
+        this.sessionStarted = false;
       }
     }
     // These three run BEFORE the collector loop and are teardown in exactly the
@@ -2609,9 +2641,7 @@ export class Crumbtrail {
     if (this.sessionStarted) {
       // bus.stop() just flushed the final batch into the transport; every
       // in-flight POST must land before end-of-session finalizes the log.
-      const pendingSettled = stopState
-        ? await this.waitForLifecycleSends(stopState)
-        : (await Promise.allSettled([...this.pendingSends]), true);
+      const pendingSettled = await this.waitForLifecycleSends(stopState);
       if (!pendingSettled) {
         this.lifecycleSuspended = true;
         this.sessionStarted = false;
@@ -2637,12 +2667,40 @@ export class Crumbtrail {
       if (this.deferredDeliveryGaps.length > 0) {
         const deferred = this.deferredDeliveryGaps;
         this.deferredDeliveryGaps = [];
-        await this.transport.sendEvents(deferred).catch(() => {});
+        const deferredSettled = await this.waitUntilLifecycleDeadline(
+          Promise.resolve()
+            .then(() => this.transport.sendEvents(deferred))
+            .then(
+              () => true,
+              () => true,
+            ),
+          stopState.deadline,
+        );
+        if (!deferredSettled) {
+          this.lifecycleSuspended = true;
+          this.sessionStarted = false;
+          return { sessionId: this.sessionId };
+        }
       }
+      const sessionId = this.sessionId;
       try {
-        await this.transport.endSession(this.sessionId);
-      } catch (error) {
-        recordStopFailure(teardownFailures, "transport.endSession", error);
+        const endSettled = await this.waitUntilLifecycleDeadline(
+          Promise.resolve()
+            .then(() => this.transport.endSession(sessionId))
+            .then(
+              () => true,
+              (error: unknown) => {
+                recordStopFailure(teardownFailures, "transport.endSession", error);
+                return true;
+              },
+            ),
+          stopState.deadline,
+        );
+        if (!endSettled) this.lifecycleSuspended = true;
+      } finally {
+        // The request may still be in flight after the local deadline. Never retry it from a
+        // later stop call, which would finalize the same session twice.
+        this.sessionStarted = false;
       }
     }
     if (teardownFailures.length > 0) throw buildStopFailure(teardownFailures);

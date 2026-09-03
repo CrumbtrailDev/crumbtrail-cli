@@ -531,6 +531,35 @@ describe("report screenshot API", () => {
     vi.useRealTimers();
   });
 
+  it("abandons lifecycle finalization when deferred gap delivery never settles", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    transport.sendEvents.mockImplementationOnce(
+      async () => new Promise<void>(() => {}),
+    );
+    const logger = init(transport);
+    (
+      logger as unknown as { deferredDeliveryGaps: unknown[] }
+    ).deferredDeliveryGaps = [{ t: Date.now(), k: "mark", d: {} }];
+
+    window.dispatchEvent(new Event("pagehide"));
+    const lifecycleClose = (
+      logger as unknown as { lifecycleClosePromise?: Promise<void> }
+    ).lifecycleClosePromise;
+    expect(lifecycleClose).toBeDefined();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(transport.sendEvents).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
+    await expect(lifecycleClose).resolves.toBeUndefined();
+    expect(transport.endSession).not.toHaveBeenCalled();
+
+    await expect(logger.stop()).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(transport.endSession).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
   it("uses one pagehide deadline for admission and a pending send", async () => {
     vi.useFakeTimers();
     const transport = makeTransport();
@@ -602,6 +631,56 @@ describe("report screenshot API", () => {
     });
     expect(transport.endSession).not.toHaveBeenCalled();
     void capture.catch(() => {});
+    vi.useRealTimers();
+  });
+
+  it("abandons explicit finalization when deferred gap delivery never settles", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    transport.sendEvents.mockImplementationOnce(
+      async () => new Promise<void>(() => {}),
+    );
+    const logger = init(transport);
+    (
+      logger as unknown as { deferredDeliveryGaps: unknown[] }
+    ).deferredDeliveryGaps = [{ t: Date.now(), k: "mark", d: {} }];
+
+    const stopping = logger.stop();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(transport.sendEvents).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
+
+    await expect(stopping).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(transport.endSession).not.toHaveBeenCalled();
+    await expect(logger.stop()).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(transport.endSession).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("bounds explicit endSession and does not retry it on a later stop", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    transport.endSession.mockImplementationOnce(
+      async () => new Promise<void>(() => {}),
+    );
+    const logger = init(transport);
+
+    const stopping = logger.stop();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(transport.endSession).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
+
+    await expect(stopping).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    await expect(logger.stop()).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(transport.endSession).toHaveBeenCalledOnce();
     vi.useRealTimers();
   });
 
