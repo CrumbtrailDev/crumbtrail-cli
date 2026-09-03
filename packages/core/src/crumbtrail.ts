@@ -433,6 +433,8 @@ export class Crumbtrail {
   private poisonedCollectors = new Set<string>();
   /** The context handed to collectors at init, kept so a later start hands over the same one. */
   private collectorContext?: CollectorContext;
+  /** Storage-failure hooks follow trigger changes without restarting the storage collector. */
+  private storageFailureSyncs = new Set<() => void>();
   private sessionId: string;
   private widgetCleanup?: () => void;
   private stateProviders = new Map<string, () => unknown>();
@@ -790,6 +792,10 @@ export class Crumbtrail {
       registerStateProvider: (name, provider) =>
         instance.registerStateProvider(name, provider),
       whenCaptureAdmitted: (settle) => instance.whenCaptureAdmitted(settle),
+      registerStorageFailureSync: (sync) => {
+        instance.storageFailureSyncs.add(sync);
+        return () => instance.storageFailureSyncs.delete(sync);
+      },
     };
 
     instance.collectorContext = collectorContext;
@@ -1208,6 +1214,7 @@ export class Crumbtrail {
       this.localCaptureFloor,
     );
     this.applyRemoteCollectorChanges();
+    for (const sync of this.storageFailureSyncs) sync();
 
     if (typeof settings.killSwitch === "boolean") {
       const changed = this.killSwitch !== settings.killSwitch;

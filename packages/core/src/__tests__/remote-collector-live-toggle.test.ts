@@ -87,6 +87,43 @@ afterEach(() => {
 });
 
 describe("collector switches applied to a live session", () => {
+  it("live-toggles storage failure hooks when the remote trigger changes", async () => {
+    const failure = new DOMException("private database", "UnknownError");
+    const firstRequest = new EventTarget() as EventTarget & {
+      error?: unknown;
+    };
+    firstRequest.error = failure;
+    const factory = {
+      open: vi.fn((_name: string) => firstRequest),
+    };
+    const originalOpen = factory.open;
+    vi.stubGlobal("indexedDB", factory);
+    const { logger, internals, kinds } = start({ storage: true });
+
+    expect(internals.config.autoFlagOnStorageFailure).toBe(false);
+    expect(factory.open).toBe(originalOpen);
+
+    internals.applyRemoteConfig({ triggers: { storageFailure: true } });
+    expect(factory.open).not.toBe(originalOpen);
+    factory.open("private-db").dispatchEvent(new Event("error"));
+    expect(
+      kinds("stor").filter((event) => event.d.type === "idb"),
+    ).toHaveLength(1);
+
+    internals.applyRemoteConfig({ triggers: { storageFailure: false } });
+    expect(factory.open).toBe(originalOpen);
+    const secondRequest = new EventTarget() as EventTarget & {
+      error?: unknown;
+    };
+    secondRequest.error = failure;
+    factory.open.mockReturnValue(secondRequest);
+    factory.open("private-db").dispatchEvent(new Event("error"));
+    expect(
+      kinds("stor").filter((event) => event.d.type === "idb"),
+    ).toHaveLength(1);
+    await logger.stop();
+  });
+
   it("stops emission at once when a switch turns a collector off", async () => {
     const { logger, internals, kinds } = start({ console: true });
 
