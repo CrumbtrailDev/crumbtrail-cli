@@ -47,6 +47,7 @@ import { safeStringify, truncate } from "./utils";
  */
 export const PROBE_NAMES = Object.freeze([
   "runtime.env",
+  "runtime.cpu_profile",
   "storage.snapshot",
   "network.inflight",
   "flags.current",
@@ -77,6 +78,19 @@ export const PROBE_MAX_MAX_ROWS = 5_000;
 export const PROBE_DEFAULT_MAX_BYTES = 32_768;
 export const PROBE_MAX_MAX_BYTES = 262_144;
 
+/** Maximum number of function rows a CPU profile may expose. */
+export const CPU_PROFILE_MAX_FUNCTIONS = 50;
+
+/** Fixed sampling window used by the Node executor. Core only validates this bound. */
+export const CPU_PROFILE_MAX_DURATION_MS = 2_000;
+
+/** Maximum count any CPU profile scalar may report. */
+export const CPU_PROFILE_MAX_SAMPLE_COUNT = 1_000_000;
+
+const CPU_PROFILE_FUNCTION_NAME_MAX_LENGTH = 160;
+const CPU_PROFILE_URL_MAX_LENGTH = 512;
+const CPU_PROFILE_SOURCE_POSITION_MAX = 1_000_000_000;
+
 /* ------------------------------------------------------------------ */
 /* Public types                                                        */
 /* ------------------------------------------------------------------ */
@@ -99,6 +113,27 @@ export interface ProbeEnvDeclaration {
   flags?: Record<string, unknown>;
   config?: Record<string, unknown>;
 }
+
+/** One privacy-safe function row from a Node CPU profile. */
+export interface CpuProfileFunction {
+  functionName: string;
+  url?: string;
+  lineNumber?: number;
+  columnNumber?: number;
+  selfSamples: number;
+}
+
+/** The only profile data allowed to cross the SDK event boundary. */
+export interface CpuProfileProbeData {
+  durationMs: number;
+  sampleCount: number;
+  topFunctions: CpuProfileFunction[];
+}
+
+/** Host-provided implementation for the Node-only CPU profile probe. */
+export type CpuProfileProbeExecutor = (
+  signal: AbortSignal,
+) => Awaitable<CpuProfileProbeData>;
 
 type Awaitable<T> = T | Promise<T>;
 
@@ -128,6 +163,16 @@ export interface ProbeContext {
   getStorageAreas?: (
     signal: AbortSignal,
   ) => Awaitable<Iterable<ProbeStorageArea> | undefined>;
+  /**
+   * Node-only CPU profile executor. Browser/core callers must omit this and
+   * receive `unavailable` for `runtime.cpu_profile`.
+   */
+  getCpuProfile?: CpuProfileProbeExecutor;
+  /**
+   * True only when the config poll was authenticated by this exact runtime
+   * binding. CPU profiling never runs from an untargeted poll.
+   */
+  runtimeTargeted?: boolean;
   /** Clock, for latency. Injectable so tests are not wall clock dependent. */
   now?: () => number;
   /** Per probe deadline in ms. Clamped to `[1, PROBE_MAX_TIMEOUT_MS]`. */
@@ -153,6 +198,10 @@ export interface ProbeResult {
   rowCount: number;
   truncated: boolean;
   latencyMs: number;
+  /** CPU profile summary fields. Present only for a successful CPU profile. */
+  durationMs?: number;
+  sampleCount?: number;
+  topFunctions?: CpuProfileFunction[];
   /**
    * Why the probe produced nothing. Bounded and redacted. Present when and only when `ok` is
    * false. Either a framework reason (`unknown probe`, `timeout`, `unavailable`) or the probe's own
@@ -170,6 +219,8 @@ interface ProbeTable {
   rows: unknown[][];
   /** Set by a probe that already dropped rows at its own source. */
   truncated?: boolean;
+  /** Specialized bounded payload for `runtime.cpu_profile`. */
+  cpuProfile?: CpuProfileProbeData;
 }
 
 type ProbeFn = (ctx: ProbeContext, signal: AbortSignal) => Promise<ProbeTable>;
@@ -287,6 +338,19 @@ function capTable(
   limits: ResolvedLimits,
   latencyMs: number,
 ): ProbeResult {
+  if (table.cpuProfile) {
+    return {
+      name,
+      ok: true,
+      columns: [],
+      rows: [],
+      rowCount: 0,
+      truncated: false,
+      latencyMs,
+      ...sanitizeCpuProfileData(table.cpuProfile),
+    };
+  }
+
   const columns = table.columns.map((column) => truncate(String(column), 64));
   let truncated = table.truncated === true;
 
@@ -314,6 +378,130 @@ function capTable(
     truncated,
     latencyMs,
   };
+}
+
+function boundedProfileInteger(value: unknown, max: number): number | undefined {
+  if (typeof value !== "number" || !Number.isSafeInteger(value))
+    return undefined;
+  if (value < 0) return undefined;
+  return Math.min(max, Math.floor(value));
+}
+
+function boundedProfileString(
+  value: unknown,
+  maxLength: number,
+): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? truncate(trimmed, maxLength) : undefined;
+}
+
+function boundedProfileUrl(value: unknown): string | undefined {
+  const url = boundedProfileString(value, CPU_PROFILE_URL_MAX_LENGTH);
+  if (!url) return undefined;
+  try {
+    return boundedProfileString(
+      redactUrl(url, "probe.runtime.cpu_profile.url").value,
+      CPU_PROFILE_URL_MAX_LENGTH,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizedProfileFunctionName(value: unknown): string {
+  const name = boundedProfileString(
+    value,
+    CPU_PROFILE_FUNCTION_NAME_MAX_LENGTH,
+  );
+  if (!name || name === "(anonymous)" || name === "(program)")
+    return "(anonymous)";
+  if (
+    ["(root)", "(idle)", "(garbage collector)"].includes(name) ||
+    name.startsWith("internal/") ||
+    name.startsWith("node:internal/")
+  )
+    return "[internal]";
+  return name;
+}
+
+/** Copy only the fixed CPU profile schema into the public probe result. */
+function sanitizeCpuProfileData(
+  value: CpuProfileProbeData,
+): Pick<ProbeResult, "durationMs" | "sampleCount" | "topFunctions"> {
+  const durationMs = boundedProfileInteger(
+    value?.durationMs,
+    CPU_PROFILE_MAX_DURATION_MS,
+  );
+  const sampleCount = boundedProfileInteger(
+    value?.sampleCount,
+    CPU_PROFILE_MAX_SAMPLE_COUNT,
+  );
+  if (
+    durationMs === undefined ||
+    sampleCount === undefined ||
+    sampleCount <= 0
+  )
+    throw new Error("malformed cpu profile");
+  if (!Array.isArray(value.topFunctions))
+    throw new Error("malformed cpu profile");
+  if (value.topFunctions.length === 0)
+    throw new Error("empty cpu profile");
+
+  const topFunctions: CpuProfileFunction[] = [];
+  for (const row of value.topFunctions.slice(0, CPU_PROFILE_MAX_FUNCTIONS)) {
+    if (!row || typeof row !== "object" || Array.isArray(row))
+      throw new Error("malformed cpu profile");
+    const source = row as unknown as Record<string, unknown>;
+    const selfSamples = boundedProfileInteger(
+      source.selfSamples,
+      CPU_PROFILE_MAX_SAMPLE_COUNT,
+    );
+    if (selfSamples === undefined || selfSamples <= 0)
+      throw new Error("malformed cpu profile");
+    if (typeof source.functionName !== "string")
+      throw new Error("malformed cpu profile");
+    if (
+      source.url !== undefined &&
+      typeof source.url !== "string"
+    )
+      throw new Error("malformed cpu profile");
+    if (
+      source.lineNumber !== undefined &&
+      boundedProfileInteger(source.lineNumber, CPU_PROFILE_SOURCE_POSITION_MAX) ===
+        undefined
+    )
+      throw new Error("malformed cpu profile");
+    if (
+      source.columnNumber !== undefined &&
+      boundedProfileInteger(
+        source.columnNumber,
+        CPU_PROFILE_SOURCE_POSITION_MAX,
+      ) === undefined
+    )
+      throw new Error("malformed cpu profile");
+    const functionName = normalizedProfileFunctionName(source.functionName);
+    const url = boundedProfileUrl(source.url);
+    const lineNumber = boundedProfileInteger(
+      source.lineNumber,
+      CPU_PROFILE_SOURCE_POSITION_MAX,
+    );
+    const columnNumber = boundedProfileInteger(
+      source.columnNumber,
+      CPU_PROFILE_SOURCE_POSITION_MAX,
+    );
+    topFunctions.push({
+      functionName,
+      ...(url ? { url } : {}),
+      ...(lineNumber !== undefined ? { lineNumber } : {}),
+      ...(columnNumber !== undefined ? { columnNumber } : {}),
+      selfSamples,
+    });
+  }
+
+  if (topFunctions.length === 0) throw new Error("empty cpu profile");
+
+  return { durationMs, sampleCount, topFunctions };
 }
 
 /**
@@ -503,8 +691,22 @@ const flagsCurrentProbe: ProbeFn = async (ctx, signal) => {
   return { columns: ["scope", "key", "value"], rows };
 };
 
+/**
+ * A CPU profile is a Node capability, not a browser capability. The targeted
+ * bit is checked before the host executor is called so an old Cloud response
+ * cannot make a bystander profile itself.
+ */
+const runtimeCpuProfileProbe: ProbeFn = async (ctx, signal) => {
+  if (!ctx.runtimeTargeted || !ctx.getCpuProfile) throw new Error(UNAVAILABLE);
+  throwIfAborted(signal);
+  const profile = await ctx.getCpuProfile(signal);
+  throwIfAborted(signal);
+  return { columns: [], rows: [], cpuProfile: profile };
+};
+
 const BUILT_IN_PROBES: Readonly<Record<ProbeName, ProbeFn>> = Object.freeze({
   "runtime.env": runtimeEnvProbe,
+  "runtime.cpu_profile": runtimeCpuProfileProbe,
   "storage.snapshot": storageSnapshotProbe,
   "network.inflight": networkInflightProbe,
   "flags.current": flagsCurrentProbe,

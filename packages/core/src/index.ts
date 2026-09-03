@@ -237,6 +237,9 @@ export type {
   EvidenceSourceResult,
 } from "./evidence-source";
 export {
+  CPU_PROFILE_MAX_DURATION_MS,
+  CPU_PROFILE_MAX_FUNCTIONS,
+  CPU_PROFILE_MAX_SAMPLE_COUNT,
   PROBE_NAMES,
   PROBE_DEFAULT_TIMEOUT_MS,
   PROBE_MAX_TIMEOUT_MS,
@@ -248,6 +251,9 @@ export {
   runProbe,
 } from "./probes";
 export type {
+  CpuProfileFunction,
+  CpuProfileProbeData,
+  CpuProfileProbeExecutor,
   ProbeName,
   ProbeResult,
   ProbeContext,

@@ -234,10 +234,9 @@ describe("probe dispatch from the config poll", () => {
   });
 
   it("caps a poll at four probes and runs each name once", async () => {
-    // PROBE_NAMES holds exactly four names today, so the cap and the allowlist coincide. This
-    // assertion is the tripwire: a fifth probe makes the cap the binding constraint and this test
-    // must then feed five distinct names.
-    expect(PROBE_NAMES).toHaveLength(4);
+    // The allowlist has five names while delivery remains capped at four. This assertion is the
+    // tripwire that keeps a fifth name from silently widening one poll's execution budget.
+    expect(PROBE_NAMES).toHaveLength(5);
 
     const { logger, transport } = startWithPollPayload({
       probes: [
@@ -253,7 +252,7 @@ describe("probe dispatch from the config poll", () => {
 
     expect(probeCalls).toHaveLength(4);
     expect(probeCalls.map((call) => call.name).sort()).toEqual(
-      [...PROBE_NAMES].sort(),
+      [...PROBE_NAMES.slice(0, 4)].sort(),
     );
     expect(probeResults(transport)).toHaveLength(4);
 
@@ -282,6 +281,24 @@ describe("probe dispatch from the config poll", () => {
     expect(results).toHaveLength(1);
     expect(results[0].d.ok).toBe(false);
     expect(results[0].d.error).toBe("unavailable");
+    expect(results[0].d.rows).toEqual([]);
+
+    await logger.stop();
+  });
+
+  it("reports runtime.cpu_profile as unavailable in the browser/core dispatcher", async () => {
+    const { logger, transport } = startWithPollPayload({
+      probes: ["runtime.cpu_profile"],
+    });
+    await settle();
+
+    const results = probeResults(transport);
+    expect(results).toHaveLength(1);
+    expect(results[0].d).toMatchObject({
+      name: "runtime.cpu_profile",
+      ok: false,
+      error: "unavailable",
+    });
     expect(results[0].d.rows).toEqual([]);
 
     await logger.stop();

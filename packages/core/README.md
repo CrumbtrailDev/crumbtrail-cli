@@ -472,12 +472,12 @@ before finalizing the report. A cloud config response can disable capture with
 A capture config response can also name probes to run, under a `probes` field. A probe answers one
 question about the running application and rests its answer as a `probe.result` event, so an agent
 reading the session afterwards sees what the app actually looked like at that moment rather than
-what the code implies it looked like. Four probes exist and the server can name nothing else:
-`runtime.env`, `storage.snapshot`, `network.inflight` and `flags.current`.
+what the code implies it looked like. Five probes exist and the server can name nothing else:
+`runtime.env`, `runtime.cpu_profile`, `storage.snapshot`, `network.inflight` and `flags.current`.
 
 The whole of what a server may say is a name. Probes take no selector, no URL, no path and no
 expression, so no value from a config response reaches probe code, and one entry shaped as an object
-rather than a string refuses the entire field rather than being salvaged. A name outside the four is
+rather than a string refuses the entire field rather than being salvaged. A name outside the five is
 dropped without normalization. At most four probes run per poll, repeats are collapsed, and a list
 longer than 64 entries is refused before it is read.
 
@@ -492,6 +492,15 @@ A current SDK registers its runtime before polling. When an agent targets a
 session, Cloud sends the probe only to the matching runtime identity. Older SDKs
 continue to receive untargeted project probes. A targeted probe whose runtime
 does not poll remains unavailable instead of being answered by a bystander.
+
+`runtime.cpu_profile` is available only in `crumbtrail-node` and only on a poll
+authenticated by the exact runtime binding for the target session. Node uses
+`node:inspector` for a fixed 1,000 ms sampling window and a 2,000 ms hard
+deadline. Its result contains only `durationMs`, `sampleCount` and up to 50
+bounded `topFunctions` rows. Browser/core callers, untargeted or stale
+responses, unsupported inspectors and profiler failures return `ok: false` with
+`error: "unavailable"` or another explicit error and do not produce a fake
+empty profile.
 
 `storage.snapshot` is the reading where that distinction changes what is emitted, so its keys get a
 stricter treatment than the ordinary storage capture uses. It reports which keys exist, how many,

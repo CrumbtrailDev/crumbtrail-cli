@@ -146,6 +146,19 @@ export { backendIntakeQueueStats, flushBackendEvents } from "./backend-intake";
 
 export { HeadlessRequestError, startHeadlessSession } from "./headless-session";
 
+export {
+  CPU_PROFILE_DEADLINE_MS,
+  CPU_PROFILE_DURATION_MS,
+  CpuProfileProbeError,
+  createCpuProfileProbeExecutor,
+} from "./cpu-profile";
+
+export type {
+  CpuProfileInspectorSession,
+  CpuProfileInspectorSessionFactory,
+  CpuProfileProbeExecutorOptions,
+} from "./cpu-profile";
+
 export type {
   HeadlessSession,
   HeadlessSessionOptions,

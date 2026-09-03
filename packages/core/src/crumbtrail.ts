@@ -1342,7 +1342,14 @@ export class Crumbtrail {
             ? { headers: { Authorization: `Bearer ${binding.instanceProof}` } }
             : {}),
         });
-        if (!response.ok && response.status >= 400) return;
+        if (!response.ok && response.status >= 400) {
+          // A revoked proof must not keep authorizing targeted work on later
+          // polls. Clear only the binding, preserving the legacy fallback and
+          // allowing the next poll to register a fresh identity.
+          if (response.status === 401 && binding)
+            options.runtimeBinding?.invalidate();
+          return;
+        }
         const payload: unknown = await response.json();
         if (stopped || generation !== this.configPollGeneration) return;
         const settings = readRemotePolicySettings(payload);
@@ -1358,7 +1365,12 @@ export class Crumbtrail {
         // Probes run after the policy is live, not during it: a probe result is an event, and an
         // event emitted while `remotePolicyReady` is still false is dropped by the admission
         // predicate before it reaches the bus.
-        if (settings) await this.runRemoteProbes(settings, generation);
+        if (settings)
+          await this.runRemoteProbes(
+            settings,
+            generation,
+            binding !== undefined,
+          );
       } catch {
         // Retain the last known policy when the config service is unavailable.
       }
@@ -1610,6 +1622,7 @@ export class Crumbtrail {
   private async runRemoteProbes(
     settings: Record<string, unknown>,
     generation: number,
+    runtimeTargeted: boolean,
   ): Promise<void> {
     const names = readRemoteProbeNames(settings);
     if (names.length === 0) return;
@@ -1625,7 +1638,10 @@ export class Crumbtrail {
       // consent being revoked — and a newer poll generation retires this run outright.
       if (!this.canTransport()) return;
       if (generation !== this.configPollGeneration) return;
-      const result = await runProbe(name, this.probeContext());
+      const context = this.probeContext();
+      if (name === "runtime.cpu_profile")
+        context.runtimeTargeted = runtimeTargeted;
+      const result = await runProbe(name, context);
       if (!this.canTransport()) return;
       if (generation !== this.configPollGeneration) return;
       this.bus.emit({

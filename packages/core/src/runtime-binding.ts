@@ -36,6 +36,11 @@ export interface RuntimeBindingHandle {
   readonly [runtimeBindingHandleBrand]: "RuntimeBindingHandle";
 }
 
+export interface RuntimeBindingConfigResponse {
+  readonly response: Response;
+  readonly targeted: boolean;
+}
+
 /** Rotate well before the one day proof lifetime ends. */
 export const RUNTIME_BINDING_ROTATE_AHEAD_MS = 60 * 60 * 1000;
 
@@ -253,8 +258,46 @@ export class RuntimeBindingClient {
   }
 
   matchesScope(endpoint: string, projectKey?: string): boolean {
-    return this.endpoint === endpoint.trim().replace(/\/+$/, "") &&
-      this.projectKey === (projectKey?.trim() ?? "");
+    return (
+      this.endpoint === endpoint.trim().replace(/\/+$/, "") &&
+      this.projectKey === (projectKey?.trim() ?? "")
+    );
+  }
+
+  async fetchConfig(
+    endpoint: string,
+    signal?: AbortSignal,
+  ): Promise<RuntimeBindingConfigResponse | undefined> {
+    if (signal?.aborted)
+      throw signal.reason ?? new Error("Config poll aborted");
+    const fetcher = this.fetcher;
+    if (!fetcher) return undefined;
+
+    const targetedOrigin = this.matchesOrigin(endpoint);
+    const binding = targetedOrigin
+      ? await waitForConfigSignal(this.getBinding(), signal)
+      : undefined;
+    if (signal?.aborted)
+      throw signal.reason ?? new Error("Config poll aborted");
+    const url = new URL(
+      endpoint,
+      this.endpoint ||
+        (typeof location !== "undefined" ? location.href : "http://localhost/"),
+    );
+    if (binding) url.searchParams.set("instanceId", binding.instanceId);
+    const response = await waitForConfigSignal(
+      fetcher(url.toString(), {
+        method: "GET",
+        cache: "no-store",
+        signal,
+        ...(binding
+          ? { headers: { Authorization: `Bearer ${binding.instanceProof}` } }
+          : {}),
+      }),
+      signal,
+    );
+    if (response.status === 401 && binding) this.invalidate();
+    return { response, targeted: binding !== undefined };
   }
 
   /** Clear the private proof and prevent late registration responses being adopted. */
@@ -274,6 +317,22 @@ export class RuntimeBindingClient {
     const retirements = [...this.pendingRetirements];
     if (previous) retirements.push(this.revoke(previous));
     this.retirement = Promise.allSettled(retirements).then(() => undefined);
+  }
+
+  /**
+   * Forget a proof the server rejected while leaving this client able to
+   * register a fresh runtime identity on the next poll.
+   */
+  invalidate(): void {
+    if (this.stopped) return;
+    this.requestGeneration += 1;
+    try {
+      this.activeRegistrationController?.abort();
+    } catch {
+      // A host supplied AbortController must not break the invalidation path.
+    }
+    this.current = undefined;
+    this.retryAfter = 0;
   }
 
   private async registerOrRotate(
@@ -631,6 +690,36 @@ export function retireRuntimeBindingHandle(
   if (!client) return Promise.resolve();
   client.stop();
   return client.getRetirement();
+}
+
+export function fetchRuntimeBindingConfig(
+  handle: RuntimeBindingHandle,
+  endpoint: string,
+  signal?: AbortSignal,
+): Promise<RuntimeBindingConfigResponse | undefined> {
+  return (
+    resolveRuntimeBindingClient(handle)?.fetchConfig(endpoint, signal) ??
+    Promise.resolve(undefined)
+  );
+}
+
+/** Cancel this config consumer's wait without retiring another consumer's binding. */
+async function waitForConfigSignal<T>(
+  pending: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return pending;
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error("Config poll aborted"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([pending, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 /**

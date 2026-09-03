@@ -1,7 +1,14 @@
-import { buildCaptureGapEvent, type BugEvent } from "crumbtrail-core";
+import {
+  buildCaptureGapEvent,
+  PROBE_RESULT_EVENT_KIND,
+  runProbe,
+  type BugEvent,
+} from "crumbtrail-core";
 import {
   createRuntimeBindingHandle,
+  fetchRuntimeBindingConfig,
   retireRuntimeBindingHandle,
+  type RuntimeBindingHandle,
 } from "crumbtrail-core/serverless";
 import {
   autoInstrumentCacheClients,
@@ -67,6 +74,11 @@ import {
   readInstrumentRaceEvidence,
   type RaceEvidenceInstrumentationOptions,
 } from "./race-evidence";
+import {
+  createCpuProfileProbeExecutor,
+  type CpuProfileInspectorSessionFactory,
+} from "./cpu-profile";
+import type { CpuProfileProbeExecutor } from "crumbtrail-core";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -125,6 +137,12 @@ export interface AutoCaptureOptions {
   service?: string;
   /** Injectable fetch (tests); forwarded to `startHeadlessSession`. */
   fetchImpl?: typeof fetch;
+  /** Alternate config route for a self-hosted capture service. */
+  configEndpoint?: string;
+  /** Capture config poll cadence. Defaults to 60 seconds. */
+  configPollIntervalMs?: number;
+  /** Test seam for the Node inspector session. */
+  cpuProfileSessionFactory?: CpuProfileInspectorSessionFactory;
   /**
    * When true (default) attempt `process.loadEnvFile()` so the key in `.env`
    * lands in `process.env` before the session starts. Guarded: a no-op when the
@@ -390,6 +408,11 @@ const TERMINATION_FLUSH_MS = 400;
 /** Signals that mean "this process is being stopped", not "this process failed". */
 const TERMINATION_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"] as const;
 
+const DEFAULT_CONFIG_POLL_INTERVAL_MS = 60_000;
+const MIN_CONFIG_POLL_INTERVAL_MS = 1_000;
+const MAX_CONFIG_POLL_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+const MAX_CONFIG_PROBE_ENTRIES = 64;
+
 /** Event kind carrying the process's own statement about how it ended. */
 export const AUTO_CAPTURE_LIFECYCLE_EVENT = "session.lifecycle";
 
@@ -403,6 +426,80 @@ function gapSurfaceFor(kind: string): CaptureGapSurface {
   // was lost in this SDK's own delivery queue, and that is what the reader needs
   // to know about it.
   return "queue";
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function configRecords(payload: unknown): Record<string, unknown>[] {
+  const root = asRecord(payload);
+  if (!root) return [];
+  const project = asRecord(root.project);
+  const captureConfig =
+    asRecord(root.captureConfig) ??
+    asRecord(root.capture_config) ??
+    asRecord(project?.captureConfig) ??
+    asRecord(project?.capture_config);
+  const policy =
+    asRecord(root.policy) ??
+    asRecord(project?.policy) ??
+    asRecord(project?.capturePolicy) ??
+    asRecord(captureConfig?.policy);
+  const settings =
+    asRecord(root.settings) ??
+    asRecord(project?.settings) ??
+    asRecord(project?.captureSettings) ??
+    asRecord(root.captureSettings) ??
+    asRecord(captureConfig?.settings);
+  return [root, project, captureConfig, policy, settings].filter(
+    (record): record is Record<string, unknown> => record !== undefined,
+  );
+}
+
+function cpuProfileRequested(payload: unknown): boolean {
+  for (const settings of configRecords(payload)) {
+    const probes = settings.probes;
+    if (!Array.isArray(probes) || probes.length > MAX_CONFIG_PROBE_ENTRIES)
+      continue;
+    if (probes.some((probe) => typeof probe !== "string")) continue;
+    if (probes.includes("runtime.cpu_profile")) return true;
+  }
+  return false;
+}
+
+function captureKilled(payload: unknown): boolean {
+  return configRecords(payload).some(
+    (settings) => settings.killSwitch === true,
+  );
+}
+
+function configPollUrl(
+  endpoint: string,
+  configEndpoint: string | undefined,
+  projectKey: string,
+): string | undefined {
+  const target =
+    configEndpoint?.trim() ||
+    `${endpoint.replace(/\/+$/, "")}/api/capture-config`;
+  try {
+    const url = new URL(target, endpoint);
+    url.searchParams.set("projectKey", projectKey);
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeConfigPollInterval(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value))
+    return DEFAULT_CONFIG_POLL_INTERVAL_MS;
+  return Math.min(
+    MAX_CONFIG_POLL_INTERVAL_MS,
+    Math.max(MIN_CONFIG_POLL_INTERVAL_MS, Math.floor(value)),
+  );
 }
 
 /** One event waiting for a live session, with the attempts already spent on it. */
@@ -476,6 +573,149 @@ export function __resetAutoCaptureInstallForTests(): void {
   installed = false;
   installedService = undefined;
   clearActiveBackendEventSink();
+}
+
+function startNodeCpuProfilePolling(options: {
+  endpoint: string;
+  configEndpoint?: string;
+  projectKey: string;
+  intervalMs?: number;
+  fetchImpl?: typeof fetch;
+  runtimeBinding: RuntimeBindingHandle;
+  executor: CpuProfileProbeExecutor;
+  emit: (event: BugEvent) => void;
+  now: () => number;
+}): () => void {
+  const fetcher =
+    options.fetchImpl ??
+    (typeof fetch === "function" ? fetch.bind(globalThis) : undefined);
+  if (!options.projectKey || !fetcher) return () => {};
+
+  const intervalMs = normalizeConfigPollInterval(options.intervalMs);
+  let stopped = false;
+  let polling = false;
+  let activePollAbort: AbortController | undefined;
+  let activeProbeAbort: AbortController | undefined;
+
+  const poll = async (): Promise<void> => {
+    if (stopped || polling) return;
+    polling = true;
+    const pollAbort = new AbortController();
+    activePollAbort = pollAbort;
+    const deadline = setTimeout(() => pollAbort.abort(), 5_000);
+    (deadline as unknown as { unref?: () => void }).unref?.();
+    try {
+      if (stopped) return;
+      const url = configPollUrl(
+        options.endpoint,
+        options.configEndpoint,
+        options.projectKey,
+      );
+      if (!url) return;
+      const config = await fetchRuntimeBindingConfig(
+        options.runtimeBinding,
+        url,
+        pollAbort.signal,
+      );
+      if (!config) return;
+      const { response, targeted } = config;
+      if (stopped) return;
+      if (!response.ok) return;
+      const payload: unknown = await waitForCpuPollSignal(
+        Promise.resolve().then(() => response.json()),
+        pollAbort.signal,
+      );
+      clearTimeout(deadline);
+      if (
+        stopped ||
+        pollAbort.signal.aborted ||
+        captureKilled(payload) ||
+        !cpuProfileRequested(payload)
+      )
+        return;
+
+      const probeAbort = new AbortController();
+      activeProbeAbort = probeAbort;
+      const result = await runProbe("runtime.cpu_profile", {
+        getCpuProfile: (signal) =>
+          runCpuProfileWithAbort(options.executor, signal, probeAbort.signal),
+        runtimeTargeted: targeted,
+      });
+      if (activeProbeAbort === probeAbort) activeProbeAbort = undefined;
+      if (stopped) return;
+      let timestamp: number;
+      try {
+        const value = options.now();
+        timestamp = Number.isFinite(value) ? value : Date.now();
+      } catch {
+        timestamp = Date.now();
+      }
+      options.emit({
+        t: timestamp,
+        k: PROBE_RESULT_EVENT_KIND,
+        d: { ...result },
+      });
+    } catch {
+      // A config or profiler failure must never affect the host process.
+    } finally {
+      clearTimeout(deadline);
+      if (activePollAbort === pollAbort) activePollAbort = undefined;
+      activeProbeAbort = undefined;
+      polling = false;
+    }
+  };
+
+  void poll();
+  const timer = setInterval(() => void poll(), intervalMs);
+  (timer as unknown as { unref?: () => void }).unref?.();
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(timer);
+    try {
+      activePollAbort?.abort();
+      activeProbeAbort?.abort();
+    } catch {
+      // A host supplied AbortController must not break capture teardown.
+    }
+  };
+}
+
+async function waitForCpuPollSignal<T>(
+  pending: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error("Config poll aborted"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([pending, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+async function runCpuProfileWithAbort(
+  executor: CpuProfileProbeExecutor,
+  probeSignal: AbortSignal,
+  stopSignal: AbortSignal,
+): Promise<Awaited<ReturnType<CpuProfileProbeExecutor>>> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (probeSignal.aborted || stopSignal.aborted) abort();
+  else {
+    probeSignal.addEventListener("abort", abort, { once: true });
+    stopSignal.addEventListener("abort", abort, { once: true });
+  }
+  try {
+    return await executor(controller.signal);
+  } finally {
+    probeSignal.removeEventListener("abort", abort);
+    stopSignal.removeEventListener("abort", abort);
+  }
 }
 
 /**
@@ -996,6 +1236,26 @@ export async function autoCapture(
   // Boot: attempt the initial handshake. On failure the hooks still install so
   // the host's crash semantics stay intact and a later capture can self-heal.
   await ensureSession();
+
+  // Node-only targeted probe lane. The binding is read for every poll, so an
+  // expired or revoked identity falls back to an explicit unavailable result
+  // instead of profiling an untargeted process. The profiler itself is created
+  // once, but its inspector session is fresh for each requested run.
+  const stopCpuProfilePolling = startNodeCpuProfilePolling({
+    endpoint: options.endpoint,
+    configEndpoint: options.configEndpoint,
+    projectKey: authToken ?? "",
+    intervalMs: options.configPollIntervalMs,
+    fetchImpl: options.fetchImpl,
+    runtimeBinding,
+    executor: createCpuProfileProbeExecutor(
+      options.cpuProfileSessionFactory
+        ? { createSession: options.cpuProfileSessionFactory }
+        : {},
+    ),
+    emit: emitSessionEvent,
+    now,
+  });
 
   let capturing = false;
   const recordLive = (
@@ -1523,6 +1783,7 @@ export async function autoCapture(
     // stop() short-circuits and an in-flight handshake resolves to a discarded
     // session instead of arming further retries.
     stopped = true;
+    stopCpuProfilePolling();
     const runtimeBindingRetirement = retireRuntimeBindingHandle(runtimeBinding);
     clearProcessSessionId(stableSessionId);
     clearApplicationAssertionSession(stableSessionId);

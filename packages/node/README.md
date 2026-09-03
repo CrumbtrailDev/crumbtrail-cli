@@ -478,13 +478,24 @@ silent, so a request is recorded once. Disable the hook with
 
 With an ingest key, `autoCapture` registers one runtime identity for the Node
 process. The identity is sent as top level fields on session start.
-`autoCapture` does not poll remote capture configuration. The proof stays in
-process memory and is reused or rotated when a session is re-established.
-There is no background rotation timer. `stop()` retires the binding. If registration
+The proof stays in process memory and is reused or rotated during session
+establishment and config polling. `stop()` retires the binding. If registration
 is unavailable or rate limited, auto capture keeps the existing untargeted
 session behavior and does not retry in a loop. The AWS, Vercel, and Netlify
 endpoint wrappers similarly reuse one binding across warm invocations for the
 same endpoint and project, with a bounded idle cache.
+
+The Node package executes the `runtime.cpu_profile` probe when a targeted
+config response requests it. It uses `node:inspector` for a fixed 1,000 ms
+sampling window and a 2,000 ms hard deadline. The result contains only
+`durationMs`, `sampleCount` and up to 50 bounded function rows. The profiler
+does not accept a duration or interval from the caller. If the runtime binding
+is absent, expired or revoked, the response is untargeted, the inspector is
+unsupported, another profile is active, or cleanup fails, the SDK emits an
+explicit unavailable/error result and leaves application execution unchanged.
+Config polling uses a five second deadline covering the binding wait, response
+headers, and response body. A timed out poll releases its slot for the next
+scheduled attempt. `stop()` aborts the pending poll and discards late responses.
 
 ### Structured logs
 
