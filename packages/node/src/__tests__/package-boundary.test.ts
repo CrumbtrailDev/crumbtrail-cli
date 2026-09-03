@@ -8,8 +8,10 @@ import {
   createCrumbtrailExpressMiddleware,
   installHttpRequestCapture,
   instrumentDatabaseClient,
+  instrumentMongoClient,
   instrumentNeonHttpQuery,
   instrumentPlanetScaleClient,
+  instrumentPrismaClient,
   withCrumbtrailAwsLambda,
   withCrumbtrailNetlify,
   withCrumbtrailVercel,
@@ -74,8 +76,10 @@ describe("package runtime boundary", () => {
     expect(typeof createCrumbtrailExpressErrorMiddleware).toBe("function");
     expect(typeof installHttpRequestCapture).toBe("function");
     expect(typeof instrumentDatabaseClient).toBe("function");
+    expect(typeof instrumentMongoClient).toBe("function");
     expect(typeof instrumentNeonHttpQuery).toBe("function");
     expect(typeof instrumentPlanetScaleClient).toBe("function");
+    expect(typeof instrumentPrismaClient).toBe("function");
     expect(typeof withCrumbtrailAwsLambda).toBe("function");
     expect(typeof withCrumbtrailVercel).toBe("function");
     expect(typeof withCrumbtrailNetlify).toBe("function");

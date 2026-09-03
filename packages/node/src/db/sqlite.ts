@@ -26,6 +26,7 @@ import {
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
+import { captureGenerationFor } from "../capture-generation";
 
 /**
  * Minimal duck-typed view of a better-sqlite3 / `node:sqlite` statement. The host injects the real
@@ -166,17 +167,15 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
   const connection = extractDbConnectionIdentity(ENGINE, db);
   let transaction: DbTransactionContext | undefined;
 
-  const resolveRequestId = (): string | undefined =>
-    options.requestId ?? options.getRequestId?.();
-
   const handleInsert = (
     realStmt: DuckTypedSqliteStatement,
     parsed: ParsedMutation,
     args: unknown[],
     requestId: string,
+    operationOptions: InstrumentDbClientOptions,
   ): unknown => {
     // The host mutation. Its own errors propagate normally — we never swallow the caller's query.
-    const elapsed = startDbQueryTimer(options);
+    const elapsed = startDbQueryTimer(operationOptions);
     const info = realStmt.run(...args);
     const context: DbStatementContext = {
       connection,
@@ -194,7 +193,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
             .get(rowid);
           if (isRecord(row)) afterRow = row;
         } catch (error) {
-          emitGap(options, { reason: "capture_exception", error });
+          emitGap(operationOptions, { reason: "capture_exception", error });
           afterRow = undefined;
         }
         if (afterRow) {
@@ -205,7 +204,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
             requestId,
             rows: [afterRow],
             rowCount: 1,
-            options,
+            options: operationOptions,
             context,
           });
           return info;
@@ -219,12 +218,12 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           table: parsed.table,
           requestId,
           rowCount: changes,
-          options,
+          options: operationOptions,
           context,
         });
       }
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
     return info;
   };
@@ -234,9 +233,10 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     parsed: ParsedMutation,
     args: unknown[],
     requestId: string,
+    operationOptions: InstrumentDbClientOptions,
   ): unknown => {
     const resolved = resolveParams(args);
-    const pkCols = options.pkColumns?.[parsed.table] ?? ["id"];
+    const pkCols = operationOptions.pkColumns?.[parsed.table] ?? ["id"];
 
     // Pre-SELECT by WHERE to capture the affected pks (and, when enabled, the before-image). Strictly
     // best-effort: a failing SELECT must NOT abort a mutation that would otherwise succeed.
@@ -251,21 +251,21 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
         const beforeMap = new Map<string, Record<string, unknown>>();
         for (const row of Array.isArray(preRows) ? preRows : []) {
           if (!isRecord(row)) continue;
-          const pk = extractPk(row, parsed.table, options.pkColumns);
+          const pk = extractPk(row, parsed.table, operationOptions.pkColumns);
           if (pk && pkCols.every((col) => col in pk)) pks.push(pk);
           if (pk) beforeMap.set(pkKey(pk), row);
         }
         usablePks = pks;
-        if (options.captureBefore) beforeByPk = beforeMap;
+        if (operationOptions.captureBefore) beforeByPk = beforeMap;
       } catch (error) {
-        emitGap(options, { reason: "capture_exception", error });
+        emitGap(operationOptions, { reason: "capture_exception", error });
         usablePks = undefined;
         beforeByPk = undefined;
       }
     }
 
     // The host mutation. Errors propagate normally.
-    const elapsed = startDbQueryTimer(options);
+    const elapsed = startDbQueryTimer(operationOptions);
     const info = realStmt.run(...args);
     const context: DbStatementContext = {
       connection,
@@ -277,7 +277,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
       const changes = toChangeCount(info);
       if (usablePks && usablePks.length > 0) {
         const maxRows = normalizeMaxRowsPerStatement(
-          options.maxRowsPerStatement,
+          operationOptions.maxRowsPerStatement,
         );
         const capped = usablePks.slice(0, maxRows);
         let afterRows: Array<Record<string, unknown>> | undefined;
@@ -288,7 +288,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
             afterRows = (Array.isArray(rows) ? rows : []).filter(isRecord);
           }
         } catch (error) {
-          emitGap(options, { reason: "capture_exception", error });
+          emitGap(operationOptions, { reason: "capture_exception", error });
           afterRows = undefined;
         }
         if (afterRows && afterRows.length > 0) {
@@ -300,7 +300,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
             rows: afterRows,
             beforeByPk,
             rowCount: changes,
-            options,
+            options: operationOptions,
             context,
           });
           return info;
@@ -314,12 +314,12 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           table: parsed.table,
           requestId,
           rowCount: changes,
-          options,
+          options: operationOptions,
           context,
         });
       }
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
     return info;
   };
@@ -329,6 +329,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     parsed: ParsedMutation,
     args: unknown[],
     requestId: string,
+    operationOptions: InstrumentDbClientOptions,
   ): unknown => {
     const resolved = resolveParams(args);
 
@@ -341,13 +342,13 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           .all(...bindReusedParams(resolved, parsed.whereClause));
         beforeRows = (Array.isArray(preRows) ? preRows : []).filter(isRecord);
       } catch (error) {
-        emitGap(options, { reason: "capture_exception", error });
+        emitGap(operationOptions, { reason: "capture_exception", error });
         beforeRows = undefined;
       }
     }
 
     // The host mutation. Errors propagate normally.
-    const elapsed = startDbQueryTimer(options);
+    const elapsed = startDbQueryTimer(operationOptions);
     const info = realStmt.run(...args);
     const context: DbStatementContext = {
       connection,
@@ -365,7 +366,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           requestId,
           rows: beforeRows,
           rowCount: changes,
-          options,
+          options: operationOptions,
           context,
         });
         return info;
@@ -377,12 +378,12 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           table: parsed.table,
           requestId,
           rowCount: changes,
-          options,
+          options: operationOptions,
           context,
         });
       }
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
     return info;
   };
@@ -393,13 +394,15 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     args: unknown[],
     statement: string,
   ): unknown => {
+    const operationOptions = captureGenerationFor(options);
     // Correlation resolution is diff-capture work; if it throws or is absent, run the host mutation
     // untouched. Instrumentation must never decide whether — or how — the host's query runs.
     let requestId: string | undefined;
     try {
-      requestId = resolveRequestId();
+      requestId =
+        operationOptions.requestId ?? operationOptions.getRequestId?.();
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
       return realStmt.run(...args);
     }
     if (!requestId) return realStmt.run(...args);
@@ -407,11 +410,29 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     try {
       switch (parsed.op) {
         case "insert":
-          return handleInsert(realStmt, parsed, args, requestId);
+          return handleInsert(
+            realStmt,
+            parsed,
+            args,
+            requestId,
+            operationOptions,
+          );
         case "update":
-          return handleUpdate(realStmt, parsed, args, requestId);
+          return handleUpdate(
+            realStmt,
+            parsed,
+            args,
+            requestId,
+            operationOptions,
+          );
         case "delete":
-          return handleDelete(realStmt, parsed, args, requestId);
+          return handleDelete(
+            realStmt,
+            parsed,
+            args,
+            requestId,
+            operationOptions,
+          );
         default:
           return realStmt.run(...args);
       }
@@ -423,7 +444,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
         statement,
         requestId,
         error,
-        options,
+        options: operationOptions,
       });
       throw error;
     }
@@ -436,15 +457,17 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     statement: string,
     method: "all" | "get",
   ): unknown => {
+    const operationOptions = captureGenerationFor(options);
     let requestId: string | undefined;
     try {
-      requestId = resolveRequestId();
+      requestId =
+        operationOptions.requestId ?? operationOptions.getRequestId?.();
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
       return realStmt[method](...args);
     }
     // The host read runs exactly once; its result is returned unchanged.
-    const elapsed = startDbQueryTimer(options);
+    const elapsed = startDbQueryTimer(operationOptions);
     let result: unknown;
     try {
       result = realStmt[method](...args);
@@ -457,7 +480,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           statement,
           requestId,
           error,
-          options,
+          options: operationOptions,
         });
       }
       throw error;
@@ -469,7 +492,8 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
     };
     // Preserve the existing read-capture boundary: `.all()` emits row evidence;
     // `.get()` is wrapped only so a refused SELECT is no longer invisible.
-    if (!requestId || !options.captureReads || method === "get") return result;
+    if (!requestId || !operationOptions.captureReads || method === "get")
+      return result;
     try {
       const rows = (
         Array.isArray(result) ? result : isRecord(result) ? [result] : []
@@ -480,7 +504,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
         requestId,
         rows,
         rowCount: rows.length,
-        options,
+        options: operationOptions,
         emittedReadRowsByRequest,
         readCallsitesByRequest,
         readStatementsByRequest,
@@ -488,7 +512,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
         context,
       });
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
     return result;
   };
@@ -519,20 +543,22 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
   const wrapTransactionFunction = (fn: (...args: unknown[]) => unknown) =>
     new Proxy(fn, {
       apply(target, thisArg, args) {
+        const operationOptions = captureGenerationFor(options);
         // better-sqlite3 implements a nested transaction wrapper with a savepoint. Keep the outer
         // transaction id and let its eventual outcome speak for the whole transaction.
         if (transaction) return Reflect.apply(target, thisArg, args);
         let requestId: string | undefined;
         try {
-          requestId = resolveRequestId();
+          requestId =
+            operationOptions.requestId ?? operationOptions.getRequestId?.();
         } catch (error) {
-          emitGap(options, { reason: "capture_exception", error });
+          emitGap(operationOptions, { reason: "capture_exception", error });
         }
         const active = startDbTransaction({
           engine: ENGINE,
           requestId,
           connection,
-          options,
+          options: operationOptions,
         });
         const previous = transaction;
         transaction = active;
@@ -543,7 +569,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
             transaction: active,
             outcome: "commit",
             requestId,
-            options,
+            options: operationOptions,
           });
           return result;
         } catch (error) {
@@ -552,7 +578,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
             transaction: active,
             outcome: "rollback",
             requestId,
-            options,
+            options: operationOptions,
           });
           throw error;
         } finally {
@@ -585,6 +611,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
       }
       if (prop === "prepare") {
         return (...prepareArgs: unknown[]): DuckTypedSqliteStatement => {
+          const operationOptions = captureGenerationFor(options);
           // The host prepare runs and its errors propagate; parsing is separate best-effort work.
           const sql = prepareArgs[0];
           let realStmt: DuckTypedSqliteStatement;
@@ -595,7 +622,8 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
           } catch (error) {
             let requestId: string | undefined;
             try {
-              requestId = resolveRequestId();
+              requestId =
+                operationOptions.requestId ?? operationOptions.getRequestId?.();
             } catch {
               requestId = undefined;
             }
@@ -607,7 +635,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
                 statement: sql,
                 requestId,
                 error,
-                options,
+                options: operationOptions,
               });
             }
             throw error;
@@ -621,7 +649,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
               classification.kind === "unparsable" &&
               classification.mayMutate
             ) {
-              emitGap(options, {
+              emitGap(operationOptions, {
                 reason: "unparsed_sql",
                 detail: leadingSqlKeyword(sql),
               });
@@ -633,7 +661,7 @@ export function instrumentSqliteDatabase<T extends DuckTypedSqliteDatabase>(
             parsedRead =
               classification.kind === "read" ? classification.read : undefined;
           } catch (error) {
-            emitGap(options, { reason: "capture_exception", error });
+            emitGap(operationOptions, { reason: "capture_exception", error });
             return realStmt;
           }
           if (!parsed && !parsedRead) return realStmt;

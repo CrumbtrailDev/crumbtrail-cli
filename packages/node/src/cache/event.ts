@@ -7,6 +7,12 @@ import {
   type PayloadSummary,
   type RedactionMetadata,
 } from "crumbtrail-core";
+import {
+  buildRaceEvidence,
+  isRaceEligibleCacheOperation,
+  type RaceEvidenceOptions,
+  type SealedRaceEvidence,
+} from "../race-evidence";
 
 export const CACHE_EVENT_KIND = "cache" as const;
 
@@ -28,6 +34,7 @@ export interface CacheEventData {
   error?: string;
   /** Bounded command summary for a Redis pipeline or transaction. */
   summary?: CacheOperationSummary;
+  raceEvidence?: SealedRaceEvidence;
   redaction?: RedactionMetadata;
 }
 
@@ -52,6 +59,7 @@ export interface BuildCacheEventInput {
   outcome?: "success" | "failure" | "aborted";
   error?: unknown;
   summary?: CacheOperationSummary;
+  raceEvidence?: RaceEvidenceOptions;
   sessionId?: string;
   now?: number;
   sessionStartedAt?: number | Date;
@@ -105,6 +113,14 @@ export function buildCacheEvent(input: BuildCacheEventInput): BugEvent {
     }
   }
   if (redaction && !d.redaction) d.redaction = redaction;
+  if (input.keys.length === 1 && isRaceEligibleCacheOperation(input.op)) {
+    const raceEvidence = buildRaceEvidence(input.raceEvidence, {
+      surface: "cache",
+      operation: input.op,
+      cacheKey: input.keys[0],
+    });
+    if (raceEvidence) d.raceEvidence = raceEvidence;
+  }
 
   const event: BugEvent = {
     t: now,

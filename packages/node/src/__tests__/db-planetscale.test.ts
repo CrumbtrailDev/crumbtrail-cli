@@ -108,6 +108,43 @@ describe("instrumentPlanetScaleClient", () => {
       db.execute("insert into carts (total_cents) values (?)", [500]),
     ).resolves.toBe(hostMutationResult);
   });
+
+  it("suppresses race evidence for committed and rolled-back transaction work", async () => {
+    const { connection, hostMutationResult } = makeConnection();
+    const events: BugEvent[] = [];
+    const transactional: DuckTypedPlanetScaleConnection = {
+      ...connection,
+      async transaction(fn) {
+        return fn(transactional);
+      },
+    };
+    const db = instrumentPlanetScaleClient(transactional, {
+      requestId: "req-tx",
+      emit: (event) => events.push(event),
+      raceEvidence: {
+        enabled: true,
+        identifiers: { entityHash: "e".repeat(64) },
+      } as never,
+    });
+
+    await db.execute("update carts set total_cents = ? where id = ?", [500, 7]);
+    await expect(
+      db.transaction!(async (tx) => {
+        await tx.execute("update carts set total_cents = ? where id = ?", [
+          500,
+          7,
+        ]);
+        throw new Error("rollback");
+      }),
+    ).rejects.toThrow("rollback");
+
+    const diffs = events.filter((event) => event.k === "db.diff");
+    expect(diffs.length).toBeGreaterThan(0);
+    expect(diffs.every((event) => event.d.raceEvidence === undefined)).toBe(
+      true,
+    );
+    expect(hostMutationResult.rowsAffected).toBe(1);
+  });
 });
 
 describe("PlanetScale auto instrumentation", () => {

@@ -373,7 +373,13 @@ export type DbDiffOp = "insert" | "update" | "delete" | "upsert";
  * index, fix-context, comparator) treat every engine identically — the engine tag exists so
  * agents and humans know which dialect the captured statement ran against.
  */
-export type DbEngine = "postgres" | "mysql" | "mssql" | "sqlite" | "prisma";
+export type DbEngine =
+  | "postgres"
+  | "mysql"
+  | "mssql"
+  | "sqlite"
+  | "prisma"
+  | "mongodb";
 
 /** Why a Prisma mutation could not carry a complete pre-mutation row image. */
 export type DbBeforeImageStatus =
@@ -433,6 +439,20 @@ export interface DbCallsite {
 }
 
 /**
+ * Fixed format, optional identifiers for cross session race analysis.
+ * Values are either SDK generated HMAC digests or application supplied opaque
+ * identifiers. Raw primary keys, cache keys, versions, and row values never
+ * belong here.
+ */
+export interface RaceEvidenceEventData {
+  readonly resourceHash?: string;
+  readonly entityHash: string;
+  readonly versionHash?: string;
+  readonly beforeVersionHash?: string;
+  readonly afterVersionHash?: string;
+}
+
+/**
  * Type-specific payload (`d`) of a `k:'db.diff'` event: the row(s) that changed for one
  * mutating statement, correlated to the request that caused them via `requestId` (which equals
  * the active request's traceId per the correlation bridge in `correlation.ts`). `after` carries
@@ -468,6 +488,8 @@ export interface DbDiffEventData {
   transactionId?: string;
   /** Application callsite that issued the statement, when capture found an application frame. */
   callsite?: DbCallsite;
+  /** Optional sealed identifiers for cross session race analysis. */
+  raceEvidence?: RaceEvidenceEventData;
   /** Redaction metadata for any column-level values dropped/masked before rest. */
   redaction?: unknown;
 }
@@ -531,6 +553,8 @@ export interface DbReadEventData {
    * this window against the request's own paging parameters can say so.
    */
   q?: { limit?: number; offset?: number };
+  /** Optional sealed identifiers for cross session race analysis. */
+  raceEvidence?: RaceEvidenceEventData;
   redaction?: unknown;
 }
 

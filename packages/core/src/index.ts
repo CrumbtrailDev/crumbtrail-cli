@@ -70,6 +70,7 @@ export type {
   DbDiffOp,
   DbEngine,
   DbBeforeImageStatus,
+  RaceEvidenceEventData,
   DbReadBulkEventData,
   DbReadEventData,
   DbErrorEventData,

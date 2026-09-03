@@ -29,6 +29,106 @@ app.post("/api/checkout", async (req, res) => {
 For a long-lived instrumented client, pass `getRequestId: () => …` (e.g. backed by
 `AsyncLocalStorage`) instead of per-request `requestId`.
 
+## Opt in to cross session race evidence
+
+Race evidence is disabled unless `raceEvidence.enabled` is `true`. When enabled, a single row
+read or diff can carry a sealed `raceEvidence` object for a future lost update analysis:
+
+```ts
+const db = instrumentPgClient(pool, {
+  getRequestId: () => requestStore.getStore()?.requestId,
+  emit: sendBackendEvent,
+  captureBefore: true,
+  raceEvidence: {
+    enabled: true,
+    resourceSubject: "orders",
+    optimisticVersionField: "version",
+  },
+});
+```
+
+With `autoCapture`, the ingest credential is used as an in memory HMAC key only when it has at
+least 32 non whitespace bytes and sufficient character diversity. The key never enters an event. The SDK emits fixed length,
+domain separated HMAC SHA 256 identifiers for the entity, the optional common resource subject,
+and the configured version field. DB reads and diffs use the same entity domain, so one row and
+its version can be compared across requests. Use the same `resourceSubject` in a cache integration
+when both planes represent the same application resource.
+
+Without a strong ingest credential, use a per operation `resolve` callback that returns exactly
+these fields: required `entityHash`, plus optional `resourceHash`, `versionHash`,
+`beforeVersionHash`, and `afterVersionHash`. Every identifier is exactly 64 characters long.
+Static `identifiers` are accepted only by the direct event builders. Multiple operation database and
+cache instrumentation ignores them so one entity's identifier cannot be reused for another.
+Accepted characters are letters, numbers, underscore, and hyphen. The callback can throw safely,
+and invalid output omits only the race object.
+
+The direct `buildDbReadEvent` and `buildDbDiffEvent` builders require
+`raceEvidenceCapability: "transaction-outcome"` before they attach race evidence. Set it only when
+the producer observed the operation's transaction outcome. The builders reject Prisma and MongoDB
+engine tags at this boundary. The PlanetScale adapter suppresses race evidence because its HTTP
+hook does not expose a transaction outcome.
+
+Race evidence is omitted from bulk and image less diffs without a resolvable entity, reads that
+return more than one row, multi key cache operations, and database work observed inside a
+transaction. A DB primary key must be nonempty and fully resolved. Every configured primary key
+column must be an own property with a defined value, including composite keys. Existing primary
+key, cache key, row, value, and redaction capture remains unchanged.
+
+Prisma, MongoDB, and PlanetScale adapters omit race evidence for all operations. Their hooks do not
+expose transaction commit or rollback outcome, so this also applies when an operation succeeds and
+when its surrounding transaction later rolls back. Ordinary database events still capture where
+the adapter can provide them.
+
+MongoDB single-entity ordinary `update`, `delete`, and `findAndModify` diffs use a fully resolved
+`_id`. Bulk and unresolved commands omit race evidence. Common BSON `ObjectId` values are supported
+by validating the ObjectId prototype's `toHexString()` result as 24 hexadecimal characters, without
+adding a MongoDB package dependency.
+
+Clients instrumented through `instrumentDatabaseClient` before `autoCapture` starts read the active
+race configuration when each event is built, so the call order remains safe.
+Do not use any of those raw or redacted values as a cross session join key.
+
+## Prisma
+
+Use the explicit fallback when the Prisma client already exists before `autoCapture` starts, or
+when the application wants to wire the client itself:
+
+```ts
+import { instrumentPrismaClient } from "crumbtrail-node";
+
+const db = instrumentPrismaClient(prisma, {
+  getRequestId: () => requestStore.getStore()?.requestId,
+  emit: sendBackendEvent,
+});
+```
+
+The function returns Prisma's extended client. Prisma query extensions do not expose transaction
+commit or rollback outcome, so the adapter captures ordinary database evidence but never adds
+`raceEvidence`.
+
+## MongoDB
+
+Enable command monitoring before instrumenting an existing `MongoClient`:
+
+```ts
+import { MongoClient, type Db } from "mongodb";
+import { instrumentMongoClient } from "crumbtrail-node";
+
+const client = new MongoClient(process.env.MONGODB_URL!, {
+  monitorCommands: true,
+});
+const instrumented = instrumentMongoClient(client, {
+  getRequestId: () => requestStore.getStore()?.requestId,
+  emit: sendBackendEvent,
+});
+const db: Db = instrumented.db("app");
+```
+
+The command monitor captures supported statements and returns the original client. MongoDB command
+monitoring does not expose transaction commit or rollback outcome, so this adapter never adds
+`raceEvidence`. `autoCapture` enables `monitorCommands` when it patches the `MongoClient`
+constructor.
+
 ## Postgres (`pg` Client or Pool)
 
 ```ts

@@ -10,10 +10,15 @@ import { runInBackendRequestContext } from "../request-context";
 
 const ENDPOINT = "http://127.0.0.1:9899";
 
-function makeFakeProcess(): NodeJS.Process {
+function makeFakeProcess(
+  opts: {
+    env?: Record<string, string | undefined>;
+  } = {},
+): NodeJS.Process {
   const emitter = new EventEmitter() as unknown as NodeJS.Process;
   (emitter as unknown as { env: Record<string, string | undefined> }).env = {
     CRUMBTRAIL_KEY: "k",
+    ...opts.env,
   };
   (emitter as unknown as { exit: (code: number) => void }).exit = vi.fn();
   return emitter;
@@ -47,8 +52,25 @@ function eventKinds(calls: FetchCall[]): string[] {
   return out;
 }
 
+function eventsFrom(
+  calls: FetchCall[],
+): Array<{ k: string; d: Record<string, unknown> }> {
+  const out: Array<{ k: string; d: Record<string, unknown> }> = [];
+  for (const call of calls) {
+    if (!call.url.endsWith("/api/events")) continue;
+    const body = JSON.parse(call.init.body as string) as {
+      events?: Array<{ k: string; d: Record<string, unknown> }>;
+    };
+    out.push(...(body.events ?? []));
+  }
+  return out;
+}
+
 /** A `pg`-shaped pool that records the statements it was asked to run. */
-function makePool(): { pool: { query(t: string): Promise<unknown> }; executed: string[] } {
+function makePool(): {
+  pool: { query(t: string): Promise<unknown> };
+  executed: string[];
+} {
   const executed: string[] = [];
   const pool = {
     async query(text: string): Promise<{ rows: unknown[]; rowCount: number }> {
@@ -94,6 +116,37 @@ describe("instrumentDatabaseClient", () => {
 
     expect(executed.some((sql) => sql.includes("UPDATE carts"))).toBe(true);
     expect(eventKinds(calls).some((k) => k.startsWith("db"))).toBe(true);
+  });
+
+  it("reads later active race configuration when an explicit client was instrumented first", async () => {
+    const { pool } = makePool();
+    const instrumented = instrumentDatabaseClient(pool);
+    const { fetchImpl, calls } = makeFetch();
+    const handle = await autoCapture({
+      endpoint: ENDPOINT,
+      service: "svc-race",
+      processImpl: makeFakeProcess({
+        env: {
+          CRUMBTRAIL_KEY:
+            "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef",
+        },
+      }),
+      consoleImpl: { error: vi.fn() } as unknown as Console,
+      fetchImpl,
+      onCrashExit: () => {},
+      instrumentDatabases: false,
+      raceEvidence: { enabled: true },
+    });
+    openHandles.push(handle);
+
+    await runInBackendRequestContext(
+      { requestId: "req-race", sessionId: "sess-race" },
+      () => instrumented.query("UPDATE carts SET total = 10 WHERE id = 1"),
+    );
+    await new Promise((r) => setTimeout(r, 0));
+
+    const diffs = eventsFrom(calls).filter((event) => event.k === "db.diff");
+    expect(diffs.some((event) => event.d.raceEvidence)).toBe(true);
   });
 
   it("is inert, not fatal, when no capture is running", async () => {

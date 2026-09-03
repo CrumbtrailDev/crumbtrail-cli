@@ -11,7 +11,14 @@ import {
   startHeadlessSession,
   type HeadlessSession,
 } from "./headless-session";
-import { clearActiveDbSink, setActiveDbSink } from "./db/active-sink";
+import {
+  clearActiveDbSink,
+  emitActiveDbEvent,
+  readActiveDbCaptureGeneration,
+  readActiveDbRaceEvidence,
+  readActiveDbRequestId,
+  setActiveDbSink,
+} from "./db/active-sink";
 import {
   autoInstrumentDbClients,
   autoInstrumentPatchedAnything,
@@ -50,6 +57,11 @@ import {
   installRuntimeMetrics,
   type RuntimeMetricsHandle,
 } from "./runtime-metrics";
+import {
+  createHmacRaceEvidenceResolver,
+  readInstrumentRaceEvidence,
+  type RaceEvidenceInstrumentationOptions,
+} from "./race-evidence";
 
 /**
  * Canonical event kind emitted for an auto-captured backend error (crash or
@@ -187,6 +199,14 @@ export interface AutoCaptureOptions {
   cacheDrivers?: readonly AutoInstrumentCacheDriver[];
   /** Module resolver seam for cache auto-instrumentation (tests). */
   cacheResolve?: (specifier: string) => unknown;
+  /**
+   * Opt in to bounded cross session DB and cache race evidence. A strong
+   * ingest credential is used only inside an HMAC resolver. Without one,
+   * provide fixed format opaque identifiers through a per-operation `resolve`.
+   * Static `identifiers` are reserved for direct one-event builders and are
+   * ignored by this multi-operation capture path.
+   */
+  raceEvidence?: RaceEvidenceInstrumentationOptions;
   /**
    * When true (default) record Node runtime warnings (`process.on("warning")`)
    * as `backend.warning` events. This is the only path by which a
@@ -518,6 +538,10 @@ export async function autoCapture(
   }
 
   const authToken = options.authToken ?? proc.env.CRUMBTRAIL_KEY;
+  const raceEvidence = resolveRaceEvidenceOptions(
+    options.raceEvidence,
+    authToken,
+  );
   const now = options.nowImpl ?? Date.now;
   // Stable id reused across every (re-)establishment attempt so events correlate
   // to one logical session even if the first handshake failed and a later one
@@ -825,6 +849,7 @@ export async function autoCapture(
   const dbSink = {
     emit: emitSessionEvent,
     getRequestId: () => readRequestCorrelation()?.requestId,
+    raceEvidence,
   };
   setActiveDbSink(dbSink);
 
@@ -832,19 +857,21 @@ export async function autoCapture(
   if (options.instrumentDatabases !== false) {
     try {
       dbInstrumentation = autoInstrumentDbClients({
-        emit: emitSessionEvent,
+        emit: emitActiveDbEvent,
         // The bridge to the request the statement ran inside. Without it every
         // wrapped driver reads an undefined request id and hands the statement
         // straight back to the host, so a correctly patched pool still produced
         // no evidence — the instrumentation was installed and inert. Resolved
         // per statement, because the scope is AsyncLocalStorage state that only
         // exists once a request is in flight.
-        getRequestId: dbSink.getRequestId,
+        getRequestId: readActiveDbRequestId,
         captureReads: options.captureDatabaseReads ?? false,
         captureBefore: options.captureDatabaseBeforeImages ?? false,
         captureCallsite: options.captureDatabaseCallsites ?? false,
         drivers: options.databaseDrivers,
         resolve: options.databaseResolve,
+        getRaceEvidence: readActiveDbRaceEvidence,
+        getCaptureGeneration: readActiveDbCaptureGeneration,
       });
       const line = formatAutoInstrumentReport(dbInstrumentation);
       // The success line stays behind `debug`: a healthy install is quiet. The
@@ -866,12 +893,14 @@ export async function autoCapture(
   if (options.instrumentCaches !== false) {
     try {
       cacheInstrumentation = autoInstrumentCacheClients({
-        emit: emitSessionEvent,
+        emit: emitActiveDbEvent,
         // Cache and database evidence read the same AsyncLocalStorage request scope, so their
         // requestId joins without a second correlation scheme.
-        getRequestId: dbSink.getRequestId,
+        getRequestId: readActiveDbRequestId,
         drivers: options.cacheDrivers,
         resolve: options.cacheResolve,
+        getRaceEvidence: readActiveDbRaceEvidence,
+        getCaptureGeneration: readActiveDbCaptureGeneration,
       });
       const line = formatAutoInstrumentCacheReport(cacheInstrumentation);
       if (
@@ -1467,6 +1496,27 @@ export async function autoCapture(
     flush: () => backendEventSink.flush?.() ?? Promise.resolve(),
     stop,
   };
+}
+
+/**
+ * Resolve the process credential once at startup. The returned resolver closes
+ * over the credential and exposes only fixed length digests to event builders.
+ * Weak or absent credentials leave the application's per operation resolver
+ * path in force and never become an event field. Static identifiers are not
+ * accepted by this multi operation capture path.
+ */
+function resolveRaceEvidenceOptions(
+  configured: RaceEvidenceInstrumentationOptions | undefined,
+  authToken: string | undefined,
+): RaceEvidenceInstrumentationOptions | undefined {
+  const perOperation = readInstrumentRaceEvidence({
+    raceEvidence: configured,
+  });
+  if (!perOperation?.enabled || perOperation.resolve) {
+    return perOperation;
+  }
+  const resolver = createHmacRaceEvidenceResolver(authToken);
+  return resolver ? { ...perOperation, resolve: resolver } : perOperation;
 }
 
 /** Normalize the held-event cap, refusing a negative or non-finite value. */

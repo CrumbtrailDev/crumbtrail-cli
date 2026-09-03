@@ -69,6 +69,7 @@ import {
   type InstrumentDbClientOptions,
   type ReadCallsitesByRequest,
 } from "./instrument-shared";
+import { captureGenerationFor } from "../capture-generation";
 
 const ENGINE = "postgres" as const;
 
@@ -198,6 +199,7 @@ function wrapSavepoint(
   if (typeof original !== "function") return original;
   const originalFn = original as (...args: unknown[]) => unknown;
   return function (this: unknown, ...args: unknown[]): unknown {
+    const operationOptions = captureGenerationFor(options);
     const index = args.findIndex((arg) => typeof arg === "function");
     if (index < 0) return originalFn.apply(sql, args);
     const fn = args[index] as (...values: unknown[]) => unknown;
@@ -207,7 +209,7 @@ function wrapSavepoint(
       if (typeof scoped === "function" && !isInstrumented(scoped)) {
         values[0] = wrapSql(
           scoped as DuckTypedPostgresSql,
-          options,
+          operationOptions,
           counters,
           context,
         );
@@ -229,10 +231,11 @@ function wrapUnsafe(
   if (typeof original !== "function") return original;
   const originalFn = original as (...args: unknown[]) => unknown;
   return function (this: unknown, ...args: unknown[]): unknown {
+    const operationOptions = captureGenerationFor(options);
     const query = originalFn.apply(sql, args);
     try {
       const text = typeof args[0] === "string" ? args[0] : undefined;
-      if (text) observe(query, text, options, counters, context);
+      if (text) observe(query, text, operationOptions, counters, context);
     } catch {
       // Same contract: never fail the host's statement.
     }
@@ -256,20 +259,22 @@ function wrapBegin(
   if (typeof original !== "function") return original;
   const originalFn = original as (...args: unknown[]) => unknown;
   return function (this: unknown, ...args: unknown[]): unknown {
+    const operationOptions = captureGenerationFor(options);
     const index = args.findIndex((arg) => typeof arg === "function");
     if (index < 0) return originalFn.apply(sql, args);
     const fn = args[index] as (...values: unknown[]) => unknown;
     let requestId: string | undefined;
     try {
-      requestId = options.requestId ?? options.getRequestId?.();
+      requestId =
+        operationOptions.requestId ?? operationOptions.getRequestId?.();
     } catch (error) {
-      emitGap(options, { reason: "capture_exception", error });
+      emitGap(operationOptions, { reason: "capture_exception", error });
     }
     const transaction = startDbTransaction({
       engine: ENGINE,
       requestId,
       connection: context.connection,
-      options,
+      options: operationOptions,
     });
     const wrapped = (...values: unknown[]): unknown => {
       const scoped = values[0];
@@ -277,10 +282,15 @@ function wrapBegin(
         // The transaction's statements share the outer counters on purpose: a
         // request's statement ordinals must stay one sequence whether or not a
         // transaction was opened partway through it.
-        values[0] = wrapSql(scoped as DuckTypedPostgresSql, options, counters, {
-          connection: context.connection,
-          transaction,
-        });
+        values[0] = wrapSql(
+          scoped as DuckTypedPostgresSql,
+          operationOptions,
+          counters,
+          {
+            connection: context.connection,
+            transaction,
+          },
+        );
       }
       return fn(...values);
     };
@@ -295,7 +305,7 @@ function wrapBegin(
         transaction,
         outcome: "rollback",
         requestId,
-        options,
+        options: operationOptions,
       });
       throw error;
     }
@@ -308,7 +318,7 @@ function wrapBegin(
           transaction,
           outcome: "commit",
           requestId,
-          options,
+          options: operationOptions,
         });
         return value;
       },
@@ -318,7 +328,7 @@ function wrapBegin(
           transaction,
           outcome: "rollback",
           requestId,
-          options,
+          options: operationOptions,
         });
         throw error;
       },
@@ -337,7 +347,8 @@ function wrapReserve(
   if (typeof original !== "function") return original;
   const originalFn = original as (...args: unknown[]) => unknown;
   return function (this: unknown, ...args: unknown[]): unknown {
-    const checkout = beginPoolCheckout(ENGINE, options);
+    const operationOptions = captureGenerationFor(options);
+    const checkout = beginPoolCheckout(ENGINE, operationOptions);
     const result = originalFn.apply(sql, args);
     if (!result || typeof (result as Promise<unknown>).then !== "function") {
       checkout.acquired();
@@ -348,15 +359,23 @@ function wrapReserve(
         checkout.acquired();
         try {
           if (typeof reserved === "function" && !isInstrumented(reserved)) {
-            return wrapSql(reserved as DuckTypedPostgresSql, options, counters, {
-              connection:
-                extractDbConnectionIdentity(ENGINE, reserved) ??
-                context.connection,
-              transaction: context.transaction,
-            });
+            return wrapSql(
+              reserved as DuckTypedPostgresSql,
+              operationOptions,
+              counters,
+              {
+                connection:
+                  extractDbConnectionIdentity(ENGINE, reserved) ??
+                  context.connection,
+                transaction: context.transaction,
+              },
+            );
           }
         } catch (error) {
-          emitGap(options, { reason: "uninstrumented_client", error });
+          emitGap(operationOptions, {
+            reason: "uninstrumented_client",
+            error,
+          });
         }
         return reserved;
       },
@@ -431,15 +450,17 @@ function observe(
   counters: RequestCounters,
   context: SqlContext,
 ): void {
+  const operationOptions = captureGenerationFor(options);
   const q = query as DuckTypedPostgresQuery | undefined;
   if (!q || typeof q.resolve !== "function" || typeof q.reject !== "function")
     return;
 
-  const requestId = options.requestId ?? options.getRequestId?.();
+  const requestId =
+    operationOptions.requestId ?? operationOptions.getRequestId?.();
   // No request scope means nothing to correlate the statement to, exactly as in
   // every other adapter.
   if (!requestId) return;
-  const elapsed = startDbQueryTimer(options);
+  const elapsed = startDbQueryTimer(operationOptions);
 
   let parsed: ParsedMutation | undefined;
   let parsedRead: ParsedRead | undefined;
@@ -447,7 +468,7 @@ function observe(
     if (plannedText) {
       const classification = classifyStatement(plannedText);
       if (classification.kind === "unparsable" && classification.mayMutate) {
-        emitGap(options, {
+        emitGap(operationOptions, {
           reason: "unparsed_sql",
           detail: leadingSqlKeyword(plannedText),
         });
@@ -464,11 +485,11 @@ function observe(
       // mutation with no diff is a completeness gap the reader must see.
       const keyword = leadingSqlKeyword(q.strings?.[0] ?? "");
       if (MUTATING_KEYWORDS.has(keyword.toUpperCase())) {
-        emitGap(options, { reason: "unparsed_sql", detail: keyword });
+        emitGap(operationOptions, { reason: "unparsed_sql", detail: keyword });
       }
     }
   } catch (error) {
-    emitGap(options, { reason: "capture_exception", error });
+    emitGap(operationOptions, { reason: "capture_exception", error });
     return;
   }
 
@@ -479,7 +500,7 @@ function observe(
   if (parsed && plannedText && !/\breturning\b/i.test(plannedText)) {
     rewritten = appendReturning(q);
     if (!rewritten) {
-      emitGap(options, { reason: "unparsed_sql", detail: parsed.op });
+      emitGap(operationOptions, { reason: "unparsed_sql", detail: parsed.op });
     }
   }
 
@@ -499,12 +520,12 @@ function observe(
           parsedRead,
           rewritten,
           requestId,
-          options,
+          options: operationOptions,
           counters,
           context: { ...context, durationMs: elapsed() },
         });
       } catch (error) {
-        emitGap(options, { reason: "capture_exception", error });
+        emitGap(operationOptions, { reason: "capture_exception", error });
       }
     }
     return originalResolve(value);
@@ -521,14 +542,14 @@ function observe(
           statement: statementTextOf(q, plannedText),
           requestId,
           error: reason,
-          options,
+          options: operationOptions,
           context: {
             connection: context.connection,
             transactionId: context.transaction?.id,
           },
         });
       } catch (error) {
-        emitGap(options, { reason: "capture_exception", error });
+        emitGap(operationOptions, { reason: "capture_exception", error });
       }
     }
     return originalReject(reason);

@@ -1,5 +1,8 @@
 import { instrumentMysqlClient } from "./mysql";
-import type { InstrumentDbClientOptions } from "./instrument-shared";
+import {
+  suppressRaceEvidence,
+  type InstrumentDbClientOptions,
+} from "./instrument-shared";
 
 export interface DuckTypedPlanetScaleResult {
   rows?: unknown[];
@@ -126,11 +129,14 @@ export function instrumentPlanetScaleClient<T>(
   if (!client || typeof client !== "object" || isInstrumented(client)) {
     return client;
   }
+  // The HTTP client exposes no transaction outcome to this hook. Keep its
+  // MySQL-compatible diffs, but never present them as committed race evidence.
+  const captureOptions = suppressRaceEvidence(options);
   const value = client as Record<string, unknown>;
   if (typeof value.execute === "function") {
     return wrapConnection(
       client as unknown as DuckTypedPlanetScaleConnection,
-      options,
+      captureOptions,
     ) as T;
   }
   if (typeof value.connection !== "function") return client;
@@ -145,7 +151,7 @@ export function instrumentPlanetScaleClient<T>(
               ...values: unknown[]
             ) => DuckTypedPlanetScaleConnection
           ).apply(client, args);
-          return wrapConnection(connection, options);
+          return wrapConnection(connection, captureOptions);
         };
       }
       const member = Reflect.get(target, prop, receiver);

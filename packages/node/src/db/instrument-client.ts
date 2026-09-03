@@ -13,7 +13,12 @@
  * and starting capture afterwards works, and is the ordinary shape.
  */
 
-import { emitActiveDbEvent, readActiveDbRequestId } from "./active-sink";
+import {
+  emitActiveDbEvent,
+  readActiveDbCaptureGeneration,
+  readActiveDbRaceEvidence,
+  readActiveDbRequestId,
+} from "./active-sink";
 import type { InstrumentDbClientOptions } from "./instrument-shared";
 import { instrumentPgClient } from "./pg";
 import { instrumentPostgresSql } from "./postgres-js";
@@ -90,6 +95,14 @@ export function instrumentDatabaseClient<T>(
     // An explicit requestId still wins; this is the fallback that makes the
     // call behave like the automatic path.
     getRequestId: rest.getRequestId ?? readActiveDbRequestId,
+    // Resolve on every event. A client may be instrumented before autoCapture
+    // installs its active sink, and must still pick up that later configuration.
+    getRaceEvidence:
+      rest.getRaceEvidence ??
+      (() => rest.raceEvidence ?? readActiveDbRaceEvidence()),
+    getCaptureGeneration:
+      rest.getCaptureGeneration ?? readActiveDbCaptureGeneration,
+    raceEvidence: undefined,
   };
 
   try {

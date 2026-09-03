@@ -59,16 +59,28 @@ async function assertBuiltCapabilityMarker() {
   await fs.access(distCjsPath);
   await fs.access(distEsmPath);
 
+  const cjsNamespace = createRequire(import.meta.url)(distCjsPath);
+  const esmNamespace = await import(pathToFileURL(distEsmPath).href);
   const cjs = assertCapabilityMarker(
     "CJS",
     distCjsPath,
-    createRequire(import.meta.url)(distCjsPath),
+    cjsNamespace,
   );
   const esm = assertCapabilityMarker(
     "ESM",
     distEsmPath,
-    await import(pathToFileURL(distEsmPath).href),
+    esmNamespace,
   );
+  for (const [format, namespace] of [
+    ["CJS", cjsNamespace],
+    ["ESM", esmNamespace],
+  ]) {
+    for (const name of ["instrumentPrismaClient", "instrumentMongoClient"]) {
+      if (typeof namespace[name] !== "function") {
+        throw new Error(`${format} dist does not export ${name} from package root`);
+      }
+    }
+  }
 
   console.log(
     `CRUMBTRAIL_NODE_CONTRACT_MARKER_PASS cjs=${JSON.stringify(cjs)} esm=${JSON.stringify(esm)}`,

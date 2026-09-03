@@ -10,6 +10,12 @@ import {
 } from "crumbtrail-core";
 import type { DbCallsite } from "./callsite";
 import { buildSensitiveColumnSet, redactColumns } from "./columns";
+import {
+  buildRaceEvidence,
+  isRaceEvidenceInputEligible,
+  readOptimisticVersion,
+  type RaceEvidenceOptions,
+} from "../race-evidence";
 
 export interface BuildDbDiffEventInput {
   /** Engine that produced the mutation. Defaults to `"postgres"` for back-compat. */
@@ -42,6 +48,16 @@ export interface BuildDbDiffEventInput {
   sessionStartedAt?: number | Date;
   /** Optional nested-value bounds applied after redaction. */
   valueBounds?: DbValueBounds;
+  /** Explicit opt in configuration for bounded cross session race evidence. */
+  raceEvidence?: RaceEvidenceOptions;
+  /** Configured DB primary-key columns used to require a complete identity. */
+  primaryKeyColumns?: readonly string[];
+  /**
+   * Capability asserted by a producer that observed this operation's
+   * transaction outcome. Generic builders cannot infer this from `engine`:
+   * PlanetScale uses the same `mysql` tag as transactional MySQL clients.
+   */
+  raceEvidenceCapability?: "transaction-outcome";
 }
 
 /**
@@ -132,10 +148,10 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     : Date.now();
   const sensitive = buildSensitiveColumnSet(input.redactColumns);
 
-  const after = redactColumns(input.after, sensitive, "db.diff.after");
-  const before = redactColumns(input.before, sensitive, "db.diff.before");
+  const after = safeRedactColumns(input.after, sensitive, "db.diff.after");
+  const before = safeRedactColumns(input.before, sensitive, "db.diff.before");
   const pk = input.pk
-    ? redactColumns(input.pk, sensitive, "db.diff.pk")
+    ? safeRedactColumns(input.pk, sensitive, "db.diff.pk")
     : { value: null as Record<string, unknown> | null, metadata: undefined };
 
   // Bound oversized column values AFTER redaction so a huge TEXT/JSONB cell can't rest in full.
@@ -169,6 +185,32 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     // the one thing in the event that is definitionally not user data.
     ...(input.callsite !== undefined ? { callsite: input.callsite } : {}),
   };
+  if (
+    input.raceEvidenceCapability === "transaction-outcome" &&
+    supportsGenericRaceEvidenceEngine(input.engine) &&
+    !input.transactionId &&
+    isRaceEvidenceInputEligible({
+      surface: "db.diff",
+      operation: input.op,
+      table: input.table,
+      primaryKey: input.pk,
+      primaryKeyColumns: input.primaryKeyColumns,
+    }) &&
+    (input.rowCount === undefined || input.rowCount === 1)
+  ) {
+    const versionField = input.raceEvidence?.optimisticVersionField;
+    const raceEvidence = buildRaceEvidence(input.raceEvidence, {
+      surface: "db.diff",
+      operation: input.op,
+      table: input.table,
+      primaryKey: input.pk,
+      primaryKeyColumns: input.primaryKeyColumns,
+      resourceSubject: input.raceEvidence?.resourceSubject,
+      beforeVersion: readOptimisticVersion(input.before, versionField),
+      afterVersion: readOptimisticVersion(input.after, versionField),
+    });
+    if (raceEvidence) d.raceEvidence = raceEvidence;
+  }
 
   const redaction = mergeRedactionMetadata(
     after.metadata,
@@ -188,6 +230,27 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
   if (startedAt !== undefined) event.offsetMs = Math.max(0, now - startedAt);
 
   return event;
+}
+
+function supportsGenericRaceEvidenceEngine(
+  engine: BuildDbDiffEventInput["engine"],
+): boolean {
+  // Prisma and MongoDB adapters do not expose a transaction outcome at this
+  // builder boundary. PlanetScale is intentionally represented as mysql, so a
+  // producer must assert the outcome capability explicitly instead.
+  return engine !== "prisma" && engine !== "mongodb";
+}
+
+function safeRedactColumns(
+  row: Record<string, unknown> | undefined,
+  sensitive: Set<string>,
+  path: string,
+): ReturnType<typeof redactColumns> {
+  try {
+    return redactColumns(row, sensitive, path);
+  } catch {
+    return { value: undefined };
+  }
 }
 
 function normalizeDuration(value: number | undefined): number {

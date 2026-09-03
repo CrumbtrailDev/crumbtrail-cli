@@ -32,6 +32,18 @@ import {
   DB_STATEMENT_SHAPE_LABEL,
 } from "./statement-event";
 import { buildDbTransactionEvent } from "./transaction-event";
+import {
+  readInstrumentRaceEvidence,
+  type RaceEvidenceOptions,
+  type RaceEvidenceInstrumentationOptions,
+} from "../race-evidence";
+import {
+  captureGenerationFor,
+  ownsCaptureGeneration,
+  withCaptureGeneration,
+  type CaptureGeneration,
+  type CaptureGenerationState,
+} from "../capture-generation";
 
 /**
  * Engine-agnostic emission pipeline shared by every DB adapter. All functions here are synchronous
@@ -77,7 +89,7 @@ export interface InstrumentDbClientOptions {
   getRequestId?: () => string | undefined;
   sessionId?: string;
   /** Sink for emitted `db.diff` events (e.g. forward to `sendBackendEvent`). */
-  emit: (event: BugEvent) => void;
+  emit: (event: BugEvent, generation?: CaptureGenerationState) => void;
   /** A separate, non recursive sink for a capture gap when `emit` fails. */
   emitGap?: (event: BugEvent) => void;
   /** Alias for `emitGap` used by hosts that keep gap handling separate from event emission. */
@@ -110,6 +122,14 @@ export interface InstrumentDbClientOptions {
   /** Monotonic clock seam used only for statement duration measurement. */
   durationNow?: () => number;
   sessionStartedAt?: number | Date;
+  /** Explicit opt in configuration for bounded cross session race evidence. */
+  raceEvidence?: RaceEvidenceInstrumentationOptions;
+  /** Resolve race evidence configuration when each event is built. */
+  getRaceEvidence?: () => RaceEvidenceOptions | undefined;
+  /** Internal capture ownership captured when an asynchronous operation starts. */
+  captureGeneration?: CaptureGenerationState;
+  /** Internal lifecycle seam used to capture ownership for a new operation. */
+  getCaptureGeneration?: () => CaptureGeneration | undefined;
 }
 
 export interface PoolCheckoutCapture {
@@ -122,9 +142,10 @@ export function beginPoolCheckout(
   engine: DbEngine,
   options: InstrumentDbClientOptions,
 ): PoolCheckoutCapture {
+  const operationOptions = captureGenerationFor(options);
   let requestId: string | undefined;
   try {
-    requestId = options.requestId ?? options.getRequestId?.();
+    requestId = operationOptions.requestId ?? operationOptions.getRequestId?.();
   } catch {
     requestId = undefined;
   }
@@ -149,7 +170,7 @@ export function beginPoolCheckout(
       if (!requestId) return;
       const timing = elapsed();
       emitDbEvent(
-        options,
+        operationOptions,
         buildDbPoolWaitEvent({
           engine,
           requestId,
@@ -165,7 +186,7 @@ export function beginPoolCheckout(
       if (!requestId || !isPoolCheckoutTimeout(engine, error)) return;
       const timing = elapsed();
       emitDbEvent(
-        options,
+        operationOptions,
         buildDbPoolTimeoutEvent({
           engine,
           requestId,
@@ -310,6 +331,7 @@ function connectionRole(
 export interface DbTransactionContext {
   id: string;
   connection?: DbConnectionIdentity;
+  captureGeneration?: CaptureGenerationState;
 }
 
 export type DbTransactionCommand = "begin" | "commit" | "rollback";
@@ -342,25 +364,35 @@ export function startDbTransaction(input: {
   connection?: DbConnectionIdentity;
   options: InstrumentDbClientOptions;
 }): DbTransactionContext {
+  const operationOptions = captureGenerationFor(input.options);
   let id: string;
   try {
     id = `dbtx_${randomUUID()}`;
   } catch {
     id = `dbtx_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   }
-  const transaction = { id, connection: input.connection };
+  const transaction: DbTransactionContext = {
+    id,
+    connection: input.connection,
+    ...(Object.prototype.hasOwnProperty.call(
+      operationOptions,
+      "captureGeneration",
+    )
+      ? { captureGeneration: operationOptions.captureGeneration }
+      : {}),
+  };
   try {
     emitDbEvent(
-      input.options,
+      operationOptions,
       buildDbTransactionEvent({
         engine: input.engine,
         transactionId: transaction.id,
         outcome: "open",
         requestId: input.requestId,
         connection: input.connection,
-        sessionId: input.options.sessionId,
-        now: input.options.now?.(),
-        sessionStartedAt: input.options.sessionStartedAt,
+        sessionId: operationOptions.sessionId,
+        now: operationOptions.now?.(),
+        sessionStartedAt: operationOptions.sessionStartedAt,
       }),
     );
   } catch {
@@ -377,17 +409,21 @@ export function finishDbTransaction(input: {
   options: InstrumentDbClientOptions;
 }): void {
   try {
-    emitDbEvent(
+    const operationOptions = withCaptureGeneration(
       input.options,
+      input.transaction.captureGeneration,
+    );
+    emitDbEvent(
+      operationOptions,
       buildDbTransactionEvent({
         engine: input.engine,
         transactionId: input.transaction.id,
         outcome: input.outcome,
         requestId: input.requestId,
         connection: input.transaction.connection,
-        sessionId: input.options.sessionId,
-        now: input.options.now?.(),
-        sessionStartedAt: input.options.sessionStartedAt,
+        sessionId: operationOptions.sessionId,
+        now: operationOptions.now?.(),
+        sessionStartedAt: operationOptions.sessionStartedAt,
       }),
     );
   } catch {
@@ -414,9 +450,10 @@ export function emitGap(
   options: InstrumentDbClientOptions,
   input: EmitGapInput,
 ): void {
+  if (!ownsCaptureGeneration(options)) return;
   const event = buildGapEvent(options, input);
   try {
-    options.emit(event);
+    options.emit(event, options.captureGeneration);
   } catch (error) {
     emitGapFallback(options, event, error);
   }
@@ -444,8 +481,9 @@ export function emitDbEvent(
   options: InstrumentDbClientOptions,
   event: BugEvent,
 ): boolean {
+  if (!ownsCaptureGeneration(options)) return false;
   try {
-    options.emit(event);
+    options.emit(event, options.captureGeneration);
     return true;
   } catch (error) {
     emitGapFallback(
@@ -510,25 +548,44 @@ export function extractPk(
   table: string,
   pkColumns?: Record<string, readonly string[]>,
 ): Record<string, unknown> | null {
-  const cols = pkColumns?.[table] ?? ["id"];
-  const pk: Record<string, unknown> = {};
-  for (const col of cols) {
-    if (col in row) pk[col] = row[col];
+  try {
+    const cols = pkColumns?.[table] ?? ["id"];
+    const pk: Record<string, unknown> = {};
+    for (const col of cols) {
+      if (col in row) pk[col] = row[col];
+    }
+    return Object.keys(pk).length > 0 ? pk : null;
+  } catch {
+    return null;
   }
-  return Object.keys(pk).length > 0 ? pk : null;
 }
 
 export function pkKey(pk: Record<string, unknown> | null): string {
-  return pk ? JSON.stringify(pk) : "";
+  try {
+    return pk ? JSON.stringify(pk) : "";
+  } catch {
+    return "";
+  }
 }
 
 function redactPkSample(
   pk: Record<string, unknown> | null,
   sensitive: ReturnType<typeof buildSensitiveColumnSet>,
 ): Record<string, unknown> | null {
-  return pk
-    ? (redactColumns(pk, sensitive, "db.diff.bulk.samplePks").value ?? null)
-    : null;
+  try {
+    return pk
+      ? (redactColumns(pk, sensitive, "db.diff.bulk.samplePks").value ?? null)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Adapter fallback for drivers whose hooks cannot prove transaction outcome. */
+export function suppressRaceEvidence(
+  options: InstrumentDbClientOptions,
+): InstrumentDbClientOptions {
+  return { ...options, raceEvidence: undefined, getRaceEvidence: undefined };
 }
 
 export function normalizeMaxRowsPerStatement(
@@ -716,6 +773,8 @@ export function emitDbDiffEvents(input: {
   beforeImageStatus?: DbBeforeImageStatus;
   /** Total rows the statement changed (may exceed `rows.length` when the driver reports more). */
   rowCount: number;
+  /** True when the adapter knows this result came from a bulk operation. */
+  bulk?: boolean;
   options: InstrumentDbClientOptions;
   context?: DbStatementContext;
   valueBounds?: DbValueBounds;
@@ -729,6 +788,7 @@ export function emitDbDiffEvents(input: {
     beforeByPk,
     beforeImageStatus,
     rowCount,
+    bulk,
     options,
   } = input;
   const maxRows = normalizeMaxRowsPerStatement(options.maxRowsPerStatement);
@@ -759,6 +819,14 @@ export function emitDbDiffEvents(input: {
       sessionStartedAt: options.sessionStartedAt,
       valueBounds: input.valueBounds,
       beforeImageStatus,
+      // A row from a bulk statement is not a single entity operation. Omit
+      // race evidence even when the row cap leaves one image to emit.
+      raceEvidence:
+        !bulk && rowCount === 1 && rows.length === 1
+          ? readInstrumentRaceEvidence(options)
+          : undefined,
+      primaryKeyColumns: options.pkColumns?.[table] ?? ["id"],
+      raceEvidenceCapability: "transaction-outcome",
       ...(op === "delete"
         ? { before: row }
         : { after: row, before: beforeByPk?.get(pkKey(pk)) }),
@@ -1087,6 +1155,12 @@ export function emitDbReadEvents(input: {
           now: options.now?.(),
           sessionStartedAt: options.sessionStartedAt,
           valueBounds: input.valueBounds,
+          raceEvidence:
+            rowCount === 1 && rows.length === 1
+              ? readInstrumentRaceEvidence(options)
+              : undefined,
+          primaryKeyColumns: options.pkColumns?.[table] ?? ["id"],
+          raceEvidenceCapability: "transaction-outcome",
         }),
       )
     ) {
