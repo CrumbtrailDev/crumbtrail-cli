@@ -66,9 +66,9 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
     ? Math.round(input.now as number)
     : Date.now();
   const sensitive = buildSensitiveColumnSet(input.redactColumns);
-  const row = redactColumns(input.row, sensitive, "db.read.row");
+  const row = safeRedactColumns(input.row, sensitive, "db.read.row");
   const pk = input.pk
-    ? redactColumns(input.pk, sensitive, "db.read.pk")
+    ? safeRedactColumns(input.pk, sensitive, "db.read.pk")
     : { value: null as Record<string, unknown> | null, metadata: undefined };
 
   const boundedRow = boundColumnRow(row.value, input.valueBounds) ?? {};
@@ -137,6 +137,18 @@ export function buildDbReadEvent(input: BuildDbReadEventInput): BugEvent {
   const startedAt = normalizeStartedAt(input.sessionStartedAt);
   if (startedAt !== undefined) event.offsetMs = Math.max(0, now - startedAt);
   return event;
+}
+
+function safeRedactColumns(
+  row: Record<string, unknown> | undefined,
+  sensitive: Set<string>,
+  path: string,
+): ReturnType<typeof redactColumns> {
+  try {
+    return redactColumns(row, sensitive, path);
+  } catch {
+    return { value: undefined };
+  }
 }
 
 function normalizeDuration(value: number | undefined): number {

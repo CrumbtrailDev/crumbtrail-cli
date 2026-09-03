@@ -186,10 +186,14 @@ export function readOptimisticVersion(
   row: Record<string, unknown> | undefined,
   field: string | undefined,
 ): unknown {
-  if (!row || !isVersionField(field)) return undefined;
-  return Object.prototype.hasOwnProperty.call(row, field)
-    ? row[field]
-    : undefined;
+  try {
+    if (!row || !isVersionField(field)) return undefined;
+    return Object.prototype.hasOwnProperty.call(row, field)
+      ? row[field]
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function isVersionField(value: string | undefined): value is string {
@@ -290,49 +294,57 @@ function isIdentifier(value: unknown): value is string {
 export function isRaceEvidenceInputEligible(
   input: RaceEvidenceResolverInput,
 ): boolean {
-  if (
-    !input ||
-    typeof input !== "object" ||
-    typeof input.surface !== "string" ||
-    typeof input.operation !== "string"
-  ) {
+  try {
+    if (
+      !input ||
+      typeof input !== "object" ||
+      typeof input.surface !== "string" ||
+      typeof input.operation !== "string"
+    ) {
+      return false;
+    }
+    if (input.surface === "cache") {
+      return (
+        isRaceEligibleCacheOperation(input.operation) &&
+        input.cacheKey !== undefined &&
+        input.cacheKey !== null &&
+        !Array.isArray(input.cacheKey)
+      );
+    }
+    return (
+      (input.surface === "db.read" || input.surface === "db.diff") &&
+      input.operation.length > 0 &&
+      isResolvedDatabasePrimaryKey(input.primaryKey, input.primaryKeyColumns)
+    );
+  } catch {
     return false;
   }
-  if (input.surface === "cache") {
-    return (
-      isRaceEligibleCacheOperation(input.operation) &&
-      input.cacheKey !== undefined &&
-      input.cacheKey !== null &&
-      !Array.isArray(input.cacheKey)
-    );
-  }
-  return (
-    (input.surface === "db.read" || input.surface === "db.diff") &&
-    input.operation.length > 0 &&
-    isResolvedDatabasePrimaryKey(input.primaryKey, input.primaryKeyColumns)
-  );
 }
 
 function isResolvedDatabasePrimaryKey(
   primaryKey: Record<string, unknown> | null | undefined,
   columns?: readonly string[],
 ): boolean {
-  if (
-    !primaryKey ||
-    typeof primaryKey !== "object" ||
-    Array.isArray(primaryKey)
-  )
+  try {
+    if (
+      !primaryKey ||
+      typeof primaryKey !== "object" ||
+      Array.isArray(primaryKey)
+    )
+      return false;
+    const keys =
+      columns && columns.length > 0 ? columns : Object.keys(primaryKey);
+    if (keys.length === 0) return false;
+    return keys.every(
+      (key) =>
+        typeof key === "string" &&
+        key.length > 0 &&
+        Object.prototype.hasOwnProperty.call(primaryKey, key) &&
+        primaryKey[key] !== undefined,
+    );
+  } catch {
     return false;
-  const keys =
-    columns && columns.length > 0 ? columns : Object.keys(primaryKey);
-  if (keys.length === 0) return false;
-  return keys.every(
-    (key) =>
-      typeof key === "string" &&
-      key.length > 0 &&
-      Object.prototype.hasOwnProperty.call(primaryKey, key) &&
-      primaryKey[key] !== undefined,
-  );
+  }
 }
 
 function normalizeCredential(value: string | undefined): string | undefined {
@@ -376,50 +388,104 @@ function digest(
 /** Small deterministic serializer for PKs, cache keys, and version values. */
 function canonicalize(value: unknown, depth = 0): string | undefined {
   if (depth > 4) return undefined;
-  if (value === null) return "null";
+  if (value === null) return encodeToken("z", "");
   switch (typeof value) {
     case "string":
-      return value.length <= MAX_SOURCE_LENGTH ? `s:${value}` : undefined;
+      return encodeToken("s", value);
     case "number":
-      return Number.isFinite(value) ? `n:${String(value)}` : undefined;
+      return Number.isFinite(value)
+        ? encodeToken("n", Object.is(value, -0) ? "-0" : String(value))
+        : undefined;
     case "boolean":
-      return `b:${value ? "1" : "0"}`;
+      return encodeToken("b", value ? "1" : "0");
     case "bigint":
-      return `i:${String(value)}`;
+      return encodeToken("i", String(value));
     case "undefined":
-      return "u:";
+      return encodeToken("u", "");
     case "object":
-      if (Array.isArray(value)) {
-        if (value.length > MAX_OBJECT_KEYS) return undefined;
-        const entries = value.map((entry) => canonicalize(entry, depth + 1));
-        if (!entries.every((entry) => entry !== undefined)) return undefined;
-        const source = `a:[${entries.join(",")}]`;
-        return source.length <= MAX_SOURCE_LENGTH ? source : undefined;
-      }
       try {
+        if (Array.isArray(value)) return canonicalizeArray(value, depth);
         const prototype = Object.getPrototypeOf(value);
         const objectId = canonicalizeObjectId(value, prototype);
         if (objectId !== undefined) return objectId;
         if (prototype !== Object.prototype && prototype !== null)
           return undefined;
-        const entries = Object.entries(value as Record<string, unknown>);
+        const entries: Array<[string, PropertyDescriptor]> = [];
+        for (const key of Reflect.ownKeys(value)) {
+          if (typeof key !== "string") return undefined;
+          const descriptor = Object.getOwnPropertyDescriptor(value, key);
+          if (!descriptor || !descriptor.enumerable || !("value" in descriptor))
+            return undefined;
+          entries.push([key, descriptor]);
+        }
         if (entries.length > MAX_OBJECT_KEYS) return undefined;
         entries.sort(([left], [right]) => compareUtf16(left, right));
-        const rendered = entries.map(([key, entry]) => {
-          const normalized = canonicalize(entry, depth + 1);
-          return normalized === undefined
+        const rendered = entries.map(([key, descriptor]) => {
+          const normalized = canonicalize(descriptor.value, depth + 1);
+          const encodedKey = encodeToken("k", key);
+          return normalized === undefined || encodedKey === undefined
             ? undefined
-            : `${key.length}:${key}=${normalized}`;
+            : `${encodedKey}${normalized}`;
         });
         if (!rendered.every((entry) => entry !== undefined)) return undefined;
-        const source = `o:{${rendered.join(",")}}`;
-        return source.length <= MAX_SOURCE_LENGTH ? source : undefined;
+        return encodeToken("o", `${entries.length}:${rendered.join("")}`);
       } catch {
         return undefined;
       }
     default:
       return undefined;
   }
+}
+
+function canonicalizeArray(value: object, depth: number): string | undefined {
+  try {
+    const array = value as unknown as Array<unknown>;
+    const length = array.length;
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_OBJECT_KEYS)
+      return undefined;
+
+    for (const key of Reflect.ownKeys(array)) {
+      if (key === "length") continue;
+      if (typeof key !== "string" || !isArrayIndexKey(key, length))
+        return undefined;
+      const descriptor = Object.getOwnPropertyDescriptor(array, key);
+      if (!descriptor || !("value" in descriptor)) return undefined;
+    }
+
+    const entries: string[] = [];
+    for (let index = 0; index < length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(array, index)) {
+        entries.push("h0:");
+        continue;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(array, String(index));
+      const normalized = descriptor
+        ? canonicalize(descriptor.value, depth + 1)
+        : undefined;
+      if (normalized === undefined) return undefined;
+      entries.push(normalized);
+    }
+    return encodeToken("a", `${length}:${entries.join("")}`);
+  } catch {
+    return undefined;
+  }
+}
+
+function isArrayIndexKey(key: string, length: number): boolean {
+  const index = Number(key);
+  return (
+    Number.isInteger(index) &&
+    index >= 0 &&
+    index < length &&
+    String(index) === key
+  );
+}
+
+function encodeToken(tag: string, payload: string): string | undefined {
+  const source = `${tag}${Buffer.byteLength(payload, "utf8")}:${payload}`;
+  return Buffer.byteLength(source, "utf8") <= MAX_SOURCE_LENGTH
+    ? source
+    : undefined;
 }
 
 /** Compare strings by UTF-16 code units, without process locale state. */
@@ -457,7 +523,7 @@ function canonicalizeObjectId(
     }
     const hex = Reflect.apply(method, value, []);
     return typeof hex === "string" && /^[a-f0-9]{24}$/i.test(hex)
-      ? `oid:${hex.toLowerCase()}`
+      ? encodeToken("q", hex.toLowerCase())
       : undefined;
   } catch {
     return undefined;

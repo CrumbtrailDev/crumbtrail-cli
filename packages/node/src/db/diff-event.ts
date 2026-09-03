@@ -142,10 +142,14 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
     : Date.now();
   const sensitive = buildSensitiveColumnSet(input.redactColumns);
 
-  const after = redactColumns(input.after, sensitive, "db.diff.after");
-  const before = redactColumns(input.before, sensitive, "db.diff.before");
+  const after = safeRedactColumns(input.after, sensitive, "db.diff.after");
+  const before = safeRedactColumns(
+    input.before,
+    sensitive,
+    "db.diff.before",
+  );
   const pk = input.pk
-    ? redactColumns(input.pk, sensitive, "db.diff.pk")
+    ? safeRedactColumns(input.pk, sensitive, "db.diff.pk")
     : { value: null as Record<string, unknown> | null, metadata: undefined };
 
   // Bound oversized column values AFTER redaction so a huge TEXT/JSONB cell can't rest in full.
@@ -222,6 +226,18 @@ export function buildDbDiffEvent(input: BuildDbDiffEventInput): BugEvent {
   if (startedAt !== undefined) event.offsetMs = Math.max(0, now - startedAt);
 
   return event;
+}
+
+function safeRedactColumns(
+  row: Record<string, unknown> | undefined,
+  sensitive: Set<string>,
+  path: string,
+): ReturnType<typeof redactColumns> {
+  try {
+    return redactColumns(row, sensitive, path);
+  } catch {
+    return { value: undefined };
+  }
 }
 
 function normalizeDuration(value: number | undefined): number {

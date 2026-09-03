@@ -90,6 +90,72 @@ describe("race evidence contract", () => {
     );
   });
 
+  it("keeps delimiter-containing values injective", () => {
+    const resolver = createHmacRaceEvidenceResolver(
+      "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef",
+    )!;
+    const embedded = resolver({
+      surface: "db.read",
+      operation: "read",
+      table: "orders",
+      primaryKey: { id: "s:one,1:z=s:two" },
+    });
+    const separate = resolver({
+      surface: "db.read",
+      operation: "read",
+      table: "orders",
+      primaryKey: { id: "s:one", z: "two" },
+    });
+
+    expect(embedded?.entityHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(separate?.entityHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(embedded?.entityHash).not.toBe(separate?.entityHash);
+  });
+
+  it("keeps nested values injective", () => {
+    const resolver = createHmacRaceEvidenceResolver(
+      "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef",
+    )!;
+    const embedded = resolver({
+      surface: "db.read",
+      operation: "read",
+      table: "orders",
+      primaryKey: { id: { value: "s:x,1:z=s:y" } },
+    });
+    const separate = resolver({
+      surface: "db.read",
+      operation: "read",
+      table: "orders",
+      primaryKey: { id: { value: "s:x", z: "y" } },
+    });
+
+    expect(embedded?.entityHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(separate?.entityHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(embedded?.entityHash).not.toBe(separate?.entityHash);
+  });
+
+  it("keeps sparse arrays distinct from dense arrays", () => {
+    const resolver = createHmacRaceEvidenceResolver(
+      "ctkey_0123456789abcdef0123456789abcdef0123456789abcdef",
+    )!;
+    const empty = resolver({
+      surface: "db.read",
+      operation: "read",
+      table: "orders",
+      primaryKey: { id: [] },
+    });
+    const sparse = resolver({
+      surface: "db.read",
+      operation: "read",
+      table: "orders",
+      primaryKey: { id: new Array(2) },
+    });
+
+    expect(empty?.entityHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(sparse?.entityHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(empty?.entityHash).not.toBe(sparse?.entityHash);
+  });
+
   it("refuses weak credentials and malformed opaque output", () => {
     expect(createHmacRaceEvidenceResolver("short")).toBeUndefined();
     expect(createHmacRaceEvidenceResolver("a".repeat(64))).toBeUndefined();
@@ -235,6 +301,61 @@ describe("race evidence contract", () => {
       buildDbDiffEvent({ ...base, pk: { tenantId: "t1", id: 1 } }).d
         .raceEvidence,
     ).toEqual({ entityHash: opaque("e") });
+  });
+
+  it("keeps normal builders safe when primary-key accessors or ownKeys throw", () => {
+    const raceEvidence = {
+      enabled: true,
+      identifiers: { entityHash: opaque("e") },
+    };
+    const accessor = {} as Record<string, unknown>;
+    Object.defineProperty(accessor, "id", {
+      enumerable: true,
+      get() {
+        throw new Error("hostile accessor");
+      },
+    });
+    const ownKeys = new Proxy(
+      { id: 1 },
+      {
+        ownKeys() {
+          throw new Error("hostile ownKeys");
+        },
+      },
+    );
+
+    for (const pk of [accessor, ownKeys]) {
+      expect(() =>
+        buildDbDiffEvent({
+          op: "update",
+          table: "orders",
+          pk,
+          after: { id: 1 },
+          requestId: "req-hostile-pk",
+          raceEvidence,
+        }),
+      ).not.toThrow();
+      const diff = buildDbDiffEvent({
+        op: "update",
+        table: "orders",
+        pk,
+        after: { id: 1 },
+        requestId: "req-hostile-pk",
+        raceEvidence,
+      });
+      expect(diff.k).toBe("db.diff");
+      expect(diff.d.raceEvidence).toBeUndefined();
+    }
+
+    const read = buildDbReadEvent({
+      table: "orders",
+      pk: ownKeys,
+      row: { id: 1 },
+      requestId: "req-hostile-pk-read",
+      raceEvidence,
+    });
+    expect(read.k).toBe("db.read");
+    expect(read.d.raceEvidence).toBeUndefined();
   });
 
   it("keeps canonical object identity stable across process locale settings", () => {

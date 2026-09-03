@@ -519,25 +519,44 @@ export function extractPk(
   table: string,
   pkColumns?: Record<string, readonly string[]>,
 ): Record<string, unknown> | null {
-  const cols = pkColumns?.[table] ?? ["id"];
-  const pk: Record<string, unknown> = {};
-  for (const col of cols) {
-    if (col in row) pk[col] = row[col];
+  try {
+    const cols = pkColumns?.[table] ?? ["id"];
+    const pk: Record<string, unknown> = {};
+    for (const col of cols) {
+      if (col in row) pk[col] = row[col];
+    }
+    return Object.keys(pk).length > 0 ? pk : null;
+  } catch {
+    return null;
   }
-  return Object.keys(pk).length > 0 ? pk : null;
 }
 
 export function pkKey(pk: Record<string, unknown> | null): string {
-  return pk ? JSON.stringify(pk) : "";
+  try {
+    return pk ? JSON.stringify(pk) : "";
+  } catch {
+    return "";
+  }
 }
 
 function redactPkSample(
   pk: Record<string, unknown> | null,
   sensitive: ReturnType<typeof buildSensitiveColumnSet>,
 ): Record<string, unknown> | null {
-  return pk
-    ? (redactColumns(pk, sensitive, "db.diff.bulk.samplePks").value ?? null)
-    : null;
+  try {
+    return pk
+      ? (redactColumns(pk, sensitive, "db.diff.bulk.samplePks").value ?? null)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Adapter fallback for drivers whose hooks cannot prove transaction outcome. */
+export function suppressRaceEvidence(
+  options: InstrumentDbClientOptions,
+): InstrumentDbClientOptions {
+  return { ...options, raceEvidence: undefined, getRaceEvidence: undefined };
 }
 
 export function normalizeMaxRowsPerStatement(
@@ -725,6 +744,8 @@ export function emitDbDiffEvents(input: {
   beforeImageStatus?: DbBeforeImageStatus;
   /** Total rows the statement changed (may exceed `rows.length` when the driver reports more). */
   rowCount: number;
+  /** True when the adapter knows this result came from a bulk operation. */
+  bulk?: boolean;
   options: InstrumentDbClientOptions;
   context?: DbStatementContext;
   valueBounds?: DbValueBounds;
@@ -738,6 +759,7 @@ export function emitDbDiffEvents(input: {
     beforeByPk,
     beforeImageStatus,
     rowCount,
+    bulk,
     options,
   } = input;
   const maxRows = normalizeMaxRowsPerStatement(options.maxRowsPerStatement);
@@ -771,7 +793,7 @@ export function emitDbDiffEvents(input: {
       // A row from a bulk statement is not a single entity operation. Omit
       // race evidence even when the row cap leaves one image to emit.
       raceEvidence:
-        rowCount === 1 && rows.length === 1
+        !bulk && rowCount === 1 && rows.length === 1
           ? readInstrumentRaceEvidence(options)
           : undefined,
       primaryKeyColumns: options.pkColumns?.[table] ?? ["id"],
