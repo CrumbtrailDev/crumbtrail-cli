@@ -87,6 +87,93 @@ afterEach(() => {
 });
 
 describe("collector switches applied to a live session", () => {
+  it("live-toggles storage failure hooks when the remote trigger changes", async () => {
+    const failure = new DOMException("private database", "UnknownError");
+    const firstRequest = new EventTarget() as EventTarget & {
+      error?: unknown;
+    };
+    firstRequest.error = failure;
+    const pendingRequest = new EventTarget() as EventTarget & {
+      error?: unknown;
+    };
+    pendingRequest.error = failure;
+    const factory = {
+      open: vi.fn((_name: string) => firstRequest),
+    };
+    const originalOpen = factory.open;
+    const cacheFailure = new DOMException(
+      "private cache",
+      "QuotaExceededError",
+    );
+    const cache = {
+      put: vi.fn(() => Promise.reject(cacheFailure)),
+    };
+    let resolvePendingCache: (value: typeof cache) => void = () => {};
+    const pendingCacheResult = new Promise<typeof cache>((resolve) => {
+      resolvePendingCache = resolve;
+    });
+    const cacheStorage = {
+      open: vi.fn((_name: string) => Promise.resolve(cache)),
+      delete: vi.fn(() => Promise.resolve(false)),
+      has: vi.fn(() => Promise.resolve(false)),
+      match: vi.fn(() => Promise.resolve(undefined)),
+      keys: vi.fn(() => Promise.resolve([])),
+    };
+    const originalCacheOpen = cacheStorage.open;
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("caches", cacheStorage);
+    const { logger, internals, kinds } = start({ storage: true });
+
+    expect(internals.config.autoFlagOnStorageFailure).toBe(false);
+    expect(factory.open).toBe(originalOpen);
+
+    internals.applyRemoteConfig({ triggers: { storageFailure: true } });
+    expect(factory.open).not.toBe(originalOpen);
+    factory.open("private-db").dispatchEvent(new Event("error"));
+    expect(
+      kinds("stor").filter((event) => event.d.type === "idb"),
+    ).toHaveLength(1);
+
+    const activeCache = await cacheStorage.open("private-cache");
+    await expect(activeCache.put()).rejects.toBe(cacheFailure);
+    await Promise.resolve();
+    expect(
+      kinds("stor").filter(
+        (event) => event.d.type === "cache" && event.d.op === "put",
+      ),
+    ).toHaveLength(1);
+
+    originalOpen.mockReturnValue(pendingRequest);
+    const pendingIdb = factory.open("pending-db");
+    originalCacheOpen.mockReturnValueOnce(pendingCacheResult);
+    const pendingCache = cacheStorage.open("pending-cache");
+
+    internals.applyRemoteConfig({ triggers: { storageFailure: false } });
+    expect(factory.open).toBe(originalOpen);
+    expect(cacheStorage.open).toBe(originalCacheOpen);
+    pendingRequest.dispatchEvent(new Event("error"));
+    resolvePendingCache(cache);
+    await pendingIdb;
+    await pendingCache;
+    await expect(cache.put()).rejects.toBe(cacheFailure);
+    await Promise.resolve();
+    const secondRequest = new EventTarget() as EventTarget & {
+      error?: unknown;
+    };
+    secondRequest.error = failure;
+    factory.open.mockReturnValue(secondRequest);
+    factory.open("private-db").dispatchEvent(new Event("error"));
+    expect(
+      kinds("stor").filter((event) => event.d.type === "idb"),
+    ).toHaveLength(1);
+    expect(
+      kinds("stor").filter(
+        (event) => event.d.type === "cache" && event.d.op === "put",
+      ),
+    ).toHaveLength(1);
+    await logger.stop();
+  });
+
   it("stops emission at once when a switch turns a collector off", async () => {
     const { logger, internals, kinds } = start({ console: true });
 

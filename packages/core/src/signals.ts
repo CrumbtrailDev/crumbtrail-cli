@@ -599,7 +599,14 @@ export function storageFailureDetector(): SignalDetector {
   return {
     inspect(event) {
       if (event.k !== "stor" || event.d.outcome !== "failure") return null;
-      const type = event.d.type === "session" ? "sessionStorage" : "localStorage";
+      const type =
+        event.d.type === "session"
+          ? "sessionStorage"
+          : event.d.type === "idb"
+            ? "IndexedDB"
+            : event.d.type === "cache"
+              ? "Cache API"
+              : "localStorage";
       const op = typeof event.d.op === "string" ? event.d.op : "mutation";
       const errorName =
         typeof event.d.errorName === "string" ? event.d.errorName : "Error";

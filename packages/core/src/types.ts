@@ -1324,6 +1324,8 @@ export interface CollectorContext {
    * no gate to wait on, so release immediately.
    */
   whenCaptureAdmitted?: (settle: (admitted: boolean) => void) => void;
+  /** Register a collector-owned hook that follows remote storage-failure trigger changes. */
+  registerStorageFailureSync?: (sync: () => void) => () => void;
 }
 
 export interface CrumbtrailTransport {

@@ -182,6 +182,11 @@ The automatic triggers are `autoFlagOnError`,
 `autoFlagOnWrongNumber`, `autoFlagOnResourceLoadFailure`, and
 `autoFlagOnStorageFailure` are disabled by default because they can be noisy.
 
+When `autoFlagOnStorageFailure` is enabled, Crumbtrail records rejected Web
+Storage, IndexedDB, and Cache API operations. It records only the storage API,
+operation, and bounded error name. It never records database or cache names,
+keys, request bodies, or responses, and ignores deliberate aborts.
+
 `autoFlagOnRenderedError` is enabled by default. It watches browser-standard
 signals: `role="alert"` or `role="alertdialog"` entering the document,
 `aria-invalid="true"` appearing on a control, and native `invalid` events. A

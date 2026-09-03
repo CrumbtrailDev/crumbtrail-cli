@@ -151,14 +151,13 @@ describe("session replay teardown fits into the stop() sequence", () => {
       flightRecorder: true,
       flightRecorderTailMs: 10_000,
     });
+    const pending = logger.flag();
     (logger as any).replay = {
       stop: vi.fn().mockRejectedValue(new Error("chunk upload blew up")),
     };
-
-    const pending = logger.flag();
-    await expect(logger.stop()).resolves.toMatchObject({
-      sessionId: expect.any(String),
-    });
+    await expect(logger.stop()).rejects.toThrow(
+      "Crumbtrail.stop() completed with teardown failures",
+    );
 
     // The recorder here was flagged, so it is terminal and legitimately closes
     // as "finalized". The never triggered case — the one finding 2 is actually

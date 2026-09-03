@@ -75,12 +75,12 @@ describe("stop() survives a throw from the teardown ahead of the cleanup loop", 
     vi.restoreAllMocks();
   });
 
-  it("resolves rather than rejecting", async () => {
+  it("rejects after reporting the teardown failure", async () => {
     const transport = makeTransport();
     const logger = await initWithThrowingWidget(transport);
 
-    await expect(logger.stop()).resolves.toMatchObject({
-      sessionId: expect.any(String),
+    await expect(logger.stop()).rejects.toMatchObject({
+      message: "Crumbtrail.stop() completed with teardown failures",
     });
     expect(widgetCleanup).toHaveBeenCalledTimes(1);
   });
@@ -96,7 +96,9 @@ describe("stop() survives a throw from the teardown ahead of the cleanup loop", 
     });
 
     const pending = logger.flag();
-    await logger.stop();
+    await expect(logger.stop()).rejects.toThrow(
+      "Crumbtrail.stop() completed with teardown failures",
+    );
 
     await expect(pending).resolves.toMatchObject({ bugId: expect.any(String) });
   });
@@ -105,7 +107,9 @@ describe("stop() survives a throw from the teardown ahead of the cleanup loop", 
     const transport = makeTransport();
     const logger = await initWithThrowingWidget(transport);
 
-    await logger.stop();
+    await expect(logger.stop()).rejects.toThrow(
+      "Crumbtrail.stop() completed with teardown failures",
+    );
 
     // `endSession` is the last thing stop() does, so reaching it means the
     // collector loop, both flushes, the flag and the bus stop all ran too.
@@ -120,7 +124,9 @@ describe("stop() survives a throw from the teardown ahead of the cleanup loop", 
     });
 
     expect((logger as any).cleanups.length).toBeGreaterThan(0);
-    await logger.stop();
+    await expect(logger.stop()).rejects.toThrow(
+      "Crumbtrail.stop() completed with teardown failures",
+    );
 
     // Retained garbage otherwise: each entry is a closure over collector state
     // the teardown has already released.
