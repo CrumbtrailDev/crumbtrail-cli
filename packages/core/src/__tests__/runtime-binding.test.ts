@@ -299,10 +299,17 @@ describe("runtime binding client", () => {
   });
 
   it("reuses defaults by endpoint and project while isolating project keys", async () => {
-    const fetcher = vi.fn(async (input: string | URL | Request) => {
-      const projectKey = new URL(String(input)).searchParams.get("projectKey");
-      return response(binding(NOW + 86_400_000, projectKey ?? "unknown"), 201);
-    });
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, _init?: RequestInit) => {
+        const projectKey = new URL(String(input)).searchParams.get(
+          "projectKey",
+        );
+        return response(
+          binding(NOW + 86_400_000, projectKey ?? "unknown"),
+          201,
+        );
+      },
+    );
     const first = getCachedRuntimeBindingClient({
       endpoint: ENDPOINT,
       projectKey: "project-a",
@@ -334,6 +341,9 @@ describe("runtime binding client", () => {
     expect(String(fetcher.mock.calls[1]?.[0])).toContain(
       "projectKey=project-b",
     );
+    expect(
+      fetcher.mock.calls.filter((call) => call[1]?.method === "DELETE"),
+    ).toHaveLength(0);
   });
 
   it("bounds and expires the warm-runtime default cache", async () => {
