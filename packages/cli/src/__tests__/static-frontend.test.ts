@@ -640,12 +640,14 @@ describe("buildPlan — static", () => {
   });
 
   it("moves a valid bootstrap ahead of an earlier application script", () => {
+    const bootstrap =
+      '<script nonce="csp-123" integrity="sha384-example" crossorigin="anonymous" data-owner="app" src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>';
     const wired = PAGE.replace(
       "    <title>Landing</title>",
       [
         "    <title>Landing</title>",
         '    <script src="/app.js"></script>',
-        '    <script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        `    ${bootstrap}`,
         '    <script type="module">',
         '      import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0";',
         `      Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });`,
@@ -668,6 +670,46 @@ describe("buildPlan — static", () => {
     expect(plan.content!.indexOf("early-bootstrap.global.js")).toBeLessThan(
       plan.content!.indexOf("/app.js"),
     );
+    expect(plan.content).toContain(bootstrap);
+    expect(plan.content).not.toContain(
+      '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+    );
+  });
+
+  it.each([
+    "http://esm.sh/crumbtrail-core@0.49.0",
+    "https://evil.example/crumbtrail-core@0.49.0",
+    "https://esm.sh.evil.example/crumbtrail-core@0.49.0",
+    "https://user:pass@esm.sh/crumbtrail-core@0.49.0",
+    "https://esm.sh:444/crumbtrail-core@0.49.0",
+    "https://esm.sh/other/crumbtrail-core@0.49.0",
+    "https://esm.sh/crumbtrail-core@0.49.0/extra",
+    "https://esm.sh/crumbtrail-core@0.49.0?bundle",
+    "https://esm.sh/crumbtrail-core@0.49.0#fragment",
+  ])("does not trust a noncanonical module URL %s", (source) => {
+    const wired = insertIntoHtmlHead(
+      PAGE,
+      [
+        '<script src="https://unpkg.com/crumbtrail-core@0.49.0/dist/early-bootstrap.global.js"></script>',
+        '<script type="module">',
+        `  import { Crumbtrail } from "${source}";`,
+        `  Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });`,
+        "</script>",
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: wired }),
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.warnings.join(" ")).toMatch(/version could not be determined/);
   });
 
   it.each([

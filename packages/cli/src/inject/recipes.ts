@@ -1596,10 +1596,28 @@ function staticBlockFor(input: BuildPlanInput): string {
   });
 }
 
-const STATIC_MODULE_VERSION =
-  /https:\/\/esm\.sh\/crumbtrail-core@(\d+\.\d+\.\d+)(?:["'/?#]|$)/i;
+const STATIC_MODULE_PATH = /^\/crumbtrail-core@(\d+\.\d+\.\d+)$/;
 const STATIC_BOOTSTRAP_PATH =
   /^\/crumbtrail-core@(\d+\.\d+\.\d+)\/dist\/early-bootstrap\.global\.js$/;
+
+function staticModuleUrlVersion(source: string): string | null {
+  try {
+    const url = new URL(source);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.toLowerCase() !== "esm.sh" ||
+      url.username !== "" ||
+      url.password !== "" ||
+      url.port !== "" ||
+      url.search !== "" ||
+      url.hash !== ""
+    )
+      return null;
+    return STATIC_MODULE_PATH.exec(url.pathname)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
 
 function staticBootstrapVersion(source: string): string | null {
   try {
@@ -1636,10 +1654,15 @@ function staticBootstrapBlock(html: string) {
 function staticModuleVersion(html: string): string | null {
   for (const block of htmlScriptBlocks(html)) {
     if (!block.executable) continue;
-    const match = STATIC_MODULE_VERSION.exec(
-      `${block.src ?? ""}\n${block.content}`,
-    );
-    if (match?.[1]) return match[1];
+    const sources = block.src === null ? [] : [block.src];
+    for (const match of block.content.matchAll(
+      /["'](https?:\/\/[^"'\\\s]+)["']/gi,
+    ))
+      sources.push(match[1]);
+    for (const source of sources) {
+      const version = staticModuleUrlVersion(source);
+      if (version !== null) return version;
+    }
   }
   return null;
 }
@@ -1789,6 +1812,7 @@ function staticExistingPagePlan(
         io,
         target,
         withoutLateBootstrap,
+        html.slice(markerBlock!.start, markerBlock!.end),
       );
     }
     return skipPlan(input, [
@@ -1841,6 +1865,7 @@ function staticEarlyBootstrapUpgrade(
   io: InjectIO,
   target: string,
   html: string,
+  existingBootstrapTag?: string,
 ): Plan {
   const location = path.relative(input.cwd, target) || target;
   const bootstrapUrl = browserEarlyBootstrapUrl(input.sdkVersion);
@@ -1859,7 +1884,8 @@ function staticEarlyBootstrapUpgrade(
 
   const content = insertIntoHtmlHead(
     html,
-    `<script src=${JSON.stringify(bootstrapUrl)}></script>`,
+    existingBootstrapTag ??
+      `<script src=${JSON.stringify(bootstrapUrl)}></script>`,
   );
   if (content == null) {
     return {
