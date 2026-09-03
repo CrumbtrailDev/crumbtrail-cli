@@ -21,6 +21,7 @@
     "verify:sdk-version-floors": "node scripts/verify-sdk-version-floors.mjs",
     "refresh:installer-fixtures": "node scripts/refresh-installer-fixtures.mjs",
     "test:browser-storage": "pnpm --filter crumbtrail-core build && node scripts/browser-storage-test.mjs",
+    "test:browser-early-bootstrap": "pnpm --filter crumbtrail-core build && node scripts/browser-early-bootstrap-test.mjs",
     "release:plan": "node scripts/release/run-release-plan.mjs",
     "test:release": "vitest run --config scripts/release/vitest.config.ts",
     "test:dev-harness": "vitest run --config scripts/dev-harness/vitest.config.ts",

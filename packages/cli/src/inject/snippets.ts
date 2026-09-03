@@ -6,6 +6,50 @@
 
 import { SDK_VERSION_FLOORS } from "../recipe-registry";
 
+const BROWSER_EARLY_CAPTURE_MIN_VERSION = "0.49.0";
+
+function releaseParts(value: string): [number, number, number] | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(value.trim());
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+function compareReleases(left: string, right: string): number {
+  const a = releaseParts(left) ?? [0, 0, 0];
+  const b = releaseParts(right) ?? [0, 0, 0];
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  return 0;
+}
+
+/**
+ * The first coordinated SDK release that contains the browser bootstrap.
+ * Missing or older CLI versions return null so setup never prints a URL for a
+ * package artifact that is not available yet.
+ */
+export function browserEarlyCaptureVersion(
+  version?: string | null,
+): string | null {
+  const trimmed = version?.trim();
+  if (!trimmed || !releaseParts(trimmed)) return null;
+  return compareReleases(trimmed, BROWSER_EARLY_CAPTURE_MIN_VERSION) >= 0
+    ? trimmed
+    : null;
+}
+
+function browserModuleVersion(version?: string | null): string {
+  const trimmed = version?.trim();
+  const floor = SDK_VERSION_FLOORS["crumbtrail-core"];
+  if (!trimmed || trimmed === "0.0.0" || !releaseParts(trimmed)) return floor;
+  return compareReleases(trimmed, floor) >= 0 ? trimmed : floor;
+}
+
+function earlyBrowserImport(version?: string | null): string[] {
+  return browserEarlyCaptureVersion(version)
+    ? ['import "crumbtrail-core/early";']
+    : [];
+}
+
 /**
  * Single-quoted string literal in Prettier's `singleQuote: true` style: wraps the
  * value in single quotes, escaping backslashes and single quotes. Used by the
@@ -167,8 +211,10 @@ export function clientInitSnippet(
   keyExpr: string,
   serviceName?: string | null,
   backendOrigins?: readonly string[] | null,
+  sdkVersion?: string | null,
 ): string {
   return [
+    ...earlyBrowserImport(sdkVersion),
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
     "",
     "Crumbtrail.init({",
@@ -193,8 +239,10 @@ export function nuxtPluginSnippet(
   keyExpr: string,
   serviceName?: string | null,
   backendOrigins?: readonly string[] | null,
+  sdkVersion?: string | null,
 ): string {
   return [
+    ...earlyBrowserImport(sdkVersion),
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
     "",
     "export default defineNuxtPlugin(() => {",
@@ -547,8 +595,10 @@ export function capacitorInitSnippet(
   keyExpr: string,
   serviceName?: string | null,
   backendOrigins?: readonly string[] | null,
+  sdkVersion?: string | null,
 ): string {
   return [
+    ...earlyBrowserImport(sdkVersion),
     'import { createCapacitorCrumbtrailAsync } from "crumbtrail-capacitor";',
     "",
     "createCapacitorCrumbtrailAsync({",
@@ -624,8 +674,9 @@ export function flutterInitSnippet(
  * `TauriTransport`, which routes bug reports to the local Rust store via the
  * Tauri plugin — so no httpEndpoint / apiKey is needed in the block.
  */
-export function tauriInitSnippet(): string {
+export function tauriInitSnippet(sdkVersion?: string | null): string {
   return [
+    ...earlyBrowserImport(sdkVersion),
     'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
     'import { TauriTransport } from "crumbtrail-core/tauri";',
     "",
@@ -651,26 +702,39 @@ export function tauriInitSnippet(): string {
  * on the registry.
  */
 export function browserModuleUrl(version?: string | null): string {
-  // `0.0.0` is what an unreadable package.json yields, not a release anyone can
-  // fetch — treating it as one would emit a URL that 404s in the user's browser.
-  const trimmed = version?.trim();
-  const pinned =
-    trimmed && trimmed !== "0.0.0" && /^\d+\.\d+\.\d+$/.test(trimmed)
-      ? trimmed
-      : SDK_VERSION_FLOORS["crumbtrail-core"];
+  const pinned = browserModuleVersion(version);
   return `https://esm.sh/crumbtrail-core@${pinned}`;
 }
 
 /**
+ * The published classic bootstrap that must run before every application
+ * script. It is a package file rather than generated page code, so it has no
+ * customer configuration, secrets, or module/network work of its own.
+ */
+export function browserEarlyBootstrapUrl(
+  version?: string | null,
+): string | null {
+  const pinned = browserEarlyCaptureVersion(version);
+  return pinned
+    ? `https://unpkg.com/crumbtrail-core@${pinned}/dist/early-bootstrap.global.js`
+    : null;
+}
+
+/**
  * Browser capture for a page with no framework and no bundler: one
- * `<script type="module">` block, dropped into the HTML itself.
+ * classic bootstrap plus a `<script type="module">` block, dropped into the
+ * HTML itself.
  *
- * This is the ONE snippet that carries the key as a literal. Every other client
- * recipe reads a public env var that its bundler inlines at build time; a page
- * served as files has neither, so there is no variable to read and no build to
- * read it. The value emitted is a placeholder, never a live key — the wizard
- * mints nothing for this recipe and points at the dashboard instead, so what
- * lands in the file is a TODO rather than a credential.
+ * The first tag is an exact-version, published package artifact loaded as a
+ * parser-blocking classic script. It installs only the bounded pre-init hooks.
+ * The second tag remains the configurable module that initializes and drains
+ * those hooks. The value emitted for its key is a placeholder, never a live
+ * key — the wizard mints nothing for this recipe and points at the dashboard
+ * instead, so what lands in the file is a TODO rather than a credential.
+ *
+ * The generated page names its CDN, CSP, SRI, and offline requirements. The URL
+ * is pinned to an exact release so a later package cannot silently change the
+ * bootstrap contract.
  */
 export function staticScriptTagSnippet(options: {
   endpoint: string;
@@ -680,15 +744,24 @@ export function staticScriptTagSnippet(options: {
   sdkVersion?: string | null;
   mintUrl?: string | null;
 }): string {
+  const moduleVersion = browserModuleVersion(options.sdkVersion);
+  const bootstrapUrl = browserEarlyBootstrapUrl(options.sdkVersion);
   const { endpoint, keyLiteral, serviceName, backendOrigins } = options;
   const mint = options.mintUrl
     ? ` Get one at ${options.mintUrl}.`
     : " Get one from your Crumbtrail dashboard.";
+  const bootstrapGuidance = bootstrapUrl
+    ? '<!-- The classic bootstrap is parser-blocking and pinned to this SDK release. CSP: allow https://unpkg.com for this tag and https://esm.sh for its module import in script-src (or the corresponding script-src-elem policy), approve this inline module with a nonce or hash, and allow the ingest endpoint in connect-src. SRI: integrity and crossorigin="anonymous" can protect this external bootstrap tag only when the hash matches its exact response. SRI does not protect the inline module or its esm.sh import. Offline: self-host the published dist files, including relative ESM chunks, replace both URLs, and use an approved external or nonce/hash-approved module. -->'
+    : `<!-- Early browser capture is not emitted until the coordinated ${BROWSER_EARLY_CAPTURE_MIN_VERSION} SDK release is supplied. Upgrade the CLI and SDK, then run setup again. -->`;
   return [
     "<!-- Crumbtrail — browser capture (console, network, DOM, errors). -->",
     `<!-- httpAuthToken must contain this project's ingest key.${mint} -->`,
+    bootstrapGuidance,
+    ...(bootstrapUrl
+      ? [`<script src=${JSON.stringify(bootstrapUrl)}></script>`]
+      : []),
     '<script type="module">',
-    `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(options.sdkVersion))};`,
+    `  import { Crumbtrail, PRESET_PASSIVE } from ${JSON.stringify(browserModuleUrl(moduleVersion))};`,
     "",
     "  Crumbtrail.init({",
     "    ...PRESET_PASSIVE,",

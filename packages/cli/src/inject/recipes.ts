@@ -34,8 +34,13 @@ import {
   type IntegrationHazard,
   type IntegrationRequirement,
   type IntegrationStatus,
+  SOURCE_EXTENSIONS,
 } from "./integration";
-import { amendSource, type AmendField } from "./amend";
+import {
+  amendSource,
+  hasExecutableEarlyBrowserImport,
+  type AmendField,
+} from "./amend";
 import { addDockerBuildArg, DOCKERFILE_CANDIDATES } from "./docker";
 import {
   deployManifestNaming,
@@ -51,6 +56,7 @@ import {
   corsWideningGuidance,
   detectExpressModuleStyle,
   findStaticMountDirs,
+  htmlScriptBlocks,
   htmlReferencesCrumbtrail,
   insertIntoHtmlHead,
   prependIntoSource,
@@ -63,6 +69,8 @@ import {
   withTrailingNewline,
 } from "./text";
 import {
+  browserEarlyBootstrapUrl,
+  browserEarlyCaptureVersion,
   capacitorInitSnippet,
   clientInitSnippet,
   envPreloadSnippet,
@@ -197,9 +205,9 @@ export interface BuildPlanInput {
    */
   backendOrigins?: readonly string[] | null;
   /**
-   * This CLI's own release, used to pin the CDN module URL the `static` recipe
-   * emits (SDK and CLI versions move in lockstep). Only that recipe reads it;
-   * every other one imports a bare specifier its bundler resolves.
+   * This CLI's own release, used to pin both CDN URLs the `static` recipe emits
+   * (SDK and CLI versions move in lockstep). Only that recipe reads it; every
+   * other one imports a bare specifier its bundler resolves.
    */
   sdkVersion?: string | null;
   /**
@@ -291,6 +299,7 @@ function incompleteSnippet(input: BuildPlanInput): string {
         keyExpr,
         input.serviceName,
         input.backendOrigins,
+        input.sdkVersion,
       );
     case "flutter":
       return [
@@ -309,7 +318,7 @@ function incompleteSnippet(input: BuildPlanInput): string {
         input.backendOrigins,
       );
     case "tauri":
-      return tauriInitSnippet();
+      return tauriInitSnippet(input.sdkVersion);
     case "static":
       return staticBlockFor(input);
     case "express":
@@ -323,6 +332,7 @@ function incompleteSnippet(input: BuildPlanInput): string {
         keyExpr,
         input.serviceName,
         input.backendOrigins,
+        input.sdkVersion,
       );
     default:
       return clientInitSnippet(
@@ -330,6 +340,7 @@ function incompleteSnippet(input: BuildPlanInput): string {
         keyExpr,
         input.serviceName,
         input.backendOrigins,
+        input.sdkVersion,
       );
   }
 }
@@ -530,10 +541,163 @@ function incompletePlan(
   ]);
 }
 
+/** Browser integrations whose entry must load the early side-effect module. */
+const EARLY_BROWSER_RECIPES = new Set<Recipe>([
+  "vite-spa",
+  "cra",
+  "next",
+  "sveltekit",
+  "nuxt",
+  "remix",
+  "astro",
+  "angular",
+  "capacitor",
+  "tauri",
+]);
+
+function hasEarlyBrowserMarker(
+  input: BuildPlanInput,
+  io: InjectIO,
+  boundaryFile?: string | null,
+): boolean {
+  if (!EARLY_BROWSER_RECIPES.has(input.recipe)) return true;
+  const boundary = boundaryFile ?? browserEntryBoundary(input, io);
+  const source = boundary ? io.readFile(boundary) : null;
+  return source !== null && source !== undefined
+    ? hasExecutableEarlyBrowserImport(source)
+    : false;
+}
+
+/** The first browser module the framework executes, not a helper it imports. */
+function browserEntryBoundary(
+  input: BuildPlanInput,
+  io: InjectIO,
+): string | null {
+  if (input.entryFile) return path.resolve(input.entryFile);
+  if (!EARLY_BROWSER_RECIPES.has(input.recipe)) return null;
+  if (input.recipe === "next") {
+    const usesSrc =
+      io.exists(path.join(input.cwd, "src", "app")) ||
+      io.exists(path.join(input.cwd, "src", "pages"));
+    const baseDir = usesSrc ? path.join(input.cwd, "src") : input.cwd;
+    const effectiveVersion =
+      installedNextVersion(input.cwd, io) ?? input.nextVersion;
+    if (supportsInstrumentationClient(effectiveVersion))
+      return findInstrumentationClient(io, input.cwd, baseDir).loaded;
+    const pagesApp = SOURCE_EXTENSIONS.map((ext) =>
+      path.join(baseDir, "pages", `_app${ext}`),
+    ).find((file) => io.exists(file));
+    if (pagesApp) return pagesApp;
+    const appLayout = SOURCE_EXTENSIONS.map((ext) =>
+      path.join(baseDir, "app", `layout${ext}`),
+    ).find((file) => io.exists(file));
+    if (appLayout) return appLayout;
+  }
+  if (input.recipe === "nuxt") {
+    const major = installedNuxtMajor(input.cwd, io);
+    const baseDir =
+      major != null
+        ? major >= 4
+          ? path.join(input.cwd, "app")
+          : input.cwd
+        : io.exists(path.join(input.cwd, "app"))
+          ? path.join(input.cwd, "app")
+          : input.cwd;
+    const plugin = SOURCE_EXTENSIONS.map((ext) =>
+      path.join(baseDir, "plugins", `crumbtrail.client${ext}`),
+    ).find((file) => io.exists(file));
+    if (plugin) return plugin;
+  }
+  if (input.recipe === "sveltekit") {
+    const hook = SOURCE_EXTENSIONS.map((ext) =>
+      path.join(input.cwd, "src", `hooks.client${ext}`),
+    ).find((file) => io.exists(file));
+    if (hook) return hook;
+  }
+  return (
+    reachableSourceFiles({
+      cwd: input.cwd,
+      recipe: input.recipe,
+      endpoint: input.endpoint,
+      entryFile: input.entryFile,
+      serviceName: input.serviceName,
+      io,
+    })[0]?.file ?? null
+  );
+}
+
+function earlyCaptureUnavailablePlan(
+  input: BuildPlanInput,
+  file: string | null,
+  kind: "browser" | "static",
+): Plan {
+  const location = file
+    ? path.relative(input.cwd, file) || file
+    : "the existing integration";
+  const subject = kind === "static" ? "page" : "browser integration";
+  return {
+    recipe: input.recipe,
+    kind: "fallback-ai",
+    targetPath: null,
+    content: null,
+    snippet: "",
+    warnings: [
+      `This ${subject} is already wired but does not include early browser capture. The compatible SDK release is not available in this CLI yet, so ${location} was left unchanged. Upgrade to the coordinated CLI and crumbtrail-core release that supplies the early capture entry, then run setup again.`,
+    ],
+    ...(kind === "static" ? { keyIsSourceLiteral: true as const } : {}),
+  };
+}
+
+function earlyBrowserUpgradePlan(
+  input: BuildPlanInput,
+  io: InjectIO,
+  boundaryFile?: string | null,
+): Plan {
+  const reachable = reachableSourceFiles({
+    cwd: input.cwd,
+    recipe: input.recipe,
+    endpoint: input.endpoint,
+    entryFile: input.entryFile,
+    serviceName: input.serviceName,
+    io,
+  });
+  const file =
+    boundaryFile ??
+    browserEntryBoundary(input, io) ??
+    reachable.find((entry) => referencesCrumbtrail(entry.text))?.file ??
+    null;
+  const version = browserEarlyCaptureVersion(input.sdkVersion);
+  if (!version || !file)
+    return earlyCaptureUnavailablePlan(input, file, "browser");
+  const status = io.gitStatus(input.cwd, file);
+  if (status.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: file,
+      content: 'import "crumbtrail-core/early";',
+      warnings: [
+        `This existing browser integration is missing early capture. The ${version} SDK supplies it, but ${path.relative(input.cwd, file) || file} has uncommitted changes.`,
+        "Confirm the edit or re-run with force to add the import.",
+      ],
+    };
+  }
+  return {
+    recipe: input.recipe,
+    kind: "prepend",
+    targetPath: file,
+    content: 'import "crumbtrail-core/early";',
+    warnings: [
+      `Added the early browser capture import to ${path.relative(input.cwd, file) || file}. It must run before this integration's initialization to retain first page errors and requests.`,
+    ],
+  };
+}
+
 function existingIntegrationPlan(
   input: BuildPlanInput,
   io: InjectIO,
   source: string,
+  boundaryFile?: string | null,
 ): Plan | null {
   if (!referencesCrumbtrail(source)) return null;
   const status = inspectIntegration({
@@ -544,7 +708,11 @@ function existingIntegrationPlan(
     serviceName: input.serviceName,
     io,
   });
-  if (status.complete) return skipPlan(input);
+  if (status.complete) {
+    if (!hasEarlyBrowserMarker(input, io, boundaryFile))
+      return earlyBrowserUpgradePlan(input, io, boundaryFile);
+    return skipPlan(input);
+  }
   return amendPlan(input, io, status) ?? incompletePlan(input, status);
 }
 
@@ -683,6 +851,37 @@ function amendPlan(
     );
   }
 
+  let earlyCaptureEdit: NonNullable<Plan["extraEdits"]>[number] | null = null;
+  let earlyCaptureAdded = false;
+  if (EARLY_BROWSER_RECIPES.has(input.recipe)) {
+    const boundary = browserEntryBoundary(input, io);
+    if (!hasEarlyBrowserMarker(input, io, boundary)) {
+      const version = browserEarlyCaptureVersion(input.sdkVersion);
+      if (!version || !boundary)
+        return earlyCaptureUnavailablePlan(input, boundary, "browser");
+      if (boundary === amended.file) {
+        amended.text = prependIntoSource(
+          amended.text,
+          'import "crumbtrail-core/early";',
+        );
+      } else {
+        const boundarySource = io.readFile(boundary);
+        if (boundarySource === null || boundarySource === undefined)
+          return earlyCaptureUnavailablePlan(input, boundary, "browser");
+        earlyCaptureEdit = {
+          path: boundary,
+          mode: "update",
+          content: prependIntoSource(
+            boundarySource,
+            'import "crumbtrail-core/early";',
+          ),
+          label: `added early browser capture to ${path.relative(input.cwd, boundary) || boundary}`,
+        };
+      }
+      earlyCaptureAdded = true;
+    }
+  }
+
   const stillMissing = status.missing.filter((r) => !report.added.includes(r));
   const rel = path.relative(input.cwd, amended.file) || amended.file;
   const added = report.added
@@ -694,8 +893,13 @@ function amendPlan(
     // beside a single edit, and stayed put once a second one was prepended
     // above the init, so it described a file the wizard no longer produced.
     preloadEnvVar
-      ? `Your own Crumbtrail initialization in ${rel} was missing ${added}. Crumbtrail added ${fieldList} to it instead of starting a second one, and prepended a guarded env file load above it so ${preloadEnvVar} is set before that init reads it. Nothing else in that file changed.`
-      : `Your own Crumbtrail initialization in ${rel} was missing ${added}. Crumbtrail added ${fieldList} to it instead of starting a second one. Nothing else in that file changed.`,
+      ? `Your own Crumbtrail initialization in ${rel} was missing ${added}. Crumbtrail added ${fieldList} to it instead of starting a second one, and prepended a guarded env file load above it so ${preloadEnvVar} is set before that init reads it.${earlyCaptureAdded ? "" : " Nothing else in that file changed."}`
+      : `Your own Crumbtrail initialization in ${rel} was missing ${added}. Crumbtrail added ${fieldList} to it instead of starting a second one.${earlyCaptureAdded ? "" : " Nothing else in that file changed."}`,
+    ...(earlyCaptureAdded
+      ? [
+          `Added the early browser capture import at the application entry boundary in the same plan.`,
+        ]
+      : []),
     ...stillMissing
       .filter((r) => !NOT_A_SOURCE_EDIT.has(r))
       .map((r) => `Next: ${nextActionFor(input, r, status, report)}`),
@@ -717,7 +921,11 @@ function amendPlan(
   };
 
   const git = io.gitStatus(input.cwd, amended.file);
-  if (git.dirty && !input.options?.force) {
+  const earlyGit = earlyCaptureEdit
+    ? io.gitStatus(input.cwd, earlyCaptureEdit.path)
+    : null;
+  const extraEdits = earlyCaptureEdit ? [earlyCaptureEdit] : undefined;
+  if ((git.dirty || earlyGit?.dirty) && !input.options?.force) {
     return {
       recipe: input.recipe,
       kind: "needs-confirm-dirty",
@@ -726,6 +934,7 @@ function amendPlan(
       applyMode: "rewrite",
       amendedFields,
       integration,
+      extraEdits,
       ...preload,
       warnings,
     };
@@ -737,6 +946,7 @@ function amendPlan(
     content: amended.text,
     amendedFields,
     integration,
+    extraEdits,
     ...preload,
     warnings,
   };
@@ -777,7 +987,7 @@ function prependWithPreflight(
       `Could not read ${target}; use the snippet or AI prompt to wire it manually.`,
     ]);
   }
-  const existingPlan = existingIntegrationPlan(input, io, existing);
+  const existingPlan = existingIntegrationPlan(input, io, existing, target);
   if (existingPlan) return existingPlan;
 
   // Wiring a backend whose CORS config pins an explicit header list, without
@@ -1023,6 +1233,7 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   // Prefer `src/` when the app uses a src directory.
   const usesSrc =
@@ -1040,7 +1251,12 @@ function planNext(input: BuildPlanInput, io: InjectIO): Plan {
     if (loaded) {
       const existing = io.readFile(loaded);
       if (existing) {
-        const existingPlan = existingIntegrationPlan(input, io, existing);
+        const existingPlan = existingIntegrationPlan(
+          input,
+          io,
+          existing,
+          loaded,
+        );
         if (existingPlan) return existingPlan;
       }
       // A user-owned instrumentation-client already exists — prepend into it,
@@ -1110,6 +1326,7 @@ function planSvelteKit(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   if (io.exists(target)) {
     return prependWithPreflight(input, io, target, block);
@@ -1139,11 +1356,12 @@ function planNuxt(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   if (io.exists(target)) {
     const existing = io.readFile(target);
     if (existing) {
-      const existingPlan = existingIntegrationPlan(input, io, existing);
+      const existingPlan = existingIntegrationPlan(input, io, existing, target);
       if (existingPlan) return existingPlan;
     }
     // Don't clobber an existing user plugin of the same name — hand off.
@@ -1160,6 +1378,7 @@ function planVite(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -1181,6 +1400,7 @@ function planCra(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -1282,7 +1502,7 @@ function planExpress(input: BuildPlanInput, io: InjectIO): Plan {
       `Could not read ${target}; use the snippet or AI prompt to wire it manually.`,
     ]);
   }
-  const existingPlan = existingIntegrationPlan(input, io, existing);
+  const existingPlan = existingIntegrationPlan(input, io, existing, target);
   if (existingPlan) return existingPlan;
 
   const style = detectExpressModuleStyle(existing);
@@ -1351,6 +1571,7 @@ function planRemix(input: BuildPlanInput, io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
@@ -1372,6 +1593,7 @@ function planAstro(input: BuildPlanInput, _io: InjectIO): Plan {
     keyExprFor(input)!,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   return fallbackPlan(input, block, [
     "Astro has no single client entry — add this snippet inside a client-side <script> in a shared layout (e.g. src/layouts/*.astro) so it runs on every page.",
@@ -1393,6 +1615,7 @@ function planAngular(input: BuildPlanInput, _io: InjectIO): Plan {
     "environment.crumbtrailKey",
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
   return fallbackPlan(input, block, [
     "Angular has no browser-safe env-var mechanism — add `crumbtrailKey: '<your-ingest-key>'` to src/environments/environment.ts (get your key from the dashboard), import `environment`, and prepend the snippet above bootstrapApplication in src/main.ts.",
@@ -1413,6 +1636,387 @@ function staticBlockFor(input: BuildPlanInput): string {
     sdkVersion: input.sdkVersion,
     mintUrl: input.mintUrl,
   });
+}
+
+const STATIC_MODULE_PATH = /^\/crumbtrail-core@(\d+\.\d+\.\d+)$/;
+const STATIC_BOOTSTRAP_PATH =
+  /^\/crumbtrail-core@(\d+\.\d+\.\d+)\/dist\/early-bootstrap\.global\.js$/;
+
+function staticModuleUrlVersion(source: string): string | null {
+  try {
+    const url = new URL(source);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.toLowerCase() !== "esm.sh" ||
+      url.username !== "" ||
+      url.password !== "" ||
+      url.port !== "" ||
+      url.search !== "" ||
+      url.hash !== ""
+    )
+      return null;
+    return STATIC_MODULE_PATH.exec(url.pathname)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function staticBootstrapVersion(source: string): string | null {
+  try {
+    const url = new URL(source);
+    if (
+      url.protocol !== "https:" ||
+      url.hostname.toLowerCase() !== "unpkg.com" ||
+      url.username !== "" ||
+      url.password !== "" ||
+      url.port !== "" ||
+      url.search !== "" ||
+      url.hash !== ""
+    )
+      return null;
+    return STATIC_BOOTSTRAP_PATH.exec(url.pathname)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function staticBootstrapBlock(html: string) {
+  for (const block of htmlScriptBlocks(html)) {
+    if (
+      block.executable &&
+      block.src !== null &&
+      staticBootstrapVersion(block.src) !== null
+    ) {
+      return block;
+    }
+  }
+  return null;
+}
+
+function isParserBlockingBootstrap(
+  attributes: ReadonlyMap<string, string>,
+): boolean {
+  return (
+    !["async", "defer", "nomodule"].some((name) => attributes.has(name)) &&
+    (attributes.get("type") ?? "").trim().toLowerCase() !== "module"
+  );
+}
+
+function staticModuleVersion(html: string): string | null {
+  for (const block of htmlScriptBlocks(html)) {
+    if (!block.executable) continue;
+    if (block.scriptKind !== "module") continue;
+    const sources = block.src === null ? [] : [block.src];
+    if (block.src === null) {
+      let program: any;
+      try {
+        program = parse(block.content, {
+          sourceType: "module",
+          plugins: ["typescript", "jsx", "dynamicImport"],
+        }).program;
+      } catch {
+        continue;
+      }
+      const visit = (node: any): void => {
+        if (!node || typeof node !== "object") return;
+        if (node.type === "ImportDeclaration" && node.source?.value)
+          sources.push(node.source.value);
+        if (node.type === "ImportExpression" && node.source?.value)
+          sources.push(node.source.value);
+        if (
+          node.type === "CallExpression" &&
+          node.callee?.type === "Import" &&
+          node.arguments?.[0]?.value
+        )
+          sources.push(node.arguments[0].value);
+        for (const value of Object.values(node)) {
+          if (Array.isArray(value)) value.forEach(visit);
+          else if (value && typeof value === "object") visit(value);
+        }
+      };
+      (program.body ?? []).forEach(visit);
+    }
+    for (const source of sources) {
+      const version = staticModuleUrlVersion(source);
+      if (version !== null) return version;
+    }
+  }
+  return null;
+}
+
+function staticBootstrapMismatchPlan(
+  input: BuildPlanInput,
+  target: string,
+  moduleVersion: string | null,
+  bootstrapVersion: string,
+): Plan {
+  const location = path.relative(input.cwd, target) || target;
+  const installed = moduleVersion
+    ? `its ESM import is pinned to ${moduleVersion}`
+    : "its ESM import version could not be determined";
+  return {
+    recipe: input.recipe,
+    kind: "fallback-ai",
+    targetPath: null,
+    content: null,
+    snippet: "",
+    keyIsSourceLiteral: true,
+    warnings: [
+      `${location} already references Crumbtrail, but ${installed}. The early bootstrap must match the ${bootstrapVersion} module release, so it was left unchanged. Upgrade the page's crumbtrail-core ESM URL to ${bootstrapVersion} and run setup again.`,
+    ],
+  };
+}
+
+function staticMarkerValidationPlan(
+  input: BuildPlanInput,
+  target: string,
+  markerSource: string,
+  moduleVersion: string | null,
+): Plan {
+  const location = path.relative(input.cwd, target) || target;
+  const suppliedVersion = browserEarlyCaptureVersion(input.sdkVersion);
+  const bootstrapVersion = staticBootstrapVersion(markerSource);
+  let reason: string;
+  if (!suppliedVersion) {
+    reason =
+      "this CLI does not supply a compatible published early capture release";
+  } else if (!bootstrapVersion) {
+    reason =
+      "the bootstrap URL is not pinned to a released crumbtrail-core version";
+  } else if (!browserEarlyCaptureVersion(bootstrapVersion)) {
+    reason = `the bootstrap URL is pinned to the incompatible ${bootstrapVersion} release`;
+  } else if (bootstrapVersion !== suppliedVersion) {
+    reason = `the bootstrap URL is pinned to ${bootstrapVersion}, but this CLI supplies ${suppliedVersion}`;
+  } else if (!moduleVersion) {
+    reason = "the page's ESM crumbtrail-core version could not be determined";
+  } else if (moduleVersion !== bootstrapVersion) {
+    reason = `the bootstrap is ${bootstrapVersion}, while the page's ESM import is ${moduleVersion}`;
+  } else {
+    reason = "the bootstrap release could not be verified";
+  }
+  return {
+    recipe: input.recipe,
+    kind: "fallback-ai",
+    targetPath: null,
+    content: null,
+    snippet: "",
+    keyIsSourceLiteral: true,
+    warnings: [
+      `${location} already has an early browser bootstrap, but ${reason}. Upgrade the CLI and page to one coordinated published crumbtrail-core release, then run setup again.`,
+    ],
+  };
+}
+
+function staticCheckInput(
+  input: BuildPlanInput,
+  target: string,
+): BuildPlanInput {
+  return { ...input, recipe: "static", entryFile: target };
+}
+
+function staticIncompletePlan(
+  input: BuildPlanInput,
+  target: string,
+  status: IntegrationStatus,
+  hasBootstrap: boolean,
+): Plan {
+  const checkInput = staticCheckInput(input, target);
+  const location = path.relative(input.cwd, target) || target;
+  const missing = status.missing
+    .map((requirement) => INTEGRATION_REQUIREMENT_COPY[requirement])
+    .join(", ");
+  const detail = missing ? ` Missing ${missing}.` : "";
+  return {
+    recipe: input.recipe,
+    kind: "fallback-ai",
+    targetPath: null,
+    content: null,
+    snippet: "",
+    keyIsSourceLiteral: true,
+    warnings: [
+      `${location} already references Crumbtrail${hasBootstrap ? " and an early bootstrap" : ""}, but the integration is not complete for ${input.endpoint}.${detail}`,
+      ...integrationInstructions(checkInput, status, null, target),
+    ],
+  };
+}
+
+/** Validate an existing static page before deciding whether a marker is enough. */
+function staticExistingPagePlan(
+  input: BuildPlanInput,
+  io: InjectIO,
+  target: string,
+  html: string,
+): Plan {
+  const markerBlock = staticBootstrapBlock(html);
+  const markerSource = markerBlock?.src ?? null;
+  const moduleVersion = staticModuleVersion(html);
+  const status = inspectIntegration({
+    cwd: input.cwd,
+    recipe: "static",
+    endpoint: input.endpoint,
+    entryFile: target,
+    serviceName: input.serviceName,
+    io,
+  });
+  if (markerSource !== null) {
+    if (
+      markerBlock!.scriptKind !== "classic" ||
+      !isParserBlockingBootstrap(markerBlock!.attributeValues)
+    ) {
+      return {
+        recipe: input.recipe,
+        kind: "fallback-ai",
+        targetPath: null,
+        content: null,
+        snippet: "",
+        keyIsSourceLiteral: true,
+        warnings: [
+          `${path.relative(input.cwd, target) || target} has a bootstrap that is not a parser blocking classic script. Remove async, defer, nomodule, and type="module" from that tag while preserving its nonce, integrity, and crossorigin attributes, then run setup again.`,
+        ],
+      };
+    }
+    const suppliedVersion = browserEarlyCaptureVersion(input.sdkVersion);
+    const bootstrapVersion = staticBootstrapVersion(markerSource);
+    if (
+      !suppliedVersion ||
+      !bootstrapVersion ||
+      !browserEarlyCaptureVersion(bootstrapVersion) ||
+      bootstrapVersion !== suppliedVersion ||
+      !moduleVersion ||
+      moduleVersion !== bootstrapVersion
+    ) {
+      return staticMarkerValidationPlan(
+        input,
+        target,
+        markerSource,
+        moduleVersion,
+      );
+    }
+    if (!status.complete)
+      return staticIncompletePlan(input, target, status, true);
+    const firstExecutable = htmlScriptBlocks(html).find(
+      (block) => block.executable,
+    );
+    if (firstExecutable?.start !== markerBlock!.start) {
+      const withoutLateBootstrap =
+        html.slice(0, markerBlock!.start) + html.slice(markerBlock!.end);
+      return staticEarlyBootstrapUpgrade(
+        input,
+        io,
+        target,
+        withoutLateBootstrap,
+        html.slice(markerBlock!.start, markerBlock!.end),
+      );
+    }
+    return skipPlan(input, [
+      `${path.relative(input.cwd, target) || target} already references Crumbtrail and has a verified early browser bootstrap — left as it is.`,
+    ]);
+  }
+  if (!status.complete) {
+    if (
+      moduleVersion !== null &&
+      browserEarlyCaptureVersion(input.sdkVersion) !== null &&
+      moduleVersion !== browserEarlyCaptureVersion(input.sdkVersion)
+    ) {
+      const mismatch = staticBootstrapMismatchPlan(
+        input,
+        target,
+        moduleVersion,
+        browserEarlyCaptureVersion(input.sdkVersion)!,
+      );
+      mismatch.warnings.push(
+        ...integrationInstructions(
+          staticCheckInput(input, target),
+          status,
+          null,
+          target,
+        ),
+      );
+      return mismatch;
+    }
+    const onlyMissingKey =
+      status.missing.length === 1 && status.missing[0] === "ingest-key";
+    if (!onlyMissingKey || status.hazards.length > 0)
+      return staticIncompletePlan(input, target, status, false);
+    const upgrade = staticEarlyBootstrapUpgrade(input, io, target, html);
+    upgrade.warnings = [
+      ...upgrade.warnings,
+      ...integrationInstructions(
+        staticCheckInput(input, target),
+        status,
+        null,
+        target,
+      ),
+    ];
+    return upgrade;
+  }
+  return staticEarlyBootstrapUpgrade(input, io, target, html);
+}
+
+function staticEarlyBootstrapUpgrade(
+  input: BuildPlanInput,
+  io: InjectIO,
+  target: string,
+  html: string,
+  existingBootstrapTag?: string,
+): Plan {
+  const location = path.relative(input.cwd, target) || target;
+  const bootstrapUrl = browserEarlyBootstrapUrl(input.sdkVersion);
+  const bootstrapVersion = browserEarlyCaptureVersion(input.sdkVersion);
+  if (!bootstrapUrl || !bootstrapVersion)
+    return earlyCaptureUnavailablePlan(input, target, "static");
+  const moduleVersion = staticModuleVersion(html);
+  if (moduleVersion !== bootstrapVersion) {
+    return staticBootstrapMismatchPlan(
+      input,
+      target,
+      moduleVersion,
+      bootstrapVersion,
+    );
+  }
+
+  const content = insertIntoHtmlHead(
+    html,
+    existingBootstrapTag ??
+      `<script src=${JSON.stringify(bootstrapUrl)}></script>`,
+  );
+  if (content == null) {
+    return {
+      recipe: input.recipe,
+      kind: "fallback-ai",
+      targetPath: null,
+      content: null,
+      snippet: "",
+      keyIsSourceLiteral: true,
+      warnings: [
+        `${location} already references Crumbtrail but has no <head> or <body> for the early bootstrap. Add the parser blocking bootstrap before the page's first executable script, then run setup again.`,
+      ],
+    };
+  }
+  const status = io.gitStatus(input.cwd, target);
+  if (status.dirty && !input.options?.force) {
+    return {
+      recipe: input.recipe,
+      kind: "needs-confirm-dirty",
+      targetPath: target,
+      content,
+      applyMode: "rewrite",
+      keyIsSourceLiteral: true,
+      warnings: [
+        `${location} already references Crumbtrail but is missing early browser capture. The ${bootstrapUrl} bootstrap is ready, but the file has uncommitted changes. Confirm the edit or re-run with force.`,
+      ],
+    };
+  }
+  return {
+    recipe: input.recipe,
+    kind: "rewrite",
+    targetPath: target,
+    content,
+    keyIsSourceLiteral: true,
+    warnings: [
+      `Added the early browser bootstrap before the first executable script in ${location}.`,
+    ],
+  };
 }
 
 /**
@@ -1444,9 +2048,7 @@ function planStatic(input: BuildPlanInput, io: InjectIO): Plan {
     ]);
   }
   if (htmlReferencesCrumbtrail(html)) {
-    return skipPlan(input, [
-      `${path.relative(input.cwd, target) || target} already references Crumbtrail — left as it is.`,
-    ]);
+    return staticExistingPagePlan(input, io, target, html);
   }
   const wired = insertIntoHtmlHead(html, block);
   if (wired == null) {
@@ -1498,9 +2100,16 @@ function planServedStaticFrontend(
   input: BuildPlanInput,
   io: InjectIO,
   entrySource: string,
-): { edits: NonNullable<Plan["extraEdits"]>; warnings: string[] } {
+): {
+  edits: NonNullable<Plan["extraEdits"]>;
+  warnings: string[];
+  unresolved: boolean;
+  needsConfirmDirty: boolean;
+} {
   const edits: NonNullable<Plan["extraEdits"]> = [];
   const warnings: string[] = [];
+  let unresolved = false;
+  let needsConfirmDirty = false;
   const entryDir = path.dirname(input.entryFile ?? path.join(input.cwd, "x"));
   const reader: FileReader = {
     readFile: (p) => io.readFile(p),
@@ -1531,7 +2140,26 @@ function planServedStaticFrontend(
       continue;
     }
     const html = io.readFile(indexPath)!;
-    if (htmlReferencesCrumbtrail(html)) continue;
+    if (htmlReferencesCrumbtrail(html)) {
+      const upgrade = staticExistingPagePlan(input, io, indexPath, html);
+      warnings.push(...upgrade.warnings);
+      if (
+        (upgrade.kind === "rewrite" ||
+          upgrade.kind === "needs-confirm-dirty") &&
+        upgrade.content
+      ) {
+        edits.push({
+          path: indexPath,
+          mode: "update",
+          content: upgrade.content,
+          label: `added early browser capture to ${path.relative(input.cwd, indexPath) || indexPath}`,
+        });
+        if (upgrade.kind === "needs-confirm-dirty") needsConfirmDirty = true;
+      } else if (upgrade.kind !== "skip-already-wired") {
+        unresolved = true;
+      }
+      continue;
+    }
     const wired = insertIntoHtmlHead(
       html,
       staticScriptTagSnippet({
@@ -1555,6 +2183,13 @@ function planServedStaticFrontend(
       continue;
     }
     const rel = path.relative(input.cwd, indexPath) || indexPath;
+    const status = io.gitStatus(input.cwd, indexPath);
+    if (status.dirty && !input.options?.force) {
+      warnings.push(
+        `${rel} is served to browsers and has uncommitted changes. Confirm the edit or re-run with force to wire browser capture.`,
+      );
+      needsConfirmDirty = true;
+    }
     edits.push({
       path: indexPath,
       mode: "update",
@@ -1565,7 +2200,7 @@ function planServedStaticFrontend(
       `Wired browser capture into ${rel}, the page this server serves. Replace ${KEY_PLACEHOLDER} in it with your ingest key — a page with no bundler has no env var to read.`,
     );
   }
-  return { edits, warnings };
+  return { edits, warnings, unresolved, needsConfirmDirty };
 }
 
 /**
@@ -1610,6 +2245,7 @@ function planCapacitor(input: BuildPlanInput, io: InjectIO): Plan {
     keyExpr,
     input.serviceName,
     input.backendOrigins,
+    input.sdkVersion,
   );
 
   // Native plugins are optional peers, so the SDK degrades rather than failing
@@ -1697,7 +2333,7 @@ function planFlutter(input: BuildPlanInput, io: InjectIO): Plan {
       buildNote,
     ]);
   }
-  const existingPlan = existingIntegrationPlan(input, io, existing);
+  const existingPlan = existingIntegrationPlan(input, io, existing, target);
   if (existingPlan) return existingPlan;
 
   const wired = wireFlutterMain(
@@ -1789,7 +2425,7 @@ const TAURI_RUST_WARNINGS = [
 function planTauri(input: BuildPlanInput, io: InjectIO): Plan {
   // The Tauri transport routes to the local Rust store, so the block needs no
   // endpoint/apiKey — but they still thread through fallbackPlan's agent prompt.
-  const block = tauriInitSnippet();
+  const block = tauriInitSnippet(input.sdkVersion);
   if (!input.entryFile) {
     return fallbackPlan(input, block, [
       "Could not resolve the Tauri frontend entry from index.html — wire it manually.",
@@ -3334,6 +3970,17 @@ export function buildPlan(
         plan.keyIsSourceLiteral = true;
       }
       plan.warnings = [...plan.warnings, ...served.warnings];
+      if (served.needsConfirmDirty && !input.options?.force) {
+        if (plan.kind === "rewrite" || plan.kind === "amend-init")
+          plan.applyMode = "rewrite";
+        plan.kind = "needs-confirm-dirty";
+      }
+      if (served.unresolved && plan.kind === "skip-already-wired") {
+        plan.kind = "fallback-ai";
+        plan.snippet = "";
+        plan.targetPath = null;
+        plan.content = null;
+      }
     }
   }
   return plan;
@@ -3384,6 +4031,7 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
     default:
       break;
   }
+  if (input.recipe === "static") return planStatic(input, io);
   // Dependency presence is not enough. Only a complete integration for this
   // endpoint and service may skip the write. An incomplete reachable setup is
   // handed back as guidance so the existing initializer is repaired in place.
@@ -3395,25 +4043,11 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
     serviceName: input.serviceName,
     io,
   });
-  if (integration.complete) return skipPlan(input);
-  // A wired static page whose ONLY gap is the key placeholder is not a broken
-  // integration — it is a finished edit with one step left that only the user
-  // can do. Handing back the whole snippet again told them to paste code their
-  // page already carries, and named an env var this recipe does not use.
-  if (
-    integration.found &&
-    input.recipe === "static" &&
-    integration.missing.every((piece) => piece === "ingest-key")
-  ) {
-    const plan = skipPlan(
-      input,
-      [
-        `This page is already wired. One step is left, and only you can do it: replace ${KEY_PLACEHOLDER} in ${input.entryFile ? path.relative(input.cwd, input.entryFile) || input.entryFile : "the page"} with your ingest key${input.mintUrl ? ` from ${input.mintUrl}` : ""}.`,
-      ],
-      { replaceDefaultWarning: true },
-    );
-    plan.keyIsSourceLiteral = true;
-    return plan;
+  if (integration.complete) {
+    const boundary = browserEntryBoundary(input, io);
+    if (!hasEarlyBrowserMarker(input, io, boundary))
+      return earlyBrowserUpgradePlan(input, io, boundary);
+    return skipPlan(input);
   }
   // An incomplete integration the customer already wrote is a thing to FINISH,
   // not a thing to refuse. Only when its init call cannot be parsed and extended
@@ -3448,10 +4082,6 @@ function dispatchPlan(input: BuildPlanInput, io: InjectIO): Plan {
       return planVite(input, io);
     case "cra":
       return planCra(input, io);
-    case "static":
-      // A page with no bundler: the HTML itself is the entry, wired with a
-      // script tag rather than an import.
-      return planStatic(input, io);
     case "express":
       // Express additionally wires the request/error middleware pair so the
       // backend emits backend.req.* spans, not just crash capture.

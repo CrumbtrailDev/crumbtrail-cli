@@ -226,7 +226,33 @@ describe("analyzeSource / referencesCrumbtrail", () => {
   it("flags crumbtrail references", () => {
     expect(referencesCrumbtrail('import x from "crumbtrail-node";')).toBe(true);
     expect(referencesCrumbtrail("import x from 'crumbtrail-core';")).toBe(true);
+    expect(referencesCrumbtrail('import("crumbtrail-core");')).toBe(true);
+    expect(referencesCrumbtrail('require("crumbtrail-node");')).toBe(true);
     expect(referencesCrumbtrail("nothing here")).toBe(false);
+  });
+
+  it("ignores package names in comments, strings, and unrelated config", () => {
+    expect(
+      referencesCrumbtrail(
+        [
+          '// import x from "crumbtrail-core";',
+          '/* require("crumbtrail-node") */',
+          'const config = { package: "crumbtrail-core" };',
+          'const text = "crumbtrail-react-native";',
+        ].join("\n"),
+      ),
+    ).toBe(false);
+  });
+
+  it("rejects member loaders while keeping bare module loaders executable", () => {
+    expect(referencesCrumbtrail('window.import("crumbtrail-core");')).toBe(
+      false,
+    );
+    expect(referencesCrumbtrail('loader.require("crumbtrail-node");')).toBe(
+      false,
+    );
+    expect(referencesCrumbtrail('import("crumbtrail-core");')).toBe(true);
+    expect(referencesCrumbtrail('require("crumbtrail-node");')).toBe(true);
   });
 
   it("flags the Dart package, whose name has no hyphen", () => {

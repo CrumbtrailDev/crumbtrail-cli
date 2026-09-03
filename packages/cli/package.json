@@ -73,7 +73,8 @@
     "crumbtrail-node": "workspace:^"
   },
   "dependencies": {
-    "@babel/parser": "^7.29.7"
+    "@babel/parser": "^7.29.7",
+    "entities": "6.0.1"
   },
   "homepage": "https://crumbtrail.ai",
   "bugs": {

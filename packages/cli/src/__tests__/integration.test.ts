@@ -10,11 +10,50 @@ import { buildPlan } from "../inject/recipes";
 import { materializePlan } from "../inject/executor";
 import { envLoadCaveat } from "../cli";
 import { fakeInjectIO } from "./helpers";
+import {
+  hasExecutableCrumbtrailReference,
+  executableModuleSpecifiers,
+} from "../inject/amend";
 
 const CWD = "/proj";
 const ENDPOINT = "https://ingest.example.com";
 const p = (...parts: string[]) => path.join(CWD, ...parts);
 const FIXTURES = path.resolve(__dirname, "../../../../test-fixtures/cli-1");
+
+it("recognizes runtime TypeScript import assignments and follows local closure", () => {
+  const entry = 'import setup = require("./setup"); setup();';
+  const setup =
+    'import ct = require("crumbtrail-node"); ct.autoCapture({ endpoint: "https://ingest.example.com", authToken: process.env.CRUMBTRAIL_KEY, service: "api" });';
+  expect(hasExecutableCrumbtrailReference(setup)).toBe(true);
+  expect(executableModuleSpecifiers(entry)).toEqual(["./setup"]);
+  expect(
+    executableModuleSpecifiers('import type ct = require("crumbtrail-node");'),
+  ).toEqual([]);
+  expect(
+    hasExecutableCrumbtrailReference(
+      'import type ct = require("crumbtrail-node");',
+    ),
+  ).toBe(false);
+  const status = inspectIntegration({
+    cwd: CWD,
+    recipe: "express",
+    endpoint: ENDPOINT,
+    entryFile: p("src/index.ts"),
+    serviceName: "api",
+    io: fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-node": "0.49.0" },
+      }),
+      [p("node_modules/crumbtrail-node/package.json")]: "{}",
+      [p("node_modules/crumbtrail-core/package.json")]: "{}",
+      [p("src/index.ts")]: entry,
+      [p("src/setup.ts")]: setup,
+      [p(".env")]: "CRUMBTRAIL_KEY=customer-key\n",
+    }),
+  });
+  expect(status.found).toBe(true);
+  expect(status.missing).not.toContain("entry");
+});
 
 function fixtureFiles(root: string): Record<string, string> {
   const files: Record<string, string> = {};
@@ -90,6 +129,29 @@ describe("inspectIntegration", () => {
     );
   });
 
+  it("follows only executable local imports, not comments or strings", () => {
+    const reachable = reachableSourceFiles({
+      cwd: CWD,
+      recipe: "node",
+      endpoint: ENDPOINT,
+      entryFile: p("src", "index.ts"),
+      io: fakeInjectIO({
+        [p("src", "index.ts")]: [
+          '// import "./commented.ts";',
+          'const note = "import ./quoted.ts";',
+          'import "./real.ts";',
+        ].join("\n"),
+        [p("src", "commented.ts")]: "commented()",
+        [p("src", "quoted.ts")]: "quoted()",
+        [p("src", "real.ts")]: "real()",
+      }),
+    });
+    const files = reachable.map((entry) => entry.file);
+    expect(files).toContain(p("src", "real.ts"));
+    expect(files).not.toContain(p("src", "commented.ts"));
+    expect(files).not.toContain(p("src", "quoted.ts"));
+  });
+
   it("requires complete endpoint, key, service and remote configuration evidence", () => {
     const status = inspectIntegration({
       cwd: CWD,
@@ -110,6 +172,30 @@ describe("inspectIntegration", () => {
       keyEnvVarsSeen: ["VITE_CRUMBTRAIL_KEY"],
       endpointEnvVarsSeen: [],
     });
+  });
+
+  it("does not find a Crumbtrail integration in comments or unrelated strings", () => {
+    const status = inspectIntegration({
+      cwd: CWD,
+      recipe: "vite-spa",
+      endpoint: ENDPOINT,
+      entryFile: p("src", "main.tsx"),
+      serviceName: "web",
+      io: fakeInjectIO({
+        [p("package.json")]: JSON.stringify({
+          dependencies: { "crumbtrail-core": "0.49.0" },
+        }),
+        [p("node_modules", "crumbtrail-core", "package.json")]: "{}",
+        [p("src", "main.tsx")]: [
+          '// import { Crumbtrail } from "crumbtrail-core";',
+          'const config = { package: "crumbtrail-core" };',
+          'const message = "require(\\"crumbtrail-node\\")";',
+        ].join("\n"),
+      }),
+    });
+
+    expect(status.found).toBe(false);
+    expect(status.missing).toContain("entry");
   });
 
   it("harvests customer env names from source and setup files without reading config values", () => {
@@ -566,6 +652,7 @@ describe("amending an integration the customer already has", () => {
         endpoint: ENDPOINT,
         entryFile: p("src", "main.tsx"),
         serviceName: "web",
+        sdkVersion: "0.49.0",
         options: { force: true },
       },
       fakeInjectIO(files),
@@ -590,6 +677,8 @@ describe("amending an integration the customer already has", () => {
     });
     expect(plan.content).toBe(
       [
+        'import "crumbtrail-core/early";',
+        "",
         'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
         "",
         "Crumbtrail.init({",
@@ -605,10 +694,64 @@ describe("amending an integration the customer already has", () => {
     // Byte-identical outside the inserted line.
     expect(
       plan
-        .content!.split("\n")
+        .content!.replace('import "crumbtrail-core/early";\n\n', "")
+        .split("\n")
         .filter((line) => line !== '  service: "web",')
         .join("\n"),
     ).toBe(before);
+  });
+
+  it("amends init and adds early capture at a separate entry boundary", () => {
+    const files = amendableFiles();
+    files[p("src", "main.tsx")] = 'import "./telemetry";\nrender();\n';
+    files[p("src", "telemetry.ts")] = [
+      'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
+      "Crumbtrail.init({",
+      "  ...PRESET_PASSIVE,",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "});",
+      "",
+    ].join("\n");
+    const plan = amendPlanFor(files);
+
+    expect(plan.kind).toBe("amend-init");
+    expect(plan.targetPath).toBe(p("src", "telemetry.ts"));
+    expect(plan.content).toContain('service: "web"');
+    expect(plan.extraEdits).toEqual([
+      expect.objectContaining({
+        path: p("src", "main.tsx"),
+        mode: "update",
+        content:
+          'import "crumbtrail-core/early";\n\nimport "./telemetry";\nrender();\n',
+      }),
+    ]);
+  });
+
+  it("requires confirmation when the separate entry boundary is dirty", () => {
+    const files = amendableFiles();
+    files[p("src", "main.tsx")] = 'import "./telemetry";\nrender();\n';
+    files[p("src", "telemetry.ts")] = files[p("src", "main.tsx")].replace(
+      'import "./telemetry";\nrender();',
+      [
+        'import { Crumbtrail } from "crumbtrail-core";',
+        `Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY });`,
+      ].join("\n"),
+    );
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.tsx"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO(files, { dirty: [p("src", "main.tsx")] }),
+    );
+
+    expect(plan.kind).toBe("needs-confirm-dirty");
+    expect(plan.extraEdits?.[0]?.path).toBe(p("src", "main.tsx"));
   });
 
   it("refuses a partial amend when an existing option disagrees", () => {
@@ -777,6 +920,7 @@ describe("an amended service reads the key the wizard just wrote", () => {
         endpoint: ENDPOINT,
         entryFile: p("src", "main.tsx"),
         serviceName: "web",
+        sdkVersion: "0.49.0",
         options: { force: true },
       },
       fakeInjectIO({
@@ -806,10 +950,7 @@ describe("SDK packages an adapter already implies", () => {
   ): Record<string, string> => ({
     [p("package.json")]: JSON.stringify({ dependencies }),
     ...Object.fromEntries(
-      installed.map((name) => [
-        p("node_modules", name, "package.json"),
-        "{}",
-      ]),
+      installed.map((name) => [p("node_modules", name, "package.json"), "{}"]),
     ),
     [p("server.js")]: [
       'import { autoCapture } from "crumbtrail-node";',

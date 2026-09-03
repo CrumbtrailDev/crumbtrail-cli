@@ -3,6 +3,8 @@
 // tests can assert behavior without touching disk.
 
 import { parse } from "@babel/parser";
+import { decodeHTMLAttribute } from "entities";
+import { hasExecutableCrumbtrailReference } from "./amend";
 
 const BOM = "﻿";
 
@@ -67,9 +69,7 @@ export function prologueEnd(lines: string[]): number {
  * name would not match the JS pattern.
  */
 export function referencesCrumbtrail(text: string): boolean {
-  return /crumbtrail-core|crumbtrail-node|crumbtrail-react-native|crumbtrail-capacitor|crumbtrail_flutter/.test(
-    text,
-  );
+  return hasExecutableCrumbtrailReference(text);
 }
 
 /**
@@ -721,8 +721,7 @@ function widenFinalSetHeaderAllowlist(
   visitReturnedHeaderPolicy(installed[0].body, (node) => {
     if (
       node.type !== "ObjectProperty" ||
-      objectPropertyName(node)?.toLowerCase() !==
-        "access-control-allow-headers"
+      objectPropertyName(node)?.toLowerCase() !== "access-control-allow-headers"
     )
       return;
     policyCount++;
@@ -1063,20 +1062,274 @@ export function corsImportedElsewhereNote(): string {
 
 // ── Static frontends ─────────────────────────────────────────────────────────
 
-/** Whether this HTML already carries a Crumbtrail script tag. */
-export function htmlReferencesCrumbtrail(html: string): boolean {
-  return /crumbtrail/i.test(html);
+/** JavaScript script types that execute as application code in an HTML page. */
+const JAVASCRIPT_SCRIPT_TYPE = new Set([
+  "application/ecmascript",
+  "application/javascript",
+  "application/x-ecmascript",
+  "application/x-javascript",
+  "text/ecmascript",
+  "text/javascript",
+  "text/javascript1.0",
+  "text/javascript1.1",
+  "text/javascript1.2",
+  "text/javascript1.3",
+  "text/javascript1.4",
+  "text/javascript1.5",
+  "text/jscript",
+  "text/livescript",
+  "text/x-ecmascript",
+  "text/x-javascript",
+]);
+
+function classifyScript(
+  attrs: ReadonlyMap<string, string>,
+): "classic" | "module" | "inert" {
+  // An omitted or empty type is a classic script. An explicit non-JavaScript
+  // type is a data block and does not establish an execution boundary.
+  const type = (attrs.get("type") ?? "").trim().toLowerCase();
+  if (type === "module") return "module";
+  if (type === "" || JAVASCRIPT_SCRIPT_TYPE.has(type))
+    return "classic";
+  return "inert";
+}
+
+function tagEnd(html: string, start: number): number | null {
+  let quote: '"' | "'" | undefined;
+  for (let index = start; index < html.length; index += 1) {
+    const character = html[index];
+    if (quote) {
+      if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character === ">") return index;
+  }
+  return null;
+}
+
+const RAW_HTML_ELEMENTS = new Set([
+  "script",
+  "style",
+  "textarea",
+  "title",
+  "noscript",
+  "iframe",
+  "xmp",
+  "noembed",
+  "noframes",
+]);
+const INERT_HTML_ELEMENT =
+  /^<(template|noscript|style|textarea|title|iframe|xmp|noembed|noframes|plaintext)(?=[\s/>])/i;
+
+export interface HtmlScriptBlock {
+  start: number;
+  end: number;
+  attributes: string;
+  attributeValues: ReadonlyMap<string, string>;
+  content: string;
+  src: string | null;
+  executable: boolean;
+  scriptKind: "classic" | "module" | "inert";
+}
+
+function afterInertElement(
+  html: string,
+  start: number,
+  tagName: string,
+): number | null {
+  const openEnd = tagEnd(html, start + tagName.length + 1);
+  if (openEnd === null) return null;
+  if (tagName.toLowerCase() === "plaintext") return html.length;
+  if (tagName.toLowerCase() !== "template")
+    return afterRawElement(html, openEnd + 1, tagName)?.end ?? null;
+  let offset = openEnd + 1;
+  let depth = 1;
+  while (offset < html.length) {
+    const start = html.indexOf("<", offset);
+    if (start < 0) return null;
+    if (html.startsWith("<!--", start)) {
+      const end = html.indexOf("-->", start + 4);
+      if (end < 0) return null;
+      offset = end + 3;
+      continue;
+    }
+    const tag = /^<(\/?)([a-z][a-z0-9:-]*)(?=[\s/>])/i.exec(html.slice(start));
+    if (!tag) {
+      offset = start + 1;
+      continue;
+    }
+    const end = tagEnd(html, start + tag[0].length);
+    if (end === null) return null;
+    const name = tag[2].toLowerCase();
+    if (name === "template") {
+      depth += tag[1] ? -1 : 1;
+      if (depth === 0) return end + 1;
+    }
+    if (!tag[1] && RAW_HTML_ELEMENTS.has(name)) {
+      const after = afterRawElement(html, end + 1, name);
+      if (!after) return null;
+      offset = after.end;
+    } else offset = end + 1;
+  }
+  return null;
+}
+
+function afterRawElement(
+  html: string,
+  offset: number,
+  name: string,
+): { start: number; end: number } | null {
+  const close = new RegExp(`</${name}(?=[\\s/>])`, "gi");
+  close.lastIndex = offset;
+  const match = close.exec(html);
+  if (!match) return null;
+  const end = tagEnd(html, match.index + match[0].length);
+  return end === null ? null : { start: match.index, end: end + 1 };
+}
+
+function htmlAttributes(source: string): ReadonlyMap<string, string> {
+  const values = new Map<string, string>();
+  let offset = 0;
+  while (offset < source.length) {
+    while (/[\s/]/.test(source[offset] ?? "") && offset < source.length)
+      offset++;
+    const start = offset;
+    while (offset < source.length && !/[\s=/>]/.test(source[offset])) offset++;
+    if (start === offset) {
+      offset++;
+      continue;
+    }
+    const name = source.slice(start, offset).toLowerCase();
+    while (offset < source.length && /\s/.test(source[offset])) offset++;
+    let value = "";
+    if (source[offset] === "=") {
+      offset++;
+      while (offset < source.length && /\s/.test(source[offset])) offset++;
+      const quote = source[offset];
+      if (quote === '"' || quote === "'") {
+        const valueStart = ++offset;
+        while (offset < source.length && source[offset] !== quote) offset++;
+        value = source.slice(valueStart, offset);
+        if (offset < source.length) offset++;
+      } else {
+        const valueStart = offset;
+        while (offset < source.length && !/\s/.test(source[offset])) offset++;
+        value = source.slice(valueStart, offset);
+      }
+    }
+    if (!values.has(name)) values.set(name, decodeHTMLAttribute(value));
+  }
+  return values;
 }
 
 /**
- * Put a block into an HTML document, as late in `<head>` as possible.
+ * Scans HTML script elements while ignoring comments and inert elements. The
+ * same scan drives insertion, Crumbtrail detection, and bootstrap detection so
+ * a marker in a comment or data block can never make setup claim completion.
+ */
+export function htmlScriptBlocks(html: string): HtmlScriptBlock[] {
+  const blocks: HtmlScriptBlock[] = [];
+  let offset = 0;
+  while (offset < html.length) {
+    const start = html.indexOf("<", offset);
+    if (start < 0) return blocks;
+
+    if (html.startsWith("<!--", start)) {
+      const commentEnd = html.indexOf("-->", start + 4);
+      offset = commentEnd < 0 ? html.length : commentEnd + 3;
+      continue;
+    }
+
+    const inert = INERT_HTML_ELEMENT.exec(html.slice(start));
+    if (inert) {
+      const after = afterInertElement(html, start, inert[1]);
+      if (after === null) return blocks;
+      offset = after;
+      continue;
+    }
+
+    const open = /^<script(?=[\s/>])/i.exec(html.slice(start));
+    if (!open) {
+      if (/^<(?:\/?[a-z]|[!?])/i.test(html.slice(start))) {
+        const end = tagEnd(html, start + 1);
+        if (end === null) return blocks;
+        offset = end + 1;
+      } else {
+        offset = start + 1;
+      }
+      continue;
+    }
+
+    const end = tagEnd(html, start + open[0].length);
+    if (end === null) return blocks;
+    const attributes = html.slice(start + open[0].length, end);
+    const attributeValues = htmlAttributes(attributes);
+    const scriptKind = classifyScript(attributeValues);
+    const closeMatch = afterRawElement(html, end + 1, "script");
+    const blockEnd = closeMatch?.end ?? html.length;
+    blocks.push({
+      start,
+      end: blockEnd,
+      attributes,
+      attributeValues,
+      content: html.slice(end + 1, closeMatch?.start ?? html.length),
+      src: attributeValues.get("src") ?? null,
+      executable: scriptKind !== "inert",
+      scriptKind,
+    });
+    offset = blockEnd;
+  }
+  return blocks;
+}
+
+const CRUMBTRAIL_CDN_HOSTS = new Set(["esm.sh", "unpkg.com"]);
+const CRUMBTRAIL_PACKAGE_URL =
+  /^\/crumbtrail-(?:core|node|react-native|capacitor)(?:@|\/|$)/i;
+
+/** True only for the package URLs emitted by the static recipe. */
+function isCrumbtrailScriptUrl(source: string): boolean {
+  try {
+    const url = new URL(source);
+    return (
+      url.protocol === "https:" &&
+      CRUMBTRAIL_CDN_HOSTS.has(url.hostname.toLowerCase()) &&
+      CRUMBTRAIL_PACKAGE_URL.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Whether this HTML already carries a Crumbtrail script or module. */
+export function htmlReferencesCrumbtrail(html: string): boolean {
+  return htmlScriptBlocks(html)
+    .filter((block) => block.executable)
+    .some((block) =>
+      block.src !== null
+        ? isCrumbtrailScriptUrl(block.src)
+        : hasExecutableCrumbtrailReference(block.content),
+    );
+}
+
+/** Finds a real executable script tag without entering comments or data blocks. */
+function firstExecutableScript(html: string): number | null {
+  return (
+    htmlScriptBlocks(html).find((block) => block.executable)?.start ?? null
+  );
+}
+
+/**
+ * Put a block into an HTML document before the first executable script.
  *
  * Order matters more here than in a module graph: capture has to be installed
  * before the page's own scripts run, or the errors it exists to record happen
- * first and are gone. `</head>` is therefore the target, with `<body>` and then
- * `</body>` as fallbacks for the many real pages that have neither a head nor a
- * closing tag. A file with no HTML structure at all returns null rather than
- * having a script tag guessed into it.
+ * first and are gone. If the page has no executable script in its head, the
+ * block goes at the end of head. `<body>` and then `</body>` are fallbacks for
+ * pages that have no head. A file with no HTML structure at all returns null.
  */
 export function insertIntoHtmlHead(html: string, block: string): string | null {
   // Indent the block to match the tag it lands above, and insert at the START
@@ -1100,8 +1353,15 @@ export function insertIntoHtmlHead(html: string, block: string): string | null {
     }
     return `${html.slice(0, at)}\n${indented}\n${indent}${html.slice(at)}`;
   };
+
+  const firstScript = firstExecutableScript(html);
+  if (firstScript !== null) return spliceBefore(firstScript);
+
+  const head = /<head\b[^>]*>/i.exec(html);
   const closeHead = /<\/head\s*>/i.exec(html);
-  if (closeHead) return spliceBefore(closeHead.index);
+  if (head && closeHead && head.index < closeHead.index)
+    return spliceBefore(closeHead.index);
+
   const openBody = /<body\b[^>]*>/i.exec(html);
   if (openBody) {
     const at = openBody.index + openBody[0].length;
@@ -1111,6 +1371,7 @@ export function insertIntoHtmlHead(html: string, block: string): string | null {
       .join("\n");
     return `${html.slice(0, at)}\n${indented}${html.slice(at)}`;
   }
+
   const closeBody = /<\/body\s*>/i.exec(html);
   if (closeBody) return spliceBefore(closeBody.index);
   return null;

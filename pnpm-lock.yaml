@@ -87,6 +87,9 @@ importers:
       '@babel/parser':
         specifier: ^7.29.7
         version: 7.29.7
+      entities:
+        specifier: 6.0.1
+        version: 6.0.1
     devDependencies:
       '@types/node':
         specifier: ^25.5.0

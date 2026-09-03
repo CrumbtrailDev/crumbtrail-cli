@@ -22,6 +22,7 @@ import {
   nestInitSnippet,
   nodeInitSnippet,
   nuxtPluginSnippet,
+  reactNativeInitSnippet,
   staticScriptTagSnippet,
   tauriInitSnippet,
 } from "../inject/snippets";
@@ -69,6 +70,77 @@ describe("browser inits opt out of the collectors that record the person", () =>
   }
 });
 
+describe("early browser capture", () => {
+  it("starts before each supported browser initializer", () => {
+    const snippets: Array<[string, string]> = [
+      [
+        "client",
+        clientInitSnippet(ENDPOINT, CLIENT_KEY, "web", null, "0.49.0"),
+      ],
+      ["nuxt", nuxtPluginSnippet(ENDPOINT, CLIENT_KEY, "web", null, "0.49.0")],
+      [
+        "capacitor",
+        capacitorInitSnippet(ENDPOINT, CLIENT_KEY, "app", null, "0.49.0"),
+      ],
+      ["tauri", tauriInitSnippet("0.49.0")],
+      [
+        "static",
+        staticScriptTagSnippet({
+          endpoint: ENDPOINT,
+          keyLiteral: "ctkey_TODO",
+          sdkVersion: "0.49.0",
+        }),
+      ],
+    ];
+    for (const [name, snippet] of snippets) {
+      expect(snippet, name).toContain("early");
+    }
+  });
+
+  it("does not add the browser-only early module to React Native", () => {
+    expect(reactNativeInitSnippet(ENDPOINT, CLIENT_KEY, "app")).not.toContain(
+      "crumbtrail-core/early",
+    );
+  });
+
+  it("does not emit an early URL or import before the coordinated SDK release", () => {
+    const staticSnippet = staticScriptTagSnippet({
+      endpoint: ENDPOINT,
+      keyLiteral: "ctkey_TODO",
+      sdkVersion: "0.48.0",
+    });
+    expect(staticSnippet).not.toContain("early-bootstrap.global.js");
+    expect(staticSnippet).toContain("https://esm.sh/crumbtrail-core@0.48.0");
+    expect(
+      clientInitSnippet(ENDPOINT, CLIENT_KEY, "web", null, "0.48.0"),
+    ).not.toContain("crumbtrail-core/early");
+  });
+
+  it("starts Tauri early capture before its main SDK import", () => {
+    const snippet = tauriInitSnippet("0.49.0");
+    expect(snippet.indexOf('import "crumbtrail-core/early";')).toBeLessThan(
+      snippet.indexOf(
+        'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
+      ),
+    );
+  });
+
+  it("uses a synchronous packaged bootstrap for static HTML", () => {
+    const snippet = staticScriptTagSnippet({
+      endpoint: ENDPOINT,
+      keyLiteral: "ctkey_TODO",
+      sdkVersion: "1.2.3",
+    });
+    expect(snippet).toContain(
+      '<script src="https://unpkg.com/crumbtrail-core@1.2.3/dist/early-bootstrap.global.js"></script>',
+    );
+    expect(snippet).not.toContain("crumbtrail-core@1.2.3/early");
+    expect(snippet.indexOf("early-bootstrap.global.js")).toBeLessThan(
+      snippet.indexOf('<script type="module">'),
+    );
+  });
+});
+
 describe("backend capture only runs with a key", () => {
   it("guards autoCapture", () => {
     expect(nodeInitSnippet(ENDPOINT, SERVER_KEY, "api")).toContain(
@@ -111,11 +183,11 @@ describe("backend capture only runs with a key", () => {
       );
       const errors = ts
         .getPreEmitDiagnostics(program)
-        .filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error);
+        .filter(
+          (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error,
+        );
       expect(errors.map((diagnostic) => diagnostic.messageText)).toEqual([]);
-      expect(source).toContain(
-        "authToken: __crumbtrailKey, service: \"api\"",
-      );
+      expect(source).toContain('authToken: __crumbtrailKey, service: "api"');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

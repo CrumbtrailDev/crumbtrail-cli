@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import path from "node:path";
 import { buildPlan, supportsInstrumentationClient } from "../inject/recipes";
+import { prependIntoSource } from "../inject/text";
+import { hasExecutableEarlyBrowserImport } from "../inject/amend";
 import { fakeInjectIO } from "./helpers";
 
 const CWD = "/proj";
@@ -91,7 +93,12 @@ describe("buildPlan — Next.js", () => {
       [p("instrumentation-client.js")]: existing,
     });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "next", endpoint: ENDPOINT, nextVersion: "15.5.12" },
+      {
+        cwd: CWD,
+        recipe: "next",
+        endpoint: ENDPOINT,
+        nextVersion: "15.5.12",
+      },
       io,
     );
     // "prepend", not "create": the customer's Sentry and PostHog init survives
@@ -101,6 +108,37 @@ describe("buildPlan — Next.js", () => {
     expect(plan.content).toContain('from "crumbtrail-core"');
     // Nothing is planned at the path the old code would have created.
     expect(plan.targetPath).not.toBe(p("src", "instrumentation-client.ts"));
+  });
+
+  it("keeps a use client directive first and starts early capture before init", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: "{}",
+      [p("instrumentation-client.ts")]:
+        '"use client";\nexport const register = () => {};\n',
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "next",
+        endpoint: ENDPOINT,
+        nextVersion: "15.5.12",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    const materialized = prependIntoSource(
+      '"use client";\nexport const register = () => {};\n',
+      plan.content!,
+    );
+    expect(materialized.startsWith('"use client";')).toBe(true);
+    expect(
+      materialized.indexOf('import "crumbtrail-core/early";'),
+    ).toBeLessThan(
+      materialized.indexOf(
+        'import { Crumbtrail, PRESET_PASSIVE } from "crumbtrail-core";',
+      ),
+    );
   });
 
   it("prefers the instrumentation-client Next actually loads and reports the other as untouched", () => {
@@ -284,6 +322,359 @@ describe("buildPlan — Next.js", () => {
 });
 
 describe("buildPlan — idempotency", () => {
+  it.each([
+    "function require() {}",
+    "const require = () => {};",
+    "class require {}",
+    "const { loader: require } = loaders;",
+    "const [require] = loaders;",
+    'import require from "loader";',
+    'import { loader as require } from "loader";',
+    'import * as require from "loader";',
+  ])(
+    "rejects shadowed require proof including hoisted bindings: %s",
+    (binding) => {
+      expect(
+        hasExecutableEarlyBrowserImport(
+          `require("crumbtrail-core/early");\n${binding}`,
+        ),
+      ).toBe(false);
+    },
+  );
+  it("accepts the genuine unbound CommonJS loader first", () => {
+    expect(
+      hasExecutableEarlyBrowserImport(
+        'require("crumbtrail-core/early");\nrequire("./app");',
+      ),
+    ).toBe(true);
+  });
+  it.each([
+    'fetch("/startup");',
+    'function startup() { fetch("/startup"); } startup();',
+    "window.started = true;",
+    "const value = window.startup;",
+    "new Startup();",
+  ])("requires runtime early capture before effects: %s", (effect) => {
+    expect(
+      hasExecutableEarlyBrowserImport(
+        `${effect}\nawait import("crumbtrail-core/early");`,
+      ),
+    ).toBe(false);
+    expect(
+      hasExecutableEarlyBrowserImport(
+        `await import("crumbtrail-core/early");\n${effect}`,
+      ),
+    ).toBe(true);
+    expect(
+      hasExecutableEarlyBrowserImport(
+        `${effect}\nrequire("crumbtrail-core/early");`,
+      ),
+    ).toBe(false);
+    expect(
+      hasExecutableEarlyBrowserImport(
+        `require("crumbtrail-core/early");\n${effect}`,
+      ),
+    ).toBe(true);
+  });
+  it.each([
+    [
+      'await import("./telemetry"); await import("crumbtrail-core/early");',
+      false,
+    ],
+    [
+      'await import("crumbtrail-core/early"); await import("./telemetry");',
+      true,
+    ],
+    ['require("./telemetry"); require("crumbtrail-core/early");', false],
+    ['require("crumbtrail-core/early"); require("./telemetry");', true],
+    ['import("./telemetry"); await import("crumbtrail-core/early");', false],
+    ['await import("crumbtrail-core/early"); import("./telemetry");', true],
+    ['import "./telemetry"; import "crumbtrail-core/early";', false],
+    ['import "crumbtrail-core/early"; import "./telemetry";', true],
+    ['import "./telemetry"; await import("crumbtrail-core/early");', false],
+    ['await import("crumbtrail-core/early"); import "./telemetry";', false],
+    [
+      'const init = Crumbtrail.init({}), early = await import("crumbtrail-core/early");',
+      false,
+    ],
+    [
+      'const early = await import("crumbtrail-core/early"), init = Crumbtrail.init({});',
+      true,
+    ],
+  ])("proves dependency and expression ordering for %s", (source, expected) => {
+    expect(hasExecutableEarlyBrowserImport(source)).toBe(expected);
+  });
+  it("retrofits early capture into a complete framework integration", () => {
+    const source = [
+      'import { Crumbtrail } from "crumbtrail-core";',
+      "Crumbtrail.init({",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "  remoteConfig: true,",
+      '  service: "web",',
+      "});",
+      "",
+    ].join("\n");
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.49.0" },
+      }),
+      [installed("crumbtrail-core")]: JSON.stringify({
+        name: "crumbtrail-core",
+        version: "0.49.0",
+      }),
+      [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+      [p("src", "main.ts")]: source,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.targetPath).toBe(p("src", "main.ts"));
+    expect(plan.content).toBe('import "crumbtrail-core/early";');
+  });
+
+  it("retrofits at the browser entry boundary when init lives in a helper", () => {
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.49.0" },
+      }),
+      [installed("crumbtrail-core")]: JSON.stringify({
+        name: "crumbtrail-core",
+        version: "0.49.0",
+      }),
+      [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+      [p("src", "main.ts")]:
+        '"use client";\nimport "./telemetry";\nrender();\n',
+      [p("src", "telemetry.ts")]: [
+        'import { Crumbtrail } from "crumbtrail-core";',
+        "Crumbtrail.init({",
+        `  httpEndpoint: "${ENDPOINT}",`,
+        "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+        "  remoteConfig: true,",
+        '  service: "web",',
+        "});",
+        "",
+      ].join("\n"),
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.targetPath).toBe(p("src", "main.ts"));
+    const materialized = prependIntoSource(
+      io.readFile(p("src", "main.ts"))!,
+      plan.content!,
+    );
+    expect(materialized.startsWith('"use client";')).toBe(true);
+    expect(
+      materialized.indexOf('import "crumbtrail-core/early";'),
+    ).toBeLessThan(materialized.indexOf('import "./telemetry";'));
+  });
+
+  it.each([
+    ["a line comment", '// import "crumbtrail-core/early";'],
+    ["a block comment", '/* import "crumbtrail-core/early"; */'],
+    ["a quoted string", 'const marker = "import \\"crumbtrail-core/early\\"";'],
+  ])("does not treat %s as an executable early import", (_kind, marker) => {
+    const source = [
+      marker,
+      'import { Crumbtrail } from "crumbtrail-core";',
+      "Crumbtrail.init({",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "  remoteConfig: true,",
+      '  service: "web",',
+      "});",
+      "",
+    ].join("\n");
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.49.0" },
+      }),
+      [installed("crumbtrail-core")]: JSON.stringify({
+        name: "crumbtrail-core",
+        version: "0.49.0",
+      }),
+      [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+      [p("src", "main.ts")]: source,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.content).toBe('import "crumbtrail-core/early";');
+  });
+
+  it.each([
+    ["window.import", 'window.import("crumbtrail-core/early")', "prepend"],
+    ["loader.require", 'loader.require("crumbtrail-core/early")', "prepend"],
+    [
+      "an unawaited dynamic import",
+      'import("crumbtrail-core/early")',
+      "prepend",
+    ],
+    [
+      "an awaited dynamic import",
+      'await import("crumbtrail-core/early")',
+      "skip-already-wired",
+    ],
+    [
+      "a bare require",
+      'require("crumbtrail-core/early")',
+      "skip-already-wired",
+    ],
+    [
+      "a static import",
+      'import "crumbtrail-core/early";',
+      "skip-already-wired",
+    ],
+    [
+      "an export",
+      'export { default } from "crumbtrail-core/early";',
+      "prepend",
+    ],
+  ] as const)(
+    "accepts only an ordering-safe executable early marker in %s",
+    (_kind, marker, expected) => {
+      const source = [
+        marker,
+        'import { Crumbtrail } from "crumbtrail-core";',
+        "Crumbtrail.init({",
+        `  httpEndpoint: "${ENDPOINT}",`,
+        "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+        "  remoteConfig: true,",
+        '  service: "web",',
+        "});",
+        "",
+      ].join("\n");
+      const io = fakeInjectIO({
+        [p("package.json")]: JSON.stringify({
+          dependencies: { "crumbtrail-core": "0.49.0" },
+        }),
+        [installed("crumbtrail-core")]: JSON.stringify({
+          name: "crumbtrail-core",
+          version: "0.49.0",
+        }),
+        [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+        [p("src", "main.ts")]: source,
+      });
+      const plan = buildPlan(
+        {
+          cwd: CWD,
+          recipe: "vite-spa",
+          endpoint: ENDPOINT,
+          entryFile: p("src", "main.ts"),
+          serviceName: "web",
+          sdkVersion: "0.49.0",
+        },
+        io,
+      );
+      expect(plan.kind).toBe(expected);
+    },
+  );
+
+  it("does not treat an awaited dynamic import after init as an early marker", () => {
+    const source = [
+      'import { Crumbtrail } from "crumbtrail-core";',
+      "Crumbtrail.init({",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "  remoteConfig: true,",
+      '  service: "web",',
+      "});",
+      'await import("crumbtrail-core/early");',
+      "",
+    ].join("\n");
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.49.0" },
+      }),
+      [installed("crumbtrail-core")]: JSON.stringify({
+        name: "crumbtrail-core",
+        version: "0.49.0",
+      }),
+      [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+      [p("src", "main.ts")]: source,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("prepend");
+    expect(plan.content).toBe('import "crumbtrail-core/early";');
+  });
+
+  it("returns an upgrade action instead of skipping a framework integration on an older SDK", () => {
+    const source = [
+      'import { Crumbtrail } from "crumbtrail-core";',
+      "Crumbtrail.init({",
+      `  httpEndpoint: "${ENDPOINT}",`,
+      "  httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY,",
+      "  remoteConfig: true,",
+      '  service: "web",',
+      "});",
+      "",
+    ].join("\n");
+    const io = fakeInjectIO({
+      [p("package.json")]: JSON.stringify({
+        dependencies: { "crumbtrail-core": "0.48.0" },
+      }),
+      [installed("crumbtrail-core")]: JSON.stringify({
+        name: "crumbtrail-core",
+        version: "0.48.0",
+      }),
+      [p(".env")]: "VITE_CRUMBTRAIL_KEY=customer-key\n",
+      [p("src", "main.ts")]: source,
+    });
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "vite-spa",
+        endpoint: ENDPOINT,
+        entryFile: p("src", "main.ts"),
+        serviceName: "web",
+        sdkVersion: "0.48.0",
+      },
+      io,
+    );
+    expect(plan.kind).toBe("fallback-ai");
+    expect(plan.content).toBeNull();
+    expect(plan.warnings.join(" ")).toMatch(/upgrade/i);
+    expect(plan.warnings.join(" ")).not.toContain("skip");
+  });
+
   it("does not skip when package.json only depends on crumbtrail-core", () => {
     const io = fakeInjectIO({
       [p("package.json")]: JSON.stringify({
@@ -399,12 +790,18 @@ describe("buildPlan — SvelteKit / Nuxt", () => {
     // No app/ dir (Nuxt 3 default): the plugin lands in the repo-root plugins/.
     const io = fakeInjectIO({ [p("package.json")]: "{}" });
     const plan = buildPlan(
-      { cwd: CWD, recipe: "nuxt", endpoint: ENDPOINT },
+      {
+        cwd: CWD,
+        recipe: "nuxt",
+        endpoint: ENDPOINT,
+        sdkVersion: "0.49.0",
+      },
       io,
     );
     expect(plan.kind).toBe("create");
     expect(plan.targetPath).toBe(p("plugins", "crumbtrail.client.ts"));
     expect(plan.content).toContain("defineNuxtPlugin");
+    expect(plan.content).toContain('import "crumbtrail-core/early";');
     expect(plan.content).toContain(
       "httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY",
     );
@@ -601,11 +998,13 @@ describe("buildPlan — Capacitor", () => {
         recipe: "capacitor",
         endpoint: ENDPOINT,
         entryFile: p("src", "main.tsx"),
+        sdkVersion: "0.49.0",
       },
       io,
     );
     expect(plan.kind).toBe("prepend");
     expect(plan.content).toContain("createCapacitorCrumbtrailAsync");
+    expect(plan.content).toContain('import "crumbtrail-core/early";');
     expect(plan.content).toContain(`httpEndpoint: "${ENDPOINT}"`);
     expect(plan.content).toContain(
       "httpAuthToken: import.meta.env.VITE_CRUMBTRAIL_KEY",
@@ -1026,6 +1425,7 @@ describe("buildPlan — Remix", () => {
         recipe: "remix",
         endpoint: ENDPOINT,
         entryFile: p("app", "entry.client.tsx"),
+        sdkVersion: "0.49.0",
       },
       io,
     );
@@ -1037,6 +1437,7 @@ describe("buildPlan — Remix", () => {
     );
     expectNoKeyLiteral(plan.content);
     expect(plan.content).toContain('from "crumbtrail-core"');
+    expect(plan.content).toContain('import "crumbtrail-core/early";');
     expect(plan.keyEnvVar).toBe("VITE_CRUMBTRAIL_KEY");
   });
 
@@ -1048,6 +1449,7 @@ describe("buildPlan — Remix", () => {
         recipe: "remix",
         endpoint: ENDPOINT,
         entryFile: null,
+        sdkVersion: "0.49.0",
       },
       io,
     );
@@ -1085,6 +1487,7 @@ describe("buildPlan — Astro", () => {
         recipe: "astro",
         endpoint: ENDPOINT,
         entryFile: null,
+        sdkVersion: "0.49.0",
       },
       io,
     );
@@ -1095,6 +1498,7 @@ describe("buildPlan — Astro", () => {
     );
     expectNoKeyLiteral(plan.snippet);
     expect(plan.snippet).toContain('from "crumbtrail-core"');
+    expect(plan.snippet).toContain('import "crumbtrail-core/early";');
     expect(plan.agentPrompt).toContain(plan.keyEnvVar as string);
     expect(plan.warnings.join(" ")).toMatch(/layout/i);
     expect(plan.keyEnvVar).toBe("PUBLIC_CRUMBTRAIL_KEY");
@@ -1116,12 +1520,14 @@ describe("buildPlan — Angular", () => {
         recipe: "angular",
         endpoint: ENDPOINT,
         entryFile: p("src", "main.ts"),
+        sdkVersion: "0.49.0",
       },
       io,
     );
     expect(plan.kind).toBe("fallback-ai");
     // The snippet reads the key from environment.ts, not an env var or literal.
     expect(plan.snippet).toContain("httpAuthToken: environment.crumbtrailKey");
+    expect(plan.snippet).toContain('import "crumbtrail-core/early";');
     expectNoKeyLiteral(plan.snippet);
     expect(plan.warnings.join(" ")).toMatch(/environment\.ts/i);
     // No browser-safe env var → no keyEnvVar guidance.

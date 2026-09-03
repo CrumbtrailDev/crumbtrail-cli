@@ -260,6 +260,46 @@ describe("hydrateGithubReader", () => {
     expect(reader.readFile(`/src/file${count - 1}.ts`)).toContain("done");
   });
 
+  it("does not prefetch local paths mentioned only in comments or strings", async () => {
+    const { src } = source(
+      {
+        "package.json": "{}",
+        "src/index.ts": [
+          '// import "./commented.ts";',
+          'const note = "import ./quoted.ts";',
+        ].join("\n"),
+        "src/commented.ts": "commented()",
+        "src/quoted.ts": "quoted()",
+      },
+      ["src"],
+    );
+    const reader = await hydrateGithubReader(src);
+    await prefetchImportClosure(reader, ["/src/index.ts"]);
+    expect(() => reader.readFile("/src/commented.ts")).toThrow(
+      UnhydratedPathError,
+    );
+    expect(() => reader.readFile("/src/quoted.ts")).toThrow(
+      UnhydratedPathError,
+    );
+  });
+
+  it("hydrates runtime TypeScript import assignments but not type-only ones", async () => {
+    const { src } = source(
+      {
+        "package.json": "{}",
+        "src/index.ts":
+          'import setup = require("./setup"); import type types = require("./types"); setup();',
+        "src/setup.ts": 'import ct = require("crumbtrail-node");',
+        "src/types.ts": "export interface Options {}",
+      },
+      ["src"],
+    );
+    const reader = await hydrateGithubReader(src);
+    await prefetchImportClosure(reader, ["/src/index.ts"]);
+    expect(reader.readFile("/src/setup.ts")).toContain("crumbtrail-node");
+    expect(() => reader.readFile("/src/types.ts")).toThrow(UnhydratedPathError);
+  });
+
   it("hydrates every ambiguous emitted source before refusing resolution", async () => {
     const { src } = source(
       {

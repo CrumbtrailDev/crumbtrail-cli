@@ -47,7 +47,10 @@ describe("executePlan — golden create/prepend on a real repo", () => {
   it("creates a SvelteKit hooks.client.ts and is then idempotent on re-run", () => {
     const root = tmp({
       "package.json": JSON.stringify({
-        dependencies: { "crumbtrail-core": "0.37.0", "crumbtrail-node": "0.37.0" },
+        dependencies: {
+          "crumbtrail-core": "0.37.0",
+          "crumbtrail-node": "0.37.0",
+        },
       }),
       "node_modules/crumbtrail-core/package.json": "{}",
       "node_modules/crumbtrail-node/package.json": "{}",
@@ -76,9 +79,14 @@ describe("executePlan — golden create/prepend on a real repo", () => {
     );
     expect(written).not.toMatch(/ctkey_|bgk_|bl_ingest_/);
     expect(written.endsWith("\n")).toBe(true);
-    writeFileSync(path.join(root, ".env.local"), "VITE_CRUMBTRAIL_KEY=ctkey_test\n");
+    writeFileSync(
+      path.join(root, ".env.local"),
+      "VITE_CRUMBTRAIL_KEY=ctkey_test\n",
+    );
 
-    // Re-detect after the code and key are present -> the complete integration skips.
+    // Re-detect after the code and key are present. The older installed SDK
+    // cannot supply early capture, so the rerun must surface the upgrade action
+    // instead of silently claiming the integration is complete.
     const second = buildPlan(
       {
         cwd: root,
@@ -88,7 +96,8 @@ describe("executePlan — golden create/prepend on a real repo", () => {
       },
       defaultInjectIO,
     );
-    expect(second.kind).toBe("skip-already-wired");
+    expect(second.kind).toBe("fallback-ai");
+    expect(second.warnings.join(" ")).toMatch(/upgrade/i);
     expect(executePlan(second).skipped).toBe(true);
   });
 
@@ -148,6 +157,61 @@ describe("executePlan — golden create/prepend on a real repo", () => {
     expect(readFileSync(path.join(root, "server.js"), "utf8")).toContain(
       "crumbtrail-node",
     );
+  });
+
+  it("confirms a backend and dirty served page as one atomic transaction", () => {
+    const page =
+      "<!doctype html><html><head><title>App</title></head><body></body></html>\n";
+    const server = [
+      'import express from "express";',
+      "const app = express();",
+      'app.use(express.static("public"));',
+      "app.listen(3000);",
+      "",
+    ].join("\n");
+    const root = tmp({
+      "package.json": JSON.stringify({
+        dependencies: { express: "^4", "crumbtrail-node": "0.49.0" },
+      }),
+      "node_modules/crumbtrail-node/package.json": "{}",
+      "server.js": server,
+      "public/index.html": page,
+    });
+    const dirtyPage = page.replace("App", "Customer edit");
+    makeTmpRepoDirty(root, "public/index.html", dirtyPage);
+    const plan = buildPlan(
+      {
+        cwd: root,
+        recipe: "express",
+        endpoint: ENDPOINT,
+        entryFile: path.join(root, "server.js"),
+        serviceName: "api",
+        sdkVersion: "0.49.0",
+      },
+      defaultInjectIO,
+    );
+
+    expect(plan.kind).toBe("needs-confirm-dirty");
+    const rejected = executePlan(plan);
+    expect(rejected.written).toEqual([]);
+    expect(readFileSync(path.join(root, "server.js"), "utf8")).toBe(server);
+    expect(readFileSync(path.join(root, "public/index.html"), "utf8")).toBe(
+      dirtyPage,
+    );
+
+    const approved = executePlan(plan, undefined, { confirmDirty: true });
+    expect(approved.written).toEqual(
+      expect.arrayContaining([
+        path.join(root, "server.js"),
+        path.join(root, "public/index.html"),
+      ]),
+    );
+    expect(readFileSync(path.join(root, "server.js"), "utf8")).toContain(
+      "crumbtrail-node",
+    );
+    expect(
+      readFileSync(path.join(root, "public/index.html"), "utf8"),
+    ).toContain("early-bootstrap.global.js");
   });
 });
 
@@ -242,7 +306,10 @@ describe("executePlan — Express rewrite", () => {
   it("applies a rewrite plan: middleware wired around routes on disk", () => {
     const root = makeTmpRepo({
       "package.json": JSON.stringify({
-        dependencies: { "crumbtrail-core": "0.37.0", "crumbtrail-node": "0.37.0" },
+        dependencies: {
+          "crumbtrail-core": "0.37.0",
+          "crumbtrail-node": "0.37.0",
+        },
       }),
       "node_modules/crumbtrail-core/package.json": "{}",
       "node_modules/crumbtrail-node/package.json": "{}",
@@ -265,9 +332,9 @@ describe("executePlan — Express rewrite", () => {
     const res = executePlan(plan);
     expect(res.written).toEqual([entry]);
     const out = readFileSync(entry, "utf8");
-    expect(out.indexOf("app.use(createCrumbtrailExpressMiddleware(")).toBeGreaterThan(
-      out.indexOf("const app = express()"),
-    );
+    expect(
+      out.indexOf("app.use(createCrumbtrailExpressMiddleware("),
+    ).toBeGreaterThan(out.indexOf("const app = express()"));
     expect(out.indexOf("app.listen(")).toBeGreaterThan(
       out.indexOf("app.use(createCrumbtrailExpressErrorMiddleware("),
     );

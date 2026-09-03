@@ -7,7 +7,12 @@ import {
 } from "../recipe-registry";
 import type { Recipe } from "../detect";
 import type { InjectIO } from "./io";
-import { findCallSites, maskLiterals } from "./amend";
+import {
+  executableModuleSpecifiers,
+  findCallSites,
+  hasExecutableCrumbtrailReference,
+  maskLiterals,
+} from "./amend";
 
 /** The evidence a complete integration must leave in the target package. */
 export type IntegrationRequirement =
@@ -90,10 +95,7 @@ const SERVER_RECIPES = new Set<Recipe>([
   "node",
 ]);
 
-const CRUMBTRAIL_REFERENCE =
-  /crumbtrail-core|crumbtrail-node|crumbtrail-react-native|crumbtrail-capacitor|crumbtrail_flutter/;
-export const LOCAL_IMPORT =
-  /(?:from\s+|import\s*\(|import\s+|require\s*\()\s*["']([^"']+)["']/g;
+const CRUMBTRAIL_REFERENCE = hasExecutableCrumbtrailReference;
 const ENDPOINT_ENV =
   /\b[A-Z][A-Z0-9_]*CRUMBTRAIL[A-Z0-9_]*ENDPOINT[A-Z0-9_]*\b/g;
 const ENV_NAME =
@@ -259,9 +261,8 @@ export function reachableSourceFiles(
     const text = input.io.readFile(file);
     if (text === null) continue;
     files.push({ file, text });
-    LOCAL_IMPORT.lastIndex = 0;
-    for (const match of text.matchAll(LOCAL_IMPORT)) {
-      const imported = sourceModulePath(input.io, file, match[1]);
+    for (const specifier of executableModuleSpecifiers(text)) {
+      const imported = sourceModulePath(input.io, file, specifier);
       if (imported && !visited.has(imported)) pending.push(imported);
     }
   }
@@ -542,6 +543,7 @@ function hazardsFor(
       for (const keyName of ["authToken", "httpAuthToken"]) {
         const value = site.keys.get(keyName);
         if (
+          input.recipe !== "static" &&
           !generatedNodeInit &&
           value !== undefined &&
           value.trim() !== keyRef?.expr
@@ -552,7 +554,10 @@ function hazardsFor(
     }
   }
 
-  if (envNames.some((name) => isKeyEnvName(name) && name !== keyRef?.envVar)) {
+  if (
+    keyRef &&
+    envNames.some((name) => isKeyEnvName(name) && name !== keyRef.envVar)
+  ) {
     hazards.add("other-key-channel");
   }
   return [...hazards];
@@ -598,7 +603,7 @@ export function inspectIntegration(
   const existingEnvVars = harvestEnvNames(input);
   const keyEnvVarsSeen = existingEnvVars.filter(isKeyEnvName);
   const endpointEnvVarsSeen = existingEnvVars.filter(isEndpointEnvName);
-  const found = CRUMBTRAIL_REFERENCE.test(source);
+  const found = CRUMBTRAIL_REFERENCE(source);
   const missing: IntegrationRequirement[] = [];
 
   const shortOfSdk = missingSdkPackages(input);
