@@ -188,6 +188,24 @@ describe("insertIntoHtmlHead", () => {
   });
 
   it.each([
+    "text&#47;javascript",
+    "text&#x2f;javascript",
+    "text&sol;javascript",
+  ])(
+    "decodes character references before first script ordering: %s",
+    (type) => {
+      const html = `<html><head><script type="${type}" src="&sol;app.js"></script></head></html>`;
+      const blocks = htmlScriptBlocks(html);
+      expect(blocks[0].scriptKind).toBe("classic");
+      expect(blocks[0].src).toBe("/app.js");
+      const out = insertIntoHtmlHead(html, "<script>early()</script>")!;
+      expect(out.indexOf("<script>early()</script>")).toBeLessThan(
+        out.indexOf(`type="${type}"`),
+      );
+    },
+  );
+
+  it.each([
     ["module;foo", "inert"],
     [" MoDuLe ", "module"],
     ["text/javascript; charset=utf-8", "classic"],
@@ -704,6 +722,32 @@ describe("buildPlan — static", () => {
         /coordinated|incompatible|bootstrap/i,
       );
     }
+  });
+
+  it.each([
+    "https&#58;//unpkg.com/crumbtrail-core&#64;0.49.0/dist/early-bootstrap.global.js",
+    "https&#x3a;//unpkg.com/crumbtrail-core&#x40;0.49.0/dist/early-bootstrap.global.js",
+    "https&colon;&sol;&sol;unpkg.com&sol;crumbtrail-core&commat;0.49.0&sol;dist&sol;early-bootstrap.global.js",
+  ])("uses decoded canonical bootstrap URLs as rerun proof: %s", (src) => {
+    const html = insertIntoHtmlHead(
+      PAGE,
+      [
+        `<script src="${src}"></script>`,
+        `<script type="&Tab;mod&#117;le&NewLine;">import { Crumbtrail } from "https://esm.sh/crumbtrail-core@0.49.0"; Crumbtrail.init({ httpEndpoint: "${ENDPOINT}", httpAuthToken: "customer-key", remoteConfig: true, service: "web" });</script>`,
+      ].join("\n"),
+    )!;
+    const plan = buildPlan(
+      {
+        cwd: CWD,
+        recipe: "static",
+        endpoint: ENDPOINT,
+        entryFile: p("index.html"),
+        serviceName: "web",
+        sdkVersion: "0.49.0",
+      },
+      fakeInjectIO({ [p("index.html")]: html }),
+    );
+    expect(plan.kind).toBe("skip-already-wired");
   });
 
   it("moves a valid bootstrap ahead of an earlier application script", () => {

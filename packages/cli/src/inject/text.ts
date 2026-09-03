@@ -3,6 +3,7 @@
 // tests can assert behavior without touching disk.
 
 import { parse } from "@babel/parser";
+import { decodeHTMLAttribute } from "entities";
 import { hasExecutableCrumbtrailReference } from "./amend";
 
 const BOM = "﻿";
@@ -1220,7 +1221,7 @@ function htmlAttributes(source: string): ReadonlyMap<string, string> {
         value = source.slice(valueStart, offset);
       }
     }
-    if (!values.has(name)) values.set(name, value);
+    if (!values.has(name)) values.set(name, decodeHTMLAttribute(value));
   }
   return values;
 }
