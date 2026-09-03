@@ -298,6 +298,10 @@ describe("instrumentIoredisClient", () => {
       [null, "OK"],
       [new Error("private transaction failure"), null],
     ];
+    let resolveExecution!: (value: unknown[]) => void;
+    const executionResult = new Promise<unknown[]>((resolve) => {
+      resolveExecution = resolve;
+    });
     const client = instrumentIoredisClient(
       {
         multi(options?: unknown) {
@@ -310,19 +314,23 @@ describe("instrumentIoredisClient", () => {
         get(_key: string) {
           return Promise.resolve("QUEUED");
         },
-        exec: async () => tuples,
+        exec: () => executionResult,
       },
       { emit: (event) => events.push(event), requestId: "req_ioredis_queued" },
     );
 
-    await expect(client.multi({ pipeline: false })).resolves.toBe("OK");
-    await expect(client.set("cart:123", "private value")).resolves.toBe(
-      "QUEUED",
-    );
-    await expect(client.get("cart:123")).resolves.toBe("QUEUED");
+    const start = client.multi({ pipeline: false });
+    const queuedSet = client.set("cart:123", "private value");
+    const queuedGet = client.get("cart:123");
+    const execution = client.exec();
+
+    await expect(start).resolves.toBe("OK");
+    await expect(queuedSet).resolves.toBe("QUEUED");
+    await expect(queuedGet).resolves.toBe("QUEUED");
     expect(events).toHaveLength(0);
 
-    const result = await client.exec();
+    resolveExecution(tuples);
+    const result = await execution;
     expect(result).toBe(tuples);
     expect(events).toHaveLength(1);
     expect(events[0]?.d).toMatchObject({
@@ -359,8 +367,13 @@ describe("instrumentIoredisClient", () => {
       },
     );
 
-    await expect(client.multi({ pipeline: false })).rejects.toBe(startFailure);
-    await expect(client.get("cart:123")).resolves.toBe("public value");
+    const start = client.multi({ pipeline: false });
+    const queued = client.get("cart:123");
+    await expect(queued).resolves.toBe("public value");
+    await expect(start).rejects.toBe(startFailure);
+    await expect(client.get("cart:after-rejection")).resolves.toBe(
+      "public value",
+    );
 
     expect(events).toHaveLength(2);
     expect(events[0]?.d).toMatchObject({
@@ -410,6 +423,51 @@ describe("instrumentIoredisClient", () => {
     });
     expect(events[1]?.d).toMatchObject({ op: "get", hit: true });
     expect(JSON.stringify(events)).not.toContain("exec-secret");
+  });
+
+  it("does not resurrect a root transaction after exec before MULTI settles", async () => {
+    const events: BugEvent[] = [];
+    const tuples: unknown[] = [[null, "OK"]];
+    let resolveStart!: (value: string) => void;
+    const startResult = new Promise<string>((resolve) => {
+      resolveStart = resolve;
+    });
+    const client = instrumentIoredisClient(
+      {
+        multi(_options?: unknown) {
+          return startResult;
+        },
+        get(_key: string) {
+          return Promise.resolve("QUEUED");
+        },
+        exec() {
+          return Promise.resolve(tuples);
+        },
+      },
+      {
+        emit: (event) => events.push(event),
+        requestId: "req_ioredis_late_start",
+      },
+    );
+
+    const start = client.multi({ pipeline: false });
+    const queued = client.get("cart:123");
+    const execution = client.exec();
+    const result = await execution;
+
+    expect(result).toBe(tuples);
+    expect(events[0]?.d).toMatchObject({
+      op: "transaction",
+      summary: { operationCount: 1, operations: ["get"] },
+    });
+
+    resolveStart("OK");
+    await expect(start).resolves.toBe("OK");
+    await expect(queued).resolves.toBe("QUEUED");
+    await expect(client.get("cart:after-exec")).resolves.toBe("QUEUED");
+
+    expect(events).toHaveLength(2);
+    expect(events[1]?.d).toMatchObject({ op: "get", hit: true });
   });
 
   it("clears root ioredis pipeline:false state after an exec abort", async () => {

@@ -38,11 +38,16 @@ interface OperationCapture {
 
 interface BatchCapture {
   mode: "pipeline" | "transaction";
-  /** ioredis sends each command separately and resolves it to QUEUED. */
   queuedTransaction: boolean;
   operationCount: number;
   operations: string[];
   keys: unknown[];
+}
+
+type QueuedTransactionStartStatus = "pending" | "fulfilled" | "rejected";
+
+interface QueuedTransactionCapture extends BatchCapture {
+  startStatus: QueuedTransactionStartStatus;
 }
 
 interface BatchCommand {
@@ -73,7 +78,7 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
     return client;
   }
   const wrappers = new Map<PropertyKey, unknown>();
-  let queuedTransaction: BatchCapture | undefined;
+  let queuedTransaction: QueuedTransactionCapture | undefined;
   return new Proxy(client, {
     get(target, property, receiver) {
       if (property === INSTRUMENTED) return true;
@@ -90,11 +95,18 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
             operationName === "multi" &&
             isQueuedIoredisTransaction(driver, operationName, args)
           ) {
-            queuedTransaction = undefined;
+            const capture = createQueuedTransactionCapture();
+            queuedTransaction = capture;
+            const isCurrent = () => queuedTransaction === capture;
+            const clear = () => {
+              if (queuedTransaction === capture) queuedTransaction = undefined;
+            };
             let result: unknown;
             try {
               result = Reflect.apply(original, target, args);
             } catch (error) {
+              capture.startStatus = "rejected";
+              clear();
               emitQueuedTransactionFailure(driver, options, error);
               throw error;
             }
@@ -102,9 +114,9 @@ function instrumentCacheClient<T extends DuckTypedCacheClient>(
               result,
               driver,
               options,
-              (capture) => {
-                queuedTransaction = capture;
-              },
+              capture,
+              isCurrent,
+              clear,
             );
           }
           const result = Reflect.apply(original, target, args);
@@ -296,29 +308,41 @@ function wrapQueuedTransactionStart(
   result: unknown,
   driver: CacheDriver,
   options: InstrumentCacheClientOptions,
-  activate: (capture: BatchCapture) => void,
+  capture: QueuedTransactionCapture,
+  isCurrent: () => boolean,
+  clear: () => void,
 ): unknown {
-  const capture: BatchCapture = {
-    mode: "transaction",
-    queuedTransaction: true,
-    operationCount: 0,
-    operations: [],
-    keys: [],
-  };
   if (!isThenable(result)) {
-    if (result === "OK") activate(capture);
+    capture.startStatus = result === "OK" ? "fulfilled" : "rejected";
+    if (result !== "OK") clear();
     return result;
   }
   return result.then(
     (resolved: unknown) => {
-      if (resolved === "OK") activate(capture);
+      capture.startStatus = resolved === "OK" ? "fulfilled" : "rejected";
+      if (resolved !== "OK" && isCurrent()) clear();
       return resolved;
     },
     (error: unknown) => {
-      emitQueuedTransactionFailure(driver, options, error);
+      capture.startStatus = "rejected";
+      if (isCurrent()) {
+        clear();
+        emitQueuedTransactionFailure(driver, options, error);
+      }
       throw error;
     },
   );
+}
+
+function createQueuedTransactionCapture(): QueuedTransactionCapture {
+  return {
+    mode: "transaction",
+    queuedTransaction: true,
+    startStatus: "pending",
+    operationCount: 0,
+    operations: [],
+    keys: [],
+  };
 }
 
 function wrapQueuedTransactionExecution(
