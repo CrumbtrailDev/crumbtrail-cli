@@ -268,6 +268,8 @@ interface UrlRedactionOptions {
   ignoreKeepFields?: boolean;
   /** Only HTTP(S), scheme-relative, and relative URLs are safe in diagnostics. */
   allowOnlyHttpSchemes?: boolean;
+  /** Include bounded root-relative URL substrings when scanning prose. */
+  allowRelativeUrlsInText?: boolean;
 }
 
 export interface StoredValueRedactionOptions {
@@ -564,15 +566,24 @@ function withMetadata<T>(
 
 function isSensitiveName(name: string | undefined): boolean {
   if (!name) return false;
-  const normalized = name.replace(/([a-z])([A-Z])/g, "$1_$2");
-  const compact = normalized.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const normalized = normalizeFieldName(name);
+  const wordSeparated = normalized.replace(/([a-z])([A-Z])/g, "$1_$2");
+  const compact = wordSeparated.toLowerCase().replace(/[^a-z0-9]/g, "");
   return (
     SENSITIVE_NAME_RE.test(name) ||
     PII_NAME_RE.test(name) ||
-    SENSITIVE_NAME_RE.test(normalized) ||
-    PII_NAME_RE.test(normalized) ||
+    SENSITIVE_NAME_RE.test(wordSeparated) ||
+    PII_NAME_RE.test(wordSeparated) ||
     isSensitiveCompactName(compact)
   );
+}
+
+function normalizeFieldName(name: string): string {
+  try {
+    return name.normalize("NFKC");
+  } catch {
+    return name;
+  }
 }
 
 function isSensitiveCompactName(compact: string): boolean {
@@ -1343,9 +1354,13 @@ export function redactUrl(
  * trimmed separately (see below) so a period/comma after the URL is not swallowed.
  */
 const URL_IN_TEXT_RE = /https?:\/\/[^\s"'`<>\\{}()[\]|^]+/gi;
+/** Relative candidates require a boundary and a `name=value` query. */
+const RELATIVE_URL_IN_TEXT_RE =
+  /(^|[\s"'`<([{])((?:\/\/[^\s"'`<>\\{}()[\]|^/?#]+(?:\/[^\s"'`<>\\{}()[\]|^?#]{0,2048})?|(?:\.{1,2}\/|\/)[^\s"'`<>\\{}()[\]|^?#]{0,2048})\?[^\s"'`<>\\{}()[\]|^#]{0,2048}=[^\s"'`<>\\{}()[\]|^]+)/gi;
 const DIAGNOSTIC_URL_SCHEME_RE =
   /\b([a-z][a-z\d+.-]*):(?=\/\/|[^\s"'`<>\\{}()[\]|^])/gi;
 const URL_TRAILING_PUNCT_RE = /[.,;:!?]+$/;
+const MAX_RELATIVE_URL_IN_TEXT_MATCHES = 16;
 
 function hasUnsafeDiagnosticUrlScheme(value: string): boolean {
   for (const match of value.matchAll(DIAGNOSTIC_URL_SCHEME_RE)) {
@@ -1356,7 +1371,7 @@ function hasUnsafeDiagnosticUrlScheme(value: string): boolean {
 }
 
 /**
- * Scrub secrets from `http(s)://…` URL substrings embedded in FREE TEXT, reusing
+ * Scrub secrets from URL substrings embedded in FREE TEXT, reusing
  * the SAME query-key-aware policy {@link redactUrl} applies to `ref.url`.
  *
  * The token-shape patterns in {@link redactTokenLikeString} catch Bearer/JWT/
@@ -1365,7 +1380,8 @@ function hasUnsafeDiagnosticUrlScheme(value: string): boolean {
  * query-aware and drops every query value. This finds each URL substring and runs
  * it through `redactUrl`, so a tokenized URL sitting in an adapter's `after`/
  * `brief`/gap text loses its query secret while keeping its origin + path as
- * provenance. Non-URL text is left untouched (fast-path bail when no `://`).
+ * provenance. Diagnostic callers also opt into bounded root-relative candidates
+ * such as `/callback?token=…`; arbitrary slash text is not a candidate.
  *
  * This shares one implementation with `ref.url` redaction — there is no second
  * URL-redaction policy.
@@ -1382,9 +1398,13 @@ export function redactUrlsInText(
       action: "redacted",
     });
   }
-  if (value.indexOf("://") === -1) return { value };
+  if (
+    value.indexOf("://") === -1 &&
+    (!options.allowRelativeUrlsInText || value.indexOf("?") === -1)
+  )
+    return { value };
   const fields: RedactionField[] = [];
-  const output = value.replace(URL_IN_TEXT_RE, (match) => {
+  let output = value.replace(URL_IN_TEXT_RE, (match) => {
     const trailing = match.match(URL_TRAILING_PUNCT_RE)?.[0] ?? "";
     const core = trailing
       ? match.slice(0, match.length - trailing.length)
@@ -1393,8 +1413,93 @@ export function redactUrlsInText(
     if (result.metadata) fields.push(...result.metadata.fields);
     return `${result.value}${trailing}`;
   });
+  if (options.allowRelativeUrlsInText) {
+    let relativeMatches = 0;
+    let relativeLimitExceeded = false;
+    output = output.replace(
+      RELATIVE_URL_IN_TEXT_RE,
+      (match, prefix: string, rawUrl: string) => {
+        if (relativeMatches >= MAX_RELATIVE_URL_IN_TEXT_MATCHES) {
+          relativeLimitExceeded = true;
+          return match;
+        }
+        relativeMatches += 1;
+        const trailing = rawUrl.match(URL_TRAILING_PUNCT_RE)?.[0] ?? "";
+        const core = trailing
+          ? rawUrl.slice(0, rawUrl.length - trailing.length)
+          : rawUrl;
+        const result = redactUrl(core, path, options);
+        if (result.metadata) fields.push(...result.metadata.fields);
+        return `${prefix}${result.value}${trailing}`;
+      },
+    );
+    if (relativeLimitExceeded) {
+      fields.push({
+        path,
+        reason: "url_in_text_match_limit",
+        action: "redacted",
+      });
+      const metadata = metadataFromFields(fields);
+      return {
+        value: REDACTED_VALUE,
+        ...(metadata ? { metadata } : {}),
+      };
+    }
+  }
   const metadata = metadataFromFields(fields);
   return { value: output, ...(metadata ? { metadata } : {}) };
+}
+
+function hasNonAsciiDecodedComponent(value: string): boolean {
+  let decoded = value;
+  for (let depth = 0; depth <= 3; depth += 1) {
+    if (!isAsciiDiagnosticString(decoded)) return true;
+    const next = decodeURIComponentSafe(decoded);
+    if (next === decoded) return false;
+    decoded = next;
+  }
+  return !isAsciiDiagnosticString(decoded);
+}
+
+function hasNonAsciiUrlComponents(url: string): boolean {
+  const trimmed = url.trim();
+  const hashIndex = trimmed.indexOf("#");
+  const beforeHash = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed;
+  const hierarchicalScheme = /^(?:[a-z][a-z\d+.-]*:)?\/\//i.exec(beforeHash);
+
+  if (hierarchicalScheme) {
+    const remainder = beforeHash.slice(hierarchicalScheme[0].length);
+    const authorityEnd = remainder.search(/[/?]/);
+    const authority =
+      authorityEnd < 0 ? remainder : remainder.slice(0, authorityEnd);
+    const rest = authorityEnd < 0 ? "" : remainder.slice(authorityEnd);
+    return (
+      hasNonAsciiDecodedComponent(authority) ||
+      hasNonAsciiDecodedComponent(rest)
+    );
+  }
+
+  return hasNonAsciiDecodedComponent(beforeHash);
+}
+
+function urlTextCore(value: string): string {
+  const trailing = value.match(URL_TRAILING_PUNCT_RE)?.[0] ?? "";
+  return trailing ? value.slice(0, value.length - trailing.length) : value;
+}
+
+function hasNonAsciiDiagnosticUrlInText(value: string): boolean {
+  for (const match of value.match(URL_IN_TEXT_RE) ?? []) {
+    if (hasNonAsciiUrlComponents(urlTextCore(match))) return true;
+  }
+
+  RELATIVE_URL_IN_TEXT_RE.lastIndex = 0;
+  for (const match of value.matchAll(RELATIVE_URL_IN_TEXT_RE)) {
+    const candidate = match[2];
+    if (candidate && hasNonAsciiUrlComponents(urlTextCore(candidate))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function redactHeaders(
@@ -2069,7 +2174,7 @@ const STRUCTURED_JWT_RE =
 const ENUM_LIKE_RE = /^[A-Za-z0-9_-]{1,24}$/;
 
 function compactFieldName(name: string): string {
-  return name
+  return normalizeFieldName(name)
     .replace(/([a-z])([A-Z])/g, "$1_$2")
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "");
@@ -2077,7 +2182,7 @@ function compactFieldName(name: string): string {
 
 /** Field name split into words at camelCase/snake/kebab boundaries. */
 function fieldNameWords(name: string): string[] {
-  return name
+  return normalizeFieldName(name)
     .replace(/([a-z])([A-Z])/g, "$1_$2")
     .toLowerCase()
     .split(/[^a-z0-9]+/)
@@ -2109,32 +2214,22 @@ function isApplicationDeniedName(
  *
  * The rest of `STRUCTURED_DENY_NAME_TOKENS` name the sensitive thing itself: everything under a key
  * called `auth`, `password`, `secret`, `cvv` or `ssn` is that secret, so dropping the whole subtree
- * loses nothing. These two do not. A gift card, a loyalty card, a customer account are ordinary
- * records that may merely CONTAIN a sensitive scalar, and their other fields are often the whole
- * subject of a bug report.
+ * loses nothing. These two exact names are the narrow object-container exception. Compound names
+ * such as `creditCardNumber` and `accountNumber` remain closed because they name sensitive values.
  *
- * Kept deliberately short. Every addition trades a real class of evidence for a name-shaped guess,
- * so a token belongs here only once a measured capture shows the guess destroying the answer.
+ * Kept deliberately short. Every addition trades a real class of evidence for a name-shaped guess.
  */
-const STRUCTURED_OPENABLE_NAME_TOKENS = new Set(["card", "account"]);
+const STRUCTURED_OPENABLE_CONTAINER_NAMES = new Set(["card", "account"]);
 
 /**
  * May a CONTAINER under this name be walked into rather than dropped whole?
  *
- * True only when every built-in token the name matched is an object-naming one. `cardToken` matches
- * both `card` and `token`, so it stays closed; `giftCard` matches only `card`, so its leaves are
- * classified individually. Names the application itself denied never reach here.
+ * True only for the exact names of the two known object containers. Compound names stay closed even
+ * when they contain one of those words, because `cardNumber` and `accountNumber` name secrets.
  */
 function isOpenableHeuristicName(name: string | undefined): boolean {
   if (!name) return false;
-  if (fieldNameWords(name).some((word) => STRUCTURED_DENY_WORD_RE.test(word)))
-    return false;
-  const compact = compactFieldName(name);
-  const matched = STRUCTURED_DENY_NAME_TOKENS.filter((token) =>
-    compact.includes(token),
-  );
-  if (matched.length === 0) return false;
-  return matched.every((token) => STRUCTURED_OPENABLE_NAME_TOKENS.has(token));
+  return STRUCTURED_OPENABLE_CONTAINER_NAMES.has(compactFieldName(name));
 }
 
 function isStructuredDenyName(
@@ -2503,7 +2598,7 @@ const DIAGNOSTIC_RESERVED_KEYS = new Set([
   "stack",
   "locals",
 ]);
-const DIAGNOSTIC_KEY_RE = /^[A-Za-z_$][A-Za-z0-9_$-]*$/;
+const DIAGNOSTIC_KEY_RE = /^(?:[$_]|\p{ID_Start})(?:[$\p{ID_Continue}-])*$/u;
 const DIAGNOSTIC_INDEX_RE = /^(?:0|[1-9][0-9]?)$/;
 
 function newDiagnosticPathNode(): DiagnosticPathNode {
@@ -2653,8 +2748,7 @@ function isDiagnosticPathKeyAllowed(
 ): boolean {
   if (isDiagnosticReservedKey(key)) return false;
   if (isApplicationDeniedName(key, denyFields)) return false;
-  if (!isStructuredDenyName(key)) return true;
-  return isOpenableHeuristicName(key);
+  return true;
 }
 
 function diagnosticPathForPart(path: string, part: DiagnosticPathPart): string {
@@ -2734,10 +2828,22 @@ function diagnosticLeafValue(
     const urlOptions: UrlRedactionOptions = {
       ignoreKeepFields: true,
       allowOnlyHttpSchemes: true,
+      allowRelativeUrlsInText: true,
     };
     const looksLikeWholeUrl = /^\s*(?:\/\/|[a-z][a-z\d+.-]*:|\.{0,2}\/)/i.test(
       normalized,
     );
+    const hasNonAsciiUrlComponent = looksLikeWholeUrl
+      ? hasNonAsciiUrlComponents(normalized)
+      : hasNonAsciiDiagnosticUrlInText(normalized);
+    if (hasNonAsciiUrlComponent) {
+      fields.push({
+        path,
+        reason: "diagnostic_non_ascii_url_component",
+        action: "dropped",
+      });
+      return undefined;
+    }
     const urlResult = looksLikeWholeUrl
       ? redactUrl(normalized, path, urlOptions)
       : redactUrlsInText(normalized, path, urlOptions);
@@ -2814,6 +2920,18 @@ function collectDiagnosticFields(
   seen.add(value);
 
   try {
+    if (
+      isStructuredDenyName(keyName, denyFields ? [...denyFields] : undefined)
+    ) {
+      const openable =
+        !isApplicationDeniedName(keyName, denyFields) &&
+        isOpenableHeuristicName(keyName);
+      if (!openable) {
+        fields.push({ path, reason: "deny_field", action: "redacted" });
+        return undefined;
+      }
+    }
+
     if (node.terminal && node.keys.size === 0 && node.indexes.size === 0) {
       fields.push({
         path,
@@ -3094,6 +3212,50 @@ function isRedactedPlaceholder(value: unknown): boolean {
   return true;
 }
 
+function redactStructuredStringValue(
+  value: string,
+  path: string,
+  keyName: string | undefined,
+  policy: StructuredFieldPolicy,
+  fields: RedactionField[],
+): unknown {
+  const urlOptions: UrlRedactionOptions = {
+    ignoreKeepFields: true,
+    allowOnlyHttpSchemes: true,
+    allowRelativeUrlsInText: true,
+  };
+  const looksLikeWholeUrl = /^\s*(?:\/\/|[a-z][a-z\d+.-]*:|\.{0,2}\/)/i.test(
+    value,
+  );
+  const urlResult = looksLikeWholeUrl
+    ? redactUrl(value, path, urlOptions)
+    : redactUrlsInText(value, path, urlOptions);
+  if (urlResult.metadata) fields.push(...urlResult.metadata.fields);
+
+  const classificationValue = looksLikeWholeUrl
+    ? "url"
+    : maskUrlsForClassification(value);
+  const classification = classifyStructuredValue(
+    classificationValue,
+    keyName,
+    policy.denyFields,
+    policy.keepFields,
+  );
+  if (classification.action === "keep") return urlResult.value;
+  fields.push({ path, reason: classification.reason, action: "redacted" });
+  return redactedShapePlaceholder(value);
+}
+
+function maskUrlsForClassification(value: string): string {
+  let masked = value.replace(URL_IN_TEXT_RE, "url");
+  RELATIVE_URL_IN_TEXT_RE.lastIndex = 0;
+  masked = masked.replace(
+    RELATIVE_URL_IN_TEXT_RE,
+    (_match, prefix: string) => `${prefix}url`,
+  );
+  return masked;
+}
+
 function redactStructuredJsonValue(
   value: unknown,
   path: string,
@@ -3104,26 +3266,8 @@ function redactStructuredJsonValue(
   // Already redacted by an earlier pass. Re-wrapping it would replace the
   // original value's shape facts with the placeholder's own.
   if (isRedactedPlaceholder(value)) return value;
-  // A deny-listed field name redacts its entire subtree, with one narrow exception: a CONTAINER
-  // matched only by an object-naming built-in token is walked into instead.
-  //
-  // The built-in name tokens are substrings, and `card` is one of them. A gift-card object, a
-  // loyalty-card object, a card-layout config: all match, and all had their whole contents replaced
-  // by a shape placeholder because of the key they hang from. Measured on a real session, the
-  // response that decided the defect rendered as `{[REDACTED_KEY]:[REDACTED]}` while the sibling
-  // `/history` endpoint reported the identical number in the clear — it simply was not nested under
-  // a key spelled `card`. The redaction was not protecting anything there; it was deleting the
-  // answer.
-  //
-  // Opening the container costs no protection, because a name is not the only defence and never was:
-  // every leaf is still classified by its OWN name and, behind that, by its VALUE. A real PAN at
-  // `card.number` is caught by the Luhn digit-run check; a token, JWT, email or high-entropy secret
-  // by their own value rules. That is the same reasoning the `keepFields` escape hatch already
-  // relies on — see `isStructuredDenyName`, which documents that every value-based check still runs
-  // behind a kept name.
-  //
-  // An application's own `denyFields` keeps the old absolute behaviour. When the app says a subtree
-  // is sensitive, that is a statement about its data that no heuristic here can outrank.
+  // A deny-listed field name redacts its entire subtree, except for the exact
+  // known object container names handled by isOpenableHeuristicName.
   const isContainer =
     Array.isArray(value) || (value !== null && typeof value === "object");
   if (isStructuredDenyName(keyName, policy.denyFields, policy.keepFields)) {
@@ -3163,19 +3307,32 @@ function redactStructuredJsonValue(
           reason: "json_key_token_like",
           action: "redacted",
         });
-        output[safeKey] = redactedShapePlaceholder(entry);
+        Object.defineProperty(output, safeKey, {
+          configurable: true,
+          enumerable: true,
+          value: redactedShapePlaceholder(entry),
+          writable: true,
+        });
         continue;
       }
-      output[safeKey] = redactStructuredJsonValue(
-        entry,
-        `${path}.${safeKey}`,
-        policy,
-        fields,
-        key,
-      );
+      Object.defineProperty(output, safeKey, {
+        configurable: true,
+        enumerable: true,
+        value: redactStructuredJsonValue(
+          entry,
+          `${path}.${safeKey}`,
+          policy,
+          fields,
+          normalizeFieldName(key),
+        ),
+        writable: true,
+      });
     }
     return output;
   }
+
+  if (typeof value === "string")
+    return redactStructuredStringValue(value, path, keyName, policy, fields);
 
   const classification = classifyStructuredValue(
     value,
