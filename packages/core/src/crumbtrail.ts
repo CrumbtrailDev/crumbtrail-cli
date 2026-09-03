@@ -194,6 +194,7 @@ const DEFAULT_CONFIG_POLL_INTERVAL_MS = 60_000;
  * the fallback declares itself with a `policy_unavailable` gap.
  */
 export const REMOTE_POLICY_TIMEOUT_MS = 5_000;
+const SESSION_METADATA_STOP_TIMEOUT_MS = REMOTE_POLICY_TIMEOUT_MS;
 const EMAIL_SHAPED_VALUE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
 /**
  * There is no terminal state: a recorder that has finalized a window re-arms to
@@ -1862,6 +1863,38 @@ export class Crumbtrail {
     );
   }
 
+  private deferShutdownUntilSessionMetadataSettles(
+    sessionMetadataWrite: Promise<void>,
+  ): void {
+    void sessionMetadataWrite.then(
+      () => void this.finishDeferredShutdown(),
+      () => void this.finishDeferredShutdown(),
+    );
+  }
+
+  private async finishDeferredShutdown(): Promise<void> {
+    this.runtimeBinding?.stop();
+    await Promise.allSettled([...this.pendingSends]);
+    if (this.deferredDeliveryGaps.length > 0) {
+      const deferred = this.deferredDeliveryGaps;
+      this.deferredDeliveryGaps = [];
+      try {
+        await this.transport.sendEvents(deferred);
+      } catch {
+        // A deferred shutdown must not surface a transport failure as an
+        // unhandled rejection after stop() has already returned.
+      }
+    }
+    if (this.sessionStarted) {
+      try {
+        await this.transport.endSession(this.sessionId);
+      } catch {
+        // A deferred shutdown must not surface a transport failure as an
+        // unhandled rejection after stop() has already returned.
+      }
+    }
+  }
+
   /** Schedule a close for a page that remains hidden after lifecycle events settle. */
   private scheduleLifecycleClose(): void {
     if (
@@ -2693,13 +2726,19 @@ export class Crumbtrail {
     // The session start owns the binding proof used in its request. Retire the
     // proof only after that request settles, while retaining the transport's
     // existing request bounds and its normal error swallowing.
-    try {
-      await this.sessionMetadataWrite;
-    } catch {
-      // sendSessionMetadata() normally absorbs this. A custom transport must
-      // not prevent the rest of shutdown from running.
+    const sessionMetadataSettled = await waitForPromiseWithin(
+      this.sessionMetadataWrite,
+      SESSION_METADATA_STOP_TIMEOUT_MS,
+    );
+    if (sessionMetadataSettled) {
+      this.runtimeBinding?.stop();
+    } else {
+      // A custom transport can return an unbounded promise. Keep the ordering
+      // by deferring retirement and session end, but let stop() return after
+      // the same finite budget used by remote policy admission.
+      this.deferShutdownUntilSessionMetadataSettles(this.sessionMetadataWrite);
+      return { sessionId: this.sessionId };
     }
-    this.runtimeBinding?.stop();
     if (this.sessionStarted) {
       // bus.stop() just flushed the final batch into the transport; every
       // in-flight POST must land before end-of-session finalizes the log.
@@ -2767,6 +2806,28 @@ export class Crumbtrail {
     }
     if (teardownFailures.length > 0) throw buildStopFailure(teardownFailures);
     return { sessionId: this.sessionId };
+  }
+}
+
+async function waitForPromiseWithin(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true,
+        () => true,
+      ),
+      timeout,
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 

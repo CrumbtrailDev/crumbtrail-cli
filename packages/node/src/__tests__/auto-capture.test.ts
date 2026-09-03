@@ -307,10 +307,13 @@ describe("autoCapture", () => {
   it("bounded crash flush: still exits(1) when the record never resolves (timeout path)", async () => {
     const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
     const onCrashExit = vi.fn();
-    // session/start resolves so the hooks install, but the /api/events POST hangs
-    // forever — the record promise never settles.
+    // runtime/register and session/start resolve so the hooks install, but the
+    // /api/events POST hangs forever — the record promise never settles.
     const fetchImpl = vi.fn(async (url: string | URL | Request) => {
-      if (String(url).endsWith("/api/session/start")) {
+      if (
+        String(url).includes("/api/runtime/register") ||
+        String(url).endsWith("/api/session/start")
+      ) {
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
       }
       return new Promise<Response>(() => {}); // never resolves
@@ -338,10 +341,13 @@ describe("autoCapture", () => {
   it("re-entrant crash during the flush does not recurse or double-exit", async () => {
     const proc = makeFakeProcess({ env: { CRUMBTRAIL_KEY: "k" } });
     const onCrashExit = vi.fn();
-    // Hang the record so the first flush is still in flight when the second
-    // crash fires.
+    // Let runtime/register and session/start complete, then hang the record so
+    // the first flush is still in flight when the second crash fires.
     const fetchImpl = vi.fn(async (url: string | URL | Request) => {
-      if (String(url).endsWith("/api/session/start")) {
+      if (
+        String(url).includes("/api/runtime/register") ||
+        String(url).endsWith("/api/session/start")
+      ) {
         return new Response(JSON.stringify({ ok: true }), { status: 200 });
       }
       return new Promise<Response>(() => {});

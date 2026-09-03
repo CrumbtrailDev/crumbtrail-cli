@@ -40,7 +40,7 @@ function terminalEvents(events: readonly ServerlessInvocationEvent[]) {
 }
 
 describe("Node serverless adapters", () => {
-  it("uses endpoint only configuration for AWS, Vercel, and Netlify lifecycles", async () => {
+  it("keeps custom fetch seams isolated across AWS, Vercel, and Netlify lifecycles", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const runtime = {
       instanceId: "ri_runtime_adapters",
@@ -84,7 +84,7 @@ describe("Node serverless adapters", () => {
     ).toHaveLength(3);
     expect(
       calls.filter((call) => call.url.includes("/api/runtime/register")),
-    ).toHaveLength(1);
+    ).toHaveLength(3);
     const starts = calls.filter((call) =>
       call.url.endsWith("/api/session/start"),
     );

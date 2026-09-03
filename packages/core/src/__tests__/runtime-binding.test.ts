@@ -10,7 +10,7 @@ import {
   RUNTIME_BINDING_ROTATE_AHEAD_MS,
 } from "../runtime-binding";
 import { HttpTransport } from "../transports/http";
-import { Crumbtrail } from "../crumbtrail";
+import { Crumbtrail, REMOTE_POLICY_TIMEOUT_MS } from "../crumbtrail";
 import { runServerlessInvocation } from "../serverless";
 
 const ENDPOINT = "https://capture.example";
@@ -941,6 +941,79 @@ describe("HttpTransport runtime binding seam", () => {
     expect(operations.indexOf("session-start-settled")).toBeGreaterThanOrEqual(
       0,
     );
+    expect(operations.indexOf("DELETE")).toBeGreaterThan(
+      operations.indexOf("session-start-settled"),
+    );
+  });
+
+  it("bounds stop while session start is still pending and retires afterward", async () => {
+    vi.useFakeTimers();
+    const runtime = binding(NOW + 86_400_000, "browser-stop-timeout");
+    const pendingStart = deferred<Response>();
+    const operations: string[] = [];
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/api/runtime/register")) {
+          if (init?.method === "DELETE") {
+            operations.push("DELETE");
+            return response({ ok: true });
+          }
+          operations.push("register");
+          return response(runtime, 201);
+        }
+        if (url.endsWith("/api/session/start")) {
+          operations.push("session-start");
+          const result = await pendingStart.promise;
+          operations.push("session-start-settled");
+          return result;
+        }
+        return response({ ok: true });
+      },
+    );
+    vi.stubGlobal("fetch", fetcher);
+
+    const logger = Crumbtrail.init({
+      httpEndpoint: ENDPOINT,
+      httpAuthToken: "project-key",
+      remoteConfig: false,
+      widget: false,
+      environment: false,
+      domSnapshot: false,
+      console: false,
+      network: false,
+      interactions: false,
+      keystrokes: false,
+      scroll: false,
+      visibility: false,
+      clipboard: false,
+      errors: false,
+      performance: false,
+      cookies: false,
+      storage: false,
+      heartbeat: false,
+      uiNumbers: false,
+      listeners: false,
+      eventSource: false,
+      webSocket: false,
+      workers: false,
+      flushIntervalMs: 100_000,
+      flushBufferSize: 1_000,
+      sessionPersistence: "memory",
+    });
+
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
+    expect(operations).toContain("session-start");
+
+    const stopping = logger.stop();
+    await vi.advanceTimersByTimeAsync(REMOTE_POLICY_TIMEOUT_MS);
+    await expect(stopping).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(operations).not.toContain("DELETE");
+
+    pendingStart.resolve(response({ ok: true }));
+    for (let index = 0; index < 20; index += 1) await Promise.resolve();
     expect(operations.indexOf("DELETE")).toBeGreaterThan(
       operations.indexOf("session-start-settled"),
     );
