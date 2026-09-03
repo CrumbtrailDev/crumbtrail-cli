@@ -1466,8 +1466,8 @@ export async function runWizard(
           plan.kind === "serverless-guidance"
             ? "No ingest key was minted because the serverless setup plan made no local changes."
             : inject.outcome === "declined"
-            ? "No ingest key was minted because the local wiring changes were declined."
-            : "No ingest key was minted because the SDK was not installed and the app was not wired.",
+              ? "No ingest key was minted because the local wiring changes were declined."
+              : "No ingest key was minted because the SDK was not installed and the app was not wired.",
         );
 
   // 8. Next steps. With the key on disk the first-event wait is a real wait on
@@ -1517,6 +1517,7 @@ export async function runWizard(
   const nothingWired =
     sdkInstallFailed ||
     inject.outcome === "declined" ||
+    plan.kind === "needs-hands" ||
     plan.kind === "serverless-guidance";
   const cloudEventUnavailable = result.recipe === "tauri";
   // Nothing reached the user's entry file: the plan fell back to a snippet
@@ -1557,8 +1558,8 @@ export async function runWizard(
       plan.kind === "serverless-guidance"
         ? "Nothing is wired yet, so there is no first event to wait for. Apply one setup plan above, then run `npx crumbtrail` again."
         : inject.outcome === "declined"
-        ? "Nothing was changed, so there is no first event to wait for. Add the snippet above when you are ready, then run `npx crumbtrail` again."
-        : "Nothing is wired yet, so there is no first event to wait for. Install the SDK, then run `npx crumbtrail` again.",
+          ? "Nothing was changed, so there is no first event to wait for. Add the snippet above when you are ready, then run `npx crumbtrail` again."
+          : "Nothing is wired yet, so there is no first event to wait for. Install the SDK, then run `npx crumbtrail` again.",
     );
   } else if (cloudEventUnavailable) {
     notes.push(
@@ -3878,7 +3879,12 @@ async function applyInjection(
   // untouched repo plus a note — not a wired app that no longer compiles and an
   // edit the user has to find and revert by hand. `otlp` is unaffected: it has
   // no SDK packages, so `installSdk` reports a skip rather than a failure.
-  if (sdkInstall && !sdkInstall.installed && sdkInstall.packages.length > 0) {
+  if (
+    plan.kind !== "needs-hands" &&
+    sdkInstall &&
+    !sdkInstall.installed &&
+    sdkInstall.packages.length > 0
+  ) {
     const pkgs = sdkInstall.packages.join(", ");
     ui.out(color.yellow(`Left your code untouched. ${pkgs} is not installed.`));
     // The wiring is withheld, but the wiring is still the thing the user came
@@ -3921,6 +3927,40 @@ async function applyInjection(
       ui.out(plan.agentPrompt);
     }
     notes.push("Injection fell back to a manual snippet / AI prompt.");
+    return { outcome: "guidance", filesTouched, notes };
+  }
+
+  if (plan.kind === "needs-hands") {
+    const integration = plan.integration;
+    ui.out(
+      color.yellow(
+        "Found an existing Crumbtrail integration and refused to amend it automatically.",
+      ),
+    );
+    if (integration?.file) {
+      ui.out(color.dim(`  File: ${integration.file}`));
+    }
+    ui.out(
+      color.dim(
+        "  Already there: the existing initialization was left unchanged.",
+      ),
+    );
+    if (integration && integration.existingEnvVars.length > 0) {
+      ui.out(
+        color.dim(
+          `  Existing environment variables: ${integration.existingEnvVars.join(", ")}`,
+        ),
+      );
+    }
+    if (integration && integration.instructions.length > 0) {
+      ui.out(color.dim("  Instructions:"));
+      for (const instruction of integration.instructions) {
+        ui.out(color.dim(`    · ${instruction}`));
+      }
+    }
+    notes.push(
+      "The existing integration needs manual review. No source files were changed.",
+    );
     return { outcome: "guidance", filesTouched, notes };
   }
 

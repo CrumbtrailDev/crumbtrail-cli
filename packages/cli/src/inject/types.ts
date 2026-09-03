@@ -1,4 +1,6 @@
 import type { Recipe } from "../detect";
+import type { AmendBlocked } from "./amend";
+import type { IntegrationHazard, IntegrationRequirement } from "./integration";
 
 /** The shape of a plan the executor knows how to (or refuses to) apply. */
 export type PlanKind =
@@ -6,11 +8,24 @@ export type PlanKind =
   | "prepend" // strictly prepend into an existing file
   | "rewrite" // replace an existing file with fully transformed content (Express middleware wiring)
   | "amend-init" // add the missing options to the customer's OWN init call, in place
+  | "needs-hands" // existing integration is unsafe or ambiguous to amend
   | "skip-already-wired" // project already references Crumbtrail; no-op
   | "needs-confirm-dirty" // target has uncommitted changes; needs --force / confirm
   | "fallback-ai" // detection/safety ambiguous; hand off to the AI-prompt path
   | "serverless-guidance" // exact serverless adapter guide; write nothing
   | "otlp-guidance"; // non-JS backend: emit OTLP setup guidance, write nothing
+
+export interface PlanIntegration {
+  found: boolean;
+  amended: boolean;
+  amendedFields?: string[];
+  missing: IntegrationRequirement[];
+  blocked: AmendBlocked[];
+  hazards: IntegrationHazard[];
+  existingEnvVars: string[];
+  file: string | null;
+  instructions: string[];
+}
 
 /**
  * A fully-resolved, side-effect-free description of what injection would do.
@@ -40,6 +55,8 @@ export interface Plan {
    * `service` to the init you already had", not "set Crumbtrail up".
    */
   amendedFields?: string[];
+  /** Structured evidence for an existing integration and any refusal. */
+  integration?: PlanIntegration;
   /**
    * `amend-init`: a guarded env file load was prepended above the customer's
    * own init, so the key this run wrote is genuinely read at startup.

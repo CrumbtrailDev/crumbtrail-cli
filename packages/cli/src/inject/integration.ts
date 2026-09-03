@@ -3,6 +3,7 @@ import { readEnvVar } from "../env-file";
 import { RECIPE_REGISTRY } from "../recipe-registry";
 import type { Recipe } from "../detect";
 import type { InjectIO } from "./io";
+import { findCallSites, maskLiterals } from "./amend";
 
 /** The evidence a complete integration must leave in the target package. */
 export type IntegrationRequirement =
@@ -12,6 +13,12 @@ export type IntegrationRequirement =
   | "ingest-key"
   | "service-name"
   | "remote-config";
+
+export type IntegrationHazard =
+  | "guarded-init"
+  | "transport-instance"
+  | "other-key-channel"
+  | "unsupported-option";
 
 export interface IntegrationCheckInput {
   cwd: string;
@@ -29,6 +36,14 @@ export interface IntegrationStatus {
   found: boolean;
   /** The concrete pieces that keep an existing integration from being complete. */
   missing: IntegrationRequirement[];
+  /** Reasons an existing integration cannot be safely amended automatically. */
+  hazards: IntegrationHazard[];
+  /** Environment names found in source or project configuration. */
+  existingEnvVars: string[];
+  /** Crumbtrail environment names that look like key channels. */
+  keyEnvVarsSeen: string[];
+  /** Crumbtrail environment names that look like endpoint channels. */
+  endpointEnvVarsSeen: string[];
   /**
    * The app name the reachable source ALREADY declares, when it declares one
    * that is not the name this run targets.
@@ -68,6 +83,74 @@ export const LOCAL_IMPORT =
   /(?:from\s+|import\s*\(|import\s+|require\s*\()\s*["']([^"']+)["']/g;
 const ENDPOINT_ENV =
   /\b[A-Z][A-Z0-9_]*CRUMBTRAIL[A-Z0-9_]*ENDPOINT[A-Z0-9_]*\b/g;
+const ENV_NAME =
+  /\b(?:[A-Z][A-Z0-9_]*CRUMBTRAIL[A-Z0-9_]*|CRUMBTRAIL[A-Z0-9_]*)\b/g;
+
+const ENV_CONFIG_FILE =
+  /^(?:\.env(?:\.[^/]+)*|docker-compose[^/]*\.ya?ml|Dockerfile[^/]*|fly\.toml|render\.ya?ml|vercel\.json|netlify\.toml|README\.md)$/;
+
+function isKeyEnvName(name: string): boolean {
+  const crumbtrail = name.indexOf("CRUMBTRAIL");
+  return (
+    crumbtrail >= 0 && /(?:API_KEY|KEY|TOKEN)/.test(name.slice(crumbtrail))
+  );
+}
+
+function isEndpointEnvName(name: string): boolean {
+  const crumbtrail = name.indexOf("CRUMBTRAIL");
+  return crumbtrail >= 0 && /ENDPOINT/.test(name.slice(crumbtrail));
+}
+
+function namesIn(text: string): string[] {
+  const names: string[] = [];
+  ENV_NAME.lastIndex = 0;
+  for (const match of text.matchAll(ENV_NAME)) names.push(match[0]);
+  return names;
+}
+
+/**
+ * Source and configuration files that can explain a customer's existing
+ * environment names. Configuration is inspected for names only, never values.
+ */
+function inspectionFiles(
+  input: IntegrationCheckInput,
+): Array<{ file: string; text: string }> {
+  const sourceFiles = reachableSourceFiles(input);
+  const files = [...sourceFiles];
+  const seen = new Set(files.map((entry) => entry.file));
+  const maxFiles = 256;
+  let dir = path.resolve(input.cwd);
+
+  while (files.length < maxFiles) {
+    const names = input.io.listFiles?.(dir) ?? [];
+    for (const name of [...names].sort()) {
+      if (!ENV_CONFIG_FILE.test(name)) continue;
+      const file = path.join(dir, name);
+      if (seen.has(file)) continue;
+      const text = input.io.readFile(file);
+      if (text === null) continue;
+      seen.add(file);
+      files.push({ file, text });
+      if (files.length >= maxFiles) break;
+    }
+    // The repository is the boundary. Without it the walk reaches the user's
+    // home directory and the filesystem root, and names harvested from an
+    // unrelated project above the checkout become hazards in this one.
+    if (input.io.exists(path.join(dir, ".git"))) break;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return files;
+}
+
+export function harvestEnvNames(input: IntegrationCheckInput): string[] {
+  const names = new Set<string>();
+  for (const entry of inspectionFiles(input)) {
+    for (const name of namesIn(entry.text)) names.add(name);
+  }
+  return [...names];
+}
 
 export function sourceModulePath(
   io: InjectIO,
@@ -287,6 +370,146 @@ function declaredServiceName(source: string): string | undefined {
   return match?.[1];
 }
 
+/** Offsets of the `{` of every block still open at `offset`, outermost first. */
+function openBlocksAt(mask: string, offset: number): number[] {
+  const stack: number[] = [];
+  for (let i = 0; i < offset; i += 1) {
+    if (mask[i] === "{") stack.push(i);
+    else if (mask[i] === "}") stack.pop();
+  }
+  return stack;
+}
+
+/** Index just past the `)` closing the `(` at `from`, or -1. */
+function closingParen(mask: string, from: number): number {
+  let depth = 0;
+  for (let i = from; i < mask.length; i += 1) {
+    if (mask[i] === "(") depth += 1;
+    else if (mask[i] === ")") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The condition of an `if` whose body starts at `at`, or undefined when `at` is
+ * not the head of an `if` body. `at` is the `{` of a block or the first token of
+ * a single-statement body.
+ */
+function ifConditionBefore(
+  mask: string,
+  source: string,
+  at: number,
+): string | undefined {
+  const lineStart = mask.lastIndexOf("\n", at - 1) + 1;
+  const prefix = mask.slice(lineStart, at);
+  let found: string | undefined;
+  for (const match of prefix.matchAll(/\bif\s*\(/g)) {
+    const openParen = lineStart + match.index + match[0].length - 1;
+    const close = closingParen(mask, openParen);
+    if (close === -1 || close >= at) continue;
+    // Anything statement-ending between the condition and `at` means this `if`
+    // finished before the call site: `if (a) f(); g({…})` does not guard `g`.
+    if (/[;{}]/.test(mask.slice(close + 1, at))) continue;
+    found = source.slice(openParen + 1, close).trim();
+  }
+  return found;
+}
+
+/**
+ * A block the CLI itself emits around its own wiring, which always runs when
+ * the key is present and is therefore not an unknown guard. The node snippet
+ * writes `if (<keyExpr>) { … }` and the Express one `if (<keyExpr>) app.use(…)`;
+ * a Nuxt plugin body is unconditional startup code that Nuxt always invokes.
+ */
+function isKnownWrapper(
+  condition: string | undefined,
+  before: string,
+  keyExpr?: string,
+): boolean {
+  if (condition !== undefined)
+    return keyExpr !== undefined && condition === keyExpr;
+  return /\bdefineNuxtPlugin\s*\(\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)?\s*=>\s*$/.test(
+    before,
+  );
+}
+
+/**
+ * Whether reaching this call site depends on something this planner cannot see:
+ * an enclosing block, or an `if` on the same statement. The CLI's own key guard
+ * and a Nuxt plugin body are the exceptions, so a project the CLI wired is not
+ * refused on its next run.
+ */
+function isGuardedCallSite(
+  source: string,
+  open: number,
+  keyExpr?: string,
+): boolean {
+  const mask = maskLiterals(source);
+  if (mask === null) return true;
+  for (const brace of openBlocksAt(mask, open)) {
+    const condition = ifConditionBefore(mask, source, brace);
+    const before = mask.slice(mask.lastIndexOf("\n", brace - 1) + 1, brace);
+    if (!isKnownWrapper(condition, before, keyExpr)) return true;
+  }
+  // The call's own statement. `open` is the options object's `{`, so the guard
+  // sits behind the callee expression rather than immediately before it.
+  const condition = ifConditionBefore(mask, source, open);
+  return condition !== undefined && condition !== keyExpr;
+}
+
+function hazardsFor(
+  input: IntegrationCheckInput,
+  sourceFiles: Array<{ file: string; text: string }>,
+  envNames: readonly string[],
+): IntegrationHazard[] {
+  const hazards = new Set<IntegrationHazard>();
+  const keyRef = RECIPE_REGISTRY[input.recipe].keyRef;
+
+  for (const entry of sourceFiles) {
+    for (const site of findCallSites(entry.text)) {
+      const generatedNodeInit =
+        site.callee === "autoCapture" &&
+        site.keys.get("authToken") === "__crumbtrailKey" &&
+        /const\s+__crumbtrailKey\s*=\s*process\.env\./.test(entry.text) &&
+        entry.text.includes('import("crumbtrail-node")');
+      if (isGuardedCallSite(entry.text, site.open, keyRef?.expr)) {
+        hazards.add("guarded-init");
+      }
+      if (
+        site.callee === "Crumbtrail.init" &&
+        site.keys.has("transportInstance")
+      ) {
+        hazards.add("transport-instance");
+      }
+      if (
+        (site.callee === "createCrumbtrailExpressMiddleware" ||
+          site.callee === "createCrumbtrailExpressErrorMiddleware") &&
+        site.keys.has("service")
+      ) {
+        hazards.add("unsupported-option");
+      }
+      for (const keyName of ["authToken", "httpAuthToken"]) {
+        const value = site.keys.get(keyName);
+        if (
+          !generatedNodeInit &&
+          value !== undefined &&
+          value.trim() !== keyRef?.expr
+        ) {
+          hazards.add("other-key-channel");
+        }
+      }
+    }
+  }
+
+  if (envNames.some((name) => isKeyEnvName(name) && name !== keyRef?.envVar)) {
+    hazards.add("other-key-channel");
+  }
+  return [...hazards];
+}
+
 /** The literal a recipe with no env mechanism leaves in place of a real key. */
 const KEY_PLACEHOLDER_IN_SOURCE = /httpAuthToken\s*:\s*["'`]<[^"'`]*>["'`]/;
 
@@ -322,9 +545,11 @@ function remoteConfigRequired(recipe: Recipe): boolean {
 export function inspectIntegration(
   input: IntegrationCheckInput,
 ): IntegrationStatus {
-  const source = reachableSourceFiles(input)
-    .map((entry) => entry.text)
-    .join("\n");
+  const sourceFiles = reachableSourceFiles(input);
+  const source = sourceFiles.map((entry) => entry.text).join("\n");
+  const existingEnvVars = harvestEnvNames(input);
+  const keyEnvVarsSeen = existingEnvVars.filter(isKeyEnvName);
+  const endpointEnvVarsSeen = existingEnvVars.filter(isEndpointEnvName);
   const found = CRUMBTRAIL_REFERENCE.test(source);
   const missing: IntegrationRequirement[] = [];
 
@@ -347,10 +572,15 @@ export function inspectIntegration(
     missing.push("remote-config");
   }
 
+  const hazards = hazardsFor(input, sourceFiles, existingEnvVars);
   return {
-    complete: missing.length === 0,
+    complete: missing.length === 0 && hazards.length === 0,
     found,
     missing,
+    hazards,
+    existingEnvVars,
+    keyEnvVarsSeen,
+    endpointEnvVarsSeen,
     ...(existingServiceName ? { existingServiceName } : {}),
   };
 }
