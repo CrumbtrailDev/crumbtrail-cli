@@ -13,6 +13,131 @@ function acceptedResponse() {
 }
 
 describe("Node application contract transport", () => {
+  it("rejects invalid session ids before consuming manager capacity", () => {
+    vi.useFakeTimers();
+    for (let index = 0; index < 1_001; index += 1) {
+      expect(
+        beginApplicationExpectation({
+          sessionId: `invalid session ${index}`,
+          name: "update",
+          kind: "update",
+          deadlineMs: 10,
+        }),
+      ).toEqual({ accepted: false, rejection: "correlation_invalid" });
+    }
+    expect(vi.getTimerCount()).toBe(0);
+    const valid = beginApplicationExpectation({
+      sessionId: "ses_valid",
+      name: "update",
+      kind: "update",
+      deadlineMs: 10,
+    });
+    expect(valid.accepted).toBe(true);
+    valid.handle?.cancel();
+  });
+
+  it("rejects option getters and proxies without executing caller code or spending capacity", async () => {
+    vi.useFakeTimers();
+    const getter = vi.fn(() => "https://capture.example");
+    const trap = vi.fn(() => {
+      throw new Error("must not run");
+    });
+    const valid = {
+      sessionId: "ses_valid",
+      name: "update",
+      kind: "update" as const,
+      deadlineMs: 10,
+      response: { total: 1 },
+      facts: [
+        {
+          name: "total",
+          operator: "equals" as const,
+          expected: 1,
+          path: "total",
+        },
+      ],
+    };
+    for (const key of [
+      "response",
+      "facts",
+      "name",
+      "kind",
+      "deadlineMs",
+      "sessionId",
+      "endpoint",
+      "authToken",
+      "fetch",
+      "signal",
+      "onWarning",
+      "retries",
+      "retryDelayMs",
+      "sleep",
+    ]) {
+      const options = { ...valid };
+      Object.defineProperty(options, key, { get: getter });
+      if (!["name", "kind", "deadlineMs"].includes(key))
+        expect(
+          (await sendApplicationResponseAssertions(options)).rejection,
+        ).toBe("invalid_options");
+      if (!["response", "facts"].includes(key))
+        expect(beginApplicationExpectation(options).rejection).toBe(
+          "invalid_options",
+        );
+    }
+    const live = new Proxy(valid, {
+      get: trap,
+      getOwnPropertyDescriptor: trap,
+      getPrototypeOf: trap,
+    });
+    const revoked = Proxy.revocable(valid, {});
+    revoked.revoke();
+    for (const options of [live, revoked.proxy]) {
+      expect((await sendApplicationResponseAssertions(options)).rejection).toBe(
+        "invalid_options",
+      );
+      expect(beginApplicationExpectation(options).rejection).toBe(
+        "invalid_options",
+      );
+    }
+    expect(getter).not.toHaveBeenCalled();
+    expect(trap).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    for (let index = 0; index < 100; index += 1) {
+      const result = beginApplicationExpectation(valid);
+      expect(result.accepted).toBe(true);
+      result.handle?.cancel();
+    }
+  });
+
+  it("rejects invalid transport types before admission", async () => {
+    const valid = {
+      sessionId: "ses_valid",
+      name: "update",
+      kind: "update" as const,
+      deadlineMs: 10,
+      response: {},
+      facts: [],
+    };
+    for (const [key, value] of Object.entries({
+      endpoint: 1,
+      authToken: {},
+      fetch: true,
+      signal: false,
+      onWarning: "warn",
+      retries: NaN,
+      retryDelayMs: Infinity,
+      sleep: 3,
+    })) {
+      const options = { ...valid, [key]: value };
+      expect((await sendApplicationResponseAssertions(options)).rejection).toBe(
+        "invalid_options",
+      );
+      expect(beginApplicationExpectation(options).rejection).toBe(
+        "invalid_options",
+      );
+    }
+  });
+
   afterEach(() => {
     vi.useRealTimers();
     resetApplicationContractStateForTests();

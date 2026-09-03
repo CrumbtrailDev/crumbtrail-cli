@@ -1,3 +1,4 @@
+import { isProxy } from "node:util/types";
 import {
   checkApplicationResponse,
   createApplicationExpectationManager,
@@ -61,6 +62,38 @@ const MAX_TRACKED_APPLICATION_CONTRACT_SESSIONS = 1_000;
 const responseCounts = new Map<string, number>();
 const expectationManagers = new Map<string, ApplicationExpectationManager>();
 
+function snapshotOptions<T extends object>(
+  input: T,
+  fields: readonly string[],
+): T {
+  if (input === null || typeof input !== "object" || isProxy(input))
+    throw new Error("invalid options");
+  const prototype = Object.getPrototypeOf(input);
+  if (prototype !== null && prototype !== Object.prototype)
+    throw new Error("invalid options");
+  const snapshot: Record<string, unknown> = Object.create(null);
+  for (const key of [
+    ...fields,
+    "sessionId",
+    "requestId",
+    "traceId",
+    "endpoint",
+    "authToken",
+    "fetch",
+    "signal",
+    "onWarning",
+    "retries",
+    "retryDelayMs",
+    "sleep",
+  ]) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (!descriptor) continue;
+    if (!("value" in descriptor)) throw new Error("invalid options");
+    snapshot[key] = descriptor.value;
+  }
+  return snapshot as T;
+}
+
 function consumeResponseSlot(
   sessionId: string,
 ):
@@ -83,6 +116,26 @@ function consumeResponseSlot(
 function transportOptions(
   options: ApplicationTransportOptions,
 ): ApplicationTransportOptions {
+  if (
+    (options.endpoint !== undefined && typeof options.endpoint !== "string") ||
+    (options.authToken !== undefined &&
+      typeof options.authToken !== "string") ||
+    (options.fetch !== undefined && typeof options.fetch !== "function") ||
+    (options.onWarning !== undefined &&
+      typeof options.onWarning !== "function") ||
+    (options.sleep !== undefined && typeof options.sleep !== "function") ||
+    (options.signal !== undefined &&
+      (typeof options.signal !== "object" ||
+        options.signal === null ||
+        isProxy(options.signal))) ||
+    (options.retries !== undefined &&
+      (typeof options.retries !== "number" ||
+        !Number.isFinite(options.retries))) ||
+    (options.retryDelayMs !== undefined &&
+      (typeof options.retryDelayMs !== "number" ||
+        !Number.isFinite(options.retryDelayMs)))
+  )
+    throw new Error("invalid transport options");
   return {
     ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
     ...(options.authToken === undefined
@@ -121,6 +174,7 @@ export async function sendApplicationResponseAssertions(
   let traceId: string | undefined;
   let transport: ApplicationTransportOptions;
   try {
+    options = snapshotOptions(options, ["response", "facts"]);
     response = options.response;
     facts = options.facts;
     const requestCorrelation = readRequestCorrelation();
@@ -201,6 +255,7 @@ export function beginApplicationExpectation(
   let declaration: ApplicationExpectationOptions;
   let transport: ApplicationTransportOptions;
   try {
+    options = snapshotOptions(options, ["name", "kind", "deadlineMs"]);
     const requestCorrelation = readRequestCorrelation();
     sessionId =
       options.sessionId ??
@@ -212,6 +267,7 @@ export function beginApplicationExpectation(
       name: options.name,
       kind: options.kind,
       deadlineMs: options.deadlineMs,
+      ...(sessionId === undefined ? {} : { sessionId }),
       ...(requestId === undefined ? {} : { requestId }),
       ...(traceId === undefined ? {} : { traceId }),
     };
