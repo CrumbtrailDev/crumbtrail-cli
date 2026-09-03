@@ -120,8 +120,7 @@ type SnapshotResult =
   | { accepted: false; rejection: "invalid_options" };
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== "object")
-    return false;
+  if (value === null || typeof value !== "object") return false;
   try {
     if (Array.isArray(value)) return false;
     const prototype = Object.getPrototypeOf(value);
@@ -191,7 +190,8 @@ export function isSafeApplicationAssertionValue(
     !SAFE_VALUE_RE.test(value)
   )
     return false;
-  if (SECRET_PREFIX_RE.test(value) || SENSITIVE_VALUE_RE.test(value)) return false;
+  if (SECRET_PREFIX_RE.test(value) || SENSITIVE_VALUE_RE.test(value))
+    return false;
   return classifyStructuredValue(value).action === "keep";
 }
 

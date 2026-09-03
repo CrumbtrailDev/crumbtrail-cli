@@ -441,13 +441,30 @@ function bodyPlaceholder(summary: PayloadSummary | undefined): string {
 function readPersistedSessionId(
   store: SessionStore,
   idleMs: number,
-): { id: string; applicationAssertionCount: number } | undefined {
+):
+  | {
+      id: string;
+      applicationAssertionCount: number;
+      applicationResponseAssertionCount: number;
+    }
+  | undefined {
   try {
     const persisted = store.read();
     if (!persisted || typeof persisted !== "object") return undefined;
     const id = persisted.id;
     const lastActivity = persisted.lastActivity;
     const applicationAssertionCount = persisted.applicationAssertionCount;
+    const applicationResponseAssertionCount =
+      persisted.applicationResponseAssertionCount;
+    if (
+      applicationResponseAssertionCount !== undefined &&
+      (typeof applicationResponseAssertionCount !== "number" ||
+        !Number.isSafeInteger(applicationResponseAssertionCount) ||
+        applicationResponseAssertionCount < 0 ||
+        applicationResponseAssertionCount >
+          MAX_APPLICATION_RESPONSE_ASSERTIONS_PER_SESSION)
+    )
+      return undefined;
     if (
       typeof id !== "string" ||
       id.length === 0 ||
@@ -465,6 +482,7 @@ function readPersistedSessionId(
     return {
       id,
       applicationAssertionCount: applicationAssertionCount ?? 0,
+      applicationResponseAssertionCount: applicationResponseAssertionCount ?? 0,
     };
   } catch {
     return undefined;
@@ -475,9 +493,15 @@ function writePersistedSession(
   store: SessionStore,
   id: string,
   applicationAssertionCount = 0,
+  applicationResponseAssertionCount = 0,
 ): void {
   try {
-    store.write({ id, lastActivity: now(), applicationAssertionCount });
+    store.write({
+      id,
+      lastActivity: now(),
+      applicationAssertionCount,
+      applicationResponseAssertionCount,
+    });
   } catch {
     // Persistence is best effort. A custom store must not break capture.
   }
@@ -533,6 +557,7 @@ export class Crumbtrail {
   private applicationAssertions = 0;
   private pendingApplicationAssertions = 0;
   private applicationResponseAssertions = 0;
+  private pendingApplicationResponseAssertions = 0;
   private applicationExpectations: ReturnType<
     typeof createApplicationExpectationManager
   >;
@@ -737,8 +762,17 @@ export class Crumbtrail {
       persistedSession?.id === sessionId
         ? persistedSession.applicationAssertionCount
         : 0;
+    const persistedResponseAssertionCount =
+      persistedSession?.id === sessionId
+        ? persistedSession.applicationResponseAssertionCount
+        : 0;
     if (sessionStore)
-      writePersistedSession(sessionStore, sessionId, persistedAssertionCount);
+      writePersistedSession(
+        sessionStore,
+        sessionId,
+        persistedAssertionCount,
+        persistedResponseAssertionCount,
+      );
 
     // Nowhere to send: same inert shape as the non-browser guard above, and for
     // the same reason. A capture SDK that throws inside a host app's module
@@ -793,6 +827,7 @@ export class Crumbtrail {
       runtimeBinding,
     );
     instance.applicationAssertions = persistedAssertionCount;
+    instance.applicationResponseAssertions = persistedResponseAssertionCount;
 
     // Send events to transport. Flight recorder sessions deliberately keep pre-trigger events
     // local; capture gap records remain visible so sampling never fails silently.
@@ -824,6 +859,7 @@ export class Crumbtrail {
           sessionStore,
           instance.sessionId,
           instance.applicationAssertions,
+          instance.applicationResponseAssertions,
         );
       });
     }
@@ -2009,6 +2045,7 @@ export class Crumbtrail {
     this.lifecycleClosePromise = (async () => {
       // Flush while transport admission is still open. Setting the lifecycle
       // gate first would make the subscriber discard the final batch.
+      this.applicationExpectations.stop();
       this.bus.flush();
       this.lifecycleClosing = true;
       try {
@@ -2210,6 +2247,12 @@ export class Crumbtrail {
 
     this.sessionId = generateSessionId();
     this.applicationAssertions = 0;
+    this.applicationResponseAssertions = 0;
+    this.applicationExpectations.stop();
+    this.applicationExpectations = createApplicationExpectationManager({
+      sessionId: this.sessionId,
+      emit: (event) => this.bus.emit(event),
+    });
     if (this.sessionStore)
       writePersistedSession(this.sessionStore, this.sessionId);
     this.visualArtifactNames.clear();
@@ -2524,6 +2567,7 @@ export class Crumbtrail {
         this.sessionStore,
         this.sessionId,
         this.applicationAssertions,
+        this.applicationResponseAssertions,
       );
     return result;
   }
@@ -2551,8 +2595,11 @@ export class Crumbtrail {
     let acceptedCount = 0;
     const results = built.results.map((result) => {
       if (!result.accepted || result.event === undefined) return result;
+      if (!this.canCapture())
+        return { accepted: false, rejection: "capture_not_admitted" as const };
       if (
-        this.applicationResponseAssertions >=
+        this.applicationResponseAssertions +
+          this.pendingApplicationResponseAssertions >=
         MAX_APPLICATION_RESPONSE_ASSERTIONS_PER_SESSION
       ) {
         return {
@@ -2560,9 +2607,26 @@ export class Crumbtrail {
           rejection: "response_session_cap_reached" as const,
         };
       }
+      this.pendingApplicationResponseAssertions += 1;
+      let admitted = false;
+      try {
+        admitted = this.bus.emit(result.event);
+      } catch {
+        admitted = false;
+      } finally {
+        this.pendingApplicationResponseAssertions -= 1;
+      }
+      if (!admitted)
+        return { accepted: false, rejection: "capture_not_admitted" as const };
       this.applicationResponseAssertions += 1;
+      if (this.sessionStore)
+        writePersistedSession(
+          this.sessionStore,
+          this.sessionId,
+          this.applicationAssertions,
+          this.applicationResponseAssertions,
+        );
       acceptedCount += 1;
-      this.bus.emit(result.event);
       return result;
     });
     return {
@@ -2585,6 +2649,8 @@ export class Crumbtrail {
   expectSideEffect(
     options: ApplicationExpectationOptions,
   ): ApplicationExpectationResult {
+    if (!this.canCapture())
+      return { accepted: false, rejection: "capture_not_admitted" };
     return this.applicationExpectations.begin(options);
   }
 

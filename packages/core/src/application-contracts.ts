@@ -154,6 +154,7 @@ export type ApplicationExpectationRejection =
   | "session_tracking_limit_reached"
   | "timer_unavailable"
   | "session_stopped"
+  | "capture_not_admitted"
   | "invalid_options";
 
 export interface ApplicationExpectationHandle {

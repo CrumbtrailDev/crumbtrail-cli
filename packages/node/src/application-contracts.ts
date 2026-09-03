@@ -246,6 +246,7 @@ export const expectApplicationEffect = beginApplicationExpectation;
 
 /** Close one process-owned expectation session and emit its unsatisfied work. */
 export function clearApplicationExpectationSession(sessionId: string): void {
+  responseCounts.delete(sessionId);
   const manager = expectationManagers.get(sessionId);
   if (!manager) return;
   manager.stop();

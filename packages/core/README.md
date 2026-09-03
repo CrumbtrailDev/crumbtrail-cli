@@ -331,7 +331,9 @@ an array item. The response is not retained or sent. Only a boolean, finite
 number, or short identifier-shaped string may become event data. Objects,
 prose, emails, tokens, headers, accessors, prototype paths, and missing values
 are rejected. A call accepts at most 20 facts, selectors scan at most 25 items,
-and a session emits at most 100 response facts. The event kind is
+and a session emits at most 100 response facts. Only admitted events consume
+the cap, and the count survives reloads with session persistence enabled.
+Inactive capture returns `capture_not_admitted`. The event kind is
 `app.response.assertion`, and `reportResponse()` is an alias when the name is
 more readable at the call site.
 

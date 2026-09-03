@@ -20,7 +20,6 @@ export {
   sendResponseAssertions,
   sendApplicationResponseFacts,
   clearApplicationExpectationSession,
-  resetApplicationContractStateForTests,
 } from "./application-contracts";
 
 export type {

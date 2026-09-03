@@ -101,13 +101,13 @@ describe("application response contracts", () => {
     const cases = [
       {
         response: { data: { value: { nested: true } } },
-        fact: { name: "body", operator: "equals", expected: 1, path: "data" },
+        fact: { name: "result", operator: "equals", expected: 1, path: "data" },
         expected: "invalid_actual",
       },
       {
         response: { data: { message: "a whole sentence" } },
         fact: {
-          name: "message",
+          name: "result",
           operator: "equals",
           expected: "ok",
           path: "data.message",
@@ -117,7 +117,7 @@ describe("application response contracts", () => {
       {
         response: { data: { email: "person@example.com" } },
         fact: {
-          name: "email",
+          name: "result",
           operator: "equals",
           expected: "ok",
           path: "data.email",
@@ -437,6 +437,78 @@ describe("application expectation lifecycle", () => {
 });
 
 describe("application contracts through Crumbtrail", () => {
+  it("refuses inactive capture without spending response capacity", async () => {
+    const logger = Crumbtrail.init({ sessionPersistence: "memory" });
+    const facts = [
+      {
+        name: "state",
+        operator: "equals" as const,
+        expected: "ready",
+        path: "state",
+      },
+    ];
+    for (let index = 0; index < 101; index += 1) {
+      expect(
+        logger.checkResponse({ state: "ready" }, facts).results[0],
+      ).toEqual({ accepted: false, rejection: "capture_not_admitted" });
+    }
+    expect(
+      logger.expectSideEffect({ name: "work", kind: "work", deadlineMs: 100 }),
+    ).toEqual({ accepted: false, rejection: "capture_not_admitted" });
+    await logger.stop();
+  });
+
+  it("retains response caps across restoration and counts only admitted events", async () => {
+    const sink = {
+      sendEvents: vi.fn().mockResolvedValue(undefined),
+      sendBlob: vi.fn().mockResolvedValue(undefined),
+      startSession: vi.fn().mockResolvedValue(undefined),
+      endSession: vi.fn().mockResolvedValue(undefined),
+      sendBugReport: vi.fn().mockResolvedValue(undefined),
+    };
+    let saved: import("../session-store").PersistedSession | undefined;
+    const sessionStore = {
+      read: () => saved,
+      write: (value: import("../session-store").PersistedSession) => {
+        saved = value;
+      },
+    };
+    const options = {
+      transportInstance: sink,
+      sessionStore,
+      flushBufferSize: 1,
+      flushIntervalMs: 100_000,
+    };
+    const logger = Crumbtrail.init(options);
+    const facts = [
+      {
+        name: "state",
+        operator: "equals" as const,
+        expected: "ready",
+        path: "state",
+      },
+    ];
+    const bus = (
+      logger as unknown as { bus: { emit: (event: unknown) => boolean } }
+    ).bus;
+    const blocked = vi.spyOn(bus, "emit").mockReturnValue(false);
+    expect(logger.checkResponse({ state: "ready" }, facts).accepted).toBe(
+      false,
+    );
+    blocked.mockRestore();
+    for (let index = 0; index < 100; index += 1)
+      expect(logger.checkResponse({ state: "ready" }, facts).accepted).toBe(
+        true,
+      );
+    expect(saved?.applicationResponseAssertionCount).toBe(100);
+    await logger.stop();
+    const resumed = Crumbtrail.init(options);
+    expect(resumed.checkResponse({ state: "ready" }, facts).results[0]).toEqual(
+      { accepted: false, rejection: "response_session_cap_reached" },
+    );
+    await resumed.stop();
+  });
+
   it("flushes response mismatches and shutdown misses through the active session", async () => {
     const sink = {
       sendEvents: vi.fn().mockResolvedValue(undefined),
