@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Debug
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -29,13 +30,13 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private lateinit var context: Context
     private var application: Application? = null
     private var activityCallbacks: Application.ActivityLifecycleCallbacks? = null
-    private var watchdogExecutor = Executors.newSingleThreadScheduledExecutor {
-        Thread(it, "crumbtrail-flutter-watchdog").apply { isDaemon = true }
-    }
+    private var watchdogExecutor = newWatchdogExecutor()
     private var watchdogTask: ScheduledFuture<*>? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    @Volatile private var lastHeartbeat = System.currentTimeMillis()
+    @Volatile private var lastHeartbeat = SystemClock.elapsedRealtime()
     @Volatile private var watchdogPending = false
+    @Volatile private var enabled = false
+    private var collectorsStarted = false
     private var previousHandler: Thread.UncaughtExceptionHandler? = null
     private var installedHandler: Thread.UncaughtExceptionHandler? = null
 
@@ -44,29 +45,23 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         channel = MethodChannel(binding.binaryMessenger, CHANNEL)
         channel.setMethodCallHandler(this)
         application = context.applicationContext as? Application
-        installCrashHandler()
-        installLifecycleCollector()
-        collectPreviousProcessExit()
-        startWatchdog()
+        if (watchdogExecutor.isShutdown) watchdogExecutor = newWatchdogExecutor()
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel.setMethodCallHandler(null)
-        activityCallbacks?.let { application?.unregisterActivityLifecycleCallbacks(it) }
-        activityCallbacks = null
-        watchdogTask?.cancel(true)
-        watchdogTask = null
+        stopCollectors(clearPending = false)
         watchdogExecutor.shutdownNow()
-        if (installedHandler != null && Thread.getDefaultUncaughtExceptionHandler() === installedHandler) {
-            Thread.setDefaultUncaughtExceptionHandler(previousHandler)
-        }
-        installedHandler = null
     }
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         try {
             when (call.method) {
                 "getCapabilities" -> result.success(capabilities())
+                "setEnabled" -> {
+                    setEnabled(call.arguments as? Boolean == true)
+                    result.success(null)
+                }
                 "drainDiagnostics" -> result.success(drainDiagnostics())
                 else -> result.notImplemented()
             }
@@ -80,10 +75,10 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     private fun capabilities(): Map<String, Any> = mapOf(
-        "nativeDiagnostics" to capability(true),
-        "nativeHang" to capability(true),
-        "nativeCrash" to capability(true),
-        "appLifecycle" to capability(true),
+        "nativeDiagnostics" to capability(),
+        "nativeHang" to capability(),
+        "nativeCrash" to capability(),
+        "appLifecycle" to capability(),
     )
 
     private fun absentCapabilities(): Map<String, Any> = mapOf(
@@ -93,15 +88,55 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         "appLifecycle" to capability(false),
     )
 
-    private fun capability(supported: Boolean): Map<String, Boolean> = mapOf(
+    private fun capability(supported: Boolean = true): Map<String, Boolean> = mapOf(
         "supported" to supported,
-        "enabled" to supported,
+        "enabled" to (supported && enabled),
         "observed" to false,
     )
+
+    private fun setEnabled(value: Boolean) {
+        if (value) startCollectors() else stopCollectors(clearPending = true)
+    }
+
+    private fun startCollectors() {
+        synchronized(PENDING_LOCK) {
+            if (collectorsStarted) return
+            enabled = true
+            collectorsStarted = true
+        }
+        installCrashHandler()
+        installLifecycleCollector()
+        collectPreviousProcessExit()
+        startWatchdog()
+    }
+
+    private fun stopCollectors(clearPending: Boolean) {
+        enabled = false
+        watchdogTask?.cancel(true)
+        watchdogTask = null
+        activityCallbacks?.let { application?.unregisterActivityLifecycleCallbacks(it) }
+        activityCallbacks = null
+        if (installedHandler != null && Thread.getDefaultUncaughtExceptionHandler() === installedHandler) {
+            Thread.setDefaultUncaughtExceptionHandler(previousHandler)
+        }
+        installedHandler = null
+        previousHandler = null
+        synchronized(PENDING_LOCK) {
+            collectorsStarted = false
+            watchdogPending = false
+            if (clearPending) {
+                preferences().edit()
+                    .remove(PENDING_KEY)
+                    .remove(LAST_PROCESS_EXIT_TIMESTAMP_KEY)
+                    .commit()
+            }
+        }
+    }
 
     private fun installCrashHandler() {
         previousHandler = Thread.getDefaultUncaughtExceptionHandler()
         val handler = Thread.UncaughtExceptionHandler { thread, throwable ->
+            if (!enabled) return@UncaughtExceptionHandler
             runCatching {
                 appendPending(
                     "native-crash",
@@ -145,54 +180,62 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return
         runCatching {
-            val prefs = preferences()
-            val lastSeen = prefs.getLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, 0L)
-            var newest = lastSeen
-            manager.getHistoricalProcessExitReasons(context.packageName, 0, 4)
-                .filter { it.timestamp > lastSeen }
-                .forEach { info ->
-                    newest = maxOf(newest, info.timestamp)
-                    val reason = info.reason
-                    when (reason) {
-                        android.app.ApplicationExitInfo.REASON_ANR -> appendPending(
-                            "native-hang",
-                            mapOf(
-                                "source" to "main-thread",
-                                "thresholdMs" to HANG_THRESHOLD_MS,
-                                "observedDurationMs" to HANG_THRESHOLD_MS,
-                                "recovered" to false,
-                                "previousLaunch" to true,
-                                "at" to info.timestamp,
-                                "status" to info.status,
-                            ),
-                        )
-                        android.app.ApplicationExitInfo.REASON_CRASH,
-                        android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> appendPending(
-                            "native-crash",
-                            mapOf(
-                                "msg" to "previous process exited: ${processExitReason(reason)}",
-                                "signal" to processExitReason(reason),
-                                "source" to "previous-launch",
-                                "at" to info.timestamp,
-                                "status" to info.status,
-                            ),
-                        )
-                        else -> appendPending(
-                            "app-lifecycle",
-                            mapOf(
-                                "state" to "process-exit",
-                                "kind" to processExitReason(reason),
-                                "source" to "application-exit-info",
-                                "at" to info.timestamp,
-                                "status" to info.status,
-                            ),
-                        )
+            synchronized(PENDING_LOCK) {
+                if (!enabled) return@synchronized
+                val prefs = preferences()
+                val lastSeen = prefs.getLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, 0L)
+                var newest = lastSeen
+                val pending = JSONArray(prefs.getString(PENDING_KEY, "[]"))
+                manager.getHistoricalProcessExitReasons(context.packageName, 0, 4)
+                    .filter { it.timestamp > lastSeen }
+                    .forEach { info ->
+                        newest = maxOf(newest, info.timestamp)
+                        appendProcessExit(pending, info)
                     }
+                if (newest > lastSeen) {
+                    val committed = prefs.edit()
+                        .putString(PENDING_KEY, pending.toString())
+                        .putLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, newest)
+                        .commit()
+                    if (!committed) return@synchronized
                 }
-            if (newest > lastSeen) {
-                prefs.edit().putLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, newest).commit()
             }
         }
+    }
+
+    private fun appendProcessExit(
+        pending: JSONArray,
+        info: android.app.ApplicationExitInfo,
+    ) {
+        val reason = info.reason
+        val (kind, data) = when (reason) {
+            android.app.ApplicationExitInfo.REASON_ANR -> "native-hang" to mapOf(
+                "source" to "main-thread",
+                "thresholdMs" to HANG_THRESHOLD_MS,
+                "observedDurationMs" to HANG_THRESHOLD_MS,
+                "recovered" to false,
+                "previousLaunch" to true,
+                "at" to info.timestamp,
+                "status" to info.status,
+            )
+            android.app.ApplicationExitInfo.REASON_CRASH,
+            android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "native-crash" to mapOf(
+                "msg" to "previous process exited: ${processExitReason(reason)}",
+                "signal" to processExitReason(reason),
+                "source" to "previous-launch",
+                "at" to info.timestamp,
+                "status" to info.status,
+            )
+            else -> "app-lifecycle" to mapOf(
+                "state" to "process-exit",
+                "kind" to processExitReason(reason),
+                "source" to "application-exit-info",
+                "at" to info.timestamp,
+                "status" to info.status,
+            )
+        }
+        while (pending.length() >= MAX_PENDING_EVENTS) pending.remove(0)
+        pending.put(JSONObject().put("kind", kind).put("data", JSONObject(data)))
     }
 
     private fun processExitReason(reason: Int): String = when (reason) {
@@ -210,7 +253,7 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private fun startWatchdog() {
         val handler = mainHandler
         watchdogTask = watchdogExecutor.scheduleAtFixedRate({
-            val now = System.currentTimeMillis()
+            val now = SystemClock.elapsedRealtime()
             if (now - lastHeartbeat > HANG_THRESHOLD_MS && !watchdogPending && !Debug.isDebuggerConnected()) {
                 watchdogPending = true
                 appendPending(
@@ -224,33 +267,39 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     ),
                 )
             }
-            runCatching { handler.post { lastHeartbeat = System.currentTimeMillis() } }
+            runCatching { handler.post { lastHeartbeat = SystemClock.elapsedRealtime() } }
         }, CHECK_INTERVAL_MS, CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS)
     }
 
     private fun drainDiagnostics(): List<Map<String, Any?>> {
-        val prefs = preferences()
-        val raw = prefs.getString(PENDING_KEY, null) ?: return emptyList()
-        prefs.edit().remove(PENDING_KEY).commit()
-        return runCatching {
-            val array = JSONArray(raw)
-            (0 until array.length()).mapNotNull { index ->
-                val item = array.optJSONObject(index) ?: return@mapNotNull null
+        return synchronized(PENDING_LOCK) {
+            if (!enabled) return@synchronized emptyList()
+            val prefs = preferences()
+            val raw = prefs.getString(PENDING_KEY, null) ?: return@synchronized emptyList()
+            val events = runCatching { JSONArray(raw) }.getOrNull()
+                ?: return@synchronized emptyList()
+            val result = (0 until events.length()).mapNotNull { index ->
+                val item = events.optJSONObject(index) ?: return@mapNotNull null
                 val kind = item.optString("kind")
                 val data = item.optJSONObject("data") ?: return@mapNotNull null
                 mapOf("kind" to kind, "data" to jsonMap(data))
             }
-        }.getOrDefault(emptyList())
+            prefs.edit().remove(PENDING_KEY).commit()
+            result
+        }
     }
 
     private fun appendPending(kind: String, data: Map<String, Any?>) {
         runCatching {
-            val prefs = preferences()
-            val current = JSONArray(prefs.getString(PENDING_KEY, "[]"))
-            while (current.length() >= MAX_PENDING_EVENTS) current.remove(0)
-            val json = JSONObject().put("kind", kind).put("data", JSONObject(data))
-            current.put(json)
-            prefs.edit().putString(PENDING_KEY, current.toString()).commit()
+            synchronized(PENDING_LOCK) {
+                if (!enabled) return@synchronized
+                val prefs = preferences()
+                val current = JSONArray(prefs.getString(PENDING_KEY, "[]"))
+                while (current.length() >= MAX_PENDING_EVENTS) current.remove(0)
+                val json = JSONObject().put("kind", kind).put("data", JSONObject(data))
+                current.put(json)
+                prefs.edit().putString(PENDING_KEY, current.toString()).commit()
+            }
         }
     }
 
@@ -268,6 +317,11 @@ class CrumbtrailFlutterPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private fun bounded(value: String): String = value.take(MAX_TEXT)
 
     companion object {
+        private fun newWatchdogExecutor() = Executors.newSingleThreadScheduledExecutor {
+            Thread(it, "crumbtrail-flutter-watchdog").apply { isDaemon = true }
+        }
+
+        private val PENDING_LOCK = Any()
         private const val CHANNEL = "ai.crumbtrail/native_diagnostics"
         private const val PREFERENCES = "ai.crumbtrail.flutter"
         private const val PENDING_KEY = "native-diagnostics"

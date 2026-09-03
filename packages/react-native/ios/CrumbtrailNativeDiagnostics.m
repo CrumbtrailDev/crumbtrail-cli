@@ -10,22 +10,32 @@ static NSUInteger const CTNativeDiagnosticsMaxText = 8192;
 static NSTimeInterval const CTNativeDiagnosticsHangThreshold = 5.0;
 
 @class CrumbtrailNativeDiagnostics;
-static __weak CrumbtrailNativeDiagnostics *CTActiveNativeDiagnostics;
+static NSHashTable<CrumbtrailNativeDiagnostics *> *CTActiveNativeDiagnostics;
 static NSUncaughtExceptionHandler *CTPreviousExceptionHandler;
+static NSLock *CTExceptionHandlerLock;
+static NSLock *CTPendingEventsLock;
 
 @interface CrumbtrailNativeDiagnostics : NSObject <RCTBridgeModule> {
   dispatch_source_t _watchdog;
   uint64_t _lastHeartbeat;
   BOOL _watchdogPending;
-  NSUncaughtExceptionHandler *_previousExceptionHandler;
+  BOOL _enabled;
+  BOOL _collectorsStarted;
   NSMutableArray *_observerTokens;
 }
 - (void)appendPendingKind:(NSString *)kind data:(NSDictionary *)data;
+- (void)startCollectors;
+- (void)stopCollectors:(BOOL)clearPending;
 @end
 
 static void CTNativeDiagnosticsUncaughtException(NSException *exception) {
-  CrumbtrailNativeDiagnostics *module = CTActiveNativeDiagnostics;
-  if (module) {
+  NSArray<CrumbtrailNativeDiagnostics *> *modules;
+  NSUncaughtExceptionHandler *previous;
+  [CTExceptionHandlerLock lock];
+  modules = CTActiveNativeDiagnostics.allObjects;
+  previous = CTPreviousExceptionHandler;
+  [CTExceptionHandlerLock unlock];
+  for (CrumbtrailNativeDiagnostics *module in modules) {
     [module appendPendingKind:@"native-crash" data:@{
       @"msg": exception.reason ?: exception.name ?: @"uncaught exception",
       @"stk": [[exception callStackSymbols] componentsJoinedByString:@"\n"],
@@ -33,7 +43,30 @@ static void CTNativeDiagnosticsUncaughtException(NSException *exception) {
       @"source": @"previous-launch",
     }];
   }
-  if (CTPreviousExceptionHandler) CTPreviousExceptionHandler(exception);
+  if (previous) previous(exception);
+}
+
+static void CTRegisterNativeDiagnostics(CrumbtrailNativeDiagnostics *module) {
+  [CTExceptionHandlerLock lock];
+  if (CTActiveNativeDiagnostics.count == 0 ||
+      NSGetUncaughtExceptionHandler() != CTNativeDiagnosticsUncaughtException) {
+    CTPreviousExceptionHandler = NSGetUncaughtExceptionHandler();
+    NSSetUncaughtExceptionHandler(CTNativeDiagnosticsUncaughtException);
+  }
+  [CTActiveNativeDiagnostics addObject:module];
+  [CTExceptionHandlerLock unlock];
+}
+
+static void CTUnregisterNativeDiagnostics(CrumbtrailNativeDiagnostics *module) {
+  [CTExceptionHandlerLock lock];
+  [CTActiveNativeDiagnostics removeObject:module];
+  if (CTActiveNativeDiagnostics.count == 0) {
+    if (NSGetUncaughtExceptionHandler() == CTNativeDiagnosticsUncaughtException) {
+      NSSetUncaughtExceptionHandler(CTPreviousExceptionHandler);
+    }
+    CTPreviousExceptionHandler = NULL;
+  }
+  [CTExceptionHandlerLock unlock];
 }
 
 @implementation CrumbtrailNativeDiagnostics
@@ -48,9 +81,12 @@ RCT_EXPORT_MODULE(CrumbtrailNativeDiagnostics)
   self = [super init];
   if (!self) return nil;
   _observerTokens = [NSMutableArray array];
-  [self installCrashHandler];
-  [self installLifecycleCollector];
-  [self startWatchdog];
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    CTActiveNativeDiagnostics = [NSHashTable weakObjectsHashTable];
+    CTExceptionHandlerLock = [NSLock new];
+    CTPendingEventsLock = [NSLock new];
+  });
   return self;
 }
 
@@ -64,12 +100,15 @@ RCT_EXPORT_METHOD(getCapabilities:(RCTPromiseResolveBlock)resolve
   });
 }
 
+RCT_EXPORT_METHOD(setEnabled:(BOOL)enabled) {
+  if (enabled) [self startCollectors];
+  else [self stopCollectors:YES];
+}
+
 RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject) {
   @try {
-    NSUserDefaults *defaults = [self defaults];
-    NSArray *events = [defaults arrayForKey:CTNativeDiagnosticsPendingKey] ?: @[];
-    [defaults removeObjectForKey:CTNativeDiagnosticsPendingKey];
+    NSArray *events = [self pendingEventsAndClear];
     NSMutableArray *result = [NSMutableArray arrayWithCapacity:events.count];
     for (id value in events) {
       if (![value isKindOfClass:[NSDictionary class]]) continue;
@@ -87,18 +126,41 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
 }
 
 - (NSDictionary<NSString *, NSNumber *> *)capability {
-  return @{ @"supported": @YES, @"enabled": @YES, @"observed": @NO };
+  return @{ @"supported": @YES, @"enabled": @(_enabled), @"observed": @NO };
 }
 
 - (NSUserDefaults *)defaults {
   return [[NSUserDefaults alloc] initWithSuiteName:CTNativeDiagnosticsSuite] ?: [NSUserDefaults standardUserDefaults];
 }
 
-- (void)installCrashHandler {
-  _previousExceptionHandler = NSGetUncaughtExceptionHandler();
-  CTPreviousExceptionHandler = _previousExceptionHandler;
-  CTActiveNativeDiagnostics = self;
-  NSSetUncaughtExceptionHandler(CTNativeDiagnosticsUncaughtException);
+- (void)startCollectors {
+  if (_collectorsStarted) return;
+  _enabled = YES;
+  _collectorsStarted = YES;
+  CTRegisterNativeDiagnostics(self);
+  [self installLifecycleCollector];
+  [self startWatchdog];
+}
+
+- (void)stopCollectors:(BOOL)clearPending {
+  _enabled = NO;
+  if (_watchdog) {
+    dispatch_source_cancel(_watchdog);
+    _watchdog = nil;
+  }
+  for (id token in _observerTokens) {
+    [[NSNotificationCenter defaultCenter] removeObserver:token];
+  }
+  [_observerTokens removeAllObjects];
+  if (_collectorsStarted) CTUnregisterNativeDiagnostics(self);
+  _collectorsStarted = NO;
+  _watchdogPending = NO;
+  if (clearPending) {
+    [CTPendingEventsLock lock];
+    NSUserDefaults *defaults = [self defaults];
+    [defaults removeObjectForKey:CTNativeDiagnosticsPendingKey];
+    [CTPendingEventsLock unlock];
+  }
 }
 
 - (void)installLifecycleCollector {
@@ -133,6 +195,7 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
   dispatch_source_set_event_handler(_watchdog, ^{
     CrumbtrailNativeDiagnostics *strongSelf = weakSelf;
     if (!strongSelf) return;
+    if (!strongSelf->_enabled) return;
     uint64_t now = mach_absolute_time();
     mach_timebase_info_data_t info;
     mach_timebase_info(&info);
@@ -162,7 +225,11 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
 }
 
 - (void)appendPendingKind:(NSString *)kind data:(NSDictionary *)data {
+  [CTPendingEventsLock lock];
   @try {
+    if (!_enabled) {
+      return;
+    }
     NSUserDefaults *defaults = [self defaults];
     NSMutableArray *events = [[defaults arrayForKey:CTNativeDiagnosticsPendingKey] mutableCopy] ?: [NSMutableArray array];
     while (events.count >= CTNativeDiagnosticsMaxEvents) [events removeObjectAtIndex:0];
@@ -171,6 +238,21 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
     [defaults synchronize];
   } @catch (__unused NSException *exception) {
     // A diagnostics write is best effort and never a host failure.
+  } @finally {
+    [CTPendingEventsLock unlock];
+  }
+}
+
+- (NSArray *)pendingEventsAndClear {
+  [CTPendingEventsLock lock];
+  @try {
+    if (!_enabled) return @[];
+    NSUserDefaults *defaults = [self defaults];
+    NSArray *events = [defaults arrayForKey:CTNativeDiagnosticsPendingKey] ?: @[];
+    [defaults removeObjectForKey:CTNativeDiagnosticsPendingKey];
+    return events;
+  } @finally {
+    [CTPendingEventsLock unlock];
   }
 }
 
@@ -190,17 +272,7 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
 }
 
 - (void)dealloc {
-  if (_watchdog) dispatch_source_cancel(_watchdog);
-  for (id token in _observerTokens) {
-    [[NSNotificationCenter defaultCenter] removeObserver:token];
-  }
-  if (CTActiveNativeDiagnostics == self) {
-    if (NSGetUncaughtExceptionHandler() == CTNativeDiagnosticsUncaughtException) {
-      NSSetUncaughtExceptionHandler(_previousExceptionHandler);
-    }
-    CTActiveNativeDiagnostics = nil;
-    CTPreviousExceptionHandler = nil;
-  }
+  [self stopCollectors:NO];
 }
 
 @end

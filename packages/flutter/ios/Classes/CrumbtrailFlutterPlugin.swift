@@ -2,6 +2,42 @@ import Flutter
 import Foundation
 import UIKit
 
+private func crumbtrailFlutterUncaughtExceptionHandler(_ exception: NSException?) {
+    guard let exception else { return }
+    CrumbtrailFlutterExceptionRegistry.shared.handle(exception)
+}
+
+private final class CrumbtrailFlutterExceptionRegistry {
+    static let shared = CrumbtrailFlutterExceptionRegistry()
+
+    private let lock = NSLock()
+    private let plugins = NSHashTable<CrumbtrailFlutterPlugin>.weakObjects()
+
+    func add(_ plugin: CrumbtrailFlutterPlugin) {
+        lock.lock()
+        defer { lock.unlock() }
+        if plugins.allObjects.isEmpty || crumbtrailFlutterExceptionBridgeInstalled() == 0 {
+            crumbtrailFlutterInstallExceptionBridge(crumbtrailFlutterUncaughtExceptionHandler)
+        }
+        plugins.add(plugin)
+    }
+
+    func remove(_ plugin: CrumbtrailFlutterPlugin) {
+        lock.lock()
+        defer { lock.unlock() }
+        plugins.remove(plugin)
+        guard plugins.allObjects.isEmpty else { return }
+        crumbtrailFlutterRemoveExceptionBridge()
+    }
+
+    func handle(_ exception: NSException) {
+        lock.lock()
+        let active = plugins.allObjects
+        lock.unlock()
+        for plugin in active { plugin.recordUncaughtException(exception) }
+    }
+}
+
 /// Optional iOS half of the Flutter diagnostics channel.
 ///
 /// The plugin stores only bounded local evidence. Dart owns the Crumbtrail
@@ -20,10 +56,8 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     private var watchdogTimer: DispatchSourceTimer?
     private var lastHeartbeat = DispatchTime.now().uptimeNanoseconds
     private var watchdogPending = false
-    private var previousExceptionHandler: (@convention(c) (NSException) -> Void)?
-
-    private static weak var activePlugin: CrumbtrailFlutterPlugin?
-    private static var activeExceptionHandler: (@convention(c) (NSException) -> Void)?
+    private var enabled = false
+    private var collectorsStarted = false
 
     override public init() {
         defaults = UserDefaults(suiteName: Self.preferencesSuite) ?? .standard
@@ -37,13 +71,15 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
             binaryMessenger: registrar.messenger()
         )
         registrar.addMethodCallDelegate(instance, channel: channel)
-        instance.installCollectors()
     }
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "getCapabilities":
             result(capabilities())
+        case "setEnabled":
+            setEnabled((call.arguments as? Bool) == true)
+            result(nil)
         case "drainDiagnostics":
             result(drainDiagnostics())
         default:
@@ -61,26 +97,18 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func capability() -> [String: Bool] {
-        ["supported": true, "enabled": true, "observed": false]
+        ["supported": true, "enabled": enabled, "observed": false]
     }
 
-    private func installCollectors() {
-        Self.activePlugin = self
-        Self.activeExceptionHandler = { exception in
-            guard let plugin = Self.activePlugin else { return }
-            plugin.appendPending(
-                kind: "native-crash",
-                data: [
-                    "msg": plugin.bounded(exception.reason ?? exception.name.rawValue),
-                    "stk": plugin.bounded(exception.callStackSymbols.joined(separator: "\n")),
-                    "signal": plugin.bounded(exception.name.rawValue),
-                    "source": "previous-launch",
-                ]
-            )
-            plugin.previousExceptionHandler?(exception)
-        }
-        previousExceptionHandler = NSGetUncaughtExceptionHandler()
-        NSSetUncaughtExceptionHandler(Self.activeExceptionHandler)
+    private func setEnabled(_ value: Bool) {
+        if value { startCollectors() } else { stopCollectors(clearPending: true) }
+    }
+
+    private func startCollectors() {
+        guard !collectorsStarted else { return }
+        enabled = true
+        collectorsStarted = true
+        CrumbtrailFlutterExceptionRegistry.shared.add(self)
 
         let center = NotificationCenter.default
         let notifications: [(Notification.Name, String)] = [
@@ -103,6 +131,34 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         startWatchdog()
     }
 
+    private func stopCollectors(clearPending: Bool) {
+        enabled = false
+        watchdogTimer?.cancel()
+        watchdogTimer = nil
+        for token in observerTokens { NotificationCenter.default.removeObserver(token) }
+        observerTokens.removeAll()
+        if collectorsStarted { CrumbtrailFlutterExceptionRegistry.shared.remove(self) }
+        collectorsStarted = false
+        watchdogPending = false
+        if clearPending {
+            Self.pendingEventsLock.lock()
+            defaults.removeObject(forKey: Self.pendingKey)
+            Self.pendingEventsLock.unlock()
+        }
+    }
+
+    fileprivate func recordUncaughtException(_ exception: NSException) {
+        appendPending(
+            kind: "native-crash",
+            data: [
+                "msg": bounded(exception.reason ?? exception.name.rawValue),
+                "stk": bounded(exception.callStackSymbols.joined(separator: "\n")),
+                "signal": bounded(exception.name.rawValue),
+                "source": "previous-launch",
+            ]
+        )
+    }
+
     private func startWatchdog() {
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(
@@ -111,6 +167,7 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         )
         timer.setEventHandler { [weak self] in
             guard let self else { return }
+            guard self.enabled else { return }
             let now = DispatchTime.now().uptimeNanoseconds
             let elapsed = Int64((now - self.lastHeartbeat) / 1_000_000)
             if elapsed > Self.hangThresholdMilliseconds,
@@ -145,7 +202,9 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func drainDiagnostics() -> [[String: Any]] {
-        guard let raw = defaults.array(forKey: Self.pendingKey) else { return [] }
+        Self.pendingEventsLock.lock()
+        defer { Self.pendingEventsLock.unlock() }
+        guard enabled, let raw = defaults.array(forKey: Self.pendingKey) else { return [] }
         defaults.removeObject(forKey: Self.pendingKey)
         return raw.compactMap { value in
             guard let item = value as? [String: Any],
@@ -156,6 +215,9 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func appendPending(kind: String, data: [String: Any]) {
+        Self.pendingEventsLock.lock()
+        defer { Self.pendingEventsLock.unlock() }
+        guard enabled else { return }
         var events = (defaults.array(forKey: Self.pendingKey) as? [[String: Any]]) ?? []
         while events.count >= Self.maxPendingEvents { events.removeFirst() }
         events.append(["kind": kind, "data": data.reduce(into: [String: Any]()) { result, item in
@@ -174,12 +236,8 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     deinit {
-        watchdogTimer?.cancel()
-        for token in observerTokens { NotificationCenter.default.removeObserver(token) }
-        if Self.activePlugin === self {
-            NSSetUncaughtExceptionHandler(previousExceptionHandler)
-            Self.activePlugin = nil
-            Self.activeExceptionHandler = nil
-        }
+        stopCollectors(clearPending: false)
     }
+
+    private static let pendingEventsLock = NSLock()
 }

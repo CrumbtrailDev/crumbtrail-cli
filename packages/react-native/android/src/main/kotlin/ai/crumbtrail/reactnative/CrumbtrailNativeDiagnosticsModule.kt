@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Debug
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -35,18 +36,13 @@ class CrumbtrailNativeDiagnosticsModule(
         Thread(it, "crumbtrail-react-native-watchdog").apply { isDaemon = true }
     }
     private var watchdogTask: ScheduledFuture<*>? = null
-    @Volatile private var lastHeartbeat = System.currentTimeMillis()
+    @Volatile private var lastHeartbeat = SystemClock.elapsedRealtime()
     @Volatile private var watchdogPending = false
+    @Volatile private var enabled = false
+    private var collectorsStarted = false
     private var previousHandler: Thread.UncaughtExceptionHandler? = null
     private var installedHandler: Thread.UncaughtExceptionHandler? = null
     private var activityCallbacks: Application.ActivityLifecycleCallbacks? = null
-
-    init {
-        installCrashHandler()
-        installLifecycleCollector()
-        collectPreviousProcessExit()
-        startWatchdog()
-    }
 
     override fun getName(): String = MODULE_NAME
 
@@ -56,39 +52,81 @@ class CrumbtrailNativeDiagnosticsModule(
     }
 
     @ReactMethod
+    fun setEnabled(value: Boolean) {
+        if (value) startCollectors() else stopCollectors(clearPending = true)
+    }
+
+    @ReactMethod
     fun drainDiagnostics(promise: Promise) {
         try {
-            val raw = preferences.getString(PENDING_KEY, null) ?: run {
-                promise.resolve(Arguments.createArray())
-                return
-            }
-            preferences.edit().remove(PENDING_KEY).commit()
-            val output = Arguments.createArray()
-            val events = JSONArray(raw)
-            for (index in 0 until events.length()) {
-                val item = events.optJSONObject(index) ?: continue
-                val data = item.optJSONObject("data") ?: continue
-                val map = Arguments.createMap()
-                map.putString("kind", item.optString("kind"))
-                val dataMap = Arguments.createMap()
-                data.keys().forEach { key ->
-                    val value = data.opt(key)
-                    when (value) {
-                        is String -> dataMap.putString(key, value)
-                        is Boolean -> dataMap.putBoolean(key, value)
-                        is Int -> dataMap.putInt(key, value)
-                        is Long -> dataMap.putDouble(key, value.toDouble())
-                        is Double -> dataMap.putDouble(key, value)
-                        is Float -> dataMap.putDouble(key, value.toDouble())
-                    }
-                }
-                map.putMap("data", dataMap)
-                output.pushMap(map)
-            }
-            promise.resolve(output)
+            promise.resolve(drainPending())
         } catch (_: Exception) {
             promise.resolve(Arguments.createArray())
         }
+    }
+
+    private fun startCollectors() {
+        synchronized(PENDING_LOCK) {
+            if (collectorsStarted) return
+            enabled = true
+            collectorsStarted = true
+        }
+        installCrashHandler()
+        installLifecycleCollector()
+        collectPreviousProcessExit()
+        startWatchdog()
+    }
+
+    private fun stopCollectors(clearPending: Boolean) {
+        enabled = false
+        watchdogTask?.cancel(true)
+        watchdogTask = null
+        activityCallbacks?.let { application?.unregisterActivityLifecycleCallbacks(it) }
+        activityCallbacks = null
+        if (installedHandler != null && Thread.getDefaultUncaughtExceptionHandler() === installedHandler) {
+            Thread.setDefaultUncaughtExceptionHandler(previousHandler)
+        }
+        installedHandler = null
+        previousHandler = null
+        synchronized(PENDING_LOCK) {
+            collectorsStarted = false
+            watchdogPending = false
+            if (clearPending) {
+                preferences.edit()
+                    .remove(PENDING_KEY)
+                    .remove(LAST_PROCESS_EXIT_TIMESTAMP_KEY)
+                    .commit()
+            }
+        }
+    }
+
+    private fun drainPending(): WritableArray = synchronized(PENDING_LOCK) {
+        val output = Arguments.createArray()
+        if (!enabled) return@synchronized output
+        val raw = preferences.getString(PENDING_KEY, null) ?: return@synchronized output
+        val events = runCatching { JSONArray(raw) }.getOrNull() ?: return@synchronized output
+        for (index in 0 until events.length()) {
+            val item = events.optJSONObject(index) ?: continue
+            val data = item.optJSONObject("data") ?: continue
+            val map = Arguments.createMap()
+            map.putString("kind", item.optString("kind"))
+            val dataMap = Arguments.createMap()
+            data.keys().forEach { key ->
+                val value = data.opt(key)
+                when (value) {
+                    is String -> dataMap.putString(key, value)
+                    is Boolean -> dataMap.putBoolean(key, value)
+                    is Int -> dataMap.putInt(key, value)
+                    is Long -> dataMap.putDouble(key, value.toDouble())
+                    is Double -> dataMap.putDouble(key, value)
+                    is Float -> dataMap.putDouble(key, value.toDouble())
+                }
+            }
+            map.putMap("data", dataMap)
+            output.pushMap(map)
+        }
+        preferences.edit().remove(PENDING_KEY).commit()
+        output
     }
 
     private fun capabilities(): Map<String, Any> = mapOf(
@@ -100,13 +138,14 @@ class CrumbtrailNativeDiagnosticsModule(
 
     private fun capability(): Map<String, Boolean> = mapOf(
         "supported" to true,
-        "enabled" to true,
+        "enabled" to enabled,
         "observed" to false,
     )
 
     private fun installCrashHandler() {
         previousHandler = Thread.getDefaultUncaughtExceptionHandler()
         val handler = Thread.UncaughtExceptionHandler { thread, throwable ->
+            if (!enabled) return@UncaughtExceptionHandler
             appendPending("native-crash", mapOf(
                 "msg" to bounded(throwable.message ?: throwable.toString()),
                 "stk" to bounded(throwable.stackTraceToString()),
@@ -143,51 +182,61 @@ class CrumbtrailNativeDiagnosticsModule(
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val manager = reactContext.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager ?: return
         runCatching {
-            val prefs = preferences
-            val lastSeen = prefs.getLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, 0L)
-            var newest = lastSeen
-            manager.getHistoricalProcessExitReasons(reactContext.packageName, 0, 4)
-                .filter { it.timestamp > lastSeen }
-                .forEach { info ->
-                    newest = maxOf(newest, info.timestamp)
-                    val reason = info.reason
-                    when (reason) {
-                        android.app.ApplicationExitInfo.REASON_ANR -> appendPending(
-                            "native-hang",
-                            mapOf(
-                                "source" to "main-thread",
-                                "thresholdMs" to HANG_THRESHOLD_MS,
-                                "observedDurationMs" to HANG_THRESHOLD_MS,
-                                "recovered" to false,
-                                "previousLaunch" to true,
-                                "at" to info.timestamp,
-                                "status" to info.status,
-                            ),
-                        )
-                        android.app.ApplicationExitInfo.REASON_CRASH,
-                        android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> appendPending(
-                            "native-crash",
-                            mapOf(
-                                "msg" to "previous process exited: ${processExitReason(reason)}",
-                                "signal" to processExitReason(reason),
-                                "source" to "previous-launch",
-                                "at" to info.timestamp,
-                                "status" to info.status,
-                            ),
-                        )
-                        else -> appendPending("app-lifecycle", mapOf(
-                            "state" to "process-exit",
-                            "kind" to processExitReason(reason),
-                            "source" to "application-exit-info",
-                            "at" to info.timestamp,
-                            "status" to info.status,
-                        ))
+            synchronized(PENDING_LOCK) {
+                if (!enabled) return@synchronized
+                val lastSeen = preferences.getLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, 0L)
+                var newest = lastSeen
+                val pending = JSONArray(preferences.getString(PENDING_KEY, "[]"))
+                manager.getHistoricalProcessExitReasons(reactContext.packageName, 0, 4)
+                    .filter { it.timestamp > lastSeen }
+                    .forEach { info ->
+                        newest = maxOf(newest, info.timestamp)
+                        appendProcessExit(pending, info)
                     }
+                if (newest > lastSeen) {
+                    val committed = preferences.edit()
+                        .putString(PENDING_KEY, pending.toString())
+                        .putLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, newest)
+                        .commit()
+                    if (!committed) return@synchronized
                 }
-            if (newest > lastSeen) {
-                prefs.edit().putLong(LAST_PROCESS_EXIT_TIMESTAMP_KEY, newest).commit()
             }
         }
+    }
+
+    private fun appendProcessExit(
+        pending: JSONArray,
+        info: android.app.ApplicationExitInfo,
+    ) {
+        val reason = info.reason
+        val (kind, data) = when (reason) {
+            android.app.ApplicationExitInfo.REASON_ANR -> "native-hang" to mapOf(
+                "source" to "main-thread",
+                "thresholdMs" to HANG_THRESHOLD_MS,
+                "observedDurationMs" to HANG_THRESHOLD_MS,
+                "recovered" to false,
+                "previousLaunch" to true,
+                "at" to info.timestamp,
+                "status" to info.status,
+            )
+            android.app.ApplicationExitInfo.REASON_CRASH,
+            android.app.ApplicationExitInfo.REASON_CRASH_NATIVE -> "native-crash" to mapOf(
+                "msg" to "previous process exited: ${processExitReason(reason)}",
+                "signal" to processExitReason(reason),
+                "source" to "previous-launch",
+                "at" to info.timestamp,
+                "status" to info.status,
+            )
+            else -> "app-lifecycle" to mapOf(
+                "state" to "process-exit",
+                "kind" to processExitReason(reason),
+                "source" to "application-exit-info",
+                "at" to info.timestamp,
+                "status" to info.status,
+            )
+        }
+        while (pending.length() >= MAX_PENDING_EVENTS) pending.remove(0)
+        pending.put(JSONObject().put("kind", kind).put("data", JSONObject(data)))
     }
 
     private fun processExitReason(reason: Int): String = when (reason) {
@@ -204,7 +253,7 @@ class CrumbtrailNativeDiagnosticsModule(
 
     private fun startWatchdog() {
         watchdogTask = executor.scheduleAtFixedRate({
-            val now = System.currentTimeMillis()
+            val now = SystemClock.elapsedRealtime()
             if (now - lastHeartbeat > HANG_THRESHOLD_MS &&
                 !watchdogPending &&
                 !Debug.isDebuggerConnected()
@@ -218,35 +267,33 @@ class CrumbtrailNativeDiagnosticsModule(
                     "previousLaunch" to false,
                 ))
             }
-            runCatching { mainHandler.post { lastHeartbeat = System.currentTimeMillis() } }
+            runCatching { mainHandler.post { lastHeartbeat = SystemClock.elapsedRealtime() } }
         }, CHECK_INTERVAL_MS, CHECK_INTERVAL_MS, TimeUnit.MILLISECONDS)
     }
 
     private fun appendPending(kind: String, data: Map<String, Any?>) {
         runCatching {
-            val current = JSONArray(preferences.getString(PENDING_KEY, "[]"))
-            while (current.length() >= MAX_PENDING_EVENTS) current.remove(0)
-            current.put(JSONObject().put("kind", kind).put("data", JSONObject(data)))
-            preferences.edit().putString(PENDING_KEY, current.toString()).commit()
+            synchronized(PENDING_LOCK) {
+                if (!enabled) return@synchronized
+                val current = JSONArray(preferences.getString(PENDING_KEY, "[]"))
+                while (current.length() >= MAX_PENDING_EVENTS) current.remove(0)
+                current.put(JSONObject().put("kind", kind).put("data", JSONObject(data)))
+                preferences.edit().putString(PENDING_KEY, current.toString()).commit()
+            }
         }
     }
 
     private fun bounded(value: String): String = value.take(MAX_TEXT)
 
     override fun onCatalystInstanceDestroy() {
-        watchdogTask?.cancel(true)
+        stopCollectors(clearPending = false)
         executor.shutdownNow()
-        activityCallbacks?.let { application?.unregisterActivityLifecycleCallbacks(it) }
-        activityCallbacks = null
-        if (installedHandler != null && Thread.getDefaultUncaughtExceptionHandler() === installedHandler) {
-            Thread.setDefaultUncaughtExceptionHandler(previousHandler)
-        }
-        installedHandler = null
         super.onCatalystInstanceDestroy()
     }
 
     companion object {
         const val MODULE_NAME = "CrumbtrailNativeDiagnostics"
+        private val PENDING_LOCK = Any()
         private const val PREFERENCES = "ai.crumbtrail.react-native"
         private const val PENDING_KEY = "native-diagnostics"
         private const val LAST_PROCESS_EXIT_TIMESTAMP_KEY = "native-diagnostics.last-process-exit"
