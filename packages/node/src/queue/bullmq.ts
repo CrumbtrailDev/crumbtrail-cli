@@ -50,6 +50,11 @@ export interface BullMqContextOptions {
   readonly token?: CrumbtrailContextToken;
   /** Clock seam used for token validation and capture. */
   readonly now?: number | (() => number);
+  /** Capture failures are reported without changing queue or worker semantics. */
+  readonly onCaptureLoss?: (
+    error: unknown,
+    phase: "context" | "collision",
+  ) => void;
 }
 
 export interface BullMqProducerOptions extends BullMqContextOptions {
@@ -63,6 +68,9 @@ export interface BullMqProcessorOptions extends BullMqContextOptions {
   /** Additional options passed to the generic job session. */
   readonly job?: Omit<CrumbtrailJobOptions, "name" | "queue" | "jobId" | "attempt" | "context">;
 }
+
+/** Marker that lets the processor distinguish its carrier from user data. */
+export const BULLMQ_CONTEXT_ENVELOPE_FIELD = "__crumbtrailEnvelope";
 
 export type BullMqProcessorHandler<
   TJob extends BullMqJobLike = BullMqJobLike,
@@ -86,13 +94,42 @@ export function injectBullMqContext<TData>(
   data: TData,
   token: CrumbtrailContextToken | undefined,
   now: number | (() => number) = Date.now,
+  onCaptureLoss?: BullMqContextOptions["onCaptureLoss"],
 ): TData {
   const cloned = clonePayload(data);
   if (!token) return cloned;
   const validated = validateCrumbtrailContextToken(token, now);
-  if (!validated || !isPlainRecord(cloned)) return cloned;
+  if (!validated) {
+    reportCaptureLoss(
+      { onCaptureLoss },
+      "context",
+      "BullMQ context token was invalid or expired",
+    );
+    return cloned;
+  }
+  if (!isPlainRecord(cloned)) {
+    reportCaptureLoss(
+      { onCaptureLoss },
+      "context",
+      "BullMQ context requires a record payload",
+    );
+    return cloned;
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(cloned, "__crumbtrail") ||
+    Object.prototype.hasOwnProperty.call(cloned, "__crumbtrailPayload") ||
+    Object.prototype.hasOwnProperty.call(cloned, BULLMQ_CONTEXT_ENVELOPE_FIELD)
+  ) {
+    reportCaptureLoss(
+      { onCaptureLoss },
+      "collision",
+      "BullMQ data already contains a reserved Crumbtrail field",
+    );
+    return cloned;
+  }
   const carrier: Record<string, unknown> = cloned;
   injectCrumbtrailContext(carrier, validated);
+  carrier[BULLMQ_CONTEXT_ENVELOPE_FIELD] = 1;
   return carrier as TData;
 }
 
@@ -101,6 +138,7 @@ export function extractBullMqContext(
   data: unknown,
   now: number | (() => number) = Date.now,
 ): CrumbtrailContextToken | undefined {
+  if (!isBullMqEnvelope(data)) return undefined;
   const extracted = extractCrumbtrailContext(data);
   return extracted
     ? validateCrumbtrailContextToken(extracted, now)
@@ -117,6 +155,7 @@ export function stripBullMqContext<TData>(
   const token = extractBullMqContext(cloned, now);
   if (!token) return cloned;
   delete cloned.__crumbtrail;
+  delete cloned[BULLMQ_CONTEXT_ENVELOPE_FIELD];
   return cloned as TData;
 }
 
@@ -150,7 +189,12 @@ export function withCrumbtrailBullMqProducer<TQueue extends BullMqQueueLike>(
         ): unknown {
           const [name, data, jobOptions] = args;
           const token = resolveToken(options);
-          const nextData = injectBullMqContext(data, token, options.now);
+          const nextData = injectBullMqContext(
+            data,
+            token,
+            options.now,
+            options.onCaptureLoss,
+          );
           return Reflect.apply(add, this === undefined ? target : this, [
             name,
             nextData,
@@ -168,7 +212,14 @@ export function withCrumbtrailBullMqProducer<TQueue extends BullMqQueueLike>(
           const [jobs, ...rest] = args;
           const token = resolveToken(options);
           const nextJobs = Array.isArray(jobs)
-            ? jobs.map((job) => cloneBullMqBulkJob(job, token, options.now))
+            ? jobs.map((job) =>
+                cloneBullMqBulkJob(
+                  job,
+                  token,
+                  options.now,
+                  options.onCaptureLoss,
+                ),
+              )
             : jobs;
           return Reflect.apply(
             addBulk,
@@ -251,11 +302,12 @@ function cloneBullMqBulkJob(
   job: unknown,
   token: CrumbtrailContextToken | undefined,
   now: number | (() => number) | undefined,
+  onCaptureLoss?: BullMqContextOptions["onCaptureLoss"],
 ): unknown {
   if (!isObject(job) || Array.isArray(job)) return clonePayload(job);
   const cloned = clonePayload(job) as Record<string, unknown>;
   if ("data" in cloned)
-    cloned.data = injectBullMqContext(cloned.data, token, now);
+    cloned.data = injectBullMqContext(cloned.data, token, now, onCaptureLoss);
   return cloned;
 }
 
@@ -285,6 +337,13 @@ function resolveToken(
   const validated = candidate
     ? validateCrumbtrailContextToken(candidate, at)
     : captureToken({ now: at });
+  if (candidate && !validated) {
+    reportCaptureLoss(
+      options,
+      "context",
+      "BullMQ context token was invalid or expired",
+    );
+  }
   if (!validated) return undefined;
   return Object.freeze({
     ...validated,
@@ -294,6 +353,26 @@ function resolveToken(
       at + DEFAULT_CONTEXT_TOKEN_TTL_MS,
     ),
   });
+}
+
+function isBullMqEnvelope(value: unknown): value is Record<string, unknown> {
+  return (
+    isPlainRecord(value) &&
+    value[BULLMQ_CONTEXT_ENVELOPE_FIELD] === 1 &&
+    Object.prototype.hasOwnProperty.call(value, "__crumbtrail")
+  );
+}
+
+function reportCaptureLoss(
+  options: Pick<BullMqContextOptions, "onCaptureLoss">,
+  phase: "context" | "collision",
+  message: string,
+): void {
+  try {
+    options.onCaptureLoss?.(new Error(message), phase);
+  } catch {
+    // Capture diagnostics must not replace queue semantics.
+  }
 }
 
 function safeText(value: unknown): string | undefined {

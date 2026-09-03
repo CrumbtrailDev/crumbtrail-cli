@@ -101,8 +101,10 @@ SQS and SNS use the `Crumbtrail.Context` message attribute, preserving message b
 fields, and existing attributes. EventBridge `putEvents` uses a namespaced field in each JSON
 `Detail`. Scheduler `createSchedule` and `updateSchedule` use the same field in `Target.Input`
 only for `at(...)` one shot schedules. Recurring `rate(...)` and `cron(...)` schedules never
-carry a request token. Carriers are bounded to 2,048 characters and malformed or expired
-tokens are ignored.
+carry a request token. The SQS and SNS context attribute is bounded to 2,048 characters.
+EventBridge entries and Scheduler inputs keep application JSON intact and add only the bounded
+context carrier. Entries and inputs are checked against their 256 KiB service limit, and
+EventBridge batches are checked against the 1 MiB request limit.
 
 The processor wrappers are `withCrumbtrailAwsSqsProcessor`,
 `withCrumbtrailAwsSqsBatchProcessor`, `withCrumbtrailAwsSnsProcessor`,
@@ -110,7 +112,9 @@ The processor wrappers are `withCrumbtrailAwsSqsProcessor`,
 batch wrapper returns only failed message ids in `batchItemFailures`, and maps
 `ApproximateReceiveCount` to the job attempt. Processor wrappers strip Crumbtrail metadata before
 the application handler runs and preserve handler results and errors through
-`withCrumbtrailJob`.
+`withCrumbtrailJob`. If a reserved application field is already present or context cannot fit
+within a service limit, the adapter leaves the payload unchanged and calls `onCaptureLoss` when
+configured.
 
 The adapters do not monkey patch queue libraries, discover workers automatically, change an
 SQS or SNS body, convert AWS X Ray headers into W3C context, or capture recurring schedule

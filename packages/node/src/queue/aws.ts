@@ -16,12 +16,27 @@ export const AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE = "Crumbtrail.Context";
 export const AWS_CRUMBTRAIL_CONTEXT_FIELD = "__crumbtrail";
 /** Internal envelope field for non-object EventBridge and Scheduler payloads. */
 export const AWS_CRUMBTRAIL_PAYLOAD_FIELD = "__crumbtrailPayload";
+/** Marker that distinguishes an adapter envelope from user fields. */
+export const AWS_CRUMBTRAIL_ENVELOPE_FIELD = "__crumbtrailEnvelope";
 export const MAX_AWS_CONTEXT_VALUE_LENGTH = 2_048;
+/** EventBridge limits one PutEvents entry to 256 KiB. */
+export const MAX_AWS_EVENTBRIDGE_ENTRY_BYTES = 256 * 1024;
+/** EventBridge limits one PutEvents request to 1 MiB. */
+export const MAX_AWS_EVENTBRIDGE_REQUEST_BYTES = 1024 * 1024;
+/** EventBridge Scheduler limits Target.Input to 256 KiB. */
+export const MAX_AWS_SCHEDULER_INPUT_BYTES = 256 * 1024;
+
+export type AwsCaptureLossPhase = "context" | "collision" | "size";
 
 export interface AwsContextOptions {
   readonly context?: CrumbtrailContextToken;
   readonly token?: CrumbtrailContextToken;
   readonly now?: number | (() => number);
+  /** Capture failures are reported without changing the host operation. */
+  readonly onCaptureLoss?: (
+    error: unknown,
+    phase: AwsCaptureLossPhase,
+  ) => void;
 }
 
 export interface AwsJobProcessorOptions extends AwsContextOptions {
@@ -200,7 +215,11 @@ export function injectCrumbtrailSqsMessage<T extends AwsSqsSendMessageInput>(
   if (!token) return cloneValue(input);
   return {
     ...cloneValue(input),
-    MessageAttributes: withContextAttribute(input.MessageAttributes, token),
+    MessageAttributes: withContextAttribute(
+      input.MessageAttributes,
+      token,
+      options,
+    ),
   } as T;
 }
 
@@ -216,7 +235,11 @@ export function injectCrumbtrailSqsBatch<T extends AwsSqsSendMessageBatchInput>(
     ...cloned,
     Entries: input.Entries.map((entry) => ({
       ...cloneValue(entry),
-      MessageAttributes: withContextAttribute(entry.MessageAttributes, token),
+      MessageAttributes: withContextAttribute(
+        entry.MessageAttributes,
+        token,
+        options,
+      ),
     })),
   } as T;
 }
@@ -230,7 +253,11 @@ export function injectCrumbtrailSnsMessage<T extends AwsSnsPublishInput>(
   if (!token) return cloneValue(input);
   return {
     ...cloneValue(input),
-    MessageAttributes: withContextAttribute(input.MessageAttributes, token),
+    MessageAttributes: withContextAttribute(
+      input.MessageAttributes,
+      token,
+      options,
+    ),
   } as T;
 }
 
@@ -240,8 +267,17 @@ export function injectCrumbtrailEventBridgeEntry<
 >(input: T, options: AwsContextOptions = {}): T {
   const token = resolveToken(options);
   if (!token || typeof input.Detail !== "string") return cloneValue(input);
-  const detail = injectJsonCarrier(input.Detail, token);
-  return { ...cloneValue(input), Detail: detail } as T;
+  const detail = injectJsonCarrier(input.Detail, token, options);
+  const candidate = { ...cloneValue(input), Detail: detail } as T;
+  if (eventBridgeEntryBytes(candidate) > MAX_AWS_EVENTBRIDGE_ENTRY_BYTES) {
+    reportCaptureLoss(
+      options,
+      "size",
+      "EventBridge entry exceeds the 256 KiB service limit with Crumbtrail context",
+    );
+    return cloneValue(input);
+  }
+  return candidate;
 }
 
 /**
@@ -257,11 +293,21 @@ export function injectCrumbtrailSchedulerInput<
   const token = oneShot ? resolveToken(options) : undefined;
   if (!token || !input.Target || typeof input.Target.Input !== "string")
     return cloneValue(input);
+  const carriedInput = injectJsonCarrier(input.Target.Input, token, options);
+  const inputBytes = utf8Bytes(carriedInput);
+  if (inputBytes > MAX_AWS_SCHEDULER_INPUT_BYTES) {
+    reportCaptureLoss(
+      options,
+      "size",
+      "Scheduler Target.Input exceeds the 256 KiB service limit with Crumbtrail context",
+    );
+    return cloneValue(input);
+  }
   return {
     ...cloneValue(input),
     Target: {
       ...cloneValue(input.Target),
-      Input: injectJsonCarrier(input.Target.Input, token),
+      Input: carriedInput,
     },
   } as T;
 }
@@ -409,9 +455,7 @@ export function withCrumbtrailAwsSqsBatchProcessor<
         : [],
     );
     return {
-      batchItemFailures: failures.length
-        ? failures
-        : [{ itemIdentifier: "" }],
+      batchItemFailures: failures,
     } as AwsSqsBatchResponse;
   };
 }
@@ -613,16 +657,27 @@ function wrapEventBridgePutEvents(
   const entries = input.Entries;
   const cloned = cloneValue(input);
   if (!token || !Array.isArray(entries)) return cloned;
+  const contextOptions = { ...options, context: token };
+  const carriedEntries = entries.map((entry) =>
+    entry && typeof entry === "object"
+      ? injectCrumbtrailEventBridgeEntry(
+          entry as AwsEventBridgeEntry,
+          contextOptions,
+        )
+      : entry,
+  );
+  const candidate = { ...cloned, Entries: carriedEntries };
+  if (jsonBytes(candidate) > MAX_AWS_EVENTBRIDGE_REQUEST_BYTES) {
+    reportCaptureLoss(
+      options,
+      "size",
+      "EventBridge request exceeds the 1 MiB service limit with Crumbtrail context",
+    );
+    return cloned;
+  }
   return {
     ...cloned,
-    Entries: entries.map((entry) =>
-      entry && typeof entry === "object"
-        ? injectCrumbtrailEventBridgeEntry(entry as AwsEventBridgeEntry, {
-            ...options,
-            context: token,
-          })
-        : entry,
-    ),
+    Entries: carriedEntries,
   };
 }
 
@@ -663,6 +718,13 @@ function resolveToken(
   const validated = explicit
     ? validateCrumbtrailContextToken(explicit, at)
     : captureToken({ now: at });
+  if (explicit && !validated) {
+    reportCaptureLoss(
+      options,
+      "context",
+      "AWS context token was invalid or expired",
+    );
+  }
   if (!validated) return undefined;
   const expiresAt = Math.min(
     validated.expiresAt ?? at + DEFAULT_CONTEXT_TOKEN_TTL_MS,
@@ -678,11 +740,28 @@ function resolveToken(
 function withContextAttribute(
   attributes: AwsMessageAttributes | undefined,
   token: CrumbtrailContextToken,
+  options: AwsContextOptions,
 ): AwsMessageAttributes {
   const value = JSON.stringify(token);
-  if (value.length > MAX_AWS_CONTEXT_VALUE_LENGTH) return { ...attributes };
+  if (value.length > MAX_AWS_CONTEXT_VALUE_LENGTH) {
+    reportCaptureLoss(
+      options,
+      "size",
+      "Crumbtrail AWS context attribute exceeds its 2 KiB carrier limit",
+    );
+    return cloneValue(attributes ?? {});
+  }
+  const next = cloneValue(attributes ?? {}) as AwsMessageAttributes;
+  for (const key of Object.keys(next)) {
+    if (
+      key !== AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE &&
+      key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase()
+    ) {
+      delete next[key];
+    }
+  }
   return {
-    ...(cloneValue(attributes ?? {}) as AwsMessageAttributes),
+    ...next,
     [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: {
       DataType: "String",
       StringValue: value,
@@ -695,11 +774,15 @@ function extractMessageAttribute(
   now: number | (() => number),
 ): CrumbtrailContextToken | undefined {
   if (!attributes) return undefined;
-  const attribute = Object.entries(attributes).find(
-    ([key]) =>
-      key === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE ||
-      key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase(),
-  )?.[1];
+  const attribute = Object.prototype.hasOwnProperty.call(
+    attributes,
+    AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE,
+  )
+    ? attributes[AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]
+    : Object.entries(attributes).find(
+        ([key]) =>
+          key.toLowerCase() === AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE.toLowerCase(),
+      )?.[1];
   const value =
     typeof attribute === "string"
       ? attribute
@@ -719,39 +802,51 @@ function extractMessageAttribute(
 function injectJsonCarrier(
   encoded: string,
   token: CrumbtrailContextToken,
+  options: AwsContextOptions,
 ): string {
   try {
     const parsed = JSON.parse(encoded) as unknown;
-    const carried = injectJsonValue(parsed, token);
-    const serialized = JSON.stringify(carried);
-    return serialized.length <= MAX_AWS_CONTEXT_VALUE_LENGTH
-      ? serialized
-      : encoded;
+    const carried = injectJsonValue(parsed, token, options);
+    if (carried === undefined) return encoded;
+    return JSON.stringify(carried);
   } catch {
     const carried = {
       [AWS_CRUMBTRAIL_CONTEXT_FIELD]: token,
       [AWS_CRUMBTRAIL_PAYLOAD_FIELD]: encoded,
+      [AWS_CRUMBTRAIL_ENVELOPE_FIELD]: 1,
     };
-    const serialized = JSON.stringify(carried);
-    return serialized.length <= MAX_AWS_CONTEXT_VALUE_LENGTH
-      ? serialized
-      : encoded;
+    return JSON.stringify(carried);
   }
 }
 
 function injectJsonValue(
   value: unknown,
   token: CrumbtrailContextToken,
-): unknown {
+  options: AwsContextOptions,
+): unknown | undefined {
   if (isPlainRecord(value)) {
+    if (
+      Object.prototype.hasOwnProperty.call(value, AWS_CRUMBTRAIL_CONTEXT_FIELD) ||
+      Object.prototype.hasOwnProperty.call(value, AWS_CRUMBTRAIL_PAYLOAD_FIELD) ||
+      Object.prototype.hasOwnProperty.call(value, AWS_CRUMBTRAIL_ENVELOPE_FIELD)
+    ) {
+      reportCaptureLoss(
+        options,
+        "collision",
+        "AWS detail or input already contains a reserved Crumbtrail field",
+      );
+      return undefined;
+    }
     return {
       ...cloneValue(value),
       [AWS_CRUMBTRAIL_CONTEXT_FIELD]: token,
+      [AWS_CRUMBTRAIL_ENVELOPE_FIELD]: 1,
     };
   }
   return {
     [AWS_CRUMBTRAIL_CONTEXT_FIELD]: token,
     [AWS_CRUMBTRAIL_PAYLOAD_FIELD]: value,
+    [AWS_CRUMBTRAIL_ENVELOPE_FIELD]: 1,
   };
 }
 
@@ -761,6 +856,7 @@ function extractJsonCarrier(
 ): CrumbtrailContextToken | undefined {
   const parsed = typeof value === "string" ? parseJson(value) : value;
   if (!isPlainRecord(parsed)) return undefined;
+  if (parsed[AWS_CRUMBTRAIL_ENVELOPE_FIELD] !== 1) return undefined;
   const candidate = parsed[AWS_CRUMBTRAIL_CONTEXT_FIELD];
   return validateCrumbtrailContextToken(candidate, now);
 }
@@ -773,6 +869,7 @@ function stripJsonCarrier<T>(value: T, now: number | (() => number)): T {
     return parsed[AWS_CRUMBTRAIL_PAYLOAD_FIELD] as T;
   const output = { ...cloneValue(parsed) } as Record<string, unknown>;
   delete output[AWS_CRUMBTRAIL_CONTEXT_FIELD];
+  delete output[AWS_CRUMBTRAIL_ENVELOPE_FIELD];
   return (typeof value === "string" ? JSON.stringify(output) : output) as T;
 }
 
@@ -803,6 +900,18 @@ function isOneShotSchedule(expression: string): boolean {
   return /^\s*at\s*\(/i.test(expression);
 }
 
+function eventBridgeEntryBytes(entry: AwsEventBridgeEntry): number {
+  try {
+    return utf8Bytes(JSON.stringify(entry));
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
 function receiveAttempt(value: string | undefined): number {
   const attempt = Number(value);
   return Number.isFinite(attempt) ? Math.max(1, Math.round(attempt)) : 1;
@@ -822,6 +931,18 @@ function stringValue(value: unknown): string | undefined {
     : undefined;
 }
 
+function reportCaptureLoss(
+  options: Pick<AwsContextOptions, "onCaptureLoss">,
+  phase: AwsCaptureLossPhase,
+  message: string,
+): void {
+  try {
+    options.onCaptureLoss?.(new Error(message), phase);
+  } catch {
+    // Capture diagnostics must not replace the host operation.
+  }
+}
+
 function readNow(now: number | (() => number) | undefined): number {
   try {
     const value = typeof now === "function" ? now() : (now ?? Date.now());
@@ -832,11 +953,19 @@ function readNow(now: number | (() => number) | undefined): number {
 }
 
 function parseJson(value: string): unknown {
-  if (value.length > MAX_AWS_CONTEXT_VALUE_LENGTH) return undefined;
+  if (utf8Bytes(value) > MAX_AWS_EVENTBRIDGE_ENTRY_BYTES) return undefined;
   try {
     return JSON.parse(value);
   } catch {
     return undefined;
+  }
+}
+
+function jsonBytes(value: unknown): number {
+  try {
+    return utf8Bytes(JSON.stringify(value));
+  } catch {
+    return Number.POSITIVE_INFINITY;
   }
 }
 

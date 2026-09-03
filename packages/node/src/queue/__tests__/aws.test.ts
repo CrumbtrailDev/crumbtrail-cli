@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE,
+  AWS_CRUMBTRAIL_ENVELOPE_FIELD,
   extractCrumbtrailEventBridgeContext,
   extractCrumbtrailSchedulerContext,
   extractCrumbtrailSnsRecord,
@@ -130,7 +131,11 @@ describe("AWS event carriers", () => {
     });
     const detail = JSON.parse(carried.Detail as string) as Record<string, unknown>;
     const event: AwsEventBridgeEvent = { id: "evt_1", source: "payments", detail };
-    expect(detail).toMatchObject({ paymentId: "pay_1", __crumbtrail: { v: 1 } });
+    expect(detail).toMatchObject({
+      paymentId: "pay_1",
+      __crumbtrail: { v: 1 },
+      [AWS_CRUMBTRAIL_ENVELOPE_FIELD]: 1,
+    });
     expect(extractCrumbtrailEventBridgeContext(event)).toMatchObject({
       sessionId: "session_parent",
     });
@@ -138,6 +143,66 @@ describe("AWS event carriers", () => {
       paymentId: "pay_1",
     });
     expect(entry.Detail).not.toContain("__crumbtrail");
+  });
+
+  it("preserves colliding application fields and reports capture loss", () => {
+    const losses: Array<{ phase: string; message: string }> = [];
+    const entry: AwsEventBridgeEntry = {
+      Detail: JSON.stringify({
+        __crumbtrail: "application-value",
+        __crumbtrailPayload: { application: true },
+        paymentId: "pay_1",
+      }),
+    };
+    const carried = injectCrumbtrailEventBridgeEntry(entry, {
+      context: token(),
+      onCaptureLoss: (error, phase) =>
+        losses.push({ phase, message: String(error) }),
+    });
+    expect(carried).toEqual(entry);
+    expect(losses).toMatchObject([{ phase: "collision" }]);
+  });
+
+  it("preserves large application detail and carries context below the service limit", () => {
+    const detail = { payload: "x".repeat(4_096) };
+    const entry = injectCrumbtrailEventBridgeEntry(
+      { Detail: JSON.stringify(detail) },
+      { context: token() },
+    );
+    const carriedDetail = JSON.parse(entry.Detail as string);
+    expect(carriedDetail.payload).toHaveLength(4_096);
+    expect(
+      extractCrumbtrailEventBridgeContext({ detail: carriedDetail }),
+    ).toBeDefined();
+  });
+
+  it("extracts context from a large EventBridge JSON string without a 2 KiB payload cap", () => {
+    const entry = injectCrumbtrailEventBridgeEntry(
+      { Detail: JSON.stringify({ payload: "x".repeat(4_096) }) },
+      { context: token() },
+    );
+    expect(
+      extractCrumbtrailEventBridgeContext({ detail: entry.Detail }),
+    ).toMatchObject({ sessionId: "session_parent" });
+  });
+
+  it("reports size loss only when an EventBridge entry cannot fit its service limit", () => {
+    const losses: string[] = [];
+    const entry = {
+      Detail: JSON.stringify({ payload: "x".repeat(256 * 1024) }),
+    };
+    const carried = injectCrumbtrailEventBridgeEntry(entry, {
+      context: token(),
+      onCaptureLoss: (error, phase) => losses.push(`${phase}:${String(error)}`),
+    });
+    expect(carried).toEqual(entry);
+    expect(losses.some((loss) => loss.startsWith("size:"))).toBe(true);
+  });
+
+  it("does not strip a user field that merely resembles context", () => {
+    const detail = { __crumbtrail: token(), paymentId: "pay_1" };
+    expect(extractCrumbtrailEventBridgeContext({ detail })).toBeUndefined();
+    expect(stripCrumbtrailEventBridgeContext(detail)).toEqual(detail);
   });
 
   it("wraps non object EventBridge detail and restores the original value", () => {
@@ -178,6 +243,130 @@ describe("AWS event carriers", () => {
       paymentId: "p1",
     });
     expect(recurringCarried).toEqual(recurring);
+  });
+
+  it("preserves colliding Scheduler fields and reports capture loss", () => {
+    const losses: string[] = [];
+    const input = {
+      Name: "pay-once",
+      ScheduleExpression: "at(2026-09-02T20:00:00)",
+      Target: {
+        Input: JSON.stringify({
+          __crumbtrailPayload: "application-value",
+          __crumbtrail: { application: true },
+        }),
+      },
+    };
+    const carried = injectCrumbtrailSchedulerInput(input, {
+      context: token(),
+      onCaptureLoss: (error, phase) => losses.push(`${phase}:${String(error)}`),
+    });
+    expect(carried).toEqual(input);
+    expect(losses.some((loss) => loss.startsWith("collision:"))).toBe(true);
+  });
+
+  it("preserves large Scheduler input and carries context below the service limit", () => {
+    const input = {
+      Name: "pay-once",
+      ScheduleExpression: "at(2026-09-02T20:00:00)",
+      Target: { Input: JSON.stringify({ payload: "x".repeat(4_096) }) },
+    };
+    const carried = injectCrumbtrailSchedulerInput(input, { context: token() });
+    const carriedInput = JSON.parse(carried.Target?.Input as string);
+    expect(carriedInput.payload).toHaveLength(4_096);
+    expect(extractCrumbtrailSchedulerContext(carriedInput)).toBeDefined();
+  });
+
+  it("reports size loss only when Scheduler input cannot fit its service limit", () => {
+    const losses: string[] = [];
+    const input = {
+      Name: "pay-once",
+      ScheduleExpression: "at(2026-09-02T20:00:00)",
+      Target: { Input: JSON.stringify({ payload: "x".repeat(256 * 1024) }) },
+    };
+    const carried = injectCrumbtrailSchedulerInput(input, {
+      context: token(),
+      onCaptureLoss: (error, phase) => losses.push(`${phase}:${String(error)}`),
+    });
+    expect(carried).toEqual(input);
+    expect(losses.some((loss) => loss.startsWith("size:"))).toBe(true);
+  });
+
+  it("does not strip a user Scheduler field that merely resembles context", () => {
+    const input = { __crumbtrail: token(), value: "application" };
+    expect(extractCrumbtrailSchedulerContext(input)).toBeUndefined();
+    expect(stripCrumbtrailSchedulerContext(input)).toEqual(input);
+  });
+
+  it("does not overwrite case variants of the reserved AWS attribute", () => {
+    const input = {
+      Message: "message",
+      MessageAttributes: {
+        "crumbtrail.context": { DataType: "String", StringValue: "user" },
+        Existing: { DataType: "String", StringValue: "x" },
+      },
+    };
+    const carried = injectCrumbtrailSnsMessage(input, { context: token() });
+    expect(carried.MessageAttributes).not.toHaveProperty("crumbtrail.context");
+    expect(carried.MessageAttributes).toHaveProperty(
+      AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE,
+    );
+  });
+
+  it("prefers the exact canonical AWS attribute when both variants arrive", () => {
+    expect(
+      extractCrumbtrailSqsRecord({
+        messageAttributes: {
+          "crumbtrail.context": attrToken(),
+          [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: attrToken(),
+        },
+      }),
+    ).toEqual(expect.objectContaining({ requestId: "request_parent" }));
+
+    expect(
+      extractCrumbtrailSqsRecord({
+        messageAttributes: {
+          "crumbtrail.context": attrToken(),
+          [AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE]: {
+            DataType: "String",
+            StringValue: "malformed",
+          },
+        },
+      }),
+    ).toBeUndefined();
+  });
+
+  it("keeps application fields when a message body contains reserved names", () => {
+    const sqsInput = {
+      MessageBody: JSON.stringify({ __crumbtrail: "application" }),
+    };
+    const snsInput = {
+      Message: JSON.stringify({ __crumbtrailPayload: "application" }),
+    };
+    expect(JSON.parse(injectCrumbtrailSqsMessage(sqsInput, { context: token() }).MessageBody)).toEqual(
+      { __crumbtrail: "application" },
+    );
+    expect(JSON.parse(injectCrumbtrailSnsMessage(snsInput, { context: token() }).Message)).toEqual(
+      { __crumbtrailPayload: "application" },
+    );
+  });
+
+  it("uses an empty failure list when every SQS batch record succeeds", async () => {
+    const wrapped = withCrumbtrailAwsSqsBatchProcessor(async () => "ok", {
+      now: 1_000,
+    });
+    await expect(
+      wrapped({ Records: [{ messageId: "ok", body: "ok" }] }),
+    ).resolves.toEqual({ batchItemFailures: [] });
+  });
+
+  it("keeps X Ray trace headers untouched", () => {
+    const input = {
+      MessageBody: "body",
+      MessageSystemAttributes: { AWSTraceHeader: "Root=1-old" },
+    };
+    const carried = injectCrumbtrailSqsMessage(input, { context: token() });
+    expect(carried.MessageSystemAttributes).toEqual(input.MessageSystemAttributes);
   });
 });
 
@@ -390,7 +579,11 @@ describe("AWS processor wrappers", () => {
     const event: AwsEventBridgeEvent = {
       id: "event_1",
       source: "payments",
-      detail: { paymentId: "p1", __crumbtrail: token(1_000) },
+      detail: {
+        paymentId: "p1",
+        __crumbtrail: token(1_000),
+        [AWS_CRUMBTRAIL_ENVELOPE_FIELD]: 1,
+      },
     };
     const eventHandler = vi.fn(async (safeEvent: AwsEventBridgeEvent) =>
       safeEvent.detail,
@@ -399,7 +592,12 @@ describe("AWS processor wrappers", () => {
       withCrumbtrailAwsEventBridgeProcessor(eventHandler, { now: 1_000 })(event),
     ).resolves.toEqual({ paymentId: "p1" });
 
-    const schedulerInput = { id: "schedule_1", value: "p1", __crumbtrail: token(1_000) };
+    const schedulerInput = {
+      id: "schedule_1",
+      value: "p1",
+      __crumbtrail: token(1_000),
+      [AWS_CRUMBTRAIL_ENVELOPE_FIELD]: 1,
+    };
     const schedulerHandler = vi.fn(async (safeInput: Record<string, unknown>) => safeInput);
     await expect(
       withCrumbtrailAwsSchedulerProcessor(schedulerHandler, { now: 1_000 })(

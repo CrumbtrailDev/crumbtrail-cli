@@ -50,6 +50,44 @@ describe("BullMQ adapters", () => {
     expect(injectBullMqContext("payload", token())).toBe("payload");
   });
 
+  it("reports an invalid explicit token without changing the queue payload", () => {
+    const losses: string[] = [];
+    const queue = {
+      add(_name: string, data: unknown) {
+        return data;
+      },
+    };
+    const wrapped = withCrumbtrailBullMqProducer(queue, {
+      context: { v: 1, traceparent: "00-invalid" } as CrumbtrailContextToken,
+      onCaptureLoss: (_error, phase) => losses.push(phase),
+    });
+    expect(wrapped.add?.("job", { value: 1 })).toEqual({ value: 1 });
+    expect(losses).toEqual(["context"]);
+  });
+
+  it("does not overwrite reserved user fields and reports the capture loss", () => {
+    const losses: Array<{ phase: string; message: string }> = [];
+    const data = { __crumbtrail: "application-value", count: 2 };
+    const carried = injectBullMqContext(data, token(), Date.now, (error, phase) => {
+      losses.push({ phase, message: String(error) });
+    });
+    expect(carried).toEqual(data);
+    expect(losses).toMatchObject([{ phase: "collision" }]);
+
+    const payloadField = { __crumbtrailPayload: "application-value" };
+    const second = injectBullMqContext(
+      payloadField,
+      token(),
+      Date.now,
+      (_error, phase) => losses.push({ phase, message: "payload collision" }),
+    );
+    expect(second).toEqual(payloadField);
+    expect(losses).toMatchObject([{ phase: "collision" }, { phase: "collision" }]);
+
+    const userCarrier = { __crumbtrail: token(), value: "application" };
+    expect(stripBullMqContext(userCarrier)).toEqual(userCarrier);
+  });
+
   it("wraps add and addBulk without changing queue identity or options", async () => {
     const added: unknown[] = [];
     const queue = {
@@ -106,7 +144,11 @@ describe("BullMQ adapters", () => {
   });
 
   it("strips the carrier before the processor and preserves retry identity", async () => {
-    const originalData = { orderId: "order_1", __crumbtrail: token() };
+    const originalData = {
+      orderId: "order_1",
+      __crumbtrail: token(),
+      __crumbtrailEnvelope: 1,
+    };
     const originalJob: BullMqJobLike = {
       name: "record-payment",
       queueName: "payments",

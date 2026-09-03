@@ -274,6 +274,7 @@ export type { BackendEventSink } from "./backend-event-sink";
 // These adapters are duck typed so BullMQ remains an application dependency.
 export {
   extractBullMqContext,
+  BULLMQ_CONTEXT_ENVELOPE_FIELD,
   injectBullMqContext,
   stripBullMqContext,
   withCrumbtrailBullMqProducer,
@@ -296,8 +297,12 @@ export type {
 export {
   AWS_CRUMBTRAIL_CONTEXT_ATTRIBUTE,
   AWS_CRUMBTRAIL_CONTEXT_FIELD,
+  AWS_CRUMBTRAIL_ENVELOPE_FIELD,
   AWS_CRUMBTRAIL_PAYLOAD_FIELD,
+  MAX_AWS_EVENTBRIDGE_ENTRY_BYTES,
+  MAX_AWS_EVENTBRIDGE_REQUEST_BYTES,
   MAX_AWS_CONTEXT_VALUE_LENGTH,
+  MAX_AWS_SCHEDULER_INPUT_BYTES,
   extractCrumbtrailEventBridgeContext,
   extractCrumbtrailSchedulerContext,
   extractCrumbtrailSnsRecord,
@@ -326,6 +331,7 @@ export {
 
 export type {
   AwsClientLike,
+  AwsCaptureLossPhase,
   AwsContextOptions,
   AwsEventBridgeEntry,
   AwsEventBridgeEvent,
