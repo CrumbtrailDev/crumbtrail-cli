@@ -55,9 +55,10 @@ its version can be compared across requests. Use the same `resourceSubject` in a
 when both planes represent the same application resource.
 
 Without a strong ingest credential, use an explicit `identifiers` object or `resolve` callback that
-returns opaque identifiers exactly 64 characters long. It must include `entityHash`; accepted
-characters are letters, numbers, underscore, and hyphen. The callback can throw safely, and invalid
-output omits only the race object.
+returns exactly these fields: required `entityHash`, plus optional `resourceHash`, `versionHash`,
+`beforeVersionHash`, and `afterVersionHash`. Every identifier is exactly 64 characters long.
+Accepted characters are letters, numbers, underscore, and hyphen. The callback can throw safely,
+and invalid output omits only the race object.
 
 Race evidence is omitted from bulk and image less diffs without a resolvable entity, reads that
 return more than one row, multi key cache operations, and database work observed inside a

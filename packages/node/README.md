@@ -89,7 +89,8 @@ provide a stable pool-timeout code, so their error prose is never guessed.
 Race evidence is off by default. Enable it only when the hosted product will inspect lost updates
 or stale cache repopulation. It adds a sealed `raceEvidence` object to eligible single entity
 `db.read`, `db.diff`, and single key cache `get`, `set`, `del`, or `unlink` events. The object has
-only fixed length identifiers:
+only these fixed length identifiers: required `entityHash`, plus optional `resourceHash`,
+`versionHash`, `beforeVersionHash`, and `afterVersionHash`:
 
 ```ts
 await autoCapture({

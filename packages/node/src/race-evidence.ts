@@ -92,11 +92,15 @@ export function createHmacRaceEvidenceResolver(
 
   return (input) => {
     try {
+      if (!isRaceEvidenceInputEligible(input)) return undefined;
       const entitySource =
         input.surface === "cache"
           ? input.cacheKey
           : { table: input.table, primaryKey: input.primaryKey };
       if (entitySource === undefined || entitySource === null) return undefined;
+      if (input.surface === "cache" && Array.isArray(entitySource)) {
+        return undefined;
+      }
       if (
         input.surface !== "cache" &&
         typeof entitySource === "object" &&
@@ -143,7 +147,7 @@ export function buildRaceEvidence(
   options: RaceEvidenceOptions | undefined,
   input: RaceEvidenceResolverInput,
 ): SealedRaceEvidence | undefined {
-  if (!options?.enabled) return undefined;
+  if (!options?.enabled || !isRaceEvidenceInputEligible(input)) return undefined;
 
   let candidate: RaceEvidenceIdentifiers | undefined;
   if (options.identifiers !== undefined) {
@@ -199,32 +203,37 @@ function sanitizeRaceEvidence(
     ) {
       return undefined;
     }
-    const keys = Object.keys(candidate);
+    const keys = Reflect.ownKeys(candidate);
     if (keys.length < 1 || keys.length > IDENTIFIER_KEYS.size) return undefined;
     if (
       keys.some(
-        (key) => !IDENTIFIER_KEYS.has(key as keyof RaceEvidenceIdentifiers),
+        (key) =>
+          typeof key !== "string" ||
+          !IDENTIFIER_KEYS.has(key as keyof RaceEvidenceIdentifiers),
       )
     ) {
       return undefined;
     }
     // Every eligible entity must have an opaque identity. Resource and version
     // ids without an entity id could be joined across unrelated rows.
-    if (!isIdentifier(candidate.entityHash)) return undefined;
+    const values: Partial<RaceEvidenceIdentifiers> = {};
     for (const key of keys as Array<keyof RaceEvidenceIdentifiers>) {
-      if (!isIdentifier(candidate[key])) return undefined;
+      const value = candidate[key];
+      if (!isIdentifier(value)) return undefined;
+      values[key] = value;
     }
+    if (!isIdentifier(values.entityHash)) return undefined;
     const sealed: RaceEvidenceIdentifiers & { entityHash: string } = {
-      entityHash: candidate.entityHash,
-      ...(candidate.resourceHash
-        ? { resourceHash: candidate.resourceHash }
+      entityHash: values.entityHash,
+      ...(values.resourceHash
+        ? { resourceHash: values.resourceHash }
         : {}),
-      ...(candidate.versionHash ? { versionHash: candidate.versionHash } : {}),
-      ...(candidate.beforeVersionHash
-        ? { beforeVersionHash: candidate.beforeVersionHash }
+      ...(values.versionHash ? { versionHash: values.versionHash } : {}),
+      ...(values.beforeVersionHash
+        ? { beforeVersionHash: values.beforeVersionHash }
         : {}),
-      ...(candidate.afterVersionHash
-        ? { afterVersionHash: candidate.afterVersionHash }
+      ...(values.afterVersionHash
+        ? { afterVersionHash: values.afterVersionHash }
         : {}),
     };
     return Object.freeze(sealed);
@@ -236,6 +245,31 @@ function sanitizeRaceEvidence(
 function isIdentifier(value: unknown): value is string {
   return (
     typeof value === "string" && RACE_EVIDENCE_IDENTIFIER_PATTERN.test(value)
+  );
+}
+
+function isRaceEvidenceInputEligible(
+  input: RaceEvidenceResolverInput,
+): boolean {
+  if (
+    !input ||
+    typeof input !== "object" ||
+    typeof input.surface !== "string" ||
+    typeof input.operation !== "string"
+  ) {
+    return false;
+  }
+  if (input.surface === "cache") {
+    return (
+      isRaceEligibleCacheOperation(input.operation) &&
+      input.cacheKey !== undefined &&
+      input.cacheKey !== null &&
+      !Array.isArray(input.cacheKey)
+    );
+  }
+  return (
+    (input.surface === "db.read" || input.surface === "db.diff") &&
+    input.operation.length > 0
   );
 }
 

@@ -120,6 +120,28 @@ describe("race evidence contract", () => {
         { surface: "cache", operation: "get", cacheKey: "key" },
       ),
     ).toBeUndefined();
+    expect(
+      buildRaceEvidence(
+        {
+          enabled: true,
+          identifiers: {
+            entityHash: opaque("e"),
+          },
+        },
+        { surface: "cache", operation: "mget", cacheKey: ["a", "b"] },
+      ),
+    ).toBeUndefined();
+    expect(
+      buildRaceEvidence(
+        {
+          enabled: true,
+          identifiers: {
+            entityHash: opaque("e"),
+          },
+        },
+        { surface: "cache", operation: "eval", cacheKey: "key" },
+      ),
+    ).toBeUndefined();
   });
 
   it("seals accepted application supplied identifiers", () => {
@@ -144,6 +166,25 @@ describe("race evidence contract", () => {
     expect(() => {
       (evidence as Record<string, unknown>).extra = opaque("x");
     }).toThrow();
+  });
+
+  it("rejects hidden and symbol metadata instead of relying on enumerable keys", () => {
+    const identifiers = { entityHash: opaque("e") } as Record<
+      string | symbol,
+      string
+    >;
+    Object.defineProperty(identifiers, "hidden", {
+      value: opaque("h"),
+      enumerable: false,
+    });
+    identifiers[Symbol("metadata")] = opaque("m");
+
+    expect(
+      buildRaceEvidence(
+        { enabled: true, identifiers: identifiers as never },
+        { surface: "db.read", operation: "read", primaryKey: { id: 1 } },
+      ),
+    ).toBeUndefined();
   });
 
   it("adds only DB read and diff evidence for one entity, including configured versions", () => {
