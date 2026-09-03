@@ -19,6 +19,10 @@ export interface CaptureGenerationOptions {
 export function captureGenerationFor<T extends CaptureGenerationOptions>(
   options: T,
 ): T {
+  // A caller may pass an operation-scoped copy through several adapter layers.
+  // Preserve its original owner instead of rebinding it at an inner boundary.
+  if (Object.prototype.hasOwnProperty.call(options, "captureGeneration"))
+    return options;
   if (typeof options.getCaptureGeneration !== "function") return options;
   let generation: CaptureGenerationState = null;
   try {
