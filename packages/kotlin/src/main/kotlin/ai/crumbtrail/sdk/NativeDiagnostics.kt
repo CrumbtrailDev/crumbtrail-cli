@@ -49,9 +49,10 @@ interface CrumbtrailPendingHangStore {
 /** In-memory implementation for hosts that opt out of persistence and tests. */
 class MemoryPendingHangStore(private var hang: CrumbtrailPendingHang? = null) :
     CrumbtrailPendingHangStore {
-    override fun write(hang: CrumbtrailPendingHang) { this.hang = hang }
-    override fun read(): CrumbtrailPendingHang? = hang
-    override fun clear() { hang = null }
+    private val lock = Any()
+    override fun write(hang: CrumbtrailPendingHang) = synchronized(lock) { this.hang = hang }
+    override fun read(): CrumbtrailPendingHang? = synchronized(lock) { hang }
+    override fun clear() = synchronized(lock) { hang = null }
 }
 
 /** One watchdog observation in the shared native-hang shape. */

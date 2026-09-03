@@ -1,9 +1,5 @@
 import Foundation
 
-#if canImport(Darwin)
-import Darwin
-#endif
-
 #if canImport(UIKit) && !os(macOS)
 import UIKit
 #endif

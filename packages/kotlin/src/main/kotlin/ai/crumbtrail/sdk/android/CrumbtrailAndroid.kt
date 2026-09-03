@@ -19,7 +19,6 @@ import ai.crumbtrail.sdk.CrumbtrailSessionStore
 import ai.crumbtrail.sdk.JsonValue
 import ai.crumbtrail.sdk.PersistedSession
 import ai.crumbtrail.sdk.boundedDiagnosticText
-import ai.crumbtrail.sdk.boundedStackTrace
 import ai.crumbtrail.sdk.installCrashHandler
 import android.app.ActivityManager
 import android.app.Activity

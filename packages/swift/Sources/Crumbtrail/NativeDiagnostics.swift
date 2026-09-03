@@ -49,11 +49,24 @@ public protocol CrumbtrailPendingHangStore: AnyObject {
 
 public final class MemoryPendingHangStore: CrumbtrailPendingHangStore {
     private var hang: CrumbtrailPendingHang?
+    private let lock = NSLock()
 
     public init(hang: CrumbtrailPendingHang? = nil) { self.hang = hang }
-    public func write(_ hang: CrumbtrailPendingHang) { self.hang = hang }
-    public func read() -> CrumbtrailPendingHang? { hang }
-    public func clear() { hang = nil }
+    public func write(_ hang: CrumbtrailPendingHang) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.hang = hang
+    }
+    public func read() -> CrumbtrailPendingHang? {
+        lock.lock()
+        defer { lock.unlock() }
+        return hang
+    }
+    public func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        hang = nil
+    }
 }
 
 public struct CrumbtrailNativeHang: Equatable, Sendable {
