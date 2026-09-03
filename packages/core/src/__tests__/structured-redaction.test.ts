@@ -1566,6 +1566,7 @@ describe("keepFields vs the built-in deny rules", () => {
           },
           account: {
             status: "active",
+            id: 12345678,
             number: "1234",
           },
         }),
@@ -1573,7 +1574,7 @@ describe("keepFields vs the built-in deny rules", () => {
       );
 
       expect(out.card).toMatchObject({ brand: "visa", balanceCents: 1250 });
-      expect(out.account).toMatchObject({ status: "active" });
+      expect(out.account).toMatchObject({ status: "active", id: 12345678 });
       expect((out.card as Record<string, unknown>).number).toMatchObject({
         $redacted: "[REDACTED]",
       });
@@ -1581,7 +1582,7 @@ describe("keepFields vs the built-in deny rules", () => {
         $redacted: "[REDACTED]",
       });
       expect(JSON.stringify(out)).not.toContain("1234567890123456");
-      expect(JSON.stringify(out)).not.toContain("1234");
+      expect(JSON.stringify(out)).not.toContain('"number":"1234"');
     });
 
     it("still redacts a scalar whose own name matches", () => {

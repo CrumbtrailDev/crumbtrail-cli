@@ -2926,7 +2926,7 @@ function diagnosticLeafValue(
   denyFields: readonly string[] | undefined,
   container: StructuredContainerContext,
 ): DiagnosticScalar | undefined {
-  if (isStructuredContainerNumber(value, keyName, container)) {
+  if (isStructuredContainerNumber(keyName, container)) {
     fields.push({
       path,
       reason: "sensitive_container_number",
@@ -3397,30 +3397,19 @@ function structuredContainerContext(
 
 /**
  * Protect number-bearing leaves inside the two intentionally traversable
- * containers without closing their ordinary business fields. A `number` field
- * in either container is a credential by schema, while a numeric `id` is only
- * denied when it has the length of an account or card number.
+ * containers without closing their ordinary business fields. These explicit
+ * number field names are credentials by schema. An `id` remains ordinary
+ * business evidence because its value alone cannot say whether it is a card or
+ * account number.
  */
 function isStructuredContainerNumber(
-  value: unknown,
   keyName: string | undefined,
   container: StructuredContainerContext,
 ): boolean {
   if (!container || keyName === undefined) return false;
   const compact = compactFieldName(keyName);
   if (STRUCTURED_CONTAINER_NUMBER_NAMES.has(compact)) return true;
-
-  if (compact !== container && compact !== "id") return false;
-  const text =
-    typeof value === "number" && Number.isFinite(value)
-      ? String(Math.abs(value))
-      : typeof value === "string"
-        ? value.replace(/[\s-]/g, "")
-        : "";
-  if (!/^\d+$/.test(text)) return false;
-  return container === "card"
-    ? text.length >= 13 && text.length <= 19
-    : text.length >= 6 && text.length <= 20;
+  return false;
 }
 
 function redactStructuredStringValue(
@@ -3477,7 +3466,7 @@ function redactStructuredJsonValue(
   // original value's shape facts with the placeholder's own.
   if (isRedactedPlaceholder(value)) return value;
   const container = structuredContainerContext(keyName, inheritedContainer);
-  if (isStructuredContainerNumber(value, keyName, container)) {
+  if (isStructuredContainerNumber(keyName, container)) {
     fields.push({
       path,
       reason: "sensitive_container_number",
