@@ -53,6 +53,8 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     private static let maxPersistenceAttempts = 3
 
     private let defaults: UserDefaults
+    private let stateLock = NSRecursiveLock()
+    private var watchdogGeneration: UInt64 = 0
     private var observerTokens: [NSObjectProtocol] = []
     private var watchdogTimer: DispatchSourceTimer?
     private var lastHeartbeat = DispatchTime.now().uptimeNanoseconds
@@ -101,7 +103,9 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func capability() -> [String: Bool] {
-        ["supported": true, "enabled": enabled, "observed": false]
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return ["supported": true, "enabled": enabled, "observed": false]
     }
 
     private func setEnabled(_ value: Bool) {
@@ -109,7 +113,11 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func startCollectors() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         guard !collectorsStarted else { return }
+        watchdogGeneration &+= 1
+        let generation = watchdogGeneration
         enabled = true
         collectorsStarted = true
         CrumbtrailFlutterExceptionRegistry.shared.add(self)
@@ -125,12 +133,16 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         for (name, state) in notifications {
             observerTokens.append(
                 center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    guard let self else { return }
+                    self.stateLock.lock()
+                    defer { self.stateLock.unlock() }
+                    guard self.enabled && self.watchdogGeneration == generation else { return }
                     if state != "memory-warning" {
-                        self?.lastHeartbeat = DispatchTime.now().uptimeNanoseconds
-                        self?.watchdogPending = false
-                        self?.foreground = state == "active"
+                        self.lastHeartbeat = DispatchTime.now().uptimeNanoseconds
+                        self.watchdogPending = false
+                        self.foreground = state == "active"
                     }
-                    self?.appendPending(
+                    self.appendPending(
                         kind: "app-lifecycle",
                         data: ["state": state, "source": "uiapplication"]
                     )
@@ -141,6 +153,8 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func stopCollectors() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         enabled = false
         watchdogTimer?.cancel()
         watchdogTimer = nil
@@ -164,9 +178,16 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func startWatchdog() {
+        let generation = watchdogGeneration
+        lastHeartbeat = DispatchTime.now().uptimeNanoseconds
+        foreground = false
         DispatchQueue.main.async { [weak self] in
-            self?.lastHeartbeat = DispatchTime.now().uptimeNanoseconds
-            self?.foreground = UIApplication.shared.applicationState == .active
+            guard let self else { return }
+            self.stateLock.lock()
+            defer { self.stateLock.unlock() }
+            guard self.enabled && self.watchdogGeneration == generation else { return }
+            self.lastHeartbeat = DispatchTime.now().uptimeNanoseconds
+            self.foreground = UIApplication.shared.applicationState == .active
         }
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
         timer.schedule(
@@ -175,9 +196,11 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
         )
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            guard self.enabled && self.foreground else { return }
+            self.stateLock.lock()
+            defer { self.stateLock.unlock() }
+            guard self.enabled && self.foreground && self.watchdogGeneration == generation else { return }
             let now = DispatchTime.now().uptimeNanoseconds
-            let elapsed = Int64((now - self.lastHeartbeat) / 1_000_000)
+            let elapsed = CrumbtrailWatchdogClock.elapsedMilliseconds(now: now, heartbeat: self.lastHeartbeat)
             if elapsed > Self.hangThresholdMilliseconds,
                !self.watchdogPending,
                !CrumbtrailFlutterPlugin.debuggerAttached {
@@ -194,8 +217,12 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
                 )
             }
             DispatchQueue.main.async { [weak self] in
-                self?.lastHeartbeat = DispatchTime.now().uptimeNanoseconds
-                self?.watchdogPending = false
+                guard let self else { return }
+                self.stateLock.lock()
+                defer { self.stateLock.unlock() }
+                guard self.enabled && self.watchdogGeneration == generation else { return }
+                self.lastHeartbeat = DispatchTime.now().uptimeNanoseconds
+                self.watchdogPending = false
             }
         }
         watchdogTimer = timer
@@ -211,6 +238,8 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func drainDiagnostics() -> [String: Any] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         Self.pendingEventsLock.lock()
         defer { Self.pendingEventsLock.unlock() }
         guard enabled else { return ["token": "", "events": []] }
@@ -268,6 +297,8 @@ public final class CrumbtrailFlutterPlugin: NSObject, FlutterPlugin {
     }
 
     private func appendPending(kind: String, data: [String: Any]) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         Self.pendingEventsLock.lock()
         defer { Self.pendingEventsLock.unlock() }
         guard enabled else { return }

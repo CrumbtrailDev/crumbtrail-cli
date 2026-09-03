@@ -2,6 +2,7 @@
 #import <UIKit/UIKit.h>
 #import <React/RCTBridgeModule.h>
 #import <mach/mach_time.h>
+#import "CrumbtrailWatchdogClock.h"
 
 static NSString * const CTNativeDiagnosticsPendingKey = @"native-diagnostics";
 static NSString * const CTNativeDiagnosticsSuite = @"ai.crumbtrail.react-native";
@@ -21,6 +22,7 @@ static NSArray<NSDictionary *> *CTInFlightDiagnosticsEvents;
 @interface CrumbtrailNativeDiagnostics : NSObject <RCTBridgeModule> {
   dispatch_source_t _watchdog;
   uint64_t _lastHeartbeat;
+  uint64_t _watchdogGeneration;
   BOOL _watchdogPending;
   BOOL _foreground;
   BOOL _enabled;
@@ -114,16 +116,35 @@ RCT_EXPORT_METHOD(setEnabled:(BOOL)enabled) {
 
 RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject) {
-  @try {
-    [CTPendingEventsLock lock];
+  @synchronized (self) {
     @try {
-      if (!_enabled) {
-        resolve([self emptyDiagnosticsBatch]);
-        return;
-      }
-      if (CTInFlightDiagnosticsToken && CTInFlightDiagnosticsEvents) {
-        NSMutableArray *events = [NSMutableArray arrayWithCapacity:CTInFlightDiagnosticsEvents.count];
-        for (NSDictionary *value in CTInFlightDiagnosticsEvents) {
+      [CTPendingEventsLock lock];
+      @try {
+        if (!_enabled) {
+          resolve([self emptyDiagnosticsBatch]);
+          return;
+        }
+        if (CTInFlightDiagnosticsToken && CTInFlightDiagnosticsEvents) {
+          NSMutableArray *events = [NSMutableArray arrayWithCapacity:CTInFlightDiagnosticsEvents.count];
+          for (NSDictionary *value in CTInFlightDiagnosticsEvents) {
+            NSDictionary *event = [self responseEvent:value];
+            if (!event) {
+              resolve([self emptyDiagnosticsBatch]);
+              return;
+            }
+            [events addObject:event];
+          }
+          resolve(@{ @"token": CTInFlightDiagnosticsToken, @"events": events });
+          return;
+        }
+        NSArray *raw = [[self defaults] arrayForKey:CTNativeDiagnosticsPendingKey] ?: @[];
+        raw = [raw subarrayWithRange:NSMakeRange(0, MIN(raw.count, CTNativeDiagnosticsMaxEvents))];
+        if (raw.count == 0) {
+          resolve([self emptyDiagnosticsBatch]);
+          return;
+        }
+        NSMutableArray *events = [NSMutableArray arrayWithCapacity:raw.count];
+        for (id value in raw) {
           NSDictionary *event = [self responseEvent:value];
           if (!event) {
             resolve([self emptyDiagnosticsBatch]);
@@ -131,32 +152,15 @@ RCT_EXPORT_METHOD(drainDiagnostics:(RCTPromiseResolveBlock)resolve
           }
           [events addObject:event];
         }
+        CTInFlightDiagnosticsToken = [NSUUID UUID].UUIDString;
+        CTInFlightDiagnosticsEvents = [raw copy];
         resolve(@{ @"token": CTInFlightDiagnosticsToken, @"events": events });
-        return;
+      } @finally {
+        [CTPendingEventsLock unlock];
       }
-      NSArray *raw = [[self defaults] arrayForKey:CTNativeDiagnosticsPendingKey] ?: @[];
-      raw = [raw subarrayWithRange:NSMakeRange(0, MIN(raw.count, CTNativeDiagnosticsMaxEvents))];
-      if (raw.count == 0) {
-        resolve([self emptyDiagnosticsBatch]);
-        return;
-      }
-      NSMutableArray *events = [NSMutableArray arrayWithCapacity:raw.count];
-      for (id value in raw) {
-        NSDictionary *event = [self responseEvent:value];
-        if (!event) {
-          resolve([self emptyDiagnosticsBatch]);
-          return;
-        }
-        [events addObject:event];
-      }
-      CTInFlightDiagnosticsToken = [NSUUID UUID].UUIDString;
-      CTInFlightDiagnosticsEvents = [raw copy];
-      resolve(@{ @"token": CTInFlightDiagnosticsToken, @"events": events });
-    } @finally {
-      [CTPendingEventsLock unlock];
+    } @catch (__unused NSException *exception) {
+      resolve([self emptyDiagnosticsBatch]);
     }
-  } @catch (__unused NSException *exception) {
-    resolve([self emptyDiagnosticsBatch]);
   }
 }
 
@@ -209,7 +213,9 @@ RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
 }
 
 - (NSDictionary<NSString *, NSNumber *> *)capability {
-  return @{ @"supported": @YES, @"enabled": @(_enabled), @"observed": @NO };
+  @synchronized (self) {
+    return @{ @"supported": @YES, @"enabled": @(_enabled), @"observed": @NO };
+  }
 }
 
 - (NSUserDefaults *)defaults {
@@ -217,30 +223,36 @@ RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
 }
 
 - (void)startCollectors {
-  if (_collectorsStarted) return;
-  _enabled = YES;
-  _collectorsStarted = YES;
-  CTRegisterNativeDiagnostics(self);
-  [self installLifecycleCollector];
-  [self startWatchdog];
+  @synchronized (self) {
+    if (_collectorsStarted) return;
+    _watchdogGeneration++;
+    _enabled = YES;
+    _collectorsStarted = YES;
+    CTRegisterNativeDiagnostics(self);
+    [self installLifecycleCollector];
+    [self startWatchdog];
+  }
 }
 
 - (void)stopCollectors {
-  _enabled = NO;
-  if (_watchdog) {
-    dispatch_source_cancel(_watchdog);
-    _watchdog = nil;
+  @synchronized (self) {
+    _enabled = NO;
+    if (_watchdog) {
+      dispatch_source_cancel(_watchdog);
+      _watchdog = nil;
+    }
+    for (id token in _observerTokens) {
+      [[NSNotificationCenter defaultCenter] removeObserver:token];
+    }
+    [_observerTokens removeAllObjects];
+    if (_collectorsStarted) CTUnregisterNativeDiagnostics(self);
+    _collectorsStarted = NO;
+    _watchdogPending = NO;
   }
-  for (id token in _observerTokens) {
-    [[NSNotificationCenter defaultCenter] removeObserver:token];
-  }
-  [_observerTokens removeAllObjects];
-  if (_collectorsStarted) CTUnregisterNativeDiagnostics(self);
-  _collectorsStarted = NO;
-  _watchdogPending = NO;
 }
 
 - (void)installLifecycleCollector {
+  uint64_t generation = _watchdogGeneration;
   NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
   NSArray<NSDictionary *> *notifications = @[
     @{ @"name": UIApplicationDidBecomeActiveNotification, @"state": @"active" },
@@ -255,24 +267,32 @@ RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
                     usingBlock:^(__unused NSNotification *notification) {
       CrumbtrailNativeDiagnostics *strongSelf = weakSelf;
       if (!strongSelf) return;
-      if (![entry[@"state"] isEqualToString:@"memory-warning"]) {
-        strongSelf->_lastHeartbeat = mach_absolute_time();
-        strongSelf->_watchdogPending = NO;
-        strongSelf->_foreground = [entry[@"state"] isEqualToString:@"active"];
+      @synchronized (strongSelf) {
+        if (!strongSelf->_enabled || strongSelf->_watchdogGeneration != generation) return;
+        if (![entry[@"state"] isEqualToString:@"memory-warning"]) {
+          strongSelf->_lastHeartbeat = mach_absolute_time();
+          strongSelf->_watchdogPending = NO;
+          strongSelf->_foreground = [entry[@"state"] isEqualToString:@"active"];
+        }
+        [weakSelf appendPendingKind:@"app-lifecycle" data:@{
+          @"state": entry[@"state"], @"source": @"uiapplication"
+        }];
       }
-      [weakSelf appendPendingKind:@"app-lifecycle" data:@{
-        @"state": entry[@"state"], @"source": @"uiapplication"
-      }];
     }];
     if (token) [_observerTokens addObject:token];
   }
 }
 
 - (void)startWatchdog {
+  uint64_t generation = _watchdogGeneration;
   _lastHeartbeat = mach_absolute_time();
+  _foreground = NO;
   dispatch_async(dispatch_get_main_queue(), ^{
-    self->_lastHeartbeat = mach_absolute_time();
-    self->_foreground = UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+    @synchronized (self) {
+      if (!self->_enabled || self->_watchdogGeneration != generation) return;
+      self->_lastHeartbeat = mach_absolute_time();
+      self->_foreground = UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+    }
   });
   _watchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
                                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
@@ -283,24 +303,29 @@ RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
   dispatch_source_set_event_handler(_watchdog, ^{
     CrumbtrailNativeDiagnostics *strongSelf = weakSelf;
     if (!strongSelf) return;
-    if (!strongSelf->_enabled || !strongSelf->_foreground) return;
-    uint64_t now = mach_absolute_time();
-    mach_timebase_info_data_t info;
-    mach_timebase_info(&info);
-    uint64_t elapsed = (now - strongSelf->_lastHeartbeat) * info.numer / info.denom / NSEC_PER_MSEC;
-    if (elapsed > (uint64_t)(CTNativeDiagnosticsHangThreshold * 1000.0) &&
-        !strongSelf->_watchdogPending && ![strongSelf debuggerAttached]) {
-      strongSelf->_watchdogPending = YES;
-      [strongSelf appendPendingKind:@"native-hang" data:@{
-        @"source": @"main-thread", @"thresholdMs": @5000,
-        @"observedDurationMs": @(MIN(elapsed, 86400000ULL)),
-        @"recovered": @NO, @"previousLaunch": @NO,
-      }];
+    @synchronized (strongSelf) {
+      if (!strongSelf->_enabled || !strongSelf->_foreground || strongSelf->_watchdogGeneration != generation) return;
+      uint64_t now = mach_absolute_time();
+      mach_timebase_info_data_t info;
+      mach_timebase_info(&info);
+      uint64_t elapsed = CTWatchdogElapsedMilliseconds(now, strongSelf->_lastHeartbeat, info.numer, info.denom);
+      if (elapsed > (uint64_t)(CTNativeDiagnosticsHangThreshold * 1000.0) &&
+          !strongSelf->_watchdogPending && ![strongSelf debuggerAttached]) {
+        strongSelf->_watchdogPending = YES;
+        [strongSelf appendPendingKind:@"native-hang" data:@{
+          @"source": @"main-thread", @"thresholdMs": @5000,
+          @"observedDurationMs": @(MIN(elapsed, 86400000ULL)),
+          @"recovered": @NO, @"previousLaunch": @NO,
+        }];
+      }
+      dispatch_async(dispatch_get_main_queue(), ^{
+        @synchronized (strongSelf) {
+          if (!strongSelf->_enabled || strongSelf->_watchdogGeneration != generation) return;
+          strongSelf->_lastHeartbeat = mach_absolute_time();
+          strongSelf->_watchdogPending = NO;
+        }
+      });
     }
-    dispatch_async(dispatch_get_main_queue(), ^{
-      strongSelf->_lastHeartbeat = mach_absolute_time();
-      strongSelf->_watchdogPending = NO;
-    });
   });
   dispatch_resume(_watchdog);
 }
@@ -314,33 +339,35 @@ RCT_EXPORT_METHOD(acknowledgeDiagnostics:(NSString *)token
 }
 
 - (void)appendPendingKind:(NSString *)kind data:(NSDictionary *)data {
-  [CTPendingEventsLock lock];
-  @try {
-    if (!_enabled) {
-      return;
-    }
-    NSUserDefaults *defaults = [self defaults];
-    NSMutableArray *events = [[defaults arrayForKey:CTNativeDiagnosticsPendingKey] mutableCopy] ?: [NSMutableArray array];
-    NSArray *previous = [events copy];
-    NSUInteger protected = CTInFlightDiagnosticsEvents.count;
-    while (events.count >= CTNativeDiagnosticsMaxEvents + protected) [events removeObjectAtIndex:protected];
-    [events addObject:@{ @"kind": kind, @"data": [self boundedData:data] }];
-    BOOL committed = NO;
-    for (NSUInteger attempt = 0; attempt < CTNativeDiagnosticsMaxPersistenceAttempts; attempt++) {
-      [defaults setObject:events forKey:CTNativeDiagnosticsPendingKey];
-      if ([defaults synchronize]) {
-        committed = YES;
-        break;
+  @synchronized (self) {
+    [CTPendingEventsLock lock];
+    @try {
+      if (!_enabled) {
+        return;
       }
+      NSUserDefaults *defaults = [self defaults];
+      NSMutableArray *events = [[defaults arrayForKey:CTNativeDiagnosticsPendingKey] mutableCopy] ?: [NSMutableArray array];
+      NSArray *previous = [events copy];
+      NSUInteger protected = CTInFlightDiagnosticsEvents.count;
+      while (events.count >= CTNativeDiagnosticsMaxEvents + protected) [events removeObjectAtIndex:protected];
+      [events addObject:@{ @"kind": kind, @"data": [self boundedData:data] }];
+      BOOL committed = NO;
+      for (NSUInteger attempt = 0; attempt < CTNativeDiagnosticsMaxPersistenceAttempts; attempt++) {
+        [defaults setObject:events forKey:CTNativeDiagnosticsPendingKey];
+        if ([defaults synchronize]) {
+          committed = YES;
+          break;
+        }
+      }
+      if (!committed) {
+        if (previous.count == 0) [defaults removeObjectForKey:CTNativeDiagnosticsPendingKey];
+        else [defaults setObject:previous forKey:CTNativeDiagnosticsPendingKey];
+      }
+    } @catch (__unused NSException *exception) {
+      // A diagnostics write is best effort and never a host failure.
+    } @finally {
+      [CTPendingEventsLock unlock];
     }
-    if (!committed) {
-      if (previous.count == 0) [defaults removeObjectForKey:CTNativeDiagnosticsPendingKey];
-      else [defaults setObject:previous forKey:CTNativeDiagnosticsPendingKey];
-    }
-  } @catch (__unused NSException *exception) {
-    // A diagnostics write is best effort and never a host failure.
-  } @finally {
-    [CTPendingEventsLock unlock];
   }
 }
 
