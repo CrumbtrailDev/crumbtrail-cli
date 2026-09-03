@@ -43,6 +43,7 @@ import {
   type PreflightResult,
   type StageResult,
 } from "./preflight";
+import { diagnoseCors, type CorsDiagnosticResult } from "./cors-diagnostic";
 import {
   createIngestKey,
   inferProjectName,
@@ -81,6 +82,7 @@ import { runPackageManager } from "./install/run-package-manager";
 import {
   APP_URL_ENV_VAR,
   dashboardBase,
+  ingestSessionStartEndpoint,
   requestJson,
   resolveEndpoint,
 } from "./net";
@@ -256,7 +258,14 @@ export function resolvedSdkVersion(
 // ── Arg parsing ──────────────────────────────────────────────────────────────
 
 export type Command =
-  "wizard" | "login" | "logout" | "token" | "verify" | "help" | "version";
+  | "wizard"
+  | "login"
+  | "logout"
+  | "token"
+  | "verify"
+  | "doctor"
+  | "help"
+  | "version";
 
 export interface ParsedArgs {
   command: Command;
@@ -279,6 +288,8 @@ export interface ParsedArgs {
    */
   noAgent: boolean;
   endpoint?: string;
+  /** `doctor` only: browser origin to check. */
+  origin?: string;
   /**
    * Monorepo root only: wire exactly these services (repeatable `--only`,
    * matched against a service's package name or path). Also the non-interactive
@@ -401,6 +412,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
           }
         }
         break;
+      case "--origin":
+        {
+          const value = flagValue(args, i, a);
+          if (value.error) parsed.parseError ??= value.error;
+          else {
+            parsed.origin = value.value;
+            i += 1;
+          }
+        }
+        break;
       case "--key":
         {
           const value = flagValue(args, i, a);
@@ -454,6 +475,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
           const value = a.slice("--key=".length).trim();
           if (value) parsed.key = value;
           else parsed.parseError ??= "--key requires a value.";
+        } else if (a.startsWith("--origin=")) {
+          const value = a.slice("--origin=".length).trim();
+          if (value) parsed.origin = value;
+          else parsed.parseError ??= "--origin requires a value.";
         } else if (a.startsWith("--only=")) {
           const value = a.slice("--only=".length).trim();
           if (value) (parsed.only ??= []).push(value);
@@ -464,7 +489,11 @@ export function parseArgs(argv: string[]): ParsedArgs {
           else parsed.parseError ??= "--workspace requires a value.";
         } else if (
           !commandSet &&
-          (a === "login" || a === "logout" || a === "token" || a === "verify")
+          (a === "login" ||
+            a === "logout" ||
+            a === "token" ||
+            a === "verify" ||
+            a === "doctor")
         ) {
           parsed.command = a;
           commandSet = true;
@@ -510,6 +539,10 @@ function usage(): string {
     cmd(
       "crumbtrail verify",
       "Preflight an endpoint + key (DNS, TLS, auth): PASS/FAIL",
+    ),
+    cmd(
+      "crumbtrail doctor",
+      "Check browser CORS without changing your project",
     ),
     "",
     color.dim(
@@ -572,6 +605,12 @@ function usage(): string {
     ),
     flag("--project <id>", "Project id for the auth GET fallback (no key)"),
     flag("--json", "Emit JSON instead of the table (exit 0 = pass, else fail)"),
+    "",
+    head("doctor options"),
+    flag(
+      "--origin <url>",
+      "Browser origin to check (or $CRUMBTRAIL_APP_ORIGIN)",
+    ),
     "",
     head("Appearance"),
     color.dim(
@@ -958,6 +997,8 @@ export interface WizardDeps {
   pollForServices: typeof pollForServices;
   /** Synthetic preflight for `verify` (stub in tests). */
   runPreflight: typeof runPreflight;
+  /** Read-only CORS check for browser correlation. */
+  runCorsDiagnostic: typeof diagnoseCors;
   /** Browser opener for the end-of-wizard dashboard hand-off (stub in tests). */
   openBrowserFn?: (url: string) => Promise<boolean>;
   /**
@@ -992,6 +1033,7 @@ export function defaultDeps(): WizardDeps {
     setSessionReplay,
     pollForServices,
     runPreflight,
+    runCorsDiagnostic: diagnoseCors,
     openBrowserFn: openBrowser,
     loadStoredAuth: loadAuth,
     ui: consoleUi,
@@ -1479,6 +1521,17 @@ export async function runWizard(
   notes.push(
     ...correlationNotes(result.recipe, singleAppOrigins, 0, inject.outcome),
   );
+  if (BROWSER_RECIPES.has(result.recipe)) {
+    const cors = await deps.runCorsDiagnostic({
+      endpoint: ingestSessionStartEndpoint(base),
+      origin: deps.env.CRUMBTRAIL_APP_ORIGIN,
+      applicable: true,
+      fetchImpl: deps.fetchImpl,
+    });
+    if (cors.status !== "pass") {
+      notes.push(`CORS ${cors.status}: ${cors.reason} ${cors.nextStep}`);
+    }
+  }
   if (keyWrite.note) notes.push(keyWrite.note);
 
   const keyReady =
@@ -4488,6 +4541,43 @@ async function runVerify(
   return exitCodeFor(result);
 }
 
+const BROWSER_RECIPES = new Set<Recipe>([
+  "next",
+  "sveltekit",
+  "nuxt",
+  "remix",
+  "astro",
+  "angular",
+  "vite-spa",
+  "cra",
+  "capacitor",
+  "static",
+]);
+
+function renderCorsDiagnostic(result: CorsDiagnosticResult, ui: Ui): void {
+  const origin = result.origin ? ` from ${result.origin}` : "";
+  ui.out(`CORS ${result.status.toUpperCase()}: ${result.endpoint}${origin}.`);
+  ui.out(`  ${result.reason}`);
+  ui.out(`  Next: ${result.nextStep}`);
+}
+
+async function runDoctor(
+  parsed: ParsedArgs,
+  deps: WizardDeps,
+): Promise<number> {
+  const detected = deps.detect(deps.cwd);
+  const result = await deps.runCorsDiagnostic({
+    endpoint: ingestSessionStartEndpoint(
+      resolveEndpoint(parsed.endpoint, deps.env),
+    ),
+    origin: parsed.origin ?? deps.env.CRUMBTRAIL_APP_ORIGIN,
+    applicable: !!detected.recipe && BROWSER_RECIPES.has(detected.recipe),
+    fetchImpl: deps.fetchImpl,
+  });
+  renderCorsDiagnostic(result, deps.ui);
+  return result.status === "fail" ? 1 : 0;
+}
+
 // ── Entry ────────────────────────────────────────────────────────────────────
 
 /** The floor the package's `engines` field declares. */
@@ -4594,6 +4684,7 @@ export async function runCli(
   // `verify` is non-interactive by design (no prompts, no browser) so it runs
   // before the TTY guard — pointing it at prod from CI is the whole point.
   if (parsed.command === "verify") return runVerify(parsed, deps);
+  if (parsed.command === "doctor") return runDoctor(parsed, deps);
 
   // Non-TTY guard — BEFORE any prompt. CI must pass --yes AND --project.
   if (!deps.isTTY && !(parsed.yes && parsed.project)) {

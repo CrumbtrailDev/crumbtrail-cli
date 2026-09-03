@@ -27,6 +27,7 @@ import type { ServiceCandidate } from "../discover";
 import type { Prompter, Ui } from "../ui";
 import type { EnvFileIO } from "../env-file";
 import { clearReportedAppBases, rememberAppBase, saveAuth } from "../auth";
+import { diagnoseCors } from "../cors-diagnostic";
 
 function captureUi(): { ui: Ui; lines: string[] } {
   const lines: string[] = [];
@@ -200,6 +201,14 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
         stages: [],
       };
     }) as unknown as WizardDeps["runPreflight"],
+    runCorsDiagnostic: vi.fn(async () => ({
+      status: "not-applicable",
+      endpoint: "https://api.crumbtrail.ai",
+      category: "not-applicable",
+      missingHeaders: [],
+      reason: "not applicable",
+      nextStep: "none",
+    })) as unknown as WizardDeps["runCorsDiagnostic"],
     openBrowserFn: vi.fn(async () => true),
     ui,
     prompter: noopPrompter,
@@ -226,6 +235,101 @@ function makeDeps(h: HarnessOpts, over: Partial<WizardDeps> = {}): WizardDeps {
   };
   return { ...base, ...over };
 }
+
+const passingCorsDiagnostic = {
+  status: "pass" as const,
+  endpoint: "https://capture.example.com/api/session/start",
+  origin: "https://app.example.com",
+  category: "http" as const,
+  responseStatus: 204,
+  missingHeaders: [],
+  reason: "allowed",
+  nextStep: "none",
+};
+
+describe("browser CORS diagnostic routes", () => {
+  it("has the setup wizard probe the browser SDK session-start route", async () => {
+    const runCorsDiagnostic = vi.fn(async () => passingCorsDiagnostic);
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        env: {
+          CRUMBTRAIL_BASE_URL: "https://capture.example.com/",
+          CRUMBTRAIL_APP_ORIGIN: "https://app.example.com",
+          DISPLAY: ":0",
+        },
+        runCorsDiagnostic: runCorsDiagnostic as WizardDeps["runCorsDiagnostic"],
+      },
+    );
+
+    expect(await runCli(["node", "cli"], deps)).toBe(0);
+    expect(runCorsDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        endpoint: "https://capture.example.com/api/session/start",
+        origin: "https://app.example.com",
+        applicable: true,
+      }),
+    );
+  });
+
+  it("does not append the session-start route twice for doctor", async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(null, {
+          status: 204,
+          headers: {
+            "access-control-allow-origin": "https://app.example.com",
+            "access-control-allow-methods": "POST",
+            "access-control-allow-headers": "content-type, x-crumbtrail-auth",
+          },
+        }),
+    );
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        runCorsDiagnostic: diagnoseCors,
+        fetchImpl: fetchImpl as typeof fetch,
+      },
+    );
+
+    expect(
+      await runCli(
+        [
+          "node",
+          "cli",
+          "doctor",
+          "--endpoint",
+          "https://capture.example.com/api/session/start/",
+          "--origin",
+          "https://app.example.com",
+        ],
+        deps,
+      ),
+    ).toBe(0);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "https://capture.example.com/api/session/start",
+      expect.objectContaining({ method: "OPTIONS" }),
+    );
+  });
+
+  it("does not run browser CORS diagnostics for React Native", async () => {
+    const runCorsDiagnostic = vi.fn(async () => passingCorsDiagnostic);
+    const deps = makeDeps(
+      { steps: [] },
+      {
+        detect: vi.fn(() => detectResult({ recipe: "react-native" })),
+        runCorsDiagnostic: runCorsDiagnostic as WizardDeps["runCorsDiagnostic"],
+      },
+    );
+
+    expect(await runCli(["node", "cli", "doctor"], deps)).toBe(0);
+    expect(runCorsDiagnostic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        applicable: false,
+      }),
+    );
+  });
+});
 
 describe("wizard first-event wait — what is actually outstanding", () => {
   it("blames the missing snippet, not the dev server, when nothing was injected", async () => {
