@@ -106,7 +106,6 @@ function makeDeadline(setTimeoutImpl: typeof setTimeout): Deadline {
     expired = true;
     resolveDeadline();
   }, CPU_PROFILE_DEADLINE_MS);
-  (timer as unknown as { unref?: () => void }).unref?.();
   return { expired: () => expired, promise, timer };
 }
 
@@ -380,7 +379,6 @@ export function createCpuProfileProbeExecutor(
         await Promise.race([
           new Promise<void>((resolve) => {
             windowTimer = setTimeoutImpl(resolve, CPU_PROFILE_DURATION_MS);
-            (windowTimer as unknown as { unref?: () => void }).unref?.();
           }),
           timeoutPromise(deadline),
           aborted.promise,
