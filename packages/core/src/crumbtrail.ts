@@ -539,6 +539,12 @@ export class Crumbtrail {
   private sessionStore?: SessionStore;
   private lifecycleTimer?: ReturnType<typeof setTimeout>;
   private lifecycleClosePromise?: Promise<void>;
+  private lifecycleCloseState?: {
+    immediateEnd: boolean;
+    deadline?: number;
+    escalationPromise?: Promise<void>;
+    escalate?: () => void;
+  };
   private lifecycleClosing = false;
   private lifecycleSuspended = false;
   private lifecycleEndPromise?: Promise<void>;
@@ -1856,9 +1862,26 @@ export class Crumbtrail {
    * the server cannot finalize an incomplete log.
    */
   private closeForLifecycle(immediateEnd: boolean): Promise<void> {
-    if (this.stopped || this.lifecycleSuspended || this.lifecycleClosePromise) {
+    if (this.stopped || this.lifecycleSuspended) {
       return this.lifecycleClosePromise ?? Promise.resolve();
     }
+    if (this.lifecycleClosePromise) {
+      if (immediateEnd) this.escalateLifecycleClose();
+      return this.lifecycleClosePromise;
+    }
+
+    const closeState: NonNullable<typeof this.lifecycleCloseState> = {
+      immediateEnd,
+      ...(immediateEnd
+        ? { deadline: Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS }
+        : {}),
+    };
+    if (!immediateEnd) {
+      closeState.escalationPromise = new Promise<void>((resolve) => {
+        closeState.escalate = resolve;
+      });
+    }
+    this.lifecycleCloseState = closeState;
 
     this.lifecycleClosePromise = (async () => {
       // Flush while transport admission is still open. Setting the lifecycle
@@ -1866,8 +1889,17 @@ export class Crumbtrail {
       this.bus.flush();
       this.lifecycleClosing = true;
       try {
-        await this.sessionMetadataWrite;
-        const pendingSettled = await this.waitForLifecycleSends(immediateEnd);
+        const admissionSettled = await this.waitForLifecyclePhase(
+          [this.sessionMetadataWrite, this.sessionAdmission],
+          closeState,
+        );
+        if (!admissionSettled) {
+          this.abandonLifecycleSends();
+          this.lifecycleSuspended = true;
+          this.sessionStarted = false;
+          return;
+        }
+        const pendingSettled = await this.waitForLifecycleSends(closeState);
         if (!pendingSettled) {
           this.lifecycleSuspended = true;
           this.sessionStarted = false;
@@ -1897,6 +1929,7 @@ export class Crumbtrail {
     })().finally(() => {
       this.lifecycleClosePromise = undefined;
       this.lifecycleEndPromise = undefined;
+      this.lifecycleCloseState = undefined;
     });
     return this.lifecycleClosePromise;
   }
@@ -1907,32 +1940,75 @@ export class Crumbtrail {
    * torn down at any moment, and a late end request is worse than letting the server TTL reclaim
    * a session whose last upload did not finish.
    */
-  private async waitForLifecycleSends(immediateEnd: boolean): Promise<boolean> {
+  private async waitForLifecycleSends(
+    closeState: NonNullable<typeof this.lifecycleCloseState>,
+  ): Promise<boolean> {
     const pending = [...this.pendingSends];
     if (pending.length === 0) return true;
     const settled = Promise.allSettled(pending).then(() => true);
-    if (!immediateEnd) {
-      await settled;
-      return true;
-    }
+    const completed = await this.waitForLifecyclePhase(
+      pending,
+      closeState,
+      settled,
+    );
+    if (!completed) this.abandonLifecycleSends(pending);
+    return completed;
+  }
 
+  /**
+   * Wait for one lifecycle phase under its close deadline. An ordinary hidden-page close waits
+   * indefinitely until an explicit stop or nonpersisted pagehide escalates it to the bounded path.
+   */
+  private async waitForLifecyclePhase(
+    promises: readonly Promise<unknown>[],
+    closeState: NonNullable<typeof this.lifecycleCloseState>,
+    settled = Promise.allSettled(promises).then(() => true),
+  ): Promise<boolean> {
+    if (promises.length === 0) return true;
+    if (!closeState.immediateEnd) {
+      const escalated = closeState.escalationPromise?.then(() => false);
+      if (escalated) {
+        const completed = await Promise.race([settled, escalated]);
+        if (completed) return true;
+      } else {
+        await settled;
+        return true;
+      }
+    }
+    return this.waitUntilLifecycleDeadline(settled, closeState.deadline);
+  }
+
+  private async waitUntilLifecycleDeadline(
+    settled: Promise<boolean>,
+    deadline = Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
+  ): Promise<boolean> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const completed = await Promise.race([
       settled,
       new Promise<boolean>((resolve) => {
-        timer = setTimeout(
-          () => resolve(false),
-          PAGEHIDE_PENDING_SEND_TIMEOUT_MS,
-        );
+        timer = setTimeout(() => resolve(false), remaining);
       }),
     ]);
     if (timer !== undefined) clearTimeout(timer);
-    if (!completed) {
-      // Do not let a transport that never settles keep a later explicit stop() hostage. The page
-      // is already closing and the server can finalize this still-open session by TTL.
-      for (const send of pending) this.pendingSends.delete(send);
-    }
     return completed;
+  }
+
+  private abandonLifecycleSends(
+    pending = [...this.pendingSends],
+  ): void {
+    // Do not let a transport that never settles keep a later explicit stop() hostage. The page
+    // is already closing and the server can finalize this still-open session by TTL.
+    for (const send of pending) this.pendingSends.delete(send);
+  }
+
+  private escalateLifecycleClose(): void {
+    const closeState = this.lifecycleCloseState;
+    if (!closeState || closeState.immediateEnd) return;
+    closeState.immediateEnd = true;
+    closeState.deadline = Date.now() + PAGEHIDE_PENDING_SEND_TIMEOUT_MS;
+    closeState.escalate?.();
   }
 
   /** Start the unload safe close without waiting for async teardown work. */
@@ -2375,12 +2451,25 @@ export class Crumbtrail {
       }
     };
 
-  this.cancelLifecycleTimer();
+    this.cancelLifecycleTimer();
     if (this.lifecycleClosePromise) {
       try {
+        this.escalateLifecycleClose();
         await this.lifecycleClosePromise;
       } catch (error) {
         recordStopFailure(teardownFailures, "lifecycle.close", error);
+      }
+    } else if (this.sessionStarted && !this.lifecycleSuspended) {
+      const admissionSettled = await this.waitUntilLifecycleDeadline(
+        Promise.allSettled([
+          this.sessionMetadataWrite,
+          this.sessionAdmission,
+        ]).then(() => true),
+      );
+      if (!admissionSettled) {
+        this.abandonLifecycleSends();
+        this.lifecycleSuspended = true;
+        this.sessionStarted = false;
       }
     }
     // A session ending while the remote policy is still outstanding takes the

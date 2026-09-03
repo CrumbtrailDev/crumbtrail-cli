@@ -79,6 +79,25 @@ describe("report screenshot API", () => {
     await logger.stop();
   });
 
+  it("waits for settled session admission before uploading", async () => {
+    const order: string[] = [];
+    const transport = makeTransport();
+    transport.startSession.mockImplementationOnce(async () => {
+      order.push("start");
+      await Promise.resolve();
+      order.push("start-done");
+    });
+    transport.sendBlob.mockImplementationOnce(async () => {
+      order.push("blob");
+    });
+    const logger = init(transport);
+
+    await logger.captureScreenshot(imageBlob(png()));
+
+    expect(order).toEqual(["start", "start-done", "blob"]);
+    await logger.stop();
+  });
+
   it("stays disabled until the project policy enables report screenshots", async () => {
     const transport = makeTransport();
     const logger = Crumbtrail.init({
@@ -420,6 +439,82 @@ describe("report screenshot API", () => {
     });
     expect(transport.endSession).not.toHaveBeenCalled();
     void capture.catch(() => {});
+    vi.useRealTimers();
+  });
+
+  it("bounds pagehide while session admission never settles", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    transport.startSession.mockImplementationOnce(
+      async () => new Promise<void>(() => {}),
+    );
+    const logger = init(transport);
+
+    window.dispatchEvent(new Event("pagehide"));
+    const lifecycleClose = (
+      logger as unknown as { lifecycleClosePromise?: Promise<void> }
+    ).lifecycleClosePromise;
+    expect(lifecycleClose).toBeDefined();
+
+    await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
+    await expect(lifecycleClose).resolves.toBeUndefined();
+    expect(transport.endSession).not.toHaveBeenCalled();
+    await expect(logger.captureScreenshot(imageBlob(png()))).rejects.toThrow(
+      "active session",
+    );
+    vi.useRealTimers();
+    await logger.stop();
+  });
+
+  it("uses one pagehide deadline for admission and a pending send", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    let finishStart!: () => void;
+    const sessionStarted = new Promise<void>((resolve) => {
+      finishStart = resolve;
+    });
+    transport.startSession.mockImplementationOnce(() => sessionStarted);
+    transport.sendEvents.mockImplementationOnce(
+      async () => new Promise<void>(() => {}),
+    );
+    const logger = init(transport);
+    const flag = logger.flag();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(transport.sendEvents).toHaveBeenCalledOnce();
+
+    window.dispatchEvent(new Event("pagehide"));
+    const lifecycleClose = (
+      logger as unknown as { lifecycleClosePromise?: Promise<void> }
+    ).lifecycleClosePromise;
+    expect(lifecycleClose).toBeDefined();
+
+    await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS - 1);
+    finishStart();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(lifecycleClose).resolves.toBeUndefined();
+    expect(transport.endSession).not.toHaveBeenCalled();
+    await expect(flag).resolves.toMatchObject({ bugId: expect.any(String) });
+    vi.useRealTimers();
+    await logger.stop();
+  });
+
+  it("bounds explicit stop while session admission never settles", async () => {
+    vi.useFakeTimers();
+    const transport = makeTransport();
+    transport.startSession.mockImplementationOnce(
+      async () => new Promise<void>(() => {}),
+    );
+    const logger = init(transport);
+
+    const stopping = logger.stop();
+    await vi.advanceTimersByTimeAsync(PAGEHIDE_PENDING_SEND_TIMEOUT_MS);
+
+    await expect(stopping).resolves.toMatchObject({
+      sessionId: expect.any(String),
+    });
+    expect(transport.endSession).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 });
