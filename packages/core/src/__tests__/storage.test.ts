@@ -69,6 +69,7 @@ describe("storageCollector", () => {
     restoreInstance(sessionStorage, "removeItem", origSessionRemoveItem);
     restoreInstance(sessionStorage, "clear", origSessionClear);
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   // The prototype patch used to be handed the *unbound* Storage.prototype
@@ -512,8 +513,8 @@ describe("storageCollector", () => {
     const request = new EventTarget() as IDBRequest;
     Object.defineProperty(request, "error", { value: failure });
     const factory = {
-      open: vi.fn(() => request),
-      deleteDatabase: vi.fn(() => request),
+      open: vi.fn((_name: string) => request),
+      deleteDatabase: vi.fn((_name: string) => request),
     };
     vi.stubGlobal("indexedDB", factory);
     const cleanup = storageCollector(bus, makeConfig({ autoFlagOnStorageFailure: true }));
@@ -577,15 +578,17 @@ describe("storageCollector", () => {
   it("records Cache API promise failures without changing promise identity or payload privacy", async () => {
     const failure = new DOMException("request body secret", "QuotaExceededError");
     const cache = {
-      put: vi.fn(() => Promise.reject(failure)),
+      put: vi.fn((_request: RequestInfo | URL, _response: Response) =>
+        Promise.reject(failure),
+      ),
     };
     const openResult = Promise.resolve(cache);
     const cacheStorage = {
-      open: vi.fn(() => openResult),
-      delete: vi.fn(),
-      has: vi.fn(),
-      match: vi.fn(),
-      keys: vi.fn(),
+      open: vi.fn((_name: string) => openResult),
+      delete: vi.fn((_name: string) => Promise.resolve(false)),
+      has: vi.fn((_name: string) => Promise.resolve(false)),
+      match: vi.fn((_request: RequestInfo | URL) => Promise.resolve(undefined)),
+      keys: vi.fn(() => Promise.resolve([])),
     };
     vi.stubGlobal("caches", cacheStorage);
     const cleanup = storageCollector(bus, makeConfig({ autoFlagOnStorageFailure: true }));
@@ -594,8 +597,8 @@ describe("storageCollector", () => {
     expect(returnedOpen).toBe(openResult);
     const returnedCache = await returnedOpen;
     const returnedPut = returnedCache.put(
-      new Request("https://example.test/private"),
-      new Response("response secret"),
+      { body: "request body secret" } as unknown as Request,
+      { body: "response secret" } as unknown as Response,
     );
     await expect(returnedPut).rejects.toBe(failure);
     await Promise.resolve();
@@ -618,13 +621,16 @@ describe("storageCollector", () => {
     Object.defineProperty(request, "error", {
       value: new DOMException("private", "UnknownError"),
     });
-    const factory = { open: vi.fn(() => request), deleteDatabase: vi.fn() };
+    const factory = {
+      open: vi.fn((_name: string) => request),
+      deleteDatabase: vi.fn((_name: string) => request),
+    };
     const cacheStorage = {
-      open: vi.fn(() => Promise.reject(new Error("private cache failure"))),
-      delete: vi.fn(),
-      has: vi.fn(),
-      match: vi.fn(),
-      keys: vi.fn(),
+      open: vi.fn((_name: string) => Promise.reject(new Error("private cache failure"))),
+      delete: vi.fn((_name: string) => Promise.resolve(false)),
+      has: vi.fn((_name: string) => Promise.resolve(false)),
+      match: vi.fn((_request: RequestInfo | URL) => Promise.resolve(undefined)),
+      keys: vi.fn(() => Promise.resolve([])),
     };
     vi.stubGlobal("indexedDB", factory);
     vi.stubGlobal("caches", cacheStorage);
